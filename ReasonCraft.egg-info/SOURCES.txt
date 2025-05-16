@@ -1,0 +1,12 @@
+LICENSE
+README.md
+setup.py
+ReasonCraft.egg-info/PKG-INFO
+ReasonCraft.egg-info/SOURCES.txt
+ReasonCraft.egg-info/dependency_links.txt
+ReasonCraft.egg-info/entry_points.txt
+ReasonCraft.egg-info/requires.txt
+ReasonCraft.egg-info/top_level.txt
+reasoncraft/__init__.py
+reasoncraft/knowledge_base.pl
+reasoncraft/main.py
