@@ -8,5 +8,4 @@ ReasonCraft.egg-info/entry_points.txt
 ReasonCraft.egg-info/requires.txt
 ReasonCraft.egg-info/top_level.txt
 reasoncraft/__init__.py
-reasoncraft/knowledge_base.pl
 reasoncraft/main.py

@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 import os
 
 # 项目名称
-PROJECT_NAME = "ReasonCraft"
+PROJECT_NAME = "KnowProlog"
 # 项目版本
 VERSION = "0.1.0"
 # 项目描述
@@ -19,12 +19,12 @@ except FileNotFoundError:
 setup(
     name=PROJECT_NAME,
     version=VERSION,
-    author="Your Name / Organization",  # 替换为你的名字或组织
-    author_email="your.email@example.com",  # 替换为你的邮箱
+    author="qwe12345678",  # 替换为你的名字或组织
+    author_email="zhongwenjia2009@163.com",  # 替换为你的邮箱
     description=DESCRIPTION,
     long_description=LONG_DESCRIPTION,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/ReasonCraft",  # 替换为你的项目URL
+    url="https://gitee.com/qwe12345678/reason-craft.git",  # 替换为你的项目URL
     
     # find_packages() 会自动找到 reasoncraft 包目录
     # 'reasoncraft' 是包含 __init__.py 和 main.py 的目录名
@@ -32,11 +32,9 @@ setup(
 
     # 依赖列表
     install_requires=[
-        "pyswip>=0.2.10", # pyswip 的一个合理版本
-        "zhipuai>=2.0.0",  # 请检查 ZhipuAI SDK 的最新推荐版本
-        # 're' 是标准库，不需要列出
-        # 'os' 是标准库，不需要列出
-    ],
+    "pyswip>=0.2.10",  # pyswip 的一个合理版本
+    "openai>=1.0.0",   # 新增：用于与智谱AI API交互
+],
     
     # Python 版本要求
     python_requires='>=3.7', # 基于代码中使用的 f-strings 和 ZhipuAI SDK 的可能要求
