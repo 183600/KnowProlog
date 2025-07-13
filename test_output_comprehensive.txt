@@ -1,0 +1,88 @@
+warning: unused import: `std::collections::HashMap`
+ --> src/main.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: `know_prolog` (bin "know_prolog") generated 1 warning (run `cargo fix --bin "know_prolog"` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.18s
+     Running `target/release/know_prolog`
+知识图谱系统启动中...
+系统已就绪！
+输入查询，例如：小明多大
+输入'录入：'开始导入知识
+输入'quit'退出系统
+
+> 查询类型: capital_query, 实体: ["法国"]
+Loading Prolog facts:
+oxigraph_entity('Python', 'programminglanguage', ['name-Python', 'birth_year-1991']).
+oxigraph_entity('珠穆朗玛峰', 'geographicfeature', ['name-珠穆朗玛峰', 'altitude-8848']).
+oxigraph_entity('日本', 'country', ['name-日本', 'capital-东京']).
+oxigraph_entity('中国', 'country', ['capital-北京', 'name-中国']).
+oxigraph_entity('哈姆雷特', 'literature', ['author-莎士比亚', 'name-哈姆雷特']).
+oxigraph_entity('法国', 'country', ['name-法国', 'capital-巴黎']).
+oxigraph_entity('水', 'chemical', ['formula-H2O', 'name-水']).
+oxigraph_entity('世界杯', 'sportevent', ['name-世界杯', 'year-2022', 'champion-阿根廷']).
+
+法国的首都是巴黎
+
+> 抱歉，我不理解您的查询
+
+> 查询类型: chemical_formula_query, 实体: ["水"]
+Loading Prolog facts:
+oxigraph_entity('中国', 'country', ['name-中国', 'capital-北京']).
+oxigraph_entity('水', 'chemical', ['name-水', 'formula-H2O']).
+oxigraph_entity('法国', 'country', ['name-法国', 'capital-巴黎']).
+oxigraph_entity('哈姆雷特', 'literature', ['author-莎士比亚', 'name-哈姆雷特']).
+oxigraph_entity('珠穆朗玛峰', 'geographicfeature', ['altitude-8848', 'name-珠穆朗玛峰']).
+oxigraph_entity('日本', 'country', ['capital-东京', 'name-日本']).
+oxigraph_entity('世界杯', 'sportevent', ['year-2022', 'name-世界杯', 'champion-阿根廷']).
+oxigraph_entity('Python', 'programminglanguage', ['name-Python', 'birth_year-1991']).
+
+% Warning: overwriting oxigraph_entity/3 because the clauses are discontiguous
+水的化学分子式是H2O
+
+> 抱歉，我不理解您的查询
+
+> 抱歉，我不理解您的查询
+
+> 抱歉，我不理解您的查询
+
+> 查询类型: birth_year_query, 实体: ["Python"]
+Loading Prolog facts:
+oxigraph_entity('世界杯', 'sportevent', ['name-世界杯', 'year-2022', 'champion-阿根廷']).
+oxigraph_entity('Python', 'programminglanguage', ['name-Python', 'birth_year-1991']).
+oxigraph_entity('珠穆朗玛峰', 'geographicfeature', ['altitude-8848', 'name-珠穆朗玛峰']).
+oxigraph_entity('水', 'chemical', ['formula-H2O', 'name-水']).
+oxigraph_entity('法国', 'country', ['capital-巴黎', 'name-法国']).
+oxigraph_entity('哈姆雷特', 'literature', ['name-哈姆雷特', 'author-莎士比亚']).
+oxigraph_entity('中国', 'country', ['name-中国', 'capital-北京']).
+oxigraph_entity('日本', 'country', ['name-日本', 'capital-东京']).
+
+% Warning: overwriting oxigraph_entity/3 because the clauses are discontiguous
+Python诞生于1991年
+
+> 抱歉，我不理解您的查询
+
+> 抱歉，我不理解您的查询
+
+> 查询类型: concept_query, 实体: ["光合作用"]
+Loading Prolog facts:
+oxigraph_entity('日本', 'country', ['capital-东京', 'name-日本']).
+oxigraph_entity('珠穆朗玛峰', 'geographicfeature', ['name-珠穆朗玛峰', 'altitude-8848']).
+oxigraph_entity('中国', 'country', ['name-中国', 'capital-北京']).
+oxigraph_entity('Python', 'programminglanguage', ['name-Python', 'birth_year-1991']).
+oxigraph_entity('世界杯', 'sportevent', ['name-世界杯', 'champion-阿根廷', 'year-2022']).
+oxigraph_entity('法国', 'country', ['capital-巴黎', 'name-法国']).
+oxigraph_entity('哈姆雷特', 'literature', ['name-哈姆雷特', 'author-莎士比亚']).
+oxigraph_entity('水', 'chemical', ['name-水', 'formula-H2O']).
+
+% Warning: overwriting oxigraph_entity/3 because the clauses are discontiguous
+Prolog查询: oxigraph_entity('光合作用', Type, Properties)
+执行Prolog查询: ?- oxigraph_entity('光合作用', Type, Properties).
+Prolog查询错误: error existence_error procedure / ?- 1 / ?- 1
+根据当前信息，无法回答您的问题。
+
+> 系统已退出。

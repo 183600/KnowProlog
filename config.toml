@@ -1,0 +1,487 @@
+[system]
+oxigraph_endpoint = "http://localhost:7878"  # Oxigraph HTTP端点
+oxigraph_store_path = "oxigraph_data"       # Oxigraph数据存储路径
+default_language = "zh"
+
+# Ownthink API配置
+[api]
+ownthink_base_url = "https://api.ownthink.com/kg"
+ownthink_timeout_seconds = 10
+enable_entity_disambiguation = true  # 是否启用实体歧义解析
+max_ambiguous_entities = 5          # 显示的最大歧义实体数量
+auto_select_best_entity = true       # 是否自动选择权重最高的实体
+
+[nlp]
+import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]
+enable_nlu = true  # 启用语义理解功能
+nlu_confidence_threshold = 0.6  # NLU置信度阈值
+enable_local_semantic = true  # 启用本地语义理解
+disable_ownthink_api = true   # 禁用 ownthink API
+semantic_similarity_threshold = 0.7  # 语义相似度阈值
+max_entity_candidates = 10  # 最大实体候选数量
+enable_advanced_entity_extraction = true  # 启用高级实体抽取
+enable_relation_extraction = true  # 启用关系抽取
+context_window_size = 5  # 上下文窗口大小
+
+[nlp.pos_dict]
+# 基础功能词和测试句子关键词
+"是" = "v"
+"的" = "u"
+"年龄" = "n"
+"岁" = "q"
+"多大" = "r"
+"谁" = "r"
+"什么" = "r"
+"几" = "m"
+"多少" = "m"
+"哪里" = "r"
+"哪一年" = "r"
+"哪一颗" = "r"
+"哪些" = "r"
+"哪几场" = "r"
+
+# 基础名词
+"海拔" = "n"
+"高度" = "n"
+"作者" = "n"
+"冠军" = "n"
+"首都" = "n"
+"海拔高度" = "n"
+"行星" = "n"
+"语言" = "n"
+"骨头" = "n"
+"分子式" = "n"
+"化学分子式" = "n"
+"世界杯" = "n"
+"队伍" = "n"
+"战役" = "n"
+"转折点" = "n"
+"影响" = "n"
+"原因" = "n"
+"区别" = "n"
+"原理" = "n"
+"工作原理" = "n"
+"思想" = "n"
+"哲学思想" = "n"
+"观点" = "n"
+"背景" = "n"
+"风格" = "n"
+"艺术风格" = "n"
+"情感" = "n"
+"含义" = "n"
+"起源" = "n"
+"角色" = "n"
+"建造目的" = "n"
+"历史意义" = "n"
+"定律" = "n"
+"例子" = "n"
+"技术" = "n"
+"提升" = "n"
+"风险" = "n"
+"问题" = "n"
+
+# 动词
+"诞生" = "v"
+"产生" = "v"
+"解释" = "v"
+"简述" = "v"
+"描述" = "v"
+"比较" = "v"
+"分析" = "v"
+"受到" = "v"
+"惩罚" = "v"
+"建造" = "v"
+"解决" = "v"
+"扮演" = "v"
+"发表" = "v"
+"适用" = "v"
+"相比" = "v"
+"能解决" = "v"
+
+# 形容词和副词
+"最大" = "a"
+"现任" = "a"
+"主要" = "a"
+"深远" = "a"
+"核心" = "a"
+"潜在" = "a"
+"关键" = "a"
+"经典" = "a"
+"真正" = "a"
+"古" = "a"
+
+# 疑问词和量词
+"米" = "q"
+"块" = "q"
+"个" = "q"
+"年" = "q"
+"支" = "q"
+"场" = "q"
+
+# 时间和方向词
+"之前" = "f"
+"现在" = "f"
+"一下" = "f"
+
+# 专有名词和地点
+"法国" = "ns"
+"珠穆朗玛峰" = "ns"
+"太阳系" = "ns"
+"日本" = "ns"
+"东京" = "ns"
+"京都" = "ns"
+"欧洲" = "ns"
+"古埃及" = "ns"
+"美国" = "ns"
+"东西方" = "ns"
+"丝绸之路" = "ns"
+"古希腊" = "ns"
+
+# 人名
+"达尔文" = "nr"
+"孔子" = "nr"
+"牛顿" = "nr"
+"梵高" = "nr"
+"普罗米修斯" = "nr"
+
+# 作品和概念名
+"哈姆雷特" = "n"
+"独立宣言" = "n"
+"星夜" = "n"
+"Python" = "n"
+"5G" = "n"
+"4G" = "n"
+"CRISPR" = "n"
+"水" = "n"
+"黑洞" = "n"
+"光合作用" = "n"
+"进化论" = "n"
+"摩尔定律" = "n"
+"区块链" = "n"
+"机器学习" = "n"
+"深度学习" = "n"
+"量子计算" = "n"
+"气候变化" = "n"
+"文艺复兴" = "n"
+"金字塔" = "n"
+"第二次世界大战" = "n"
+"斯多葛主义" = "n"
+"享乐主义" = "n"
+"基因编辑" = "n"
+"内卷" = "n"
+"神话" = "n"
+
+# 数字
+"2022" = "m"
+"人体" = "n"
+
+[nlp.name_patterns]
+prefixes = ["小", "老", "大"]
+suffixes = ["总", "哥", "姐"]
+full_names = ["张三", "李四", "王五", "赵六"]
+profession_suffix = ["医生", "老师", "工程师"]
+
+# 基础事实查询规则
+[[prolog_rules]]
+name = "首都查询"
+pattern = ["ns", "的", "首都", "是", "哪里"]
+query_type = "capital_query"
+priority = 15
+
+[[prolog_rules]]
+name = "首都查询2"
+pattern = ["ns", "首都"]
+query_type = "capital_query"
+priority = 14
+
+[[prolog_rules]]
+name = "海拔查询"
+pattern = ["ns", "的", "海拔", "高度", "是", "多少"]
+query_type = "altitude_query"
+priority = 15
+
+[[prolog_rules]]
+name = "海拔查询2"
+pattern = ["ns", "海拔", "多少"]
+query_type = "altitude_query"
+priority = 14
+
+[[prolog_rules]]
+name = "化学分子式查询"
+pattern = ["n", "的", "化学", "分子式", "是", "什么"]
+query_type = "chemical_formula_query"
+priority = 15
+
+[[prolog_rules]]
+name = "化学分子式查询2"
+pattern = ["n", "化学", "分子式"]
+query_type = "chemical_formula_query"
+priority = 14
+
+[[prolog_rules]]
+name = "作者查询"
+pattern = ["n", "的", "作者", "是", "谁"]
+query_type = "author_query"
+priority = 15
+
+[[prolog_rules]]
+name = "作者查询2"
+pattern = ["n", "作者"]
+query_type = "author_query"
+priority = 14
+
+[[prolog_rules]]
+name = "冠军查询"
+pattern = ["n", "的", "冠军", "是", "哪支", "队伍"]
+query_type = "champion_query"
+priority = 15
+
+[[prolog_rules]]
+name = "冠军查询2"
+pattern = ["n", "冠军"]
+query_type = "champion_query"
+priority = 14
+
+[[prolog_rules]]
+name = "诞生年份查询"
+pattern = ["n", "语言", "是", "哪一年", "诞生", "的"]
+query_type = "birth_year_query"
+priority = 15
+
+[[prolog_rules]]
+name = "诞生年份查询2"
+pattern = ["n", "诞生", "年"]
+query_type = "birth_year_query"
+priority = 14
+
+[[prolog_rules]]
+name = "最大行星查询"
+pattern = ["太阳系", "中", "最大", "的", "行星", "是", "哪一颗"]
+query_type = "planet_query"
+priority = 15
+
+[[prolog_rules]]
+name = "最大查询"
+pattern = ["最大", "的", "n", "是", "r"]
+query_type = "largest_query"
+priority = 14
+
+[[prolog_rules]]
+name = "数量查询"
+pattern = ["人体", "有", "多少", "块", "n"]
+query_type = "quantity_query"
+priority = 15
+
+[[prolog_rules]]
+name = "数量查询2"
+pattern = ["有", "多少", "n"]
+query_type = "quantity_query"
+priority = 14
+
+[[prolog_rules]]
+name = "时间前查询"
+pattern = ["ns", "是", "在", "哪一年", "之前"]
+query_type = "time_before_query"
+priority = 15
+
+# 概念解释查询规则
+[[prolog_rules]]
+name = "概念查询"
+pattern = ["什么", "是", "n"]
+query_type = "concept_query"
+priority = 12
+
+[[prolog_rules]]
+name = "概念解释查询"
+pattern = ["解释", "一下", "什么", "是", "n"]
+query_type = "explanation_query"
+priority = 15
+
+[[prolog_rules]]
+name = "解释查询"
+pattern = ["解释", "n"]
+query_type = "explanation_query"
+priority = 14
+
+[[prolog_rules]]
+name = "原理查询"
+pattern = ["n", "的", "工作", "原理", "是", "什么"]
+query_type = "principle_query"
+priority = 15
+
+[[prolog_rules]]
+name = "原理查询2"
+pattern = ["n", "工作", "原理"]
+query_type = "principle_query"
+priority = 14
+
+# 比较查询规则
+[[prolog_rules]]
+name = "比较查询"
+pattern = ["n", "和", "n", "有什么", "区别"]
+query_type = "comparison_query"
+priority = 15
+
+[[prolog_rules]]
+name = "比较查询2"
+pattern = ["比较", "n", "和", "n"]
+query_type = "comparison_query"
+priority = 14
+
+# 哲学思想查询
+[[prolog_rules]]
+name = "哲学思想查询"
+pattern = ["nr", "的", "核心", "哲学", "思想", "是", "什么"]
+query_type = "philosophy_query"
+priority = 15
+
+[[prolog_rules]]
+name = "思想查询"
+pattern = ["nr", "思想"]
+query_type = "philosophy_query"
+priority = 13
+
+# 影响查询
+[[prolog_rules]]
+name = "影响查询"
+pattern = ["n", "对", "ns", "产生", "了", "哪些", "影响"]
+query_type = "impact_query"
+priority = 15
+
+[[prolog_rules]]
+name = "影响查询2"
+pattern = ["n", "影响"]
+query_type = "impact_query"
+priority = 13
+
+# 原因查询
+[[prolog_rules]]
+name = "原因查询"
+pattern = ["n", "的", "主要", "原因", "是", "什么"]
+query_type = "cause_query"
+priority = 15
+
+[[prolog_rules]]
+name = "原因查询2"
+pattern = ["为何", "v"]
+query_type = "reason_query"
+priority = 14
+
+# 基础查询规则（保留原有的）
+[[prolog_rules]]
+name = "年龄查询"
+pattern = ["nr", "多大"]
+query_type = "age_query"
+priority = 10
+
+[[prolog_rules]]
+name = "年龄查询2"
+pattern = ["nr", "的", "年龄"]
+query_type = "age_query"
+priority = 9
+
+[[prolog_rules]]
+name = "关系查询"
+pattern = ["nr", "和", "nr", "什么", "关系"]
+query_type = "relation_query"
+priority = 10
+
+[[prolog_rules]]
+name = "配偶查询"
+pattern = ["nr", "的", "老婆"]
+query_type = "spouse_query"
+priority = 10
+
+[[prolog_rules]]
+name = "配偶查询2"
+pattern = ["nr", "的", "老公"]
+query_type = "spouse_query"
+priority = 10
+
+[[prolog_rules]]
+name = "计数查询"
+pattern = ["有", "多少", "个", "n"]
+query_type = "count_query"
+priority = 8
+
+# 通用查询规则
+[[prolog_rules]]
+name = "属性查询"
+pattern = ["nr", "的", "n"]
+query_type = "property_query"
+priority = 5
+# 基础实体类型配置（仅保留系统正常运行必需的基础类型）
+[[entity_types]]
+label = "Person"
+examples = ["人物信息"]
+
+[[entity_types.properties]]
+name = "name"
+data_type = "string"
+required = true
+extraction_patterns = ["pos:nr"]
+
+[[entity_types.properties]]
+name = "age"
+data_type = "integer"
+required = false
+extraction_patterns = ["pos:m"]
+
+# 通用实体类型
+[[entity_types]]
+label = "Entity"
+examples = ["通用实体"]
+
+[[entity_types.properties]]
+name = "name"
+data_type = "string"
+required = true
+extraction_patterns = ["pos:nr", "pos:n"]
+
+[[entity_types.properties]]
+name = "property"
+data_type = "string"
+required = false
+extraction_patterns = ["pos:n", "pos:a", "pos:m"]# 基础提取规则（仅保留基本的规则模板）
+[[extraction_rules]]
+name = "人物信息提取"
+entity_type = "Person"
+priority = 10
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "m", "q"]
+property_mappings = { name = "pos:nr", age = "pos:m" }
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "v", "m", "q"]
+property_mappings = { name = "pos:nr", age = "pos:m" }
+
+# 通用实体提取规则
+[[extraction_rules]]
+name = "通用实体提取"
+entity_type = "Entity"
+priority = 1
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "v", "*"]
+property_mappings = { name = "pos:nr", property = "pos:*" }
+
+[[extraction_rules.patterns]]
+pos_pattern = ["n", "v", "*"]
+property_mappings = { name = "pos:n", property = "pos:*" }
+
+[messages]
+startup = "知识图谱系统启动中..."
+ready = "系统已就绪！"
+query_prompt = "请输入您的查询"
+import_prompt = "输入'导入：'开始导入知识"
+quit_prompt = "输入'quit'退出系统"
+importing = "正在导入知识..."
+no_knowledge_extracted = "未能从输入中提取到有效知识"
+cannot_understand = "抱歉，我不理解您的查询"
+process_error = "处理过程中出现错误"
+
+[synonyms.mappings]
+# 基础同义词映射（系统正常运行必需）
+"老婆" = "妻子"
+"老公" = "丈夫"

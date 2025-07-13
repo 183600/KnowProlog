@@ -1,0 +1,25 @@
+{
+  "@context": {
+    "name": "http://example.org/kg/name",
+    "age": "http://example.org/kg/age",
+    "knows": "http://example.org/kg/knows",
+    "Person": "http://example.org/kg/Person"
+  },
+  "@graph": [
+    {
+      "@id": "http://example.org/kg/entity/张三",
+      "@type": "Person",
+      "name": "张三",
+      "age": 25,
+      "knows": {
+        "@id": "http://example.org/kg/entity/李四"
+      }
+    },
+    {
+      "@id": "http://example.org/kg/entity/李四",
+      "@type": "Person",
+      "name": "李四",
+      "age": 30
+    }
+  ]
+}

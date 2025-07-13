@@ -1,0 +1,57 @@
+warning: unused import: `std::collections::HashMap`
+ --> src/main.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: `know_prolog` (bin "know_prolog") generated 1 warning (run `cargo fix --bin "know_prolog"` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.18s
+     Running `target/release/know_prolog`
+知识图谱系统启动中...
+系统已就绪！
+输入查询，例如：小明多大
+输入'录入：'开始导入知识
+输入'quit'退出系统
+
+> 正在导入知识...
+实体 - 类型: Country, 属性: {"name": "法国", "capital": "巴黎"}
+知识已成功保存
+
+> 正在导入知识...
+实体 - 类型: GeographicFeature, 属性: {"name": "珠穆朗玛峰", "altitude": "8848"}
+知识已成功保存
+
+> 正在导入知识...
+实体 - 类型: Chemical, 属性: {"formula": "H2O", "name": "水"}
+知识已成功保存
+
+> 正在导入知识...
+实体 - 类型: Literature, 属性: {"author": "莎士比亚", "name": "哈姆雷特"}
+知识已成功保存
+
+> 正在导入知识...
+实体 - 类型: ProgrammingLanguage, 属性: {"name": "Python", "birth_year": "1991"}
+知识已成功保存
+
+> 正在导入知识...
+未能从输入中提取到有效知识
+
+> 抱歉，我不理解您的查询
+
+> 抱歉，我不理解您的查询
+
+> 查询类型: chemical_formula_query, 实体: ["水"]
+生成的Prolog事实：
+oxigraph_entity('珠穆朗玛峰', 'geographicfeature', ['name-珠穆朗玛峰', 'altitude-8848']).
+oxigraph_entity('法国', 'country', ['name-法国', 'capital-巴黎']).
+oxigraph_entity('水', 'chemical', ['name-水', 'formula-H2O']).
+oxigraph_entity('Python', 'programminglanguage', ['birth_year-1991', 'name-Python']).
+oxigraph_entity('哈姆雷特', 'literature', ['name-哈姆雷特', 'author-莎士比亚']).
+
+Prolog查询: has_property('水', 'formula', Formula)
+
+thread 'main' panicked at /home/qwe12345678/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/scryer-prolog-0.9.4/src/machine/lib_machine.rs:74:14:
+Failed to parse query: IncompleteReduction(0, 38)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
