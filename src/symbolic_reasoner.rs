@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::abduction::{
+    self, AbductionEngine, AbductionReport, ClarificationReply, ClarificationSession, Hypothesis,
+    Scenario,
+};
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::entity_linker::{EntityLinker, LinkMethod};
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
@@ -9,7 +13,8 @@ use crate::ontology_alignment::{OntologyAligner, TermKind};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::resolution_engine::{
-    render_term, Atom, Clause, DerivedFact, ProofNode, ProofSource, ResolutionEngine, Term,
+    render_term, Atom, Clause, DerivedFact, ProofNode, ProofSource, ResolutionEngine, Solution,
+    Term,
 };
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{
@@ -73,6 +78,13 @@ pub struct GenerationState {
     pub order: GenerationOrder,
 }
 
+// 会话事实的持久化快照（定义域：全部为基事实，故只存谓词+常量名）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotAtom {
+    pub predicate: String,
+    pub terms: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueSnapshot {
     pub focus_entities: Vec<String>,
@@ -80,6 +92,9 @@ pub struct DialogueSnapshot {
     pub history: Vec<String>,
     #[serde(default)]
     pub generation: Option<GenerationState>,
+    // 跨会话临时信念：被采纳的假设事实（会话级，不写知识图谱）
+    #[serde(default)]
+    pub session_facts: Vec<SnapshotAtom>,
 }
 
 pub struct DialogueContext {
@@ -176,6 +191,7 @@ impl DialogueContext {
             last_predicate: self.last_predicate.clone(),
             history: self.history.clone(),
             generation: self.generation.clone(),
+            session_facts: Vec::new(),
         }
     }
 
@@ -258,6 +274,15 @@ pub struct SymbolicReasoner {
     associations: AssociationMiner,
     // 一阶归结引擎（事实 + 链接预测规则 + 关联规则）
     resolver: ResolutionEngine,
+    // 溯因·假设生成引擎（后向链失败前沿 → 候选假设 → 反事实模拟）
+    abduction: AbductionEngine,
+    // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
+    session_facts: Vec<Atom>,
+    // 当前澄清对话（把待定假设逆转为系统主动提问）
+    clarification: Option<ClarificationSession>,
+    // 最近一次溯因的目标与查询变量（澄清确认真后验证目标是否得证）
+    last_abduction_goal: Option<Atom>,
+    last_abduction_vars: Vec<String>,
 }
 
 impl SymbolicReasoner {
@@ -281,6 +306,12 @@ impl SymbolicReasoner {
             config.resolution_max_depth,
             config.resolution_max_solutions,
         );
+        let abduction = AbductionEngine::new(
+            config.resolution_max_depth,
+            config.abduction_max_hypotheses,
+        );
+        let mut abduction = abduction;
+        abduction.set_max_scenario_size(config.abduction_max_scenario_size);
         Self {
             config,
             aligner,
@@ -293,6 +324,11 @@ impl SymbolicReasoner {
             attributes: HashSet::new(),
             associations,
             resolver,
+            abduction,
+            session_facts: Vec::new(),
+            clarification: None,
+            last_abduction_goal: None,
+            last_abduction_vars: Vec::new(),
         }
     }
 
@@ -313,6 +349,8 @@ impl SymbolicReasoner {
     }
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
+        // 溯因统计只累积计数（谓词取值、类型分布、特征），不参与学习
+        self.abduction.observe_facts(facts);
         let mut added = 0usize;
         let mut entity_observed = false;
         let mut entity_type_changed = false;
@@ -423,6 +461,10 @@ impl SymbolicReasoner {
         }
         for rule in self.predictor.rules() {
             engine.add_clause(clause_from_path_rule(rule));
+        }
+        // 会话级假设事实必须在重建后重新注入（否则刷新知识图谱会丢失"采纳的假设"）
+        for atom in &self.session_facts {
+            engine.add_fact_atom(atom.clone());
         }
         self.resolver = engine;
     }
@@ -768,6 +810,494 @@ impl SymbolicReasoner {
         output
     }
 
+    // ------------------------- 溯因推理·假设生成 -------------------------
+
+    fn proposition_atom(&self, proposition: &semantic_entailment::Proposition) -> Atom {
+        match proposition.kind {
+            semantic_entailment::PropositionKind::TypeMembership => {
+                Atom::rel(PROOF_TYPE, &proposition.subject, &proposition.object)
+            }
+            _ => Atom::rel(&proposition.predicate, &proposition.subject, &proposition.object),
+        }
+    }
+
+    /// 把陈述句形式化为归结原子（否定句返回 None）
+    fn statement_atom(&self, text: &str) -> Option<Atom> {
+        let parser = self.proposition_parser();
+        let propositions = parser.parse(text);
+        let proposition = propositions.iter().find(|item| !item.negative)?;
+        Some(self.proposition_atom(proposition))
+    }
+
+    /// 把（可能含多个条件的）文本切分为归结原子列表
+    fn condition_atoms(&self, text: &str) -> Vec<Atom> {
+        let mut atoms: Vec<Atom> = Vec::new();
+        let mut candidates: Vec<String> = text
+            .split(['；', ';', '，', ','])
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if candidates.is_empty() {
+            candidates.push(text.trim().to_string());
+        }
+        let parser = self.proposition_parser();
+        for part in &candidates {
+            for proposition in parser.parse(part) {
+                if proposition.negative {
+                    continue;
+                }
+                let atom = self.proposition_atom(&proposition);
+                if !atoms.contains(&atom) {
+                    atoms.push(atom);
+                }
+            }
+        }
+        if atoms.is_empty() {
+            if let Some(atom) = self.statement_atom(text) {
+                atoms.push(atom);
+            }
+        }
+        atoms
+    }
+
+    /// 把问句/陈述解析为溯因目标（开放问句 → 谓词链目标；陈述句 → 单原子目标）
+    fn abduction_target(&self, trimmed: &str) -> Option<(Vec<Atom>, Vec<String>, String)> {
+        if let Some(plan) = self.planner.parse(trimmed) {
+            match plan {
+                QueryPlan::FindObject { segments } => {
+                    if let Some((entity, predicates)) = self.split_chain(&segments) {
+                        if !predicates.is_empty()
+                            && self.is_known_entity(&entity)
+                            && predicates.iter().all(|p| self.is_known_predicate(p))
+                        {
+                            let answer_var = "答案".to_string();
+                            let mut goals = Vec::new();
+                            let mut previous = Term::constant(&entity);
+                            for (index, predicate) in predicates.iter().enumerate() {
+                                let next = if index + 1 == predicates.len() {
+                                    Term::var(&answer_var)
+                                } else {
+                                    Term::var(&format!("V{}", index + 1))
+                                };
+                                goals.push(Atom::pattern(predicate, previous, next.clone()));
+                                previous = next;
+                            }
+                            let phrase = format!("{}的{}是谁", entity, predicates.join("的"));
+                            return Some((goals, vec![answer_var], phrase));
+                        }
+                    }
+                }
+                QueryPlan::Exist { subject, predicate } => {
+                    let entity = self.aligner.canonical_form(subject.trim());
+                    let predicate = self.aligner.canonical_form(predicate.trim());
+                    if !entity.is_empty() && !predicate.is_empty() {
+                        return Some((
+                            vec![Atom::pattern(
+                                &predicate,
+                                Term::constant(&entity),
+                                Term::var("答案"),
+                            )],
+                            vec!["答案".to_string()],
+                            format!("{}的{}是否存在", entity, predicate),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let atom = self.statement_atom(trimmed)?;
+        let phrase = self.render_atom_nl(&atom);
+        Some((vec![atom], Vec::new(), phrase))
+    }
+
+    /// 统一渲染溯因报告：非空假设（含联合场景成员）存为待定，供「采纳假设 N / 澄清」
+    fn finish_abduction_report(
+        &mut self,
+        report: AbductionReport,
+        phrase: &str,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> String {
+        if report.provable {
+            let render = |atom: &Atom| self.render_atom_nl(atom);
+            let mut output = abduction::render_report(&report, &render);
+            if !phrase.is_empty() {
+                output = format!("（问题：{}）\n{}", phrase, output);
+            }
+            return output;
+        }
+        if !goals.is_empty() {
+            self.last_abduction_goal = Some(report.goal.clone());
+            self.last_abduction_vars = query_vars.to_vec();
+        }
+        // 联合解释场景（多假设协同 + 注入验证）：成员也并入待定池
+        let scenarios = self.abduction.scenarios(&self.resolver, goals, query_vars);
+        // 循环假设过滤："假设目标本身成立"不算解释，不进入待定池/澄清队列
+        let mut hypotheses: Vec<abduction::Hypothesis> = report
+            .hypotheses
+            .iter()
+            .filter(|hypothesis| !goals.iter().any(|goal| goal == &hypothesis.atom))
+            .cloned()
+            .collect();
+        for scenario in &scenarios {
+            for hypothesis in &scenario.hypotheses {
+                if !hypotheses
+                    .iter()
+                    .any(|existing| existing.atom == hypothesis.atom)
+                {
+                    hypotheses.push(hypothesis.clone());
+                }
+            }
+        }
+        self.abduction.set_pending(hypotheses);
+        let render = |atom: &Atom| self.render_atom_nl(atom);
+        let mut output = abduction::render_report(&report, &render);
+        // 只有当"多条假设协同"确实能验证目标时才展示场景，避免噪音
+        let joint: Vec<Scenario> = scenarios
+            .into_iter()
+            .filter(|scenario| scenario.verified && scenario.size() >= 2)
+            .collect();
+        if !joint.is_empty() {
+            output.push('\n');
+            output.push_str(&abduction::render_scenarios(
+                &report.goal,
+                &report.frontier,
+                &joint,
+                &render,
+            ));
+        }
+        if !phrase.is_empty() {
+            output = format!("（问题：{}）\n{}", phrase, output);
+        }
+        output
+    }
+
+    /// 溯因陈述：能证明就给证明；不能证明就做失败前沿分析并生成候选假设
+    pub fn abduce_statement(&mut self, text: &str) -> Option<String> {
+        if !self.config.enable_abduction {
+            return None;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let atom = self.statement_atom(trimmed)?;
+        let goals = vec![atom.clone()];
+        let report = self.abduction.analyze(&self.resolver, &goals, &[]);
+        Some(self.finish_abduction_report(report, "", &goals, &[]))
+    }
+
+    /// 溯因问句：把开放问句拆成谓词链目标，失败前沿生成候选答案假设
+    pub fn hypothesis_answer(&mut self, question: &str) -> Option<String> {
+        if !self.config.enable_abduction {
+            return None;
+        }
+        let trimmed = question
+            .trim()
+            .trim_end_matches(['？', '?', '。', '！', '!', ' ']);
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (goals, query_vars, phrase) = self.abduction_target(trimmed)?;
+        let report = self.abduction.analyze(&self.resolver, &goals, &query_vars);
+        let solution = report.solutions.first().cloned();
+        let mut output = self.finish_abduction_report(report, &phrase, &goals, &query_vars);
+        if let Some(solution) = solution {
+            let answer = solution
+                .bindings
+                .get("答案")
+                .cloned()
+                .unwrap_or_else(|| "?".to_string());
+            output = format!(
+                "后向链推理给出答案：「{}」（证明置信度 {:.2}）\n{}",
+                answer, solution.confidence, output
+            );
+        }
+        Some(output)
+    }
+
+    /// 生成式联合解释：枚举假设组合 + 注入克隆引擎验证 + 输出可证场景
+    pub fn scenario_report(&mut self, text: &str) -> String {
+        if !self.config.enable_abduction {
+            return "溯因推理未启用（config.toml [reasoning] enable_abduction = false）。".to_string();
+        }
+        let trimmed = text
+            .trim()
+            .trim_end_matches(['？', '?', '。', '！', '!', ' ']);
+        if trimmed.is_empty() {
+            return "请输入要解释的陈述或问句，例如：场景：张三的师祖是赵六".to_string();
+        }
+        let Some((goals, query_vars, phrase)) = self.abduction_target(trimmed) else {
+            return format!(
+                "无法把「{}」形式化为可联合解释的目标。支持句式：S的P是O / S的P是谁。",
+                trimmed
+            );
+        };
+        let report = self.abduction.analyze(&self.resolver, &goals, &query_vars);
+        if report.provable {
+            let render = |atom: &Atom| self.render_atom_nl(atom);
+            return format!(
+                "目标「{}」已可由现有知识证明，无需联合假设：\n{}",
+                phrase,
+                abduction::render_report(&report, &render)
+            );
+        }
+        self.last_abduction_goal = Some(report.goal.clone());
+        self.last_abduction_vars = query_vars.clone();
+        let scenarios = self.abduction.scenarios(&self.resolver, &goals, &query_vars);
+        // 循环假设过滤："假设目标本身成立"不算解释，不进入待定池/澄清队列
+        let mut pending: Vec<Hypothesis> = report
+            .hypotheses
+            .iter()
+            .filter(|hypothesis| !goals.iter().any(|goal| goal == &hypothesis.atom))
+            .cloned()
+            .collect();
+        for scenario in &scenarios {
+            for hypothesis in &scenario.hypotheses {
+                if !pending
+                    .iter()
+                    .any(|existing| existing.atom == hypothesis.atom)
+                {
+                    pending.push(hypothesis.clone());
+                }
+            }
+        }
+        self.abduction.set_pending(pending);
+        let render = |atom: &Atom| self.render_atom_nl(atom);
+        abduction::render_scenarios(&report.goal, &report.frontier, &scenarios, &render)
+    }
+
+    /// 把一条基事实加入会话事实集（不写知识图谱；归结引擎重建后依然保留）
+    fn adopt_atom(&mut self, atom: Atom) -> bool {
+        if !atom.is_ground() {
+            return false;
+        }
+        let mut added = false;
+        if self.config.enable_resolution && self.resolver.add_fact_atom(atom.clone()) {
+            added = true;
+        }
+        if !self.session_facts.contains(&atom) {
+            self.session_facts.push(atom);
+            added = true;
+        }
+        added
+    }
+
+    /// 采纳第 index（1 起）条待定假设：加入会话归结事实集（不写知识图谱）
+    pub fn adopt_hypothesis(&mut self, index: usize) -> Option<String> {
+        let hypothesis = self.abduction.take_pending(index)?;
+        let atom = hypothesis.atom.clone();
+        let rendered = self.render_atom_nl(&atom);
+        if !hypothesis.is_adoptable() {
+            return Some(format!(
+                "假设 {}「{}」仍含未绑定变量，无法直接采纳；请提供更具体的陈述。",
+                index, rendered
+            ));
+        }
+        self.adopt_atom(atom);
+        let reasons = hypothesis.reasons.join("；");
+        self.abduction.adopt(hypothesis);
+        Some(format!(
+            "已采纳假设 {}：{}。该事实已加入本轮会话的归结事实集（未写入知识图谱），后续「证明/推理链/溯因」会使用它。\n  依据：{}",
+            index, rendered, reasons
+        ))
+    }
+
+    pub fn pending_hypotheses_report(&self) -> String {
+        let render = |atom: &Atom| self.render_atom_nl(atom);
+        abduction::render_pending(self.abduction.pending(), &render)
+    }
+
+    /// 供外部查询当前待定假设
+    pub fn pending_hypotheses(&self) -> &[Hypothesis] {
+        self.abduction.pending()
+    }
+
+    /// 会话级假设事实（被采纳、跨会话持久化的临时信念）
+    pub fn session_facts(&self) -> &[Atom] {
+        &self.session_facts
+    }
+
+    // ------------------------- 对话式澄清（把"猜"升级为"问"） -------------------------
+
+    /// 开始澄清对话：把待定假设逐条逆转为「是否成立」的提问
+    pub fn start_clarification(&mut self) -> Option<String> {
+        if !self.config.enable_abduction || !self.config.enable_clarification {
+            return None;
+        }
+        let session = ClarificationSession::start(self.abduction.pending());
+        if session.is_finished() {
+            return None;
+        }
+        self.clarification = Some(session);
+        Some(self.render_clarification_prompt())
+    }
+
+    fn render_clarification_prompt(&self) -> String {
+        let render = |atom: &Atom| self.render_atom_nl(atom);
+        match &self.clarification {
+            Some(session) => abduction::render_clarification_question(session, &render),
+            None => "【对话式澄清】没有进行中的澄清会话。".to_string(),
+        }
+    }
+
+    pub fn clarification_active(&self) -> bool {
+        self.clarification
+            .as_ref()
+            .map(|session| !session.is_finished())
+            .unwrap_or(false)
+    }
+
+    /// 处理用户对当前澄清问题的回答（是 / 不是 / 不知道）
+    pub fn answer_clarification(&mut self, text: &str) -> Option<String> {
+        let reply = {
+            let session = self.clarification.as_mut()?;
+            session.respond(text)
+        };
+        match reply {
+            ClarificationReply::Confirmed(hypothesis) => {
+                self.adopt_atom(hypothesis.atom.clone());
+                let mut output = format!(
+                    "✓ 已确认假设：{}。已加入会话事实集（未写知识图谱）。",
+                    self.render_atom_nl(&hypothesis.atom)
+                );
+                if !hypothesis.reasons.is_empty() {
+                    output.push_str(&format!("\n  依据：{}", hypothesis.reasons.join("；")));
+                }
+                output.push_str(&self.clarification_follow_up());
+                Some(output)
+            }
+            ClarificationReply::Rejected(hypothesis) => Some(format!(
+                "✗ 已排除假设：{}。{}",
+                self.render_atom_nl(&hypothesis.atom),
+                self.clarification_follow_up()
+            )),
+            ClarificationReply::Deferred(hypothesis) => Some(format!(
+                "？暂记为不确定：{}。{}",
+                self.render_atom_nl(&hypothesis.atom),
+                self.clarification_follow_up()
+            )),
+            ClarificationReply::Unrecognized => Some(format!(
+                "没有理解回答（请用「是 / 不是 / 不知道」）。\n{}",
+                self.render_clarification_prompt()
+            )),
+            ClarificationReply::Finished => Some(self.finish_clarification_session()),
+        }
+    }
+
+    /// 澄清推进：若原始目标已得证则汇报答案并结束会话；否则继续下一问
+    fn clarification_follow_up(&mut self) -> String {
+        if let Some((goal, solution)) = self.clarified_goal_solution() {
+            let mut text = format!(
+                "\n  → 目标「{}」现在已可证明（置信度 {:.2}）",
+                self.render_atom_nl(&goal),
+                solution.confidence
+            );
+            if let Some(answer) = solution.bindings.get("答案") {
+                if !answer.is_empty() {
+                    text.push_str(&format!("：答案是「{}」", answer));
+                }
+            }
+            text.push_str("。\n");
+            text.push_str(&self.finish_clarification_session());
+            return text;
+        }
+        if self.clarification_active() {
+            format!("\n{}", self.render_clarification_prompt())
+        } else {
+            format!("\n{}", self.finish_clarification_session())
+        }
+    }
+
+    /// 原溯因目标是否已被会话事实证明（含"答案"绑定）
+    fn clarified_goal_solution(&self) -> Option<(Atom, Solution)> {
+        let goal = self.last_abduction_goal.clone()?;
+        let vars = self.last_abduction_vars.clone();
+        let solution = self
+            .resolver
+            .solve(std::slice::from_ref(&goal), &vars)
+            .into_iter()
+            .next()?;
+        Some((goal, solution))
+    }
+
+    fn finish_clarification_session(&mut self) -> String {
+        let Some(session) = self.clarification.take() else {
+            return "【对话式澄清】没有进行中的澄清会话。".to_string();
+        };
+        let render = |atom: &Atom| self.render_atom_nl(atom);
+        let mut output = abduction::render_clarification_summary(&session, &render);
+        if let Some((goal, solution)) = self.clarified_goal_solution() {
+            output.push_str(&format!(
+                "\n  → 当前目标「{}」已可证明（置信度 {:.2}）",
+                self.render_atom_nl(&goal),
+                solution.confidence
+            ));
+            if let Some(answer) = solution.bindings.get("答案") {
+                if !answer.is_empty() {
+                    output.push_str(&format!("：答案是「{}」", answer));
+                }
+            }
+            output.push('。');
+        }
+        output
+    }
+
+    /// 手动结束澄清会话：输出已确认/否定/不确定清单
+    pub fn stop_clarification(&mut self) -> Option<String> {
+        self.clarification.as_ref()?;
+        Some(self.finish_clarification_session())
+    }
+
+    pub fn clarification_progress(&self) -> Option<String> {
+        self.clarification
+            .as_ref()
+            .map(ClarificationSession::progress_text)
+    }
+
+    /// 反事实模拟："如果……那么……" 把条件当临时假设，正向链推导后用后自动回滚
+    pub fn what_if_report(&mut self, text: &str) -> Option<String> {
+        if !self.config.enable_abduction {
+            return None;
+        }
+        let trimmed = text
+            .trim()
+            .trim_end_matches(['。', '！', '!', '？', '?', ' ']);
+        if trimmed.is_empty() {
+            return None;
+        }
+        // 只取条件部分："如果A那么B" / "如果A，就B" / "如果A则B" → A
+        let condition = trimmed
+            .strip_prefix("如果")
+            .or_else(|| trimmed.strip_prefix("假如"))
+            .or_else(|| trimmed.strip_prefix("假设"))
+            .unwrap_or(trimmed);
+        let condition = ["那么", "则", "，就", ",就"]
+            .iter()
+            .filter_map(|separator| condition.find(separator))
+            .min()
+            .map(|index| &condition[..index])
+            .unwrap_or(condition)
+            .trim()
+            .trim_end_matches(['，', ','])
+            .trim();
+        if condition.is_empty() {
+            return None;
+        }
+        let assumptions = self.condition_atoms(condition);
+        if assumptions.is_empty() {
+            return None;
+        }
+        let result = self.abduction.what_if(
+            &self.resolver,
+            &assumptions,
+            self.resolver.max_depth(),
+            20,
+        );
+        let render = |atom: &Atom| self.render_atom_nl(atom);
+        Some(abduction::render_what_if(&result, &render))
+    }
+
     // 生成自检：逐句回译为命题并验证是否被知识图谱蕴含（对抗"幻觉"）
     fn generation_self_check(&self, text: &str) -> Option<String> {
         if !self.config.enable_entailment {
@@ -894,6 +1424,9 @@ impl SymbolicReasoner {
     }
 
     fn render_atom_nl(&self, atom: &Atom) -> String {
+        if !atom.is_ground() {
+            return atom.display();
+        }
         let names: Vec<String> = atom.terms.iter().map(render_term).collect();
         if &*atom.predicate == PROOF_HAS && names.len() == 2 {
             return format!("{} 具有 {}", names[0], names[1]);
@@ -1897,12 +2430,23 @@ impl SymbolicReasoner {
                 format!("「{}」（已讲 {} 句，{}）", state.entity, state.shown, order)
             })
             .unwrap_or_else(|| "（无）".to_string());
+        let session_info = if self.session_facts.is_empty() {
+            "（无）".to_string()
+        } else {
+            format!("{} 条", self.session_facts.len())
+        };
+        let clarify = self
+            .clarification_progress()
+            .map(|progress| format!("进行中（{}）", progress))
+            .unwrap_or_else(|| "（无）".to_string());
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，澄清 {}。",
             focus,
             predicate,
             generation,
-            self.context.history().len()
+            self.context.history().len(),
+            session_info,
+            clarify
         )
     }
 
@@ -1912,7 +2456,20 @@ impl SymbolicReasoner {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let snapshot = self.context.snapshot();
+        let mut snapshot = self.context.snapshot();
+        snapshot.session_facts = self
+            .session_facts
+            .iter()
+            .filter(|atom| atom.is_ground())
+            .map(|atom| SnapshotAtom {
+                predicate: atom.predicate.to_string(),
+                terms: atom
+                    .terms
+                    .iter()
+                    .map(|term| term.name().to_string())
+                    .collect(),
+            })
+            .collect();
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
@@ -1926,6 +2483,29 @@ impl SymbolicReasoner {
             return false;
         };
         self.context.restore(&snapshot);
+        // 跨会话临时信念：恢复被采纳的会话假设（仍不写知识图谱）
+        let mut restored: Vec<Atom> = Vec::new();
+        for entry in &snapshot.session_facts {
+            if entry.predicate.is_empty() || entry.terms.is_empty() {
+                continue;
+            }
+            let terms: Vec<Term> = entry
+                .terms
+                .iter()
+                .map(|name| Term::constant(name))
+                .collect();
+            let atom = Atom::new(&entry.predicate, terms);
+            if atom.is_ground() && !restored.contains(&atom) {
+                restored.push(atom);
+            }
+        }
+        if !restored.is_empty() {
+            self.abduction.restore_adopted(restored.clone());
+            self.session_facts = restored;
+            if self.config.enable_resolution {
+                self.rebuild_resolver();
+            }
+        }
         true
     }
 
@@ -2004,6 +2584,10 @@ mod tests {
             association_min_support: 0.2,
             association_min_confidence: 0.5,
             association_min_lift: 1.05,
+            enable_abduction: true,
+            abduction_max_hypotheses: 5,
+            abduction_max_scenario_size: 2,
+            enable_clarification: true,
         }
     }
 
@@ -2614,5 +3198,253 @@ mod tests {
             .expect("已知实体应能续写");
         assert!(text.contains("关联规则联想"), "实际：{}", text);
         assert!(text.contains("国籍"));
+    }
+
+    #[test]
+    fn test_abduce_statement_generates_explained_hypotheses() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        // 张三的师祖是赵六：需要补全 师傅(李四, 赵六) 才能沿规则链证明
+        let report = reasoner
+            .abduce_statement("张三的师祖是赵六")
+            .expect("陈述应可形式化为溯因目标");
+        assert!(report.contains("假设生成"), "实际：{}", report);
+        assert!(report.contains("失败前沿"), "实际：{}", report);
+        assert!(report.contains("师傅") && report.contains("李四") && report.contains("赵六"));
+        assert!(report.contains("可信度"));
+        let pending = reasoner.pending_hypotheses();
+        assert!(!pending.is_empty(), "应暂存候选假设供采纳");
+        assert!(pending.iter().all(|hypothesis| hypothesis.atom.is_ground()));
+    }
+
+    #[test]
+    fn test_adopt_hypothesis_enables_session_proof() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.adopt_hypothesis(1).is_none(), "无待定假设时应返回 None");
+        let _ = reasoner.abduce_statement("张三的师祖是赵六");
+        assert!(reasoner
+            .resolution_proof_report("张三的师祖是赵六")
+            .contains("未得证"));
+        let message = reasoner
+            .adopt_hypothesis(1)
+            .expect("应能采纳第 1 条假设");
+        assert!(message.contains("已采纳假设"), "实际：{}", message);
+        // 采纳后：假设进入会话归结事实集，后向链即可证明
+        let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
+        assert!(proof.contains("得证"), "实际：{}", proof);
+        assert!(proof.contains("赵六"));
+    }
+
+    #[test]
+    fn test_hypothesis_answer_for_missing_link() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        // 赵六没有师傅记录：开放问句应生成候选取值假设
+        let report = reasoner
+            .hypothesis_answer("赵六的师傅是谁")
+            .expect("已知实体+已知谓词应可溯因");
+        assert!(report.contains("假设生成"), "实际：{}", report);
+        assert!(report.contains("候选假设"), "实际：{}", report);
+        assert!(report.contains("师傅"));
+        let pending = reasoner.pending_hypotheses();
+        assert!(!pending.is_empty());
+        let displays: Vec<String> = pending.iter().map(|h| h.atom.display()).collect();
+        assert!(
+            pending
+                .iter()
+                .any(|hypothesis| hypothesis.atom.display().contains("师傅")),
+            "候选假设应补全师傅关系，实际：{:?}",
+            displays
+        );
+    }
+
+    #[test]
+    fn test_what_if_report_derives_and_rolls_back() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner
+            .what_if_report("如果李四的师傅是赵六")
+            .expect("条件句应可解析为反事实假设");
+        assert!(report.contains("反事实模拟"), "实际：{}", report);
+        assert!(report.contains("赵六"), "实际：{}", report);
+        assert!(report.contains("师祖"), "应沿师傅→师祖规则推出新结论：{}", report);
+        // 模拟回滚：原知识库不能被改变
+        let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
+        assert!(proof.contains("未得证"), "反事实模拟必须回滚：{}", proof);
+    }
+
+    #[test]
+    fn test_provable_statement_gets_proof_not_hypotheses() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner
+            .abduce_statement("张三的师祖是王五")
+            .expect("可证陈述应返回证明");
+        assert!(report.contains("后向链得证"), "实际：{}", report);
+        assert!(report.contains("证明树"));
+        assert!(reasoner.pending_hypotheses().is_empty());
+    }
+
+    // ---- 第 2 轮：生成式联合解释 + 对话式澄清 + 跨会话临时信念 ----
+
+    fn sparse_master_facts() -> Vec<PrologFact> {
+        // 只有 李四→王五 一条师傅关系：证明 张三的师祖是赵六 需要同时补两条边
+        let mut facts = vec![
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "王五".to_string(),
+            },
+            // 让"师祖"成为已知谓词（解析需要），与目标无关
+            PrologFact::Relation {
+                from: "钱七".to_string(),
+                rel_type: "师祖".to_string(),
+                to: "孙八".to_string(),
+            },
+        ];
+        for name in ["张三", "李四", "王五", "赵六", "钱七", "孙八"] {
+            facts.push(PrologFact::Entity {
+                name: name.to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            });
+        }
+        facts
+    }
+
+    fn teacher_rule() -> Clause {
+        Clause::new(
+            Atom::pattern("师祖", Term::var("x"), Term::var("y")),
+            vec![
+                Atom::pattern("师傅", Term::var("x"), Term::var("z")),
+                Atom::pattern("师傅", Term::var("z"), Term::var("y")),
+            ],
+            0.9,
+            "测试规则：师傅传递",
+        )
+    }
+
+    #[test]
+    fn test_scenario_report_verifies_joint_explanation() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&sparse_master_facts());
+        reasoner.resolver.add_clause(teacher_rule());
+        let report = reasoner.scenario_report("张三的师祖是赵六");
+        assert!(report.contains("生成式联合解释"), "实际：{}", report);
+        assert!(
+            report.contains("2 条假设"),
+            "应枚举出两条假设的联合场景：{}",
+            report
+        );
+        assert!(
+            report.contains("注入后目标可证"),
+            "联合场景应通过注入验证：{}",
+            report
+        );
+        assert!(report.contains("验证证明"), "应展示验证证明：{}", report);
+        assert!(
+            !reasoner.pending_hypotheses().is_empty(),
+            "场景成员应进入待定池，供采纳/澄清"
+        );
+    }
+
+    #[test]
+    fn test_clarification_confirms_hypothesis_and_proves_goal() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner
+            .abduce_statement("张三的师祖是赵六")
+            .expect("应能溯因");
+        assert!(report.contains("假设生成"), "实际：{}", report);
+        let question = reasoner.start_clarification().expect("有待定假设即可澄清");
+        assert!(
+            question.contains("请确认") || question.contains("是否成立"),
+            "实际：{}",
+            question
+        );
+        let response = reasoner.answer_clarification("是的").expect("应处理确认");
+        assert!(response.contains("已确认假设"), "实际：{}", response);
+        assert!(response.contains("已可证明"), "确认后目标应可证明：{}", response);
+        assert!(!reasoner.clarification_active(), "目标得证后澄清应结束");
+        let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
+        assert!(proof.contains("得证"), "实际：{}", proof);
+        assert_eq!(reasoner.session_facts().len(), 1);
+    }
+
+    #[test]
+    fn test_clarification_reject_and_defer_flow() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner
+            .abduce_statement("张三的师祖是赵六")
+            .expect("应能溯因");
+        reasoner.start_clarification().expect("应能开始澄清");
+        let rejected = reasoner.answer_clarification("不是").expect("应处理否定");
+        assert!(rejected.contains("已排除假设"), "实际：{}", rejected);
+        if reasoner.clarification_active() {
+            let deferred = reasoner
+                .answer_clarification("不确定")
+                .expect("应处理不确定");
+            assert!(
+                deferred.contains("暂记为不确定") || deferred.contains("澄清结束"),
+                "实际：{}",
+                deferred
+            );
+        }
+        assert!(
+            reasoner.session_facts().is_empty(),
+            "否定/不确定都不应产生会话事实"
+        );
+    }
+
+    #[test]
+    fn test_session_facts_persist_across_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.abduce_statement("张三的师祖是赵六");
+        let message = reasoner.adopt_hypothesis(1).expect("应能采纳");
+        assert!(message.contains("已采纳假设"), "实际：{}", message);
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_session_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
+        let proof = restored.resolution_proof_report("张三的师祖是赵六");
+        assert!(proof.contains("得证"), "跨会话恢复的假设应参与证明：{}", proof);
+        assert!(
+            restored.dialogue_summary().contains("会话假设 1 条"),
+            "对话记忆应显示会话假设：{}",
+            restored.dialogue_summary()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_session_facts_survive_resolver_rebuild() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.abduce_statement("张三的师祖是赵六");
+        reasoner.adopt_hypothesis(1).expect("应能采纳");
+        assert!(reasoner
+            .resolution_proof_report("张三的师祖是赵六")
+            .contains("得证"));
+        // 再观察新关系会触发归结引擎重建：会话事实必须在重建后重新注入
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "赵六".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "钱七".to_string(),
+        }]);
+        let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
+        assert!(
+            proof.contains("得证"),
+            "重建后采纳的假设不应丢失：{}",
+            proof
+        );
     }
 }

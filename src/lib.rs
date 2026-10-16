@@ -32,6 +32,7 @@ pub mod entity_linker;
 pub mod symbolic_generator;
 pub mod semantic_entailment;
 pub mod resolution_engine;
+pub mod abduction;
 pub mod association_miner;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
@@ -106,6 +107,14 @@ pub struct ReasoningConfig {
     pub association_min_confidence: f64,
     #[serde(default = "default_association_min_lift")]
     pub association_min_lift: f64,
+    #[serde(default = "default_enable_abduction")]
+    pub enable_abduction: bool,
+    #[serde(default = "default_abduction_max_hypotheses")]
+    pub abduction_max_hypotheses: usize,
+    #[serde(default = "default_abduction_max_scenario_size")]
+    pub abduction_max_scenario_size: usize,
+    #[serde(default = "default_enable_clarification")]
+    pub enable_clarification: bool,
 }
 
 fn default_enable_resolution() -> bool {
@@ -134,6 +143,22 @@ fn default_association_min_confidence() -> f64 {
 
 fn default_association_min_lift() -> f64 {
     1.05
+}
+
+fn default_enable_abduction() -> bool {
+    true
+}
+
+fn default_abduction_max_hypotheses() -> usize {
+    5
+}
+
+fn default_abduction_max_scenario_size() -> usize {
+    2
+}
+
+fn default_enable_clarification() -> bool {
+    true
 }
 
 fn default_enable_entailment() -> bool {
@@ -207,6 +232,10 @@ impl Default for ReasoningConfig {
             association_min_support: default_association_min_support(),
             association_min_confidence: default_association_min_confidence(),
             association_min_lift: default_association_min_lift(),
+            enable_abduction: default_enable_abduction(),
+            abduction_max_hypotheses: default_abduction_max_hypotheses(),
+            abduction_max_scenario_size: default_abduction_max_scenario_size(),
+            enable_clarification: default_enable_clarification(),
         }
     }
 }

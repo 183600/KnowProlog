@@ -217,6 +217,7 @@ pub struct DerivedFact {
     pub depth: usize,
 }
 
+#[derive(Clone)]
 pub struct ResolutionEngine {
     facts: HashSet<Atom>,
     facts_by_pred: HashMap<Rc<str>, Vec<Atom>>,
@@ -250,6 +251,32 @@ impl ResolutionEngine {
 
     pub fn clause_count(&self) -> usize {
         self.clauses.len()
+    }
+
+    /// 某个谓词下的全部基事实（供溯因/假设生成做失败前沿分析）
+    pub fn facts_for(&self, predicate: &str) -> &[Atom] {
+        self.facts_by_pred
+            .get(predicate)
+            .map(|atoms| atoms.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 头谓词匹配的子句（规则），供后向链展开
+    pub fn clauses_for(&self, predicate: &str) -> Vec<&Clause> {
+        self.rules_by_head
+            .get(predicate)
+            .map(|indices| indices.iter().map(|&index| &self.clauses[index]).collect())
+            .unwrap_or_default()
+    }
+
+    /// 是否为已知基事实
+    pub fn has_fact(&self, atom: &Atom) -> bool {
+        self.facts.contains(atom)
+    }
+
+    /// 全部基事实（供反事实模拟做新旧对比）
+    pub fn all_facts(&self) -> impl Iterator<Item = &Atom> {
+        self.facts.iter()
     }
 
     /// 加入基事实；已存在返回 false
@@ -634,7 +661,7 @@ fn apply_term(subst: &Substitution, term: &Term) -> Term {
     resolve_term(term, subst)
 }
 
-fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
+pub fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
     Atom {
         predicate: atom.predicate.clone(),
         terms: atom.terms.iter().map(|term| apply_term(subst, term)).collect(),
@@ -721,7 +748,7 @@ impl<'a> Renamer<'a> {
     }
 }
 
-fn freshen_clause(clause: &Clause, tag: usize) -> Clause {
+pub fn freshen_clause(clause: &Clause, tag: usize) -> Clause {
     let mut renamer = Renamer::new(tag);
     Clause {
         head: renamer.atom(&clause.head),

@@ -33,6 +33,10 @@ enable_association_rules = true        # 是否启用关联规则挖掘（支持
 association_min_support = 0.2          # 关联规则最小支持度（实体篮子占比）
 association_min_confidence = 0.5       # 关联规则最小置信度
 association_min_lift = 1.05            # 关联规则最小提升度（>1 才说明非随机共现）
+enable_abduction = true               # 是否启用溯因推理·假设生成（后向链失败前沿 + 候选假设排序，纯符号）
+abduction_max_hypotheses = 5          # 单次溯因最多生成的候选假设数
+abduction_max_scenario_size = 2       # 联合解释场景最多包含的假设条数（多假设协同证明目标）
+enable_clarification = true           # 是否启用对话式澄清（系统把待定假设逆转为「是/不是」提问并记忆回答）
 
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]

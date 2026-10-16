@@ -214,6 +214,59 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 对话式澄清进行中：优先把输入当作对当前提问的回答（是 / 不是 / 不知道）
+        if symbolic_reasoner.clarification_active()
+            && !matches!(input, "结束澄清" | "停止澄清" | "退出澄清" | "quit")
+            && !is_command_like(input)
+        {
+            match symbolic_reasoner.answer_clarification(input) {
+                Some(text) => println!("{}", text),
+                None => println!("（澄清会话已结束）"),
+            }
+            println!();
+            continue;
+        }
+
+        // 开始对话式澄清：把待定假设逆转为系统主动提问
+        if matches!(input, "澄清" | "开始澄清" | "澄清提问" | "提问确认") {
+            match symbolic_reasoner.start_clarification() {
+                Some(text) => println!("{}", text),
+                None => println!(
+                    "当前没有可澄清的待定假设。可先输入「溯因：<陈述>」或「场景：<问句>」生成候选假设。"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 结束澄清会话：输出已确认/否定/不确定清单
+        if matches!(input, "结束澄清" | "停止澄清" | "退出澄清") {
+            match symbolic_reasoner.stop_clarification() {
+                Some(text) => println!("{}", text),
+                None => println!("当前没有进行中的澄清会话。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 生成式联合解释：枚举假设组合并注入验证，输出"哪些假设一起才能解释目标"
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "场景：", "场景:", "联合解释：", "联合解释:", "解释场景：", "解释场景:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要联合解释的目标，例如：场景：张三的师祖是赵六");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.scenario_report(target));
+            }
+            println!();
+            continue;
+        }
+
         // 形式化语义与语义蕴含：把陈述句解析为逻辑形式并判定蕴含/矛盾/未知
         if let Some(target) = strip_any_prefix(
             input,
@@ -388,6 +441,88 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
         if input == "推理发现" || input == "推导发现" {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             println!("{}", symbolic_reasoner.derived_facts_report(10));
+            println!();
+            continue;
+        }
+
+        // 溯因·假设生成：后向链失败前沿 → 候选假设（可证明则直接给证明）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["溯因：", "溯因:", "假设生成：", "假设生成:", "为什么：", "为什么:"],
+        ) {
+            let target = target.trim().trim_end_matches(['？', '?', '。', ' ']);
+            if target.is_empty() {
+                println!("请提供要溯因的陈述，例如：溯因：张三是赵六的师祖");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                match symbolic_reasoner.abduce_statement(target) {
+                    Some(text) => println!("{}", text),
+                    None => println!(
+                        "无法把「{}」形式化为可溯因的目标。支持句式：S的P是O / O是S的P / S是类型。",
+                        target
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // "为什么……？"：先尝试后向链证明，未得证则生成假设解释
+        if let Some(target) = input.strip_prefix("为什么") {
+            let target = target.trim().trim_end_matches(['？', '?', '。', ' ']);
+            if target.is_empty() {
+                println!("请提供要解释的结论，例如：为什么张三是王五的师祖？");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                match symbolic_reasoner.abduce_statement(target) {
+                    Some(text) => println!("{}", text),
+                    None => println!(
+                        "无法把「{}」形式化为可解释的目标。支持句式：S的P是O / O是S的P / S是类型。",
+                        target
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 反事实模拟："如果……那么……" / "假设：……"，正向链推演后自动回滚
+        if input.starts_with("如果")
+            || input.starts_with("假如")
+            || strip_any_prefix(input, &["反事实：", "反事实:", "假设：", "假设:", "假如：", "假如:"])
+                .is_some()
+        {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            match symbolic_reasoner.what_if_report(input) {
+                Some(text) => println!("{}", text),
+                None => println!(
+                    "无法把条件形式化为可模拟的假设。支持句式：如果S的P是O那么… / 假设：S是类型。"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 采纳待定假设：加入本轮会话事实集（不写知识图谱）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["采纳假设", "采纳假设：", "采纳假设:", "确认假设", "确认假设：", "确认假设:"],
+        ) {
+            match parse_hypothesis_index(target) {
+                Some(index) => println!("{}", symbolic_reasoner.adopt_hypothesis(index)
+                    .unwrap_or_else(|| format!("没有第 {} 条待定假设；可用「待定假设」查看列表。", index))),
+                None => println!(
+                    "请给出假设编号，例如：采纳假设 1。当前待定假设：\n{}",
+                    symbolic_reasoner.pending_hypotheses_report()
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 待定假设列表
+        if matches!(input, "待定假设" | "假设列表" | "候选假设" | "溯因假设") {
+            println!("{}", symbolic_reasoner.pending_hypotheses_report());
             println!();
             continue;
         }
@@ -936,15 +1071,32 @@ async fn try_symbolic_reasoning(
             symbolic_reasoner.observe_facts(&facts);
         }
     }
-    // 陈述句优先：形式化语义 + 语义蕴含判定（校验用户断言）
+    // 陈述句优先：形式化语义 + 语义蕴含判定（校验用户断言）；
+    // 判为"未知"时追加溯因分析——后向链失败前沿生成候选假设（可解释的推测）
     if !contains_question_marker(input) {
         let report = symbolic_reasoner.entailment_report(input);
         if !report.starts_with("形式化失败") {
+            if report.contains("未知（证据不足）") {
+                if let Some(abduction) = symbolic_reasoner.abduce_statement(input) {
+                    return Some(format!("{}\n{}", report, abduction));
+                }
+            }
             return Some(report);
         }
     }
     if let Some(answer) = symbolic_reasoner.answer(input) {
+        // 图谱无记录时，用溯因假设生成候选答案（LLM 式的"猜测 + 理由"）
+        if answer.contains("没有记录") || answer.contains("没有相关记录") || answer.contains("数量为 0")
+        {
+            if let Some(abduction) = symbolic_reasoner.hypothesis_answer(input) {
+                return Some(format!("{}\n{}", answer, abduction));
+            }
+        }
         return Some(answer);
+    }
+    // 开放问句无直接答案：尝试溯因生成候选假设
+    if let Some(abduction) = symbolic_reasoner.hypothesis_answer(input) {
+        return Some(abduction);
     }
     // 逻辑问答失败时，回退到"知识图谱即语言模型"的生成式介绍
     let entity = symbolic_reasoner.best_linked_entity(input)?;
@@ -959,10 +1111,82 @@ fn contains_question_marker(text: &str) -> bool {
     .any(|marker| text.contains(marker))
 }
 
+/// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
+fn is_command_like(input: &str) -> bool {
+    const COMMANDS: [&str; 42] = [
+        "溯因",
+        "假设生成",
+        "为什么",
+        "证明",
+        "归结",
+        "推理链",
+        "寻找证明",
+        "场景",
+        "联合解释",
+        "解释场景",
+        "采纳假设",
+        "确认假设",
+        "待定假设",
+        "假设列表",
+        "候选假设",
+        "介绍",
+        "生成介绍",
+        "续写",
+        "接龙",
+        "补全",
+        "关联规则",
+        "关联联想",
+        "联想",
+        "推理发现",
+        "推导发现",
+        "对齐报告",
+        "本体对齐",
+        "推理规则",
+        "链接预测规则",
+        "实体链接",
+        "识别实体",
+        "判断",
+        "蕴含",
+        "校验",
+        "形式化",
+        "相似实体",
+        "语义相似",
+        "对话记忆",
+        "如果",
+        "假如",
+        "反事实",
+        "澄清",
+    ];
+    COMMANDS.iter().any(|command| input.starts_with(command))
+}
+
 fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     prefixes
         .iter()
         .find_map(|prefix| input.strip_prefix(prefix))
+}
+
+/// 解析「采纳假设 N」中的编号：支持阿拉伯数字与「一、二、三…十」
+fn parse_hypothesis_index(text: &str) -> Option<usize> {
+    let trimmed = text.trim().trim_start_matches(['：', ':', ' ', '第']);
+    if let Ok(index) = trimmed.trim_end_matches('条').trim().parse::<usize>() {
+        return (index > 0).then_some(index);
+    }
+    let first = trimmed.chars().next()?;
+    let index = match first {
+        '一' => 1,
+        '二' | '两' => 2,
+        '三' => 3,
+        '四' => 4,
+        '五' => 5,
+        '六' => 6,
+        '七' => 7,
+        '八' => 8,
+        '九' => 9,
+        '十' => 10,
+        _ => return None,
+    };
+    Some(index)
 }
 
 async fn continue_original_query(
