@@ -271,27 +271,28 @@ impl SymbolicReasoner {
         if !entities.is_empty() {
             self.context.record_entities(&entities);
         }
-        let predicates = self.known_predicates();
-        if let Some(predicate) = predicates
+        let predicate = self
+            .known_predicates()
             .into_iter()
             .find(|p| self.predicate_mentioned(text, p))
-        {
+            .map(str::to_string);
+        if let Some(predicate) = predicate {
             self.context.record_predicate(&predicate);
         }
         self.context.record_question(text);
     }
 
-    fn known_predicates(&self) -> Vec<String> {
-        let mut predicates: Vec<String> = self
+    fn known_predicates(&self) -> Vec<&str> {
+        let mut predicates: Vec<&str> = self
             .aligner
             .profiles()
             .iter()
             .filter(|p| p.kind == TermKind::Relation)
-            .map(|p| p.term.clone())
+            .map(|p| p.term.as_str())
             .collect();
         for rule in self.predictor.rules() {
-            if !predicates.contains(&rule.head) {
-                predicates.push(rule.head.clone());
+            if !predicates.contains(&rule.head.as_str()) {
+                predicates.push(rule.head.as_str());
             }
         }
         predicates

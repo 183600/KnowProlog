@@ -176,14 +176,15 @@ impl SymbolicEmbedding {
     }
 
     pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
-        if !self.vectors.contains_key(entity) {
+        // 直接复用源实体向量，避免每个候选重复两次哈希查找
+        let Some(va) = self.vectors.get(entity) else {
             return Vec::new();
-        }
+        };
         let mut neighbors: Vec<(String, f64)> = self
             .vectors
             .iter()
             .filter(|(name, _)| name.as_str() != entity)
-            .map(|(name, _)| (name.clone(), self.similarity(entity, name)))
+            .map(|(name, vector)| (name.clone(), Self::cosine(va, vector)))
             .filter(|(_, score)| *score >= self.similarity_floor)
             .collect();
         neighbors.sort_by(|a, b| {

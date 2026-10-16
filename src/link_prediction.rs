@@ -300,17 +300,17 @@ impl LinkPredictor {
         let mut rules = Vec::new();
 
         for p1 in &predicates {
+            // 逆向规则只依赖 p1，预先取反一次即可供所有 p2 复用
+            let reversed: Option<HashSet<(String, String)>> = self
+                .pairs_of(p1)
+                .map(|pairs1| pairs1.iter().map(|(o, s)| (s.clone(), o.clone())).collect());
             for p2 in &predicates {
-                if let Some(pairs1) = self.pairs_of(p1) {
-                    let reversed: HashSet<(String, String)> = pairs1
-                        .iter()
-                        .map(|(o, s)| (s.clone(), o.clone()))
-                        .collect();
+                if let Some(reversed) = &reversed {
                     if let Some(rule) = self.build_rule(
                         RuleTemplate::Inverse,
                         vec![p1.clone()],
                         p2.clone(),
-                        &reversed,
+                        reversed,
                         min_support,
                         min_confidence,
                     ) {
@@ -378,28 +378,42 @@ impl LinkPredictor {
         self.rules = rules;
     }
 
-    fn make_prediction(
+    fn try_prediction<F, E>(
         &self,
         seen: &mut HashSet<Triple>,
+        generated: &mut usize,
         rule_index: usize,
         confidence: f64,
         triple: Triple,
-        evidence: Vec<Triple>,
-    ) -> Option<Prediction> {
+        matches: F,
+        evidence: E,
+    ) -> Option<Prediction>
+    where
+        F: FnOnce(&Triple) -> bool,
+        E: FnOnce() -> Vec<Triple>,
+    {
         if self.known.contains(&triple) || !seen.insert(triple.clone()) {
+            return None;
+        }
+        *generated += 1;
+        if !matches(&triple) {
             return None;
         }
         Some(Prediction {
             triple,
             rule_index,
             confidence,
-            evidence,
+            evidence: evidence(),
         })
     }
 
-    fn enumerate_predictions(&self, cap: usize) -> Vec<Prediction> {
+    fn enumerate_predictions_matching<F>(&self, cap: usize, matches: F) -> Vec<Prediction>
+    where
+        F: Fn(&Triple) -> bool,
+    {
         let mut out = Vec::new();
         let mut seen: HashSet<Triple> = HashSet::new();
+        let mut generated = 0usize;
 
         for (idx, rule) in self.rules.iter().enumerate() {
             match rule.template {
@@ -416,21 +430,22 @@ impl LinkPredictor {
                                         continue;
                                     }
                                     let triple = Triple::new(x, p3, z);
-                                    let evidence = vec![
-                                        Triple::new(x, p1, y),
-                                        Triple::new(y, p2, z),
-                                    ];
-                                    if let Some(pred) = self.make_prediction(
+                                    if let Some(pred) = self.try_prediction(
                                         &mut seen,
+                                        &mut generated,
                                         idx,
                                         rule.confidence,
                                         triple,
-                                        evidence,
+                                        &matches,
+                                        || vec![
+                                            Triple::new(x, p1, y),
+                                            Triple::new(y, p2, z),
+                                        ],
                                     ) {
                                         out.push(pred);
-                                        if out.len() >= cap {
-                                            return out;
-                                        }
+                                    }
+                                    if generated >= cap {
+                                        return out;
                                     }
                                 }
                             }
@@ -443,18 +458,19 @@ impl LinkPredictor {
                     if let Some(pairs1) = self.pairs_of(p1) {
                         for (s, o) in pairs1 {
                             let triple = Triple::new(o, p2, s);
-                            let evidence = vec![Triple::new(s, p1, o)];
-                            if let Some(pred) = self.make_prediction(
+                            if let Some(pred) = self.try_prediction(
                                 &mut seen,
+                                &mut generated,
                                 idx,
                                 rule.confidence,
                                 triple,
-                                evidence,
+                                &matches,
+                                || vec![Triple::new(s, p1, o)],
                             ) {
                                 out.push(pred);
-                                if out.len() >= cap {
-                                    return out;
-                                }
+                            }
+                            if generated >= cap {
+                                return out;
                             }
                         }
                     }
@@ -472,21 +488,22 @@ impl LinkPredictor {
                                         continue;
                                     }
                                     let triple = Triple::new(x, p3, y);
-                                    let evidence = vec![
-                                        Triple::new(x, p1, z),
-                                        Triple::new(y, p2, z),
-                                    ];
-                                    if let Some(pred) = self.make_prediction(
+                                    if let Some(pred) = self.try_prediction(
                                         &mut seen,
+                                        &mut generated,
                                         idx,
                                         rule.confidence,
                                         triple,
-                                        evidence,
+                                        &matches,
+                                        || vec![
+                                            Triple::new(x, p1, z),
+                                            Triple::new(y, p2, z),
+                                        ],
                                     ) {
                                         out.push(pred);
-                                        if out.len() >= cap {
-                                            return out;
-                                        }
+                                    }
+                                    if generated >= cap {
+                                        return out;
                                     }
                                 }
                             }
@@ -506,21 +523,22 @@ impl LinkPredictor {
                                         continue;
                                     }
                                     let triple = Triple::new(x, p3, y);
-                                    let evidence = vec![
-                                        Triple::new(z, p1, x),
-                                        Triple::new(z, p2, y),
-                                    ];
-                                    if let Some(pred) = self.make_prediction(
+                                    if let Some(pred) = self.try_prediction(
                                         &mut seen,
+                                        &mut generated,
                                         idx,
                                         rule.confidence,
                                         triple,
-                                        evidence,
+                                        &matches,
+                                        || vec![
+                                            Triple::new(z, p1, x),
+                                            Triple::new(z, p2, y),
+                                        ],
                                     ) {
                                         out.push(pred);
-                                        if out.len() >= cap {
-                                            return out;
-                                        }
+                                    }
+                                    if generated >= cap {
+                                        return out;
                                     }
                                 }
                             }
@@ -531,6 +549,10 @@ impl LinkPredictor {
         }
 
         out
+    }
+
+    fn enumerate_predictions(&self, cap: usize) -> Vec<Prediction> {
+        self.enumerate_predictions_matching(cap, |_| true)
     }
 
     fn sort_predictions(predictions: &mut Vec<Prediction>) {
@@ -557,12 +579,10 @@ impl LinkPredictor {
         predicate: Option<&str>,
         limit: usize,
     ) -> Vec<Prediction> {
-        let mut predictions: Vec<Prediction> = self
-            .enumerate_predictions(self.max_enumeration)
-            .into_iter()
-            .filter(|p| p.triple.subject == entity || p.triple.object == entity)
-            .filter(|p| predicate.map_or(true, |q| p.triple.predicate == q))
-            .collect();
+        let mut predictions = self.enumerate_predictions_matching(self.max_enumeration, |triple| {
+            (triple.subject == entity || triple.object == entity)
+                && predicate.map_or(true, |q| triple.predicate == q)
+        });
         Self::sort_predictions(&mut predictions);
         predictions.truncate(limit);
         predictions

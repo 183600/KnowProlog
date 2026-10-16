@@ -1,3 +1,4 @@
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -43,6 +44,8 @@ pub struct OntologyAligner {
     similarity_threshold: f64,
     structural_min_shared: usize,
     structural_min_jaccard: f64,
+    // 术语解析结果缓存：注册新术语时整体失效，避免重复执行 O(n) 相似度扫描
+    resolve_cache: RwLock<HashMap<String, Option<(AlignmentPair, Option<usize>)>>>,
 }
 
 impl OntologyAligner {
@@ -55,6 +58,7 @@ impl OntologyAligner {
             similarity_threshold,
             structural_min_shared: 2,
             structural_min_jaccard: 0.3,
+            resolve_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -93,6 +97,7 @@ impl OntologyAligner {
         let idx = self.profiles.len() - 1;
         self.profile_norms.push(normalized.clone());
         self.index.insert(normalized, idx);
+        self.resolve_cache.write().clear();
         idx
     }
 
@@ -203,33 +208,39 @@ impl OntologyAligner {
     }
 
     fn bigram_dice(a: &str, b: &str) -> f64 {
-        let ga = Self::bigrams(a);
-        let gb = Self::bigrams(b);
+        let mut ga = Self::bigram_keys(a);
+        let gb = Self::bigram_keys(b);
         if ga.is_empty() || gb.is_empty() {
             return 0.0;
         }
-        let mut counts: HashMap<String, i32> = HashMap::new();
-        for g in &ga {
-            *counts.entry(g.clone()).or_insert(0) += 1;
-        }
+        let total = ga.len() + gb.len();
         let mut overlap = 0usize;
-        for g in &gb {
-            if let Some(c) = counts.get_mut(g) {
-                if *c > 0 {
-                    *c -= 1;
-                    overlap += 1;
-                }
+        for key in &gb {
+            if let Some(pos) = ga.iter().position(|k| k == key) {
+                ga.swap_remove(pos);
+                overlap += 1;
             }
         }
-        2.0 * overlap as f64 / (ga.len() + gb.len()) as f64
+        2.0 * overlap as f64 / total as f64
     }
 
-    fn bigrams(s: &str) -> Vec<String> {
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() < 2 {
-            return vec![s.to_string()];
+    /// 以 (字符, 下一字符) 作为 bigram 键，避免为每个 bigram 分配字符串；
+    /// 长度不足 2 的字符串保留原有的单元素语义（第二项为 None）。
+    fn bigram_keys(s: &str) -> Vec<(char, Option<char>)> {
+        let mut keys = Vec::new();
+        let mut prev: Option<char> = None;
+        for ch in s.chars() {
+            if let Some(p) = prev {
+                keys.push((p, Some(ch)));
+            }
+            prev = Some(ch);
         }
-        chars.windows(2).map(|w| w.iter().collect()).collect()
+        if keys.is_empty() {
+            if let Some(single) = prev {
+                keys.push((single, None));
+            }
+        }
+        keys
     }
 
     fn synonym_chain(&self, term: &str) -> Option<String> {
@@ -261,6 +272,17 @@ impl OntologyAligner {
     }
 
     fn resolve_with_index(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
+        if let Some(cached) = self.resolve_cache.read().get(term) {
+            return cached.clone();
+        }
+        let resolved = self.resolve_with_index_uncached(term);
+        self.resolve_cache
+            .write()
+            .insert(term.to_string(), resolved.clone());
+        resolved
+    }
+
+    fn resolve_with_index_uncached(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
         if let Some(target) = self.synonym_chain(term) {
             let target_norm = self.normalize(&target);
             if target_norm != self.normalize(term) {
@@ -432,17 +454,26 @@ impl OntologyAligner {
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
 
         for (s, p, o) in triples {
-            for part in [s, p, o] {
-                if let Some(pair) = self.resolve(part) {
-                    if seen_pairs.insert((pair.source.clone(), pair.target.clone())) {
-                        pairs.push(pair);
-                    }
+            // 每个部分只解析一次，供对齐证据与规范化三元组共用
+            let resolved = [self.resolve(s), self.resolve(p), self.resolve(o)];
+            for pair in resolved.iter().flatten() {
+                if seen_pairs.insert((pair.source.clone(), pair.target.clone())) {
+                    pairs.push(pair.clone());
                 }
             }
             let canonical = (
-                self.canonical_form(s),
-                self.canonical_form(p),
-                self.canonical_form(o),
+                match &resolved[0] {
+                    Some(pair) => pair.target.clone(),
+                    None => s.clone(),
+                },
+                match &resolved[1] {
+                    Some(pair) => pair.target.clone(),
+                    None => p.clone(),
+                },
+                match &resolved[2] {
+                    Some(pair) => pair.target.clone(),
+                    None => o.clone(),
+                },
             );
             if seen_triples.insert(canonical.clone()) {
                 rewritten.push(canonical);

@@ -412,9 +412,17 @@ impl EntityRelationExtractor {
         let mut entities = Vec::new();
         let entity_types = self.entity_types.read();
         
+        // 分词与字节偏移只计算一次，供所有实体类型的上下文关键词匹配复用
+        let words: Vec<&str> = self.jieba.cut(sentence, false).into_iter().collect();
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        word_offsets.push(0usize);
+        for word in &words {
+            word_offsets.push(word_offsets.last().copied().unwrap_or(0) + word.len());
+        }
+        
         // 使用每种实体类型的模式进行匹配
         for (type_name, entity_type) in entity_types.iter() {
-            let type_entities = self.extract_entities_by_type(sentence, type_name, entity_type, sentence_id).await?;
+            let type_entities = self.extract_entities_by_type(sentence, &words, &word_offsets, type_name, entity_type, sentence_id).await?;
             entities.extend(type_entities);
         }
         
@@ -445,7 +453,7 @@ impl EntityRelationExtractor {
         }
     }
 
-    async fn extract_entities_by_type(&self, sentence: &str, type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
+    async fn extract_entities_by_type(&self, sentence: &str, words: &[&str], word_offsets: &[usize], type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
         // 正则模式匹配
@@ -476,21 +484,13 @@ impl EntityRelationExtractor {
         }
         
         // 上下文关键词匹配
-        entities.extend(self.extract_by_context_keywords(sentence, type_name, entity_type, sentence_id).await?);
+        entities.extend(self.extract_by_context_keywords(words, word_offsets, type_name, entity_type, sentence_id).await?);
         
         Ok(entities)
     }
 
-    async fn extract_by_context_keywords(&self, sentence: &str, type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
+    async fn extract_by_context_keywords(&self, words: &[&str], word_offsets: &[usize], type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        let words: Vec<_> = self.jieba.cut(sentence, false).into_iter().collect();
-        
-        // 每个词在句子中的字节偏移
-        let mut word_offsets = Vec::with_capacity(words.len() + 1);
-        word_offsets.push(0usize);
-        for word in &words {
-            word_offsets.push(word_offsets.last().copied().unwrap_or(0) + word.len());
-        }
         
         // 查找上下文关键词
         for (i, word) in words.iter().enumerate() {

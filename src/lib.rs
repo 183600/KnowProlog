@@ -776,23 +776,30 @@ impl OxigraphManager {
             return self.load_all_facts_internal(&store).await;
         }
         
-        // 构建实体名称的匹配模式
-        let entity_patterns: Vec<String> = query_entities.iter()
+        // 构建实体名称的匹配模式（合并为单次查询，避免逐实体重复扫描整库）
+        let combined_pattern = query_entities.iter()
             .map(|e| format!(".*{}.*", regex::escape(e)))
-            .collect();
+            .collect::<Vec<_>>()
+            .join("|");
         
         // 第一步：找到直接匹配的实体
-        let mut relevant_entities = std::collections::HashSet::new();
-        for pattern in &entity_patterns {
-            let direct_matches = self.find_entities_by_pattern(&store, pattern).await?;
-            relevant_entities.extend(direct_matches);
-        }
+        let direct_matches = self.find_entities_by_pattern(&store, &combined_pattern).await?;
+        let mut relevant_entities: std::collections::HashSet<String> = direct_matches.into_iter().collect();
         
-        // 第二步：扩展到相邻实体（基于指定跳数）
+        // 第二步：扩展到相邻实体（基于指定跳数，仅扩展每轮新增的前沿节点）
+        let mut frontier: Vec<String> = relevant_entities.iter().cloned().collect();
         for _hop in 0..max_hops {
-            let current_entities: Vec<String> = relevant_entities.iter().cloned().collect();
-            let neighbors = self.find_neighbors(&store, &current_entities).await?;
-            relevant_entities.extend(neighbors);
+            if frontier.is_empty() {
+                break;
+            }
+            let neighbors = self.find_neighbors(&store, &frontier).await?;
+            let mut next_frontier: Vec<String> = Vec::new();
+            for neighbor in neighbors {
+                if relevant_entities.insert(neighbor.clone()) {
+                    next_frontier.push(neighbor);
+                }
+            }
+            frontier = next_frontier;
         }
         
         // 第三步：为相关实体构建Prolog事实

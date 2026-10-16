@@ -38,6 +38,8 @@ pub struct SemanticEngine {
     relation_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     intent_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     stop_words: HashSet<String>,
+    // 实体名与描述的过滤后分词缓存，避免每次语义匹配重复分词
+    token_cache: Arc<RwLock<HashMap<String, (Vec<String>, Vec<String>)>>>,
 }
 
 impl SemanticEngine {
@@ -55,12 +57,23 @@ impl SemanticEngine {
             relation_patterns: Arc::new(RwLock::new(HashMap::new())),
             intent_patterns: Arc::new(RwLock::new(HashMap::new())),
             stop_words,
+            token_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn tokenize_filtered(&self, text: &str) -> Vec<String> {
+        self.jieba
+            .cut(text, false)
+            .into_iter()
+            .filter(|word| !self.stop_words.contains(*word))
+            .map(|word| word.to_string())
+            .collect()
     }
 
     pub fn initialize_knowledge_base(&self, entities: Vec<SemanticKnowledge>) -> Result<(), Box<dyn std::error::Error>> {
         let mut knowledge = self.entity_knowledge.write();
         let mut aliases = self.entity_aliases.write();
+        let mut token_cache = self.token_cache.write();
         
         for entity in entities {
             let entity_name = entity.entity.clone();
@@ -78,6 +91,10 @@ impl SemanticEngine {
                 aliases.entry(alias.clone()).or_insert_with(Vec::new).push(entity_name.clone());
             }
             
+            token_cache.insert(
+                entity_name.clone(),
+                (self.tokenize_filtered(&entity.entity), self.tokenize_filtered(&entity.description)),
+            );
             knowledge.insert(entity_name, entity);
         }
         
@@ -194,6 +211,7 @@ impl SemanticEngine {
     async fn semantic_entity_matching(&self, mention: &str) -> Result<Vec<EntityCandidate>, Box<dyn std::error::Error>> {
         let mut candidates = Vec::new();
         let knowledge = self.entity_knowledge.read();
+        let token_cache = self.token_cache.read();
         
         // 分词
         let mention_words: Vec<_> = self.jieba.cut(mention, false).into_iter()
@@ -201,17 +219,24 @@ impl SemanticEngine {
             .collect();
         
         for (entity_name, entity_knowledge) in knowledge.iter() {
-            let entity_words: Vec<_> = self.jieba.cut(&entity_knowledge.entity, false).into_iter()
-                .filter(|word| !self.stop_words.contains(*word))
-                .collect();
+            let cached = token_cache.get(entity_name);
+            let entity_words: Vec<&str> = match cached {
+                Some((name_words, _)) => name_words.iter().map(String::as_str).collect(),
+                None => self.jieba.cut(&entity_knowledge.entity, false).into_iter()
+                    .filter(|word| !self.stop_words.contains(*word))
+                    .collect(),
+            };
             
             // 计算词汇重叠度
             let overlap_score = self.calculate_word_overlap(&mention_words, &entity_words);
             
             // 计算描述相似度
-            let desc_words: Vec<_> = self.jieba.cut(&entity_knowledge.description, false).into_iter()
-                .filter(|word| !self.stop_words.contains(*word))
-                .collect();
+            let desc_words: Vec<&str> = match cached {
+                Some((_, desc_words)) => desc_words.iter().map(String::as_str).collect(),
+                None => self.jieba.cut(&entity_knowledge.description, false).into_iter()
+                    .filter(|word| !self.stop_words.contains(*word))
+                    .collect(),
+            };
             let desc_similarity = self.calculate_word_overlap(&mention_words, &desc_words);
             
             let combined_score = (overlap_score * 0.7 + desc_similarity * 0.3).max(0.0).min(1.0);
@@ -238,12 +263,10 @@ impl SemanticEngine {
         } else {
             // 尝试通过别名查找
             let aliases = self.entity_aliases.read();
-            for (alias, entity_names) in aliases.iter() {
-                if alias == entity {
-                    for entity_name in entity_names {
-                        if let Some(entity_knowledge) = knowledge.get(entity_name) {
-                            return Ok(entity_knowledge.clone());
-                        }
+            if let Some(entity_names) = aliases.get(entity) {
+                for entity_name in entity_names {
+                    if let Some(entity_knowledge) = knowledge.get(entity_name) {
+                        return Ok(entity_knowledge.clone());
                     }
                 }
             }
@@ -551,6 +574,7 @@ impl SemanticEngine {
         let entity_name = entity.entity.clone();
         let mut knowledge = self.entity_knowledge.write();
         let mut aliases = self.entity_aliases.write();
+        let mut token_cache = self.token_cache.write();
         
         // 添加实体别名映射
         let mut entity_aliases_list = vec![entity_name.clone()];
@@ -562,6 +586,10 @@ impl SemanticEngine {
             aliases.entry(alias.clone()).or_insert_with(Vec::new).push(entity_name.clone());
         }
         
+        token_cache.insert(
+            entity_name.clone(),
+            (self.tokenize_filtered(&entity.entity), self.tokenize_filtered(&entity.description)),
+        );
         knowledge.insert(entity_name, entity);
     }
 

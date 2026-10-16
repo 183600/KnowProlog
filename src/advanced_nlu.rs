@@ -433,14 +433,13 @@ impl AdvancedNLU {
         let mut best_confidence = 0.0;
         
         // 分词
-        let words: Vec<_> = self.jieba.cut(query, false).into_iter().collect();
-        let query_text = words.join(" ");
+        let query_words: Vec<_> = self.jieba.cut(query, false).into_iter().collect();
         
         for (intent_name, pattern_info) in intent_patterns.iter() {
             let mut max_pattern_confidence: f64 = 0.0;
             
             for pattern in &pattern_info.patterns {
-                let confidence = self.calculate_pattern_match_confidence(&query_text, pattern);
+                let confidence = self.calculate_pattern_match_confidence(&query_words, pattern);
                 max_pattern_confidence = max_pattern_confidence.max(confidence);
             }
             
@@ -499,17 +498,16 @@ impl AdvancedNLU {
         Ok(best)
     }
 
-    fn calculate_pattern_match_confidence(&self, query: &str, pattern: &str) -> f64 {
+    fn calculate_pattern_match_confidence(&self, query_words: &[&str], pattern: &str) -> f64 {
         // 简化的模式匹配
         let pattern_keywords: Vec<_> = pattern.split_whitespace()
             .filter(|word| !word.starts_with('(') || !word.ends_with(')'))
             .collect();
         
-        let query_words: Vec<_> = query.split_whitespace().collect();
         let mut matches = 0;
         
         for pattern_word in &pattern_keywords {
-            for query_word in &query_words {
+            for query_word in query_words {
                 if pattern_word == query_word || self.calculate_word_similarity(pattern_word, query_word) > 0.8 {
                     matches += 1;
                     break;
@@ -810,7 +808,7 @@ impl AdvancedNLU {
             }
         }
         
-        Ok(slots.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+        Ok(slots)
     }
 
     async fn extract_slot_value(&self, query: &str, slot_name: &str, entities: &[ExtractedEntity]) -> Result<Option<String>, Box<dyn std::error::Error>> {
