@@ -111,12 +111,15 @@ impl OntologyAligner {
         let o_idx = self.register_term(object, TermKind::Entity);
         self.register_term(predicate, TermKind::Relation);
         if s_idx != o_idx {
-            self.profiles[s_idx]
+            let forward_inserted = self.profiles[s_idx]
                 .neighbors
                 .insert(format!("{}{}{}", predicate, '\u{2192}', object));
-            self.profiles[o_idx]
+            let backward_inserted = self.profiles[o_idx]
                 .neighbors
                 .insert(format!("{}{}{}", predicate, '\u{2190}', subject));
+            if forward_inserted || backward_inserted {
+                self.resolve_cache.write().clear();
+            }
         }
     }
 
@@ -554,6 +557,22 @@ mod tests {
         assert_eq!(pair.target, "苹果公司");
         assert_eq!(pair.kind, AlignmentKind::Structural);
         assert!(pair.evidence.iter().any(|e| e.contains("乔布斯")));
+    }
+
+    #[test]
+    fn test_observe_triple_invalidates_cached_resolution() {
+        let mut aligner = OntologyAligner::new(HashMap::new(), 0.99);
+        aligner.register_term("甲", TermKind::Entity);
+        aligner.register_term("乙", TermKind::Entity);
+        aligner.register_term("丙", TermKind::Entity);
+        aligner.observe_triple("甲", "关系", "乙");
+        aligner.observe_triple("丁", "关系", "乙");
+        assert!(aligner.resolve("丁").is_none());
+        aligner.observe_triple("甲", "关系", "丙");
+        aligner.observe_triple("丁", "关系", "丙");
+        let pair = aligner.resolve("丁").expect("邻居变化后缓存应失效并触发结构对齐");
+        assert_eq!(pair.target, "甲");
+        assert_eq!(pair.kind, AlignmentKind::Structural);
     }
 
     #[test]
