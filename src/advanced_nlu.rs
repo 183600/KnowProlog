@@ -709,7 +709,8 @@ impl AdvancedNLU {
         let mut current: u64 = 0;
         for ch in text.chars() {
             if let Some(d) = digit(ch) {
-                current = d;
+                // 连续数字按位拼接（「一九九八」→ 1998），而非只保留最后一位
+                current = current.checked_mul(10)?.checked_add(d)?;
             } else if let Some(u) = unit(ch) {
                 if current == 0 {
                     current = 1;

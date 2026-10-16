@@ -588,7 +588,11 @@ fn positive_proof(prop: &Proposition, knowledge: &Knowledge<'_>) -> Option<(Proo
                 knowledge.max_rule_candidates,
             );
             for prediction in candidates {
-                if prediction.triple.object == prop.object
+                // predict_for_entity 同时匹配主体在左或右的候选：主客体相同的
+                // 断言（如「张三的师傅是张三」）必须主体也一致，避免把
+                // （李四，师傅，张三）当成 （张三，师傅，张三）的证据
+                if prediction.triple.subject == prop.subject
+                    && prediction.triple.object == prop.object
                     && prediction.confidence >= knowledge.min_rule_confidence
                 {
                     return Some((

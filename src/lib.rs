@@ -553,9 +553,10 @@ impl OxigraphManager {
     }
 
     pub async fn import_jsonld(&self, jsonld_content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 写前先失效整图快照缓存
-        self.revision.fetch_add(1, Ordering::AcqRel);
         let store = self.store.lock().await;
+        // 持锁后、写前失效整图快照缓存：若在持锁前自增，并发读者可能
+        // 读到新 revision 却在写完成前扫描到旧数据，并把旧快照缓存到新 revision 上
+        self.revision.fetch_add(1, Ordering::AcqRel);
         
         // 解析 JSON-LD 内容
         let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
@@ -789,9 +790,9 @@ impl OxigraphManager {
     }
 
     pub async fn save_knowledge(&self, items: Vec<KnowledgeItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // 写前先失效整图快照缓存
-        self.revision.fetch_add(1, Ordering::AcqRel);
         let store = self.store.lock().await;
+        // 持锁后、写前失效整图快照缓存（原因同 import_jsonld）
+        self.revision.fetch_add(1, Ordering::AcqRel);
         
         for item in items {
             match item {
@@ -921,8 +922,8 @@ impl OxigraphManager {
 
     /// 整图快照（实体属性 + 关系），在两次写操作之间复用缓存，避免重复全量扫描。
     ///
-    /// 正确性依赖：所有写入口在修改存储前自增 `revision`，且存储只增不删；
-    /// 因此命中缓存意味着自缓存构建以来没有任何写发生，内容必然一致。
+    /// 正确性依赖：所有写入口在持有存储锁期间（修改存储前）自增 `revision`，
+    /// 且存储只增不删；因此命中缓存意味着自缓存构建以来没有任何写发生，内容必然一致。
     pub async fn load_graph_snapshot(&self) -> Result<Arc<Vec<PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
         let revision = self.revision.load(Ordering::Acquire);
         {

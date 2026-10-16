@@ -315,6 +315,7 @@ impl SymbolicReasoner {
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         let mut added = 0usize;
         let mut entity_observed = false;
+        let mut entity_type_changed = false;
         let mut association_changed = false;
         let mut attribute_changed = false;
         let triples_before = self.predictor.triple_count();
@@ -346,6 +347,13 @@ impl SymbolicReasoner {
                         .iter()
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect();
+                    // 生成器的实体类型会被后续观察覆盖，归结引擎的 __类型__ 事实依赖它：
+                    // 类型变化时必须触发重建（关联篮子的变化无法覆盖此情形）
+                    if !entity_type.trim().is_empty()
+                        && self.generator.entity_type_of(name) != Some(entity_type.as_str())
+                    {
+                        entity_type_changed = true;
+                    }
                     self.generator
                         .observe_entity(name, entity_type, &property_pairs);
                     let property_keys: Vec<String> = properties.keys().cloned().collect();
@@ -380,7 +388,8 @@ impl SymbolicReasoner {
         if self.config.enable_association_rules && (association_changed || triples_added) {
             self.associations.mine();
         }
-        if self.config.enable_resolution && (association_changed || attribute_changed || triples_added)
+        if self.config.enable_resolution
+            && (association_changed || attribute_changed || entity_type_changed || triples_added)
         {
             self.rebuild_resolver();
         }
