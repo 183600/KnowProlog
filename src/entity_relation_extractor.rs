@@ -204,7 +204,7 @@ impl EntityRelationExtractor {
         patterns.extend(vec![
             ExtractionPattern {
                 name: "is_a_pattern".to_string(),
-                pattern: r"(.+?)是(.+?)".to_string(),
+                pattern: r"(.+?)是(.+)".to_string(),
                 relation_type: "is_a".to_string(),
                 subject_group: 1,
                 object_group: 2,
@@ -214,7 +214,7 @@ impl EntityRelationExtractor {
             
             ExtractionPattern {
                 name: "born_in_pattern".to_string(),
-                pattern: r"(.+?)出生于(.+?)".to_string(),
+                pattern: r"(.+?)出生于(.+)".to_string(),
                 relation_type: "born_in".to_string(),
                 subject_group: 1,
                 object_group: 2,
@@ -234,7 +234,7 @@ impl EntityRelationExtractor {
             
             ExtractionPattern {
                 name: "located_in_pattern".to_string(),
-                pattern: r"(.+?)位于(.+?)".to_string(),
+                pattern: r"(.+?)位于(.+)".to_string(),
                 relation_type: "located_in".to_string(),
                 subject_group: 1,
                 object_group: 2,
@@ -254,7 +254,7 @@ impl EntityRelationExtractor {
             
             ExtractionPattern {
                 name: "has_property_pattern".to_string(),
-                pattern: r"(.+?)的(.+?)是(.+?)".to_string(),
+                pattern: r"(.+?)的(.+?)是(.+)".to_string(),
                 relation_type: "has_property".to_string(),
                 subject_group: 1,
                 object_group: 3,
@@ -274,7 +274,7 @@ impl EntityRelationExtractor {
             
             ExtractionPattern {
                 name: "owns_pattern".to_string(),
-                pattern: r"(.+?)拥有(.+?)".to_string(),
+                pattern: r"(.+?)拥有(.+)".to_string(),
                 relation_type: "owns".to_string(),
                 subject_group: 1,
                 object_group: 2,
@@ -294,7 +294,7 @@ impl EntityRelationExtractor {
             
             ExtractionPattern {
                 name: "graduated_from_pattern".to_string(),
-                pattern: r"(.+?)毕业于(.+?)".to_string(),
+                pattern: r"(.+?)毕业于(.+)".to_string(),
                 relation_type: "graduated_from".to_string(),
                 subject_group: 1,
                 object_group: 2,
@@ -530,6 +530,15 @@ impl EntityRelationExtractor {
         
         // 最长匹配算法
         let chars: Vec<char> = sentence.chars().collect();
+        
+        // 预先计算每个字符对应的字节偏移：EntityPosition 使用字节偏移
+        // （与正则匹配的 mat.start()/mat.end() 以及句子切片保持一致）
+        let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
+        byte_offsets.push(0usize);
+        for ch in &chars {
+            byte_offsets.push(byte_offsets.last().copied().unwrap_or(0) + ch.len_utf8());
+        }
+        
         let mut i = 0;
         
         while i < chars.len() {
@@ -544,8 +553,9 @@ impl EntityRelationExtractor {
                 substring.push(chars[j - 1]);
                 
                 if let Some(types) = named_entity_dict.get(substring.as_str()) {
-                    if substring.len() > max_length {
-                        max_length = substring.len();
+                    // i 为字符索引，匹配长度必须按字符数（j - i）计算而非字节数
+                    if j - i > max_length {
+                        max_length = j - i;
                         best_entity = substring.clone();
                         best_types = types.clone();
                         found_entity = true;
@@ -560,8 +570,8 @@ impl EntityRelationExtractor {
                         entity_type,
                         confidence: 0.9, // 词典匹配的高置信度
                         position: EntityPosition {
-                            start: i,
-                            end: i + max_length,
+                            start: byte_offsets[i],
+                            end: byte_offsets[i + max_length],
                             sentence_id,
                             paragraph_id: 0,
                         },

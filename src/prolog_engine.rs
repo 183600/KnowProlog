@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use scryer_prolog::machine::Machine;
+use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryResolution, Value};
 
 pub struct PrologEngine {
     machine: Machine,
@@ -11,6 +12,13 @@ impl PrologEngine {
         let mut machine = Machine::new_lib();
         
         let base_rules = r#"
+            % 列表谓词（member/2、length/2 等）
+            :- use_module(library(lists)).
+            
+            % 动态事实谓词声明（支持 retractall 更新事实）
+            :- dynamic(oxigraph_entity/3).
+            :- dynamic(oxigraph_relation/3).
+            
             % 基础谓词定义
             entity(Name, Type, Properties) :- 
                 oxigraph_entity(Name, Type, Properties).
@@ -76,7 +84,8 @@ impl PrologEngine {
                         if i > 0 {
                             fact_string.push_str(", ");
                         }
-                        let _ = write!(fact_string, "'{}-{}'", k, v);
+                        // 属性写成 '键'-'值' 复合项，才能与 member(age-Age, Props) 等规则统一
+                        let _ = write!(fact_string, "'{}'-'{}'", k, v);
                     }
                     fact_string.push_str("]).\n");
                 }
@@ -91,7 +100,8 @@ impl PrologEngine {
         }
         
         println!("Loading {} Prolog facts", facts_count);
-        self.machine.consult_module_string("facts", fact_string);
+        // 事实与基础规则放在同一模块，动态谓词才可被 retractall 清除
+        self.machine.consult_module_string("user", fact_string);
     }
 
     pub fn load_relevant_facts(&mut self, facts: Vec<PrologFact>) {
@@ -99,29 +109,55 @@ impl PrologEngine {
     }
 
     fn clear_dynamic_facts(&mut self) {
-        let clear_command = r#"
-            retractall(oxigraph_entity(_, _, _)).
-            retractall(oxigraph_relation(_, _, _)).
-        "#;
-        
-        match self.machine.run_query(format!("?- {}.", clear_command)) {
-            Ok(_) => {},
-            Err(e) => eprintln!("清除动态事实时出错: {}", e),
+        // run_query 只接受以句点结尾的单个裸目标，"?- " 前缀会报 existence_error
+        for goal in [
+            "retractall(oxigraph_entity(_, _, _)).",
+            "retractall(oxigraph_relation(_, _, _)).",
+        ] {
+            match self.machine.run_query(goal.to_string()) {
+                Ok(_) => {},
+                Err(e) => eprintln!("清除动态事实时出错: {}", e),
+            }
         }
     }
     
     pub fn query(&mut self, query: &str) -> Vec<HashMap<String, String>> {
         let mut results = Vec::new();
         
-        let query_str = format!("?- {}.", query);
+        // scryer-prolog 的 run_query 需要以句点结尾的裸目标，不能带 "?- " 前缀
+        let query_str = format!("{}.", query);
         println!("执行Prolog查询: {}", query_str);
         
         match self.machine.run_query(query_str) {
             Ok(query_output) => {
-                let output_str = format!("{:?}", query_output);
-                println!("Prolog输出: {}", output_str);
+                println!("Prolog输出: {:?}", query_output);
                 
-                if output_str.contains("true") {
+                let mut succeeded_without_bindings = false;
+                
+                match query_output {
+                    QueryResolution::Matches(matches) => {
+                        // 直接提取变量绑定（如 Age/Relation/Count/Spouse）
+                        for query_match in matches {
+                            if query_match.bindings.is_empty() {
+                                continue;
+                            }
+                            let result_map: HashMap<String, String> = query_match.bindings
+                                .into_iter()
+                                .map(|(name, value)| (name, value_to_string(value)))
+                                .collect();
+                            results.push(result_map);
+                        }
+                    }
+                    QueryResolution::True => {
+                        succeeded_without_bindings = true;
+                    }
+                    QueryResolution::False => {
+                        println!("查询未返回结果");
+                    }
+                }
+                
+                if succeeded_without_bindings {
+                    // 查询成功但没有变量绑定，沿用简化的兜底结果
                     let mut result_map = HashMap::new();
                     
                     // 基于查询类型提取结果
@@ -161,8 +197,6 @@ impl PrologEngine {
                     if !result_map.is_empty() {
                         results.push(result_map);
                     }
-                } else {
-                    println!("查询未返回结果");
                 }
             }
             Err(err) => {
@@ -212,35 +246,35 @@ impl PrologEngine {
             }
             "altitude_query" => {
                 if let Some(place) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'GeographicFeature', Properties), member(altitude-Altitude, Properties)", place))
+                    Some(format!("oxigraph_entity('{}', 'geographicfeature', Properties), member(altitude-Altitude, Properties)", place))
                 } else {
                     None
                 }
             }
             "chemical_formula_query" => {
                 if let Some(chemical) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'Chemical', Properties), member(formula-Formula, Properties)", chemical))
+                    Some(format!("oxigraph_entity('{}', 'chemical', Properties), member(formula-Formula, Properties)", chemical))
                 } else {
                     None
                 }
             }
             "author_query" => {
                 if let Some(work) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'Literature', Properties), member(author-Author, Properties)", work))
+                    Some(format!("oxigraph_entity('{}', 'literature', Properties), member(author-Author, Properties)", work))
                 } else {
                     None
                 }
             }
             "champion_query" => {
                 if let Some(event) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'SportEvent', Properties), member(champion-Champion, Properties)", event))
+                    Some(format!("oxigraph_entity('{}', 'sportevent', Properties), member(champion-Champion, Properties)", event))
                 } else {
                     None
                 }
             }
             "birth_year_query" => {
                 if let Some(language) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'ProgrammingLanguage', Properties), member(birth_year-Year, Properties)", language))
+                    Some(format!("oxigraph_entity('{}', 'programminglanguage', Properties), member(birth_year-Year, Properties)", language))
                 } else {
                     None
                 }
@@ -254,7 +288,7 @@ impl PrologEngine {
             }
             "quantity_query" => {
                 if entities.len() >= 2 {
-                    Some(format!("oxigraph_entity('{}', 'BiologicalConcept', Properties), member(quantity-Quantity, Properties), member(unit-'{}', Properties)", entities[0], entities[1]))
+                    Some(format!("oxigraph_entity('{}', 'biologicalconcept', Properties), member(quantity-Quantity, Properties), member(unit-'{}', Properties)", entities[0], entities[1]))
                 } else {
                     None
                 }
@@ -279,6 +313,14 @@ impl PrologEngine {
             }
             _ => None,
         }
+    }
+}
+
+fn value_to_string(value: Value) -> String {
+    match value {
+        // 字符串字面量直接取内容，避免 JSON 转换添加的引号
+        Value::String(s) => s,
+        other => prolog_value_to_json_string(other),
     }
 }
 

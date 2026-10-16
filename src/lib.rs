@@ -407,17 +407,60 @@ impl OxigraphManager {
             for item in array {
                 if let Some(obj) = item.as_object() {
                     // 处理每个对象
-                    self.process_jsonld_object(store, obj).await?;
+                    let context = Self::extract_jsonld_context(obj);
+                    self.process_jsonld_object(store, obj, &context).await?;
                 }
             }
         } else if let Some(obj) = jsonld.as_object() {
-            // 单个对象
-            self.process_jsonld_object(store, obj).await?;
+            // 顶层 @context 中的字符串映射用于展开类型与属性名
+            let context = Self::extract_jsonld_context(obj);
+            // 顶层为包含 @graph 的 JSON-LD 文档时，递归处理图中的每个节点
+            if let Some(graph) = obj.get("@graph") {
+                if let Some(graph_array) = graph.as_array() {
+                    for item in graph_array {
+                        if let Some(inner) = item.as_object() {
+                            self.process_jsonld_object(store, inner, &context).await?;
+                        }
+                    }
+                } else if let Some(inner) = graph.as_object() {
+                    self.process_jsonld_object(store, inner, &context).await?;
+                }
+            } else {
+                // 单个对象
+                self.process_jsonld_object(store, obj, &context).await?;
+            }
         }
         Ok(())
     }
 
-    async fn process_jsonld_object(&self, store: &Store, obj: &serde_json::Map<String, Value>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// 提取顶层 @context 中的字符串映射（term -> IRI），供类型与属性名展开使用
+    fn extract_jsonld_context(obj: &serde_json::Map<String, Value>) -> HashMap<String, String> {
+        let mut context = HashMap::new();
+        if let Some(ctx) = obj.get("@context").and_then(|c| c.as_object()) {
+            for (term, value) in ctx {
+                if let Some(iri) = value.as_str() {
+                    context.insert(term.clone(), iri.to_string());
+                }
+            }
+        }
+        context
+    }
+
+    /// 按 @context 展开 JSON-LD 词项：已是 IRI 的保留，映射词项替换为对应 IRI，否则回退到 @vocab
+    fn expand_jsonld_term(term: &str, context: &HashMap<String, String>) -> String {
+        if term.contains(':') {
+            return term.to_string();
+        }
+        if let Some(iri) = context.get(term) {
+            return iri.clone();
+        }
+        if let Some(vocab) = context.get("@vocab") {
+            return format!("{}{}", vocab, term);
+        }
+        term.to_string()
+    }
+
+    async fn process_jsonld_object(&self, store: &Store, obj: &serde_json::Map<String, Value>, context: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 获取主语 (subject)
         let subject_uri = if let Some(id) = obj.get("@id") {
             id.as_str().unwrap_or("").to_string()
@@ -437,7 +480,7 @@ impl OxigraphManager {
                 for type_val in type_array {
                     if let Some(type_uri) = type_val.as_str() {
                         let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
-                        let object_type = NamedNode::new(type_uri)?;
+                        let object_type = NamedNode::new(Self::expand_jsonld_term(type_uri, context))?;
                         
                         store.insert(&Quad::new(
                             subject.clone(),
@@ -449,7 +492,7 @@ impl OxigraphManager {
                 }
             } else if let Some(type_uri) = types.as_str() {
                 let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
-                let object_type = NamedNode::new(type_uri)?;
+                let object_type = NamedNode::new(Self::expand_jsonld_term(type_uri, context))?;
                 
                 store.insert(&Quad::new(
                     subject.clone(),
@@ -466,7 +509,7 @@ impl OxigraphManager {
                 continue; // 跳过 JSON-LD 关键字
             }
             
-            let predicate = NamedNode::new(key)?;
+            let predicate = NamedNode::new(Self::expand_jsonld_term(key, context))?;
             
             if let Some(value_array) = value.as_array() {
                 for val in value_array {
@@ -528,22 +571,29 @@ impl OxigraphManager {
                         ))?;
                     }
                 } else if let Some(val) = obj.get("@value") {
+                    // 字符串值应取其内容本身，其他类型才使用 JSON 表示
+                    // （Value::to_string() 对字符串会带上双引号和转义，不能直接作为字面量值）
+                    let value_text = match val {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    
                     // 处理带数据类型的值
                     let literal = if let Some(datatype) = obj.get("@type") {
                         if let Some(datatype_uri) = datatype.as_str() {
                             let dt = NamedNode::new(datatype_uri)?;
-                            Literal::new_typed_literal(&val.to_string(), dt)
+                            Literal::new_typed_literal(&value_text, dt)
                         } else {
-                            Literal::new_simple_literal(&val.to_string())
+                            Literal::new_simple_literal(&value_text)
                         }
                     } else if let Some(lang) = obj.get("@language") {
                         if let Some(lang_tag) = lang.as_str() {
-                            Literal::new_language_tagged_literal(&val.to_string(), lang_tag)?
+                            Literal::new_language_tagged_literal(&value_text, lang_tag)?
                         } else {
-                            Literal::new_simple_literal(&val.to_string())
+                            Literal::new_simple_literal(&value_text)
                         }
                     } else {
-                        Literal::new_simple_literal(&val.to_string())
+                        Literal::new_simple_literal(&value_text)
                     };
                     
                     store.insert(&Quad::new(
@@ -991,7 +1041,7 @@ impl OxigraphManager {
                             for solution in solutions {
                                 if let Ok(solution) = solution {
                                     // 获取第一个变量的值
-                                    for (_, value) in solution.iter() {
+                                    if let Some((_, value)) = solution.iter().next() {
                                         let value_str = if let Term::Literal(lit) = value {
                                             lit.value().to_string()
                                         } else {
@@ -1146,8 +1196,9 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
         }
     }
     
-    entities.dedup();
-    entities.retain(|e| e.len() > 1);
+    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+    let mut seen = std::collections::HashSet::new();
+    entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
     entities
 }
 
@@ -1410,8 +1461,9 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
         }
     }
     
-    entities.dedup();
-    entities.retain(|e| e.len() > 1);
+    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+    let mut seen = std::collections::HashSet::new();
+    entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
     entities
 }
 

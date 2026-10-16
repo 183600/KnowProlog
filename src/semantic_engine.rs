@@ -176,12 +176,17 @@ impl SemanticEngine {
             }
         }
         
+        // 读锁必须在 await 前释放，避免与写入方互相等待造成死锁
+        drop(aliases);
+        drop(knowledge);
+        
         // 基于语义向量的匹配
         candidates.extend(self.semantic_entity_matching(mention).await?);
         
-        // 去重并排序
+        // 去重并排序（保留权重最高的同名实体；dedup_by 只能去除相邻重复项）
         candidates.sort_by(|a, b| b.weight.cmp(&a.weight));
-        candidates.dedup_by(|a, b| a.entity == b.entity);
+        let mut seen = HashSet::new();
+        candidates.retain(|c| seen.insert(c.entity.clone()));
         candidates.truncate(10); // 最多返回10个候选
         
         Ok(candidates)
@@ -383,8 +388,9 @@ impl SemanticEngine {
             for j in (i + 1)..=(chars.len().min(i + 10)) {
                 substring.push(chars[j - 1]);
                 
-                if aliases.contains_key(substring.as_str()) && substring.len() > max_length {
-                    max_length = substring.len();
+                // 注意：i 为字符索引，前进长度必须按字符数（j - i）计算而非字节数
+                if aliases.contains_key(substring.as_str()) && j - i > max_length {
+                    max_length = j - i;
                     best_entity = substring.clone();
                     found_entity = true;
                 }

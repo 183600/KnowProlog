@@ -42,9 +42,33 @@ pub enum PatternElement {
 // 注意：crate::NlpConfig 现在引用的是 lib.rs 中的 NlpConfig
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     let words = jieba().cut(text, false); // 执行分词，false表示精准模式
-    
-    let mut tagged_words = Vec::with_capacity(words.len());
-    for word in words {
+
+    // 结巴分词可能把配置中的常见人名（如"张三"）切分成多个单字，
+    // 这里按最长匹配合并相邻词，使 full_names 中的人名能被正确识别
+    let mut merged_words: Vec<String> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let mut matched = None;
+        let max_end = (i + 4).min(words.len()); // 人名一般不超过4个分词
+        for end in (i + 2..=max_end).rev() {
+            let candidate: String = words[i..end].concat();
+            if config.name_patterns.full_names.contains(&candidate) {
+                matched = Some((candidate, end));
+                break;
+            }
+        }
+        if let Some((name, end)) = matched {
+            merged_words.push(name);
+            i = end;
+        } else {
+            merged_words.push(words[i].to_string());
+            i += 1;
+        }
+    }
+
+    let mut tagged_words = Vec::with_capacity(merged_words.len());
+    for word in &merged_words {
+        let word = word.as_str();
         // 确定词性
         let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
             "m".to_string() // m表示数词

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use crate::semantic_engine::{SemanticEngine, SemanticKnowledge};
 use crate::similarity_calculator::{SimilarityCalculator, SimilarityResult, WordEmbedding, ConceptNode};
 use crate::advanced_nlu::{AdvancedNLU, IntentResult};
@@ -343,7 +343,18 @@ impl LocalSemanticAdapter {
         let confidence = self.calculate_complex_confidence(&question_analysis, &intent_result, &entities).await?;
         
         // 提取实体名称字符串（直接移动，避免额外克隆）
-        let entity_names: Vec<String> = entities.into_iter().map(|e| e.entity).collect();
+        let mut entity_names: Vec<String> = entities.into_iter().map(|e| e.entity).collect();
+        
+        // 补充知识库中已知实体的识别结果：通用抽取器可能识别不出
+        // 采样知识库中已收录的实体（如"珠穆朗玛峰"），这里通过别名做最长匹配补齐
+        let knowledge_entities = self.semantic_engine.analyze_intent(query).await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
+        let mut seen_entities: HashSet<String> = entity_names.iter().cloned().collect();
+        for entity_name in knowledge_entities.entities {
+            if seen_entities.insert(entity_name.clone()) {
+                entity_names.push(entity_name);
+            }
+        }
         
         // 第六阶段：生成查询模式
         let query_patterns = self.generate_complex_query_patterns(&query_type, &entity_names).await?;

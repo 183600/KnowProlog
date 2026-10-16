@@ -918,7 +918,9 @@ impl AdvancedNLU {
         for entity in entities {
             if entity.entity_type == "TEMPORAL" {
                 let is_relative = matches!(entity.normalized_value.as_deref(), 
-                    Some("TODAY") | Some("TOMORROW") | Some("YESTERDAY") | Some("NOW") | Some("PAST") | Some("FUTURE"));
+                    Some("TODAY") | Some("TOMORROW") | Some("YESTERDAY") | Some("NOW") | Some("PAST") | Some("FUTURE")
+                    | Some("LAST_WEEK") | Some("NEXT_WEEK") | Some("LAST_MONTH") | Some("NEXT_MONTH")
+                    | Some("LAST_YEAR") | Some("NEXT_YEAR"));
                 
                 return Some(TemporalInfo {
                     time_type: entity.normalized_value.clone().unwrap_or_default(),

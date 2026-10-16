@@ -280,8 +280,8 @@ impl QuestionAnalyzer {
         // 概念实体
         patterns.push((Regex::new(r"黑洞|光合作用|进化论|量子计算|区块链|机器学习").unwrap(), "CONCEPT".to_string()));
         
-        // 组织实体
-        patterns.push((Regex::new(r"[联合国|世界杯|奥运会]").unwrap(), "ORGANIZATION".to_string()));
+        // 组织实体（多字符词必须用分组/选择，字符类只会匹配单个字符）
+        patterns.push((Regex::new(r"联合国|世界杯|奥运会").unwrap(), "ORGANIZATION".to_string()));
         
         // 时间实体
         patterns.push((Regex::new(r"\d{4}年|\d{1,2}世纪|古代|现代|当代").unwrap(), "TIME".to_string()));

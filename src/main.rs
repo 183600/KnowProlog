@@ -441,7 +441,9 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     // 提取查询中的实体
                     let mut query_entities = extract_query_entities(input, &config);
                     query_entities.extend(entities.clone());
-                    query_entities.dedup();
+                    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+                    let mut seen_entities = std::collections::HashSet::new();
+                    query_entities.retain(|e| seen_entities.insert(e.clone()));
                     
                     // === 新增歧义解析功能 ===
                     if let Some(api_config) = &config.api {
@@ -643,7 +645,9 @@ async fn continue_original_query(
     // 提取查询中的实体
     let mut query_entities = extract_query_entities(input, config);
     query_entities.extend(entities.iter().cloned());
-    query_entities.dedup();
+    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+    let mut seen_entities = std::collections::HashSet::new();
+    query_entities.retain(|e| seen_entities.insert(e.clone()));
     
     // 使用歧义解析功能（如果启用）
     if let Some(api_config) = &config.api {

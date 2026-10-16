@@ -164,6 +164,14 @@ impl ExternalKnowledgeService {
             }
         }
         
+        if question.contains("作者") {
+            for (attr, value) in &knowledge.avp {
+                if attr.contains("作者") || attr.contains("创作者") {
+                    return format!("{}的作者是{}", knowledge.entity, value);
+                }
+            }
+        }
+        
         // Default response with entity description
         if let Some(desc) = &knowledge.desc {
             format!("关于{}：{}", knowledge.entity, desc)
