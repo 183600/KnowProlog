@@ -207,8 +207,7 @@ impl EntityLinker {
         }
     }
 
-    // 与历史全量排序等价：先按字符数降序，再按字典序升序。
-    // 仅对新增的表层名做二分插入，避免每次注册都重排全部表层名。
+    // 表层名序列按字符数降序、字典序升序维护，新项二分插入保持有序。
     fn insert_surface_sorted(&mut self, surface: &str) {
         let chars: Vec<char> = surface.chars().collect();
         let len = chars.len();
