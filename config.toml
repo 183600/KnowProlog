@@ -26,6 +26,13 @@ max_profile_sentences = 6              # 单次生成介绍段落的最大事实
 completion_min_score = 0.3             # 类型级/全局级谓词回退的最低统计支持度
 enable_entailment = true               # 是否启用形式化语义与语义蕴含判定（陈述句校验/生成自检）
 entailment_min_confidence = 0.5        # 规则推断作为蕴含证据的最低置信度
+enable_resolution = true               # 是否启用一阶归结推理（证明树 + 推理链，纯符号）
+resolution_max_depth = 6               # 归结搜索的最大嵌套深度（防无限递归）
+resolution_max_solutions = 12          # 归结查询最多返回的解数
+enable_association_rules = true        # 是否启用关联规则挖掘（支持度/置信度/提升度/杠杆率）
+association_min_support = 0.2          # 关联规则最小支持度（实体篮子占比）
+association_min_confidence = 0.5       # 关联规则最小置信度
+association_min_lift = 1.05            # 关联规则最小提升度（>1 才说明非随机共现）
 
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]

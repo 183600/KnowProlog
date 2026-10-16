@@ -114,6 +114,19 @@ impl SymbolicGenerator {
         self.entity_types.get(name).map(String::as_str)
     }
 
+    /// 已登记类型的所有实体（实体名, 类型名），供归结引擎编码 type 事实
+    pub fn typed_entities(&self) -> Vec<(String, String)> {
+        self.entity_types
+            .iter()
+            .map(|(entity, etype)| (entity.clone(), etype.clone()))
+            .collect()
+    }
+
+    /// 把一条事实渲染成自然中文句子（对外复用动词化词典）
+    pub fn render_fact(&self, subject: &str, predicate: &str, objects: &[String]) -> String {
+        self.lexicalize(subject, predicate, objects)
+    }
+
     pub fn has_attribute(&self, entity: &str, key: &str, value: &str) -> bool {
         self.attributes.get(entity).map_or(false, |pairs| {
             pairs.iter().any(|(k, v)| k == key && v == value)

@@ -2,17 +2,68 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::entity_linker::{EntityLinker, LinkMethod};
-use crate::link_prediction::{LinkPredictor, Prediction, Triple};
+use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
+use crate::resolution_engine::{
+    render_term, Atom, Clause, DerivedFact, ProofNode, ProofSource, ResolutionEngine, Term,
+};
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{
     self, EntailmentResult, Knowledge, PropositionParser, Verdict,
 };
 use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
 use crate::ReasoningConfig;
+
+// 归结引擎内部谓词：has(E, 谓词名) / type(E, 类型名)，用于承载关联规则的物品
+const PROOF_HAS: &str = "__具有__";
+const PROOF_TYPE: &str = "__类型__";
+
+// 把链接预测挖掘出的 Horn 规则（组合/逆向/共同邻居/共同主体）转成归结子句
+fn clause_from_path_rule(rule: &HornRule) -> Clause {
+    let a = || Term::var("A");
+    let b = || Term::var("B");
+    let c = || Term::var("C");
+    let source = format!("链接预测规则 {}", rule.rule_text());
+    match rule.template {
+        RuleTemplate::Compose => Clause::new(
+            Atom::pattern(&rule.head, a(), c()),
+            vec![
+                Atom::pattern(rule.body1(), a(), b()),
+                Atom::pattern(rule.body2().unwrap_or(""), b(), c()),
+            ],
+            rule.confidence,
+            &source,
+        ),
+        RuleTemplate::Inverse => Clause::new(
+            Atom::pattern(&rule.head, b(), a()),
+            vec![Atom::pattern(rule.body1(), a(), b())],
+            rule.confidence,
+            &source,
+        ),
+        RuleTemplate::CommonNeighbor => Clause::new(
+            Atom::pattern(&rule.head, a(), b()),
+            vec![
+                Atom::pattern(rule.body1(), a(), c()),
+                Atom::pattern(rule.body2().unwrap_or(""), b(), c()),
+            ],
+            rule.confidence,
+            &source,
+        ),
+        RuleTemplate::CommonObject => Clause::new(
+            Atom::pattern(&rule.head, a(), b()),
+            vec![
+                Atom::pattern(rule.body1(), c(), a()),
+                Atom::pattern(rule.body2().unwrap_or(""), c(), b()),
+            ],
+            rule.confidence,
+            &source,
+        ),
+    }
+}
 
 // 上一段生成的记忆：实体、已讲句数、段落排序角度（支持"接着说/换个角度说"）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +250,12 @@ pub struct SymbolicReasoner {
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
+    // 实体属性三元组（观察到的），供归结引擎编码事实
+    attributes: HashSet<(String, String, String)>,
+    // 关联规则挖掘器（类型/谓词/属性篮子的支持度-置信度-提升度）
+    associations: AssociationMiner,
+    // 一阶归结引擎（事实 + 链接预测规则 + 关联规则）
+    resolver: ResolutionEngine,
 }
 
 impl SymbolicReasoner {
@@ -213,6 +270,15 @@ impl SymbolicReasoner {
             config.max_profile_sentences,
             config.completion_min_score,
         );
+        let associations = AssociationMiner::new(
+            config.association_min_support,
+            config.association_min_confidence,
+            config.association_min_lift,
+        );
+        let resolver = ResolutionEngine::new(
+            config.resolution_max_depth,
+            config.resolution_max_solutions,
+        );
         Self {
             config,
             aligner,
@@ -222,6 +288,9 @@ impl SymbolicReasoner {
             planner: QueryPlanner::new(),
             linker,
             generator,
+            attributes: HashSet::new(),
+            associations,
+            resolver,
         }
     }
 
@@ -244,6 +313,8 @@ impl SymbolicReasoner {
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         let mut added = 0usize;
         let mut entity_observed = false;
+        let mut association_changed = false;
+        let mut attribute_changed = false;
         let triples_before = self.predictor.triple_count();
         for fact in facts {
             match fact {
@@ -255,6 +326,7 @@ impl SymbolicReasoner {
                     if self.config.enable_semantic_embedding {
                         self.embedding.observe_triple(from, rel_type, to);
                     }
+                    association_changed |= self.associations.observe_triple(from, rel_type);
                     added += 1;
                 }
                 PrologFact::Entity {
@@ -278,25 +350,79 @@ impl SymbolicReasoner {
                         let property_keys: Vec<String> = properties.keys().cloned().collect();
                         self.embedding.observe_entity(name, entity_type, &property_keys);
                     }
+                    let property_keys: Vec<String> = properties.keys().cloned().collect();
+                    association_changed |=
+                        self.associations
+                            .observe_entity(name, entity_type, &property_keys);
+                    for (key, value) in properties {
+                        if self
+                            .attributes
+                            .insert((name.clone(), key.clone(), value.clone()))
+                        {
+                            attribute_changed = true;
+                        }
+                    }
                     entity_observed = true;
                 }
             }
         }
+        let triples_added = self.predictor.triple_count() > triples_before;
         // 规则只依赖已积累的三元组与固定阈值：若本次没有新增三元组，
         // 重新挖掘必然得到相同规则，直接跳过
-        if added > 0
-            && self.config.enable_link_prediction
-            && self.predictor.triple_count() > triples_before
-        {
+        if triples_added && self.config.enable_link_prediction {
             self.predictor.mine_rules(
                 self.config.link_prediction_min_support,
                 self.config.link_prediction_min_confidence,
             );
         }
+        // 关联规则与前向/反向归结都只依赖已观察的篮子与事实：无新增则跳过重建
+        if self.config.enable_association_rules && (association_changed || triples_added) {
+            self.associations.mine();
+        }
+        if self.config.enable_resolution && (association_changed || attribute_changed || triples_added)
+        {
+            self.rebuild_resolver();
+        }
         // 实体事实同样会更新嵌入（observe_entity），因此也需要重建
         if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();
         }
+    }
+
+    // 用当前知识（事实 + 链接预测规则 + 关联规则）重建归结引擎
+    fn rebuild_resolver(&mut self) {
+        let mut engine = ResolutionEngine::new(
+            self.config.resolution_max_depth,
+            self.config.resolution_max_solutions,
+        );
+        for triple in self.predictor.triples() {
+            engine.add_fact(&triple.predicate, &triple.subject, &triple.object);
+            engine.add_fact(PROOF_HAS, &triple.subject, &triple.predicate);
+        }
+        for (subject, key, value) in &self.attributes {
+            engine.add_fact(key, subject, value);
+            engine.add_fact(PROOF_HAS, subject, key);
+        }
+        for (entity, etype) in self.generator.typed_entities() {
+            engine.add_fact(PROOF_TYPE, &entity, &etype);
+        }
+        if self.config.enable_association_rules {
+            for clause in self.associations.to_clauses(PROOF_HAS, PROOF_TYPE) {
+                engine.add_clause(clause);
+            }
+        }
+        for rule in self.predictor.rules() {
+            engine.add_clause(clause_from_path_rule(rule));
+        }
+        self.resolver = engine;
+    }
+
+    pub fn resolver(&self) -> &ResolutionEngine {
+        &self.resolver
+    }
+
+    pub fn associations(&self) -> &AssociationMiner {
+        &self.associations
     }
 
     pub fn contextualize(&mut self, input: &str) -> Option<String> {
@@ -679,14 +805,442 @@ impl SymbolicReasoner {
             return None;
         }
         let trimmed = prefix.trim();
-        if let Some(root) = trimmed.strip_suffix('的') {
+        let normalized = trimmed.strip_suffix('的').map(|root| {
             let root = root.trim();
             let canonical = self.aligner.canonical_form(root);
             if !canonical.is_empty() && canonical != root {
-                return self.generator.complete(&format!("{}的", canonical));
+                format!("{}的", canonical)
+            } else {
+                trimmed.to_string()
+            }
+        });
+        let base = self
+            .generator
+            .complete(normalized.as_deref().unwrap_or(trimmed))?;
+        // 统计回退之外再挂一层"关联规则联想"：由已有特征推荐缺失特征（纯计数）
+        if self.config.enable_association_rules {
+            if let Some(root) = trimmed.strip_suffix('的') {
+                if let Some(extra) = self.association_suggestions(root.trim()) {
+                    let mut output = base;
+                    output.push('\n');
+                    output.push_str(&extra);
+                    return Some(output);
+                }
             }
         }
-        self.generator.complete(trimmed)
+        Some(base)
+    }
+
+    // ===== 归结推理：证明、推理链与关联规则 =====
+
+    fn resolve_known_entity(&self, raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let canonical = self.aligner.canonical_form(trimmed);
+        let candidate = if canonical.is_empty() {
+            trimmed.to_string()
+        } else {
+            canonical
+        };
+        if self.generator.is_known_entity(&candidate) || self.associations.basket(&candidate).is_some()
+        {
+            return Some(candidate);
+        }
+        self.best_linked_entity(trimmed).filter(|entity| {
+            self.generator.is_known_entity(entity) || self.associations.basket(entity).is_some()
+        })
+    }
+
+    // 解析 "S的P1的P2...是O"（谓词串可为空 ⇒ 类型断言）
+    fn parse_chain_statement(&self, text: &str) -> Option<(String, Vec<String>, String)> {
+        let trimmed = text.trim().trim_end_matches(['。', '！', '!']).trim();
+        let (subject_part, object_part) = trimmed.rsplit_once('是')?;
+        let object = self.aligner.canonical_form(object_part.trim());
+        if object.is_empty() {
+            return None;
+        }
+        let segments: Vec<String> = subject_part
+            .split('的')
+            .map(|segment| segment.trim().to_string())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments.is_empty() {
+            return None;
+        }
+        if segments.len() == 1 {
+            let entity = self.aligner.canonical_form(&segments[0]);
+            if entity.is_empty() {
+                return None;
+            }
+            return Some((entity, Vec::new(), object));
+        }
+        let (entity, predicates) = self.split_chain(&segments)?;
+        if predicates.is_empty() {
+            return None;
+        }
+        Some((entity, predicates, object))
+    }
+
+    fn render_atom_nl(&self, atom: &Atom) -> String {
+        let names: Vec<String> = atom.terms.iter().map(render_term).collect();
+        if atom.predicate == PROOF_HAS && names.len() == 2 {
+            return format!("{} 具有 {}", names[0], names[1]);
+        }
+        if atom.predicate == PROOF_TYPE && names.len() == 2 {
+            return format!("{} 属于类型 {}", names[0], names[1]);
+        }
+        if names.len() == 2 {
+            let sentence = self
+                .generator
+                .render_fact(&names[0], &atom.predicate, &[names[1].clone()]);
+            return sentence.trim_end_matches('。').to_string();
+        }
+        atom.display()
+    }
+
+    fn render_proof_tree(&self, node: &ProofNode, lines: &mut Vec<String>, indent: usize) {
+        let padding = "    ".repeat(indent);
+        let fact = self.render_atom_nl(&node.atom);
+        match &node.source {
+            ProofSource::Fact => lines.push(format!("{}{}（事实）", padding, fact)),
+            ProofSource::Rule { source } => lines.push(format!(
+                "{}{}（由 {}；本步置信度 {:.2}）",
+                padding, fact, source, node.confidence
+            )),
+        }
+        for child in &node.children {
+            self.render_proof_tree(child, lines, indent + 1);
+        }
+    }
+
+    fn render_resolution_result(&self, phrase: &str, goals: &[Atom]) -> String {
+        let solutions = self.resolver.solve(goals, &[]);
+        let goal_display = goals
+            .iter()
+            .map(|goal| goal.display())
+            .collect::<Vec<_>>()
+            .join("，");
+        let mut output = String::from("归结证明（一阶 Horn 归结 + 回溯证明树，纯符号）：\n");
+        output.push_str(&format!("  目标：{}  〔逻辑形式：{}〕\n", phrase, goal_display));
+        output.push_str(&format!(
+            "  知识库：{} 条事实，{} 条规则（含链接预测与关联规则）\n",
+            self.resolver.fact_count(),
+            self.resolver.clause_count()
+        ));
+        if let Some(solution) = solutions.first() {
+            output.push_str(&format!("  得证：证明置信度 {:.2}\n", solution.confidence));
+            output.push_str("  证明树：\n");
+            let mut lines = Vec::new();
+            for proof in &solution.proofs {
+                self.render_proof_tree(proof, &mut lines, 2);
+            }
+            output.push_str(&lines.join("\n"));
+        } else {
+            output.push_str(&format!(
+                "  未得证：在深度上限 {} 内未找到归结反驳（开世界假设：推不出 ≠ 为假）。\n",
+                self.resolver.max_depth()
+            ));
+            output.push_str("  可尝试「推理链：同句式问句」查看可能的解，或先补充相关事实/规则。\n");
+        }
+        output
+    }
+
+    // "X有P" 形式的存在性目标：由关联规则/前向推导证明
+    fn prove_existence_statement(&self, text: &str) -> Option<String> {
+        let (subject_part, object_part) = text.split_once('有')?;
+        let subject_part = subject_part.trim();
+        let object_part = object_part.trim();
+        if subject_part.is_empty() || object_part.is_empty() {
+            return None;
+        }
+        if subject_part.contains('的') || object_part.contains('的') {
+            return None;
+        }
+        let entity = self.resolve_known_entity(subject_part)?;
+        let predicate = self.aligner.canonical_form(object_part);
+        if predicate.is_empty() {
+            return None;
+        }
+        let goals = vec![Atom::rel(PROOF_HAS, &entity, &predicate)];
+        Some(self.render_resolution_result(&format!("{} 具有 {}", entity, predicate), &goals))
+    }
+
+    /// 证明一条陈述（"S的P…是O" / "S是类型" / "S有P"），输出回归结证明树
+    pub fn resolution_proof_report(&self, text: &str) -> String {
+        if !self.config.enable_resolution {
+            return "归结推理未启用（config.toml [reasoning] enable_resolution = false）。".to_string();
+        }
+        let trimmed = text.trim().trim_end_matches(['？', '?', '。', '！', '!', ' ']);
+        if trimmed.is_empty() {
+            return "请提供要证明的陈述，例如：证明：张三的师祖是王五 或 证明：姚明有国籍".to_string();
+        }
+        if let Some(report) = self.prove_existence_statement(trimmed) {
+            return report;
+        }
+        match self.parse_chain_statement(trimmed) {
+            Some((entity, predicates, object)) => {
+                let (goals, phrase) = if predicates.is_empty() {
+                    (
+                        vec![Atom::rel(PROOF_TYPE, &entity, &object)],
+                        format!("{} 属于类型 {}", entity, object),
+                    )
+                } else if predicates.len() == 1 {
+                    (
+                        vec![Atom::rel(&predicates[0], &entity, &object)],
+                        format!("{}的{}是{}", entity, predicates[0], object),
+                    )
+                } else {
+                    let mut goals = Vec::new();
+                    let mut previous = Term::constant(&entity);
+                    for (index, predicate) in predicates.iter().enumerate() {
+                        let next = if index + 1 == predicates.len() {
+                            Term::constant(&object)
+                        } else {
+                            Term::var(&format!("V{}", index + 1))
+                        };
+                        goals.push(Atom::pattern(predicate, previous.clone(), next.clone()));
+                        previous = next;
+                    }
+                    (
+                        goals,
+                        format!("{}的{}是{}", entity, predicates.join("的"), object),
+                    )
+                };
+                self.render_resolution_result(&phrase, &goals)
+            }
+            None => format!(
+                "无法把「{}」解析为可归结的目标。支持句式：S的P…是O / S是类型 / S有P。",
+                trimmed
+            ),
+        }
+    }
+
+    /// 开放目标（"X的P…是谁"）：返回全部归结解与各解的证明链
+    pub fn resolution_query_report(&self, text: &str) -> String {
+        if !self.config.enable_resolution {
+            return "归结推理未启用（config.toml [reasoning] enable_resolution = false）。".to_string();
+        }
+        let trimmed = text.trim().trim_end_matches(['？', '?', '。', ' ']);
+        if trimmed.is_empty() {
+            return "请提供推理目标，例如：推理链：张三的师祖是谁".to_string();
+        }
+        let mut core = trimmed.to_string();
+        for suffix in [
+            "是谁", "是什么", "是多少", "是哪里", "是哪个", "是哪儿", "是哪位", "是哪些", "是几",
+        ] {
+            if let Some(rest) = core.strip_suffix(suffix) {
+                core = rest.to_string();
+                break;
+            }
+        }
+        // 句中仍带"是"（如"推理链：张三的师祖是王五"）→ 按证明处理
+        if core.contains('是') {
+            return self.resolution_proof_report(&core);
+        }
+        let segments: Vec<String> = core
+            .split('的')
+            .map(|segment| segment.trim().to_string())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let Some((entity, predicates)) = self.split_chain(&segments) else {
+            return format!("无法把「{}」解析为谓词链目标。", trimmed);
+        };
+        if predicates.is_empty() {
+            return format!(
+                "「{}」只有实体没有谓词链，请补充关系，例如：推理链：{}的师傅是谁",
+                trimmed, entity
+            );
+        }
+        let answer_var = "答案".to_string();
+        let mut goals = Vec::new();
+        let mut previous = Term::constant(&entity);
+        for (index, predicate) in predicates.iter().enumerate() {
+            let next = if index + 1 == predicates.len() {
+                Term::var(&answer_var)
+            } else {
+                Term::var(&format!("V{}", index + 1))
+            };
+            goals.push(Atom::pattern(predicate, previous, next.clone()));
+            previous = next;
+        }
+        let solutions = self.resolver.solve(&goals, std::slice::from_ref(&answer_var));
+        let goal_display = goals
+            .iter()
+            .map(|goal| goal.display())
+            .collect::<Vec<_>>()
+            .join("，");
+        let mut output = String::from("归结推理链（一阶 Horn 归结，解与证明均可回溯）：\n");
+        output.push_str(&format!(
+            "  目标：{}的{}是谁  〔逻辑形式：{}〕\n",
+            entity,
+            predicates.join("的"),
+            goal_display
+        ));
+        output.push_str(&format!(
+            "  知识库：{} 条事实，{} 条规则；深度上限 {}\n",
+            self.resolver.fact_count(),
+            self.resolver.clause_count(),
+            self.resolver.max_depth()
+        ));
+        if solutions.is_empty() {
+            output.push_str("  没有找到解（开世界假设：推不出 ≠ 不存在）。\n");
+            return output;
+        }
+        for (index, solution) in solutions.iter().enumerate() {
+            let answer = solution
+                .bindings
+                .get(&answer_var)
+                .cloned()
+                .unwrap_or_else(|| "?".to_string());
+            output.push_str(&format!(
+                "  解 {}（证明置信度 {:.2}）：答案是「{}」\n",
+                index + 1,
+                solution.confidence,
+                answer
+            ));
+            let mut lines = Vec::new();
+            for proof in &solution.proofs {
+                self.render_proof_tree(proof, &mut lines, 2);
+            }
+            output.push_str(&lines.join("\n"));
+            output.push('\n');
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 关联规则报告（可带过滤词，比如实体/类型/谓词）
+    pub fn association_report(&self, filter: Option<&str>) -> String {
+        if !self.config.enable_association_rules {
+            return "关联规则挖掘未启用（config.toml [reasoning] enable_association_rules = false）。"
+                .to_string();
+        }
+        let mut output = String::from("关联规则报告（支持度/置信度/提升度/杠杆率，纯计数）：\n");
+        output.push_str(&format!(
+            "  实体篮子 {} 个，物品 {} 种，规则 {} 条（阈值：支持度≥{:.2}，置信度≥{:.2}，提升度≥{:.2}）\n",
+            self.associations.basket_count(),
+            self.associations.item_kinds(),
+            self.associations.rules().len(),
+            self.config.association_min_support,
+            self.config.association_min_confidence,
+            self.config.association_min_lift
+        ));
+        let filter = filter.map(str::trim).filter(|filter| !filter.is_empty());
+        let rules: Vec<&AssociationRule> = self
+            .associations
+            .rules()
+            .iter()
+            .filter(|rule| match filter {
+                None => true,
+                Some(filter) => {
+                    let normalized = self.aligner.canonical_form(filter);
+                    rule.consequent.contains(filter)
+                        || rule.consequent.contains(&normalized)
+                        || rule
+                            .antecedent
+                            .iter()
+                            .any(|item| item.contains(filter) || item.contains(&normalized))
+                }
+            })
+            .collect();
+        if rules.is_empty() {
+            output.push_str("  （没有满足条件/阈值的规则：可多导入同类型实体，或降低阈值）\n");
+            return output;
+        }
+        for (index, rule) in rules.iter().take(20).enumerate() {
+            output.push_str(&format!(
+                "  {}. {} —— {}\n",
+                index + 1,
+                rule.rule_text(),
+                rule.metrics_text()
+            ));
+        }
+        if rules.len() > 20 {
+            output.push_str(&format!("  ……其余 {} 条省略\n", rules.len() - 20));
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 实体补全联想："已有特征 ⇒ 可能还具备的缺失特征"
+    pub fn association_suggestions(&self, entity_raw: &str) -> Option<String> {
+        if !self.config.enable_association_rules {
+            return None;
+        }
+        let entity = self.resolve_known_entity(entity_raw)?;
+        let suggestions = self.associations.suggestions_for(&entity, 3);
+        if suggestions.is_empty() {
+            return None;
+        }
+        let basket = self.associations.basket(&entity)?;
+        let mut features: Vec<&str> = basket.iter().map(|item| display_item(item)).collect();
+        features.sort();
+        let mut output = format!(
+            "关联规则联想（{} 个实体篮子的计数统计，无神经网络）：\n",
+            self.associations.basket_count()
+        );
+        output.push_str(&format!(
+            "  「{}」已有特征：{}\n",
+            entity,
+            features.join("、")
+        ));
+        for (index, rule) in suggestions.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. 可能还具备「{}」——{}\n",
+                index + 1,
+                rule.consequent_text(),
+                self.associations.explain(rule)
+            ));
+        }
+        Some(output.trim_end().to_string())
+    }
+
+    /// 前向饱和推导报告：多跳新事实（含前提与规则来源）
+    pub fn derived_facts_report(&self, limit: usize) -> String {
+        if !self.config.enable_resolution {
+            return "归结推理未启用（config.toml [reasoning] enable_resolution = false）。".to_string();
+        }
+        let derived = self.resolver.forward_chain(3, 100);
+        let mut output = String::from("推理发现（前向饱和，多跳优先；均可回溯前提）：\n");
+        output.push_str(&format!(
+            "  现有 {} 条事实、{} 条规则，本轮推出 {} 条新事实。\n",
+            self.resolver.fact_count(),
+            self.resolver.clause_count(),
+            derived.len()
+        ));
+        if derived.is_empty() {
+            output.push_str("  （没有可推导的新事实：可增加事实/规则或放宽规则阈值）\n");
+            return output;
+        }
+        let mut items: Vec<&DerivedFact> = derived.iter().collect();
+        items.sort_by(|a, b| {
+            b.depth
+                .cmp(&a.depth)
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        for (index, item) in items.into_iter().take(limit.max(1)).enumerate() {
+            let premises = item
+                .premises
+                .iter()
+                .map(|premise| self.render_atom_nl(premise))
+                .collect::<Vec<_>>()
+                .join("；");
+            output.push_str(&format!(
+                "  {}. {}（第 {} 轮推导；前提：{}；规则：{}；置信度 {:.2}）\n",
+                index + 1,
+                self.render_atom_nl(&item.atom),
+                item.depth,
+                premises,
+                item.rule_source,
+                item.confidence
+            ));
+        }
+        output.trim_end().to_string()
     }
 
     fn is_known_entity(&self, name: &str) -> bool {
@@ -1422,6 +1976,13 @@ mod tests {
             completion_min_score: 0.3,
             enable_entailment: true,
             entailment_min_confidence: 0.5,
+            enable_resolution: true,
+            resolution_max_depth: 6,
+            resolution_max_solutions: 12,
+            enable_association_rules: true,
+            association_min_support: 0.2,
+            association_min_confidence: 0.5,
+            association_min_lift: 1.05,
         }
     }
 
@@ -1904,5 +2465,133 @@ mod tests {
             .predict_continuation("老三的")
             .expect("同义词前缀应先归一化再续写");
         assert!(aliased_completion.contains("张三"));
+    }
+
+    fn nationality_facts() -> Vec<PrologFact> {
+        let mut facts = Vec::new();
+        for (name, has_nationality) in [
+            ("张三", true),
+            ("李四", true),
+            ("王五", true),
+            ("赵六", false),
+        ] {
+            let mut properties = HashMap::new();
+            properties.insert("出生地".to_string(), format!("{}市", name));
+            if has_nationality {
+                properties.insert("国籍".to_string(), "中国".to_string());
+            }
+            facts.push(PrologFact::Entity {
+                name: name.to_string(),
+                entity_type: "人物".to_string(),
+                properties,
+            });
+        }
+        // 一个无特征的地点篮子：拉低国籍先验，使关联规则的提升度可判
+        facts.push(PrologFact::Entity {
+            name: "无名城".to_string(),
+            entity_type: "地点".to_string(),
+            properties: HashMap::new(),
+        });
+        // 关系事实：让生成器有全局统计可回退（属性不进入关系计数）
+        facts.push(PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "李四".to_string(),
+        });
+        facts
+    }
+
+    #[test]
+    fn test_resolution_proof_from_facts_and_chain_goals() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.resolution_proof_report("张三的师傅的师傅是王五");
+        assert!(report.contains("得证"), "实际：{}", report);
+        assert!(report.contains("王五"));
+        assert!(report.contains("证明树"));
+        assert!(report.contains("事实"));
+        let failed = reasoner.resolution_proof_report("张三的师傅的师傅是赵六");
+        assert!(failed.contains("未得证"), "实际：{}", failed);
+    }
+
+    #[test]
+    fn test_resolution_proof_uses_mined_horn_rule() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.resolution_proof_report("李四的师祖是赵六");
+        assert!(report.contains("得证"), "实际：{}", report);
+        assert!(
+            report.contains("链接预测规则"),
+            "证明树应标出规则来源：{}",
+            report
+        );
+        assert!(report.contains("师傅"));
+    }
+
+    #[test]
+    fn test_resolution_query_returns_solution_and_proof() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.resolution_query_report("张三的师傅的师傅是谁");
+        assert!(report.contains("答案是「王五」"), "实际：{}", report);
+        assert!(report.contains("事实"));
+        assert!(report.contains("知识库"));
+    }
+
+    #[test]
+    fn test_resolution_proves_existence_via_association_rule() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&nationality_facts());
+        let report = reasoner.resolution_proof_report("赵六有国籍");
+        assert!(report.contains("得证"), "实际：{}", report);
+        assert!(report.contains("关联规则"), "应有归结算子句来源：{}", report);
+        assert!(report.contains("国籍"));
+        let known = reasoner.resolution_proof_report("张三有国籍");
+        assert!(known.contains("得证"));
+        assert!(known.contains("事实"));
+    }
+
+    #[test]
+    fn test_association_report_and_suggestions() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&nationality_facts());
+        let report = reasoner.association_report(None);
+        assert!(report.contains("支持度"), "实际：{}", report);
+        assert!(report.contains("提升度"));
+        assert!(report.contains("出生地"));
+        let filtered = reasoner.association_report(Some("国籍"));
+        assert!(filtered.contains("国籍"), "实际：{}", filtered);
+        let suggestions = reasoner
+            .association_suggestions("赵六")
+            .expect("赵六缺国籍应有关联联想");
+        assert!(suggestions.contains("国籍"), "实际：{}", suggestions);
+        assert!(suggestions.contains("提升度"));
+        assert!(!suggestions.contains("已有特征：国籍"));
+    }
+
+    #[test]
+    fn test_derived_facts_report_discovers_multi_hop() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.derived_facts_report(10);
+        assert!(report.contains("推理发现"), "实际：{}", report);
+        assert!(
+            report.contains("第 1 轮推导"),
+            "应给出推导轮次：{}",
+            report
+        );
+        assert!(report.contains("李四") && report.contains("赵六"));
+        assert!(report.contains("前提"));
+    }
+
+    #[test]
+    fn test_continuation_appends_association_suggestions() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&nationality_facts());
+        let text = reasoner
+            .predict_continuation("赵六的")
+            .expect("已知实体应能续写");
+        assert!(text.contains("关联规则联想"), "实际：{}", text);
+        assert!(text.contains("国籍"));
     }
 }

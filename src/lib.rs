@@ -30,6 +30,8 @@ pub mod symbolic_reasoner;
 pub mod entity_linker;
 pub mod symbolic_generator;
 pub mod semantic_entailment;
+pub mod resolution_engine;
+pub mod association_miner;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
@@ -87,6 +89,48 @@ pub struct ReasoningConfig {
     pub enable_entailment: bool,
     #[serde(default = "default_entailment_min_confidence")]
     pub entailment_min_confidence: f64,
+    #[serde(default = "default_enable_resolution")]
+    pub enable_resolution: bool,
+    #[serde(default = "default_resolution_max_depth")]
+    pub resolution_max_depth: usize,
+    #[serde(default = "default_resolution_max_solutions")]
+    pub resolution_max_solutions: usize,
+    #[serde(default = "default_enable_association_rules")]
+    pub enable_association_rules: bool,
+    #[serde(default = "default_association_min_support")]
+    pub association_min_support: f64,
+    #[serde(default = "default_association_min_confidence")]
+    pub association_min_confidence: f64,
+    #[serde(default = "default_association_min_lift")]
+    pub association_min_lift: f64,
+}
+
+fn default_enable_resolution() -> bool {
+    true
+}
+
+fn default_resolution_max_depth() -> usize {
+    6
+}
+
+fn default_resolution_max_solutions() -> usize {
+    12
+}
+
+fn default_enable_association_rules() -> bool {
+    true
+}
+
+fn default_association_min_support() -> f64 {
+    0.2
+}
+
+fn default_association_min_confidence() -> f64 {
+    0.5
+}
+
+fn default_association_min_lift() -> f64 {
+    1.05
 }
 
 fn default_enable_entailment() -> bool {
@@ -153,6 +197,13 @@ impl Default for ReasoningConfig {
             completion_min_score: default_completion_min_score(),
             enable_entailment: default_enable_entailment(),
             entailment_min_confidence: default_entailment_min_confidence(),
+            enable_resolution: default_enable_resolution(),
+            resolution_max_depth: default_resolution_max_depth(),
+            resolution_max_solutions: default_resolution_max_solutions(),
+            enable_association_rules: default_enable_association_rules(),
+            association_min_support: default_association_min_support(),
+            association_min_confidence: default_association_min_confidence(),
+            association_min_lift: default_association_min_lift(),
         }
     }
 }

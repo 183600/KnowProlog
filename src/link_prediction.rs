@@ -127,6 +127,10 @@ impl LinkPredictor {
         self.triples.len()
     }
 
+    pub fn triples(&self) -> &[Triple] {
+        &self.triples
+    }
+
     pub fn rules(&self) -> &[HornRule] {
         &self.rules
     }

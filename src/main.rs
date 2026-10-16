@@ -317,6 +317,81 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 归结证明：对陈述句做 SLD 反驳并输出证明树（纯符号）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["证明：", "证明:", "归结：", "归结:", "证明目标：", "证明目标:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要证明的陈述，例如：证明：张三的师祖是王五");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.resolution_proof_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 推理链：对开放目标求全部归结解，逐解展示证明链
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["推理链：", "推理链:", "寻找证明：", "寻找证明:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供推理目标，例如：推理链：张三的师傅的师傅是谁");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.resolution_query_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 关联规则报告：支持度/置信度/提升度/杠杆率（可带过滤词）
+        if input == "关联规则" || input == "关联规则报告" {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.association_report(None));
+            println!();
+            continue;
+        }
+        if let Some(filter) = strip_any_prefix(input, &["关联规则：", "关联规则:"]) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.association_report(Some(filter)));
+            println!();
+            continue;
+        }
+
+        // 联想：由关联规则推荐实体可能还具备的缺失特征
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["联想：", "联想:", "关联联想：", "关联联想:"],
+        ) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请提供要联想的实体，例如：联想：姚明");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                match symbolic_reasoner.association_suggestions(entity) {
+                    Some(text) => println!("{}", text),
+                    None => println!(
+                        "没有可用的关联联想（实体未见过，或没有满足阈值的关联规则）。"
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 推理发现：正向饱和推出多跳新事实（含前提与规则来源）
+        if input == "推理发现" || input == "推导发现" {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.derived_facts_report(10));
+            println!();
+            continue;
+        }
+
         let mode = detect_input_mode(input, &config.nlp.import_keywords);
 
         match mode {
