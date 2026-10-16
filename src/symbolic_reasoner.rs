@@ -2,24 +2,40 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::entity_linker::{EntityLinker, LinkMethod};
 use crate::link_prediction::{LinkPredictor, Prediction, Triple};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::semantic_embedding::SymbolicEmbedding;
+use crate::semantic_entailment::{
+    self, EntailmentResult, Knowledge, PropositionParser, Verdict,
+};
+use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
 use crate::ReasoningConfig;
+
+// 上一段生成的记忆：实体、已讲句数、段落排序角度（支持"接着说/换个角度说"）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationState {
+    pub entity: String,
+    pub shown: usize,
+    pub order: GenerationOrder,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueSnapshot {
     pub focus_entities: Vec<String>,
     pub last_predicate: Option<String>,
     pub history: Vec<String>,
+    #[serde(default)]
+    pub generation: Option<GenerationState>,
 }
 
 pub struct DialogueContext {
     focus_entities: Vec<String>,
     last_predicate: Option<String>,
     history: Vec<String>,
+    generation: Option<GenerationState>,
     max_focus: usize,
     max_history: usize,
 }
@@ -30,6 +46,7 @@ impl DialogueContext {
             focus_entities: Vec::new(),
             last_predicate: None,
             history: Vec::new(),
+            generation: None,
             max_focus,
             max_history: 20,
         }
@@ -84,6 +101,22 @@ impl DialogueContext {
         self.focus_entities.clear();
         self.last_predicate = None;
         self.history.clear();
+        self.generation = None;
+    }
+
+    pub fn generation_state(&self) -> Option<&GenerationState> {
+        self.generation.as_ref()
+    }
+
+    pub fn record_generation(&mut self, entity: &str, shown: usize, order: GenerationOrder) {
+        if entity.trim().is_empty() {
+            return;
+        }
+        self.generation = Some(GenerationState {
+            entity: entity.to_string(),
+            shown,
+            order,
+        });
     }
 
     pub fn snapshot(&self) -> DialogueSnapshot {
@@ -91,6 +124,7 @@ impl DialogueContext {
             focus_entities: self.focus_entities.clone(),
             last_predicate: self.last_predicate.clone(),
             history: self.history.clone(),
+            generation: self.generation.clone(),
         }
     }
 
@@ -100,6 +134,7 @@ impl DialogueContext {
         self.last_predicate = snapshot.last_predicate.clone();
         self.history = snapshot.history.clone();
         self.history.truncate(self.max_history);
+        self.generation = snapshot.generation.clone();
     }
 
     pub fn resolve_pronouns(&self, input: &str) -> Option<String> {
@@ -162,12 +197,22 @@ pub struct SymbolicReasoner {
     context: DialogueContext,
     embedding: SymbolicEmbedding,
     planner: QueryPlanner,
+    linker: EntityLinker,
+    generator: SymbolicGenerator,
 }
 
 impl SymbolicReasoner {
     pub fn new(config: ReasoningConfig, synonyms: HashMap<String, String>) -> Self {
         let aligner = OntologyAligner::new(synonyms, config.ontology_alignment_threshold);
         let embedding = SymbolicEmbedding::new(config.embedding_similarity_floor);
+        let mut linker = EntityLinker::new();
+        for (alias, canonical) in aligner.synonyms() {
+            linker.register_alias(alias, canonical);
+        }
+        let generator = SymbolicGenerator::new(
+            config.max_profile_sentences,
+            config.completion_min_score,
+        );
         Self {
             config,
             aligner,
@@ -175,6 +220,8 @@ impl SymbolicReasoner {
             context: DialogueContext::new(5),
             embedding,
             planner: QueryPlanner::new(),
+            linker,
+            generator,
         }
     }
 
@@ -186,6 +233,14 @@ impl SymbolicReasoner {
         &self.embedding
     }
 
+    pub fn linker(&self) -> &EntityLinker {
+        &self.linker
+    }
+
+    pub fn generator(&self) -> &SymbolicGenerator {
+        &self.generator
+    }
+
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         let mut added = 0usize;
         let triples_before = self.predictor.triple_count();
@@ -194,6 +249,8 @@ impl SymbolicReasoner {
                 PrologFact::Relation { from, rel_type, to } => {
                     self.aligner.observe_triple(from, rel_type, to);
                     self.predictor.add_triple(from, rel_type, to);
+                    self.linker.observe_triple(from, rel_type, to);
+                    self.generator.observe_triple(from, rel_type, to);
                     if self.config.enable_semantic_embedding {
                         self.embedding.observe_triple(from, rel_type, to);
                     }
@@ -209,6 +266,13 @@ impl SymbolicReasoner {
                     for property in properties.keys() {
                         self.aligner.register_term(property, TermKind::Attribute);
                     }
+                    self.linker.register_entity(name, Some(entity_type.as_str()));
+                    let property_pairs: Vec<(String, String)> = properties
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    self.generator
+                        .observe_entity(name, entity_type, &property_pairs);
                     if self.config.enable_semantic_embedding {
                         let property_keys: Vec<String> = properties.keys().cloned().collect();
                         self.embedding.observe_entity(name, entity_type, &property_keys);
@@ -267,7 +331,14 @@ impl SymbolicReasoner {
     }
 
     fn record_vocabulary(&mut self, text: &str) {
-        let entities = self.entities_mentioned(text);
+        let mut entities = self.entities_mentioned(text);
+        if self.config.enable_generation {
+            for entity in self.linked_entities(text) {
+                if !entities.contains(&entity) {
+                    entities.push(entity);
+                }
+            }
+        }
         if !entities.is_empty() {
             self.context.record_entities(&entities);
         }
@@ -346,6 +417,264 @@ impl SymbolicReasoner {
             }
         }
         false
+    }
+
+    // 实体链接：候选生成 + 模糊容错 + 上下文消歧（详见 entity_linker 模块）
+    const LINK_ACCEPT_THRESHOLD: f64 = 0.5;
+
+    pub fn linked_entities(&self, text: &str) -> Vec<String> {
+        let hints = self.link_hints(text);
+        let mentions = self.linker.link_with_context(text, &hints);
+        let mut seen = HashSet::new();
+        mentions
+            .iter()
+            .filter_map(|mention| mention.best())
+            .filter(|candidate| candidate.score >= Self::LINK_ACCEPT_THRESHOLD)
+            .map(|candidate| candidate.entity.clone())
+            .filter(|entity| seen.insert(entity.clone()))
+            .collect()
+    }
+
+    pub fn best_linked_entity(&self, text: &str) -> Option<String> {
+        let hints = self.link_hints(text);
+        self.linker
+            .link_with_context(text, &hints)
+            .iter()
+            .filter_map(|mention| {
+                mention
+                    .best()
+                    .map(|candidate| (candidate.score, candidate.entity.clone()))
+            })
+            .filter(|(score, _)| *score >= Self::LINK_ACCEPT_THRESHOLD)
+            .max_by(|a, b| {
+                a.0.partial_cmp(&b.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.1.cmp(&a.1))
+            })
+            .map(|(_, entity)| entity)
+    }
+
+    pub fn entity_link_report(&self, text: &str) -> String {
+        let hints = self.link_hints(text);
+        self.linker.report(text, &hints)
+    }
+
+    // 仅返回"模糊匹配"的链接说明，用于在回答前向用户提示容错链接
+    pub fn entity_link_notes(&self, text: &str) -> Vec<String> {
+        let hints = self.link_hints(text);
+        self.linker
+            .link_with_context(text, &hints)
+            .iter()
+            .filter_map(|mention| {
+                let candidate = mention.best()?;
+                if candidate.method != LinkMethod::Fuzzy {
+                    return None;
+                }
+                Some(format!(
+                    "实体链接：「{}」→「{}」（置信度 {:.2}）",
+                    mention.mention, candidate.entity, candidate.score
+                ))
+            })
+            .collect()
+    }
+
+    fn link_hints(&self, text: &str) -> Vec<String> {
+        self.known_predicates()
+            .into_iter()
+            .filter(|predicate| self.predicate_mentioned(text, predicate))
+            .map(str::to_string)
+            .collect()
+    }
+
+    // 生成式介绍：把实体的相关事实组合成连贯段落（无神经网络）
+    // 生成后自动做语义蕴含自检，并记录"上一段生成"以便多轮续说。
+    pub fn generate_about(&mut self, entity_raw: &str) -> Option<String> {
+        if !self.config.enable_generation {
+            return None;
+        }
+        let trimmed = entity_raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let canonical = self.aligner.canonical_form(trimmed);
+        let entity = if canonical.is_empty() {
+            trimmed.to_string()
+        } else {
+            canonical
+        };
+        let page = self
+            .generator
+            .profile_page(&entity, 0, GenerationOrder::Relevance)?;
+        self.context
+            .record_generation(&entity, page.next_offset, GenerationOrder::Relevance);
+        let mut text = page.text;
+        if let Some(note) = self.generation_self_check(&text) {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        Some(text)
+    }
+
+    // 多轮生成：接着上一段介绍继续讲后面的句子
+    pub fn continue_generation(&mut self) -> Option<String> {
+        if !self.config.enable_generation {
+            return None;
+        }
+        let state = self.context.generation_state()?.clone();
+        let page = self
+            .generator
+            .profile_page(&state.entity, state.shown, state.order)?;
+        if page.shown == 0 {
+            return Some(format!(
+                "关于「{}」的知识已经介绍完毕。可以输入「换个角度说」按不同顺序重述，或介绍其它实体。",
+                state.entity
+            ));
+        }
+        self.context
+            .record_generation(&state.entity, page.next_offset, state.order);
+        let mut text = page.text;
+        if let Some(note) = self.generation_self_check(&text) {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        Some(text)
+    }
+
+    // 多轮生成：换一个排序角度重述同一实体的介绍
+    pub fn switch_generation_angle(&mut self) -> Option<String> {
+        if !self.config.enable_generation {
+            return None;
+        }
+        let state = self.context.generation_state()?.clone();
+        let order = match state.order {
+            GenerationOrder::Relevance => GenerationOrder::Alphabetical,
+            GenerationOrder::Alphabetical => GenerationOrder::Relevance,
+        };
+        let page = self.generator.profile_page(&state.entity, 0, order)?;
+        if page.shown == 0 {
+            return Some(format!("关于「{}」暂无可重述的事实。", state.entity));
+        }
+        self.context
+            .record_generation(&state.entity, page.next_offset, order);
+        let label = match order {
+            GenerationOrder::Relevance => "信息量排序（由稀有谓词到常见谓词）",
+            GenerationOrder::Alphabetical => "主题排序（按谓词字典序）",
+        };
+        let mut text = format!("换个角度介绍「{}」（{}）：\n{}", state.entity, label, page.text);
+        if let Some(note) = self.generation_self_check(&text) {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        Some(text)
+    }
+
+    fn knowledge(&self) -> Knowledge<'_> {
+        Knowledge {
+            predictor: &self.predictor,
+            generator: &self.generator,
+            min_rule_confidence: self.config.entailment_min_confidence,
+            max_rule_candidates: 16,
+        }
+    }
+
+    fn proposition_parser(&self) -> PropositionParser<'_> {
+        PropositionParser::new(
+            &self.aligner,
+            &self.linker,
+            self.generator.predicate_surfaces(),
+        )
+    }
+
+    // 形式化语义 + 语义蕴含：把陈述句解析为命题并逐条判定蕴含/矛盾/未知
+    pub fn check_statement(&self, text: &str) -> Vec<EntailmentResult> {
+        if !self.config.enable_entailment {
+            return Vec::new();
+        }
+        let parser = self.proposition_parser();
+        let knowledge = self.knowledge();
+        parser
+            .parse(text)
+            .into_iter()
+            .map(|proposition| semantic_entailment::entail(&proposition, &knowledge))
+            .collect()
+    }
+
+    pub fn entailment_report(&self, text: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return "请输入要判定的陈述句，例如：判断：张三是李四的师傅".to_string();
+        }
+        let results = self.check_statement(trimmed);
+        if results.is_empty() {
+            return format!(
+                "形式化失败：未能把「{}」解析为可判定命题。\n  可用句式：S的P是O / O是S的P / S是类型 / S P O（P 为图谱已知谓词）。",
+                trimmed
+            );
+        }
+        let mut output = format!(
+            "形式化语义分析：「{}」解析出 {} 个候选命题，逐条给出蕴含判定（证据可追溯）：\n",
+            trimmed,
+            results.len()
+        );
+        output.push_str(&semantic_entailment::render_results(&results));
+        output
+    }
+
+    // 生成自检：逐句回译为命题并验证是否被知识图谱蕴含（对抗"幻觉"）
+    fn generation_self_check(&self, text: &str) -> Option<String> {
+        if !self.config.enable_entailment {
+            return None;
+        }
+        let parser = self.proposition_parser();
+        let knowledge = self.knowledge();
+        let mut total = 0usize;
+        let mut entailed = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for raw_line in text.lines() {
+            let sentence = semantic_entailment::strip_discourse_markers(raw_line.trim());
+            if !sentence.ends_with('。') {
+                continue;
+            }
+            let propositions = parser.parse(sentence);
+            if propositions.is_empty() {
+                continue;
+            }
+            total += 1;
+            let supported = propositions.iter().any(|proposition| {
+                semantic_entailment::entail(proposition, &knowledge).verdict == Verdict::Entailed
+            });
+            if supported {
+                entailed += 1;
+            } else {
+                failed.push(sentence.to_string());
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        let mut note = format!("（生成自检：{}/{} 句可由知识图谱蕴含", entailed, total);
+        if failed.is_empty() {
+            note.push_str("，零幻觉）");
+        } else {
+            note.push_str(&format!("，未通过 {} 句：{}）", failed.len(), failed.join("；")));
+        }
+        Some(note)
+    }
+
+    // 符号续写：对「X的」做谓词预测，支持实体级→类型级→全局回退
+    pub fn predict_continuation(&self, prefix: &str) -> Option<String> {
+        if !self.config.enable_generation {
+            return None;
+        }
+        let trimmed = prefix.trim();
+        if let Some(root) = trimmed.strip_suffix('的') {
+            let root = root.trim();
+            let canonical = self.aligner.canonical_form(root);
+            if !canonical.is_empty() && canonical != root {
+                return self.generator.complete(&format!("{}的", canonical));
+            }
+        }
+        self.generator.complete(trimmed)
     }
 
     fn is_known_entity(&self, name: &str) -> bool {
@@ -462,13 +791,56 @@ impl SymbolicReasoner {
         }
     }
 
+    // 期望答案类型（形式语义中的问题类型约束）：谁→人物、哪里→地点、何时→时间
+    fn expected_type_keywords(question: &str) -> Vec<&'static str> {
+        if question.contains('谁') || question.contains("何人") || question.contains("哪位") {
+            vec!["人", "person"]
+        } else if question.contains("哪里")
+            || question.contains("哪儿")
+            || question.contains("什么地方")
+            || question.contains("何处")
+        {
+            vec!["地", "城市", "国家", "place", "location", "country", "city"]
+        } else if question.contains("什么时候") || question.contains("哪年") || question.contains("何时") {
+            vec!["日期", "时间", "date", "time", "年"]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn value_matches_expectation(&self, value: &str, keywords: &[&str]) -> bool {
+        let Some(etype) = self.generator.entity_type_of(value) else {
+            return false;
+        };
+        let etype_lower = etype.to_lowercase();
+        keywords.iter().any(|keyword| {
+            etype.contains(*keyword) || etype_lower.contains(&keyword.to_lowercase())
+        })
+    }
+
     fn generate_find_object(
         &self,
         entity: &str,
         predicates: &[String],
         steps: &[ChainStep],
         last_hits: &[ValueHit],
+        question: &str,
     ) -> String {
+        let expectations = Self::expected_type_keywords(question);
+        let mut ordered: Vec<&ValueHit> = last_hits.iter().collect();
+        if !expectations.is_empty() {
+            ordered.sort_by_key(|hit| {
+                if self.value_matches_expectation(&hit.value, &expectations) {
+                    0usize
+                } else {
+                    1usize
+                }
+            });
+        }
+        let reordered = ordered
+            .iter()
+            .zip(last_hits.iter())
+            .any(|(a, b)| !std::ptr::eq(*a, b));
         let chain_text = format!("{} 的 {}", entity, predicates.join(" 的 "));
         let mut output = String::from("根据知识图谱");
         if steps.len() > 1 {
@@ -500,8 +872,8 @@ impl SymbolicReasoner {
                 ));
             }
         } else {
-            for (index, hit) in last_hits.iter().enumerate() {
-                let marker = Self::discourse_marker(index, last_hits.len());
+            for (index, hit) in ordered.iter().enumerate() {
+                let marker = Self::discourse_marker(index, ordered.len());
                 output.push_str(&format!(
                     "  {}{}{} 是 {}。",
                     marker,
@@ -531,6 +903,12 @@ impl SymbolicReasoner {
                     output.push_str(&format!("  推理依据：{}", evidence.join("；")));
                 }
             }
+            if reordered {
+                output.push_str(&format!(
+                    "\n  说明：已按问题期望的答案类型（{}）优先排序。",
+                    expectations.join("/")
+                ));
+            }
         }
         output
     }
@@ -549,6 +927,7 @@ impl SymbolicReasoner {
                         &predicates,
                         &steps,
                         &last_hits,
+                        question,
                     ));
                 }
                 if self.is_known_entity(&entity)
@@ -820,7 +1199,11 @@ impl SymbolicReasoner {
         if !self.config.enable_link_prediction || self.predictor.rules().is_empty() {
             return None;
         }
-        let entities = self.entities_mentioned(question);
+        let mut entities = self.entities_mentioned(question);
+        if entities.is_empty() && self.config.enable_generation {
+            // 精确匹配失败时，退回到带容错的实体链接结果（别名词表之外也能命中）
+            entities = self.linked_entities(question);
+        }
         if entities.is_empty() {
             return None;
         }
@@ -906,10 +1289,22 @@ impl SymbolicReasoner {
             .last_predicate()
             .unwrap_or("（无）")
             .to_string();
+        let generation = self
+            .context
+            .generation_state()
+            .map(|state| {
+                let order = match state.order {
+                    GenerationOrder::Relevance => "信息量排序",
+                    GenerationOrder::Alphabetical => "主题排序",
+                };
+                format!("「{}」（已讲 {} 句，{}）", state.entity, state.shown, order)
+            })
+            .unwrap_or_else(|| "（无）".to_string());
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，历史问题 {} 条。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条。",
             focus,
             predicate,
+            generation,
             self.context.history().len()
         )
     }
@@ -1000,6 +1395,11 @@ mod tests {
             enable_semantic_embedding: true,
             embedding_similarity_floor: 0.6,
             dialogue_state_path: None,
+            enable_generation: true,
+            max_profile_sentences: 6,
+            completion_min_score: 0.3,
+            enable_entailment: true,
+            entailment_min_confidence: 0.5,
         }
     }
 
@@ -1262,5 +1662,225 @@ mod tests {
         assert!(reasoner.embedding().is_embedded("张三"));
         assert!(reasoner.embedding().is_embedded("赵六"));
         assert!(reasoner.embedding().similarity("张三", "王五") > 0.9);
+    }
+
+    #[test]
+    fn test_entity_link_notes_for_typo_mention() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let notes = reasoner.entity_link_notes("张山的师傅是谁");
+        assert!(
+            notes.iter().any(|note| note.contains("张三") && note.contains("→")),
+            "错别字指称应产生模糊链接说明：{:?}",
+            notes
+        );
+        assert!(reasoner.linker().is_known_entity("张三"));
+    }
+
+    #[test]
+    fn test_linked_entity_fallback_recovers_typo_query() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李寺的师祖是谁")
+            .expect("错别字实体应能通过链接回退命中推理");
+        assert!(answer.contains("赵六"), "实际回答：{}", answer);
+    }
+
+    #[test]
+    fn test_generate_about_combines_facts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let profile = reasoner.generate_about("张三").expect("应能生成介绍段落");
+        assert!(profile.contains("关于「张三」"));
+        assert!(profile.contains("师傅"));
+        assert!(profile.contains("师祖"));
+        assert!(profile.contains("李四"));
+        assert!(reasoner.generate_about("不存在的人").is_none());
+    }
+
+    #[test]
+    fn test_check_statement_entailed_contradicted_unknown() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        let entailed = reasoner.check_statement("张三的师傅是李四");
+        assert_eq!(entailed.len(), 1);
+        assert_eq!(entailed[0].verdict, Verdict::Entailed);
+        assert_eq!(
+            entailed[0].proof[0].kind,
+            semantic_entailment::ProofKind::DirectFact
+        );
+
+        let contradicted = reasoner.check_statement("李四的师傅是张三");
+        assert_eq!(contradicted[0].verdict, Verdict::Contradicted);
+        assert!(contradicted[0]
+            .counter_evidence
+            .iter()
+            .any(|evidence| evidence.contains("王五")));
+
+        let unknown = reasoner.check_statement("钱七的师傅是李四");
+        assert_eq!(unknown[0].verdict, Verdict::Unknown);
+        assert!(unknown[0].reason.contains("尚未收录"), "实际原因：{}", unknown[0].reason);
+
+        assert!(reasoner.check_statement("张三的师傅是谁").is_empty());
+    }
+
+    #[test]
+    fn test_check_statement_recovers_typo_via_linker() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let results = reasoner.check_statement("张山的师傅是李四");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verdict, Verdict::Entailed);
+        assert!(
+            results[0]
+                .proposition
+                .notes
+                .iter()
+                .any(|note| note.contains("模糊链接") && note.contains("张三")),
+            "解析证据应记录容错链接：{:?}",
+            results[0].proposition.notes
+        );
+    }
+
+    #[test]
+    fn test_entailment_report_renders_logical_form_and_proof() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.entailment_report("张三的师傅是李四");
+        assert!(report.contains("逻辑形式：relation(张三, 师傅, 李四)"));
+        assert!(report.contains("蕴含"));
+        assert!(report.contains("直接事实"));
+
+        let failure = reasoner.entailment_report("今天天气如何");
+        assert!(failure.contains("形式化失败"));
+    }
+
+    #[test]
+    fn test_generate_about_appends_entailment_self_check() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let profile = reasoner.generate_about("张三").expect("应能生成介绍段落");
+        assert!(profile.contains("生成自检"), "应附蕴含自检：{}", profile);
+        assert!(profile.contains("零幻觉") || profile.contains("未通过"));
+        assert_eq!(reasoner.context().generation_state().map(|s| s.entity.as_str()), Some("张三"));
+    }
+
+    #[test]
+    fn test_generation_self_check_with_bare_english_predicates() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), "张三".to_string()),
+                    ("age".to_string(), "25".to_string()),
+                ]),
+            },
+            PrologFact::Entity {
+                name: "李四".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), "李四".to_string()),
+                    ("age".to_string(), "30".to_string()),
+                ]),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "knows".to_string(),
+                to: "李四".to_string(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let profile = reasoner.generate_about("张三").expect("应能生成介绍");
+        assert!(profile.contains("张三认识李四"), "{}", profile);
+        assert!(profile.contains("零幻觉"), "裸谓词生成应通过自检：{}", profile);
+    }
+
+    #[test]
+    fn test_continue_generation_and_switch_angle() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        let first = reasoner.generate_about("张三").expect("第一页应可生成");
+        assert!(first.contains("共 1 条事实"), "实际：{}", first);
+        let second = reasoner
+            .continue_generation()
+            .expect("接着说应返回下一页");
+        assert!(second.contains("续：第 2–2 句"), "实际：{}", second);
+        assert!(second.contains("接着，"));
+        assert_ne!(first, second);
+
+        let done = reasoner.continue_generation().expect("讲完后应给出提示");
+        assert!(done.contains("已经介绍完毕"));
+
+        let angled = reasoner
+            .switch_generation_angle()
+            .expect("换个角度说应重新生成");
+        assert!(angled.contains("换个角度"), "实际：{}", angled);
+        assert!(reasoner.dialogue_summary().contains("上一段生成"));
+    }
+
+    #[test]
+    fn test_expected_answer_type_reorders_find_object() {
+        let mut facts = vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "徒弟".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "徒弟".to_string(),
+                to: "星海公司".to_string(),
+            },
+        ];
+        facts.push(PrologFact::Entity {
+            name: "李四".to_string(),
+            entity_type: "人物".to_string(),
+            properties: HashMap::new(),
+        });
+        facts.push(PrologFact::Entity {
+            name: "星海公司".to_string(),
+            entity_type: "公司".to_string(),
+            properties: HashMap::new(),
+        });
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let answer = reasoner
+            .answer("张三的徒弟是谁")
+            .expect("应能回答反查对象问题");
+        let person_at = answer.find("李四").expect("应包含李四");
+        let company_at = answer.find("星海公司").expect("应包含星海公司");
+        assert!(
+            person_at < company_at,
+            "人物类型答案应排在前面：{}",
+            answer
+        );
+        assert!(answer.contains("期望"), "应说明排序依据：{}", answer);
+    }
+
+    #[test]
+    fn test_predict_continuation_uses_facts_and_backoff() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let completion = reasoner
+            .predict_continuation("张三的")
+            .expect("已知实体应能续写");
+        assert!(completion.contains("实体级统计"));
+        assert!(completion.contains("师傅"));
+
+        let mut synonyms = HashMap::new();
+        synonyms.insert("老三".to_string(), "张三".to_string());
+        let mut aliased = SymbolicReasoner::new(test_config(), synonyms);
+        aliased.observe_facts(&master_facts());
+        let aliased_completion = aliased
+            .predict_continuation("老三的")
+            .expect("同义词前缀应先归一化再续写");
+        assert!(aliased_completion.contains("张三"));
     }
 }

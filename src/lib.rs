@@ -27,6 +27,9 @@ pub mod link_prediction;
 pub mod semantic_embedding;
 pub mod query_planner;
 pub mod symbolic_reasoner;
+pub mod entity_linker;
+pub mod symbolic_generator;
+pub mod semantic_entailment;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
@@ -74,6 +77,36 @@ pub struct ReasoningConfig {
     pub embedding_similarity_floor: f64,
     #[serde(default)]
     pub dialogue_state_path: Option<String>,
+    #[serde(default = "default_enable_generation")]
+    pub enable_generation: bool,
+    #[serde(default = "default_max_profile_sentences")]
+    pub max_profile_sentences: usize,
+    #[serde(default = "default_completion_min_score")]
+    pub completion_min_score: f64,
+    #[serde(default = "default_enable_entailment")]
+    pub enable_entailment: bool,
+    #[serde(default = "default_entailment_min_confidence")]
+    pub entailment_min_confidence: f64,
+}
+
+fn default_enable_entailment() -> bool {
+    true
+}
+
+fn default_entailment_min_confidence() -> f64 {
+    0.5
+}
+
+fn default_enable_generation() -> bool {
+    true
+}
+
+fn default_max_profile_sentences() -> usize {
+    6
+}
+
+fn default_completion_min_score() -> f64 {
+    0.3
 }
 
 fn default_enable_semantic_embedding() -> bool {
@@ -115,6 +148,11 @@ impl Default for ReasoningConfig {
             enable_semantic_embedding: default_enable_semantic_embedding(),
             embedding_similarity_floor: default_embedding_similarity_floor(),
             dialogue_state_path: None,
+            enable_generation: default_enable_generation(),
+            max_profile_sentences: default_max_profile_sentences(),
+            completion_min_score: default_completion_min_score(),
+            enable_entailment: default_enable_entailment(),
+            entailment_min_confidence: default_entailment_min_confidence(),
         }
     }
 }

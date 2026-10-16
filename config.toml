@@ -21,6 +21,11 @@ max_predictions = 5                    # 单次回答最多展示的预测数量
 enable_semantic_embedding = true       # 是否启用符号化知识嵌入（PPMI 角色向量，无神经网络）
 embedding_similarity_floor = 0.6       # 近邻检索的最低余弦相似度
 dialogue_state_path = "oxigraph_data/dialogue_state.json"  # 对话记忆持久化文件（跨会话）
+enable_generation = true               # 是否启用符号化生成（实体链接 + 介绍生成 + 统计续写）
+max_profile_sentences = 6              # 单次生成介绍段落的最大事实句数
+completion_min_score = 0.3             # 类型级/全局级谓词回退的最低统计支持度
+enable_entailment = true               # 是否启用形式化语义与语义蕴含判定（陈述句校验/生成自检）
+entailment_min_confidence = 0.5        # 规则推断作为蕴含证据的最低置信度
 
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]

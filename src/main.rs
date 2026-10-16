@@ -215,6 +215,109 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 形式化语义与语义蕴含：把陈述句解析为逻辑形式并判定蕴含/矛盾/未知
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "判断：", "判断:", "蕴含：", "蕴含:", "校验：", "校验:", "形式化：", "形式化:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要判定的陈述句，例如：判断：张三是李四的师傅");
+            } else {
+                match load_graph_snapshot(&oxigraph_manager).await {
+                    Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                    Err(e) => println!("加载知识图谱失败: {}", e),
+                }
+                println!("{}", symbolic_reasoner.entailment_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 多轮生成：接着上一段介绍继续讲
+        if matches!(input, "接着说" | "继续说" | "继续介绍" | "继续讲" | "接着讲") {
+            match symbolic_reasoner.continue_generation() {
+                Some(text) => println!("{}", text),
+                None => println!("还没有可续说的生成内容，请先输入「介绍：实体名」。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 多轮生成：换个角度重述
+        if matches!(
+            input,
+            "换个角度说" | "换个说法" | "换个角度" | "换一个角度" | "重新介绍"
+        ) {
+            match symbolic_reasoner.switch_generation_angle() {
+                Some(text) => println!("{}", text),
+                None => println!("还没有可重述的生成内容，请先输入「介绍：实体名」。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(entity) = strip_any_prefix(input, &["实体链接：", "实体链接:", "识别实体：", "识别实体:"]) {
+            match load_graph_snapshot(&oxigraph_manager).await {
+                Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                Err(e) => println!("加载知识图谱失败: {}", e),
+            }
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请提供要链接的文本，例如：实体链接：刘德桦的出生地");
+            } else {
+                println!("{}", symbolic_reasoner.entity_link_report(entity));
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["介绍：", "介绍:", "生成介绍：", "生成介绍:", "介绍一下", "讲讲", "说说"],
+        ) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请提供要介绍的实体名，例如：介绍：姚明");
+                println!();
+                continue;
+            }
+            match load_graph_snapshot(&oxigraph_manager).await {
+                Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                Err(e) => println!("加载知识图谱失败: {}", e),
+            }
+            match symbolic_reasoner.generate_about(entity) {
+                Some(text) => println!("{}", text),
+                None => println!("知识图谱中没有关于「{}」的可生成事实。", entity),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(prefix) = strip_any_prefix(
+            input,
+            &["续写：", "续写:", "接龙：", "接龙:", "补全：", "补全:"],
+        ) {
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                println!("请提供要续写的前缀，例如：续写：姚明的");
+                println!();
+                continue;
+            }
+            match load_graph_snapshot(&oxigraph_manager).await {
+                Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                Err(e) => println!("加载知识图谱失败: {}", e),
+            }
+            match symbolic_reasoner.predict_continuation(prefix) {
+                Some(text) => println!("{}", text),
+                None => println!("无法为「{}」生成续写（实体未知或不含「的」后缀）。", prefix),
+            }
+            println!();
+            continue;
+        }
+
         let mode = detect_input_mode(input, &config.nlp.import_keywords);
 
         match mode {
@@ -315,6 +418,10 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     None => input.to_string(),
                 };
                 let input = contextual_input.as_str();
+
+                for note in symbolic_reasoner.entity_link_notes(input) {
+                    println!("（{}）", note);
+                }
 
                 let tagged_words = preprocess(input, &config.nlp);
                 let normalized_words = normalize_words(tagged_words, &synonyms);
@@ -752,9 +859,38 @@ async fn try_symbolic_reasoning(
     input: &str,
 ) -> Option<String> {
     let entities = extract_query_entities(input, config);
-    let facts = oxigraph_manager.get_relevant_facts(&entities, 2).await.ok()?;
-    symbolic_reasoner.observe_facts(&facts);
-    symbolic_reasoner.answer(input)
+    if !entities.is_empty() {
+        if let Ok(facts) = oxigraph_manager.get_relevant_facts(&entities, 2).await {
+            symbolic_reasoner.observe_facts(&facts);
+        }
+    }
+    // 陈述句优先：形式化语义 + 语义蕴含判定（校验用户断言）
+    if !contains_question_marker(input) {
+        let report = symbolic_reasoner.entailment_report(input);
+        if !report.starts_with("形式化失败") {
+            return Some(report);
+        }
+    }
+    if let Some(answer) = symbolic_reasoner.answer(input) {
+        return Some(answer);
+    }
+    // 逻辑问答失败时，回退到"知识图谱即语言模型"的生成式介绍
+    let entity = symbolic_reasoner.best_linked_entity(input)?;
+    symbolic_reasoner.generate_about(&entity)
+}
+
+fn contains_question_marker(text: &str) -> bool {
+    [
+        "谁", "什么", "哪", "多少", "几", "怎么", "为什么", "如何", "吗", "呢", "何人", "何时",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    prefixes
+        .iter()
+        .find_map(|prefix| input.strip_prefix(prefix))
 }
 
 async fn continue_original_query(

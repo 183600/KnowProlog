@@ -87,6 +87,12 @@ impl OntologyAligner {
     pub fn register_term(&mut self, term: &str, kind: TermKind) -> usize {
         let normalized = self.normalize(term);
         if let Some(&idx) = self.index.get(&normalized) {
+            // 同一术语先以属性注册、后以关系出现时（RDF 对象属性），升级为关系，
+            // 以便「关系/属性」判定与谓词问答使用正确语义。
+            if kind == TermKind::Relation && self.profiles[idx].kind == TermKind::Attribute {
+                self.profiles[idx].kind = TermKind::Relation;
+                self.resolve_cache.write().clear();
+            }
             return idx;
         }
         self.profiles.push(TermProfile {

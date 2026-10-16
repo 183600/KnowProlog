@@ -166,6 +166,22 @@ impl LinkPredictor {
         self.pairs_by_pred.contains_key(predicate)
     }
 
+    // 数据驱动的对称关系判定：图中该关系的双向对占多数时视为对称，
+    // 供语义蕴含做「逆向成立」的证据（如配偶、朋友等）。
+    pub fn is_relation_symmetric(&self, predicate: &str) -> bool {
+        let Some(pairs) = self.pairs_by_pred.get(predicate) else {
+            return false;
+        };
+        if pairs.is_empty() {
+            return false;
+        }
+        let mutual = pairs
+            .iter()
+            .filter(|(a, b)| pairs.iter().any(|(x, y)| x == b && y == a))
+            .count();
+        mutual >= 1 && mutual * 2 >= pairs.len()
+    }
+
     pub fn objects_of(&self, subject: &str, predicate: &str) -> Vec<String> {
         let mut objects: Vec<String> = self
             .out_edges
