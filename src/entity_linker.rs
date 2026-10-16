@@ -336,10 +336,15 @@ impl EntityLinker {
                 .profiles
                 .iter()
                 .filter_map(|(canonical, profile)| {
-                    // 长度差异过大时相似度上界低于阈值，直接跳过昂贵集合运算
+                    // 上界低于阈值时直接跳过昂贵集合运算（须用真实集合大小，
+                    // 重复字符会令集合远小于字符数，按字符数估界会误剪）
                     let upper = similarity_upper_bound(
                         trimmed_chars.len(),
                         profile.char_count,
+                        trimmed_char_set.len(),
+                        profile.char_set.len(),
+                        trimmed_bigrams.len(),
+                        profile.bigrams.len(),
                         trimmed == canonical.as_str(),
                     );
                     if upper + 0.1 < self.fuzzy_threshold {
@@ -544,20 +549,36 @@ fn dice_similarity(a: &str, b: &str) -> f64 {
     bigram_score.max(unigram_score)
 }
 
-/// 给定两侧字符数，相似度（二元组/单字 Dice 取大者）的理论上界；
+/// 给定两侧字符数与字符/二元组集合大小，相似度（二元组/单字 Dice 取大者）的
+/// 理论上界：交集不超过较小集合，故 `2*min(|A|,|B|)/(|A|+|B|)` 是可达最大值；
 /// 文本完全相同时按 1.0 计（`dice_similarity_precomputed` 的相等捷径）。
-fn similarity_upper_bound(len_a: usize, len_b: usize, equal_text: bool) -> f64 {
+fn similarity_upper_bound(
+    len_a: usize,
+    len_b: usize,
+    char_set_a: usize,
+    char_set_b: usize,
+    bigrams_a: usize,
+    bigrams_b: usize,
+    equal_text: bool,
+) -> f64 {
     if equal_text {
         return 1.0;
     }
     if len_a < 2 || len_b < 2 {
         return 0.0;
     }
-    let min = len_a.min(len_b) as f64;
-    let sum = (len_a + len_b) as f64;
-    let bigram_max = 2.0 * (min - 1.0) / sum;
-    let unigram_max = 2.0 * min / sum * 0.8;
-    bigram_max.max(unigram_max)
+    let mut upper: f64 = 0.0;
+    if bigrams_a + bigrams_b > 0 {
+        upper = upper.max(
+            2.0 * bigrams_a.min(bigrams_b) as f64 / (bigrams_a + bigrams_b) as f64,
+        );
+    }
+    if char_set_a + char_set_b > 0 {
+        upper = upper.max(
+            2.0 * char_set_a.min(char_set_b) as f64 / (char_set_a + char_set_b) as f64 * 0.8,
+        );
+    }
+    upper
 }
 
 // 与 dice_similarity 完全同值，但复用已预计算的指称字符集合与实体画像特征集合
@@ -648,6 +669,17 @@ mod tests {
         let hints2 = vec!["颜色".to_string()];
         let mentions2 = linker.link_with_context("苹果的颜色是什么", &hints2);
         assert_eq!(mentions2[0].best().unwrap().entity, "苹果果实");
+    }
+
+    #[test]
+    fn test_fuzzy_matching_survives_repeated_characters() {
+        // 重复字符令 bigram/字符集合远小于字符数：真实相似度仍可达到阈值，
+        // 剪枝的上界必须按集合大小估计，否则会漏掉这些匹配
+        let mut linker = EntityLinker::new();
+        linker.register_entity("哈哈哈哈哈哈哈哈", Some("人物"));
+        let mentions = linker.link("哈哈的来历");
+        assert_eq!(mentions.len(), 1, "重复字符文本不应被上界剪枝漏掉");
+        assert_eq!(mentions[0].best().unwrap().entity, "哈哈哈哈哈哈哈哈");
     }
 
     #[test]

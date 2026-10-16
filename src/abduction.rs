@@ -1159,19 +1159,12 @@ fn constant_name(term: &Term) -> Option<String> {
     }
 }
 
-/// 去重：同一基事实只保留置信度最高的一条
+/// 去重：同一基事实只保留置信度最高的一条。
+/// 输入已按可信度降序排序，故保留每个原子的首次出现即可，
+/// 同时保持原有顺序（调用方随后依赖该顺序做截断与「假设 N」编号）。
 fn dedupe_hypotheses(hypotheses: &mut Vec<Hypothesis>) {
-    let mut best: HashMap<String, Hypothesis> = HashMap::new();
-    for hypothesis in hypotheses.drain(..) {
-        let key = hypothesis.atom.display();
-        match best.get(&key) {
-            Some(existing) if existing.confidence >= hypothesis.confidence => {}
-            _ => {
-                best.insert(key, hypothesis);
-            }
-        }
-    }
-    *hypotheses = best.into_values().collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    hypotheses.retain(|hypothesis| seen.insert(hypothesis.atom.display()));
 }
 
 /// 有界后向链失败前沿搜索：
@@ -1952,6 +1945,31 @@ mod tests {
             best.conflicts.iter().any(|conflict| conflict.contains("宾体类型")),
             "类型不相容应被记录为冲突：{:?}",
             best.conflicts
+        );
+    }
+
+    #[test]
+    fn dedupe_keeps_confidence_order_and_best_duplicate() {
+        let mut hypotheses = vec![
+            hyp("师傅", "张三", "李四", 0.9),
+            hyp("师傅", "张三", "王五", 0.7),
+            hyp("师傅", "张三", "李四", 0.3),
+            hyp("师傅", "李四", "王五", 0.5),
+        ];
+        dedupe_hypotheses(&mut hypotheses);
+        let displays: Vec<String> = hypotheses.iter().map(|h| h.atom.display()).collect();
+        assert_eq!(
+            displays,
+            vec![
+                "师傅(张三, 李四)",
+                "师傅(张三, 王五)",
+                "师傅(李四, 王五)"
+            ],
+            "去重后应保持可信度降序"
+        );
+        assert_eq!(
+            hypotheses[0].confidence, 0.9,
+            "同一原子应保留置信度最高的一条"
         );
     }
 }
