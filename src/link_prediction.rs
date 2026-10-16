@@ -194,13 +194,13 @@ impl LinkPredictor {
         if pairs.is_empty() {
             return false;
         }
-        let reversed: HashSet<(&str, &str)> = pairs
-            .iter()
-            .map(|(a, b)| (b.as_str(), a.as_str()))
-            .collect();
+        let Some(by_subject) = self.out_edges.get(predicate) else {
+            return false;
+        };
+        // 无需构建反向集合：反向对 (b,a) 存在 ⟺ by_subject[b] 含 a
         let mutual = pairs
             .iter()
-            .filter(|(a, b)| reversed.contains(&(a.as_str(), b.as_str())))
+            .filter(|(a, b)| by_subject.get(b).map_or(false, |objects| objects.contains(a)))
             .count();
         mutual >= 1 && mutual * 2 >= pairs.len()
     }

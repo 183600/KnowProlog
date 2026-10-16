@@ -59,8 +59,9 @@ struct EntityProfile {
 pub struct EntityLinker {
     profiles: HashMap<String, EntityProfile>,
     surface_candidates: HashMap<String, Vec<String>>,
-    // 表层名及其字符序列：注册期预计算，匹配时零分配
-    surface_order: Vec<(String, Vec<char>)>,
+    // 表层名及其字符序列，按首字符分桶；桶内保持（长度降序、字典序升序），
+    // 注册期维护，精确匹配时无需每次重建索引
+    surfaces_by_first: HashMap<char, Vec<(String, Vec<char>)>>,
     neighbors: HashMap<String, HashSet<String>>,
     out_predicates: HashMap<String, HashMap<String, usize>>,
     in_predicates: HashMap<String, HashMap<String, usize>>,
@@ -86,7 +87,7 @@ impl EntityLinker {
         Self {
             profiles: HashMap::new(),
             surface_candidates: HashMap::new(),
-            surface_order: Vec::new(),
+            surfaces_by_first: HashMap::new(),
             neighbors: HashMap::new(),
             out_predicates: HashMap::new(),
             in_predicates: HashMap::new(),
@@ -207,12 +208,15 @@ impl EntityLinker {
         }
     }
 
-    // 表层名序列按字符数降序、字典序升序维护，新项二分插入保持有序。
+    // 表层名按首字符分桶，桶内按字符数降序、字典序升序维护，新项二分插入保持有序。
     fn insert_surface_sorted(&mut self, surface: &str) {
         let chars: Vec<char> = surface.chars().collect();
+        let Some(&first) = chars.first() else {
+            return;
+        };
         let len = chars.len();
-        let pos = self
-            .surface_order
+        let bucket = self.surfaces_by_first.entry(first).or_default();
+        let pos = bucket
             .binary_search_by(|probe| {
                 probe
                     .1
@@ -222,7 +226,7 @@ impl EntityLinker {
                     .then_with(|| probe.0.as_str().cmp(surface))
             })
             .unwrap_or_else(|pos| pos);
-        self.surface_order.insert(pos, (surface.to_string(), chars));
+        bucket.insert(pos, (surface.to_string(), chars));
     }
 
     pub fn link(&self, text: &str) -> Vec<LinkedMention> {
@@ -243,18 +247,11 @@ impl EntityLinker {
 
     fn exact_mentions(&self, text: &str) -> Vec<LinkedMention> {
         let chars: Vec<char> = text.chars().collect();
-        // 按首字符分桶，保持 surface_order 的（长度降序、字典序升序）相对顺序
-        let mut by_first: HashMap<char, Vec<&(String, Vec<char>)>> = HashMap::new();
-        for entry in &self.surface_order {
-            if let Some(first) = entry.1.first() {
-                by_first.entry(*first).or_default().push(entry);
-            }
-        }
         let mut mentions: Vec<LinkedMention> = Vec::new();
         let mut i = 0;
         while i < chars.len() {
             let mut matched: Option<(&str, usize)> = None;
-            if let Some(candidates) = by_first.get(&chars[i]) {
+            if let Some(candidates) = self.surfaces_by_first.get(&chars[i]) {
                 for (surface, surface_chars) in candidates {
                     let len = surface_chars.len();
                     if i + len > chars.len() {
@@ -338,7 +335,16 @@ impl EntityLinker {
             let mut scored: Vec<(f64, f64, &String)> = self
                 .profiles
                 .iter()
-                .map(|(canonical, profile)| {
+                .filter_map(|(canonical, profile)| {
+                    // 长度差异过大时相似度上界低于阈值，直接跳过昂贵集合运算
+                    let upper = similarity_upper_bound(
+                        trimmed_chars.len(),
+                        profile.char_count,
+                        trimmed == canonical.as_str(),
+                    );
+                    if upper + 0.1 < self.fuzzy_threshold {
+                        return None;
+                    }
                     let similarity = dice_similarity_precomputed(
                         trimmed,
                         &trimmed_chars,
@@ -348,7 +354,7 @@ impl EntityLinker {
                         profile,
                     );
                     let degree_bonus = ((1.0 + profile.degree as f64).ln() / 10.0).min(0.1);
-                    (similarity + degree_bonus, similarity, canonical)
+                    Some((similarity + degree_bonus, similarity, canonical))
                 })
                 .filter(|(combined, _, _)| *combined >= self.fuzzy_threshold)
                 .collect();
@@ -536,6 +542,22 @@ fn dice_similarity(a: &str, b: &str) -> f64 {
         2.0 * intersection / (set_a.len() + set_b.len()) as f64 * 0.8
     };
     bigram_score.max(unigram_score)
+}
+
+/// 给定两侧字符数，相似度（二元组/单字 Dice 取大者）的理论上界；
+/// 文本完全相同时按 1.0 计（`dice_similarity_precomputed` 的相等捷径）。
+fn similarity_upper_bound(len_a: usize, len_b: usize, equal_text: bool) -> f64 {
+    if equal_text {
+        return 1.0;
+    }
+    if len_a < 2 || len_b < 2 {
+        return 0.0;
+    }
+    let min = len_a.min(len_b) as f64;
+    let sum = (len_a + len_b) as f64;
+    let bigram_max = 2.0 * (min - 1.0) / sum;
+    let unigram_max = 2.0 * min / sum * 0.8;
+    bigram_max.max(unigram_max)
 }
 
 // 与 dice_similarity 完全同值，但复用已预计算的指称字符集合与实体画像特征集合

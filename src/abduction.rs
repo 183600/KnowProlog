@@ -412,13 +412,10 @@ impl AbductionEngine {
                 }
                 PrologFact::Entity {
                     name,
-                    entity_type,
                     properties,
+                    ..
                 } => {
-                    if !entity_type.trim().is_empty() {
-                        self.entity_types
-                            .insert(name.clone(), entity_type.clone());
-                    }
+                    // 实体类型已在第一遍登记，这里无需重复写入
                     for (key, value) in properties {
                         // 关系型属性在存储层可能以完整 IRI 形式留存，跳过以免污染
                         // 谓词取值统计与候选生成（如「师傅」的候选值变成 IRI）
@@ -891,23 +888,22 @@ impl AbductionEngine {
             }
         }
         let derived = simulation.forward_chain(max_rounds, max_facts);
+        // 单遍同时构造“排除已知事实后的推导结果”和“去重后的新事实”
         let mut seen: HashSet<String> = HashSet::new();
         let mut new_facts: Vec<Atom> = Vec::new();
-        for item in &derived {
+        let mut kept: Vec<DerivedFact> = Vec::with_capacity(derived.len());
+        for item in derived {
             if engine.has_fact(&item.atom) {
                 continue;
             }
             if seen.insert(item.atom.display()) {
                 new_facts.push(item.atom.clone());
             }
+            kept.push(item);
         }
-        let derived = derived
-            .into_iter()
-            .filter(|item| !engine.has_fact(&item.atom))
-            .collect();
         WhatIfResult {
             assumptions: assumptions.to_vec(),
-            derived,
+            derived: kept,
             new_facts,
         }
     }
@@ -926,18 +922,27 @@ impl AbductionEngine {
                 })
                 .sum()
         };
-        let mut candidates = frontiers;
+        // 排序键只计算一次：规模升序 → 谓词支撑降序 → 显示长度升序（与逐次调用等价）
+        let mut candidates: Vec<(Vec<Atom>, usize, u64, usize)> = frontiers
+            .into_iter()
+            .map(|frontier| {
+                let size = frontier.len();
+                let support = quality(&frontier);
+                let display_len: usize =
+                    frontier.iter().map(|atom| atom.display().len()).sum();
+                (frontier, size, support, display_len)
+            })
+            .collect();
         candidates.sort_by(|a, b| {
-            a.len()
-                .cmp(&b.len())
-                .then_with(|| quality(b).cmp(&quality(a)))
-                .then_with(|| {
-                    let la: usize = a.iter().map(|atom| atom.display().len()).sum();
-                    let lb: usize = b.iter().map(|atom| atom.display().len()).sum();
-                    la.cmp(&lb)
-                })
+            a.1.cmp(&b.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
         });
-        candidates.into_iter().next().unwrap_or_default()
+        candidates
+            .into_iter()
+            .next()
+            .map(|(frontier, _, _, _)| frontier)
+            .unwrap_or_default()
     }
 
     /// 暂存候选假设，供「采纳假设 N」使用
@@ -1049,6 +1054,10 @@ impl AbductionEngine {
         let mut scenarios: Vec<Scenario> = Vec::new();
         let mut budget = 60usize;
         let mut indices: Vec<usize> = Vec::new();
+        // 组合验证复用一个引擎克隆：逐组合“加入假设 → 求解 → 按原顺序移除”。
+        // 移除采用压缩式删除，恢复后的事实索引顺序与全新克隆一致，
+        // 因此结果与逐个组合重新克隆完全相同，但省去重复的深拷贝。
+        let mut simulation = engine.clone();
         for size in 1..=max_size {
             let _ = collect_combinations(&pool, size, 0, &mut indices, &mut |combo| {
                 if budget == 0 {
@@ -1065,11 +1074,17 @@ impl AbductionEngine {
                 }
                 let members: Vec<Hypothesis> =
                     combo.iter().map(|&index| pool[index].clone()).collect();
-                let mut simulation = engine.clone();
+                let mut added: Vec<Atom> = Vec::with_capacity(members.len());
                 for hypothesis in &members {
-                    simulation.add_fact_atom(hypothesis.atom.clone());
+                    let atom = hypothesis.atom.clone();
+                    if simulation.add_fact_atom(atom.clone()) {
+                        added.push(atom);
+                    }
                 }
                 let solutions = simulation.solve(goals, query_vars);
+                for atom in &added {
+                    simulation.remove_fact_atom(atom);
+                }
                 if solutions.is_empty() {
                     return true;
                 }
@@ -1200,16 +1215,15 @@ impl<'a> FrontierSearch<'a> {
         }
 
         // 1) 与基事实归结：命中即可继续推进剩余目标
-        let fact_candidates: Vec<Atom> = self
-            .engine
+        //（把引擎引用拷出，避免与递归调用 `self.run` 的可变借用冲突，同时省去事实克隆）
+        let engine = self.engine;
+        let mut fact_matched = false;
+        for fact in engine
             .facts_for(&applied.predicate)
             .iter()
             .filter(|fact| fact.arity() == applied.arity())
             .take(6)
-            .cloned()
-            .collect();
-        let mut fact_matched = false;
-        for fact in &fact_candidates {
+        {
             let mut unified = subst.clone();
             if crate::resolution_engine::unify_atoms(&applied, fact, &mut unified) {
                 if fact_matched {
@@ -1230,14 +1244,11 @@ impl<'a> FrontierSearch<'a> {
 
         // 3) 与规则头归结：换名后合一，再把规则体前置到目标队列
         //    （规则解释作为备选前沿，与直接切点一起参与排序）
-        let clauses: Vec<_> = self
-            .engine
-            .clauses_for(&applied.predicate)
-            .into_iter()
+        for (index, clause) in engine
+            .clauses_iter_for(&applied.predicate)
             .take(6)
-            .cloned()
-            .collect();
-        for (index, clause) in clauses.iter().enumerate() {
+            .enumerate()
+        {
             if self.budget == 0 {
                 break;
             }
@@ -1246,7 +1257,8 @@ impl<'a> FrontierSearch<'a> {
             if !crate::resolution_engine::unify_atoms(&applied, &fresh.head, &mut unified) {
                 continue;
             }
-            let mut combined: Vec<Atom> = fresh.body.clone();
+            // 规则体可直接移动进组合目标队列（head 已不再需要）
+            let mut combined: Vec<Atom> = fresh.body;
             combined.extend_from_slice(&goals[1..]);
             self.run(&combined, &unified, depth + 1, missing);
         }

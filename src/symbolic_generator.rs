@@ -72,6 +72,8 @@ pub struct SymbolicGenerator {
     predicate_totals: HashMap<String, usize>,
     entity_predicate_counts: HashMap<String, HashMap<String, usize>>,
     entity_relation_total: HashMap<String, usize>,
+    // 谓词 → 拥有该谓词的主体中字典序最小者（全局回退原型，增量维护）
+    predicate_min_entity: HashMap<String, String>,
     triples: HashSet<(String, String, String)>,
     total_relations: usize,
     max_profile_sentences: usize,
@@ -79,6 +81,9 @@ pub struct SymbolicGenerator {
     // 谓词的中文表述（含词汇化动词）→ 规范谓词，供形式化语义解析复用
     predicate_surfaces: HashMap<String, String>,
     lexicalized_predicates: HashSet<String>,
+    // 类型 → 谓词计数聚合缓存；知识变更（revision 自增）后失效
+    revision: u64,
+    type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
 }
 
 impl SymbolicGenerator {
@@ -93,12 +98,15 @@ impl SymbolicGenerator {
             predicate_totals: HashMap::new(),
             entity_predicate_counts: HashMap::new(),
             entity_relation_total: HashMap::new(),
+            predicate_min_entity: HashMap::new(),
             triples: HashSet::new(),
             total_relations: 0,
             max_profile_sentences: max_profile_sentences.max(1),
             completion_min_score: completion_min_score.clamp(0.0, 1.0),
             predicate_surfaces: HashMap::new(),
             lexicalized_predicates: HashSet::new(),
+            revision: 0,
+            type_count_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -158,6 +166,7 @@ impl SymbolicGenerator {
         if name.trim().is_empty() {
             return;
         }
+        self.revision += 1;
         self.known_entities.insert(name.to_string());
         if !etype.trim().is_empty() {
             match self.entity_types.insert(name.to_string(), etype.to_string()) {
@@ -229,6 +238,7 @@ impl SymbolicGenerator {
         if !self.triples.insert(key) {
             return;
         }
+        self.revision += 1;
         self.known_entities.insert(subject.to_string());
         self.known_entities.insert(object.to_string());
 
@@ -273,6 +283,15 @@ impl SymbolicGenerator {
             Some(count) => *count += 1,
             None => {
                 predicate_counts.insert(predicate.to_string(), 1);
+                // 该主体首次拥有此谓词：增量维护字典序最小的原型主体
+                let replace = match self.predicate_min_entity.get(predicate) {
+                    Some(current) => current.as_str() > subject,
+                    None => true,
+                };
+                if replace {
+                    self.predicate_min_entity
+                        .insert(predicate.to_string(), subject.to_string());
+                }
             }
         }
         match self.entity_relation_total.get_mut(subject) {
@@ -546,61 +565,80 @@ impl SymbolicGenerator {
 
     fn type_level_predictions(&self, entity: &str) -> Option<Vec<CompletionPrediction>> {
         let etype = self.entity_types.get(entity)?;
-        let (type_counts, type_total) = self.type_predicate_counts(etype);
-        if type_counts.is_empty() || type_total == 0 {
-            return None;
-        }
-        let mut items: Vec<(&String, &usize)> = type_counts.iter().collect();
-        items.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        let mut predictions: Vec<CompletionPrediction> = Vec::new();
-        for (predicate, count) in items.into_iter() {
-            let score = *count as f64 / type_total as f64;
-            if score < self.completion_min_score {
-                // 已按计数降序，后续得分只会更低
-                break;
+        self.with_type_counts(etype, |type_counts, type_total| {
+            if type_counts.is_empty() || type_total == 0 {
+                return None;
             }
-            let Some((prototype, objects)) = self.prototype_for(etype, entity, predicate) else {
-                continue;
-            };
-            predictions.push(CompletionPrediction {
-                predicate: predicate.clone(),
-                level: CompletionLevel::Type,
-                score,
-                support: format!("{}/{}", count, type_total),
-                sentence: format!(
-                    "参照同类实体「{}」：{}的{}很可能是{}。",
-                    prototype,
-                    entity,
-                    predicate,
-                    objects.join("、")
-                ),
-            });
-            if predictions.len() >= 3 {
-                break;
+            let mut items: Vec<(&String, &usize)> = type_counts.iter().collect();
+            items.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            let mut predictions: Vec<CompletionPrediction> = Vec::new();
+            for (predicate, count) in items.into_iter() {
+                let score = *count as f64 / type_total as f64;
+                if score < self.completion_min_score {
+                    // 已按计数降序，后续得分只会更低
+                    break;
+                }
+                let Some((prototype, objects)) = self.prototype_for(etype, entity, predicate) else {
+                    continue;
+                };
+                predictions.push(CompletionPrediction {
+                    predicate: predicate.clone(),
+                    level: CompletionLevel::Type,
+                    score,
+                    support: format!("{}/{}", count, type_total),
+                    sentence: format!(
+                        "参照同类实体「{}」：{}的{}很可能是{}。",
+                        prototype,
+                        entity,
+                        predicate,
+                        objects.join("、")
+                    ),
+                });
+                if predictions.len() >= 3 {
+                    break;
+                }
             }
-        }
-        if predictions.is_empty() {
-            None
-        } else {
-            Some(predictions)
-        }
+            if predictions.is_empty() {
+                None
+            } else {
+                Some(predictions)
+            }
+        })
     }
 
-    fn type_predicate_counts(&self, etype: &str) -> (HashMap<String, usize>, usize) {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        let mut total = 0usize;
-        let Some(members) = self.type_members.get(etype) else {
-            return (counts, total);
-        };
-        for entity in members {
-            if let Some(predicate_counts) = self.entity_predicate_counts.get(entity) {
-                for (predicate, count) in predicate_counts {
-                    *counts.entry(predicate.clone()).or_insert(0) += count;
-                    total += count;
+    /// 用带失效机制的缓存提供某类型的谓词计数聚合结果
+    fn with_type_counts<R>(
+        &self,
+        etype: &str,
+        f: impl FnOnce(&HashMap<String, usize>, usize) -> R,
+    ) -> R {
+        let revision = self.revision;
+        {
+            let cache = self.type_count_cache.read();
+            if let Some((cached_revision, counts, total)) = cache.get(etype) {
+                if *cached_revision == revision {
+                    return f(counts, *total);
                 }
             }
         }
-        (counts, total)
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut total = 0usize;
+        if let Some(members) = self.type_members.get(etype) {
+            for entity in members {
+                if let Some(predicate_counts) = self.entity_predicate_counts.get(entity) {
+                    for (predicate, count) in predicate_counts {
+                        *counts.entry(predicate.clone()).or_insert(0) += count;
+                        total += count;
+                    }
+                }
+            }
+        }
+        let result = f(&counts, total);
+        self.type_count_cache
+            .write()
+            .insert(etype.to_string(), (revision, counts, total));
+        result
     }
 
     fn prototype_for(
@@ -685,13 +723,8 @@ impl SymbolicGenerator {
     }
 
     fn global_prototype(&self, predicate: &str) -> Option<(String, Vec<String>)> {
-        // 只需字典序最小的主体，无需收集后整体排序
-        let prototype = self
-            .entity_predicate_counts
-            .iter()
-            .filter(|(_, m)| m.contains_key(predicate))
-            .map(|(entity, _)| entity)
-            .min()?;
+        // 增量的“字典序最小主体”索引，无需每次全量扫描
+        let prototype = self.predicate_min_entity.get(predicate)?;
         let objects = self
             .by_subject
             .get(prototype.as_str())

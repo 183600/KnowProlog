@@ -195,19 +195,24 @@ impl AssociationMiner {
             }
         }
 
-        // 单前件规则 A ⇒ B
+        // 单前件规则 A ⇒ B（物品按出现次数降序，低于阈值的尾部直接截断）
         for (index, (a, a_count)) in items.iter().enumerate() {
             if *a_count < min_count {
                 continue;
             }
-            for (other, (b, _b_count)) in items.iter().enumerate() {
+            for (other, (b, b_count)) in items.iter().enumerate() {
                 if index == other {
                     continue;
                 }
+                if *b_count < min_count {
+                    break;
+                }
                 if let Some(rule) = self.build_rule(
-                    vec![a.clone()],
-                    a.clone(),
+                    std::slice::from_ref(a),
+                    a,
                     b,
+                    *b_count,
+                    *a_count,
                     total,
                     min_count,
                     &item_entities,
@@ -240,14 +245,16 @@ impl AssociationMiner {
                 }
                 let antecedent = vec![first.clone(), second.clone()];
                 let antecedent_text = antecedent.join(" ∧ ");
-                for (b, _b_count) in top.iter() {
+                for (b, b_count) in top.iter() {
                     if b == first || b == second {
                         continue;
                     }
                     if let Some(rule) = self.build_rule(
-                        antecedent.clone(),
-                        antecedent_text.clone(),
+                        &antecedent,
+                        &antecedent_text,
                         b,
+                        *b_count,
+                        pair_count,
                         total,
                         min_count,
                         &item_entities,
@@ -279,54 +286,43 @@ impl AssociationMiner {
 
     fn build_rule(
         &self,
-        antecedent: Vec<String>,
-        antecedent_text: String,
+        antecedent: &[String],
+        antecedent_text: &str,
         consequent: &str,
+        consequent_count: usize,
+        antecedent_count: usize,
         total: usize,
         min_count: usize,
         item_entities: &HashMap<&str, HashSet<&str>>,
     ) -> Option<AssociationRule> {
-        let consequent_count = self.item_count(consequent);
         if consequent_count < min_count {
             return None;
         }
-        let (antecedent_support, support) = if antecedent.len() == 1 {
-            let a = &antecedent[0];
-            let a_count = self.item_count(a);
-            let support = match (
-                item_entities.get(a.as_str()),
+        // 支持度：整个前件与结论共现的实体数（前件计数由调用方提供，避免重复求交）
+        let support = if antecedent.len() == 1 {
+            match (
+                item_entities.get(antecedent[0].as_str()),
                 item_entities.get(consequent),
             ) {
                 (Some(x), Some(y)) => intersection_count(x, y),
                 _ => 0,
-            };
-            (a_count, support)
+            }
         } else {
-            let a = &antecedent[0];
-            let b = &antecedent[1];
-            let a_count = match (
-                item_entities.get(a.as_str()),
-                item_entities.get(b.as_str()),
-            ) {
-                (Some(x), Some(y)) => intersection_count(x, y),
-                _ => 0,
-            };
-            let support = match (
-                item_entities.get(a.as_str()),
-                item_entities.get(b.as_str()),
+            match (
+                item_entities.get(antecedent[0].as_str()),
+                item_entities.get(antecedent[1].as_str()),
                 item_entities.get(consequent),
             ) {
                 (Some(x), Some(y), Some(z)) => triple_intersection_count(x, y, z),
                 _ => 0,
-            };
-            (a_count, support)
+            }
         };
-        if support < min_count || antecedent_support < min_count || antecedent_support == 0 {
+        if support < min_count || antecedent_count < min_count || antecedent_count == 0 {
             return None;
         }
         // 保证前提集合非空且前件文本与项一致（防误用）
         debug_assert!(antecedent.iter().any(|item| antecedent_text.contains(item)));
-        let confidence = support as f64 / antecedent_support as f64;
+        let confidence = support as f64 / antecedent_count as f64;
         if confidence < self.min_confidence {
             return None;
         }
@@ -338,13 +334,13 @@ impl AssociationMiner {
         if lift < self.min_lift {
             return None;
         }
-        let p_a = antecedent_support as f64 / total as f64;
+        let p_a = antecedent_count as f64 / total as f64;
         let leverage = support as f64 / total as f64 - p_a * p_b;
         Some(AssociationRule {
-            antecedent,
+            antecedent: antecedent.to_vec(),
             consequent: consequent.to_string(),
             support,
-            antecedent_support,
+            antecedent_support: antecedent_count,
             consequent_support: consequent_count,
             total,
             confidence,

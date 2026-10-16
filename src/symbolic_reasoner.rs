@@ -283,6 +283,10 @@ pub struct SymbolicReasoner {
     // 最近一次溯因的目标与查询变量（澄清确认真后验证目标是否得证）
     last_abduction_goal: Option<Atom>,
     last_abduction_vars: Vec<String>,
+    // 谓词清单缓存：仅在 observe_facts 后重建（按对齐器剖面与预测规则生成，顺序敏感）
+    known_predicates_cache: Vec<String>,
+    // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
+    proposition_surfaces: Vec<(String, String)>,
 }
 
 impl SymbolicReasoner {
@@ -312,7 +316,7 @@ impl SymbolicReasoner {
         );
         let mut abduction = abduction;
         abduction.set_max_scenario_size(config.abduction_max_scenario_size);
-        Self {
+        let mut reasoner = Self {
             config,
             aligner,
             predictor: LinkPredictor::new(),
@@ -329,7 +333,20 @@ impl SymbolicReasoner {
             clarification: None,
             last_abduction_goal: None,
             last_abduction_vars: Vec::new(),
-        }
+            known_predicates_cache: Vec::new(),
+            proposition_surfaces: Vec::new(),
+        };
+        reasoner.rebuild_knowledge_caches();
+        reasoner
+    }
+
+    /// 重建谓词清单与命题表面积索引（二者仅依赖对齐器/生成器/预测规则的状态）
+    fn rebuild_knowledge_caches(&mut self) {
+        self.known_predicates_cache = self.collect_known_predicates();
+        self.proposition_surfaces = semantic_entailment::build_predicate_surfaces(
+            &self.aligner,
+            self.generator.predicate_surfaces(),
+        );
     }
 
     pub fn context(&self) -> &DialogueContext {
@@ -435,6 +452,10 @@ impl SymbolicReasoner {
         if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();
         }
+        // 谓词清单与命题表面积索引随剖面/规则变化，统一在观察后重建一次
+        if !facts.is_empty() {
+            self.rebuild_knowledge_caches();
+        }
     }
 
     // 用当前知识（事实 + 链接预测规则 + 关联规则）重建归结引擎
@@ -524,32 +545,43 @@ impl SymbolicReasoner {
             self.context.record_entities(&entities);
         }
         let normalized_text = self.aligner.normalize(text);
+        let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
         let predicate = self
             .known_predicates()
-            .into_iter()
-            .find(|p| self.predicate_mentioned_normalized(text, &normalized_text, p))
-            .map(str::to_string);
+            .iter()
+            .find(|p| {
+                self.predicate_mentioned_normalized_with(
+                    &normalized_text,
+                    p,
+                    &mentioned_canonicals,
+                )
+            })
+            .cloned();
         if let Some(predicate) = predicate {
             self.context.record_predicate(&predicate);
         }
         self.context.record_question(text);
     }
 
-    fn known_predicates(&self) -> Vec<&str> {
-        let mut predicates: Vec<&str> = self
+    fn collect_known_predicates(&self) -> Vec<String> {
+        let mut predicates: Vec<String> = self
             .aligner
             .profiles()
             .iter()
             .filter(|p| p.kind == TermKind::Relation)
-            .map(|p| p.term.as_str())
+            .map(|p| p.term.clone())
             .collect();
-        let mut seen: HashSet<&str> = predicates.iter().copied().collect();
+        let mut seen: HashSet<String> = predicates.iter().cloned().collect();
         for rule in self.predictor.rules() {
-            if seen.insert(rule.head.as_str()) {
-                predicates.push(rule.head.as_str());
+            if seen.insert(rule.head.clone()) {
+                predicates.push(rule.head.clone());
             }
         }
         predicates
+    }
+
+    fn known_predicates(&self) -> &[String] {
+        &self.known_predicates_cache
     }
 
     pub fn entities_mentioned(&self, text: &str) -> Vec<String> {
@@ -588,22 +620,29 @@ impl SymbolicReasoner {
             .collect()
     }
 
-    fn predicate_mentioned_normalized(
-        &self,
-        text: &str,
-        normalized_text: &str,
-        predicate: &str,
-    ) -> bool {
-        let predicate_norm = self.aligner.normalize(predicate);
-        if !predicate_norm.is_empty() && normalized_text.contains(&predicate_norm) {
-            return true;
-        }
+    /// 预计算文本中出现的同义词对应的规范谓词集合（同义词表可能远大于谓词表）
+    fn mentioned_predicate_canonicals<'t>(&'t self, text: &str) -> HashSet<&'t str> {
+        let mut mentioned: HashSet<&str> = HashSet::new();
         for (alias, canonical) in self.aligner.synonyms() {
-            if canonical == predicate && text.contains(alias.as_str()) {
-                return true;
+            if text.contains(alias.as_str()) {
+                mentioned.insert(canonical.as_str());
             }
         }
-        false
+        mentioned
+    }
+
+    /// 在预计算集合的辅助下判断谓词是否被文本提及（等价于 predicate_mentioned_normalized）
+    fn predicate_mentioned_normalized_with(
+        &self,
+        normalized_text: &str,
+        predicate: &str,
+        mentioned_canonicals: &HashSet<&str>,
+    ) -> bool {
+        if mentioned_canonicals.contains(predicate) {
+            return true;
+        }
+        let predicate_norm = self.aligner.normalize(predicate);
+        !predicate_norm.is_empty() && normalized_text.contains(&predicate_norm)
     }
 
     // 实体链接：候选生成 + 模糊容错 + 上下文消歧（详见 entity_linker 模块）
@@ -667,12 +706,17 @@ impl SymbolicReasoner {
 
     fn link_hints(&self, text: &str) -> Vec<String> {
         let normalized_text = self.aligner.normalize(text);
+        let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
         self.known_predicates()
-            .into_iter()
+            .iter()
             .filter(|predicate| {
-                self.predicate_mentioned_normalized(text, &normalized_text, predicate)
+                self.predicate_mentioned_normalized_with(
+                    &normalized_text,
+                    predicate,
+                    &mentioned_canonicals,
+                )
             })
-            .map(str::to_string)
+            .cloned()
             .collect()
     }
 
@@ -768,10 +812,10 @@ impl SymbolicReasoner {
     }
 
     fn proposition_parser(&self) -> PropositionParser<'_> {
-        PropositionParser::new(
+        PropositionParser::with_surfaces(
             &self.aligner,
             &self.linker,
-            self.generator.predicate_surfaces(),
+            &self.proposition_surfaces,
         )
     }
 
@@ -2334,6 +2378,7 @@ impl SymbolicReasoner {
         }
 
         let normalized_question = self.aligner.normalize(question);
+        let mentioned_canonicals = self.mentioned_predicate_canonicals(question);
         let mut candidates: Vec<Prediction> = Vec::new();
         for entity in &entities {
             for prediction in self.predictor.predict_for_entity(
@@ -2341,10 +2386,10 @@ impl SymbolicReasoner {
                 None,
                 self.config.max_predictions * 4,
             ) {
-                if self.predicate_mentioned_normalized(
-                    question,
+                if self.predicate_mentioned_normalized_with(
                     &normalized_question,
                     &prediction.triple.predicate,
+                    &mentioned_canonicals,
                 ) {
                     candidates.push(prediction);
                 }

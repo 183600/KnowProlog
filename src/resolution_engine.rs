@@ -81,16 +81,31 @@ impl Atom {
 
     /// 内部调试表示，如 `师傅(张三, ?X)`
     pub fn display(&self) -> String {
-        let args = self
-            .terms
-            .iter()
-            .map(|term| match term {
-                Term::Var(name) => format!("?{}", name),
-                Term::Const(name) => name.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{}({})", self.predicate, args)
+        let mut out = String::with_capacity(
+            self.predicate.len()
+                + 2
+                + self
+                    .terms
+                    .iter()
+                    .map(|term| term.name().len() + 3)
+                    .sum::<usize>(),
+        );
+        out.push_str(&self.predicate);
+        out.push('(');
+        for (index, term) in self.terms.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            match term {
+                Term::Var(name) => {
+                    out.push('?');
+                    out.push_str(name);
+                }
+                Term::Const(name) => out.push_str(name),
+            }
+        }
+        out.push(')');
+        out
     }
 }
 
@@ -263,10 +278,16 @@ impl ResolutionEngine {
 
     /// 头谓词匹配的子句（规则），供后向链展开
     pub fn clauses_for(&self, predicate: &str) -> Vec<&Clause> {
+        self.clauses_iter_for(predicate).collect()
+    }
+
+    /// 头谓词匹配的子句迭代器：不分配中间 Vec，便于热路径按需 take
+    pub(crate) fn clauses_iter_for(&self, predicate: &str) -> impl Iterator<Item = &Clause> {
         self.rules_by_head
             .get(predicate)
-            .map(|indices| indices.iter().map(|&index| &self.clauses[index]).collect())
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .map(move |&index| &self.clauses[index])
     }
 
     /// 是否为已知基事实
@@ -297,6 +318,20 @@ impl ResolutionEngine {
     /// 加入二元基事实 `predicate(subject, object)`
     pub fn add_fact(&mut self, predicate: &str, subject: &str, object: &str) -> bool {
         self.add_fact_atom(Atom::rel(predicate, subject, object))
+    }
+
+    /// 移除基事实（`add_fact_atom` 的逆操作，按原顺序压缩索引，保证迭代顺序可复原）；
+    /// 事实不存在返回 false
+    pub fn remove_fact_atom(&mut self, atom: &Atom) -> bool {
+        if !self.facts.remove(atom) {
+            return false;
+        }
+        if let Some(facts) = self.facts_by_pred.get_mut(&atom.predicate) {
+            if let Some(position) = facts.iter().position(|fact| fact == atom) {
+                facts.remove(position);
+            }
+        }
+        true
     }
 
     /// 加入一元基事实 `predicate(subject)`
@@ -502,10 +537,8 @@ impl ResolutionEngine {
     pub fn forward_chain(&self, max_rounds: usize, max_new_facts: usize) -> Vec<DerivedFact> {
         let mut known: HashSet<Atom> = self.facts.clone();
         let mut known_by_pred: HashMap<Rc<str>, Vec<Atom>> = self.facts_by_pred.clone();
+        // 基事实未记录置信度时按 1.0 处理（与显式预填 1.0 等价），无需预先复制整张事实表
         let mut confidence_of: HashMap<Atom, f64> = HashMap::new();
-        for fact in &self.facts {
-            confidence_of.insert(fact.clone(), 1.0);
-        }
         let mut derived: Vec<DerivedFact> = Vec::new();
         let mut counter = 0usize;
 
@@ -662,6 +695,10 @@ fn apply_term(subst: &Substitution, term: &Term) -> Term {
 }
 
 pub fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
+    if subst.head.is_none() {
+        // 空置换下解析结果与原原子相同，直接克隆省去逐项解析
+        return atom.clone();
+    }
     Atom {
         predicate: atom.predicate.clone(),
         terms: atom.terms.iter().map(|term| apply_term(subst, term)).collect(),
@@ -797,18 +834,23 @@ pub fn proof_uses_rules(node: &ProofNode) -> bool {
 /// 证明中出现的规则来源（去重、保持出现顺序）
 pub fn proof_rule_sources(node: &ProofNode) -> Vec<String> {
     let mut sources = Vec::new();
-    collect_rule_sources(node, &mut sources);
+    let mut seen: HashSet<&str> = HashSet::new();
+    collect_rule_sources(node, &mut sources, &mut seen);
     sources
 }
 
-fn collect_rule_sources(node: &ProofNode, sources: &mut Vec<String>) {
+fn collect_rule_sources<'a>(
+    node: &'a ProofNode,
+    sources: &mut Vec<String>,
+    seen: &mut HashSet<&'a str>,
+) {
     if let ProofSource::Rule { source } = &node.source {
-        if !sources.contains(source) {
+        if seen.insert(source.as_str()) {
             sources.push(source.clone());
         }
     }
     for child in &node.children {
-        collect_rule_sources(child, sources);
+        collect_rule_sources(child, sources, seen);
     }
 }
 

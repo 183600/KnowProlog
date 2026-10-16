@@ -807,17 +807,17 @@ impl EntityRelationExtractor {
         Ok(relations)
     }
 
-    fn simple_pos_tagging(&self, words: &[&str]) -> Vec<String> {
+    fn simple_pos_tagging(&self, words: &[&str]) -> Vec<&'static str> {
         // 简化的词性标注
         words.iter().map(|word| {
             if self.is_noun(word) {
-                "n".to_string()
+                "n"
             } else if self.is_verb_word(word) {
-                "v".to_string()
+                "v"
             } else if self.is_adjective(word) {
-                "a".to_string()
+                "a"
             } else {
-                "x".to_string()
+                "x"
             }
         }).collect()
     }
@@ -844,7 +844,7 @@ impl EntityRelationExtractor {
         pos_tag == "v"
     }
 
-    fn find_subject(&self, words: &[&str], pos_tags: &[String], verb_index: usize) -> Option<String> {
+    fn find_subject(&self, words: &[&str], pos_tags: &[&str], verb_index: usize) -> Option<String> {
         // 在动词前查找主语
         for i in (0..verb_index).rev() {
             if pos_tags[i] == "n" && !self.stop_words.contains(words[i]) {
@@ -854,7 +854,7 @@ impl EntityRelationExtractor {
         None
     }
 
-    fn find_object(&self, words: &[&str], pos_tags: &[String], verb_index: usize) -> Option<String> {
+    fn find_object(&self, words: &[&str], pos_tags: &[&str], verb_index: usize) -> Option<String> {
         // 在动词后查找宾语
         for i in (verb_index + 1)..words.len() {
             if pos_tags[i] == "n" && !self.stop_words.contains(words[i]) {
@@ -896,18 +896,26 @@ impl EntityRelationExtractor {
     }
 
     async fn link_and_normalize_entities(&self, entities: Vec<EntityExtraction>) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
-        let mut linked_entities = Vec::new();
-        
+        let mut linked_entities = Vec::with_capacity(entities.len());
+        // 一次性持有类型表读锁，避免逐实体重复加锁
+        let entity_types = self.entity_types.read();
+
         for mut entity in entities {
             // 实体规范化
             entity.canonical_form = self.normalize_entity_name(&entity.entity, &entity.entity_type).await;
-            
+
             // 提取实体属性
-            entity.attributes = self.extract_entity_attributes(&entity).await?;
-            
+            let mut attributes = HashMap::new();
+            if let Some(entity_type) = entity_types.get(&entity.entity_type) {
+                for property in &entity_type.properties {
+                    attributes.insert(property.clone(), vec![]);
+                }
+            }
+            entity.attributes = attributes;
+
             linked_entities.push(entity);
         }
-        
+
         Ok(linked_entities)
     }
 
@@ -917,11 +925,13 @@ impl EntityRelationExtractor {
         
         match entity_type {
             "PERSON" => {
-                // 人名规范化：去除称谓
+                // 人名规范化：去除称谓（无匹配时不产生新分配）
                 let titles = ["先生", "女士", "老师", "教授", "博士"];
                 let mut result = normalized;
                 for title in &titles {
-                    result = result.replace(title, "");
+                    if result.contains(title) {
+                        result = result.replace(title, "");
+                    }
                 }
                 Some(result.trim().to_string())
             }
@@ -937,29 +947,22 @@ impl EntityRelationExtractor {
         }
     }
 
-    async fn extract_entity_attributes(&self, entity: &EntityExtraction) -> Result<HashMap<String, Vec<String>>, Box<dyn std::error::Error>> {
-        let mut attributes = HashMap::new();
-        
-        // 基于实体类型添加默认属性
-        let entity_types = self.entity_types.read();
-        if let Some(entity_type) = entity_types.get(&entity.entity_type) {
-            for property in &entity_type.properties {
-                attributes.insert(property.clone(), vec![]);
-            }
-        }
-        
-        Ok(attributes)
-    }
-
     async fn validate_relations(&self, relations: Vec<KnowledgeTriple>, entities: &[EntityExtraction]) -> Result<Vec<KnowledgeTriple>, Box<dyn std::error::Error>> {
         let mut validated_relations = Vec::new();
         let entity_names: HashSet<_> = entities.iter().map(|e| &e.entity).collect();
+        // 名称 → 类型（首个匹配优先），把逐关系线性查找变成 O(1)
+        let mut entity_type_of: HashMap<&str, &str> = HashMap::new();
+        for entity in entities {
+            entity_type_of
+                .entry(entity.entity.as_str())
+                .or_insert(entity.entity_type.as_str());
+        }
         
         for relation in relations {
             // 验证主语和宾语是否为识别出的实体
             if entity_names.contains(&relation.subject) && entity_names.contains(&relation.object) {
                 // 验证关系类型的合理性
-                if self.is_valid_relation(&relation.subject, &relation.predicate, &relation.object, entities) {
+                if Self::is_valid_relation(&entity_type_of, &relation.subject, &relation.predicate, &relation.object) {
                     validated_relations.push(relation);
                 }
             }
@@ -968,18 +971,18 @@ impl EntityRelationExtractor {
         Ok(validated_relations)
     }
 
-    fn is_valid_relation(&self, subject: &str, predicate: &str, object: &str, entities: &[EntityExtraction]) -> bool {
+    fn is_valid_relation(
+        entity_type_of: &HashMap<&str, &str>,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> bool {
         // 获取主语和宾语的实体类型
-        let subject_type = entities.iter()
-            .find(|e| e.entity == subject)
-            .map(|e| &e.entity_type);
-        
-        let object_type = entities.iter()
-            .find(|e| e.entity == object)
-            .map(|e| &e.entity_type);
+        let subject_type = entity_type_of.get(subject).copied();
+        let object_type = entity_type_of.get(object).copied();
         
         // 基于实体类型验证关系的合理性
-        match (subject_type.map(|s| s.as_str()), predicate, object_type.map(|s| s.as_str())) {
+        match (subject_type, predicate, object_type) {
             (Some("PERSON"), "work_for", Some("ORGANIZATION")) => true,
             (Some("PERSON"), "born_in", Some("LOCATION")) => true,
             (Some("ORGANIZATION"), "located_in", Some("LOCATION")) => true,

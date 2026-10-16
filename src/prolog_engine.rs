@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use scryer_prolog::machine::Machine;
@@ -5,6 +6,8 @@ use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryR
 
 pub struct PrologEngine {
     machine: Machine,
+    /// 已加载的动态事实（按规范序排序），用于跳过重复加载
+    loaded_facts: Vec<PrologFact>,
 }
 
 impl PrologEngine {
@@ -67,15 +70,26 @@ impl PrologEngine {
         
         machine.consult_module_string("user", base_rules.to_string());
         
-        Self { machine }
+        Self { machine, loaded_facts: Vec::new() }
     }
     
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
-        self.clear_dynamic_facts();
+        // 先按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
+        let mut facts = facts;
+        facts.sort_by(Self::compare_facts);
         let facts_count = facts.len();
+
+        println!("Loading {} Prolog facts", facts_count);
+
+        // 事实集未变化时跳过清空与重载，机器状态保持一致
+        if facts == self.loaded_facts {
+            return;
+        }
+
+        self.clear_dynamic_facts();
         let mut fact_string = String::with_capacity(facts_count * 64);
         
-        for fact in facts {
+        for fact in &facts {
             match fact {
                 PrologFact::Entity { name, entity_type, properties } => {
                     let _ = write!(fact_string, "oxigraph_entity('{}', '{}', [", name, entity_type);
@@ -98,8 +112,24 @@ impl PrologEngine {
             }
         }
         
-        println!("Loading {} Prolog facts", facts_count);
         self.machine.consult_module_string("user", fact_string);
+        self.loaded_facts = facts;
+    }
+
+    /// 事实的规范比较顺序：先实体后关系，各自按字段字典序
+    fn compare_facts(a: &PrologFact, b: &PrologFact) -> Ordering {
+        match (a, b) {
+            (
+                PrologFact::Entity { name: n1, entity_type: t1, .. },
+                PrologFact::Entity { name: n2, entity_type: t2, .. },
+            ) => n1.cmp(n2).then_with(|| t1.cmp(t2)),
+            (PrologFact::Entity { .. }, PrologFact::Relation { .. }) => Ordering::Less,
+            (PrologFact::Relation { .. }, PrologFact::Entity { .. }) => Ordering::Greater,
+            (
+                PrologFact::Relation { from: f1, rel_type: r1, to: o1 },
+                PrologFact::Relation { from: f2, rel_type: r2, to: o2 },
+            ) => f1.cmp(f2).then_with(|| r1.cmp(r2)).then_with(|| o1.cmp(o2)),
+        }
     }
 
     pub fn load_relevant_facts(&mut self, facts: Vec<PrologFact>) {
@@ -320,7 +350,7 @@ fn value_to_string(value: Value) -> String {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PrologFact {
     Entity {
         name: String,

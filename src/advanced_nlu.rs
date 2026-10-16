@@ -405,11 +405,16 @@ impl AdvancedNLU {
 
     fn normalize_query(&self, query: &str) -> String {
         // 去除多余空白字符
-        let normalized = query.trim().to_string();
-        
-        // 统一标点符号
-        let normalized = normalized.replace("？", "?").replace("！", "!");
-        
+        let mut normalized = query.trim().to_string();
+
+        // 统一标点符号（仅在确有需要时分配新字符串）
+        if normalized.contains('？') {
+            normalized = normalized.replace('？', "?");
+        }
+        if normalized.contains('！') {
+            normalized = normalized.replace('！', "!");
+        }
+
         // 转换为小写（但保留中文）
         normalized
     }
@@ -487,26 +492,46 @@ impl AdvancedNLU {
 
     fn calculate_pattern_match_confidence(&self, query_words: &[&str], pattern: &str) -> f64 {
         // 简化的模式匹配
-        let pattern_keywords: Vec<_> = pattern.split_whitespace()
-            .filter(|word| !word.starts_with('(') || !word.ends_with(')'))
-            .collect();
-        
         let mut matches = 0;
-        
-        for pattern_word in &pattern_keywords {
+        let mut total = 0;
+
+        for pattern_word in pattern
+            .split_whitespace()
+            .filter(|word| !word.starts_with('(') || !word.ends_with(')'))
+        {
+            total += 1;
             for query_word in query_words {
-                if pattern_word == query_word || self.calculate_word_similarity(pattern_word, query_word) > 0.8 {
+                if pattern_word == *query_word
+                    || self.words_similarity_above_08(pattern_word, query_word)
+                {
                     matches += 1;
                     break;
                 }
             }
         }
-        
-        if pattern_keywords.is_empty() {
+
+        if total == 0 {
             0.0
         } else {
-            matches as f64 / pattern_keywords.len() as f64
+            matches as f64 / total as f64
         }
+    }
+
+    /// 与 `calculate_word_similarity(...) > 0.8` 完全等价；
+    /// 先用长度差下界剪枝（编辑距离 ≥ 长度差），避免无谓的 DP 分配
+    fn words_similarity_above_08(&self, word1: &str, word2: &str) -> bool {
+        let len1 = word1.chars().count();
+        let len2 = word2.chars().count();
+        if len1 == 0 || len2 == 0 {
+            return false;
+        }
+        let max_len = len1.max(len2);
+        let min_len = len1.min(len2);
+        // 相似度 ≤ 1 - (max-min)/max；当长度差达到 20% 上界时必然不满足 > 0.8
+        if (max_len - min_len) * 5 >= max_len {
+            return false;
+        }
+        self.calculate_word_similarity(word1, word2) > 0.8
     }
 
     fn calculate_word_similarity(&self, word1: &str, word2: &str) -> f64 {
@@ -801,6 +826,10 @@ impl AdvancedNLU {
         while i < entities.len() {
             let mut j = i + 1;
             while j < entities.len() {
+                if entities[i].end_pos <= entities[j].start_pos {
+                    // 列表按起点升序：i 完全位于 j 之前，后续实体更不可能与 i 重叠
+                    break;
+                }
                 if self.entities_overlap(&entities[i], &entities[j]) {
                     // 嵌套时保留更完整的复合实体，否则保留置信度更高的实体
                     let i_contains_j = entities[i].start_pos <= entities[j].start_pos
@@ -984,12 +1013,13 @@ impl AdvancedNLU {
     }
 
     async fn extract_modifiers(&self, query: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let modifiers = vec![
+        // 数组字面量直接在栈上迭代，避免每次调用堆分配 Vec
+        let modifiers = [
             "最", "更", "非常", "特别", "很", "极其", "相当", "十分", "比较", "稍微", "略", "大概", "大约", "可能", "也许", "或许", "一定", "肯定", "必须", "应该", "需要"
         ];
         
         let mut found_modifiers = Vec::new();
-        for modifier in &modifiers {
+        for modifier in modifiers {
             if query.contains(modifier) {
                 found_modifiers.push(modifier.to_string());
             }

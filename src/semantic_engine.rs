@@ -35,6 +35,8 @@ pub struct SemanticEngine {
     jieba: &'static Jieba,
     entity_knowledge: Arc<RwLock<HashMap<String, SemanticKnowledge>>>,
     entity_aliases: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    // 小写别名索引：避免每次歧义解析都重复对全部别名做 to_lowercase
+    entity_aliases_lower: Arc<RwLock<HashMap<String, Vec<String>>>>,
     relation_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     intent_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     stop_words: HashSet<String>,
@@ -54,6 +56,7 @@ impl SemanticEngine {
             jieba,
             entity_knowledge: Arc::new(RwLock::new(HashMap::new())),
             entity_aliases: Arc::new(RwLock::new(HashMap::new())),
+            entity_aliases_lower: Arc::new(RwLock::new(HashMap::new())),
             relation_patterns: Arc::new(RwLock::new(HashMap::new())),
             intent_patterns: Arc::new(RwLock::new(HashMap::new())),
             stop_words,
@@ -77,6 +80,7 @@ impl SemanticEngine {
         {
             let mut knowledge = self.entity_knowledge.write();
             let mut aliases = self.entity_aliases.write();
+            let mut aliases_lower = self.entity_aliases_lower.write();
             let mut token_cache = self.token_cache.write();
             
             for entity in entities {
@@ -93,6 +97,7 @@ impl SemanticEngine {
                 
                 for alias in &entity_aliases_list {
                     aliases.entry(alias.clone()).or_insert_with(Vec::new).push(entity_name.clone());
+                    aliases_lower.entry(alias.to_lowercase()).or_insert_with(Vec::new).push(entity_name.clone());
                 }
                 
                 token_cache.insert(
@@ -176,12 +181,20 @@ impl SemanticEngine {
             }
         }
         
-        // 模糊匹配
+        // 模糊匹配（使用预构建的小写别名索引，省去每次调用重复转小写）
         let mention_lower = mention.to_lowercase();
-        for (alias, entity_names) in aliases.iter() {
-            let alias_lower = alias.to_lowercase();
-            if alias_lower.contains(&mention_lower) || mention_lower.contains(&alias_lower) {
-                let similarity = self.calculate_string_similarity(&mention_lower, &alias_lower);
+        let aliases_lower = self.entity_aliases_lower.read();
+        for (alias_lower, entity_names) in aliases_lower.iter() {
+            if alias_lower.contains(&mention_lower) || mention_lower.contains(alias_lower) {
+                // 相似度 > 0.6 ⟹ 长度差 < 40%；先按长度差剪枝
+                let len_a = alias_lower.chars().count();
+                let len_b = mention_lower.chars().count();
+                let max_len = len_a.max(len_b);
+                let min_len = len_a.min(len_b);
+                if max_len > 0 && (max_len - min_len) * 5 >= max_len * 2 {
+                    continue;
+                }
+                let similarity = self.calculate_string_similarity(&mention_lower, alias_lower);
                 if similarity > 0.6 {
                     for entity_name in entity_names {
                         if let Some(entity_knowledge) = knowledge.get(entity_name) {
@@ -199,6 +212,7 @@ impl SemanticEngine {
             }
         }
         
+        drop(aliases_lower);
         drop(aliases);
         drop(knowledge);
         
@@ -456,27 +470,42 @@ impl SemanticEngine {
 
     fn match_pattern_confidence(&self, text: &str, pattern: &str) -> f64 {
         // 简化的模式匹配，实际实现中可以使用正则表达式
-        let pattern_words: Vec<_> = pattern.split_whitespace().collect();
-        let text_words: Vec<_> = text.split_whitespace().collect();
-        
         let mut matches = 0;
-        for pattern_word in &pattern_words {
+        let mut total = 0;
+        
+        for pattern_word in pattern.split_whitespace() {
+            total += 1;
             if pattern_word.starts_with('(') && pattern_word.ends_with(')') {
                 continue; // 跳过捕获组
             }
             
-            for text_word in &text_words {
-                if pattern_word == text_word || self.calculate_string_similarity(pattern_word, text_word) > 0.8 {
+            for text_word in text.split_whitespace() {
+                if pattern_word == text_word {
+                    matches += 1;
+                    break;
+                }
+                // 相似度 > 0.8 ⟹ 长度差 < 20%；先按长度差剪枝，避免无谓的编辑距离计算
+                let len1 = pattern_word.chars().count();
+                let len2 = text_word.chars().count();
+                if len1 == 0 || len2 == 0 {
+                    continue;
+                }
+                let max_len = len1.max(len2);
+                let min_len = len1.min(len2);
+                if (max_len - min_len) * 5 >= max_len {
+                    continue;
+                }
+                if self.calculate_string_similarity(pattern_word, text_word) > 0.8 {
                     matches += 1;
                     break;
                 }
             }
         }
         
-        if pattern_words.is_empty() {
+        if total == 0 {
             0.0
         } else {
-            matches as f64 / pattern_words.len() as f64
+            matches as f64 / total as f64
         }
     }
 
@@ -578,6 +607,7 @@ impl SemanticEngine {
         let entity_name = entity.entity.clone();
         let mut knowledge = self.entity_knowledge.write();
         let mut aliases = self.entity_aliases.write();
+        let mut aliases_lower = self.entity_aliases_lower.write();
         let mut token_cache = self.token_cache.write();
         
         // 添加实体别名映射
@@ -591,6 +621,7 @@ impl SemanticEngine {
         
         for alias in &entity_aliases_list {
             aliases.entry(alias.clone()).or_insert_with(Vec::new).push(entity_name.clone());
+            aliases_lower.entry(alias.to_lowercase()).or_insert_with(Vec::new).push(entity_name.clone());
         }
         
         token_cache.insert(

@@ -2,6 +2,13 @@ use jieba_rs::Jieba;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+static QUESTION_PATTERNS: OnceLock<HashMap<QuestionType, Vec<Regex>>> = OnceLock::new();
+static DOMAIN_KEYWORDS: OnceLock<HashMap<Domain, Vec<String>>> = OnceLock::new();
+static INTENT_INDICATORS: OnceLock<HashMap<Intent, Vec<String>>> = OnceLock::new();
+static ENTITY_PATTERNS: OnceLock<Vec<(Regex, String)>> = OnceLock::new();
+static STOP_WORDS: OnceLock<HashSet<&'static str>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionAnalysis {
@@ -72,27 +79,29 @@ pub struct Entity {
 
 pub struct QuestionAnalyzer {
     jieba: &'static Jieba,
-    question_patterns: HashMap<QuestionType, Vec<Regex>>,
-    domain_keywords: HashMap<Domain, Vec<String>>,
-    intent_indicators: HashMap<Intent, Vec<String>>,
-    entity_patterns: Vec<(Regex, String)>,
-    stop_words: HashSet<String>,
+    question_patterns: &'static HashMap<QuestionType, Vec<Regex>>,
+    domain_keywords: &'static HashMap<Domain, Vec<String>>,
+    intent_indicators: &'static HashMap<Intent, Vec<String>>,
+    entity_patterns: &'static Vec<(Regex, String)>,
+    stop_words: &'static HashSet<&'static str>,
 }
 
 impl QuestionAnalyzer {
     pub fn new() -> Self {
         let jieba = crate::nlp::shared_jieba();
         
-        let stop_words: HashSet<String> = [
-            "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是"
-        ].iter().map(|s| s.to_string()).collect();
+        let stop_words = STOP_WORDS.get_or_init(|| {
+            [
+                "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是"
+            ].into_iter().collect()
+        });
 
         Self {
             jieba,
-            question_patterns: Self::initialize_question_patterns(),
-            domain_keywords: Self::initialize_domain_keywords(),
-            intent_indicators: Self::initialize_intent_indicators(),
-            entity_patterns: Self::initialize_entity_patterns(),
+            question_patterns: QUESTION_PATTERNS.get_or_init(Self::initialize_question_patterns),
+            domain_keywords: DOMAIN_KEYWORDS.get_or_init(Self::initialize_domain_keywords),
+            intent_indicators: INTENT_INDICATORS.get_or_init(Self::initialize_intent_indicators),
+            entity_patterns: ENTITY_PATTERNS.get_or_init(Self::initialize_entity_patterns),
             stop_words,
         }
     }

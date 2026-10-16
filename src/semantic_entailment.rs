@@ -10,6 +10,7 @@
 //     假设给出矛盾与反证；证据不足则明确报"未知"。
 // 这套机制让系统能像 LLM 一样"听懂陈述句"，但判定结果完全可追溯、可复现。
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::entity_linker::EntityLinker;
@@ -211,7 +212,42 @@ pub struct PropositionParser<'a> {
     aligner: &'a OntologyAligner,
     linker: &'a EntityLinker,
     // 表面积（含中文动词化形式）→ 规范谓词，按长度降序排列
-    surfaces: Vec<(String, String)>,
+    surfaces: Cow<'a, [(String, String)]>,
+}
+
+/// 构建“表面积 → 规范谓词”索引（按表面长度降序、再按字典序）。
+///
+/// 该索引只依赖对齐器与词法表面表，可在图谱修订之间缓存复用。
+pub fn build_predicate_surfaces(
+    aligner: &OntologyAligner,
+    lexical_surfaces: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut surfaces: HashMap<String, String> = lexical_surfaces.clone();
+    for profile in aligner.profiles() {
+        if matches!(profile.kind, TermKind::Relation | TermKind::Attribute) {
+            let canonical = aligner.canonical_form(&profile.term);
+            if !canonical.is_empty() {
+                surfaces.entry(canonical.clone()).or_insert(canonical);
+            }
+        }
+    }
+    for (alias, canonical) in aligner.synonyms() {
+        let target = aligner.canonical_form(canonical);
+        if matches!(
+            aligner.kind_of(&target),
+            Some(TermKind::Relation) | Some(TermKind::Attribute)
+        ) {
+            surfaces.entry(alias.clone()).or_insert(target);
+        }
+    }
+    let mut surfaces: Vec<(String, String)> = surfaces.into_iter().collect();
+    surfaces.sort_by(|a, b| {
+        b.0.chars()
+            .count()
+            .cmp(&a.0.chars().count())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    surfaces
 }
 
 impl<'a> PropositionParser<'a> {
@@ -220,35 +256,23 @@ impl<'a> PropositionParser<'a> {
         linker: &'a EntityLinker,
         lexical_surfaces: &HashMap<String, String>,
     ) -> Self {
-        let mut surfaces: HashMap<String, String> = lexical_surfaces.clone();
-        for profile in aligner.profiles() {
-            if matches!(profile.kind, TermKind::Relation | TermKind::Attribute) {
-                let canonical = aligner.canonical_form(&profile.term);
-                if !canonical.is_empty() {
-                    surfaces.entry(canonical.clone()).or_insert(canonical);
-                }
-            }
-        }
-        for (alias, canonical) in aligner.synonyms() {
-            let target = aligner.canonical_form(canonical);
-            if matches!(
-                aligner.kind_of(&target),
-                Some(TermKind::Relation) | Some(TermKind::Attribute)
-            ) {
-                surfaces.entry(alias.clone()).or_insert(target);
-            }
-        }
-        let mut surfaces: Vec<(String, String)> = surfaces.into_iter().collect();
-        surfaces.sort_by(|a, b| {
-            b.0.chars()
-                .count()
-                .cmp(&a.0.chars().count())
-                .then_with(|| a.0.cmp(&b.0))
-        });
         Self {
             aligner,
             linker,
-            surfaces,
+            surfaces: Cow::Owned(build_predicate_surfaces(aligner, lexical_surfaces)),
+        }
+    }
+
+    /// 使用调用方缓存的表面积索引构造解析器，避免每次重建
+    pub fn with_surfaces(
+        aligner: &'a OntologyAligner,
+        linker: &'a EntityLinker,
+        surfaces: &'a [(String, String)],
+    ) -> Self {
+        Self {
+            aligner,
+            linker,
+            surfaces: Cow::Borrowed(surfaces),
         }
     }
 
@@ -487,7 +511,7 @@ impl<'a> PropositionParser<'a> {
     }
 
     fn parse_predicate_infix(&self, body: &str, negative: bool, props: &mut Vec<Proposition>) {
-        for (surface, predicate) in &self.surfaces {
+        for (surface, predicate) in self.surfaces.iter() {
             let Some(pos) = body.find(surface.as_str()) else {
                 continue;
             };

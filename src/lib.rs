@@ -900,12 +900,19 @@ impl OxigraphManager {
     }
 
     pub async fn get_relevant_facts(&self, query_entities: &[String], max_hops: usize) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+        if query_entities.is_empty() {
+            // 复用整图快照缓存，仅保留实体事实（与全量扫描的结果与顺序一致），
+            // 避免每次空实体查询都重新遍历整个存储
+            let snapshot = self.load_graph_snapshot().await?;
+            return Ok(snapshot
+                .iter()
+                .filter(|fact| matches!(fact, PrologFact::Entity { .. }))
+                .cloned()
+                .collect());
+        }
+
         let mut facts = Vec::new();
         let store = self.store.lock().await;
-        
-        if query_entities.is_empty() {
-            return self.load_all_facts_internal(&store).await;
-        }
         
         // 构建实体名称的匹配模式
         let combined_pattern = query_entities.iter()
@@ -945,8 +952,13 @@ impl OxigraphManager {
     }
 
     pub async fn load_all_facts(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.lock().await;
-        self.load_all_facts_internal(&store).await
+        // 与 get_relevant_facts 一致：直接复用整图快照缓存中的实体事实
+        let snapshot = self.load_graph_snapshot().await?;
+        Ok(snapshot
+            .iter()
+            .filter(|fact| matches!(fact, PrologFact::Entity { .. }))
+            .cloned()
+            .collect())
     }
 
     /// 整图快照（实体属性 + 关系），在两次写操作之间复用缓存，避免重复全量扫描。
@@ -975,10 +987,6 @@ impl OxigraphManager {
         let mut cache = self.snapshot_cache.lock();
         *cache = Some((revision, snapshot.clone()));
         Ok(snapshot)
-    }
-
-    async fn load_all_facts_internal(&self, store: &Store) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Self::scan_graph_parts(store).0)
     }
 
     /// 单次遍历存储，同时构建整图的实体事实与关系事实。
@@ -1047,7 +1055,7 @@ impl OxigraphManager {
             let is_name_predicate = quad.predicate.as_str() == NAME_PREDICATE_IRI;
             let predicate_iri = quad.predicate.as_str();
             let prop_name = if predicate_iri.contains(BASE_NS) {
-                predicate_iri.replace(BASE_NS, "").to_string()
+                predicate_iri.replace(BASE_NS, "")
             } else {
                 predicate_iri.to_string()
             };
