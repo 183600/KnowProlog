@@ -512,7 +512,7 @@ impl SimilarityCalculator {
     fn tokenize_and_filter<'a>(&self, text: &'a str) -> Vec<&'a str> {
         self.jieba.cut(text, false)
             .into_iter()
-            .filter(|word| !self.stop_words.contains(*word) && word.trim().len() > 1)
+            .filter(|word| !self.stop_words.contains(*word) && word.trim().chars().count() > 1)
             .collect()
     }
 

@@ -264,17 +264,24 @@ impl QueryPlanner {
     }
 
     fn parse_count(&self, q: &str) -> Option<QueryPlan> {
-        if let Some((head, rest)) = q.split_once("有几个") {
-            if let Some(predicate) = Self::strip_measure(rest) {
-                if !head.is_empty() && !predicate.is_empty() {
-                    return Some(QueryPlan::Count {
-                        subject: head.to_string(),
-                        predicate,
-                    });
+        // 「有几个/几位/几名…」：量词可省略（有几个），也可跟上其它量词（有几位）
+        if let Some((head, rest)) = q.split_once("有几") {
+            let stripped = rest.trim_start_matches(|c: char| {
+                matches!(c, '个' | '位' | '条' | '种' | '名' | '只')
+            });
+            if stripped.len() != rest.len() {
+                if let Some(predicate) = Self::strip_measure(stripped) {
+                    if !head.is_empty() && !predicate.is_empty() {
+                        return Some(QueryPlan::Count {
+                            subject: head.to_string(),
+                            predicate,
+                        });
+                    }
                 }
             }
         }
         if let Some((head, rest)) = q.split_once("有多少") {
+            let rest = rest.strip_prefix('个').unwrap_or(rest);
             if let Some(predicate) = Self::strip_measure(rest) {
                 if !head.is_empty() && !predicate.is_empty() {
                     return Some(QueryPlan::Count {
@@ -285,7 +292,10 @@ impl QueryPlanner {
             }
         }
         if let Some((subject, tail)) = q.split_once('的') {
-            if let Some((predicate, _)) = tail.split_once("有几个") {
+            if let Some((predicate, _)) = tail
+                .split_once("有几个")
+                .or_else(|| tail.split_once("有多少个"))
+            {
                 if !subject.is_empty() && !predicate.is_empty() {
                     return Some(QueryPlan::Count {
                         subject: subject.to_string(),
@@ -421,7 +431,12 @@ impl QueryPlanner {
                     }
                 }
                 if let Some((a, b)) = left.split_once("之于") {
-                    let c = right.trim();
+                    // 与「对应」句式一致：去掉右侧问句尾巴「对应谁/是谁」
+                    let c = right
+                        .strip_suffix("对应谁")
+                        .or_else(|| right.strip_suffix("是谁"))
+                        .unwrap_or(right)
+                        .trim();
                     if !a.trim().is_empty() && !b.trim().is_empty() && !c.is_empty() {
                         return Some(QueryPlan::Analogy {
                             a: a.trim().to_string(),

@@ -941,7 +941,7 @@ impl OxigraphManager {
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_string()
                                         } else {
-                                            entity_str.clone()
+                                            entity_str.trim_matches(|c| c == '<' || c == '>').to_string()
                                         };
                                         
                                         // 提取类型名称（去掉URI前缀）
@@ -950,7 +950,9 @@ impl OxigraphManager {
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_lowercase()
                                         } else {
-                                            type_str.to_lowercase()
+                                            type_str
+                                                .trim_matches(|c| c == '<' || c == '>')
+                                                .to_lowercase()
                                         };
                                         
                                         // 获取或创建实体数据
@@ -965,7 +967,7 @@ impl OxigraphManager {
                                                     .trim_matches(|c| c == '<' || c == '>')
                                                     .to_string()
                                             } else {
-                                                prop_str
+                                                prop_str.trim_matches(|c| c == '<' || c == '>').to_string()
                                             };
                                             
                                             let value_str = if let Term::Literal(lit) = value {
@@ -1447,7 +1449,9 @@ impl OxigraphManager {
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_lowercase()
                                         } else {
-                                            type_str.to_lowercase()
+                                            type_str
+                                                .trim_matches(|c| c == '<' || c == '>')
+                                                .to_lowercase()
                                         };
                                     }
                                     
@@ -1458,7 +1462,7 @@ impl OxigraphManager {
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_string()
                                         } else {
-                                            prop_str
+                                            prop_str.trim_matches(|c| c == '<' || c == '>').to_string()
                                         };
                                         
                                         let value_str = if let Term::Literal(lit) = value {
@@ -1575,7 +1579,7 @@ impl OxigraphManager {
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_string()
                                         } else {
-                                            rel_str
+                                            rel_str.trim_matches(|c| c == '<' || c == '>').to_string()
                                         };
                                         
                                         relations.push(PrologFact::Relation {
@@ -1633,6 +1637,15 @@ impl ResponseFormatter {
         Self { _config: config }
     }
 
+    // Prolog 真实变量绑定使用首字母大写的变量名，早期兜底结果使用小写键名，两者都兼容
+    fn result_value<'a>(
+        results: &'a [HashMap<String, String>],
+        primary: &str,
+        legacy: &str,
+    ) -> Option<&'a String> {
+        results[0].get(primary).or_else(|| results[0].get(legacy))
+    }
+
     pub fn format_prolog_results(&self, results: &[HashMap<String, String>], query_type: &str) -> String {
         if results.is_empty() {
             return "根据当前知识库，无法回答您的问题。请先导入相关知识。".to_string();
@@ -1680,49 +1693,49 @@ impl ResponseFormatter {
                 }
             }
             "altitude_query" => {
-                if let Some(altitude) = results[0].get("altitude") {
+                if let Some(altitude) = Self::result_value(results, "Altitude", "altitude") {
                     format!("海拔高度是{}米", altitude)
                 } else {
                     "未找到海拔信息".to_string()
                 }
             }
             "chemical_formula_query" => {
-                if let Some(formula) = results[0].get("formula") {
+                if let Some(formula) = Self::result_value(results, "Formula", "formula") {
                     format!("化学分子式是{}", formula)
                 } else {
                     "未找到分子式信息".to_string()
                 }
             }
             "author_query" => {
-                if let Some(author) = results[0].get("author") {
+                if let Some(author) = Self::result_value(results, "Author", "author") {
                     format!("作者是{}", author)
                 } else {
                     "未找到作者信息".to_string()
                 }
             }
             "champion_query" => {
-                if let Some(champion) = results[0].get("champion") {
+                if let Some(champion) = Self::result_value(results, "Champion", "champion") {
                     format!("冠军是{}", champion)
                 } else {
                     "未找到冠军信息".to_string()
                 }
             }
             "birth_year_query" => {
-                if let Some(year) = results[0].get("birth_year") {
+                if let Some(year) = Self::result_value(results, "Year", "birth_year") {
                     format!("诞生于{}年", year)
                 } else {
                     "未找到诞生年份信息".to_string()
                 }
             }
             "largest_query" => {
-                if let Some(entity) = results[0].get("entity") {
+                if let Some(entity) = Self::result_value(results, "Entity", "entity") {
                     format!("最大的是{}", entity)
                 } else {
                     "未找到相关信息".to_string()
                 }
             }
             "quantity_query" => {
-                if let Some(quantity) = results[0].get("quantity") {
+                if let Some(quantity) = Self::result_value(results, "Quantity", "quantity") {
                     format!("数量是{}", quantity)
                 } else {
                     "未找到数量信息".to_string()

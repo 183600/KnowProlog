@@ -293,7 +293,7 @@ impl AdvancedNLU {
             entity_type: "NUMBER".to_string(),
             patterns: vec![
                 r"\d+".to_string(),
-                r"[一二三四五六七八九十百千万亿]+".to_string(),
+                r"[一二三四五六七八九十百千万亿两]+".to_string(),
                 r"\d+\.\d+".to_string(),
             ],
             keywords: vec![
@@ -353,7 +353,7 @@ impl AdvancedNLU {
         
         patterns.extend(vec![
             (Regex::new(r"(\d+)").unwrap(), "ARABIC_NUMBER".to_string()),
-            (Regex::new(r"([一二三四五六七八九十百千万亿]+)").unwrap(), "CHINESE_NUMBER".to_string()),
+            (Regex::new(r"([一二三四五六七八九十百千万亿两]+)").unwrap(), "CHINESE_NUMBER".to_string()),
             (Regex::new(r"(\d+\.\d+)").unwrap(), "DECIMAL".to_string()),
             (Regex::new(r"第(\d+)").unwrap(), "ORDINAL".to_string()),
             (Regex::new(r"(\d+)%").unwrap(), "PERCENTAGE".to_string()),
@@ -735,8 +735,9 @@ impl AdvancedNLU {
                 section = 0;
                 current = 0;
             } else if ch == '亿' {
+                // 亿作用于其之前累积的整个数值段（如「一万亿」= 1 万亿）
                 section = section.checked_add(current)?;
-                total = total.checked_add(section.checked_mul(100_000_000)?)?;
+                total = total.checked_add(section)?.checked_mul(100_000_000)?;
                 section = 0;
                 current = 0;
             } else {
@@ -813,8 +814,19 @@ impl AdvancedNLU {
             let mut j = i + 1;
             while j < entities.len() {
                 if self.entities_overlap(&entities[i], &entities[j]) {
-                    // 保留置信度更高的实体
-                    if entities[i].confidence >= entities[j].confidence {
+                    // 嵌套时保留更完整的复合实体，否则保留置信度更高的实体
+                    let i_contains_j = entities[i].start_pos <= entities[j].start_pos
+                        && entities[i].end_pos >= entities[j].end_pos;
+                    let j_contains_i = entities[j].start_pos <= entities[i].start_pos
+                        && entities[j].end_pos >= entities[i].end_pos;
+                    let keep_i = if i_contains_j && !j_contains_i {
+                        true
+                    } else if j_contains_i && !i_contains_j {
+                        false
+                    } else {
+                        entities[i].confidence >= entities[j].confidence
+                    };
+                    if keep_i {
                         entities.remove(j);
                     } else {
                         entities.remove(i);

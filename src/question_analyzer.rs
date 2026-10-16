@@ -481,7 +481,7 @@ impl QuestionAnalyzer {
 
     async fn extract_keywords(&self, question: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let words: Vec<_> = self.jieba.cut(question, false).into_iter()
-            .filter(|word| !self.stop_words.contains(*word) && word.len() > 1)
+            .filter(|word| !self.stop_words.contains(*word) && word.chars().count() > 1)
             .map(|word| word.to_string())
             .collect();
             
