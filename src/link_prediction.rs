@@ -301,8 +301,8 @@ impl LinkPredictor {
 
         for p1 in &predicates {
             for p2 in &predicates {
-                if let Some(pairs2) = self.pairs_of(p2) {
-                    let reversed: HashSet<(String, String)> = pairs2
+                if let Some(pairs1) = self.pairs_of(p1) {
+                    let reversed: HashSet<(String, String)> = pairs1
                         .iter()
                         .map(|(o, s)| (s.clone(), o.clone()))
                         .collect();

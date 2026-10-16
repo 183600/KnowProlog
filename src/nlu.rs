@@ -147,7 +147,7 @@ impl NLUEngine {
                 }
             } else {
                 for input_word in &input_words {
-                    if self.word_similarity(pattern_word, input_word) > 0.8 {
+                    if self.word_similarity(pattern_word, input_word) >= 0.8 {
                         matched_count += 1;
                         break;
                     }

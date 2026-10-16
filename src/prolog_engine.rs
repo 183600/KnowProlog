@@ -277,7 +277,7 @@ impl PrologEngine {
             }
             "largest_query" => {
                 if entities.len() >= 2 {
-                    Some(format!("oxigraph_entity(Entity, '{}', Properties), member(type-'{}', Properties), member(size_rank-1, Properties)", entities[0], entities[1]))
+                    Some(format!("oxigraph_entity(Entity, '{}', Properties), member(type-'{}', Properties), member(size_rank-'1', Properties)", entities[0], entities[1]))
                 } else {
                     None
                 }
