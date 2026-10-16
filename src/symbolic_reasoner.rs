@@ -191,34 +191,36 @@ impl DialogueContext {
     pub fn resolve_pronouns(&self, input: &str) -> Option<String> {
         let focus = self.focus()?;
         const PRONOUNS: [&str; 7] = ["他们", "她们", "它们", "这个人", "他", "她", "它"];
-        let chars: Vec<char> = input.chars().collect();
         let mut result = String::with_capacity(input.len() + focus.len());
-        let mut i = 0;
         let mut replaced = false;
-        while i < chars.len() {
-            // 直接在字符切片上比较
+        let mut chars = input.char_indices().peekable();
+        while let Some((i, ch)) = chars.next() {
+            // 在字节切片上直接判断前缀，避免收集整段字符向量
             let mut matched: Option<&str> = None;
             for pronoun in PRONOUNS {
-                let plen = pronoun.chars().count();
-                if chars.len() - i >= plen
-                    && chars[i..i + plen].iter().copied().eq(pronoun.chars())
-                {
+                if input[i..].starts_with(pronoun) {
                     matched = Some(pronoun);
                     break;
                 }
             }
             if let Some(pronoun) = matched {
-                let previous = if i == 0 { None } else { Some(chars[i - 1]) };
+                let previous = input[..i].chars().next_back();
                 let blocked = matches!(previous, Some('其') | Some('无'));
                 if !blocked {
                     result.push_str(focus);
-                    i += pronoun.chars().count();
+                    let end = i + pronoun.len();
+                    while let Some((next, _)) = chars.peek() {
+                        if *next < end {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
                     replaced = true;
                     continue;
                 }
             }
-            result.push(chars[i]);
-            i += 1;
+            result.push(ch);
         }
         if replaced {
             Some(result)
@@ -884,10 +886,10 @@ impl SymbolicReasoner {
 
     fn render_atom_nl(&self, atom: &Atom) -> String {
         let names: Vec<String> = atom.terms.iter().map(render_term).collect();
-        if atom.predicate == PROOF_HAS && names.len() == 2 {
+        if &*atom.predicate == PROOF_HAS && names.len() == 2 {
             return format!("{} 具有 {}", names[0], names[1]);
         }
-        if atom.predicate == PROOF_TYPE && names.len() == 2 {
+        if &*atom.predicate == PROOF_TYPE && names.len() == 2 {
             return format!("{} 属于类型 {}", names[0], names[1]);
         }
         if names.len() == 2 {

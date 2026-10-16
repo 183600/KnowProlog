@@ -8,21 +8,24 @@
 // 全程只有：项、置换、合一、深度上限与搜索预算——每一步都可解释、可回溯。
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// 项：逻辑变量或常量（实体名、属性值、谓词名都是常量）
+///
+/// 字符串用 `Rc<str>` 共享：克隆项只增加引用计数，避免合一/换名时反复分配。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
-    Var(String),
-    Const(String),
+    Var(Rc<str>),
+    Const(Rc<str>),
 }
 
 impl Term {
     pub fn var(name: &str) -> Self {
-        Term::Var(name.to_string())
+        Term::Var(Rc::from(name))
     }
 
     pub fn constant(name: &str) -> Self {
-        Term::Const(name.to_string())
+        Term::Const(Rc::from(name))
     }
 
     pub fn is_var(&self) -> bool {
@@ -39,14 +42,14 @@ impl Term {
 /// 原子：谓词 + 参数（知识图谱二元关系；类型/属性存在性用一元或二元谓词编码）
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Atom {
-    pub predicate: String,
+    pub predicate: Rc<str>,
     pub terms: Vec<Term>,
 }
 
 impl Atom {
     pub fn new(predicate: &str, terms: Vec<Term>) -> Self {
         Self {
-            predicate: predicate.to_string(),
+            predicate: Rc::from(predicate),
             terms,
         }
     }
@@ -83,7 +86,7 @@ impl Atom {
             .iter()
             .map(|term| match term {
                 Term::Var(name) => format!("?{}", name),
-                Term::Const(name) => name.clone(),
+                Term::Const(name) => name.to_string(),
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -92,7 +95,57 @@ impl Atom {
 }
 
 /// 置换：变量名 → 项
-pub type Substitution = HashMap<String, Term>;
+///
+/// 用不可变单链表 + `Rc` 持久化表示：克隆置换只增加一次引用计数，
+/// 合一产生的扩展在常数时间完成，避免归结搜索中反复复制整张映射表。
+#[derive(Debug, Clone, Default)]
+pub struct Substitution {
+    head: Option<Rc<SubstitutionBinding>>,
+}
+
+#[derive(Debug)]
+struct SubstitutionBinding {
+    name: Rc<str>,
+    term: Term,
+    next: Option<Rc<SubstitutionBinding>>,
+}
+
+impl Substitution {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Term> {
+        let mut current = self.head.as_deref();
+        while let Some(binding) = current {
+            if &*binding.name == name {
+                return Some(&binding.term);
+            }
+            current = binding.next.as_deref();
+        }
+        None
+    }
+
+    /// 与 [`Self::get`] 相同，但对同一个 `Rc<str>` 走指针比较快速路径
+    fn get_rc(&self, name: &Rc<str>) -> Option<&Term> {
+        let mut current = self.head.as_deref();
+        while let Some(binding) = current {
+            if Rc::ptr_eq(&binding.name, name) || &*binding.name == &**name {
+                return Some(&binding.term);
+            }
+            current = binding.next.as_deref();
+        }
+        None
+    }
+
+    pub fn insert(&mut self, name: impl Into<Rc<str>>, term: Term) {
+        self.head = Some(Rc::new(SubstitutionBinding {
+            name: name.into(),
+            term,
+            next: self.head.take(),
+        }));
+    }
+}
 
 /// 证明节点来源
 #[derive(Debug, Clone, PartialEq)]
@@ -166,9 +219,9 @@ pub struct DerivedFact {
 
 pub struct ResolutionEngine {
     facts: HashSet<Atom>,
-    facts_by_pred: HashMap<String, Vec<Atom>>,
+    facts_by_pred: HashMap<Rc<str>, Vec<Atom>>,
     clauses: Vec<Clause>,
-    rules_by_head: HashMap<String, Vec<usize>>,
+    rules_by_head: HashMap<Rc<str>, Vec<usize>>,
     max_depth: usize,
     max_solutions: usize,
     max_steps: usize,
@@ -224,7 +277,8 @@ impl ResolutionEngine {
         self.add_fact_atom(Atom::unary(predicate, Term::constant(subject)))
     }
 
-    pub fn add_clause(&mut self, clause: Clause) {
+    pub fn add_clause(&mut self, mut clause: Clause) {
+        canonicalize_clause_vars(&mut clause);
         let index = self.clauses.len();
         self.rules_by_head
             .entry(clause.head.predicate.clone())
@@ -274,7 +328,7 @@ impl ResolutionEngine {
             let bindings: HashMap<String, String> = query_vars
                 .iter()
                 .map(|var| {
-                    let value = resolve_term(&Term::Var(var.clone()), &subst);
+                    let value = resolve_term(&Term::var(var), &subst);
                     (var.clone(), render_term(&value))
                 })
                 .collect();
@@ -326,9 +380,6 @@ impl ResolutionEngine {
                 if fact.arity() != applied.arity() {
                     continue;
                 }
-                if !may_unify_quick(&applied, fact, subst) {
-                    continue;
-                }
                 let mut unified = subst.clone();
                 if unify_atoms(&applied, fact, &mut unified) {
                     let ground = apply_atom(&unified, &applied);
@@ -340,7 +391,7 @@ impl ResolutionEngine {
             }
         }
 
-        // 2) 与规则头归结：先对子句做变量换名，再合一，然后递归证明规则体
+        // 2) 与规则头归结：先对子句头做变量换名并合一，成功后再换名规则体
         if let Some(indices) = self.rules_by_head.get(&applied.predicate) {
             for &idx in indices {
                 if *budget == 0 {
@@ -349,14 +400,21 @@ impl ResolutionEngine {
                 let clause = &self.clauses[idx];
                 let tag = *counter;
                 *counter += 1;
-                let fresh = freshen_clause(clause, tag);
+                let mut renamer = Renamer::new(tag);
+                let fresh_head = renamer.atom(&clause.head);
                 let mut unified = subst.clone();
                 *budget -= 1;
-                if !unify_atoms(&applied, &fresh.head, &mut unified) {
+                if !unify_atoms(&applied, &fresh_head, &mut unified) {
                     continue;
                 }
+                // 头合一失败时无需换名规则体，避免无效的字符串构造
+                let fresh_body: Vec<Atom> = clause
+                    .body
+                    .iter()
+                    .map(|atom| renamer.atom(atom))
+                    .collect();
                 for (solved, children) in
-                    self.prove_body(&fresh.body, depth + 1, &unified, counter, budget)
+                    self.prove_body(&fresh_body, depth + 1, &unified, counter, budget)
                 {
                     let ground = apply_atom(&solved, &applied);
                     let child_confidence: f64 =
@@ -416,7 +474,7 @@ impl ResolutionEngine {
     /// 前向半朴素饱和：从事实出发反复应用子句，推导新基事实（含前提来源）
     pub fn forward_chain(&self, max_rounds: usize, max_new_facts: usize) -> Vec<DerivedFact> {
         let mut known: HashSet<Atom> = self.facts.clone();
-        let mut known_by_pred: HashMap<String, Vec<Atom>> = self.facts_by_pred.clone();
+        let mut known_by_pred: HashMap<Rc<str>, Vec<Atom>> = self.facts_by_pred.clone();
         let mut confidence_of: HashMap<Atom, f64> = HashMap::new();
         for fact in &self.facts {
             confidence_of.insert(fact.clone(), 1.0);
@@ -477,7 +535,7 @@ impl ResolutionEngine {
     fn match_body(
         &self,
         goals: &[Atom],
-        known_by_pred: &HashMap<String, Vec<Atom>>,
+        known_by_pred: &HashMap<Rc<str>, Vec<Atom>>,
     ) -> Vec<(Substitution, Vec<Atom>)> {
         let mut states: Vec<(Substitution, Vec<Atom>)> = vec![(Substitution::new(), Vec::new())];
         for goal in goals {
@@ -489,9 +547,6 @@ impl ResolutionEngine {
                 };
                 for fact in facts {
                     if fact.arity() != applied.arity() {
-                        continue;
-                    }
-                    if !may_unify_quick(&applied, fact, subst) {
                         continue;
                     }
                     let mut unified = subst.clone();
@@ -520,56 +575,45 @@ impl ResolutionEngine {
 
 /// 快速预检查：若所有已解析的词项对都是互不相同的常量，则合一必然失败。
 /// 用于在克隆全部替换之前尽早跳过不匹配的事实/规则头。
-fn may_unify_quick(pattern: &Atom, other: &Atom, subst: &Substitution) -> bool {
-    for (left, right) in pattern.terms.iter().zip(other.terms.iter()) {
-        let resolved_left = resolve_term(left, subst);
-        let resolved_right = resolve_term(right, subst);
-        if let (Term::Const(a), Term::Const(b)) = (&resolved_left, &resolved_right) {
-            if a != b {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn resolve_term(term: &Term, subst: &Substitution) -> Term {
-    let mut current = term.clone();
+/// 沿置换链解析词项，返回最具体的引用（避免中间克隆）
+fn resolve_ref<'a>(term: &'a Term, subst: &'a Substitution) -> &'a Term {
+    let mut current = term;
     let mut hops = 0;
-    while let Term::Var(name) = &current {
-        let Some(next) = subst.get(name) else {
-            break;
-        };
-        current = next.clone();
-        hops += 1;
-        if hops > 128 {
-            break;
+    while let Term::Var(name) = current {
+        match subst.get_rc(name) {
+            Some(next) => {
+                current = next;
+                hops += 1;
+                if hops > 128 {
+                    break;
+                }
+            }
+            None => break,
         }
     }
     current
 }
 
-fn occurs_in(var: &str, term: &Term, subst: &Substitution) -> bool {
-    match resolve_term(term, subst) {
-        Term::Var(name) => name == var,
-        Term::Const(_) => false,
-    }
+fn resolve_term(term: &Term, subst: &Substitution) -> Term {
+    resolve_ref(term, subst).clone()
+}
+
+/// `term` 必须是 [`resolve_ref`] 已解析过的词项
+fn occurs_in(var: &str, term: &Term) -> bool {
+    matches!(term, Term::Var(name) if &**name == var)
 }
 
 fn unify_terms(left: &Term, right: &Term, subst: &mut Substitution) -> bool {
-    let resolved_left = resolve_term(left, subst);
-    let resolved_right = resolve_term(right, subst);
-    match (&resolved_left, &resolved_right) {
-        (Term::Var(a), Term::Var(b)) if a == b => true,
-        (Term::Var(var), other) | (other, Term::Var(var)) => {
-            if occurs_in(var, other, subst) {
-                false
-            } else {
-                subst.insert(var.clone(), other.clone());
-                true
-            }
-        }
-        (Term::Const(a), Term::Const(b)) => a == b,
+    let (var, other) = match (resolve_ref(left, subst), resolve_ref(right, subst)) {
+        (Term::Var(a), Term::Var(b)) if a == b => return true,
+        (Term::Var(var), other) | (other, Term::Var(var)) => (var.clone(), other.clone()),
+        (Term::Const(a), Term::Const(b)) => return a == b,
+    };
+    if occurs_in(&var, &other) {
+        false
+    } else {
+        subst.insert(var, other);
+        true
     }
 }
 
@@ -597,28 +641,91 @@ fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
     }
 }
 
-fn freshen_atom(atom: &Atom, tag: usize) -> Atom {
-    Atom {
-        predicate: atom.predicate.clone(),
-        terms: atom
-            .terms
+/// 与 `format!("{}#{}", name, tag)` 命名一致，但绕过格式化框架的分配与动态派发
+fn fresh_var_name(name: &str, tag: usize) -> String {
+    let mut out = String::with_capacity(name.len() + 21);
+    out.push_str(name);
+    out.push('#');
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut value = tag;
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.push_str(std::str::from_utf8(&digits[index..]).unwrap_or("0"));
+    out
+}
+
+/// 让同名的变量在子句内共享同一个 `Rc<str>`，从而换名缓存可走指针比较
+fn canonicalize_clause_vars(clause: &mut Clause) {
+    let mut canonical: HashMap<Rc<str>, Rc<str>> = HashMap::new();
+    for atom in std::iter::once(&mut clause.head).chain(clause.body.iter_mut()) {
+        for term in &mut atom.terms {
+            if let Term::Var(name) = term {
+                match canonical.get(name) {
+                    Some(shared) => *name = shared.clone(),
+                    None => {
+                        canonical.insert(name.clone(), name.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 变量换名器：同一次子句使用中，相同变量名的所有出现共享同一个换名结果，
+/// 既减少分配，也让后续置换查找能走 `Rc` 指针比较的快速路径。
+struct Renamer<'a> {
+    tag: usize,
+    cache: Vec<(&'a Rc<str>, Rc<str>)>,
+}
+
+impl<'a> Renamer<'a> {
+    fn new(tag: usize) -> Self {
+        Self {
+            tag,
+            cache: Vec::new(),
+        }
+    }
+
+    fn fresh(&mut self, name: &'a Rc<str>) -> Rc<str> {
+        if let Some((_, fresh)) = self
+            .cache
             .iter()
-            .map(|term| match term {
-                Term::Var(name) => Term::Var(format!("{}#{}", name, tag)),
-                other => other.clone(),
-            })
-            .collect(),
+            .find(|(original, _)| Rc::ptr_eq(original, name))
+        {
+            return fresh.clone();
+        }
+        let fresh: Rc<str> = fresh_var_name(name, self.tag).into();
+        self.cache.push((name, fresh.clone()));
+        fresh
+    }
+
+    fn atom(&mut self, atom: &'a Atom) -> Atom {
+        Atom {
+            predicate: atom.predicate.clone(),
+            terms: atom
+                .terms
+                .iter()
+                .map(|term| match term {
+                    Term::Var(name) => Term::Var(self.fresh(name)),
+                    other => other.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
 fn freshen_clause(clause: &Clause, tag: usize) -> Clause {
+    let mut renamer = Renamer::new(tag);
     Clause {
-        head: freshen_atom(&clause.head, tag),
-        body: clause
-            .body
-            .iter()
-            .map(|atom| freshen_atom(atom, tag))
-            .collect(),
+        head: renamer.atom(&clause.head),
+        body: clause.body.iter().map(|atom| renamer.atom(atom)).collect(),
         confidence: clause.confidence,
         source: clause.source.clone(),
     }
@@ -627,7 +734,7 @@ fn freshen_clause(clause: &Clause, tag: usize) -> Clause {
 pub fn render_term(term: &Term) -> String {
     match term {
         Term::Var(name) => format!("?{}", name),
-        Term::Const(name) => name.clone(),
+        Term::Const(name) => name.to_string(),
     }
 }
 

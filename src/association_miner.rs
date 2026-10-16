@@ -607,9 +607,9 @@ mod tests {
             .iter()
             .find(|clause| clause.source.contains("出生地") && clause.source.contains("国籍"))
             .expect("应有 出生地⇒国籍 相关子句");
-        assert_eq!(clause.head.predicate, "__has__");
+        assert_eq!(&*clause.head.predicate, "__has__");
         assert_eq!(clause.body.len(), 1);
-        assert_eq!(clause.body[0].predicate, "__has__");
+        assert_eq!(&*clause.body[0].predicate, "__has__");
         // 同一实体变量 E，前提与结论可从同一实体实例化
         assert!(clause.head.terms.iter().any(|term| term.is_var()));
     }

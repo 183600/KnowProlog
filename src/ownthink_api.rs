@@ -1,8 +1,15 @@
 use reqwest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const OWNTHINK_BASE_URL: &str = "https://api.ownthink.com/kg";
+
+/// 复用同一个连接池与 TLS 上下文；`reqwest::Client` 克隆开销极低
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmbiguousRequest {
@@ -64,7 +71,7 @@ pub struct OwnthinkApiClient {
 impl OwnthinkApiClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: shared_http_client(),
             base_url: OWNTHINK_BASE_URL.to_string(),
             timeout_seconds: 10,
             max_retries: 3,

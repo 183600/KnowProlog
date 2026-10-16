@@ -970,56 +970,87 @@ impl OxigraphManager {
                 Err(_) => continue,
             };
 
-            let subject_str = Term::from(quad.subject.clone()).to_string();
-            let entity_name = if let Some((_, tail)) = subject_str.rsplit_once("entity/") {
-                tail.trim_matches(|c| c == '<' || c == '>').to_string()
-            } else {
-                subject_str.trim_matches(|c| c == '<' || c == '>').to_string()
+            // 命名节点直接取 IRI 尾部，省去 Display 包装与再裁剪的中间字符串
+            let entity_name = match &quad.subject {
+                Subject::NamedNode(node) => {
+                    let iri = node.as_str();
+                    match iri.rsplit_once("entity/") {
+                        Some((_, tail)) => tail.to_string(),
+                        None => iri.to_string(),
+                    }
+                }
+                _ => {
+                    let subject_str = quad.subject.to_string();
+                    if let Some((_, tail)) = subject_str.rsplit_once("entity/") {
+                        tail.trim_matches(|c| c == '<' || c == '>').to_string()
+                    } else {
+                        subject_str.trim_matches(|c| c == '<' || c == '>').to_string()
+                    }
+                }
             };
 
             if quad.predicate.as_str() == RDF_TYPE_IRI {
-                let type_str = quad.object.to_string();
-                let type_name = if type_str.contains(BASE_NS) {
-                    type_str.replace(BASE_NS, "")
-                        .trim_matches(|c| c == '<' || c == '>')
-                        .to_lowercase()
-                } else {
-                    type_str.trim_matches(|c| c == '<' || c == '>').to_lowercase()
+                let type_name = match &quad.object {
+                    Term::NamedNode(node) => {
+                        let iri = node.as_str();
+                        if iri.contains(BASE_NS) {
+                            iri.replace(BASE_NS, "").to_lowercase()
+                        } else {
+                            iri.to_lowercase()
+                        }
+                    }
+                    object => {
+                        let type_str = object.to_string();
+                        if type_str.contains(BASE_NS) {
+                            type_str.replace(BASE_NS, "")
+                                .trim_matches(|c| c == '<' || c == '>')
+                                .to_lowercase()
+                        } else {
+                            type_str.trim_matches(|c| c == '<' || c == '>').to_lowercase()
+                        }
+                    }
                 };
                 entity_types.entry(entity_name).or_insert(type_name);
                 continue;
             }
 
             let is_name_predicate = quad.predicate.as_str() == NAME_PREDICATE_IRI;
-            let prop_str = Term::from(quad.predicate).to_string();
-            let prop_name = if prop_str.contains(BASE_NS) {
-                prop_str.replace(BASE_NS, "")
-                    .trim_matches(|c| c == '<' || c == '>')
-                    .to_string()
+            let predicate_iri = quad.predicate.as_str();
+            let prop_name = if predicate_iri.contains(BASE_NS) {
+                predicate_iri.replace(BASE_NS, "").to_string()
             } else {
-                prop_str.trim_matches(|c| c == '<' || c == '>').to_string()
+                predicate_iri.to_string()
             };
 
             let value_str = if let Term::Literal(lit) = &quad.object {
                 lit.value().to_string()
             } else {
-                quad.object.to_string()
-                    .trim_matches(|c| c == '<' || c == '>')
-                    .to_string()
+                match &quad.object {
+                    Term::NamedNode(node) => node.as_str().to_string(),
+                    object => object
+                        .to_string()
+                        .trim_matches(|c| c == '<' || c == '>')
+                        .to_string(),
+                }
+            };
+
+            let name_value = if is_name_predicate {
+                Some(if let Term::Literal(lit) = &quad.object {
+                    lit.value().to_string()
+                } else {
+                    quad.object.to_string()
+                })
+            } else {
+                None
             };
 
             entity_props.entry(entity_name).or_default().insert(prop_name.clone(), value_str);
 
-            if is_name_predicate {
-                subject_names.entry(Term::from(quad.subject.clone())).or_default().push(
-                    if let Term::Literal(lit) = &quad.object {
-                        lit.value().to_string()
-                    } else {
-                        quad.object.to_string()
-                    },
-                );
+            let subject_term = Term::from(quad.subject);
+            if let Some(name_value) = name_value {
+                subject_names.entry(subject_term.clone()).or_default().push(name_value);
             }
-            relation_candidates.push((Term::from(quad.subject), quad.object, prop_name));
+            relation_candidates.push((subject_term, quad.object, prop_name));
         }
 
         let mut facts = Vec::with_capacity(entity_types.len());

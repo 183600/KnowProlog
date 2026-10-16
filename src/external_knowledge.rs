@@ -1,6 +1,13 @@
 use reqwest;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::sync::OnceLock;
+
+/// 复用同一个连接池与 TLS 上下文；`reqwest::Client` 克隆开销极低
+fn shared_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct KnowledgeResponse {
@@ -23,7 +30,7 @@ pub struct ExternalKnowledgeService {
 impl ExternalKnowledgeService {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: shared_http_client(),
         }
     }
 
