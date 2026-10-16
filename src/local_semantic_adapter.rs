@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 use crate::semantic_engine::{SemanticEngine, SemanticKnowledge};
 use crate::similarity_calculator::{SimilarityCalculator, SimilarityResult, WordEmbedding, ConceptNode};
 use crate::advanced_nlu::{AdvancedNLU, IntentResult};
@@ -8,24 +9,45 @@ use crate::question_analyzer::{QuestionAnalyzer, QuestionAnalysis};
 use crate::ownthink_api::{AmbiguousResponse, KnowledgeResponse, KnowledgeData, EavResponse, EavData};
 
 pub struct LocalSemanticAdapter {
-    semantic_engine: SemanticEngine,
-    similarity_calculator: SimilarityCalculator,
-    advanced_nlu: AdvancedNLU,
-    entity_extractor: EntityRelationExtractor,
-    question_analyzer: QuestionAnalyzer,
+    // 各子引擎按需惰性构建，避免未启用或未使用时的初始化开销
+    semantic_engine_cell: OnceLock<SemanticEngine>,
+    similarity_calculator_cell: OnceLock<SimilarityCalculator>,
+    advanced_nlu_cell: OnceLock<AdvancedNLU>,
+    entity_extractor_cell: OnceLock<EntityRelationExtractor>,
+    question_analyzer_cell: OnceLock<QuestionAnalyzer>,
     enabled: bool,
 }
 
 impl LocalSemanticAdapter {
     pub fn new(enabled: bool) -> Self {
         Self {
-            semantic_engine: SemanticEngine::new(),
-            similarity_calculator: SimilarityCalculator::new(),
-            advanced_nlu: AdvancedNLU::new(),
-            entity_extractor: EntityRelationExtractor::new(),
-            question_analyzer: QuestionAnalyzer::new(),
+            semantic_engine_cell: OnceLock::new(),
+            similarity_calculator_cell: OnceLock::new(),
+            advanced_nlu_cell: OnceLock::new(),
+            entity_extractor_cell: OnceLock::new(),
+            question_analyzer_cell: OnceLock::new(),
             enabled,
         }
+    }
+
+    fn semantic_engine(&self) -> &SemanticEngine {
+        self.semantic_engine_cell.get_or_init(SemanticEngine::new)
+    }
+
+    fn similarity_calculator(&self) -> &SimilarityCalculator {
+        self.similarity_calculator_cell.get_or_init(SimilarityCalculator::new)
+    }
+
+    fn advanced_nlu(&self) -> &AdvancedNLU {
+        self.advanced_nlu_cell.get_or_init(AdvancedNLU::new)
+    }
+
+    fn entity_extractor(&self) -> &EntityRelationExtractor {
+        self.entity_extractor_cell.get_or_init(EntityRelationExtractor::new)
+    }
+
+    fn question_analyzer(&self) -> &QuestionAnalyzer {
+        self.question_analyzer_cell.get_or_init(QuestionAnalyzer::new)
     }
 
     pub fn initialize_with_knowledge(&self, entities: Vec<SemanticKnowledge>) -> Result<(), Box<dyn std::error::Error>> {
@@ -33,7 +55,7 @@ impl LocalSemanticAdapter {
             return Ok(());
         }
         
-        self.semantic_engine.initialize_knowledge_base(entities)?;
+        self.semantic_engine().initialize_knowledge_base(entities)?;
         Ok(())
     }
 
@@ -42,7 +64,7 @@ impl LocalSemanticAdapter {
             return Ok(());
         }
         
-        self.similarity_calculator.initialize_embeddings(embeddings)?;
+        self.similarity_calculator().initialize_embeddings(embeddings)?;
         Ok(())
     }
 
@@ -51,7 +73,7 @@ impl LocalSemanticAdapter {
             return Ok(());
         }
         
-        self.similarity_calculator.initialize_concept_hierarchy(concepts)?;
+        self.similarity_calculator().initialize_concept_hierarchy(concepts)?;
         Ok(())
     }
 
@@ -60,7 +82,7 @@ impl LocalSemanticAdapter {
             return Err("本地语义理解功能未启用".into());
         }
 
-        let candidates = self.semantic_engine.get_ambiguous_entities(mention).await
+        let candidates = self.semantic_engine().get_ambiguous_entities(mention).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
         
         let data: Vec<(String, u64)> = candidates.into_iter()
@@ -78,7 +100,7 @@ impl LocalSemanticAdapter {
             return Err("本地语义理解功能未启用".into());
         }
 
-        let knowledge = self.semantic_engine.get_entity_knowledge(entity).await
+        let knowledge = self.semantic_engine().get_entity_knowledge(entity).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
         
         let mut avp = Vec::new();
@@ -106,7 +128,7 @@ impl LocalSemanticAdapter {
             return Err("本地语义理解功能未启用".into());
         }
 
-        let values = self.semantic_engine.get_entity_attribute_value(entity, attribute).await
+        let values = self.semantic_engine().get_entity_attribute_value(entity, attribute).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
 
         let data = EavData {
@@ -126,7 +148,7 @@ impl LocalSemanticAdapter {
             return Ok(None);
         }
 
-        Ok(self.semantic_engine.resolve_entity_ambiguity(mention, context).await
+        Ok(self.semantic_engine().resolve_entity_ambiguity(mention, context).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -135,7 +157,7 @@ impl LocalSemanticAdapter {
             return Ok(HashMap::new());
         }
 
-        Ok(self.semantic_engine.get_simplified_knowledge(entity).await
+        Ok(self.semantic_engine().get_simplified_knowledge(entity).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -144,7 +166,7 @@ impl LocalSemanticAdapter {
             return Ok(HashMap::new());
         }
 
-        Ok(self.semantic_engine.batch_resolve_entities(mentions).await
+        Ok(self.semantic_engine().batch_resolve_entities(mentions).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -153,7 +175,7 @@ impl LocalSemanticAdapter {
             return Err("本地语义理解功能未启用".into());
         }
 
-        Ok(self.question_analyzer.analyze_question(question).await
+        Ok(self.question_analyzer().analyze_question(question).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -162,7 +184,7 @@ impl LocalSemanticAdapter {
             return Err("本地语义理解功能未启用".into());
         }
 
-        Ok(self.advanced_nlu.analyze_query(query).await
+        Ok(self.advanced_nlu().analyze_query(query).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -171,7 +193,7 @@ impl LocalSemanticAdapter {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        Ok(self.entity_extractor.extract_entities_and_relations(text).await
+        Ok(self.entity_extractor().extract_entities_and_relations(text).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -180,7 +202,7 @@ impl LocalSemanticAdapter {
             return Err("本地语义理解功能未启用".into());
         }
 
-        Ok(self.similarity_calculator.calculate_semantic_similarity(text1, text2).await
+        Ok(self.similarity_calculator().calculate_semantic_similarity(text1, text2).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?)
     }
 
@@ -189,30 +211,30 @@ impl LocalSemanticAdapter {
             return Ok(0.0);
         }
 
-        Ok(self.similarity_calculator.calculate_simple_similarity(text1, text2).await)
+        Ok(self.similarity_calculator().calculate_simple_similarity(text1, text2).await)
     }
 
     pub fn add_entity_knowledge(&self, entity: SemanticKnowledge) {
         if self.enabled {
-            self.semantic_engine.add_entity_knowledge(entity);
+            self.semantic_engine().add_entity_knowledge(entity);
         }
     }
 
     pub fn add_word_embedding(&self, word: String, vector: Vec<f32>) {
         if self.enabled {
-            self.similarity_calculator.add_word_embedding(word, vector);
+            self.similarity_calculator().add_word_embedding(word, vector);
         }
     }
 
     pub fn add_concept(&self, concept: ConceptNode) {
         if self.enabled {
-            self.similarity_calculator.add_concept(concept);
+            self.similarity_calculator().add_concept(concept);
         }
     }
 
     pub fn get_entity_count(&self) -> usize {
         if self.enabled {
-            self.semantic_engine.get_entity_count()
+            self.semantic_engine().get_entity_count()
         } else {
             0
         }
@@ -220,7 +242,7 @@ impl LocalSemanticAdapter {
 
     pub fn get_embedding_count(&self) -> usize {
         if self.enabled {
-            self.similarity_calculator.get_embedding_count()
+            self.similarity_calculator().get_embedding_count()
         } else {
             0
         }
@@ -228,7 +250,7 @@ impl LocalSemanticAdapter {
 
     pub fn get_concept_count(&self) -> usize {
         if self.enabled {
-            self.similarity_calculator.get_concept_count()
+            self.similarity_calculator().get_concept_count()
         } else {
             0
         }
@@ -347,7 +369,7 @@ impl LocalSemanticAdapter {
         
         // 补充知识库中已知实体的识别结果：通用抽取器可能识别不出
         // 采样知识库中已收录的实体（如"珠穆朗玛峰"），这里通过别名做最长匹配补齐
-        let knowledge_entities = self.semantic_engine.analyze_intent(query).await
+        let knowledge_entities = self.semantic_engine().analyze_intent(query).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
         let mut seen_entities: HashSet<String> = entity_names.iter().cloned().collect();
         for entity_name in knowledge_entities.entities {

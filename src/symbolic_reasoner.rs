@@ -342,10 +342,11 @@ impl SymbolicReasoner {
         if !entities.is_empty() {
             self.context.record_entities(&entities);
         }
+        let normalized_text = self.aligner.normalize(text);
         let predicate = self
             .known_predicates()
             .into_iter()
-            .find(|p| self.predicate_mentioned(text, p))
+            .find(|p| self.predicate_mentioned_normalized(text, &normalized_text, p))
             .map(str::to_string);
         if let Some(predicate) = predicate {
             self.context.record_predicate(&predicate);
@@ -361,8 +362,9 @@ impl SymbolicReasoner {
             .filter(|p| p.kind == TermKind::Relation)
             .map(|p| p.term.as_str())
             .collect();
+        let mut seen: HashSet<&str> = predicates.iter().copied().collect();
         for rule in self.predictor.rules() {
-            if !predicates.contains(&rule.head.as_str()) {
+            if seen.insert(rule.head.as_str()) {
                 predicates.push(rule.head.as_str());
             }
         }
@@ -405,8 +407,12 @@ impl SymbolicReasoner {
             .collect()
     }
 
-    fn predicate_mentioned(&self, text: &str, predicate: &str) -> bool {
-        let normalized_text = self.aligner.normalize(text);
+    fn predicate_mentioned_normalized(
+        &self,
+        text: &str,
+        normalized_text: &str,
+        predicate: &str,
+    ) -> bool {
         let predicate_norm = self.aligner.normalize(predicate);
         if !predicate_norm.is_empty() && normalized_text.contains(&predicate_norm) {
             return true;
@@ -479,9 +485,12 @@ impl SymbolicReasoner {
     }
 
     fn link_hints(&self, text: &str) -> Vec<String> {
+        let normalized_text = self.aligner.normalize(text);
         self.known_predicates()
             .into_iter()
-            .filter(|predicate| self.predicate_mentioned(text, predicate))
+            .filter(|predicate| {
+                self.predicate_mentioned_normalized(text, &normalized_text, predicate)
+            })
             .map(str::to_string)
             .collect()
     }
@@ -1208,6 +1217,7 @@ impl SymbolicReasoner {
             return None;
         }
 
+        let normalized_question = self.aligner.normalize(question);
         let mut candidates: Vec<Prediction> = Vec::new();
         for entity in &entities {
             for prediction in self.predictor.predict_for_entity(
@@ -1215,7 +1225,11 @@ impl SymbolicReasoner {
                 None,
                 self.config.max_predictions * 4,
             ) {
-                if self.predicate_mentioned(question, &prediction.triple.predicate) {
+                if self.predicate_mentioned_normalized(
+                    question,
+                    &normalized_question,
+                    &prediction.triple.predicate,
+                ) {
                     candidates.push(prediction);
                 }
             }

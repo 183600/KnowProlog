@@ -151,8 +151,9 @@ impl SemanticEngine {
     }
 
     pub async fn get_ambiguous_entities(&self, mention: &str) -> Result<Vec<EntityCandidate>, Box<dyn std::error::Error>> {
-        let aliases = self.entity_aliases.read();
+        // 与 get_entity_knowledge / 写入方保持一致的加锁顺序：先 knowledge 后 aliases
         let knowledge = self.entity_knowledge.read();
+        let aliases = self.entity_aliases.read();
         let mut candidates = Vec::new();
         
         // 直接匹配
@@ -213,10 +214,11 @@ impl SemanticEngine {
         let knowledge = self.entity_knowledge.read();
         let token_cache = self.token_cache.read();
         
-        // 分词
+        // 分词；指称词集合只构建一次，供所有实体复用
         let mention_words: Vec<_> = self.jieba.cut(mention, false).into_iter()
             .filter(|word| !self.stop_words.contains(*word))
             .collect();
+        let mention_set: HashSet<&str> = mention_words.iter().copied().collect();
         
         for (entity_name, entity_knowledge) in knowledge.iter() {
             let cached = token_cache.get(entity_name);
@@ -228,7 +230,7 @@ impl SemanticEngine {
             };
             
             // 计算词汇重叠度
-            let overlap_score = self.calculate_word_overlap(&mention_words, &entity_words);
+            let overlap_score = Self::calculate_word_overlap_with(&mention_set, &entity_words);
             
             // 计算描述相似度
             let desc_words: Vec<&str> = match cached {
@@ -237,7 +239,7 @@ impl SemanticEngine {
                     .filter(|word| !self.stop_words.contains(*word))
                     .collect(),
             };
-            let desc_similarity = self.calculate_word_overlap(&mention_words, &desc_words);
+            let desc_similarity = Self::calculate_word_overlap_with(&mention_set, &desc_words);
             
             let combined_score = (overlap_score * 0.7 + desc_similarity * 0.3).max(0.0).min(1.0);
             
@@ -301,11 +303,13 @@ impl SemanticEngine {
         
         let mut best_candidate = &candidates[0];
         
-        // 如果有上下文，使用上下文进行消歧
+        // 如果有上下文，使用上下文进行消歧；上下文只分词一次
         if let Some(context) = context {
+            let context_words = self.tokenize_filtered(context);
             let mut best_score = 0.0;
             for candidate in &candidates {
-                let context_score = self.calculate_context_relevance(context, candidate).await;
+                let context_score =
+                    self.calculate_context_relevance(&context_words, candidate).await;
                 if context_score > best_score {
                     best_score = context_score;
                     best_candidate = candidate;
@@ -316,17 +320,13 @@ impl SemanticEngine {
         Ok(Some(best_candidate.entity.clone()))
     }
 
-    async fn calculate_context_relevance(&self, context: &str, candidate: &EntityCandidate) -> f64 {
-        let context_words: Vec<_> = self.jieba.cut(context, false).into_iter()
-            .filter(|word| !self.stop_words.contains(*word))
-            .collect();
-        
+    async fn calculate_context_relevance(&self, context_words: &[String], candidate: &EntityCandidate) -> f64 {
         let mut relevance_score = 0.0;
         let mut total_comparisons = 0;
         
         // 与实体标签的相关性
         for tag in &candidate.entity_type {
-            for context_word in &context_words {
+            for context_word in context_words {
                 relevance_score += self.calculate_string_similarity(context_word, tag);
                 total_comparisons += 1;
             }
@@ -334,7 +334,7 @@ impl SemanticEngine {
         
         // 与实体属性的相关性
         for (attr_name, attr_values) in &candidate.attributes {
-            for context_word in &context_words {
+            for context_word in context_words {
                 relevance_score += self.calculate_string_similarity(context_word, attr_name);
                 total_comparisons += 1;
                 
@@ -522,13 +522,12 @@ impl SemanticEngine {
         prev[col_count]
     }
 
-    fn calculate_word_overlap(&self, words1: &[&str], words2: &[&str]) -> f64 {
-        let set1: HashSet<_> = words1.iter().collect();
-        let set2: HashSet<_> = words2.iter().collect();
-        
-        let intersection = set1.intersection(&set2).count();
-        let union = set1.union(&set2).count();
-        
+    fn calculate_word_overlap_with(prebuilt: &HashSet<&str>, words: &[&str]) -> f64 {
+        let other: HashSet<&str> = words.iter().copied().collect();
+
+        let intersection = prebuilt.intersection(&other).count();
+        let union = prebuilt.union(&other).count();
+
         if union == 0 {
             0.0
         } else {

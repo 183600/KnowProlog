@@ -7,6 +7,7 @@
 //   3) 可解释输出：每个候选附带置信度与打分理由，便于人工检查链接是否可信。
 // 这对应 LLM 的"输入理解/实体识别"，但实现是字符串索引 + 计数 + 规则。
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,12 +51,16 @@ impl LinkedMention {
 struct EntityProfile {
     etype: Option<String>,
     degree: usize,
+    char_count: usize,
+    char_set: HashSet<char>,
+    bigrams: HashSet<(char, char)>,
 }
 
 pub struct EntityLinker {
     profiles: HashMap<String, EntityProfile>,
     surface_candidates: HashMap<String, Vec<String>>,
-    surface_order: Vec<String>,
+    // 表层名及其字符序列：注册期预计算，匹配时零分配
+    surface_order: Vec<(String, Vec<char>)>,
     neighbors: HashMap<String, HashSet<String>>,
     out_predicates: HashMap<String, HashMap<String, usize>>,
     in_predicates: HashMap<String, HashMap<String, usize>>,
@@ -111,11 +116,17 @@ impl EntityLinker {
             return;
         }
         let degree = self.profiles.get(name).map(|p| p.degree).unwrap_or(0);
+        let chars: Vec<char> = name.chars().collect();
+        let char_set: HashSet<char> = chars.iter().copied().collect();
+        let bigrams: HashSet<(char, char)> = chars.windows(2).map(|w| (w[0], w[1])).collect();
         self.profiles.insert(
             name.to_string(),
             EntityProfile {
                 etype: etype.filter(|t| !t.trim().is_empty()).map(str::to_string),
                 degree,
+                char_count: chars.len(),
+                char_set,
+                bigrams,
             },
         );
         self.add_surface(name, name);
@@ -125,11 +136,21 @@ impl EntityLinker {
         if alias.trim().is_empty() || canonical.trim().is_empty() || alias == canonical {
             return;
         }
-        let entry = self.surface_candidates.entry(alias.to_string()).or_default();
-        if !entry.iter().any(|c| c == canonical) {
-            entry.push(canonical.to_string());
+        let is_new = match self.surface_candidates.entry(alias.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if !entry.get().iter().any(|c| c == canonical) {
+                    entry.get_mut().push(canonical.to_string());
+                }
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(vec![canonical.to_string()]);
+                true
+            }
+        };
+        if is_new {
+            self.insert_surface_sorted(alias);
         }
-        self.rebuild_surface_order();
     }
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
@@ -153,22 +174,40 @@ impl EntityLinker {
     }
 
     fn add_surface(&mut self, surface: &str, canonical: &str) {
-        let entry = self.surface_candidates.entry(surface.to_string()).or_default();
-        if !entry.iter().any(|c| c == canonical) {
-            entry.push(canonical.to_string());
+        let is_new = match self.surface_candidates.entry(surface.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if !entry.get().iter().any(|c| c == canonical) {
+                    entry.get_mut().push(canonical.to_string());
+                }
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(vec![canonical.to_string()]);
+                true
+            }
+        };
+        if is_new {
+            self.insert_surface_sorted(surface);
         }
-        self.rebuild_surface_order();
     }
 
-    fn rebuild_surface_order(&mut self) {
-        let mut surfaces: Vec<String> = self.surface_candidates.keys().cloned().collect();
-        surfaces.sort_by(|a, b| {
-            b.chars()
-                .count()
-                .cmp(&a.chars().count())
-                .then_with(|| a.cmp(b))
-        });
-        self.surface_order = surfaces;
+    // 与历史全量排序等价：先按字符数降序，再按字典序升序。
+    // 仅对新增的表层名做二分插入，避免每次注册都重排全部表层名。
+    fn insert_surface_sorted(&mut self, surface: &str) {
+        let chars: Vec<char> = surface.chars().collect();
+        let len = chars.len();
+        let pos = self
+            .surface_order
+            .binary_search_by(|probe| {
+                probe
+                    .1
+                    .len()
+                    .cmp(&len)
+                    .reverse()
+                    .then_with(|| probe.0.as_str().cmp(surface))
+            })
+            .unwrap_or_else(|pos| pos);
+        self.surface_order.insert(pos, (surface.to_string(), chars));
     }
 
     pub fn link(&self, text: &str) -> Vec<LinkedMention> {
@@ -192,18 +231,18 @@ impl EntityLinker {
         let mut mentions: Vec<LinkedMention> = Vec::new();
         let mut i = 0;
         while i < chars.len() {
-            let mut matched: Option<&str> = None;
-            for surface in &self.surface_order {
-                let surface_chars: Vec<char> = surface.chars().collect();
-                if surface_chars.is_empty() || i + surface_chars.len() > chars.len() {
+            let mut matched: Option<(&str, usize)> = None;
+            for (surface, surface_chars) in &self.surface_order {
+                let len = surface_chars.len();
+                if len == 0 || i + len > chars.len() {
                     continue;
                 }
-                if chars[i..i + surface_chars.len()] == surface_chars[..] {
-                    matched = Some(surface.as_str());
+                if chars[i..i + len] == surface_chars[..] {
+                    matched = Some((surface.as_str(), len));
                     break;
                 }
             }
-            if let Some(surface) = matched {
+            if let Some((surface, len)) = matched {
                 let candidates = self.candidates_for_surface(surface);
                 if !candidates.is_empty() {
                     mentions.push(LinkedMention {
@@ -211,7 +250,7 @@ impl EntityLinker {
                         start: i,
                         candidates,
                     });
-                    i += surface.chars().count();
+                    i += len;
                     continue;
                 }
             }
@@ -266,12 +305,24 @@ impl EntityLinker {
             if char_count < 2 || char_count > FUZZY_MAX_CHARS || is_stop_segment(trimmed) {
                 continue;
             }
+            let trimmed_chars: Vec<char> = trimmed.chars().collect();
+            let trimmed_char_set: HashSet<char> = trimmed_chars.iter().copied().collect();
+            let trimmed_bigrams: HashSet<(char, char)> = trimmed_chars
+                .windows(2)
+                .map(|w| (w[0], w[1]))
+                .collect();
             let mut scored: Vec<(f64, f64, &String)> = self
                 .profiles
-                .keys()
-                .map(|canonical| {
-                    let profile = self.profiles.get(canonical).expect("键来自 profiles");
-                    let similarity = dice_similarity(trimmed, canonical);
+                .iter()
+                .map(|(canonical, profile)| {
+                    let similarity = dice_similarity_precomputed(
+                        trimmed,
+                        &trimmed_chars,
+                        &trimmed_char_set,
+                        &trimmed_bigrams,
+                        canonical,
+                        profile,
+                    );
                     let degree_bonus = ((1.0 + profile.degree as f64).ln() / 10.0).min(0.1);
                     (similarity + degree_bonus, similarity, canonical)
                 })
@@ -427,6 +478,7 @@ fn is_stop_segment(segment: &str) -> bool {
     STOP.contains(&segment)
 }
 
+#[cfg(test)]
 fn bigrams(text: &str) -> HashSet<(char, char)> {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() < 2 {
@@ -435,6 +487,7 @@ fn bigrams(text: &str) -> HashSet<(char, char)> {
     chars.windows(2).map(|w| (w[0], w[1])).collect()
 }
 
+#[cfg(test)]
 fn dice_similarity(a: &str, b: &str) -> f64 {
     if a == b {
         return 1.0;
@@ -457,6 +510,32 @@ fn dice_similarity(a: &str, b: &str) -> f64 {
         let intersection = set_a.intersection(&set_b).count() as f64;
         // 单字重叠较宽松，打折后仅作为二元组相似度的补充（处理双字名错别字）
         2.0 * intersection / (set_a.len() + set_b.len()) as f64 * 0.8
+    };
+    bigram_score.max(unigram_score)
+}
+
+// 与 dice_similarity 完全同值，但复用已预计算的指称字符集合与实体画像特征集合
+fn dice_similarity_precomputed(
+    trimmed: &str,
+    trimmed_chars: &[char],
+    trimmed_char_set: &HashSet<char>,
+    trimmed_bigrams: &HashSet<(char, char)>,
+    canonical: &str,
+    profile: &EntityProfile,
+) -> f64 {
+    if trimmed == canonical {
+        return 1.0;
+    }
+    if trimmed_chars.len() < 2 || profile.char_count < 2 {
+        return 0.0;
+    }
+    let bigram_score = {
+        let intersection = trimmed_bigrams.intersection(&profile.bigrams).count() as f64;
+        2.0 * intersection / (trimmed_bigrams.len() + profile.bigrams.len()) as f64
+    };
+    let unigram_score = {
+        let intersection = trimmed_char_set.intersection(&profile.char_set).count() as f64;
+        2.0 * intersection / (trimmed_char_set.len() + profile.char_set.len()) as f64 * 0.8
     };
     bigram_score.max(unigram_score)
 }

@@ -88,13 +88,17 @@ impl SimilarityCalculator {
 
     pub async fn calculate_semantic_similarity(&self, text1: &str, text2: &str) -> Result<SimilarityResult, Box<dyn std::error::Error>> {
         let mut details = HashMap::new();
-        
+
+        // 分词只做一次，供各相似度分量复用
+        let words1 = self.tokenize_and_filter(text1);
+        let words2 = self.tokenize_and_filter(text2);
+
         // 1. 词汇相似度 (Jaccard similarity)
-        let jaccard_sim = self.calculate_jaccard_similarity(text1, text2).await;
+        let jaccard_sim = self.jaccard_similarity_from_words(&words1, &words2);
         details.insert("jaccard".to_string(), jaccard_sim);
         
         // 2. 余弦相似度 (基于词向量)
-        let cosine_sim = self.calculate_cosine_similarity(text1, text2).await;
+        let cosine_sim = self.cosine_similarity_from_words(&words1, text1, &words2, text2);
         details.insert("cosine".to_string(), cosine_sim);
         
         // 3. 编辑距离相似度
@@ -102,11 +106,11 @@ impl SimilarityCalculator {
         details.insert("edit_distance".to_string(), edit_sim);
         
         // 4. TF-IDF 相似度
-        let tfidf_sim = self.calculate_tfidf_similarity(text1, text2).await;
+        let tfidf_sim = self.tfidf_similarity_from_words(&words1, &words2).await;
         details.insert("tfidf".to_string(), tfidf_sim);
         
         // 5. 语义概念相似度
-        let concept_sim = self.calculate_concept_similarity(text1, text2).await;
+        let concept_sim = self.concept_similarity_from_words(&words1, &words2);
         details.insert("concept".to_string(), concept_sim);
         
         // 6. N-gram 相似度
@@ -131,9 +135,12 @@ impl SimilarityCalculator {
     async fn calculate_jaccard_similarity(&self, text1: &str, text2: &str) -> f64 {
         let words1 = self.tokenize_and_filter(text1);
         let words2 = self.tokenize_and_filter(text2);
-        
-        let set1: HashSet<_> = words1.into_iter().collect();
-        let set2: HashSet<_> = words2.into_iter().collect();
+        self.jaccard_similarity_from_words(&words1, &words2)
+    }
+
+    fn jaccard_similarity_from_words(&self, words1: &[&str], words2: &[&str]) -> f64 {
+        let set1: HashSet<_> = words1.iter().copied().collect();
+        let set2: HashSet<_> = words2.iter().copied().collect();
         
         let intersection = set1.intersection(&set2).count();
         let union = set1.union(&set2).count();
@@ -145,9 +152,15 @@ impl SimilarityCalculator {
         }
     }
 
-    async fn calculate_cosine_similarity(&self, text1: &str, text2: &str) -> f64 {
-        let vec1 = self.text_to_vector(text1).await;
-        let vec2 = self.text_to_vector(text2).await;
+    fn cosine_similarity_from_words(
+        &self,
+        words1: &[&str],
+        text1: &str,
+        words2: &[&str],
+        text2: &str,
+    ) -> f64 {
+        let vec1 = self.text_to_vector_from_words(words1, text1);
+        let vec2 = self.text_to_vector_from_words(words2, text2);
         
         if vec1.is_empty() || vec2.is_empty() {
             return 0.0;
@@ -156,19 +169,17 @@ impl SimilarityCalculator {
         self.cosine_similarity(&vec1, &vec2)
     }
 
-    async fn text_to_vector(&self, text: &str) -> Vec<f32> {
-        let words = self.tokenize_and_filter(text);
-        let embeddings = self.word_embeddings.read();
-        
+    fn text_to_vector_from_words(&self, words: &[&str], text: &str) -> Vec<f32> {
         if words.is_empty() {
             return vec![];
         }
+        let embeddings = self.word_embeddings.read();
         
         let mut total_vector: Option<Vec<f32>> = None;
         let mut word_count = 0;
         
         for word in words {
-            if let Some(embedding) = embeddings.get(word) {
+            if let Some(embedding) = embeddings.get(*word) {
                 match &mut total_vector {
                     Some(ref mut vec) => {
                         for (i, &val) in embedding.iter().enumerate() {
@@ -275,12 +286,9 @@ impl SimilarityCalculator {
         prev[col_count]
     }
 
-    async fn calculate_tfidf_similarity(&self, text1: &str, text2: &str) -> f64 {
-        let words1 = self.tokenize_and_filter(text1);
-        let words2 = self.tokenize_and_filter(text2);
-        
-        let tfidf1 = self.calculate_tfidf_vector(&words1).await;
-        let tfidf2 = self.calculate_tfidf_vector(&words2).await;
+    async fn tfidf_similarity_from_words(&self, words1: &[&str], words2: &[&str]) -> f64 {
+        let tfidf1 = self.calculate_tfidf_vector(words1).await;
+        let tfidf2 = self.calculate_tfidf_vector(words2).await;
         
         self.calculate_vector_similarity(&tfidf1, &tfidf2)
     }
@@ -309,9 +317,8 @@ impl SimilarityCalculator {
     }
 
     async fn get_idf(&self, word: &str) -> f64 {
-        let mut idf_cache = self.idf_cache.write();
-        
-        if let Some(&idf) = idf_cache.get(word) {
+        // 缓存命中只取读锁，未命中再升级为写锁
+        if let Some(&idf) = self.idf_cache.read().get(word) {
             return idf;
         }
         
@@ -324,8 +331,9 @@ impl SimilarityCalculator {
         
         let document_frequency = *word_frequencies.get(word).unwrap_or(&1) as f64;
         let idf = (total_documents / document_frequency).ln();
+        drop(word_frequencies);
         
-        idf_cache.insert(word.to_string(), idf);
+        self.idf_cache.write().insert(word.to_string(), idf);
         idf
     }
 
@@ -359,20 +367,36 @@ impl SimilarityCalculator {
         }
     }
 
-    async fn calculate_concept_similarity(&self, text1: &str, text2: &str) -> f64 {
-        let concepts1 = self.extract_concepts(text1).await;
-        let concepts2 = self.extract_concepts(text2).await;
+    fn concept_similarity_from_words(&self, words1: &[&str], words2: &[&str]) -> f64 {
+        let concepts1 = self.extract_concepts_from_words(words1);
+        let concepts2 = self.extract_concepts_from_words(words2);
         
         if concepts1.is_empty() || concepts2.is_empty() {
             return 0.0;
         }
         
+        // 整个配对循环只取一次读锁
+        let concept_hierarchy = self.concept_hierarchy.read();
         let mut total_similarity = 0.0;
         let mut comparisons = 0;
         
         for concept1 in &concepts1 {
             for concept2 in &concepts2 {
-                total_similarity += self.calculate_concept_pair_similarity(concept1, concept2).await;
+                let similarity = if concept1 == concept2 {
+                    1.0
+                } else {
+                    match (concept_hierarchy.get(concept1), concept_hierarchy.get(concept2)) {
+                        (Some(n1), Some(n2)) => {
+                            // 计算概念层次相似度
+                            let hierarchy_sim = Self::calculate_hierarchy_similarity(n1, n2);
+                            // 计算同义词相似度
+                            let synonym_sim = Self::calculate_synonym_similarity(n1, n2);
+                            (hierarchy_sim + synonym_sim) / 2.0
+                        }
+                        _ => 0.0,
+                    }
+                };
+                total_similarity += similarity;
                 comparisons += 1;
             }
         }
@@ -384,20 +408,19 @@ impl SimilarityCalculator {
         }
     }
 
-    async fn extract_concepts(&self, text: &str) -> Vec<String> {
-        let words = self.tokenize_and_filter(text);
+    fn extract_concepts_from_words(&self, words: &[&str]) -> Vec<String> {
         let concept_hierarchy = self.concept_hierarchy.read();
         let synonym_dict = self.synonym_dict.read();
         let mut concepts = Vec::new();
         
         for word in words {
             // 直接概念匹配
-            if concept_hierarchy.contains_key(word) {
+            if concept_hierarchy.contains_key(*word) {
                 concepts.push(word.to_string());
             }
             
             // 通过同义词查找概念
-            if let Some(concept_list) = synonym_dict.get(word) {
+            if let Some(concept_list) = synonym_dict.get(*word) {
                 concepts.extend(concept_list.clone());
             }
         }
@@ -407,31 +430,7 @@ impl SimilarityCalculator {
         concepts
     }
 
-    async fn calculate_concept_pair_similarity(&self, concept1: &str, concept2: &str) -> f64 {
-        if concept1 == concept2 {
-            return 1.0;
-        }
-        
-        let concept_hierarchy = self.concept_hierarchy.read();
-        
-        let node1 = concept_hierarchy.get(concept1);
-        let node2 = concept_hierarchy.get(concept2);
-        
-        match (node1, node2) {
-            (Some(n1), Some(n2)) => {
-                // 计算概念层次相似度
-                let hierarchy_sim = self.calculate_hierarchy_similarity(n1, n2);
-                
-                // 计算同义词相似度
-                let synonym_sim = self.calculate_synonym_similarity(n1, n2);
-                
-                (hierarchy_sim + synonym_sim) / 2.0
-            }
-            _ => 0.0
-        }
-    }
-
-    fn calculate_hierarchy_similarity(&self, node1: &ConceptNode, node2: &ConceptNode) -> f64 {
+    fn calculate_hierarchy_similarity(node1: &ConceptNode, node2: &ConceptNode) -> f64 {
         // 简化的层次相似度计算
         // 实际实现中可以使用更复杂的算法，如 Wu-Palmer 相似度
         
@@ -449,7 +448,7 @@ impl SimilarityCalculator {
         0.0
     }
 
-    fn calculate_synonym_similarity(&self, node1: &ConceptNode, node2: &ConceptNode) -> f64 {
+    fn calculate_synonym_similarity(node1: &ConceptNode, node2: &ConceptNode) -> f64 {
         let synonyms1: HashSet<_> = node1.synonyms.iter().collect();
         let synonyms2: HashSet<_> = node2.synonyms.iter().collect();
         

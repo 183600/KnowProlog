@@ -60,34 +60,61 @@ impl SymbolicEmbedding {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             return;
         }
-        self.add_feature(subject, &format!("{}→", predicate));
-        self.add_feature(object, &format!("←{}", predicate));
+        // 复用同一个缓冲区构造特征名，避免每次 format! 的额外分配
+        let mut feature = String::with_capacity(predicate.len() + 3);
+        feature.push_str(predicate);
+        feature.push('→');
+        self.add_feature(subject, &feature);
+        feature.clear();
+        feature.push('←');
+        feature.push_str(predicate);
+        self.add_feature(object, &feature);
     }
 
     pub fn observe_entity(&mut self, name: &str, entity_type: &str, properties: &[String]) {
         if name.is_empty() {
             return;
         }
+        let mut feature = String::new();
         if !entity_type.is_empty() {
-            self.add_feature(name, &format!("类型·{}", entity_type));
+            feature.clear();
+            feature.push_str("类型·");
+            feature.push_str(entity_type);
+            self.add_feature(name, &feature);
         }
         for property in properties {
             if !property.is_empty() {
-                self.add_feature(name, &format!("属性·{}", property));
+                feature.clear();
+                feature.push_str("属性·");
+                feature.push_str(property);
+                self.add_feature(name, &feature);
             }
         }
     }
 
     fn add_feature(&mut self, entity: &str, feature: &str) {
-        let entry = self
-            .counts
-            .entry(entity.to_string())
-            .or_default()
-            .entry(feature.to_string())
-            .or_insert(0.0);
-        *entry += 1.0;
-        *self.feature_totals.entry(feature.to_string()).or_insert(0.0) += 1.0;
-        *self.entity_masses.entry(entity.to_string()).or_insert(0.0) += 1.0;
+        // 已存在的热点路径直接自增，避免为 entry 键重复分配 String
+        match self.counts.get_mut(entity).and_then(|map| map.get_mut(feature)) {
+            Some(count) => *count += 1.0,
+            None => {
+                self.counts
+                    .entry(entity.to_string())
+                    .or_default()
+                    .insert(feature.to_string(), 1.0);
+            }
+        }
+        match self.feature_totals.get_mut(feature) {
+            Some(total) => *total += 1.0,
+            None => {
+                self.feature_totals.insert(feature.to_string(), 1.0);
+            }
+        }
+        match self.entity_masses.get_mut(entity) {
+            Some(mass) => *mass += 1.0,
+            None => {
+                self.entity_masses.insert(entity.to_string(), 1.0);
+            }
+        }
         self.total_mass += 1.0;
         self.dirty = true;
     }

@@ -64,6 +64,8 @@ struct FactLine {
 pub struct SymbolicGenerator {
     known_entities: HashSet<String>,
     entity_types: HashMap<String, String>,
+    // 类型 → 成员实体索引，避免类型级统计/原型查找时全量扫描实体
+    type_members: HashMap<String, Vec<String>>,
     attributes: HashMap<String, Vec<(String, String)>>,
     by_subject: HashMap<String, HashMap<String, Vec<String>>>,
     by_object: HashMap<String, HashMap<String, Vec<String>>>,
@@ -84,6 +86,7 @@ impl SymbolicGenerator {
         Self {
             known_entities: HashSet::new(),
             entity_types: HashMap::new(),
+            type_members: HashMap::new(),
             attributes: HashMap::new(),
             by_subject: HashMap::new(),
             by_object: HashMap::new(),
@@ -144,7 +147,27 @@ impl SymbolicGenerator {
         }
         self.known_entities.insert(name.to_string());
         if !etype.trim().is_empty() {
-            self.entity_types.insert(name.to_string(), etype.to_string());
+            match self.entity_types.insert(name.to_string(), etype.to_string()) {
+                Some(previous) => {
+                    if previous != etype {
+                        if let Some(members) = self.type_members.get_mut(&previous) {
+                            if let Some(pos) = members.iter().position(|m| m == name) {
+                                members.swap_remove(pos);
+                            }
+                        }
+                        self.type_members
+                            .entry(etype.to_string())
+                            .or_default()
+                            .push(name.to_string());
+                    }
+                }
+                None => {
+                    self.type_members
+                        .entry(etype.to_string())
+                        .or_default()
+                        .push(name.to_string());
+                }
+            }
         }
         if !properties.is_empty() {
             let bucket = self.attributes.entry(name.to_string()).or_default();
@@ -196,16 +219,13 @@ impl SymbolicGenerator {
         self.known_entities.insert(subject.to_string());
         self.known_entities.insert(object.to_string());
 
+        // triples 已按 (s,p,o) 去重，此处到达即保证是新事实，无需再线性扫描去重
         let subjects = self.by_subject.entry(subject.to_string()).or_default();
         let objects = subjects.entry(predicate.to_string()).or_default();
-        if !objects.iter().any(|existing| existing == object) {
-            objects.push(object.to_string());
-        }
+        objects.push(object.to_string());
         let object_bucket = self.by_object.entry(object.to_string()).or_default();
         let subjects_rev = object_bucket.entry(predicate.to_string()).or_default();
-        if !subjects_rev.iter().any(|existing| existing == subject) {
-            subjects_rev.push(subject.to_string());
-        }
+        subjects_rev.push(subject.to_string());
 
         *self.predicate_totals.entry(predicate.to_string()).or_insert(0) += 1;
         *self
@@ -518,10 +538,10 @@ impl SymbolicGenerator {
     fn type_predicate_counts(&self, etype: &str) -> (HashMap<String, usize>, usize) {
         let mut counts: HashMap<String, usize> = HashMap::new();
         let mut total = 0usize;
-        for (entity, entity_type) in &self.entity_types {
-            if entity_type != etype {
-                continue;
-            }
+        let Some(members) = self.type_members.get(etype) else {
+            return (counts, total);
+        };
+        for entity in members {
             if let Some(predicate_counts) = self.entity_predicate_counts.get(entity) {
                 for (predicate, count) in predicate_counts {
                     *counts.entry(predicate.clone()).or_insert(0) += count;
@@ -538,9 +558,10 @@ impl SymbolicGenerator {
         entity: &str,
         predicate: &str,
     ) -> Option<(String, Vec<String>)> {
-        let mut best: Option<(usize, String)> = None;
-        for (other, other_type) in &self.entity_types {
-            if other_type != etype || other == entity {
+        let members = self.type_members.get(etype)?;
+        let mut best: Option<(usize, &str)> = None;
+        for other in members {
+            if other == entity {
                 continue;
             }
             let count = self
@@ -555,21 +576,21 @@ impl SymbolicGenerator {
             let replace = match &best {
                 None => true,
                 Some((best_count, best_name)) => {
-                    count > *best_count || (count == *best_count && other < best_name)
+                    count > *best_count || (count == *best_count && other.as_str() < *best_name)
                 }
             };
             if replace {
-                best = Some((count, other.clone()));
+                best = Some((count, other.as_str()));
             }
         }
         let (_, prototype) = best?;
         let objects = self
             .by_subject
-            .get(&prototype)
+            .get(prototype)
             .and_then(|m| m.get(predicate))
             .cloned()
             .unwrap_or_default();
-        Some((prototype, objects))
+        Some((prototype.to_string(), objects))
     }
 
     fn global_predictions(&self) -> Option<Vec<CompletionPrediction>> {

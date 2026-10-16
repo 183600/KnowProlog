@@ -67,8 +67,13 @@ impl NLUEngine {
 
         let mut semantics = Vec::new();
 
+        // 分词文本在一轮分析内不变，提前展开一次供所有模式复用
+        let input_words: Vec<&str> = normalized_words.iter().map(|w| w.text.as_str()).collect();
+
         for domain in &self.domains {
-            if let Some(result) = self.analyze_domain(input, &normalized_words, domain) {
+            if let Some(result) =
+                self.analyze_domain(input, &normalized_words, &input_words, domain)
+            {
                 semantics.push(result);
             }
         }
@@ -81,13 +86,19 @@ impl NLUEngine {
         }
     }
 
-    fn analyze_domain(&self, input: &str, tagged_words: &[TaggedWord], domain: &DomainConfig) -> Option<SemanticResult> {
+    fn analyze_domain(
+        &self,
+        input: &str,
+        tagged_words: &[TaggedWord],
+        input_words: &[&str],
+        domain: &DomainConfig,
+    ) -> Option<SemanticResult> {
         let mut best_intent = None;
         let mut best_score = 0.0;
         let mut best_slots = Vec::new();
 
         for intent in &domain.intents {
-            if let Some((score, slots)) = self.match_intent(input, tagged_words, intent) {
+            if let Some((score, slots)) = self.match_intent(input, tagged_words, input_words, intent) {
                 if score > best_score {
                     best_score = score;
                     best_intent = Some(intent.name.clone());
@@ -108,12 +119,20 @@ impl NLUEngine {
         }
     }
 
-    fn match_intent(&self, input: &str, tagged_words: &[TaggedWord], intent: &IntentConfig) -> Option<(f64, Vec<(String, String)>)> {
+    fn match_intent(
+        &self,
+        input: &str,
+        tagged_words: &[TaggedWord],
+        input_words: &[&str],
+        intent: &IntentConfig,
+    ) -> Option<(f64, Vec<(String, String)>)> {
         let mut best_score = 0.0;
         let mut best_slots = Vec::new();
 
         for pattern in &intent.patterns {
-            if let Some((score, slots)) = self.match_pattern(input, tagged_words, pattern, &intent.slots) {
+            if let Some((score, slots)) =
+                self.match_pattern(input, tagged_words, input_words, pattern, &intent.slots)
+            {
                 if score > best_score {
                     best_score = score;
                     best_slots = slots;
@@ -128,17 +147,22 @@ impl NLUEngine {
         }
     }
 
-    fn match_pattern(&self, _input: &str, tagged_words: &[TaggedWord], pattern: &str, slot_configs: &[SlotConfig]) -> Option<(f64, Vec<(String, String)>)> {
-        let pattern_words: Vec<&str> = pattern.split_whitespace().collect();
-        let input_words: Vec<&str> = tagged_words.iter().map(|w| w.text.as_str()).collect();
-        
+    fn match_pattern(
+        &self,
+        _input: &str,
+        tagged_words: &[TaggedWord],
+        input_words: &[&str],
+        pattern: &str,
+        slot_configs: &[SlotConfig],
+    ) -> Option<(f64, Vec<(String, String)>)> {
+        let total_count = pattern.split_whitespace().count();
+
         let mut matched_count = 0;
-        let total_count = pattern_words.len();
         let mut slots = Vec::new();
 
-        for pattern_word in &pattern_words {
+        for pattern_word in pattern.split_whitespace() {
             if pattern_word.starts_with('{') && pattern_word.ends_with('}') {
-                let slot_name = &pattern_word[1..pattern_word.len()-1];
+                let slot_name = &pattern_word[1..pattern_word.len() - 1];
                 if let Some(slot_config) = slot_configs.iter().find(|s| s.name == slot_name) {
                     if let Some(value) = self.extract_slot_value(tagged_words, slot_config) {
                         slots.push((slot_name.to_string(), value));
@@ -146,7 +170,7 @@ impl NLUEngine {
                     }
                 }
             } else {
-                for input_word in &input_words {
+                for input_word in input_words {
                     if self.word_similarity(pattern_word, input_word) >= 0.8 {
                         matched_count += 1;
                         break;

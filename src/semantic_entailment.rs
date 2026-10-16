@@ -659,7 +659,6 @@ fn entity_unknown(prop: &Proposition, knowledge: &Knowledge<'_>) -> bool {
 
 pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> EntailmentResult {
     let positive = positive_proof(proposition, knowledge);
-    let values = known_values(proposition, knowledge);
 
     if proposition.negative {
         if let Some((step, confidence)) = positive {
@@ -675,6 +674,8 @@ pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> Entailmen
                 reason: "否定形式与已确认事实冲突".to_string(),
             };
         }
+        // 仅在需要封闭世界假设证据时才收集图谱取值
+        let values = known_values(proposition, knowledge);
         if !values.is_empty() && !values.iter().any(|value| value == &proposition.object) {
             return EntailmentResult {
                 proposition: proposition.clone(),
@@ -722,6 +723,7 @@ pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> Entailmen
         };
     }
 
+    let values = known_values(proposition, knowledge);
     if !values.is_empty() {
         let mut counter: Vec<String> = values
             .iter()

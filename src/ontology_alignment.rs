@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TermKind {
@@ -44,8 +45,8 @@ pub struct OntologyAligner {
     similarity_threshold: f64,
     structural_min_shared: usize,
     structural_min_jaccard: f64,
-    // 术语解析结果缓存：注册新术语时整体失效
-    resolve_cache: RwLock<HashMap<String, Option<(AlignmentPair, Option<usize>)>>>,
+    // 术语解析结果缓存：注册新术语时整体失效；用 Arc 避免命中时的深拷贝
+    resolve_cache: RwLock<HashMap<String, Option<Arc<(AlignmentPair, Option<usize>)>>>>,
 }
 
 impl OntologyAligner {
@@ -203,13 +204,13 @@ impl OntologyAligner {
         if na == nb {
             return 1.0;
         }
-        let (short, long) = if na.chars().count() <= nb.chars().count() {
-            (na, nb)
+        let na_len = na.chars().count();
+        let nb_len = nb.chars().count();
+        let (short, long, short_len, long_len) = if na_len <= nb_len {
+            (na, nb, na_len, nb_len)
         } else {
-            (nb, na)
+            (nb, na, nb_len, na_len)
         };
-        let short_len = short.chars().count();
-        let long_len = long.chars().count();
         if short_len >= 2 && long.contains(short) {
             return 0.7 + 0.3 * (short_len as f64 / long_len as f64);
         }
@@ -217,17 +218,24 @@ impl OntologyAligner {
     }
 
     fn bigram_dice(a: &str, b: &str) -> f64 {
-        let mut ga = Self::bigram_keys(a);
+        let ga = Self::bigram_keys(a);
         let gb = Self::bigram_keys(b);
         if ga.is_empty() || gb.is_empty() {
             return 0.0;
         }
         let total = ga.len() + gb.len();
+        // 计数映射实现多重集交集，避免逐元素线性查找的 O(n²)
+        let mut counts: HashMap<(char, Option<char>), usize> = HashMap::with_capacity(ga.len());
+        for key in ga {
+            *counts.entry(key).or_insert(0) += 1;
+        }
         let mut overlap = 0usize;
-        for key in &gb {
-            if let Some(pos) = ga.iter().position(|k| k == key) {
-                ga.swap_remove(pos);
-                overlap += 1;
+        for key in gb {
+            if let Some(count) = counts.get_mut(&key) {
+                if *count > 0 {
+                    *count -= 1;
+                    overlap += 1;
+                }
             }
         }
         2.0 * overlap as f64 / total as f64
@@ -254,20 +262,25 @@ impl OntologyAligner {
 
     fn synonym_chain(&self, term: &str) -> Option<String> {
         let mut current = term.to_string();
+        let mut current_norm = self.normalize(term);
         let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(self.normalize(&current));
+        seen.insert(current_norm.clone());
         let mut changed = false;
         for _ in 0..8 {
-            let lookup = current.clone();
             let next = self
                 .synonyms
-                .get(&lookup)
+                .get(current.as_str())
                 .cloned()
-                .or_else(|| self.synonyms.get(&self.normalize(&lookup)).cloned());
+                .or_else(|| self.synonyms.get(&current_norm).cloned());
             match next {
-                Some(target) if !target.is_empty() && !seen.contains(&self.normalize(&target)) => {
-                    seen.insert(self.normalize(&target));
+                Some(target) if !target.is_empty() => {
+                    let target_norm = self.normalize(&target);
+                    if seen.contains(&target_norm) {
+                        break;
+                    }
+                    seen.insert(target_norm.clone());
                     current = target;
+                    current_norm = target_norm;
                     changed = true;
                 }
                 _ => break,
@@ -280,15 +293,22 @@ impl OntologyAligner {
         }
     }
 
-    fn resolve_with_index(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
-        if let Some(cached) = self.resolve_cache.read().get(term) {
-            return cached.clone();
+    fn resolve_arc(&self, term: &str) -> Option<Arc<(AlignmentPair, Option<usize>)>> {
+        {
+            let cache = self.resolve_cache.read();
+            if let Some(cached) = cache.get(term) {
+                return cached.clone();
+            }
         }
-        let resolved = self.resolve_with_index_uncached(term);
+        let resolved = self.resolve_with_index_uncached(term).map(Arc::new);
         self.resolve_cache
             .write()
             .insert(term.to_string(), resolved.clone());
         resolved
+    }
+
+    fn resolve_with_index(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
+        self.resolve_arc(term).map(|resolved| (*resolved).clone())
     }
 
     fn resolve_with_index_uncached(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
@@ -368,19 +388,16 @@ impl OntologyAligner {
                         continue;
                     }
                 }
-                let shared: Vec<String> = profile
-                    .neighbors
-                    .intersection(&other.neighbors)
-                    .cloned()
-                    .collect();
-                if shared.len() < self.structural_min_shared {
+                // 先只统计交集大小，胜出后再重建证据，避免为每个候选克隆邻居
+                let shared_count = profile.neighbors.intersection(&other.neighbors).count();
+                if shared_count < self.structural_min_shared {
                     continue;
                 }
                 let union = profile.neighbors.union(&other.neighbors).count();
                 if union == 0 {
                     continue;
                 }
-                let jaccard = shared.len() as f64 / union as f64;
+                let jaccard = shared_count as f64 / union as f64;
                 if jaccard < self.structural_min_jaccard {
                     continue;
                 }
@@ -389,8 +406,9 @@ impl OntologyAligner {
                     .as_ref()
                     .map_or(true, |(b, _, _)| confidence > *b)
                 {
-                    let mut evidence: Vec<String> = shared
-                        .iter()
+                    let mut evidence: Vec<String> = profile
+                        .neighbors
+                        .intersection(&other.neighbors)
                         .take(3)
                         .map(|n| format!("共同关系「{}」", n))
                         .collect();
@@ -420,20 +438,19 @@ impl OntologyAligner {
     }
 
     pub fn canonical_form(&self, term: &str) -> String {
-        if let Some(pair) = self.resolve(term) {
-            pair.target
-        } else {
-            term.to_string()
+        match self.resolve_arc(term) {
+            Some(pair) => pair.0.target.clone(),
+            None => term.to_string(),
         }
     }
 
     pub fn align_all(&self) -> Vec<AlignmentPair> {
         let mut pairs = Vec::new();
         for (i, profile) in self.profiles.iter().enumerate() {
-            if let Some((pair, target_idx)) = self.resolve_with_index(&profile.term) {
-                match target_idx {
+            if let Some(resolved) = self.resolve_arc(&profile.term) {
+                match resolved.1 {
                     Some(t) if t >= i => continue,
-                    _ => pairs.push(pair),
+                    _ => pairs.push(resolved.0.clone()),
                 }
             }
         }

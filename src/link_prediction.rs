@@ -96,6 +96,7 @@ pub struct LinkPredictor {
     pairs_by_pred: HashMap<String, HashSet<(String, String)>>,
     out_edges: HashMap<String, HashMap<String, HashSet<String>>>,
     in_edges: HashMap<String, HashMap<String, HashSet<String>>>,
+    participants: HashSet<String>,
     rules: Vec<HornRule>,
     max_body_pairs: usize,
     max_enumeration: usize,
@@ -115,6 +116,7 @@ impl LinkPredictor {
             pairs_by_pred: HashMap::new(),
             out_edges: HashMap::new(),
             in_edges: HashMap::new(),
+            participants: HashSet::new(),
             rules: Vec::new(),
             max_body_pairs: 20_000,
             max_enumeration: 5_000,
@@ -151,6 +153,8 @@ impl LinkPredictor {
             .entry(object.to_string())
             .or_default()
             .insert(subject.to_string());
+        self.participants.insert(subject.to_string());
+        self.participants.insert(object.to_string());
     }
 
     fn pairs_of(&self, predicate: &str) -> Option<&HashSet<(String, String)>> {
@@ -158,8 +162,11 @@ impl LinkPredictor {
     }
 
     pub fn has_triple(&self, subject: &str, predicate: &str, object: &str) -> bool {
-        self.known
-            .contains(&Triple::new(subject, predicate, object))
+        // 与 known 等价：add_triple 同时写入 known 与 out_edges 且首个写入去重
+        self.out_edges
+            .get(predicate)
+            .and_then(|by_subject| by_subject.get(subject))
+            .map_or(false, |objects| objects.contains(object))
     }
 
     pub fn has_predicate(&self, predicate: &str) -> bool {
@@ -175,9 +182,13 @@ impl LinkPredictor {
         if pairs.is_empty() {
             return false;
         }
+        let reversed: HashSet<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (b.as_str(), a.as_str()))
+            .collect();
         let mutual = pairs
             .iter()
-            .filter(|(a, b)| pairs.iter().any(|(x, y)| x == b && y == a))
+            .filter(|(a, b)| reversed.contains(&(a.as_str(), b.as_str())))
             .count();
         mutual >= 1 && mutual * 2 >= pairs.len()
     }
@@ -205,13 +216,7 @@ impl LinkPredictor {
     }
 
     pub fn participates(&self, entity: &str) -> bool {
-        self.out_edges
-            .values()
-            .any(|by_subject| by_subject.contains_key(entity))
-            || self
-                .in_edges
-                .values()
-                .any(|by_object| by_object.contains_key(entity))
+        self.participants.contains(entity)
     }
 
     fn compose_body_pairs(&self, p1: &str, p2: &str) -> Option<HashSet<(String, String)>> {
@@ -284,10 +289,18 @@ impl LinkPredictor {
         min_confidence: f64,
     ) -> Option<HornRule> {
         let head_pairs = self.pairs_of(&head)?;
-        let support = body_pairs
-            .iter()
-            .filter(|pair| head_pairs.contains(*pair))
-            .count();
+        // 从较小集合侧做包含计数，交集大小不变
+        let support = if body_pairs.len() <= head_pairs.len() {
+            body_pairs
+                .iter()
+                .filter(|pair| head_pairs.contains(*pair))
+                .count()
+        } else {
+            head_pairs
+                .iter()
+                .filter(|pair| body_pairs.contains(*pair))
+                .count()
+        };
         if support < min_support || body_pairs.is_empty() {
             return None;
         }
