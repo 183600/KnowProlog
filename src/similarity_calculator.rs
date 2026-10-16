@@ -168,7 +168,7 @@ impl SimilarityCalculator {
         let mut word_count = 0;
         
         for word in words {
-            if let Some(embedding) = embeddings.get(&word) {
+            if let Some(embedding) = embeddings.get(word) {
                 match &mut total_vector {
                     Some(ref mut vec) => {
                         for (i, &val) in embedding.iter().enumerate() {
@@ -248,32 +248,31 @@ impl SimilarityCalculator {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
+        // 双行动态规划：距离对称，将较短字符串作为列方向，内存降为 O(min(n, m))
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
-        let len1 = chars1.len();
-        let len2 = chars2.len();
+        let (rows, cols) = if chars1.len() <= chars2.len() {
+            (chars1, chars2)
+        } else {
+            (chars2, chars1)
+        };
+        let col_count = cols.len();
         
-        let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
+        let mut prev: Vec<usize> = (0..=col_count).collect();
+        let mut curr = vec![0usize; col_count + 1];
         
-        for i in 0..=len1 {
-            dp[i][0] = i;
-        }
-        
-        for j in 0..=len2 {
-            dp[0][j] = j;
-        }
-        
-        for i in 1..=len1 {
-            for j in 1..=len2 {
-                if chars1[i - 1] == chars2[j - 1] {
-                    dp[i][j] = dp[i - 1][j - 1];
-                } else {
-                    dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1]);
-                }
+        for (i, row_char) in rows.iter().enumerate() {
+            curr[0] = i + 1;
+            for j in 1..=col_count {
+                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                curr[j] = (prev[j] + 1)
+                    .min(curr[j - 1] + 1)
+                    .min(prev[j - 1] + cost);
             }
+            std::mem::swap(&mut prev, &mut curr);
         }
         
-        dp[len1][len2]
+        prev[col_count]
     }
 
     async fn calculate_tfidf_similarity(&self, text1: &str, text2: &str) -> f64 {
@@ -286,13 +285,13 @@ impl SimilarityCalculator {
         self.calculate_vector_similarity(&tfidf1, &tfidf2)
     }
 
-    async fn calculate_tfidf_vector(&self, words: &[String]) -> HashMap<String, f64> {
-        let mut tf_map = HashMap::new();
+    async fn calculate_tfidf_vector<'a>(&self, words: &[&'a str]) -> HashMap<&'a str, f64> {
+        let mut tf_map: HashMap<&'a str, f64> = HashMap::new();
         let total_words = words.len() as f64;
         
         // 计算 TF (Term Frequency)
         for word in words {
-            *tf_map.entry(word.clone()).or_insert(0.0) += 1.0;
+            *tf_map.entry(*word).or_insert(0.0) += 1.0;
         }
         
         for (_, tf) in tf_map.iter_mut() {
@@ -302,7 +301,7 @@ impl SimilarityCalculator {
         // 计算 TF-IDF
         let mut tfidf_vector = HashMap::new();
         for (word, tf) in tf_map {
-            let idf = self.get_idf(&word).await;
+            let idf = self.get_idf(word).await;
             tfidf_vector.insert(word, tf * idf);
         }
         
@@ -330,7 +329,7 @@ impl SimilarityCalculator {
         idf
     }
 
-    fn calculate_vector_similarity(&self, vec1: &HashMap<String, f64>, vec2: &HashMap<String, f64>) -> f64 {
+    fn calculate_vector_similarity(&self, vec1: &HashMap<&str, f64>, vec2: &HashMap<&str, f64>) -> f64 {
         if vec1.is_empty() || vec2.is_empty() {
             return 0.0;
         }
@@ -393,12 +392,12 @@ impl SimilarityCalculator {
         
         for word in words {
             // 直接概念匹配
-            if concept_hierarchy.contains_key(&word) {
-                concepts.push(word.clone());
+            if concept_hierarchy.contains_key(word) {
+                concepts.push(word.to_string());
             }
             
             // 通过同义词查找概念
-            if let Some(concept_list) = synonym_dict.get(&word) {
+            if let Some(concept_list) = synonym_dict.get(word) {
                 concepts.extend(concept_list.clone());
             }
         }
@@ -465,20 +464,23 @@ impl SimilarityCalculator {
     }
 
     async fn calculate_ngram_similarity(&self, text1: &str, text2: &str) -> f64 {
-        let bigrams1 = self.generate_character_ngrams(text1, 2);
-        let bigrams2 = self.generate_character_ngrams(text2, 2);
+        // 每个文本只收集一次字符序列，bigram/trigram 复用
+        let chars1: Vec<char> = text1.chars().collect();
+        let chars2: Vec<char> = text2.chars().collect();
         
-        let trigrams1 = self.generate_character_ngrams(text1, 3);
-        let trigrams2 = self.generate_character_ngrams(text2, 3);
-        
-        let bigram_sim = self.calculate_ngram_set_similarity(&bigrams1, &bigrams2);
-        let trigram_sim = self.calculate_ngram_set_similarity(&trigrams1, &trigrams2);
+        let bigram_sim = self.calculate_ngram_set_similarity(
+            &Self::ngrams_from_chars(&chars1, 2),
+            &Self::ngrams_from_chars(&chars2, 2),
+        );
+        let trigram_sim = self.calculate_ngram_set_similarity(
+            &Self::ngrams_from_chars(&chars1, 3),
+            &Self::ngrams_from_chars(&chars2, 3),
+        );
         
         (bigram_sim + trigram_sim) / 2.0
     }
 
-    fn generate_character_ngrams(&self, text: &str, n: usize) -> HashSet<String> {
-        let chars: Vec<char> = text.chars().collect();
+    fn ngrams_from_chars(chars: &[char], n: usize) -> HashSet<String> {
         let mut ngrams = HashSet::new();
         
         if chars.len() >= n {
@@ -489,6 +491,12 @@ impl SimilarityCalculator {
         }
         
         ngrams
+    }
+
+    #[cfg(test)]
+    fn generate_character_ngrams(&self, text: &str, n: usize) -> HashSet<String> {
+        let chars: Vec<char> = text.chars().collect();
+        Self::ngrams_from_chars(&chars, n)
     }
 
     fn calculate_ngram_set_similarity(&self, set1: &HashSet<String>, set2: &HashSet<String>) -> f64 {
@@ -502,11 +510,10 @@ impl SimilarityCalculator {
         }
     }
 
-    fn tokenize_and_filter(&self, text: &str) -> Vec<String> {
+    fn tokenize_and_filter<'a>(&self, text: &'a str) -> Vec<&'a str> {
         self.jieba.cut(text, false)
             .into_iter()
             .filter(|word| !self.stop_words.contains(*word) && word.trim().len() > 1)
-            .map(|word| word.to_string())
             .collect()
     }
 

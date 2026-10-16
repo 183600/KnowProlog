@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use scryer_prolog::machine::Machine;
 
 pub struct PrologEngine {
@@ -63,27 +64,28 @@ impl PrologEngine {
     
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
         self.clear_dynamic_facts();
-        let mut fact_string = String::new();
         let facts_count = facts.len();
+        // 直接写入最终字符串，避免为每条事实生成中间字符串和临时属性列表
+        let mut fact_string = String::with_capacity(facts_count * 64);
         
         for fact in facts {
             match fact {
                 PrologFact::Entity { name, entity_type, properties } => {
-                    let props_list = properties.iter()
-                        .map(|(k, v)| format!("'{}-{}'", k, v))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    
-                    fact_string.push_str(&format!(
-                        "oxigraph_entity('{}', '{}', [{}]).\n",
-                        name, entity_type, props_list
-                    ));
+                    let _ = write!(fact_string, "oxigraph_entity('{}', '{}', [", name, entity_type);
+                    for (i, (k, v)) in properties.iter().enumerate() {
+                        if i > 0 {
+                            fact_string.push_str(", ");
+                        }
+                        let _ = write!(fact_string, "'{}-{}'", k, v);
+                    }
+                    fact_string.push_str("]).\n");
                 }
                 PrologFact::Relation { from, rel_type, to } => {
-                    fact_string.push_str(&format!(
+                    let _ = write!(
+                        fact_string,
                         "oxigraph_relation('{}', '{}', '{}').\n",
                         from, rel_type, to
-                    ));
+                    );
                 }
             }
         }

@@ -1,6 +1,14 @@
 // src/nlp.rs
 use jieba_rs::Jieba; // 导入结巴分词库，用于中文分词
 use std::collections::HashMap; // 导入哈希映射，用于存储键值对
+use std::sync::OnceLock; // 用于全局缓存分词器实例
+
+// 结巴分词器初始化开销较大（需加载内置词典），全局复用同一实例
+static JIEBA: OnceLock<Jieba> = OnceLock::new();
+
+fn jieba() -> &'static Jieba {
+    JIEBA.get_or_init(Jieba::new)
+}
 
 // 标注了词性的单词结构体
 #[derive(Debug, Clone)]
@@ -33,10 +41,9 @@ pub enum PatternElement {
 // 预处理函数：分词并进行词性标注
 // 注意：crate::NlpConfig 现在引用的是 lib.rs 中的 NlpConfig
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
-    let jieba = Jieba::new(); // 创建分词器实例
-    let words = jieba.cut(text, false); // 执行分词，false表示精准模式
+    let words = jieba().cut(text, false); // 执行分词，false表示精准模式
     
-    let mut tagged_words = Vec::new();
+    let mut tagged_words = Vec::with_capacity(words.len());
     for word in words {
         // 确定词性
         let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
@@ -45,7 +52,7 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
             "nr".to_string() // nr表示人名
         } else {
             // 从词性字典查找，找不到则标记为unknown
-            config.pos_dict.get(word).unwrap_or(&"unknown".to_string()).to_string()
+            config.pos_dict.get(word).cloned().unwrap_or_else(|| "unknown".to_string())
         };
         
         tagged_words.push(TaggedWord {
@@ -73,17 +80,18 @@ pub fn normalize_words(words: Vec<TaggedWord>, synonyms: &HashMap<String, String
 fn is_name(word: &str, patterns: &crate::NamePatterns) -> bool {
     patterns.prefixes.iter().any(|p| word.starts_with(p)) || // 以姓氏前缀开头
     patterns.suffixes.iter().any(|s| word.ends_with(s)) || // 以名字后缀结尾
-    patterns.full_names.contains(&word.to_string()) || // 在常见人名列表中
+    patterns.full_names.iter().any(|n| n == word) || // 在常见人名列表中（避免为每个词分配临时字符串）
     patterns.profession_suffix.iter().any(|ps| word.ends_with(ps) && word.len() > ps.len()) // 以职业后缀结尾且不只是后缀本身
 }
 
 // 分析查询意图并提取实体
 pub fn analyze_query_intent(tagged_words: &[TaggedWord], rules: &[PrologRule]) -> Option<(String, Vec<String>)> {
-    let mut sorted_rules = rules.to_vec();
+    // 仅对引用排序，避免深拷贝规则数据；稳定排序保证同优先级顺序与原来一致
+    let mut sorted_rules: Vec<&PrologRule> = rules.iter().collect();
     sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority)); // 按优先级降序排序
     
     // 按优先级尝试匹配每个规则
-    for rule in &sorted_rules {
+    for rule in sorted_rules {
         if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {
             return Some((rule.query_type.clone(), entities)); // 返回查询类型和提取的实体
         }
@@ -172,13 +180,18 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                         let mut temp_pos = pos;
                         
                         for expected_char in &expected_chars {
-                            if temp_pos < tagged_words.len() && 
-                               tagged_words[temp_pos].text == expected_char.to_string() {
-                                matched_chars.push(expected_char);
-                                temp_pos += 1;
-                            } else {
-                                break;
+                            if temp_pos < tagged_words.len() {
+                                let word_text = tagged_words[temp_pos].text.as_str();
+                                // 等价于 word_text == expected_char.to_string()，但不分配临时字符串
+                                if word_text.len() == expected_char.len_utf8()
+                                    && word_text.starts_with(*expected_char)
+                                {
+                                    matched_chars.push(expected_char);
+                                    temp_pos += 1;
+                                    continue;
+                                }
                             }
+                            break;
                         }
                         
                         if matched_chars.len() == expected_chars.len() {

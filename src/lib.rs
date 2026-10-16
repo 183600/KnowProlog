@@ -679,12 +679,9 @@ impl OxigraphManager {
             relevant_entities.extend(neighbors);
         }
         
-        // 第三步：为相关实体构建Prolog事实
-        for entity_name in &relevant_entities {
-            if let Some(entity_fact) = self.build_entity_fact(&store, entity_name).await? {
-                facts.push(entity_fact);
-            }
-        }
+        // 第三步：为相关实体构建Prolog事实（单次 SPARQL 查询批量获取，避免逐实体 N+1 查询）
+        let relevant_entity_list: Vec<String> = relevant_entities.iter().cloned().collect();
+        facts.extend(self.build_entity_facts(&store, &relevant_entity_list).await?);
         
         // 第四步：添加实体间的关系
         let relations = self.find_relations_between(&store, &relevant_entities).await?;
@@ -1214,31 +1211,51 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
         Ok(neighbors)
     }
 
-    async fn build_entity_fact(&self, store: &Store, entity_name: &str) -> Result<Option<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn build_entity_facts(&self, store: &Store, entity_names: &[String]) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut facts = Vec::new();
+        
+        if entity_names.is_empty() {
+            return Ok(facts);
+        }
+        
+        let name_filter = entity_names.iter()
+            .map(|e| format!("\"{}\"", e))
+            .collect::<Vec<_>>()
+            .join(", ");
+        
         let query = format!(r#"
             PREFIX kg: <http://example.org/kg/>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             
-            SELECT ?type ?prop ?value WHERE {{
-                ?entity kg:name "{}" .
+            SELECT ?name ?type ?prop ?value WHERE {{
+                ?entity kg:name ?name .
                 ?entity rdf:type ?type .
+                FILTER(?name IN ({}))
                 OPTIONAL {{ ?entity ?prop ?value . FILTER(?prop != rdf:type && ?prop != kg:name) }}
             }}
-        "#, entity_name);
+        "#, name_filter);
         
         match Query::parse(&query, None) {
             Ok(query_obj) => {
                 match store.query(query_obj) {
                     Ok(results) => {
                         if let QueryResults::Solutions(solutions) = results {
-                            let mut entity_type = String::new();
-                            let mut properties = HashMap::new();
+                            let mut entity_data: HashMap<String, (String, HashMap<String, String>)> = HashMap::new();
                             
                             for solution in solutions {
                                 if let Ok(solution) = solution {
+                                    let entity_name = match solution.get("name") {
+                                        Some(Term::Literal(lit)) => lit.value().to_string(),
+                                        _ => continue,
+                                    };
+                                    
+                                    let entry = entity_data.entry(entity_name)
+                                        .or_insert_with(|| (String::new(), HashMap::new()));
+                                    
                                     if let Some(type_term) = solution.get("type") {
                                         let type_str = type_term.to_string();
-                                        entity_type = if type_str.contains(BASE_NS) {
+                                        // 与逐实体版本一致：后续类型覆盖先前类型
+                                        entry.0 = if type_str.contains(BASE_NS) {
                                             type_str.replace(BASE_NS, "")
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_lowercase()
@@ -1265,17 +1282,22 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
                                                 .to_string()
                                         };
                                         
-                                        properties.insert(prop_name, value_str);
+                                        entry.1.insert(prop_name, value_str);
                                     }
                                 }
                             }
                             
-                            if !entity_type.is_empty() {
-                                return Ok(Some(PrologFact::Entity {
-                                    name: entity_name.to_string(),
-                                    entity_type,
-                                    properties,
-                                }));
+                            // 按传入顺序输出，跳过没有类型信息的实体（与原逐实体查询行为一致）
+                            for name in entity_names {
+                                if let Some((entity_type, properties)) = entity_data.remove(name) {
+                                    if !entity_type.is_empty() {
+                                        facts.push(PrologFact::Entity {
+                                            name: name.clone(),
+                                            entity_type,
+                                            properties,
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
@@ -1285,7 +1307,7 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
             Err(_) => {}
         }
         
-        Ok(None)
+        Ok(facts)
     }
 
     async fn find_relations_between(&self, store: &Store, entities: &std::collections::HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {

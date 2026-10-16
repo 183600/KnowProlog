@@ -204,8 +204,11 @@ impl SemanticEngine {
             // 计算词汇重叠度
             let overlap_score = self.calculate_word_overlap(&mention_words, &entity_words);
             
-            // 计算描述相似度
-            let desc_similarity = self.calculate_description_similarity(mention, &entity_knowledge.description).await;
+            // 计算描述相似度（mention 分词结果在上方已缓存，避免逐实体重复分词）
+            let desc_words: Vec<_> = self.jieba.cut(&entity_knowledge.description, false).into_iter()
+                .filter(|word| !self.stop_words.contains(*word))
+                .collect();
+            let desc_similarity = self.calculate_word_overlap(&mention_words, &desc_words);
             
             let combined_score = (overlap_score * 0.7 + desc_similarity * 0.3).max(0.0).min(1.0);
             
@@ -375,13 +378,14 @@ impl SemanticEngine {
             let mut max_length = 0;
             let mut best_entity = String::new();
             
-            // 尝试不同长度的子串
+            // 尝试不同长度的子串（增量构建，避免每个长度都重新分配字符串）
+            let mut substring = String::new();
             for j in (i + 1)..=(chars.len().min(i + 10)) {
-                let substring: String = chars[i..j].iter().collect();
+                substring.push(chars[j - 1]);
                 
-                if aliases.contains_key(&substring) && substring.len() > max_length {
+                if aliases.contains_key(substring.as_str()) && substring.len() > max_length {
                     max_length = substring.len();
-                    best_entity = substring;
+                    best_entity = substring.clone();
                     found_entity = true;
                 }
             }
@@ -463,32 +467,31 @@ impl SemanticEngine {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
+        // 双行动态规划：距离对称，将较短字符串作为列方向，内存降为 O(min(n, m))
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
-        let len1 = chars1.len();
-        let len2 = chars2.len();
+        let (rows, cols) = if chars1.len() <= chars2.len() {
+            (chars1, chars2)
+        } else {
+            (chars2, chars1)
+        };
+        let col_count = cols.len();
         
-        let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
+        let mut prev: Vec<usize> = (0..=col_count).collect();
+        let mut curr = vec![0usize; col_count + 1];
         
-        for i in 0..=len1 {
-            dp[i][0] = i;
-        }
-        
-        for j in 0..=len2 {
-            dp[0][j] = j;
-        }
-        
-        for i in 1..=len1 {
-            for j in 1..=len2 {
-                if chars1[i - 1] == chars2[j - 1] {
-                    dp[i][j] = dp[i - 1][j - 1];
-                } else {
-                    dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1]);
-                }
+        for (i, row_char) in rows.iter().enumerate() {
+            curr[0] = i + 1;
+            for j in 1..=col_count {
+                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                curr[j] = (prev[j] + 1)
+                    .min(curr[j - 1] + 1)
+                    .min(prev[j - 1] + cost);
             }
+            std::mem::swap(&mut prev, &mut curr);
         }
         
-        dp[len1][len2]
+        prev[col_count]
     }
 
     fn calculate_word_overlap(&self, words1: &[&str], words2: &[&str]) -> f64 {
@@ -503,18 +506,6 @@ impl SemanticEngine {
         } else {
             intersection as f64 / union as f64
         }
-    }
-
-    async fn calculate_description_similarity(&self, query: &str, description: &str) -> f64 {
-        let query_words: Vec<_> = self.jieba.cut(query, false).into_iter()
-            .filter(|word| !self.stop_words.contains(*word))
-            .collect();
-        
-        let desc_words: Vec<_> = self.jieba.cut(description, false).into_iter()
-            .filter(|word| !self.stop_words.contains(*word))
-            .collect();
-        
-        self.calculate_word_overlap(&query_words, &desc_words)
     }
 
     pub async fn get_simplified_knowledge(&self, entity: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {

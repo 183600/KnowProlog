@@ -79,6 +79,7 @@ pub struct EntityRelationExtractor {
     relation_keywords: Arc<RwLock<HashMap<String, Vec<String>>>>,
     stop_words: HashSet<String>,
     dependency_patterns: Arc<RwLock<Vec<DependencyPattern>>>,
+    regex_cache: Arc<RwLock<HashMap<String, Regex>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,7 @@ impl EntityRelationExtractor {
             relation_keywords: Arc::new(RwLock::new(HashMap::new())),
             stop_words,
             dependency_patterns: Arc::new(RwLock::new(Vec::new())),
+            regex_cache: Arc::new(RwLock::new(HashMap::new())),
         };
         
         extractor.initialize_default_types();
@@ -384,14 +386,13 @@ impl EntityRelationExtractor {
 
     fn split_into_sentences(&self, text: &str) -> Vec<String> {
         // 简单的句子分割，基于标点符号
-        let sentence_endings = ["。", "！", "？", "；", "\n"];
         let mut sentences = Vec::new();
         let mut current_sentence = String::new();
         
         for ch in text.chars() {
             current_sentence.push(ch);
             
-            if sentence_endings.iter().any(|&ending| ending.contains(ch)) {
+            if matches!(ch, '。' | '！' | '？' | '；' | '\n') {
                 let sentence = current_sentence.trim().to_string();
                 if !sentence.is_empty() {
                     sentences.push(sentence);
@@ -426,19 +427,37 @@ impl EntityRelationExtractor {
         Ok(entities)
     }
 
+    /// 编译并缓存正则，避免重复编译相同模式
+    fn get_compiled_regex(&self, pattern: &str) -> Option<Regex> {
+        {
+            let cache = self.regex_cache.read();
+            if let Some(regex) = cache.get(pattern) {
+                return Some(regex.clone());
+            }
+        }
+        
+        match Regex::new(pattern) {
+            Ok(regex) => {
+                self.regex_cache.write().insert(pattern.to_string(), regex.clone());
+                Some(regex)
+            }
+            Err(_) => None,
+        }
+    }
+
     async fn extract_entities_by_type(&self, sentence: &str, type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
         // 正则模式匹配
         for pattern in &entity_type.recognition_patterns {
-            if let Ok(regex) = Regex::new(pattern) {
+            if let Some(regex) = self.get_compiled_regex(pattern) {
                 for mat in regex.find_iter(sentence) {
-                    let entity_text = mat.as_str().to_string();
-                    let confidence = self.calculate_entity_confidence(&entity_text, entity_type, sentence);
+                    let entity_text = mat.as_str();
+                    let confidence = self.calculate_entity_confidence(entity_text, entity_type, sentence);
                     
                     if confidence > 0.5 {
                         entities.push(EntityExtraction {
-                            entity: entity_text.clone(),
+                            entity: entity_text.to_string(),
                             entity_type: type_name.to_string(),
                             confidence,
                             position: EntityPosition {
@@ -466,9 +485,16 @@ impl EntityRelationExtractor {
         let mut entities = Vec::new();
         let words: Vec<_> = self.jieba.cut(sentence, false).into_iter().collect();
         
+        // 预先计算每个词在句子中的字节偏移，避免在原循环中反复重新分词
+        let mut word_offsets = Vec::with_capacity(words.len() + 1);
+        word_offsets.push(0usize);
+        for word in &words {
+            word_offsets.push(word_offsets.last().copied().unwrap_or(0) + word.len());
+        }
+        
         // 查找上下文关键词
         for (i, word) in words.iter().enumerate() {
-            if entity_type.context_keywords.contains(&word.to_string()) {
+            if entity_type.context_keywords.iter().any(|keyword| keyword.as_str() == *word) {
                 // 在关键词附近查找可能的实体
                 let search_range = 3; // 前后3个词的范围
                 let start_idx = if i >= search_range { i - search_range } else { 0 };
@@ -476,52 +502,26 @@ impl EntityRelationExtractor {
                 
                 for j in start_idx..end_idx {
                     if j != i && !self.stop_words.contains(words[j]) {
-                        let entity_text = words[j].to_string();
-                        let confidence = 0.6; // 基于上下文的基础置信度
-                        
-                        // 计算在原句中的位置
-                        let char_position = self.find_word_position(sentence, &entity_text, j);
-                        
-                        if let Some((start, end)) = char_position {
-                            entities.push(EntityExtraction {
-                                entity: entity_text,
-                                entity_type: type_name.to_string(),
-                                confidence,
-                                position: EntityPosition {
-                                    start,
-                                    end,
-                                    sentence_id,
-                                    paragraph_id: 0,
-                                },
-                                attributes: HashMap::new(),
-                                relations: Vec::new(),
-                                canonical_form: None,
-                            });
-                        }
+                        entities.push(EntityExtraction {
+                            entity: words[j].to_string(),
+                            entity_type: type_name.to_string(),
+                            confidence: 0.6, // 基于上下文的基础置信度
+                            position: EntityPosition {
+                                start: word_offsets[j],
+                                end: word_offsets[j + 1],
+                                sentence_id,
+                                paragraph_id: 0,
+                            },
+                            attributes: HashMap::new(),
+                            relations: Vec::new(),
+                            canonical_form: None,
+                        });
                     }
                 }
             }
         }
         
         Ok(entities)
-    }
-
-    fn find_word_position(&self, sentence: &str, _word: &str, word_index: usize) -> Option<(usize, usize)> {
-        let words: Vec<_> = self.jieba.cut(sentence, false).into_iter().collect();
-        
-        if word_index >= words.len() {
-            return None;
-        }
-        
-        let mut char_pos = 0;
-        for (i, w) in words.iter().enumerate() {
-            if i == word_index {
-                return Some((char_pos, char_pos + w.len()));
-            }
-            char_pos += w.len();
-        }
-        
-        None
     }
 
     async fn extract_entities_from_dict(&self, sentence: &str, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
@@ -538,14 +538,15 @@ impl EntityRelationExtractor {
             let mut best_entity = String::new();
             let mut best_types = Vec::new();
             
-            // 尝试不同长度的子串
+            // 尝试不同长度的子串（增量构建，避免每个长度都重新分配字符串）
+            let mut substring = String::new();
             for j in (i + 1)..=(chars.len().min(i + 10)) {
-                let substring: String = chars[i..j].iter().collect();
+                substring.push(chars[j - 1]);
                 
-                if let Some(types) = named_entity_dict.get(&substring) {
+                if let Some(types) = named_entity_dict.get(substring.as_str()) {
                     if substring.len() > max_length {
                         max_length = substring.len();
-                        best_entity = substring;
+                        best_entity = substring.clone();
                         best_types = types.clone();
                         found_entity = true;
                     }
@@ -648,7 +649,7 @@ impl EntityRelationExtractor {
         let extraction_patterns = self.extraction_patterns.read();
         
         for pattern in extraction_patterns.iter() {
-            if let Ok(regex) = Regex::new(&pattern.pattern) {
+            if let Some(regex) = self.get_compiled_regex(&pattern.pattern) {
                 for captures in regex.captures_iter(sentence) {
                     if let (Some(subject), Some(object)) = (captures.get(pattern.subject_group), captures.get(pattern.object_group)) {
                         let subject_text = subject.as_str().trim().to_string();
@@ -722,14 +723,14 @@ impl EntityRelationExtractor {
         Ok(relations)
     }
 
-    fn extract_text_between_entities(&self, sentence: &str, entity1: &EntityExtraction, entity2: &EntityExtraction) -> String {
+    fn extract_text_between_entities<'a>(&self, sentence: &'a str, entity1: &EntityExtraction, entity2: &EntityExtraction) -> &'a str {
         let start = entity1.position.end.min(entity2.position.end);
         let end = entity1.position.start.max(entity2.position.start);
         
         if start < end && end <= sentence.len() {
-            sentence[start..end].to_string()
+            &sentence[start..end]
         } else {
-            String::new()
+            ""
         }
     }
 

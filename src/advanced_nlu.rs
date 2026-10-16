@@ -74,6 +74,7 @@ pub struct AdvancedNLU {
     spatial_patterns: Arc<RwLock<Vec<(Regex, String)>>>,
     number_patterns: Arc<RwLock<Vec<(Regex, String)>>>,
     context_memory: Arc<RwLock<Vec<QueryContext>>>,
+    entity_regex_cache: Arc<RwLock<HashMap<String, Regex>>>,
 }
 
 impl AdvancedNLU {
@@ -89,6 +90,7 @@ impl AdvancedNLU {
             spatial_patterns: Arc::new(RwLock::new(Vec::new())),
             number_patterns: Arc::new(RwLock::new(Vec::new())),
             context_memory: Arc::new(RwLock::new(Vec::new())),
+            entity_regex_cache: Arc::new(RwLock::new(HashMap::new())),
         };
         
         nlu.initialize_default_patterns();
@@ -541,32 +543,31 @@ impl AdvancedNLU {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
+        // 双行动态规划：距离对称，将较短字符串作为列方向，内存降为 O(min(n, m))
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
-        let len1 = chars1.len();
-        let len2 = chars2.len();
+        let (rows, cols) = if chars1.len() <= chars2.len() {
+            (chars1, chars2)
+        } else {
+            (chars2, chars1)
+        };
+        let col_count = cols.len();
         
-        let mut dp = vec![vec![0; len2 + 1]; len1 + 1];
+        let mut prev: Vec<usize> = (0..=col_count).collect();
+        let mut curr = vec![0usize; col_count + 1];
         
-        for i in 0..=len1 {
-            dp[i][0] = i;
-        }
-        
-        for j in 0..=len2 {
-            dp[0][j] = j;
-        }
-        
-        for i in 1..=len1 {
-            for j in 1..=len2 {
-                if chars1[i - 1] == chars2[j - 1] {
-                    dp[i][j] = dp[i - 1][j - 1];
-                } else {
-                    dp[i][j] = 1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1]);
-                }
+        for (i, row_char) in rows.iter().enumerate() {
+            curr[0] = i + 1;
+            for j in 1..=col_count {
+                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                curr[j] = (prev[j] + 1)
+                    .min(curr[j - 1] + 1)
+                    .min(prev[j - 1] + cost);
             }
+            std::mem::swap(&mut prev, &mut curr);
         }
         
-        dp[len1][len2]
+        prev[col_count]
     }
 
     async fn extract_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
@@ -594,23 +595,41 @@ impl AdvancedNLU {
         Ok(entities)
     }
 
+    /// 编译并缓存实体识别正则，避免每次查询重复编译
+    fn get_compiled_entity_regex(&self, pattern: &str) -> Option<Regex> {
+        {
+            let cache = self.entity_regex_cache.read();
+            if let Some(regex) = cache.get(pattern) {
+                return Some(regex.clone());
+            }
+        }
+        
+        match Regex::new(pattern) {
+            Ok(regex) => {
+                self.entity_regex_cache.write().insert(pattern.to_string(), regex.clone());
+                Some(regex)
+            }
+            Err(_) => None,
+        }
+    }
+
     async fn extract_entities_by_type(&self, query: &str, entity_type: &str, pattern_info: &EntityPattern) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
         // 使用正则模式匹配
         for pattern in &pattern_info.patterns {
-            if let Ok(regex) = Regex::new(pattern) {
+            if let Some(regex) = self.get_compiled_entity_regex(pattern) {
                 for mat in regex.find_iter(query) {
-                    let text = mat.as_str().to_string();
-                    let confidence = self.calculate_entity_confidence(&text, pattern_info);
+                    let text = mat.as_str();
+                    let confidence = self.calculate_entity_confidence(text, pattern_info);
                     
                     entities.push(ExtractedEntity {
-                        text: text.clone(),
+                        text: text.to_string(),
                         entity_type: entity_type.to_string(),
                         start_pos: mat.start(),
                         end_pos: mat.end(),
                         confidence,
-                        normalized_value: self.normalize_entity_value(&text, entity_type).await,
+                        normalized_value: self.normalize_entity_value(text, entity_type).await,
                     });
                 }
             }
@@ -666,17 +685,27 @@ impl AdvancedNLU {
     }
 
     fn normalize_number(&self, text: &str) -> Option<String> {
-        // 中文数字转阿拉伯数字
-        let chinese_digits = [
-            ("零", "0"), ("一", "1"), ("二", "2"), ("三", "3"), ("四", "4"),
-            ("五", "5"), ("六", "6"), ("七", "7"), ("八", "8"), ("九", "9"),
-            ("十", "10"), ("百", "100"), ("千", "1000"), ("万", "10000"),
-            ("亿", "100000000"),
-        ];
-        
-        let mut normalized = text.to_string();
-        for (chinese, arabic) in &chinese_digits {
-            normalized = normalized.replace(chinese, arabic);
+        // 中文数字转阿拉伯数字（单次遍历替换，替代反复分配字符串的多次 replace）
+        let mut normalized = String::with_capacity(text.len());
+        for ch in text.chars() {
+            match ch {
+                '零' => normalized.push('0'),
+                '一' => normalized.push('1'),
+                '二' => normalized.push('2'),
+                '三' => normalized.push('3'),
+                '四' => normalized.push('4'),
+                '五' => normalized.push('5'),
+                '六' => normalized.push('6'),
+                '七' => normalized.push('7'),
+                '八' => normalized.push('8'),
+                '九' => normalized.push('9'),
+                '十' => normalized.push_str("10"),
+                '百' => normalized.push_str("100"),
+                '千' => normalized.push_str("1000"),
+                '万' => normalized.push_str("10000"),
+                '亿' => normalized.push_str("100000000"),
+                _ => normalized.push(ch),
+            }
         }
         
         Some(normalized)
@@ -728,14 +757,14 @@ impl AdvancedNLU {
         
         for (regex, _number_type) in number_patterns.iter() {
             for mat in regex.find_iter(query) {
-                let text = mat.as_str().to_string();
+                let text = mat.as_str();
                 entities.push(ExtractedEntity {
-                    text: text.clone(),
+                    text: text.to_string(),
                     entity_type: "NUMBER".to_string(),
                     start_pos: mat.start(),
                     end_pos: mat.end(),
                     confidence: 0.95,
-                    normalized_value: self.normalize_number(&text),
+                    normalized_value: self.normalize_number(text),
                 });
             }
         }

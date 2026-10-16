@@ -1,6 +1,6 @@
 // src/main.rs
 use std::io::{BufRead, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use clap::{Parser, Subcommand};
 
 // 从库（know_prolog）中导入所需的功能
@@ -30,6 +30,9 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 }
+
+// 实体属性查询模式是固定不变的，全局编译一次即可
+static ENTITY_ATTRIBUTE_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 #[derive(Subcommand, Debug)]
 enum Commands {
@@ -405,7 +408,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                 }
                 
                 // 检查是否是实体属性查询（例如："刘德华的年龄" 或 "苹果的颜色"）
-                if let Some(captures) = regex::Regex::new(r"(.+?)的(.+?)$").unwrap().captures(input) {
+                let attribute_re = ENTITY_ATTRIBUTE_RE.get_or_init(|| regex::Regex::new(r"(.+?)的(.+?)$").unwrap());
+                if let Some(captures) = attribute_re.captures(input) {
                     if let (Some(entity_match), Some(attr_match)) = (captures.get(1), captures.get(2)) {
                         let entity_name = entity_match.as_str().trim();
                         let attribute = attr_match.as_str().trim();

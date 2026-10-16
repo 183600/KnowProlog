@@ -342,8 +342,8 @@ impl LocalSemanticAdapter {
         // 第五阶段：计算置信度
         let confidence = self.calculate_complex_confidence(&question_analysis, &intent_result, &entities).await?;
         
-        // 提取实体名称字符串
-        let entity_names: Vec<String> = entities.iter().map(|e| e.entity.clone()).collect();
+        // 提取实体名称字符串（直接移动，避免额外克隆）
+        let entity_names: Vec<String> = entities.into_iter().map(|e| e.entity).collect();
         
         // 第六阶段：生成查询模式
         let query_patterns = self.generate_complex_query_patterns(&query_type, &entity_names).await?;
@@ -361,7 +361,7 @@ impl LocalSemanticAdapter {
             confidence,
             question_analysis,
             intent_result,
-            entities: entities.into_iter().map(|e| e.entity).collect(),
+            entities: entity_names,
             relations: relations.into_iter().map(|r| format!("{}-{}-{}", r.subject, r.predicate, r.object)).collect(),
             query_patterns,
             suggested_answer,

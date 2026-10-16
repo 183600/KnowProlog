@@ -130,7 +130,7 @@ impl NLUEngine {
 
     fn match_pattern(&self, _input: &str, tagged_words: &[TaggedWord], pattern: &str, slot_configs: &[SlotConfig]) -> Option<(f64, Vec<(String, String)>)> {
         let pattern_words: Vec<&str> = pattern.split_whitespace().collect();
-        let input_words: Vec<String> = tagged_words.iter().map(|w| w.text.clone()).collect();
+        let input_words: Vec<&str> = tagged_words.iter().map(|w| w.text.as_str()).collect();
         
         let mut matched_count = 0;
         let total_count = pattern_words.len();
