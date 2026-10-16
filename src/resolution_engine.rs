@@ -326,6 +326,9 @@ impl ResolutionEngine {
                 if fact.arity() != applied.arity() {
                     continue;
                 }
+                if !may_unify_quick(&applied, fact, subst) {
+                    continue;
+                }
                 let mut unified = subst.clone();
                 if unify_atoms(&applied, fact, &mut unified) {
                     let ground = apply_atom(&unified, &applied);
@@ -338,8 +341,8 @@ impl ResolutionEngine {
         }
 
         // 2) 与规则头归结：先对子句做变量换名，再合一，然后递归证明规则体
-        if let Some(indices) = self.rules_by_head.get(&applied.predicate).cloned() {
-            for idx in indices {
+        if let Some(indices) = self.rules_by_head.get(&applied.predicate) {
+            for &idx in indices {
                 if *budget == 0 {
                     break;
                 }
@@ -413,6 +416,7 @@ impl ResolutionEngine {
     /// 前向半朴素饱和：从事实出发反复应用子句，推导新基事实（含前提来源）
     pub fn forward_chain(&self, max_rounds: usize, max_new_facts: usize) -> Vec<DerivedFact> {
         let mut known: HashSet<Atom> = self.facts.clone();
+        let mut known_by_pred: HashMap<String, Vec<Atom>> = self.facts_by_pred.clone();
         let mut confidence_of: HashMap<Atom, f64> = HashMap::new();
         for fact in &self.facts {
             confidence_of.insert(fact.clone(), 1.0);
@@ -422,16 +426,17 @@ impl ResolutionEngine {
 
         for round in 1..=max_rounds.max(1) {
             let mut new_this_round: Vec<DerivedFact> = Vec::new();
+            let mut new_this_round_atoms: HashSet<Atom> = HashSet::new();
             for clause in &self.clauses {
                 let tag = counter;
                 counter += 1;
                 let fresh = freshen_clause(clause, tag);
-                for (subst, premises) in self.match_body(&fresh.body, &known) {
+                for (subst, premises) in self.match_body(&fresh.body, &known_by_pred) {
                     let head = apply_atom(&subst, &fresh.head);
                     if !head.is_ground() || known.contains(&head) {
                         continue;
                     }
-                    if new_this_round.iter().any(|item| item.atom == head) {
+                    if !new_this_round_atoms.insert(head.clone()) {
                         continue;
                     }
                     let premise_confidence = premises
@@ -455,29 +460,44 @@ impl ResolutionEngine {
             }
             for item in &new_this_round {
                 known.insert(item.atom.clone());
+                known_by_pred
+                    .entry(item.atom.predicate.clone())
+                    .or_default()
+                    .push(item.atom.clone());
                 confidence_of.insert(item.atom.clone(), item.confidence);
             }
-            derived.extend(new_this_round.clone());
-            if new_this_round.is_empty() || derived.len() >= max_new_facts {
+            derived.append(&mut new_this_round);
+            if new_this_round_atoms.is_empty() || derived.len() >= max_new_facts {
                 break;
             }
         }
         derived
     }
 
-    fn match_body(&self, goals: &[Atom], known: &HashSet<Atom>) -> Vec<(Substitution, Vec<Atom>)> {
+    fn match_body(
+        &self,
+        goals: &[Atom],
+        known_by_pred: &HashMap<String, Vec<Atom>>,
+    ) -> Vec<(Substitution, Vec<Atom>)> {
         let mut states: Vec<(Substitution, Vec<Atom>)> = vec![(Substitution::new(), Vec::new())];
         for goal in goals {
             let mut next: Vec<(Substitution, Vec<Atom>)> = Vec::new();
             for (subst, premises) in &states {
                 let applied = apply_atom(subst, goal);
-                for fact in known {
-                    if fact.predicate != applied.predicate || fact.arity() != applied.arity() {
+                let Some(facts) = known_by_pred.get(&applied.predicate) else {
+                    continue;
+                };
+                for fact in facts {
+                    if fact.arity() != applied.arity() {
+                        continue;
+                    }
+                    if !may_unify_quick(&applied, fact, subst) {
                         continue;
                     }
                     let mut unified = subst.clone();
                     if unify_atoms(&applied, fact, &mut unified) {
-                        let mut chain = premises.clone();
+                        let mut chain = Vec::with_capacity(premises.len() + 1);
+                        chain.extend_from_slice(premises);
                         chain.push(fact.clone());
                         next.push((unified, chain));
                         if next.len() >= 4_000 {
@@ -496,6 +516,21 @@ impl ResolutionEngine {
         }
         states
     }
+}
+
+/// 快速预检查：若所有已解析的词项对都是互不相同的常量，则合一必然失败。
+/// 用于在克隆全部替换之前尽早跳过不匹配的事实/规则头。
+fn may_unify_quick(pattern: &Atom, other: &Atom, subst: &Substitution) -> bool {
+    for (left, right) in pattern.terms.iter().zip(other.terms.iter()) {
+        let resolved_left = resolve_term(left, subst);
+        let resolved_right = resolve_term(right, subst);
+        if let (Term::Const(a), Term::Const(b)) = (&resolved_left, &resolved_right) {
+            if a != b {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn resolve_term(term: &Term, subst: &Substitution) -> Term {

@@ -47,6 +47,14 @@ pub enum PatternElement {
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     let words = jieba().cut(text, false); // 执行分词，false表示精准模式
 
+    // 常见人名集合只构建一次，避免在合并循环中反复线性查找
+    let full_names: std::collections::HashSet<&str> = config
+        .name_patterns
+        .full_names
+        .iter()
+        .map(String::as_str)
+        .collect();
+
     // 结巴分词可能把配置中的常见人名（如"张三"）切分成多个单字，
     // 这里按最长匹配合并相邻词，使 full_names 中的人名能被正确识别
     let mut merged_words: Vec<String> = Vec::with_capacity(words.len());
@@ -58,7 +66,7 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
         let max_end = (i + 4).min(words.len()); // 人名一般不超过4个分词
         for end in i + 1..max_end {
             candidate.push_str(words[end]);
-            if config.name_patterns.full_names.contains(&candidate) {
+            if full_names.contains(candidate.as_str()) {
                 matched = Some((candidate.clone(), end + 1));
             }
         }
@@ -72,20 +80,19 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     }
 
     let mut tagged_words = Vec::with_capacity(merged_words.len());
-    for word in &merged_words {
-        let word = word.as_str();
+    for word in merged_words {
         // 确定词性
         let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
             "m".to_string() // m表示数词
-        } else if is_name(word, &config.name_patterns) { // 判断是否为人名
+        } else if is_name(&word, &config.name_patterns, &full_names) { // 判断是否为人名
             "nr".to_string() // nr表示人名
         } else {
             // 从词性字典查找，找不到则标记为unknown
-            config.pos_dict.get(word).cloned().unwrap_or_else(|| "unknown".to_string())
+            config.pos_dict.get(&word).cloned().unwrap_or_else(|| "unknown".to_string())
         };
         
         tagged_words.push(TaggedWord {
-            text: word.to_string(),
+            text: word,
             pos,
         });
     }
@@ -109,10 +116,14 @@ pub fn normalize_words(
 
 // 判断一个词是否为人名
 // 注意：crate::NamePatterns 引用的是 lib.rs 中的 NamePatterns
-fn is_name(word: &str, patterns: &crate::NamePatterns) -> bool {
+fn is_name(
+    word: &str,
+    patterns: &crate::NamePatterns,
+    full_names: &std::collections::HashSet<&str>,
+) -> bool {
     patterns.prefixes.iter().any(|p| word.starts_with(p)) || // 以姓氏前缀开头
     patterns.suffixes.iter().any(|s| word.ends_with(s)) || // 以名字后缀结尾
-    patterns.full_names.iter().any(|n| n == word) || // 在常见人名列表中
+    full_names.contains(word) || // 在常见人名列表中
     patterns.profession_suffix.iter().any(|ps| word.ends_with(ps) && word.len() > ps.len()) // 以职业后缀结尾且不只是后缀本身
 }
 

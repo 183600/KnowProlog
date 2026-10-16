@@ -160,16 +160,32 @@ impl EntityLinker {
             }
             let profile = self.profiles.get_mut(name).expect("实体刚注册");
             profile.degree += 1;
-            self.neighbors
-                .entry(name.to_string())
-                .or_default()
-                .insert(other.to_string());
-            let bucket = if name == subject {
-                self.out_predicates.entry(name.to_string()).or_default()
+            match self.neighbors.get_mut(name) {
+                Some(neighbors) => {
+                    neighbors.insert(other.to_string());
+                }
+                None => {
+                    self.neighbors
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(other.to_string());
+                }
+            }
+            let predicates = if name == subject {
+                &mut self.out_predicates
             } else {
-                self.in_predicates.entry(name.to_string()).or_default()
+                &mut self.in_predicates
             };
-            *bucket.entry(predicate.to_string()).or_insert(0) += 1;
+            if !predicates.contains_key(name) {
+                predicates.insert(name.to_string(), HashMap::new());
+            }
+            let bucket = predicates.get_mut(name).expect("刚插入");
+            match bucket.get_mut(predicate) {
+                Some(count) => *count += 1,
+                None => {
+                    bucket.insert(predicate.to_string(), 1);
+                }
+            }
         }
     }
 
@@ -228,18 +244,27 @@ impl EntityLinker {
 
     fn exact_mentions(&self, text: &str) -> Vec<LinkedMention> {
         let chars: Vec<char> = text.chars().collect();
+        // 按首字符分桶，保持 surface_order 的（长度降序、字典序升序）相对顺序
+        let mut by_first: HashMap<char, Vec<&(String, Vec<char>)>> = HashMap::new();
+        for entry in &self.surface_order {
+            if let Some(first) = entry.1.first() {
+                by_first.entry(*first).or_default().push(entry);
+            }
+        }
         let mut mentions: Vec<LinkedMention> = Vec::new();
         let mut i = 0;
         while i < chars.len() {
             let mut matched: Option<(&str, usize)> = None;
-            for (surface, surface_chars) in &self.surface_order {
-                let len = surface_chars.len();
-                if len == 0 || i + len > chars.len() {
-                    continue;
-                }
-                if chars[i..i + len] == surface_chars[..] {
-                    matched = Some((surface.as_str(), len));
-                    break;
+            if let Some(candidates) = by_first.get(&chars[i]) {
+                for (surface, surface_chars) in candidates {
+                    let len = surface_chars.len();
+                    if i + len > chars.len() {
+                        continue;
+                    }
+                    if chars[i..i + len] == surface_chars[..] {
+                        matched = Some((surface.as_str(), len));
+                        break;
+                    }
                 }
             }
             if let Some((surface, len)) = matched {

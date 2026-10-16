@@ -138,7 +138,11 @@ impl AssociationMiner {
         if entity.trim().is_empty() || item.trim().is_empty() {
             return false;
         }
-        let basket = self.baskets.entry(entity.to_string()).or_default();
+        // 已存在的篮子直接复用，避免为 entry 键重复分配 String
+        let basket = match self.baskets.get_mut(entity) {
+            Some(basket) => basket,
+            None => self.baskets.entry(entity.to_string()).or_default(),
+        };
         if !basket.insert(item.clone()) {
             return false;
         }
@@ -180,6 +184,17 @@ impl AssociationMiner {
             .collect();
         items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
+        // 倒排索引：物品 → 包含该物品的实体集合，使共现计数无需反复扫描全部篮子
+        let mut item_entities: HashMap<&str, HashSet<&str>> = HashMap::with_capacity(items.len());
+        for (entity, basket) in &self.baskets {
+            for item in basket {
+                item_entities
+                    .entry(item.as_str())
+                    .or_default()
+                    .insert(entity.as_str());
+            }
+        }
+
         // 单前件规则 A ⇒ B
         for (index, (a, a_count)) in items.iter().enumerate() {
             if *a_count < min_count {
@@ -189,9 +204,14 @@ impl AssociationMiner {
                 if index == other {
                     continue;
                 }
-                if let Some(rule) =
-                    self.build_rule(vec![a.clone()], a.clone(), b, total, min_count)
-                {
+                if let Some(rule) = self.build_rule(
+                    vec![a.clone()],
+                    a.clone(),
+                    b,
+                    total,
+                    min_count,
+                    &item_entities,
+                ) {
                     self.rules.push(rule);
                 }
             }
@@ -208,11 +228,13 @@ impl AssociationMiner {
             for j in (i + 1)..top.len() {
                 let first = &top[i].0;
                 let second = &top[j].0;
-                let pair_count = self
-                    .baskets
-                    .values()
-                    .filter(|basket| basket.contains(first) && basket.contains(second))
-                    .count();
+                let pair_count = match (
+                    item_entities.get(first.as_str()),
+                    item_entities.get(second.as_str()),
+                ) {
+                    (Some(x), Some(y)) => intersection_count(x, y),
+                    _ => 0,
+                };
                 if pair_count < min_count {
                     continue;
                 }
@@ -228,6 +250,7 @@ impl AssociationMiner {
                         b,
                         total,
                         min_count,
+                        &item_entities,
                     ) {
                         self.rules.push(rule);
                     }
@@ -261,6 +284,7 @@ impl AssociationMiner {
         consequent: &str,
         total: usize,
         min_count: usize,
+        item_entities: &HashMap<&str, HashSet<&str>>,
     ) -> Option<AssociationRule> {
         let consequent_count = self.item_count(consequent);
         if consequent_count < min_count {
@@ -269,27 +293,32 @@ impl AssociationMiner {
         let (antecedent_support, support) = if antecedent.len() == 1 {
             let a = &antecedent[0];
             let a_count = self.item_count(a);
-            let support = self
-                .baskets
-                .values()
-                .filter(|basket| basket.contains(a) && basket.contains(consequent))
-                .count();
+            let support = match (
+                item_entities.get(a.as_str()),
+                item_entities.get(consequent),
+            ) {
+                (Some(x), Some(y)) => intersection_count(x, y),
+                _ => 0,
+            };
             (a_count, support)
         } else {
             let a = &antecedent[0];
             let b = &antecedent[1];
-            let a_count = self
-                .baskets
-                .values()
-                .filter(|basket| basket.contains(a) && basket.contains(b))
-                .count();
-            let support = self
-                .baskets
-                .values()
-                .filter(|basket| {
-                    basket.contains(a) && basket.contains(b) && basket.contains(consequent)
-                })
-                .count();
+            let a_count = match (
+                item_entities.get(a.as_str()),
+                item_entities.get(b.as_str()),
+            ) {
+                (Some(x), Some(y)) => intersection_count(x, y),
+                _ => 0,
+            };
+            let support = match (
+                item_entities.get(a.as_str()),
+                item_entities.get(b.as_str()),
+                item_entities.get(consequent),
+            ) {
+                (Some(x), Some(y), Some(z)) => triple_intersection_count(x, y, z),
+                _ => 0,
+            };
             (a_count, support)
         };
         if support < min_count || antecedent_support < min_count || antecedent_support == 0 {
@@ -398,6 +427,27 @@ impl AssociationMiner {
             })
             .collect()
     }
+}
+
+fn intersection_count(a: &HashSet<&str>, b: &HashSet<&str>) -> usize {
+    let (small, large) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    small.iter().filter(|item| large.contains(*item)).count()
+}
+
+fn triple_intersection_count(
+    a: &HashSet<&str>,
+    b: &HashSet<&str>,
+    c: &HashSet<&str>,
+) -> usize {
+    let sets = [a, b, c];
+    let smallest = sets
+        .iter()
+        .min_by_key(|set| set.len())
+        .expect("non-empty sets array");
+    smallest
+        .iter()
+        .filter(|item| sets.iter().all(|set| set.contains(*item)))
+        .count()
 }
 
 fn item_atom(item: &str, has_predicate: &str, type_predicate: &str) -> Atom {

@@ -1338,32 +1338,6 @@ impl OxigraphManager {
         Ok(entities)
 }
 
-pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String> {
-    let mut entities = Vec::new();
-    
-    let tagged_words = preprocess(query, &config.nlp);
-    
-    for word in &tagged_words {
-        if word.pos == "nr" || word.pos == "ns" || word.pos == "nz" || 
-           word.pos == "n" || word.pos == "nt" {
-            entities.push(word.text.clone());
-        }
-    }
-    
-    if let Some(synonyms_config) = &config.synonyms {
-        for entity in entities.iter_mut() {
-            if let Some(normalized) = synonyms_config.mappings.get(entity) {
-                *entity = normalized.clone();
-            }
-        }
-    }
-    
-    // 去重时保留首次出现顺序
-    let mut seen = std::collections::HashSet::new();
-    entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
-    entities
-}
-
     async fn find_neighbors(&self, store: &Store, entities: &[String]) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let mut neighbors = Vec::new();
         

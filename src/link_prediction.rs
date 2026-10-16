@@ -90,6 +90,14 @@ pub struct Prediction {
     pub evidence: Vec<Triple>,
 }
 
+/// 候选项：延迟证据构造，排序截断后才还原完整证据链
+struct Candidate {
+    triple: Triple,
+    rule_index: usize,
+    confidence: f64,
+    anchor: String,
+}
+
 pub struct LinkPredictor {
     triples: Vec<Triple>,
     known: HashSet<Triple>,
@@ -411,19 +419,18 @@ impl LinkPredictor {
         self.rules = rules;
     }
 
-    fn try_prediction<F, E>(
+    fn try_prediction<F>(
         &self,
         seen: &mut HashSet<Triple>,
         generated: &mut usize,
         rule_index: usize,
         confidence: f64,
         triple: Triple,
+        anchor: &str,
         matches: F,
-        evidence: E,
-    ) -> Option<Prediction>
+    ) -> Option<Candidate>
     where
         F: FnOnce(&Triple) -> bool,
-        E: FnOnce() -> Vec<Triple>,
     {
         if self.known.contains(&triple) || !seen.insert(triple.clone()) {
             return None;
@@ -432,15 +439,58 @@ impl LinkPredictor {
         if !matches(&triple) {
             return None;
         }
-        Some(Prediction {
+        Some(Candidate {
             triple,
             rule_index,
             confidence,
-            evidence: evidence(),
+            anchor: anchor.to_string(),
         })
     }
 
-    fn enumerate_predictions_matching<F>(&self, cap: usize, matches: F) -> Vec<Prediction>
+    /// 用规则与候选自带的锚点变量还原证据链（排序截断后才调用）
+    fn materialize_prediction(&self, candidate: Candidate) -> Prediction {
+        let triple = candidate.triple;
+        let evidence = match self.rules.get(candidate.rule_index) {
+            Some(rule) => match rule.template {
+                RuleTemplate::Compose => {
+                    let p1 = rule.body1();
+                    let p2 = rule.body2().unwrap_or("");
+                    vec![
+                        Triple::new(&triple.subject, p1, &candidate.anchor),
+                        Triple::new(&candidate.anchor, p2, &triple.object),
+                    ]
+                }
+                RuleTemplate::Inverse => {
+                    vec![Triple::new(&triple.object, rule.body1(), &triple.subject)]
+                }
+                RuleTemplate::CommonNeighbor => {
+                    let p1 = rule.body1();
+                    let p2 = rule.body2().unwrap_or("");
+                    vec![
+                        Triple::new(&triple.subject, p1, &candidate.anchor),
+                        Triple::new(&triple.object, p2, &candidate.anchor),
+                    ]
+                }
+                RuleTemplate::CommonObject => {
+                    let p1 = rule.body1();
+                    let p2 = rule.body2().unwrap_or("");
+                    vec![
+                        Triple::new(&candidate.anchor, p1, &triple.subject),
+                        Triple::new(&candidate.anchor, p2, &triple.object),
+                    ]
+                }
+            },
+            None => Vec::new(),
+        };
+        Prediction {
+            triple,
+            rule_index: candidate.rule_index,
+            confidence: candidate.confidence,
+            evidence,
+        }
+    }
+
+    fn enumerate_predictions_matching<F>(&self, cap: usize, matches: F) -> Vec<Candidate>
     where
         F: Fn(&Triple) -> bool,
     {
@@ -469,11 +519,8 @@ impl LinkPredictor {
                                         idx,
                                         rule.confidence,
                                         triple,
+                                        y,
                                         &matches,
-                                        || vec![
-                                            Triple::new(x, p1, y),
-                                            Triple::new(y, p2, z),
-                                        ],
                                     ) {
                                         out.push(pred);
                                     }
@@ -497,8 +544,8 @@ impl LinkPredictor {
                                 idx,
                                 rule.confidence,
                                 triple,
+                                "",
                                 &matches,
-                                || vec![Triple::new(s, p1, o)],
                             ) {
                                 out.push(pred);
                             }
@@ -527,11 +574,8 @@ impl LinkPredictor {
                                         idx,
                                         rule.confidence,
                                         triple,
+                                        z,
                                         &matches,
-                                        || vec![
-                                            Triple::new(x, p1, z),
-                                            Triple::new(y, p2, z),
-                                        ],
                                     ) {
                                         out.push(pred);
                                     }
@@ -562,11 +606,8 @@ impl LinkPredictor {
                                         idx,
                                         rule.confidence,
                                         triple,
+                                        z,
                                         &matches,
-                                        || vec![
-                                            Triple::new(z, p1, x),
-                                            Triple::new(z, p2, y),
-                                        ],
                                     ) {
                                         out.push(pred);
                                     }
@@ -584,12 +625,12 @@ impl LinkPredictor {
         out
     }
 
-    fn enumerate_predictions(&self, cap: usize) -> Vec<Prediction> {
+    fn enumerate_predictions(&self, cap: usize) -> Vec<Candidate> {
         self.enumerate_predictions_matching(cap, |_| true)
     }
 
-    fn sort_predictions(predictions: &mut Vec<Prediction>) {
-        predictions.sort_by(|a, b| {
+    fn sort_candidates(candidates: &mut Vec<Candidate>) {
+        candidates.sort_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
                 .unwrap_or(Ordering::Equal)
@@ -600,10 +641,13 @@ impl LinkPredictor {
 
     pub fn predict_missing(&self, limit: usize) -> Vec<Prediction> {
         let cap = self.max_enumeration.max(limit.saturating_mul(20));
-        let mut predictions = self.enumerate_predictions(cap);
-        Self::sort_predictions(&mut predictions);
-        predictions.truncate(limit);
-        predictions
+        let mut candidates = self.enumerate_predictions(cap);
+        Self::sort_candidates(&mut candidates);
+        candidates.truncate(limit);
+        candidates
+            .into_iter()
+            .map(|candidate| self.materialize_prediction(candidate))
+            .collect()
     }
 
     pub fn predict_for_entity(
@@ -612,13 +656,17 @@ impl LinkPredictor {
         predicate: Option<&str>,
         limit: usize,
     ) -> Vec<Prediction> {
-        let mut predictions = self.enumerate_predictions_matching(self.max_enumeration, |triple| {
-            (triple.subject == entity || triple.object == entity)
-                && predicate.map_or(true, |q| triple.predicate == q)
-        });
-        Self::sort_predictions(&mut predictions);
-        predictions.truncate(limit);
-        predictions
+        let mut candidates =
+            self.enumerate_predictions_matching(self.max_enumeration, |triple| {
+                (triple.subject == entity || triple.object == entity)
+                    && predicate.map_or(true, |q| triple.predicate == q)
+            });
+        Self::sort_candidates(&mut candidates);
+        candidates.truncate(limit);
+        candidates
+            .into_iter()
+            .map(|candidate| self.materialize_prediction(candidate))
+            .collect()
     }
 
     pub fn explain(&self, prediction: &Prediction) -> String {

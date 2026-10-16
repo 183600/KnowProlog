@@ -456,12 +456,19 @@ impl EntityRelationExtractor {
     async fn extract_entities_by_type(&self, sentence: &str, words: &[&str], word_offsets: &[usize], type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
+        // 上下文关键词命中数与匹配文本无关，每种类型对整句只统计一次
+        let keyword_hits = entity_type
+            .context_keywords
+            .iter()
+            .filter(|keyword| sentence.contains(keyword.as_str()))
+            .count();
+
         // 正则模式匹配
         for pattern in &entity_type.recognition_patterns {
             if let Some(regex) = self.get_compiled_regex(pattern) {
                 for mat in regex.find_iter(sentence) {
                     let entity_text = mat.as_str();
-                    let confidence = self.calculate_entity_confidence(entity_text, entity_type, sentence);
+                    let confidence = self.calculate_entity_confidence(entity_text, keyword_hits);
                     
                     if confidence > 0.5 {
                         entities.push(EntityExtraction {
@@ -492,16 +499,24 @@ impl EntityRelationExtractor {
     async fn extract_by_context_keywords(&self, words: &[&str], word_offsets: &[usize], type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
+        // 关键词集合与已产出的词索引，避免重复扫描与重复产出
+        let keyword_set: HashSet<&str> = entity_type
+            .context_keywords
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut emitted: HashSet<usize> = HashSet::new();
+
         // 查找上下文关键词
         for (i, word) in words.iter().enumerate() {
-            if entity_type.context_keywords.iter().any(|keyword| keyword.as_str() == *word) {
+            if keyword_set.contains(*word) {
                 // 在关键词附近查找可能的实体
                 let search_range = 3; // 前后3个词的范围
                 let start_idx = if i >= search_range { i - search_range } else { 0 };
                 let end_idx = (i + search_range + 1).min(words.len());
                 
                 for j in start_idx..end_idx {
-                    if j != i && !self.stop_words.contains(words[j]) {
+                    if j != i && !self.stop_words.contains(words[j]) && emitted.insert(j) {
                         entities.push(EntityExtraction {
                             entity: words[j].to_string(),
                             entity_type: type_name.to_string(),
@@ -588,16 +603,12 @@ impl EntityRelationExtractor {
         Ok(entities)
     }
 
-    fn calculate_entity_confidence(&self, entity_text: &str, entity_type: &EntityType, sentence: &str) -> f64 {
+    fn calculate_entity_confidence(&self, entity_text: &str, keyword_hits: usize) -> f64 {
         let mut confidence: f64 = 0.5;
-        
-        // 检查是否包含类型关键词
-        for keyword in &entity_type.context_keywords {
-            if sentence.contains(keyword) {
-                confidence += 0.2;
-            }
-        }
-        
+
+        // 类型关键词命中数由调用方按句预计算
+        confidence += 0.2 * keyword_hits as f64;
+
         // 检查实体文本长度和格式
         if entity_text.len() >= 2 && entity_text.len() <= 10 {
             confidence += 0.1;
@@ -627,7 +638,8 @@ impl EntityRelationExtractor {
                         j = i + 1;
                     }
                 } else {
-                    j += 1;
+                    // 已按起点排序：后续实体的起点更靠后，不会与 i 再重叠
+                    break;
                 }
             }
             i += 1;
@@ -709,31 +721,32 @@ impl EntityRelationExtractor {
                 let text_between = self.extract_text_between_entities(sentence, entity1, entity2);
                 
                 for (relation_type, keywords) in relation_keywords.iter() {
-                    for keyword in keywords {
-                        if text_between.contains(keyword) {
-                            let confidence = 0.7;
-                            
-                            relations.push(KnowledgeTriple {
-                                subject: entity1.entity.clone(),
-                                predicate: relation_type.clone(),
-                                object: entity2.entity.clone(),
-                                confidence,
-                                source_text: sentence.to_string(),
-                                extraction_method: "entity_pair_based".to_string(),
-                            });
-                            
-                            // 如果是双向关系，也添加反向关系
-                            if self.is_bidirectional_relation(relation_type) {
-                                relations.push(KnowledgeTriple {
-                                    subject: entity2.entity.clone(),
-                                    predicate: relation_type.clone(),
-                                    object: entity1.entity.clone(),
-                                    confidence,
-                                    source_text: sentence.to_string(),
-                                    extraction_method: "entity_pair_based_reverse".to_string(),
-                                });
-                            }
-                        }
+                    // 同一实体对+关系类型只产出一次（多个关键词命中时，重复三元组最终也会被去重）
+                    if !keywords.iter().any(|keyword| text_between.contains(keyword)) {
+                        continue;
+                    }
+                    let confidence = 0.7;
+                    let source_text = sentence.to_string();
+
+                    relations.push(KnowledgeTriple {
+                        subject: entity1.entity.clone(),
+                        predicate: relation_type.clone(),
+                        object: entity2.entity.clone(),
+                        confidence,
+                        source_text: source_text.clone(),
+                        extraction_method: "entity_pair_based".to_string(),
+                    });
+
+                    // 如果是双向关系，也添加反向关系
+                    if self.is_bidirectional_relation(relation_type) {
+                        relations.push(KnowledgeTriple {
+                            subject: entity2.entity.clone(),
+                            predicate: relation_type.clone(),
+                            object: entity1.entity.clone(),
+                            confidence,
+                            source_text,
+                            extraction_method: "entity_pair_based_reverse".to_string(),
+                        });
                     }
                 }
             }

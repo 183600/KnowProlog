@@ -233,24 +233,54 @@ impl SymbolicGenerator {
         self.known_entities.insert(object.to_string());
 
         // triples 已按 (s,p,o) 去重，此处到达即保证是新事实，无需再线性扫描去重
-        let subjects = self.by_subject.entry(subject.to_string()).or_default();
-        let objects = subjects.entry(predicate.to_string()).or_default();
-        objects.push(object.to_string());
-        let object_bucket = self.by_object.entry(object.to_string()).or_default();
-        let subjects_rev = object_bucket.entry(predicate.to_string()).or_default();
-        subjects_rev.push(subject.to_string());
+        let subjects = match self.by_subject.get_mut(subject) {
+            Some(subjects) => subjects,
+            None => self.by_subject.entry(subject.to_string()).or_default(),
+        };
+        match subjects.get_mut(predicate) {
+            Some(objects) => objects.push(object.to_string()),
+            None => subjects
+                .entry(predicate.to_string())
+                .or_default()
+                .push(object.to_string()),
+        }
+        let object_bucket = match self.by_object.get_mut(object) {
+            Some(bucket) => bucket,
+            None => self.by_object.entry(object.to_string()).or_default(),
+        };
+        match object_bucket.get_mut(predicate) {
+            Some(subjects_rev) => subjects_rev.push(subject.to_string()),
+            None => object_bucket
+                .entry(predicate.to_string())
+                .or_default()
+                .push(subject.to_string()),
+        }
 
-        *self.predicate_totals.entry(predicate.to_string()).or_insert(0) += 1;
-        *self
-            .entity_predicate_counts
-            .entry(subject.to_string())
-            .or_default()
-            .entry(predicate.to_string())
-            .or_insert(0) += 1;
-        *self
-            .entity_relation_total
-            .entry(subject.to_string())
-            .or_insert(0) += 1;
+        match self.predicate_totals.get_mut(predicate) {
+            Some(total) => *total += 1,
+            None => {
+                self.predicate_totals.insert(predicate.to_string(), 1);
+            }
+        }
+        let predicate_counts = match self.entity_predicate_counts.get_mut(subject) {
+            Some(counts) => counts,
+            None => self
+                .entity_predicate_counts
+                .entry(subject.to_string())
+                .or_default(),
+        };
+        match predicate_counts.get_mut(predicate) {
+            Some(count) => *count += 1,
+            None => {
+                predicate_counts.insert(predicate.to_string(), 1);
+            }
+        }
+        match self.entity_relation_total.get_mut(subject) {
+            Some(total) => *total += 1,
+            None => {
+                self.entity_relation_total.insert(subject.to_string(), 1);
+            }
+        }
         self.total_relations += 1;
 
         self.register_predicate_surface(predicate);
@@ -482,6 +512,11 @@ impl SymbolicGenerator {
             .unwrap_or(1)
             .max(1);
         let mut items: Vec<(&String, &usize)> = predicate_counts.iter().collect();
+        // 只取前 3 名：部分选择代替全量排序
+        if items.len() > 3 {
+            items.select_nth_unstable_by(2, |a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            items.truncate(3);
+        }
         items.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
         let mut predictions: Vec<CompletionPrediction> = Vec::new();
         for (predicate, count) in items.into_iter().take(3) {
@@ -521,7 +556,8 @@ impl SymbolicGenerator {
         for (predicate, count) in items.into_iter() {
             let score = *count as f64 / type_total as f64;
             if score < self.completion_min_score {
-                continue;
+                // 已按计数降序，后续得分只会更低
+                break;
             }
             let Some((prototype, objects)) = self.prototype_for(etype, entity, predicate) else {
                 continue;
@@ -618,7 +654,8 @@ impl SymbolicGenerator {
         for (predicate, count) in items.into_iter() {
             let score = *count as f64 / self.total_relations as f64;
             if score < self.completion_min_score {
-                continue;
+                // 已按计数降序，后续得分只会更低
+                break;
             }
             let Some((prototype, objects)) = self.global_prototype(predicate) else {
                 continue;
@@ -648,21 +685,20 @@ impl SymbolicGenerator {
     }
 
     fn global_prototype(&self, predicate: &str) -> Option<(String, Vec<String>)> {
-        let mut subjects: Vec<&String> = self
+        // 只需字典序最小的主体，无需收集后整体排序
+        let prototype = self
             .entity_predicate_counts
             .iter()
             .filter(|(_, m)| m.contains_key(predicate))
             .map(|(entity, _)| entity)
-            .collect();
-        subjects.sort();
-        let prototype = subjects.first()?;
+            .min()?;
         let objects = self
             .by_subject
-            .get(*prototype)
+            .get(prototype.as_str())
             .and_then(|m| m.get(predicate))
             .cloned()
             .unwrap_or_default();
-        Some(((*prototype).clone(), objects))
+        Some((prototype.clone(), objects))
     }
 }
 

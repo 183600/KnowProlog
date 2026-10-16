@@ -346,11 +346,10 @@ impl SymbolicReasoner {
                         .collect();
                     self.generator
                         .observe_entity(name, entity_type, &property_pairs);
+                    let property_keys: Vec<String> = properties.keys().cloned().collect();
                     if self.config.enable_semantic_embedding {
-                        let property_keys: Vec<String> = properties.keys().cloned().collect();
                         self.embedding.observe_entity(name, entity_type, &property_keys);
                     }
-                    let property_keys: Vec<String> = properties.keys().cloned().collect();
                     association_changed |=
                         self.associations
                             .observe_entity(name, entity_type, &property_keys);
@@ -1127,6 +1126,8 @@ impl SymbolicReasoner {
             self.config.association_min_lift
         ));
         let filter = filter.map(str::trim).filter(|filter| !filter.is_empty());
+        // 规范化一次即可，避免对每条规则重复计算
+        let normalized = filter.map(|filter| self.aligner.canonical_form(filter));
         let rules: Vec<&AssociationRule> = self
             .associations
             .rules()
@@ -1134,13 +1135,13 @@ impl SymbolicReasoner {
             .filter(|rule| match filter {
                 None => true,
                 Some(filter) => {
-                    let normalized = self.aligner.canonical_form(filter);
+                    let normalized = normalized.as_deref().unwrap_or(filter);
                     rule.consequent.contains(filter)
-                        || rule.consequent.contains(&normalized)
+                        || rule.consequent.contains(normalized)
                         || rule
                             .antecedent
                             .iter()
-                            .any(|item| item.contains(filter) || item.contains(&normalized))
+                            .any(|item| item.contains(filter) || item.contains(normalized))
                 }
             })
             .collect();
@@ -1212,8 +1213,12 @@ impl SymbolicReasoner {
             output.push_str("  （没有可推导的新事实：可增加事实/规则或放宽规则阈值）\n");
             return output;
         }
-        let mut items: Vec<&DerivedFact> = derived.iter().collect();
-        items.sort_by(|a, b| {
+        // 预计算展示文本，避免排序比较时反复格式化
+        let mut items: Vec<(&DerivedFact, String)> = derived
+            .iter()
+            .map(|item| (item, item.atom.display()))
+            .collect();
+        items.sort_by(|(a, a_display), (b, b_display)| {
             b.depth
                 .cmp(&a.depth)
                 .then_with(|| {
@@ -1221,9 +1226,9 @@ impl SymbolicReasoner {
                         .partial_cmp(&a.confidence)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+                .then_with(|| a_display.cmp(b_display))
         });
-        for (index, item) in items.into_iter().take(limit.max(1)).enumerate() {
+        for (index, (item, _)) in items.into_iter().take(limit.max(1)).enumerate() {
             let premises = item
                 .premises
                 .iter()
@@ -1319,13 +1324,22 @@ impl SymbolicReasoner {
         for predicate in predicates {
             let mut next_frontier: Vec<String> = Vec::new();
             let mut round_hits: Vec<ValueHit> = Vec::new();
+            // 多个分支可能命中同一实体，边收集边去重，保留首次出现顺序
+            let mut seen_values: HashSet<String> = HashSet::new();
+            let mut seen_hit_values: HashSet<String> = HashSet::new();
             for node in &frontier {
                 let hits = self.node_hits(node, predicate);
                 if hits.is_empty() {
                     continue;
                 }
-                next_frontier.extend(hits.iter().map(|hit| hit.value.clone()));
-                round_hits.extend(hits.clone());
+                for hit in &hits {
+                    if seen_values.insert(hit.value.clone()) {
+                        next_frontier.push(hit.value.clone());
+                    }
+                    if seen_hit_values.insert(hit.value.clone()) {
+                        round_hits.push(hit.clone());
+                    }
+                }
                 steps.push(ChainStep {
                     subject: node.clone(),
                     predicate: predicate.clone(),
@@ -1335,11 +1349,6 @@ impl SymbolicReasoner {
             if next_frontier.is_empty() {
                 return None;
             }
-            // 多个分支可能命中同一实体，去重后再进入下一跳/汇总，避免答案重复
-            let mut seen_values: HashSet<String> = HashSet::new();
-            next_frontier.retain(|value| seen_values.insert(value.clone()));
-            let mut seen_hit_values: HashSet<String> = HashSet::new();
-            round_hits.retain(|hit| seen_hit_values.insert(hit.value.clone()));
             frontier = next_frontier;
             last_hits = round_hits;
         }
@@ -1400,7 +1409,8 @@ impl SymbolicReasoner {
         let expectations = Self::expected_type_keywords(question);
         let mut ordered: Vec<&ValueHit> = last_hits.iter().collect();
         if !expectations.is_empty() {
-            ordered.sort_by_key(|hit| {
+            // 缓存判定结果，避免排序时对同一元素重复做类型查询
+            ordered.sort_by_cached_key(|hit| {
                 if self.value_matches_expectation(&hit.value, &expectations) {
                     0usize
                 } else {

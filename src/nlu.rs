@@ -155,12 +155,13 @@ impl NLUEngine {
         pattern: &str,
         slot_configs: &[SlotConfig],
     ) -> Option<(f64, Vec<(String, String)>)> {
-        let total_count = pattern.split_whitespace().count();
+        let pattern_words: Vec<&str> = pattern.split_whitespace().collect();
+        let total_count = pattern_words.len();
 
         let mut matched_count = 0;
         let mut slots = Vec::new();
 
-        for pattern_word in pattern.split_whitespace() {
+        for pattern_word in pattern_words {
             if pattern_word.starts_with('{') && pattern_word.ends_with('}') {
                 let slot_name = &pattern_word[1..pattern_word.len() - 1];
                 if let Some(slot_config) = slot_configs.iter().find(|s| s.name == slot_name) {

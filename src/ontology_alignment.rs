@@ -218,8 +218,10 @@ impl OntologyAligner {
     }
 
     fn bigram_dice(a: &str, b: &str) -> f64 {
-        let ga = Self::bigram_keys(a);
-        let gb = Self::bigram_keys(b);
+        Self::bigram_dice_keys(&Self::bigram_keys(a), &Self::bigram_keys(b))
+    }
+
+    fn bigram_dice_keys(ga: &[(char, Option<char>)], gb: &[(char, Option<char>)]) -> f64 {
         if ga.is_empty() || gb.is_empty() {
             return 0.0;
         }
@@ -227,11 +229,11 @@ impl OntologyAligner {
         // 计数映射实现多重集交集，避免逐元素线性查找的 O(n²)
         let mut counts: HashMap<(char, Option<char>), usize> = HashMap::with_capacity(ga.len());
         for key in ga {
-            *counts.entry(key).or_insert(0) += 1;
+            *counts.entry(*key).or_insert(0) += 1;
         }
         let mut overlap = 0usize;
         for key in gb {
-            if let Some(count) = counts.get_mut(&key) {
+            if let Some(count) = counts.get_mut(key) {
                 if *count > 0 {
                     *count -= 1;
                     overlap += 1;
@@ -239,6 +241,38 @@ impl OntologyAligner {
             }
         }
         2.0 * overlap as f64 / total as f64
+    }
+
+    /// 与 `similarity_normalized` 等价，但复用调用方预计算的查询侧 bigram，
+    /// 避免在一批候选中反复重建同一个字符串的 bigram 表。
+    fn similarity_normalized_with_keys(
+        &self,
+        query: &str,
+        query_keys: &[(char, Option<char>)],
+        other: &str,
+    ) -> f64 {
+        if query.is_empty() || other.is_empty() {
+            return 0.0;
+        }
+        if query == other {
+            return 1.0;
+        }
+        let q_len = query.chars().count();
+        let o_len = other.chars().count();
+        let (short, long, short_len, long_len) = if q_len <= o_len {
+            (query, other, q_len, o_len)
+        } else {
+            (other, query, o_len, q_len)
+        };
+        if short_len >= 2 && long.contains(short) {
+            return 0.7 + 0.3 * (short_len as f64 / long_len as f64);
+        }
+        let other_keys = Self::bigram_keys(other);
+        if short == query {
+            Self::bigram_dice_keys(query_keys, &other_keys)
+        } else {
+            Self::bigram_dice_keys(&other_keys, query_keys)
+        }
     }
 
     /// 以 (字符, 下一字符) 作为 bigram 键；
@@ -348,6 +382,8 @@ impl OntologyAligner {
         }
 
         let mut best_similarity: Option<(f64, usize)> = None;
+        // 查询侧 bigram 只需计算一次，供全部候选复用
+        let query_keys = Self::bigram_keys(&normalized);
         for i in 0..self.profiles.len() {
             if Some(i) == self_idx {
                 continue;
@@ -357,7 +393,8 @@ impl OntologyAligner {
                     continue;
                 }
             }
-            let sim = self.similarity_normalized(&normalized, &self.profile_norms[i]);
+            let sim =
+                self.similarity_normalized_with_keys(&normalized, &query_keys, &self.profile_norms[i]);
             if sim >= self.similarity_threshold
                 && best_similarity.map_or(true, |(b, _)| sim > b)
             {
