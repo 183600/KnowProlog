@@ -5,8 +5,13 @@ use std::sync::OnceLock;
 
 static JIEBA: OnceLock<Jieba> = OnceLock::new();
 
-fn jieba() -> &'static Jieba {
+/// 进程级共享的结巴分词器，避免各模块重复加载词典。
+pub fn shared_jieba() -> &'static Jieba {
     JIEBA.get_or_init(Jieba::new)
+}
+
+fn jieba() -> &'static Jieba {
+    shared_jieba()
 }
 
 // 标注了词性的单词结构体
@@ -47,13 +52,14 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     let mut merged_words: Vec<String> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
-        let mut matched = None;
+        // 增量拼接候选词并记录最长匹配，避免对每个长度重复分配字符串
+        let mut matched: Option<(String, usize)> = None;
+        let mut candidate = String::from(words[i]);
         let max_end = (i + 4).min(words.len()); // 人名一般不超过4个分词
-        for end in (i + 2..=max_end).rev() {
-            let candidate: String = words[i..end].concat();
+        for end in i + 1..max_end {
+            candidate.push_str(words[end]);
             if config.name_patterns.full_names.contains(&candidate) {
-                matched = Some((candidate, end));
-                break;
+                matched = Some((candidate.clone(), end + 1));
             }
         }
         if let Some((name, end)) = matched {
@@ -88,14 +94,17 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
 }
 
 // 词语归一化函数，将同义词转换为标准形式
-pub fn normalize_words(words: Vec<TaggedWord>, synonyms: &HashMap<String, String>) -> Vec<TaggedWord> {
-    words.into_iter().map(|mut word| {
-        // 如果词语在同义词表中，替换为标准形式
+pub fn normalize_words(
+    mut words: Vec<TaggedWord>,
+    synonyms: &HashMap<String, String>,
+) -> Vec<TaggedWord> {
+    // 原地替换，避免为每个词重新分配一个 Vec
+    for word in &mut words {
         if let Some(canonical_word) = synonyms.get(&word.text) {
             word.text = canonical_word.clone();
         }
-        word
-    }).collect()
+    }
+    words
 }
 
 // 判断一个词是否为人名

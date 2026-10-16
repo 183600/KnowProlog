@@ -37,6 +37,8 @@ pub struct TermProfile {
 pub struct OntologyAligner {
     synonyms: HashMap<String, String>,
     profiles: Vec<TermProfile>,
+    // 与 profiles 一一对应，注册时预计算规范化结果，避免每次对齐重复计算
+    profile_norms: Vec<String>,
     index: HashMap<String, usize>,
     similarity_threshold: f64,
     structural_min_shared: usize,
@@ -48,6 +50,7 @@ impl OntologyAligner {
         Self {
             synonyms,
             profiles: Vec::new(),
+            profile_norms: Vec::new(),
             index: HashMap::new(),
             similarity_threshold,
             structural_min_shared: 2,
@@ -88,8 +91,14 @@ impl OntologyAligner {
             ..Default::default()
         });
         let idx = self.profiles.len() - 1;
+        self.profile_norms.push(normalized.clone());
         self.index.insert(normalized, idx);
         idx
+    }
+
+    /// 返回第 `idx` 个术语的预计算规范化形式
+    pub fn normalized_term_at(&self, idx: usize) -> Option<&str> {
+        self.profile_norms.get(idx).map(String::as_str)
     }
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
@@ -169,8 +178,11 @@ impl OntologyAligner {
     }
 
     pub fn similarity(&self, a: &str, b: &str) -> f64 {
-        let na = self.normalize(a);
-        let nb = self.normalize(b);
+        self.similarity_normalized(&self.normalize(a), &self.normalize(b))
+    }
+
+    /// 对已规范化的字符串直接计算相似度，避免重复规范化
+    fn similarity_normalized(&self, na: &str, nb: &str) -> f64 {
         if na.is_empty() || nb.is_empty() {
             return 0.0;
         }
@@ -178,13 +190,13 @@ impl OntologyAligner {
             return 1.0;
         }
         let (short, long) = if na.chars().count() <= nb.chars().count() {
-            (&na, &nb)
+            (na, nb)
         } else {
-            (&nb, &na)
+            (nb, na)
         };
         let short_len = short.chars().count();
         let long_len = long.chars().count();
-        if short_len >= 2 && long.contains(short.as_str()) {
+        if short_len >= 2 && long.contains(short) {
             return 0.7 + 0.3 * (short_len as f64 / long_len as f64);
         }
         Self::bigram_dice(short, long)
@@ -285,7 +297,7 @@ impl OntologyAligner {
         }
 
         let mut best_similarity: Option<(f64, usize)> = None;
-        for (i, profile) in self.profiles.iter().enumerate() {
+        for i in 0..self.profiles.len() {
             if Some(i) == self_idx {
                 continue;
             }
@@ -294,7 +306,7 @@ impl OntologyAligner {
                     continue;
                 }
             }
-            let sim = self.similarity(&normalized, &self.normalize(&profile.term));
+            let sim = self.similarity_normalized(&normalized, &self.profile_norms[i]);
             if sim >= self.similarity_threshold
                 && best_similarity.map_or(true, |(b, _)| sim > b)
             {

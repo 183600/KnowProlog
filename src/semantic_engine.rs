@@ -32,7 +32,7 @@ pub struct IntentAnalysisResult {
 }
 
 pub struct SemanticEngine {
-    jieba: Arc<Jieba>,
+    jieba: &'static Jieba,
     entity_knowledge: Arc<RwLock<HashMap<String, SemanticKnowledge>>>,
     entity_aliases: Arc<RwLock<HashMap<String, Vec<String>>>>,
     relation_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
@@ -42,7 +42,7 @@ pub struct SemanticEngine {
 
 impl SemanticEngine {
     pub fn new() -> Self {
-        let jieba = Arc::new(Jieba::new());
+        let jieba = crate::nlp::shared_jieba();
         
         let stop_words = [
             "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是", "什么", "怎么", "为什么", "哪里", "那么", "这么", "怎样", "多少", "几个", "如何"

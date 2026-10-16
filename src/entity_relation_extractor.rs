@@ -72,7 +72,7 @@ pub struct EntityType {
 }
 
 pub struct EntityRelationExtractor {
-    jieba: Arc<Jieba>,
+    jieba: &'static Jieba,
     entity_types: Arc<RwLock<HashMap<String, EntityType>>>,
     extraction_patterns: Arc<RwLock<Vec<ExtractionPattern>>>,
     named_entity_dict: Arc<RwLock<HashMap<String, Vec<String>>>>,
@@ -93,7 +93,7 @@ pub struct DependencyPattern {
 
 impl EntityRelationExtractor {
     pub fn new() -> Self {
-        let jieba = Arc::new(Jieba::new());
+        let jieba = crate::nlp::shared_jieba();
         
         let stop_words = [
             "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是", "什么", "怎么", "为什么", "哪里", "那么", "这么", "怎样", "多少", "几个", "如何", "这个", "那个", "这样", "那样", "因为", "所以", "然后", "接着", "最后", "首先", "其次", "另外", "此外", "而且", "并且", "或者", "还是", "虽然", "但是", "可是", "然而", "不过", "只要", "除非", "无论", "不管", "即使", "哪怕", "只有", "只是", "仅仅", "刚刚", "正在", "已经", "曾经", "将要", "可能", "应该", "必须", "需要", "想要", "希望", "愿意", "喜欢", "讨厌", "觉得", "认为", "以为", "知道", "了解", "明白", "理解", "发现", "意识"

@@ -66,7 +66,7 @@ pub struct EntityPattern {
 }
 
 pub struct AdvancedNLU {
-    jieba: Arc<Jieba>,
+    jieba: &'static Jieba,
     intent_patterns: Arc<RwLock<HashMap<String, IntentPattern>>>,
     entity_patterns: Arc<RwLock<HashMap<String, EntityPattern>>>,
     domain_keywords: Arc<RwLock<HashMap<String, Vec<String>>>>,
@@ -79,7 +79,7 @@ pub struct AdvancedNLU {
 
 impl AdvancedNLU {
     pub fn new() -> Self {
-        let jieba = Arc::new(Jieba::new());
+        let jieba = crate::nlp::shared_jieba();
 
         let nlu = Self {
             jieba,

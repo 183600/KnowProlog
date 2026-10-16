@@ -110,10 +110,13 @@ impl DialogueContext {
         let mut i = 0;
         let mut replaced = false;
         while i < chars.len() {
-            let rest: String = chars[i..].iter().take(4).collect();
+            // 直接在字符切片上比较，避免为每个位置构造临时 String
             let mut matched: Option<&str> = None;
             for pronoun in PRONOUNS {
-                if rest.starts_with(pronoun) {
+                let plen = pronoun.chars().count();
+                if chars.len() - i >= plen
+                    && chars[i..i + plen].iter().copied().eq(pronoun.chars())
+                {
                     matched = Some(pronoun);
                     break;
                 }
@@ -185,6 +188,7 @@ impl SymbolicReasoner {
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         let mut added = 0usize;
+        let triples_before = self.predictor.triple_count();
         for fact in facts {
             match fact {
                 PrologFact::Relation { from, rel_type, to } => {
@@ -202,17 +206,22 @@ impl SymbolicReasoner {
                 } => {
                     self.aligner.register_term(name, TermKind::Entity);
                     self.aligner.register_term(entity_type, TermKind::Type);
-                    let property_keys: Vec<String> = properties.keys().cloned().collect();
-                    for property in &property_keys {
+                    for property in properties.keys() {
                         self.aligner.register_term(property, TermKind::Attribute);
                     }
                     if self.config.enable_semantic_embedding {
+                        let property_keys: Vec<String> = properties.keys().cloned().collect();
                         self.embedding.observe_entity(name, entity_type, &property_keys);
                     }
                 }
             }
         }
-        if added > 0 && self.config.enable_link_prediction {
+        // 规则只依赖已积累的三元组与固定阈值：若本次没有新增三元组，
+        // 重新挖掘必然得到相同规则，直接跳过可避免重复的 O(P²) 计算
+        if added > 0
+            && self.config.enable_link_prediction
+            && self.predictor.triple_count() > triples_before
+        {
             self.predictor.mine_rules(
                 self.config.link_prediction_min_support,
                 self.config.link_prediction_min_confidence,
@@ -291,15 +300,17 @@ impl SymbolicReasoner {
     pub fn entities_mentioned(&self, text: &str) -> Vec<String> {
         let normalized_text = self.aligner.normalize(text);
         let mut found: Vec<(usize, String)> = Vec::new();
-        for profile in self.aligner.profiles() {
+        for (i, profile) in self.aligner.profiles().iter().enumerate() {
             if profile.kind != TermKind::Entity {
                 continue;
             }
-            let term_norm = self.aligner.normalize(&profile.term);
+            let Some(term_norm) = self.aligner.normalized_term_at(i) else {
+                continue;
+            };
             if term_norm.is_empty() {
                 continue;
             }
-            if normalized_text.contains(&term_norm) {
+            if normalized_text.contains(term_norm) {
                 found.push((profile.term.chars().count(), self.aligner.canonical_form(&profile.term)));
             }
         }

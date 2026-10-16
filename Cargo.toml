@@ -25,3 +25,8 @@ parking_lot = "0.12"
 [dev-dependencies]
 # 这是修复第一个错误 (E0432: unresolved import `tempfile`) 所必需的
 tempfile = "3.3.0"
+
+[profile.release]
+# 发布构建面向运行时性能：跨单元优化并减少代码生成单元
+lto = "thin"
+codegen-units = 1

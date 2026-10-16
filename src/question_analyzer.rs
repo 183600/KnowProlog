@@ -73,7 +73,7 @@ pub struct Entity {
 }
 
 pub struct QuestionAnalyzer {
-    jieba: Arc<Jieba>,
+    jieba: &'static Jieba,
     question_patterns: Arc<RwLock<HashMap<QuestionType, Vec<Regex>>>>,
     domain_keywords: Arc<RwLock<HashMap<Domain, Vec<String>>>>,
     intent_indicators: Arc<RwLock<HashMap<Intent, Vec<String>>>>,
@@ -83,7 +83,7 @@ pub struct QuestionAnalyzer {
 
 impl QuestionAnalyzer {
     pub fn new() -> Self {
-        let jieba = Arc::new(Jieba::new());
+        let jieba = crate::nlp::shared_jieba();
         
         let stop_words = [
             "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是"
