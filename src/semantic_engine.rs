@@ -71,31 +71,36 @@ impl SemanticEngine {
     }
 
     pub fn initialize_knowledge_base(&self, entities: Vec<SemanticKnowledge>) -> Result<(), Box<dyn std::error::Error>> {
-        let mut knowledge = self.entity_knowledge.write();
-        let mut aliases = self.entity_aliases.write();
-        let mut token_cache = self.token_cache.write();
-        
-        for entity in entities {
-            let entity_name = entity.entity.clone();
+        // 显式限定写锁作用域：initialize_default_patterns 需要获取
+        // intent_patterns/relation_patterns 写锁，若与 entity_aliases 写锁同时持有，
+        // 会与 analyze_intent（持 intent_patterns 读锁并读 entity_aliases）构成死锁。
+        {
+            let mut knowledge = self.entity_knowledge.write();
+            let mut aliases = self.entity_aliases.write();
+            let mut token_cache = self.token_cache.write();
             
-            // 添加实体别名映射
-            let mut entity_aliases_list = vec![entity_name.clone()];
-            if let Some(alias_list) = entity.attributes.get("别名") {
-                entity_aliases_list.extend(alias_list.clone());
+            for entity in entities {
+                let entity_name = entity.entity.clone();
+                
+                // 添加实体别名映射
+                let mut entity_aliases_list = vec![entity_name.clone()];
+                if let Some(alias_list) = entity.attributes.get("别名") {
+                    entity_aliases_list.extend(alias_list.clone());
+                }
+                if let Some(other_names) = entity.attributes.get("其他名称") {
+                    entity_aliases_list.extend(other_names.clone());
+                }
+                
+                for alias in &entity_aliases_list {
+                    aliases.entry(alias.clone()).or_insert_with(Vec::new).push(entity_name.clone());
+                }
+                
+                token_cache.insert(
+                    entity_name.clone(),
+                    (self.tokenize_filtered(&entity.entity), self.tokenize_filtered(&entity.description)),
+                );
+                knowledge.insert(entity_name, entity);
             }
-            if let Some(other_names) = entity.attributes.get("其他名称") {
-                entity_aliases_list.extend(other_names.clone());
-            }
-            
-            for alias in &entity_aliases_list {
-                aliases.entry(alias.clone()).or_insert_with(Vec::new).push(entity_name.clone());
-            }
-            
-            token_cache.insert(
-                entity_name.clone(),
-                (self.tokenize_filtered(&entity.entity), self.tokenize_filtered(&entity.description)),
-            );
-            knowledge.insert(entity_name, entity);
         }
         
         self.initialize_default_patterns();
@@ -579,6 +584,9 @@ impl SemanticEngine {
         let mut entity_aliases_list = vec![entity_name.clone()];
         if let Some(alias_list) = entity.attributes.get("别名") {
             entity_aliases_list.extend(alias_list.clone());
+        }
+        if let Some(other_names) = entity.attributes.get("其他名称") {
+            entity_aliases_list.extend(other_names.clone());
         }
         
         for alias in &entity_aliases_list {

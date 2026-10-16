@@ -243,6 +243,7 @@ impl SymbolicReasoner {
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         let mut added = 0usize;
+        let mut entity_observed = false;
         let triples_before = self.predictor.triple_count();
         for fact in facts {
             match fact {
@@ -277,6 +278,7 @@ impl SymbolicReasoner {
                         let property_keys: Vec<String> = properties.keys().cloned().collect();
                         self.embedding.observe_entity(name, entity_type, &property_keys);
                     }
+                    entity_observed = true;
                 }
             }
         }
@@ -291,7 +293,8 @@ impl SymbolicReasoner {
                 self.config.link_prediction_min_confidence,
             );
         }
-        if self.config.enable_semantic_embedding && added > 0 {
+        // 实体事实同样会更新嵌入（observe_entity），因此也需要重建
+        if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();
         }
     }
@@ -778,6 +781,11 @@ impl SymbolicReasoner {
             if next_frontier.is_empty() {
                 return None;
             }
+            // 多个分支可能命中同一实体，去重后再进入下一跳/汇总，避免答案重复
+            let mut seen_values: HashSet<String> = HashSet::new();
+            next_frontier.retain(|value| seen_values.insert(value.clone()));
+            let mut seen_hit_values: HashSet<String> = HashSet::new();
+            round_hits.retain(|hit| seen_hit_values.insert(hit.value.clone()));
             frontier = next_frontier;
             last_hits = round_hits;
         }

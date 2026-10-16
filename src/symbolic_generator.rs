@@ -266,6 +266,8 @@ impl SymbolicGenerator {
         order: GenerationOrder,
     ) -> Option<ProfilePage> {
         let lines = self.profile_lines(entity, order)?;
+        // offset 超出末尾时视为请求最后一页之后的内容，避免切片越界 panic
+        let offset = offset.min(lines.len());
         let end = offset.saturating_add(self.max_profile_sentences).min(lines.len());
         let shown = end.saturating_sub(offset);
         Some(ProfilePage {

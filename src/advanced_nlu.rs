@@ -683,30 +683,67 @@ impl AdvancedNLU {
     }
 
     fn normalize_number(&self, text: &str) -> Option<String> {
-        // 中文数字转阿拉伯数字
-        let mut normalized = String::with_capacity(text.len());
-        for ch in text.chars() {
+        // 中文数字按位值换算（五十 → 50），阿拉伯数字等保持原样
+        match Self::chinese_numeral_to_arabic(text) {
+            Some(value) => Some(value.to_string()),
+            None => Some(text.to_string()),
+        }
+    }
+
+    fn chinese_numeral_to_arabic(text: &str) -> Option<u64> {
+        fn digit(ch: char) -> Option<u64> {
             match ch {
-                '零' => normalized.push('0'),
-                '一' => normalized.push('1'),
-                '二' => normalized.push('2'),
-                '三' => normalized.push('3'),
-                '四' => normalized.push('4'),
-                '五' => normalized.push('5'),
-                '六' => normalized.push('6'),
-                '七' => normalized.push('7'),
-                '八' => normalized.push('8'),
-                '九' => normalized.push('9'),
-                '十' => normalized.push_str("10"),
-                '百' => normalized.push_str("100"),
-                '千' => normalized.push_str("1000"),
-                '万' => normalized.push_str("10000"),
-                '亿' => normalized.push_str("100000000"),
-                _ => normalized.push(ch),
+                '零' | '〇' => Some(0),
+                '一' | '壹' => Some(1),
+                '二' | '两' | '贰' => Some(2),
+                '三' | '叁' => Some(3),
+                '四' | '肆' => Some(4),
+                '五' | '伍' => Some(5),
+                '六' | '陆' => Some(6),
+                '七' | '柒' => Some(7),
+                '八' | '捌' => Some(8),
+                '九' | '玖' => Some(9),
+                _ => None,
             }
         }
-        
-        Some(normalized)
+        fn unit(ch: char) -> Option<u64> {
+            match ch {
+                '十' | '拾' => Some(10),
+                '百' | '佰' => Some(100),
+                '千' | '仟' => Some(1000),
+                _ => None,
+            }
+        }
+        if text.is_empty() {
+            return None;
+        }
+        let mut total: u64 = 0;
+        let mut section: u64 = 0;
+        let mut current: u64 = 0;
+        for ch in text.chars() {
+            if let Some(d) = digit(ch) {
+                current = d;
+            } else if let Some(u) = unit(ch) {
+                if current == 0 {
+                    current = 1;
+                }
+                section = section.checked_add(current.checked_mul(u)?)?;
+                current = 0;
+            } else if ch == '万' {
+                section = section.checked_add(current)?;
+                total = total.checked_add(section.checked_mul(10000)?)?;
+                section = 0;
+                current = 0;
+            } else if ch == '亿' {
+                section = section.checked_add(current)?;
+                total = total.checked_add(section.checked_mul(100_000_000)?)?;
+                section = 0;
+                current = 0;
+            } else {
+                return None;
+            }
+        }
+        total.checked_add(section)?.checked_add(current)
     }
 
     async fn extract_temporal_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {

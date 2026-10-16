@@ -125,8 +125,8 @@ impl QueryPlanner {
         let mut text = question.trim().to_string();
         for prefix in [
             "请问",
-            "请告诉我",
             "请告诉我一下",
+            "请告诉我",
             "我想知道",
             "我想问一下",
             "帮我查一下",
@@ -346,37 +346,46 @@ impl QueryPlanner {
     }
 
     fn parse_similar(&self, q: &str) -> Option<QueryPlan> {
-        if let Some((_, rest)) = q.split_once("和") {
+        // 「谁和张三最像」中问题词在左侧，真正要检索的实体在右侧；
+        // 「张三和谁最像」则相反，选非问题词的一侧作为实体。
+        let resolve = |left: &str, entity: &str| -> Option<QueryPlan> {
+            let entity = entity.trim();
+            let candidate = if Self::is_question_word(entity) {
+                left.trim()
+            } else {
+                entity
+            };
+            if candidate.is_empty() || Self::is_question_word(candidate) {
+                None
+            } else {
+                Some(QueryPlan::Similar {
+                    entity: candidate.to_string(),
+                })
+            }
+        };
+        if let Some((left, rest)) = q.split_once("和") {
             if let Some((entity, _)) = rest.split_once("最像") {
-                if !entity.trim().is_empty() {
-                    return Some(QueryPlan::Similar {
-                        entity: entity.trim().to_string(),
-                    });
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
                 }
             }
             if let Some((entity, _)) = rest.split_once("相似") {
-                if !entity.trim().is_empty() {
-                    return Some(QueryPlan::Similar {
-                        entity: entity.trim().to_string(),
-                    });
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
                 }
             }
         }
-        if let Some((_, rest)) = q.split_once("跟") {
+        if let Some((left, rest)) = q.split_once("跟") {
             if let Some((entity, _)) = rest.split_once("最像") {
-                if !entity.trim().is_empty() {
-                    return Some(QueryPlan::Similar {
-                        entity: entity.trim().to_string(),
-                    });
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
                 }
             }
         }
-        if let Some((_, rest)) = q.split_once("与") {
+        if let Some((left, rest)) = q.split_once("与") {
             if let Some((entity, _)) = rest.split_once("相似") {
-                if !entity.trim().is_empty() {
-                    return Some(QueryPlan::Similar {
-                        entity: entity.trim().to_string(),
-                    });
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
                 }
             }
         }
@@ -387,7 +396,7 @@ impl QueryPlanner {
                 .trim_end_matches('跟')
                 .trim_end_matches('与')
                 .trim();
-            if !entity.is_empty() {
+            if !entity.is_empty() && !Self::is_question_word(entity) {
                 return Some(QueryPlan::Similar {
                     entity: entity.to_string(),
                 });

@@ -650,6 +650,16 @@ impl EntityRelationExtractor {
         // 基于依存句法的关系抽取
         relations.extend(self.extract_relations_by_dependency(sentence, entities).await?);
         
+        // 三种策略可能产出同一三元组，按 (主体, 谓词, 客体) 去重并保留首次出现
+        let mut seen = HashSet::new();
+        relations.retain(|triple| {
+            seen.insert((
+                triple.subject.clone(),
+                triple.predicate.clone(),
+                triple.object.clone(),
+            ))
+        });
+        
         Ok(relations)
     }
 

@@ -376,8 +376,9 @@ impl QuestionAnalyzer {
             *scores.entry(QuestionType::ProcessDescription).or_insert(0.0) += 0.8;
         }
         
-        // 选择得分最高的类型
+        // 选择得分最高的类型；全部为 0 时回落到默认类型
         let best_type = scores.into_iter()
+            .filter(|(_, score)| *score > 0.0)
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(q_type, _)| q_type)
             .unwrap_or(QuestionType::FactualQuery);
@@ -401,6 +402,7 @@ impl QuestionAnalyzer {
         }
         
         let best_domain = scores.into_iter()
+            .filter(|(_, score)| *score > 0.0)
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(domain, _)| domain)
             .unwrap_or(Domain::General);
@@ -409,7 +411,8 @@ impl QuestionAnalyzer {
     }
 
     async fn assess_complexity(&self, question: &str, question_type: &QuestionType) -> Result<ComplexityLevel, Box<dyn std::error::Error + Send + Sync>> {
-        let word_count = question.split_whitespace().count();
+        // 中文问句没有空格分词，用字符数衡量长度
+        let word_count = question.chars().count();
         
         let complexity = match question_type {
             QuestionType::FactualQuery => {
@@ -449,6 +452,7 @@ impl QuestionAnalyzer {
         }
         
         let best_intent = scores.into_iter()
+            .filter(|(_, score)| *score > 0.0)
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(intent, _)| intent)
             .unwrap_or(Intent::SeekInformation);
