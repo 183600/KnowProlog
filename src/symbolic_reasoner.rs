@@ -145,7 +145,7 @@ impl DialogueContext {
         let mut i = 0;
         let mut replaced = false;
         while i < chars.len() {
-            // 直接在字符切片上比较，避免为每个位置构造临时 String
+            // 直接在字符切片上比较
             let mut matched: Option<&str> = None;
             for pronoun in PRONOUNS {
                 let plen = pronoun.chars().count();
@@ -281,7 +281,7 @@ impl SymbolicReasoner {
             }
         }
         // 规则只依赖已积累的三元组与固定阈值：若本次没有新增三元组，
-        // 重新挖掘必然得到相同规则，直接跳过可避免重复的 O(P²) 计算
+        // 重新挖掘必然得到相同规则，直接跳过
         if added > 0
             && self.config.enable_link_prediction
             && self.predictor.triple_count() > triples_before

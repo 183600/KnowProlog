@@ -814,7 +814,7 @@ impl OxigraphManager {
             return self.load_all_facts_internal(&store).await;
         }
         
-        // 构建实体名称的匹配模式（合并为单次查询，避免逐实体重复扫描整库）
+        // 构建实体名称的匹配模式
         let combined_pattern = query_entities.iter()
             .map(|e| format!(".*{}.*", regex::escape(e)))
             .collect::<Vec<_>>()

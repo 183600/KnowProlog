@@ -38,13 +38,13 @@ pub struct TermProfile {
 pub struct OntologyAligner {
     synonyms: HashMap<String, String>,
     profiles: Vec<TermProfile>,
-    // 与 profiles 一一对应，注册时预计算规范化结果，避免每次对齐重复计算
+    // 与 profiles 一一对应，注册时预计算规范化结果
     profile_norms: Vec<String>,
     index: HashMap<String, usize>,
     similarity_threshold: f64,
     structural_min_shared: usize,
     structural_min_jaccard: f64,
-    // 术语解析结果缓存：注册新术语时整体失效，避免重复执行 O(n) 相似度扫描
+    // 术语解析结果缓存：注册新术语时整体失效
     resolve_cache: RwLock<HashMap<String, Option<(AlignmentPair, Option<usize>)>>>,
 }
 
@@ -195,7 +195,7 @@ impl OntologyAligner {
         self.similarity_normalized(&self.normalize(a), &self.normalize(b))
     }
 
-    /// 对已规范化的字符串直接计算相似度，避免重复规范化
+    /// 对已规范化的字符串直接计算相似度
     fn similarity_normalized(&self, na: &str, nb: &str) -> f64 {
         if na.is_empty() || nb.is_empty() {
             return 0.0;
@@ -233,8 +233,8 @@ impl OntologyAligner {
         2.0 * overlap as f64 / total as f64
     }
 
-    /// 以 (字符, 下一字符) 作为 bigram 键，避免为每个 bigram 分配字符串；
-    /// 长度不足 2 的字符串保留原有的单元素语义（第二项为 None）。
+    /// 以 (字符, 下一字符) 作为 bigram 键；
+    /// 长度不足 2 的字符串使用单元素语义（第二项为 None）。
     fn bigram_keys(s: &str) -> Vec<(char, Option<char>)> {
         let mut keys = Vec::new();
         let mut prev: Option<char> = None;
@@ -463,7 +463,7 @@ impl OntologyAligner {
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
 
         for (s, p, o) in triples {
-            // 每个部分只解析一次，供对齐证据与规范化三元组共用
+            // 部分解析结果供对齐证据与规范化三元组共用
             let resolved = [self.resolve(s), self.resolve(p), self.resolve(o)];
             for pair in resolved.iter().flatten() {
                 if seen_pairs.insert((pair.source.clone(), pair.target.clone())) {

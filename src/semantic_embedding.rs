@@ -176,7 +176,7 @@ impl SymbolicEmbedding {
     }
 
     pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
-        // 直接复用源实体向量，避免每个候选重复两次哈希查找
+        // 直接复用源实体向量
         let Some(va) = self.vectors.get(entity) else {
             return Vec::new();
         };

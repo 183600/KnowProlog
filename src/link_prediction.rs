@@ -316,7 +316,7 @@ impl LinkPredictor {
         let mut rules = Vec::new();
 
         for p1 in &predicates {
-            // 逆向规则只依赖 p1，预先取反一次即可供所有 p2 复用
+            // 逆向规则只依赖 p1
             let reversed: Option<HashSet<(String, String)>> = self
                 .pairs_of(p1)
                 .map(|pairs1| pairs1.iter().map(|(o, s)| (s.clone(), o.clone())).collect());

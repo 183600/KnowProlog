@@ -38,7 +38,7 @@ pub struct SemanticEngine {
     relation_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     intent_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     stop_words: HashSet<String>,
-    // 实体名与描述的过滤后分词缓存，避免每次语义匹配重复分词
+    // 实体名与描述的过滤后分词缓存
     token_cache: Arc<RwLock<HashMap<String, (Vec<String>, Vec<String>)>>>,
 }
 

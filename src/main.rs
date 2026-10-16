@@ -73,7 +73,6 @@ async fn main() {
     };
 
     // 处理命令行参数
-    println!("Debug: cli.command = {:?}", cli.command);
     match cli.command {
         Some(Commands::ImportJsonld { file_path }) => {
             println!("正在导入 JSON-LD 文件: {}", file_path);

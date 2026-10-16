@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 static JIEBA: OnceLock<Jieba> = OnceLock::new();
 
-/// 进程级共享的结巴分词器，避免各模块重复加载词典。
+/// 进程级共享的结巴分词器。
 pub fn shared_jieba() -> &'static Jieba {
     JIEBA.get_or_init(Jieba::new)
 }
@@ -52,7 +52,7 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     let mut merged_words: Vec<String> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
-        // 增量拼接候选词并记录最长匹配，避免对每个长度重复分配字符串
+        // 增量拼接候选词并记录最长匹配
         let mut matched: Option<(String, usize)> = None;
         let mut candidate = String::from(words[i]);
         let max_end = (i + 4).min(words.len()); // 人名一般不超过4个分词
@@ -98,7 +98,7 @@ pub fn normalize_words(
     mut words: Vec<TaggedWord>,
     synonyms: &HashMap<String, String>,
 ) -> Vec<TaggedWord> {
-    // 原地替换，避免为每个词重新分配一个 Vec
+    // 原地替换
     for word in &mut words {
         if let Some(canonical_word) = synonyms.get(&word.text) {
             word.text = canonical_word.clone();

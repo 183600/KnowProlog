@@ -412,7 +412,7 @@ impl EntityRelationExtractor {
         let mut entities = Vec::new();
         let entity_types = self.entity_types.read();
         
-        // 分词与字节偏移只计算一次，供所有实体类型的上下文关键词匹配复用
+        // 分词与字节偏移供所有实体类型的上下文关键词匹配使用
         let words: Vec<&str> = self.jieba.cut(sentence, false).into_iter().collect();
         let mut word_offsets = Vec::with_capacity(words.len() + 1);
         word_offsets.push(0usize);
