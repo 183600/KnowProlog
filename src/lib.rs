@@ -22,6 +22,11 @@ pub mod entity_relation_extractor;
 pub mod local_semantic_adapter;
 pub mod question_analyzer;
 pub mod external_knowledge;
+pub mod ontology_alignment;
+pub mod link_prediction;
+pub mod semantic_embedding;
+pub mod query_planner;
+pub mod symbolic_reasoner;
 
 // 移除了未使用的 analyze_query_intent
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
@@ -45,11 +50,76 @@ pub struct SystemConfig {
     pub system: SystemSettings,
     pub api: Option<ApiConfig>,
     pub nlp: NlpConfig,
+    #[serde(default)]
+    pub reasoning: ReasoningConfig,
     pub entity_types: Vec<EntityTypeConfig>,
     pub extraction_rules: Vec<ExtractionRule>,
     pub prolog_rules: Vec<PrologRuleConfig>,
     pub messages: Messages,
     pub synonyms: Option<SynonymsConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReasoningConfig {
+    #[serde(default = "default_enable_link_prediction")]
+    pub enable_link_prediction: bool,
+    #[serde(default = "default_link_prediction_min_confidence")]
+    pub link_prediction_min_confidence: f64,
+    #[serde(default = "default_link_prediction_min_support")]
+    pub link_prediction_min_support: usize,
+    #[serde(default = "default_ontology_alignment_threshold")]
+    pub ontology_alignment_threshold: f64,
+    #[serde(default = "default_max_predictions")]
+    pub max_predictions: usize,
+    #[serde(default = "default_enable_semantic_embedding")]
+    pub enable_semantic_embedding: bool,
+    #[serde(default = "default_embedding_similarity_floor")]
+    pub embedding_similarity_floor: f64,
+    #[serde(default)]
+    pub dialogue_state_path: Option<String>,
+}
+
+fn default_enable_semantic_embedding() -> bool {
+    true
+}
+
+fn default_embedding_similarity_floor() -> f64 {
+    0.6
+}
+
+fn default_enable_link_prediction() -> bool {
+    true
+}
+
+fn default_link_prediction_min_confidence() -> f64 {
+    0.6
+}
+
+fn default_link_prediction_min_support() -> usize {
+    2
+}
+
+fn default_ontology_alignment_threshold() -> f64 {
+    0.72
+}
+
+fn default_max_predictions() -> usize {
+    5
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            enable_link_prediction: default_enable_link_prediction(),
+            link_prediction_min_confidence: default_link_prediction_min_confidence(),
+            link_prediction_min_support: default_link_prediction_min_support(),
+            ontology_alignment_threshold: default_ontology_alignment_threshold(),
+            max_predictions: default_max_predictions(),
+            enable_semantic_embedding: default_enable_semantic_embedding(),
+            embedding_similarity_floor: default_embedding_similarity_floor(),
+            dialogue_state_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1361,11 +1431,26 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
         Ok(facts)
     }
 
+    pub async fn load_all_relations(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let query = r#"
+            PREFIX kg: <http://example.org/kg/>
+            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+            SELECT ?from_name ?to_name ?rel WHERE {
+                ?from kg:name ?from_name .
+                ?to kg:name ?to_name .
+                ?from ?rel ?to .
+                FILTER(?rel != rdf:type)
+                FILTER(?from != ?to)
+            }
+        "#;
+        self.query_relations(&store, query).await
+    }
+
     async fn find_relations_between(&self, store: &Store, entities: &std::collections::HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut relations = Vec::new();
-        
         if entities.len() < 2 {
-            return Ok(relations);
+            return Ok(Vec::new());
         }
         
         let entity_names: Vec<String> = entities.iter()
@@ -1387,8 +1472,14 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
                 FILTER(?from != ?to)
             }}
         "#, entity_filter, entity_filter);
-        
-        match Query::parse(&query, None) {
+
+        self.query_relations(store, &query).await
+    }
+
+    async fn query_relations(&self, store: &Store, query: &str) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut relations = Vec::new();
+
+        match Query::parse(query, None) {
             Ok(query_obj) => {
                 match store.query(query_obj) {
                     Ok(results) => {

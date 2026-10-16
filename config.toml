@@ -11,6 +11,17 @@ enable_entity_disambiguation = true  # 是否启用实体歧义解析
 max_ambiguous_entities = 5          # 显示的最大歧义实体数量
 auto_select_best_entity = true       # 是否自动选择权重最高的实体
 
+# 符号推理配置（本体对齐 + 链接预测）
+[reasoning]
+enable_link_prediction = true          # 是否启用链接预测推理
+link_prediction_min_confidence = 0.6   # 规则置信度阈值
+link_prediction_min_support = 2        # 规则最小支持度
+ontology_alignment_threshold = 0.72    # 术语字面相似度对齐阈值
+max_predictions = 5                    # 单次回答最多展示的预测数量
+enable_semantic_embedding = true       # 是否启用符号化知识嵌入（PPMI 角色向量，无神经网络）
+embedding_similarity_floor = 0.6       # 近邻检索的最低余弦相似度
+dialogue_state_path = "oxigraph_data/dialogue_state.json"  # 对话记忆持久化文件（跨会话）
+
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]
 enable_nlu = true  # 启用语义理解功能

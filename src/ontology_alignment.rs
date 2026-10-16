@@ -1,0 +1,557 @@
+use std::collections::{HashMap, HashSet};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TermKind {
+    #[default]
+    Entity,
+    Relation,
+    Attribute,
+    Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignmentKind {
+    Synonym,
+    Normalized,
+    Similarity,
+    Structural,
+}
+
+#[derive(Debug, Clone)]
+pub struct AlignmentPair {
+    pub source: String,
+    pub target: String,
+    pub kind: AlignmentKind,
+    pub confidence: f64,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TermProfile {
+    pub term: String,
+    pub kind: TermKind,
+    pub neighbors: HashSet<String>,
+    pub types: HashSet<String>,
+}
+
+pub struct OntologyAligner {
+    synonyms: HashMap<String, String>,
+    profiles: Vec<TermProfile>,
+    index: HashMap<String, usize>,
+    similarity_threshold: f64,
+    structural_min_shared: usize,
+    structural_min_jaccard: f64,
+}
+
+impl OntologyAligner {
+    pub fn new(synonyms: HashMap<String, String>, similarity_threshold: f64) -> Self {
+        Self {
+            synonyms,
+            profiles: Vec::new(),
+            index: HashMap::new(),
+            similarity_threshold,
+            structural_min_shared: 2,
+            structural_min_jaccard: 0.3,
+        }
+    }
+
+    pub fn term_count(&self) -> usize {
+        self.profiles.len()
+    }
+
+    pub fn profiles(&self) -> &[TermProfile] {
+        &self.profiles
+    }
+
+    pub fn synonyms(&self) -> &HashMap<String, String> {
+        &self.synonyms
+    }
+
+    pub fn is_registered(&self, term: &str) -> bool {
+        self.index.contains_key(&self.normalize(term))
+    }
+
+    pub fn kind_of(&self, term: &str) -> Option<TermKind> {
+        self.index
+            .get(&self.normalize(term))
+            .map(|&idx| self.profiles[idx].kind)
+    }
+
+    pub fn register_term(&mut self, term: &str, kind: TermKind) -> usize {
+        let normalized = self.normalize(term);
+        if let Some(&idx) = self.index.get(&normalized) {
+            return idx;
+        }
+        self.profiles.push(TermProfile {
+            term: term.to_string(),
+            kind,
+            ..Default::default()
+        });
+        let idx = self.profiles.len() - 1;
+        self.index.insert(normalized, idx);
+        idx
+    }
+
+    pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
+        let s_idx = self.register_term(subject, TermKind::Entity);
+        let o_idx = self.register_term(object, TermKind::Entity);
+        self.register_term(predicate, TermKind::Relation);
+        if s_idx != o_idx {
+            self.profiles[s_idx]
+                .neighbors
+                .insert(format!("{}{}{}", predicate, '\u{2192}', object));
+            self.profiles[o_idx]
+                .neighbors
+                .insert(format!("{}{}{}", predicate, '\u{2190}', subject));
+        }
+    }
+
+    pub fn normalize(&self, term: &str) -> String {
+        let mut out = String::with_capacity(term.len());
+        for ch in term.trim().chars() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            let mapped = match ch {
+                '（' => '(',
+                '）' => ')',
+                '：' => ':',
+                '，' => ',',
+                '。' => '.',
+                '、' => ',',
+                '；' => ';',
+                '！' => '!',
+                '？' => '?',
+                '《' => '<',
+                '》' => '>',
+                '【' => '[',
+                '】' => ']',
+                '“' | '”' => '"',
+                '‘' | '’' => '\'',
+                '－' | '—' | '–' => '-',
+                '·' => '.',
+                _ => ch,
+            };
+            if matches!(
+                mapped,
+                '(' | ')'
+                    | ':'
+                    | ','
+                    | '.'
+                    | ';'
+                    | '!'
+                    | '?'
+                    | '<'
+                    | '>'
+                    | '['
+                    | ']'
+                    | '"'
+                    | '\''
+                    | '-'
+                    | '_'
+                    | '/'
+                    | '\\'
+                    | '#'
+                    | '@'
+                    | '&'
+                    | '+'
+                    | '*'
+            ) {
+                continue;
+            }
+            if mapped.is_ascii_uppercase() {
+                out.push(mapped.to_ascii_lowercase());
+            } else {
+                out.push(mapped);
+            }
+        }
+        out
+    }
+
+    pub fn similarity(&self, a: &str, b: &str) -> f64 {
+        let na = self.normalize(a);
+        let nb = self.normalize(b);
+        if na.is_empty() || nb.is_empty() {
+            return 0.0;
+        }
+        if na == nb {
+            return 1.0;
+        }
+        let (short, long) = if na.chars().count() <= nb.chars().count() {
+            (&na, &nb)
+        } else {
+            (&nb, &na)
+        };
+        let short_len = short.chars().count();
+        let long_len = long.chars().count();
+        if short_len >= 2 && long.contains(short.as_str()) {
+            return 0.7 + 0.3 * (short_len as f64 / long_len as f64);
+        }
+        Self::bigram_dice(short, long)
+    }
+
+    fn bigram_dice(a: &str, b: &str) -> f64 {
+        let ga = Self::bigrams(a);
+        let gb = Self::bigrams(b);
+        if ga.is_empty() || gb.is_empty() {
+            return 0.0;
+        }
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for g in &ga {
+            *counts.entry(g.clone()).or_insert(0) += 1;
+        }
+        let mut overlap = 0usize;
+        for g in &gb {
+            if let Some(c) = counts.get_mut(g) {
+                if *c > 0 {
+                    *c -= 1;
+                    overlap += 1;
+                }
+            }
+        }
+        2.0 * overlap as f64 / (ga.len() + gb.len()) as f64
+    }
+
+    fn bigrams(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() < 2 {
+            return vec![s.to_string()];
+        }
+        chars.windows(2).map(|w| w.iter().collect()).collect()
+    }
+
+    fn synonym_chain(&self, term: &str) -> Option<String> {
+        let mut current = term.to_string();
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(self.normalize(&current));
+        let mut changed = false;
+        for _ in 0..8 {
+            let lookup = current.clone();
+            let next = self
+                .synonyms
+                .get(&lookup)
+                .cloned()
+                .or_else(|| self.synonyms.get(&self.normalize(&lookup)).cloned());
+            match next {
+                Some(target) if !target.is_empty() && !seen.contains(&self.normalize(&target)) => {
+                    seen.insert(self.normalize(&target));
+                    current = target;
+                    changed = true;
+                }
+                _ => break,
+            }
+        }
+        if changed {
+            Some(current)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_with_index(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
+        if let Some(target) = self.synonym_chain(term) {
+            let target_norm = self.normalize(&target);
+            if target_norm != self.normalize(term) {
+                let idx = self.index.get(&target_norm).copied();
+                return Some((
+                    AlignmentPair {
+                        source: term.to_string(),
+                        target,
+                        kind: AlignmentKind::Synonym,
+                        confidence: 0.99,
+                        evidence: vec![format!("同义词映射 {} → {}", term, self.synonyms.get(term).map(|s| s.as_str()).unwrap_or(""))],
+                    },
+                    idx,
+                ));
+            }
+        }
+
+        let normalized = self.normalize(term);
+        let self_idx = self.index.get(&normalized).copied();
+        if let Some(idx) = self_idx {
+            let canonical = self.profiles[idx].term.clone();
+            if canonical != term {
+                return Some((
+                    AlignmentPair {
+                        source: term.to_string(),
+                        target: canonical.clone(),
+                        kind: AlignmentKind::Normalized,
+                        confidence: 0.98,
+                        evidence: vec![format!("规范化后与「{}」相同", canonical)],
+                    },
+                    Some(idx),
+                ));
+            }
+        }
+
+        let mut best_similarity: Option<(f64, usize)> = None;
+        for (i, profile) in self.profiles.iter().enumerate() {
+            if Some(i) == self_idx {
+                continue;
+            }
+            if let Some(self_i) = self_idx {
+                if i > self_i {
+                    continue;
+                }
+            }
+            let sim = self.similarity(&normalized, &self.normalize(&profile.term));
+            if sim >= self.similarity_threshold
+                && best_similarity.map_or(true, |(b, _)| sim > b)
+            {
+                best_similarity = Some((sim, i));
+            }
+        }
+        if let Some((sim, i)) = best_similarity {
+            return Some((
+                AlignmentPair {
+                    source: term.to_string(),
+                    target: self.profiles[i].term.clone(),
+                    kind: AlignmentKind::Similarity,
+                    confidence: sim,
+                    evidence: vec![format!("字面相似度 {:.2}", sim)],
+                },
+                Some(i),
+            ));
+        }
+
+        if let Some(profile) = self_idx.map(|i| &self.profiles[i]) {
+            let mut best_structural: Option<(f64, usize, Vec<String>)> = None;
+            for (i, other) in self.profiles.iter().enumerate() {
+                if Some(i) == self_idx || other.kind != profile.kind {
+                    continue;
+                }
+                if let Some(self_i) = self_idx {
+                    if i > self_i {
+                        continue;
+                    }
+                }
+                let shared: Vec<String> = profile
+                    .neighbors
+                    .intersection(&other.neighbors)
+                    .cloned()
+                    .collect();
+                if shared.len() < self.structural_min_shared {
+                    continue;
+                }
+                let union = profile.neighbors.union(&other.neighbors).count();
+                if union == 0 {
+                    continue;
+                }
+                let jaccard = shared.len() as f64 / union as f64;
+                if jaccard < self.structural_min_jaccard {
+                    continue;
+                }
+                let confidence = (0.5 + 0.5 * jaccard).min(0.95);
+                if best_structural
+                    .as_ref()
+                    .map_or(true, |(b, _, _)| confidence > *b)
+                {
+                    let mut evidence: Vec<String> = shared
+                        .iter()
+                        .take(3)
+                        .map(|n| format!("共同关系「{}」", n))
+                        .collect();
+                    evidence.push(format!("Jaccard {:.2}", jaccard));
+                    best_structural = Some((confidence, i, evidence));
+                }
+            }
+            if let Some((confidence, i, evidence)) = best_structural {
+                return Some((
+                    AlignmentPair {
+                        source: term.to_string(),
+                        target: self.profiles[i].term.clone(),
+                        kind: AlignmentKind::Structural,
+                        confidence,
+                        evidence,
+                    },
+                    Some(i),
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub fn resolve(&self, term: &str) -> Option<AlignmentPair> {
+        self.resolve_with_index(term).map(|(pair, _)| pair)
+    }
+
+    pub fn canonical_form(&self, term: &str) -> String {
+        if let Some(pair) = self.resolve(term) {
+            pair.target
+        } else {
+            term.to_string()
+        }
+    }
+
+    pub fn align_all(&self) -> Vec<AlignmentPair> {
+        let mut pairs = Vec::new();
+        for (i, profile) in self.profiles.iter().enumerate() {
+            if let Some((pair, target_idx)) = self.resolve_with_index(&profile.term) {
+                match target_idx {
+                    Some(t) if t >= i => continue,
+                    _ => pairs.push(pair),
+                }
+            }
+        }
+        pairs.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source.cmp(&b.source))
+        });
+        pairs
+    }
+
+    pub fn alignment_triples(&self) -> Vec<(String, String, String)> {
+        self.align_all()
+            .into_iter()
+            .map(|p| (p.source, "sameAs".to_string(), p.target))
+            .collect()
+    }
+
+    pub fn rewrite_triples(
+        &self,
+        triples: &[(String, String, String)],
+    ) -> (Vec<(String, String, String)>, Vec<AlignmentPair>) {
+        let mut rewritten = Vec::new();
+        let mut pairs = Vec::new();
+        let mut seen_triples: HashSet<(String, String, String)> = HashSet::new();
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+
+        for (s, p, o) in triples {
+            for part in [s, p, o] {
+                if let Some(pair) = self.resolve(part) {
+                    if seen_pairs.insert((pair.source.clone(), pair.target.clone())) {
+                        pairs.push(pair);
+                    }
+                }
+            }
+            let canonical = (
+                self.canonical_form(s),
+                self.canonical_form(p),
+                self.canonical_form(o),
+            );
+            if seen_triples.insert(canonical.clone()) {
+                rewritten.push(canonical);
+            }
+        }
+
+        pairs.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.source.cmp(&b.source))
+        });
+        (rewritten, pairs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synonyms() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("老婆".to_string(), "妻子".to_string());
+        m.insert("老公".to_string(), "丈夫".to_string());
+        m.insert("北大".to_string(), "北京大学".to_string());
+        m.insert("北京大学".to_string(), "北大".to_string());
+        m
+    }
+
+    #[test]
+    fn test_synonym_resolution() {
+        let aligner = OntologyAligner::new(synonyms(), 0.72);
+        let pair = aligner.resolve("老婆").expect("老婆应能对齐");
+        assert_eq!(pair.target, "妻子");
+        assert_eq!(pair.kind, AlignmentKind::Synonym);
+        assert!(pair.confidence > 0.9);
+        assert_eq!(aligner.canonical_form("老公"), "丈夫");
+    }
+
+    #[test]
+    fn test_synonym_cycle_terminates() {
+        let aligner = OntologyAligner::new(synonyms(), 0.72);
+        let form = aligner.canonical_form("北大");
+        assert!(form == "北大" || form == "北京大学");
+        let form2 = aligner.canonical_form("北京大学");
+        assert!(form2 == "北大" || form2 == "北京大学");
+    }
+
+    #[test]
+    fn test_normalized_alignment() {
+        let mut aligner = OntologyAligner::new(HashMap::new(), 0.9);
+        aligner.register_term("Python 语言", TermKind::Entity);
+        let pair = aligner.resolve("python语言").expect("空格与大小写差异应被规范化");
+        assert_eq!(pair.target, "Python 语言");
+        assert_eq!(pair.kind, AlignmentKind::Normalized);
+    }
+
+    #[test]
+    fn test_similarity_alignment() {
+        let mut aligner = OntologyAligner::new(HashMap::new(), 0.72);
+        aligner.register_term("北京大学", TermKind::Entity);
+        let pair = aligner.resolve("北京大学校").expect("包含关系应触发相似度对齐");
+        assert_eq!(pair.target, "北京大学");
+        assert_eq!(pair.kind, AlignmentKind::Similarity);
+        assert!(pair.confidence >= 0.72);
+    }
+
+    #[test]
+    fn test_structural_alignment() {
+        let mut aligner = OntologyAligner::new(HashMap::new(), 0.99);
+        aligner.observe_triple("苹果公司", "创始人", "乔布斯");
+        aligner.observe_triple("苹果公司", "产品", "iPhone");
+        aligner.observe_triple("苹果公司", "总部", "库比蒂诺");
+        aligner.observe_triple("apple", "创始人", "乔布斯");
+        aligner.observe_triple("apple", "产品", "iPhone");
+        aligner.observe_triple("apple", "总部", "加利福尼亚");
+        let pair = aligner.resolve("apple").expect("共享邻居应触发结构对齐");
+        assert_eq!(pair.target, "苹果公司");
+        assert_eq!(pair.kind, AlignmentKind::Structural);
+        assert!(pair.evidence.iter().any(|e| e.contains("乔布斯")));
+    }
+
+    #[test]
+    fn test_align_all_and_triples() {
+        let mut aligner = OntologyAligner::new(synonyms(), 0.8);
+        aligner.observe_triple("张三", "妻子", "李四");
+        aligner.observe_triple("张三的老婆", "妻子", "李四");
+        let pairs = aligner.align_all();
+        assert!(pairs.iter().any(|p| p.source == "张三的老婆" && p.target == "张三"));
+        let triples = aligner.alignment_triples();
+        assert!(triples
+            .iter()
+            .any(|(s, p, o)| s == "张三的老婆" && p == "sameAs" && o == "张三"));
+    }
+
+    #[test]
+    fn test_rewrite_triples_merges_duplicates() {
+        let mut aligner = OntologyAligner::new(synonyms(), 0.72);
+        aligner.observe_triple("张三", "妻子", "李四");
+        aligner.observe_triple("张三的老婆", "妻子", "李四");
+        let triples = vec![
+            (
+                "张三的老婆".to_string(),
+                "妻子".to_string(),
+                "李四".to_string(),
+            ),
+            ("张三".to_string(), "妻子".to_string(), "李四".to_string()),
+            ("张三".to_string(), "老婆".to_string(), "李四".to_string()),
+        ];
+        let (rewritten, pairs) = aligner.rewrite_triples(&triples);
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0].0, "张三");
+        assert_eq!(rewritten[0].1, "妻子");
+        assert!(pairs.iter().any(|p| p.source == "老婆" && p.target == "妻子"));
+        assert!(pairs.iter().any(|p| p.source == "张三的老婆" && p.target == "张三"));
+    }
+
+    #[test]
+    fn test_unknown_term_returns_none() {
+        let aligner = OntologyAligner::new(synonyms(), 0.95);
+        assert!(aligner.resolve("完全不存在的术语").is_none());
+        assert_eq!(aligner.canonical_form("完全不存在的术语"), "完全不存在的术语");
+    }
+}

@@ -1,0 +1,42 @@
+{
+  "@context": {
+    "kg": "http://example.org/kg/",
+    "name": "http://example.org/kg/name",
+    "师傅": "http://example.org/kg/师傅",
+    "师祖": "http://example.org/kg/师祖",
+    "Person": "http://example.org/kg/Person"
+  },
+  "@graph": [
+    {
+      "@id": "http://example.org/kg/entity/张三",
+      "@type": "Person",
+      "name": "张三",
+      "师傅": { "@id": "http://example.org/kg/entity/李四" },
+      "师祖": { "@id": "http://example.org/kg/entity/王五" }
+    },
+    {
+      "@id": "http://example.org/kg/entity/李四",
+      "@type": "Person",
+      "name": "李四",
+      "师傅": { "@id": "http://example.org/kg/entity/王五" },
+      "师祖": { "@id": "http://example.org/kg/entity/赵六" }
+    },
+    {
+      "@id": "http://example.org/kg/entity/王五",
+      "@type": "Person",
+      "name": "王五",
+      "师傅": { "@id": "http://example.org/kg/entity/赵六" }
+    },
+    {
+      "@id": "http://example.org/kg/entity/赵六",
+      "@type": "Person",
+      "name": "赵六",
+      "师傅": { "@id": "http://example.org/kg/entity/钱七" }
+    },
+    {
+      "@id": "http://example.org/kg/entity/钱七",
+      "@type": "Person",
+      "name": "钱七"
+    }
+  ]
+}

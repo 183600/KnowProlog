@@ -20,6 +20,7 @@ use know_prolog::{
     prolog_engine::PrologEngine,
     local_semantic_adapter::LocalSemanticAdapter,
     external_knowledge::{ExternalKnowledgeService, get_direct_answer},
+    symbolic_reasoner::SymbolicReasoner,
 };
 
 #[derive(Parser)]
@@ -132,6 +133,17 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
         create_default_synonyms()
     };
 
+    // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
+    let mut symbolic_reasoner = SymbolicReasoner::new(config.reasoning.clone(), synonyms.clone());
+    if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
+        symbolic_reasoner.observe_facts(&facts);
+    }
+    if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
+        if symbolic_reasoner.load_dialogue_state(state_path) {
+            println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
+        }
+    }
+
     println!("{}", config.messages.ready);
     println!("{}", config.messages.query_prompt);
     println!("{}", config.messages.import_prompt);
@@ -158,6 +170,51 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             break;
         }
 
+        if input == "对齐报告" || input == "本体对齐" {
+            match load_graph_snapshot(&oxigraph_manager).await {
+                Ok(facts) => {
+                    symbolic_reasoner.observe_facts(&facts);
+                    println!("{}", symbolic_reasoner.alignment_report());
+                }
+                Err(e) => println!("加载知识图谱失败: {}", e),
+            }
+            println!();
+            continue;
+        }
+
+        if input == "推理规则" || input == "链接预测规则" {
+            match load_graph_snapshot(&oxigraph_manager).await {
+                Ok(facts) => {
+                    symbolic_reasoner.observe_facts(&facts);
+                    println!("{}", symbolic_reasoner.rules_report());
+                }
+                Err(e) => println!("加载知识图谱失败: {}", e),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(entity) = input
+            .strip_prefix("相似实体：")
+            .or_else(|| input.strip_prefix("相似实体:"))
+            .or_else(|| input.strip_prefix("语义相似："))
+            .or_else(|| input.strip_prefix("语义相似:"))
+        {
+            match load_graph_snapshot(&oxigraph_manager).await {
+                Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                Err(e) => println!("加载知识图谱失败: {}", e),
+            }
+            println!("{}", symbolic_reasoner.similarity_report(entity));
+            println!();
+            continue;
+        }
+
+        if input == "对话记忆" {
+            println!("{}", symbolic_reasoner.dialogue_summary());
+            println!();
+            continue;
+        }
+
         let mode = detect_input_mode(input, &config.nlp.import_keywords);
 
         match mode {
@@ -179,6 +236,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     match oxigraph_manager.import_jsonld_from_file(&file_path).await {
                         Ok(_) => {
                             println!("JSON-LD 文件导入成功！");
+                            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                         }
                         Err(e) => {
                             eprintln!("JSON-LD 文件导入失败: {}", e);
@@ -200,6 +258,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     match oxigraph_manager.import_jsonld(&jsonld_content).await {
                         Ok(_) => {
                             println!("JSON-LD 内容导入成功！");
+                            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                         }
                         Err(e) => {
                             eprintln!("JSON-LD 内容导入失败: {}", e);
@@ -237,13 +296,26 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                         }
                         
                         match oxigraph_manager.save_knowledge(items).await {
-                            Ok(_) => println!("知识已成功保存"),
+                            Ok(_) => {
+                                println!("知识已成功保存");
+                                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                            }
                             Err(e) => eprintln!("保存失败: {}", e),
                         }
                     }
                 }
             }
             InputMode::Query => {
+                // 多轮对话上下文：指代消解与省略补全（符号方式，无神经网络）
+                let contextual_input = match symbolic_reasoner.contextualize(input) {
+                    Some(rewritten) => {
+                        println!("（结合对话上下文理解为：{}）", rewritten);
+                        rewritten
+                    }
+                    None => input.to_string(),
+                };
+                let input = contextual_input.as_str();
+
                 let tagged_words = preprocess(input, &config.nlp);
                 let normalized_words = normalize_words(tagged_words, &synonyms);
                 
@@ -347,7 +419,9 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     // 继续使用原有的查询逻辑
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                                         // 执行原有的查询流程
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, input, &query_type, &entities).await;
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities).await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, &config, input).await {
+                                        println!("{}", answer);
                                     } else {
                                         println!("无法理解您的查询，请重新描述您的问题。");
                                     }
@@ -356,7 +430,9 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到原有逻辑
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, input, &query_type, &entities).await;
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities).await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, &config, input).await {
+                                        println!("{}", answer);
                                     } else {
                                         println!("{}", config.messages.cannot_understand);
                                     }
@@ -414,8 +490,15 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                         let entity_name = entity_match.as_str().trim();
                         let attribute = attr_match.as_str().trim();
                         
-                        // 排除已经处理过的模式
-                        if !input.contains("信息") && !input.contains("什么") {
+                        // 排除已经处理过的模式与符号推理问句（谁/吗/几/多少等）
+                        if !input.contains("信息")
+                            && !input.contains("什么")
+                            && !input.contains("谁")
+                            && !input.contains("吗")
+                            && !input.contains("呢")
+                            && !input.contains("几")
+                            && !input.contains("多少")
+                        {
                             println!("正在查询实体 '{}' 的属性 '{}'...", entity_name, attribute);
                             
                             match local_semantic_adapter.get_entity_attribute_value(entity_name, attribute).await {
@@ -599,6 +682,15 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                             }
                         }
                     }
+                } else if let Some(answer) = try_symbolic_reasoning(
+                    &mut symbolic_reasoner,
+                    &oxigraph_manager,
+                    &config,
+                    input,
+                )
+                .await
+                {
+                    println!("{}", answer);
                 } else {
                     println!("{}", config.messages.cannot_understand);
                     
@@ -626,7 +718,43 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
         println!();
     }
 
+    if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
+        match symbolic_reasoner.save_dialogue_state(state_path) {
+            Ok(_) => println!("对话记忆已保存到 {}", state_path),
+            Err(e) => eprintln!("保存对话记忆失败: {}", e),
+        }
+    }
+
     println!("系统已退出。");
+}
+
+async fn load_graph_snapshot(
+    oxigraph_manager: &OxigraphManager,
+) -> Result<Vec<know_prolog::prolog_engine::PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut facts = oxigraph_manager.load_all_facts().await?;
+    facts.extend(oxigraph_manager.load_all_relations().await?);
+    Ok(facts)
+}
+
+async fn refresh_symbolic_reasoner(
+    symbolic_reasoner: &mut SymbolicReasoner,
+    oxigraph_manager: &OxigraphManager,
+) {
+    if let Ok(facts) = load_graph_snapshot(oxigraph_manager).await {
+        symbolic_reasoner.observe_facts(&facts);
+    }
+}
+
+async fn try_symbolic_reasoning(
+    symbolic_reasoner: &mut SymbolicReasoner,
+    oxigraph_manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+    input: &str,
+) -> Option<String> {
+    let entities = extract_query_entities(input, config);
+    let facts = oxigraph_manager.get_relevant_facts(&entities, 2).await.ok()?;
+    symbolic_reasoner.observe_facts(&facts);
+    symbolic_reasoner.answer(input)
 }
 
 async fn continue_original_query(
@@ -636,6 +764,7 @@ async fn continue_original_query(
     response_formatter: &ResponseFormatter,
     local_semantic_adapter: &LocalSemanticAdapter,
     external_knowledge_service: &ExternalKnowledgeService,
+    symbolic_reasoner: &mut SymbolicReasoner,
     input: &str,
     query_type: &str,
     entities: &[String]
@@ -740,6 +869,11 @@ async fn continue_original_query(
                 }
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
+                    if let Some(answer) =
+                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, config, input).await
+                    {
+                        println!("{}", answer);
+                    }
                 }
             }
         } else {
@@ -764,6 +898,11 @@ async fn continue_original_query(
                 }
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
+                    if let Some(answer) =
+                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, config, input).await
+                    {
+                        println!("{}", answer);
+                    }
                 }
             }
         }
@@ -789,22 +928,28 @@ async fn continue_original_query(
             }
             Err(e) => {
                 println!("{}: {}", config.messages.process_error, e);
-                
-                // 本地查询失败时，尝试外部知识API
-                println!("本地查询失败，尝试外部知识源...");
-                
-                if let Some(direct_answer) = get_direct_answer(input) {
-                    println!("根据常识知识库：{}", direct_answer);
+
+                if let Some(answer) =
+                    try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, config, input).await
+                {
+                    println!("{}", answer);
                 } else {
-                    match external_knowledge_service.answer_question(input).await {
-                        Ok(Some(answer)) => {
-                            println!("根据外部知识：{}", answer);
-                        }
-                        Ok(None) => {
-                            println!("很抱歉，我无法找到相关信息。");
-                        }
-                        Err(e) => {
-                            println!("查询外部知识时出错：{}。", e);
+                    // 本地查询失败时，尝试外部知识API
+                    println!("本地查询失败，尝试外部知识源...");
+
+                    if let Some(direct_answer) = get_direct_answer(input) {
+                        println!("根据常识知识库：{}", direct_answer);
+                    } else {
+                        match external_knowledge_service.answer_question(input).await {
+                            Ok(Some(answer)) => {
+                                println!("根据外部知识：{}", answer);
+                            }
+                            Ok(None) => {
+                                println!("很抱歉，我无法找到相关信息。");
+                            }
+                            Err(e) => {
+                                println!("查询外部知识时出错：{}。", e);
+                            }
                         }
                     }
                 }
