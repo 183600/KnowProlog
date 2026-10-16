@@ -2,8 +2,6 @@ use jieba_rs::Jieba;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionAnalysis {
@@ -74,10 +72,10 @@ pub struct Entity {
 
 pub struct QuestionAnalyzer {
     jieba: &'static Jieba,
-    question_patterns: Arc<RwLock<HashMap<QuestionType, Vec<Regex>>>>,
-    domain_keywords: Arc<RwLock<HashMap<Domain, Vec<String>>>>,
-    intent_indicators: Arc<RwLock<HashMap<Intent, Vec<String>>>>,
-    entity_patterns: Arc<RwLock<Vec<(Regex, String)>>>,
+    question_patterns: HashMap<QuestionType, Vec<Regex>>,
+    domain_keywords: HashMap<Domain, Vec<String>>,
+    intent_indicators: HashMap<Intent, Vec<String>>,
+    entity_patterns: Vec<(Regex, String)>,
     stop_words: HashSet<String>,
 }
 
@@ -85,32 +83,22 @@ impl QuestionAnalyzer {
     pub fn new() -> Self {
         let jieba = crate::nlp::shared_jieba();
         
-        let stop_words = [
+        let stop_words: HashSet<String> = [
             "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是"
         ].iter().map(|s| s.to_string()).collect();
 
-        let analyzer = Self {
+        Self {
             jieba,
-            question_patterns: Arc::new(RwLock::new(HashMap::new())),
-            domain_keywords: Arc::new(RwLock::new(HashMap::new())),
-            intent_indicators: Arc::new(RwLock::new(HashMap::new())),
-            entity_patterns: Arc::new(RwLock::new(Vec::new())),
+            question_patterns: Self::initialize_question_patterns(),
+            domain_keywords: Self::initialize_domain_keywords(),
+            intent_indicators: Self::initialize_intent_indicators(),
+            entity_patterns: Self::initialize_entity_patterns(),
             stop_words,
-        };
-        
-        analyzer.initialize_patterns();
-        analyzer
+        }
     }
 
-    fn initialize_patterns(&self) {
-        self.initialize_question_patterns();
-        self.initialize_domain_keywords();
-        self.initialize_intent_indicators();
-        self.initialize_entity_patterns();
-    }
-
-    fn initialize_question_patterns(&self) {
-        let mut patterns = self.question_patterns.write();
+    fn initialize_question_patterns() -> HashMap<QuestionType, Vec<Regex>> {
+        let mut patterns = HashMap::new();
         
         // 事实查询模式
         patterns.insert(QuestionType::FactualQuery, vec![
@@ -182,10 +170,12 @@ impl QuestionAnalyzer {
             Regex::new(r"(.+)的过程").unwrap(),
             Regex::new(r"(.+)的步骤").unwrap(),
         ]);
+
+        patterns
     }
 
-    fn initialize_domain_keywords(&self) {
-        let mut domains = self.domain_keywords.write();
+    fn initialize_domain_keywords() -> HashMap<Domain, Vec<String>> {
+        let mut domains = HashMap::new();
         
         domains.insert(Domain::Geography, vec![
             "国家".to_string(), "首都".to_string(), "城市".to_string(), "海拔".to_string(), 
@@ -232,10 +222,12 @@ impl QuestionAnalyzer {
             "文化".to_string(), "艺术".to_string(), "绘画".to_string(), "音乐".to_string(),
             "梵高".to_string(), "星夜".to_string(), "希腊神话".to_string(), "内卷".to_string(),
         ]);
+
+        domains
     }
 
-    fn initialize_intent_indicators(&self) {
-        let mut intents = self.intent_indicators.write();
+    fn initialize_intent_indicators() -> HashMap<Intent, Vec<String>> {
+        let mut intents = HashMap::new();
         
         intents.insert(Intent::SeekInformation, vec![
             "是什么".to_string(), "是谁".to_string(), "是哪里".to_string(), "多少".to_string(),
@@ -265,10 +257,12 @@ impl QuestionAnalyzer {
             "影响".to_string(), "作用".to_string(), "效果".to_string(), "结果".to_string(),
             "意义".to_string(), "价值".to_string(),
         ]);
+
+        intents
     }
 
-    fn initialize_entity_patterns(&self) {
-        let mut patterns = self.entity_patterns.write();
+    fn initialize_entity_patterns() -> Vec<(Regex, String)> {
+        let mut patterns = Vec::new();
         
         // 地名实体
         patterns.push((Regex::new(r"[法德英美中日韩俄印澳][国]").unwrap(), "COUNTRY".to_string()));
@@ -288,6 +282,8 @@ impl QuestionAnalyzer {
         
         // 数量实体
         patterns.push((Regex::new(r"\d+(\.\d+)?(米|公里|千米|厘米|毫米|块|个|人|年|月|日)").unwrap(), "QUANTITY".to_string()));
+
+        patterns
     }
 
     pub async fn analyze_question(&self, question: &str) -> Result<QuestionAnalysis, Box<dyn std::error::Error + Send + Sync>> {
@@ -341,7 +337,7 @@ impl QuestionAnalyzer {
     }
 
     async fn identify_question_type(&self, question: &str) -> Result<QuestionType, Box<dyn std::error::Error + Send + Sync>> {
-        let patterns = self.question_patterns.read();
+        let patterns = &self.question_patterns;
         
         let mut scores: HashMap<QuestionType, f64> = HashMap::new();
         
@@ -387,7 +383,7 @@ impl QuestionAnalyzer {
     }
 
     async fn identify_domain(&self, question: &str) -> Result<Domain, Box<dyn std::error::Error + Send + Sync>> {
-        let domains = self.domain_keywords.read();
+        let domains = &self.domain_keywords;
         
         let mut scores: HashMap<Domain, f64> = HashMap::new();
         
@@ -437,7 +433,7 @@ impl QuestionAnalyzer {
     }
 
     async fn identify_intent(&self, question: &str) -> Result<Intent, Box<dyn std::error::Error + Send + Sync>> {
-        let intents = self.intent_indicators.read();
+        let intents = &self.intent_indicators;
         
         let mut scores: HashMap<Intent, f64> = HashMap::new();
         
@@ -461,7 +457,7 @@ impl QuestionAnalyzer {
     }
 
     async fn extract_entities(&self, question: &str) -> Result<Vec<Entity>, Box<dyn std::error::Error + Send + Sync>> {
-        let patterns = self.entity_patterns.read();
+        let patterns = &self.entity_patterns;
         let mut entities = Vec::new();
         
         for (regex, entity_type) in patterns.iter() {

@@ -911,10 +911,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
 async fn load_graph_snapshot(
     oxigraph_manager: &OxigraphManager,
-) -> Result<Vec<know_prolog::prolog_engine::PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut facts = oxigraph_manager.load_all_facts().await?;
-    facts.extend(oxigraph_manager.load_all_relations().await?);
-    Ok(facts)
+) -> Result<Arc<Vec<know_prolog::prolog_engine::PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
+    oxigraph_manager.load_graph_snapshot().await
 }
 
 async fn refresh_symbolic_reasoner(

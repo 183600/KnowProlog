@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use toml;
@@ -39,6 +40,8 @@ use prolog_engine::PrologFact;
 // RDF命名空间
 const BASE_NS: &str = "http://example.org/kg/";
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const NAME_PREDICATE_IRI: &str = "http://example.org/kg/name";
 
 #[derive(Debug)]
 pub struct QueryResult {
@@ -517,6 +520,9 @@ impl KnowledgeExtractor {
 // Oxigraph操作管理器
 pub struct OxigraphManager {
     store: Arc<Mutex<Store>>,
+    // 每次写操作自增，用于判定缓存的整图快照是否仍然有效
+    revision: AtomicU64,
+    snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
 }
 
 impl OxigraphManager {
@@ -541,10 +547,14 @@ impl OxigraphManager {
         let store = Store::open(&expanded_path)?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
+            revision: AtomicU64::new(0),
+            snapshot_cache: parking_lot::Mutex::new(None),
         })
     }
 
     pub async fn import_jsonld(&self, jsonld_content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 写前先失效整图快照缓存
+        self.revision.fetch_add(1, Ordering::AcqRel);
         let store = self.store.lock().await;
         
         // 解析 JSON-LD 内容
@@ -779,6 +789,8 @@ impl OxigraphManager {
     }
 
     pub async fn save_knowledge(&self, items: Vec<KnowledgeItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 写前先失效整图快照缓存
+        self.revision.fetch_add(1, Ordering::AcqRel);
         let store = self.store.lock().await;
         
         for item in items {
@@ -907,106 +919,140 @@ impl OxigraphManager {
         self.load_all_facts_internal(&store).await
     }
 
-    async fn load_all_facts_internal(&self, store: &Store) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut facts = Vec::new();
-        
-        // 查询所有实体
-        let query = r#"
-            PREFIX kg: <http://example.org/kg/>
-            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-            
-            SELECT ?entity ?type ?prop ?value
-            WHERE {
-                ?entity rdf:type ?type .
-                OPTIONAL { ?entity ?prop ?value . FILTER(?prop != rdf:type) }
+    /// 整图快照（实体属性 + 关系），在两次写操作之间复用缓存，避免重复全量扫描。
+    ///
+    /// 正确性依赖：所有写入口在修改存储前自增 `revision`，且存储只增不删；
+    /// 因此命中缓存意味着自缓存构建以来没有任何写发生，内容必然一致。
+    pub async fn load_graph_snapshot(&self) -> Result<Arc<Vec<PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
+        let revision = self.revision.load(Ordering::Acquire);
+        {
+            let cache = self.snapshot_cache.lock();
+            if let Some((cached_revision, snapshot)) = cache.as_ref() {
+                if *cached_revision == revision {
+                    return Ok(snapshot.clone());
+                }
             }
-        "#;
-        
-        match Query::parse(query, None) {
-            Ok(query_obj) => {
-                match store.query(query_obj) {
-                    Ok(results) => {
-                        if let QueryResults::Solutions(solutions) = results {
-                            let mut entity_data: HashMap<String, (String, HashMap<String, String>)> = HashMap::new();
-                            
-                            for solution in solutions {
-                                if let Ok(solution) = solution {
-                                    if let (Some(entity), Some(entity_type)) = (solution.get("entity"), solution.get("type")) {
-                                        let entity_str = entity.to_string();
-                                        let type_str = entity_type.to_string();
-                                        
-                                        // 提取实体名称（去掉URI前缀）
-                                        let entity_name = if entity_str.contains("entity/") {
-                                            entity_str.split("entity/").last().unwrap_or(&entity_str)
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_string()
-                                        } else {
-                                            entity_str.trim_matches(|c| c == '<' || c == '>').to_string()
-                                        };
-                                        
-                                        // 提取类型名称（去掉URI前缀）
-                                        let type_name = if type_str.contains(BASE_NS) {
-                                            type_str.replace(BASE_NS, "")
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_lowercase()
-                                        } else {
-                                            type_str
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_lowercase()
-                                        };
-                                        
-                                        // 获取或创建实体数据
-                                        let entry = entity_data.entry(entity_name.clone())
-                                            .or_insert_with(|| (type_name, HashMap::new()));
-                                        
-                                        // 添加属性
-                                        if let (Some(prop), Some(value)) = (solution.get("prop"), solution.get("value")) {
-                                            let prop_str = prop.to_string();
-                                            let prop_name = if prop_str.contains(BASE_NS) {
-                                                prop_str.replace(BASE_NS, "")
-                                                    .trim_matches(|c| c == '<' || c == '>')
-                                                    .to_string()
-                                            } else {
-                                                prop_str.trim_matches(|c| c == '<' || c == '>').to_string()
-                                            };
-                                            
-                                            let value_str = if let Term::Literal(lit) = value {
-                                                lit.value().to_string()
-                                            } else {
-                                                value.to_string()
-                                                    .trim_matches(|c| c == '<' || c == '>')
-                                                    .to_string()
-                                            };
-                                            
-                                            entry.1.insert(prop_name, value_str);
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // 转换为Prolog事实
-                            for (entity_name, (entity_type, properties)) in entity_data {
-                                facts.push(PrologFact::Entity {
-                                    name: entity_name,
-                                    entity_type,
-                                    properties,
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("SPARQL查询执行失败: {}", e);
-                        return Err(Box::new(e));
+        }
+
+        let (facts, relations) = {
+            let store = self.store.lock().await;
+            Self::scan_graph_parts(&store)
+        };
+        let mut snapshot_facts = facts;
+        snapshot_facts.extend(relations);
+        let snapshot = Arc::new(snapshot_facts);
+
+        let mut cache = self.snapshot_cache.lock();
+        *cache = Some((revision, snapshot.clone()));
+        Ok(snapshot)
+    }
+
+    async fn load_all_facts_internal(&self, store: &Store) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self::scan_graph_parts(store).0)
+    }
+
+    /// 单次遍历存储，同时构建整图的实体事实与关系事实。
+    ///
+    /// 与逐条 SPARQL 查询相比，直接迭代四元组避免了查询引擎的联接开销；
+    /// 语义与 `load_all_facts` + `load_all_relations` 的组合保持一致：
+    /// - 实体只保留拥有 `rdf:type` 的主体；同一实体多个类型时取最先遇到者，
+    ///   重复属性取最后遇到者（与原先 SPARQL 解流的顺序一致，均为按主体聚簇的存储序）；
+    /// - 关系仅保留两端都有 `kg:name` 的命名主体，且排除自环与 `rdf:type`。
+    fn scan_graph_parts(store: &Store) -> (Vec<PrologFact>, Vec<PrologFact>) {
+        let mut entity_types: HashMap<String, String> = HashMap::new();
+        let mut entity_props: HashMap<String, HashMap<String, String>> = HashMap::new();
+        let mut subject_names: HashMap<Term, Vec<String>> = HashMap::new();
+        let mut relation_candidates: Vec<(Term, Term, String)> = Vec::new();
+
+        for quad in store.iter() {
+            let quad = match quad {
+                Ok(quad) => quad,
+                Err(_) => continue,
+            };
+
+            let subject_str = Term::from(quad.subject.clone()).to_string();
+            let entity_name = if let Some((_, tail)) = subject_str.rsplit_once("entity/") {
+                tail.trim_matches(|c| c == '<' || c == '>').to_string()
+            } else {
+                subject_str.trim_matches(|c| c == '<' || c == '>').to_string()
+            };
+
+            if quad.predicate.as_str() == RDF_TYPE_IRI {
+                let type_str = quad.object.to_string();
+                let type_name = if type_str.contains(BASE_NS) {
+                    type_str.replace(BASE_NS, "")
+                        .trim_matches(|c| c == '<' || c == '>')
+                        .to_lowercase()
+                } else {
+                    type_str.trim_matches(|c| c == '<' || c == '>').to_lowercase()
+                };
+                entity_types.entry(entity_name).or_insert(type_name);
+                continue;
+            }
+
+            let is_name_predicate = quad.predicate.as_str() == NAME_PREDICATE_IRI;
+            let prop_str = Term::from(quad.predicate).to_string();
+            let prop_name = if prop_str.contains(BASE_NS) {
+                prop_str.replace(BASE_NS, "")
+                    .trim_matches(|c| c == '<' || c == '>')
+                    .to_string()
+            } else {
+                prop_str.trim_matches(|c| c == '<' || c == '>').to_string()
+            };
+
+            let value_str = if let Term::Literal(lit) = &quad.object {
+                lit.value().to_string()
+            } else {
+                quad.object.to_string()
+                    .trim_matches(|c| c == '<' || c == '>')
+                    .to_string()
+            };
+
+            entity_props.entry(entity_name).or_default().insert(prop_name.clone(), value_str);
+
+            if is_name_predicate {
+                subject_names.entry(Term::from(quad.subject.clone())).or_default().push(
+                    if let Term::Literal(lit) = &quad.object {
+                        lit.value().to_string()
+                    } else {
+                        quad.object.to_string()
+                    },
+                );
+            }
+            relation_candidates.push((Term::from(quad.subject), quad.object, prop_name));
+        }
+
+        let mut facts = Vec::with_capacity(entity_types.len());
+        for (entity_name, entity_type) in entity_types {
+            let properties = entity_props.remove(&entity_name).unwrap_or_default();
+            facts.push(PrologFact::Entity {
+                name: entity_name,
+                entity_type,
+                properties,
+            });
+        }
+
+        let mut relations = Vec::with_capacity(relation_candidates.len());
+        for (from, to, rel_type) in relation_candidates {
+            if from == to {
+                continue;
+            }
+            if let (Some(from_names), Some(to_names)) =
+                (subject_names.get(&from), subject_names.get(&to))
+            {
+                for from_name in from_names {
+                    for to_name in to_names {
+                        relations.push(PrologFact::Relation {
+                            from: from_name.clone(),
+                            rel_type: rel_type.clone(),
+                            to: to_name.clone(),
+                        });
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("SPARQL查询解析失败: {}", e);
-                return Err(Box::new(e));
-            }
         }
-        
-        Ok(facts)
+
+        (facts, relations)
     }
     
     pub async fn get_direct_answer(&self, query_type: &str, entities: &[String]) -> Option<String> {
@@ -1503,19 +1549,7 @@ impl OxigraphManager {
 
     pub async fn load_all_relations(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
-        let query = r#"
-            PREFIX kg: <http://example.org/kg/>
-            PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-
-            SELECT ?from_name ?to_name ?rel WHERE {
-                ?from kg:name ?from_name .
-                ?to kg:name ?to_name .
-                ?from ?rel ?to .
-                FILTER(?rel != rdf:type)
-                FILTER(?from != ?to)
-            }
-        "#;
-        self.query_relations(&store, query).await
+        Ok(Self::scan_graph_parts(&store).1)
     }
 
     async fn find_relations_between(&self, store: &Store, entities: &std::collections::HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {

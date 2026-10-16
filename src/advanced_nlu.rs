@@ -2,7 +2,6 @@ use jieba_rs::Jieba;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,47 +66,35 @@ pub struct EntityPattern {
 
 pub struct AdvancedNLU {
     jieba: &'static Jieba,
-    intent_patterns: Arc<RwLock<HashMap<String, IntentPattern>>>,
-    entity_patterns: Arc<RwLock<HashMap<String, EntityPattern>>>,
-    domain_keywords: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    temporal_patterns: Arc<RwLock<Vec<(Regex, String)>>>,
-    spatial_patterns: Arc<RwLock<Vec<(Regex, String)>>>,
-    number_patterns: Arc<RwLock<Vec<(Regex, String)>>>,
-    context_memory: Arc<RwLock<Vec<QueryContext>>>,
-    entity_regex_cache: Arc<RwLock<HashMap<String, Regex>>>,
+    intent_patterns: RwLock<HashMap<String, IntentPattern>>,
+    entity_patterns: RwLock<HashMap<String, EntityPattern>>,
+    domain_keywords: HashMap<String, Vec<String>>,
+    temporal_patterns: Vec<(Regex, String)>,
+    spatial_patterns: Vec<(Regex, String)>,
+    number_patterns: Vec<(Regex, String)>,
+    context_memory: RwLock<Vec<QueryContext>>,
+    entity_regex_cache: RwLock<HashMap<String, Regex>>,
 }
 
 impl AdvancedNLU {
     pub fn new() -> Self {
         let jieba = crate::nlp::shared_jieba();
 
-        let nlu = Self {
+        Self {
             jieba,
-            intent_patterns: Arc::new(RwLock::new(HashMap::new())),
-            entity_patterns: Arc::new(RwLock::new(HashMap::new())),
-            domain_keywords: Arc::new(RwLock::new(HashMap::new())),
-            temporal_patterns: Arc::new(RwLock::new(Vec::new())),
-            spatial_patterns: Arc::new(RwLock::new(Vec::new())),
-            number_patterns: Arc::new(RwLock::new(Vec::new())),
-            context_memory: Arc::new(RwLock::new(Vec::new())),
-            entity_regex_cache: Arc::new(RwLock::new(HashMap::new())),
-        };
-        
-        nlu.initialize_default_patterns();
-        nlu
+            intent_patterns: RwLock::new(Self::initialize_intent_patterns()),
+            entity_patterns: RwLock::new(Self::initialize_entity_patterns()),
+            domain_keywords: Self::initialize_domain_keywords(),
+            temporal_patterns: Self::initialize_temporal_patterns(),
+            spatial_patterns: Self::initialize_spatial_patterns(),
+            number_patterns: Self::initialize_number_patterns(),
+            context_memory: RwLock::new(Vec::new()),
+            entity_regex_cache: RwLock::new(HashMap::new()),
+        }
     }
 
-    fn initialize_default_patterns(&self) {
-        self.initialize_intent_patterns();
-        self.initialize_entity_patterns();
-        self.initialize_temporal_patterns();
-        self.initialize_spatial_patterns();
-        self.initialize_number_patterns();
-        self.initialize_domain_keywords();
-    }
-
-    fn initialize_intent_patterns(&self) {
-        let mut patterns = self.intent_patterns.write();
+    fn initialize_intent_patterns() -> HashMap<String, IntentPattern> {
+        let mut patterns = HashMap::new();
         
         // 实体查询意图
         patterns.insert("entity_query".to_string(), IntentPattern {
@@ -223,10 +210,12 @@ impl AdvancedNLU {
             ],
             priority: 7,
         });
+
+        patterns
     }
 
-    fn initialize_entity_patterns(&self) {
-        let mut patterns = self.entity_patterns.write();
+    fn initialize_entity_patterns() -> HashMap<String, EntityPattern> {
+        let mut patterns = HashMap::new();
         
         patterns.insert("PERSON".to_string(), EntityPattern {
             entity_type: "PERSON".to_string(),
@@ -306,12 +295,12 @@ impl AdvancedNLU {
                 "重量".to_string(), "长度".to_string(), "面积".to_string(),
             ],
         });
+
+        patterns
     }
 
-    fn initialize_temporal_patterns(&self) {
-        let mut patterns = self.temporal_patterns.write();
-        
-        patterns.extend(vec![
+    fn initialize_temporal_patterns() -> Vec<(Regex, String)> {
+        vec![
             (Regex::new(r"(\d{4})年").unwrap(), "YEAR".to_string()),
             (Regex::new(r"(\d{1,2})月").unwrap(), "MONTH".to_string()),
             (Regex::new(r"(\d{1,2})日").unwrap(), "DAY".to_string()),
@@ -327,13 +316,11 @@ impl AdvancedNLU {
             (Regex::new(r"下个月").unwrap(), "NEXT_MONTH".to_string()),
             (Regex::new(r"去年").unwrap(), "LAST_YEAR".to_string()),
             (Regex::new(r"明年").unwrap(), "NEXT_YEAR".to_string()),
-        ]);
+        ]
     }
 
-    fn initialize_spatial_patterns(&self) {
-        let mut patterns = self.spatial_patterns.write();
-        
-        patterns.extend(vec![
+    fn initialize_spatial_patterns() -> Vec<(Regex, String)> {
+        vec![
             (Regex::new(r"这里|此处").unwrap(), "HERE".to_string()),
             (Regex::new(r"那里|彼处").unwrap(), "THERE".to_string()),
             (Regex::new(r"附近|周围|周边").unwrap(), "NEARBY".to_string()),
@@ -345,23 +332,21 @@ impl AdvancedNLU {
             (Regex::new(r"前面|前方").unwrap(), "FRONT".to_string()),
             (Regex::new(r"后面|后方").unwrap(), "BACK".to_string()),
             (Regex::new(r"中间|中央").unwrap(), "CENTER".to_string()),
-        ]);
+        ]
     }
 
-    fn initialize_number_patterns(&self) {
-        let mut patterns = self.number_patterns.write();
-        
-        patterns.extend(vec![
+    fn initialize_number_patterns() -> Vec<(Regex, String)> {
+        vec![
             (Regex::new(r"(\d+)").unwrap(), "ARABIC_NUMBER".to_string()),
             (Regex::new(r"([一二三四五六七八九十百千万亿两]+)").unwrap(), "CHINESE_NUMBER".to_string()),
             (Regex::new(r"(\d+\.\d+)").unwrap(), "DECIMAL".to_string()),
             (Regex::new(r"第(\d+)").unwrap(), "ORDINAL".to_string()),
             (Regex::new(r"(\d+)%").unwrap(), "PERCENTAGE".to_string()),
-        ]);
+        ]
     }
 
-    fn initialize_domain_keywords(&self) {
-        let mut domains = self.domain_keywords.write();
+    fn initialize_domain_keywords() -> HashMap<String, Vec<String>> {
+        let mut domains = HashMap::new();
         
         domains.insert("ENTERTAINMENT".to_string(), vec![
             "演员".to_string(), "歌手".to_string(), "电影".to_string(), "音乐".to_string(),
@@ -386,6 +371,8 @@ impl AdvancedNLU {
             "教授".to_string(), "学生".to_string(), "研究".to_string(), "学术".to_string(),
             "教育".to_string(), "课程".to_string(), "学位".to_string(),
         ]);
+
+        domains
     }
 
     pub async fn analyze_query(&self, query: &str) -> Result<IntentResult, Box<dyn std::error::Error>> {
@@ -749,7 +736,7 @@ impl AdvancedNLU {
 
     async fn extract_temporal_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        let temporal_patterns = self.temporal_patterns.read();
+        let temporal_patterns = &self.temporal_patterns;
         
         for (regex, time_type) in temporal_patterns.iter() {
             for mat in regex.find_iter(query) {
@@ -769,7 +756,7 @@ impl AdvancedNLU {
 
     async fn extract_spatial_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        let spatial_patterns = self.spatial_patterns.read();
+        let spatial_patterns = &self.spatial_patterns;
         
         for (regex, location_type) in spatial_patterns.iter() {
             for mat in regex.find_iter(query) {
@@ -789,7 +776,7 @@ impl AdvancedNLU {
 
     async fn extract_number_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        let number_patterns = self.number_patterns.read();
+        let number_patterns = &self.number_patterns;
         
         for (regex, _number_type) in number_patterns.iter() {
             for mat in regex.find_iter(query) {
@@ -938,7 +925,7 @@ impl AdvancedNLU {
     }
 
     async fn determine_domain(&self, query: &str, entities: &[ExtractedEntity]) -> Result<String, Box<dyn std::error::Error>> {
-        let domain_keywords = self.domain_keywords.read();
+        let domain_keywords = &self.domain_keywords;
         
         for (domain, keywords) in domain_keywords.iter() {
             for keyword in keywords {
