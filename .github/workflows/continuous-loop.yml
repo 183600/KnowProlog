@@ -1,0 +1,1024 @@
+name: Continuous Loop
+
+on:
+  workflow_dispatch:
+  # 每 5 分钟一次「心跳」+ 下面 concurrency 排队，保证「一个 job 结束后立刻触发下一个」：
+  # 任何时刻组内最多 1 个 running + 1 个 pending；当前 run 无论以何种方式结束
+  # （成功 / 失败 / 被取消 / runner 意外宕机），队列中的下一个 run 都会在几秒内开始。
+  # 即使收尾的 self-dispatch 步骤被 GitHub 跳过（runner 宕机时连 if: always()
+  # 步骤也不会执行），下一次心跳也能在 ≤5 分钟内补位续跑，链条永不断。
+  schedule:
+    - cron: '*/5 * * * *'
+
+concurrency:
+  group: continuous-loop
+  cancel-in-progress: false
+
+jobs:
+  run-opencode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free up disk space (keep miniconda)
+        run: |
+          set +e
+          echo "=== disk before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet \
+                      /usr/share/swift \
+                      /usr/local/lib/android \
+                      /usr/local/share/boost \
+                      /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get clean
+          echo "=== disk after cleanup ==="
+          df -h /
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Prefetch cargo dependencies
+        run: |
+          set +e
+          timeout 600 cargo fetch 2>&1 | tail -5 || echo "[warn] cargo fetch 超时/失败，首次 gate 时再拉取"
+
+      - name: Configure swap (safe version)
+        run: |
+          set -e
+          echo "=== Before ==="
+          free -h
+          df -h /
+
+          sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+
+          sudo modprobe zram 2>/dev/null || true
+          if [ -e /dev/zram0 ]; then
+            sudo swapoff /dev/zram0 2>/dev/null || true
+            echo 8G | sudo tee /sys/block/zram0/disksize >/dev/null || true
+            sudo mkswap /dev/zram0 >/dev/null 2>&1 || true
+            sudo swapon -p 100 /dev/zram0 2>/dev/null && echo "[ok] zram enabled (8G, prio=100)" \
+              || echo "[warn] zram enable failed"
+          else
+            echo "[info] zram not available, skip"
+          fi
+
+          AVAIL_KB=$(df --output=avail / | tail -1)
+          AVAIL_MB=$((AVAIL_KB / 1024))
+          WANT_MB=$((AVAIL_MB - 3072))
+          if [ "$WANT_MB" -gt 8192 ]; then WANT_MB=8192; fi
+          if [ "$WANT_MB" -lt 2048 ]; then WANT_MB=2048; fi
+          echo "[info] available disk: ${AVAIL_MB}MB, will create swapfile: ${WANT_MB}MB"
+
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          if ! sudo fallocate -l "${WANT_MB}M" /swapfile 2>/dev/null; then
+            echo "[info] fallocate failed, falling back to dd"
+            sudo dd if=/dev/zero of=/swapfile bs=1M count=$WANT_MB status=none
+          fi
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile >/dev/null
+          sudo swapon -p 10 /swapfile && echo "[ok] swapfile enabled"
+
+          sudo sysctl -w vm.swappiness=100
+          sudo sysctl -w vm.vfs_cache_pressure=200
+          sudo sysctl -w vm.overcommit_memory=1
+          sudo sysctl -w vm.dirty_ratio=40
+          sudo sysctl -w vm.dirty_background_ratio=10
+          sudo sysctl -w vm.watermark_scale_factor=200 2>/dev/null || true
+
+          echo "=== After ==="
+          free -h
+          swapon --show
+          df -h /
+
+      - name: Install opencode
+        run: npm i -g opencode-ai
+
+      - name: Configure opencode (free models + tamper protection)
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          # opencode 自带的 OpenCode Zen 免费 provider 无需任何 API key；
+          # 如需更高限额，可在仓库 secrets 里可选配置 OPENCODE_API_KEY。
+          if [ -n "$OPENCODE_API_KEY" ]; then
+            echo "[info] OPENCODE_API_KEY 已配置（用于提升免费模型限额）"
+          else
+            echo "[info] 未配置 OPENCODE_API_KEY，匿名使用免费模型（有速率限制）"
+          fi
+          mkdir -p ~/.config/opencode
+          # 免费模型路径的基准配置（权限锁定）；NVIDIA 路径的配置由主循环的探测脚本
+          # 以本文件为基础合并生成 opencode.nvidia.json（保留同样的权限锁定）。
+          cat > ~/.config/opencode/opencode.free.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {
+              "*": "allow",
+              "edit": {
+                "*": "allow",
+                ".github/**": "deny",
+                "**/.github/**": "deny",
+                "LICENSE": "deny",
+                "LICENSE.*": "deny",
+                "**/LICENSE": "deny",
+                "**/LICENSE.*": "deny",
+                "tests/**": "deny",
+                "**/tests/**": "deny"
+              },
+              "bash": {
+                "*": "allow",
+                "rm -rf .github*": "deny",
+                "rm -r .github*": "deny",
+                "rm .github*": "deny",
+                "mv .github*": "deny",
+                "git rm -r .github*": "deny",
+                "rm *LICENSE*": "deny",
+                "mv *LICENSE*": "deny",
+                "cp *LICENSE*": "deny",
+                "git rm *LICENSE*": "deny",
+                "git mv *LICENSE*": "deny",
+                "shred *LICENSE*": "deny",
+                "truncate *LICENSE*": "deny",
+                "unlink *LICENSE*": "deny",
+                "dd *of=LICENSE*": "deny",
+                "find * -name *LICENSE*": "deny",
+                "rm *PLAN.md": "deny",
+                "mv *PLAN.md": "deny",
+                "git rm *PLAN.md": "deny",
+                "rm -r tests*": "deny",
+                "rm -rf tests*": "deny",
+                "mv tests*": "deny",
+                "git rm -r tests*": "deny",
+                "git push*": "deny",
+                "git checkout --orphan*": "deny",
+                "git switch --orphan*": "deny",
+                "git filter-branch*": "deny",
+                "git rebase*": "deny",
+                "git branch -D*": "deny",
+                "git update-ref*": "deny",
+                "git symbolic-ref*": "deny",
+                "git reflog*": "deny",
+                "git gc*": "deny",
+                "git remote add*": "deny",
+                "git remote remove*": "deny",
+                "git remote set-url*": "deny"
+              }
+            }
+          }
+          EOF
+          cp -f ~/.config/opencode/opencode.free.json ~/.config/opencode/opencode.json
+          echo "[guard] opencode 权限已锁定：edit/bash 对 .github/** 与 LICENSE 禁止操作"
+
+          echo "=== OpenCode Zen 可用模型目录 ==="
+          opencode models opencode 2>/dev/null \
+            || opencode models 2>/dev/null | grep -F 'opencode/' \
+            || echo "[warn] 暂时无法获取模型列表，将在运行时重试"
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup xuen (improve 阶段的 agent 编排器)
+        run: |
+          set -e
+          for i in 1 2 3; do
+            git clone --depth 1 https://github.com/183600/xuen.git /tmp/xuen && break
+            rm -rf /tmp/xuen; sleep 10
+          done
+          [ -d /tmp/xuen ] || { echo "[error] 无法克隆 xuen 仓库"; exit 1; }
+          python3 -m pip install --quiet -r /tmp/xuen/requirements.txt
+          mkdir -p /tmp/xuen_ws
+          cat > /tmp/xuen/config.yaml <<'EOF'
+          agent:
+            # 由主循环在启动 xuen 前导出 XUEN_MODEL / XUEN_MODEL_FLAGS，
+            # 这里经 shell 环境变量展开，保证与 opencode 直连路径同一套动态选模。
+            command: 'opencode run -m "$XUEN_MODEL" $XUEN_MODEL_FLAGS "$prompt"'
+            timeout: 1200
+          extra_notes: |
+            你是在项目仓库根目录下直接工作的编码 agent：请直接修改、新增项目源代码来落实本轮改进，
+            而不是只写文字方案；每轮结束时把本轮关键改动与下一步计划写入产物区。
+            改进方向：让系统像 LLM 一样具备自然语言理解与生成能力（多轮对话、上下文记忆、
+            生成式回答），但实现路径完全是符号主义的（知识图谱、规则、逻辑推理、检索与
+            组合生成），不引入神经网络与权重训练。每次改动后运行 cargo check --all-targets
+            自检，不通过就自己修好，并尽量运行 cargo test 验证。不得删除或削弱测试；
+            .github 目录、LICENSE、README*.md、tests/ 绝对不能删除、修改或移动。
+          words:
+            count: 200
+            batch: 100
+            pick: 2
+            reuse: true
+          loop:
+            iterations: 2
+          tui: false
+          color: false
+          workspace: /tmp/xuen_ws
+          EOF
+          echo "[ok] xuen 就绪（工作区 /tmp/xuen_ws，每轮 2 个灵感词）"
+
+      - name: Run agent loop for ~5 hours (4 phases per iteration)
+        timeout-minutes: 300
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          set +e
+          set -o pipefail
+          BRANCH="${GITHUB_REF_NAME:-master}"
+          OUT=/tmp/oc_out.log
+          DEADLINE=$(( $(date +%s) + 4*3600 + 1800 ))
+
+          # ================= 四阶段提示词（perf -> bug -> improve -> clean） =================
+          # improve 阶段承接 ada-squash 原 apply 阶段的位置：任务为「改进这个项目」。
+          PROMPT_PERF='优化代码的性能和资源占用，可以改进算法、数据结构、缓存、并发与内存布局，但不得改变对外的功能语义。每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。不要输出或写入“优化了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动。'
+          PROMPT_BUG='仔细检查代码中是否存在bug，如果有就修改代码。修复必须保持原有功能语义不变，不得借修复之名做无意义的等价重写；不得削弱或删除测试。每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动。'
+          XUEN_TASK='改进这个项目，让这个项目变成像LLM一样的，但是是符号主义的'
+          PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORT*.md、临时调试脚本与调试输出等杂物；确保仓库中没有任何关于修复了哪些bug、优化或改进了哪些内容的记录（包括注释）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README*.md（含所有语言版本的 README）是项目说明文档，同样必须原样保留，不能删除或移动；tests/ 是测试套件，必须原样保留；知识库与语料等仍被项目引用或加载的数据文件（如 *.txt、*.jsonld）不属于“多余的内容”，必须保留。'
+
+          # 每阶段单次调用的最大时长（秒）
+          PERF_TIMEOUT=$((60*60))     # 1h
+          BUG_TIMEOUT=$((60*60))      # 1h
+          IMPROVE_TIMEOUT=$((50*60))   # 50m（xuen：2 轮 × 最长 20 分钟 + 首轮词库生成）
+          CLEAN_TIMEOUT=$((30*60))    # 30m
+
+          # ================= 动态模型池（不写死，实时读取线上目录） =================
+          # 池直接来自 `opencode models opencode` 的实时输出：模型上新自动入池、
+          # 下线自动出池，无需再改本文件。目录暂时不可达时池置空，
+          # pick_model 会在每个阶段开始时惰性重建重试。
+          # 现在同时通过 --verbose 读取每个模型支持的 variant（思考强度档位）。
+          declare -A MODEL_VARIANTS=()
+          # ================= 优先模型：deepseek-v4.1-flash-free =================
+          # 池中存在时始终优先选用；不存在时保持随机选择。
+          # 同一阶段内若优先模型刚失败/限流，则暂时回退随机，下个阶段开始时自动恢复优先。
+          PREFERRED_MODEL="opencode/deepseek-v4.1-flash-free"
+          PREFERRED_BROKEN=0
+
+          # ================= 副选 provider：NVIDIA GLM（每次抽样 20%） =================
+          # 其余 80% 走上方免费模型池（优先 deepseek-v4.1-flash-free，池不可达时随机）。
+          # NVIDIA 端点 https://integrate.api.nvidia.com/v1，模型优先 glm-5.3，目录中
+          # 不存在时自动改用 glm-5-3-flash；无 NVIDIA_API_KEY / 端点失效 / 无 GLM 模型时
+          # 自然回落免费模型。harness 保持统一：所有 provider 一律通过同一 agent CLI 调用。
+          NVIDIA_PROB=20
+          NVIDIA_MODEL=""
+          CURRENT_PROVIDER="free"
+          PROVIDER_BROKEN=""
+
+          mark_broken() {
+            case ",$PROVIDER_BROKEN," in *",$1,"*) ;; *) PROVIDER_BROKEN="$PROVIDER_BROKEN${PROVIDER_BROKEN:+,}$1" ;; esac
+          }
+          is_broken() {
+            case ",$PROVIDER_BROKEN," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+          }
+
+          # ---------- NVIDIA GLM 探测：优先 glm-5.3，没有则 glm-5-3-flash ----------
+          # 探测成功同时把 nvidia provider 配置写入 ~/.config/opencode/opencode.nvidia.json
+          # （可选合并 $1 指定的基准配置，保留其中已有字段，如权限锁定）。
+          cat > /tmp/probe_nvidia.py <<'PYEOF'
+          import json, os, sys, urllib.request
+
+          def emit(status, model=''):
+              print((status + ' ' + model).strip())
+              sys.exit(0)
+
+          def norm(s):
+              return s.lower().replace('.', '-').replace('_', '-')
+
+          key = os.environ.get('NVIDIA_API_KEY', '').strip()
+          if not key:
+              emit('DOWN')
+          try:
+              req = urllib.request.Request(
+                  'https://integrate.api.nvidia.com/v1/models',
+                  headers={'Authorization': 'Bearer ' + key})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  d = json.load(r)
+          except Exception:
+              emit('DOWN')
+
+          ids = [m.get('id', '') for m in (d.get('data') or []) if m.get('id')]
+
+          def pick(cands, target):
+              if not cands:
+                  return ''
+              def keyf(x):
+                  return (0 if norm(x.rsplit('/', 1)[-1]) == target else 1, len(x))
+              return sorted(cands, key=keyf)[0]
+
+          primary = [i for i in ids if 'glm-5-3' in norm(i) and 'flash' not in norm(i)]
+          flash = [i for i in ids if 'glm-5-3' in norm(i) and 'flash' in norm(i)]
+          mid = pick(primary, 'glm-5-3') or pick(flash, 'glm-5-3-flash')
+          if not mid:
+              emit('NOMODEL')
+
+          cfg = {}
+          base = sys.argv[1] if len(sys.argv) > 1 else ''
+          if base and os.path.exists(base):
+              try:
+                  with open(base) as f:
+                      cfg = json.load(f)
+              except Exception:
+                  cfg = {}
+          cfg['$schema'] = 'https://opencode.ai/config.json'
+          cfg.setdefault('provider', {})
+          cfg['provider']['nvidia'] = {
+              'npm': '@ai-sdk/openai-compatible',
+              'name': 'NVIDIA',
+              'options': {
+                  'baseURL': 'https://integrate.api.nvidia.com/v1',
+                  'apiKey': '{env:NVIDIA_API_KEY}',
+              },
+              'models': {mid: {'name': mid}},
+          }
+          cfg['model'] = 'nvidia/' + mid
+          try:
+              os.makedirs(os.path.expanduser('~/.config/opencode'), exist_ok=True)
+              with open(os.path.expanduser('~/.config/opencode/opencode.nvidia.json'), 'w') as f:
+                  json.dump(cfg, f, indent=2, ensure_ascii=False)
+          except Exception:
+              pass
+          emit('OK', mid)
+          PYEOF
+
+          probe_nvidia() {
+            local out st mid
+            out="$(python3 /tmp/probe_nvidia.py "$HOME/.config/opencode/opencode.free.json" 2>/dev/null)" || out="DOWN"
+            st="${out%% *}"; mid="${out#* }"
+            if [ "$st" = "OK" ] && [ "$mid" != "$out" ] && [ -n "$mid" ]; then
+              NVIDIA_MODEL="$mid"; return 0
+            fi
+            NVIDIA_MODEL=""; return 1
+          }
+          # ---- 解析脚本：从 --verbose 输出提取模型 ID + 支持的 variant 列表 ----
+          # `opencode models --verbose` 在每个模型行后输出一段 JSON 元数据，其中
+          # variants 字段列出该模型支持的思考强度档位（如 deepseek-v4.1-flash-free
+          # 有 low/high/max）。输出两列（\t 分隔）：opencode/<model-id>  逗号分隔 variant。
+          cat > /tmp/parse_model_variants.py <<'PYEOF'
+          import sys, json, re
+          text = sys.stdin.read()
+          parts = re.split(r'(?m)^opencode/([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$', text)
+          for i in range(1, len(parts) - 1, 2):
+              mid, blob = parts[i], parts[i + 1]
+              try:
+                  meta = json.loads(blob)
+              except Exception:
+                  try:
+                      meta = json.loads(blob[:blob.rindex('}') + 1])
+                  except Exception:
+                      continue
+              variants = sorted((meta.get('variants') or {}).keys())
+              print('opencode/%s\t%s' % (mid, ','.join(variants)))
+          PYEOF
+          build_model_pool() {
+            local out tsv m v
+            local pool=()
+            # --refresh 强制拉取线上最新目录（避免 runner 本地缓存过期、错过新上的模型）；
+            # refresh 失败时自动回退缓存目录，仍失败则返回空，由 pick_model 惰性重建重试。
+            out="$(opencode models opencode --verbose --refresh 2>/dev/null \
+              || opencode models opencode --verbose 2>/dev/null \
+              || opencode models --verbose 2>/dev/null \
+              || true)"
+            [ -z "$out" ] && return 1
+            tsv="$(printf '%s\n' "$out" | python3 /tmp/parse_model_variants.py 2>/dev/null)" || true
+            [ -z "$tsv" ] && return 1
+            MODEL_VARIANTS=()
+            while IFS=$'\t' read -r m v; do
+              [ -n "$m" ] || continue
+              pool+=("$m")
+              MODEL_VARIANTS["$m"]="$v"
+            done <<< "$tsv"
+            [ ${#pool[@]} -eq 0 ] && return 1
+            FREE_MODELS=("${pool[@]}")
+            echo "[info] 动态模型池（${#FREE_MODELS[@]} 个）: ${FREE_MODELS[*]}"
+            if printf '%s\n' "${FREE_MODELS[@]}" | grep -qx -- "$PREFERRED_MODEL"; then
+              echo "[info] 优先模型在池中: $PREFERRED_MODEL (variant: ${MODEL_VARIANTS[$PREFERRED_MODEL]:-无})"
+            else
+              echo "[warn] 优先模型 $PREFERRED_MODEL 不在池中，本阶段改用随机模型"
+            fi
+            return 0
+          }
+          if ! build_model_pool; then
+            echo "[warn] 启动时读取模型目录失败，模型池暂空；将随阶段重试自动重建"
+            FREE_MODELS=()
+            MODEL_VARIANTS=()
+          fi
+
+          # ================= workflow 防删自愈 =================
+          # agent 的 clean 阶段可能把 .github 当作“多余内容”删除。
+          # 启动时保存触发版本的 workflow 原始副本（触发 commit 必然包含它），
+          # 每次提交前校验，一旦被删/被改立即恢复，保证循环链条永不断。
+          WF_PATH=".github/workflows/continuous-loop.yml"
+          PRISTINE=/tmp/wf_pristine.yml
+
+          fetch_pristine() {
+            # 优先：raw 直读触发 commit 的 workflow 文件（公共仓库免鉴权）
+            if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/${WF_PATH}" -o "$PRISTINE" 2>/dev/null && [ -s "$PRISTINE" ]; then
+              return 0
+            fi
+            # 备选：仓库工作区副本（私有仓库 raw 不可达时）
+            if [ -f "$WF_PATH" ]; then
+              cp "$WF_PATH" "$PRISTINE"
+              return 0
+            fi
+            return 1
+          }
+
+          ensure_workflow() {
+            [ -s "$PRISTINE" ] || return 0
+            if [ ! -f "$WF_PATH" ] || ! cmp -s "$WF_PATH" "$PRISTINE"; then
+              mkdir -p "$(dirname "$WF_PATH")"
+              cp "$PRISTINE" "$WF_PATH"
+              echo "[guard] 检测到 workflow 文件被删除/篡改，已自动恢复"
+            fi
+          }
+
+          if fetch_pristine && grep -q "Continuous Loop" "$PRISTINE"; then
+            echo "[guard] workflow 原始副本就绪（$(wc -l < "$PRISTINE") 行）"
+          else
+            echo "[warn] 无法获取 workflow 原始副本，自愈保护不可用"
+          fi
+          ensure_workflow
+
+          # ================= LICENSE 防删自愈 =================
+          # agent 的 clean 阶段可能把 LICENSE 当作“多余内容”删除或篡改。
+          # 启动时保存触发 commit 的 LICENSE 原始副本，
+          # 每次提交前校验，一旦被删/被改立即恢复，保证 LICENSE 永不丢失。
+          LICENSE_PATH="LICENSE"
+          LICENSE_PRISTINE=/tmp/license_pristine
+
+          fetch_license_pristine() {
+            # 优先：raw 直读触发 commit 的 LICENSE（公共仓库免鉴权）
+            if curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/LICENSE" -o "$LICENSE_PRISTINE" 2>/dev/null && [ -s "$LICENSE_PRISTINE" ]; then
+              return 0
+            fi
+            # 备选：仓库工作区副本（私有仓库 raw 不可达时）
+            if [ -f "$LICENSE_PATH" ]; then
+              cp "$LICENSE_PATH" "$LICENSE_PRISTINE"
+              return 0
+            fi
+            return 1
+          }
+
+          ensure_license() {
+            [ -s "$LICENSE_PRISTINE" ] || return 0
+            if [ ! -f "$LICENSE_PATH" ] || ! cmp -s "$LICENSE_PATH" "$LICENSE_PRISTINE"; then
+              cp "$LICENSE_PRISTINE" "$LICENSE_PATH"
+              echo "[guard] 检测到 LICENSE 被删除/篡改，已自动恢复"
+            fi
+          }
+
+          if fetch_license_pristine; then
+            echo "[guard] LICENSE 原始副本就绪（$(wc -c < "$LICENSE_PRISTINE") 字节）"
+          else
+            echo "[warn] 无法获取 LICENSE 原始副本，LICENSE 自愈保护不可用"
+          fi
+          ensure_license
+
+          # ================= README.md 防删自愈 =================
+          # clean 阶段可能把 README.md 当作“多余内容”删除。
+          # 每次提交前校验：一旦被删，立即从 HEAD（其次最近一个包含它的历史版本）恢复；
+          # 只防删除，允许正常的内容修改。
+          ensure_readme() {
+            # 保护所有语言版本的 README（README.md / README_zh.md / README_en.md）。
+            # 只防删除；内容修改不受影响。
+            for f in README.md README_zh.md README_en.md; do
+              [ -f "$f" ] && continue
+              if git show "HEAD:$f" > /tmp/readme_restore.md 2>/dev/null && [ -s /tmp/readme_restore.md ]; then
+                mv /tmp/readme_restore.md "$f"
+                echo "[guard] 检测到 $f 被删除，已从 HEAD 恢复"
+                continue
+              fi
+              F_SHA=$(git log --format=%H --diff-filter=AM -- "$f" 2>/dev/null | head -1)
+              if [ -n "$F_SHA" ] && git show "${F_SHA}:$f" > /tmp/readme_restore2.md 2>/dev/null && [ -s /tmp/readme_restore2.md ]; then
+                mv /tmp/readme_restore2.md "$f"
+                echo "[guard] 检测到 $f 被删除，已从历史版本 ${F_SHA:0:7} 恢复"
+              else
+                echo "[warn] $f 缺失且找不到可恢复的历史版本"
+              fi
+            done
+          }
+          ensure_readme
+
+          # ================= PLAN.md / 测试文件 防删自愈 =================
+          # PLAN.md（如有）是项目规划文档，只防删除，允许正常修改；
+          # 测试文件被删除时一律从 HEAD 恢复（同样允许正常修改）。
+          ensure_plan() {
+            [ -f PLAN.md ] && return 0
+            if git show "HEAD:PLAN.md" > /tmp/plan_restore.md 2>/dev/null && [ -s /tmp/plan_restore.md ]; then
+              mv /tmp/plan_restore.md PLAN.md
+              echo "[guard] 检测到 PLAN.md 被删除，已从 HEAD 恢复"
+            fi
+          }
+          ensure_tests() {
+            git ls-files -- 'tests' 2>/dev/null | while read -r f; do
+              [ -n "$f" ] || continue
+              if [ ! -e "$f" ]; then
+                git checkout HEAD -- "$f" 2>/dev/null && echo "[guard] 检测到测试文件 $f 被删除，已从 HEAD 恢复"
+              fi
+            done
+          }
+          ensure_plan
+          ensure_tests
+
+          # ================= 质量门禁 =================
+          # 门禁按仓库语言适配（编译/测试必须通过）；不通过则整段撤销。
+          gate_check() {
+            echo "=========== GATE CHECK ==========="
+            cargo check --all-targets --quiet 2>&1
+            local EC=$?
+            if [ $EC -eq 0 ]; then
+              echo "[gate] PASS"
+            else
+              echo "[gate] FAIL (exit=$EC) —— 本阶段改动将被撤销"
+            fi
+            return $EC
+          }
+
+          reject_phase() {
+            echo "[gate] git reset --hard HEAD + git clean -fd —— 撤销本阶段全部改动"
+            git reset --hard HEAD
+            git clean -fd
+            ensure_workflow
+            ensure_license
+          }
+
+          i=0
+          FAIL_COUNT=0
+          RATE_COUNT=0
+          CURRENT_MODEL=""
+          PREVIOUS_MODEL=""
+
+          commit_and_push() {
+            ensure_workflow
+            ensure_license
+            ensure_readme
+            ensure_plan
+            ensure_tests
+            git add -A || true
+            git commit -m "auto: iteration $1" || true
+            git pull --rebase origin "$BRANCH" || git rebase --abort || true
+            git push origin "HEAD:${BRANCH}" || echo "[warn] push $1 failed"
+          }
+
+          on_shutdown() {
+            echo "[trap] 收到 runner 终止信号，保存未提交的改动..."
+            ensure_workflow
+            ensure_license
+            ensure_readme
+            ensure_plan
+            ensure_tests
+            # 语法快速检查：半成品代码不允许进入历史（超时视为结果未知，保留改动）
+            SYNTAX_EC=0
+            timeout 1200 cargo check --all-targets --quiet >/dev/null 2>&1 || SYNTAX_EC=$?
+            if [ "$SYNTAX_EC" -ne 0 ] && [ "$SYNTAX_EC" -ne 124 ]; then
+              echo "[trap] 语法检查未通过，丢弃未提交改动"
+              git reset --hard HEAD
+              git clean -fd
+              exit 0
+            fi
+            [ "$SYNTAX_EC" -eq 124 ] && echo "[trap] 语法检查超时（结果未知），保留未提交改动"
+            git add -A || true
+            if ! git diff --cached --quiet; then
+              git commit -m "auto: partial work saved on shutdown" || true
+              git pull --rebase origin "$BRANCH" || git rebase --abort || true
+              git push origin "HEAD:${BRANCH}" || true
+              echo "[trap] partial work committed & pushed"
+            else
+              echo "[trap] nothing to commit"
+            fi
+            exit 0
+          }
+          trap on_shutdown TERM INT
+
+          # ---------- 选模型：优先 deepseek-v4.1-flash-free，没有则随机 ----------
+          # 1) 优先模型在池中、且本阶段内未刚失败/限流时，始终优先选用；
+          # 2) 否则保持随机选择，并尽量避免和上次相同。
+          # 池为空时先惰性重建（目录 API 瞬时故障的自愈）；
+          # 重建后仍为空则返回 1，由调用方计入失败并稍后重试。
+          pick_model() {
+            if [ ${#FREE_MODELS[@]} -eq 0 ]; then
+              build_model_pool || true
+            fi
+            local n=${#FREE_MODELS[@]}
+            if [ "$n" -eq 0 ]; then
+              CURRENT_MODEL=""
+              return 1
+            fi
+            local m="" x
+            if [ -n "$PREFERRED_MODEL" ] && [ "$PREFERRED_BROKEN" -ne 1 ]; then
+              for x in "${FREE_MODELS[@]}"; do
+                if [ "$x" = "$PREFERRED_MODEL" ]; then m="$x"; break; fi
+              done
+            fi
+            if [ -z "$m" ]; then
+              for _ in 1 2 3; do
+                m="${FREE_MODELS[$((RANDOM % n))]}"
+                if [ "$n" -le 1 ] || [ "$m" != "$PREVIOUS_MODEL" ]; then break; fi
+              done
+            fi
+            PREVIOUS_MODEL="$m"
+            CURRENT_MODEL="$m"
+            return 0
+          }
+
+          # ---------- 选 provider：80% 免费模型池 / 20% NVIDIA GLM ----------
+          # NVIDIA 路径：切换到「权限锁定 + nvidia provider」配置，模型 glm-5.3(-flash)；
+          # 免费路径：恢复权限锁定基准配置，再按原逻辑选模型（优先 deepseek-v4.1-flash-free）。
+          pick_provider() {
+            CURRENT_PROVIDER="free"
+            local roll=$((RANDOM % 100))
+            if [ "$roll" -lt "$NVIDIA_PROB" ]; then
+              if ! is_broken nvidia && probe_nvidia; then
+                cp -f "$HOME/.config/opencode/opencode.nvidia.json" "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
+                CURRENT_PROVIDER="nvidia"
+                CURRENT_MODEL="nvidia/$NVIDIA_MODEL"
+                PREVIOUS_MODEL="$CURRENT_MODEL"
+                echo "[info] 抽中 NVIDIA GLM（${NVIDIA_PROB}%）：$NVIDIA_MODEL"
+                return 0
+              fi
+              echo "[info] 抽中 NVIDIA 但不可用（无 key / 端点失效 / 无 glm-5.3(-flash)），回退免费模型"
+            fi
+            cp -f "$HOME/.config/opencode/opencode.free.json" "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
+            if ! pick_model; then
+              # 免费池不可用：尝试 NVIDIA 救场
+              if ! is_broken nvidia && probe_nvidia; then
+                cp -f "$HOME/.config/opencode/opencode.nvidia.json" "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
+                CURRENT_PROVIDER="nvidia"
+                CURRENT_MODEL="nvidia/$NVIDIA_MODEL"
+                PREVIOUS_MODEL="$CURRENT_MODEL"
+                echo "[info] 免费模型池不可用，改用 NVIDIA：$NVIDIA_MODEL"
+                return 0
+              fi
+              return 1
+            fi
+            return 0
+          }
+
+
+          # ---------- 确定模型思考强度：优先 max，无 max 用 high，都不支持则不设置 ----------
+          # 从模型官方元数据公布的 variant 列表中选取；都不支持时按默认方式启动
+          # （不传 --variant），避免传无效值导致启动失败。
+          variant_for() {
+            local v="${MODEL_VARIANTS[$1]:-}"
+            case ",$v," in
+              *,max,*)  echo "max" ;;
+              *,high,*) echo "high" ;;
+              *)        echo "" ;;
+            esac
+          }
+
+          # ---------- 单阶段执行（带重试 + 随机换模型） ----------
+          # 参数: phase_name  prompt  timeout_seconds
+          # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
+          run_phase() {
+            local phase="$1" prompt="$2" budget="$3"
+            local attempt=0
+            FAIL_COUNT=0
+            RATE_COUNT=0
+            # 每个阶段开始时恢复优先模型（每阶段总是优先尝试 deepseek-v4.1-flash-free）
+            # 并清除 NVIDIA 的阶段内失效标记
+            PREFERRED_BROKEN=0
+            PROVIDER_BROKEN=""
+
+            while [ $attempt -lt 3 ]; do
+              attempt=$((attempt+1))
+
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                echo "[info] phase=$phase 全局时间已用尽，跳过"
+                return 1
+              fi
+
+              if ! pick_provider; then
+                FAIL_COUNT=$((FAIL_COUNT+1))
+                echo "[warn] phase=$phase 免费池与 NVIDIA 均不可用（目录不可达），连续 $FAIL_COUNT 次，120s 后重试"
+                if [ $FAIL_COUNT -ge 3 ]; then
+                  echo "[warn] 连续 3 次拿不到可用模型，放弃该阶段"
+                  return 1
+                fi
+                sleep 120
+                continue
+              fi
+              # 思考强度：仅免费模型池的模型支持（优先 max，无 max 用 high），NVIDIA 不设置
+              local EFFORT="" VARFLAG=()
+              if [ "$CURRENT_PROVIDER" = "free" ]; then
+              EFFORT="$(variant_for "$CURRENT_MODEL")"
+              fi
+              if [ -n "$EFFORT" ]; then
+                VARFLAG=(--variant "$EFFORT")
+                echo "[info] model=$CURRENT_MODEL 思考强度=$EFFORT"
+              else
+                echo "[info] model=$CURRENT_MODEL 按默认档位启动"
+              fi
+              echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$CURRENT_MODEL effort=${EFFORT:-none} ==========="
+
+              timeout --kill-after=180 "$budget" opencode run -m "$CURRENT_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
+              local EC=$?
+
+              # 成功
+              if [ $EC -eq 0 ]; then
+                return 0
+              fi
+
+              # 超时 / 被杀
+              if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
+                echo "[warn] phase=$phase 超时/被杀 (exit=$EC)"
+                return $EC
+              fi
+
+              # 429 限流：休息一会儿，换 provider / 模型再试
+              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
+                RATE_COUNT=$((RATE_COUNT+1))
+                echo "[warn] phase=$phase 命中限流(429) (连续: $RATE_COUNT)，90s 后换 provider/模型重试"
+                if [ "$CURRENT_PROVIDER" = "nvidia" ]; then
+                  mark_broken nvidia
+                  echo "[info] NVIDIA 命中限流，本阶段内改走免费模型"
+                elif [ "$CURRENT_MODEL" = "$PREFERRED_MODEL" ]; then
+                  PREFERRED_BROKEN=1
+                  echo "[info] 优先模型命中限流，本阶段内改用随机模型"
+                fi
+                if [ $RATE_COUNT -ge 8 ]; then
+                  echo "[warn] 连续 8 次限流，放弃该阶段"
+                  return 1
+                fi
+                sleep 90
+                continue
+              fi
+
+              # 鉴权类错误提示（免费模型匿名限额耗尽/需要 key 时的排查线索）
+              if tail -40 "$OUT" | grep -qiE "401|unauthorized|invalid.{0,4}api.?key|missing.{0,4}api.?key"; then
+                echo "[hint] 疑似鉴权问题：匿名限额可能耗尽。可在仓库 secrets 配置 OPENCODE_API_KEY 提升限额后重试"
+              fi
+
+              # 其它非零退出：换 provider / 模型重试
+              FAIL_COUNT=$((FAIL_COUNT+1))
+              echo "[warn] phase=$phase provider=$CURRENT_PROVIDER 模型 $CURRENT_MODEL 失败 (连续: $FAIL_COUNT)，换 provider/模型重试"
+                if [ "$CURRENT_PROVIDER" = "nvidia" ]; then
+                  mark_broken nvidia
+                  echo "[info] NVIDIA 失败，本阶段内改走免费模型"
+                elif [ "$CURRENT_MODEL" = "$PREFERRED_MODEL" ]; then
+                  PREFERRED_BROKEN=1
+                  echo "[info] 优先模型失败，本阶段内改用随机模型"
+                fi
+              if [ $FAIL_COUNT -ge 3 ]; then
+                echo "[warn] 连续 3 次失败，放弃该阶段"
+                return 1
+              fi
+              sleep 30
+            done
+
+            return 1
+          }
+
+          # ---------- xuen 阶段执行（improve：随机灵感词 × 外部 agent 研究循环） ----------
+          # xuen 内部自带「每轮超时 + 连续 3 次失败中止」；外层 timeout 只做该阶段
+          # 的总预算兜底。xuen 退出后清理可能残留的 opencode 孤儿进程，避免与
+          # 后续阶段/门禁并发写仓库。模型选择与 opencode 直连路径共用 pick_provider。
+          run_xuen_phase() {
+            local budget="$1" task="$2"
+            local attempt=0
+            if [ ! -d /tmp/xuen ] || [ ! -f /tmp/xuen/config.yaml ]; then
+              echo "[warn] xuen 未就绪，跳过 improve 阶段"
+              return 1
+            fi
+            while [ $attempt -lt 2 ]; do
+              attempt=$((attempt+1))
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                echo "[info] phase=improve(xuen) 全局时间已用尽，跳过"
+                return 1
+              fi
+              if ! pick_provider; then
+                echo "[warn] phase=improve(xuen) 免费池与 NVIDIA 均不可用，120s 后重试"
+                sleep 120
+                continue
+              fi
+              local VARFLAGS=""
+              if [ "$CURRENT_PROVIDER" = "free" ]; then
+                local EFFORT
+                EFFORT="$(variant_for "$CURRENT_MODEL")"
+                [ -n "$EFFORT" ] && VARFLAGS="--variant $EFFORT"
+              fi
+              export XUEN_MODEL="$CURRENT_MODEL"
+              export XUEN_MODEL_FLAGS="$VARFLAGS"
+              echo "=========== iter #$i | phase=improve(xuen) | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$CURRENT_MODEL effort=${XUEN_MODEL_FLAGS:-none} ==========="
+              timeout --kill-after=180 "$budget" python3 /tmp/xuen/main.py "$task" --no-tui -c /tmp/xuen/config.yaml 2>&1 | tee "$OUT"
+              local EC=${PIPESTATUS[0]}
+              # 清理可能残留的 opencode 孤儿进程
+              pkill -f "opencode run" 2>/dev/null || true
+              sleep 2
+              pkill -9 -f "opencode run" 2>/dev/null || true
+              if [ $EC -eq 0 ]; then
+                return 0
+              fi
+              if [ $EC -eq 124 ] || [ $EC -eq 137 ] || [ $EC -eq 143 ]; then
+                echo "[warn] phase=improve(xuen) 超时/被杀 (exit=$EC)，保留已完成的改动"
+                return 0
+              fi
+              if tail -40 "$OUT" | grep -qiE "too many requests|rate.?limit|status.{0,3}429"; then
+                echo "[warn] phase=improve(xuen) 命中限流(429)，90s 后换 provider/模型重试"
+                if [ "$CURRENT_PROVIDER" = "nvidia" ]; then
+                  mark_broken nvidia
+                  echo "[info] NVIDIA 命中限流，改走免费模型"
+                fi
+                sleep 90
+                continue
+              fi
+              echo "[warn] phase=improve(xuen) 失败 (exit=$EC)"
+              return 1
+            done
+            return 1
+          }
+
+          # ================= 主循环 =================
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            i=$((i+1))
+
+            AVAIL_MB=$(( $(df --output=avail / | tail -1) / 1024 ))
+            echo "--- iteration #$i | free disk: ${AVAIL_MB}MB ---"
+            free -h | head -2
+            if [ "$AVAIL_MB" -lt 2048 ]; then
+              echo "[error] 磁盘剩余不足 2GB，提前结束循环，交给收尾步骤清理"
+              break
+            fi
+
+            # ----- 四个阶段：perf -> bug -> improve -> clean -----
+            for phase in perf bug improve clean; do
+              case "$phase" in
+                perf)    P="$PROMPT_PERF";    T="$PERF_TIMEOUT"    ;;
+                bug)     P="$PROMPT_BUG";     T="$BUG_TIMEOUT"     ;;
+                improve) P="$XUEN_TASK"; T="$IMPROVE_TIMEOUT" ;;
+                clean)   P="$PROMPT_CLEAN";   T="$CLEAN_TIMEOUT"   ;;
+              esac
+
+              # 收窄到剩余时间
+              REMAIN=$(( DEADLINE - $(date +%s) ))
+              if [ "$REMAIN" -le 0 ]; then
+                echo "[info] 全局时间已到，退出循环"
+                break 2
+              fi
+              if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
+
+              echo ">>> iteration #$i | phase=$phase | budget=${T}s"
+              if [ "$phase" = "improve" ]; then
+                run_xuen_phase "$T" "$P"
+              else
+                run_phase "$phase" "$P" "$T"
+              fi
+
+
+              # ---- 质量门禁：通过才提交；不通过则整段撤销 ----
+              if gate_check; then
+                commit_and_push "$i-$phase"
+              else
+                reject_phase
+              fi
+
+              sleep 5
+            done
+          done
+      - name: Cleanup repo artifacts
+        if: always()
+        run: |
+          set +e
+          find . -type f -name 'REPORT*.md'          -not -path './.git/*' -delete
+          find . -type f -name 'autodl_budget*.json' -not -path './.git/*' -delete
+
+      - name: Final commit and push
+        if: always()
+        run: |
+          set +e
+          # 防删自愈：收尾提交前恢复被删/改的 workflow
+          WF=".github/workflows/continuous-loop.yml"
+          PRISTINE=/tmp/wf_pristine.yml
+          if [ ! -s "$PRISTINE" ] && [ -n "${GITHUB_SHA:-}" ]; then
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/${WF}" -o "$PRISTINE" 2>/dev/null || true
+          fi
+          if [ -s "$PRISTINE" ] && { [ ! -f "$WF" ] || ! cmp -s "$WF" "$PRISTINE"; }; then
+            mkdir -p .github/workflows
+            cp "$PRISTINE" "$WF"
+            echo "[guard] 收尾阶段发现 workflow 被删/改，已恢复"
+          fi
+          # 防删自愈：收尾提交前恢复被删/改的 LICENSE
+          LIC="LICENSE"
+          LIC_PRISTINE=/tmp/license_pristine
+          if [ ! -s "$LIC_PRISTINE" ] && [ -n "${GITHUB_SHA:-}" ]; then
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/LICENSE" -o "$LIC_PRISTINE" 2>/dev/null || true
+          fi
+          if [ -s "$LIC_PRISTINE" ] && { [ ! -f "$LIC" ] || ! cmp -s "$LIC" "$LIC_PRISTINE"; }; then
+            cp "$LIC_PRISTINE" "$LIC"
+            echo "[guard] 收尾阶段发现 LICENSE 被删/改，已恢复"
+          fi
+          # 防删自愈：收尾提交前恢复被删的 README.md
+          if [ ! -f "README.md" ]; then
+            if git show HEAD:README.md > /tmp/readme_restore.md 2>/dev/null && [ -s /tmp/readme_restore.md ]; then
+              mv /tmp/readme_restore.md README.md
+            else
+              README_SHA=$(git log --format=%H --diff-filter=AM -- README.md 2>/dev/null | head -1)
+              if [ -n "$README_SHA" ] && git show "${README_SHA}:README.md" > /tmp/readme_restore2.md 2>/dev/null && [ -s /tmp/readme_restore2.md ]; then
+                mv /tmp/readme_restore2.md README.md
+              fi
+            fi
+            [ -f README.md ] && echo "[guard] 收尾阶段发现 README.md 被删，已恢复"
+          fi
+          # 防删自愈：收尾提交前恢复被删的多语言 README 与 PLAN.md
+          for f in README_zh.md README_en.md PLAN.md; do
+            if [ ! -f "$f" ] && git show "HEAD:$f" > "/tmp/final_restore_$f" 2>/dev/null && [ -s "/tmp/final_restore_$f" ]; then
+              mv "/tmp/final_restore_$f" "$f"
+              echo "[guard] 收尾阶段发现 $f 被删，已恢复"
+            fi
+          done
+          # 防删自愈：收尾提交前恢复被删的测试文件
+          git ls-files -- 'tests' 2>/dev/null | while read -r f; do
+            [ -n "$f" ] || continue
+            if [ ! -e "$f" ]; then
+              git checkout HEAD -- "$f" 2>/dev/null && echo "[guard] 收尾阶段发现测试文件 $f 被删，已恢复"
+            fi
+          done
+
+          # 质量门禁：收尾状态必须可运行，否则回退到最后一次已验证状态
+          gate_final() {
+            cargo check --all-targets --quiet 2>&1
+          }
+          if ! gate_final; then
+            echo "[gate] 收尾状态未通过，回退到 HEAD"
+            git reset --hard HEAD
+            git clean -fd
+          fi
+          git add -A
+          git commit -m "auto: end of 5h run, cleanup" || echo "nothing to commit"
+          BRANCH="${GITHUB_REF_NAME:-master}"
+          git pull --rebase origin "$BRANCH" || git rebase --abort || true
+          git push origin "HEAD:${BRANCH}" || echo "[warn] final push failed"
+
+      - name: Push to Gitee
+        if: always()
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPO: ${{ secrets.GITEE_REPO }}
+        run: |
+          set +e
+          if [ -z "$GITEE_TOKEN" ] || [ -z "$GITEE_REPO" ]; then
+            echo "GITEE_TOKEN or GITEE_REPO not set, skipping Gitee push."
+            exit 0
+          fi
+          BRANCH="${GITHUB_REF_NAME:-master}"
+          git remote remove gitee 2>/dev/null || true
+          git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
+          git push gitee "HEAD:${BRANCH}" --force || echo "[warn] push to Gitee failed"
+
+      - name: Trigger next workflow run (self-loop)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          BRANCH="${GITHUB_REF_NAME:-master}"
+
+          # 派发前最新 run 的 id，用来确认新 run 确实进入队列
+          BEFORE=$(gh run list --workflow=continuous-loop.yml --limit 1 \
+                    --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)
+          echo "[info] newest run before dispatch: #${BEFORE}"
+
+          # 重试 3 次：瞬时 API 故障不再打断链条
+          DISPATCHED=0
+          for attempt in 1 2 3; do
+            if gh workflow run continuous-loop.yml --ref "$BRANCH"; then
+              echo "[ok] dispatch accepted on ${BRANCH} (attempt ${attempt})"
+              DISPATCHED=1
+              break
+            fi
+            echo "[warn] dispatch attempt ${attempt} failed, retry in 15s"
+            sleep 15
+          done
+
+          if [ "$DISPATCHED" -eq 1 ]; then
+            # 最多等 60 秒，确认新 run 已出现在队列中
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              sleep 5
+              AFTER=$(gh run list --workflow=continuous-loop.yml --limit 1 \
+                        --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null || echo 0)
+              if [ "$AFTER" != "0" ] && [ "$AFTER" != "$BEFORE" ]; then
+                echo "[ok] next run #${AFTER} queued — loop continues"
+                exit 0
+              fi
+            done
+            echo "[warn] dispatch accepted but no new run visible yet"
+          fi
+
+          echo "[warn] self-dispatch failed; */5 cron heartbeat will start the next run"
