@@ -248,7 +248,7 @@ impl SimilarityCalculator {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：距离对称，将较短字符串作为列方向，内存降为 O(min(n, m))
+        // 双行动态规划：将较短字符串作为列方向
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
         let (rows, cols) = if chars1.len() <= chars2.len() {
@@ -464,7 +464,7 @@ impl SimilarityCalculator {
     }
 
     async fn calculate_ngram_similarity(&self, text1: &str, text2: &str) -> f64 {
-        // 每个文本只收集一次字符序列，bigram/trigram 复用
+        // 收集字符序列用于 bigram/trigram 相似度
         let chars1: Vec<char> = text1.chars().collect();
         let chars2: Vec<char> = text2.chars().collect();
         

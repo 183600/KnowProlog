@@ -348,8 +348,7 @@ impl SymbolicReasoner {
         if segments.is_empty() {
             return None;
         }
-        // 只在"精确登记"的实体名上做最长前缀切分；模糊相似度会把
-        // "张三的师傅的师傅" 误并成 "张三"，导致多跳链被压扁。
+        // 在"精确登记"的实体名上做最长前缀切分
         for take in (1..=segments.len()).rev() {
             let candidate = segments[..take].join("的");
             if self.aligner.kind_of(&candidate) == Some(TermKind::Entity) {
@@ -382,8 +381,7 @@ impl SymbolicReasoner {
         if self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
             for prediction in self.predictor.predict_for_entity(node, Some(predicate), limit) {
-                // 只取 node 作为主体的出边预测；predict_for_entity 也会返回
-                // node 作为客体的入边预测，直接使用会把值错位成自环。
+                // 只取 node 作为主体的出边预测
                 if prediction.triple.subject != node {
                     continue;
                 }

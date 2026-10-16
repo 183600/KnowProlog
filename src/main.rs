@@ -32,7 +32,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-// 实体属性查询模式是固定不变的，全局编译一次即可
+// 实体属性查询模式的全局正则
 static ENTITY_ATTRIBUTE_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 #[derive(Subcommand, Debug)]
@@ -265,7 +265,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                         }
                     }
                 } else {
-                    // 原有的知识导入逻辑
+                    // 知识导入逻辑
                     println!("{}", config.messages.importing);
                     
                     let clean_text = config.nlp.import_keywords.iter()
@@ -416,9 +416,9 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     }
                                 }
                                 "知识查询" => {
-                                    // 继续使用原有的查询逻辑
+                                    // 继续使用查询逻辑
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        // 执行原有的查询流程
+                                        // 执行查询流程
                                         continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities).await;
                                     } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, &config, input).await {
                                         println!("{}", answer);
@@ -428,7 +428,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                 }
                                 _ => {
                                     println!("暂不支持该领域: {}", best_semantic.domain);
-                                    // 如果NLU不能处理，回退到原有逻辑
+                                    // 如果NLU不能处理，回退到查询流程
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                                         continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities).await;
                                     } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, &config, input).await {
@@ -438,11 +438,11 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     }
                                 }
                             }
-                            continue; // 跳过原有的查询逻辑
+                            continue; // 跳过后续查询逻辑
                         }
                     }
                     
-                    // 如果NLU置信度不够，回退到原有逻辑
+                    // 如果NLU置信度不够，使用传统模式处理
                     println!("NLU置信度不足，使用传统模式处理查询...");
                 }
                 
@@ -524,11 +524,11 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     // 提取查询中的实体
                     let mut query_entities = extract_query_entities(input, &config);
                     query_entities.extend(entities.clone());
-                    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+                    // 去重时保留首次出现顺序
                     let mut seen_entities = std::collections::HashSet::new();
                     query_entities.retain(|e| seen_entities.insert(e.clone()));
                     
-                    // === 新增歧义解析功能 ===
+                    // === 歧义解析 ===
                     if let Some(api_config) = &config.api {
                         if api_config.enable_entity_disambiguation {
                             println!("正在解析实体歧义...");
@@ -605,7 +605,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                 entities.clone()
                             };
                             
-                            // 优化：仅加载相关知识子集
+                            // 仅加载相关知识子集
                             let max_hops = 2; // 可配置的跳跃数
                             match oxigraph_manager.get_relevant_facts(&final_entities, max_hops).await {
                                 Ok(facts) => {
@@ -631,7 +631,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                 }
                             }
                         } else {
-                            // 歧义解析功能被禁用，使用原始流程
+                            // 歧义解析功能被禁用，直接查询
                             let max_hops = 2;
                             match oxigraph_manager.get_relevant_facts(&query_entities, max_hops).await {
                                 Ok(facts) => {
@@ -657,7 +657,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                             }
                         }
                     } else {
-                        // 没有API配置，使用原始流程
+                        // 没有API配置，直接查询
                         let max_hops = 2;
                         match oxigraph_manager.get_relevant_facts(&query_entities, max_hops).await {
                             Ok(facts) => {
@@ -774,7 +774,7 @@ async fn continue_original_query(
     // 提取查询中的实体
     let mut query_entities = extract_query_entities(input, config);
     query_entities.extend(entities.iter().cloned());
-    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+    // 去重时保留首次出现顺序
     let mut seen_entities = std::collections::HashSet::new();
     query_entities.retain(|e| seen_entities.insert(e.clone()));
     

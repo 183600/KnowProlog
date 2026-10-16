@@ -342,7 +342,7 @@ impl LocalSemanticAdapter {
         // 第五阶段：计算置信度
         let confidence = self.calculate_complex_confidence(&question_analysis, &intent_result, &entities).await?;
         
-        // 提取实体名称字符串（直接移动，避免额外克隆）
+        // 提取实体名称字符串
         let mut entity_names: Vec<String> = entities.into_iter().map(|e| e.entity).collect();
         
         // 补充知识库中已知实体的识别结果：通用抽取器可能识别不出

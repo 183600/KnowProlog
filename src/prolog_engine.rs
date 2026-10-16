@@ -73,7 +73,6 @@ impl PrologEngine {
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
         self.clear_dynamic_facts();
         let facts_count = facts.len();
-        // 直接写入最终字符串，避免为每条事实生成中间字符串和临时属性列表
         let mut fact_string = String::with_capacity(facts_count * 64);
         
         for fact in facts {
@@ -84,7 +83,7 @@ impl PrologEngine {
                         if i > 0 {
                             fact_string.push_str(", ");
                         }
-                        // 属性写成 '键'-'值' 复合项，才能与 member(age-Age, Props) 等规则统一
+                        // 属性为 '键'-'值' 复合项
                         let _ = write!(fact_string, "'{}'-'{}'", k, v);
                     }
                     fact_string.push_str("]).\n");
@@ -100,7 +99,6 @@ impl PrologEngine {
         }
         
         println!("Loading {} Prolog facts", facts_count);
-        // 事实与基础规则放在同一模块，动态谓词才可被 retractall 清除
         self.machine.consult_module_string("user", fact_string);
     }
 
@@ -109,7 +107,6 @@ impl PrologEngine {
     }
 
     fn clear_dynamic_facts(&mut self) {
-        // run_query 只接受以句点结尾的单个裸目标，"?- " 前缀会报 existence_error
         for goal in [
             "retractall(oxigraph_entity(_, _, _)).",
             "retractall(oxigraph_relation(_, _, _)).",
@@ -124,7 +121,6 @@ impl PrologEngine {
     pub fn query(&mut self, query: &str) -> Vec<HashMap<String, String>> {
         let mut results = Vec::new();
         
-        // scryer-prolog 的 run_query 需要以句点结尾的裸目标，不能带 "?- " 前缀
         let query_str = format!("{}.", query);
         println!("执行Prolog查询: {}", query_str);
         
@@ -318,7 +314,7 @@ impl PrologEngine {
 
 fn value_to_string(value: Value) -> String {
     match value {
-        // 字符串字面量直接取内容，避免 JSON 转换添加的引号
+        // 字符串字面量取内容本身
         Value::String(s) => s,
         other => prolog_value_to_json_string(other),
     }

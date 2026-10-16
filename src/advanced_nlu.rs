@@ -543,7 +543,7 @@ impl AdvancedNLU {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：距离对称，将较短字符串作为列方向，内存降为 O(min(n, m))
+        // 双行动态规划：将较短字符串作为列方向
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
         let (rows, cols) = if chars1.len() <= chars2.len() {
@@ -595,7 +595,7 @@ impl AdvancedNLU {
         Ok(entities)
     }
 
-    /// 编译并缓存实体识别正则，避免每次查询重复编译
+    /// 获取缓存的实体识别正则
     fn get_compiled_entity_regex(&self, pattern: &str) -> Option<Regex> {
         {
             let cache = self.entity_regex_cache.read();
@@ -685,7 +685,7 @@ impl AdvancedNLU {
     }
 
     fn normalize_number(&self, text: &str) -> Option<String> {
-        // 中文数字转阿拉伯数字（单次遍历替换，替代反复分配字符串的多次 replace）
+        // 中文数字转阿拉伯数字
         let mut normalized = String::with_capacity(text.len());
         for ch in text.chars() {
             match ch {

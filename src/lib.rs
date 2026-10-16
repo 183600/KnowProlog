@@ -28,15 +28,12 @@ pub mod semantic_embedding;
 pub mod query_planner;
 pub mod symbolic_reasoner;
 
-// 移除了未使用的 analyze_query_intent
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
-// 移除了未使用的 PrologEngine
 use prolog_engine::PrologFact;
 
 // RDF命名空间
 const BASE_NS: &str = "http://example.org/kg/";
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-// const RDFS_NS: &str = "http://www.w3.org/2000/01/rdf-schema#"; // RDFS_NS 在代码中未使用，暂时保留
 
 #[derive(Debug)]
 pub struct QueryResult {
@@ -268,7 +265,7 @@ impl KnowledgeExtractor {
                 } else {
                     part_tagged
                 };
-                // 避免递归调用时重复提取，此处逻辑可能需要根据业务调整，但保持原样
+                // 避免递归调用时重复提取
                 items.extend(self.extract(part, &normalized_part_tagged));
             }
         }
@@ -641,8 +638,7 @@ impl OxigraphManager {
                         ))?;
                     }
                 } else if let Some(val) = obj.get("@value") {
-                    // 字符串值应取其内容本身，其他类型才使用 JSON 表示
-                    // （Value::to_string() 对字符串会带上双引号和转义，不能直接作为字面量值）
+                    // 字符串值取其内容本身，其他类型使用 JSON 表示
                     let value_text = match val {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
@@ -799,7 +795,7 @@ impl OxigraphManager {
             relevant_entities.extend(neighbors);
         }
         
-        // 第三步：为相关实体构建Prolog事实（单次 SPARQL 查询批量获取，避免逐实体 N+1 查询）
+        // 第三步：为相关实体构建Prolog事实
         let relevant_entity_list: Vec<String> = relevant_entities.iter().cloned().collect();
         facts.extend(self.build_entity_facts(&store, &relevant_entity_list).await?);
         
@@ -818,7 +814,7 @@ impl OxigraphManager {
     async fn load_all_facts_internal(&self, store: &Store) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         let mut facts = Vec::new();
         
-        // 查询所有实体 - 简化版本，避免复杂的URI处理
+        // 查询所有实体
         let query = r#"
             PREFIX kg: <http://example.org/kg/>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -1266,7 +1262,7 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
         }
     }
     
-    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+    // 去重时保留首次出现顺序
     let mut seen = std::collections::HashSet::new();
     entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
     entities
@@ -1375,7 +1371,7 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
                                     
                                     if let Some(type_term) = solution.get("type") {
                                         let type_str = type_term.to_string();
-                                        // 与逐实体版本一致：后续类型覆盖先前类型
+                                        // 后续类型覆盖先前类型
                                         entry.0 = if type_str.contains(BASE_NS) {
                                             type_str.replace(BASE_NS, "")
                                                 .trim_matches(|c| c == '<' || c == '>')
@@ -1408,7 +1404,7 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
                                 }
                             }
                             
-                            // 按传入顺序输出，跳过没有类型信息的实体（与原逐实体查询行为一致）
+                            // 按传入顺序输出，跳过没有类型信息的实体
                             for name in entity_names {
                                 if let Some((entity_type, properties)) = entity_data.remove(name) {
                                     if !entity_type.is_empty() {
@@ -1552,7 +1548,7 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
         }
     }
     
-    // 去重时保留首次出现顺序（dedup() 只能去除相邻重复项）
+    // 去重时保留首次出现顺序
     let mut seen = std::collections::HashSet::new();
     entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
     entities
@@ -1757,7 +1753,7 @@ pub fn create_prolog_rules(config: &SystemConfig) -> Vec<PrologRule> {
 pub fn create_default_synonyms() -> HashMap<String, String> {
     let mut synonyms = HashMap::new();
     
-    // 基础同义词映射（仅保留系统基本功能需要的同义词）
+    // 基础同义词映射
     synonyms.insert("老婆".to_string(), "妻子".to_string());
     synonyms.insert("老公".to_string(), "丈夫".to_string());
     

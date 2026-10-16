@@ -427,7 +427,7 @@ impl EntityRelationExtractor {
         Ok(entities)
     }
 
-    /// 编译并缓存正则，避免重复编译相同模式
+    /// 获取缓存的正则
     fn get_compiled_regex(&self, pattern: &str) -> Option<Regex> {
         {
             let cache = self.regex_cache.read();
@@ -485,7 +485,7 @@ impl EntityRelationExtractor {
         let mut entities = Vec::new();
         let words: Vec<_> = self.jieba.cut(sentence, false).into_iter().collect();
         
-        // 预先计算每个词在句子中的字节偏移，避免在原循环中反复重新分词
+        // 每个词在句子中的字节偏移
         let mut word_offsets = Vec::with_capacity(words.len() + 1);
         word_offsets.push(0usize);
         for word in &words {
@@ -531,8 +531,7 @@ impl EntityRelationExtractor {
         // 最长匹配算法
         let chars: Vec<char> = sentence.chars().collect();
         
-        // 预先计算每个字符对应的字节偏移：EntityPosition 使用字节偏移
-        // （与正则匹配的 mat.start()/mat.end() 以及句子切片保持一致）
+        // 每个字符对应的字节偏移（EntityPosition 使用字节偏移）
         let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
         byte_offsets.push(0usize);
         for ch in &chars {
@@ -547,13 +546,13 @@ impl EntityRelationExtractor {
             let mut best_entity = String::new();
             let mut best_types = Vec::new();
             
-            // 尝试不同长度的子串（增量构建，避免每个长度都重新分配字符串）
+            // 尝试不同长度的子串，增量构建
             let mut substring = String::new();
             for j in (i + 1)..=(chars.len().min(i + 10)) {
                 substring.push(chars[j - 1]);
                 
                 if let Some(types) = named_entity_dict.get(substring.as_str()) {
-                    // i 为字符索引，匹配长度必须按字符数（j - i）计算而非字节数
+                    // i 为字符索引，匹配长度按字符数（j - i）计算
                     if j - i > max_length {
                         max_length = j - i;
                         best_entity = substring.clone();

@@ -176,14 +176,13 @@ impl SemanticEngine {
             }
         }
         
-        // 读锁必须在 await 前释放，避免与写入方互相等待造成死锁
         drop(aliases);
         drop(knowledge);
         
         // 基于语义向量的匹配
         candidates.extend(self.semantic_entity_matching(mention).await?);
         
-        // 去重并排序（保留权重最高的同名实体；dedup_by 只能去除相邻重复项）
+        // 去重并排序（保留权重最高的同名实体）
         candidates.sort_by(|a, b| b.weight.cmp(&a.weight));
         let mut seen = HashSet::new();
         candidates.retain(|c| seen.insert(c.entity.clone()));
@@ -209,7 +208,7 @@ impl SemanticEngine {
             // 计算词汇重叠度
             let overlap_score = self.calculate_word_overlap(&mention_words, &entity_words);
             
-            // 计算描述相似度（mention 分词结果在上方已缓存，避免逐实体重复分词）
+            // 计算描述相似度
             let desc_words: Vec<_> = self.jieba.cut(&entity_knowledge.description, false).into_iter()
                 .filter(|word| !self.stop_words.contains(*word))
                 .collect();
@@ -383,12 +382,12 @@ impl SemanticEngine {
             let mut max_length = 0;
             let mut best_entity = String::new();
             
-            // 尝试不同长度的子串（增量构建，避免每个长度都重新分配字符串）
+            // 尝试不同长度的子串，增量构建
             let mut substring = String::new();
             for j in (i + 1)..=(chars.len().min(i + 10)) {
                 substring.push(chars[j - 1]);
                 
-                // 注意：i 为字符索引，前进长度必须按字符数（j - i）计算而非字节数
+                // i 为字符索引，前进长度按字符数（j - i）计算
                 if aliases.contains_key(substring.as_str()) && j - i > max_length {
                     max_length = j - i;
                     best_entity = substring.clone();
@@ -473,7 +472,7 @@ impl SemanticEngine {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：距离对称，将较短字符串作为列方向，内存降为 O(min(n, m))
+        // 双行动态规划：将较短字符串作为列方向
         let chars1: Vec<char> = s1.chars().collect();
         let chars2: Vec<char> = s2.chars().collect();
         let (rows, cols) = if chars1.len() <= chars2.len() {
