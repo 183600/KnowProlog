@@ -197,38 +197,42 @@ impl GraphWalkEmbedding {
             }
             current = next;
         }
-        let mut result: Vec<(String, f64)> = current
-            .into_iter()
-            .map(|(node, weight)| (node.to_string(), weight))
-            .collect();
-        let cmp = |a: &(String, f64), b: &(String, f64)| {
+        let mut result: Vec<(&str, f64)> = current.into_iter().collect();
+        let cmp = |a: &(&str, f64), b: &(&str, f64)| {
             rank_key(b.1)
                 .cmp(&rank_key(a.1))
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         };
         if limit != usize::MAX && result.len() > limit {
             result.select_nth_unstable_by(limit, cmp);
             result.truncate(limit);
         }
         result.sort_by(cmp);
+        // 只为最终保留的分量克隆节点名
         result
+            .into_iter()
+            .map(|(node, weight)| (node.to_string(), weight))
+            .collect()
     }
 
     /// 结构最相关的实体（概率质量最大的分量，排除自身）
     pub fn related(&self, seed: &str, k: usize) -> Vec<(String, f64)> {
-        let vector = match self.vectors.get(seed) {
-            Some(vector) => vector.clone(),
+        match self.vectors.get(seed) {
+            // 命中缓存向量时只克隆最终保留的 k 个分量，避免整条向量深拷贝
+            Some(vector) => vector
+                .iter()
+                .filter(|(entity, _)| entity != seed)
+                .take(k.max(1))
+                .cloned()
+                .collect(),
             None => {
                 let mut computed = self.ppr(seed);
                 computed.truncate(MAX_VECTOR_LEN);
+                computed.retain(|(entity, _)| entity != seed);
+                computed.truncate(k.max(1));
                 computed
             }
-        };
-        vector
-            .into_iter()
-            .filter(|(entity, _)| entity != seed)
-            .take(k.max(1))
-            .collect()
+        }
     }
 
     /// 结构相似度：两个实体 RWR 向量的余弦相似度（需要已重建嵌入）
@@ -254,7 +258,7 @@ impl GraphWalkEmbedding {
         };
         let left_map: HashMap<&str, f64> =
             left.iter().map(|(name, w)| (name.as_str(), *w)).collect();
-        let mut scored: Vec<(String, f64)> = self
+        let mut scored: Vec<(&str, f64)> = self
             .entities
             .iter()
             .filter(|other| other.as_str() != entity)
@@ -268,16 +272,16 @@ impl GraphWalkEmbedding {
                 }
                 let score = dot.clamp(-1.0, 1.0);
                 if score >= self.similarity_floor {
-                    Some((other.clone(), score))
+                    Some((other.as_str(), score))
                 } else {
                     None
                 }
             })
             .collect();
-        let cmp = |a: &(String, f64), b: &(String, f64)| {
+        let cmp = |a: &(&str, f64), b: &(&str, f64)| {
             rank_key(b.1)
                 .cmp(&rank_key(a.1))
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         };
         let keep = k.max(1);
         if scored.len() > keep {
@@ -285,7 +289,11 @@ impl GraphWalkEmbedding {
             scored.truncate(keep);
         }
         scored.sort_by(cmp);
+        // 只为最终保留的邻居克隆实体名
         scored
+            .into_iter()
+            .map(|(name, score)| (name.to_string(), score))
+            .collect()
     }
 
     /// 多源重启：把多个种子实体（如对话焦点栈）作为共同起点做上下文向量
@@ -293,18 +301,21 @@ impl GraphWalkEmbedding {
         let mut merged: HashMap<String, f64> = HashMap::new();
         let mut used = 0usize;
         for seed in seeds {
-            let vector = match self.vectors.get(seed) {
-                Some(vector) => vector.clone(),
+            // 命中缓存时直接借用，未命中才计算临时向量，避免逐种子深拷贝
+            let computed;
+            let vector: &[(String, f64)] = match self.vectors.get(seed) {
+                Some(vector) => vector.as_slice(),
                 None => {
                     if !self.neighbors.contains_key(seed) {
                         continue;
                     }
-                    self.ppr(seed)
+                    computed = self.ppr(seed);
+                    computed.as_slice()
                 }
             };
             used += 1;
             for (entity, weight) in vector {
-                *merged.entry(entity).or_insert(0.0) += weight;
+                *merged.entry(entity.clone()).or_insert(0.0) += *weight;
             }
         }
         if used == 0 {

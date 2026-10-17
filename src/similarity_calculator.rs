@@ -547,8 +547,10 @@ impl SimilarityCalculator {
             return 1.0;
         }
         
-        // 快速相似度计算，适用于实时查询
-        let jaccard = self.calculate_jaccard_similarity(text1, text2).await;
+        // 快速相似度计算，适用于实时查询；分词只做一次，Jaccard 复用结果
+        let words1 = self.tokenize_and_filter(text1);
+        let words2 = self.tokenize_and_filter(text2);
+        let jaccard = self.jaccard_similarity_from_words(&words1, &words2);
         let edit = self.calculate_edit_distance_similarity(text1, text2);
         
         (jaccard * 0.7 + edit * 0.3).max(0.0).min(1.0)

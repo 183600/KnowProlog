@@ -608,7 +608,7 @@ impl ProblogEngine {
                     atom: fact.atom.clone(),
                     probability,
                     from_fact: true,
-                    proofs: compiled.proofs_for(&fact.atom, 2),
+                    proofs: Vec::new(),
                 },
             );
         }
@@ -625,7 +625,7 @@ impl ProblogEngine {
                     atom: atom.clone(),
                     probability,
                     from_fact: false,
-                    proofs: compiled.proofs_for(atom, self.max_proofs),
+                    proofs: Vec::new(),
                 },
             );
         }
@@ -635,6 +635,19 @@ impl ProblogEngine {
             display: answer.atom.display(),
         });
         answers.truncate(limit.max(1));
+
+        // 排序与截断只依赖概率与原子显示名，证明可在截断后仅为保留的答案补算，
+        // 避免为被丢弃的答案做昂贵的证明搜索
+        for answer in &mut answers {
+            if answer.from_fact {
+                // 确定事实不携带证明；概率事实沿用上限 2 的证明
+                if compiled.probabilistic_facts.contains_key(&answer.atom) {
+                    answer.proofs = compiled.proofs_for(&answer.atom, 2);
+                }
+            } else {
+                answer.proofs = compiled.proofs_for(&answer.atom, self.max_proofs);
+            }
+        }
         ProblogQuery {
             answers,
             choice_variables: compiled.choice_variables,

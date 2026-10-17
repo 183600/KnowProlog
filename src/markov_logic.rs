@@ -345,7 +345,7 @@ impl MarkovLogicEngine {
                 }
                 results.push(GroundedRule {
                     head,
-                    premises: premises.clone(),
+                    premises,
                     weight: rule.weight,
                     source: rule.source.clone(),
                     rule_text: rule.text(),

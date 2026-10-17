@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -461,6 +462,9 @@ pub struct SymbolicReasoner {
     problog: ProblogEngine,
     // 用户用中文教过的概率知识原句（会话级记忆，随对话状态持久化）
     lessons: Vec<String>,
+    // 上面原句的解析结果缓存：rebuild_problog 会随每次知识变更重放，
+    // 缓存后无需每次重新解析中文句子
+    lessons_parsed: Vec<chinese_reasoning_nlu::ChineseLesson>,
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
@@ -486,8 +490,8 @@ pub struct SymbolicReasoner {
     // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
     proposition_surfaces: Vec<(String, String)>,
     // 单条链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
-    // 观察事实或重建缓存（线索变化）时整体失效
-    link_memo: parking_lot::Mutex<Option<(String, Vec<LinkedMention>)>>,
+    // 观察事实或重建缓存（线索变化）时整体失效；命中时只复制 Arc，避免深拷贝链接明细
+    link_memo: parking_lot::Mutex<Option<(String, Arc<Vec<LinkedMention>>)>>,
     // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
     entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
 }
@@ -539,6 +543,7 @@ impl SymbolicReasoner {
             soft,
             problog,
             lessons: Vec::new(),
+            lessons_parsed: Vec::new(),
             planner: QueryPlanner::new(),
             linker,
             generator,
@@ -806,11 +811,9 @@ impl SymbolicReasoner {
             self.config.problog_max_depth,
             self.config.problog_max_proofs,
         );
-        for sentence in &self.lessons {
-            let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
-            for lesson in &outcome.lessons {
-                chinese_reasoning_nlu::apply_lesson(&mut program, lesson);
-            }
+        // 重放缓存好的解析结果，避免每次重建都重新解析中文原句
+        for lesson in &self.lessons_parsed {
+            chinese_reasoning_nlu::apply_lesson(&mut program, lesson);
         }
         self.problog = program;
     }
@@ -987,14 +990,14 @@ impl SymbolicReasoner {
     const LINK_ACCEPT_THRESHOLD: f64 = 0.5;
 
     /// 文本的实体链接结果：一次查询流程内同一文本会被多处链接，做单条记忆复用
-    fn linked_mentions(&self, text: &str) -> Vec<LinkedMention> {
+    fn linked_mentions(&self, text: &str) -> Arc<Vec<LinkedMention>> {
         if let Some((cached_text, mentions)) = self.link_memo.lock().as_ref() {
             if cached_text == text {
                 return mentions.clone();
             }
         }
         let hints = self.link_hints(text);
-        let mentions = self.linker.link_with_context(text, &hints);
+        let mentions = Arc::new(self.linker.link_with_context(text, &hints));
         *self.link_memo.lock() = Some((text.to_string(), mentions.clone()));
         mentions
     }
@@ -1029,7 +1032,7 @@ impl SymbolicReasoner {
 
     pub fn entity_link_report(&self, text: &str) -> String {
         let mentions = self.linked_mentions(text);
-        self.linker.report_for_mentions(text, &mentions)
+        self.linker.report_for_mentions(text, mentions.as_slice())
     }
 
     // 仅返回"模糊匹配"的链接说明，用于在回答前向用户提示容错链接
@@ -2407,8 +2410,9 @@ impl SymbolicReasoner {
             return false;
         };
         let etype_lower = etype.to_lowercase();
+        // 期望类型关键词均为小写（或中文），无需再做一次 to_lowercase 分配
         keywords.iter().any(|keyword| {
-            etype.contains(*keyword) || etype_lower.contains(&keyword.to_lowercase())
+            etype.contains(*keyword) || etype_lower.contains(*keyword)
         })
     }
 
@@ -3559,6 +3563,8 @@ impl SymbolicReasoner {
             ));
         }
         self.lessons.push(sentence.to_string());
+        // 与上面 apply_lesson 的重放保持一致：缓存本次解析结果
+        self.lessons_parsed.extend(outcome.lessons.iter().cloned());
         output.push_str(&format!(
             "  概率程序现有 {} 条确定事实、{} 条概率事实、{} 条概率规则；用「概率推理：实体」做可能世界精确查询，用「对话记忆」查看教学记忆。",
             self.problog.deterministic_fact_count(),
@@ -3589,7 +3595,7 @@ impl SymbolicReasoner {
             }
             for atom in std::iter::once(&clause.head).chain(clause.body.iter()) {
                 if !self.aligner.is_registered(&atom.predicate)
-                    && !new_predicates.contains(&atom.predicate.to_string())
+                    && !new_predicates.iter().any(|p| p.as_str() == atom.predicate.as_ref())
                 {
                     new_predicates.push(atom.predicate.to_string());
                 }
@@ -4186,6 +4192,12 @@ impl SymbolicReasoner {
         // 教学记忆：恢复中文概率知识原句并在概率程序中重放（不写知识图谱）
         if !snapshot.lessons.is_empty() {
             self.lessons = snapshot.lessons.clone();
+            // 恢复原句时一次性重建解析缓存（后续 rebuild_problog 直接复用）
+            self.lessons_parsed = self
+                .lessons
+                .iter()
+                .flat_map(|sentence| chinese_reasoning_nlu::parse_lessons(sentence).lessons)
+                .collect();
             if self.config.enable_problog && self.config.enable_soft_logic {
                 self.rebuild_problog();
             }
@@ -4206,7 +4218,7 @@ impl SymbolicReasoner {
                 }
                 for atom in std::iter::once(&clause.head).chain(clause.body.iter()) {
                     if !self.aligner.is_registered(&atom.predicate)
-                        && !new_predicates.contains(&atom.predicate.to_string())
+                        && !new_predicates.iter().any(|p| p.as_str() == atom.predicate.as_ref())
                     {
                         new_predicates.push(atom.predicate.to_string());
                     }

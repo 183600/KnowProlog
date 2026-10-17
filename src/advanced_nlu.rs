@@ -420,27 +420,34 @@ impl AdvancedNLU {
     }
 
     async fn recognize_intent(&self, query: &str) -> Result<(String, f64), Box<dyn std::error::Error>> {
-        let intent_patterns = self.intent_patterns.read();
         let mut best_intent = "unknown".to_string();
         let mut best_confidence = 0.0;
         
-        // 分词
-        let query_words: Vec<_> = self.jieba.cut(query, false).into_iter().collect();
+        // 分词（词长一次算好，供全部模式复用）
+        let query_words: Vec<(&str, usize)> = self
+            .jieba
+            .cut(query, false)
+            .into_iter()
+            .map(|word| (word, word.chars().count()))
+            .collect();
         
-        for (intent_name, pattern_info) in intent_patterns.iter() {
-            let mut max_pattern_confidence: f64 = 0.0;
-            
-            for pattern in &pattern_info.patterns {
-                let confidence = self.calculate_pattern_match_confidence(&query_words, pattern);
-                max_pattern_confidence = max_pattern_confidence.max(confidence);
-            }
-            
-            // 考虑优先级权重
-            let weighted_confidence = max_pattern_confidence * (pattern_info.priority as f64 / 20.0);
-            
-            if weighted_confidence > best_confidence {
-                best_confidence = weighted_confidence;
-                best_intent = intent_name.clone();
+        {
+            let intent_patterns = self.intent_patterns.read();
+            for (intent_name, pattern_info) in intent_patterns.iter() {
+                let mut max_pattern_confidence: f64 = 0.0;
+                
+                for pattern in &pattern_info.patterns {
+                    let confidence = self.calculate_pattern_match_confidence(&query_words, pattern);
+                    max_pattern_confidence = max_pattern_confidence.max(confidence);
+                }
+                
+                // 考虑优先级权重
+                let weighted_confidence = max_pattern_confidence * (pattern_info.priority as f64 / 20.0);
+                
+                if weighted_confidence > best_confidence {
+                    best_confidence = weighted_confidence;
+                    best_intent = intent_name.clone();
+                }
             }
         }
         
@@ -490,7 +497,7 @@ impl AdvancedNLU {
         Ok(best)
     }
 
-    fn calculate_pattern_match_confidence(&self, query_words: &[&str], pattern: &str) -> f64 {
+    fn calculate_pattern_match_confidence(&self, query_words: &[(&str, usize)], pattern: &str) -> f64 {
         // 简化的模式匹配
         let mut matches = 0;
         let mut total = 0;
@@ -500,9 +507,16 @@ impl AdvancedNLU {
             .filter(|word| !word.starts_with('(') || !word.ends_with(')'))
         {
             total += 1;
-            for query_word in query_words {
+            // 模式词长度只算一次，供与该模式下所有查询词的比较复用
+            let pattern_len = pattern_word.chars().count();
+            for (query_word, query_len) in query_words {
                 if pattern_word == *query_word
-                    || self.words_similarity_above_08(pattern_word, query_word)
+                    || self.words_similarity_above_08_with_lens(
+                        pattern_word,
+                        pattern_len,
+                        query_word,
+                        *query_len,
+                    )
                 {
                     matches += 1;
                     break;
@@ -519,9 +533,13 @@ impl AdvancedNLU {
 
     /// 与 `calculate_word_similarity(...) > 0.8` 完全等价；
     /// 先用长度差下界剪枝（编辑距离 ≥ 长度差），避免无谓的 DP 分配
-    fn words_similarity_above_08(&self, word1: &str, word2: &str) -> bool {
-        let len1 = word1.chars().count();
-        let len2 = word2.chars().count();
+    fn words_similarity_above_08_with_lens(
+        &self,
+        word1: &str,
+        len1: usize,
+        word2: &str,
+        len2: usize,
+    ) -> bool {
         if len1 == 0 || len2 == 0 {
             return false;
         }
@@ -531,31 +549,36 @@ impl AdvancedNLU {
         if (max_len - min_len) * 5 >= max_len {
             return false;
         }
-        self.calculate_word_similarity(word1, word2) > 0.8
+        self.word_similarity_with_lens(word1, len1, word2, len2) > 0.8
     }
 
+    #[cfg(test)]
     fn calculate_word_similarity(&self, word1: &str, word2: &str) -> f64 {
+        self.word_similarity_with_lens(
+            word1,
+            word1.chars().count(),
+            word2,
+            word2.chars().count(),
+        )
+    }
+
+    fn word_similarity_with_lens(&self, word1: &str, len1: usize, word2: &str, len2: usize) -> f64 {
         if word1 == word2 {
             return 1.0;
         }
-        
-        let len1 = word1.chars().count();
-        let len2 = word2.chars().count();
         
         if len1 == 0 || len2 == 0 {
             return 0.0;
         }
         
-        let distance = self.levenshtein_distance(word1, word2);
+        let distance = self.levenshtein_distance_with_lens(word1, len1, word2, len2);
         let max_len = len1.max(len2);
         
         1.0 - (distance as f64 / max_len as f64)
     }
 
-    fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
+    fn levenshtein_distance_with_lens(&self, s1: &str, len1: usize, s2: &str, len2: usize) -> usize {
         // 双行动态规划：将较短字符串作为列方向；行方向直接迭代字符，省去一份 Vec 收集
-        let len1 = s1.chars().count();
-        let len2 = s2.chars().count();
         let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
         let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
@@ -579,11 +602,12 @@ impl AdvancedNLU {
 
     async fn extract_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        let entity_patterns = self.entity_patterns.read();
-        
-        for (entity_type, pattern_info) in entity_patterns.iter() {
-            let extracted = self.extract_entities_by_type(query, entity_type, pattern_info).await?;
-            entities.extend(extracted);
+        {
+            let entity_patterns = self.entity_patterns.read();
+            for (entity_type, pattern_info) in entity_patterns.iter() {
+                let extracted = self.extract_entities_by_type(query, entity_type, pattern_info)?;
+                entities.extend(extracted);
+            }
         }
         
         // 提取时间实体
@@ -620,7 +644,7 @@ impl AdvancedNLU {
         }
     }
 
-    async fn extract_entities_by_type(&self, query: &str, entity_type: &str, pattern_info: &EntityPattern) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
+    fn extract_entities_by_type(&self, query: &str, entity_type: &str, pattern_info: &EntityPattern) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
         // 使用正则模式匹配
@@ -636,7 +660,7 @@ impl AdvancedNLU {
                         start_pos: mat.start(),
                         end_pos: mat.end(),
                         confidence,
-                        normalized_value: self.normalize_entity_value(text, entity_type).await,
+                        normalized_value: self.normalize_entity_value(text, entity_type),
                     });
                 }
             }
@@ -653,7 +677,7 @@ impl AdvancedNLU {
                     start_pos: start,
                     end_pos: start + keyword.len(),
                     confidence,
-                    normalized_value: self.normalize_entity_value(keyword, entity_type).await,
+                    normalized_value: self.normalize_entity_value(keyword, entity_type),
                 });
             }
         }
@@ -681,7 +705,7 @@ impl AdvancedNLU {
         confidence.min(1.0)
     }
 
-    async fn normalize_entity_value(&self, text: &str, entity_type: &str) -> Option<String> {
+    fn normalize_entity_value(&self, text: &str, entity_type: &str) -> Option<String> {
         match entity_type {
             "NUMBER" => self.normalize_number(text),
             "PERSON" => Some(text.trim().to_string()),
@@ -860,13 +884,15 @@ impl AdvancedNLU {
 
     async fn extract_slots(&self, query: &str, intent_info: &(String, f64), entities: &[ExtractedEntity]) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let mut slots = HashMap::new();
-        let intent_patterns = self.intent_patterns.read();
         
-        if let Some(pattern_info) = intent_patterns.get(&intent_info.0) {
-            for required_slot in &pattern_info.required_slots {
-                let slot_value = self.extract_slot_value(query, required_slot, entities).await?;
-                if let Some(value) = slot_value {
-                    slots.insert(required_slot.clone(), value);
+        {
+            let intent_patterns = self.intent_patterns.read();
+            if let Some(pattern_info) = intent_patterns.get(&intent_info.0) {
+                for required_slot in &pattern_info.required_slots {
+                    let slot_value = self.extract_slot_value(query, required_slot, entities)?;
+                    if let Some(value) = slot_value {
+                        slots.insert(required_slot.clone(), value);
+                    }
                 }
             }
         }
@@ -874,7 +900,7 @@ impl AdvancedNLU {
         Ok(slots)
     }
 
-    async fn extract_slot_value(&self, query: &str, slot_name: &str, entities: &[ExtractedEntity]) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    fn extract_slot_value(&self, query: &str, slot_name: &str, entities: &[ExtractedEntity]) -> Result<Option<String>, Box<dyn std::error::Error>> {
         match slot_name {
             "entity" => {
                 // 查找第一个人物、组织或概念实体

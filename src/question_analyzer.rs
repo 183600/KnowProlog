@@ -543,12 +543,17 @@ fn deterministic_max<T: std::fmt::Debug>(scores: HashMap<T, f64>, fallback: T) -
     scores
         .into_iter()
         .filter(|(_, score)| *score > 0.0)
+        // 每个候选的类型名只格式化一次，避免比较器内反复分配
+        .map(|(value, score)| {
+            let name = format!("{:?}", value);
+            (value, score, name)
+        })
         .max_by(|a, b| {
             a.1.partial_cmp(&b.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| format!("{:?}", b.0).cmp(&format!("{:?}", a.0)))
+                .then_with(|| b.2.cmp(&a.2))
         })
-        .map(|(value, _)| value)
+        .map(|(value, _, _)| value)
         .unwrap_or(fallback)
 }
 

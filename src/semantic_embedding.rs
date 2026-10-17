@@ -134,7 +134,7 @@ impl SymbolicEmbedding {
                 continue;
             }
             // 先用借用排序并截断，只为最终保留的特征克隆名称
-            let mut weights: Vec<(&str, f64)> = Vec::new();
+            let mut weights: Vec<(&str, f64)> = Vec::with_capacity(features.len());
             for (feature, count) in features {
                 let feature_total = self.feature_totals.get(feature).copied().unwrap_or(0.0);
                 if feature_total <= 0.0 || *count <= 0.0 {
@@ -220,17 +220,17 @@ impl SymbolicEmbedding {
         let Some(va) = self.vectors.get(entity) else {
             return Vec::new();
         };
-        let mut neighbors: Vec<(String, f64)> = self
+        let mut neighbors: Vec<(&str, f64)> = self
             .vectors
             .iter()
             .filter(|(name, _)| name.as_str() != entity)
-            .map(|(name, vector)| (name.clone(), Self::cosine(va, vector)))
+            .map(|(name, vector)| (name.as_str(), Self::cosine(va, vector)))
             .filter(|(_, score)| *score >= self.similarity_floor)
             .collect();
-        let cmp = |a: &(String, f64), b: &(String, f64)| {
+        let cmp = |a: &(&str, f64), b: &(&str, f64)| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         };
         // 全序（分数+名称唯一）下先划分 top-k 再排序，与全排序截断等价
         if neighbors.len() > k {
@@ -238,7 +238,11 @@ impl SymbolicEmbedding {
             neighbors.truncate(k);
         }
         neighbors.sort_by(cmp);
+        // 只为最终保留的邻居克隆名称
         neighbors
+            .into_iter()
+            .map(|(name, score)| (name.to_string(), score))
+            .collect()
     }
 
     // 向量算术类比：v(B) - v(A) + v(C) 的最近邻。
@@ -266,7 +270,7 @@ impl SymbolicEmbedding {
         if residual_norm <= 0.0 {
             return Vec::new();
         }
-        let mut scored: Vec<(String, f64)> = self
+        let mut scored: Vec<(&str, f64)> = self
             .vectors
             .iter()
             .filter(|(name, _)| {
@@ -279,14 +283,14 @@ impl SymbolicEmbedding {
                         vector.weights.get(*feature).map(|v| weight * v)
                     })
                     .sum();
-                (name.clone(), dot / (residual_norm * vector.norm))
+                (name.as_str(), dot / (residual_norm * vector.norm))
             })
             .filter(|(_, score)| score.is_finite())
             .collect();
-        let cmp = |x: &(String, f64), y: &(String, f64)| {
+        let cmp = |x: &(&str, f64), y: &(&str, f64)| {
             y.1.partial_cmp(&x.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.0.cmp(&y.0))
+                .then_with(|| x.0.cmp(y.0))
         };
         // 全序（分数+名称唯一）下先划分 top-k 再排序，与全排序截断等价
         if scored.len() > k {
@@ -294,7 +298,11 @@ impl SymbolicEmbedding {
             scored.truncate(k);
         }
         scored.sort_by(cmp);
+        // 只为最终保留的类比项克隆名称
         scored
+            .into_iter()
+            .map(|(name, score)| (name.to_string(), score))
+            .collect()
     }
 
     // 方向的可解释描述：从 a 到 b 哪些特征增强、哪些减弱。

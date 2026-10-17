@@ -772,6 +772,10 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     
                     let clean_text = config.nlp.import_keywords.iter()
                         .fold(input.to_string(), |text, keyword| {
+                            // 未出现该关键词时不构造替换串、不做整串扫描
+                            if !text.contains(keyword.as_str()) {
+                                return text;
+                            }
                             text.replace(&format!("{}：", keyword), "")
                                 .replace(&format!("{}:", keyword), "")
                         })

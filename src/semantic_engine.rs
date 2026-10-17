@@ -242,24 +242,29 @@ impl SemanticEngine {
         
         for (entity_name, entity_knowledge) in knowledge.iter() {
             let cached = token_cache.get(entity_name);
-            let entity_words: Vec<&str> = match cached {
-                Some((name_words, _)) => name_words.iter().map(String::as_str).collect(),
-                None => self.jieba.cut(&entity_knowledge.entity, false).into_iter()
-                    .filter(|word| !self.stop_words.contains(*word))
-                    .collect(),
+            // 命中缓存时直接借用缓存的词表，避免每个实体再复制一份 Vec<&str>
+            let owned_name_words: Vec<String>;
+            let owned_desc_words: Vec<String>;
+            let (entity_words, desc_words): (&[String], &[String]) = match cached {
+                Some((name_words, desc_words)) => (name_words, desc_words),
+                None => {
+                    owned_name_words = self.jieba.cut(&entity_knowledge.entity, false).into_iter()
+                        .filter(|word| !self.stop_words.contains(*word))
+                        .map(|word| word.to_string())
+                        .collect();
+                    owned_desc_words = self.jieba.cut(&entity_knowledge.description, false).into_iter()
+                        .filter(|word| !self.stop_words.contains(*word))
+                        .map(|word| word.to_string())
+                        .collect();
+                    (&owned_name_words, &owned_desc_words)
+                }
             };
             
             // 计算词汇重叠度
-            let overlap_score = Self::calculate_word_overlap_with(&mention_set, &entity_words);
+            let overlap_score = Self::calculate_word_overlap_with_strings(&mention_set, entity_words);
             
             // 计算描述相似度
-            let desc_words: Vec<&str> = match cached {
-                Some((_, desc_words)) => desc_words.iter().map(String::as_str).collect(),
-                None => self.jieba.cut(&entity_knowledge.description, false).into_iter()
-                    .filter(|word| !self.stop_words.contains(*word))
-                    .collect(),
-            };
-            let desc_similarity = Self::calculate_word_overlap_with(&mention_set, &desc_words);
+            let desc_similarity = Self::calculate_word_overlap_with_strings(&mention_set, desc_words);
             
             let combined_score = (overlap_score * 0.7 + desc_similarity * 0.3).max(0.0).min(1.0);
             
@@ -296,7 +301,24 @@ impl SemanticEngine {
     }
 
     pub async fn get_entity_attribute_value(&self, entity: &str, attribute: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        let entity_knowledge = self.get_entity_knowledge(entity).await?;
+        // 直接在读锁内解析实体，只克隆命中的属性值，避免复制整份实体知识
+        let knowledge = self.entity_knowledge.read();
+        let entity_knowledge = if let Some(entity_knowledge) = knowledge.get(entity) {
+            entity_knowledge
+        } else {
+            let entity_knowledge = {
+                let aliases = self.entity_aliases.read();
+                aliases
+                    .get(entity)
+                    .and_then(|entity_names| {
+                        entity_names.iter().find_map(|entity_name| knowledge.get(entity_name))
+                    })
+            };
+            match entity_knowledge {
+                Some(entity_knowledge) => entity_knowledge,
+                None => return Err(format!("未找到实体: {}", entity).into()),
+            }
+        };
         
         if let Some(values) = entity_knowledge.attributes.get(attribute) {
             Ok(values.clone())
@@ -371,7 +393,6 @@ impl SemanticEngine {
     }
 
     pub async fn analyze_intent(&self, query: &str) -> Result<IntentAnalysisResult, Box<dyn std::error::Error>> {
-        let intent_patterns = self.intent_patterns.read();
         let mut best_intent = "unknown".to_string();
         let mut best_confidence = 0.0;
         let mut matched_patterns = Vec::new();
@@ -384,17 +405,20 @@ impl SemanticEngine {
             .map(|word| (word, word.chars().count()))
             .collect();
         
-        // 匹配意图模式
-        for (intent_type, patterns) in intent_patterns.iter() {
-            for pattern in patterns {
-                let confidence = self.match_pattern_confidence(&text_words, pattern);
-                if confidence > best_confidence {
-                    best_confidence = confidence;
-                    best_intent = intent_type.clone();
-                    matched_patterns.clear();
-                    matched_patterns.push(pattern.to_string());
-                } else if confidence > 0.7 && confidence == best_confidence {
-                    matched_patterns.push(pattern.to_string());
+        {
+            let intent_patterns = self.intent_patterns.read();
+            // 匹配意图模式
+            for (intent_type, patterns) in intent_patterns.iter() {
+                for pattern in patterns {
+                    let confidence = self.match_pattern_confidence(&text_words, pattern);
+                    if confidence > best_confidence {
+                        best_confidence = confidence;
+                        best_intent = intent_type.clone();
+                        matched_patterns.clear();
+                        matched_patterns.push(pattern.to_string());
+                    } else if confidence > 0.7 && confidence == best_confidence {
+                        matched_patterns.push(pattern.to_string());
+                    }
                 }
             }
         }
@@ -527,16 +551,14 @@ impl SemanticEngine {
         }
         
         // 使用编辑距离计算相似度
-        let edit_distance = self.levenshtein_distance(s1, s2);
+        let edit_distance = self.levenshtein_distance_with_lens(s1, len1, s2, len2);
         let max_len = len1.max(len2);
         
         1.0 - (edit_distance as f64 / max_len as f64)
     }
 
-    fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
+    fn levenshtein_distance_with_lens(&self, s1: &str, len1: usize, s2: &str, len2: usize) -> usize {
         // 双行动态规划：将较短字符串作为列方向；行方向直接迭代字符，省去一份 Vec 收集
-        let len1 = s1.chars().count();
-        let len2 = s2.chars().count();
         let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
         let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
@@ -558,8 +580,8 @@ impl SemanticEngine {
         prev[col_count]
     }
 
-    fn calculate_word_overlap_with(prebuilt: &HashSet<&str>, words: &[&str]) -> f64 {
-        let other: HashSet<&str> = words.iter().copied().collect();
+    fn calculate_word_overlap_with_strings(prebuilt: &HashSet<&str>, words: &[String]) -> f64 {
+        let other: HashSet<&str> = words.iter().map(String::as_str).collect();
 
         let intersection = prebuilt.intersection(&other).count();
         let union = prebuilt.union(&other).count();

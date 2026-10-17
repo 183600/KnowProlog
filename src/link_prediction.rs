@@ -102,7 +102,6 @@ struct Candidate {
 
 pub struct LinkPredictor {
     triples: Vec<Triple>,
-    known: HashSet<Triple>,
     pairs_by_pred: HashMap<String, HashSet<(String, String)>>,
     out_edges: HashMap<String, HashMap<String, HashSet<String>>>,
     in_edges: HashMap<String, HashMap<String, HashSet<String>>>,
@@ -122,7 +121,6 @@ impl LinkPredictor {
     pub fn new() -> Self {
         Self {
             triples: Vec::new(),
-            known: HashSet::new(),
             pairs_by_pred: HashMap::new(),
             out_edges: HashMap::new(),
             in_edges: HashMap::new(),
@@ -151,7 +149,6 @@ impl LinkPredictor {
             return;
         }
         let triple = Triple::new(subject, predicate, object);
-        self.known.insert(triple.clone());
         self.triples.push(triple);
         self.pairs_by_pred
             .entry(predicate.to_string())
@@ -298,13 +295,13 @@ impl LinkPredictor {
     fn build_rule(
         &self,
         template: RuleTemplate,
-        body: Vec<String>,
-        head: String,
+        body: &[&str],
+        head: &str,
         body_pairs: &HashSet<(String, String)>,
         min_support: usize,
         min_confidence: f64,
     ) -> Option<HornRule> {
-        let head_pairs = self.pairs_of(&head)?;
+        let head_pairs = self.pairs_of(head)?;
         // 从较小集合侧做包含计数，交集大小不变
         let support = if body_pairs.len() <= head_pairs.len() {
             body_pairs
@@ -329,10 +326,11 @@ impl LinkPredictor {
         } else {
             support as f64 / head_pairs.len() as f64
         };
+        // 只有通过全部过滤的规则才克隆体部/头部名称
         Some(HornRule {
             template,
-            body,
-            head,
+            body: body.iter().map(|name| name.to_string()).collect(),
+            head: head.to_string(),
             support,
             body_count: body_pairs.len(),
             confidence,
@@ -353,8 +351,8 @@ impl LinkPredictor {
                 if let Some(reversed) = &reversed {
                     if let Some(rule) = self.build_rule(
                         RuleTemplate::Inverse,
-                        vec![p1.clone()],
-                        p2.clone(),
+                        &[p1.as_str()],
+                        p2,
                         reversed,
                         min_support,
                         min_confidence,
@@ -366,11 +364,12 @@ impl LinkPredictor {
                 if let Some(body) = self.compose_body_pairs(p1, p2) {
                     // 支撑量不可能超过体部对数：先剪掉不足阈值的体部，避免整轮头部枚举
                     if body.len() >= min_support {
+                        let body_names = [p1.as_str(), p2.as_str()];
                         for p3 in &predicates {
                             if let Some(rule) = self.build_rule(
                                 RuleTemplate::Compose,
-                                vec![p1.clone(), p2.clone()],
-                                p3.clone(),
+                                &body_names,
+                                p3,
                                 &body,
                                 min_support,
                                 min_confidence,
@@ -383,11 +382,12 @@ impl LinkPredictor {
 
                 if let Some(body) = self.common_body_pairs(p1, p2, false) {
                     if body.len() >= min_support {
+                        let body_names = [p1.as_str(), p2.as_str()];
                         for p3 in &predicates {
                             if let Some(rule) = self.build_rule(
                                 RuleTemplate::CommonNeighbor,
-                                vec![p1.clone(), p2.clone()],
-                                p3.clone(),
+                                &body_names,
+                                p3,
                                 &body,
                                 min_support,
                                 min_confidence,
@@ -400,11 +400,12 @@ impl LinkPredictor {
 
                 if let Some(body) = self.common_body_pairs(p1, p2, true) {
                     if body.len() >= min_support {
+                        let body_names = [p1.as_str(), p2.as_str()];
                         for p3 in &predicates {
                             if let Some(rule) = self.build_rule(
                                 RuleTemplate::CommonObject,
-                                vec![p1.clone(), p2.clone()],
-                                p3.clone(),
+                                &body_names,
+                                p3,
                                 &body,
                                 min_support,
                                 min_confidence,
@@ -443,7 +444,10 @@ impl LinkPredictor {
     where
         F: FnOnce(&Triple) -> bool,
     {
-        if self.known.contains(&triple) || !seen.insert(triple.clone()) {
+        // 与已删除的 known 集合等价：out_edges 索引即事实集
+        if self.has_triple(&triple.subject, &triple.predicate, &triple.object)
+            || !seen.insert(triple.clone())
+        {
             return None;
         }
         *generated += 1;

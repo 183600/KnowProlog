@@ -1729,8 +1729,13 @@ impl OxigraphManager {
     }
 
     pub async fn load_all_relations(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.lock().await;
-        Ok(Self::scan_graph_parts(&store).1)
+        // 复用整图快照缓存，避免每次调用都重新全量扫描存储
+        let snapshot = self.load_graph_snapshot().await?;
+        Ok(snapshot
+            .iter()
+            .filter(|fact| matches!(fact, PrologFact::Relation { .. }))
+            .cloned()
+            .collect())
     }
 
     async fn find_relations_between(&self, store: &Store, entities: &std::collections::HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
@@ -1890,9 +1895,9 @@ impl ResponseFormatter {
                 }
             }
             "relation_query" => {
-                let relations: Vec<String> = results.iter()
+                let relations: Vec<&str> = results.iter()
                     .filter_map(|r| r.get("Relation"))
-                    .map(|r| r.clone())
+                    .map(String::as_str)
                     .collect();
                 
                 if relations.is_empty() {

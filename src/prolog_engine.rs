@@ -365,8 +365,17 @@ impl PrologEngine {
 }
 
 /// 转义 Prolog 单引号原子中的特殊字符，避免名称里的引号/反斜杠破坏事实或查询语法
-fn escape_atom(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
+fn escape_atom(text: &str) -> std::borrow::Cow<'_, str> {
+    // 常见情况无需转义：借用原字符串，避免每步都分配
+    if !text
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\\' | b'\'' | b'\n' | b'\r' | b'\t'))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let mut escaped = String::with_capacity(text.len() + 8);
     for ch in text.chars() {
         match ch {
             '\\' => escaped.push_str("\\\\"),
@@ -377,7 +386,7 @@ fn escape_atom(text: &str) -> String {
             _ => escaped.push(ch),
         }
     }
-    escaped
+    std::borrow::Cow::Owned(escaped)
 }
 
 fn value_to_string(value: Value) -> String {

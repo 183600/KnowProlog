@@ -71,10 +71,35 @@ pub struct EntityLinker {
 const FUZZY_MIN_SCORE: f64 = 0.45;
 const FUZZY_MAX_CHARS: usize = 12;
 const MAX_CANDIDATES_PER_MENTION: usize = 3;
-const SEGMENT_DELIMITERS: [char; 22] = [
-    '的', '是', '有', '吗', '呢', '谁', '什', '么', '多', '少', '几', '和', '与', '在', '为', '把',
-    '？', '?', '，', ',', '。', '：',
-];
+
+#[inline]
+fn is_segment_delimiter(ch: char) -> bool {
+    // 与旧版 `SEGMENT_DELIMITERS.contains(&ch)` 等价，但编译为直接比较而非线性扫描
+    matches!(
+        ch,
+        '的' | '是'
+            | '有'
+            | '吗'
+            | '呢'
+            | '谁'
+            | '什'
+            | '么'
+            | '多'
+            | '少'
+            | '几'
+            | '和'
+            | '与'
+            | '在'
+            | '为'
+            | '把'
+            | '？'
+            | '?'
+            | '，'
+            | ','
+            | '。'
+            | '：'
+    )
+}
 
 impl Default for EntityLinker {
     fn default() -> Self {
@@ -496,7 +521,7 @@ fn segment_spans(text: &str) -> Vec<(usize, String)> {
     let mut current = String::new();
     let mut current_start = 0usize;
     for (index, ch) in text.chars().enumerate() {
-        if SEGMENT_DELIMITERS.contains(&ch) {
+        if is_segment_delimiter(ch) {
             if !current.trim().is_empty() {
                 segments.push((current_start, std::mem::take(&mut current)));
             } else {

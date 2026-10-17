@@ -390,9 +390,9 @@ impl SymbolicGenerator {
                 if duplicated {
                     continue;
                 }
-                lines.push(FactLine {
+                lines.push(                FactLine {
                     rank: 0.5,
-                    sentence: self.lexicalize(entity, key, &[value.clone()]),
+                    sentence: self.lexicalize(entity, key, std::slice::from_ref(value)),
                 });
             }
         }
@@ -652,7 +652,13 @@ impl SymbolicGenerator {
             for entity in members {
                 if let Some(predicate_counts) = self.entity_predicate_counts.get(entity) {
                     for (predicate, count) in predicate_counts {
-                        *counts.entry(predicate.clone()).or_insert(0) += count;
+                        // 键通常已存在：命中时直接累加，避免每次克隆谓词名
+                        match counts.get_mut(predicate) {
+                            Some(existing) => *existing += count,
+                            None => {
+                                counts.insert(predicate.clone(), *count);
+                            }
+                        }
                         total += count;
                     }
                 }

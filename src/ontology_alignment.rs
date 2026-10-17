@@ -41,6 +41,8 @@ pub struct OntologyAligner {
     profiles: Vec<TermProfile>,
     // 与 profiles 一一对应，注册时预计算规范化结果
     profile_norms: Vec<String>,
+    // 与 profiles 一一对应，注册时预计算 bigram 键（供相似度扫描复用）
+    profile_keys: Vec<Vec<(char, Option<char>)>>,
     index: HashMap<String, usize>,
     similarity_threshold: f64,
     structural_min_shared: usize,
@@ -55,6 +57,7 @@ impl OntologyAligner {
             synonyms,
             profiles: Vec::new(),
             profile_norms: Vec::new(),
+            profile_keys: Vec::new(),
             index: HashMap::new(),
             similarity_threshold,
             structural_min_shared: 2,
@@ -103,6 +106,7 @@ impl OntologyAligner {
         });
         let idx = self.profiles.len() - 1;
         self.profile_norms.push(normalized.clone());
+        self.profile_keys.push(Self::bigram_keys(&normalized));
         self.index.insert(normalized, idx);
         self.resolve_cache.write().clear();
         idx
@@ -243,13 +247,14 @@ impl OntologyAligner {
         2.0 * overlap as f64 / total as f64
     }
 
-    /// 与 `similarity_normalized` 等价，但复用调用方预计算的查询侧 bigram，
-    /// 避免在一批候选中反复重建同一个字符串的 bigram 表。
+    /// 与 `similarity_normalized` 等价，但复用调用方预计算的查询侧与候选侧 bigram，
+    /// 避免在一批候选中反复重建 bigram 表。
     fn similarity_normalized_with_keys(
         &self,
         query: &str,
         query_keys: &[(char, Option<char>)],
         other: &str,
+        other_keys: &[(char, Option<char>)],
     ) -> f64 {
         if query.is_empty() || other.is_empty() {
             return 0.0;
@@ -267,11 +272,10 @@ impl OntologyAligner {
         if short_len >= 2 && long.contains(short) {
             return 0.7 + 0.3 * (short_len as f64 / long_len as f64);
         }
-        let other_keys = Self::bigram_keys(other);
         if short == query {
-            Self::bigram_dice_keys(query_keys, &other_keys)
+            Self::bigram_dice_keys(query_keys, other_keys)
         } else {
-            Self::bigram_dice_keys(&other_keys, query_keys)
+            Self::bigram_dice_keys(other_keys, query_keys)
         }
     }
 
@@ -294,9 +298,10 @@ impl OntologyAligner {
         keys
     }
 
-    fn synonym_chain(&self, term: &str) -> Option<String> {
+    /// `term_norm` 必须是 `self.normalize(term)` 的结果，避免重复规范化
+    fn synonym_chain(&self, term: &str, term_norm: &str) -> Option<String> {
         let mut current = term.to_string();
-        let mut current_norm = self.normalize(term);
+        let mut current_norm = term_norm.to_string();
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(current_norm.clone());
         let mut changed = false;
@@ -346,9 +351,11 @@ impl OntologyAligner {
     }
 
     fn resolve_with_index_uncached(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
-        if let Some(target) = self.synonym_chain(term) {
+        // 规范化只做一次，供同义词链、索引查询与相似度扫描复用
+        let normalized = self.normalize(term);
+        if let Some(target) = self.synonym_chain(term, &normalized) {
             let target_norm = self.normalize(&target);
-            if target_norm != self.normalize(term) {
+            if target_norm != normalized {
                 let idx = self.index.get(&target_norm).copied();
                 return Some((
                     AlignmentPair {
@@ -363,7 +370,6 @@ impl OntologyAligner {
             }
         }
 
-        let normalized = self.normalize(term);
         let self_idx = self.index.get(&normalized).copied();
         if let Some(idx) = self_idx {
             let canonical = self.profiles[idx].term.clone();
@@ -389,8 +395,12 @@ impl OntologyAligner {
             if Some(i) == self_idx {
                 continue;
             }
-            let sim =
-                self.similarity_normalized_with_keys(&normalized, &query_keys, &self.profile_norms[i]);
+            let sim = self.similarity_normalized_with_keys(
+                &normalized,
+                &query_keys,
+                &self.profile_norms[i],
+                &self.profile_keys[i],
+            );
             if sim >= self.similarity_threshold
                 && best_similarity.map_or(true, |(b, _)| sim > b)
             {
@@ -520,24 +530,25 @@ impl OntologyAligner {
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
 
         for (s, p, o) in triples {
-            // 部分解析结果供对齐证据与规范化三元组共用
-            let resolved = [self.resolve(s), self.resolve(p), self.resolve(o)];
+            // 部分解析结果供对齐证据与规范化三元组共用；命中缓存时只复制 Arc，
+            // 并在确认是新的对齐对时才做一次深拷贝
+            let resolved = [self.resolve_arc(s), self.resolve_arc(p), self.resolve_arc(o)];
             for pair in resolved.iter().flatten() {
-                if seen_pairs.insert((pair.source.clone(), pair.target.clone())) {
-                    pairs.push(pair.clone());
+                if seen_pairs.insert((pair.0.source.clone(), pair.0.target.clone())) {
+                    pairs.push(pair.0.clone());
                 }
             }
             let canonical = (
                 match &resolved[0] {
-                    Some(pair) => pair.target.clone(),
+                    Some(pair) => pair.0.target.clone(),
                     None => s.clone(),
                 },
                 match &resolved[1] {
-                    Some(pair) => pair.target.clone(),
+                    Some(pair) => pair.0.target.clone(),
                     None => p.clone(),
                 },
                 match &resolved[2] {
-                    Some(pair) => pair.target.clone(),
+                    Some(pair) => pair.0.target.clone(),
                     None => o.clone(),
                 },
             );
