@@ -122,6 +122,10 @@ impl SymbolicEmbedding {
     // PPMI 逐分量计算：pmi = ln( count(e,f) * total / (count(f) * mass(e)) )
     // 只保留正值，随后 L2 归一化，便于余弦相似度。
     pub fn rebuild(&mut self) {
+        // 计数未变化时向量必然与上次重建一致，直接跳过昂贵的 PPMI 全量重算
+        if !self.dirty && !self.vectors.is_empty() {
+            return;
+        }
         let mut vectors: HashMap<String, EntityVector> = HashMap::new();
         let total = self.total_mass;
         for (entity, features) in &self.counts {
@@ -129,7 +133,8 @@ impl SymbolicEmbedding {
             if mass <= 0.0 || total <= 0.0 {
                 continue;
             }
-            let mut weights: Vec<(String, f64)> = Vec::new();
+            // 先用借用排序并截断，只为最终保留的特征克隆名称
+            let mut weights: Vec<(&str, f64)> = Vec::new();
             for (feature, count) in features {
                 let feature_total = self.feature_totals.get(feature).copied().unwrap_or(0.0);
                 if feature_total <= 0.0 || *count <= 0.0 {
@@ -138,15 +143,20 @@ impl SymbolicEmbedding {
                 let ratio = count * total / (feature_total * mass);
                 let pmi = ratio.ln();
                 if pmi > 0.0 {
-                    weights.push((feature.clone(), pmi));
+                    weights.push((feature.as_str(), pmi));
                 }
             }
-            weights.sort_by(|a, b| {
+            let cmp = |a: &(&str, f64), b: &(&str, f64)| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            weights.truncate(self.max_features);
+                    .then_with(|| a.0.cmp(b.0))
+            };
+            // 先按全序做 top-k 划分再排序：与"全排序后截断"结果一致，但平均复杂度更低
+            if weights.len() > self.max_features {
+                weights.select_nth_unstable_by(self.max_features, cmp);
+                weights.truncate(self.max_features);
+            }
+            weights.sort_by(cmp);
             let norm = weights.iter().map(|(_, w)| w * w).sum::<f64>().sqrt();
             if norm <= 0.0 {
                 continue;
@@ -154,7 +164,10 @@ impl SymbolicEmbedding {
             vectors.insert(
                 entity.clone(),
                 EntityVector {
-                    weights: weights.into_iter().collect(),
+                    weights: weights
+                        .into_iter()
+                        .map(|(feature, weight)| (feature.to_string(), weight))
+                        .collect(),
                     norm,
                 },
             );
@@ -214,12 +227,17 @@ impl SymbolicEmbedding {
             .map(|(name, vector)| (name.clone(), Self::cosine(va, vector)))
             .filter(|(_, score)| *score >= self.similarity_floor)
             .collect();
-        neighbors.sort_by(|a, b| {
+        let cmp = |a: &(String, f64), b: &(String, f64)| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(&b.0))
-        });
-        neighbors.truncate(k);
+        };
+        // 全序（分数+名称唯一）下先划分 top-k 再排序，与全排序截断等价
+        if neighbors.len() > k {
+            neighbors.select_nth_unstable_by(k, cmp);
+            neighbors.truncate(k);
+        }
+        neighbors.sort_by(cmp);
         neighbors
     }
 

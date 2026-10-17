@@ -369,6 +369,24 @@ impl CausalAnalyzer {
         }
     }
 
+    /// 与 `from_engine` 相同，但复用调用方已算好的概率视图（省去重复的软真值传播）
+    pub fn from_engine_with_probabilities(
+        engine: &MarkovLogicEngine,
+        probabilities: &HashMap<Atom, f64>,
+        max_depth: usize,
+    ) -> Self {
+        let mut graph = CausalGraph {
+            edges: Vec::new(),
+            by_cause: HashMap::new(),
+            by_effect: HashMap::new(),
+            max_depth: max_depth.clamp(1, 8),
+        };
+        for grounded in engine.ground_all_with_probabilities(probabilities) {
+            graph.add_grounded(&grounded);
+        }
+        Self { graph }
+    }
+
     pub fn graph(&self) -> &CausalGraph {
         &self.graph
     }
@@ -381,6 +399,17 @@ impl CausalAnalyzer {
         max_chains: usize,
     ) -> CausalExplanation {
         let probabilities = engine.probability_map();
+        self.explain_with_probabilities(engine, &probabilities, target, max_chains)
+    }
+
+    /// 与 `explain` 相同，但概率视图由调用方提供，可跨多个目标复用
+    pub fn explain_with_probabilities(
+        &self,
+        engine: &MarkovLogicEngine,
+        probabilities: &HashMap<Atom, f64>,
+        target: &Atom,
+        max_chains: usize,
+    ) -> CausalExplanation {
         let probability = if engine.has_fact(target) {
             1.0
         } else {

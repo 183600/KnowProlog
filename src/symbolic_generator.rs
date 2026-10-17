@@ -74,7 +74,7 @@ pub struct SymbolicGenerator {
     entity_relation_total: HashMap<String, usize>,
     // 谓词 → 拥有该谓词的主体中字典序最小者（全局回退原型，增量维护）
     predicate_min_entity: HashMap<String, String>,
-    triples: HashSet<(String, String, String)>,
+    triples: HashSet<String>,
     total_relations: usize,
     max_profile_sentences: usize,
     completion_min_score: f64,
@@ -84,6 +84,24 @@ pub struct SymbolicGenerator {
     // 类型 → 谓词计数聚合缓存；知识变更（revision 自增）后失效
     revision: u64,
     type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
+}
+
+// 三元组的去重键：长度前缀保证无歧义；单一 String 键相比三元组哈希更省内存、
+// 哈希与比较都只走一段连续字节（重复观察是热路径）
+fn triple_key(subject: &str, predicate: &str, object: &str) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::with_capacity(subject.len() + predicate.len() + object.len() + 24);
+    let _ = write!(
+        key,
+        "{}#{}#{}#",
+        subject.len(),
+        predicate.len(),
+        object.len()
+    );
+    key.push_str(subject);
+    key.push_str(predicate);
+    key.push_str(object);
+    key
 }
 
 impl SymbolicGenerator {
@@ -166,12 +184,16 @@ impl SymbolicGenerator {
         if name.trim().is_empty() {
             return;
         }
-        self.revision += 1;
-        self.known_entities.insert(name.to_string());
+        // 只在知识确有变化时自增 revision，避免重复观察同一实体让聚合缓存失效
+        let mut changed = false;
+        if self.known_entities.insert(name.to_string()) {
+            changed = true;
+        }
         if !etype.trim().is_empty() {
             match self.entity_types.insert(name.to_string(), etype.to_string()) {
                 Some(previous) => {
                     if previous != etype {
+                        changed = true;
                         if let Some(members) = self.type_members.get_mut(&previous) {
                             if let Some(pos) = members.iter().position(|m| m == name) {
                                 members.swap_remove(pos);
@@ -184,6 +206,7 @@ impl SymbolicGenerator {
                     }
                 }
                 None => {
+                    changed = true;
                     self.type_members
                         .entry(etype.to_string())
                         .or_default()
@@ -199,19 +222,23 @@ impl SymbolicGenerator {
                 }
                 if !bucket.iter().any(|(k, v)| k == key && v == value) {
                     bucket.push((key.clone(), value.clone()));
+                    changed = true;
                 }
             }
         }
         for (key, _) in properties {
-            if !key.trim().is_empty() {
-                self.register_predicate_surface(key);
+            if !key.trim().is_empty() && self.register_predicate_surface(key) {
+                changed = true;
             }
+        }
+        if changed {
+            self.revision += 1;
         }
     }
 
-    fn register_predicate_surface(&mut self, predicate: &str) {
+    fn register_predicate_surface(&mut self, predicate: &str) -> bool {
         if !self.lexicalized_predicates.insert(predicate.to_string()) {
-            return;
+            return false;
         }
         // 规范谓词自身总是可解析；规范形式优先于其它谓词的词汇化表述
         self.predicate_surfaces
@@ -224,17 +251,14 @@ impl SymbolicGenerator {
                 .entry(surface.to_string())
                 .or_insert_with(|| predicate.to_string());
         }
+        true
     }
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
         if subject.trim().is_empty() || predicate.trim().is_empty() || object.trim().is_empty() {
             return;
         }
-        let key = (
-            subject.to_string(),
-            predicate.to_string(),
-            object.to_string(),
-        );
+        let key = triple_key(subject, predicate, object);
         if !self.triples.insert(key) {
             return;
         }

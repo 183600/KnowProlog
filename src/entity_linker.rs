@@ -163,7 +163,10 @@ impl EntityLinker {
             profile.degree += 1;
             match self.neighbors.get_mut(name) {
                 Some(neighbors) => {
-                    neighbors.insert(other.to_string());
+                    // 先借用检查，避免对已存在的邻居重复分配 String
+                    if !neighbors.contains(other) {
+                        neighbors.insert(other.to_string());
+                    }
                 }
                 None => {
                     self.neighbors
@@ -446,6 +449,10 @@ impl EntityLinker {
 
     pub fn report(&self, text: &str, hints: &[String]) -> String {
         let mentions = self.link_with_context(text, hints);
+        self.report_for_mentions(text, &mentions)
+    }
+
+    pub fn report_for_mentions(&self, text: &str, mentions: &[LinkedMention]) -> String {
         if mentions.is_empty() {
             return format!("实体链接：「{}」中未识别到知识图谱中的实体。", text);
         }
@@ -455,7 +462,7 @@ impl EntityLinker {
             mentions.len(),
             self.profiles.len()
         );
-        for mention in &mentions {
+        for mention in mentions {
             let method = mention
                 .best()
                 .map(|c| c.method.label())

@@ -240,14 +240,19 @@ pub fn build_predicate_surfaces(
             surfaces.entry(alias.clone()).or_insert(target);
         }
     }
-    let mut surfaces: Vec<(String, String)> = surfaces.into_iter().collect();
-    surfaces.sort_by(|a, b| {
-        b.0.chars()
-            .count()
-            .cmp(&a.0.chars().count())
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    surfaces
+    // 装饰-排序-还原：字符数只计算一次，避免排序比较反复遍历字符串
+    let mut decorated: Vec<(std::cmp::Reverse<usize>, String, String)> = surfaces
+        .into_iter()
+        .map(|(name, canonical)| {
+            let len = name.chars().count();
+            (std::cmp::Reverse(len), name, canonical)
+        })
+        .collect();
+    decorated.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    decorated
+        .into_iter()
+        .map(|(_, name, canonical)| (name, canonical))
+        .collect()
 }
 
 impl<'a> PropositionParser<'a> {

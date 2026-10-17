@@ -26,32 +26,35 @@ pub struct WeightedRule {
     /// 对数几率权重：正=支持 head，负=抑制 head
     pub weight: f64,
     pub source: String,
+    /// 渲染文本在构造时缓存（基化时每条规则会被渲染多次）
+    text: String,
 }
 
 impl WeightedRule {
     pub fn new(head: Atom, body: Vec<Atom>, weight: f64, source: &str) -> Self {
+        let weight = weight.clamp(-LOG_ODDS_CLAMP, LOG_ODDS_CLAMP);
+        let text = Self::render_text(&head, &body, weight);
         Self {
             head,
             body,
-            weight: weight.clamp(-LOG_ODDS_CLAMP, LOG_ODDS_CLAMP),
+            weight,
             source: source.to_string(),
+            text,
         }
     }
 
-    /// 形如 `师傅(?A, ?B) ⇒ 师祖(?A, ?B)（权重 +2.20）`
-    pub fn text(&self) -> String {
-        let body = self
-            .body
+    fn render_text(head: &Atom, body: &[Atom], weight: f64) -> String {
+        let body = body
             .iter()
             .map(|atom| atom.display())
             .collect::<Vec<_>>()
             .join(" ∧ ");
-        format!(
-            "{} ⇒ {}（权重 {:+.2}）",
-            body,
-            self.head.display(),
-            self.weight
-        )
+        format!("{} ⇒ {}（权重 {:+.2}）", body, head.display(), weight)
+    }
+
+    /// 形如 `师傅(?A, ?B) ⇒ 师祖(?A, ?B)（权重 +2.20）`
+    pub fn text(&self) -> String {
+        self.text.clone()
     }
 }
 
@@ -315,6 +318,14 @@ impl MarkovLogicEngine {
             .map(|(atom, (log_odds, _))| (atom.clone(), Self::sigmoid(*log_odds)))
             .collect();
         self.ground_rules_against(&derived, &HashMap::new())
+    }
+
+    /// 与 `ground_all` 相同，但复用调用方已算好的概率视图，避免重复传播
+    pub fn ground_all_with_probabilities(
+        &self,
+        probabilities: &HashMap<Atom, f64>,
+    ) -> Vec<GroundedRule> {
+        self.ground_rules_against(probabilities, &HashMap::new())
     }
 
     /// 当前软信念的"概率视图"（事实不在内；事实按需由调用方补 1.0）

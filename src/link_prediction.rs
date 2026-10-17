@@ -96,6 +96,8 @@ struct Candidate {
     rule_index: usize,
     confidence: f64,
     anchor: String,
+    /// 枚举顺序（唯一、递增），作为并列时的稳定排序键
+    order: usize,
 }
 
 pub struct LinkPredictor {
@@ -444,6 +446,7 @@ impl LinkPredictor {
             rule_index,
             confidence,
             anchor: anchor.to_string(),
+            order: *generated,
         })
     }
 
@@ -629,21 +632,34 @@ impl LinkPredictor {
         self.enumerate_predictions_matching(cap, |_| true)
     }
 
-    fn sort_candidates(candidates: &mut Vec<Candidate>) {
-        candidates.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| a.triple.subject.cmp(&b.triple.subject))
-                .then_with(|| a.triple.object.cmp(&b.triple.object))
-        });
+    fn compare_candidates(a: &Candidate, b: &Candidate) -> Ordering {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.triple.subject.cmp(&b.triple.subject))
+            .then_with(|| a.triple.object.cmp(&b.triple.object))
+            .then_with(|| a.order.cmp(&b.order))
+    }
+
+    fn sort_candidates(candidates: &mut [Candidate]) {
+        candidates.sort_by(Self::compare_candidates);
+    }
+
+    /// 只保留排序最靠前的 `limit` 个候选，再对保留部分排序。
+    /// 比较键是包含枚举序的全序，因此结果与"全量稳定排序后截断"完全一致，
+    /// 但避免了为截断而排序全部候选的开销。
+    fn top_candidates(candidates: &mut Vec<Candidate>, limit: usize) {
+        if limit < candidates.len() {
+            candidates.select_nth_unstable_by(limit, Self::compare_candidates);
+            candidates.truncate(limit);
+        }
+        Self::sort_candidates(candidates);
     }
 
     pub fn predict_missing(&self, limit: usize) -> Vec<Prediction> {
         let cap = self.max_enumeration.max(limit.saturating_mul(20));
         let mut candidates = self.enumerate_predictions(cap);
-        Self::sort_candidates(&mut candidates);
-        candidates.truncate(limit);
+        Self::top_candidates(&mut candidates, limit);
         candidates
             .into_iter()
             .map(|candidate| self.materialize_prediction(candidate))
@@ -661,8 +677,7 @@ impl LinkPredictor {
                 (triple.subject == entity || triple.object == entity)
                     && predicate.map_or(true, |q| triple.predicate == q)
             });
-        Self::sort_candidates(&mut candidates);
-        candidates.truncate(limit);
+        Self::top_candidates(&mut candidates, limit);
         candidates
             .into_iter()
             .map(|candidate| self.materialize_prediction(candidate))

@@ -8,7 +8,7 @@ use crate::abduction::{
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::causal_reasoning::{CausalAnalyzer, CounterfactualDelta};
-use crate::entity_linker::{EntityLinker, LinkMethod};
+use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
@@ -294,6 +294,9 @@ pub struct SymbolicReasoner {
     known_predicates_cache: Vec<String>,
     // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
     proposition_surfaces: Vec<(String, String)>,
+    // 单条链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
+    // 观察事实或重建缓存（线索变化）时整体失效
+    link_memo: parking_lot::Mutex<Option<(String, Vec<LinkedMention>)>>,
 }
 
 impl SymbolicReasoner {
@@ -353,6 +356,7 @@ impl SymbolicReasoner {
             last_abduction_vars: Vec::new(),
             known_predicates_cache: Vec::new(),
             proposition_surfaces: Vec::new(),
+            link_memo: parking_lot::Mutex::new(None),
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
@@ -392,6 +396,10 @@ impl SymbolicReasoner {
     }
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
+        if !facts.is_empty() {
+            // 链接剖面（度数/邻居等）会随观察变化的可能，记忆必须整体失效
+            *self.link_memo.lock() = None;
+        }
         // 溯因统计只累积计数（谓词取值、类型分布、特征），不参与学习
         self.abduction.observe_facts(facts);
         let mut added = 0usize;
@@ -491,8 +499,11 @@ impl SymbolicReasoner {
         if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();
         }
-        // 谓词清单与命题表面积索引随剖面/规则变化，统一在观察后重建一次
-        if !facts.is_empty() {
+        // 谓词清单与命题表面积索引随剖面/规则变化，统一在观察后重建一次；
+        // 无任何变更（纯重复观察）时索引必然与上次一致，跳过重建
+        if !facts.is_empty()
+            && (triples_added || association_changed || attribute_changed || entity_type_changed)
+        {
             self.rebuild_knowledge_caches();
         }
     }
@@ -729,11 +740,22 @@ impl SymbolicReasoner {
     // 实体链接：候选生成 + 模糊容错 + 上下文消歧（详见 entity_linker 模块）
     const LINK_ACCEPT_THRESHOLD: f64 = 0.5;
 
-    pub fn linked_entities(&self, text: &str) -> Vec<String> {
+    /// 文本的实体链接结果：一次查询流程内同一文本会被多处链接，做单条记忆复用
+    fn linked_mentions(&self, text: &str) -> Vec<LinkedMention> {
+        if let Some((cached_text, mentions)) = self.link_memo.lock().as_ref() {
+            if cached_text == text {
+                return mentions.clone();
+            }
+        }
         let hints = self.link_hints(text);
         let mentions = self.linker.link_with_context(text, &hints);
-        let mut seen = HashSet::new();
+        *self.link_memo.lock() = Some((text.to_string(), mentions.clone()));
         mentions
+    }
+
+    pub fn linked_entities(&self, text: &str) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.linked_mentions(text)
             .iter()
             .filter_map(|mention| mention.best())
             .filter(|candidate| candidate.score >= Self::LINK_ACCEPT_THRESHOLD)
@@ -743,9 +765,7 @@ impl SymbolicReasoner {
     }
 
     pub fn best_linked_entity(&self, text: &str) -> Option<String> {
-        let hints = self.link_hints(text);
-        self.linker
-            .link_with_context(text, &hints)
+        self.linked_mentions(text)
             .iter()
             .filter_map(|mention| {
                 mention
@@ -762,15 +782,13 @@ impl SymbolicReasoner {
     }
 
     pub fn entity_link_report(&self, text: &str) -> String {
-        let hints = self.link_hints(text);
-        self.linker.report(text, &hints)
+        let mentions = self.linked_mentions(text);
+        self.linker.report_for_mentions(text, &mentions)
     }
 
     // 仅返回"模糊匹配"的链接说明，用于在回答前向用户提示容错链接
     pub fn entity_link_notes(&self, text: &str) -> Vec<String> {
-        let hints = self.link_hints(text);
-        self.linker
-            .link_with_context(text, &hints)
+        self.linked_mentions(text)
             .iter()
             .filter_map(|mention| {
                 let candidate = mention.best()?;
@@ -2862,17 +2880,13 @@ impl SymbolicReasoner {
         {
             return Some(atom.clone());
         }
-        self.soft
-            .all_predictions(256)
-            .into_iter()
+        // 软预测全量传播开销大：最多计算一次，两次查找复用同一结果
+        let predictions = self.soft.all_predictions(256);
+        predictions
+            .iter()
             .find(|fact| subject_matches(&fact.atom))
-            .or_else(|| {
-                self.soft
-                    .all_predictions(256)
-                    .into_iter()
-                    .find(|fact| any_matches(&fact.atom))
-            })
-            .map(|fact| fact.atom)
+            .or_else(|| predictions.iter().find(|fact| any_matches(&fact.atom)))
+            .map(|fact| fact.atom.clone())
     }
 
     /// 因果推理报告：因果图 + 直接原因 + 事实根因链 + 混杂因子（纯符号 do-演算视角）
@@ -2895,7 +2909,13 @@ impl SymbolicReasoner {
         if candidates.is_empty() {
             return format!("没有找到关于「{}」可用于因果解释的事实或加权推测。", entity);
         }
-        let analyzer = CausalAnalyzer::from_engine(&self.soft, self.config.causal_max_depth);
+        // 概率视图与因果图各只算一次，供所有候选目标复用（软真值传播开销大）
+        let probabilities = self.soft.probability_map();
+        let analyzer = CausalAnalyzer::from_engine_with_probabilities(
+            &self.soft,
+            &probabilities,
+            self.config.causal_max_depth,
+        );
         let graph = analyzer.graph();
         let mut output = format!(
             "因果推理（因果图 {} 节点 / {} 条有符号机制；正权促进、负权抑制；规则基化自 {} 条事实）：\n",
@@ -2904,7 +2924,8 @@ impl SymbolicReasoner {
             self.soft.fact_count()
         );
         for (index, fact) in candidates.iter().enumerate() {
-            let explanation = analyzer.explain(&self.soft, &fact.atom, 3);
+            let explanation =
+                analyzer.explain_with_probabilities(&self.soft, &probabilities, &fact.atom, 3);
             output.push_str(&format!(
                 "  {}. {} {}（P={:.2}）\n",
                 index + 1,
@@ -2972,7 +2993,13 @@ impl SymbolicReasoner {
                 entity
             );
         };
-        let analyzer = CausalAnalyzer::from_engine(&self.soft, self.config.causal_max_depth);
+        // 因果图基化复用同一份概率视图，省去一次额外的软真值传播
+        let probabilities = self.soft.probability_map();
+        let analyzer = CausalAnalyzer::from_engine_with_probabilities(
+            &self.soft,
+            &probabilities,
+            self.config.causal_max_depth,
+        );
         let probes = analyzer.direct_effect_probes(&intervention);
         if probes.is_empty() {
             return format!(

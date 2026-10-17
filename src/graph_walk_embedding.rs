@@ -126,8 +126,7 @@ impl GraphWalkEmbedding {
             return;
         }
         for entity in &self.entities {
-            let mut vector = self.single_source_ppr(entity);
-            vector.truncate(MAX_VECTOR_LEN);
+            let mut vector = self.single_source_ppr_limit(entity, MAX_VECTOR_LEN);
             let norm = vector
                 .iter()
                 .map(|(_, weight)| weight * weight)
@@ -151,6 +150,11 @@ impl GraphWalkEmbedding {
     }
 
     fn single_source_ppr(&self, seed: &str) -> Vec<(String, f64)> {
+        self.single_source_ppr_limit(seed, usize::MAX)
+    }
+
+    /// 幂迭代求平稳分布；limit 限制保留的分量数（与全排序后截断等价）
+    fn single_source_ppr_limit(&self, seed: &str, limit: usize) -> Vec<(String, f64)> {
         let mut current: HashMap<&str, f64> = HashMap::new();
         current.insert(seed, 1.0);
         for _ in 0..self.iterations {
@@ -195,11 +199,16 @@ impl GraphWalkEmbedding {
             .into_iter()
             .map(|(node, weight)| (node.to_string(), weight))
             .collect();
-        result.sort_by(|a, b| {
+        let cmp = |a: &(String, f64), b: &(String, f64)| {
             rank_key(b.1)
                 .cmp(&rank_key(a.1))
                 .then_with(|| a.0.cmp(&b.0))
-        });
+        };
+        if limit != usize::MAX && result.len() > limit {
+            result.select_nth_unstable_by(limit, cmp);
+            result.truncate(limit);
+        }
+        result.sort_by(cmp);
         result
     }
 
@@ -237,25 +246,43 @@ impl GraphWalkEmbedding {
 
     /// 结构角色最接近的实体（按余弦相似度降序，过滤低于阈值者）
     pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
-        if !self.vectors.contains_key(entity) {
+        // 源实体的查找表只构建一次，供所有候选复用（避免每个候选重复构建）
+        let Some(left) = self.vectors.get(entity) else {
             return Vec::new();
-        }
+        };
+        let left_map: HashMap<&str, f64> =
+            left.iter().map(|(name, w)| (name.as_str(), *w)).collect();
         let mut scored: Vec<(String, f64)> = self
             .entities
             .iter()
             .filter(|other| other.as_str() != entity)
             .filter_map(|other| {
-                self.similarity(entity, other)
-                    .filter(|score| *score >= self.similarity_floor)
-                    .map(|score| (other.clone(), score))
+                let right = self.vectors.get(other)?;
+                let mut dot = 0.0;
+                for (name, weight) in right {
+                    if let Some(other_weight) = left_map.get(name.as_str()) {
+                        dot += weight * other_weight;
+                    }
+                }
+                let score = dot.clamp(-1.0, 1.0);
+                if score >= self.similarity_floor {
+                    Some((other.clone(), score))
+                } else {
+                    None
+                }
             })
             .collect();
-        scored.sort_by(|a, b| {
+        let cmp = |a: &(String, f64), b: &(String, f64)| {
             rank_key(b.1)
                 .cmp(&rank_key(a.1))
                 .then_with(|| a.0.cmp(&b.0))
-        });
-        scored.truncate(k.max(1));
+        };
+        let keep = k.max(1);
+        if scored.len() > keep {
+            scored.select_nth_unstable_by(keep, cmp);
+            scored.truncate(keep);
+        }
+        scored.sort_by(cmp);
         scored
     }
 
@@ -286,12 +313,17 @@ impl GraphWalkEmbedding {
             .into_iter()
             .filter(|(entity, _)| !seed_set.contains(entity.as_str()))
             .collect();
-        result.sort_by(|a, b| {
+        let cmp = |a: &(String, f64), b: &(String, f64)| {
             rank_key(b.1)
                 .cmp(&rank_key(a.1))
                 .then_with(|| a.0.cmp(&b.0))
-        });
-        result.truncate(k.max(1));
+        };
+        let keep = k.max(1);
+        if result.len() > keep {
+            result.select_nth_unstable_by(keep, cmp);
+            result.truncate(keep);
+        }
+        result.sort_by(cmp);
         result
     }
 

@@ -74,12 +74,16 @@ impl PrologEngine {
     }
     
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
-        // 先按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
+        println!("Loading {} Prolog facts", facts.len());
+
+        // 快路径：事实集与加载顺序都未变化时无需排序（排序本身 O(n log n)）
+        if facts == self.loaded_facts {
+            return;
+        }
+
+        // 再按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
         let mut facts = facts;
         facts.sort_by(Self::compare_facts);
-        let facts_count = facts.len();
-
-        println!("Loading {} Prolog facts", facts_count);
 
         // 事实集未变化时跳过清空与重载，机器状态保持一致
         if facts == self.loaded_facts {
@@ -87,7 +91,7 @@ impl PrologEngine {
         }
 
         self.clear_dynamic_facts();
-        let mut fact_string = String::with_capacity(facts_count * 64);
+        let mut fact_string = String::with_capacity(facts.len() * 64);
         
         for fact in &facts {
             match fact {

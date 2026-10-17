@@ -399,7 +399,9 @@ impl AbductionEngine {
                 name, entity_type, ..
             } = fact
             {
-                if !entity_type.trim().is_empty() {
+                if !entity_type.trim().is_empty()
+                    && self.entity_types.get(name).map(String::as_str) != Some(entity_type.as_str())
+                {
                     self.entity_types
                         .insert(name.clone(), entity_type.clone());
                 }
@@ -433,60 +435,149 @@ impl AbductionEngine {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             return;
         }
-        *self
+        // 已存在的计数直接自增，避免为 map 键重复分配 String（重复观察是热路径）
+        match self
             .pred_objects
-            .entry(predicate.to_string())
-            .or_default()
-            .entry(object.to_string())
-            .or_insert(0) += 1;
-
-        let subject_type = self.entity_types.get(subject).cloned();
-        if let Some(ref t) = subject_type {
-            *self
-                .pred_subject_types
-                .entry(predicate.to_string())
-                .or_default()
-                .entry(t.clone())
-                .or_insert(0) += 1;
-        }
-        let object_type = self.entity_types.get(object).cloned();
-        if let Some(ref t) = object_type {
-            *self
-                .pred_object_types
-                .entry(predicate.to_string())
-                .or_default()
-                .entry(t.clone())
-                .or_insert(0) += 1;
+            .get_mut(predicate)
+            .and_then(|values| values.get_mut(object))
+        {
+            Some(count) => *count += 1,
+            None => {
+                *self
+                    .pred_objects
+                    .entry(predicate.to_string())
+                    .or_default()
+                    .entry(object.to_string())
+                    .or_insert(0) += 1;
+            }
         }
 
-        self.pred_subject_objects
-            .entry(predicate.to_string())
-            .or_default()
-            .entry(subject.to_string())
-            .or_default()
-            .insert(object.to_string());
+        if let Some(t) = self.entity_types.get(subject) {
+            match self.pred_subject_types.get_mut(predicate) {
+                Some(types) => match types.get_mut(t) {
+                    Some(count) => *count += 1,
+                    None => {
+                        types.insert(t.clone(), 1);
+                    }
+                },
+                None => {
+                    *self
+                        .pred_subject_types
+                        .entry(predicate.to_string())
+                        .or_default()
+                        .entry(t.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        if let Some(t) = self.entity_types.get(object) {
+            match self.pred_object_types.get_mut(predicate) {
+                Some(types) => match types.get_mut(t) {
+                    Some(count) => *count += 1,
+                    None => {
+                        types.insert(t.clone(), 1);
+                    }
+                },
+                None => {
+                    *self
+                        .pred_object_types
+                        .entry(predicate.to_string())
+                        .or_default()
+                        .entry(t.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
 
-        self.entity_features
-            .entry(subject.to_string())
-            .or_default()
-            .insert(format!("出:{}={}", predicate, object));
-        self.entity_features
-            .entry(object.to_string())
-            .or_default()
-            .insert(format!("入:{}={}", predicate, subject));
+        match self
+            .pred_subject_objects
+            .get_mut(predicate)
+            .and_then(|subjects| subjects.get_mut(subject))
+        {
+            Some(objects) => {
+                // HashSet 的 insert 需要所有权：先借用检查可避免重复分配
+                if !objects.contains(object) {
+                    objects.insert(object.to_string());
+                }
+            }
+            None => {
+                self.pred_subject_objects
+                    .entry(predicate.to_string())
+                    .or_default()
+                    .entry(subject.to_string())
+                    .or_default()
+                    .insert(object.to_string());
+            }
+        }
 
-        *self
+        // 特征串用可复用缓冲构造：重复观察时仅做借用检查，不重复分配
+        let mut feature = String::with_capacity(predicate.len() + subject.len() + object.len() + 4);
+        feature.push_str("出:");
+        feature.push_str(predicate);
+        feature.push('=');
+        feature.push_str(object);
+        match self.entity_features.get_mut(subject) {
+            Some(features) => {
+                if !features.contains(feature.as_str()) {
+                    features.insert(feature.clone());
+                }
+            }
+            None => {
+                self.entity_features
+                    .entry(subject.to_string())
+                    .or_default()
+                    .insert(feature.clone());
+            }
+        }
+        feature.clear();
+        feature.push_str("入:");
+        feature.push_str(predicate);
+        feature.push('=');
+        feature.push_str(subject);
+        match self.entity_features.get_mut(object) {
+            Some(features) => {
+                if !features.contains(feature.as_str()) {
+                    features.insert(feature.clone());
+                }
+            }
+            None => {
+                self.entity_features
+                    .entry(object.to_string())
+                    .or_default()
+                    .insert(feature.clone());
+            }
+        }
+
+        match self
             .entity_predicates
-            .entry(subject.to_string())
-            .or_default()
-            .entry(predicate.to_string())
-            .or_insert(0) += 1;
-        *self
+            .get_mut(subject)
+            .and_then(|counts| counts.get_mut(predicate))
+        {
+            Some(count) => *count += 1,
+            None => {
+                *self
+                    .entity_predicates
+                    .entry(subject.to_string())
+                    .or_default()
+                    .entry(predicate.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        match self
             .entity_predicates
-            .entry(object.to_string())
-            .or_default()
-            .entry(predicate.to_string())
-            .or_insert(0) += 1;
+            .get_mut(object)
+            .and_then(|counts| counts.get_mut(predicate))
+        {
+            Some(count) => *count += 1,
+            None => {
+                *self
+                    .entity_predicates
+                    .entry(object.to_string())
+                    .or_default()
+                    .entry(predicate.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
     }
 
     /// 目标制导的溯因分析：
@@ -923,7 +1014,7 @@ impl AbductionEngine {
                 .sum()
         };
         // 排序键只计算一次：规模升序 → 谓词支撑降序 → 显示长度升序（与逐次调用等价）
-        let mut candidates: Vec<(Vec<Atom>, usize, u64, usize)> = frontiers
+        let candidates: Vec<(Vec<Atom>, usize, u64, usize)> = frontiers
             .into_iter()
             .map(|frontier| {
                 let size = frontier.len();
@@ -933,14 +1024,14 @@ impl AbductionEngine {
                 (frontier, size, support, display_len)
             })
             .collect();
-        candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.cmp(&a.2))
-                .then_with(|| a.3.cmp(&b.3))
-        });
+        // 只需极值：min_by 与"稳定升序排序后取首个"等价，但无需排序全部候选
         candidates
             .into_iter()
-            .next()
+            .min_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.3.cmp(&b.3))
+            })
             .map(|(frontier, _, _, _)| frontier)
             .unwrap_or_default()
     }
