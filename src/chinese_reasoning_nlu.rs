@@ -163,20 +163,40 @@ pub fn extract_probability(text: &str) -> Option<(f64, String)> {
     let mut word_candidates: Vec<(usize, usize, f64)> = Vec::new();
     // 百分之八十 / 百分之 80
     if let Some(pos) = text.find("百分之") {
-        let after = &text[pos + "百分之".len()..];
+        let after_raw = &text[pos + "百分之".len()..];
+        // 允许「百分之 80」中的空白：跳过并计入被移除片段的长度
+        let whitespace_len: usize = after_raw
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .map(|ch| ch.len_utf8())
+            .sum();
+        let after = &after_raw[whitespace_len..];
         let cn: String = after.chars().take_while(|ch| is_cn_digit(*ch)).collect();
         if let Some(value) = parse_chinese_number(&cn).filter(|value| *value <= 100) {
-            percent_candidates.push((pos, "百分之".len() + cn.len(), value as f64 / 100.0));
+            percent_candidates.push((
+                pos,
+                "百分之".len() + whitespace_len + cn.len(),
+                value as f64 / 100.0,
+            ));
         } else {
             let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
             if let Some(value) = digits.parse::<u32>().ok().filter(|value| *value <= 100) {
-                percent_candidates.push((pos, "百分之".len() + digits.len(), value as f64 / 100.0));
+                percent_candidates.push((
+                    pos,
+                    "百分之".len() + whitespace_len + digits.len(),
+                    value as f64 / 100.0,
+                ));
             }
         }
     }
     // 80% / 80％
-    for (pos, _) in text.char_indices() {
-        if !text[pos..].starts_with(|ch: char| ch.is_ascii_digit()) {
+    let mut previous_is_digit = false;
+    for (pos, ch) in text.char_indices() {
+        let is_digit = ch.is_ascii_digit();
+        // 只从数字串的开头匹配，避免「180%」被截成「80%」
+        let starts_digit_run = is_digit && !previous_is_digit;
+        previous_is_digit = is_digit;
+        if !starts_digit_run {
             continue;
         }
         let digits: String = text[pos..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
@@ -625,6 +645,17 @@ mod tests {
         assert!((probability - 0.95).abs() < 1e-9);
         assert_eq!(cleaned, "下雨");
         assert!(extract_probability("不可能下雨").is_none());
+    }
+
+    #[test]
+    fn test_extract_probability_percent_boundaries() {
+        // 「180%」不是合法概率，不能从中间的「80%」截取，也不应留下残字
+        assert!(extract_probability("180%的学生通过考试").is_none());
+        assert!(extract_probability("百分之200的鸟会飞").is_none());
+        // 「百分之 80」带空白仍可识别
+        let (probability, cleaned) = extract_probability("百分之 80 的学生通过考试").unwrap();
+        assert!((probability - 0.8).abs() < 1e-9);
+        assert_eq!(cleaned, " 的学生通过考试");
     }
 
     #[test]

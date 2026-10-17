@@ -292,11 +292,18 @@ impl Compiled {
         if *budget == 0 || depth > self.max_depth {
             return Vec::new();
         }
-        if self.deterministic_facts.contains(atom) || self.probabilistic_facts.contains_key(atom) {
+        if self.deterministic_facts.contains(atom) {
             *budget -= 1;
             return vec![ProblogProof {
                 steps: Vec::new(),
                 probability: 1.0,
+            }];
+        }
+        if let Some(&probability) = self.probabilistic_facts.get(atom) {
+            *budget -= 1;
+            return vec![ProblogProof {
+                steps: Vec::new(),
+                probability,
             }];
         }
         if path.contains(atom) {
@@ -525,6 +532,10 @@ impl ProblogEngine {
             }
         }
         for fact in &self.probabilistic_facts {
+            // 同一原子既是确定事实时以确定事实为准（与 compile 的跳过规则一致）
+            if self.deterministic_facts.contains(&fact.atom) {
+                continue;
+            }
             if !pattern_matches(pattern, &fact.atom) || fact.probability < min_probability {
                 continue;
             }
@@ -873,7 +884,7 @@ fn render_premises(premises: &[Atom]) -> String {
         .join("&")
 }
 
-fn pattern_matches(pattern: &Atom, atom: &Atom) -> bool {
+pub(crate) fn pattern_matches(pattern: &Atom, atom: &Atom) -> bool {
     if pattern.predicate != atom.predicate || pattern.arity() != atom.arity() {
         return false;
     }
@@ -1054,6 +1065,38 @@ mod tests {
         assert!((query.answers[0].probability - 0.3).abs() < 1e-9);
         assert_eq!(query.answers[0].proofs.len(), 1);
         assert!((query.answers[0].proofs[0].probability - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_probabilistic_premise_fact_contributes_probability_to_proof() {
+        let mut engine = rule_engine();
+        engine.add_probabilistic_fact(fact("p", "x", "y"), 0.8);
+        engine.add_rule(
+            fact("a", "x", "y"),
+            vec![fact("p", "x", "y")],
+            0.5,
+            "p⇒a",
+        );
+        let query = engine.query(&fact("a", "x", "y"), 5, 0.0);
+        assert_eq!(query.answers.len(), 1);
+        assert!((query.answers[0].probability - 0.4).abs() < 1e-9);
+        assert_eq!(query.answers[0].proofs.len(), 1);
+        assert!(
+            (query.answers[0].proofs[0].probability - 0.4).abs() < 1e-9,
+            "证明路径应包含概率事实的 0.8（实得 {}）",
+            query.answers[0].proofs[0].probability
+        );
+    }
+
+    #[test]
+    fn test_deterministic_fact_wins_over_probabilistic_in_query() {
+        let mut engine = rule_engine();
+        engine.add_probabilistic_fact(fact("p", "x", "y"), 0.2);
+        engine.add_deterministic_fact(fact("p", "x", "y"));
+        let query = engine.query(&fact("p", "x", "y"), 5, 0.0);
+        assert_eq!(query.answers.len(), 1);
+        assert!((query.answers[0].probability - 1.0).abs() < 1e-9);
+        assert!(query.answers[0].from_fact);
     }
 
     #[test]

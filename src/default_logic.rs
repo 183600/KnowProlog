@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chinese_reasoning_nlu::{parse_proposition, render_atom_zh};
 use crate::ontology_reasoning::OntologyClosure;
-use crate::problog::ProblogEngine;
+use crate::problog::{pattern_matches, ProblogEngine};
 use crate::resolution_engine::{Atom, Term};
 
 const MAX_GROUND_ENVS_PER_RULE: usize = 2048;

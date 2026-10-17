@@ -3648,6 +3648,16 @@ impl SymbolicReasoner {
             }
         }
         if !restored.is_empty() {
+            // 与 adopt_atom 保持一致：恢复的会话事实同样注入软逻辑/概率程序，
+            // 否则恢复后 soft_inference_report 与 problog_report 缺少这些事实
+            for atom in &restored {
+                if self.config.enable_soft_logic {
+                    self.soft.add_fact(atom.clone());
+                }
+                if self.config.enable_problog {
+                    self.problog.add_deterministic_fact(atom.clone());
+                }
+            }
             self.abduction.restore_adopted(restored.clone());
             self.session_facts = restored;
             if self.config.enable_resolution {
@@ -4584,6 +4594,18 @@ mod tests {
         assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
         let proof = restored.resolution_proof_report("张三的师祖是赵六");
         assert!(proof.contains("得证"), "跨会话恢复的假设应参与证明：{}", proof);
+        let soft = restored.soft_inference_report("张三");
+        assert!(
+            soft.contains("师祖") && soft.contains("赵六"),
+            "跨会话恢复的假设应注入软逻辑：{}",
+            soft
+        );
+        let problog = restored.problog_report("张三");
+        assert!(
+            problog.contains("师祖") && problog.contains("赵六"),
+            "跨会话恢复的假设应注入概率程序：{}",
+            problog
+        );
         assert!(
             restored.dialogue_summary().contains("会话假设 1 条"),
             "对话记忆应显示会话假设：{}",

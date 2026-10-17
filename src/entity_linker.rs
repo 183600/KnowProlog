@@ -156,6 +156,10 @@ impl EntityLinker {
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
         for (name, other, predicate) in [(subject, object, predicate), (object, subject, predicate)] {
+            // 空白端点无法登记画像（register_entity 会跳过），整条边忽略避免 panic
+            if name.trim().is_empty() || other.trim().is_empty() {
+                continue;
+            }
             if !self.profiles.contains_key(name) {
                 self.register_entity(name, None);
             }
@@ -663,6 +667,17 @@ mod tests {
 
         let long_typo = linker.link("珠穆朗玛锋有多高");
         assert_eq!(long_typo[0].best().unwrap().entity, "珠穆朗玛峰");
+    }
+
+    #[test]
+    fn test_observe_triple_ignores_blank_endpoints() {
+        let mut linker = EntityLinker::new();
+        linker.observe_triple("", "师傅", "李四");
+        linker.observe_triple("张三", "师傅", " ");
+        assert_eq!(linker.len(), 0, "空白端点不应登记任何画像");
+        linker.observe_triple("张三", "师傅", "李四");
+        assert!(linker.is_known_entity("张三"));
+        assert!(linker.is_known_entity("李四"));
     }
 
     #[test]

@@ -905,12 +905,17 @@ fn extract_property_prefix(body: &str, suffixes: &[&str]) -> Option<String> {
 
 /// 解析单句本体知识：类层级、互斥、子关系、传递/对称/逆、定义域/值域、类固有属性、个体归类
 pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
+    // 疑问句检查必须在清理标点之前：clean_lesson_text 会去掉句末的问号
+    let raw = text.trim();
+    if raw.contains('？') || raw.contains('?') {
+        return Err(format!(
+            "「{}」是疑问句，不能作为本体知识教学",
+            clean_lesson_text(text)
+        ));
+    }
     let cleaned = clean_lesson_text(text);
     if cleaned.is_empty() {
         return Err("空句子".to_string());
-    }
-    if cleaned.contains('？') || cleaned.contains('?') {
-        return Err(format!("「{}」是疑问句，不能作为本体知识教学", cleaned));
     }
     let original = cleaned.clone();
     // 互斥：X和Y互斥 / X与Y不相容
