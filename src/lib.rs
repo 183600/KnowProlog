@@ -37,11 +37,13 @@ pub mod association_miner;
 pub mod graph_walk_embedding;
 pub mod markov_logic;
 pub mod causal_reasoning;
+pub mod causal_tokenization;
 pub mod problog;
 pub mod chinese_reasoning_nlu;
 pub mod ontology_reasoning;
 pub mod default_logic;
 pub mod neuro_symbolic_contrast;
+pub mod discourse;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
@@ -165,12 +167,20 @@ pub struct ReasoningConfig {
     pub causal_max_depth: usize,
     #[serde(default = "default_enable_gradient_attribution")]
     pub enable_gradient_attribution: bool,
+    #[serde(default = "default_enable_causal_tokenization")]
+    pub enable_causal_tokenization: bool,
     #[serde(default = "default_enable_problog")]
     pub enable_problog: bool,
     #[serde(default = "default_problog_max_depth")]
     pub problog_max_depth: usize,
     #[serde(default = "default_problog_max_proofs")]
     pub problog_max_proofs: usize,
+    #[serde(default = "default_enable_discourse")]
+    pub enable_discourse: bool,
+    #[serde(default = "default_discourse_max_sentences")]
+    pub discourse_max_sentences: usize,
+    #[serde(default = "default_discourse_max_rounds")]
+    pub discourse_max_rounds: usize,
 }
 
 fn default_enable_problog() -> bool {
@@ -185,6 +195,18 @@ fn default_problog_max_proofs() -> usize {
     12
 }
 
+fn default_enable_discourse() -> bool {
+    true
+}
+
+fn default_discourse_max_sentences() -> usize {
+    6
+}
+
+fn default_discourse_max_rounds() -> usize {
+    4
+}
+
 fn default_enable_causal_reasoning() -> bool {
     true
 }
@@ -194,6 +216,10 @@ fn default_causal_max_depth() -> usize {
 }
 
 fn default_enable_gradient_attribution() -> bool {
+    true
+}
+
+fn default_enable_causal_tokenization() -> bool {
     true
 }
 
@@ -349,9 +375,13 @@ impl Default for ReasoningConfig {
             enable_causal_reasoning: default_enable_causal_reasoning(),
             causal_max_depth: default_causal_max_depth(),
             enable_gradient_attribution: default_enable_gradient_attribution(),
+            enable_causal_tokenization: default_enable_causal_tokenization(),
             enable_problog: default_enable_problog(),
             problog_max_depth: default_problog_max_depth(),
             problog_max_proofs: default_problog_max_proofs(),
+            enable_discourse: default_enable_discourse(),
+            discourse_max_sentences: default_discourse_max_sentences(),
+            discourse_max_rounds: default_discourse_max_rounds(),
         }
     }
 }

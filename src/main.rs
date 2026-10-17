@@ -495,6 +495,67 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 符号主义叙述：OWL 本体定义开场 + 层级/继承推理 + DCG 文法实现的多句连贯段落
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["叙述：", "叙述:", "讲述：", "讲述:", "详细叙述：", "详细叙述:"],
+        ) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请提供要叙述的实体名，例如：叙述：姚明");
+                println!();
+                continue;
+            }
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            match symbolic_reasoner.narrate(entity) {
+                Some(text) => println!("{}", text),
+                None => println!("知识图谱中没有关于「{}」的叙述材料。", entity),
+            }
+            println!();
+            continue;
+        }
+
+        // DCG 文法复述：对同一条事实给出多种合规句式（纯符号改写）
+        if let Some(spec) = strip_any_prefix(input, &["复述：", "复述:", "换个句式：", "换个句式:"]) {
+            let spec = spec.trim();
+            match spec.rsplit_once('的') {
+                Some((entity, predicate)) if !entity.trim().is_empty() && !predicate.trim().is_empty() => {
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                    match symbolic_reasoner.paraphrase_fact(entity.trim(), predicate.trim(), 4) {
+                        Some(text) => println!("{}", text),
+                        None => println!(
+                            "没有找到「{}」的「{}」相关事实。",
+                            entity.trim(),
+                            predicate.trim()
+                        ),
+                    }
+                }
+                _ => println!("用法：复述：<实体>的<属性>，例如：复述：姚明的身高"),
+            }
+            println!();
+            continue;
+        }
+
+        // OWL 本体教学：把中文公理（子类/互斥/定义域/固有属性……）纳入本体推理
+        if let Some(axiom) = strip_any_prefix(
+            input,
+            &["教本体：", "教本体:", "本体教学：", "本体教学:"],
+        ) {
+            let axiom = axiom.trim();
+            if axiom.is_empty() {
+                println!("请提供本体公理，例如：教本体：人是一种动物");
+                println!();
+                continue;
+            }
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            match symbolic_reasoner.teach_ontology(axiom) {
+                Ok(summary) => println!("已学习本体公理：{}", summary),
+                Err(e) => println!("本体公理解析失败：{}", e),
+            }
+            println!();
+            continue;
+        }
+
         if let Some(prefix) = strip_any_prefix(
             input,
             &["续写：", "续写:", "接龙：", "接龙:", "补全：", "补全:"],
@@ -676,6 +737,29 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.gradient_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 因果分词：知识/因果图引导的 token 格 k-best DP + token 级因果归因（纯符号 attention）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "因果分词：",
+                "因果分词:",
+                "分词：",
+                "分词:",
+                "token归因：",
+                "token归因:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要分词的文本，例如：因果分词：张三的师父是谁");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.causal_tokenize_report(target));
             }
             println!();
             continue;
@@ -1476,9 +1560,12 @@ async fn try_symbolic_reasoning(
     if let Some(abduction) = symbolic_reasoner.hypothesis_answer(input) {
         return Some(abduction);
     }
-    // 逻辑问答失败时，回退到"知识图谱即语言模型"的生成式介绍
+    // 逻辑问答失败时，优先用 OWL+DCG 话语引擎做连贯叙述，
+    // 再回退到"知识图谱即语言模型"的统计生成式介绍
     let entity = symbolic_reasoner.best_linked_entity(input)?;
-    symbolic_reasoner.generate_about(&entity)
+    symbolic_reasoner
+        .narrate(&entity)
+        .or_else(|| symbolic_reasoner.generate_about(&entity))
 }
 
 fn contains_question_marker(text: &str) -> bool {
@@ -1491,7 +1578,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 75] = [
+    const COMMANDS: [&str; 84] = [
         "溯因",
         "假设生成",
         "为什么",
@@ -1509,6 +1596,12 @@ fn is_command_like(input: &str) -> bool {
         "候选假设",
         "介绍",
         "生成介绍",
+        "叙述",
+        "讲述",
+        "详细叙述",
+        "复述",
+        "教本体",
+        "本体教学",
         "续写",
         "接龙",
         "补全",
@@ -1546,6 +1639,9 @@ fn is_command_like(input: &str) -> bool {
         "do:",
         "梯度归因",
         "可微推理",
+        "因果分词",
+        "分词：",
+        "分词:",
         "概率推理",
         "可能世界",
         "教学：",

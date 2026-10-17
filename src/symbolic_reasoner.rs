@@ -8,8 +8,12 @@ use crate::abduction::{
     Scenario,
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
-use crate::causal_reasoning::{CausalAnalyzer, CounterfactualDelta};
+use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
+use crate::causal_tokenization::{
+    attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS,
+};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
+use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
@@ -498,6 +502,8 @@ pub struct SymbolicReasoner {
     link_memo: parking_lot::Mutex<Option<(String, Arc<Vec<LinkedMention>>)>>,
     // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
     entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
+    // 符号主义话语引擎：OWL 本体叙述（定义/继承/推导链）+ DCG 文法实现（多句式生成）
+    discourse: DiscoursePlanner,
 }
 
 impl SymbolicReasoner {
@@ -537,6 +543,8 @@ impl SymbolicReasoner {
             config.soft_logic_min_probability,
         );
         let problog = ProblogEngine::new(config.problog_max_depth, config.problog_max_proofs);
+        let discourse =
+            DiscoursePlanner::new(config.discourse_max_rounds, config.discourse_max_sentences);
         let mut reasoner = Self {
             config,
             aligner,
@@ -564,6 +572,7 @@ impl SymbolicReasoner {
             proposition_surfaces: Vec::new(),
             link_memo: parking_lot::Mutex::new(None),
             entity_mentions_memo: parking_lot::Mutex::new(None),
+            discourse,
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
@@ -619,6 +628,10 @@ impl SymbolicReasoner {
             // 链接剖面（度数/邻居等）会随观察变化的可能，记忆必须整体失效
             *self.link_memo.lock() = None;
             *self.entity_mentions_memo.lock() = None;
+        }
+        // 话语引擎：本体叙事与 DCG 生成共用同一批事实（内部去重，可反复观察）
+        if self.config.enable_discourse {
+            self.discourse.observe_facts(facts);
         }
         // 溯因统计只累积计数（谓词取值、类型分布、特征），不参与学习
         self.abduction.observe_facts(facts);
@@ -1102,6 +1115,111 @@ impl SymbolicReasoner {
             text.push_str(&note);
         }
         Some(text)
+    }
+
+    pub fn discourse(&self) -> &DiscoursePlanner {
+        &self.discourse
+    }
+
+    // 符号主义叙述：OWL 本体定义开场 + 层级/继承补充 + DCG 文法实现的多句连贯段落
+    pub fn narrate(&mut self, entity_raw: &str) -> Option<String> {
+        if !self.config.enable_generation || !self.config.enable_discourse {
+            return None;
+        }
+        let trimmed = entity_raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let canonical = self.aligner.canonical_form(trimmed);
+        let entity = if canonical.is_empty() {
+            trimmed.to_string()
+        } else {
+            canonical
+        };
+        let focus = self.context.focus().map(|focus| focus.to_string());
+        let text = self.discourse.narrate(
+            &entity,
+            focus.as_deref(),
+            None,
+            self.config.discourse_max_sentences,
+            self.generator.predicate_surfaces(),
+        )?;
+        self.context.record_entities(&[entity.clone()]);
+        self.context.record_question(&format!("叙述：{}", entity));
+        Some(text)
+    }
+
+    // 围绕话题的叙述：命中话题的谓词优先（回答"关于X的P"式追问）
+    pub fn narrate_topic(&mut self, entity_raw: &str, topic: &str) -> Option<String> {
+        if !self.config.enable_generation || !self.config.enable_discourse {
+            return None;
+        }
+        let trimmed = entity_raw.trim();
+        let topic = topic.trim();
+        if trimmed.is_empty() || topic.is_empty() {
+            return None;
+        }
+        let canonical = self.aligner.canonical_form(trimmed);
+        let entity = if canonical.is_empty() {
+            trimmed.to_string()
+        } else {
+            canonical
+        };
+        let focus = self.context.focus().map(|focus| focus.to_string());
+        self.discourse.narrate(
+            &entity,
+            focus.as_deref(),
+            Some(topic),
+            self.config.discourse_max_sentences,
+            self.generator.predicate_surfaces(),
+        )
+    }
+
+    // DCG 文法复述：同一事实的多种合规句式（纯符号改写，不改变语义）
+    pub fn paraphrase_fact(
+        &mut self,
+        entity_raw: &str,
+        predicate: &str,
+        limit: usize,
+    ) -> Option<String> {
+        if !self.config.enable_discourse {
+            return None;
+        }
+        let canonical = self.aligner.canonical_form(entity_raw.trim());
+        let entity = if canonical.is_empty() {
+            entity_raw.trim().to_string()
+        } else {
+            canonical
+        };
+        let variants = self.discourse.paraphrase(
+            &entity,
+            predicate.trim(),
+            limit.max(2),
+            self.generator.predicate_surfaces(),
+        );
+        if variants.is_empty() {
+            return None;
+        }
+        let mut text = String::new();
+        for (index, variant) in variants.iter().enumerate() {
+            if index > 0 {
+                text.push('\n');
+            }
+            text.push_str(&format!("{}. {}", index + 1, variant));
+        }
+        Some(text)
+    }
+
+    // OWL 本体教学：把中文公理加入本体（子类/互斥/定义域/固有属性……）
+    pub fn teach_ontology(&mut self, axiom: &str) -> Result<String, String> {
+        if !self.config.enable_discourse {
+            return Err("话语引擎未启用（enable_discourse = false）".to_string());
+        }
+        let trimmed = axiom.trim();
+        if trimmed.is_empty() {
+            return Err("请提供本体公理，例如：人是一种动物".to_string());
+        }
+        self.discourse.teach_axiom(trimmed)
     }
 
     // 多轮生成：接着上一段介绍继续讲后面的句子
@@ -3510,6 +3628,167 @@ impl SymbolicReasoner {
         output.trim_end().to_string()
     }
 
+    /// 从本体对齐器、生成器、会话事实与因果图构建因果分词器：
+    /// 词表锚（实体/类型/谓词/同义词）+ 每条因果机制的权重质量
+    fn build_causal_tokenizer(&self, graph: &CausalGraph) -> CausalTokenizer {
+        let mut tokenizer = CausalTokenizer::new(MAX_TOKEN_CHARS);
+        // 本体对齐器词条：实体/类型/关系/属性
+        let mut profiles: Vec<(&str, AnchorKind, String)> = self
+            .aligner
+            .profiles()
+            .iter()
+            .map(|profile| {
+                let kind = match profile.kind {
+                    TermKind::Entity => AnchorKind::Entity,
+                    TermKind::Type => AnchorKind::Type,
+                    TermKind::Relation | TermKind::Attribute => AnchorKind::Predicate,
+                };
+                (
+                    profile.term.as_str(),
+                    kind,
+                    self.aligner.canonical_form(&profile.term),
+                )
+            })
+            .collect();
+        profiles.sort_by(|a, b| a.0.cmp(b.0));
+        for (term, kind, canonical) in profiles {
+            tokenizer.add_anchor(term, &canonical, kind, 0.95);
+            if canonical != term {
+                tokenizer.add_anchor(&canonical, &canonical, kind, 1.0);
+            }
+        }
+        // 同义词表：别名 → 规范词
+        let mut aliases: Vec<(&String, &String)> = self.aligner.synonyms().iter().collect();
+        aliases.sort();
+        for (alias, canonical) in aliases {
+            tokenizer.add_alias(alias, canonical);
+        }
+        // 生成器的谓词表面形式（动词化表述也参与锚定）
+        let mut surfaces: Vec<(&String, &String)> =
+            self.generator.predicate_surfaces().iter().collect();
+        surfaces.sort();
+        for (surface, canonical) in surfaces {
+            tokenizer.add_anchor(surface, canonical, AnchorKind::Predicate, 0.7);
+        }
+        // 图谱事实：孤立事实同样具有词表地位
+        for atom in self.soft.facts() {
+            tokenizer.observe_fact(atom);
+        }
+        // 因果图：每条有符号机制为两侧原子累计因果质量
+        for edge in graph.edges() {
+            tokenizer.observe_causal_edge(edge);
+        }
+        tokenizer
+    }
+
+    /// 因果分词报告：知识/因果图引导的 token 格 k-best DP 分词 + token 级因果归因
+    /// （纯符号 attention：结论的概率质量沿因果链回溯摊到输入 token 上）
+    pub fn causal_tokenize_report(&self, input_raw: &str) -> String {
+        if !self.config.enable_causal_tokenization {
+            return "因果分词未启用（config.toml [reasoning] enable_causal_tokenization = false）。"
+                .to_string();
+        }
+        let text = input_raw.trim();
+        if text.is_empty() {
+            return "请输入要分词的文本，例如：因果分词：张三的师父是谁".to_string();
+        }
+        let probabilities = self.soft.probability_map();
+        let analyzer = CausalAnalyzer::from_engine_with_probabilities(
+            &self.soft,
+            &probabilities,
+            self.config.causal_max_depth,
+        );
+        let graph = analyzer.graph();
+        let tokenizer = self.build_causal_tokenizer(graph);
+        let tokenization = tokenizer.tokenize(text);
+        let mut output = format!(
+            "因果分词（知识/因果图引导的 token 格 k-best DP：锚定支持度 + 因果质量加成；词表 {} 个锚、因果图 {} 条机制；无神经网络）\n输入：{}\n最优分词（得分 {:.2}）：{}\n",
+            tokenizer.anchor_count(),
+            graph.edge_count(),
+            text,
+            tokenization.score,
+            tokenization.render_segmentation()
+        );
+        for token in &tokenization.tokens {
+            match &token.anchor {
+                Some(anchor) => output.push_str(&format!(
+                    "   • {} → {}（锚定 {:.2}，机制 {} 条 / 因果质量 {:.2}）\n",
+                    token.text,
+                    anchor.text(),
+                    anchor.support,
+                    anchor.causal_edges,
+                    anchor.causal_mass
+                )),
+                None => output.push_str(&format!("   • {} → 未锚定（回退）\n", token.text)),
+            }
+        }
+        if !tokenization.alternatives.is_empty() {
+            let rendered: Vec<String> = tokenization
+                .alternatives
+                .iter()
+                .take(2)
+                .map(|alt| format!("{}（{:.2}）", alt.tokens.join(" | "), alt.score))
+                .collect();
+            output.push_str(&format!("备选分词：{}\n", rendered.join("；")));
+        }
+        // 目标原子：优先按「实体[的谓词]」解析，退而取第一个实体锚
+        let target = self
+            .split_entity_predicate(text)
+            .and_then(|(entity, predicate)| self.find_causal_atom(&entity, predicate.as_deref()))
+            .or_else(|| {
+                tokenization
+                    .anchored_tokens()
+                    .filter(|token| {
+                        token
+                            .anchor
+                            .as_ref()
+                            .map(|anchor| anchor.kind == AnchorKind::Entity)
+                            .unwrap_or(false)
+                    })
+                    .map(|token| {
+                        token
+                            .anchor
+                            .as_ref()
+                            .expect("已按锚定过滤")
+                            .canonical
+                            .clone()
+                    })
+                    .next()
+                    .and_then(|entity| self.find_causal_atom(&entity, None))
+            });
+        match target {
+            Some(target) => {
+                let attributions = attribute_tokens(&tokenization, &self.soft, graph, &target);
+                output.push_str(&format!(
+                    "token 因果归因（目标：{}）：\n",
+                    self.render_atom_nl(&target)
+                ));
+                if attributions.is_empty() {
+                    output.push_str(
+                        "   • 目标未落在输入 token 的锚定路径上（结论来自输入之外的图谱事实）。\n",
+                    );
+                } else {
+                    for item in &attributions {
+                        output.push_str(&format!(
+                            "   • 「{}」 +{:.3}（{:>5.1}%）锚：{}\n",
+                            item.token,
+                            item.contribution,
+                            item.share * 100.0,
+                            item.anchor
+                        ));
+                    }
+                    output.push_str(
+                        "归因说明：概率质量沿因果链回溯到锚定 token，纯符号 attention、逐行可回放。\n",
+                    );
+                }
+            }
+            None => {
+                output.push_str("（未在知识库中找到与输入对应的可归因目标）\n");
+            }
+        }
+        output.trim_end().to_string()
+    }
+
     /// 中文概率知识教学：把「如果…那么…」「八成…」等句子解析成 ProbLog 概率知识，
     /// 只写入会话级概率程序（不修改知识图谱），可随对话状态持久化并在下次会话重放
     pub fn teach_report(&mut self, sentence_raw: &str) -> String {
@@ -4363,9 +4642,13 @@ mod tests {
             enable_causal_reasoning: true,
             causal_max_depth: 4,
             enable_gradient_attribution: true,
+            enable_causal_tokenization: true,
             enable_problog: true,
             problog_max_depth: 6,
             problog_max_proofs: 12,
+            enable_discourse: true,
+            discourse_max_sentences: 6,
+            discourse_max_rounds: 4,
         }
     }
 
@@ -4663,6 +4946,65 @@ mod tests {
         assert!(profile.contains("师祖"));
         assert!(profile.contains("李四"));
         assert!(reasoner.generate_about("不存在的人").is_none());
+    }
+
+    #[test]
+    fn test_narrate_uses_owl_definition_and_dcg_variants() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut properties = HashMap::new();
+        properties.insert("职业".to_string(), "教师".to_string());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "人".to_string(),
+                properties,
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "任教于".to_string(),
+                to: "北京大学".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "任教于".to_string(),
+                to: "清华大学".to_string(),
+            },
+        ];
+        reasoner.observe_facts(&facts);
+        let text = reasoner.narrate("张三").expect("应能生成符号主义叙述");
+        assert!(text.contains("是一种人"), "应包含 OWL 定义开场：{}", text);
+        assert!(
+            text.contains("北京大学") && text.contains("清华大学") && text.contains("、"),
+            "多值事实应聚合：{}",
+            text
+        );
+        assert!(reasoner.narrate("不存在的人").is_none());
+
+        let variants = reasoner
+            .paraphrase_fact("张三", "职业", 4)
+            .expect("应能改写事实句式");
+        assert!(variants.lines().count() >= 2, "应有多种合规句式：{}", variants);
+        assert!(variants.contains("教师"));
+    }
+
+    #[test]
+    fn test_teach_ontology_axiom_flows_into_narration() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "苏格拉底".to_string(),
+            entity_type: "人".to_string(),
+            properties: HashMap::new(),
+        }]);
+        let summary = reasoner
+            .teach_ontology("人是一种动物")
+            .expect("本体公理应可学习");
+        assert!(summary.contains("动物"), "教学回执应包含公理内容：{}", summary);
+        let text = reasoner.narrate("苏格拉底").expect("叙述应可用");
+        assert!(
+            text.contains("动物"),
+            "本体继承推理应进入叙述（定义/推导链）：{}",
+            text
+        );
     }
 
     #[test]
@@ -5377,6 +5719,39 @@ mod tests {
         assert!(reasoner.causal_report("李四的师祖").contains("未启用"));
         assert!(reasoner.counterfactual_report("张三的师傅", false).contains("未启用"));
         assert!(reasoner.gradient_report("李四的师祖").contains("未启用"));
+    }
+
+    #[test]
+    fn test_causal_tokenize_report_segments_with_alias_and_attributes() {
+        let synonyms = HashMap::from([("师父".to_string(), "师傅".to_string())]);
+        let mut reasoner = SymbolicReasoner::new(test_config(), synonyms);
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.causal_tokenize_report("张三的师父是谁");
+        assert!(report.contains("因果分词"), "实际：{}", report);
+        assert!(report.contains("最优分词"), "实际：{}", report);
+        assert!(
+            report.contains("「师傅」（别名）"),
+            "同义词「师父」应锚定到规范谓词「师傅」：{}",
+            report
+        );
+        assert!(report.contains("token 因果归因"), "实际：{}", report);
+        assert!(report.contains("张三"), "输入实体应出现在归因中：{}", report);
+        assert!(
+            report.contains("纯符号 attention"),
+            "应声明归因是纯符号可回放：{}",
+            report
+        );
+    }
+
+    #[test]
+    fn test_causal_tokenization_respects_disabled_config() {
+        let mut config = test_config();
+        config.enable_causal_tokenization = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner
+            .causal_tokenize_report("张三的师傅是谁")
+            .contains("未启用"));
     }
 
     #[test]
