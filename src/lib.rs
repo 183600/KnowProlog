@@ -1221,7 +1221,6 @@ impl OxigraphManager {
 
             let name_value = if is_name_predicate {
                 Some(if let Term::Literal(_) = &quad.object {
-                    // 字面量在 value_str 中已经是同一个字符串值，直接复用
                     value_str.clone()
                 } else {
                     quad.object.to_string()

@@ -404,7 +404,7 @@ impl AdvancedNLU {
     }
 
     fn normalize_query(&self, query: &str) -> String {
-        // 去除多余空白字符并统一标点符号（单遍映射，避免多次分配）
+        // 去除多余空白字符并统一标点符号
         query
             .trim()
             .chars()
@@ -654,7 +654,6 @@ impl AdvancedNLU {
     fn extract_entities_by_type(&self, query: &str, entity_type: &str, pattern_info: &EntityPattern) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
-        // 上下文线索在整句上的命中数对本类型所有匹配都相同，先算一次
         let context_hits = pattern_info
             .context_clues
             .iter()

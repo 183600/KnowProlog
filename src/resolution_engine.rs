@@ -724,8 +724,7 @@ pub fn unify_atoms(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> bo
     true
 }
 
-/// 记录本次合一中已处理的变量；返回 true 表示该变量重复出现。
-/// 超出小数组容量时同样返回 true，让调用方回退到通用合一（保守但正确）。
+/// 记录本次合一中已处理的变量；返回 true 表示该变量重复出现或容器已满。
 #[inline]
 fn remember_var(
     touched: &mut [Option<Rc<str>>; 4],
@@ -746,11 +745,10 @@ fn remember_var(
     }
 }
 
-/// 合一快速路径，前置条件：
+/// 合一 `pattern` 与 `other`，前置条件：
 /// - `pattern` 已按 `subst` 完全解析（其中仍为变量的项必然在 `subst` 中未绑定）；
 /// - `other` 为基原子，或其变量均未出现在 `subst` 中。
 ///
-/// 满足条件时无需为每一对词项重复扫描置换链，可直接写入新绑定；
 /// 同一变量在本次合一中重复出现时回退到通用合一，语义与 [`unify_atoms`] 一致。
 fn unify_prepared(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> bool {
     if pattern.predicate != other.predicate || pattern.arity() != other.arity() {
@@ -769,8 +767,7 @@ fn unify_prepared(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> boo
                 if a == b {
                     continue;
                 }
-                // 两个变量都要登记：回退到通用合一时可能绑定其中之一
-                // （或经解析链绑定），漏登记会让后续出现被当作新变量而被直接覆盖
+                // 两个变量都要登记
                 let seen_a = remember_var(&mut touched, &mut touched_len, a);
                 let seen_b = remember_var(&mut touched, &mut touched_len, b);
                 if seen_a || seen_b {
