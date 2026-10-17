@@ -361,22 +361,42 @@ impl LocalSemanticAdapter {
         // 第四阶段：确定查询类型
         let query_type = self.determine_complex_query_type(&question_analysis, &intent_result, query).await?;
         
-        // 第五阶段：计算置信度
-        let confidence = self.calculate_complex_confidence(&question_analysis, &intent_result, &entities).await?;
-        
         // 提取实体名称字符串
-        let mut entity_names: Vec<String> = entities.into_iter().map(|e| e.entity).collect();
+        let mut entity_names: Vec<String> = entities.iter().map(|e| e.entity.clone()).collect();
+        let mut seen_entities: HashSet<String> = entity_names.iter().cloned().collect();
         
         // 补充知识库中已知实体的识别结果：通用抽取器可能识别不出
         // 采样知识库中已收录的实体（如"珠穆朗玛峰"），这里通过别名做最长匹配补齐
         let knowledge_entities = self.semantic_engine().analyze_intent(query).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
-        let mut seen_entities: HashSet<String> = entity_names.iter().cloned().collect();
         for entity_name in knowledge_entities.entities {
             if seen_entities.insert(entity_name.clone()) {
                 entity_names.push(entity_name);
             }
         }
+        // 题目分析器与意图分析器识别出的实体也计入证据（多源互证）
+        for entity in &question_analysis.entities {
+            if seen_entities.insert(entity.text.clone()) {
+                entity_names.push(entity.text.clone());
+            }
+        }
+        for entity in &intent_result.entities {
+            if seen_entities.insert(entity.text.clone()) {
+                entity_names.push(entity.text.clone());
+            }
+        }
+        
+        // 第五阶段：计算置信度（多源证据：问题分析 + 意图 + 实体 + 查询类型的关键词证据）
+        let confidence = self
+            .calculate_complex_confidence(
+                &question_analysis,
+                &intent_result,
+                &entities,
+                &entity_names,
+                query,
+                &query_type,
+            )
+            .await?;
         
         // 第六阶段：生成查询模式
         let query_patterns = self.generate_complex_query_patterns(&query_type, &entity_names).await?;
@@ -491,32 +511,95 @@ impl LocalSemanticAdapter {
         Ok(best_type)
     }
 
-    async fn calculate_complex_confidence(&self, question_analysis: &QuestionAnalysis, intent_result: &IntentResult, entities: &[crate::entity_relation_extractor::EntityExtraction]) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let mut confidence = 0.0;
-        let mut weight_sum = 0.0;
-        
+    /// 查询类型的关键词证据（纯符号的词汇规则，与 `determine_complex_query_type`
+    /// 使用同一套关键词；命中=强证据，未命中=弱负证据，无对应规则=中性）
+    fn lexical_evidence(query: &str, query_type: &str) -> f64 {
+        let matched: Option<bool> = match query_type {
+            "capital_query" => Some(query.contains("首都") || query.contains("首府")),
+            "altitude_query" => Some(query.contains("海拔") || query.contains("高度")),
+            "chemical_formula_query" => Some(
+                query.contains("分子式") || query.contains("化学式") || query.contains("化学"),
+            ),
+            "author_query" => Some(query.contains("作者") || query.contains("谁写")),
+            "champion_query" => Some(query.contains("冠军")),
+            "birth_year_query" => Some(
+                query.contains("诞生") || query.contains("哪一年") || query.contains("哪年"),
+            ),
+            "quantity_query" => Some(query.contains("多少") || query.contains("几")),
+            "planet_query" | "largest_query" => {
+                Some(query.contains("行星") || query.contains("最大"))
+            }
+            "explanation_query" => Some(
+                query.contains("解释") || query.contains("说明") || query.contains("什么是"),
+            ),
+            "concept_query" => Some(
+                query.contains("什么是") || query.contains("概念") || query.contains("定义"),
+            ),
+            "comparison_query" => Some(
+                query.contains("比较")
+                    || query.contains("区别")
+                    || query.contains("差异")
+                    || query.contains("相比"),
+            ),
+            "impact_query" => Some(
+                query.contains("影响") || query.contains("意义") || query.contains("作用"),
+            ),
+            "principle_query" => Some(
+                query.contains("原理")
+                    || query.contains("定律")
+                    || query.contains("理论")
+                    || query.contains("过程")
+                    || query.contains("如何")
+                    || query.contains("怎么"),
+            ),
+            "philosophy_query" => Some(query.contains("哲学") || query.contains("思想")),
+            "reason_query" | "cause_query" => Some(
+                query.contains("为什么") || query.contains("为何") || query.contains("原因"),
+            ),
+            "relation_query" => Some(query.contains("关系") || query.contains("联系")),
+            _ => None,
+        };
+        match matched {
+            Some(true) => 1.0,
+            Some(false) => 0.65,
+            None => 0.7,
+        }
+    }
+
+    async fn calculate_complex_confidence(
+        &self,
+        question_analysis: &QuestionAnalysis,
+        intent_result: &IntentResult,
+        extractor_entities: &[crate::entity_relation_extractor::EntityExtraction],
+        entity_names: &[String],
+        query: &str,
+        query_type: &str,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         // 问题分析置信度
-        confidence += question_analysis.confidence * 0.4;
-        weight_sum += 0.4;
-        
+        let mut confidence = question_analysis.confidence * 0.3;
+
         // 意图分析置信度
-        confidence += intent_result.confidence * 0.3;
-        weight_sum += 0.3;
-        
-        // 实体识别置信度
-        if !entities.is_empty() {
-            let entity_confidence = entities.iter()
-                .map(|e| e.confidence)
-                .sum::<f64>() / entities.len() as f64;
-            confidence += entity_confidence * 0.3;
-            weight_sum += 0.3;
+        confidence += intent_result.confidence * 0.2;
+
+        // 实体识别置信度：任一来源识别出实体即构成证据；
+        // 通用抽取器给出置信度时按之微调，否则取 0.7 的保守证据
+        if !entity_names.is_empty() {
+            let extractor_average = if extractor_entities.is_empty() {
+                0.0
+            } else {
+                extractor_entities
+                    .iter()
+                    .map(|e| e.confidence)
+                    .sum::<f64>()
+                    / extractor_entities.len() as f64
+            };
+            confidence += (0.7 + 0.3 * extractor_average) * 0.25;
         }
-        
-        if weight_sum > 0.0 {
-            confidence /= weight_sum;
-        }
-        
-        Ok(confidence.min(1.0))
+
+        // 查询类型的关键词证据（词法-语义一致性检验）
+        confidence += Self::lexical_evidence(query, query_type) * 0.25;
+
+        Ok(confidence.clamp(0.0, 1.0))
     }
 
     async fn generate_complex_query_patterns(&self, query_type: &str, _entities: &[String]) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {

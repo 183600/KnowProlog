@@ -571,6 +571,62 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 中文规则学习：教一条 Horn 规则（含占位符自动变量化），直接进入后向链
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "规则：", "规则:", "教规则：", "教规则:", "学习规则：", "学习规则:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请给出中文规则，例如：规则：如果X的师傅是Y，那么X的老师是Y");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.learn_rule_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 记住会话事实：断言为会话级事实（不写知识图谱，可随对话记忆持久化）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["记住：", "记住:", "记录：", "记录:", "断言：", "断言:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请给出要记住的事实，例如：记住：张三是李四的师傅");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.assert_nl_fact(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 忘记会话事实：从会话事实集撤回（不触碰知识图谱）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["忘记：", "忘记:", "遗忘：", "遗忘:", "撤回：", "撤回:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请给出要忘记的事实，例如：忘记：张三是李四的师傅");
+            } else {
+                println!("{}", symbolic_reasoner.retract_nl_fact(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 会话规则库：列出学过的 Horn 规则与会话事实
+        if matches!(input, "会话规则" | "规则库" | "后向链规则" | "规则列表") {
+            println!("{}", symbolic_reasoner.session_rules_report());
+            println!();
+            continue;
+        }
+
         // 推理发现：正向饱和推出多跳新事实（含前提与规则来源）
         if input == "推理发现" || input == "推导发现" {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
@@ -1261,7 +1317,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 62] = [
+    const COMMANDS: [&str; 72] = [
         "溯因",
         "假设生成",
         "为什么",
@@ -1324,6 +1380,16 @@ fn is_command_like(input: &str) -> bool {
         "概率知识",
         "ProbLog",
         "probLog",
+        "规则",
+        "教规则",
+        "学习规则",
+        "记住",
+        "记录",
+        "断言",
+        "忘记",
+        "遗忘",
+        "撤回",
+        "会话规则",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
 }

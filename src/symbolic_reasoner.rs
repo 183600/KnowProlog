@@ -85,6 +85,70 @@ fn clause_from_path_rule(rule: &HornRule) -> Clause {
     }
 }
 
+fn snapshot_clause_atom(atom: &Atom) -> SnapshotClauseAtom {
+    SnapshotClauseAtom {
+        predicate: atom.predicate.to_string(),
+        terms: atom
+            .terms
+            .iter()
+            .map(|term| match term {
+                Term::Var(name) => SnapshotTerm {
+                    name: name.to_string(),
+                    is_var: true,
+                },
+                Term::Const(name) => SnapshotTerm {
+                    name: name.to_string(),
+                    is_var: false,
+                },
+            })
+            .collect(),
+    }
+}
+
+fn snapshot_clause(clause: &Clause) -> SnapshotClause {
+    SnapshotClause {
+        head: snapshot_clause_atom(&clause.head),
+        body: clause.body.iter().map(snapshot_clause_atom).collect(),
+        confidence: clause.confidence,
+        source: clause.source.clone(),
+    }
+}
+
+fn restore_clause(snapshot: &SnapshotClause) -> Option<Clause> {
+    let restore_atom = |atom: &SnapshotClauseAtom| -> Option<Atom> {
+        if atom.predicate.is_empty() || atom.terms.is_empty() {
+            return None;
+        }
+        let terms: Vec<Term> = atom
+            .terms
+            .iter()
+            .filter(|term| !term.name.is_empty())
+            .map(|term| {
+                if term.is_var {
+                    Term::var(&term.name)
+                } else {
+                    Term::constant(&term.name)
+                }
+            })
+            .collect();
+        if terms.len() != atom.terms.len() {
+            return None;
+        }
+        Some(Atom::new(&atom.predicate, terms))
+    };
+    let head = restore_atom(&snapshot.head)?;
+    let mut body = Vec::with_capacity(snapshot.body.len());
+    for atom in &snapshot.body {
+        body.push(restore_atom(atom)?);
+    }
+    Some(Clause::new(
+        head,
+        body,
+        snapshot.confidence,
+        &snapshot.source,
+    ))
+}
+
 // 上一段生成的记忆：实体、已讲句数、段落排序角度（支持"接着说/换个角度说"）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationState {
@@ -100,6 +164,27 @@ pub struct SnapshotAtom {
     pub terms: Vec<String>,
 }
 
+// 会话 Horn 规则的持久化快照（变量/常量需区分，便于跨会话还原后向链）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotTerm {
+    pub name: String,
+    pub is_var: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotClauseAtom {
+    pub predicate: String,
+    pub terms: Vec<SnapshotTerm>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotClause {
+    pub head: SnapshotClauseAtom,
+    pub body: Vec<SnapshotClauseAtom>,
+    pub confidence: f64,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueSnapshot {
     pub focus_entities: Vec<String>,
@@ -113,6 +198,9 @@ pub struct DialogueSnapshot {
     // 用户用中文教过的概率知识原句（会话级，跨会话持久化后自动重放）
     #[serde(default)]
     pub lessons: Vec<String>,
+    // 用户用中文教过的 Horn 规则（会话级后向链规则库，跨会话持久化）
+    #[serde(default)]
+    pub session_clauses: Vec<SnapshotClause>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
@@ -291,6 +379,7 @@ impl DialogueContext {
             generation: self.generation.clone(),
             session_facts: Vec::new(),
             lessons: Vec::new(),
+            session_clauses: Vec::new(),
         }
     }
 
@@ -385,6 +474,8 @@ pub struct SymbolicReasoner {
     abduction: AbductionEngine,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
     session_facts: Vec<Atom>,
+    // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
+    session_clauses: Vec<Clause>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）
     clarification: Option<ClarificationSession>,
     // 最近一次溯因的目标与查询变量（澄清确认真后验证目标是否得证）
@@ -456,6 +547,7 @@ impl SymbolicReasoner {
             resolver,
             abduction,
             session_facts: Vec::new(),
+            session_clauses: Vec::new(),
             clarification: None,
             last_abduction_goal: None,
             last_abduction_vars: Vec::new(),
@@ -652,6 +744,10 @@ impl SymbolicReasoner {
         // 会话级假设事实必须在重建后重新注入（否则刷新知识图谱会丢失"采纳的假设"）
         for atom in &self.session_facts {
             engine.add_fact_atom(atom.clone());
+        }
+        // 会话级 Horn 规则同样在重建后重新注入（教过的一般规则不能因刷新而丢失）
+        for clause in &self.session_clauses {
+            engine.add_clause(clause.clone());
         }
         self.resolver = engine;
     }
@@ -1082,6 +1178,30 @@ impl SymbolicReasoner {
             .collect()
     }
 
+    /// 语义蕴含判未知/形式化失败时的后向链补充判定：把陈述转成归结目标，
+    /// 用「图谱事实 + 会话规则」做 SLD 反驳，得证则输出可追溯的证明树
+    fn backward_chain_appendix(&self, text: &str) -> Option<String> {
+        if !self.config.enable_resolution {
+            return None;
+        }
+        let atom = self
+            .statement_atom(text)
+            .or_else(|| chinese_reasoning_nlu::parse_proposition(text))
+            .filter(Atom::is_ground)?;
+        let solutions = self.resolver.solve(std::slice::from_ref(&atom), &[]);
+        let solution = solutions.first()?;
+        let mut lines = Vec::new();
+        for proof in &solution.proofs {
+            self.render_proof_tree(proof, &mut lines, 2);
+        }
+        Some(format!(
+            "【后向链补充判定】语义蕴含未能直接判定，但归结引擎证明了「{}」（证明置信度 {:.2}）：\n  后向链证明树：\n{}",
+            self.render_atom_nl(&atom),
+            solution.confidence,
+            lines.join("\n")
+        ))
+    }
+
     pub fn entailment_report(&self, text: &str) -> String {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -1089,6 +1209,9 @@ impl SymbolicReasoner {
         }
         let results = self.check_statement(trimmed);
         if results.is_empty() {
+            if let Some(appendix) = self.backward_chain_appendix(trimmed) {
+                return appendix;
+            }
             return format!(
                 "形式化失败：未能把「{}」解析为可判定命题。\n  可用句式：S的P是O / O是S的P / S是类型 / S P O（P 为图谱已知谓词）。",
                 trimmed
@@ -1100,6 +1223,15 @@ impl SymbolicReasoner {
             results.len()
         );
         output.push_str(&semantic_entailment::render_results(&results));
+        if results
+            .iter()
+            .all(|result| result.verdict == Verdict::Unknown)
+        {
+            if let Some(appendix) = self.backward_chain_appendix(trimmed) {
+                output.push('\n');
+                output.push_str(&appendix);
+            }
+        }
         output
     }
 
@@ -1358,6 +1490,45 @@ impl SymbolicReasoner {
         self.abduction.set_pending(pending);
         let render = |atom: &Atom| self.render_atom_nl(atom);
         abduction::render_scenarios(&report.goal, &report.frontier, &scenarios, &render)
+    }
+
+    /// 把断言事实中的新实体/新谓词登记进词表：后续解析、意图规划与实体链接才能识别它们
+    fn register_atom_vocabulary(&mut self, atom: &Atom) -> bool {
+        let mut changed = false;
+        if !atom.predicate.trim().is_empty() && !self.aligner.is_registered(&atom.predicate) {
+            self.aligner.register_term(&atom.predicate, TermKind::Relation);
+            changed = true;
+        }
+        for term in &atom.terms {
+            if let Term::Const(name) = term {
+                if !name.trim().is_empty() && !self.aligner.is_registered(name) {
+                    self.aligner.register_term(name, TermKind::Entity);
+                    self.linker.register_entity(name, None);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.rebuild_knowledge_caches();
+        }
+        changed
+    }
+
+    /// 把一条基事实从会话事实集中撤回（不触碰知识图谱；软逻辑/概率程序同步重建）
+    fn retract_atom(&mut self, atom: &Atom) -> bool {
+        let mut removed = false;
+        if self.session_facts.iter().any(|existing| existing == atom) {
+            self.session_facts.retain(|existing| existing != atom);
+            removed = true;
+        }
+        if self.config.enable_resolution && self.resolver.remove_fact_atom(atom) {
+            removed = true;
+        }
+        // 软逻辑与概率程序同源：撤回后整体重建（概率程序随软逻辑一起重放）
+        if removed && self.config.enable_soft_logic {
+            self.rebuild_soft_logic();
+        }
+        removed
     }
 
     /// 把一条基事实加入会话事实集（不写知识图谱；归结引擎重建后依然保留）
@@ -3379,6 +3550,14 @@ impl SymbolicReasoner {
         for error in &outcome.errors {
             output.push_str(&format!("  未学会：{}\n", error));
         }
+        // 条件/因果知识同时登记为会话 Horn 子句：后向链（判断/证明/为什么/推理链）直接可用
+        let added_clauses = self.register_lesson_clauses(&outcome.lessons);
+        if added_clauses > 0 {
+            output.push_str(&format!(
+                "  其中 {} 条规则已进入会话后向链规则库（含占位符的自动变量化，可用「判断/为什么/推理链」验证）。\n",
+                added_clauses
+            ));
+        }
         self.lessons.push(sentence.to_string());
         output.push_str(&format!(
             "  概率程序现有 {} 条确定事实、{} 条概率事实、{} 条概率规则；用「概率推理：实体」做可能世界精确查询，用「对话记忆」查看教学记忆。",
@@ -3386,6 +3565,259 @@ impl SymbolicReasoner {
             self.problog.probabilistic_fact_count(),
             self.problog.rule_count()
         ));
+        output
+    }
+
+    /// 把教过的条件/因果知识登记为会话 Horn 子句（含占位符的自动变量化），
+    /// 重建归结算子库；返回新增子句条数
+    fn register_lesson_clauses(&mut self, lessons: &[chinese_reasoning_nlu::ChineseLesson]) -> usize {
+        if !self.config.enable_resolution {
+            return 0;
+        }
+        let mut added = 0;
+        let mut new_predicates: Vec<String> = Vec::new();
+        for lesson in lessons {
+            let Some(clause) = chinese_reasoning_nlu::lesson_to_clause(lesson) else {
+                continue;
+            };
+            let duplicate = self
+                .session_clauses
+                .iter()
+                .any(|existing| existing.head == clause.head && existing.body == clause.body);
+            if duplicate {
+                continue;
+            }
+            for atom in std::iter::once(&clause.head).chain(clause.body.iter()) {
+                if !self.aligner.is_registered(&atom.predicate)
+                    && !new_predicates.contains(&atom.predicate.to_string())
+                {
+                    new_predicates.push(atom.predicate.to_string());
+                }
+            }
+            self.session_clauses.push(clause);
+            added += 1;
+        }
+        if added > 0 {
+            // 新谓词登记为关系：命题解析/意图规划才能识别规则里的谓词（如"老师"）
+            for predicate in &new_predicates {
+                self.aligner.register_term(predicate, TermKind::Relation);
+            }
+            if !new_predicates.is_empty() {
+                self.rebuild_knowledge_caches();
+            }
+            self.rebuild_resolver();
+        }
+        added
+    }
+
+    fn render_clause_zh(&self, clause: &Clause) -> String {
+        let head = chinese_reasoning_nlu::render_atom_zh(&clause.head);
+        let body = clause
+            .body
+            .iter()
+            .map(chinese_reasoning_nlu::render_atom_zh)
+            .collect::<Vec<_>>()
+            .join(" 且 ");
+        format!("只要「{}」，就「{}」", body, head)
+    }
+
+    /// 中文通用规则学习：把「规则：如果X的师傅是Y，那么X的老师是Y」直接解析成
+    /// Horn 子句（X/Y/Z、甲乙丙、A/B/C 等占位符自动成为逻辑变量），进入会话后向链规则库
+    pub fn learn_rule_report(&mut self, sentence_raw: &str) -> String {
+        if !self.config.enable_resolution {
+            return "归结推理未启用（config.toml [reasoning] enable_resolution = false）。".to_string();
+        }
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请给出中文规则，例如：规则：如果X的师傅是Y，那么X的老师是Y".to_string();
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let rules: Vec<(&chinese_reasoning_nlu::ChineseLesson, Clause)> = outcome
+            .lessons
+            .iter()
+            .filter_map(|lesson| {
+                chinese_reasoning_nlu::lesson_to_clause(lesson).map(|clause| (lesson, clause))
+            })
+            .collect();
+        if rules.is_empty() {
+            let mut output = String::from("没能把这句话解析成规则。支持句式：\n");
+            output.push_str("  • 如果S的P是O，那么S的Q是O（S/O 用 X/Y/Z、甲乙丙、A/B/C 等占位符表示变量）\n");
+            output.push_str("  • 因为S的P是O，所以S的Q是O\n");
+            for error in &outcome.errors {
+                output.push_str(&format!("  失败原因：{}\n", error));
+            }
+            return output.trim_end().to_string();
+        }
+        let mut output = String::from("已学习中文规则（纯符号解析 → Horn 子句，直接进入后向链）：\n");
+        for (index, (lesson, clause)) in rules.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. 原始：{}\n     逻辑形式：{} :- {}\n     规则性质：{}；置信度 {:.2}\n",
+                index + 1,
+                lesson.original,
+                clause.head.display(),
+                clause
+                    .body
+                    .iter()
+                    .map(|atom| atom.display())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if chinese_reasoning_nlu::lesson_has_variables(lesson) {
+                    "通用规则（含逻辑变量，可套用到任意实体）"
+                } else {
+                    "具体规则（仅对提到的实体生效）"
+                },
+                clause.confidence
+            ));
+        }
+        for error in &outcome.errors {
+            output.push_str(&format!("  未学习：{}\n", error));
+        }
+        let added = self.register_lesson_clauses(&outcome.lessons);
+        if added == 0 {
+            output.push_str("  （以上规则已存在，未重复添加）\n");
+        } else {
+            output.push_str(&format!("  新增 {} 条会话规则。", added));
+        }
+        output.push_str(&format!(
+            "会话规则库现有 {} 条子句、{} 条事实；可用「判断/为什么/推理链/推理发现」验证后向链。",
+            self.resolver.clause_count(),
+            self.resolver.fact_count()
+        ));
+        output
+    }
+
+    /// 记住一条中文事实：解析为确定事实并加入会话归结事实集（不写知识图谱）
+    pub fn assert_nl_fact(&mut self, sentence_raw: &str) -> String {
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请给出要记住的事实，例如：记住：张三是李四的师傅".to_string();
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let mut remembered: Vec<String> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for lesson in &outcome.lessons {
+            if lesson.kind != LessonKind::DeterministicFact {
+                refused.push(format!(
+                    "「{}」不是确定事实（条件句请用「规则：」学习，概率句请用「教学：」）",
+                    lesson.original
+                ));
+                continue;
+            }
+            if !lesson.head.is_ground() {
+                refused.push(format!(
+                    "「{}」含占位符，无法作为具体事实；请改用「规则：」",
+                    lesson.original
+                ));
+                continue;
+            }
+            self.register_atom_vocabulary(&lesson.head);
+            let rendered = self.render_atom_nl(&lesson.head);
+            if self.adopt_atom(lesson.head.clone()) {
+                remembered.push(rendered);
+            } else {
+                refused.push(format!("「{}」此前已记住", rendered));
+            }
+        }
+        let mut output = String::new();
+        if remembered.is_empty() {
+            output.push_str("没有新的会话事实被记住。\n");
+        } else {
+            output.push_str(&format!(
+                "已记住 {} 条会话事实（不写知识图谱，随对话记忆持久化）：\n",
+                remembered.len()
+            ));
+            for (index, fact) in remembered.iter().enumerate() {
+                output.push_str(&format!("  {}. {}\n", index + 1, fact));
+            }
+        }
+        for reason in &refused {
+            output.push_str(&format!("  跳过：{}\n", reason));
+        }
+        for error in &outcome.errors {
+            output.push_str(&format!("  未解析：{}\n", error));
+        }
+        output.push_str(&format!(
+            "会话事实共 {} 条；后续「判断/为什么/推理链」会使用它们。",
+            self.session_facts.len()
+        ));
+        output
+    }
+
+    /// 忘记一条会话事实：从会话归结事实集撤回（不触碰知识图谱）
+    pub fn retract_nl_fact(&mut self, sentence_raw: &str) -> String {
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请给出要忘记的事实，例如：忘记：张三是李四的师傅".to_string();
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let mut removed: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        for lesson in &outcome.lessons {
+            if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
+                continue;
+            }
+            let rendered = self.render_atom_nl(&lesson.head);
+            if self.retract_atom(&lesson.head) {
+                removed.push(rendered);
+            } else {
+                missing.push(rendered);
+            }
+        }
+        let mut output = String::new();
+        if removed.is_empty() && missing.is_empty() {
+            output.push_str("没能把这句话解析为可撤回的事实（会话事实不会来自知识图谱，只撤回会话级记忆）。\n");
+        }
+        for fact in &removed {
+            output.push_str(&format!("已忘记会话事实：{}\n", fact));
+        }
+        for fact in &missing {
+            output.push_str(&format!("会话事实中没有「{}」（知识图谱事实不在此处撤回）。\n", fact));
+        }
+        for error in &outcome.errors {
+            output.push_str(&format!("未解析：{}\n", error));
+        }
+        output.push_str(&format!("会话事实剩余 {} 条。", self.session_facts.len()));
+        output
+    }
+
+    /// 会话规则库报告：教过的 Horn 规则 + 记住的会话事实
+    pub fn session_rules_report(&self) -> String {
+        let mut output = format!(
+            "会话后向链规则库（纯符号 Horn 子句，{} 条；事实 {} 条，其中教过的规则 {} 条）：\n",
+            self.resolver.clause_count(),
+            self.resolver.fact_count(),
+            self.session_clauses.len()
+        );
+        if self.session_clauses.is_empty() {
+            output.push_str("  （还没有学习过中文规则；可输入「规则：如果X的师傅是Y，那么X的老师是Y」）\n");
+        }
+        for (index, clause) in self.session_clauses.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}  〔{} :- {}；来源：{}；置信度 {:.2}〕\n",
+                index + 1,
+                self.render_clause_zh(clause),
+                clause.head.display(),
+                clause
+                    .body
+                    .iter()
+                    .map(|atom| atom.display())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                clause.source,
+                clause.confidence
+            ));
+        }
+        if self.session_facts.is_empty() {
+            output.push_str("  会话事实：（无；可输入「记住：张三是李四的师傅」）");
+        } else {
+            output.push_str("  会话事实（未写知识图谱）：");
+            for (index, atom) in self.session_facts.iter().enumerate() {
+                if index > 0 {
+                    output.push('；');
+                }
+                output.push_str(&self.render_atom_nl(atom));
+            }
+        }
         output
     }
 
@@ -3671,12 +4103,13 @@ impl SymbolicReasoner {
             format!("{} 条", self.lessons.len())
         };
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，澄清 {}，中文概率知识 {}。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}。",
             focus,
             predicate,
             generation,
             self.context.history().len(),
             session_info,
+            self.session_clauses.len(),
             clarify,
             lesson_info
         )
@@ -3703,6 +4136,7 @@ impl SymbolicReasoner {
             })
             .collect();
         snapshot.lessons = self.lessons.clone();
+        snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
@@ -3754,6 +4188,42 @@ impl SymbolicReasoner {
             self.lessons = snapshot.lessons.clone();
             if self.config.enable_problog && self.config.enable_soft_logic {
                 self.rebuild_problog();
+            }
+        }
+        // 会话 Horn 规则：跨会话还原后向链规则库（谓词词表随之恢复）
+        if !snapshot.session_clauses.is_empty() {
+            let mut restored: Vec<Clause> = Vec::new();
+            let mut new_predicates: Vec<String> = Vec::new();
+            for entry in &snapshot.session_clauses {
+                let Some(clause) = restore_clause(entry) else {
+                    continue;
+                };
+                if restored
+                    .iter()
+                    .any(|existing: &Clause| existing.head == clause.head && existing.body == clause.body)
+                {
+                    continue;
+                }
+                for atom in std::iter::once(&clause.head).chain(clause.body.iter()) {
+                    if !self.aligner.is_registered(&atom.predicate)
+                        && !new_predicates.contains(&atom.predicate.to_string())
+                    {
+                        new_predicates.push(atom.predicate.to_string());
+                    }
+                }
+                restored.push(clause);
+            }
+            if !restored.is_empty() {
+                for predicate in &new_predicates {
+                    self.aligner.register_term(predicate, TermKind::Relation);
+                }
+                self.session_clauses = restored;
+                if !new_predicates.is_empty() {
+                    self.rebuild_knowledge_caches();
+                }
+                if self.config.enable_resolution {
+                    self.rebuild_resolver();
+                }
             }
         }
         true
@@ -4968,6 +5438,97 @@ mod tests {
         assert!(report.contains("会飞"), "教学事实应可查询：{}", report);
         assert!(report.contains("P=0.800"), "应给出精确概率：{}", report);
         assert!(report.contains("概率事实"), "应说明来源：{}", report);
+    }
+
+    #[test]
+    fn test_learn_general_rule_enables_backward_chain() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.learn_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        assert!(taught.contains("通用规则"), "应识别为含变量的通用规则：{}", taught);
+        assert!(taught.contains("老师"), "应展示逻辑形式：{}", taught);
+        // 判断走语义蕴含；图谱里没有"老师"事实时由后向链接管
+        let judged = reasoner.entailment_report("李四的老师是王五");
+        assert!(judged.contains("后向链补充判定"), "实际：{}", judged);
+        assert!(judged.contains("王五"), "证明树应落到王五：{}", judged);
+        // 一般规则可套用到任意实体：张三的师傅是李四
+        let queried = reasoner.resolution_query_report("张三的老师是谁");
+        assert!(queried.contains("答案是「李四」"), "实际：{}", queried);
+        let proof = reasoner.resolution_proof_report("李四的老师是王五");
+        assert!(proof.contains("得证"), "实际：{}", proof);
+        assert!(proof.contains("中文教学"), "证明树应标出规则来源：{}", proof);
+    }
+
+    #[test]
+    fn test_learn_ground_rule_joins_backward_chain() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.learn_rule_report("如果张三的师傅是李四，那么张三的师祖是赵六");
+        assert!(taught.contains("具体规则"), "应识别为具体规则：{}", taught);
+        let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
+        assert!(proof.contains("得证"), "教过的具体规则应参与后向链：{}", proof);
+    }
+
+    #[test]
+    fn test_learn_rule_report_rejects_non_rules_gracefully() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.learn_rule_report("张三是李四的师傅");
+        assert!(report.contains("没能把这句话解析成规则"), "实际：{}", report);
+        let empty = reasoner.learn_rule_report("   ");
+        assert!(empty.contains("请给出中文规则"), "实际：{}", empty);
+    }
+
+    #[test]
+    fn test_assert_and_retract_session_fact() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let message = reasoner.assert_nl_fact("钱七是孙八的师傅");
+        assert!(message.contains("已记住"), "实际：{}", message);
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("得证"), "记住的事实应参与后向链：{}", proof);
+        let rules = reasoner.session_rules_report();
+        assert!(rules.contains("会话事实"), "实际：{}", rules);
+        assert!(rules.contains("钱七"), "会话事实清单应包含新事实：{}", rules);
+
+        let forgotten = reasoner.retract_nl_fact("钱七是孙八的师傅");
+        assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("未得证"), "撤回后不应再得证：{}", proof);
+    }
+
+    #[test]
+    fn test_assert_nl_fact_rejects_conditional_sentence() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let message = reasoner.assert_nl_fact("如果张三的师傅是李四，那么张三的师祖是赵六");
+        assert!(message.contains("不是确定事实"), "实际：{}", message);
+        assert!(reasoner.session_facts().is_empty());
+    }
+
+    #[test]
+    fn test_session_clauses_persist_across_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.learn_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_clauses_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
+        let proof = restored.resolution_proof_report("李四的老师是王五");
+        assert!(proof.contains("得证"), "恢复后的会话规则应参与后向链：{}", proof);
+        assert!(
+            restored.dialogue_summary().contains("会话规则 1 条"),
+            "对话记忆应显示会话规则：{}",
+            restored.dialogue_summary()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

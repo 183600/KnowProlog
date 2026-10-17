@@ -12,7 +12,7 @@
 // 全过程只有字符串切分、连词表、中文数字解析与合一——没有神经网络、没有训练。
 
 use crate::problog::ProblogEngine;
-use crate::resolution_engine::{Atom, Term};
+use crate::resolution_engine::{Atom, Clause, Term};
 
 /// 一条从中文句子解析出的概率知识
 #[derive(Debug, Clone, PartialEq)]
@@ -346,6 +346,73 @@ pub fn parse_proposition(text: &str) -> Option<Atom> {
         }
     }
     None
+}
+
+/// 通用规则的占位符识别：X/Y/Z、A/B/C、甲乙丙…、某人/某个
+/// 例：「如果X的师傅是Y，那么X的老师是Y」中的 X/Y 应被变量化
+pub fn is_placeholder(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("某人") || trimmed.starts_with("某个") {
+        return true;
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.next().is_some() {
+        return false;
+    }
+    first.is_ascii_alphabetic()
+        || matches!(
+            first,
+            '甲' | '乙' | '丙' | '丁' | '戊' | '己' | '庚' | '辛' | '壬' | '癸'
+        )
+}
+
+/// 把命题中的占位符常量泛化为逻辑变量（同名占位符共享同一变量）
+pub fn generalize_atom(atom: &Atom) -> Atom {
+    let terms: Vec<Term> = atom
+        .terms
+        .iter()
+        .map(|term| match term {
+            Term::Const(name) if is_placeholder(name) => Term::var(name),
+            other => other.clone(),
+        })
+        .collect();
+    Atom::new(&atom.predicate, terms)
+}
+
+/// 规则中是否存在被泛化的变量
+pub fn lesson_has_variables(lesson: &ChineseLesson) -> bool {
+    lesson
+        .head
+        .terms
+        .iter()
+        .chain(lesson.body.iter().flat_map(|atom| atom.terms.iter()))
+        .any(|term| match term {
+            Term::Const(name) => is_placeholder(name),
+            Term::Var(_) => true,
+        })
+}
+
+/// 条件/因果知识 → Horn 子句（含占位符时自动变量化，供后向链归结使用）
+pub fn lesson_to_clause(lesson: &ChineseLesson) -> Option<Clause> {
+    match lesson.kind {
+        LessonKind::ConditionalRule | LessonKind::CausalRule => Some(Clause::new(
+            generalize_atom(&lesson.head),
+            lesson
+                .body
+                .iter()
+                .map(generalize_atom)
+                .collect(),
+            lesson.probability,
+            &lesson.source,
+        )),
+        _ => None,
+    }
 }
 
 /// 中文命题的生成式回读：Atom → 自然语言
@@ -737,6 +804,48 @@ mod tests {
         let query = program.query(&Atom::unary("能上天", Term::constant("鸟")), 3, 0.0);
         assert_eq!(query.answers.len(), 1);
         assert!((query.answers[0].probability - 0.8 * 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_generalize_atom_turns_placeholders_into_variables() {
+        let lesson = parse_lesson("如果X的师傅是Y，那么X的老师是Y").unwrap();
+        assert_eq!(lesson.kind, LessonKind::ConditionalRule);
+        assert_eq!(lesson.head.display(), "老师(X, Y)");
+        assert_eq!(lesson.body[0].display(), "师傅(X, Y)");
+        assert!(lesson_has_variables(&lesson));
+        let clause = lesson_to_clause(&lesson).expect("条件句应可转成 Horn 子句");
+        assert_eq!(clause.head.display(), "老师(?X, ?Y)");
+        assert_eq!(clause.body[0].display(), "师傅(?X, ?Y)");
+        assert!((clause.confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_generalize_atom_supports_chinese_and_letter_placeholders() {
+        for (sentence, expected) in [
+            ("如果甲是乙的师傅，那么甲是乙的老师", "老师(?乙, ?甲)"),
+            ("如果A的师傅是B，那么A的老师是B", "老师(?A, ?B)"),
+        ] {
+            let lesson = parse_lesson(sentence).unwrap();
+            let clause = lesson_to_clause(&lesson).expect("应可变量化");
+            assert_eq!(clause.head.display(), expected, "句子：{}", sentence);
+        }
+    }
+
+    #[test]
+    fn test_ground_rule_stays_ground_clause() {
+        let lesson = parse_lesson("如果张三的师傅是李四，那么张三的师祖是王五").unwrap();
+        assert!(!lesson_has_variables(&lesson));
+        let clause = lesson_to_clause(&lesson).expect("条件句应可转成子句");
+        assert!(clause.head.is_ground());
+        assert_eq!(clause.head.display(), "师祖(张三, 王五)");
+    }
+
+    #[test]
+    fn test_non_rule_lessons_have_no_clause() {
+        let fact = parse_lesson("张三是老师").unwrap();
+        assert!(lesson_to_clause(&fact).is_none());
+        let probabilistic = parse_lesson("八成的鸟会飞").unwrap();
+        assert!(lesson_to_clause(&probabilistic).is_none());
     }
 
     #[test]
