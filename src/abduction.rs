@@ -234,11 +234,9 @@ impl ClarificationSession {
                 queue.push(hypothesis.clone());
             }
         }
-        queue.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        queue.sort_by_cached_key(|hypothesis| ConfidenceDisplayKey {
+            confidence: hypothesis.confidence,
+            display: hypothesis.atom.display(),
         });
         let mut session = Self {
             queue,
@@ -621,11 +619,9 @@ impl AbductionEngine {
         for atom in &frontier {
             hypotheses.extend(self.hypotheses_for(engine, atom));
         }
-        hypotheses.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        hypotheses.sort_by_cached_key(|hypothesis| ConfidenceDisplayKey {
+            confidence: hypothesis.confidence,
+            display: hypothesis.atom.display(),
         });
         dedupe_hypotheses(&mut hypotheses);
         if hypotheses.len() > self.max_hypotheses {
@@ -719,10 +715,10 @@ impl AbductionEngine {
     fn candidate_values(&self, engine: &ResolutionEngine, atom: &Atom, var_index: usize) -> Vec<String> {
         let mut candidates: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let predicate = atom.predicate.to_string();
+        let predicate: &str = &atom.predicate;
 
         // 1) 同谓词已知取值（按频次降序）
-        if let Some(counts) = self.pred_objects.get(predicate.as_str()) {
+        if let Some(counts) = self.pred_objects.get(predicate) {
             let mut values: Vec<(&String, &u64)> = counts.iter().collect();
             let cmp = |a: &(&String, &u64), b: &(&String, &u64)| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0));
             // 只需前 6 名：部分选择代替全量排序
@@ -745,16 +741,13 @@ impl AbductionEngine {
             .enumerate()
             .find_map(|(index, term)| {
                 if index != var_index {
-                    match term {
-                        Term::Const(name) => Some(name.to_string()),
-                        Term::Var(_) => None,
-                    }
+                    constant_name(term)
                 } else {
                     None
                 }
             });
 
-        if let Some(base) = counterpart.as_deref() {
+        if let Some(base) = counterpart {
             // 2) 同类型实体（共享主体类型时最自然）
             if let Some(base_type) = self.entity_types.get(base) {
                 let mut same_type: Vec<&String> = self
@@ -827,13 +820,12 @@ impl AbductionEngine {
         let mut contradicts_known = false;
         let mut score = 0.25f64;
 
-        let predicate = atom.predicate.to_string();
+        let predicate: &str = &atom.predicate;
         let subject = atom.terms.first().and_then(constant_name);
         let object = atom.terms.get(1).and_then(constant_name);
 
         // 1) 同谓词取值先验
-        if let (Some(counts), Some(object)) = (self.pred_objects.get(predicate.as_str()), object.as_deref())
-        {
+        if let (Some(counts), Some(object)) = (self.pred_objects.get(predicate), object) {
             let total: u64 = counts.values().sum();
             if let Some(&count) = counts.get(object) {
                 let share = count as f64 / total.max(1) as f64;
@@ -855,9 +847,9 @@ impl AbductionEngine {
         }
 
         // 2) 主语类型 × 谓词相容度
-        if let Some(subject) = subject.as_deref() {
+        if let Some(subject) = subject {
             if let Some(subject_type) = self.entity_types.get(subject) {
-                if let Some(type_counts) = self.pred_subject_types.get(predicate.as_str()) {
+                if let Some(type_counts) = self.pred_subject_types.get(predicate) {
                     let total: u64 = type_counts.values().sum();
                     let count = type_counts.get(subject_type).copied().unwrap_or(0);
                     if count > 0 {
@@ -882,9 +874,9 @@ impl AbductionEngine {
         }
 
         // 3) 宾语类型 × 谓词相容度
-        if let Some(object) = object.as_deref() {
+        if let Some(object) = object {
             if let Some(object_type) = self.entity_types.get(object) {
-                if let Some(type_counts) = self.pred_object_types.get(predicate.as_str()) {
+                if let Some(type_counts) = self.pred_object_types.get(predicate) {
                     let total: u64 = type_counts.values().sum();
                     let count = type_counts.get(object_type).copied().unwrap_or(0);
                     if count > 0 {
@@ -910,7 +902,7 @@ impl AbductionEngine {
         }
 
         // 4) 特征重叠（Jaccard）
-        if let (Some(subject), Some(object)) = (subject.as_deref(), object.as_deref()) {
+        if let (Some(subject), Some(object)) = (subject, object) {
             if let (Some(subject_features), Some(object_features)) =
                 (self.entity_features.get(subject), self.entity_features.get(object))
             {
@@ -943,10 +935,10 @@ impl AbductionEngine {
         }
 
         // 6) 功能谓词冲突：同主语已有不同取值 ⇒ 封闭世界假设下重罚
-        if let (Some(subject), Some(object)) = (subject.as_deref(), object.as_deref()) {
-            if let Some(by_subject) = self.pred_subject_objects.get(predicate.as_str()) {
+        if let (Some(subject), Some(object)) = (subject, object) {
+            if let Some(by_subject) = self.pred_subject_objects.get(predicate) {
                 if let Some(existing) = by_subject.get(subject) {
-                    if !existing.contains(object) && self.is_functional(predicate.as_str()) {
+                    if !existing.contains(object) && self.is_functional(predicate) {
                         conflicts.push(format!(
                             "「{}」是功能谓词，「{}」已有取值：{}（封闭世界假设）",
                             predicate,
@@ -1159,11 +1151,9 @@ impl AbductionEngine {
                 }
             }
         }
-        pool.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        pool.sort_by_cached_key(|hypothesis| ConfidenceDisplayKey {
+            confidence: hypothesis.confidence,
+            display: hypothesis.atom.display(),
         });
         // 组合枚举上限：池 10 × 规模 2 ⇒ 45 组，足够覆盖典型解释空间
         pool.truncate(10);
@@ -1233,15 +1223,10 @@ impl AbductionEngine {
             }
         }
         // 规模最小优先（最小基数解释），同规模按联合可信度降序
-        scenarios.sort_by(|a, b| {
-            a.size()
-                .cmp(&b.size())
-                .then_with(|| {
-                    b.joint_confidence
-                        .partial_cmp(&a.joint_confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.hypotheses[0].atom.display().cmp(&b.hypotheses[0].atom.display()))
+        scenarios.sort_by_cached_key(|scenario| ScenarioOrderKey {
+            size: scenario.size(),
+            joint_confidence: scenario.joint_confidence,
+            first_display: scenario.hypotheses[0].atom.display(),
         });
         scenarios.truncate(5);
         scenarios
@@ -1270,10 +1255,65 @@ fn collect_combinations(
     true
 }
 
-fn constant_name(term: &Term) -> Option<String> {
+fn constant_name(term: &Term) -> Option<&str> {
     match term {
-        Term::Const(name) => Some(name.to_string()),
+        Term::Const(name) => Some(name),
         Term::Var(_) => None,
+    }
+}
+
+/// 置信度降序、同置信度按显示串升序的排序键：预先算好避免比较器重复渲染
+#[derive(PartialEq)]
+struct ConfidenceDisplayKey {
+    confidence: f64,
+    display: String,
+}
+
+impl Eq for ConfidenceDisplayKey {}
+
+impl PartialOrd for ConfidenceDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ConfidenceDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .confidence
+            .partial_cmp(&self.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
+/// 场景排序键：规模升序 → 联合可信度降序 → 首假设显示串升序
+#[derive(PartialEq)]
+struct ScenarioOrderKey {
+    size: usize,
+    joint_confidence: f64,
+    first_display: String,
+}
+
+impl Eq for ScenarioOrderKey {}
+
+impl PartialOrd for ScenarioOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScenarioOrderKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.size
+            .cmp(&other.size)
+            .then_with(|| {
+                other
+                    .joint_confidence
+                    .partial_cmp(&self.joint_confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| self.first_display.cmp(&other.first_display))
     }
 }
 

@@ -364,46 +364,53 @@ impl LinkPredictor {
                 }
 
                 if let Some(body) = self.compose_body_pairs(p1, p2) {
-                    for p3 in &predicates {
-                        if let Some(rule) = self.build_rule(
-                            RuleTemplate::Compose,
-                            vec![p1.clone(), p2.clone()],
-                            p3.clone(),
-                            &body,
-                            min_support,
-                            min_confidence,
-                        ) {
-                            rules.push(rule);
+                    // 支撑量不可能超过体部对数：先剪掉不足阈值的体部，避免整轮头部枚举
+                    if body.len() >= min_support {
+                        for p3 in &predicates {
+                            if let Some(rule) = self.build_rule(
+                                RuleTemplate::Compose,
+                                vec![p1.clone(), p2.clone()],
+                                p3.clone(),
+                                &body,
+                                min_support,
+                                min_confidence,
+                            ) {
+                                rules.push(rule);
+                            }
                         }
                     }
                 }
 
                 if let Some(body) = self.common_body_pairs(p1, p2, false) {
-                    for p3 in &predicates {
-                        if let Some(rule) = self.build_rule(
-                            RuleTemplate::CommonNeighbor,
-                            vec![p1.clone(), p2.clone()],
-                            p3.clone(),
-                            &body,
-                            min_support,
-                            min_confidence,
-                        ) {
-                            rules.push(rule);
+                    if body.len() >= min_support {
+                        for p3 in &predicates {
+                            if let Some(rule) = self.build_rule(
+                                RuleTemplate::CommonNeighbor,
+                                vec![p1.clone(), p2.clone()],
+                                p3.clone(),
+                                &body,
+                                min_support,
+                                min_confidence,
+                            ) {
+                                rules.push(rule);
+                            }
                         }
                     }
                 }
 
                 if let Some(body) = self.common_body_pairs(p1, p2, true) {
-                    for p3 in &predicates {
-                        if let Some(rule) = self.build_rule(
-                            RuleTemplate::CommonObject,
-                            vec![p1.clone(), p2.clone()],
-                            p3.clone(),
-                            &body,
-                            min_support,
-                            min_confidence,
-                        ) {
-                            rules.push(rule);
+                    if body.len() >= min_support {
+                        for p3 in &predicates {
+                            if let Some(rule) = self.build_rule(
+                                RuleTemplate::CommonObject,
+                                vec![p1.clone(), p2.clone()],
+                                p3.clone(),
+                                &body,
+                                min_support,
+                                min_confidence,
+                            ) {
+                                rules.push(rule);
+                            }
                         }
                     }
                 }

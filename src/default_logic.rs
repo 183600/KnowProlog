@@ -130,7 +130,7 @@ impl DefaultExtension {
             .filter(|literal| pattern_matches(pattern, &literal.atom))
             .cloned()
             .collect();
-        matches.sort_by(|a, b| a.display().cmp(&b.display()));
+        matches.sort_by_cached_key(Literal::display);
         matches
     }
 }

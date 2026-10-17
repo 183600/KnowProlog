@@ -1005,11 +1005,16 @@ impl OxigraphManager {
         let mut facts = Vec::new();
         let store = self.store.lock().await;
         
-        // 构建实体名称的匹配模式
-        let combined_pattern = query_entities.iter()
-            .map(|e| format!(".*{}.*", regex::escape(e)))
-            .collect::<Vec<_>>()
-            .join("|");
+        // 构建实体名称的匹配模式（预分配，避免 map/collect/join 的中间 Vec）
+        let mut combined_pattern = String::new();
+        for (index, entity) in query_entities.iter().enumerate() {
+            if index > 0 {
+                combined_pattern.push('|');
+            }
+            combined_pattern.push_str(".*");
+            combined_pattern.push_str(&regex::escape(entity));
+            combined_pattern.push_str(".*");
+        }
         
         // 第一步：找到直接匹配的实体
         let direct_matches = self.find_entities_by_pattern(&store, &combined_pattern).await?;
@@ -1551,10 +1556,16 @@ impl OxigraphManager {
             return Ok(neighbors);
         }
         
-        let entity_filter = entities.iter()
-            .map(|e| format!("\"{}\"", e))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // 与原先 map/format/collect/join 输出完全一致，去掉中间 Vec
+        let mut entity_filter = String::new();
+        for (index, entity) in entities.iter().enumerate() {
+            if index > 0 {
+                entity_filter.push_str(", ");
+            }
+            entity_filter.push('"');
+            entity_filter.push_str(entity);
+            entity_filter.push('"');
+        }
         
         let query = format!(r#"
             PREFIX kg: <http://example.org/kg/>
@@ -1611,10 +1622,15 @@ impl OxigraphManager {
             return Ok(facts);
         }
         
-        let name_filter = entity_names.iter()
-            .map(|e| format!("\"{}\"", e))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut name_filter = String::new();
+        for (index, entity) in entity_names.iter().enumerate() {
+            if index > 0 {
+                name_filter.push_str(", ");
+            }
+            name_filter.push('"');
+            name_filter.push_str(entity);
+            name_filter.push('"');
+        }
         
         let query = format!(r#"
             PREFIX kg: <http://example.org/kg/>
@@ -1646,7 +1662,11 @@ impl OxigraphManager {
                                         .or_insert_with(|| (String::new(), HashMap::new()));
                                     
                                     if let Some(type_term) = solution.get("type") {
-                                        let type_str = type_term.to_string();
+                                        // 命名节点走 IRI 快路径，避免 to_string 的 '<' '>' 包装与再裁剪
+                                        let type_str = match type_term {
+                                            Term::NamedNode(node) => node.as_str().to_string(),
+                                            other => other.to_string(),
+                                        };
                                         // 后续类型覆盖先前类型
                                         entry.0 = if type_str.contains(BASE_NS) {
                                             type_str.replace(BASE_NS, "")
@@ -1660,7 +1680,10 @@ impl OxigraphManager {
                                     }
                                     
                                     if let (Some(prop), Some(value)) = (solution.get("prop"), solution.get("value")) {
-                                        let prop_str = prop.to_string();
+                                        let prop_str = match prop {
+                                            Term::NamedNode(node) => node.as_str().to_string(),
+                                            other => other.to_string(),
+                                        };
                                         let prop_name = if prop_str.contains(BASE_NS) {
                                             prop_str.replace(BASE_NS, "")
                                                 .trim_matches(|c| c == '<' || c == '>')
@@ -1715,10 +1738,15 @@ impl OxigraphManager {
             return Ok(Vec::new());
         }
         
-        let entity_names: Vec<String> = entities.iter()
-            .map(|e| format!("\"{}\"", e))
-            .collect();
-        let entity_filter = entity_names.join(", ");
+        let mut entity_filter = String::new();
+        for (index, entity) in entities.iter().enumerate() {
+            if index > 0 {
+                entity_filter.push_str(", ");
+            }
+            entity_filter.push('"');
+            entity_filter.push_str(entity);
+            entity_filter.push('"');
+        }
         
         let query = format!(r#"
             PREFIX kg: <http://example.org/kg/>
@@ -1765,7 +1793,10 @@ impl OxigraphManager {
                                             to.to_string()
                                         };
                                         
-                                        let rel_str = rel.to_string();
+                                        let rel_str = match rel {
+                                            Term::NamedNode(node) => node.as_str().to_string(),
+                                            other => other.to_string(),
+                                        };
                                         let rel_type = if rel_str.contains(BASE_NS) {
                                             rel_str.replace(BASE_NS, "")
                                                 .trim_matches(|c| c == '<' || c == '>')

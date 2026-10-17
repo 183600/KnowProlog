@@ -160,13 +160,14 @@ impl NLUEngine {
         pattern: &str,
         slot_configs: &[SlotConfig],
     ) -> Option<(f64, Vec<(String, String)>)> {
-        let pattern_words: Vec<&str> = pattern.split_whitespace().collect();
-        let total_count = pattern_words.len();
+        // 不收集中间 Vec：模式词本就可重复遍历，统计与匹配合并为一次扫描
+        let mut total_count = 0usize;
 
         let mut matched_count = 0;
         let mut slots = Vec::new();
 
-        for pattern_word in pattern_words {
+        for pattern_word in pattern.split_whitespace() {
+            total_count += 1;
             if pattern_word.starts_with('{') && pattern_word.ends_with('}') {
                 let slot_name = &pattern_word[1..pattern_word.len() - 1];
                 if let Some(slot_config) = slot_configs.iter().find(|s| s.name == slot_name) {

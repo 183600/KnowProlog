@@ -18,6 +18,7 @@
 // 选择变量，天然处理证明重叠（相关源头），给出的是可能世界精确概率而不是近似和。
 
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -28,6 +29,58 @@ const MAX_GROUNDINGS_PER_RULE: usize = 400;
 const TRUE_NODE: u32 = 1;
 const FALSE_NODE: u32 = 0;
 const TERMINAL_VAR: u32 = u32::MAX;
+
+/// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
+#[derive(PartialEq)]
+struct ProbabilityDisplayKey {
+    probability: f64,
+    display: String,
+}
+
+impl Eq for ProbabilityDisplayKey {}
+
+impl PartialOrd for ProbabilityDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ProbabilityDisplayKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .probability
+            .partial_cmp(&self.probability)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
+/// 实例排序键：概率降序 → 来源升序 → 前件显示串升序
+#[derive(PartialEq)]
+struct InstanceOrderKey {
+    probability: f64,
+    source: String,
+    premises: String,
+}
+
+impl Eq for InstanceOrderKey {}
+
+impl PartialOrd for InstanceOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InstanceOrderKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .probability
+            .partial_cmp(&self.probability)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.source.cmp(&other.source))
+            .then_with(|| self.premises.cmp(&other.premises))
+    }
+}
 
 /// 概率事实：`p::atom`（基原子）
 #[derive(Debug, Clone)]
@@ -567,11 +620,9 @@ impl ProblogEngine {
             );
         }
         let mut answers: Vec<ProblogAnswer> = by_atom.into_values().collect();
-        answers.sort_by(|a, b| {
-            b.probability
-                .partial_cmp(&a.probability)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        answers.sort_by_cached_key(|answer| ProbabilityDisplayKey {
+            probability: answer.probability,
+            display: answer.atom.display(),
         });
         answers.truncate(limit.max(1));
         ProblogQuery {
@@ -615,7 +666,7 @@ impl ProblogEngine {
         for atom in compiled.atom_probability.keys() {
             consider(atom);
         }
-        patterns.sort_by(|a, b| a.display().cmp(&b.display()));
+        patterns.sort_by_cached_key(Atom::display);
         patterns
     }
 
@@ -638,7 +689,7 @@ impl ProblogEngine {
             push_universe(&mut universe, fact);
         }
         let mut probabilistic: Vec<&ProbabilisticFact> = self.probabilistic_facts.iter().collect();
-        probabilistic.sort_by(|a, b| a.atom.display().cmp(&b.atom.display()));
+        probabilistic.sort_by_cached_key(|fact| fact.atom.display());
         let mut prob_fact_probability: HashMap<Atom, f64> = HashMap::new();
         let mut prob_fact_bdd: HashMap<Atom, u32> = HashMap::new();
         for fact in probabilistic {
@@ -655,7 +706,7 @@ impl ProblogEngine {
             prob_fact_bdd.insert(fact.atom.clone(), node);
         }
         for atoms in universe.values_mut() {
-            atoms.sort_by(|a, b| a.display().cmp(&b.display()));
+            atoms.sort_by_cached_key(Atom::display);
             atoms.dedup();
         }
 
@@ -843,14 +894,13 @@ impl ProblogEngine {
                 .push(index);
         }
         for indices in instances_by_head.values_mut() {
-            indices.sort_by(|&left, &right| {
-                let a = &instances[left];
-                let b = &instances[right];
-                b.probability
-                    .partial_cmp(&a.probability)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.source.cmp(&b.source))
-                    .then_with(|| render_premises(&a.premises).cmp(&render_premises(&b.premises)))
+            indices.sort_by_cached_key(|&index| {
+                let instance = &instances[index];
+                InstanceOrderKey {
+                    probability: instance.probability,
+                    source: instance.source.clone(),
+                    premises: render_premises(&instance.premises),
+                }
             });
         }
 
@@ -870,18 +920,24 @@ impl ProblogEngine {
 }
 
 fn push_universe(universe: &mut HashMap<String, Vec<Atom>>, atom: &Atom) {
-    universe
-        .entry(atom.predicate.to_string())
-        .or_default()
-        .push(atom.clone());
+    // 已有同谓词桶时直接复用，避免为每个原子重复分配谓词字符串
+    match universe.get_mut(atom.predicate.as_ref()) {
+        Some(atoms) => atoms.push(atom.clone()),
+        None => {
+            universe.insert(atom.predicate.to_string(), vec![atom.clone()]);
+        }
+    }
 }
 
 fn render_premises(premises: &[Atom]) -> String {
-    premises
-        .iter()
-        .map(|atom| atom.display())
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut out = String::new();
+    for (index, atom) in premises.iter().enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        out.push_str(&atom.display());
+    }
+    out
 }
 
 pub(crate) fn pattern_matches(pattern: &Atom, atom: &Atom) -> bool {

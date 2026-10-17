@@ -58,6 +58,56 @@ impl WeightedRule {
     }
 }
 
+/// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
+#[derive(PartialEq)]
+struct ProbabilityDisplayKey {
+    probability: f64,
+    display: String,
+}
+
+impl Eq for ProbabilityDisplayKey {}
+
+impl PartialOrd for ProbabilityDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ProbabilityDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .probability
+            .partial_cmp(&self.probability)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
+/// 验证优先级降序、同优先级按显示串升序的排序键
+#[derive(PartialEq)]
+struct PriorityDisplayKey {
+    priority: f64,
+    display: String,
+}
+
+impl Eq for PriorityDisplayKey {}
+
+impl PartialOrd for PriorityDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PriorityDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .priority
+            .partial_cmp(&self.priority)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
 /// 某条规则对某个候选事实的证据
 #[derive(Debug, Clone)]
 pub struct RuleEvidence {
@@ -540,11 +590,9 @@ impl MarkovLogicEngine {
             });
             let mut premise_sensitivity: Vec<PremiseSensitivity> =
                 sensitivities.into_values().collect();
-            premise_sensitivity.sort_by(|a, b| {
-                b.verify_priority
-                    .partial_cmp(&a.verify_priority)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.premise.display().cmp(&b.premise.display()))
+            premise_sensitivity.sort_by_cached_key(|item| PriorityDisplayKey {
+                priority: item.verify_priority,
+                display: item.premise.display(),
             });
             results.push(GradientAttribution {
                 atom,
@@ -554,11 +602,9 @@ impl MarkovLogicEngine {
                 premise_sensitivity,
             });
         }
-        results.sort_by(|a, b| {
-            b.probability
-                .partial_cmp(&a.probability)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        results.sort_by_cached_key(|item| ProbabilityDisplayKey {
+            probability: item.probability,
+            display: item.atom.display(),
         });
         results.truncate(limit.max(1));
         results
@@ -645,10 +691,9 @@ impl MarkovLogicEngine {
                 (atom, probability, log_odds, evidence, from_fact)
             })
             .collect();
-        entries.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.display().cmp(&b.0.display()))
+        entries.sort_by_cached_key(|entry| ProbabilityDisplayKey {
+            probability: entry.1,
+            display: entry.0.display(),
         });
         entries.truncate(limit.max(1));
         entries
@@ -706,11 +751,9 @@ impl MarkovLogicEngine {
             }
         }
         let mut results: Vec<SoftFact> = merged.into_values().collect();
-        results.sort_by(|a, b| {
-            b.probability
-                .partial_cmp(&a.probability)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        results.sort_by_cached_key(|item| ProbabilityDisplayKey {
+            probability: item.probability,
+            display: item.atom.display(),
         });
         results.truncate(limit.max(1));
         results

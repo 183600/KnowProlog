@@ -376,14 +376,18 @@ impl SemanticEngine {
         let mut best_confidence = 0.0;
         let mut matched_patterns = Vec::new();
         
-        // 预处理查询
+        // 预处理查询（词与字符长度一次算好，供全部模式复用）
         let query_words: Vec<_> = self.jieba.cut(query, false).into_iter().collect();
         let query_text = query_words.join(" ");
+        let text_words: Vec<(&str, usize)> = query_text
+            .split_whitespace()
+            .map(|word| (word, word.chars().count()))
+            .collect();
         
         // 匹配意图模式
         for (intent_type, patterns) in intent_patterns.iter() {
             for pattern in patterns {
-                let confidence = self.match_pattern_confidence(&query_text, pattern);
+                let confidence = self.match_pattern_confidence(&text_words, pattern);
                 if confidence > best_confidence {
                     best_confidence = confidence;
                     best_intent = intent_type.clone();
@@ -467,7 +471,7 @@ impl SemanticEngine {
         Ok(relations)
     }
 
-    fn match_pattern_confidence(&self, text: &str, pattern: &str) -> f64 {
+    fn match_pattern_confidence(&self, text_words: &[(&str, usize)], pattern: &str) -> f64 {
         // 简化的模式匹配，实际实现中可以使用正则表达式
         let mut matches = 0;
         let mut total = 0;
@@ -477,20 +481,22 @@ impl SemanticEngine {
             if pattern_word.starts_with('(') && pattern_word.ends_with(')') {
                 continue; // 跳过捕获组
             }
+            let len1 = pattern_word.chars().count();
+            if len1 == 0 {
+                continue;
+            }
             
-            for text_word in text.split_whitespace() {
-                if pattern_word == text_word {
+            for (text_word, len2) in text_words {
+                if pattern_word == *text_word {
                     matches += 1;
                     break;
                 }
                 // 相似度 > 0.8 ⟹ 长度差 < 20%；先按长度差剪枝，避免无谓的编辑距离计算
-                let len1 = pattern_word.chars().count();
-                let len2 = text_word.chars().count();
-                if len1 == 0 || len2 == 0 {
+                if *len2 == 0 {
                     continue;
                 }
-                let max_len = len1.max(len2);
-                let min_len = len1.min(len2);
+                let max_len = len1.max(*len2);
+                let min_len = len1.min(*len2);
                 if (max_len - min_len) * 5 >= max_len {
                     continue;
                 }

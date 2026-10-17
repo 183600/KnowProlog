@@ -22,6 +22,56 @@ pub const DEFAULT_MAX_CAUSAL_DEPTH: usize = 4;
 /// 单次查询最多枚举的简单路径数
 const MAX_PATHS_PER_QUERY: usize = 64;
 
+/// 强度降序、同强度按渲染串升序的排序键：预先算好避免比较器里重复渲染
+#[derive(PartialEq)]
+struct StrengthRenderKey {
+    strength: f64,
+    render: String,
+}
+
+impl Eq for StrengthRenderKey {}
+
+impl PartialOrd for StrengthRenderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StrengthRenderKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .strength
+            .partial_cmp(&self.strength)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.render.cmp(&other.render))
+    }
+}
+
+/// 绝对值降序、同值按显示串升序的排序键
+#[derive(PartialEq)]
+struct MagnitudeDisplayKey {
+    magnitude: f64,
+    display: String,
+}
+
+impl Eq for MagnitudeDisplayKey {}
+
+impl PartialOrd for MagnitudeDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MagnitudeDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .magnitude
+            .partial_cmp(&self.magnitude)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
 /// 因果边：一条基化规则贡献的 "前件原子 → 后件原子" 有符号机制
 #[derive(Debug, Clone, PartialEq)]
 pub struct CausalEdge {
@@ -278,11 +328,9 @@ impl CausalGraph {
     }
 
     fn sort_paths(paths: &mut [CausalPath]) {
-        paths.sort_by(|a, b| {
-            b.strength()
-                .partial_cmp(&a.strength())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.render().cmp(&b.render()))
+        paths.sort_by_cached_key(|path| StrengthRenderKey {
+            strength: path.strength(),
+            render: path.render(),
         });
     }
 
@@ -434,12 +482,9 @@ impl CausalAnalyzer {
                 }
             })
             .collect();
-        direct_causes.sort_by(|a, b| {
-            b.weight
-                .abs()
-                .partial_cmp(&a.weight.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.cause.display().cmp(&b.cause.display()))
+        direct_causes.sort_by_cached_key(|link| MagnitudeDisplayKey {
+            magnitude: link.weight.abs(),
+            display: link.cause.display(),
         });
         let roots: HashSet<Atom> = engine.facts().cloned().collect();
         let mut chains = self.graph.root_paths(target, &roots);
@@ -535,12 +580,9 @@ impl CausalAnalyzer {
             delta.delta = delta.counterfactual - delta.factual;
         }
         let mut deltas: Vec<CounterfactualDelta> = merged.into_values().collect();
-        deltas.sort_by(|a, b| {
-            b.delta
-                .abs()
-                .partial_cmp(&a.delta.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        deltas.sort_by_cached_key(|delta| MagnitudeDisplayKey {
+            magnitude: delta.delta.abs(),
+            display: delta.atom.display(),
         });
         deltas.truncate(limit);
         CounterfactualComparison {

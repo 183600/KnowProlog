@@ -387,18 +387,20 @@ impl ResolutionEngine {
         // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明
         let mut best: HashMap<String, Solution> = HashMap::new();
         for (subst, proofs) in states {
-            let bindings: HashMap<String, String> = query_vars
-                .iter()
-                .map(|var| {
-                    let value = resolve_term(&Term::var(var), &subst);
-                    (var.clone(), render_term(&value))
-                })
-                .collect();
-            let key = query_vars
-                .iter()
-                .map(|var| format!("{}={}", var, bindings.get(var).cloned().unwrap_or_default()))
-                .collect::<Vec<_>>()
-                .join("|");
+            // 渲染一次变量值：同时用于绑定表与去重键，避免二次查表与中间 Vec
+            let mut bindings: HashMap<String, String> = HashMap::with_capacity(query_vars.len());
+            let mut key = String::new();
+            for var in query_vars {
+                let value = resolve_term(&Term::var(var), &subst);
+                let rendered = render_term(&value);
+                if !key.is_empty() {
+                    key.push('|');
+                }
+                key.push_str(var);
+                key.push('=');
+                key.push_str(&rendered);
+                bindings.insert(var.clone(), rendered);
+            }
             let confidence: f64 = proofs.iter().map(|node| node.confidence).product();
             let candidate = Solution {
                 bindings,

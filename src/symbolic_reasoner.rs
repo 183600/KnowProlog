@@ -115,6 +115,86 @@ pub struct DialogueSnapshot {
     pub lessons: Vec<String>,
 }
 
+/// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
+#[derive(PartialEq)]
+struct ProbabilityDisplayKey {
+    probability: f64,
+    display: String,
+}
+
+impl Eq for ProbabilityDisplayKey {}
+
+impl PartialOrd for ProbabilityDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ProbabilityDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .probability
+            .partial_cmp(&self.probability)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
+/// 事实标志升序 → 概率降序 → 显示串升序的排序键
+#[derive(PartialEq)]
+struct FromFactProbabilityKey {
+    from_fact: bool,
+    probability: f64,
+    display: String,
+}
+
+impl Eq for FromFactProbabilityKey {}
+
+impl PartialOrd for FromFactProbabilityKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FromFactProbabilityKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.from_fact
+            .cmp(&other.from_fact)
+            .then_with(|| {
+                other
+                    .probability
+                    .partial_cmp(&self.probability)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
+/// 数值绝对值降序、同值按显示串升序的排序键
+#[derive(PartialEq)]
+struct MagnitudeDisplayKey {
+    magnitude: f64,
+    display: String,
+}
+
+impl Eq for MagnitudeDisplayKey {}
+
+impl PartialOrd for MagnitudeDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MagnitudeDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .magnitude
+            .partial_cmp(&self.magnitude)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+
 pub struct DialogueContext {
     focus_entities: Vec<String>,
     last_predicate: Option<String>,
@@ -317,6 +397,8 @@ pub struct SymbolicReasoner {
     // 单条链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
     // 观察事实或重建缓存（线索变化）时整体失效
     link_memo: parking_lot::Mutex<Option<(String, Vec<LinkedMention>)>>,
+    // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
+    entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
 }
 
 impl SymbolicReasoner {
@@ -380,6 +462,7 @@ impl SymbolicReasoner {
             known_predicates_cache: Vec::new(),
             proposition_surfaces: Vec::new(),
             link_memo: parking_lot::Mutex::new(None),
+            entity_mentions_memo: parking_lot::Mutex::new(None),
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
@@ -431,6 +514,7 @@ impl SymbolicReasoner {
         if !facts.is_empty() {
             // 链接剖面（度数/邻居等）会随观察变化的可能，记忆必须整体失效
             *self.link_memo.lock() = None;
+            *self.entity_mentions_memo.lock() = None;
         }
         // 溯因统计只累积计数（谓词取值、类型分布、特征），不参与学习
         self.abduction.observe_facts(facts);
@@ -730,6 +814,19 @@ impl SymbolicReasoner {
     }
 
     pub fn entities_mentioned(&self, text: &str) -> Vec<String> {
+        // 同一文本在一轮对话中会被多次询问（上下文记录/链接/回答），做单条记忆复用；
+        // 实体剖面或同义词表只在 observe_facts 中变化，届时整体失效
+        if let Some((cached_text, found)) = self.entity_mentions_memo.lock().as_ref() {
+            if cached_text == text {
+                return found.clone();
+            }
+        }
+        let found = self.entities_mentioned_uncached(text);
+        *self.entity_mentions_memo.lock() = Some((text.to_string(), found.clone()));
+        found
+    }
+
+    fn entities_mentioned_uncached(&self, text: &str) -> Vec<String> {
         let normalized_text = self.aligner.normalize(text);
         let mut found: Vec<(usize, String)> = Vec::new();
         for (i, profile) in self.aligner.profiles().iter().enumerate() {
@@ -2829,11 +2926,9 @@ impl SymbolicReasoner {
                 .or_insert(fact);
         }
         let mut results: Vec<SoftFact> = merged.into_values().collect();
-        results.sort_by(|a, b| {
-            b.probability
-                .partial_cmp(&a.probability)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        results.sort_by_cached_key(|item| ProbabilityDisplayKey {
+            probability: item.probability,
+            display: item.atom.display(),
         });
         results.truncate(limit.max(1));
         results
@@ -2896,15 +2991,10 @@ impl SymbolicReasoner {
                 .or_insert(fact);
         }
         let mut results: Vec<SoftFact> = merged.into_values().collect();
-        results.sort_by(|a, b| {
-            a.from_fact
-                .cmp(&b.from_fact)
-                .then_with(|| {
-                    b.probability
-                        .partial_cmp(&a.probability)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        results.sort_by_cached_key(|item| FromFactProbabilityKey {
+            from_fact: item.from_fact,
+            probability: item.probability,
+            display: item.atom.display(),
         });
         results.truncate(limit.max(1));
         results
@@ -3090,12 +3180,9 @@ impl SymbolicReasoner {
                 }
             }
         }
-        deltas.sort_by(|a, b| {
-            b.delta
-                .abs()
-                .partial_cmp(&a.delta.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        deltas.sort_by_cached_key(|item| MagnitudeDisplayKey {
+            magnitude: item.delta.abs(),
+            display: item.atom.display(),
         });
         deltas.truncate(8);
         let mut output = format!(
@@ -3382,11 +3469,9 @@ impl SymbolicReasoner {
             }
         }
         let mut answers: Vec<ProblogAnswer> = merged.into_values().collect();
-        answers.sort_by(|a, b| {
-            b.probability
-                .partial_cmp(&a.probability)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        answers.sort_by_cached_key(|answer| ProbabilityDisplayKey {
+            probability: answer.probability,
+            display: answer.atom.display(),
         });
         answers.truncate(8);
         if answers.is_empty() {
