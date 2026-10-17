@@ -44,6 +44,8 @@ pub mod ontology_reasoning;
 pub mod default_logic;
 pub mod neuro_symbolic_contrast;
 pub mod discourse;
+pub mod dense_retrieval;
+pub mod formal_semantics;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
