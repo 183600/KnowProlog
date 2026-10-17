@@ -8,10 +8,12 @@ use crate::abduction::{
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::causal_reasoning::{CausalAnalyzer, CounterfactualDelta};
+use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
+use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
@@ -29,6 +31,16 @@ use crate::ReasoningConfig;
 // 归结引擎内部谓词：has(E, 谓词名) / type(E, 类型名)，用于承载关联规则的物品
 const PROOF_HAS: &str = "__具有__";
 const PROOF_TYPE: &str = "__类型__";
+
+// 中文教学知识类型的展示名
+fn lesson_kind_label(kind: LessonKind) -> &'static str {
+    match kind {
+        LessonKind::DeterministicFact => "确定事实",
+        LessonKind::ProbabilisticFact => "概率事实",
+        LessonKind::ConditionalRule => "条件规则（如果…那么…）",
+        LessonKind::CausalRule => "因果规则（因为…所以…）",
+    }
+}
 
 // 把链接预测挖掘出的 Horn 规则（组合/逆向/共同邻居/共同主体）转成归结子句
 fn clause_from_path_rule(rule: &HornRule) -> Clause {
@@ -98,6 +110,9 @@ pub struct DialogueSnapshot {
     // 跨会话临时信念：被采纳的假设事实（会话级，不写知识图谱）
     #[serde(default)]
     pub session_facts: Vec<SnapshotAtom>,
+    // 用户用中文教过的概率知识原句（会话级，跨会话持久化后自动重放）
+    #[serde(default)]
+    pub lessons: Vec<String>,
 }
 
 pub struct DialogueContext {
@@ -195,6 +210,7 @@ impl DialogueContext {
             history: self.history.clone(),
             generation: self.generation.clone(),
             session_facts: Vec::new(),
+            lessons: Vec::new(),
         }
     }
 
@@ -272,6 +288,10 @@ pub struct SymbolicReasoner {
     walks: GraphWalkEmbedding,
     // 轻量马尔可夫逻辑网络：加权规则软真值传播 + 加权 MAP 局部搜索
     soft: MarkovLogicEngine,
+    // ProbLog 风格概率逻辑程序：概率事实/规则/注释析取 + 可能世界精确推理（BDD 编译）
+    problog: ProblogEngine,
+    // 用户用中文教过的概率知识原句（会话级记忆，随对话状态持久化）
+    lessons: Vec<String>,
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
@@ -335,6 +355,7 @@ impl SymbolicReasoner {
             config.soft_logic_max_iterations,
             config.soft_logic_min_probability,
         );
+        let problog = ProblogEngine::new(config.problog_max_depth, config.problog_max_proofs);
         let mut reasoner = Self {
             config,
             aligner,
@@ -343,6 +364,8 @@ impl SymbolicReasoner {
             embedding,
             walks,
             soft,
+            problog,
+            lessons: Vec::new(),
             planner: QueryPlanner::new(),
             linker,
             generator,
@@ -385,6 +408,15 @@ impl SymbolicReasoner {
 
     pub fn soft_logic(&self) -> &MarkovLogicEngine {
         &self.soft
+    }
+
+    pub fn problog(&self) -> &ProblogEngine {
+        &self.problog
+    }
+
+    /// 已学的中文概率知识原句（教学记忆）
+    pub fn lessons(&self) -> &[String] {
+        &self.lessons
     }
 
     pub fn linker(&self) -> &EntityLinker {
@@ -580,6 +612,27 @@ impl SymbolicReasoner {
             ));
         }
         self.soft = engine;
+        // 概率逻辑程序与软逻辑同源：软逻辑重建后同步转换（含重放教过的中文知识）
+        if self.config.enable_problog {
+            self.rebuild_problog();
+        }
+    }
+
+    /// 重建 ProbLog 风格概率程序：MLN-lite 规则按 σ(w) 转成概率规则，
+    /// 再重放用户用中文教过的概率知识（会话级，不修改知识图谱）
+    fn rebuild_problog(&mut self) {
+        let mut program = ProblogEngine::from_markov_engine(
+            &self.soft,
+            self.config.problog_max_depth,
+            self.config.problog_max_proofs,
+        );
+        for sentence in &self.lessons {
+            let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+            for lesson in &outcome.lessons {
+                chinese_reasoning_nlu::apply_lesson(&mut program, lesson);
+            }
+        }
+        self.problog = program;
     }
 
     pub fn resolver(&self) -> &ResolutionEngine {
@@ -1225,7 +1278,11 @@ impl SymbolicReasoner {
         }
         // 会话假设同步注入软逻辑引擎（无需等待下一次全量重建）
         if added && self.config.enable_soft_logic {
-            self.soft.add_fact(atom);
+            self.soft.add_fact(atom.clone());
+        }
+        // 概率程序同步注入（ProbLog 的确定事实），保持两套语义事实一致
+        if added && self.config.enable_problog {
+            self.problog.add_deterministic_fact(atom);
         }
         added
     }
@@ -3166,6 +3223,280 @@ impl SymbolicReasoner {
         output.trim_end().to_string()
     }
 
+    /// 中文概率知识教学：把「如果…那么…」「八成…」等句子解析成 ProbLog 概率知识，
+    /// 只写入会话级概率程序（不修改知识图谱），可随对话状态持久化并在下次会话重放
+    pub fn teach_report(&mut self, sentence_raw: &str) -> String {
+        if !self.config.enable_problog {
+            return "概率逻辑教学未启用（config.toml [reasoning] enable_problog = false）。"
+                .to_string();
+        }
+        if !self.config.enable_soft_logic {
+            return "概率逻辑教学依赖加权软逻辑（事实与规则同源），请先启用 enable_soft_logic。"
+                .to_string();
+        }
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请用中文教一条概率知识，例如：教学：如果张三的师傅是李四，那么张三的师祖是王五。"
+                .to_string();
+        }
+        if self.lessons.iter().any(|existing| existing == sentence) {
+            return format!(
+                "这条知识已经学过（重复教学不会重复计概率）：{}。可用「概率推理：实体」查看推断结果。",
+                sentence
+            );
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        if outcome.lessons.is_empty() {
+            let mut output = String::from("没能把这句话解析成概率知识。支持句式：\n");
+            output.push_str("  • 条件句：如果S的P是O，那么S的P是O（可带 八成/很可能/百分之八十 等概率词）\n");
+            output.push_str("  • 因果句：因为S的P是O，所以S的P是O\n");
+            output.push_str("  • 比例句：八成的S会V / S的P是O的可能性是百分之八十\n");
+            output.push_str("  • 直陈句：S的P是O（作为确定事实）");
+            if !outcome.errors.is_empty() {
+                output.push_str("\n  失败原因：\n");
+                for error in &outcome.errors {
+                    output.push_str(&format!("   • {}\n", error));
+                }
+            }
+            return output.trim_end().to_string();
+        }
+        let mut output = format!(
+            "已学会 {} 条中文概率知识（纯符号解析 → ProbLog 程序，可回放、不训练）：\n",
+            outcome.lessons.len()
+        );
+        for (index, lesson) in outcome.lessons.iter().enumerate() {
+            chinese_reasoning_nlu::apply_lesson(&mut self.problog, lesson);
+            output.push_str(&format!(
+                "  {}. 原始：{}\n     逻辑形式：{}\n     知识类型：{}；规则来源：{}\n",
+                index + 1,
+                lesson.original,
+                chinese_reasoning_nlu::render_lesson_zh(lesson),
+                lesson_kind_label(lesson.kind),
+                lesson.source
+            ));
+        }
+        for error in &outcome.errors {
+            output.push_str(&format!("  未学会：{}\n", error));
+        }
+        self.lessons.push(sentence.to_string());
+        output.push_str(&format!(
+            "  概率程序现有 {} 条确定事实、{} 条概率事实、{} 条概率规则；用「概率推理：实体」做可能世界精确查询，用「对话记忆」查看教学记忆。",
+            self.problog.deterministic_fact_count(),
+            self.problog.probabilistic_fact_count(),
+            self.problog.rule_count()
+        ));
+        output
+    }
+
+    /// ProbLog 风格可能世界精确推理报告：
+    /// 概率事实/规则/注释析取 → BDD 加权模型计数（无采样），并列出证明路径与联合概率
+    pub fn problog_report(&self, target_raw: &str) -> String {
+        if !self.config.enable_problog {
+            return "概率可能世界推理未启用（config.toml [reasoning] enable_problog = false）。"
+                .to_string();
+        }
+        if !self.config.enable_soft_logic {
+            return "概率可能世界推理依赖加权软逻辑（图谱事实与规则同源），请先启用 enable_soft_logic。"
+                .to_string();
+        }
+        let target = target_raw.trim();
+        if target.is_empty() {
+            return "请输入要精确查询的对象，例如：概率推理：李四的师祖 或 概率推理：李四".to_string();
+        }
+        let (entity, predicate, known_entity) = match self.split_entity_predicate(target) {
+            Some((entity, predicate)) => (entity, predicate, true),
+            None => {
+                let trimmed = target.trim();
+                match trimmed.split_once('的') {
+                    Some((entity, predicate)) if !entity.trim().is_empty() => (
+                        entity.trim().to_string(),
+                        Some(predicate.trim().to_string())
+                            .filter(|predicate| !predicate.is_empty()),
+                        false,
+                    ),
+                    _ if !trimmed.is_empty() => (trimmed.to_string(), None, false),
+                    _ => return format!("无法在「{}」中识别出已知实体。", target),
+                }
+            }
+        };
+        let patterns = if known_entity {
+            self.problog_patterns(&entity, predicate.as_deref())
+        } else {
+            let mut patterns = self.problog.patterns_for_subject(&entity);
+            if let Some(predicate) = predicate.as_deref() {
+                patterns.retain(|atom| {
+                    atom.predicate.contains(predicate) || predicate.contains(atom.predicate.as_ref())
+                });
+            }
+            patterns.truncate(6);
+            patterns
+        };
+        if patterns.is_empty() {
+            return if known_entity {
+                format!(
+                    "没有找到关于「{}」可用于概率查询的目标（可先用「教学：」教一条知识，或确认实体已在知识图谱中）。",
+                    entity
+                )
+            } else {
+                format!("无法在「{}」中识别出已知实体（也没有教过与「{}」相关的概率知识）。", target, entity)
+            };
+        }
+        let mut merged: HashMap<String, ProblogAnswer> = HashMap::new();
+        let mut stats: Option<(usize, usize, usize, usize, bool)> = None;
+        for pattern in &patterns {
+            let query = self.problog.query(
+                pattern,
+                8,
+                self.config.soft_logic_min_probability.max(0.05),
+            );
+            stats.get_or_insert((
+                query.choice_variables,
+                query.bdd_nodes,
+                query.ground_instances,
+                query.ground_rounds,
+                query.exact,
+            ));
+            for answer in query.answers {
+                merged
+                    .entry(answer.atom.display())
+                    .and_modify(|existing| {
+                        if answer.probability > existing.probability {
+                            *existing = answer.clone();
+                        }
+                    })
+                    .or_insert(answer);
+            }
+        }
+        let mut answers: Vec<ProblogAnswer> = merged.into_values().collect();
+        answers.sort_by(|a, b| {
+            b.probability
+                .partial_cmp(&a.probability)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        answers.truncate(8);
+        if answers.is_empty() {
+            return format!("关于「{}」目前没有概率 ≥ 阈值的精确推断结果。", entity);
+        }
+        let (choice_variables, bdd_nodes, ground_instances, ground_rounds, exact) =
+            stats.unwrap_or((0, 0, 0, 0, true));
+        let mut output = format!(
+            "可能世界精确推理（ProbLog 风格：{} 轮基化得到 {} 条规则实例，{} 个选择变量编译成 {} 个 BDD 节点；加权模型计数，无采样、不训练）\n",
+            ground_rounds, ground_instances, choice_variables, bdd_nodes
+        );
+        if !exact {
+            output.push_str("  注意：BDD 超出编译上限，概率为证明路径联合概率上界近似。\n");
+        }
+        let soft_probabilities = self.soft.probability_map();
+        for (index, answer) in answers.iter().enumerate() {
+            let source_note = if answer.from_fact {
+                if self.soft.has_fact(&answer.atom) {
+                    "图谱事实"
+                } else {
+                    "概率事实/会话事实"
+                }
+            } else {
+                "由概率规则编译推出"
+            };
+            output.push_str(&format!(
+                "  {}. {} {}（P={:.3}，{}）\n",
+                index + 1,
+                self.render_atom_nl(&answer.atom),
+                MarkovLogicEngine::hedge(answer.probability),
+                answer.probability,
+                source_note
+            ));
+            let soft_probability = if self.soft.has_fact(&answer.atom) {
+                1.0
+            } else {
+                soft_probabilities
+                    .get(&answer.atom)
+                    .copied()
+                    .unwrap_or(0.0)
+            };
+            if soft_probability > 1e-9 {
+                output.push_str(&format!(
+                    "     与软逻辑（MLN-lite）对照：{:.3}，Δ={:+.3}（差异来自两套语义：log-odds 求和 vs 可能世界共享选择变量）\n",
+                    soft_probability,
+                    answer.probability - soft_probability
+                ));
+            }
+            if answer.proofs.is_empty() {
+                if !answer.from_fact {
+                    output.push_str("     证明路径：（存在递归/循环依赖，未展开有限证明路径）\n");
+                }
+                continue;
+            }
+            for (proof_index, proof) in answer.proofs.iter().take(3).enumerate() {
+                let steps = proof
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        let premises = if step.premises.is_empty() {
+                            "（无条件）".to_string()
+                        } else {
+                            step.premises
+                                .iter()
+                                .map(|premise| self.render_atom_nl(premise))
+                                .collect::<Vec<_>>()
+                                .join(" 且 ")
+                        };
+                        format!(
+                            "{} —[{:.2}]→ {}（来源：{}）",
+                            premises,
+                            step.probability,
+                            self.render_atom_nl(&step.head),
+                            step.source
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；");
+                output.push_str(&format!(
+                    "     证明路径 {}（联合概率 {:.3}）：{}\n",
+                    proof_index + 1,
+                    proof.probability,
+                    steps
+                ));
+            }
+            let path_sum: f64 = answer.proofs.iter().map(|proof| proof.probability).sum();
+            if answer.proofs.len() > 1 && path_sum > answer.probability + 1e-6 {
+                output.push_str(&format!(
+                    "     路径联合概率之和 {:.3} > 精确概率 {:.3}：各路径共享同一批选择变量（证明重叠），精确值已做去重\n",
+                    path_sum, answer.probability
+                ));
+            }
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 概率查询模式：有谓词时二元/一元各试一次；无谓词时枚举主语相关的概率原子
+    fn problog_patterns(&self, entity: &str, predicate: Option<&str>) -> Vec<Atom> {
+        if let Some(pred) = predicate.filter(|pred| !pred.is_empty()) {
+            let mut patterns = vec![Atom::pattern(pred, Term::constant(entity), Term::var("X"))];
+            patterns.push(Atom::unary(pred, Term::constant(entity)));
+            return patterns;
+        }
+        let mut patterns = self.problog.patterns_for_subject(entity);
+        if patterns.is_empty() {
+            for fact in self.collect_soft_facts_for_entity(entity, 6) {
+                let pattern = if fact.atom.arity() == 2 && fact.atom.terms[0].name() == entity {
+                    Atom::pattern(
+                        fact.atom.predicate.as_ref(),
+                        Term::constant(entity),
+                        Term::var("X"),
+                    )
+                } else {
+                    fact.atom.clone()
+                };
+                if !patterns.contains(&pattern) {
+                    patterns.push(pattern);
+                }
+            }
+        }
+        patterns.truncate(6);
+        patterns
+    }
+
     /// 把「实体[的谓词]」拆成规范实体与可选谓词（最长前缀匹配，支持同义词）
     fn split_entity_predicate(&self, target: &str) -> Option<(String, Option<String>)> {
         let mut best: Option<(usize, String)> = None;
@@ -3235,14 +3566,20 @@ impl SymbolicReasoner {
             .clarification_progress()
             .map(|progress| format!("进行中（{}）", progress))
             .unwrap_or_else(|| "（无）".to_string());
+        let lesson_info = if self.lessons.is_empty() {
+            "（无）".to_string()
+        } else {
+            format!("{} 条", self.lessons.len())
+        };
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，澄清 {}。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，澄清 {}，中文概率知识 {}。",
             focus,
             predicate,
             generation,
             self.context.history().len(),
             session_info,
-            clarify
+            clarify,
+            lesson_info
         )
     }
 
@@ -3266,6 +3603,7 @@ impl SymbolicReasoner {
                     .collect(),
             })
             .collect();
+        snapshot.lessons = self.lessons.clone();
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
@@ -3300,6 +3638,13 @@ impl SymbolicReasoner {
             self.session_facts = restored;
             if self.config.enable_resolution {
                 self.rebuild_resolver();
+            }
+        }
+        // 教学记忆：恢复中文概率知识原句并在概率程序中重放（不写知识图谱）
+        if !snapshot.lessons.is_empty() {
+            self.lessons = snapshot.lessons.clone();
+            if self.config.enable_problog && self.config.enable_soft_logic {
+                self.rebuild_problog();
             }
         }
         true
@@ -3393,6 +3738,9 @@ mod tests {
             enable_causal_reasoning: true,
             causal_max_depth: 4,
             enable_gradient_attribution: true,
+            enable_problog: true,
+            problog_max_depth: 6,
+            problog_max_proofs: 12,
         }
     }
 
@@ -4408,5 +4756,106 @@ mod tests {
             "干预中间节点置真不应降低下游：{}",
             report
         );
+    }
+
+    #[test]
+    fn test_problog_report_gives_exact_probability_and_proof_paths() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.problog_report("李四的师祖");
+        assert!(report.contains("可能世界精确推理"), "实际：{}", report);
+        assert!(report.contains("赵六"), "应推出赵六：{}", report);
+        assert!(report.contains("证明路径"), "应给出证明路径：{}", report);
+        assert!(report.contains("与软逻辑"), "应给出与 MLN-lite 的对照：{}", report);
+        assert!(report.contains("P=0.") || report.contains("P=1."), "应给出概率：{}", report);
+        assert!(reasoner.problog_report("不存在的人").contains("无法"));
+    }
+
+    #[test]
+    fn test_teach_chinese_conditional_rule_affects_problog() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.teach_report("如果张三的师傅是李四，那么张三的师祖是赵六");
+        assert!(taught.contains("逻辑形式"), "实际：{}", taught);
+        assert!(taught.contains("中文教学·条件句"), "应标注来源：{}", taught);
+        assert!(taught.contains("95%"), "默认条件句概率应为 95%：{}", taught);
+        let report = reasoner.problog_report("张三的师祖");
+        assert!(report.contains("赵六"), "教学规则应推出赵六：{}", report);
+        assert!(report.contains("中文教学"), "证明路径应保留教学来源：{}", report);
+        let again = reasoner.teach_report("如果张三的师傅是李四，那么张三的师祖是赵六");
+        assert!(again.contains("已经学过"), "重复教学应被识别：{}", again);
+    }
+
+    #[test]
+    fn test_teach_probabilistic_fact_percentage_query() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.teach_report("李四的喜欢是赵六的可能性是百分之八十");
+        assert!(taught.contains("概率事实"), "实际：{}", taught);
+        assert!(taught.contains("80%"), "应为百分比概率：{}", taught);
+        let report = reasoner.problog_report("李四的喜欢");
+        assert!(report.contains("P=0.800"), "应给出精确概率 0.800：{}", report);
+        assert!(report.contains("概率事实"), "应说明来源：{}", report);
+    }
+
+    #[test]
+    fn test_problog_and_teaching_respect_disabled_config() {
+        let mut config = test_config();
+        config.enable_problog = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.problog_report("李四的师祖").contains("未启用"));
+        assert!(reasoner.teach_report("八成的鸟会飞").contains("未启用"));
+    }
+
+    #[test]
+    fn test_problog_lessons_persist_across_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.teach_report("李四的喜欢是赵六的可能性是百分之八十");
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_lessons_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
+        assert_eq!(restored.lessons().len(), 1, "教学记忆应跨会话恢复");
+        let report = restored.problog_report("李四的喜欢");
+        assert!(
+            report.contains("P=0.800"),
+            "恢复后应重放概率知识：{}",
+            report
+        );
+        assert!(
+            restored.dialogue_summary().contains("中文概率知识 1 条"),
+            "对话记忆应显示教学记忆：{}",
+            restored.dialogue_summary()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_problog_query_accepts_taught_entity_outside_graph() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.teach_report("八成的鸟会飞");
+        let report = reasoner.problog_report("鸟");
+        assert!(report.contains("会飞"), "教学事实应可查询：{}", report);
+        assert!(report.contains("P=0.800"), "应给出精确概率：{}", report);
+        assert!(report.contains("概率事实"), "应说明来源：{}", report);
+    }
+
+    #[test]
+    fn test_problog_multi_sentence_teaching_reports_errors() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.teach_report("如果李四的师傅是王五，那么李四的师祖是赵六。这句话是谁说的？");
+        assert!(report.contains("已学会 1 条"), "实际：{}", report);
+        assert!(report.contains("未学会"), "应逐条报告失败原因：{}", report);
+        assert!(report.contains("疑问句"), "疑问句应被拒绝：{}", report);
     }
 }

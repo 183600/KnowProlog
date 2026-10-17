@@ -534,6 +534,43 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 概率可能世界精确推理：ProbLog 风格 BDD 加权模型计数（概率事实/规则/注释析取）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "概率推理：", "概率推理:", "可能世界：", "可能世界:", "ProbLog：", "ProbLog:",
+                "probLog：", "probLog:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要精确查询的对象，例如：概率推理：李四的师祖 或 概率推理：李四");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.problog_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 中文概率知识教学：自然语言句子 → ProbLog 概率知识（会话级，不写知识图谱）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["教学：", "教学:", "教我：", "教我:", "概率知识：", "概率知识:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!(
+                    "请给出要教的中文知识，例如：教学：如果张三的师傅是李四，那么张三的师祖是王五"
+                );
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.teach_report(target));
+            }
+            println!();
+            continue;
+        }
+
         // 推理发现：正向饱和推出多跳新事实（含前提与规则来源）
         if input == "推理发现" || input == "推导发现" {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
@@ -1210,7 +1247,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 54] = [
+    const COMMANDS: [&str; 62] = [
         "溯因",
         "假设生成",
         "为什么",
@@ -1265,6 +1302,14 @@ fn is_command_like(input: &str) -> bool {
         "do:",
         "梯度归因",
         "可微推理",
+        "概率推理",
+        "可能世界",
+        "教学：",
+        "教学:",
+        "教我",
+        "概率知识",
+        "ProbLog",
+        "probLog",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
 }

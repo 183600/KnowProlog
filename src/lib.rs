@@ -37,6 +37,8 @@ pub mod association_miner;
 pub mod graph_walk_embedding;
 pub mod markov_logic;
 pub mod causal_reasoning;
+pub mod problog;
+pub mod chinese_reasoning_nlu;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
@@ -136,6 +138,24 @@ pub struct ReasoningConfig {
     pub causal_max_depth: usize,
     #[serde(default = "default_enable_gradient_attribution")]
     pub enable_gradient_attribution: bool,
+    #[serde(default = "default_enable_problog")]
+    pub enable_problog: bool,
+    #[serde(default = "default_problog_max_depth")]
+    pub problog_max_depth: usize,
+    #[serde(default = "default_problog_max_proofs")]
+    pub problog_max_proofs: usize,
+}
+
+fn default_enable_problog() -> bool {
+    true
+}
+
+fn default_problog_max_depth() -> usize {
+    6
+}
+
+fn default_problog_max_proofs() -> usize {
+    12
 }
 
 fn default_enable_causal_reasoning() -> bool {
@@ -302,6 +322,9 @@ impl Default for ReasoningConfig {
             enable_causal_reasoning: default_enable_causal_reasoning(),
             causal_max_depth: default_causal_max_depth(),
             enable_gradient_attribution: default_enable_gradient_attribution(),
+            enable_problog: default_enable_problog(),
+            problog_max_depth: default_problog_max_depth(),
+            problog_max_proofs: default_problog_max_proofs(),
         }
     }
 }
