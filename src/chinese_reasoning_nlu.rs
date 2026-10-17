@@ -272,11 +272,30 @@ fn clean_sentence(text: &str) -> String {
 }
 
 fn contains_question_word(text: &str) -> bool {
-    [
-        "吗", "呢", "谁", "什么", "怎么", "为什么", "如何", "哪", "多少", "几",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+    // 多字疑问词不会与普通词冲突，直接子串匹配
+    const UNAMBIGUOUS: [&str; 8] = ["吗", "呢", "谁", "什么", "怎么", "为什么", "如何", "多少"];
+    if UNAMBIGUOUS.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    // 单字疑问词需排除构词：几（几乎/几何/几内亚）、哪（哪吒）
+    for (pos, ch) in text.char_indices() {
+        let rest = &text[pos + ch.len_utf8()..];
+        match ch {
+            '几' => {
+                if !(rest.starts_with('乎') || rest.starts_with('何') || rest.starts_with('内')) {
+                    return true;
+                }
+            }
+            '哪' => {
+                if !(rest.starts_with('吒') || rest.starts_with('咤')) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // 「几何」在句末是疑问（价值几何），在句首/句中通常作名词（几何是数学分支）
+    text.ends_with("几何")
 }
 
 fn valid_part(part: &str) -> bool {

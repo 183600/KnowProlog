@@ -51,6 +51,30 @@ const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const NAME_PREDICATE_IRI: &str = "http://example.org/kg/name";
 
+/// 转义 SPARQL 字符串字面量中的特殊字符（引号/反斜杠/换行等），
+/// 避免名称里的特殊字符破坏查询语法或造成查询注入
+fn sparql_literal(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\\' | b'"' | b'\n' | b'\r' | b'\t'))
+    {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    std::borrow::Cow::Owned(escaped)
+}
+
 #[derive(Debug)]
 pub struct QueryResult {
     pub success: bool,
@@ -1232,7 +1256,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:capital ?capital .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "altitude_query" => {
                 let entity_name = if entities.is_empty() { return None; } else { &entities[0] };
@@ -1242,7 +1266,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:altitude ?altitude .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "chemical_formula_query" => {
                 if entities.is_empty() { return None; }
@@ -1253,7 +1277,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:formula ?formula .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "author_query" => {
                 let entity_name = if entities.is_empty() { return None; } else { &entities[0] };
@@ -1263,7 +1287,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:author ?author .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "champion_query" => {
                 let entity_name = if entities.is_empty() { return None; } else { &entities[0] };
@@ -1273,7 +1297,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:champion ?champion .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "birth_year_query" => {
                 if entities.is_empty() { return None; }
@@ -1284,7 +1308,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:birth_year ?year .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "concept_query" | "explanation_query" => {
                 if entities.is_empty() { return None; }
@@ -1295,7 +1319,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:definition ?definition .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "quantity_query" => {
                 if entities.is_empty() { return None; }
@@ -1306,7 +1330,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:quantity ?quantity .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "planet_query" | "largest_query" => {
                 format!(r#"
@@ -1327,7 +1351,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:time ?time .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "principle_query" => {
                 if entities.is_empty() { return None; }
@@ -1338,7 +1362,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:principle ?principle .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "comparison_query" => {
                 if entities.len() < 2 { return None; }
@@ -1353,7 +1377,7 @@ impl OxigraphManager {
                         ?comparison kg:entity2 ?entity2 .
                         ?comparison kg:difference ?difference .
                     }}
-                "#, entity1, entity2)
+                "#, sparql_literal(entity1), sparql_literal(entity2))
             }
             "philosophy_query" => {
                 if entities.is_empty() { return None; }
@@ -1364,7 +1388,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:philosophy ?philosophy .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "impact_query" => {
                 if entities.len() < 2 { return None; }
@@ -1378,7 +1402,7 @@ impl OxigraphManager {
                         ?entity1 kg:impact ?impact .
                         ?impact kg:target ?entity2 .
                     }}
-                "#, subject, target)
+                "#, sparql_literal(subject), sparql_literal(target))
             }
             "cause_query" => {
                 if entities.is_empty() { return None; }
@@ -1389,7 +1413,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:cause ?cause .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             "reason_query" => {
                 if entities.is_empty() { return None; }
@@ -1400,7 +1424,7 @@ impl OxigraphManager {
                         ?entity kg:name "{}" .
                         ?entity kg:reason ?reason .
                     }}
-                "#, entity_name)
+                "#, sparql_literal(entity_name))
             }
             _ => return None,
         };
@@ -1522,7 +1546,7 @@ impl OxigraphManager {
                 ?entity kg:name ?name .
                 FILTER(REGEX(?name, "{}", "i"))
             }}
-        "#, pattern);
+        "#, sparql_literal(pattern));
         
         match Query::parse(&query, None) {
             Ok(query_obj) => {
@@ -1563,7 +1587,7 @@ impl OxigraphManager {
                 entity_filter.push_str(", ");
             }
             entity_filter.push('"');
-            entity_filter.push_str(entity);
+            entity_filter.push_str(&sparql_literal(entity));
             entity_filter.push('"');
         }
         
@@ -1749,7 +1773,7 @@ impl OxigraphManager {
                 entity_filter.push_str(", ");
             }
             entity_filter.push('"');
-            entity_filter.push_str(entity);
+            entity_filter.push_str(&sparql_literal(entity));
             entity_filter.push('"');
         }
         
@@ -1921,7 +1945,7 @@ impl ResponseFormatter {
                 }
             }
             "capital_query" => {
-                if let Some(capital) = results[0].get("capital") {
+                if let Some(capital) = Self::result_value(results, "Capital", "capital") {
                     format!("首都是{}", capital)
                 } else {
                     "未找到首都信息".to_string()

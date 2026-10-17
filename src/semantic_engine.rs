@@ -206,8 +206,8 @@ impl SemanticEngine {
         // 基于语义向量的匹配
         scored.extend(self.semantic_entity_matching(mention).await?);
         
-        // 去重并排序（保留权重最高的同名实体），再截断到 10 个
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        // 去重并排序（保留权重最高的同名实体），同权按名称排序保证结果稳定，再截断到 10 个
+        scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut seen = HashSet::new();
         scored.retain(|c| seen.insert(c.0.clone()));
         scored.truncate(10); // 最多返回10个候选
@@ -407,8 +407,13 @@ impl SemanticEngine {
         
         {
             let intent_patterns = self.intent_patterns.read();
-            // 匹配意图模式
-            for (intent_type, patterns) in intent_patterns.iter() {
+            // 按类型名排序后匹配，同分时结果确定可复现（HashMap 迭代顺序随机）
+            let mut intent_types: Vec<&String> = intent_patterns.keys().collect();
+            intent_types.sort();
+            for intent_type in intent_types {
+                let Some(patterns) = intent_patterns.get(intent_type) else {
+                    continue;
+                };
                 for pattern in patterns {
                     let confidence = self.match_pattern_confidence(&text_words, pattern);
                     if confidence > best_confidence {
@@ -491,6 +496,8 @@ impl SemanticEngine {
                 }
             }
         }
+        // 关系来自 HashMap，排序后输出保证同一查询结果稳定
+        relations.sort();
         
         Ok(relations)
     }

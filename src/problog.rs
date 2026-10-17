@@ -725,8 +725,14 @@ impl ProblogEngine {
                 format!("概率事实 {}={:.2}", fact.atom.display(), fact.probability),
             );
             let node = bdd.literal(var, true);
-            prob_fact_probability.insert(fact.atom.clone(), fact.probability);
-            prob_fact_bdd.insert(fact.atom.clone(), node);
+            // 同一原子的多条概率事实是析取支持：合并 BDD，而不是只保留最后一条
+            let merged = prob_fact_bdd
+                .get(&fact.atom)
+                .map_or(node, |&existing| bdd.disjunction(existing, node));
+            prob_fact_probability
+                .entry(fact.atom.clone())
+                .or_insert(fact.probability);
+            prob_fact_bdd.insert(fact.atom.clone(), merged);
         }
         for atoms in universe.values_mut() {
             atoms.sort_by_cached_key(Atom::display);

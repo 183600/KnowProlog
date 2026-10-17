@@ -919,7 +919,11 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
     let original = cleaned.clone();
     // 否定句检查：解析器只接受肯定知识，避免「企鹅不属于鸟」被解析成
     // 子类「企鹅不」这类被吞掉否定词的错误知识
-    if cleaned.contains("不是") || cleaned.contains("不属于") {
+    if cleaned.contains("不是")
+        || cleaned.contains("不属于")
+        || cleaned.contains("不一定")
+        || cleaned.contains("并非")
+    {
         return Err(format!("「{}」是否定句，本体教学只接受肯定知识", cleaned));
     }
     // 互斥：X和Y互斥 / X与Y不相容
@@ -1016,7 +1020,14 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
     for marker in ["是一种", "是一类", "属于"] {
         if let Some(position) = cleaned.find(marker) {
             let sub = cleaned[..position].trim().to_string();
-            let sup = cleaned[position + marker.len()..].trim().to_string();
+            let mut sup = cleaned[position + marker.len()..].trim().to_string();
+            // 「X属于Y的一种」等后置分类词写法：剥离后缀，避免把「Y的一种」整体当作父类
+            for suffix in ["的一种", "的一类", "的子类", "的子集"] {
+                if let Some(stripped) = sup.strip_suffix(suffix) {
+                    sup = stripped.trim().to_string();
+                    break;
+                }
+            }
             if valid_name(&sub) && valid_name(&sup) {
                 return Ok(OntologyLesson::Subclass { sub, sup, original });
             }

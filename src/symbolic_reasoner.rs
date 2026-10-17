@@ -572,6 +572,9 @@ impl SymbolicReasoner {
             &self.aligner,
             self.generator.predicate_surfaces(),
         );
+        // 词表变化后实体链接/实体提及的旧结果可能过时，同步失效记忆缓存
+        *self.link_memo.lock() = None;
+        *self.entity_mentions_memo.lock() = None;
     }
 
     pub fn context(&self) -> &DialogueContext {
@@ -1519,19 +1522,20 @@ impl SymbolicReasoner {
 
     /// 把一条基事实从会话事实集中撤回（不触碰知识图谱；软逻辑/概率程序同步重建）
     fn retract_atom(&mut self, atom: &Atom) -> bool {
-        let mut removed = false;
-        if self.session_facts.iter().any(|existing| existing == atom) {
-            self.session_facts.retain(|existing| existing != atom);
-            removed = true;
+        // 只撤回会话事实：归结引擎里同样载入知识图谱事实，直接 remove 会误删图谱知识
+        if !self.session_facts.iter().any(|existing| existing == atom) {
+            return false;
         }
-        if self.config.enable_resolution && self.resolver.remove_fact_atom(atom) {
-            removed = true;
+        self.session_facts.retain(|existing| existing != atom);
+        // 归结引擎重建后图谱事实仍在、被撤回的会话事实消失
+        if self.config.enable_resolution {
+            self.rebuild_resolver();
         }
         // 软逻辑与概率程序同源：撤回后整体重建（概率程序随软逻辑一起重放）
-        if removed && self.config.enable_soft_logic {
+        if self.config.enable_soft_logic {
             self.rebuild_soft_logic();
         }
-        removed
+        true
     }
 
     /// 把一条基事实加入会话事实集（不写知识图谱；归结引擎重建后依然保留）
@@ -1560,15 +1564,19 @@ impl SymbolicReasoner {
 
     /// 采纳第 index（1 起）条待定假设：加入会话归结事实集（不写知识图谱）
     pub fn adopt_hypothesis(&mut self, index: usize) -> Option<String> {
-        let hypothesis = self.abduction.take_pending(index)?;
-        let atom = hypothesis.atom.clone();
-        let rendered = self.render_atom_nl(&atom);
-        if !hypothesis.is_adoptable() {
+        // 先检查可采纳性再取用：不可采纳的假设不能从待定列表中丢失
+        let position = index.checked_sub(1)?;
+        if !self.abduction.pending().get(position)?.is_adoptable() {
+            let hypothesis = &self.abduction.pending()[position];
+            let rendered = self.render_atom_nl(&hypothesis.atom);
             return Some(format!(
                 "假设 {}「{}」仍含未绑定变量，无法直接采纳；请提供更具体的陈述。",
                 index, rendered
             ));
         }
+        let hypothesis = self.abduction.take_pending(index)?;
+        let atom = hypothesis.atom.clone();
+        let rendered = self.render_atom_nl(&atom);
         self.adopt_atom(atom);
         let reasons = hypothesis.reasons.join("；");
         self.abduction.adopt(hypothesis);
@@ -2287,7 +2295,7 @@ impl SymbolicReasoner {
                     .iter()
                     .map(|segment| self.aligner.canonical_form(segment))
                     .collect();
-                return Some((candidate, predicates));
+                return Some((self.aligner.canonical_form(&candidate), predicates));
             }
         }
         let entity = self.aligner.canonical_form(&segments[0]);

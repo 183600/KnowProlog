@@ -610,6 +610,7 @@ impl AbductionEngine {
             budget: 20_000,
             results: Vec::new(),
             seen: HashSet::new(),
+            freshen_counter: 0,
         };
         let mut missing = Vec::new();
         search.run(goals, &Substitution::new(), 0, &mut missing);
@@ -1128,6 +1129,7 @@ impl AbductionEngine {
             budget: 20_000,
             results: Vec::new(),
             seen: HashSet::new(),
+            freshen_counter: 0,
         };
         let mut missing = Vec::new();
         search.run(goals, &Substitution::new(), 0, &mut missing);
@@ -1335,6 +1337,9 @@ struct FrontierSearch<'a> {
     budget: usize,
     results: Vec<Vec<Atom>>,
     seen: HashSet<String>,
+    /// 全局单调递增的换名计数：每次规则换名取一个全新 tag，
+    /// 避免递归不同层复用同一 tag 造成变量捕获
+    freshen_counter: usize,
 }
 
 impl<'a> FrontierSearch<'a> {
@@ -1395,15 +1400,13 @@ impl<'a> FrontierSearch<'a> {
 
         // 3) 与规则头归结：换名后合一，再把规则体前置到目标队列
         //    （规则解释作为备选前沿，与直接切点一起参与排序）
-        for (index, clause) in engine
-            .clauses_iter_for(&applied.predicate)
-            .take(6)
-            .enumerate()
-        {
+        for clause in engine.clauses_iter_for(&applied.predicate).take(6) {
             if self.budget == 0 {
                 break;
             }
-            let fresh = freshen_clause(clause, index);
+            let tag = self.freshen_counter;
+            self.freshen_counter += 1;
+            let fresh = freshen_clause(clause, tag);
             let mut unified = subst.clone();
             if !crate::resolution_engine::unify_atoms(&applied, &fresh.head, &mut unified) {
                 continue;

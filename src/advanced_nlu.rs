@@ -490,8 +490,13 @@ impl AdvancedNLU {
             intent_scores.insert("count_query".to_string(), 0.6);
         }
         
+        // 同分时按意图名字典序打破平局，避免 HashMap 迭代顺序导致结果不可复现
         let best = intent_scores.into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .max_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap()
+                    .then_with(|| b.0.cmp(&a.0))
+            })
             .unwrap_or(("unknown".to_string(), 0.0));
         
         Ok(best)
@@ -604,7 +609,13 @@ impl AdvancedNLU {
         let mut entities = Vec::new();
         {
             let entity_patterns = self.entity_patterns.read();
-            for (entity_type, pattern_info) in entity_patterns.iter() {
+            // 按类型名排序后抽取，重叠实体的取舍不依赖 HashMap 迭代顺序
+            let mut entity_types: Vec<&String> = entity_patterns.keys().collect();
+            entity_types.sort();
+            for entity_type in entity_types {
+                let Some(pattern_info) = entity_patterns.get(entity_type) else {
+                    continue;
+                };
                 let extracted = self.extract_entities_by_type(query, entity_type, pattern_info)?;
                 entities.extend(extracted);
             }
@@ -652,7 +663,7 @@ impl AdvancedNLU {
             if let Some(regex) = self.get_compiled_entity_regex(pattern) {
                 for mat in regex.find_iter(query) {
                     let text = mat.as_str();
-                    let confidence = self.calculate_entity_confidence(text, pattern_info);
+                    let confidence = self.calculate_entity_confidence(text, query, pattern_info);
                     
                     entities.push(ExtractedEntity {
                         text: text.to_string(),
@@ -666,18 +677,18 @@ impl AdvancedNLU {
             }
         }
         
-        // 基于关键词的实体识别
+        // 基于关键词的实体识别（同一关键词的多次出现都要产出）
         for keyword in &pattern_info.keywords {
-            if let Some(start) = query.find(keyword) {
+            for (start, matched) in query.match_indices(keyword.as_str()) {
                 let confidence = 0.7; // 关键词匹配的基础置信度
                 
                 entities.push(ExtractedEntity {
-                    text: keyword.clone(),
+                    text: matched.to_string(),
                     entity_type: entity_type.to_string(),
                     start_pos: start,
-                    end_pos: start + keyword.len(),
+                    end_pos: start + matched.len(),
                     confidence,
-                    normalized_value: self.normalize_entity_value(keyword, entity_type),
+                    normalized_value: self.normalize_entity_value(matched, entity_type),
                 });
             }
         }
@@ -685,19 +696,19 @@ impl AdvancedNLU {
         Ok(entities)
     }
 
-    fn calculate_entity_confidence(&self, text: &str, pattern_info: &EntityPattern) -> f64 {
+    fn calculate_entity_confidence(&self, text: &str, context: &str, pattern_info: &EntityPattern) -> f64 {
         let mut confidence: f64 = 0.5; // 基础置信度
         
-        // 检查是否包含类型关键词
+        // 检查实体文本是否包含类型关键词
         for keyword in &pattern_info.keywords {
             if text.contains(keyword) {
                 confidence += 0.2;
             }
         }
         
-        // 检查上下文线索
+        // 上下文线索通常出现在实体以外的句中语境（如「刘德华的年龄」中的「年龄」），须在整句上匹配
         for clue in &pattern_info.context_clues {
-            if text.contains(clue) {
+            if context.contains(clue) {
                 confidence += 0.1;
             }
         }
@@ -764,12 +775,20 @@ impl AdvancedNLU {
                 section = section.checked_add(current.checked_mul(u)?)?;
                 current = 0;
             } else if ch == '万' {
+                // 与十/百/千 一致：整串只有「万」时省略的前导数字按 1 计
+                // （累计值非零时「一万亿」等写法已有前导数值，不能补 1）
+                if total == 0 && section == 0 && current == 0 {
+                    current = 1;
+                }
                 section = section.checked_add(current)?;
                 total = total.checked_add(section.checked_mul(10000)?)?;
                 section = 0;
                 current = 0;
             } else if ch == '亿' {
                 // 亿作用于其之前累积的整个数值段（如「一万亿」= 1 万亿）
+                if total == 0 && section == 0 && current == 0 {
+                    current = 1;
+                }
                 section = section.checked_add(current)?;
                 total = total.checked_add(section)?.checked_mul(100_000_000)?;
                 section = 0;
@@ -980,12 +999,29 @@ impl AdvancedNLU {
     async fn determine_domain(&self, query: &str, entities: &[ExtractedEntity]) -> Result<String, Box<dyn std::error::Error>> {
         let domain_keywords = &self.domain_keywords;
         
+        // 命中关键词最多的领域胜出；同分按领域名字典序打破平局，
+        // 避免 HashMap 迭代顺序导致同一查询得到不同领域
+        let mut best: Option<(&String, usize)> = None;
         for (domain, keywords) in domain_keywords.iter() {
-            for keyword in keywords {
-                if query.contains(keyword) {
-                    return Ok(domain.clone());
-                }
+            let hits = keywords
+                .iter()
+                .filter(|keyword| query.contains(keyword.as_str()))
+                .count();
+            if hits == 0 {
+                continue;
             }
+            let better = match best {
+                None => true,
+                Some((best_domain, best_hits)) => {
+                    hits > best_hits || (hits == best_hits && domain < best_domain)
+                }
+            };
+            if better {
+                best = Some((domain, hits));
+            }
+        }
+        if let Some((domain, _)) = best {
+            return Ok(domain.clone());
         }
         
         // 基于实体类型推断领域

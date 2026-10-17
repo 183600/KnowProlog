@@ -720,10 +720,20 @@ impl EntityRelationExtractor {
                 
                 // 查找实体间的关系词
                 let text_between = self.extract_text_between_entities(sentence, entity1, entity2);
+                // 分词一次供单字关键词判断：单字关键词必须作为独立词命中，
+                // 避免「现在」里的「在」、「认为」里的「为」这类子串误报
+                let between_words: Vec<&str> = self.jieba.cut(text_between, false);
                 
                 for (relation_type, keywords) in relation_keywords.iter() {
                     // 同一实体对+关系类型只产出一次（多个关键词命中时，重复三元组最终也会被去重）
-                    if !keywords.iter().any(|keyword| text_between.contains(keyword)) {
+                    let hit = keywords.iter().any(|keyword| {
+                        if keyword.chars().count() == 1 {
+                            between_words.iter().any(|word| *word == keyword.as_str())
+                        } else {
+                            text_between.contains(keyword.as_str())
+                        }
+                    });
+                    if !hit {
                         continue;
                     }
                     let confidence = 0.7;

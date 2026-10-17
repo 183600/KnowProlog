@@ -62,8 +62,14 @@ impl SimilarityCalculator {
         
         for embedding in embeddings {
             word_embeddings.insert(embedding.word.clone(), embedding.vector);
-            word_frequencies.insert(embedding.word, embedding.frequency);
+            // 频率为 0 会让 IDF 出现 ln(∞)，整个 TF-IDF 结果变成 NaN，按「未知频率」处理
+            if embedding.frequency > 0 {
+                word_frequencies.insert(embedding.word, embedding.frequency);
+            }
         }
+        
+        // IDF 依赖词频统计，初始化新语料后必须失效旧缓存，否则继续使用上一份语料的 IDF
+        self.idf_cache.write().clear();
         
         Ok(())
     }
@@ -330,6 +336,7 @@ impl SimilarityCalculator {
         }
         
         let document_frequency = *word_frequencies.get(word).unwrap_or(&1) as f64;
+        let document_frequency = document_frequency.max(1.0);
         let idf = (total_documents / document_frequency).ln();
         drop(word_frequencies);
         

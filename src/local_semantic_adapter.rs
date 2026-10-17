@@ -502,9 +502,13 @@ impl LocalSemanticAdapter {
             }
         }
         
-        // 选择得分最高的查询类型
+        // 选择得分最高的查询类型；同分时按类型名字典序打破平局，保证结果可复现
         let best_type = scores.into_iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
             .map(|(query_type, _)| query_type)
             .unwrap_or_else(|| "property_query".to_string());
         

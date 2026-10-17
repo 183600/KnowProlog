@@ -270,9 +270,22 @@ impl EntityLinker {
             return Vec::new();
         }
         let mut mentions = self.exact_mentions(text);
-        if mentions.is_empty() {
-            mentions = self.fuzzy_mentions(text);
+        // 模糊匹配补充精确匹配未覆盖的片段：同一句中既有已知实体又有错别字时，
+        // 不能因为有精确命中就整体跳过模糊匹配
+        let exact_spans: Vec<(usize, usize)> = mentions
+            .iter()
+            .map(|mention| (mention.start, mention.start + mention.mention.chars().count()))
+            .collect();
+        for fuzzy in self.fuzzy_mentions(text) {
+            let fuzzy_end = fuzzy.start + fuzzy.mention.chars().count();
+            let overlaps_exact = exact_spans
+                .iter()
+                .any(|&(start, end)| fuzzy.start < end && start < fuzzy_end);
+            if !overlaps_exact {
+                mentions.push(fuzzy);
+            }
         }
+        mentions.sort_by_key(|mention| mention.start);
         self.disambiguate(&mut mentions, hints);
         mentions
     }

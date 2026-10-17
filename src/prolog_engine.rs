@@ -266,7 +266,7 @@ impl PrologEngine {
             }
             "count_query" => {
                 if let Some(entity_type) = entities.first() {
-                    Some(format!("count_entities({}, Count)", entity_type))
+                    Some(format!("count_entities('{}', Count)", escape_atom(entity_type)))
                 } else {
                     None
                 }
@@ -281,7 +281,7 @@ impl PrologEngine {
             "capital_query" => {
                 if let Some(country) = entities.first() {
                     Some(format!(
-                        "oxigraph_entity('{}', 'country', Properties)",
+                        "oxigraph_entity('{}', 'country', Properties), member(capital-Capital, Properties)",
                         escape_atom(country)
                     ))
                 } else {
