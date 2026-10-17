@@ -724,10 +724,9 @@ impl SymbolicReasoner {
         {
             self.rebuild_soft_logic();
         }
-        // 图游走嵌入只在结构边新增时重算（RWR 幂迭代)
-        if self.config.enable_graph_walk && triples_added {
-            self.walks.rebuild();
-        }
+        // 图游走向量采用惰性重建：新边在 observe_triple 内标记失效，
+        // 首次需要嵌入时才做全量幂迭代（连续导入期间避免逐行重算，
+        // 查询结果与即时重建完全一致）
         // 实体事实同样会更新嵌入（observe_entity），因此也需要重建
         if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();

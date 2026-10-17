@@ -13,7 +13,9 @@
 //
 // 全部由幂迭代确定性求得：没有参数学习、没有梯度、没有神经网络。
 
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 超过该规模就不再为每个实体预算向量（检索仍可按需单源计算）
 pub const DEFAULT_MAX_EMBEDDED_ENTITIES: usize = 4000;
@@ -31,16 +33,144 @@ fn rank_key(score: f64) -> i64 {
     }
 }
 
+/// 幂迭代的可复用缓冲区：避免为每个实体反复分配哈希表
+#[derive(Default)]
+struct PprScratch {
+    mass_a: Vec<f64>,
+    has_a: Vec<bool>,
+    nodes_a: Vec<u32>,
+    mass_b: Vec<f64>,
+    has_b: Vec<bool>,
+    nodes_b: Vec<u32>,
+}
+
+/// 单源重启随机游走的索引化实现（语义与字符串哈希表版本一致，
+/// 仅把键哈希换成了整数下标访问，并复用缓冲区）。
+///
+/// `out` 按（量化概率降序，实体名升序）截断到 `limit` 个分量后输出。
+#[allow(clippy::too_many_arguments)]
+fn single_source_ppr_indexed(
+    adjacency: &[Vec<u32>],
+    seed: u32,
+    limit: usize,
+    damping: f64,
+    iterations: usize,
+    scratch: &mut PprScratch,
+    out: &mut Vec<(u32, f64)>,
+) {
+    let n = adjacency.len();
+    scratch.mass_a.clear();
+    scratch.mass_a.resize(n, 0.0);
+    scratch.has_a.clear();
+    scratch.has_a.resize(n, false);
+    scratch.mass_b.clear();
+    scratch.mass_b.resize(n, 0.0);
+    scratch.has_b.clear();
+    scratch.has_b.resize(n, false);
+    scratch.nodes_a.clear();
+    scratch.nodes_a.push(seed);
+    scratch.mass_a[seed as usize] = 1.0;
+    scratch.has_a[seed as usize] = true;
+
+    for _ in 0..iterations {
+        // 清理上一轮留下的下一轮缓冲区
+        for &node in &scratch.nodes_b {
+            scratch.mass_b[node as usize] = 0.0;
+            scratch.has_b[node as usize] = false;
+        }
+        scratch.nodes_b.clear();
+        for &node in &scratch.nodes_a {
+            let mass = scratch.mass_a[node as usize];
+            let list = &adjacency[node as usize];
+            if list.is_empty() {
+                // 悬挂节点：跳回种子的概率质量
+                let idx = seed as usize;
+                if !scratch.has_b[idx] {
+                    scratch.has_b[idx] = true;
+                    scratch.nodes_b.push(seed);
+                }
+                scratch.mass_b[idx] += mass * damping;
+            } else {
+                let share = mass * damping / list.len() as f64;
+                for &neighbor in list {
+                    let idx = neighbor as usize;
+                    if !scratch.has_b[idx] {
+                        scratch.has_b[idx] = true;
+                        scratch.nodes_b.push(neighbor);
+                    }
+                    scratch.mass_b[idx] += share;
+                }
+            }
+        }
+        let seed_idx = seed as usize;
+        if !scratch.has_b[seed_idx] {
+            scratch.has_b[seed_idx] = true;
+            scratch.nodes_b.push(seed);
+        }
+        scratch.mass_b[seed_idx] += 1.0 - damping;
+        // 剪枝：丢弃低于最大分量 1e-4 的涓流并重新归一，控制支持集规模
+        let max_mass = scratch
+            .nodes_b
+            .iter()
+            .map(|&node| scratch.mass_b[node as usize])
+            .fold(0.0f64, f64::max);
+        if max_mass > 0.0 {
+            let threshold = max_mass * 1e-4;
+            let mut total = 0.0;
+            scratch.nodes_b.retain(|&node| {
+                let mass = scratch.mass_b[node as usize];
+                if mass >= threshold {
+                    total += mass;
+                    true
+                } else {
+                    scratch.has_b[node as usize] = false;
+                    scratch.mass_b[node as usize] = 0.0;
+                    false
+                }
+            });
+            if total > 0.0 {
+                for &node in &scratch.nodes_b {
+                    scratch.mass_b[node as usize] /= total;
+                }
+            }
+        }
+        std::mem::swap(&mut scratch.mass_a, &mut scratch.mass_b);
+        std::mem::swap(&mut scratch.has_a, &mut scratch.has_b);
+        std::mem::swap(&mut scratch.nodes_a, &mut scratch.nodes_b);
+    }
+
+    out.clear();
+    out.extend(
+        scratch
+            .nodes_a
+            .iter()
+            .map(|&node| (node, scratch.mass_a[node as usize])),
+    );
+    let cmp = |a: &(u32, f64), b: &(u32, f64)| {
+        rank_key(b.1)
+            .cmp(&rank_key(a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    if limit != usize::MAX && out.len() > limit {
+        out.select_nth_unstable_by(limit, cmp);
+        out.truncate(limit);
+    }
+    out.sort_by(cmp);
+}
+
 pub struct GraphWalkEmbedding {
     // 无向结构边（关系方向不参与游走，保留谓词用于路径解释）
     neighbors: HashMap<String, Vec<(String, String)>>,
-    entities: Vec<String>,
+    entities: RwLock<Vec<String>>,
     damping: f64,
     iterations: usize,
     similarity_floor: f64,
     max_embedded_entities: usize,
     // L2 归一化后的截断 RWR 向量：实体 → [(命中实体, 概率质量)]
-    vectors: HashMap<String, Vec<(String, f64)>>,
+    vectors: RwLock<HashMap<String, Vec<(String, f64)>>>,
+    // 有新边加入后向量即失效；真正的重算推迟到首次访问向量时（惰性重建），
+    // 连续导入期间不会反复做全量幂迭代
+    vectors_dirty: AtomicBool,
     edge_count: usize,
 }
 
@@ -48,12 +178,13 @@ impl GraphWalkEmbedding {
     pub fn new(damping: f64, iterations: usize, similarity_floor: f64) -> Self {
         Self {
             neighbors: HashMap::new(),
-            entities: Vec::new(),
+            entities: RwLock::new(Vec::new()),
             damping: damping.clamp(0.05, 0.99),
             iterations: iterations.clamp(1, 100),
             similarity_floor: similarity_floor.clamp(0.0, 1.0),
             max_embedded_entities: DEFAULT_MAX_EMBEDDED_ENTITIES,
-            vectors: HashMap::new(),
+            vectors: RwLock::new(HashMap::new()),
+            vectors_dirty: AtomicBool::new(false),
             edge_count: 0,
         }
     }
@@ -71,7 +202,8 @@ impl GraphWalkEmbedding {
     }
 
     pub fn entity_count(&self) -> usize {
-        self.entities.len()
+        self.ensure_vectors();
+        self.entities.read().len()
     }
 
     /// 有向视角的边数（每条三元组贡献正反两条游走边）
@@ -95,12 +227,14 @@ impl GraphWalkEmbedding {
                 if !list.contains(&forward) {
                     list.push(forward);
                     self.edge_count += 1;
+                    self.vectors_dirty.store(true, Ordering::Release);
                 }
             }
             None => {
                 self.neighbors
                     .insert(subject.to_string(), vec![forward]);
                 self.edge_count += 1;
+                self.vectors_dirty.store(true, Ordering::Release);
             }
         }
         match self.neighbors.get_mut(object) {
@@ -108,27 +242,77 @@ impl GraphWalkEmbedding {
                 if !list.contains(&backward) {
                     list.push(backward);
                     self.edge_count += 1;
+                    self.vectors_dirty.store(true, Ordering::Release);
                 }
             }
             None => {
                 self.neighbors
                     .insert(object.to_string(), vec![backward]);
                 self.edge_count += 1;
+                self.vectors_dirty.store(true, Ordering::Release);
             }
         }
     }
 
-    /// 重建全部实体的符号嵌入（幂迭代；规模过大时跳过，保留单源按需计算）
-    pub fn rebuild(&mut self) {
-        let mut entities: Vec<String> = self.neighbors.keys().cloned().collect();
-        entities.sort();
-        self.entities = entities;
-        self.vectors.clear();
-        if self.entities.len() > self.max_embedded_entities {
+    /// 若新边加入后向量已失效则重算（惰性重建，语义与即时重建一致）
+    fn ensure_vectors(&self) {
+        if !self.vectors_dirty.load(Ordering::Acquire) {
             return;
         }
-        for entity in &self.entities {
-            let mut vector = self.single_source_ppr_limit(entity, MAX_VECTOR_LEN);
+        self.rebuild_vectors();
+    }
+
+    /// 重建全部实体的符号嵌入（幂迭代；规模过大时跳过，保留单源按需计算）
+    pub fn rebuild(&mut self) {
+        self.rebuild_vectors();
+    }
+
+    fn rebuild_vectors(&self) {
+        let mut entities: Vec<String> = self.neighbors.keys().cloned().collect();
+        entities.sort();
+        if entities.is_empty() || entities.len() > self.max_embedded_entities {
+            self.vectors.write().clear();
+            *self.entities.write() = entities;
+            self.vectors_dirty.store(false, Ordering::Release);
+            return;
+        }
+        // 索引化邻接表：名称哈希只在重建开始时做一次，幂迭代只操作整数索引
+        let index: HashMap<&str, u32> = entities
+            .iter()
+            .enumerate()
+            .map(|(i, entity)| (entity.as_str(), i as u32))
+            .collect();
+        let mut adjacency: Vec<Vec<u32>> = Vec::with_capacity(entities.len());
+        for entity in &entities {
+            let mut list = Vec::new();
+            if let Some(neighbors) = self.neighbors.get(entity) {
+                list.reserve(neighbors.len());
+                for (_, target) in neighbors {
+                    if let Some(&idx) = index.get(target.as_str()) {
+                        list.push(idx);
+                    }
+                }
+            }
+            adjacency.push(list);
+        }
+        let mut vectors = HashMap::with_capacity(entities.len());
+        let mut scratch = PprScratch::default();
+        let mut result = Vec::new();
+        for (idx, entity) in entities.iter().enumerate() {
+            result.clear();
+            single_source_ppr_indexed(
+                &adjacency,
+                idx as u32,
+                MAX_VECTOR_LEN,
+                self.damping,
+                self.iterations,
+                &mut scratch,
+                &mut result,
+            );
+            let mut vector: Vec<(String, f64)> = result
+                .iter()
+                .map(|&(node, weight)| (entities[node as usize].clone(), weight))
+                .collect();
             let norm = vector
                 .iter()
                 .map(|(_, weight)| weight * weight)
@@ -139,8 +323,11 @@ impl GraphWalkEmbedding {
                     *weight /= norm;
                 }
             }
-            self.vectors.insert(entity.clone(), vector);
+            vectors.insert(entity.clone(), vector);
         }
+        *self.vectors.write() = vectors;
+        *self.entities.write() = entities;
+        self.vectors_dirty.store(false, Ordering::Release);
     }
 
     /// 单源重启随机游走：幂迭代求平稳分布，返回按概率降序的分量
@@ -217,8 +404,10 @@ impl GraphWalkEmbedding {
 
     /// 结构最相关的实体（概率质量最大的分量，排除自身）
     pub fn related(&self, seed: &str, k: usize) -> Vec<(String, f64)> {
-        match self.vectors.get(seed) {
-            // 命中缓存向量时克隆最终保留的 k 个分量
+        self.ensure_vectors();
+        let vectors = self.vectors.read();
+        match vectors.get(seed) {
+            // 命中缓存向量时只克隆最终保留的 k 个分量
             Some(vector) => vector
                 .iter()
                 .filter(|(entity, _)| entity != seed)
@@ -237,8 +426,10 @@ impl GraphWalkEmbedding {
 
     /// 结构相似度：两个实体 RWR 向量的余弦相似度（需要已重建嵌入）
     pub fn similarity(&self, a: &str, b: &str) -> Option<f64> {
-        let left = self.vectors.get(a)?;
-        let right = self.vectors.get(b)?;
+        self.ensure_vectors();
+        let vectors = self.vectors.read();
+        let left = vectors.get(a)?;
+        let right = vectors.get(b)?;
         let left_map: HashMap<&str, f64> =
             left.iter().map(|(name, w)| (name.as_str(), *w)).collect();
         let mut dot = 0.0;
@@ -252,18 +443,20 @@ impl GraphWalkEmbedding {
 
     /// 结构角色最接近的实体（按余弦相似度降序，过滤低于阈值者）
     pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
+        self.ensure_vectors();
+        let vectors = self.vectors.read();
         // 构建源实体的查找表
-        let Some(left) = self.vectors.get(entity) else {
+        let Some(left) = vectors.get(entity) else {
             return Vec::new();
         };
         let left_map: HashMap<&str, f64> =
             left.iter().map(|(name, w)| (name.as_str(), *w)).collect();
-        let mut scored: Vec<(&str, f64)> = self
-            .entities
+        let entities = self.entities.read();
+        let mut scored: Vec<(&str, f64)> = entities
             .iter()
             .filter(|other| other.as_str() != entity)
             .filter_map(|other| {
-                let right = self.vectors.get(other)?;
+                let right = vectors.get(other)?;
                 let mut dot = 0.0;
                 for (name, weight) in right {
                     if let Some(other_weight) = left_map.get(name.as_str()) {
@@ -298,12 +491,14 @@ impl GraphWalkEmbedding {
 
     /// 多源重启：把多个种子实体（如对话焦点栈）作为共同起点做上下文向量
     pub fn context_related(&self, seeds: &[String], k: usize) -> Vec<(String, f64)> {
+        self.ensure_vectors();
+        let vectors = self.vectors.read();
         let mut merged: HashMap<String, f64> = HashMap::new();
         let mut used = 0usize;
         for seed in seeds {
             // 命中缓存时直接借用，未命中才计算临时向量
             let computed;
-            let vector: &[(String, f64)] = match self.vectors.get(seed) {
+            let vector: &[(String, f64)] = match vectors.get(seed) {
                 Some(vector) => vector.as_slice(),
                 None => {
                     if !self.neighbors.contains_key(seed) {
@@ -350,7 +545,8 @@ impl GraphWalkEmbedding {
         if from == to || !self.neighbors.contains_key(from) || !self.neighbors.contains_key(to) {
             return None;
         }
-        if self.entities.len() > self.max_embedded_entities {
+        self.ensure_vectors();
+        if self.entities.read().len() > self.max_embedded_entities {
             return None;
         }
         let max_hops = max_hops.clamp(1, 5);

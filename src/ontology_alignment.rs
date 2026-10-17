@@ -41,8 +41,10 @@ pub struct OntologyAligner {
     profiles: Vec<TermProfile>,
     // 与 profiles 一一对应，注册时预计算规范化结果
     profile_norms: Vec<String>,
-    // 与 profiles 一一对应，注册时预计算 bigram 键
+    // 与 profiles 一一对应，注册时预计算并排序的 bigram 键
     profile_keys: Vec<Vec<(char, Option<char>)>>,
+    // 与 profiles 一一对应，规范化后的字符长度（相似度剪枝用）
+    profile_lens: Vec<usize>,
     index: HashMap<String, usize>,
     similarity_threshold: f64,
     structural_min_shared: usize,
@@ -58,6 +60,7 @@ impl OntologyAligner {
             profiles: Vec::new(),
             profile_norms: Vec::new(),
             profile_keys: Vec::new(),
+            profile_lens: Vec::new(),
             index: HashMap::new(),
             similarity_threshold,
             structural_min_shared: 2,
@@ -105,8 +108,11 @@ impl OntologyAligner {
             ..Default::default()
         });
         let idx = self.profiles.len() - 1;
+        let mut keys = Self::bigram_keys(&normalized);
+        keys.sort_unstable();
+        self.profile_lens.push(normalized.chars().count());
         self.profile_norms.push(normalized.clone());
-        self.profile_keys.push(Self::bigram_keys(&normalized));
+        self.profile_keys.push(keys);
         self.index.insert(normalized, idx);
         self.resolve_cache.write().clear();
         idx
@@ -222,29 +228,34 @@ impl OntologyAligner {
     }
 
     fn bigram_dice(a: &str, b: &str) -> f64 {
-        Self::bigram_dice_keys(&Self::bigram_keys(a), &Self::bigram_keys(b))
+        let mut ga = Self::bigram_keys(a);
+        let mut gb = Self::bigram_keys(b);
+        ga.sort_unstable();
+        gb.sort_unstable();
+        Self::bigram_dice_sorted(&ga, &gb)
     }
 
-    fn bigram_dice_keys(ga: &[(char, Option<char>)], gb: &[(char, Option<char>)]) -> f64 {
+    /// 对两个已排序的 bigram 多重集做归并求交（无分配），
+    /// 与哈希计数实现给出完全相同的 Dice 系数。
+    fn bigram_dice_sorted(ga: &[(char, Option<char>)], gb: &[(char, Option<char>)]) -> f64 {
         if ga.is_empty() || gb.is_empty() {
             return 0.0;
         }
-        let total = ga.len() + gb.len();
-        // 计数映射实现多重集交集
-        let mut counts: HashMap<(char, Option<char>), usize> = HashMap::with_capacity(ga.len());
-        for key in ga {
-            *counts.entry(*key).or_insert(0) += 1;
-        }
+        let mut i = 0usize;
+        let mut j = 0usize;
         let mut overlap = 0usize;
-        for key in gb {
-            if let Some(count) = counts.get_mut(key) {
-                if *count > 0 {
-                    *count -= 1;
+        while i < ga.len() && j < gb.len() {
+            match ga[i].cmp(&gb[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
                     overlap += 1;
+                    i += 1;
+                    j += 1;
                 }
             }
         }
-        2.0 * overlap as f64 / total as f64
+        2.0 * overlap as f64 / (ga.len() + gb.len()) as f64
     }
 
     /// 使用调用方预计算的查询侧与候选侧 bigram 计算相似度。
@@ -272,9 +283,9 @@ impl OntologyAligner {
             return 0.7 + 0.3 * (short_len as f64 / long_len as f64);
         }
         if short == query {
-            Self::bigram_dice_keys(query_keys, other_keys)
+            Self::bigram_dice_sorted(query_keys, other_keys)
         } else {
-            Self::bigram_dice_keys(other_keys, query_keys)
+            Self::bigram_dice_sorted(other_keys, query_keys)
         }
     }
 
@@ -386,11 +397,43 @@ impl OntologyAligner {
         }
 
         let mut best_similarity: Option<(f64, usize)> = None;
-        let query_keys = Self::bigram_keys(&normalized);
+        let mut query_keys = Self::bigram_keys(&normalized);
+        query_keys.sort_unstable();
+        let query_len = normalized.chars().count();
+        let query_key_len = query_keys.len();
         let scan_end = self_idx.map_or(self.profiles.len(), |i| i + 1);
         for i in 0..scan_end {
             if Some(i) == self_idx {
                 continue;
+            }
+            // 廉价上界剪枝：包含关系与 Dice 的取值上限都不可能达到阈值时直接跳过，
+            // 避免对多数候选做子串搜索与逐键归并
+            if self.similarity_threshold > 0.0 {
+                let other_len = self.profile_lens[i];
+                if query_len == 0 || other_len == 0 {
+                    continue;
+                }
+                let (min_len, max_len) = if query_len <= other_len {
+                    (query_len, other_len)
+                } else {
+                    (other_len, query_len)
+                };
+                let mut upper_bound = if min_len >= 2 {
+                    0.7 + 0.3 * (min_len as f64 / max_len as f64)
+                } else {
+                    0.0
+                };
+                let other_key_len = self.profile_keys[i].len();
+                if other_key_len > 0 && query_key_len > 0 {
+                    let dice_bound = 2.0 * (query_key_len.min(other_key_len) as f64)
+                        / (query_key_len + other_key_len) as f64;
+                    if dice_bound > upper_bound {
+                        upper_bound = dice_bound;
+                    }
+                }
+                if upper_bound < self.similarity_threshold {
+                    continue;
+                }
             }
             let sim = self.similarity_normalized_with_keys(
                 &normalized,
@@ -420,8 +463,21 @@ impl OntologyAligner {
         if let Some(profile) = self_idx.map(|i| &self.profiles[i]) {
             let mut best_structural: Option<(f64, usize, Vec<String>)> = None;
             let structural_scan_end = self_idx.map_or(self.profiles.len(), |i| i + 1);
+            let own_degree = profile.neighbors.len();
             for (i, other) in self.profiles.iter().enumerate().take(structural_scan_end) {
                 if Some(i) == self_idx || other.kind != profile.kind {
+                    continue;
+                }
+                let other_degree = other.neighbors.len();
+                // 长度上界剪枝：共享数不可能达到下限或 Jaccard 不可能达标时跳过
+                let (smaller, larger) = if own_degree <= other_degree {
+                    (own_degree, other_degree)
+                } else {
+                    (other_degree, own_degree)
+                };
+                if smaller < self.structural_min_shared
+                    || (smaller as f64) < self.structural_min_jaccard * (larger as f64)
+                {
                     continue;
                 }
                 // 先统计交集大小，胜出后再重建证据
@@ -429,7 +485,8 @@ impl OntologyAligner {
                 if shared_count < self.structural_min_shared {
                     continue;
                 }
-                let union = profile.neighbors.union(&other.neighbors).count();
+                // |A∪B| = |A| + |B| − |A∩B|，避免对整个并集再做一次哈希遍历
+                let union = own_degree + other_degree - shared_count;
                 if union == 0 {
                     continue;
                 }

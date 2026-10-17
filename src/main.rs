@@ -141,6 +141,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
     let mut symbolic_reasoner = SymbolicReasoner::new(config.reasoning.clone(), synonyms.clone());
+    // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部），避免逐行 O(n²) 重扫重观察
+    let mut reasoner_stale = false;
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
         symbolic_reasoner.observe_facts(&facts);
     }
@@ -181,6 +183,17 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
         if input == "quit" {
             break;
+        }
+
+        // 导入行不立即刷新：连续导入在真正进入查询/命令前只做一次整图观察
+        if reasoner_stale
+            && !matches!(
+                detect_input_mode(input, &config.nlp.import_keywords),
+                InputMode::KnowledgeImport
+            )
+        {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            reasoner_stale = false;
         }
 
         if input == "对齐报告" || input == "本体对齐" {
@@ -969,7 +982,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     match oxigraph_manager.import_jsonld_from_file(&file_path).await {
                         Ok(_) => {
                             println!("JSON-LD 文件导入成功！");
-                            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                            reasoner_stale = true;
                         }
                         Err(e) => {
                             eprintln!("JSON-LD 文件导入失败: {}", e);
@@ -991,7 +1004,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     match oxigraph_manager.import_jsonld(&jsonld_content).await {
                         Ok(_) => {
                             println!("JSON-LD 内容导入成功！");
-                            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                            reasoner_stale = true;
                         }
                         Err(e) => {
                             eprintln!("JSON-LD 内容导入失败: {}", e);
@@ -1035,7 +1048,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                         match oxigraph_manager.save_knowledge(items).await {
                             Ok(_) => {
                                 println!("知识已成功保存");
-                                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                                reasoner_stale = true;
                             }
                             Err(e) => eprintln!("保存失败: {}", e),
                         }
