@@ -3,7 +3,7 @@ use oxigraph::sparql::{Query, QueryResults};
 use oxigraph::store::Store;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1030,8 +1030,7 @@ impl OxigraphManager {
         }
         
         // 第三步：为相关实体构建Prolog事实
-        let relevant_entity_list: Vec<String> = relevant_entities.iter().cloned().collect();
-        facts.extend(self.build_entity_facts(&store, &relevant_entity_list).await?);
+        facts.extend(self.build_entity_facts(&store, &relevant_entities).await?);
         
         // 第四步：添加实体间的关系
         let relations = self.find_relations_between(&store, &relevant_entities).await?;
@@ -1603,7 +1602,7 @@ impl OxigraphManager {
         Ok(neighbors)
     }
 
-    async fn build_entity_facts(&self, store: &Store, entity_names: &[String]) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn build_entity_facts(&self, store: &Store, entity_names: &HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         let mut facts = Vec::new();
         
         if entity_names.is_empty() {
@@ -1794,11 +1793,18 @@ impl OxigraphManager {
 }
 
 pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String> {
-    let mut entities = Vec::new();
-    
     let tagged_words = preprocess(query, &config.nlp);
-    
-    for word in &tagged_words {
+    extract_query_entities_from_tagged(&tagged_words, config)
+}
+
+/// 与 `extract_query_entities` 等价，但复用已分词结果，避免重复分词
+pub fn extract_query_entities_from_tagged(
+    tagged_words: &[TaggedWord],
+    config: &SystemConfig,
+) -> Vec<String> {
+    let mut entities = Vec::new();
+
+    for word in tagged_words {
         if word.pos == "nr" || word.pos == "ns" || word.pos == "nz" || 
            word.pos == "n" || word.pos == "nt" {
             entities.push(word.text.clone());

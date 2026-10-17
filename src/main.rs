@@ -14,7 +14,7 @@ use know_prolog::{
     create_prolog_rules,
     detect_input_mode,
     create_default_synonyms,
-    extract_query_entities,
+    extract_query_entities_from_tagged,
     nlp::{preprocess, normalize_words, analyze_query_intent},
     nlu::NLUEngine,
     prolog_engine::PrologEngine,
@@ -767,11 +767,22 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                 }
 
                 let tagged_words = preprocess(input, &config.nlp);
+                // 复用本次分词：查询实体提取与 NLU 不再重复分词
+                let precomputed_query_entities =
+                    extract_query_entities_from_tagged(&tagged_words, &config);
+                let nlu_tagged_words = if config.nlp.enable_nlu.unwrap_or(false) {
+                    Some(tagged_words.clone())
+                } else {
+                    None
+                };
                 let normalized_words = normalize_words(tagged_words, &synonyms);
                 
                 // 使用NLU进行语义理解
                 if config.nlp.enable_nlu.unwrap_or(false) {
-                    let semantic_analysis = nlu_engine.analyze(input);
+                    let semantic_analysis = match nlu_tagged_words {
+                        Some(tagged) => nlu_engine.analyze_tagged(input, tagged),
+                        None => nlu_engine.analyze(input),
+                    };
                     
                     if !semantic_analysis.semantics.is_empty() {
                         let best_semantic = &semantic_analysis.semantics[0];
@@ -869,8 +880,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     // 继续使用查询逻辑
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                                         // 执行查询流程
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities).await;
-                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, &config, input).await {
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities, &precomputed_query_entities).await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                     } else {
                                         println!("无法理解您的查询，请重新描述您的问题。");
@@ -880,8 +891,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities).await;
-                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, &config, input).await {
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities, &precomputed_query_entities).await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                     } else {
                                         println!("{}", config.messages.cannot_understand);
@@ -971,12 +982,16 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                 if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     
-                    // 提取查询中的实体
-                    let mut query_entities = extract_query_entities(input, &config);
-                    query_entities.extend(entities.clone());
-                    // 去重时保留首次出现顺序
+                    // 提取查询中的实体（复用本次分词结果）
                     let mut seen_entities = std::collections::HashSet::new();
-                    query_entities.retain(|e| seen_entities.insert(e.clone()));
+                    let mut query_entities: Vec<String> = Vec::with_capacity(
+                        precomputed_query_entities.len() + entities.len(),
+                    );
+                    for entity in precomputed_query_entities.iter().chain(entities.iter()) {
+                        if seen_entities.insert(entity.as_str()) {
+                            query_entities.push(entity.clone());
+                        }
+                    }
                     
                     // === 歧义解析 ===
                     if let Some(api_config) = &config.api {
@@ -1135,8 +1150,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                 } else if let Some(answer) = try_symbolic_reasoning(
                     &mut symbolic_reasoner,
                     &oxigraph_manager,
-                    &config,
                     input,
+                    &precomputed_query_entities,
                 )
                 .await
                 {
@@ -1196,12 +1211,11 @@ async fn refresh_symbolic_reasoner(
 async fn try_symbolic_reasoning(
     symbolic_reasoner: &mut SymbolicReasoner,
     oxigraph_manager: &OxigraphManager,
-    config: &know_prolog::SystemConfig,
     input: &str,
+    query_entities: &[String],
 ) -> Option<String> {
-    let entities = extract_query_entities(input, config);
-    if !entities.is_empty() {
-        if let Ok(facts) = oxigraph_manager.get_relevant_facts(&entities, 2).await {
+    if !query_entities.is_empty() {
+        if let Ok(facts) = oxigraph_manager.get_relevant_facts(query_entities, 2).await {
             symbolic_reasoner.observe_facts(&facts);
         }
     }
@@ -1372,16 +1386,20 @@ async fn continue_original_query(
     symbolic_reasoner: &mut SymbolicReasoner,
     input: &str,
     query_type: &str,
-    entities: &[String]
+    entities: &[String],
+    precomputed_query_entities: &[String]
 ) {
     println!("查询类型: {}, 实体: {:?}", query_type, entities);
     
-    // 提取查询中的实体
-    let mut query_entities = extract_query_entities(input, config);
-    query_entities.extend(entities.iter().cloned());
-    // 去重时保留首次出现顺序
+    // 提取查询中的实体（复用本次分词结果）
     let mut seen_entities = std::collections::HashSet::new();
-    query_entities.retain(|e| seen_entities.insert(e.clone()));
+    let mut query_entities: Vec<String> =
+        Vec::with_capacity(precomputed_query_entities.len() + entities.len());
+    for entity in precomputed_query_entities.iter().chain(entities.iter()) {
+        if seen_entities.insert(entity.as_str()) {
+            query_entities.push(entity.clone());
+        }
+    }
     
     // 使用歧义解析功能（如果启用）
     if let Some(api_config) = &config.api {
@@ -1475,7 +1493,7 @@ async fn continue_original_query(
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
                     if let Some(answer) =
-                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, config, input).await
+                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, input, precomputed_query_entities).await
                     {
                         println!("{}", answer);
                     }
@@ -1504,7 +1522,7 @@ async fn continue_original_query(
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
                     if let Some(answer) =
-                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, config, input).await
+                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, input, precomputed_query_entities).await
                     {
                         println!("{}", answer);
                     }
@@ -1535,7 +1553,7 @@ async fn continue_original_query(
                 println!("{}: {}", config.messages.process_error, e);
 
                 if let Some(answer) =
-                    try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, config, input).await
+                    try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, input, precomputed_query_entities).await
                 {
                     println!("{}", answer);
                 } else {

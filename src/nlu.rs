@@ -59,6 +59,11 @@ impl NLUEngine {
 
     pub fn analyze(&self, input: &str) -> SemanticAnalysis {
         let tagged_words = preprocess(input, &self.nlp_config);
+        self.analyze_tagged(input, tagged_words)
+    }
+
+    /// 使用已分词结果进行语义分析，避免重复分词
+    pub fn analyze_tagged(&self, input: &str, tagged_words: Vec<TaggedWord>) -> SemanticAnalysis {
         let normalized_words = if let Some(synonyms) = &self.synonyms {
             normalize_words(tagged_words, synonyms)
         } else {

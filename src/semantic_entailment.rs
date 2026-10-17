@@ -371,9 +371,14 @@ impl<'a> PropositionParser<'a> {
             return None;
         }
         let mut notes = Vec::new();
-        let mapped = self
+        // surfaces 按字符数降序排列：精确匹配只可能落在等长的连续块内
+        let surface_len = trimmed.chars().count();
+        let block_start = self
             .surfaces
+            .partition_point(|(surface, _)| surface.chars().count() > surface_len);
+        let mapped = self.surfaces[block_start..]
             .iter()
+            .take_while(|(surface, _)| surface.chars().count() == surface_len)
             .find(|(surface, _)| surface == trimmed)
             .map(|(_, canonical)| canonical.clone());
         let canonical = mapped

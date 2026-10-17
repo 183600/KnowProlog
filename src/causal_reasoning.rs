@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::markov_logic::{GroundedRule, MarkovLogicEngine};
+use crate::markov_logic::{Beliefs, GroundedRule, MarkovLogicEngine};
 use crate::resolution_engine::Atom;
 
 /// 默认因果链最大长度（防组合爆炸）
@@ -466,11 +466,48 @@ impl CausalAnalyzer {
         value: bool,
         limit: usize,
     ) -> CounterfactualComparison {
-        let limit = limit.max(1);
-        let factual = engine.infer(effect_pattern, limit * 4);
         let mut fixed = HashMap::new();
         fixed.insert(intervention.clone(), if value { 1.0 } else { 0.0 });
-        let counterfactual = engine.infer_with_fixed(effect_pattern, limit * 4, &fixed);
+        let factual_beliefs = engine.propagate_with_fixed(&HashMap::new());
+        let counterfactual_beliefs = engine.propagate_with_fixed(&fixed);
+        self.counterfactual_from_beliefs(
+            engine,
+            &factual_beliefs,
+            &counterfactual_beliefs,
+            &fixed,
+            effect_pattern,
+            intervention,
+            value,
+            limit,
+        )
+    }
+
+    /// 与 `counterfactual` 相同，但两个世界的软真值信念由调用方提供，
+    /// 供多个效应探测点复用同一批传播结果
+    pub fn counterfactual_from_beliefs(
+        &self,
+        engine: &MarkovLogicEngine,
+        factual_beliefs: &Beliefs,
+        counterfactual_beliefs: &Beliefs,
+        fixed: &HashMap<Atom, f64>,
+        effect_pattern: &Atom,
+        intervention: &Atom,
+        value: bool,
+        limit: usize,
+    ) -> CounterfactualComparison {
+        let limit = limit.max(1);
+        let factual = engine.infer_from_beliefs(
+            effect_pattern,
+            limit * 4,
+            factual_beliefs,
+            &HashMap::new(),
+        );
+        let counterfactual = engine.infer_from_beliefs(
+            effect_pattern,
+            limit * 4,
+            counterfactual_beliefs,
+            fixed,
+        );
         let mut merged: HashMap<String, CounterfactualDelta> = HashMap::new();
         for fact in &factual {
             merged.insert(

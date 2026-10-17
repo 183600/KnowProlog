@@ -56,8 +56,9 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
         .collect();
 
     // 结巴分词可能把配置中的常见人名（如"张三"）切分成多个单字，
-    // 这里按最长匹配合并相邻词，使 full_names 中的人名能被正确识别
-    let mut merged_words: Vec<String> = Vec::with_capacity(words.len());
+    // 这里按最长匹配合并相邻词，使 full_names 中的人名能被正确识别；
+    // 合并与标注在同一次遍历内完成，省去中间的合并词列表
+    let mut tagged_words: Vec<TaggedWord> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
         // 增量拼接候选词并记录最长匹配
@@ -71,33 +72,33 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
             }
         }
         if let Some((name, end)) = matched {
-            merged_words.push(name);
+            tagged_words.push(tag_word(name, config, &full_names));
             i = end;
         } else {
-            merged_words.push(words[i].to_string());
+            tagged_words.push(tag_word(words[i].to_string(), config, &full_names));
             i += 1;
         }
     }
 
-    let mut tagged_words = Vec::with_capacity(merged_words.len());
-    for word in merged_words {
-        // 确定词性
-        let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
-            "m".to_string() // m表示数词
-        } else if is_name(&word, &config.name_patterns, &full_names) { // 判断是否为人名
-            "nr".to_string() // nr表示人名
-        } else {
-            // 从词性字典查找，找不到则标记为unknown
-            config.pos_dict.get(&word).cloned().unwrap_or_else(|| "unknown".to_string())
-        };
-        
-        tagged_words.push(TaggedWord {
-            text: word,
-            pos,
-        });
-    }
-    
     tagged_words
+}
+
+// 确定单个词语的词性并封装为标注词
+fn tag_word(
+    word: String,
+    config: &crate::NlpConfig,
+    full_names: &std::collections::HashSet<&str>,
+) -> TaggedWord {
+    let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
+        "m".to_string() // m表示数词
+    } else if is_name(&word, &config.name_patterns, full_names) { // 判断是否为人名
+        "nr".to_string() // nr表示人名
+    } else {
+        // 从词性字典查找，找不到则标记为unknown
+        config.pos_dict.get(&word).cloned().unwrap_or_else(|| "unknown".to_string())
+    };
+
+    TaggedWord { text: word, pos }
 }
 
 // 词语归一化函数，将同义词转换为标准形式
@@ -129,6 +130,16 @@ fn is_name(
 
 // 分析查询意图并提取实体
 pub fn analyze_query_intent(tagged_words: &[TaggedWord], rules: &[PrologRule]) -> Option<(String, Vec<String>)> {
+    // 规则通常已按优先级降序排列：先做一次线性检查，避免每次调用都分配并排序
+    if rules.windows(2).all(|pair| pair[0].priority >= pair[1].priority) {
+        for rule in rules {
+            if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {
+                return Some((rule.query_type.clone(), entities)); // 返回查询类型和提取的实体
+            }
+        }
+        return None; // 没有匹配的规则
+    }
+
     let mut sorted_rules: Vec<&PrologRule> = rules.iter().collect();
     sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority)); // 按优先级降序排序
     

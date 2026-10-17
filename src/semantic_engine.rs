@@ -162,73 +162,74 @@ impl SemanticEngine {
 
     pub async fn get_ambiguous_entities(&self, mention: &str) -> Result<Vec<EntityCandidate>, Box<dyn std::error::Error>> {
         // 与 get_entity_knowledge / 写入方保持一致的加锁顺序：先 knowledge 后 aliases
-        let knowledge = self.entity_knowledge.read();
-        let aliases = self.entity_aliases.read();
-        let mut candidates = Vec::new();
-        
-        // 直接匹配
-        if let Some(entity_names) = aliases.get(mention) {
-            for entity_name in entity_names {
-                if let Some(entity_knowledge) = knowledge.get(entity_name) {
-                    candidates.push(EntityCandidate {
-                        entity: entity_name.clone(),
-                        weight: 100,
-                        confidence: 1.0,
-                        entity_type: entity_knowledge.tags.clone(),
-                        attributes: entity_knowledge.attributes.clone(),
-                    });
+        // 第一阶段只收集轻量评分（实体名、权重、置信度），完整知识只对最终幸存者克隆
+        let mut scored: Vec<(String, u64, f64)> = Vec::new();
+        {
+            let knowledge = self.entity_knowledge.read();
+            let aliases = self.entity_aliases.read();
+            
+            // 直接匹配
+            if let Some(entity_names) = aliases.get(mention) {
+                for entity_name in entity_names {
+                    if knowledge.contains_key(entity_name) {
+                        scored.push((entity_name.clone(), 100, 1.0));
+                    }
                 }
             }
-        }
-        
-        // 模糊匹配（使用预构建的小写别名索引，省去每次调用重复转小写）
-        let mention_lower = mention.to_lowercase();
-        let aliases_lower = self.entity_aliases_lower.read();
-        for (alias_lower, entity_names) in aliases_lower.iter() {
-            if alias_lower.contains(&mention_lower) || mention_lower.contains(alias_lower) {
-                // 相似度 > 0.6 ⟹ 长度差 < 40%；先按长度差剪枝
-                let len_a = alias_lower.chars().count();
-                let len_b = mention_lower.chars().count();
-                let max_len = len_a.max(len_b);
-                let min_len = len_a.min(len_b);
-                if max_len > 0 && (max_len - min_len) * 5 >= max_len * 2 {
-                    continue;
-                }
-                let similarity = self.calculate_string_similarity(&mention_lower, alias_lower);
-                if similarity > 0.6 {
-                    for entity_name in entity_names {
-                        if let Some(entity_knowledge) = knowledge.get(entity_name) {
-                            let weight = (similarity * 100.0) as u64;
-                            candidates.push(EntityCandidate {
-                                entity: entity_name.clone(),
-                                weight,
-                                confidence: similarity,
-                                entity_type: entity_knowledge.tags.clone(),
-                                attributes: entity_knowledge.attributes.clone(),
-                            });
+            
+            // 模糊匹配（使用预构建的小写别名索引，省去每次调用重复转小写）
+            let mention_lower = mention.to_lowercase();
+            let aliases_lower = self.entity_aliases_lower.read();
+            for (alias_lower, entity_names) in aliases_lower.iter() {
+                if alias_lower.contains(&mention_lower) || mention_lower.contains(alias_lower) {
+                    // 相似度 > 0.6 ⟹ 长度差 < 40%；先按长度差剪枝
+                    let len_a = alias_lower.chars().count();
+                    let len_b = mention_lower.chars().count();
+                    let max_len = len_a.max(len_b);
+                    let min_len = len_a.min(len_b);
+                    if max_len > 0 && (max_len - min_len) * 5 >= max_len * 2 {
+                        continue;
+                    }
+                    let similarity = self.calculate_string_similarity(&mention_lower, alias_lower);
+                    if similarity > 0.6 {
+                        for entity_name in entity_names {
+                            if knowledge.contains_key(entity_name) {
+                                let weight = (similarity * 100.0) as u64;
+                                scored.push((entity_name.clone(), weight, similarity));
+                            }
                         }
                     }
                 }
             }
         }
         
-        drop(aliases_lower);
-        drop(aliases);
-        drop(knowledge);
-        
         // 基于语义向量的匹配
-        candidates.extend(self.semantic_entity_matching(mention).await?);
+        scored.extend(self.semantic_entity_matching(mention).await?);
         
-        // 去重并排序（保留权重最高的同名实体）
-        candidates.sort_by(|a, b| b.weight.cmp(&a.weight));
+        // 去重并排序（保留权重最高的同名实体），再截断到 10 个
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
         let mut seen = HashSet::new();
-        candidates.retain(|c| seen.insert(c.entity.clone()));
-        candidates.truncate(10); // 最多返回10个候选
+        scored.retain(|c| seen.insert(c.0.clone()));
+        scored.truncate(10); // 最多返回10个候选
+        
+        let knowledge = self.entity_knowledge.read();
+        let candidates = scored
+            .into_iter()
+            .filter_map(|(entity, weight, confidence)| {
+                knowledge.get(&entity).map(|entity_knowledge| EntityCandidate {
+                    entity,
+                    weight,
+                    confidence,
+                    entity_type: entity_knowledge.tags.clone(),
+                    attributes: entity_knowledge.attributes.clone(),
+                })
+            })
+            .collect();
         
         Ok(candidates)
     }
 
-    async fn semantic_entity_matching(&self, mention: &str) -> Result<Vec<EntityCandidate>, Box<dyn std::error::Error>> {
+    async fn semantic_entity_matching(&self, mention: &str) -> Result<Vec<(String, u64, f64)>, Box<dyn std::error::Error>> {
         let mut candidates = Vec::new();
         let knowledge = self.entity_knowledge.read();
         let token_cache = self.token_cache.read();
@@ -263,13 +264,11 @@ impl SemanticEngine {
             let combined_score = (overlap_score * 0.7 + desc_similarity * 0.3).max(0.0).min(1.0);
             
             if combined_score > 0.3 {
-                candidates.push(EntityCandidate {
-                    entity: entity_name.clone(),
-                    weight: (combined_score * 80.0) as u64,
-                    confidence: combined_score,
-                    entity_type: entity_knowledge.tags.clone(),
-                    attributes: entity_knowledge.attributes.clone(),
-                });
+                candidates.push((
+                    entity_name.clone(),
+                    (combined_score * 80.0) as u64,
+                    combined_score,
+                ));
             }
         }
         
@@ -529,23 +528,20 @@ impl SemanticEngine {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：将较短字符串作为列方向
-        let chars1: Vec<char> = s1.chars().collect();
-        let chars2: Vec<char> = s2.chars().collect();
-        let (rows, cols) = if chars1.len() <= chars2.len() {
-            (chars1, chars2)
-        } else {
-            (chars2, chars1)
-        };
+        // 双行动态规划：将较短字符串作为列方向；行方向直接迭代字符，省去一份 Vec 收集
+        let len1 = s1.chars().count();
+        let len2 = s2.chars().count();
+        let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
+        let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
         
         let mut prev: Vec<usize> = (0..=col_count).collect();
         let mut curr = vec![0usize; col_count + 1];
         
-        for (i, row_char) in rows.iter().enumerate() {
+        for (i, row_char) in rows.chars().enumerate() {
             curr[0] = i + 1;
             for j in 1..=col_count {
-                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                let cost = if row_char == cols[j - 1] { 0 } else { 1 };
                 curr[j] = (prev[j] + 1)
                     .min(curr[j - 1] + 1)
                     .min(prev[j - 1] + cost);

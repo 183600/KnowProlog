@@ -90,29 +90,31 @@ impl GraphWalkEmbedding {
         }
         let forward = (predicate.to_string(), object.to_string());
         let backward = (predicate.to_string(), subject.to_string());
-        if !self
-            .neighbors
-            .entry(subject.to_string())
-            .or_default()
-            .contains(&forward)
-        {
-            self.neighbors
-                .get_mut(subject)
-                .expect("刚插入的键必然存在")
-                .push(forward);
-            self.edge_count += 1;
+        match self.neighbors.get_mut(subject) {
+            Some(list) => {
+                if !list.contains(&forward) {
+                    list.push(forward);
+                    self.edge_count += 1;
+                }
+            }
+            None => {
+                self.neighbors
+                    .insert(subject.to_string(), vec![forward]);
+                self.edge_count += 1;
+            }
         }
-        if !self
-            .neighbors
-            .entry(object.to_string())
-            .or_default()
-            .contains(&backward)
-        {
-            self.neighbors
-                .get_mut(object)
-                .expect("刚插入的键必然存在")
-                .push(backward);
-            self.edge_count += 1;
+        match self.neighbors.get_mut(object) {
+            Some(list) => {
+                if !list.contains(&backward) {
+                    list.push(backward);
+                    self.edge_count += 1;
+                }
+            }
+            None => {
+                self.neighbors
+                    .insert(object.to_string(), vec![backward]);
+                self.edge_count += 1;
+            }
         }
     }
 

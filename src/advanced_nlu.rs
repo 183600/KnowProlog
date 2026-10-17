@@ -553,23 +553,20 @@ impl AdvancedNLU {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：将较短字符串作为列方向
-        let chars1: Vec<char> = s1.chars().collect();
-        let chars2: Vec<char> = s2.chars().collect();
-        let (rows, cols) = if chars1.len() <= chars2.len() {
-            (chars1, chars2)
-        } else {
-            (chars2, chars1)
-        };
+        // 双行动态规划：将较短字符串作为列方向；行方向直接迭代字符，省去一份 Vec 收集
+        let len1 = s1.chars().count();
+        let len2 = s2.chars().count();
+        let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
+        let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
         
         let mut prev: Vec<usize> = (0..=col_count).collect();
         let mut curr = vec![0usize; col_count + 1];
         
-        for (i, row_char) in rows.iter().enumerate() {
+        for (i, row_char) in rows.chars().enumerate() {
             curr[0] = i + 1;
             for j in 1..=col_count {
-                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                let cost = if row_char == cols[j - 1] { 0 } else { 1 };
                 curr[j] = (prev[j] + 1)
                     .min(curr[j - 1] + 1)
                     .min(prev[j - 1] + cost);

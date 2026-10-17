@@ -384,14 +384,10 @@ impl OntologyAligner {
         let mut best_similarity: Option<(f64, usize)> = None;
         // 查询侧 bigram 只需计算一次，供全部候选复用
         let query_keys = Self::bigram_keys(&normalized);
-        for i in 0..self.profiles.len() {
+        let scan_end = self_idx.map_or(self.profiles.len(), |i| i + 1);
+        for i in 0..scan_end {
             if Some(i) == self_idx {
                 continue;
-            }
-            if let Some(self_i) = self_idx {
-                if i > self_i {
-                    continue;
-                }
             }
             let sim =
                 self.similarity_normalized_with_keys(&normalized, &query_keys, &self.profile_norms[i]);
@@ -416,14 +412,10 @@ impl OntologyAligner {
 
         if let Some(profile) = self_idx.map(|i| &self.profiles[i]) {
             let mut best_structural: Option<(f64, usize, Vec<String>)> = None;
-            for (i, other) in self.profiles.iter().enumerate() {
+            let structural_scan_end = self_idx.map_or(self.profiles.len(), |i| i + 1);
+            for (i, other) in self.profiles.iter().enumerate().take(structural_scan_end) {
                 if Some(i) == self_idx || other.kind != profile.kind {
                     continue;
-                }
-                if let Some(self_i) = self_idx {
-                    if i > self_i {
-                        continue;
-                    }
                 }
                 // 先只统计交集大小，胜出后再重建证据，避免为每个候选克隆邻居
                 let shared_count = profile.neighbors.intersection(&other.neighbors).count();

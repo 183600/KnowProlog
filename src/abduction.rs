@@ -724,8 +724,14 @@ impl AbductionEngine {
         // 1) 同谓词已知取值（按频次降序）
         if let Some(counts) = self.pred_objects.get(predicate.as_str()) {
             let mut values: Vec<(&String, &u64)> = counts.iter().collect();
-            values.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-            for (value, _) in values.into_iter().take(6) {
+            let cmp = |a: &(&String, &u64), b: &(&String, &u64)| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0));
+            // 只需前 6 名：部分选择代替全量排序
+            if values.len() > 6 {
+                values.select_nth_unstable_by(6, cmp);
+                values.truncate(6);
+            }
+            values.sort_by(cmp);
+            for (value, _) in values.into_iter() {
                 if seen.insert(value.clone()) {
                     candidates.push(value.clone());
                 }
@@ -757,8 +763,13 @@ impl AbductionEngine {
                     .filter(|(entity, etype)| *etype == base_type && entity.as_str() != base)
                     .map(|(entity, _)| entity)
                     .collect();
+                // 只需字典序前 5 个：部分选择代替全量排序
+                if same_type.len() > 5 {
+                    same_type.select_nth_unstable(5);
+                    same_type.truncate(5);
+                }
                 same_type.sort();
-                for entity in same_type.into_iter().take(5) {
+                for entity in same_type.into_iter() {
                     if seen.insert(entity.clone()) {
                         candidates.push(entity.clone());
                     }
@@ -778,12 +789,18 @@ impl AbductionEngine {
                     })
                     .filter(|(score, _)| *score > 0.0)
                     .collect();
-                similar.sort_by(|a, b| {
+                let cmp = |a: &(f64, &String), b: &(f64, &String)| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.1.cmp(b.1))
-                });
-                for (_, entity) in similar.into_iter().take(5) {
+                };
+                // 只需前 5 名：部分选择代替全量排序
+                if similar.len() > 5 {
+                    similar.select_nth_unstable_by(5, cmp);
+                    similar.truncate(5);
+                }
+                similar.sort_by(cmp);
+                for (_, entity) in similar.into_iter() {
                     if seen.insert(entity.clone()) {
                         candidates.push(entity.clone());
                     }
@@ -972,13 +989,14 @@ impl AbductionEngine {
         max_rounds: usize,
         max_facts: usize,
     ) -> WhatIfResult {
-        let mut simulation = engine.clone();
-        for assumption in assumptions {
-            if assumption.is_ground() {
-                simulation.add_fact_atom(assumption.clone());
-            }
-        }
-        let derived = simulation.forward_chain(max_rounds, max_facts);
+        // 假设作为额外基事实注入推导，无需克隆整个引擎
+        let ground_assumptions: Vec<Atom> = assumptions
+            .iter()
+            .filter(|assumption| assumption.is_ground())
+            .cloned()
+            .collect();
+        let derived =
+            engine.forward_chain_with_extra_facts(&ground_assumptions, max_rounds, max_facts);
         // 单遍同时构造“排除已知事实后的推导结果”和“去重后的新事实”
         let mut seen: HashSet<String> = HashSet::new();
         let mut new_facts: Vec<Atom> = Vec::new();
@@ -1060,11 +1078,20 @@ impl AbductionEngine {
 
     /// 恢复历史会话采纳的假设（跨会话临时信念）
     pub fn restore_adopted(&mut self, atoms: Vec<Atom>) {
-        for atom in atoms {
-            if !self.adopted.contains(&atom) {
-                self.adopted.push(atom);
+        if atoms.is_empty() {
+            return;
+        }
+        // 用哈希集合做成员检查，避免逐条线性扫描已采纳列表（O(n²)）
+        let mut new_atoms: Vec<Atom> = Vec::new();
+        {
+            let mut seen: HashSet<&Atom> = self.adopted.iter().collect();
+            for atom in &atoms {
+                if seen.insert(atom) {
+                    new_atoms.push(atom.clone());
+                }
             }
         }
+        self.adopted.extend(new_atoms);
     }
 
     /// 两条假设是否互斥：同一主体的功能谓词给出不同取值（不会同时为真）

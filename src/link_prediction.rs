@@ -146,10 +146,12 @@ impl LinkPredictor {
     }
 
     pub fn add_triple(&mut self, subject: &str, predicate: &str, object: &str) {
-        let triple = Triple::new(subject, predicate, object);
-        if !self.known.insert(triple.clone()) {
+        // 先走已有索引的无分配检查（与 known 等价）；重复观察时不再构造/克隆字符串
+        if self.has_triple(subject, predicate, object) {
             return;
         }
+        let triple = Triple::new(subject, predicate, object);
+        self.known.insert(triple.clone());
         self.triples.push(triple);
         self.pairs_by_pred
             .entry(predicate.to_string())

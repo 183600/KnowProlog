@@ -124,7 +124,7 @@ pub struct GradientAttribution {
 }
 
 /// 软真值传播的中间结果：候选原子 → (log-odds, 证据)
-type Beliefs = HashMap<Atom, (f64, Vec<RuleEvidence>)>;
+pub(crate) type Beliefs = HashMap<Atom, (f64, Vec<RuleEvidence>)>;
 
 pub struct MarkovLogicEngine {
     facts: HashSet<Atom>,
@@ -223,40 +223,36 @@ impl MarkovLogicEngine {
         1.0 / (1.0 + (-x.clamp(-LOG_ODDS_CLAMP, LOG_ODDS_CLAMP)).exp())
     }
 
-    /// 合并事实、"软真值 ≥ 0.5"的已推出原子与被干预原子，作为下一轮基化的论域
-    fn build_universe(
+    /// 合并事实、"软真值 ≥ 0.5"的已推出原子与被干预原子，作为下一轮基化的论域。
+    ///
+    /// 事实由 `self.facts_by_pred` 直接引用，不复制整张事实表；本函数只返回
+    /// 事实之外的补充原子（已去重、去事实重复），按谓词分组。
+    fn extra_universe(
         &self,
         derived: &HashMap<Atom, f64>,
         fixed: &HashMap<Atom, f64>,
-    ) -> HashMap<String, Vec<Atom>> {
-        let mut universe: HashMap<String, Vec<Atom>> = HashMap::new();
-        for (predicate, atoms) in &self.facts_by_pred {
-            universe
-                .entry(predicate.to_string())
-                .or_default()
-                .extend(atoms.iter().cloned());
-        }
+    ) -> HashMap<Rc<str>, Vec<Atom>> {
+        let mut extra: HashMap<Rc<str>, Vec<Atom>> = HashMap::new();
+        // 去重：同一原子可能既是事实又已被推出（或多条路径推出同一原子），
+        // 重复候选会让同一条基化规则被重复计数、人为抬高 log-odds
+        let mut seen: HashSet<&Atom> = HashSet::new();
         for (atom, truth) in derived {
-            if *truth >= 0.5 {
-                universe
-                    .entry(atom.predicate.to_string())
+            if *truth >= 0.5 && !self.facts.contains(atom) && seen.insert(atom) {
+                extra
+                    .entry(atom.predicate.clone())
                     .or_default()
                     .push(atom.clone());
             }
         }
         for atom in fixed.keys() {
-            universe
-                .entry(atom.predicate.to_string())
-                .or_default()
-                .push(atom.clone());
+            if !self.facts.contains(atom) && seen.insert(atom) {
+                extra
+                    .entry(atom.predicate.clone())
+                    .or_default()
+                    .push(atom.clone());
+            }
         }
-        // 去重：同一原子可能既是事实又已被推出（或多条路径推出同一原子），
-        // 重复候选会让同一条基化规则被重复计数、人为抬高 log-odds
-        for atoms in universe.values_mut() {
-            let mut seen: HashSet<Atom> = HashSet::new();
-            atoms.retain(|atom| seen.insert(atom.clone()));
-        }
-        universe
+        extra
     }
 
     /// 前件的软真值：被干预原子取干预值 > 事实 1.0 > 已推出原子当前软真值
@@ -281,10 +277,10 @@ impl MarkovLogicEngine {
         derived: &HashMap<Atom, f64>,
         fixed: &HashMap<Atom, f64>,
     ) -> Vec<GroundedRule> {
-        let universe = self.build_universe(derived, fixed);
+        let extra = self.extra_universe(derived, fixed);
         let mut results = Vec::new();
         for rule in &self.rules {
-            for (subst, premises) in self.ground_rule(rule, &universe) {
+            for (subst, premises) in self.ground_rule(rule, &extra) {
                 let head = apply_atom(&subst, &rule.head);
                 if !head.is_ground() {
                     continue;
@@ -352,11 +348,12 @@ impl MarkovLogicEngine {
         }
     }
 
-    /// 对规则前件做半连接基化：返回 (置换, 基化前提) 列表
+    /// 对规则前件做半连接基化：返回 (置换, 基化前提) 列表。
+    /// 论域 = 事实（引用 `facts_by_pred`）+ `extra` 中的补充原子。
     fn ground_rule(
         &self,
         rule: &WeightedRule,
-        universe: &HashMap<String, Vec<Atom>>,
+        extra: &HashMap<Rc<str>, Vec<Atom>>,
     ) -> Vec<(Substitution, Vec<Atom>)> {
         let mut results = Vec::new();
         let mut subst = Substitution::new();
@@ -366,7 +363,7 @@ impl MarkovLogicEngine {
             0,
             &mut subst,
             &mut premises,
-            universe,
+            extra,
             &mut results,
         );
         results
@@ -378,7 +375,7 @@ impl MarkovLogicEngine {
         index: usize,
         subst: &mut Substitution,
         premises: &mut Vec<Atom>,
-        universe: &HashMap<String, Vec<Atom>>,
+        extra: &HashMap<Rc<str>, Vec<Atom>>,
         results: &mut Vec<(Substitution, Vec<Atom>)>,
     ) {
         if results.len() >= self.max_groundings_per_rule {
@@ -389,9 +386,15 @@ impl MarkovLogicEngine {
             return;
         }
         let pattern = &body[index];
-        let Some(candidates) = universe.get(pattern.predicate.as_ref()) else {
+        let base = self.facts_by_pred.get(pattern.predicate.as_ref());
+        let supplement = extra.get(pattern.predicate.as_ref());
+        if base.is_none() && supplement.is_none() {
             return;
-        };
+        }
+        let candidates = base
+            .into_iter()
+            .flat_map(|atoms| atoms.iter())
+            .chain(supplement.into_iter().flat_map(|atoms| atoms.iter()));
         for candidate in candidates {
             if results.len() >= self.max_groundings_per_rule {
                 return;
@@ -401,7 +404,7 @@ impl MarkovLogicEngine {
                 let ground = apply_atom(&extended, pattern);
                 if ground.is_ground() {
                     premises.push(ground);
-                    self.ground_step(body, index + 1, &mut extended, premises, universe, results);
+                    self.ground_step(body, index + 1, &mut extended, premises, extra, results);
                     premises.pop();
                 }
             }
@@ -595,14 +598,17 @@ impl MarkovLogicEngine {
         self.infer_from_beliefs(pattern, limit, &beliefs, fixed)
     }
 
-    fn infer_from_beliefs(
+    pub(crate) fn infer_from_beliefs(
         &self,
         pattern: &Atom,
         limit: usize,
         beliefs: &Beliefs,
         fixed: &HashMap<Atom, f64>,
     ) -> Vec<SoftFact> {
-        let mut merged: HashMap<Atom, SoftFact> = HashMap::new();
+        // 先只收集轻量字段（借用证据），排序截断后才克隆证据并排序，
+        // 避免为未入选的候选复制证据列表
+        let mut merged: HashMap<&Atom, (f64, f64, Option<&Vec<RuleEvidence>>, bool)> =
+            HashMap::new();
         for fact in &self.facts {
             if !Self::atom_matches(pattern, fact) {
                 continue;
@@ -613,16 +619,7 @@ impl MarkovLogicEngine {
                     continue;
                 }
             }
-            merged.insert(
-                fact.clone(),
-                SoftFact {
-                    atom: fact.clone(),
-                    probability: 1.0,
-                    log_odds: LOG_ODDS_CLAMP,
-                    evidence: Vec::new(),
-                    from_fact: true,
-                },
-            );
+            merged.insert(fact, (1.0, LOG_ODDS_CLAMP, None, true));
         }
         for (atom, (log_odds, evidence)) in beliefs {
             if !Self::atom_matches(pattern, atom) {
@@ -632,38 +629,47 @@ impl MarkovLogicEngine {
             if probability < self.min_probability {
                 continue;
             }
-            let mut evidence = evidence.clone();
-            evidence.sort_by(|a, b| {
-                b.weight
-                    .partial_cmp(&a.weight)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.source.cmp(&b.source))
-            });
-            let entry = SoftFact {
-                atom: atom.clone(),
-                probability,
-                log_odds: *log_odds,
-                evidence,
-                from_fact: false,
-            };
-            merged
-                .entry(atom.clone())
-                .and_modify(|existing| {
-                    if entry.probability > existing.probability {
-                        *existing = entry.clone();
-                    }
-                })
-                .or_insert(entry);
+            match merged.get_mut(atom) {
+                Some(existing) if probability > existing.0 => {
+                    *existing = (probability, *log_odds, Some(evidence), false);
+                }
+                Some(_) => {}
+                None => {
+                    merged.insert(atom, (probability, *log_odds, Some(evidence), false));
+                }
+            }
         }
-        let mut results: Vec<SoftFact> = merged.into_values().collect();
-        results.sort_by(|a, b| {
-            b.probability
-                .partial_cmp(&a.probability)
+        let mut entries: Vec<(&Atom, f64, f64, Option<&Vec<RuleEvidence>>, bool)> = merged
+            .into_iter()
+            .map(|(atom, (probability, log_odds, evidence, from_fact))| {
+                (atom, probability, log_odds, evidence, from_fact)
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+                .then_with(|| a.0.display().cmp(&b.0.display()))
         });
-        results.truncate(limit.max(1));
-        results
+        entries.truncate(limit.max(1));
+        entries
+            .into_iter()
+            .map(|(atom, probability, log_odds, evidence, from_fact)| {
+                let mut evidence = evidence.cloned().unwrap_or_default();
+                evidence.sort_by(|a, b| {
+                    b.weight
+                        .partial_cmp(&a.weight)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.source.cmp(&b.source))
+                });
+                SoftFact {
+                    atom: atom.clone(),
+                    probability,
+                    log_odds,
+                    evidence,
+                    from_fact,
+                }
+            })
+            .collect()
     }
 
     /// 全部规则头模式的软预测（用于"我来推测一下"式全局展示）
@@ -718,28 +724,22 @@ impl MarkovLogicEngine {
             return Vec::new();
         }
         let candidate_set: HashSet<Atom> = candidates.iter().cloned().collect();
-        // MAP 论域 = 事实 + 候选原子（候选原子无论当前真值都参与基化）
-        let mut universe: HashMap<String, Vec<Atom>> = HashMap::new();
-        for (predicate, atoms) in &self.facts_by_pred {
-            universe
-                .entry(predicate.to_string())
-                .or_default()
-                .extend(atoms.iter().cloned());
-        }
+        // MAP 论域 = 事实 + 候选原子（候选原子无论当前真值都参与基化）。
+        // 事实直接引用 self.facts_by_pred，仅对候选补充原子去重建表。
+        let mut extra: HashMap<Rc<str>, Vec<Atom>> = HashMap::new();
+        let mut seen: HashSet<&Atom> = HashSet::new();
         for atom in &candidate_set {
-            universe
-                .entry(atom.predicate.to_string())
-                .or_default()
-                .push(atom.clone());
-        }
-        for atoms in universe.values_mut() {
-            let mut seen: HashSet<Atom> = HashSet::new();
-            atoms.retain(|atom| seen.insert(atom.clone()));
+            if !self.facts.contains(atom) && seen.insert(atom) {
+                extra
+                    .entry(atom.predicate.clone())
+                    .or_default()
+                    .push(atom.clone());
+            }
         }
         // 基化所有规则（用候选集合补齐论域中的原子）
         let mut ground_rules: Vec<(f64, Vec<Atom>, Atom)> = Vec::new();
         for rule in &self.rules {
-            for (subst, premises) in self.ground_rule(rule, &universe) {
+            for (subst, premises) in self.ground_rule(rule, &extra) {
                 let head = apply_atom(&subst, &rule.head);
                 if head.is_ground() {
                     ground_rules.push((rule.weight, premises, head));

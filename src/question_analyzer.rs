@@ -337,12 +337,18 @@ impl QuestionAnalyzer {
     }
 
     fn normalize_question(&self, question: &str) -> String {
-        question.trim()
-            .replace("？", "?")
-            .replace("！", "!")
-            .replace("，", ",")
-            .replace("。", ".")
-            .to_string()
+        // 四个源字符与替换字符互不相同，可单遍映射，避免四次整体分配
+        question
+            .trim()
+            .chars()
+            .map(|ch| match ch {
+                '？' => '?',
+                '！' => '!',
+                '，' => ',',
+                '。' => '.',
+                other => other,
+            })
+            .collect()
     }
 
     async fn identify_question_type(&self, question: &str) -> Result<QuestionType, Box<dyn std::error::Error + Send + Sync>> {

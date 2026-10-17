@@ -467,18 +467,41 @@ impl SimilarityCalculator {
         let chars1: Vec<char> = text1.chars().collect();
         let chars2: Vec<char> = text2.chars().collect();
         
-        let bigram_sim = self.calculate_ngram_set_similarity(
-            &Self::ngrams_from_chars(&chars1, 2),
-            &Self::ngrams_from_chars(&chars2, 2),
+        let bigram_sim = Self::calculate_ngram_set_similarity(
+            &Self::bigrams_from_chars(&chars1),
+            &Self::bigrams_from_chars(&chars2),
         );
-        let trigram_sim = self.calculate_ngram_set_similarity(
-            &Self::ngrams_from_chars(&chars1, 3),
-            &Self::ngrams_from_chars(&chars2, 3),
+        let trigram_sim = Self::calculate_ngram_set_similarity(
+            &Self::trigrams_from_chars(&chars1),
+            &Self::trigrams_from_chars(&chars2),
         );
         
         (bigram_sim + trigram_sim) / 2.0
     }
 
+    /// 二元组集合：用 (char, char) 作为键，避免为每个 n-gram 分配 String
+    fn bigrams_from_chars(chars: &[char]) -> HashSet<(char, char)> {
+        let mut ngrams = HashSet::new();
+        if chars.len() >= 2 {
+            for window in chars.windows(2) {
+                ngrams.insert((window[0], window[1]));
+            }
+        }
+        ngrams
+    }
+
+    /// 三元组集合：用 (char, char, char) 作为键，避免为每个 n-gram 分配 String
+    fn trigrams_from_chars(chars: &[char]) -> HashSet<(char, char, char)> {
+        let mut ngrams = HashSet::new();
+        if chars.len() >= 3 {
+            for window in chars.windows(3) {
+                ngrams.insert((window[0], window[1], window[2]));
+            }
+        }
+        ngrams
+    }
+
+    #[cfg(test)]
     fn ngrams_from_chars(chars: &[char], n: usize) -> HashSet<String> {
         let mut ngrams = HashSet::new();
         
@@ -498,7 +521,10 @@ impl SimilarityCalculator {
         Self::ngrams_from_chars(&chars, n)
     }
 
-    fn calculate_ngram_set_similarity(&self, set1: &HashSet<String>, set2: &HashSet<String>) -> f64 {
+    fn calculate_ngram_set_similarity<T: std::hash::Hash + Eq>(
+        set1: &HashSet<T>,
+        set2: &HashSet<T>,
+    ) -> f64 {
         let intersection = set1.intersection(set2).count();
         let union = set1.union(set2).count();
         

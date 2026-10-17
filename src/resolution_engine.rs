@@ -533,10 +533,34 @@ impl ResolutionEngine {
         out
     }
 
-    /// 前向半朴素饱和：从事实出发反复应用子句，推导新基事实（含前提来源）
+    /// 前向半朴素饱和：从事实出发反复应用子句，推导新基事实（含前提来源）。
+    /// 事实直接引用 `self.facts`/`self.facts_by_pred`，只维护新推出的事实，
+    /// 避免每次调用都深拷贝整张事实表。
     pub fn forward_chain(&self, max_rounds: usize, max_new_facts: usize) -> Vec<DerivedFact> {
-        let mut known: HashSet<Atom> = self.facts.clone();
-        let mut known_by_pred: HashMap<Rc<str>, Vec<Atom>> = self.facts_by_pred.clone();
+        self.forward_chain_with_extra_facts(&[], max_rounds, max_new_facts)
+    }
+
+    /// 与 `forward_chain` 相同，但把 `extra_facts` 当作额外基事实参与推导
+    /// （用于反事实模拟：不修改自身即可注入假设）
+    pub(crate) fn forward_chain_with_extra_facts(
+        &self,
+        extra_facts: &[Atom],
+        max_rounds: usize,
+        max_new_facts: usize,
+    ) -> Vec<DerivedFact> {
+        let mut derived_known: HashSet<Atom> = HashSet::new();
+        let mut derived_by_pred: HashMap<Rc<str>, Vec<Atom>> = HashMap::new();
+        for atom in extra_facts {
+            if !atom.is_ground() || self.facts.contains(atom) {
+                continue;
+            }
+            if derived_known.insert(atom.clone()) {
+                derived_by_pred
+                    .entry(atom.predicate.clone())
+                    .or_default()
+                    .push(atom.clone());
+            }
+        }
         // 基事实未记录置信度时按 1.0 处理（与显式预填 1.0 等价），无需预先复制整张事实表
         let mut confidence_of: HashMap<Atom, f64> = HashMap::new();
         let mut derived: Vec<DerivedFact> = Vec::new();
@@ -549,9 +573,12 @@ impl ResolutionEngine {
                 let tag = counter;
                 counter += 1;
                 let fresh = freshen_clause(clause, tag);
-                for (subst, premises) in self.match_body(&fresh.body, &known_by_pred) {
+                for (subst, premises) in self.match_body(&fresh.body, &derived_by_pred) {
                     let head = apply_atom(&subst, &fresh.head);
-                    if !head.is_ground() || known.contains(&head) {
+                    if !head.is_ground()
+                        || self.facts.contains(&head)
+                        || derived_known.contains(&head)
+                    {
                         continue;
                     }
                     if !new_this_round_atoms.insert(head.clone()) {
@@ -577,8 +604,8 @@ impl ResolutionEngine {
                 }
             }
             for item in &new_this_round {
-                known.insert(item.atom.clone());
-                known_by_pred
+                derived_known.insert(item.atom.clone());
+                derived_by_pred
                     .entry(item.atom.predicate.clone())
                     .or_default()
                     .push(item.atom.clone());
@@ -595,16 +622,22 @@ impl ResolutionEngine {
     fn match_body(
         &self,
         goals: &[Atom],
-        known_by_pred: &HashMap<Rc<str>, Vec<Atom>>,
+        derived_by_pred: &HashMap<Rc<str>, Vec<Atom>>,
     ) -> Vec<(Substitution, Vec<Atom>)> {
         let mut states: Vec<(Substitution, Vec<Atom>)> = vec![(Substitution::new(), Vec::new())];
         for goal in goals {
             let mut next: Vec<(Substitution, Vec<Atom>)> = Vec::new();
             for (subst, premises) in &states {
                 let applied = apply_atom(subst, goal);
-                let Some(facts) = known_by_pred.get(&applied.predicate) else {
+                let base = self.facts_by_pred.get(&applied.predicate);
+                let derived_extra = derived_by_pred.get(&applied.predicate);
+                if base.is_none() && derived_extra.is_none() {
                     continue;
-                };
+                }
+                let facts = base
+                    .into_iter()
+                    .flat_map(|facts| facts.iter())
+                    .chain(derived_extra.into_iter().flat_map(|facts| facts.iter()));
                 for fact in facts {
                     if fact.arity() != applied.arity() {
                         continue;

@@ -2072,9 +2072,9 @@ impl SymbolicReasoner {
         for predicate in predicates {
             let mut next_frontier: Vec<String> = Vec::new();
             let mut round_hits: Vec<ValueHit> = Vec::new();
-            // 多个分支可能命中同一实体，边收集边去重，保留首次出现顺序
+            // 多个分支可能命中同一实体，边收集边去重：两个集合插入条件相同，
+            // 合并为一个即可（保留首次出现顺序）
             let mut seen_values: HashSet<String> = HashSet::new();
-            let mut seen_hit_values: HashSet<String> = HashSet::new();
             for node in &frontier {
                 let hits = self.node_hits(node, predicate);
                 if hits.is_empty() {
@@ -2083,8 +2083,6 @@ impl SymbolicReasoner {
                 for hit in &hits {
                     if seen_values.insert(hit.value.clone()) {
                         next_frontier.push(hit.value.clone());
-                    }
-                    if seen_hit_values.insert(hit.value.clone()) {
                         round_hits.push(hit.clone());
                     }
                 }
@@ -2423,9 +2421,11 @@ impl SymbolicReasoner {
         let mut evidence: Vec<String> = Vec::new();
         if self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
+            // 用哈希集合做成员检查，避免预测循环中的线性扫描
+            let mut seen_subjects: HashSet<String> = subjects.iter().cloned().collect();
             for prediction in self.predictor.predict_for_entity(&object, Some(&predicate), limit) {
                 if prediction.triple.object == object && prediction.triple.subject != object {
-                    if !subjects.contains(&prediction.triple.subject) {
+                    if seen_subjects.insert(prediction.triple.subject.clone()) {
                         subjects.push(prediction.triple.subject.clone());
                     }
                     evidence.push(self.predictor.explain(&prediction));
@@ -3066,9 +3066,23 @@ impl SymbolicReasoner {
         }
         let mut deltas: Vec<CounterfactualDelta> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        // 事实世界与干预世界的软真值传播只做一次，供所有探测点复用
+        let mut fixed = HashMap::new();
+        fixed.insert(intervention.clone(), if value { 1.0 } else { 0.0 });
+        let factual_beliefs = self.soft.propagate_with_fixed(&HashMap::new());
+        let counterfactual_beliefs = self.soft.propagate_with_fixed(&fixed);
         for probe in probes.iter().take(6) {
             for delta in analyzer
-                .counterfactual(&self.soft, probe, &intervention, value, 4)
+                .counterfactual_from_beliefs(
+                    &self.soft,
+                    &factual_beliefs,
+                    &counterfactual_beliefs,
+                    &fixed,
+                    probe,
+                    &intervention,
+                    value,
+                    4,
+                )
                 .deltas
             {
                 if seen.insert(delta.atom.display()) {

@@ -283,12 +283,17 @@ impl SymbolicEmbedding {
             })
             .filter(|(_, score)| score.is_finite())
             .collect();
-        scored.sort_by(|x, y| {
+        let cmp = |x: &(String, f64), y: &(String, f64)| {
             y.1.partial_cmp(&x.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| x.0.cmp(&y.0))
-        });
-        scored.truncate(k);
+        };
+        // 全序（分数+名称唯一）下先划分 top-k 再排序，与全排序截断等价
+        if scored.len() > k {
+            scored.select_nth_unstable_by(k, cmp);
+            scored.truncate(k);
+        }
+        scored.sort_by(cmp);
         scored
     }
 

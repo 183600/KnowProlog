@@ -735,10 +735,18 @@ impl ProblogEngine {
                 }
             }
             let mut added = false;
+            // 与 universe 同步的成员集合（按谓词惰性构建），避免对新增头逐个线性扫描
+            let mut universe_sets: HashMap<String, HashSet<Atom>> = HashMap::new();
             for head in new_heads {
-                let entry = universe.entry(head.predicate.to_string()).or_default();
-                if !entry.contains(&head) {
-                    entry.push(head);
+                let predicate = head.predicate.to_string();
+                let known = universe_sets.entry(predicate.clone()).or_insert_with(|| {
+                    universe
+                        .get(&predicate)
+                        .map(|atoms| atoms.iter().cloned().collect())
+                        .unwrap_or_default()
+                });
+                if known.insert(head.clone()) {
+                    universe.entry(predicate).or_default().push(head);
                     added = true;
                 }
             }
