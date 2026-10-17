@@ -76,7 +76,7 @@ impl PrologEngine {
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
         println!("Loading {} Prolog facts", facts.len());
 
-        // 快路径：事实集与加载顺序都未变化时无需排序（排序本身 O(n log n)）
+        // 事实集与加载顺序都未变化时无需排序
         if facts == self.loaded_facts {
             return;
         }
@@ -366,7 +366,7 @@ impl PrologEngine {
 
 /// 转义 Prolog 单引号原子中的特殊字符，避免名称里的引号/反斜杠破坏事实或查询语法
 fn escape_atom(text: &str) -> std::borrow::Cow<'_, str> {
-    // 常见情况无需转义：借用原字符串，避免每步都分配
+    // 常见情况无需转义：直接借用原字符串
     if !text
         .as_bytes()
         .iter()

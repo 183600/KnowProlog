@@ -60,7 +60,7 @@ impl SymbolicEmbedding {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             return;
         }
-        // 复用同一个缓冲区构造特征名，避免每次 format! 的额外分配
+        // 复用同一个缓冲区构造特征名
         let mut feature = String::with_capacity(predicate.len() + 3);
         feature.push_str(predicate);
         feature.push('→');
@@ -93,7 +93,7 @@ impl SymbolicEmbedding {
     }
 
     fn add_feature(&mut self, entity: &str, feature: &str) {
-        // 已存在的热点路径直接自增，避免为 entry 键重复分配 String
+        // 已存在的键直接自增
         match self.counts.get_mut(entity).and_then(|map| map.get_mut(feature)) {
             Some(count) => *count += 1.0,
             None => {
@@ -133,7 +133,7 @@ impl SymbolicEmbedding {
             if mass <= 0.0 || total <= 0.0 {
                 continue;
             }
-            // 先用借用排序并截断，只为最终保留的特征克隆名称
+            // 排序截断后克隆保留的特征名称
             let mut weights: Vec<(&str, f64)> = Vec::with_capacity(features.len());
             for (feature, count) in features {
                 let feature_total = self.feature_totals.get(feature).copied().unwrap_or(0.0);
@@ -216,7 +216,7 @@ impl SymbolicEmbedding {
     }
 
     pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
-        // 直接复用源实体向量
+        // 使用源实体向量
         let Some(va) = self.vectors.get(entity) else {
             return Vec::new();
         };
@@ -232,13 +232,13 @@ impl SymbolicEmbedding {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.0.cmp(b.0))
         };
-        // 全序（分数+名称唯一）下先划分 top-k 再排序，与全排序截断等价
+        // 全序（分数+名称唯一）下先划分 top-k 再排序
         if neighbors.len() > k {
             neighbors.select_nth_unstable_by(k, cmp);
             neighbors.truncate(k);
         }
         neighbors.sort_by(cmp);
-        // 只为最终保留的邻居克隆名称
+        // 克隆最终保留的邻居名称
         neighbors
             .into_iter()
             .map(|(name, score)| (name.to_string(), score))
@@ -292,13 +292,13 @@ impl SymbolicEmbedding {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| x.0.cmp(y.0))
         };
-        // 全序（分数+名称唯一）下先划分 top-k 再排序，与全排序截断等价
+        // 全序（分数+名称唯一）下先划分 top-k 再排序
         if scored.len() > k {
             scored.select_nth_unstable_by(k, cmp);
             scored.truncate(k);
         }
         scored.sort_by(cmp);
-        // 只为最终保留的类比项克隆名称
+        // 克隆最终保留的类比项名称
         scored
             .into_iter()
             .map(|(name, score)| (name.to_string(), score))

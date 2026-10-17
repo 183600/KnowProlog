@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 pub const OWNTHINK_BASE_URL: &str = "https://api.ownthink.com/kg";
 
-/// 复用同一个连接池与 TLS 上下文；`reqwest::Client` 克隆开销极低
+/// 复用同一个连接池与 TLS 上下文。
 fn shared_http_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new).clone()

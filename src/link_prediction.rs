@@ -144,7 +144,7 @@ impl LinkPredictor {
     }
 
     pub fn add_triple(&mut self, subject: &str, predicate: &str, object: &str) {
-        // 先走已有索引的无分配检查（与 known 等价）；重复观察时不再构造/克隆字符串
+        // 已存在的三元组直接跳过
         if self.has_triple(subject, predicate, object) {
             return;
         }
@@ -175,7 +175,7 @@ impl LinkPredictor {
     }
 
     pub fn has_triple(&self, subject: &str, predicate: &str, object: &str) -> bool {
-        // 与 known 等价：add_triple 同时写入 known 与 out_edges 且首个写入去重
+        // out_edges 索引即事实集（add_triple 写入时已去重）
         self.out_edges
             .get(predicate)
             .and_then(|by_subject| by_subject.get(subject))
@@ -198,7 +198,7 @@ impl LinkPredictor {
         let Some(by_subject) = self.out_edges.get(predicate) else {
             return false;
         };
-        // 无需构建反向集合：反向对 (b,a) 存在 ⟺ by_subject[b] 含 a
+        // 反向对 (b,a) 存在 ⟺ by_subject[b] 含 a
         let mutual = pairs
             .iter()
             .filter(|(a, b)| by_subject.get(b).map_or(false, |objects| objects.contains(a)))
@@ -326,7 +326,7 @@ impl LinkPredictor {
         } else {
             support as f64 / head_pairs.len() as f64
         };
-        // 只有通过全部过滤的规则才克隆体部/头部名称
+        // 通过全部过滤后克隆体部/头部名称
         Some(HornRule {
             template,
             body: body.iter().map(|name| name.to_string()).collect(),
@@ -362,7 +362,7 @@ impl LinkPredictor {
                 }
 
                 if let Some(body) = self.compose_body_pairs(p1, p2) {
-                    // 支撑量不可能超过体部对数：先剪掉不足阈值的体部，避免整轮头部枚举
+                    // 支撑量不可能超过体部对数：先剪掉不足阈值的体部
                     if body.len() >= min_support {
                         let body_names = [p1.as_str(), p2.as_str()];
                         for p3 in &predicates {
@@ -444,7 +444,7 @@ impl LinkPredictor {
     where
         F: FnOnce(&Triple) -> bool,
     {
-        // 与已删除的 known 集合等价：out_edges 索引即事实集
+        // out_edges 索引即事实集
         if self.has_triple(&triple.subject, &triple.predicate, &triple.object)
             || !seen.insert(triple.clone())
         {
@@ -659,8 +659,7 @@ impl LinkPredictor {
     }
 
     /// 只保留排序最靠前的 `limit` 个候选，再对保留部分排序。
-    /// 比较键是包含枚举序的全序，因此结果与"全量稳定排序后截断"完全一致，
-    /// 但避免了为截断而排序全部候选的开销。
+    /// 比较键是包含枚举序的全序，结果与"全量稳定排序后截断"一致。
     fn top_candidates(candidates: &mut Vec<Candidate>, limit: usize) {
         if limit < candidates.len() {
             candidates.select_nth_unstable_by(limit, Self::compare_candidates);

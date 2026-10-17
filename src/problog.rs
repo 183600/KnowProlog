@@ -30,7 +30,7 @@ const TRUE_NODE: u32 = 1;
 const FALSE_NODE: u32 = 0;
 const TERMINAL_VAR: u32 = u32::MAX;
 
-/// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
+/// 概率降序、同概率按显示串升序的排序键
 #[derive(PartialEq)]
 struct ProbabilityDisplayKey {
     probability: f64,
@@ -636,8 +636,7 @@ impl ProblogEngine {
         });
         answers.truncate(limit.max(1));
 
-        // 排序与截断只依赖概率与原子显示名，证明可在截断后仅为保留的答案补算，
-        // 避免为被丢弃的答案做昂贵的证明搜索
+        // 排序与截断只依赖概率与原子显示名，证明在截断后仅为保留的答案补算。
         for answer in &mut answers {
             if answer.from_fact {
                 // 确定事实不携带证明；概率事实沿用上限 2 的证明
@@ -826,7 +825,7 @@ impl ProblogEngine {
                 }
             }
             let mut added = false;
-            // 与 universe 同步的成员集合（按谓词惰性构建），避免对新增头逐个线性扫描
+            // 与 universe 同步的成员集合（按谓词惰性构建）
             let mut universe_sets: HashMap<String, HashSet<Atom>> = HashMap::new();
             for head in new_heads {
                 let predicate = head.predicate.to_string();
@@ -951,7 +950,7 @@ impl ProblogEngine {
 }
 
 fn push_universe(universe: &mut HashMap<String, Vec<Atom>>, atom: &Atom) {
-    // 已有同谓词桶时直接复用，避免为每个原子重复分配谓词字符串
+    // 已有同谓词桶时直接复用
     match universe.get_mut(atom.predicate.as_ref()) {
         Some(atoms) => atoms.push(atom.clone()),
         None => {

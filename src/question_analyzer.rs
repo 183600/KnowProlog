@@ -337,7 +337,7 @@ impl QuestionAnalyzer {
     }
 
     fn normalize_question(&self, question: &str) -> String {
-        // 四个源字符与替换字符互不相同，可单遍映射，避免四次整体分配
+        // 四个源字符与替换字符互不相同，可单遍映射
         question
             .trim()
             .chars()
@@ -387,7 +387,7 @@ impl QuestionAnalyzer {
             *scores.entry(QuestionType::ProcessDescription).or_insert(0.0) += 0.8;
         }
         
-        // 选择得分最高的类型；同分时按类型名字典序固定选择，避免 HashMap 迭代顺序导致结果不稳定
+        // 选择得分最高的类型；同分时按类型名字典序固定选择
         Ok(deterministic_max(scores, QuestionType::FactualQuery))
     }
 
@@ -537,13 +537,11 @@ impl Default for QuestionAnalyzer {
     }
 }
 
-/// 从打分表中选择得分最高的项；同分时按类型名的字典序固定选择，
-/// 避免 HashMap 随机迭代顺序让同一问题在不同进程得到不同的分类结果。
+/// 从打分表中选择得分最高的项；同分时按类型名的字典序固定选择。
 fn deterministic_max<T: std::fmt::Debug>(scores: HashMap<T, f64>, fallback: T) -> T {
     scores
         .into_iter()
         .filter(|(_, score)| *score > 0.0)
-        // 每个候选的类型名只格式化一次，避免比较器内反复分配
         .map(|(value, score)| {
             let name = format!("{:?}", value);
             (value, score, name)

@@ -1511,8 +1511,8 @@ mod tests {
         let again = arbiter.contrast_statement("李四的国籍是德国", &reasoner);
         assert!(again.distributional.blocked);
         assert!(!again.distributional.supported);
-        // 第 2 轮强化：否认同时进入符号通道成为会话级否证，
-        // 因此不再是"双通道未知"，而是"双通道一致否定"
+        // 否认同时进入符号通道成为会话级否证，
+        // 因此不是"双通道未知"，而是"双通道一致否定"
         assert!(again.symbolic.contradicted);
         assert_eq!(again.verdict, ContrastVerdict::Agree);
         assert!(again.answer.contains("不成立"));

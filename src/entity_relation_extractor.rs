@@ -456,7 +456,7 @@ impl EntityRelationExtractor {
     async fn extract_entities_by_type(&self, sentence: &str, words: &[&str], word_offsets: &[usize], type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
-        // 上下文关键词命中数与匹配文本无关，每种类型对整句只统计一次
+        // 上下文关键词命中数与匹配文本无关
         let keyword_hits = entity_type
             .context_keywords
             .iter()
@@ -499,7 +499,7 @@ impl EntityRelationExtractor {
     async fn extract_by_context_keywords(&self, words: &[&str], word_offsets: &[usize], type_name: &str, entity_type: &EntityType, sentence_id: usize) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
-        // 关键词集合与已产出的词索引，避免重复扫描与重复产出
+        // 关键词集合与已产出的词索引
         let keyword_set: HashSet<&str> = entity_type
             .context_keywords
             .iter()
@@ -908,7 +908,7 @@ impl EntityRelationExtractor {
 
     async fn link_and_normalize_entities(&self, entities: Vec<EntityExtraction>) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut linked_entities = Vec::with_capacity(entities.len());
-        // 一次性持有类型表读锁，避免逐实体重复加锁
+        // 一次性持有类型表读锁
         let entity_types = self.entity_types.read();
 
         for mut entity in entities {
@@ -936,7 +936,7 @@ impl EntityRelationExtractor {
         
         match entity_type {
             "PERSON" => {
-                // 人名规范化：去除称谓（无匹配时不产生新分配）
+                // 人名规范化：去除称谓
                 let titles = ["先生", "女士", "老师", "教授", "博士"];
                 let mut result = normalized;
                 for title in &titles {
@@ -961,7 +961,7 @@ impl EntityRelationExtractor {
     async fn validate_relations(&self, relations: Vec<KnowledgeTriple>, entities: &[EntityExtraction]) -> Result<Vec<KnowledgeTriple>, Box<dyn std::error::Error>> {
         let mut validated_relations = Vec::new();
         let entity_names: HashSet<_> = entities.iter().map(|e| &e.entity).collect();
-        // 名称 → 类型（首个匹配优先），把逐关系线性查找变成 O(1)
+        // 名称 → 类型（首个匹配优先）
         let mut entity_type_of: HashMap<&str, &str> = HashMap::new();
         for entity in entities {
             entity_type_of

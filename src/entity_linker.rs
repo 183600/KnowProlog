@@ -60,7 +60,7 @@ pub struct EntityLinker {
     profiles: HashMap<String, EntityProfile>,
     surface_candidates: HashMap<String, Vec<String>>,
     // 表层名及其字符序列，按首字符分桶；桶内保持（长度降序、字典序升序），
-    // 注册期维护，精确匹配时无需每次重建索引
+    // 注册期维护
     surfaces_by_first: HashMap<char, Vec<(String, Vec<char>)>>,
     neighbors: HashMap<String, HashSet<String>>,
     out_predicates: HashMap<String, HashMap<String, usize>>,
@@ -74,7 +74,6 @@ const MAX_CANDIDATES_PER_MENTION: usize = 3;
 
 #[inline]
 fn is_segment_delimiter(ch: char) -> bool {
-    // 与旧版 `SEGMENT_DELIMITERS.contains(&ch)` 等价，但编译为直接比较而非线性扫描
     matches!(
         ch,
         '的' | '是'
@@ -192,7 +191,7 @@ impl EntityLinker {
             profile.degree += 1;
             match self.neighbors.get_mut(name) {
                 Some(neighbors) => {
-                    // 先借用检查，避免对已存在的邻居重复分配 String
+                    // 先借用检查
                     if !neighbors.contains(other) {
                         neighbors.insert(other.to_string());
                     }
@@ -630,7 +629,7 @@ fn similarity_upper_bound(
     upper
 }
 
-// 与 dice_similarity 完全同值，但复用已预计算的指称字符集合与实体画像特征集合
+// 使用已预计算的指称字符集合与实体画像特征集合
 fn dice_similarity_precomputed(
     trimmed: &str,
     trimmed_chars: &[char],

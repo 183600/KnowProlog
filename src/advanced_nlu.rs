@@ -407,7 +407,7 @@ impl AdvancedNLU {
         // 去除多余空白字符
         let mut normalized = query.trim().to_string();
 
-        // 统一标点符号（仅在确有需要时分配新字符串）
+        // 统一标点符号
         if normalized.contains('？') {
             normalized = normalized.replace('？', "?");
         }
@@ -423,7 +423,7 @@ impl AdvancedNLU {
         let mut best_intent = "unknown".to_string();
         let mut best_confidence = 0.0;
         
-        // 分词（词长一次算好，供全部模式复用）
+        // 分词
         let query_words: Vec<(&str, usize)> = self
             .jieba
             .cut(query, false)
@@ -490,7 +490,7 @@ impl AdvancedNLU {
             intent_scores.insert("count_query".to_string(), 0.6);
         }
         
-        // 同分时按意图名字典序打破平局，避免 HashMap 迭代顺序导致结果不可复现
+        // 同分时按意图名字典序打破平局
         let best = intent_scores.into_iter()
             .max_by(|a, b| {
                 a.1.partial_cmp(&b.1)
@@ -512,7 +512,6 @@ impl AdvancedNLU {
             .filter(|word| !word.starts_with('(') || !word.ends_with(')'))
         {
             total += 1;
-            // 模式词长度只算一次，供与该模式下所有查询词的比较复用
             let pattern_len = pattern_word.chars().count();
             for (query_word, query_len) in query_words {
                 if pattern_word == *query_word
@@ -536,8 +535,8 @@ impl AdvancedNLU {
         }
     }
 
-    /// 与 `calculate_word_similarity(...) > 0.8` 完全等价；
-    /// 先用长度差下界剪枝（编辑距离 ≥ 长度差），避免无谓的 DP 分配
+    /// 判定相似度是否大于 0.8；
+    /// 先用长度差下界剪枝（编辑距离 ≥ 长度差）
     fn words_similarity_above_08_with_lens(
         &self,
         word1: &str,
@@ -583,7 +582,7 @@ impl AdvancedNLU {
     }
 
     fn levenshtein_distance_with_lens(&self, s1: &str, len1: usize, s2: &str, len2: usize) -> usize {
-        // 双行动态规划：将较短字符串作为列方向；行方向直接迭代字符，省去一份 Vec 收集
+        // 双行动态规划：较短字符串作为列方向，行方向逐字符迭代
         let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
         let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
@@ -609,7 +608,7 @@ impl AdvancedNLU {
         let mut entities = Vec::new();
         {
             let entity_patterns = self.entity_patterns.read();
-            // 按类型名排序后抽取，重叠实体的取舍不依赖 HashMap 迭代顺序
+            // 按类型名排序后抽取
             let mut entity_types: Vec<&String> = entity_patterns.keys().collect();
             entity_types.sort();
             for entity_type in entity_types {
@@ -999,8 +998,7 @@ impl AdvancedNLU {
     async fn determine_domain(&self, query: &str, entities: &[ExtractedEntity]) -> Result<String, Box<dyn std::error::Error>> {
         let domain_keywords = &self.domain_keywords;
         
-        // 命中关键词最多的领域胜出；同分按领域名字典序打破平局，
-        // 避免 HashMap 迭代顺序导致同一查询得到不同领域
+        // 命中关键词最多的领域胜出；同分按领域名字典序打破平局
         let mut best: Option<(&String, usize)> = None;
         for (domain, keywords) in domain_keywords.iter() {
             let hits = keywords
@@ -1072,7 +1070,6 @@ impl AdvancedNLU {
     }
 
     async fn extract_modifiers(&self, query: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        // 数组字面量直接在栈上迭代，避免每次调用堆分配 Vec
         let modifiers = [
             "最", "更", "非常", "特别", "很", "极其", "相当", "十分", "比较", "稍微", "略", "大概", "大约", "可能", "也许", "或许", "一定", "肯定", "必须", "应该", "需要"
         ];

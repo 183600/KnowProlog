@@ -22,7 +22,7 @@ pub const DEFAULT_MAX_CAUSAL_DEPTH: usize = 4;
 /// 单次查询最多枚举的简单路径数
 const MAX_PATHS_PER_QUERY: usize = 64;
 
-/// 强度降序、同强度按渲染串升序的排序键：预先算好避免比较器里重复渲染
+/// 强度降序、同强度按渲染串升序的排序键
 #[derive(PartialEq)]
 struct StrengthRenderKey {
     strength: f64,
@@ -417,7 +417,7 @@ impl CausalAnalyzer {
         }
     }
 
-    /// 与 `from_engine` 相同，但复用调用方已算好的概率视图（省去重复的软真值传播）
+    /// 使用调用方已算好的概率视图
     pub fn from_engine_with_probabilities(
         engine: &MarkovLogicEngine,
         probabilities: &HashMap<Atom, f64>,
@@ -450,7 +450,7 @@ impl CausalAnalyzer {
         self.explain_with_probabilities(engine, &probabilities, target, max_chains)
     }
 
-    /// 与 `explain` 相同，但概率视图由调用方提供，可跨多个目标复用
+    /// 概率视图由调用方提供，可跨多个目标使用
     pub fn explain_with_probabilities(
         &self,
         engine: &MarkovLogicEngine,
@@ -528,7 +528,7 @@ impl CausalAnalyzer {
     }
 
     /// 与 `counterfactual` 相同，但两个世界的软真值信念由调用方提供，
-    /// 供多个效应探测点复用同一批传播结果
+    /// 多个效应探测点使用同一批传播结果
     pub fn counterfactual_from_beliefs(
         &self,
         engine: &MarkovLogicEngine,

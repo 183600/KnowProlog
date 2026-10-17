@@ -433,7 +433,7 @@ impl AbductionEngine {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             return;
         }
-        // 已存在的计数直接自增，避免为 map 键重复分配 String（重复观察是热路径）
+        // 已存在的计数直接自增
         match self
             .pred_objects
             .get_mut(predicate)
@@ -493,7 +493,7 @@ impl AbductionEngine {
             .and_then(|subjects| subjects.get_mut(subject))
         {
             Some(objects) => {
-                // HashSet 的 insert 需要所有权：先借用检查可避免重复分配
+                // HashSet 的 insert 需要所有权：先做借用检查
                 if !objects.contains(object) {
                     objects.insert(object.to_string());
                 }
@@ -508,7 +508,7 @@ impl AbductionEngine {
             }
         }
 
-        // 特征串用可复用缓冲构造：重复观察时仅做借用检查，不重复分配
+        // 特征串用可复用缓冲构造
         let mut feature = String::with_capacity(predicate.len() + subject.len() + object.len() + 4);
         feature.push_str("出:");
         feature.push_str(predicate);
@@ -722,7 +722,7 @@ impl AbductionEngine {
         if let Some(counts) = self.pred_objects.get(predicate) {
             let mut values: Vec<(&String, &u64)> = counts.iter().collect();
             let cmp = |a: &(&String, &u64), b: &(&String, &u64)| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0));
-            // 只需前 6 名：部分选择代替全量排序
+            // 取前 6 名
             if values.len() > 6 {
                 values.select_nth_unstable_by(6, cmp);
                 values.truncate(6);
@@ -757,7 +757,7 @@ impl AbductionEngine {
                     .filter(|(entity, etype)| *etype == base_type && entity.as_str() != base)
                     .map(|(entity, _)| entity)
                     .collect();
-                // 只需字典序前 5 个：部分选择代替全量排序
+                // 取字典序前 5 个
                 if same_type.len() > 5 {
                     same_type.select_nth_unstable(5);
                     same_type.truncate(5);
@@ -788,7 +788,7 @@ impl AbductionEngine {
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| a.1.cmp(b.1))
                 };
-                // 只需前 5 名：部分选择代替全量排序
+                // 取前 5 名
                 if similar.len() > 5 {
                     similar.select_nth_unstable_by(5, cmp);
                     similar.truncate(5);
@@ -982,7 +982,7 @@ impl AbductionEngine {
         max_rounds: usize,
         max_facts: usize,
     ) -> WhatIfResult {
-        // 假设作为额外基事实注入推导，无需克隆整个引擎
+        // 假设作为额外基事实注入推导
         let ground_assumptions: Vec<Atom> = assumptions
             .iter()
             .filter(|assumption| assumption.is_ground())
@@ -1024,7 +1024,7 @@ impl AbductionEngine {
                 })
                 .sum()
         };
-        // 排序键只计算一次：规模升序 → 谓词支撑降序 → 显示长度升序（与逐次调用等价）
+        // 排序键：规模升序 → 谓词支撑降序 → 显示长度升序
         let candidates: Vec<(Vec<Atom>, usize, u64, usize)> = frontiers
             .into_iter()
             .map(|frontier| {
@@ -1035,7 +1035,7 @@ impl AbductionEngine {
                 (frontier, size, support, display_len)
             })
             .collect();
-        // 只需极值：min_by 与"稳定升序排序后取首个"等价，但无需排序全部候选
+        // 取极值（稳定升序排序后的首个）
         candidates
             .into_iter()
             .min_by(|a, b| {
@@ -1074,7 +1074,7 @@ impl AbductionEngine {
         if atoms.is_empty() {
             return;
         }
-        // 用哈希集合做成员检查，避免逐条线性扫描已采纳列表（O(n²)）
+        // 用哈希集合做成员检查
         let mut new_atoms: Vec<Atom> = Vec::new();
         {
             let mut seen: HashSet<&Atom> = self.adopted.iter().collect();
@@ -1165,8 +1165,6 @@ impl AbductionEngine {
         let mut budget = 60usize;
         let mut indices: Vec<usize> = Vec::new();
         // 组合验证复用一个引擎克隆：逐组合“加入假设 → 求解 → 按原顺序移除”。
-        // 移除采用压缩式删除，恢复后的事实索引顺序与全新克隆一致，
-        // 因此结果与逐个组合重新克隆完全相同，但省去重复的深拷贝。
         let mut simulation = engine.clone();
         for size in 1..=max_size {
             let _ = collect_combinations(&pool, size, 0, &mut indices, &mut |combo| {
@@ -1264,7 +1262,7 @@ fn constant_name(term: &Term) -> Option<&str> {
     }
 }
 
-/// 置信度降序、同置信度按显示串升序的排序键：预先算好避免比较器重复渲染
+/// 置信度降序、同置信度按显示串升序的排序键
 #[derive(PartialEq)]
 struct ConfidenceDisplayKey {
     confidence: f64,
@@ -1371,7 +1369,7 @@ impl<'a> FrontierSearch<'a> {
         }
 
         // 1) 与基事实归结：命中即可继续推进剩余目标
-        //（把引擎引用拷出，避免与递归调用 `self.run` 的可变借用冲突，同时省去事实克隆）
+        //（把引擎引用拷出，避免与递归调用 `self.run` 的可变借用冲突）
         let engine = self.engine;
         let mut fact_matched = false;
         for fact in engine

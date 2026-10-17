@@ -62,7 +62,7 @@ impl NLUEngine {
         self.analyze_tagged(input, tagged_words)
     }
 
-    /// 使用已分词结果进行语义分析，避免重复分词
+    /// 使用已分词结果进行语义分析
     pub fn analyze_tagged(&self, input: &str, tagged_words: Vec<TaggedWord>) -> SemanticAnalysis {
         let normalized_words = if let Some(synonyms) = &self.synonyms {
             normalize_words(tagged_words, synonyms)
@@ -72,7 +72,7 @@ impl NLUEngine {
 
         let mut semantics = Vec::new();
 
-        // 分词文本在一轮分析内不变，提前展开一次供所有模式复用
+        // 分词文本在一轮分析内不变，提前展开
         let input_words: Vec<&str> = normalized_words.iter().map(|w| w.text.as_str()).collect();
 
         for domain in &self.domains {

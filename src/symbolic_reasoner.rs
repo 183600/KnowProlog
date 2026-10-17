@@ -208,7 +208,7 @@ pub struct DialogueSnapshot {
     pub contrast: Option<ContrastSnapshot>,
 }
 
-/// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
+/// 概率降序、同概率按显示串升序的排序键
 #[derive(PartialEq)]
 struct ProbabilityDisplayKey {
     probability: f64,
@@ -405,7 +405,7 @@ impl DialogueContext {
         let mut replaced = false;
         let mut chars = input.char_indices().peekable();
         while let Some((i, ch)) = chars.next() {
-            // 在字节切片上直接判断前缀，避免收集整段字符向量
+            // 在字节切片上直接判断前缀
             let mut matched: Option<&str> = None;
             for pronoun in PRONOUNS {
                 if input[i..].starts_with(pronoun) {
@@ -467,8 +467,7 @@ pub struct SymbolicReasoner {
     problog: ProblogEngine,
     // 用户用中文教过的概率知识原句（会话级记忆，随对话状态持久化）
     lessons: Vec<String>,
-    // 上面原句的解析结果缓存：rebuild_problog 会随每次知识变更重放，
-    // 缓存后无需每次重新解析中文句子
+    // 上面原句的解析结果缓存：rebuild_problog 会随每次知识变更重放。
     lessons_parsed: Vec<chinese_reasoning_nlu::ChineseLesson>,
     planner: QueryPlanner,
     linker: EntityLinker,
@@ -495,7 +494,7 @@ pub struct SymbolicReasoner {
     // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
     proposition_surfaces: Vec<(String, String)>,
     // 单条链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
-    // 观察事实或重建缓存（线索变化）时整体失效；命中时只复制 Arc，避免深拷贝链接明细
+    // 观察事实或重建缓存（线索变化）时整体失效
     link_memo: parking_lot::Mutex<Option<(String, Arc<Vec<LinkedMention>>)>>,
     // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
     entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
@@ -819,7 +818,7 @@ impl SymbolicReasoner {
             self.config.problog_max_depth,
             self.config.problog_max_proofs,
         );
-        // 重放缓存好的解析结果，避免每次重建都重新解析中文原句
+        // 重放缓存好的解析结果
         for lesson in &self.lessons_parsed {
             chinese_reasoning_nlu::apply_lesson(&mut program, lesson);
         }
@@ -1556,7 +1555,7 @@ impl SymbolicReasoner {
             self.session_facts.push(atom.clone());
             added = true;
         }
-        // 会话假设同步注入软逻辑引擎（无需等待下一次全量重建）
+        // 会话假设同步注入软逻辑引擎
         if added && self.config.enable_soft_logic {
             self.soft.add_fact(atom.clone());
         }
@@ -2158,7 +2157,6 @@ impl SymbolicReasoner {
             self.config.association_min_lift
         ));
         let filter = filter.map(str::trim).filter(|filter| !filter.is_empty());
-        // 规范化一次即可，避免对每条规则重复计算
         let normalized = filter.map(|filter| self.aligner.canonical_form(filter));
         let rules: Vec<&AssociationRule> = self
             .associations
@@ -2245,7 +2243,7 @@ impl SymbolicReasoner {
             output.push_str("  （没有可推导的新事实：可增加事实/规则或放宽规则阈值）\n");
             return output;
         }
-        // 预计算展示文本，避免排序比较时反复格式化
+        // 预计算展示文本
         let mut items: Vec<(&DerivedFact, String)> = derived
             .iter()
             .map(|item| (item, item.atom.display()))
@@ -2423,7 +2421,7 @@ impl SymbolicReasoner {
             return false;
         };
         let etype_lower = etype.to_lowercase();
-        // 期望类型关键词均为小写（或中文），无需再做一次 to_lowercase 分配
+        // 期望类型关键词均为小写（或中文）
         keywords.iter().any(|keyword| {
             etype.contains(*keyword) || etype_lower.contains(*keyword)
         })
@@ -2440,7 +2438,7 @@ impl SymbolicReasoner {
         let expectations = Self::expected_type_keywords(question);
         let mut ordered: Vec<&ValueHit> = last_hits.iter().collect();
         if !expectations.is_empty() {
-            // 缓存判定结果，避免排序时对同一元素重复做类型查询
+            // 缓存判定结果
             ordered.sort_by_cached_key(|hit| {
                 if self.value_matches_expectation(&hit.value, &expectations) {
                     0usize
@@ -2706,7 +2704,7 @@ impl SymbolicReasoner {
         let mut evidence: Vec<String> = Vec::new();
         if self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
-            // 用哈希集合做成员检查，避免预测循环中的线性扫描
+            // 用哈希集合做成员检查
             let mut seen_subjects: HashSet<String> = subjects.iter().cloned().collect();
             for prediction in self.predictor.predict_for_entity(&object, Some(&predicate), limit) {
                 if prediction.triple.object == object && prediction.triple.subject != object {
@@ -3215,7 +3213,7 @@ impl SymbolicReasoner {
         {
             return Some(atom.clone());
         }
-        // 软预测全量传播开销大：最多计算一次，两次查找复用同一结果
+        // 软预测最多计算一次，两次查找共用同一结果
         let predictions = self.soft.all_predictions(256);
         predictions
             .iter()
@@ -3244,7 +3242,7 @@ impl SymbolicReasoner {
         if candidates.is_empty() {
             return format!("没有找到关于「{}」可用于因果解释的事实或加权推测。", entity);
         }
-        // 概率视图与因果图各只算一次，供所有候选目标复用（软真值传播开销大）
+        // 概率视图与因果图供所有候选目标共用
         let probabilities = self.soft.probability_map();
         let analyzer = CausalAnalyzer::from_engine_with_probabilities(
             &self.soft,
@@ -3328,7 +3326,7 @@ impl SymbolicReasoner {
                 entity
             );
         };
-        // 因果图基化复用同一份概率视图，省去一次额外的软真值传播
+        // 因果图基化使用同一份概率视图
         let probabilities = self.soft.probability_map();
         let analyzer = CausalAnalyzer::from_engine_with_probabilities(
             &self.soft,
@@ -3344,7 +3342,7 @@ impl SymbolicReasoner {
         }
         let mut deltas: Vec<CounterfactualDelta> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        // 事实世界与干预世界的软真值传播只做一次，供所有探测点复用
+        // 事实世界与干预世界共用软真值传播结果
         let mut fixed = HashMap::new();
         fixed.insert(intervention.clone(), if value { 1.0 } else { 0.0 });
         let factual_beliefs = self.soft.propagate_with_fixed(&HashMap::new());
@@ -4229,7 +4227,7 @@ impl SymbolicReasoner {
         // 教学记忆：恢复中文概率知识原句并在概率程序中重放（不写知识图谱）
         if !snapshot.lessons.is_empty() {
             self.lessons = snapshot.lessons.clone();
-            // 恢复原句时一次性重建解析缓存（后续 rebuild_problog 直接复用）
+            // 恢复原句时一次性重建解析缓存
             self.lessons_parsed = self
                 .lessons
                 .iter()

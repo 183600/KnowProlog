@@ -26,7 +26,7 @@ pub struct WeightedRule {
     /// 对数几率权重：正=支持 head，负=抑制 head
     pub weight: f64,
     pub source: String,
-    /// 渲染文本在构造时缓存（基化时每条规则会被渲染多次）
+    /// 渲染文本在构造时缓存
     text: String,
 }
 
@@ -58,7 +58,7 @@ impl WeightedRule {
     }
 }
 
-/// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
+/// 概率降序、同概率按显示串升序的排序键
 #[derive(PartialEq)]
 struct ProbabilityDisplayKey {
     probability: f64,
@@ -366,7 +366,7 @@ impl MarkovLogicEngine {
         self.ground_rules_against(&derived, &HashMap::new())
     }
 
-    /// 与 `ground_all` 相同，但复用调用方已算好的概率视图，避免重复传播
+    /// 使用调用方已算好的概率视图进行基化
     pub fn ground_all_with_probabilities(
         &self,
         probabilities: &HashMap<Atom, f64>,
@@ -651,8 +651,7 @@ impl MarkovLogicEngine {
         beliefs: &Beliefs,
         fixed: &HashMap<Atom, f64>,
     ) -> Vec<SoftFact> {
-        // 先只收集轻量字段（借用证据），排序截断后才克隆证据并排序，
-        // 避免为未入选的候选复制证据列表
+        // 先收集借用证据，排序截断后再克隆证据并排序
         let mut merged: HashMap<&Atom, (f64, f64, Option<&Vec<RuleEvidence>>, bool)> =
             HashMap::new();
         for fact in &self.facts {
@@ -736,7 +735,7 @@ impl MarkovLogicEngine {
             }
         }
         let mut merged: HashMap<Atom, SoftFact> = HashMap::new();
-        // 软真值传播只算一次，所有头模式复用同一批信念
+        // 所有头模式共用同一批信念
         let beliefs = self.propagate();
         for pattern in &patterns {
             for fact in self.infer_from_beliefs(pattern, 64, &beliefs, &HashMap::new()) {

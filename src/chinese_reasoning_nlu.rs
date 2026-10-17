@@ -251,7 +251,7 @@ fn strip_probability_wrappers(text: &str) -> String {
         "的可能性",
         "的概率",
     ] {
-        // 不存在时 replace 会原样返回并白白分配一次，先检查可跳过
+        // 不存在时 replace 会原样返回，先检查可跳过
         if cleaned.contains(wrapper) {
             cleaned = cleaned.replace(wrapper, "");
         }

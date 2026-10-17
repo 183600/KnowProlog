@@ -95,7 +95,6 @@ impl SimilarityCalculator {
     pub async fn calculate_semantic_similarity(&self, text1: &str, text2: &str) -> Result<SimilarityResult, Box<dyn std::error::Error>> {
         let mut details = HashMap::new();
 
-        // 分词只做一次，供各相似度分量复用
         let words1 = self.tokenize_and_filter(text1);
         let words2 = self.tokenize_and_filter(text2);
 
@@ -486,7 +485,7 @@ impl SimilarityCalculator {
         (bigram_sim + trigram_sim) / 2.0
     }
 
-    /// 二元组集合：用 (char, char) 作为键，避免为每个 n-gram 分配 String
+    /// 二元组集合：用 (char, char) 作为键
     fn bigrams_from_chars(chars: &[char]) -> HashSet<(char, char)> {
         let mut ngrams = HashSet::new();
         if chars.len() >= 2 {
@@ -497,7 +496,7 @@ impl SimilarityCalculator {
         ngrams
     }
 
-    /// 三元组集合：用 (char, char, char) 作为键，避免为每个 n-gram 分配 String
+    /// 三元组集合：用 (char, char, char) 作为键
     fn trigrams_from_chars(chars: &[char]) -> HashSet<(char, char, char)> {
         let mut ngrams = HashSet::new();
         if chars.len() >= 3 {
@@ -554,7 +553,7 @@ impl SimilarityCalculator {
             return 1.0;
         }
         
-        // 快速相似度计算，适用于实时查询；分词只做一次，Jaccard 复用结果
+        // 快速相似度计算，适用于实时查询
         let words1 = self.tokenize_and_filter(text1);
         let words2 = self.tokenize_and_filter(text2);
         let jaccard = self.jaccard_similarity_from_words(&words1, &words2);

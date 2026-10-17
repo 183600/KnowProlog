@@ -155,7 +155,7 @@ impl GraphWalkEmbedding {
         self.single_source_ppr_limit(seed, usize::MAX)
     }
 
-    /// 幂迭代求平稳分布；limit 限制保留的分量数（与全排序后截断等价）
+    /// 幂迭代求平稳分布；limit 限制保留的分量数
     fn single_source_ppr_limit(&self, seed: &str, limit: usize) -> Vec<(String, f64)> {
         let mut current: HashMap<&str, f64> = HashMap::new();
         current.insert(seed, 1.0);
@@ -208,7 +208,7 @@ impl GraphWalkEmbedding {
             result.truncate(limit);
         }
         result.sort_by(cmp);
-        // 只为最终保留的分量克隆节点名
+        // 收集最终保留的分量节点名
         result
             .into_iter()
             .map(|(node, weight)| (node.to_string(), weight))
@@ -218,7 +218,7 @@ impl GraphWalkEmbedding {
     /// 结构最相关的实体（概率质量最大的分量，排除自身）
     pub fn related(&self, seed: &str, k: usize) -> Vec<(String, f64)> {
         match self.vectors.get(seed) {
-            // 命中缓存向量时只克隆最终保留的 k 个分量，避免整条向量深拷贝
+            // 命中缓存向量时克隆最终保留的 k 个分量
             Some(vector) => vector
                 .iter()
                 .filter(|(entity, _)| entity != seed)
@@ -252,7 +252,7 @@ impl GraphWalkEmbedding {
 
     /// 结构角色最接近的实体（按余弦相似度降序，过滤低于阈值者）
     pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
-        // 源实体的查找表只构建一次，供所有候选复用（避免每个候选重复构建）
+        // 构建源实体的查找表
         let Some(left) = self.vectors.get(entity) else {
             return Vec::new();
         };
@@ -289,7 +289,7 @@ impl GraphWalkEmbedding {
             scored.truncate(keep);
         }
         scored.sort_by(cmp);
-        // 只为最终保留的邻居克隆实体名
+        // 收集最终保留的邻居实体名
         scored
             .into_iter()
             .map(|(name, score)| (name.to_string(), score))
@@ -301,7 +301,7 @@ impl GraphWalkEmbedding {
         let mut merged: HashMap<String, f64> = HashMap::new();
         let mut used = 0usize;
         for seed in seeds {
-            // 命中缓存时直接借用，未命中才计算临时向量，避免逐种子深拷贝
+            // 命中缓存时直接借用，未命中才计算临时向量
             let computed;
             let vector: &[(String, f64)] = match self.vectors.get(seed) {
                 Some(vector) => vector.as_slice(),

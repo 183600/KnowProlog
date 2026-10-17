@@ -138,7 +138,7 @@ impl AssociationMiner {
         if entity.trim().is_empty() || item.trim().is_empty() {
             return false;
         }
-        // 已存在的篮子直接复用，避免为 entry 键重复分配 String
+        // 已存在的篮子直接复用
         let basket = match self.baskets.get_mut(entity) {
             Some(basket) => basket,
             None => self.baskets.entry(entity.to_string()).or_default(),
@@ -184,7 +184,7 @@ impl AssociationMiner {
             .collect();
         items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-        // 倒排索引：物品 → 包含该物品的实体集合，使共现计数无需反复扫描全部篮子
+        // 倒排索引：物品 → 包含该物品的实体集合
         let mut item_entities: HashMap<&str, HashSet<&str>> = HashMap::with_capacity(items.len());
         for (entity, basket) in &self.baskets {
             for item in basket {
@@ -298,7 +298,7 @@ impl AssociationMiner {
         if consequent_count < min_count {
             return None;
         }
-        // 支持度：整个前件与结论共现的实体数（前件计数由调用方提供，避免重复求交）
+        // 支持度：整个前件与结论共现的实体数（前件计数由调用方提供）
         let support = if antecedent.len() == 1 {
             match (
                 item_entities.get(antecedent[0].as_str()),

@@ -9,7 +9,7 @@ use crate::question_analyzer::{QuestionAnalyzer, QuestionAnalysis};
 use crate::ownthink_api::{AmbiguousResponse, KnowledgeResponse, KnowledgeData, EavResponse, EavData};
 
 pub struct LocalSemanticAdapter {
-    // 各子引擎按需惰性构建，避免未启用或未使用时的初始化开销
+    // 各子引擎按需惰性构建
     semantic_engine_cell: OnceLock<SemanticEngine>,
     similarity_calculator_cell: OnceLock<SimilarityCalculator>,
     advanced_nlu_cell: OnceLock<AdvancedNLU>,

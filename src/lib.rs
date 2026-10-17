@@ -502,7 +502,6 @@ impl KnowledgeExtractor {
                 } else {
                     part_tagged
                 };
-                // 避免递归调用时重复提取
                 items.extend(self.extract(part, &normalized_part_tagged));
             }
         }
@@ -1017,8 +1016,7 @@ impl OxigraphManager {
 
     pub async fn get_relevant_facts(&self, query_entities: &[String], max_hops: usize) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         if query_entities.is_empty() {
-            // 复用整图快照缓存，仅保留实体事实（与全量扫描的结果与顺序一致），
-            // 避免每次空实体查询都重新遍历整个存储
+            // 使用整图快照缓存，仅保留实体事实
             let snapshot = self.load_graph_snapshot().await?;
             return Ok(snapshot
                 .iter()
@@ -1030,7 +1028,7 @@ impl OxigraphManager {
         let mut facts = Vec::new();
         let store = self.store.lock().await;
         
-        // 构建实体名称的匹配模式（预分配，避免 map/collect/join 的中间 Vec）
+        // 构建实体名称的匹配模式
         let mut combined_pattern = String::new();
         for (index, entity) in query_entities.iter().enumerate() {
             if index > 0 {
@@ -1081,7 +1079,7 @@ impl OxigraphManager {
             .collect())
     }
 
-    /// 整图快照（实体属性 + 关系），在两次写操作之间复用缓存，避免重复全量扫描。
+    /// 整图快照（实体属性 + 关系），在两次写操作之间缓存。
     ///
     /// 正确性依赖：所有写入口在持有存储锁期间（修改存储前）自增 `revision`，
     /// 且存储只增不删；因此命中缓存意味着自缓存构建以来没有任何写发生，内容必然一致。
@@ -1127,7 +1125,7 @@ impl OxigraphManager {
                 Err(_) => continue,
             };
 
-            // 命名节点直接取 IRI 尾部，省去 Display 包装与再裁剪的中间字符串
+            // 命名节点直接取 IRI 尾部
             let entity_name = match &quad.subject {
                 Subject::NamedNode(node) => {
                     let iri = node.as_str();
@@ -1581,7 +1579,6 @@ impl OxigraphManager {
             return Ok(neighbors);
         }
         
-        // 与原先 map/format/collect/join 输出完全一致，去掉中间 Vec
         let mut entity_filter = String::new();
         for (index, entity) in entities.iter().enumerate() {
             if index > 0 {
@@ -1687,7 +1684,6 @@ impl OxigraphManager {
                                         .or_insert_with(|| (String::new(), HashMap::new()));
                                     
                                     if let Some(type_term) = solution.get("type") {
-                                        // 命名节点走 IRI 快路径，避免 to_string 的 '<' '>' 包装与再裁剪
                                         let type_str = match type_term {
                                             Term::NamedNode(node) => node.as_str().to_string(),
                                             other => other.to_string(),
@@ -1754,7 +1750,7 @@ impl OxigraphManager {
     }
 
     pub async fn load_all_relations(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
-        // 复用整图快照缓存，避免每次调用都重新全量扫描存储
+        // 使用整图快照缓存
         let snapshot = self.load_graph_snapshot().await?;
         Ok(snapshot
             .iter()
@@ -1860,7 +1856,7 @@ pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String>
     extract_query_entities_from_tagged(&tagged_words, config)
 }
 
-/// 与 `extract_query_entities` 等价，但复用已分词结果，避免重复分词
+/// 使用已分词结果提取查询实体
 pub fn extract_query_entities_from_tagged(
     tagged_words: &[TaggedWord],
     config: &SystemConfig,

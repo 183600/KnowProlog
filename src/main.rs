@@ -974,7 +974,6 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                 }
 
                 let tagged_words = preprocess(input, &config.nlp);
-                // 复用本次分词：查询实体提取与 NLU 不再重复分词
                 let precomputed_query_entities =
                     extract_query_entities_from_tagged(&tagged_words, &config);
                 let nlu_tagged_words = if config.nlp.enable_nlu.unwrap_or(false) {
@@ -1199,7 +1198,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                 if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     
-                    // 提取查询中的实体（复用本次分词结果）
+                    // 提取查询中的实体
                     let mut seen_entities = std::collections::HashSet::new();
                     let mut query_entities: Vec<String> = Vec::with_capacity(
                         precomputed_query_entities.len() + entities.len(),
@@ -1636,7 +1635,7 @@ async fn continue_original_query(
 ) {
     println!("查询类型: {}, 实体: {:?}", query_type, entities);
     
-    // 提取查询中的实体（复用本次分词结果）
+    // 提取查询中的实体
     let mut seen_entities = std::collections::HashSet::new();
     let mut query_entities: Vec<String> =
         Vec::with_capacity(precomputed_query_entities.len() + entities.len());

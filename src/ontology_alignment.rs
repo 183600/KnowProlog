@@ -41,13 +41,13 @@ pub struct OntologyAligner {
     profiles: Vec<TermProfile>,
     // 与 profiles 一一对应，注册时预计算规范化结果
     profile_norms: Vec<String>,
-    // 与 profiles 一一对应，注册时预计算 bigram 键（供相似度扫描复用）
+    // 与 profiles 一一对应，注册时预计算 bigram 键
     profile_keys: Vec<Vec<(char, Option<char>)>>,
     index: HashMap<String, usize>,
     similarity_threshold: f64,
     structural_min_shared: usize,
     structural_min_jaccard: f64,
-    // 术语解析结果缓存：注册新术语时整体失效；用 Arc 避免命中时的深拷贝
+    // 术语解析结果缓存：注册新术语时整体失效
     resolve_cache: RwLock<HashMap<String, Option<Arc<(AlignmentPair, Option<usize>)>>>>,
 }
 
@@ -230,7 +230,7 @@ impl OntologyAligner {
             return 0.0;
         }
         let total = ga.len() + gb.len();
-        // 计数映射实现多重集交集，避免逐元素线性查找的 O(n²)
+        // 计数映射实现多重集交集
         let mut counts: HashMap<(char, Option<char>), usize> = HashMap::with_capacity(ga.len());
         for key in ga {
             *counts.entry(*key).or_insert(0) += 1;
@@ -247,8 +247,7 @@ impl OntologyAligner {
         2.0 * overlap as f64 / total as f64
     }
 
-    /// 与 `similarity_normalized` 等价，但复用调用方预计算的查询侧与候选侧 bigram，
-    /// 避免在一批候选中反复重建 bigram 表。
+    /// 使用调用方预计算的查询侧与候选侧 bigram 计算相似度。
     fn similarity_normalized_with_keys(
         &self,
         query: &str,
@@ -298,7 +297,7 @@ impl OntologyAligner {
         keys
     }
 
-    /// `term_norm` 必须是 `self.normalize(term)` 的结果，避免重复规范化
+    /// `term_norm` 必须是 `self.normalize(term)` 的结果
     fn synonym_chain(&self, term: &str, term_norm: &str) -> Option<String> {
         let mut current = term.to_string();
         let mut current_norm = term_norm.to_string();
@@ -351,7 +350,6 @@ impl OntologyAligner {
     }
 
     fn resolve_with_index_uncached(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
-        // 规范化只做一次，供同义词链、索引查询与相似度扫描复用
         let normalized = self.normalize(term);
         if let Some(target) = self.synonym_chain(term, &normalized) {
             let target_norm = self.normalize(&target);
@@ -388,7 +386,6 @@ impl OntologyAligner {
         }
 
         let mut best_similarity: Option<(f64, usize)> = None;
-        // 查询侧 bigram 只需计算一次，供全部候选复用
         let query_keys = Self::bigram_keys(&normalized);
         let scan_end = self_idx.map_or(self.profiles.len(), |i| i + 1);
         for i in 0..scan_end {
@@ -427,7 +424,7 @@ impl OntologyAligner {
                 if Some(i) == self_idx || other.kind != profile.kind {
                     continue;
                 }
-                // 先只统计交集大小，胜出后再重建证据，避免为每个候选克隆邻居
+                // 先统计交集大小，胜出后再重建证据
                 let shared_count = profile.neighbors.intersection(&other.neighbors).count();
                 if shared_count < self.structural_min_shared {
                     continue;
@@ -530,8 +527,7 @@ impl OntologyAligner {
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
 
         for (s, p, o) in triples {
-            // 部分解析结果供对齐证据与规范化三元组共用；命中缓存时只复制 Arc，
-            // 并在确认是新的对齐对时才做一次深拷贝
+            // 部分解析结果供对齐证据与规范化三元组共用
             let resolved = [self.resolve_arc(s), self.resolve_arc(p), self.resolve_arc(o)];
             for pair in resolved.iter().flatten() {
                 if seen_pairs.insert((pair.0.source.clone(), pair.0.target.clone())) {

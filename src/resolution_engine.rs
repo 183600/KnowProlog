@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 /// 项：逻辑变量或常量（实体名、属性值、谓词名都是常量）
 ///
-/// 字符串用 `Rc<str>` 共享：克隆项只增加引用计数，避免合一/换名时反复分配。
+/// 字符串用 `Rc<str>` 共享。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
     Var(Rc<str>),
@@ -111,8 +111,8 @@ impl Atom {
 
 /// 置换：变量名 → 项
 ///
-/// 用不可变单链表 + `Rc` 持久化表示：克隆置换只增加一次引用计数，
-/// 合一产生的扩展在常数时间完成，避免归结搜索中反复复制整张映射表。
+/// 用不可变单链表 + `Rc` 持久化表示置换：
+/// 合一产生的扩展在常数时间完成。
 #[derive(Debug, Clone, Default)]
 pub struct Substitution {
     head: Option<Rc<SubstitutionBinding>>,
@@ -281,7 +281,7 @@ impl ResolutionEngine {
         self.clauses_iter_for(predicate).collect()
     }
 
-    /// 头谓词匹配的子句迭代器：不分配中间 Vec，便于热路径按需 take
+    /// 头谓词匹配的子句迭代器
     pub(crate) fn clauses_iter_for(&self, predicate: &str) -> impl Iterator<Item = &Clause> {
         self.rules_by_head
             .get(predicate)
@@ -387,7 +387,7 @@ impl ResolutionEngine {
         // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明
         let mut best: HashMap<String, Solution> = HashMap::new();
         for (subst, proofs) in states {
-            // 渲染一次变量值：同时用于绑定表与去重键，避免二次查表与中间 Vec
+            // 渲染变量值：同时用于绑定表与去重键
             let mut bindings: HashMap<String, String> = HashMap::with_capacity(query_vars.len());
             let mut key = String::new();
             for var in query_vars {
@@ -471,7 +471,7 @@ impl ResolutionEngine {
                 if !unify_atoms(&applied, &fresh_head, &mut unified) {
                     continue;
                 }
-                // 头合一失败时无需换名规则体，避免无效的字符串构造
+                // 头合一失败时无需换名规则体
                 let fresh_body: Vec<Atom> = clause
                     .body
                     .iter()
@@ -536,8 +536,7 @@ impl ResolutionEngine {
     }
 
     /// 前向半朴素饱和：从事实出发反复应用子句，推导新基事实（含前提来源）。
-    /// 事实直接引用 `self.facts`/`self.facts_by_pred`，只维护新推出的事实，
-    /// 避免每次调用都深拷贝整张事实表。
+    /// 事实直接引用 `self.facts`/`self.facts_by_pred`，只维护新推出的事实。
     pub fn forward_chain(&self, max_rounds: usize, max_new_facts: usize) -> Vec<DerivedFact> {
         self.forward_chain_with_extra_facts(&[], max_rounds, max_new_facts)
     }
@@ -563,7 +562,7 @@ impl ResolutionEngine {
                     .push(atom.clone());
             }
         }
-        // 基事实未记录置信度时按 1.0 处理（与显式预填 1.0 等价），无需预先复制整张事实表
+        // 基事实未记录置信度时按 1.0 处理
         let mut confidence_of: HashMap<Atom, f64> = HashMap::new();
         let mut derived: Vec<DerivedFact> = Vec::new();
         let mut counter = 0usize;
@@ -670,7 +669,7 @@ impl ResolutionEngine {
 
 /// 快速预检查：若所有已解析的词项对都是互不相同的常量，则合一必然失败。
 /// 用于在克隆全部替换之前尽早跳过不匹配的事实/规则头。
-/// 沿置换链解析词项，返回最具体的引用（避免中间克隆）
+/// 沿置换链解析词项，返回最具体的引用
 fn resolve_ref<'a>(term: &'a Term, subst: &'a Substitution) -> &'a Term {
     let mut current = term;
     let mut hops = 0;
@@ -731,7 +730,7 @@ fn apply_term(subst: &Substitution, term: &Term) -> Term {
 
 pub fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
     if subst.head.is_none() {
-        // 空置换下解析结果与原原子相同，直接克隆省去逐项解析
+        // 空置换下解析结果与原原子相同，直接克隆
         return atom.clone();
     }
     Atom {
@@ -740,7 +739,7 @@ pub fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
     }
 }
 
-/// 与 `format!("{}#{}", name, tag)` 命名一致，但绕过格式化框架的分配与动态派发
+/// 与 `format!("{}#{}", name, tag)` 命名一致
 fn fresh_var_name(name: &str, tag: usize) -> String {
     let mut out = String::with_capacity(name.len() + 21);
     out.push_str(name);
@@ -760,7 +759,7 @@ fn fresh_var_name(name: &str, tag: usize) -> String {
     out
 }
 
-/// 让同名的变量在子句内共享同一个 `Rc<str>`，从而换名缓存可走指针比较
+/// 让同名的变量在子句内共享同一个 `Rc<str>`
 fn canonicalize_clause_vars(clause: &mut Clause) {
     let mut canonical: HashMap<Rc<str>, Rc<str>> = HashMap::new();
     for atom in std::iter::once(&mut clause.head).chain(clause.body.iter_mut()) {
@@ -777,8 +776,7 @@ fn canonicalize_clause_vars(clause: &mut Clause) {
     }
 }
 
-/// 变量换名器：同一次子句使用中，相同变量名的所有出现共享同一个换名结果，
-/// 既减少分配，也让后续置换查找能走 `Rc` 指针比较的快速路径。
+/// 变量换名器：同一次子句使用中，相同变量名的所有出现共享同一个换名结果。
 struct Renamer<'a> {
     tag: usize,
     cache: Vec<(&'a Rc<str>, Rc<str>)>,

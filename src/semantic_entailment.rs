@@ -221,7 +221,7 @@ pub struct PropositionParser<'a> {
 
 /// 构建“表面积 → 规范谓词”索引（按表面长度降序、再按字典序）。
 ///
-/// 该索引只依赖对齐器与词法表面表，可在图谱修订之间缓存复用。
+/// 该索引只依赖对齐器与词法表面表。
 pub fn build_predicate_surfaces(
     aligner: &OntologyAligner,
     lexical_surfaces: &HashMap<String, String>,
@@ -244,7 +244,7 @@ pub fn build_predicate_surfaces(
             surfaces.entry(alias.clone()).or_insert(target);
         }
     }
-    // 装饰-排序-还原：字符数只计算一次，避免排序比较反复遍历字符串
+    // 装饰-排序-还原（排序键为字符数）
     let mut decorated: Vec<(std::cmp::Reverse<usize>, String, String)> = surfaces
         .into_iter()
         .map(|(name, canonical)| {
@@ -272,7 +272,7 @@ impl<'a> PropositionParser<'a> {
         }
     }
 
-    /// 使用调用方缓存的表面积索引构造解析器，避免每次重建
+    /// 使用调用方缓存的表面积索引构造解析器
     pub fn with_surfaces(
         aligner: &'a OntologyAligner,
         linker: &'a EntityLinker,

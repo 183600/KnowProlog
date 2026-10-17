@@ -47,7 +47,7 @@ pub enum PatternElement {
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     let words = jieba().cut(text, false); // 执行分词，false表示精准模式
 
-    // 常见人名集合只构建一次，避免在合并循环中反复线性查找
+    // 常见人名集合
     let full_names: std::collections::HashSet<&str> = config
         .name_patterns
         .full_names
@@ -57,7 +57,7 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
 
     // 结巴分词可能把配置中的常见人名（如"张三"）切分成多个单字，
     // 这里按最长匹配合并相邻词，使 full_names 中的人名能被正确识别；
-    // 合并与标注在同一次遍历内完成，省去中间的合并词列表
+    // 合并与标注在同一次遍历内完成
     let mut tagged_words: Vec<TaggedWord> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
@@ -130,7 +130,7 @@ fn is_name(
 
 // 分析查询意图并提取实体
 pub fn analyze_query_intent(tagged_words: &[TaggedWord], rules: &[PrologRule]) -> Option<(String, Vec<String>)> {
-    // 规则通常已按优先级降序排列：先做一次线性检查，避免每次调用都分配并排序
+    // 规则通常已按优先级降序排列：先做一次线性检查
     if rules.windows(2).all(|pair| pair[0].priority >= pair[1].priority) {
         for rule in rules {
             if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {

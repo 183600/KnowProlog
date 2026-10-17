@@ -64,7 +64,7 @@ struct FactLine {
 pub struct SymbolicGenerator {
     known_entities: HashSet<String>,
     entity_types: HashMap<String, String>,
-    // 类型 → 成员实体索引，避免类型级统计/原型查找时全量扫描实体
+    // 类型 → 成员实体索引
     type_members: HashMap<String, Vec<String>>,
     attributes: HashMap<String, Vec<(String, String)>>,
     by_subject: HashMap<String, HashMap<String, Vec<String>>>,
@@ -86,8 +86,7 @@ pub struct SymbolicGenerator {
     type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
 }
 
-// 三元组的去重键：长度前缀保证无歧义；单一 String 键相比三元组哈希更省内存、
-// 哈希与比较都只走一段连续字节（重复观察是热路径）
+// 三元组的去重键：长度前缀保证无歧义
 fn triple_key(subject: &str, predicate: &str, object: &str) -> String {
     use std::fmt::Write as _;
     let mut key = String::with_capacity(subject.len() + predicate.len() + object.len() + 24);
@@ -184,7 +183,7 @@ impl SymbolicGenerator {
         if name.trim().is_empty() {
             return;
         }
-        // 只在知识确有变化时自增 revision，避免重复观察同一实体让聚合缓存失效
+        // 只在知识确有变化时自增 revision
         let mut changed = false;
         if self.known_entities.insert(name.to_string()) {
             changed = true;
@@ -266,7 +265,7 @@ impl SymbolicGenerator {
         self.known_entities.insert(subject.to_string());
         self.known_entities.insert(object.to_string());
 
-        // triples 已按 (s,p,o) 去重，此处到达即保证是新事实，无需再线性扫描去重
+        // triples 已按 (s,p,o) 去重，此处到达即保证是新事实
         let subjects = match self.by_subject.get_mut(subject) {
             Some(subjects) => subjects,
             None => self.by_subject.entry(subject.to_string()).or_default(),
@@ -652,7 +651,7 @@ impl SymbolicGenerator {
             for entity in members {
                 if let Some(predicate_counts) = self.entity_predicate_counts.get(entity) {
                     for (predicate, count) in predicate_counts {
-                        // 键通常已存在：命中时直接累加，避免每次克隆谓词名
+                        // 键通常已存在：命中时直接累加
                         match counts.get_mut(predicate) {
                             Some(existing) => *existing += count,
                             None => {
@@ -753,7 +752,7 @@ impl SymbolicGenerator {
     }
 
     fn global_prototype(&self, predicate: &str) -> Option<(String, Vec<String>)> {
-        // 增量的“字典序最小主体”索引，无需每次全量扫描
+        // 增量的“字典序最小主体”索引
         let prototype = self.predicate_min_entity.get(predicate)?;
         let objects = self
             .by_subject

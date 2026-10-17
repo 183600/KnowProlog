@@ -35,7 +35,7 @@ pub struct SemanticEngine {
     jieba: &'static Jieba,
     entity_knowledge: Arc<RwLock<HashMap<String, SemanticKnowledge>>>,
     entity_aliases: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    // 小写别名索引：避免每次歧义解析都重复对全部别名做 to_lowercase
+    // 小写别名索引
     entity_aliases_lower: Arc<RwLock<HashMap<String, Vec<String>>>>,
     relation_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
     intent_patterns: Arc<RwLock<HashMap<String, Vec<String>>>>,
@@ -162,7 +162,7 @@ impl SemanticEngine {
 
     pub async fn get_ambiguous_entities(&self, mention: &str) -> Result<Vec<EntityCandidate>, Box<dyn std::error::Error>> {
         // 与 get_entity_knowledge / 写入方保持一致的加锁顺序：先 knowledge 后 aliases
-        // 第一阶段只收集轻量评分（实体名、权重、置信度），完整知识只对最终幸存者克隆
+        // 第一阶段只收集评分信息（实体名、权重、置信度）
         let mut scored: Vec<(String, u64, f64)> = Vec::new();
         {
             let knowledge = self.entity_knowledge.read();
@@ -177,7 +177,7 @@ impl SemanticEngine {
                 }
             }
             
-            // 模糊匹配（使用预构建的小写别名索引，省去每次调用重复转小写）
+            // 模糊匹配（使用预构建的小写别名索引）
             let mention_lower = mention.to_lowercase();
             let aliases_lower = self.entity_aliases_lower.read();
             for (alias_lower, entity_names) in aliases_lower.iter() {
@@ -234,7 +234,7 @@ impl SemanticEngine {
         let knowledge = self.entity_knowledge.read();
         let token_cache = self.token_cache.read();
         
-        // 分词；指称词集合只构建一次，供所有实体复用
+        // 分词
         let mention_words: Vec<_> = self.jieba.cut(mention, false).into_iter()
             .filter(|word| !self.stop_words.contains(*word))
             .collect();
@@ -242,7 +242,7 @@ impl SemanticEngine {
         
         for (entity_name, entity_knowledge) in knowledge.iter() {
             let cached = token_cache.get(entity_name);
-            // 命中缓存时直接借用缓存的词表，避免每个实体再复制一份 Vec<&str>
+            // 命中缓存时直接借用缓存的词表
             let owned_name_words: Vec<String>;
             let owned_desc_words: Vec<String>;
             let (entity_words, desc_words): (&[String], &[String]) = match cached {
@@ -301,7 +301,7 @@ impl SemanticEngine {
     }
 
     pub async fn get_entity_attribute_value(&self, entity: &str, attribute: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        // 直接在读锁内解析实体，只克隆命中的属性值，避免复制整份实体知识
+        // 直接在读锁内解析实体
         let knowledge = self.entity_knowledge.read();
         let entity_knowledge = if let Some(entity_knowledge) = knowledge.get(entity) {
             entity_knowledge
@@ -397,7 +397,7 @@ impl SemanticEngine {
         let mut best_confidence = 0.0;
         let mut matched_patterns = Vec::new();
         
-        // 预处理查询（词与字符长度一次算好，供全部模式复用）
+        // 预处理查询
         let query_words: Vec<_> = self.jieba.cut(query, false).into_iter().collect();
         let query_text = query_words.join(" ");
         let text_words: Vec<(&str, usize)> = query_text
@@ -407,7 +407,7 @@ impl SemanticEngine {
         
         {
             let intent_patterns = self.intent_patterns.read();
-            // 按类型名排序后匹配，同分时结果确定可复现（HashMap 迭代顺序随机）
+            // 按类型名排序后匹配，同分时结果确定可复现
             let mut intent_types: Vec<&String> = intent_patterns.keys().collect();
             intent_types.sort();
             for intent_type in intent_types {
@@ -522,7 +522,7 @@ impl SemanticEngine {
                     matches += 1;
                     break;
                 }
-                // 相似度 > 0.8 ⟹ 长度差 < 20%；先按长度差剪枝，避免无谓的编辑距离计算
+                // 相似度 > 0.8 ⟹ 长度差 < 20%；先按长度差剪枝
                 if *len2 == 0 {
                     continue;
                 }
@@ -565,7 +565,7 @@ impl SemanticEngine {
     }
 
     fn levenshtein_distance_with_lens(&self, s1: &str, len1: usize, s2: &str, len2: usize) -> usize {
-        // 双行动态规划：将较短字符串作为列方向；行方向直接迭代字符，省去一份 Vec 收集
+        // 双行动态规划：较短字符串作为列方向，行方向逐字符迭代
         let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
         let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
