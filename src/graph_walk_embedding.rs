@@ -1,0 +1,557 @@
+// 符号化知识图谱嵌入：随机游走重启（Random Walk with Restart / Personalized PageRank）
+//
+// 灵感：知识图谱嵌入（KGE）把每个实体映射为向量，用向量相似度做检索与推理。
+// 本模块完全不做训练，而是把"嵌入"定义为从实体出发的随机游走平稳分布：
+//
+//     v_e(u) = 以 e 为起点、每步以阻尼 d 沿关系边随机走、以 1-d 概率跳回 e 时，
+//              长期停留在节点 u 的概率（Personalized PageRank）。
+//
+//   • 向量分量即"该实体与各节点的结构亲近度"，天然稀疏、可读、可解释；
+//   • 结构相似 = 两个实体 RWR 向量的余弦相似度（邻域结构/角色相近的实体）；
+//   • 多源重启（把对话焦点实体一起当种子）→ 上下文敏感的话题延伸；
+//   • 路径解释 = 在带权图上搜索最高游走概率的简单路径，输出可回放的关系链。
+//
+// 全部由幂迭代确定性求得：没有参数学习、没有梯度、没有神经网络。
+
+use std::collections::{HashMap, HashSet};
+
+/// 超过该规模就不再为每个实体预算向量（检索仍可按需单源计算）
+pub const DEFAULT_MAX_EMBEDDED_ENTITIES: usize = 4000;
+
+/// 单个嵌入向量保留的最大分量数（其余概率质量很小，截断以控制内存与相似度计算量）
+const MAX_VECTOR_LEN: usize = 64;
+
+/// 排序用的量化键：幂迭代的浮点尾差（~1e-16）不应改变名次，
+/// 对称结构应得到相同的排名键并按名称稳定排序（确定性、可复现）
+fn rank_key(score: f64) -> i64 {
+    if score.is_nan() {
+        i64::MIN
+    } else {
+        (score * 1e9).round() as i64
+    }
+}
+
+pub struct GraphWalkEmbedding {
+    // 无向结构边（关系方向不参与游走，保留谓词用于路径解释）
+    neighbors: HashMap<String, Vec<(String, String)>>,
+    entities: Vec<String>,
+    damping: f64,
+    iterations: usize,
+    similarity_floor: f64,
+    max_embedded_entities: usize,
+    // L2 归一化后的截断 RWR 向量：实体 → [(命中实体, 概率质量)]
+    vectors: HashMap<String, Vec<(String, f64)>>,
+    edge_count: usize,
+}
+
+impl GraphWalkEmbedding {
+    pub fn new(damping: f64, iterations: usize, similarity_floor: f64) -> Self {
+        Self {
+            neighbors: HashMap::new(),
+            entities: Vec::new(),
+            damping: damping.clamp(0.05, 0.99),
+            iterations: iterations.clamp(1, 100),
+            similarity_floor: similarity_floor.clamp(0.0, 1.0),
+            max_embedded_entities: DEFAULT_MAX_EMBEDDED_ENTITIES,
+            vectors: HashMap::new(),
+            edge_count: 0,
+        }
+    }
+
+    pub fn damping(&self) -> f64 {
+        self.damping
+    }
+
+    pub fn iterations(&self) -> usize {
+        self.iterations
+    }
+
+    pub fn similarity_floor(&self) -> f64 {
+        self.similarity_floor
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// 有向视角的边数（每条三元组贡献正反两条游走边）
+    pub fn edge_count(&self) -> usize {
+        self.edge_count
+    }
+
+    pub fn is_embedded(&self, entity: &str) -> bool {
+        self.neighbors.contains_key(entity)
+    }
+
+    /// 观察一条关系三元组：加入无向结构边（正反两条）
+    pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
+        if subject == object {
+            return;
+        }
+        let forward = (predicate.to_string(), object.to_string());
+        let backward = (predicate.to_string(), subject.to_string());
+        if !self
+            .neighbors
+            .entry(subject.to_string())
+            .or_default()
+            .contains(&forward)
+        {
+            self.neighbors
+                .get_mut(subject)
+                .expect("刚插入的键必然存在")
+                .push(forward);
+            self.edge_count += 1;
+        }
+        if !self
+            .neighbors
+            .entry(object.to_string())
+            .or_default()
+            .contains(&backward)
+        {
+            self.neighbors
+                .get_mut(object)
+                .expect("刚插入的键必然存在")
+                .push(backward);
+            self.edge_count += 1;
+        }
+    }
+
+    /// 重建全部实体的符号嵌入（幂迭代；规模过大时跳过，保留单源按需计算）
+    pub fn rebuild(&mut self) {
+        let mut entities: Vec<String> = self.neighbors.keys().cloned().collect();
+        entities.sort();
+        self.entities = entities;
+        self.vectors.clear();
+        if self.entities.len() > self.max_embedded_entities {
+            return;
+        }
+        for entity in &self.entities {
+            let mut vector = self.single_source_ppr(entity);
+            vector.truncate(MAX_VECTOR_LEN);
+            let norm = vector
+                .iter()
+                .map(|(_, weight)| weight * weight)
+                .sum::<f64>()
+                .sqrt();
+            if norm > 0.0 {
+                for (_, weight) in &mut vector {
+                    *weight /= norm;
+                }
+            }
+            self.vectors.insert(entity.clone(), vector);
+        }
+    }
+
+    /// 单源重启随机游走：幂迭代求平稳分布，返回按概率降序的分量
+    pub fn ppr(&self, seed: &str) -> Vec<(String, f64)> {
+        if !self.neighbors.contains_key(seed) {
+            return Vec::new();
+        }
+        self.single_source_ppr(seed)
+    }
+
+    fn single_source_ppr(&self, seed: &str) -> Vec<(String, f64)> {
+        let mut current: HashMap<&str, f64> = HashMap::new();
+        current.insert(seed, 1.0);
+        for _ in 0..self.iterations {
+            let mut next: HashMap<&str, f64> = HashMap::new();
+            for (node, mass) in &current {
+                match self.neighbors.get(*node) {
+                    Some(list) if !list.is_empty() => {
+                        let share = mass * self.damping / list.len() as f64;
+                        for (_, neighbor) in list {
+                            *next.entry(neighbor.as_str()).or_insert(0.0) += share;
+                        }
+                    }
+                    // 悬挂节点：跳回种子的概率质量
+                    _ => {
+                        *next.entry(seed).or_insert(0.0) += mass * self.damping;
+                    }
+                }
+            }
+            *next.entry(seed).or_insert(0.0) += 1.0 - self.damping;
+            // 剪枝：丢弃低于最大分量 1e-4 的涓流并重新归一，控制支持集规模（近似但确定）
+            let max_mass = next.values().copied().fold(0.0f64, f64::max);
+            if max_mass > 0.0 {
+                let threshold = max_mass * 1e-4;
+                let mut total = 0.0;
+                next.retain(|_, mass| {
+                    if *mass >= threshold {
+                        total += *mass;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if total > 0.0 {
+                    for mass in next.values_mut() {
+                        *mass /= total;
+                    }
+                }
+            }
+            current = next;
+        }
+        let mut result: Vec<(String, f64)> = current
+            .into_iter()
+            .map(|(node, weight)| (node.to_string(), weight))
+            .collect();
+        result.sort_by(|a, b| {
+            rank_key(b.1)
+                .cmp(&rank_key(a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        result
+    }
+
+    /// 结构最相关的实体（概率质量最大的分量，排除自身）
+    pub fn related(&self, seed: &str, k: usize) -> Vec<(String, f64)> {
+        let vector = match self.vectors.get(seed) {
+            Some(vector) => vector.clone(),
+            None => {
+                let mut computed = self.ppr(seed);
+                computed.truncate(MAX_VECTOR_LEN);
+                computed
+            }
+        };
+        vector
+            .into_iter()
+            .filter(|(entity, _)| entity != seed)
+            .take(k.max(1))
+            .collect()
+    }
+
+    /// 结构相似度：两个实体 RWR 向量的余弦相似度（需要已重建嵌入）
+    pub fn similarity(&self, a: &str, b: &str) -> Option<f64> {
+        let left = self.vectors.get(a)?;
+        let right = self.vectors.get(b)?;
+        let left_map: HashMap<&str, f64> =
+            left.iter().map(|(name, w)| (name.as_str(), *w)).collect();
+        let mut dot = 0.0;
+        for (name, weight) in right {
+            if let Some(other) = left_map.get(name.as_str()) {
+                dot += weight * other;
+            }
+        }
+        Some(dot.clamp(-1.0, 1.0))
+    }
+
+    /// 结构角色最接近的实体（按余弦相似度降序，过滤低于阈值者）
+    pub fn nearest(&self, entity: &str, k: usize) -> Vec<(String, f64)> {
+        if !self.vectors.contains_key(entity) {
+            return Vec::new();
+        }
+        let mut scored: Vec<(String, f64)> = self
+            .entities
+            .iter()
+            .filter(|other| other.as_str() != entity)
+            .filter_map(|other| {
+                self.similarity(entity, other)
+                    .filter(|score| *score >= self.similarity_floor)
+                    .map(|score| (other.clone(), score))
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            rank_key(b.1)
+                .cmp(&rank_key(a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored.truncate(k.max(1));
+        scored
+    }
+
+    /// 多源重启：把多个种子实体（如对话焦点栈）作为共同起点做上下文向量
+    pub fn context_related(&self, seeds: &[String], k: usize) -> Vec<(String, f64)> {
+        let mut merged: HashMap<String, f64> = HashMap::new();
+        let mut used = 0usize;
+        for seed in seeds {
+            let vector = match self.vectors.get(seed) {
+                Some(vector) => vector.clone(),
+                None => {
+                    if !self.neighbors.contains_key(seed) {
+                        continue;
+                    }
+                    self.ppr(seed)
+                }
+            };
+            used += 1;
+            for (entity, weight) in vector {
+                *merged.entry(entity).or_insert(0.0) += weight;
+            }
+        }
+        if used == 0 {
+            return Vec::new();
+        }
+        let seed_set: HashSet<&str> = seeds.iter().map(|s| s.as_str()).collect();
+        let mut result: Vec<(String, f64)> = merged
+            .into_iter()
+            .filter(|(entity, _)| !seed_set.contains(entity.as_str()))
+            .collect();
+        result.sort_by(|a, b| {
+            rank_key(b.1)
+                .cmp(&rank_key(a.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        result.truncate(k.max(1));
+        result
+    }
+
+    /// 最高游走概率的简单路径（用于解释两个实体为什么"结构相关"）
+    pub fn best_path(
+        &self,
+        from: &str,
+        to: &str,
+        max_hops: usize,
+    ) -> Option<Vec<(String, String)>> {
+        if from == to || !self.neighbors.contains_key(from) || !self.neighbors.contains_key(to) {
+            return None;
+        }
+        if self.entities.len() > self.max_embedded_entities {
+            return None;
+        }
+        let max_hops = max_hops.clamp(1, 5);
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(from);
+        let mut best: Option<(f64, Vec<(String, String)>)> = None;
+        self.search_path(
+            from,
+            to,
+            max_hops,
+            1.0,
+            &mut Vec::new(),
+            &mut visited,
+            &mut best,
+        );
+        best.map(|(_, path)| path)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_path<'a>(
+        &'a self,
+        current: &'a str,
+        target: &str,
+        remaining: usize,
+        score: f64,
+        path: &mut Vec<(String, String)>,
+        visited: &mut HashSet<&'a str>,
+        best: &mut Option<(f64, Vec<(String, String)>)>,
+    ) {
+        if remaining == 0 {
+            return;
+        }
+        let Some(list) = self.neighbors.get(current) else {
+            return;
+        };
+        for (predicate, neighbor) in list {
+            if neighbor == target {
+                let step_score = score / list.len() as f64;
+                path.push((predicate.clone(), neighbor.clone()));
+                let candidate = (step_score, path.clone());
+                let replace = match best {
+                    None => true,
+                    Some((best_score, best_path)) => {
+                        let diff = step_score - *best_score;
+                        if diff.abs() < 1e-12 {
+                            candidate.1 < *best_path
+                        } else {
+                            diff > 0.0
+                        }
+                    }
+                };
+                if replace {
+                    *best = Some(candidate);
+                }
+                path.pop();
+                continue;
+            }
+            if visited.contains(neighbor.as_str()) {
+                continue;
+            }
+            let step_score = score / list.len() as f64;
+            // 剪枝：剩余步数内不可能超过当前最优
+            if let Some((best_score, _)) = best {
+                if step_score <= *best_score {
+                    continue;
+                }
+            }
+            visited.insert(neighbor.as_str());
+            path.push((predicate.clone(), neighbor.clone()));
+            self.search_path(
+                neighbor,
+                target,
+                remaining - 1,
+                step_score,
+                path,
+                visited,
+                best,
+            );
+            path.pop();
+            visited.remove(neighbor.as_str());
+        }
+    }
+
+    /// 路径渲染：`张三 —师傅→ 李四 —师祖→ 王五`
+    pub fn render_path(from: &str, path: &[(String, String)]) -> String {
+        let mut out = String::from(from);
+        for (predicate, node) in path {
+            out.push_str(&format!(" —{}→ {}", predicate, node));
+        }
+        out
+    }
+
+    /// 结构联想报告：相关的实体、结构角色近邻、解释路径
+    pub fn report(&self, entity: &str, k: usize) -> String {
+        if !self.is_embedded(entity) {
+            return format!(
+                "结构联想中没有「{}」：它没有出现在任何关系三元组中。",
+                entity
+            );
+        }
+        let mut output = String::from(
+            "结构联想（随机游走重启 RWR 符号嵌入：向量=游走驻留分布，无神经网络）：\n",
+        );
+        output.push_str(&format!(
+            "  图规模：{} 个实体 / {} 条游走边；阻尼 {:.2}，迭代 {} 轮。\n",
+            self.entity_count(),
+            self.edge_count(),
+            self.damping,
+            self.iterations
+        ));
+        let related = self.related(entity, k.max(1));
+        if related.is_empty() {
+            output.push_str("  （没有可游走到的邻近实体：该实体是孤立节点）\n");
+            return output.trim_end().to_string();
+        }
+        output.push_str(&format!("  与「{}」结构最相关的实体：\n", entity));
+        for (index, (name, weight)) in related.iter().enumerate() {
+            output.push_str(&format!(
+                "    {}. {}（游走驻留概率 {:.3}）\n",
+                index + 1,
+                name,
+                weight
+            ));
+        }
+        let neighbors = self.nearest(entity, 3);
+        if !neighbors.is_empty() {
+            output.push_str("  结构角色最接近（RWR 向量余弦）：\n");
+            for (index, (name, score)) in neighbors.iter().enumerate() {
+                output.push_str(&format!(
+                    "    {}. {}（相似度 {:.3}）\n",
+                    index + 1,
+                    name,
+                    score
+                ));
+            }
+        }
+        if let Some((top, _)) = related.first() {
+            if let Some(path) = self.best_path(entity, top, 4) {
+                output.push_str(&format!(
+                    "  近邻解释路径：{}\n",
+                    Self::render_path(entity, &path)
+                ));
+            }
+        }
+        output.trim_end().to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain() -> GraphWalkEmbedding {
+        let mut graph = GraphWalkEmbedding::new(0.85, 20, 0.2);
+        graph.observe_triple("张三", "师傅", "李四");
+        graph.observe_triple("李四", "师傅", "王五");
+        graph.observe_triple("王五", "师傅", "赵六");
+        graph.rebuild();
+        graph
+    }
+
+    #[test]
+    fn test_related_prefers_direct_neighbor() {
+        let graph = chain();
+        let related = graph.related("张三", 3);
+        assert!(!related.is_empty());
+        assert_eq!(related[0].0, "李四", "直接邻居应是游走概率最高者");
+        assert!(related[0].1 > 0.0);
+    }
+
+    #[test]
+    fn test_probability_mass_decays_with_distance() {
+        let graph = chain();
+        let related: HashMap<String, f64> = graph.related("张三", 3).into_iter().collect();
+        let li = related.get("李四").copied().unwrap_or(0.0);
+        let wang = related.get("王五").copied().unwrap_or(0.0);
+        assert!(li > wang, "越远的实体驻留概率应越低");
+    }
+
+    #[test]
+    fn test_structural_similarity_symmetric_positions() {
+        let mut graph = GraphWalkEmbedding::new(0.85, 20, 0.2);
+        // 甲、乙、丙 都有同一个老师 "导师"，结构角色相同
+        graph.observe_triple("甲", "导师", "导师");
+        graph.observe_triple("乙", "导师", "导师");
+        graph.observe_triple("丙", "导师", "导师");
+        graph.observe_triple("导师", "就职于", "大学");
+        // 一个无关的小组件：与甲的结构向量无重叠，应被相似度区分开
+        graph.observe_triple("老张", "朋友", "老王");
+        graph.rebuild();
+        let ab = graph.similarity("甲", "乙").expect("应有向量");
+        let ac = graph.similarity("甲", "丙").expect("应有向量");
+        assert!(ab > 0.5, "结构同位实体的余弦相似度应较高，实得 {}", ab);
+        assert!((ab - ac).abs() < 1e-9, "对称结构相似度应相等");
+        let nearest = graph.nearest("甲", 2);
+        assert!(
+            nearest.iter().any(|(name, _)| name == "乙" || name == "丙"),
+            "nearest={:?}, ab={}, ac={}",
+            nearest,
+            ab,
+            ac
+        );
+    }
+
+    #[test]
+    fn test_context_related_uses_multiple_seeds() {
+        let graph = chain();
+        let seeds = vec!["张三".to_string(), "赵六".to_string()];
+        let related = graph.context_related(&seeds, 2);
+        assert!(!related.is_empty());
+        assert!(
+            related
+                .iter()
+                .all(|(name, _)| name != "张三" && name != "赵六"),
+            "种子实体本身不应出现在延伸结果里"
+        );
+    }
+
+    #[test]
+    fn test_best_path_explains_connection() {
+        let graph = chain();
+        let path = graph.best_path("张三", "赵六", 4).expect("存在三跳路径");
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0].1, "李四");
+        assert_eq!(path[1].1, "王五");
+        assert_eq!(path[2].1, "赵六");
+        assert!(path.iter().all(|(predicate, _)| predicate == "师傅"));
+        let rendered = GraphWalkEmbedding::render_path("张三", &path);
+        assert!(rendered.contains("张三 —师傅→ 李四"));
+    }
+
+    #[test]
+    fn test_unknown_entity_report_is_graceful() {
+        let graph = chain();
+        let report = graph.report("不存在的人", 3);
+        assert!(report.contains("没有"));
+        assert!(graph.ppr("不存在的人").is_empty());
+        assert!(graph.best_path("张三", "不存在的人", 4).is_none());
+    }
+
+    #[test]
+    fn test_report_contains_walk_evidence() {
+        let graph = chain();
+        let report = graph.report("张三", 3);
+        assert!(report.contains("随机游走重启"));
+        assert!(report.contains("李四"));
+        assert!(report.contains("游走驻留概率"));
+    }
+}

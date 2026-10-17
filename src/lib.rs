@@ -34,6 +34,9 @@ pub mod semantic_entailment;
 pub mod resolution_engine;
 pub mod abduction;
 pub mod association_miner;
+pub mod graph_walk_embedding;
+pub mod markov_logic;
+pub mod causal_reasoning;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
@@ -115,6 +118,36 @@ pub struct ReasoningConfig {
     pub abduction_max_scenario_size: usize,
     #[serde(default = "default_enable_clarification")]
     pub enable_clarification: bool,
+    #[serde(default = "default_enable_graph_walk")]
+    pub enable_graph_walk: bool,
+    #[serde(default = "default_graph_walk_damping")]
+    pub graph_walk_damping: f64,
+    #[serde(default = "default_graph_walk_iterations")]
+    pub graph_walk_iterations: usize,
+    #[serde(default = "default_enable_soft_logic")]
+    pub enable_soft_logic: bool,
+    #[serde(default = "default_soft_logic_max_iterations")]
+    pub soft_logic_max_iterations: usize,
+    #[serde(default = "default_soft_logic_min_probability")]
+    pub soft_logic_min_probability: f64,
+    #[serde(default = "default_enable_causal_reasoning")]
+    pub enable_causal_reasoning: bool,
+    #[serde(default = "default_causal_max_depth")]
+    pub causal_max_depth: usize,
+    #[serde(default = "default_enable_gradient_attribution")]
+    pub enable_gradient_attribution: bool,
+}
+
+fn default_enable_causal_reasoning() -> bool {
+    true
+}
+
+fn default_causal_max_depth() -> usize {
+    4
+}
+
+fn default_enable_gradient_attribution() -> bool {
+    true
 }
 
 fn default_enable_resolution() -> bool {
@@ -159,6 +192,30 @@ fn default_abduction_max_scenario_size() -> usize {
 
 fn default_enable_clarification() -> bool {
     true
+}
+
+fn default_enable_graph_walk() -> bool {
+    true
+}
+
+fn default_graph_walk_damping() -> f64 {
+    0.85
+}
+
+fn default_graph_walk_iterations() -> usize {
+    12
+}
+
+fn default_enable_soft_logic() -> bool {
+    true
+}
+
+fn default_soft_logic_max_iterations() -> usize {
+    4
+}
+
+fn default_soft_logic_min_probability() -> f64 {
+    0.5
 }
 
 fn default_enable_entailment() -> bool {
@@ -236,6 +293,15 @@ impl Default for ReasoningConfig {
             abduction_max_hypotheses: default_abduction_max_hypotheses(),
             abduction_max_scenario_size: default_abduction_max_scenario_size(),
             enable_clarification: default_enable_clarification(),
+            enable_graph_walk: default_enable_graph_walk(),
+            graph_walk_damping: default_graph_walk_damping(),
+            graph_walk_iterations: default_graph_walk_iterations(),
+            enable_soft_logic: default_enable_soft_logic(),
+            soft_logic_max_iterations: default_soft_logic_max_iterations(),
+            soft_logic_min_probability: default_soft_logic_min_probability(),
+            enable_causal_reasoning: default_enable_causal_reasoning(),
+            causal_max_depth: default_causal_max_depth(),
+            enable_gradient_attribution: default_enable_gradient_attribution(),
         }
     }
 }

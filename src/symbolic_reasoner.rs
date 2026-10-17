@@ -7,8 +7,11 @@ use crate::abduction::{
     Scenario,
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
+use crate::causal_reasoning::{CausalAnalyzer, CounterfactualDelta};
 use crate::entity_linker::{EntityLinker, LinkMethod};
+use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
+use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
@@ -265,6 +268,10 @@ pub struct SymbolicReasoner {
     predictor: LinkPredictor,
     context: DialogueContext,
     embedding: SymbolicEmbedding,
+    // 符号化图嵌入：随机游走重启（RWR）向量，做结构联想与话题延伸
+    walks: GraphWalkEmbedding,
+    // 轻量马尔可夫逻辑网络：加权规则软真值传播 + 加权 MAP 局部搜索
+    soft: MarkovLogicEngine,
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
@@ -316,12 +323,23 @@ impl SymbolicReasoner {
         );
         let mut abduction = abduction;
         abduction.set_max_scenario_size(config.abduction_max_scenario_size);
+        let walks = GraphWalkEmbedding::new(
+            config.graph_walk_damping,
+            config.graph_walk_iterations,
+            config.embedding_similarity_floor,
+        );
+        let soft = MarkovLogicEngine::new(
+            config.soft_logic_max_iterations,
+            config.soft_logic_min_probability,
+        );
         let mut reasoner = Self {
             config,
             aligner,
             predictor: LinkPredictor::new(),
             context: DialogueContext::new(5),
             embedding,
+            walks,
+            soft,
             planner: QueryPlanner::new(),
             linker,
             generator,
@@ -357,6 +375,14 @@ impl SymbolicReasoner {
         &self.embedding
     }
 
+    pub fn walks(&self) -> &GraphWalkEmbedding {
+        &self.walks
+    }
+
+    pub fn soft_logic(&self) -> &MarkovLogicEngine {
+        &self.soft
+    }
+
     pub fn linker(&self) -> &EntityLinker {
         &self.linker
     }
@@ -383,6 +409,9 @@ impl SymbolicReasoner {
                     self.generator.observe_triple(from, rel_type, to);
                     if self.config.enable_semantic_embedding {
                         self.embedding.observe_triple(from, rel_type, to);
+                    }
+                    if self.config.enable_graph_walk {
+                        self.walks.observe_triple(from, rel_type, to);
                     }
                     association_changed |= self.associations.observe_triple(from, rel_type);
                     added += 1;
@@ -448,6 +477,16 @@ impl SymbolicReasoner {
         {
             self.rebuild_resolver();
         }
+        // 加权软逻辑与归结引擎同源（同一批事实与规则），触发条件保持一致
+        if self.config.enable_soft_logic
+            && (association_changed || attribute_changed || entity_type_changed || triples_added)
+        {
+            self.rebuild_soft_logic();
+        }
+        // 图游走嵌入只在结构边新增时重算（RWR 幂迭代)
+        if self.config.enable_graph_walk && triples_added {
+            self.walks.rebuild();
+        }
         // 实体事实同样会更新嵌入（observe_entity），因此也需要重建
         if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();
@@ -488,6 +527,48 @@ impl SymbolicReasoner {
             engine.add_fact_atom(atom.clone());
         }
         self.resolver = engine;
+    }
+
+    /// 用当前知识重建加权软逻辑引擎：事实同上，规则权重 = 置信度的 log-odds
+    fn rebuild_soft_logic(&mut self) {
+        let mut engine = MarkovLogicEngine::new(
+            self.config.soft_logic_max_iterations,
+            self.config.soft_logic_min_probability,
+        );
+        for triple in self.predictor.triples() {
+            engine.add_fact(Atom::rel(&triple.predicate, &triple.subject, &triple.object));
+            engine.add_fact(Atom::rel(PROOF_HAS, &triple.subject, &triple.predicate));
+        }
+        for (subject, key, value) in &self.attributes {
+            engine.add_fact(Atom::rel(key, subject, value));
+            engine.add_fact(Atom::rel(PROOF_HAS, subject, key));
+        }
+        for (entity, etype) in self.generator.typed_entities() {
+            engine.add_fact(Atom::rel(PROOF_TYPE, &entity, &etype));
+        }
+        for atom in &self.session_facts {
+            engine.add_fact(atom.clone());
+        }
+        if self.config.enable_association_rules {
+            for clause in self.associations.to_clauses(PROOF_HAS, PROOF_TYPE) {
+                engine.add_rule(WeightedRule::new(
+                    clause.head,
+                    clause.body,
+                    MarkovLogicEngine::weight_from_confidence(clause.confidence),
+                    &clause.source,
+                ));
+            }
+        }
+        for rule in self.predictor.rules() {
+            let clause = clause_from_path_rule(rule);
+            engine.add_rule(WeightedRule::new(
+                clause.head,
+                clause.body,
+                MarkovLogicEngine::weight_from_confidence(clause.confidence),
+                &clause.source,
+            ));
+        }
+        self.soft = engine;
     }
 
     pub fn resolver(&self) -> &ResolutionEngine {
@@ -1121,8 +1202,12 @@ impl SymbolicReasoner {
             added = true;
         }
         if !self.session_facts.contains(&atom) {
-            self.session_facts.push(atom);
+            self.session_facts.push(atom.clone());
             added = true;
+        }
+        // 会话假设同步注入软逻辑引擎（无需等待下一次全量重建）
+        if added && self.config.enable_soft_logic {
+            self.soft.add_fact(atom);
         }
         added
     }
@@ -2453,6 +2538,645 @@ impl SymbolicReasoner {
         output.trim_end().to_string()
     }
 
+    /// 结构联想：RWR 图嵌入检索 + 结构角色近邻 + 关联路径解释
+    pub fn structural_related_report(&self, entity_raw: &str) -> String {
+        if !self.config.enable_graph_walk {
+            return "结构联想（图游走）未启用（config.toml [reasoning] enable_graph_walk = false）。"
+                .to_string();
+        }
+        let raw = entity_raw.trim();
+        if raw.is_empty() {
+            return "请输入要联想的实体，例如：结构联想：张三".to_string();
+        }
+        let entity = self.aligner.canonical_form(raw);
+        if !self.walks.is_embedded(&entity) {
+            if let Some(linked) = self.best_linked_entity(raw) {
+                if self.walks.is_embedded(&linked) {
+                    return self.walks.report(&linked, 5);
+                }
+            }
+            return format!("结构联想中没有「{}」：它没有出现在任何关系三元组中。", entity);
+        }
+        self.walks.report(&entity, 5)
+    }
+
+    /// 话题延伸：以对话焦点实体栈为多源种子做重启随机游走（上下文敏感的联想）
+    pub fn topic_extension_report(&self) -> String {
+        if !self.config.enable_graph_walk {
+            return "话题延伸（图游走）未启用（config.toml [reasoning] enable_graph_walk = false）。"
+                .to_string();
+        }
+        let seeds: Vec<String> = self.context.focus_entities().to_vec();
+        if seeds.is_empty() {
+            return "还没有对话焦点：先聊到一个实体，再输入「话题延伸」。".to_string();
+        }
+        let related = self.walks.context_related(&seeds, 6);
+        if related.is_empty() {
+            return format!(
+                "焦点实体「{}」不在关系图中（或无相邻实体），暂时无法延伸话题。",
+                seeds.join("、")
+            );
+        }
+        let mut output = format!(
+            "话题延伸（以对话焦点 [{}] 为多源种子做 RWR 图游走；图规模 {} 实体 / {} 边）：\n",
+            seeds.join(" → "),
+            self.walks.entity_count(),
+            self.walks.edge_count()
+        );
+        for (index, (name, weight)) in related.iter().enumerate() {
+            let mut line = format!("  {}. {}（联合驻留概率 {:.3}）", index + 1, name, weight);
+            if let Some((seed, path)) = seeds.iter().find_map(|seed| {
+                self.walks
+                    .best_path(seed, name, 4)
+                    .map(|path| (seed.clone(), path))
+            }) {
+                line.push_str(&format!(
+                    "；路径：{}",
+                    GraphWalkEmbedding::render_path(&seed, &path)
+                ));
+            }
+            output.push_str(&line);
+            output.push('\n');
+        }
+        if let Some(focus) = seeds.first() {
+            let similar = self.walks.nearest(focus, 3);
+            if !similar.is_empty() {
+                output.push_str(&format!("\n  与「{}」结构角色相近：", focus));
+                output.push_str(
+                    &similar
+                        .iter()
+                        .map(|(name, score)| format!("{}({:.2})", name, score))
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                );
+            }
+        }
+        output
+    }
+
+    /// 全局软推理报告：加权规则推出的候选事实（按概率排序）
+    pub fn soft_facts_report(&self, limit: usize) -> String {
+        if !self.config.enable_soft_logic {
+            return "加权软逻辑未启用（config.toml [reasoning] enable_soft_logic = false）。"
+                .to_string();
+        }
+        let limit = limit.clamp(1, 20);
+        let all: Vec<SoftFact> = self.soft.all_predictions(limit * 4);
+        // 优先展示"推出的新事实"；若没有（规则不足），退化为展示已知事实
+        let inferred: Vec<SoftFact> = all
+            .iter()
+            .filter(|fact| !fact.from_fact)
+            .cloned()
+            .collect();
+        let showing_inferred = !inferred.is_empty();
+        let mut predictions = if showing_inferred { inferred } else { all };
+        predictions.truncate(limit);
+        let mut output = format!(
+            "加权软推理（MLN-lite：log-odds 累加 + sigmoid 归一；事实 {} 条，加权规则 {} 条，阈值 P≥{:.2}）：\n",
+            self.soft.fact_count(),
+            self.soft.rule_count(),
+            self.soft.min_probability()
+        );
+        if predictions.is_empty() {
+            output.push_str("  （暂无可推出的软事实：可增加事实/规则或降低阈值）\n");
+            return output.trim_end().to_string();
+        }
+        if !showing_inferred {
+            output.push_str("  （暂无可加权推出的新事实，以下为已确认事实）\n");
+        }
+        for (index, fact) in predictions.iter().enumerate() {
+            output.push_str(&format!("  {}. {}\n", index + 1, self.render_soft_fact(fact)));
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 针对某个实体（可带「的谓词」）的软推理报告
+    pub fn soft_inference_report(&self, target_raw: &str) -> String {
+        if !self.config.enable_soft_logic {
+            return "加权软逻辑未启用（config.toml [reasoning] enable_soft_logic = false）。"
+                .to_string();
+        }
+        let target = target_raw.trim();
+        if target.is_empty() {
+            return "请输入要软推理的对象，例如：软推理：张三 或 软推理：张三的师傅".to_string();
+        }
+        let Some((entity, predicate)) = self.split_entity_predicate(target) else {
+            return format!("无法在「{}」中识别出已知实体。", target);
+        };
+        let facts: Vec<SoftFact> = match predicate {
+            Some(predicate) if !predicate.is_empty() => {
+                let forward = self.soft.infer(
+                    &Atom::pattern(&predicate, Term::constant(&entity), Term::var("X")),
+                    8,
+                );
+                if !forward.is_empty() {
+                    forward
+                } else {
+                    self.soft.infer(
+                        &Atom::pattern(&predicate, Term::var("X"), Term::constant(&entity)),
+                        8,
+                    )
+                }
+            }
+            _ => self.collect_soft_facts_for_entity(&entity, 8),
+        };
+        if facts.is_empty() {
+            return format!(
+                "软推理没有找到关于「{}」达到阈值（P≥{:.2}）的候选：可增加同类事实/规则，或降低阈值。",
+                entity,
+                self.soft.min_probability()
+            );
+        }
+        let mut output = format!(
+            "加权软推理（关于「{}」；事实 {} 条，加权规则 {} 条，无神经网络）：\n",
+            entity,
+            self.soft.fact_count(),
+            self.soft.rule_count()
+        );
+        for (index, fact) in facts.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}\n",
+                index + 1,
+                self.render_soft_fact(fact)
+            ));
+            if let Some(evidence) = fact.evidence.first() {
+                output.push_str(&format!(
+                    "     依据：{}（权重 {:+.2}）\n",
+                    evidence.source, evidence.weight
+                ));
+                if !evidence.premises.is_empty() {
+                    let premises = evidence
+                        .premises
+                        .iter()
+                        .map(|premise| self.render_atom_nl(premise))
+                        .collect::<Vec<_>>()
+                        .join(" 且 ");
+                    output.push_str(&format!("     前提：{}\n", premises));
+                }
+            }
+        }
+        output.trim_end().to_string()
+    }
+
+    fn collect_soft_facts_for_entity(&self, entity: &str, limit: usize) -> Vec<SoftFact> {
+        let mut merged: HashMap<String, SoftFact> = HashMap::new();
+        for atom in self.soft.facts() {
+            if atom.predicate.starts_with("__") {
+                continue;
+            }
+            if atom.terms.iter().any(|term| term.name() == entity) {
+                merged.insert(
+                    atom.display(),
+                    SoftFact {
+                        atom: atom.clone(),
+                        probability: 1.0,
+                        log_odds: 6.0,
+                        evidence: Vec::new(),
+                        from_fact: true,
+                    },
+                );
+            }
+        }
+        for fact in self.soft.all_predictions(256) {
+            if fact.from_fact && fact.atom.predicate.starts_with("__") {
+                continue;
+            }
+            if !fact.atom.terms.iter().any(|term| term.name() == entity) {
+                continue;
+            }
+            merged
+                .entry(fact.atom.display())
+                .and_modify(|existing| {
+                    if fact.probability > existing.probability {
+                        *existing = fact.clone();
+                    }
+                })
+                .or_insert(fact);
+        }
+        let mut results: Vec<SoftFact> = merged.into_values().collect();
+        results.sort_by(|a, b| {
+            b.probability
+                .partial_cmp(&a.probability)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        results.truncate(limit.max(1));
+        results
+    }
+
+    fn render_soft_fact(&self, fact: &SoftFact) -> String {
+        let mut text = format!(
+            "{} {}（P={:.2}",
+            self.render_atom_nl(&fact.atom),
+            MarkovLogicEngine::hedge(fact.probability),
+            fact.probability
+        );
+        if fact.from_fact {
+            text.push_str("，图谱事实");
+        }
+        if let Some(evidence) = fact.evidence.first() {
+            text.push_str(&format!("；依据：{}", evidence.source));
+        }
+        text.push('）');
+        text
+    }
+
+    /// 收集可用于因果解释的目标（优先非事实的加权推测，其次图谱事实）
+    fn causal_targets(&self, entity: &str, predicate: Option<&str>, limit: usize) -> Vec<SoftFact> {
+        let predicate_matches = |atom: &Atom| -> bool {
+            match predicate {
+                Some(pred) if !pred.is_empty() => atom.predicate.as_ref() == pred,
+                _ => !atom.predicate.starts_with("__"),
+            }
+        };
+        let mentions_entity =
+            |atom: &Atom| atom.terms.iter().any(|term| term.name() == entity);
+        let mut merged: HashMap<String, SoftFact> = HashMap::new();
+        for atom in self.soft.facts() {
+            if !mentions_entity(atom) || !predicate_matches(atom) {
+                continue;
+            }
+            merged.insert(
+                atom.display(),
+                SoftFact {
+                    atom: atom.clone(),
+                    probability: 1.0,
+                    log_odds: 6.0,
+                    evidence: Vec::new(),
+                    from_fact: true,
+                },
+            );
+        }
+        for fact in self.soft.all_predictions(256) {
+            if !mentions_entity(&fact.atom) || !predicate_matches(&fact.atom) {
+                continue;
+            }
+            merged
+                .entry(fact.atom.display())
+                .and_modify(|existing| {
+                    if fact.probability > existing.probability {
+                        *existing = fact.clone();
+                    }
+                })
+                .or_insert(fact);
+        }
+        let mut results: Vec<SoftFact> = merged.into_values().collect();
+        results.sort_by(|a, b| {
+            a.from_fact
+                .cmp(&b.from_fact)
+                .then_with(|| {
+                    b.probability
+                        .partial_cmp(&a.probability)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        results.truncate(limit.max(1));
+        results
+    }
+
+    /// 找出某个「实体[的谓词]」对应的可干预原子（优先图谱事实，其次加权推测；
+    /// 实体作主语优先——"李四的师傅"应干预 师傅(李四, ?)，结果确定可复现）
+    fn find_causal_atom(&self, entity: &str, predicate: Option<&str>) -> Option<Atom> {
+        let predicate_matches = |atom: &Atom| -> bool {
+            match predicate {
+                Some(pred) if !pred.is_empty() => atom.predicate.as_ref() == pred,
+                _ => !atom.predicate.starts_with("__"),
+            }
+        };
+        let subject_matches = |atom: &Atom| -> bool {
+            atom.terms
+                .first()
+                .map(|term| term.name() == entity)
+                .unwrap_or(false)
+                && predicate_matches(atom)
+        };
+        let any_matches = |atom: &Atom| -> bool {
+            atom.terms.iter().any(|term| term.name() == entity) && predicate_matches(atom)
+        };
+        if let Some(atom) = self
+            .soft
+            .facts()
+            .find(|atom| subject_matches(atom))
+            .or_else(|| self.soft.facts().find(|atom| any_matches(atom)))
+        {
+            return Some(atom.clone());
+        }
+        self.soft
+            .all_predictions(256)
+            .into_iter()
+            .find(|fact| subject_matches(&fact.atom))
+            .or_else(|| {
+                self.soft
+                    .all_predictions(256)
+                    .into_iter()
+                    .find(|fact| any_matches(&fact.atom))
+            })
+            .map(|fact| fact.atom)
+    }
+
+    /// 因果推理报告：因果图 + 直接原因 + 事实根因链 + 混杂因子（纯符号 do-演算视角）
+    pub fn causal_report(&self, target_raw: &str) -> String {
+        if !self.config.enable_causal_reasoning {
+            return "因果推理未启用（config.toml [reasoning] enable_causal_reasoning = false）。"
+                .to_string();
+        }
+        if !self.config.enable_soft_logic {
+            return "因果推理依赖加权软逻辑，请先启用 enable_soft_logic。".to_string();
+        }
+        let target = target_raw.trim();
+        if target.is_empty() {
+            return "请输入要因果解释的对象，例如：因果：李四的师祖 或 因果：张三".to_string();
+        }
+        let Some((entity, predicate)) = self.split_entity_predicate(target) else {
+            return format!("无法在「{}」中识别出已知实体。", target);
+        };
+        let candidates = self.causal_targets(&entity, predicate.as_deref(), 3);
+        if candidates.is_empty() {
+            return format!("没有找到关于「{}」可用于因果解释的事实或加权推测。", entity);
+        }
+        let analyzer = CausalAnalyzer::from_engine(&self.soft, self.config.causal_max_depth);
+        let graph = analyzer.graph();
+        let mut output = format!(
+            "因果推理（因果图 {} 节点 / {} 条有符号机制；正权促进、负权抑制；规则基化自 {} 条事实）：\n",
+            graph.node_count(),
+            graph.edge_count(),
+            self.soft.fact_count()
+        );
+        for (index, fact) in candidates.iter().enumerate() {
+            let explanation = analyzer.explain(&self.soft, &fact.atom, 3);
+            output.push_str(&format!(
+                "  {}. {} {}（P={:.2}）\n",
+                index + 1,
+                self.render_atom_nl(&explanation.target),
+                if explanation.probability >= 0.999 {
+                    "是图谱事实"
+                } else {
+                    MarkovLogicEngine::hedge(explanation.probability)
+                },
+                explanation.probability
+            ));
+            if explanation.direct_causes.is_empty() {
+                output.push_str("     直接原因：（没有规则指向它，可能是一手事实）\n");
+            } else {
+                output.push_str("     直接原因：\n");
+                for link in &explanation.direct_causes {
+                    output.push_str(&format!(
+                        "       • {}（P={:.2}）—[{:+.2}{}]→ 本结论；依据：{}\n",
+                        self.render_atom_nl(&link.cause),
+                        link.cause_probability,
+                        link.weight,
+                        if link.is_inhibitory() { "，抑制" } else { "" },
+                        link.source
+                    ));
+                }
+            }
+            if let Some(chain) = explanation.chains.first() {
+                output.push_str(&format!("     事实根因链：{}\n", chain.render()));
+            }
+            if !explanation.confounders.is_empty() {
+                let names = explanation
+                    .confounders
+                    .iter()
+                    .map(|atom| self.render_atom_nl(atom))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                output.push_str(&format!(
+                    "     注意混杂因子（同为原因，相关≠因果）：{}\n",
+                    names
+                ));
+            }
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 因果反事实报告：do(干预原子=真/假) 后，下游结论在"事实世界"与"干预世界"的概率差
+    pub fn counterfactual_report(&self, target_raw: &str, value: bool) -> String {
+        if !self.config.enable_causal_reasoning {
+            return "因果推理未启用（config.toml [reasoning] enable_causal_reasoning = false）。"
+                .to_string();
+        }
+        if !self.config.enable_soft_logic {
+            return "反事实推理依赖加权软逻辑，请先启用 enable_soft_logic。".to_string();
+        }
+        let target = target_raw.trim();
+        if target.is_empty() {
+            return "请输入要干预的对象，例如：干预：张三的师傅 或 干预：张三的师傅=真".to_string();
+        }
+        let Some((entity, predicate)) = self.split_entity_predicate(target) else {
+            return format!("无法在「{}」中识别出已知实体。", target);
+        };
+        let Some(intervention) = self.find_causal_atom(&entity, predicate.as_deref()) else {
+            return format!(
+                "没有找到关于「{}」的可干预原子（需要先有该事实或能推出它的规则）。",
+                entity
+            );
+        };
+        let analyzer = CausalAnalyzer::from_engine(&self.soft, self.config.causal_max_depth);
+        let probes = analyzer.direct_effect_probes(&intervention);
+        if probes.is_empty() {
+            return format!(
+                "干预「{}」在当前因果图中没有直接下游（没有规则以它为前提），因此反事实世界与事实世界相同。",
+                intervention.display()
+            );
+        }
+        let mut deltas: Vec<CounterfactualDelta> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for probe in probes.iter().take(6) {
+            for delta in analyzer
+                .counterfactual(&self.soft, probe, &intervention, value, 4)
+                .deltas
+            {
+                if seen.insert(delta.atom.display()) {
+                    deltas.push(delta);
+                }
+            }
+        }
+        deltas.sort_by(|a, b| {
+            b.delta
+                .abs()
+                .partial_cmp(&a.delta.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        deltas.truncate(8);
+        let mut output = format!(
+            "反事实推理（do：干预「{}」={}；符号实现 = 钉住真值 + 切断指向它的规则，其余规则重新软传播）：\n",
+            self.render_atom_nl(&intervention),
+            if value { "真" } else { "假" }
+        );
+        output.push_str("  事实世界 → 干预世界（Δ=干预后−事实）：\n");
+        for (index, delta) in deltas.iter().enumerate() {
+            let direction = if delta.delta > 1e-9 {
+                "上升"
+            } else if delta.delta < -1e-9 {
+                "下降"
+            } else {
+                "不变"
+            };
+            let factual_hedge = if delta.factual <= 1e-9 {
+                "未推出"
+            } else {
+                MarkovLogicEngine::hedge(delta.factual)
+            };
+            let counterfactual_hedge = if delta.counterfactual <= 1e-9 {
+                "未推出"
+            } else {
+                MarkovLogicEngine::hedge(delta.counterfactual)
+            };
+            output.push_str(&format!(
+                "  {}. {}：P {:.2}（{}）→ {:.2}（{}），Δ={:+.2}（{}）\n",
+                index + 1,
+                self.render_atom_nl(&delta.atom),
+                delta.factual,
+                factual_hedge,
+                delta.counterfactual,
+                counterfactual_hedge,
+                delta.delta,
+                direction
+            ));
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 符号梯度归因报告（"可微推理"的纯符号实现：解析求导，只解释与排序求证，不训练）
+    pub fn gradient_report(&self, target_raw: &str) -> String {
+        if !self.config.enable_gradient_attribution {
+            return "符号梯度归因未启用（config.toml [reasoning] enable_gradient_attribution = false）。"
+                .to_string();
+        }
+        if !self.config.enable_soft_logic {
+            return "符号梯度归因依赖加权软逻辑，请先启用 enable_soft_logic。".to_string();
+        }
+        let target = target_raw.trim();
+        if target.is_empty() {
+            return "请输入要归因的对象，例如：梯度归因：李四的师祖 或 梯度归因：张三".to_string();
+        }
+        let Some((entity, predicate)) = self.split_entity_predicate(target) else {
+            return format!("无法在「{}」中识别出已知实体。", target);
+        };
+        let pattern = match predicate.as_deref() {
+            Some(pred) if !pred.is_empty() => {
+                Atom::pattern(pred, Term::constant(&entity), Term::var("X"))
+            }
+            _ => {
+                let Some(candidate) = self
+                    .collect_soft_facts_for_entity(&entity, 8)
+                    .into_iter()
+                    .find(|fact| !fact.from_fact)
+                else {
+                    return format!(
+                        "「{}」目前只有图谱事实、没有加权推测，无需梯度归因。",
+                        entity
+                    );
+                };
+                candidate.atom
+            }
+        };
+        let mut attributions = self.soft.gradient(&pattern, 3);
+        if attributions.is_empty() {
+            if let Some(pred) = predicate.as_deref().filter(|pred| !pred.is_empty()) {
+                attributions = self.soft.gradient(
+                    &Atom::pattern(pred, Term::var("X"), Term::constant(&entity)),
+                    3,
+                );
+            }
+        }
+        if attributions.is_empty() {
+            return format!("没有可做梯度归因的加权推测（「{}」未被任何规则支持）。", entity);
+        }
+        let mut output = format!(
+            "符号梯度归因（可微推理的纯符号版：∂P/∂w = P(1−P)·前件满足度；解析求导、不训练、无神经网络）\n"
+        );
+        for (index, attribution) in attributions.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {} {}（P={:.3}，log-odds {:+.3}）\n",
+                index + 1,
+                self.render_atom_nl(&attribution.atom),
+                MarkovLogicEngine::hedge(attribution.probability),
+                attribution.probability,
+                attribution.log_odds
+            ));
+            for contribution in attribution.contributions.iter().take(4) {
+                let premises = if contribution.premises.is_empty() {
+                    "（无前件）".to_string()
+                } else {
+                    contribution
+                        .premises
+                        .iter()
+                        .map(|premise| self.render_atom_nl(premise))
+                        .collect::<Vec<_>>()
+                        .join(" 且 ")
+                };
+                output.push_str(&format!(
+                    "     规则贡献 ∂P/∂w={:+.4}（权重 {:+.2}，前件满足度 {:.2}）：{}\n       来源：{}\n",
+                    contribution.gradient,
+                    contribution.weight,
+                    contribution.satisfaction,
+                    premises,
+                    contribution.source
+                ));
+            }
+            let uncertain: Vec<_> = attribution
+                .premise_sensitivity
+                .iter()
+                .filter(|sensitivity| sensitivity.truth < 0.999)
+                .take(3)
+                .collect();
+            if !uncertain.is_empty() {
+                output.push_str("     最值得求证的前提（按 |∂P/∂s|·(1−真值) 排序）：\n");
+                for sensitivity in uncertain {
+                    output.push_str(&format!(
+                        "       • {}（当前软真值 {:.2}，∂P/∂s={:+.3}，求证优先级 {:.3}）\n",
+                        self.render_atom_nl(&sensitivity.premise),
+                        sensitivity.truth,
+                        sensitivity.gradient,
+                        sensitivity.verify_priority
+                    ));
+                }
+            }
+        }
+        output.trim_end().to_string()
+    }
+
+    /// 把「实体[的谓词]」拆成规范实体与可选谓词（最长前缀匹配，支持同义词）
+    fn split_entity_predicate(&self, target: &str) -> Option<(String, Option<String>)> {
+        let mut best: Option<(usize, String)> = None;
+        let mut consider = |name: &str, canonical: &str| {
+            if name.is_empty() || !target.starts_with(name) {
+                return;
+            }
+            let length = name.chars().count();
+            if best
+                .as_ref()
+                .map(|(best_length, _)| length > *best_length)
+                .unwrap_or(true)
+            {
+                best = Some((length, canonical.to_string()));
+            }
+        };
+        for profile in self.aligner.profiles() {
+            if profile.kind == TermKind::Entity {
+                let canonical = self.aligner.canonical_form(&profile.term);
+                consider(&profile.term, &canonical);
+            }
+        }
+        for (alias, canonical) in self.aligner.synonyms() {
+            if self.aligner.kind_of(canonical) == Some(TermKind::Entity) {
+                consider(alias, canonical);
+            }
+        }
+        let (length, entity) = best?;
+        let remainder: String = target.chars().skip(length).collect();
+        let remainder = remainder.trim().trim_start_matches(['的', '：', ':', ' ', '是']);
+        let predicate = if remainder.is_empty() {
+            None
+        } else {
+            Some(self.aligner.canonical_form(remainder))
+        };
+        Some((entity, predicate))
+    }
+
     pub fn dialogue_summary(&self) -> String {
         let focus = if self.context.focus_entities().is_empty() {
             "（空）".to_string()
@@ -2633,6 +3357,15 @@ mod tests {
             abduction_max_hypotheses: 5,
             abduction_max_scenario_size: 2,
             enable_clarification: true,
+            enable_graph_walk: true,
+            graph_walk_damping: 0.85,
+            graph_walk_iterations: 12,
+            enable_soft_logic: true,
+            soft_logic_max_iterations: 4,
+            soft_logic_min_probability: 0.5,
+            enable_causal_reasoning: true,
+            causal_max_depth: 4,
+            enable_gradient_attribution: true,
         }
     }
 
@@ -3490,6 +4223,163 @@ mod tests {
             proof.contains("得证"),
             "重建后采纳的假设不应丢失：{}",
             proof
+        );
+    }
+
+    #[test]
+    fn test_structural_related_report_uses_random_walk() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.structural_related_report("张三");
+        assert!(report.contains("随机游走重启"), "实际：{}", report);
+        assert!(report.contains("李四"), "直接邻居应在结构联想中：{}", report);
+        assert!(report.contains("游走驻留概率"));
+    }
+
+    #[test]
+    fn test_topic_extension_uses_dialogue_focus() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(
+            reasoner.topic_extension_report().contains("还没有对话焦点"),
+            "无焦点时应给出提示"
+        );
+        let _ = reasoner.contextualize("张三的师傅是谁");
+        let report = reasoner.topic_extension_report();
+        assert!(report.contains("话题延伸"), "实际：{}", report);
+        assert!(report.contains("张三"), "焦点实体应出现在报告中：{}", report);
+        assert!(report.contains("李四"), "焦点邻居应被延伸出来：{}", report);
+    }
+
+    #[test]
+    fn test_soft_inference_report_gives_probability_and_evidence() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let known = reasoner.soft_inference_report("张三的师祖");
+        assert!(known.contains("王五"), "实际：{}", known);
+        assert!(known.contains("P=1.00"), "图谱事实概率应为 1：{}", known);
+        let inferred = reasoner.soft_inference_report("李四的师祖");
+        assert!(inferred.contains("赵六"), "实际：{}", inferred);
+        assert!(inferred.contains("依据"), "软推理应给出证据：{}", inferred);
+        assert!(inferred.contains("P="), "软推理应给出概率：{}", inferred);
+    }
+
+    #[test]
+    fn test_soft_facts_report_lists_weighted_rules() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.soft_facts_report(5);
+        assert!(report.contains("加权软推理"), "实际：{}", report);
+        assert!(report.contains("加权规则"), "实际：{}", report);
+    }
+
+    #[test]
+    fn test_graph_walk_and_soft_logic_respect_disabled_config() {
+        let mut config = test_config();
+        config.enable_graph_walk = false;
+        config.enable_soft_logic = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.structural_related_report("张三").contains("未启用"));
+        assert!(reasoner.topic_extension_report().contains("未启用"));
+        assert!(reasoner.soft_inference_report("张三").contains("未启用"));
+        assert!(reasoner.soft_facts_report(5).contains("未启用"));
+    }
+
+    #[test]
+    fn test_session_assumption_feeds_soft_inference() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.abduce_statement("张三的师祖是赵六");
+        reasoner.adopt_hypothesis(1).expect("应能采纳假设");
+        let report = reasoner.soft_inference_report("张三的师祖");
+        assert!(
+            report.contains("赵六"),
+            "采纳的会话假设应进入软推理：{}",
+            report
+        );
+    }
+
+    #[test]
+    fn test_causal_report_explains_soft_prediction() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.causal_report("李四的师祖");
+        assert!(report.contains("因果推理"), "实际：{}", report);
+        assert!(report.contains("赵六"), "应解释推出的师祖：{}", report);
+        assert!(report.contains("直接原因"), "应列出直接原因：{}", report);
+        assert!(report.contains("依据："), "应给出规则来源：{}", report);
+        assert!(
+            report.contains("事实根因链") && report.contains("—["),
+            "应给出可回放的因果链：{}",
+            report
+        );
+        // 没有可解释目标时优雅降级
+        assert!(reasoner.causal_report("不存在的人").contains("无法"));
+    }
+
+    #[test]
+    fn test_counterfactual_report_quantifies_do_effect() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.counterfactual_report("李四的师傅", false);
+        assert!(report.contains("反事实推理"), "实际：{}", report);
+        assert!(report.contains("do"), "应说明干预语义：{}", report);
+        assert!(report.contains("师傅"), "应指出被干预的关系：{}", report);
+        assert!(report.contains("Δ="), "应给出概率差：{}", report);
+        assert!(
+            report.contains("下降"),
+            "移除师傅应使下游加权推测下降：{}",
+            report
+        );
+        let boosted = reasoner.counterfactual_report("李四的师傅", true);
+        assert!(
+            boosted.contains("不变") || boosted.contains("上升"),
+            "置真干预不应使下游下降：{}",
+            boosted
+        );
+    }
+
+    #[test]
+    fn test_gradient_report_shows_symbolic_derivatives() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner.gradient_report("李四的师祖");
+        assert!(report.contains("符号梯度归因"), "实际：{}", report);
+        assert!(report.contains("∂P/∂w"), "应展示解析梯度：{}", report);
+        assert!(report.contains("规则贡献"), "应逐条列出规则贡献：{}", report);
+        assert!(report.contains("权重"), "应展示规则权重：{}", report);
+        assert!(report.contains("来源："), "应展示规则来源：{}", report);
+        assert!(report.contains("P="), "应展示概率：{}", report);
+        // 未知实体时优雅提示
+        assert!(reasoner.gradient_report("钱七").contains("无法"));
+    }
+
+    #[test]
+    fn test_causal_and_gradient_respect_disabled_config() {
+        let mut config = test_config();
+        config.enable_causal_reasoning = false;
+        config.enable_gradient_attribution = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.causal_report("李四的师祖").contains("未启用"));
+        assert!(reasoner.counterfactual_report("张三的师傅", false).contains("未启用"));
+        assert!(reasoner.gradient_report("李四的师祖").contains("未启用"));
+    }
+
+    #[test]
+    fn test_intervention_boosts_downstream_probability() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        // 干预一个"推导出来的中间节点"（李四的师傅=王五）为真：
+        // 王五被钉真后，李四的师祖（赵六）概率应不低于事实世界
+        let report = reasoner.counterfactual_report("李四的师傅", true);
+        assert!(report.contains("师傅"), "实际：{}", report);
+        assert!(report.contains("反事实推理"));
+        assert!(
+            report.contains("不变") || report.contains("上升"),
+            "干预中间节点置真不应降低下游：{}",
+            report
         );
     }
 }

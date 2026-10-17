@@ -437,6 +437,103 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 结构联想：RWR 图嵌入（随机游走重启）检索结构相关实体与解释路径
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["结构联想：", "结构联想:", "图游走：", "图游走:"],
+        ) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请提供要联想的实体，例如：结构联想：张三");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.structural_related_report(entity));
+            }
+            println!();
+            continue;
+        }
+
+        // 话题延伸：以对话焦点实体栈为多源种子的 RWR 图游走联想
+        if matches!(input, "话题延伸" | "顺着话题" | "话题联想") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.topic_extension_report());
+            println!();
+            continue;
+        }
+
+        // 加权软推理：MLN-lite 加权规则 + 软真值传播（输出概率与模糊限定词）
+        if matches!(input, "软推理" | "加权推理") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.soft_facts_report(8));
+            println!();
+            continue;
+        }
+        if let Some(target) =
+            strip_any_prefix(input, &["软推理：", "软推理:", "加权推理：", "加权推理:"])
+        {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供软推理对象，例如：软推理：张三 或 软推理：张三的师傅");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.soft_inference_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 因果反事实/干预：do(X=真/假) 后对比"事实世界 vs 干预世界"的下游概率差
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "因果反事实：", "因果反事实:", "反事实干预：", "反事实干预:", "干预：",
+                "干预:", "do：", "do:",
+            ],
+        ) {
+            let (target, value) = parse_intervention_value(target.trim());
+            if target.is_empty() {
+                println!("请提供要干预的对象，例如：干预：张三的师傅 或 干预：张三的师傅=真");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.counterfactual_report(target, value));
+            }
+            println!();
+            continue;
+        }
+
+        // 因果推理：因果图 + 直接原因 + 事实根因链 + 混杂因子（do-演算视角）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "因果链：", "因果链:", "因果关系：", "因果关系:", "因果：", "因果:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要因果解释的对象，例如：因果：李四的师祖 或 因果：张三");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.causal_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 符号梯度归因：可微推理的纯符号版（解析求导 + 求证优先级）
+        if let Some(target) =
+            strip_any_prefix(input, &["梯度归因：", "梯度归因:", "可微推理：", "可微推理:"])
+        {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要归因的对象，例如：梯度归因：李四的师祖 或 梯度归因：张三");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.gradient_report(target));
+            }
+            println!();
+            continue;
+        }
+
         // 推理发现：正向饱和推出多跳新事实（含前提与规则来源）
         if input == "推理发现" || input == "推导发现" {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
@@ -1113,7 +1210,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 42] = [
+    const COMMANDS: [&str; 54] = [
         "溯因",
         "假设生成",
         "为什么",
@@ -1156,8 +1253,39 @@ fn is_command_like(input: &str) -> bool {
         "假如",
         "反事实",
         "澄清",
+        "结构联想",
+        "图游走",
+        "话题延伸",
+        "软推理",
+        "加权推理",
+        "因果",
+        "干预",
+        "反事实干预",
+        "do：",
+        "do:",
+        "梯度归因",
+        "可微推理",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
+}
+
+/// 解析干预命令的后缀 `=真/假`（默认 do(…=假)：移除该事实再观察下游变化）
+fn parse_intervention_value(target: &str) -> (&str, bool) {
+    for (suffix, value) in [
+        ("=真", true),
+        ("=对", true),
+        ("=true", true),
+        ("=1", true),
+        ("=假", false),
+        ("=错", false),
+        ("=false", false),
+        ("=0", false),
+    ] {
+        if let Some(stripped) = target.strip_suffix(suffix) {
+            return (stripped.trim(), value);
+        }
+    }
+    (target, false)
 }
 
 fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {

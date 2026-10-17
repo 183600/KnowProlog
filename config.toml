@@ -37,6 +37,15 @@ enable_abduction = true               # 是否启用溯因推理·假设生成�
 abduction_max_hypotheses = 5          # 单次溯因最多生成的候选假设数
 abduction_max_scenario_size = 2       # 联合解释场景最多包含的假设条数（多假设协同证明目标）
 enable_clarification = true           # 是否启用对话式澄清（系统把待定假设逆转为「是/不是」提问并记忆回答）
+enable_graph_walk = true              # 是否启用符号化图嵌入（随机游走重启 RWR，结构联想/话题延伸，无神经网络）
+graph_walk_damping = 0.85             # RWR 阻尼系数（每步继续游走的概率）
+graph_walk_iterations = 12            # RWR 幂迭代轮数
+enable_soft_logic = true              # 是否启用加权软逻辑（MLN-lite：log-odds 累加 + sigmoid，输出概率化推测）
+soft_logic_max_iterations = 4         # 软真值传播的最大不动点迭代轮数
+soft_logic_min_probability = 0.5      # 软推理候选的最低概率阈值
+enable_causal_reasoning = true        # 是否启用因果推理（因果图 + do-演算干预 + 反事实比较，纯符号）
+causal_max_depth = 4                  # 因果链最大枚举长度（1-8，防组合爆炸）
+enable_gradient_attribution = true    # 是否启用符号梯度归因（∂P/∂w 解析求导，仅解释不训练）
 
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]
