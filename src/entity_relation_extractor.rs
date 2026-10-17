@@ -609,8 +609,9 @@ impl EntityRelationExtractor {
         // 类型关键词命中数由调用方按句预计算
         confidence += 0.2 * keyword_hits as f64;
 
-        // 检查实体文本长度和格式
-        if entity_text.len() >= 2 && entity_text.len() <= 10 {
+        // 检查实体文本长度和格式（按字符数而非 UTF-8 字节数，避免中文被误判过长）
+        let char_count = entity_text.chars().count();
+        if char_count >= 2 && char_count <= 10 {
             confidence += 0.1;
         }
         
@@ -1067,6 +1068,16 @@ mod tests {
         
         assert!(!relations.is_empty());
         assert_eq!(relations[0].predicate, "is_a");
+    }
+
+    #[test]
+    fn test_entity_confidence_uses_char_count() {
+        let extractor = EntityRelationExtractor::new();
+        // 4 个中文字符（12 字节）不应因字节长度被误判为「过长」
+        assert!((extractor.calculate_entity_confidence("甲乙丙丁", 0) - 0.6).abs() < 1e-9);
+        assert!((extractor.calculate_entity_confidence("甲", 0) - 0.5).abs() < 1e-9);
+        let long_name = "甲".repeat(11);
+        assert!((extractor.calculate_entity_confidence(&long_name, 0) - 0.5).abs() < 1e-9);
     }
 
     #[test]

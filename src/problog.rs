@@ -589,14 +589,24 @@ impl ProblogEngine {
             if self.deterministic_facts.contains(&fact.atom) {
                 continue;
             }
-            if !pattern_matches(pattern, &fact.atom) || fact.probability < min_probability {
+            if !pattern_matches(pattern, &fact.atom) {
+                continue;
+            }
+            // 概率事实同时被规则支持时，精确概率是 BDD 合并后的结果，
+            // 不能只报裸事实概率（否则与依赖它的原子概率不一致）
+            let probability = compiled
+                .atom_probability
+                .get(&fact.atom)
+                .copied()
+                .unwrap_or(fact.probability);
+            if probability < min_probability {
                 continue;
             }
             by_atom.insert(
                 fact.atom.clone(),
                 ProblogAnswer {
                     atom: fact.atom.clone(),
-                    probability: fact.probability,
+                    probability,
                     from_fact: true,
                     proofs: compiled.proofs_for(&fact.atom, 2),
                 },
@@ -880,9 +890,11 @@ impl ProblogEngine {
 
         let mut atom_probability: HashMap<Atom, f64> = HashMap::new();
         for (atom, &node) in &atom_bdd {
-            if deterministic.contains(atom) || prob_fact_probability.contains_key(atom) {
+            if deterministic.contains(atom) {
                 continue;
             }
+            // 概率事实同样计入：事实与规则对同一原子是析取支持，
+            // WMC 结果可能高于裸事实概率（查询侧区分 from_fact 展示）
             atom_probability.insert(atom.clone(), bdd.wmc(node));
         }
 
@@ -1153,6 +1165,43 @@ mod tests {
         assert_eq!(query.answers.len(), 1);
         assert!((query.answers[0].probability - 1.0).abs() < 1e-9);
         assert!(query.answers[0].from_fact);
+    }
+
+    #[test]
+    fn test_query_merges_rule_support_for_probabilistic_fact() {
+        let mut engine = rule_engine();
+        engine.add_probabilistic_fact(fact("q", "x", "y"), 0.3);
+        engine.add_deterministic_fact(fact("t", "x", "y"));
+        engine.add_rule(
+            fact("q", "x", "y"),
+            vec![fact("t", "x", "y")],
+            0.9,
+            "t⇒q",
+        );
+        engine.add_rule(
+            fact("r", "x", "y"),
+            vec![fact("q", "x", "y")],
+            1.0,
+            "q⇒r",
+        );
+        let expected = 1.0 - (1.0 - 0.3) * (1.0 - 0.9);
+        let q = engine.query(&fact("q", "x", "y"), 5, 0.0);
+        assert_eq!(q.answers.len(), 1);
+        assert!(q.answers[0].from_fact);
+        assert!(
+            (q.answers[0].probability - expected).abs() < 1e-9,
+            "事实与规则应析取合并，实得 {}",
+            q.answers[0].probability
+        );
+        let r = engine.query(&fact("r", "x", "y"), 5, 0.0);
+        assert!(
+            (r.answers[0].probability - expected).abs() < 1e-9,
+            "下游原子概率应与合并后的 q 一致，实得 {}",
+            r.answers[0].probability
+        );
+        // min_probability 过滤应基于合并后的精确概率
+        let filtered = engine.query(&fact("q", "x", "y"), 5, 0.5);
+        assert_eq!(filtered.answers.len(), 1);
     }
 
     #[test]

@@ -140,10 +140,6 @@ pub struct Knowledge<'a> {
 }
 
 const FUZZY_ACCEPT: f64 = 0.5;
-const QUESTION_MARKERS: [&str; 14] = [
-    "谁", "什么", "哪", "多少", "几", "怎么", "为什么", "如何", "吗", "呢", "何人", "何时",
-    "何处", "几何",
-];
 const DISCOURSE_MARKERS: [&str; 5] = ["首先，", "此外，", "最后，", "接着，", "然后，"];
 
 pub fn strip_discourse_markers(text: &str) -> &str {
@@ -182,24 +178,32 @@ fn clean_sentence(text: &str) -> String {
 }
 
 fn contains_question_word(text: &str) -> bool {
-    QUESTION_MARKERS.iter().any(|marker| text.contains(marker))
-}
-
-fn detect_negation(body: &str) -> (bool, String) {
-    for marker in ["不属于", "不是", "没有"] {
-        if body.contains(marker) {
-            let replacement = match marker {
-                "不属于" => "属于",
-                "不是" => "是",
-                _ => "有",
-            };
-            return (true, body.replace(marker, replacement));
+    // 多字疑问词不会与普通词冲突，直接子串匹配
+    const UNAMBIGUOUS: [&str; 11] = [
+        "谁", "什么", "多少", "怎么", "为什么", "如何", "吗", "呢", "何人", "何时", "何处",
+    ];
+    if UNAMBIGUOUS.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    // 单字疑问词需排除构词：几（几乎/几何/几内亚）、哪（哪吒）
+    for (pos, ch) in text.char_indices() {
+        let rest = &text[pos + ch.len_utf8()..];
+        match ch {
+            '几' => {
+                if !(rest.starts_with('乎') || rest.starts_with('何') || rest.starts_with('内')) {
+                    return true;
+                }
+            }
+            '哪' => {
+                if !(rest.starts_with('吒') || rest.starts_with('咤')) {
+                    return true;
+                }
+            }
+            _ => {}
         }
     }
-    if body.contains('不') {
-        return (true, body.replace('不', ""));
-    }
-    (false, body.to_string())
+    // 「几何」在句末是疑问（价值几何），在句首/句中通常作名词（几何是数学分支）
+    text.ends_with("几何")
 }
 
 struct Resolved {
@@ -281,12 +285,43 @@ impl<'a> PropositionParser<'a> {
         }
     }
 
+    /// 识别否定并把句子还原成肯定形式。
+    ///
+    /// 裸「不」只有在紧跟已知谓词表面时才视为否定词，避免把「不锈钢」这类
+    /// 词内部的「不」误当成否定（否则「不锈钢是合金」会被解析成否定命题）。
+    fn detect_negation(&self, body: &str) -> (bool, String) {
+        for marker in ["不属于", "不是", "没有"] {
+            if body.contains(marker) {
+                let replacement = match marker {
+                    "不属于" => "属于",
+                    "不是" => "是",
+                    _ => "有",
+                };
+                return (true, body.replace(marker, replacement));
+            }
+        }
+        for (pos, _) in body.match_indices('不') {
+            let rest = &body[pos + '不'.len_utf8()..];
+            if self
+                .surfaces
+                .iter()
+                .any(|(surface, _)| rest.starts_with(surface.as_str()))
+            {
+                let mut replaced = String::with_capacity(body.len() - '不'.len_utf8());
+                replaced.push_str(&body[..pos]);
+                replaced.push_str(rest);
+                return (true, replaced);
+            }
+        }
+        (false, body.to_string())
+    }
+
     pub fn parse(&self, text: &str) -> Vec<Proposition> {
         let cleaned = clean_sentence(text);
         if cleaned.is_empty() || contains_question_word(&cleaned) {
             return Vec::new();
         }
-        let (negative, body) = detect_negation(&cleaned);
+        let (negative, body) = self.detect_negation(&cleaned);
         let mut props: Vec<Proposition> = Vec::new();
         if body.contains('的') {
             self.parse_de_shi(&body, negative, &mut props);
@@ -950,6 +985,48 @@ mod tests {
         let fixture = Fixture::new();
         assert!(fixture.parse("张三的师傅是谁").is_empty());
         assert!(fixture.parse("张三的年龄是多少").is_empty());
+    }
+
+    #[test]
+    fn test_bare_bu_inside_word_is_not_negation() {
+        let mut fixture = Fixture::new();
+        fixture.aligner.register_term("合金", TermKind::Type);
+        fixture.aligner.register_term("不锈钢", TermKind::Entity);
+        fixture.linker.register_entity("不锈钢", Some("合金"));
+        let props = fixture.parse("不锈钢是合金");
+        assert_eq!(props.len(), 1, "「不锈钢」中的「不」不应被当成否定：{:?}", props);
+        assert!(!props[0].negative);
+        assert_eq!(props[0].subject, "不锈钢");
+        assert_eq!(props[0].object, "合金");
+    }
+
+    #[test]
+    fn test_bare_bu_before_predicate_is_negation() {
+        let mut fixture = Fixture::new();
+        fixture.aligner.observe_triple("张三", "knows", "李四");
+        fixture.predictor.add_triple("张三", "knows", "李四");
+        fixture.generator.observe_triple("张三", "knows", "李四");
+        let props = fixture.parse("张三不认识李四");
+        assert!(
+            props.iter().any(|p| p.predicate == "knows" && p.negative),
+            "「不认识」应解析为否定命题：{:?}",
+            props.iter().map(Proposition::render).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_question_word_substrings_in_statements() {
+        let mut fixture = Fixture::new();
+        fixture.aligner.register_term("非洲国家", TermKind::Type);
+        fixture.aligner.register_term("几内亚", TermKind::Entity);
+        let props = fixture.parse("几内亚是非洲国家");
+        assert_eq!(props.len(), 1, "「几内亚」是陈述句主语，不应被当成疑问句");
+        assert_eq!(props[0].subject, "几内亚");
+
+        fixture.aligner.register_term("数学分支", TermKind::Type);
+        fixture.aligner.register_term("几何", TermKind::Entity);
+        let props = fixture.parse("几何是数学分支");
+        assert_eq!(props.len(), 1, "「几何」作主语时是陈述句");
     }
 
     #[test]

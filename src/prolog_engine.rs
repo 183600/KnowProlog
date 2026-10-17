@@ -96,13 +96,18 @@ impl PrologEngine {
         for fact in &facts {
             match fact {
                 PrologFact::Entity { name, entity_type, properties } => {
-                    let _ = write!(fact_string, "oxigraph_entity('{}', '{}', [", name, entity_type);
+                    let _ = write!(
+                        fact_string,
+                        "oxigraph_entity('{}', '{}', [",
+                        escape_atom(name),
+                        escape_atom(entity_type)
+                    );
                     for (i, (k, v)) in properties.iter().enumerate() {
                         if i > 0 {
                             fact_string.push_str(", ");
                         }
                         // 属性为 '键'-'值' 复合项
-                        let _ = write!(fact_string, "'{}'-'{}'", k, v);
+                        let _ = write!(fact_string, "'{}'-'{}'", escape_atom(k), escape_atom(v));
                     }
                     fact_string.push_str("]).\n");
                 }
@@ -110,7 +115,9 @@ impl PrologEngine {
                     let _ = write!(
                         fact_string,
                         "oxigraph_relation('{}', '{}', '{}').\n",
-                        from, rel_type, to
+                        escape_atom(from),
+                        escape_atom(rel_type),
+                        escape_atom(to)
                     );
                 }
             }
@@ -241,14 +248,18 @@ impl PrologEngine {
         match pattern {
             "age_query" => {
                 if let Some(person) = entities.first() {
-                    Some(format!("age_of('{}', Age)", person))
+                    Some(format!("age_of('{}', Age)", escape_atom(person)))
                 } else {
                     None
                 }
             }
             "relation_query" => {
                 if entities.len() >= 2 {
-                    Some(format!("related('{}', Relation, '{}')", entities[0], entities[1]))
+                    Some(format!(
+                        "related('{}', Relation, '{}')",
+                        escape_atom(&entities[0]),
+                        escape_atom(&entities[1])
+                    ))
                 } else {
                     None
                 }
@@ -262,70 +273,73 @@ impl PrologEngine {
             }
             "spouse_query" => {
                 if let Some(person) = entities.first() {
-                    Some(format!("spouse_of('{}', Spouse)", person))
+                    Some(format!("spouse_of('{}', Spouse)", escape_atom(person)))
                 } else {
                     None
                 }
             }
             "capital_query" => {
                 if let Some(country) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'country', Properties)", country))
+                    Some(format!(
+                        "oxigraph_entity('{}', 'country', Properties)",
+                        escape_atom(country)
+                    ))
                 } else {
                     None
                 }
             }
             "altitude_query" => {
                 if let Some(place) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'geographicfeature', Properties), member(altitude-Altitude, Properties)", place))
+                    Some(format!("oxigraph_entity('{}', 'geographicfeature', Properties), member(altitude-Altitude, Properties)", escape_atom(place)))
                 } else {
                     None
                 }
             }
             "chemical_formula_query" => {
                 if let Some(chemical) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'chemical', Properties), member(formula-Formula, Properties)", chemical))
+                    Some(format!("oxigraph_entity('{}', 'chemical', Properties), member(formula-Formula, Properties)", escape_atom(chemical)))
                 } else {
                     None
                 }
             }
             "author_query" => {
                 if let Some(work) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'literature', Properties), member(author-Author, Properties)", work))
+                    Some(format!("oxigraph_entity('{}', 'literature', Properties), member(author-Author, Properties)", escape_atom(work)))
                 } else {
                     None
                 }
             }
             "champion_query" => {
                 if let Some(event) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'sportevent', Properties), member(champion-Champion, Properties)", event))
+                    Some(format!("oxigraph_entity('{}', 'sportevent', Properties), member(champion-Champion, Properties)", escape_atom(event)))
                 } else {
                     None
                 }
             }
             "birth_year_query" => {
                 if let Some(language) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'programminglanguage', Properties), member(birth_year-Year, Properties)", language))
+                    Some(format!("oxigraph_entity('{}', 'programminglanguage', Properties), member(birth_year-Year, Properties)", escape_atom(language)))
                 } else {
                     None
                 }
             }
             "largest_query" => {
                 if entities.len() >= 2 {
-                    Some(format!("oxigraph_entity(Entity, '{}', Properties), member(type-'{}', Properties), member(size_rank-'1', Properties)", entities[0], entities[1]))
+                    Some(format!("oxigraph_entity(Entity, '{}', Properties), member(type-'{}', Properties), member(size_rank-'1', Properties)", escape_atom(&entities[0]), escape_atom(&entities[1])))
                 } else {
                     None
                 }
             }
             "quantity_query" => {
                 if entities.len() >= 2 {
-                    Some(format!("oxigraph_entity('{}', 'biologicalconcept', Properties), member(quantity-Quantity, Properties), member(unit-'{}', Properties)", entities[0], entities[1]))
+                    Some(format!("oxigraph_entity('{}', 'biologicalconcept', Properties), member(quantity-Quantity, Properties), member(unit-'{}', Properties)", escape_atom(&entities[0]), escape_atom(&entities[1])))
                 } else {
                     None
                 }
             }
             "concept_query" => {
                 if let Some(concept) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', Type, Properties)", concept))
+                    Some(format!("oxigraph_entity('{}', Type, Properties)", escape_atom(concept)))
                 } else {
                     None
                 }
@@ -333,10 +347,14 @@ impl PrologEngine {
             "property_query" => {
                 if entities.len() >= 2 {
                     // 为基础知识属性查询生成通用查询，调整实体顺序
-                    Some(format!("oxigraph_relation('{}', Property, '{}')", entities[1], entities[0]))
+                    Some(format!(
+                        "oxigraph_relation('{}', Property, '{}')",
+                        escape_atom(&entities[1]),
+                        escape_atom(&entities[0])
+                    ))
                 } else if let Some(entity) = entities.first() {
                     // 单实体查询，查找所有属性
-                    Some(format!("oxigraph_entity('{}', Type, Properties)", entity))
+                    Some(format!("oxigraph_entity('{}', Type, Properties)", escape_atom(entity)))
                 } else {
                     None
                 }
@@ -344,6 +362,22 @@ impl PrologEngine {
             _ => None,
         }
     }
+}
+
+/// 转义 Prolog 单引号原子中的特殊字符，避免名称里的引号/反斜杠破坏事实或查询语法
+fn escape_atom(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("''"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn value_to_string(value: Value) -> String {
@@ -366,4 +400,56 @@ pub enum PrologFact {
         rel_type: String,
         to: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_atom_escapes_quotes_and_backslashes() {
+        assert_eq!(escape_atom("O'Brien"), "O''Brien");
+        assert_eq!(escape_atom("a\\b"), "a\\\\b");
+        assert_eq!(escape_atom("line\nbreak"), "line\\nbreak");
+        assert_eq!(escape_atom("张三"), "张三");
+    }
+
+    #[test]
+    fn test_load_facts_with_quotes_does_not_break_engine() {
+        let mut engine = PrologEngine::new();
+        let facts = vec![
+            PrologFact::Entity {
+                name: "O'Brien".to_string(),
+                entity_type: "person".to_string(),
+                properties: {
+                    let mut props = HashMap::new();
+                    props.insert("note".to_string(), "it's fine".to_string());
+                    props
+                },
+            },
+            PrologFact::Relation {
+                from: "O'Brien".to_string(),
+                rel_type: "knows".to_string(),
+                to: "back\\slash".to_string(),
+            },
+        ];
+        engine.load_facts(facts);
+        let results = engine.query("oxigraph_entity(Name, Type, _)");
+        assert!(
+            results
+                .iter()
+                .any(|result| result.get("Name").map(|name| name.contains("Brien")) == Some(true)),
+            "带引号的事实应可查询（不崩、不丢失）：{:?}",
+            results
+        );
+        let relations = engine.query("oxigraph_relation(From, Type, To)");
+        assert!(
+            relations.iter().any(|result| {
+                result.get("From").map(|from| from.contains("Brien")) == Some(true)
+                    && result.get("To").map(|to| to.contains("slash")) == Some(true)
+            }),
+            "带反斜杠的事实应可查询（不崩、不丢失）：{:?}",
+            relations
+        );
+    }
 }

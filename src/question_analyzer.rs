@@ -387,14 +387,8 @@ impl QuestionAnalyzer {
             *scores.entry(QuestionType::ProcessDescription).or_insert(0.0) += 0.8;
         }
         
-        // 选择得分最高的类型；全部为 0 时回落到默认类型
-        let best_type = scores.into_iter()
-            .filter(|(_, score)| *score > 0.0)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(q_type, _)| q_type)
-            .unwrap_or(QuestionType::FactualQuery);
-            
-        Ok(best_type)
+        // 选择得分最高的类型；同分时按类型名字典序固定选择，避免 HashMap 迭代顺序导致结果不稳定
+        Ok(deterministic_max(scores, QuestionType::FactualQuery))
     }
 
     async fn identify_domain(&self, question: &str) -> Result<Domain, Box<dyn std::error::Error + Send + Sync>> {
@@ -412,11 +406,7 @@ impl QuestionAnalyzer {
             scores.insert(domain.clone(), score);
         }
         
-        let best_domain = scores.into_iter()
-            .filter(|(_, score)| *score > 0.0)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(domain, _)| domain)
-            .unwrap_or(Domain::General);
+        let best_domain = deterministic_max(scores, Domain::General);
             
         Ok(best_domain)
     }
@@ -462,11 +452,7 @@ impl QuestionAnalyzer {
             scores.insert(intent.clone(), score);
         }
         
-        let best_intent = scores.into_iter()
-            .filter(|(_, score)| *score > 0.0)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(intent, _)| intent)
-            .unwrap_or(Intent::SeekInformation);
+        let best_intent = deterministic_max(scores, Intent::SeekInformation);
             
         Ok(best_intent)
     }
@@ -549,6 +535,21 @@ impl Default for QuestionAnalyzer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 从打分表中选择得分最高的项；同分时按类型名的字典序固定选择，
+/// 避免 HashMap 随机迭代顺序让同一问题在不同进程得到不同的分类结果。
+fn deterministic_max<T: std::fmt::Debug>(scores: HashMap<T, f64>, fallback: T) -> T {
+    scores
+        .into_iter()
+        .filter(|(_, score)| *score > 0.0)
+        .max_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| format!("{:?}", b.0).cmp(&format!("{:?}", a.0)))
+        })
+        .map(|(value, _)| value)
+        .unwrap_or(fallback)
 }
 
 #[cfg(test)]

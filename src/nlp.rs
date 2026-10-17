@@ -164,7 +164,7 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
     }
     
     // 遍历模式中的每个元素
-    for pattern_elem in pattern {
+    for (pattern_index, pattern_elem) in pattern.iter().enumerate() {
         // 跳过空白词语（标点符号等）
         while pos < tagged_words.len() && 
               (tagged_words[pos].text.trim().is_empty() || 
@@ -191,11 +191,20 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                        (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown") {
                         let mut name_parts = vec![tagged_words[pos].text.clone()];
                         let mut next_pos = pos + 1;
+                        // 下一个模式元素若是具体词语，合并人名时不能把它吞掉
+                        // （如「张三和李四」中的人名合并不能吃掉「和」）
+                        let next_literal = match pattern.get(pattern_index + 1) {
+                            Some(PatternElement::Word(word)) => Some(word.as_str()),
+                            _ => None,
+                        };
                         
                         // 检查后续的unknown词是否应该合并
                         while next_pos < tagged_words.len() && 
                               (tagged_words[next_pos].pos == "unknown" || 
                                tagged_words[next_pos].pos == "nr") {
+                            if next_literal == Some(tagged_words[next_pos].text.as_str()) {
+                                break;
+                            }
                             name_parts.push(tagged_words[next_pos].text.clone());
                             next_pos += 1;
                         }
@@ -206,8 +215,8 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                         return None; // 不是人名
                     }
                 } else if pos < tagged_words.len() && tagged_words[pos].pos == *expected_pos {
-                    // 如果是人名或名词，提取为实体
-                    if expected_pos == "n" || expected_pos == "nr" {
+                    // 如果是名词性成分，提取为实体
+                    if expected_pos == "n" || expected_pos == "nr" || expected_pos == "ns" {
                         entities.push(tagged_words[pos].text.clone());
                     }
                     pos += 1;
@@ -298,6 +307,7 @@ pub fn pattern_from_strings(strings: Vec<String>) -> Vec<PatternElement> {
             "r" => PatternElement::Pos("r".to_string()), // 代词
             "n" => PatternElement::Pos("n".to_string()), // 名词
             "nr" => PatternElement::Pos("nr".to_string()), // 人名
+            "ns" => PatternElement::Pos("ns".to_string()), // 地名
             "m" => PatternElement::Pos("m".to_string()), // 数词
             "q" => PatternElement::Pos("q".to_string()), // 量词
             "v" => PatternElement::Pos("v".to_string()), // 动词
@@ -309,4 +319,59 @@ pub fn pattern_from_strings(strings: Vec<String>) -> Vec<PatternElement> {
             _ => PatternElement::Word(s), // 具体词语
         }
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tagged(pairs: &[(&str, &str)]) -> Vec<TaggedWord> {
+        pairs
+            .iter()
+            .map(|(text, pos)| TaggedWord {
+                text: text.to_string(),
+                pos: pos.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ns_pattern_is_matched_and_captured() {
+        let pattern = pattern_from_strings(vec![
+            "ns".to_string(),
+            "的".to_string(),
+            "首都".to_string(),
+            "是".to_string(),
+            "哪里".to_string(),
+        ]);
+        let words = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = match_pattern_for_prolog(&words, &pattern).expect("ns 模式应能匹配");
+        assert_eq!(matched, vec!["法国".to_string()]);
+    }
+
+    #[test]
+    fn test_name_merge_stops_before_literal_conjunction() {
+        let pattern = pattern_from_strings(vec![
+            "nr".to_string(),
+            "和".to_string(),
+            "nr".to_string(),
+            "什么".to_string(),
+            "关系".to_string(),
+        ]);
+        let words = tagged(&[
+            ("张三", "nr"),
+            ("和", "unknown"),
+            ("李四", "nr"),
+            ("什么", "r"),
+            ("关系", "unknown"),
+        ]);
+        let matched = match_pattern_for_prolog(&words, &pattern).expect("关系模式应能匹配");
+        assert_eq!(matched, vec!["张三".to_string(), "李四".to_string()]);
+    }
 }

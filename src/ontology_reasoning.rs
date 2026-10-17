@@ -652,9 +652,8 @@ impl OntologyReasoner {
                 }
             }
             for (class, supers) in &closure.subclasses {
-                if class == left || class == right {
-                    continue;
-                }
+                // 互斥成员自身也可能因继承对方而不可满足（如「鸟 ⊑ 鱼」且鸟/鱼互斥），
+                // 因此这里不能跳过 left/right
                 let in_left = supers.iter().any(|super_class| left_supers.contains(super_class));
                 let in_right = supers.iter().any(|super_class| right_supers.contains(super_class));
                 if in_left && in_right {
@@ -918,6 +917,11 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
         return Err("空句子".to_string());
     }
     let original = cleaned.clone();
+    // 否定句检查：解析器只接受肯定知识，避免「企鹅不属于鸟」被解析成
+    // 子类「企鹅不」这类被吞掉否定词的错误知识
+    if cleaned.contains("不是") || cleaned.contains("不属于") {
+        return Err(format!("「{}」是否定句，本体教学只接受肯定知识", cleaned));
+    }
     // 互斥：X和Y互斥 / X与Y不相容
     for marker in ["互不相容", "互相排斥", "彼此排斥", "互斥", "不相容", "排斥"] {
         if let Some(position) = cleaned.find(marker) {
@@ -1274,6 +1278,35 @@ mod tests {
             "应报出不可满足类：{:?}",
             closure.problems()
         );
+    }
+
+    #[test]
+    fn test_disjoint_member_subclass_is_unsatisfiable() {
+        let mut ontology = OntologyReasoner::new(6);
+        ontology.add_disjoint("鸟", "鱼");
+        ontology.add_subclass("鸟", "鱼");
+        let closure = ontology.materialize();
+        assert!(
+            closure.problems().iter().any(|p| p.contains("不可满足")),
+            "互斥类自身成为对方子类时应报出不可满足：{:?}",
+            closure.problems()
+        );
+    }
+
+    #[test]
+    fn test_negated_ontology_lessons_are_rejected() {
+        assert!(parse_ontology_lesson("企鹅不属于鸟").is_err());
+        assert!(parse_ontology_lesson("张三不是老师").is_err());
+        // 「不相容」是合法的互斥知识，不应被否定句检查误伤
+        assert!(matches!(
+            parse_ontology_lesson("猫和狗互不相容"),
+            Ok(OntologyLesson::Disjoint { .. })
+        ));
+        // 含「不」的肯定类名不应被误伤
+        assert!(matches!(
+            parse_ontology_lesson("不锈钢是一种合金"),
+            Ok(OntologyLesson::Subclass { .. })
+        ));
     }
 
     #[test]

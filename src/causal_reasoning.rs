@@ -239,7 +239,7 @@ impl CausalGraph {
         weights: &mut Vec<f64>,
         out: &mut Vec<CausalPath>,
     ) {
-        if out.len() >= MAX_PATHS_PER_QUERY || nodes.len() > self.max_depth + 1 {
+        if out.len() >= MAX_PATHS_PER_QUERY || nodes.len() > self.max_depth {
             return;
         }
         let current = nodes.last().cloned();
@@ -733,6 +733,39 @@ mod tests {
         assert!(delta.delta > 0.0);
         let probes = analyzer.direct_effect_probes(&intervention);
         assert_eq!(probes, vec![Atom::rel("尊敬", "张三", "李四")]);
+    }
+
+    #[test]
+    fn test_causal_paths_respect_max_depth() {
+        let mut engine = MarkovLogicEngine::new(8, 0.5);
+        engine.add_fact(Atom::rel("p0", "张三", "李四"));
+        for (head, body) in [("p1", "p0"), ("p2", "p1"), ("p3", "p2")] {
+            engine.add_rule(WeightedRule::new(
+                Atom::pattern(head, Term::var("A"), Term::var("B")),
+                vec![Atom::pattern(body, Term::var("A"), Term::var("B"))],
+                1.0,
+                "链式规则",
+            ));
+        }
+        let graph = CausalGraph::from_engine(&engine, 2);
+        let root = Atom::rel("p0", "张三", "李四");
+        let middle = Atom::rel("p2", "张三", "李四");
+        let target = Atom::rel("p3", "张三", "李四");
+        assert_eq!(
+            graph.causal_paths(&root, &middle).len(),
+            1,
+            "2 条边的链应被枚举"
+        );
+        assert!(
+            graph.causal_paths(&root, &target).is_empty(),
+            "max_depth=2 不应枚举 3 条边的链"
+        );
+        let mut roots = HashSet::new();
+        roots.insert(root);
+        assert!(
+            graph.root_paths(&target, &roots).is_empty(),
+            "反向搜索与正向搜索的深度上限应一致"
+        );
     }
 
     #[test]

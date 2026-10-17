@@ -474,12 +474,23 @@ impl OntologyAligner {
     }
 
     pub fn align_all(&self) -> Vec<AlignmentPair> {
+        // 对齐是对称关系（sameAs），同一对术语只保留一次；
+        // 不能按「目标索引 >= 源索引」跳过，否则同义词目标注册得比源晚时会被整体丢弃
         let mut pairs = Vec::new();
-        for (i, profile) in self.profiles.iter().enumerate() {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        for profile in &self.profiles {
             if let Some(resolved) = self.resolve_arc(&profile.term) {
-                match resolved.1 {
-                    Some(t) if t >= i => continue,
-                    _ => pairs.push(resolved.0.clone()),
+                let pair = resolved.0.clone();
+                if pair.source == pair.target {
+                    continue;
+                }
+                let (left, right) = if pair.source <= pair.target {
+                    (pair.source.clone(), pair.target.clone())
+                } else {
+                    (pair.target.clone(), pair.source.clone())
+                };
+                if seen.insert((left, right)) {
+                    pairs.push(pair);
                 }
             }
         }
@@ -638,6 +649,25 @@ mod tests {
         assert!(triples
             .iter()
             .any(|(s, p, o)| s == "张三的老婆" && p == "sameAs" && o == "张三"));
+    }
+
+    #[test]
+    fn test_align_all_keeps_synonym_pair_regardless_of_registration_order() {
+        let mut synonyms = HashMap::new();
+        synonyms.insert("老婆".to_string(), "妻子".to_string());
+        let mut aligner = OntologyAligner::new(synonyms, 0.99);
+        // 目标术语比源术语更晚注册
+        aligner.register_term("老婆", TermKind::Entity);
+        aligner.register_term("妻子", TermKind::Entity);
+        assert_eq!(aligner.resolve("老婆").map(|p| p.target), Some("妻子".to_string()));
+        let pairs = aligner.align_all();
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.source == "老婆" && p.target == "妻子"),
+            "同义词对不应因注册顺序而被丢弃：{:?}",
+            pairs
+        );
     }
 
     #[test]
