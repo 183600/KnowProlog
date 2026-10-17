@@ -495,6 +495,8 @@ pub struct SymbolicReasoner {
     last_abduction_vars: Vec<String>,
     // 谓词清单缓存：仅在 observe_facts 后重建（按对齐器剖面与预测规则生成，顺序敏感）
     known_predicates_cache: Vec<String>,
+    // 与 known_predicates_cache 同序的（原形, 归一化形）缓存，避免每轮查询重复归一化
+    known_predicates_normalized_cache: Vec<(String, String)>,
     // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
     proposition_surfaces: Vec<(String, String)>,
     // 单条链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
@@ -502,6 +504,8 @@ pub struct SymbolicReasoner {
     link_memo: parking_lot::Mutex<Option<(String, Arc<Vec<LinkedMention>>)>>,
     // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
     entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
+    // 同义词命中的规范谓词集合记忆（同一文本一轮内多处查询，同义词表全量扫描只做一次）
+    predicate_canonicals_memo: parking_lot::Mutex<Option<(String, Arc<HashSet<String>>)>>,
     // 符号主义话语引擎：OWL 本体叙述（定义/继承/推导链）+ DCG 文法实现（多句式生成）
     discourse: DiscoursePlanner,
 }
@@ -569,9 +573,11 @@ impl SymbolicReasoner {
             last_abduction_goal: None,
             last_abduction_vars: Vec::new(),
             known_predicates_cache: Vec::new(),
+            known_predicates_normalized_cache: Vec::new(),
             proposition_surfaces: Vec::new(),
             link_memo: parking_lot::Mutex::new(None),
             entity_mentions_memo: parking_lot::Mutex::new(None),
+            predicate_canonicals_memo: parking_lot::Mutex::new(None),
             discourse,
         };
         reasoner.rebuild_knowledge_caches();
@@ -581,6 +587,11 @@ impl SymbolicReasoner {
     /// 重建谓词清单与命题表面积索引（二者仅依赖对齐器/生成器/预测规则的状态）
     fn rebuild_knowledge_caches(&mut self) {
         self.known_predicates_cache = self.collect_known_predicates();
+        self.known_predicates_normalized_cache = self
+            .known_predicates_cache
+            .iter()
+            .map(|predicate| (predicate.clone(), self.aligner.normalize(predicate)))
+            .collect();
         self.proposition_surfaces = semantic_entailment::build_predicate_surfaces(
             &self.aligner,
             self.generator.predicate_surfaces(),
@@ -588,6 +599,7 @@ impl SymbolicReasoner {
         // 词表变化后实体链接/实体提及的旧结果可能过时，同步失效记忆缓存
         *self.link_memo.lock() = None;
         *self.entity_mentions_memo.lock() = None;
+        *self.predicate_canonicals_memo.lock() = None;
     }
 
     pub fn context(&self) -> &DialogueContext {
@@ -628,6 +640,7 @@ impl SymbolicReasoner {
             // 链接剖面（度数/邻居等）会随观察变化的可能，记忆必须整体失效
             *self.link_memo.lock() = None;
             *self.entity_mentions_memo.lock() = None;
+            *self.predicate_canonicals_memo.lock() = None;
         }
         // 话语引擎：本体叙事与 DCG 生成共用同一批事实（内部去重，可反复观察）
         if self.config.enable_discourse {
@@ -893,17 +906,7 @@ impl SymbolicReasoner {
         }
         let normalized_text = self.aligner.normalize(text);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
-        let predicate = self
-            .known_predicates()
-            .iter()
-            .find(|p| {
-                self.predicate_mentioned_normalized_with(
-                    &normalized_text,
-                    p,
-                    &mentioned_canonicals,
-                )
-            })
-            .cloned();
+        let predicate = self.first_mentioned_known_predicate(&normalized_text, &mentioned_canonicals);
         if let Some(predicate) = predicate {
             self.context.record_predicate(&predicate);
         }
@@ -925,10 +928,6 @@ impl SymbolicReasoner {
             }
         }
         predicates
-    }
-
-    fn known_predicates(&self) -> &[String] {
-        &self.known_predicates_cache
     }
 
     pub fn entities_mentioned(&self, text: &str) -> Vec<String> {
@@ -981,14 +980,41 @@ impl SymbolicReasoner {
     }
 
     /// 预计算文本中出现的同义词对应的规范谓词集合（同义词表可能远大于谓词表）
-    fn mentioned_predicate_canonicals<'t>(&'t self, text: &str) -> HashSet<&'t str> {
-        let mut mentioned: HashSet<&str> = HashSet::new();
-        for (alias, canonical) in self.aligner.synonyms() {
-            if text.contains(alias.as_str()) {
-                mentioned.insert(canonical.as_str());
+    /// 同一文本一轮内多处查询（词表记录/链接线索/回答）复用记忆，避免重复全量扫描
+    fn mentioned_predicate_canonicals(&self, text: &str) -> Arc<HashSet<String>> {
+        if let Some((cached_text, canonicals)) = self.predicate_canonicals_memo.lock().as_ref() {
+            if cached_text == text {
+                return canonicals.clone();
             }
         }
+        let mut mentioned: HashSet<String> = HashSet::new();
+        for (alias, canonical) in self.aligner.synonyms() {
+            if text.contains(alias.as_str()) {
+                mentioned.insert(canonical.clone());
+            }
+        }
+        let mentioned = Arc::new(mentioned);
+        *self.predicate_canonicals_memo.lock() = Some((text.to_string(), mentioned.clone()));
         mentioned
+    }
+
+    /// 按缓存顺序返回首个被文本提及的已知谓词（原形）
+    fn first_mentioned_known_predicate(
+        &self,
+        normalized_text: &str,
+        mentioned_canonicals: &HashSet<String>,
+    ) -> Option<String> {
+        self.known_predicates_normalized_cache
+            .iter()
+            .find_map(|(predicate, predicate_norm)| {
+                if mentioned_canonicals.contains(predicate)
+                    || (!predicate_norm.is_empty() && normalized_text.contains(predicate_norm))
+                {
+                    Some(predicate.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     /// 在预计算集合的辅助下判断谓词是否被文本提及（等价于 predicate_mentioned_normalized）
@@ -996,7 +1022,7 @@ impl SymbolicReasoner {
         &self,
         normalized_text: &str,
         predicate: &str,
-        mentioned_canonicals: &HashSet<&str>,
+        mentioned_canonicals: &HashSet<String>,
     ) -> bool {
         if mentioned_canonicals.contains(predicate) {
             return true;
@@ -1074,16 +1100,13 @@ impl SymbolicReasoner {
     fn link_hints(&self, text: &str) -> Vec<String> {
         let normalized_text = self.aligner.normalize(text);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
-        self.known_predicates()
+        self.known_predicates_normalized_cache
             .iter()
-            .filter(|predicate| {
-                self.predicate_mentioned_normalized_with(
-                    &normalized_text,
-                    predicate,
-                    &mentioned_canonicals,
-                )
+            .filter(|(predicate, predicate_norm)| {
+                mentioned_canonicals.contains(predicate)
+                    || (!predicate_norm.is_empty() && normalized_text.contains(predicate_norm))
             })
-            .cloned()
+            .map(|(predicate, _)| predicate.clone())
             .collect()
     }
 

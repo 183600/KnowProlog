@@ -12,17 +12,20 @@
 // 以及为本体对齐提供"角色分布"证据。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 struct EntityVector {
-    weights: HashMap<String, f64>,
+    weights: HashMap<Arc<str>, f64>,
     norm: f64,
 }
 
 pub struct SymbolicEmbedding {
-    counts: HashMap<String, HashMap<String, f64>>,
-    feature_totals: HashMap<String, f64>,
+    counts: HashMap<String, HashMap<Arc<str>, f64>>,
+    feature_totals: HashMap<Arc<str>, f64>,
     entity_masses: HashMap<String, f64>,
+    /// 特征名驻留表：同一特征在全图中只存一份 Arc<str>，重建向量时零字符串拷贝
+    feature_interner: HashMap<String, Arc<str>>,
     total_mass: f64,
     vectors: HashMap<String, EntityVector>,
     dirty: bool,
@@ -36,6 +39,7 @@ impl SymbolicEmbedding {
             counts: HashMap::new(),
             feature_totals: HashMap::new(),
             entity_masses: HashMap::new(),
+            feature_interner: HashMap::new(),
             total_mass: 0.0,
             vectors: HashMap::new(),
             dirty: false,
@@ -97,16 +101,18 @@ impl SymbolicEmbedding {
         match self.counts.get_mut(entity).and_then(|map| map.get_mut(feature)) {
             Some(count) => *count += 1.0,
             None => {
+                let interned = self.intern_feature(feature);
                 self.counts
                     .entry(entity.to_string())
                     .or_default()
-                    .insert(feature.to_string(), 1.0);
+                    .insert(interned, 1.0);
             }
         }
         match self.feature_totals.get_mut(feature) {
             Some(total) => *total += 1.0,
             None => {
-                self.feature_totals.insert(feature.to_string(), 1.0);
+                let interned = self.intern_feature(feature);
+                self.feature_totals.insert(interned, 1.0);
             }
         }
         match self.entity_masses.get_mut(entity) {
@@ -117,6 +123,16 @@ impl SymbolicEmbedding {
         }
         self.total_mass += 1.0;
         self.dirty = true;
+    }
+
+    fn intern_feature(&mut self, feature: &str) -> Arc<str> {
+        if let Some(shared) = self.feature_interner.get(feature) {
+            return shared.clone();
+        }
+        let shared: Arc<str> = Arc::from(feature);
+        self.feature_interner
+            .insert(feature.to_string(), shared.clone());
+        shared
     }
 
     // PPMI 逐分量计算：pmi = ln( count(e,f) * total / (count(f) * mass(e)) )
@@ -133,23 +149,27 @@ impl SymbolicEmbedding {
             if mass <= 0.0 || total <= 0.0 {
                 continue;
             }
-            // 排序截断后克隆保留的特征名称
-            let mut weights: Vec<(&str, f64)> = Vec::with_capacity(features.len());
+            // 排序截断后共享特征名（Arc 克隆为引用计数自增）
+            let mut weights: Vec<(Arc<str>, f64)> = Vec::with_capacity(features.len());
             for (feature, count) in features {
-                let feature_total = self.feature_totals.get(feature).copied().unwrap_or(0.0);
+                let feature_total = self
+                    .feature_totals
+                    .get(&**feature)
+                    .copied()
+                    .unwrap_or(0.0);
                 if feature_total <= 0.0 || *count <= 0.0 {
                     continue;
                 }
                 let ratio = count * total / (feature_total * mass);
                 let pmi = ratio.ln();
                 if pmi > 0.0 {
-                    weights.push((feature.as_str(), pmi));
+                    weights.push((feature.clone(), pmi));
                 }
             }
-            let cmp = |a: &(&str, f64), b: &(&str, f64)| {
+            let cmp = |a: &(Arc<str>, f64), b: &(Arc<str>, f64)| {
                 b.1.partial_cmp(&a.1)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(b.0))
+                    .then_with(|| a.0.cmp(&b.0))
             };
             // 先按全序做 top-k 划分再排序：与"全排序后截断"结果一致，但平均复杂度更低
             if weights.len() > self.max_features {
@@ -164,10 +184,7 @@ impl SymbolicEmbedding {
             vectors.insert(
                 entity.clone(),
                 EntityVector {
-                    weights: weights
-                        .into_iter()
-                        .map(|(feature, weight)| (feature.to_string(), weight))
-                        .collect(),
+                    weights: weights.into_iter().collect(),
                     norm,
                 },
             );
@@ -257,13 +274,13 @@ impl SymbolicEmbedding {
         };
         let mut residual: HashMap<&str, f64> = HashMap::new();
         for (feature, weight) in &vb.weights {
-            *residual.entry(feature.as_str()).or_insert(0.0) += *weight / vb.norm;
+            *residual.entry(&**feature).or_insert(0.0) += *weight / vb.norm;
         }
         for (feature, weight) in &va.weights {
-            *residual.entry(feature.as_str()).or_insert(0.0) -= *weight / va.norm;
+            *residual.entry(&**feature).or_insert(0.0) -= *weight / va.norm;
         }
         for (feature, weight) in &vc.weights {
-            *residual.entry(feature.as_str()).or_insert(0.0) += *weight / vc.norm;
+            *residual.entry(&**feature).or_insert(0.0) += *weight / vc.norm;
         }
         residual.retain(|_, value| value.abs() > 1e-12);
         let residual_norm: f64 = residual.values().map(|w| w * w).sum::<f64>().sqrt();
@@ -312,10 +329,10 @@ impl SymbolicEmbedding {
         };
         let mut deltas: HashMap<&str, f64> = HashMap::new();
         for (feature, weight) in &vb.weights {
-            *deltas.entry(feature.as_str()).or_insert(0.0) += *weight / vb.norm;
+            *deltas.entry(&**feature).or_insert(0.0) += *weight / vb.norm;
         }
         for (feature, weight) in &va.weights {
-            *deltas.entry(feature.as_str()).or_insert(0.0) -= *weight / va.norm;
+            *deltas.entry(&**feature).or_insert(0.0) -= *weight / va.norm;
         }
         let mut positive: Vec<(&str, f64)> = deltas
             .iter()
@@ -355,11 +372,12 @@ impl SymbolicEmbedding {
         let (Some(ca), Some(cb)) = (self.counts.get(a), self.counts.get(b)) else {
             return Vec::new();
         };
-        let mut shared: Vec<(String, f64, f64)> = ca
+        // 先借用排序截断，仅对最终保留的 k 项克隆特征名
+        let mut shared: Vec<(&str, f64, f64)> = ca
             .iter()
             .filter_map(|(feature, count_a)| {
                 cb.get(feature)
-                    .map(|count_b| (feature.clone(), *count_a, *count_b))
+                    .map(|count_b| (&**feature, *count_a, *count_b))
             })
             .collect();
         shared.sort_by(|x, y| {
@@ -367,10 +385,13 @@ impl SymbolicEmbedding {
             let my = y.1.min(y.2);
             my.partial_cmp(&mx)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| x.0.cmp(&y.0))
+                .then_with(|| x.0.cmp(y.0))
         });
         shared.truncate(k);
         shared
+            .into_iter()
+            .map(|(feature, count_a, count_b)| (feature.to_string(), count_a, count_b))
+            .collect()
     }
 
     pub fn explain_similarity(&self, a: &str, b: &str) -> String {

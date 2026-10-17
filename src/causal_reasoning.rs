@@ -168,14 +168,16 @@ impl CausalGraph {
     fn add_grounded(&mut self, grounded: &GroundedRule) {
         for premise in &grounded.premises {
             let index = self.edges.len();
-            self.by_cause
-                .entry(premise.clone())
-                .or_default()
-                .push(index);
-            self.by_effect
-                .entry(grounded.head.clone())
-                .or_default()
-                .push(index);
+            if let Some(indices) = self.by_cause.get_mut(premise) {
+                indices.push(index);
+            } else {
+                self.by_cause.insert(premise.clone(), vec![index]);
+            }
+            if let Some(indices) = self.by_effect.get_mut(&grounded.head) {
+                indices.push(index);
+            } else {
+                self.by_effect.insert(grounded.head.clone(), vec![index]);
+            }
             self.edges.push(CausalEdge {
                 cause: premise.clone(),
                 effect: grounded.head.clone(),
@@ -242,11 +244,10 @@ impl CausalGraph {
         if out.len() >= MAX_PATHS_PER_QUERY || nodes.len() > self.max_depth {
             return;
         }
-        let current = nodes.last().cloned();
-        let Some(current) = current else {
+        let Some(current) = nodes.last() else {
             return;
         };
-        let Some(indices) = self.by_cause.get(&current) else {
+        let Some(indices) = self.by_cause.get(current) else {
             return;
         };
         for &index in indices {
@@ -299,20 +300,20 @@ impl CausalGraph {
         if out.len() >= MAX_PATHS_PER_QUERY || reverse_nodes.len() > self.max_depth + 1 {
             return;
         }
-        let current = reverse_nodes.last().cloned().expect("递归时序列非空");
-        if roots.contains(&current) && reverse_nodes.len() > 1 {
+        let current = reverse_nodes.last().expect("递归时序列非空");
+        if roots.contains(current) && reverse_nodes.len() > 1 {
             let nodes: Vec<Atom> = reverse_nodes.iter().rev().cloned().collect();
             let weights: Vec<f64> = reverse_weights.iter().rev().cloned().collect();
             out.push(CausalPath { nodes, weights });
             return;
         }
-        let Some(indices) = self.by_effect.get(&current) else {
+        let Some(indices) = self.by_effect.get(current) else {
             return;
         };
-        let mut seen_causes: HashSet<Atom> = HashSet::new();
+        let mut seen_causes: HashSet<&Atom> = HashSet::new();
         for &index in indices {
             let edge = &self.edges[index];
-            if !seen_causes.insert(edge.cause.clone()) {
+            if !seen_causes.insert(&edge.cause) {
                 continue;
             }
             if !visited.insert(edge.cause.clone()) {

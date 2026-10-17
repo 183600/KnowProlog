@@ -198,7 +198,8 @@ impl AssociationMiner {
         // 单前件规则 A ⇒ B（物品按出现次数降序，低于阈值的尾部直接截断）
         for (index, (a, a_count)) in items.iter().enumerate() {
             if *a_count < min_count {
-                continue;
+                // 已按出现次数降序排列，后续项只会更少
+                break;
             }
             for (other, (b, b_count)) in items.iter().enumerate() {
                 if index == other {
@@ -244,7 +245,11 @@ impl AssociationMiner {
                     continue;
                 }
                 let antecedent = vec![first.clone(), second.clone()];
-                let antecedent_text = antecedent.join(" ∧ ");
+                let antecedent_text = if cfg!(debug_assertions) {
+                    antecedent.join(" ∧ ")
+                } else {
+                    String::new()
+                };
                 for (b, b_count) in top.iter() {
                     if b == first || b == second {
                         continue;

@@ -1,8 +1,15 @@
 use jieba_rs::Jieba;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
+
+thread_local! {
+    /// 编辑距离计算的可复用缓冲：避免每次调用产生 4 次堆分配
+    static LEVENSHTEIN_SCRATCH: RefCell<(Vec<char>, Vec<char>, Vec<usize>, Vec<usize>)> =
+        RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimilarityResult {
@@ -148,7 +155,7 @@ impl SimilarityCalculator {
         let set2: HashSet<_> = words2.iter().copied().collect();
         
         let intersection = set1.intersection(&set2).count();
-        let union = set1.union(&set2).count();
+        let union = set1.len() + set2.len() - intersection;
         
         if union == 0 {
             0.0
@@ -217,9 +224,8 @@ impl SimilarityCalculator {
     fn generate_fallback_vector(&self, text: &str) -> Vec<f32> {
         // 基于文本特征生成简单的向量表示
         let mut vector = vec![0.0; 100]; // 100维向量
-        let chars: Vec<char> = text.chars().collect();
         
-        for (_i, &ch) in chars.iter().enumerate() {
+        for ch in text.chars() {
             let char_code = ch as u32;
             let index = (char_code % 100) as usize;
             vector[index] += 1.0;
@@ -264,31 +270,39 @@ impl SimilarityCalculator {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：将较短字符串作为列方向
-        let chars1: Vec<char> = s1.chars().collect();
-        let chars2: Vec<char> = s2.chars().collect();
-        let (rows, cols) = if chars1.len() <= chars2.len() {
-            (chars1, chars2)
-        } else {
-            (chars2, chars1)
-        };
-        let col_count = cols.len();
-        
-        let mut prev: Vec<usize> = (0..=col_count).collect();
-        let mut curr = vec![0usize; col_count + 1];
-        
-        for (i, row_char) in rows.iter().enumerate() {
-            curr[0] = i + 1;
-            for j in 1..=col_count {
-                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
-                curr[j] = (prev[j] + 1)
-                    .min(curr[j - 1] + 1)
-                    .min(prev[j - 1] + cost);
+        // 双行动态规划：将较短字符串作为列方向；复用线程本地缓冲避免反复分配
+        LEVENSHTEIN_SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let (chars1, chars2, prev, curr) = &mut *scratch;
+            chars1.clear();
+            chars1.extend(s1.chars());
+            chars2.clear();
+            chars2.extend(s2.chars());
+            let (rows, cols) = if chars1.len() <= chars2.len() {
+                (&*chars1, &*chars2)
+            } else {
+                (&*chars2, &*chars1)
+            };
+            let col_count = cols.len();
+
+            prev.clear();
+            prev.extend(0..=col_count);
+            curr.clear();
+            curr.resize(col_count + 1, 0);
+
+            for (i, row_char) in rows.iter().enumerate() {
+                curr[0] = i + 1;
+                for j in 1..=col_count {
+                    let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                    curr[j] = (prev[j] + 1)
+                        .min(curr[j - 1] + 1)
+                        .min(prev[j - 1] + cost);
+                }
+                std::mem::swap(prev, curr);
             }
-            std::mem::swap(&mut prev, &mut curr);
-        }
-        
-        prev[col_count]
+
+            prev[col_count]
+        })
     }
 
     async fn tfidf_similarity_from_words(&self, words1: &[&str], words2: &[&str]) -> f64 {
@@ -311,36 +325,43 @@ impl SimilarityCalculator {
             *tf /= total_words;
         }
         
-        // 计算 TF-IDF
-        let mut tfidf_vector = HashMap::new();
-        for (word, tf) in tf_map {
-            let idf = self.get_idf(word).await;
-            tfidf_vector.insert(word, tf * idf);
+        // 计算 TF-IDF；先整批命中缓存（一次读锁），剩余未命中词再统一计算
+        let mut tfidf_vector: HashMap<&'a str, f64> = HashMap::with_capacity(tf_map.len());
+        {
+            let cache = self.idf_cache.read();
+            for (&word, &tf) in &tf_map {
+                if let Some(&idf) = cache.get(word) {
+                    tfidf_vector.insert(word, tf * idf);
+                }
+            }
+        }
+        if tfidf_vector.len() < tf_map.len() {
+            let word_frequencies = self.word_frequencies.read();
+            let total_documents = word_frequencies.len() as f64;
+            let mut freshly_computed: Vec<(&'a str, f64)> = Vec::new();
+            for (&word, &tf) in &tf_map {
+                if tfidf_vector.contains_key(word) {
+                    continue;
+                }
+                if total_documents == 0.0 {
+                    tfidf_vector.insert(word, tf);
+                } else {
+                    let document_frequency = (*word_frequencies.get(word).unwrap_or(&1) as f64).max(1.0);
+                    let idf = (total_documents / document_frequency).ln();
+                    tfidf_vector.insert(word, tf * idf);
+                    freshly_computed.push((word, idf));
+                }
+            }
+            drop(word_frequencies);
+            if !freshly_computed.is_empty() {
+                let mut cache = self.idf_cache.write();
+                for (word, idf) in freshly_computed {
+                    cache.insert(word.to_string(), idf);
+                }
+            }
         }
         
         tfidf_vector
-    }
-
-    async fn get_idf(&self, word: &str) -> f64 {
-        // 缓存命中只取读锁，未命中再升级为写锁
-        if let Some(&idf) = self.idf_cache.read().get(word) {
-            return idf;
-        }
-        
-        let word_frequencies = self.word_frequencies.read();
-        let total_documents = word_frequencies.len() as f64;
-        
-        if total_documents == 0.0 {
-            return 1.0;
-        }
-        
-        let document_frequency = *word_frequencies.get(word).unwrap_or(&1) as f64;
-        let document_frequency = document_frequency.max(1.0);
-        let idf = (total_documents / document_frequency).ln();
-        drop(word_frequencies);
-        
-        self.idf_cache.write().insert(word.to_string(), idf);
-        idf
     }
 
     fn calculate_vector_similarity(&self, vec1: &HashMap<&str, f64>, vec2: &HashMap<&str, f64>) -> f64 {
@@ -352,15 +373,17 @@ impl SimilarityCalculator {
         let mut magnitude1 = 0.0;
         let mut magnitude2 = 0.0;
         
-        let all_terms: HashSet<_> = vec1.keys().chain(vec2.keys()).collect();
-        
-        for term in all_terms {
-            let val1 = vec1.get(term).unwrap_or(&0.0);
-            let val2 = vec2.get(term).unwrap_or(&0.0);
-            
+        // 共用词在两次遍历中只需各贡献一次；仅 vec2 独有的词在第二遍补齐
+        for (term, val1) in vec1 {
+            let val2 = vec2.get(term).copied().unwrap_or(0.0);
             dot_product += val1 * val2;
             magnitude1 += val1 * val1;
             magnitude2 += val2 * val2;
+        }
+        for (term, val2) in vec2 {
+            if !vec1.contains_key(term) {
+                magnitude2 += val2 * val2;
+            }
         }
         
         magnitude1 = magnitude1.sqrt();
@@ -459,7 +482,7 @@ impl SimilarityCalculator {
         let synonyms2: HashSet<_> = node2.synonyms.iter().collect();
         
         let intersection = synonyms1.intersection(&synonyms2).count();
-        let union = synonyms1.union(&synonyms2).count();
+        let union = synonyms1.len() + synonyms2.len() - intersection;
         
         if union == 0 {
             0.0
@@ -532,7 +555,7 @@ impl SimilarityCalculator {
         set2: &HashSet<T>,
     ) -> f64 {
         let intersection = set1.intersection(set2).count();
-        let union = set1.union(set2).count();
+        let union = set1.len() + set2.len() - intersection;
         
         if union == 0 {
             0.0

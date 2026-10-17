@@ -351,9 +351,9 @@ pub struct OwlNarrator {
     ontology: OntologyReasoner,
     closure: OntologyClosure,
     known: HashSet<String>,
-    seen_entities: HashSet<(String, String)>,
-    seen_hierarchy: HashSet<(String, String)>,
-    seen_relations: HashSet<(String, String, String)>,
+    seen_entities: HashMap<String, HashSet<String>>,
+    seen_hierarchy: HashMap<String, HashSet<String>>,
+    seen_relations: HashMap<String, HashMap<String, HashSet<String>>>,
     dirty: bool,
     taught_axioms: usize,
 }
@@ -364,9 +364,9 @@ impl OwlNarrator {
             ontology: OntologyReasoner::new(max_rounds),
             closure: OntologyClosure::default(),
             known: HashSet::new(),
-            seen_entities: HashSet::new(),
-            seen_hierarchy: HashSet::new(),
-            seen_relations: HashSet::new(),
+            seen_entities: HashMap::new(),
+            seen_hierarchy: HashMap::new(),
+            seen_relations: HashMap::new(),
             dirty: false,
             taught_axioms: 0,
         }
@@ -385,13 +385,14 @@ impl OwlNarrator {
                     if name.trim().is_empty() {
                         continue;
                     }
-                    self.known.insert(name.clone());
+                    if !self.known.contains(name.as_str()) {
+                        self.known.insert(name.clone());
+                    }
                     if !entity_type.trim().is_empty() {
-                        self.known.insert(entity_type.clone());
-                        if self
-                            .seen_entities
-                            .insert((name.clone(), entity_type.clone()))
-                        {
+                        if !self.known.contains(entity_type.as_str()) {
+                            self.known.insert(entity_type.clone());
+                        }
+                        if self.mark_entity_seen(name, entity_type) {
                             self.ontology.add_instance(name, entity_type);
                             self.dirty = true;
                         }
@@ -412,19 +413,90 @@ impl OwlNarrator {
         if from.trim().is_empty() || predicate.trim().is_empty() || to.trim().is_empty() {
             return;
         }
-        self.known.insert(from.to_string());
-        self.known.insert(to.to_string());
+        if !self.known.contains(from) {
+            self.known.insert(from.to_string());
+        }
+        if !self.known.contains(to) {
+            self.known.insert(to.to_string());
+        }
         if is_hierarchy_predicate(predicate) {
-            if self.seen_hierarchy.insert((from.to_string(), to.to_string())) {
+            if self.mark_hierarchy_seen(from, to) {
                 self.ontology.add_subclass(from, to);
                 self.dirty = true;
             }
-        } else if self
-            .seen_relations
-            .insert((from.to_string(), predicate.to_string(), to.to_string()))
-        {
+        } else if self.mark_relation_seen(from, predicate, to) {
             self.ontology.add_relation(from, predicate, to);
             self.dirty = true;
+        }
+    }
+
+    /// 记录“名称-类型”二元组；返回是否为首次出现（借用查找，重复项零分配）
+    fn mark_entity_seen(&mut self, name: &str, entity_type: &str) -> bool {
+        match self.seen_entities.get_mut(name) {
+            Some(types) => {
+                if types.contains(entity_type) {
+                    false
+                } else {
+                    types.insert(entity_type.to_string());
+                    true
+                }
+            }
+            None => {
+                let mut types = HashSet::new();
+                types.insert(entity_type.to_string());
+                self.seen_entities.insert(name.to_string(), types);
+                true
+            }
+        }
+    }
+
+    /// 记录“子类-超类”二元组；返回是否为首次出现
+    fn mark_hierarchy_seen(&mut self, from: &str, to: &str) -> bool {
+        match self.seen_hierarchy.get_mut(from) {
+            Some(targets) => {
+                if targets.contains(to) {
+                    false
+                } else {
+                    targets.insert(to.to_string());
+                    true
+                }
+            }
+            None => {
+                let mut targets = HashSet::new();
+                targets.insert(to.to_string());
+                self.seen_hierarchy.insert(from.to_string(), targets);
+                true
+            }
+        }
+    }
+
+    /// 记录“主语-谓词-宾语”三元组；返回是否为首次出现
+    fn mark_relation_seen(&mut self, from: &str, predicate: &str, to: &str) -> bool {
+        match self.seen_relations.get_mut(from) {
+            Some(predicates) => match predicates.get_mut(predicate) {
+                Some(objects) => {
+                    if objects.contains(to) {
+                        false
+                    } else {
+                        objects.insert(to.to_string());
+                        true
+                    }
+                }
+                None => {
+                    let mut objects = HashSet::new();
+                    objects.insert(to.to_string());
+                    predicates.insert(predicate.to_string(), objects);
+                    true
+                }
+            },
+            None => {
+                let mut objects = HashSet::new();
+                objects.insert(to.to_string());
+                let mut predicates = HashMap::new();
+                predicates.insert(predicate.to_string(), objects);
+                self.seen_relations.insert(from.to_string(), predicates);
+                true
+            }
         }
     }
 
@@ -606,7 +678,7 @@ pub struct DiscoursePlanner {
     by_subject: HashMap<String, Vec<(String, Vec<String>)>>,
     predicate_freq: HashMap<String, usize>,
     known_entities: HashSet<String>,
-    seen_triples: HashSet<(String, String, String)>,
+    seen_triples: HashMap<String, HashMap<String, HashSet<String>>>,
     max_sentences: usize,
 }
 
@@ -618,7 +690,7 @@ impl DiscoursePlanner {
             by_subject: HashMap::new(),
             predicate_freq: HashMap::new(),
             known_entities: HashSet::new(),
-            seen_triples: HashSet::new(),
+            seen_triples: HashMap::new(),
             max_sentences: max_sentences.max(1),
         }
     }
@@ -633,9 +705,14 @@ impl DiscoursePlanner {
 
     pub fn relation_count(&self) -> usize {
         self.seen_triples
-            .iter()
-            .filter(|(_, predicate, _)| !is_hierarchy_predicate(predicate))
-            .count()
+            .values()
+            .flat_map(|predicates| {
+                predicates
+                    .iter()
+                    .filter(|(predicate, _)| !is_hierarchy_predicate(predicate))
+                    .map(|(_, objects)| objects.len())
+            })
+            .sum()
     }
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
@@ -644,7 +721,9 @@ impl DiscoursePlanner {
                 PrologFact::Entity {
                     name, properties, ..
                 } => {
-                    self.known_entities.insert(name.clone());
+                    if !self.known_entities.contains(name.as_str()) {
+                        self.known_entities.insert(name.clone());
+                    }
                     for (key, value) in properties {
                         self.observe_triple(name, key, value);
                     }
@@ -661,15 +740,28 @@ impl DiscoursePlanner {
         if subject.trim().is_empty() || predicate.trim().is_empty() || object.trim().is_empty() {
             return;
         }
-        self.known_entities.insert(subject.to_string());
-        self.known_entities.insert(object.to_string());
-        if !self.seen_triples.insert((
-            subject.to_string(),
-            predicate.to_string(),
-            object.to_string(),
-        )) {
+        if !self.known_entities.contains(subject) {
+            self.known_entities.insert(subject.to_string());
+        }
+        if !self.known_entities.contains(object) {
+            self.known_entities.insert(object.to_string());
+        }
+        // 借用查找优先：重放快照时重复三元组不产生堆分配
+        let already_seen = self
+            .seen_triples
+            .get(subject)
+            .and_then(|predicates| predicates.get(predicate))
+            .map(|objects| objects.contains(object))
+            .unwrap_or(false);
+        if already_seen {
             return;
         }
+        self.seen_triples
+            .entry(subject.to_string())
+            .or_default()
+            .entry(predicate.to_string())
+            .or_default()
+            .insert(object.to_string());
         *self.predicate_freq.entry(predicate.to_string()).or_insert(0) += 1;
         let entry = self.by_subject.entry(subject.to_string()).or_default();
         match entry.iter_mut().find(|(pred, _)| pred == predicate) {

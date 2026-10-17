@@ -661,6 +661,7 @@ impl ProblogEngine {
     pub fn patterns_for_subject(&self, subject: &str) -> Vec<Atom> {
         let compiled = self.compiled();
         let mut patterns: Vec<Atom> = Vec::new();
+        let mut seen: HashSet<Atom> = HashSet::new();
         let mut consider = |atom: &Atom| {
             let matches_subject = atom
                 .terms
@@ -675,7 +676,7 @@ impl ProblogEngine {
                 terms.push(Term::var("X"));
             }
             let pattern = Atom::new(atom.predicate.as_ref(), terms);
-            if !patterns.contains(&pattern) {
+            if seen.insert(pattern.clone()) {
                 patterns.push(pattern);
             }
         };

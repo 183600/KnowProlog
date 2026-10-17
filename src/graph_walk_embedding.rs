@@ -220,37 +220,42 @@ impl GraphWalkEmbedding {
         if subject == object {
             return;
         }
-        let forward = (predicate.to_string(), object.to_string());
-        let backward = (predicate.to_string(), subject.to_string());
-        match self.neighbors.get_mut(subject) {
-            Some(list) => {
-                if !list.contains(&forward) {
-                    list.push(forward);
-                    self.edge_count += 1;
-                    self.vectors_dirty.store(true, Ordering::Release);
+        // 先借用查找：重复边（快照重放）不产生任何字符串分配
+        let forward_exists = self
+            .neighbors
+            .get(subject)
+            .map_or(false, |list| {
+                list.iter()
+                    .any(|(pred, target)| pred == predicate && target == object)
+            });
+        if !forward_exists {
+            let forward = (predicate.to_string(), object.to_string());
+            match self.neighbors.get_mut(subject) {
+                Some(list) => list.push(forward),
+                None => {
+                    self.neighbors.insert(subject.to_string(), vec![forward]);
                 }
             }
-            None => {
-                self.neighbors
-                    .insert(subject.to_string(), vec![forward]);
-                self.edge_count += 1;
-                self.vectors_dirty.store(true, Ordering::Release);
-            }
+            self.edge_count += 1;
+            self.vectors_dirty.store(true, Ordering::Release);
         }
-        match self.neighbors.get_mut(object) {
-            Some(list) => {
-                if !list.contains(&backward) {
-                    list.push(backward);
-                    self.edge_count += 1;
-                    self.vectors_dirty.store(true, Ordering::Release);
+        let backward_exists = self
+            .neighbors
+            .get(object)
+            .map_or(false, |list| {
+                list.iter()
+                    .any(|(pred, target)| pred == predicate && target == subject)
+            });
+        if !backward_exists {
+            let backward = (predicate.to_string(), subject.to_string());
+            match self.neighbors.get_mut(object) {
+                Some(list) => list.push(backward),
+                None => {
+                    self.neighbors.insert(object.to_string(), vec![backward]);
                 }
             }
-            None => {
-                self.neighbors
-                    .insert(object.to_string(), vec![backward]);
-                self.edge_count += 1;
-                self.vectors_dirty.store(true, Ordering::Release);
-            }
+            self.edge_count += 1;
+            self.vectors_dirty.store(true, Ordering::Release);
         }
     }
 
@@ -345,9 +350,11 @@ impl GraphWalkEmbedding {
     /// 幂迭代求平稳分布；limit 限制保留的分量数
     fn single_source_ppr_limit(&self, seed: &str, limit: usize) -> Vec<(String, f64)> {
         let mut current: HashMap<&str, f64> = HashMap::new();
+        // 复用两张表交替迭代，避免每轮重新分配哈希表
+        let mut next: HashMap<&str, f64> = HashMap::new();
         current.insert(seed, 1.0);
         for _ in 0..self.iterations {
-            let mut next: HashMap<&str, f64> = HashMap::new();
+            next.clear();
             for (node, mass) in &current {
                 match self.neighbors.get(*node) {
                     Some(list) if !list.is_empty() => {
@@ -382,7 +389,7 @@ impl GraphWalkEmbedding {
                     }
                 }
             }
-            current = next;
+            std::mem::swap(&mut current, &mut next);
         }
         let mut result: Vec<(&str, f64)> = current.into_iter().collect();
         let cmp = |a: &(&str, f64), b: &(&str, f64)| {
@@ -586,20 +593,20 @@ impl GraphWalkEmbedding {
             if neighbor == target {
                 let step_score = score / list.len() as f64;
                 path.push((predicate.clone(), neighbor.clone()));
-                let candidate = (step_score, path.clone());
+                // 仅在需要更新最优路径时才克隆整条路径
                 let replace = match best {
                     None => true,
                     Some((best_score, best_path)) => {
                         let diff = step_score - *best_score;
                         if diff.abs() < 1e-12 {
-                            candidate.1 < *best_path
+                            path.as_slice() < best_path.as_slice()
                         } else {
                             diff > 0.0
                         }
                     }
                 };
                 if replace {
-                    *best = Some(candidate);
+                    *best = Some((step_score, path.clone()));
                 }
                 path.pop();
                 continue;

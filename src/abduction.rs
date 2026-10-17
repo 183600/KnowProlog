@@ -777,9 +777,11 @@ impl AbductionEngine {
                     .iter()
                     .filter(|(entity, _)| entity.as_str() != base)
                     .map(|(entity, features)| {
-                        let inter = features.intersection(base_features).count() as f64;
-                        let union = features.union(base_features).count().max(1) as f64;
-                        (inter / union, entity)
+                        let inter = features.intersection(base_features).count();
+                        let union = (features.len() + base_features.len())
+                            .saturating_sub(inter)
+                            .max(1) as f64;
+                        (inter as f64 / union, entity)
                     })
                     .filter(|(score, _)| *score > 0.0)
                     .collect();
@@ -907,8 +909,10 @@ impl AbductionEngine {
             if let (Some(subject_features), Some(object_features)) =
                 (self.entity_features.get(subject), self.entity_features.get(object))
             {
-                let union = subject_features.union(object_features).count().max(1);
                 let inter = subject_features.intersection(object_features).count();
+                let union = (subject_features.len() + object_features.len())
+                    .saturating_sub(inter)
+                    .max(1);
                 if inter > 0 {
                     let jaccard = inter as f64 / union as f64;
                     score += 0.25 * jaccard;
@@ -924,10 +928,13 @@ impl AbductionEngine {
                 self.entity_predicates.get(subject),
                 self.entity_predicates.get(object),
             ) {
-                let subject_set: HashSet<&String> = subject_predicates.keys().collect();
-                let object_set: HashSet<&String> = object_predicates.keys().collect();
-                let union = subject_set.union(&object_set).count().max(1);
-                let inter = subject_set.intersection(&object_set).count();
+                let inter = subject_predicates
+                    .keys()
+                    .filter(|key| object_predicates.contains_key(*key))
+                    .count();
+                let union = (subject_predicates.len() + object_predicates.len())
+                    .saturating_sub(inter)
+                    .max(1);
                 if inter > 0 {
                     score += 0.10 * inter as f64 / union as f64;
                     reasons.push(format!("与主体共用 {} 个谓词上下文", inter));

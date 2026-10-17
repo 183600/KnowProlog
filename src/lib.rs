@@ -1231,11 +1231,24 @@ impl OxigraphManager {
 
             entity_props.entry(entity_name).or_default().insert(prop_name.clone(), value_str);
 
-            let subject_term = Term::from(quad.subject);
-            if let Some(name_value) = name_value {
-                subject_names.entry(subject_term.clone()).or_default().push(name_value);
+            if matches!(&quad.object, Term::Literal(_)) {
+                // 字面量宾语不可能是命名主体：只需登记名称，无需生成关系候选
+                if let Some(name_value) = name_value {
+                    subject_names
+                        .entry(Term::from(quad.subject))
+                        .or_default()
+                        .push(name_value);
+                }
+            } else {
+                let subject_term = Term::from(quad.subject);
+                if let Some(name_value) = name_value {
+                    subject_names
+                        .entry(subject_term.clone())
+                        .or_default()
+                        .push(name_value);
+                }
+                relation_candidates.push((subject_term, quad.object, prop_name));
             }
-            relation_candidates.push((subject_term, quad.object, prop_name));
         }
 
         let mut facts = Vec::with_capacity(entity_types.len());

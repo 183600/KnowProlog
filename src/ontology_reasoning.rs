@@ -434,6 +434,11 @@ impl OntologyReasoner {
                 "直接声明".to_string(),
             );
         }
+        // 超类/上位属性/定义域/值域只依赖固定的 TBox 闭包，跨轮次不变：整次物化内缓存
+        let mut supers_cache_props: HashMap<String, Vec<String>> = HashMap::new();
+        let mut supers_cache_classes: HashMap<String, Vec<String>> = HashMap::new();
+        let mut domain_cache: HashMap<String, Vec<String>> = HashMap::new();
+        let mut range_cache: HashMap<String, Vec<String>> = HashMap::new();
         for round in 0..self.max_rounds {
             closure.rounds = round + 1;
             let mut changed = false;
@@ -441,14 +446,17 @@ impl OntologyReasoner {
             let snapshot: Vec<(String, String, String)> =
                 closure.relations.iter().cloned().collect();
             for (subject, predicate, object) in snapshot {
-                for super_predicate in supers_of(&closure.subproperties, &predicate) {
-                    if super_predicate == predicate {
+                let supers = supers_cache_props
+                    .entry(predicate.clone())
+                    .or_insert_with(|| supers_of(&closure.subproperties, &predicate));
+                for super_predicate in supers.iter() {
+                    if *super_predicate == predicate {
                         continue;
                     }
                     derive_relation(
                         &mut closure,
                         &subject,
-                        &super_predicate,
+                        super_predicate,
                         &object,
                         format!("{} ⊑ {}", predicate, super_predicate),
                         &mut changed,
@@ -458,14 +466,17 @@ impl OntologyReasoner {
             // 2. 个体类型沿子类上推
             let snapshot: Vec<(String, String)> = closure.instances.iter().cloned().collect();
             for (individual, class) in snapshot {
-                for super_class in supers_of(&closure.subclasses, &class) {
-                    if super_class == class {
+                let supers = supers_cache_classes
+                    .entry(class.clone())
+                    .or_insert_with(|| supers_of(&closure.subclasses, &class));
+                for super_class in supers.iter() {
+                    if *super_class == class {
                         continue;
                     }
                     derive_instance(
                         &mut closure,
                         &individual,
-                        &super_class,
+                        super_class,
                         format!("{} ⊑ {}", class, super_class),
                         &mut changed,
                     );
@@ -475,20 +486,26 @@ impl OntologyReasoner {
             let snapshot: Vec<(String, String, String)> =
                 closure.relations.iter().cloned().collect();
             for (subject, predicate, object) in snapshot {
-                for class in self.domain_classes(&predicate, &closure.subproperties) {
+                let classes = domain_cache
+                    .entry(predicate.clone())
+                    .or_insert_with(|| self.domain_classes(&predicate, &closure.subproperties));
+                for class in classes.iter() {
                     derive_instance(
                         &mut closure,
                         &subject,
-                        &class,
+                        class,
                         format!("关系 {}({}, {}) 的定义域是 {}", predicate, subject, object, class),
                         &mut changed,
                     );
                 }
-                for class in self.range_classes(&predicate, &closure.subproperties) {
+                let classes = range_cache
+                    .entry(predicate.clone())
+                    .or_insert_with(|| self.range_classes(&predicate, &closure.subproperties));
+                for class in classes.iter() {
                     derive_instance(
                         &mut closure,
                         &object,
-                        &class,
+                        class,
                         format!("关系 {}({}, {}) 的值域是 {}", predicate, subject, object, class),
                         &mut changed,
                     );
@@ -497,6 +514,8 @@ impl OntologyReasoner {
             // 4. 类固有属性被实例继承（类自身保留一份，便于类级查询）
             let class_properties: Vec<(String, String, String)> =
                 self.class_properties.iter().cloned().collect();
+            // 本轮内实例集合不再变化，每个类的成员只计算一次
+            let mut round_members: HashMap<String, Vec<String>> = HashMap::new();
             for (class, predicate, object) in class_properties {
                 derive_relation(
                     &mut closure,
@@ -506,13 +525,15 @@ impl OntologyReasoner {
                     format!("类 {} 的固有属性", class),
                     &mut changed,
                 );
-                let members: Vec<String> = closure
-                    .instances
-                    .iter()
-                    .filter(|(_, member_class)| closure.is_subclass(member_class, &class))
-                    .map(|(individual, _)| individual.clone())
-                    .collect();
-                for individual in members {
+                let members = round_members.entry(class.clone()).or_insert_with(|| {
+                    closure
+                        .instances
+                        .iter()
+                        .filter(|(_, member_class)| closure.is_subclass(member_class, &class))
+                        .map(|(individual, _)| individual.clone())
+                        .collect()
+                });
+                for individual in members.iter() {
                     derive_relation(
                         &mut closure,
                         &individual,
@@ -523,7 +544,7 @@ impl OntologyReasoner {
                     );
                 }
             }
-            // 5. 传递关系闭包
+            // 5. 传递关系闭包：按中间节点分组做邻接交叉，避免全对全比较
             for property in &self.transitive {
                 let pairs: Vec<(String, String)> = closure
                     .relations
@@ -531,17 +552,37 @@ impl OntologyReasoner {
                     .filter(|(_, p, _)| p == property)
                     .map(|(s, _, o)| (s.clone(), o.clone()))
                     .collect();
-                for (left, middle) in &pairs {
-                    for (middle2, right) in &pairs {
-                        if middle == middle2 && left != right {
-                            derive_relation(
-                                &mut closure,
-                                left,
-                                property,
-                                right,
-                                format!("{} 具有传递性", property),
-                                &mut changed,
-                            );
+                if pairs.len() < 2 {
+                    continue;
+                }
+                let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
+                let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
+                for (left, right) in &pairs {
+                    outgoing
+                        .entry(left.as_str())
+                        .or_default()
+                        .push(right.as_str());
+                    incoming
+                        .entry(right.as_str())
+                        .or_default()
+                        .push(left.as_str());
+                }
+                for (middle, rights) in &outgoing {
+                    let Some(lefts) = incoming.get(middle) else {
+                        continue;
+                    };
+                    for left in lefts {
+                        for right in rights {
+                            if left != right {
+                                derive_relation(
+                                    &mut closure,
+                                    left,
+                                    property,
+                                    right,
+                                    format!("{} 具有传递性", property),
+                                    &mut changed,
+                                );
+                            }
                         }
                     }
                 }
