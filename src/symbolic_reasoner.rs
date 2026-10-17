@@ -14,6 +14,7 @@ use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
+use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
 use crate::prolog_engine::PrologFact;
@@ -202,6 +203,9 @@ pub struct DialogueSnapshot {
     // 用户用中文教过的 Horn 规则（会话级后向链规则库，跨会话持久化）
     #[serde(default)]
     pub session_clauses: Vec<SnapshotClause>,
+    // 神经符号对比仲裁记忆（校准统计、待定推测、屏蔽/否证集），跨会话持久化
+    #[serde(default)]
+    pub contrast: Option<ContrastSnapshot>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键：预先算好避免比较器里重复渲染
@@ -381,6 +385,7 @@ impl DialogueContext {
             session_facts: Vec::new(),
             lessons: Vec::new(),
             session_clauses: Vec::new(),
+            contrast: None,
         }
     }
 
@@ -4130,6 +4135,15 @@ impl SymbolicReasoner {
     }
 
     pub fn save_dialogue_state(&self, path: &str) -> std::io::Result<()> {
+        self.save_dialogue_state_with_contrast(path, None)
+    }
+
+    /// 保存对话状态，并额外写入神经符号对比仲裁记忆（校准统计/待定推测/否证集）
+    pub fn save_dialogue_state_with_contrast(
+        &self,
+        path: &str,
+        contrast: Option<&ContrastSnapshot>,
+    ) -> std::io::Result<()> {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -4151,19 +4165,34 @@ impl SymbolicReasoner {
             .collect();
         snapshot.lessons = self.lessons.clone();
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
+        snapshot.contrast = contrast.cloned();
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
     }
 
     pub fn load_dialogue_state(&mut self, path: &str) -> bool {
+        self.load_dialogue_state_with_contrast(path).0
+    }
+
+    /// 加载对话状态，同时返回其中的对比仲裁记忆快照（无则 None）
+    pub fn load_dialogue_state_with_contrast(
+        &mut self,
+        path: &str,
+    ) -> (bool, Option<ContrastSnapshot>) {
         let Ok(content) = std::fs::read_to_string(path) else {
-            return false;
+            return (false, None);
         };
         let Ok(snapshot) = serde_json::from_str::<DialogueSnapshot>(&content) else {
-            return false;
+            return (false, None);
         };
-        self.context.restore(&snapshot);
+        let contrast = snapshot.contrast.clone();
+        self.apply_dialogue_snapshot(&snapshot);
+        (true, contrast)
+    }
+
+    fn apply_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) {
+        self.context.restore(snapshot);
         // 跨会话临时信念：恢复被采纳的会话假设（仍不写知识图谱）
         let mut restored: Vec<Atom> = Vec::new();
         for entry in &snapshot.session_facts {
@@ -4246,7 +4275,6 @@ impl SymbolicReasoner {
                 }
             }
         }
-        true
     }
 
     pub fn alignment_report(&self) -> String {

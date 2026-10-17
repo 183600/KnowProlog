@@ -41,6 +41,7 @@ pub mod problog;
 pub mod chinese_reasoning_nlu;
 pub mod ontology_reasoning;
 pub mod default_logic;
+pub mod neuro_symbolic_contrast;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;

@@ -21,6 +21,7 @@ use know_prolog::{
     local_semantic_adapter::LocalSemanticAdapter,
     external_knowledge::{ExternalKnowledgeService, get_direct_answer},
     symbolic_reasoner::SymbolicReasoner,
+    neuro_symbolic_contrast::ContrastArbiter,
 };
 
 #[derive(Parser)]
@@ -132,14 +133,27 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
         create_default_synonyms()
     };
 
+    // 神经符号对比仲裁器：联想通道（软逻辑+关联+图游走）与符号通道（蕴含+归结）
+    // 交叉验证，输出带对冲词的结论，并保留会话级校准记忆
+    let mut contrast_arbiter = ContrastArbiter::from_reasoning_config(&config.reasoning);
+    // 对比追问进行中：记录当前提问对应的待定推测编号，用户答「是/不是」即结算
+    let mut contrast_followup: Option<usize> = None;
+
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
     let mut symbolic_reasoner = SymbolicReasoner::new(config.reasoning.clone(), synonyms.clone());
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
         symbolic_reasoner.observe_facts(&facts);
     }
     if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
-        if symbolic_reasoner.load_dialogue_state(state_path) {
+        let (restored, contrast_snapshot) =
+            symbolic_reasoner.load_dialogue_state_with_contrast(state_path);
+        if restored {
             println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
+        }
+        if let Some(snapshot) = contrast_snapshot {
+            if contrast_arbiter.restore_snapshot(&snapshot) {
+                println!("已恢复上次对比校准记忆：{}", contrast_arbiter.memory_summary());
+            }
         }
     }
 
@@ -212,6 +226,139 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             println!("{}", symbolic_reasoner.dialogue_summary());
             println!();
             continue;
+        }
+
+        // 神经符号对比：对任意陈述做联想通道与符号通道的交叉验证与仲裁
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "对比：", "对比:", "神经符号对比：", "神经符号对比:", "双通道对比：",
+                "双通道对比:", "仲裁：", "仲裁:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要对比的陈述句，例如：对比：李四的国籍是德国");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                let case = contrast_arbiter.contrast_statement(target, &symbolic_reasoner);
+                println!("{}", contrast_arbiter.render_case(&case));
+            }
+            println!();
+            continue;
+        }
+
+        // 对比校准报告：会话级一致率/冲突率与最近案例
+        if matches!(
+            input,
+            "对比报告" | "对比统计" | "校准报告" | "对比校准" | "仲裁报告" | "仲裁统计"
+                | "对比记忆" | "校准记忆"
+        ) {
+            println!("{}", contrast_arbiter.memory_summary());
+            println!("{}", contrast_arbiter.calibration_report());
+            println!();
+            continue;
+        }
+
+        // 待定联想推测清单
+        if matches!(input, "待定推测" | "对比推测" | "联想推测") {
+            println!("{}", contrast_arbiter.pending_report());
+            println!();
+            continue;
+        }
+
+        // 确认联想推测：采信为会话事实（不修改知识图谱）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["对比确认", "对比确认：", "对比确认:", "对比采纳", "对比采纳：", "对比采纳:"],
+        ) {
+            match parse_hypothesis_index(target) {
+                Some(index) => {
+                    println!("{}", contrast_arbiter
+                        .confirm_guess(index, &mut symbolic_reasoner)
+                        .unwrap_or_else(|| format!(
+                            "没有待定的联想推测 #{}；可用「待定推测」查看列表。",
+                            index
+                        )));
+                }
+                None => println!(
+                    "请给出推测编号，例如：对比确认 1。当前待定推测：\n{}",
+                    contrast_arbiter.pending_report()
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 否认联想推测：加入屏蔽集，联想通道之后不再提出
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["对比否认", "对比否认：", "对比否认:", "对比否决", "对比否决：", "对比否决:"],
+        ) {
+            match parse_hypothesis_index(target) {
+                Some(index) => {
+                    println!("{}", contrast_arbiter.refute_guess(index)
+                        .unwrap_or_else(|| format!(
+                            "没有待定的联想推测 #{}；可用「待定推测」查看列表。",
+                            index
+                        )));
+                }
+                None => println!(
+                    "请给出推测编号，例如：对比否认 1。当前待定推测：\n{}",
+                    contrast_arbiter.pending_report()
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 对比追问：系统主动就最旧的待定推测提问，把联想直觉逆转为澄清对话
+        if matches!(input, "对比追问" | "对比提问" | "对比核实" | "逐条核实") {
+            match contrast_arbiter.next_followup() {
+                Some(followup) => {
+                    println!("{}", followup.question);
+                    contrast_followup = Some(followup.guess_id);
+                }
+                None => println!(
+                    "当前没有待定联想推测。可输入「对比：<陈述句>」生成新的双通道对比，或「待定推测」查看清单。"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 对比追问进行中：把「是 / 不是 / 跳过」直接结算为确认或否认（多轮对话）
+        if let Some(guess_id) = contrast_followup {
+            let answer = input.trim().trim_end_matches(['。', '！', '!', '~']);
+            let affirmative = ["是", "是的", "对", "对的", "没错", "属实", "确认", "yes", "y"]
+                .contains(&answer);
+            let negative =
+                ["不是", "不对", "否", "不属实", "错", "no", "n"].contains(&answer);
+            if affirmative || negative {
+                let outcome = if affirmative {
+                    contrast_arbiter.confirm_guess(guess_id, &mut symbolic_reasoner)
+                } else {
+                    contrast_arbiter.refute_guess(guess_id)
+                };
+                println!(
+                    "{}",
+                    outcome.unwrap_or_else(|| format!(
+                        "推测 #{} 已不在待定列表（可能已被处理）。",
+                        guess_id
+                    ))
+                );
+                contrast_followup = None;
+                println!();
+                continue;
+            }
+            if matches!(answer, "跳过" | "下一个" | "不知道" | "不确定") {
+                println!("已跳过推测 #{}；可稍后再输入「对比追问」。", guess_id);
+                contrast_followup = None;
+                println!();
+                continue;
+            }
+            // 非作答输入：结束本轮追问，按普通输入继续处理
+            contrast_followup = None;
         }
 
         // 对话式澄清进行中：优先把输入当作对当前提问的回答（是 / 不是 / 不知道）
@@ -907,16 +1054,26 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                                         println!("─────────────────────────────────");
                                                     }
                                                     Err(e) => {
-                                                        println!("获取{}身高信息时出错: {}", person_name, e);
+                                                        println!("获取{}身高信息时出错: {}，回退到本地符号推理...", person_name, e);
+                                                        if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                            println!("{}", answer);
+                                                        }
                                                     }
                                                 }
                                             }
                                             "年龄查询" => {
                                                 println!("正在查询{}的年龄信息...", person_name);
-                                                // 使用现有的查询逻辑
+                                                if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                    println!("{}", answer);
+                                                } else {
+                                                    println!("知识库中没有{}的年龄记录。", person_name);
+                                                }
                                             }
                                             _ => {
-                                                println!("暂不支持该人物查询类型: {}", best_semantic.intent);
+                                                println!("暂不支持该人物查询类型: {}，尝试本地符号推理...", best_semantic.intent);
+                                                if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                    println!("{}", answer);
+                                                }
                                             }
                                         }
                                     } else {
@@ -940,8 +1097,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     // 继续使用查询逻辑
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                                         // 执行查询流程
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities, &precomputed_query_entities).await;
-                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, input, &query_type, &entities, &precomputed_query_entities).await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                     } else {
                                         println!("无法理解您的查询，请重新描述您的问题。");
@@ -951,8 +1108,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, input, &query_type, &entities, &precomputed_query_entities).await;
-                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, input, &query_type, &entities, &precomputed_query_entities).await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                     } else {
                                         println!("{}", config.messages.cannot_understand);
@@ -1209,6 +1366,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     }
                 } else if let Some(answer) = try_symbolic_reasoning(
                     &mut symbolic_reasoner,
+                    &mut contrast_arbiter,
                     &oxigraph_manager,
                     input,
                     &precomputed_query_entities,
@@ -1244,8 +1402,14 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
     }
 
     if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
-        match symbolic_reasoner.save_dialogue_state(state_path) {
-            Ok(_) => println!("对话记忆已保存到 {}", state_path),
+        match symbolic_reasoner
+            .save_dialogue_state_with_contrast(state_path, Some(&contrast_arbiter.snapshot()))
+        {
+            Ok(_) => println!(
+                "对话记忆已保存到 {}（含对比校准记忆：{}）",
+                state_path,
+                contrast_arbiter.memory_summary()
+            ),
             Err(e) => eprintln!("保存对话记忆失败: {}", e),
         }
     }
@@ -1270,6 +1434,7 @@ async fn refresh_symbolic_reasoner(
 
 async fn try_symbolic_reasoning(
     symbolic_reasoner: &mut SymbolicReasoner,
+    contrast_arbiter: &mut ContrastArbiter,
     oxigraph_manager: &OxigraphManager,
     input: &str,
     query_entities: &[String],
@@ -1280,16 +1445,22 @@ async fn try_symbolic_reasoning(
         }
     }
     // 陈述句优先：形式化语义 + 语义蕴含判定（校验用户断言）；
-    // 判为"未知"时追加溯因分析——后向链失败前沿生成候选假设（可解释的推测）
+    // 判为"未知"时追加溯因分析——后向链失败前沿生成候选假设（可解释的推测）；
+    // 最后统一做神经符号对比（联想通道 vs 符号通道），输出仲裁结论并写入会话记忆
     if !contains_question_marker(input) {
         let report = symbolic_reasoner.entailment_report(input);
         if !report.starts_with("形式化失败") {
-            if report.contains("未知（证据不足）") {
+            let mut combined = report;
+            if combined.contains("未知（证据不足）") {
                 if let Some(abduction) = symbolic_reasoner.abduce_statement(input) {
-                    return Some(format!("{}\n{}", report, abduction));
+                    combined.push('\n');
+                    combined.push_str(&abduction);
                 }
             }
-            return Some(report);
+            let case = contrast_arbiter.contrast_statement(input, symbolic_reasoner);
+            combined.push('\n');
+            combined.push_str(&contrast_arbiter.render_case_brief(&case));
+            return Some(combined);
         }
     }
     if let Some(answer) = symbolic_reasoner.answer(input) {
@@ -1321,7 +1492,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 72] = [
+    const COMMANDS: [&str; 75] = [
         "溯因",
         "假设生成",
         "为什么",
@@ -1394,6 +1565,9 @@ fn is_command_like(input: &str) -> bool {
         "遗忘",
         "撤回",
         "会话规则",
+        "对比",
+        "校准",
+        "仲裁",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
 }
@@ -1454,6 +1628,7 @@ async fn continue_original_query(
     local_semantic_adapter: &LocalSemanticAdapter,
     external_knowledge_service: &ExternalKnowledgeService,
     symbolic_reasoner: &mut SymbolicReasoner,
+    contrast_arbiter: &mut ContrastArbiter,
     input: &str,
     query_type: &str,
     entities: &[String],
@@ -1563,7 +1738,7 @@ async fn continue_original_query(
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
                     if let Some(answer) =
-                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, input, precomputed_query_entities).await
+                        try_symbolic_reasoning(symbolic_reasoner, contrast_arbiter, oxigraph_manager, input, precomputed_query_entities).await
                     {
                         println!("{}", answer);
                     }
@@ -1592,7 +1767,7 @@ async fn continue_original_query(
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
                     if let Some(answer) =
-                        try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, input, precomputed_query_entities).await
+                        try_symbolic_reasoning(symbolic_reasoner, contrast_arbiter, oxigraph_manager, input, precomputed_query_entities).await
                     {
                         println!("{}", answer);
                     }
@@ -1623,7 +1798,7 @@ async fn continue_original_query(
                 println!("{}: {}", config.messages.process_error, e);
 
                 if let Some(answer) =
-                    try_symbolic_reasoning(symbolic_reasoner, oxigraph_manager, input, precomputed_query_entities).await
+                    try_symbolic_reasoning(symbolic_reasoner, contrast_arbiter, oxigraph_manager, input, precomputed_query_entities).await
                 {
                     println!("{}", answer);
                 } else {
