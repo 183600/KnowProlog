@@ -238,7 +238,7 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                     // 检查是否是被分词的复合词
                     if expected_word.len() > 1 {
                         let expected_chars: Vec<char> = expected_word.chars().collect();
-                        let mut matched_chars = Vec::new();
+                        let mut matched_count = 0usize;
                         let mut temp_pos = pos;
                         
                         for expected_char in &expected_chars {
@@ -248,7 +248,7 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                                 if word_text.len() == expected_char.len_utf8()
                                     && word_text.starts_with(*expected_char)
                                 {
-                                    matched_chars.push(expected_char);
+                                    matched_count += 1;
                                     temp_pos += 1;
                                     continue;
                                 }
@@ -256,7 +256,7 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                             break;
                         }
                         
-                        if matched_chars.len() == expected_chars.len() {
+                        if matched_count == expected_chars.len() {
                             pos = temp_pos;
                             continue;
                         }

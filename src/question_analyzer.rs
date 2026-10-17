@@ -357,12 +357,11 @@ impl QuestionAnalyzer {
         let mut scores: HashMap<QuestionType, f64> = HashMap::new();
         
         for (q_type, regexes) in patterns.iter() {
-            let mut max_score: f64 = 0.0;
-            for regex in regexes {
-                if regex.is_match(question) {
-                    max_score = max_score.max(1.0);
-                }
-            }
+            let max_score: f64 = if regexes.iter().any(|regex| regex.is_match(question)) {
+                1.0
+            } else {
+                0.0
+            };
             scores.insert(q_type.clone(), max_score);
         }
         
@@ -539,20 +538,29 @@ impl Default for QuestionAnalyzer {
 
 /// 从打分表中选择得分最高的项；同分时按类型名的字典序固定选择。
 fn deterministic_max<T: std::fmt::Debug>(scores: HashMap<T, f64>, fallback: T) -> T {
-    scores
-        .into_iter()
-        .filter(|(_, score)| *score > 0.0)
-        .map(|(value, score)| {
-            let name = format!("{:?}", value);
-            (value, score, name)
-        })
-        .max_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.2.cmp(&a.2))
-        })
-        .map(|(value, _, _)| value)
-        .unwrap_or(fallback)
+    let mut best: Option<(T, f64)> = None;
+    for (value, score) in scores {
+        if score <= 0.0 {
+            continue;
+        }
+        match &best {
+            None => best = Some((value, score)),
+            Some((best_value, best_score)) => {
+                let better = if score > *best_score {
+                    true
+                } else if score < *best_score {
+                    false
+                } else {
+                    // 仅在分数相同时才格式化比较名字，避免每次调用都分配
+                    format!("{:?}", value) > format!("{:?}", best_value)
+                };
+                if better {
+                    best = Some((value, score));
+                }
+            }
+        }
+    }
+    best.map(|(value, _)| value).unwrap_or(fallback)
 }
 
 #[cfg(test)]

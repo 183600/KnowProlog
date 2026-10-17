@@ -404,19 +404,16 @@ impl AdvancedNLU {
     }
 
     fn normalize_query(&self, query: &str) -> String {
-        // 去除多余空白字符
-        let mut normalized = query.trim().to_string();
-
-        // 统一标点符号
-        if normalized.contains('？') {
-            normalized = normalized.replace('？', "?");
-        }
-        if normalized.contains('！') {
-            normalized = normalized.replace('！', "!");
-        }
-
-        // 转换为小写（但保留中文）
-        normalized
+        // 去除多余空白字符并统一标点符号（单遍映射，避免多次分配）
+        query
+            .trim()
+            .chars()
+            .map(|ch| match ch {
+                '？' => '?',
+                '！' => '!',
+                other => other,
+            })
+            .collect()
     }
 
     async fn recognize_intent(&self, query: &str) -> Result<(String, f64), Box<dyn std::error::Error>> {
@@ -657,12 +654,19 @@ impl AdvancedNLU {
     fn extract_entities_by_type(&self, query: &str, entity_type: &str, pattern_info: &EntityPattern) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         
+        // 上下文线索在整句上的命中数对本类型所有匹配都相同，先算一次
+        let context_hits = pattern_info
+            .context_clues
+            .iter()
+            .filter(|clue| query.contains(clue.as_str()))
+            .count();
+        
         // 使用正则模式匹配
         for pattern in &pattern_info.patterns {
             if let Some(regex) = self.get_compiled_entity_regex(pattern) {
                 for mat in regex.find_iter(query) {
                     let text = mat.as_str();
-                    let confidence = self.calculate_entity_confidence(text, query, pattern_info);
+                    let confidence = self.calculate_entity_confidence(text, context_hits, pattern_info);
                     
                     entities.push(ExtractedEntity {
                         text: text.to_string(),
@@ -695,7 +699,7 @@ impl AdvancedNLU {
         Ok(entities)
     }
 
-    fn calculate_entity_confidence(&self, text: &str, context: &str, pattern_info: &EntityPattern) -> f64 {
+    fn calculate_entity_confidence(&self, text: &str, context_hits: usize, pattern_info: &EntityPattern) -> f64 {
         let mut confidence: f64 = 0.5; // 基础置信度
         
         // 检查实体文本是否包含类型关键词
@@ -706,10 +710,8 @@ impl AdvancedNLU {
         }
         
         // 上下文线索通常出现在实体以外的句中语境（如「刘德华的年龄」中的「年龄」），须在整句上匹配
-        for clue in &pattern_info.context_clues {
-            if context.contains(clue) {
-                confidence += 0.1;
-            }
+        for _ in 0..context_hits {
+            confidence += 0.1;
         }
         
         confidence.min(1.0)

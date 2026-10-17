@@ -207,7 +207,7 @@ impl NLUEngine {
                         return Some(word.text.clone());
                     }
                     // 如果没有标记为地点，检查是否是已知城市名
-                    if ["厦门", "北京", "上海", "广州", "深圳", "杭州", "南京", "武汉"].contains(&word.text.as_str()) {
+                    if matches!(word.text.as_str(), "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉") {
                         return Some(word.text.clone());
                     }
                 }
@@ -226,7 +226,7 @@ impl NLUEngine {
                         return Some(word.text.clone());
                     }
                     // 检查常见时间词
-                    if ["明天", "后天", "今天", "昨天", "大后天"].contains(&word.text.as_str()) {
+                    if matches!(word.text.as_str(), "明天" | "后天" | "今天" | "昨天" | "大后天") {
                         return Some(word.text.clone());
                     }
                 }
@@ -237,7 +237,7 @@ impl NLUEngine {
                         return Some(word.text.clone());
                     }
                     // 检查常见人名
-                    if ["姚明", "刘德华", "张三", "李四", "王五", "李明"].contains(&word.text.as_str()) {
+                    if matches!(word.text.as_str(), "姚明" | "刘德华" | "张三" | "李四" | "王五" | "李明") {
                         return Some(word.text.clone());
                     }
                 }
@@ -255,7 +255,7 @@ impl NLUEngine {
                         return Some(word.text.clone());
                     }
                     // 检查常见实体名
-                    if ["李明", "姚明", "刘德华", "张三", "李四", "王五"].contains(&word.text.as_str()) {
+                    if matches!(word.text.as_str(), "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五") {
                         return Some(word.text.clone());
                     }
                 }

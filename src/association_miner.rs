@@ -387,15 +387,17 @@ impl AssociationMiner {
     }
 
     pub fn explain(&self, rule: &AssociationRule) -> String {
+        let antecedent = rule.antecedent_text();
+        let consequent = rule.consequent_text();
         format!(
             "在该知识图谱的 {} 个实体中，「{}」与「{}」共现 {} 次；已知「{}」的实体有 {:.0}% 也具备「{}」（提升度 {:.2}，说明不是随机共现）",
             rule.total,
-            rule.antecedent_text(),
-            rule.consequent_text(),
+            antecedent,
+            consequent,
             rule.support,
-            rule.antecedent_text(),
+            antecedent,
             rule.confidence * 100.0,
-            rule.consequent_text(),
+            consequent,
             rule.lift
         )
     }

@@ -9,6 +9,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkMethod {
@@ -508,20 +509,22 @@ impl EntityLinker {
                 .best()
                 .map(|c| c.method.label())
                 .unwrap_or("无候选");
-            output.push_str(&format!(
+            let _ = write!(
+                output,
                 "  • 「{}」（第 {} 字起；{}）\n",
                 mention.mention,
                 mention.start + 1,
                 method
-            ));
+            );
             for (index, candidate) in mention.candidates.iter().enumerate() {
-                output.push_str(&format!(
+                let _ = write!(
+                    output,
                     "      {}. {}（置信度 {:.2}；{}）\n",
                     index + 1,
                     candidate.entity,
                     candidate.score,
                     candidate.reasons.join("；")
-                ));
+                );
             }
         }
         output.trim_end().to_string()
