@@ -4064,7 +4064,7 @@ mod tests {
         assert!(reasoner.pending_hypotheses().is_empty());
     }
 
-    // ---- 第 2 轮：生成式联合解释 + 对话式澄清 + 跨会话临时信念 ----
+    // ---- 生成式联合解释 + 对话式澄清 + 跨会话临时信念 ----
 
     fn sparse_master_facts() -> Vec<PrologFact> {
         // 只有 李四→王五 一条师傅关系：证明 张三的师祖是赵六 需要同时补两条边

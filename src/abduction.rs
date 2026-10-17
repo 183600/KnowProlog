@@ -1746,7 +1746,7 @@ mod tests {
         assert!(abduction.take_pending(1).is_none());
     }
 
-    // ---- 第 2 轮：联合解释场景 + 对话式澄清 ----
+    // ---- 联合解释场景 + 对话式澄清 ----
 
     fn hyp(predicate: &str, subject: &str, object: &str, confidence: f64) -> Hypothesis {
         Hypothesis {

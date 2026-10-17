@@ -1057,10 +1057,9 @@ impl OxigraphManager {
 
     /// 单次遍历存储，同时构建整图的实体事实与关系事实。
     ///
-    /// 与逐条 SPARQL 查询相比，直接迭代四元组避免了查询引擎的联接开销；
     /// 语义与 `load_all_facts` + `load_all_relations` 的组合保持一致：
     /// - 实体只保留拥有 `rdf:type` 的主体；同一实体多个类型时取最先遇到者，
-    ///   重复属性取最后遇到者（与原先 SPARQL 解流的顺序一致，均为按主体聚簇的存储序）；
+    ///   重复属性取最后遇到者（按主体聚簇的存储序）；
     /// - 关系仅保留两端都有 `kg:name` 的命名主体，且排除自环与 `rdf:type`。
     fn scan_graph_parts(store: &Store) -> (Vec<PrologFact>, Vec<PrologFact>) {
         let mut entity_types: HashMap<String, String> = HashMap::new();
