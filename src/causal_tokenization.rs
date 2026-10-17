@@ -389,7 +389,7 @@ impl CausalTokenizer {
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.start.cmp(&a.start))
+                    .then_with(|| a.start.cmp(&b.start))
                     .then_with(|| a.prev_rank.cmp(&b.prev_rank))
             });
             candidates.truncate(K_BEST);

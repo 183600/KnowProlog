@@ -928,9 +928,30 @@ fn split_shi(text: &str) -> Option<(String, String)> {
     }
 }
 
+/// 断言标记词前是否紧邻否定词（如「不互斥」「不可以传递」「不具有对称性」），
+/// 避免把否定句解析成吞掉否定词的知识
+fn assertion_negated(text: &str, position: usize) -> bool {
+    let prefix = text[..position].trim_end();
+    if prefix.ends_with('不')
+        || prefix.ends_with('没')
+        || prefix.ends_with('无')
+        || prefix.ends_with('非')
+    {
+        return true;
+    }
+    [
+        "没有", "不满足", "不构成", "不具备", "不具有", "不可以", "不能", "不会",
+    ]
+    .iter()
+    .any(|negation| prefix.ends_with(negation))
+}
+
 fn extract_property_prefix(body: &str, suffixes: &[&str]) -> Option<String> {
     for suffix in suffixes {
         if let Some(position) = body.find(suffix) {
+            if assertion_negated(body, position) {
+                continue;
+            }
             let mut property = body[..position].trim().to_string();
             for tail in ["的", "是", "为", "具有", "可以", "关系"] {
                 property = property.trim_end_matches(tail).trim().to_string();
@@ -964,12 +985,20 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
         || cleaned.contains("不属于")
         || cleaned.contains("不一定")
         || cleaned.contains("并非")
+        || cleaned.contains("不具有")
+        || cleaned.contains("不满足")
+        || cleaned.contains("不构成")
+        || cleaned.contains("不可以")
+        || cleaned.contains("不能")
     {
         return Err(format!("「{}」是否定句，本体教学只接受肯定知识", cleaned));
     }
     // 互斥：X和Y互斥 / X与Y不相容
     for marker in ["互不相容", "互相排斥", "彼此排斥", "互斥", "不相容", "排斥"] {
         if let Some(position) = cleaned.find(marker) {
+            if assertion_negated(&cleaned, position) {
+                continue;
+            }
             if let Some((left, right)) = split_pair(&cleaned[..position]) {
                 return Ok(OntologyLesson::Disjoint {
                     left,
@@ -1005,6 +1034,9 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
     // 逆关系
     for marker in ["互为逆关系", "互为相反关系", "互为逆"] {
         if let Some(position) = cleaned.find(marker) {
+            if assertion_negated(&cleaned, position) {
+                continue;
+            }
             if let Some((left, right)) = split_pair(&cleaned[..position]) {
                 return Ok(OntologyLesson::Inverse {
                     left,

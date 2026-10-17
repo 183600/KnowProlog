@@ -490,10 +490,15 @@ impl CausalAnalyzer {
         let roots: HashSet<Atom> = engine.facts().cloned().collect();
         let mut chains = self.graph.root_paths(target, &roots);
         chains.truncate(max_chains.max(1));
-        let confounders = direct_causes
-            .first()
-            .map(|link| self.graph.confounders(&link.cause, target))
-            .unwrap_or_default();
+        // 混杂因子对任意一个直接原因成立都应报告（保持最强原因优先的顺序，去重）
+        let mut confounders: Vec<Atom> = Vec::new();
+        for link in &direct_causes {
+            for confounder in self.graph.confounders(&link.cause, target) {
+                if !confounders.contains(&confounder) {
+                    confounders.push(confounder);
+                }
+            }
+        }
         CausalExplanation {
             target: target.clone(),
             probability,

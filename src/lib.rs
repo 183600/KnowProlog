@@ -626,7 +626,8 @@ impl KnowledgeExtractor {
                 let parts: Vec<&str> = pos_rule.split(['[', ']']).collect();
                 if parts.len() >= 2 {
                     let pos = parts[0];
-                    let index: usize = parts[1].parse().unwrap_or(0);
+                    // 索引语法畸形时视为无效规则，避免静默提取到错误的词
+                    let index: usize = parts[1].trim().parse().ok()?;
                     
                     let mut matching_words = Vec::new();
                     for word in tagged_words {
@@ -664,7 +665,10 @@ impl KnowledgeExtractor {
             if pos_rule == "*" {
                 // 对于通配符，返回所有不是功能词的词的组合
                 let content_words: Vec<String> = tagged_words.iter()
-                    .filter(|word| !matches!(word.pos.as_str(), "u" | "c" | "p" | "的" | "是" | "有"))
+                    .filter(|word| {
+                        !matches!(word.pos.as_str(), "u" | "c" | "p")
+                            && !matches!(word.text.as_str(), "的" | "是" | "有")
+                    })
                     .map(|word| word.text.clone())
                     .collect();
                 if !content_words.is_empty() {
@@ -1693,7 +1697,7 @@ impl OxigraphManager {
                 name_filter.push_str(", ");
             }
             name_filter.push('"');
-            name_filter.push_str(entity);
+            name_filter.push_str(&sparql_literal(entity));
             name_filter.push('"');
         }
         

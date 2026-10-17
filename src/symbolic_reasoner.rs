@@ -490,8 +490,8 @@ pub struct SymbolicReasoner {
     session_clauses: Vec<Clause>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）
     clarification: Option<ClarificationSession>,
-    // 最近一次溯因的目标与查询变量（澄清确认真后验证目标是否得证）
-    last_abduction_goal: Option<Atom>,
+    // 最近一次溯因的目标合取与查询变量（澄清确认真后验证整个目标是否得证）
+    last_abduction_goal: Option<Vec<Atom>>,
     last_abduction_vars: Vec<String>,
     // 谓词清单缓存：仅在 observe_facts 后重建（按对齐器剖面与预测规则生成，顺序敏感）
     known_predicates_cache: Vec<String>,
@@ -1502,7 +1502,7 @@ impl SymbolicReasoner {
             return output;
         }
         if !goals.is_empty() {
-            self.last_abduction_goal = Some(report.goal.clone());
+            self.last_abduction_goal = Some(goals.to_vec());
             self.last_abduction_vars = query_vars.to_vec();
         }
         // 联合解释场景（多假设协同 + 注入验证）：成员也并入待定池
@@ -1578,15 +1578,18 @@ impl SymbolicReasoner {
         let solution = report.solutions.first().cloned();
         let mut output = self.finish_abduction_report(report, &phrase, &goals, &query_vars);
         if let Some(solution) = solution {
-            let answer = solution
-                .bindings
-                .get("答案")
-                .cloned()
-                .unwrap_or_else(|| "?".to_string());
-            output = format!(
-                "后向链推理给出答案：「{}」（证明置信度 {:.2}）\n{}",
-                answer, solution.confidence, output
-            );
+            output = if let Some(answer) = solution.bindings.get("答案") {
+                format!(
+                    "后向链推理给出答案：「{}」（证明置信度 {:.2}）\n{}",
+                    answer, solution.confidence, output
+                )
+            } else {
+                // 陈述句目标没有答案变量，展示"已证明"而不是伪造「?」答案
+                format!(
+                    "后向链推理已证明该陈述（证明置信度 {:.2}）\n{}",
+                    solution.confidence, output
+                )
+            };
         }
         Some(output)
     }
@@ -1617,7 +1620,7 @@ impl SymbolicReasoner {
                 abduction::render_report(&report, &render)
             );
         }
-        self.last_abduction_goal = Some(report.goal.clone());
+        self.last_abduction_goal = Some(goals.clone());
         self.last_abduction_vars = query_vars.clone();
         let scenarios = self.abduction.scenarios(&self.resolver, &goals, &query_vars);
         // 循环假设过滤："假设目标本身成立"不算解释，不进入待定池/澄清队列
@@ -1817,7 +1820,7 @@ impl SymbolicReasoner {
         if let Some((goal, solution)) = self.clarified_goal_solution() {
             let mut text = format!(
                 "\n  → 目标「{}」现在已可证明（置信度 {:.2}）",
-                self.render_atom_nl(&goal),
+                goal,
                 solution.confidence
             );
             if let Some(answer) = solution.bindings.get("答案") {
@@ -1836,16 +1839,20 @@ impl SymbolicReasoner {
         }
     }
 
-    /// 原溯因目标是否已被会话事实证明（含"答案"绑定）
-    fn clarified_goal_solution(&self) -> Option<(Atom, Solution)> {
-        let goal = self.last_abduction_goal.clone()?;
+    /// 原溯因目标合取是否已被会话事实证明（含"答案"绑定）；返回渲染后的目标描述
+    fn clarified_goal_solution(&self) -> Option<(String, Solution)> {
+        let goals = self.last_abduction_goal.clone()?;
+        if goals.is_empty() {
+            return None;
+        }
         let vars = self.last_abduction_vars.clone();
-        let solution = self
-            .resolver
-            .solve(std::slice::from_ref(&goal), &vars)
-            .into_iter()
-            .next()?;
-        Some((goal, solution))
+        let solution = self.resolver.solve(&goals, &vars).into_iter().next()?;
+        let description = goals
+            .iter()
+            .map(|goal| self.render_atom_nl(goal))
+            .collect::<Vec<_>>()
+            .join(" 且 ");
+        Some((description, solution))
     }
 
     fn finish_clarification_session(&mut self) -> String {
@@ -1857,7 +1864,7 @@ impl SymbolicReasoner {
         if let Some((goal, solution)) = self.clarified_goal_solution() {
             output.push_str(&format!(
                 "\n  → 当前目标「{}」已可证明（置信度 {:.2}）",
-                self.render_atom_nl(&goal),
+                goal,
                 solution.confidence
             ));
             if let Some(answer) = solution.bindings.get("答案") {

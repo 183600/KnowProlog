@@ -374,9 +374,6 @@ impl ResolutionEngine {
                         break 'states;
                     }
                 }
-                if budget == 0 {
-                    break;
-                }
             }
             states = next;
             if states.is_empty() {
@@ -527,9 +524,6 @@ impl ResolutionEngine {
                 if out.len() >= self.max_solutions {
                     return out;
                 }
-            }
-            if *budget == 0 {
-                break;
             }
         }
         out

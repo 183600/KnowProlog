@@ -165,13 +165,25 @@ impl NLUEngine {
 
         let mut matched_count = 0;
         let mut slots = Vec::new();
+        // 同类型词槽按出现次序取不同取值（实体1/实体2 不应拿到同一个词）
+        let mut slot_occurrences: HashMap<&str, usize> = HashMap::new();
 
         for pattern_word in pattern.split_whitespace() {
             total_count += 1;
             if pattern_word.starts_with('{') && pattern_word.ends_with('}') {
                 let slot_name = &pattern_word[1..pattern_word.len() - 1];
                 if let Some(slot_config) = slot_configs.iter().find(|s| s.name == slot_name) {
-                    if let Some(value) = self.extract_slot_value(tagged_words, slot_config) {
+                    let occurrence = {
+                        let count = slot_occurrences
+                            .entry(slot_config.slot_type.as_str())
+                            .or_insert(0);
+                        let current = *count;
+                        *count += 1;
+                        current
+                    };
+                    if let Some(value) =
+                        self.extract_slot_value(tagged_words, slot_config, occurrence)
+                    {
                         slots.push((slot_name.to_string(), value));
                         matched_count += 1;
                     }
@@ -199,18 +211,36 @@ impl NLUEngine {
         }
     }
 
-    fn extract_slot_value(&self, tagged_words: &[TaggedWord], slot_config: &SlotConfig) -> Option<String> {
+    /// 取第 `occurrence` 个满足条件的词，用于同名多槽（实体1/实体2）的区分
+    fn nth_matching_value<F>(
+        &self,
+        tagged_words: &[TaggedWord],
+        occurrence: usize,
+        matches: F,
+    ) -> Option<String>
+    where
+        F: Fn(&TaggedWord) -> bool,
+    {
+        tagged_words
+            .iter()
+            .filter(|word| matches(word))
+            .nth(occurrence)
+            .map(|word| word.text.clone())
+    }
+
+    fn extract_slot_value(
+        &self,
+        tagged_words: &[TaggedWord],
+        slot_config: &SlotConfig,
+        occurrence: usize,
+    ) -> Option<String> {
         match slot_config.slot_type.as_str() {
             "城市" | "地点" => {
-                for word in tagged_words {
-                    if word.pos == "ns" || word.pos == "n" {
-                        return Some(word.text.clone());
-                    }
-                    // 如果没有标记为地点，检查是否是已知城市名
-                    if matches!(word.text.as_str(), "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉") {
-                        return Some(word.text.clone());
-                    }
-                }
+                self.nth_matching_value(tagged_words, occurrence, |word| {
+                    word.pos == "ns"
+                        || word.pos == "n"
+                        || matches!(word.text.as_str(), "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉")
+                })
             }
             "日期" | "时间" => {
                 for pattern in &slot_config.patterns {
@@ -230,39 +260,32 @@ impl NLUEngine {
                         return Some(word.text.clone());
                     }
                 }
+                None
             }
-            "人名" => {
-                for word in tagged_words {
-                    if word.pos == "nr" {
-                        return Some(word.text.clone());
-                    }
-                    // 检查常见人名
-                    if matches!(word.text.as_str(), "姚明" | "刘德华" | "张三" | "李四" | "王五" | "李明") {
+            "人名" => self.nth_matching_value(tagged_words, occurrence, |word| {
+                word.pos == "nr"
+                    || matches!(word.text.as_str(), "姚明" | "刘德华" | "张三" | "李四" | "王五" | "李明")
+            }),
+            "数量" => self.nth_matching_value(tagged_words, occurrence, |word| {
+                word.pos == "m" || word.text.chars().all(|c| c.is_numeric())
+            }),
+            "实体" => self.nth_matching_value(tagged_words, occurrence, |word| {
+                word.pos == "nr"
+                    || word.pos == "ns"
+                    || word.pos == "n"
+                    || matches!(word.text.as_str(), "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五")
+            }),
+            "属性" => {
+                // 属性是「X的Y」中的名词性成分，取最后一个名词，避免把实体本身当属性
+                for word in tagged_words.iter().rev() {
+                    if matches!(word.pos.as_str(), "n" | "nz" | "vn") {
                         return Some(word.text.clone());
                     }
                 }
+                None
             }
-            "数量" => {
-                for word in tagged_words {
-                    if word.pos == "m" || word.text.chars().all(|c| c.is_numeric()) {
-                        return Some(word.text.clone());
-                    }
-                }
-            }
-            "实体" => {
-                for word in tagged_words {
-                    if word.pos == "nr" || word.pos == "n" {
-                        return Some(word.text.clone());
-                    }
-                    // 检查常见实体名
-                    if matches!(word.text.as_str(), "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五") {
-                        return Some(word.text.clone());
-                    }
-                }
-            }
-            _ => {}
+            _ => None,
         }
-        None
     }
 
     fn word_similarity(&self, word1: &str, word2: &str) -> f64 {

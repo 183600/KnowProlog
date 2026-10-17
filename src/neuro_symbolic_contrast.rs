@@ -30,7 +30,7 @@ use std::collections::{HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
-use crate::association_miner::{attribute_item, display_item, relation_item};
+use crate::association_miner::{attribute_item, display_item, relation_item, type_item};
 use crate::chinese_reasoning_nlu::{parse_proposition, render_atom_zh};
 use crate::resolution_engine::{Atom, ProofNode, ProofSource, Term};
 use crate::semantic_entailment::Verdict;
@@ -787,12 +787,16 @@ impl ContrastArbiter {
     ) -> Option<ChannelEvidence> {
         let miner = reasoner.associations();
         let basket = miner.basket(&probe.subject)?;
-        // 谓词可能以关系（三元组）或属性（键值）形式入库，两种物品名都接受
+        // 谓词可能以关系（三元组）、属性（键值）或类型标签形式入库，三种物品名都接受
         let relation_target = relation_item(&probe.target);
         let attribute_target = attribute_item(&probe.target);
+        let type_target = type_item(&probe.target);
         let mut best: Option<&crate::association_miner::AssociationRule> = None;
         for rule in miner.rules() {
-            if rule.consequent != relation_target && rule.consequent != attribute_target {
+            if rule.consequent != relation_target
+                && rule.consequent != attribute_target
+                && rule.consequent != type_target
+            {
                 continue;
             }
             // 跳过同义反复规则（结论物品与前件物品同显示名），它们不提供新信息

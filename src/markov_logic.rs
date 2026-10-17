@@ -847,7 +847,15 @@ impl MarkovLogicEngine {
                 None => break,
             }
         }
-        candidates.iter().cloned().zip(assignment).collect()
+        candidates
+            .into_iter()
+            .cloned()
+            .zip(assignment)
+            .map(|(atom, value)| {
+                let fixed_true = self.facts.contains(&atom);
+                (atom, value || fixed_true)
+            })
+            .collect()
     }
 }
 

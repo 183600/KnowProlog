@@ -352,21 +352,23 @@ impl Compiled {
                 probability: 1.0,
             }];
         }
+        // 概率事实本身是一条证明；同一原子还可能有规则支持，继续向下收集避免
+        // 证明概率与精确 WMC 概率不一致（例如事实 0.3、规则合并后 0.93）
+        let mut results: Vec<ProblogProof> = Vec::new();
         if let Some(&probability) = self.probabilistic_facts.get(atom) {
             *budget -= 1;
-            return vec![ProblogProof {
+            results.push(ProblogProof {
                 steps: Vec::new(),
                 probability,
-            }];
+            });
         }
         if path.contains(atom) {
-            return Vec::new();
+            return results;
         }
         let Some(indices) = self.instances_by_head.get(atom) else {
-            return Vec::new();
+            return results;
         };
         path.insert(atom.clone());
-        let mut results: Vec<ProblogProof> = Vec::new();
         for &index in indices.iter().take(6) {
             if *budget == 0 || results.len() >= max_proofs {
                 break;

@@ -1705,27 +1705,42 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
         .find_map(|prefix| input.strip_prefix(prefix))
 }
 
-/// 解析「采纳假设 N」中的编号：支持阿拉伯数字与「一、二、三…十」
+/// 解析中文数词（1..=99）：十一、二十、二十三、九十九
+fn parse_chinese_numeral(text: &str) -> Option<usize> {
+    let digit = |ch: char| -> Option<usize> {
+        Some(match ch {
+            '一' => 1,
+            '二' | '两' => 2,
+            '三' => 3,
+            '四' => 4,
+            '五' => 5,
+            '六' => 6,
+            '七' => 7,
+            '八' => 8,
+            '九' => 9,
+            _ => return None,
+        })
+    };
+    let chars: Vec<char> = text.chars().collect();
+    match chars.as_slice() {
+        ['十'] => Some(10),
+        [single] => digit(*single),
+        ['十', ones] => Some(10 + digit(*ones)?),
+        [tens, '十'] => Some(digit(*tens)? * 10),
+        [tens, '十', ones] => Some(digit(*tens)? * 10 + digit(*ones)?),
+        _ => None,
+    }
+}
+
+/// 解析「采纳假设 N」中的编号：支持阿拉伯数字与「一、二、三…十、十二、二十三」
 fn parse_hypothesis_index(text: &str) -> Option<usize> {
     let trimmed = text.trim().trim_start_matches(['：', ':', ' ', '第']);
-    if let Ok(index) = trimmed.trim_end_matches('条').trim().parse::<usize>() {
+    let trimmed = trimmed.trim_end_matches('条').trim();
+    if let Ok(index) = trimmed.parse::<usize>() {
         return (index > 0).then_some(index);
     }
-    let first = trimmed.chars().next()?;
-    let index = match first {
-        '一' => 1,
-        '二' | '两' => 2,
-        '三' => 3,
-        '四' => 4,
-        '五' => 5,
-        '六' => 6,
-        '七' => 7,
-        '八' => 8,
-        '九' => 9,
-        '十' => 10,
-        _ => return None,
-    };
-    Some(index)
+    let index = parse_chinese_numeral(trimmed)?;
+    (index > 0).then_some(index)
 }
 
 async fn continue_original_query(

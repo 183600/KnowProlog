@@ -481,6 +481,7 @@ impl LocalSemanticAdapter {
             ("作者", "author_query"),
             ("冠军", "champion_query"),
             ("诞生", "birth_year_query"),
+            ("发明", "birth_year_query"),
             ("解释", "explanation_query"),
             ("什么是", "concept_query"),
             ("比较", "comparison_query"),
@@ -527,7 +528,10 @@ impl LocalSemanticAdapter {
             "author_query" => Some(query.contains("作者") || query.contains("谁写")),
             "champion_query" => Some(query.contains("冠军")),
             "birth_year_query" => Some(
-                query.contains("诞生") || query.contains("哪一年") || query.contains("哪年"),
+                query.contains("诞生")
+                    || query.contains("发明")
+                    || query.contains("哪一年")
+                    || query.contains("哪年"),
             ),
             "quantity_query" => Some(query.contains("多少") || query.contains("几")),
             "planet_query" | "largest_query" => {
