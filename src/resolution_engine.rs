@@ -769,9 +769,11 @@ fn unify_prepared(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> boo
                 if a == b {
                     continue;
                 }
-                if remember_var(&mut touched, &mut touched_len, a)
-                    || remember_var(&mut touched, &mut touched_len, b)
-                {
+                // 两个变量都要登记：回退到通用合一时可能绑定其中之一
+                // （或经解析链绑定），漏登记会让后续出现被当作新变量而被直接覆盖
+                let seen_a = remember_var(&mut touched, &mut touched_len, a);
+                let seen_b = remember_var(&mut touched, &mut touched_len, b);
+                if seen_a || seen_b {
                     if !unify_terms(left, right, subst) {
                         return false;
                     }

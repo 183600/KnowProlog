@@ -551,8 +551,9 @@ fn deterministic_max<T: std::fmt::Debug>(scores: HashMap<T, f64>, fallback: T) -
                 } else if score < *best_score {
                     false
                 } else {
-                    // 仅在分数相同时才格式化比较名字，避免每次调用都分配
-                    format!("{:?}", value) > format!("{:?}", best_value)
+                    // 仅在分数相同时才格式化比较名字，避免每次调用都分配；
+                    // 与 `max_by` 的 b.2.cmp(&a.2) 一致：同分取字典序更小的名字
+                    format!("{:?}", value) < format!("{:?}", best_value)
                 };
                 if better {
                     best = Some((value, score));
