@@ -445,7 +445,7 @@ impl ResolutionEngine {
                     continue;
                 }
                 let mut unified = subst.clone();
-                if unify_atoms(&applied, fact, &mut unified) {
+                if unify_prepared(&applied, fact, &mut unified) {
                     let ground = apply_atom(&unified, &applied);
                     results.push((unified, ProofNode::fact(ground)));
                     if results.len() >= self.max_solutions {
@@ -468,7 +468,7 @@ impl ResolutionEngine {
                 let fresh_head = renamer.atom(&clause.head);
                 let mut unified = subst.clone();
                 *budget -= 1;
-                if !unify_atoms(&applied, &fresh_head, &mut unified) {
+                if !unify_prepared(&applied, &fresh_head, &mut unified) {
                     continue;
                 }
                 // 头合一失败时无需换名规则体
@@ -644,7 +644,7 @@ impl ResolutionEngine {
                         continue;
                     }
                     let mut unified = subst.clone();
-                    if unify_atoms(&applied, fact, &mut unified) {
+                    if unify_prepared(&applied, fact, &mut unified) {
                         let mut chain = Vec::with_capacity(premises.len() + 1);
                         chain.extend_from_slice(premises);
                         chain.push(fact.clone());
@@ -719,6 +719,85 @@ pub fn unify_atoms(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> bo
     for (left, right) in pattern.terms.iter().zip(other.terms.iter()) {
         if !unify_terms(left, right, subst) {
             return false;
+        }
+    }
+    true
+}
+
+/// 记录本次合一中已处理的变量；返回 true 表示该变量重复出现。
+/// 超出小数组容量时同样返回 true，让调用方回退到通用合一（保守但正确）。
+#[inline]
+fn remember_var(
+    touched: &mut [Option<Rc<str>>; 4],
+    len: &mut usize,
+    name: &Rc<str>,
+) -> bool {
+    for slot in touched.iter().flatten() {
+        if Rc::ptr_eq(slot, name) || **slot == **name {
+            return true;
+        }
+    }
+    if *len < touched.len() {
+        touched[*len] = Some(name.clone());
+        *len += 1;
+        false
+    } else {
+        true
+    }
+}
+
+/// 合一快速路径，前置条件：
+/// - `pattern` 已按 `subst` 完全解析（其中仍为变量的项必然在 `subst` 中未绑定）；
+/// - `other` 为基原子，或其变量均未出现在 `subst` 中。
+///
+/// 满足条件时无需为每一对词项重复扫描置换链，可直接写入新绑定；
+/// 同一变量在本次合一中重复出现时回退到通用合一，语义与 [`unify_atoms`] 一致。
+fn unify_prepared(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> bool {
+    if pattern.predicate != other.predicate || pattern.arity() != other.arity() {
+        return false;
+    }
+    let mut touched: [Option<Rc<str>>; 4] = Default::default();
+    let mut touched_len = 0usize;
+    for (left, right) in pattern.terms.iter().zip(other.terms.iter()) {
+        match (left, right) {
+            (Term::Const(a), Term::Const(b)) => {
+                if a != b {
+                    return false;
+                }
+            }
+            (Term::Var(a), Term::Var(b)) => {
+                if a == b {
+                    continue;
+                }
+                if remember_var(&mut touched, &mut touched_len, a)
+                    || remember_var(&mut touched, &mut touched_len, b)
+                {
+                    if !unify_terms(left, right, subst) {
+                        return false;
+                    }
+                } else {
+                    subst.insert(a.clone(), right.clone());
+                }
+            }
+            (Term::Var(a), _) => {
+                if remember_var(&mut touched, &mut touched_len, a) {
+                    if !unify_terms(left, right, subst) {
+                        return false;
+                    }
+                } else {
+                    subst.insert(a.clone(), right.clone());
+                }
+            }
+            (_, Term::Var(b)) => {
+                if remember_var(&mut touched, &mut touched_len, b) {
+                    if !unify_terms(left, right, subst) {
+                        return false;
+                    }
+                } else {
+                    subst.insert(b.clone(), left.clone());
+                }
+            }
+            _ => {}
         }
     }
     true
