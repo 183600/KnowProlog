@@ -91,9 +91,10 @@ impl QuestionAnalyzer {
         let jieba = crate::nlp::shared_jieba();
         
         let stop_words = STOP_WORDS.get_or_init(|| {
-            [
-                "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为", "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是"
-            ].into_iter().collect()
+            crate::function_words::projection_set(crate::function_words::Projection::Question)
+                .iter()
+                .copied()
+                .collect()
         });
 
         Self {

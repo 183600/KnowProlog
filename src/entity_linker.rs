@@ -49,6 +49,283 @@ impl LinkedMention {
     }
 }
 
+/// 类型核对结论：疑问词的「类型期待」× 候选实体的「类型证据」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeVerdict {
+    /// 有期待且候选类型命中
+    Match,
+    /// 有期待但候选类型不符
+    Mismatch,
+    /// 有期待但候选类型未知（证据不足，不阻断）
+    Unknown,
+    /// 无疑问词期待
+    NotExpected,
+}
+
+impl TypeVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            TypeVerdict::Match => "命中期待",
+            TypeVerdict::Mismatch => "与期待不符",
+            TypeVerdict::Unknown => "类型未知",
+            TypeVerdict::NotExpected => "无类型期待",
+        }
+    }
+}
+
+/// 单个候选的证据收据（只读审计，不参与链接打分）。
+#[derive(Debug, Clone)]
+pub struct CandidateReceipt {
+    pub entity: String,
+    pub score: f64,
+    pub method: LinkMethod,
+    /// 候选实体的图谱登记类型（类型证据）
+    pub entity_type: Option<String>,
+    /// 当前问题类型期待与该候选的核对结论（诊断用）
+    pub expectation_check: TypeVerdict,
+    /// 该候选是否恰为当前对话焦点（先验标注，不抬分）
+    pub focus_prior: bool,
+    pub reasons: Vec<String>,
+}
+
+/// 一个指称的完整证据收据：边界证据 + 链接候选 + 类型证据 + 焦点先验。
+#[derive(Debug, Clone)]
+pub struct MentionReceipt {
+    pub mention: String,
+    pub start: usize,
+    pub candidates: Vec<CandidateReceipt>,
+}
+
+/// 类型核对：实体类型未知→Unknown；关键词命中（忽略大小写）→Match；否则 Mismatch。
+fn expectation_check(entity_type: Option<&str>, expectations: &[&str]) -> TypeVerdict {
+    if expectations.is_empty() {
+        return TypeVerdict::NotExpected;
+    }
+    let Some(etype) = entity_type else {
+        return TypeVerdict::Unknown;
+    };
+    let etype_lower = etype.to_lowercase();
+    if expectations.iter().any(|keyword| {
+        etype.contains(keyword) || etype_lower.contains(&keyword.to_lowercase())
+    }) {
+        TypeVerdict::Match
+    } else {
+        TypeVerdict::Mismatch
+    }
+}
+
+/// OOV（未登录）疑点的来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OovKind {
+    /// 书名号 / 引号包裹的词
+    Quoted,
+    /// 命中实体后缀表的词
+    Suffix,
+}
+
+/// OOV 疑点：只报告、不落库；采纳须走人工确认（编年史）流程。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OovSuspect {
+    pub text: String,
+    pub start: usize,
+    pub kind: OovKind,
+    pub reason: String,
+}
+
+/// 实体后缀表（机构/地点/人物角色）：用于把未登录词提名为疑点。
+pub const ENTITY_SUFFIXES: [&str; 20] = [
+    "公司", "集团", "大学", "学院", "医院", "银行", "博物馆", "图书馆", "研究院", "委员会",
+    "政府", "法院", "城市", "自治区", "老师", "教授", "博士", "医生", "律师", "导演",
+];
+
+fn is_covered(covered: &[(usize, usize)], start: usize, end: usize) -> bool {
+    covered.iter().any(|&(s, e)| start < e && s < end)
+}
+
+fn is_han_char(ch: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&ch)
+}
+
+/// OOV 后缀词前缀扫描的边界虚词：向前取名字时遇到这些字即截断。
+const OOV_BOUNDARY_CHARS: [char; 18] = [
+    '的', '是', '和', '与', '或', '及', '在', '为', '把', '被', '由', '将', '有', '了', '地', '得',
+    '对', '从',
+];
+
+fn is_oov_boundary(ch: char) -> bool {
+    OOV_BOUNDARY_CHARS.contains(&ch)
+}
+
+/// 扫描文本中的 OOV 疑点：引号词 + 后缀词，排除已链接区间。
+///
+/// 只提名不落库；输出按（起始位置，来源）确定排序、按文本去重。
+pub fn oov_suspects(text: &str, receipts: &[MentionReceipt]) -> Vec<OovSuspect> {
+    let chars: Vec<char> = text.chars().collect();
+    let covered: Vec<(usize, usize)> = receipts
+        .iter()
+        .map(|receipt| {
+            (
+                receipt.start,
+                receipt.start + receipt.mention.chars().count(),
+            )
+        })
+        .collect();
+    let mut suspects: Vec<OovSuspect> = Vec::new();
+
+    // 1) 引号词：书名号 / 各类引号
+    let mut i = 0;
+    while i < chars.len() {
+        let close = match chars[i] {
+            '《' => Some('》'),
+            '“' => Some('”'),
+            '「' => Some('」'),
+            '『' => Some('』'),
+            _ => None,
+        };
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        if let Some(offset) = chars[i + 1..].iter().position(|ch| *ch == close) {
+            let end = i + 1 + offset;
+            let inner: String = chars[i + 1..end].iter().collect();
+            let trimmed = inner.trim();
+            let count = trimmed.chars().count();
+            if count > 0 && count <= 12 && !is_covered(&covered, i + 1, end) {
+                suspects.push(OovSuspect {
+                    text: trimmed.to_string(),
+                    start: i + 1,
+                    kind: OovKind::Quoted,
+                    reason: "未在知识图谱登记".to_string(),
+                });
+            }
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    // 2) 实体后缀词：向前取最多 4 个连续汉字作前缀（功能词处截断）
+    let suffix_chars: Vec<Vec<char>> = ENTITY_SUFFIXES
+        .iter()
+        .map(|suffix| suffix.chars().collect())
+        .collect();
+    for (suffix_index, suffix) in ENTITY_SUFFIXES.iter().enumerate() {
+        let suffix = &suffix_chars[suffix_index];
+        let len = suffix.len();
+        if len == 0 || chars.len() < len {
+            continue;
+        }
+        for start in 0..=chars.len() - len {
+            if chars[start..start + len] != suffix[..] {
+                continue;
+            }
+            let mut prefix_start = start;
+            let mut taken = 0;
+            while prefix_start > 0 && taken < 4 {
+                let prev = chars[prefix_start - 1];
+                if !is_han_char(prev) || is_oov_boundary(prev) {
+                    break;
+                }
+                prefix_start -= 1;
+                taken += 1;
+            }
+            if taken == 0 {
+                continue; // 裸后缀（公司/大学…）不提名
+            }
+            let end = start + len;
+            if is_covered(&covered, prefix_start, end) {
+                continue;
+            }
+            let candidate: String = chars[prefix_start..end].iter().collect();
+            suspects.push(OovSuspect {
+                text: candidate,
+                start: prefix_start,
+                kind: OovKind::Suffix,
+                reason: format!("实体后缀「{}」，未在知识图谱登记", ENTITY_SUFFIXES[suffix_index]),
+            });
+        }
+    }
+
+    suspects.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| a.text.cmp(&b.text)));
+    let mut seen = HashSet::new();
+    suspects.retain(|suspect| seen.insert(suspect.text.clone()));
+    suspects
+}
+
+/// 渲染提及账本：每个指称一张证据收据，输出确定性可 golden。
+pub fn render_mention_ledger(
+    text: &str,
+    receipts: &[MentionReceipt],
+    expectations: &[&str],
+    suspects: &[OovSuspect],
+) -> String {
+    let expectation_text = if expectations.is_empty() {
+        "无".to_string()
+    } else {
+        expectations.join("/")
+    };
+    let mut output = String::new();
+    if receipts.is_empty() {
+        output.push_str(&format!(
+            "提及账本：「{}」中未识别到知识图谱中的实体（类型期待：{}）。\n",
+            text, expectation_text
+        ));
+    } else {
+        output.push_str(&format!(
+            "提及账本：「{}」识别到 {} 个指称（类型期待：{}）。\n",
+            text,
+            receipts.len(),
+            expectation_text
+        ));
+        for receipt in receipts {
+            let _ = writeln!(
+                output,
+                "  • 「{}」（第 {} 字起）",
+                receipt.mention,
+                receipt.start + 1
+            );
+            for (index, candidate) in receipt.candidates.iter().enumerate() {
+                let etype = candidate.entity_type.as_deref().unwrap_or("未登记类型");
+                let _ = writeln!(
+                    output,
+                    "      {}. {}（置信度 {:.2}；{}；类型证据：{} → {}）",
+                    index + 1,
+                    candidate.entity,
+                    candidate.score,
+                    candidate.method.label(),
+                    etype,
+                    candidate.expectation_check.label()
+                );
+                for reason in &candidate.reasons {
+                    let _ = writeln!(output, "         - {}", reason);
+                }
+                if candidate.focus_prior {
+                    let _ = writeln!(output, "         - 焦点先验：当前对话焦点");
+                }
+            }
+        }
+    }
+    if !suspects.is_empty() {
+        output.push_str(&format!("OOV 疑点（只报告，不落库）：{} 个\n", suspects.len()));
+        for suspect in suspects {
+            let kind = match suspect.kind {
+                OovKind::Quoted => "引号词",
+                OovKind::Suffix => "后缀词",
+            };
+            let _ = writeln!(
+                output,
+                "  • 「{}」（第 {} 字起；{}；{}）",
+                suspect.text,
+                suspect.start + 1,
+                kind,
+                suspect.reason
+            );
+        }
+    }
+    output.trim_end().to_string()
+}
+
 struct EntityProfile {
     etype: Option<String>,
     degree: usize,
@@ -554,6 +831,53 @@ impl EntityLinker {
         }
         output.trim_end().to_string()
     }
+
+    /// 查询实体的登记类型（提及账本的「类型证据」来源）。
+    pub fn entity_type(&self, entity: &str) -> Option<&str> {
+        self.profiles
+            .get(entity)
+            .and_then(|profile| profile.etype.as_deref())
+    }
+
+    /// 为文本中的每个指称生成证据收据（只读审计，不改变链接行为）。
+    ///
+    /// - 边界证据：链接方法 + 位置 + 打分理由（`reasons`）；
+    /// - 类型证据：候选实体的图谱登记类型 → 与问题期待核对的结论；
+    /// - 对话先验：候选恰为当前焦点实体时标注（不抬分，焦点不得压倒证据）。
+    pub fn mention_receipts(
+        &self,
+        text: &str,
+        hints: &[String],
+        expectations: &[&str],
+        focus: Option<&str>,
+    ) -> Vec<MentionReceipt> {
+        self.link_with_context(text, hints)
+            .into_iter()
+            .map(|mention| MentionReceipt {
+                mention: mention.mention.clone(),
+                start: mention.start,
+                candidates: mention
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        let entity_type = self.entity_type(&candidate.entity).map(str::to_string);
+                        CandidateReceipt {
+                            entity: candidate.entity.clone(),
+                            score: candidate.score,
+                            method: candidate.method,
+                            expectation_check: expectation_check(
+                                entity_type.as_deref(),
+                                expectations,
+                            ),
+                            entity_type,
+                            focus_prior: focus == Some(candidate.entity.as_str()),
+                            reasons: candidate.reasons.clone(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
 }
 
 fn segment_spans(text: &str) -> Vec<(usize, String)> {
@@ -582,11 +906,8 @@ fn segment_spans(text: &str) -> Vec<(usize, String)> {
 }
 
 fn is_stop_segment(segment: &str) -> bool {
-    const STOP: [&str; 14] = [
-        "什么", "多少", "哪里", "哪个", "哪些", "怎么", "如何", "为什么", "介绍", "一下",
-        "告诉我", "请问", "你好", "一下吗",
-    ];
-    STOP.contains(&segment)
+    crate::function_words::projection_set(crate::function_words::Projection::LinkerSegment)
+        .contains(segment)
 }
 
 #[cfg(test)]
@@ -816,5 +1137,110 @@ mod tests {
         assert!(dice_similarity("刘德桦", "刘德华") > 0.4);
         assert_eq!(dice_similarity("张三", "苹果"), 0.0);
         assert_eq!(dice_similarity("张", "张三"), 0.0);
+    }
+
+    /// 提及账本：候选带类型证据、期待核对与焦点先验；不改变链接排序。
+    #[test]
+    fn test_mention_receipts_type_evidence_and_focus() {
+        let linker = sample_linker();
+        let hints = vec!["创始人".to_string()];
+        let receipts = linker.mention_receipts(
+            "苹果的创始人是谁",
+            &hints,
+            &["人", "person"],
+            Some("苹果公司"),
+        );
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].mention, "苹果");
+        let best = &receipts[0].candidates[0];
+        assert_eq!(best.entity, "苹果公司");
+        assert_eq!(best.method, LinkMethod::Alias);
+        assert_eq!(best.entity_type.as_deref(), Some("公司"));
+        // 「公司」不含「人/person」→ 与疑问词期待不符；类型证据仍如实展示
+        assert_eq!(best.expectation_check, TypeVerdict::Mismatch);
+        assert!(best.focus_prior, "候选中含当前焦点实体应标注先验");
+        assert!(
+            receipts[0]
+                .candidates
+                .iter()
+                .any(|candidate| candidate.entity == "苹果果实" && !candidate.focus_prior)
+        );
+    }
+
+    /// 类型未知→Unknown；无期待→NotExpected；命中→Match（忽略大小写）。
+    #[test]
+    fn test_expectation_check_verdicts() {
+        assert_eq!(expectation_check(Some("人物"), &["人", "person"]), TypeVerdict::Match);
+        assert_eq!(expectation_check(Some("Person"), &["person"]), TypeVerdict::Match);
+        assert_eq!(expectation_check(Some("公司"), &["人"]), TypeVerdict::Mismatch);
+        assert_eq!(expectation_check(None, &["人"]), TypeVerdict::Unknown);
+        assert_eq!(expectation_check(Some("公司"), &[]), TypeVerdict::NotExpected);
+    }
+
+    /// 账本渲染确定性：含类型证据、焦点先验与候选理由；两次渲染同字节。
+    #[test]
+    fn test_render_mention_ledger_is_deterministic() {
+        let linker = sample_linker();
+        let hints = vec!["创始人".to_string()];
+        let expectations = ["人", "person"];
+        let receipts =
+            linker.mention_receipts("苹果的创始人是谁", &hints, &expectations, Some("苹果公司"));
+        let first = render_mention_ledger("苹果的创始人是谁", &receipts, &expectations, &[]);
+        let second = render_mention_ledger("苹果的创始人是谁", &receipts, &expectations, &[]);
+        assert_eq!(first, second);
+        assert!(first.contains("提及账本"));
+        assert!(first.contains("类型证据：公司 → 与期待不符"));
+        assert!(first.contains("焦点先验：当前对话焦点"));
+
+        let empty = render_mention_ledger("今天天气怎么样", &[], &[], &[]);
+        assert!(empty.contains("未识别到知识图谱中的实体"));
+    }
+
+    /// OOV 疑点：引号词与后缀词被提名，已链接区间不重复提名，KB 不变。
+    #[test]
+    fn test_oov_suspects_quoted_and_suffix() {
+        let linker = sample_linker();
+        let before = linker.len();
+        let text = "想了解未名科技公司和《背影》的作者";
+        let receipts = linker.mention_receipts(text, &[], &[], None);
+        let suspects = oov_suspects(text, &receipts);
+        let names: Vec<&str> = suspects.iter().map(|s| s.text.as_str()).collect();
+        assert!(names.contains(&"未名科技公司"), "后缀词应被提名：{:?}", names);
+        assert!(names.contains(&"背影"), "书名号词应被提名：{:?}", names);
+        assert!(
+            suspects
+                .iter()
+                .any(|s| s.text == "未名科技公司" && s.kind == OovKind::Suffix),
+        );
+        assert!(suspects
+            .iter()
+            .any(|s| s.text == "背影" && s.kind == OovKind::Quoted));
+        // 已链接实体（刘德华）不进入 OOV 疑点
+        let linked_text = "刘德华的公司";
+        let linked_receipts = linker.mention_receipts(linked_text, &[], &[], None);
+        let linked_suspects = oov_suspects(linked_text, &linked_receipts);
+        assert!(
+            linked_suspects.iter().all(|s| s.text != "刘德华的" && s.text != "刘德华的公司"),
+            "已链接区间不应提名：{:?}",
+            linked_suspects
+        );
+        // KB 不变：账本只读
+        assert_eq!(linker.len(), before);
+    }
+
+    /// 渲染含 OOV 段落时仍确定；无疑点时不出现该段落。
+    #[test]
+    fn test_render_mention_ledger_oov_section() {
+        let linker = sample_linker();
+        let text = "未名研究院的院长是谁";
+        let receipts = linker.mention_receipts(text, &[], &["人"], None);
+        let suspects = oov_suspects(text, &receipts);
+        let rendered = render_mention_ledger(text, &receipts, &["人"], &suspects);
+        assert!(rendered.contains("OOV 疑点（只报告，不落库）"));
+        assert!(rendered.contains("未名研究院"));
+        assert_eq!(render_mention_ledger(text, &receipts, &["人"], &suspects), rendered);
+
+        let no_oov = render_mention_ledger("苹果的创始人是谁", &[], &[], &[]);
+        assert!(!no_oov.contains("OOV 疑点"));
     }
 }

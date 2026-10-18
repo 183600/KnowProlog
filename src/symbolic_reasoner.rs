@@ -1328,6 +1328,19 @@ impl SymbolicReasoner {
             .collect()
     }
 
+    /// 提及账本：每个指称一张证据收据（边界 + 类型证据 × 疑问词期待 + 焦点先验）。
+    ///
+    /// 只读审计面：不改变链接与作答行为，输出确定可 golden。
+    pub fn mention_ledger_report(&self, text: &str) -> String {
+        let hints = self.link_hints(text);
+        let expectations = crate::function_words::answer_type_keywords(text);
+        let receipts =
+            self.linker
+                .mention_receipts(text, &hints, &expectations, self.context.focus());
+        let suspects = crate::entity_linker::oov_suspects(text, &receipts);
+        crate::entity_linker::render_mention_ledger(text, &receipts, &expectations, &suspects)
+    }
+
     fn link_hints(&self, text: &str) -> Vec<String> {
         let normalized_text = self.aligner.normalize_cow(text);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
@@ -2988,20 +3001,9 @@ impl SymbolicReasoner {
     }
 
     // 期望答案类型（形式语义中的问题类型约束）：谁→人物、哪里→地点、何时→时间
+    // 疑问词识别与关键词表统一收敛到虚词算符表（`function_words::answer_type_keywords`）
     fn expected_type_keywords(question: &str) -> Vec<&'static str> {
-        if question.contains('谁') || question.contains("何人") || question.contains("哪位") {
-            vec!["人", "person"]
-        } else if question.contains("哪里")
-            || question.contains("哪儿")
-            || question.contains("什么地方")
-            || question.contains("何处")
-        {
-            vec!["地", "城市", "国家", "place", "location", "country", "city"]
-        } else if question.contains("什么时候") || question.contains("哪年") || question.contains("何时") {
-            vec!["日期", "时间", "date", "time", "年"]
-        } else {
-            Vec::new()
-        }
+        crate::function_words::answer_type_keywords(question)
     }
 
     fn value_matches_expectation(&self, value: &str, keywords: &[&str]) -> bool {

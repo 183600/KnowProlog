@@ -10,14 +10,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::function_words::{projection_set, Projection};
 use crate::nlp::shared_jieba;
 
-/// 查询/文档共用的停用词（功能词不携带检索信息）
-const STOPWORDS: [&str; 34] = [
-    "的", "了", "是", "在", "和", "与", "也", "都", "就", "吗", "呢", "吧", "啊", "什么", "多少",
-    "几", "哪", "哪个", "哪些", "谁", "怎么", "为什么", "如何", "请问", "帮我", "告诉", "我",
-    "一下", "这个", "那个", "他", "她", "它", "们",
-];
+/// 查询/文档共用的停用词（唯一正本见 `function_words`；本投影与历史名单逐词一致）
+fn stopwords() -> &'static HashSet<&'static str> {
+    projection_set(Projection::Retrieval)
+}
 
 /// 单条被检索的证据（三元组或实体属性）
 #[derive(Debug, Clone)]
@@ -527,7 +526,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
     for word in shared_jieba().cut(text, false) {
         let word = word.trim();
-        if word.is_empty() || is_punctuation(word) || STOPWORDS.contains(&word) {
+        if word.is_empty() || is_punctuation(word) || stopwords().contains(word) {
             continue;
         }
         let normalized = word.to_lowercase();

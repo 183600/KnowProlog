@@ -762,6 +762,13 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 虚词算符表：功能词唯一正本 + 投影快照（语言地基审计视图）
+        if matches!(input, "虚词表" | "功能词表" | "虚词报告" | "算符表") {
+            println!("{}", know_prolog::function_words::render_registry_report());
+            println!();
+            continue;
+        }
+
         // 神经符号对比：对任意陈述做联想通道与符号通道的交叉验证与仲裁
         if let Some(target) = strip_any_prefix(
             input,
@@ -987,6 +994,19 @@ async fn run_interactive_mode(
             match symbolic_reasoner.switch_generation_angle() {
                 Some(text) => println!("{}", text),
                 None => println!("还没有可重述的生成内容，请先输入「介绍：实体名」。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 提及账本：每个指称的证据收据（边界 + 类型证据 × 疑问词期待 + 焦点先验）
+        if let Some(text) = strip_any_prefix(input, &["提及账本：", "提及账本:", "账本：", "账本:"]) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            let text = text.trim();
+            if text.is_empty() {
+                println!("请提供要审计的文本，例如：提及账本：谁写过《背影》");
+            } else {
+                println!("{}", symbolic_reasoner.mention_ledger_report(text));
             }
             println!();
             continue;
@@ -2511,16 +2531,13 @@ async fn try_symbolic_reasoning(
 }
 
 fn contains_question_marker(text: &str) -> bool {
-    [
-        "谁", "什么", "哪", "多少", "几", "怎么", "为什么", "如何", "吗", "呢", "何人", "何时",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+    // 疑问词识别统一收敛到虚词算符表（合并历史两份复制实现 + 同形守卫）
+    know_prolog::function_words::contains_question_marker(text)
 }
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 117] = [
+    const COMMANDS: [&str; 122] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -2560,6 +2577,7 @@ fn is_command_like(input: &str) -> bool {
         "推理规则",
         "链接预测规则",
         "实体链接",
+        "提及账本",
         "识别实体",
         "判断",
         "蕴含",
@@ -2638,6 +2656,10 @@ fn is_command_like(input: &str) -> bool {
         "覆盖报告",
         "质量报告",
         "覆盖检查",
+        "虚词表",
+        "功能词表",
+        "虚词报告",
+        "算符表",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
 }
@@ -3109,6 +3131,11 @@ mod session_tests {
             "性能台账",
             "派生台账",
             "增量报告",
+            "虚词表",
+            "功能词表",
+            "虚词报告",
+            "算符表",
+            "提及账本",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
