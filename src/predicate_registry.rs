@@ -884,7 +884,7 @@ impl PredicateRegistry {
 }
 
 /// 一次导入的原子动作，供撤销（撤销导入 = 逐条移除这些动作）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportAction {
     /// 实体-实体关系（完整 IRI）
     Named {
@@ -901,7 +901,7 @@ pub enum ImportAction {
 }
 
 /// 功能谓词冲突：同主语已有取值，新值未写入。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportConflict {
     pub subject: String,
     pub predicate: String,
@@ -910,7 +910,7 @@ pub struct ImportConflict {
 }
 
 /// 导入回执：新增/合并/重复/冲突/待确认谓词/待准入谓词 + 撤销动作。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportReceipt {
     pub added: usize,
     pub merged: usize,

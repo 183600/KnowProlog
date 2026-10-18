@@ -66,6 +66,8 @@ pub struct EntityLinker {
     neighbors: HashMap<String, HashSet<String>>,
     out_predicates: HashMap<String, HashMap<String, usize>>,
     in_predicates: HashMap<String, HashMap<String, usize>>,
+    // 已观测三元组（去重）：整图快照会被反复观察，度数/谓词计数不得因重放膨胀
+    seen_triples: HashSet<(String, String, String)>,
     fuzzy_threshold: f64,
 }
 
@@ -116,6 +118,7 @@ impl EntityLinker {
             neighbors: HashMap::new(),
             out_predicates: HashMap::new(),
             in_predicates: HashMap::new(),
+            seen_triples: HashSet::new(),
             fuzzy_threshold: FUZZY_MIN_SCORE,
         }
     }
@@ -187,11 +190,21 @@ impl EntityLinker {
     }
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
+        let subject = subject.trim();
+        let predicate = predicate.trim();
+        let object = object.trim();
+        // 空白端点无法登记画像（register_entity 会跳过），整条边忽略避免 panic
+        if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            return;
+        }
+        // 重复观察（快照重放）是无操作：度数、谓词计数与邻居都不变
+        if !self
+            .seen_triples
+            .insert((subject.to_string(), predicate.to_string(), object.to_string()))
+        {
+            return;
+        }
         for (name, other, predicate) in [(subject, object, predicate), (object, subject, predicate)] {
-            // 空白端点无法登记画像（register_entity 会跳过），整条边忽略避免 panic
-            if name.trim().is_empty() || other.trim().is_empty() {
-                continue;
-            }
             if !self.profiles.contains_key(name) {
                 self.register_entity(name, None);
             }
@@ -227,6 +240,11 @@ impl EntityLinker {
                 }
             }
         }
+    }
+
+    /// 已观测的唯一三元组数（去重后）。
+    pub fn triple_count(&self) -> usize {
+        self.seen_triples.len()
     }
 
     fn add_surface(&mut self, surface: &str, canonical: &str) {
@@ -725,6 +743,31 @@ mod tests {
         linker.observe_triple("张三", "师傅", "李四");
         assert!(linker.is_known_entity("张三"));
         assert!(linker.is_known_entity("李四"));
+    }
+
+    #[test]
+    fn test_repeat_observation_does_not_inflate_degree() {
+        let mut linker = EntityLinker::new();
+        linker.observe_triple("张三", "师傅", "李四");
+        let degree = linker.profiles.get("张三").unwrap().degree;
+        let predicate_count = linker
+            .out_predicates
+            .get("张三")
+            .and_then(|bucket| bucket.get("师傅"))
+            .copied()
+            .unwrap();
+        // 整图快照重放：度数与谓词计数必须保持不变
+        linker.observe_triple("张三", "师傅", "李四");
+        assert_eq!(linker.profiles.get("张三").unwrap().degree, degree);
+        assert_eq!(
+            linker
+                .out_predicates
+                .get("张三")
+                .and_then(|bucket| bucket.get("师傅"))
+                .copied(),
+            Some(predicate_count)
+        );
+        assert_eq!(linker.triple_count(), 1);
     }
 
     #[test]

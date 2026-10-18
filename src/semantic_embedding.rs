@@ -11,7 +11,7 @@
 // 支撑的上层能力：实体近邻检索（谁和 X 最像）、向量算术类比（A:B :: C:?）、
 // 以及为本体对齐提供"角色分布"证据。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +31,10 @@ pub struct SymbolicEmbedding {
     dirty: bool,
     similarity_floor: f64,
     max_features: usize,
+    /// 已观测三元组（去重）：整图快照会被反复观察，重复观察不得抬高 PPMI 计数
+    seen_triples: HashSet<(String, String, String)>,
+    /// 已观测实体特征（实体, 特征名）：同上，实体事实重复观察亦不得抬高计数
+    seen_entity_features: HashSet<(String, String)>,
 }
 
 impl SymbolicEmbedding {
@@ -45,11 +49,23 @@ impl SymbolicEmbedding {
             dirty: false,
             similarity_floor,
             max_features: 128,
+            seen_triples: HashSet::new(),
+            seen_entity_features: HashSet::new(),
         }
     }
 
     pub fn similarity_floor(&self) -> f64 {
         self.similarity_floor
+    }
+
+    /// 计数是否比上次重建有更新（供调用方跳过无谓的 `rebuild` 调用）。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// 已观测的唯一三元组数（去重后）。
+    pub fn triple_count(&self) -> usize {
+        self.seen_triples.len()
     }
 
     pub fn entity_count(&self) -> usize {
@@ -62,6 +78,13 @@ impl SymbolicEmbedding {
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            return;
+        }
+        // 重复观察（快照重放）是无操作：计数与向量都不变
+        if !self
+            .seen_triples
+            .insert((subject.to_string(), predicate.to_string(), object.to_string()))
+        {
             return;
         }
         // 复用同一个缓冲区构造特征名
@@ -102,16 +125,27 @@ impl SymbolicEmbedding {
             feature.clear();
             feature.push_str("类型·");
             feature.push_str(entity_type);
-            self.add_feature(name, &feature);
+            self.observe_entity_feature(name, &feature);
         }
         for property in properties {
             if !property.is_empty() {
                 feature.clear();
                 feature.push_str("属性·");
                 feature.push_str(property);
-                self.add_feature(name, &feature);
+                self.observe_entity_feature(name, &feature);
             }
         }
+    }
+
+    /// 实体特征去重观测：同一（实体, 特征）重复出现时不重复计票。
+    fn observe_entity_feature(&mut self, entity: &str, feature: &str) {
+        if !self
+            .seen_entity_features
+            .insert((entity.to_string(), feature.to_string()))
+        {
+            return;
+        }
+        self.add_feature(entity, feature);
     }
 
     fn add_feature(&mut self, entity: &str, feature: &str) {
@@ -555,5 +589,31 @@ mod tests {
         let after = embedding.similarity("张三", "王五");
         assert!((before - after).abs() < 1e-9);
         assert!(!embedding.dirty);
+    }
+
+    #[test]
+    fn test_repeat_observation_is_noop() {
+        let mut embedding = SymbolicEmbedding::new(0.6);
+        embedding.observe_triple("张三", "师傅", "李四");
+        embedding.observe_triple("王五", "师傅", "赵六");
+        embedding.observe_entity("张三", "Person", &["age".to_string()]);
+        embedding.rebuild();
+        assert_eq!(embedding.triple_count(), 2);
+        let mass = embedding.total_mass;
+        let features = embedding.feature_count();
+
+        // 整图快照重放：同一批事实再次观察必须是无操作
+        embedding.observe_triple("张三", "师傅", "李四");
+        embedding.observe_triple("王五", "师傅", "赵六");
+        embedding.observe_entity("张三", "Person", &["age".to_string()]);
+        assert!(!embedding.is_dirty(), "纯重复观察不应标脏");
+        assert_eq!(embedding.triple_count(), 2);
+        assert_eq!(embedding.total_mass, mass, "PPMI 计票不得因重放翻倍");
+        assert_eq!(embedding.feature_count(), features);
+
+        // 新增一条事实仍应正常生效
+        embedding.observe_triple("李四", "师傅", "王五");
+        assert!(embedding.is_dirty());
+        assert_eq!(embedding.triple_count(), 3);
     }
 }

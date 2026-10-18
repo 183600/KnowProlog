@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,7 @@ use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
+use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::resolution_engine::{
@@ -523,10 +524,27 @@ pub struct SymbolicReasoner {
     // 全息符号记忆（VSA/HDC）：绑定/叠加/置换 + 净噪的软召回通道，
     // 与三元组登记集合（硬核查通道）交叉验证，无神经网络、零训练
     holo: HolographicMemory,
+    // 知识版本：observe_facts 检测到内容确有变化时自增（纯重复观察不动）
+    revision: u64,
+    // 派生台账：每个派生器最后重建时的知识版本（版本键，可审计、可断言）
+    derived_stamps: BTreeMap<&'static str, u64>,
+    // 依赖台账：每类依赖最后发生变化的版本
+    dependency_stamps: BTreeMap<&'static str, u64>,
+    // 操作计数台账（可与其他模块共享）
+    perf: Arc<PerfLedger>,
 }
 
 impl SymbolicReasoner {
     pub fn new(config: ReasoningConfig, synonyms: HashMap<String, String>) -> Self {
+        Self::with_perf_ledger(config, synonyms, Arc::new(PerfLedger::new()))
+    }
+
+    /// 与 `new` 相同，但可注入共享的性能台账（会话级操作计数）。
+    pub fn with_perf_ledger(
+        config: ReasoningConfig,
+        synonyms: HashMap<String, String>,
+        perf: Arc<PerfLedger>,
+    ) -> Self {
         let aligner = OntologyAligner::new(synonyms, config.ontology_alignment_threshold);
         let embedding = SymbolicEmbedding::new(config.embedding_similarity_floor);
         let mut linker = EntityLinker::new();
@@ -601,9 +619,74 @@ impl SymbolicReasoner {
             inverse_query_map: HashMap::new(),
             discourse,
             holo,
+            revision: 0,
+            derived_stamps: BTreeMap::new(),
+            dependency_stamps: BTreeMap::new(),
+            perf,
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
+    }
+
+    /// 当前知识版本（每次内容确有变化的观察 +1）。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// 共享的性能台账（与 `OxigraphManager` 可为同一实例）。
+    pub fn perf_ledger(&self) -> Arc<PerfLedger> {
+        Arc::clone(&self.perf)
+    }
+
+    /// 记录一次派生重建：派生器戳上当前知识版本，并在性能台账计一次数。
+    fn stamp_rebuild(&mut self, deriver: &'static str) {
+        self.derived_stamps.insert(deriver, self.revision);
+        self.perf.bump(match deriver {
+            "link_rules" => "rebuild_link_rules",
+            "associations" => "rebuild_associations",
+            "resolver" => "rebuild_resolver",
+            "soft_logic" => "rebuild_soft_logic",
+            "problog" => "rebuild_problog",
+            "knowledge_caches" => "rebuild_knowledge_caches",
+            _ => "rebuild_other",
+        });
+    }
+
+    /// 记录某类依赖发生变化的版本。
+    fn stamp_dependency(&mut self, dependency: &'static str) {
+        self.dependency_stamps.insert(dependency, self.revision);
+    }
+
+    /// 派生台账报告：知识版本 + 各派生器最后重建版本 + 各依赖最后变化版本。
+    ///
+    /// 「纯重复观察零重建」因此可审计：版本不动 → 台账不动。
+    pub fn derivation_report(&self) -> String {
+        let mut output = format!("派生台账：知识版本 {}。\n", self.revision);
+        if self.dependency_stamps.is_empty() {
+            output.push_str("依赖变化：暂无。\n");
+        } else {
+            output.push_str("依赖变化（最后版本）：");
+            let items: Vec<String> = self
+                .dependency_stamps
+                .iter()
+                .map(|(name, revision)| format!("{}={}", name, revision))
+                .collect();
+            output.push_str(&items.join("；"));
+            output.push('\n');
+        }
+        if self.derived_stamps.is_empty() {
+            output.push_str("派生重建：暂无。\n");
+        } else {
+            output.push_str("派生重建（最后版本）：");
+            let items: Vec<String> = self
+                .derived_stamps
+                .iter()
+                .map(|(name, revision)| format!("{}={}", name, revision))
+                .collect();
+            output.push_str(&items.join("；"));
+            output.push('\n');
+        }
+        output
     }
 
     /// 重建谓词清单与命题表面积索引（二者仅依赖对齐器/生成器/预测规则的状态）
@@ -622,6 +705,7 @@ impl SymbolicReasoner {
         *self.link_memo.lock() = None;
         *self.entity_mentions_memo.lock() = None;
         *self.predicate_canonicals_memo.lock() = None;
+        self.stamp_rebuild("knowledge_caches");
     }
 
     pub fn context(&self) -> &DialogueContext {
@@ -718,20 +802,16 @@ impl SymbolicReasoner {
     }
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
-        if !facts.is_empty() {
-            // 链接剖面（度数/邻居等）会随观察变化的可能，记忆必须整体失效
-            *self.link_memo.lock() = None;
-            *self.entity_mentions_memo.lock() = None;
-            *self.predicate_canonicals_memo.lock() = None;
-        }
+        self.perf.bump("observe_calls");
+        self.perf.bump_by("observe_facts_input", facts.len() as u64);
         // 话语引擎：本体叙事与 DCG 生成共用同一批事实（内部去重，可反复观察）
         if self.config.enable_discourse {
             self.discourse.observe_facts(facts);
         }
         // 溯因统计只累积计数（谓词取值、类型分布、特征），不参与学习
         self.abduction.observe_facts(facts);
-        let mut added = 0usize;
-        let mut entity_observed = false;
+        let mut relation_seen = 0usize;
+        let mut entity_new = false;
         let mut entity_type_changed = false;
         let mut association_changed = false;
         let mut attribute_changed = false;
@@ -753,7 +833,7 @@ impl SymbolicReasoner {
                         self.holo.observe_triple(from, rel_type, to);
                     }
                     association_changed |= self.associations.observe_triple(from, rel_type);
-                    added += 1;
+                    relation_seen += 1;
                 }
                 PrologFact::Entity {
                     name,
@@ -764,6 +844,10 @@ impl SymbolicReasoner {
                     self.aligner.register_term(entity_type, TermKind::Type);
                     for property in properties.keys() {
                         self.aligner.register_term(property, TermKind::Attribute);
+                    }
+                    // 新实体同样会改变实体提及/链接剖面，必须触发词表缓存重建
+                    if !self.linker.is_known_entity(name) {
+                        entity_new = true;
                     }
                     self.linker.register_entity(name, Some(entity_type.as_str()));
                     // 生成器的实体类型会被后续观察覆盖，归结引擎的 __类型__ 事实依赖它：
@@ -793,11 +877,41 @@ impl SymbolicReasoner {
                             self.holo.observe_triple(name, key, value);
                         }
                     }
-                    entity_observed = true;
                 }
             }
         }
         let triples_added = self.predictor.triple_count() > triples_before;
+        self.perf.bump_by("observe_relations", relation_seen as u64);
+        // 版本化增量：内容确有变化 → 版本 +1、依赖挂牌、派生重建；
+        // 纯重复观察（快照重放）→ 版本不动、memo 不清、派生零重建
+        let changed = triples_added
+            || association_changed
+            || attribute_changed
+            || entity_type_changed
+            || entity_new;
+        if !changed {
+            self.perf.bump("observe_no_change");
+            return;
+        }
+        self.revision += 1;
+        self.perf.bump("observe_changed");
+        if triples_added {
+            self.perf.bump("observe_new_triples");
+            self.stamp_dependency("triples");
+        }
+        if attribute_changed {
+            self.stamp_dependency("attributes");
+        }
+        if entity_type_changed {
+            self.stamp_dependency("entity_types");
+        }
+        if association_changed {
+            self.stamp_dependency("associations");
+        }
+        // 内容变化意味着链接剖面可能变化，单条记忆整体失效（在变更检测后统一做）
+        *self.link_memo.lock() = None;
+        *self.entity_mentions_memo.lock() = None;
+        *self.predicate_canonicals_memo.lock() = None;
         // 规则只依赖已积累的三元组与固定阈值：若本次没有新增三元组，
         // 重新挖掘必然得到相同规则，直接跳过
         if triples_added && self.config.enable_link_prediction {
@@ -805,10 +919,12 @@ impl SymbolicReasoner {
                 self.config.link_prediction_min_support,
                 self.config.link_prediction_min_confidence,
             );
+            self.stamp_rebuild("link_rules");
         }
         // 关联规则与前向/反向归结都只依赖已观察的篮子与事实：无新增则跳过重建
         if self.config.enable_association_rules && (association_changed || triples_added) {
             self.associations.mine();
+            self.stamp_rebuild("associations");
         }
         if self.config.enable_resolution
             && (association_changed || attribute_changed || entity_type_changed || triples_added)
@@ -822,18 +938,18 @@ impl SymbolicReasoner {
             self.rebuild_soft_logic();
         }
         // 图游走向量采用惰性重建：新边在 observe_triple 内标记失效，
-        // 首次需要嵌入时才做全量幂迭代（查询结果与即时重建完全一致）
-        // 实体事实同样会更新嵌入（observe_entity），因此也需要重建
-        if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
-            self.embedding.rebuild();
+        // 首次需要嵌入时才做全量幂迭代（查询结果与即时重建完全一致）；
+        // PPMI 嵌入自带 dirty 跳过，纯重复观察时连调用都省去
+        if self.config.enable_semantic_embedding {
+            if self.embedding.is_dirty() {
+                self.perf.bump("embedding_rebuild");
+                self.embedding.rebuild();
+            } else {
+                self.perf.bump("embedding_rebuild_skipped");
+            }
         }
-        // 谓词清单与命题表面积索引随剖面/规则变化，统一在观察后重建一次；
-        // 无任何变更（纯重复观察）时索引必然与上次一致，跳过重建
-        if !facts.is_empty()
-            && (triples_added || association_changed || attribute_changed || entity_type_changed)
-        {
-            self.rebuild_knowledge_caches();
-        }
+        // 谓词清单与命题表面积索引随剖面/规则变化，统一在变更后重建一次
+        self.rebuild_knowledge_caches();
     }
 
     // 用当前知识（事实 + 链接预测规则 + 关联规则）重建归结引擎
@@ -870,6 +986,7 @@ impl SymbolicReasoner {
             engine.add_clause(clause.clone());
         }
         self.resolver = engine;
+        self.stamp_rebuild("resolver");
     }
 
     /// 用当前知识重建加权软逻辑引擎：事实同上，规则权重 = 置信度的 log-odds
@@ -912,6 +1029,7 @@ impl SymbolicReasoner {
             ));
         }
         self.soft = engine;
+        self.stamp_rebuild("soft_logic");
         // 概率逻辑程序与软逻辑同源：软逻辑重建后同步转换（含重放教过的中文知识）
         if self.config.enable_problog {
             self.rebuild_problog();
@@ -931,6 +1049,7 @@ impl SymbolicReasoner {
             chinese_reasoning_nlu::apply_lesson(&mut program, lesson);
         }
         self.problog = program;
+        self.stamp_rebuild("problog");
     }
 
     pub fn resolver(&self) -> &ResolutionEngine {
@@ -1024,9 +1143,11 @@ impl SymbolicReasoner {
         // 实体剖面或同义词表只在 observe_facts 中变化，届时整体失效
         if let Some((cached_text, found)) = self.entity_mentions_memo.lock().as_ref() {
             if cached_text == text {
+                self.perf.bump("memo_entity_mentions_hit");
                 return found.clone();
             }
         }
+        self.perf.bump("memo_entity_mentions_miss");
         let found = self.entities_mentioned_uncached(text);
         *self.entity_mentions_memo.lock() = Some((text.to_string(), found.clone()));
         found
@@ -1072,9 +1193,11 @@ impl SymbolicReasoner {
     fn mentioned_predicate_canonicals(&self, text: &str) -> Arc<HashSet<String>> {
         if let Some((cached_text, canonicals)) = self.predicate_canonicals_memo.lock().as_ref() {
             if cached_text == text {
+                self.perf.bump("memo_predicate_canonicals_hit");
                 return canonicals.clone();
             }
         }
+        self.perf.bump("memo_predicate_canonicals_miss");
         let mut mentioned: HashSet<String> = HashSet::new();
         for (alias, canonical) in self.aligner.synonyms() {
             if text.contains(alias.as_str()) {
@@ -1126,9 +1249,11 @@ impl SymbolicReasoner {
     fn linked_mentions(&self, text: &str) -> Arc<Vec<LinkedMention>> {
         if let Some((cached_text, mentions)) = self.link_memo.lock().as_ref() {
             if cached_text == text {
+                self.perf.bump("memo_link_hit");
                 return mentions.clone();
             }
         }
+        self.perf.bump("memo_link_miss");
         let hints = self.link_hints(text);
         let mentions = Arc::new(self.linker.link_with_context(text, &hints));
         *self.link_memo.lock() = Some((text.to_string(), mentions.clone()));
@@ -6285,5 +6410,69 @@ mod tests {
         reasoner.note_holo_context("张三的师傅是谁？");
         assert_eq!(reasoner.holographic().triple_count(), 0);
         assert_eq!(reasoner.holographic().context_len(), 0);
+    }
+
+    /// VID（版本化增量派生）：重复观察同一批事实必须版本不动、派生零重建。
+    #[test]
+    fn test_repeat_observation_is_version_stable() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert_eq!(reasoner.revision(), 1, "首次观察应产生版本 1");
+        let perf = reasoner.perf_ledger();
+        let resolver_rebuilds = perf.count("rebuild_resolver");
+        let soft_rebuilds = perf.count("rebuild_soft_logic");
+        let cache_rebuilds = perf.count("rebuild_knowledge_caches");
+        let embedding_rebuilds = perf.count("embedding_rebuild");
+
+        // 整图快照重放：版本与派生台账必须纹丝不动
+        reasoner.observe_facts(&master_facts());
+        reasoner.observe_facts(&master_facts());
+        assert_eq!(reasoner.revision(), 1, "纯重复观察不应推进版本");
+        assert_eq!(perf.count("rebuild_resolver"), resolver_rebuilds);
+        assert_eq!(perf.count("rebuild_soft_logic"), soft_rebuilds);
+        assert_eq!(perf.count("rebuild_knowledge_caches"), cache_rebuilds);
+        assert_eq!(perf.count("embedding_rebuild"), embedding_rebuilds);
+        assert_eq!(perf.count("observe_no_change"), 2);
+
+        // 新增一条事实：版本推进，派生台账重新挂牌
+        let mut extended = master_facts();
+        extended.push(PrologFact::Relation {
+            from: "王五".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "钱七".to_string(),
+        });
+        reasoner.observe_facts(&extended);
+        assert_eq!(reasoner.revision(), 2, "新增事实应推进版本");
+        assert_eq!(perf.count("rebuild_resolver"), resolver_rebuilds + 1);
+        assert!(reasoner.derivation_report().contains("知识版本 2"));
+    }
+
+    /// 失效的 memo 必须在知识变化后清空（版本感应的缓存一致性）。
+    #[test]
+    fn test_memo_invalidated_only_on_change() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        let perf = reasoner.perf_ledger();
+        let hits = perf.count("memo_entity_mentions_hit");
+        // 同一文本重复查询：命中记忆
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 1);
+
+        // 纯重复观察不清缓存：仍应命中
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2);
+
+        // 知识变化后缓存失效：同文本查询不能再命中
+        let mut extended = master_facts();
+        extended.push(PrologFact::Relation {
+            from: "李四".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "钱七".to_string(),
+        });
+        reasoner.observe_facts(&extended);
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2, "版本变化后旧记忆必须失效");
     }
 }

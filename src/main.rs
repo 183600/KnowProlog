@@ -24,7 +24,8 @@ use know_prolog::{
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::DialogueManager,
     holographic_memory::{HoloAnalogyHit, HoloHit},
-    predicate_registry::ImportReceipt,
+    import_journal::{ImportJournal, JournalLoad},
+    perf_ledger::PerfLedger,
 };
 
 #[derive(Parser)]
@@ -67,8 +68,14 @@ async fn main() {
         }
     };
 
+    // 会话级性能台账：存储与推理共享同一实例，报告覆盖整条链路
+    let perf_ledger = PerfLedger::shared();
+
     // 创建Oxigraph存储
-    let oxigraph_manager = match OxigraphManager::new(&config.system.oxigraph_store_path) {
+    let oxigraph_manager = match OxigraphManager::with_perf_ledger(
+        &config.system.oxigraph_store_path,
+        perf_ledger.clone(),
+    ) {
         Ok(manager) => manager,
         Err(e) => {
             eprintln!("创建Oxigraph存储失败: {}", e);
@@ -106,12 +113,16 @@ async fn main() {
         }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
-            run_interactive_mode(config, oxigraph_manager).await;
+            run_interactive_mode(config, oxigraph_manager, perf_ledger).await;
         }
     }
 }
 
-async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_manager: OxigraphManager) {
+async fn run_interactive_mode(
+    config: Arc<know_prolog::SystemConfig>,
+    oxigraph_manager: OxigraphManager,
+    perf_ledger: Arc<PerfLedger>,
+) {
     println!("{}", config.messages.startup);
 
     // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
@@ -153,13 +164,33 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
     let mut contrast_followup: Option<usize> = None;
 
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
-    let mut symbolic_reasoner = SymbolicReasoner::new(config.reasoning.clone(), synonyms.clone());
+    let mut symbolic_reasoner = SymbolicReasoner::with_perf_ledger(
+        config.reasoning.clone(),
+        synonyms.clone(),
+        perf_ledger.clone(),
+    );
     // 谓词归一：把画像里的别名/互逆词面同步到查询解析与生成词面。
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
     sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
-    // 最近一次文本导入的回执（供「撤销导入」使用）
-    let mut last_import: Option<ImportReceipt> = None;
+    // 导入日志：把「最近一次导入回执」升级为跨重启的有界撤销栈
+    let journal_path = format!("{}/import_journal.json", config.system.oxigraph_store_path);
+    let mut import_journal = match ImportJournal::load(&journal_path) {
+        JournalLoad::Loaded(journal) => {
+            if !journal.is_empty() {
+                println!(
+                    "已恢复导入日志：{} 笔可撤销（「导入历史」查看）。",
+                    journal.len()
+                );
+            }
+            journal
+        }
+        JournalLoad::Damaged(message) => {
+            eprintln!("导入日志损坏，已忽略（不影响知识库）：{}", message);
+            ImportJournal::new()
+        }
+        JournalLoad::Missing => ImportJournal::new(),
+    };
     // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部）
     let mut reasoner_stale = false;
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
@@ -1127,18 +1158,26 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
-        // 撤销最近一次文本导入：逐条移除本次写入的三元组
+        // 撤销最近一次文本导入：逐条移除本次写入的三元组（重启后仍可撤销）
         if matches!(input, "撤销导入" | "撤销上次导入" | "撤回导入") {
-            match last_import.take() {
+            match import_journal.pop() {
                 Some(receipt) => match oxigraph_manager.undo_import(&receipt).await {
                     Ok(removed) => {
                         reasoner_stale = true;
                         let _ = oxigraph_manager.save_predicate_registry(&registry_path);
-                        println!("已撤销上次导入：移除 {} 条三元组。", removed);
+                        let _ = import_journal.save(&journal_path);
+                        println!(
+                            "已撤销上次导入：移除 {} 条三元组（日志余 {} 笔）。",
+                            removed,
+                            import_journal.len()
+                        );
                     }
-                    Err(e) => eprintln!("撤销导入失败: {}", e),
+                    Err(e) => {
+                        import_journal.push(receipt);
+                        eprintln!("撤销导入失败: {}", e);
+                    }
                 },
-                None => println!("没有可撤销的导入记录（仅支持撤销最近一次文本导入）。"),
+                None => println!("没有可撤销的导入记录。"),
             }
             println!();
             continue;
@@ -1146,10 +1185,31 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
         // 上次导入回执：新增/合并/重复/冲突/待确认谓词
         if matches!(input, "导入回执" | "上次导入" | "导入记录") {
-            match &last_import {
+            match import_journal.last() {
                 Some(receipt) => println!("{}", receipt.summary()),
-                None => println!("本次会话还没有文本导入记录。"),
+                None => println!("还没有可查询的文本导入记录。"),
             }
+            println!();
+            continue;
+        }
+
+        // 导入历史：跨会话撤销栈（新 → 旧）
+        if matches!(input, "导入历史" | "导入日志" | "撤销历史") {
+            println!("{}", import_journal.summary());
+            println!();
+            continue;
+        }
+
+        // 性能报告：存储/推理共享台账（缓存命中、图扫描、版本推进等）
+        if matches!(input, "性能报告" | "性能台账" | "运行统计") {
+            println!("{}", perf_ledger.report_with_title("性能台账（本会话累计）"));
+            println!();
+            continue;
+        }
+
+        // 派生台账：知识版本、重建/依赖打戳与推理器内部计数
+        if matches!(input, "派生台账" | "版本台账" | "增量报告") {
+            println!("{}", symbolic_reasoner.derivation_report());
             println!();
             continue;
         }
@@ -1344,7 +1404,8 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                             Ok(receipt) => {
                                 println!("{}", receipt.summary());
                                 if receipt.can_undo() {
-                                    last_import = Some(receipt);
+                                    import_journal.push(receipt);
+                                    let _ = import_journal.save(&journal_path);
                                 }
                                 reasoner_stale = true;
                                 let _ = oxigraph_manager.save_predicate_registry(&registry_path);
@@ -1913,7 +1974,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 87] = [
+    const COMMANDS: [&str; 98] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -1997,6 +2058,17 @@ fn is_command_like(input: &str) -> bool {
         "忘记",
         "遗忘",
         "撤回",
+        "撤销导入",
+        "导入回执",
+        "导入历史",
+        "导入日志",
+        "撤销历史",
+        "性能报告",
+        "性能台账",
+        "运行统计",
+        "派生台账",
+        "版本台账",
+        "增量报告",
         "会话规则",
         "对比",
         "校准",
@@ -2438,5 +2510,78 @@ async fn continue_original_query(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// 新命令必须被 is_command_like 识别，避免澄清追问时被吞掉
+    #[test]
+    fn command_like_covers_journal_and_perf_commands() {
+        for command in [
+            "撤销导入",
+            "导入回执",
+            "导入历史",
+            "导入日志",
+            "性能报告",
+            "性能台账",
+            "派生台账",
+            "增量报告",
+        ] {
+            assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
+    }
+
+    /// 跨重启撤销：导入 → 日志落盘 → 重新打开存储 → 恢复日志 → 撤销归零
+    #[tokio::test]
+    async fn journal_survives_restart_and_undoes_import() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().to_str().unwrap().to_string();
+        let journal_path = format!("{}/import_journal.json", store_path);
+
+        let receipt = {
+            let manager = OxigraphManager::with_perf_ledger(
+                &store_path,
+                PerfLedger::shared(),
+            )
+            .unwrap();
+            let items = vec![KnowledgeItem::Relationship {
+                from_label: "人物".to_string(),
+                from_id: "张三".to_string(),
+                to_label: "人物".to_string(),
+                to_id: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                properties: HashMap::new(),
+            }];
+            let receipt = manager.save_knowledge_with_receipt(items).await.unwrap();
+            assert!(receipt.can_undo());
+
+            let mut journal = ImportJournal::new();
+            journal.push(receipt.clone());
+            journal.save(&journal_path).unwrap();
+            let snapshot = manager.load_graph_snapshot().await.unwrap();
+            assert!(!snapshot.is_empty());
+            receipt
+        };
+
+        // 模拟进程重启：新开存储 + 从信封恢复日志
+        let manager =
+            OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
+        let JournalLoad::Loaded(mut journal) = ImportJournal::load(&journal_path) else {
+            panic!("应能从 ContextImage 信封恢复导入日志");
+        };
+        let restored = journal.pop().expect("栈顶应有一笔可撤销导入");
+        let removed = manager.undo_import(&restored).await.unwrap();
+        assert_eq!(removed, restored.actions.len());
+        assert_eq!(journal.len(), 0);
+        let snapshot = manager.load_graph_snapshot().await.unwrap();
+        assert!(
+            snapshot.is_empty(),
+            "撤销后图谱应回到导入前状态，实际剩余 {} 条",
+            snapshot.len()
+        );
     }
 }

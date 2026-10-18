@@ -50,6 +50,9 @@ pub mod logic_program;
 pub mod dialogue_manager;
 pub mod holographic_memory;
 pub mod predicate_registry;
+pub mod perf_ledger;
+pub mod context_image;
+pub mod import_journal;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -752,12 +755,27 @@ pub struct OxigraphManager {
     // 每次写操作自增，用于判定缓存的整图快照是否仍然有效
     revision: AtomicU64,
     snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
+    // 相关事实查询缓存：(revision, 规范化查询键) → 结果。
+    // 同一知识版本下重复问同一实体 = 命中缓存，零图扫描
+    relevant_cache: parking_lot::Mutex<Option<(u64, String, Arc<Vec<PrologFact>>)>>,
+    // 直答缓存：(revision, 查询键) → 答案（含"确无答案"的负缓存）
+    direct_answer_cache: parking_lot::Mutex<Option<(u64, String, Option<String>)>>,
+    // 操作计数台账（可与会话推理器共享同一实例）
+    perf: Arc<perf_ledger::PerfLedger>,
     // 谓词画像注册表：导入准入、别名/逆向归一、功能谓词冲突裁决
     predicate_registry: parking_lot::RwLock<predicate_registry::PredicateRegistry>,
 }
 
 impl OxigraphManager {
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::with_perf_ledger(store_path, Arc::new(perf_ledger::PerfLedger::new()))
+    }
+
+    /// 与 `new` 相同，但可注入共享的性能台账（会话级操作计数）。
+    pub fn with_perf_ledger(
+        store_path: &str,
+        perf: Arc<perf_ledger::PerfLedger>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // 展开波浪号路径
         let expanded_path = if store_path.starts_with("~/") {
             if let Some(home_dir) = std::env::var_os("HOME") {
@@ -780,17 +798,33 @@ impl OxigraphManager {
             store: Arc::new(Mutex::new(store)),
             revision: AtomicU64::new(0),
             snapshot_cache: parking_lot::Mutex::new(None),
+            relevant_cache: parking_lot::Mutex::new(None),
+            direct_answer_cache: parking_lot::Mutex::new(None),
+            perf,
             predicate_registry: parking_lot::RwLock::new(
                 predicate_registry::PredicateRegistry::new(),
             ),
         })
     }
 
+    /// 共享的性能台账（与 `SymbolicReasoner` 可为同一实例）。
+    pub fn perf_ledger(&self) -> Arc<perf_ledger::PerfLedger> {
+        Arc::clone(&self.perf)
+    }
+
+    /// 标记知识版本变化：调用方必须持有存储锁，且在本次实际写入完成之后
+    /// （version-after-write）。这样并发读者绝不会把旧数据缓存到新版本号上，
+    /// 且零新增的重复导入不推进版本、不失效任何下游缓存。
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        self.perf.bump("revision_bump");
+    }
+
     pub async fn import_jsonld(&self, jsonld_content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
-        // 持锁后、写前失效整图快照缓存：若在持锁前自增，并发读者可能
-        // 读到新 revision 却在写完成前扫描到旧数据，并把旧快照缓存到新 revision 上
-        self.revision.fetch_add(1, Ordering::AcqRel);
+        // 持锁后、写前失效整图快照缓存：JSON-LD 导入可能分批写入，
+        // 版本号先行可保证中途失败也不会让读者把半成品缓存成完整快照
+        self.bump_revision();
         
         // 解析 JSON-LD 内容
         let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
@@ -1034,8 +1068,6 @@ impl OxigraphManager {
         items: Vec<KnowledgeItem>,
     ) -> Result<predicate_registry::ImportReceipt, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
-        // 持锁后、写前失效整图快照缓存（原因同 import_jsonld）
-        self.revision.fetch_add(1, Ordering::AcqRel);
 
         let mut receipt = predicate_registry::ImportReceipt::default();
         for item in items {
@@ -1051,6 +1083,10 @@ impl OxigraphManager {
                     )?;
                 }
             }
+        }
+        // 只有确有写入才推进版本：全重复导入零新增、零缓存失效
+        if receipt.added > 0 {
+            self.bump_revision();
         }
         Ok(receipt)
     }
@@ -1252,7 +1288,6 @@ impl OxigraphManager {
         receipt: &predicate_registry::ImportReceipt,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
-        self.revision.fetch_add(1, Ordering::AcqRel);
         let mut removed = 0usize;
         for action in &receipt.actions {
             let quad = match action {
@@ -1309,6 +1344,10 @@ impl OxigraphManager {
                     }
                 }
             }
+        }
+        // 只有确有条目被移除才推进版本；重复撤销是无操作
+        if removed > 0 {
+            self.bump_revision();
         }
         Ok(removed)
     }
@@ -1436,7 +1475,7 @@ impl OxigraphManager {
                 }
             }
             if removed > 0 {
-                self.revision.fetch_add(1, Ordering::AcqRel);
+                self.bump_revision();
             }
             removed
         };
@@ -1468,6 +1507,24 @@ impl OxigraphManager {
                 .cloned()
                 .collect());
         }
+
+        // 同一知识版本下的同一组实体（排序后）与跳数 → 直接复用上次结果。
+        // 问句实体顺序不影响语义，键里统一排序消除排列差异
+        let mut sorted_entities: Vec<&str> = query_entities.iter().map(String::as_str).collect();
+        sorted_entities.sort_unstable();
+        let cache_key = format!("{}|{}", max_hops, sorted_entities.join("\u{1}"));
+        let revision = self.revision.load(Ordering::Acquire);
+        {
+            let cache = self.relevant_cache.lock();
+            if let Some((cached_revision, cached_key, facts)) = cache.as_ref() {
+                if *cached_revision == revision && cached_key == &cache_key {
+                    self.perf.bump("relevant_facts_cache_hit");
+                    return Ok(facts.as_ref().clone());
+                }
+            }
+        }
+        self.perf.bump("relevant_facts_cache_miss");
+        self.perf.bump("relevant_facts_graph_scan");
 
         let mut facts = Vec::new();
         let store = self.store.lock().await;
@@ -1510,7 +1567,9 @@ impl OxigraphManager {
         let relations = self.find_relations_between(&store, &relevant_entities).await?;
         facts.extend(relations);
         
-        Ok(facts)
+        let facts = Arc::new(facts);
+        *self.relevant_cache.lock() = Some((revision, cache_key, facts.clone()));
+        Ok(facts.as_ref().clone())
     }
 
     pub async fn load_all_facts(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
@@ -1525,18 +1584,21 @@ impl OxigraphManager {
 
     /// 整图快照（实体属性 + 关系），在两次写操作之间缓存。
     ///
-    /// 正确性依赖：所有写入口在持有存储锁期间（修改存储前）自增 `revision`，
-    /// 且存储只增不删；因此命中缓存意味着自缓存构建以来没有任何写发生，内容必然一致。
+    /// 正确性依赖：所有写入口在持有存储锁期间、且在实际写入完成之后自增
+    /// `revision`（version-after-write）；因此命中缓存意味着自缓存构建以来
+    /// 没有任何成功写入，内容必然一致。
     pub async fn load_graph_snapshot(&self) -> Result<Arc<Vec<PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
         let revision = self.revision.load(Ordering::Acquire);
         {
             let cache = self.snapshot_cache.lock();
             if let Some((cached_revision, snapshot)) = cache.as_ref() {
                 if *cached_revision == revision {
+                    self.perf.bump("graph_snapshot_cache_hit");
                     return Ok(snapshot.clone());
                 }
             }
         }
+        self.perf.bump("graph_snapshot_scan");
 
         let (facts, relations) = {
             let store = self.store.lock().await;
@@ -1698,8 +1760,28 @@ impl OxigraphManager {
         (facts, relations)
     }
     
+    /// 直答入口：同一知识版本下同一（查询类型 + 实体）复用结果（含负缓存）。
     pub async fn get_direct_answer(&self, query_type: &str, entities: &[String]) -> Option<String> {
+        let cache_key = format!("{}|{}", query_type, entities.join("\u{1}"));
+        let revision = self.revision.load(Ordering::Acquire);
+        {
+            let cache = self.direct_answer_cache.lock();
+            if let Some((cached_revision, cached_key, answer)) = cache.as_ref() {
+                if *cached_revision == revision && cached_key == &cache_key {
+                    self.perf.bump("direct_answer_cache_hit");
+                    return answer.clone();
+                }
+            }
+        }
+        self.perf.bump("direct_answer_cache_miss");
+        let answer = self.get_direct_answer_uncached(query_type, entities).await;
+        *self.direct_answer_cache.lock() = Some((revision, cache_key, answer.clone()));
+        answer
+    }
+
+    async fn get_direct_answer_uncached(&self, query_type: &str, entities: &[String]) -> Option<String> {
         let store = self.store.lock().await;
+        self.perf.bump("direct_answer_query");
         
         // 根据查询类型构造不同的SPARQL查询
         let query = match query_type {
@@ -2553,4 +2635,149 @@ pub fn create_default_synonyms() -> HashMap<String, String> {
     synonyms.insert("老公".to_string(), "丈夫".to_string());
     
     synonyms
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::perf_ledger::PerfLedger;
+
+    async fn temp_manager() -> (OxigraphManager, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = OxigraphManager::with_perf_ledger(
+            dir.path().to_str().unwrap(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        (manager, dir)
+    }
+
+    fn items(first: &str, second: &str) -> Vec<KnowledgeItem> {
+        vec![KnowledgeItem::Relationship {
+            from_label: "人物".to_string(),
+            from_id: first.to_string(),
+            to_label: "人物".to_string(),
+            to_id: second.to_string(),
+            rel_type: "师傅".to_string(),
+            properties: HashMap::new(),
+        }]
+    }
+
+    fn person(name: &str) -> KnowledgeItem {
+        KnowledgeItem::Entity {
+            label: "Person".to_string(),
+            properties: HashMap::from([("name".to_string(), name.to_string())]),
+        }
+    }
+
+    /// 版本键查询缓存：同版本重复问同一实体零图扫描；写入后自动失效。
+    #[tokio::test]
+    async fn relevant_facts_cache_is_revision_keyed() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![person("张三"), person("李四")])
+            .await
+            .unwrap();
+        manager.save_knowledge(items("张三", "李四")).await.unwrap();
+        let perf = manager.perf_ledger();
+
+        let first = manager
+            .get_relevant_facts(&["张三".to_string()], 2)
+            .await
+            .unwrap();
+        assert!(!first.is_empty());
+        let scans_after_first = perf.count("relevant_facts_graph_scan");
+        let misses_after_first = perf.count("relevant_facts_cache_miss");
+
+        // 同一版本、同一实体（顺序不同也不影响）：命中缓存，零新增扫描
+        let second = manager
+            .get_relevant_facts(&["张三".to_string()], 2)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(perf.count("relevant_facts_graph_scan"), scans_after_first);
+        assert_eq!(perf.count("relevant_facts_cache_miss"), misses_after_first);
+        assert_eq!(perf.count("relevant_facts_cache_hit"), 1);
+
+        // 写入新关系 → 版本变化 → 必须重新扫描并看到新数据
+        manager.save_knowledge(items("李四", "王五")).await.unwrap();
+        let third = manager
+            .get_relevant_facts(&["张三".to_string()], 2)
+            .await
+            .unwrap();
+        assert!(perf.count("relevant_facts_graph_scan") > scans_after_first);
+        let relations: Vec<&str> = third
+            .iter()
+            .filter_map(|fact| match fact {
+                PrologFact::Relation { rel_type, .. } => Some(rel_type.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(relations.contains(&"师傅"));
+    }
+
+    /// 零新增的重复导入不推进知识版本、不失效快照缓存。
+    #[tokio::test]
+    async fn duplicate_import_does_not_bump_revision() {
+        let (manager, _dir) = temp_manager().await;
+        manager.save_knowledge(items("张三", "李四")).await.unwrap();
+        let perf = manager.perf_ledger();
+        let bumps = perf.count("revision_bump");
+
+        let replay = manager
+            .save_knowledge_with_receipt(items("张三", "李四"))
+            .await
+            .unwrap();
+        assert_eq!(replay.added, 0);
+        assert_eq!(perf.count("revision_bump"), bumps, "纯重复导入不应推进版本");
+
+        let _ = manager.load_graph_snapshot().await.unwrap();
+        let scans = perf.count("graph_snapshot_scan");
+        let _ = manager.load_graph_snapshot().await.unwrap();
+        assert_eq!(perf.count("graph_snapshot_scan"), scans, "同版本快照应命中缓存");
+        assert!(perf.count("graph_snapshot_cache_hit") >= 1);
+    }
+
+    /// 直答缓存：同版本命中（含负缓存）；写入后重查看到新值。
+    #[tokio::test]
+    async fn direct_answer_cache_is_revision_keyed() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![KnowledgeItem::Entity {
+                label: "City".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), "北京".to_string()),
+                    ("capital".to_string(), "中国".to_string()),
+                ]),
+            }])
+            .await
+            .unwrap();
+        let perf = manager.perf_ledger();
+        let entities = vec!["北京".to_string()];
+
+        let first = manager.get_direct_answer("capital_query", &entities).await;
+        assert_eq!(first.as_deref(), Some("北京的首都是中国"));
+        let queries = perf.count("direct_answer_query");
+
+        // 同版本同问句：命中缓存，不再发 SPARQL
+        let second = manager.get_direct_answer("capital_query", &entities).await;
+        assert_eq!(second, first);
+        assert_eq!(perf.count("direct_answer_query"), queries);
+        assert_eq!(perf.count("direct_answer_cache_hit"), 1);
+
+        // 负缓存：同版本问不存在的属性不再发 SPARQL
+        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        let queries_with_negative = perf.count("direct_answer_query");
+        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        assert_eq!(perf.count("direct_answer_query"), queries_with_negative);
+
+        // 写入后版本变化 → 缓存失效并重查
+        manager
+            .save_knowledge(vec![person("李四")])
+            .await
+            .unwrap();
+        let third = manager.get_direct_answer("capital_query", &entities).await;
+        assert_eq!(third.as_deref(), Some("北京的首都是中国"));
+        assert!(perf.count("direct_answer_query") > queries_with_negative);
+    }
 }
