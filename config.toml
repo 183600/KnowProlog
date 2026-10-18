@@ -58,6 +58,44 @@ enable_holographic_memory = true       # 是否启用全息符号记忆（VSA/HD
 holographic_dimension = 4096           # 全息超向量维度（越大串扰越小，建议 2048~8192）
 holographic_similarity_floor = 0.01    # 召回候选的余弦下限（低于视为串扰噪声）
 holographic_max_hits = 6               # 单次全息召回的最大候选数
+require_predicate_admission = false    # 严格准入：只允许画像中已登记的谓词入库（false=未知谓词自动待确认准入）
+
+# 谓词画像：声明别名/互逆/功能/传递/对称，导入时统一归一方向，查询时自动换算。
+[[predicate_profiles]]
+name = "师傅"                          # 规范谓词名
+aliases = ["老师", "恩师", "师父"]     # 别名导入/查询均归一为规范名
+inverse = "徒弟"                       # 互逆谓词：徒弟(b,a) ≡ 师傅(a,b)，导入自动翻转
+transitive = true                      # 传递：师傅(a,b) ∧ 师傅(b,c) ⇒ 师傅(a,c)（师祖链）
+
+[[predicate_profiles]]
+name = "徒弟"
+aliases = ["学生"]
+inverse = "师傅"
+transitive = true
+
+[[predicate_profiles]]
+name = "年龄"
+aliases = ["岁数"]
+functional = true                      # 功能谓词：同主语多值将标记冲突而非静默覆盖
+
+[[predicate_profiles]]
+name = "配偶"
+aliases = ["妻子", "丈夫", "老婆", "老公"]
+symmetric = true                       # 对称：配偶(a,b) ⇒ 配偶(b,a)
+
+[[predicate_profiles]]
+name = "居住于"
+aliases = ["住在", "居住地"]
+functional = true
+
+[[predicate_profiles]]
+name = "出生于"
+aliases = ["籍贯", "出生地"]
+functional = true
+
+[[predicate_profiles]]
+name = "任职于"
+aliases = ["工作单位", "所在单位"]
 
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]

@@ -179,6 +179,23 @@ impl SymbolicGenerator {
         &self.predicate_surfaces
     }
 
+    /// 运行时登记谓词别名（谓词画像准入后同步，查询/生成共用同一词面表）。
+    pub fn register_predicate_alias(&mut self, alias: &str, canonical: &str) -> bool {
+        if alias.trim().is_empty() || canonical.trim().is_empty() || alias == canonical {
+            return false;
+        }
+        if self.predicate_surfaces.get(alias).map(String::as_str) == Some(canonical) {
+            return false;
+        }
+        self.predicate_surfaces
+            .insert(canonical.to_string(), canonical.to_string());
+        self.predicate_surfaces
+            .insert(alias.to_string(), canonical.to_string());
+        self.lexicalized_predicates.insert(alias.to_string());
+        self.revision += 1;
+        true
+    }
+
     /// 实体的属性键（去重排序）：供对话管理器生成"我还知道它的……"式追问建议
     pub fn attribute_keys(&self, entity: &str) -> Vec<String> {
         let mut keys: Vec<String> = self

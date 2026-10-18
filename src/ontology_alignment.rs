@@ -82,6 +82,19 @@ impl OntologyAligner {
         &self.synonyms
     }
 
+    /// 运行时登记同义词映射（谓词别名准入后同步到对齐器，供查询归一）。
+    pub fn register_synonym(&mut self, alias: &str, canonical: &str) -> bool {
+        if alias.is_empty() || canonical.is_empty() || alias == canonical {
+            return false;
+        }
+        if self.synonyms.get(alias).map(String::as_str) == Some(canonical) {
+            return false;
+        }
+        self.synonyms.insert(alias.to_string(), canonical.to_string());
+        self.resolve_cache.write().clear();
+        true
+    }
+
     pub fn is_registered(&self, term: &str) -> bool {
         self.index.contains_key(self.normalize_cow(term).as_ref())
     }

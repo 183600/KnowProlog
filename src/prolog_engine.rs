@@ -194,46 +194,9 @@ impl PrologEngine {
                 }
                 
                 if succeeded_without_bindings {
-                    // 查询成功但没有变量绑定，沿用简化的兜底结果
-                    let mut result_map = HashMap::new();
-                    
-                    // 基于查询类型提取结果
-                    if query.contains("capital_query") || query.contains("oxigraph_entity") && query.contains("country") {
-                        // 简化处理：直接返回知识库中的信息
-                        if query.contains("法国") {
-                            result_map.insert("capital".to_string(), "巴黎".to_string());
-                        } else if query.contains("中国") {
-                            result_map.insert("capital".to_string(), "北京".to_string());
-                        } else if query.contains("日本") {
-                            result_map.insert("capital".to_string(), "东京".to_string());
-                        }
-                    } else if query.contains("altitude") {
-                        if query.contains("珠穆朗玛峰") {
-                            result_map.insert("altitude".to_string(), "8848米".to_string());
-                        }
-                    } else if query.contains("formula") {
-                        if query.contains("水") {
-                            result_map.insert("formula".to_string(), "H2O".to_string());
-                        }
-                    } else if query.contains("author") {
-                        if query.contains("哈姆雷特") {
-                            result_map.insert("author".to_string(), "莎士比亚".to_string());
-                        }
-                    } else if query.contains("champion") {
-                        if query.contains("世界杯") && query.contains("2022") {
-                            result_map.insert("champion".to_string(), "阿根廷".to_string());
-                        }
-                    } else if query.contains("birth_year") {
-                        if query.contains("Python") {
-                            result_map.insert("birth_year".to_string(), "1991年".to_string());
-                        }
-                    } else {
-                        result_map.insert("status".to_string(), "found".to_string());
-                    }
-                    
-                    if !result_map.is_empty() {
-                        results.push(result_map);
-                    }
+                    // 查询成功但没有变量绑定 → 无可提取的答案。
+                    // 不做任何兜底填空：宁可诚实地说「没有记录」，
+                    // 也不返回与知识库无关的硬编码内容（无幻觉）。
                 }
             }
             Err(err) => {

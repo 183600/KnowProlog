@@ -24,6 +24,7 @@ use know_prolog::{
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::DialogueManager,
     holographic_memory::{HoloAnalogyHit, HoloHit},
+    predicate_registry::ImportReceipt,
 };
 
 #[derive(Parser)]
@@ -113,6 +114,16 @@ async fn main() {
 async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_manager: OxigraphManager) {
     println!("{}", config.messages.startup);
 
+    // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
+    let registry_path = format!("{}/predicate_registry.json", config.system.oxigraph_store_path);
+    if oxigraph_manager.load_predicate_registry(&registry_path) {
+        println!("已恢复谓词画像注册表。可用「谓词报告」查看。");
+    }
+    oxigraph_manager.configure_predicates(
+        &config.predicate_profiles,
+        config.reasoning.require_predicate_admission,
+    );
+
     let knowledge_extractor = KnowledgeExtractor::new(config.clone());
     let response_formatter = ResponseFormatter::new(config.clone());
     let nlu_engine = NLUEngine::new(&config);
@@ -143,6 +154,12 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
     let mut symbolic_reasoner = SymbolicReasoner::new(config.reasoning.clone(), synonyms.clone());
+    // 谓词归一：把画像里的别名/互逆词面同步到查询解析与生成词面。
+    // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
+    // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
+    sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+    // 最近一次文本导入的回执（供「撤销导入」使用）
+    let mut last_import: Option<ImportReceipt> = None;
     // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部）
     let mut reasoner_stale = false;
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
@@ -982,6 +999,161 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 谓词画像：注册表报告 + 知识库观测 + 候选发现（功能/对称/互逆）
+        if matches!(input, "谓词报告" | "谓词画像" | "谓词注册表" | "谓词列表") {
+            if let Err(e) = oxigraph_manager.refresh_predicate_registry().await {
+                eprintln!("刷新谓词画像失败: {}", e);
+            }
+            println!("{}", oxigraph_manager.predicate_registry_report());
+            let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+            println!();
+            continue;
+        }
+
+        // 登记谓词别名：别名 = 规范谓词（查询/生成/导入共用同一词面）
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &[
+                "登记别名：", "登记别名:", "谓词别名：", "谓词别名:", "同义谓词：", "同义谓词:",
+            ],
+        ) {
+            match parse_predicate_pair(spec) {
+                Some((alias, canonical)) => {
+                    if oxigraph_manager.register_predicate_alias(&alias, &canonical) {
+                        sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+                        let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                        println!(
+                            "已登记谓词别名：{} → {}（问「{}」与「{}」将命中同一事实）",
+                            alias, canonical, alias, canonical
+                        );
+                    } else {
+                        println!("未发生变化（别名已存在或与规范名相同）。");
+                    }
+                }
+                None => println!(
+                    "请用「登记别名：别名 = 规范谓词」的格式，例如：登记别名：老师 = 师傅"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 登记互逆谓词：左 = 右（p(a,b) 与 q(b,a) 等价，导入自动统一方向）
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &["登记逆谓词：", "登记逆谓词:", "逆谓词：", "逆谓词:", "互逆谓词：", "互逆谓词:"],
+        ) {
+            match parse_predicate_pair(spec) {
+                Some((left, right)) => {
+                    if oxigraph_manager.register_predicate_inverse(&left, &right) {
+                        sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+                        let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                        println!(
+                            "已登记互逆谓词：{} ↔ {}（导入时统一为规范方向，问句自动换算）",
+                            left, right
+                        );
+                    } else {
+                        println!("未发生变化（互逆关系已存在或两侧相同）。");
+                    }
+                }
+                None => println!(
+                    "请用「登记逆谓词：左 = 右」的格式，例如：登记逆谓词：师傅 = 徒弟"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 标记功能谓词：同主语只允许唯一取值，冲突不覆盖、只标记
+        if let Some(predicate) = strip_any_prefix(input, &["功能谓词：", "功能谓词:"]) {
+            let predicate = predicate.trim();
+            if predicate.is_empty() {
+                println!("请给出谓词名，例如：功能谓词：年龄");
+            } else if oxigraph_manager.mark_predicate_functional(predicate, true) {
+                let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                println!("已标记功能谓词「{}」：同主语的新值将与原值冲突并等待裁决。", predicate);
+            } else {
+                println!("「{}」已是功能谓词。", predicate);
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(predicate) = strip_any_prefix(input, &["取消功能谓词：", "取消功能谓词:"]) {
+            let predicate = predicate.trim();
+            if !predicate.is_empty() && oxigraph_manager.mark_predicate_functional(predicate, false) {
+                let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                println!("已取消「{}」的功能谓词标记。", predicate);
+            } else {
+                println!("「{}」不是功能谓词。", predicate);
+            }
+            println!();
+            continue;
+        }
+
+        // 确认/拒绝待定谓词：准入对话的裁决入口
+        if let Some(predicate) = strip_any_prefix(input, &["确认谓词：", "确认谓词:"]) {
+            let predicate = predicate.trim();
+            if !predicate.is_empty() && oxigraph_manager.confirm_predicate(predicate) {
+                let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                println!("已确认谓词「{}」：画像转为已声明，可用于稳定推理。", predicate);
+            } else {
+                println!("「{}」不是待确认谓词（可能已确认或未登记）。", predicate);
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(predicate) = strip_any_prefix(input, &["拒绝谓词：", "拒绝谓词:"]) {
+            let predicate = predicate.trim();
+            if predicate.is_empty() {
+                println!("请给出谓词名，例如：拒绝谓词：师从");
+            } else {
+                match oxigraph_manager.reject_predicate(predicate).await {
+                    Ok(removed) if removed > 0 => {
+                        reasoner_stale = true;
+                        sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+                        let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                        println!("已拒绝谓词「{}」并移除 {} 条相关三元组。", predicate, removed);
+                    }
+                    Ok(_) => println!(
+                        "没有可拒绝的待定谓词「{}」（仅自动准入且未确认的谓词可拒绝）。",
+                        predicate
+                    ),
+                    Err(e) => eprintln!("拒绝谓词失败: {}", e),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 撤销最近一次文本导入：逐条移除本次写入的三元组
+        if matches!(input, "撤销导入" | "撤销上次导入" | "撤回导入") {
+            match last_import.take() {
+                Some(receipt) => match oxigraph_manager.undo_import(&receipt).await {
+                    Ok(removed) => {
+                        reasoner_stale = true;
+                        let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                        println!("已撤销上次导入：移除 {} 条三元组。", removed);
+                    }
+                    Err(e) => eprintln!("撤销导入失败: {}", e),
+                },
+                None => println!("没有可撤销的导入记录（仅支持撤销最近一次文本导入）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 上次导入回执：新增/合并/重复/冲突/待确认谓词
+        if matches!(input, "导入回执" | "上次导入" | "导入记录") {
+            match &last_import {
+                Some(receipt) => println!("{}", receipt.summary()),
+                None => println!("本次会话还没有文本导入记录。"),
+            }
+            println!();
+            continue;
+        }
+
         // 推理发现：正向饱和推出多跳新事实（含前提与规则来源）
         if input == "推理发现" || input == "推导发现" {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
@@ -1149,7 +1321,9 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     
                     let tagged_words = preprocess(&clean_text, &config.nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
-                    let items = knowledge_extractor.extract(&clean_text, &normalized_words);
+                    let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
+                    // 中文关系句 → 关系三元组（「张三是李四的师傅」不再只落实体快照）
+                    items.extend(extract_relationships_from_text(&clean_text));
                     
                     if items.is_empty() {
                         println!("{}", config.messages.no_knowledge_extracted);
@@ -1166,10 +1340,14 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                             }
                         }
                         
-                        match oxigraph_manager.save_knowledge(items).await {
-                            Ok(_) => {
-                                println!("知识已成功保存");
+                        match oxigraph_manager.save_knowledge_with_receipt(items).await {
+                            Ok(receipt) => {
+                                println!("{}", receipt.summary());
+                                if receipt.can_undo() {
+                                    last_import = Some(receipt);
+                                }
                                 reasoner_stale = true;
+                                let _ = oxigraph_manager.save_predicate_registry(&registry_path);
                             }
                             Err(e) => eprintln!("保存失败: {}", e),
                         }
@@ -1850,6 +2028,77 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     prefixes
         .iter()
         .find_map(|prefix| input.strip_prefix(prefix))
+}
+
+/// 解析「左 = 右」形式的谓词登记参数（支持 = / ＝ / =>）
+fn parse_predicate_pair(spec: &str) -> Option<(String, String)> {
+    let spec = spec.trim();
+    for separator in ["=>", "=", "＝"] {
+        if let Some((left, right)) = spec.split_once(separator) {
+            let left = left.trim();
+            let right = right.trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left.to_string(), right.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// 中文句子 → 关系三元组：只取确定事实、二元、无占位符的原子，
+/// 跳过「是」断言（类型断言不落成关系）。与「记住：」共用同一中文解析器。
+fn extract_relationships_from_text(text: &str) -> Vec<KnowledgeItem> {
+    use know_prolog::chinese_reasoning_nlu::{parse_lessons, LessonKind};
+    let outcome = parse_lessons(text);
+    let mut seen: std::collections::BTreeSet<(String, String, String)> =
+        std::collections::BTreeSet::new();
+    let mut items = Vec::new();
+    for lesson in outcome.lessons {
+        if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
+            continue;
+        }
+        if &*lesson.head.predicate == "是" {
+            continue;
+        }
+        let terms = &lesson.head.terms;
+        if terms.len() != 2 {
+            continue;
+        }
+        let from = terms[0].name().trim().to_string();
+        let to = terms[1].name().trim().to_string();
+        if from.is_empty() || to.is_empty() || from == to {
+            continue;
+        }
+        let predicate = lesson.head.predicate.to_string();
+        let key = (from.clone(), predicate.clone(), to.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        items.push(KnowledgeItem::Relationship {
+            from_label: String::new(),
+            from_id: from,
+            to_label: String::new(),
+            to_id: to,
+            rel_type: predicate,
+            properties: std::collections::HashMap::new(),
+        });
+    }
+    items
+}
+
+/// 把谓词画像注册表的词面同步到符号推理器：
+/// 正向词面（别名 → 槽位）走别名通道（对齐同义词 + 生成词面表），
+/// 逆向词面只登记查询换向（不改生成叙事词面，避免叙事错向）。
+fn sync_predicate_pairs(reasoner: &mut SymbolicReasoner, oxigraph_manager: &OxigraphManager) {
+    for (surface, slot, inverted) in oxigraph_manager.predicate_query_pairs() {
+        if surface == slot {
+            continue;
+        } else if inverted {
+            reasoner.register_predicate_query_surface(&surface, &slot);
+        } else {
+            reasoner.register_predicate_alias(&surface, &slot);
+        }
+    }
 }
 
 /// 把全息命令参数切成若干词项：支持空白/中英文逗号/冒号分隔

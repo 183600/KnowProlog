@@ -451,6 +451,127 @@ fn c8_deterministic_and_idempotent_replay() {
     assert_eq!(first.summary(), second.summary());
 }
 
+/// C9 谓词归一：换说法/换方向不换事实。
+///
+/// 图谱事实以「师傅」为规范槽位存储（导入按谓词画像自动统一方向）。
+/// 本维度约束：别名问句（老师/学生）与互逆问句（徒弟、谁是…的师傅）
+/// 与规范问句（师傅）必须命中同一批事实、给出方向一致的答案。
+#[test]
+fn c9_predicate_normalization_alias_and_inverse() {
+    use crate::predicate_registry::{PredicateProfileConfig, PredicateRegistry};
+
+    // 知识：李四是张三的师傅 ⇒ 规范槽位事实 师傅(张三, 李四)；
+    // 实体快照（真实导入会伴随 name 字面量，供按名检索与消歧）
+    let mut properties = HashMap::new();
+    properties.insert("国籍".to_string(), "中国".to_string());
+    let facts = vec![
+        PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "李四".to_string(),
+        },
+        PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "人物".to_string(),
+            properties: properties.clone(),
+        },
+        PrologFact::Entity {
+            name: "李四".to_string(),
+            entity_type: "人物".to_string(),
+            properties,
+        },
+    ];
+    let config = ReasoningConfig {
+        enable_link_prediction: false,
+        ..ReasoningConfig::default()
+    };
+    let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+    reasoner.observe_facts(&facts);
+
+    // 谓词画像：师傅(规范) ↔ 徒弟(互逆)，别名 老师；徒弟别名 学生
+    let mut registry = PredicateRegistry::new();
+    let mut master = PredicateProfileConfig::default();
+    master.name = "师傅".to_string();
+    master.aliases = vec!["老师".to_string()];
+    master.inverse = Some("徒弟".to_string());
+    assert!(registry.declare(&master));
+    let mut disciple = PredicateProfileConfig::default();
+    disciple.name = "徒弟".to_string();
+    disciple.aliases = vec!["学生".to_string()];
+    disciple.inverse = Some("师傅".to_string());
+    // 徒弟已被师傅的互逆声明折入同一槽位：声明并入槽位画像（无新建画像）
+    registry.declare(&disciple);
+    // 与主循环 sync_predicate_pairs 相同的同步方式
+    for (surface, slot, inverted) in registry.alias_pairs() {
+        if surface == slot {
+            continue;
+        } else if inverted {
+            reasoner.register_predicate_query_surface(&surface, &slot);
+        } else {
+            reasoner.register_predicate_alias(&surface, &slot);
+        }
+    }
+
+    let canonical_answer = reasoner
+        .answer("张三的师傅是谁")
+        .expect("规范谓词问句应作答");
+    assert!(canonical_answer.contains("李四"), "{}", canonical_answer);
+
+    // 换说法：别名「老师」命中同一槽位事实
+    let alias_answer = reasoner.answer("张三的老师是谁").expect("别名问句应作答");
+    assert!(alias_answer.contains("李四"), "{}", alias_answer);
+
+    // 换方向：互逆词面「徒弟」与它的别名「学生」按槽位反方向命中同一事实
+    let inverse_answer = reasoner.answer("李四的徒弟是谁").expect("互逆问句应作答");
+    assert!(inverse_answer.contains("张三"), "{}", inverse_answer);
+    let inverse_alias = reasoner.answer("李四的学生是谁").expect("互逆别名应作答");
+    assert!(inverse_alias.contains("张三"), "{}", inverse_alias);
+
+    // 反查主体：「谁是李四的徒弟」= 张三的师傅是李四 ⇒ 答张三
+    let find_subject = reasoner.answer("谁是李四的徒弟").expect("反查应作答");
+    assert!(find_subject.contains("张三"), "{}", find_subject);
+
+    // 计数与存在：李四有徒弟吗 / 李四有几个徒弟
+    let exist_answer = reasoner.answer("李四有徒弟吗").expect("存在句应作答");
+    assert!(
+        exist_answer.contains("是的") && exist_answer.contains("张三"),
+        "{}",
+        exist_answer
+    );
+    let count_answer = reasoner.answer("李四有几个徒弟").expect("计数应作答");
+    assert!(
+        count_answer.contains('1') && count_answer.contains("张三"),
+        "{}",
+        count_answer
+    );
+
+    // 判定校验：「张三的徒弟是李四吗」应得否定并给出正确值（李四的徒弟≠李四…）
+    // 规范校验：李四的徒弟是张三 ⇔ 事实 师傅(张三, 李四)
+    let check = reasoner.answer("李四的徒弟是张三吗").expect("校验句应作答");
+    assert!(check.contains("是的"), "{}", check);
+
+    // 别名/互逆问句不得回答出「没有记录」以外的幻觉事实
+    let unknown = reasoner
+        .answer("李四的老师是谁")
+        .expect("已登记谓词的未知命中应坦白");
+    assert!(
+        unknown.contains("没有记录") || unknown.contains("没有"),
+        "{}",
+        unknown
+    );
+
+    // 对话管理器路径同样成立：目光从规范到别名到互逆，答案事实一致
+    let mut manager = DialogueManager::new();
+    let reply = manager
+        .plan_reply("张三的师傅是谁", &reasoner)
+        .expect("对话管理器应接管规范问句");
+    assert!(reply.text.contains("李四"), "{}", reply.text);
+    let swapped = manager
+        .plan_reply("李四的徒弟是谁", &reasoner)
+        .expect("对话管理器应接管互逆问句");
+    assert!(swapped.text.contains("张三"), "{}", swapped.text);
+}
+
 /// 往返一致性：`render(generate(fact))` 应被中文解析器还原为同一实体/谓词/值，
 /// 生成器与解析器互为 oracle，零人工标注；再次渲染应为不动点。
 /// 覆盖动词化模板的全部谓词面 + 无模板的中文谓词回退。
@@ -563,3 +684,4 @@ fn real_reasoner_stack_answers_and_defers() {
     assert!(report.contains("已记住"), "{}", report);
     assert!(report.contains("姚明喜欢叶莉"), "教回应还原动词化模板：{}", report);
 }
+

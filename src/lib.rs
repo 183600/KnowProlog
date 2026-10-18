@@ -49,6 +49,7 @@ pub mod formal_semantics;
 pub mod logic_program;
 pub mod dialogue_manager;
 pub mod holographic_memory;
+pub mod predicate_registry;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -105,6 +106,9 @@ pub struct SystemConfig {
     pub prolog_rules: Vec<PrologRuleConfig>,
     pub messages: Messages,
     pub synonyms: Option<SynonymsConfig>,
+    /// 谓词画像声明（可选）：导入准入、别名/逆向归一、功能谓词冲突裁决的共同依据
+    #[serde(default)]
+    pub predicate_profiles: Vec<predicate_registry::PredicateProfileConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -199,6 +203,9 @@ pub struct ReasoningConfig {
     pub holographic_similarity_floor: f64,
     #[serde(default = "default_holographic_max_hits")]
     pub holographic_max_hits: usize,
+    /// 严格谓词准入：未登记谓词不自动准入、其事实不落库（默认自动准入 + 待确认）
+    #[serde(default)]
+    pub require_predicate_admission: bool,
 }
 
 fn default_enable_holographic_memory() -> bool {
@@ -425,6 +432,7 @@ impl Default for ReasoningConfig {
             holographic_dimension: default_holographic_dimension(),
             holographic_similarity_floor: default_holographic_similarity_floor(),
             holographic_max_hits: default_holographic_max_hits(),
+            require_predicate_admission: false,
         }
     }
 }
@@ -744,6 +752,8 @@ pub struct OxigraphManager {
     // 每次写操作自增，用于判定缓存的整图快照是否仍然有效
     revision: AtomicU64,
     snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
+    // 谓词画像注册表：导入准入、别名/逆向归一、功能谓词冲突裁决
+    predicate_registry: parking_lot::RwLock<predicate_registry::PredicateRegistry>,
 }
 
 impl OxigraphManager {
@@ -770,6 +780,9 @@ impl OxigraphManager {
             store: Arc::new(Mutex::new(store)),
             revision: AtomicU64::new(0),
             snapshot_cache: parking_lot::Mutex::new(None),
+            predicate_registry: parking_lot::RwLock::new(
+                predicate_registry::PredicateRegistry::new(),
+            ),
         })
     }
 
@@ -1011,84 +1024,438 @@ impl OxigraphManager {
     }
 
     pub async fn save_knowledge(&self, items: Vec<KnowledgeItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.save_knowledge_with_receipt(items).await.map(|_| ())
+    }
+
+    /// 带回执的知识保存：谓词准入、别名/逆向归一、去重合并、功能谓词冲突
+    /// 标记（不覆盖）、撤销动作记录。返回的回执可交给 `undo_import` 撤回。
+    pub async fn save_knowledge_with_receipt(
+        &self,
+        items: Vec<KnowledgeItem>,
+    ) -> Result<predicate_registry::ImportReceipt, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
         // 持锁后、写前失效整图快照缓存（原因同 import_jsonld）
         self.revision.fetch_add(1, Ordering::AcqRel);
-        
+
+        let mut receipt = predicate_registry::ImportReceipt::default();
         for item in items {
             match item {
                 KnowledgeItem::Entity { label, properties } => {
-                    self.create_or_merge_entity(&store, &label, &properties)?;
+                    self.save_entity_with_receipt(&store, &label, &properties, &mut receipt)?;
                 }
                 KnowledgeItem::Relationship {
-                    from_label, from_id, to_label, to_id, rel_type, properties
+                    from_id, to_id, rel_type, ..
                 } => {
-                    self.create_relationship(
-                        &store, &from_label, &from_id, &to_label, &to_id, &rel_type, &properties
+                    self.save_relationship_with_receipt(
+                        &store, &from_id, &to_id, &rel_type, &mut receipt,
                     )?;
                 }
+            }
+        }
+        Ok(receipt)
+    }
+
+    fn save_entity_with_receipt(
+        &self,
+        store: &Store,
+        label: &str,
+        properties: &HashMap<String, String>,
+        receipt: &mut predicate_registry::ImportReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let subject_name = properties
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let subject_iri = format!("{}entity/{}", BASE_NS, subject_name);
+        let subject = NamedNode::new(subject_iri.clone())?;
+        let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
+        let entity_type_iri = format!("{}{}", BASE_NS, label);
+        let entity_type = NamedNode::new(entity_type_iri.clone())?;
+
+        let type_quad = Quad::new(subject.clone(), rdf_type, entity_type, GraphName::DefaultGraph);
+        if store.contains(&type_quad)? {
+            receipt.duplicates += 1;
+        } else {
+            store.insert(&type_quad)?;
+            receipt.added += 1;
+            receipt.actions.push(predicate_registry::ImportAction::Named {
+                subject: subject_iri.clone(),
+                predicate: format!("{}type", RDF_NS),
+                object: entity_type_iri,
+            });
+        }
+
+        // 属性迭代顺序固定，回执与撤销动作可复现
+        let mut properties: Vec<(&String, &String)> = properties.iter().collect();
+        properties.sort();
+        for (key, value) in properties {
+            let predicate_iri = format!("{}{}", BASE_NS, key);
+            let conflict = {
+                let registry = self.predicate_registry.read();
+                registry.conflict(&subject_name, key, value)
+            };
+            if let Some(existing) = conflict {
+                receipt.conflicts.push(predicate_registry::ImportConflict {
+                    subject: subject_name.clone(),
+                    predicate: key.clone(),
+                    existing,
+                    incoming: value.clone(),
+                });
+                continue;
+            }
+            let predicate = NamedNode::new(predicate_iri.clone())?;
+            let object = Literal::new_simple_literal(value);
+            let quad = Quad::new(subject.clone(), predicate, object, GraphName::DefaultGraph);
+            if store.contains(&quad)? {
+                receipt.duplicates += 1;
+                receipt.merged += 1;
+            } else {
+                store.insert(&quad)?;
+                receipt.added += 1;
+                receipt.actions.push(predicate_registry::ImportAction::Literal {
+                    subject: subject_iri.clone(),
+                    predicate: predicate_iri,
+                    value: value.clone(),
+                });
+                self.predicate_registry.write().observe(
+                    &subject_name,
+                    key,
+                    value,
+                    Some("知识导入"),
+                );
             }
         }
         Ok(())
     }
 
-    fn create_or_merge_entity(&self, store: &Store, label: &str, properties: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let entity_id = if let Some(name) = properties.get("name") {
-            format!("{}entity/{}", BASE_NS, name)
-        } else {
-            format!("{}entity/{}", BASE_NS, Uuid::new_v4())
-        };
-        
-        let subject = NamedNode::new(entity_id)?;
-        let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
-        let entity_type = NamedNode::new(format!("{}{}", BASE_NS, label))?;
-        
-        // 添加类型三元组
-        store.insert(&Quad::new(
-            subject.clone(),
-            rdf_type,
-            entity_type,
-            GraphName::DefaultGraph,
-        ))?;
-        
-        // 添加属性三元组
-        for (key, value) in properties {
-            let predicate = NamedNode::new(format!("{}{}", BASE_NS, key))?;
-            let object = Literal::new_simple_literal(value);
-            
-            store.insert(&Quad::new(
-                subject.clone(),
-                predicate,
-                object,
-                GraphName::DefaultGraph,
-            ))?;
+    fn save_relationship_with_receipt(
+        &self,
+        store: &Store,
+        from_id: &str,
+        to_id: &str,
+        rel_type: &str,
+        receipt: &mut predicate_registry::ImportReceipt,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let from_id = from_id.trim();
+        let to_id = to_id.trim();
+        let rel_type = rel_type.trim();
+        if from_id.is_empty() || to_id.is_empty() || rel_type.is_empty() {
+            return Ok(());
         }
-        
+
+        // 谓词准入：未登记谓词先登记为「待确认」；严格准入下不落库
+        let resolution = self.predicate_registry.read().resolve(rel_type);
+        if !resolution.known {
+            let strict = self.predicate_registry.read().strict_admission();
+            if strict {
+                if !receipt.pending_admissions.iter().any(|p| p == rel_type) {
+                    receipt.pending_admissions.push(rel_type.to_string());
+                }
+                return Ok(());
+            }
+            let admitted = self.predicate_registry.write().admit(rel_type, "文本导入");
+            if admitted && !receipt.provisional_predicates.iter().any(|p| p == rel_type) {
+                receipt.provisional_predicates.push(rel_type.to_string());
+                receipt.registry_changed = true;
+            }
+        }
+
+        // 逆向谓词统一方向落库：徒弟(A,B) ≡ 师傅(B,A)
+        let (subject_name, object_name) = if resolution.inverted {
+            (to_id, from_id)
+        } else {
+            (from_id, to_id)
+        };
+        let predicate_name = resolution.canonical.clone();
+
+        // 关系两端至少要有 name 字面量，保证按名称检索能找到它们
+        self.ensure_entity_name(store, subject_name, receipt)?;
+        self.ensure_entity_name(store, object_name, receipt)?;
+
+        let conflict = {
+            let registry = self.predicate_registry.read();
+            registry.conflict(subject_name, &predicate_name, object_name)
+        };
+        if let Some(existing) = conflict {
+            receipt.conflicts.push(predicate_registry::ImportConflict {
+                subject: subject_name.to_string(),
+                predicate: predicate_name,
+                existing,
+                incoming: object_name.to_string(),
+            });
+            return Ok(());
+        }
+
+        let subject_iri = format!("{}entity/{}", BASE_NS, subject_name);
+        let object_iri = format!("{}entity/{}", BASE_NS, object_name);
+        let predicate_iri = format!("{}{}", BASE_NS, predicate_name);
+        let subject = NamedNode::new(subject_iri.clone())?;
+        let predicate = NamedNode::new(predicate_iri.clone())?;
+        let object = NamedNode::new(object_iri.clone())?;
+        let quad = Quad::new(subject, predicate, object, GraphName::DefaultGraph);
+        if store.contains(&quad)? {
+            receipt.duplicates += 1;
+        } else {
+            store.insert(&quad)?;
+            receipt.added += 1;
+            receipt.actions.push(predicate_registry::ImportAction::Named {
+                subject: subject_iri,
+                predicate: predicate_iri,
+                object: object_iri,
+            });
+            self.predicate_registry.write().observe(
+                subject_name,
+                &predicate_name,
+                object_name,
+                Some("文本导入"),
+            );
+        }
         Ok(())
     }
 
-    fn create_relationship(
+    /// 确保实体有 name 字面量（辅助三元组，仅在缺失时插入并记录撤销动作）。
+    fn ensure_entity_name(
         &self,
         store: &Store,
-        _from_label: &str, // 未使用
-        from_id: &str,
-        _to_label: &str, // 未使用
-        to_id: &str,
-        rel_type: &str,
-        _properties: &HashMap<String, String>
+        name: &str,
+        receipt: &mut predicate_registry::ImportReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let from_subject = NamedNode::new(format!("{}entity/{}", BASE_NS, from_id))?;
-        let to_object = NamedNode::new(format!("{}entity/{}", BASE_NS, to_id))?;
-        let predicate = NamedNode::new(format!("{}{}", BASE_NS, rel_type))?;
-        
-        store.insert(&Quad::new(
-            from_subject,
+        let subject_iri = format!("{}entity/{}", BASE_NS, name);
+        let predicate_iri = format!("{}name", BASE_NS);
+        let subject = NamedNode::new(subject_iri.clone())?;
+        let predicate = NamedNode::new(predicate_iri.clone())?;
+        let quad = Quad::new(
+            subject,
             predicate,
-            to_object,
+            Literal::new_simple_literal(name),
             GraphName::DefaultGraph,
-        ))?;
-        
+        );
+        if store.contains(&quad)? {
+            return Ok(());
+        }
+        store.insert(&quad)?;
+        receipt.added += 1;
+        receipt.actions.push(predicate_registry::ImportAction::Literal {
+            subject: subject_iri,
+            predicate: predicate_iri,
+            value: name.to_string(),
+        });
+        self.predicate_registry
+            .write()
+            .observe(name, "name", name, Some("文本导入"));
         Ok(())
+    }
+
+    /// 撤回一次导入：逐条移除回执中记录的三元组，并同步回撤画像观测。
+    pub async fn undo_import(
+        &self,
+        receipt: &predicate_registry::ImportReceipt,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        let mut removed = 0usize;
+        for action in &receipt.actions {
+            let quad = match action {
+                predicate_registry::ImportAction::Named {
+                    subject,
+                    predicate,
+                    object,
+                } => Quad::new(
+                    NamedNode::new(subject.clone())?,
+                    NamedNode::new(predicate.clone())?,
+                    NamedNode::new(object.clone())?,
+                    GraphName::DefaultGraph,
+                ),
+                predicate_registry::ImportAction::Literal {
+                    subject,
+                    predicate,
+                    value,
+                } => Quad::new(
+                    NamedNode::new(subject.clone())?,
+                    NamedNode::new(predicate.clone())?,
+                    Literal::new_simple_literal(value),
+                    GraphName::DefaultGraph,
+                ),
+            };
+            if store.remove(&quad).unwrap_or(false) {
+                removed += 1;
+            }
+        }
+        {
+            let mut registry = self.predicate_registry.write();
+            for action in &receipt.actions {
+                match action {
+                    predicate_registry::ImportAction::Named {
+                        subject,
+                        predicate,
+                        object,
+                    } => {
+                        registry.retract(
+                            &Self::local_kg_name(subject),
+                            &Self::local_kg_name(predicate),
+                            &Self::local_kg_name(object),
+                        );
+                    }
+                    predicate_registry::ImportAction::Literal {
+                        subject,
+                        predicate,
+                        value,
+                    } => {
+                        registry.retract(
+                            &Self::local_kg_name(subject),
+                            &Self::local_kg_name(predicate),
+                            value,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// `http://example.org/kg/entity/张三` → `张三`，其它 IRI 原样返回。
+    fn local_kg_name(iri: &str) -> String {
+        match iri.strip_prefix(BASE_NS) {
+            Some(rest) => rest.strip_prefix("entity/").unwrap_or(rest).to_string(),
+            None => iri.to_string(),
+        }
+    }
+
+    /// 把知识库中现存三元组观测进谓词画像（供「谓词报告」与候选发现使用）。
+    pub async fn refresh_predicate_registry(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let observed: Vec<(String, String, String)> = {
+            let store = self.store.lock().await;
+            let mut observed = Vec::new();
+            for quad in store.iter() {
+                let quad = match quad {
+                    Ok(quad) => quad,
+                    Err(_) => continue,
+                };
+                let predicate = Self::local_kg_name(quad.predicate.as_str());
+                // rdf:type 不是领域谓词，跳过
+                if predicate == "type" {
+                    continue;
+                }
+                let subject = match &quad.subject {
+                    Subject::NamedNode(node) => Self::local_kg_name(node.as_str()),
+                    _ => continue,
+                };
+                let object = match &quad.object {
+                    Term::NamedNode(node) => Self::local_kg_name(node.as_str()),
+                    Term::Literal(literal) => literal.value().to_string(),
+                    _ => continue,
+                };
+                observed.push((subject, predicate, object));
+            }
+            observed
+        };
+        let mut registry = self.predicate_registry.write();
+        for (subject, predicate, object) in observed {
+            registry.observe(&subject, &predicate, &object, Some("知识图谱"));
+        }
+        Ok(())
+    }
+
+    /// 从配置声明谓词画像，并设置准入策略。
+    pub fn configure_predicates(
+        &self,
+        profiles: &[predicate_registry::PredicateProfileConfig],
+        strict_admission: bool,
+    ) {
+        let mut registry = self.predicate_registry.write();
+        registry.set_strict_admission(strict_admission);
+        for profile in profiles {
+            registry.declare(profile);
+        }
+    }
+
+    /// 谓词画像 + 候选发现报告。
+    pub fn predicate_registry_report(&self) -> String {
+        let registry = self.predicate_registry.read();
+        let mut output = registry.report();
+        output.push_str(&registry.findings_report());
+        output
+    }
+
+    /// 全部（词面 → 规范谓词, 是否逆向）映射，供对话层把问句归一到规范方向。
+    pub fn predicate_query_pairs(&self) -> Vec<(String, String, bool)> {
+        self.predicate_registry.read().alias_pairs()
+    }
+
+    pub fn register_predicate_alias(&self, alias: &str, canonical: &str) -> bool {
+        self.predicate_registry
+            .write()
+            .register_alias(alias, canonical, "人工确认")
+    }
+
+    pub fn register_predicate_inverse(&self, left: &str, right: &str) -> bool {
+        self.predicate_registry
+            .write()
+            .register_inverse(left, right, "人工确认")
+    }
+
+    pub fn mark_predicate_functional(&self, predicate: &str, functional: bool) -> bool {
+        let mut registry = self.predicate_registry.write();
+        if !registry.is_known(predicate) {
+            registry.admit(predicate, "人工确认");
+            registry.confirm(predicate);
+        }
+        registry.mark_functional(predicate, functional)
+    }
+
+    pub fn confirm_predicate(&self, predicate: &str) -> bool {
+        self.predicate_registry.write().confirm(predicate)
+    }
+
+    /// 拒绝待定谓词：移除画像并删除图谱中该谓词的全部三元组。
+    pub async fn reject_predicate(
+        &self,
+        predicate: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let canonical = self.predicate_registry.read().resolve(predicate).canonical.clone();
+        let provisional = self
+            .predicate_registry
+            .read()
+            .profile(&canonical)
+            .map_or(false, |profile| profile.provisional);
+        if !provisional {
+            return Ok(0);
+        }
+        let removed = {
+            let store = self.store.lock().await;
+            let predicate_iri = NamedNode::new(format!("{}{}", BASE_NS, canonical))?;
+            let quads: Vec<Quad> = store
+                .quads_for_pattern(None, Some(predicate_iri.as_ref()), None, None)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut removed = 0usize;
+            for quad in quads {
+                if store.remove(&quad).unwrap_or(false) {
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                self.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            removed
+        };
+        self.predicate_registry.write().reject(&canonical);
+        Ok(removed)
+    }
+
+    pub fn save_predicate_registry(&self, path: &str) -> std::io::Result<()> {
+        self.predicate_registry.read().save_to_path(path)
+    }
+
+    pub fn load_predicate_registry(&self, path: &str) -> bool {
+        match predicate_registry::PredicateRegistry::load_from_path(path) {
+            Some(loaded) => {
+                *self.predicate_registry.write() = loaded;
+                true
+            }
+            None => false,
+        }
     }
 
     pub async fn get_relevant_facts(&self, query_entities: &[String], max_hops: usize) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {

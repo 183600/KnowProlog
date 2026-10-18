@@ -458,6 +458,14 @@ struct ChainStep {
     hits: Vec<ValueHit>,
 }
 
+/// 问句链上的一个谓词环节：词面（用户问法）+ 规范槽位（存储坐标）+ 是否逆向。
+#[derive(Debug, Clone)]
+struct ChainPredicate {
+    surface: String,
+    slot: String,
+    inverted: bool,
+}
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -507,6 +515,9 @@ pub struct SymbolicReasoner {
     entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
     // 同义词命中的规范谓词集合记忆
     predicate_canonicals_memo: parking_lot::Mutex<Option<(String, Arc<HashSet<String>>)>>,
+    // 谓词画像逆向词面：词面 → (规范槽位, 逆向)。问句以逆向谓词发问时
+    // 主宾对调命中同一批事实（「徒弟」问句 ↔「师傅」事实），零数据冗余
+    inverse_query_map: HashMap<String, (String, bool)>,
     // 符号主义话语引擎：OWL 本体叙述（定义/继承/推导链）+ DCG 文法实现（多句式生成）
     discourse: DiscoursePlanner,
     // 全息符号记忆（VSA/HDC）：绑定/叠加/置换 + 净噪的软召回通道，
@@ -587,6 +598,7 @@ impl SymbolicReasoner {
             link_memo: parking_lot::Mutex::new(None),
             entity_mentions_memo: parking_lot::Mutex::new(None),
             predicate_canonicals_memo: parking_lot::Mutex::new(None),
+            inverse_query_map: HashMap::new(),
             discourse,
             holo,
         };
@@ -658,6 +670,51 @@ impl SymbolicReasoner {
 
     pub fn generator(&self) -> &SymbolicGenerator {
         &self.generator
+    }
+
+    /// 运行时登记谓词别名（来自谓词画像准入）：查询解析与生成词面同步归一。
+    pub fn register_predicate_alias(&mut self, alias: &str, canonical: &str) -> bool {
+        if alias.trim().is_empty() || canonical.trim().is_empty() || alias == canonical {
+            return false;
+        }
+        self.aligner.register_term(canonical, TermKind::Relation);
+        let synonym_added = self.aligner.register_synonym(alias, canonical);
+        let surface_added = self.generator.register_predicate_alias(alias, canonical);
+        if synonym_added || surface_added {
+            self.rebuild_knowledge_caches();
+        }
+        synonym_added || surface_added
+    }
+
+    /// 登记逆向谓词词面：问句用该词面发问时，命中规范槽位三元组的反方向
+    ///（「徒弟」问句 ↔「师傅」事实）。只影响查询换向，不改词面/叙事表。
+    pub fn register_predicate_query_surface(&mut self, surface: &str, slot: &str) {
+        let (surface, slot) = (surface.trim(), slot.trim());
+        if surface.is_empty() || slot.is_empty() || surface == slot {
+            return;
+        }
+        self.aligner.register_term(surface, TermKind::Relation);
+        self.aligner.register_term(slot, TermKind::Relation);
+        let changed = self.inverse_query_map.get(surface) != Some(&(slot.to_string(), true));
+        self.inverse_query_map
+            .insert(surface.to_string(), (slot.to_string(), true));
+        if changed {
+            self.rebuild_knowledge_caches();
+        }
+    }
+
+    /// 问句谓词解析：对齐器归一后，若为反向词面则返回 (槽位, true)。
+    /// 与「谓词画像」约定一致：逆向词面的答案是槽位三元组的反方向。
+    fn resolve_question_predicate(&self, raw: &str) -> (String, bool) {
+        let raw = raw.trim();
+        if let Some((slot, inverted)) = self.inverse_query_map.get(raw) {
+            return (slot.clone(), *inverted);
+        }
+        let canonical = self.aligner.canonical_form(raw);
+        if let Some((slot, inverted)) = self.inverse_query_map.get(canonical.as_str()) {
+            return (slot.clone(), *inverted);
+        }
+        (canonical, false)
     }
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
@@ -1474,7 +1531,9 @@ impl SymbolicReasoner {
                     if let Some((entity, predicates)) = self.split_chain(&segments) {
                         if !predicates.is_empty()
                             && self.is_known_entity(&entity)
-                            && predicates.iter().all(|p| self.is_known_predicate(p))
+                            && predicates
+                                .iter()
+                                .all(|p| self.is_known_predicate(&p.surface))
                         {
                             let answer_var = "答案".to_string();
                             let mut goals = Vec::new();
@@ -1485,26 +1544,49 @@ impl SymbolicReasoner {
                                 } else {
                                     Term::var(&format!("V{}", index + 1))
                                 };
-                                goals.push(Atom::pattern(predicate, previous, next.clone()));
+                                // 逆向环节以槽位反方向成立：slot(next, previous)
+                                let atom = if predicate.inverted {
+                                    Atom::pattern(
+                                        &predicate.slot,
+                                        next.clone(),
+                                        previous.clone(),
+                                    )
+                                } else {
+                                    Atom::pattern(
+                                        &predicate.slot,
+                                        previous.clone(),
+                                        next.clone(),
+                                    )
+                                };
+                                goals.push(atom);
                                 previous = next;
                             }
-                            let phrase = format!("{}的{}是谁", entity, predicates.join("的"));
+                            let phrase = format!(
+                                "{}的{}是谁",
+                                entity,
+                                predicates
+                                    .iter()
+                                    .map(|p| p.surface.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("的")
+                            );
                             return Some((goals, vec![answer_var], phrase));
                         }
                     }
                 }
                 QueryPlan::Exist { subject, predicate } => {
                     let entity = self.aligner.canonical_form(subject.trim());
-                    let predicate = self.aligner.canonical_form(predicate.trim());
-                    if !entity.is_empty() && !predicate.is_empty() {
+                    let (slot, inverted) = self.resolve_question_predicate(&predicate);
+                    if !entity.is_empty() && !slot.is_empty() {
+                        let atom = if inverted {
+                            Atom::pattern(&slot, Term::var("答案"), Term::constant(&entity))
+                        } else {
+                            Atom::pattern(&slot, Term::constant(&entity), Term::var("答案"))
+                        };
                         return Some((
-                            vec![Atom::pattern(
-                                &predicate,
-                                Term::constant(&entity),
-                                Term::var("答案"),
-                            )],
+                            vec![atom],
                             vec!["答案".to_string()],
-                            format!("{}的{}是否存在", entity, predicate),
+                            format!("{}的{}是否存在", entity, slot),
                         ));
                     }
                 }
@@ -2065,7 +2147,10 @@ impl SymbolicReasoner {
     }
 
     // 解析 "S的P1的P2...是O"（谓词串可为空 ⇒ 类型断言）
-    fn parse_chain_statement(&self, text: &str) -> Option<(String, Vec<String>, String)> {
+    fn parse_chain_statement(
+        &self,
+        text: &str,
+    ) -> Option<(String, Vec<ChainPredicate>, String)> {
         let trimmed = text.trim().trim_end_matches(['。', '！', '!']).trim();
         let (subject_part, object_part) = trimmed.rsplit_once('是')?;
         let object = self.aligner.canonical_form(object_part.trim());
@@ -2195,15 +2280,23 @@ impl SymbolicReasoner {
         }
         match self.parse_chain_statement(trimmed) {
             Some((entity, predicates, object)) => {
+                let surfaces: Vec<&str> = predicates.iter().map(|p| p.surface.as_str()).collect();
                 let (goals, phrase) = if predicates.is_empty() {
                     (
                         vec![Atom::rel(PROOF_TYPE, &entity, &object)],
                         format!("{} 属于类型 {}", entity, object),
                     )
                 } else if predicates.len() == 1 {
+                    let predicate = &predicates[0];
+                    // 逆向谓词的陈述按槽位反方向编码（slot(object, entity)）
+                    let atom = if predicate.inverted {
+                        Atom::rel(&predicate.slot, &object, &entity)
+                    } else {
+                        Atom::rel(&predicate.slot, &entity, &object)
+                    };
                     (
-                        vec![Atom::rel(&predicates[0], &entity, &object)],
-                        format!("{}的{}是{}", entity, predicates[0], object),
+                        vec![atom],
+                        format!("{}的{}是{}", entity, predicate.surface, object),
                     )
                 } else {
                     let mut goals = Vec::new();
@@ -2214,12 +2307,17 @@ impl SymbolicReasoner {
                         } else {
                             Term::var(&format!("V{}", index + 1))
                         };
-                        goals.push(Atom::pattern(predicate, previous.clone(), next.clone()));
+                        let atom = if predicate.inverted {
+                            Atom::pattern(&predicate.slot, next.clone(), previous.clone())
+                        } else {
+                            Atom::pattern(&predicate.slot, previous.clone(), next.clone())
+                        };
+                        goals.push(atom);
                         previous = next;
                     }
                     (
                         goals,
-                        format!("{}的{}是{}", entity, predicates.join("的"), object),
+                        format!("{}的{}是{}", entity, surfaces.join("的"), object),
                     )
                 };
                 self.render_resolution_result(&phrase, &goals)
@@ -2276,7 +2374,12 @@ impl SymbolicReasoner {
             } else {
                 Term::var(&format!("V{}", index + 1))
             };
-            goals.push(Atom::pattern(predicate, previous, next.clone()));
+            let atom = if predicate.inverted {
+                Atom::pattern(&predicate.slot, next.clone(), previous.clone())
+            } else {
+                Atom::pattern(&predicate.slot, previous.clone(), next.clone())
+            };
+            goals.push(atom);
             previous = next;
         }
         let solutions = self.resolver.solve(&goals, std::slice::from_ref(&answer_var));
@@ -2289,7 +2392,11 @@ impl SymbolicReasoner {
         output.push_str(&format!(
             "  目标：{}的{}是谁  〔逻辑形式：{}〕\n",
             entity,
-            predicates.join("的"),
+            predicates
+                .iter()
+                .map(|p| p.surface.as_str())
+                .collect::<Vec<_>>()
+                .join("的"),
             goal_display
         ));
         output.push_str(&format!(
@@ -2466,10 +2573,18 @@ impl SymbolicReasoner {
     }
 
     fn is_known_predicate(&self, name: &str) -> bool {
-        self.aligner.kind_of(name) == Some(TermKind::Relation) || self.predictor.has_predicate(name)
+        self.aligner.kind_of(name) == Some(TermKind::Relation)
+            || self.inverse_query_map.contains_key(name)
+            || self.inverse_query_map.contains_key(self.aligner.canonical_form(name).as_str())
+            || self.predictor.has_predicate(name)
+            // 正向别名（同义词）按规范化槽位回查预测器
+            || {
+                let canonical = self.aligner.canonical_form(name);
+                canonical != name && self.predictor.has_predicate(&canonical)
+            }
     }
 
-    fn split_chain(&self, segments: &[String]) -> Option<(String, Vec<String>)> {
+    fn split_chain(&self, segments: &[String]) -> Option<(String, Vec<ChainPredicate>)> {
         if segments.is_empty() {
             return None;
         }
@@ -2479,7 +2594,14 @@ impl SymbolicReasoner {
             if self.aligner.kind_of(&candidate) == Some(TermKind::Entity) {
                 let predicates = segments[take..]
                     .iter()
-                    .map(|segment| self.aligner.canonical_form(segment))
+                    .map(|segment| {
+                        let (slot, inverted) = self.resolve_question_predicate(segment);
+                        ChainPredicate {
+                            surface: segment.trim().to_string(),
+                            slot,
+                            inverted,
+                        }
+                    })
                     .collect();
                 return Some((self.aligner.canonical_form(&candidate), predicates));
             }
@@ -2487,15 +2609,31 @@ impl SymbolicReasoner {
         let entity = self.aligner.canonical_form(&segments[0]);
         let predicates = segments[1..]
             .iter()
-            .map(|segment| self.aligner.canonical_form(segment))
+            .map(|segment| {
+                let (slot, inverted) = self.resolve_question_predicate(segment);
+                ChainPredicate {
+                    surface: segment.trim().to_string(),
+                    slot,
+                    inverted,
+                }
+            })
             .collect();
         Some((entity, predicates))
     }
 
-    fn node_hits(&self, node: &str, predicate: &str) -> Vec<ValueHit> {
+    /// 取一个节点沿谓词的命中：正向给出宾语集合，逆向给出主语集合。
+    /// 逆向命中以槽位反方向搜索（无预测分支：符号推断仅支持正向出边）。
+    fn node_hits(&self, node: &str, predicate: &ChainPredicate) -> Vec<ValueHit> {
         let mut hits: Vec<ValueHit> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for object in self.predictor.objects_of(node, predicate) {
+        let objects: Vec<String> = if predicate.inverted {
+            self.predictor
+                .subjects_of(&predicate.slot, node)
+        } else {
+            self.predictor
+                .objects_of(node, &predicate.slot)
+        };
+        for object in objects {
             if seen.insert(object.clone()) {
                 hits.push(ValueHit {
                     value: object,
@@ -2503,9 +2641,12 @@ impl SymbolicReasoner {
                 });
             }
         }
-        if self.config.enable_link_prediction {
+        if !predicate.inverted && self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
-            for prediction in self.predictor.predict_for_entity(node, Some(predicate), limit) {
+            for prediction in self
+                .predictor
+                .predict_for_entity(node, Some(&predicate.slot), limit)
+            {
                 // 只取 node 作为主体的出边预测
                 if prediction.triple.subject != node {
                     continue;
@@ -2526,7 +2667,7 @@ impl SymbolicReasoner {
     fn run_chain(
         &self,
         entity: &str,
-        predicates: &[String],
+        predicates: &[ChainPredicate],
     ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
         if predicates.is_empty() {
             return None;
@@ -2553,7 +2694,7 @@ impl SymbolicReasoner {
                 }
                 steps.push(ChainStep {
                     subject: node.clone(),
-                    predicate: predicate.clone(),
+                    predicate: predicate.surface.clone(),
                     hits,
                 });
             }
@@ -2613,7 +2754,7 @@ impl SymbolicReasoner {
     fn generate_find_object(
         &self,
         entity: &str,
-        predicates: &[String],
+        predicates: &[ChainPredicate],
         steps: &[ChainStep],
         last_hits: &[ValueHit],
         question: &str,
@@ -2633,7 +2774,15 @@ impl SymbolicReasoner {
             .iter()
             .zip(last_hits.iter())
             .any(|(a, b)| !std::ptr::eq(*a, b));
-        let chain_text = format!("{} 的 {}", entity, predicates.join(" 的 "));
+        let chain_text = format!(
+            "{} 的 {}",
+            entity,
+            predicates
+                .iter()
+                .map(|p| p.surface.as_str())
+                .collect::<Vec<_>>()
+                .join(" 的 ")
+        );
         let mut output = String::from("根据知识图谱");
         if steps.len() > 1 {
             output.push_str("（多跳推理）");
@@ -2723,12 +2872,18 @@ impl SymbolicReasoner {
                     ));
                 }
                 if self.is_known_entity(&entity)
-                    && predicates.iter().all(|p| self.is_known_predicate(p))
+                    && predicates
+                        .iter()
+                        .all(|p| self.is_known_predicate(&p.surface))
                 {
                     return Some(format!(
                         "根据现有知识库，没有记录「{} 的 {}」。",
                         entity,
-                        predicates.join(" 的 ")
+                        predicates
+                            .iter()
+                            .map(|p| p.surface.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" 的 ")
                     ));
                 }
                 None
@@ -2753,25 +2908,33 @@ impl SymbolicReasoner {
 
     fn answer_count(&self, subject: &str, predicate: &str, exist: bool) -> Option<String> {
         let entity = self.aligner.canonical_form(subject.trim());
-        let predicate = self.aligner.canonical_form(predicate.trim());
-        if entity.is_empty() || predicate.is_empty() {
+        if entity.is_empty() {
+            return None;
+        }
+        let (slot, inverted) = self.resolve_question_predicate(predicate);
+        if slot.is_empty() {
             return None;
         }
         if !self.is_known_entity(&entity) && !self.predictor.participates(&entity) {
             return None;
         }
-        let hits = self.node_hits(&entity, &predicate);
+        let chain_predicate = ChainPredicate {
+            surface: predicate.trim().to_string(),
+            slot: slot.clone(),
+            inverted,
+        };
+        let hits = self.node_hits(&entity, &chain_predicate);
         if hits.is_empty() {
-            if self.is_known_predicate(&predicate) {
+            if self.is_known_predicate(&chain_predicate.surface) {
                 if exist {
                     return Some(format!(
                         "根据现有知识库，「{}」没有「{}」的记录。",
-                        entity, predicate
+                        entity, chain_predicate.surface
                     ));
                 }
                 return Some(format!(
                     "根据现有知识库，「{}」的「{}」数量为 0（没有相关记录）。",
-                    entity, predicate
+                    entity, chain_predicate.surface
                 ));
             }
             return None;
@@ -2781,7 +2944,7 @@ impl SymbolicReasoner {
             format!(
                 "是的，根据知识图谱，「{}」有 {}（共 {} 个：{}）。",
                 entity,
-                predicate,
+                chain_predicate.surface,
                 values.len(),
                 values.join("、")
             )
@@ -2789,7 +2952,7 @@ impl SymbolicReasoner {
             format!(
                 "根据知识图谱：「{}」的「{}」共有 {} 个：{}。",
                 entity,
-                predicate,
+                chain_predicate.surface,
                 values.len(),
                 values.join("、")
             )
@@ -2811,19 +2974,29 @@ impl SymbolicReasoner {
         let predicate_raw = subject_segments.last()?.clone();
         let (entity, mut intermediate) =
             self.split_chain(&subject_segments[..subject_segments.len() - 1])?;
-        let predicate = self.aligner.canonical_form(&predicate_raw);
+        let (slot, inverted) = self.resolve_question_predicate(&predicate_raw);
         let object = self.aligner.canonical_form(object_raw.trim());
-        if entity.is_empty() || predicate.is_empty() || object.is_empty() {
+        if entity.is_empty() || slot.is_empty() || object.is_empty() {
             return None;
         }
-        intermediate.push(predicate.clone());
+        let surface = predicate_raw.trim().to_string();
+        intermediate.push(ChainPredicate {
+            surface: surface.clone(),
+            slot: slot.clone(),
+            inverted,
+        });
 
+        // 单跳直查：逆向谓词按槽位反方向核对（triple(object, slot, entity)）
         if intermediate.len() == 1
-            && self.predictor.has_triple(&entity, &predicate, &object)
+            && (if inverted {
+                self.predictor.has_triple(&object, &slot, &entity)
+            } else {
+                self.predictor.has_triple(&entity, &slot, &object)
+            })
         {
             return Some(format!(
                 "是的。根据知识图谱：{} 的 {} 是 {}。",
-                entity, predicate, object
+                entity, surface, object
             ));
         }
 
@@ -2856,21 +3029,25 @@ impl SymbolicReasoner {
                 ));
             }
         } else if intermediate.len() == 1 {
-            let known_values = self.predictor.objects_of(&entity, &predicate);
+            let known_values: Vec<String> = if inverted {
+                self.predictor.subjects_of(&slot, &entity)
+            } else {
+                self.predictor.objects_of(&entity, &slot)
+            };
             if !known_values.is_empty() {
                 return Some(format!(
                     "不是。知识图谱记录的是：{} 的 {} 是 {}。",
                     entity,
-                    predicate,
+                    surface,
                     known_values.join("、")
                 ));
             }
         }
 
-        if self.is_known_entity(&entity) && self.is_known_predicate(&predicate) {
+        if self.is_known_entity(&entity) && self.is_known_predicate(&surface) {
             return Some(format!(
                 "根据现有知识库，无法确认「{} 的 {} 是 {}」（没有相关记录）。",
-                entity, predicate, object
+                entity, surface, object
             ));
         }
         None
@@ -2878,17 +3055,27 @@ impl SymbolicReasoner {
 
     fn answer_find_subject(&self, object_raw: &str, predicate_raw: &str) -> Option<String> {
         let object = self.aligner.canonical_form(object_raw.trim());
-        let predicate = self.aligner.canonical_form(predicate_raw.trim());
-        if object.is_empty() || predicate.is_empty() {
+        let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
+        if object.is_empty() || slot.is_empty() {
             return None;
         }
-        let mut subjects: Vec<String> = self.predictor.subjects_of(&predicate, &object);
+        let surface = predicate_raw.trim().to_string();
+        // 反查主体：正向找槽位三元组的主语；逆向词面（如「徒弟」）语义即
+        // "谁的槽位值是 object"，等价于找槽位三元组的宾语（object 作为主语）
+        let mut subjects: Vec<String> = if inverted {
+            self.predictor.objects_of(&object, &slot)
+        } else {
+            self.predictor.subjects_of(&slot, &object)
+        };
         let mut evidence: Vec<String> = Vec::new();
-        if self.config.enable_link_prediction {
+        if !inverted && self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
             // 用哈希集合做成员检查
             let mut seen_subjects: HashSet<String> = subjects.iter().cloned().collect();
-            for prediction in self.predictor.predict_for_entity(&object, Some(&predicate), limit) {
+            for prediction in self
+                .predictor
+                .predict_for_entity(&object, Some(&slot), limit)
+            {
                 if prediction.triple.object == object && prediction.triple.subject != object {
                     if seen_subjects.insert(prediction.triple.subject.clone()) {
                         subjects.push(prediction.triple.subject.clone());
@@ -2898,10 +3085,10 @@ impl SymbolicReasoner {
             }
         }
         if subjects.is_empty() {
-            if self.is_known_entity(&object) && self.is_known_predicate(&predicate) {
+            if self.is_known_entity(&object) && self.is_known_predicate(&surface) {
                 return Some(format!(
                     "根据现有知识库，没有记录「谁的 {} 是 {}」。",
-                    predicate, object
+                    surface, object
                 ));
             }
             return None;
@@ -2910,7 +3097,7 @@ impl SymbolicReasoner {
         let mut output = format!(
             "根据知识图谱：{} 的 {} 是 {}。",
             subjects.join("、"),
-            predicate,
+            surface,
             object
         );
         if !evidence.is_empty() {
@@ -4725,6 +4912,7 @@ mod tests {
             holographic_dimension: 4096,
             holographic_similarity_floor: 0.01,
             holographic_max_hits: 6,
+            require_predicate_admission: false,
         }
     }
 
