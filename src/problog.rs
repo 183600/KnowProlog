@@ -732,6 +732,9 @@ impl ProblogEngine {
                 .map_or(node, |&existing| bdd.disjunction(existing, node));
             prob_fact_probability
                 .entry(fact.atom.clone())
+                .and_modify(|probability| {
+                    *probability = 1.0 - (1.0 - *probability) * (1.0 - fact.probability);
+                })
                 .or_insert(fact.probability);
             prob_fact_bdd.insert(fact.atom.clone(), merged);
         }
@@ -1185,6 +1188,29 @@ mod tests {
         assert_eq!(query.answers.len(), 1);
         assert!((query.answers[0].probability - 1.0).abs() < 1e-9);
         assert!(query.answers[0].from_fact);
+    }
+
+    #[test]
+    fn test_duplicate_probabilistic_facts_merge_as_disjunction() {
+        let mut engine = rule_engine();
+        engine.add_probabilistic_fact(fact("q", "x", "y"), 0.3);
+        engine.add_probabilistic_fact(fact("q", "x", "y"), 0.4);
+        let expected = 1.0 - (1.0 - 0.3) * (1.0 - 0.4);
+        let q = engine.query(&fact("q", "x", "y"), 5, 0.0);
+        assert_eq!(q.answers.len(), 1);
+        assert!(
+            (q.answers[0].probability - expected).abs() < 1e-9,
+            "实得 {}",
+            q.answers[0].probability
+        );
+        assert!(
+            q.answers[0]
+                .proofs
+                .iter()
+                .any(|proof| (proof.probability - expected).abs() < 1e-9),
+            "裸事实证明的概率也应按析取合并：{:?}",
+            q.answers[0].proofs
+        );
     }
 
     #[test]

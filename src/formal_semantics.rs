@@ -1259,7 +1259,7 @@ const DET_SOME: [&str; 5] = ["有些", "有的", "某些", "某个", "存在"];
 const CONJ_AND: [&str; 4] = ["并且", "而且", "且", "同时"];
 const CONJ_OR: [&str; 3] = ["或者", "或", "要么"];
 const COPULA_CONNECTORS: [&str; 5] = ["是", "为", "属于", "不是", "并非"];
-const PARTICLES: [&str; 5] = ["都", "也", "而", "乃", "则"];
+const PARTICLES: [&str; 4] = ["都", "也", "而", "乃"];
 const QUESTION_SUFFIX: [&str; 2] = ["吗", "呢"];
 const MAX_ITEMS_PER_CELL: usize = 8;
 
@@ -1754,10 +1754,13 @@ impl FormalSemantics {
                         if head.ty != unary_ty {
                             continue;
                         }
-                        let body = Term::Implies(
-                            Box::new(Term::apply(head.term.clone(), Term::Var("x".into()))),
-                            Box::new(Term::apply(Term::Var("P".into()), Term::Var("x".into()))),
-                        );
+                        let restrictor = Term::apply(head.term.clone(), Term::Var("x".into()));
+                        let scope = Term::apply(Term::Var("P".into()), Term::Var("x".into()));
+                        let body = if universal {
+                            Term::Implies(Box::new(restrictor), Box::new(scope))
+                        } else {
+                            Term::And(vec![restrictor, scope])
+                        };
                         let key = if universal {
                             Term::Forall {
                                 var: "x".into(),
@@ -2475,6 +2478,33 @@ mod tests {
         let rendered = lf.render();
         assert!(rendered.contains("→"), "rendered = {}", rendered);
         let _ = model.fact_count();
+    }
+
+    #[test]
+    fn conditional_accepts_ze_connective() {
+        let mut semantics = FormalSemantics::new();
+        semantics.register_unary_predicate("下雨");
+        semantics.register_unary_predicate("地湿");
+        let lf = semantics.parse("如果下雨则地湿");
+        assert!(matches!(lf.kind, LfKind::Statement(_)), "lf = {:?}", lf);
+        let rendered = lf.render();
+        assert!(rendered.contains("→"), "rendered = {}", rendered);
+    }
+
+    #[test]
+    fn existential_quantifier_requires_witness() {
+        let (semantics, model) = people_setup();
+        let lf = semantics.parse("有些中国人是美国人");
+        assert!(matches!(lf.kind, LfKind::Statement(_)), "lf = {:?}", lf);
+        assert!(matches!(
+            semantics.solve(&lf, &model),
+            QueryOutcome::Truth { holds: false, .. }
+        ));
+        let lf = semantics.parse("有些中国人是中国人");
+        assert!(matches!(
+            semantics.solve(&lf, &model),
+            QueryOutcome::Truth { holds: true, .. }
+        ));
     }
 
     #[test]

@@ -179,8 +179,9 @@ fn clean_sentence(text: &str) -> String {
 
 fn contains_question_word(text: &str) -> bool {
     // 多字疑问词不会与普通词冲突，直接子串匹配
-    const UNAMBIGUOUS: [&str; 11] = [
+    const UNAMBIGUOUS: [&str; 14] = [
         "谁", "什么", "多少", "怎么", "为什么", "如何", "吗", "呢", "何人", "何时", "何处",
+        "是不是", "是否", "有没有",
     ];
     if UNAMBIGUOUS.iter().any(|marker| text.contains(marker)) {
         return true;
@@ -985,6 +986,14 @@ mod tests {
         let fixture = Fixture::new();
         assert!(fixture.parse("张三的师傅是谁").is_empty());
         assert!(fixture.parse("张三的年龄是多少").is_empty());
+    }
+
+    #[test]
+    fn test_a_not_a_questions_are_not_propositions() {
+        let fixture = Fixture::new();
+        assert!(fixture.parse("张三是不是李四的师傅").is_empty());
+        assert!(fixture.parse("张三有没有师傅").is_empty());
+        assert!(fixture.parse("张三是否是李四的师傅").is_empty());
     }
 
     #[test]

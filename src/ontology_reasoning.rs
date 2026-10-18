@@ -676,11 +676,13 @@ impl OntologyReasoner {
         }
         let mut seen: HashSet<String> = HashSet::new();
         for (left, right) in &self.disjoint {
-            let left_supers = supers_set(&closure.subclasses, left);
-            let right_supers = supers_set(&closure.subclasses, right);
             for (individual, classes) in &classes_of {
-                let in_left = classes.iter().any(|class| left_supers.contains(class));
-                let in_right = classes.iter().any(|class| right_supers.contains(class));
+                let in_left = classes
+                    .iter()
+                    .any(|class| closure.is_subclass(class, left));
+                let in_right = classes
+                    .iter()
+                    .any(|class| closure.is_subclass(class, right));
                 if in_left && in_right {
                     let message = format!(
                         "个体「{}」同时属于互斥类「{}」与「{}」（不一致）",
@@ -694,8 +696,8 @@ impl OntologyReasoner {
             for (class, supers) in &closure.subclasses {
                 // 互斥成员自身也可能因继承对方而不可满足（如「鸟 ⊑ 鱼」且鸟/鱼互斥），
                 // 因此这里不能跳过 left/right
-                let in_left = supers.iter().any(|super_class| left_supers.contains(super_class));
-                let in_right = supers.iter().any(|super_class| right_supers.contains(super_class));
+                let in_left = supers.contains(left);
+                let in_right = supers.contains(right);
                 if in_left && in_right {
                     let message = format!(
                         "类「{}」不可满足：同时 ⊑「{}」与「{}」，而两者互斥",
@@ -745,12 +747,6 @@ fn derive_relation(
         closure.why_relations.insert(key, reason);
         *changed = true;
     }
-}
-
-fn supers_set(closure_map: &HashMap<String, HashSet<String>>, name: &str) -> HashSet<String> {
-    let mut supers = closure_map.get(name).cloned().unwrap_or_default();
-    supers.insert(name.to_string());
-    supers
 }
 
 fn supers_of(closure_map: &HashMap<String, HashSet<String>>, name: &str) -> Vec<String> {
@@ -1344,6 +1340,21 @@ mod tests {
         assert!(
             closure.problems()[0].contains("互斥"),
             "问题应说明互斥冲突：{:?}",
+            closure.problems()
+        );
+    }
+
+    #[test]
+    fn test_shared_superclass_is_not_a_disjoint_conflict() {
+        let mut ontology = OntologyReasoner::new(6);
+        ontology.add_subclass("狗", "动物");
+        ontology.add_subclass("猫", "动物");
+        ontology.add_disjoint("狗", "猫");
+        ontology.add_instance("旺财", "动物");
+        let closure = ontology.materialize();
+        assert!(
+            closure.problems().is_empty(),
+            "个体仅属于共同上位类时不应报互斥冲突：{:?}",
             closure.problems()
         );
     }
