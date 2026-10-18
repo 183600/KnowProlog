@@ -104,6 +104,40 @@ functional = true
 name = "任职于"
 aliases = ["工作单位", "所在单位"]
 
+# 类型体系：实体类型的别名/子类/互斥声明（谓词画像的定义域/值域以规范类型书写）。
+# closure_gate = true 时模式闸门按「别名归一 + 子类闭包 + 互斥证据」判定：
+# 仅当两类型存在显式互斥声明时才拒收；无证据（含未声明类型）一律按开放世界放行。
+[type_system]
+closure_gate = true
+
+[[type_system.aliases]]
+alias = "Person"                       # 实体标签别名（大小写不敏感，导入/查询均归一）
+canonical = "人物"
+
+[[type_system.aliases]]
+alias = "Entity"
+canonical = "实体"
+
+[[type_system.aliases]]
+alias = "人"
+canonical = "人物"
+
+[[type_system.subclasses]]
+sub = "人物"
+sup = "实体"
+
+[[type_system.subclasses]]
+sub = "地点"
+sup = "实体"
+
+[[type_system.subclasses]]
+sub = "学生"                           # 学生 ⊑ 人物：自动满足要求「人物」的定义域
+sup = "人物"
+
+[[type_system.disjoint]]
+left = "人物"                          # 可证明不兼容的唯一来源（互斥兜底）
+right = "地点"
+
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]
 enable_nlu = true  # 启用语义理解功能

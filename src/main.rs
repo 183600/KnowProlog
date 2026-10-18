@@ -41,6 +41,10 @@ use know_prolog::{
         compare_baseline as compare_dialogue_baseline, evaluate_seed_with, EvalKnowledge,
         DialogueEvalBaseline,
     },
+    quality::{
+        build_report as build_quality_report, compare_baseline as compare_quality_baseline,
+        render_entity_passport, QualityBaseline,
+    },
     prompt_spec::{self, LintSeverity, PromptMode},
 };
 
@@ -116,6 +120,22 @@ enum Commands {
     /// Lint the prompt asset registry (executable examples + template checks)
     PromptLint {
         /// Print the lint report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build the data quality passport (deterministic entity scores + gaps)
+    /// with a corpus-digest regression ratchet
+    EvalQuality {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -316,6 +336,66 @@ async fn main() {
         Some(Commands::PromptLint { json }) => {
             run_prompt_lint(json);
         }
+        Some(Commands::EvalQuality {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_type_system(&config.type_system);
+            let report = match quality_report_for(&oxigraph_manager, &config).await {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("质量报告序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", report.render_text());
+            }
+
+            let baseline_path = baseline
+                .clone()
+                .unwrap_or_else(|| "quality_baseline.json".to_string());
+            if update_baseline {
+                let new_baseline = QualityBaseline::from_report(&report);
+                match new_baseline.save(&baseline_path) {
+                    Ok(()) => println!("质量基线已写入 {}", baseline_path),
+                    Err(e) => {
+                        eprintln!("基线写入失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else if baseline.is_some() {
+                match QualityBaseline::load(&baseline_path) {
+                    Ok(old_baseline) => {
+                        let verdict = compare_quality_baseline(&old_baseline, &report, 1e-6);
+                        print!("{}", verdict.render_text());
+                        if !verdict.passed && !allow_regression {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("基线读取失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
         Some(Commands::Serve {
             addr,
             max_sessions,
@@ -425,6 +505,20 @@ fn run_prompt_lint(json: bool) {
     }
 }
 
+/// 构建质量护照（`eval-quality` 与交互命令共用同一确定性路径）。
+async fn quality_report_for(
+    oxigraph_manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+) -> Result<know_prolog::quality::QualityReport, Box<dyn std::error::Error + Send + Sync>> {
+    let facts = oxigraph_manager.load_graph_snapshot().await?;
+    Ok(build_quality_report(
+        &facts,
+        &oxigraph_manager.predicate_registry_snapshot(),
+        &oxigraph_manager.type_system_snapshot(),
+        &config.entity_types,
+    ))
+}
+
 async fn run_interactive_mode(
     config: Arc<know_prolog::SystemConfig>,
     oxigraph_manager: OxigraphManager,
@@ -441,6 +535,9 @@ async fn run_interactive_mode(
         &config.predicate_profiles,
         config.reasoning.require_predicate_admission,
     );
+
+    // 类型体系：别名/子类/互斥声明 + 模式闸门闭包档（config.toml [type_system]）
+    oxigraph_manager.configure_type_system(&config.type_system);
 
     let knowledge_extractor = KnowledgeExtractor::new(config.clone());
     // 文法式关系抽取器：DCG 语言器官，词库由谓词画像注册表注入
@@ -1855,6 +1952,49 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 质量护照：确定性可信向量（低分只用于排序/措辞/追问，不写回、不删事实）
+        if matches!(input, "质量护照" | "质量总览" | "护照总览") {
+            match quality_report_for(&oxigraph_manager, &config).await {
+                Ok(report) => println!("{}", report.render_text()),
+                Err(e) => eprintln!("构建质量护照失败: {}", e),
+            }
+            println!();
+            continue;
+        }
+
+        // 单实体质量护照：类型来源 / 四维分数 / 可行动缺口
+        if let Some(entity) = strip_any_prefix(input, &["质量护照：", "质量护照:"]) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请给出实体名，例如：质量护照：张三");
+            } else {
+                match quality_report_for(&oxigraph_manager, &config).await {
+                    Ok(report) => match report.passport_for(entity) {
+                        Some(passport) => println!("{}", render_entity_passport(passport)),
+                        None => println!(
+                            "知识库中没有实体「{}」（护照只覆盖图谱中存在的实体）。",
+                            entity
+                        ),
+                    },
+                    Err(e) => eprintln!("构建质量护照失败: {}", e),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 类型体系：别名/子类/互斥声明与闭包档状态（config.toml [type_system]）
+        if matches!(input, "类型体系" | "类型报告" | "类型格") {
+            let report = oxigraph_manager.type_system_report();
+            if report.trim().is_empty() {
+                println!("未声明类型体系（config.toml 的 [type_system] 段可选）。");
+            } else {
+                println!("{}", report);
+            }
+            println!();
+            continue;
+        }
+
         // 登记谓词别名：别名 = 规范谓词（查询/生成/导入共用同一词面）
         if let Some(spec) = strip_any_prefix(
             input,
@@ -3206,7 +3346,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 134] = [
+    const COMMANDS: [&str; 140] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -3336,6 +3476,12 @@ fn is_command_like(input: &str) -> bool {
         "邻域",
         "覆盖报告",
         "质量报告",
+        "质量护照",
+        "质量总览",
+        "护照总览",
+        "类型体系",
+        "类型报告",
+        "类型格",
         "覆盖检查",
         "虚词表",
         "功能词表",

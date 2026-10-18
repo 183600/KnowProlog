@@ -183,6 +183,7 @@ mod tests {
                 })
                 .collect(),
             registry_changed: false,
+            ..Default::default()
         }
     }
 

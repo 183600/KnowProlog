@@ -65,6 +65,8 @@ pub mod dialogue_eval;
 pub mod serve_api;
 pub mod bindings;
 pub mod prompt_spec;
+pub mod type_system;
+pub mod quality;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -144,6 +146,9 @@ pub struct SystemConfig {
     /// 谓词画像声明（可选）：导入准入、别名/逆向归一、功能谓词冲突裁决的共同依据
     #[serde(default)]
     pub predicate_profiles: Vec<predicate_registry::PredicateProfileConfig>,
+    /// 类型体系声明（可选）：别名/子类/互斥 + 模式闸门的闭包档
+    #[serde(default)]
+    pub type_system: type_system::TypeSystemConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -809,6 +814,8 @@ pub struct OxigraphManager {
     perf: Arc<perf_ledger::PerfLedger>,
     // 谓词画像注册表：导入准入、别名/逆向归一、功能谓词冲突裁决
     predicate_registry: parking_lot::RwLock<predicate_registry::PredicateRegistry>,
+    // 类型体系：别名/子类/互斥声明的类型格，模式闸门与质量护照共同消费
+    type_system: parking_lot::RwLock<type_system::TypeSystem>,
 }
 
 /// 每次写操作缓存容量上限（条目数）。对话中交替询问少量实体，
@@ -909,6 +916,7 @@ impl OxigraphManager {
             predicate_registry: parking_lot::RwLock::new(
                 predicate_registry::PredicateRegistry::new(),
             ),
+            type_system: parking_lot::RwLock::new(type_system::TypeSystem::new()),
         })
     }
 
@@ -1241,6 +1249,9 @@ impl OxigraphManager {
                     existing,
                     incoming: value.clone(),
                 });
+                self.predicate_registry
+                    .write()
+                    .note_conflict(&subject_name, key, value);
                 continue;
             }
             let predicate = NamedNode::new(predicate_iri.clone())?;
@@ -1319,25 +1330,51 @@ impl OxigraphManager {
         if let Some(existing) = conflict {
             receipt.conflicts.push(predicate_registry::ImportConflict {
                 subject: subject_name.to_string(),
-                predicate: predicate_name,
+                predicate: predicate_name.clone(),
                 existing,
                 incoming: object_name.to_string(),
             });
+            self.predicate_registry.write().note_conflict(
+                subject_name,
+                &predicate_name,
+                object_name,
+            );
             return Ok(());
         }
 
-        // 模式闸门：定义域/值域校验（实体类型未知时按开放世界放行）
+        // 模式闸门：定义域/值域校验（实体类型未知时按开放世界放行）。
+        // 类型体系开启闭包档时按别名/子类/互斥判定，并记录与 legacy 判定的
+        // 差异（误杀消解 / 收紧），差异只统计、不改变本次结果。
         let subject_types = entity_type_labels(store, subject_name)?;
         let object_types = entity_type_labels(store, object_name)?;
         let violation = {
             let registry = self.predicate_registry.read();
-            registry.check_schema(
+            let types = self.type_system.read();
+            let legacy = registry.check_schema(
                 subject_name,
                 &predicate_name,
                 object_name,
                 &subject_types,
                 &object_types,
-            )
+            );
+            if types.closure_gate() {
+                let closure = registry.check_schema_with_types(
+                    subject_name,
+                    &predicate_name,
+                    object_name,
+                    &subject_types,
+                    &object_types,
+                    &types,
+                );
+                if legacy.is_some() && closure.is_none() {
+                    receipt.gate_relaxed += 1;
+                } else if legacy.is_none() && closure.is_some() {
+                    receipt.gate_tightened += 1;
+                }
+                closure
+            } else {
+                legacy
+            }
         };
         if let Some(violation) = violation {
             receipt.schema_violations.push(violation);
@@ -1534,6 +1571,36 @@ impl OxigraphManager {
         for profile in profiles {
             registry.declare(profile);
         }
+    }
+
+    /// 从配置装载类型体系（别名/子类/互斥 + 闭包闸门开关）。
+    pub fn configure_type_system(&self, config: &type_system::TypeSystemConfig) {
+        *self.type_system.write() = type_system::TypeSystem::from_config(config);
+    }
+
+    /// 类型体系快照（质量护照等只读消费者使用）。
+    pub fn type_system_snapshot(&self) -> type_system::TypeSystem {
+        self.type_system.read().clone()
+    }
+
+    /// 类型体系报告（确定性）。
+    pub fn type_system_report(&self) -> String {
+        self.type_system.read().report()
+    }
+
+    /// 模式闸门是否处于闭包档。
+    pub fn closure_gate(&self) -> bool {
+        self.type_system.read().closure_gate()
+    }
+
+    /// 谓词注册表快照（质量护照等只读消费者使用）。
+    pub fn predicate_registry_snapshot(&self) -> predicate_registry::PredicateRegistry {
+        self.predicate_registry.read().clone()
+    }
+
+    /// 全部功能谓词冲突笔记（被拒入值；图谱快照里看不到的「不同说法」）。
+    pub fn predicate_conflicts(&self) -> Vec<predicate_registry::ImportConflict> {
+        self.predicate_registry.read().conflicts()
     }
 
     /// 谓词画像 + 候选发现报告。

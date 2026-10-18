@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::type_system::{TypeSystem, TypeVerdict};
+
 /// config.toml 中的 `[[predicate_profiles]]` 声明。
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PredicateProfileConfig {
@@ -169,6 +171,10 @@ pub struct PredicateRegistry {
     /// 已观测的规范事实 (主语, 规范谓词, 宾语)：支撑数去重的唯一依据
     #[serde(default)]
     facts: BTreeSet<(String, String, String)>,
+    /// 冲突笔记：主语 → 规范谓词 → 被拒的入值集合（功能谓词冲突不覆盖、只登记）。
+    /// 图谱快照看不到「被拒的值」，质量护照靠这本笔记披露「存在不同说法」。
+    #[serde(default)]
+    conflict_notes: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
     /// 严格准入：未登记谓词不自动准入，也不落库
     #[serde(default)]
     strict_admission: bool,
@@ -409,6 +415,10 @@ impl PredicateRegistry {
             self.inverse_index.remove(&inverse);
         }
         self.facts.retain(|(_, predicate, _)| predicate != &canonical);
+        self.conflict_notes.retain(|_, by_predicate| {
+            by_predicate.remove(&canonical);
+            !by_predicate.is_empty()
+        });
         true
     }
 
@@ -724,6 +734,76 @@ impl PredicateRegistry {
         Some(existing)
     }
 
+    /// 登记一条功能谓词冲突笔记（被拒的入值，不覆盖原值）。
+    /// 主宾语按互逆归一方向记录，与图谱中的规范方向一致。
+    pub fn note_conflict(&mut self, subject: &str, predicate: &str, incoming: &str) {
+        let subject = subject.trim();
+        let incoming = incoming.trim();
+        let predicate = predicate.trim();
+        if subject.is_empty() || predicate.is_empty() || incoming.is_empty() {
+            return;
+        }
+        let resolution = self.resolve(predicate);
+        let (subject, incoming) = if resolution.inverted {
+            (incoming, subject)
+        } else {
+            (subject, incoming)
+        };
+        self.conflict_notes
+            .entry(subject.to_string())
+            .or_default()
+            .entry(resolution.canonical)
+            .or_default()
+            .insert(incoming.to_string());
+    }
+
+    /// 全部冲突笔记 → 回执式冲突清单（现有值取自画像统计，确定性排序）。
+    pub fn conflicts(&self) -> Vec<ImportConflict> {
+        let mut conflicts = Vec::new();
+        for (subject, by_predicate) in &self.conflict_notes {
+            for (predicate, incoming) in by_predicate {
+                let existing: Vec<String> = self
+                    .profiles
+                    .get(predicate)
+                    .and_then(|profile| profile.values.get(subject))
+                    .map(|values| values.iter().cloned().collect())
+                    .unwrap_or_default();
+                for value in incoming {
+                    conflicts.push(ImportConflict {
+                        subject: subject.clone(),
+                        predicate: predicate.clone(),
+                        existing: existing.clone(),
+                        incoming: value.clone(),
+                    });
+                }
+            }
+        }
+        conflicts
+    }
+
+    /// 冲突笔记条数（被拒入值的总条数）。
+    pub fn conflict_count(&self) -> usize {
+        self.conflict_notes
+            .values()
+            .map(|by_predicate| by_predicate.values().map(BTreeSet::len).sum::<usize>())
+            .sum()
+    }
+
+    /// 某主语是否存在任何冲突笔记。
+    pub fn has_conflict(&self, subject: &str) -> bool {
+        self.conflict_notes.contains_key(subject.trim())
+    }
+
+    /// 某（主语, 谓词）被拒入值清单（排序）；无笔记返回 None。
+    pub fn conflict_incoming(&self, subject: &str, predicate: &str) -> Option<Vec<String>> {
+        let resolution = self.resolve(predicate);
+        let incoming = self
+            .conflict_notes
+            .get(subject.trim())?
+            .get(&resolution.canonical)?;
+        Some(incoming.iter().cloned().collect())
+    }
+
     /// 定义域/值域校验（开放世界）：实体类型未知（空集）时放行；
     /// 类型已知但与声明的允许类型完全不相交时判违规。互逆谓词先翻转坐标。
     pub fn check_schema(
@@ -757,6 +837,52 @@ impl PredicateRegistry {
         if !profile.range.is_empty()
             && !object_types.is_empty()
             && object_types.is_disjoint(&profile.range)
+        {
+            return Some(SchemaViolation {
+                subject: subject.to_string(),
+                predicate: resolution.canonical.clone(),
+                object: object.to_string(),
+                slot: "值域".to_string(),
+                expected: profile.range.iter().cloned().collect(),
+                actual: object_types.iter().cloned().collect(),
+            });
+        }
+        None
+    }
+
+    /// 闭包档定义域/值域校验（需类型体系）：别名/子类闭包相容即放行；
+    /// 只有闭包无交集且存在互斥证据（[`TypeVerdict::Disjoint`]）才判违规。
+    /// 开放世界语义不变：类型未知、或两类型只是「互不相关」时一律放行。
+    pub fn check_schema_with_types(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        subject_types: &BTreeSet<String>,
+        object_types: &BTreeSet<String>,
+        types: &TypeSystem,
+    ) -> Option<SchemaViolation> {
+        let resolution = self.resolve(predicate);
+        let profile = self.profiles.get(&resolution.canonical)?;
+        let (subject, object, subject_types, object_types) = if resolution.inverted {
+            (object, subject, object_types, subject_types)
+        } else {
+            (subject, object, subject_types, object_types)
+        };
+        if !profile.domain.is_empty()
+            && types.sets_admit(subject_types, &profile.domain) == TypeVerdict::Disjoint
+        {
+            return Some(SchemaViolation {
+                subject: subject.to_string(),
+                predicate: resolution.canonical.clone(),
+                object: object.to_string(),
+                slot: "定义域".to_string(),
+                expected: profile.domain.iter().cloned().collect(),
+                actual: subject_types.iter().cloned().collect(),
+            });
+        }
+        if !profile.range.is_empty()
+            && types.sets_admit(object_types, &profile.range) == TypeVerdict::Disjoint
         {
             return Some(SchemaViolation {
                 subject: subject.to_string(),
@@ -1029,6 +1155,12 @@ pub struct ImportReceipt {
     pub pending_admissions: Vec<String>,
     pub actions: Vec<ImportAction>,
     pub registry_changed: bool,
+    /// 闭包档相对 legacy 精确判定「由误杀转为放行」的条数（只统计，不改变结果）。
+    #[serde(default)]
+    pub gate_relaxed: usize,
+    /// 闭包档拒绝而 legacy 放行的条数（收紧；有互斥证据才会发生）。
+    #[serde(default)]
+    pub gate_tightened: usize,
 }
 
 impl ImportReceipt {
@@ -1094,6 +1226,12 @@ impl ImportReceipt {
             output.push_str(&format!(
                 "\n严格准入下未落库的谓词：{}\n  可用「确认谓词：名称」登记后重新导入。",
                 self.pending_admissions.join("、")
+            ));
+        }
+        if self.gate_relaxed > 0 || self.gate_tightened > 0 {
+            output.push_str(&format!(
+                "\n类型闸门（闭包档）：误杀消解 {} 条，收紧 {} 条。",
+                self.gate_relaxed, self.gate_tightened
             ));
         }
         if self.can_undo() {
@@ -1334,6 +1472,7 @@ mod tests {
                 value: "v".to_string(),
             }],
             registry_changed: true,
+            ..Default::default()
         };
         let summary = receipt.summary();
         assert!(summary.contains("新增 3 条"));
@@ -1576,5 +1715,164 @@ mod tests {
             "确认后关系应落库：{:?}",
             relations
         );
+    }
+
+    fn closure_type_system() -> crate::type_system::TypeSystemConfig {
+        use crate::type_system::{
+            TypeAliasConfig, TypeDisjointConfig, TypeSubclassConfig, TypeSystemConfig,
+        };
+        TypeSystemConfig {
+            closure_gate: true,
+            aliases: vec![
+                TypeAliasConfig {
+                    alias: "Person".to_string(),
+                    canonical: "人物".to_string(),
+                },
+                TypeAliasConfig {
+                    alias: "Entity".to_string(),
+                    canonical: "实体".to_string(),
+                },
+            ],
+            subclasses: vec![TypeSubclassConfig {
+                sub: "人物".to_string(),
+                sup: "实体".to_string(),
+            }],
+            disjoint: vec![TypeDisjointConfig {
+                left: "人物".to_string(),
+                right: "地点".to_string(),
+            }],
+        }
+    }
+
+    /// C14（类型格×模式闸门）：别名归一消解误杀（Person/人物），
+    /// 互斥声明兜底拒绝（地点⊥人物），未知类型仍按开放世界放行；
+    /// 与 legacy 判定的差异计入回执（gate_relaxed / gate_tightened）。
+    #[tokio::test]
+    async fn c14_closure_gate_normalizes_aliases_and_keeps_disjoint_guard() {
+        let (manager, _dir) = temp_manager().await;
+        let mut master = master_profile();
+        master.domain = vec!["人物".to_string()];
+        master.range = vec!["人物".to_string()];
+        manager.configure_predicates(&[master], false);
+        manager.configure_type_system(&closure_type_system());
+
+        manager
+            .save_knowledge_with_receipt(vec![
+                typed_entity("Person", "张三"),
+                typed_entity("Person", "李四"),
+                typed_entity("地点", "北京"),
+                typed_entity("未知类型", "乌云"),
+            ])
+            .await
+            .unwrap();
+
+        // Person = 人物（别名）：legacy 精确集合会误杀，闭包档放行并计 relaxed
+        let admitted = manager
+            .save_knowledge_with_receipt(master_disciple_items("张三", "李四"))
+            .await
+            .unwrap();
+        assert!(
+            admitted.schema_violations.is_empty(),
+            "别名归一后应放行：{:?}",
+            admitted.schema_violations
+        );
+        assert!(admitted.added > 0, "{:?}", admitted);
+        assert_eq!(admitted.gate_relaxed, 1, "{:?}", admitted);
+        assert_eq!(admitted.gate_tightened, 0);
+
+        // 北京 是「地点」，与值域「人物」有显式互斥声明：必拒
+        let blocked = manager
+            .save_knowledge_with_receipt(master_disciple_items("李四", "北京"))
+            .await
+            .unwrap();
+        assert_eq!(blocked.schema_violations.len(), 1, "{:?}", blocked);
+        assert_eq!(blocked.schema_violations[0].slot, "值域");
+        assert!(
+            blocked
+                .actions
+                .iter()
+                .all(|action| !matches!(action, ImportAction::Named { .. })),
+            "互斥证据下不得落库：{:?}",
+            blocked.actions
+        );
+
+        // 未声明类型（乌云）：闭包不可达但无互斥证据 → 开放世界放行
+        let unknown = manager
+            .save_knowledge_with_receipt(master_disciple_items("李四", "乌云"))
+            .await
+            .unwrap();
+        assert!(
+            unknown.schema_violations.is_empty(),
+            "未声明类型不得误杀：{:?}",
+            unknown.schema_violations
+        );
+        assert!(unknown.added > 0, "{:?}", unknown);
+    }
+
+    /// C15（冲突笔记·在线查询）：功能谓词冲突不覆盖、入注册表，
+    /// 供质量护照与对话层披露「存在不同说法」；拒绝谓词时笔记随画像清理。
+    #[tokio::test]
+    async fn c15_conflict_notes_are_queryable() {
+        let (manager, _dir) = temp_manager().await;
+        manager.configure_predicates(&[master_profile()], false);
+
+        let mut items = master_disciple_items("张三", "李四");
+        let receipt = manager.save_knowledge_with_receipt(items).await.unwrap();
+        assert!(receipt.conflicts.is_empty(), "{:?}", receipt.conflicts);
+
+        items = master_disciple_items("张三", "王五");
+        let clash = manager.save_knowledge_with_receipt(items).await.unwrap();
+        assert_eq!(clash.conflicts.len(), 1, "{:?}", clash);
+
+        let notes = manager.predicate_conflicts();
+        assert_eq!(notes.len(), 1, "{:?}", notes);
+        assert_eq!(notes[0].subject, "张三");
+        assert_eq!(notes[0].predicate, "师傅");
+        assert_eq!(notes[0].existing, vec!["李四".to_string()]);
+        assert_eq!(notes[0].incoming, "王五");
+        let registry = manager.predicate_registry_snapshot();
+        assert!(registry.has_conflict("张三"));
+        assert_eq!(
+            registry.conflict_incoming("张三", "师傅"),
+            Some(vec!["王五".to_string()])
+        );
+
+        // 快照往返后笔记仍在（跨会话可披露）
+        let restored = PredicateRegistry::from_json(&registry.to_json()).unwrap();
+        assert_eq!(restored.conflict_count(), 1);
+
+        // 拒绝待定谓词时，冲突笔记随画像一并清理（注册表级路径）
+        let mut scratch = PredicateRegistry::new();
+        scratch.admit("搭伙", "文本导入");
+        scratch.note_conflict("张三", "搭伙", "王五");
+        assert_eq!(scratch.conflict_count(), 1);
+        assert_eq!(
+            scratch.conflict_incoming("张三", "搭伙"),
+            Some(vec!["王五".to_string()])
+        );
+        scratch.reject("搭伙");
+        assert_eq!(scratch.conflict_count(), 0, "拒绝谓词后笔记应清理");
+    }
+
+    /// C16（类型体系·摘要与闭包判定）：类型格的判定与摘要确定性。
+    #[test]
+    fn c16_type_lattice_digest_and_closure() {
+        let system = TypeSystem::from_config(&closure_type_system());
+        assert!(system.is_subclass("Person", "实体"));
+        assert!(system.types_disjoint("地点", "人物"));
+        assert!(!system.types_disjoint("乌云", "人物"));
+        assert_eq!(
+            system.sets_admit(
+                &["Person".to_string()].into_iter().collect(),
+                &["人物".to_string()].into_iter().collect()
+            ),
+            TypeVerdict::Compatible
+        );
+        // 摘要锁定：同配置同字节、改一条声明即变化
+        let clone = TypeSystem::from_config(&closure_type_system());
+        assert_eq!(system.digest(), clone.digest());
+        let mut changed = closure_type_system();
+        changed.disjoint.clear();
+        assert_ne!(system.digest(), TypeSystem::from_config(&changed).digest());
     }
 }
