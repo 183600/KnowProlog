@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::function_words::{projection_set, Projection};
 use crate::nlp::shared_jieba;
 
-/// 查询/文档共用的停用词（唯一正本见 `function_words`；本投影与历史名单逐词一致）
+/// 查询/文档共用的停用词（唯一正本见 `function_words`）
 fn stopwords() -> &'static HashSet<&'static str> {
     projection_set(Projection::Retrieval)
 }

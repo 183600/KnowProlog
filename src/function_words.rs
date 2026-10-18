@@ -5,14 +5,12 @@
 //! 把/将=话题前置、和/与=合取、不/没=否定（闭世界）、吗/呢=句类、
 //! 谁/什么/哪里/几/多少=答案类型约束与聚合。它们驱动结构，不该被丢弃。
 //!
-//! 历史上各模块各自硬编码私有名单（稠密检索 34 词、问题分析 41 词、
-//! 语义引擎 51 词、相似度与抽取 ~105 词、实体链接 14 词），同一批词有
-//! 五六种命运、每次扩展语料要改多处。本模块把它们收敛为：
+//! 各模块的词面过滤名单以本模块为唯一正本，按「投影快照」分发：
 //!
 //! 1. `REGISTRY`：带角色标注的词条正本（一词一记录，可多重角色）；
-//! 2. `Projection`：五个「投影快照」+ 一个片段投影，首轮与历史私有名单
-//!    逐词一致，行为守恒可对账（见 `tests` 中的投影校验）；
-//! 3. 共享函数：`contains_question_marker`（合并两份复制函数，含同形守卫）、
+//! 2. `Projection`：五个「投影快照」+ 一个片段投影，逐词固定，
+//!    行为守恒可对账（见 `tests` 中的投影校验）；
+//! 3. 共享函数：`contains_question_marker`（含同形守卫）、
 //!    `wh_kind` / `answer_type_keywords`（疑问词 → 答案类型期待）。
 //!
 //! 设计戒律：投影只增不改语义；升级先在正本加角色，再让模块显式消费。
@@ -306,7 +304,7 @@ pub fn is_registered(word: &str) -> bool {
     REGISTRY.iter().any(|entry| entry.text == word)
 }
 
-/// 投影名：历史私有名单在正本中的快照坐标。
+/// 投影名：各模块词面名单在正本中的快照坐标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Projection {
     /// dense_retrieval 的查询/文档停用词（34 词）
@@ -347,21 +345,21 @@ impl Projection {
     ];
 }
 
-/// 稠密检索的停用词快照（与 dense_retrieval 历史名单逐词一致）。
+/// 稠密检索的停用词快照。
 pub const RETRIEVAL_WORDS: [&str; 34] = [
     "的", "了", "是", "在", "和", "与", "也", "都", "就", "吗", "呢", "吧", "啊", "什么", "多少",
     "几", "哪", "哪个", "哪些", "谁", "怎么", "为什么", "如何", "请问", "帮我", "告诉", "我",
     "一下", "这个", "那个", "他", "她", "它", "们",
 ];
 
-/// 问题分析的关键词停用词快照（与 question_analyzer 历史名单逐词一致）。
+/// 问题分析的关键词停用词快照。
 pub const QUESTION_WORDS: [&str; 41] = [
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要",
     "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为",
     "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是",
 ];
 
-/// 语义引擎的词面过滤快照（与 semantic_engine 历史名单逐词一致）。
+/// 语义引擎的词面过滤快照。
 pub const SEMANTIC_WORDS: [&str; 51] = [
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要",
     "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为",
@@ -369,7 +367,7 @@ pub const SEMANTIC_WORDS: [&str; 51] = [
     "哪里", "那么", "这么", "怎样", "多少", "几个", "如何",
 ];
 
-/// 相似度计算的词面过滤快照（与 similarity_calculator 历史名单逐词一致）。
+/// 相似度计算的词面过滤快照。
 pub const SIMILARITY_WORDS: [&str; 105] = [
     "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要",
     "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为",
@@ -382,10 +380,10 @@ pub const SIMILARITY_WORDS: [&str; 105] = [
     "意识",
 ];
 
-/// 关系抽取的停用词快照（与 entity_relation_extractor 历史名单逐词一致）。
+/// 关系抽取的停用词快照。
 pub const EXTRACTION_WORDS: [&str; 105] = SIMILARITY_WORDS;
 
-/// 实体链接的片段级停用词快照（与 entity_linker 历史名单逐词一致）。
+/// 实体链接的片段级停用词快照。
 pub const LINKER_SEGMENT_WORDS: [&str; 14] = [
     "什么", "多少", "哪里", "哪个", "哪些", "怎么", "如何", "为什么", "介绍", "一下", "告诉我",
     "请问", "你好", "一下吗",
@@ -425,10 +423,9 @@ pub const QUESTION_MARKERS: [&str; 12] = [
     "有没有",
 ];
 
-/// 判断文本是否含疑问标记（两份历史 `contains_question_word` 的合并升级版）。
+/// 判断文本是否含疑问标记。
 ///
-/// 合并了 chinese_reasoning_nlu（8 词）与 semantic_entailment（14 词）的并集，
-/// 并把同形守卫收敛到一处：
+/// 多字标记直接子串匹配，单字标记带同形守卫：
 /// - 几（几乎/几何/几内亚）、哪（哪吒/哪咤）不误报；
 /// - 吗啡（吗）、呢子/呢绒/呢喃（呢）不误报；
 /// - 「几何」仅在句末是疑问（价值几何），句首/句中作名词（几何是数学分支）。
@@ -510,8 +507,7 @@ pub fn wh_kind(text: &str) -> Option<WhKind> {
 
 /// 疑问词的「类型期待」→ 实体类型关键词：谁→人、哪里→地点、何时→时间。
 ///
-/// 与 symbolic_reasoner 历史 `expected_type_keywords` 的关键词表逐词一致；
-/// 数量/实体槽/原因类不给类型期待（返回空表），保持原有重排行为不变。
+/// 数量/实体槽/原因类不给类型期待（返回空表）。
 pub fn answer_type_keywords(question: &str) -> Vec<&'static str> {
     match wh_kind(question) {
         Some(WhKind::Person) => vec!["人", "person"],
@@ -534,7 +530,7 @@ pub fn render_registry_report() -> String {
             .join("、");
         out.push_str(&format!("  {:<6} [{}]\n", entry.text, roles));
     }
-    out.push_str("投影快照（首轮与历史私有名单逐词一致）：\n");
+    out.push_str("投影快照（逐词固定）：\n");
     for projection in Projection::ALL {
         let words = projection_words(projection);
         out.push_str(&format!(
@@ -565,9 +561,9 @@ pub fn render_registry_report() -> String {
 mod tests {
     use super::*;
 
-    /// H1 投影守恒：五个投影与历史私有名单逐词一致（长度 + 前缀关系 + 内容）。
+    /// 投影守恒：五个投影逐词固定（长度 + 前缀关系 + 内容）。
     #[test]
-    fn projections_match_historical_lists() {
+    fn projections_are_frozen() {
         assert_eq!(RETRIEVAL_WORDS.len(), 34);
         assert_eq!(
             RETRIEVAL_WORDS,
@@ -587,10 +583,10 @@ mod tests {
         assert_eq!(SEMANTIC_WORDS[40], "只是");
         assert_eq!(SEMANTIC_WORDS[50], "如何");
 
-        // 相似度与抽取共用同一份历史名单（两份逐字复制）
+        // 相似度与抽取共用同一份名单
         assert_eq!(SIMILARITY_WORDS, EXTRACTION_WORDS);
         assert_eq!(EXTRACTION_WORDS.len(), 105);
-        // 历史名单里「但是」「只是」各出现两次；集合消费不受影响，快照保留原样
+        // 「但是」「只是」各出现两次；集合消费不受影响，快照保留原样
         assert_eq!(
             EXTRACTION_WORDS.iter().filter(|w| **w == "但是").count(),
             2
@@ -633,7 +629,7 @@ mod tests {
         }
     }
 
-    /// 关键角色标注与历史行为一致。
+    /// 关键角色标注。
     #[test]
     fn roles_are_typed() {
         assert!(roles_of("的").contains(&Role::Attribute));
@@ -653,7 +649,7 @@ mod tests {
         assert!(roles_of("几乎").is_empty());
     }
 
-    /// H2 守卫统一：并集疑问词全绿，同形词零误报。
+    /// 疑问标记识别：疑问词全绿，同形词零误报。
     #[test]
     fn question_marker_union_and_guards() {
         for marker in [
@@ -688,9 +684,9 @@ mod tests {
         }
     }
 
-    /// 疑问词 → 答案类型期待：与 symbolic_reasoner 历史行为一致。
+    /// 疑问词 → 答案类型期待。
     #[test]
-    fn answer_type_expectation_matches_legacy() {
+    fn answer_type_expectation_keywords() {
         assert_eq!(
             answer_type_keywords("张三的师傅是谁？"),
             vec!["人", "person"]
@@ -703,7 +699,7 @@ mod tests {
             answer_type_keywords("公司是什么时候成立的"),
             vec!["日期", "时间", "date", "time", "年"]
         );
-        // 人优先于地点（与历史 else-if 顺序一致）
+        // 人优先于地点
         assert_eq!(
             answer_type_keywords("谁在哪里"),
             vec!["人", "person"]

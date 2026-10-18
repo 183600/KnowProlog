@@ -2531,7 +2531,7 @@ async fn try_symbolic_reasoning(
 }
 
 fn contains_question_marker(text: &str) -> bool {
-    // 疑问词识别统一收敛到虚词算符表（合并历史两份复制实现 + 同形守卫）
+    // 疑问词识别走虚词算符表（含同形守卫）
     know_prolog::function_words::contains_question_marker(text)
 }
 

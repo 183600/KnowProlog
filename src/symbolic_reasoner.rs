@@ -3001,7 +3001,7 @@ impl SymbolicReasoner {
     }
 
     // 期望答案类型（形式语义中的问题类型约束）：谁→人物、哪里→地点、何时→时间
-    // 疑问词识别与关键词表统一收敛到虚词算符表（`function_words::answer_type_keywords`）
+    // 疑问词识别与关键词表由虚词算符表提供（`function_words::answer_type_keywords`）
     fn expected_type_keywords(question: &str) -> Vec<&'static str> {
         crate::function_words::answer_type_keywords(question)
     }
