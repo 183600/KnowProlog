@@ -228,8 +228,7 @@ impl SymbolicGenerator {
         self.observe_entity_refs(name, etype, &refs);
     }
 
-    /// 与 `observe_entity` 等价，但直接以属性表为输入，避免调用方为构造
-    /// `&[(String, String)]` 而复制全部键值。属性迭代顺序与原方法一致。
+    /// 与 `observe_entity` 等价，但直接以属性表为输入，迭代顺序与之一致。
     pub fn observe_entity_map(
         &mut self,
         name: &str,

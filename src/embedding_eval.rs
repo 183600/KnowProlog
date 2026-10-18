@@ -1,8 +1,5 @@
-//! 符号嵌入评估台（Eval Harness）：给纯符号嵌入发一张可复现的「成绩单」。
-//!
-//! 背景：本仓库的嵌入全是确定性符号构造（RWR/PPR、PPMI、VSA 全息），
-//! 但没有统一的评估协议——有向量、有相似度，唯独没有「怎么算好、有没有变坏」。
-//! 本模块补上这一层，且遵守三条戒律：
+//! 符号嵌入评估台（Eval Harness）：统一的评估协议，给确定性符号构造
+//! （RWR/PPR、PPMI、VSA 全息）的嵌入发一张可复现的「成绩单」，遵守三条戒律：
 //!
 //!  1. **确定性**：留出划分只用 FNV-1a 哈希（`canonical key % 1000`），
 //!     无 RNG、无 HashMap 序依赖；指标对输入顺序不敏感，同输入同字节。
@@ -1048,7 +1045,7 @@ pub struct EvalBaseline {
     pub test_ratio_per_mille: u32,
     /// 通道 ID → 指标。
     pub channels: BTreeMap<String, EvalMetrics>,
-    /// 类比通道 ID → 指标；旧基线缺此字段时视为空。
+    /// 类比通道 ID → 指标；该字段缺失时视为空。
     #[serde(default)]
     pub analogy: BTreeMap<String, EvalMetrics>,
 }

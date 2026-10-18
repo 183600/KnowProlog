@@ -12,3 +12,6 @@ Cargo.lock
 
 # Runtime Oxigraph data store
 oxigraph_data/
+
+# Runtime evaluation baseline artifact
+eval_baseline.json

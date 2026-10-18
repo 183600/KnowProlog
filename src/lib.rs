@@ -853,8 +853,7 @@ impl OxigraphManager {
         // 解析 JSON-LD 内容
         let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
         
-        // 简化的 JSON-LD 处理 - 直接解析 JSON 结构
-        // 暂时跳过复杂的 JSON-LD 展开，直接处理 JSON 结构
+        // 直接处理 JSON 结构
         self.process_jsonld_simple(&store, &jsonld_value).await?;
         
         Ok(())
@@ -2801,13 +2800,13 @@ mod cache_tests {
         assert_eq!(first.as_deref(), Some("北京的首都是中国"));
         let queries = perf.count("direct_answer_query");
 
-        // 同版本同问句：命中缓存，不再发 SPARQL
+        // 同版本同问句：命中缓存
         let second = manager.get_direct_answer("capital_query", &entities).await;
         assert_eq!(second, first);
         assert_eq!(perf.count("direct_answer_query"), queries);
         assert_eq!(perf.count("direct_answer_cache_hit"), 1);
 
-        // 负缓存：同版本问不存在的属性不再发 SPARQL
+        // 负缓存：同版本问不存在的属性同样命中缓存
         assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
         let queries_with_negative = perf.count("direct_answer_query");
         assert!(manager.get_direct_answer("author_query", &entities).await.is_none());

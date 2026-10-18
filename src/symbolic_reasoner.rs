@@ -4856,8 +4856,7 @@ impl SymbolicReasoner {
             }
         };
         for profile in self.aligner.profiles() {
-            // 先做前缀预筛（`consider` 内部同样要求），避免为不匹配的
-            // profile 做规范化与缓存查询
+            // 前缀预筛：只处理可能命中目标前缀的实体画像
             if profile.kind == TermKind::Entity
                 && !profile.term.is_empty()
                 && target.starts_with(&profile.term)

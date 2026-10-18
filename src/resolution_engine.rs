@@ -661,8 +661,6 @@ impl ResolutionEngine {
     }
 }
 
-/// 快速预检查：若所有已解析的词项对都是互不相同的常量，则合一必然失败。
-/// 用于在克隆全部替换之前尽早跳过不匹配的事实/规则头。
 /// 沿置换链解析词项，返回最具体的引用
 fn resolve_ref<'a>(term: &'a Term, subst: &'a Substitution) -> &'a Term {
     let mut current = term;

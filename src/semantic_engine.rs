@@ -503,7 +503,7 @@ impl SemanticEngine {
     }
 
     fn match_pattern_confidence(&self, text_words: &[(&str, usize)], pattern: &str) -> f64 {
-        // 简化的模式匹配，实际实现中可以使用正则表达式
+        // 词级模式匹配
         let mut matches = 0;
         let mut total = 0;
         
