@@ -276,6 +276,20 @@ impl DenseRetriever {
         vector.values().map(|w| w * w).sum::<f64>().sqrt()
     }
 
+    /// 两个概率分布之间的 L1 距离（用于判断幂迭代是否收敛）
+    fn distribution_delta(left: &HashMap<String, f64>, right: &HashMap<String, f64>) -> f64 {
+        let mut delta: f64 = left
+            .iter()
+            .map(|(node, mass)| (mass - right.get(node).copied().unwrap_or(0.0)).abs())
+            .sum();
+        for (node, mass) in right {
+            if !left.contains_key(node) {
+                delta += mass.abs();
+            }
+        }
+        delta
+    }
+
     /// 结构信号：以查询实体为种子的随机游走重启分布（PPR）
     fn structural_scores(&self, seeds: &[String]) -> HashMap<String, f64> {
         let mut scores: HashMap<String, f64> = HashMap::new();
@@ -290,7 +304,15 @@ impl DenseRetriever {
             .iter()
             .map(|(name, weight)| ((*name).to_string(), *weight))
             .collect();
-        for _ in 0..self.iterations {
+        // 幂迭代至少执行 `iterations` 轮；实体图常为（近）二分图，固定轮数可能恰好
+        // 停在奇偶振荡的反相上，使距离 2 的节点压过直接邻居。达到最少轮数后继续
+        // 迭代到相邻两轮分布收敛为止，并以轮数上限兜底（防止高阻尼下振荡不收敛）。
+        let min_iterations = self.iterations.max(1);
+        let max_iterations = min_iterations
+            .saturating_mul(8)
+            .max(64)
+            .min(1024);
+        for iteration in 0..max_iterations {
             let mut next: HashMap<String, f64> = personalization
                 .iter()
                 .map(|(name, weight)| ((*name).to_string(), (1.0 - self.damping) * weight))
@@ -317,7 +339,11 @@ impl DenseRetriever {
                         self.damping * mass * (weight / total);
                 }
             }
+            let delta = Self::distribution_delta(&current, &next);
             current = next;
+            if iteration + 1 >= min_iterations && delta <= 1e-9 {
+                break;
+            }
         }
         let max = current.values().cloned().fold(0.0_f64, f64::max);
         if max <= 0.0 {
