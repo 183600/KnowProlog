@@ -24,7 +24,7 @@ pub struct SymbolicEmbedding {
     counts: HashMap<String, HashMap<Arc<str>, f64>>,
     feature_totals: HashMap<Arc<str>, f64>,
     entity_masses: HashMap<String, f64>,
-    /// 特征名驻留表：同一特征在全图中只存一份 Arc<str>，重建向量时零字符串拷贝
+    /// 特征名驻留表：同一特征在全图中只存一份 Arc<str>
     feature_interner: HashMap<String, Arc<str>>,
     total_mass: f64,
     vectors: HashMap<String, EntityVector>,
@@ -149,7 +149,7 @@ impl SymbolicEmbedding {
             if mass <= 0.0 || total <= 0.0 {
                 continue;
             }
-            // 排序截断后共享特征名（Arc 克隆为引用计数自增）
+            // 排序截断后共享特征名
             let mut weights: Vec<(Arc<str>, f64)> = Vec::with_capacity(features.len());
             for (feature, count) in features {
                 let feature_total = self
@@ -372,7 +372,7 @@ impl SymbolicEmbedding {
         let (Some(ca), Some(cb)) = (self.counts.get(a), self.counts.get(b)) else {
             return Vec::new();
         };
-        // 先借用排序截断，仅对最终保留的 k 项克隆特征名
+        // 先排序截断，再克隆保留项的特征名
         let mut shared: Vec<(&str, f64, f64)> = ca
             .iter()
             .filter_map(|(feature, count_a)| {

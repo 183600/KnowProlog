@@ -651,7 +651,7 @@ impl MarkovLogicEngine {
         beliefs: &Beliefs,
         fixed: &HashMap<Atom, f64>,
     ) -> Vec<SoftFact> {
-        // 先收集借用证据，排序截断后再克隆证据并排序
+        // 收集证据，排序截断后再克隆
         let mut merged: HashMap<&Atom, (f64, f64, Option<&Vec<RuleEvidence>>, bool)> =
             HashMap::new();
         for fact in &self.facts {

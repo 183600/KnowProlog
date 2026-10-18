@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 thread_local! {
-    /// 编辑距离计算的可复用缓冲：避免每次调用产生 4 次堆分配
+    /// 编辑距离计算的可复用缓冲
     static LEVENSHTEIN_SCRATCH: RefCell<(Vec<char>, Vec<char>, Vec<usize>, Vec<usize>)> =
         RefCell::new((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
 }
@@ -75,7 +75,7 @@ impl SimilarityCalculator {
             }
         }
         
-        // IDF 依赖词频统计，初始化新语料后必须失效旧缓存，否则继续使用上一份语料的 IDF
+        // IDF 依赖词频统计，初始化新语料后必须失效旧缓存
         self.idf_cache.write().clear();
         
         Ok(())
@@ -270,7 +270,7 @@ impl SimilarityCalculator {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：将较短字符串作为列方向；复用线程本地缓冲避免反复分配
+        // 双行动态规划：将较短字符串作为列方向；复用线程本地缓冲
         LEVENSHTEIN_SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
             let (chars1, chars2, prev, curr) = &mut *scratch;
@@ -325,7 +325,7 @@ impl SimilarityCalculator {
             *tf /= total_words;
         }
         
-        // 计算 TF-IDF；先整批命中缓存（一次读锁），剩余未命中词再统一计算
+        // 计算 TF-IDF；先整批查缓存，剩余未命中词再统一计算
         let mut tfidf_vector: HashMap<&'a str, f64> = HashMap::with_capacity(tf_map.len());
         {
             let cache = self.idf_cache.read();
@@ -404,7 +404,6 @@ impl SimilarityCalculator {
             return 0.0;
         }
         
-        // 整个配对循环只取一次读锁
         let concept_hierarchy = self.concept_hierarchy.read();
         let mut total_similarity = 0.0;
         let mut comparisons = 0;

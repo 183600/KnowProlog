@@ -141,7 +141,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
     let mut symbolic_reasoner = SymbolicReasoner::new(config.reasoning.clone(), synonyms.clone());
-    // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部），避免逐行 O(n²) 重扫重观察
+    // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部）
     let mut reasoner_stale = false;
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
         symbolic_reasoner.observe_facts(&facts);
@@ -185,7 +185,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             break;
         }
 
-        // 导入行不立即刷新：连续导入在真正进入查询/命令前只做一次整图观察
+        // 导入行不立即刷新：进入查询/命令前统一观察整图
         if reasoner_stale
             && !matches!(
                 detect_input_mode(input, &config.nlp.import_keywords),

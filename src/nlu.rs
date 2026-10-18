@@ -72,7 +72,6 @@ impl NLUEngine {
 
         let mut semantics = Vec::new();
 
-        // 分词文本在一轮分析内不变，提前展开
         let input_words: Vec<&str> = normalized_words.iter().map(|w| w.text.as_str()).collect();
 
         for domain in &self.domains {
@@ -160,12 +159,11 @@ impl NLUEngine {
         pattern: &str,
         slot_configs: &[SlotConfig],
     ) -> Option<(f64, Vec<(String, String)>)> {
-        // 不收集中间 Vec：模式词本就可重复遍历，统计与匹配合并为一次扫描
         let mut total_count = 0usize;
 
         let mut matched_count = 0;
         let mut slots = Vec::new();
-        // 同类型词槽按出现次序取不同取值（实体1/实体2 不应拿到同一个词）
+        // 同类型词槽按出现次序取不同取值
         let mut slot_occurrences: HashMap<&str, usize> = HashMap::new();
 
         for pattern_word in pattern.split_whitespace() {
@@ -276,7 +274,7 @@ impl NLUEngine {
                     || matches!(word.text.as_str(), "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五")
             }),
             "属性" => {
-                // 属性是「X的Y」中的名词性成分，取最后一个名词，避免把实体本身当属性
+                // 属性是「X的Y」中的名词性成分，取最后一个名词
                 for word in tagged_words.iter().rev() {
                     if matches!(word.pos.as_str(), "n" | "nz" | "vn") {
                         return Some(word.text.clone());

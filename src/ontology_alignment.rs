@@ -39,11 +39,11 @@ pub struct TermProfile {
 pub struct OntologyAligner {
     synonyms: HashMap<String, String>,
     profiles: Vec<TermProfile>,
-    // 与 profiles 一一对应，注册时预计算规范化结果
+    // 与 profiles 一一对应的规范化结果
     profile_norms: Vec<String>,
-    // 与 profiles 一一对应，注册时预计算并排序的 bigram 键
+    // 与 profiles 一一对应的有序 bigram 键
     profile_keys: Vec<Vec<(char, Option<char>)>>,
-    // 与 profiles 一一对应，规范化后的字符长度（相似度剪枝用）
+    // 与 profiles 一一对应的规范化字符长度
     profile_lens: Vec<usize>,
     index: HashMap<String, usize>,
     similarity_threshold: f64,
@@ -118,7 +118,7 @@ impl OntologyAligner {
         idx
     }
 
-    /// 返回第 `idx` 个术语的预计算规范化形式
+    /// 返回第 `idx` 个术语的规范化形式
     pub fn normalized_term_at(&self, idx: usize) -> Option<&str> {
         self.profile_norms.get(idx).map(String::as_str)
     }
@@ -235,8 +235,7 @@ impl OntologyAligner {
         Self::bigram_dice_sorted(&ga, &gb)
     }
 
-    /// 对两个已排序的 bigram 多重集做归并求交（无分配），
-    /// 与哈希计数实现给出完全相同的 Dice 系数。
+    /// 对两个已排序的 bigram 多重集做归并求交，得到 Dice 系数。
     fn bigram_dice_sorted(ga: &[(char, Option<char>)], gb: &[(char, Option<char>)]) -> f64 {
         if ga.is_empty() || gb.is_empty() {
             return 0.0;
@@ -258,7 +257,7 @@ impl OntologyAligner {
         2.0 * overlap as f64 / (ga.len() + gb.len()) as f64
     }
 
-    /// 使用调用方预计算的查询侧与候选侧 bigram 计算相似度。
+    /// 使用查询侧与候选侧 bigram 计算相似度。
     fn similarity_normalized_with_keys(
         &self,
         query: &str,
@@ -406,8 +405,7 @@ impl OntologyAligner {
             if Some(i) == self_idx {
                 continue;
             }
-            // 廉价上界剪枝：包含关系与 Dice 的取值上限都不可能达到阈值时直接跳过，
-            // 避免对多数候选做子串搜索与逐键归并
+            // 上界剪枝：包含关系与 Dice 的取值上限都不可能达到阈值时直接跳过
             if self.similarity_threshold > 0.0 {
                 let other_len = self.profile_lens[i];
                 if query_len == 0 || other_len == 0 {
@@ -485,7 +483,7 @@ impl OntologyAligner {
                 if shared_count < self.structural_min_shared {
                     continue;
                 }
-                // |A∪B| = |A| + |B| − |A∩B|，避免对整个并集再做一次哈希遍历
+                // |A∪B| = |A| + |B| − |A∩B|
                 let union = own_degree + other_degree - shared_count;
                 if union == 0 {
                     continue;

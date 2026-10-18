@@ -628,7 +628,7 @@ impl KnowledgeExtractor {
                 let parts: Vec<&str> = pos_rule.split(['[', ']']).collect();
                 if parts.len() >= 2 {
                     let pos = parts[0];
-                    // 索引语法畸形时视为无效规则，避免静默提取到错误的词
+                    // 索引语法畸形时视为无效规则
                     let index: usize = parts[1].trim().parse().ok()?;
                     
                     let mut matching_words = Vec::new();
@@ -1238,7 +1238,7 @@ impl OxigraphManager {
             entity_props.entry(entity_name).or_default().insert(prop_name.clone(), value_str);
 
             if matches!(&quad.object, Term::Literal(_)) {
-                // 字面量宾语不可能是命名主体：只需登记名称，无需生成关系候选
+                // 字面量宾语只登记名称，不生成关系候选
                 if let Some(name_value) = name_value {
                     subject_names
                         .entry(Term::from(quad.subject))

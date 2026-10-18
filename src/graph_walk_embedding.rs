@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 超过该规模就不再为每个实体预算向量（检索仍可按需单源计算）
 pub const DEFAULT_MAX_EMBEDDED_ENTITIES: usize = 4000;
 
-/// 单个嵌入向量保留的最大分量数（其余概率质量很小，截断以控制内存与相似度计算量）
+/// 单个嵌入向量保留的最大分量数
 const MAX_VECTOR_LEN: usize = 64;
 
 /// 排序用的量化键：幂迭代的浮点尾差（~1e-16）不应改变名次，
@@ -33,7 +33,7 @@ fn rank_key(score: f64) -> i64 {
     }
 }
 
-/// 幂迭代的可复用缓冲区：避免为每个实体反复分配哈希表
+/// 幂迭代的可复用缓冲区
 #[derive(Default)]
 struct PprScratch {
     mass_a: Vec<f64>,
@@ -44,8 +44,7 @@ struct PprScratch {
     nodes_b: Vec<u32>,
 }
 
-/// 单源重启随机游走的索引化实现（语义与字符串哈希表版本一致，
-/// 仅把键哈希换成了整数下标访问，并复用缓冲区）。
+/// 单源重启随机游走的索引化实现（语义与字符串哈希表版本一致）。
 ///
 /// `out` 按（量化概率降序，实体名升序）截断到 `limit` 个分量后输出。
 #[allow(clippy::too_many_arguments)]
@@ -168,8 +167,7 @@ pub struct GraphWalkEmbedding {
     max_embedded_entities: usize,
     // L2 归一化后的截断 RWR 向量：实体 → [(命中实体, 概率质量)]
     vectors: RwLock<HashMap<String, Vec<(String, f64)>>>,
-    // 有新边加入后向量即失效；真正的重算推迟到首次访问向量时（惰性重建），
-    // 连续导入期间不会反复做全量幂迭代
+    // 有新边加入后向量即失效；真正的重算推迟到首次访问向量时（惰性重建）
     vectors_dirty: AtomicBool,
     edge_count: usize,
 }
@@ -220,7 +218,7 @@ impl GraphWalkEmbedding {
         if subject == object {
             return;
         }
-        // 先借用查找：重复边（快照重放）不产生任何字符串分配
+        // 先借用查找：重复边（快照重放）直接跳过
         let forward_exists = self
             .neighbors
             .get(subject)
@@ -281,7 +279,7 @@ impl GraphWalkEmbedding {
             self.vectors_dirty.store(false, Ordering::Release);
             return;
         }
-        // 索引化邻接表：名称哈希只在重建开始时做一次，幂迭代只操作整数索引
+        // 索引化邻接表：名称哈希在重建开始时建立，幂迭代操作整数索引
         let index: HashMap<&str, u32> = entities
             .iter()
             .enumerate()
@@ -350,7 +348,7 @@ impl GraphWalkEmbedding {
     /// 幂迭代求平稳分布；limit 限制保留的分量数
     fn single_source_ppr_limit(&self, seed: &str, limit: usize) -> Vec<(String, f64)> {
         let mut current: HashMap<&str, f64> = HashMap::new();
-        // 复用两张表交替迭代，避免每轮重新分配哈希表
+        // 复用两张表交替迭代
         let mut next: HashMap<&str, f64> = HashMap::new();
         current.insert(seed, 1.0);
         for _ in 0..self.iterations {
@@ -414,7 +412,7 @@ impl GraphWalkEmbedding {
         self.ensure_vectors();
         let vectors = self.vectors.read();
         match vectors.get(seed) {
-            // 命中缓存向量时只克隆最终保留的 k 个分量
+            // 克隆最终保留的 k 个分量
             Some(vector) => vector
                 .iter()
                 .filter(|(entity, _)| entity != seed)
@@ -593,7 +591,7 @@ impl GraphWalkEmbedding {
             if neighbor == target {
                 let step_score = score / list.len() as f64;
                 path.push((predicate.clone(), neighbor.clone()));
-                // 仅在需要更新最优路径时才克隆整条路径
+                // 需要更新最优路径时克隆整条路径
                 let replace = match best {
                     None => true,
                     Some((best_score, best_path)) => {

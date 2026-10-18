@@ -430,7 +430,7 @@ impl OwlNarrator {
         }
     }
 
-    /// 记录“名称-类型”二元组；返回是否为首次出现（借用查找，重复项零分配）
+    /// 记录“名称-类型”二元组；返回是否为首次出现
     fn mark_entity_seen(&mut self, name: &str, entity_type: &str) -> bool {
         match self.seen_entities.get_mut(name) {
             Some(types) => {
@@ -746,7 +746,7 @@ impl DiscoursePlanner {
         if !self.known_entities.contains(object) {
             self.known_entities.insert(object.to_string());
         }
-        // 借用查找优先：重放快照时重复三元组不产生堆分配
+        // 借用查找优先：重放快照时重复三元组直接跳过
         let already_seen = self
             .seen_triples
             .get(subject)

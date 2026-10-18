@@ -352,8 +352,7 @@ impl Compiled {
                 probability: 1.0,
             }];
         }
-        // 概率事实本身是一条证明；同一原子还可能有规则支持，继续向下收集避免
-        // 证明概率与精确 WMC 概率不一致（例如事实 0.3、规则合并后 0.93）
+        // 概率事实本身是一条证明；同一原子还可能有规则支持，继续向下收集
         let mut results: Vec<ProblogProof> = Vec::new();
         if let Some(&probability) = self.probabilistic_facts.get(atom) {
             *budget -= 1;

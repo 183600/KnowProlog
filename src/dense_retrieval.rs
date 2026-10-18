@@ -169,7 +169,7 @@ impl DenseRetriever {
         }
     }
 
-    /// 惰性重建倒排索引（只有新事实时才需要重算）
+    /// 惰性重建倒排索引
     fn rebuild(&mut self) {
         if self.built && !self.dirty {
             return;
@@ -287,7 +287,7 @@ impl DenseRetriever {
                 let neighbors = match self.adjacency.get(node) {
                     Some(map) if !map.is_empty() => map,
                     _ => {
-                        // 悬挂节点：质量留在原地，避免概率流失
+                        // 悬挂节点：质量留在原地
                         *next.entry(node.clone()).or_insert(0.0) += self.damping * mass;
                         continue;
                     }
@@ -465,7 +465,7 @@ impl DenseRetriever {
     }
 }
 
-/// 分词并构造索引词项：结巴切词 + 中文二元组（提升词面召回）
+/// 分词并构造索引词项：结巴切词 + 中文二元组
 pub fn tokenize(text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {

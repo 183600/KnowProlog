@@ -2147,7 +2147,7 @@ impl SemanticMemory {
         }
     }
 
-    /// 记录一条逻辑形式（未知形式不进入记忆，避免污染指代）
+    /// 记录一条逻辑形式（未知形式不进入记忆）
     pub fn record(&mut self, lf: &LogicalForm) {
         if !lf.is_known() {
             return;

@@ -434,7 +434,7 @@ impl OntologyReasoner {
                 "直接声明".to_string(),
             );
         }
-        // 超类/上位属性/定义域/值域只依赖固定的 TBox 闭包，跨轮次不变：整次物化内缓存
+        // 超类/上位属性/定义域/值域来自固定的 TBox 闭包：整次物化内缓存
         let mut supers_cache_props: HashMap<String, Vec<String>> = HashMap::new();
         let mut supers_cache_classes: HashMap<String, Vec<String>> = HashMap::new();
         let mut domain_cache: HashMap<String, Vec<String>> = HashMap::new();
@@ -514,7 +514,6 @@ impl OntologyReasoner {
             // 4. 类固有属性被实例继承（类自身保留一份，便于类级查询）
             let class_properties: Vec<(String, String, String)> =
                 self.class_properties.iter().cloned().collect();
-            // 本轮内实例集合不再变化，每个类的成员只计算一次
             let mut round_members: HashMap<String, Vec<String>> = HashMap::new();
             for (class, predicate, object) in class_properties {
                 derive_relation(
@@ -544,7 +543,7 @@ impl OntologyReasoner {
                     );
                 }
             }
-            // 5. 传递关系闭包：按中间节点分组做邻接交叉，避免全对全比较
+            // 5. 传递关系闭包：按中间节点分组做邻接交叉
             for property in &self.transitive {
                 let pairs: Vec<(String, String)> = closure
                     .relations
@@ -928,8 +927,7 @@ fn split_shi(text: &str) -> Option<(String, String)> {
     }
 }
 
-/// 断言标记词前是否紧邻否定词（如「不互斥」「不可以传递」「不具有对称性」），
-/// 避免把否定句解析成吞掉否定词的知识
+/// 断言标记词前是否紧邻否定词（如「不互斥」「不可以传递」「不具有对称性」）
 fn assertion_negated(text: &str, position: usize) -> bool {
     let prefix = text[..position].trim_end();
     if prefix.ends_with('不')

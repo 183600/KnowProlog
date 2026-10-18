@@ -495,7 +495,7 @@ pub struct SymbolicReasoner {
     last_abduction_vars: Vec<String>,
     // 谓词清单缓存：仅在 observe_facts 后重建（按对齐器剖面与预测规则生成，顺序敏感）
     known_predicates_cache: Vec<String>,
-    // 与 known_predicates_cache 同序的（原形, 归一化形）缓存，避免每轮查询重复归一化
+    // 与 known_predicates_cache 同序的（原形, 归一化形）缓存
     known_predicates_normalized_cache: Vec<(String, String)>,
     // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
     proposition_surfaces: Vec<(String, String)>,
@@ -504,7 +504,7 @@ pub struct SymbolicReasoner {
     link_memo: parking_lot::Mutex<Option<(String, Arc<Vec<LinkedMention>>)>>,
     // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
     entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
-    // 同义词命中的规范谓词集合记忆（同一文本一轮内多处查询，同义词表全量扫描只做一次）
+    // 同义词命中的规范谓词集合记忆
     predicate_canonicals_memo: parking_lot::Mutex<Option<(String, Arc<HashSet<String>>)>>,
     // 符号主义话语引擎：OWL 本体叙述（定义/继承/推导链）+ DCG 文法实现（多句式生成）
     discourse: DiscoursePlanner,
@@ -738,8 +738,7 @@ impl SymbolicReasoner {
             self.rebuild_soft_logic();
         }
         // 图游走向量采用惰性重建：新边在 observe_triple 内标记失效，
-        // 首次需要嵌入时才做全量幂迭代（连续导入期间避免逐行重算，
-        // 查询结果与即时重建完全一致）
+        // 首次需要嵌入时才做全量幂迭代（查询结果与即时重建完全一致）
         // 实体事实同样会更新嵌入（observe_entity），因此也需要重建
         if self.config.enable_semantic_embedding && (added > 0 || entity_observed) {
             self.embedding.rebuild();
@@ -931,7 +930,7 @@ impl SymbolicReasoner {
     }
 
     pub fn entities_mentioned(&self, text: &str) -> Vec<String> {
-        // 同一文本在一轮对话中会被多次询问（上下文记录/链接/回答），做单条记忆复用；
+        // 同一文本会在一轮对话中被多次询问，做单条记忆复用；
         // 实体剖面或同义词表只在 observe_facts 中变化，届时整体失效
         if let Some((cached_text, found)) = self.entity_mentions_memo.lock().as_ref() {
             if cached_text == text {
@@ -979,8 +978,7 @@ impl SymbolicReasoner {
             .collect()
     }
 
-    /// 预计算文本中出现的同义词对应的规范谓词集合（同义词表可能远大于谓词表）
-    /// 同一文本一轮内多处查询（词表记录/链接线索/回答）复用记忆，避免重复全量扫描
+    /// 收集文本中出现的同义词对应的规范谓词集合
     fn mentioned_predicate_canonicals(&self, text: &str) -> Arc<HashSet<String>> {
         if let Some((cached_text, canonicals)) = self.predicate_canonicals_memo.lock().as_ref() {
             if cached_text == text {
@@ -1017,7 +1015,7 @@ impl SymbolicReasoner {
             })
     }
 
-    /// 在预计算集合的辅助下判断谓词是否被文本提及（等价于 predicate_mentioned_normalized）
+    /// 判断谓词是否被文本提及（等价于 predicate_mentioned_normalized）
     fn predicate_mentioned_normalized_with(
         &self,
         normalized_text: &str,
@@ -2390,7 +2388,6 @@ impl SymbolicReasoner {
             output.push_str("  （没有可推导的新事实：可增加事实/规则或放宽规则阈值）\n");
             return output;
         }
-        // 预计算展示文本
         let mut items: Vec<(&DerivedFact, String)> = derived
             .iter()
             .map(|item| (item, item.atom.display()))
@@ -2585,7 +2582,6 @@ impl SymbolicReasoner {
         let expectations = Self::expected_type_keywords(question);
         let mut ordered: Vec<&ValueHit> = last_hits.iter().collect();
         if !expectations.is_empty() {
-            // 缓存判定结果
             ordered.sort_by_cached_key(|hit| {
                 if self.value_matches_expectation(&hit.value, &expectations) {
                     0usize
@@ -3882,7 +3878,7 @@ impl SymbolicReasoner {
             ));
         }
         self.lessons.push(sentence.to_string());
-        // 与上面 apply_lesson 的重放保持一致：缓存本次解析结果
+        // 与上面 apply_lesson 的重放保持一致
         self.lessons_parsed.extend(outcome.lessons.iter().cloned());
         output.push_str(&format!(
             "  概率程序现有 {} 条确定事实、{} 条概率事实、{} 条概率规则；用「概率推理：实体」做可能世界精确查询，用「对话记忆」查看教学记忆。",
@@ -4535,7 +4531,7 @@ impl SymbolicReasoner {
         // 教学记忆：恢复中文概率知识原句并在概率程序中重放（不写知识图谱）
         if !snapshot.lessons.is_empty() {
             self.lessons = snapshot.lessons.clone();
-            // 恢复原句时一次性重建解析缓存
+            // 恢复原句时重建解析缓存
             self.lessons_parsed = self
                 .lessons
                 .iter()
