@@ -1157,8 +1157,8 @@ impl SymbolicReasoner {
 
     /// 与 `contextualize` 相同，但附带来源收据（哪个洞由哪一轮的哪个槽补上）。
     ///
-    /// 处理顺序：代词消解 → 话语帧合一（前置尝试，命中才接管）→ 旧省略规则
-    /// → 代词改写。帧通道不合法的合一逐字回退，保证零劣化。
+    /// 处理顺序：代词消解 → 话语帧合一（前置尝试，命中才接管）→ 省略规则
+    /// → 代词改写。帧通道不合法的合一逐字回退。
     pub fn contextualize_with_receipt(&mut self, input: &str) -> Option<ContextRewrite> {
         self.frames.begin_turn();
         let pronoun_resolved = self.context.resolve_pronouns(input);
@@ -5547,7 +5547,7 @@ mod tests {
         reasoner.contextualize("张三的师傅是谁");
         let rewritten = reasoner
             .contextualize("某某某呢")
-            .expect("未知实体仍应走旧省略规则");
+            .expect("未知实体仍应走省略规则");
         assert_eq!(rewritten, "某某某的师傅是什么");
     }
 

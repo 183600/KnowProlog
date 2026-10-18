@@ -1,8 +1,7 @@
 // 话语帧（Dialogue Frame）——把一句话解析成带洞（hole）的查询帧，
 // 洞的排序（sort）由本体给定，洞的填充由合一（unification）完成。
 //
-// 与字符规则的区别：省略/指代/追问/话题回指不再是字符串替换，而是
-// 「同槽位、排序相容、最近优先」的帧间合一：
+// 省略/指代/追问/话题回指处理为「同槽位、排序相容、最近优先」的帧间合一：
 //
 //   上一完整帧：问属性(姚明, 身高)
 //   本轮片段：  问属性(□,    体重)
@@ -10,7 +9,7 @@
 //
 // 复合问句（姚明的身高和体重是多少）解析为多个帧：第一帧照答，其余进入
 // 「挂账」（pending）等待后续输入补全；挂账有容量与轮数上限，且只在
-// 追问命中时消费（无半消费），不合法的合一逐字回退旧管线（零劣化）。
+// 追问命中时消费（无半消费），不合法的合一逐字回退既有管线。
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +17,7 @@ use crate::resolution_engine::{unify_atoms, Atom, Substitution, Term};
 
 /// 帧原子谓词：问属性(实体槽, 属性槽)
 const ASK_ATTRIBUTE: &str = "问属性";
-/// 追问核心的最大字数（超限不接管，回退旧管线）
+/// 追问核心的最大字数（超限不接管，回退既有管线）
 const FOLLOWUP_MAX_CORE_CHARS: usize = 16;
 const DEFAULT_MAX_PENDING: usize = 4;
 const DEFAULT_PENDING_TTL: u64 = 6;
@@ -321,7 +320,7 @@ impl FrameMemory {
     }
 
     /// 追问补全计划：属性明确时优先补全同名属性的挂账（用户正在补它），
-    /// 其余洞由上一完整帧同槽位补入；仍不完整返回 None（调用方回退旧管线）。
+    /// 其余洞由上一完整帧同槽位补入；仍不完整返回 None（调用方回退既有管线）。
     pub fn plan_followup(&self, current: &AskAttributeFrame) -> Option<FollowUpPlan> {
         if current.entity.is_none() && current.attribute.is_none() {
             return None;
