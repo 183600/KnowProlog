@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::chinese_reasoning_nlu::{parse_lessons, LessonKind};
+use crate::chronicle::{Chronicle, FsyncPolicy};
 use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueReply, MoveKind};
 use crate::prolog_engine::PrologFact;
 use crate::symbolic_generator::SymbolicGenerator;
@@ -449,6 +450,69 @@ fn c8_deterministic_and_idempotent_replay() {
     assert_eq!(out_a, out_b, "同一 transcript 两次回放应完全一致");
     assert_eq!(first.snapshot(), second.snapshot());
     assert_eq!(first.summary(), second.summary());
+}
+
+/// C10 编年史持久性：transcript 逐轮落盘为哈希链档案，
+/// 重启后可校验、可续写、可检索；同 transcript 两份档案逐字节一致。
+/// 这是「真相源」语义：快照只是检查点，档案才是对话本身。
+#[test]
+fn c10_chronicle_transcript_is_durable_and_deterministic() {
+    fn run_into(path: &str, inputs: &[&str], kb: &ScriptedKnowledge) -> Vec<String> {
+        let mut manager = DialogueManager::new();
+        let (mut chronicle, audit) = Chronicle::open(path, FsyncPolicy::EachAppend).unwrap();
+        assert!(audit.is_clean());
+        let mut outputs = Vec::new();
+        for input in inputs {
+            // 写前日志：输入先落盘（含当轮开始时的焦点），再处理
+            chronicle
+                .append_turn(input, "turn", manager.focus_entity(), manager.turn_count())
+                .unwrap();
+            let reply = ask(&mut manager, kb, input);
+            chronicle
+                .append_reply(&reply.text, &reply.plan, &[])
+                .unwrap();
+            outputs.push(format!("[{}] {}", reply.plan.join("+"), reply.text));
+        }
+        outputs
+    }
+
+    let kb = scripted();
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+    let path_a = dir_a.path().join("a.jsonl").to_string_lossy().to_string();
+    let path_b = dir_b.path().join("b.jsonl").to_string_lossy().to_string();
+    let out_a = run_into(&path_a, &TRANSCRIPT, &kb);
+    let out_b = run_into(&path_b, &TRANSCRIPT, &kb);
+    assert_eq!(out_a, out_b, "回放输出应确定");
+    assert_eq!(
+        std::fs::read(&path_a).unwrap(),
+        std::fs::read(&path_b).unwrap(),
+        "同 transcript 的两份档案必须逐字节一致（seq 是语义时戳）"
+    );
+
+    // 重启：重新打开后链完整、seq 连续，可继续追加
+    let (mut reopened, audit) = Chronicle::open(&path_a, FsyncPolicy::EachAppend).unwrap();
+    assert!(audit.is_clean(), "{}", audit.verdict());
+    assert_eq!(reopened.len(), TRANSCRIPT.len() * 2);
+    let focus_at_split = reopened
+        .entries()
+        .iter()
+        .find(|entry| entry.kind == "turn" && entry.seq == 5)
+        .and_then(|entry| entry.payload.get("focus"))
+        .and_then(|focus| focus.as_str())
+        .map(str::to_string);
+    assert_eq!(
+        focus_at_split.as_deref(),
+        Some("姚明"),
+        "写前日志记录的是当轮开始时的焦点（第 5 轮时话题仍在姚明）"
+    );
+    reopened
+        .append_turn("继续", "turn", Some("姚明"), 6)
+        .unwrap();
+    let (reloaded, audit) = Chronicle::open(&path_a, FsyncPolicy::None).unwrap();
+    assert!(audit.is_clean());
+    assert_eq!(reloaded.last_seq(), (TRANSCRIPT.len() * 2 + 1) as u64);
+    assert!(!reloaded.search("姚明").is_empty(), "历史轮次应可检索");
 }
 
 /// C9 谓词归一：换说法/换方向不换事实。

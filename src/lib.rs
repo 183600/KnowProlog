@@ -54,6 +54,8 @@ pub mod perf_ledger;
 pub mod context_image;
 pub mod import_journal;
 pub mod grammar_extractor;
+pub mod chronicle;
+pub mod view_render;
 
 #[cfg(test)]
 mod dialogue_conformance;

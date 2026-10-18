@@ -34,6 +34,7 @@ use crate::semantic_entailment::{
     self, EntailmentResult, Knowledge, PropositionParser, Verdict,
 };
 use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
+use crate::view_render::ProofViewNode;
 use crate::ReasoningConfig;
 
 // 归结引擎内部谓词：has(E, 谓词名) / type(E, 类型名)，用于承载关联规则的物品
@@ -465,6 +466,25 @@ struct ChainPredicate {
     surface: String,
     slot: String,
     inverted: bool,
+}
+
+/// 结构化证明视图：可视化（Mermaid/ASCII）消费的纯数据，不重复解析逻辑。
+#[derive(Debug, Clone)]
+pub struct ResolutionProofView {
+    pub phrase: String,
+    pub goal_display: String,
+    pub facts: usize,
+    pub clauses: usize,
+    pub max_depth: usize,
+    pub solutions: Vec<ProofSolutionView>,
+}
+
+/// 一个归结解：变量绑定 + 置信度 + 各目标的证明树。
+#[derive(Debug, Clone)]
+pub struct ProofSolutionView {
+    pub bindings: Vec<(String, String)>,
+    pub confidence: f64,
+    pub proofs: Vec<ProofViewNode>,
 }
 
 pub struct SymbolicReasoner {
@@ -2337,6 +2357,150 @@ impl SymbolicReasoner {
         }
     }
 
+    /// 结构化证明视图：与报告共用同一套解析/求解路径，供可视化消费。
+    /// 不变量：每棵树的节点集 ≡ `Solution.proofs` 展平集合（不增不减）。
+    fn build_resolution_view(&self, phrase: String, goals: Vec<Atom>) -> ResolutionProofView {
+        // 目标中出现的变量即查询变量（按首现顺序，确定）：绑定表随视图返回
+        let mut query_vars: Vec<String> = Vec::new();
+        for goal in &goals {
+            for term in &goal.terms {
+                if term.is_var() {
+                    let name = term.name().to_string();
+                    if !query_vars.contains(&name) {
+                        query_vars.push(name);
+                    }
+                }
+            }
+        }
+        let solutions = self.resolver.solve(&goals, &query_vars);
+        let goal_display = goals
+            .iter()
+            .map(|goal| goal.display())
+            .collect::<Vec<_>>()
+            .join("，");
+        let solutions = solutions
+            .iter()
+            .map(|solution| {
+                let mut bindings: Vec<(String, String)> = solution
+                    .bindings
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect();
+                bindings.sort();
+                ProofSolutionView {
+                    bindings,
+                    confidence: solution.confidence,
+                    proofs: solution
+                        .proofs
+                        .iter()
+                        .map(|proof| ProofViewNode::from_proof_with(proof, |node| self.render_atom_nl(&node.atom)))
+                        .collect(),
+                }
+            })
+            .collect();
+        ResolutionProofView {
+            phrase,
+            goal_display,
+            facts: self.resolver.fact_count(),
+            clauses: self.resolver.clause_count(),
+            max_depth: self.resolver.max_depth(),
+            solutions,
+        }
+    }
+
+    /// 陈述句目标（"S有P" / "S的P…是O" / "S是类型"）→ (短语, 目标原子)。
+    fn statement_goals(&self, text: &str) -> Option<(String, Vec<Atom>)> {
+        if let Some(goals) = self.existence_goals(text) {
+            return Some(goals);
+        }
+        let trimmed = text.trim().trim_end_matches(['。', '！', '!']).trim();
+        let (entity, predicates, object) = self.parse_chain_statement(trimmed)?;
+        let surfaces: Vec<&str> = predicates.iter().map(|p| p.surface.as_str()).collect();
+        let (goals, phrase) = if predicates.is_empty() {
+            (
+                vec![Atom::rel(PROOF_TYPE, &entity, &object)],
+                format!("{} 属于类型 {}", entity, object),
+            )
+        } else if predicates.len() == 1 {
+            let predicate = &predicates[0];
+            // 逆向谓词的陈述按槽位反方向编码（slot(object, entity)）
+            let atom = if predicate.inverted {
+                Atom::rel(&predicate.slot, &object, &entity)
+            } else {
+                Atom::rel(&predicate.slot, &entity, &object)
+            };
+            (
+                vec![atom],
+                format!("{}的{}是{}", entity, predicate.surface, object),
+            )
+        } else {
+            let mut goals = Vec::new();
+            let mut previous = Term::constant(&entity);
+            for (index, predicate) in predicates.iter().enumerate() {
+                let next = if index + 1 == predicates.len() {
+                    Term::constant(&object)
+                } else {
+                    Term::var(&format!("V{}", index + 1))
+                };
+                let atom = if predicate.inverted {
+                    Atom::pattern(&predicate.slot, next.clone(), previous.clone())
+                } else {
+                    Atom::pattern(&predicate.slot, previous.clone(), next.clone())
+                };
+                goals.push(atom);
+                previous = next;
+            }
+            (goals, format!("{}的{}是{}", entity, surfaces.join("的"), object))
+        };
+        Some((phrase, goals))
+    }
+
+    /// "X有P" 形式的存在性目标（由关联规则/前向推导证明）。
+    fn existence_goals(&self, text: &str) -> Option<(String, Vec<Atom>)> {
+        let (subject_part, object_part) = text.split_once('有')?;
+        let subject_part = subject_part.trim();
+        let object_part = object_part.trim();
+        if subject_part.is_empty() || object_part.is_empty() {
+            return None;
+        }
+        if subject_part.contains('的') || object_part.contains('的') {
+            return None;
+        }
+        let entity = self.resolve_known_entity(subject_part)?;
+        let predicate = self.aligner.canonical_form(object_part);
+        if predicate.is_empty() {
+            return None;
+        }
+        let goals = vec![Atom::rel(PROOF_HAS, &entity, &predicate)];
+        Some((format!("{} 具有 {}", entity, predicate), goals))
+    }
+
+    /// 开放问句的谓词链目标构造（"X的P…是谁"），答案变量固定为「答案」。
+    fn build_question_goals(
+        &self,
+        entity: &str,
+        predicates: &[ChainPredicate],
+        answer_var: &str,
+    ) -> Vec<Atom> {
+        let mut goals = Vec::new();
+        let mut previous = Term::constant(entity);
+        for (index, predicate) in predicates.iter().enumerate() {
+            let next = if index + 1 == predicates.len() {
+                Term::var(answer_var)
+            } else {
+                Term::var(&format!("V{}", index + 1))
+            };
+            let atom = if predicate.inverted {
+                Atom::pattern(&predicate.slot, next.clone(), previous.clone())
+            } else {
+                Atom::pattern(&predicate.slot, previous.clone(), next.clone())
+            };
+            goals.push(atom);
+            previous = next;
+        }
+        goals
+    }
+
     fn render_resolution_result(&self, phrase: &str, goals: &[Atom]) -> String {
         let solutions = self.resolver.solve(goals, &[]);
         let goal_display = goals
@@ -2369,26 +2533,6 @@ impl SymbolicReasoner {
         output
     }
 
-    // "X有P" 形式的存在性目标：由关联规则/前向推导证明
-    fn prove_existence_statement(&self, text: &str) -> Option<String> {
-        let (subject_part, object_part) = text.split_once('有')?;
-        let subject_part = subject_part.trim();
-        let object_part = object_part.trim();
-        if subject_part.is_empty() || object_part.is_empty() {
-            return None;
-        }
-        if subject_part.contains('的') || object_part.contains('的') {
-            return None;
-        }
-        let entity = self.resolve_known_entity(subject_part)?;
-        let predicate = self.aligner.canonical_form(object_part);
-        if predicate.is_empty() {
-            return None;
-        }
-        let goals = vec![Atom::rel(PROOF_HAS, &entity, &predicate)];
-        Some(self.render_resolution_result(&format!("{} 具有 {}", entity, predicate), &goals))
-    }
-
     /// 证明一条陈述（"S的P…是O" / "S是类型" / "S有P"），输出回归结证明树
     pub fn resolution_proof_report(&self, text: &str) -> String {
         if !self.config.enable_resolution {
@@ -2398,58 +2542,70 @@ impl SymbolicReasoner {
         if trimmed.is_empty() {
             return "请提供要证明的陈述，例如：证明：张三的师祖是王五 或 证明：姚明有国籍".to_string();
         }
-        if let Some(report) = self.prove_existence_statement(trimmed) {
-            return report;
-        }
-        match self.parse_chain_statement(trimmed) {
-            Some((entity, predicates, object)) => {
-                let surfaces: Vec<&str> = predicates.iter().map(|p| p.surface.as_str()).collect();
-                let (goals, phrase) = if predicates.is_empty() {
-                    (
-                        vec![Atom::rel(PROOF_TYPE, &entity, &object)],
-                        format!("{} 属于类型 {}", entity, object),
-                    )
-                } else if predicates.len() == 1 {
-                    let predicate = &predicates[0];
-                    // 逆向谓词的陈述按槽位反方向编码（slot(object, entity)）
-                    let atom = if predicate.inverted {
-                        Atom::rel(&predicate.slot, &object, &entity)
-                    } else {
-                        Atom::rel(&predicate.slot, &entity, &object)
-                    };
-                    (
-                        vec![atom],
-                        format!("{}的{}是{}", entity, predicate.surface, object),
-                    )
-                } else {
-                    let mut goals = Vec::new();
-                    let mut previous = Term::constant(&entity);
-                    for (index, predicate) in predicates.iter().enumerate() {
-                        let next = if index + 1 == predicates.len() {
-                            Term::constant(&object)
-                        } else {
-                            Term::var(&format!("V{}", index + 1))
-                        };
-                        let atom = if predicate.inverted {
-                            Atom::pattern(&predicate.slot, next.clone(), previous.clone())
-                        } else {
-                            Atom::pattern(&predicate.slot, previous.clone(), next.clone())
-                        };
-                        goals.push(atom);
-                        previous = next;
-                    }
-                    (
-                        goals,
-                        format!("{}的{}是{}", entity, surfaces.join("的"), object),
-                    )
-                };
-                self.render_resolution_result(&phrase, &goals)
-            }
+        match self.statement_goals(trimmed) {
+            Some((phrase, goals)) => self.render_resolution_result(&phrase, &goals),
             None => format!(
                 "无法把「{}」解析为可归结的目标。支持句式：S的P…是O / S是类型 / S有P。",
                 trimmed
             ),
         }
+    }
+
+    /// 结构化证明视图：陈述句（"证明"）与开放问句（"推理链"）统一入口。
+    /// 返回 None 表示无法形式化为归结目标或归结未启用。
+    pub fn resolution_proof_view(&self, text: &str) -> Option<ResolutionProofView> {
+        if !self.config.enable_resolution {
+            return None;
+        }
+        let trimmed = text.trim().trim_end_matches(['？', '?', '。', '！', '!', ' ']);
+        if trimmed.is_empty() {
+            return None;
+        }
+        // 开放问句优先：剥离问句后缀（"…是谁/是什么/…"）后按谓词链处理。
+        // 否则 "张三的师傅的师傅是谁" 会被误判为陈述，把「谁」当常量求证。
+        let mut core = trimmed.to_string();
+        let mut stripped = false;
+        for suffix in [
+            "是谁", "是什么", "是多少", "是哪里", "是哪个", "是哪儿", "是哪位", "是哪些", "是几",
+        ] {
+            if let Some(rest) = core.strip_suffix(suffix) {
+                core = rest.to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if stripped && !core.contains('是') {
+            if let Some(view) = self.build_question_view(&core) {
+                return Some(view);
+            }
+        }
+        if let Some((phrase, goals)) = self.statement_goals(trimmed) {
+            return Some(self.build_resolution_view(phrase, goals));
+        }
+        if !core.contains('是') {
+            if let Some(view) = self.build_question_view(&core) {
+                return Some(view);
+            }
+        }
+        None
+    }
+
+    fn build_question_view(&self, core: &str) -> Option<ResolutionProofView> {
+        let segments: Vec<String> = core
+            .split('的')
+            .map(|segment| segment.trim().to_string())
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let (entity, predicates) = self.split_chain(&segments)?;
+        if predicates.is_empty() {
+            return None;
+        }
+        let surfaces: Vec<String> = predicates.iter().map(|p| p.surface.clone()).collect();
+        let goals = self.build_question_goals(&entity, &predicates, "答案");
+        Some(self.build_resolution_view(
+            format!("{}的{}是谁", entity, surfaces.join("的")),
+            goals,
+        ))
     }
 
     /// 开放目标（"X的P…是谁"）：返回全部归结解与各解的证明链
@@ -2489,22 +2645,7 @@ impl SymbolicReasoner {
             );
         }
         let answer_var = "答案".to_string();
-        let mut goals = Vec::new();
-        let mut previous = Term::constant(&entity);
-        for (index, predicate) in predicates.iter().enumerate() {
-            let next = if index + 1 == predicates.len() {
-                Term::var(&answer_var)
-            } else {
-                Term::var(&format!("V{}", index + 1))
-            };
-            let atom = if predicate.inverted {
-                Atom::pattern(&predicate.slot, next.clone(), previous.clone())
-            } else {
-                Atom::pattern(&predicate.slot, previous.clone(), next.clone())
-            };
-            goals.push(atom);
-            previous = next;
-        }
+        let goals = self.build_question_goals(&entity, &predicates, &answer_var);
         let solutions = self.resolver.solve(&goals, std::slice::from_ref(&answer_var));
         let goal_display = goals
             .iter()
@@ -5648,6 +5789,54 @@ mod tests {
         assert!(report.contains("答案是「王五」"), "实际：{}", report);
         assert!(report.contains("事实"));
         assert!(report.contains("知识库"));
+    }
+
+    #[test]
+    fn test_resolution_proof_view_is_structured_and_complete() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        // 陈述句：与报告同路径求解，结构可视图化
+        let statement = reasoner
+            .resolution_proof_view("张三的师傅的师傅是王五")
+            .expect("陈述句应可视图化");
+        assert!(statement.phrase.contains("王五"), "{}", statement.phrase);
+        assert_eq!(statement.solutions.len(), 1);
+        let nodes = crate::view_render::proof_forest_node_count(&statement.solutions[0].proofs);
+        assert!(nodes >= 2, "链式证明至少覆盖两个事实：{}", nodes);
+        let mermaid = crate::view_render::render_proof_mermaid(&statement.solutions[0].proofs);
+        let rendered_nodes = mermaid
+            .lines()
+            .filter(|line| line.contains('[') && line.trim_start().starts_with('n'))
+            .count();
+        assert_eq!(
+            rendered_nodes, nodes,
+            "渲染节点集必须等于展平集合（不增不减）"
+        );
+        assert_eq!(mermaid, crate::view_render::render_proof_mermaid(&statement.solutions[0].proofs));
+
+        // 开放问句：绑定含答案变量
+        let question = reasoner
+            .resolution_proof_view("张三的师傅的师傅是谁")
+            .expect("开放问句应可视图化");
+        let solution = &question.solutions[0];
+        assert!(
+            solution
+                .bindings
+                .iter()
+                .any(|(name, value)| name == "答案" && value == "王五"),
+            "{:?}",
+            solution.bindings
+        );
+
+        // 未得证：结构仍在，解为空（开世界假设）
+        let unknown = reasoner
+            .resolution_proof_view("张三的师傅的师傅是赵六")
+            .expect("可解析但未得证");
+        assert!(unknown.solutions.is_empty());
+
+        // 不可形式化：None，而不是伪造空证明
+        assert!(reasoner.resolution_proof_view("@@@").is_none());
     }
 
     #[test]
