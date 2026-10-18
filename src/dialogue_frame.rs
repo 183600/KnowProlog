@@ -10,6 +10,11 @@
 // 复合问句（姚明的身高和体重是多少）解析为多个帧：第一帧照答，其余进入
 // 「挂账」（pending）等待后续输入补全；挂账有容量与轮数上限，且只在
 // 追问命中时消费（无半消费），不合法的合一逐字回退既有管线。
+//
+// 无源可填的洞还有第 4 种合法结局：澄清（clarification）——不猜，把
+// 变量显式还给用户。用户短答（序号/实体名/都不是）被确定性解析为一次
+// 绑定（σ 扩展），随后原问句被实例化并重放。绑定带出处（候选表 + 轮次），
+// 因此「系统为什么把『体重是多少』当成姚明」逐字可断言。
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +26,7 @@ const ASK_ATTRIBUTE: &str = "问属性";
 const FOLLOWUP_MAX_CORE_CHARS: usize = 16;
 const DEFAULT_MAX_PENDING: usize = 4;
 const DEFAULT_PENDING_TTL: u64 = 6;
+const DEFAULT_CLARIFICATION_TTL: u64 = 3;
 
 fn default_max_pending() -> usize {
     DEFAULT_MAX_PENDING
@@ -28,6 +34,10 @@ fn default_max_pending() -> usize {
 
 fn default_pending_ttl() -> u64 {
     DEFAULT_PENDING_TTL
+}
+
+fn default_clarification_ttl() -> u64 {
+    DEFAULT_CLARIFICATION_TTL
 }
 
 /// 本体视图：洞的合法性 = 成员检查（排序判定），不做模糊猜测。
@@ -44,6 +54,8 @@ pub enum SlotOrigin {
     Explicit,
     Inherited { turn: u64 },
     FromPending { turn: u64 },
+    /// 无源可填的洞由用户回答澄清问题后绑定（第几轮发起的澄清）
+    Clarified { turn: u64 },
 }
 
 impl Default for SlotOrigin {
@@ -58,6 +70,7 @@ impl SlotOrigin {
             SlotOrigin::Explicit => "本轮".to_string(),
             SlotOrigin::Inherited { turn } => format!("第 {} 轮的完整帧", turn),
             SlotOrigin::FromPending { turn } => format!("第 {} 轮的挂账", turn),
+            SlotOrigin::Clarified { turn } => format!("第 {} 轮的澄清", turn),
         }
     }
 }
@@ -206,6 +219,123 @@ pub fn unify_frames(
     })
 }
 
+/// 澄清请求：一个无源可填的实体洞 + 确定性候选 + 原问句。
+///
+/// 这是变量求解的第四种合法结局：不猜（回退失败）、不静默择一，而是把
+/// 自由变量显式还给用户，请用户做一次绑定；绑定后原问句被实例化并重放。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClarificationRequest {
+    /// 原问句（带洞帧的原始表述）
+    pub raw: String,
+    /// 洞所在问句的属性槽（已归一）
+    pub attribute: String,
+    /// 候选绑定（构造方保证确定性排序：焦点优先，其余按名称）
+    pub candidates: Vec<String>,
+    /// 发起轮次
+    pub turn: u64,
+}
+
+impl ClarificationRequest {
+    /// 澄清提示：候选编号列表 + 三种合法回答（序号 / 实体名 / 都不是）
+    pub fn prompt(&self) -> String {
+        let mut output = format!(
+            "「{}」还缺一个实体。你想问谁的「{}」？\n",
+            self.raw.trim(),
+            self.attribute
+        );
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            output.push_str(&format!("  {}. {}\n", index + 1, candidate));
+        }
+        output.push_str("回复序号或实体名完成绑定；「都不是」放弃这次追问。");
+        output
+    }
+
+    /// 确定性短答解析：序号（阿拉伯/中文数字）→ 候选名 → 都不是。
+    /// 解析不了的回答一律 Unmatched（调用方放行给常规管线，零状态变化）。
+    pub fn parse_reply(&self, text: &str) -> ClarificationReply {
+        let reply = text.trim().trim_end_matches(|c: char| {
+            matches!(c, '。' | '！' | '!' | '？' | '?' | ' ' | '～' | '~')
+        });
+        if reply.is_empty() {
+            return ClarificationReply::Unmatched;
+        }
+        const CANCEL: [&str; 9] = [
+            "都不是", "算了", "取消", "不用了", "不查了", "不问了", "结束澄清", "停止澄清",
+            "退出澄清",
+        ];
+        if CANCEL.contains(&reply) {
+            return ClarificationReply::Cancel;
+        }
+        if let Some(choice) = parse_choice_index(reply) {
+            if choice >= 1 {
+                if let Some(candidate) = self.candidates.get(choice - 1) {
+                    return ClarificationReply::Candidate(candidate.clone());
+                }
+            }
+            return ClarificationReply::OutOfRange;
+        }
+        if let Some(candidate) = self
+            .candidates
+            .iter()
+            .find(|candidate| candidate.as_str() == reply)
+        {
+            return ClarificationReply::Candidate(candidate.clone());
+        }
+        ClarificationReply::Unmatched
+    }
+}
+
+/// 澄清短答的确定性分类（解析规则之外的一切回答都放行）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClarificationReply {
+    /// 绑定到某候选
+    Candidate(String),
+    /// 纯数字/中文数字但越界：重问（零状态变化）
+    OutOfRange,
+    /// 放弃本次追问
+    Cancel,
+    /// 不是对澄清的回答
+    Unmatched,
+}
+
+/// 澄清应答结果（供对话层直接消费；重放问句由调用方交给既有问答管线）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClarificationOutcome {
+    /// 绑定成功：question 为实例化后的原问句，note 为出处收据
+    Bound { question: String, note: String },
+    /// 用户放弃本次追问（洞随之撤销，其余状态不变）
+    Cancelled { note: String },
+    /// 序号越界：重问（零状态变化）
+    Reprompt { prompt: String },
+}
+
+/// 一基序号解析：支持「1 / 1. / 第2 / 三个 / 二」等确定性写法
+fn parse_choice_index(text: &str) -> Option<usize> {
+    let spec = text
+        .trim()
+        .trim_start_matches('第')
+        .trim_end_matches(|c: char| matches!(c, '.' | '。' | '、' | '个' | ')' | '）' | ' '));
+    if spec.is_empty() {
+        return None;
+    }
+    if spec.chars().all(|c| c.is_ascii_digit()) {
+        return spec.parse().ok();
+    }
+    match spec {
+        "一" => Some(1),
+        "二" => Some(2),
+        "三" => Some(3),
+        "四" => Some(4),
+        "五" => Some(5),
+        "六" => Some(6),
+        "七" => Some(7),
+        "八" => Some(8),
+        "九" => Some(9),
+        "十" => Some(10),
+        _ => None,
+    }
+}
+
 /// 追问消解结果（已提交：挂账已结清、上一帧已更新）
 #[derive(Debug, Clone)]
 pub struct FollowUpResolution {
@@ -225,7 +355,8 @@ pub struct FollowUpPlan {
     filled_from_pending: bool,
 }
 
-/// 话语帧记忆：上一完整帧 + 挂账（未竟之问），带容量与轮数上限。
+/// 话语帧记忆：上一完整帧 + 挂账（未竟之问）+ 澄清（待绑定变量），
+/// 带容量与轮数上限。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameMemory {
     #[serde(default)]
@@ -242,6 +373,19 @@ pub struct FrameMemory {
     unifications: u64,
     #[serde(default)]
     pending_closed: u64,
+    /// 至多一条待绑定澄清（新请求覆盖旧请求）
+    #[serde(default)]
+    clarification: Option<ClarificationRequest>,
+    #[serde(default = "default_clarification_ttl")]
+    clarification_ttl: u64,
+    #[serde(default)]
+    clarifications_asked: u64,
+    #[serde(default)]
+    clarifications_bound: u64,
+    #[serde(default)]
+    clarifications_cancelled: u64,
+    #[serde(default)]
+    clarifications_expired: u64,
 }
 
 impl Default for FrameMemory {
@@ -260,16 +404,31 @@ impl FrameMemory {
             pending_ttl: DEFAULT_PENDING_TTL,
             unifications: 0,
             pending_closed: 0,
+            clarification: None,
+            clarification_ttl: DEFAULT_CLARIFICATION_TTL,
+            clarifications_asked: 0,
+            clarifications_bound: 0,
+            clarifications_cancelled: 0,
+            clarifications_expired: 0,
         }
     }
 
-    /// 新一轮：轮次 +1，过期挂账自动清理（挂账有界）
+    /// 新一轮：轮次 +1，过期挂账与过期澄清自动清理（状态有界）
     pub fn begin_turn(&mut self) {
         self.turn += 1;
-        let ttl = self.pending_ttl as u64;
+        let ttl = self.pending_ttl;
         let turn = self.turn;
         self.pending
             .retain(|frame| turn.saturating_sub(frame.turn) <= ttl);
+        let expired = self
+            .clarification
+            .as_ref()
+            .map(|request| turn.saturating_sub(request.turn) >= self.clarification_ttl)
+            .unwrap_or(false);
+        if expired {
+            self.clarification = None;
+            self.clarifications_expired += 1;
+        }
     }
 
     pub fn turn(&self) -> u64 {
@@ -282,6 +441,59 @@ impl FrameMemory {
 
     pub fn pending(&self) -> &[AskAttributeFrame] {
         &self.pending
+    }
+
+    /// 当前待绑定澄清（至多一条）
+    pub fn clarification(&self) -> Option<&ClarificationRequest> {
+        self.clarification.as_ref()
+    }
+
+    /// 发起澄清：登记待绑定变量 + 候选表（新请求覆盖旧请求，至多一条）
+    pub fn begin_clarification(
+        &mut self,
+        raw: &str,
+        attribute: &str,
+        candidates: Vec<String>,
+    ) -> ClarificationRequest {
+        let request = ClarificationRequest {
+            raw: raw.trim().to_string(),
+            attribute: attribute.to_string(),
+            candidates,
+            turn: self.turn,
+        };
+        self.clarifications_asked += 1;
+        self.clarification = Some(request.clone());
+        request
+    }
+
+    /// 提交绑定：σ 扩展为常量，实例化原问句成为上一帧；返回重放问句与出处收据
+    pub fn commit_clarification(&mut self, entity: &str) -> Option<ClarificationOutcome> {
+        let request = self.clarification.take()?;
+        let frame = AskAttributeFrame {
+            entity: Some(entity.to_string()),
+            attribute: Some(request.attribute.clone()),
+            entity_origin: SlotOrigin::Clarified { turn: request.turn },
+            attribute_origin: SlotOrigin::Explicit,
+            raw: request.raw.clone(),
+            turn: self.turn,
+        };
+        let question = frame.question()?;
+        let note = format!(
+            "变量澄清：实体「{}」←第 {} 轮澄清（原问句「{}」）",
+            entity, request.turn, request.raw
+        );
+        self.last = Some(frame);
+        self.clarifications_bound += 1;
+        Some(ClarificationOutcome::Bound { question, note })
+    }
+
+    /// 放弃澄清：撤销待绑定变量，其余状态不变
+    pub fn cancel_clarification(&mut self) -> Option<ClarificationOutcome> {
+        let request = self.clarification.take()?;
+        self.clarifications_cancelled += 1;
+        Some(ClarificationOutcome::Cancelled {
+            note: format!("变量澄清：已放弃「{}」（可随时重新提问）。", request.raw),
+        })
     }
 
     /// 登记完整帧：问句已被既有管线执行后成为「上一帧」
@@ -397,8 +609,14 @@ impl FrameMemory {
     /// 帧记忆报告（逐条展示来源轮次，可审计、确定性）
     pub fn report(&self) -> String {
         let mut output = format!(
-            "话语帧记忆（带洞查询帧 + 合一；无神经网络）：轮次 {}，合一 {} 次，结清挂账 {} 次。\n",
-            self.turn, self.unifications, self.pending_closed
+            "话语帧记忆（带洞查询帧 + 合一 + 澄清；无神经网络）：轮次 {}，合一 {} 次，结清挂账 {} 次，澄清 {} 次（绑定 {}、放弃 {}、过期 {}）。\n",
+            self.turn,
+            self.unifications,
+            self.pending_closed,
+            self.clarifications_asked,
+            self.clarifications_bound,
+            self.clarifications_cancelled,
+            self.clarifications_expired
         );
         match &self.last {
             Some(frame) => output.push_str(&format!(
@@ -429,6 +647,28 @@ impl FrameMemory {
                     frame.attribute.as_deref().unwrap_or("?")
                 ));
             }
+        }
+        match &self.clarification {
+            Some(request) => {
+                let remaining = self
+                    .clarification_ttl
+                    .saturating_sub(self.turn.saturating_sub(request.turn));
+                output.push_str(&format!(
+                    "澄清（等待绑定，第 {} 轮发起，剩余 {} 轮）：原问句「{}」，候选：",
+                    request.turn,
+                    remaining,
+                    request.raw
+                ));
+                let list: Vec<String> = request
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| format!("{}.{}", index + 1, candidate))
+                    .collect();
+                output.push_str(&list.join("；"));
+                output.push_str("。回复序号或实体名绑定；「都不是」放弃。\n");
+            }
+            None => output.push_str("澄清（等待绑定）：暂无。\n"),
         }
         output
     }
@@ -906,5 +1146,136 @@ mod tests {
         assert!(report.contains("挂账"));
         assert!(report.contains("姚明 的 体重"));
         assert!(report.contains("第 1 轮挂起"));
+    }
+
+    // ------------------------- 澄清：变量求解的第 4 种合法结局 -------------------------
+
+    fn pending_clarification(memory: &mut FrameMemory) -> ClarificationRequest {
+        memory.begin_turn();
+        memory.begin_clarification(
+            "体重是多少",
+            "体重",
+            vec!["叶莉".to_string(), "姚明".to_string()],
+        )
+    }
+
+    #[test]
+    fn clarification_prompt_lists_candidates_deterministically() {
+        let mut memory = FrameMemory::new();
+        let request = pending_clarification(&mut memory);
+        let prompt = request.prompt();
+        assert!(prompt.contains("体重是多少"), "{}", prompt);
+        assert!(prompt.contains("1. 叶莉") && prompt.contains("2. 姚明"), "{}", prompt);
+        assert!(memory.report().contains("等待绑定"));
+        assert!(memory.report().contains("1.叶莉；2.姚明"));
+    }
+
+    #[test]
+    fn clarification_binds_by_index_and_completes_frame() {
+        let mut memory = FrameMemory::new();
+        pending_clarification(&mut memory);
+        let outcome = memory.commit_clarification("姚明").expect("有澄清才能绑定");
+        match outcome {
+            ClarificationOutcome::Bound { question, note } => {
+                assert_eq!(question, "姚明的体重是什么");
+                assert!(note.contains("第 1 轮澄清"), "{}", note);
+            }
+            other => panic!("应为绑定：{:?}", other),
+        }
+        let last = memory.last().expect("绑定应成为上一帧");
+        assert_eq!(last.entity.as_deref(), Some("姚明"));
+        assert_eq!(last.attribute.as_deref(), Some("体重"));
+        assert_eq!(last.entity_origin, SlotOrigin::Clarified { turn: 1 });
+        assert!(memory.clarification().is_none(), "绑定后至多一条澄清应被消费");
+    }
+
+    #[test]
+    fn clarification_reply_parses_index_names_and_cancel() {
+        let mut memory = FrameMemory::new();
+        let request = pending_clarification(&mut memory);
+        assert_eq!(
+            request.parse_reply("2"),
+            ClarificationReply::Candidate("姚明".to_string())
+        );
+        assert_eq!(
+            request.parse_reply("第2个"),
+            ClarificationReply::Candidate("姚明".to_string())
+        );
+        assert_eq!(
+            request.parse_reply("一"),
+            ClarificationReply::Candidate("叶莉".to_string())
+        );
+        assert_eq!(
+            request.parse_reply("姚明"),
+            ClarificationReply::Candidate("姚明".to_string())
+        );
+        assert_eq!(request.parse_reply("8"), ClarificationReply::OutOfRange);
+        assert_eq!(request.parse_reply("都不是"), ClarificationReply::Cancel);
+        assert_eq!(request.parse_reply("算了"), ClarificationReply::Cancel);
+        assert_eq!(request.parse_reply("诸葛亮是谁"), ClarificationReply::Unmatched);
+    }
+
+    #[test]
+    fn clarification_out_of_range_reply_keeps_state() {
+        let mut memory = FrameMemory::new();
+        let request = pending_clarification(&mut memory);
+        assert_eq!(request.parse_reply("9"), ClarificationReply::OutOfRange);
+        let before = memory.report();
+        // 重问路径：不提交、不消费、计数不变
+        assert_eq!(memory.report(), before);
+        assert!(memory.clarification().is_some());
+    }
+
+    #[test]
+    fn clarification_cancel_releases_without_binding() {
+        let mut memory = FrameMemory::new();
+        pending_clarification(&mut memory);
+        match memory.cancel_clarification() {
+            Some(ClarificationOutcome::Cancelled { note }) => {
+                assert!(note.contains("已放弃"), "{}", note);
+            }
+            other => panic!("应为取消：{:?}", other),
+        }
+        assert!(memory.clarification().is_none());
+        assert!(memory.last().is_none(), "取消不得产生上一帧");
+        assert!(memory.cancel_clarification().is_none(), "只能取消一次");
+    }
+
+    #[test]
+    fn clarification_is_at_most_one_and_new_replaces_old() {
+        let mut memory = FrameMemory::new();
+        pending_clarification(&mut memory);
+        memory.begin_clarification("身高是多少", "身高", vec!["姚明".to_string()]);
+        let request = memory.clarification().expect("仍有澄清");
+        assert_eq!(request.attribute, "身高");
+        assert_eq!(request.candidates, vec!["姚明".to_string()]);
+    }
+
+    #[test]
+    fn clarification_expires_after_ttl() {
+        let mut memory = FrameMemory::new();
+        pending_clarification(&mut memory);
+        for _ in 0..DEFAULT_CLARIFICATION_TTL - 1 {
+            memory.begin_turn();
+        }
+        assert!(memory.clarification().is_some(), "TTL 内应保留");
+        memory.begin_turn();
+        assert!(memory.clarification().is_none(), "超过 TTL 应过期");
+        assert!(memory.report().contains("过期 1"));
+    }
+
+    #[test]
+    fn clarification_survives_serde_roundtrip() {
+        let mut memory = FrameMemory::new();
+        pending_clarification(&mut memory);
+        let json = serde_json::to_string(&memory).expect("帧记忆应可序列化");
+        let restored: FrameMemory = serde_json::from_str(&json).expect("帧记忆应可反序列化");
+        let request = restored.clarification().expect("澄清应随记忆持久化");
+        assert_eq!(request.raw, "体重是多少");
+        assert_eq!(request.candidates.len(), 2);
+        // 旧版快照（无澄清字段）仍可读：缺省即无澄清
+        let old_json = r#"{"turn":2,"last":null,"pending":[],"max_pending":4,"pending_ttl":6,"unifications":0,"pending_closed":0}"#;
+        let old: FrameMemory = serde_json::from_str(old_json).expect("旧快照应向后兼容");
+        assert!(old.clarification().is_none());
     }
 }

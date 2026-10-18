@@ -21,6 +21,7 @@ use know_prolog::{
     external_knowledge::{AnswerOutcome, ExternalKnowledgeService, get_direct_answer},
     external_ledger::{ExternalLedger, LedgerLoad},
     symbolic_reasoner::SymbolicReasoner,
+    dialogue_frame::ClarificationOutcome,
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::DialogueManager,
     holographic_memory::{HoloAnalogyHit, HoloHit},
@@ -966,6 +967,16 @@ async fn run_interactive_mode(
             // 非作答输入：结束本轮追问，按普通输入继续处理
             contrast_followup = None;
         }
+
+        // 帧澄清进行中：短答（序号 / 实体名 / 都不是）→ 确定性绑定 → 重放原问句。
+        // 绑定有出处（候选 + 轮次），无源可填的洞不猜；非回答输入零状态变化、放行。
+        let mut frame_replay: Option<String> = None;
+        match handle_frame_clarification(&mut symbolic_reasoner, input) {
+            FrameClarificationStep::Replay(question) => frame_replay = Some(question),
+            FrameClarificationStep::Handled => continue,
+            FrameClarificationStep::Pass => {}
+        }
+        let input = frame_replay.as_deref().unwrap_or(input);
 
         // 对话式澄清进行中：优先把输入当作对当前提问的回答（是 / 不是 / 不知道）
         if symbolic_reasoner.clarification_active()
@@ -2046,7 +2057,16 @@ async fn run_interactive_mode(
                         println!("（结合对话上下文理解为：{}）", rewrite.text);
                         rewrite.text
                     }
-                    None => input.to_string(),
+                    None => {
+                        // 无源可填的实体洞：不落进「无法理解」，转为一次显式绑定请求
+                        // （澄清 = 请求一次绑定；旧通道必然失败时才开启）。
+                        if let Some(prompt) = symbolic_reasoner.start_frame_clarification(input) {
+                            println!("{}", prompt);
+                            println!();
+                            continue;
+                        }
+                        input.to_string()
+                    }
                 };
                 let input = contextual_input.as_str();
 
@@ -2870,6 +2890,41 @@ fn is_command_like(input: &str) -> bool {
     COMMANDS.iter().any(|command| input.starts_with(command))
 }
 
+/// 帧澄清(input) 的一步处理结果：绑定后重放 / 本轮已消化 / 放行常规管线
+enum FrameClarificationStep {
+    Replay(String),
+    Handled,
+    Pass,
+}
+
+/// 帧澄清进行中的短答处理：序号/候选名/已知实体名 → 确定性绑定；
+/// 越界 → 重问（零状态变化）；取消词 → 释放；命令或非回答 → 放行。
+fn handle_frame_clarification(
+    reasoner: &mut SymbolicReasoner,
+    input: &str,
+) -> FrameClarificationStep {
+    if !reasoner.frame_clarification_active() || is_command_like(input) {
+        return FrameClarificationStep::Pass;
+    }
+    match reasoner.answer_frame_clarification(input) {
+        Some(ClarificationOutcome::Bound { question, note }) => {
+            println!("（{}）", note);
+            FrameClarificationStep::Replay(question)
+        }
+        Some(ClarificationOutcome::Cancelled { note }) => {
+            println!("（{}）", note);
+            println!();
+            FrameClarificationStep::Handled
+        }
+        Some(ClarificationOutcome::Reprompt { prompt }) => {
+            println!("{}", prompt);
+            println!();
+            FrameClarificationStep::Handled
+        }
+        None => FrameClarificationStep::Pass,
+    }
+}
+
 /// 解析干预命令的后缀 `=真/假`（默认 do(…=假)：移除该事实再观察下游变化）
 fn parse_intervention_value(target: &str) -> (&str, bool) {
     for (suffix, value) in [
@@ -3430,5 +3485,61 @@ mod session_tests {
             "撤销后图谱应回到导入前状态，实际剩余 {} 条",
             snapshot.len()
         );
+    }
+
+    /// 帧澄清粘合层：命令/无关输入放行且零状态变化；序号绑定后返回重放问句
+    #[test]
+    fn frame_clarification_step_binds_replays_and_passes_through() {
+        let mut yao = HashMap::new();
+        yao.insert("身高".to_string(), "226cm".to_string());
+        yao.insert("体重".to_string(), "140kg".to_string());
+        let mut ye = HashMap::new();
+        ye.insert("身高".to_string(), "190cm".to_string());
+        ye.insert("体重".to_string(), "85kg".to_string());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "人".to_string(),
+                properties: yao,
+            },
+            PrologFact::Entity {
+                name: "叶莉".to_string(),
+                entity_type: "人".to_string(),
+                properties: ye,
+            },
+        ];
+        let mut reasoner =
+            SymbolicReasoner::new(know_prolog::ReasoningConfig::default(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        // 无源可填的洞 → 澄清（候选人名序：叶莉、姚明）
+        reasoner.contextualize("体重是多少");
+        let prompt = reasoner
+            .start_frame_clarification("体重是多少")
+            .expect("应开启帧澄清");
+        assert!(prompt.contains("叶莉") && prompt.contains("姚明"), "{}", prompt);
+
+        // 命令让位：放行给常规命令通道，澄清保持
+        assert!(matches!(
+            handle_frame_clarification(&mut reasoner, "帧记忆"),
+            FrameClarificationStep::Pass
+        ));
+        // 非回答自然语言：放行，澄清保持
+        assert!(matches!(
+            handle_frame_clarification(&mut reasoner, "北京是哪个省的"),
+            FrameClarificationStep::Pass
+        ));
+        assert!(reasoner.frame_clarification_active());
+
+        // 序号短答：确定性绑定 → 返回重放问句（将由主循环走常规问答）
+        match handle_frame_clarification(&mut reasoner, "1") {
+            FrameClarificationStep::Replay(question) => {
+                assert_eq!(question, "叶莉的体重是什么");
+            }
+            _ => panic!("序号应绑定并重放"),
+        }
+        assert!(!reasoner.frame_clarification_active(), "绑定后澄清应关闭");
+        let answer = reasoner.answer("叶莉的体重是什么").expect("重放应可作答");
+        assert!(answer.contains("85kg"), "{}", answer);
     }
 }

@@ -804,6 +804,123 @@ impl SymbolicReasoner {
         self.frames.report()
     }
 
+    /// 帧澄清是否进行中（无源可填的洞已转为等待一次显式绑定）
+    pub fn frame_clarification_active(&self) -> bool {
+        self.frames.clarification().is_some()
+    }
+
+    /// 帧澄清提示（候选编号列表；确定性渲染）
+    pub fn frame_clarification_prompt(&self) -> Option<String> {
+        self.frames
+            .clarification()
+            .map(dialogue_frame::ClarificationRequest::prompt)
+    }
+
+    /// 帧澄清入口：无上下文的「体重是多少」这类带洞问句在既有通道必然失败时，
+    /// 不落进「无法理解」，而是挂成一次显式绑定请求（变量求解的第 4 种结局）。
+    ///
+    /// 开启条件（全部满足才接管）：
+    ///   1) 配置启用澄清，且没有进行中的溯因/帧澄清（至多一条）；
+    ///   2) 问句是无主语属性问句（`属性+是多少/是什么`），但不含「呢」
+    ///      （「体重呢」属于既有省略/对话管理器通道）；
+    ///   3) 旧通道必然失败：上一完整帧为空、挂账为空（否则应走合一补全）；
+    ///   4) 候选非空：焦点实体优先，其余是知识库中确实拥有该属性的实体。
+    pub fn start_frame_clarification(&mut self, input: &str) -> Option<String> {
+        if !self.config.enable_clarification || self.clarification_active() {
+            return None;
+        }
+        if self.frames.clarification().is_some()
+            || self.frames.last().is_some()
+            || !self.frames.pending().is_empty()
+        {
+            return None;
+        }
+        let trimmed = input
+            .trim()
+            .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+            .trim();
+        if trimmed.ends_with('呢') {
+            return None;
+        }
+        let turn = self.frames.turn();
+        let fragment =
+            dialogue_frame::parse_bare_attribute_question(input, &FrameOntology(self), turn)?;
+        let attribute = fragment.attribute.clone()?;
+        let candidates = self.frame_clarification_candidates(&attribute);
+        if candidates.is_empty() {
+            return None;
+        }
+        let request = self
+            .frames
+            .begin_clarification(input.trim(), &attribute, candidates);
+        Some(request.prompt())
+    }
+
+    /// 处理对帧澄清的短答：序号/候选名 → 绑定；越界 → 重问；都不是 → 取消。
+    /// 已知实体名（即使不在候选表里）同样接受为一次显式绑定；
+    /// 其余回答返回 None（放行给常规管线，零状态变化）。
+    pub fn answer_frame_clarification(
+        &mut self,
+        text: &str,
+    ) -> Option<dialogue_frame::ClarificationOutcome> {
+        let request = self.frames.clarification()?.clone();
+        match request.parse_reply(text) {
+            dialogue_frame::ClarificationReply::Candidate(entity) => {
+                self.frames.commit_clarification(&entity)
+            }
+            dialogue_frame::ClarificationReply::OutOfRange => {
+                Some(dialogue_frame::ClarificationOutcome::Reprompt {
+                    prompt: request.prompt(),
+                })
+            }
+            dialogue_frame::ClarificationReply::Cancel => self.frames.cancel_clarification(),
+            dialogue_frame::ClarificationReply::Unmatched => {
+                let entity = FrameOntology(self).canonical_entity(text)?;
+                self.frames.commit_clarification(&entity)
+            }
+        }
+    }
+
+    /// 澄清候选：焦点实体 ∩ 有该属性的实体 → 有该属性的实体（名称序）→ 其余焦点实体。
+    /// 上限 5 条；顺序确定（可 golden），焦点只作为先验来源，不引入新猜测。
+    fn frame_clarification_candidates(&self, attribute: &str) -> Vec<String> {
+        const MAX_CANDIDATES: usize = 5;
+        let mut with_attribute: Vec<String> = self
+            .attribute_index
+            .iter()
+            .filter(|((_, slot), values)| slot == attribute && !values.is_empty())
+            .map(|((entity, _), _)| entity.clone())
+            .collect();
+        with_attribute.sort();
+        with_attribute.dedup();
+        let available: HashSet<&str> = with_attribute.iter().map(String::as_str).collect();
+        let mut ranked: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for focus in self.context.focus_entities() {
+            if available.contains(focus.as_str()) && seen.insert(focus.clone()) {
+                ranked.push(focus.clone());
+            }
+        }
+        for entity in &with_attribute {
+            if ranked.len() >= MAX_CANDIDATES {
+                break;
+            }
+            if seen.insert(entity.clone()) {
+                ranked.push(entity.clone());
+            }
+        }
+        for focus in self.context.focus_entities() {
+            if ranked.len() >= MAX_CANDIDATES {
+                break;
+            }
+            if self.is_known_entity(focus) && seen.insert(focus.clone()) {
+                ranked.push(focus.clone());
+            }
+        }
+        ranked.truncate(MAX_CANDIDATES);
+        ranked
+    }
+
     pub fn embedding(&self) -> &SymbolicEmbedding {
         &self.embedding
     }
@@ -5135,9 +5252,24 @@ impl SymbolicReasoner {
         } else {
             format!("{} 条", self.lessons.len())
         };
-        let frame_info = match self.frames.last() {
-            Some(frame) => format!("上一帧「{}」、挂账 {} 条", frame.display(), self.frames.pending().len()),
-            None => format!("上一帧（无）、挂账 {} 条", self.frames.pending().len()),
+        let frame_info = {
+            let clarification = match self.frames.clarification() {
+                Some(request) => format!("，待绑定澄清「{}」", request.raw),
+                None => String::new(),
+            };
+            match self.frames.last() {
+                Some(frame) => format!(
+                    "上一帧「{}」、挂账 {} 条{}",
+                    frame.display(),
+                    self.frames.pending().len(),
+                    clarification
+                ),
+                None => format!(
+                    "上一帧（无）、挂账 {} 条{}",
+                    self.frames.pending().len(),
+                    clarification
+                ),
+            }
         };
         format!(
             "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}，话语帧 {}。",
@@ -5636,6 +5768,194 @@ mod tests {
             .expect("恢复后挂账应仍可结清");
         assert_eq!(rewrite.text, "姚明的体重是什么");
         assert!(rewrite.notes.iter().any(|note| note.contains("第 1 轮挂账")));
+    }
+
+    fn attribute_candidates_facts() -> Vec<PrologFact> {
+        let mut yao = HashMap::new();
+        yao.insert("身高".to_string(), "226cm".to_string());
+        yao.insert("体重".to_string(), "140kg".to_string());
+        let mut ye = HashMap::new();
+        ye.insert("身高".to_string(), "190cm".to_string());
+        ye.insert("体重".to_string(), "85kg".to_string());
+        vec![
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "人".to_string(),
+                properties: yao,
+            },
+            PrologFact::Entity {
+                name: "叶莉".to_string(),
+                entity_type: "人".to_string(),
+                properties: ye,
+            },
+            // 已知但无体重的实体：用于「已知实体名也可作为一次显式绑定」的测试
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "人".to_string(),
+                properties: HashMap::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_frame_bare_attribute_without_context_starts_clarification() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_candidates_facts());
+        assert!(
+            reasoner.contextualize("体重是多少").is_none(),
+            "无上下文时帧通道不应凭空改写"
+        );
+        let prompt = reasoner
+            .start_frame_clarification("体重是多少")
+            .expect("无源可填的洞应转为一次显式绑定请求");
+        assert!(
+            prompt.contains("叶莉") && prompt.contains("姚明"),
+            "候选应来自知识库中拥有该属性的实体：{}",
+            prompt
+        );
+        assert!(reasoner.frame_clarification_active());
+        let report = reasoner.frame_memory_report();
+        assert!(report.contains("等待绑定"), "{}", report);
+        assert!(report.contains("1.叶莉；2.姚明"), "候选顺序应确定：{}", report);
+        assert!(
+            !prompt.contains("张三"),
+            "无该属性且不在焦点的实体不应凭空成为候选：{}",
+            prompt
+        );
+    }
+
+    #[test]
+    fn test_frame_clarification_binding_replays_and_remembers() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_candidates_facts());
+        reasoner.contextualize("体重是多少");
+        reasoner
+            .start_frame_clarification("体重是多少")
+            .expect("应开启澄清");
+        let outcome = reasoner
+            .answer_frame_clarification("2")
+            .expect("序号应被确定性解析为一次绑定");
+        let question = match outcome {
+            dialogue_frame::ClarificationOutcome::Bound { question, note } => {
+                assert!(note.contains("第 1 轮澄清"), "{}", note);
+                question
+            }
+            other => panic!("应为绑定：{:?}", other),
+        };
+        assert_eq!(question, "姚明的体重是什么");
+        assert!(!reasoner.frame_clarification_active(), "绑定后澄清应关闭");
+        let answer = reasoner.answer(&question).expect("重放问句应可作答");
+        assert!(answer.contains("140kg"), "{}", answer);
+
+        // 记忆回写：重放的问句成为上一帧，后续省略追问自然继承
+        assert!(reasoner.contextualize(&question).is_none());
+        let followup = reasoner
+            .contextualize_with_receipt("身高呢")
+            .expect("绑定后的实体槽应可被追问继承");
+        assert_eq!(followup.text, "姚明的身高是什么");
+    }
+
+    #[test]
+    fn test_frame_clarification_accepts_known_entity_outside_candidates() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_candidates_facts());
+        reasoner.contextualize("身高是多少");
+        let prompt = reasoner
+            .start_frame_clarification("身高是多少")
+            .expect("应开启澄清");
+        assert!(prompt.contains("叶莉") && prompt.contains("姚明"), "{}", prompt);
+        // 候选表外的已知实体名（张三没有身高记录）同样接受：绑定决定权在用户
+        let outcome = reasoner
+            .answer_frame_clarification("张三")
+            .expect("已知实体名应可作为显式绑定");
+        match outcome {
+            dialogue_frame::ClarificationOutcome::Bound { question, .. } => {
+                assert_eq!(question, "张三的身高是什么");
+            }
+            other => panic!("应为绑定：{:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_frame_clarification_reprompts_out_of_range_and_passes_natural_language() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_candidates_facts());
+        reasoner.contextualize("体重是多少");
+        reasoner.start_frame_clarification("体重是多少").unwrap();
+        // 越界序号：重问，零状态变化
+        match reasoner.answer_frame_clarification("9") {
+            Some(dialogue_frame::ClarificationOutcome::Reprompt { prompt }) => {
+                assert!(prompt.contains("姚明"), "{}", prompt);
+            }
+            other => panic!("越界序号应重问：{:?}", other),
+        }
+        assert!(reasoner.frame_clarification_active());
+        // 自然语言非回答：放行给常规管线，澄清保持
+        assert!(
+            reasoner.answer_frame_clarification("北京是哪个省的").is_none(),
+            "无法确定性解析的输入应放行"
+        );
+        assert!(reasoner.frame_clarification_active());
+        // 都不是：放弃
+        match reasoner.answer_frame_clarification("都不是") {
+            Some(dialogue_frame::ClarificationOutcome::Cancelled { .. }) => {}
+            other => panic!("应取消：{:?}", other),
+        }
+        assert!(!reasoner.frame_clarification_active());
+        assert!(reasoner.frame_memory().last().is_none());
+    }
+
+    #[test]
+    fn test_frame_clarification_not_started_when_old_channel_can_fill() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_candidates_facts());
+        reasoner.contextualize("姚明的身高是什么");
+        assert!(
+            reasoner.start_frame_clarification("体重是多少").is_none(),
+            "有上一帧时应走合一补全，不另起澄清"
+        );
+        let rewrite = reasoner
+            .contextualize_with_receipt("体重是多少")
+            .expect("合一应补全实体洞");
+        assert_eq!(rewrite.text, "姚明的体重是什么");
+        assert!(!reasoner.frame_clarification_active());
+        // 「呢」省略句属于既有通道，帧澄清不得抢答
+        assert!(reasoner.start_frame_clarification("体重呢").is_none());
+    }
+
+    #[test]
+    fn test_frame_clarification_expires_and_persists_across_sessions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dialogue.json");
+        let state_path = path.to_str().unwrap();
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_candidates_facts());
+        reasoner.contextualize("体重是多少");
+        reasoner.start_frame_clarification("体重是多少").unwrap();
+        reasoner.save_dialogue_state(state_path).unwrap();
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&attribute_candidates_facts());
+        assert!(restored.load_dialogue_state(state_path));
+        assert!(restored.frame_clarification_active(), "澄清应跨会话恢复");
+        match restored.answer_frame_clarification("1") {
+            Some(dialogue_frame::ClarificationOutcome::Bound { question, .. }) => {
+                assert_eq!(question, "叶莉的体重是什么");
+            }
+            other => panic!("恢复后应可绑定：{:?}", other),
+        }
+
+        // TTL：3 轮内有效，超过后过期（零残留）
+        let mut expiring = SymbolicReasoner::new(test_config(), HashMap::new());
+        expiring.observe_facts(&attribute_candidates_facts());
+        expiring.contextualize("体重是多少");
+        expiring.start_frame_clarification("体重是多少").unwrap();
+        for _ in 0..3 {
+            let _ = expiring.contextualize("姚明的身高是什么");
+        }
+        assert!(!expiring.frame_clarification_active(), "超过 TTL 的澄清应过期");
+        assert!(expiring.frame_memory_report().contains("过期 1"));
     }
 
     #[test]
