@@ -53,7 +53,7 @@ struct DocRecord {
     subject: String,
     predicate: String,
     object: String,
-    terms: Vec<String>,
+    terms: HashSet<String>,
 }
 
 /// 符号稠密检索器
@@ -71,6 +71,8 @@ pub struct DenseRetriever {
     doc_norms: Vec<f64>,
     entity_docs: HashMap<String, Vec<usize>>,
     adjacency: HashMap<String, HashMap<String, f64>>,
+    /// 实体名按长度降序的缓存（与 `entity_docs` 的键集合同步，`rebuild` 时刷新）
+    seed_candidates: Vec<String>,
     dirty: bool,
     built: bool,
 }
@@ -91,6 +93,7 @@ impl DenseRetriever {
             doc_norms: Vec::new(),
             entity_docs: HashMap::new(),
             adjacency: HashMap::new(),
+            seed_candidates: Vec::new(),
             dirty: false,
             built: false,
         }
@@ -120,22 +123,16 @@ impl DenseRetriever {
         if !self.seen.insert(key) {
             return;
         }
-        let mut terms = index_terms(subject);
+        let mut terms: HashSet<String> = HashSet::new();
+        terms.extend(index_terms(subject));
         terms.extend(index_terms(predicate));
         terms.extend(index_terms(object));
-        let mut unique = Vec::with_capacity(terms.len());
-        let mut seen_terms: HashSet<String> = HashSet::new();
-        for term in terms {
-            if seen_terms.insert(term.clone()) {
-                unique.push(term);
-            }
-        }
         let id = self.docs.len();
         self.docs.push(DocRecord {
             subject: subject.to_string(),
             predicate: predicate.to_string(),
             object: object.to_string(),
-            terms: unique,
+            terms,
         });
         self.entity_docs.entry(subject.to_string()).or_default().push(id);
         if object != subject {
@@ -206,6 +203,10 @@ impl DenseRetriever {
             }
             self.doc_norms[id] = norm_sq.sqrt();
         }
+        // 实体名按键长降序缓存，供 `seeds` 的最长优先匹配复用（避免每次查询排序）
+        let mut names: Vec<String> = self.entity_docs.keys().cloned().collect();
+        names.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
+        self.seed_candidates = names;
         self.dirty = false;
         self.built = true;
     }
@@ -219,8 +220,22 @@ impl DenseRetriever {
     pub fn seeds(&self, query: &str) -> Vec<String> {
         let mut names: Vec<&String> = self.entity_docs.keys().collect();
         names.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
+        Self::seeds_from_names(&names, query)
+    }
+
+    /// 复用重建时缓存的实体名（`rebuild` 后与键集合一致）
+    fn seeds_cached(&self, query: &str) -> Vec<String> {
+        if self.seed_candidates.len() != self.entity_docs.len() {
+            return self.seeds(query);
+        }
+        let names: Vec<&String> = self.seed_candidates.iter().collect();
+        Self::seeds_from_names(&names, query)
+    }
+
+    fn seeds_from_names(names: &[&String], query: &str) -> Vec<String> {
         let mut seeds = Vec::new();
         for name in names {
+            let name: &String = name;
             if name.chars().count() < 2 {
                 continue;
             }
@@ -235,16 +250,16 @@ impl DenseRetriever {
     }
 
     /// 查询词向量的 tf-idf 权重（tf 按查询内出现次数）
-    fn query_vector(&self, query: &str, seeds: &[String]) -> HashMap<String, f64> {
+    fn query_vector(&self, tokens: &[String], seeds: &[String]) -> HashMap<String, f64> {
         let total = self.docs.len().max(1);
         let mut weights: HashMap<String, f64> = HashMap::new();
-        for token in tokenize(query) {
-            let idf = if self.df.contains_key(&token) {
-                self.idf(&token, total)
+        for token in tokens {
+            let idf = if self.df.contains_key(token) {
+                self.idf(token, total)
             } else {
                 (1.0 + total as f64).ln()
             };
-            *weights.entry(token).or_insert(0.0) += idf;
+            *weights.entry(token.clone()).or_insert(0.0) += idf;
         }
         for seed in seeds {
             let idf = if self.df.contains_key(seed) {
@@ -324,14 +339,28 @@ impl DenseRetriever {
         if query.is_empty() {
             return Vec::new();
         }
-        let seeds = self.seeds(query);
-        let query_vector = self.query_vector(query, &seeds);
+        let seeds = self.seeds_cached(query);
+        let tokens = tokenize(query);
+        let query_vector = self.query_vector(&tokens, &seeds);
         if query_vector.is_empty() && seeds.is_empty() {
             return Vec::new();
         }
         let query_norm = Self::query_norm(&query_vector).max(1e-9);
         let structural = self.structural_scores(&seeds);
-        let query_tokens: HashSet<String> = tokenize(query).into_iter().collect();
+        let query_tokens: HashSet<String> = tokens.into_iter().collect();
+        // 预计算查询词项的加权（q 权重 × idf），内层只需判断文档是否包含该词项
+        let total_docs = self.docs.len();
+        let dot_terms: Vec<(&String, f64)> = query_vector
+            .iter()
+            .map(|(term, weight)| {
+                let idf = if self.df.contains_key(term) {
+                    self.idf(term, total_docs)
+                } else {
+                    (1.0 + total_docs as f64).ln()
+                };
+                (term, weight * idf)
+            })
+            .collect();
 
         let mut candidate_ids: HashSet<usize> = HashSet::new();
         for term in query_vector.keys() {
@@ -370,10 +399,9 @@ impl DenseRetriever {
         for id in candidate_ids {
             let doc = &self.docs[id];
             let mut dot = 0.0;
-            for term in query_vector.keys() {
-                if doc.terms.iter().any(|candidate| candidate == term) {
-                    let idf = self.idf(term, self.docs.len());
-                    dot += query_vector[term] * idf;
+            for (term, weighted) in &dot_terms {
+                if doc.terms.contains(*term) {
+                    dot += weighted;
                 }
             }
             let lexical = if self.doc_norms[id] > 0.0 {

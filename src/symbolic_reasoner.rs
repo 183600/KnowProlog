@@ -1504,7 +1504,10 @@ impl SymbolicReasoner {
             self.last_abduction_vars = query_vars.to_vec();
         }
         // 联合解释场景（多假设协同 + 注入验证）：成员也并入待定池
-        let scenarios = self.abduction.scenarios(&self.resolver, goals, query_vars);
+        //（`report.provable == false` 已确认目标不可证，跳过重复的可证性检查）
+        let scenarios =
+            self.abduction
+                .scenarios_assuming_unprovable(&self.resolver, goals, query_vars);
         // 循环假设过滤："假设目标本身成立"不算解释，不进入待定池/澄清队列
         let mut hypotheses: Vec<abduction::Hypothesis> = report
             .hypotheses
@@ -1620,7 +1623,10 @@ impl SymbolicReasoner {
         }
         self.last_abduction_goal = Some(goals.clone());
         self.last_abduction_vars = query_vars.clone();
-        let scenarios = self.abduction.scenarios(&self.resolver, &goals, &query_vars);
+        //（`report.provable == false` 已确认目标不可证，跳过重复的可证性检查）
+        let scenarios =
+            self.abduction
+                .scenarios_assuming_unprovable(&self.resolver, &goals, &query_vars);
         // 循环假设过滤："假设目标本身成立"不算解释，不进入待定池/澄清队列
         let mut pending: Vec<Hypothesis> = report
             .hypotheses
@@ -4366,13 +4372,20 @@ impl SymbolicReasoner {
             }
         };
         for profile in self.aligner.profiles() {
-            if profile.kind == TermKind::Entity {
+            // 先做前缀预筛（`consider` 内部同样要求），避免为不匹配的
+            // profile 做规范化与缓存查询
+            if profile.kind == TermKind::Entity
+                && !profile.term.is_empty()
+                && target.starts_with(&profile.term)
+            {
                 let canonical = self.aligner.canonical_form(&profile.term);
                 consider(&profile.term, &canonical);
             }
         }
         for (alias, canonical) in self.aligner.synonyms() {
-            if self.aligner.kind_of(canonical) == Some(TermKind::Entity) {
+            if target.starts_with(alias.as_str())
+                && self.aligner.kind_of(canonical) == Some(TermKind::Entity)
+            {
                 consider(alias, canonical);
             }
         }

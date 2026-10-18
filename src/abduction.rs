@@ -1128,7 +1128,30 @@ impl AbductionEngine {
         if !engine.solve(goals, query_vars).is_empty() {
             return Vec::new();
         }
+        self.scenarios_impl(engine, goals, query_vars)
+    }
 
+    /// 与 [`AbductionEngine::scenarios`] 相同，但调用方已确认目标在 `engine`
+    /// 上不可证，因而跳过重复的可证性检查（省去一次必然失败的完整求解）。
+    /// 仅在 `engine` 状态与不可证结论一致时调用，语义与 `scenarios` 等价。
+    pub fn scenarios_assuming_unprovable(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> Vec<Scenario> {
+        if goals.is_empty() {
+            return Vec::new();
+        }
+        self.scenarios_impl(engine, goals, query_vars)
+    }
+
+    fn scenarios_impl(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> Vec<Scenario> {
         let mut search = FrontierSearch {
             engine,
             max_depth: self.max_depth,
@@ -1399,9 +1422,11 @@ impl<'a> FrontierSearch<'a> {
         }
 
         // 2) 直接切点：把当前原子记为缺失前提（最小解释，最先记录）
-        missing.push(applied.clone());
+        //（借出 `applied` 随递归入栈，返回后再取回，避免为每个切点克隆原子；
+        //  递归按栈序归还，`pop` 必然取回同一原子）
+        missing.push(applied);
         self.run(&goals[1..], subst, depth, missing);
-        missing.pop();
+        let applied = missing.pop().unwrap_or_else(|| apply_atom(subst, goal));
 
         // 3) 与规则头归结：换名后合一，再把规则体前置到目标队列
         //    （规则解释作为备选前沿，与直接切点一起参与排序）
@@ -1424,12 +1449,17 @@ impl<'a> FrontierSearch<'a> {
     }
 
     fn record(&mut self, missing: &[Atom]) {
-        let key = missing
-            .iter()
-            .map(|atom| atom.display())
-            .collect::<Vec<_>>()
-            .join("|");
-        if self.results.len() >= self.max_frontiers || !self.seen.insert(key) {
+        if self.results.len() >= self.max_frontiers {
+            return;
+        }
+        let mut key = String::new();
+        for (index, atom) in missing.iter().enumerate() {
+            if index > 0 {
+                key.push('|');
+            }
+            key.push_str(&atom.display());
+        }
+        if !self.seen.insert(key) {
             return;
         }
         self.results.push(missing.to_vec());
