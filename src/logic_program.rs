@@ -38,6 +38,7 @@ impl LTerm {
         matches!(self, LTerm::Var(_))
     }
 
+    #[allow(dead_code)]
     fn is_anonymous(&self) -> bool {
         matches!(self, LTerm::Var(name) if name.starts_with("_anon_"))
     }

@@ -641,6 +641,18 @@ pub struct SymbolicReasoner {
 }
 
 impl SymbolicReasoner {
+    /// 审计辅助：词条是否是任一实体的属性键、取值或实体名本身。
+    /// 供对话忠信度检查（回答引用必须可回溯）使用。
+    pub fn attribute_token_known(&self, token: &str) -> bool {
+        self.attribute_index
+            .iter()
+            .any(|((entity, attribute), values)| {
+                entity == token
+                    || attribute == token
+                    || values.iter().any(|value| value == token)
+            })
+    }
+
     pub fn new(config: ReasoningConfig, synonyms: HashMap<String, String>) -> Self {
         Self::with_perf_ledger(config, synonyms, Arc::new(PerfLedger::new()))
     }

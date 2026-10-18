@@ -136,6 +136,12 @@ pub trait DialogueKnowledge {
         let _ = entity;
         None
     }
+    /// 审计 / 评测用：回答中引用的词条是否可在知识源中回溯到出处。
+    /// 缺省不可判定（false），由具体知识源按需实现。
+    fn traceable_token(&self, token: &str) -> bool {
+        let _ = token;
+        false
+    }
 }
 
 impl DialogueKnowledge for SymbolicReasoner {
@@ -167,6 +173,13 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn describe(&self, entity: &str) -> Option<String> {
         self.generator().profile(entity)
+    }
+
+    /// 词条可回溯：登记实体 / 谓词词面 / 任一实体的属性键或取值。
+    fn traceable_token(&self, token: &str) -> bool {
+        self.generator().is_known_entity(token)
+            || self.generator().predicate_surfaces().contains_key(token)
+            || self.attribute_token_known(token)
     }
 }
 

@@ -1153,7 +1153,7 @@ mod tests {
     #[test]
     fn test_dcg_depth_guard_terminates_on_left_recursion() {
         let mut grammar = DcgGrammar::with_limits(4, 8);
-        grammar.parse_rule("loop --> loop tail");
+        let _ = grammar.parse_rule("loop --> loop tail");
         grammar.add_terminal_rule("tail", "尾");
         let _ = grammar.generate("loop", &HashMap::new(), 4);
         assert!(grammar

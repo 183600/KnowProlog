@@ -147,6 +147,7 @@ impl SimilarityCalculator {
         })
     }
 
+    #[cfg(test)]
     async fn calculate_jaccard_similarity(&self, text1: &str, text2: &str) -> f64 {
         let words1 = self.tokenize_and_filter(text1);
         let words2 = self.tokenize_and_filter(text2);

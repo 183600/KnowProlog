@@ -37,6 +37,10 @@ use know_prolog::{
     embedding_eval::{
         compare_baseline, evaluate, triples_from_prolog_facts, EvalBaseline, EvalConfig,
     },
+    dialogue_eval::{
+        compare_baseline as compare_dialogue_baseline, evaluate_seed, EvalKnowledge,
+        DialogueEvalBaseline,
+    },
 };
 
 #[derive(Parser)]
@@ -84,6 +88,34 @@ enum Commands {
         /// RRF fusion constant
         #[arg(long, default_value_t = 60.0)]
         rrf_k: f64,
+    },
+    /// Evaluate dialogue NLU (intent / entity linking / slots / clarification /
+    /// answers / provenance) on the built-in gold corpus with a regression ratchet
+    EvalNlu {
+        /// Knowledge backend: "reasoner" (end-to-end) or "scripted" (policy layer)
+        #[arg(long, default_value = "reasoner")]
+        knowledge: String,
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the session REST service (multi-turn dialogue over HTTP + SSE)
+    Serve {
+        /// Listen address
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Maximum concurrent sessions
+        #[arg(long, default_value_t = 64)]
+        max_sessions: usize,
     },
     /// Run interactive mode (default)
     Interactive,
@@ -207,6 +239,93 @@ async fn main() {
                     eprintln!("读取知识库失败: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Some(Commands::EvalNlu {
+            knowledge,
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            let mode = match knowledge.as_str() {
+                "scripted" => EvalKnowledge::Scripted,
+                "reasoner" => EvalKnowledge::Reasoner,
+                other => {
+                    eprintln!("未知的知识后端「{}」：可选 reasoner / scripted", other);
+                    std::process::exit(1);
+                }
+            };
+            let report = evaluate_seed(mode);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("报告序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print!("{}", report.render_text());
+            }
+
+            let baseline_path = baseline
+                .clone()
+                .unwrap_or_else(|| "nlu_eval_baseline.json".to_string());
+            if update_baseline {
+                let new_baseline = DialogueEvalBaseline::from_report(&report);
+                match new_baseline.save(&baseline_path) {
+                    Ok(()) => println!("对话 NLU 基线已写入 {}", baseline_path),
+                    Err(e) => {
+                        eprintln!("基线写入失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else if baseline.is_some() {
+                match DialogueEvalBaseline::load(&baseline_path) {
+                    Ok(old_baseline) => {
+                        let verdict = compare_dialogue_baseline(&old_baseline, &report, 1e-6);
+                        print!("{}", verdict.render_text());
+                        if !verdict.passed && !allow_regression {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("基线读取失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Some(Commands::Serve { addr, max_sessions }) => {
+            let facts = match oxigraph_manager.load_all_facts().await {
+                Ok(facts) => facts,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let synonyms = if let Some(synonyms_config) = &config.synonyms {
+                synonyms_config.mappings.clone()
+            } else {
+                create_default_synonyms()
+            };
+            println!(
+                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个会话）",
+                addr,
+                facts.len(),
+                max_sessions
+            );
+            let state = Arc::new(know_prolog::serve_api::ApiState::new(
+                facts,
+                config.reasoning.clone(),
+                synonyms,
+                perf_ledger.clone(),
+                max_sessions,
+            ));
+            if let Err(e) = know_prolog::serve_api::serve(state, &addr).await {
+                eprintln!("服务退出: {}", e);
+                std::process::exit(1);
             }
         }
         Some(Commands::Interactive) | None => {
@@ -672,7 +791,6 @@ async fn run_interactive_mode(
                         println!("```");
                     }
                 }
-                (Some(_), None) => println!("用法：回放 <序号>，例如：回放 3"),
                 (None, _) => println!("编年史不可用（打开失败，见启动警告）。"),
             }
             println!();
@@ -3702,7 +3820,7 @@ mod session_tests {
         let store_path = dir.path().to_str().unwrap().to_string();
         let journal_path = format!("{}/import_journal.json", store_path);
 
-        let receipt = {
+        {
             let manager = OxigraphManager::with_perf_ledger(
                 &store_path,
                 PerfLedger::shared(),

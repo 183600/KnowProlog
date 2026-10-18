@@ -61,6 +61,8 @@ pub mod view_render;
 pub mod embedding_eval;
 pub mod function_words;
 pub mod graph_ledger;
+pub mod dialogue_eval;
+pub mod serve_api;
 
 #[cfg(test)]
 mod dialogue_conformance;

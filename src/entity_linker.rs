@@ -210,7 +210,7 @@ pub fn oov_suspects(text: &str, receipts: &[MentionReceipt]) -> Vec<OovSuspect> 
         .iter()
         .map(|suffix| suffix.chars().collect())
         .collect();
-    for (suffix_index, suffix) in ENTITY_SUFFIXES.iter().enumerate() {
+    for (suffix_index, _) in ENTITY_SUFFIXES.iter().enumerate() {
         let suffix = &suffix_chars[suffix_index];
         let len = suffix.len();
         if len == 0 || chars.len() < len {

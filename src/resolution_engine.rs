@@ -788,7 +788,6 @@ fn unify_prepared(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> boo
                     subst.insert(b.clone(), left.clone());
                 }
             }
-            _ => {}
         }
     }
     true
