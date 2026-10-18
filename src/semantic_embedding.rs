@@ -76,6 +76,24 @@ impl SymbolicEmbedding {
     }
 
     pub fn observe_entity(&mut self, name: &str, entity_type: &str, properties: &[String]) {
+        self.observe_entity_keys(name, entity_type, properties.iter().map(|p| p.as_str()));
+    }
+
+    /// 与 `observe_entity` 等价，但直接以属性表的键为输入，避免调用方为构造
+    /// `&[String]` 而复制全部键名。
+    pub fn observe_entity_map(
+        &mut self,
+        name: &str,
+        entity_type: &str,
+        properties: &HashMap<String, String>,
+    ) {
+        self.observe_entity_keys(name, entity_type, properties.keys().map(|p| p.as_str()));
+    }
+
+    fn observe_entity_keys<'a, I>(&mut self, name: &str, entity_type: &str, properties: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         if name.is_empty() {
             return;
         }

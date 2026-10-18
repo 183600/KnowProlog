@@ -1,4 +1,5 @@
 use parking_lot::RwLock;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -82,18 +83,18 @@ impl OntologyAligner {
     }
 
     pub fn is_registered(&self, term: &str) -> bool {
-        self.index.contains_key(&self.normalize(term))
+        self.index.contains_key(self.normalize_cow(term).as_ref())
     }
 
     pub fn kind_of(&self, term: &str) -> Option<TermKind> {
         self.index
-            .get(&self.normalize(term))
+            .get(self.normalize_cow(term).as_ref())
             .map(|&idx| self.profiles[idx].kind)
     }
 
     pub fn register_term(&mut self, term: &str, kind: TermKind) -> usize {
-        let normalized = self.normalize(term);
-        if let Some(&idx) = self.index.get(&normalized) {
+        let normalized = self.normalize_cow(term);
+        if let Some(&idx) = self.index.get(normalized.as_ref()) {
             // 同一术语先以属性注册、后以关系出现时（RDF 对象属性），升级为关系，
             // 以便「关系/属性」判定与谓词问答使用正确语义。
             if kind == TermKind::Relation && self.profiles[idx].kind == TermKind::Attribute {
@@ -108,9 +109,10 @@ impl OntologyAligner {
             ..Default::default()
         });
         let idx = self.profiles.len() - 1;
-        let mut keys = Self::bigram_keys(&normalized);
+        let mut keys = Self::bigram_keys(normalized.as_ref());
         keys.sort_unstable();
         self.profile_lens.push(normalized.chars().count());
+        let normalized = normalized.into_owned();
         self.profile_norms.push(normalized.clone());
         self.profile_keys.push(keys);
         self.index.insert(normalized, idx);
@@ -138,6 +140,64 @@ impl OntologyAligner {
                 self.resolve_cache.write().clear();
             }
         }
+    }
+
+    /// 规范化术语；无需任何改写时直接借用原字符串，避免每次调用都分配。
+    pub fn normalize_cow<'a>(&self, term: &'a str) -> Cow<'a, str> {
+        let needs_work = term.chars().any(|ch| {
+            ch.is_whitespace()
+                || ch.is_ascii_uppercase()
+                || matches!(
+                    ch,
+                    '（' | '）'
+                        | '：'
+                        | '，'
+                        | '。'
+                        | '、'
+                        | '；'
+                        | '！'
+                        | '？'
+                        | '《'
+                        | '》'
+                        | '【'
+                        | '】'
+                        | '“'
+                        | '”'
+                        | '‘'
+                        | '’'
+                        | '－'
+                        | '—'
+                        | '–'
+                        | '·'
+                        | '('
+                        | ')'
+                        | ':'
+                        | ','
+                        | '.'
+                        | ';'
+                        | '!'
+                        | '?'
+                        | '<'
+                        | '>'
+                        | '['
+                        | ']'
+                        | '"'
+                        | '\''
+                        | '-'
+                        | '_'
+                        | '/'
+                        | '\\'
+                        | '#'
+                        | '@'
+                        | '&'
+                        | '+'
+                        | '*'
+                )
+        });
+        if !needs_work {
+            return Cow::Borrowed(term);
+        }
+        Cow::Owned(self.normalize(term))
     }
 
     pub fn normalize(&self, term: &str) -> String {

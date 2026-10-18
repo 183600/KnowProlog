@@ -681,10 +681,6 @@ impl SymbolicReasoner {
                         self.aligner.register_term(property, TermKind::Attribute);
                     }
                     self.linker.register_entity(name, Some(entity_type.as_str()));
-                    let property_pairs: Vec<(String, String)> = properties
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect();
                     // 生成器的实体类型会被后续观察覆盖，归结引擎的 __类型__ 事实依赖它：
                     // 类型变化时必须触发重建（关联篮子的变化无法覆盖此情形）
                     if !entity_type.trim().is_empty()
@@ -693,14 +689,14 @@ impl SymbolicReasoner {
                         entity_type_changed = true;
                     }
                     self.generator
-                        .observe_entity(name, entity_type, &property_pairs);
-                    let property_keys: Vec<String> = properties.keys().cloned().collect();
+                        .observe_entity_map(name, entity_type, properties);
                     if self.config.enable_semantic_embedding {
-                        self.embedding.observe_entity(name, entity_type, &property_keys);
+                        self.embedding
+                            .observe_entity_map(name, entity_type, properties);
                     }
                     association_changed |=
                         self.associations
-                            .observe_entity(name, entity_type, &property_keys);
+                            .observe_entity_map(name, entity_type, properties);
                     for (key, value) in properties {
                         if self
                             .attributes
@@ -903,9 +899,10 @@ impl SymbolicReasoner {
         if !entities.is_empty() {
             self.context.record_entities(&entities);
         }
-        let normalized_text = self.aligner.normalize(text);
+        let normalized_text = self.aligner.normalize_cow(text);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
-        let predicate = self.first_mentioned_known_predicate(&normalized_text, &mentioned_canonicals);
+        let predicate =
+            self.first_mentioned_known_predicate(normalized_text.as_ref(), &mentioned_canonicals);
         if let Some(predicate) = predicate {
             self.context.record_predicate(&predicate);
         }
@@ -943,7 +940,7 @@ impl SymbolicReasoner {
     }
 
     fn entities_mentioned_uncached(&self, text: &str) -> Vec<String> {
-        let normalized_text = self.aligner.normalize(text);
+        let normalized_text = self.aligner.normalize_cow(text);
         let mut found: Vec<(usize, String)> = Vec::new();
         for (i, profile) in self.aligner.profiles().iter().enumerate() {
             if profile.kind != TermKind::Entity {
@@ -1025,8 +1022,8 @@ impl SymbolicReasoner {
         if mentioned_canonicals.contains(predicate) {
             return true;
         }
-        let predicate_norm = self.aligner.normalize(predicate);
-        !predicate_norm.is_empty() && normalized_text.contains(&predicate_norm)
+        let predicate_norm = self.aligner.normalize_cow(predicate);
+        !predicate_norm.is_empty() && normalized_text.contains(predicate_norm.as_ref())
     }
 
     // 实体链接：候选生成 + 模糊容错 + 上下文消歧（详见 entity_linker 模块）
@@ -1096,7 +1093,7 @@ impl SymbolicReasoner {
     }
 
     fn link_hints(&self, text: &str) -> Vec<String> {
-        let normalized_text = self.aligner.normalize(text);
+        let normalized_text = self.aligner.normalize_cow(text);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
         self.known_predicates_normalized_cache
             .iter()
@@ -2969,7 +2966,7 @@ impl SymbolicReasoner {
             return None;
         }
 
-        let normalized_question = self.aligner.normalize(question);
+        let normalized_question = self.aligner.normalize_cow(question);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(question);
         let mut candidates: Vec<Prediction> = Vec::new();
         for entity in &entities {
@@ -2979,7 +2976,7 @@ impl SymbolicReasoner {
                 self.config.max_predictions * 4,
             ) {
                 if self.predicate_mentioned_normalized_with(
-                    &normalized_question,
+                    normalized_question.as_ref(),
                     &prediction.triple.predicate,
                     &mentioned_canonicals,
                 ) {

@@ -180,6 +180,29 @@ impl SymbolicGenerator {
     }
 
     pub fn observe_entity(&mut self, name: &str, etype: &str, properties: &[(String, String)]) {
+        let refs: Vec<(&str, &str)> = properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        self.observe_entity_refs(name, etype, &refs);
+    }
+
+    /// 与 `observe_entity` 等价，但直接以属性表为输入，避免调用方为构造
+    /// `&[(String, String)]` 而复制全部键值。属性迭代顺序与原方法一致。
+    pub fn observe_entity_map(
+        &mut self,
+        name: &str,
+        etype: &str,
+        properties: &HashMap<String, String>,
+    ) {
+        let refs: Vec<(&str, &str)> = properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        self.observe_entity_refs(name, etype, &refs);
+    }
+
+    fn observe_entity_refs(&mut self, name: &str, etype: &str, properties: &[(&str, &str)]) {
         if name.trim().is_empty() {
             return;
         }
@@ -215,17 +238,17 @@ impl SymbolicGenerator {
         }
         if !properties.is_empty() {
             let bucket = self.attributes.entry(name.to_string()).or_default();
-            for (key, value) in properties {
+            for &(key, value) in properties {
                 if key.trim().is_empty() {
                     continue;
                 }
                 if !bucket.iter().any(|(k, v)| k == key && v == value) {
-                    bucket.push((key.clone(), value.clone()));
+                    bucket.push((key.to_string(), value.to_string()));
                     changed = true;
                 }
             }
         }
-        for (key, _) in properties {
+        for &(key, _) in properties {
             if !key.trim().is_empty() && self.register_predicate_surface(key) {
                 changed = true;
             }

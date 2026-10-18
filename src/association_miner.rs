@@ -152,6 +152,24 @@ impl AssociationMiner {
 
     /// 观察一个带类型的实体：类型标签 + 属性键入篮
     pub fn observe_entity(&mut self, name: &str, etype: &str, property_keys: &[String]) -> bool {
+        self.observe_entity_keys(name, etype, property_keys.iter().map(|k| k.as_str()))
+    }
+
+    /// 与 `observe_entity` 等价，但直接以属性表的键为输入，避免调用方为构造
+    /// `&[String]` 而复制全部键名。
+    pub fn observe_entity_map(
+        &mut self,
+        name: &str,
+        etype: &str,
+        property_keys: &HashMap<String, String>,
+    ) -> bool {
+        self.observe_entity_keys(name, etype, property_keys.keys().map(|k| k.as_str()))
+    }
+
+    fn observe_entity_keys<'a, I>(&mut self, name: &str, etype: &str, property_keys: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
         let mut changed = false;
         if !etype.trim().is_empty() && etype != "Entity" {
             changed |= self.insert_item(name, type_item(etype));

@@ -141,6 +141,13 @@ impl EntityLinker {
         if name.trim().is_empty() {
             return;
         }
+        let new_etype = etype.filter(|t| !t.trim().is_empty());
+        // 重复观察同一实体且类型未变时，画像（字符集/bigram/表面映射）必然一致，跳过重建
+        if let Some(existing) = self.profiles.get(name) {
+            if existing.etype.as_deref() == new_etype {
+                return;
+            }
+        }
         let degree = self.profiles.get(name).map(|p| p.degree).unwrap_or(0);
         let chars: Vec<char> = name.chars().collect();
         let char_set: HashSet<char> = chars.iter().copied().collect();
@@ -148,7 +155,7 @@ impl EntityLinker {
         self.profiles.insert(
             name.to_string(),
             EntityProfile {
-                etype: etype.filter(|t| !t.trim().is_empty()).map(str::to_string),
+                etype: new_etype.map(str::to_string),
                 degree,
                 char_count: chars.len(),
                 char_set,
