@@ -360,6 +360,44 @@ async fn run_interactive_mode(
             }
         }
     }
+    // 规则图账本：命名图物化视图恢复会话规则（跨进程）；账本写入不推进知识版本
+    let stored_rule_ledger = match oxigraph_manager.load_rule_ledger().await {
+        Ok(ledger) => Some(ledger),
+        Err(error) => {
+            eprintln!("规则图账本读取失败（已忽略，不影响知识库）：{}", error);
+            None
+        }
+    };
+    if let Some(ledger) = stored_rule_ledger.as_ref() {
+        if !ledger.entries.is_empty() {
+            let restored = symbolic_reasoner.restore_rules_from_ledger(&ledger.entries);
+            if restored > 0 {
+                println!(
+                    "已从规则图账本恢复 {} 条会话规则（命名图 kg:graphs/rules）。",
+                    restored
+                );
+            }
+        }
+    }
+    // 仅当本会话确有规则时回写，避免 enable_resolution=false 时清空账本
+    let startup_rule_entries = symbolic_reasoner.rule_ledger_entries();
+    if !startup_rule_entries.is_empty() {
+        let needs_sync = stored_rule_ledger
+            .as_ref()
+            .map(|ledger| ledger.fingerprint != symbolic_reasoner.rule_fingerprint())
+            .unwrap_or(true);
+        if needs_sync {
+            match oxigraph_manager.sync_rule_ledger(&startup_rule_entries).await {
+                Ok(count) => println!(
+                    "规则图账本已同步：{} 条规则 → 命名图 kg:graphs/rules。",
+                    count
+                ),
+                Err(error) => {
+                    eprintln!("规则图账本同步失败（已忽略，不影响会话）：{}", error);
+                }
+            }
+        }
+    }
 
     // 本体化对话管理器：把每轮对话实例化为对话本体，用 Horn 规则策略推导回答方式
     let dialogue_enabled = config.reasoning.enable_dialogue_manager;
@@ -1507,6 +1545,7 @@ async fn run_interactive_mode(
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.teach_report(target));
+                sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             }
             println!();
             continue;
@@ -1525,6 +1564,7 @@ async fn run_interactive_mode(
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.learn_rule_report(target));
+                sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             }
             println!();
             continue;
@@ -1561,6 +1601,19 @@ async fn run_interactive_mode(
                 println!("{}", answer);
                 log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
             }
+            println!();
+            continue;
+        }
+
+        // 忘记会话规则：子句库与教学原句一致撤回，并重同步规则图账本
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["忘记规则：", "忘记规则:", "撤回规则：", "撤回规则:"],
+        ) {
+            let answer = symbolic_reasoner.forget_rule_report(target);
+            println!("{}", answer);
+            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+            sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             println!();
             continue;
         }
@@ -1835,6 +1888,55 @@ async fn run_interactive_mode(
         if input == "推理发现" || input == "推导发现" {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             println!("{}", symbolic_reasoner.derived_facts_report(10));
+            println!();
+            continue;
+        }
+
+        // 物化推理：前向饱和的派生事实写入命名图（含来源/前提/物化戳，可审计）
+        if matches!(input, "物化推理" | "推理物化" | "物化派生") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            let entries = symbolic_reasoner.derived_ledger_entries(100);
+            let revision = oxigraph_manager.revision();
+            let fingerprint = symbolic_reasoner.rule_fingerprint();
+            match oxigraph_manager
+                .materialize_derived_ledger(&entries, revision, &fingerprint)
+                .await
+            {
+                Ok(0) => println!(
+                    "没有可物化的派生事实（先教学规则，或启用 enable_resolution）。命名图 kg:graphs/derived 已置空。"
+                ),
+                Ok(count) => {
+                    println!(
+                        "已物化 {} 条派生事实 → 命名图 kg:graphs/derived（知识版本 {}，规则指纹 {}）。",
+                        count, revision, fingerprint
+                    );
+                    for (index, entry) in entries.iter().take(5).enumerate() {
+                        println!(
+                            "  {}. {} ← {}（轮次 {}，置信度 {:.2}，前提 {} 条）",
+                            index + 1,
+                            entry.atom.display(),
+                            entry.rule_source,
+                            entry.depth,
+                            entry.confidence,
+                            entry.premises.len()
+                        );
+                    }
+                    if entries.len() > 5 {
+                        println!("  …共 {} 条，用「图账本」查看完整出处。", entries.len());
+                    }
+                }
+                Err(error) => eprintln!("派生账本物化失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 图账本：命名图物化视图审计（规则账本 + 派生账本 + 过期判定）
+        if matches!(input, "图账本" | "规则账本" | "规则图账本" | "派生图账本") {
+            println!(
+                "{}",
+                graph_ledger_report(&symbolic_reasoner, &oxigraph_manager).await
+            );
             println!();
             continue;
         }
@@ -2600,6 +2702,116 @@ async fn refresh_symbolic_reasoner(
     }
 }
 
+/// 规则图账本同步：把当前会话规则全量重写进命名图（幂等；不推进知识版本）。
+async fn sync_rule_ledger_report(
+    symbolic_reasoner: &SymbolicReasoner,
+    oxigraph_manager: &OxigraphManager,
+) {
+    let entries = symbolic_reasoner.rule_ledger_entries();
+    match oxigraph_manager.sync_rule_ledger(&entries).await {
+        Ok(0) => println!("规则图账本已同步：0 条规则（命名图 kg:graphs/rules 已置空）。"),
+        Ok(count) => println!(
+            "规则图账本已同步：{} 条规则 → 命名图 kg:graphs/rules（指纹 {}）。",
+            count,
+            symbolic_reasoner.rule_fingerprint()
+        ),
+        Err(error) => eprintln!("规则图账本同步失败：{}", error),
+    }
+}
+
+/// 图账本审计：规则账本与派生账本读取 + 与当前会话对账（指纹/版本过期判定）。
+async fn graph_ledger_report(
+    symbolic_reasoner: &SymbolicReasoner,
+    oxigraph_manager: &OxigraphManager,
+) -> String {
+    let mut output = String::from("图账本审计（命名图物化视图，与知识图谱隔离）：\n");
+    match oxigraph_manager.load_rule_ledger().await {
+        Ok(ledger) => {
+            if !ledger.synced {
+                output.push_str(
+                    "■ 规则账本 kg:graphs/rules：尚未同步过（教一条「规则：…」即会入账）。\n",
+                );
+            } else {
+                output.push_str(&format!(
+                    "■ 规则账本 kg:graphs/rules：{} 条规则，规则集指纹 {}。\n",
+                    ledger.entries.len(),
+                    ledger.fingerprint
+                ));
+                for (index, entry) in ledger.entries.iter().take(10).enumerate() {
+                    output.push_str(&format!(
+                        "  {}. {}（来源：{}；置信度 {:.2}）\n",
+                        index + 1,
+                        entry.display_zh(),
+                        entry.source,
+                        entry.confidence
+                    ));
+                }
+                if ledger.entries.len() > 10 {
+                    output.push_str(&format!("  …共 {} 条。\n", ledger.entries.len()));
+                }
+                let current = symbolic_reasoner.rule_fingerprint();
+                if ledger.fingerprint == current {
+                    output.push_str("  对账：与当前会话规则集一致。\n");
+                } else {
+                    output.push_str(&format!(
+                        "  对账：账本指纹 {} ≠ 当前会话指纹 {}——会话有未同步变更。\n",
+                        ledger.fingerprint, current
+                    ));
+                }
+            }
+        }
+        Err(error) => output.push_str(&format!("■ 规则账本读取失败：{}\n", error)),
+    }
+    match oxigraph_manager.load_derived_ledger().await {
+        Ok(ledger) => {
+            if !ledger.materialized {
+                output.push_str(
+                    "■ 派生账本 kg:graphs/derived：尚未物化过（用「物化推理」写入）。\n",
+                );
+            } else {
+                output.push_str(&format!(
+                    "■ 派生账本 kg:graphs/derived：{} 条派生事实，物化于知识版本 {}，规则指纹 {}。\n",
+                    ledger.entries.len(),
+                    ledger.revision,
+                    ledger.fingerprint
+                ));
+                for (index, entry) in ledger.entries.iter().take(10).enumerate() {
+                    let premises = entry
+                        .premises
+                        .iter()
+                        .map(|premise| premise.display())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    output.push_str(&format!(
+                        "  {}. {} ← {}（轮次 {}，置信度 {:.2}；前提：{}）\n",
+                        index + 1,
+                        entry.atom.display(),
+                        entry.rule_source,
+                        entry.depth,
+                        entry.confidence,
+                        premises
+                    ));
+                }
+                if ledger.entries.len() > 10 {
+                    output.push_str(&format!("  …共 {} 条。\n", ledger.entries.len()));
+                }
+                let current_revision = oxigraph_manager.revision();
+                let current_fingerprint = symbolic_reasoner.rule_fingerprint();
+                if ledger.revision == current_revision && ledger.fingerprint == current_fingerprint {
+                    output.push_str("  对账：物化戳与当前知识版本、规则集一致。\n");
+                } else {
+                    output.push_str(&format!(
+                        "  对账：已过期（物化于版本 {} / 指纹 {}；当前版本 {} / 指纹 {}）——用「物化推理」重写。\n",
+                        ledger.revision, ledger.fingerprint, current_revision, current_fingerprint
+                    ));
+                }
+            }
+        }
+        Err(error) => output.push_str(&format!("■ 派生账本读取失败：{}\n", error)),
+    }
+    output.trim_end().to_string()
+}
+
 /// 从知识图谱快照抽取关系边（子图视图的输入；确定性排序由视图层负责）。
 fn prolog_fact_edges(facts: &[PrologFact]) -> Vec<(String, String, String)> {
     facts
@@ -2758,7 +2970,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 127] = [
+    const COMMANDS: [&str; 132] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -2859,6 +3071,11 @@ fn is_command_like(input: &str) -> bool {
         "派生台账",
         "版本台账",
         "增量报告",
+        "图账本",
+        "派生图账本",
+        "物化推理",
+        "推理物化",
+        "物化派生",
         "会话规则",
         "对比",
         "校准",
@@ -3393,6 +3610,15 @@ mod session_tests {
             "性能台账",
             "派生台账",
             "增量报告",
+            "图账本",
+            "规则账本",
+            "规则图账本",
+            "派生图账本",
+            "物化推理",
+            "推理物化",
+            "物化派生",
+            "忘记规则：如果X的师傅是Y，那么X的老师是Y",
+            "撤回规则：如果X的师傅是Y，那么X的老师是Y",
             "虚词表",
             "功能词表",
             "虚词报告",

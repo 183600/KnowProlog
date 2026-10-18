@@ -16,6 +16,7 @@ use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
+use crate::graph_ledger;
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
@@ -157,6 +158,40 @@ fn restore_clause(snapshot: &SnapshotClause) -> Option<Clause> {
         snapshot.confidence,
         &snapshot.source,
     ))
+}
+
+/// 归结原子 → 图账本原子（规则/派生物化为 RDF 时的结构载体）。
+fn ledger_atom(atom: &Atom) -> graph_ledger::LedgerAtom {
+    graph_ledger::LedgerAtom {
+        predicate: atom.predicate.to_string(),
+        terms: atom
+            .terms
+            .iter()
+            .map(|term| graph_ledger::LedgerTerm {
+                name: term.name().to_string(),
+                is_var: matches!(term, Term::Var(_)),
+            })
+            .collect(),
+    }
+}
+
+/// 图账本原子 → 归结原子（从规则账本恢复会话规则时使用；空名/空谓词拒绝）。
+fn atom_from_ledger(atom: &graph_ledger::LedgerAtom) -> Option<Atom> {
+    if atom.predicate.is_empty() || atom.terms.is_empty() {
+        return None;
+    }
+    let mut terms = Vec::with_capacity(atom.terms.len());
+    for term in &atom.terms {
+        if term.name.is_empty() {
+            return None;
+        }
+        terms.push(if term.is_var {
+            Term::var(&term.name)
+        } else {
+            Term::constant(&term.name)
+        });
+    }
+    Some(Atom::new(&atom.predicate, terms))
 }
 
 // 上一段生成的记忆：实体、已讲句数、段落排序角度（支持"接着说/换个角度说"）
@@ -4965,6 +5000,232 @@ impl SymbolicReasoner {
         output
     }
 
+    /// 会话规则 → 图账本条目（规则即数据：稳定 id、规范逻辑形式、来源、置信度）。
+    pub fn rule_ledger_entries(&self) -> Vec<graph_ledger::RuleLedgerEntry> {
+        self.session_clauses
+            .iter()
+            .map(|clause| {
+                let head = ledger_atom(&clause.head);
+                let body: Vec<graph_ledger::LedgerAtom> =
+                    clause.body.iter().map(ledger_atom).collect();
+                graph_ledger::RuleLedgerEntry {
+                    id: graph_ledger::rule_entry_id(&head, &body),
+                    head,
+                    body,
+                    confidence: clause.confidence,
+                    source: clause.source.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// 当前会话规则集指纹（派生账本过期判定的依据之一；与插入顺序无关）。
+    pub fn rule_fingerprint(&self) -> String {
+        graph_ledger::rule_fingerprint(&self.rule_ledger_entries())
+    }
+
+    /// 从规则账本恢复会话规则（启动时合并；重复规则不重复添加）。返回新增条数。
+    ///
+    /// 与 `apply_dialogue_snapshot` 的规则恢复同语义：新谓词登记为关系、
+    /// 词表缓存与归结引擎整体重建，保证恢复的规则立即可用于后向链。
+    pub fn restore_rules_from_ledger(
+        &mut self,
+        entries: &[graph_ledger::RuleLedgerEntry],
+    ) -> usize {
+        if !self.config.enable_resolution {
+            return 0;
+        }
+        let mut added = 0usize;
+        let mut new_predicates: Vec<String> = Vec::new();
+        for entry in entries {
+            let Some(head) = atom_from_ledger(&entry.head) else {
+                continue;
+            };
+            let mut body = Vec::with_capacity(entry.body.len());
+            let mut valid = true;
+            for atom in &entry.body {
+                match atom_from_ledger(atom) {
+                    Some(restored) => body.push(restored),
+                    None => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+            if self
+                .session_clauses
+                .iter()
+                .any(|existing| existing.head == head && existing.body == body)
+            {
+                continue;
+            }
+            for atom in std::iter::once(&head).chain(body.iter()) {
+                if !self.aligner.is_registered(&atom.predicate)
+                    && !new_predicates.iter().any(|p| p.as_str() == atom.predicate.as_ref())
+                {
+                    new_predicates.push(atom.predicate.to_string());
+                }
+            }
+            self.session_clauses
+                .push(Clause::new(head, body, entry.confidence, &entry.source));
+            added += 1;
+        }
+        if added > 0 {
+            for predicate in &new_predicates {
+                self.aligner.register_term(predicate, TermKind::Relation);
+            }
+            if !new_predicates.is_empty() {
+                self.rebuild_knowledge_caches();
+            }
+            self.rebuild_resolver();
+        }
+        added
+    }
+
+    /// 忘记一条会话规则：子句库与教学原句两处一致撤回（图账本由调用方重同步）。
+    ///
+    /// 教学原句若解析出同一规则，整句一并撤回——否则重启时 `rebuild_problog`
+    /// 重放原句会让规则经「教学」通道复活。
+    pub fn forget_rule_report(&mut self, sentence_raw: &str) -> String {
+        if !self.config.enable_resolution {
+            return "归结推理未启用（config.toml [reasoning] enable_resolution = false）。"
+                .to_string();
+        }
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请给出要忘记的规则，例如：忘记规则：如果X的师傅是Y，那么X的老师是Y"
+                .to_string();
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let targets: Vec<Clause> = outcome
+            .lessons
+            .iter()
+            .filter_map(chinese_reasoning_nlu::lesson_to_clause)
+            .collect();
+        if targets.is_empty() {
+            let mut output = String::from("没能把这句话解析成可忘记的规则。支持句式：\n");
+            output.push_str("  • 如果S的P是O，那么S的Q是O（与「规则：」同款，占位符自动变量化）\n");
+            for error in &outcome.errors {
+                output.push_str(&format!("  失败原因：{}\n", error));
+            }
+            return output.trim_end().to_string();
+        }
+        let same_clause =
+            |left: &Clause, right: &Clause| left.head == right.head && left.body == right.body;
+
+        let existing_clauses = std::mem::take(&mut self.session_clauses);
+        let mut removed_targets: Vec<Clause> = Vec::new();
+        let mut kept_clauses: Vec<Clause> = Vec::new();
+        for clause in existing_clauses {
+            match targets.iter().find(|target| same_clause(target, &clause)) {
+                Some(target) => removed_targets.push(target.clone()),
+                None => kept_clauses.push(clause),
+            }
+        }
+        self.session_clauses = kept_clauses;
+
+        // 教学原句撤回：解析结果命中同一规则的整句不再回放
+        let mut lessons_removed = 0usize;
+        let mut kept_lessons: Vec<String> = Vec::new();
+        for lesson_sentence in &self.lessons {
+            let matches = chinese_reasoning_nlu::parse_lessons(lesson_sentence)
+                .lessons
+                .iter()
+                .filter_map(chinese_reasoning_nlu::lesson_to_clause)
+                .any(|parsed| targets.iter().any(|target| same_clause(target, &parsed)));
+            if matches {
+                lessons_removed += 1;
+            } else {
+                kept_lessons.push(lesson_sentence.clone());
+            }
+        }
+        if lessons_removed > 0 {
+            self.lessons = kept_lessons;
+            self.lessons_parsed = self
+                .lessons
+                .iter()
+                .flat_map(|lesson_sentence| {
+                    chinese_reasoning_nlu::parse_lessons(lesson_sentence).lessons
+                })
+                .collect();
+            if self.config.enable_problog && self.config.enable_soft_logic {
+                self.rebuild_problog();
+            }
+        }
+
+        let mut output = String::new();
+        if removed_targets.is_empty() {
+            output.push_str("会话规则库中没有匹配的规则（可能未学过或已被忘记）。\n");
+        } else {
+            output.push_str(&format!("已忘记 {} 条会话规则：\n", removed_targets.len()));
+            for (index, clause) in removed_targets.iter().enumerate() {
+                output.push_str(&format!(
+                    "  {}. {} :- {}\n",
+                    index + 1,
+                    clause.head.display(),
+                    clause
+                        .body
+                        .iter()
+                        .map(|atom| atom.display())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            self.rebuild_resolver();
+        }
+        if lessons_removed > 0 {
+            output.push_str(&format!(
+                "同时撤回 {} 条对应教学原句（防止重启重放复活）。\n",
+                lessons_removed
+            ));
+        }
+        output.push_str(&format!("会话规则库现有 {} 条子句。", self.session_clauses.len()));
+        output
+    }
+
+    /// 前向饱和的派生事实 → 图账本条目（含前提、规则来源、轮次、置信度与物化戳）。
+    ///
+    /// 与「推理发现」报告同排序（轮次降序 → 置信度降序 → 原子字典序），
+    /// 截断到 `limit` 条；物化戳取当前知识版本与当前规则集指纹。
+    pub fn derived_ledger_entries(&self, limit: usize) -> Vec<graph_ledger::DerivedLedgerEntry> {
+        if !self.config.enable_resolution || limit == 0 {
+            return Vec::new();
+        }
+        let fingerprint = self.rule_fingerprint();
+        let derived = self.resolver.forward_chain(3, 100);
+        let mut items: Vec<&DerivedFact> = derived.iter().collect();
+        items.sort_by(|a, b| {
+            b.depth
+                .cmp(&a.depth)
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        items.truncate(limit);
+        items
+            .into_iter()
+            .map(|item| {
+                let atom = ledger_atom(&item.atom);
+                graph_ledger::DerivedLedgerEntry {
+                    id: graph_ledger::derived_entry_id(&atom),
+                    atom,
+                    rule_source: item.rule_source.clone(),
+                    premises: item.premises.iter().map(ledger_atom).collect(),
+                    depth: item.depth,
+                    confidence: item.confidence,
+                    revision: self.revision,
+                    fingerprint: fingerprint.clone(),
+                }
+            })
+            .collect()
+    }
+
     /// ProbLog 风格可能世界精确推理报告：
     /// 概率事实/规则/注释析取 → BDD 加权模型计数（无采样），并列出证明路径与联合概率
     pub fn problog_report(&self, target_raw: &str) -> String {
@@ -7232,6 +7493,95 @@ mod tests {
             restored.dialogue_summary()
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_rule_ledger_entries_and_fingerprint_track_session_rules() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let empty = reasoner.rule_fingerprint();
+        assert!(reasoner.rule_ledger_entries().is_empty());
+
+        reasoner.learn_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        let entries = reasoner.rule_ledger_entries();
+        assert_eq!(entries.len(), 1, "教过的规则应成为账本条目");
+        assert!(entries[0].head.display().contains("老师"), "实际：{}", entries[0].head.display());
+        assert_eq!(entries[0].body.len(), 1);
+        assert!(entries[0].source.contains("中文教学"), "来源应可审计：{}", entries[0].source);
+        assert!(!entries[0].id.is_empty());
+        assert_eq!(
+            reasoner.rule_fingerprint(),
+            graph_ledger::rule_fingerprint(&entries),
+            "指纹必须由当前规则集确定"
+        );
+        assert_ne!(reasoner.rule_fingerprint(), empty, "规则增删必须改变指纹");
+    }
+
+    #[test]
+    fn test_forget_rule_retracts_clause_and_lesson_consistently() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.teach_report("如果X的师傅是Y，那么X的老师是Y");
+        assert_eq!(reasoner.rule_ledger_entries().len(), 1, "教学规则应立即入账");
+        assert!(!reasoner.lessons().is_empty());
+
+        let forgotten = reasoner.forget_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        assert!(forgotten.contains("已忘记 1 条会话规则"), "实际：{}", forgotten);
+        assert!(forgotten.contains("撤回 1 条对应教学原句"), "实际：{}", forgotten);
+        assert!(reasoner.rule_ledger_entries().is_empty(), "忘记后账本条目清空");
+        assert!(reasoner.lessons().is_empty(), "教学原句应一并撤回");
+        let proof = reasoner.resolution_proof_report("李四的老师是王五");
+        assert!(proof.contains("未得证"), "忘记后规则不应再得证：{}", proof);
+
+        let again = reasoner.forget_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        assert!(again.contains("没有匹配的规则"), "重复忘记应零状态变化：{}", again);
+    }
+
+    #[test]
+    fn test_restore_rules_from_ledger_enables_backward_chain() {
+        let mut teacher = SymbolicReasoner::new(test_config(), HashMap::new());
+        teacher.observe_facts(&master_facts());
+        teacher.learn_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        let entries = teacher.rule_ledger_entries();
+
+        let mut learner = SymbolicReasoner::new(test_config(), HashMap::new());
+        learner.observe_facts(&master_facts());
+        assert_eq!(learner.restore_rules_from_ledger(&entries), 1);
+        assert_eq!(learner.restore_rules_from_ledger(&entries), 0, "重复恢复不重复添加");
+        let proof = learner.resolution_proof_report("李四的老师是王五");
+        assert!(proof.contains("得证"), "恢复的规则应参与后向链：{}", proof);
+        assert_eq!(
+            learner.rule_fingerprint(),
+            teacher.rule_fingerprint(),
+            "恢复后指纹与原会话一致"
+        );
+    }
+
+    #[test]
+    fn test_derived_ledger_entries_carry_provenance_and_stamp() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner.learn_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        let entries = reasoner.derived_ledger_entries(10);
+        assert!(!entries.is_empty(), "教过的规则应推出新事实");
+        let derived = entries
+            .iter()
+            .find(|entry| entry.atom.predicate == "老师" && entry.atom.display().contains("李四"))
+            .unwrap_or_else(|| panic!("应推出李四的老师：{:?}", entries));
+        assert_eq!(derived.depth, 1);
+        assert!(
+            derived.rule_source.contains("中文教学"),
+            "规则来源应可审计：{}",
+            derived.rule_source
+        );
+        assert_eq!(derived.premises.len(), 1, "应记录前提：{:?}", derived.premises);
+        assert_eq!(derived.revision, reasoner.revision(), "物化戳应记知识版本");
+        assert_eq!(
+            derived.fingerprint,
+            reasoner.rule_fingerprint(),
+            "物化戳应记规则集指纹"
+        );
+        assert!(reasoner.derived_ledger_entries(0).is_empty(), "limit=0 不产出条目");
     }
 
     #[test]

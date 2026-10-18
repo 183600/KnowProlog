@@ -60,6 +60,7 @@ pub mod chronicle;
 pub mod view_render;
 pub mod embedding_eval;
 pub mod function_words;
+pub mod graph_ledger;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -1489,6 +1490,10 @@ impl OxigraphManager {
                     Ok(quad) => quad,
                     Err(_) => continue,
                 };
+                // 命名图（规则/派生账本）不是知识图谱：谓词画像只观测默认图
+                if quad.graph_name != GraphName::DefaultGraph {
+                    continue;
+                }
                 let predicate = Self::local_kg_name(quad.predicate.as_str());
                 // rdf:type 不是领域谓词，跳过
                 if predicate == "type" {
@@ -1752,6 +1757,10 @@ impl OxigraphManager {
                 Ok(quad) => quad,
                 Err(_) => continue,
             };
+            // 命名图（规则/派生账本）不参与知识快照：只拍平默认图
+            if quad.graph_name != GraphName::DefaultGraph {
+                continue;
+            }
 
             // 命名节点直接取 IRI 尾部
             let entity_name = match &quad.subject {
@@ -2515,6 +2524,87 @@ impl OxigraphManager {
         
         Ok(relations)
     }
+
+    /// 当前知识版本（写操作 version-after-write 自增；账本写入不推进版本）。
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// 同步规则账本：清空 `kg:graphs/rules` 后全量重写（幂等；不推进知识版本）。
+    ///
+    /// 规则即数据：稳定 id + 规范逻辑形式（JSON）+ 可读词面 + 来源 + 置信度，
+    /// 加上账本戳（规则集指纹 + 条数）。返回写入的规则条数。
+    pub async fn sync_rule_ledger(
+        &self,
+        entries: &[graph_ledger::RuleLedgerEntry],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = graph_ledger::rule_quads(entries)?;
+        let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::RULES_GRAPH)?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("rule_ledger_sync");
+        Ok(entries.len())
+    }
+
+    /// 读取规则账本（按条目 id 升序，确定性；不触碰任何缓存）。
+    pub async fn load_rule_ledger(
+        &self,
+    ) -> Result<graph_ledger::RuleLedger, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::RULES_GRAPH)?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("rule_ledger_load");
+        Ok(graph_ledger::parse_rule_graph(quads.into_iter()))
+    }
+
+    /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
+    ///
+    /// 每条派生事实带规则来源、前提、推导轮次、置信度与物化戳
+    /// （知识版本 + 规则集指纹），过期与否可审计。
+    pub async fn materialize_derived_ledger(
+        &self,
+        entries: &[graph_ledger::DerivedLedgerEntry],
+        revision: u64,
+        fingerprint: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = graph_ledger::derived_quads(entries, revision, fingerprint)?;
+        let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::DERIVED_GRAPH)?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("derived_ledger_materialize");
+        Ok(entries.len())
+    }
+
+    /// 读取派生账本（按条目 id 升序，确定性；不触碰任何缓存）。
+    pub async fn load_derived_ledger(
+        &self,
+    ) -> Result<graph_ledger::DerivedLedger, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::DERIVED_GRAPH)?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("derived_ledger_load");
+        Ok(graph_ledger::parse_derived_graph(quads.into_iter()))
+    }
 }
 
 pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String> {
@@ -3003,5 +3093,147 @@ mod cache_tests {
         let third = manager.get_direct_answer("capital_query", &entities).await;
         assert_eq!(third.as_deref(), Some("北京的首都是中国"));
         assert!(perf.count("direct_answer_query") > queries_with_negative);
+    }
+
+    fn ledger_var(name: &str) -> graph_ledger::LedgerTerm {
+        graph_ledger::LedgerTerm {
+            name: name.to_string(),
+            is_var: true,
+        }
+    }
+
+    fn ledger_const(name: &str) -> graph_ledger::LedgerTerm {
+        graph_ledger::LedgerTerm {
+            name: name.to_string(),
+            is_var: false,
+        }
+    }
+
+    fn ledger_rule_entry() -> graph_ledger::RuleLedgerEntry {
+        let head = graph_ledger::LedgerAtom {
+            predicate: "老师".to_string(),
+            terms: vec![ledger_var("X"), ledger_var("Y")],
+        };
+        let body = vec![graph_ledger::LedgerAtom {
+            predicate: "师傅".to_string(),
+            terms: vec![ledger_var("X"), ledger_var("Y")],
+        }];
+        graph_ledger::RuleLedgerEntry {
+            id: graph_ledger::rule_entry_id(&head, &body),
+            head,
+            body,
+            confidence: 0.95,
+            source: "中文规则".to_string(),
+        }
+    }
+
+    fn ledger_derived_entry(revision: u64, fingerprint: &str) -> graph_ledger::DerivedLedgerEntry {
+        let atom = graph_ledger::LedgerAtom {
+            predicate: "老师".to_string(),
+            terms: vec![ledger_const("张三"), ledger_const("李四")],
+        };
+        graph_ledger::DerivedLedgerEntry {
+            id: graph_ledger::derived_entry_id(&atom),
+            atom,
+            rule_source: "中文规则".to_string(),
+            premises: vec![graph_ledger::LedgerAtom {
+                predicate: "师傅".to_string(),
+                terms: vec![ledger_const("张三"), ledger_const("李四")],
+            }],
+            depth: 1,
+            confidence: 0.95,
+            revision,
+            fingerprint: fingerprint.to_string(),
+        }
+    }
+
+    /// 图账本与知识图谱隔离：账本写入不进快照/谓词画像，也不推进知识版本。
+    #[tokio::test]
+    async fn ledger_graphs_are_isolated_from_knowledge_snapshot() {
+        let (manager, _dir) = temp_manager().await;
+        manager.save_knowledge(items("张三", "李四")).await.unwrap();
+        let revision = manager.revision();
+        let snapshot_before = manager.load_graph_snapshot().await.unwrap();
+
+        let rule = ledger_rule_entry();
+        let fingerprint = graph_ledger::rule_fingerprint(&[rule.clone()]);
+        manager.sync_rule_ledger(&[rule]).await.unwrap();
+        manager
+            .materialize_derived_ledger(&[ledger_derived_entry(revision, &fingerprint)], revision, &fingerprint)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.revision(), revision, "账本写入不推进知识版本");
+        let snapshot_after = manager.load_graph_snapshot().await.unwrap();
+        assert_eq!(
+            snapshot_before.as_ref(),
+            snapshot_after.as_ref(),
+            "命名图里的账本四元组不得进入知识快照"
+        );
+
+        manager.refresh_predicate_registry().await.unwrap();
+        let report = manager.predicate_registry_report();
+        assert!(
+            !report.contains("ledger"),
+            "谓词画像不得观测账本谓词：{}",
+            report
+        );
+    }
+
+    /// 规则账本经存储往返一致；重复同步幂等；空集同步清空账本。
+    #[tokio::test]
+    async fn rule_ledger_store_roundtrip_and_idempotent_resync() {
+        let (manager, _dir) = temp_manager().await;
+        let entry = ledger_rule_entry();
+        assert_eq!(manager.sync_rule_ledger(&[entry.clone()]).await.unwrap(), 1);
+
+        let loaded = manager.load_rule_ledger().await.unwrap();
+        assert!(loaded.synced);
+        assert_eq!(loaded.entries, vec![entry.clone()]);
+        assert_eq!(
+            loaded.fingerprint,
+            graph_ledger::rule_fingerprint(&[entry.clone()])
+        );
+
+        manager.sync_rule_ledger(&[entry.clone()]).await.unwrap();
+        assert_eq!(
+            manager.load_rule_ledger().await.unwrap().entries,
+            vec![entry.clone()],
+            "同内容重复同步应幂等"
+        );
+
+        manager.sync_rule_ledger(&[]).await.unwrap();
+        let cleared = manager.load_rule_ledger().await.unwrap();
+        assert!(cleared.synced);
+        assert!(cleared.entries.is_empty(), "空集同步必须清空账本");
+    }
+
+    /// 派生账本经存储往返一致，物化戳（版本 + 指纹）可审计；重物化全量替换。
+    #[tokio::test]
+    async fn derived_ledger_store_roundtrip_and_stamp() {
+        let (manager, _dir) = temp_manager().await;
+        let entry = ledger_derived_entry(5, "fp-one");
+        assert_eq!(
+            manager
+                .materialize_derived_ledger(&[entry.clone()], 5, "fp-one")
+                .await
+                .unwrap(),
+            1
+        );
+        let loaded = manager.load_derived_ledger().await.unwrap();
+        assert!(loaded.materialized);
+        assert_eq!(loaded.revision, 5);
+        assert_eq!(loaded.fingerprint, "fp-one");
+        assert_eq!(loaded.entries, vec![entry.clone()]);
+
+        let replacement = ledger_derived_entry(6, "fp-two");
+        manager
+            .materialize_derived_ledger(&[replacement.clone()], 6, "fp-two")
+            .await
+            .unwrap();
+        let reloaded = manager.load_derived_ledger().await.unwrap();
+        assert_eq!(reloaded.entries, vec![replacement], "重物化应全量替换");
+        assert_eq!(reloaded.revision, 6);
+        assert_eq!(reloaded.fingerprint, "fp-two");
     }
 }
