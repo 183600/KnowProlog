@@ -13,6 +13,7 @@ use crate::causal_tokenization::{
     attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS,
 };
 use crate::chinese_reasoning_nlu::{self, LessonKind};
+use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
@@ -213,6 +214,9 @@ pub struct DialogueSnapshot {
     // 神经符号对比仲裁记忆（校准统计、待定推测、屏蔽/否证集），跨会话持久化
     #[serde(default)]
     pub contrast: Option<ContrastSnapshot>,
+    // 话语帧记忆（上一帧 + 挂账），跨会话持久化后可接着补全未竟之问
+    #[serde(default)]
+    pub frames: Option<FrameMemory>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -393,6 +397,7 @@ impl DialogueContext {
             lessons: Vec::new(),
             session_clauses: Vec::new(),
             contrast: None,
+            frames: None,
         }
     }
 
@@ -487,6 +492,43 @@ pub struct ProofSolutionView {
     pub proofs: Vec<ProofViewNode>,
 }
 
+/// 上下文改写收据：改写文本 + 来源说明（可打印、可审计）
+#[derive(Debug, Clone)]
+pub struct ContextRewrite {
+    pub text: String,
+    pub notes: Vec<String>,
+}
+
+impl ContextRewrite {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            notes: Vec::new(),
+        }
+    }
+}
+
+/// 本体视图适配器：帧解析与合一期间只读消费对齐器/谓词清单（排序判定）
+struct FrameOntology<'a>(&'a SymbolicReasoner);
+
+impl OntologyView for FrameOntology<'_> {
+    fn canonical_entity(&self, raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let canonical = self.0.aligner.canonical_form(raw);
+        if self.0.is_known_entity(&canonical) || self.0.is_known_entity(raw) {
+            return Some(canonical);
+        }
+        None
+    }
+
+    fn canonical_attribute(&self, raw: &str) -> Option<String> {
+        self.0.canonical_attribute(raw)
+    }
+}
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -508,12 +550,16 @@ pub struct SymbolicReasoner {
     generator: SymbolicGenerator,
     // 实体属性三元组（观察到的），供归结引擎编码事实
     attributes: HashSet<(String, String, String)>,
+    // 属性查询索引：规范槽位 `(实体, 属性)` → 取值列表（随知识重建）
+    attribute_index: HashMap<(String, String), Vec<String>>,
     // 关联规则挖掘器（类型/谓词/属性篮子的支持度-置信度-提升度）
     associations: AssociationMiner,
     // 一阶归结引擎（事实 + 链接预测规则 + 关联规则）
     resolver: ResolutionEngine,
     // 溯因·假设生成引擎（后向链失败前沿 → 候选假设 → 反事实模拟）
     abduction: AbductionEngine,
+    // 话语帧记忆：带洞查询帧 + 挂账（合一式多轮消解，跨会话持久化）
+    frames: FrameMemory,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
     session_facts: Vec<Atom>,
     // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
@@ -622,9 +668,11 @@ impl SymbolicReasoner {
             linker,
             generator,
             attributes: HashSet::new(),
+            attribute_index: HashMap::new(),
             associations,
             resolver,
             abduction,
+            frames: FrameMemory::new(),
             session_facts: Vec::new(),
             session_clauses: Vec::new(),
             clarification: None,
@@ -721,6 +769,20 @@ impl SymbolicReasoner {
             &self.aligner,
             self.generator.predicate_surfaces(),
         );
+        // 属性查询索引按规范槽位重建（同义词/谓词别名变化后仍可命中）
+        let mut attribute_index: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for (subject, key, value) in &self.attributes {
+            let slot = self.aligner.canonical_form(key);
+            attribute_index
+                .entry((subject.clone(), slot))
+                .or_default()
+                .push(value.clone());
+        }
+        for values in attribute_index.values_mut() {
+            values.sort();
+            values.dedup();
+        }
+        self.attribute_index = attribute_index;
         // 词表变化后实体链接/实体提及的旧结果可能过时，同步失效记忆缓存
         *self.link_memo.lock() = None;
         *self.entity_mentions_memo.lock() = None;
@@ -730,6 +792,16 @@ impl SymbolicReasoner {
 
     pub fn context(&self) -> &DialogueContext {
         &self.context
+    }
+
+    /// 话语帧记忆（只读）：上一完整帧 + 挂账（未竟之问）
+    pub fn frame_memory(&self) -> &FrameMemory {
+        &self.frames
+    }
+
+    /// 话语帧记忆报告：帧、洞填充来源、挂账与剩余轮数（确定性、可断言）
+    pub fn frame_memory_report(&self) -> String {
+        self.frames.report()
     }
 
     pub fn embedding(&self) -> &SymbolicEmbedding {
@@ -1079,16 +1151,141 @@ impl SymbolicReasoner {
     }
 
     pub fn contextualize(&mut self, input: &str) -> Option<String> {
+        self.contextualize_with_receipt(input)
+            .map(|rewrite| rewrite.text)
+    }
+
+    /// 与 `contextualize` 相同，但附带来源收据（哪个洞由哪一轮的哪个槽补上）。
+    ///
+    /// 处理顺序：代词消解 → 话语帧合一（前置尝试，命中才接管）→ 旧省略规则
+    /// → 代词改写。帧通道不合法的合一逐字回退，保证零劣化。
+    pub fn contextualize_with_receipt(&mut self, input: &str) -> Option<ContextRewrite> {
+        self.frames.begin_turn();
         let pronoun_resolved = self.context.resolve_pronouns(input);
-        let ellipsis_base = pronoun_resolved.as_deref().unwrap_or(input);
-        let rewritten = self
-            .resolve_ellipsis(ellipsis_base)
-            .or(pronoun_resolved);
+        let base = pronoun_resolved.as_deref().unwrap_or(input);
+        let rewrite = self
+            .try_frame_rewrite(base)
+            .or_else(|| {
+                self.resolve_ellipsis(base)
+                    .map(|text| ContextRewrite::new(text))
+            })
+            .or_else(|| pronoun_resolved.map(ContextRewrite::new));
         self.record_vocabulary(input);
-        if let Some(rewritten_text) = &rewritten {
-            self.record_vocabulary(rewritten_text);
+        if let Some(rewrite) = &rewrite {
+            self.record_vocabulary(&rewrite.text);
         }
-        rewritten
+        rewrite
+    }
+
+    /// 话语帧通道：复合问句拆帧（第一问照答、其余挂账）、省略追问合一补全、
+    /// 完整 AskAttr 问句登记为上一帧。命中返回规范问句与来源收据。
+    fn try_frame_rewrite(&mut self, input: &str) -> Option<ContextRewrite> {
+        let turn = self.frames.turn();
+        if let Some(compound) =
+            dialogue_frame::parse_compound(input, &FrameOntology(self), turn)
+        {
+            let frames = compound.frames;
+            let first_question = frames.first().and_then(|frame| frame.question())?;
+            let mut notes = Vec::new();
+            if frames.len() > 1 {
+                notes.push(format!(
+                    "话语帧：先答「{}」，其余挂账等待追问：{}",
+                    first_question,
+                    frames[1..]
+                        .iter()
+                        .map(|frame| frame.display())
+                        .collect::<Vec<_>>()
+                        .join("；")
+                ));
+            }
+            self.frames.record_compound(frames);
+            return Some(ContextRewrite {
+                text: first_question,
+                notes,
+            });
+        }
+
+        let fragment = dialogue_frame::parse_followup(input, &FrameOntology(self), turn)
+            .or_else(|| {
+                dialogue_frame::parse_bare_attribute_question(input, &FrameOntology(self), turn)
+            });
+        if let Some(fragment) = fragment {
+            let plan = self.frames.plan_followup(&fragment)?;
+            if !self.frame_slots_known(&plan.frame) {
+                return None;
+            }
+            let resolution = self.frames.commit_followup(plan);
+            return Some(ContextRewrite {
+                text: resolution.question,
+                notes: vec![resolution.note],
+            });
+        }
+
+        if let Some(frame) = self.parse_full_ask_frame(input) {
+            self.frames.record_last(frame);
+        }
+        None
+    }
+
+    /// 完整 AskAttr 问句（单跳、实体与谓词均在本体登记）→ 登记为上一帧
+    fn parse_full_ask_frame(&self, input: &str) -> Option<AskAttributeFrame> {
+        let plan = self.planner.parse(input)?;
+        let QueryPlan::FindObject { segments } = plan else {
+            return None;
+        };
+        let (entity, predicates) = self.split_chain(&segments)?;
+        if predicates.len() != 1 {
+            return None;
+        }
+        if !self.is_known_entity(&entity) {
+            return None;
+        }
+        let attribute = self.canonical_attribute(&predicates[0].surface)?;
+        Some(AskAttributeFrame::new(
+            input.trim(),
+            self.frames.turn(),
+            Some(entity),
+            Some(attribute),
+        ))
+    }
+
+    /// 合一产物的排序复核：实体/属性都必须是已登记项
+    fn frame_slots_known(&self, frame: &AskAttributeFrame) -> bool {
+        let entity_known = frame
+            .entity
+            .as_deref()
+            .map(|entity| self.is_known_entity(entity))
+            .unwrap_or(false);
+        let attribute_known = frame
+            .attribute
+            .as_deref()
+            .and_then(|attribute| self.canonical_attribute(attribute))
+            .is_some();
+        entity_known && attribute_known
+    }
+
+    /// 归一化属性词面：保留逆向词面的表述方向（「徒弟」问句 ↔「师傅」事实）
+    fn canonical_attribute(&self, raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if self.inverse_query_map.contains_key(raw) {
+            return Some(raw.to_string());
+        }
+        let canonical = self.aligner.canonical_form(raw);
+        if self.inverse_query_map.contains_key(canonical.as_str()) {
+            return Some(canonical);
+        }
+        let known = matches!(
+            self.aligner.kind_of(&canonical),
+            Some(TermKind::Relation) | Some(TermKind::Attribute)
+        ) || self.predictor.has_predicate(&canonical);
+        if known {
+            Some(canonical)
+        } else {
+            None
+        }
     }
 
     fn resolve_ellipsis(&self, input: &str) -> Option<String> {
@@ -2916,6 +3113,23 @@ impl SymbolicReasoner {
                     value: object,
                     prediction: None,
                 });
+            }
+        }
+        // 实体属性（非关系型三元组）同样沿属性槽位命中：属性查询与关系查询
+        // 走同一条链，逆向（反查主体）暂不支持属性。
+        if !predicate.inverted {
+            if let Some(values) = self
+                .attribute_index
+                .get(&(node.to_string(), predicate.slot.clone()))
+            {
+                for value in values {
+                    if seen.insert(value.clone()) {
+                        hits.push(ValueHit {
+                            value: value.clone(),
+                            prediction: None,
+                        });
+                    }
+                }
             }
         }
         if !predicate.inverted && self.config.enable_link_prediction {
@@ -4921,8 +5135,12 @@ impl SymbolicReasoner {
         } else {
             format!("{} 条", self.lessons.len())
         };
+        let frame_info = match self.frames.last() {
+            Some(frame) => format!("上一帧「{}」、挂账 {} 条", frame.display(), self.frames.pending().len()),
+            None => format!("上一帧（无）、挂账 {} 条", self.frames.pending().len()),
+        };
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}，话语帧 {}。",
             focus,
             predicate,
             generation,
@@ -4930,7 +5148,8 @@ impl SymbolicReasoner {
             session_info,
             self.session_clauses.len(),
             clarify,
-            lesson_info
+            lesson_info,
+            frame_info
         )
     }
 
@@ -4966,6 +5185,7 @@ impl SymbolicReasoner {
         snapshot.lessons = self.lessons.clone();
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
         snapshot.contrast = contrast.cloned();
+        snapshot.frames = Some(self.frames.clone());
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)
@@ -4993,6 +5213,10 @@ impl SymbolicReasoner {
 
     fn apply_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) {
         self.context.restore(snapshot);
+        // 话语帧记忆：恢复上一帧与挂账（重启后接着补全未竟之问）
+        if let Some(frames) = &snapshot.frames {
+            self.frames = frames.clone();
+        }
         // 跨会话临时信念：恢复被采纳的会话假设（仍不写知识图谱）
         let mut restored: Vec<Atom> = Vec::new();
         for entry in &snapshot.session_facts {
@@ -5251,6 +5475,167 @@ mod tests {
         reasoner.contextualize("张三的师傅是谁");
         let rewritten = reasoner.contextualize("其他人的师傅是谁");
         assert!(rewritten.is_none() || rewritten.as_deref() == Some("其他张三的师傅是谁"));
+    }
+
+    fn attribute_facts() -> Vec<PrologFact> {
+        let mut properties = HashMap::new();
+        properties.insert("身高".to_string(), "226cm".to_string());
+        properties.insert("体重".to_string(), "140kg".to_string());
+        vec![PrologFact::Entity {
+            name: "姚明".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }]
+    }
+
+    #[test]
+    fn test_frame_full_question_records_last_frame() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.contextualize("张三的师祖是谁").is_none());
+        assert_eq!(
+            reasoner.frame_memory().last().map(|frame| frame.display()),
+            Some("张三 的 师祖".to_string())
+        );
+    }
+
+    #[test]
+    fn test_frame_multi_hop_question_is_not_recorded() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.contextualize("张三的师傅的师傅是谁").is_none());
+        assert!(
+            reasoner.frame_memory().last().is_none(),
+            "多跳问句不是 AskAttr 帧，不应被登记"
+        );
+    }
+
+    #[test]
+    fn test_frame_followup_inherits_attribute_with_receipt() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.contextualize("张三的师祖是谁");
+        let rewrite = reasoner
+            .contextualize_with_receipt("那李四呢")
+            .expect("帧合一应接管省略追问");
+        assert_eq!(rewrite.text, "李四的师祖是什么");
+        assert!(
+            rewrite
+                .notes
+                .iter()
+                .any(|note| note.contains("属性「师祖」←第 1 轮的完整帧")),
+            "来源收据应标注属性洞的来源：{:?}",
+            rewrite.notes
+        );
+    }
+
+    #[test]
+    fn test_frame_followup_inherits_entity_slot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.contextualize("张三的师傅是谁");
+        let rewrite = reasoner
+            .contextualize_with_receipt("师祖呢")
+            .expect("帧合一应接管属性追问");
+        assert_eq!(rewrite.text, "张三的师祖是什么");
+    }
+
+    #[test]
+    fn test_frame_unknown_followup_falls_back_to_char_rule() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.contextualize("张三的师傅是谁");
+        let rewritten = reasoner
+            .contextualize("某某某呢")
+            .expect("未知实体仍应走旧省略规则");
+        assert_eq!(rewritten, "某某某的师傅是什么");
+    }
+
+    #[test]
+    fn test_frame_compound_defers_tail_then_pays_off() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        let first = reasoner
+            .contextualize_with_receipt("姚明的身高和体重是多少")
+            .expect("复合问句应拆帧并先答第一问");
+        assert_eq!(first.text, "姚明的身高是什么");
+        assert!(
+            first.notes.iter().any(|note| note.contains("挂账")),
+            "第一答应提示其余挂账：{:?}",
+            first.notes
+        );
+        assert!(reasoner.frame_memory_report().contains("姚明 的 体重"));
+
+        let answer = reasoner
+            .answer(&first.text)
+            .expect("第一问应能命中属性索引");
+        assert!(answer.contains("226cm"), "第一问答案：{}", answer);
+
+        let second = reasoner
+            .contextualize_with_receipt("体重呢")
+            .expect("追问应结清挂账");
+        assert_eq!(second.text, "姚明的体重是什么");
+        assert!(
+            second.notes.iter().any(|note| note.contains("补全第 1 轮挂账")),
+            "收据应标注挂账来源：{:?}",
+            second.notes
+        );
+        assert!(reasoner.frame_memory().pending().is_empty());
+        let answer2 = reasoner
+            .answer(&second.text)
+            .expect("结清的问句应能命中属性索引");
+        assert!(answer2.contains("140kg"), "第二问答案：{}", answer2);
+    }
+
+    #[test]
+    fn test_attribute_question_answers_from_index() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        let answer = reasoner
+            .answer("姚明的身高是什么")
+            .expect("属性值应沿属性槽位命中");
+        assert!(answer.contains("226cm"), "属性答案：{}", answer);
+    }
+
+    #[test]
+    fn test_frame_keeps_inverted_query_surface() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.register_predicate_query_surface("徒弟", "师傅");
+        reasoner.contextualize("张三的徒弟是谁");
+        assert_eq!(
+            reasoner
+                .frame_memory()
+                .last()
+                .and_then(|frame| frame.attribute.clone()),
+            Some("徒弟".to_string()),
+            "帧属性应保留逆向词面，不能塌缩成槽位「师傅」"
+        );
+        let rewrite = reasoner
+            .contextualize_with_receipt("那李四呢")
+            .expect("帧合一应保留逆向方向");
+        assert_eq!(rewrite.text, "李四的徒弟是什么");
+    }
+
+    #[test]
+    fn test_frame_memory_persists_across_sessions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dialogue.json");
+        let state_path = path.to_str().unwrap();
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        reasoner.contextualize_with_receipt("姚明的身高和体重是多少");
+        reasoner.save_dialogue_state(state_path).unwrap();
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&attribute_facts());
+        assert!(restored.load_dialogue_state(state_path));
+        let rewrite = restored
+            .contextualize_with_receipt("体重呢")
+            .expect("恢复后挂账应仍可结清");
+        assert_eq!(rewrite.text, "姚明的体重是什么");
+        assert!(rewrite.notes.iter().any(|note| note.contains("第 1 轮挂账")));
     }
 
     #[test]

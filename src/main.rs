@@ -545,6 +545,13 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 话语帧记忆：带洞查询帧 + 挂账（合一式多轮消解，可审计）
+        if matches!(input, "帧记忆" | "话语帧" | "挂账") {
+            println!("{}", symbolic_reasoner.frame_memory_report());
+            println!();
+            continue;
+        }
+
         // 对话本体状态：展示对话管理器实例与显式的策略规则程序
         if input == "对话本体" || input == "对话状态" {
             println!("{}", dialogue_manager.summary());
@@ -2030,11 +2037,14 @@ async fn run_interactive_mode(
                 }
             }
             InputMode::Query => {
-                // 多轮对话上下文：指代消解与省略补全（符号方式，无神经网络）
-                let contextual_input = match symbolic_reasoner.contextualize(input) {
-                    Some(rewritten) => {
-                        println!("（结合对话上下文理解为：{}）", rewritten);
-                        rewritten
+                // 多轮对话上下文：指代消解与省略补全（话语帧合一，符号方式，无神经网络）
+                let contextual_input = match symbolic_reasoner.contextualize_with_receipt(input) {
+                    Some(rewrite) => {
+                        for note in &rewrite.notes {
+                            println!("（{}）", note);
+                        }
+                        println!("（结合对话上下文理解为：{}）", rewrite.text);
+                        rewrite.text
                     }
                     None => input.to_string(),
                 };
@@ -2728,7 +2738,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 124] = [
+    const COMMANDS: [&str; 127] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -2777,6 +2787,9 @@ fn is_command_like(input: &str) -> bool {
         "相似实体",
         "语义相似",
         "对话记忆",
+        "帧记忆",
+        "话语帧",
+        "挂账",
         "如果",
         "假如",
         "反事实",
@@ -3335,6 +3348,9 @@ mod session_tests {
             "外链刷新：法国",
             "外链删除：法国",
             "同义链接：姚明 = ownthink:姚明",
+            "帧记忆",
+            "话语帧",
+            "挂账",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }

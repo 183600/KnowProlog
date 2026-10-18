@@ -163,10 +163,12 @@ impl QueryPlanner {
     }
 
     fn strip_question_tail(q: &str) -> (&str, bool) {
-        const TAILS: [&str; 9] = [
+        const TAILS: [&str; 11] = [
             "是什么人",
             "是哪一位",
             "是哪一个",
+            "是多少",
+            "有多少",
             "是什么",
             "是哪个",
             "是哪位",
@@ -477,6 +479,24 @@ mod tests {
             plan,
             QueryPlan::FindObject {
                 segments: vec!["李四".to_string(), "师祖".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_find_object_with_amount_tail() {
+        let plan = planner().parse("姚明的身高是多少").expect("应编译为查找计划");
+        assert_eq!(
+            plan,
+            QueryPlan::FindObject {
+                segments: vec!["姚明".to_string(), "身高".to_string()]
+            }
+        );
+        let plan2 = planner().parse("李四的师傅有多少").expect("应编译为查找计划");
+        assert_eq!(
+            plan2,
+            QueryPlan::FindObject {
+                segments: vec!["李四".to_string(), "师傅".to_string()]
             }
         );
     }

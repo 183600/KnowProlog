@@ -33,6 +33,7 @@ pub mod entity_linker;
 pub mod symbolic_generator;
 pub mod semantic_entailment;
 pub mod resolution_engine;
+pub mod dialogue_frame;
 pub mod abduction;
 pub mod association_miner;
 pub mod graph_walk_embedding;
