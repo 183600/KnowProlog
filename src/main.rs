@@ -2059,7 +2059,7 @@ async fn run_interactive_mode(
                     }
                     None => {
                         // 无源可填的实体洞：不落进「无法理解」，转为一次显式绑定请求
-                        // （澄清 = 请求一次绑定；旧通道必然失败时才开启）。
+                        // （澄清 = 请求一次绑定；既有通道必然失败时才开启）。
                         if let Some(prompt) = symbolic_reasoner.start_frame_clarification(input) {
                             println!("{}", prompt);
                             println!();

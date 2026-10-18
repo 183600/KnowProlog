@@ -2817,7 +2817,7 @@ mod cache_tests {
         assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
         let queries = perf.count("direct_answer_query");
 
-        // 两个键都在：来回询问均命中缓存，不再重查
+        // 两个键都在：来回询问均命中缓存
         assert_eq!(
             manager.get_direct_answer("capital_query", &entities).await,
             first

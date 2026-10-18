@@ -1273,9 +1273,9 @@ mod tests {
         let request = restored.clarification().expect("澄清应随记忆持久化");
         assert_eq!(request.raw, "体重是多少");
         assert_eq!(request.candidates.len(), 2);
-        // 旧版快照（无澄清字段）仍可读：缺省即无澄清
-        let old_json = r#"{"turn":2,"last":null,"pending":[],"max_pending":4,"pending_ttl":6,"unifications":0,"pending_closed":0}"#;
-        let old: FrameMemory = serde_json::from_str(old_json).expect("旧快照应向后兼容");
-        assert!(old.clarification().is_none());
+        // 缺少澄清字段的快照仍可读：缺省即无澄清
+        let stored_json = r#"{"turn":2,"last":null,"pending":[],"max_pending":4,"pending_ttl":6,"unifications":0,"pending_closed":0}"#;
+        let stored: FrameMemory = serde_json::from_str(stored_json).expect("缺少澄清字段的快照应可反序列化");
+        assert!(stored.clarification().is_none());
     }
 }

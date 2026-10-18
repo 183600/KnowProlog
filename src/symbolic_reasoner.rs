@@ -823,7 +823,7 @@ impl SymbolicReasoner {
     ///   1) 配置启用澄清，且没有进行中的溯因/帧澄清（至多一条）；
     ///   2) 问句是无主语属性问句（`属性+是多少/是什么`），但不含「呢」
     ///      （「体重呢」属于既有省略/对话管理器通道）；
-    ///   3) 旧通道必然失败：上一完整帧为空、挂账为空（否则应走合一补全）；
+    ///   3) 既有通道必然失败：上一完整帧为空、挂账为空（否则应走合一补全）；
     ///   4) 候选非空：焦点实体优先，其余是知识库中确实拥有该属性的实体。
     pub fn start_frame_clarification(&mut self, input: &str) -> Option<String> {
         if !self.config.enable_clarification || self.clarification_active() {
