@@ -851,7 +851,9 @@ jobs:
               export XUEN_MODEL_FLAGS="$VARFLAGS"
               record_model "$CURRENT_MODEL"
               echo "=========== iter #$i | phase=ideas(xuen) | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$CURRENT_MODEL effort=${XUEN_MODEL_FLAGS:-none} ==========="
-              timeout --kill-after=120 "$budget" python3 /tmp/xuen/main.py "$task" --no-tui -c /tmp/xuen/config.yaml 2>&1 | tee "$OUT"
+              # --no-rounds：只取「想法区」，跳过轮次守卫（候选快照 + AI 评审都会再调一次 agent，
+              # 纯灵感阶段没必要，省下的时间留给后面的写代码阶段）
+              timeout --kill-after=120 "$budget" python3 /tmp/xuen/main.py "$task" --no-tui --no-rounds -c /tmp/xuen/config.yaml 2>&1 | tee "$OUT"
               local EC=${PIPESTATUS[0]}
               # 清理可能残留的 opencode 孤儿进程
               pkill -f "opencode run" 2>/dev/null || true
