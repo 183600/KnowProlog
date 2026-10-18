@@ -179,6 +179,30 @@ impl SymbolicGenerator {
         &self.predicate_surfaces
     }
 
+    /// 实体的属性键（去重排序）：供对话管理器生成"我还知道它的……"式追问建议
+    pub fn attribute_keys(&self, entity: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .attributes
+            .get(entity)
+            .map(|pairs| pairs.iter().map(|(key, _)| key.clone()).collect())
+            .unwrap_or_default();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// 实体作为主语出现过的关系谓词（去重排序）：与属性键合并后作为可追问主题
+    pub fn relation_predicates(&self, entity: &str) -> Vec<String> {
+        let mut predicates: Vec<String> = self
+            .by_subject
+            .get(entity)
+            .map(|subjects| subjects.keys().cloned().collect())
+            .unwrap_or_default();
+        predicates.sort();
+        predicates.dedup();
+        predicates
+    }
+
     pub fn observe_entity(&mut self, name: &str, etype: &str, properties: &[(String, String)]) {
         let refs: Vec<(&str, &str)> = properties
             .iter()

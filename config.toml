@@ -50,9 +50,14 @@ enable_causal_tokenization = true     # 是否启用因果分词（知识/因果
 enable_problog = true                  # 是否启用 ProbLog 风格概率逻辑（概率事实/规则/注释析取 + BDD 可能世界精确推理）
 problog_max_depth = 6                  # 概率规则基化展开与证明路径搜索的最大深度
 problog_max_proofs = 12                # 单次概率查询最多枚举的证明路径数
+enable_dialogue_manager = true         # 是否启用本体化对话管理器（对话本体 + Horn 规则策略 + 组合生成，无神经网络）
 enable_discourse = true                # 是否启用符号主义话语引擎（OWL 本体叙述 + Prolog DCG 文法实现，无神经网络）
 discourse_max_sentences = 6            # 单次叙述最多包含的句子数（定义开场/继承/聚合/衔接共享上限）
 discourse_max_rounds = 4               # 本体闭包物化的最大推理轮数（子类/属性继承沿层级传播）
+enable_holographic_memory = true       # 是否启用全息符号记忆（VSA/HDC：绑定/叠加/置换 + 净噪的软召回 + 三元组硬核查，零训练）
+holographic_dimension = 4096           # 全息超向量维度（越大串扰越小，建议 2048~8192）
+holographic_similarity_floor = 0.01    # 召回候选的余弦下限（低于视为串扰噪声）
+holographic_max_hits = 6               # 单次全息召回的最大候选数
 
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]

@@ -22,6 +22,8 @@ use know_prolog::{
     external_knowledge::{ExternalKnowledgeService, get_direct_answer},
     symbolic_reasoner::SymbolicReasoner,
     neuro_symbolic_contrast::ContrastArbiter,
+    dialogue_manager::DialogueManager,
+    holographic_memory::{HoloAnalogyHit, HoloHit},
 };
 
 #[derive(Parser)]
@@ -159,6 +161,18 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
         }
     }
 
+    // 本体化对话管理器：把每轮对话实例化为对话本体，用 Horn 规则策略推导回答方式
+    let dialogue_enabled = config.reasoning.enable_dialogue_manager;
+    let mut dialogue_manager = DialogueManager::new();
+    if dialogue_enabled {
+        if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
+            let manager_path = format!("{}.manager.json", state_path);
+            if dialogue_manager.restore_from_path(&manager_path) {
+                println!("已恢复对话本体记忆：{}", dialogue_manager.summary());
+            }
+        }
+    }
+
     println!("{}", config.messages.ready);
     println!("{}", config.messages.query_prompt);
     println!("{}", config.messages.import_prompt);
@@ -183,6 +197,15 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
         if input == "quit" {
             break;
+        }
+
+        if dialogue_enabled && !input.is_empty() {
+            dialogue_manager.observe_input(input);
+        }
+
+        // 全息时序记忆：把本轮输入中提及的实体压入置换编码的焦点叠加（多轮"注意力轨迹"）
+        if config.reasoning.enable_holographic_memory && !input.is_empty() {
+            symbolic_reasoner.note_holo_context(input);
         }
 
         // 导入行不立即刷新：进入查询/命令前统一观察整图
@@ -237,6 +260,14 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
         if input == "对话记忆" {
             println!("{}", symbolic_reasoner.dialogue_summary());
+            println!();
+            continue;
+        }
+
+        // 对话本体状态：展示对话管理器实例与显式的策略规则程序
+        if input == "对话本体" || input == "对话状态" {
+            println!("{}", dialogue_manager.summary());
+            println!("{}", DialogueManager::policy_source());
             println!();
             continue;
         }
@@ -682,6 +713,86 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 全息符号记忆（VSA/HDC）：状态报告与召回自检（纯符号、零训练）
+        if matches!(input, "全息状态" | "全息记忆" | "全息自检" | "全息报告") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.holographic().report());
+            println!();
+            continue;
+        }
+
+        // 全息检索：软召回（绑定/解缠/净噪）→ 硬核查（三元组登记）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "全息检索：", "全息检索:", "全息查询：", "全息查询:", "全息补全：", "全息补全:",
+            ],
+        ) {
+            match parse_holo_pair(target) {
+                Some((subject, predicate)) => {
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                    let hits = symbolic_reasoner
+                        .holographic()
+                        .recall_object(&subject, &predicate);
+                    println!(
+                        "{}",
+                        render_holo_hits(
+                            &format!("全息召回「{} --{}--> ?」", subject, predicate),
+                            &hits
+                        )
+                    );
+                }
+                None => println!(
+                    "请给出「主体 谓词」，例如：全息检索：张三 师傅 或 全息检索：张三的师傅"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 全息反查：(谓词, 客体) → ?主体
+        if let Some(target) = strip_any_prefix(input, &["全息反查：", "全息反查:"]) {
+            match parse_holo_pair(target) {
+                Some((predicate, object)) => {
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                    let hits = symbolic_reasoner
+                        .holographic()
+                        .recall_subject(&predicate, &object);
+                    println!(
+                        "{}",
+                        render_holo_hits(
+                            &format!("全息反查「? --{}--> {}」", predicate, object),
+                            &hits
+                        )
+                    );
+                }
+                None => println!("请给出「谓词 客体」，例如：全息反查：师傅 李四"),
+            }
+            println!();
+            continue;
+        }
+
+        // 全息类比：A:B :: C:? —— 解缠关系谓词（硬核查通过）再迁移绑定
+        if let Some(target) = strip_any_prefix(input, &["全息类比：", "全息类比:"]) {
+            match parse_holo_terms(target, 3) {
+                Some(terms) => {
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                    let hits = symbolic_reasoner
+                        .holographic()
+                        .analogy(&terms[0], &terms[1], &terms[2]);
+                    println!(
+                        "{}",
+                        render_holo_analogy(&terms[0], &terms[1], &terms[2], &hits)
+                    );
+                }
+                None => println!(
+                    "请给出三个词，例如：全息类比：张三 李四 王五（意为 张三:李四 :: 王五:?）"
+                ),
+            }
+            println!();
+            continue;
+        }
+
         // 加权软推理：MLN-lite 加权规则 + 软真值传播（输出概率与模糊限定词）
         if matches!(input, "软推理" | "加权推理") {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
@@ -901,6 +1012,16 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
             continue;
         }
 
+        // 本体化对话管理器（纯对话行为）：回顾、解释依据、续聊、展开、寒暄。
+        // 用对话本体 + 逻辑程序策略推导话语行为，再由模板组合生成回答。
+        if dialogue_enabled {
+            if let Some(reply) = dialogue_manager.plan_pure_dialogue(input, &symbolic_reasoner) {
+                println!("{}", reply.text);
+                println!();
+                continue;
+            }
+        }
+
         // "为什么……？"：先尝试后向链证明，未得证则生成假设解释
         if let Some(target) = input.strip_prefix("为什么") {
             let target = target.trim().trim_end_matches(['？', '?', '。', ' ']);
@@ -1068,6 +1189,15 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
 
                 for note in symbolic_reasoner.entity_link_notes(input) {
                     println!("（{}）", note);
+                }
+
+                // 本体化对话管理器：实体已知的知识问句给出"结论 + 出处 + 追问建议"式组合回答
+                if dialogue_enabled {
+                    if let Some(reply) = dialogue_manager.plan_reply(input, &symbolic_reasoner) {
+                        println!("{}", reply.text);
+                        println!();
+                        continue;
+                    }
                 }
 
                 let tagged_words = preprocess(input, &config.nlp);
@@ -1510,6 +1640,20 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
         }
     }
 
+    if dialogue_enabled {
+        if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
+            let manager_path = format!("{}.manager.json", state_path);
+            match dialogue_manager.save_to_path(&manager_path) {
+                Ok(_) => println!(
+                    "对话本体记忆已保存到 {}（{}）",
+                    manager_path,
+                    dialogue_manager.summary()
+                ),
+                Err(e) => eprintln!("保存对话本体记忆失败: {}", e),
+            }
+        }
+    }
+
     println!("系统已退出。");
 }
 
@@ -1591,7 +1735,10 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 84] = [
+    const COMMANDS: [&str; 87] = [
+        "全息",
+        "对话本体",
+        "对话状态",
         "溯因",
         "假设生成",
         "为什么",
@@ -1703,6 +1850,102 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     prefixes
         .iter()
         .find_map(|prefix| input.strip_prefix(prefix))
+}
+
+/// 把全息命令参数切成若干词项：支持空白/中英文逗号/冒号分隔
+fn parse_holo_terms(target: &str, expected: usize) -> Option<Vec<String>> {
+    let terms: Vec<String> = target
+        .split(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '，' | ',' | '：' | ':' | '、')
+        })
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_string())
+        .collect();
+    if terms.len() == expected {
+        Some(terms)
+    } else {
+        None
+    }
+}
+
+/// 解析全息检索的两元组：支持「主体 谓词」与「主语的谓词」两种写法
+fn parse_holo_pair(target: &str) -> Option<(String, String)> {
+    if let Some(terms) = parse_holo_terms(target, 2) {
+        return Some((terms[0].clone(), terms[1].clone()));
+    }
+    let text = target.trim();
+    if let Some(index) = text.find('的') {
+        let subject = text[..index].trim();
+        let predicate = text[index + '的'.len_utf8()..].trim();
+        if !subject.is_empty() && !predicate.is_empty() {
+            return Some((subject.to_string(), predicate.to_string()));
+        }
+    }
+    None
+}
+
+/// 渲染全息召回候选（软召回分数 + 硬核查标记）
+fn render_holo_hits(title: &str, hits: &[HoloHit]) -> String {
+    if hits.is_empty() {
+        return format!(
+            "{}：全息图未召回候选（实体/谓词未登记，或该结构在知识中不存在）。",
+            title
+        );
+    }
+    let verified = hits.iter().filter(|hit| hit.verified).count();
+    let mut out = format!(
+        "{}（候选 {} 个，通过三元组核查 {} 个）：",
+        title,
+        hits.len(),
+        verified
+    );
+    for (index, hit) in hits.iter().enumerate() {
+        let mark = if hit.verified {
+            "已核查✓"
+        } else {
+            "未登记（串扰/推测，不入结论）"
+        };
+        out.push_str(&format!(
+            "\n  {}. {}  余弦 {:.3}  [{}]",
+            index + 1,
+            hit.symbol,
+            hit.score,
+            mark
+        ));
+    }
+    out
+}
+
+/// 渲染全息类比候选（关系迁移路径 + 核查标记）
+fn render_holo_analogy(a: &str, b: &str, c: &str, hits: &[HoloAnalogyHit]) -> String {
+    if hits.is_empty() {
+        return format!(
+            "全息类比 {}:{} :: {}:? 未产生候选（需先登记一组对应事实，关系才能被解缠迁移）。",
+            a, b, c
+        );
+    }
+    let mut out = format!("全息类比 {}:{} :: {}:?（关系解缠 → 迁移绑定 → 净噪）：", a, b, c);
+    for (index, hit) in hits.iter().enumerate() {
+        let via: Vec<String> = hit
+            .via
+            .iter()
+            .map(|(predicate, score)| format!("{}（{:.2}）", predicate, score))
+            .collect();
+        let mark = if hit.verified {
+            "已核查✓"
+        } else {
+            "未登记（全息推测，供参考）"
+        };
+        out.push_str(&format!(
+            "\n  {}. {}  综合分 {:.3}  关系通道：{}  [{}]",
+            index + 1,
+            hit.symbol,
+            hit.score,
+            via.join("、"),
+            mark
+        ));
+    }
+    out
 }
 
 /// 解析中文数词（1..=99）：十一、二十、二十三、九十九

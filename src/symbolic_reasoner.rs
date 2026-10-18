@@ -16,6 +16,7 @@ use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
+use crate::holographic_memory::HolographicMemory;
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
@@ -508,6 +509,9 @@ pub struct SymbolicReasoner {
     predicate_canonicals_memo: parking_lot::Mutex<Option<(String, Arc<HashSet<String>>)>>,
     // 符号主义话语引擎：OWL 本体叙述（定义/继承/推导链）+ DCG 文法实现（多句式生成）
     discourse: DiscoursePlanner,
+    // 全息符号记忆（VSA/HDC）：绑定/叠加/置换 + 净噪的软召回通道，
+    // 与三元组登记集合（硬核查通道）交叉验证，无神经网络、零训练
+    holo: HolographicMemory,
 }
 
 impl SymbolicReasoner {
@@ -549,6 +553,11 @@ impl SymbolicReasoner {
         let problog = ProblogEngine::new(config.problog_max_depth, config.problog_max_proofs);
         let discourse =
             DiscoursePlanner::new(config.discourse_max_rounds, config.discourse_max_sentences);
+        let holo = HolographicMemory::new(
+            config.holographic_dimension,
+            config.holographic_similarity_floor,
+            config.holographic_max_hits,
+        );
         let mut reasoner = Self {
             config,
             aligner,
@@ -579,6 +588,7 @@ impl SymbolicReasoner {
             entity_mentions_memo: parking_lot::Mutex::new(None),
             predicate_canonicals_memo: parking_lot::Mutex::new(None),
             discourse,
+            holo,
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
@@ -612,6 +622,21 @@ impl SymbolicReasoner {
 
     pub fn walks(&self) -> &GraphWalkEmbedding {
         &self.walks
+    }
+
+    /// 全息符号记忆（VSA/HDC 软召回通道 + 三元组硬核查通道）
+    pub fn holographic(&self) -> &HolographicMemory {
+        &self.holo
+    }
+
+    /// 把一段文本里的已知实体压入全息时序记忆（多轮对话的"注意力轨迹"）
+    pub fn note_holo_context(&mut self, text: &str) {
+        if !self.config.enable_holographic_memory {
+            return;
+        }
+        for entity in self.entities_mentioned(text) {
+            self.holo.push_focus(&entity);
+        }
     }
 
     pub fn soft_logic(&self) -> &MarkovLogicEngine {
@@ -667,6 +692,9 @@ impl SymbolicReasoner {
                     if self.config.enable_graph_walk {
                         self.walks.observe_triple(from, rel_type, to);
                     }
+                    if self.config.enable_holographic_memory {
+                        self.holo.observe_triple(from, rel_type, to);
+                    }
                     association_changed |= self.associations.observe_triple(from, rel_type);
                     added += 1;
                 }
@@ -703,6 +731,9 @@ impl SymbolicReasoner {
                             .insert((name.clone(), key.clone(), value.clone()))
                         {
                             attribute_changed = true;
+                        }
+                        if self.config.enable_holographic_memory {
+                            self.holo.observe_triple(name, key, value);
                         }
                     }
                     entity_observed = true;
@@ -898,6 +929,11 @@ impl SymbolicReasoner {
         }
         if !entities.is_empty() {
             self.context.record_entities(&entities);
+            if self.config.enable_holographic_memory {
+                for entity in &entities {
+                    self.holo.push_focus(entity);
+                }
+            }
         }
         let normalized_text = self.aligner.normalize_cow(text);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(text);
@@ -4681,9 +4717,14 @@ mod tests {
             enable_problog: true,
             problog_max_depth: 6,
             problog_max_proofs: 12,
+            enable_dialogue_manager: true,
             enable_discourse: true,
             discourse_max_sentences: 6,
             discourse_max_rounds: 4,
+            enable_holographic_memory: true,
+            holographic_dimension: 4096,
+            holographic_similarity_floor: 0.01,
+            holographic_max_hits: 6,
         }
     }
 
@@ -5995,5 +6036,66 @@ mod tests {
         assert!(report.contains("已学会 1 条"), "实际：{}", report);
         assert!(report.contains("未学会"), "应逐条报告失败原因：{}", report);
         assert!(report.contains("疑问句"), "疑问句应被拒绝：{}", report);
+    }
+
+    #[test]
+    fn test_holographic_memory_feeds_from_facts_and_recalls() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let holo = reasoner.holographic();
+        assert_eq!(holo.triple_count(), 4, "全部三元组应进入全息图");
+        assert!(holo.dimension() >= 256);
+
+        let objects = holo.recall_object("张三", "师傅");
+        assert_eq!(
+            objects.first().map(|hit| hit.symbol.as_str()),
+            Some("李四"),
+            "全息客体召回 top-1 应为李四：{:?}",
+            objects
+        );
+        assert!(objects[0].verified, "事实中的三元组应通过硬核查");
+
+        let subjects = holo.recall_subject("师傅", "王五");
+        assert_eq!(subjects.first().map(|hit| hit.symbol.as_str()), Some("李四"));
+
+        let predicates = holo.recall_predicate("张三", "王五");
+        assert_eq!(
+            predicates.first().map(|hit| hit.symbol.as_str()),
+            Some("师祖")
+        );
+
+        let analogy = holo.analogy("张三", "李四", "王五");
+        assert_eq!(
+            analogy.first().map(|hit| hit.symbol.as_str()),
+            Some("赵六"),
+            "张三:李四 :: 王五:? 应迁移师傅关系召回赵六：{:?}",
+            analogy
+        );
+        assert!(analogy[0].verified);
+    }
+
+    #[test]
+    fn test_holographic_context_records_mention_trace() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.note_holo_context("张三的师傅是谁？");
+        reasoner.note_holo_context("李四的国籍是什么？");
+        let holo = reasoner.holographic();
+        assert_eq!(holo.context_len(), 2, "两轮不同焦点应产生两条时序记忆");
+        let recent = holo.recent_focus(0).expect("应能回读最近焦点");
+        assert_eq!(recent.symbol, "李四");
+        let previous = holo.recent_focus(1).expect("应能回读上一轮焦点");
+        assert_eq!(previous.symbol, "张三");
+    }
+
+    #[test]
+    fn test_holographic_memory_respects_disabled_config() {
+        let mut config = test_config();
+        config.enable_holographic_memory = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.note_holo_context("张三的师傅是谁？");
+        assert_eq!(reasoner.holographic().triple_count(), 0);
+        assert_eq!(reasoner.holographic().context_len(), 0);
     }
 }

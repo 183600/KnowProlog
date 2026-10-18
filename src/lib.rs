@@ -46,6 +46,9 @@ pub mod neuro_symbolic_contrast;
 pub mod discourse;
 pub mod dense_retrieval;
 pub mod formal_semantics;
+pub mod logic_program;
+pub mod dialogue_manager;
+pub mod holographic_memory;
 
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
@@ -177,12 +180,38 @@ pub struct ReasoningConfig {
     pub problog_max_depth: usize,
     #[serde(default = "default_problog_max_proofs")]
     pub problog_max_proofs: usize,
+    #[serde(default = "default_enable_dialogue_manager")]
+    pub enable_dialogue_manager: bool,
     #[serde(default = "default_enable_discourse")]
     pub enable_discourse: bool,
     #[serde(default = "default_discourse_max_sentences")]
     pub discourse_max_sentences: usize,
     #[serde(default = "default_discourse_max_rounds")]
     pub discourse_max_rounds: usize,
+    #[serde(default = "default_enable_holographic_memory")]
+    pub enable_holographic_memory: bool,
+    #[serde(default = "default_holographic_dimension")]
+    pub holographic_dimension: usize,
+    #[serde(default = "default_holographic_similarity_floor")]
+    pub holographic_similarity_floor: f64,
+    #[serde(default = "default_holographic_max_hits")]
+    pub holographic_max_hits: usize,
+}
+
+fn default_enable_holographic_memory() -> bool {
+    true
+}
+
+fn default_holographic_dimension() -> usize {
+    holographic_memory::DEFAULT_DIMENSION
+}
+
+fn default_holographic_similarity_floor() -> f64 {
+    0.01
+}
+
+fn default_holographic_max_hits() -> usize {
+    6
 }
 
 fn default_enable_problog() -> bool {
@@ -198,6 +227,10 @@ fn default_problog_max_proofs() -> usize {
 }
 
 fn default_enable_discourse() -> bool {
+    true
+}
+
+fn default_enable_dialogue_manager() -> bool {
     true
 }
 
@@ -381,9 +414,14 @@ impl Default for ReasoningConfig {
             enable_problog: default_enable_problog(),
             problog_max_depth: default_problog_max_depth(),
             problog_max_proofs: default_problog_max_proofs(),
+            enable_dialogue_manager: default_enable_dialogue_manager(),
             enable_discourse: default_enable_discourse(),
             discourse_max_sentences: default_discourse_max_sentences(),
             discourse_max_rounds: default_discourse_max_rounds(),
+            enable_holographic_memory: default_enable_holographic_memory(),
+            holographic_dimension: default_holographic_dimension(),
+            holographic_similarity_floor: default_holographic_similarity_floor(),
+            holographic_max_hits: default_holographic_max_hits(),
         }
     }
 }
