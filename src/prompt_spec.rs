@@ -8,7 +8,7 @@
 //!   渲染并比对——示例不是装饰，是可执行的符合性测试；
 //! - **接地闸门（grounding gate）**：spec 声明的 `required` 槽位必须全部
 //!   拿到绑定才允许渲染；任一未绑定即返回 [`RenderOutcome::Ungrounded`]，
-//!   调用方沿 fallback 图回退（如实回退到旧渲染器 / 澄清追问），
+//!   调用方沿 fallback 图回退（如实回退到组合生成器 / 澄清追问），
 //!   从结构上排除「模板里编造内容」；
 //! - **版本化**：注册表带 [`PROMPT_SPEC_VERSION`]，逐 spec 指标可归因，
 //!   为纯符号的提示迭代（A/B）留好接口。
@@ -201,7 +201,7 @@ pub fn render_spec(spec: &PromptSpec, bindings: &BindingSet) -> RenderOutcome {
 
 /// 默认注册表：覆盖 10/13 条策略的 20 个模板变体。
 ///
-/// 未外化的策略（`recap` / `continue_topic` / `elaborate`）保留旧组合生成器，
+/// 未外化的策略（`recap` / `continue_topic` / `elaborate`）保留组合生成器，
 /// 由 [`coverage`] 显式报告——「有没有外化」本身是可观测状态。
 pub static DEFAULT_SPECS: &[PromptSpec] = &[
     PromptSpec {
@@ -583,7 +583,7 @@ pub fn lint_default() -> Vec<PromptLintIssue> {
     lint_specs(DEFAULT_SPECS)
 }
 
-/// 策略覆盖情况：(已外化, 仍旧内嵌)。
+/// 策略覆盖情况：(已外化, 未外化)。
 pub fn coverage() -> (Vec<&'static str>, Vec<&'static str>) {
     let mut covered = Vec::new();
     let mut legacy = Vec::new();
@@ -605,11 +605,11 @@ pub fn coverage() -> (Vec<&'static str>, Vec<&'static str>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
-    /// 只走旧组合生成器（零行为变化）。
+    /// 只走组合生成器（零行为变化）。
     Off,
-    /// 双跑：旧文本照常返回，同时用 spec 渲染并计数差异（迁移观察期）。
+    /// 双跑：文本照常返回，同时用 spec 渲染并计数差异。
     Parity,
-    /// 启用 spec 渲染；接地失败时回退旧渲染器（结构保证不幻觉）。
+    /// 启用 spec 渲染；接地失败时回退组合生成器（结构保证不幻觉）。
     On,
 }
 
@@ -645,11 +645,11 @@ pub struct PromptStats {
     pub checked: usize,
     /// required 槽位全部绑定，成功渲染。
     pub grounded: usize,
-    /// required 槽位缺失，回退旧渲染器。
+    /// required 槽位缺失，回退组合生成器。
     pub ungrounded: usize,
-    /// 无 spec 映射、保留旧组合生成器的策略次数。
+    /// 无 spec 映射、保留组合生成器的策略次数。
     pub legacy: usize,
-    /// 平价模式下 spec 渲染与旧文本不一致的次数。
+    /// 平价模式下 spec 渲染与组合生成器文本不一致的次数。
     pub parity_mismatches: usize,
     /// 缺失槽位计数（槽位名 → 次数）。
     pub missing_slots: BTreeMap<String, usize>,
@@ -700,7 +700,7 @@ impl PromptStats {
 
     pub fn render_text(&self) -> String {
         format!(
-            "提示模板：尝试 {} 次（接地 {} / 未接地 {}），旧组合 {} 次，平价差异 {} 次，接地率 {:.4}。",
+            "提示模板：尝试 {} 次（接地 {} / 未接地 {}），组合生成器 {} 次，平价差异 {} 次，接地率 {:.4}。",
             self.attempted(),
             self.grounded,
             self.ungrounded,

@@ -1,11 +1,11 @@
 //! 视图渲染：把内部符号结构渲染为「看得见的推理」。
 //!
 //! 四张视图，全部零依赖、确定性优先（同输入同字节，可做 golden 测试）：
-//!   - V1 证明树：`ProofNode` → Mermaid / ASCII，节点集 ≡ 证明展平集合（不增不减）；
-//!   - V2 知识子图：焦点实体 N 跳邻域的确定性 BFS 分层 → Mermaid / DOT / SVG / JSON，
+//!   - 证明树：`ProofNode` → Mermaid / ASCII，节点集 ≡ 证明展平集合（不增不减）；
+//!   - 知识子图：焦点实体 N 跳邻域的确定性 BFS 分层 → Mermaid / DOT / SVG / JSON，
 //!     本轮实际用到的边可高亮（provenance 审计）；
-//!   - V3 对话时间线：Chronicle → Markdown 表格 / Mermaid 流程，焦点迁移与出处逐轮可见；
-//!   - V4 覆盖报告：悬空引用 / 孤立实体 / 未登记谓词，只做不依赖 schema 的确定性检查。
+//!   - 对话时间线：Chronicle → Markdown 表格 / Mermaid 流程，焦点迁移与出处逐轮可见；
+//!   - 覆盖报告：悬空引用 / 孤立实体 / 未登记谓词，只做不依赖 schema 的确定性检查。
 //!
 //! 设计戒律：输入三元组打乱顺序输出仍须同字节——视图层否则不可测试、必然腐烂。
 
@@ -20,7 +20,7 @@ use crate::resolution_engine::{ProofNode, ProofSource};
 /// SVG 手绘规模上限：超过则退化为 Mermaid 文本（避免浏览器卡死与布局失控）。
 pub const MAX_SVG_NODES: usize = 200;
 
-// ============================ V1 证明树 ============================
+// ============================ 证明树 ============================
 
 /// 证明树节点（与归结引擎解耦的视图类型；标签可用自然语言渲染）。
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +91,7 @@ fn mermaid_label(text: &str) -> String {
         .replace('\r', "")
 }
 
-/// V1：证明森林 → Mermaid（前序编号，边 = 子证明关系）。
+/// 证明森林 → Mermaid（前序编号，边 = 子证明关系）。
 pub fn render_proof_mermaid(forest: &[ProofViewNode]) -> String {
     let mut lines = vec!["graph TD".to_string()];
     let mut next_id = 0usize;
@@ -130,7 +130,7 @@ fn ascii_children(children: &[ProofViewNode], prefix: &str, lines: &mut Vec<Stri
     }
 }
 
-/// V1：证明森林 → ASCII 树（终端可读）。
+/// 证明森林 → ASCII 树（终端可读）。
 pub fn render_proof_ascii(forest: &[ProofViewNode]) -> String {
     let mut lines = Vec::new();
     for (index, root) in forest.iter().enumerate() {
@@ -146,7 +146,7 @@ pub fn render_proof_ascii(forest: &[ProofViewNode]) -> String {
     lines.join("\n")
 }
 
-// ============================ V2 知识子图 ============================
+// ============================ 知识子图 ============================
 
 /// 子图节点。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,7 +286,7 @@ impl KnowledgeSubgraph {
             .collect()
     }
 
-    /// V2：Mermaid（高亮边用粗箭头 `==>` 表达）。
+    /// Mermaid（高亮边用粗箭头 `==>` 表达）。
     pub fn render_mermaid(&self) -> String {
         let ids = self.node_ids();
         let mut lines = vec!["graph LR".to_string()];
@@ -315,7 +315,7 @@ impl KnowledgeSubgraph {
         lines.join("\n")
     }
 
-    /// V2：Graphviz DOT（可离线渲染为图片）。
+    /// Graphviz DOT（可离线渲染为图片）。
     pub fn render_dot(&self) -> String {
         let mutate = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
         let mut lines = vec!["digraph kg {".to_string(), "    rankdir=LR;".to_string()];
@@ -345,7 +345,7 @@ impl KnowledgeSubgraph {
         lines.join("\n")
     }
 
-    /// V2：JSON（规范序；机器消费/前端二次渲染）。
+    /// JSON（规范序；机器消费/前端二次渲染）。
     pub fn render_json(&self) -> String {
         let nodes: Vec<Value> = self
             .nodes
@@ -378,7 +378,7 @@ impl KnowledgeSubgraph {
         }))
     }
 
-    /// V2：零依赖手绘 SVG（确定性分层布局）；超过 `MAX_SVG_NODES` 退化为 Mermaid。
+    /// 零依赖手绘 SVG（确定性分层布局）；超过 `MAX_SVG_NODES` 退化为 Mermaid。
     pub fn render_svg(&self) -> String {
         if self.nodes.len() > MAX_SVG_NODES {
             return format!(
@@ -454,7 +454,7 @@ impl KnowledgeSubgraph {
     }
 }
 
-// ============================ V3 对话时间线 ============================
+// ============================ 对话时间线 ============================
 
 /// 时间线的一轮（从 Chronicle 记录投影而来）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,7 +513,7 @@ fn cell(text: &str) -> String {
     text.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
 
-/// V3：时间线 → Markdown 表格（审计视图：轮次/输入/类型/焦点/出处）。
+/// 时间线 → Markdown 表格（审计视图：轮次/输入/类型/焦点/出处）。
 pub fn render_timeline_markdown(turns: &[TimelineTurn]) -> String {
     if turns.is_empty() {
         return "（编年史为空：还没有可回放的对话）".to_string();
@@ -545,7 +545,7 @@ pub fn render_timeline_markdown(turns: &[TimelineTurn]) -> String {
     lines.join("\n")
 }
 
-/// V3：时间线 → Mermaid 流程（焦点迁移一眼可见）。
+/// 时间线 → Mermaid 流程（焦点迁移一眼可见）。
 pub fn render_timeline_flow(turns: &[TimelineTurn]) -> String {
     if turns.is_empty() {
         return "（编年史为空）".to_string();
@@ -573,7 +573,7 @@ pub fn render_timeline_flow(turns: &[TimelineTurn]) -> String {
     lines.join("\n")
 }
 
-// ============================ V4 覆盖报告 ============================
+// ============================ 覆盖报告 ============================
 
 /// 覆盖检查输入（从导入事实清单投影，不依赖 schema/domain/range）。
 #[derive(Debug, Clone, Default)]
@@ -599,7 +599,7 @@ fn push_capped(lines: &mut Vec<String>, items: &[String]) {
     }
 }
 
-/// V4：确定性覆盖/质量报告。
+/// 确定性覆盖/质量报告。
 pub fn render_coverage_report(input: &CoverageInput) -> String {
     let entities: BTreeSet<&str> = input.entities.iter().map(String::as_str).collect();
     let mut lines = vec!["知识覆盖报告（不依赖 schema 的确定性检查）：".to_string()];

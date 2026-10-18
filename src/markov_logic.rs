@@ -467,7 +467,7 @@ impl MarkovLogicEngine {
     }
 
     /// 干预语义（do-演算的符号版）：`fixed` 中的原子真值被钉住、
-    /// 且指向它们的规则不再贡献（切断因果边），其余规则照常软真值传播。
+    /// 且指向它们的规则不贡献（切断因果边），其余规则照常软真值传播。
     pub fn propagate_with_fixed(&self, fixed: &HashMap<Atom, f64>) -> Beliefs {
         let mut derived: HashMap<Atom, f64> = HashMap::new();
         let mut evidence: HashMap<Atom, Vec<RuleEvidence>> = HashMap::new();

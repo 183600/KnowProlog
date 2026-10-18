@@ -82,7 +82,7 @@ pub struct SessionPolicy {
     /// 每个回答追加「依据：…」，内容来自真实策略轨迹（非生成文本）。
     #[serde(default)]
     pub require_evidence: bool,
-    /// 让位轮不再沉默，改为确定性澄清问句（status = needs_clarification）。
+    /// 让位轮给出确定性澄清问句（status = needs_clarification）。
     #[serde(default)]
     pub strict_clarify: bool,
     /// 命中的规则标签（按出现顺序去重）。
@@ -381,7 +381,7 @@ impl ApiState {
     }
 
     /// 设置模板运行模式（在 `Arc::new` 之前调用；默认 [`PromptMode::On`]，
-    /// 接地失败会自动回退旧渲染器）。
+    /// 接地失败会自动回退组合生成器）。
     pub fn set_prompt_mode(&mut self, mode: PromptMode) {
         self.prompt_mode = mode;
     }

@@ -336,7 +336,7 @@ impl DialogueManager {
         self.prompt_stats = PromptStats::default();
     }
 
-    /// 平价差异计数（Parity 模式下 spec 渲染与旧文本不一致的次数）。
+    /// 平价差异计数（Parity 模式下 spec 渲染与组合生成器文本不一致的次数）。
     pub fn prompt_parity_mismatches(&self) -> usize {
         self.prompt_stats.parity_mismatches
     }
@@ -809,7 +809,7 @@ impl DialogueManager {
             _ => return None,
         };
         // 提示资产接管：接地闸门通过则用模板渲染（On），平价模式双跑计数（Parity），
-        // 任一 required 槽位未绑定则回退上面的旧组合生成器（结构保证不幻觉）。
+        // 任一 required 槽位未绑定则回退上面的组合生成器（结构保证不幻觉）。
         let text = self.apply_prompt_spec(
             &chosen,
             &frame,
@@ -1095,7 +1095,7 @@ impl DialogueManager {
 
     /// 选策略 → 选 spec 变体 → 绑定槽位；未外化的策略返回 None。
     ///
-    /// 槽位值必须与旧组合生成器使用的是同一批运行时值，
+    /// 槽位值必须与组合生成器使用的是同一批运行时值，
     /// 这样 Parity 模式的逐字比对才有意义（差异 = 模板资产的真差异）。
     fn prompt_bindings(
         &self,
@@ -1231,7 +1231,7 @@ impl DialogueManager {
         }
     }
 
-    /// 模板接管：Parity 双跑计数、On 用模板文本、接地失败回退旧文本。
+    /// 模板接管：Parity 双跑计数、On 用模板文本、接地失败回退组合生成器文本。
     fn apply_prompt_spec(
         &mut self,
         policy: &str,
@@ -1257,7 +1257,7 @@ impl DialogueManager {
                 if text != legacy {
                     self.prompt_stats.parity_mismatches += 1;
                     self.prompt_stats.record_mismatch(format!(
-                        "{}：模板与旧文本不一致\n    模板: {}\n    旧文: {}",
+                        "{}：模板与组合生成器文本不一致\n    模板: {}\n    组合: {}",
                         spec_id,
                         text.replace('\n', "⏎"),
                         legacy.replace('\n', "⏎")
@@ -1786,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_specs_reproduce_legacy_replies_byte_for_byte() {
+    fn test_prompt_specs_reproduce_replies_byte_for_byte() {
         let knowledge = parity_knowledge();
         let mut manager = DialogueManager::new();
         manager.set_prompt_mode(PromptMode::Parity);
@@ -1800,7 +1800,7 @@ mod tests {
         assert!(stats.checked >= 10, "覆盖不足：{}", stats.render_text());
         assert_eq!(
             stats.parity_mismatches, 0,
-            "模板与旧文本存在差异：{:#?}",
+            "模板与组合生成器文本存在差异：{:#?}",
             stats.mismatch_examples
         );
         assert_eq!(stats.ungrounded, 0, "缺槽位：{:?}", stats.missing_slots);

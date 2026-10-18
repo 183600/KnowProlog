@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 超过该规模就不再为每个实体预算向量（检索仍可按需单源计算）
+/// 超过该规模不为每个实体预算向量（检索仍可按需单源计算）
 pub const DEFAULT_MAX_EMBEDDED_ENTITIES: usize = 4000;
 
 /// 单个嵌入向量保留的最大分量数

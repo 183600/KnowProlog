@@ -203,9 +203,9 @@ pub struct Solution {
     pub confidence: f64,
 }
 
-/// 类型化归结解：与 [`Solution`] 同构，但绑定升格为 [`BoundTerm`]。
+/// 类型化归结解：与 [`Solution`] 同构，但绑定为 [`BoundTerm`]。
 ///
-/// - 未绑定变量显式表示为 [`BoundTerm::Unbound`]（旧 API 里的 `"?X"` 约定）；
+/// - 未绑定变量显式表示为 [`BoundTerm::Unbound`]（字符串 API 里的 `"?X"` 约定）；
 /// - 数值常量双存 `raw` + `value`，渲染平价、比较可用；
 /// - 绑定按查询变量顺序给出，且整个集合经 `BTreeMap` 确定性排序。
 #[derive(Debug, Clone)]
@@ -309,7 +309,7 @@ impl ResolutionEngine {
         self.facts.contains(atom)
     }
 
-    /// 全部基事实（供反事实模拟做新旧对比）
+    /// 全部基事实（供反事实模拟对比真实与干预后的推导）
     pub fn all_facts(&self) -> impl Iterator<Item = &Atom> {
         self.facts.iter()
     }
@@ -397,8 +397,8 @@ impl ResolutionEngine {
         solutions
     }
 
-    /// 与 [`Self::solve`] 同序同解的类型化版本：旧字符串行为不变，
-    /// 新调用方拿到 [`BoundTerm`]（显式未绑定 / 数值可比较）。
+    /// 与 [`Self::solve`] 同序同解的类型化版本：字符串行为不变，
+    /// 调用方拿到 [`BoundTerm`]（显式未绑定 / 数值可比较）。
     pub fn solve_typed(&self, goals: &[Atom], query_vars: &[String]) -> Vec<TypedSolution> {
         let states = self.solve_states(goals);
         let mut best: HashMap<String, TypedSolution> = HashMap::new();
@@ -950,11 +950,11 @@ pub fn bound_term(term: &Term) -> BoundTerm {
     }
 }
 
-/// 为查询变量生成「去重键 + 旧字符串绑定 + 类型化绑定」三件套。
+/// 为查询变量生成「去重键 + 字符串绑定 + 类型化绑定」三件套。
 ///
-/// 旧字符串绑定沿用 `render_term` 的隐式未绑定约定（`?X`），
+/// 字符串绑定沿用 `render_term` 的隐式未绑定约定（`?X`），
 /// 类型化绑定则给出 [`BoundTerm::Unbound`]；两者从同一次置换解析得出，
-/// 保证新旧 API 在同一解上严格对应。
+/// 保证两个 API 在同一解上严格对应。
 fn bind_query_vars(
     subst: &Substitution,
     query_vars: &[String],
@@ -1092,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_typed_matches_legacy_and_exposes_unbound() {
+    fn test_solve_typed_matches_string_engine_and_exposes_unbound() {
         let mut engine = master_engine();
         engine.add_fact("年龄", "张三", "226");
         let goals = vec![Atom::pattern(
@@ -1100,11 +1100,11 @@ mod tests {
             Term::constant("张三"),
             Term::var("X"),
         )];
-        let legacy = engine.solve(&goals, &["X".to_string()]);
+        let strings = engine.solve(&goals, &["X".to_string()]);
         let typed = engine.solve_typed(&goals, &["X".to_string()]);
-        assert_eq!(legacy.len(), typed.len());
-        // 绑定平价：类型化绑定的 raw 渲染与旧字符串逐字一致
-        for (old, new) in legacy.iter().zip(typed.iter()) {
+        assert_eq!(strings.len(), typed.len());
+        // 绑定平价：类型化绑定的 raw 渲染与字符串形式逐字一致
+        for (old, new) in strings.iter().zip(typed.iter()) {
             for (name, value) in &old.bindings {
                 let typed_value = new.bindings.get(name).expect("同解应有同名绑定");
                 assert_eq!(typed_value.render_raw().as_deref(), Some(value.as_str()));
@@ -1112,7 +1112,7 @@ mod tests {
             assert!((old.confidence - new.confidence).abs() < 1e-9);
         }
 
-        // 未绑定变量：旧 API 渲染 "?Y"，新 API 给出显式 Unbound
+        // 未绑定变量：字符串 API 渲染 "?Y"，类型化 API 给出显式 Unbound
         let goals = vec![Atom::pattern(
             "师傅",
             Term::constant("张三"),
@@ -1122,7 +1122,7 @@ mod tests {
         assert_eq!(typed[0].bindings.get("X"), Some(&BoundTerm::text("李四")));
         assert_eq!(typed[0].bindings.get("Y"), Some(&BoundTerm::Unbound));
 
-        // 数值分类：属性值 "226" 升级为可比较的 Number，但渲染仍是 "226"
+        // 数值分类：属性值 "226" 分类为可比较的 Number，但渲染仍是 "226"
         let goals = vec![Atom::pattern(
             "年龄",
             Term::constant("张三"),

@@ -96,8 +96,8 @@ enum Commands {
         /// Knowledge backend: "reasoner" (end-to-end) or "scripted" (policy layer)
         #[arg(long, default_value = "reasoner")]
         knowledge: String,
-        /// Prompt asset mode: "off" (legacy renderer only), "parity" (dual-run
-        /// comparison), or "on" (grounded templates with legacy fallback)
+        /// Prompt asset mode: "off" (combination generator only), "parity"
+        /// (dual-run comparison), or "on" (grounded templates with fallback)
         #[arg(long, default_value = "on")]
         prompt_mode: String,
         /// Baseline JSON path; enables the regression ratchet
@@ -417,7 +417,7 @@ fn run_prompt_lint(json: bool) {
             println!("lint 通过：{} 条示例逐字渲染一致，无错误与警告", specs.len());
         }
         if !legacy.is_empty() {
-            println!("仍由旧组合生成器负责的策略：{}", legacy.join("、"));
+            println!("仍由组合生成器负责的策略：{}", legacy.join("、"));
         }
     }
     if errors > 0 {
@@ -1143,7 +1143,7 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 否认联想推测：加入屏蔽集，联想通道之后不再提出
+        // 否认联想推测：加入屏蔽集，联想通道不再提出同类推测
         if let Some(target) = strip_any_prefix(
             input,
             &["对比否认", "对比否认：", "对比否认:", "对比否决", "对比否决：", "对比否决:"],
@@ -2067,7 +2067,7 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 确认同义链接：把推测升格为别名知识（纯符号的 sameAs 学习，可显式撤销）
+        // 确认同义链接：把推测记为别名知识（纯符号的 sameAs 学习，可显式撤销）
         if let Some(body) = strip_any_prefix(
             input,
             &["同义链接：", "同义链接:", "外链别名：", "外链别名:"],

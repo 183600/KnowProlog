@@ -71,7 +71,7 @@ impl ExternalAnswer {
 pub enum AnswerOutcome {
     /// 已作答（可为新鲜取回或名册命中）。
     Answered(ExternalAnswer),
-    /// 名册中的负缓存命中：来源已确认未收录，不再打网。
+    /// 名册中的负缓存命中：来源已确认未收录，不打网。
     KnownAbsent {
         entity: String,
         source_uri: String,

@@ -185,7 +185,7 @@ pub fn derived_entry_id(atom: &LedgerAtom) -> String {
 /// 规则集指纹：对全部规则的规范形式 + 置信度排序后整体哈希。
 ///
 /// 与条目顺序无关；规则增删改（头/体/置信度）都会改变指纹，
-/// 从而让此前物化的派生账本自动判定为「已过期」。
+/// 从而让已物化的派生账本自动判定为「已过期」。
 pub fn rule_fingerprint(entries: &[RuleLedgerEntry]) -> String {
     let mut canonicals: Vec<String> = entries
         .iter()

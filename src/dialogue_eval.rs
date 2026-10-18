@@ -158,9 +158,9 @@ pub struct GroundingMetrics {
     pub attempted: u32,
     /// required 槽位全部绑定，成功渲染。
     pub grounded: u32,
-    /// required 槽位缺失，回退旧渲染器。
+    /// required 槽位缺失，回退组合生成器。
     pub ungrounded: u32,
-    /// 平价模式下模板与旧文本不一致的次数（应为 0）。
+    /// 平价模式下模板与组合生成器文本不一致的次数（应为 0）。
     pub parity_mismatches: u32,
     /// grounded / attempted（无尝试时为 1.0）。
     pub slot_rate: f64,
@@ -263,7 +263,7 @@ impl DialogueEvalReport {
         out
     }
 
-    /// 金标支持数 > 0 的最低 F1 类别（供下一轮迭代定点攻坚）。
+    /// 金标支持数 > 0 的最低 F1 类别（供定点攻坚）。
     pub fn weakest_intent_class(&self) -> Option<(String, f64)> {
         self.intents
             .per_class
@@ -848,8 +848,8 @@ pub fn reasoner_for_scenario(
 
 /// 逐场景、逐轮执行金标脚本，输出确定性报告。
 ///
-/// 模板运行模式为 [`PromptMode::On`]（接地失败自动回退旧渲染器，
-/// 因此答案文本与历史行为一致），同时收集 [`GroundingMetrics`]。
+/// 模板运行模式为 [`PromptMode::On`]（接地失败自动回退组合生成器，
+/// 因此答案文本保持一致），同时收集 [`GroundingMetrics`]。
 pub fn evaluate_scenarios(scenarios: &[GoldScenario]) -> DialogueEvalReport {
     evaluate_scenarios_with(scenarios, |scenario| {
         Box::new(GoldKnowledge::from_scenario(scenario))
