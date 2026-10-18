@@ -1428,13 +1428,13 @@ mod tests {
 
     #[test]
     fn test_snapshot_deserializes_without_last_reply_field() {
-        let legacy = r#"{
+        let stored = r#"{
             "turns": [],
             "focus": ["姚明"],
             "externals": []
         }"#;
         let snapshot: DialogueManagerSnapshot =
-            serde_json::from_str(legacy).expect("缺少 last_reply 字段的快照应可反序列化");
+            serde_json::from_str(stored).expect("缺少 last_reply 字段的快照应可反序列化");
         assert!(snapshot.last_reply.is_empty());
         let mut manager = DialogueManager::new();
         manager.restore(&snapshot);

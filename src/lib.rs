@@ -795,7 +795,7 @@ pub struct OxigraphManager {
     revision: AtomicU64,
     snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
     // 相关事实查询缓存：同一知识版本内按查询键多槽缓存（LRU），
-    // 交替询问不同实体不再互相撕票；写后整体失效
+    // 交替询问不同实体互不挤占；写后整体失效
     relevant_cache: parking_lot::Mutex<RevisionLru<Arc<Vec<PrologFact>>>>,
     // 直答缓存：同一知识版本内按查询键多槽缓存（LRU，含"确无答案"的负缓存）
     direct_answer_cache: parking_lot::Mutex<RevisionLru<Option<String>>>,
@@ -811,7 +811,7 @@ const QUERY_CACHE_CAPACITY: usize = 32;
 
 /// 按知识版本失效的有界 LRU 查询缓存。
 ///
-/// 正确性契约与单槽缓存相同：缓存条目只在 `revision` 与当前知识版本一致时
+/// 正确性契约：缓存条目只在 `revision` 与当前知识版本一致时
 /// 才可命中；版本推进（写之后自增）会让下一查整体重新装载。容量溢出时
 /// 淘汰最久未用条目，淘汰顺序确定（LRU 序由访问推进）。
 struct RevisionLru<V> {
@@ -2788,7 +2788,7 @@ mod cache_tests {
         assert_eq!(cache.get(2, "d"), Some(&4));
     }
 
-    /// 多槽直答缓存：交替询问两个同版本问题，第二次都可命中（单槽会互相撕票）
+    /// 多槽直答缓存：交替询问两个同版本问题，第二次都可命中
     #[tokio::test]
     async fn direct_answer_cache_keeps_multiple_keys_per_revision() {
         let (manager, _dir) = temp_manager().await;

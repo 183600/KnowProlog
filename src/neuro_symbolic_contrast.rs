@@ -1670,9 +1670,9 @@ mod tests {
 
     #[test]
     fn dialogue_state_without_contrast_field_still_loads() {
-        let legacy = r#"{"focus_entities":["张三"],"last_predicate":"师傅","history":["张三是谁"]}"#;
+        let stored = r#"{"focus_entities":["张三"],"last_predicate":"师傅","history":["张三是谁"]}"#;
         let snapshot: DialogueSnapshot =
-            serde_json::from_str(legacy).expect("缺少 contrast 字段的对话记忆应能反序列化");
+            serde_json::from_str(stored).expect("缺少 contrast 字段的对话记忆应能反序列化");
         assert!(snapshot.contrast.is_none());
         assert_eq!(snapshot.focus_entities, vec!["张三".to_string()]);
     }

@@ -137,14 +137,14 @@ impl ExternalKnowledgeService {
         self.ledger.lock().entry_report(entity.trim())
     }
 
-    /// 标记实体重取：下次提问重新打网。返回是否存在旧条目。
+    /// 标记实体重取：下次提问重新打网。返回该条目是否存在。
     pub fn refresh_entity(&self, entity: &str) -> bool {
         let mut ledger = self.ledger.lock();
         let canonical = ledger.resolve(entity.trim());
         ledger.refresh(&canonical)
     }
 
-    /// 遗忘实体条目（同义链接保留）。返回是否存在旧条目。
+    /// 遗忘实体条目（同义链接保留）。返回该条目是否存在。
     pub fn forget_entity(&self, entity: &str) -> bool {
         let mut ledger = self.ledger.lock();
         let canonical = ledger.resolve(entity.trim());
@@ -201,7 +201,7 @@ impl ExternalKnowledgeService {
             });
         }
 
-        // 兼容 eval 风格的旧响应：单引号字典
+        // 非标准响应：单引号字典，手动取出 data 段
         if let Some(data_start) = text.find("'data':") {
             let data_section = &text[data_start + 7..];
             if let Some(data_end) = data_section.find('}') {
@@ -375,7 +375,7 @@ impl ExternalKnowledgeService {
                     });
                 }
                 Ok(EntityQueryOutcome::Unparseable) => {
-                    // 不可采信：不写任何缓存；有旧条目则以 stale 兜底，
+                    // 不可采信：不写任何缓存；有过期条目则以 stale 兜底，
                     // 否则换下一个候选实体（坏响应不应耗尽整次问答）
                     if let Some(fallback) = fallback {
                         return Ok(fallback.into_outcome());
@@ -384,7 +384,7 @@ impl ExternalKnowledgeService {
                     continue;
                 }
                 Err(error) => {
-                    // 网络失败：不写负缓存；有旧条目则以 stale 低置信兜底
+                    // 网络失败：不写负缓存；有过期条目则以 stale 低置信兜底
                     if let Some(fallback) = fallback {
                         return Ok(fallback.into_outcome());
                     }
@@ -498,7 +498,7 @@ impl ExternalKnowledgeService {
     }
 }
 
-/// 网络失败 / 响应不可解析时的旧名册兜底（低置信）。
+/// 网络失败 / 响应不可解析时的过期名册兜底（低置信）。
 enum Fallback {
     Answer(ExternalAnswer),
     Absent {

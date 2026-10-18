@@ -325,7 +325,7 @@ impl ExternalLedger {
         self.perf.bump("external_ledger_store_absent");
     }
 
-    /// 标记重取：删除条目，下次查询将重新打网。返回是否存在旧条目。
+    /// 标记重取：删除条目，下次查询将重新打网。返回该条目是否存在。
     pub fn refresh(&mut self, entity: &str) -> bool {
         let removed = self.remove_entry(entity);
         if removed {
@@ -334,7 +334,7 @@ impl ExternalLedger {
         removed
     }
 
-    /// 遗忘条目（同义链接保留）。返回是否存在旧条目。
+    /// 遗忘条目（同义链接保留）。返回该条目是否存在。
     pub fn forget(&mut self, entity: &str) -> bool {
         let removed = self.remove_entry(entity);
         if removed {
