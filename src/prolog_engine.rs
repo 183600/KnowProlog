@@ -169,8 +169,6 @@ impl PrologEngine {
             Ok(query_output) => {
                 println!("Prolog输出: {:?}", query_output);
                 
-                let mut succeeded_without_bindings = false;
-                
                 match query_output {
                     QueryResolution::Matches(matches) => {
                         // 直接提取变量绑定（如 Age/Relation/Count/Spouse）
@@ -186,17 +184,11 @@ impl PrologEngine {
                         }
                     }
                     QueryResolution::True => {
-                        succeeded_without_bindings = true;
+                        // 查询成功但无变量绑定：无可提取的答案。
                     }
                     QueryResolution::False => {
                         println!("查询未返回结果");
                     }
-                }
-                
-                if succeeded_without_bindings {
-                    // 查询成功但没有变量绑定 → 无可提取的答案。
-                    // 不做任何兜底填空：宁可诚实地说「没有记录」，
-                    // 也不返回与知识库无关的硬编码内容（无幻觉）。
                 }
             }
             Err(err) => {

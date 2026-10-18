@@ -1322,7 +1322,7 @@ async fn run_interactive_mode(config: Arc<know_prolog::SystemConfig>, oxigraph_m
                     let tagged_words = preprocess(&clean_text, &config.nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
-                    // 中文关系句 → 关系三元组（「张三是李四的师傅」不再只落实体快照）
+                    // 中文关系句 → 关系三元组（如「张三是李四的师傅」）
                     items.extend(extract_relationships_from_text(&clean_text));
                     
                     if items.is_empty() {

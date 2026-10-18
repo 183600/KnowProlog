@@ -2350,13 +2350,12 @@ impl ResponseFormatter {
         Self { _config: config }
     }
 
-    // Prolog 真实变量绑定使用首字母大写的变量名，早期兜底结果使用小写键名，两者都兼容
+    /// 取首个结果集中指定变量的绑定值（Prolog 变量名为首字母大写）。
     fn result_value<'a>(
         results: &'a [HashMap<String, String>],
-        primary: &str,
-        legacy: &str,
+        variable: &str,
     ) -> Option<&'a String> {
-        results[0].get(primary).or_else(|| results[0].get(legacy))
+        results[0].get(variable)
     }
 
     pub fn format_prolog_results(&self, results: &[HashMap<String, String>], query_type: &str) -> String {
@@ -2399,56 +2398,56 @@ impl ResponseFormatter {
                 }
             }
             "capital_query" => {
-                if let Some(capital) = Self::result_value(results, "Capital", "capital") {
+                if let Some(capital) = Self::result_value(results, "Capital") {
                     format!("首都是{}", capital)
                 } else {
                     "未找到首都信息".to_string()
                 }
             }
             "altitude_query" => {
-                if let Some(altitude) = Self::result_value(results, "Altitude", "altitude") {
+                if let Some(altitude) = Self::result_value(results, "Altitude") {
                     format!("海拔高度是{}米", altitude)
                 } else {
                     "未找到海拔信息".to_string()
                 }
             }
             "chemical_formula_query" => {
-                if let Some(formula) = Self::result_value(results, "Formula", "formula") {
+                if let Some(formula) = Self::result_value(results, "Formula") {
                     format!("化学分子式是{}", formula)
                 } else {
                     "未找到分子式信息".to_string()
                 }
             }
             "author_query" => {
-                if let Some(author) = Self::result_value(results, "Author", "author") {
+                if let Some(author) = Self::result_value(results, "Author") {
                     format!("作者是{}", author)
                 } else {
                     "未找到作者信息".to_string()
                 }
             }
             "champion_query" => {
-                if let Some(champion) = Self::result_value(results, "Champion", "champion") {
+                if let Some(champion) = Self::result_value(results, "Champion") {
                     format!("冠军是{}", champion)
                 } else {
                     "未找到冠军信息".to_string()
                 }
             }
             "birth_year_query" => {
-                if let Some(year) = Self::result_value(results, "Year", "birth_year") {
+                if let Some(year) = Self::result_value(results, "Year") {
                     format!("诞生于{}年", year)
                 } else {
                     "未找到诞生年份信息".to_string()
                 }
             }
             "largest_query" => {
-                if let Some(entity) = Self::result_value(results, "Entity", "entity") {
+                if let Some(entity) = Self::result_value(results, "Entity") {
                     format!("最大的是{}", entity)
                 } else {
                     "未找到相关信息".to_string()
                 }
             }
             "quantity_query" => {
-                if let Some(quantity) = Self::result_value(results, "Quantity", "quantity") {
+                if let Some(quantity) = Self::result_value(results, "Quantity") {
                     format!("数量是{}", quantity)
                 } else {
                     "未找到数量信息".to_string()
