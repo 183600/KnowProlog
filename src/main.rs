@@ -32,6 +32,9 @@ use know_prolog::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
         render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
     },
+    embedding_eval::{
+        compare_baseline, evaluate, triples_from_prolog_facts, EvalBaseline, EvalConfig,
+    },
 };
 
 #[derive(Parser)]
@@ -39,6 +42,9 @@ use know_prolog::{
 #[command(about = "KnowProlog - Chinese knowledge graph system")]
 #[command(version)]
 struct Cli {
+    /// Override the configured Oxigraph store path (all subcommands)
+    #[arg(long, global = true)]
+    store: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -57,6 +63,25 @@ enum Commands {
     ImportJsonldContent {
         /// JSON-LD content as string
         content: String,
+    },
+    /// Evaluate symbolic embeddings (link prediction + analogy) with a
+    /// deterministic holdout split and regression ratchet
+    Eval {
+        /// Test split ratio in per mille (0-1000)
+        #[arg(long, default_value_t = 200)]
+        test_ratio: u32,
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// RRF fusion constant
+        #[arg(long, default_value_t = 60.0)]
+        rrf_k: f64,
     },
     /// Run interactive mode (default)
     Interactive,
@@ -77,9 +102,15 @@ async fn main() {
     // 会话级性能台账：存储与推理共享同一实例，报告覆盖整条链路
     let perf_ledger = PerfLedger::shared();
 
+    // 存储路径可被 --store 覆盖（便于对独立知识库做导入/评估而不动主库）
+    let store_path = cli
+        .store
+        .clone()
+        .unwrap_or_else(|| config.system.oxigraph_store_path.clone());
+
     // 创建Oxigraph存储
     let oxigraph_manager = match OxigraphManager::with_perf_ledger(
-        &config.system.oxigraph_store_path,
+        &store_path,
         perf_ledger.clone(),
     ) {
         Ok(manager) => manager,
@@ -113,6 +144,65 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("JSON-LD 内容导入失败: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::Eval {
+            test_ratio,
+            baseline,
+            update_baseline,
+            allow_regression,
+            rrf_k,
+        }) => {
+            match oxigraph_manager.load_all_relations().await {
+                Ok(relations) => {
+                    let triples = triples_from_prolog_facts(&relations);
+                    if triples.len() < 2 {
+                        eprintln!(
+                            "知识库中的关系三元组不足（{} 条），无法评估。可先导入 JSON-LD 知识库。",
+                            triples.len()
+                        );
+                        std::process::exit(1);
+                    }
+                    let eval_config = EvalConfig {
+                        test_ratio_per_mille: test_ratio,
+                        rrf_k: rrf_k.max(1.0),
+                        ..Default::default()
+                    };
+                    let report = evaluate(&triples, &eval_config);
+                    println!("{}", report.render_text(&eval_config));
+
+                    let baseline_path = baseline
+                        .clone()
+                        .unwrap_or_else(|| "eval_baseline.json".to_string());
+                    if update_baseline {
+                        let new_baseline = EvalBaseline::from_report(&report);
+                        match new_baseline.save(&baseline_path) {
+                            Ok(()) => println!("基线已写入 {}", baseline_path),
+                            Err(e) => {
+                                eprintln!("基线写入失败: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if baseline.is_some() {
+                        match EvalBaseline::load(&baseline_path) {
+                            Ok(old_baseline) => {
+                                let verdict = compare_baseline(&old_baseline, &report, 1e-6);
+                                print!("{}", verdict.render_text());
+                                if !verdict.passed && !allow_regression {
+                                    std::process::exit(1);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("基线读取失败: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
                     std::process::exit(1);
                 }
             }

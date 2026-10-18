@@ -56,6 +56,7 @@ pub mod import_journal;
 pub mod grammar_extractor;
 pub mod chronicle;
 pub mod view_render;
+pub mod embedding_eval;
 
 #[cfg(test)]
 mod dialogue_conformance;
