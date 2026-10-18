@@ -1343,7 +1343,7 @@ impl OxigraphManager {
         }
 
         // 模式闸门：定义域/值域校验（实体类型未知时按开放世界放行）。
-        // 类型体系开启闭包档时按别名/子类/互斥判定，并记录与 legacy 判定的
+        // 类型体系开启闭包档时按别名/子类/互斥判定，并记录与精确集合判定的
         // 差异（误杀消解 / 收紧），差异只统计、不改变本次结果。
         let subject_types = entity_type_labels(store, subject_name)?;
         let object_types = entity_type_labels(store, object_name)?;

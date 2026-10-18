@@ -1804,7 +1804,7 @@ mod tests {
             stats.mismatch_examples
         );
         assert_eq!(stats.ungrounded, 0, "缺槽位：{:?}", stats.missing_slots);
-        assert_eq!(stats.legacy, 3, "recap/continue/elaborate 应保持旧生成器");
+        assert_eq!(stats.legacy, 3, "recap/continue/elaborate 应保持组合生成器");
     }
 
     #[test]
@@ -1812,7 +1812,7 @@ mod tests {
         let off = replay_texts(PromptMode::Off);
         let on = replay_texts(PromptMode::On);
         let parity = replay_texts(PromptMode::Parity);
-        assert_eq!(off, on, "On 模式应逐字等价于旧渲染");
+        assert_eq!(off, on, "On 模式应逐字等价于 Off 模式渲染");
         assert_eq!(off, parity, "Parity 模式对外行为不应改变");
     }
 

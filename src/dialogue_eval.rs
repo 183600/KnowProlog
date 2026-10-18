@@ -921,7 +921,7 @@ pub fn evaluate_seed(mode: EvalKnowledge) -> DialogueEvalReport {
 }
 
 /// 与 [`evaluate_seed`] 相同，但可指定模板运行模式
-/// （`--prompt-mode off|parity|on`，供提示迭代的 A/B 实验使用）。
+/// （`--prompt-mode off|parity|on`，供提示模板对比使用）。
 pub fn evaluate_seed_with(mode: EvalKnowledge, prompt_mode: PromptMode) -> DialogueEvalReport {
     match mode {
         EvalKnowledge::Scripted => {

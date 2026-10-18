@@ -51,7 +51,7 @@ pub struct TypeDisjointConfig {
 /// config.toml 中的 `[type_system]` 段。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeSystemConfig {
-    /// 模式闸门按闭包判定（默认关：保持 legacy 精确集合语义）。
+    /// 模式闸门按闭包判定（默认关：按精确集合语义判定）。
     #[serde(default)]
     pub closure_gate: bool,
     #[serde(default)]

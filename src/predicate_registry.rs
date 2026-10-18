@@ -1155,10 +1155,10 @@ pub struct ImportReceipt {
     pub pending_admissions: Vec<String>,
     pub actions: Vec<ImportAction>,
     pub registry_changed: bool,
-    /// 闭包档相对 legacy 精确判定「由误杀转为放行」的条数（只统计，不改变结果）。
+    /// 闭包档相对精确集合判定「由误杀转为放行」的条数（只统计，不改变结果）。
     #[serde(default)]
     pub gate_relaxed: usize,
-    /// 闭包档拒绝而 legacy 放行的条数（收紧；有互斥证据才会发生）。
+    /// 闭包档拒绝而精确集合放行的条数（收紧；有互斥证据才会发生）。
     #[serde(default)]
     pub gate_tightened: usize,
 }
@@ -1746,7 +1746,7 @@ mod tests {
 
     /// C14（类型格×模式闸门）：别名归一消解误杀（Person/人物），
     /// 互斥声明兜底拒绝（地点⊥人物），未知类型仍按开放世界放行；
-    /// 与 legacy 判定的差异计入回执（gate_relaxed / gate_tightened）。
+    /// 与精确集合判定的差异计入回执（gate_relaxed / gate_tightened）。
     #[tokio::test]
     async fn c14_closure_gate_normalizes_aliases_and_keeps_disjoint_guard() {
         let (manager, _dir) = temp_manager().await;
@@ -1766,7 +1766,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Person = 人物（别名）：legacy 精确集合会误杀，闭包档放行并计 relaxed
+        // Person = 人物（别名）：精确集合会误杀，闭包档放行并计 relaxed
         let admitted = manager
             .save_knowledge_with_receipt(master_disciple_items("张三", "李四"))
             .await
