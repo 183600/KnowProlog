@@ -417,7 +417,7 @@ pub fn parse_derived_graph(quads: impl Iterator<Item = Quad>) -> DerivedLedger {
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     entries.dedup_by(|a, b| a.id == b.id);
     if !materialized && !entries.is_empty() {
-        // 无账本戳的旧账本：从条目自身恢复物化戳（兼容读取）
+        // 无账本戳的账本：从条目自身恢复物化戳
         materialized = true;
         revision = entries.iter().map(|entry| entry.revision).max().unwrap_or(0);
         fingerprint = entries

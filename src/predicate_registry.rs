@@ -1249,7 +1249,7 @@ mod tests {
         assert!(registry.register_alias("老师", "师傅", "人工确认"));
         assert!(
             !registry.canonical_names().contains(&"老师"),
-            "别名不再单独成画像"
+            "别名不单独成画像"
         );
         let profile = registry.profile("师傅").unwrap();
         assert_eq!(profile.support, 2);

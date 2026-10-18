@@ -1441,7 +1441,7 @@ impl<'a> FrontierSearch<'a> {
             if !crate::resolution_engine::unify_atoms(&applied, &fresh.head, &mut unified) {
                 continue;
             }
-            // 规则体可直接移动进组合目标队列（head 已不再需要）
+            // 规则体直接移动进组合目标队列（head 已合一，只需继续推进规则体）
             let mut combined: Vec<Atom> = fresh.body;
             combined.extend_from_slice(&goals[1..]);
             self.run(&combined, &unified, depth + 1, missing);

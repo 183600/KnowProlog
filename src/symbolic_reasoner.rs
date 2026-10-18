@@ -5153,7 +5153,7 @@ impl SymbolicReasoner {
         }
         self.session_clauses = kept_clauses;
 
-        // 教学原句撤回：解析结果命中同一规则的整句不再回放
+        // 教学原句撤回：解析结果命中同一规则的整句一并移除
         let mut lessons_removed = 0usize;
         let mut kept_lessons: Vec<String> = Vec::new();
         for lesson_sentence in &self.lessons {
@@ -6322,7 +6322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_clarification_not_started_when_old_channel_can_fill() {
+    fn test_frame_clarification_not_started_when_existing_channel_can_fill() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&attribute_candidates_facts());
         reasoner.contextualize("姚明的身高是什么");
