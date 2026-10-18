@@ -618,7 +618,7 @@ impl SymbolicGenerator {
             .unwrap_or(1)
             .max(1);
         let mut items: Vec<(&String, &usize)> = predicate_counts.iter().collect();
-        // 只取前 3 名：部分选择代替全量排序
+        // 取前 3 名
         if items.len() > 3 {
             items.select_nth_unstable_by(2, |a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
             items.truncate(3);

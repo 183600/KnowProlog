@@ -145,7 +145,7 @@ impl EntityLinker {
             return;
         }
         let new_etype = etype.filter(|t| !t.trim().is_empty());
-        // 重复观察同一实体且类型未变时，画像（字符集/bigram/表面映射）必然一致，跳过重建
+        // 重复观察同一实体且类型未变：画像（字符集/bigram/表面映射）一致
         if let Some(existing) = self.profiles.get(name) {
             if existing.etype.as_deref() == new_etype {
                 return;

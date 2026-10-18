@@ -28,7 +28,7 @@ pub const CHRONICLE_VERSION: u32 = 1;
 pub enum FsyncPolicy {
     /// 每轮落盘即 fsync：崩溃最多丢进行中的一轮（交互式默认）。
     EachAppend,
-    /// 交给操作系统：更快，但崩溃可能丢最近若干轮（批处理/测试用）。
+    /// 交给操作系统：崩溃可能丢最近若干轮（批处理/测试用）。
     None,
 }
 

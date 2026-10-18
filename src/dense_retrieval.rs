@@ -373,7 +373,7 @@ impl DenseRetriever {
         let query_norm = Self::query_norm(&query_vector).max(1e-9);
         let structural = self.structural_scores(&seeds);
         let query_tokens: HashSet<String> = tokens.into_iter().collect();
-        // 预计算查询词项的加权（q 权重 × idf），内层只需判断文档是否包含该词项
+        // 查询词项的加权（q 权重 × idf）
         let total_docs = self.docs.len();
         let dot_terms: Vec<(&String, f64)> = query_vector
             .iter()

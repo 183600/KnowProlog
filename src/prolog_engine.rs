@@ -6,7 +6,7 @@ use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryR
 
 pub struct PrologEngine {
     machine: Machine,
-    /// 已加载的动态事实（按规范序排序），用于跳过重复加载
+    /// 已加载的动态事实（按规范序排序）
     loaded_facts: Vec<PrologFact>,
 }
 
@@ -74,18 +74,14 @@ impl PrologEngine {
     }
     
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
-        println!("Loading {} Prolog facts", facts.len());
-
-        // 事实集与加载顺序都未变化时无需排序
         if facts == self.loaded_facts {
             return;
         }
 
-        // 再按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
+        // 按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
         let mut facts = facts;
         facts.sort_by(Self::compare_facts);
 
-        // 事实集未变化时跳过清空与重载，机器状态保持一致
         if facts == self.loaded_facts {
             return;
         }
@@ -163,12 +159,9 @@ impl PrologEngine {
         let mut results = Vec::new();
         
         let query_str = format!("{}.", query);
-        println!("执行Prolog查询: {}", query_str);
         
         match self.machine.run_query(query_str) {
             Ok(query_output) => {
-                println!("Prolog输出: {:?}", query_output);
-                
                 match query_output {
                     QueryResolution::Matches(matches) => {
                         // 直接提取变量绑定（如 Age/Relation/Count/Spouse）
@@ -187,7 +180,7 @@ impl PrologEngine {
                         // 查询成功但无变量绑定：无可提取的答案。
                     }
                     QueryResolution::False => {
-                        println!("查询未返回结果");
+                        // 查询成功但无解：无可提取的答案。
                     }
                 }
             }
