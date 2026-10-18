@@ -25,6 +25,7 @@ use know_prolog::{
     holographic_memory::{HoloAnalogyHit, HoloHit},
     import_journal::{ImportJournal, JournalLoad},
     perf_ledger::PerfLedger,
+    grammar_extractor::GrammarExtractor,
 };
 
 #[derive(Parser)]
@@ -135,6 +136,8 @@ async fn run_interactive_mode(
     );
 
     let knowledge_extractor = KnowledgeExtractor::new(config.clone());
+    // 文法式关系抽取器：DCG 语言器官，词库由谓词画像注册表注入
+    let grammar_extractor = GrammarExtractor::new();
     let response_formatter = ResponseFormatter::new(config.clone());
     let nlu_engine = NLUEngine::new(&config);
     let prolog_rules = create_prolog_rules(&config);
@@ -1381,8 +1384,15 @@ async fn run_interactive_mode(
                     let tagged_words = preprocess(&clean_text, &config.nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
-                    // 中文关系句 → 关系三元组（如「张三是李四的师傅」）
-                    items.extend(extract_relationships_from_text(&clean_text));
+                    // 中文关系句 → 关系三元组（如「张三是李四的师傅」），
+                    // 叠加 DCG 文法抽取（被字句/把字句/并列/所有格换向）
+                    grammar_extractor
+                        .set_lexicon_if_changed(&oxigraph_manager.predicate_query_pairs());
+                    items.extend(extract_relationships_from_text(
+                        &clean_text,
+                        &normalized_words,
+                        &grammar_extractor,
+                    ));
                     
                     if items.is_empty() {
                         println!("{}", config.messages.no_knowledge_extracted);
@@ -2117,33 +2127,27 @@ fn parse_predicate_pair(spec: &str) -> Option<(String, String)> {
 }
 
 /// 中文句子 → 关系三元组：只取确定事实、二元、无占位符的原子，
-/// 跳过「是」断言（类型断言不落成关系）。与「记住：」共用同一中文解析器。
-fn extract_relationships_from_text(text: &str) -> Vec<KnowledgeItem> {
+/// 跳过「是」断言（类型断言不落成关系）。
+/// 两条抽取通道合并去重：
+///   1. 模式解析器 `parse_lessons`（「记住：」同款）；
+///   2. DCG 文法抽取（被字句/把字句/并列/所有格换向/词库归一）。
+fn extract_relationships_from_text(
+    text: &str,
+    words: &[know_prolog::nlp::TaggedWord],
+    grammar_extractor: &GrammarExtractor,
+) -> Vec<KnowledgeItem> {
     use know_prolog::chinese_reasoning_nlu::{parse_lessons, LessonKind};
     let outcome = parse_lessons(text);
     let mut seen: std::collections::BTreeSet<(String, String, String)> =
         std::collections::BTreeSet::new();
     let mut items = Vec::new();
-    for lesson in outcome.lessons {
-        if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
-            continue;
+    let mut push_triple = |from: String, predicate: String, to: String| {
+        if predicate == "是" || from.is_empty() || to.is_empty() || from == to {
+            return;
         }
-        if &*lesson.head.predicate == "是" {
-            continue;
-        }
-        let terms = &lesson.head.terms;
-        if terms.len() != 2 {
-            continue;
-        }
-        let from = terms[0].name().trim().to_string();
-        let to = terms[1].name().trim().to_string();
-        if from.is_empty() || to.is_empty() || from == to {
-            continue;
-        }
-        let predicate = lesson.head.predicate.to_string();
         let key = (from.clone(), predicate.clone(), to.clone());
         if !seen.insert(key) {
-            continue;
+            return;
         }
         items.push(KnowledgeItem::Relationship {
             from_label: String::new(),
@@ -2153,7 +2157,27 @@ fn extract_relationships_from_text(text: &str) -> Vec<KnowledgeItem> {
             rel_type: predicate,
             properties: std::collections::HashMap::new(),
         });
+    };
+
+    for lesson in outcome.lessons {
+        if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
+            continue;
+        }
+        let terms = &lesson.head.terms;
+        if terms.len() != 2 {
+            continue;
+        }
+        push_triple(
+            terms[0].name().trim().to_string(),
+            lesson.head.predicate.to_string(),
+            terms[1].name().trim().to_string(),
+        );
     }
+
+    for triple in grammar_extractor.extract_from_tagged(words) {
+        push_triple(triple.subject, triple.predicate, triple.object);
+    }
+
     items
 }
 

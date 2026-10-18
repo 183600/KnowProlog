@@ -3,7 +3,7 @@ use oxigraph::sparql::{Query, QueryResults};
 use oxigraph::store::Store;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -53,6 +53,7 @@ pub mod predicate_registry;
 pub mod perf_ledger;
 pub mod context_image;
 pub mod import_journal;
+pub mod grammar_extractor;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -88,6 +89,26 @@ fn sparql_literal(text: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     std::borrow::Cow::Owned(escaped)
+}
+
+/// 实体在图中已声明的类型（rdf:type 的本地名集合，用于定义域/值域校验）。
+fn entity_type_labels(
+    store: &Store,
+    name: &str,
+) -> Result<BTreeSet<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let subject = NamedNode::new(format!("{}entity/{}", BASE_NS, name))?;
+    let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
+    let mut labels = BTreeSet::new();
+    for quad in
+        store.quads_for_pattern(Some(subject.as_ref().into()), Some(rdf_type.as_ref()), None, None)
+    {
+        if let Term::NamedNode(type_node) = quad?.object {
+            if let Some(label) = type_node.as_str().strip_prefix(BASE_NS) {
+                labels.insert(label.to_string());
+            }
+        }
+    }
+    Ok(labels)
 }
 
 #[derive(Debug)]
@@ -1219,6 +1240,24 @@ impl OxigraphManager {
                 existing,
                 incoming: object_name.to_string(),
             });
+            return Ok(());
+        }
+
+        // 模式闸门：定义域/值域校验（实体类型未知时按开放世界放行）
+        let subject_types = entity_type_labels(store, subject_name)?;
+        let object_types = entity_type_labels(store, object_name)?;
+        let violation = {
+            let registry = self.predicate_registry.read();
+            registry.check_schema(
+                subject_name,
+                &predicate_name,
+                object_name,
+                &subject_types,
+                &object_types,
+            )
+        };
+        if let Some(violation) = violation {
+            receipt.schema_violations.push(violation);
             return Ok(());
         }
 

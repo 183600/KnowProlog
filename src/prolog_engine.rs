@@ -320,7 +320,7 @@ impl PrologEngine {
 }
 
 /// 转义 Prolog 单引号原子中的特殊字符，避免名称里的引号/反斜杠破坏事实或查询语法
-fn escape_atom(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn escape_atom(text: &str) -> std::borrow::Cow<'_, str> {
     // 常见情况直接借用原字符串
     if !text
         .as_bytes()

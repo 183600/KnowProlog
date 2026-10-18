@@ -172,6 +172,7 @@ mod tests {
             merged: 0,
             duplicates: 0,
             conflicts: Vec::new(),
+            schema_violations: Vec::new(),
             provisional_predicates: Vec::new(),
             pending_admissions: Vec::new(),
             actions: (0..added)

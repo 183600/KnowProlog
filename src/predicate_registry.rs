@@ -29,8 +29,28 @@ pub struct PredicateProfileConfig {
     pub transitive: bool,
     #[serde(default)]
     pub symmetric: bool,
+    /// 定义域：主语允许的实体类型（空 = 不限制）
+    #[serde(default)]
+    pub domain: Vec<String>,
+    /// 值域：宾语允许的实体类型（空 = 不限制）
+    #[serde(default)]
+    pub range: Vec<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// 定义域/值域违规：实体类型已知且与声明类型不相交时拒绝落库。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaViolation {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    /// 违规的一侧："定义域"（主语）或 "值域"（宾语）
+    pub slot: String,
+    /// 声明允许的类型
+    pub expected: Vec<String>,
+    /// 实体实际已有的类型
+    pub actual: Vec<String>,
 }
 
 /// 谓词解析结果：规范谓词 + 是否需要翻转主宾语（逆向谓词）。
@@ -65,6 +85,12 @@ pub struct PredicateProfile {
     pub transitive: bool,
     #[serde(default)]
     pub symmetric: bool,
+    /// 定义域：主语允许的实体类型（空 = 不限制）
+    #[serde(default)]
+    pub domain: BTreeSet<String>,
+    /// 值域：宾语允许的实体类型（空 = 不限制）
+    #[serde(default)]
+    pub range: BTreeSet<String>,
     /// 由配置声明或人工确认（可稳定依赖）
     #[serde(default)]
     pub declared: bool,
@@ -96,6 +122,8 @@ impl PredicateProfile {
             functional: false,
             transitive: false,
             symmetric: false,
+            domain: BTreeSet::new(),
+            range: BTreeSet::new(),
             declared: false,
             provisional: false,
             support: 0,
@@ -310,6 +338,20 @@ impl PredicateRegistry {
             profile.functional |= config.functional;
             profile.transitive |= config.transitive;
             profile.symmetric |= config.symmetric;
+            profile.domain.extend(
+                config
+                    .domain
+                    .iter()
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty()),
+            );
+            profile.range.extend(
+                config
+                    .range
+                    .iter()
+                    .map(|item| item.trim().to_string())
+                    .filter(|item| !item.is_empty()),
+            );
             if let Some(description) = &config.description {
                 profile.description = Some(description.clone());
             }
@@ -436,6 +478,13 @@ impl PredicateRegistry {
         profile.functional |= old.functional;
         profile.transitive |= old.transitive;
         profile.symmetric |= old.symmetric;
+        if inverted {
+            profile.domain.extend(old.range.iter().cloned());
+            profile.range.extend(old.domain.iter().cloned());
+        } else {
+            profile.domain.extend(old.domain.iter().cloned());
+            profile.range.extend(old.range.iter().cloned());
+        }
         profile.declared |= old.declared;
         profile.provisional &= old.provisional;
         profile.sources.extend(old.sources.iter().cloned());
@@ -675,6 +724,52 @@ impl PredicateRegistry {
         Some(existing)
     }
 
+    /// 定义域/值域校验（开放世界）：实体类型未知（空集）时放行；
+    /// 类型已知但与声明的允许类型完全不相交时判违规。互逆谓词先翻转坐标。
+    pub fn check_schema(
+        &self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        subject_types: &BTreeSet<String>,
+        object_types: &BTreeSet<String>,
+    ) -> Option<SchemaViolation> {
+        let resolution = self.resolve(predicate);
+        let profile = self.profiles.get(&resolution.canonical)?;
+        let (subject, object, subject_types, object_types) = if resolution.inverted {
+            (object, subject, object_types, subject_types)
+        } else {
+            (subject, object, subject_types, object_types)
+        };
+        if !profile.domain.is_empty()
+            && !subject_types.is_empty()
+            && subject_types.is_disjoint(&profile.domain)
+        {
+            return Some(SchemaViolation {
+                subject: subject.to_string(),
+                predicate: resolution.canonical.clone(),
+                object: object.to_string(),
+                slot: "定义域".to_string(),
+                expected: profile.domain.iter().cloned().collect(),
+                actual: subject_types.iter().cloned().collect(),
+            });
+        }
+        if !profile.range.is_empty()
+            && !object_types.is_empty()
+            && object_types.is_disjoint(&profile.range)
+        {
+            return Some(SchemaViolation {
+                subject: subject.to_string(),
+                predicate: resolution.canonical.clone(),
+                object: object.to_string(),
+                slot: "值域".to_string(),
+                expected: profile.range.iter().cloned().collect(),
+                actual: object_types.iter().cloned().collect(),
+            });
+        }
+        None
+    }
+
     /// 功能谓词候选：≥3 主语且 90% 以上主语只有唯一取值（未标记功能的才建议）。
     pub fn functional_candidates(&self) -> Vec<String> {
         let mut candidates = Vec::new();
@@ -783,6 +878,18 @@ impl PredicateRegistry {
             }
             if let Some(inverse) = &profile.inverse {
                 traits.push(format!("互逆「{}」", inverse));
+            }
+            if !profile.domain.is_empty() {
+                traits.push(format!(
+                    "定义域「{}」",
+                    profile.domain.iter().cloned().collect::<Vec<_>>().join("、")
+                ));
+            }
+            if !profile.range.is_empty() {
+                traits.push(format!(
+                    "值域「{}」",
+                    profile.range.iter().cloned().collect::<Vec<_>>().join("、")
+                ));
             }
             if !profile.aliases.is_empty() {
                 traits.push(format!(
@@ -909,13 +1016,15 @@ pub struct ImportConflict {
     pub incoming: String,
 }
 
-/// 导入回执：新增/合并/重复/冲突/待确认谓词/待准入谓词 + 撤销动作。
+/// 导入回执：新增/合并/重复/冲突/模式违规/待确认谓词/待准入谓词 + 撤销动作。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportReceipt {
     pub added: usize,
     pub merged: usize,
     pub duplicates: usize,
     pub conflicts: Vec<ImportConflict>,
+    #[serde(default)]
+    pub schema_violations: Vec<SchemaViolation>,
     pub provisional_predicates: Vec<String>,
     pub pending_admissions: Vec<String>,
     pub actions: Vec<ImportAction>,
@@ -928,6 +1037,7 @@ impl ImportReceipt {
             && self.merged == 0
             && self.duplicates == 0
             && self.conflicts.is_empty()
+            && self.schema_violations.is_empty()
             && self.provisional_predicates.is_empty()
             && self.pending_admissions.is_empty()
     }
@@ -953,6 +1063,23 @@ impl ImportReceipt {
                     conflict.predicate,
                     conflict.existing.join("、"),
                     conflict.incoming
+                ));
+            }
+        }
+        if !self.schema_violations.is_empty() {
+            output.push_str(&format!(
+                "\n定义域/值域不符 {} 处（不落库）：",
+                self.schema_violations.len()
+            ));
+            for violation in &self.schema_violations {
+                output.push_str(&format!(
+                    "\n  • {} -[{}]-> {} 违反{}：允许类型「{}」，实际类型「{}」",
+                    violation.subject,
+                    violation.predicate,
+                    violation.object,
+                    violation.slot,
+                    violation.expected.join("、"),
+                    violation.actual.join("、")
                 ));
             }
         }
@@ -1024,6 +1151,51 @@ mod tests {
         assert!(profile.values.get("李四").unwrap().contains("张三"));
         assert!(!profile.values.contains_key("张三"));
         assert_eq!(registry.conflict("李四", "师傅", "王五"), Some(vec!["张三".to_string()]));
+    }
+
+    #[test]
+    fn schema_domain_range_gate_is_open_world() {
+        let mut registry = PredicateRegistry::new();
+        let mut master = config("师傅");
+        master.domain = vec!["人物".to_string()];
+        master.range = vec!["人物".to_string()];
+        registry.declare(&master);
+
+        let people: BTreeSet<String> = ["人物".to_string()].into_iter().collect();
+        let places: BTreeSet<String> = ["地点".to_string()].into_iter().collect();
+        let empty = BTreeSet::new();
+
+        assert!(
+            registry
+                .check_schema("张三", "师傅", "李四", &empty, &empty)
+                .is_none(),
+            "类型未知时应按开放世界放行"
+        );
+        assert!(
+            registry
+                .check_schema("张三", "师傅", "李四", &people, &people)
+                .is_none(),
+            "类型相符应放行"
+        );
+        let violation = registry
+            .check_schema("北京", "师傅", "李四", &places, &people)
+            .expect("定义域不符应判违规");
+        assert_eq!(violation.slot, "定义域");
+        assert_eq!(violation.expected, vec!["人物".to_string()]);
+        assert_eq!(violation.actual, vec!["地点".to_string()]);
+        let violation = registry
+            .check_schema("张三", "师傅", "北京", &people, &places)
+            .expect("值域不符应判违规");
+        assert_eq!(violation.slot, "值域");
+
+        let mut master = config("师傅");
+        master.domain = vec!["人物".to_string()];
+        master.range = vec!["人物".to_string()];
+        assert!(
+            !registry.declare(&master),
+            "重复声明同一画像不新增"
+        );
+        assert!(registry.report().contains("定义域"));
     }
 
     #[test]
@@ -1146,6 +1318,14 @@ mod tests {
                 existing: vec!["18".to_string()],
                 incoming: "19".to_string(),
             }],
+            schema_violations: vec![SchemaViolation {
+                subject: "北京".to_string(),
+                predicate: "师傅".to_string(),
+                object: "李四".to_string(),
+                slot: "定义域".to_string(),
+                expected: vec!["人物".to_string()],
+                actual: vec!["地点".to_string()],
+            }],
             provisional_predicates: vec!["师从".to_string()],
             pending_admissions: Vec::new(),
             actions: vec![ImportAction::Literal {
@@ -1158,6 +1338,7 @@ mod tests {
         let summary = receipt.summary();
         assert!(summary.contains("新增 3 条"));
         assert!(summary.contains("冲突 1 处"));
+        assert!(summary.contains("定义域/值域不符 1 处"));
         assert!(summary.contains("待确认"));
         assert!(summary.contains("撤销导入"));
         assert!(receipt.can_undo());
@@ -1289,6 +1470,68 @@ mod tests {
             rel_type: "拜师".to_string(),
             properties: HashMap::new(),
         }]
+    }
+
+    fn typed_entity(entity_type: &str, name: &str) -> KnowledgeItem {
+        let mut properties = HashMap::new();
+        properties.insert("name".to_string(), name.to_string());
+        KnowledgeItem::Entity {
+            label: entity_type.to_string(),
+            properties,
+        }
+    }
+
+    /// C13（导入闸门·定义域/值域）：两端实体类型已知且与画像声明不符时
+    /// 关系不落库并入回执；类型未知按开放世界放行；类型相符正常落库。
+    #[tokio::test]
+    async fn c13_import_gates_schema_domain_range() {
+        let (manager, _dir) = temp_manager().await;
+        let mut master = master_profile();
+        master.domain = vec!["人物".to_string()];
+        master.range = vec!["人物".to_string()];
+        manager.configure_predicates(&[master], false);
+
+        manager
+            .save_knowledge_with_receipt(vec![
+                typed_entity("人物", "张三"),
+                typed_entity("地点", "北京"),
+                typed_entity("人物", "李四"),
+            ])
+            .await
+            .unwrap();
+
+        // 值域不符：北京 是「地点」而非「人物」，关系不落库
+        let blocked = manager
+            .save_knowledge_with_receipt(master_disciple_items("张三", "北京"))
+            .await
+            .unwrap();
+        assert_eq!(blocked.schema_violations.len(), 1, "{:?}", blocked);
+        assert!(
+            blocked
+                .actions
+                .iter()
+                .all(|action| !matches!(action, ImportAction::Named { .. })),
+            "违规关系不得落库：{:?}",
+            blocked.actions
+        );
+        assert!(blocked.summary().contains("定义域/值域不符"));
+        let relations = manager.load_all_relations().await.unwrap();
+        assert!(
+            !relations.iter().any(|fact| matches!(
+                fact,
+                PrologFact::Relation { to, .. } if to == "北京"
+            )),
+            "违规关系不得进入图谱：{:?}",
+            relations
+        );
+
+        // 类型相符：正常落库
+        let admitted = manager
+            .save_knowledge_with_receipt(master_disciple_items("张三", "李四"))
+            .await
+            .unwrap();
+        assert!(admitted.schema_violations.is_empty());
+        assert!(admitted.added > 0, "{:?}", admitted);
     }
 
     /// C12（导入闸门·严格准入）：未登记谓词在严格模式下不落库；
