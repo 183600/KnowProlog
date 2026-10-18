@@ -18,7 +18,8 @@ use know_prolog::{
     nlu::NLUEngine,
     prolog_engine::PrologEngine,
     local_semantic_adapter::LocalSemanticAdapter,
-    external_knowledge::{ExternalKnowledgeService, get_direct_answer},
+    external_knowledge::{AnswerOutcome, ExternalKnowledgeService, get_direct_answer},
+    external_ledger::{ExternalLedger, LedgerLoad},
     symbolic_reasoner::SymbolicReasoner,
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::DialogueManager,
@@ -246,8 +247,60 @@ async fn run_interactive_mode(
         )
     };
     
-    // 创建外部知识服务
-    let external_knowledge_service = ExternalKnowledgeService::new();
+    // 创建外部知识服务：外链名册为外部知识留册（出处 + 逻辑时刻 + 时限），
+    // 跨轮、跨重启记住"从哪里、在第几轮、读到了什么"，避免重复打网。
+    let external_ledger_path = config
+        .api
+        .as_ref()
+        .and_then(|api| api.external_ledger_path.clone())
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}/external_ledger.json",
+                config.system.oxigraph_store_path
+            )
+        });
+    let external_ledger_capacity = config
+        .api
+        .as_ref()
+        .map(|api| api.external_ledger_capacity)
+        .unwrap_or(64);
+    let external_ledger_ttl = config
+        .api
+        .as_ref()
+        .map(|api| api.external_ledger_ttl_ticks)
+        .unwrap_or(0);
+    let external_knowledge_service = {
+        let ledger = ExternalLedger::with_config(
+            external_ledger_capacity,
+            external_ledger_ttl,
+            perf_ledger.clone(),
+        );
+        let service = ExternalKnowledgeService::with_ledger(ledger);
+        let service = if let Some(api_config) = &config.api {
+            service.with_endpoint(
+                api_config.ownthink_base_url.clone(),
+                api_config.ownthink_timeout_seconds,
+            )
+        } else {
+            service
+        };
+        match service.load_ledger(&external_ledger_path) {
+            LedgerLoad::Loaded(restored) if restored > 0 => {
+                println!(
+                    "已恢复外链名册：{} 条（「外链台账」查看，逻辑时刻 tick={}）。",
+                    restored,
+                    service.ledger_tick()
+                );
+            }
+            LedgerLoad::Loaded(_) => {}
+            LedgerLoad::Damaged(message) => {
+                eprintln!("外链名册损坏，已忽略（不影响本地知识）：{}", message);
+            }
+            LedgerLoad::Missing => {}
+        }
+        service
+    };
     
     let synonyms = if let Some(synonyms_config) = &config.synonyms {
         synonyms_config.mappings.clone()
@@ -397,6 +450,11 @@ async fn run_interactive_mode(
 
         if input == "quit" {
             break;
+        }
+
+        // 外链名册的逻辑时刻：每个非空用户轮次推进一次（TTL 的计量单位）
+        if !input.is_empty() {
+            external_knowledge_service.advance_tick();
         }
 
         if dialogue_enabled && !input.is_empty() {
@@ -1666,6 +1724,81 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 外链名册：外部知识的出处、取回时刻与时限（跨轮、跨重启）
+        if matches!(input, "外链台账" | "外链名册" | "外链报告" | "外链统计") {
+            println!("{}", external_knowledge_service.ledger_report());
+            println!();
+            continue;
+        }
+
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["外链查看：", "外链查看:", "外链详情：", "外链详情:"],
+        ) {
+            println!(
+                "{}",
+                external_knowledge_service.ledger_entry_report(entity.trim())
+            );
+            println!();
+            continue;
+        }
+
+        // 显式刷新：删除旧页，下次提问重新取回（外链数据不在本地写权限内，
+        // 用"逻辑时刻 + 显式刷新"代替时间戳轮询）
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["外链刷新：", "外链刷新:", "外链重取：", "外链重取:"],
+        ) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请给出实体名，例如：外链刷新：法国");
+            } else if external_knowledge_service.refresh_entity(entity) {
+                let _ = external_knowledge_service.save_ledger(&external_ledger_path);
+                println!("已标记「{}」待刷新：下次提问将重新取回外部知识。", entity);
+            } else {
+                println!("外链名册中没有「{}」的条目；下次提问将直接取回。", entity);
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["外链删除：", "外链删除:", "外链遗忘：", "外链遗忘:"],
+        ) {
+            let entity = entity.trim();
+            if external_knowledge_service.forget_entity(entity) {
+                let _ = external_knowledge_service.save_ledger(&external_ledger_path);
+                println!("已从外链名册删除「{}」。", entity);
+            } else {
+                println!("外链名册中没有「{}」的条目。", entity);
+            }
+            println!();
+            continue;
+        }
+
+        // 确认同义链接：把推测升格为别名知识（纯符号的 sameAs 学习，可显式撤销）
+        if let Some(body) = strip_any_prefix(
+            input,
+            &["同义链接：", "同义链接:", "外链别名：", "外链别名:"],
+        ) {
+            match parse_alias_link(body) {
+                Some((alias, target)) => {
+                    if external_knowledge_service.confirm_alias(alias, target) {
+                        let _ = external_knowledge_service.save_ledger(&external_ledger_path);
+                        println!("已确认同义链接：「{}」= 「{}」。", alias, target);
+                    } else {
+                        println!("同义链接不成立：别名与规范实体不能相同或为空。");
+                    }
+                }
+                None => println!(
+                    "请使用「同义链接：别名 = 规范实体」格式，例如：同义链接：姚明 = ownthink:姚明"
+                ),
+            }
+            println!();
+            continue;
+        }
+
         // 性能报告：存储/推理共享台账（缓存命中、图扫描、版本推进等）
         if matches!(input, "性能报告" | "性能台账" | "运行统计") {
             println!("{}", perf_ledger.report_with_title("性能台账（本会话累计）"));
@@ -2350,22 +2483,26 @@ async fn run_interactive_mode(
                             &[],
                         );
                     } else {
-                        // 尝试使用OwnThink API查询
-                        match external_knowledge_service.answer_question(input).await {
-                            Ok(Some(answer)) => {
-                                println!("根据外部知识：{}", answer);
-                                log_chronicle_reply(
-                                    &mut chronicle,
-                                    &format!("根据外部知识：{}", answer),
-                                    &[],
-                                    &[],
-                                );
-                            }
-                            Ok(None) => {
-                                let fallback = "很抱歉，我无法理解您的问题。请尝试重新描述。";
-                                println!("{}", fallback);
-                                log_chronicle_reply(&mut chronicle, fallback, &[], &[]);
-                            }
+                        // 尝试使用外链知识（名册优先，未命中才打网，回答带出处）
+                        match external_knowledge_service
+                            .answer_question_with_entities(
+                                input,
+                                &external_candidates(&[], &precomputed_query_entities),
+                            )
+                            .await
+                        {
+                            Ok(outcome) => match external_outcome_text(&outcome) {
+                                Some(text) => {
+                                    println!("{}", text);
+                                    log_chronicle_reply(&mut chronicle, &text, &[], &[]);
+                                }
+                                None => {
+                                    let fallback =
+                                        "很抱歉，我无法理解您的问题。请尝试重新描述。";
+                                    println!("{}", fallback);
+                                    log_chronicle_reply(&mut chronicle, fallback, &[], &[]);
+                                }
+                            },
                             Err(e) => {
                                 println!("查询外部知识时出错：{}。请检查网络连接。", e);
                             }
@@ -2403,6 +2540,16 @@ async fn run_interactive_mode(
                 Err(e) => eprintln!("保存对话本体记忆失败: {}", e),
             }
         }
+    }
+
+    // 外链名册落盘：跨重启保留取回的外部知识（出处 + 逻辑时刻）
+    match external_knowledge_service.save_ledger(&external_ledger_path) {
+        Ok(_) => println!(
+            "外链名册已保存到 {}（{} 条条目）。",
+            external_ledger_path,
+            external_knowledge_service.ledger_len()
+        ),
+        Err(e) => eprintln!("保存外链名册失败: {}", e),
     }
 
     println!("系统已退出。");
@@ -2446,6 +2593,50 @@ fn log_chronicle_reply(
     if let Some(chronicle) = chronicle.as_mut() {
         let _ = chronicle.append_reply(answer, plan, provenance);
     }
+}
+
+/// 外链候选实体：预计算实体在前、本轮解析实体在后，去重保序。
+fn external_candidates(entities: &[String], precomputed: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for entity in precomputed.iter().chain(entities.iter()) {
+        if seen.insert(entity.clone()) {
+            merged.push(entity.clone());
+        }
+    }
+    merged
+}
+
+/// 外链结果的可展示文本（回答带出处标注）；`None` 表示没有可用信息。
+fn external_outcome_text(outcome: &AnswerOutcome) -> Option<String> {
+    match outcome {
+        AnswerOutcome::Answered(answer) => {
+            Some(format!("根据外部知识：{}", answer.with_provenance()))
+        }
+        AnswerOutcome::KnownAbsent {
+            entity,
+            source_uri,
+            fetched_tick,
+        } => Some(format!(
+            "外部知识源已确认未收录「{}」（来源：{}，第 {} 轮核验）。",
+            entity, source_uri, fetched_tick
+        )),
+        AnswerOutcome::Unknown => None,
+    }
+}
+
+/// 解析「同义链接：别名 = 规范实体」的两端（支持半角/全角等号）。
+fn parse_alias_link(body: &str) -> Option<(&str, &str)> {
+    for separator in ['=', '＝'] {
+        if let Some((alias, target)) = body.split_once(separator) {
+            let alias = alias.trim();
+            let target = target.trim();
+            if !alias.is_empty() && !target.is_empty() {
+                return Some((alias, target));
+            }
+        }
+    }
+    None
 }
 
 /// 本轮对话实际用到的边：最近一轮对话实例的焦点实体 + 所问属性。
@@ -2537,7 +2728,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 122] = [
+    const COMMANDS: [&str; 124] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -2627,6 +2818,8 @@ fn is_command_like(input: &str) -> bool {
         "导入历史",
         "导入日志",
         "撤销历史",
+        "外链",
+        "同义链接",
         "性能报告",
         "性能台账",
         "运行统计",
@@ -3096,13 +3289,14 @@ async fn continue_original_query(
                     if let Some(direct_answer) = get_direct_answer(input) {
                         println!("根据常识知识库：{}", direct_answer);
                     } else {
-                        match external_knowledge_service.answer_question(input).await {
-                            Ok(Some(answer)) => {
-                                println!("根据外部知识：{}", answer);
-                            }
-                            Ok(None) => {
-                                println!("很抱歉，我无法找到相关信息。");
-                            }
+                        match external_knowledge_service
+                            .answer_question_with_entities(input, &query_entities)
+                            .await
+                        {
+                            Ok(outcome) => match external_outcome_text(&outcome) {
+                                Some(text) => println!("{}", text),
+                                None => println!("很抱歉，我无法找到相关信息。"),
+                            },
                             Err(e) => {
                                 println!("查询外部知识时出错：{}。", e);
                             }
@@ -3136,9 +3330,40 @@ mod session_tests {
             "虚词报告",
             "算符表",
             "提及账本",
+            "外链台账",
+            "外链查看：法国",
+            "外链刷新：法国",
+            "外链删除：法国",
+            "同义链接：姚明 = ownthink:姚明",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
+    }
+
+    /// 「同义链接」命令的解析：半角/全角等号、缺端拒绝
+    #[test]
+    fn alias_link_parses_both_equals_forms() {
+        assert_eq!(
+            parse_alias_link("姚明 = ownthink:姚明"),
+            Some(("姚明", "ownthink:姚明"))
+        );
+        assert_eq!(
+            parse_alias_link("姚明＝ownthink:姚明"),
+            Some(("姚明", "ownthink:姚明"))
+        );
+        assert_eq!(parse_alias_link("只有一头 = "), None);
+        assert_eq!(parse_alias_link("没有等号"), None);
+    }
+
+    /// 外链候选实体：预计算在前、去重保序
+    #[test]
+    fn external_candidates_merge_dedup_and_order() {
+        let entities = vec!["B".to_string(), "D".to_string()];
+        let precomputed = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(
+            external_candidates(&entities, &precomputed),
+            vec!["A", "B", "D"]
+        );
     }
 
     /// 跨重启撤销：导入 → 日志落盘 → 重新打开存储 → 恢复日志 → 撤销归零

@@ -23,6 +23,7 @@ pub mod entity_relation_extractor;
 pub mod local_semantic_adapter;
 pub mod question_analyzer;
 pub mod external_knowledge;
+pub mod external_ledger;
 pub mod ontology_alignment;
 pub mod link_prediction;
 pub mod semantic_embedding;
@@ -472,6 +473,19 @@ pub struct ApiConfig {
     pub enable_entity_disambiguation: bool,
     pub max_ambiguous_entities: usize,
     pub auto_select_best_entity: bool,
+    /// 外链名册落盘路径（缺省为 `<store>/external_ledger.json`）
+    #[serde(default)]
+    pub external_ledger_path: Option<String>,
+    /// 外链名册容量（条目数上限，LRU 淘汰）
+    #[serde(default = "default_external_ledger_capacity")]
+    pub external_ledger_capacity: usize,
+    /// 外链名册时限（逻辑轮次；0 = 不过期，刷新交给显式命令）
+    #[serde(default)]
+    pub external_ledger_ttl_ticks: u64,
+}
+
+fn default_external_ledger_capacity() -> usize {
+    external_ledger::DEFAULT_CAPACITY
 }
 
 #[derive(Debug, Deserialize)]
@@ -780,15 +794,75 @@ pub struct OxigraphManager {
     // 每次写操作自增，用于判定缓存的整图快照是否仍然有效
     revision: AtomicU64,
     snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
-    // 相关事实查询缓存：(revision, 规范化查询键) → 结果。
-    // 同一知识版本下重复问同一实体命中缓存
-    relevant_cache: parking_lot::Mutex<Option<(u64, String, Arc<Vec<PrologFact>>)>>,
-    // 直答缓存：(revision, 查询键) → 答案（含"确无答案"的负缓存）
-    direct_answer_cache: parking_lot::Mutex<Option<(u64, String, Option<String>)>>,
+    // 相关事实查询缓存：同一知识版本内按查询键多槽缓存（LRU），
+    // 交替询问不同实体不再互相撕票；写后整体失效
+    relevant_cache: parking_lot::Mutex<RevisionLru<Arc<Vec<PrologFact>>>>,
+    // 直答缓存：同一知识版本内按查询键多槽缓存（LRU，含"确无答案"的负缓存）
+    direct_answer_cache: parking_lot::Mutex<RevisionLru<Option<String>>>,
     // 操作计数台账（可与会话推理器共享同一实例）
     perf: Arc<perf_ledger::PerfLedger>,
     // 谓词画像注册表：导入准入、别名/逆向归一、功能谓词冲突裁决
     predicate_registry: parking_lot::RwLock<predicate_registry::PredicateRegistry>,
+}
+
+/// 每次写操作缓存容量上限（条目数）。对话中交替询问少量实体，
+/// 32 槽足以消除往返抖动，同时让内存占用可计算。
+const QUERY_CACHE_CAPACITY: usize = 32;
+
+/// 按知识版本失效的有界 LRU 查询缓存。
+///
+/// 正确性契约与单槽缓存相同：缓存条目只在 `revision` 与当前知识版本一致时
+/// 才可命中；版本推进（写之后自增）会让下一查整体重新装载。容量溢出时
+/// 淘汰最久未用条目，淘汰顺序确定（LRU 序由访问推进）。
+struct RevisionLru<V> {
+    revision: u64,
+    capacity: usize,
+    entries: HashMap<String, V>,
+    order: Vec<String>,
+}
+
+impl<V> RevisionLru<V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            revision: u64::MAX,
+            capacity: capacity.max(1),
+            entries: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    /// 命中则触碰 LRU 并返回引用；版本不符或未命中返回 None。
+    fn get(&mut self, revision: u64, key: &str) -> Option<&V> {
+        if self.revision != revision || !self.entries.contains_key(key) {
+            return None;
+        }
+        self.order.retain(|cached| cached != key);
+        self.order.push(key.to_string());
+        self.entries.get(key)
+    }
+
+    /// 写入（返回被淘汰的条目数：0 或 1）。版本变化时先清空。
+    fn put(&mut self, revision: u64, key: String, value: V) -> usize {
+        if self.revision != revision {
+            self.entries.clear();
+            self.order.clear();
+            self.revision = revision;
+        }
+        if self.entries.insert(key.clone(), value).is_none() {
+            self.order.push(key);
+        } else {
+            self.order.retain(|cached| cached != &key);
+            self.order.push(key);
+        }
+        if self.entries.len() > self.capacity {
+            if let Some(oldest) = self.order.first().cloned() {
+                self.order.remove(0);
+                self.entries.remove(&oldest);
+                return 1;
+            }
+        }
+        0
+    }
 }
 
 impl OxigraphManager {
@@ -823,8 +897,8 @@ impl OxigraphManager {
             store: Arc::new(Mutex::new(store)),
             revision: AtomicU64::new(0),
             snapshot_cache: parking_lot::Mutex::new(None),
-            relevant_cache: parking_lot::Mutex::new(None),
-            direct_answer_cache: parking_lot::Mutex::new(None),
+            relevant_cache: parking_lot::Mutex::new(RevisionLru::new(QUERY_CACHE_CAPACITY)),
+            direct_answer_cache: parking_lot::Mutex::new(RevisionLru::new(QUERY_CACHE_CAPACITY)),
             perf,
             predicate_registry: parking_lot::RwLock::new(
                 predicate_registry::PredicateRegistry::new(),
@@ -1557,12 +1631,10 @@ impl OxigraphManager {
         let cache_key = format!("{}|{}", max_hops, sorted_entities.join("\u{1}"));
         let revision = self.revision.load(Ordering::Acquire);
         {
-            let cache = self.relevant_cache.lock();
-            if let Some((cached_revision, cached_key, facts)) = cache.as_ref() {
-                if *cached_revision == revision && cached_key == &cache_key {
-                    self.perf.bump("relevant_facts_cache_hit");
-                    return Ok(facts.as_ref().clone());
-                }
+            let mut cache = self.relevant_cache.lock();
+            if let Some(facts) = cache.get(revision, &cache_key) {
+                self.perf.bump("relevant_facts_cache_hit");
+                return Ok(facts.as_ref().clone());
             }
         }
         self.perf.bump("relevant_facts_cache_miss");
@@ -1610,7 +1682,14 @@ impl OxigraphManager {
         facts.extend(relations);
         
         let facts = Arc::new(facts);
-        *self.relevant_cache.lock() = Some((revision, cache_key, facts.clone()));
+        if self
+            .relevant_cache
+            .lock()
+            .put(revision, cache_key, facts.clone())
+            > 0
+        {
+            self.perf.bump("relevant_facts_cache_evict");
+        }
         Ok(facts.as_ref().clone())
     }
 
@@ -1807,17 +1886,22 @@ impl OxigraphManager {
         let cache_key = format!("{}|{}", query_type, entities.join("\u{1}"));
         let revision = self.revision.load(Ordering::Acquire);
         {
-            let cache = self.direct_answer_cache.lock();
-            if let Some((cached_revision, cached_key, answer)) = cache.as_ref() {
-                if *cached_revision == revision && cached_key == &cache_key {
-                    self.perf.bump("direct_answer_cache_hit");
-                    return answer.clone();
-                }
+            let mut cache = self.direct_answer_cache.lock();
+            if let Some(answer) = cache.get(revision, &cache_key) {
+                self.perf.bump("direct_answer_cache_hit");
+                return answer.clone();
             }
         }
         self.perf.bump("direct_answer_cache_miss");
         let answer = self.get_direct_answer_uncached(query_type, entities).await;
-        *self.direct_answer_cache.lock() = Some((revision, cache_key, answer.clone()));
+        if self
+            .direct_answer_cache
+            .lock()
+            .put(revision, cache_key, answer.clone())
+            > 0
+        {
+            self.perf.bump("direct_answer_cache_evict");
+        }
         answer
     }
 
@@ -2683,6 +2767,103 @@ pub fn create_default_synonyms() -> HashMap<String, String> {
 mod cache_tests {
     use super::*;
     use crate::perf_ledger::PerfLedger;
+
+    /// 有界 LRU：版本失效整体清空、命中触碰、溢出淘汰最久未用
+    #[test]
+    fn revision_lru_invalidates_touches_and_evicts() {
+        let mut cache: RevisionLru<u64> = RevisionLru::new(2);
+        assert!(cache.get(1, "a").is_none(), "空缓存不命中");
+        assert_eq!(cache.put(1, "a".to_string(), 1), 0);
+        assert_eq!(cache.put(1, "b".to_string(), 2), 0);
+        assert_eq!(cache.get(1, "a"), Some(&1));
+        // 触碰 a 后，写入 c 应淘汰 b
+        assert_eq!(cache.put(1, "c".to_string(), 3), 1);
+        assert_eq!(cache.get(1, "b"), None);
+        assert_eq!(cache.get(1, "a"), Some(&1));
+        assert_eq!(cache.get(1, "c"), Some(&3));
+        // 版本推进：全部失效，旧键不得复活
+        assert!(cache.get(2, "a").is_none());
+        assert_eq!(cache.put(2, "d".to_string(), 4), 0);
+        assert_eq!(cache.entries.len(), 1, "版本变化时先清空");
+        assert_eq!(cache.get(2, "d"), Some(&4));
+    }
+
+    /// 多槽直答缓存：交替询问两个同版本问题，第二次都可命中（单槽会互相撕票）
+    #[tokio::test]
+    async fn direct_answer_cache_keeps_multiple_keys_per_revision() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![
+                KnowledgeItem::Entity {
+                    label: "City".to_string(),
+                    properties: HashMap::from([
+                        ("name".to_string(), "北京".to_string()),
+                        ("capital".to_string(), "中国".to_string()),
+                    ]),
+                },
+                KnowledgeItem::Entity {
+                    label: "Person".to_string(),
+                    properties: HashMap::from([("name".to_string(), "张三".to_string())]),
+                },
+            ])
+            .await
+            .unwrap();
+        let perf = manager.perf_ledger();
+        let entities = vec!["北京".to_string()];
+
+        let first = manager.get_direct_answer("capital_query", &entities).await;
+        assert_eq!(first.as_deref(), Some("北京的首都是中国"));
+        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        let queries = perf.count("direct_answer_query");
+
+        // 两个键都在：来回询问均命中缓存，不再重查
+        assert_eq!(
+            manager.get_direct_answer("capital_query", &entities).await,
+            first
+        );
+        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        assert_eq!(perf.count("direct_answer_query"), queries);
+        assert_eq!(perf.count("direct_answer_cache_hit"), 2);
+    }
+
+    /// 多槽相关事实缓存：同一版本交替询问两个实体，第二次都命中
+    #[tokio::test]
+    async fn relevant_facts_cache_keeps_multiple_keys_per_revision() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![person("张三"), person("李四")])
+            .await
+            .unwrap();
+        manager.save_knowledge(items("张三", "李四")).await.unwrap();
+        let perf = manager.perf_ledger();
+
+        let _ = manager
+            .get_relevant_facts(&["张三".to_string()], 2)
+            .await
+            .unwrap();
+        let _ = manager
+            .get_relevant_facts(&["李四".to_string()], 2)
+            .await
+            .unwrap();
+        let scans = perf.count("relevant_facts_graph_scan");
+
+        let second_zhang = manager
+            .get_relevant_facts(&["张三".to_string()], 2)
+            .await
+            .unwrap();
+        assert!(!second_zhang.is_empty());
+        let second_li = manager
+            .get_relevant_facts(&["李四".to_string()], 2)
+            .await
+            .unwrap();
+        assert!(!second_li.is_empty());
+        assert_eq!(
+            perf.count("relevant_facts_graph_scan"),
+            scans,
+            "两个键同版本都应在缓存中"
+        );
+        assert_eq!(perf.count("relevant_facts_cache_hit"), 2);
+    }
 
     async fn temp_manager() -> (OxigraphManager, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
