@@ -1,4 +1,3 @@
-// src/main.rs
 use std::io::{BufRead, Write};
 use std::sync::{Arc, OnceLock};
 use clap::{Parser, Subcommand};
@@ -173,7 +172,7 @@ async fn run_interactive_mode(
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
     sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
-    // 导入日志：把「最近一次导入回执」升级为跨重启的有界撤销栈
+    // 导入日志：跨重启的有界撤销栈
     let journal_path = format!("{}/import_journal.json", config.system.oxigraph_store_path);
     let mut import_journal = match ImportJournal::load(&journal_path) {
         JournalLoad::Loaded(journal) => {
@@ -1369,7 +1368,7 @@ async fn run_interactive_mode(
                     
                     let clean_text = config.nlp.import_keywords.iter()
                         .fold(input.to_string(), |text, keyword| {
-                            // 未出现该关键词时不构造替换串、不做整串扫描
+                            // 关键词未出现时原样返回
                             if !text.contains(keyword.as_str()) {
                                 return text;
                             }

@@ -659,7 +659,7 @@ impl SymbolicReasoner {
 
     /// 派生台账报告：知识版本 + 各派生器最后重建版本 + 各依赖最后变化版本。
     ///
-    /// 「纯重复观察零重建」因此可审计：版本不动 → 台账不动。
+    /// 「重复观察不触发重建」因此可审计：版本不动 → 台账不动。
     pub fn derivation_report(&self) -> String {
         let mut output = format!("派生台账：知识版本 {}。\n", self.revision);
         if self.dependency_stamps.is_empty() {
@@ -883,7 +883,7 @@ impl SymbolicReasoner {
         let triples_added = self.predictor.triple_count() > triples_before;
         self.perf.bump_by("observe_relations", relation_seen as u64);
         // 版本化增量：内容确有变化 → 版本 +1、依赖挂牌、派生重建；
-        // 纯重复观察（快照重放）→ 版本不动、memo 不清、派生零重建
+        // 重复观察（快照重放）→ 版本不动、memo 不清、派生不重建
         let changed = triples_added
             || association_changed
             || attribute_changed
@@ -912,8 +912,7 @@ impl SymbolicReasoner {
         *self.link_memo.lock() = None;
         *self.entity_mentions_memo.lock() = None;
         *self.predicate_canonicals_memo.lock() = None;
-        // 规则只依赖已积累的三元组与固定阈值：若本次没有新增三元组，
-        // 重新挖掘必然得到相同规则，直接跳过
+        // 规则只依赖已积累的三元组与固定阈值：有新增三元组时才重新挖掘
         if triples_added && self.config.enable_link_prediction {
             self.predictor.mine_rules(
                 self.config.link_prediction_min_support,
@@ -921,7 +920,7 @@ impl SymbolicReasoner {
             );
             self.stamp_rebuild("link_rules");
         }
-        // 关联规则与前向/反向归结都只依赖已观察的篮子与事实：无新增则跳过重建
+        // 关联规则与前向/反向归结都只依赖已观察的篮子与事实：有新增时才重建
         if self.config.enable_association_rules && (association_changed || triples_added) {
             self.associations.mine();
             self.stamp_rebuild("associations");
@@ -938,8 +937,7 @@ impl SymbolicReasoner {
             self.rebuild_soft_logic();
         }
         // 图游走向量采用惰性重建：新边在 observe_triple 内标记失效，
-        // 首次需要嵌入时才做全量幂迭代（查询结果与即时重建完全一致）；
-        // PPMI 嵌入自带 dirty 跳过，纯重复观察时连调用都省去
+        // 首次需要嵌入时才做全量幂迭代（查询结果与即时重建完全一致）
         if self.config.enable_semantic_embedding {
             if self.embedding.is_dirty() {
                 self.perf.bump("embedding_rebuild");
@@ -1744,7 +1742,7 @@ impl SymbolicReasoner {
             self.last_abduction_vars = query_vars.to_vec();
         }
         // 联合解释场景（多假设协同 + 注入验证）：成员也并入待定池
-        //（`report.provable == false` 已确认目标不可证，跳过重复的可证性检查）
+        //（`report.provable == false` 已确认目标不可证）
         let scenarios =
             self.abduction
                 .scenarios_assuming_unprovable(&self.resolver, goals, query_vars);
@@ -1863,7 +1861,7 @@ impl SymbolicReasoner {
         }
         self.last_abduction_goal = Some(goals.clone());
         self.last_abduction_vars = query_vars.clone();
-        //（`report.provable == false` 已确认目标不可证，跳过重复的可证性检查）
+        //（`report.provable == false` 已确认目标不可证）
         let scenarios =
             self.abduction
                 .scenarios_assuming_unprovable(&self.resolver, &goals, &query_vars);
@@ -6412,7 +6410,7 @@ mod tests {
         assert_eq!(reasoner.holographic().context_len(), 0);
     }
 
-    /// VID（版本化增量派生）：重复观察同一批事实必须版本不动、派生零重建。
+    /// VID（版本化增量派生）：重复观察同一批事实必须版本不动、派生不重建。
     #[test]
     fn test_repeat_observation_is_version_stable() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());

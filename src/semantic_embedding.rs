@@ -58,7 +58,7 @@ impl SymbolicEmbedding {
         self.similarity_floor
     }
 
-    /// 计数是否比上次重建有更新（供调用方跳过无谓的 `rebuild` 调用）。
+    /// 计数是否比上次重建有更新（供调用方判断是否需要 `rebuild`）。
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -190,7 +190,7 @@ impl SymbolicEmbedding {
     // PPMI 逐分量计算：pmi = ln( count(e,f) * total / (count(f) * mass(e)) )
     // 只保留正值，随后 L2 归一化，便于余弦相似度。
     pub fn rebuild(&mut self) {
-        // 计数未变化时向量必然与上次重建一致，直接跳过昂贵的 PPMI 全量重算
+        // 计数未变化时向量与上次重建一致，跳过 PPMI 全量重算
         if !self.dirty && !self.vectors.is_empty() {
             return;
         }
@@ -223,7 +223,7 @@ impl SymbolicEmbedding {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.0.cmp(&b.0))
             };
-            // 先按全序做 top-k 划分再排序：与"全排序后截断"结果一致，但平均复杂度更低
+            // 先做 top-k 划分，再对保留项排序
             if weights.len() > self.max_features {
                 weights.select_nth_unstable_by(self.max_features, cmp);
                 weights.truncate(self.max_features);

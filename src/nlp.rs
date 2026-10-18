@@ -1,4 +1,3 @@
-// src/nlp.rs
 use jieba_rs::Jieba; // 导入结巴分词库，用于中文分词
 use std::collections::HashMap; // 导入哈希映射，用于存储键值对
 use std::sync::OnceLock;

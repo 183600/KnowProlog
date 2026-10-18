@@ -1,4 +1,3 @@
-// src/dense_retrieval.rs
 //! 符号主义「稠密检索」：把每条知识当作一篇文档，用纯统计与图游走信号编码成
 //! 稀疏高维向量（TF-IDF 词面 × 结构 PPR × 谓词匹配），查询与文档做加权内积。
 //!
@@ -203,7 +202,7 @@ impl DenseRetriever {
             }
             self.doc_norms[id] = norm_sq.sqrt();
         }
-        // 实体名按键长降序缓存，供 `seeds` 的最长优先匹配复用（避免每次查询排序）
+        // 实体名按键长降序缓存，供 `seeds_cached` 的最长优先匹配复用
         let mut names: Vec<String> = self.entity_docs.keys().cloned().collect();
         names.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
         self.seed_candidates = names;

@@ -406,7 +406,7 @@ impl EntityLinker {
                 .profiles
                 .iter()
                 .filter_map(|(canonical, profile)| {
-                    // 上界低于阈值时直接跳过昂贵集合运算（须用真实集合大小，
+                    // 上界低于阈值时直接跳过集合运算（须用真实集合大小，
                     // 重复字符会令集合远小于字符数，按字符数估界会误剪）
                     let upper = similarity_upper_bound(
                         trimmed_chars.len(),

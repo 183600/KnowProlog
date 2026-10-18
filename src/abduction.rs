@@ -1132,8 +1132,8 @@ impl AbductionEngine {
     }
 
     /// 与 [`AbductionEngine::scenarios`] 相同，但调用方已确认目标在 `engine`
-    /// 上不可证，因而跳过重复的可证性检查（省去一次必然失败的完整求解）。
-    /// 仅在 `engine` 状态与不可证结论一致时调用，语义与 `scenarios` 等价。
+    /// 上不可证，因而跳过可证性检查。仅在 `engine` 状态与不可证结论一致时调用，
+    /// 语义与 `scenarios` 等价。
     pub fn scenarios_assuming_unprovable(
         &self,
         engine: &ResolutionEngine,
@@ -1422,7 +1422,7 @@ impl<'a> FrontierSearch<'a> {
         }
 
         // 2) 直接切点：把当前原子记为缺失前提（最小解释，最先记录）
-        //（借出 `applied` 随递归入栈，返回后再取回，避免为每个切点克隆原子；
+        //（借出 `applied` 随递归入栈，返回后再取回；
         //  递归按栈序归还，`pop` 必然取回同一原子）
         missing.push(applied);
         self.run(&goals[1..], subst, depth, missing);

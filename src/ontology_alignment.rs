@@ -155,7 +155,7 @@ impl OntologyAligner {
         }
     }
 
-    /// 规范化术语；无需任何改写时直接借用原字符串，避免每次调用都分配。
+    /// 规范化术语；无需改写时直接借用原字符串。
     pub fn normalize_cow<'a>(&self, term: &'a str) -> Cow<'a, str> {
         let needs_work = term.chars().any(|ch| {
             ch.is_whitespace()

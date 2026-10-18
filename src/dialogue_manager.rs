@@ -98,7 +98,7 @@ pub struct DialogueTurn {
 ///
 /// 状态充分性：快照必须覆盖全部可观察状态——`turns`、`focus`、`externals`
 /// 之外的 `last_reply` 也要持久化，恢复后的 `summary()` 与中断运行逐字一致。
-/// `last_reply` 带 serde 默认值，兼容旧版快照文件。
+/// `last_reply` 带 serde 默认值，快照缺少该字段时按默认值恢复。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialogueManagerSnapshot {
     pub turns: Vec<DialogueTurn>,

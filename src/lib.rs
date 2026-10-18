@@ -756,7 +756,7 @@ pub struct OxigraphManager {
     revision: AtomicU64,
     snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
     // 相关事实查询缓存：(revision, 规范化查询键) → 结果。
-    // 同一知识版本下重复问同一实体 = 命中缓存，零图扫描
+    // 同一知识版本下重复问同一实体命中缓存
     relevant_cache: parking_lot::Mutex<Option<(u64, String, Arc<Vec<PrologFact>>)>>,
     // 直答缓存：(revision, 查询键) → 答案（含"确无答案"的负缓存）
     direct_answer_cache: parking_lot::Mutex<Option<(u64, String, Option<String>)>>,
@@ -814,7 +814,7 @@ impl OxigraphManager {
 
     /// 标记知识版本变化：调用方必须持有存储锁，且在本次实际写入完成之后
     /// （version-after-write）。这样并发读者绝不会把旧数据缓存到新版本号上，
-    /// 且零新增的重复导入不推进版本、不失效任何下游缓存。
+    /// 且重复导入不推进版本。
     fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::AcqRel);
         self.perf.bump("revision_bump");
@@ -1084,7 +1084,7 @@ impl OxigraphManager {
                 }
             }
         }
-        // 只有确有写入才推进版本：全重复导入零新增、零缓存失效
+        // 只有确有写入才推进版本
         if receipt.added > 0 {
             self.bump_revision();
         }
@@ -2670,7 +2670,7 @@ mod cache_tests {
         }
     }
 
-    /// 版本键查询缓存：同版本重复问同一实体零图扫描；写入后自动失效。
+    /// 版本键查询缓存：同版本重复问同一实体命中缓存；写入后自动失效。
     #[tokio::test]
     async fn relevant_facts_cache_is_revision_keyed() {
         let (manager, _dir) = temp_manager().await;
@@ -2689,7 +2689,7 @@ mod cache_tests {
         let scans_after_first = perf.count("relevant_facts_graph_scan");
         let misses_after_first = perf.count("relevant_facts_cache_miss");
 
-        // 同一版本、同一实体（顺序不同也不影响）：命中缓存，零新增扫描
+        // 同一版本、同一实体（顺序不同也不影响）：命中缓存
         let second = manager
             .get_relevant_facts(&["张三".to_string()], 2)
             .await
@@ -2716,7 +2716,7 @@ mod cache_tests {
         assert!(relations.contains(&"师傅"));
     }
 
-    /// 零新增的重复导入不推进知识版本、不失效快照缓存。
+    /// 重复导入不推进知识版本。
     #[tokio::test]
     async fn duplicate_import_does_not_bump_revision() {
         let (manager, _dir) = temp_manager().await;
