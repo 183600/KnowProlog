@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, MoveKind, UtteranceFrame};
 use crate::prolog_engine::PrologFact;
+use crate::prompt_spec::{PromptMode, PromptStats};
 use crate::symbolic_reasoner::SymbolicReasoner;
 use crate::ReasoningConfig;
 
@@ -150,6 +151,21 @@ pub struct ProvenanceMetrics {
     pub precision: f64,
 }
 
+/// 提示接地指标：模板所需槽位是否全部拿到绑定（事前约束，而非事后审计）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GroundingMetrics {
+    /// 尝试走模板渲染的策略次数。
+    pub attempted: u32,
+    /// required 槽位全部绑定，成功渲染。
+    pub grounded: u32,
+    /// required 槽位缺失，回退旧渲染器。
+    pub ungrounded: u32,
+    /// 平价模式下模板与旧文本不一致的次数（应为 0）。
+    pub parity_mismatches: u32,
+    /// grounded / attempted（无尝试时为 1.0）。
+    pub slot_rate: f64,
+}
+
 /// 一次完整评测的报告（可序列化，供基线棘轮与 CI 消费）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DialogueEvalReport {
@@ -166,6 +182,9 @@ pub struct DialogueEvalReport {
     pub takeover: Prf,
     pub answers: AnswerMetrics,
     pub provenance: ProvenanceMetrics,
+    /// 模板接地闸门指标（v2 起）。
+    #[serde(default)]
+    pub grounding: GroundingMetrics,
 }
 
 impl DialogueEvalReport {
@@ -230,6 +249,14 @@ impl DialogueEvalReport {
             self.provenance.quoted_tokens,
             self.provenance.precision
         ));
+        out.push_str(&format!(
+            "槽位接地：{}/{} 次模板渲染通过闸门（slot_rate {:.4}），回退 {} 次，平价差异 {} 次\n",
+            self.grounding.grounded,
+            self.grounding.attempted,
+            self.grounding.slot_rate,
+            self.grounding.ungrounded,
+            self.grounding.parity_mismatches
+        ));
         if let Some((label, f1)) = self.weakest_intent_class() {
             out.push_str(&format!("最弱意图类别：{}（F1 {:.4}）\n", label, f1));
         }
@@ -269,6 +296,7 @@ impl DialogueEvalReport {
             ratio(self.answers.answered, self.answers.reference_turns),
         );
         metrics.insert("provenance.precision".to_string(), self.provenance.precision);
+        metrics.insert("grounding.slot_rate".to_string(), self.grounding.slot_rate);
         metrics
     }
 }
@@ -286,7 +314,7 @@ pub struct DialogueEvalBaseline {
     pub metrics: BTreeMap<String, f64>,
 }
 
-pub const DIALOGUE_BASELINE_VERSION: u32 = 1;
+pub const DIALOGUE_BASELINE_VERSION: u32 = 2;
 
 impl DialogueEvalBaseline {
     pub fn from_report(report: &DialogueEvalReport) -> Self {
@@ -819,6 +847,9 @@ pub fn reasoner_for_scenario(
 // ---------------------------------------------------------------------------
 
 /// 逐场景、逐轮执行金标脚本，输出确定性报告。
+///
+/// 模板运行模式为 [`PromptMode::On`]（接地失败自动回退旧渲染器，
+/// 因此答案文本与历史行为一致），同时收集 [`GroundingMetrics`]。
 pub fn evaluate_scenarios(scenarios: &[GoldScenario]) -> DialogueEvalReport {
     evaluate_scenarios_with(scenarios, |scenario| {
         Box::new(GoldKnowledge::from_scenario(scenario))
@@ -839,6 +870,7 @@ where
         acc.scenarios += 1;
         let knowledge = build_knowledge(scenario);
         let mut manager = DialogueManager::new();
+        manager.set_prompt_mode(PromptMode::On);
         let mut history: Vec<String> = Vec::new();
         for turn in scenario.turns {
             acc.turns += 1;
@@ -877,6 +909,7 @@ where
                 history.push(reply.text.clone());
             }
         }
+        acc.prompt_stats.absorb(manager.prompt_stats());
     }
     let digest = corpus_digest(scenarios, EvalKnowledge::Scripted);
     acc.finalize(EvalKnowledge::Scripted, digest)
@@ -884,8 +917,20 @@ where
 
 /// 跑种子语料：`Scripted` 用脚本知识替身，`Reasoner` 用真实推理器。
 pub fn evaluate_seed(mode: EvalKnowledge) -> DialogueEvalReport {
+    evaluate_seed_with(mode, PromptMode::On)
+}
+
+/// 与 [`evaluate_seed`] 相同，但可指定模板运行模式
+/// （`--prompt-mode off|parity|on`，供提示迭代的 A/B 实验使用）。
+pub fn evaluate_seed_with(mode: EvalKnowledge, prompt_mode: PromptMode) -> DialogueEvalReport {
     match mode {
-        EvalKnowledge::Scripted => evaluate_scenarios(seed_corpus()),
+        EvalKnowledge::Scripted => {
+            let mut report = evaluate_scenarios(seed_corpus());
+            if prompt_mode != PromptMode::On {
+                report = reevaluate_scripted(prompt_mode);
+            }
+            report
+        }
         EvalKnowledge::Reasoner => {
             let config = ReasoningConfig {
                 enable_link_prediction: false,
@@ -896,6 +941,7 @@ pub fn evaluate_seed(mode: EvalKnowledge) -> DialogueEvalReport {
                 acc.scenarios += 1;
                 let knowledge = reasoner_for_scenario(scenario, config.clone(), HashMap::new());
                 let mut manager = DialogueManager::new();
+                manager.set_prompt_mode(prompt_mode);
                 let mut history: Vec<String> = Vec::new();
                 for turn in scenario.turns {
                     acc.turns += 1;
@@ -932,11 +978,61 @@ pub fn evaluate_seed(mode: EvalKnowledge) -> DialogueEvalReport {
                         history.push(reply.text.clone());
                     }
                 }
+                acc.prompt_stats.absorb(manager.prompt_stats());
             }
             let digest = corpus_digest(seed_corpus(), mode);
             acc.finalize(mode, digest)
         }
     }
+}
+
+/// Scripted 模式下按指定模板模式重跑种子语料（与 reasoner 模式同构）。
+fn reevaluate_scripted(prompt_mode: PromptMode) -> DialogueEvalReport {
+    let mut acc = Acc::default();
+    for scenario in seed_corpus() {
+        acc.scenarios += 1;
+        let knowledge = GoldKnowledge::from_scenario(scenario);
+        let mut manager = DialogueManager::new();
+        manager.set_prompt_mode(prompt_mode);
+        let mut history: Vec<String> = Vec::new();
+        for turn in scenario.turns {
+            acc.turns += 1;
+            let frame = manager.analyze(turn.input, &knowledge);
+            acc.observe_intent(turn, &frame);
+            let predicted_entities: HashSet<String> =
+                knowledge.entities_in(turn.input).into_iter().collect();
+            acc.entity.observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
+            let predicted_slot: HashSet<String> = frame.attribute.clone().into_iter().collect();
+            acc.slot.observe_sets(
+                &set_of(turn.attribute.as_ref().into_iter().copied()),
+                &predicted_slot,
+            );
+            history.push(turn.input.to_string());
+            let reply = manager
+                .plan_pure_dialogue(turn.input, &knowledge)
+                .or_else(|| manager.plan_reply(turn.input, &knowledge));
+            acc.takeover.observe_bool(turn.expect_takeover, reply.is_some());
+            let predicted_clarify = reply
+                .as_ref()
+                .map(|reply| {
+                    reply.plan.iter().any(|plan| {
+                        plan == "clarify_entity" || plan == "clarify_entity_no_focus"
+                    })
+                })
+                .unwrap_or(false);
+            acc.observe_clarify(turn.clarify, predicted_clarify);
+            acc.observe_answer(turn, reply.as_ref().map(|reply| reply.text.as_str()));
+            if let Some(reply) = &reply {
+                acc.observe_provenance(&reply.text, reply.plan.first(), &knowledge, &history);
+            }
+            if let Some(reply) = &reply {
+                history.push(reply.text.clone());
+            }
+        }
+        acc.prompt_stats.absorb(manager.prompt_stats());
+    }
+    let digest = corpus_digest(seed_corpus(), EvalKnowledge::Scripted);
+    acc.finalize(EvalKnowledge::Scripted, digest)
 }
 
 fn set_of<'a, I: IntoIterator<Item = &'a str>>(items: I) -> HashSet<String> {
@@ -964,6 +1060,7 @@ struct Acc {
     provenance_replies: u32,
     provenance_quoted: u32,
     provenance_traceable: u32,
+    prompt_stats: PromptStats,
 }
 
 impl Acc {
@@ -1114,6 +1211,13 @@ impl Acc {
                 quoted_tokens: self.provenance_quoted,
                 traceable_tokens: self.provenance_traceable,
                 precision: ratio(self.provenance_traceable, self.provenance_quoted),
+            },
+            grounding: GroundingMetrics {
+                attempted: self.prompt_stats.attempted() as u32,
+                grounded: self.prompt_stats.grounded as u32,
+                ungrounded: self.prompt_stats.ungrounded as u32,
+                parity_mismatches: self.prompt_stats.parity_mismatches as u32,
+                slot_rate: self.prompt_stats.grounding_rate(),
             },
         }
     }
@@ -1291,6 +1395,14 @@ mod tests {
         assert_eq!(report.takeover.f1(), 1.0, "{}", report.render_text());
         assert_eq!(report.over_ask_rate, 0.0, "{}", report.render_text());
         assert_eq!(report.provenance.precision, 1.0, "{}", report.render_text());
+        assert_eq!(report.grounding.slot_rate, 1.0, "{}", report.render_text());
+        assert_eq!(report.grounding.ungrounded, 0, "{}", report.render_text());
+        assert_eq!(
+            report.grounding.parity_mismatches, 0,
+            "{}",
+            report.render_text()
+        );
+        assert!(report.grounding.attempted > 0);
         assert!(report.answers.reference_turns >= 4);
         assert!(
             report.answers.char_f1 > 0.5,
@@ -1374,5 +1486,23 @@ mod tests {
                 value
             );
         }
+    }
+
+    #[test]
+    fn prompt_modes_agree_on_seed_corpus_metrics() {
+        let off = evaluate_seed_with(EvalKnowledge::Scripted, PromptMode::Off);
+        let parity = evaluate_seed_with(EvalKnowledge::Scripted, PromptMode::Parity);
+        let on = evaluate_seed_with(EvalKnowledge::Scripted, PromptMode::On);
+        for (name, report) in [("off", &off), ("parity", &parity), ("on", &on)] {
+            assert_eq!(report.answers, off.answers, "{} 模式改变了回答指标", name);
+            assert_eq!(report.over_ask_rate, off.over_ask_rate, "{}", name);
+            assert_eq!(report.takeover, off.takeover, "{}", name);
+            assert_eq!(report.grounding.ungrounded, 0, "{}", name);
+            assert_eq!(report.grounding.parity_mismatches, 0, "{}", name);
+        }
+        assert_eq!(off.grounding.attempted, 0, "Off 模式不应尝试模板");
+        assert!(parity.grounding.attempted > 0);
+        assert_eq!(on.grounding.attempted, parity.grounding.attempted);
+        assert_eq!(on.grounding.grounded, parity.grounding.grounded);
     }
 }

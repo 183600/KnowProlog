@@ -63,6 +63,8 @@ pub mod function_words;
 pub mod graph_ledger;
 pub mod dialogue_eval;
 pub mod serve_api;
+pub mod bindings;
+pub mod prompt_spec;
 
 #[cfg(test)]
 mod dialogue_conformance;

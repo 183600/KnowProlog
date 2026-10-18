@@ -10,6 +10,8 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use crate::bindings::{BindingSet, BoundTerm};
+
 /// 项：逻辑变量或常量（实体名、属性值、谓词名都是常量）
 ///
 /// 字符串用 `Rc<str>` 共享。
@@ -201,6 +203,18 @@ pub struct Solution {
     pub confidence: f64,
 }
 
+/// 类型化归结解：与 [`Solution`] 同构，但绑定升格为 [`BoundTerm`]。
+///
+/// - 未绑定变量显式表示为 [`BoundTerm::Unbound`]（旧 API 里的 `"?X"` 约定）；
+/// - 数值常量双存 `raw` + `value`，渲染平价、比较可用；
+/// - 绑定按查询变量顺序给出，且整个集合经 `BTreeMap` 确定性排序。
+#[derive(Debug, Clone)]
+pub struct TypedSolution {
+    pub bindings: BindingSet,
+    pub proofs: Vec<ProofNode>,
+    pub confidence: f64,
+}
+
 /// Horn 子句：head :- body（body 为空即事实；置信度用于排序/展示，不参与学习）
 #[derive(Debug, Clone)]
 pub struct Clause {
@@ -354,6 +368,67 @@ impl ResolutionEngine {
     // 搜索预算按"每个合取目标"独立分配：规则探索耗尽预算时，事实匹配
     // （单位归结）仍会完成，避免前一个目标的规则分支拖垮后续目标。
     pub fn solve(&self, goals: &[Atom], query_vars: &[String]) -> Vec<Solution> {
+        let states = self.solve_states(goals);
+
+        // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明
+        let mut best: HashMap<String, Solution> = HashMap::new();
+        for (subst, proofs) in states {
+            let (key, bindings, _) = bind_query_vars(&subst, query_vars);
+            let confidence: f64 = proofs.iter().map(|node| node.confidence).product();
+            let candidate = Solution {
+                bindings,
+                proofs,
+                confidence: confidence.clamp(0.0, 1.0),
+            };
+            match best.get(&key) {
+                Some(existing) if existing.confidence >= candidate.confidence => {}
+                _ => {
+                    best.insert(key, candidate);
+                }
+            }
+        }
+        let mut solutions: Vec<Solution> = best.into_values().collect();
+        solutions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        solutions.truncate(self.max_solutions);
+        solutions
+    }
+
+    /// 与 [`Self::solve`] 同序同解的类型化版本：旧字符串行为不变，
+    /// 新调用方拿到 [`BoundTerm`]（显式未绑定 / 数值可比较）。
+    pub fn solve_typed(&self, goals: &[Atom], query_vars: &[String]) -> Vec<TypedSolution> {
+        let states = self.solve_states(goals);
+        let mut best: HashMap<String, TypedSolution> = HashMap::new();
+        for (subst, proofs) in states {
+            let (key, _, typed) = bind_query_vars(&subst, query_vars);
+            let confidence: f64 = proofs.iter().map(|node| node.confidence).product();
+            let candidate = TypedSolution {
+                bindings: typed,
+                proofs,
+                confidence: confidence.clamp(0.0, 1.0),
+            };
+            match best.get(&key) {
+                Some(existing) if existing.confidence >= candidate.confidence => {}
+                _ => {
+                    best.insert(key, candidate);
+                }
+            }
+        }
+        let mut solutions: Vec<TypedSolution> = best.into_values().collect();
+        solutions.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        solutions.truncate(self.max_solutions);
+        solutions
+    }
+
+    /// 求解 goals 合取，返回「置换 + 各目标证明」的全部中间状态。
+    fn solve_states(&self, goals: &[Atom]) -> Vec<(Substitution, Vec<ProofNode>)> {
         if goals.is_empty() {
             return Vec::new();
         }
@@ -380,45 +455,7 @@ impl ResolutionEngine {
                 break;
             }
         }
-
-        // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明
-        let mut best: HashMap<String, Solution> = HashMap::new();
-        for (subst, proofs) in states {
-            // 渲染变量值：同时用于绑定表与去重键
-            let mut bindings: HashMap<String, String> = HashMap::with_capacity(query_vars.len());
-            let mut key = String::new();
-            for var in query_vars {
-                let value = resolve_term(&Term::var(var), &subst);
-                let rendered = render_term(&value);
-                if !key.is_empty() {
-                    key.push('|');
-                }
-                key.push_str(var);
-                key.push('=');
-                key.push_str(&rendered);
-                bindings.insert(var.clone(), rendered);
-            }
-            let confidence: f64 = proofs.iter().map(|node| node.confidence).product();
-            let candidate = Solution {
-                bindings,
-                proofs,
-                confidence: confidence.clamp(0.0, 1.0),
-            };
-            match best.get(&key) {
-                Some(existing) if existing.confidence >= candidate.confidence => {}
-                _ => {
-                    best.insert(key, candidate);
-                }
-            }
-        }
-        let mut solutions: Vec<Solution> = best.into_values().collect();
-        solutions.sort_by(|a, b| {
-            b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        solutions.truncate(self.max_solutions);
-        solutions
+        states
     }
 
     fn prove_goal(
@@ -904,6 +941,42 @@ pub fn render_term(term: &Term) -> String {
     }
 }
 
+/// 项 → 类型化绑定值：变量（未绑定）显式化为 [`BoundTerm::Unbound`]，
+/// 常量按 [`BoundTerm::classify`] 分类（数值双存 raw/value）。
+pub fn bound_term(term: &Term) -> BoundTerm {
+    match term {
+        Term::Var(_) => BoundTerm::Unbound,
+        Term::Const(name) => BoundTerm::classify(name),
+    }
+}
+
+/// 为查询变量生成「去重键 + 旧字符串绑定 + 类型化绑定」三件套。
+///
+/// 旧字符串绑定沿用 `render_term` 的隐式未绑定约定（`?X`），
+/// 类型化绑定则给出 [`BoundTerm::Unbound`]；两者从同一次置换解析得出，
+/// 保证新旧 API 在同一解上严格对应。
+fn bind_query_vars(
+    subst: &Substitution,
+    query_vars: &[String],
+) -> (String, HashMap<String, String>, BindingSet) {
+    let mut key = String::new();
+    let mut legacy: HashMap<String, String> = HashMap::with_capacity(query_vars.len());
+    let mut typed = BindingSet::new();
+    for var in query_vars {
+        let value = resolve_term(&Term::var(var), subst);
+        let rendered = render_term(&value);
+        if !key.is_empty() {
+            key.push('|');
+        }
+        key.push_str(var);
+        key.push('=');
+        key.push_str(&rendered);
+        legacy.insert(var.clone(), rendered);
+        typed.insert(var.clone(), bound_term(&value));
+    }
+    (key, legacy, typed)
+}
+
 /// 证明树文本渲染（缩进层级 + 置信度），供报告/日志使用
 pub fn render_proof(node: &ProofNode, indent: usize) -> Vec<String> {
     let mut lines = Vec::new();
@@ -1016,6 +1089,49 @@ mod tests {
         let solutions = engine.solve(&[goal], &["X".to_string()]);
         assert_eq!(solutions.len(), 1);
         assert_eq!(solutions[0].bindings.get("X").map(String::as_str), Some("李四"));
+    }
+
+    #[test]
+    fn test_solve_typed_matches_legacy_and_exposes_unbound() {
+        let mut engine = master_engine();
+        engine.add_fact("年龄", "张三", "226");
+        let goals = vec![Atom::pattern(
+            "师傅",
+            Term::constant("张三"),
+            Term::var("X"),
+        )];
+        let legacy = engine.solve(&goals, &["X".to_string()]);
+        let typed = engine.solve_typed(&goals, &["X".to_string()]);
+        assert_eq!(legacy.len(), typed.len());
+        // 绑定平价：类型化绑定的 raw 渲染与旧字符串逐字一致
+        for (old, new) in legacy.iter().zip(typed.iter()) {
+            for (name, value) in &old.bindings {
+                let typed_value = new.bindings.get(name).expect("同解应有同名绑定");
+                assert_eq!(typed_value.render_raw().as_deref(), Some(value.as_str()));
+            }
+            assert!((old.confidence - new.confidence).abs() < 1e-9);
+        }
+
+        // 未绑定变量：旧 API 渲染 "?Y"，新 API 给出显式 Unbound
+        let goals = vec![Atom::pattern(
+            "师傅",
+            Term::constant("张三"),
+            Term::var("X"),
+        )];
+        let typed = engine.solve_typed(&goals, &["X".to_string(), "Y".to_string()]);
+        assert_eq!(typed[0].bindings.get("X"), Some(&BoundTerm::text("李四")));
+        assert_eq!(typed[0].bindings.get("Y"), Some(&BoundTerm::Unbound));
+
+        // 数值分类：属性值 "226" 升级为可比较的 Number，但渲染仍是 "226"
+        let goals = vec![Atom::pattern(
+            "年龄",
+            Term::constant("张三"),
+            Term::var("A"),
+        )];
+        let typed = engine.solve_typed(&goals, &["A".to_string()]);
+        let age = typed[0].bindings.get("A").expect("年龄应绑定");
+        assert_eq!(age.numeric_value(), Some(226.0));
+        assert_eq!(age.render_raw().as_deref(), Some("226"));
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::fmt::Write as _;
 use scryer_prolog::machine::Machine;
 use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryResolution, Value};
 
+use crate::bindings::{BindingSet, BoundTerm};
+
 pub struct PrologEngine {
     machine: Machine,
     /// 已加载的动态事实（按规范序排序）
@@ -156,10 +158,41 @@ impl PrologEngine {
     }
     
     pub fn query(&mut self, query: &str) -> Vec<HashMap<String, String>> {
+        self.query_values(query)
+            .into_iter()
+            .map(|bindings| {
+                bindings
+                    .into_iter()
+                    .map(|(name, value)| (name, value_to_string(value)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 与 [`Self::query`] 同解同序的类型化版本：绑定升格为 [`BoundTerm`]。
+    ///
+    /// 旧文本行为（`Value::Var` → `"null"` 等）保留在 [`Self::query`] 中；
+    /// 新 API 暴露语义：未绑定 = [`BoundTerm::Unbound`]，整数/浮点 = `Number`
+    /// （raw 与旧渲染逐字一致，value 可参与比较），列表/结构保持形状。
+    pub fn query_typed(&mut self, query: &str) -> Vec<BindingSet> {
+        self.query_values(query)
+            .into_iter()
+            .map(|bindings| {
+                let mut typed = BindingSet::new();
+                for (name, value) in bindings {
+                    typed.insert(name, bound_from_value(&value));
+                }
+                typed
+            })
+            .collect()
+    }
+
+    /// 执行查询并返回非空绑定的原始值（新旧 API 共用的提取层）。
+    fn query_values(&mut self, query: &str) -> Vec<std::collections::BTreeMap<String, Value>> {
         let mut results = Vec::new();
-        
+
         let query_str = format!("{}.", query);
-        
+
         match self.machine.run_query(query_str) {
             Ok(query_output) => {
                 match query_output {
@@ -169,11 +202,7 @@ impl PrologEngine {
                             if query_match.bindings.is_empty() {
                                 continue;
                             }
-                            let result_map: HashMap<String, String> = query_match.bindings
-                                .into_iter()
-                                .map(|(name, value)| (name, value_to_string(value)))
-                                .collect();
-                            results.push(result_map);
+                            results.push(query_match.bindings);
                         }
                     }
                     QueryResolution::True => {
@@ -188,7 +217,7 @@ impl PrologEngine {
                 eprintln!("Prolog查询错误: {}", err);
             }
         }
-        
+
         results
     }
     
@@ -345,6 +374,39 @@ fn value_to_string(value: Value) -> String {
     }
 }
 
+/// Scryer 值 → 统一类型化绑定（旧渲染约定只在 [`BoundTerm::render_raw`] 中体现）。
+pub fn bound_from_value(value: &Value) -> BoundTerm {
+    match value {
+        Value::Integer(_) | Value::Float(_) => BoundTerm::classify(&prolog_value_to_json_string(value.clone())),
+        Value::Rational(_) => {
+            let raw = prolog_value_to_json_string(value.clone());
+            match parse_fraction(&raw) {
+                Some(value) => BoundTerm::number(raw, value),
+                None => BoundTerm::text(raw),
+            }
+        }
+        Value::Atom(atom) => BoundTerm::text(format!("{}", atom.as_str())),
+        Value::String(text) => BoundTerm::text(text),
+        Value::List(items) => BoundTerm::List {
+            items: items.iter().map(bound_from_value).collect(),
+        },
+        Value::Structure(name, fields) => BoundTerm::Struct {
+            name: format!("{}", name.as_str()),
+            fields: fields.iter().map(bound_from_value).collect(),
+        },
+        Value::Var => BoundTerm::Unbound,
+    }
+}
+
+/// 解析 "n/d" 形式的有理数（Scryer Rational 的文本形式）。
+fn parse_fraction(raw: &str) -> Option<f64> {
+    let (numerator, denominator) = raw.split_once('/')?;
+    let numerator: f64 = numerator.trim().parse().ok()?;
+    let denominator: f64 = denominator.trim().parse().ok()?;
+    let value = numerator / denominator;
+    value.is_finite().then_some(value)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PrologFact {
     Entity {
@@ -408,5 +470,41 @@ mod tests {
             "带反斜杠的事实应可查询（不崩、不丢失）：{:?}",
             relations
         );
+    }
+
+    #[test]
+    fn test_query_typed_exposes_numbers_and_unbound() {
+        let mut engine = PrologEngine::new();
+
+        // 数值：value 可比较，raw 与旧字符串逐字一致
+        let typed = engine.query_typed("X is 1 + 2");
+        assert_eq!(
+            typed[0].get("X").and_then(BoundTerm::numeric_value),
+            Some(3.0)
+        );
+        assert_eq!(
+            typed[0].get("X").and_then(BoundTerm::render_raw).as_deref(),
+            Some("3")
+        );
+
+        // 旧/新 API 平价：同一查询的绑定渲染逐字一致
+        let legacy = engine.query("X is 1 + 2");
+        assert_eq!(
+            typed[0].get("X").and_then(BoundTerm::render_raw),
+            legacy[0].get("X").cloned()
+        );
+
+        // 文本与结构：字符串取内容本身
+        let typed = engine.query_typed("atom_string(hello, S)");
+        if let Some(term) = typed.first().and_then(|bindings| bindings.get("S")) {
+            assert!(matches!(term, BoundTerm::Text { .. }), "{:?}", term);
+            assert_eq!(term.render_raw().as_deref(), Some("hello"));
+        }
+    }
+
+    #[test]
+    fn test_bound_from_value_keeps_legacy_raw_rendering() {
+        assert_eq!(bound_from_value(&Value::Var), BoundTerm::Unbound);
+        assert_eq!(BoundTerm::Unbound.render_raw(), None);
     }
 }

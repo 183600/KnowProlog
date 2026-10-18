@@ -4,16 +4,20 @@
 //! 独立 [`SymbolicReasoner`]，共享启动时加载的知识事实；SSE 按句流式输出
 //! 等价于符号版的 token streaming；`/health` 与 `/metrics` 暴露确定性计数。
 //!
+//! `system` / `developer` 消息被解析为确定性 [`SessionPolicy`]（白名单短语），
+//! 生效于该会话的后续轮次：简短/详细风格、必须给依据、严格澄清。
+//!
 //! 端点：
 //! - `GET  /`                      服务索引（端点清单）
 //! - `GET  /health`                健康检查
 //! - `GET  /metrics`               会话数 / 轮数 / 性能台账
 //! - `POST /sessions`              新建会话 → `{"session_id": "s-1"}`
-//! - `GET  /sessions/{id}`         会话快照（焦点栈 / 历史摘要）
+//! - `GET  /sessions/{id}`         会话快照（焦点栈 / 历史摘要 / 策略）
 //! - `DELETE /sessions/{id}`       关闭会话
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
 //!   或 `?stream=1` 时按句 SSE 流式返回
 //! - `GET  /v1/models`             OpenAI 兼容：模型清单
+//! - `GET  /v1/prompts`            提示资产注册表（spec + lint + 覆盖）
 //! - `POST /v1/chat/completions`   OpenAI 兼容聊天补全（`stream: true` 时
 //!   按句 SSE 流式）；无扩展字段时按无状态语义重放用户消息，带
 //!   `"session_id"` 扩展时只执行最后一条用户消息并沿用服务端记忆
@@ -35,9 +39,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::dialogue_manager::DialogueManager;
+use crate::dialogue_manager::{DialogueKnowledge, DialogueManager};
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
+use crate::prompt_spec::{self, PromptMode};
 use crate::symbolic_reasoner::SymbolicReasoner;
 use crate::ReasoningConfig;
 
@@ -47,6 +52,210 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const HISTORY_LIMIT: usize = 64;
 /// OpenAI 兼容层报告的模型名（纯符号推理，非神经网络）。
 pub const DEFAULT_MODEL: &str = "knowprolog-symbolic";
+
+/// 回答风格（由 system 指令白名单解析）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyStyle {
+    #[default]
+    Normal,
+    Concise,
+    Detailed,
+}
+
+impl PolicyStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            PolicyStyle::Normal => "normal",
+            PolicyStyle::Concise => "concise",
+            PolicyStyle::Detailed => "detailed",
+        }
+    }
+}
+
+/// 会话级策略：从 OpenAI 兼容请求的 `system` / `developer` 消息确定性解析，
+/// 只认白名单短语，未识别的子句进 `warnings` 原样回显（不猜、不静默丢弃）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionPolicy {
+    #[serde(default)]
+    pub style: PolicyStyle,
+    /// 每个回答追加「依据：…」，内容来自真实策略轨迹（非生成文本）。
+    #[serde(default)]
+    pub require_evidence: bool,
+    /// 让位轮不再沉默，改为确定性澄清问句（status = needs_clarification）。
+    #[serde(default)]
+    pub strict_clarify: bool,
+    /// 命中的规则标签（按出现顺序去重）。
+    #[serde(default)]
+    pub recognized: Vec<String>,
+    /// 未被识别的子句（截断回显，提示调用方表述更明确）。
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+const STYLE_CONCISE_PHRASES: &[&str] = &[
+    "简短", "简洁", "一句话", "尽量短", "concise", "brief", "short",
+];
+const STYLE_DETAILED_PHRASES: &[&str] = &[
+    "详细", "展开", "深入", "in depth", "detailed", "elaborate", "verbose",
+];
+const EVIDENCE_PHRASES: &[&str] = &[
+    "依据", "来源", "出处", "证据", "引用", "evidence", "cite", "citation", "source",
+    "provenance", "justify",
+];
+const STRICT_CLARIFY_PHRASES: &[&str] = &[
+    "澄清", "追问", "不要猜", "不要臆测", "先确认", "clarify", "ask before",
+    "do not guess", "don't guess", "no guessing", "confirm",
+];
+
+impl SessionPolicy {
+    /// 从 `system` / `developer` 消息文本解析；空输入返回默认策略。
+    pub fn from_system_texts(texts: &[String]) -> SessionPolicy {
+        let mut policy = SessionPolicy::default();
+        for text in texts {
+            for clause in text.split(['。', '.', '；', ';', '\n', '！', '!', '？', '?']) {
+                let clause = clause.trim();
+                if clause.is_empty() {
+                    continue;
+                }
+                let lowered = clause.to_lowercase();
+                let mut matched = false;
+                if STYLE_CONCISE_PHRASES.iter().any(|p| lowered.contains(p)) {
+                    policy.style = PolicyStyle::Concise;
+                    Self::record(&mut policy.recognized, "style:concise");
+                    matched = true;
+                }
+                if STYLE_DETAILED_PHRASES.iter().any(|p| lowered.contains(p)) {
+                    policy.style = PolicyStyle::Detailed;
+                    Self::record(&mut policy.recognized, "style:detailed");
+                    matched = true;
+                }
+                if EVIDENCE_PHRASES.iter().any(|p| lowered.contains(p)) {
+                    policy.require_evidence = true;
+                    Self::record(&mut policy.recognized, "require_evidence");
+                    matched = true;
+                }
+                if STRICT_CLARIFY_PHRASES.iter().any(|p| lowered.contains(p)) {
+                    policy.strict_clarify = true;
+                    Self::record(&mut policy.recognized, "strict_clarify");
+                    matched = true;
+                }
+                if !matched {
+                    policy.warnings.push(truncate_chars(clause, 32));
+                }
+            }
+        }
+        policy
+    }
+
+    fn record(recognized: &mut Vec<String>, label: &str) {
+        if !recognized.iter().any(|existing| existing == label) {
+            recognized.push(label.to_string());
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.style == PolicyStyle::Normal
+            && !self.require_evidence
+            && !self.strict_clarify
+            && self.recognized.is_empty()
+            && self.warnings.is_empty()
+    }
+
+    pub fn render_text(&self) -> String {
+        if self.is_default() {
+            return "默认策略（风格 normal）".to_string();
+        }
+        format!(
+            "风格 {}·依据 {}·严格澄清 {}·命中 [{}]",
+            self.style.label(),
+            if self.require_evidence { "开" } else { "关" },
+            if self.strict_clarify { "开" } else { "关" },
+            self.recognized.join(", ")
+        )
+    }
+
+    /// 把策略作用到一轮结果上：风格 → 依据 → 严格澄清。
+    fn apply(&self, input: &str, turn: &mut TurnResponse, knowledge: &dyn DialogueKnowledge) {
+        if self.strict_clarify && turn.status == "deferred" {
+            turn.status = "needs_clarification".to_string();
+            turn.source = "policy".to_string();
+            turn.plan = vec!["strict_clarify".to_string()];
+            turn.reply = format!(
+                "我还不能确定如何回答「{}」，请补充实体名称或换一种问法。",
+                truncate_chars(input.trim(), 24)
+            );
+        }
+        if !turn.reply.is_empty() && turn.status != "needs_clarification" {
+            match self.style {
+                PolicyStyle::Concise => turn.reply = first_sentence(&turn.reply),
+                PolicyStyle::Detailed => {
+                    let already_offers = turn.reply.contains("还可以") || turn.reply.contains("可继续");
+                    if !already_offers {
+                        if let Some(focus) = &turn.focus {
+                            let attributes = knowledge.known_attributes(focus);
+                            if !attributes.is_empty() {
+                                let list = attributes
+                                    .iter()
+                                    .take(4)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join("、");
+                                turn.reply.push_str(&format!("\n（可继续了解：{}）", list));
+                            }
+                        }
+                    }
+                }
+                PolicyStyle::Normal => {}
+            }
+        }
+        if self.require_evidence && !turn.reply.is_empty() {
+            let evidence = match turn.source.as_str() {
+                "dialogue" => match &turn.focus {
+                    Some(focus) => format!(
+                        "\n依据：对话策略「{}」· 焦点「{}」",
+                        turn.plan.join("→"),
+                        focus
+                    ),
+                    None => format!("\n依据：对话策略「{}」", turn.plan.join("→")),
+                },
+                "reasoner" => "\n依据：知识图谱符号推理".to_string(),
+                "policy" => "\n依据：服务策略 strict_clarify（未猜测）".to_string(),
+                _ => return,
+            };
+            turn.reply.push_str(&evidence);
+        }
+    }
+}
+
+/// 截断到前 `limit` 个字符（按字符边界，尾部加省略号）。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    let mut out: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        out.push('…');
+    }
+    out
+}
+
+/// 取出首条实质句（跳过空行与以「：」结尾的标题行，止于 。！？或换行）。
+fn first_sentence(text: &str) -> String {
+    let substantive = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.ends_with('：') && !line.ends_with(':'))
+        .unwrap_or("");
+    if substantive.is_empty() {
+        return text.trim().to_string();
+    }
+    let mut out = String::new();
+    for ch in substantive.chars() {
+        out.push(ch);
+        if matches!(ch, '。' | '！' | '？') {
+            break;
+        }
+    }
+    out
+}
 
 /// 一轮对话的服务级结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,15 +272,19 @@ pub struct TurnResponse {
     pub plan: Vec<String>,
     pub reply: String,
     pub focus: Option<String>,
+    /// 生效的会话级策略（默认策略时省略）。
+    #[serde(default, skip_serializing_if = "SessionPolicy::is_default")]
+    pub policy: SessionPolicy,
 }
 
-/// 单个会话：对话管理器 + 独立推理器 + 有界历史。
+/// 单个会话：对话管理器 + 独立推理器 + 有界历史 + 会话级策略。
 struct Session {
     id: String,
     turns: u32,
     manager: DialogueManager,
     reasoner: SymbolicReasoner,
     history: Vec<String>,
+    policy: SessionPolicy,
 }
 
 impl Session {
@@ -115,7 +328,7 @@ impl Session {
         if !reply.is_empty() && self.history.len() < HISTORY_LIMIT {
             self.history.push(reply.clone());
         }
-        TurnResponse {
+        let mut response = TurnResponse {
             session_id: self.id.clone(),
             turn: self.turns,
             status,
@@ -124,7 +337,10 @@ impl Session {
             plan,
             reply,
             focus: self.manager.focus_entity().map(str::to_string),
-        }
+            policy: self.policy.clone(),
+        };
+        self.policy.apply(&input, &mut response, &self.reasoner);
+        response
     }
 }
 
@@ -139,6 +355,7 @@ pub struct ApiState {
     turns_total: AtomicU64,
     max_sessions: usize,
     max_body_bytes: usize,
+    prompt_mode: PromptMode,
 }
 
 impl ApiState {
@@ -159,7 +376,18 @@ impl ApiState {
             turns_total: AtomicU64::new(0),
             max_sessions: max_sessions.max(1),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            prompt_mode: PromptMode::On,
         }
+    }
+
+    /// 设置模板运行模式（在 `Arc::new` 之前调用；默认 [`PromptMode::On`]，
+    /// 接地失败会自动回退旧渲染器）。
+    pub fn set_prompt_mode(&mut self, mode: PromptMode) {
+        self.prompt_mode = mode;
+    }
+
+    pub fn prompt_mode(&self) -> PromptMode {
+        self.prompt_mode
     }
 
     fn build_session(&self, id: String) -> Session {
@@ -169,12 +397,15 @@ impl ApiState {
             self.perf.clone(),
         );
         reasoner.observe_facts(&self.facts);
+        let mut manager = DialogueManager::new();
+        manager.set_prompt_mode(self.prompt_mode);
         Session {
             id,
             turns: 0,
-            manager: DialogueManager::new(),
+            manager,
             reasoner,
             history: Vec::new(),
+            policy: SessionPolicy::default(),
         }
     }
 
@@ -190,8 +421,21 @@ impl ApiState {
     }
 
     async fn take_turn(&self, session_id: &str, input: &str) -> Option<TurnResponse> {
+        self.take_turn_with_policy(session_id, input, None).await
+    }
+
+    /// 执行一轮；给出 `policy` 时先更新会话策略再执行。
+    async fn take_turn_with_policy(
+        &self,
+        session_id: &str,
+        input: &str,
+        policy: Option<&SessionPolicy>,
+    ) -> Option<TurnResponse> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(session_id)?;
+        if let Some(policy) = policy {
+            session.policy = policy.clone();
+        }
         let response = session.run_turn(input);
         self.turns_total.fetch_add(1, Ordering::Relaxed);
         Some(response)
@@ -207,6 +451,7 @@ impl ApiState {
             "focus_stack": session.manager.focus_stack(),
             "history": session.history,
             "summary": session.manager.summary(),
+            "policy": session.policy,
         }))
     }
 
@@ -344,6 +589,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "DELETE /sessions/{id}",
                     "POST /sessions/{id}/turns",
                     "GET /v1/models",
+                    "GET /v1/prompts",
                     "POST /v1/chat/completions"
                 ]
             }),
@@ -406,6 +652,48 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 }]
             }),
         ),
+        ("GET", ["v1", "prompts"]) => {
+            let specs = prompt_spec::default_specs();
+            let lint = prompt_spec::lint_default();
+            let errors = lint
+                .iter()
+                .filter(|issue| issue.severity == prompt_spec::LintSeverity::Error)
+                .count();
+            let (covered, legacy) = prompt_spec::coverage();
+            let spec_json: Vec<serde_json::Value> = specs
+                .iter()
+                .map(|spec| {
+                    serde_json::json!({
+                        "id": spec.id,
+                        "policy": spec.policy,
+                        "template": spec.template,
+                        "required": spec.required,
+                        "optional": spec.optional,
+                        "example_rendered": spec.example_rendered,
+                        "description": spec.description,
+                    })
+                })
+                .collect();
+            Response::json(
+                200,
+                &serde_json::json!({
+                    "object": "list",
+                    "version": prompt_spec::PROMPT_SPEC_VERSION,
+                    "modes": ["off", "parity", "on"],
+                    "serving_mode": state.prompt_mode.label(),
+                    "count": specs.len(),
+                    "data": spec_json,
+                    "lint": {
+                        "errors": errors,
+                        "issues": lint,
+                    },
+                    "coverage": {
+                        "covered": covered,
+                        "legacy": legacy,
+                    },
+                }),
+            )
+        }
         ("POST", ["v1", "chat", "completions"]) => {
             let chat = match parse_chat_request(request) {
                 Ok(chat) => chat,
@@ -429,6 +717,8 @@ struct ChatRequest {
     session_id: Option<String>,
     /// 无状态模式下的用户消息序列（按顺序重放到一个临时会话）。
     inputs: Vec<String>,
+    /// 由 `system` / `developer` 消息解析出的会话级策略（无则沿用默认）。
+    policy: Option<SessionPolicy>,
     stream: bool,
 }
 
@@ -440,17 +730,23 @@ fn parse_chat_request(request: &Request) -> Result<ChatRequest, String> {
         .and_then(|messages| messages.as_array())
         .ok_or_else(|| "missing messages array".to_string())?;
     let mut inputs = Vec::new();
+    let mut system_texts = Vec::new();
     for message in messages {
         let role = message.get("role").and_then(|role| role.as_str()).unwrap_or("");
-        if role != "user" {
+        if role != "user" && role != "system" && role != "developer" {
             continue;
         }
         let content = message
             .get("content")
             .and_then(|content| content.as_str())
             .ok_or_else(|| "message content must be a string".to_string())?;
-        if !content.trim().is_empty() {
+        if content.trim().is_empty() {
+            continue;
+        }
+        if role == "user" {
             inputs.push(content.to_string());
+        } else {
+            system_texts.push(content.to_string());
         }
     }
     if inputs.is_empty() {
@@ -467,6 +763,11 @@ fn parse_chat_request(request: &Request) -> Result<ChatRequest, String> {
             .and_then(|session| session.as_str())
             .map(str::to_string),
         inputs,
+        policy: if system_texts.is_empty() {
+            None
+        } else {
+            Some(SessionPolicy::from_system_texts(&system_texts))
+        },
         stream: value.get("stream").and_then(|stream| stream.as_bool()).unwrap_or(false),
     })
 }
@@ -482,7 +783,10 @@ async fn run_chat_turns(
     let prompt_chars: usize = chat.inputs.iter().map(|input| input.chars().count()).sum();
     if let Some(session_id) = &chat.session_id {
         let input = chat.inputs.last().expect("inputs non-empty by construction");
-        return match state.take_turn(session_id, input).await {
+        return match state
+            .take_turn_with_policy(session_id, input, chat.policy.as_ref())
+            .await
+        {
             Some(turn) => Ok((turn, prompt_chars)),
             None => Err((404, "session not found".to_string())),
         };
@@ -493,7 +797,9 @@ async fn run_chat_turns(
         .map_err(|message| (429, message.to_string()))?;
     let mut last = None;
     for input in &chat.inputs {
-        last = state.take_turn(&temp_id, input).await;
+        last = state
+            .take_turn_with_policy(&temp_id, input, chat.policy.as_ref())
+            .await;
     }
     state.close_session(&temp_id).await;
     last.map(|turn| (turn, prompt_chars))
@@ -540,6 +846,7 @@ fn chat_completion_response(
             "kind": turn.kind,
             "plan": turn.plan,
             "focus": turn.focus,
+            "policy": turn.policy,
         }
     })
 }
@@ -1183,5 +1490,120 @@ mod tests {
 
         let (status, _, _) = raw_request(addr, "GET", "/sessions/missing", &[], "").await;
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn session_policy_parses_whitelist_and_echoes_unknown_clauses() {
+        let texts = vec![
+            "请用简短的一句话回答；回答必须给出依据；遇到不确定时先澄清，不要猜测。像莎士比亚一样说话".to_string(),
+            "Answer concisely with citations".to_string(),
+        ];
+        let policy = SessionPolicy::from_system_texts(&texts);
+        assert_eq!(policy.style, PolicyStyle::Concise);
+        assert!(policy.require_evidence);
+        assert!(policy.strict_clarify);
+        assert!(policy.recognized.contains(&"style:concise".to_string()));
+        assert!(policy.recognized.contains(&"require_evidence".to_string()));
+        assert!(policy.recognized.contains(&"strict_clarify".to_string()));
+        assert_eq!(policy.warnings.len(), 1, "{:?}", policy.warnings);
+        assert!(policy.warnings[0].starts_with("像莎士比亚"));
+        assert!(policy.render_text().contains("风格 concise"));
+
+        let empty = SessionPolicy::from_system_texts(&[]);
+        assert!(empty.is_default());
+        let detailed = SessionPolicy::from_system_texts(&["请详细展开".to_string()]);
+        assert_eq!(detailed.style, PolicyStyle::Detailed);
+    }
+
+    #[tokio::test]
+    async fn system_policy_shapes_chat_completion_turns() {
+        let (addr, _server) = start_server(4);
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "请用简短的一句话回答；必须给出依据。"},
+                {"role": "user", "content": "姚明的身高是多少"},
+            ]
+        })
+        .to_string();
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["knowprolog"]["policy"]["style"], "concise");
+        assert_eq!(value["knowprolog"]["policy"]["require_evidence"], true);
+        let content = value["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("226"), "{}", content);
+        assert!(content.contains("依据：对话策略"), "{}", content);
+        assert!(content.lines().count() <= 2, "简短策略不应多行：{}", content);
+
+        // 详细策略：给出可继续了解的真实属性清单
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "Please answer in depth."},
+                {"role": "user", "content": "姚明是谁"},
+            ]
+        })
+        .to_string();
+        let (_, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let content = value["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("可继续了解："), "{}", content);
+        assert!(content.contains("身高"), "{}", content);
+
+        // 严格澄清：让位轮变成确定性澄清问句
+        let payload = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "遇到不确定时先澄清，不要猜测。"},
+                {"role": "user", "content": "今天天气怎么样"},
+            ]
+        })
+        .to_string();
+        let (_, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["knowprolog"]["status"], "needs_clarification");
+        assert_eq!(value["knowprolog"]["source"], "policy");
+        assert!(value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("请补充实体名称"));
+    }
+
+    #[tokio::test]
+    async fn prompts_endpoint_exposes_registry() {
+        let (addr, _server) = start_server(2);
+        let (status, _, body) = raw_request(addr, "GET", "/v1/prompts", &[], "").await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["version"], prompt_spec::PROMPT_SPEC_VERSION);
+        assert_eq!(value["count"], prompt_spec::default_specs().len());
+        assert_eq!(value["lint"]["errors"], 0, "{}", body);
+        assert_eq!(value["serving_mode"], "on");
+        assert!(value["coverage"]["covered"].as_array().unwrap().len() >= 8);
+        let first = &value["data"][0];
+        assert!(first["id"].is_string() && first["template"].is_string());
+
+        let (status, _, body) = raw_request(addr, "GET", "/", &[], "").await;
+        assert_eq!(status, 200);
+        assert!(body.contains("/v1/prompts"), "{}", body);
     }
 }

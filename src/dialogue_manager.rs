@@ -17,7 +17,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::bindings::BindingSet;
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
+use crate::prompt_spec::{
+    self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION,
+};
 use crate::symbolic_reasoner::SymbolicReasoner;
 
 /// 一轮话语的语用类型（对话本体的「动作类」）。
@@ -284,6 +288,10 @@ pub struct DialogueManager {
     externals: Vec<String>,
     policy: LogicProgram,
     last_reply: Vec<String>,
+    /// 提示模板运行模式（默认 Off：零行为变化）。
+    prompt_mode: PromptMode,
+    /// 提示模板运行统计（诊断计数，不参与对话快照的语义状态）。
+    prompt_stats: PromptStats,
 }
 
 impl Default for DialogueManager {
@@ -301,11 +309,45 @@ impl DialogueManager {
             externals: Vec::new(),
             policy,
             last_reply: Vec::new(),
+            prompt_mode: PromptMode::Off,
+            prompt_stats: PromptStats::default(),
         }
     }
 
     pub fn policy_source() -> &'static str {
         POLICY_SOURCE
+    }
+
+    /// 设置模板运行模式（Off / Parity / On），支持链式调用。
+    pub fn set_prompt_mode(&mut self, mode: PromptMode) -> &mut Self {
+        self.prompt_mode = mode;
+        self
+    }
+
+    pub fn prompt_mode(&self) -> PromptMode {
+        self.prompt_mode
+    }
+
+    pub fn prompt_stats(&self) -> &PromptStats {
+        &self.prompt_stats
+    }
+
+    pub fn reset_prompt_stats(&mut self) {
+        self.prompt_stats = PromptStats::default();
+    }
+
+    /// 平价差异计数（Parity 模式下 spec 渲染与旧文本不一致的次数）。
+    pub fn prompt_parity_mismatches(&self) -> usize {
+        self.prompt_stats.parity_mismatches
+    }
+
+    /// 可读的提示资产状态行。
+    pub fn prompt_report(&self) -> String {
+        format!(
+            "提示资产 v{}：{}",
+            PROMPT_SPEC_VERSION,
+            self.prompt_stats.render_text()
+        )
     }
 
     pub fn turn_count(&self) -> usize {
@@ -766,6 +808,16 @@ impl DialogueManager {
             "farewell" => self.farewell_text(),
             _ => return None,
         };
+        // 提示资产接管：接地闸门通过则用模板渲染（On），平价模式双跑计数（Parity），
+        // 任一 required 槽位未绑定则回退上面的旧组合生成器（结构保证不幻觉）。
+        let text = self.apply_prompt_spec(
+            &chosen,
+            &frame,
+            entity.as_deref(),
+            answer.as_deref(),
+            &more_attributes,
+            text,
+        );
 
         let provenance = answer
             .as_deref()
@@ -1039,6 +1091,195 @@ impl DialogueManager {
             text.push_str("\n你可以换一种问法，或者直接告诉我相关事实，我会把它记住。");
         }
         text
+    }
+
+    /// 选策略 → 选 spec 变体 → 绑定槽位；未外化的策略返回 None。
+    ///
+    /// 槽位值必须与旧组合生成器使用的是同一批运行时值，
+    /// 这样 Parity 模式的逐字比对才有意义（差异 = 模板资产的真差异）。
+    fn prompt_bindings(
+        &self,
+        policy: &str,
+        frame: &UtteranceFrame,
+        entity: Option<&str>,
+        answer: Option<&str>,
+        more: &[String],
+    ) -> Option<(&'static str, BindingSet)> {
+        let listed = || {
+            more.iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("」「")
+        };
+        match policy {
+            "direct_answer" => {
+                if more.is_empty() {
+                    let mut bindings = BindingSet::new();
+                    if let Some(answer) = answer {
+                        bindings.bind("answer", answer.trim());
+                    }
+                    Some(("direct_answer/plain", bindings))
+                } else {
+                    let ids = [
+                        "direct_answer/more/0",
+                        "direct_answer/more/1",
+                        "direct_answer/more/2",
+                    ];
+                    let id = ids[self.turns.len() % ids.len()];
+                    let mut bindings = BindingSet::new();
+                    if let Some(answer) = answer {
+                        bindings.bind("answer", answer.trim());
+                    }
+                    bindings.bind("entity", entity.unwrap_or(""));
+                    bindings.bind("listed", &listed());
+                    bindings.bind("count", &more.len().to_string());
+                    Some((id, bindings))
+                }
+            }
+            "admit_ignorance" => {
+                let id = match (frame.attribute.is_some(), more.is_empty()) {
+                    (true, true) => "admit_ignorance/attribute/plain",
+                    (true, false) => "admit_ignorance/attribute/more",
+                    (false, true) => "admit_ignorance/identity/plain",
+                    (false, false) => "admit_ignorance/identity/more",
+                };
+                let mut bindings = BindingSet::new();
+                bindings.bind("entity", entity.unwrap_or(""));
+                if let Some(attribute) = frame.attribute.as_deref() {
+                    bindings.bind("attribute", attribute);
+                }
+                if !more.is_empty() {
+                    bindings.bind("listed", &listed());
+                    bindings.bind("count", &more.len().to_string());
+                }
+                Some((id, bindings))
+            }
+            "clarify_entity" => {
+                let candidates: Vec<String> =
+                    self.focus.iter().rev().take(3).cloned().collect();
+                match candidates.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        let mut bindings = BindingSet::new();
+                        if let Some(attribute) = frame.attribute.as_deref() {
+                            bindings.bind("attribute", attribute);
+                        }
+                        bindings.bind("candidates", &rest.join("」「"));
+                        bindings.bind("last", last);
+                        Some(("clarify_entity/multi", bindings))
+                    }
+                    _ => {
+                        let mut bindings = BindingSet::new();
+                        if let Some(attribute) = frame.attribute.as_deref() {
+                            bindings.bind("attribute", attribute);
+                        }
+                        Some(("clarify_entity/single", bindings))
+                    }
+                }
+            }
+            "clarify_entity_no_focus" => {
+                let mut bindings = BindingSet::new();
+                if let Some(attribute) = frame.attribute.as_deref() {
+                    bindings.bind("attribute", attribute);
+                }
+                Some(("clarify_entity_no_focus/plain", bindings))
+            }
+            "greet" => {
+                if self.turns.is_empty() {
+                    Some(("greet/first", BindingSet::new()))
+                } else if let Some(focus) = self.focus.last() {
+                    let mut bindings = BindingSet::new();
+                    bindings.bind("focus", focus);
+                    Some(("greet/returning_focus", bindings))
+                } else {
+                    Some(("greet/returning_plain", BindingSet::new()))
+                }
+            }
+            "thanks" => match self.focus.last() {
+                Some(focus) => {
+                    let mut bindings = BindingSet::new();
+                    bindings.bind("focus", focus);
+                    Some(("thanks/focus", bindings))
+                }
+                None => Some(("thanks/plain", BindingSet::new())),
+            },
+            "farewell" => {
+                let mut bindings = BindingSet::new();
+                bindings.bind("turn_count", &self.turns.len().to_string());
+                Some(("farewell/plain", bindings))
+            }
+            "why_no_evidence" => Some(("why_no_evidence/plain", BindingSet::new())),
+            "continue_no_focus" => Some(("continue_no_focus/plain", BindingSet::new())),
+            "explain_why" => {
+                let turn = self.last_answered_turn()?;
+                let provenance = if turn.provenance.is_empty() {
+                    vec!["知识图谱中的事实".to_string()]
+                } else {
+                    turn.provenance.clone()
+                };
+                let topic = match (&turn.entity, &turn.attribute) {
+                    (Some(entity), Some(attribute)) => format!("「{}」的「{}」", entity, attribute),
+                    (Some(entity), None) => format!("「{}」", entity),
+                    _ => format!("「{}」", excerpt(&turn.user, 16)),
+                };
+                let mut bindings = BindingSet::new();
+                bindings.bind("topic", &topic);
+                bindings.bind("provenance", &provenance.join("、"));
+                Some(("explain_why/plain", bindings))
+            }
+            _ => None,
+        }
+    }
+
+    /// 模板接管：Parity 双跑计数、On 用模板文本、接地失败回退旧文本。
+    fn apply_prompt_spec(
+        &mut self,
+        policy: &str,
+        frame: &UtteranceFrame,
+        entity: Option<&str>,
+        answer: Option<&str>,
+        more: &[String],
+        legacy: String,
+    ) -> String {
+        if self.prompt_mode == PromptMode::Off {
+            return legacy;
+        }
+        let Some((spec_id, bindings)) =
+            self.prompt_bindings(policy, frame, entity, answer, more)
+        else {
+            self.prompt_stats.legacy += 1;
+            return legacy;
+        };
+        self.prompt_stats.checked += 1;
+        match prompt_spec::render(spec_id, &bindings) {
+            RenderOutcome::Rendered { text, .. } => {
+                self.prompt_stats.grounded += 1;
+                if text != legacy {
+                    self.prompt_stats.parity_mismatches += 1;
+                    self.prompt_stats.record_mismatch(format!(
+                        "{}：模板与旧文本不一致\n    模板: {}\n    旧文: {}",
+                        spec_id,
+                        text.replace('\n', "⏎"),
+                        legacy.replace('\n', "⏎")
+                    ));
+                }
+                match self.prompt_mode {
+                    PromptMode::On => text,
+                    _ => legacy,
+                }
+            }
+            RenderOutcome::Ungrounded { missing, .. } => {
+                self.prompt_stats.ungrounded += 1;
+                self.prompt_stats.record_missing(&missing);
+                legacy
+            }
+            RenderOutcome::Invalid { message, .. } => {
+                self.prompt_stats.ungrounded += 1;
+                self.prompt_stats
+                    .record_mismatch(format!("{} 资产无效：{}", spec_id, message));
+                legacy
+            }
+        }
     }
 
     fn greet_text(&self) -> String {
@@ -1497,5 +1738,96 @@ mod tests {
             reply.plan
         );
         assert!(reply.text.contains("叶莉") && reply.text.contains("姚明"));
+    }
+
+    fn parity_knowledge() -> MockKnowledge {
+        MockKnowledge::new()
+            .with_entity("姚明", &["身高", "国籍", "出生地"])
+            .with_entity("叶莉", &["身高", "国籍"])
+            .with_answer("姚明是谁", "姚明是中国篮球运动员。")
+            .with_answer("叶莉是谁", "叶莉是中国篮球运动员。")
+            .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
+            .with_answer("姚明的国籍是什么", "姚明的国籍是中国。")
+            .with_answer("叶莉的身高是什么", "叶莉的身高是 190 厘米。")
+    }
+
+    const PARITY_TRANSCRIPT: [&str; 15] = [
+        "你怎么知道的？",
+        "谢谢！",
+        "你好",
+        "姚明是谁",
+        "他的身高呢",
+        "你怎么知道的？",
+        "我们聊了什么？",
+        "还有呢",
+        "详细一点",
+        "姚明的体重是多少",
+        "叶莉是谁",
+        "叶莉的身高是多少",
+        "身高呢",
+        "谢谢！",
+        "再见",
+    ];
+
+    fn replay_texts(mode: PromptMode) -> Vec<String> {
+        let knowledge = parity_knowledge();
+        let mut manager = DialogueManager::new();
+        manager.set_prompt_mode(mode);
+        PARITY_TRANSCRIPT
+            .iter()
+            .map(|input| {
+                manager
+                    .plan_pure_dialogue(input, &knowledge)
+                    .or_else(|| manager.plan_reply(input, &knowledge))
+                    .unwrap_or_else(|| panic!("输入「{}」应被接管", input))
+                    .text
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_prompt_specs_reproduce_legacy_replies_byte_for_byte() {
+        let knowledge = parity_knowledge();
+        let mut manager = DialogueManager::new();
+        manager.set_prompt_mode(PromptMode::Parity);
+        for input in PARITY_TRANSCRIPT {
+            manager
+                .plan_pure_dialogue(input, &knowledge)
+                .or_else(|| manager.plan_reply(input, &knowledge))
+                .unwrap_or_else(|| panic!("输入「{}」应被接管", input));
+        }
+        let stats = manager.prompt_stats();
+        assert!(stats.checked >= 10, "覆盖不足：{}", stats.render_text());
+        assert_eq!(
+            stats.parity_mismatches, 0,
+            "模板与旧文本存在差异：{:#?}",
+            stats.mismatch_examples
+        );
+        assert_eq!(stats.ungrounded, 0, "缺槽位：{:?}", stats.missing_slots);
+        assert_eq!(stats.legacy, 3, "recap/continue/elaborate 应保持旧生成器");
+    }
+
+    #[test]
+    fn test_prompt_on_mode_is_byte_identical_on_seed_transcript() {
+        let off = replay_texts(PromptMode::Off);
+        let on = replay_texts(PromptMode::On);
+        let parity = replay_texts(PromptMode::Parity);
+        assert_eq!(off, on, "On 模式应逐字等价于旧渲染");
+        assert_eq!(off, parity, "Parity 模式对外行为不应改变");
+    }
+
+    #[test]
+    fn test_prompt_stats_are_observable() {
+        let knowledge = parity_knowledge();
+        let mut manager = DialogueManager::new();
+        manager.set_prompt_mode(PromptMode::On);
+        manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        let stats = manager.prompt_stats();
+        assert_eq!(stats.grounded, 1);
+        assert_eq!(stats.ungrounded, 0);
+        assert!((stats.grounding_rate() - 1.0).abs() < 1e-12);
+        assert!(manager.prompt_report().contains("提示资产 v1"));
+        manager.reset_prompt_stats();
+        assert_eq!(manager.prompt_stats().attempted(), 0);
     }
 }

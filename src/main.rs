@@ -38,9 +38,10 @@ use know_prolog::{
         compare_baseline, evaluate, triples_from_prolog_facts, EvalBaseline, EvalConfig,
     },
     dialogue_eval::{
-        compare_baseline as compare_dialogue_baseline, evaluate_seed, EvalKnowledge,
+        compare_baseline as compare_dialogue_baseline, evaluate_seed_with, EvalKnowledge,
         DialogueEvalBaseline,
     },
+    prompt_spec::{self, LintSeverity, PromptMode},
 };
 
 #[derive(Parser)]
@@ -95,6 +96,10 @@ enum Commands {
         /// Knowledge backend: "reasoner" (end-to-end) or "scripted" (policy layer)
         #[arg(long, default_value = "reasoner")]
         knowledge: String,
+        /// Prompt asset mode: "off" (legacy renderer only), "parity" (dual-run
+        /// comparison), or "on" (grounded templates with legacy fallback)
+        #[arg(long, default_value = "on")]
+        prompt_mode: String,
         /// Baseline JSON path; enables the regression ratchet
         #[arg(long)]
         baseline: Option<String>,
@@ -108,6 +113,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Lint the prompt asset registry (executable examples + template checks)
+    PromptLint {
+        /// Print the lint report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the session REST service (multi-turn dialogue over HTTP + SSE)
     Serve {
         /// Listen address
@@ -116,6 +127,9 @@ enum Commands {
         /// Maximum concurrent sessions
         #[arg(long, default_value_t = 64)]
         max_sessions: usize,
+        /// Prompt asset mode for sessions: "off", "parity", or "on"
+        #[arg(long, default_value = "on")]
+        prompt_mode: String,
     },
     /// Run interactive mode (default)
     Interactive,
@@ -243,6 +257,7 @@ async fn main() {
         }
         Some(Commands::EvalNlu {
             knowledge,
+            prompt_mode,
             baseline,
             update_baseline,
             allow_regression,
@@ -256,7 +271,8 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let report = evaluate_seed(mode);
+            let prompt_mode = parse_prompt_mode(&prompt_mode);
+            let report = evaluate_seed_with(mode, prompt_mode);
             if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{}", text),
@@ -297,7 +313,15 @@ async fn main() {
                 }
             }
         }
-        Some(Commands::Serve { addr, max_sessions }) => {
+        Some(Commands::PromptLint { json }) => {
+            run_prompt_lint(json);
+        }
+        Some(Commands::Serve {
+            addr,
+            max_sessions,
+            prompt_mode,
+        }) => {
+            let prompt_mode = parse_prompt_mode(&prompt_mode);
             let facts = match oxigraph_manager.load_all_facts().await {
                 Ok(facts) => facts,
                 Err(e) => {
@@ -311,18 +335,21 @@ async fn main() {
                 create_default_synonyms()
             };
             println!(
-                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个会话）",
+                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个会话，提示模式 {}）",
                 addr,
                 facts.len(),
-                max_sessions
+                max_sessions,
+                prompt_mode.label()
             );
-            let state = Arc::new(know_prolog::serve_api::ApiState::new(
+            let mut api_state = know_prolog::serve_api::ApiState::new(
                 facts,
                 config.reasoning.clone(),
                 synonyms,
                 perf_ledger.clone(),
                 max_sessions,
-            ));
+            );
+            api_state.set_prompt_mode(prompt_mode);
+            let state = Arc::new(api_state);
             if let Err(e) = know_prolog::serve_api::serve(state, &addr).await {
                 eprintln!("服务退出: {}", e);
                 std::process::exit(1);
@@ -332,6 +359,69 @@ async fn main() {
             // 运行交互模式
             run_interactive_mode(config, oxigraph_manager, perf_ledger).await;
         }
+    }
+}
+
+/// 解析 `--prompt-mode`：off / parity / on，非法值立即退出。
+fn parse_prompt_mode(value: &str) -> PromptMode {
+    PromptMode::parse(value).unwrap_or_else(|| {
+        eprintln!("未知的提示模式「{}」：可选 off / parity / on", value);
+        std::process::exit(1);
+    })
+}
+
+/// `prompt-lint`：校验提示资产注册表；存在 Error 时以非零码退出。
+fn run_prompt_lint(json: bool) {
+    let specs = prompt_spec::default_specs();
+    let issues = prompt_spec::lint_default();
+    let (covered, legacy) = prompt_spec::coverage();
+    let errors = issues
+        .iter()
+        .filter(|issue| issue.severity == LintSeverity::Error)
+        .count();
+    if json {
+        let value = serde_json::json!({
+            "version": prompt_spec::PROMPT_SPEC_VERSION,
+            "count": specs.len(),
+            "examples_checked": specs.len(),
+            "coverage": {
+                "covered": covered,
+                "legacy": legacy,
+            },
+            "errors": errors,
+            "lint": issues,
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("lint 报告序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!(
+            "提示资产注册表 v{}：{} 条模板，已外化策略 {}/{}",
+            prompt_spec::PROMPT_SPEC_VERSION,
+            specs.len(),
+            covered.len(),
+            covered.len() + legacy.len()
+        );
+        for issue in &issues {
+            let severity = match issue.severity {
+                LintSeverity::Error => "ERROR",
+                LintSeverity::Warning => "WARN ",
+            };
+            println!("{} [{}] {}", severity, issue.spec_id, issue.message);
+        }
+        if issues.is_empty() {
+            println!("lint 通过：{} 条示例逐字渲染一致，无错误与警告", specs.len());
+        }
+        if !legacy.is_empty() {
+            println!("仍由旧组合生成器负责的策略：{}", legacy.join("、"));
+        }
+    }
+    if errors > 0 {
+        std::process::exit(1);
     }
 }
 
