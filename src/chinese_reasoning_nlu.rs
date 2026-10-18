@@ -85,6 +85,13 @@ const UNARY_VERBS: [&str; 12] = [
     "会", "能", "要", "喜欢", "讨厌", "经常", "通过", "属于", "位于", "参加", "知道", "相信",
 ];
 
+/// 可作二元关系的动词（「S + V + O」读作 V(S, O)，与知识图谱二元谓词一致）。
+/// 必须长词在前：否则「隶属于」会被「属于」抢先切成「甲隶 / 属于 / 乙」。
+/// 与符号生成器的动词化模板互逆，保证「生成→解析」往返一致。
+const RELATION_VERBS: [&str; 8] = [
+    "出生于", "隶属于", "工作于", "位于", "认识", "属于", "喜欢", "讨厌",
+];
+
 fn default_rule_probability(kind: LessonKind) -> f64 {
     match kind {
         LessonKind::ConditionalRule => 0.95,
@@ -350,6 +357,21 @@ pub fn parse_proposition(text: &str) -> Option<Atom> {
         let object = text[position_shi + '是'.len_utf8()..].trim();
         if valid_part(subject) && valid_part(object) {
             return Some(Atom::rel("是", subject, object));
+        }
+    }
+    // 二元关系动词：S + V + O（长词优先，见 RELATION_VERBS）。
+    // 与 UNARY_VERBS 的一元读法区分：知识图谱统一用二元谓词，
+    // 生成器动词化模板（「甲认识乙」等）应能原样教回。
+    for verb in RELATION_VERBS {
+        if let Some(position) = text.find(verb) {
+            if position == 0 {
+                continue;
+            }
+            let subject = text[..position].trim();
+            let object = text[position + verb.len()..].trim();
+            if valid_part(subject) && valid_part(object) {
+                return Some(Atom::rel(verb, subject, object));
+            }
         }
     }
     for verb in UNARY_VERBS {
@@ -751,6 +773,32 @@ mod tests {
         assert_eq!(lesson.head.display(), "师祖(张三, 王五)");
         assert_eq!(lesson.body[0].display(), "师傅(张三, 李四)");
         assert!((lesson.probability - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_binary_relation_verbs() {
+        let atom = parse_proposition("张三认识李四").expect("S+V+O 应解析为二元关系");
+        assert_eq!(atom.display(), "认识(张三, 李四)");
+
+        // 长词优先：「隶属于」不能被「属于」抢先切成「甲隶 / 属于 / 乙」
+        let atom = parse_proposition("张三隶属于清华大学").expect("长词应优先匹配");
+        assert_eq!(atom.display(), "隶属于(张三, 清华大学)");
+
+        let atom = parse_proposition("厦门位于福建").expect("位于应读作二元关系");
+        assert_eq!(atom.display(), "位于(厦门, 福建)");
+
+        let atom = parse_proposition("张三出生于上海").expect("出生于应可解析");
+        assert_eq!(atom.display(), "出生于(张三, 上海)");
+
+        let atom = parse_proposition("张三工作于清华大学").expect("工作于应可解析");
+        assert_eq!(atom.display(), "工作于(张三, 清华大学)");
+
+        let atom = parse_proposition("张三喜欢李四").expect("喜欢应有二元读法");
+        assert_eq!(atom.display(), "喜欢(张三, 李四)");
+
+        // 情态动词仍保持一元读法
+        let atom = parse_proposition("鸟会飞").expect("会+V 应保持一元");
+        assert_eq!(atom.display(), "会飞(鸟)");
     }
 
     #[test]

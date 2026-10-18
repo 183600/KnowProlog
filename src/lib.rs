@@ -50,6 +50,9 @@ pub mod logic_program;
 pub mod dialogue_manager;
 pub mod holographic_memory;
 
+#[cfg(test)]
+mod dialogue_conformance;
+
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
 

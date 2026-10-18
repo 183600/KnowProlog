@@ -95,11 +95,17 @@ pub struct DialogueTurn {
 }
 
 /// 对话管理器快照（随会话持久化）。
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+///
+/// 状态充分性：快照必须覆盖全部可观察状态——`turns`、`focus`、`externals`
+/// 之外的 `last_reply` 也要持久化，恢复后的 `summary()` 与中断运行逐字一致。
+/// `last_reply` 带 serde 默认值，兼容旧版快照文件。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialogueManagerSnapshot {
     pub turns: Vec<DialogueTurn>,
     pub focus: Vec<String>,
     pub externals: Vec<String>,
+    #[serde(default)]
+    pub last_reply: Vec<String>,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -293,8 +299,17 @@ impl DialogueManager {
         self.turns.len()
     }
 
+    /// 已记录的对话本体实例（知识/续聊轮），供外部审计与一致性测试。
+    pub fn turns(&self) -> &[DialogueTurn] {
+        &self.turns
+    }
+
     pub fn focus_entity(&self) -> Option<&str> {
         self.focus.last().map(String::as_str)
+    }
+
+    pub fn focus_stack(&self) -> &[String] {
+        &self.focus
     }
 
     pub fn last_reply_plan(&self) -> &[String] {
@@ -340,6 +355,7 @@ impl DialogueManager {
             turns: self.turns.clone(),
             focus: self.focus.clone(),
             externals: self.externals.clone(),
+            last_reply: self.last_reply.clone(),
         }
     }
 
@@ -347,6 +363,7 @@ impl DialogueManager {
         self.turns = snapshot.turns.clone();
         self.focus = snapshot.focus.clone();
         self.externals = snapshot.externals.clone();
+        self.last_reply = snapshot.last_reply.clone();
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -514,12 +531,13 @@ impl DialogueManager {
         if let Some(remainder) = stripped.strip_suffix('呢') {
             let remainder = remainder.trim();
             if let Some(entity) = explicit.first().cloned() {
+                // 显式实体的省略问句（「那叶莉呢」）：规范化问句，保证查询可命中
                 return UtteranceFrame {
                     raw: raw.to_string(),
                     kind: MoveKind::AskIdentity,
-                    entity: Some(entity),
+                    entity: Some(entity.clone()),
                     attribute: None,
-                    question: Some(raw.to_string()),
+                    question: Some(format!("{}是什么", entity)),
                     inherited: false,
                 };
             }
@@ -985,11 +1003,13 @@ impl DialogueManager {
     }
 
     fn compose_ignorance(&self, entity: &str, attribute: Option<&str>, more: &[String]) -> String {
-        let attribute = attribute.unwrap_or("这个问题");
-        let mut text = format!(
-            "关于「{}」的「{}」，我的知识图谱里暂时没有记录。",
-            entity, attribute
-        );
+        let mut text = match attribute {
+            Some(attribute) => format!(
+                "关于「{}」的「{}」，我的知识图谱里暂时没有记录。",
+                entity, attribute
+            ),
+            None => format!("我的知识图谱里暂时没有关于「{}」的介绍信息。", entity),
+        };
         if !more.is_empty() {
             let listed = more
                 .iter()
@@ -1390,6 +1410,35 @@ mod tests {
         assert_eq!(restored.turn_count(), 1);
         assert_eq!(restored.focus_entity(), Some("姚明"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_snapshot_preserves_observable_state() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        manager.plan_pure_dialogue("还有呢", &knowledge).unwrap();
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(restored.summary(), manager.summary());
+        assert_eq!(restored.last_reply_plan(), manager.last_reply_plan());
+    }
+
+    #[test]
+    fn test_snapshot_deserializes_without_last_reply_field() {
+        let legacy = r#"{
+            "turns": [],
+            "focus": ["姚明"],
+            "externals": []
+        }"#;
+        let snapshot: DialogueManagerSnapshot =
+            serde_json::from_str(legacy).expect("旧版快照应可反序列化");
+        assert!(snapshot.last_reply.is_empty());
+        let mut manager = DialogueManager::new();
+        manager.restore(&snapshot);
+        assert_eq!(manager.focus_entity(), Some("姚明"));
     }
 
     #[test]
