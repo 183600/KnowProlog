@@ -292,7 +292,16 @@ impl NLUEngine {
         }
         
         if word1.contains(word2) || word2.contains(word1) {
-            return 0.8;
+            // 单字包含（如「会」⊂「会不会下雨」）不构成词语相似：
+            // 否则「麻雀会飞」等普通句子会被误判为天气意图，永远到不了符号推理
+            let shorter = if word1.chars().count() <= word2.chars().count() {
+                word1
+            } else {
+                word2
+            };
+            if shorter.chars().count() >= 2 {
+                return 0.8;
+            }
         }
         
         if let Some(synonyms) = &self.synonyms {

@@ -23,6 +23,8 @@ pub struct ChineseLesson {
     pub probability: f64,
     pub source: String,
     pub original: String,
+    /// 默认句（「除非」）的例外条件：通常结论成立，除非该条件成立
+    pub exception: Option<Atom>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,8 @@ pub enum LessonKind {
     ConditionalRule,
     /// 因果规则：因为/由于…
     CausalRule,
+    /// 默认规则（非单调）：通常…除非…（可被例外反驳）
+    DefaultRule,
 }
 
 /// 解析结果：成功的知识与逐条失败原因（用于教学报告）
@@ -96,6 +100,7 @@ fn default_rule_probability(kind: LessonKind) -> f64 {
     match kind {
         LessonKind::ConditionalRule => 0.95,
         LessonKind::CausalRule => 0.90,
+        LessonKind::DefaultRule => 0.90,
         _ => 1.0,
     }
 }
@@ -406,6 +411,7 @@ pub fn lesson_has_variables(lesson: &ChineseLesson) -> bool {
         .terms
         .iter()
         .chain(lesson.body.iter().flat_map(|atom| atom.terms.iter()))
+        .chain(lesson.exception.iter().flat_map(|atom| atom.terms.iter()))
         .any(|term| match term {
             Term::Const(name) => is_placeholder(name),
             Term::Var(_) => true,
@@ -531,6 +537,146 @@ fn split_conditional(text: &str) -> Option<(LessonKind, String, String)> {
     None
 }
 
+/// 默认句切分：返回（通常结论文本, 例外文本）。
+/// 支持两种语序：
+///   「除非X是企鹅，否则X会飞」  → 例外在前、结论在后；
+///   「X会飞，除非X是企鹅」/「如果X是鸟，那么X会飞，除非X是企鹅」 → 结论在前。
+fn split_unless(text: &str) -> Option<(String, String)> {
+    let position = text.find("除非")?;
+    let before = text[..position]
+        .trim()
+        .trim_end_matches(['，', ',', '。', '；', ';'])
+        .trim();
+    let after = text[position + '除'.len_utf8() + '非'.len_utf8()..].trim();
+    if before.is_empty() {
+        let mut best: Option<(usize, &str)> = None;
+        for marker in ["否则", "那么就", "那么", "就", "则", "，", ","] {
+            if let Some(found) = after.find(marker) {
+                if best.map(|(best_position, _)| found < best_position).unwrap_or(true) {
+                    best = Some((found, marker));
+                }
+            }
+        }
+        let (found, marker) = best?;
+        let exception = after[..found]
+            .trim()
+            .trim_matches(|ch| matches!(ch, '，' | ',' | '。' | ' '))
+            .to_string();
+        let mut main = after[found + marker.len()..].trim().to_string();
+        loop {
+            let mut stripped = false;
+            for lead in ["否则", "那么", "就", "则", "便", "也"] {
+                if let Some(rest) = main.strip_prefix(lead) {
+                    main = rest.trim().to_string();
+                    stripped = true;
+                    break;
+                }
+            }
+            if !stripped {
+                break;
+            }
+        }
+        if exception.is_empty() || main.is_empty() {
+            return None;
+        }
+        return Some((main, exception));
+    }
+    let mut exception = after;
+    if let Some(again) = exception.find("否则") {
+        exception = exception[..again].trim();
+    }
+    if exception.is_empty() {
+        return None;
+    }
+    Some((before.to_string(), exception.to_string()))
+}
+
+/// 默认句 → 默认知识：结论/前件来自主句，例外来自「除非」子句
+fn parse_default_lesson(
+    main: &str,
+    exception: &str,
+    probability: Option<f64>,
+    original: &str,
+) -> Result<ChineseLesson, String> {
+    let (head, body) =
+        if let Some((_, antecedent, consequent)) = split_conditional(&strip_probability_wrappers(main))
+        {
+            let antecedent = strip_probability_wrappers(&antecedent);
+            let consequent = strip_probability_wrappers(&consequent);
+            let Some(head) = parse_proposition(&consequent) else {
+                return Err(format!(
+                    "无法解析默认结论「{}」（支持：S的P是O / S是O / S会V）",
+                    consequent
+                ));
+            };
+            let Some(premise) = parse_proposition(&antecedent) else {
+                return Err(format!(
+                    "无法解析默认前提「{}」（支持：S的P是O / S是O / S会V）",
+                    antecedent
+                ));
+            };
+            (head, vec![premise])
+        } else {
+            let main = strip_probability_wrappers(main);
+            let Some(head) = parse_proposition(&main) else {
+                return Err(format!(
+                    "无法解析默认结论「{}」（支持：S的P是O / S是O / S会V）",
+                    main
+                ));
+            };
+            (head, Vec::new())
+        };
+    let mut exception_text = strip_probability_wrappers(exception);
+    // 「鸟会飞，除非是企鹅」：例外省略主语时从上文继承
+    if head.arity() == 1
+        && exception_text.starts_with('是')
+        && !exception_text.starts_with("是否")
+    {
+        if let Some(subject) = head.terms.first().map(|term| term.name().to_string()) {
+            exception_text = format!("{}{}", subject, exception_text);
+        }
+    }
+    let Some(exception_atom) = parse_proposition(&exception_text) else {
+        return Err(format!(
+            "无法解析例外「{}」（支持：S的P是O / S是O / S会V）",
+            exception
+        ));
+    };
+    // 例外里的占位符必须也出现在结论/前提中，否则量词范围不明
+    let mut main_placeholders: Vec<&str> = Vec::new();
+    for term in head
+        .terms
+        .iter()
+        .chain(body.iter().flat_map(|atom| atom.terms.iter()))
+    {
+        if let Term::Const(name) = term {
+            if is_placeholder(name) {
+                main_placeholders.push(name);
+            }
+        }
+    }
+    for term in &exception_atom.terms {
+        if let Term::Const(name) = term {
+            if is_placeholder(name) && !main_placeholders.iter().any(|known| *known == &**name) {
+                return Err(format!(
+                    "例外里的占位符「{}」必须也出现在默认结论或前提中",
+                    name
+                ));
+            }
+        }
+    }
+    Ok(ChineseLesson {
+        kind: LessonKind::DefaultRule,
+        head,
+        body,
+        probability: probability
+            .unwrap_or_else(|| default_rule_probability(LessonKind::DefaultRule)),
+        source: "中文教学·默认规则".to_string(),
+        original: original.to_string(),
+        exception: Some(exception_atom),
+    })
+}
+
 /// 解析单句中文知识
 pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
     let raw = text.trim();
@@ -549,6 +695,10 @@ pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
         None => (None, cleaned.clone()),
     };
     let normalized = strip_probability_wrappers(&without_quantifier);
+    // 默认句（非单调）：除非…否则… / …，除非…
+    if let Some((main, exception)) = split_unless(&normalized) {
+        return parse_default_lesson(&main, &exception, probability, &cleaned);
+    }
     // 条件/因果句
     if let Some((kind, antecedent, consequent)) =
         split_conditional(&normalized).or_else(|| split_conditional(&cleaned))
@@ -573,6 +723,7 @@ pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
             probability,
             source,
             original: cleaned,
+            exception: None,
         });
     }
     // 比例/量词陈述
@@ -591,6 +742,7 @@ pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
             probability,
             source: "中文教学·概率事实".to_string(),
             original: cleaned,
+            exception: None,
         });
     }
     // 直陈句 → 确定事实
@@ -607,6 +759,7 @@ pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
         probability: 1.0,
         source: "中文教学·确定事实".to_string(),
         original: cleaned,
+        exception: None,
     })
 }
 
@@ -643,6 +796,20 @@ pub fn apply_lesson(program: &mut ProblogEngine, lesson: &ChineseLesson) {
                 lesson.probability,
                 &lesson.source,
             );
+        }
+        LessonKind::DefaultRule => {
+            // 概率视图：不建模「除非」例外，只保留乐观倾向（默认逻辑另行处理例外）
+            let head = generalize_atom(&lesson.head);
+            if lesson.body.is_empty() {
+                program.add_probabilistic_fact(head, lesson.probability);
+            } else {
+                program.add_rule(
+                    head,
+                    lesson.body.iter().map(generalize_atom).collect(),
+                    lesson.probability,
+                    &lesson.source,
+                );
+            }
         }
     }
 }
@@ -686,6 +853,35 @@ pub fn render_lesson_zh(lesson: &ChineseLesson) -> String {
                 probability,
                 render_atom_zh(&lesson.head)
             )
+        }
+        LessonKind::DefaultRule => {
+            let exception = lesson
+                .exception
+                .as_ref()
+                .map(render_atom_zh)
+                .unwrap_or_else(|| "未知例外".to_string());
+            if lesson.body.is_empty() {
+                format!(
+                    "通常「{}」，除非「{}」（概率视图 {}）",
+                    render_atom_zh(&lesson.head),
+                    exception,
+                    probability
+                )
+            } else {
+                let premises = lesson
+                    .body
+                    .iter()
+                    .map(render_atom_zh)
+                    .collect::<Vec<_>>()
+                    .join(" 且 ");
+                format!(
+                    "只要「{}」，通常「{}」，除非「{}」（概率视图 {}）",
+                    premises,
+                    render_atom_zh(&lesson.head),
+                    exception,
+                    probability
+                )
+            }
         }
     }
 }
@@ -893,5 +1089,62 @@ mod tests {
         let outcome = parse_lessons("除非下雨，否则比赛照常");
         assert!(outcome.lessons.is_empty());
         assert!(!outcome.errors.is_empty());
+    }
+
+    #[test]
+    fn test_parse_default_rule_with_unless_after_consequent() {
+        let lesson = parse_lesson("如果X是鸟，那么X会飞，除非X是企鹅").unwrap();
+        assert_eq!(lesson.kind, LessonKind::DefaultRule);
+        assert_eq!(lesson.head.display(), "会飞(X)");
+        assert_eq!(lesson.body[0].display(), "是(X, 鸟)");
+        assert_eq!(lesson.exception.as_ref().unwrap().display(), "是(X, 企鹅)");
+        assert!((lesson.probability - 0.9).abs() < 1e-9);
+        let rendered = render_lesson_zh(&lesson);
+        assert!(rendered.contains("通常"), "{}", rendered);
+        assert!(rendered.contains("除非"), "{}", rendered);
+    }
+
+    #[test]
+    fn test_parse_default_rule_unless_first() {
+        let lesson = parse_lesson("除非X是企鹅，否则X会飞").unwrap();
+        assert_eq!(lesson.kind, LessonKind::DefaultRule);
+        assert_eq!(lesson.head.display(), "会飞(X)");
+        assert!(lesson.body.is_empty());
+        assert_eq!(lesson.exception.as_ref().unwrap().display(), "是(X, 企鹅)");
+    }
+
+    #[test]
+    fn test_parse_default_rule_ellipsis_exception_inherits_subject() {
+        let lesson = parse_lesson("鸟会飞，除非是企鹅").unwrap();
+        assert_eq!(lesson.kind, LessonKind::DefaultRule);
+        assert_eq!(lesson.head.display(), "会飞(鸟)");
+        assert_eq!(lesson.exception.as_ref().unwrap().display(), "是(鸟, 企鹅)");
+    }
+
+    #[test]
+    fn test_parse_default_rule_rejects_orphan_exception_placeholder() {
+        let error = parse_lesson("如果X是鸟，那么X会飞，除非Y是企鹅").unwrap_err();
+        assert!(error.contains("占位符"), "{}", error);
+    }
+
+    #[test]
+    fn test_default_rule_applies_optimistic_probability_view() {
+        let mut program = ProblogEngine::new(6, 8);
+        let lesson = parse_lesson("如果X是鸟，那么X会飞，除非X是企鹅").unwrap();
+        apply_lesson(&mut program, &lesson);
+        program.add_deterministic_fact(Atom::rel("是", "麻雀", "鸟"));
+        let query = program.query(&Atom::unary("会飞", Term::constant("麻雀")), 3, 0.0);
+        assert_eq!(query.answers.len(), 1, "概率视图应给出乐观结论");
+        assert!((query.answers[0].probability - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_default_lesson_has_no_horn_clause() {
+        let lesson = parse_lesson("如果X是鸟，那么X会飞，除非X是企鹅").unwrap();
+        assert!(lesson_has_variables(&lesson), "含 X 的默认句应识别为含变量");
+        assert!(
+            lesson_to_clause(&lesson).is_none(),
+            "默认句不是 Horn 子句（例外语义不能进 SLD）"
+        );
     }
 }

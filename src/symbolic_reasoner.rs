@@ -13,6 +13,7 @@ use crate::causal_tokenization::{
     attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS,
 };
 use crate::chinese_reasoning_nlu::{self, LessonKind};
+use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
@@ -43,6 +44,9 @@ use crate::ReasoningConfig;
 const PROOF_HAS: &str = "__具有__";
 const PROOF_TYPE: &str = "__类型__";
 
+// 默认逻辑（可反驳常识）的最大接地推导轮数
+const DEFAULT_LOGIC_MAX_ROUNDS: usize = 8;
+
 // 中文教学知识类型的展示名
 fn lesson_kind_label(kind: LessonKind) -> &'static str {
     match kind {
@@ -50,6 +54,7 @@ fn lesson_kind_label(kind: LessonKind) -> &'static str {
         LessonKind::ProbabilisticFact => "概率事实",
         LessonKind::ConditionalRule => "条件规则（如果…那么…）",
         LessonKind::CausalRule => "因果规则（因为…所以…）",
+        LessonKind::DefaultRule => "默认规则（通常…除非…，可例外反驳）",
     }
 }
 
@@ -4700,6 +4705,7 @@ impl SymbolicReasoner {
             output.push_str("  • 条件句：如果S的P是O，那么S的P是O（可带 八成/很可能/百分之八十 等概率词）\n");
             output.push_str("  • 因果句：因为S的P是O，所以S的P是O\n");
             output.push_str("  • 比例句：八成的S会V / S的P是O的可能性是百分之八十\n");
+            output.push_str("  • 默认句（可反驳常识）：如果X是鸟，那么X会飞，除非X是企鹅\n");
             output.push_str("  • 直陈句：S的P是O（作为确定事实）");
             if !outcome.errors.is_empty() {
                 output.push_str("\n  失败原因：\n");
@@ -4876,9 +4882,17 @@ impl SymbolicReasoner {
         let mut refused: Vec<String> = Vec::new();
         for lesson in &outcome.lessons {
             if lesson.kind != LessonKind::DeterministicFact {
+                let hint = match lesson.kind {
+                    LessonKind::DefaultRule => "默认句请用「教学：」学习",
+                    LessonKind::ConditionalRule | LessonKind::CausalRule => {
+                        "条件句请用「规则：」或「教学：」学习"
+                    }
+                    LessonKind::ProbabilisticFact => "概率句请用「教学：」学习",
+                    LessonKind::DeterministicFact => "",
+                };
                 refused.push(format!(
-                    "「{}」不是确定事实（条件句请用「规则：」学习，概率句请用「教学：」）",
-                    lesson.original
+                    "「{}」不是确定事实（{}）",
+                    lesson.original, hint
                 ));
                 continue;
             }
@@ -5403,6 +5417,135 @@ impl SymbolicReasoner {
             }
         }
         output.trim_end().to_string()
+    }
+
+    /// 从当前会话知识构建默认理论：图谱三元组/属性/实体类型 + 会话事实为事实，
+    /// 教过的「除非」默认句为默认规则（cross-session 由 lessons 重放，无新增快照字段）
+    fn build_default_theory(&self) -> DefaultTheory {
+        let mut theory = DefaultTheory::new(DEFAULT_LOGIC_MAX_ROUNDS);
+        for triple in self.predictor.triples() {
+            theory.add_fact_atom(Atom::rel(
+                &triple.predicate,
+                &triple.subject,
+                &triple.object,
+            ));
+        }
+        for (subject, key, value) in &self.attributes {
+            theory.add_fact_atom(Atom::rel(key, subject, value));
+        }
+        for (entity, entity_type) in self.generator.typed_entities() {
+            if !entity.trim().is_empty() && !entity_type.trim().is_empty() {
+                theory.add_fact_atom(Atom::rel("是", &entity, &entity_type));
+            }
+        }
+        for atom in &self.session_facts {
+            theory.add_fact_atom(atom.clone());
+        }
+        for lesson in &self.lessons_parsed {
+            if lesson.kind != LessonKind::DefaultRule {
+                continue;
+            }
+            let Some(exception) = &lesson.exception else {
+                continue;
+            };
+            let prerequisite: Vec<Literal> = lesson
+                .body
+                .iter()
+                .map(|atom| Literal::positive(chinese_reasoning_nlu::generalize_atom(atom)))
+                .collect();
+            let justifications = vec![Literal::negative(
+                chinese_reasoning_nlu::generalize_atom(exception),
+            )];
+            let consequent =
+                Literal::positive(chinese_reasoning_nlu::generalize_atom(&lesson.head));
+            theory.add_default(prerequisite, justifications, consequent, &lesson.source);
+        }
+        theory
+    }
+
+    /// 默认逻辑查询：把会话知识接地成良基扩展，报告触发/例外阻断，
+    /// 并用 ProbLog 对同一目标给出「概率视图」对照（不建模例外的乐观倾向）
+    pub fn default_logic_report(&mut self, target_raw: &str) -> String {
+        let theory = self.build_default_theory();
+        let closure = self.discourse.narrator_mut().closure().clone();
+        let extension = theory.extend(&closure);
+        let target_text = target_raw.trim();
+        let target_atom = if target_text.is_empty() {
+            None
+        } else {
+            chinese_reasoning_nlu::parse_proposition(target_text)
+        };
+        let target = target_atom
+            .as_ref()
+            .map(|atom| Literal::positive(atom.clone()));
+        let mut output = default_logic::render_extension_zh(&theory, &extension, target.as_ref());
+        if !target_text.is_empty() && target.is_none() {
+            output.push_str(&format!(
+                "\n无法把「{}」形式化为可查询命题（支持：S的P是O / S是O / S会V / 谓词(参数)）。",
+                target_text
+            ));
+        }
+        if let (Some(atom), true, true) = (
+            target_atom.as_ref(),
+            self.config.enable_problog,
+            self.config.enable_soft_logic,
+        ) {
+            let query = self.problog.query(atom, 3, 0.0);
+            match query.answers.first() {
+                Some(answer) => output.push_str(&format!(
+                    "\n概率视图（ProbLog 精确可能世界，不建模「除非」例外，仅作对照）：{} {}（P={:.3}）。",
+                    self.render_atom_nl(&answer.atom),
+                    MarkovLogicEngine::hedge(answer.probability),
+                    answer.probability
+                )),
+                None => output
+                    .push_str("\n概率视图（ProbLog）：概率程序中没有与目标相关的证据。"),
+            }
+        }
+        output
+    }
+
+    /// 默认逻辑补充证据（结果抽取兜底入口）：主问答路径未命中「没有记录」或
+    /// 无法作答时，用「除非」默认知识给出非单调补充；无默认规则、目标无法
+    /// 形式化或默认扩展中无证据时返回 None（不产生任何输出与状态变化）
+    pub fn default_logic_supplement(&mut self, question: &str) -> Option<String> {
+        if !self
+            .lessons_parsed
+            .iter()
+            .any(|lesson| lesson.kind == LessonKind::DefaultRule)
+        {
+            return None;
+        }
+        // 自然问句去掉句首礼貌语与句末疑问/标点，让「麻雀会飞吗」也能走默认推理
+        let trimmed = question.trim();
+        let trimmed = trimmed.strip_prefix("请问").unwrap_or(trimmed);
+        let cleaned = trimmed
+            .trim_end_matches(|c| matches!(c, '吗' | '呢' | '吧' | '么' | '呀' | '？' | '?' | '。' | '！' | '!'))
+            .trim();
+        let atom = chinese_reasoning_nlu::parse_proposition(cleaned)?;
+        let target = Literal::positive(atom);
+        let theory = self.build_default_theory();
+        let closure = self.discourse.narrator_mut().closure().clone();
+        let extension = theory.extend(&closure);
+        if let Some(application) = extension.application_for(&target) {
+            let mut output = format!(
+                "默认推理补充：「{}」通常成立（{}；未发现例外）。",
+                default_logic::Literal::render_zh(&target),
+                default_logic::render_application_zh(application)
+            );
+            if extension.truncated {
+                output.push_str("（注意：接地推导达到轮数上限，结果可能不完整。）");
+            }
+            return Some(output);
+        }
+        if let Some(blocked) = extension.blocked_for(&target).first() {
+            return Some(format!(
+                "默认推理补充：不能推出「{}」。{}",
+                default_logic::Literal::render_zh(&target),
+                default_logic::render_blocked_zh(blocked)
+            ));
+        }
+        None
     }
 
     /// 概率查询模式：有谓词时二元/一元各试一次；无谓词时枚举主语相关的概率原子
@@ -7402,6 +7545,97 @@ mod tests {
         assert!(report.contains("会飞"), "教学事实应可查询：{}", report);
         assert!(report.contains("P=0.800"), "应给出精确概率：{}", report);
         assert!(report.contains("概率事实"), "应说明来源：{}", report);
+    }
+
+    #[test]
+    fn test_default_logic_applies_and_blocks_with_exception() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("麻雀是鸟");
+        reasoner.assert_nl_fact("蒂娜是鸟");
+        reasoner.assert_nl_fact("蒂娜是企鹅");
+        let taught = reasoner.teach_report("如果X是鸟，那么X会飞，除非X是企鹅");
+        assert!(taught.contains("默认规则"), "应识别默认规则：{}", taught);
+        assert!(taught.contains("除非"), "应展示例外：{}", taught);
+
+        let applied = reasoner.default_logic_report("麻雀会飞");
+        assert!(applied.contains("成立（默认推理触发）"), "实际：{}", applied);
+        assert!(applied.contains("通常推出"), "应给出触发默认：{}", applied);
+        assert!(applied.contains("P=0.900"), "应给出概率视图对照：{}", applied);
+
+        let blocked = reasoner.default_logic_report("蒂娜会飞");
+        assert!(blocked.contains("未成立（被默认阻断）"), "实际：{}", blocked);
+        assert!(blocked.contains("例外"), "应说明例外：{}", blocked);
+        assert!(blocked.contains("蒂娜是企鹅"), "应点名例外事实：{}", blocked);
+    }
+
+    #[test]
+    fn test_default_logic_reports_missing_evidence_and_unformalizable() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let unknown = reasoner.default_logic_report("阿猫会飞");
+        assert!(unknown.contains("未找到证据"), "实际：{}", unknown);
+        let unformalizable = reasoner.default_logic_report("今天天气怎么样");
+        assert!(
+            unformalizable.contains("无法把"),
+            "应提示无法形式化：{}",
+            unformalizable
+        );
+    }
+
+    #[test]
+    fn test_default_logic_supplement_only_fires_with_defaults() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("麻雀是鸟");
+        reasoner.assert_nl_fact("蒂娜是鸟");
+        reasoner.assert_nl_fact("蒂娜是企鹅");
+        assert!(
+            reasoner.default_logic_supplement("麻雀会飞").is_none(),
+            "没有默认规则时不应产生补充"
+        );
+        reasoner.teach_report("如果X是鸟，那么X会飞，除非X是企鹅");
+        let supplement = reasoner
+            .default_logic_supplement("麻雀会飞")
+            .expect("默认规则就位后应给出补充");
+        assert!(supplement.contains("通常成立"), "实际：{}", supplement);
+        let question = reasoner
+            .default_logic_supplement("请问麻雀会飞吗")
+            .expect("疑问句形式也应给出补充");
+        assert!(question.contains("通常成立"), "实际：{}", question);
+        let blocked = reasoner
+            .default_logic_supplement("蒂娜会飞吗")
+            .expect("例外应给出阻断补充");
+        assert!(blocked.contains("不能推出"), "实际：{}", blocked);
+        assert!(
+            reasoner.default_logic_supplement("今天天气怎么样").is_none(),
+            "无法形式化时不应产生补充"
+        );
+    }
+
+    #[test]
+    fn test_default_lessons_persist_across_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("麻雀是鸟");
+        reasoner.teach_report("如果X是鸟，那么X会飞，除非X是企鹅");
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_defaults_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
+        let report = restored.default_logic_report("麻雀会飞");
+        assert!(
+            report.contains("成立（默认推理触发）"),
+            "恢复后默认规则与会话事实应重放生效：{}",
+            report
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

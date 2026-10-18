@@ -1532,6 +1532,17 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 默认逻辑推理：可反驳常识（通常…除非…）的接地良基扩展 + 例外阻断 + 概率视图对照
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["默认推理：", "默认推理:", "默认逻辑：", "默认逻辑:"],
+        ) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.default_logic_report(target.trim()));
+            println!();
+            continue;
+        }
+
         // 中文概率知识教学：自然语言句子 → ProbLog 概率知识（会话级，不写知识图谱）
         if let Some(target) = strip_any_prefix(
             input,
@@ -2934,6 +2945,11 @@ async fn try_symbolic_reasoning(
                     combined.push('\n');
                     combined.push_str(&abduction);
                 }
+                // 默认逻辑（可反驳常识）补充：把「通常…除非…」知识用于陈述校验
+                if let Some(supplement) = symbolic_reasoner.default_logic_supplement(input) {
+                    combined.push('\n');
+                    combined.push_str(&supplement);
+                }
             }
             let case = contrast_arbiter.contrast_statement(input, symbolic_reasoner);
             combined.push('\n');
@@ -2942,18 +2958,30 @@ async fn try_symbolic_reasoning(
         }
     }
     if let Some(answer) = symbolic_reasoner.answer(input) {
-        // 图谱无记录时，用溯因假设生成候选答案（LLM 式的"猜测 + 理由"）
+        // 图谱无记录时，用溯因假设生成候选答案（LLM 式的"猜测 + 理由"），
+        // 再追加默认逻辑（可反驳常识「通常…除非…」）补充证据
         if answer.contains("没有记录") || answer.contains("没有相关记录") || answer.contains("数量为 0")
         {
+            let mut combined = answer;
             if let Some(abduction) = symbolic_reasoner.hypothesis_answer(input) {
-                return Some(format!("{}\n{}", answer, abduction));
+                combined.push('\n');
+                combined.push_str(&abduction);
             }
+            if let Some(supplement) = symbolic_reasoner.default_logic_supplement(input) {
+                combined.push('\n');
+                combined.push_str(&supplement);
+            }
+            return Some(combined);
         }
         return Some(answer);
     }
     // 开放问句无直接答案：尝试溯因生成候选假设
     if let Some(abduction) = symbolic_reasoner.hypothesis_answer(input) {
         return Some(abduction);
+    }
+    // 仍无结果时：默认逻辑（非单调常识）补充证据，避免结果抽取断层
+    if let Some(supplement) = symbolic_reasoner.default_logic_supplement(input) {
+        return Some(supplement);
     }
     // 逻辑问答失败时，优先用 OWL+DCG 话语引擎做连贯叙述，
     // 再回退到"知识图谱即语言模型"的统计生成式介绍
@@ -2970,7 +2998,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 132] = [
+    const COMMANDS: [&str; 134] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -3043,6 +3071,8 @@ fn is_command_like(input: &str) -> bool {
         "分词:",
         "概率推理",
         "可能世界",
+        "默认推理",
+        "默认逻辑",
         "教学：",
         "教学:",
         "教我",
@@ -3632,6 +3662,8 @@ mod session_tests {
             "帧记忆",
             "话语帧",
             "挂账",
+            "默认推理：麻雀会飞",
+            "默认逻辑：",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
