@@ -490,7 +490,7 @@ priority = 15
 
 [[prolog_rules]]
 name = "原因查询2"
-pattern = ["为何", "v"]
+pattern = ["n", "为何", "v"]
 query_type = "reason_query"
 priority = 14
 
@@ -546,13 +546,21 @@ examples = ["人物信息"]
 name = "name"
 data_type = "string"
 required = true
-extraction_patterns = ["pos:nr"]
 
 [[entity_types.properties]]
 name = "age"
 data_type = "integer"
 required = false
-extraction_patterns = ["pos:m"]
+
+[[entity_types.properties]]
+name = "height"
+data_type = "integer"
+required = false
+
+[[entity_types.properties]]
+name = "weight"
+data_type = "integer"
+required = false
 
 # 通用实体类型
 [[entity_types]]
@@ -563,13 +571,11 @@ examples = ["通用实体"]
 name = "name"
 data_type = "string"
 required = true
-extraction_patterns = ["pos:nr", "pos:n"]
 
 [[entity_types.properties]]
 name = "property"
 data_type = "string"
 required = false
-extraction_patterns = ["pos:n", "pos:a", "pos:m"]
 # 基础提取规则
 [[extraction_rules]]
 name = "人物信息提取"

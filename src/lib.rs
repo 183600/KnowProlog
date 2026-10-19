@@ -55,6 +55,7 @@ pub mod predicate_registry;
 pub mod perf_ledger;
 pub mod startup_ledger;
 pub mod cache;
+pub mod config_contract;
 pub mod context_image;
 pub mod canonical;
 pub mod artifact_audit;
@@ -690,6 +691,7 @@ pub struct PropertyConfig {
     pub name: String,
     pub data_type: String,
     pub required: bool,
+    #[serde(default)]
     pub extraction_patterns: Vec<String>,
 }
 

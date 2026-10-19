@@ -50,6 +50,7 @@ use know_prolog::{
         render_entity_passport, QualityBaseline,
     },
     prompt_spec::{self, LintSeverity, PromptMode},
+    config_contract,
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
 };
 
@@ -169,6 +170,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Compile-check config.toml as the source of a small language: dangling
+    /// references, unreachable capabilities, cycles/conflicts, out-of-range
+    /// thresholds (does not touch the knowledge store)
+    ConfigLint {
+        /// Config file path (defaults to config.toml)
+        #[arg(long)]
+        file: Option<String>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Also fail (exit code) on warnings
+        #[arg(long)]
+        strict: bool,
+    },
     /// Build the data quality passport (deterministic entity scores + gaps)
     /// with a corpus-digest regression ratchet
     EvalQuality {
@@ -225,6 +240,19 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // 配置契约 lint 必须最先处理：它恰恰要在 config.toml 损坏时可用，
+    // 因此不依赖默认配置加载，也不打开知识存储。
+    if let Some(Commands::ConfigLint {
+        file,
+        json,
+        strict,
+    }) = &cli.command
+    {
+        run_config_lint(file.as_deref(), *json, *strict);
+        return;
+    }
+
     let recovery_mode = parse_recovery_mode(&cli.recovery);
 
     // 启动分期台账：config_load / store_open / facts_load / warm_build / bind
@@ -473,6 +501,8 @@ async fn main() {
         Some(Commands::EvalRecovery { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
         Some(Commands::PromptLint { .. }) => {}
+        // 已在加载配置前处理（见 main 顶部早期分派）
+        Some(Commands::ConfigLint { .. }) => {}
         Some(Commands::EvalQuality {
             baseline,
             update_baseline,
@@ -545,6 +575,7 @@ async fn main() {
         }) => {
             let prompt_mode = parse_prompt_mode(&prompt_mode);
             let recovery_mode = parse_recovery_mode(&recovery);
+            warn_config_contract(&config);
             let facts_start = Instant::now();
             let facts = match oxigraph_manager.load_all_facts().await {
                 Ok(facts) => {
@@ -917,6 +948,84 @@ fn run_prompt_lint(json: bool) {
     }
 }
 
+/// `config-lint`：把 config.toml 当源码做契约编译；默认 Error 非零退出，
+/// `--strict` 连 Warning 也非零退出，便于 CI 棘轮推进。
+fn run_config_lint(file: Option<&str>, json: bool, strict: bool) {
+    let path = file.unwrap_or("config.toml");
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) => {
+            eprintln!("读取配置文件 {} 失败: {}", path, e);
+            std::process::exit(1);
+        }
+    };
+    let issues = match config_contract::lint_str(&source) {
+        Ok(issues) => issues,
+        Err(e) => {
+            if json {
+                let value = serde_json::json!({
+                    "version": config_contract::CONFIG_CONTRACT_VERSION,
+                    "file": path,
+                    "errors": 1,
+                    "warnings": 0,
+                    "issues": [{
+                        "severity": "error",
+                        "code": "toml_parse",
+                        "path": path,
+                        "message": e,
+                    }],
+                });
+                match serde_json::to_string_pretty(&value) {
+                    Ok(text) => println!("{}", text),
+                    Err(inner) => eprintln!("契约报告序列化失败: {}", inner),
+                }
+            } else {
+                eprintln!("配置契约 v{}（CC）：TOML 解析失败", config_contract::CONFIG_CONTRACT_VERSION);
+                eprintln!("ERROR [toml_parse] {}：{}", path, e);
+            }
+            std::process::exit(1);
+        }
+    };
+    let errors = config_contract::error_count(&issues);
+    let warnings = config_contract::warning_count(&issues);
+    if json {
+        let value = serde_json::json!({
+            "version": config_contract::CONFIG_CONTRACT_VERSION,
+            "file": path,
+            "errors": errors,
+            "warnings": warnings,
+            "issues": issues,
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("契约报告序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("配置文件：{}", path);
+        println!("{}", config_contract::render_text(&issues));
+    }
+    if errors > 0 || (strict && warnings > 0) {
+        std::process::exit(1);
+    }
+}
+
+/// 启动时的静默断链提醒：只在契约存在 Error 时打一行 stderr，
+/// 说明去哪里看明细；不改变任何运行路径（观察，不接管）。
+fn warn_config_contract(config: &know_prolog::SystemConfig) {
+    let issues = config_contract::lint(config);
+    let errors = config_contract::error_count(&issues);
+    if errors > 0 {
+        eprintln!(
+            "配置契约警告：检测到 {} 个 Error、{} 个 Warning（运行 `knowprolog config-lint` 查看明细；本次启动不改变任何回答路径）",
+            errors,
+            config_contract::warning_count(&issues)
+        );
+    }
+}
+
 /// 构建质量护照（`eval-quality` 与交互命令共用同一确定性路径）。
 async fn quality_report_for(
     oxigraph_manager: &OxigraphManager,
@@ -939,6 +1048,7 @@ async fn run_interactive_mode(
     store_path: &str,
 ) {
     println!("{}", config.messages.startup);
+    warn_config_contract(&config);
     if !recovery_mode.eq(&RecoveryMode::Off) {
         println!("失败恢复模式：{}（失败会生成结构化回执）。", recovery_mode.label());
     }
@@ -1259,6 +1369,13 @@ async fn run_interactive_mode(
         if matches!(input, "帮助" | "help" | "?" | "？" | "h") {
             println!("{}", interactive_help());
             println!();
+            continue;
+        }
+
+        // 配置契约体检：随时把当前 config.toml 当源码再编译一遍
+        if matches!(input, "配置契约" | "配置检查" | "配置体检" | "config-lint") {
+            let issues = config_contract::lint(&config);
+            println!("{}", config_contract::render_text(&issues));
             continue;
         }
 
@@ -4081,6 +4198,7 @@ fn interactive_help() -> String {
         "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
         "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
         "  外链台账 / 图账本                     外部知识留册与命名图物化视图",
+        "  配置契约 / 配置体检                   config.toml 引用/能力/阈值静态检查",
         "",
         "证明与视图",
         "  证明图：<目标> / 知识子图：<实体>     证明树 / 邻域子图",
@@ -4333,6 +4451,10 @@ fn is_command_like(input: &str) -> bool {
         "撤销历史",
         "外链",
         "同义链接",
+        "配置契约",
+        "配置检查",
+        "配置体检",
+        "config-lint",
         "性能报告",
         "性能台账",
         "运行统计",
@@ -5005,6 +5127,8 @@ mod session_tests {
             "导入日志",
             "性能报告",
             "性能台账",
+            "配置契约",
+            "配置体检",
             "派生台账",
             "增量报告",
             "图账本",
