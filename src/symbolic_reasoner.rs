@@ -8912,7 +8912,7 @@ mod tests {
         assert!(!two_hops.contains("丁"), "{}", two_hops);
     }
 
-    /// 对称律补足单向事实：反向问句不再答「没有记录」，且说明依据。
+    /// 对称律补足单向事实：反向问句给出反方向取值，且说明依据。
     #[test]
     fn symmetric_law_recovers_reverse_direction() {
         let mut config = test_config();

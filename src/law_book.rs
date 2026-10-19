@@ -2,7 +2,7 @@
 //!
 //! 系统里同一个关系语义可能同时出现在四处：谓词画像的配置声明、导入时观测到的
 //! 统计、链接预测挖出的 Horn 规则、以及查询/生成路径上的隐式约定。它们各自成立，
-//! 却没有一本可审计的总账。律典补上这一层：
+//! 却没有一本可审计的总账。律典提供这一层：
 //!
 //!   - 统一：谓词画像声明（别名/互逆/功能/传递/对称/定义域/值域）与链接挖掘规则
 //!     编译成同一批 `SemanticLaw`，每条有稳定 id、状态与证据；
@@ -99,7 +99,7 @@ pub enum LawStatus {
     Corroborated,
     /// 生效：只由显式声明或人工采纳进入，参与推理与规划
     Active,
-    /// 退役：显式撤销/被新律取代（本次不做自动退役）
+    /// 退役：显式撤销/被新律取代（不做自动退役）
     Retired,
 }
 
@@ -650,7 +650,7 @@ impl LawBook {
 
         for law in self.laws.values() {
             if law.status == LawStatus::Retired {
-                // 退役是显式撤销：不再拿旧约束去审判当前事实。
+                // 退役是显式撤销：旧约束不参与当前事实的审计。
                 continue;
             }
             let (count, examples) = match law.kind {
@@ -1134,7 +1134,7 @@ mod tests {
         assert!(current.active_transitive("师傅").is_some());
     }
 
-    /// 退役律不再产生矛盾/缺口：撤销必须是可执行的，而不只是账面上的状态。
+    /// 退役律不产生矛盾或缺口：撤销必须是可执行的，而不只是账面上的状态。
     #[test]
     fn retired_law_is_not_audited() {
         let mut book = LawBook::from_registry(&registry());
