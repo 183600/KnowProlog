@@ -24,6 +24,7 @@ use crate::chronicle::{Chronicle, FsyncPolicy};
 use crate::context_image::{ContextImage, IMAGE_VERSION};
 use crate::dialogue_manager::DialogueManagerSnapshot;
 use crate::embedding_eval::EvalBaseline;
+use crate::entity_registry::{EntityRegistry, FOLD_VERSION};
 use crate::predicate_registry::PredicateRegistry;
 use crate::serve_api::SessionEnvelope;
 use crate::symbolic_reasoner::DialogueSnapshot;
@@ -41,6 +42,8 @@ pub enum ArtifactKind {
     DialogueManager,
     /// 谓词画像注册表。
     PredicateRegistry,
+    /// 实体身份注册表。
+    EntityRegistry,
     /// Eval* 棘轮基线。
     EvalBaseline,
     /// 追加式哈希链对话档案（JSONL，`.chronicle.jsonl`）。
@@ -57,6 +60,7 @@ impl ArtifactKind {
             ArtifactKind::DialogueState => "dialogue_state",
             ArtifactKind::DialogueManager => "dialogue_manager",
             ArtifactKind::PredicateRegistry => "predicate_registry",
+            ArtifactKind::EntityRegistry => "entity_registry",
             ArtifactKind::EvalBaseline => "eval_baseline",
             ArtifactKind::Chronicle => "chronicle",
             ArtifactKind::Json => "json",
@@ -76,6 +80,7 @@ impl ArtifactKind {
             "import_journal.json" | "external_ledger.json" => ArtifactKind::ContextImage,
             "dialogue_state.json" => ArtifactKind::DialogueState,
             "predicate_registry.json" => ArtifactKind::PredicateRegistry,
+            "entity_registry.json" => ArtifactKind::EntityRegistry,
             "eval_baseline.json"
             | "nlu_eval_baseline.json"
             | "recovery_baseline.json"
@@ -321,6 +326,18 @@ fn verify(bytes: &[u8], kind: ArtifactKind) -> Result<(String, bool), DecodeErro
         ArtifactKind::PredicateRegistry => {
             typed::<PredicateRegistry>(bytes, kind.label(), 1, limit)
         }
+        ArtifactKind::EntityRegistry => {
+            // 折叠算法版本门：高于支持版本属于「陌生工件」，不以规范字节通过
+            let (registry, receipt) =
+                canonical::decode_json::<EntityRegistry>(bytes, kind.label(), FOLD_VERSION, limit)?;
+            if !registry.version_supported() {
+                return Err(DecodeError::Version {
+                    found: registry.fold_version,
+                    supported: FOLD_VERSION,
+                });
+            }
+            Ok((canonical::canonical_text(&registry)?, receipt.canonical))
+        }
         ArtifactKind::EvalBaseline => typed::<EvalBaseline>(bytes, kind.label(), 1, limit),
         ArtifactKind::Chronicle => Err(DecodeError::Invariant(
             "chronicle 不以 JSON 规范重编码审计（走哈希链校验）".to_string(),
@@ -499,6 +516,10 @@ mod tests {
             ArtifactKind::infer("oxigraph_data/dialogue_state.json.chronicle.jsonl"),
             ArtifactKind::Chronicle
         );
+        assert_eq!(
+            ArtifactKind::infer("oxigraph_data/entity_registry.json"),
+            ArtifactKind::EntityRegistry
+        );
         assert_eq!(ArtifactKind::infer("random.json"), ArtifactKind::Json);
     }
 
@@ -552,7 +573,7 @@ mod tests {
                 .append("turn", serde_json::json!({"user": "第二轮"}))
                 .unwrap();
         }
-        // 篡改首行内容（哈希不再匹配）→ Damaged；fix 拒绝且字节不动
+        // 篡改首行内容（哈希不匹配）→ Damaged；fix 拒绝且字节不动
         let text = std::fs::read_to_string(&path_text).unwrap();
         let tampered = text.replacen("第一轮", "被篡改", 1);
         std::fs::write(&path_text, tampered).unwrap();
@@ -593,18 +614,44 @@ mod tests {
         let path_text = path.to_string_lossy().to_string();
         let registry = PredicateRegistry::default();
         std::fs::write(&path_text, registry.to_json()).unwrap();
-        let audit = audit(&path_text, ArtifactKind::PredicateRegistry);
+        let report = audit(&path_text, ArtifactKind::PredicateRegistry);
         assert!(
-            audit.status == ArtifactStatus::NonCanonical
-                || audit.status == ArtifactStatus::Canonical,
+            report.status == ArtifactStatus::NonCanonical
+                || report.status == ArtifactStatus::Canonical,
             "{}",
-            audit.status.label()
+            report.status.label()
         );
         assert_eq!(
             fix(&path_text, ArtifactKind::PredicateRegistry).unwrap().status,
             ArtifactStatus::Canonical
         );
         let _ = std::fs::remove_file(&path);
+
+        // 实体身份注册表：规范重写 + 折叠版本门（高版本 → Damaged，永不改写）
+        let path = temp_path("entity-registry");
+        let path_text = path.to_string_lossy().to_string();
+        let mut entity_registry = EntityRegistry::new();
+        entity_registry.confirm_alias("苹果", "苹果公司");
+        std::fs::write(&path_text, entity_registry.to_json()).unwrap();
+        assert_eq!(
+            audit(&path_text, ArtifactKind::EntityRegistry).status,
+            ArtifactStatus::NonCanonical
+        );
+        assert_eq!(
+            fix(&path_text, ArtifactKind::EntityRegistry).unwrap().status,
+            ArtifactStatus::Canonical
+        );
+        let mut future: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path_text).unwrap()).unwrap();
+        future["fold_version"] = serde_json::json!(FOLD_VERSION + 1);
+        std::fs::write(&path_text, future.to_string()).unwrap();
+        assert!(matches!(
+            audit(&path_text, ArtifactKind::EntityRegistry).status,
+            ArtifactStatus::Damaged(_)
+        ));
+        assert!(fix(&path_text, ArtifactKind::EntityRegistry).is_err());
+        let _ = std::fs::remove_file(&path);
+
         let _ = version_gate(1, 1);
         assert!(version_gate(2, 1).is_err());
     }

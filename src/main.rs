@@ -50,6 +50,7 @@ use know_prolog::{
         render_entity_passport, QualityBaseline,
     },
     prompt_spec::{self, LintSeverity, PromptMode},
+    entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
 };
 
 #[derive(Parser)]
@@ -628,6 +629,7 @@ fn run_artifact_audit(
         format!("{}/import_journal.json", store_path),
         format!("{}/external_ledger.json", store_path),
         format!("{}/predicate_registry.json", store_path),
+        format!("{}/entity_registry.json", store_path),
         format!("{}/eval_baseline.json", store_path),
         format!("{}/nlu_eval_baseline.json", store_path),
         format!("{}/recovery_baseline.json", store_path),
@@ -829,6 +831,15 @@ async fn run_interactive_mode(
         config.reasoning.require_predicate_admission,
     );
 
+    // 实体身份注册表：跨会话加载已确认的别名/重定向，再叠加配置声明；
+    // 已确认别名同步进链接器（持久别名词面与规范名同权）。
+    let entity_registry_path =
+        format!("{}/entity_registry.json", config.system.oxigraph_store_path);
+    if oxigraph_manager.load_entity_registry(&entity_registry_path) {
+        println!("已恢复实体身份注册表。可用「身份台账」查看。");
+    }
+    oxigraph_manager.configure_entities(&config.entity_profiles);
+
     // 类型体系：别名/子类/互斥声明 + 模式闸门闭包档（config.toml [type_system]）
     oxigraph_manager.configure_type_system(&config.type_system);
 
@@ -924,6 +935,8 @@ async fn run_interactive_mode(
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
     sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+    // 实体身份：已确认的持久别名同步进链接器（别名与规范名同权）
+    sync_entity_aliases(&mut symbolic_reasoner, &oxigraph_manager);
     // 导入日志：跨重启的有界撤销栈
     let journal_path = format!("{}/import_journal.json", config.system.oxigraph_store_path);
     let mut import_journal = match ImportJournal::load(&journal_path) {
@@ -946,7 +959,10 @@ async fn run_interactive_mode(
     let mut reasoner_stale = false;
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
         symbolic_reasoner.observe_facts(&facts);
+        oxigraph_manager.observe_entity_facts(&facts);
     }
+    // 图谱观测落盘：重启后身份台账与图谱一致（观测是幂等的）
+    let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
     if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
         if std::path::Path::new(state_path).exists() {
             match SymbolicReasoner::read_dialogue_state(state_path) {
@@ -1762,6 +1778,7 @@ async fn run_interactive_mode(
         // 身份台账：规范身份 ↔ 别名 ↔ 歧义（实体 URI 的只读审计视图）
         if matches!(input, "身份台账" | "身份注册表" | "身份报告" | "实体身份") {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", oxigraph_manager.entity_registry_report());
             println!("{}", symbolic_reasoner.identity_report());
             println!();
             continue;
@@ -1789,6 +1806,21 @@ async fn run_interactive_mode(
             if target.is_empty() {
                 println!("请提供要准入的词面，例如：准入：未名科技公司");
             } else {
+                // 铸 URI 前的宪法检查：已存在/重定向/折叠同形/歧义时只引导，不新铸
+                match oxigraph_manager.entity_mint_check(target) {
+                    MintVerdict::Fresh => {}
+                    verdict => {
+                        println!("{}", verdict.line(target));
+                        if let MintVerdict::Variant { canonical, .. } = verdict {
+                            println!(
+                                "若「{}」确指「{}」，请用「记住身份：{} = {}」登记别名。",
+                                target, canonical, target, canonical
+                            );
+                        }
+                        println!();
+                        continue;
+                    }
+                }
                 match symbolic_reasoner.admit_vocabulary(target) {
                     Some((name, etype)) => {
                         let mut properties = std::collections::HashMap::new();
@@ -1801,6 +1833,7 @@ async fn run_interactive_mode(
                             Ok(()) => {
                                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager)
                                     .await;
+                                let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
                                 println!(
                                     "已准入：「{}」→ 类型 {}（已写入知识库，可在后续问句中被识别）。",
                                     name, etype
@@ -2461,6 +2494,115 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 实体身份：确认/拒绝/记住/忘记/合并/铸造检查（谓词注册表的实体侧对偶）
+        if let Some(spec) = strip_any_prefix(input, &["确认身份：", "确认身份:"]) {
+            match parse_predicate_pair(spec) {
+                Some((surface, canonical)) => {
+                    if oxigraph_manager.confirm_entity_alias(&surface, &canonical) {
+                        symbolic_reasoner.register_entity_alias(&surface, &canonical);
+                        let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                        println!("已确认身份：「{}」≡「{}」（持久别名，重启后仍生效）。", surface, canonical);
+                    } else {
+                        println!("确认未有改动（词面为空、词面即规范名或已确认）。");
+                    }
+                }
+                None => println!("请给出身份对，例如：确认身份：苹果 = 苹果公司"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(input, &["记住身份：", "记住身份:"]) {
+            match parse_predicate_pair(spec) {
+                Some((surface, canonical)) => {
+                    if oxigraph_manager.confirm_entity_alias(&surface, &canonical) {
+                        symbolic_reasoner.register_entity_alias(&surface, &canonical);
+                        let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                        println!("已记住身份：「{}」≡「{}」（提名即时确认并落盘）。", surface, canonical);
+                    } else {
+                        println!("记住未有改动（词面为空、词面即规范名或已确认）。");
+                    }
+                }
+                None => println!("请给出身份对，例如：记住身份：苹果 = 苹果公司"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(input, &["拒绝身份：", "拒绝身份:"]) {
+            match parse_predicate_pair(spec) {
+                Some((surface, canonical)) => {
+                    if oxigraph_manager.reject_entity_alias(&surface, &canonical) {
+                        let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                        println!(
+                            "已拒绝身份：「{}」↛「{}」（立碑：不予自动提名、不参与解析；重启后生效）。",
+                            surface, canonical
+                        );
+                    } else {
+                        println!("拒绝未有改动（未找到该提名，或该词面即规范名）。");
+                    }
+                }
+                None => println!("请给出身份对，例如：拒绝身份：苹果 = 苹果果实"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(surface) = strip_any_prefix(input, &["忘记别名：", "忘记别名:"]) {
+            let surface = surface.trim();
+            if surface.is_empty() {
+                println!("请给出要忘记的词面，例如：忘记别名：苹果");
+            } else {
+                let affected = oxigraph_manager.forget_entity_alias(surface);
+                if affected.is_empty() {
+                    println!("没有找到已确认别名「{}」。", surface);
+                } else {
+                    let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                    println!(
+                        "已忘记别名「{}」（影响 {} 个身份；墓碑已立，重启后链接器彻底忘记）。",
+                        surface,
+                        affected.len()
+                    );
+                }
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(input, &["合并身份：", "合并身份:"]) {
+            match parse_predicate_pair(spec) {
+                Some((from, into)) => match oxigraph_manager.merge_entity_identities(&from, &into)
+                {
+                    Ok(record) => {
+                        symbolic_reasoner.register_entity_alias(&from, &into);
+                        let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                        println!(
+                            "已合并身份：「{}」→「{}」（迁移 {} 个别名；旧名永久重定向，URI 不回收）。",
+                            record.from,
+                            record.into,
+                            record.moved_aliases
+                        );
+                    }
+                    Err(e) => println!("合并失败：{}", e),
+                },
+                None => println!("请给出合并对，例如：合并身份：苹果公司 = 苹果"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(name) = strip_any_prefix(input, &["铸造检查：", "铸造检查:"]) {
+            let name = name.trim();
+            if name.is_empty() {
+                println!("请给出要检查的名称，例如：铸造检查：苹果公司");
+            } else {
+                let verdict = oxigraph_manager.entity_mint_check(name);
+                println!("{}", verdict.line(name));
+            }
+            println!();
+            continue;
+        }
+
         // 确认/拒绝待定谓词：准入对话的裁决入口
         if let Some(predicate) = strip_any_prefix(input, &["确认谓词：", "确认谓词:"]) {
             let predicate = predicate.trim();
@@ -2920,6 +3062,28 @@ async fn run_interactive_mode(
                                 }
                                 reasoner_stale = true;
                                 let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                                // 文本别名模式（全称/简称/又称…）→ 只提名，不自动改写身份
+                                let candidates = extract_alias_candidates(&clean_text);
+                                if !candidates.is_empty() {
+                                    let outcomes =
+                                        oxigraph_manager.nominate_entity_aliases(&candidates);
+                                    let pending = outcomes
+                                        .iter()
+                                        .filter(|o| o.kind == NominationKind::Pending)
+                                        .count();
+                                    let conflicts = outcomes
+                                        .iter()
+                                        .filter(|o| o.kind == NominationKind::TypeConflict)
+                                        .count();
+                                    if pending > 0 || conflicts > 0 {
+                                        println!(
+                                            "身份提名：待确认 {} 个、类型冲突 {} 个（用「身份台账」查看，「确认身份：A = B」裁决）。",
+                                            pending, conflicts
+                                        );
+                                    }
+                                }
+                                let _ =
+                                    oxigraph_manager.save_entity_registry(&entity_registry_path);
                             }
                             Err(e) => eprintln!("保存失败: {}", e),
                         }
@@ -3417,6 +3581,7 @@ async fn refresh_symbolic_reasoner(
 ) {
     if let Ok(facts) = load_graph_snapshot(oxigraph_manager).await {
         symbolic_reasoner.observe_facts(&facts);
+        oxigraph_manager.observe_entity_facts(&facts);
     }
 }
 
@@ -3705,7 +3870,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 147] = [
+    const COMMANDS: [&str; 153] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -3753,6 +3918,12 @@ fn is_command_like(input: &str) -> bool {
         "身份台账",
         "身份注册表",
         "身份报告",
+        "确认身份",
+        "记住身份",
+        "拒绝身份",
+        "忘记别名",
+        "合并身份",
+        "铸造检查",
         "识别实体",
         "判断",
         "蕴含",
@@ -3999,6 +4170,13 @@ fn sync_predicate_pairs(reasoner: &mut SymbolicReasoner, oxigraph_manager: &Oxig
         } else {
             reasoner.register_predicate_alias(&surface, &slot);
         }
+    }
+}
+
+/// 把实体身份注册表里已确认的持久别名同步进链接器（别名与规范名同权）。
+fn sync_entity_aliases(reasoner: &mut SymbolicReasoner, oxigraph_manager: &OxigraphManager) {
+    for (surface, canonical) in oxigraph_manager.confirmed_entity_aliases() {
+        reasoner.register_entity_alias(&surface, &canonical);
     }
 }
 

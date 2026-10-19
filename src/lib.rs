@@ -75,6 +75,7 @@ pub mod epistemic;
 pub mod eval_recovery;
 pub mod recovery;
 pub mod identity;
+pub mod entity_registry;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -154,6 +155,9 @@ pub struct SystemConfig {
     /// 谓词画像声明（可选）：导入准入、别名/逆向归一、功能谓词冲突裁决的共同依据
     #[serde(default)]
     pub predicate_profiles: Vec<predicate_registry::PredicateProfileConfig>,
+    /// 实体身份声明（可选）：规范名 + 别名 + 类型，声明即已确认（显式承诺）
+    #[serde(default)]
+    pub entity_profiles: Vec<entity_registry::EntityProfileConfig>,
     /// 类型体系声明（可选）：别名/子类/互斥 + 模式闸门的闭包档
     #[serde(default)]
     pub type_system: type_system::TypeSystemConfig,
@@ -822,6 +826,8 @@ pub struct OxigraphManager {
     perf: Arc<perf_ledger::PerfLedger>,
     // 谓词画像注册表：导入准入、别名/逆向归一、功能谓词冲突裁决
     predicate_registry: parking_lot::RwLock<predicate_registry::PredicateRegistry>,
+    // 实体身份注册表：提名（待确认）/ 确认 / 拒绝 / 忘记 / 合并的显式台账
+    entity_registry: parking_lot::RwLock<entity_registry::EntityRegistry>,
     // 类型体系：别名/子类/互斥声明的类型格，模式闸门与质量护照共同消费
     type_system: parking_lot::RwLock<type_system::TypeSystem>,
 }
@@ -870,6 +876,7 @@ impl OxigraphManager {
             predicate_registry: parking_lot::RwLock::new(
                 predicate_registry::PredicateRegistry::new(),
             ),
+            entity_registry: parking_lot::RwLock::new(entity_registry::EntityRegistry::new()),
             type_system: parking_lot::RwLock::new(type_system::TypeSystem::new()),
         })
     }
@@ -1223,6 +1230,8 @@ impl OxigraphManager {
             .get("name")
             .cloned()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // 图谱观测的 name 证据（属性迭代前先取，避免被排序视图遮蔽）
+        let name_literal = properties.get("name").cloned();
         let subject_iri = crate::identity::entity_uri(BASE_NS, &subject_name);
         let subject = NamedNode::new(subject_iri.clone())?;
         let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
@@ -1285,6 +1294,14 @@ impl OxigraphManager {
                 );
             }
         }
+        // 图谱观测：实体身份进入注册表（唯一自动确认来源；name 属性即别名证据）
+        if let Some(name) = name_literal {
+            let mut types = BTreeSet::new();
+            types.insert(label.to_string());
+            self.entity_registry
+                .write()
+                .observe_kb_entity(&subject_name, &types, &[name], "文本导入");
+        }
         Ok(())
     }
 
@@ -1331,6 +1348,23 @@ impl OxigraphManager {
         // 关系两端至少要有 name 字面量，保证按名称检索能找到它们
         self.ensure_entity_name(store, subject_name, receipt)?;
         self.ensure_entity_name(store, object_name, receipt)?;
+        // 图谱观测：关系端点身份进入注册表（规范名即图谱键）
+        {
+            let empty_types = BTreeSet::new();
+            let mut registry = self.entity_registry.write();
+            registry.observe_kb_entity(
+                subject_name,
+                &empty_types,
+                &[subject_name.to_string()],
+                "文本导入",
+            );
+            registry.observe_kb_entity(
+                object_name,
+                &empty_types,
+                &[object_name.to_string()],
+                "文本导入",
+            );
+        }
 
         let conflict = {
             let registry = self.predicate_registry.read();
@@ -1701,6 +1735,228 @@ impl OxigraphManager {
         match predicate_registry::PredicateRegistry::load_from_path(path) {
             Some(loaded) => {
                 *self.predicate_registry.write() = loaded;
+                true
+            }
+            None => false,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 实体身份注册表：谓词注册表的实体侧对偶（提名 / 确认 / 拒绝 / 忘记 / 合并）
+    // ------------------------------------------------------------------
+
+    /// 从配置声明实体画像（声明即已确认的显式承诺）。
+    pub fn configure_entities(&self, profiles: &[entity_registry::EntityProfileConfig]) {
+        let mut registry = self.entity_registry.write();
+        for profile in profiles {
+            registry.declare(profile);
+        }
+    }
+
+    pub fn entity_registry_snapshot(&self) -> entity_registry::EntityRegistry {
+        self.entity_registry.read().clone()
+    }
+
+    /// 身份台账报告（确定性；含待确认提名与墓碑）。
+    pub fn entity_registry_report(&self) -> String {
+        self.entity_registry.read().report()
+    }
+
+    /// 铸 URI 前的宪法检查（Exists / Redirect / Variant / Ambiguous / Fresh）。
+    pub fn entity_mint_check(&self, name: &str) -> entity_registry::MintVerdict {
+        self.entity_registry.read().mint_check(name)
+    }
+
+    pub fn resolve_entity_identity(&self, surface: &str) -> entity_registry::EntityResolution {
+        self.entity_registry.read().resolve(surface)
+    }
+
+    /// 已确认别名对（词面 → 规范名），供链接器按持久别名识别。
+    pub fn confirmed_entity_aliases(&self) -> Vec<(String, String)> {
+        self.entity_registry.read().confirmed_alias_pairs()
+    }
+
+    /// 确认一个别名（显式承诺：词义改写需要第二次签字）。
+    pub fn confirm_entity_alias(&self, surface: &str, canonical: &str) -> bool {
+        let changed = self.entity_registry.write().confirm_alias(surface, canonical);
+        if changed {
+            self.perf.bump("identity_alias_confirm");
+        }
+        changed
+    }
+
+    /// 拒绝一个别名提名（墓碑：不予自动提名，也不参与解析）。
+    pub fn reject_entity_alias(&self, surface: &str, canonical: &str) -> bool {
+        let changed = self.entity_registry.write().reject_alias(surface, canonical);
+        if changed {
+            self.perf.bump("identity_alias_reject");
+        }
+        changed
+    }
+
+    /// 忘记一个已确认别名（撤销 + 墓碑）；返回受影响的规范身份。
+    pub fn forget_entity_alias(&self, surface: &str) -> Vec<String> {
+        let affected = self.entity_registry.write().forget_alias(surface);
+        if !affected.is_empty() {
+            self.perf.bump("identity_alias_forget");
+        }
+        affected
+    }
+
+    /// 合并身份（重命名 = 合并 + 重定向；URI 永不回收）。
+    pub fn merge_entity_identities(
+        &self,
+        from: &str,
+        into: &str,
+    ) -> Result<entity_registry::MergeRecord, String> {
+        let record = self.entity_registry.write().merge(from, into)?;
+        self.perf.bump("identity_merge");
+        Ok(record)
+    }
+
+    /// 提名文本模式抽出的别名候选（只提名，不写库）。
+    pub fn nominate_entity_aliases(
+        &self,
+        candidates: &[entity_registry::AliasCandidate],
+    ) -> Vec<entity_registry::NominationOutcome> {
+        let types = self.type_system.read().clone();
+        let mut registry = self.entity_registry.write();
+        let mut outcomes = Vec::new();
+        for candidate in candidates {
+            let evidence = if candidate.evidence.is_empty() {
+                candidate.pattern.clone()
+            } else {
+                format!("{}：{}", candidate.pattern, candidate.evidence)
+            };
+            let outcome = registry.nominate_alias_with_types(
+                &candidate.surface,
+                &candidate.canonical,
+                entity_registry::NominationOrigin::Import,
+                &evidence,
+                Some(&types),
+            );
+            match outcome.kind {
+                entity_registry::NominationKind::Confirmed => {
+                    self.perf.bump("identity_nominate_confirmed")
+                }
+                entity_registry::NominationKind::Pending => {
+                    self.perf.bump("identity_nominate_pending")
+                }
+                entity_registry::NominationKind::TypeConflict => {
+                    self.perf.bump("identity_nominate_type_conflict")
+                }
+                entity_registry::NominationKind::Tombstoned => {
+                    self.perf.bump("identity_nominate_tombstoned")
+                }
+                _ => {}
+            }
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// 从知识图谱刷新身份观测：`rdf:type` 与 `kg:name`（唯一自动确认来源）。
+    ///
+    /// 按规范名排序处理，保证同一图谱得到逐字节一致的身份台账。
+    pub async fn refresh_entity_registry(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut observed: std::collections::BTreeMap<
+            String,
+            (BTreeSet<String>, BTreeSet<String>),
+        > = std::collections::BTreeMap::new();
+        {
+            let store = self.store.lock().await;
+            let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
+            for quad in store.iter() {
+                let quad = match quad {
+                    Ok(quad) => quad,
+                    Err(_) => continue,
+                };
+                if quad.graph_name != GraphName::DefaultGraph {
+                    continue;
+                }
+                let Subject::NamedNode(subject) = &quad.subject else {
+                    continue;
+                };
+                let Some(canonical) = crate::identity::entity_local_name(BASE_NS, subject.as_str())
+                else {
+                    continue;
+                };
+                let entry = observed.entry(canonical).or_default();
+                if quad.predicate == rdf_type {
+                    if let Term::NamedNode(type_node) = &quad.object {
+                        if let Some(label) = type_node.as_str().strip_prefix(BASE_NS) {
+                            entry.0.insert(label.to_string());
+                        }
+                    }
+                } else if quad.predicate.as_str() == NAME_PREDICATE_IRI {
+                    if let Term::Literal(literal) = &quad.object {
+                        entry.1.insert(literal.value().to_string());
+                    }
+                }
+            }
+        }
+        let mut registry = self.entity_registry.write();
+        let mut changed = 0usize;
+        for (canonical, (types, names)) in observed {
+            let names: Vec<String> = names.into_iter().collect();
+            if registry.observe_kb_entity(&canonical, &types, &names, "知识图谱") {
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// 从已加载的事实观测实体身份（与 `refresh_entity_registry` 等价，省一次全库扫描）。
+    pub fn observe_entity_facts(&self, facts: &[PrologFact]) -> usize {
+        let mut by_name: std::collections::BTreeMap<
+            String,
+            (BTreeSet<String>, BTreeSet<String>),
+        > = std::collections::BTreeMap::new();
+        for fact in facts {
+            match fact {
+                PrologFact::Entity {
+                    name,
+                    entity_type,
+                    properties,
+                } => {
+                    let entry = by_name.entry(name.clone()).or_default();
+                    if !entity_type.trim().is_empty() {
+                        entry.0.insert(entity_type.clone());
+                    }
+                    if let Some(value) = properties.get("name") {
+                        if !value.trim().is_empty() {
+                            entry.1.insert(value.clone());
+                        }
+                    }
+                }
+                PrologFact::Relation { from, to, .. } => {
+                    by_name.entry(from.clone()).or_default();
+                    by_name.entry(to.clone()).or_default();
+                }
+            }
+        }
+        let mut registry = self.entity_registry.write();
+        let mut changed = 0usize;
+        for (canonical, (types, names)) in by_name {
+            let names: Vec<String> = names.into_iter().collect();
+            if registry.observe_kb_entity(&canonical, &types, &names, "知识图谱") {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    pub fn save_entity_registry(&self, path: &str) -> std::io::Result<()> {
+        self.entity_registry.read().save_to_path(path)
+    }
+
+    /// 加载身份注册表（版本门：折叠算法版本高于支持版本时不加载）。
+    pub fn load_entity_registry(&self, path: &str) -> bool {
+        match entity_registry::EntityRegistry::load_from_path(path) {
+            Some(loaded) => {
+                *self.entity_registry.write() = loaded;
                 true
             }
             None => false,
@@ -3466,5 +3722,77 @@ mod cache_tests {
             fact,
             PrologFact::Entity { name, .. } if name == "孙七"
         )));
+    }
+
+    /// 实体身份注册表：保存即观测（name 别名自动确认）、显式裁决、落盘往返。
+    #[tokio::test]
+    async fn entity_registry_observes_saves_and_roundtrips() {
+        let (manager, dir) = temp_manager().await;
+        let mut knowledge = vec![person("张三"), person("李四")];
+        knowledge.extend(items("张三", "李四"));
+        manager.save_knowledge(knowledge).await.unwrap();
+
+        let facts = manager.load_all_facts().await.unwrap();
+        assert!(manager.observe_entity_facts(&facts) > 0, "首次观测应有变化");
+        assert_eq!(
+            manager.resolve_entity_identity("张三"),
+            crate::entity_registry::EntityResolution::Canonical("张三".to_string())
+        );
+        assert!(matches!(
+            manager.entity_mint_check("张三"),
+            crate::entity_registry::MintVerdict::Exists { .. }
+        ));
+
+        // 显式确认别名 → 链接器可见；重复确认无变化
+        assert!(manager.confirm_entity_alias("老张", "张三"));
+        assert!(!manager.confirm_entity_alias("老张", "张三"));
+        assert_eq!(
+            manager.resolve_entity_identity("老张"),
+            crate::entity_registry::EntityResolution::Canonical("张三".to_string())
+        );
+        assert_eq!(
+            manager.confirmed_entity_aliases(),
+            vec![("老张".to_string(), "张三".to_string())]
+        );
+
+        // 落盘 → 新实例加载逐字节一致（规范 JSON）；库目录另起（RocksDB 单写锁）
+        let path = dir.path().join("entity_registry.json");
+        let path_text = path.to_str().unwrap();
+        manager.save_entity_registry(path_text).unwrap();
+        let (restored, _other_dir) = temp_manager().await;
+        assert!(restored.load_entity_registry(path_text));
+        assert_eq!(
+            restored.entity_registry_snapshot().to_json(),
+            manager.entity_registry_snapshot().to_json()
+        );
+
+        // 提名 → 拒绝：墓碑阻止解析；合并：旧名重定向
+        let nominations = manager.nominate_entity_aliases(&[crate::entity_registry::AliasCandidate {
+            surface: "小张".to_string(),
+            canonical: "张三".to_string(),
+            pattern: "简称".to_string(),
+            evidence: "测试".to_string(),
+        }]);
+        assert_eq!(
+            nominations[0].kind,
+            crate::entity_registry::NominationKind::Pending
+        );
+        assert!(manager.reject_entity_alias("小张", "张三"));
+        assert_eq!(
+            manager.resolve_entity_identity("小张"),
+            crate::entity_registry::EntityResolution::Unknown
+        );
+        let merged = manager.merge_entity_identities("张三", "张老师").unwrap();
+        assert_eq!(merged.into, "张老师");
+        assert_eq!(
+            manager.resolve_entity_identity("张三"),
+            crate::entity_registry::EntityResolution::Redirected {
+                from: "张三".to_string(),
+                to: "张老师".to_string(),
+            }
+        );
+        let perf = manager.perf_ledger();
+        assert!(perf.count("identity_alias_confirm") >= 1);
+        assert_eq!(perf.count("identity_merge"), 1);
     }
 }

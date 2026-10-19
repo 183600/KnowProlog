@@ -868,7 +868,7 @@ impl SymbolicReasoner {
     /// 正确性契约：分叉结果与「新建实例 + 重放同一批 `observe_facts`」在固定
     /// 查询集上逐字节一致（同一知识版本、同一配置、同一同义词表），
     /// 由 `fork_matches_fresh_observe_byte_for_byte` 等测试守护。
-    /// `Rc<str>` 已统一为 `Arc<str>`，因此分叉基座可跨线程共享（`Send`）。
+    /// 分叉基座以 `Arc<str>` 共享，可跨线程使用（`Send`）。
     pub fn fork_session(&self) -> Self {
         let mut fork = self.clone();
         fork.reset_session_state();
@@ -1200,6 +1200,18 @@ impl SymbolicReasoner {
             self.rebuild_knowledge_caches();
         }
         synonym_added || surface_added
+    }
+
+    /// 登记实体别名（来自实体身份注册表已确认的持久别名）：链接器按别名识别，
+    /// 与 KB 里的规范名同权；歧义词面如实保留多候选，不静默择一。
+    pub fn register_entity_alias(&mut self, alias: &str, canonical: &str) -> bool {
+        let (alias, canonical) = (alias.trim(), canonical.trim());
+        if alias.is_empty() || canonical.is_empty() || alias == canonical {
+            return false;
+        }
+        self.linker.register_alias(alias, canonical);
+        self.link_memo.lock().clear();
+        true
     }
 
     /// 登记逆向谓词词面：问句用该词面发问时，命中规范槽位三元组的反方向
@@ -8429,7 +8441,7 @@ mod tests {
         assert_eq!(perf.count("memo_entity_mentions_hit"), before);
     }
 
-    /// WarmBase 的跨线程前提：分叉基座必须可 `Send`（Rc 已统一为 Arc）。
+    /// WarmBase 的跨线程前提：分叉基座必须可 `Send`。
     #[test]
     fn reasoner_is_send_for_cross_thread_fork() {
         fn assert_send<T: Send>() {}

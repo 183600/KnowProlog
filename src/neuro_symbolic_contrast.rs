@@ -687,7 +687,7 @@ impl ContrastArbiter {
 
         if self.refuted_keys.contains(&case_key(statement, atom)) {
             reading.blocked = true;
-            reading.note = "该推测曾被用户否认，联想通道已将其屏蔽".to_string();
+            reading.note = "该推测已被用户否认，联想通道已将其屏蔽".to_string();
             return reading;
         }
 
@@ -1554,7 +1554,7 @@ mod tests {
     fn knowledge_graph_fact_outranks_user_refutation_memory() {
         let reasoner = reasoner();
         let mut arbiter = ContrastArbiter::new();
-        // 构造"用户曾否认的事实恰好与图谱一致"的持久化记忆：
+        // 构造"用户否认的事实恰好与图谱一致"的持久化记忆：
         // 图谱已有证明时，符号通道应优先采信图谱，而不是被会话否证覆盖
         let snapshot = ContrastSnapshot {
             refuted_atoms: vec!["师傅(李四, 王五)".to_string()],
