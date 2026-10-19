@@ -72,6 +72,7 @@ pub mod bindings;
 pub mod prompt_spec;
 pub mod type_system;
 pub mod quality;
+pub mod dialogue_fuzz;
 pub mod epistemic;
 pub mod eval_recovery;
 pub mod recovery;

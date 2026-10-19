@@ -47,8 +47,9 @@ use know_prolog::{
     },
     quality::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
-        render_entity_passport, QualityBaseline,
+        render_entity_passport, QualityBaseline, QualityIndex,
     },
+    dialogue_fuzz::{self, FuzzConfig},
     prompt_spec::{self, LintSeverity, PromptMode},
     config_contract,
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
@@ -200,6 +201,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run deterministic quality-delta dialogue fuzzing offline (no store I/O)
+    FuzzDialogue {
+        /// Number of generated cases
+        #[arg(long, default_value_t = 96)]
+        cases: usize,
+        /// Deterministic PRNG seed (same seed → byte-identical report)
+        #[arg(long, default_value_t = 20261019)]
+        seed: u64,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Audit persisted artifacts (knowledge `rustfmt --check`): canonical /
     /// non-canonical / damaged / missing, with optional atomic `--fix`
     Artifacts {
@@ -250,6 +263,12 @@ async fn main() {
     }) = &cli.command
     {
         run_config_lint(file.as_deref(), *json, *strict);
+        return;
+    }
+
+    // 质量差分模糊测试完全离线：不依赖 config.toml / 存储，先于任何 I/O 处理。
+    if let Some(Commands::FuzzDialogue { cases, seed, json }) = &cli.command {
+        run_fuzz_dialogue(*cases, *seed, *json);
         return;
     }
 
@@ -307,6 +326,10 @@ async fn main() {
                 *allow_regression,
                 *json,
             );
+            return;
+        }
+        Some(Commands::FuzzDialogue { cases, seed, json }) => {
+            run_fuzz_dialogue(*cases, *seed, *json);
             return;
         }
         _ => {}
@@ -622,6 +645,9 @@ async fn main() {
                 eprintln!("服务退出: {}", e);
                 std::process::exit(1);
             }
+        }
+        Some(Commands::FuzzDialogue { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
         }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
@@ -948,6 +974,22 @@ fn run_prompt_lint(json: bool) {
     }
 }
 
+/// `fuzz-dialogue`：确定性质量差分模糊测试（无配置、无存储、无网络）。
+fn run_fuzz_dialogue(cases: usize, seed: u64, json: bool) {
+    let report = dialogue_fuzz::run(&FuzzConfig { cases, seed });
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        println!("{}", report.render_text());
+    }
+    if report.failed > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// `config-lint`：把 config.toml 当源码做契约编译；默认 Error 非零退出，
 /// `--strict` 连 Warning 也非零退出，便于 CI 棘轮推进。
 fn run_config_lint(file: Option<&str>, json: bool, strict: bool) {
@@ -1038,6 +1080,30 @@ async fn quality_report_for(
         &oxigraph_manager.type_system_snapshot(),
         &config.entity_types,
     ))
+}
+
+/// 把质量护照注入对话管理器；仅在知识版本推进时重建（离线派生，不写图谱）。
+async fn refresh_dialogue_quality(
+    dialogue_manager: &mut DialogueManager,
+    oxigraph_manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+    revision: u64,
+) {
+    if dialogue_manager.quality_revision() == Some(revision) {
+        return;
+    }
+    let Ok(facts) = oxigraph_manager.load_graph_snapshot().await else {
+        return;
+    };
+    let registry = oxigraph_manager.predicate_registry_snapshot();
+    let report = build_quality_report(
+        &facts,
+        &registry,
+        &oxigraph_manager.type_system_snapshot(),
+        &config.entity_types,
+    );
+    let index = QualityIndex::from_report(&report, &facts, &registry).with_revision(revision);
+    dialogue_manager.set_quality_index(Some(index));
 }
 
 async fn run_interactive_mode(
@@ -3098,6 +3164,13 @@ async fn run_interactive_mode(
         // 本体化对话管理器（纯对话行为）：回顾、解释依据、续聊、展开、寒暄。
         // 用对话本体 + 逻辑程序策略推导话语行为，再由模板组合生成回答。
         if dialogue_enabled {
+            refresh_dialogue_quality(
+                &mut dialogue_manager,
+                &oxigraph_manager,
+                &config,
+                symbolic_reasoner.revision(),
+            )
+            .await;
             if let Some(reply) = dialogue_manager.plan_pure_dialogue(input, &symbolic_reasoner) {
                 println!("{}", reply.text);
                 let provenance: Vec<String> = dialogue_manager
@@ -3398,6 +3471,13 @@ async fn run_interactive_mode(
 
                 // 本体化对话管理器：实体已知的知识问句给出"结论 + 出处 + 追问建议"式组合回答
                 if dialogue_enabled {
+                    refresh_dialogue_quality(
+                        &mut dialogue_manager,
+                        &oxigraph_manager,
+                        &config,
+                        symbolic_reasoner.revision(),
+                    )
+                    .await;
                     if let Some(reply) = dialogue_manager.plan_reply(input, &symbolic_reasoner) {
                         println!("{}", reply.text);
                         let provenance: Vec<String> = dialogue_manager

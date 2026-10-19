@@ -69,6 +69,260 @@ pub struct EntityPassport {
     pub gaps: Vec<String>,
     /// 与该实体相关的冲突笔记（导入时被拒的入值）。
     pub conflicts: Vec<ImportConflict>,
+    /// 该实体涉及谓词的来源标签并集（确定性排序）。
+    ///
+    /// 这是护照里唯一直接面向「怎么引用」的字段：无来源时为空，
+    /// 但**空来源不等于事实为假**，只表示引用方式要更保守。
+    #[serde(default)]
+    pub source_tags: Vec<String>,
+}
+
+/// 一条断言（实体 + 可选属性）的「说话许可证」。
+///
+/// 质量层不输出单一置信度，而是把护照翻译成可执行的话语许可：
+/// - `conflicts` 非空 → 必须披露两种说法，不能静默择一；
+/// - `typed == false` → 身份问句应先澄清类型；
+/// - `gaps` 非空 → 可以追问一个缺口，但不得把缺属性说成事实不确定；
+/// - `source_tags` 决定引用方式，而不是真值。
+///
+/// 该结构只含字符串/布尔/整数，便于写入对话快照并逐字节复现。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimWarrant {
+    pub entity: String,
+    /// 规范化后的属性（若配置/画像能解析）；身份问句为 None。
+    pub attribute: Option<String>,
+    /// 已落类型（规范名，排序）。
+    pub types: Vec<String>,
+    /// 该实体在该属性上的已知取值（排序、去重）。
+    pub known_values: Vec<String>,
+    /// 该断言可引用的来源标签。
+    pub source_tags: Vec<String>,
+    /// 与该断言相关的冲突笔记。
+    pub conflicts: Vec<ImportConflict>,
+    /// 护照缺口（未落型 / 缺必备属性 / 冲突 / 互斥类型）。
+    pub gaps: Vec<String>,
+    /// 是否有明确类型。
+    pub typed: bool,
+    /// 护照是否无缺口（不等于真值）。
+    pub complete: bool,
+    /// 生成该担保时的知识版本。
+    pub revision: u64,
+}
+
+impl ClaimWarrant {
+    pub fn has_source(&self) -> bool {
+        !self.source_tags.is_empty()
+    }
+
+    /// 是否需要先澄清类型（未落型且问的是身份）。
+    pub fn needs_type_clarification(&self) -> bool {
+        !self.typed
+    }
+
+    /// 第一个可行动、且尚未被冲突/类型话语覆盖的缺口。
+    pub fn actionable_gap(&self) -> Option<&str> {
+        self.gaps.iter().find(|gap| {
+            !gap.starts_with("未落型") && !gap.starts_with("存在未裁决冲突")
+        }).map(String::as_str)
+    }
+
+    /// 冲突披露句（无冲突时为 None；按现有值优先，绝不覆盖）。
+    ///
+    /// 多条冲突全部列出，避免只披露第一条而静默隐藏其余说法。
+    pub fn conflict_note(&self) -> Option<String> {
+        if self.conflicts.is_empty() {
+            return None;
+        }
+        let notes: Vec<String> = self
+            .conflicts
+            .iter()
+            .map(|conflict| {
+                let existing = if conflict.existing.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    conflict.existing.join("、")
+                };
+                format!(
+                    "关于「{}」，还有另一种说法「{}」，与已有「{}」不一致",
+                    conflict.predicate, conflict.incoming, existing
+                )
+            })
+            .collect();
+        Some(format!(
+            "{}；我暂按已有记录回答，你可以确认哪个为准。",
+            notes.join("；")
+        ))
+    }
+
+    /// 引用说明：有来源就列出，没有来源就如实说明（不改变真值）。
+    pub fn citation_note(&self) -> String {
+        if self.source_tags.is_empty() {
+            "（据现有记录，该信息尚未登记来源）".to_string()
+        } else {
+            format!("（出处：{}）", self.source_tags.join("、"))
+        }
+    }
+}
+
+/// 质量索引：把一次护照报告投影成对话可消费的「担保查询表」。
+///
+/// 只读派生数据：不写图谱、不改事实。`revision` 由宿主注入，
+/// 用于多轮记忆里判断「这条旧回答基于哪一版知识」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityIndex {
+    pub revision: u64,
+    pub digest: String,
+    entities: BTreeMap<String, EntityPassport>,
+    /// 实体 → 属性 → 取值（仅主语侧事实；逆谓词不混入）。
+    values: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// 实体 → 谓词 → 来源标签。
+    predicate_sources: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// 非逆向别名 → 规范谓词（让「师父/老师」问句也享受同一份担保）。
+    attribute_aliases: BTreeMap<String, String>,
+}
+
+impl QualityIndex {
+    pub fn empty() -> Self {
+        QualityIndex {
+            revision: 0,
+            digest: String::new(),
+            entities: BTreeMap::new(),
+            values: BTreeMap::new(),
+            predicate_sources: BTreeMap::new(),
+            attribute_aliases: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    pub fn with_revision(mut self, revision: u64) -> Self {
+        self.revision = revision;
+        self
+    }
+
+    pub fn passport(&self, entity: &str) -> Option<&EntityPassport> {
+        self.entities.get(entity)
+    }
+
+    /// 从护照报告 + 事实快照 + 谓词画像构建索引（确定性）。
+    pub fn from_report(
+        report: &QualityReport,
+        facts: &[PrologFact],
+        registry: &PredicateRegistry,
+    ) -> Self {
+        let entities: BTreeMap<String, EntityPassport> = report
+            .entities
+            .iter()
+            .map(|passport| (passport.name.clone(), passport.clone()))
+            .collect();
+        let mut values: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for fact in facts {
+            match fact {
+                PrologFact::Entity { name, properties, .. } => {
+                    let slots = values.entry(name.clone()).or_default();
+                    for (key, value) in properties {
+                        let entry = slots.entry(key.clone()).or_default();
+                        entry.push(value.clone());
+                    }
+                }
+                PrologFact::Relation { from, rel_type, to } => {
+                    let entry = values
+                        .entry(from.clone())
+                        .or_default()
+                        .entry(rel_type.clone())
+                        .or_default();
+                    entry.push(to.clone());
+                }
+            }
+        }
+        for slots in values.values_mut() {
+            for entry in slots.values_mut() {
+                entry.sort();
+                entry.dedup();
+            }
+        }
+        let mut predicate_sources: BTreeMap<String, BTreeMap<String, Vec<String>>> =
+            BTreeMap::new();
+        for (entity, slots) in &values {
+            let sources = predicate_sources.entry(entity.clone()).or_default();
+            for predicate in slots.keys() {
+                if let Some(profile) = registry.profile(predicate) {
+                    if !profile.sources.is_empty() {
+                        sources.insert(
+                            predicate.clone(),
+                            profile.sources.iter().cloned().collect(),
+                        );
+                    }
+                }
+            }
+        }
+        let mut attribute_aliases: BTreeMap<String, String> = BTreeMap::new();
+        for canonical in registry.canonical_names() {
+            attribute_aliases.insert(canonical.to_string(), canonical.to_string());
+        }
+        for (alias, canonical, inverted) in registry.alias_pairs() {
+            if !inverted {
+                attribute_aliases.insert(alias, canonical);
+            }
+        }
+        QualityIndex {
+            revision: 0,
+            digest: report.digest.clone(),
+            entities,
+            values,
+            predicate_sources,
+            attribute_aliases,
+        }
+    }
+
+    /// 查询一条断言的担保；实体不存在时返回 None（交给常规管线）。
+    pub fn warrant_for(&self, entity: &str, attribute: Option<&str>) -> Option<ClaimWarrant> {
+        let passport = self.entities.get(entity)?;
+        let canonical_attribute = attribute.map(|raw| {
+            let trimmed = raw.trim();
+            self.attribute_aliases
+                .get(trimmed)
+                .cloned()
+                .unwrap_or_else(|| trimmed.to_string())
+        });
+        let known_values = canonical_attribute
+            .as_ref()
+            .and_then(|attribute| self.values.get(entity)?.get(attribute))
+            .cloned()
+            .unwrap_or_default();
+        let conflicts: Vec<ImportConflict> = match &canonical_attribute {
+            Some(attribute) => passport
+                .conflicts
+                .iter()
+                .filter(|conflict| conflict.predicate == *attribute)
+                .cloned()
+                .collect(),
+            None => passport.conflicts.clone(),
+        };
+        let source_tags = canonical_attribute
+            .as_ref()
+            .and_then(|attribute| self.predicate_sources.get(entity)?.get(attribute))
+            .cloned()
+            .unwrap_or_else(|| passport.source_tags.clone());
+        Some(ClaimWarrant {
+            entity: entity.to_string(),
+            attribute: canonical_attribute,
+            types: passport.types.clone(),
+            known_values,
+            source_tags,
+            conflicts,
+            gaps: passport.gaps.clone(),
+            typed: !passport.types.is_empty(),
+            complete: passport.gaps.is_empty(),
+            revision: self.revision,
+        })
+    }
 }
 
 /// 语料级汇总。
@@ -420,6 +674,7 @@ pub fn build_report(
             degree,
             gaps,
             conflicts: entity_conflicts,
+            source_tags: source_tags.into_iter().collect(),
         });
     }
 
@@ -873,5 +1128,68 @@ mod tests {
                 .iter()
                 .any(|delta| delta.metric == "mean_score" && !delta.passed)
         );
+    }
+
+    #[test]
+    fn warrant_separates_truth_from_citation_and_conflict() {
+        let mut registry = registry_with_master();
+        registry.observe("张三", "师傅", "李四", Some("知识图谱"));
+        registry.note_conflict("张三", "师傅", "王五");
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三")]),
+            entity("李四", "Person", &[("name", "李四")]),
+            entity("王五", "Person", &[("name", "王五")]),
+            relation("张三", "师傅", "李四"),
+        ];
+        let report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let index = QualityIndex::from_report(&report, &facts, &registry).with_revision(7);
+        let warrant = index.warrant_for("张三", Some("师傅")).unwrap();
+        assert_eq!(warrant.revision, 7);
+        assert_eq!(warrant.known_values, vec!["李四".to_string()]);
+        assert!(warrant.typed);
+        assert!(warrant.has_source());
+        assert!(
+            warrant.conflict_note().unwrap().contains("王五"),
+            "冲突必须同时披露 incoming：{:?}",
+            warrant.conflicts
+        );
+        assert!(warrant.citation_note().contains("出处"));
+        assert_eq!(warrant.actionable_gap(), None, "冲突不应被当成缺属性追问");
+
+        assert_eq!(index.warrant_for("不存在", Some("师傅")), None);
+        assert_eq!(index.warrant_for("张三", Some("未知属性")).unwrap().known_values, Vec::<String>::new());
+    }
+
+    #[test]
+    fn warrant_alias_resolves_to_same_predicate() {
+        let mut registry = registry_with_master();
+        registry.register_alias("师父", "师傅", "人工确认");
+        registry.observe("张三", "师傅", "李四", Some("知识图谱"));
+        registry.note_conflict("张三", "师傅", "王五");
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三")]),
+            relation("张三", "师傅", "李四"),
+        ];
+        let report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let index = QualityIndex::from_report(&report, &facts, &registry);
+        let warrant = index.warrant_for("张三", Some("师父")).unwrap();
+        assert_eq!(warrant.attribute.as_deref(), Some("师傅"));
+        assert_eq!(warrant.known_values, vec!["李四".to_string()]);
+        assert_eq!(warrant.conflicts.len(), 1, "别名问句也必须披露同一冲突");
+    }
+
+    #[test]
+    fn index_digest_and_order_are_deterministic() {
+        let registry = registry_with_master();
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三")]),
+            relation("张三", "师傅", "李四"),
+        ];
+        let report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let first = QualityIndex::from_report(&report, &facts, &registry);
+        let second = QualityIndex::from_report(&report, &facts, &registry);
+        assert_eq!(first, second);
+        assert_eq!(first.digest, report.digest);
+        assert_eq!(first.len(), report.entities.len());
     }
 }

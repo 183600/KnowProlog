@@ -23,6 +23,7 @@ use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{
     self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION,
 };
+use crate::quality::{ClaimWarrant, QualityIndex};
 use crate::recovery::{
     self, PendingKind, RecoveryMode, RecoveryRequest, RecoveryState,
 };
@@ -40,6 +41,7 @@ pub enum MoveKind {
     AskBinary,
     Assert,
     MetaRecap,
+    MetaReview,
     MetaWhy,
     ContinueRequest,
     ElaborateRequest,
@@ -57,6 +59,7 @@ impl MoveKind {
             MoveKind::AskBinary => "ask_binary",
             MoveKind::Assert => "assert",
             MoveKind::MetaRecap => "meta_recap",
+            MoveKind::MetaReview => "meta_review",
             MoveKind::MetaWhy => "meta_why",
             MoveKind::ContinueRequest => "continue",
             MoveKind::ElaborateRequest => "elaborate",
@@ -101,6 +104,12 @@ pub struct DialogueTurn {
     pub answer_excerpt: Option<String>,
     pub provenance: Vec<String>,
     pub plan: Vec<String>,
+    /// 本轮回答依据的质量担保（来源/冲突/缺口/类型）；旧快照缺省为 None。
+    #[serde(default)]
+    pub warrant: Option<ClaimWarrant>,
+    /// 回答时所依据的知识版本（多轮复核用）；旧快照缺省为 None。
+    #[serde(default)]
+    pub kb_revision: Option<u64>,
 }
 
 /// 对话管理器快照（随会话持久化）。
@@ -298,8 +307,9 @@ impl DialogueKnowledge for SymbolicReasoner {
 /// 每轮把状态固化为 ABox，求值后得到 `respond(...)` 集合。
 pub const POLICY_SOURCE: &str = r#"
 # —— 对话策略本体（Horn 规则 + 分层否定）——
-# 元话语：回顾与解释依据
+# 元话语：回顾、复核与解释依据
 respond(recap) :- kind(T, meta_recap).
+respond(review_answer) :- kind(T, meta_review).
 respond(explain_why) :- kind(T, meta_why), has_evidence(T).
 respond(why_no_evidence) :- kind(T, meta_why), not has_evidence(T).
 # 对话控制：继续说 / 展开细节
@@ -320,8 +330,9 @@ respond(farewell) :- kind(T, farewell).
 "#;
 
 /// 策略优先级：同一轮推导出多条策略时取第一个可落地者。
-const REPLY_PRIORITY: [&str; 13] = [
+const REPLY_PRIORITY: [&str; 14] = [
     "recap",
+    "review_answer",
     "explain_why",
     "why_no_evidence",
     "continue_topic",
@@ -347,6 +358,19 @@ const RECAP_PATTERNS: [&str; 10] = [
     "回顾一下",
     "对话总结",
     "总结一下我们的对话",
+];
+
+const REVIEW_PATTERNS: [&str; 10] = [
+    "你确定吗",
+    "你确定么",
+    "确定吗",
+    "刚才说的还算吗",
+    "刚才说的还算数吗",
+    "现在还成立吗",
+    "还成立吗",
+    "复核一下",
+    "复核",
+    "有没有变化",
 ];
 
 const WHY_PATTERNS: [&str; 9] = [
@@ -405,6 +429,8 @@ pub struct DialogueManager {
     recovery: RecoveryState,
     /// 最近一次恢复动作（运行时视图，不进快照）。
     last_recovery: Option<RecoveryNotice>,
+    /// 质量护照索引（只读派生数据；由宿主按知识版本注入，不进快照）。
+    quality: Option<QualityIndex>,
 }
 
 impl Default for DialogueManager {
@@ -427,6 +453,7 @@ impl DialogueManager {
             recovery_mode: RecoveryMode::Off,
             recovery: RecoveryState::new(),
             last_recovery: None,
+            quality: None,
         }
     }
 
@@ -474,6 +501,22 @@ impl DialogueManager {
 
     pub fn recovery_mode(&self) -> RecoveryMode {
         self.recovery_mode
+    }
+
+    /// 注入质量索引（只读；`None` 时完全保持原有回答路径）。
+    /// 宿主应在知识版本推进后重建索引，使「带出处/披露冲突/追问缺口」生效。
+    pub fn set_quality_index(&mut self, index: Option<QualityIndex>) -> &mut Self {
+        self.quality = index;
+        self
+    }
+
+    pub fn quality_index(&self) -> Option<&QualityIndex> {
+        self.quality.as_ref()
+    }
+
+    /// 当前索引对应的知识版本（未注入时为 None）。
+    pub fn quality_revision(&self) -> Option<u64> {
+        self.quality.as_ref().map(|index| index.revision)
     }
 
     /// 失败台账（只读），供 CLI 报告与评测。
@@ -690,6 +733,7 @@ impl DialogueManager {
         let frame = self.analyze(input, knowledge);
         match frame.kind {
             MoveKind::MetaRecap
+            | MoveKind::MetaReview
             | MoveKind::MetaWhy
             | MoveKind::Greet
             | MoveKind::Thanks
@@ -785,6 +829,9 @@ impl DialogueManager {
             .trim();
         if RECAP_PATTERNS.iter().any(|pattern| stripped.contains(pattern)) {
             return UtteranceFrame::new(raw, MoveKind::MetaRecap);
+        }
+        if REVIEW_PATTERNS.iter().any(|pattern| stripped.contains(pattern)) {
+            return UtteranceFrame::new(raw, MoveKind::MetaReview);
         }
         if WHY_PATTERNS.iter().any(|pattern| stripped.contains(pattern)) {
             return UtteranceFrame::new(raw, MoveKind::MetaWhy);
@@ -965,6 +1012,7 @@ impl DialogueManager {
                 | MoveKind::Thanks
                 | MoveKind::Farewell
                 | MoveKind::MetaRecap
+                | MoveKind::MetaReview
                 | MoveKind::MetaWhy
         );
         if entity.is_none() && !pure_dialogue {
@@ -1024,6 +1072,8 @@ impl DialogueManager {
                         answer_excerpt: None,
                         provenance: vec![format!("引擎故障：{}", fault)],
                         plan: plans.clone(),
+                        warrant: None,
+                        kb_revision: self.quality.as_ref().map(|index| index.revision),
                     });
                     if let Some(entity) = &entity {
                         self.push_focus(entity);
@@ -1083,6 +1133,7 @@ impl DialogueManager {
         let turn_id = format!("t{}", self.turns.len() + 1);
         let kind_atom = match frame.kind {
             MoveKind::MetaRecap => "meta_recap",
+            MoveKind::MetaReview => "meta_review",
             MoveKind::MetaWhy => "meta_why",
             MoveKind::Greet => "greet",
             MoveKind::Thanks => "thanks",
@@ -1141,9 +1192,19 @@ impl DialogueManager {
         });
         plans.dedup();
         let chosen = plans.first()?.clone();
+        let warrant = self.quality.as_ref().and_then(|index| {
+            entity
+                .as_deref()
+                .and_then(|name| index.warrant_for(name, frame.attribute.as_deref()))
+        });
 
         let text = match chosen.as_str() {
             "recap" => self.recap_text(),
+            "review_answer" => {
+                let (text, tag) = self.review_text(knowledge);
+                plans.push(tag.to_string());
+                text
+            }
             "explain_why" => self.explain_last(),
             "why_no_evidence" => self
                 .failure_self_description()
@@ -1220,6 +1281,13 @@ impl DialogueManager {
             }
             _ => text,
         };
+        let (text, plans) = self.apply_warrant(
+            text,
+            plans,
+            warrant.as_ref(),
+            &frame.kind,
+            answer.is_some(),
+        );
 
         let provenance = answer
             .as_deref()
@@ -1244,6 +1312,8 @@ impl DialogueManager {
                 answer_excerpt: answer.as_deref().map(|text| excerpt(text, 40)),
                 provenance,
                 plan: plans.clone(),
+                warrant,
+                kb_revision: self.quality.as_ref().map(|index| index.revision),
             });
         }
         if let Some(entity) = &entity {
@@ -1297,6 +1367,116 @@ impl DialogueManager {
         while self.focus.len() > 5 {
             self.focus.remove(0);
         }
+    }
+
+    /// 复核上一轮回答：比较当时保存的担保与当前知识版本。
+    ///
+    /// 关键约束：删掉的事实绝不能再被说成「现在仍为真」；新增冲突必须显式
+    /// 披露；版本推进但事实未变时只更新「仍成立」而不制造虚假变化。
+    fn review_text(&self, knowledge: &dyn DialogueKnowledge) -> (String, &'static str) {
+        let Some(turn) = self.last_answered_turn() else {
+            return (
+                "我还没有给出过可复核的知识回答。先问我一个具体问题吧。".to_string(),
+                "review_empty",
+            );
+        };
+        let Some(entity) = turn.entity.as_deref() else {
+            return (
+                "上一轮没有落到具体实体，暂时无法复核。".to_string(),
+                "review_empty",
+            );
+        };
+        let attribute = turn.attribute.as_deref();
+        let current_answer = if let Some(attribute) = attribute {
+            self.lookup_attribute(knowledge, entity, attribute)
+        } else {
+            knowledge
+                .answer(&format!("{}是什么", entity))
+                .or_else(|| knowledge.describe(entity))
+        };
+        let current_warrant = self
+            .quality
+            .as_ref()
+            .and_then(|index| index.warrant_for(entity, attribute));
+        let current_revision = self.quality_revision();
+        let subject = match attribute {
+            Some(attribute) => format!("「{}」的「{}」", entity, attribute),
+            None => format!("「{}」", entity),
+        };
+        if current_answer.is_none() {
+            return (
+                format!(
+                    "复核结果：{}现在已没有记录，上一轮的说法不再作为当前事实。",
+                    subject
+                ),
+                "review_stale",
+            );
+        }
+        if let (Some(old), Some(new)) = (turn.warrant.as_ref(), current_warrant.as_ref()) {
+            if old.known_values != new.known_values {
+                let old_values = if old.known_values.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    old.known_values.join("、")
+                };
+                let new_values = if new.known_values.is_empty() {
+                    "（无）".to_string()
+                } else {
+                    new.known_values.join("、")
+                };
+                return (
+                    format!(
+                        "复核结果：知识已变化。{}上一轮记录为「{}」，现在记录为「{}」，以现在为准。",
+                        subject, old_values, new_values
+                    ),
+                    "review_changed",
+                );
+            }
+            let new_conflicts: Vec<&crate::predicate_registry::ImportConflict> = new
+                .conflicts
+                .iter()
+                .filter(|conflict| !old.conflicts.contains(*conflict))
+                .collect();
+            if !new_conflicts.is_empty() {
+                let incoming = new_conflicts
+                    .iter()
+                    .map(|conflict| conflict.incoming.clone())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                return (
+                    format!(
+                        "复核结果：{}仍为「{}」，但出现了新的不同说法「{}」，需要你确认哪个为准。",
+                        subject,
+                        old.known_values.join("、"),
+                        incoming
+                    ),
+                    "review_conflict",
+                );
+            }
+            if current_revision != Some(old.revision) {
+                return (
+                    format!(
+                        "复核结果：知识版本已从 {} 推进到 {}，但{}仍然成立。",
+                        old.revision,
+                        current_revision.unwrap_or(old.revision),
+                        subject
+                    ),
+                    "review_confirmed",
+                );
+            }
+            return (
+                format!("复核结果：知识版本没有变化，{}仍然成立。", subject),
+                "review_confirmed",
+            );
+        }
+        let excerpt = current_answer
+            .as_deref()
+            .map(|answer| excerpt(answer, 60))
+            .unwrap_or_default();
+        (
+            format!("复核结果：现有记录仍支持上一轮的回答：{}", excerpt),
+            "review_confirmed",
+        )
     }
 
     /// 多轮回顾：把对话本体实例组织成一段连贯自述。
@@ -1471,6 +1651,52 @@ impl DialogueManager {
             ),
             _ => format!("你想问谁的「{}」？先告诉我实体名吧。", attribute),
         }
+    }
+
+    /// 把质量担保翻译成话语行为：冲突披露 → 类型澄清 → 一个缺口 → 引用方式。
+    ///
+    /// 顺序固定，最多追加四条（每类至多一条），因此回答不会因质量问题无限膨胀。
+    /// 担保只改「怎么说」，不改答案本身，也不把低分/缺来源说成事实为假。
+    fn apply_warrant(
+        &self,
+        mut text: String,
+        mut plans: Vec<String>,
+        warrant: Option<&ClaimWarrant>,
+        kind: &MoveKind,
+        answered: bool,
+    ) -> (String, Vec<String>) {
+        let Some(warrant) = warrant else {
+            return (text, plans);
+        };
+        let ask_like = matches!(
+            kind,
+            MoveKind::AskAttribute | MoveKind::AskIdentity | MoveKind::AskBinary
+        );
+        if !ask_like {
+            return (text, plans);
+        }
+        if let Some(note) = warrant.conflict_note() {
+            text.push('\n');
+            text.push_str(&note);
+            plans.push("quality_disclose_conflict".to_string());
+        }
+        if warrant.needs_type_clarification() && matches!(kind, MoveKind::AskIdentity) {
+            text.push_str("\n另外，我还不能确定它的类型（人物/地点/组织等），你能补充一下吗？");
+            plans.push("quality_clarify_type".to_string());
+        }
+        if let Some(gap) = warrant.actionable_gap() {
+            text.push_str(&format!("\n补充线索：{}。", gap));
+            plans.push("quality_offer_gap".to_string());
+        }
+        if answered {
+            text.push_str(&warrant.citation_note());
+            plans.push(if warrant.has_source() {
+                "quality_cite_source".to_string()
+            } else {
+                "quality_no_source".to_string()
+            });
+        }
+        (text, plans)
     }
 
     fn compose_direct(&self, answer: &str, entity: &str, more: &[String]) -> String {
