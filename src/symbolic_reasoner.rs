@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,10 @@ use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_ledger;
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
+use crate::law_book::{LawBook, LawStatus};
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
+use crate::predicate_registry::PredicateRegistry;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{OntologyAligner, TermKind};
@@ -48,6 +50,10 @@ const PROOF_TYPE: &str = "__类型__";
 
 // 默认逻辑（可反驳常识）的最大接地推导轮数
 const DEFAULT_LOGIC_MAX_ROUNDS: usize = 8;
+
+// 语义律闭包的有界扩张：深度与节点数双上限，超限即停止（不静默扩成全集）。
+const LAW_CLOSURE_MAX_DEPTH: usize = 8;
+const LAW_CLOSURE_MAX_NODES: usize = 512;
 
 // 会话内纯函数记忆槽容量（提及/链接/谓词）：多轮交替询问时各自留槽，
 // 知识版本推进（revision 自增）时整体失效；容量按条目数确定，LRU 序可审计。
@@ -557,6 +563,8 @@ impl DialogueContext {
 struct ValueHit {
     value: String,
     prediction: Option<Prediction>,
+    /// 该取值由哪条 Active 语义律推出（直接事实为 None）。
+    law: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -634,6 +642,12 @@ pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
     predictor: LinkPredictor,
+    // 律典：声明律 + 挖掘律的统一台账；仅 Active 的传递/对称/互逆律参与查询扩展。
+    laws: LawBook,
+    // 律典的声明来源快照；知识变化时据此重建，避免把配置知识散落在查询路径。
+    law_registry: Option<PredicateRegistry>,
+    // 显式持久化的采纳/退役决定；每次重建律典后重新盖到声明/挖掘结果上。
+    persisted_laws: Option<LawBook>,
     context: DialogueContext,
     embedding: SymbolicEmbedding,
     // 符号化图嵌入：随机游走重启（RWR）向量，做结构联想与话题延伸
@@ -713,6 +727,9 @@ impl Clone for SymbolicReasoner {
             config: self.config.clone(),
             aligner: self.aligner.clone(),
             predictor: self.predictor.clone(),
+            laws: self.laws.clone(),
+            law_registry: self.law_registry.clone(),
+            persisted_laws: self.persisted_laws.clone(),
             context: self.context.clone(),
             embedding: self.embedding.clone(),
             walks: self.walks.clone(),
@@ -824,6 +841,9 @@ impl SymbolicReasoner {
             config,
             aligner,
             predictor: LinkPredictor::new(),
+            laws: LawBook::new(),
+            law_registry: None,
+            persisted_laws: None,
             context: DialogueContext::new(5),
             embedding,
             walks,
@@ -1011,6 +1031,8 @@ impl SymbolicReasoner {
         self.link_memo.lock().clear();
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
+        // 律典是谓词画像与当前挖掘规则的纯派生：知识/规则变化后同批重建。
+        self.rebuild_laws();
         self.stamp_rebuild("knowledge_caches");
     }
 
@@ -1230,6 +1252,50 @@ impl SymbolicReasoner {
         if changed {
             self.rebuild_knowledge_caches();
         }
+    }
+
+    /// 配置律典：把谓词画像中的显式声明编译为 Active 律，并吸收当前挖掘规则。
+    /// 可反复调用；知识变化后由 `rebuild_knowledge_caches` 自动重放同一来源。
+    pub fn configure_laws(&mut self, registry: &PredicateRegistry) {
+        self.law_registry = Some(registry.clone());
+        self.rebuild_laws();
+    }
+
+    /// 载入持久化账本中的显式采纳/退役决定，并立即重放律典。
+    /// 返回载入的显式决定条数（Active/Retired）。
+    pub fn load_persisted_laws(&mut self, persisted: LawBook) -> usize {
+        let loaded = persisted
+            .laws()
+            .filter(|law| matches!(law.status, LawStatus::Active | LawStatus::Retired))
+            .count();
+        self.persisted_laws = Some(persisted);
+        self.rebuild_laws();
+        loaded
+    }
+
+    /// 律典快照（只读派生；调用方审计时在其副本上取反例）。
+    pub fn law_book_snapshot(&self) -> LawBook {
+        self.laws.clone()
+    }
+
+    /// 当前律典 + 对现有事实的确定性审计（交互命令与评测共用）。
+    pub fn law_report(&self) -> String {
+        let mut book = self.laws.clone();
+        let audit = book.audit(self.predictor.triples());
+        format!("{}{}", book.render_text(), audit.render_text())
+    }
+
+    fn rebuild_laws(&mut self) {
+        let Some(registry) = &self.law_registry else {
+            self.laws = self.persisted_laws.clone().unwrap_or_default();
+            return;
+        };
+        let mut book = LawBook::from_registry(registry);
+        book.add_mined_rules(self.predictor.rules());
+        if let Some(persisted) = &self.persisted_laws {
+            book.apply_persisted(persisted);
+        }
+        self.laws = book;
     }
 
     /// 问句谓词解析：对齐器归一后，若为反向词面则返回 (槽位, true)。
@@ -3599,6 +3665,7 @@ impl SymbolicReasoner {
                 hits.push(ValueHit {
                     value: object,
                     prediction: None,
+                    law: None,
                 });
             }
         }
@@ -3614,6 +3681,7 @@ impl SymbolicReasoner {
                         hits.push(ValueHit {
                             value: value.clone(),
                             prediction: None,
+                            law: None,
                         });
                     }
                 }
@@ -3634,6 +3702,7 @@ impl SymbolicReasoner {
                     hits.push(ValueHit {
                         value,
                         prediction: Some(prediction),
+                        law: None,
                     });
                 }
             }
@@ -3642,10 +3711,189 @@ impl SymbolicReasoner {
         hits
     }
 
+    /// 主动声明律带来的查询扩展：传递闭包 / 对称反向 / 互逆反向。
+    /// 只从已观测事实做有界遍历，不调用链接预测，因此不会编造未登记取值。
+    fn law_hits(
+        &self,
+        node: &str,
+        predicate: &ChainPredicate,
+        direct_empty: bool,
+    ) -> Vec<ValueHit> {
+        let mut hits: Vec<ValueHit> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        if let Some(law) = self.laws.active_transitive(&predicate.slot) {
+            // 传递闭包：沿槽位方向逐层扩展，深度与节点数都有硬上限。
+            let mut visited: HashSet<String> = HashSet::from([node.to_string()]);
+            let mut frontier = vec![node.to_string()];
+            let mut expanded = 0usize;
+            'closure: for _ in 0..LAW_CLOSURE_MAX_DEPTH {
+                let mut next: Vec<String> = Vec::new();
+                for current in &frontier {
+                    let neighbors = if predicate.inverted {
+                        self.predictor.subjects_of(&predicate.slot, current)
+                    } else {
+                        self.predictor.objects_of(current, &predicate.slot)
+                    };
+                    for value in neighbors {
+                        if value == node || !visited.insert(value.clone()) {
+                            continue;
+                        }
+                        expanded += 1;
+                        if expanded > LAW_CLOSURE_MAX_NODES {
+                            break 'closure;
+                        }
+                        next.push(value);
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                for value in &next {
+                    if seen.insert(value.clone()) {
+                        hits.push(ValueHit {
+                            value: value.clone(),
+                            prediction: None,
+                            law: Some(law.id.clone()),
+                        });
+                    }
+                }
+                frontier = next;
+            }
+        }
+
+        if direct_empty {
+            if let Some(law) = self.laws.active_symmetric(&predicate.slot) {
+                let values = if predicate.inverted {
+                    self.predictor.objects_of(node, &predicate.slot)
+                } else {
+                    self.predictor.subjects_of(&predicate.slot, node)
+                };
+                for value in values {
+                    if value != node && seen.insert(value.clone()) {
+                        hits.push(ValueHit {
+                            value,
+                            prediction: None,
+                            law: Some(law.id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+
+        if direct_empty {
+            if let Some(other) = self.laws.inverse_partner(&predicate.slot) {
+                if let Some(law) = self.laws.active_inverse(&predicate.slot, other) {
+                    let values = if predicate.inverted {
+                        self.predictor.objects_of(node, other)
+                    } else {
+                        self.predictor.subjects_of(other, node)
+                    };
+                    for value in values {
+                        if value != node && seen.insert(value.clone()) {
+                            hits.push(ValueHit {
+                                value,
+                                prediction: None,
+                                law: Some(law.id.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        hits.sort_by(|a, b| a.value.cmp(&b.value));
+        hits
+    }
+
+    /// 链上所有谓词是否都是同一个声明的传递谓词（仅词面重复时启用闭包选路）。
+    fn is_transitive_chain(&self, predicates: &[ChainPredicate]) -> bool {
+        if predicates.len() < 2 {
+            return false;
+        }
+        let first = &predicates[0];
+        if self.laws.active_transitive(&first.slot).is_none() {
+            return false;
+        }
+        predicates.iter().all(|predicate| {
+            predicate.slot == first.slot && predicate.inverted == first.inverted
+        })
+    }
+
     fn run_chain(
         &self,
         entity: &str,
         predicates: &[ChainPredicate],
+    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+        self.run_chain_mode(entity, predicates, false)
+    }
+
+    /// 指定律闭包通道：重复传递谓词走精确步数链，其余情况回退到逐跳律扩展。
+    fn run_chain_via_laws(
+        &self,
+        entity: &str,
+        predicates: &[ChainPredicate],
+    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+        if self.is_transitive_chain(predicates) {
+            return self.run_transitive_chain_exact(entity, predicates);
+        }
+        self.run_chain_mode(entity, predicates, true)
+    }
+
+    /// 传递链的精确语义：`P(P(x))` 是恰好两跳，而不是「所有可达后代」。
+    /// 传递律在这里负责授权与归因；闭包可达性不能替代步数约束。
+    fn run_transitive_chain_exact(
+        &self,
+        entity: &str,
+        predicates: &[ChainPredicate],
+    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+        let law = self.laws.active_transitive(&predicates[0].slot)?;
+        let mut frontier = vec![entity.to_string()];
+        let mut steps: Vec<ChainStep> = Vec::new();
+        let mut last_hits: Vec<ValueHit> = Vec::new();
+        for predicate in predicates {
+            let mut next_frontier: Vec<String> = Vec::new();
+            let mut round_hits: Vec<ValueHit> = Vec::new();
+            let mut seen_values: HashSet<String> = HashSet::new();
+            for node in &frontier {
+                let mut hits = self.node_hits(node, predicate);
+                for hit in &mut hits {
+                    if hit.prediction.is_none() {
+                        hit.law = Some(law.id.clone());
+                    }
+                }
+                if hits.is_empty() {
+                    continue;
+                }
+                for hit in &hits {
+                    if seen_values.insert(hit.value.clone()) {
+                        next_frontier.push(hit.value.clone());
+                        round_hits.push(hit.clone());
+                    }
+                }
+                steps.push(ChainStep {
+                    subject: node.clone(),
+                    predicate: predicate.surface.clone(),
+                    hits,
+                });
+            }
+            if next_frontier.is_empty() {
+                return None;
+            }
+            frontier = next_frontier;
+            last_hits = round_hits;
+        }
+        if last_hits.is_empty() {
+            return None;
+        }
+        Some((steps, last_hits))
+    }
+
+    fn run_chain_mode(
+        &self,
+        entity: &str,
+        predicates: &[ChainPredicate],
+        force_closure: bool,
     ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
         if predicates.is_empty() {
             return None;
@@ -3660,7 +3908,29 @@ impl SymbolicReasoner {
             // 合并为一个即可（保留首次出现顺序）
             let mut seen_values: HashSet<String> = HashSet::new();
             for node in &frontier {
-                let hits = self.node_hits(node, predicate);
+                let direct = self.node_hits(node, predicate);
+                let hits = if force_closure || direct.is_empty() {
+                    let expanded = self.law_hits(node, predicate, direct.is_empty());
+                    if force_closure && !expanded.is_empty() {
+                        // 闭包结果优先保留律归属；直接事实只补闭包未覆盖的取值。
+                        let mut merged = expanded;
+                        let mut seen_hits: HashSet<String> =
+                            merged.iter().map(|hit| hit.value.clone()).collect();
+                        for hit in direct {
+                            if seen_hits.insert(hit.value.clone()) {
+                                merged.push(hit);
+                            }
+                        }
+                        merged.sort_by(|a, b| a.value.cmp(&b.value));
+                        merged
+                    } else if direct.is_empty() {
+                        expanded
+                    } else {
+                        direct
+                    }
+                } else {
+                    direct
+                };
                 if hits.is_empty() {
                     continue;
                 }
@@ -3741,6 +4011,14 @@ impl SymbolicReasoner {
             .iter()
             .zip(last_hits.iter())
             .any(|(a, b)| !std::ptr::eq(*a, b));
+        // 只复述真正用到的律；直接事实不冒充「推理得出」。
+        let law_notes: Vec<String> = last_hits
+            .iter()
+            .filter_map(|hit| hit.law.as_deref())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|id| self.laws.explain(id))
+            .collect();
         let chain_text = format!(
             "{} 的 {}",
             entity,
@@ -3778,6 +4056,10 @@ impl SymbolicReasoner {
                     "\n  推理依据：{}",
                     self.predictor.explain(prediction)
                 ));
+            } else if let Some(law_id) = &hit.law {
+                if let Some(explain) = self.laws.explain(law_id) {
+                    output.push_str(&format!("\n  推理依据：{}", explain));
+                }
             }
         } else {
             for (index, hit) in ordered.iter().enumerate() {
@@ -3811,6 +4093,9 @@ impl SymbolicReasoner {
                     output.push_str(&format!("  推理依据：{}", evidence.join("；")));
                 }
             }
+            if !law_notes.is_empty() {
+                output.push_str(&format!("  推理依据：{}\n", law_notes.join("；")));
+            }
             if reordered {
                 output.push_str(&format!(
                     "\n  说明：已按问题期望的答案类型（{}）优先排序。",
@@ -3829,7 +4114,19 @@ impl SymbolicReasoner {
                 if predicates.is_empty() {
                     return None;
                 }
-                if let Some((steps, last_hits)) = self.run_chain(&entity, &predicates) {
+                let chain_result = if self.is_transitive_chain(&predicates) {
+                    // 重复的传递谓词：用 Closure 算子压缩链，trace 会引用该律。
+                    self.run_chain_via_laws(&entity, &predicates)
+                } else {
+                    self.run_chain(&entity, &predicates).or_else(|| {
+                        if self.laws.has_inference_laws() {
+                            self.run_chain_via_laws(&entity, &predicates)
+                        } else {
+                            None
+                        }
+                    })
+                };
+                if let Some((steps, last_hits)) = chain_result {
                     return Some(self.generate_find_object(
                         &entity,
                         &predicates,
@@ -3967,14 +4264,32 @@ impl SymbolicReasoner {
             ));
         }
 
-        if let Some((steps, last_hits)) = self.run_chain(&entity, &intermediate) {
+        let mut chain_result = self.run_chain(&entity, &intermediate);
+        let need_laws = self.laws.has_inference_laws()
+            && chain_result.as_ref().map_or(true, |(_, hits)| {
+                !hits.iter().any(|hit| hit.value == object)
+            });
+        if need_laws {
+            if let Some(expanded) = self.run_chain_via_laws(&entity, &intermediate) {
+                chain_result = Some(expanded);
+            }
+        }
+        if let Some((steps, last_hits)) = chain_result {
             if let Some(hit) = last_hits.iter().find(|hit| hit.value == object) {
                 let step = steps.last()?;
                 return Some(match &hit.prediction {
-                    None => format!(
-                        "是的。根据知识图谱：{} 的 {} 是 {}。",
-                        step.subject, step.predicate, object
-                    ),
+                    None => match &hit.law {
+                        Some(law_id) => format!(
+                            "是的。{}",
+                            self.laws.explain(law_id).unwrap_or_else(|| {
+                                format!("根据知识图谱：{} 的 {} 是 {}。", step.subject, step.predicate, object)
+                            })
+                        ),
+                        None => format!(
+                            "是的。根据知识图谱：{} 的 {} 是 {}。",
+                            step.subject, step.predicate, object
+                        ),
+                    },
                     Some(prediction) => format!(
                         "很可能是的（符号推断）。{}",
                         self.predictor.explain(prediction)
@@ -8525,6 +8840,144 @@ mod tests {
         assert_eq!(
             forked.answer("张三的师傅是谁"),
             used.answer("张三的师傅是谁")
+        );
+    }
+
+    fn transitive_registry(predicate: &str, symmetric: bool) -> crate::predicate_registry::PredicateRegistry {
+        use crate::predicate_registry::{PredicateProfileConfig, PredicateRegistry};
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&PredicateProfileConfig {
+            name: predicate.to_string(),
+            transitive: !symmetric,
+            symmetric,
+            ..Default::default()
+        });
+        registry
+    }
+
+    fn inverse_registry() -> crate::predicate_registry::PredicateRegistry {
+        use crate::predicate_registry::{PredicateProfileConfig, PredicateRegistry};
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&PredicateProfileConfig {
+            name: "师傅".to_string(),
+            inverse: Some("徒弟".to_string()),
+            ..Default::default()
+        });
+        registry.declare(&PredicateProfileConfig {
+            name: "徒弟".to_string(),
+            inverse: Some("师傅".to_string()),
+            ..Default::default()
+        });
+        registry
+    }
+
+    /// 重复的传递谓词由 Closure 算子压缩，回答必须引用具体定律。
+    #[test]
+    fn law_closure_answers_repeated_transitive_chain() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "上司".to_string(),
+                to: "乙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "丙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丁".to_string(),
+            },
+        ]);
+        reasoner.configure_laws(&transitive_registry("上司", false));
+
+        let answer = reasoner
+            .answer("甲的上司的上司的上司是谁")
+            .expect("传递律应支持重复谓词链");
+        assert!(answer.contains("丁"), "{}", answer);
+        assert!(answer.contains("推理依据"), "{}", answer);
+        assert!(answer.contains("传递律"), "{}", answer);
+        assert!(answer.contains("law:transitive:上司"), "{}", answer);
+
+        // 两跳问句必须恰好两跳：不能把三跳才可达的「丁」也算进来。
+        let two_hops = reasoner
+            .answer("甲的上司的上司是谁")
+            .expect("两跳链应有答案");
+        assert!(two_hops.contains("丙"), "{}", two_hops);
+        assert!(!two_hops.contains("丁"), "{}", two_hops);
+    }
+
+    /// 对称律补足单向事实：反向问句不再答「没有记录」，且说明依据。
+    #[test]
+    fn symmetric_law_recovers_reverse_direction() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "配偶".to_string(),
+            to: "李四".to_string(),
+        }]);
+        reasoner.configure_laws(&transitive_registry("配偶", true));
+
+        let answer = reasoner
+            .answer("李四的配偶是谁")
+            .expect("对称律应恢复反向命中");
+        assert!(answer.contains("张三"), "{}", answer);
+        assert!(answer.contains("对称律"), "{}", answer);
+
+        let check = reasoner
+            .answer("李四的配偶是张三吗")
+            .expect("校验问句也应使用对称律");
+        assert!(check.starts_with("是的"), "{}", check);
+        assert!(check.contains("对称律"), "{}", check);
+    }
+
+    /// 持久化账本的退役决定必须压过配置声明，并在后续知识重建中保持。
+    #[test]
+    fn persisted_retirement_disables_inverse_law_and_survives_rebuild() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "李四".to_string(),
+        }]);
+        reasoner.configure_laws(&inverse_registry());
+
+        let before = reasoner
+            .answer("李四的徒弟是谁")
+            .expect("声明互逆律应支持反向问句");
+        assert!(before.contains("张三"), "{}", before);
+
+        let mut persisted = LawBook::from_registry(&inverse_registry());
+        assert!(persisted.retire("law:inverse:师傅|徒弟"));
+        assert!(reasoner.load_persisted_laws(persisted) >= 1);
+
+        let after = reasoner.answer("李四的徒弟是谁");
+        assert!(
+            after.as_deref().map_or(true, |text| !text.contains("张三")),
+            "{:?}",
+            after
+        );
+
+        // 新事实触发缓存重建，退役决定不能被重建冲掉。
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "王五".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "赵六".to_string(),
+        }]);
+        let rebuilt = reasoner.answer("李四的徒弟是谁");
+        assert!(
+            rebuilt.as_deref().map_or(true, |text| !text.contains("张三")),
+            "{:?}",
+            rebuilt
         );
     }
 }

@@ -54,6 +54,8 @@ use know_prolog::{
     },
     prompt_spec::{self, LintSeverity, PromptMode},
     config_contract,
+    law_book::LawBook,
+    link_prediction::{LinkPredictor, Triple as LawTriple},
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
 };
 
@@ -186,6 +188,22 @@ enum Commands {
         /// Also fail (exit code) on warnings
         #[arg(long)]
         strict: bool,
+    },
+    /// Audit the semantic law ledger: declared predicate laws + mined rules,
+    /// with functional-violation and closure-gap counters
+    Laws {
+        /// Print the ledger and audit as JSON
+        #[arg(long)]
+        json: bool,
+        /// Persist the ledger to `<store>/law_book.json` (explicit adoption artifact)
+        #[arg(long)]
+        save: bool,
+        /// Explicitly adopt a law id (repeatable); requires --save to persist
+        #[arg(long = "adopt", value_name = "LAW_ID")]
+        adopt: Vec<String>,
+        /// Explicitly retire a law id (repeatable); requires --save to persist
+        #[arg(long = "retire", value_name = "LAW_ID")]
+        retire: Vec<String>,
     },
     /// Build the data quality passport (deterministic entity scores + gaps)
     /// with a corpus-digest regression ratchet
@@ -499,6 +517,98 @@ async fn main() {
                     eprintln!("SPARQL 查询失败: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Some(Commands::Laws {
+            json,
+            save,
+            adopt,
+            retire,
+        }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            if let Err(e) = oxigraph_manager.refresh_predicate_registry().await {
+                eprintln!("刷新谓词画像失败: {}", e);
+                std::process::exit(1);
+            }
+            let relations = match oxigraph_manager.load_all_relations().await {
+                Ok(relations) => relations,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let triples: Vec<LawTriple> = relations
+                .iter()
+                .filter_map(|fact| match fact {
+                    PrologFact::Relation { from, rel_type, to } => {
+                        Some(LawTriple::new(from, rel_type, to))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut predictor = LinkPredictor::new();
+            for triple in &triples {
+                predictor.add_triple(&triple.subject, &triple.predicate, &triple.object);
+            }
+            predictor.mine_rules(
+                config.reasoning.link_prediction_min_support,
+                config.reasoning.link_prediction_min_confidence,
+            );
+            let registry = oxigraph_manager.predicate_registry_snapshot();
+            let path = format!("{}/law_book.json", store_path);
+            let mut book = LawBook::from_registry(&registry);
+            if let Some(persisted) = LawBook::load_from_path(&path) {
+                let changed = book.apply_persisted(&persisted);
+                if changed > 0 && !json {
+                    eprintln!("载入持久化律典：{} 条显式决定生效", changed);
+                }
+            }
+            book.add_mined_rules(predictor.rules());
+
+            let mut unknown: Vec<&str> = Vec::new();
+            for id in adopt.iter().chain(retire.iter()) {
+                if book.law(id).is_none() {
+                    unknown.push(id);
+                }
+            }
+            if !unknown.is_empty() {
+                eprintln!("未知定律 id：{}", unknown.join(", "));
+                std::process::exit(1);
+            }
+            let adopted = adopt.iter().filter(|id| book.adopt(id)).count();
+            let retired = retire.iter().filter(|id| book.retire(id)).count();
+            if (adopted > 0 || retired > 0) && !save {
+                eprintln!("提示：未加 --save，采纳/退役决定仅在本次运行生效");
+            }
+            let audit = book.audit(&triples);
+            if save {
+                match book.save_to_path(&path) {
+                    Ok(()) => eprintln!(
+                        "律典已写入 {}（采纳 {} 条，退役 {} 条）",
+                        path, adopted, retired
+                    ),
+                    Err(e) => {
+                        eprintln!("律典写入失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            if json {
+                let payload = serde_json::json!({ "book": &book, "audit": &audit });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("律典序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print!("{}{}", book.render_text(), audit.render_text());
             }
         }
         Some(Commands::Eval {
@@ -1349,6 +1459,10 @@ async fn run_interactive_mode(
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
     sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+    // 律典：显式采纳/退役决定跨重启生效；缺失文件不影响声明律。
+    if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+        symbolic_reasoner.load_persisted_laws(persisted);
+    }
     // 实体身份：已确认的持久别名同步进链接器（别名与规范名同权）
     sync_entity_aliases(&mut symbolic_reasoner, &oxigraph_manager);
     // 导入日志：跨重启的有界撤销栈
@@ -2790,6 +2904,20 @@ async fn run_interactive_mode(
             }
             println!("{}", oxigraph_manager.predicate_registry_report());
             let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+            println!();
+            continue;
+        }
+
+        // 律典：声明律 + 挖掘规则的统一台账，附确定性审计（矛盾/缺口分开）
+        if matches!(input, "律典" | "定律台账" | "语义定律" | "law-report") {
+            if let Err(e) = oxigraph_manager.refresh_predicate_registry().await {
+                eprintln!("刷新谓词画像失败: {}", e);
+            }
+            sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+                symbolic_reasoner.load_persisted_laws(persisted);
+            }
+            println!("{}", symbolic_reasoner.law_report());
             println!();
             continue;
         }
@@ -4393,7 +4521,7 @@ fn interactive_help() -> String {
         "",
         "台账与报告",
         "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
-        "  身份台账 / 谓词报告 / 类型体系        实体身份、谓词画像与类型格",
+        "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
         "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
         "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
@@ -4704,6 +4832,10 @@ fn is_command_like(input: &str) -> bool {
         "谓词画像",
         "谓词注册表",
         "谓词列表",
+        "律典",
+        "定律台账",
+        "语义定律",
+        "law-report",
         "登记别名",
         "登记逆谓词",
         "功能谓词",
@@ -4888,6 +5020,8 @@ fn sync_predicate_pairs(reasoner: &mut SymbolicReasoner, oxigraph_manager: &Oxig
             reasoner.register_predicate_alias(&surface, &slot);
         }
     }
+    // 谓词画像的显式声明同步进律典：传递/对称/互逆律从此进入查询选路。
+    reasoner.configure_laws(&oxigraph_manager.predicate_registry_snapshot());
 }
 
 /// 把实体身份注册表里已确认的持久别名同步进链接器（别名与规范名同权）。

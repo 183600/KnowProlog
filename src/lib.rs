@@ -52,6 +52,7 @@ pub mod logic_program;
 pub mod dialogue_manager;
 pub mod holographic_memory;
 pub mod predicate_registry;
+pub mod law_book;
 pub mod perf_ledger;
 pub mod startup_ledger;
 pub mod cache;
