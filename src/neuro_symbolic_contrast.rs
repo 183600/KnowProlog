@@ -641,7 +641,7 @@ impl ContrastArbiter {
 
         // 用户否认过该原子：作为会话级否证进入符号通道（除非知识图谱/规则已证实它）。
         // 这正是纯符号的"从反馈中校准"：一次否认即成为可持久化的负事实，
-        // 此后同一陈述会被逻辑通道判为不成立，而不仅是屏蔽联想通道。
+        // 同一陈述在逻辑通道会被判为不成立（不止于联想通道的屏蔽）。
         if !reading.proved && !reading.contradicted && !negated {
             if let Some(atom) = &reading.atom {
                 if self.refuted_atoms.contains(&atom.display()) {

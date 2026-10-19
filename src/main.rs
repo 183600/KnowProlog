@@ -4956,7 +4956,7 @@ mod session_tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// 新命令必须被 is_command_like 识别，避免澄清追问时被吞掉
+    /// 各命令必须被 is_command_like 识别，避免澄清追问时被吞掉
     #[test]
     fn command_like_covers_journal_and_perf_commands() {
         for command in [
