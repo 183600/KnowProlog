@@ -64,6 +64,9 @@ use know_prolog::{
     law_book::LawBook,
     link_prediction::{LinkPredictor, Triple as LawTriple},
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
+    knowledge_fusion::{
+        Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel,
+    },
 };
 
 #[derive(Parser)]
@@ -211,6 +214,41 @@ enum Commands {
         /// Explicitly retire a law id (repeatable); requires --save to persist
         #[arg(long = "retire", value_name = "LAW_ID")]
         retire: Vec<String>,
+    },
+    /// Inspect the knowledge-fusion view over source namespaces (corroboration
+    /// and quarantined conflicts); `--apply` materializes winners into the
+    /// default graph, `--prefer PREDICATE=NAMESPACE` records an adjudication
+    Fuse {
+        /// Materialize the fusion view into the default graph
+        #[arg(long)]
+        apply: bool,
+        /// Record an adjudication `PREDICATE=NAMESPACE` (repeatable)
+        #[arg(long = "prefer", value_name = "PREDICATE=NAMESPACE")]
+        prefer: Vec<String>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import an RDF file into a named source namespace: raw assertions stay in
+    /// their own named graph, the default graph is untouched until `fuse --apply`
+    Namespace {
+        /// Namespace id (IRI-safe slug), e.g. "alice" or "batch-2026-10"
+        #[arg(long)]
+        source: String,
+        /// Human-readable source label (defaults to the namespace id)
+        #[arg(long)]
+        label: Option<String>,
+        /// Trust level: verified / curated / imported / external / speculative
+        #[arg(long, default_value = "imported")]
+        trust: String,
+        /// Namespace kind: global / import / session / hypothesis
+        #[arg(long, default_value = "import")]
+        kind: String,
+        /// RDF file path (.ttl / .nt / .nq / .trig / .rdf / .xml)
+        file_path: String,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Build the data quality passport (deterministic entity scores + gaps)
     /// with a corpus-digest regression ratchet
@@ -803,6 +841,39 @@ async fn main() {
                 }
             }
         }
+        Some(Commands::Fuse {
+            apply,
+            prefer,
+            json,
+        }) => {
+            if let Err(e) = run_fuse(&oxigraph_manager, &config, apply, &prefer, json).await {
+                eprintln!("知识融合失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Namespace {
+            source,
+            label,
+            trust,
+            kind,
+            file_path,
+            json,
+        }) => {
+            if let Err(e) = run_namespace_import(
+                &oxigraph_manager,
+                &source,
+                label.as_deref(),
+                &trust,
+                &kind,
+                &file_path,
+                json,
+            )
+            .await
+            {
+                eprintln!("命名空间导入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Artifacts { fix, json, paths }) => {
             run_artifact_audit(&config, &store_path, fix, json, &paths);
         }
@@ -1179,6 +1250,162 @@ fn run_artifact_audit(
     if damaged > 0 || non_canonical > 0 || repairable > 0 {
         std::process::exit(1);
     }
+}
+
+/// 配置声明的功能谓词（融合冲突判定的默认策略来源）。
+fn functional_predicates(config: &know_prolog::SystemConfig) -> Vec<String> {
+    config
+        .predicate_profiles
+        .iter()
+        .filter(|profile| profile.functional)
+        .map(|profile| profile.name.clone())
+        .collect()
+}
+
+/// `namespace`：把 RDF 文件导入命名空间源图（默认图不动）。
+async fn run_namespace_import(
+    manager: &OxigraphManager,
+    source: &str,
+    label: Option<&str>,
+    trust: &str,
+    kind: &str,
+    file_path: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let trust = TrustLevel::parse(trust).ok_or_else(|| {
+        format!(
+            "未知信任层级：{}（可用 verified / curated / imported / external / speculative）",
+            trust
+        )
+    })?;
+    let kind = NamespaceKind::parse(kind).ok_or_else(|| {
+        format!(
+            "未知命名空间种类：{}（可用 global / import / session / hypothesis）",
+            kind
+        )
+    })?;
+    let format = OxigraphManager::detect_rdf_format(file_path)?;
+    let file = std::fs::File::open(file_path)?;
+    let parser = oxigraph::io::RdfParser::from_format(format).for_reader(file);
+
+    let mut assertions = Vec::new();
+    let mut skipped = 0usize;
+    for quad in parser {
+        let quad = quad.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("解析 RDF 失败：{}", error).into()
+        })?;
+        match OxigraphManager::assertion_from_rdf_quad(&quad, source, file_path) {
+            Some(assertion) => assertions.push(assertion),
+            None => skipped += 1,
+        }
+    }
+
+    let namespace = NamespaceRecord::new(source, label.unwrap_or(source), kind, trust);
+    let added = manager
+        .record_namespace_assertions(&namespace, &assertions)
+        .await?;
+
+    if json {
+        let report = serde_json::json!({
+            "namespace": namespace.id,
+            "label": namespace.label,
+            "trust": namespace.trust.label_zh(),
+            "kind": namespace.kind.label_zh(),
+            "graph": namespace.graph_iri(),
+            "parsed": assertions.len(),
+            "added": added,
+            "skipped": skipped,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "命名空间 {}（{}，{}，{}）",
+            namespace.id,
+            namespace.label,
+            namespace.kind.label_zh(),
+            namespace.trust.label_zh()
+        );
+        println!("  源图：{}", namespace.graph_iri());
+        println!(
+            "  解析 {} 条断言（跳过 {}），新增源图四元组 {}",
+            assertions.len(),
+            skipped,
+            added
+        );
+        println!("  默认图未改动；用 `fuse --apply` 物化融合视图");
+    }
+    Ok(())
+}
+
+/// `fuse`：预览 / 物化融合视图，并记录显式裁决。
+async fn run_fuse(
+    manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+    apply: bool,
+    prefer: &[String],
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut ledger = manager.load_fusion_ledger().await?;
+
+    let mut recorded = Vec::new();
+    for spec in prefer {
+        let Some((predicate, namespace)) = spec.split_once('=') else {
+            return Err(format!("裁决格式应为 谓词=命名空间：{}", spec).into());
+        };
+        let predicate = predicate.trim();
+        let namespace = namespace.trim();
+        if predicate.is_empty() || namespace.is_empty() {
+            return Err(format!("裁决格式应为 谓词=命名空间：{}", spec).into());
+        }
+        let namespace_id = know_prolog::knowledge_fusion::sanitize_namespace_id(namespace);
+        if ledger.namespace(&namespace_id).is_none() {
+            return Err(format!(
+                "命名空间「{}」不在账本中：先导入来源，再写裁决",
+                namespace
+            )
+            .into());
+        }
+        let adjudication = Adjudication::new(predicate, &namespace_id, "命令行裁决", "user");
+        ledger.record_adjudication(adjudication.clone());
+        recorded.push(adjudication);
+    }
+    if !recorded.is_empty() {
+        ledger.sort_and_dedup();
+        manager.sync_fusion_ledger(&ledger).await?;
+    }
+
+    let policy = FusionPolicy::new().with_functional(functional_predicates(config));
+    let (plan, inserted, removed) = if apply {
+        let outcome = manager.apply_fusion(&policy).await?;
+        (outcome.plan, outcome.inserted, outcome.removed)
+    } else {
+        (manager.fusion_plan(&policy).await?, 0, 0)
+    };
+    if apply {
+        ledger = manager.load_fusion_ledger().await?;
+    }
+
+    if json {
+        let report = serde_json::json!({
+            "namespaces": ledger.namespaces,
+            "assertions": ledger.assertions.len(),
+            "adjudications": ledger.adjudications,
+            "applied": ledger.applied.len(),
+            "inserted": inserted,
+            "removed": removed,
+            "plan": plan,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", ledger.render_zh());
+        println!("{}", plan.render_zh());
+        if apply {
+            println!("已物化：写入 {} 条，回收 {} 条", inserted, removed);
+        } else {
+            println!("（预览模式：加 --apply 才会写入默认图）");
+        }
+    }
+    Ok(())
 }
 
 /// `prompt-lint`：校验提示资产注册表；存在 Error 时以非零码退出。
@@ -3868,6 +4095,79 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 知识融合：来源命名空间视图（只读，不写默认图）
+        if matches!(input, "融合" | "融合视图" | "知识融合" | "来源台账") {
+            match oxigraph_manager.load_fusion_ledger().await {
+                Ok(ledger) => println!("{}", ledger.render_zh()),
+                Err(e) => println!("读取融合账本失败：{}", e),
+            }
+            match oxigraph_manager
+                .fusion_plan(&FusionPolicy::new().with_functional(functional_predicates(&config)))
+                .await
+            {
+                Ok(plan) => println!("{}", plan.render_zh()),
+                Err(e) => println!("计算融合视图失败：{}", e),
+            }
+            println!();
+            continue;
+        }
+
+        // 知识融合物化：把当前视图的赢家写入默认图（可重复执行，幂等）
+        if matches!(input, "融合应用" | "物化融合" | "应用融合") {
+            match oxigraph_manager
+                .apply_fusion(&FusionPolicy::new().with_functional(functional_predicates(&config)))
+                .await
+            {
+                Ok(outcome) => {
+                    println!("{}", outcome.plan.render_zh());
+                    println!(
+                        "已物化：写入 {} 条，回收 {} 条",
+                        outcome.inserted, outcome.removed
+                    );
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                }
+                Err(e) => println!("融合物化失败：{}", e),
+            }
+            println!();
+            continue;
+        }
+
+        // 显式裁决：裁决：谓词=来源（只影响声明的槽位，可审计）
+        if let Some(body) = strip_any_prefix(input, &["裁决：", "裁决:"]) {
+            match parse_alias_link(body) {
+                Some((predicate, namespace)) => {
+                    let namespace_id =
+                        know_prolog::knowledge_fusion::sanitize_namespace_id(namespace);
+                    match oxigraph_manager.load_fusion_ledger().await {
+                        Ok(mut ledger) if ledger.namespace(&namespace_id).is_some() => {
+                            ledger.record_adjudication(Adjudication::new(
+                                predicate,
+                                &namespace_id,
+                                "交互裁决",
+                                "user",
+                            ));
+                            ledger.sort_and_dedup();
+                            match oxigraph_manager.sync_fusion_ledger(&ledger).await {
+                                Ok(_) => println!(
+                                    "已记录裁决：{} 优先来源 {}（「融合应用」后生效）",
+                                    predicate, namespace_id
+                                ),
+                                Err(e) => println!("裁决保存失败：{}", e),
+                            }
+                        }
+                        Ok(_) => println!(
+                            "命名空间「{}」不在账本中：先用 `namespace` 子命令导入来源",
+                            namespace
+                        ),
+                        Err(e) => println!("读取融合账本失败：{}", e),
+                    }
+                }
+                None => println!("裁决格式：裁决：谓词=来源，例如「裁决：年龄=friend」"),
+            }
+            println!();
+            continue;
+        }
+
         // 溯因·假设生成：后向链失败前沿 → 候选假设（可证明则直接给证明）
         if let Some(target) = strip_any_prefix(
             input,
@@ -5250,6 +5550,7 @@ fn interactive_help() -> String {
         "  形状报告 / 形状校验                  必备属性、基数、类型与定义域/值域校验",
         "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
         "  外链台账 / 图账本                     外部知识留册与命名图物化视图",
+        "  融合 / 融合应用 / 裁决：谓词=来源     多来源融合视图、物化与显式裁决",
         "  配置契约 / 配置体检                   config.toml 引用/能力/阈值静态检查",
         "",
         "证明与视图",

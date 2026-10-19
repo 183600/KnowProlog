@@ -69,6 +69,7 @@ pub mod view_render;
 pub mod embedding_eval;
 pub mod function_words;
 pub mod graph_ledger;
+pub mod knowledge_fusion;
 pub mod dialogue_eval;
 pub mod serve_api;
 pub mod bindings;
@@ -3283,6 +3284,318 @@ impl OxigraphManager {
         self.perf.bump("derived_ledger_load");
         Ok(graph_ledger::parse_derived_graph(quads.into_iter()))
     }
+
+    // ------------------------------------------------------------------
+    // 知识融合：命名空间源图 + 融合账本 + 受审默认视图
+    // ------------------------------------------------------------------
+
+    /// 断言谓词 → RDF 谓词 IRI：`type` 归一到 rdf:type，外部 IRI 原样保留，
+    /// 其余按 `BASE_NS` 展开。
+    fn assertion_predicate_iri(predicate: &str) -> String {
+        if predicate == "type" {
+            format!("{}type", RDF_NS)
+        } else if predicate.starts_with("http://") || predicate.starts_with("https://") {
+            predicate.to_string()
+        } else {
+            format!("{}{}", BASE_NS, predicate)
+        }
+    }
+
+    /// 断言宾语 → 实体 IRI：外部 IRI 原样保留，其余编码为 `kg:entity/...`。
+    fn assertion_object_iri(object: &str) -> String {
+        if object.starts_with("http://") || object.starts_with("https://") {
+            object.to_string()
+        } else {
+            crate::identity::entity_uri(BASE_NS, object)
+        }
+    }
+
+    /// 把命名空间断言编码为四元组（写源图或默认图共用）。
+    fn assertion_quad(
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        object_kind: knowledge_fusion::ObjectKind,
+        graph: GraphName,
+    ) -> Result<Quad, Box<dyn std::error::Error + Send + Sync>> {
+        let subject_node = NamedNode::new(crate::identity::entity_uri(BASE_NS, subject))?;
+        let predicate_node = NamedNode::new(Self::assertion_predicate_iri(predicate))?;
+        let object_term = match object_kind {
+            knowledge_fusion::ObjectKind::Literal => {
+                Term::Literal(Literal::new_simple_literal(object))
+            }
+            knowledge_fusion::ObjectKind::Entity => {
+                let iri = if predicate == "type" && !object.starts_with("http") {
+                    format!("{}{}", BASE_NS, object)
+                } else {
+                    Self::assertion_object_iri(object)
+                };
+                Term::NamedNode(NamedNode::new(iri)?)
+            }
+        };
+        Ok(Quad::new(subject_node, predicate_node, object_term, graph))
+    }
+
+    /// 从 RDF 四元组构造命名空间断言（`import namespace` 的解析辅助）：
+    /// `rdf:type` 归一为谓词 `type`，kg 词面还原为本地名，外部 IRI 原样保留；
+    /// 空白节点主语或词表宾语返回 None（不猜测）。
+    pub fn assertion_from_rdf_quad(
+        quad: &Quad,
+        namespace: &str,
+        source: &str,
+    ) -> Option<knowledge_fusion::ScopedAssertion> {
+        let subject = match &quad.subject {
+            Subject::NamedNode(node) => {
+                crate::identity::entity_local_name(BASE_NS, node.as_str())
+                    .or_else(|| crate::identity::local_name(BASE_NS, node.as_str()))
+                    .unwrap_or_else(|| node.as_str().to_string())
+            }
+            _ => return None,
+        };
+        let predicate_iri = quad.predicate.as_str();
+        let predicate = if predicate_iri == format!("{}type", RDF_NS) {
+            "type".to_string()
+        } else {
+            crate::identity::local_name(BASE_NS, predicate_iri)
+                .unwrap_or_else(|| predicate_iri.to_string())
+        };
+        let (object, object_kind) = match &quad.object {
+            Term::NamedNode(node) => {
+                let iri = node.as_str();
+                let name = crate::identity::entity_local_name(BASE_NS, iri)
+                    .or_else(|| crate::identity::local_name(BASE_NS, iri))
+                    .unwrap_or_else(|| iri.to_string());
+                (name, knowledge_fusion::ObjectKind::Entity)
+            }
+            Term::Literal(literal) => (
+                literal.value().to_string(),
+                knowledge_fusion::ObjectKind::Literal,
+            ),
+            _ => return None,
+        };
+        Some(knowledge_fusion::ScopedAssertion::new(
+            namespace, &subject, &predicate, &object, object_kind, source,
+        ))
+    }
+
+    /// 从融合命名图读取账本（不触碰缓存，供持锁内部调用）。
+    fn fusion_ledger_from_store(
+        store: &Store,
+    ) -> Result<knowledge_fusion::FusionLedger, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(knowledge_fusion::FUSION_GRAPH)?);
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(knowledge_fusion::parse_fusion_graph(quads.into_iter()))
+    }
+
+    /// 全量重写融合账本命名图（幂等；不推进知识版本）。
+    fn sync_fusion_ledger_locked(
+        &self,
+        store: &Store,
+        ledger: &knowledge_fusion::FusionLedger,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = knowledge_fusion::fusion_quads(ledger)?;
+        let graph = GraphName::NamedNode(NamedNode::new(knowledge_fusion::FUSION_GRAPH)?);
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("fusion_ledger_sync");
+        Ok(ledger.assertions.len())
+    }
+
+    /// 全量重写融合账本（幂等；默认图与知识版本不变）。
+    pub async fn sync_fusion_ledger(
+        &self,
+        ledger: &knowledge_fusion::FusionLedger,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        self.sync_fusion_ledger_locked(&store, ledger)
+    }
+
+    /// 读取融合账本（按 id 排序去重，确定性）。
+    pub async fn load_fusion_ledger(
+        &self,
+    ) -> Result<knowledge_fusion::FusionLedger, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let ledger = Self::fusion_ledger_from_store(&store)?;
+        self.perf.bump("fusion_ledger_load");
+        Ok(ledger)
+    }
+
+    /// 把断言写入命名空间源图，并记入融合账本。
+    ///
+    /// 源图与账本都是命名图：默认图不变、知识版本不推进，因此现有回答路径
+    /// 与缓存不受影响；返回本次新增的源图四元组数（重复导入计 0）。
+    pub async fn record_namespace_assertions(
+        &self,
+        namespace: &knowledge_fusion::NamespaceRecord,
+        assertions: &[knowledge_fusion::ScopedAssertion],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let graph = GraphName::NamedNode(NamedNode::new(namespace.graph_iri())?);
+        let mut added = 0usize;
+        for assertion in assertions {
+            let quad = Self::assertion_quad(
+                &assertion.subject,
+                &assertion.predicate,
+                &assertion.object,
+                assertion.object_kind,
+                graph.clone(),
+            )?;
+            if store.insert(&quad)? {
+                added += 1;
+            }
+        }
+        let mut ledger = Self::fusion_ledger_from_store(&store)?;
+        ledger.upsert_namespace(namespace.clone());
+        for assertion in assertions {
+            ledger.record_assertion(assertion.clone());
+        }
+        ledger.sort_and_dedup();
+        self.sync_fusion_ledger_locked(&store, &ledger)?;
+        self.perf.bump("namespace_assertions");
+        Ok(added)
+    }
+
+    /// 设置命名空间状态（启用 / 隔离 / 退役）；返回是否存在该命名空间。
+    ///
+    /// 只改融合账本元数据：源图证据与默认图都不动，退役后可随时恢复。
+    pub async fn set_namespace_status(
+        &self,
+        namespace: &str,
+        status: knowledge_fusion::NamespaceStatus,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let mut ledger = Self::fusion_ledger_from_store(&store)?;
+        let id = knowledge_fusion::sanitize_namespace_id(namespace);
+        let Some(record) = ledger
+            .namespaces
+            .iter_mut()
+            .find(|record| record.id == id)
+        else {
+            return Ok(false);
+        };
+        record.status = status;
+        ledger.sort_and_dedup();
+        self.sync_fusion_ledger_locked(&store, &ledger)?;
+        Ok(true)
+    }
+
+    /// 按策略计算融合计划（只读，不写默认图）。
+    pub async fn fusion_plan(
+        &self,
+        policy: &knowledge_fusion::FusionPolicy,
+    ) -> Result<knowledge_fusion::FusionPlan, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        Ok(self.fusion_plan_locked(&store, policy)?.1)
+    }
+
+    fn fusion_plan_locked(
+        &self,
+        store: &Store,
+        policy: &knowledge_fusion::FusionPolicy,
+    ) -> Result<
+        (
+            knowledge_fusion::FusionLedger,
+            knowledge_fusion::FusionPlan,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let ledger = Self::fusion_ledger_from_store(store)?;
+        let plan = knowledge_fusion::fusion_plan(
+            &ledger.namespaces,
+            &ledger.assertions,
+            &ledger.adjudications,
+            policy,
+            |subject, predicate, object, object_kind| {
+                match Self::assertion_quad(
+                    subject,
+                    predicate,
+                    object,
+                    object_kind,
+                    GraphName::DefaultGraph,
+                ) {
+                    Ok(quad) => store.contains(&quad).unwrap_or(false),
+                    Err(_) => false,
+                }
+            },
+        );
+        Ok((ledger, plan))
+    }
+
+    /// 把融合视图物化进默认图：写入赢家、回收被替换的旧赢家。
+    ///
+    /// 只回收本账本 `applied` 记录过的赢家，绝不触碰未纳入融合的历史数据；
+    /// 默认图确有变化才推进知识版本，重复融合幂等。
+    pub async fn apply_fusion(
+        &self,
+        policy: &knowledge_fusion::FusionPolicy,
+    ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let (mut ledger, plan) = self.fusion_plan_locked(&store, policy)?;
+        let winners = plan.materialize_keys();
+
+        let mut removed = 0usize;
+        for previous in &ledger.applied {
+            if winners.contains(&(
+                previous.subject.clone(),
+                previous.predicate.clone(),
+                previous.object.clone(),
+                previous.object_kind,
+            )) {
+                continue;
+            }
+            let quad = Self::assertion_quad(
+                &previous.subject,
+                &previous.predicate,
+                &previous.object,
+                previous.object_kind,
+                GraphName::DefaultGraph,
+            )?;
+            if store.remove(&quad)? {
+                removed += 1;
+            }
+        }
+
+        let mut inserted = 0usize;
+        for assertion in &plan.materialize {
+            let quad = Self::assertion_quad(
+                &assertion.subject,
+                &assertion.predicate,
+                &assertion.object,
+                assertion.object_kind,
+                GraphName::DefaultGraph,
+            )?;
+            if store.insert(&quad)? {
+                inserted += 1;
+            }
+        }
+
+        ledger.set_applied(
+            plan.materialize
+                .iter()
+                .map(knowledge_fusion::AppliedWinner::from_assertion)
+                .collect(),
+        );
+        ledger.sort_and_dedup();
+        self.sync_fusion_ledger_locked(&store, &ledger)?;
+        if inserted + removed > 0 {
+            self.bump_revision();
+        }
+        self.perf.bump("fusion_apply");
+        Ok(knowledge_fusion::FusionApplyOutcome {
+            plan,
+            inserted,
+            removed,
+        })
+    }
 }
 
 pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String> {
@@ -4317,5 +4630,306 @@ mod cache_tests {
         let error = manager.export_rdf_file(path.to_str().unwrap()).await;
         assert!(error.is_err());
         assert!(error.unwrap_err().to_string().contains("识别"));
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use crate::knowledge_fusion::{
+        Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, NamespaceStatus, ObjectKind,
+        ScopedAssertion, TrustLevel,
+    };
+    use crate::perf_ledger::PerfLedger;
+
+    async fn temp_manager() -> (OxigraphManager, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = OxigraphManager::with_perf_ledger(
+            dir.path().to_str().unwrap(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        (manager, dir)
+    }
+
+    fn ns(id: &str, trust: TrustLevel) -> NamespaceRecord {
+        NamespaceRecord::new(id, id, NamespaceKind::Import, trust)
+    }
+
+    fn literal(namespace: &str, subject: &str, predicate: &str, object: &str) -> ScopedAssertion {
+        ScopedAssertion::new(namespace, subject, predicate, object, ObjectKind::Literal, "test")
+    }
+
+    /// 一个带类型与名字的实体断言集合（实体事实的物化需要 kg:name + rdf:type）。
+    fn person_assertions(namespace: &str, name: &str, age: &str) -> Vec<ScopedAssertion> {
+        vec![
+            ScopedAssertion::new(namespace, name, "type", "Person", ObjectKind::Entity, "test"),
+            literal(namespace, name, "name", name),
+            literal(namespace, name, "年龄", age),
+        ]
+    }
+
+    fn has_property(facts: &[PrologFact], name: &str, key: &str, value: &str) -> bool {
+        facts.iter().any(|fact| match fact {
+            PrologFact::Entity {
+                name: entity,
+                properties,
+                ..
+            } if entity == name => properties.get(key).map(String::as_str) == Some(value),
+            _ => false,
+        })
+    }
+
+    /// 源图断言不进入默认图、不推进知识版本；重复导入幂等；账本可往返。
+    #[tokio::test]
+    async fn namespace_assertions_stay_out_of_default_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let revision_before = manager.revision();
+        let namespace = ns("alice", TrustLevel::Curated);
+        let assertions = vec![literal("alice", "小明", "年龄", "18")];
+        let added = manager
+            .record_namespace_assertions(&namespace, &assertions)
+            .await
+            .unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(manager.revision(), revision_before, "源图写入不推进知识版本");
+        assert!(
+            manager.load_all_facts().await.unwrap().is_empty(),
+            "默认图不受源图写入影响"
+        );
+
+        let rows = manager
+            .query_sparql(
+                "SELECT ?o WHERE { GRAPH <http://example.org/kg/graphs/source/alice> { \
+                 ?s <http://example.org/kg/年龄> ?o } }",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.data.len(), 1, "源图应可被 SPARQL 查询");
+
+        let ledger = manager.load_fusion_ledger().await.unwrap();
+        assert!(ledger.synced);
+        assert_eq!(ledger.namespaces.len(), 1);
+        assert_eq!(ledger.assertions, assertions);
+
+        let added_again = manager
+            .record_namespace_assertions(&namespace, &assertions)
+            .await
+            .unwrap();
+        assert_eq!(added_again, 0, "重复导入幂等");
+        assert_eq!(manager.load_fusion_ledger().await.unwrap().assertions.len(), 1);
+    }
+
+    /// 功能谓词冲突：受管来源获胜、少数派隔离、默认图只写入赢家；重复融合幂等。
+    #[tokio::test]
+    async fn apply_fusion_materializes_winner_and_quarantines_loser() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .record_namespace_assertions(
+                &ns("kb", TrustLevel::Curated),
+                &person_assertions("kb", "小明", "18"),
+            )
+            .await
+            .unwrap();
+        manager
+            .record_namespace_assertions(
+                &ns("friend", TrustLevel::Imported),
+                &[literal("friend", "小明", "年龄", "19")],
+            )
+            .await
+            .unwrap();
+
+        let policy = FusionPolicy::new().with_functional(["年龄"]);
+        let plan = manager.fusion_plan(&policy).await.unwrap();
+        assert_eq!(plan.conflicts().len(), 1);
+        assert_eq!(plan.stats.quarantined, 1);
+
+        let revision_before = manager.revision();
+        let outcome = manager.apply_fusion(&policy).await.unwrap();
+        assert_eq!(outcome.inserted, 3, "类型 / 名字 / 年龄三条都应物化");
+        assert_eq!(outcome.removed, 0);
+        assert!(outcome.changed());
+        assert!(manager.revision() > revision_before, "默认图变化应推进版本");
+
+        let facts = manager.load_all_facts().await.unwrap();
+        assert!(has_property(&facts, "小明", "name", "小明"));
+        assert!(has_property(&facts, "小明", "年龄", "18"));
+        assert!(
+            !has_property(&facts, "小明", "年龄", "19"),
+            "少数派不得进入默认图"
+        );
+
+        let again = manager.apply_fusion(&policy).await.unwrap();
+        assert!(!again.changed(), "重复融合应幂等");
+        let revision_after = manager.revision();
+        manager.apply_fusion(&policy).await.unwrap();
+        assert_eq!(manager.revision(), revision_after);
+
+        let ledger = manager.load_fusion_ledger().await.unwrap();
+        assert_eq!(ledger.applied.len(), 3);
+        assert!(ledger
+            .applied
+            .iter()
+            .any(|winner| winner.predicate == "年龄" && winner.object == "18"));
+    }
+
+    /// 用户裁决翻转赢家：旧赢家被回收、新赢家写入，且只影响声明的谓词槽位。
+    #[tokio::test]
+    async fn adjudication_flip_reclaims_previous_winner() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .record_namespace_assertions(
+                &ns("kb", TrustLevel::Curated),
+                &person_assertions("kb", "小明", "18"),
+            )
+            .await
+            .unwrap();
+        manager
+            .record_namespace_assertions(
+                &ns("friend", TrustLevel::Imported),
+                &[literal("friend", "小明", "年龄", "19")],
+            )
+            .await
+            .unwrap();
+        let policy = FusionPolicy::new().with_functional(["年龄"]);
+        manager.apply_fusion(&policy).await.unwrap();
+
+        let mut ledger = manager.load_fusion_ledger().await.unwrap();
+        ledger.record_adjudication(Adjudication::new("年龄", "friend", "本人确认", "user"));
+        manager.sync_fusion_ledger(&ledger).await.unwrap();
+
+        let outcome = manager.apply_fusion(&policy).await.unwrap();
+        assert_eq!(outcome.inserted, 1, "只有年龄槽位翻转");
+        assert_eq!(outcome.removed, 1, "旧赢家应被回收");
+        let facts = manager.load_all_facts().await.unwrap();
+        assert!(has_property(&facts, "小明", "年龄", "19"));
+        assert!(!has_property(&facts, "小明", "年龄", "18"));
+
+        let ledger = manager.load_fusion_ledger().await.unwrap();
+        assert_eq!(ledger.adjudications.len(), 1);
+        assert_eq!(ledger.applied.len(), 3);
+        assert!(ledger
+            .applied
+            .iter()
+            .any(|winner| winner.predicate == "年龄" && winner.object == "19"));
+    }
+
+    /// 历史默认图事实不被融合触碰（兼容旧路径，只增不删非托管数据）。
+    #[tokio::test]
+    async fn fusion_apply_keeps_legacy_default_facts() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![KnowledgeItem::Entity {
+                label: "Person".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), "小明".to_string()),
+                    ("年龄".to_string(), "17".to_string()),
+                ]),
+            }])
+            .await
+            .unwrap();
+        manager
+            .record_namespace_assertions(
+                &ns("kb", TrustLevel::Curated),
+                &person_assertions("kb", "小明", "18"),
+            )
+            .await
+            .unwrap();
+        let policy = FusionPolicy::new().with_functional(["年龄"]);
+        let outcome = manager.apply_fusion(&policy).await.unwrap();
+        assert_eq!(outcome.inserted, 1, "只有年龄是新事实（类型/名字已存在）");
+        assert_eq!(outcome.removed, 0);
+        let facts = manager.load_all_facts().await.unwrap();
+        assert!(has_property(&facts, "小明", "name", "小明"));
+
+        // 同槽位的历史值（17）与融合赢家（18）都保留在默认图：兼容旧路径，不做静默删除
+        for value in ["17", "18"] {
+            let ask = manager
+                .query_sparql(&format!(
+                    "ASK {{ <http://example.org/kg/entity/小明> <http://example.org/kg/年龄> \"{}\" }}",
+                    value
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                ask.data[0]["boolean"],
+                serde_json::Value::Bool(true),
+                "默认图应保留「{}」",
+                value
+            );
+        }
+    }
+
+    /// 退役命名空间退出视图（其断言计为孤儿），只改账本元数据。
+    #[tokio::test]
+    async fn retiring_namespace_removes_it_from_view() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .record_namespace_assertions(
+                &ns("kb", TrustLevel::Curated),
+                &[literal("kb", "小明", "年龄", "18")],
+            )
+            .await
+            .unwrap();
+        manager
+            .record_namespace_assertions(
+                &ns("friend", TrustLevel::Imported),
+                &[literal("friend", "小明", "年龄", "19")],
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .set_namespace_status("friend", NamespaceStatus::Retired)
+            .await
+            .unwrap());
+        let policy = FusionPolicy::new().with_functional(["年龄"]);
+        let plan = manager.fusion_plan(&policy).await.unwrap();
+        assert_eq!(plan.stats.namespaces, 1);
+        assert_eq!(plan.stats.orphans, 1);
+        assert_eq!(plan.slots[0].delta, crate::knowledge_fusion::FusionDelta::New);
+        assert_eq!(plan.slots[0].accepted[0].object, "18");
+        assert!(!manager
+            .set_namespace_status("ghost", NamespaceStatus::Retired)
+            .await
+            .unwrap());
+    }
+
+    /// RDF 四元组 → 命名空间断言：kg 词面还原本地名、rdf:type 归一、外部 IRI 保留。
+    #[test]
+    fn assertion_from_rdf_quad_normalizes_terms() {
+        let quad = Quad::new(
+            NamedNode::new("http://example.org/kg/entity/小明").unwrap(),
+            NamedNode::new("http://example.org/kg/年龄").unwrap(),
+            Literal::new_simple_literal("18"),
+            GraphName::DefaultGraph,
+        );
+        let assertion =
+            OxigraphManager::assertion_from_rdf_quad(&quad, "alice", "a.ttl").unwrap();
+        assert_eq!(assertion.subject, "小明");
+        assert_eq!(assertion.predicate, "年龄");
+        assert_eq!(assertion.object, "18");
+        assert_eq!(assertion.object_kind, ObjectKind::Literal);
+        assert_eq!(assertion.namespace, "alice");
+        assert_eq!(assertion.source, "a.ttl");
+
+        let type_quad = Quad::new(
+            NamedNode::new("http://example.org/kg/entity/小明").unwrap(),
+            NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").unwrap(),
+            NamedNode::new("http://example.org/kg/Person").unwrap(),
+            GraphName::DefaultGraph,
+        );
+        let assertion =
+            OxigraphManager::assertion_from_rdf_quad(&type_quad, "alice", "a.ttl").unwrap();
+        assert_eq!(assertion.predicate, "type");
+        assert_eq!(assertion.object, "Person");
+        assert_eq!(assertion.object_kind, ObjectKind::Entity);
+
+        let blank = Quad::new(
+            BlankNode::default(),
+            NamedNode::new("http://example.org/kg/年龄").unwrap(),
+            Literal::new_simple_literal("1"),
+            GraphName::DefaultGraph,
+        );
+        assert!(OxigraphManager::assertion_from_rdf_quad(&blank, "alice", "a.ttl").is_none());
     }
 }
