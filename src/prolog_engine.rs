@@ -37,7 +37,7 @@ impl QueryOutcome {
         }
     }
 
-    /// 兼容视图：非解（无解 / 故障）给空 Vec（故障信息保留在枚举里）。
+    /// 简化视图：非解（无解 / 故障）给空 Vec（故障信息保留在枚举里）。
     pub fn into_solutions(self) -> Vec<BindingSet> {
         match self {
             QueryOutcome::Solutions(solutions) => solutions,

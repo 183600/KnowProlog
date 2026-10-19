@@ -399,7 +399,7 @@ pub struct DialogueManager {
     prompt_mode: PromptMode,
     /// 提示模板运行统计（诊断计数，不参与对话快照的语义状态）。
     prompt_stats: PromptStats,
-    /// 失败恢复模式（默认 Off：旧行为逐字；Observe 只记台账；On 完整阶梯）。
+    /// 失败恢复模式（默认 Off：原样输出；Observe 只记台账；On 完整阶梯）。
     recovery_mode: RecoveryMode,
     /// 失败台账 + 待定挂账（随快照持久化）。
     recovery: RecoveryState,
@@ -1198,8 +1198,8 @@ impl DialogueManager {
             &more_attributes,
             text,
         );
-        // On 模式：恢复引擎的文本（含证据链/追问/回执 id）取代旧措辞；
-        // Observe 模式只记台账，保持旧行为逐字不变。
+        // On 模式：恢复引擎的文本（含证据链/追问/回执 id）取代生成器措辞；
+        // Observe 模式只记台账，文本不变。
         let text = match &recovery_attempt {
             Some(attempt)
                 if self.recovery_mode == RecoveryMode::On && !attempt.text.is_empty() =>
@@ -2241,7 +2241,7 @@ mod tests {
         let on = replay_texts(PromptMode::On);
         let parity = replay_texts(PromptMode::Parity);
         assert_eq!(off, on, "On 模式应逐字等价于 Off 模式渲染");
-        assert_eq!(off, parity, "Parity 模式对外行为不应改变");
+        assert_eq!(off, parity, "Parity 模式对外输出应与 Off 模式一致");
     }
 
     #[test]

@@ -15,13 +15,13 @@
 //! ```
 //!
 //! 设计纪律（纯符号，零训练）：
-//! - 阈值不做学习：沿用对比仲裁的既有常量口径（0.45），候选有上限；
+//! - 阈值不做学习：提名最低分固定为 0.45，候选有上限；
 //! - 排序定点化（score × 10⁶ 取整）后按 (分数降序, 值升序)，同输入必同序；
 //! - 未经验证的提名永不以肯定语气输出、永不写图谱；
-//! - 澄清每轮至多一个，与既有帧澄清共用「问题预算」的克制原则；
+//! - 澄清每轮至多一个，与帧澄清共用「问题预算」的克制原则；
 //! - EngineFault 与 Unknown 永不合并（见 [`crate::epistemic`]）。
 //!
-//! 三档模式沿用提示资产先例：[`RecoveryMode::Off`] 旧行为逐字、
+//! 三档模式与提示资产同构：[`RecoveryMode::Off`] 原样输出、
 //! [`RecoveryMode::Observe`] 只记台账不改文本、[`RecoveryMode::On`] 完整阶梯。
 
 use std::collections::BTreeMap;
@@ -43,11 +43,11 @@ pub const MAX_PENDING: usize = 8;
 /// 定点化标尺（排序确定性）。
 pub const SCORE_FIXED_SCALE: f64 = 1_000_000.0;
 
-/// 恢复三档模式（沿用提示资产 Off / Observe / On 先例）。
+/// 恢复三档模式（与提示资产 Off / Observe / On 同构）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryMode {
-    /// 旧行为逐字（默认，兼容既有管线）。
+    /// 原样输出，不做恢复处理（默认）。
     Off,
     /// 只记失败台账，不改动进程文本（先收集真实失败分布）。
     Observe,
@@ -448,7 +448,7 @@ fn recover_missing<K: RecoveryKnowledge + ?Sized>(
     let status = request.status;
     let base = render_statement(status, request.entity, request.attribute, None);
 
-    // Observe：只记账，不查联想通道（文本由调用方保持旧行为）。
+    // Observe：只记账，不查联想通道（文本由调用方按原样输出）。
     if !mode.acts() {
         let mut attempt = RecoveryAttempt::plain(status, RecoveryLevel::Admit);
         attempt.text = base;

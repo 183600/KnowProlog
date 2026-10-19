@@ -174,7 +174,7 @@ enum Commands {
         /// Prompt asset mode for sessions: "off", "parity", or "on"
         #[arg(long, default_value = "on")]
         prompt_mode: String,
-        /// Failure recovery mode for sessions: "off" (legacy text verbatim),
+        /// Failure recovery mode for sessions: "off" (text verbatim),
         /// "observe" (record receipts only), or "on" (full recovery ladder)
         #[arg(long, default_value = "observe")]
         recovery: String,

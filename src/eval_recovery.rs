@@ -9,7 +9,7 @@
 //! - `receipt_coverage`：失败回执覆盖率（每个失败都有可追溯 id）；
 //! - `evidence_rate`：推测必须带证据链的比例（不幻觉的硬条件）；
 //! - `ratification_rate`：用户裁定（是/不是）能关闭挂账回执的比例；
-//! - `legacy_off_purity`：Off 模式零副作用（旧行为逐字、不起台账）；
+//! - `off_purity`：Off 模式零副作用（原样输出、不起台账）；
 //! - `ledger_digest`：整个评测的台账摘要（确定性回归锚点）。
 //!
 //! 语料是确定性的种子场景；基线 JSON + 棘轮判定与 `dialogue_eval` 同构。
@@ -265,7 +265,7 @@ pub struct EvalRecoveryReport {
     pub evidence_rate: f64,
     pub ratification_rate: f64,
     pub fault_named_rate: f64,
-    pub legacy_off_purity: f64,
+    pub off_purity: f64,
     pub ladder: BTreeMap<String, usize>,
     pub ledger_digest: String,
 }
@@ -282,8 +282,8 @@ impl EvalRecoveryReport {
             self.silent_failure_rate, self.named_failure_rate, self.fault_named_rate
         ));
         out.push_str(&format!(
-            "  receipt_coverage {:.4}；evidence_rate {:.4}；ratification_rate {:.4}；legacy_off_purity {:.4}\n",
-            self.receipt_coverage, self.evidence_rate, self.ratification_rate, self.legacy_off_purity
+            "  receipt_coverage {:.4}；evidence_rate {:.4}；ratification_rate {:.4}；off_purity {:.4}\n",
+            self.receipt_coverage, self.evidence_rate, self.ratification_rate, self.off_purity
         ));
         let ladder: Vec<String> = self
             .ladder
@@ -303,7 +303,7 @@ impl EvalRecoveryReport {
         metrics.insert("recovery.evidence_rate".to_string(), self.evidence_rate);
         metrics.insert("recovery.ratification_rate".to_string(), self.ratification_rate);
         metrics.insert("recovery.fault_named_rate".to_string(), self.fault_named_rate);
-        metrics.insert("recovery.legacy_off_purity".to_string(), self.legacy_off_purity);
+        metrics.insert("recovery.off_purity".to_string(), self.off_purity);
         for (level, count) in &self.ladder {
             metrics.insert(format!("recovery.ladder.{}.count", level), *count as f64);
         }
@@ -396,15 +396,15 @@ pub fn evaluate_seed() -> EvalRecoveryReport {
     // Off 纯度：所有场景在 Off 模式下不得留下任何回执/挂账。
     let mut off_pure = 0usize;
     for (_name, knowledge, inputs) in &corpus {
-        let mut legacy = DialogueManager::new();
+        let mut off = DialogueManager::new();
         for input in inputs {
-            let _ = legacy
+            let _ = off
                 .plan_pure_dialogue(input, knowledge)
-                .or_else(|| legacy.plan_reply(input, knowledge));
+                .or_else(|| off.plan_reply(input, knowledge));
         }
-        if legacy.failure_ledger().is_empty()
-            && legacy.recovery_state().pending.is_empty()
-            && legacy.last_recovery().is_none()
+        if off.failure_ledger().is_empty()
+            && off.recovery_state().pending.is_empty()
+            && off.last_recovery().is_none()
         {
             off_pure += 1;
         }
@@ -423,7 +423,7 @@ pub fn evaluate_seed() -> EvalRecoveryReport {
         evidence_rate: ratio(with_evidence, provisional),
         ratification_rate: ratio(ratified, verdicts),
         fault_named_rate: ratio(faults_named, faults),
-        legacy_off_purity: ratio(off_pure, corpus.len()),
+        off_purity: ratio(off_pure, corpus.len()),
         ladder,
         ledger_digest: fnv1a_hex(ledger_digests.join("\u{1}").as_bytes()),
     }
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(report.evidence_rate, 1.0, "{}", report.render_text());
         assert_eq!(report.ratification_rate, 1.0, "{}", report.render_text());
         assert_eq!(report.fault_named_rate, 1.0, "{}", report.render_text());
-        assert_eq!(report.legacy_off_purity, 1.0, "{}", report.render_text());
+        assert_eq!(report.off_purity, 1.0, "{}", report.render_text());
         assert!(report.failures > 0, "语料必须真的包含失败");
         assert!(
             report.ladder.contains_key("L2") && report.ladder.contains_key("L3"),

@@ -15,7 +15,7 @@
 //!
 //! 错误处理 × 神经符号推理扩展（恢复维度）：
 //!   C14 失败可命名：引擎故障显式「出错」，绝不伪装成「没有记录」；
-//!       Off / Observe / On 三档各自的行为契约（旧行为 / 只记账 / 显式恢复）
+//!       Off / Observe / On 三档各自的行为契约（原样 / 只记账 / 显式恢复）
 //!   C15 推测不幻觉：联想提名必带「推测」定性 + 证据 + 追问，可被用户裁定作废
 //!   C16 恢复确定性与有界：同 transcript 回放逐字一致；挂账有 TTL 不滞留
 //!
@@ -808,7 +808,7 @@ fn real_reasoner_stack_answers_and_defers() {
 }
 
 /// C14 失败可命名：引擎故障必须显式说「我出错了」，绝不伪装成「没有记录」；
-/// Observe 只记账不改文本；Off 完全保持旧行为。
+/// Observe 只记账不改文本；Off 原样输出、零副作用。
 #[test]
 fn c14_failures_are_named_and_never_masked() {
     // (a) On：故障优先、显式命名、可回溯、绝不出现「没有记录」式伪装
@@ -836,18 +836,18 @@ fn c14_failures_are_named_and_never_masked() {
     assert!(notice.receipt_id.is_some(), "故障必须有回执 id");
     assert_eq!(manager.failure_ledger().open_count(), 1);
 
-    // (b) Off：旧行为逐字，且完全不记账（零副作用）
-    let mut legacy = DialogueManager::new();
-    let legacy_reply = ask(&mut legacy, &faulted, "姚明的身高是什么");
+    // (b) Off：原样输出，且完全不记账（零副作用）
+    let mut off = DialogueManager::new();
+    let off_reply = ask(&mut off, &faulted, "姚明的身高是什么");
     assert!(
-        legacy_reply.plan.contains(&"direct_answer".to_string()),
-        "Off 模式应保持旧行为：{:?}",
-        legacy_reply.plan
+        off_reply.plan.contains(&"direct_answer".to_string()),
+        "Off 模式应原样输出：{:?}",
+        off_reply.plan
     );
-    assert!(legacy.failure_ledger().is_empty(), "Off 模式不得记账");
-    assert!(legacy.last_recovery().is_none());
+    assert!(off.failure_ledger().is_empty(), "Off 模式不得记账");
+    assert!(off.last_recovery().is_none());
 
-    // (c) Observe：只记账不改文本，文本仍可被旧管线回答
+    // (c) Observe：只记账不改文本，文本仍由常规管线回答
     let mut observe = DialogueManager::new();
     observe.set_recovery_mode(RecoveryMode::Observe);
     let observed = ask(&mut observe, &faulted, "姚明的身高是什么");
