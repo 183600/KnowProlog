@@ -92,6 +92,18 @@ impl QueryPlanner {
         None
     }
 
+    pub fn kind(plan: &QueryPlan) -> &'static str {
+        match plan {
+            QueryPlan::FindObject { .. } => "FindObject",
+            QueryPlan::FindSubject { .. } => "FindSubject",
+            QueryPlan::CheckTriple { .. } => "CheckTriple",
+            QueryPlan::Count { .. } => "Count",
+            QueryPlan::Exist { .. } => "Exist",
+            QueryPlan::Similar { .. } => "Similar",
+            QueryPlan::Analogy { .. } => "Analogy",
+        }
+    }
+
     pub fn format_plan(plan: &QueryPlan) -> String {
         match plan {
             QueryPlan::FindObject { segments } => {
