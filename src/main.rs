@@ -4163,7 +4163,7 @@ fn is_command_like(input: &str) -> bool {
         "功能词表",
         "虚词报告",
         "算符表",
-        // 谓词画像 / 身份裁决（补全：此前在澄清进行中会被当作回答吞掉）
+        // 谓词画像 / 身份裁决
         "谓词报告",
         "谓词画像",
         "谓词注册表",
@@ -4822,7 +4822,7 @@ mod session_tests {
         }
     }
 
-    /// 新补的命令（谓词裁决 / 澄清子命令 / 帮助退出等）同样要被 is_command_like 识别
+    /// 各命令（谓词裁决 / 澄清子命令 / 帮助退出等）都要被 is_command_like 识别
     #[test]
     fn command_like_covers_help_predicate_and_clarification_commands() {
         for command in [
