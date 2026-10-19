@@ -2660,7 +2660,7 @@ mod tests {
             .as_str()
             .is_some_and(|reply| !reply.contains("暂时") || reply.contains("没有记录")));
 
-        // 无失败的动作轮不重复携带陈旧视图
+        // 无失败的动作轮只携带当前视图
         let (_, _, body) = raw_request(
             addr,
             "POST",
@@ -3353,7 +3353,7 @@ mod tests {
         assert_eq!(status, 409, "{}", response);
         assert!(response.contains("already exists"), "{}", response);
 
-        // 原有会话不受任何导入尝试影响
+        // 其余会话不受任何导入尝试影响
         let turn = take_turn_body(addr, &session_id, "他的身高呢").await;
         assert!(turn["reply"].as_str().unwrap().contains("226"), "{}", turn);
     }

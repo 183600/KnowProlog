@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(embedding.total_mass, mass, "PPMI 计票不得因重放翻倍");
         assert_eq!(embedding.feature_count(), features);
 
-        // 新增一条事实仍应正常生效
+        // 加入一条事实仍应正常生效
         embedding.observe_triple("李四", "师傅", "王五");
         assert!(embedding.is_dirty());
         assert_eq!(embedding.triple_count(), 3);

@@ -8363,7 +8363,7 @@ mod tests {
         assert_eq!(perf.count("embedding_rebuild"), embedding_rebuilds);
         assert_eq!(perf.count("observe_no_change"), 2);
 
-        // 新增一条事实：版本推进，派生台账重新挂牌
+        // 加入一条事实：版本推进，派生台账重新挂牌
         let mut extended = master_facts();
         extended.push(PrologFact::Relation {
             from: "王五".to_string(),

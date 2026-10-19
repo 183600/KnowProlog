@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     fn rule_channel_completes_transitive_chain() {
-        // 训练里既有传递链 A→B→C，也有直达边 A→C（规则的支持度来源）；
+        // 训练集同时包含传递链 A→B→C 与直达边 A→C（规则的支持度来源）；
         // 另有一条 D→E→F 的链留出 D→F：组合规则应把 F 排在首位。
         let train = vec![
             EvalTriple::new("A", "师傅", "B"),

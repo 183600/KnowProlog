@@ -256,7 +256,7 @@ impl KnownFuzzGap {
 /// known-gap 基线（`fuzz-dialogue --update-baseline` 落盘）。
 ///
 /// 棘轮语义：基线里的缺口可以继续存在（已知债务），但**不能出现新签名**；
-/// 修好的缺口会自动进入 `fixed_gaps`，更新基线即可收紧棘轮。
+/// 本次运行未复现的基线缺口会进入 `unseen_gaps`，更新基线即可收紧棘轮。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzBaseline {
     #[serde(default = "default_baseline_version")]
@@ -310,35 +310,35 @@ impl FuzzBaseline {
     }
 }
 
-/// 棘轮裁决：哪些是新缺陷，哪些已修复。
+/// 棘轮裁决：区分基线内缺口与基线外失败。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzVerdict {
     pub passed: bool,
     pub baseline_gaps: usize,
     pub known_failures: usize,
     pub new_failures: Vec<FuzzFailure>,
-    pub fixed_gaps: Vec<KnownFuzzGap>,
+    pub unseen_gaps: Vec<KnownFuzzGap>,
 }
 
 impl FuzzVerdict {
     pub fn render_text(&self) -> String {
         let mut lines = vec![format!(
-            "QDF 棘轮：{}（基线缺口 {}，当前仍失败 {}，新增 {}，已修复 {}）。",
+            "QDF 棘轮：{}（基线缺口 {}，当前仍失败 {}，基线外失败 {}，未复现缺口 {}）。",
             if self.passed { "通过" } else { "未通过" },
             self.baseline_gaps,
             self.known_failures,
             self.new_failures.len(),
-            self.fixed_gaps.len()
+            self.unseen_gaps.len()
         )];
         for failure in self.new_failures.iter().take(8) {
             lines.push(format!(
-                "  ✗ 新缺陷 {} / {}：{}（{}）",
+                "  ✗ 基线外失败 {} / {}：{}（{}）",
                 failure.mutation, failure.question, failure.contract, failure.detail
             ));
         }
-        for gap in self.fixed_gaps.iter().take(8) {
+        for gap in self.unseen_gaps.iter().take(8) {
             lines.push(format!(
-                "  ✓ 已修复 {} / {}：{}",
+                "  ✓ 未复现缺口 {} / {}：{}",
                 gap.mutation, gap.question, gap.contract
             ));
         }
@@ -346,7 +346,7 @@ impl FuzzVerdict {
     }
 }
 
-/// 对比 known-gap 基线：只对新增失败判红；已修复项作为改进报告。
+/// 对比 known-gap 基线：只对基线外失败判红；未复现的基线缺口单列。
 pub fn compare_baseline(baseline: &FuzzBaseline, report: &FuzzReport) -> FuzzVerdict {
     let known: BTreeSet<(String, String, String)> = baseline
         .gaps
@@ -365,7 +365,7 @@ pub fn compare_baseline(baseline: &FuzzBaseline, report: &FuzzReport) -> FuzzVer
         .iter()
         .filter(|failure| known.contains(&failure.signature()))
         .count();
-    let fixed_gaps: Vec<KnownFuzzGap> = baseline
+    let unseen_gaps: Vec<KnownFuzzGap> = baseline
         .gaps
         .iter()
         .filter(|gap| !current_keys.contains(&gap.signature()))
@@ -376,7 +376,7 @@ pub fn compare_baseline(baseline: &FuzzBaseline, report: &FuzzReport) -> FuzzVer
         baseline_gaps: baseline.gaps.len(),
         known_failures,
         new_failures,
-        fixed_gaps,
+        unseen_gaps,
     }
 }
 
@@ -1123,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn known_gap_baseline_reports_new_and_fixed() {
+    fn known_gap_baseline_classifies_unseen_gaps() {
         let failure = |mutation: &str, contract: &str| FuzzFailure {
             case: 1,
             mutation: mutation.to_string(),
@@ -1158,7 +1158,7 @@ mod tests {
         assert!(verdict.passed, "已知缺口不应判红");
         assert_eq!(verdict.known_failures, 1);
         assert!(verdict.new_failures.is_empty());
-        assert!(verdict.fixed_gaps.is_empty());
+        assert!(verdict.unseen_gaps.is_empty());
 
         let regressed = FuzzReport {
             seed: 1,
@@ -1175,9 +1175,9 @@ mod tests {
         let verdict = compare_baseline(&baseline, &regressed);
         assert!(!verdict.passed);
         assert_eq!(verdict.new_failures.len(), 1);
-        assert_eq!(verdict.fixed_gaps.len(), 0);
+        assert_eq!(verdict.unseen_gaps.len(), 0);
 
-        let fixed = FuzzReport {
+        let clean = FuzzReport {
             seed: 1,
             cases: 1,
             passed: 1,
@@ -1186,9 +1186,9 @@ mod tests {
             failures: Vec::new(),
             digest: "d".to_string(),
         };
-        let verdict = compare_baseline(&baseline, &fixed);
+        let verdict = compare_baseline(&baseline, &clean);
         assert!(verdict.passed);
-        assert_eq!(verdict.fixed_gaps.len(), 1);
+        assert_eq!(verdict.unseen_gaps.len(), 1);
     }
 
     #[test]

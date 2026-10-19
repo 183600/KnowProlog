@@ -594,7 +594,7 @@ impl EntityLinker {
             return Vec::new();
         }
         let mut mentions = self.exact_mentions(text);
-        // 模糊匹配补充精确匹配未覆盖的片段：同一句中既有已知实体又有错别字时，
+        // 模糊匹配补充精确匹配未覆盖的片段：同一句中同时存在已知实体与错别字时，
         // 不能因为有精确命中就整体跳过模糊匹配
         let exact_spans: Vec<(usize, usize)> = mentions
             .iter()

@@ -47,7 +47,7 @@ pub const GENERATED_QUERY_TYPES: &[&str] = &[
     "spouse_query",
 ];
 
-/// `get_direct_answer` 能用 SPARQL 直接回答的 `query_type`（命中即不再走 Prolog）。
+/// `get_direct_answer` 能用 SPARQL 直接回答的 `query_type`（命中时由 SPARQL 直接回答）。
 pub const DIRECT_ANSWER_QUERY_TYPES: &[&str] = &[
     "altitude_query",
     "author_query",

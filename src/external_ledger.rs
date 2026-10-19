@@ -740,7 +740,7 @@ mod tests {
         }
         ledger.save(path_text).unwrap();
 
-        // 容量缩水到 2：恢复时按取回时刻淘汰最旧（old）
+        // 容量缩水到 2：恢复时按取回时刻淘汰最久未使用项
         let mut small = ExternalLedger::with_config(2, 0, Arc::new(PerfLedger::new()));
         let LedgerLoad::Loaded(count) = small.load_into(path_text) else {
             panic!("应能恢复");

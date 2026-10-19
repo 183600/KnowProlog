@@ -1462,7 +1462,7 @@ impl DialogueManager {
                     "review_conflict",
                 );
             }
-            // 缺口变化也是知识变化：删掉必备属性/类型后，旧答案可能仍为真，
+            // 缺口变化也是知识变化：删掉必备属性/类型后，答案本身可能仍为真，
             // 但「当时完整、现在有缺口」必须可见，不能只说「版本推进了」。
             let conflict_gap = |gap: &&String| gap.starts_with("存在未裁决冲突");
             let new_gaps: Vec<&String> = new
@@ -1500,7 +1500,7 @@ impl DialogueManager {
                     ));
                 }
                 let still = if old.known_values.is_empty() {
-                    "原有回答仍成立".to_string()
+                    "该回答仍成立".to_string()
                 } else {
                     format!("仍为「{}」", old.known_values.join("、"))
                 };
