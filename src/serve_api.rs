@@ -304,6 +304,23 @@ pub struct TurnResponse {
     /// 本轮的认识论定性（仅恢复模式开启且本轮发生失败/恢复动作时出现）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic: Option<EpistemicView>,
+    /// 接地清单：本轮输入中链接到知识图谱的实体（词面 ↔ URI ↔ 类型 ↔ 角色）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<GroundingCitation>,
+}
+
+/// 一条接地引用：回答依据的实体身份（URI 可寻址、词面可回溯、类型可审计）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroundingCitation {
+    /// 实体 URI（identity::entity_uri 确定性生成，本地名可无损反解）
+    pub uri: String,
+    /// 输入中的原词面（可能含错别字，模糊链接时与规范名不同）
+    pub surface: String,
+    /// 知识图谱登记类型（未登记时省略）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etype: Option<String>,
+    /// `focus` = 本轮对话焦点；`mention` = 普通指称
+    pub role: String,
 }
 
 /// 一轮回答的认识论视图：状态、档位、回执与开放计数。
@@ -398,6 +415,29 @@ impl Session {
             }),
             None => None,
         };
+        let focus = self.manager.focus_entity().map(str::to_string);
+        // 接地引用：本轮输入链接到的实体（与回答同源，可审计、可寻址）
+        let entities = self
+            .reasoner
+            .grounding_mentions(&input)
+            .into_iter()
+            .filter(|grounded| {
+                grounded.score >= crate::symbolic_reasoner::SymbolicReasoner::LINK_ACCEPT_THRESHOLD
+            })
+            .map(|grounded| GroundingCitation {
+                uri: crate::identity::entity_uri(
+                    crate::identity::DEFAULT_BASE_NS,
+                    &grounded.entity,
+                ),
+                role: if focus.as_deref() == Some(grounded.entity.as_str()) {
+                    "focus".to_string()
+                } else {
+                    "mention".to_string()
+                },
+                surface: grounded.mention,
+                etype: grounded.etype,
+            })
+            .collect();
         let mut response = TurnResponse {
             session_id: self.id.clone(),
             turn: self.turns,
@@ -406,9 +446,10 @@ impl Session {
             kind,
             plan,
             reply,
-            focus: self.manager.focus_entity().map(str::to_string),
+            focus,
             policy: self.policy.clone(),
             epistemic,
+            entities,
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
         response
@@ -1581,6 +1622,7 @@ fn chat_completion_response(
             "plan": turn.plan,
             "focus": turn.focus,
             "policy": turn.policy,
+            "entities": turn.entities,
         }
     })
 }
@@ -1721,6 +1763,7 @@ async fn stream_turn(
         "source": turn.source,
         "kind": turn.kind,
         "focus": turn.focus,
+        "entities": turn.entities,
     });
     stream
         .write_all(format!("data: {}\n\ndata: [DONE]\n\n", done).as_bytes())
@@ -2137,6 +2180,31 @@ mod tests {
         )
         .await;
         assert_eq!(status, 404);
+    }
+
+    /// 接地引用：回答附 `entities`（词面 ↔ URI ↔ 类型 ↔ 角色），身份可寻址。
+    #[tokio::test]
+    async fn grounding_citations_expose_uri_type_and_role() {
+        let (addr, _server) = start_server(2);
+        let session_id = create_session(addr).await;
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[],
+            "姚明的身高是多少",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let entities = value["entities"].as_array().expect("应附接地清单");
+        let yao = entities
+            .iter()
+            .find(|entity| entity["surface"] == "姚明")
+            .expect("应接地到姚明");
+        assert_eq!(yao["uri"], "http://example.org/kg/entity/姚明");
+        assert_eq!(yao["etype"], "人物");
+        assert_eq!(yao["role"], "focus");
     }
 
     #[tokio::test]

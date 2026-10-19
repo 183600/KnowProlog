@@ -1538,6 +1538,63 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 身份台账：规范身份 ↔ 别名 ↔ 歧义（实体 URI 的只读审计视图）
+        if matches!(input, "身份台账" | "身份注册表" | "身份报告" | "实体身份") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.identity_report());
+            println!();
+            continue;
+        }
+
+        // 提及格全局解码：不重叠最大证据路径（精确/别名/模糊/嵌套统一选路）
+        if let Some(text) = strip_any_prefix(input, &["提及格：", "提及格:", "格解码：", "格解码:"]) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            let text = text.trim();
+            if text.is_empty() {
+                println!("请提供要解码的文本，例如：提及格：北京大学的校长是谁");
+            } else {
+                println!("{}", symbolic_reasoner.mention_lattice_report(text));
+            }
+            println!();
+            continue;
+        }
+
+        // OOV 准入：提名 → 用户确认 → 写入知识库（显式词汇增长，可回溯）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["准入：", "准入:", "收录：", "收录:", "确认录入：", "确认录入:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要准入的词面，例如：准入：未名科技公司");
+            } else {
+                match symbolic_reasoner.admit_vocabulary(target) {
+                    Some((name, etype)) => {
+                        let mut properties = std::collections::HashMap::new();
+                        properties.insert("name".to_string(), name.clone());
+                        let items = vec![KnowledgeItem::Entity {
+                            label: etype.clone(),
+                            properties,
+                        }];
+                        match oxigraph_manager.save_knowledge(items).await {
+                            Ok(()) => {
+                                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager)
+                                    .await;
+                                println!(
+                                    "已准入：「{}」→ 类型 {}（已写入知识库，可在后续问句中被识别）。",
+                                    name, etype
+                                );
+                            }
+                            Err(error) => println!("准入写入知识库失败：{}", error),
+                        }
+                    }
+                    None => println!("词面为空，无法准入。"),
+                }
+            }
+            println!();
+            continue;
+        }
+
         if let Some(entity) = strip_any_prefix(input, &["实体链接：", "实体链接:", "识别实体：", "识别实体:"]) {
             match load_graph_snapshot(&oxigraph_manager).await {
                 Ok(facts) => symbolic_reasoner.observe_facts(&facts),
@@ -3461,7 +3518,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 140] = [
+    const COMMANDS: [&str; 147] = [
         "全息",
         "对话本体",
         "对话状态",
@@ -3502,6 +3559,13 @@ fn is_command_like(input: &str) -> bool {
         "链接预测规则",
         "实体链接",
         "提及账本",
+        "提及格",
+        "格解码",
+        "准入",
+        "收录",
+        "身份台账",
+        "身份注册表",
+        "身份报告",
         "识别实体",
         "判断",
         "蕴含",

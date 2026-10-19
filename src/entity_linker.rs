@@ -88,6 +88,15 @@ pub struct CandidateReceipt {
     pub reasons: Vec<String>,
 }
 
+/// 接地条目：回答引用的最小单位（词面 ↔ 实体 ↔ 类型 ↔ 置信度）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundedMention {
+    pub mention: String,
+    pub entity: String,
+    pub etype: Option<String>,
+    pub score: f64,
+}
+
 /// 一个指称的完整证据收据：边界证据 + 链接候选 + 类型证据 + 焦点先验。
 #[derive(Debug, Clone)]
 pub struct MentionReceipt {
@@ -130,6 +139,8 @@ pub struct OovSuspect {
     pub start: usize,
     pub kind: OovKind,
     pub reason: String,
+    /// 后缀表给出的暂定类型（如「未名科技公司」→ 组织）；只标注，不进 KB
+    pub suggested_type: Option<String>,
 }
 
 /// 实体后缀表（机构/地点/人物角色）：用于把未登录词提名为疑点。
@@ -197,6 +208,8 @@ pub fn oov_suspects(text: &str, receipts: &[MentionReceipt]) -> Vec<OovSuspect> 
                     start: i + 1,
                     kind: OovKind::Quoted,
                     reason: "未在知识图谱登记".to_string(),
+                    suggested_type: crate::identity::infer_suffix_type(trimmed)
+                        .map(|(_, etype)| etype.to_string()),
                 });
             }
             i = end + 1;
@@ -238,11 +251,14 @@ pub fn oov_suspects(text: &str, receipts: &[MentionReceipt]) -> Vec<OovSuspect> 
                 continue;
             }
             let candidate: String = chars[prefix_start..end].iter().collect();
+            let suggested_type = crate::identity::infer_suffix_type(&candidate)
+                .map(|(_, etype)| etype.to_string());
             suspects.push(OovSuspect {
                 text: candidate,
                 start: prefix_start,
                 kind: OovKind::Suffix,
                 reason: format!("实体后缀「{}」，未在知识图谱登记", ENTITY_SUFFIXES[suffix_index]),
+                suggested_type,
             });
         }
     }
@@ -313,14 +329,18 @@ pub fn render_mention_ledger(
                 OovKind::Quoted => "引号词",
                 OovKind::Suffix => "后缀词",
             };
-            let _ = writeln!(
-                output,
-                "  • 「{}」（第 {} 字起；{}；{}）",
+            let mut line = format!(
+                "  • 「{}」（第 {} 字起；{}；{}",
                 suspect.text,
                 suspect.start + 1,
                 kind,
                 suspect.reason
             );
+            if let Some(etype) = &suspect.suggested_type {
+                line.push_str(&format!("；暂定类型：{}（准入后生效）", etype));
+            }
+            line.push('）');
+            let _ = writeln!(output, "{}", line);
         }
     }
     output.trim_end().to_string()
@@ -740,6 +760,32 @@ impl EntityLinker {
         out
     }
 
+    /// 问题线索加成：候选实体的出/入谓词或登记类型命中线索时 +0.1（可解释理由）。
+    fn hint_boost(&self, entity: &str, hints: &[String]) -> (f64, Vec<String>) {
+        let mut boost = 0.0;
+        let mut reasons: Vec<String> = Vec::new();
+        for hint in hints {
+            let predicate_hit = self
+                .out_predicates
+                .get(entity)
+                .map_or(false, |p| p.contains_key(hint))
+                || self
+                    .in_predicates
+                    .get(entity)
+                    .map_or(false, |p| p.contains_key(hint));
+            let type_hit = self
+                .profiles
+                .get(entity)
+                .and_then(|p| p.etype.as_deref())
+                == Some(hint.as_str());
+            if predicate_hit || type_hit {
+                boost += 0.1;
+                reasons.push(format!("与问题线索「{}」相容", hint));
+            }
+        }
+        (boost, reasons)
+    }
+
     fn disambiguate(&self, mentions: &mut [LinkedMention], hints: &[String]) {
         let top_entities: Vec<String> = mentions
             .iter()
@@ -757,25 +803,9 @@ impl EntityLinker {
                         }
                     }
                 }
-                for hint in hints {
-                    let predicate_hit = self
-                        .out_predicates
-                        .get(&candidate.entity)
-                        .map_or(false, |p| p.contains_key(hint))
-                        || self
-                            .in_predicates
-                            .get(&candidate.entity)
-                            .map_or(false, |p| p.contains_key(hint));
-                    let type_hit = self
-                        .profiles
-                        .get(&candidate.entity)
-                        .and_then(|p| p.etype.as_deref())
-                        == Some(hint.as_str());
-                    if predicate_hit || type_hit {
-                        boost += 0.1;
-                        reasons.push(format!("与问题线索「{}」相容", hint));
-                    }
-                }
+                let (hint_gain, hint_reasons) = self.hint_boost(&candidate.entity, hints);
+                boost += hint_gain;
+                reasons.extend(hint_reasons);
                 if boost > 0.0 {
                     candidate.score = (candidate.score + boost).min(0.99);
                     candidate.reasons.extend(reasons);
@@ -789,6 +819,323 @@ impl EntityLinker {
             });
             mention.candidates.truncate(MAX_CANDIDATES_PER_MENTION);
         }
+    }
+
+    /// 显式准入一个 OOV 词面（提名的唯一出口）：按后缀表推断暂定类型并登记实体。
+    ///
+    /// 幂等：已登记实体直接返回既有类型，不覆盖。返回（词面，类型）；
+    /// 空词面返回 None；无后缀线索时类型为通用的 `Entity`（准入动作本身是显式的）。
+    pub fn admit_entity(&mut self, surface: &str) -> Option<(String, String)> {
+        let surface = surface.trim();
+        if surface.is_empty() {
+            return None;
+        }
+        if self.is_known_entity(surface) {
+            let etype = self.entity_type(surface).unwrap_or("Entity").to_string();
+            return Some((surface.to_string(), etype));
+        }
+        let etype = crate::identity::infer_suffix_type(surface)
+            .map(|(_, etype)| etype.to_string())
+            .unwrap_or_else(|| "Entity".to_string());
+        self.register_entity(surface, Some(&etype));
+        Some((surface.to_string(), etype))
+    }
+
+    /// 提及格全局解码：把所有候选跨度（精确/别名/模糊/嵌套）放进格，
+    /// 用 Viterbi 式动态规划选一条「不重叠、总分最大」的路径（对应 LLM 的分词/束搜索）。
+    ///
+    /// 打分口径（全部符号化、可复现）：
+    /// - 节点权重 = 候选置信度 × 覆盖字数（置信度 × 证据长度）；
+    /// - 相邻选中实体在知识图谱中有关联时 +0.08 共现加成；
+    /// - 问题线索加成沿用 `hint_boost`（+0.1/条）；
+    /// - 平局裁决：总分高 → 节点少（长词优先）→ 迭代序（确定性）。
+    /// OOV 提名不进入格：没有候选就没有节点，保持「只报告、不落库」。
+    pub fn link_lattice(&self, text: &str, hints: &[String]) -> Vec<LinkedMention> {
+        if self.profiles.is_empty() || text.trim().is_empty() {
+            return Vec::new();
+        }
+        let chars: Vec<char> = text.chars().collect();
+
+        #[derive(Debug, Clone)]
+        struct LatticeNode {
+            start: usize,
+            end: usize,
+            surface: String,
+            candidates: Vec<LinkCandidate>,
+        }
+
+        let mut nodes: Vec<LatticeNode> = Vec::new();
+        // 1) 精确/别名：位置 i 上收集全部命中词面（不提前截断，保留嵌套候选）
+        for i in 0..chars.len() {
+            let Some(bucket) = self.surfaces_by_first.get(&chars[i]) else {
+                continue;
+            };
+            for (surface, surface_chars) in bucket {
+                let len = surface_chars.len();
+                if i + len > chars.len() || chars[i..i + len] != surface_chars[..] {
+                    continue;
+                }
+                let candidates = self.candidates_for_surface(surface);
+                if candidates.is_empty() {
+                    continue;
+                }
+                nodes.push(LatticeNode {
+                    start: i,
+                    end: i + len,
+                    surface: surface.clone(),
+                    candidates,
+                });
+            }
+        }
+        // 2) 模糊：按分隔段的容错候选（与旧路径共用同一候选生成器）
+        for fuzzy in self.fuzzy_mentions(text) {
+            let end = fuzzy.start + fuzzy.mention.chars().count();
+            nodes.push(LatticeNode {
+                start: fuzzy.start,
+                end,
+                surface: fuzzy.mention.clone(),
+                candidates: fuzzy.candidates,
+            });
+        }
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        // 线索加成先落到候选分上（与 disambiguate 的线索部分同口径）
+        for node in nodes.iter_mut() {
+            for candidate in node.candidates.iter_mut() {
+                let (boost, reasons) = self.hint_boost(&candidate.entity, hints);
+                if boost > 0.0 {
+                    candidate.score = (candidate.score + boost).min(0.99);
+                    candidate.reasons.extend(reasons);
+                }
+            }
+            node.candidates.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.entity.cmp(&b.entity))
+            });
+        }
+
+        // 起点 → 节点下标，保持构造序（确定性）
+        let mut nodes_by_start: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            nodes_by_start.entry(node.start).or_default().push(index);
+        }
+
+        #[derive(Debug, Clone)]
+        struct DpCell {
+            score: f64,
+            nodes: u32,
+            from_pos: usize,
+            from_state: String,
+            chosen: Option<(usize, usize)>,
+        }
+
+        fn better(a: &DpCell, b: &DpCell) -> bool {
+            if (a.score - b.score).abs() > 1e-9 {
+                return a.score > b.score;
+            }
+            a.nodes < b.nodes
+        }
+
+        fn offer(
+            layer: &mut std::collections::BTreeMap<String, DpCell>,
+            state: String,
+            cell: DpCell,
+        ) {
+            match layer.get(&state) {
+                Some(existing) if !better(&cell, existing) => {}
+                _ => {
+                    layer.insert(state, cell);
+                }
+            }
+        }
+
+        // dp[pos][上次选中的实体] = 覆盖前 pos 个字的最优路径；空串键表示尚未选中实体
+        let mut dp: Vec<std::collections::BTreeMap<String, DpCell>> =
+            vec![std::collections::BTreeMap::new(); chars.len() + 1];
+        dp[0].insert(
+            String::new(),
+            DpCell {
+                score: 0.0,
+                nodes: 0,
+                from_pos: 0,
+                from_state: String::new(),
+                chosen: None,
+            },
+        );
+        for pos in 0..=chars.len() {
+            let states: Vec<(String, DpCell)> = dp[pos]
+                .iter()
+                .map(|(state, cell)| (state.clone(), cell.clone()))
+                .collect();
+            for (state, cell) in states {
+                // 跳过当前字符（不产生指称）
+                if pos < chars.len() {
+                    offer(
+                        &mut dp[pos + 1],
+                        state.clone(),
+                        DpCell {
+                            score: cell.score,
+                            nodes: cell.nodes,
+                            from_pos: pos,
+                            from_state: state.clone(),
+                            chosen: None,
+                        },
+                    );
+                }
+                let Some(indices) = nodes_by_start.get(&pos) else {
+                    continue;
+                };
+                let prev_entity = if state.is_empty() {
+                    None
+                } else {
+                    Some(state.as_str())
+                };
+                for &node_index in indices {
+                    let node = &nodes[node_index];
+                    let mut best: Option<(f64, usize)> = None;
+                    for (candidate_index, candidate) in node.candidates.iter().enumerate() {
+                        let mut weight = candidate.score * (node.end - node.start) as f64;
+                        if let Some(prev) = prev_entity {
+                            if self
+                                .neighbors
+                                .get(prev)
+                                .map_or(false, |neighbors| neighbors.contains(&candidate.entity))
+                            {
+                                weight += 0.08;
+                            }
+                        }
+                        if best.map_or(true, |(best_weight, _)| weight > best_weight) {
+                            best = Some((weight, candidate_index));
+                        }
+                    }
+                    let Some((weight, candidate_index)) = best else {
+                        continue;
+                    };
+                    let entity = node.candidates[candidate_index].entity.clone();
+                    offer(
+                        &mut dp[node.end],
+                        entity,
+                        DpCell {
+                            score: cell.score + weight,
+                            nodes: cell.nodes + 1,
+                            from_pos: pos,
+                            from_state: state.clone(),
+                            chosen: Some((node_index, candidate_index)),
+                        },
+                    );
+                }
+            }
+        }
+
+        // 终点：全文本覆盖下总分最优（平局取节点少者）
+        let final_pos = chars.len();
+        let mut best_state: Option<String> = None;
+        for (state, cell) in dp[final_pos].iter() {
+            let replace = match &best_state {
+                None => true,
+                Some(current) => dp[final_pos]
+                    .get(current)
+                    .map_or(true, |current_cell| better(cell, current_cell)),
+            };
+            if replace {
+                best_state = Some(state.clone());
+            }
+        }
+        let Some(mut state) = best_state else {
+            return Vec::new();
+        };
+        let mut selected: Vec<(usize, usize, Option<String>)> = Vec::new();
+        let mut pos = final_pos;
+        while pos > 0 {
+            let Some(cell) = dp[pos].get(&state).cloned() else {
+                break;
+            };
+            if let Some((node_index, candidate_index)) = cell.chosen {
+                let prev_entity = if cell.from_state.is_empty() {
+                    None
+                } else {
+                    Some(cell.from_state.clone())
+                };
+                selected.push((node_index, candidate_index, prev_entity));
+            }
+            pos = cell.from_pos;
+            state = cell.from_state;
+        }
+        selected.reverse();
+
+        let mut mentions: Vec<LinkedMention> = Vec::with_capacity(selected.len());
+        for (node_index, candidate_index, prev_entity) in selected {
+            let node = &nodes[node_index];
+            let mut candidates = node.candidates.clone();
+            let chosen = &mut candidates[candidate_index];
+            if let Some(prev) = &prev_entity {
+                if self
+                    .neighbors
+                    .get(prev)
+                    .map_or(false, |neighbors| neighbors.contains(&chosen.entity))
+                {
+                    chosen.score = (chosen.score + 0.08).min(0.99);
+                    chosen
+                        .reasons
+                        .push(format!("全局选路：与相邻指称「{}」共现（+0.08）", prev));
+                }
+            }
+            chosen
+                .reasons
+                .push("全局选路：置信度×覆盖字数在该路径上最优".to_string());
+            let chosen_candidate = candidates.remove(candidate_index);
+            candidates.insert(0, chosen_candidate);
+            mentions.push(LinkedMention {
+                mention: node.surface.clone(),
+                start: node.start,
+                candidates,
+            });
+        }
+        mentions.sort_by_key(|mention| mention.start);
+        mentions
+    }
+
+    /// 格解码的可读报告：选中的指称与理由（只读展示，不改链接行为）。
+    pub fn lattice_report(&self, text: &str, hints: &[String]) -> String {
+        let mentions = self.link_lattice(text, hints);
+        if mentions.is_empty() {
+            return format!("格解码：「{}」未选出任何不重叠指称。", text);
+        }
+        let covered: usize = mentions
+            .iter()
+            .map(|mention| mention.mention.chars().count())
+            .sum();
+        let mut output = format!(
+            "格解码（提及格全局选路）：「{}」选出 {} 个不重叠指称，覆盖 {} 字。\n",
+            text,
+            mentions.len(),
+            covered
+        );
+        for mention in &mentions {
+            let _ = writeln!(
+                output,
+                "  • 「{}」（第 {} 字起）",
+                mention.mention,
+                mention.start + 1
+            );
+            if let Some(candidate) = mention.best() {
+                let _ = writeln!(
+                    output,
+                    "      → {}（置信度 {:.2}；{}）",
+                    candidate.entity,
+                    candidate.score,
+                    candidate.method.label()
+                );
+                for reason in &candidate.reasons {
+                    let _ = writeln!(output, "         - {}", reason);
+                }
+            }
+        }
+        output.trim_end().to_string()
     }
 
     pub fn report(&self, text: &str, hints: &[String]) -> String {
@@ -837,6 +1184,39 @@ impl EntityLinker {
         self.profiles
             .get(entity)
             .and_then(|profile| profile.etype.as_deref())
+    }
+
+    /// 从当前词表导出身份注册表（只读审计视图；歧义别名原样保留，不静默取一）。
+    pub fn identity_registry(&self) -> crate::identity::IdentityRegistry {
+        let mut registry = crate::identity::IdentityRegistry::new();
+        for name in self.profiles.keys() {
+            registry.register(name);
+        }
+        for (surface, canonicals) in &self.surface_candidates {
+            for canonical in canonicals {
+                if surface != canonical && self.profiles.contains_key(canonical) {
+                    let _ = registry.register_alias(surface, canonical);
+                }
+            }
+        }
+        registry
+    }
+
+    /// 接地清单：每个指称的最佳候选（词面 ↔ 实体 ↔ 类型 ↔ 置信度）。
+    ///
+    /// 只读视图，与链接路径同源；置信度阈值由调用方决定（回答附引用用）。
+    pub fn grounded_mentions(&self, text: &str, hints: &[String]) -> Vec<GroundedMention> {
+        self.link_with_context(text, hints)
+            .into_iter()
+            .filter_map(|mention| {
+                mention.best().map(|candidate| GroundedMention {
+                    mention: mention.mention.clone(),
+                    entity: candidate.entity.clone(),
+                    etype: self.entity_type(&candidate.entity).map(str::to_string),
+                    score: candidate.score,
+                })
+            })
+            .collect()
     }
 
     /// 为文本中的每个指称生成证据收据（只读审计，不改变链接行为）。
@@ -1238,9 +1618,113 @@ mod tests {
         let rendered = render_mention_ledger(text, &receipts, &["人"], &suspects);
         assert!(rendered.contains("OOV 疑点（只报告，不落库）"));
         assert!(rendered.contains("未名研究院"));
+        assert!(rendered.contains("暂定类型：组织"), "后缀表应给出暂定类型：{}", rendered);
         assert_eq!(render_mention_ledger(text, &receipts, &["人"], &suspects), rendered);
 
         let no_oov = render_mention_ledger("苹果的创始人是谁", &[], &[], &[]);
         assert!(!no_oov.contains("OOV 疑点"));
+    }
+
+    /// 格解码：嵌套指称等分时由「长词优先」（节点少者）裁决，选不重叠的最大证据路径。
+    #[test]
+    fn test_lattice_decoding_prefers_longest_exact_path_on_tie() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("北京大学", Some("组织"));
+        linker.register_entity("北京", Some("地点"));
+        linker.register_entity("大学", Some("组织"));
+        let mentions = linker.link_lattice("北京大学的校长是谁", &[]);
+        assert_eq!(mentions.len(), 1, "等分时长词应压过拆分路径：{:?}", mentions);
+        assert_eq!(mentions[0].mention, "北京大学");
+        assert_eq!(mentions[0].best().unwrap().entity, "北京大学");
+        assert!(mentions[0]
+            .best()
+            .unwrap()
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("全局选路")));
+    }
+
+    #[test]
+    fn test_lattice_decoding_splits_when_long_form_unknown() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("北京", Some("地点"));
+        linker.register_entity("大学", Some("组织"));
+        let mentions = linker.link_lattice("北京大学的校长是谁", &[]);
+        let surfaces: Vec<&str> = mentions.iter().map(|m| m.mention.as_str()).collect();
+        assert_eq!(surfaces, vec!["北京", "大学"]);
+        assert_eq!(
+            linker.lattice_report("北京大学的校长是谁", &[]),
+            linker.lattice_report("北京大学的校长是谁", &[]),
+            "格解码报告必须确定可复现"
+        );
+        assert!(linker
+            .lattice_report("今天天气怎么样", &[])
+            .contains("未选出"));
+    }
+
+    #[test]
+    fn test_lattice_decoding_includes_fuzzy_overlaps() {
+        let linker = sample_linker();
+        let mentions = linker.link_lattice("刘德桦的出生地是哪里", &[]);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].best().unwrap().entity, "刘德华");
+        assert_eq!(mentions[0].best().unwrap().method, LinkMethod::Fuzzy);
+    }
+
+    /// 身份注册表快照：别名与歧义原样保留（不静默取一），审计行确定。
+    #[test]
+    fn test_identity_registry_snapshot_keeps_aliases_and_ambiguity() {
+        let linker = sample_linker();
+        let registry = linker.identity_registry();
+        assert_eq!(registry.len(), linker.len());
+        assert_eq!(
+            registry.resolve("苹果"),
+            crate::identity::Resolution::Ambiguous(vec![
+                "苹果公司".to_string(),
+                "苹果果实".to_string(),
+            ])
+        );
+        assert_eq!(
+            registry.resolve("苹果公司"),
+            crate::identity::Resolution::Canonical("苹果公司".to_string())
+        );
+        let report = registry.audit_lines().join("\n");
+        assert!(report.contains("身份注册表"));
+        assert!(report.contains("苹果公司"));
+        assert!(report.contains("苹果果实"));
+    }
+
+    /// OOV 提名带暂定类型；准入是显式动作且幂等，未准入前 KB 不变。
+    #[test]
+    fn test_oov_suggested_type_and_explicit_admission() {
+        let mut linker = sample_linker();
+        let before = linker.len();
+        let text = "未名科技公司发布了新书";
+        let receipts = linker.mention_receipts(text, &[], &[], None);
+        let suspects = oov_suspects(text, &receipts);
+        let company = suspects
+            .iter()
+            .find(|suspect| suspect.text == "未名科技公司")
+            .expect("后缀词应被提名");
+        assert_eq!(company.suggested_type.as_deref(), Some("组织"));
+        assert!(!linker.is_known_entity("未名科技公司"));
+        assert_eq!(linker.len(), before, "提名不落库");
+
+        let (name, etype) = linker.admit_entity("未名科技公司").expect("准入应成功");
+        assert_eq!(name, "未名科技公司");
+        assert_eq!(etype, "组织");
+        assert!(linker.is_known_entity("未名科技公司"));
+        assert_eq!(linker.len(), before + 1);
+        assert_eq!(
+            linker.admit_entity("未名科技公司").unwrap().1,
+            "组织",
+            "重复准入幂等"
+        );
+        assert!(linker.admit_entity("   ").is_none());
+        assert_eq!(
+            linker.admit_entity("张三丰").unwrap().1,
+            "Entity",
+            "无后缀线索时显式准入为通用类型"
+        );
     }
 }

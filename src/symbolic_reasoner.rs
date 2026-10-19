@@ -238,6 +238,9 @@ pub struct SnapshotClause {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueSnapshot {
     pub focus_entities: Vec<String>,
+    /// 焦点实体的类型证据（代词消解闸门；旧信封缺省为空）
+    #[serde(default)]
+    pub focus_types: HashMap<String, String>,
     pub last_predicate: Option<String>,
     pub history: Vec<String>,
     #[serde(default)]
@@ -341,6 +344,8 @@ impl Ord for MagnitudeDisplayKey {
 
 pub struct DialogueContext {
     focus_entities: Vec<String>,
+    /// 焦点实体的类型证据（代词消解的类型闸门；未知=键不存在）
+    focus_types: HashMap<String, String>,
     last_predicate: Option<String>,
     history: Vec<String>,
     generation: Option<GenerationState>,
@@ -352,6 +357,7 @@ impl DialogueContext {
     pub fn new(max_focus: usize) -> Self {
         Self {
             focus_entities: Vec::new(),
+            focus_types: HashMap::new(),
             last_predicate: None,
             history: Vec::new(),
             generation: None,
@@ -377,9 +383,21 @@ impl DialogueContext {
     }
 
     pub fn record_entities(&mut self, entities: &[String]) {
-        for entity in entities.iter().rev() {
+        let typed: Vec<(String, Option<String>)> = entities
+            .iter()
+            .map(|entity| (entity.clone(), None))
+            .collect();
+        self.record_entities_typed(&typed);
+    }
+
+    /// 带类型证据的焦点登记：类型随实体入栈，供代词消解做类型过滤。
+    pub fn record_entities_typed(&mut self, entities: &[(String, Option<String>)]) {
+        for (entity, etype) in entities.iter().rev() {
             if entity.is_empty() {
                 continue;
+            }
+            if let Some(etype) = etype.as_deref().filter(|etype| !etype.trim().is_empty()) {
+                self.focus_types.insert(entity.clone(), etype.to_string());
             }
             self.focus_entities.retain(|e| e != entity);
             self.focus_entities.insert(0, entity.clone());
@@ -387,6 +405,14 @@ impl DialogueContext {
         if self.focus_entities.len() > self.max_focus {
             self.focus_entities.truncate(self.max_focus);
         }
+        // 类型表随焦点栈裁剪，避免无限增长
+        self.focus_types
+            .retain(|entity, _| self.focus_entities.contains(entity));
+    }
+
+    /// 焦点实体的类型证据（代词闸门用）。
+    pub fn focus_type(&self, entity: &str) -> Option<&str> {
+        self.focus_types.get(entity).map(String::as_str)
     }
 
     pub fn record_predicate(&mut self, predicate: &str) {
@@ -407,6 +433,7 @@ impl DialogueContext {
 
     pub fn clear(&mut self) {
         self.focus_entities.clear();
+        self.focus_types.clear();
         self.last_predicate = None;
         self.history.clear();
         self.generation = None;
@@ -430,6 +457,7 @@ impl DialogueContext {
     pub fn snapshot(&self) -> DialogueSnapshot {
         DialogueSnapshot {
             focus_entities: self.focus_entities.clone(),
+            focus_types: self.focus_types.clone(),
             last_predicate: self.last_predicate.clone(),
             history: self.history.clone(),
             generation: self.generation.clone(),
@@ -444,22 +472,45 @@ impl DialogueContext {
     pub fn restore(&mut self, snapshot: &DialogueSnapshot) {
         self.focus_entities = snapshot.focus_entities.clone();
         self.focus_entities.truncate(self.max_focus);
+        self.focus_types = snapshot.focus_types.clone();
+        self.focus_types
+            .retain(|entity, _| self.focus_entities.contains(entity));
         self.last_predicate = snapshot.last_predicate.clone();
         self.history = snapshot.history.clone();
         self.history.truncate(self.max_history);
         self.generation = snapshot.generation.clone();
     }
 
+    /// 类型过滤 + 显著度排序地消解一个代词。
+    ///
+    /// - 序数代词：「前者」= 焦点栈第 1 个、「后者」= 第 2 个（按最近一次提及顺序）；
+    /// - 类型代词：「他/她/这个人」要求人物类型（类型未知按开放世界放行），
+    ///   「它/它们」要求已知非人物类型，「该公司」要求公司/组织类型；
+    /// - 找不到唯一相容指称就返回 None：原样让位，绝不乱猜。
+    pub fn resolve_pronoun_referent(&self, pronoun: &str) -> Option<String> {
+        if let Some(index) = crate::identity::ordinal_pronoun_index(pronoun) {
+            return self.focus_entities.get(index).cloned();
+        }
+        let filter = crate::identity::pronoun_filter(pronoun)?;
+        self.focus_entities
+            .iter()
+            .find(|entity| {
+                crate::identity::type_allows(self.focus_type(entity), filter)
+            })
+            .cloned()
+    }
+
     pub fn resolve_pronouns(&self, input: &str) -> Option<String> {
-        let focus = self.focus()?;
-        const PRONOUNS: [&str; 7] = ["他们", "她们", "它们", "这个人", "他", "她", "它"];
-        let mut result = String::with_capacity(input.len() + focus.len());
+        if self.focus_entities.is_empty() {
+            return None;
+        }
+        let mut result = String::with_capacity(input.len() + 8);
         let mut replaced = false;
         let mut chars = input.char_indices().peekable();
         while let Some((i, ch)) = chars.next() {
-            // 在字节切片上直接判断前缀
+            // 在字节切片上直接判断前缀（代词表长词面优先，避免「他们」被「他」截断）
             let mut matched: Option<&str> = None;
-            for pronoun in PRONOUNS {
+            for pronoun in crate::identity::PRONOUNS {
                 if input[i..].starts_with(pronoun) {
                     matched = Some(pronoun);
                     break;
@@ -469,17 +520,20 @@ impl DialogueContext {
                 let previous = input[..i].chars().next_back();
                 let blocked = matches!(previous, Some('其') | Some('无'));
                 if !blocked {
-                    result.push_str(focus);
-                    let end = i + pronoun.len();
-                    while let Some((next, _)) = chars.peek() {
-                        if *next < end {
-                            chars.next();
-                        } else {
-                            break;
+                    if let Some(referent) = self.resolve_pronoun_referent(pronoun) {
+                        result.push_str(&referent);
+                        let end = i + pronoun.len();
+                        while let Some((next, _)) = chars.peek() {
+                            if *next < end {
+                                chars.next();
+                            } else {
+                                break;
+                            }
                         }
+                        replaced = true;
+                        continue;
                     }
-                    replaced = true;
-                    continue;
+                    // 类型不相容 / 指称不足：代词原样保留（让位），不伪造指代
                 }
             }
             result.push(ch);
@@ -1512,7 +1566,17 @@ impl SymbolicReasoner {
             }
         }
         if !entities.is_empty() {
-            self.context.record_entities(&entities);
+            // 焦点实体带类型证据入栈：代词消解据此做类型闸门（未知则不设限）
+            let typed: Vec<(String, Option<String>)> = entities
+                .iter()
+                .map(|entity| {
+                    (
+                        entity.clone(),
+                        self.linker.entity_type(entity).map(str::to_string),
+                    )
+                })
+                .collect();
+            self.context.record_entities_typed(&typed);
             if self.config.enable_holographic_memory {
                 for entity in &entities {
                     self.holo.push_focus(entity);
@@ -1651,7 +1715,37 @@ impl SymbolicReasoner {
     }
 
     // 实体链接：候选生成 + 模糊容错 + 上下文消歧（详见 entity_linker 模块）
-    const LINK_ACCEPT_THRESHOLD: f64 = 0.5;
+    pub const LINK_ACCEPT_THRESHOLD: f64 = 0.5;
+
+    /// 接地清单：词面 ↔ 实体 ↔ 类型（与链接路径同源，供回答附引用）。
+    pub fn grounding_mentions(
+        &self,
+        text: &str,
+    ) -> Vec<crate::entity_linker::GroundedMention> {
+        let hints = self.link_hints(text);
+        self.linker.grounded_mentions(text, &hints)
+    }
+
+    /// 显式准入一个 OOV 词面（提名 → 用户确认 → 词表增长）。
+    ///
+    /// 返回（词面，类型）；只改会话内词表（链接缓存即时失效）；
+    /// 持久化由调用方写入知识库后重新观察事实完成。
+    pub fn admit_vocabulary(&mut self, surface: &str) -> Option<(String, String)> {
+        let admitted = self.linker.admit_entity(surface)?;
+        *self.link_memo.lock() = None;
+        Some(admitted)
+    }
+
+    /// 提及格全局解码报告（只读审计面：不改变实际链接路径）。
+    pub fn mention_lattice_report(&self, text: &str) -> String {
+        let hints = self.link_hints(text);
+        self.linker.lattice_report(text, &hints)
+    }
+
+    /// 身份台账：规范身份 ↔ 别名 ↔ 歧义（URI 身份的只读审计视图，确定排序）。
+    pub fn identity_report(&self) -> String {
+        self.linker.identity_registry().audit_lines().join("\n")
+    }
 
     /// 文本的实体链接结果：一次查询流程内同一文本会被多处链接，做单条记忆复用
     fn linked_mentions(&self, text: &str) -> Arc<Vec<LinkedMention>> {
@@ -6123,6 +6217,57 @@ mod tests {
             .expect("代词应被解析为上下文焦点实体");
         assert!(rewritten.contains("张三"));
         assert!(!rewritten.contains("他的"));
+    }
+
+    /// 类型闸门：「他/她」可解析人物（类型未知按开放世界放行），
+    /// 「它」绝不指代人物，「该公司」顺位到组织，「前者/后者」按焦点栈序取。
+    #[test]
+    fn test_pronoun_type_gate_and_ordinals() {
+        let mut context = DialogueContext::new(8);
+        context.record_entities_typed(&[
+            ("张三".to_string(), Some("人".to_string())),
+            ("未名科技公司".to_string(), Some("组织".to_string())),
+            ("某物".to_string(), None),
+        ]);
+        assert_eq!(
+            context.resolve_pronouns("他的师傅是谁").as_deref(),
+            Some("张三的师傅是谁")
+        );
+        assert_eq!(
+            context.resolve_pronouns("它的创始人是谁").as_deref(),
+            Some("未名科技公司的创始人是谁"),
+            "「它」应优先解析到已知非人物焦点"
+        );
+        assert_eq!(
+            context.resolve_pronouns("前者是谁").as_deref(),
+            Some("张三是谁"),
+            "「前者」= 焦点栈第 1 个（最近一次提及顺序）"
+        );
+        assert_eq!(
+            context.resolve_pronouns("后者是谁").as_deref(),
+            Some("未名科技公司是谁")
+        );
+        // 「该公司」只认公司/组织：焦点栈顶端是人时顺位到组织
+        context.clear();
+        context.record_entities_typed(&[
+            ("张三".to_string(), Some("人".to_string())),
+            ("未名科技公司".to_string(), Some("组织".to_string())),
+        ]);
+        assert_eq!(
+            context.resolve_pronouns("该公司的创始人是谁").as_deref(),
+            Some("未名科技公司的创始人是谁")
+        );
+        // 只有人物焦点时「它」让位（不替换、不乱猜）
+        context.clear();
+        context.record_entities_typed(&[("张三".to_string(), Some("人".to_string()))]);
+        assert_eq!(
+            context.resolve_pronouns("他的师傅是谁").as_deref(),
+            Some("张三的师傅是谁")
+        );
+        assert!(
+            context.resolve_pronouns("它的师傅是谁").is_none(),
+            "「它」不得指代人物"
+        );
     }
 
     #[test]

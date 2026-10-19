@@ -70,6 +70,7 @@ pub mod quality;
 pub mod epistemic;
 pub mod eval_recovery;
 pub mod recovery;
+pub mod identity;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -77,8 +78,8 @@ mod dialogue_conformance;
 use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
 use prolog_engine::PrologFact;
 
-// RDF命名空间
-const BASE_NS: &str = "http://example.org/kg/";
+// RDF命名空间（与 identity::DEFAULT_BASE_NS 单一正本）
+const BASE_NS: &str = crate::identity::DEFAULT_BASE_NS;
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const NAME_PREDICATE_IRI: &str = "http://example.org/kg/name";
@@ -112,7 +113,7 @@ fn entity_type_labels(
     store: &Store,
     name: &str,
 ) -> Result<BTreeSet<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let subject = NamedNode::new(format!("{}entity/{}", BASE_NS, name))?;
+    let subject = NamedNode::new(crate::identity::entity_uri(BASE_NS, name))?;
     let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
     let mut labels = BTreeSet::new();
     for quad in
@@ -1015,7 +1016,7 @@ impl OxigraphManager {
         let subject_uri = if let Some(id) = obj.get("@id") {
             id.as_str().unwrap_or("").to_string()
         } else {
-            format!("{}entity/{}", BASE_NS, Uuid::new_v4())
+            crate::identity::entity_uri(BASE_NS, &Uuid::new_v4().to_string())
         };
         
         if subject_uri.is_empty() {
@@ -1217,7 +1218,7 @@ impl OxigraphManager {
             .get("name")
             .cloned()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let subject_iri = format!("{}entity/{}", BASE_NS, subject_name);
+        let subject_iri = crate::identity::entity_uri(BASE_NS, &subject_name);
         let subject = NamedNode::new(subject_iri.clone())?;
         let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
         let entity_type_iri = format!("{}{}", BASE_NS, label);
@@ -1384,8 +1385,8 @@ impl OxigraphManager {
             return Ok(());
         }
 
-        let subject_iri = format!("{}entity/{}", BASE_NS, subject_name);
-        let object_iri = format!("{}entity/{}", BASE_NS, object_name);
+        let subject_iri = crate::identity::entity_uri(BASE_NS, &subject_name);
+        let object_iri = crate::identity::entity_uri(BASE_NS, &object_name);
         let predicate_iri = format!("{}{}", BASE_NS, predicate_name);
         let subject = NamedNode::new(subject_iri.clone())?;
         let predicate = NamedNode::new(predicate_iri.clone())?;
@@ -1418,7 +1419,7 @@ impl OxigraphManager {
         name: &str,
         receipt: &mut predicate_registry::ImportReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let subject_iri = format!("{}entity/{}", BASE_NS, name);
+        let subject_iri = crate::identity::entity_uri(BASE_NS, name);
         let predicate_iri = format!("{}name", BASE_NS);
         let subject = NamedNode::new(subject_iri.clone())?;
         let predicate = NamedNode::new(predicate_iri.clone())?;
@@ -1514,10 +1515,18 @@ impl OxigraphManager {
         Ok(removed)
     }
 
-    /// `http://example.org/kg/entity/张三` → `张三`，其它 IRI 原样返回。
+    /// `http://example.org/kg/entity/张三` → `张三`（百分号编码无损反解），其它 IRI 原样返回。
     fn local_kg_name(iri: &str) -> String {
-        match iri.strip_prefix(BASE_NS) {
-            Some(rest) => rest.strip_prefix("entity/").unwrap_or(rest).to_string(),
+        crate::identity::local_name(BASE_NS, iri).unwrap_or_else(|| iri.to_string())
+    }
+
+    /// 主体 IRI → 图谱键：优先按 kg 实体路径无损反解；外部 IRI 退回「尾部段」旧语义。
+    fn entity_key_from_iri(iri: &str) -> String {
+        if let Some(name) = crate::identity::local_name(BASE_NS, iri) {
+            return name;
+        }
+        match iri.rsplit_once("entity/") {
+            Some((_, tail)) => tail.to_string(),
             None => iri.to_string(),
         }
     }
@@ -1836,22 +1845,13 @@ impl OxigraphManager {
                 continue;
             }
 
-            // 命名节点直接取 IRI 尾部
+            // 命名节点直接取 IRI 尾部（kg 实体 IRI 经百分号解码反解；外部 IRI 保持旧语义）
             let entity_name = match &quad.subject {
-                Subject::NamedNode(node) => {
-                    let iri = node.as_str();
-                    match iri.rsplit_once("entity/") {
-                        Some((_, tail)) => tail.to_string(),
-                        None => iri.to_string(),
-                    }
-                }
+                Subject::NamedNode(node) => Self::entity_key_from_iri(node.as_str()),
                 _ => {
                     let subject_str = quad.subject.to_string();
-                    if let Some((_, tail)) = subject_str.rsplit_once("entity/") {
-                        tail.trim_matches(|c| c == '<' || c == '>').to_string()
-                    } else {
-                        subject_str.trim_matches(|c| c == '<' || c == '>').to_string()
-                    }
+                    let trimmed = subject_str.trim_matches(|c| c == '<' || c == '>');
+                    Self::entity_key_from_iri(trimmed)
                 }
             };
 
@@ -3056,6 +3056,29 @@ mod cache_tests {
             label: "Person".to_string(),
             properties: HashMap::from([("name".to_string(), name.to_string())]),
         }
+    }
+
+    /// 身份 URI 往返：名字含 `/`、空格时 IRI 合法，且图谱键能无损反解（编码/解码往返律）。
+    #[tokio::test]
+    async fn entity_uri_roundtrip_handles_awkward_names() {
+        let (manager, _dir) = temp_manager().await;
+        let name = "北京/大学 附中";
+        manager.save_knowledge(vec![person(name)]).await.unwrap();
+        let facts = manager.load_all_facts().await.unwrap();
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                PrologFact::Entity { name: fact_name, .. } if fact_name == name
+            )),
+            "图谱键应无损往返：{:?}",
+            facts
+        );
+        let iri = crate::identity::entity_uri(crate::identity::DEFAULT_BASE_NS, name);
+        assert!(!iri.contains(' '), "URI 不允许空格：{}", iri);
+        assert_eq!(
+            crate::identity::entity_local_name(crate::identity::DEFAULT_BASE_NS, &iri).as_deref(),
+            Some(name)
+        );
     }
 
     /// 版本键查询缓存：同版本重复问同一实体命中缓存；写入后自动失效。
