@@ -1357,7 +1357,7 @@ impl Ord for ScenarioOrderKey {
 
 /// 去重：同一基事实只保留置信度最高的一条。
 /// 输入已按可信度降序排序，故保留每个原子的首次出现即可，
-/// 同时保持原有顺序（调用方随后依赖该顺序做截断与「假设 N」编号）。
+/// 同时保持顺序（调用方随后依赖该顺序做截断与「假设 N」编号）。
 fn dedupe_hypotheses(hypotheses: &mut Vec<Hypothesis>) {
     let mut seen: HashSet<String> = HashSet::new();
     hypotheses.retain(|hypothesis| seen.insert(hypothesis.atom.display()));

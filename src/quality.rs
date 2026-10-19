@@ -167,7 +167,7 @@ impl ClaimWarrant {
 /// 质量索引：把一次护照报告投影成对话可消费的「担保查询表」。
 ///
 /// 只读派生数据：不写图谱、不改事实。`revision` 由宿主注入，
-/// 用于多轮记忆里判断「这条旧回答基于哪一版知识」。
+/// 用于多轮记忆里判断「该回答基于哪一版知识」。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QualityIndex {
     pub revision: u64,

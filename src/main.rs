@@ -3004,7 +3004,7 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 显式刷新：删除旧页，下次提问重新取回（外链数据不在本地写权限内，
+        // 显式刷新：删除缓存页，下次提问重新取回（外链数据不在本地写权限内，
         // 用"逻辑时刻 + 显式刷新"代替时间戳轮询）
         if let Some(entity) = strip_any_prefix(
             input,

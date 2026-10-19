@@ -104,10 +104,10 @@ pub struct DialogueTurn {
     pub answer_excerpt: Option<String>,
     pub provenance: Vec<String>,
     pub plan: Vec<String>,
-    /// 本轮回答依据的质量担保（来源/冲突/缺口/类型）；旧快照缺省为 None。
+    /// 本轮回答依据的质量担保（来源/冲突/缺口/类型）；快照未包含该字段时按 None 恢复。
     #[serde(default)]
     pub warrant: Option<ClaimWarrant>,
-    /// 回答时所依据的知识版本（多轮复核用）；旧快照缺省为 None。
+    /// 回答时所依据的知识版本（多轮复核用）；快照未包含该字段时按 None 恢复。
     #[serde(default)]
     pub kb_revision: Option<u64>,
 }
@@ -503,7 +503,7 @@ impl DialogueManager {
         self.recovery_mode
     }
 
-    /// 注入质量索引（只读；`None` 时完全保持原有回答路径）。
+    /// 注入质量索引（只读；`None` 时完全走常规回答路径）。
     /// 宿主应在知识版本推进后重建索引，使「带出处/披露冲突/追问缺口」生效。
     pub fn set_quality_index(&mut self, index: Option<QualityIndex>) -> &mut Self {
         self.quality = index;
@@ -1371,7 +1371,7 @@ impl DialogueManager {
 
     /// 复核上一轮回答：比较当时保存的担保与当前知识版本。
     ///
-    /// 关键约束：删掉的事实绝不能再被说成「现在仍为真」；新增冲突必须显式
+    /// 关键约束：删掉的事实绝不能被说成「现在仍为真」；新增冲突必须显式
     /// 披露；版本推进但事实未变时只更新「仍成立」而不制造虚假变化。
     fn review_text(&self, knowledge: &dyn DialogueKnowledge) -> (String, &'static str) {
         let Some(turn) = self.last_answered_turn() else {

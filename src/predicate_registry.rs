@@ -605,7 +605,7 @@ impl PredicateRegistry {
             let profile = self.ensure_profile(slot, source);
             profile.aliases.insert(alias.to_string());
         }
-        // alias 名下原有的其它别名 → 以逆向坐标重新指向槽位
+        // alias 名下的其它别名 → 以逆向坐标重新指向槽位
         let descendants: Vec<String> = self
             .alias_index
             .iter()
@@ -1578,7 +1578,7 @@ mod tests {
             clash.actions
         );
 
-        // 图谱维持原有关系
+        // 图谱维持关系
         let relations = manager.load_all_relations().await.unwrap();
         assert!(
             relations.iter().any(|fact| matches!(
@@ -1586,7 +1586,7 @@ mod tests {
                 PrologFact::Relation { from, rel_type, to }
                     if rel_type == "师傅" && from == "张三" && to == "李四"
             )),
-            "冲突后不得丢失原有关系：{:?}",
+            "冲突后不得丢失关系：{:?}",
             relations
         );
         assert!(

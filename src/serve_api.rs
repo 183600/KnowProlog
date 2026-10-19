@@ -1625,7 +1625,7 @@ fn session_error_response(error: SessionError) -> Response {
     }
 }
 
-/// 解码失败 → HTTP 响应：保留原有人类可读措辞，附加稳定错误码。
+/// 解码失败 → HTTP 响应：保留人类可读措辞，附加稳定错误码。
 fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Response {
     state.perf.bump(&error.metric_key());
     match error {

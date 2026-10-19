@@ -4060,7 +4060,7 @@ mod cache_tests {
             manager.entity_registry_snapshot().to_json()
         );
 
-        // 提名 → 拒绝：墓碑阻止解析；合并：旧名重定向
+        // 提名 → 拒绝：墓碑阻止解析；合并：改名后重定向
         let nominations = manager.nominate_entity_aliases(&[crate::entity_registry::AliasCandidate {
             surface: "小张".to_string(),
             canonical: "张三".to_string(),

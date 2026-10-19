@@ -1604,7 +1604,7 @@ mod tests {
             registry.mint_check("ＡＣＭＥ公司"),
             MintVerdict::Variant { ref canonical, .. } if canonical == "ACME"
         ));
-        // 合并后：旧名重定向，新名存在
+        // 合并后：改名重定向，新名存在
         let record = registry.merge("ACME", "宏基").unwrap();
         assert_eq!(record.moved_aliases, 1);
         assert!(matches!(
