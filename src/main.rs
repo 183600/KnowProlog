@@ -226,6 +226,48 @@ async fn main() {
         }
     };
 
+    // 无需知识存储的子命令先行处理：只跑提示词 lint / NLU 评测时，
+    // 即使 Oxigraph 库路径不可用也不受影响（不创建存储、不读知识库）。
+    match &cli.command {
+        Some(Commands::PromptLint { json }) => {
+            run_prompt_lint(*json);
+            return;
+        }
+        Some(Commands::EvalNlu {
+            knowledge,
+            prompt_mode,
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            run_eval_nlu(
+                knowledge,
+                prompt_mode,
+                baseline.clone(),
+                *update_baseline,
+                *allow_regression,
+                *json,
+            );
+            return;
+        }
+        Some(Commands::EvalRecovery {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            run_eval_recovery(
+                baseline.clone(),
+                *update_baseline,
+                *allow_regression,
+                *json,
+            );
+            return;
+        }
+        _ => {}
+    }
+
     // 会话级性能台账：存储与推理共享同一实例，报告覆盖整条链路
     let perf_ledger = PerfLedger::shared();
 
@@ -257,8 +299,8 @@ async fn main() {
             println!("正在导入 JSON-LD 文件: {}", file_path);
             
             match oxigraph_manager.import_jsonld_from_file(&file_path).await {
-                Ok(_) => {
-                    println!("JSON-LD 文件导入成功！");
+                Ok(stats) => {
+                    println!("JSON-LD 文件导入成功：{}", stats.summary());
                 }
                 Err(e) => {
                     eprintln!("JSON-LD 文件导入失败: {}", e);
@@ -270,8 +312,8 @@ async fn main() {
             println!("正在导入 JSON-LD 内容...");
             
             match oxigraph_manager.import_jsonld(&content).await {
-                Ok(_) => {
-                    println!("JSON-LD 内容导入成功！");
+                Ok(stats) => {
+                    println!("JSON-LD 内容导入成功：{}", stats.summary());
                 }
                 Err(e) => {
                     eprintln!("JSON-LD 内容导入失败: {}", e);
@@ -351,120 +393,11 @@ async fn main() {
                 }
             }
         }
-        Some(Commands::EvalNlu {
-            knowledge,
-            prompt_mode,
-            baseline,
-            update_baseline,
-            allow_regression,
-            json,
-        }) => {
-            let mode = match knowledge.as_str() {
-                "scripted" => EvalKnowledge::Scripted,
-                "reasoner" => EvalKnowledge::Reasoner,
-                other => {
-                    eprintln!("未知的知识后端「{}」：可选 reasoner / scripted", other);
-                    std::process::exit(1);
-                }
-            };
-            let prompt_mode = parse_prompt_mode(&prompt_mode);
-            let report = evaluate_seed_with(mode, prompt_mode);
-            if json {
-                match serde_json::to_string_pretty(&report) {
-                    Ok(text) => println!("{}", text),
-                    Err(e) => {
-                        eprintln!("报告序列化失败: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                print!("{}", report.render_text());
-            }
-
-            let baseline_path = baseline
-                .clone()
-                .unwrap_or_else(|| "nlu_eval_baseline.json".to_string());
-            if update_baseline {
-                let new_baseline = DialogueEvalBaseline::from_report(&report);
-                match new_baseline.save(&baseline_path) {
-                    Ok(()) => println!("对话 NLU 基线已写入 {}", baseline_path),
-                    Err(e) => {
-                        eprintln!("基线写入失败: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else if baseline.is_some() {
-                match DialogueEvalBaseline::load(&baseline_path) {
-                    Ok(old_baseline) => {
-                        let verdict = compare_dialogue_baseline(&old_baseline, &report, 1e-6);
-                        print!("{}", verdict.render_text());
-                        if !verdict.passed && !allow_regression {
-                            std::process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("基线读取失败: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-        Some(Commands::EvalRecovery {
-            baseline,
-            update_baseline,
-            allow_regression,
-            json,
-        }) => {
-            let report = know_prolog::eval_recovery::evaluate_seed();
-            if json {
-                match serde_json::to_string_pretty(&report) {
-                    Ok(text) => println!("{}", text),
-                    Err(e) => {
-                        eprintln!("恢复评测序列化失败: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                println!("{}", report.render_text());
-            }
-
-            let baseline_path = baseline
-                .clone()
-                .unwrap_or_else(|| "recovery_baseline.json".to_string());
-            if update_baseline {
-                let new_baseline = know_prolog::eval_recovery::EvalRecoveryBaseline::from_report(
-                    &report,
-                );
-                match new_baseline.save(&baseline_path) {
-                    Ok(()) => println!("恢复基线已写入 {}", baseline_path),
-                    Err(e) => {
-                        eprintln!("基线写入失败: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else if baseline.is_some() {
-                match know_prolog::eval_recovery::EvalRecoveryBaseline::load(&baseline_path) {
-                    Ok(old_baseline) => {
-                        let verdict = know_prolog::eval_recovery::compare_baseline(
-                            &old_baseline,
-                            &report,
-                            1e-6,
-                        );
-                        print!("{}", verdict.render_text());
-                        if !verdict.passed && !allow_regression {
-                            std::process::exit(1);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("基线读取失败: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-        Some(Commands::PromptLint { json }) => {
-            run_prompt_lint(json);
-        }
+        // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
+        Some(Commands::EvalNlu { .. }) => {}
+        Some(Commands::EvalRecovery { .. }) => {}
+        // 已在打开存储前处理（见 main 顶部早期分派）
+        Some(Commands::PromptLint { .. }) => {}
         Some(Commands::EvalQuality {
             baseline,
             update_baseline,
@@ -586,7 +519,120 @@ async fn main() {
         }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
-            run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode).await;
+            run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode, &store_path).await;
+        }
+    }
+}
+
+/// `eval-nlu`：对话 NLU 金标评测 + 回归棘轮（不依赖知识存储）。
+fn run_eval_nlu(
+    knowledge: &str,
+    prompt_mode: &str,
+    baseline: Option<String>,
+    update_baseline: bool,
+    allow_regression: bool,
+    json: bool,
+) {
+    let mode = match knowledge {
+        "scripted" => EvalKnowledge::Scripted,
+        "reasoner" => EvalKnowledge::Reasoner,
+        other => {
+            eprintln!("未知的知识后端「{}」：可选 reasoner / scripted", other);
+            std::process::exit(1);
+        }
+    };
+    let prompt_mode = parse_prompt_mode(prompt_mode);
+    let report = evaluate_seed_with(mode, prompt_mode);
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("报告序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline
+        .clone()
+        .unwrap_or_else(|| "nlu_eval_baseline.json".to_string());
+    if update_baseline {
+        let new_baseline = DialogueEvalBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => println!("对话 NLU 基线已写入 {}", baseline_path),
+            Err(e) => {
+                eprintln!("基线写入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match DialogueEvalBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                let verdict = compare_dialogue_baseline(&old_baseline, &report, 1e-6);
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `eval-recovery`：失败恢复金标评测 + 回归棘轮（不依赖知识存储）。
+fn run_eval_recovery(
+    baseline: Option<String>,
+    update_baseline: bool,
+    allow_regression: bool,
+    json: bool,
+) {
+    let report = know_prolog::eval_recovery::evaluate_seed();
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("恢复评测序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline
+        .clone()
+        .unwrap_or_else(|| "recovery_baseline.json".to_string());
+    if update_baseline {
+        let new_baseline = know_prolog::eval_recovery::EvalRecoveryBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => println!("恢复基线已写入 {}", baseline_path),
+            Err(e) => {
+                eprintln!("基线写入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match know_prolog::eval_recovery::EvalRecoveryBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                let verdict = know_prolog::eval_recovery::compare_baseline(
+                    &old_baseline,
+                    &report,
+                    1e-6,
+                );
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -815,6 +861,7 @@ async fn run_interactive_mode(
     oxigraph_manager: OxigraphManager,
     perf_ledger: Arc<PerfLedger>,
     recovery_mode: RecoveryMode,
+    store_path: &str,
 ) {
     println!("{}", config.messages.startup);
     if !recovery_mode.eq(&RecoveryMode::Off) {
@@ -822,7 +869,7 @@ async fn run_interactive_mode(
     }
 
     // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
-    let registry_path = format!("{}/predicate_registry.json", config.system.oxigraph_store_path);
+    let registry_path = format!("{}/predicate_registry.json", store_path);
     if oxigraph_manager.load_predicate_registry(&registry_path) {
         println!("已恢复谓词画像注册表。可用「谓词报告」查看。");
     }
@@ -833,8 +880,7 @@ async fn run_interactive_mode(
 
     // 实体身份注册表：跨会话加载已确认的别名/重定向，再叠加配置声明；
     // 已确认别名同步进链接器（持久别名词面与规范名同权）。
-    let entity_registry_path =
-        format!("{}/entity_registry.json", config.system.oxigraph_store_path);
+    let entity_registry_path = format!("{}/entity_registry.json", store_path);
     if oxigraph_manager.load_entity_registry(&entity_registry_path) {
         println!("已恢复实体身份注册表。可用「身份台账」查看。");
     }
@@ -866,10 +912,7 @@ async fn run_interactive_mode(
         .and_then(|api| api.external_ledger_path.clone())
         .filter(|path| !path.trim().is_empty())
         .unwrap_or_else(|| {
-            format!(
-                "{}/external_ledger.json",
-                config.system.oxigraph_store_path
-            )
+            format!("{}/external_ledger.json", store_path)
         });
     let external_ledger_capacity = config
         .api
@@ -938,7 +981,7 @@ async fn run_interactive_mode(
     // 实体身份：已确认的持久别名同步进链接器（别名与规范名同权）
     sync_entity_aliases(&mut symbolic_reasoner, &oxigraph_manager);
     // 导入日志：跨重启的有界撤销栈
-    let journal_path = format!("{}/import_journal.json", config.system.oxigraph_store_path);
+    let journal_path = format!("{}/import_journal.json", store_path);
     let mut import_journal = match ImportJournal::load(&journal_path) {
         JournalLoad::Loaded(journal) => {
             if !journal.is_empty() {
@@ -1070,10 +1113,7 @@ async fn run_interactive_mode(
         .as_deref()
         .map(|path| format!("{}.chronicle.jsonl", path))
         .unwrap_or_else(|| {
-            format!(
-                "{}/dialogue.chronicle.jsonl",
-                config.system.oxigraph_store_path
-            )
+            format!("{}/dialogue.chronicle.jsonl", store_path)
         });
     let mut chronicle = match Chronicle::open(&chronicle_path, FsyncPolicy::EachAppend) {
         Ok((chronicle, audit)) => {
@@ -1137,8 +1177,14 @@ async fn run_interactive_mode(
         }
         let input = input.trim();
 
-        if input == "quit" {
+        if matches!(input, "quit" | "退出" | "exit") {
             break;
+        }
+
+        if matches!(input, "帮助" | "help" | "?" | "？" | "h") {
+            println!("{}", interactive_help());
+            println!();
+            continue;
         }
 
         // 外链名册的逻辑时刻：每个非空用户轮次推进一次（TTL 的计量单位）
@@ -2933,71 +2979,53 @@ async fn run_interactive_mode(
             continue;
         }
 
-        let mode = detect_input_mode(input, &config.nlp.import_keywords);
-
-        match mode {
-            InputMode::KnowledgeImport => {
-                // 检查是否是 JSON-LD 文件导入
-                if input.starts_with("导入jsonld文件：") || input.starts_with("import jsonld:") {
-                    let file_path = input.replace("导入jsonld文件：", "")
-                                        .replace("import jsonld:", "")
-                                        .trim()
-                                        .to_string();
-                    
+        // 导入指令先于输入模式判定解析：简写（如「导入文件：」）不在 import_keywords
+        // 中也可用；参数正文只做前缀剥离，路径/JSON 中的关键词不受影响。
+        if let Some(directive) = parse_import_directive(input) {
+            match directive {
+                ImportDirective::JsonldFile(file_path) => {
                     if file_path.is_empty() {
-                        println!("请提供 JSON-LD 文件路径");
+                        println!("请提供 JSON-LD 文件路径，例如：导入jsonld文件：test_data.jsonld");
+                        println!();
                         continue;
                     }
-                    
                     println!("正在导入 JSON-LD 文件: {}", file_path);
-                    
                     match oxigraph_manager.import_jsonld_from_file(&file_path).await {
-                        Ok(_) => {
-                            println!("JSON-LD 文件导入成功！");
+                        Ok(stats) => {
+                            println!("JSON-LD 文件导入成功：{}", stats.summary());
                             reasoner_stale = true;
                         }
                         Err(e) => {
                             eprintln!("JSON-LD 文件导入失败: {}", e);
                         }
                     }
-                } else if input.starts_with("导入jsonld内容：") || input.starts_with("import jsonld content:") {
-                    let jsonld_content = input.replace("导入jsonld内容：", "")
-                                             .replace("import jsonld content:", "")
-                                             .trim()
-                                             .to_string();
-                    
+                }
+                ImportDirective::JsonldContent(jsonld_content) => {
                     if jsonld_content.is_empty() {
-                        println!("请提供 JSON-LD 内容");
+                        println!(
+                            "请提供 JSON-LD 内容，例如：导入内容：{{\"@id\": \"…\", \"@type\": \"Person\"}}"
+                        );
+                        println!();
                         continue;
                     }
-                    
                     println!("正在导入 JSON-LD 内容...");
-                    
                     match oxigraph_manager.import_jsonld(&jsonld_content).await {
-                        Ok(_) => {
-                            println!("JSON-LD 内容导入成功！");
+                        Ok(stats) => {
+                            println!("JSON-LD 内容导入成功：{}", stats.summary());
                             reasoner_stale = true;
                         }
                         Err(e) => {
                             eprintln!("JSON-LD 内容导入失败: {}", e);
                         }
                     }
-                } else if input.starts_with("导入rdf文件：") || input.starts_with("导入rdf文件:")
-                    || input.starts_with("import rdf:")
-                {
-                    let file_path = input.replace("导入rdf文件：", "")
-                                        .replace("导入rdf文件:", "")
-                                        .replace("import rdf:", "")
-                                        .trim()
-                                        .to_string();
-                    
+                }
+                ImportDirective::RdfFile(file_path) => {
                     if file_path.is_empty() {
                         println!("请提供 RDF 文件路径（支持 .ttl / .nt / .nq / .trig / .rdf / .xml）");
+                        println!();
                         continue;
                     }
-                    
                     println!("正在导入 RDF 文件: {}", file_path);
-                    
                     match oxigraph_manager.import_rdf_file(&file_path).await {
                         Ok(added) => {
                             println!("RDF 文件导入成功：新增 {} 条三元组！", added);
@@ -3007,7 +3035,17 @@ async fn run_interactive_mode(
                             eprintln!("RDF 文件导入失败: {}", e);
                         }
                     }
-                } else {
+                }
+            }
+            println!();
+            continue;
+        }
+
+        let mode = detect_input_mode(input, &config.nlp.import_keywords);
+
+        match mode {
+            InputMode::KnowledgeImport => {
+                {
                     // 知识导入逻辑
                     println!("{}", config.messages.importing);
                     
@@ -3182,11 +3220,18 @@ async fn run_interactive_mode(
                                     match best_semantic.intent.as_str() {
                                         "雨" | "天气查询" => {
                                             println!("正在查询{}{}的天气信息...", city, date);
-                                            println!("（此功能需要连接天气API服务）");
+                                            println!("（天气API未接入，尝试从本地知识库回答）");
                                         }
                                         _ => {
-                                            println!("暂不支持该天气查询类型: {}", best_semantic.intent);
+                                            println!("暂不支持该天气查询类型: {}，尝试本地符号推理...", best_semantic.intent);
                                         }
+                                    }
+                                    // 天气 API 不可用时不能丢问题：回落到本地图谱/符号推理
+                                    if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                        println!("{}", answer);
+                                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                    } else {
+                                        println!("本地知识库中没有相关天气记录。");
                                     }
                                 }
                                 "人物" => {
@@ -3198,25 +3243,34 @@ async fn run_interactive_mode(
                                         match best_semantic.intent.as_str() {
                                             "身高查询" => {
                                                 println!("正在查询{}的身高信息...", person_name);
-                                                // 这里可以调用现有的知识图谱查询逻辑
-                                                match local_semantic_adapter.get_entity_knowledge(&person_name).await {
+                                                // 本地适配器返回了实体但没有身高/高度属性时，
+                                                // 不能就此收尾：回落到本地图谱与符号推理
+                                                let found_height = match local_semantic_adapter.get_entity_knowledge(&person_name).await {
                                                     Ok(response) => {
                                                         println!("─────────────────────────────────");
                                                         println!("实体: {}", response.data.entity);
                                                         println!("描述: {}", response.data.desc);
+                                                        let mut found = false;
                                                         for avp in &response.data.avp {
                                                             if avp.len() >= 2 && (avp[0].contains("身高") || avp[0].contains("高度")) {
                                                                 println!("身高: {}", avp[1]);
+                                                                found = true;
                                                             }
                                                         }
                                                         println!("─────────────────────────────────");
+                                                        found
                                                     }
                                                     Err(e) => {
                                                         println!("获取{}身高信息时出错: {}，回退到本地符号推理...", person_name, e);
-                                                        if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
-                                                            println!("{}", answer);
-                                                            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
-                                                        }
+                                                        false
+                                                    }
+                                                };
+                                                if !found_height {
+                                                    if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                        println!("{}", answer);
+                                                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                                    } else {
+                                                        println!("知识库中没有{}的身高记录。", person_name);
                                                     }
                                                 }
                                             }
@@ -3750,6 +3804,91 @@ fn external_outcome_text(outcome: &AnswerOutcome) -> Option<String> {
     }
 }
 
+/// 交互式导入指令的解析结果。
+#[derive(Debug, PartialEq, Eq)]
+enum ImportDirective {
+    JsonldFile(String),
+    JsonldContent(String),
+    RdfFile(String),
+}
+
+/// 解析「导入…文件：路径」/「导入…内容：内容」指令。
+///
+/// 兼容全角「：」与半角「:」，并接受 README 中的简写「导入文件：」「导入内容：」；
+/// 只剥离前缀关键词，参数正文不做替换（路径/JSON 中再次出现关键词也不会被删改）。
+fn parse_import_directive(input: &str) -> Option<ImportDirective> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let groups: [(&[&str], fn(String) -> ImportDirective); 3] = [
+        (
+            &["导入jsonld内容", "导入内容", "import jsonld content", "import content"],
+            ImportDirective::JsonldContent,
+        ),
+        (
+            &["导入jsonld文件", "导入文件", "import jsonld file", "import jsonld"],
+            ImportDirective::JsonldFile,
+        ),
+        (
+            &["导入rdf文件", "导入rdf", "import rdf"],
+            ImportDirective::RdfFile,
+        ),
+    ];
+    for (keywords, build) in groups {
+        for keyword in keywords {
+            let needle = keyword.to_ascii_lowercase();
+            for colon in [':', '：'] {
+                let prefix = format!("{}{}", needle, colon);
+                if lower.starts_with(&prefix) {
+                    return Some(build(trimmed[prefix.len()..].trim().to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 交互模式命令速查（只列常用命令，完整命令集见各分支实现与 CLAUDE.md）。
+fn interactive_help() -> String {
+    [
+        "KnowProlog 交互命令速查（输入「帮助 / help / ?」显示本页）",
+        "",
+        "知识录入",
+        "  录入：<文本> / 添加：<文本>        自然语言抽取实体与关系（如「录入：小明18岁」）",
+        "  导入jsonld文件：<路径>              导入 JSON-LD 文件（简写：导入文件：）",
+        "  导入jsonld内容：<JSON>              直接导入 JSON-LD 内容（简写：导入内容：）",
+        "  导入rdf文件：<路径>                 导入 Turtle/N-Triples/N-Quads/TriG/RDF/XML",
+        "  撤销导入 / 导入回执 / 导入历史       导入回执与可撤销导入栈",
+        "",
+        "查询与推理",
+        "  直接输入自然语言                    如「小明多大？」「张三和李四什么关系？」",
+        "  判断：<陈述> / 蕴含：<陈述>         形式化语义 + 语义蕴含校验",
+        "  证明：<目标> / 推理链：<目标>        归结证明与后向链推理",
+        "  为什么<陈述> / 溯因：<陈述>         证明失败前沿生成候选假设",
+        "  如果…那么… / 假设：…                 反事实推演（推演后自动回滚）",
+        "  默认推理：<陈述> / 概率推理：…       非单调常识与加权可能世界",
+        "  规则：<如果X的P是Y，那么X的Q是Y>    教一条 Horn 规则（占位符自动变量化）",
+        "  记住：<事实> / 忘记：<事实>          会话事实断言与撤回",
+        "",
+        "台账与报告",
+        "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
+        "  身份台账 / 谓词报告 / 类型体系        实体身份、谓词画像与类型格",
+        "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
+        "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
+        "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
+        "  外链台账 / 图账本                     外部知识留册与命名图物化视图",
+        "",
+        "证明与视图",
+        "  证明图：<目标> / 知识子图：<实体>     证明树 / 邻域子图",
+        "  时间线 / 编年史 / 回放 <N>            对话编年史审计与重建",
+        "  相似实体：<实体> / 介绍：<实体>       相似度排序与生成式介绍",
+        "",
+        "其他",
+        "  帮助 / help / ?                      显示本页",
+        "  quit / 退出                          退出系统",
+    ]
+    .join("\n")
+}
+
 /// 解析「同义链接：别名 = 规范实体」的两端（支持半角/全角等号）。
 fn parse_alias_link(body: &str) -> Option<(&str, &str)> {
     for separator in ['=', '＝'] {
@@ -3870,7 +4009,7 @@ fn contains_question_marker(text: &str) -> bool {
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
-    const COMMANDS: [&str; 153] = [
+    const COMMANDS: &[&str] = &[
         "全息",
         "对话本体",
         "对话状态",
@@ -4024,6 +4163,48 @@ fn is_command_like(input: &str) -> bool {
         "功能词表",
         "虚词报告",
         "算符表",
+        // 谓词画像 / 身份裁决（补全：此前在澄清进行中会被当作回答吞掉）
+        "谓词报告",
+        "谓词画像",
+        "谓词注册表",
+        "谓词列表",
+        "登记别名",
+        "登记逆谓词",
+        "功能谓词",
+        "取消功能谓词",
+        "确认谓词",
+        "拒绝谓词",
+        // 对比记忆的追问与待定推测
+        "待定推测",
+        // 会话规则库别名
+        "后向链规则",
+        // 澄清子命令（澄清进行中不应被当作回答）
+        "开始澄清",
+        "停止澄清",
+        "结束澄清",
+        "退出澄清",
+        "提问确认",
+        // 对话续说 / 换角度
+        "接着说",
+        "继续说",
+        "继续介绍",
+        "继续讲",
+        "接着讲",
+        "换个角度说",
+        "换个说法",
+        "换个角度",
+        "换一个角度",
+        "重新介绍",
+        "讲讲",
+        "说说",
+        // 撤销上次导入
+        "撤销上次导入",
+        // 帮助与退出
+        "帮助",
+        "help",
+        "?",
+        "退出",
+        "exit",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
 }
@@ -4638,6 +4819,113 @@ mod session_tests {
             "默认逻辑：",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
+    }
+
+    /// 新补的命令（谓词裁决 / 澄清子命令 / 帮助退出等）同样要被 is_command_like 识别
+    #[test]
+    fn command_like_covers_help_predicate_and_clarification_commands() {
+        for command in [
+            "帮助",
+            "help",
+            "?",
+            "退出",
+            "exit",
+            "谓词报告",
+            "谓词画像",
+            "谓词注册表",
+            "谓词列表",
+            "登记别名：师父 = 师傅",
+            "登记逆谓词：师傅 = 徒弟",
+            "功能谓词：出生地",
+            "取消功能谓词：出生地",
+            "确认谓词：师傅",
+            "拒绝谓词：师傅",
+            "待定推测",
+            "后向链规则",
+            "开始澄清",
+            "停止澄清",
+            "结束澄清",
+            "退出澄清",
+            "提问确认",
+            "接着说",
+            "继续说",
+            "继续介绍",
+            "继续讲",
+            "接着讲",
+            "换个角度说",
+            "换个说法",
+            "换个角度",
+            "换一个角度",
+            "重新介绍",
+            "撤销上次导入",
+        ] {
+            assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
+    }
+
+    /// 导入指令解析：全角/半角冒号、README 简写、参数正文零替换
+    #[test]
+    fn import_directive_parses_colons_aliases_and_keeps_body() {
+        assert_eq!(
+            parse_import_directive("导入jsonld文件：test_data.jsonld"),
+            Some(ImportDirective::JsonldFile("test_data.jsonld".to_string()))
+        );
+        assert_eq!(
+            parse_import_directive("导入jsonld文件: test_data.jsonld"),
+            Some(ImportDirective::JsonldFile("test_data.jsonld".to_string()))
+        );
+        // README 中的简写
+        assert_eq!(
+            parse_import_directive("导入文件：examples/master_disciple.jsonld"),
+            Some(ImportDirective::JsonldFile(
+                "examples/master_disciple.jsonld".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_import_directive("导入内容：{\"@id\": \"http://example.org/kg/entity/王五\"}"),
+            Some(ImportDirective::JsonldContent(
+                "{\"@id\": \"http://example.org/kg/entity/王五\"}".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_import_directive("import jsonld content: {\"@id\": \"x\"}"),
+            Some(ImportDirective::JsonldContent("{\"@id\": \"x\"}".to_string()))
+        );
+        assert_eq!(
+            parse_import_directive("导入rdf文件：data/sample.ttl"),
+            Some(ImportDirective::RdfFile("data/sample.ttl".to_string()))
+        );
+        assert_eq!(
+            parse_import_directive("import rdf: data/sample.nt"),
+            Some(ImportDirective::RdfFile("data/sample.nt".to_string()))
+        );
+
+        // 参数正文里再出现关键词不得被删改
+        assert_eq!(
+            parse_import_directive("导入文件：导入文件：备份.jsonld"),
+            Some(ImportDirective::JsonldFile("导入文件：备份.jsonld".to_string()))
+        );
+
+        // 非导入指令（自然语言条目）不误判
+        assert_eq!(parse_import_directive("录入：小明18岁"), None);
+        assert_eq!(parse_import_directive("导入jsonld文件"), None);
+    }
+
+    /// 帮助页覆盖关键入口（录入 / 导入 / 查询 / 退出），避免手册与实现漂移
+    #[test]
+    fn interactive_help_mentions_key_commands() {
+        let help = interactive_help();
+        for needle in [
+            "录入：",
+            "导入jsonld文件：",
+            "导入rdf文件：",
+            "为什么",
+            "证明：",
+            "帮助",
+            "quit",
+        ] {
+            assert!(help.contains(needle), "帮助页应包含 {}", needle);
         }
     }
 

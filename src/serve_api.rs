@@ -1177,7 +1177,17 @@ impl ApiState {
                 .await
                 .map_err(|_| "failed to freeze least-recently-used session")?;
         }
-        let id = format!("s-{}", self.next_session_id.fetch_add(1, Ordering::Relaxed));
+        // 跳过已占用的 id：导入的信封可以使用任意 id（含 s-N），
+        // 服务端生成的 id 绝不能覆盖已存在（尤其是刚导入）的会话。
+        let id = loop {
+            let candidate = format!(
+                "s-{}",
+                self.next_session_id.fetch_add(1, Ordering::Relaxed)
+            );
+            if !sessions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let handle = self.spawn_actor(id.clone(), None)?;
         sessions.insert(id.clone(), handle);
         Ok(id)
@@ -1244,6 +1254,14 @@ impl ApiState {
                 "session {} already exists",
                 session_id
             )));
+        }
+        // 导入 id 形如 s-N 时把自增游标推过 N：后续 create_session 不会撞上它
+        if let Some(number) = session_id
+            .strip_prefix("s-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+        {
+            self.next_session_id
+                .fetch_max(number.saturating_add(1), Ordering::Relaxed);
         }
         if sessions.len() >= self.max_sessions {
             if self.session_dir.is_none() {
@@ -1398,7 +1416,11 @@ impl Response {
 async fn serve_connection(mut stream: TcpStream, state: Arc<ApiState>) -> std::io::Result<()> {
     let request = match read_request(&mut stream, state.max_body_bytes).await {
         Ok(request) => request,
-        Err(message) => {
+        Err(RequestReadError::BodyTooLarge) => {
+            write_response(&mut stream, Response::error(413, "body too large")).await?;
+            return Ok(());
+        }
+        Err(RequestReadError::Malformed(message)) => {
             write_response(&mut stream, Response::error(400, &message)).await?;
             return Ok(());
         }
@@ -1641,7 +1663,10 @@ fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Respons
 /// 导入信封：解码（解析/格式/版本/摘要/尺寸）→ 校验（会话 id/引擎）→
 /// 零副作用重建会话。解码回执随 201 响应返回（可审计的接收凭据）。
 async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
-    let (envelope, receipt) = match SessionEnvelope::decode(&request.body, state.max_body_bytes) {
+    // 信封解码一律用信封上限：导出的会话必须能原样导回，
+    // 默认 256KB 体量只约束对话轮，不约束冷存储信封。
+    let (envelope, receipt) = match SessionEnvelope::decode(&request.body, SESSION_ENVELOPE_MAX_BYTES)
+    {
         Ok(decoded) => decoded,
         Err(error) => return import_decode_response(state, &error),
     };
@@ -2040,7 +2065,20 @@ fn sentence_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
-async fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request, String> {
+/// 请求读取失败：体量超限单独成类，映射 413（而非一律 400）。
+enum RequestReadError {
+    Malformed(String),
+    BodyTooLarge,
+}
+
+fn malformed(message: impl Into<String>) -> RequestReadError {
+    RequestReadError::Malformed(message.into())
+}
+
+async fn read_request(
+    stream: &mut TcpStream,
+    max_body: usize,
+) -> Result<Request, RequestReadError> {
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -2048,24 +2086,30 @@ async fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request
             break position;
         }
         if buffer.len() > MAX_HEADER_BYTES {
-            return Err("header too large".to_string());
+            return Err(malformed("header too large"));
         }
         let read = stream
             .read(&mut chunk)
             .await
-            .map_err(|error| format!("read error: {}", error))?;
+            .map_err(|error| malformed(format!("read error: {}", error)))?;
         if read == 0 {
-            return Err("connection closed before header".to_string());
+            return Err(malformed("connection closed before header"));
         }
         buffer.extend_from_slice(&chunk[..read]);
     };
 
     let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| "missing request line".to_string())?;
+    let request_line = lines.next().ok_or_else(|| malformed("missing request line"))?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().ok_or_else(|| "missing method".to_string())?.to_string();
-    let target = parts.next().ok_or_else(|| "missing target".to_string())?.to_string();
+    let method = parts
+        .next()
+        .ok_or_else(|| malformed("missing method"))?
+        .to_string();
+    let target = parts
+        .next()
+        .ok_or_else(|| malformed("missing target"))?
+        .to_string();
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path.to_string(), parse_query(query)),
         None => (target, BTreeMap::new()),
@@ -2080,17 +2124,23 @@ async fn read_request(stream: &mut TcpStream, max_body: usize) -> Result<Request
         .get("content-length")
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    if content_length > max_body {
-        return Err("body too large".to_string());
+    // 信封导入允许到信封上限（导出必须能原样导回）；其余路由维持默认体量。
+    let limit = if path == "/sessions/import" {
+        SESSION_ENVELOPE_MAX_BYTES
+    } else {
+        max_body
+    };
+    if content_length > limit {
+        return Err(RequestReadError::BodyTooLarge);
     }
     let mut body = buffer[header_end + 4..].to_vec();
     while body.len() < content_length {
         let read = stream
             .read(&mut chunk)
             .await
-            .map_err(|error| format!("read error: {}", error))?;
+            .map_err(|error| malformed(format!("read error: {}", error)))?;
         if read == 0 {
-            return Err("connection closed before body".to_string());
+            return Err(malformed("connection closed before body"));
         }
         body.extend_from_slice(&chunk[..read]);
     }
@@ -3207,6 +3257,114 @@ mod tests {
         // 原有会话不受任何导入尝试影响
         let turn = take_turn_body(addr, &session_id, "他的身高呢").await;
         assert!(turn["reply"].as_str().unwrap().contains("226"), "{}", turn);
+    }
+
+    /// 导入的信封可以占用服务端生成空间里的 id（如 s-2）：新建会话必须跳过
+    /// 已占用的 id，绝不覆盖（尤其是刚导入的）会话。
+    #[tokio::test]
+    async fn create_session_never_overwrites_imported_ids() {
+        let (addr, _server) = start_server(4);
+        let original = create_session(addr).await; // s-1，游标推进到 2
+        take_turn_body(addr, &original, "姚明是谁").await;
+        let mut envelope: SessionEnvelope =
+            serde_json::from_value(export_envelope(addr, &original).await).unwrap();
+        envelope.session_id = "s-2".to_string(); // 模拟携带 s-2 的历史信封
+        envelope.seal();
+
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", original),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let payload = serde_json::to_string(&envelope).unwrap();
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/sessions/import",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+
+        let next = create_session(addr).await;
+        assert_ne!(next, "s-2", "服务端生成的 id 不得撞上已导入的会话");
+
+        // 导入的会话仍然可用（焦点记忆未被覆盖）
+        let turn = take_turn_body(addr, &"s-2".to_string(), "他的身高呢").await;
+        assert!(
+            turn["reply"].as_str().unwrap().contains("226"),
+            "{}",
+            turn
+        );
+    }
+
+    /// 导出的信封必须能原样导回：超过默认 256KB 体量上限的信封
+    /// 在 `/sessions/import` 上按信封上限（16MB）放行。
+    #[tokio::test]
+    async fn import_accepts_envelopes_larger_than_default_body_limit() {
+        let (addr, _server) = start_server(4);
+        let session_id = create_session(addr).await;
+        take_turn_body(addr, &session_id, "姚明是谁").await;
+        let mut envelope: SessionEnvelope =
+            serde_json::from_value(export_envelope(addr, &session_id).await).unwrap();
+        envelope.history.push("长".repeat(300_000));
+        envelope.seal();
+        let payload = serde_json::to_string(&envelope).unwrap();
+        assert!(
+            payload.len() > DEFAULT_MAX_BODY_BYTES,
+            "测试信封必须超过默认体量上限：{} 字节",
+            payload.len()
+        );
+
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/sessions/import",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+
+        // 大信封重建后仍可对话：焦点记忆完好
+        let turn = take_turn_body(addr, &session_id, "他的身高呢").await;
+        assert!(
+            turn["reply"].as_str().unwrap().contains("226"),
+            "{}",
+            turn
+        );
+    }
+
+    /// 普通路由（非信封导入）体量超限时明确返回 413，而不是 400。
+    #[tokio::test]
+    async fn oversized_body_on_regular_route_gets_413() {
+        let (addr, _server) = start_server(2);
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        // 只声明超限的 Content-Length，不真正发送 256KB 体：
+        // 服务端在读取体之前就必须拒绝，避免连接中止导致测试抖动。
+        let request = format!(
+            "POST /sessions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            DEFAULT_MAX_BODY_BYTES + 1
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 413"), "{}", text);
     }
 
     #[tokio::test]

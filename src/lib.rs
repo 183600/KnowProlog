@@ -1,7 +1,7 @@
 use oxigraph::model::*;
 use oxigraph::sparql::{Query, QueryResults};
 use oxigraph::store::Store;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -137,6 +137,25 @@ fn entity_type_labels(
 pub struct QueryResult {
     pub success: bool,
     pub data: Vec<HashMap<String, Value>>,
+}
+
+/// JSON-LD 导入统计：节点（实体）数、指向命名节点的关系边数、
+/// 本次实际新增的三元组数（与库中已有三元组重复者不计入）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct JsonldImportStats {
+    pub entities: usize,
+    pub relations: usize,
+    pub triples: usize,
+}
+
+impl JsonldImportStats {
+    /// 单行中文摘要（CLI 与交互模式共用同一措辞）。
+    pub fn summary(&self) -> String {
+        format!(
+            "解析了 {} 个实体和 {} 个关系，新增 {} 条三元组。",
+            self.entities, self.relations, self.triples
+        )
+    }
 }
 
 // 所有配置结构体都需要是 pub，以便在测试中使用
@@ -894,29 +913,42 @@ impl OxigraphManager {
         self.perf.bump("revision_bump");
     }
 
-    pub async fn import_jsonld(&self, jsonld_content: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn import_jsonld(
+        &self,
+        jsonld_content: &str,
+    ) -> Result<JsonldImportStats, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
         // 持锁后、写前失效整图快照缓存：JSON-LD 导入可能分批写入，
         // 版本号先行可保证中途失败也不会让读者把半成品缓存成完整快照
         self.bump_revision();
-        
+
         // 解析 JSON-LD 内容
         let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
-        
-        // 直接处理 JSON 结构
-        self.process_jsonld_simple(&store, &jsonld_value).await?;
-        
-        Ok(())
+
+        // 直接处理 JSON 结构；三元组数按库长度差统计（重复导入计 0）
+        let before = store.len()?;
+        let mut stats = JsonldImportStats::default();
+        self.process_jsonld_simple(&store, &jsonld_value, &mut stats)
+            .await?;
+        let after = store.len()?;
+        stats.triples = after.saturating_sub(before);
+
+        Ok(stats)
     }
 
-    async fn process_jsonld_simple(&self, store: &Store, jsonld: &Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn process_jsonld_simple(
+        &self,
+        store: &Store,
+        jsonld: &Value,
+        stats: &mut JsonldImportStats,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 处理直接的 JSON-LD 结构
         if let Some(array) = jsonld.as_array() {
             for item in array {
                 if let Some(obj) = item.as_object() {
                     // 处理每个对象
                     let context = Self::extract_jsonld_context(obj);
-                    self.process_jsonld_object(store, obj, &context).await?;
+                    self.process_jsonld_object(store, obj, &context, stats).await?;
                 }
             }
         } else if let Some(obj) = jsonld.as_object() {
@@ -927,15 +959,15 @@ impl OxigraphManager {
                 if let Some(graph_array) = graph.as_array() {
                     for item in graph_array {
                         if let Some(inner) = item.as_object() {
-                            self.process_jsonld_object(store, inner, &context).await?;
+                            self.process_jsonld_object(store, inner, &context, stats).await?;
                         }
                     }
                 } else if let Some(inner) = graph.as_object() {
-                    self.process_jsonld_object(store, inner, &context).await?;
+                    self.process_jsonld_object(store, inner, &context, stats).await?;
                 }
             } else {
                 // 单个对象
-                self.process_jsonld_object(store, obj, &context).await?;
+                self.process_jsonld_object(store, obj, &context, stats).await?;
             }
         }
         Ok(())
@@ -968,7 +1000,13 @@ impl OxigraphManager {
         term.to_string()
     }
 
-    async fn process_jsonld_object(&self, store: &Store, obj: &serde_json::Map<String, Value>, context: &HashMap<String, String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn process_jsonld_object(
+        &self,
+        store: &Store,
+        obj: &serde_json::Map<String, Value>,
+        context: &HashMap<String, String>,
+        stats: &mut JsonldImportStats,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 获取主语 (subject)
         let subject_uri = if let Some(id) = obj.get("@id") {
             id.as_str().unwrap_or("").to_string()
@@ -979,7 +1017,8 @@ impl OxigraphManager {
         if subject_uri.is_empty() {
             return Ok(());
         }
-        
+        stats.entities += 1;
+
         let subject = NamedNode::new(&subject_uri)?;
         
         // 处理类型信息
@@ -1021,10 +1060,10 @@ impl OxigraphManager {
             
             if let Some(value_array) = value.as_array() {
                 for val in value_array {
-                    self.process_property_value(store, &subject, &predicate, val)?;
+                    self.process_property_value(store, &subject, &predicate, val, stats)?;
                 }
             } else {
-                self.process_property_value(store, &subject, &predicate, value)?;
+                self.process_property_value(store, &subject, &predicate, value, stats)?;
             }
         }
         
@@ -1037,6 +1076,7 @@ impl OxigraphManager {
         subject: &NamedNode,
         predicate: &NamedNode,
         value: &Value,
+        stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match value {
             Value::String(s) => {
@@ -1077,6 +1117,8 @@ impl OxigraphManager {
                             object,
                             GraphName::DefaultGraph,
                         ))?;
+                        // 对象属性指向另一实体（命名节点）时计一条关系
+                        stats.relations += 1;
                     }
                 } else if let Some(val) = obj.get("@value") {
                     // 字符串值取其内容本身，其他类型使用 JSON 表示
@@ -1125,7 +1167,10 @@ impl OxigraphManager {
         Ok(())
     }
 
-    pub async fn import_jsonld_from_file(&self, file_path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn import_jsonld_from_file(
+        &self,
+        file_path: &str,
+    ) -> Result<JsonldImportStats, Box<dyn std::error::Error + Send + Sync>> {
         let content = fs::read_to_string(file_path)?;
         self.import_jsonld(&content).await
     }
@@ -3794,5 +3839,46 @@ mod cache_tests {
         let perf = manager.perf_ledger();
         assert!(perf.count("identity_alias_confirm") >= 1);
         assert_eq!(perf.count("identity_merge"), 1);
+    }
+
+    /// JSON-LD 导入统计：实体数 / 命名节点关系数 / 实际新增三元组数；
+    /// 重复导入新增为 0（与 RDF 导入一致的确定性口径）。
+    #[tokio::test]
+    async fn import_jsonld_reports_entity_relation_and_triple_counts() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "teacher_of": "http://example.org/kg/teacher_of",
+                "Person": "http://example.org/kg/Person"
+            },
+            "@graph": [
+                {
+                    "@id": "http://example.org/kg/entity/小明",
+                    "@type": "Person",
+                    "name": "小明"
+                },
+                {
+                    "@id": "http://example.org/kg/entity/张三",
+                    "@type": "Person",
+                    "name": "张三",
+                    "teacher_of": { "@id": "http://example.org/kg/entity/李四" }
+                }
+            ]
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 2, "两个节点");
+        assert_eq!(stats.relations, 1, "一条指向命名节点的关系边");
+        assert_eq!(stats.triples, 5, "类型 2 + 名字 2 + 关系 1");
+        assert_eq!(
+            stats.summary(),
+            "解析了 2 个实体和 1 个关系，新增 5 条三元组。"
+        );
+
+        let replay = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(replay.entities, 2);
+        assert_eq!(replay.relations, 1);
+        assert_eq!(replay.triples, 0, "重复导入不新增三元组");
     }
 }
