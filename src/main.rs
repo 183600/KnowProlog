@@ -454,7 +454,7 @@ fn parse_prompt_mode(value: &str) -> PromptMode {
 fn run_prompt_lint(json: bool) {
     let specs = prompt_spec::default_specs();
     let issues = prompt_spec::lint_default();
-    let (covered, legacy) = prompt_spec::coverage();
+    let (covered, composed) = prompt_spec::coverage();
     let errors = issues
         .iter()
         .filter(|issue| issue.severity == LintSeverity::Error)
@@ -466,7 +466,7 @@ fn run_prompt_lint(json: bool) {
             "examples_checked": specs.len(),
             "coverage": {
                 "covered": covered,
-                "legacy": legacy,
+                "composed": composed,
             },
             "errors": errors,
             "lint": issues,
@@ -484,7 +484,7 @@ fn run_prompt_lint(json: bool) {
             prompt_spec::PROMPT_SPEC_VERSION,
             specs.len(),
             covered.len(),
-            covered.len() + legacy.len()
+            covered.len() + composed.len()
         );
         for issue in &issues {
             let severity = match issue.severity {
@@ -496,8 +496,8 @@ fn run_prompt_lint(json: bool) {
         if issues.is_empty() {
             println!("lint 通过：{} 条示例逐字渲染一致，无错误与警告", specs.len());
         }
-        if !legacy.is_empty() {
-            println!("仍由组合生成器负责的策略：{}", legacy.join("、"));
+        if !composed.is_empty() {
+            println!("仍由组合生成器负责的策略：{}", composed.join("、"));
         }
     }
     if errors > 0 {
@@ -719,7 +719,7 @@ async fn run_interactive_mode(
 
     // 对话编年史：追加式哈希链档案，是对话的真相源；快照只是检查点。
     // 每轮输入在任何处理之前先落盘（写前日志），崩溃最多丢进行中的一轮；
-    // 坏行只废尾巴不废全档：可信前缀保留、原子重写尾修复后续写。
+    // 坏行只废尾巴不废全档：可信前缀保留、原子重写截断后续写。
     let chronicle_path = config
         .reasoning
         .dialogue_state_path
@@ -738,13 +738,13 @@ async fn run_interactive_mode(
                 match chronicle.repair_tail() {
                     Ok(_) => {
                         println!(
-                            "编年史已修复尾行并保留可信前缀：{} 条记录。",
+                            "编年史已截断损坏尾行并保留可信前缀：{} 条记录。",
                             chronicle.len()
                         );
                         Some(chronicle)
                     }
                     Err(error) => {
-                        eprintln!("编年史尾修复失败（本轮不落史以免污染链条）：{}", error);
+                        eprintln!("编年史尾行重写失败（本轮不落史以免污染链条）：{}", error);
                         None
                     }
                 }

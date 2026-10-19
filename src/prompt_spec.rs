@@ -10,8 +10,8 @@
 //!   拿到绑定才允许渲染；任一未绑定即返回 [`RenderOutcome::Ungrounded`]，
 //!   调用方沿 fallback 图回退（如实回退到组合生成器 / 澄清追问），
 //!   从结构上排除「模板里编造内容」；
-//! - **版本化**：注册表带 [`PROMPT_SPEC_VERSION`]，逐 spec 指标可归因，
-//!   为纯符号的提示迭代（A/B）留好接口。
+//! - **版本化**：注册表带 [`PROMPT_SPEC_VERSION`]，逐 spec 指标可归因、
+//!   可对比。
 //!
 //! 与 [`crate::dialogue_manager`] 的关系：管理器负责「选策略 + 选 spec 变体 +
 //! 绑定槽位」，本模块只负责「校验 + 渲染」。三档模式
@@ -586,26 +586,26 @@ pub fn lint_default() -> Vec<PromptLintIssue> {
 /// 策略覆盖情况：(已外化, 未外化)。
 pub fn coverage() -> (Vec<&'static str>, Vec<&'static str>) {
     let mut covered = Vec::new();
-    let mut legacy = Vec::new();
+    let mut composed = Vec::new();
     for policy in POLICY_NAMES {
         if DEFAULT_SPECS.iter().any(|spec| spec.policy == policy) {
             covered.push(policy);
         } else {
-            legacy.push(policy);
+            composed.push(policy);
         }
     }
-    (covered, legacy)
+    (covered, composed)
 }
 
 // ---------------------------------------------------------------------------
 // 运行模式与统计
 // ---------------------------------------------------------------------------
 
-/// 模板运行三档：关 / 平价双跑 / 启用。
+/// 模板运行三档：关 / 双跑 / 启用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
-    /// 只走组合生成器（零行为变化）。
+    /// 只走组合生成器。
     Off,
     /// 双跑：文本照常返回，同时用 spec 渲染并计数差异。
     Parity,
@@ -648,8 +648,8 @@ pub struct PromptStats {
     /// required 槽位缺失，回退组合生成器。
     pub ungrounded: usize,
     /// 无 spec 映射、保留组合生成器的策略次数。
-    pub legacy: usize,
-    /// 平价模式下 spec 渲染与组合生成器文本不一致的次数。
+    pub composed: usize,
+    /// 双跑模式下 spec 渲染与组合生成器文本不一致的次数。
     pub parity_mismatches: usize,
     /// 缺失槽位计数（槽位名 → 次数）。
     pub missing_slots: BTreeMap<String, usize>,
@@ -688,7 +688,7 @@ impl PromptStats {
         self.checked += other.checked;
         self.grounded += other.grounded;
         self.ungrounded += other.ungrounded;
-        self.legacy += other.legacy;
+        self.composed += other.composed;
         self.parity_mismatches += other.parity_mismatches;
         for (slot, count) in &other.missing_slots {
             *self.missing_slots.entry(slot.clone()).or_insert(0) += count;
@@ -700,11 +700,11 @@ impl PromptStats {
 
     pub fn render_text(&self) -> String {
         format!(
-            "提示模板：尝试 {} 次（接地 {} / 未接地 {}），组合生成器 {} 次，平价差异 {} 次，接地率 {:.4}。",
+            "提示模板：尝试 {} 次（接地 {} / 未接地 {}），组合生成器 {} 次，双跑差异 {} 次，接地率 {:.4}。",
             self.attempted(),
             self.grounded,
             self.ungrounded,
-            self.legacy,
+            self.composed,
             self.parity_mismatches,
             self.grounding_rate()
         )
@@ -813,11 +813,11 @@ mod tests {
     }
 
     #[test]
-    fn test_coverage_reports_legacy_policies() {
-        let (covered, legacy) = coverage();
+    fn test_coverage_reports_composed_policies() {
+        let (covered, composed) = coverage();
         assert!(covered.contains(&"direct_answer"));
-        assert!(legacy.contains(&"recap"));
-        assert_eq!(covered.len() + legacy.len(), POLICY_NAMES.len());
+        assert!(composed.contains(&"recap"));
+        assert_eq!(covered.len() + composed.len(), POLICY_NAMES.len());
     }
 
     #[test]

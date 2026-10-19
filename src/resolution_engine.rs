@@ -206,7 +206,7 @@ pub struct Solution {
 /// 类型化归结解：与 [`Solution`] 同构，但绑定为 [`BoundTerm`]。
 ///
 /// - 未绑定变量显式表示为 [`BoundTerm::Unbound`]（字符串 API 里的 `"?X"` 约定）；
-/// - 数值常量双存 `raw` + `value`，渲染平价、比较可用；
+/// - 数值常量双存 `raw` + `value`，渲染原样、比较可用；
 /// - 绑定按查询变量顺序给出，且整个集合经 `BTreeMap` 确定性排序。
 #[derive(Debug, Clone)]
 pub struct TypedSolution {
@@ -397,7 +397,7 @@ impl ResolutionEngine {
         solutions
     }
 
-    /// 与 [`Self::solve`] 同序同解的类型化版本：字符串行为不变，
+    /// 与 [`Self::solve`] 同序同解的类型化版本；字符串绑定仍由 [`Self::solve`] 提供，
     /// 调用方拿到 [`BoundTerm`]（显式未绑定 / 数值可比较）。
     pub fn solve_typed(&self, goals: &[Atom], query_vars: &[String]) -> Vec<TypedSolution> {
         let states = self.solve_states(goals);
@@ -960,7 +960,7 @@ fn bind_query_vars(
     query_vars: &[String],
 ) -> (String, HashMap<String, String>, BindingSet) {
     let mut key = String::new();
-    let mut legacy: HashMap<String, String> = HashMap::with_capacity(query_vars.len());
+    let mut string_bindings: HashMap<String, String> = HashMap::with_capacity(query_vars.len());
     let mut typed = BindingSet::new();
     for var in query_vars {
         let value = resolve_term(&Term::var(var), subst);
@@ -971,10 +971,10 @@ fn bind_query_vars(
         key.push_str(var);
         key.push('=');
         key.push_str(&rendered);
-        legacy.insert(var.clone(), rendered);
+        string_bindings.insert(var.clone(), rendered);
         typed.insert(var.clone(), bound_term(&value));
     }
-    (key, legacy, typed)
+    (key, string_bindings, typed)
 }
 
 /// 证明树文本渲染（缩进层级 + 置信度），供报告/日志使用
@@ -1103,7 +1103,7 @@ mod tests {
         let strings = engine.solve(&goals, &["X".to_string()]);
         let typed = engine.solve_typed(&goals, &["X".to_string()]);
         assert_eq!(strings.len(), typed.len());
-        // 绑定平价：类型化绑定的 raw 渲染与字符串形式逐字一致
+        // 绑定一致：类型化绑定的 raw 渲染原样输出
         for (old, new) in strings.iter().zip(typed.iter()) {
             for (name, value) in &old.bindings {
                 let typed_value = new.bindings.get(name).expect("同解应有同名绑定");

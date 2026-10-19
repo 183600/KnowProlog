@@ -1,6 +1,6 @@
 //! TSL：类型体系（Type System / Lattice）。
 //!
-//! 把「实体类型」升为图谱的脊柱：一张带显式别名、子类边与互斥声明的类型格。
+//! 实体类型是图谱的脊柱：一张带显式别名、子类边与互斥声明的类型格。
 //! 它是模式闸门（`predicate_registry` 的定义域/值域校验）、质量护照
 //! （`quality` 的完整性/一致性）与域/值域类型推断共同消费的坐标系。
 //!
@@ -434,7 +434,7 @@ impl TypeSystem {
             if self.closure_gate {
                 "闭包档（别名/子类/互斥判定）"
             } else {
-                "legacy（精确集合）"
+                "精确集合（无闭包）"
             }
         ));
         if self.aliases.is_empty() && self.subclasses.is_empty() && self.disjoint.is_empty() {

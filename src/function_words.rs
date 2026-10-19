@@ -9,7 +9,7 @@
 //!
 //! 1. `REGISTRY`：带角色标注的词条正本（一词一记录，可多重角色）；
 //! 2. `Projection`：五个「投影快照」+ 一个片段投影，逐词固定，
-//!    行为守恒可对账（见 `tests` 中的投影校验）；
+//!    可对账（见 `tests` 中的投影校验）；
 //! 3. 共享函数：`contains_question_marker`（含同形守卫）、
 //!    `wh_kind` / `answer_type_keywords`（疑问词 → 答案类型期待）。
 //!
@@ -561,7 +561,7 @@ pub fn render_registry_report() -> String {
 mod tests {
     use super::*;
 
-    /// 投影守恒：五个投影逐词固定（长度 + 前缀关系 + 内容）。
+    /// 投影快照：五个投影逐词固定（长度 + 前缀关系 + 内容）。
     #[test]
     fn projections_are_frozen() {
         assert_eq!(RETRIEVAL_WORDS.len(), 34);

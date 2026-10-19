@@ -1,4 +1,4 @@
-//! 对话 NLU 评测台（Dialogue NLU Eval）：把「更懂用户」变成可回归的数字。
+//! 对话 NLU 评测台（Dialogue NLU Eval）：用可回归的数字度量对话理解质量。
 //!
 //! 与 `embedding_eval` 的关系：后者度量图谱侧（链接预测 / 类比），本模块度量
 //! 对话侧（意图判定 / 实体链接 / 槽位填充 / 澄清决策 / 接管决策 / 答案生成 /
@@ -160,7 +160,7 @@ pub struct GroundingMetrics {
     pub grounded: u32,
     /// required 槽位缺失，回退组合生成器。
     pub ungrounded: u32,
-    /// 平价模式下模板与组合生成器文本不一致的次数（应为 0）。
+    /// 双跑模式下模板与组合生成器文本不一致的次数（应为 0）。
     pub parity_mismatches: u32,
     /// grounded / attempted（无尝试时为 1.0）。
     pub slot_rate: f64,
@@ -250,7 +250,7 @@ impl DialogueEvalReport {
             self.provenance.precision
         ));
         out.push_str(&format!(
-            "槽位接地：{}/{} 次模板渲染通过闸门（slot_rate {:.4}），回退 {} 次，平价差异 {} 次\n",
+            "槽位接地：{}/{} 次模板渲染通过闸门（slot_rate {:.4}），回退 {} 次，双跑差异 {} 次\n",
             self.grounding.grounded,
             self.grounding.attempted,
             self.grounding.slot_rate,

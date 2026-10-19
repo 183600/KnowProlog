@@ -2,7 +2,7 @@
 //! 确定性序的地面真值。
 //!
 //! 绑定以 [`BoundTerm`] / [`BindingSet`] 表达：
-//! - [`BoundTerm::Number`] 双存 `raw`（保渲染平价）+ `value`（供数值比较）；
+//! - [`BoundTerm::Number`] 双存 `raw`（原样保留）+ `value`（供数值比较）；
 //! - [`BoundTerm::Unbound`] 显式表达「没有绑定」；
 //! - [`BindingSet`] 以 `BTreeMap` 保证确定性序遍历，并提供「required 槽位
 //!   全部绑定」的接地闸门判定，供提示模板渲染消费。
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 pub enum BoundTerm {
     /// 文本常量（原样保留）。
     Text { raw: String },
-    /// 数值：`raw` 用于渲染（与字符串行为逐字一致），`value` 用于比较。
+    /// 数值：`raw` 用于渲染（原样保留），`value` 用于比较。
     Number { raw: String, value: f64 },
     /// 列表项（Scryer `Value::List` 等）。
     List { items: Vec<BoundTerm> },
@@ -74,8 +74,7 @@ impl BoundTerm {
         !matches!(self, BoundTerm::Unbound)
     }
 
-    /// 数值视图：`Number` 直接给出，可解析的 `Text` 也尝试解析
-    /// （字符串绑定的兼容桥）。
+    /// 数值视图：`Number` 直接给出，可解析为有限数值的 `Text` 也给数值。
     pub fn numeric_value(&self) -> Option<f64> {
         match self {
             BoundTerm::Number { value, .. } => Some(*value),
@@ -84,7 +83,7 @@ impl BoundTerm {
         }
     }
 
-    /// 渲染为字符串形式（对 `Text`/`Number` 与既有行为逐字一致；
+    /// 渲染为字符串形式（对 `Text`/`Number` 原样输出；
     /// 复杂项按 Scryer 的 JSON 风格渲染；`Unbound` 无字符串文本，返回 None）。
     pub fn render_raw(&self) -> Option<String> {
         match self {
@@ -210,11 +209,11 @@ pub fn compare_numeric(left: &BoundTerm, right: &BoundTerm) -> Option<std::cmp::
 pub fn bound_or_unbound(
     name: impl Into<String>,
     value: Option<&str>,
-    legacy_unbound: Option<&str>,
+    unbound: Option<&str>,
 ) -> (String, BoundTerm) {
     let name = name.into();
     let term = match value {
-        Some(value) if Some(value) != legacy_unbound => BoundTerm::classify(value),
+        Some(value) if Some(value) != unbound => BoundTerm::classify(value),
         Some(_) | None => BoundTerm::Unbound,
     };
     (name, term)
@@ -245,7 +244,7 @@ mod tests {
         assert_eq!(BoundTerm::classify(" 226"), BoundTerm::text(" 226"));
         assert_eq!(BoundTerm::classify("NaN"), BoundTerm::text("NaN"));
         assert_eq!(BoundTerm::classify("inf"), BoundTerm::text("inf"));
-        // 数值渲染与字符串形式逐字一致
+        // 数值渲染原样输出
         for raw in ["226", "-1.5", "张三", " 226"] {
             assert_eq!(BoundTerm::classify(raw).render_raw().as_deref(), Some(raw));
         }

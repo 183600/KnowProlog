@@ -659,7 +659,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 .iter()
                 .filter(|issue| issue.severity == prompt_spec::LintSeverity::Error)
                 .count();
-            let (covered, legacy) = prompt_spec::coverage();
+            let (covered, composed) = prompt_spec::coverage();
             let spec_json: Vec<serde_json::Value> = specs
                 .iter()
                 .map(|spec| {
@@ -689,7 +689,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     },
                     "coverage": {
                         "covered": covered,
-                        "legacy": legacy,
+                        "composed": composed,
                     },
                 }),
             )

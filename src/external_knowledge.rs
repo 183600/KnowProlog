@@ -215,7 +215,7 @@ impl ExternalKnowledgeService {
         Ok(EntityQueryOutcome::Unparseable)
     }
 
-    /// 兼容入口：`Ok(Some(text))` 的文本已带出处标注。
+    /// 便捷入口：`Ok(Some(text))` 的文本已带出处标注。
     pub async fn answer_question(
         &self,
         question: &str,

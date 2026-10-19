@@ -1350,7 +1350,7 @@ impl OxigraphManager {
         let violation = {
             let registry = self.predicate_registry.read();
             let types = self.type_system.read();
-            let legacy = registry.check_schema(
+            let exact = registry.check_schema(
                 subject_name,
                 &predicate_name,
                 object_name,
@@ -1366,14 +1366,14 @@ impl OxigraphManager {
                     &object_types,
                     &types,
                 );
-                if legacy.is_some() && closure.is_none() {
+                if exact.is_some() && closure.is_none() {
                     receipt.gate_relaxed += 1;
-                } else if legacy.is_none() && closure.is_some() {
+                } else if exact.is_none() && closure.is_some() {
                     receipt.gate_tightened += 1;
                 }
                 closure
             } else {
-                legacy
+                exact
             }
         };
         if let Some(violation) = violation {

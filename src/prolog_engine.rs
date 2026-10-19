@@ -173,7 +173,7 @@ impl PrologEngine {
     ///
     /// 字符串行为（`Value::Var` → `"null"` 等）保留在 [`Self::query`] 中；
     /// 本 API 暴露语义：未绑定 = [`BoundTerm::Unbound`]，整数/浮点 = `Number`
-    /// （raw 与字符串渲染逐字一致，value 可参与比较），列表/结构保持形状。
+    /// （raw 原样保留，value 可参与比较），列表/结构保持形状。
     pub fn query_typed(&mut self, query: &str) -> Vec<BindingSet> {
         self.query_values(query)
             .into_iter()
@@ -476,7 +476,7 @@ mod tests {
     fn test_query_typed_exposes_numbers_and_unbound() {
         let mut engine = PrologEngine::new();
 
-        // 数值：value 可比较，raw 与字符串形式逐字一致
+        // 数值：value 可比较，raw 原样保留
         let typed = engine.query_typed("X is 1 + 2");
         assert_eq!(
             typed[0].get("X").and_then(BoundTerm::numeric_value),
@@ -487,11 +487,11 @@ mod tests {
             Some("3")
         );
 
-        // 两个 API 平价：同一查询的绑定渲染逐字一致
-        let legacy = engine.query("X is 1 + 2");
+        // 两个 API 一致：同一查询的绑定渲染相同
+        let string_api = engine.query("X is 1 + 2");
         assert_eq!(
             typed[0].get("X").and_then(BoundTerm::render_raw),
-            legacy[0].get("X").cloned()
+            string_api[0].get("X").cloned()
         );
 
         // 文本与结构：字符串取内容本身

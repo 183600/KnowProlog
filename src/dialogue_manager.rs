@@ -288,7 +288,7 @@ pub struct DialogueManager {
     externals: Vec<String>,
     policy: LogicProgram,
     last_reply: Vec<String>,
-    /// 提示模板运行模式（默认 Off：零行为变化）。
+    /// 提示模板运行模式（默认 Off）。
     prompt_mode: PromptMode,
     /// 提示模板运行统计（诊断计数，不参与对话快照的语义状态）。
     prompt_stats: PromptStats,
@@ -336,7 +336,7 @@ impl DialogueManager {
         self.prompt_stats = PromptStats::default();
     }
 
-    /// 平价差异计数（Parity 模式下 spec 渲染与组合生成器文本不一致的次数）。
+    /// 双跑差异计数（Parity 模式下 spec 渲染与组合生成器文本不一致的次数）。
     pub fn prompt_parity_mismatches(&self) -> usize {
         self.prompt_stats.parity_mismatches
     }
@@ -808,7 +808,7 @@ impl DialogueManager {
             "farewell" => self.farewell_text(),
             _ => return None,
         };
-        // 提示资产接管：接地闸门通过则用模板渲染（On），平价模式双跑计数（Parity），
+        // 提示资产接管：接地闸门通过则用模板渲染（On），双跑模式计数（Parity），
         // 任一 required 槽位未绑定则回退上面的组合生成器（结构保证不幻觉）。
         let text = self.apply_prompt_spec(
             &chosen,
@@ -1239,45 +1239,45 @@ impl DialogueManager {
         entity: Option<&str>,
         answer: Option<&str>,
         more: &[String],
-        legacy: String,
+        composed: String,
     ) -> String {
         if self.prompt_mode == PromptMode::Off {
-            return legacy;
+            return composed;
         }
         let Some((spec_id, bindings)) =
             self.prompt_bindings(policy, frame, entity, answer, more)
         else {
-            self.prompt_stats.legacy += 1;
-            return legacy;
+            self.prompt_stats.composed += 1;
+            return composed;
         };
         self.prompt_stats.checked += 1;
         match prompt_spec::render(spec_id, &bindings) {
             RenderOutcome::Rendered { text, .. } => {
                 self.prompt_stats.grounded += 1;
-                if text != legacy {
+                if text != composed {
                     self.prompt_stats.parity_mismatches += 1;
                     self.prompt_stats.record_mismatch(format!(
                         "{}：模板与组合生成器文本不一致\n    模板: {}\n    组合: {}",
                         spec_id,
                         text.replace('\n', "⏎"),
-                        legacy.replace('\n', "⏎")
+                        composed.replace('\n', "⏎")
                     ));
                 }
                 match self.prompt_mode {
                     PromptMode::On => text,
-                    _ => legacy,
+                    _ => composed,
                 }
             }
             RenderOutcome::Ungrounded { missing, .. } => {
                 self.prompt_stats.ungrounded += 1;
                 self.prompt_stats.record_missing(&missing);
-                legacy
+                composed
             }
             RenderOutcome::Invalid { message, .. } => {
                 self.prompt_stats.ungrounded += 1;
                 self.prompt_stats
                     .record_mismatch(format!("{} 资产无效：{}", spec_id, message));
-                legacy
+                composed
             }
         }
     }
@@ -1804,7 +1804,7 @@ mod tests {
             stats.mismatch_examples
         );
         assert_eq!(stats.ungrounded, 0, "缺槽位：{:?}", stats.missing_slots);
-        assert_eq!(stats.legacy, 3, "recap/continue/elaborate 应保持组合生成器");
+        assert_eq!(stats.composed, 3, "recap/continue/elaborate 应保持组合生成器");
     }
 
     #[test]

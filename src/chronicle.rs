@@ -171,7 +171,7 @@ impl Chronicle {
     /// 打开（或创建）档案。返回已通过链校验的可信前缀与自检报告。
     ///
     /// 文件不存在视为空档案；存在但损坏时**只加载可信前缀**，
-    /// 由调用方根据 `ChainAudit` 走修复或拒绝路径（绝不静默全量采信）。
+    /// 由调用方根据 `ChainAudit` 走截断重写或拒绝路径（绝不静默全量采信）。
     pub fn open(path: &str, fsync: FsyncPolicy) -> std::io::Result<(Self, ChainAudit)> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -437,7 +437,7 @@ impl Chronicle {
         Ok(())
     }
 
-    /// 原子重写整档（临时文件 + rename）。修复损坏尾巴 / 截断超水位后调用。
+    /// 原子重写整档（临时文件 + rename）。重写损坏尾巴 / 截断超水位后调用。
     pub fn rewrite_atomic(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -460,7 +460,7 @@ impl Chronicle {
         std::fs::rename(&tmp, &self.path)
     }
 
-    /// 修复：把磁盘内容重写为当前可信前缀（用于尾行截断后的续写）。
+    /// 重写：把磁盘内容重写为当前可信前缀（用于尾行截断后的续写）。
     pub fn repair_tail(&self) -> std::io::Result<()> {
         self.rewrite_atomic()
     }
@@ -628,7 +628,7 @@ mod tests {
         let seq = salvaged
             .append_turn("他的国籍呢", "query", Some("姚明"), 2)
             .unwrap();
-        assert_eq!(seq, 3, "修复后续写应从可信前缀继续编号");
+        assert_eq!(seq, 3, "截断后续写应从可信前缀继续编号");
         assert!(Chronicle::audit_file(&path_text).unwrap().is_clean());
     }
 
