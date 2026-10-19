@@ -49,6 +49,7 @@ use know_prolog::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
         render_entity_passport, QualityBaseline, QualityIndex,
     },
+    shape_gate::{ShapeReport, ShapeSet},
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
@@ -220,6 +221,16 @@ enum Commands {
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Validate the knowledge graph against SHACL-style shapes compiled from
+    /// entity-type config, predicate profiles and the type system
+    EvalShapes {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when any Violation-severity finding is reported
+        #[arg(long)]
+        strict: bool,
     },
     /// Run deterministic quality-delta dialogue fuzzing offline (no store I/O),
     /// with an optional known-gap baseline regression ratchet
@@ -734,6 +745,37 @@ async fn main() {
                         eprintln!("基线读取失败: {}", e);
                         std::process::exit(1);
                     }
+                }
+            }
+        }
+        Some(Commands::EvalShapes { json, strict }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_type_system(&config.type_system);
+            match shape_report_for(&oxigraph_manager, &config).await {
+                Ok((_, report)) => {
+                    if json {
+                        match serde_json::to_string_pretty(&report) {
+                            Ok(text) => println!("{}", text),
+                            Err(e) => {
+                                eprintln!("形状报告序列化失败: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        println!("{}", report.render_text());
+                    }
+                    if strict && !report.conforms {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
                 }
             }
         }
@@ -1310,6 +1352,19 @@ async fn quality_report_for(
         &oxigraph_manager.type_system_snapshot(),
         &config.entity_types,
     ))
+}
+
+/// 编译并执行形状校验（`eval-shapes` 与交互命令共用同一确定性路径）。
+async fn shape_report_for(
+    oxigraph_manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+) -> Result<(ShapeSet, ShapeReport), Box<dyn std::error::Error + Send + Sync>> {
+    let facts = oxigraph_manager.load_graph_snapshot().await?;
+    let registry = oxigraph_manager.predicate_registry_snapshot();
+    let types = oxigraph_manager.type_system_snapshot();
+    let shapes = ShapeSet::from_schema(&config.entity_types, &registry, &types);
+    let report = shapes.validate(&facts, &registry, &types);
+    Ok((shapes, report))
 }
 
 /// 把质量护照注入对话管理器；仅在知识版本推进时重建（离线派生，不写图谱）。
@@ -2932,6 +2987,16 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 形状校验：必备属性 / 基数 / 数据类型 / 定义域值域（只读派生）
+        if matches!(input, "形状报告" | "形状校验" | "SHACL报告" | "shacl报告" | "shapes") {
+            match shape_report_for(&oxigraph_manager, &config).await {
+                Ok((_, report)) => println!("{}", report.render_text()),
+                Err(e) => eprintln!("构建形状报告失败: {}", e),
+            }
+            println!();
+            continue;
+        }
+
         // 单实体质量护照：类型来源 / 四维分数 / 可行动缺口
         if let Some(entity) = strip_any_prefix(input, &["质量护照：", "质量护照:"]) {
             let entity = entity.trim();
@@ -4524,6 +4589,7 @@ fn interactive_help() -> String {
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
         "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
+        "  形状报告 / 形状校验                  必备属性、基数、类型与定义域/值域校验",
         "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
         "  外链台账 / 图账本                     外部知识留册与命名图物化视图",
         "  配置契约 / 配置体检                   config.toml 引用/能力/阈值静态检查",
@@ -4815,6 +4881,11 @@ fn is_command_like(input: &str) -> bool {
         "子图",
         "邻域",
         "覆盖报告",
+        "形状报告",
+        "形状校验",
+        "SHACL报告",
+        "shacl报告",
+        "shapes",
         "质量报告",
         "质量护照",
         "质量总览",

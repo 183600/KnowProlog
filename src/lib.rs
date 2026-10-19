@@ -80,6 +80,7 @@ pub mod eval_recovery;
 pub mod recovery;
 pub mod identity;
 pub mod entity_registry;
+pub mod shape_gate;
 
 #[cfg(test)]
 mod dialogue_conformance;
