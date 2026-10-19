@@ -887,7 +887,7 @@ impl EntityLinker {
                 });
             }
         }
-        // 2) 模糊：按分隔段的容错候选（与旧路径共用同一候选生成器）
+        // 2) 模糊：按分隔段的容错候选（与精确匹配共用同一候选生成器）
         for fuzzy in self.fuzzy_mentions(text) {
             let end = fuzzy.start + fuzzy.mention.chars().count();
             nodes.push(LatticeNode {

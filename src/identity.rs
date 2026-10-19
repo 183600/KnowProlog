@@ -2,13 +2,13 @@
 //
 // 本模块不依赖任何神经网络，给纯符号系统补上两件 LLM 的核心装备：
 //   1) 稳定身份：`entity_uri` 把规范名确定性编码成合法 IRI（本地名可无损反解），
-//      身份注册表把「别名 / 旧名 / 合并」记成显式台账，绝不静默改写；
+//      身份注册表把「别名 / 曾用名 / 合并」记成显式台账，绝不静默改写；
 //   2) 组合切分：指称栈（对话焦点 + 类型）上的代词消解与后缀类型推断，
 //      为实体链接的全局解码（见 entity_linker::link_lattice）提供类型闸门。
 //
 // 设计边界：
 // - EntityId 就是与图谱键一致的规范名（不做不透明 ID、不做全库 IRI 重写）；
-// - 编码只转义 IRI 路径段中非法的字符，汉字与常见标点原样保留，向后兼容旧数据；
+// - 编码只转义 IRI 路径段中非法的字符，汉字与常见标点原样保留，可无损解析既有数据；
 // - 代词消解「宁缺毋滥」：类型不匹配或证据不足时原样让位，绝不乱猜。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -103,7 +103,7 @@ pub struct MergeRecord {
 pub enum Resolution {
     /// 唯一规范身份
     Canonical(String),
-    /// 经重定向（旧名/已合并名）解析到规范身份
+    /// 经重定向（曾用名/已合并名）解析到规范身份
     Redirected { from: String, to: String },
     /// 多个规范身份（歧义：需上下文或澄清）
     Ambiguous(Vec<String>),
@@ -321,7 +321,7 @@ impl IdentityRegistry {
         }
     }
 
-    /// 某规范身份的全部可解析词面（别名 + 指向它的旧名），字典序。
+    /// 某规范身份的全部可解析词面（别名 + 指向它的曾用名），字典序。
     pub fn surfaces_of(&self, id: &str) -> Vec<String> {
         let mut surfaces: BTreeSet<String> = BTreeSet::new();
         for (surface, targets) in &self.aliases {
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(
             registry.resolve("苹果"),
             Resolution::Canonical("苹果公司".to_string()),
-            "旧别名应随合并搬去新身份"
+            "被合并词面应随合并解析为新身份"
         );
         assert_eq!(
             registry.surfaces_of("苹果公司"),

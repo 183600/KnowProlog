@@ -19,7 +19,7 @@
 //! - 会话记忆（多轮）：
 //!     案例日志（有界）、校准统计（一致率/争议率）、待定推测清单；
 //!     用户可「对比确认 N」把推测采信为会话事实（无需改知识图谱），
-//!     或「对比否认 N」把推测加入屏蔽集，联想通道不再提出同类推测——
+//!     或「对比否认 N」把推测加入屏蔽集，同类推测被抑制——
 //!     这是纯符号的"从反馈中校准"，不含梯度。
 //!
 //! 与 LLM 的对照：LLM 的"幻觉"来自分布通道没有符号约束；本模块把两条通道
@@ -941,7 +941,7 @@ impl ContrastArbiter {
         ))
     }
 
-    /// 否认推测：加入联想通道屏蔽集（不再提出），同时记为会话级否证
+    /// 否认推测：加入联想通道屏蔽集（同类推测被抑制），同时记为会话级否证
     /// （符号通道会明确反驳同一陈述）
     pub fn refute_guess(&mut self, id: usize) -> Option<String> {
         let index = self
@@ -961,7 +961,7 @@ impl ContrastArbiter {
         };
         self.stats.refuted += 1;
         Some(format!(
-            "已否认联想推测 #{}：{}。该推测已加入联想通道屏蔽集，之后不再提出{}。",
+            "已否认联想推测 #{}：{}。该推测已加入联想通道屏蔽集，同类推测被抑制{}。",
             id, statement, negation_note
         ))
     }
@@ -1156,7 +1156,7 @@ impl ContrastArbiter {
             self.pending_guess_count()
         ));
         output.push_str(&format!(
-            "  推测反馈：确认 {} 条（写入会话事实），否认 {} 条（已屏蔽，联想通道不再重提）\n",
+            "  推测反馈：确认 {} 条（写入会话事实），否认 {} 条（已屏蔽，联想通道不重提）\n",
             stats.confirmed, stats.refuted
         ));
         output.push_str(&format!(

@@ -629,7 +629,7 @@ async fn run_interactive_mode(
 ) {
     println!("{}", config.messages.startup);
     if !recovery_mode.eq(&RecoveryMode::Off) {
-        println!("失败恢复模式：{}（失败会生成结构化回执，不再无声）。", recovery_mode.label());
+        println!("失败恢复模式：{}（失败会生成结构化回执）。", recovery_mode.label());
     }
 
     // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
@@ -1347,7 +1347,7 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 否认联想推测：加入屏蔽集，联想通道不再提出同类推测
+        // 否认联想推测：加入屏蔽集，同类推测被抑制
         if let Some(target) = strip_any_prefix(
             input,
             &["对比否认", "对比否认：", "对比否认:", "对比否决", "对比否决：", "对比否决:"],

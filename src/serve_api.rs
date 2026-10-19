@@ -14,7 +14,7 @@
 //! `mpsc::Sender`，通过 oneshot 等待结果。其结果是：
 //! - [`ApiState`] 是 `Send + Sync`，accept 循环 `tokio::spawn` 每连接，
 //!   跨会话真并行、同会话严格 FIFO（命令按到达顺序处理）；
-//! - 一个慢查询/慢 SSE 连接不再阻塞其他连接的 accept；
+//! - 一个慢查询/慢 SSE 连接不会阻塞其他连接的 accept；
 //! - 会话关闭 = 丢弃 `Sender`，actor 处理完已排队命令后线程自然退出。
 //!
 //! # 会话信封（序列化 + 冷存储）
@@ -1131,9 +1131,9 @@ pub async fn serve(state: Arc<ApiState>, addr: &str) -> std::io::Result<()> {
 
 /// 在已绑定的监听器上运行（测试可直接绑定 `127.0.0.1:0`）。
 ///
-/// [`ApiState`] 现在是 `Send + Sync`（会话在专属 actor 线程内），因此每个连接
+/// [`ApiState`] 是 `Send + Sync`（会话在专属 actor 线程内），因此每个连接
 /// 独立 `tokio::spawn`：跨会话真并行、同会话由 actor 串行化；每个连接仍有
-/// [`CONNECTION_TIMEOUT`] 兜底，慢客户端不再阻塞新连接。
+/// [`CONNECTION_TIMEOUT`] 兜底，慢客户端不会阻塞新连接。
 pub async fn run(listener: TcpListener, state: Arc<ApiState>) -> std::io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;

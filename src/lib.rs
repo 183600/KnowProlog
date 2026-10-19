@@ -1520,7 +1520,7 @@ impl OxigraphManager {
         crate::identity::local_name(BASE_NS, iri).unwrap_or_else(|| iri.to_string())
     }
 
-    /// 主体 IRI → 图谱键：优先按 kg 实体路径无损反解；外部 IRI 退回「尾部段」旧语义。
+    /// 主体 IRI → 图谱键：优先按 kg 实体路径无损反解；外部 IRI 退回「尾部段」语义。
     fn entity_key_from_iri(iri: &str) -> String {
         if let Some(name) = crate::identity::local_name(BASE_NS, iri) {
             return name;
@@ -1845,7 +1845,7 @@ impl OxigraphManager {
                 continue;
             }
 
-            // 命名节点直接取 IRI 尾部（kg 实体 IRI 经百分号解码反解；外部 IRI 保持旧语义）
+            // 命名节点直接取 IRI 尾部（kg 实体 IRI 经百分号解码反解；外部 IRI 按尾部段语义）
             let entity_name = match &quad.subject {
                 Subject::NamedNode(node) => Self::entity_key_from_iri(node.as_str()),
                 _ => {

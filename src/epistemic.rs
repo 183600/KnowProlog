@@ -329,7 +329,7 @@ impl FailureLedger {
         self.open().count()
     }
 
-    /// 裁定一条回执；返回是否存在且此前未结。
+    /// 裁定一条回执；返回是否裁定了未结的回执。
     pub fn resolve(&mut self, id: &str, resolution: ReceiptResolution) -> bool {
         let Some(receipt) = self
             .receipts

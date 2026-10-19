@@ -8,7 +8,7 @@ use crate::bindings::{BindingSet, BoundTerm};
 
 /// 查询的三态结局：有解 / 无解 / 引擎故障。
 ///
-/// 无解（`QueryResolution::False`）与故障（`Err`）绝不再合并成同一个空
+/// 无解（`QueryResolution::False`）与故障（`Err`）绝不合并成同一个空
 /// `Vec`：前者是「知识里没有」，后者是「我出错了」——认识论上不同，
 /// 恢复策略也不同（见 [`crate::recovery`]）。
 #[derive(Debug, Clone, PartialEq)]
@@ -303,7 +303,7 @@ impl PrologEngine {
     /// 三态查询：有解 / 无解 / 引擎故障——`query` 与 `query_typed` 的公共真值层。
     ///
     /// 引擎崩溃（scryer 内部 panic）也被收进 `EngineFault`：崩溃后的实例
-    /// 标记为停止服务，后续查询不再触碰内部状态。
+    /// 标记为停止服务，后续查询不触碰内部状态。
     pub fn query_outcome(&mut self, query: &str) -> QueryOutcome {
         if self.poisoned {
             let message = "引擎已因崩溃停止服务（需重建实例）".to_string();
@@ -673,6 +673,6 @@ mod tests {
         assert!(engine.last_fault().is_some());
         assert!(engine
             .consult_source("p(a).")
-            .is_err(), "停止服务的引擎不再接受事实");
+            .is_err(), "停止服务的引擎不接受事实");
     }
 }

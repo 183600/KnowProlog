@@ -498,8 +498,8 @@ impl DialogueManager {
 
     /// 把一次让位（defer）记为 Unknown 失败回执：知识管线未能接管输入。
     ///
-    /// Off 模式零副作用；返回是否产生了回执。让位不再是「无声的」——
-    /// 它和确答一样有状态、有 id、可被自省检索。
+    /// Off 模式零副作用；返回是否产生了回执。让位和确答一样，
+    /// 有状态、有 id、可被自省检索。
     pub fn note_deferred(&mut self, input: &str, knowledge: &dyn DialogueKnowledge) -> bool {
         if self.recovery_mode.eq(&RecoveryMode::Off) {
             return false;
@@ -1350,7 +1350,7 @@ impl DialogueManager {
             "最近一条失败回执"
         };
         Some(format!(
-            "我还没有答过带依据的问题；但失败不是无声的——{}：{}。失败回执和成功回答一样会被记录（状态、档位、证据都可回溯），我不会为此编造依据。",
+            "我还没有答过带依据的问题；这里有一条失败回执——{}：{}。失败回执和成功回答一样会被记录（状态、档位、证据都可回溯），我不会为此编造依据。",
             framing,
             receipt.render_line()
         ))

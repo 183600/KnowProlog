@@ -238,7 +238,7 @@ pub struct SnapshotClause {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueSnapshot {
     pub focus_entities: Vec<String>,
-    /// 焦点实体的类型证据（代词消解闸门；旧信封缺省为空）
+    /// 焦点实体的类型证据（代词消解闸门；字段缺省为空）
     #[serde(default)]
     pub focus_types: HashMap<String, String>,
     pub last_predicate: Option<String>,
@@ -2578,7 +2578,7 @@ impl SymbolicReasoner {
     fn clarification_follow_up(&mut self) -> String {
         if let Some((goal, solution)) = self.clarified_goal_solution() {
             let mut text = format!(
-                "\n  → 目标「{}」现在已可证明（置信度 {:.2}）",
+                "\n  → 目标「{}」已可证明（置信度 {:.2}）",
                 goal,
                 solution.confidence
             );

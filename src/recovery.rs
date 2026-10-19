@@ -863,7 +863,7 @@ mod tests {
         assert!(first.question.is_some());
         let first_question = first.question.clone().unwrap();
 
-        // 同缺口重复提问：不再挂第二个问题，降级为 L4 状态措辞
+        // 同缺口重复提问：不挂第二个问题，降级为 L4 状态措辞
         let second = attempt(
             &mut state,
             RecoveryMode::On,
