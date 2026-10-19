@@ -1202,6 +1202,18 @@ impl SymbolicReasoner {
         synonym_added || surface_added
     }
 
+    /// 登记实体别名（来自实体身份注册表已确认的持久别名）：链接器按别名识别，
+    /// 与 KB 里的规范名同权；歧义词面如实保留多候选，不静默择一。
+    pub fn register_entity_alias(&mut self, alias: &str, canonical: &str) -> bool {
+        let (alias, canonical) = (alias.trim(), canonical.trim());
+        if alias.is_empty() || canonical.is_empty() || alias == canonical {
+            return false;
+        }
+        self.linker.register_alias(alias, canonical);
+        self.link_memo.lock().clear();
+        true
+    }
+
     /// 登记逆向谓词词面：问句用该词面发问时，命中规范槽位三元组的反方向
     ///（「徒弟」问句 ↔「师傅」事实）。只影响查询换向，不改词面/叙事表。
     pub fn register_predicate_query_surface(&mut self, surface: &str, slot: &str) {
