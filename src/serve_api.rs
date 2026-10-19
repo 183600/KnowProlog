@@ -65,9 +65,12 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
-use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueManagerSnapshot};
+use crate::dialogue_manager::{
+    DialogueKnowledge, DialogueManager, DialogueManagerSnapshot, MoveKind,
+};
 use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
+use crate::plugin::{PluginOutcome, PluginRuntime};
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
 use crate::quality::QualityIndex;
@@ -396,29 +399,107 @@ struct Session {
     reasoner: SymbolicReasoner,
     history: Vec<String>,
     policy: SessionPolicy,
+    /// 服务级插件运行时（多会话共享；模式在服务启动时确定，HTTP 不提供热切换）。
+    plugin: Option<Arc<parking_lot::Mutex<PluginRuntime>>>,
 }
 
 impl Session {
+    /// 插件配方直答：只读既有知识源，模板必须全部槽位接地；取不到值则让位核心管线。
+    fn plugin_recipe_answer(
+        &mut self,
+        raw_input: &str,
+        outcome: Option<&PluginOutcome>,
+    ) -> Option<(String, Vec<String>, String)> {
+        let outcome = outcome?;
+        let recipe = outcome.trace.recipe.clone()?;
+        let entity = recipe.slots.get("entity").cloned();
+        let mut answer = None;
+        if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
+            let mut values = DialogueKnowledge::attribute_values(&self.reasoner, entity, attribute);
+            values = values
+                .into_iter()
+                .map(|value| {
+                    crate::identity::local_name(crate::identity::DEFAULT_BASE_NS, &value)
+                        .unwrap_or(value)
+                })
+                .collect();
+            values.sort();
+            values.dedup();
+            if !values.is_empty() {
+                answer = Some(values.join("、"));
+            }
+        }
+        if answer.is_none() {
+            answer = self.reasoner.answer(&recipe.question);
+        }
+        let answer = answer?;
+        let composed = self
+            .plugin
+            .as_ref()?
+            .lock()
+            .compose_answer(outcome, &answer);
+        let plan = vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
+        let provenance = vec![format!(
+            "插件 {} / 配方 {} / 问句 {}",
+            recipe.plugin, recipe.contribution, recipe.question
+        )];
+        self.manager.note_plugin_turn(
+            raw_input,
+            MoveKind::AskAttribute,
+            entity.as_deref(),
+            recipe.attribute.as_deref(),
+            &composed.text,
+            plan.clone(),
+            provenance,
+        );
+        Some((composed.text, plan, "attribute".to_string()))
+    }
+
     fn run_turn(&mut self, input: &str) -> TurnResponse {
-        let input = input.trim().to_string();
+        let raw_input = input.trim().to_string();
         self.turns += 1;
         if self.history.len() >= HISTORY_LIMIT {
             self.history.remove(0);
         }
-        self.history.push(input.clone());
+        self.history.push(raw_input.clone());
         self.manager.clear_last_recovery();
+
+        // 插件改写预通道：词表/本体归一只影响管线输入，原始措辞仍用于接地引用。
+        let plugin_outcome: Option<PluginOutcome> = self
+            .plugin
+            .as_ref()
+            .map(|runtime| runtime.lock().rewrite(&raw_input));
+        let input = plugin_outcome
+            .as_ref()
+            .map(|outcome| outcome.trace.effective.clone())
+            .unwrap_or_else(|| raw_input.clone());
+        let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
         let dialogue = self
             .manager
             .plan_pure_dialogue(&input, &self.reasoner)
             .or_else(|| self.manager.plan_reply(&input, &self.reasoner));
-        let (status, source, kind, plan, reply) = if let Some(reply) = dialogue {
+        let (status, source, kind, plan, reply) = if let Some((text, plan, kind)) = plugin_answer
+        {
+            (
+                "answered".to_string(),
+                "plugin".to_string(),
+                Some(kind),
+                plan,
+                text,
+            )
+        } else if let Some(reply) = dialogue {
+            let text = self
+                .plugin
+                .as_ref()
+                .map(|runtime| runtime.lock().style_wrap(&reply.text))
+                .unwrap_or(reply.text);
             (
                 "answered".to_string(),
                 "dialogue".to_string(),
                 Some(reply.kind.label().to_string()),
                 reply.plan,
-                reply.text,
+                text,
             )
         } else if let Some(answer) = self.reasoner.answer(&input) {
             (
@@ -427,6 +508,23 @@ impl Session {
                 None,
                 Vec::new(),
                 answer,
+            )
+        } else if let Some((text, plan)) = self
+            .plugin
+            .as_ref()
+            .and_then(|runtime| runtime.lock().policy_reply(&input))
+        {
+            let text = self
+                .plugin
+                .as_ref()
+                .map(|runtime| runtime.lock().style_wrap(&text))
+                .unwrap_or(text);
+            (
+                "answered".to_string(),
+                "plugin".to_string(),
+                Some("policy".to_string()),
+                vec![plan],
+                text,
             )
         } else {
             // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
@@ -778,6 +876,7 @@ fn build_session(
     prompt_mode: PromptMode,
     recovery_mode: RecoveryMode,
     quality: Option<Arc<QualityIndex>>,
+    plugin: Option<Arc<parking_lot::Mutex<PluginRuntime>>>,
     restore: Option<SessionRestore>,
 ) -> Session {
     let reasoner = warm.fork();
@@ -794,6 +893,7 @@ fn build_session(
         reasoner,
         history: Vec::new(),
         policy: SessionPolicy::default(),
+        plugin,
     };
     if let Some(restore) = restore {
         session.turns = restore.turns;
@@ -817,6 +917,8 @@ pub struct ApiState {
     kb_revision: u64,
     /// 质量护照索引（由宿主注入；只读派生数据，供会话生成出处/冲突/缺口话语）。
     quality: Option<Arc<QualityIndex>>,
+    /// 插件运行时（由宿主注入；多会话共享，模式在注入时确定）。
+    plugin: Option<Arc<parking_lot::Mutex<PluginRuntime>>>,
     /// 身份准入纪元：新实体/别名准入时 +1，全部缓存条目整体失效（可审计）。
     identity_epoch: AtomicU64,
     perf: Arc<PerfLedger>,
@@ -866,6 +968,7 @@ impl ApiState {
             ))),
             kb_revision,
             quality: None,
+            plugin: None,
             identity_epoch: AtomicU64::new(0),
             perf,
             startup,
@@ -970,6 +1073,14 @@ impl ApiState {
         self.quality.as_deref()
     }
 
+    /// 注入插件运行时（在 `Arc::new` 之前调用）。
+    ///
+    /// 运行时被所有会话共享：词表/本体/改写/配方/风格一致地作用于每个会话，
+    /// 而对话记忆仍按会话隔离。模式在注入时确定，运行中不提供 HTTP 热切换。
+    pub fn set_plugin_runtime(&mut self, runtime: Option<Arc<parking_lot::Mutex<PluginRuntime>>>) {
+        self.plugin = runtime;
+    }
+
     /// 当前引擎指纹（知识库指纹 + 运行模式）。
     pub fn engine_stamp(&self) -> EngineStamp {
         EngineStamp {
@@ -994,6 +1105,7 @@ impl ApiState {
         let prompt_mode = self.prompt_mode;
         let recovery_mode = self.recovery_mode;
         let quality = self.quality.clone();
+        let plugin = self.plugin.clone();
         let engine = Arc::new(self.engine_stamp());
         let thread_name = format!("kp-session-{}", id);
         std::thread::Builder::new()
@@ -1010,6 +1122,7 @@ impl ApiState {
                         prompt_mode,
                         recovery_mode,
                         quality,
+                        plugin,
                         restore,
                     )
                 };
@@ -2248,6 +2361,74 @@ mod tests {
     fn api_state_is_send_and_sync() {
         // actor 化后的核心契约：HTTP 层可以跨线程/跨任务共享服务状态
         assert_send_sync::<ApiState>();
+    }
+
+    #[tokio::test]
+    async fn plugin_recipe_answers_across_http_sessions() {
+        let manifest: crate::plugin::PluginManifest = toml::from_str(
+            r#"
+id = "test.height"
+version = "0.1.0"
+api = 1
+name = "身高包"
+default_mode = "on"
+
+[[contributions]]
+kind = "recipe"
+id = "height.recipe"
+patterns = ["{entity}有多高"]
+question = "{entity}的身高是什么"
+attribute = "身高"
+template = "height.template"
+
+[[contributions]]
+kind = "template"
+id = "height.template"
+template = "「{entity}」的身高是{answer}。"
+"#,
+        )
+        .expect("测试清单应可解析");
+        let registry = crate::plugin::PluginRegistry::from_manifests(vec![manifest]);
+        let runtime = crate::plugin::PluginRuntime::with_settings(
+            registry,
+            &crate::plugin::PluginSettings::default(),
+        );
+        assert_eq!(runtime.enabled_count(), 1);
+
+        let mut yao = HashMap::new();
+        yao.insert("身高".to_string(), "226".to_string());
+        let facts = vec![PrologFact::Entity {
+            name: "姚明".to_string(),
+            entity_type: "人物".to_string(),
+            properties: yao,
+        }];
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: false,
+            ..ReasoningConfig::default()
+        };
+        let mut state = ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        );
+        state.set_plugin_runtime(Some(Arc::new(parking_lot::Mutex::new(runtime))));
+        let state = Arc::new(state);
+
+        let session_id = state.create_session().await.expect("会话应创建成功");
+        let turn = state
+            .take_turn(&session_id, "姚明有多高")
+            .await
+            .expect("轮次应成功");
+        assert_eq!(turn.source, "plugin");
+        assert!(turn.reply.contains("226"), "{}", turn.reply);
+        assert!(
+            turn.plan.iter().any(|plan| plan.contains("height.recipe")),
+            "{:?}",
+            turn.plan
+        );
     }
 
     fn test_state(max_sessions: usize) -> Arc<ApiState> {

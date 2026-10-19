@@ -65,6 +65,13 @@ holographic_similarity_floor = 0.01    # 召回候选的余弦下限（低于视
 holographic_max_hits = 6               # 单次全息召回的最大候选数
 require_predicate_admission = false    # 严格准入：只允许画像中已登记的谓词入库（false=未知谓词自动待确认准入）
 
+# 声明式插件（符号专家）：每个包是一份带类型贡献的 TOML 清单，
+# 不加载动态库、不执行插件代码；交互模式用「插件」查看，用「启用插件：<id>」切换。
+[plugins]
+directory = "plugins"                 # 清单目录：dir/*.toml 或 dir/<package>/manifest.toml
+enabled = []                          # 启动时默认启用的插件 id（可留空）
+modes = {}                            # 逐包模式覆盖，例如 [plugins.modes] "zh.film" = "on"
+
 # 谓词画像：声明别名/互逆/功能/传递/对称，导入时统一归一方向，查询时自动换算。
 [[predicate_profiles]]
 name = "师傅"                          # 规范谓词名

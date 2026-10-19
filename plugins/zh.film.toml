@@ -1,0 +1,75 @@
+id = "zh.film"
+version = "0.1.0"
+api = 1
+name = "电影知识包"
+description = "作品 / 导演 / 演员的声明式问法与检索配方。"
+default_mode = "off"
+
+[[contributions]]
+kind = "lexicon"
+id = "film.lexicon"
+description = "电影领域词面归一。"
+entries = [
+  { surface = "影片", canonical = "电影" },
+  { surface = "执导", canonical = "导演" },
+]
+
+[[contributions]]
+kind = "ontology"
+id = "film.ontology"
+description = "电影领域谓词别名（启动时合并进谓词对齐器）。"
+predicates = [
+  { name = "导演", aliases = ["director"] },
+]
+
+[[contributions]]
+kind = "recipe"
+id = "film.directed_by"
+description = "作品 → 导演"
+patterns = [
+  "{entity}是谁导演的",
+  "{entity}由谁导演",
+  "谁导演了{entity}",
+]
+question = "{entity}的导演是什么"
+attribute = "导演"
+template = "film.directed_by.template"
+
+[[contributions]]
+kind = "rewrite"
+id = "film.works_by_actor"
+description = "演员 → 作品"
+pattern = "{entity}演过哪些电影"
+replacement = "{entity}的电影有哪些"
+
+[[contributions]]
+kind = "template"
+id = "film.directed_by.template"
+description = "导演配方模板（所有槽位必须接地）。"
+template = "「{entity}」的导演是{answer}。"
+
+[[eval_cases]]
+input = "阿凡达是谁导演的"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+expect_contains = "导演"
+
+[[eval_cases]]
+input = "阿凡达由谁执导"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[contributions]]
+kind = "reference"
+id = "film.reference"
+description = "电影领域指称线索（启动时补入分词/词性词典）。"
+quantifiers = ["这位", "那位", "该"]
+role_words = ["导演", "演员"]
+surnames = ["卡梅隆"]
+
+[[contributions]]
+kind = "policy"
+id = "film.unknown"
+description = "领域问题答不了时的兜底措辞。"
+when = ["导演", "演员", "影片"]
+reply = "我的电影知识库暂时没有这条记录。你可以说「录入：…」教我，或换个说法再问。"

@@ -25,7 +25,7 @@ use know_prolog::{
     symbolic_reasoner::SymbolicReasoner,
     dialogue_frame::ClarificationOutcome,
     neuro_symbolic_contrast::ContrastArbiter,
-    dialogue_manager::DialogueManager,
+    dialogue_manager::{DialogueManager, MoveKind},
     contextual_reference::{
         parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
         ContextualResolver,
@@ -60,6 +60,7 @@ use know_prolog::{
     },
     prompt_spec::{self, LintSeverity, PromptMode},
     config_contract,
+    plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
     law_book::LawBook,
     link_prediction::{LinkPredictor, Triple as LawTriple},
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
@@ -272,6 +273,18 @@ enum Commands {
         #[arg(long = "path")]
         paths: Vec<String>,
     },
+    /// Inspect, lint and evaluate declarative plugin manifests
+    Plugins {
+        /// Override the configured plugin directory
+        #[arg(long)]
+        dir: Option<String>,
+        /// Print the plugin report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Run every manifest's bundled eval cases
+        #[arg(long)]
+        eval: bool,
+    },
     /// Run the session REST service (multi-turn dialogue over HTTP + SSE)
     Serve {
         /// Listen address
@@ -349,6 +362,12 @@ async fn main() {
             return;
         }
     };
+
+    // 插件清点/评测同样不依赖知识存储：清单是纯声明式资产。
+    if let Some(Commands::Plugins { dir, json, eval }) = &cli.command {
+        run_plugins(&config.plugins, dir.as_deref(), *json, *eval);
+        return;
+    }
 
     // 无需知识存储的子命令先行处理：只跑提示词 lint / NLU 评测时，
     // 即使 Oxigraph 库路径不可用也不受影响（不创建存储、不读知识库）。
@@ -860,11 +879,34 @@ async fn main() {
             }
             api_state.set_prompt_mode(prompt_mode);
             api_state.set_recovery_mode(recovery_mode);
+            // 服务级插件运行时：多会话共享改写/配方/模板/风格，模式取自
+            // 配置与 <store>/plugin_state.json；HTTP 不提供热切换。
+            let plugin_state_path = format!("{}/plugin_state.json", store_path);
+            let plugin_registry = PluginRegistry::load_dir(&config.plugins.directory);
+            let mut plugin_runtime =
+                PluginRuntime::with_settings(plugin_registry, &config.plugins);
+            if let Some(state) = PluginSessionState::load(&plugin_state_path) {
+                plugin_runtime.restore_session_state(state);
+            }
+            if plugin_runtime.installed_count() > 0 {
+                println!(
+                    "插件目录「{}」：已安装 {} 个，启用 {} 个（服务级共享）。",
+                    config.plugins.directory,
+                    plugin_runtime.installed_count(),
+                    plugin_runtime.enabled_count()
+                );
+            }
+            let plugin_runtime = (plugin_runtime.installed_count() > 0)
+                .then(|| Arc::new(parking_lot::Mutex::new(plugin_runtime)));
+            api_state.set_plugin_runtime(plugin_runtime);
             let state = Arc::new(api_state);
             if let Err(e) = know_prolog::serve_api::serve(state, &addr).await {
                 eprintln!("服务退出: {}", e);
                 std::process::exit(1);
             }
+        }
+        Some(Commands::Plugins { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
         }
         Some(Commands::FuzzDialogue { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
@@ -1331,6 +1373,43 @@ fn run_config_lint(file: Option<&str>, json: bool, strict: bool) {
     }
 }
 
+/// `plugins`：清点清单、报告启用模式、跑包内评测；不打开知识存储。
+fn run_plugins(settings: &PluginSettings, directory: Option<&str>, json: bool, eval: bool) {
+    let directory = directory.unwrap_or(&settings.directory);
+    let registry = PluginRegistry::load_dir(directory);
+    let runtime = PluginRuntime::with_settings(registry, settings);
+    let results = if eval {
+        runtime.registry().evaluate()
+    } else {
+        Vec::new()
+    };
+    if json {
+        let value = serde_json::json!({
+            "directory": directory,
+            "plugins": runtime.manifests(),
+            "modes": runtime.modes(),
+            "issues": runtime.issues(),
+            "evals": results,
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("插件报告序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", runtime.render_report());
+        if eval {
+            println!("{}", runtime.registry().render_eval(&results));
+        }
+    }
+    let failed_eval = results.iter().any(|result| !result.passed);
+    if runtime.registry().has_errors() || failed_eval {
+        std::process::exit(1);
+    }
+}
+
 /// 启动时的静默断链提醒：只在契约存在 Error 时打一行 stderr，
 /// 说明去哪里看明细；不改变任何运行路径（观察，不接管）。
 fn warn_config_contract(config: &know_prolog::SystemConfig) {
@@ -1688,6 +1767,47 @@ async fn run_interactive_mode(
         }
     }
 
+    // 声明式插件：清单只在启动时合并；运行中切换的是改写/配方/模板/风格的
+    // 启用模式。用户显式覆盖落盘到 <store>/plugin_state.json，重启后继续生效。
+    let plugin_state_path = format!("{}/plugin_state.json", store_path);
+    let plugin_registry = PluginRegistry::load_dir(&config.plugins.directory);
+    let mut plugin_runtime = PluginRuntime::with_settings(plugin_registry, &config.plugins);
+    if let Some(state) = PluginSessionState::load(&plugin_state_path) {
+        let restored = plugin_runtime.restore_session_state(state);
+        if restored > 0 {
+            println!("已恢复插件会话状态：{} 个模式覆盖。", restored);
+        }
+    }
+    if plugin_runtime.installed_count() > 0 {
+        println!(
+            "插件目录「{}」：已安装 {} 个，启用 {} 个（「插件」查看，「启用插件：<id>」切换）。",
+            config.plugins.directory,
+            plugin_runtime.installed_count(),
+            plugin_runtime.enabled_count()
+        );
+    }
+    for issue in plugin_runtime.issues() {
+        if issue.severity == know_prolog::plugin::PluginSeverity::Error {
+            eprintln!("插件：{}", issue.render());
+        }
+    }
+    // 本体贡献在启动时合并进既有谓词对齐器（运行中只切换词表/改写/配方/模板/风格）。
+    let mut plugin_aliases = 0;
+    for (alias, canonical) in plugin_runtime.ontology_aliases() {
+        if symbolic_reasoner.register_predicate_alias(&alias, &canonical) {
+            plugin_aliases += 1;
+        }
+    }
+    if plugin_aliases > 0 {
+        println!("插件本体已合并：{} 条谓词别名。", plugin_aliases);
+    }
+    // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
+    let plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
+    let plugin_reference_entries = plugin_nlp.pos_dict.len().saturating_sub(config.nlp.pos_dict.len());
+    if plugin_reference_entries > 0 {
+        println!("插件指称线索已合并：{} 条词性提示。", plugin_reference_entries);
+    }
+
     // 问答式关系获取（QRA）：会话账本 + 覆盖层 + 对话诱导模式。
     // 只读图谱与画像，确认后才进入覆盖层；采纳后才进入会话事实集。
     let acquisition_path = format!("{}/acquisition_ledger.json", store_path);
@@ -1790,18 +1910,48 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 声明式插件：启停、模式、诊断与自述先于一切查询处理。
+        if let Some(outcome) = plugin_runtime.handle_command(input) {
+            println!("{}", outcome.text);
+            if outcome.state_changed {
+                if let Err(error) = plugin_runtime.session_state().save(&plugin_state_path) {
+                    eprintln!("插件会话状态保存失败（不影响本次回答）：{}", error);
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 插件改写只作用于自然语言查询：命令、导入行与帮助保持逐字原样。
+        let raw_input = input;
+        let plugin_outcome = if !raw_input.is_empty()
+            && matches!(
+                detect_input_mode(raw_input, &config.nlp.import_keywords),
+                InputMode::Query
+            )
+            && !is_command_like(raw_input)
+        {
+            Some(plugin_runtime.rewrite(raw_input))
+        } else {
+            None
+        };
+        let input = plugin_outcome
+            .as_ref()
+            .map(|outcome| outcome.text.as_str())
+            .unwrap_or(raw_input);
+
         // 外链名册的逻辑时刻：每个非空用户轮次推进一次（TTL 的计量单位）
         if !input.is_empty() {
             external_knowledge_service.advance_tick();
         }
 
-        if dialogue_enabled && !input.is_empty() {
-            dialogue_manager.observe_input(input);
+        if dialogue_enabled && !raw_input.is_empty() {
+            dialogue_manager.observe_input(raw_input);
         }
 
         // 全息时序记忆：把本轮输入中提及的实体压入置换编码的焦点叠加（多轮"注意力轨迹"）
-        if config.reasoning.enable_holographic_memory && !input.is_empty() {
-            symbolic_reasoner.note_holo_context(input);
+        if config.reasoning.enable_holographic_memory && !raw_input.is_empty() {
+            symbolic_reasoner.note_holo_context(raw_input);
         }
 
         // 导入行不立即刷新：进入查询/命令前统一观察整图
@@ -1821,16 +1971,16 @@ async fn run_interactive_mode(
 
         // 编年史写前日志：用户输入先落盘再处理；记录当轮开始时的焦点与对话水位，
         // 重启后据此回放/重建上下文（崩溃语义：最多丢进行中的一轮）。
-        if !input.is_empty() {
+        if !raw_input.is_empty() {
             if let Some(chronicle) = chronicle.as_mut() {
-                let mode = match detect_input_mode(input, &config.nlp.import_keywords) {
+                let mode = match detect_input_mode(raw_input, &config.nlp.import_keywords) {
                     InputMode::KnowledgeImport => "import",
                     InputMode::Query => "query",
                 };
-                let kind = if is_command_like(input) { "command" } else { mode };
+                let kind = if is_command_like(raw_input) { "command" } else { mode };
                 let focus = dialogue_manager.focus_entity();
                 let _ = chronicle.append_turn(
-                    input,
+                    raw_input,
                     kind,
                     focus,
                     dialogue_manager.turn_count(),
@@ -3759,13 +3909,14 @@ async fn run_interactive_mode(
             )
             .await;
             if let Some(reply) = dialogue_manager.plan_pure_dialogue(input, &symbolic_reasoner) {
-                println!("{}", reply.text);
+                let text = plugin_runtime.style_wrap(&reply.text);
+                println!("{}", text);
                 let provenance: Vec<String> = dialogue_manager
                     .turns()
                     .last()
                     .map(|turn| turn.provenance.clone())
                     .unwrap_or_default();
-                log_chronicle_reply(&mut chronicle, &reply.text, &reply.plan, &provenance);
+                log_chronicle_reply(&mut chronicle, &text, &reply.plan, &provenance);
                 println!();
                 continue;
             }
@@ -3951,7 +4102,7 @@ async fn run_interactive_mode(
                         .trim()
                         .to_string();
                     
-                    let tagged_words = preprocess(&clean_text, &config.nlp);
+                    let tagged_words = preprocess(&clean_text, &plugin_nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
                     // 中文关系句 → 关系三元组（如「张三是李四的师傅」），
@@ -4189,6 +4340,69 @@ async fn run_interactive_mode(
                     continue;
                 }
 
+                // 插件配方：只读既有知识源，模板必须全部槽位接地；取不到值则让位核心管线。
+                if let Some(outcome) = plugin_outcome.as_ref() {
+                    if let Some(recipe) = outcome.trace.recipe.clone() {
+                        let entity = recipe.slots.get("entity").cloned();
+                        let mut answer = None;
+                        if let (Some(entity), Some(attribute)) =
+                            (entity.as_deref(), recipe.attribute.as_deref())
+                        {
+                            let mut values =
+                                know_prolog::dialogue_manager::DialogueKnowledge::attribute_values(
+                                    &symbolic_reasoner,
+                                    entity,
+                                    attribute,
+                                );
+                            values = values
+                                .into_iter()
+                                .map(|value| {
+                                    know_prolog::identity::local_name(
+                                        know_prolog::identity::DEFAULT_BASE_NS,
+                                        &value,
+                                    )
+                                    .unwrap_or(value)
+                                })
+                                .collect();
+                            values.sort();
+                            values.dedup();
+                            if !values.is_empty() {
+                                answer = Some(values.join("、"));
+                            }
+                        }
+                        if answer.is_none() {
+                            answer = symbolic_reasoner.answer(&recipe.question);
+                        }
+                        if let Some(answer) = answer {
+                            let composed = plugin_runtime.compose_answer(outcome, &answer);
+                            let text = composed.text;
+                            println!("{}", text);
+                            let plan = vec![format!(
+                                "plugin:{}:{}",
+                                recipe.plugin, recipe.contribution
+                            )];
+                            let provenance = vec![format!(
+                                "插件 {} / 配方 {} / 问句 {}",
+                                recipe.plugin, recipe.contribution, recipe.question
+                            )];
+                            if dialogue_enabled {
+                                dialogue_manager.note_plugin_turn(
+                                    raw_input,
+                                    MoveKind::AskAttribute,
+                                    recipe.slots.get("entity").map(String::as_str),
+                                    recipe.attribute.as_deref(),
+                                    &text,
+                                    plan.clone(),
+                                    provenance.clone(),
+                                );
+                            }
+                            log_chronicle_reply(&mut chronicle, &text, &plan, &provenance);
+                            println!();
+                            continue;
+                        }
+                    }
+                }
+
                 // 本体化对话管理器：实体已知的知识问句给出"结论 + 出处 + 追问建议"式组合回答
                 if dialogue_enabled {
                     refresh_dialogue_quality(
@@ -4199,19 +4413,20 @@ async fn run_interactive_mode(
                     )
                     .await;
                     if let Some(reply) = dialogue_manager.plan_reply(input, &symbolic_reasoner) {
-                        println!("{}", reply.text);
+                        let text = plugin_runtime.style_wrap(&reply.text);
+                        println!("{}", text);
                         let provenance: Vec<String> = dialogue_manager
                             .turns()
                             .last()
                             .map(|turn| turn.provenance.clone())
                             .unwrap_or_default();
-                        log_chronicle_reply(&mut chronicle, &reply.text, &reply.plan, &provenance);
+                        log_chronicle_reply(&mut chronicle, &text, &reply.plan, &provenance);
                         println!();
                         continue;
                     }
                 }
 
-                let tagged_words = preprocess(input, &config.nlp);
+                let tagged_words = preprocess(input, &plugin_nlp);
                 let precomputed_query_entities =
                     extract_query_entities_from_tagged(&tagged_words, &config);
                 let nlu_tagged_words = if config.nlp.enable_nlu.unwrap_or(false) {
@@ -4349,10 +4564,20 @@ async fn run_interactive_mode(
                                     // 继续使用查询逻辑
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
                                         // 执行查询流程
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, input, &query_type, &entities, &precomputed_query_entities).await;
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
                                     } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                    } else if let Some((text, plan)) =
+                                        plugin_policy_text(&mut plugin_runtime, input)
+                                    {
+                                        println!("{}", text);
+                                        log_chronicle_reply(
+                                            &mut chronicle,
+                                            &text,
+                                            &[plan.clone()],
+                                            &[format!("插件策略 {}", plan)],
+                                        );
                                     } else {
                                         let fallback = "无法理解您的查询，请重新描述您的问题。";
                                         println!("{}", fallback);
@@ -4363,10 +4588,20 @@ async fn run_interactive_mode(
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
                                     if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, input, &query_type, &entities, &precomputed_query_entities).await;
+                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
                                     } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                    } else if let Some((text, plan)) =
+                                        plugin_policy_text(&mut plugin_runtime, input)
+                                    {
+                                        println!("{}", text);
+                                        log_chronicle_reply(
+                                            &mut chronicle,
+                                            &text,
+                                            &[plan.clone()],
+                                            &[format!("插件策略 {}", plan)],
+                                        );
                                     } else {
                                         println!("{}", config.messages.cannot_understand);
                                         log_chronicle_reply(&mut chronicle, &config.messages.cannot_understand, &[], &[]);
@@ -4610,8 +4845,19 @@ async fn run_interactive_mode(
                         );
                     }
                     
-                    // 尝试使用外部知识API
-                    if let Some(direct_answer) = get_direct_answer(input) {
+                    // 插件声明的兜底策略先于外链/常识别源；只改措辞，不伪造事实。
+                    if let Some((policy_text, policy_plan)) =
+                        plugin_runtime.policy_reply(raw_input)
+                    {
+                        let text = plugin_runtime.style_wrap(&policy_text);
+                        println!("{}", text);
+                        log_chronicle_reply(
+                            &mut chronicle,
+                            &text,
+                            &[policy_plan.clone()],
+                            &[format!("插件策略 {}", policy_plan)],
+                        );
+                    } else if let Some(direct_answer) = get_direct_answer(input) {
                         println!("根据常识知识库：{}", direct_answer);
                         log_chronicle_reply(
                             &mut chronicle,
@@ -5137,6 +5383,15 @@ fn contains_question_marker(text: &str) -> bool {
 }
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
+/// 插件声明式兜底：返回（可直接打印的文本，贡献路径）。
+fn plugin_policy_text(
+    runtime: &mut know_prolog::plugin::PluginRuntime,
+    input: &str,
+) -> Option<(String, String)> {
+    let (text, plan) = runtime.policy_reply(input)?;
+    Some((runtime.style_wrap(&text), plan))
+}
+
 fn is_command_like(input: &str) -> bool {
     const COMMANDS: &[&str] = &[
         "SPARQL",
@@ -5384,6 +5639,12 @@ fn is_command_like(input: &str) -> bool {
         "说说",
         // 撤销上次导入
         "撤销上次导入",
+        // 声明式插件
+        "插件",
+        "启用插件",
+        "停用插件",
+        "禁用插件",
+        "为什么这么答",
         // 帮助与退出
         "帮助",
         "help",
@@ -5819,6 +6080,7 @@ async fn continue_original_query(
     external_knowledge_service: &ExternalKnowledgeService,
     symbolic_reasoner: &mut SymbolicReasoner,
     contrast_arbiter: &mut ContrastArbiter,
+    plugin_runtime: &mut know_prolog::plugin::PluginRuntime,
     input: &str,
     query_type: &str,
     entities: &[String],
@@ -5938,10 +6200,12 @@ async fn continue_original_query(
                 {
                     println!("{}", answer);
                 } else {
-                    // 本地查询失败时，尝试外部知识API
+                    // 本地查询失败时，先给插件声明式兜底一次机会，再尝试外部知识API
                     println!("本地查询失败，尝试外部知识源...");
 
-                    if let Some(direct_answer) = get_direct_answer(input) {
+                    if let Some((text, _plan)) = plugin_policy_text(plugin_runtime, input) {
+                        println!("{}", text);
+                    } else if let Some(direct_answer) = get_direct_answer(input) {
                         println!("根据常识知识库：{}", direct_answer);
                     } else {
                         match external_knowledge_service

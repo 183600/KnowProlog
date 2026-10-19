@@ -60,6 +60,7 @@ pub mod cache;
 pub mod config_contract;
 pub mod context_image;
 pub mod canonical;
+pub mod plugin;
 pub mod artifact_audit;
 pub mod import_journal;
 pub mod grammar_extractor;
@@ -299,6 +300,9 @@ pub struct SystemConfig {
     /// 类型体系声明（可选）：别名/子类/互斥 + 模式闸门的闭包档
     #[serde(default)]
     pub type_system: type_system::TypeSystemConfig,
+    /// 声明式插件（符号专家）目录、默认启用与逐包模式
+    #[serde(default)]
+    pub plugins: plugin::PluginSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]

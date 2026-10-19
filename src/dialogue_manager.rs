@@ -638,6 +638,39 @@ impl DialogueManager {
         }
     }
 
+    /// 记录一次由插件配方给出的回答：不经过策略求值，但纳入同一对话本体，
+    /// 让焦点栈、回顾、续聊与「为什么这么答」都能看到外部专家的贡献。
+    pub fn note_plugin_turn(
+        &mut self,
+        input: &str,
+        kind: MoveKind,
+        entity: Option<&str>,
+        attribute: Option<&str>,
+        answer: &str,
+        plan: Vec<String>,
+        provenance: Vec<String>,
+    ) {
+        self.turns.push(DialogueTurn {
+            index: self.turns.len() + 1,
+            user: input.trim().to_string(),
+            kind,
+            entity: entity.map(str::to_string),
+            attribute: attribute.map(str::to_string),
+            answer_excerpt: Some(excerpt(answer, 40)),
+            provenance,
+            plan: plan.clone(),
+            warrant: None,
+            kb_revision: self.quality.as_ref().map(|index| index.revision),
+        });
+        if let Some(entity) = entity {
+            self.push_focus(entity);
+        }
+        self.last_reply = plan;
+        if self.externals.last().map(String::as_str) == Some(input.trim()) {
+            self.externals.pop();
+        }
+    }
+
     /// 对话管理器的对外自述（对话本体状态）。
     pub fn summary(&self) -> String {
         let focus = if self.focus.is_empty() {
@@ -2266,6 +2299,38 @@ mod tests {
             .plan_reply("姚明的身高到底是多少呢？", &knowledge)
             .expect("填充词不应阻断属性问句");
         assert!(reply.text.contains("226"), "{}", reply.text);
+    }
+
+    #[test]
+    fn test_note_plugin_turn_updates_focus_and_conversation_body() {
+        let mut manager = DialogueManager::new();
+        manager.note_plugin_turn(
+            "阿凡达是谁导演的",
+            MoveKind::AskAttribute,
+            Some("阿凡达"),
+            Some("导演"),
+            "「阿凡达」的导演是詹姆斯·卡梅隆。",
+            vec!["plugin:zh.film:film.directed_by".to_string()],
+            vec!["插件 zh.film / 配方 film.directed_by".to_string()],
+        );
+        assert_eq!(manager.turn_count(), 1);
+        assert_eq!(manager.focus_entity(), Some("阿凡达"));
+        let turn = &manager.turns()[0];
+        assert_eq!(turn.entity.as_deref(), Some("阿凡达"));
+        assert_eq!(turn.attribute.as_deref(), Some("导演"));
+        assert!(turn
+            .answer_excerpt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("詹姆斯"));
+        assert_eq!(
+            manager.last_reply_plan(),
+            &["plugin:zh.film:film.directed_by".to_string()]
+        );
+        assert_eq!(
+            manager.analyze("还有呢", &mock()).kind,
+            MoveKind::ContinueRequest
+        );
     }
 
     #[test]
