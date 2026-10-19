@@ -762,6 +762,8 @@ impl KnowledgeExtractor {
 
     pub fn extract(&self, text: &str, tagged_words: &[TaggedWord]) -> Vec<KnowledgeItem> {
         let mut items = Vec::new();
+        let tagged_words = nlp::merge_name_fragments(tagged_words);
+        let tagged_words = tagged_words.as_slice();
         
         for rule in &self.config.extraction_rules {
             items.extend(self.apply_extraction_rule(text, tagged_words, rule));
@@ -889,22 +891,14 @@ impl KnowledgeExtractor {
                 }
             }
             
-            // 特殊处理人名提取：如果是nr类型，尝试组合相邻的nr和unknown词
+            // 人名提取：相邻的 nr + 单字 unknown 已在预处理阶段合并
+            // （见 nlp::merge_name_fragments），这里只取首个 nr 词，
+            // 避免把「姚明身高226」这类句式里紧跟的未知属性词并进人名。
             if pos_rule == "nr" {
-                let mut name_parts = Vec::new();
-                let mut i = 0;
-                while i < tagged_words.len() {
-                    if tagged_words[i].pos == "nr" {
-                        name_parts.push(tagged_words[i].text.clone());
-                        // 检查后续的unknown词是否应该合并
-                        i += 1;
-                        while i < tagged_words.len() && tagged_words[i].pos == "unknown" {
-                            name_parts.push(tagged_words[i].text.clone());
-                            i += 1;
-                        }
-                        return Some(name_parts.join(""));
+                for word in tagged_words {
+                    if word.pos == "nr" {
+                        return Some(word.text.clone());
                     }
-                    i += 1;
                 }
             }
             
@@ -2848,7 +2842,6 @@ impl OxigraphManager {
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             
             SELECT DISTINCT ?entity ?name WHERE {{
-                ?entity rdf:type ?type .
                 ?entity kg:name ?name .
                 FILTER(REGEX(?name, "{}", "i"))
             }}
@@ -3249,9 +3242,10 @@ pub fn extract_query_entities_from_tagged(
     tagged_words: &[TaggedWord],
     config: &SystemConfig,
 ) -> Vec<String> {
+    let tagged_words = nlp::merge_name_fragments(tagged_words);
     let mut entities = Vec::new();
 
-    for word in tagged_words {
+    for word in &tagged_words {
         if word.pos == "nr" || word.pos == "ns" || word.pos == "nz" || 
            word.pos == "n" || word.pos == "nt" {
             entities.push(word.text.clone());

@@ -1,4 +1,4 @@
-use crate::nlp::{preprocess, normalize_words, TaggedWord};
+use crate::nlp::{merge_name_fragments, normalize_words, preprocess, TaggedWord};
 use crate::{SystemConfig, NlpConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -64,6 +64,9 @@ impl NLUEngine {
 
     /// 使用已分词结果进行语义分析
     pub fn analyze_tagged(&self, input: &str, tagged_words: Vec<TaggedWord>) -> SemanticAnalysis {
+        // 人名碎片先合并（「小/nr + 明/unknown」→「小明/nr」），
+        // 否则词槽会只截到「小」，意图匹配也随之走偏。
+        let tagged_words = merge_name_fragments(&tagged_words);
         let normalized_words = if let Some(synonyms) = &self.synonyms {
             normalize_words(tagged_words, synonyms)
         } else {

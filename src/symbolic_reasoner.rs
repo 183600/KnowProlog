@@ -763,6 +763,7 @@ impl SymbolicReasoner {
             .any(|((entity, attribute), values)| {
                 entity == token
                     || attribute == token
+                    || crate::symbolic_generator::localized_predicate_key(attribute) == Some(token)
                     || values.iter().any(|value| value == token)
             })
     }

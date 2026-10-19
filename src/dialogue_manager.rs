@@ -1445,7 +1445,7 @@ impl DialogueManager {
         let mut parts = Vec::new();
         for attribute in knowledge.known_attributes(entity).iter().take(3) {
             if let Some(answer) = self.lookup_attribute(knowledge, entity, attribute) {
-                parts.push(format!("{}：{}", attribute, answer.trim()));
+                parts.push(format!("{}：{}", surface_attribute(attribute), answer.trim()));
             }
         }
         if parts.is_empty() {
@@ -1479,7 +1479,7 @@ impl DialogueManager {
             let listed = more
                 .iter()
                 .take(3)
-                .cloned()
+                .map(|attribute| surface_attribute(attribute).to_string())
                 .collect::<Vec<_>>()
                 .join("」「");
             let variants = [
@@ -1519,7 +1519,7 @@ impl DialogueManager {
             let listed = more
                 .iter()
                 .take(3)
-                .cloned()
+                .map(|attribute| surface_attribute(attribute).to_string())
                 .collect::<Vec<_>>()
                 .join("」「");
             text.push_str(&format!(
@@ -1548,7 +1548,7 @@ impl DialogueManager {
         let listed = || {
             more.iter()
                 .take(3)
-                .cloned()
+                .map(|attribute| surface_attribute(attribute).to_string())
                 .collect::<Vec<_>>()
                 .join("」「")
         };
@@ -1750,6 +1750,12 @@ impl DialogueManager {
 
 fn raw_input(frame: &UtteranceFrame) -> String {
     frame.raw.trim().to_string()
+}
+
+/// 属性键的展示词面：英文内置键（name/age 等）本地化为中文，
+/// 未知键保持原样（查询仍用原始键，只有展示走词面）。
+fn surface_attribute(attribute: &str) -> &str {
+    crate::symbolic_generator::localized_predicate_key(attribute).unwrap_or(attribute)
 }
 
 /// 把回答文本归类为可宣讲的推理出处（纯符号标记识别）。

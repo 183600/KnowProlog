@@ -584,6 +584,36 @@ property_mappings = { name = "pos:nr", age = "pos:m" }
 pos_pattern = ["nr", "v", "m", "q"]
 property_mappings = { name = "pos:nr", age = "pos:m" }
 
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "unknown", "m", "q"]
+property_mappings = { name = "pos:nr", age = "pos:m" }
+
+# 身体数据提取：X身高226 / X体重120
+[[extraction_rules]]
+name = "身体数据提取"
+entity_type = "Person"
+priority = 9
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "unknown", "m", "q"]
+keyword_patterns = ["身高"]
+property_mappings = { name = "pos:nr", height = "pos:m" }
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "unknown", "m"]
+keyword_patterns = ["身高"]
+property_mappings = { name = "pos:nr", height = "pos:m" }
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "unknown", "m", "q"]
+keyword_patterns = ["体重"]
+property_mappings = { name = "pos:nr", weight = "pos:m" }
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "unknown", "m"]
+keyword_patterns = ["体重"]
+property_mappings = { name = "pos:nr", weight = "pos:m" }
+
 # 通用实体提取规则
 [[extraction_rules]]
 name = "通用实体提取"

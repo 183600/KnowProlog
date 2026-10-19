@@ -186,6 +186,17 @@ impl SymbolicGenerator {
     }
 
     pub fn attribute_values(&self, entity: &str, key: &str) -> Vec<String> {
+        let mut values = self.values_for_key(entity, key);
+        if values.is_empty() {
+            // 中文词面（「身高」）回落英文图谱键（height）
+            if let Some(canonical) = canonical_predicate_key(key) {
+                values = self.values_for_key(entity, canonical);
+            }
+        }
+        values
+    }
+
+    fn values_for_key(&self, entity: &str, key: &str) -> Vec<String> {
         let mut values: Vec<String> = self
             .attributes
             .get(entity)
@@ -424,7 +435,8 @@ impl SymbolicGenerator {
         if let Some(template) = lexical_template(predicate) {
             return template.replace("{s}", subject).replace("{o}", &joined);
         }
-        format!("{}的{}是{}。", subject, predicate, joined)
+        let surface = localized_predicate_key(predicate).unwrap_or(predicate);
+        format!("{}的{}是{}。", subject, surface, joined)
     }
 
     // 生成式介绍：把实体相关事实排序、模板化、加话语标记后组合成段落。
@@ -479,6 +491,10 @@ impl SymbolicGenerator {
                 if duplicated {
                     continue;
                 }
+                // 姓名与实体名相同属于同义反复，跳过以免生成「X的名字是X」
+                if is_name_key(key) && value == entity {
+                    continue;
+                }
                 lines.push(                FactLine {
                     rank: 0.5,
                     sentence: self.lexicalize(entity, key, std::slice::from_ref(value)),
@@ -511,8 +527,8 @@ impl SymbolicGenerator {
         let type_note = self
             .entity_types
             .get(entity)
-            .filter(|t| t.as_str() != "Entity")
-            .map(|t| format!("类型：{}；", t))
+            .filter(|t| t.as_str() != "Entity" && t.as_str() != "实体")
+            .map(|t| format!("类型：{}；", localized_type_label(t)))
             .unwrap_or_default();
         if lines.is_empty() {
             return format!(
@@ -873,6 +889,67 @@ fn lexical_template(predicate: &str) -> Option<&'static str> {
         "occupation" | "职业" => "{s}的职业是{o}。",
         _ => return None,
     })
+}
+
+/// 常见英文谓词键的中文表述（生成叙事用；图谱内的谓词本身不变）。
+pub fn localized_predicate_key(key: &str) -> Option<&'static str> {
+    PREDICATE_LABELS
+        .iter()
+        .find(|(canonical, _)| *canonical == key)
+        .map(|(_, label)| *label)
+}
+
+/// 中文谓词词面 → 图谱英文键（「身高」→ height）：
+/// 供按中文属性名检索字面量取值时做归一。
+pub fn canonical_predicate_key(label: &str) -> Option<&'static str> {
+    PREDICATE_LABELS
+        .iter()
+        .find(|(_, surface)| *surface == label)
+        .map(|(canonical, _)| *canonical)
+}
+
+/// 图谱属性键与中文词面的对照表（英文键 → 中文）。
+const PREDICATE_LABELS: &[(&str, &str)] = &[
+    ("name", "姓名"),
+    ("gender", "性别"),
+    ("height", "身高"),
+    ("weight", "体重"),
+    ("birthDate", "出生日期"),
+    ("capital", "首都"),
+    ("author", "作者"),
+    ("founder", "创始人"),
+    ("location", "所在地"),
+    ("locatedIn", "所在地"),
+    ("worksAt", "工作单位"),
+    ("memberOf", "隶属于"),
+    ("nationality", "国籍"),
+    ("occupation", "职业"),
+    ("spouse", "配偶"),
+    ("child", "子女"),
+    ("age", "年龄"),
+    ("birthPlace", "出生地"),
+];
+
+/// 是否姓名类谓词（生成画像时与实体名相同的取值属于同义反复）。
+fn is_name_key(key: &str) -> bool {
+    matches!(key, "name" | "姓名" | "名字")
+}
+
+/// 常见英文类型标签的中文表述（仅用于生成与展示兜底）。
+pub fn localized_type_label(etype: &str) -> &str {
+    match etype.to_ascii_lowercase().as_str() {
+        "person" | "people" | "human" => "人物",
+        "entity" => "实体",
+        "location" | "place" => "地点",
+        "city" => "城市",
+        "country" => "国家",
+        "organization" | "organisation" | "company" => "组织",
+        "event" => "事件",
+        "work" => "作品",
+        "animal" => "动物",
+        "food" => "食物",
+        _ => etype,
+    }
 }
 
 // 中文表述集合（首个为动词化时选择的面）→ 供形式化语义解析识别

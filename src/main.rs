@@ -3186,6 +3186,17 @@ async fn run_interactive_mode(
                         &normalized_words,
                         &grammar_extractor,
                     ));
+                    // 已抽出显式关系时，通用兜底实体会把整句内容词拼成
+                    // property（如「张三李四老师」），属于重复噪声，予以剔除；
+                    // 具名类型实体（Person 等）保留。
+                    if items
+                        .iter()
+                        .any(|item| matches!(item, KnowledgeItem::Relationship { .. }))
+                    {
+                        items.retain(|item| {
+                            !matches!(item, KnowledgeItem::Entity { label, .. } if label == "Entity")
+                        });
+                    }
                     
                     if items.is_empty() {
                         println!("{}", config.messages.no_knowledge_extracted);
@@ -3652,7 +3663,35 @@ async fn run_interactive_mode(
                     println!("{}", answer);
                     log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
                 } else {
-                    println!("{}", config.messages.cannot_understand);
+                    // 先区分「实体未知」与「问法不支持」：库里完全没有提到过的实体，
+                    // 坦白说没有记录，比笼统的「不理解」更接近人类对话
+                    let mut missing_entities: Vec<String> = Vec::new();
+                    for entity in &precomputed_query_entities {
+                        if entity.chars().count() < 2 {
+                            continue;
+                        }
+                        match oxigraph_manager
+                            .get_relevant_facts(std::slice::from_ref(entity), 0)
+                            .await
+                        {
+                            Ok(facts) if facts.is_empty() => missing_entities.push(entity.clone()),
+                            _ => {}
+                        }
+                    }
+                    if missing_entities.is_empty() {
+                        println!("{}", config.messages.cannot_understand);
+                    } else {
+                        let names = missing_entities
+                            .iter()
+                            .map(|name| format!("「{}」", name))
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        println!(
+                            "我的知识库里暂时没有{}的记录。如果你想教我，可以说「录入：{}…」。",
+                            names,
+                            missing_entities.first().map(String::as_str).unwrap_or("")
+                        );
+                    }
                     
                     // 尝试使用外部知识API
                     if let Some(direct_answer) = get_direct_answer(input) {

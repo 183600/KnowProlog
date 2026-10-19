@@ -877,7 +877,7 @@ impl DiscoursePlanner {
                         sentences.push(format!(
                             "与{}同属{}的已知实体还有{}。",
                             entity,
-                            primary,
+                            crate::symbolic_generator::localized_type_label(primary),
                             brief.siblings.join("、")
                         ));
                     }
@@ -960,6 +960,7 @@ impl DiscoursePlanner {
         category: &str,
         variant: usize,
     ) -> Option<String> {
+        let category = crate::symbolic_generator::localized_type_label(category);
         let mut slots = HashMap::new();
         slots.insert("s".to_string(), subject.to_string());
         slots.insert("c".to_string(), category.to_string());
@@ -981,7 +982,9 @@ impl DiscoursePlanner {
         let surface = surface_of(predicate, surfaces);
         Some(format!(
             "此外，作为{}的一员，{}的{}是{}。",
-            brief.primary_type.as_deref().unwrap_or("该类"),
+            crate::symbolic_generator::localized_type_label(
+                brief.primary_type.as_deref().unwrap_or("该类")
+            ),
             reference,
             surface,
             object
@@ -999,7 +1002,11 @@ impl DiscoursePlanner {
             if let Some(primary) = brief.primary_type.as_deref() {
                 let focus_types = self.narrator.types_of(focus);
                 if focus_types.iter().any(|etype| etype == primary) {
-                    return Some(format!("它与前面提到的「{}」同属{}。", focus, primary));
+                    return Some(format!(
+                        "它与前面提到的「{}」同属{}。",
+                        focus,
+                        crate::symbolic_generator::localized_type_label(primary)
+                    ));
                 }
             }
         }
@@ -1026,8 +1033,11 @@ impl DiscoursePlanner {
     }
 }
 
-/// 谓词的中文表述（优先用生成器登记的动词化表述）
+/// 谓词的中文表述（优先本地化键名，其次用生成器登记的动词化表述）
 fn surface_of<'a>(predicate: &'a str, surfaces: &'a HashMap<String, String>) -> &'a str {
+    if let Some(localized) = crate::symbolic_generator::localized_predicate_key(predicate) {
+        return localized;
+    }
     surfaces.get(predicate).map(String::as_str).unwrap_or(predicate)
 }
 

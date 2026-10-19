@@ -44,7 +44,12 @@ pub enum PatternElement {
 // 预处理函数：分词并进行词性标注
 // 注意：crate::NlpConfig 引用的是 lib.rs 中的 NlpConfig
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
-    let words = jieba().cut(text, false); // 执行分词，false表示精准模式
+    // 结巴自带词性标注（nr 人名 / ns 地名 / nt 机构名 / nz 专名）：
+    // 用作未知词的兜底，让「姚明」「诸葛亮」等词无需写进配置也能落型；
+    // 配置 pos_dict 与 name_patterns 的优先级更高。
+    let tagged = jieba().tag(text, false);
+    let words: Vec<&str> = tagged.iter().map(|tag| tag.word).collect();
+    let jieba_tags: Vec<&str> = tagged.iter().map(|tag| tag.tag).collect();
 
     // 常见人名集合
     let full_names: std::collections::HashSet<&str> = config
@@ -71,10 +76,15 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
             }
         }
         if let Some((name, end)) = matched {
-            tagged_words.push(tag_word(name, config, &full_names));
+            tagged_words.push(tag_word(name, config, &full_names, None));
             i = end;
         } else {
-            tagged_words.push(tag_word(words[i].to_string(), config, &full_names));
+            tagged_words.push(tag_word(
+                words[i].to_string(),
+                config,
+                &full_names,
+                jieba_tags.get(i).copied(),
+            ));
             i += 1;
         }
     }
@@ -87,14 +97,24 @@ fn tag_word(
     word: String,
     config: &crate::NlpConfig,
     full_names: &std::collections::HashSet<&str>,
+    jieba_tag: Option<&str>,
 ) -> TaggedWord {
     let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
         "m".to_string() // m表示数词
     } else if is_name(&word, &config.name_patterns, full_names) { // 判断是否为人名
         "nr".to_string() // nr表示人名
+    } else if let Some(pos) = config.pos_dict.get(&word) {
+        // 从词性字典查找（配置优先）
+        pos.clone()
     } else {
-        // 从词性字典查找，找不到则标记为unknown
-        config.pos_dict.get(&word).cloned().unwrap_or_else(|| "unknown".to_string())
+        // 结巴标注的人名/地名/机构名/专名兜底，其余标记为unknown
+        match jieba_tag {
+            Some("nr") => "nr".to_string(),
+            Some("ns") => "ns".to_string(),
+            Some("nt") => "nt".to_string(),
+            Some("nz") => "nz".to_string(),
+            _ => "unknown".to_string(),
+        }
     };
 
     TaggedWord { text: word, pos }
@@ -112,6 +132,67 @@ pub fn normalize_words(
         }
     }
     words
+}
+
+/// 人名碎片合并：结巴可能把「小明」切成「小/nr + 明/unknown」，
+/// 配置里的提取模式（如 ["nr","m","q"]）与查询槽位便难以命中。
+/// 这里把「nr + 连续单字 unknown」按最长 4 个字符合并成单一人名 token；
+/// 遇到标点、数字、空白、多字词或常见疑问/功能词即停止，不吞并其它成分。
+pub fn merge_name_fragments(tagged_words: &[TaggedWord]) -> Vec<TaggedWord> {
+    // 单字碎片中不允许并入人名的常见疑问/功能/语气字
+    const BLOCKED_FRAGMENTS: &str =
+        "多少谁哪什么吗呢吧的了是有岁年月日个位名人上下前后里外中来去想要会能也都还就才\
+         很最更太真不没与和跟把被给对从向为以于之而且或但在高矮胖瘦长短老新好坏男女\
+         家们些时候地方怎样如何做干用说问答错该应当可需请让使叫称看听吃喝玩学生师医院";
+
+    fn is_mergeable_fragment(word: &TaggedWord) -> bool {
+        word.pos == "unknown"
+            && word.text.chars().count() == 1
+            && !word.text.is_empty()
+            && word
+                .text
+                .chars()
+                .all(|ch| !ch.is_numeric() && !ch.is_whitespace() && !is_boundary_char(ch))
+            && !word
+                .text
+                .chars()
+                .all(|ch| BLOCKED_FRAGMENTS.contains(ch))
+    }
+
+    fn is_boundary_char(ch: char) -> bool {
+        "，。、；：？！「」『』《》【】（）()[]{}<>\"'`~,.;:!?-_|/\\".contains(ch)
+    }
+
+    let mut merged: Vec<TaggedWord> = Vec::with_capacity(tagged_words.len());
+    let mut index = 0;
+    while index < tagged_words.len() {
+        let word = &tagged_words[index];
+        if word.pos != "nr" {
+            merged.push(word.clone());
+            index += 1;
+            continue;
+        }
+        let mut text = word.text.clone();
+        let mut end = index + 1;
+        while end < tagged_words.len() && text.chars().count() < 4 {
+            let fragment = &tagged_words[end];
+            if !is_mergeable_fragment(fragment) {
+                break;
+            }
+            let candidate = format!("{}{}", text, fragment.text);
+            if candidate.chars().count() > 4 {
+                break;
+            }
+            text = candidate;
+            end += 1;
+        }
+        merged.push(TaggedWord {
+            text,
+            pos: word.pos.clone(),
+        });
+        index = end;
+    }
+    merged
 }
 
 // 判断一个词是否为人名
