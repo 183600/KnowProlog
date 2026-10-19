@@ -1594,7 +1594,7 @@ impl PluginRuntime {
     }
 
     fn resolve_activation_issues(&mut self) {
-        // 显式 set_mode 已做前置检查；这里只同步诊断，不再改变模式。
+        // 显式 set_mode 已做前置检查；这里只同步诊断，不改动模式。
         let mut issues = Vec::new();
         for manifest in &self.manifests {
             if self.modes.get(&manifest.id) != Some(&PluginMode::On) {
@@ -1730,7 +1730,7 @@ impl PluginRuntime {
             if let Some(recipe) = &chosen.recipe_invocation {
                 trace.recipe = Some(recipe.clone());
             } else {
-                // 后续普通改写改变了规范问句：先前配方的答案不再对应当前问法。
+                // 后续普通改写改变了规范问句：先前配方的答案与当前问法不一致。
                 trace.recipe = None;
             }
             let next = chosen.output.clone();

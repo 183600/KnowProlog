@@ -182,7 +182,7 @@ pub struct DialogueEvalReport {
     pub takeover: Prf,
     pub answers: AnswerMetrics,
     pub provenance: ProvenanceMetrics,
-    /// 模板接地闸门指标（v2 起）。
+    /// 模板接地闸门指标。
     #[serde(default)]
     pub grounding: GroundingMetrics,
 }
