@@ -9,8 +9,7 @@
 //!
 //! # 会话 actor（并发结构）
 //!
-//! 推理器内部含 `Rc`（归结编译产物），会话不是 `Send`，不能直接跨线程共享。
-//! 因此每个会话由**专属 OS 线程**拥有（actor）：HTTP 层只持有一个
+//! 每个会话由**专属 OS 线程**拥有（actor）：HTTP 层只持有一个
 //! `mpsc::Sender`，通过 oneshot 等待结果。其结果是：
 //! - [`ApiState`] 是 `Send + Sync`，accept 循环 `tokio::spawn` 每连接，
 //!   跨会话真并行、同会话严格 FIFO（命令按到达顺序处理）；
@@ -34,7 +33,7 @@
 //! 端点：
 //! - `GET  /`                      服务索引（端点清单）
 //! - `GET  /health`                健康检查
-//! - `GET  /metrics`               会话数 / 轮数 / 性能台账
+//! - `GET  /metrics`               会话数 / 轮数 / 性能台账 / 启动分期明细
 //! - `POST /sessions`              新建会话 → `{"session_id": "s-1"}`
 //! - `GET  /sessions/{id}`         会话快照（焦点栈 / 历史摘要 / 策略）
 //! - `GET  /sessions/{id}/export`  导出会话信封（可移植 JSON）
@@ -57,18 +56,20 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::cache::RevisionLru;
 use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueManagerSnapshot};
 use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
+use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::ReasoningConfig;
 
@@ -76,8 +77,43 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const HISTORY_LIMIT: usize = 64;
+/// 无状态问答缓存容量（条目数）；纯函数结果，命中与重算必须逐字节一致。
+const STATELESS_CACHE_CAPACITY: usize = 64;
 /// OpenAI 兼容层报告的模型名（纯符号推理，非神经网络）。
 pub const DEFAULT_MODEL: &str = "knowprolog-symbolic";
+
+/// 缓存纪元：失效必须由显式版本驱动，绝不用 TTL / 挂钟。
+///
+/// - `kb_revision`：知识库版本（写路径推进；无写路径时等于预热基座版本）；
+/// - `identity_epoch`：身份准入纪元（新实体/别名准入时推进）。
+///
+/// 任何一元推进都会让旧缓存整体不可命中（[`crate::cache::RevisionLru`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheEpoch {
+    pub kb_revision: u64,
+    pub identity_epoch: u64,
+}
+
+/// 无状态问答缓存键：按序的全部用户消息（trim 后）+ 生效策略。
+///
+/// 只做「完全相等」命中，不做相似/近似匹配：键由长度前缀拼接，
+/// 任何字符差异都会产生不同键。同义词归约由下游推理器（对齐器）完成，
+/// 缓存层不猜测语义等价。
+fn stateless_answer_key(inputs: &[String], policy: Option<&SessionPolicy>) -> String {
+    let mut key = String::new();
+    for input in inputs {
+        let trimmed = input.trim();
+        key.push_str(&trimmed.len().to_string());
+        key.push('#');
+        key.push_str(trimmed);
+        key.push('\u{1f}');
+    }
+    key.push_str("\u{1e}");
+    if let Some(policy) = policy {
+        key.push_str(&serde_json::to_string(policy).unwrap_or_default());
+    }
+    key
+}
 
 /// 回答风格（由 system 指令白名单解析）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,24 +692,62 @@ enum SessionError {
     Stale,
 }
 
+/// 预热基座：进程启动时对 `(facts, reasoning config, synonyms)` 只做一次
+/// `observe_facts` 全量重放，之后每个会话按值分叉（字段级深拷贝），不再重放。
+///
+/// 这是 LLM 权重预加载的符号等价物：知识派生状态（对齐剖面/谓词规则/关联/
+/// 向量/全息码本/链接索引）只构建一次；分叉输出与「全新观察同一批事实」
+/// 逐字节一致（`fork_matches_fresh_observe_byte_for_byte` 守护）。
+///
+/// 事实正文不进入基座的可变部分：store 仍是唯一事实源；若知识版本变化
+/// （未来的写入路径），调用方应重建整个 [`WarmBase`]（单飞），而不是修补它。
+pub struct WarmBase {
+    reasoner: parking_lot::Mutex<SymbolicReasoner>,
+}
+
+impl WarmBase {
+    /// 构建基座：全量观察一次事实（唯一一次重放），并计入启动分期。
+    fn build(
+        facts: &[PrologFact],
+        reasoning: &ReasoningConfig,
+        synonyms: &HashMap<String, String>,
+        perf: &Arc<PerfLedger>,
+        startup: &StartupLedger,
+    ) -> Self {
+        let _span = startup.span("warm_build");
+        let mut reasoner =
+            SymbolicReasoner::with_perf_ledger(reasoning.clone(), synonyms.clone(), Arc::clone(perf));
+        reasoner.observe_facts(facts);
+        perf.bump("warm_base_builds");
+        Self {
+            reasoner: parking_lot::Mutex::new(reasoner),
+        }
+    }
+
+    /// 分叉一个新会话的推理器。锁只在克隆期间持有（毫秒级），
+    /// 并发建会话按到达顺序串行分叉，但不会重放事实。
+    fn fork(&self) -> SymbolicReasoner {
+        self.reasoner.lock().fork_session()
+    }
+
+    /// 知识版本（分叉基座当前携带的 revision，供审计与测试）。
+    pub fn revision(&self) -> u64 {
+        self.reasoner.lock().revision()
+    }
+}
+
 /// 构造会话（可在任意线程调用；返回的 [`Session`] 只应留在该线程）。
 #[allow(clippy::too_many_arguments)]
 fn build_session(
     id: String,
-    facts: &[PrologFact],
-    reasoning: &ReasoningConfig,
-    synonyms: &HashMap<String, String>,
+    warm: &WarmBase,
     perf: &Arc<PerfLedger>,
     prompt_mode: PromptMode,
     recovery_mode: RecoveryMode,
     restore: Option<SessionRestore>,
 ) -> Session {
-    let mut reasoner = SymbolicReasoner::with_perf_ledger(
-        reasoning.clone(),
-        synonyms.clone(),
-        Arc::clone(perf),
-    );
-    reasoner.observe_facts(facts);
+    let reasoner = warm.fork();
+    perf.bump("session_forks");
     let mut manager = DialogueManager::new();
     manager.set_prompt_mode(prompt_mode);
     manager.set_recovery_mode(recovery_mode);
@@ -695,13 +769,21 @@ fn build_session(
     session
 }
 
-/// 服务共享状态：知识事实 + 会话 actor 表 + 计数（`Send + Sync`）。
+/// 服务共享状态：预热基座 + 会话 actor 表 + 计数（`Send + Sync`）。
 pub struct ApiState {
     facts: Arc<Vec<PrologFact>>,
     kb_fingerprint: String,
-    reasoning: ReasoningConfig,
-    synonyms: HashMap<String, String>,
+    /// 知识派生状态的预热基座：会话从这里分叉，不再逐会话重放事实。
+    warm: Arc<WarmBase>,
+    /// 无状态问答缓存：键为「按序全部用户消息 + 策略」，纪元失效（纯函数结果）。
+    stateless_answers: Arc<parking_lot::Mutex<RevisionLru<TurnResponse, CacheEpoch>>>,
+    /// 预热基座构建时的知识版本（缓存纪元的一部分）。
+    kb_revision: u64,
+    /// 身份准入纪元：新实体/别名准入时 +1，旧缓存整体失效（可审计）。
+    identity_epoch: AtomicU64,
     perf: Arc<PerfLedger>,
+    /// 启动分期台账（进程启动 / 会话分叉 / 冷换入）。
+    startup: Arc<StartupLedger>,
     sessions: Mutex<BTreeMap<String, SessionHandle>>,
     next_session_id: AtomicU64,
     turns_total: AtomicU64,
@@ -725,14 +807,29 @@ impl ApiState {
         synonyms: HashMap<String, String>,
         perf: Arc<PerfLedger>,
         max_sessions: usize,
+        startup: Arc<StartupLedger>,
     ) -> Self {
         let kb_fingerprint = fingerprint_facts(&facts);
+        // 预热基座：整进程唯一的全量重放点（会话创建只做字段级分叉）
+        let warm = Arc::new(WarmBase::build(
+            &facts,
+            &reasoning,
+            &synonyms,
+            &perf,
+            &startup,
+        ));
+        let kb_revision = warm.revision();
         ApiState {
             facts: Arc::new(facts),
             kb_fingerprint,
-            reasoning,
-            synonyms,
+            warm,
+            stateless_answers: Arc::new(parking_lot::Mutex::new(RevisionLru::new(
+                STATELESS_CACHE_CAPACITY,
+            ))),
+            kb_revision,
+            identity_epoch: AtomicU64::new(0),
             perf,
+            startup,
             sessions: Mutex::new(BTreeMap::new()),
             next_session_id: AtomicU64::new(1),
             turns_total: AtomicU64::new(0),
@@ -744,6 +841,49 @@ impl ApiState {
             prompt_mode: PromptMode::On,
             recovery_mode: RecoveryMode::Observe,
         }
+    }
+
+    /// 共享的启动分期台账（主程序打印摘要 / `/metrics` 输出明细）。
+    pub fn startup_ledger(&self) -> Arc<StartupLedger> {
+        Arc::clone(&self.startup)
+    }
+
+    /// 预热基座的知识版本（分叉一致性审计）。
+    pub fn warm_revision(&self) -> u64 {
+        self.warm.revision()
+    }
+
+    /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
+    pub fn cache_epoch(&self) -> CacheEpoch {
+        CacheEpoch {
+            kb_revision: self.kb_revision,
+            identity_epoch: self.identity_epoch.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 推进身份准入纪元（准入新词面后调用）：所有旧缓存整体失效。
+    pub fn bump_identity_epoch(&self) {
+        self.identity_epoch.fetch_add(1, Ordering::Relaxed);
+        self.perf.bump("identity_epoch_bumps");
+    }
+
+    /// 无状态问答缓存查询：命中即返回缓存响应（调用方负责重戳会话 id）。
+    fn cached_stateless_answer(&self, epoch: CacheEpoch, key: &str) -> Option<TurnResponse> {
+        let mut cache = self.stateless_answers.lock();
+        let hit = cache.get(epoch, key).cloned();
+        if hit.is_some() {
+            self.perf.bump("answer_cache_hits");
+        } else {
+            self.perf.bump("answer_cache_misses");
+        }
+        hit
+    }
+
+    /// 写入无状态问答缓存；返回被淘汰条目数并计入台账。
+    fn store_stateless_answer(&self, epoch: CacheEpoch, key: String, response: TurnResponse) {
+        let evicted = self.stateless_answers.lock().put(epoch, key, response);
+        self.perf
+            .bump_by("answer_cache_evictions", evicted as u64);
     }
 
     /// 设置冷会话目录（在 `Arc::new` 之前调用）。
@@ -797,10 +937,9 @@ impl ApiState {
         restore: Option<SessionRestore>,
     ) -> Result<SessionHandle, &'static str> {
         let (tx, mut rx) = mpsc::channel::<SessionCommand>(64);
-        let facts = Arc::clone(&self.facts);
-        let reasoning = self.reasoning.clone();
-        let synonyms = self.synonyms.clone();
+        let warm = Arc::clone(&self.warm);
         let perf = Arc::clone(&self.perf);
+        let startup = Arc::clone(&self.startup);
         let prompt_mode = self.prompt_mode;
         let recovery_mode = self.recovery_mode;
         let engine = Arc::new(self.engine_stamp());
@@ -808,16 +947,12 @@ impl ApiState {
         std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let mut session = build_session(
-                    id,
-                    &facts,
-                    &reasoning,
-                    &synonyms,
-                    &perf,
-                    prompt_mode,
-                    recovery_mode,
-                    restore,
-                );
+                // 只计量「分叉到就绪」：guard 在 session 构造完成时立即落账，
+                // 绝不能覆盖整个 actor 生命周期（那会拖到线程退出才记账）
+                let mut session = {
+                    let _span = startup.span("session_fork");
+                    build_session(id, &warm, &perf, prompt_mode, recovery_mode, restore)
+                };
                 while let Some(command) = rx.blocking_recv() {
                     match command {
                         SessionCommand::Turn {
@@ -921,11 +1056,13 @@ impl ApiState {
         let Some(path) = self.session_file(session_id) else {
             return Ok(false);
         };
+        let read_start = Instant::now();
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(false);
         };
         let envelope: SessionEnvelope =
             serde_json::from_slice(&bytes).map_err(|_| SessionError::Stale)?;
+        self.startup.record_since("session_resume_read", read_start);
         if envelope.format != ENVELOPE_FORMAT
             || envelope.version != ENVELOPE_VERSION
             || !envelope.digest_valid()
@@ -1124,8 +1261,18 @@ enum ImportError {
 }
 
 /// 启动服务（阻塞直到监听套接字出错）。
+///
+/// 套接字绑定完成后打印启动分期摘要（stdout 一行）：进程启动各相耗时 +
+/// 已在建会话（若有）。计时只观测，不影响服务行为。
 pub async fn serve(state: Arc<ApiState>, addr: &str) -> std::io::Result<()> {
+    let bind_start = Instant::now();
     let listener = TcpListener::bind(addr).await?;
+    state
+        .startup
+        .record_since("bind", bind_start);
+    if let Some(line) = state.startup.summary_line() {
+        println!("{}", line);
+    }
     run(listener, state).await
 }
 
@@ -1273,7 +1420,9 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 "session_dir": state.session_dir.as_ref().map(|dir| dir.display().to_string()),
                 "cold_sessions": state.cold_session_count(),
                 "evictions_total": state.evictions_total.load(Ordering::Relaxed),
+                "warm_revision": state.warm_revision(),
                 "perf": state.perf.snapshot(),
+                "startup": state.startup.snapshot(),
             }),
         ),
         ("POST", ["sessions"]) => match state.create_session().await {
@@ -1565,6 +1714,18 @@ async fn run_chat_turns(
             Err(SessionError::Stale) => Err((409, "session snapshot is stale".to_string())),
         };
     }
+    // 无状态路径是纯函数：键完全相等才命中缓存（纪元不符一律未命中）。
+    // 命中时不建会话（临时会话本就随响应关闭，id 不可续用），
+    // 只发一个新 id 供响应回执；响应载荷（回答/焦点/回执）来自缓存。
+    let epoch = state.cache_epoch();
+    let key = stateless_answer_key(&chat.inputs, chat.policy.as_ref());
+    if let Some(mut cached) = state.cached_stateless_answer(epoch, &key) {
+        cached.session_id = format!(
+            "s-{}",
+            state.next_session_id.fetch_add(1, Ordering::Relaxed)
+        );
+        return Ok((cached, prompt_chars));
+    }
     let temp_id = state
         .create_session()
         .await
@@ -1577,8 +1738,10 @@ async fn run_chat_turns(
             .ok();
     }
     state.close_session(&temp_id).await;
-    last.map(|turn| (turn, prompt_chars))
-        .ok_or_else(|| (500, "turn failed".to_string()))
+    let turn = last.ok_or_else(|| (500, "turn failed".to_string()))?;
+    // 只缓存纯函数结果：无会话状态残留，命中与重算逐字节一致
+    state.store_stateless_answer(epoch, key, turn.clone());
+    Ok((turn, prompt_chars))
 }
 
 fn completion_id(session_id: &str, turn: u32) -> String {
@@ -1946,6 +2109,7 @@ mod tests {
             HashMap::new(),
             PerfLedger::shared(),
             max_sessions,
+            StartupLedger::shared(),
         ))
     }
 
@@ -2334,6 +2498,120 @@ mod tests {
         .await;
         assert_eq!(status, 200, "{}", body);
         assert!(body.contains("226"), "{}", body);
+    }
+
+    /// 无状态问答缓存：第二次同键请求命中缓存（回答逐字节一致），
+    /// 命中路径不消耗会话额度；纪元计数与启动分期可从 /metrics 审计。
+    #[tokio::test]
+    async fn stateless_answer_cache_hits_are_byte_identical_and_audited() {
+        let (addr, _server) = start_server(4);
+        let payload = r#"{"messages": [
+            {"role": "user", "content": "姚明是谁"},
+            {"role": "user", "content": "姚明的身高是多少"}
+        ]}"#;
+
+        let (status, _, first_body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", first_body);
+        let first: serde_json::Value = serde_json::from_str(&first_body).unwrap();
+
+        let (status, _, second_body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", second_body);
+        let second: serde_json::Value = serde_json::from_str(&second_body).unwrap();
+
+        // 命中输出 ≡ 重算输出：回答/模型/选择逐字节一致
+        assert_eq!(
+            first["choices"], second["choices"],
+            "缓存命中的回答必须与首次计算逐字节一致"
+        );
+        assert_eq!(first["model"], second["model"]);
+        assert_ne!(
+            first["id"], second["id"],
+            "完成 id 按请求的新会话戳记，不共享"
+        );
+        assert!(
+            first["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("226"),
+            "{}",
+            first_body
+        );
+
+        // 命中路径不驻留会话（临时会话本就关闭）；台账可审计
+        let (_, _, metrics) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+        assert_eq!(metrics["sessions"], 0);
+        assert_eq!(metrics["perf"]["answer_cache_misses"], 1);
+        assert_eq!(metrics["perf"]["answer_cache_hits"], 1);
+        assert_eq!(metrics["perf"]["session_forks"], 1, "命中不应再分叉会话");
+
+        // 启动分期：进程启动相与会话分叉相都有明细（结构断言，不断言毫秒）
+        let phases: Vec<&str> = metrics["startup"]
+            .as_array()
+            .expect("startup 明细应存在")
+            .iter()
+            .filter_map(|entry| entry["phase"].as_str())
+            .collect();
+        // 测试直接注入已绑定的监听器，故 bind 相不在场；进程内相与会话相必须可见
+        assert!(phases.contains(&"warm_build"), "{:?}", phases);
+        assert!(phases.contains(&"session_fork"), "{:?}", phases);
+        assert!(metrics["warm_revision"].as_u64().unwrap() >= 1);
+    }
+
+    /// 身份准入纪元推进必须让无状态问答缓存整体失效：
+    /// 旧纪元条目不可命中（即便键相同），新纪元写入后恢复正常命中。
+    #[tokio::test]
+    async fn identity_epoch_bump_invalidates_stateless_cache() {
+        let state = test_state(4);
+        let response = TurnResponse {
+            session_id: "s-1".to_string(),
+            turn: 1,
+            status: "answered".to_string(),
+            source: "reasoner".to_string(),
+            kind: None,
+            plan: Vec::new(),
+            reply: "姚明的身高是226cm".to_string(),
+            focus: None,
+            policy: SessionPolicy::default(),
+            epistemic: None,
+            entities: Vec::new(),
+        };
+        let key = stateless_answer_key(&["姚明的身高是多少".to_string()], None);
+
+        let epoch = state.cache_epoch();
+        state.store_stateless_answer(epoch, key.clone(), response.clone());
+        assert!(state.cached_stateless_answer(epoch, &key).is_some());
+
+        state.bump_identity_epoch();
+        let bumped = state.cache_epoch();
+        assert_ne!(epoch, bumped, "身份准入必须推进纪元");
+        assert!(
+            state.cached_stateless_answer(bumped, &key).is_none(),
+            "旧纪元条目在新纪元下不得命中"
+        );
+
+        state.store_stateless_answer(bumped, key.clone(), response);
+        assert!(
+            state.cached_stateless_answer(bumped, &key).is_some(),
+            "新纪元写入后恢复命中"
+        );
+        assert_eq!(state.perf.count("identity_epoch_bumps"), 1);
+        assert_eq!(state.perf.count("answer_cache_hits"), 2);
+        assert_eq!(state.perf.count("answer_cache_misses"), 1);
     }
 
     #[tokio::test]

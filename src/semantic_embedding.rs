@@ -20,6 +20,7 @@ struct EntityVector {
     norm: f64,
 }
 
+#[derive(Clone)]
 pub struct SymbolicEmbedding {
     counts: HashMap<String, HashMap<Arc<str>, f64>>,
     feature_totals: HashMap<Arc<str>, f64>,

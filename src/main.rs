@@ -1,5 +1,6 @@
 use std::io::{BufRead, Write};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use clap::{Parser, Subcommand};
 
 // 从库（know_prolog）中导入所需的功能
@@ -28,6 +29,7 @@ use know_prolog::{
     holographic_memory::{HoloAnalogyHit, HoloHit},
     import_journal::{ImportJournal, JournalLoad},
     perf_ledger::PerfLedger,
+    startup_ledger::StartupLedger,
     grammar_extractor::GrammarExtractor,
     prolog_engine::PrologFact,
     chronicle::{Chronicle, FsyncPolicy},
@@ -187,9 +189,16 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
     let recovery_mode = parse_recovery_mode(&cli.recovery);
-    
+
+    // 启动分期台账：config_load / store_open / facts_load / warm_build / bind
+    // 各相耗时只观测不断言；serve 分支打印摘要，/metrics 输出明细。
+    let startup_ledger = StartupLedger::shared();
+    let config_start = Instant::now();
     let config = match load_config().await {
-        Ok(cfg) => Arc::new(cfg),
+        Ok(cfg) => {
+            startup_ledger.record_since("config_load", config_start);
+            Arc::new(cfg)
+        }
         Err(e) => {
             eprintln!("加载配置文件失败: {}", e);
             return;
@@ -206,11 +215,15 @@ async fn main() {
         .unwrap_or_else(|| config.system.oxigraph_store_path.clone());
 
     // 创建Oxigraph存储
+    let store_start = Instant::now();
     let oxigraph_manager = match OxigraphManager::with_perf_ledger(
         &store_path,
         perf_ledger.clone(),
     ) {
-        Ok(manager) => manager,
+        Ok(manager) => {
+            startup_ledger.record_since("store_open", store_start);
+            manager
+        }
         Err(e) => {
             eprintln!("创建Oxigraph存储失败: {}", e);
             return;
@@ -487,8 +500,12 @@ async fn main() {
         }) => {
             let prompt_mode = parse_prompt_mode(&prompt_mode);
             let recovery_mode = parse_recovery_mode(&recovery);
+            let facts_start = Instant::now();
             let facts = match oxigraph_manager.load_all_facts().await {
-                Ok(facts) => facts,
+                Ok(facts) => {
+                    startup_ledger.record_since("facts_load", facts_start);
+                    facts
+                }
                 Err(e) => {
                     eprintln!("读取知识库失败: {}", e);
                     std::process::exit(1);
@@ -517,6 +534,7 @@ async fn main() {
                 synonyms,
                 perf_ledger.clone(),
                 max_sessions,
+                startup_ledger.clone(),
             );
             if let Some(dir) = session_dir {
                 api_state.set_session_dir(dir);

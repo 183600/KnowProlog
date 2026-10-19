@@ -103,6 +103,33 @@ fn triple_key(subject: &str, predicate: &str, object: &str) -> String {
     key
 }
 
+/// 深拷贝：类型计数缓存一并复制。供 WarmBase 会话分叉使用，
+/// 复制后的读数与重算结果一致（缓存键含 revision，跨版本不会串味）。
+impl Clone for SymbolicGenerator {
+    fn clone(&self) -> Self {
+        Self {
+            known_entities: self.known_entities.clone(),
+            entity_types: self.entity_types.clone(),
+            type_members: self.type_members.clone(),
+            attributes: self.attributes.clone(),
+            by_subject: self.by_subject.clone(),
+            by_object: self.by_object.clone(),
+            predicate_totals: self.predicate_totals.clone(),
+            entity_predicate_counts: self.entity_predicate_counts.clone(),
+            entity_relation_total: self.entity_relation_total.clone(),
+            predicate_min_entity: self.predicate_min_entity.clone(),
+            triples: self.triples.clone(),
+            total_relations: self.total_relations,
+            max_profile_sentences: self.max_profile_sentences,
+            completion_min_score: self.completion_min_score,
+            predicate_surfaces: self.predicate_surfaces.clone(),
+            lexicalized_predicates: self.lexicalized_predicates.clone(),
+            revision: self.revision,
+            type_count_cache: parking_lot::RwLock::new(self.type_count_cache.read().clone()),
+        }
+    }
+}
+
 impl SymbolicGenerator {
     pub fn new(max_profile_sentences: usize, completion_min_score: f64) -> Self {
         Self {

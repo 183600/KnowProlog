@@ -323,6 +323,7 @@ pub enum ClarificationReply {
 }
 
 /// 溯因引擎：统计知识分布 + 失败前沿搜索 + 假设生成与排序 + 反事实模拟
+#[derive(Clone)]
 pub struct AbductionEngine {
     max_depth: usize,
     max_hypotheses: usize,
@@ -1061,6 +1062,13 @@ impl AbductionEngine {
 
     pub fn clear_pending(&mut self) {
         self.pending.clear();
+    }
+
+    /// 清空全部会话态（待定假设 + 已采纳假设），保留观察统计。
+    /// 供 WarmBase 会话分叉：新会话不得继承其他会话的假设。
+    pub fn reset_session(&mut self) {
+        self.pending.clear();
+        self.adopted.clear();
     }
 
     /// 取第 index（1 起）条假设并从待定列表移除

@@ -172,6 +172,24 @@ pub struct GraphWalkEmbedding {
     edge_count: usize,
 }
 
+/// 深拷贝：向量表与失效标记随值复制。供 WarmBase 会话分叉使用；
+/// 懒重建语义保持（脏标记照抄，首次访问仍会按同一批边重算，结果逐字节一致）。
+impl Clone for GraphWalkEmbedding {
+    fn clone(&self) -> Self {
+        Self {
+            neighbors: self.neighbors.clone(),
+            entities: RwLock::new(self.entities.read().clone()),
+            damping: self.damping,
+            iterations: self.iterations,
+            similarity_floor: self.similarity_floor,
+            max_embedded_entities: self.max_embedded_entities,
+            vectors: RwLock::new(self.vectors.read().clone()),
+            vectors_dirty: AtomicBool::new(self.vectors_dirty.load(Ordering::Relaxed)),
+            edge_count: self.edge_count,
+        }
+    }
+}
+
 impl GraphWalkEmbedding {
     pub fn new(damping: f64, iterations: usize, similarity_floor: f64) -> Self {
         Self {

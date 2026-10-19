@@ -100,6 +100,7 @@ struct Candidate {
     order: usize,
 }
 
+#[derive(Clone)]
 pub struct LinkPredictor {
     triples: Vec<Triple>,
     pairs_by_pred: HashMap<String, HashSet<(String, String)>>,

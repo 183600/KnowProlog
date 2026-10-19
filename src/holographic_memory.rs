@@ -168,6 +168,7 @@ pub fn cosine(a: &[f64], b: &[i8]) -> f64 {
     dot / (norm_sq.sqrt() * (b.len() as f64).sqrt())
 }
 
+#[derive(Clone)]
 pub struct HolographicMemory {
     dim: usize,
     similarity_floor: f64,

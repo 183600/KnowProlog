@@ -8,26 +8,26 @@
 // 全程只有：项、置换、合一、深度上限与搜索预算——每一步都可解释、可回溯。
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::bindings::{BindingSet, BoundTerm};
 
 /// 项：逻辑变量或常量（实体名、属性值、谓词名都是常量）
 ///
-/// 字符串用 `Rc<str>` 共享。
+/// 字符串用 `Arc<str>` 共享（跨线程可克隆的分叉基座要求 `Send`）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Term {
-    Var(Rc<str>),
-    Const(Rc<str>),
+    Var(Arc<str>),
+    Const(Arc<str>),
 }
 
 impl Term {
     pub fn var(name: &str) -> Self {
-        Term::Var(Rc::from(name))
+        Term::Var(Arc::from(name))
     }
 
     pub fn constant(name: &str) -> Self {
-        Term::Const(Rc::from(name))
+        Term::Const(Arc::from(name))
     }
 
     pub fn is_var(&self) -> bool {
@@ -44,14 +44,14 @@ impl Term {
 /// 原子：谓词 + 参数（知识图谱二元关系；类型/属性存在性用一元或二元谓词编码）
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Atom {
-    pub predicate: Rc<str>,
+    pub predicate: Arc<str>,
     pub terms: Vec<Term>,
 }
 
 impl Atom {
     pub fn new(predicate: &str, terms: Vec<Term>) -> Self {
         Self {
-            predicate: Rc::from(predicate),
+            predicate: Arc::from(predicate),
             terms,
         }
     }
@@ -113,18 +113,18 @@ impl Atom {
 
 /// 置换：变量名 → 项
 ///
-/// 用不可变单链表 + `Rc` 持久化表示置换：
+/// 用不可变单链表 + `Arc` 持久化表示置换：
 /// 合一产生的扩展在常数时间完成。
 #[derive(Debug, Clone, Default)]
 pub struct Substitution {
-    head: Option<Rc<SubstitutionBinding>>,
+    head: Option<Arc<SubstitutionBinding>>,
 }
 
 #[derive(Debug)]
 struct SubstitutionBinding {
-    name: Rc<str>,
+    name: Arc<str>,
     term: Term,
-    next: Option<Rc<SubstitutionBinding>>,
+    next: Option<Arc<SubstitutionBinding>>,
 }
 
 impl Substitution {
@@ -143,11 +143,11 @@ impl Substitution {
         None
     }
 
-    /// 与 [`Self::get`] 相同，但对同一个 `Rc<str>` 走指针比较快速路径
-    fn get_rc(&self, name: &Rc<str>) -> Option<&Term> {
+    /// 与 [`Self::get`] 相同，但对同一个 `Arc<str>` 走指针比较快速路径
+    fn get_rc(&self, name: &Arc<str>) -> Option<&Term> {
         let mut current = self.head.as_deref();
         while let Some(binding) = current {
-            if Rc::ptr_eq(&binding.name, name) || &*binding.name == &**name {
+            if Arc::ptr_eq(&binding.name, name) || &*binding.name == &**name {
                 return Some(&binding.term);
             }
             current = binding.next.as_deref();
@@ -155,8 +155,8 @@ impl Substitution {
         None
     }
 
-    pub fn insert(&mut self, name: impl Into<Rc<str>>, term: Term) {
-        self.head = Some(Rc::new(SubstitutionBinding {
+    pub fn insert(&mut self, name: impl Into<Arc<str>>, term: Term) {
+        self.head = Some(Arc::new(SubstitutionBinding {
             name: name.into(),
             term,
             next: self.head.take(),
@@ -249,9 +249,9 @@ pub struct DerivedFact {
 #[derive(Clone)]
 pub struct ResolutionEngine {
     facts: HashSet<Atom>,
-    facts_by_pred: HashMap<Rc<str>, Vec<Atom>>,
+    facts_by_pred: HashMap<Arc<str>, Vec<Atom>>,
     clauses: Vec<Clause>,
-    rules_by_head: HashMap<Rc<str>, Vec<usize>>,
+    rules_by_head: HashMap<Arc<str>, Vec<usize>>,
     max_depth: usize,
     max_solutions: usize,
     max_steps: usize,
@@ -581,7 +581,7 @@ impl ResolutionEngine {
         max_new_facts: usize,
     ) -> Vec<DerivedFact> {
         let mut derived_known: HashSet<Atom> = HashSet::new();
-        let mut derived_by_pred: HashMap<Rc<str>, Vec<Atom>> = HashMap::new();
+        let mut derived_by_pred: HashMap<Arc<str>, Vec<Atom>> = HashMap::new();
         for atom in extra_facts {
             if !atom.is_ground() || self.facts.contains(atom) {
                 continue;
@@ -654,7 +654,7 @@ impl ResolutionEngine {
     fn match_body(
         &self,
         goals: &[Atom],
-        derived_by_pred: &HashMap<Rc<str>, Vec<Atom>>,
+        derived_by_pred: &HashMap<Arc<str>, Vec<Atom>>,
     ) -> Vec<(Substitution, Vec<Atom>)> {
         let mut states: Vec<(Substitution, Vec<Atom>)> = vec![(Substitution::new(), Vec::new())];
         for goal in goals {
@@ -756,12 +756,12 @@ pub fn unify_atoms(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> bo
 /// 记录本次合一中已处理的变量；返回 true 表示该变量重复出现或容器已满。
 #[inline]
 fn remember_var(
-    touched: &mut [Option<Rc<str>>; 4],
+    touched: &mut [Option<Arc<str>>; 4],
     len: &mut usize,
-    name: &Rc<str>,
+    name: &Arc<str>,
 ) -> bool {
     for slot in touched.iter().flatten() {
-        if Rc::ptr_eq(slot, name) || **slot == **name {
+        if Arc::ptr_eq(slot, name) || **slot == **name {
             return true;
         }
     }
@@ -783,7 +783,7 @@ fn unify_prepared(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> boo
     if pattern.predicate != other.predicate || pattern.arity() != other.arity() {
         return false;
     }
-    let mut touched: [Option<Rc<str>>; 4] = Default::default();
+    let mut touched: [Option<Arc<str>>; 4] = Default::default();
     let mut touched_len = 0usize;
     for (left, right) in pattern.terms.iter().zip(other.terms.iter()) {
         match (left, right) {
@@ -865,9 +865,9 @@ fn fresh_var_name(name: &str, tag: usize) -> String {
     out
 }
 
-/// 让同名的变量在子句内共享同一个 `Rc<str>`
+/// 让同名的变量在子句内共享同一个 `Arc<str>`
 fn canonicalize_clause_vars(clause: &mut Clause) {
-    let mut canonical: HashMap<Rc<str>, Rc<str>> = HashMap::new();
+    let mut canonical: HashMap<Arc<str>, Arc<str>> = HashMap::new();
     for atom in std::iter::once(&mut clause.head).chain(clause.body.iter_mut()) {
         for term in &mut atom.terms {
             if let Term::Var(name) = term {
@@ -885,7 +885,7 @@ fn canonicalize_clause_vars(clause: &mut Clause) {
 /// 变量换名器：同一次子句使用中，相同变量名的所有出现共享同一个换名结果。
 struct Renamer<'a> {
     tag: usize,
-    cache: Vec<(&'a Rc<str>, Rc<str>)>,
+    cache: Vec<(&'a Arc<str>, Arc<str>)>,
 }
 
 impl<'a> Renamer<'a> {
@@ -896,15 +896,15 @@ impl<'a> Renamer<'a> {
         }
     }
 
-    fn fresh(&mut self, name: &'a Rc<str>) -> Rc<str> {
+    fn fresh(&mut self, name: &'a Arc<str>) -> Arc<str> {
         if let Some((_, fresh)) = self
             .cache
             .iter()
-            .find(|(original, _)| Rc::ptr_eq(original, name))
+            .find(|(original, _)| Arc::ptr_eq(original, name))
         {
             return fresh.clone();
         }
-        let fresh: Rc<str> = fresh_var_name(name, self.tag).into();
+        let fresh: Arc<str> = fresh_var_name(name, self.tag).into();
         self.cache.push((name, fresh.clone()));
         fresh
     }

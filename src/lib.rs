@@ -53,6 +53,8 @@ pub mod dialogue_manager;
 pub mod holographic_memory;
 pub mod predicate_registry;
 pub mod perf_ledger;
+pub mod startup_ledger;
+pub mod cache;
 pub mod context_image;
 pub mod import_journal;
 pub mod grammar_extractor;
@@ -826,61 +828,7 @@ pub struct OxigraphManager {
 /// 32 槽足以消除往返抖动，同时让内存占用可计算。
 const QUERY_CACHE_CAPACITY: usize = 32;
 
-/// 按知识版本失效的有界 LRU 查询缓存。
-///
-/// 正确性契约：缓存条目只在 `revision` 与当前知识版本一致时
-/// 才可命中；版本推进（写之后自增）会让下一查整体重新装载。容量溢出时
-/// 淘汰最久未用条目，淘汰顺序确定（LRU 序由访问推进）。
-struct RevisionLru<V> {
-    revision: u64,
-    capacity: usize,
-    entries: HashMap<String, V>,
-    order: Vec<String>,
-}
-
-impl<V> RevisionLru<V> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            revision: u64::MAX,
-            capacity: capacity.max(1),
-            entries: HashMap::new(),
-            order: Vec::new(),
-        }
-    }
-
-    /// 命中则触碰 LRU 并返回引用；版本不符或未命中返回 None。
-    fn get(&mut self, revision: u64, key: &str) -> Option<&V> {
-        if self.revision != revision || !self.entries.contains_key(key) {
-            return None;
-        }
-        self.order.retain(|cached| cached != key);
-        self.order.push(key.to_string());
-        self.entries.get(key)
-    }
-
-    /// 写入（返回被淘汰的条目数：0 或 1）。版本变化时先清空。
-    fn put(&mut self, revision: u64, key: String, value: V) -> usize {
-        if self.revision != revision {
-            self.entries.clear();
-            self.order.clear();
-            self.revision = revision;
-        }
-        if self.entries.insert(key.clone(), value).is_none() {
-            self.order.push(key);
-        } else {
-            self.order.retain(|cached| cached != &key);
-            self.order.push(key);
-        }
-        if self.entries.len() > self.capacity {
-            if let Some(oldest) = self.order.first().cloned() {
-                self.order.remove(0);
-                self.entries.remove(&oldest);
-                return 1;
-            }
-        }
-        0
-    }
-}
+use crate::cache::RevisionLru;
 
 impl OxigraphManager {
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -2949,7 +2897,7 @@ mod cache_tests {
         // 版本推进：全部失效，旧键不得复活
         assert!(cache.get(2, "a").is_none());
         assert_eq!(cache.put(2, "d".to_string(), 4), 0);
-        assert_eq!(cache.entries.len(), 1, "版本变化时先清空");
+        assert_eq!(cache.len(), 1, "版本变化时先清空");
         assert_eq!(cache.get(2, "d"), Some(&4));
     }
 

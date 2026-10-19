@@ -346,6 +346,7 @@ pub fn render_mention_ledger(
     output.trim_end().to_string()
 }
 
+#[derive(Clone)]
 struct EntityProfile {
     etype: Option<String>,
     degree: usize,
@@ -354,6 +355,7 @@ struct EntityProfile {
     bigrams: HashSet<(char, char)>,
 }
 
+#[derive(Clone)]
 pub struct EntityLinker {
     profiles: HashMap<String, EntityProfile>,
     surface_candidates: HashMap<String, Vec<String>>,

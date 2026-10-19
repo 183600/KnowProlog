@@ -7,6 +7,7 @@ use crate::abduction::{
     self, AbductionEngine, AbductionReport, ClarificationReply, ClarificationSession, Hypothesis,
     Scenario,
 };
+use crate::cache::RevisionLru;
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{
@@ -46,6 +47,10 @@ const PROOF_TYPE: &str = "__类型__";
 
 // 默认逻辑（可反驳常识）的最大接地推导轮数
 const DEFAULT_LOGIC_MAX_ROUNDS: usize = 8;
+
+// 会话内纯函数记忆槽容量（提及/链接/谓词）：多轮交替询问时各自留槽，
+// 知识版本推进（revision 自增）时整体失效；容量按条目数确定，LRU 序可审计。
+const MEMO_CAPACITY: usize = 16;
 
 // 中文教学知识类型的展示名
 fn lesson_kind_label(kind: LessonKind) -> &'static str {
@@ -342,6 +347,7 @@ impl Ord for MagnitudeDisplayKey {
     }
 }
 
+#[derive(Clone)]
 pub struct DialogueContext {
     focus_entities: Vec<String>,
     /// 焦点实体的类型证据（代词消解的类型闸门；未知=键不存在）
@@ -669,13 +675,14 @@ pub struct SymbolicReasoner {
     known_predicates_normalized_cache: Vec<(String, String)>,
     // 命题解析器的“表面积 → 规范谓词”索引缓存：随观察事实重建
     proposition_surfaces: Vec<(String, String)>,
-    // 单条链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
+    // 链接结果记忆：同一文本在一次查询流程中会被多处链接（上下文记录/链接说明/回答），
+    // 多轮中交替询问的文本各自留槽（按知识版本失效的有界 LRU）；
     // 观察事实或重建缓存（线索变化）时整体失效
-    link_memo: parking_lot::Mutex<Option<(String, Arc<Vec<LinkedMention>>)>>,
+    link_memo: parking_lot::Mutex<RevisionLru<Arc<Vec<LinkedMention>>>>,
     // 实体提及记忆：record_vocabulary 对同一文本会多次调用，且每次需全量扫描实体剖面
-    entity_mentions_memo: parking_lot::Mutex<Option<(String, Vec<String>)>>,
+    entity_mentions_memo: parking_lot::Mutex<RevisionLru<Vec<String>>>,
     // 同义词命中的规范谓词集合记忆
-    predicate_canonicals_memo: parking_lot::Mutex<Option<(String, Arc<HashSet<String>>)>>,
+    predicate_canonicals_memo: parking_lot::Mutex<RevisionLru<Arc<HashSet<String>>>>,
     // 谓词画像逆向词面：词面 → (规范槽位, 逆向)。问句以逆向谓词发问时
     // 主宾对调命中同一批事实（「徒弟」问句 ↔「师傅」事实），零数据冗余
     inverse_query_map: HashMap<String, (String, bool)>,
@@ -695,6 +702,55 @@ pub struct SymbolicReasoner {
     // 引擎层故障通道（Prolog / 存储等下游失败由宿主注入）：
     // 非空时对话管理器走 EngineFault 路径，绝不与「知识里没有」合并。
     engine_fault: Option<String>,
+}
+
+/// 深拷贝：所有子引擎必须实现 `Clone`（锁/原子量以值重建，不共享可变状态）。
+/// 内存记忆缓存（提及/链接/谓词）按内容复制，语义不变。
+impl Clone for SymbolicReasoner {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            aligner: self.aligner.clone(),
+            predictor: self.predictor.clone(),
+            context: self.context.clone(),
+            embedding: self.embedding.clone(),
+            walks: self.walks.clone(),
+            soft: self.soft.clone(),
+            problog: self.problog.clone(),
+            lessons: self.lessons.clone(),
+            lessons_parsed: self.lessons_parsed.clone(),
+            planner: self.planner.clone(),
+            linker: self.linker.clone(),
+            generator: self.generator.clone(),
+            attributes: self.attributes.clone(),
+            attribute_index: self.attribute_index.clone(),
+            associations: self.associations.clone(),
+            resolver: self.resolver.clone(),
+            abduction: self.abduction.clone(),
+            frames: self.frames.clone(),
+            session_facts: self.session_facts.clone(),
+            session_clauses: self.session_clauses.clone(),
+            clarification: self.clarification.clone(),
+            last_abduction_goal: self.last_abduction_goal.clone(),
+            last_abduction_vars: self.last_abduction_vars.clone(),
+            known_predicates_cache: self.known_predicates_cache.clone(),
+            known_predicates_normalized_cache: self.known_predicates_normalized_cache.clone(),
+            proposition_surfaces: self.proposition_surfaces.clone(),
+            // 记忆缓存是纯派生数据：分叉时留空，由新会话按需重建
+            // （空缓存与「重建后的缓存」在固定纪元下读数一致）
+            link_memo: parking_lot::Mutex::new(RevisionLru::new(MEMO_CAPACITY)),
+            entity_mentions_memo: parking_lot::Mutex::new(RevisionLru::new(MEMO_CAPACITY)),
+            predicate_canonicals_memo: parking_lot::Mutex::new(RevisionLru::new(MEMO_CAPACITY)),
+            inverse_query_map: self.inverse_query_map.clone(),
+            discourse: self.discourse.clone(),
+            holo: self.holo.clone(),
+            revision: self.revision,
+            derived_stamps: self.derived_stamps.clone(),
+            dependency_stamps: self.dependency_stamps.clone(),
+            perf: Arc::clone(&self.perf),
+            engine_fault: self.engine_fault.clone(),
+        }
+    }
 }
 
 impl SymbolicReasoner {
@@ -790,9 +846,9 @@ impl SymbolicReasoner {
             known_predicates_cache: Vec::new(),
             known_predicates_normalized_cache: Vec::new(),
             proposition_surfaces: Vec::new(),
-            link_memo: parking_lot::Mutex::new(None),
-            entity_mentions_memo: parking_lot::Mutex::new(None),
-            predicate_canonicals_memo: parking_lot::Mutex::new(None),
+            link_memo: parking_lot::Mutex::new(RevisionLru::new(MEMO_CAPACITY)),
+            entity_mentions_memo: parking_lot::Mutex::new(RevisionLru::new(MEMO_CAPACITY)),
+            predicate_canonicals_memo: parking_lot::Mutex::new(RevisionLru::new(MEMO_CAPACITY)),
             inverse_query_map: HashMap::new(),
             discourse,
             holo,
@@ -804,6 +860,42 @@ impl SymbolicReasoner {
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
+    }
+
+    /// 从预热基座分叉一个新会话：知识派生状态按值深拷贝，会话态清零。
+    ///
+    /// 正确性契约：分叉结果与「新建实例 + 重放同一批 `observe_facts`」在固定
+    /// 查询集上逐字节一致（同一知识版本、同一配置、同一同义词表），
+    /// 由 `fork_matches_fresh_observe_byte_for_byte` 等测试守护。
+    /// `Rc<str>` 已统一为 `Arc<str>`，因此分叉基座可跨线程共享（`Send`）。
+    pub fn fork_session(&self) -> Self {
+        let mut fork = self.clone();
+        fork.reset_session_state();
+        fork
+    }
+
+    /// 清空会话态：焦点/历史、会话事实与临时规则、澄清、教学、记忆缓存、
+    /// 注入故障。知识派生状态（剖面/规则/向量/台账）原样保留。
+    fn reset_session_state(&mut self) {
+        self.context.clear();
+        let lessons_were_taught = !self.lessons_parsed.is_empty();
+        self.lessons.clear();
+        self.lessons_parsed.clear();
+        self.frames = FrameMemory::new();
+        self.session_facts.clear();
+        self.session_clauses.clear();
+        self.clarification = None;
+        self.last_abduction_goal = None;
+        self.last_abduction_vars.clear();
+        self.abduction.reset_session();
+        self.link_memo.lock().clear();
+        self.entity_mentions_memo.lock().clear();
+        self.predicate_canonicals_memo.lock().clear();
+        self.engine_fault = None;
+        // 教学规则会随 lessons_parsed 重放进概率程序；只有真的教过才需要重建
+        if lessons_were_taught && self.config.enable_problog {
+            self.rebuild_problog();
+        }
     }
 
     /// 注入引擎层故障（宿主在 Prolog / 存储失败后调用）：
@@ -914,9 +1006,9 @@ impl SymbolicReasoner {
         }
         self.attribute_index = attribute_index;
         // 词表变化后实体链接/实体提及的旧结果可能过时，同步失效记忆缓存
-        *self.link_memo.lock() = None;
-        *self.entity_mentions_memo.lock() = None;
-        *self.predicate_canonicals_memo.lock() = None;
+        self.link_memo.lock().clear();
+        self.entity_mentions_memo.lock().clear();
+        self.predicate_canonicals_memo.lock().clear();
         self.stamp_rebuild("knowledge_caches");
     }
 
@@ -1248,9 +1340,9 @@ impl SymbolicReasoner {
             self.stamp_dependency("associations");
         }
         // 内容变化意味着链接剖面可能变化，单条记忆整体失效（在变更检测后统一做）
-        *self.link_memo.lock() = None;
-        *self.entity_mentions_memo.lock() = None;
-        *self.predicate_canonicals_memo.lock() = None;
+        self.link_memo.lock().clear();
+        self.entity_mentions_memo.lock().clear();
+        self.predicate_canonicals_memo.lock().clear();
         // 规则只依赖已积累的三元组与固定阈值：有新增三元组时才重新挖掘
         if triples_added && self.config.enable_link_prediction {
             self.predictor.mine_rules(
@@ -1611,17 +1703,22 @@ impl SymbolicReasoner {
     }
 
     pub fn entities_mentioned(&self, text: &str) -> Vec<String> {
-        // 同一文本会在一轮对话中被多次询问，做单条记忆复用；
-        // 实体剖面或同义词表只在 observe_facts 中变化，届时整体失效
-        if let Some((cached_text, found)) = self.entity_mentions_memo.lock().as_ref() {
-            if cached_text == text {
-                self.perf.bump("memo_entity_mentions_hit");
-                return found.clone();
-            }
+        // 同一文本会在一轮对话中被多次询问，做多槽记忆复用；
+        // 实体剖面或同义词表只在 observe_facts 中变化，届时（revision 推进）整体失效
+        if let Some(found) = self
+            .entity_mentions_memo
+            .lock()
+            .get(self.revision, text)
+            .cloned()
+        {
+            self.perf.bump("memo_entity_mentions_hit");
+            return found;
         }
         self.perf.bump("memo_entity_mentions_miss");
         let found = self.entities_mentioned_uncached(text);
-        *self.entity_mentions_memo.lock() = Some((text.to_string(), found.clone()));
+        self.entity_mentions_memo
+            .lock()
+            .put(self.revision, text.to_string(), found.clone());
         found
     }
 
@@ -1663,11 +1760,14 @@ impl SymbolicReasoner {
 
     /// 收集文本中出现的同义词对应的规范谓词集合
     fn mentioned_predicate_canonicals(&self, text: &str) -> Arc<HashSet<String>> {
-        if let Some((cached_text, canonicals)) = self.predicate_canonicals_memo.lock().as_ref() {
-            if cached_text == text {
-                self.perf.bump("memo_predicate_canonicals_hit");
-                return canonicals.clone();
-            }
+        if let Some(canonicals) = self
+            .predicate_canonicals_memo
+            .lock()
+            .get(self.revision, text)
+            .cloned()
+        {
+            self.perf.bump("memo_predicate_canonicals_hit");
+            return canonicals;
         }
         self.perf.bump("memo_predicate_canonicals_miss");
         let mut mentioned: HashSet<String> = HashSet::new();
@@ -1677,7 +1777,9 @@ impl SymbolicReasoner {
             }
         }
         let mentioned = Arc::new(mentioned);
-        *self.predicate_canonicals_memo.lock() = Some((text.to_string(), mentioned.clone()));
+        self.predicate_canonicals_memo
+            .lock()
+            .put(self.revision, text.to_string(), mentioned.clone());
         mentioned
     }
 
@@ -1732,7 +1834,7 @@ impl SymbolicReasoner {
     /// 持久化由调用方写入知识库后重新观察事实完成。
     pub fn admit_vocabulary(&mut self, surface: &str) -> Option<(String, String)> {
         let admitted = self.linker.admit_entity(surface)?;
-        *self.link_memo.lock() = None;
+        self.link_memo.lock().clear();
         Some(admitted)
     }
 
@@ -1749,16 +1851,21 @@ impl SymbolicReasoner {
 
     /// 文本的实体链接结果：一次查询流程内同一文本会被多处链接，做单条记忆复用
     fn linked_mentions(&self, text: &str) -> Arc<Vec<LinkedMention>> {
-        if let Some((cached_text, mentions)) = self.link_memo.lock().as_ref() {
-            if cached_text == text {
-                self.perf.bump("memo_link_hit");
-                return mentions.clone();
-            }
+        if let Some(mentions) = self
+            .link_memo
+            .lock()
+            .get(self.revision, text)
+            .cloned()
+        {
+            self.perf.bump("memo_link_hit");
+            return mentions;
         }
         self.perf.bump("memo_link_miss");
         let hints = self.link_hints(text);
         let mentions = Arc::new(self.linker.link_with_context(text, &hints));
-        *self.link_memo.lock() = Some((text.to_string(), mentions.clone()));
+        self.link_memo
+            .lock()
+            .put(self.revision, text.to_string(), mentions.clone());
         mentions
     }
 
@@ -8228,5 +8335,128 @@ mod tests {
         reasoner.observe_facts(&extended);
         let _ = reasoner.entities_mentioned("张三的师傅是谁");
         assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2, "版本变化后旧记忆必须失效");
+    }
+
+    /// 多槽记忆：同一知识版本内交替询问多个文本，各自留槽、重复命中；
+    /// 版本推进后整体不可命中（纪元失效，不靠 TTL）。
+    #[test]
+    fn test_memo_keeps_multiple_texts_within_revision() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let perf = reasoner.perf_ledger();
+
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        let _ = reasoner.entities_mentioned("李四的师傅是谁");
+        let hits = perf.count("memo_entity_mentions_hit");
+        // 交替再问：两个文本都应命中（旧实现单槽会互相挤掉）
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        let _ = reasoner.entities_mentioned("李四的师傅是谁");
+        assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2);
+
+        // 链接记忆同样多槽
+        let _ = reasoner.linked_mentions("张三的师傅是谁");
+        let _ = reasoner.linked_mentions("李四的师傅是谁");
+        let link_hits = perf.count("memo_link_hit");
+        let _ = reasoner.linked_mentions("张三的师傅是谁");
+        let _ = reasoner.linked_mentions("李四的师傅是谁");
+        assert_eq!(perf.count("memo_link_hit"), link_hits + 2);
+
+        // 知识版本推进：旧文本不得再命中
+        let mut extended = master_facts();
+        extended.push(PrologFact::Relation {
+            from: "王五".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "钱七".to_string(),
+        });
+        reasoner.observe_facts(&extended);
+        let before = perf.count("memo_entity_mentions_hit");
+        let _ = reasoner.entities_mentioned("张三的师傅是谁");
+        assert_eq!(perf.count("memo_entity_mentions_hit"), before);
+    }
+
+    /// WarmBase 的跨线程前提：分叉基座必须可 `Send`（Rc 已统一为 Arc）。
+    #[test]
+    fn reasoner_is_send_for_cross_thread_fork() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SymbolicReasoner>();
+    }
+
+    /// 分叉契约：从「观察完毕的基座」分叉，与「新建 + 重放同一批事实」在
+    /// 固定查询集与固定对话序列上逐字节一致（回答、焦点、历史、接地清单）。
+    #[test]
+    fn fork_matches_fresh_observe_byte_for_byte() {
+        let facts = master_facts();
+        let config = test_config();
+
+        let mut base = SymbolicReasoner::new(config.clone(), HashMap::new());
+        base.observe_facts(&facts);
+        let mut forked = base.fork_session();
+
+        let mut fresh = SymbolicReasoner::new(config, HashMap::new());
+        fresh.observe_facts(&facts);
+
+        assert_eq!(forked.revision(), fresh.revision(), "知识版本必须一致");
+
+        // 固定查询集：覆盖关系查询、逆向谓词、属性、链式与未知实体
+        let questions = [
+            "张三的师傅是谁",
+            "李四的师祖是谁",
+            "王五的师傅是谁",
+            "赵六的师傅是谁",
+            "张三的师傅的师傅是谁",
+            "姚明的身高是什么",
+            "秦始皇是谁",
+            "张三多大",
+        ];
+        for question in questions {
+            assert_eq!(
+                forked.answer(question),
+                fresh.answer(question),
+                "回答必须逐字节一致：{}",
+                question
+            );
+        }
+        // 接地清单（提及解码 + 链接记忆路径）也必须一致
+        let forked_grounding = forked.grounding_mentions("张三的师傅是谁");
+        let fresh_grounding = fresh.grounding_mentions("张三的师傅是谁");
+        assert_eq!(
+            format!("{:?}", forked_grounding),
+            format!("{:?}", fresh_grounding),
+            "接地清单必须一致"
+        );
+
+        // 固定对话序列：多轮上下文状态（焦点/历史）必须一致
+        for turn in ["张三的师傅是谁", "那李四呢", "他的师傅是谁"] {
+            let _ = forked.contextualize(turn);
+            let _ = fresh.contextualize(turn);
+        }
+        assert_eq!(
+            forked.contextualize("王五的师傅是谁"),
+            fresh.contextualize("王五的师傅是谁")
+        );
+        assert_eq!(
+            format!("{:?}", forked.context.focus_entities()),
+            format!("{:?}", fresh.context.focus_entities())
+        );
+    }
+
+    /// 分叉必须清零会话态：源实例用过的焦点/教学不得泄漏进新会话。
+    #[test]
+    fn fork_session_clears_session_state_only() {
+        let config = test_config();
+        let mut used = SymbolicReasoner::new(config, HashMap::new());
+        used.observe_facts(&master_facts());
+        let _ = used.contextualize("张三的师傅是谁");
+        let _ = used.answer("张三的师傅是谁");
+        assert!(!used.context.focus_entities().is_empty(), "源实例应有焦点");
+
+        let forked = used.fork_session();
+        assert!(forked.context.focus_entities().is_empty(), "分叉不得继承焦点");
+        assert_eq!(forked.revision(), used.revision(), "知识版本随分叉保留");
+        // 知识仍在：同一问句回答与源实例一致
+        assert_eq!(
+            forked.answer("张三的师傅是谁"),
+            used.answer("张三的师傅是谁")
+        );
     }
 }

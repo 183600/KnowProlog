@@ -9,7 +9,7 @@
 // 全部运算是合一、集合交并、对数与 sigmoid —— 没有神经网络、没有权重训练。
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::resolution_engine::{apply_atom, unify_atoms, Atom, Substitution, Term};
 
@@ -176,9 +176,10 @@ pub struct GradientAttribution {
 /// 软真值传播的中间结果：候选原子 → (log-odds, 证据)
 pub(crate) type Beliefs = HashMap<Atom, (f64, Vec<RuleEvidence>)>;
 
+#[derive(Clone)]
 pub struct MarkovLogicEngine {
     facts: HashSet<Atom>,
-    facts_by_pred: HashMap<Rc<str>, Vec<Atom>>,
+    facts_by_pred: HashMap<Arc<str>, Vec<Atom>>,
     rules: Vec<WeightedRule>,
     max_iterations: usize,
     min_probability: f64,
@@ -281,8 +282,8 @@ impl MarkovLogicEngine {
         &self,
         derived: &HashMap<Atom, f64>,
         fixed: &HashMap<Atom, f64>,
-    ) -> HashMap<Rc<str>, Vec<Atom>> {
-        let mut extra: HashMap<Rc<str>, Vec<Atom>> = HashMap::new();
+    ) -> HashMap<Arc<str>, Vec<Atom>> {
+        let mut extra: HashMap<Arc<str>, Vec<Atom>> = HashMap::new();
         // 去重：同一原子可能既是事实又已被推出（或多条路径推出同一原子），
         // 重复候选会让同一条基化规则被重复计数、人为抬高 log-odds
         let mut seen: HashSet<&Atom> = HashSet::new();
@@ -403,7 +404,7 @@ impl MarkovLogicEngine {
     fn ground_rule(
         &self,
         rule: &WeightedRule,
-        extra: &HashMap<Rc<str>, Vec<Atom>>,
+        extra: &HashMap<Arc<str>, Vec<Atom>>,
     ) -> Vec<(Substitution, Vec<Atom>)> {
         let mut results = Vec::new();
         let mut subst = Substitution::new();
@@ -425,7 +426,7 @@ impl MarkovLogicEngine {
         index: usize,
         subst: &mut Substitution,
         premises: &mut Vec<Atom>,
-        extra: &HashMap<Rc<str>, Vec<Atom>>,
+        extra: &HashMap<Arc<str>, Vec<Atom>>,
         results: &mut Vec<(Substitution, Vec<Atom>)>,
     ) {
         if results.len() >= self.max_groundings_per_rule {
@@ -768,7 +769,7 @@ impl MarkovLogicEngine {
         let candidate_set: HashSet<Atom> = candidates.iter().cloned().collect();
         // MAP 论域 = 事实 + 候选原子（候选原子无论当前真值都参与基化）。
         // 事实直接引用 self.facts_by_pred，仅对候选补充原子去重建表。
-        let mut extra: HashMap<Rc<str>, Vec<Atom>> = HashMap::new();
+        let mut extra: HashMap<Arc<str>, Vec<Atom>> = HashMap::new();
         let mut seen: HashSet<&Atom> = HashSet::new();
         for atom in &candidate_set {
             if !self.facts.contains(atom) && seen.insert(atom) {

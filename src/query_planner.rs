@@ -32,6 +32,7 @@ pub enum QueryPlan {
     Analogy { a: String, b: String, c: String },
 }
 
+#[derive(Clone)]
 pub struct QueryPlanner {
     max_question_chars: usize,
     max_chain: usize,

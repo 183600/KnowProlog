@@ -347,6 +347,7 @@ pub struct ConceptBrief {
 }
 
 /// OWL 本体叙述器：观察事实 → 闭包物化 → 输出可叙述的画像与“为什么”
+#[derive(Clone)]
 pub struct OwlNarrator {
     ontology: OntologyReasoner,
     closure: OntologyClosure,
@@ -672,6 +673,7 @@ pub struct NarrationOptions<'a> {
 }
 
 /// 话语规划器：索引事实 + 维护本体 + 生成多句连贯叙述与句式改写
+#[derive(Clone)]
 pub struct DiscoursePlanner {
     narrator: OwlNarrator,
     grammar: DcgGrammar,

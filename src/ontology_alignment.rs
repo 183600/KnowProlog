@@ -54,6 +54,25 @@ pub struct OntologyAligner {
     resolve_cache: RwLock<HashMap<String, Option<Arc<(AlignmentPair, Option<usize>)>>>>,
 }
 
+/// 深拷贝：解析缓存一并复制（缓存内容是不可变 `Arc`，克隆只是指针复制）。
+/// 供 WarmBase 会话分叉使用：派生状态按值分叉，绝不与源实例共享可变锁。
+impl Clone for OntologyAligner {
+    fn clone(&self) -> Self {
+        Self {
+            synonyms: self.synonyms.clone(),
+            profiles: self.profiles.clone(),
+            profile_norms: self.profile_norms.clone(),
+            profile_keys: self.profile_keys.clone(),
+            profile_lens: self.profile_lens.clone(),
+            index: self.index.clone(),
+            similarity_threshold: self.similarity_threshold,
+            structural_min_shared: self.structural_min_shared,
+            structural_min_jaccard: self.structural_min_jaccard,
+            resolve_cache: RwLock::new(self.resolve_cache.read().clone()),
+        }
+    }
+}
+
 impl OntologyAligner {
     pub fn new(synonyms: HashMap<String, String>, similarity_threshold: f64) -> Self {
         Self {

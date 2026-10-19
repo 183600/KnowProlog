@@ -88,6 +88,7 @@ impl AssociationRule {
     }
 }
 
+#[derive(Clone)]
 pub struct AssociationMiner {
     // 实体 → 物品篮（集合，天然去重）
     baskets: HashMap<String, HashSet<String>>,

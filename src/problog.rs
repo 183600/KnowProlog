@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::markov_logic::MarkovLogicEngine;
 use crate::resolution_engine::{apply_atom, unify_atoms, Atom, Substitution, Term};
@@ -427,6 +427,7 @@ impl Compiled {
 }
 
 /// ProbLog 风格引擎：概率事实 + 概率规则 + 注释析取，查询即精确 WMC
+#[derive(Clone)]
 pub struct ProblogEngine {
     deterministic_facts: HashSet<Atom>,
     probabilistic_facts: Vec<ProbabilisticFact>,
@@ -435,7 +436,7 @@ pub struct ProblogEngine {
     max_depth: usize,
     max_proofs: usize,
     max_bdd_nodes: usize,
-    compiled: RefCell<Option<Rc<Compiled>>>,
+    compiled: RefCell<Option<Arc<Compiled>>>,
 }
 
 impl ProblogEngine {
@@ -554,11 +555,11 @@ impl ProblogEngine {
         *self.compiled.borrow_mut() = None;
     }
 
-    fn compiled(&self) -> Rc<Compiled> {
+    fn compiled(&self) -> Arc<Compiled> {
         if let Some(existing) = self.compiled.borrow().as_ref() {
             return existing.clone();
         }
-        let compiled = Rc::new(self.compile());
+        let compiled = Arc::new(self.compile());
         *self.compiled.borrow_mut() = Some(compiled.clone());
         compiled
     }
