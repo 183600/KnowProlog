@@ -10,7 +10,7 @@
 //! 同一 `seed` 两次运行得到逐字节一致的报告。失败用例本身就是最小复现
 //! （每个用例只含一次世界变异 + 一个问题），可直接作为回归资产。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,7 @@ pub enum QualityMutation {
     RemoveType,
     AddDisjointType,
     RemoveEdge,
+    RemoveEntity,
 }
 
 impl QualityMutation {
@@ -63,6 +64,7 @@ impl QualityMutation {
             QualityMutation::RemoveType => "remove_type",
             QualityMutation::AddDisjointType => "add_disjoint_type",
             QualityMutation::RemoveEdge => "remove_edge",
+            QualityMutation::RemoveEntity => "remove_entity",
         }
     }
 }
@@ -76,6 +78,7 @@ pub enum QuestionClass {
     Typo,
     Pronoun,
     Ellipsis,
+    Particle,
     Identity,
 }
 
@@ -88,6 +91,7 @@ impl QuestionClass {
             QuestionClass::Typo => "typo",
             QuestionClass::Pronoun => "pronoun",
             QuestionClass::Ellipsis => "ellipsis",
+            QuestionClass::Particle => "particle",
             QuestionClass::Identity => "identity",
         }
     }
@@ -111,6 +115,7 @@ impl QuestionClass {
             QuestionClass::Typo => "张三的师付是谁",
             QuestionClass::Pronoun => "他的师傅是谁",
             QuestionClass::Ellipsis => "师傅呢",
+            QuestionClass::Particle => "张三的师傅到底是谁",
             QuestionClass::Identity => "王五是谁",
         }
     }
@@ -136,6 +141,17 @@ pub struct FuzzFailure {
     pub detail: String,
 }
 
+impl FuzzFailure {
+    /// 失败签名：同一种变异 + 问法 + 契约只保留一个最小复现。
+    pub fn signature(&self) -> (String, String, String) {
+        (
+            self.mutation.clone(),
+            self.question.clone(),
+            self.contract.clone(),
+        )
+    }
+}
+
 /// 模糊测试报告（确定性，可按 seed 复现）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FuzzReport {
@@ -149,24 +165,41 @@ pub struct FuzzReport {
 }
 
 impl FuzzReport {
+    /// 最小复现：按「变异 + 问法 + 契约」去重，保留最早出现的用例。
+    ///
+    /// 覆盖轮转会让同一缺陷在多个 case 重复出现；去重后每个失败都对应
+    /// 一个可单独重放的（世界变异, 问题）对，可直接作为回归资产。
+    pub fn minimal_failures(&self) -> Vec<FuzzFailure> {
+        let mut seen = BTreeSet::new();
+        let mut minimal = Vec::new();
+        for failure in &self.failures {
+            if seen.insert(failure.signature()) {
+                minimal.push(failure.clone());
+            }
+        }
+        minimal
+    }
+
     pub fn render_text(&self) -> String {
+        let minimal = self.minimal_failures();
         let mut lines = vec![format!(
-            "QDF 质量差分模糊测试：种子 {}，用例 {}（通过 {} / 失败 {} 例），契约失败 {} 条，覆盖 {} 格。",
+            "QDF 质量差分模糊测试：种子 {}，用例 {}（通过 {} / 失败 {} 例），契约失败 {} 条（最小复现 {} 条），覆盖 {} 格。",
             self.seed,
             self.cases,
             self.passed,
             self.failed,
             self.failures.len(),
+            minimal.len(),
             self.coverage.len()
         )];
-        if self.failures.is_empty() {
+        if minimal.is_empty() {
             lines.push(
                 "  所有变异方向与话语契约通过：删事实不再复读、加冲突必须披露、删来源只改引用、缺属性只追问。"
                     .to_string(),
             );
         } else {
             lines.push("  失败用例（最小复现 = 变异 + 问题）：".to_string());
-            for failure in self.failures.iter().take(12) {
+            for failure in minimal.iter().take(12) {
                 lines.push(format!(
                     "  [{}] {} / {}：{}（{}）",
                     failure.case,
@@ -176,12 +209,174 @@ impl FuzzReport {
                     failure.detail
                 ));
             }
-            if self.failures.len() > 12 {
-                lines.push(format!("  ……其余 {} 条省略", self.failures.len() - 12));
+            if minimal.len() > 12 {
+                lines.push(format!("  ……其余 {} 条省略", minimal.len() - 12));
             }
         }
         lines.push(format!("摘要：{}", self.digest));
         lines.join("\n")
+    }
+}
+
+/// known-gap 基线格式版本（未来迁移的版本门）。
+pub const FUZZ_BASELINE_VERSION: u32 = 1;
+
+/// 一个已知缺口：允许存在、但不得增多的失败签名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnownFuzzGap {
+    pub mutation: String,
+    pub question: String,
+    pub contract: String,
+    #[serde(default)]
+    pub input: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+impl KnownFuzzGap {
+    fn from_failure(failure: &FuzzFailure) -> Self {
+        KnownFuzzGap {
+            mutation: failure.mutation.clone(),
+            question: failure.question.clone(),
+            contract: failure.contract.clone(),
+            input: failure.input.clone(),
+            detail: failure.detail.clone(),
+        }
+    }
+
+    fn signature(&self) -> (String, String, String) {
+        (
+            self.mutation.clone(),
+            self.question.clone(),
+            self.contract.clone(),
+        )
+    }
+}
+
+/// known-gap 基线（`fuzz-dialogue --update-baseline` 落盘）。
+///
+/// 棘轮语义：基线里的缺口可以继续存在（已知债务），但**不能出现新签名**；
+/// 修好的缺口会自动进入 `fixed_gaps`，更新基线即可收紧棘轮。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuzzBaseline {
+    #[serde(default = "default_baseline_version")]
+    pub version: u32,
+    pub seed: u64,
+    pub gaps: Vec<KnownFuzzGap>,
+}
+
+fn default_baseline_version() -> u32 {
+    FUZZ_BASELINE_VERSION
+}
+
+impl FuzzBaseline {
+    pub fn from_report(report: &FuzzReport) -> Self {
+        Self::from_failures(&report.minimal_failures(), report.seed)
+    }
+
+    pub fn from_failures(failures: &[FuzzFailure], seed: u64) -> Self {
+        let mut gaps: Vec<KnownFuzzGap> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for failure in failures {
+            if seen.insert(failure.signature()) {
+                gaps.push(KnownFuzzGap::from_failure(failure));
+            }
+        }
+        FuzzBaseline {
+            version: FUZZ_BASELINE_VERSION,
+            seed,
+            gaps,
+        }
+    }
+
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let text = serde_json::to_string_pretty(self).unwrap_or_default();
+        std::fs::write(path, text)
+    }
+
+    pub fn load(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let text = std::fs::read_to_string(path)?;
+        let baseline: FuzzBaseline = serde_json::from_str(&text)?;
+        if baseline.version > FUZZ_BASELINE_VERSION {
+            return Err(format!(
+                "基线版本 {} 高于支持版本 {}（请升级程序）",
+                baseline.version, FUZZ_BASELINE_VERSION
+            )
+            .into());
+        }
+        Ok(baseline)
+    }
+}
+
+/// 棘轮裁决：哪些是新缺陷，哪些已修复。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuzzVerdict {
+    pub passed: bool,
+    pub baseline_gaps: usize,
+    pub known_failures: usize,
+    pub new_failures: Vec<FuzzFailure>,
+    pub fixed_gaps: Vec<KnownFuzzGap>,
+}
+
+impl FuzzVerdict {
+    pub fn render_text(&self) -> String {
+        let mut lines = vec![format!(
+            "QDF 棘轮：{}（基线缺口 {}，当前仍失败 {}，新增 {}，已修复 {}）。",
+            if self.passed { "通过" } else { "未通过" },
+            self.baseline_gaps,
+            self.known_failures,
+            self.new_failures.len(),
+            self.fixed_gaps.len()
+        )];
+        for failure in self.new_failures.iter().take(8) {
+            lines.push(format!(
+                "  ✗ 新缺陷 {} / {}：{}（{}）",
+                failure.mutation, failure.question, failure.contract, failure.detail
+            ));
+        }
+        for gap in self.fixed_gaps.iter().take(8) {
+            lines.push(format!(
+                "  ✓ 已修复 {} / {}：{}",
+                gap.mutation, gap.question, gap.contract
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// 对比 known-gap 基线：只对新增失败判红；已修复项作为改进报告。
+pub fn compare_baseline(baseline: &FuzzBaseline, report: &FuzzReport) -> FuzzVerdict {
+    let known: BTreeSet<(String, String, String)> = baseline
+        .gaps
+        .iter()
+        .map(KnownFuzzGap::signature)
+        .collect();
+    let current = report.minimal_failures();
+    let current_keys: BTreeSet<(String, String, String)> =
+        current.iter().map(FuzzFailure::signature).collect();
+    let new_failures: Vec<FuzzFailure> = current
+        .iter()
+        .filter(|failure| !known.contains(&failure.signature()))
+        .cloned()
+        .collect();
+    let known_failures = current
+        .iter()
+        .filter(|failure| known.contains(&failure.signature()))
+        .count();
+    let fixed_gaps: Vec<KnownFuzzGap> = baseline
+        .gaps
+        .iter()
+        .filter(|gap| !current_keys.contains(&gap.signature()))
+        .cloned()
+        .collect();
+    FuzzVerdict {
+        passed: new_failures.is_empty(),
+        baseline_gaps: baseline.gaps.len(),
+        known_failures,
+        new_failures,
+        fixed_gaps,
     }
 }
 
@@ -384,6 +579,12 @@ fn mutate(mutation: QualityMutation) -> World {
                 )
             });
         }
+        QualityMutation::RemoveEntity => {
+            facts.retain(|fact| match fact {
+                PrologFact::Entity { name, .. } => name != "王五",
+                PrologFact::Relation { from, to, .. } => from != "王五" && to != "王五",
+            });
+        }
     }
     World {
         facts,
@@ -576,6 +777,15 @@ fn check_quality_delta(
             }
             Ok(())
         }
+        QualityMutation::RemoveEntity => {
+            if after.passport_for("王五").is_some() {
+                return Err("删除实体后护照仍存在（依赖已删事实）".to_string());
+            }
+            if after.summary.clarify_candidates.contains(&"王五".to_string()) {
+                return Err("删除实体后仍被列为类型澄清候选".to_string());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -595,6 +805,17 @@ fn check_speech(
     class: QuestionClass,
     reply: Option<&DialogueReply>,
 ) -> Result<(), String> {
+    // 整实体被删除后，身份问句必须让位（或至少绝不复读旧身份）。
+    if mutation == QualityMutation::RemoveEntity && !class.is_attribute() {
+        return match reply {
+            None => Ok(()),
+            Some(reply) if reply.text.contains("王五") => Err(format!(
+                "已删除实体仍被当成已知身份回答：{}",
+                reply.text
+            )),
+            Some(_) => Ok(()),
+        };
+    }
     let Some(reply) = reply else {
         return Err("已知实体的问题未被对话管理器接管（返回 None）".to_string());
     };
@@ -602,7 +823,7 @@ fn check_speech(
     let plans = &reply.plan;
     let attribute_question = class.is_attribute();
     match mutation {
-        QualityMutation::Baseline => {
+        QualityMutation::Baseline | QualityMutation::RemoveEntity => {
             if attribute_question {
                 if !text.contains("李四") {
                     return Err(format!("保义问法丢失答案：{}", text));
@@ -736,7 +957,7 @@ fn run_case(
 
 /// 运行离线 QDF。无 I/O、无网络；同 seed 逐字节可复现。
 pub fn run(config: &FuzzConfig) -> FuzzReport {
-    const MUTATIONS: [QualityMutation; 7] = [
+    const MUTATIONS: [QualityMutation; 8] = [
         QualityMutation::Baseline,
         QualityMutation::RemoveRequired,
         QualityMutation::AddConflict,
@@ -744,14 +965,16 @@ pub fn run(config: &FuzzConfig) -> FuzzReport {
         QualityMutation::RemoveType,
         QualityMutation::AddDisjointType,
         QualityMutation::RemoveEdge,
+        QualityMutation::RemoveEntity,
     ];
-    const QUESTIONS: [QuestionClass; 7] = [
+    const QUESTIONS: [QuestionClass; 8] = [
         QuestionClass::Direct,
         QuestionClass::Punctuation,
         QuestionClass::Synonym,
         QuestionClass::Typo,
         QuestionClass::Pronoun,
         QuestionClass::Ellipsis,
+        QuestionClass::Particle,
         QuestionClass::Identity,
     ];
     let cells = MUTATIONS.len() * QUESTIONS.len();
@@ -848,10 +1071,10 @@ mod tests {
     #[test]
     fn full_grid_covers_every_mutation_and_question() {
         let report = run(&FuzzConfig {
-            cases: 49,
+            cases: 64,
             seed: 7,
         });
-        assert_eq!(report.coverage.len(), 49);
+        assert_eq!(report.coverage.len(), 64);
         assert!(report.coverage.iter().all(|cell| cell.cases >= 1));
         assert_eq!(report.failed, 0, "{:?}", report.failures);
     }
@@ -866,12 +1089,161 @@ mod tests {
             QualityMutation::RemoveType,
             QualityMutation::AddDisjointType,
             QualityMutation::RemoveEdge,
+            QualityMutation::RemoveEntity,
         ] {
             let world = mutate(mutation);
             let report = report_for(&world);
             check_quality_delta(mutation, &baseline, &report)
                 .unwrap_or_else(|error| panic!("{}：{}", mutation.label(), error));
         }
+    }
+
+    #[test]
+    fn minimal_failures_dedupe_repeated_cases() {
+        let failure = |case: usize| FuzzFailure {
+            case,
+            mutation: "remove_edge".to_string(),
+            question: "direct".to_string(),
+            input: "张三的师傅是谁".to_string(),
+            contract: "speech_contract".to_string(),
+            detail: "已删除事实仍被复读".to_string(),
+        };
+        let report = FuzzReport {
+            seed: 1,
+            cases: 3,
+            passed: 0,
+            failed: 3,
+            coverage: Vec::new(),
+            failures: vec![failure(2), failure(0), failure(1)],
+            digest: "d".to_string(),
+        };
+        let minimal = report.minimal_failures();
+        assert_eq!(minimal.len(), 1);
+        assert_eq!(minimal[0].case, 2, "保留最早出现的复现");
+    }
+
+    #[test]
+    fn known_gap_baseline_reports_new_and_fixed() {
+        let failure = |mutation: &str, contract: &str| FuzzFailure {
+            case: 1,
+            mutation: mutation.to_string(),
+            question: "direct".to_string(),
+            input: "张三的师傅是谁".to_string(),
+            contract: contract.to_string(),
+            detail: "detail".to_string(),
+        };
+        let known = failure("remove_edge", "speech_contract");
+        let baseline_report = FuzzReport {
+            seed: 1,
+            cases: 1,
+            passed: 0,
+            failed: 1,
+            coverage: Vec::new(),
+            failures: vec![known.clone()],
+            digest: "a".to_string(),
+        };
+        let baseline = FuzzBaseline::from_report(&baseline_report);
+        assert_eq!(baseline.gaps.len(), 1);
+
+        let same = FuzzReport {
+            seed: 9,
+            cases: 2,
+            passed: 1,
+            failed: 1,
+            coverage: Vec::new(),
+            failures: vec![known.clone()],
+            digest: "b".to_string(),
+        };
+        let verdict = compare_baseline(&baseline, &same);
+        assert!(verdict.passed, "已知缺口不应判红");
+        assert_eq!(verdict.known_failures, 1);
+        assert!(verdict.new_failures.is_empty());
+        assert!(verdict.fixed_gaps.is_empty());
+
+        let regressed = FuzzReport {
+            seed: 1,
+            cases: 2,
+            passed: 0,
+            failed: 2,
+            coverage: Vec::new(),
+            failures: vec![
+                known.clone(),
+                failure("remove_source", "speech_contract"),
+            ],
+            digest: "c".to_string(),
+        };
+        let verdict = compare_baseline(&baseline, &regressed);
+        assert!(!verdict.passed);
+        assert_eq!(verdict.new_failures.len(), 1);
+        assert_eq!(verdict.fixed_gaps.len(), 0);
+
+        let fixed = FuzzReport {
+            seed: 1,
+            cases: 1,
+            passed: 1,
+            failed: 0,
+            coverage: Vec::new(),
+            failures: Vec::new(),
+            digest: "d".to_string(),
+        };
+        let verdict = compare_baseline(&baseline, &fixed);
+        assert!(verdict.passed);
+        assert_eq!(verdict.fixed_gaps.len(), 1);
+    }
+
+    #[test]
+    fn baseline_roundtrips_and_rejects_future_versions() {
+        let report = FuzzReport {
+            seed: 3,
+            cases: 1,
+            passed: 0,
+            failed: 1,
+            coverage: Vec::new(),
+            failures: vec![FuzzFailure {
+                case: 0,
+                mutation: "remove_edge".to_string(),
+                question: "direct".to_string(),
+                input: "张三的师傅是谁".to_string(),
+                contract: "speech_contract".to_string(),
+                detail: "detail".to_string(),
+            }],
+            digest: "e".to_string(),
+        };
+        let baseline = FuzzBaseline::from_report(&report);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fuzz_baseline.json");
+        baseline.save(&path).unwrap();
+        assert_eq!(FuzzBaseline::load(&path).unwrap(), baseline);
+
+        let mut future = baseline.clone();
+        future.version = FUZZ_BASELINE_VERSION + 1;
+        future.save(&path).unwrap();
+        assert!(FuzzBaseline::load(&path).is_err());
+    }
+
+    #[test]
+    fn review_discloses_new_quality_gap() {
+        let base = mutate(QualityMutation::Baseline);
+        let knowledge = FuzzKnowledge::new(base.clone());
+        let mut manager = DialogueManager::new();
+        manager.set_quality_index(Some(index_for(&base, 1)));
+        ask(&mut manager, &knowledge, "张三的师傅是谁").expect("首轮应回答");
+
+        let gap_world = mutate(QualityMutation::RemoveRequired);
+        let current = FuzzKnowledge::new(gap_world);
+        manager.set_quality_index(Some(index_for(&current.world, 2)));
+        let review = ask(&mut manager, &current, "你确定吗").expect("复核应被接管");
+        assert!(
+            review.plan.iter().any(|plan| plan == "review_gap"),
+            "{:?}",
+            review.plan
+        );
+        assert!(
+            review.text.contains("缺少必备属性「name」"),
+            "复核必须披露新增缺口：{}",
+            review.text
+        );
+        assert!(review.text.contains("李四"), "{}", review.text);
     }
 
     #[test]

@@ -49,7 +49,9 @@ use know_prolog::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
         render_entity_passport, QualityBaseline, QualityIndex,
     },
-    dialogue_fuzz::{self, FuzzConfig},
+    dialogue_fuzz::{
+        self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
+    },
     prompt_spec::{self, LintSeverity, PromptMode},
     config_contract,
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
@@ -201,7 +203,8 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Run deterministic quality-delta dialogue fuzzing offline (no store I/O)
+    /// Run deterministic quality-delta dialogue fuzzing offline (no store I/O),
+    /// with an optional known-gap baseline regression ratchet
     FuzzDialogue {
         /// Number of generated cases
         #[arg(long, default_value_t = 96)]
@@ -209,6 +212,15 @@ enum Commands {
         /// Deterministic PRNG seed (same seed → byte-identical report)
         #[arg(long, default_value_t = 20261019)]
         seed: u64,
+        /// Known-gap baseline JSON path (new failure signatures fail the run)
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write the current failures as the known-gap baseline
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -267,8 +279,23 @@ async fn main() {
     }
 
     // 质量差分模糊测试完全离线：不依赖 config.toml / 存储，先于任何 I/O 处理。
-    if let Some(Commands::FuzzDialogue { cases, seed, json }) = &cli.command {
-        run_fuzz_dialogue(*cases, *seed, *json);
+    if let Some(Commands::FuzzDialogue {
+        cases,
+        seed,
+        baseline,
+        update_baseline,
+        allow_regression,
+        json,
+    }) = &cli.command
+    {
+        run_fuzz_dialogue(
+            *cases,
+            *seed,
+            *json,
+            baseline.as_deref(),
+            *update_baseline,
+            *allow_regression,
+        );
         return;
     }
 
@@ -328,8 +355,22 @@ async fn main() {
             );
             return;
         }
-        Some(Commands::FuzzDialogue { cases, seed, json }) => {
-            run_fuzz_dialogue(*cases, *seed, *json);
+        Some(Commands::FuzzDialogue {
+            cases,
+            seed,
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            run_fuzz_dialogue(
+                *cases,
+                *seed,
+                *json,
+                baseline.as_deref(),
+                *update_baseline,
+                *allow_regression,
+            );
             return;
         }
         _ => {}
@@ -615,6 +656,25 @@ async fn main() {
             } else {
                 create_default_synonyms()
             };
+            // 质量护照索引：与交互模式同一确定性构建路径，供每个会话的
+            // 「带出处 / 披露冲突 / 追问缺口」话语行为使用（只读派生，不写图谱）。
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_entities(&config.entity_profiles);
+            oxigraph_manager.configure_type_system(&config.type_system);
+            let registry = oxigraph_manager.predicate_registry_snapshot();
+            let quality_report = build_quality_report(
+                &facts,
+                &registry,
+                &oxigraph_manager.type_system_snapshot(),
+                &config.entity_types,
+            );
+            let quality_index =
+                QualityIndex::from_report(&quality_report, &facts, &registry);
             println!(
                 "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个驻留会话{}，提示模式 {}，失败恢复 {}）",
                 addr,
@@ -635,6 +695,9 @@ async fn main() {
                 max_sessions,
                 startup_ledger.clone(),
             );
+            let quality_index =
+                quality_index.with_revision(api_state.warm_revision());
+            api_state.set_quality_index(Some(Arc::new(quality_index)));
             if let Some(dir) = session_dir {
                 api_state.set_session_dir(dir);
             }
@@ -975,17 +1038,74 @@ fn run_prompt_lint(json: bool) {
 }
 
 /// `fuzz-dialogue`：确定性质量差分模糊测试（无配置、无存储、无网络）。
-fn run_fuzz_dialogue(cases: usize, seed: u64, json: bool) {
+fn run_fuzz_dialogue(
+    cases: usize,
+    seed: u64,
+    json: bool,
+    baseline: Option<&str>,
+    update_baseline: bool,
+    allow_regression: bool,
+) {
     let report = dialogue_fuzz::run(&FuzzConfig { cases, seed });
+    let baseline_path = baseline
+        .map(str::to_string)
+        .unwrap_or_else(|| "dialogue_fuzz_baseline.json".to_string());
+    let mut verdict: Option<FuzzVerdict> = None;
+
+    if update_baseline {
+        let new_baseline = FuzzBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => {
+                if !json {
+                    println!(
+                        "known-gap 基线已写入 {}（{} 条已知缺口）。",
+                        baseline_path,
+                        new_baseline.gaps.len()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("基线写入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match FuzzBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                verdict = Some(compare_fuzz_baseline(&old_baseline, &report));
+            }
+            Err(e) => {
+                eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
+        let value = match &verdict {
+            Some(verdict) => serde_json::json!({
+                "report": &report,
+                "verdict": verdict,
+            }),
+            None => serde_json::to_value(&report).unwrap_or_default(),
+        };
+        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
     } else {
         println!("{}", report.render_text());
+        if let Some(verdict) = &verdict {
+            println!("{}", verdict.render_text());
+        }
     }
-    if report.failed > 0 {
+
+    let regressed = if update_baseline {
+        false
+    } else {
+        verdict
+            .as_ref()
+            .map(|verdict| !verdict.passed)
+            .unwrap_or(report.failed > 0)
+    };
+    if regressed && !allow_regression {
         std::process::exit(1);
     }
 }

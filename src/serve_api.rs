@@ -70,6 +70,7 @@ use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
+use crate::quality::QualityIndex;
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::ReasoningConfig;
@@ -776,6 +777,7 @@ fn build_session(
     perf: &Arc<PerfLedger>,
     prompt_mode: PromptMode,
     recovery_mode: RecoveryMode,
+    quality: Option<Arc<QualityIndex>>,
     restore: Option<SessionRestore>,
 ) -> Session {
     let reasoner = warm.fork();
@@ -783,6 +785,8 @@ fn build_session(
     let mut manager = DialogueManager::new();
     manager.set_prompt_mode(prompt_mode);
     manager.set_recovery_mode(recovery_mode);
+    // 质量担保是只读派生数据：多会话共享同一份索引，不写图谱、不进快照。
+    manager.set_quality_index_shared(quality);
     let mut session = Session {
         id,
         turns: 0,
@@ -811,6 +815,8 @@ pub struct ApiState {
     stateless_answers: Arc<parking_lot::Mutex<RevisionLru<TurnResponse, CacheEpoch>>>,
     /// 预热基座构建时的知识版本（缓存纪元的一部分）。
     kb_revision: u64,
+    /// 质量护照索引（由宿主注入；只读派生数据，供会话生成出处/冲突/缺口话语）。
+    quality: Option<Arc<QualityIndex>>,
     /// 身份准入纪元：新实体/别名准入时 +1，全部缓存条目整体失效（可审计）。
     identity_epoch: AtomicU64,
     perf: Arc<PerfLedger>,
@@ -859,6 +865,7 @@ impl ApiState {
                 STATELESS_CACHE_CAPACITY,
             ))),
             kb_revision,
+            quality: None,
             identity_epoch: AtomicU64::new(0),
             perf,
             startup,
@@ -951,6 +958,18 @@ impl ApiState {
         self.recovery_mode
     }
 
+    /// 注入质量护照索引（在 `Arc::new` 之前调用）。
+    ///
+    /// 索引只影响「怎么说」（出处/冲突披露/缺口追问），不改变真值与存储；
+    /// 会话分叉时共享同一份 `Arc`，不复制整张查询表。
+    pub fn set_quality_index(&mut self, index: Option<Arc<QualityIndex>>) {
+        self.quality = index;
+    }
+
+    pub fn quality_index(&self) -> Option<&QualityIndex> {
+        self.quality.as_deref()
+    }
+
     /// 当前引擎指纹（知识库指纹 + 运行模式）。
     pub fn engine_stamp(&self) -> EngineStamp {
         EngineStamp {
@@ -974,6 +993,7 @@ impl ApiState {
         let startup = Arc::clone(&self.startup);
         let prompt_mode = self.prompt_mode;
         let recovery_mode = self.recovery_mode;
+        let quality = self.quality.clone();
         let engine = Arc::new(self.engine_stamp());
         let thread_name = format!("kp-session-{}", id);
         std::thread::Builder::new()
@@ -983,7 +1003,15 @@ impl ApiState {
                 // 绝不能覆盖整个 actor 生命周期（那会拖到线程退出才记账）
                 let mut session = {
                     let _span = startup.span("session_fork");
-                    build_session(id, &warm, &perf, prompt_mode, recovery_mode, restore)
+                    build_session(
+                        id,
+                        &warm,
+                        &perf,
+                        prompt_mode,
+                        recovery_mode,
+                        quality,
+                        restore,
+                    )
                 };
                 while let Some(command) = rx.blocking_recv() {
                     match command {
@@ -1489,6 +1517,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 "version": env!("CARGO_PKG_VERSION"),
                 "sessions": state.session_count().await,
                 "turns": state.turns_total.load(Ordering::Relaxed),
+                "quality": state.quality_index().is_some(),
             }),
         ),
         ("GET", ["metrics"]) => Response::json(
@@ -1496,6 +1525,11 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             &serde_json::json!({
                 "sessions": state.session_count().await,
                 "turns_total": state.turns_total.load(Ordering::Relaxed),
+                "quality": state.quality_index().map(|index| serde_json::json!({
+                    "entities": index.len(),
+                    "revision": index.revision,
+                    "digest": index.digest,
+                })),
                 "max_sessions": state.max_sessions,
                 "session_dir": state.session_dir.as_ref().map(|dir| dir.display().to_string()),
                 "cold_sessions": state.cold_session_count(),
@@ -2246,6 +2280,71 @@ mod tests {
             max_sessions,
             StartupLedger::shared(),
         ))
+    }
+
+    fn test_state_with_quality() -> Arc<ApiState> {
+        use crate::predicate_registry::PredicateRegistry;
+        use crate::quality::{build_report, QualityIndex};
+        use crate::type_system::TypeSystem;
+
+        let mut yao = HashMap::new();
+        yao.insert("身高".to_string(), "226".to_string());
+        let mut ye = HashMap::new();
+        ye.insert("身高".to_string(), "190".to_string());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "人物".to_string(),
+                properties: yao,
+            },
+            PrologFact::Entity {
+                name: "叶莉".to_string(),
+                entity_type: "人物".to_string(),
+                properties: ye,
+            },
+        ];
+        let mut registry = PredicateRegistry::new();
+        registry.observe("姚明", "身高", "226", Some("体育百科"));
+        let report = build_report(&facts, &registry, &TypeSystem::new(), &[]);
+        let index = QualityIndex::from_report(&report, &facts, &registry);
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: false,
+            ..ReasoningConfig::default()
+        };
+        let mut state = ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        );
+        let index = index.with_revision(state.warm_revision());
+        state.set_quality_index(Some(Arc::new(index)));
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn quality_index_reaches_http_sessions() {
+        let state = test_state_with_quality();
+        assert!(state.quality_index().is_some());
+        let session_id = state.create_session().await.expect("会话应创建成功");
+        let turn = state
+            .take_turn(&session_id, "姚明的身高是多少")
+            .await
+            .expect("轮次应成功");
+        assert!(turn.reply.contains("226"), "{}", turn.reply);
+        assert!(
+            turn.plan.iter().any(|plan| plan == "quality_cite_source"),
+            "HTTP 回答必须带出处：{:?} / {}",
+            turn.plan,
+            turn.reply
+        );
+        assert!(turn.reply.contains("出处：体育百科"), "{}", turn.reply);
+        assert_eq!(
+            state.quality_index().map(|index| index.revision),
+            Some(state.warm_revision())
+        );
     }
 
     /// 构造最小合法信封（`insert_order` 只改变焦点类型表的插入序，

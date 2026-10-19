@@ -15,6 +15,8 @@
 //! `DialogueKnowledge` 接口向推理器要「答案 / 实体 / 实体属性表」。
 
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::BindingSet;
@@ -430,7 +432,8 @@ pub struct DialogueManager {
     /// 最近一次恢复动作（运行时视图，不进快照）。
     last_recovery: Option<RecoveryNotice>,
     /// 质量护照索引（只读派生数据；由宿主按知识版本注入，不进快照）。
-    quality: Option<QualityIndex>,
+    /// 用 `Arc` 共享：多会话（HTTP actor）注入同一份索引时不复制整张查询表。
+    quality: Option<Arc<QualityIndex>>,
 }
 
 impl Default for DialogueManager {
@@ -506,12 +509,18 @@ impl DialogueManager {
     /// 注入质量索引（只读；`None` 时完全走常规回答路径）。
     /// 宿主应在知识版本推进后重建索引，使「带出处/披露冲突/追问缺口」生效。
     pub fn set_quality_index(&mut self, index: Option<QualityIndex>) -> &mut Self {
+        self.quality = index.map(Arc::new);
+        self
+    }
+
+    /// 注入共享质量索引（供多会话服务复用同一份只读派生数据）。
+    pub fn set_quality_index_shared(&mut self, index: Option<Arc<QualityIndex>>) -> &mut Self {
         self.quality = index;
         self
     }
 
     pub fn quality_index(&self) -> Option<&QualityIndex> {
-        self.quality.as_ref()
+        self.quality.as_deref()
     }
 
     /// 当前索引对应的知识版本（未注入时为 None）。
@@ -1453,6 +1462,58 @@ impl DialogueManager {
                     "review_conflict",
                 );
             }
+            // 缺口变化也是知识变化：删掉必备属性/类型后，旧答案可能仍为真，
+            // 但「当时完整、现在有缺口」必须可见，不能只说「版本推进了」。
+            let conflict_gap = |gap: &&String| gap.starts_with("存在未裁决冲突");
+            let new_gaps: Vec<&String> = new
+                .gaps
+                .iter()
+                .filter(|gap| !old.gaps.contains(gap) && !conflict_gap(gap))
+                .collect();
+            let resolved_gaps: Vec<&String> = old
+                .gaps
+                .iter()
+                .filter(|gap| !new.gaps.contains(gap) && !conflict_gap(gap))
+                .collect();
+            if !new_gaps.is_empty() || !resolved_gaps.is_empty() {
+                let mut changes = Vec::new();
+                if !new_gaps.is_empty() {
+                    changes.push(format!(
+                        "新增缺口「{}」",
+                        new_gaps
+                            .iter()
+                            .take(2)
+                            .map(|gap| gap.as_str())
+                            .collect::<Vec<_>>()
+                            .join("」「")
+                    ));
+                }
+                if !resolved_gaps.is_empty() {
+                    changes.push(format!(
+                        "已补齐「{}」",
+                        resolved_gaps
+                            .iter()
+                            .take(2)
+                            .map(|gap| gap.as_str())
+                            .collect::<Vec<_>>()
+                            .join("」「")
+                    ));
+                }
+                let still = if old.known_values.is_empty() {
+                    "原有回答仍成立".to_string()
+                } else {
+                    format!("仍为「{}」", old.known_values.join("、"))
+                };
+                return (
+                    format!(
+                        "复核结果：{}{}，但知识质量有变化：{}。事实本身不变，缺口可用于下一次补全。",
+                        subject,
+                        still,
+                        changes.join("；")
+                    ),
+                    "review_gap",
+                );
+            }
             if current_revision != Some(old.revision) {
                 return (
                     format!(
@@ -2031,12 +2092,30 @@ fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
     let index = text.find('的')?;
     let head = text[..index].trim();
     let mut tail = text[index + '的'.len_utf8()..].trim();
-    for suffix in [
-        "是什么", "是多少", "是谁", "是哪个", "是哪里", "怎么样", "多少", "呢", "吗",
-    ] {
-        if let Some(stripped) = tail.strip_suffix(suffix) {
-            tail = stripped.trim();
+    // 连续剥离（「…到底是多少呢」需要先剥「呢」再剥「是多少」）。
+    for _ in 0..3 {
+        let mut stripped_once = false;
+        for suffix in [
+            "是什么", "是多少", "是谁", "是哪个", "是哪里", "怎么样", "多少", "呢", "吗",
+        ] {
+            if let Some(stripped) = tail.strip_suffix(suffix) {
+                tail = stripped.trim();
+                stripped_once = true;
+                break;
+            }
+        }
+        if !stripped_once {
             break;
+        }
+    }
+    // 语气/强调填充词不承载属性：先把「到底是谁」剥成「到底」，再归一成属性。
+    for filler in ["到底", "究竟", "来着", "呀", "啊", "嘛"] {
+        if let Some(stripped) = tail.strip_suffix(filler) {
+            let stripped = stripped.trim();
+            if !stripped.is_empty() {
+                tail = stripped;
+                break;
+            }
         }
     }
     if tail.is_empty() || tail.contains('是') || tail.chars().count() > 16 {
@@ -2166,6 +2245,27 @@ mod tests {
         assert_eq!(frame.kind, MoveKind::AskAttribute);
         assert_eq!(frame.entity.as_deref(), Some("姚明"));
         assert_eq!(frame.attribute.as_deref(), Some("身高"));
+    }
+
+    #[test]
+    fn test_analyze_attribute_question_ignores_emphasis_fillers() {
+        let knowledge = mock();
+        let manager = DialogueManager::new();
+        for input in [
+            "姚明的身高到底是多少？",
+            "姚明的身高究竟是多少呢？",
+        ] {
+            let frame = manager.analyze(input, &knowledge);
+            assert_eq!(frame.kind, MoveKind::AskAttribute, "{}", input);
+            assert_eq!(frame.entity.as_deref(), Some("姚明"), "{}", input);
+            assert_eq!(frame.attribute.as_deref(), Some("身高"), "{}", input);
+        }
+
+        let mut manager = DialogueManager::new();
+        let reply = manager
+            .plan_reply("姚明的身高到底是多少呢？", &knowledge)
+            .expect("填充词不应阻断属性问句");
+        assert!(reply.text.contains("226"), "{}", reply.text);
     }
 
     #[test]

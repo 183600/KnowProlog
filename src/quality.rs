@@ -305,11 +305,17 @@ impl QualityIndex {
                 .collect(),
             None => passport.conflicts.clone(),
         };
-        let source_tags = canonical_attribute
-            .as_ref()
-            .and_then(|attribute| self.predicate_sources.get(entity)?.get(attribute))
-            .cloned()
-            .unwrap_or_else(|| passport.source_tags.clone());
+        // 来源必须按断言（谓词）取，不能回退到实体级并集：
+        // 「另一个属性有出处」不能给本属性背书。身份问句（无属性）才用实体并集。
+        let source_tags = match canonical_attribute.as_ref() {
+            Some(attribute) => self
+                .predicate_sources
+                .get(entity)
+                .and_then(|sources| sources.get(attribute))
+                .cloned()
+                .unwrap_or_default(),
+            None => passport.source_tags.clone(),
+        };
         Some(ClaimWarrant {
             entity: entity.to_string(),
             attribute: canonical_attribute,
@@ -1158,6 +1164,38 @@ mod tests {
 
         assert_eq!(index.warrant_for("不存在", Some("师傅")), None);
         assert_eq!(index.warrant_for("张三", Some("未知属性")).unwrap().known_values, Vec::<String>::new());
+    }
+
+    #[test]
+    fn warrant_source_is_per_predicate_not_entity_union() {
+        let mut registry = registry_with_master();
+        registry.observe("张三", "师傅", "李四", Some("知识图谱"));
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三"), ("age", "30")]),
+            relation("张三", "师傅", "李四"),
+        ];
+        let report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let index = QualityIndex::from_report(&report, &facts, &registry);
+
+        let sourced = index.warrant_for("张三", Some("师傅")).unwrap();
+        assert!(sourced.has_source());
+        assert!(
+            sourced.source_tags.iter().any(|tag| tag == "知识图谱"),
+            "{:?}",
+            sourced.source_tags
+        );
+
+        let unsourced = index.warrant_for("张三", Some("age")).unwrap();
+        assert!(
+            !unsourced.has_source(),
+            "age 没有来源，不能借用师傅的来源：{:?}",
+            unsourced.source_tags
+        );
+        assert!(unsourced.citation_note().contains("未登记来源"));
+
+        // 身份问句问的是整个实体，可以用实体级来源并集。
+        let identity = index.warrant_for("张三", None).unwrap();
+        assert!(identity.has_source());
     }
 
     #[test]
