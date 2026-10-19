@@ -49,7 +49,8 @@ use know_prolog::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
         render_entity_passport, QualityBaseline, QualityIndex,
     },
-    shape_gate::{ShapeReport, ShapeSet},
+    shape_gate::{RepairAction, ShapeReport, ShapeSet},
+    relation_acquisition::{GoalOpen, RelationAcquisition},
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
@@ -1367,6 +1368,32 @@ async fn shape_report_for(
     Ok((shapes, report))
 }
 
+/// 关系获取的只读上下文：图快照 + 谓词画像 + 类型体系 + 形状集。
+async fn acquisition_context(
+    oxigraph_manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+) -> Result<
+    (
+        Arc<Vec<PrologFact>>,
+        know_prolog::predicate_registry::PredicateRegistry,
+        know_prolog::type_system::TypeSystem,
+        ShapeSet,
+    ),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let facts = load_graph_snapshot(oxigraph_manager).await?;
+    let registry = oxigraph_manager.predicate_registry_snapshot();
+    let types = oxigraph_manager.type_system_snapshot();
+    let shapes = ShapeSet::from_schema(&config.entity_types, &registry, &types);
+    Ok((facts, registry, types, shapes))
+}
+
+fn persist_acquisition(acquisition: &RelationAcquisition, path: &str) {
+    if let Err(error) = acquisition.save_to_path(path) {
+        eprintln!("关系获取账本保存失败：{}", error);
+    }
+}
+
 /// 把质量护照注入对话管理器；仅在知识版本推进时重建（离线派生，不写图谱）。
 async fn refresh_dialogue_quality(
     dialogue_manager: &mut DialogueManager,
@@ -1644,6 +1671,18 @@ async fn run_interactive_mode(
         }
     }
 
+    // 问答式关系获取（QRA）：会话账本 + 覆盖层 + 对话诱导模式。
+    // 只读图谱与画像，确认后才进入覆盖层；采纳后才进入会话事实集。
+    let acquisition_path = format!("{}/acquisition_ledger.json", store_path);
+    let mut acquisition = RelationAcquisition::load_from_path(&acquisition_path).unwrap_or_default();
+    if acquisition.turn_count() > 0 {
+        println!(
+            "已恢复关系获取账本：{} 条，诱导模式 {} 个。",
+            acquisition.claims().count(),
+            acquisition.patterns().count()
+        );
+    }
+
     // 对话编年史：追加式哈希链档案，是对话的真相源；快照只是检查点。
     // 每轮输入在任何处理之前先落盘（写前日志），崩溃最多丢进行中的一轮；
     // 坏行只废尾巴不废全档：可信前缀保留、原子重写截断后续写。
@@ -1780,6 +1819,217 @@ async fn run_interactive_mode(
                     dialogue_manager.turn_count(),
                 );
             }
+        }
+
+        // 关系获取：把「答不出」编译成带期望的槽位问题（以问代抽）。
+        if let Some(raw) = strip_any_prefix(
+            input,
+            &[
+                "关系获取：",
+                "关系获取:",
+                "问答获取：",
+                "问答获取:",
+                "获取关系：",
+                "获取关系:",
+            ],
+        ) {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                println!("用法：关系获取：<实体> 的 <谓词>，例如「关系获取：姚明的女儿是谁」。");
+            } else {
+                match acquisition_context(&oxigraph_manager, &config).await {
+                    Ok((facts, registry, types, shapes)) => {
+                        let opening =
+                            acquisition.start_command(raw, &facts, &registry, &types, &shapes);
+                        println!("{}", opening.render_text());
+                        persist_acquisition(&acquisition, &acquisition_path);
+                    }
+                    Err(error) => eprintln!("加载关系获取上下文失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 形状缺口 → 下一个问题：把节点的必备属性缺口编译成槽位追问。
+        if matches!(input, "获取缺口" | "关系缺口" | "追问缺口" | "缺口追问") {
+            match acquisition_context(&oxigraph_manager, &config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    let report = shapes.validate(&facts, &registry, &types);
+                    let mut opened = None;
+                    for violation in &report.violations {
+                        if let RepairAction::AskProperty { entity, property } = &violation.repair {
+                            let candidate = acquisition.start_shape_gap(
+                                entity, property, &facts, &registry, &types, &shapes,
+                            );
+                            if matches!(&candidate, GoalOpen::Opened { .. }) {
+                                opened = Some(candidate);
+                                break;
+                            }
+                        }
+                    }
+                    match opened {
+                        Some(opening) => {
+                            println!("{}", opening.render_text());
+                            persist_acquisition(&acquisition, &acquisition_path);
+                        }
+                        None => println!("形状校验没有可追问的必备属性缺口（或缺口值已在覆盖层）。"),
+                    }
+                }
+                Err(error) => eprintln!("加载形状缺口失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 关系获取台账：候选 / 已确认 / 冲突 / 否证 + 覆盖层 + 模式库
+        // 关系获取台账：候选 / 已确认 / 冲突 / 否证 + 覆盖层 + 模式库
+        if matches!(
+            input,
+            "获取台账" | "获取报告" | "关系获取报告" | "问答获取报告" | "获取状态"
+        ) {
+            println!("{}", acquisition.report());
+            println!();
+            continue;
+        }
+
+        if matches!(input, "获取模式" | "关系获取模式" | "诱导模式" | "模式库") {
+            println!("{}", acquisition.patterns_report());
+            println!();
+            continue;
+        }
+
+        if matches!(input, "获取覆盖" | "会话覆盖层" | "覆盖层") {
+            println!("{}", acquisition.overlay().render_text());
+            println!();
+            continue;
+        }
+
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["确认获取", "确认关系获取", "确认问答获取"],
+        ) {
+            let id = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            let outcome = acquisition.confirm(if id.is_empty() { None } else { Some(id) });
+            println!("{}", outcome.message);
+            if let Some(follow_up) = outcome.follow_up {
+                println!("{}", follow_up);
+            }
+            persist_acquisition(&acquisition, &acquisition_path);
+            println!();
+            continue;
+        }
+
+        if let Some(rest) = strip_any_prefix(input, &["否认获取", "否认关系获取", "拒绝获取"]) {
+            let id = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            let outcome = acquisition.deny(if id.is_empty() { None } else { Some(id) });
+            println!("{}", outcome.message);
+            persist_acquisition(&acquisition, &acquisition_path);
+            println!();
+            continue;
+        }
+
+        if let Some(rest) = strip_any_prefix(input, &["撤回获取", "撤销获取", "撤回关系获取"]) {
+            let id = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            let outcome = acquisition.retract(if id.is_empty() { None } else { Some(id) });
+            println!("{}", outcome.message);
+            persist_acquisition(&acquisition, &acquisition_path);
+            println!();
+            continue;
+        }
+
+        // 采纳：Confirmed/Admitted 的条目进入会话事实集（仍不写知识图谱）。
+        if let Some(rest) = strip_any_prefix(input, &["采纳获取", "采纳关系获取", "提交获取"]) {
+            let id = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            match acquisition.commit_proposal(if id.is_empty() { None } else { Some(id) }) {
+                Some(proposal) => {
+                    let answer = symbolic_reasoner.assert_nl_fact(&proposal.sentence);
+                    println!("{}", answer);
+                    if acquisition.mark_admitted(&proposal.claim_id) {
+                        println!(
+                            "已采纳 {}：{}（会话覆盖层仍可回溯；未写入知识图谱）。",
+                            proposal.claim_id, proposal.sentence
+                        );
+                    }
+                    log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                    persist_acquisition(&acquisition, &acquisition_path);
+                }
+                None => println!(
+                    "没有可采纳的条目；只有「已确认」或「已采纳」的关系才能进入会话事实集。"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 对话诱导模式扫描：只有被两次确认激活的模式才会命中。
+        if let Some(text) = strip_any_prefix(
+            input,
+            &["模式扫描：", "模式扫描:", "模式扫描 "],
+        ) {
+            let text = text.trim();
+            if text.is_empty() {
+                println!("用法：模式扫描：<文本>，例如「模式扫描：王强的女儿是赵敏」。");
+            } else {
+                match acquisition_context(&oxigraph_manager, &config).await {
+                    Ok((facts, registry, types, shapes)) => {
+                        let outcome = acquisition.absorb_pattern_scan(
+                            text, &facts, &registry, &types, &shapes,
+                        );
+                        println!("{}", outcome.message);
+                        persist_acquisition(&acquisition, &acquisition_path);
+                    }
+                    Err(error) => eprintln!("加载模式扫描上下文失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(id) = strip_any_prefix(input, &["退役模式：", "退役模式:", "退役模式 "]) {
+            let id = id.trim();
+            if acquisition.retire_pattern(id) {
+                println!("已退役诱导模式 {}。", id);
+                persist_acquisition(&acquisition, &acquisition_path);
+            } else {
+                println!("没有找到诱导模式 {}。", id);
+            }
+            println!();
+            continue;
+        }
+
+        // 待填槽位的短答：先做对话行为分类，再进形状闸门与账本。
+        // 命令、导入行与新问题不拦截，保持既有管线不变。
+        if acquisition.has_pending_goal()
+            && !is_command_like(input)
+            && RelationAcquisition::looks_like_answer(input)
+            && !matches!(
+                detect_input_mode(input, &config.nlp.import_keywords),
+                InputMode::KnowledgeImport
+            )
+        {
+            match acquisition_context(&oxigraph_manager, &config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    let outcome =
+                        acquisition.interpret_answer(input, &facts, &registry, &types, &shapes);
+                    println!("{}", outcome.message);
+                    if let Some(follow_up) = outcome.follow_up {
+                        println!("{}", follow_up);
+                    }
+                    persist_acquisition(&acquisition, &acquisition_path);
+                }
+                Err(error) => eprintln!("加载关系获取上下文失败：{}", error),
+            }
+            println!();
+            continue;
         }
 
         if input == "对齐报告" || input == "本体对齐" {
@@ -3782,6 +4032,17 @@ async fn run_interactive_mode(
                     println!("（{}）", note);
                 }
 
+                // 会话覆盖层优先：只回答本会话已确认的关系，绝不冒充图谱事实。
+                if let Some(answer) = acquisition.answer_from_overlay(
+                    input,
+                    &oxigraph_manager.predicate_registry_snapshot(),
+                ) {
+                    println!("{}", answer.render_text());
+                    log_chronicle_reply(&mut chronicle, &answer.render_text(), &[], &[]);
+                    println!();
+                    continue;
+                }
+
                 // 本体化对话管理器：实体已知的知识问句给出"结论 + 出处 + 追问建议"式组合回答
                 if dialogue_enabled {
                     refresh_dialogue_quality(
@@ -4282,6 +4543,7 @@ async fn run_interactive_mode(
         Err(e) => eprintln!("保存外链名册失败: {}", e),
     }
 
+    persist_acquisition(&acquisition, &acquisition_path);
     println!("系统已退出。");
 }
 
@@ -4589,6 +4851,9 @@ fn interactive_help() -> String {
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
         "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
+        "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
+        "  获取缺口 / 获取模式 / 模式扫描：…    形状缺口转追问、诱导模式库与文本扫描",
+        "  确认获取 / 采纳获取 / 模式扫描：…    确认、写入会话事实集、用诱导模式扫描新文本",
         "  形状报告 / 形状校验                  必备属性、基数、类型与定义域/值域校验",
         "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
         "  外链台账 / 图账本                     外部知识留册与命名图物化视图",
@@ -4881,6 +5146,37 @@ fn is_command_like(input: &str) -> bool {
         "子图",
         "邻域",
         "覆盖报告",
+        "关系获取",
+        "获取关系",
+        "获取缺口",
+        "关系缺口",
+        "追问缺口",
+        "缺口追问",
+        "问答获取",
+        "获取台账",
+        "获取报告",
+        "关系获取报告",
+        "问答获取报告",
+        "获取状态",
+        "获取模式",
+        "关系获取模式",
+        "诱导模式",
+        "模式库",
+        "获取覆盖",
+        "会话覆盖层",
+        "覆盖层",
+        "确认获取",
+        "确认关系获取",
+        "否认获取",
+        "否认关系获取",
+        "拒绝获取",
+        "撤回获取",
+        "撤销获取",
+        "采纳获取",
+        "采纳关系获取",
+        "提交获取",
+        "模式扫描",
+        "退役模式",
         "形状报告",
         "形状校验",
         "SHACL报告",

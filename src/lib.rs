@@ -81,6 +81,7 @@ pub mod recovery;
 pub mod identity;
 pub mod entity_registry;
 pub mod shape_gate;
+pub mod relation_acquisition;
 
 #[cfg(test)]
 mod dialogue_conformance;
