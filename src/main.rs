@@ -19,6 +19,7 @@ use know_prolog::{
     nlu::NLUEngine,
     prolog_engine::PrologEngine,
     local_semantic_adapter::LocalSemanticAdapter,
+    ownthink_api::select_candidate_by_context,
     external_knowledge::{AnswerOutcome, ExternalKnowledgeService, get_direct_answer},
     external_ledger::{ExternalLedger, LedgerLoad},
     symbolic_reasoner::SymbolicReasoner,
@@ -74,6 +75,12 @@ enum Commands {
     /// Import JSON-LD knowledge base from file
     ImportJsonld {
         /// Path to the JSON-LD file
+        file_path: String,
+    },
+    /// Import an RDF file (Turtle / N-Triples / N-Quads / TriG / RDF/XML;
+    /// format inferred from the extension)
+    ImportRdf {
+        /// Path to the RDF file (.ttl / .nt / .nq / .trig / .rdf / .xml)
         file_path: String,
     },
     /// Import JSON-LD knowledge base from content
@@ -267,6 +274,19 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("JSON-LD 内容导入失败: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::ImportRdf { file_path }) => {
+            println!("正在导入 RDF 文件: {}", file_path);
+            
+            match oxigraph_manager.import_rdf_file(&file_path).await {
+                Ok(added) => {
+                    println!("RDF 文件导入成功：新增 {} 条三元组！", added);
+                }
+                Err(e) => {
+                    eprintln!("RDF 文件导入失败: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -2820,6 +2840,31 @@ async fn run_interactive_mode(
                             eprintln!("JSON-LD 内容导入失败: {}", e);
                         }
                     }
+                } else if input.starts_with("导入rdf文件：") || input.starts_with("导入rdf文件:")
+                    || input.starts_with("import rdf:")
+                {
+                    let file_path = input.replace("导入rdf文件：", "")
+                                        .replace("导入rdf文件:", "")
+                                        .replace("import rdf:", "")
+                                        .trim()
+                                        .to_string();
+                    
+                    if file_path.is_empty() {
+                        println!("请提供 RDF 文件路径（支持 .ttl / .nt / .nq / .trig / .rdf / .xml）");
+                        continue;
+                    }
+                    
+                    println!("正在导入 RDF 文件: {}", file_path);
+                    
+                    match oxigraph_manager.import_rdf_file(&file_path).await {
+                        Ok(added) => {
+                            println!("RDF 文件导入成功：新增 {} 条三元组！", added);
+                            reasoner_stale = true;
+                        }
+                        Err(e) => {
+                            eprintln!("RDF 文件导入失败: {}", e);
+                        }
+                    }
                 } else {
                     // 知识导入逻辑
                     println!("{}", config.messages.importing);
@@ -3166,72 +3211,13 @@ async fn run_interactive_mode(
                     // === 歧义解析 ===
                     if let Some(api_config) = &config.api {
                         if api_config.enable_entity_disambiguation {
-                            println!("正在解析实体歧义...");
-                            let mut resolved_entities = Vec::new();
-                            let mut found_ambiguous = false;
-                            
-                            for entity in &query_entities {
-                                match local_semantic_adapter.get_ambiguous_entities(entity).await {
-                                    Ok(ambiguous_response) => {
-                                        if ambiguous_response.data.len() > 1 {
-                                            found_ambiguous = true;
-                                            println!("发现实体 '{}' 有多种含义:", entity);
-                                            for (i, (entity_name, weight)) in ambiguous_response.data.iter()
-                                                .take(api_config.max_ambiguous_entities).enumerate() {
-                                                println!("  {}. {} (权重: {})", i + 1, entity_name, weight);
-                                            }
-                                            
-                                            // 根据配置决定是否自动选择
-                                            if api_config.auto_select_best_entity {
-                                                if let Some((best_entity, _)) = ambiguous_response.data.first() {
-                                                    println!("自动选择: {}", best_entity);
-                                                    resolved_entities.push(best_entity.clone());
-                                                    
-                                                    // 尝试获取并显示该实体的知识
-                                                    match local_semantic_adapter.get_simplified_knowledge(best_entity).await {
-                                                        Ok(knowledge) => {
-                                                            if let Some(desc) = knowledge.get("description") {
-                                                                if !desc.is_empty() {
-                                                                    println!("  描述: {}", desc);
-                                                                }
-                                                            }
-                                                            if let Some(tags) = knowledge.get("tags") {
-                                                                if !tags.is_empty() {
-                                                                    println!("  标签: {}", tags);
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!("获取实体知识时出错: {}", e);
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                // TODO: 实现用户交互选择逻辑
-                                                if let Some((best_entity, _)) = ambiguous_response.data.first() {
-                                                    resolved_entities.push(best_entity.clone());
-                                                }
-                                            }
-                                        } else if ambiguous_response.data.len() == 1 {
-                                            // 只有一个匹配，直接使用
-                                            if let Some((entity_name, _)) = ambiguous_response.data.first() {
-                                                resolved_entities.push(entity_name.clone());
-                                            }
-                                        } else {
-                                            // 没有找到匹配，使用原始实体名
-                                            resolved_entities.push(entity.clone());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("查询实体 '{}' 的歧义信息时出错: {}", entity, e);
-                                        resolved_entities.push(entity.clone());
-                                    }
-                                }
-                            }
-                            
-                            if found_ambiguous {
-                                println!("─────────────────────────────────");
-                            }
+                            let resolved_entities = resolve_query_entities_with_disambiguation(
+                                input,
+                                &query_entities,
+                                api_config,
+                                &local_semantic_adapter,
+                            )
+                            .await;
                             
                             // 使用解析后的实体进行查询
                             let final_entities = if !resolved_entities.is_empty() {
@@ -4150,6 +4136,134 @@ fn parse_hypothesis_index(text: &str) -> Option<usize> {
     (index > 0).then_some(index)
 }
 
+/// 解析歧义义项选择输入（1 基编号）：返回候选表 0 基下标。
+///
+/// 空输入 / 非数字 / 越界一律返回 `None`（调用方回退权重最高项）。
+fn parse_ambiguous_choice(text: &str, options: usize) -> Option<usize> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(index) if (1..=options).contains(&index) => Some(index - 1),
+        _ => None,
+    }
+}
+
+/// 歧义实体的人工选择：提示用户按编号选择义项。
+///
+/// 仅在交互模式调用；空输入 / 非法输入 / EOF 均回退到权重最高项（第 1 项），
+/// 返回候选表下标。
+fn prompt_ambiguous_selection(
+    entity: &str,
+    candidates: &[(String, u64)],
+    max_options: usize,
+) -> usize {
+    let options = candidates.len().min(max_options.max(1));
+    print!(
+        "请选择「{}」的义项编号 [1-{}]（直接回车选权重最高项）: ",
+        entity, options
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return 0;
+    }
+    match parse_ambiguous_choice(&line, options) {
+        Some(index) => index,
+        None => {
+            if !line.trim().is_empty() {
+                println!("输入「{}」无效，使用权重最高项。", line.trim());
+            }
+            0
+        }
+    }
+}
+
+/// 对查询实体做歧义解析：自动模式结合整句上下文选择义项，
+/// 人工模式在交互界面提示用户按编号选择。
+///
+/// 无候选或调用失败时保留原实体名，保证返回结果与输入实体一一对应。
+async fn resolve_query_entities_with_disambiguation(
+    input: &str,
+    query_entities: &[String],
+    api_config: &know_prolog::ApiConfig,
+    adapter: &LocalSemanticAdapter,
+) -> Vec<String> {
+    println!("正在解析实体歧义...");
+    let mut resolved_entities = Vec::new();
+    let mut found_ambiguous = false;
+
+    for entity in query_entities {
+        match adapter.get_ambiguous_entities(entity).await {
+            Ok(ambiguous_response) => {
+                if ambiguous_response.data.len() > 1 {
+                    found_ambiguous = true;
+                    println!("发现实体 '{}' 有多种含义:", entity);
+                    for (i, (entity_name, weight)) in ambiguous_response
+                        .data
+                        .iter()
+                        .take(api_config.max_ambiguous_entities)
+                        .enumerate()
+                    {
+                        println!("  {}. {} (权重: {})", i + 1, entity_name, weight);
+                    }
+
+                    let chosen_entity = if api_config.auto_select_best_entity {
+                        let index =
+                            select_candidate_by_context(&ambiguous_response.data, Some(input))
+                                .unwrap_or(0);
+                        let (best_entity, _) = &ambiguous_response.data[index];
+                        println!("自动选择（结合上下文）: {}", best_entity);
+                        best_entity.clone()
+                    } else {
+                        let index = prompt_ambiguous_selection(
+                            entity,
+                            &ambiguous_response.data,
+                            api_config.max_ambiguous_entities,
+                        );
+                        let (chosen, _) = &ambiguous_response.data[index];
+                        println!("已选择: {}", chosen);
+                        chosen.clone()
+                    };
+                    resolved_entities.push(chosen_entity.clone());
+
+                    match adapter.get_simplified_knowledge(&chosen_entity).await {
+                        Ok(knowledge) => {
+                            if let Some(desc) = knowledge.get("description") {
+                                if !desc.is_empty() {
+                                    println!("  描述: {}", desc);
+                                }
+                            }
+                            if let Some(tags) = knowledge.get("tags") {
+                                if !tags.is_empty() {
+                                    println!("  标签: {}", tags);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("获取实体知识时出错: {}", e),
+                    }
+                } else if ambiguous_response.data.len() == 1 {
+                    if let Some((entity_name, _)) = ambiguous_response.data.first() {
+                        resolved_entities.push(entity_name.clone());
+                    }
+                } else {
+                    resolved_entities.push(entity.clone());
+                }
+            }
+            Err(e) => {
+                eprintln!("查询实体 '{}' 的歧义信息时出错: {}", entity, e);
+                resolved_entities.push(entity.clone());
+            }
+        }
+    }
+
+    if found_ambiguous {
+        println!("─────────────────────────────────");
+    }
+    resolved_entities
+}
+
 async fn continue_original_query(
     config: &know_prolog::SystemConfig,
     oxigraph_manager: &OxigraphManager,
@@ -4179,67 +4293,13 @@ async fn continue_original_query(
     // 使用歧义解析功能（如果启用）
     if let Some(api_config) = &config.api {
         if api_config.enable_entity_disambiguation {
-            println!("正在解析实体歧义...");
-            let mut resolved_entities = Vec::new();
-            let mut found_ambiguous = false;
-            
-            for entity in &query_entities {
-                match local_semantic_adapter.get_ambiguous_entities(entity).await {
-                    Ok(ambiguous_response) => {
-                        if ambiguous_response.data.len() > 1 {
-                            found_ambiguous = true;
-                            println!("发现实体 '{}' 有多种含义:", entity);
-                            for (i, (entity_name, weight)) in ambiguous_response.data.iter()
-                                .take(api_config.max_ambiguous_entities).enumerate() {
-                                println!("  {}. {} (权重: {})", i + 1, entity_name, weight);
-                            }
-                            
-                            if api_config.auto_select_best_entity {
-                                if let Some((best_entity, _)) = ambiguous_response.data.first() {
-                                    println!("自动选择: {}", best_entity);
-                                    resolved_entities.push(best_entity.clone());
-                                    
-                                    match local_semantic_adapter.get_simplified_knowledge(best_entity).await {
-                                        Ok(knowledge) => {
-                                            if let Some(desc) = knowledge.get("description") {
-                                                if !desc.is_empty() {
-                                                    println!("  描述: {}", desc);
-                                                }
-                                            }
-                                            if let Some(tags) = knowledge.get("tags") {
-                                                if !tags.is_empty() {
-                                                    println!("  标签: {}", tags);
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("获取实体知识时出错: {}", e);
-                                        }
-                                    }
-                                }
-                            } else {
-                                if let Some((best_entity, _)) = ambiguous_response.data.first() {
-                                    resolved_entities.push(best_entity.clone());
-                                }
-                            }
-                        } else if ambiguous_response.data.len() == 1 {
-                            if let Some((entity_name, _)) = ambiguous_response.data.first() {
-                                resolved_entities.push(entity_name.clone());
-                            }
-                        } else {
-                            resolved_entities.push(entity.clone());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("查询实体 '{}' 的歧义信息时出错: {}", entity, e);
-                        resolved_entities.push(entity.clone());
-                    }
-                }
-            }
-            
-            if found_ambiguous {
-                println!("─────────────────────────────────");
-            }
+            let resolved_entities = resolve_query_entities_with_disambiguation(
+                input,
+                &query_entities,
+                api_config,
+                local_semantic_adapter,
+            )
+            .await;
             
             let final_entities = if !resolved_entities.is_empty() {
                 resolved_entities
@@ -4533,5 +4593,18 @@ mod session_tests {
         assert!(!reasoner.frame_clarification_active(), "绑定后澄清应关闭");
         let answer = reasoner.answer("叶莉的体重是什么").expect("重放应可作答");
         assert!(answer.contains("85kg"), "{}", answer);
+    }
+
+    /// 歧义义项选择解析：合法编号映射为 0 基下标；空/非数字/越界回退 None
+    #[test]
+    fn ambiguous_choice_parses_valid_index_and_rejects_invalid() {
+        assert_eq!(parse_ambiguous_choice("1", 5), Some(0));
+        assert_eq!(parse_ambiguous_choice(" 3 ", 5), Some(2));
+        assert_eq!(parse_ambiguous_choice("5", 5), Some(4));
+        assert_eq!(parse_ambiguous_choice("0", 5), None, "编号从 1 开始");
+        assert_eq!(parse_ambiguous_choice("6", 5), None, "超出候选数量");
+        assert_eq!(parse_ambiguous_choice("", 5), None, "空输入回退");
+        assert_eq!(parse_ambiguous_choice("苹果", 5), None, "非数字回退");
+        assert_eq!(parse_ambiguous_choice("2", 1), None, "单个候选时越界");
     }
 }

@@ -209,6 +209,9 @@ impl OwnthinkApiClient {
     }
 
     /// 解析歧义实体 - 返回最佳匹配的实体
+    ///
+    /// 未提供上下文（或上下文无法区分）时选权重最高者；
+    /// 提供上下文时用 [`select_candidate_by_context`] 做确定性消歧。
     pub async fn resolve_entity_ambiguity(&self, mention: &str, context: Option<&str>) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         let ambiguous_response = self.get_ambiguous_entities(mention).await?;
         
@@ -216,19 +219,8 @@ impl OwnthinkApiClient {
             return Ok(None);
         }
 
-        // 简单策略：返回权重最高的实体
-        // 在更复杂的实现中，可以根据上下文信息进行更智能的选择
-        let best_entity = ambiguous_response.data
-            .into_iter()
-            .max_by_key(|(_, weight)| *weight)
-            .map(|(entity, _)| entity);
-
-        // 如果提供了上下文，可以在此处实现更复杂的消歧逻辑
-        if let Some(_context) = context {
-            // TODO: 实现基于上下文的消歧策略
-        }
-
-        Ok(best_entity)
+        Ok(select_candidate_by_context(&ambiguous_response.data, context)
+            .map(|index| ambiguous_response.data[index].0.clone()))
     }
 
     /// 获取实体的简化知识 - 转换为内部知识表示
@@ -275,6 +267,138 @@ impl Default for OwnthinkApiClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 抽取候选名中的括号限定词（`[...]`、`（...）`、`(...)`、`【...】`）。
+///
+/// 例如 `苹果[蔷薇科苹果属果实]` → `["蔷薇科苹果属果实"]`；
+/// 无括号时返回空表。限定词通常比全名更能区分同名义项。
+pub fn candidate_qualifiers(name: &str) -> Vec<String> {
+    let mut qualifiers = Vec::new();
+    let mut closing: Option<char> = None;
+    let mut current = String::new();
+    for ch in name.chars() {
+        match closing {
+            None => match ch {
+                '[' => {
+                    closing = Some(']');
+                    current.clear();
+                }
+                '（' => {
+                    closing = Some('）');
+                    current.clear();
+                }
+                '(' => {
+                    closing = Some(')');
+                    current.clear();
+                }
+                '【' => {
+                    closing = Some('】');
+                    current.clear();
+                }
+                _ => {}
+            },
+            Some(close) if ch == close => {
+                let text = current.trim();
+                if !text.is_empty() {
+                    qualifiers.push(text.to_string());
+                }
+                closing = None;
+                current.clear();
+            }
+            Some(_) => current.push(ch),
+        }
+    }
+    qualifiers
+}
+
+/// 最长公共子串长度（按字符、忽略空白）。
+///
+/// 用于消歧：词面越长的连续匹配越有区分度，且不会像单字重叠那样
+/// 把「苹果公司」与「蔷薇科苹果属」里的共同提及误判成同类证据。
+pub fn longest_common_substring_len(a: &str, b: &str) -> u64 {
+    let a: Vec<char> = a.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let b: Vec<char> = b.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut previous = vec![0u64; b.len() + 1];
+    let mut best = 0u64;
+    for i in 1..=a.len() {
+        let mut current = vec![0u64; b.len() + 1];
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                current[j] = previous[j - 1] + 1;
+                if current[j] > best {
+                    best = current[j];
+                }
+            }
+        }
+        previous = current;
+    }
+    best
+}
+
+/// 去掉候选名中的括号限定词，只留主体名（与 [`candidate_qualifiers`] 互补）。
+pub fn candidate_primary_name(name: &str) -> String {
+    let mut result = String::new();
+    let mut depth = 0usize;
+    for ch in name.chars() {
+        match ch {
+            '[' | '（' | '(' | '【' => depth += 1,
+            ']' | '）' | ')' | '】' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => result.push(ch),
+            _ => {}
+        }
+    }
+    result
+}
+
+/// 基于上下文对候选项做确定性消歧，返回最佳下标。
+///
+/// 规则（纯函数，便于离线测试）：
+/// - 无可用上下文：选权重最高者，同权取先出现者；
+/// - 有上下文：得分 = 2 × 主体名最长公共子串长度 + 括号限定词最长公共子串长度
+///   （主体名权重更高，限定词提供补充证据）；得分高者胜，同分比权重，
+///   仍相同取先出现者；
+/// - 所有候选得分均为 0（上下文无关）时回退到权重最高者。
+pub fn select_candidate_by_context(
+    candidates: &[(String, u64)],
+    context: Option<&str>,
+) -> Option<usize> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let context = context.map(str::trim).filter(|text| !text.is_empty());
+    let mut best_index = 0usize;
+    let mut best_key = candidate_context_key(&candidates[0], context);
+    for (index, candidate) in candidates.iter().enumerate().skip(1) {
+        let key = candidate_context_key(candidate, context);
+        if key > best_key {
+            best_key = key;
+            best_index = index;
+        }
+    }
+    Some(best_index)
+}
+
+/// 候选的排序键：`(上下文得分, 权重)`；无上下文时得分恒为 0，退化为权重比较。
+fn candidate_context_key(candidate: &(String, u64), context: Option<&str>) -> (u64, u64) {
+    let (name, weight) = candidate;
+    let score = match context {
+        Some(context) => {
+            let primary = candidate_primary_name(name);
+            let name_score = 2 * longest_common_substring_len(&primary, context);
+            let qualifier_score = candidate_qualifiers(name)
+                .iter()
+                .map(|qualifier| longest_common_substring_len(qualifier, context))
+                .max()
+                .unwrap_or(0);
+            name_score + qualifier_score
+        }
+        None => 0,
+    };
+    (score, *weight)
 }
 
 #[cfg(test)]
@@ -334,5 +458,85 @@ mod tests {
                 println!("测试跳过，API调用失败: {}", e);
             }
         }
+    }
+
+    #[test]
+    fn candidate_qualifiers_extracts_all_bracket_styles() {
+        assert_eq!(
+            candidate_qualifiers("苹果[蔷薇科苹果属果实]"),
+            vec!["蔷薇科苹果属果实".to_string()]
+        );
+        assert_eq!(
+            candidate_qualifiers("苹果（水果）"),
+            vec!["水果".to_string()]
+        );
+        assert_eq!(
+            candidate_qualifiers("Apple(company)【科技】"),
+            vec!["company".to_string(), "科技".to_string()]
+        );
+        assert!(candidate_qualifiers("苹果公司").is_empty());
+        assert!(
+            candidate_qualifiers("空白[   ]").is_empty(),
+            "纯空白限定词忽略"
+        );
+    }
+
+    #[test]
+    fn candidate_primary_name_strips_qualifiers() {
+        assert_eq!(candidate_primary_name("苹果[蔷薇科苹果属果实]"), "苹果");
+        assert_eq!(candidate_primary_name("苹果（水果）"), "苹果");
+        assert_eq!(candidate_primary_name("Apple(company)【科技】"), "Apple");
+        assert_eq!(candidate_primary_name("苹果公司"), "苹果公司");
+    }
+
+    #[test]
+    fn longest_common_substring_len_measures_continuous_match() {
+        assert_eq!(longest_common_substring_len("苹果公司", "苹果公司发布了新产品"), 4);
+        assert_eq!(longest_common_substring_len("苹果", "蔷薇科植物的果实"), 1);
+        assert_eq!(longest_common_substring_len("果实", "蔷薇科植物的果实"), 2);
+        assert_eq!(longest_common_substring_len("苹", "蔷薇科植物的果实"), 0);
+        assert_eq!(longest_common_substring_len("", "任意上下文"), 0);
+        assert_eq!(longest_common_substring_len("苹果", ""), 0);
+        assert_eq!(
+            longest_common_substring_len("苹 果", "这里有苹果"),
+            2,
+            "空白不参与匹配"
+        );
+    }
+
+    #[test]
+    fn select_candidate_uses_context_over_weight() {
+        // 权重上水果更高，但上下文明显指向公司
+        let candidates = vec![
+            ("苹果公司".to_string(), 10_084_009),
+            ("苹果[蔷薇科苹果属果实]".to_string(), 12_223_855),
+        ];
+        let index = select_candidate_by_context(&candidates, Some("苹果公司发布了新产品")).unwrap();
+        assert_eq!(candidates[index].0, "苹果公司");
+
+        // 上下文只命中括号限定词时选中水果（即使权重更低）
+        let index =
+            select_candidate_by_context(&candidates, Some("蔷薇科植物的果实有哪些")).unwrap();
+        assert_eq!(candidates[index].0, "苹果[蔷薇科苹果属果实]");
+    }
+
+    #[test]
+    fn select_candidate_falls_back_to_weight() {
+        let candidates = vec![
+            ("苹果[蔷薇科苹果属果实]".to_string(), 12_223_855),
+            ("苹果公司".to_string(), 10_084_009),
+        ];
+        // 无上下文：选权重最高者
+        assert_eq!(select_candidate_by_context(&candidates, None), Some(0));
+        assert_eq!(select_candidate_by_context(&candidates, Some("   ")), Some(0));
+        // 上下文与所有候选都无关：仍回退到权重最高者
+        assert_eq!(
+            select_candidate_by_context(&candidates, Some("今天天气不错")),
+            Some(0)
+        );
+        // 同分同权：取先出现者（稳定）
+        let tied = vec![("甲".to_string(), 1), ("乙".to_string(), 1)];
+        assert_eq!(select_candidate_by_context(&tied, None), Some(0));
+        assert_eq!(select_candidate_by_context(&[], None), None);
     }
 }

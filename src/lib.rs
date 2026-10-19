@@ -1123,6 +1123,61 @@ impl OxigraphManager {
         self.import_jsonld(&content).await
     }
 
+    /// 从文件扩展名识别 RDF 序列化格式（ttl / nt / nq / trig / rdf / xml）。
+    ///
+    /// JSON-LD 不在此列：请使用 `import_jsonld` / `import_jsonld_from_file`，
+    /// 它们支持 `@context` 展开与更宽松的文档结构。
+    pub fn detect_rdf_format(
+        file_path: &str,
+    ) -> Result<oxigraph::io::RdfFormat, Box<dyn std::error::Error + Send + Sync>> {
+        let extension = std::path::Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        match extension.to_ascii_lowercase().as_str() {
+            "json" | "jsonld" => Err(format!(
+                "「{}」是 JSON-LD 文件：请改用 import-jsonld（或交互命令「导入jsonld文件：」）",
+                file_path
+            )
+            .into()),
+            _ => oxigraph::io::RdfFormat::from_extension(extension).ok_or_else(|| {
+                format!(
+                    "无法从扩展名「{}」识别 RDF 格式（支持 ttl / nt / nq / trig / rdf / xml）",
+                    if extension.is_empty() { "（无）" } else { extension }
+                )
+                .into()
+            }),
+        }
+    }
+
+    /// 从 RDF 文件导入三元组（支持 Turtle / N-Triples / N-Quads / TriG / RDF/XML），
+    /// 返回本次新增的三元组数（与库中已有三元组重复者不计入）。
+    pub async fn import_rdf_file(
+        &self,
+        file_path: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let format = Self::detect_rdf_format(file_path)?;
+        let file = fs::File::open(file_path)?;
+        self.import_rdf_reader(format, file).await
+    }
+
+    /// 从任意 reader 导入 RDF 到默认图，返回新增三元组数。
+    ///
+    /// 与 JSON-LD 导入一致：持锁后、写前推进知识版本，保证并发读者不会把
+    /// 半成品缓存成完整快照；解析或写入失败时版本号也已推进（保守失效）。
+    pub async fn import_rdf_reader<R: std::io::Read>(
+        &self,
+        format: oxigraph::io::RdfFormat,
+        reader: R,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let before = store.len()?;
+        self.bump_revision();
+        store.load_from_reader(format, reader)?;
+        let after = store.len()?;
+        Ok(after.saturating_sub(before))
+    }
+
     pub async fn save_knowledge(&self, items: Vec<KnowledgeItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.save_knowledge_with_receipt(items).await.map(|_| ())
     }
@@ -3282,5 +3337,134 @@ mod cache_tests {
         assert_eq!(reloaded.entries, vec![replacement], "重物化应全量替换");
         assert_eq!(reloaded.revision, 6);
         assert_eq!(reloaded.fingerprint, "fp-two");
+    }
+
+    /// RDF 格式识别：常见扩展名映射到对应解析器；JSON-LD 与未知扩展名给出可操作错误。
+    #[test]
+    fn detect_rdf_format_maps_extensions_and_rejects_jsonld() {
+        use oxigraph::io::RdfFormat;
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("kb.ttl").unwrap(),
+            RdfFormat::Turtle
+        );
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("KB.TTL").unwrap(),
+            RdfFormat::Turtle,
+            "扩展名大小写不敏感"
+        );
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("kb.nt").unwrap(),
+            RdfFormat::NTriples
+        );
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("kb.nq").unwrap(),
+            RdfFormat::NQuads
+        );
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("kb.trig").unwrap(),
+            RdfFormat::TriG
+        );
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("kb.rdf").unwrap(),
+            RdfFormat::RdfXml
+        );
+        assert_eq!(
+            OxigraphManager::detect_rdf_format("kb.xml").unwrap(),
+            RdfFormat::RdfXml
+        );
+
+        let jsonld_error = OxigraphManager::detect_rdf_format("kb.jsonld")
+            .unwrap_err()
+            .to_string();
+        assert!(jsonld_error.contains("import-jsonld"), "{}", jsonld_error);
+        let unknown_error = OxigraphManager::detect_rdf_format("kb.bin")
+            .unwrap_err()
+            .to_string();
+        assert!(unknown_error.contains("ttl"), "{}", unknown_error);
+        assert!(OxigraphManager::detect_rdf_format("kb").is_err(), "无扩展名应报错");
+    }
+
+    /// RDF 文件导入：新增三元组计数正确、重复导入幂等、数据进入知识快照。
+    #[tokio::test]
+    async fn import_rdf_file_counts_new_triples_and_feeds_snapshot() {
+        let (manager, dir) = temp_manager().await;
+        let ttl_path = dir.path().join("sample.ttl");
+        fs::write(
+            &ttl_path,
+            r#"@prefix kg: <http://example.org/kg/> .
+<http://example.org/kg/entity/王五> a kg:Person ;
+    kg:name "王五" ;
+    kg:age "20" .
+<http://example.org/kg/entity/王五> kg:师父 <http://example.org/kg/entity/赵六> .
+"#,
+        )
+        .unwrap();
+
+        let added = manager
+            .import_rdf_file(ttl_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(added, 4, "应报告 4 条新增三元组");
+
+        let facts = manager.load_graph_snapshot().await.unwrap();
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                PrologFact::Entity { name, properties, .. }
+                    if name == "王五" && properties.get("age").map(String::as_str) == Some("20")
+            )),
+            "导入的实体应进入知识快照：{:?}",
+            facts
+        );
+
+        let revision_after_first = manager.revision();
+        let replay = manager
+            .import_rdf_file(ttl_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(replay, 0, "重复导入不应新增三元组");
+        assert!(
+            manager.revision() >= revision_after_first,
+            "导入后知识版本推进（严格正版本号）"
+        );
+
+        let nt_path = dir.path().join("extra.nt");
+        fs::write(
+            &nt_path,
+            "<http://example.org/kg/entity/赵六> <http://example.org/kg/name> \"赵六\" .\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manager
+                .import_rdf_file(nt_path.to_str().unwrap())
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// RDF/XML 经 reader 导入同样落入默认图。
+    #[tokio::test]
+    async fn import_rdf_reader_accepts_rdfxml() {
+        let (manager, _dir) = temp_manager().await;
+        let rdfxml = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:kg="http://example.org/kg/">
+  <rdf:Description rdf:about="http://example.org/kg/entity/孙七">
+    <rdf:type rdf:resource="http://example.org/kg/Person"/>
+    <kg:name>孙七</kg:name>
+  </rdf:Description>
+</rdf:RDF>
+"#;
+        let added = manager
+            .import_rdf_reader(oxigraph::io::RdfFormat::RdfXml, rdfxml.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(added, 2);
+        let facts = manager.load_graph_snapshot().await.unwrap();
+        assert!(facts.iter().any(|fact| matches!(
+            fact,
+            PrologFact::Entity { name, .. } if name == "孙七"
+        )));
     }
 }
