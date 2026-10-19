@@ -5804,21 +5804,11 @@ impl SymbolicReasoner {
         )
     }
 
-    pub fn save_dialogue_state(&self, path: &str) -> std::io::Result<()> {
-        self.save_dialogue_state_with_contrast(path, None)
-    }
-
-    /// 保存对话状态，并额外写入神经符号对比仲裁记忆（校准统计/待定推测/否证集）
-    pub fn save_dialogue_state_with_contrast(
-        &self,
-        path: &str,
-        contrast: Option<&ContrastSnapshot>,
-    ) -> std::io::Result<()> {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+    /// 会话记忆的完整内存快照（焦点/历史/生成状态/会话事实/教学/规则/话语帧）。
+    ///
+    /// 与 [`Self::save_dialogue_state_with_contrast`] 落盘的内容一致（除对比仲裁
+    /// 记忆外），供服务层在不触碰文件系统的前提下导出/导入会话。
+    pub fn dialogue_snapshot(&self) -> DialogueSnapshot {
         let mut snapshot = self.context.snapshot();
         snapshot.session_facts = self
             .session_facts
@@ -5835,8 +5825,35 @@ impl SymbolicReasoner {
             .collect();
         snapshot.lessons = self.lessons.clone();
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
-        snapshot.contrast = contrast.cloned();
         snapshot.frames = Some(self.frames.clone());
+        snapshot
+    }
+
+    /// 把 [`Self::dialogue_snapshot`] 的内容恢复到当前推理器上。
+    ///
+    /// 恢复只重建会话级派生数据（会话事实/教学/会话规则/话语帧），全局知识
+    /// 图谱不受影响；同一快照恢复两次结果一致（幂等去重）。
+    pub fn restore_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) {
+        self.apply_dialogue_snapshot(snapshot);
+    }
+
+    pub fn save_dialogue_state(&self, path: &str) -> std::io::Result<()> {
+        self.save_dialogue_state_with_contrast(path, None)
+    }
+
+    /// 保存对话状态，并额外写入神经符号对比仲裁记忆（校准统计/待定推测/否证集）
+    pub fn save_dialogue_state_with_contrast(
+        &self,
+        path: &str,
+        contrast: Option<&ContrastSnapshot>,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut snapshot = self.dialogue_snapshot();
+        snapshot.contrast = contrast.cloned();
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(path, json)

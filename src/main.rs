@@ -164,9 +164,13 @@ enum Commands {
         /// Listen address
         #[arg(long, default_value = "127.0.0.1:8080")]
         addr: String,
-        /// Maximum concurrent sessions
+        /// Maximum resident (in-memory) sessions
         #[arg(long, default_value_t = 64)]
         max_sessions: usize,
+        /// Cold-session directory: when resident capacity is full, the
+        /// least-recently-used session is frozen here and revived on access
+        #[arg(long)]
+        session_dir: Option<String>,
         /// Prompt asset mode for sessions: "off", "parity", or "on"
         #[arg(long, default_value = "on")]
         prompt_mode: String,
@@ -477,6 +481,7 @@ async fn main() {
         Some(Commands::Serve {
             addr,
             max_sessions,
+            session_dir,
             prompt_mode,
             recovery,
         }) => {
@@ -495,10 +500,14 @@ async fn main() {
                 create_default_synonyms()
             };
             println!(
-                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个会话，提示模式 {}，失败恢复 {}）",
+                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个驻留会话{}，提示模式 {}，失败恢复 {}）",
                 addr,
                 facts.len(),
                 max_sessions,
+                session_dir
+                    .as_deref()
+                    .map(|dir| format!("，冷会话目录 {}", dir))
+                    .unwrap_or_default(),
                 prompt_mode.label(),
                 recovery_mode.label()
             );
@@ -509,6 +518,9 @@ async fn main() {
                 perf_ledger.clone(),
                 max_sessions,
             );
+            if let Some(dir) = session_dir {
+                api_state.set_session_dir(dir);
+            }
             api_state.set_prompt_mode(prompt_mode);
             api_state.set_recovery_mode(recovery_mode);
             let state = Arc::new(api_state);

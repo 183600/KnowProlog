@@ -7,12 +7,38 @@
 //! `system` / `developer` 消息被解析为确定性 [`SessionPolicy`]（白名单短语），
 //! 生效于该会话的后续轮次：简短/详细风格、必须给依据、严格澄清。
 //!
+//! # 会话 actor（并发结构）
+//!
+//! 推理器内部含 `Rc`（归结编译产物），会话不是 `Send`，不能直接跨线程共享。
+//! 因此每个会话由**专属 OS 线程**拥有（actor）：HTTP 层只持有一个
+//! `mpsc::Sender`，通过 oneshot 等待结果。其结果是：
+//! - [`ApiState`] 是 `Send + Sync`，accept 循环 `tokio::spawn` 每连接，
+//!   跨会话真并行、同会话严格 FIFO（命令按到达顺序处理）；
+//! - 一个慢查询/慢 SSE 连接不再阻塞其他连接的 accept；
+//! - 会话关闭 = 丢弃 `Sender`，actor 处理完已排队命令后线程自然退出。
+//!
+//! # 会话信封（序列化 + 冷存储）
+//!
+//! `GET /sessions/{id}/export` 把会话导出为可移植 JSON 信封：策略 + 轮数 +
+//! 历史 + 对话管理器快照（含失败回执台账）+ 推理器会话记忆（焦点/会话事实/
+//! 教学/会话规则/话语帧）+ 引擎指纹（crate 版本、知识库 FNV-1a 指纹、事实数、
+//! 运行模式）+ 信封摘要（FNV-1a）。`POST /sessions/import` 反序列化重建：
+//! 版本 / 摘要 / 引擎指纹 / 尺寸四重校验全部通过才产生副作用；陌生引擎或
+//! 不同知识库的信封默认 409 拒收，`?accept_foreign=1` 显式接收并回执差异字段。
+//!
+//! 配置 `--session-dir` 后，`max_sessions` 变为「内存驻留上限」：容量已满时
+//! 最近最少使用的会话被冻结到磁盘（换出），再次访问时自动反序列化重建
+//! （换入）——LLM 服务 context cache 的确定性符号等价物；DELETE/关闭会同时
+//! 清理冷存储，已删除会话不会复活。
+//!
 //! 端点：
 //! - `GET  /`                      服务索引（端点清单）
 //! - `GET  /health`                健康检查
 //! - `GET  /metrics`               会话数 / 轮数 / 性能台账
 //! - `POST /sessions`              新建会话 → `{"session_id": "s-1"}`
 //! - `GET  /sessions/{id}`         会话快照（焦点栈 / 历史摘要 / 策略）
+//! - `GET  /sessions/{id}/export`  导出会话信封（可移植 JSON）
+//! - `POST /sessions/import`       导入会话信封重建会话
 //! - `DELETE /sessions/{id}`       关闭会话
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
 //!   或 `?stream=1` 时按句 SSE 流式返回
@@ -24,9 +50,8 @@
 //!
 //! 设计约束：
 //! - 零新依赖：tokio 已在依赖中，HTTP/1.1 手写最小实现；
-//! - 正确优先于并发：推理器内部含 `Rc`（求解器编译产物），会话不是 `Send`，
-//!   因此连接在单一 accept 循环中串行处理，且同一会话的轮次天然串行化；
-//!   每个连接有 30s 超时兜底，真正的并行留给后续把推理器送进专属工作线程；
+//! - 恢复等价性承诺「可观察输出逐字一致」（回答/状态/焦点/策略），不承诺
+//!   内部派生缓存一致——缓存是快照的派生数据；
 //! - 请求体上限、连接超时、会话数上限全部显式配置，防御性默认值。
 
 use std::collections::{BTreeMap, HashMap};
@@ -37,14 +62,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::dialogue_manager::{DialogueKnowledge, DialogueManager};
+use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueManagerSnapshot};
 use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
-use crate::symbolic_reasoner::SymbolicReasoner;
+use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::ReasoningConfig;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -305,6 +330,8 @@ pub struct EpistemicView {
 }
 
 /// 单个会话：对话管理器 + 独立推理器 + 有界历史 + 会话级策略。
+///
+/// 只在会话 actor 线程内被创建与访问（`SymbolicReasoner` 含 `Rc`，不是 `Send`）。
 struct Session {
     id: String,
     turns: u32,
@@ -388,15 +415,262 @@ impl Session {
     }
 }
 
-/// 服务共享状态：知识事实 + 会话表 + 计数。
+// ---------------------------------------------------------------------------
+// 会话信封：可移植的会话序列化格式
+// ---------------------------------------------------------------------------
+
+/// 信封格式标识与版本（导入时逐项校验）。
+pub const ENVELOPE_FORMAT: &str = "knowprolog-session-envelope";
+pub const ENVELOPE_VERSION: u32 = 1;
+
+/// 引擎指纹：证明信封产自同版本、同知识库、同运行模式的引擎。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineStamp {
+    pub crate_version: String,
+    /// 知识库事实内容的 FNV-1a 指纹（与加载顺序无关的确定性哈希）。
+    pub kb_fingerprint: String,
+    pub kb_facts: usize,
+    pub prompt_mode: String,
+    pub recovery_mode: String,
+}
+
+impl EngineStamp {
+    fn mismatched_fields(&self, other: &EngineStamp) -> Vec<String> {
+        let mut fields = Vec::new();
+        if self.crate_version != other.crate_version {
+            fields.push("crate_version".to_string());
+        }
+        if self.kb_fingerprint != other.kb_fingerprint {
+            fields.push("kb_fingerprint".to_string());
+        }
+        if self.kb_facts != other.kb_facts {
+            fields.push("kb_facts".to_string());
+        }
+        if self.prompt_mode != other.prompt_mode {
+            fields.push("prompt_mode".to_string());
+        }
+        if self.recovery_mode != other.recovery_mode {
+            fields.push("recovery_mode".to_string());
+        }
+        fields
+    }
+}
+
+/// 会话信封：策略 + 轮数 + 服务层历史 + 管理器/推理器快照 + 引擎指纹 + 摘要。
+///
+/// `digest` 是对除自身以外全部字段序列化结果的 FNV-1a 摘要；导入时重算比对，
+/// 任何字段被篡改都会被拒绝。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionEnvelope {
+    pub format: String,
+    pub version: u32,
+    pub session_id: String,
+    pub turns: u32,
+    #[serde(default)]
+    pub history: Vec<String>,
+    #[serde(default)]
+    pub policy: SessionPolicy,
+    pub manager: DialogueManagerSnapshot,
+    pub reasoner: DialogueSnapshot,
+    pub engine: EngineStamp,
+    #[serde(default)]
+    pub digest: String,
+}
+
+impl SessionEnvelope {
+    /// 计算（不写入）摘要。
+    fn compute_digest(&self) -> String {
+        let mut copy = self.clone();
+        copy.digest = String::new();
+        match serde_json::to_vec(&copy) {
+            Ok(bytes) => format!("{:016x}", fnv1a(&bytes)),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// 就地封缄：写入正确摘要。
+    pub fn seal(&mut self) {
+        self.digest = self.compute_digest();
+    }
+
+    pub fn digest_valid(&self) -> bool {
+        !self.digest.is_empty() && self.digest == self.compute_digest()
+    }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_step(hash: u64, bytes: &[u8]) -> u64 {
+    let mut hash = hash;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    fnv1a_step(FNV_OFFSET, bytes)
+}
+
+fn fnv1a_field(hash: u64, value: &str) -> u64 {
+    fnv1a_step(fnv1a_step(hash, value.as_bytes()), b"\x1f")
+}
+
+/// 事实集的确定性指纹：HashMap 属性按键排序，保证跨进程稳定。
+pub fn fingerprint_facts(facts: &[PrologFact]) -> String {
+    let mut hash = FNV_OFFSET;
+    for fact in facts {
+        match fact {
+            PrologFact::Entity {
+                name,
+                entity_type,
+                properties,
+            } => {
+                hash = fnv1a_step(hash, b"E\x1f");
+                hash = fnv1a_field(hash, name);
+                hash = fnv1a_field(hash, entity_type);
+                let mut keys: Vec<&String> = properties.keys().collect();
+                keys.sort();
+                for key in keys {
+                    hash = fnv1a_field(hash, key);
+                    hash = fnv1a_field(hash, &properties[key]);
+                }
+            }
+            PrologFact::Relation { from, rel_type, to } => {
+                hash = fnv1a_step(hash, b"R\x1f");
+                hash = fnv1a_field(hash, from);
+                hash = fnv1a_field(hash, rel_type);
+                hash = fnv1a_field(hash, to);
+            }
+        }
+        hash = fnv1a_step(hash, b"\n");
+    }
+    format!("{:016x}", hash)
+}
+
+/// 会话 id → 冷存储文件名（过滤路径分隔符等，防目录穿越）。
+fn session_file_name(session_id: &str) -> String {
+    let mut name: String = session_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.is_empty() {
+        name.push('_');
+    }
+    name.truncate(128);
+    name
+}
+
+/// 导入信封时恢复会话所需的全部可序列化状态。
+struct SessionRestore {
+    turns: u32,
+    history: Vec<String>,
+    policy: SessionPolicy,
+    manager: DialogueManagerSnapshot,
+    reasoner: DialogueSnapshot,
+}
+
+/// actor 命令：会话线程是唯一能触碰 [`Session`] 的执行者。
+enum SessionCommand {
+    Turn {
+        input: String,
+        policy: Option<SessionPolicy>,
+        reply: oneshot::Sender<TurnResponse>,
+    },
+    Snapshot {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
+    Export {
+        reply: oneshot::Sender<SessionEnvelope>,
+    },
+}
+
+/// 会话句柄：HTTP 层可见的唯一部分（`Send + Sync`）。
+struct SessionHandle {
+    tx: mpsc::Sender<SessionCommand>,
+    /// 最近一次被访问的活动序号（确定性 LRU，不依赖挂钟）。
+    last_active: Arc<AtomicU64>,
+}
+
+impl SessionHandle {
+    fn touch(&self, clock: &AtomicU64) {
+        self.last_active
+            .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// 会话访问错误：区分「不存在」「actor 已退出」「冷会话不可恢复」。
+#[derive(Debug)]
+enum SessionError {
+    NotFound,
+    Unavailable,
+    Stale,
+}
+
+/// 构造会话（可在任意线程调用；返回的 [`Session`] 只应留在该线程）。
+#[allow(clippy::too_many_arguments)]
+fn build_session(
+    id: String,
+    facts: &[PrologFact],
+    reasoning: &ReasoningConfig,
+    synonyms: &HashMap<String, String>,
+    perf: &Arc<PerfLedger>,
+    prompt_mode: PromptMode,
+    recovery_mode: RecoveryMode,
+    restore: Option<SessionRestore>,
+) -> Session {
+    let mut reasoner = SymbolicReasoner::with_perf_ledger(
+        reasoning.clone(),
+        synonyms.clone(),
+        Arc::clone(perf),
+    );
+    reasoner.observe_facts(facts);
+    let mut manager = DialogueManager::new();
+    manager.set_prompt_mode(prompt_mode);
+    manager.set_recovery_mode(recovery_mode);
+    let mut session = Session {
+        id,
+        turns: 0,
+        manager,
+        reasoner,
+        history: Vec::new(),
+        policy: SessionPolicy::default(),
+    };
+    if let Some(restore) = restore {
+        session.turns = restore.turns;
+        session.history = restore.history;
+        session.policy = restore.policy;
+        session.manager.restore(&restore.manager);
+        session.reasoner.restore_dialogue_snapshot(&restore.reasoner);
+    }
+    session
+}
+
+/// 服务共享状态：知识事实 + 会话 actor 表 + 计数（`Send + Sync`）。
 pub struct ApiState {
     facts: Arc<Vec<PrologFact>>,
+    kb_fingerprint: String,
     reasoning: ReasoningConfig,
     synonyms: HashMap<String, String>,
     perf: Arc<PerfLedger>,
-    sessions: Mutex<BTreeMap<String, Session>>,
+    sessions: Mutex<BTreeMap<String, SessionHandle>>,
     next_session_id: AtomicU64,
     turns_total: AtomicU64,
+    /// 冷会话换出次数（容量压力下把 LRU 会话冻结到磁盘）。
+    evictions_total: AtomicU64,
+    /// 会话活动时钟：每次命中 +1，用于确定性 LRU（不依赖挂钟）。
+    activity_clock: Arc<AtomicU64>,
+    /// 冷会话目录：配置后，容量已满时把 LRU 会话冻结到磁盘，
+    /// 再次访问时反序列化重建（上下文缓存的符号等价物）。
+    session_dir: Option<std::path::PathBuf>,
     max_sessions: usize,
     max_body_bytes: usize,
     prompt_mode: PromptMode,
@@ -411,19 +685,37 @@ impl ApiState {
         perf: Arc<PerfLedger>,
         max_sessions: usize,
     ) -> Self {
+        let kb_fingerprint = fingerprint_facts(&facts);
         ApiState {
             facts: Arc::new(facts),
+            kb_fingerprint,
             reasoning,
             synonyms,
             perf,
             sessions: Mutex::new(BTreeMap::new()),
             next_session_id: AtomicU64::new(1),
             turns_total: AtomicU64::new(0),
+            evictions_total: AtomicU64::new(0),
+            activity_clock: Arc::new(AtomicU64::new(1)),
+            session_dir: None,
             max_sessions: max_sessions.max(1),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             prompt_mode: PromptMode::On,
             recovery_mode: RecoveryMode::Observe,
         }
+    }
+
+    /// 设置冷会话目录（在 `Arc::new` 之前调用）。
+    ///
+    /// 配置后 `max_sessions` 语义变为「内存驻留上限」：容量已满时新建/恢复会话
+    /// 会把最近最少使用的会话冻结到该目录，而不是直接拒绝；被冻结的会话在
+    /// 下一次访问时自动反序列化重建。
+    pub fn set_session_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.session_dir = Some(dir.into());
+    }
+
+    pub fn session_dir(&self) -> Option<&std::path::Path> {
+        self.session_dir.as_deref()
     }
 
     /// 设置模板运行模式（在 `Arc::new` 之前调用；默认 [`PromptMode::On`]，
@@ -446,38 +738,224 @@ impl ApiState {
         self.recovery_mode
     }
 
-    fn build_session(&self, id: String) -> Session {
-        let mut reasoner = SymbolicReasoner::with_perf_ledger(
-            self.reasoning.clone(),
-            self.synonyms.clone(),
-            self.perf.clone(),
-        );
-        reasoner.observe_facts(&self.facts);
-        let mut manager = DialogueManager::new();
-        manager.set_prompt_mode(self.prompt_mode);
-        manager.set_recovery_mode(self.recovery_mode);
-        Session {
-            id,
-            turns: 0,
-            manager,
-            reasoner,
-            history: Vec::new(),
-            policy: SessionPolicy::default(),
+    /// 当前引擎指纹（知识库指纹 + 运行模式）。
+    pub fn engine_stamp(&self) -> EngineStamp {
+        EngineStamp {
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            kb_fingerprint: self.kb_fingerprint.clone(),
+            kb_facts: self.facts.len(),
+            prompt_mode: self.prompt_mode.label().to_string(),
+            recovery_mode: self.recovery_mode.label().to_string(),
         }
+    }
+
+    /// 启动一个会话 actor 线程；失败返回错误描述。
+    fn spawn_actor(
+        &self,
+        id: String,
+        restore: Option<SessionRestore>,
+    ) -> Result<SessionHandle, &'static str> {
+        let (tx, mut rx) = mpsc::channel::<SessionCommand>(64);
+        let facts = Arc::clone(&self.facts);
+        let reasoning = self.reasoning.clone();
+        let synonyms = self.synonyms.clone();
+        let perf = Arc::clone(&self.perf);
+        let prompt_mode = self.prompt_mode;
+        let recovery_mode = self.recovery_mode;
+        let engine = Arc::new(self.engine_stamp());
+        let thread_name = format!("kp-session-{}", id);
+        std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                let mut session = build_session(
+                    id,
+                    &facts,
+                    &reasoning,
+                    &synonyms,
+                    &perf,
+                    prompt_mode,
+                    recovery_mode,
+                    restore,
+                );
+                while let Some(command) = rx.blocking_recv() {
+                    match command {
+                        SessionCommand::Turn {
+                            input,
+                            policy,
+                            reply,
+                        } => {
+                            if let Some(policy) = policy {
+                                session.policy = policy;
+                            }
+                            let response = session.run_turn(&input);
+                            let _ = reply.send(response);
+                        }
+                        SessionCommand::Snapshot { reply } => {
+                            let _ = reply.send(serde_json::json!({
+                                "session_id": session.id,
+                                "turns": session.turns,
+                                "focus": session.manager.focus_entity(),
+                                "focus_stack": session.manager.focus_stack(),
+                                "history": session.history,
+                                "summary": session.manager.summary(),
+                                "policy": session.policy,
+                            }));
+                        }
+                        SessionCommand::Export { reply } => {
+                            let mut envelope = SessionEnvelope {
+                                format: ENVELOPE_FORMAT.to_string(),
+                                version: ENVELOPE_VERSION,
+                                session_id: session.id.clone(),
+                                turns: session.turns,
+                                history: session.history.clone(),
+                                policy: session.policy.clone(),
+                                manager: session.manager.snapshot(),
+                                reasoner: session.reasoner.dialogue_snapshot(),
+                                engine: (*engine).clone(),
+                                digest: String::new(),
+                            };
+                            envelope.seal();
+                            let _ = reply.send(envelope);
+                        }
+                    }
+                }
+            })
+            .map_err(|_| "failed to spawn session actor")?;
+        Ok(SessionHandle {
+            tx,
+            last_active: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// 冷会话文件路径（id 已通过导入校验/服务端生成，再做防穿越过滤）。
+    fn session_file(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        let dir = self.session_dir.as_ref()?;
+        Some(dir.join(format!("{}.json", session_file_name(session_id))))
+    }
+
+    /// 把 LRU 会话冻结到磁盘并从内存移除（容量压力下的换出）。
+    async fn freeze_lru_locked(
+        &self,
+        sessions: &mut BTreeMap<String, SessionHandle>,
+    ) -> Result<(), SessionError> {
+        let Some(id) = sessions
+            .iter()
+            .min_by_key(|(_, handle)| handle.last_active.load(Ordering::Relaxed))
+            .map(|(id, _)| id.clone())
+        else {
+            return Err(SessionError::NotFound);
+        };
+        let envelope = {
+            let tx = sessions
+                .get(&id)
+                .map(|handle| handle.tx.clone())
+                .ok_or(SessionError::NotFound)?;
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(SessionCommand::Export { reply: reply_tx })
+                .await
+                .map_err(|_| SessionError::Unavailable)?;
+            reply_rx.await.map_err(|_| SessionError::Unavailable)?
+        };
+        let Some(path) = self.session_file(&id) else {
+            return Err(SessionError::Unavailable);
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|_| SessionError::Unavailable)?;
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&envelope).map_err(|_| SessionError::Unavailable)?;
+        // 先写临时文件再原子重命名：崩溃/并发下不会留下半个信封
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes).map_err(|_| SessionError::Unavailable)?;
+        std::fs::rename(&tmp, &path).map_err(|_| SessionError::Unavailable)?;
+        sessions.remove(&id);
+        self.evictions_total.fetch_add(1, Ordering::Relaxed);
+        self.perf.bump("session_evictions");
+        Ok(())
+    }
+
+    /// 尝试从磁盘反序列化恢复冷会话；返回是否已驻留内存。
+    async fn resume_from_disk(&self, session_id: &str) -> Result<bool, SessionError> {
+        let Some(path) = self.session_file(session_id) else {
+            return Ok(false);
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(false);
+        };
+        let envelope: SessionEnvelope =
+            serde_json::from_slice(&bytes).map_err(|_| SessionError::Stale)?;
+        if envelope.format != ENVELOPE_FORMAT
+            || envelope.version != ENVELOPE_VERSION
+            || !envelope.digest_valid()
+            || envelope.session_id != session_id
+        {
+            return Err(SessionError::Stale);
+        }
+        if !envelope.engine.mismatched_fields(&self.engine_stamp()).is_empty() {
+            return Err(SessionError::Stale);
+        }
+        let restore = SessionRestore {
+            turns: envelope.turns,
+            history: envelope.history,
+            policy: envelope.policy,
+            manager: envelope.manager,
+            reasoner: envelope.reasoner,
+        };
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(session_id) {
+            return Ok(true);
+        }
+        if sessions.len() >= self.max_sessions {
+            self.freeze_lru_locked(&mut sessions).await?;
+        }
+        let handle = self
+            .spawn_actor(session_id.to_string(), Some(restore))
+            .map_err(|_| SessionError::Unavailable)?;
+        sessions.insert(session_id.to_string(), handle);
+        self.perf.bump("session_resumes");
+        Ok(true)
+    }
+
+    /// 取会话命令通道：内存命中 → 触活；冷会话 → 反序列化换入。
+    async fn session_tx(
+        &self,
+        session_id: &str,
+    ) -> Result<mpsc::Sender<SessionCommand>, SessionError> {
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(handle) = sessions.get(session_id) {
+                handle.touch(&self.activity_clock);
+                return Ok(handle.tx.clone());
+            }
+        }
+        if self.resume_from_disk(session_id).await? {
+            let sessions = self.sessions.lock().await;
+            if let Some(handle) = sessions.get(session_id) {
+                handle.touch(&self.activity_clock);
+                return Ok(handle.tx.clone());
+            }
+        }
+        Err(SessionError::NotFound)
     }
 
     async fn create_session(&self) -> Result<String, &'static str> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
-            return Err("too many sessions");
+            if self.session_dir.is_none() {
+                return Err("too many sessions");
+            }
+            self.freeze_lru_locked(&mut sessions)
+                .await
+                .map_err(|_| "failed to freeze least-recently-used session")?;
         }
         let id = format!("s-{}", self.next_session_id.fetch_add(1, Ordering::Relaxed));
-        let session = self.build_session(id.clone());
-        sessions.insert(id.clone(), session);
+        let handle = self.spawn_actor(id.clone(), None)?;
+        sessions.insert(id.clone(), handle);
         Ok(id)
     }
 
-    async fn take_turn(&self, session_id: &str, input: &str) -> Option<TurnResponse> {
+    async fn take_turn(&self, session_id: &str, input: &str) -> Result<TurnResponse, SessionError> {
         self.take_turn_with_policy(session_id, input, None).await
     }
 
@@ -487,38 +965,121 @@ impl ApiState {
         session_id: &str,
         input: &str,
         policy: Option<&SessionPolicy>,
-    ) -> Option<TurnResponse> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id)?;
-        if let Some(policy) = policy {
-            session.policy = policy.clone();
-        }
-        let response = session.run_turn(input);
+    ) -> Result<TurnResponse, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::Turn {
+            input: input.to_string(),
+            policy: policy.cloned(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| SessionError::Unavailable)?;
+        let response = reply_rx.await.map_err(|_| SessionError::Unavailable)?;
         self.turns_total.fetch_add(1, Ordering::Relaxed);
-        Some(response)
+        Ok(response)
     }
 
-    async fn session_snapshot(&self, session_id: &str) -> Option<serde_json::Value> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(session_id)?;
-        Some(serde_json::json!({
-            "session_id": session.id,
-            "turns": session.turns,
-            "focus": session.manager.focus_entity(),
-            "focus_stack": session.manager.focus_stack(),
-            "history": session.history,
-            "summary": session.manager.summary(),
-            "policy": session.policy,
+    async fn session_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::Snapshot { reply: reply_tx })
+            .await
+            .map_err(|_| SessionError::Unavailable)?;
+        reply_rx.await.map_err(|_| SessionError::Unavailable)
+    }
+
+    /// 导出会话信封（在 actor 内取一致快照）。
+    async fn export_session(&self, session_id: &str) -> Result<SessionEnvelope, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::Export { reply: reply_tx })
+            .await
+            .map_err(|_| SessionError::Unavailable)?;
+        reply_rx.await.map_err(|_| SessionError::Unavailable)
+    }
+
+    /// 导入结果：新会话 id + 被显式接收的陌生字段回执。
+    async fn import_session(
+        &self,
+        restore: SessionRestore,
+        session_id: String,
+        foreign_fields: Vec<String>,
+    ) -> Result<serde_json::Value, ImportError> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&session_id) {
+            return Err(ImportError::Conflict(format!(
+                "session {} already exists",
+                session_id
+            )));
+        }
+        if sessions.len() >= self.max_sessions {
+            if self.session_dir.is_none() {
+                return Err(ImportError::TooMany);
+            }
+            self.freeze_lru_locked(&mut sessions)
+                .await
+                .map_err(|_| ImportError::Conflict("failed to freeze session".to_string()))?;
+        }
+        let handle = self
+            .spawn_actor(session_id.clone(), Some(restore))
+            .map_err(|message| ImportError::Conflict(message.to_string()))?;
+        sessions.insert(session_id.clone(), handle);
+        Ok(serde_json::json!({
+            "object": "session.imported",
+            "session_id": session_id,
+            "foreign_accepted": !foreign_fields.is_empty(),
+            "foreign_fields": foreign_fields,
         }))
     }
 
     async fn close_session(&self, session_id: &str) -> bool {
-        self.sessions.lock().await.remove(session_id).is_some()
+        let removed = self.sessions.lock().await.remove(session_id).is_some();
+        match self.session_file(session_id) {
+            // 冷会话（已换出）也必须可删除，否则会被下次访问复活
+            Some(path) => {
+                let file_removed = std::fs::remove_file(&path).is_ok();
+                removed || file_removed
+            }
+            None => removed,
+        }
     }
 
     async fn session_count(&self) -> usize {
         self.sessions.lock().await.len()
     }
+
+    /// 冷存储中的会话数（`.json` 信封文件计数，供 `/metrics` 观测换出水位）。
+    fn cold_session_count(&self) -> usize {
+        let Some(dir) = &self.session_dir else {
+            return 0;
+        };
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .map(|ext| ext == "json")
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}
+
+/// 导入失败的具体原因（映射到 HTTP 状态与错误码）。
+#[derive(Debug)]
+enum ImportError {
+    BadRequest(String),
+    Conflict(String),
+    TooMany,
 }
 
 /// 启动服务（阻塞直到监听套接字出错）。
@@ -529,16 +1090,16 @@ pub async fn serve(state: Arc<ApiState>, addr: &str) -> std::io::Result<()> {
 
 /// 在已绑定的监听器上运行（测试可直接绑定 `127.0.0.1:0`）。
 ///
-/// 会话（及其推理器）不是 `Send`，连接按到达顺序串行处理；
-/// 每个连接有 [`CONNECTION_TIMEOUT`] 兜底，避免慢客户端永久占用。
+/// [`ApiState`] 现在是 `Send + Sync`（会话在专属 actor 线程内），因此每个连接
+/// 独立 `tokio::spawn`：跨会话真并行、同会话由 actor 串行化；每个连接仍有
+/// [`CONNECTION_TIMEOUT`] 兜底，慢客户端不再阻塞新连接。
 pub async fn run(listener: TcpListener, state: Arc<ApiState>) -> std::io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
-        let _ = tokio::time::timeout(
-            CONNECTION_TIMEOUT,
-            serve_connection(stream, Arc::clone(&state)),
-        )
-        .await;
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(CONNECTION_TIMEOUT, serve_connection(stream, state)).await;
+        });
     }
 }
 
@@ -643,6 +1204,8 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "GET /metrics",
                     "POST /sessions",
                     "GET /sessions/{id}",
+                    "GET /sessions/{id}/export",
+                    "POST /sessions/import",
                     "DELETE /sessions/{id}",
                     "POST /sessions/{id}/turns",
                     "GET /v1/models",
@@ -666,6 +1229,9 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 "sessions": state.session_count().await,
                 "turns_total": state.turns_total.load(Ordering::Relaxed),
                 "max_sessions": state.max_sessions,
+                "session_dir": state.session_dir.as_ref().map(|dir| dir.display().to_string()),
+                "cold_sessions": state.cold_session_count(),
+                "evictions_total": state.evictions_total.load(Ordering::Relaxed),
                 "perf": state.perf.snapshot(),
             }),
         ),
@@ -673,9 +1239,17 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             Ok(session_id) => Response::json(201, &serde_json::json!({"session_id": session_id})),
             Err(message) => Response::error(429, message),
         },
+        ("POST", ["sessions", "import"]) => handle_import(state, request).await,
         ("GET", ["sessions", id]) => match state.session_snapshot(id).await {
-            Some(snapshot) => Response::json(200, &snapshot),
-            None => Response::error(404, "session not found"),
+            Ok(snapshot) => Response::json(200, &snapshot),
+            Err(error) => session_error_response(error),
+        },
+        ("GET", ["sessions", id, "export"]) => match state.export_session(id).await {
+            Ok(envelope) => Response::json(
+                200,
+                &serde_json::to_value(&envelope).unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            Err(error) => session_error_response(error),
         },
         ("DELETE", ["sessions", id]) => {
             if state.close_session(id).await {
@@ -690,11 +1264,11 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 Err(message) => return Response::error(400, &message),
             };
             match state.take_turn(id, &input).await {
-                Some(turn) => Response::json(
+                Ok(turn) => Response::json(
                     200,
                     &serde_json::to_value(&turn).unwrap_or_else(|_| serde_json::json!({})),
                 ),
-                None => Response::error(404, "session not found"),
+                Err(error) => session_error_response(error),
             }
         }
         ("GET", ["v1", "models"]) => Response::json(
@@ -765,6 +1339,104 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
         }
         (_method, _) => Response::error(404, "not found"),
     }
+}
+
+fn session_error_response(error: SessionError) -> Response {
+    match error {
+        SessionError::NotFound => Response::error(404, "session not found"),
+        SessionError::Unavailable => Response::error(500, "session actor unavailable"),
+        SessionError::Stale => Response::error(
+            409,
+            "session snapshot is stale or from a different engine; re-import it explicitly",
+        ),
+    }
+}
+
+/// 导入信封：解析 → 校验（格式/版本/摘要/引擎/尺寸）→ 零副作用重建会话。
+async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
+    if request.body.len() > state.max_body_bytes {
+        return Response::error(413, "envelope too large");
+    }
+    let envelope: SessionEnvelope = match serde_json::from_slice(&request.body) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return Response::error(400, &format!("invalid envelope JSON: {}", error))
+        }
+    };
+    let accept_foreign = request
+        .query
+        .get("accept_foreign")
+        .map(|value| value == "1" || value == "true")
+        .unwrap_or(false);
+    match validate_envelope(state, envelope, accept_foreign) {
+        Ok((restore, session_id, foreign_fields)) => {
+            match state.import_session(restore, session_id, foreign_fields).await {
+                Ok(body) => Response::json(201, &body),
+                Err(ImportError::BadRequest(message)) => Response::error(400, &message),
+                Err(ImportError::Conflict(message)) => Response::error(409, &message),
+                Err(ImportError::TooMany) => Response::error(429, "too many sessions"),
+            }
+        }
+        Err(ImportError::BadRequest(message)) => Response::error(400, &message),
+        Err(ImportError::Conflict(message)) => Response::error(409, &message),
+        Err(ImportError::TooMany) => Response::error(429, "too many sessions"),
+    }
+}
+
+/// 四重校验：格式标识、版本、摘要（防篡改）、引擎指纹（防陌生引擎）。
+///
+/// 任一项失败都**不**产生任何副作用（会话表不变）。
+fn validate_envelope(
+    state: &ApiState,
+    envelope: SessionEnvelope,
+    accept_foreign: bool,
+) -> Result<(SessionRestore, String, Vec<String>), ImportError> {
+    if envelope.format != ENVELOPE_FORMAT {
+        return Err(ImportError::BadRequest(format!(
+            "unknown envelope format: {}",
+            truncate_chars(&envelope.format, 32)
+        )));
+    }
+    if envelope.version != ENVELOPE_VERSION {
+        return Err(ImportError::Conflict(format!(
+            "unsupported envelope version: {} (expected {})",
+            envelope.version, ENVELOPE_VERSION
+        )));
+    }
+    if !envelope.digest_valid() {
+        return Err(ImportError::Conflict(
+            "envelope digest mismatch (tampered or truncated)".to_string(),
+        ));
+    }
+    if envelope.session_id.trim().is_empty() || envelope.session_id.len() > 128 {
+        return Err(ImportError::BadRequest(
+            "envelope session_id must be 1..=128 bytes".to_string(),
+        ));
+    }
+    if !envelope
+        .session_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(ImportError::BadRequest(
+            "envelope session_id may only contain [A-Za-z0-9_-]".to_string(),
+        ));
+    }
+    let foreign_fields = envelope.engine.mismatched_fields(&state.engine_stamp());
+    if !foreign_fields.is_empty() && !accept_foreign {
+        return Err(ImportError::Conflict(format!(
+            "foreign envelope (engine mismatch: {}); retry with ?accept_foreign=1 to import",
+            foreign_fields.join(", ")
+        )));
+    }
+    let restore = SessionRestore {
+        turns: envelope.turns,
+        history: envelope.history,
+        policy: envelope.policy,
+        manager: envelope.manager,
+        reasoner: envelope.reasoner,
+    };
+    Ok((restore, envelope.session_id, foreign_fields))
 }
 
 /// OpenAI 兼容的聊天请求（`session_id` 为本服务的扩展字段）。
@@ -844,8 +1516,12 @@ async fn run_chat_turns(
             .take_turn_with_policy(session_id, input, chat.policy.as_ref())
             .await
         {
-            Some(turn) => Ok((turn, prompt_chars)),
-            None => Err((404, "session not found".to_string())),
+            Ok(turn) => Ok((turn, prompt_chars)),
+            Err(SessionError::NotFound) => Err((404, "session not found".to_string())),
+            Err(SessionError::Unavailable) => {
+                Err((500, "session actor unavailable".to_string()))
+            }
+            Err(SessionError::Stale) => Err((409, "session snapshot is stale".to_string())),
         };
     }
     let temp_id = state
@@ -856,7 +1532,8 @@ async fn run_chat_turns(
     for input in &chat.inputs {
         last = state
             .take_turn_with_policy(&temp_id, input, chat.policy.as_ref())
-            .await;
+            .await
+            .ok();
     }
     state.close_session(&temp_id).await;
     last.map(|turn| (turn, prompt_chars))
@@ -1017,9 +1694,9 @@ async fn stream_turn(
         }
     };
     let turn = match state.take_turn(session_id, &input).await {
-        Some(turn) => turn,
-        None => {
-            write_response(stream, Response::error(404, "session not found")).await?;
+        Ok(turn) => turn,
+        Err(error) => {
+            write_response(stream, session_error_response(error)).await?;
             return Ok(());
         }
     };
@@ -1158,6 +1835,8 @@ fn status_reason(status: u16) -> &'static str {
         201 => "Created",
         400 => "Bad Request",
         404 => "Not Found",
+        409 => "Conflict",
+        413 => "Payload Too Large",
         429 => "Too Many Requests",
         _ => "Internal Server Error",
     }
@@ -1183,10 +1862,17 @@ mod tests {
     use super::*;
 
     fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn turn_response_is_send() {
         assert_send::<TurnResponse>();
+    }
+
+    #[test]
+    fn api_state_is_send_and_sync() {
+        // actor 化后的核心契约：HTTP 层可以跨线程/跨任务共享服务状态
+        assert_send_sync::<ApiState>();
     }
 
     fn test_state(max_sessions: usize) -> Arc<ApiState> {
@@ -1220,8 +1906,8 @@ mod tests {
         ))
     }
 
-    /// 服务状态不是 `Send`（推理器含 `Rc`），因此把服务跑在专属 OS 线程的
-    /// current-thread 运行时里；测试只通过 TCP 交互，不跨线程共享状态。
+    /// 服务跑在专属 OS 线程的 current-thread 运行时里（会话 actor 由 `run`
+    /// 自行派生）；测试只通过 TCP 交互。
     fn start_server(max_sessions: usize) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         start_server_with_recovery(max_sessions, RecoveryMode::Observe)
     }
@@ -1229,6 +1915,14 @@ mod tests {
     fn start_server_with_recovery(
         max_sessions: usize,
         recovery: RecoveryMode,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        start_server_with_options(max_sessions, recovery, None)
+    }
+
+    fn start_server_with_options(
+        max_sessions: usize,
+        recovery: RecoveryMode,
+        session_dir: Option<std::path::PathBuf>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1244,10 +1938,24 @@ mod tests {
                 // Arc::get_mut 不适用（已 Arc）：状态在启动前唯一持有，先解包
                 let inner = Arc::get_mut(&mut state).expect("测试启动前状态唯一");
                 inner.set_recovery_mode(recovery);
+                if let Some(dir) = session_dir {
+                    inner.set_session_dir(dir);
+                }
                 let _ = run(listener, state).await;
             });
         });
         (addr, handle)
+    }
+
+    fn temp_session_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kp-serve-{}-{}",
+            std::process::id(),
+            label
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     async fn raw_request(
@@ -1733,5 +2441,300 @@ mod tests {
         let (status, _, body) = raw_request(addr, "GET", "/", &[], "").await;
         assert_eq!(status, 200);
         assert!(body.contains("/v1/prompts"), "{}", body);
+    }
+
+    async fn take_turn_body(
+        addr: std::net::SocketAddr,
+        session_id: &str,
+        input: &str,
+    ) -> serde_json::Value {
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[],
+            input,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        serde_json::from_str(&body).unwrap()
+    }
+
+    async fn export_envelope(
+        addr: std::net::SocketAddr,
+        session_id: &str,
+    ) -> serde_json::Value {
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/export", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn session_envelope_export_import_roundtrip_is_behaviorally_exact() {
+        let (addr, _server) = start_server(4);
+        let session_id = create_session(addr).await;
+        take_turn_body(addr, &session_id, "姚明是谁").await;
+        take_turn_body(addr, &session_id, "他的身高呢").await;
+
+        let envelope = export_envelope(addr, &session_id).await;
+        assert_eq!(envelope["format"], ENVELOPE_FORMAT);
+        assert_eq!(envelope["version"], ENVELOPE_VERSION);
+        assert_eq!(envelope["session_id"], session_id);
+        assert_eq!(envelope["turns"], 2);
+        assert_eq!(envelope["engine"]["kb_facts"], 2);
+        assert_eq!(
+            envelope["digest"].as_str().map(str::len),
+            Some(16),
+            "{}",
+            envelope
+        );
+        // 信封是纯 JSON 值，摘要字段可独立复核
+        let mut check: SessionEnvelope = serde_json::from_value(envelope.clone()).unwrap();
+        let digest = check.digest.clone();
+        check.seal();
+        assert_eq!(check.digest, digest, "导出摘要必须自洽可复核");
+        assert!(check.digest_valid());
+
+        // 对照组：导出后原会话继续走一轮
+        let original = take_turn_body(addr, &session_id, "姚明的国籍是什么").await;
+        assert!(original["reply"].as_str().unwrap().contains("中国"));
+
+        // 关闭原会话 → 反序列化信封重建同 id 会话
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let payload = serde_json::to_string(&envelope).unwrap();
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/sessions/import",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+        let imported: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(imported["session_id"], session_id);
+        assert_eq!(imported["foreign_accepted"], false);
+
+        // 恢复后的同一下一轮输出必须逐字一致（含轮号/状态/焦点/策略）
+        let restored = take_turn_body(addr, &session_id, "姚明的国籍是什么").await;
+        assert_eq!(original, restored, "恢复等价性：可观察输出逐字一致");
+    }
+
+    #[tokio::test]
+    async fn import_gates_tampering_version_and_foreign_engine_with_zero_side_effects() {
+        let (addr, _server) = start_server(4);
+        let session_id = create_session(addr).await;
+        take_turn_body(addr, &session_id, "姚明是谁").await;
+        let envelope = export_envelope(addr, &session_id).await;
+
+        let session_count = |value: &serde_json::Value| value["sessions"].as_u64().unwrap();
+
+        // 1) 篡改内容但不重算摘要 → 409，且零副作用
+        let mut tampered: SessionEnvelope = serde_json::from_value(envelope.clone()).unwrap();
+        tampered.history.push("伪造的历史".to_string());
+        let body = serde_json::to_string(&tampered).unwrap();
+        let (status, _, response) =
+            raw_request(addr, "POST", "/sessions/import", &[], &body).await;
+        assert_eq!(status, 409, "{}", response);
+        assert!(response.contains("digest"), "{}", response);
+        let (_, _, metrics) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+        assert_eq!(session_count(&metrics), 1, "校验失败不得产生会话");
+
+        // 2) 未知版本 → 409
+        let mut future: SessionEnvelope = serde_json::from_value(envelope.clone()).unwrap();
+        future.version = ENVELOPE_VERSION + 1;
+        future.seal();
+        let body = serde_json::to_string(&future).unwrap();
+        let (status, _, response) =
+            raw_request(addr, "POST", "/sessions/import", &[], &body).await;
+        assert_eq!(status, 409, "{}", response);
+        assert!(response.contains("version"), "{}", response);
+
+        // 3) 陌生引擎（crate 版本不同）→ 默认拒收
+        let mut foreign: SessionEnvelope = serde_json::from_value(envelope.clone()).unwrap();
+        foreign.session_id = "s-foreign".to_string();
+        foreign.engine.crate_version = "0.0.0-foreign".to_string();
+        foreign.seal();
+        let body = serde_json::to_string(&foreign).unwrap();
+        let (status, _, response) =
+            raw_request(addr, "POST", "/sessions/import", &[], &body).await;
+        assert_eq!(status, 409, "{}", response);
+        assert!(response.contains("foreign envelope"), "{}", response);
+        assert!(response.contains("crate_version"), "{}", response);
+
+        // 4) 显式 accept_foreign → 201，并带回执字段，重建的会话可继续对话
+        let (status, _, response) = raw_request(
+            addr,
+            "POST",
+            "/sessions/import?accept_foreign=1",
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", response);
+        let imported: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(imported["foreign_accepted"], true);
+        assert_eq!(imported["foreign_fields"][0], "crate_version");
+        let turn = take_turn_body(addr, &"s-foreign".to_string(), "他的身高呢").await;
+        assert!(
+            turn["reply"].as_str().unwrap().contains("226"),
+            "外来信封恢复后应保留焦点记忆：{}",
+            turn
+        );
+
+        // 5) id 冲突 → 409（不覆盖在用会话）
+        let conflict_body = serde_json::to_string(&{
+            let mut value: SessionEnvelope = serde_json::from_value(envelope.clone()).unwrap();
+            value.seal();
+            value
+        })
+        .unwrap();
+        let (status, _, response) =
+            raw_request(addr, "POST", "/sessions/import", &[], &conflict_body).await;
+        assert_eq!(status, 409, "{}", response);
+        assert!(response.contains("already exists"), "{}", response);
+
+        // 原有会话不受任何导入尝试影响
+        let turn = take_turn_body(addr, &session_id, "他的身高呢").await;
+        assert!(turn["reply"].as_str().unwrap().contains("226"), "{}", turn);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_are_isolated_actors() {
+        let (addr, _server) = start_server(4);
+        let first = create_session(addr).await;
+        let second = create_session(addr).await;
+        let first_path = format!("/sessions/{}/turns", first);
+        let second_path = format!("/sessions/{}/turns", second);
+        let (a, b) = tokio::join!(
+            raw_request(addr, "POST", &first_path, &[], "姚明的身高是多少"),
+            raw_request(addr, "POST", &second_path, &[], "姚明的国籍是什么"),
+        );
+        assert_eq!(a.0, 200, "{}", a.2);
+        assert!(a.2.contains("226"), "{}", a.2);
+        assert_eq!(b.0, 200, "{}", b.2);
+        assert!(b.2.contains("中国"), "{}", b.2);
+        // 指代各自解析到各会话自己的焦点，不串台
+        let a2 = take_turn_body(addr, &first, "他的国籍呢").await;
+        let b2 = take_turn_body(addr, &second, "他的身高呢").await;
+        assert!(a2["reply"].as_str().unwrap().contains("中国"), "{}", a2);
+        assert!(b2["reply"].as_str().unwrap().contains("226"), "{}", b2);
+    }
+
+    #[tokio::test]
+    async fn cold_sessions_freeze_and_resume_across_capacity() {
+        let dir = temp_session_dir("cold");
+        let (addr, _server) =
+            start_server_with_options(1, RecoveryMode::Observe, Some(dir.clone()));
+        let first = create_session(addr).await;
+        take_turn_body(addr, &first, "姚明是谁").await;
+
+        // 容量 1：新建第二个会话必须把 LRU（first）冻结到磁盘
+        let second = create_session(addr).await;
+        assert!(
+            dir.join(format!("{}.json", first)).exists(),
+            "冷会话应落盘：{:?}",
+            dir
+        );
+        let (_, _, metrics) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+        assert_eq!(metrics["sessions"], 1);
+        assert_eq!(metrics["evictions_total"], 1, "{}", metrics);
+        assert_eq!(metrics["cold_sessions"], 1, "{}", metrics);
+        assert!(metrics["session_dir"].as_str().unwrap().contains("kp-serve"));
+
+        take_turn_body(addr, &second, "姚明是谁").await;
+
+        // 访问冷会话 → 反序列化换入（焦点/轮号随快照恢复），并冻结当前 LRU
+        let resumed = take_turn_body(addr, &first, "他的身高呢").await;
+        assert!(
+            resumed["reply"].as_str().unwrap().contains("226"),
+            "焦点记忆应随反序列化恢复：{}",
+            resumed
+        );
+        assert_eq!(resumed["turn"], 2, "轮号应连续：{}", resumed);
+        assert_eq!(resumed["focus"], "姚明");
+        assert!(
+            dir.join(format!("{}.json", second)).exists(),
+            "换入 first 时应把 second 冻结"
+        );
+
+        // DELETE 清除内存与冷存储：已删除会话不得从磁盘复活
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", first),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            !dir.join(format!("{}.json", first)).exists(),
+            "删除会话应清理冷存储"
+        );
+        let (status, _, _) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", first),
+            &[],
+            "你好",
+        )
+        .await;
+        assert_eq!(status, 404, "已删除的会话不得复活");
+
+        // second 仍在冷存储，可恢复并继续多轮记忆
+        let reopened = take_turn_body(addr, &second, "他的国籍呢").await;
+        assert!(
+            reopened["reply"].as_str().unwrap().contains("中国"),
+            "{}",
+            reopened
+        );
+        assert_eq!(reopened["turn"], 2, "{}", reopened);
+
+        // 冷会话也必须可删除：再次换出 second 后 DELETE 应清理磁盘且不得复活
+        let third = create_session(addr).await;
+        assert!(
+            dir.join(format!("{}.json", second)).exists(),
+            "新建 third 应换出 second"
+        );
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", second),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "冷会话删除应成功");
+        assert!(!dir.join(format!("{}.json", second)).exists());
+        let (status, _, _) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", second),
+            &[],
+            "你好",
+        )
+        .await;
+        assert_eq!(status, 404, "已删除的冷会话不得复活");
+        let _ = third;
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
