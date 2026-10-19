@@ -82,6 +82,7 @@ pub mod identity;
 pub mod entity_registry;
 pub mod shape_gate;
 pub mod relation_acquisition;
+pub mod contextual_reference;
 
 #[cfg(test)]
 mod dialogue_conformance;
@@ -2145,6 +2146,47 @@ impl OxigraphManager {
                 }
                 entity_registry::NominationKind::Tombstoned => {
                     self.perf.bump("identity_nominate_tombstoned")
+                }
+                _ => {}
+            }
+            outcomes.push(outcome);
+        }
+        outcomes
+    }
+
+    /// 语境指称绑定经二次确认后的别名提名（来源＝用户确认，仍走类型闸门）。
+    pub fn nominate_dialogue_aliases(
+        &self,
+        candidates: &[entity_registry::AliasCandidate],
+    ) -> Vec<entity_registry::NominationOutcome> {
+        let types = self.type_system.read().clone();
+        let mut registry = self.entity_registry.write();
+        let mut outcomes = Vec::new();
+        for candidate in candidates {
+            let evidence = if candidate.evidence.is_empty() {
+                candidate.pattern.clone()
+            } else {
+                format!("{}：{}", candidate.pattern, candidate.evidence)
+            };
+            let outcome = registry.nominate_alias_with_types(
+                &candidate.surface,
+                &candidate.canonical,
+                entity_registry::NominationOrigin::Dialogue,
+                &evidence,
+                Some(&types),
+            );
+            match outcome.kind {
+                entity_registry::NominationKind::Confirmed => {
+                    self.perf.bump("identity_dialogue_confirmed")
+                }
+                entity_registry::NominationKind::Pending => {
+                    self.perf.bump("identity_dialogue_pending")
+                }
+                entity_registry::NominationKind::TypeConflict => {
+                    self.perf.bump("identity_dialogue_type_conflict")
+                }
+                entity_registry::NominationKind::Tombstoned => {
+                    self.perf.bump("identity_dialogue_tombstoned")
                 }
                 _ => {}
             }

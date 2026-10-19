@@ -649,6 +649,11 @@ impl EntityLinker {
         mentions
     }
 
+    /// 按词面取精确/别名候选（只读；供语境消歧剥离量词/同位语前缀后复核）。
+    pub fn surface_candidates(&self, surface: &str) -> Vec<LinkCandidate> {
+        self.candidates_for_surface(surface)
+    }
+
     fn candidates_for_surface(&self, surface: &str) -> Vec<LinkCandidate> {
         let Some(canonicals) = self.surface_candidates.get(surface) else {
             return Vec::new();
@@ -1186,6 +1191,44 @@ impl EntityLinker {
         self.profiles
             .get(entity)
             .and_then(|profile| profile.etype.as_deref())
+    }
+
+    /// 实体的图谱度数（未登记为 0）；供语境指称消歧的义项卡只读复用。
+    pub fn degree_of(&self, entity: &str) -> usize {
+        self.profiles.get(entity).map(|p| p.degree).unwrap_or(0)
+    }
+
+    /// 实体的一跳邻居锚点（字典序；未登记为空）。只读视图，不改变链接行为。
+    pub fn neighbors_of(&self, entity: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .neighbors
+            .get(entity)
+            .map(|neighbors| neighbors.iter().cloned().collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// 实体作为主语出现过的谓词（字典序；未登记为空）。
+    pub fn out_predicates_of(&self, entity: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .out_predicates
+            .get(entity)
+            .map(|predicates| predicates.keys().cloned().collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// 实体作为宾语出现过的谓词（字典序；未登记为空）。
+    pub fn in_predicates_of(&self, entity: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .in_predicates
+            .get(entity)
+            .map(|predicates| predicates.keys().cloned().collect())
+            .unwrap_or_default();
+        out.sort();
+        out
     }
 
     /// 从当前词表导出身份注册表（只读审计视图；歧义别名原样保留，不静默取一）。

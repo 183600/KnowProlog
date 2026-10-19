@@ -15,6 +15,7 @@ use crate::causal_tokenization::{
     attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS,
 };
 use crate::chinese_reasoning_nlu::{self, LessonKind};
+use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
@@ -768,6 +769,47 @@ impl Clone for SymbolicReasoner {
             perf: Arc::clone(&self.perf),
             engine_fault: self.engine_fault.clone(),
         }
+    }
+}
+
+/// 语境指称消歧（CRD）的只读义项来源：复用生成器（类型/谓词/取值）与
+/// 链接器（邻居锚点/度数），不新建词表、不重写链接打分。
+const SENSE_CARD_ANCHOR_LIMIT: usize = 8;
+
+impl SenseSource for SymbolicReasoner {
+    fn sense_card(&self, entity: &str) -> Option<SenseCard> {
+        let known = self.generator.is_known_entity(entity) || self.linker.is_known_entity(entity);
+        if !known {
+            return None;
+        }
+        let etype = self
+            .linker
+            .entity_type(entity)
+            .map(str::to_string)
+            .or_else(|| self.generator.entity_type_of(entity).map(str::to_string));
+        let mut out_predicates = self.generator.relation_predicates(entity);
+        out_predicates.extend(self.generator.attribute_keys(entity));
+        out_predicates.sort();
+        out_predicates.dedup();
+        let in_predicates = self.generator.relation_predicates_in(entity);
+        let mut anchors = self.linker.neighbors_of(entity);
+        anchors.truncate(SENSE_CARD_ANCHOR_LIMIT);
+        Some(SenseCard {
+            entity: entity.to_string(),
+            etype,
+            out_predicates,
+            in_predicates,
+            anchors,
+            degree: self.linker.degree_of(entity),
+        })
+    }
+
+    fn predicate_values(&self, entity: &str, predicate: &str) -> Vec<String> {
+        self.generator.relation_values(entity, predicate)
+    }
+
+    fn predicate_values_in(&self, entity: &str, predicate: &str) -> Vec<String> {
+        self.generator.relation_values_in(entity, predicate)
     }
 }
 

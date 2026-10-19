@@ -26,6 +26,10 @@ use know_prolog::{
     dialogue_frame::ClarificationOutcome,
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::DialogueManager,
+    contextual_reference::{
+        parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
+        ContextualResolver,
+    },
     recovery::RecoveryMode,
     holographic_memory::{HoloAnalogyHit, HoloHit},
     import_journal::{ImportJournal, JournalLoad},
@@ -1547,6 +1551,19 @@ async fn run_interactive_mode(
     }
     // 实体身份：已确认的持久别名同步进链接器（别名与规范名同权）
     sync_entity_aliases(&mut symbolic_reasoner, &oxigraph_manager);
+    // 语境指称消歧（CRD）：跨轮「说法 ↔ 实体」绑定账本 + 区分性追问；
+    // 账本落盘 {store}/reference_bindings.json，重启后仍记得澄清过的指称。
+    let reference_binding_path = format!("{}/reference_bindings.json", store_path);
+    let mut crd_ledger = match BindingLedger::load_from_path(&reference_binding_path) {
+        Some(ledger) if !ledger.is_empty() => {
+            println!("已恢复指称绑定账本：{} 条（「绑定账本」查看）。", ledger.len());
+            ledger
+        }
+        _ => BindingLedger::new(),
+    };
+    let crd_resolver = ContextualResolver::new();
+    // 进行中的澄清请求：下一轮优先按「选哪个/不是A是B」结算
+    let mut crd_pending: Option<ClarifyRequest> = None;
     // 导入日志：跨重启的有界撤销栈
     let journal_path = format!("{}/import_journal.json", store_path);
     let mut import_journal = match ImportJournal::load(&journal_path) {
@@ -2623,6 +2640,13 @@ async fn run_interactive_mode(
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             println!("{}", oxigraph_manager.entity_registry_report());
             println!("{}", symbolic_reasoner.identity_report());
+            println!();
+            continue;
+        }
+
+        // 指称绑定账本：跨轮「说法 ↔ 实体」绑定与澄清裁决记录（CRD）
+        if matches!(input, "绑定账本" | "指称账本" | "语境账本") {
+            println!("{}", crd_ledger.report());
             println!();
             continue;
         }
@@ -4006,8 +4030,130 @@ async fn run_interactive_mode(
                 }
             }
             InputMode::Query => {
+                // 语境指称消歧（CRD）：先结算上一轮反问，再对本轮做绑定/改写/追问。
+                crd_ledger.begin_turn();
+                let mut crd_input: Option<String> = None;
+                if let Some(pending) = crd_pending.take() {
+                    match parse_clarify_act(input, &pending.question) {
+                        Some(ClarifyAct::Choose { entity, .. })
+                        | Some(ClarifyAct::Restate { entity }) => {
+                            crd_ledger.bind(
+                                &pending.key,
+                                &entity,
+                                BindingScope::Topic,
+                                &format!("澄清回答：{}", input),
+                            );
+                            println!("（语境绑定：{} ⇒ {}）", pending.mention, entity);
+                            crd_input = Some(rewrite_at(
+                                &pending.original_input,
+                                pending.start,
+                                pending.mention.chars().count(),
+                                &entity,
+                            ));
+                            let _ = crd_ledger.save_to_path(&reference_binding_path);
+                        }
+                        Some(ClarifyAct::Correct { to, .. }) => {
+                            crd_ledger.correct(&pending.key, &to, &format!("澄清纠正：{}", input));
+                            println!("（语境纠错：{} ⇒ {}）", pending.mention, to);
+                            crd_input = Some(rewrite_at(
+                                &pending.original_input,
+                                pending.start,
+                                pending.mention.chars().count(),
+                                &to,
+                            ));
+                            let _ = crd_ledger.save_to_path(&reference_binding_path);
+                        }
+                        Some(ClarifyAct::Unknown) | Some(ClarifyAct::Decline) => {
+                            println!("（已跳过这次澄清，仍按原句理解。）");
+                        }
+                        None => {
+                            // 不是澄清回答：丢弃待定问题，按新输入继续。
+                        }
+                    }
+                }
+                // 二次确认的绑定 → 别名提名（类型闸门 + 人工复核，不自动改库）
+                if crd_input.is_some() {
+                    let nominations = crd_ledger.take_alias_nominations();
+                    if !nominations.is_empty() {
+                        let candidates: Vec<know_prolog::entity_registry::AliasCandidate> =
+                            nominations
+                                .iter()
+                                .map(|nomination| know_prolog::entity_registry::AliasCandidate {
+                                    surface: nomination.surface.clone(),
+                                    canonical: nomination.canonical.clone(),
+                                    pattern: "语境指称绑定".to_string(),
+                                    evidence: nomination.evidence.clone(),
+                                })
+                                .collect();
+                        let outcomes = oxigraph_manager.nominate_dialogue_aliases(&candidates);
+                        for outcome in outcomes {
+                            match outcome.kind {
+                                know_prolog::entity_registry::NominationKind::Confirmed => {
+                                    println!(
+                                        "（语境绑定已获二次确认：「{}」≡「{}」，已登记为别名。）",
+                                        outcome.surface, outcome.canonical
+                                    );
+                                    let _ = symbolic_reasoner
+                                        .register_entity_alias(&outcome.surface, &outcome.canonical);
+                                }
+                                know_prolog::entity_registry::NominationKind::Pending => {
+                                    println!(
+                                        "（语境绑定提名待确认：「{}」≡「{}」，用「身份台账」复核。）",
+                                        outcome.surface, outcome.canonical
+                                    );
+                                }
+                                know_prolog::entity_registry::NominationKind::TypeConflict => {
+                                    println!(
+                                        "（语境绑定提名类型冲突：「{}」≡「{}」，需人工裁决。）",
+                                        outcome.surface, outcome.canonical
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                    }
+                }
+                if crd_input.is_none()
+                    && (contains_question_marker(input) || input.contains('？') || input.contains('?'))
+                {
+                    let outcome = crd_resolver.resolve_text(
+                        input,
+                        symbolic_reasoner.linker(),
+                        &symbolic_reasoner,
+                        &crd_ledger,
+                        &[],
+                        dialogue_manager.focus_entity(),
+                    );
+                    // 只在确有竞争/绑定/追问/描述改写时展示证据，避免每问都刷屏
+                    let show_notes = outcome.ask.is_some()
+                        || outcome.rewrite.is_some()
+                        || outcome.resolutions.iter().any(|resolution| {
+                            resolution.candidates.len() > 1
+                                || resolution.verdict == know_prolog::contextual_reference::Verdict::Bound
+                        });
+                    if show_notes {
+                        for note in &outcome.notes {
+                            println!("（{}）", note);
+                        }
+                    }
+                    if let Some(ask) = outcome.ask {
+                        println!("{}", ask.question.render());
+                        crd_pending = Some(ask);
+                        println!();
+                        continue;
+                    }
+                    if let Some(rewrite) = outcome.rewrite {
+                        if rewrite != input {
+                            println!("（语境改写：{}）", rewrite);
+                        }
+                        crd_input = Some(rewrite);
+                    }
+                }
+                let crd_base_input = crd_input.unwrap_or_else(|| input.to_string());
+
                 // 多轮对话上下文：指代消解与省略补全（话语帧合一，符号方式，无神经网络）
-                let contextual_input = match symbolic_reasoner.contextualize_with_receipt(input) {
+                let contextual_input = match symbolic_reasoner.contextualize_with_receipt(&crd_base_input) {
                     Some(rewrite) => {
                         for note in &rewrite.notes {
                             println!("（{}）", note);
@@ -4018,12 +4164,12 @@ async fn run_interactive_mode(
                     None => {
                         // 无源可填的实体洞：不落进「无法理解」，转为一次显式绑定请求
                         // （澄清 = 请求一次绑定；常规通道必然失败时才开启）。
-                        if let Some(prompt) = symbolic_reasoner.start_frame_clarification(input) {
+                        if let Some(prompt) = symbolic_reasoner.start_frame_clarification(&crd_base_input) {
                             println!("{}", prompt);
                             println!();
                             continue;
                         }
-                        input.to_string()
+                        crd_base_input
                     }
                 };
                 let input = contextual_input.as_str();
@@ -4849,6 +4995,7 @@ fn interactive_help() -> String {
         "台账与报告",
         "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
+        "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
         "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
         "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
@@ -5047,6 +5194,9 @@ fn is_command_like(input: &str) -> bool {
         "收录",
         "身份台账",
         "身份注册表",
+        "绑定账本",
+        "指称账本",
+        "语境账本",
         "身份报告",
         "确认身份",
         "记住身份",

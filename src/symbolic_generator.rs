@@ -258,6 +258,45 @@ impl SymbolicGenerator {
         predicates
     }
 
+    /// 实体作为宾语出现过的关系谓词（入向；去重排序）。
+    /// 供语境指称消歧的义项卡比较「同一类型、不同角色」的候选。
+    pub fn relation_predicates_in(&self, entity: &str) -> Vec<String> {
+        let mut predicates: Vec<String> = self
+            .by_object
+            .get(entity)
+            .map(|objects| objects.keys().cloned().collect())
+            .unwrap_or_default();
+        predicates.sort();
+        predicates.dedup();
+        predicates
+    }
+
+    /// 出向关系取值（主语, 谓词 → 宾语；去重排序）。
+    pub fn relation_values(&self, entity: &str, predicate: &str) -> Vec<String> {
+        let mut values: Vec<String> = self
+            .by_subject
+            .get(entity)
+            .and_then(|subjects| subjects.get(predicate))
+            .cloned()
+            .unwrap_or_default();
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    /// 入向关系取值（宾语, 谓词 → 主语；去重排序）。
+    pub fn relation_values_in(&self, entity: &str, predicate: &str) -> Vec<String> {
+        let mut values: Vec<String> = self
+            .by_object
+            .get(entity)
+            .and_then(|objects| objects.get(predicate))
+            .cloned()
+            .unwrap_or_default();
+        values.sort();
+        values.dedup();
+        values
+    }
+
     pub fn observe_entity(&mut self, name: &str, etype: &str, properties: &[(String, String)]) {
         let refs: Vec<(&str, &str)> = properties
             .iter()
