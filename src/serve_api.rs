@@ -64,6 +64,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::cache::RevisionLru;
+use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueManagerSnapshot};
 use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
@@ -75,6 +76,8 @@ use crate::ReasoningConfig;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
+/// 冷存储信封的体量上限（解码绝不因巨量输入拖垮进程）。
+const SESSION_ENVELOPE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const HISTORY_LIMIT: usize = 64;
 /// 无状态问答缓存容量（条目数）；纯函数结果，命中与重算必须逐字节一致。
@@ -555,14 +558,12 @@ pub struct SessionEnvelope {
 }
 
 impl SessionEnvelope {
-    /// 计算（不写入）摘要。
+    /// 计算（不写入）摘要。摘要对**规范字节**计算（对象键递归排序），
+    /// 因此 `HashMap` 迭代序不会泄漏进摘要：同一状态跨进程永远同一摘要。
     fn compute_digest(&self) -> String {
         let mut copy = self.clone();
         copy.digest = String::new();
-        match serde_json::to_vec(&copy) {
-            Ok(bytes) => format!("{:016x}", fnv1a(&bytes)),
-            Err(_) => String::new(),
-        }
+        canonical::canonical_digest(&copy).unwrap_or_default()
     }
 
     /// 就地封缄：写入正确摘要。
@@ -572,6 +573,39 @@ impl SessionEnvelope {
 
     pub fn digest_valid(&self) -> bool {
         !self.digest.is_empty() && self.digest == self.compute_digest()
+    }
+
+    /// 解码宪法入口：体量门 → 解析 → 格式门 → 版本门 → 摘要门。
+    ///
+    /// 任一门失败都返回带稳定错误码的 [`DecodeError`]，且不产生任何副作用；
+    /// 全部通过才返回信封与 [`DecodeReceipt`]（含「字节是否已规范」）。
+    pub fn decode(
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<(Self, DecodeReceipt), DecodeError> {
+        let (envelope, mut receipt) = canonical::decode_json::<Self>(
+            bytes,
+            "session_envelope",
+            ENVELOPE_VERSION,
+            max_bytes,
+        )?;
+        if envelope.format != ENVELOPE_FORMAT {
+            return Err(DecodeError::Format(truncate_chars(&envelope.format, 32)));
+        }
+        if envelope.version != ENVELOPE_VERSION {
+            return Err(DecodeError::Version {
+                found: envelope.version,
+                supported: ENVELOPE_VERSION,
+            });
+        }
+        if !envelope.digest_valid() {
+            return Err(DecodeError::Digest {
+                found: truncate_chars(&envelope.digest, 32),
+                expected: truncate_chars(&envelope.compute_digest(), 32),
+            });
+        }
+        receipt.version = envelope.version;
+        Ok((envelope, receipt))
     }
 }
 
@@ -585,10 +619,6 @@ fn fnv1a_step(hash: u64, bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    fnv1a_step(FNV_OFFSET, bytes)
 }
 
 fn fnv1a_field(hash: u64, value: &str) -> u64 {
@@ -685,11 +715,13 @@ impl SessionHandle {
 }
 
 /// 会话访问错误：区分「不存在」「actor 已退出」「冷会话不可恢复」。
+/// `Stale` 携带解码错误分类：为什么被拒（parse/version/digest/fingerprint…）
+/// 是可回答的，而不是折叠成一个「不行」。
 #[derive(Debug)]
 enum SessionError {
     NotFound,
     Unavailable,
-    Stale,
+    Stale(DecodeError),
 }
 
 /// 预热基座：进程启动时对 `(facts, reasoning config, synonyms)` 只做一次
@@ -1040,7 +1072,7 @@ impl ApiState {
                 std::fs::create_dir_all(parent).map_err(|_| SessionError::Unavailable)?;
             }
         }
-        let bytes = serde_json::to_vec_pretty(&envelope).map_err(|_| SessionError::Unavailable)?;
+        let bytes = canonical::canonical_bytes(&envelope).map_err(|_| SessionError::Unavailable)?;
         // 先写临时文件再原子重命名：崩溃/并发下不会留下半个信封
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, bytes).map_err(|_| SessionError::Unavailable)?;
@@ -1052,6 +1084,10 @@ impl ApiState {
     }
 
     /// 尝试从磁盘反序列化恢复冷会话；返回是否已驻留内存。
+    ///
+    /// 解码走 [`SessionEnvelope::decode`] 宪法：失败带分类错误码并计入
+    /// `decode_reject_<code>`；成功计入 `decode_ok`（非规范字节另计
+    /// `decode_non_canonical`，供未来 `--fix` 审计）。
     async fn resume_from_disk(&self, session_id: &str) -> Result<bool, SessionError> {
         let Some(path) = self.session_file(session_id) else {
             return Ok(false);
@@ -1060,18 +1096,32 @@ impl ApiState {
         let Ok(bytes) = std::fs::read(&path) else {
             return Ok(false);
         };
-        let envelope: SessionEnvelope =
-            serde_json::from_slice(&bytes).map_err(|_| SessionError::Stale)?;
-        self.startup.record_since("session_resume_read", read_start);
-        if envelope.format != ENVELOPE_FORMAT
-            || envelope.version != ENVELOPE_VERSION
-            || !envelope.digest_valid()
-            || envelope.session_id != session_id
+        let (envelope, receipt) = match SessionEnvelope::decode(&bytes, SESSION_ENVELOPE_MAX_BYTES)
         {
-            return Err(SessionError::Stale);
+            Ok(decoded) => decoded,
+            Err(error) => {
+                self.perf.bump(&error.metric_key());
+                return Err(SessionError::Stale(error));
+            }
+        };
+        self.startup.record_since("session_resume_read", read_start);
+        if envelope.session_id != session_id {
+            let error = DecodeError::Invariant(format!(
+                "冷存储会话 id 不匹配：{} != {}",
+                envelope.session_id, session_id
+            ));
+            self.perf.bump(&error.metric_key());
+            return Err(SessionError::Stale(error));
         }
-        if !envelope.engine.mismatched_fields(&self.engine_stamp()).is_empty() {
-            return Err(SessionError::Stale);
+        let foreign = envelope.engine.mismatched_fields(&self.engine_stamp());
+        if !foreign.is_empty() {
+            let error = DecodeError::Fingerprint(foreign);
+            self.perf.bump(&error.metric_key());
+            return Err(SessionError::Stale(error));
+        }
+        self.perf.bump("decode_ok");
+        if !receipt.canonical {
+            self.perf.bump("decode_non_canonical");
         }
         let restore = SessionRestore {
             turns: envelope.turns,
@@ -1180,12 +1230,13 @@ impl ApiState {
         reply_rx.await.map_err(|_| SessionError::Unavailable)
     }
 
-    /// 导入结果：新会话 id + 被显式接收的陌生字段回执。
+    /// 导入结果：新会话 id + 被显式接收的陌生字段回执 + 解码回执。
     async fn import_session(
         &self,
         restore: SessionRestore,
         session_id: String,
         foreign_fields: Vec<String>,
+        receipt: &DecodeReceipt,
     ) -> Result<serde_json::Value, ImportError> {
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(&session_id) {
@@ -1211,6 +1262,13 @@ impl ApiState {
             "session_id": session_id,
             "foreign_accepted": !foreign_fields.is_empty(),
             "foreign_fields": foreign_fields,
+            "decode": {
+                "code": "decode_ok",
+                "kind": receipt.kind,
+                "version": receipt.version,
+                "canonical": receipt.canonical,
+                "migrations": receipt.migrations,
+            },
         }))
     }
 
@@ -1535,24 +1593,62 @@ fn session_error_response(error: SessionError) -> Response {
     match error {
         SessionError::NotFound => Response::error(404, "session not found"),
         SessionError::Unavailable => Response::error(500, "session actor unavailable"),
-        SessionError::Stale => Response::error(
+        SessionError::Stale(error) => Response::error(
             409,
-            "session snapshot is stale or from a different engine; re-import it explicitly",
+            &format!(
+                "session snapshot is stale or from a different engine (decode_{}); re-import it explicitly",
+                error.code()
+            ),
         ),
     }
 }
 
-/// 导入信封：解析 → 校验（格式/版本/摘要/引擎/尺寸）→ 零副作用重建会话。
-async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
-    if request.body.len() > state.max_body_bytes {
-        return Response::error(413, "envelope too large");
+/// 解码失败 → HTTP 响应：保留原有人类可读措辞，附加稳定错误码。
+fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Response {
+    state.perf.bump(&error.metric_key());
+    match error {
+        DecodeError::TooLarge { .. } => Response::error(413, "envelope too large [decode_too_large]"),
+        DecodeError::Parse(message) => Response::error(
+            400,
+            &format!("invalid envelope JSON: {} [decode_parse]", message),
+        ),
+        DecodeError::Format(formatted) => Response::error(
+            400,
+            &format!("unknown envelope format: {} [decode_format]", formatted),
+        ),
+        DecodeError::Version { found, supported } => Response::error(
+            409,
+            &format!(
+                "unsupported envelope version: {} (expected {}) [decode_version]",
+                found, supported
+            ),
+        ),
+        DecodeError::Digest { .. } => Response::error(
+            409,
+            "envelope digest mismatch (tampered or truncated) [decode_digest]",
+        ),
+        other => Response::error(
+            400,
+            &format!(
+                "envelope decode failed: {} [decode_{}]",
+                other,
+                other.code()
+            ),
+        ),
     }
-    let envelope: SessionEnvelope = match serde_json::from_slice(&request.body) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            return Response::error(400, &format!("invalid envelope JSON: {}", error))
-        }
+}
+
+/// 导入信封：解码（解析/格式/版本/摘要/尺寸）→ 校验（会话 id/引擎）→
+/// 零副作用重建会话。解码回执随 201 响应返回（可审计的接收凭据）。
+async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
+    let (envelope, receipt) = match SessionEnvelope::decode(&request.body, state.max_body_bytes) {
+        Ok(decoded) => decoded,
+        Err(error) => return import_decode_response(state, &error),
     };
+    state.perf.bump("decode_ok");
+    if !receipt.canonical {
+        state.perf.bump("decode_non_canonical");
+    }
     let accept_foreign = request
         .query
         .get("accept_foreign")
@@ -1560,7 +1656,10 @@ async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
         .unwrap_or(false);
     match validate_envelope(state, envelope, accept_foreign) {
         Ok((restore, session_id, foreign_fields)) => {
-            match state.import_session(restore, session_id, foreign_fields).await {
+            match state
+                .import_session(restore, session_id, foreign_fields, &receipt)
+                .await
+            {
                 Ok(body) => Response::json(201, &body),
                 Err(ImportError::BadRequest(message)) => Response::error(400, &message),
                 Err(ImportError::Conflict(message)) => Response::error(409, &message),
@@ -1573,7 +1672,7 @@ async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
     }
 }
 
-/// 四重校验：格式标识、版本、摘要（防篡改）、引擎指纹（防陌生引擎）。
+/// 导入校验：会话 id 合法性 + 引擎指纹（解码门已由 [`SessionEnvelope::decode`] 完成）。
 ///
 /// 任一项失败都**不**产生任何副作用（会话表不变）。
 fn validate_envelope(
@@ -1581,23 +1680,6 @@ fn validate_envelope(
     envelope: SessionEnvelope,
     accept_foreign: bool,
 ) -> Result<(SessionRestore, String, Vec<String>), ImportError> {
-    if envelope.format != ENVELOPE_FORMAT {
-        return Err(ImportError::BadRequest(format!(
-            "unknown envelope format: {}",
-            truncate_chars(&envelope.format, 32)
-        )));
-    }
-    if envelope.version != ENVELOPE_VERSION {
-        return Err(ImportError::Conflict(format!(
-            "unsupported envelope version: {} (expected {})",
-            envelope.version, ENVELOPE_VERSION
-        )));
-    }
-    if !envelope.digest_valid() {
-        return Err(ImportError::Conflict(
-            "envelope digest mismatch (tampered or truncated)".to_string(),
-        ));
-    }
     if envelope.session_id.trim().is_empty() || envelope.session_id.len() > 128 {
         return Err(ImportError::BadRequest(
             "envelope session_id must be 1..=128 bytes".to_string(),
@@ -1711,7 +1793,10 @@ async fn run_chat_turns(
             Err(SessionError::Unavailable) => {
                 Err((500, "session actor unavailable".to_string()))
             }
-            Err(SessionError::Stale) => Err((409, "session snapshot is stale".to_string())),
+            Err(SessionError::Stale(error)) => Err((
+                409,
+                format!("session snapshot is stale (decode_{})", error.code()),
+            )),
         };
     }
     // 无状态路径是纯函数：键完全相等才命中缓存（纪元不符一律未命中）。
@@ -2113,10 +2198,170 @@ mod tests {
         ))
     }
 
+    /// 构造最小合法信封（`insert_order` 只改变焦点类型表的插入序，
+    /// 焦点栈本身固定，用于验证摘要与 HashMap 迭代序无关）。
+    fn envelope_with_focus(insert_order: &[&str]) -> SessionEnvelope {
+        use crate::symbolic_reasoner::DialogueContext;
+        let keys = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛"];
+        let mut context = DialogueContext::new(16);
+        for key in &keys {
+            context.record_entities_typed(&[(key.to_string(), Some("人物".to_string()))]);
+        }
+        let mut snapshot = context.snapshot();
+        let mut focus_types = HashMap::new();
+        for key in insert_order {
+            focus_types.insert(key.to_string(), "人物".to_string());
+        }
+        snapshot.focus_types = focus_types;
+        SessionEnvelope {
+            format: ENVELOPE_FORMAT.to_string(),
+            version: ENVELOPE_VERSION,
+            session_id: "s-test".to_string(),
+            turns: 2,
+            history: vec!["姚明是谁".to_string()],
+            policy: SessionPolicy::default(),
+            manager: DialogueManager::new().snapshot(),
+            reasoner: snapshot,
+            engine: EngineStamp {
+                crate_version: env!("CARGO_PKG_VERSION").to_string(),
+                kb_fingerprint: "test-fingerprint".to_string(),
+                kb_facts: 2,
+                prompt_mode: "on".to_string(),
+                recovery_mode: "observe".to_string(),
+            },
+            digest: String::new(),
+        }
+    }
+
+    #[test]
+    fn envelope_digest_is_canonical_and_hashmap_order_invariant() {
+        let forward_keys = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛"];
+        let reversed_keys: Vec<&str> = forward_keys.iter().rev().copied().collect();
+        let mut forward = envelope_with_focus(&forward_keys);
+        let mut backward = envelope_with_focus(&reversed_keys);
+        forward.seal();
+        backward.seal();
+        assert!(forward.digest_valid() && backward.digest_valid());
+        assert_eq!(
+            forward.digest, backward.digest,
+            "摘要不得依赖 HashMap 迭代序（跨进程换入不得误判 Stale）"
+        );
+
+        // L1/L2/L3/L4：规范字节往返 + 摘要交换
+        let bytes = canonical::canonical_bytes(&forward).unwrap();
+        let (decoded, receipt) = SessionEnvelope::decode(&bytes, 1 << 20).unwrap();
+        assert!(receipt.canonical, "自产字节必须是规范形");
+        assert_eq!(decoded.digest, forward.digest);
+        assert!(decoded.digest_valid());
+        assert_eq!(canonical::canonical_bytes(&decoded).unwrap(), bytes);
+        assert_eq!(
+            canonical::canonical_digest(&decoded).unwrap(),
+            canonical::canonical_digest(&forward).unwrap()
+        );
+    }
+
+    #[test]
+    fn envelope_decode_error_taxonomy_is_stable() {
+        let mut base = envelope_with_focus(&["甲"]);
+        base.seal();
+        let canonical_bytes = canonical::canonical_bytes(&base).unwrap();
+
+        assert_eq!(
+            SessionEnvelope::decode(b"{not json", 1 << 20)
+                .unwrap_err()
+                .code(),
+            "parse"
+        );
+        assert_eq!(
+            SessionEnvelope::decode(&canonical_bytes, 8)
+                .unwrap_err()
+                .code(),
+            "too_large"
+        );
+
+        let mut wrong_format = base.clone();
+        wrong_format.format = "other-format".to_string();
+        wrong_format.seal();
+        assert_eq!(
+            SessionEnvelope::decode(
+                &canonical::canonical_bytes(&wrong_format).unwrap(),
+                1 << 20
+            )
+            .unwrap_err()
+            .code(),
+            "format"
+        );
+
+        let mut future = base.clone();
+        future.version = ENVELOPE_VERSION + 1;
+        future.seal();
+        assert_eq!(
+            SessionEnvelope::decode(&canonical::canonical_bytes(&future).unwrap(), 1 << 20)
+                .unwrap_err()
+                .code(),
+            "version"
+        );
+
+        let mut tampered = base.clone();
+        tampered.history.push("伪造的历史".to_string());
+        assert_eq!(
+            SessionEnvelope::decode(&canonical::canonical_bytes(&tampered).unwrap(), 1 << 20)
+                .unwrap_err()
+                .code(),
+            "digest"
+        );
+    }
+
     /// 服务跑在专属 OS 线程的 current-thread 运行时里（会话 actor 由 `run`
     /// 自行派生）；测试只通过 TCP 交互。
     fn start_server(max_sessions: usize) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         start_server_with_recovery(max_sessions, RecoveryMode::Observe)
+    }
+
+    #[tokio::test]
+    async fn tampered_cold_session_surfaces_decode_code_without_side_effects() {
+        let dir = temp_session_dir("decode");
+        let (addr, _server) =
+            start_server_with_options(1, RecoveryMode::Observe, Some(dir.clone()));
+        let first = create_session(addr).await;
+        take_turn_body(addr, &first, "姚明是谁").await;
+        let _second = create_session(addr).await;
+        let path = dir.join(format!("{}.json", first));
+        assert!(path.exists(), "容量 1 应把 first 冻结到磁盘");
+
+        // 换出写规范字节：解码回执必须标记 canonical（L2 字节不动点）
+        let frozen_bytes = std::fs::read(&path).unwrap();
+        let (frozen, receipt) = SessionEnvelope::decode(&frozen_bytes, 1 << 20).unwrap();
+        assert!(receipt.canonical, "换出的冷信封必须写规范字节");
+        assert!(frozen.digest_valid());
+        assert_eq!(
+            canonical::canonical_bytes(&frozen).unwrap(),
+            frozen_bytes,
+            "规范字节再编码逐字节一致"
+        );
+
+        // 篡改 turns 但不重算摘要 → 换入必须被拒，且给出稳定错误码
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        value["turns"] = serde_json::json!(99);
+        std::fs::write(&path, value.to_string()).unwrap();
+        let (status, _, body) =
+            raw_request(addr, "GET", &format!("/sessions/{}", first), &[], "").await;
+        assert_eq!(status, 409, "{}", body);
+        assert!(body.contains("decode_digest"), "{}", body);
+
+        let (_, _, metrics) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        let metrics: serde_json::Value = serde_json::from_str(&metrics).unwrap();
+        assert_eq!(metrics["sessions"], 1, "被拒的冷换入不得产生会话");
+        assert_eq!(metrics["perf"]["decode_reject_digest"], 1, "{}", metrics);
+        assert_eq!(
+            metrics["perf"]["decode_ok"].as_u64().unwrap_or(0),
+            0,
+            "{}",
+            metrics
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn start_server_with_recovery(
@@ -2875,6 +3120,9 @@ mod tests {
         let imported: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(imported["session_id"], session_id);
         assert_eq!(imported["foreign_accepted"], false);
+        assert_eq!(imported["decode"]["code"], "decode_ok", "{}", body);
+        assert_eq!(imported["decode"]["version"], ENVELOPE_VERSION);
+        assert_eq!(imported["decode"]["canonical"], true, "{}", body);
 
         // 恢复后的同一下一轮输出必须逐字一致（含轮号/状态/焦点/策略）
         let restored = take_turn_body(addr, &session_id, "姚明的国籍是什么").await;

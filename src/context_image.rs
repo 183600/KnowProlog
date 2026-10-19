@@ -16,6 +16,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::canonical::{self, DecodeError, DecodeReceipt};
+
 /// 当前支持的镜像格式版本。
 pub const IMAGE_VERSION: u32 = 1;
 
@@ -209,12 +211,21 @@ impl ContextImage {
         }
     }
 
-    /// 确定性 JSON 文本（BTreeMap 序 + pretty）。
+    /// 确定性 JSON 文本（BTreeMap 序 + pretty）；仅作「人读导出」，
+    /// 不用于落盘或摘要。
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
 
+    /// 规范文本（对象键递归排序、紧凑无空白）：落盘与摘要的唯一来源。
+    pub fn canonical_text(&self) -> Result<String, DecodeError> {
+        canonical::canonical_text(self)
+    }
+
     /// 原子保存：先写 `{path}.tmp` 再 rename，任何时刻磁盘上只有完整镜像。
+    ///
+    /// 写入的是规范字节：同一镜像重复保存逐字节一致（L2 字节不动点），
+    /// 摘要只对规范字节计算（L4 摘要交换）。
     pub fn save_atomic(&self, path: &str) -> std::io::Result<()> {
         let target = Path::new(path);
         if let Some(parent) = target.parent() {
@@ -222,27 +233,49 @@ impl ContextImage {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        let text = self
+            .canonical_text()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
         let tmp_path = format!("{}.tmp", path);
         {
             let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(self.to_json().as_bytes())?;
+            file.write_all(text.as_bytes())?;
             file.sync_all()?;
         }
         std::fs::rename(&tmp_path, target)
     }
 
+    /// 读取镜像并返回解码回执（解析 + 版本门；哈希裁决仍由 `verify` 决定）。
+    ///
+    /// 读宽容：旧 pretty 文件仍可解码（`receipt.canonical == false`），
+    /// 下一次 `save_atomic` 自动规范。
+    pub fn decode(path: &str) -> Result<(Self, DecodeReceipt), DecodeError> {
+        let bytes = std::fs::read(path).map_err(|error| DecodeError::Io(error.to_string()))?;
+        Self::decode_bytes(&bytes)
+    }
+
+    /// 从字节解码（审计/测试可复用，避免重复读盘）。
+    pub fn decode_bytes(bytes: &[u8]) -> Result<(Self, DecodeReceipt), DecodeError> {
+        let (image, receipt) = canonical::decode_json::<Self>(
+            bytes,
+            "context_image",
+            IMAGE_VERSION,
+            canonical::DEFAULT_MAX_DECODE_BYTES,
+        )?;
+        if image.image_version > IMAGE_VERSION {
+            return Err(DecodeError::Version {
+                found: image.image_version,
+                supported: IMAGE_VERSION,
+            });
+        }
+        Ok((image, receipt))
+    }
+
     /// 读取镜像（只做解析与版本门，不做哈希裁决；调用方用 `verify` 决定信任哪些节）。
     pub fn load(path: &str) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败：{}", e))?;
-        let image: Self =
-            serde_json::from_str(&text).map_err(|e| format!("解析失败：{}", e))?;
-        if image.image_version > IMAGE_VERSION {
-            return Err(format!(
-                "镜像版本 {} 高于支持版本 {}（请升级程序）",
-                image.image_version, IMAGE_VERSION
-            ));
-        }
-        Ok(image)
+        Self::decode(path)
+            .map(|(image, _)| image)
+            .map_err(|error| error.to_string())
     }
 
     /// 读取并要求完全自检通过。
@@ -298,12 +331,38 @@ mod tests {
         let loaded = ContextImage::load_verified(path_text).unwrap();
         assert_eq!(loaded, image);
         assert!(loaded.verify().is_clean());
-        assert_eq!(loaded.to_json(), image.to_json(), "落盘字节稳定");
+        assert_eq!(
+            loaded.canonical_text().unwrap(),
+            image.canonical_text().unwrap(),
+            "落盘字节稳定"
+        );
         // 再存一次字节不变
         loaded.save_atomic(path_text).unwrap();
         assert_eq!(
             std::fs::read_to_string(path_text).unwrap(),
-            image.to_json()
+            image.canonical_text().unwrap()
+        );
+    }
+
+    #[test]
+    fn pretty_image_decodes_with_non_canonical_receipt_then_normalizes() {
+        let image = sample();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("image.json");
+        let path_text = path.to_str().unwrap();
+        std::fs::write(path_text, image.to_json()).unwrap();
+
+        let (loaded, receipt) = ContextImage::decode(path_text).unwrap();
+        assert_eq!(loaded, image);
+        assert!(!receipt.canonical, "人读 pretty 不是规范形");
+        assert_eq!(receipt.kind, "context_image");
+
+        image.save_atomic(path_text).unwrap();
+        let (_, receipt) = ContextImage::decode(path_text).unwrap();
+        assert!(receipt.canonical, "规范化落盘后必须是规范形");
+        assert_eq!(
+            std::fs::read_to_string(path_text).unwrap(),
+            image.canonical_text().unwrap()
         );
     }
 
@@ -330,6 +389,15 @@ mod tests {
         std::fs::write(path_text, image.to_json()).unwrap();
         let error = ContextImage::load(path_text).unwrap_err();
         assert!(error.contains("高于支持版本"), "{}", error);
+        let error = ContextImage::decode(path_text).unwrap_err();
+        assert_eq!(error.code(), "version");
+        assert_eq!(
+            error,
+            DecodeError::Version {
+                found: IMAGE_VERSION + 1,
+                supported: IMAGE_VERSION
+            }
+        );
     }
 
     #[test]

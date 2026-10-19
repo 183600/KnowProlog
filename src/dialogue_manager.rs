@@ -645,20 +645,32 @@ impl DialogueManager {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let json = serde_json::to_string_pretty(&self.snapshot())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-        std::fs::write(path, json)
+        // 规范字节：同一快照永远同一字节串（不依赖任何内部容器迭代序）。
+        let bytes = crate::canonical::canonical_bytes(&self.snapshot())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+        std::fs::write(path, bytes)
+    }
+
+    /// 带解码回执的恢复：失败原因是可回答的（io/parse/invariant），
+    /// 不再是折叠的 `false`。
+    pub fn restore_from_path_report(
+        &mut self,
+        path: &str,
+    ) -> Result<crate::canonical::DecodeReceipt, crate::canonical::DecodeError> {
+        use crate::canonical::{self, DecodeError};
+        let bytes = std::fs::read(path).map_err(|error| DecodeError::Io(error.to_string()))?;
+        let (snapshot, receipt) = canonical::decode_json::<DialogueManagerSnapshot>(
+            &bytes,
+            "dialogue_manager",
+            1,
+            canonical::DEFAULT_MAX_DECODE_BYTES,
+        )?;
+        self.restore(&snapshot);
+        Ok(receipt)
     }
 
     pub fn restore_from_path(&mut self, path: &str) -> bool {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let Ok(snapshot) = serde_json::from_str::<DialogueManagerSnapshot>(&content) else {
-            return false;
-        };
-        self.restore(&snapshot);
-        true
+        self.restore_from_path_report(path).is_ok()
     }
 
     /// 纯对话行为（元话语 / 续聊 / 展开 / 寒暄）：可在管线早段拦截。
@@ -2092,6 +2104,51 @@ mod tests {
         assert_eq!(restored.turn_count(), 1);
         assert_eq!(restored.focus_entity(), Some("姚明"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_snapshot_roundtrip_writes_canonical_bytes_with_receipt() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        manager.plan_reply("姚明是谁", &knowledge).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_dialogue_manager_canonical_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        manager.save_to_path(&path_str).expect("应能保存");
+        let bytes = std::fs::read(&path).unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            crate::canonical::canonical_bytes(&snapshot).unwrap(),
+            bytes,
+            "落盘必须是规范字节（L2 字节不动点）"
+        );
+
+        let mut restored = DialogueManager::new();
+        let receipt = restored
+            .restore_from_path_report(&path_str)
+            .expect("应能恢复");
+        assert!(receipt.canonical);
+        assert_eq!(receipt.kind, "dialogue_manager");
+        assert_eq!(restored.snapshot(), snapshot);
+
+        // 失败不再折叠为 false：坏字节/缺失文件都有稳定错误码
+        let bad = std::env::temp_dir().join(format!(
+            "knowprolog_dialogue_manager_bad_{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&bad, b"{broken").unwrap();
+        let error = DialogueManager::new()
+            .restore_from_path_report(bad.to_str().unwrap())
+            .unwrap_err();
+        assert_eq!(error.code(), "parse");
+        let error = DialogueManager::new()
+            .restore_from_path_report("/nonexistent/definitely/not/here.json")
+            .unwrap_err();
+        assert_eq!(error.code(), "io");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&bad);
     }
 
     #[test]

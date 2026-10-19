@@ -8,6 +8,7 @@ use crate::abduction::{
     Scenario,
 };
 use crate::cache::RevisionLru;
+use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{
@@ -6042,7 +6043,10 @@ impl SymbolicReasoner {
         self.save_dialogue_state_with_contrast(path, None)
     }
 
-    /// 保存对话状态，并额外写入神经符号对比仲裁记忆（校准统计/待定推测/否证集）
+    /// 保存对话状态，并额外写入神经符号对比仲裁记忆（校准统计/待定推测/否证集）。
+    ///
+    /// 落盘为**规范字节**（对象键递归排序）：同一会话状态永远同一字节串，
+    /// 跨运行 diff / 审计不再受 `HashMap` 迭代序影响（L2 字节不动点）。
     pub fn save_dialogue_state_with_contrast(
         &self,
         path: &str,
@@ -6055,9 +6059,24 @@ impl SymbolicReasoner {
         }
         let mut snapshot = self.dialogue_snapshot();
         snapshot.contrast = contrast.cloned();
-        let json = serde_json::to_string_pretty(&snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, json)
+        let bytes = canonical::canonical_bytes(&snapshot)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+        std::fs::write(path, bytes)
+    }
+
+    /// 读取并解码对话状态（不做任何应用），返回快照与解码回执。
+    ///
+    /// 读宽容：旧 pretty 文件仍可解码（回执 `canonical == false`）。
+    pub fn read_dialogue_state(
+        path: &str,
+    ) -> Result<(DialogueSnapshot, DecodeReceipt), DecodeError> {
+        let bytes = std::fs::read(path).map_err(|error| DecodeError::Io(error.to_string()))?;
+        canonical::decode_json::<DialogueSnapshot>(
+            &bytes,
+            "dialogue_state",
+            1,
+            canonical::DEFAULT_MAX_DECODE_BYTES,
+        )
     }
 
     pub fn load_dialogue_state(&mut self, path: &str) -> bool {
@@ -6069,10 +6088,7 @@ impl SymbolicReasoner {
         &mut self,
         path: &str,
     ) -> (bool, Option<ContrastSnapshot>) {
-        let Ok(content) = std::fs::read_to_string(path) else {
-            return (false, None);
-        };
-        let Ok(snapshot) = serde_json::from_str::<DialogueSnapshot>(&content) else {
+        let Ok((snapshot, _)) = Self::read_dialogue_state(path) else {
             return (false, None);
         };
         let contrast = snapshot.contrast.clone();
@@ -6913,6 +6929,45 @@ mod tests {
             .contextualize("他的师祖是谁")
             .expect("恢复后的记忆应支持指代消解");
         assert!(rewritten.contains("李四"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dialogue_state_persistence_is_canonical_bytes_with_receipt() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.contextualize("张三的师祖是谁");
+        reasoner.contextualize("那李四呢");
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_canonical_state_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let bytes = std::fs::read(&path).unwrap();
+        let (snapshot, receipt) = SymbolicReasoner::read_dialogue_state(&path_str).unwrap();
+        assert!(receipt.canonical, "落盘必须是规范字节");
+        assert_eq!(receipt.kind, "dialogue_state");
+        // L1/L2/L3/L4：往返恒等 / 字节不动点 / 编码幂等 / 摘要交换
+        assert_eq!(canonical::canonical_bytes(&snapshot).unwrap(), bytes);
+        assert_eq!(
+            canonical::canonical_digest(&snapshot).unwrap(),
+            canonical::canonical_digest(&reasoner.dialogue_snapshot()).unwrap()
+        );
+        let (again, _) = SymbolicReasoner::read_dialogue_state(&path_str).unwrap();
+        assert_eq!(
+            canonical::canonical_bytes(&again).unwrap(),
+            canonical::canonical_bytes(&snapshot).unwrap()
+        );
+
+        // 坏字节给 parse 码；缺失文件给 io 码（原因可回答）
+        assert_eq!(
+            SymbolicReasoner::read_dialogue_state("/nonexistent/state.json")
+                .unwrap_err()
+                .code(),
+            "io"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

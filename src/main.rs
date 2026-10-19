@@ -161,6 +161,19 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Audit persisted artifacts (knowledge `rustfmt --check`): canonical /
+    /// non-canonical / damaged / missing, with optional atomic `--fix`
+    Artifacts {
+        /// Atomically rewrite non-canonical artifacts (damaged are never touched)
+        #[arg(long)]
+        fix: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Extra artifact paths to audit (kind inferred from file name)
+        #[arg(long = "path")]
+        paths: Vec<String>,
+    },
     /// Run the session REST service (multi-turn dialogue over HTTP + SSE)
     Serve {
         /// Listen address
@@ -491,6 +504,9 @@ async fn main() {
                 }
             }
         }
+        Some(Commands::Artifacts { fix, json, paths }) => {
+            run_artifact_audit(&config, &store_path, fix, json, &paths);
+        }
         Some(Commands::Serve {
             addr,
             max_sessions,
@@ -568,6 +584,139 @@ fn parse_recovery_mode(value: &str) -> RecoveryMode {
         eprintln!("未知的失败恢复模式「{}」：可选 off / observe / on", value);
         std::process::exit(1);
     })
+}
+
+/// `artifacts`：工件审计（知识版 `rustfmt --check`）。
+///
+/// 扫描已知持久化工件，按「解码 → 规范重编码 → 与磁盘比对」分类；
+/// `--fix` 原子重写非规范工件（损坏工件一律不触碰）。存在损坏或未修好的
+/// 非规范工件时以非零码退出，可直接用于 CI 巡检。
+fn run_artifact_audit(
+    config: &know_prolog::SystemConfig,
+    store_path: &str,
+    fix: bool,
+    json: bool,
+    extra_paths: &[String],
+) {
+    use know_prolog::artifact_audit::{self, ArtifactKind};
+
+    let mut targets: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for path in extra_paths {
+        targets.insert(path.clone(), true);
+    }
+    let mut defaults = vec![
+        format!("{}/import_journal.json", store_path),
+        format!("{}/external_ledger.json", store_path),
+        format!("{}/predicate_registry.json", store_path),
+        format!("{}/eval_baseline.json", store_path),
+        format!("{}/nlu_eval_baseline.json", store_path),
+        format!("{}/recovery_baseline.json", store_path),
+        format!("{}/quality_baseline.json", store_path),
+    ];
+    if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
+        defaults.push(state_path.to_string());
+        defaults.push(format!("{}.manager.json", state_path));
+        defaults.push(format!("{}.chronicle.jsonl", state_path));
+    } else {
+        defaults.push(format!("{}/dialogue.chronicle.jsonl", store_path));
+    }
+    for path in defaults {
+        targets.entry(path).or_insert(false);
+    }
+
+    let mut audits = Vec::new();
+    for (path, explicit) in &targets {
+        let kind = ArtifactKind::infer(path);
+        let audit = if fix {
+            match artifact_audit::fix(path, kind) {
+                Ok(audit) => audit,
+                Err(error) => {
+                    eprintln!("工件修复被拒：{}", error);
+                    artifact_audit::audit(path, kind)
+                }
+            }
+        } else {
+            artifact_audit::audit(path, kind)
+        };
+        if audit.status == artifact_audit::ArtifactStatus::Missing && !explicit {
+            continue;
+        }
+        audits.push(audit);
+    }
+
+    let (mut canonical, mut non_canonical, mut repairable, mut damaged, mut missing) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    for audit in &audits {
+        match audit.status {
+            artifact_audit::ArtifactStatus::Canonical => canonical += 1,
+            artifact_audit::ArtifactStatus::NonCanonical => non_canonical += 1,
+            artifact_audit::ArtifactStatus::Repairable(_) => repairable += 1,
+            artifact_audit::ArtifactStatus::Damaged(_) => damaged += 1,
+            artifact_audit::ArtifactStatus::Missing => missing += 1,
+        }
+    }
+
+    if json {
+        let value = serde_json::json!({
+            "object": "artifacts.audit",
+            "fix": fix,
+            "total": audits.len(),
+            "canonical": canonical,
+            "non_canonical": non_canonical,
+            "repairable": repairable,
+            "damaged": damaged,
+            "missing": missing,
+            "artifacts": audits
+                .iter()
+                .map(|audit| serde_json::json!({
+                    "path": audit.path,
+                    "kind": audit.kind.label(),
+                    "status": audit.status.label(),
+                    "detail": audit.status.detail(),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("工件审计序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!(
+            "工件审计：共 {} 件（规范 {}，非规范 {}，可截尾 {}，损坏 {}，缺失 {}）。",
+            audits.len(),
+            canonical,
+            non_canonical,
+            repairable,
+            damaged,
+            missing
+        );
+        for audit in &audits {
+            let detail = audit.status.detail();
+            if detail.is_empty() {
+                println!("- {} [{}] {}", audit.path, audit.kind.label(), audit.status.label());
+            } else {
+                println!(
+                    "- {} [{}] {} —— {}",
+                    audit.path,
+                    audit.kind.label(),
+                    audit.status.label(),
+                    detail
+                );
+            }
+        }
+        if fix {
+            println!(
+                "提示：--fix 只原子重写非规范工件、只截编年史的损坏尾行；其余损坏工件一律不触碰（宁可不修，也不误改）。"
+            );
+        }
+    }
+
+    if damaged > 0 || non_canonical > 0 || repairable > 0 {
+        std::process::exit(1);
+    }
 }
 
 /// `prompt-lint`：校验提示资产注册表；存在 Error 时以非零码退出。
@@ -779,14 +928,31 @@ async fn run_interactive_mode(
         symbolic_reasoner.observe_facts(&facts);
     }
     if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
-        let (restored, contrast_snapshot) =
-            symbolic_reasoner.load_dialogue_state_with_contrast(state_path);
-        if restored {
-            println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
-        }
-        if let Some(snapshot) = contrast_snapshot {
-            if contrast_arbiter.restore_snapshot(&snapshot) {
-                println!("已恢复上次对比校准记忆：{}", contrast_arbiter.memory_summary());
+        if std::path::Path::new(state_path).exists() {
+            match SymbolicReasoner::read_dialogue_state(state_path) {
+                Ok((snapshot, receipt)) => {
+                    if !receipt.canonical {
+                        eprintln!(
+                            "对话记忆字节非规范（已宽容读取，可用 `artifacts --fix` 规范化）：{}",
+                            state_path
+                        );
+                    }
+                    let contrast_snapshot = snapshot.contrast.clone();
+                    symbolic_reasoner.restore_dialogue_snapshot(&snapshot);
+                    println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
+                    if let Some(snapshot) = contrast_snapshot {
+                        if contrast_arbiter.restore_snapshot(&snapshot) {
+                            println!("已恢复上次对比校准记忆：{}", contrast_arbiter.memory_summary());
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "对话记忆读取失败（已忽略，不影响知识库）：{} [decode_{}]",
+                        error,
+                        error.code()
+                    );
+                }
             }
         }
     }
@@ -836,8 +1002,25 @@ async fn run_interactive_mode(
     if dialogue_enabled {
         if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
             let manager_path = format!("{}.manager.json", state_path);
-            if dialogue_manager.restore_from_path(&manager_path) {
-                println!("已恢复对话本体记忆：{}", dialogue_manager.summary());
+            if std::path::Path::new(&manager_path).exists() {
+                match dialogue_manager.restore_from_path_report(&manager_path) {
+                    Ok(receipt) => {
+                        if !receipt.canonical {
+                            eprintln!(
+                                "对话本体记忆字节非规范（已宽容读取，可用 `artifacts --fix` 规范化）：{}",
+                                manager_path
+                            );
+                        }
+                        println!("已恢复对话本体记忆：{}", dialogue_manager.summary());
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "对话本体记忆读取失败（已忽略，不影响会话）：{} [decode_{}]",
+                            error,
+                            error.code()
+                        );
+                    }
+                }
             }
         }
     }

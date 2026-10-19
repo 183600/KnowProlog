@@ -56,6 +56,8 @@ pub mod perf_ledger;
 pub mod startup_ledger;
 pub mod cache;
 pub mod context_image;
+pub mod canonical;
+pub mod artifact_audit;
 pub mod import_journal;
 pub mod grammar_extractor;
 pub mod chronicle;

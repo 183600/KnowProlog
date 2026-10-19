@@ -7,10 +7,17 @@
 //!   - 对话时间线：Chronicle → Markdown 表格 / Mermaid 流程，焦点迁移与出处逐轮可见；
 //!   - 覆盖报告：悬空引用 / 孤立实体 / 未登记谓词，只做不依赖 schema 的确定性检查。
 //!
+//! 渲染→解析律（反渲染）：机器可读视图都有反向解析器——`render_json` ↔
+//! `parse_json`（逐字节无损）、`render_timeline_markdown` ↔
+//! `parse_timeline_markdown`、`render_timeline_flow` ↔ `parse_timeline_flow`
+//! （后两者在安全域内逐字段无损，见各自文档）。渲染器不是「只写不读」的
+//! 死角：看过的视图都能读回来，视图层因此可审计、可回归。
+//!
 //! 设计戒律：输入三元组打乱顺序输出仍须同字节——视图层否则不可测试、必然腐烂。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::chronicle::ChronicleEntry;
@@ -172,6 +179,57 @@ pub struct KnowledgeSubgraph {
     pub max_depth: usize,
     pub nodes: Vec<SubgraphNode>,
     pub edges: Vec<SubgraphEdge>,
+}
+
+/// `render_json` 的反渲染：JSON → 子图（逐字段无损，含任意引号/换行/中文）。
+///
+/// 解析律：`parse_json(&g.render_json())? == g`（nodes/edges 顺序也一致）。
+pub fn parse_json(text: &str) -> Result<KnowledgeSubgraph, String> {
+    #[derive(Deserialize)]
+    struct JsonNode {
+        name: String,
+        depth: usize,
+        focus: bool,
+    }
+    #[derive(Deserialize)]
+    struct JsonEdge {
+        subject: String,
+        predicate: String,
+        object: String,
+        highlight: bool,
+    }
+    #[derive(Deserialize)]
+    struct JsonSubgraph {
+        focus: String,
+        max_depth: usize,
+        nodes: Vec<JsonNode>,
+        edges: Vec<JsonEdge>,
+    }
+    let decoded: JsonSubgraph =
+        serde_json::from_str(text).map_err(|error| format!("子图 JSON 解析失败：{}", error))?;
+    Ok(KnowledgeSubgraph {
+        focus: decoded.focus,
+        max_depth: decoded.max_depth,
+        nodes: decoded
+            .nodes
+            .into_iter()
+            .map(|node| SubgraphNode {
+                name: node.name,
+                depth: node.depth,
+                is_focus: node.focus,
+            })
+            .collect(),
+        edges: decoded
+            .edges
+            .into_iter()
+            .map(|edge| SubgraphEdge {
+                subject: edge.subject,
+                predicate: edge.predicate,
+                object: edge.object,
+                highlight: edge.highlight,
+            })
+            .collect(),
+    })
 }
 
 impl KnowledgeSubgraph {
@@ -545,6 +603,102 @@ pub fn render_timeline_markdown(turns: &[TimelineTurn]) -> String {
     lines.join("\n")
 }
 
+/// `render_timeline_markdown` 的反渲染：Markdown 表格 → 时间线。
+///
+/// 解析律：在「安全域」（字段不包含换行；制表带来的换行→空格归一化见
+/// [`cell`]）内 `parse_timeline_markdown(&render_timeline_markdown(t)) == t`。
+/// 空视图文本解析为空列表；表头/列数不符一律报错而非静默丢失。
+pub fn parse_timeline_markdown(text: &str) -> Result<Vec<TimelineTurn>, String> {
+    if text.trim() == "（编年史为空：还没有可回放的对话）" {
+        return Ok(Vec::new());
+    }
+    let mut lines = text.lines();
+    let header = lines.next().ok_or("缺少表头")?;
+    if header.trim() != "| 序号 | 输入/回答 | 类型 | 焦点 | 出处 |" {
+        return Err(format!("表头不匹配：{}", header));
+    }
+    let separator = lines.next().ok_or("缺少分隔行")?;
+    if separator.trim() != "| --- | --- | --- | --- | --- |" {
+        return Err(format!("分隔行不匹配：{}", separator));
+    }
+    let mut turns = Vec::new();
+    for (index, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let inner = line
+            .trim()
+            .strip_prefix("| ")
+            .and_then(|rest| rest.strip_suffix(" |"))
+            .ok_or_else(|| format!("第 {} 行不是表格行：{}", index + 3, line))?;
+        let cells = split_escaped_pipes(inner);
+        if cells.len() != 5 {
+            return Err(format!(
+                "第 {} 行应为 5 列，实为 {} 列：{}",
+                index + 3,
+                cells.len(),
+                line
+            ));
+        }
+        let seq: u64 = cells[0]
+            .trim()
+            .parse()
+            .map_err(|error| format!("第 {} 行序号非法：{}", index + 3, error))?;
+        let text_cell = cells[1].trim().replace("\\|", "|");
+        let kind = cells[2].trim().replace("\\|", "|");
+        let focus_cell = cells[3].trim();
+        let (focus, inherited) = if focus_cell == "—" {
+            (None, false)
+        } else if let Some(stripped) = focus_cell.strip_suffix("（继承）") {
+            (Some(stripped.replace("\\|", "|")), true)
+        } else {
+            (Some(focus_cell.replace("\\|", "|")), false)
+        };
+        let provenance = if cells[4].trim() == "—" {
+            Vec::new()
+        } else {
+            cells[4]
+                .trim()
+                .split('、')
+                .map(|item| item.trim().replace("\\|", "|"))
+                .collect()
+        };
+        turns.push(TimelineTurn {
+            seq,
+            kind,
+            text: text_cell,
+            focus,
+            inherited,
+            provenance,
+        });
+    }
+    Ok(turns)
+}
+
+/// 按未转义的 `|` 切分：`\|` 属于单元格内容（与渲染端 `cell` 转义互逆）。
+fn split_escaped_pipes(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut cells = Vec::new();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'|' {
+            continue;
+        }
+        let mut backslashes = 0;
+        let mut probe = index;
+        while probe > 0 && bytes[probe - 1] == b'\\' {
+            backslashes += 1;
+            probe -= 1;
+        }
+        if backslashes % 2 == 0 {
+            cells.push(&text[start..index]);
+            start = index + 1;
+        }
+    }
+    cells.push(&text[start..]);
+    cells
+}
+
 /// 时间线 → Mermaid 流程（焦点迁移一眼可见）。
 pub fn render_timeline_flow(turns: &[TimelineTurn]) -> String {
     if turns.is_empty() {
@@ -571,6 +725,115 @@ pub fn render_timeline_flow(turns: &[TimelineTurn]) -> String {
         previous = Some(turn.seq);
     }
     lines.join("\n")
+}
+
+/// `mermaid_label` 的逆：`#quot;` → `"`，`<br/>` → 换行。
+fn mermaid_unescape(label: &str) -> String {
+    label.replace("#quot;", "\"").replace("<br/>", "\n")
+}
+
+/// `render_timeline_flow` 的反渲染：Mermaid 流程 → 时间线。
+///
+/// 解析律：在「安全域」（正文不含字面 `<br/>焦点→`；焦点不以 `（继承）`
+/// 结尾）内 `parse_timeline_flow(&render_timeline_flow(t)) == t`，其中
+/// `kind` 固定为 `"turn"`——流程图无损承载 seq/正文/焦点/继承，但不编码
+/// `kind`（该字段由表格视图承载）。同时校验流程结构本身：`T{n}` 单调
+/// 递增且逐条以 `-->` 链到前一轮——渲染出的图若断链，解析必须报错而不是
+/// 假装成功。
+pub fn parse_timeline_flow(text: &str) -> Result<Vec<TimelineTurn>, String> {
+    if text.trim() == "（编年史为空）" {
+        return Ok(Vec::new());
+    }
+    let mut lines = text.lines();
+    if lines.next() != Some("graph LR") {
+        return Err("流程缺少 graph LR 头".to_string());
+    }
+    let mut turns: Vec<TimelineTurn> = Vec::new();
+    // 渲染序：T1；T2；T1-->T2；T3；T2-->T3；……即每个 n≥2 的节点后必跟其入边。
+    let mut expecting_edge = false;
+    for line in lines {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let body = line
+            .strip_prefix("    ")
+            .ok_or_else(|| format!("流程行缺少缩进：{}", line))?;
+        if let Some(edge) = body.strip_prefix('T') {
+            if let Some((from, to)) = edge.split_once(" --> T") {
+                if !expecting_edge {
+                    return Err(format!("意外的边（上一行不是节点）：{}", line));
+                }
+                let from: u64 = from
+                    .parse()
+                    .map_err(|error| format!("边起点非法：{} ({})", from, error))?;
+                let to: u64 = to
+                    .parse()
+                    .map_err(|error| format!("边终点非法：{} ({})", to, error))?;
+                let expected_from = turns[turns.len() - 2].seq;
+                let expected_to = turns[turns.len() - 1].seq;
+                if from != expected_from || to != expected_to {
+                    return Err(format!(
+                        "流程断链：T{} --> T{}（应为 T{} --> T{}）",
+                        from, to, expected_from, expected_to
+                    ));
+                }
+                expecting_edge = false;
+                continue;
+            }
+            if expecting_edge {
+                return Err(format!(
+                    "流程断链：T{} 后缺少 T{} --> T{} 边",
+                    turns.last().map(|turn| turn.seq).unwrap_or(0),
+                    turns[turns.len() - 2].seq,
+                    turns.last().map(|turn| turn.seq).unwrap_or(0)
+                ));
+            }
+            let open = edge.find("[\"").ok_or_else(|| format!("节点行缺少标签：{}", line))?;
+            let seq_text = &edge[..open];
+            let seq: u64 = seq_text
+                .parse()
+                .map_err(|error| format!("节点序号非法：{} ({})", seq_text, error))?;
+            let label = edge[open + 2..]
+                .strip_suffix("\"]")
+                .ok_or_else(|| format!("节点标签未闭合：{}", line))?;
+            let expected_prefix = format!("{}. ", seq);
+            let rest = label
+                .strip_prefix(&expected_prefix)
+                .ok_or_else(|| format!("节点标签前缀不匹配：{}", label))?;
+            let (raw_text, focus_part) = match rest.rfind("<br/>焦点→") {
+                Some(position) => (
+                    &rest[..position],
+                    Some(&rest[position + "<br/>焦点→".len()..]),
+                ),
+                None => (rest, None),
+            };
+            let (focus, inherited) = match focus_part {
+                None => (None, false),
+                Some(part) => match part.strip_suffix("（继承）") {
+                    Some(stripped) => (Some(mermaid_unescape(stripped)), true),
+                    None => (Some(mermaid_unescape(part)), false),
+                },
+            };
+            turns.push(TimelineTurn {
+                seq,
+                kind: "turn".to_string(),
+                text: mermaid_unescape(raw_text),
+                focus,
+                inherited,
+                provenance: Vec::new(),
+            });
+            if turns.len() >= 2 {
+                expecting_edge = true;
+            }
+        } else {
+            return Err(format!("无法识别的流程行：{}", line));
+        }
+    }
+    if expecting_edge {
+        return Err("流程缺少末尾入边".to_string());
+    }
+    Ok(turns)
 }
 
 // ============================ 覆盖报告 ============================
@@ -934,5 +1197,137 @@ mod tests {
         let markdown = render_timeline_markdown(&turns);
         assert!(markdown.contains("A\\|B"), "{}", markdown);
         assert!(render_timeline_markdown(&[]).contains("编年史为空"));
+    }
+
+    #[test]
+    fn subgraph_json_parse_law_holds_for_hostile_strings() {
+        let subgraph = KnowledgeSubgraph {
+            focus: "焦点\"X\"\n多行".to_string(),
+            max_depth: 2,
+            nodes: vec![
+                SubgraphNode {
+                    name: "焦点\"X\"\n多行".to_string(),
+                    depth: 0,
+                    is_focus: true,
+                },
+                SubgraphNode {
+                    name: "A|B\"]逃逸".to_string(),
+                    depth: 1,
+                    is_focus: false,
+                },
+                SubgraphNode {
+                    name: "<br/>焦点→伪装".to_string(),
+                    depth: 2,
+                    is_focus: false,
+                },
+            ],
+            edges: vec![
+                SubgraphEdge {
+                    subject: "焦点\"X\"\n多行".to_string(),
+                    predicate: "谓词|带|竖线".to_string(),
+                    object: "A|B\"]逃逸".to_string(),
+                    highlight: true,
+                },
+                SubgraphEdge {
+                    subject: "A|B\"]逃逸".to_string(),
+                    predicate: "p".to_string(),
+                    object: "<br/>焦点→伪装".to_string(),
+                    highlight: false,
+                },
+            ],
+        };
+        let text = subgraph.render_json();
+        let parsed = parse_json(&text).unwrap();
+        assert_eq!(parsed, subgraph, "parse(render(x)) 必须逐字段等于 x");
+        assert_eq!(parsed.render_json(), text, "解析后再渲染必须同字节（L2 不动点）");
+        assert!(parse_json("{").is_err());
+        assert!(parse_json("{\"focus\":1}").is_err());
+    }
+
+    #[test]
+    fn timeline_markdown_parse_law_holds_on_safe_corpus() {
+        let turns = vec![
+            TimelineTurn {
+                seq: 1,
+                kind: "turn".to_string(),
+                text: "姚明是谁".to_string(),
+                focus: None,
+                inherited: false,
+                provenance: Vec::new(),
+            },
+            TimelineTurn {
+                seq: 2,
+                kind: "turn".to_string(),
+                text: "A|B 与 \"引号\"（伪）".to_string(),
+                focus: Some("姚明".to_string()),
+                inherited: true,
+                provenance: vec!["师傅".to_string(), "身高|别名".to_string()],
+            },
+            TimelineTurn {
+                seq: 7,
+                kind: "reply".to_string(),
+                text: "答：226".to_string(),
+                focus: Some("姚 明".to_string()),
+                inherited: false,
+                provenance: Vec::new(),
+            },
+        ];
+        let markdown = render_timeline_markdown(&turns);
+        assert_eq!(
+            parse_timeline_markdown(&markdown).unwrap(),
+            turns,
+            "\n{}",
+            markdown
+        );
+        assert_eq!(
+            parse_timeline_markdown(&render_timeline_markdown(&[])).unwrap(),
+            Vec::new()
+        );
+        assert!(parse_timeline_markdown("表头错误").is_err());
+        assert!(parse_timeline_markdown("| 序号 | 输入/回答 | 类型 | 焦点 | 出处 |\n| --- | --- | --- | --- | --- |\n| x | y | z | — | — |").is_err());
+    }
+
+    #[test]
+    fn timeline_flow_parse_law_holds_on_safe_corpus() {
+        let turns = vec![
+            TimelineTurn {
+                seq: 1,
+                kind: "turn".to_string(),
+                text: "姚明是谁".to_string(),
+                focus: None,
+                inherited: false,
+                provenance: Vec::new(),
+            },
+            TimelineTurn {
+                seq: 2,
+                kind: "turn".to_string(),
+                text: "A|B 与 \"引号\"\n第二行".to_string(),
+                focus: Some("姚明".to_string()),
+                inherited: true,
+                provenance: Vec::new(),
+            },
+            TimelineTurn {
+                seq: 9,
+                kind: "turn".to_string(),
+                text: "他的身高呢".to_string(),
+                focus: Some("姚 明".to_string()),
+                inherited: false,
+                provenance: Vec::new(),
+            },
+        ];
+        let flow = render_timeline_flow(&turns);
+        assert_eq!(parse_timeline_flow(&flow).unwrap(), turns, "\n{}", flow);
+        assert_eq!(
+            parse_timeline_flow(&render_timeline_flow(&[])).unwrap(),
+            Vec::new()
+        );
+        let broken = flow.replace("T1 --> T2", "T1 --> T8");
+        assert!(
+            parse_timeline_flow(&broken).is_err(),
+            "断链流程解析必须报错：{}",
+            broken
+        );
+        assert!(parse_timeline_flow("graph LR\n    T1[\"无序号前缀\"]").is_err());
+        assert!(parse_timeline_flow("graph LR\n    T1 --> T2").is_err());
     }
 }
