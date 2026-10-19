@@ -638,6 +638,9 @@ pub struct SymbolicReasoner {
     dependency_stamps: BTreeMap<&'static str, u64>,
     // 操作计数台账（可与其他模块共享）
     perf: Arc<PerfLedger>,
+    // 引擎层故障通道（Prolog / 存储等下游失败由宿主注入）：
+    // 非空时对话管理器走 EngineFault 路径，绝不与「知识里没有」合并。
+    engine_fault: Option<String>,
 }
 
 impl SymbolicReasoner {
@@ -743,9 +746,30 @@ impl SymbolicReasoner {
             derived_stamps: BTreeMap::new(),
             dependency_stamps: BTreeMap::new(),
             perf,
+            engine_fault: None,
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
+    }
+
+    /// 注入引擎层故障（宿主在 Prolog / 存储失败后调用）：
+    /// 之后对话管理器的知识问句会走 EngineFault 路径。
+    pub fn note_engine_fault(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        let message = message.trim();
+        if !message.is_empty() {
+            self.engine_fault = Some(message.to_string());
+        }
+    }
+
+    /// 清除引擎层故障（默认实现里故障是粘性的，仅在宿主确认恢复后清除）。
+    pub fn clear_engine_fault(&mut self) {
+        self.engine_fault = None;
+    }
+
+    /// 当前引擎层故障（无则 None）。
+    pub fn engine_fault(&self) -> Option<String> {
+        self.engine_fault.clone()
     }
 
     /// 当前知识版本（每次内容确有变化的观察 +1）。
@@ -3158,6 +3182,85 @@ impl SymbolicReasoner {
             ));
         }
         Some(output.trim_end().to_string())
+    }
+
+    /// 恢复通道 L2：联想提名（链接预测）——「(实体, 属性) 还可能是哪个值」。
+    ///
+    /// 只提名、不下结论；每条附规则证据。返回顺序由预测器确定，
+    /// 调用方（恢复引擎）会再做定点化排序与验证。
+    pub fn recovery_nominations(
+        &self,
+        entity: &str,
+        attribute: &str,
+    ) -> Vec<crate::recovery::RecoveryNomination> {
+        if !self.config.enable_link_prediction {
+            return Vec::new();
+        }
+        let limit = self.config.max_predictions.saturating_mul(2).max(4);
+        let mut nominations = Vec::new();
+        for prediction in self
+            .predictor
+            .predict_for_entity(entity, Some(attribute), limit)
+        {
+            if prediction.triple.subject != entity || prediction.triple.predicate != attribute {
+                continue;
+            }
+            nominations.push(crate::recovery::RecoveryNomination {
+                value: prediction.triple.object.clone(),
+                score: prediction.confidence,
+                evidence: vec![self.predictor.explain(&prediction)],
+            });
+        }
+        nominations
+    }
+
+    /// 恢复通道 L2：符号验证——提名值是否被图谱/生成器支持或反驳。
+    pub fn recovery_verify(
+        &self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+    ) -> crate::recovery::VerificationOutcome {
+        if self.generator.has_attribute(entity, attribute, value)
+            || self.predictor.has_triple(entity, attribute, value)
+        {
+            return crate::recovery::VerificationOutcome::Confirmed;
+        }
+        if !self.generator.attribute_values(entity, attribute).is_empty() {
+            return crate::recovery::VerificationOutcome::Refuted;
+        }
+        crate::recovery::VerificationOutcome::NoVerdict
+    }
+
+    /// 恢复通道 L3：实体可追问的属性/关系线索（确定性排序，取前几项）。
+    pub fn recovery_clues(&self, entity: &str) -> Vec<String> {
+        let mut clues = self.generator.attribute_keys(entity);
+        for predicate in self.generator.relation_predicates(entity) {
+            if !clues.contains(&predicate) {
+                clues.push(predicate);
+            }
+        }
+        clues.truncate(3);
+        clues
+    }
+
+    /// 恢复通道 L1：换帧重解——换问法重新查询（不生成，只重查）。
+    pub fn recovery_reframe(
+        &self,
+        entity: &str,
+        attribute: &str,
+    ) -> Vec<crate::recovery::ReframedReading> {
+        let questions = [
+            format!("{}的{}是多少", entity, attribute),
+            format!("{}的{}是什么", entity, attribute),
+            format!("{}的{}呢", entity, attribute),
+        ];
+        let mut readings = Vec::new();
+        for question in questions {
+            let answer = SymbolicReasoner::answer(self, &question);
+            readings.push(crate::recovery::ReframedReading { question, answer });
+        }
+        readings
     }
 
     /// 前向饱和推导报告：多跳新事实（含前提与规则来源）

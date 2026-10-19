@@ -6,15 +6,71 @@ use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryR
 
 use crate::bindings::{BindingSet, BoundTerm};
 
+/// 查询的三态结局：有解 / 无解 / 引擎故障。
+///
+/// 无解（`QueryResolution::False`）与故障（`Err`）绝不再合并成同一个空
+/// `Vec`：前者是「知识里没有」，后者是「我出错了」——认识论上不同，
+/// 恢复策略也不同（见 [`crate::recovery`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryOutcome {
+    /// 查询成功：`Matches` 的绑定解（跳过空绑定行）；纯 `True` 为空的解集。
+    Solutions(Vec<BindingSet>),
+    /// 查询成功但无解：知识图谱里确实没有。
+    NoSolution,
+    /// 引擎执行失败（语法错误 / 未定义谓词 / consult 损坏等）：信息不销毁。
+    EngineFault(String),
+}
+
+impl QueryOutcome {
+    pub fn is_fault(&self) -> bool {
+        matches!(self, QueryOutcome::EngineFault(_))
+    }
+
+    pub fn has_solutions(&self) -> bool {
+        matches!(self, QueryOutcome::Solutions(solutions) if !solutions.is_empty())
+    }
+
+    pub fn fault_message(&self) -> Option<&str> {
+        match self {
+            QueryOutcome::EngineFault(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    /// 兼容视图：非解（无解 / 故障）给空 Vec（故障信息保留在枚举里）。
+    pub fn into_solutions(self) -> Vec<BindingSet> {
+        match self {
+            QueryOutcome::Solutions(solutions) => solutions,
+            _ => Vec::new(),
+        }
+    }
+}
+
 pub struct PrologEngine {
     machine: Machine,
     /// 已加载的动态事实（按规范序排序）
     loaded_facts: Vec<PrologFact>,
+    /// 最近一次引擎层故障（consult / 查询错误 / 崩溃），由调用方取走上报。
+    last_fault: Option<String>,
+    /// 引擎是否已在崩溃后停止服务（scryer 0.9.x 的 consult 解析错误会 panic，
+    /// 崩溃后的内部状态不可信：此后一律返回 EngineFault，绝不静默当作无解）。
+    poisoned: bool,
+}
+
+/// 从 panic payload 提取可读消息。
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "未知 panic".to_string()
+    }
 }
 
 impl PrologEngine {
     pub fn new() -> Self {
-        let mut machine = Machine::new_lib();
+        let machine = Machine::new_lib();
         
         let base_rules = r#"
             % 列表谓词（member/2、length/2 等）
@@ -70,14 +126,73 @@ impl PrologEngine {
                 ancestor_of(Parent, Person).
         "#;
         
-        machine.consult_module_string("user", base_rules.to_string());
-        
-        Self { machine, loaded_facts: Vec::new() }
+        let mut engine = Self {
+            machine,
+            loaded_facts: Vec::new(),
+            last_fault: None,
+            poisoned: false,
+        };
+        if let Err(error) = engine.consult_source(base_rules) {
+            engine.note_fault(format!("基础规则加载失败: {}", error));
+        }
+        engine
     }
-    
+
+    /// 记录一条引擎层故障（同消息只打印一次 + 留存供调用方上报）。
+    fn note_fault(&mut self, message: String) {
+        if self.last_fault.as_deref() != Some(message.as_str()) {
+            eprintln!("Prolog引擎故障: {}", message);
+        }
+        self.last_fault = Some(message);
+    }
+
+    /// 查看（不清空）最近一次引擎故障。
+    pub fn last_fault(&self) -> Option<&str> {
+        self.last_fault.as_deref()
+    }
+
+    /// 取走最近一次引擎故障（上报后清空，避免重复刷屏）。
+    pub fn take_fault(&mut self) -> Option<String> {
+        self.last_fault.take()
+    }
+
+    /// 引擎是否已在崩溃后停止服务。
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// 向 user 模块 consult 一段 Prolog 源码（供事实加载与故障注入）。
+    ///
+    /// Scryer 0.9.x 的 `consult_module_string` 不返回 Result，解析错误会在
+    /// 引擎内部 panic。这里用 `catch_unwind` 兜底：崩溃被转成 `Err`，引擎
+    /// 标记为停止服务（后续查询一律 [`QueryOutcome::EngineFault`]），
+    /// 「我出错了」永远不会伪装成「知识里没有」。
+    pub fn consult_source(&mut self, source: impl Into<String>) -> Result<(), String> {
+        if self.poisoned {
+            return Err("引擎已因先前的崩溃停止服务（需重建实例）".to_string());
+        }
+        let source = source.into();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.machine.consult_module_string("user", source);
+        })) {
+            Ok(()) => Ok(()),
+            Err(payload) => {
+                self.poisoned = true;
+                Err(format!("consult 触发引擎崩溃：{}", panic_message(payload)))
+            }
+        }
+    }
+
     pub fn load_facts(&mut self, facts: Vec<PrologFact>) {
+        if let Err(error) = self.load_facts_checked(facts) {
+            self.note_fault(format!("事实加载失败: {}", error));
+        }
+    }
+
+    /// 与 [`Self::load_facts`] 相同，但把 consult 失败显式交给调用方。
+    pub fn load_facts_checked(&mut self, facts: Vec<PrologFact>) -> Result<(), String> {
         if facts == self.loaded_facts {
-            return;
+            return Ok(());
         }
 
         // 按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
@@ -85,10 +200,10 @@ impl PrologEngine {
         facts.sort_by(Self::compare_facts);
 
         if facts == self.loaded_facts {
-            return;
+            return Ok(());
         }
 
-        self.clear_dynamic_facts();
+        self.clear_dynamic_facts()?;
         let mut fact_string = String::with_capacity(facts.len() * 64);
         
         for fact in &facts {
@@ -121,8 +236,9 @@ impl PrologEngine {
             }
         }
         
-        self.machine.consult_module_string("user", fact_string);
+        self.consult_source(fact_string)?;
         self.loaded_facts = facts;
+        Ok(())
     }
 
     /// 事实的规范比较顺序：先实体后关系，各自按字段字典序
@@ -145,25 +261,31 @@ impl PrologEngine {
         self.load_facts(facts);
     }
 
-    fn clear_dynamic_facts(&mut self) {
+    fn clear_dynamic_facts(&mut self) -> Result<(), String> {
         for goal in [
             "retractall(oxigraph_entity(_, _, _)).",
             "retractall(oxigraph_relation(_, _, _)).",
         ] {
-            match self.machine.run_query(goal.to_string()) {
-                Ok(_) => {},
-                Err(e) => eprintln!("清除动态事实时出错: {}", e),
-            }
+            self.machine
+                .run_query(goal.to_string())
+                .map_err(|error| error.to_string())?;
         }
+        Ok(())
     }
-    
+
     pub fn query(&mut self, query: &str) -> Vec<HashMap<String, String>> {
-        self.query_values(query)
+        self.query_outcome(query)
+            .into_solutions()
             .into_iter()
             .map(|bindings| {
                 bindings
-                    .into_iter()
-                    .map(|(name, value)| (name, value_to_string(value)))
+                    .iter()
+                    .map(|(name, term)| {
+                        (
+                            name.clone(),
+                            term.render_raw().unwrap_or_else(|| "null".to_string()),
+                        )
+                    })
                     .collect()
             })
             .collect()
@@ -175,50 +297,57 @@ impl PrologEngine {
     /// 本 API 暴露语义：未绑定 = [`BoundTerm::Unbound`]，整数/浮点 = `Number`
     /// （raw 原样保留，value 可参与比较），列表/结构保持形状。
     pub fn query_typed(&mut self, query: &str) -> Vec<BindingSet> {
-        self.query_values(query)
-            .into_iter()
-            .map(|bindings| {
-                let mut typed = BindingSet::new();
-                for (name, value) in bindings {
-                    typed.insert(name, bound_from_value(&value));
-                }
-                typed
-            })
-            .collect()
+        self.query_outcome(query).into_solutions()
     }
 
-    /// 执行查询并返回非空绑定的原始值（`query` / `query_typed` 共用的提取层）。
-    fn query_values(&mut self, query: &str) -> Vec<std::collections::BTreeMap<String, Value>> {
-        let mut results = Vec::new();
-
+    /// 三态查询：有解 / 无解 / 引擎故障——`query` 与 `query_typed` 的公共真值层。
+    ///
+    /// 引擎崩溃（scryer 内部 panic）也被收进 `EngineFault`：崩溃后的实例
+    /// 标记为停止服务，后续查询不再触碰内部状态。
+    pub fn query_outcome(&mut self, query: &str) -> QueryOutcome {
+        if self.poisoned {
+            let message = "引擎已因崩溃停止服务（需重建实例）".to_string();
+            self.note_fault(message.clone());
+            return QueryOutcome::EngineFault(message);
+        }
         let query_str = format!("{}.", query);
-
-        match self.machine.run_query(query_str) {
-            Ok(query_output) => {
-                match query_output {
-                    QueryResolution::Matches(matches) => {
-                        // 直接提取变量绑定（如 Age/Relation/Count/Spouse）
-                        for query_match in matches {
-                            if query_match.bindings.is_empty() {
-                                continue;
-                            }
-                            results.push(query_match.bindings);
-                        }
-                    }
-                    QueryResolution::True => {
-                        // 查询成功但无变量绑定：无可提取的答案。
-                    }
-                    QueryResolution::False => {
-                        // 查询成功但无解：无可提取的答案。
-                    }
-                }
+        let resolution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.machine.run_query(query_str)
+        }));
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            Err(payload) => {
+                self.poisoned = true;
+                let message = format!("查询触发引擎崩溃：{}", panic_message(payload));
+                self.note_fault(message.clone());
+                return QueryOutcome::EngineFault(message);
             }
+        };
+        match resolution {
+            Ok(QueryResolution::Matches(matches)) => {
+                // 直接提取变量绑定（如 Age/Relation/Count/Spouse）
+                let solutions: Vec<BindingSet> = matches
+                    .iter()
+                    .filter(|query_match| !query_match.bindings.is_empty())
+                    .map(|query_match| {
+                        let mut typed = BindingSet::new();
+                        for (name, value) in &query_match.bindings {
+                            typed.insert(name.clone(), bound_from_value(value));
+                        }
+                        typed
+                    })
+                    .collect();
+                QueryOutcome::Solutions(solutions)
+            }
+            // 查询成功但无可提取变量：目标成立（如 `true` 或全绑定查询）。
+            Ok(QueryResolution::True) => QueryOutcome::Solutions(Vec::new()),
+            Ok(QueryResolution::False) => QueryOutcome::NoSolution,
             Err(err) => {
-                eprintln!("Prolog查询错误: {}", err);
+                let message = err.to_string();
+                self.note_fault(message.clone());
+                QueryOutcome::EngineFault(message)
             }
         }
-
-        results
     }
     
     pub fn generate_prolog_query(pattern: &str, entities: &[String]) -> Option<String> {
@@ -366,14 +495,6 @@ pub(crate) fn escape_atom(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(escaped)
 }
 
-fn value_to_string(value: Value) -> String {
-    match value {
-        // 字符串字面量取内容本身
-        Value::String(s) => s,
-        other => prolog_value_to_json_string(other),
-    }
-}
-
 /// Scryer 值 → 统一类型化绑定（字符串渲染约定只在 [`BoundTerm::render_raw`] 中体现）。
 pub fn bound_from_value(value: &Value) -> BoundTerm {
     match value {
@@ -506,5 +627,52 @@ mod tests {
     fn test_bound_from_value_keeps_raw_rendering() {
         assert_eq!(bound_from_value(&Value::Var), BoundTerm::Unbound);
         assert_eq!(BoundTerm::Unbound.render_raw(), None);
+    }
+
+    #[test]
+    fn query_outcome_separates_no_solution_from_engine_fault() {
+        let mut engine = PrologEngine::new();
+
+        // 有解
+        let outcome = engine.query_outcome("X is 1 + 2");
+        assert!(!outcome.is_fault());
+        assert!(outcome.has_solutions());
+        assert!(engine.last_fault().is_none());
+
+        // 无解：查询本身成功，只是知识里确实没有
+        let outcome = engine.query_outcome("entity(不存在的人, person, _)");
+        assert_eq!(outcome, QueryOutcome::NoSolution);
+        assert!(!outcome.is_fault());
+        assert!(engine.last_fault().is_none(), "无解不是引擎故障");
+
+        // 引擎故障：未定义谓词必须可判、可上报、信息不销毁
+        let outcome = engine.query_outcome("definitely_not_a_predicate_xyz(1, 2)");
+        match &outcome {
+            QueryOutcome::EngineFault(message) => assert!(!message.is_empty()),
+            other => panic!("未定义谓词应报引擎故障：{:?}", other),
+        }
+        assert!(engine.last_fault().is_some());
+        assert!(engine.take_fault().is_some());
+        assert!(engine.last_fault().is_none(), "故障取走后不重复刷屏");
+    }
+
+    #[test]
+    fn engine_crash_is_contained_and_reported() {
+        let mut engine = PrologEngine::new();
+        // scryer 0.9.x 对坏语法会在 consult 中 panic：必须被兜住并转成故障
+        let error = engine
+            .consult_source("this is (((not prolog")
+            .expect_err("坏语法不得静默通过");
+        assert!(error.contains("崩溃"), "{}", error);
+        assert!(engine.is_poisoned());
+
+        // 崩溃后的实例：一律 EngineFault，绝不伪装成无解
+        let outcome = engine.query_outcome("X is 1 + 2");
+        assert!(outcome.is_fault(), "{:?}", outcome);
+        assert!(!matches!(outcome, QueryOutcome::NoSolution));
+        assert!(engine.last_fault().is_some());
+        assert!(engine
+            .consult_source("p(a).")
+            .is_err(), "停止服务的引擎不再接受事实");
     }
 }

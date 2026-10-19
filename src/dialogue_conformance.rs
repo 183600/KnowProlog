@@ -13,6 +13,12 @@
 //!   C7 状态充分性：快照-恢复-续聊 ≡ 不中断运行（逐字一致）
 //!   C8 确定性与幂等：同一 transcript 两次回放输出一致
 //!
+//! 错误处理 × 神经符号推理扩展（恢复维度）：
+//!   C14 失败可命名：引擎故障显式「出错」，绝不伪装成「没有记录」；
+//!       Off / Observe / On 三档各自的行为契约（旧行为 / 只记账 / 显式恢复）
+//!   C15 推测不幻觉：联想提名必带「推测」定性 + 证据 + 追问，可被用户裁定作废
+//!   C16 恢复确定性与有界：同 transcript 回放逐字一致；挂账有 TTL 不滞留
+//!
 //! 另含两条跨模块一致性测试：生成器→解析器往返（互为 oracle）、
 //! 真实 SymbolicReasoner 全栈冒烟。
 
@@ -21,7 +27,9 @@ use std::collections::{BTreeMap, HashMap};
 use crate::chinese_reasoning_nlu::{parse_lessons, LessonKind};
 use crate::chronicle::{Chronicle, FsyncPolicy};
 use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueReply, MoveKind};
+use crate::epistemic::EpistemicStatus;
 use crate::prolog_engine::PrologFact;
+use crate::recovery::{RecoveryMode, RecoveryNomination};
 use crate::symbolic_generator::SymbolicGenerator;
 use crate::symbolic_reasoner::SymbolicReasoner;
 use crate::ReasoningConfig;
@@ -36,6 +44,9 @@ struct ScriptedKnowledge {
     answers: BTreeMap<String, String>,
     values: BTreeMap<(String, String), Vec<String>>,
     profiles: BTreeMap<String, String>,
+    nominations: BTreeMap<(String, String), Vec<RecoveryNomination>>,
+    clues: BTreeMap<String, Vec<String>>,
+    fault: Option<String>,
 }
 
 impl ScriptedKnowledge {
@@ -66,6 +77,38 @@ impl ScriptedKnowledge {
     fn with_profile(mut self, entity: &str, profile: &str) -> Self {
         self.profiles
             .insert(entity.to_string(), profile.to_string());
+        self
+    }
+
+    fn with_nomination(
+        mut self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+        score: f64,
+        evidence: &str,
+    ) -> Self {
+        self.nominations
+            .entry((entity.to_string(), attribute.to_string()))
+            .or_default()
+            .push(RecoveryNomination {
+                value: value.to_string(),
+                score,
+                evidence: vec![evidence.to_string()],
+            });
+        self
+    }
+
+    fn with_clue(mut self, entity: &str, clue: &str) -> Self {
+        self.clues
+            .entry(entity.to_string())
+            .or_default()
+            .push(clue.to_string());
+        self
+    }
+
+    fn with_fault(mut self, fault: &str) -> Self {
+        self.fault = Some(fault.to_string());
         self
     }
 
@@ -118,6 +161,21 @@ impl DialogueKnowledge for ScriptedKnowledge {
 
     fn describe(&self, entity: &str) -> Option<String> {
         self.profiles.get(entity).cloned()
+    }
+
+    fn recovery_nominations(&self, entity: &str, attribute: &str) -> Vec<RecoveryNomination> {
+        self.nominations
+            .get(&(entity.to_string(), attribute.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn recovery_clues(&self, entity: &str) -> Vec<String> {
+        self.clues.get(entity).cloned().unwrap_or_default()
+    }
+
+    fn engine_fault(&self) -> Option<String> {
+        self.fault.clone()
     }
 }
 
@@ -747,5 +805,173 @@ fn real_reasoner_stack_answers_and_defers() {
     let report = reasoner.assert_nl_fact("姚明喜欢叶莉");
     assert!(report.contains("已记住"), "{}", report);
     assert!(report.contains("姚明喜欢叶莉"), "教回应还原动词化模板：{}", report);
+}
+
+/// C14 失败可命名：引擎故障必须显式说「我出错了」，绝不伪装成「没有记录」；
+/// Observe 只记账不改文本；Off 完全保持旧行为。
+#[test]
+fn c14_failures_are_named_and_never_masked() {
+    // (a) On：故障优先、显式命名、可回溯、绝不出现「没有记录」式伪装
+    let faulted = scripted().with_fault("Prolog 引擎故障：index out of bounds");
+    let mut manager = DialogueManager::new();
+    manager.set_recovery_mode(RecoveryMode::On);
+    let reply = ask(&mut manager, &faulted, "姚明的身高是什么");
+    assert!(
+        reply.plan.contains(&"engine_fault".to_string()),
+        "故障轮必须走 engine_fault 策略：{:?}",
+        reply.plan
+    );
+    assert!(
+        reply.text.contains("出错") || reply.text.contains("故障"),
+        "故障必须被命名：{}",
+        reply.text
+    );
+    assert!(
+        !reply.text.contains("没有记录"),
+        "引擎故障绝不能伪装成不知道：{}",
+        reply.text
+    );
+    let notice = manager.last_recovery().expect("故障轮必须产生认识论视图");
+    assert_eq!(notice.status, EpistemicStatus::EngineFault);
+    assert!(notice.receipt_id.is_some(), "故障必须有回执 id");
+    assert_eq!(manager.failure_ledger().open_count(), 1);
+
+    // (b) Off：旧行为逐字，且完全不记账（零副作用）
+    let mut legacy = DialogueManager::new();
+    let legacy_reply = ask(&mut legacy, &faulted, "姚明的身高是什么");
+    assert!(
+        legacy_reply.plan.contains(&"direct_answer".to_string()),
+        "Off 模式应保持旧行为：{:?}",
+        legacy_reply.plan
+    );
+    assert!(legacy.failure_ledger().is_empty(), "Off 模式不得记账");
+    assert!(legacy.last_recovery().is_none());
+
+    // (c) Observe：只记账不改文本，文本仍可被旧管线回答
+    let mut observe = DialogueManager::new();
+    observe.set_recovery_mode(RecoveryMode::Observe);
+    let observed = ask(&mut observe, &faulted, "姚明的身高是什么");
+    assert!(observed.text.contains("226"), "{}", observed.text);
+    assert_eq!(
+        observe.last_recovery().map(|notice| notice.status),
+        Some(EpistemicStatus::EngineFault),
+        "Observe 模式故障必须入账"
+    );
+
+    // (d) 确无记录（Absent）与引擎故障（EngineFault）措辞必须可区分
+    let kb = scripted();
+    let mut absent = DialogueManager::new();
+    absent.set_recovery_mode(RecoveryMode::On);
+    let absent_reply = ask(&mut absent, &kb, "姚明的体重是多少");
+    let absent_notice = absent.last_recovery().expect("缺记录轮必须产生视图");
+    assert_eq!(absent_notice.status, EpistemicStatus::Absent);
+    assert!(
+        absent_reply.text.contains("确定") || absent_reply.text.contains("没有记录"),
+        "缺记录应显式命名：{}",
+        absent_reply.text
+    );
+    assert_ne!(
+        absent_reply.text,
+        reply.text,
+        "「确定没有」与「引擎故障」的措辞绝不能同形"
+    );
+    assert!(
+        absent.recovery_report().contains("absent"),
+        "报告应给出状态码分布：{}",
+        absent.recovery_report()
+    );
+}
+
+/// C15 推测不幻觉：联想提名以「推测」呈现、必带证据与追问，
+/// 用户裁定（不是）后回执关闭、推测作废、挂账清空。
+#[test]
+fn c15_speculation_is_evidence_backed_and_resolvable() {
+    let kb = scripted()
+        .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：同位置中锋体重分布")
+        .with_clue("姚明", "国籍");
+    let mut manager = DialogueManager::new();
+    manager.set_recovery_mode(RecoveryMode::On);
+
+    let reply = ask(&mut manager, &kb, "姚明的体重是多少");
+    assert!(reply.text.contains("140公斤"), "{}", reply.text);
+    assert!(
+        reply.text.contains("推测"),
+        "提名必须以「推测」定性：{}",
+        reply.text
+    );
+    assert!(
+        reply.text.contains("依据") && reply.text.contains("链接预测"),
+        "推测必须带证据链：{}",
+        reply.text
+    );
+    let notice = manager.last_recovery().expect("推测轮必须产生视图");
+    assert_eq!(notice.status, EpistemicStatus::Provisional);
+    assert_eq!(notice.level, "L2");
+    assert!(!notice.evidence.is_empty());
+    assert!(notice.question.as_deref().is_some_and(|q| !q.is_empty()));
+    assert_eq!(manager.recovery_state().pending.len(), 1, "推测应挂账待确认");
+
+    // 用户否认：回执关闭、摘要改变、挂账清空、承诺不再引用
+    let open_before = manager.failure_ledger().digest();
+    let refute = ask(&mut manager, &kb, "不是");
+    assert!(
+        refute.text.contains("作废") || refute.text.contains("不会再"),
+        "{}",
+        refute.text
+    );
+    assert_eq!(manager.failure_ledger().open_count(), 0);
+    assert_ne!(open_before, manager.failure_ledger().digest());
+    assert!(manager.recovery_state().pending.is_empty());
+    assert_eq!(
+        manager.last_recovery().map(|notice| notice.status),
+        Some(EpistemicStatus::Provisional)
+    );
+}
+
+/// C16 恢复确定性与有界：同一 transcript 两次回放逐字一致、台账摘要一致；
+/// 澄清挂账有 TTL（3 轮）不会无限滞留。
+#[test]
+fn c16_recovery_is_deterministic_and_bounded() {
+    let kb = scripted()
+        .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据")
+        .with_clue("姚明", "国籍");
+    let run = || {
+        let mut manager = DialogueManager::new();
+        manager.set_recovery_mode(RecoveryMode::On);
+        let outputs = replay(
+            &mut manager,
+            &kb,
+            &[
+                "姚明的体重是多少", // L2 推测 + 挂账
+                "不是",             // 裁定否认、关闭回执
+                "姚明的体重是多少", // 身份已结：允许新回执（新 id）
+                "我们聊了什么？",
+            ],
+        );
+        (
+            outputs.join("\n"),
+            manager.failure_ledger().digest(),
+            manager.failure_ledger().len(),
+        )
+    };
+    let first = run();
+    let second = run();
+    assert_eq!(first.0, second.0, "恢复回放必须逐字一致");
+    assert_eq!(first.1, second.1, "台账摘要必须一致");
+    assert_eq!(first.2, second.2);
+    assert_eq!(first.2, 2, "否认后同身份应可再次入账（新回执）");
+
+    // TTL：澄清挂账 3 轮未获回答即过期（无挂钟，按逻辑轮次）
+    let mut manager = DialogueManager::new();
+    manager.set_recovery_mode(RecoveryMode::On);
+    ask(&mut manager, &kb, "叶莉的体重是多少");
+    assert_eq!(manager.recovery_state().pending.len(), 1, "应挂一个澄清问题");
+    for _ in 0..3 {
+        ask(&mut manager, &kb, "叶莉的身高呢");
+    }
+    assert!(
+        manager.recovery_state().pending.is_empty(),
+        "澄清挂账应在 TTL 后过期，不留无限追问"
+    );
 }
 

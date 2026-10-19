@@ -18,10 +18,15 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::BindingSet;
+use crate::epistemic::{EpistemicStatus, LedgerLoad};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{
     self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION,
 };
+use crate::recovery::{
+    self, PendingKind, RecoveryMode, RecoveryRequest, RecoveryState,
+};
+use crate::recovery::{RecoveryNomination, ReframedReading, VerificationOutcome};
 use crate::symbolic_reasoner::SymbolicReasoner;
 
 /// 一轮话语的语用类型（对话本体的「动作类」）。
@@ -110,6 +115,9 @@ pub struct DialogueManagerSnapshot {
     pub externals: Vec<String>,
     #[serde(default)]
     pub last_reply: Vec<String>,
+    /// 失败回执台账与挂账问题（认识论状态也是可观察状态的一部分）。
+    #[serde(default)]
+    pub recovery: RecoveryState,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -118,6 +126,21 @@ pub struct DialogueReply {
     pub text: String,
     pub plan: Vec<String>,
     pub kind: MoveKind,
+}
+
+/// 最近一次恢复动作的对外视图（不持久化；派生于台账与挂账）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryNotice {
+    /// 本轮对外的认识论定性。
+    pub status: crate::epistemic::EpistemicStatus,
+    /// 恢复阶梯档位（`L0`–`L4`）。
+    pub level: String,
+    /// 关联回执 id（如有）。
+    pub receipt_id: Option<String>,
+    /// 证据链（推测/冲突时非空；逐字可回溯）。
+    pub evidence: Vec<String>,
+    /// 挂账追问（如有）。
+    pub question: Option<String>,
 }
 
 /// 管理器向知识源提出的接口（由 `SymbolicReasoner` 或测试替身实现）。
@@ -145,6 +168,64 @@ pub trait DialogueKnowledge {
     fn traceable_token(&self, token: &str) -> bool {
         let _ = token;
         false
+    }
+
+    /// 恢复通道 L1：换帧重解（缺省无替代问法）。
+    fn recovery_reframe(&self, entity: &str, attribute: &str) -> Vec<ReframedReading> {
+        let _ = (entity, attribute);
+        Vec::new()
+    }
+
+    /// 恢复通道 L2：联想通道提名（缺省无提名）。
+    fn recovery_nominations(&self, entity: &str, attribute: &str) -> Vec<RecoveryNomination> {
+        let _ = (entity, attribute);
+        Vec::new()
+    }
+
+    /// 恢复通道 L2：符号通道验证一条提名（缺省无结论）。
+    fn recovery_verify(
+        &self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+    ) -> VerificationOutcome {
+        let _ = (entity, attribute, value);
+        VerificationOutcome::NoVerdict
+    }
+
+    /// 恢复通道 L3：实体可追问的相关线索（缺省无）。
+    fn recovery_clues(&self, entity: &str) -> Vec<String> {
+        let _ = entity;
+        Vec::new()
+    }
+
+    /// 引擎层故障（Prolog / 存储 / 策略求值）：非空时走 EngineFault 路径，
+    /// 绝不与「知识里没有」合并。缺省无故障。
+    fn engine_fault(&self) -> Option<String> {
+        None
+    }
+}
+
+/// 把 [`DialogueKnowledge`] 适配为恢复引擎所需的 [`recovery::RecoveryKnowledge`]。
+struct KnowledgeRecovery<'a> {
+    knowledge: &'a dyn DialogueKnowledge,
+}
+
+impl recovery::RecoveryKnowledge for KnowledgeRecovery<'_> {
+    fn reframe(&self, entity: &str, attribute: &str) -> Vec<ReframedReading> {
+        self.knowledge.recovery_reframe(entity, attribute)
+    }
+
+    fn nominations(&self, entity: &str, attribute: &str) -> Vec<RecoveryNomination> {
+        self.knowledge.recovery_nominations(entity, attribute)
+    }
+
+    fn verify(&self, entity: &str, attribute: &str, value: &str) -> VerificationOutcome {
+        self.knowledge.recovery_verify(entity, attribute, value)
+    }
+
+    fn related(&self, entity: &str) -> Vec<String> {
+        self.knowledge.recovery_clues(entity)
     }
 }
 
@@ -184,6 +265,32 @@ impl DialogueKnowledge for SymbolicReasoner {
         self.generator().is_known_entity(token)
             || self.generator().predicate_surfaces().contains_key(token)
             || self.attribute_token_known(token)
+    }
+
+    /// 联想提名来自链接预测（符号统计，非神经网络）。
+    fn recovery_nominations(&self, entity: &str, attribute: &str) -> Vec<RecoveryNomination> {
+        SymbolicReasoner::recovery_nominations(self, entity, attribute)
+    }
+
+    fn recovery_verify(
+        &self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+    ) -> VerificationOutcome {
+        SymbolicReasoner::recovery_verify(self, entity, attribute, value)
+    }
+
+    fn recovery_clues(&self, entity: &str) -> Vec<String> {
+        SymbolicReasoner::recovery_clues(self, entity)
+    }
+
+    fn recovery_reframe(&self, entity: &str, attribute: &str) -> Vec<ReframedReading> {
+        SymbolicReasoner::recovery_reframe(self, entity, attribute)
+    }
+
+    fn engine_fault(&self) -> Option<String> {
+        SymbolicReasoner::engine_fault(self)
     }
 }
 
@@ -292,6 +399,12 @@ pub struct DialogueManager {
     prompt_mode: PromptMode,
     /// 提示模板运行统计（诊断计数，不参与对话快照的语义状态）。
     prompt_stats: PromptStats,
+    /// 失败恢复模式（默认 Off：旧行为逐字；Observe 只记台账；On 完整阶梯）。
+    recovery_mode: RecoveryMode,
+    /// 失败台账 + 待定挂账（随快照持久化）。
+    recovery: RecoveryState,
+    /// 最近一次恢复动作（运行时视图，不进快照）。
+    last_recovery: Option<RecoveryNotice>,
 }
 
 impl Default for DialogueManager {
@@ -311,6 +424,9 @@ impl DialogueManager {
             last_reply: Vec::new(),
             prompt_mode: PromptMode::Off,
             prompt_stats: PromptStats::default(),
+            recovery_mode: RecoveryMode::Off,
+            recovery: RecoveryState::new(),
+            last_recovery: None,
         }
     }
 
@@ -348,6 +464,93 @@ impl DialogueManager {
             PROMPT_SPEC_VERSION,
             self.prompt_stats.render_text()
         )
+    }
+
+    /// 设置失败恢复模式（Off / Observe / On），支持链式调用。
+    pub fn set_recovery_mode(&mut self, mode: RecoveryMode) -> &mut Self {
+        self.recovery_mode = mode;
+        self
+    }
+
+    pub fn recovery_mode(&self) -> RecoveryMode {
+        self.recovery_mode
+    }
+
+    /// 失败台账（只读），供 CLI 报告与评测。
+    pub fn failure_ledger(&self) -> &crate::epistemic::FailureLedger {
+        &self.recovery.ledger
+    }
+
+    /// 恢复状态（只读）。
+    pub fn recovery_state(&self) -> &RecoveryState {
+        &self.recovery
+    }
+
+    /// 最近一次恢复动作的对外视图（服务层 `epistemic` 字段用；Off 模式下为 None）。
+    pub fn last_recovery(&self) -> Option<&RecoveryNotice> {
+        self.last_recovery.as_ref()
+    }
+
+    /// 清除最近恢复视图（服务层每轮开始时调用，防止跨轮陈旧泄漏）。
+    pub fn clear_last_recovery(&mut self) {
+        self.last_recovery = None;
+    }
+
+    /// 把一次让位（defer）记为 Unknown 失败回执：知识管线未能接管输入。
+    ///
+    /// Off 模式零副作用；返回是否产生了回执。让位不再是「无声的」——
+    /// 它和确答一样有状态、有 id、可被自省检索。
+    pub fn note_deferred(&mut self, input: &str, knowledge: &dyn DialogueKnowledge) -> bool {
+        if self.recovery_mode.eq(&RecoveryMode::Off) {
+            return false;
+        }
+        let detail = excerpt(input.trim(), 40);
+        if detail.is_empty() {
+            return false;
+        }
+        self.recovery.begin_turn();
+        let request = RecoveryRequest {
+            status: EpistemicStatus::Unknown,
+            entity: None,
+            attribute: None,
+            detail: &detail,
+        };
+        let attempt = recovery::attempt(
+            &mut self.recovery,
+            self.recovery_mode,
+            &request,
+            &KnowledgeRecovery { knowledge },
+        );
+        if attempt.receipt_id.is_none() {
+            return false;
+        }
+        self.note_recovery(&attempt);
+        true
+    }
+
+    /// 可读的失败恢复状态行（无回执时为确定性空态描述）。
+    pub fn recovery_report(&self) -> String {
+        format!(
+            "失败恢复：模式 {}；{}；挂账 {} 个待定问题。\n{}",
+            self.recovery_mode.label(),
+            format!("回执 {} 条（未结 {}）", self.recovery.ledger.len(), self.recovery.ledger.open_count()),
+            self.recovery.pending.len(),
+            self.recovery.ledger.render_text()
+        )
+    }
+
+    /// 把失败台账写入路径（供跨会话持久化，`--recovery-ledger` 使用）。
+    pub fn save_recovery_ledger(&self, path: &str) -> std::io::Result<()> {
+        self.recovery.ledger.save(path)
+    }
+
+    /// 从路径恢复失败台账（缺失/损坏时不改动现有台账，安全降级）。
+    pub fn load_recovery_ledger(&mut self, path: &str) -> LedgerLoad {
+        let (load, ledger) = crate::epistemic::FailureLedger::load_full(path);
+        if let Some(ledger) = ledger {
+            self.recovery.ledger = ledger;
+        }
+        load
     }
 
     pub fn turn_count(&self) -> usize {
@@ -395,14 +598,27 @@ impl DialogueManager {
         } else {
             self.last_reply.join(" + ")
         };
-        format!(
+        let mut summary = format!(
             "对话本体：{} 轮对话实例；焦点栈 [{}]；最近策略 [{}]；外部指令 {} 条；策略程序 {} 条规则。",
             self.turns.len(),
             focus,
             last,
             self.externals.len(),
             self.policy.rule_count()
-        )
+        );
+        if !self.recovery_mode.eq(&RecoveryMode::Off)
+            || !self.recovery.ledger.is_empty()
+            || !self.recovery.pending.is_empty()
+        {
+            summary.push_str(&format!(
+                " 失败恢复：模式 {}，回执 {} 条（未结 {}），挂账 {} 个。",
+                self.recovery_mode.label(),
+                self.recovery.ledger.len(),
+                self.recovery.ledger.open_count(),
+                self.recovery.pending.len()
+            ));
+        }
+        summary
     }
 
     pub fn snapshot(&self) -> DialogueManagerSnapshot {
@@ -411,6 +627,7 @@ impl DialogueManager {
             focus: self.focus.clone(),
             externals: self.externals.clone(),
             last_reply: self.last_reply.clone(),
+            recovery: self.recovery.clone(),
         }
     }
 
@@ -419,6 +636,7 @@ impl DialogueManager {
         self.focus = snapshot.focus.clone();
         self.externals = snapshot.externals.clone();
         self.last_reply = snapshot.last_reply.clone();
+        self.recovery = snapshot.recovery.clone();
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -444,11 +662,19 @@ impl DialogueManager {
     }
 
     /// 纯对话行为（元话语 / 续聊 / 展开 / 寒暄）：可在管线早段拦截。
+    ///
+    /// 恢复模式开启时，先尝试结算挂账（「是/不是」确认推测、具体线索关闭澄清），
+    /// 这保证「推测 → 用户裁定 → 回执关闭」的闭环。
     pub fn plan_pure_dialogue(
         &mut self,
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        if !self.recovery_mode.eq(&RecoveryMode::Off) {
+            if let Some(reply) = self.try_resolve_pending(input) {
+                return Some(reply);
+            }
+        }
         let frame = self.analyze(input, knowledge);
         match frame.kind {
             MoveKind::MetaRecap
@@ -460,6 +686,69 @@ impl DialogueManager {
             | MoveKind::ElaborateRequest => self.execute(frame, knowledge),
             _ => None,
         }
+    }
+
+    /// 挂账结算：是/不是裁定推测挂账；具体而短的陈述关闭澄清挂账。
+    fn try_resolve_pending(&mut self, input: &str) -> Option<DialogueReply> {
+        if self.recovery.pending.is_empty() {
+            return None;
+        }
+        let stripped = input
+            .trim()
+            .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+            .trim();
+        if stripped.is_empty() {
+            return None;
+        }
+        const YES: [&str; 6] = ["是", "是的", "对", "对的", "没错", "嗯"];
+        const NO: [&str; 5] = ["不是", "不对", "错了", "错", "不"];
+        let pending = self.recovery.latest_pending().cloned()?;
+        let (text, plan) = if YES.contains(&stripped) {
+            (
+                recovery::resolve_by_yes(&mut self.recovery, true)?,
+                "recovery_confirm",
+            )
+        } else if NO.contains(&stripped) {
+            (
+                recovery::resolve_by_yes(&mut self.recovery, false)?,
+                "recovery_refute",
+            )
+        } else {
+            // 澄清回答：排除问句与命令式输入，只收短陈述。
+            if pending.kind != PendingKind::Clarification || stripped.chars().count() > 24 {
+                return None;
+            }
+            if [
+                "？", "?", "导入", "导出", "帮助", "退出", "为什么", "你怎么", "什么", "谁",
+                "哪", "多少", "几", "吗", "呢", "怎么", "吧", "哈哈",
+            ]
+            .iter()
+            .any(|marker| input.contains(marker))
+            {
+                return None;
+            }
+            (
+                recovery::resolve_clarification(&mut self.recovery, stripped)?,
+                "recovery_acknowledge",
+            )
+        };
+        let level = match pending.kind {
+            PendingKind::Provisional => "L2",
+            PendingKind::Clarification => "L3",
+        };
+        self.last_recovery = Some(RecoveryNotice {
+            status: pending.status,
+            level: level.to_string(),
+            receipt_id: Some(pending.receipt_id.clone()),
+            evidence: Vec::new(),
+            question: Some(pending.question.clone()),
+        });
+        self.last_reply = vec![plan.to_string()];
+        Some(DialogueReply {
+            text,
+            plan: vec![plan.to_string()],
+            kind: MoveKind::Other,
+        })
     }
 
     /// 知识问句的生成式回答：仅在实体已知时才接管（否则让位给既有管线）。
@@ -656,6 +945,7 @@ impl DialogueManager {
         frame: UtteranceFrame,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        self.last_recovery = None;
         let mut entity = frame.entity.clone();
         let pure_dialogue = matches!(
             frame.kind,
@@ -676,6 +966,70 @@ impl DialogueManager {
         // 实体存在但图谱不认识时让位给既有 NLU / 外部知识管线。
         let attribute_only =
             matches!(frame.kind, MoveKind::AskAttribute) && entity.is_none() && frame.attribute.is_some();
+
+        // —— 失败恢复：引擎层故障优先于一切知识判定 ——
+        // On 模式下故障必须显式说「我出错了」；Observe 只入台账；Off 不介入。
+        let mut recovery_attempt: Option<recovery::RecoveryAttempt> = None;
+        let ask_like = matches!(
+            frame.kind,
+            MoveKind::AskAttribute | MoveKind::AskIdentity | MoveKind::AskBinary
+        );
+        if !self.recovery_mode.eq(&RecoveryMode::Off) && ask_like {
+            self.recovery.begin_turn();
+            if let Some(fault) = knowledge.engine_fault() {
+                let fault = fault.trim().to_string();
+                let request = RecoveryRequest {
+                    status: EpistemicStatus::EngineFault,
+                    entity: entity.as_deref(),
+                    attribute: frame.attribute.as_deref(),
+                    detail: &fault,
+                };
+                let attempt = recovery::attempt(
+                    &mut self.recovery,
+                    self.recovery_mode,
+                    &request,
+                    &KnowledgeRecovery { knowledge },
+                );
+                self.note_recovery(&attempt);
+                if self.recovery_mode == RecoveryMode::On {
+                    let text = if attempt.text.is_empty() {
+                        crate::epistemic::render_statement(
+                            EpistemicStatus::EngineFault,
+                            entity.as_deref(),
+                            frame.attribute.as_deref(),
+                            None,
+                        )
+                    } else {
+                        attempt.text.clone()
+                    };
+                    let plans = vec!["engine_fault".to_string()];
+                    self.turns.push(DialogueTurn {
+                        index: self.turns.len() + 1,
+                        user: raw_input(&frame),
+                        kind: frame.kind.clone(),
+                        entity: entity.clone(),
+                        attribute: frame.attribute.clone(),
+                        answer_excerpt: None,
+                        provenance: vec![format!("引擎故障：{}", fault)],
+                        plan: plans.clone(),
+                    });
+                    if let Some(entity) = &entity {
+                        self.push_focus(entity);
+                    }
+                    self.last_reply = plans.clone();
+                    if self.externals.last().map(String::as_str) == Some(frame.raw.trim()) {
+                        self.externals.pop();
+                    }
+                    return Some(DialogueReply {
+                        text,
+                        plan: plans,
+                        kind: frame.kind.clone(),
+                    });
+                }
+                recovery_attempt = Some(attempt);
+            }
+        }
+
         if matches!(frame.kind, MoveKind::AskAttribute | MoveKind::AskIdentity) && !known && !attribute_only
         {
             return None;
@@ -779,10 +1133,12 @@ impl DialogueManager {
         let text = match chosen.as_str() {
             "recap" => self.recap_text(),
             "explain_why" => self.explain_last(),
-            "why_no_evidence" => {
-                "我还没有答过什么问题，暂时没有可解释的依据。你可以先问我一个知识问题，再问我「你怎么知道的」。"
-                    .to_string()
-            }
+            "why_no_evidence" => self
+                .failure_self_description()
+                .unwrap_or_else(|| {
+                    "我还没有答过什么问题，暂时没有可解释的依据。你可以先问我一个知识问题，再问我「你怎么知道的」。"
+                        .to_string()
+                }),
             "continue_topic" => self.continue_text(entity.as_deref(), knowledge),
             "continue_no_focus" => {
                 "我还不知道你想接着聊哪个实体。先给我一个名字吧，比如「姚明」。".to_string()
@@ -798,11 +1154,35 @@ impl DialogueManager {
                 entity.as_deref().unwrap_or(""),
                 &more_attributes,
             ),
-            "admit_ignorance" => self.compose_ignorance(
-                entity.as_deref().unwrap_or(""),
-                frame.attribute.as_deref(),
-                &more_attributes,
-            ),
+            "admit_ignorance" => {
+                // 失败恢复：缺记录时走 L2（候选验证）/ L3（一问澄清）/ L4（承认）。
+                if recovery_attempt.is_none() && !self.recovery_mode.eq(&RecoveryMode::Off) {
+                    let status = if known {
+                        EpistemicStatus::Absent
+                    } else {
+                        EpistemicStatus::Unknown
+                    };
+                    let request = RecoveryRequest {
+                        status,
+                        entity: entity.as_deref(),
+                        attribute: frame.attribute.as_deref(),
+                        detail: "",
+                    };
+                    let attempt = recovery::attempt(
+                        &mut self.recovery,
+                        self.recovery_mode,
+                        &request,
+                        &KnowledgeRecovery { knowledge },
+                    );
+                    self.note_recovery(&attempt);
+                    recovery_attempt = Some(attempt);
+                }
+                self.compose_ignorance(
+                    entity.as_deref().unwrap_or(""),
+                    frame.attribute.as_deref(),
+                    &more_attributes,
+                )
+            }
             "greet" => self.greet_text(),
             "thanks" => self.thanks_text(),
             "farewell" => self.farewell_text(),
@@ -818,6 +1198,16 @@ impl DialogueManager {
             &more_attributes,
             text,
         );
+        // On 模式：恢复引擎的文本（含证据链/追问/回执 id）取代旧措辞；
+        // Observe 模式只记台账，保持旧行为逐字不变。
+        let text = match &recovery_attempt {
+            Some(attempt)
+                if self.recovery_mode == RecoveryMode::On && !attempt.text.is_empty() =>
+            {
+                attempt.text.clone()
+            }
+            _ => text,
+        };
 
         let provenance = answer
             .as_deref()
@@ -856,6 +1246,17 @@ impl DialogueManager {
             plan: plans,
             kind: frame.kind,
         })
+    }
+
+    /// 记录一次恢复动作的对外视图。
+    fn note_recovery(&mut self, attempt: &recovery::RecoveryAttempt) {
+        self.last_recovery = Some(RecoveryNotice {
+            status: attempt.status,
+            level: attempt.level.label().to_string(),
+            receipt_id: attempt.receipt_id.clone(),
+            evidence: attempt.evidence.clone(),
+            question: attempt.question.clone(),
+        });
     }
 
     fn already_asked(&self, entity: &Option<String>, attribute: &str) -> bool {
@@ -930,11 +1331,38 @@ impl DialogueManager {
         text
     }
 
+    /// 失败自省：恢复模式开启且台账非空时，把失败回执讲给用户听。
+    ///
+    /// 绝不编造依据：没有成功回答时不假装有，只有回执可引用。
+    fn failure_self_description(&self) -> Option<String> {
+        if self.recovery_mode.eq(&RecoveryMode::Off) || self.recovery.ledger.is_empty() {
+            return None;
+        }
+        let receipt = self
+            .recovery
+            .ledger
+            .open()
+            .next()
+            .or_else(|| self.recovery.ledger.last())?;
+        let framing = if receipt.is_open() {
+            "还有一条没结清的失败回执"
+        } else {
+            "最近一条失败回执"
+        };
+        Some(format!(
+            "我还没有答过带依据的问题；但失败不是无声的——{}：{}。失败回执和成功回答一样会被记录（状态、档位、证据都可回溯），我不会为此编造依据。",
+            framing,
+            receipt.render_line()
+        ))
+    }
+
     /// 元话语：解释上一轮回答的依据（把推理出处「讲」出来）。
     pub fn explain_last(&self) -> String {
         let Some(turn) = self.last_answered_turn() else {
-            return "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。"
-                .to_string();
+            return self.failure_self_description().unwrap_or_else(|| {
+                "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。"
+                    .to_string()
+            });
         };
         let provenance = if turn.provenance.is_empty() {
             vec!["知识图谱中的事实".to_string()]

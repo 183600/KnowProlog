@@ -40,6 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::dialogue_manager::{DialogueKnowledge, DialogueManager};
+use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
@@ -275,6 +276,32 @@ pub struct TurnResponse {
     /// 生效的会话级策略（默认策略时省略）。
     #[serde(default, skip_serializing_if = "SessionPolicy::is_default")]
     pub policy: SessionPolicy,
+    /// 本轮的认识论定性（仅恢复模式开启且本轮发生失败/恢复动作时出现）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic: Option<EpistemicView>,
+}
+
+/// 一轮回答的认识论视图：状态、档位、回执与开放计数。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpistemicView {
+    /// 状态码（`certain`/`provisional`/`conflict`/`absent`/`unknown`/`unparseable`/`engine_fault`）。
+    pub status: String,
+    /// 状态中文标签。
+    pub label: String,
+    /// 恢复阶梯档位（`L0`–`L4`）。
+    pub level: String,
+    /// 关联回执 id（如有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<String>,
+    /// 证据链（推测/冲突时出现；逐字可回溯）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// 挂账追问（如有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// 会话内未结回执数 + 挂账数（透明度计数）。
+    pub open_receipts: usize,
+    pub pending_followups: usize,
 }
 
 /// 单个会话：对话管理器 + 独立推理器 + 有界历史 + 会话级策略。
@@ -295,6 +322,7 @@ impl Session {
             self.history.remove(0);
         }
         self.history.push(input.clone());
+        self.manager.clear_last_recovery();
 
         let dialogue = self
             .manager
@@ -317,6 +345,8 @@ impl Session {
                 answer,
             )
         } else {
+            // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
+            self.manager.note_deferred(&input, &self.reasoner);
             (
                 "deferred".to_string(),
                 "none".to_string(),
@@ -328,6 +358,19 @@ impl Session {
         if !reply.is_empty() && self.history.len() < HISTORY_LIMIT {
             self.history.push(reply.clone());
         }
+        let epistemic = match self.manager.last_recovery() {
+            Some(notice) => Some(EpistemicView {
+                status: notice.status.code().to_string(),
+                label: notice.status.label().to_string(),
+                level: notice.level.clone(),
+                receipt: notice.receipt_id.clone(),
+                evidence: notice.evidence.clone(),
+                question: notice.question.clone(),
+                open_receipts: self.manager.failure_ledger().open_count(),
+                pending_followups: self.manager.recovery_state().pending.len(),
+            }),
+            None => None,
+        };
         let mut response = TurnResponse {
             session_id: self.id.clone(),
             turn: self.turns,
@@ -338,6 +381,7 @@ impl Session {
             reply,
             focus: self.manager.focus_entity().map(str::to_string),
             policy: self.policy.clone(),
+            epistemic,
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
         response
@@ -356,6 +400,7 @@ pub struct ApiState {
     max_sessions: usize,
     max_body_bytes: usize,
     prompt_mode: PromptMode,
+    recovery_mode: RecoveryMode,
 }
 
 impl ApiState {
@@ -377,6 +422,7 @@ impl ApiState {
             max_sessions: max_sessions.max(1),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             prompt_mode: PromptMode::On,
+            recovery_mode: RecoveryMode::Observe,
         }
     }
 
@@ -390,6 +436,16 @@ impl ApiState {
         self.prompt_mode
     }
 
+    /// 设置失败恢复模式（在 `Arc::new` 之前调用；默认 [`RecoveryMode::Observe`]：
+    /// 只记失败台账不改回答文本，On 才启用完整恢复阶梯）。
+    pub fn set_recovery_mode(&mut self, mode: RecoveryMode) {
+        self.recovery_mode = mode;
+    }
+
+    pub fn recovery_mode(&self) -> RecoveryMode {
+        self.recovery_mode
+    }
+
     fn build_session(&self, id: String) -> Session {
         let mut reasoner = SymbolicReasoner::with_perf_ledger(
             self.reasoning.clone(),
@@ -399,6 +455,7 @@ impl ApiState {
         reasoner.observe_facts(&self.facts);
         let mut manager = DialogueManager::new();
         manager.set_prompt_mode(self.prompt_mode);
+        manager.set_recovery_mode(self.recovery_mode);
         Session {
             id,
             turns: 0,
@@ -1166,6 +1223,13 @@ mod tests {
     /// 服务状态不是 `Send`（推理器含 `Rc`），因此把服务跑在专属 OS 线程的
     /// current-thread 运行时里；测试只通过 TCP 交互，不跨线程共享状态。
     fn start_server(max_sessions: usize) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        start_server_with_recovery(max_sessions, RecoveryMode::Observe)
+    }
+
+    fn start_server_with_recovery(
+        max_sessions: usize,
+        recovery: RecoveryMode,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1176,7 +1240,10 @@ mod tests {
                 .unwrap();
             runtime.block_on(async move {
                 let listener = TcpListener::from_std(listener).unwrap();
-                let state = test_state(max_sessions);
+                let mut state = test_state(max_sessions);
+                // Arc::get_mut 不适用（已 Arc）：状态在启动前唯一持有，先解包
+                let inner = Arc::get_mut(&mut state).expect("测试启动前状态唯一");
+                inner.set_recovery_mode(recovery);
                 let _ = run(listener, state).await;
             });
         });
@@ -1252,6 +1319,67 @@ mod tests {
         let (status, _, body) = raw_request(addr, "GET", "/", &[], "").await;
         assert_eq!(status, 200);
         assert!(body.contains("knowprolog"));
+    }
+
+    #[tokio::test]
+    async fn recovery_mode_surfaces_epistemic_view() {
+        let (addr, _server) = start_server_with_recovery(4, RecoveryMode::On);
+        let session_id = create_session(addr).await;
+
+        // 已知实体 + 图谱里没有的属性：On 模式必须给出认识论视图与回执
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[],
+            "姚明的体重是多少",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let epistemic = &value["epistemic"];
+        assert_eq!(epistemic["status"], "absent", "{}", body);
+        assert_eq!(epistemic["label"], "确无");
+        assert!(
+            epistemic["receipt"]
+                .as_str()
+                .is_some_and(|receipt| receipt.starts_with('r')),
+            "缺记录必须有回执 id：{}",
+            body
+        );
+        assert!(value["reply"]
+            .as_str()
+            .is_some_and(|reply| !reply.contains("暂时") || reply.contains("没有记录")));
+
+        // 无失败的动作轮不重复携带陈旧视图
+        let (_, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[],
+            "姚明的身高是多少",
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value.get("epistemic").is_none(),
+            "成功回答轮不得携带陈旧认识论视图：{}",
+            body
+        );
+
+        // 让位（defer）也必须可命名：Unknown 回执而非无声丢弃
+        let (_, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[],
+            "随便聊聊吧",
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "deferred", "{}", body);
+        assert_eq!(value["epistemic"]["status"], "unknown", "{}", body);
+        assert!(value["epistemic"]["receipt"].as_str().is_some(), "{}", body);
     }
 
     #[tokio::test]

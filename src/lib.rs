@@ -67,6 +67,9 @@ pub mod bindings;
 pub mod prompt_spec;
 pub mod type_system;
 pub mod quality;
+pub mod epistemic;
+pub mod eval_recovery;
+pub mod recovery;
 
 #[cfg(test)]
 mod dialogue_conformance;

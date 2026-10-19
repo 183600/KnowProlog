@@ -24,6 +24,7 @@ use know_prolog::{
     dialogue_frame::ClarificationOutcome,
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::DialogueManager,
+    recovery::RecoveryMode,
     holographic_memory::{HoloAnalogyHit, HoloHit},
     import_journal::{ImportJournal, JournalLoad},
     perf_ledger::PerfLedger,
@@ -56,6 +57,9 @@ struct Cli {
     /// Override the configured Oxigraph store path (all subcommands)
     #[arg(long, global = true)]
     store: Option<String>,
+    /// Failure recovery mode for interactive dialogue: "off", "observe", or "on"
+    #[arg(long, global = true, default_value = "observe")]
+    recovery: String,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -117,6 +121,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Evaluate failure recovery (silent-failure / receipt / evidence rates) on
+    /// the built-in seed scenarios with a regression ratchet
+    EvalRecovery {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Lint the prompt asset registry (executable examples + template checks)
     PromptLint {
         /// Print the lint report as JSON
@@ -150,6 +170,10 @@ enum Commands {
         /// Prompt asset mode for sessions: "off", "parity", or "on"
         #[arg(long, default_value = "on")]
         prompt_mode: String,
+        /// Failure recovery mode for sessions: "off" (legacy text verbatim),
+        /// "observe" (record receipts only), or "on" (full recovery ladder)
+        #[arg(long, default_value = "observe")]
+        recovery: String,
     },
     /// Run interactive mode (default)
     Interactive,
@@ -158,6 +182,7 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let recovery_mode = parse_recovery_mode(&cli.recovery);
     
     let config = match load_config().await {
         Ok(cfg) => Arc::new(cfg),
@@ -333,6 +358,59 @@ async fn main() {
                 }
             }
         }
+        Some(Commands::EvalRecovery {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            let report = know_prolog::eval_recovery::evaluate_seed();
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("恢复评测序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", report.render_text());
+            }
+
+            let baseline_path = baseline
+                .clone()
+                .unwrap_or_else(|| "recovery_baseline.json".to_string());
+            if update_baseline {
+                let new_baseline = know_prolog::eval_recovery::EvalRecoveryBaseline::from_report(
+                    &report,
+                );
+                match new_baseline.save(&baseline_path) {
+                    Ok(()) => println!("恢复基线已写入 {}", baseline_path),
+                    Err(e) => {
+                        eprintln!("基线写入失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else if baseline.is_some() {
+                match know_prolog::eval_recovery::EvalRecoveryBaseline::load(&baseline_path) {
+                    Ok(old_baseline) => {
+                        let verdict = know_prolog::eval_recovery::compare_baseline(
+                            &old_baseline,
+                            &report,
+                            1e-6,
+                        );
+                        print!("{}", verdict.render_text());
+                        if !verdict.passed && !allow_regression {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("基线读取失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
         Some(Commands::PromptLint { json }) => {
             run_prompt_lint(json);
         }
@@ -400,8 +478,10 @@ async fn main() {
             addr,
             max_sessions,
             prompt_mode,
+            recovery,
         }) => {
             let prompt_mode = parse_prompt_mode(&prompt_mode);
+            let recovery_mode = parse_recovery_mode(&recovery);
             let facts = match oxigraph_manager.load_all_facts().await {
                 Ok(facts) => facts,
                 Err(e) => {
@@ -415,11 +495,12 @@ async fn main() {
                 create_default_synonyms()
             };
             println!(
-                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个会话，提示模式 {}）",
+                "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个会话，提示模式 {}，失败恢复 {}）",
                 addr,
                 facts.len(),
                 max_sessions,
-                prompt_mode.label()
+                prompt_mode.label(),
+                recovery_mode.label()
             );
             let mut api_state = know_prolog::serve_api::ApiState::new(
                 facts,
@@ -429,6 +510,7 @@ async fn main() {
                 max_sessions,
             );
             api_state.set_prompt_mode(prompt_mode);
+            api_state.set_recovery_mode(recovery_mode);
             let state = Arc::new(api_state);
             if let Err(e) = know_prolog::serve_api::serve(state, &addr).await {
                 eprintln!("服务退出: {}", e);
@@ -437,7 +519,7 @@ async fn main() {
         }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
-            run_interactive_mode(config, oxigraph_manager, perf_ledger).await;
+            run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode).await;
         }
     }
 }
@@ -446,6 +528,14 @@ async fn main() {
 fn parse_prompt_mode(value: &str) -> PromptMode {
     PromptMode::parse(value).unwrap_or_else(|| {
         eprintln!("未知的提示模式「{}」：可选 off / parity / on", value);
+        std::process::exit(1);
+    })
+}
+
+/// 解析 `--recovery`：off / observe / on，非法值立即退出。
+fn parse_recovery_mode(value: &str) -> RecoveryMode {
+    RecoveryMode::parse(value).unwrap_or_else(|| {
+        eprintln!("未知的失败恢复模式「{}」：可选 off / observe / on", value);
         std::process::exit(1);
     })
 }
@@ -523,8 +613,12 @@ async fn run_interactive_mode(
     config: Arc<know_prolog::SystemConfig>,
     oxigraph_manager: OxigraphManager,
     perf_ledger: Arc<PerfLedger>,
+    recovery_mode: RecoveryMode,
 ) {
     println!("{}", config.messages.startup);
+    if !recovery_mode.eq(&RecoveryMode::Off) {
+        println!("失败恢复模式：{}（失败会生成结构化回执，不再无声）。", recovery_mode.label());
+    }
 
     // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
     let registry_path = format!("{}/predicate_registry.json", config.system.oxigraph_store_path);
@@ -708,6 +802,7 @@ async fn run_interactive_mode(
     // 本体化对话管理器：把每轮对话实例化为对话本体，用 Horn 规则策略推导回答方式
     let dialogue_enabled = config.reasoning.enable_dialogue_manager;
     let mut dialogue_manager = DialogueManager::new();
+    dialogue_manager.set_recovery_mode(recovery_mode);
     if dialogue_enabled {
         if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
             let manager_path = format!("{}.manager.json", state_path);
@@ -2320,6 +2415,14 @@ async fn run_interactive_mode(
             }
             println!();
             continue;
+        }
+
+        // 引擎层故障同步：Prolog / 事实加载失败注入推理器，
+        // 恢复模式开启时对话管理器会显式说「我出错了」，绝不并入「没有记录」。
+        if dialogue_enabled {
+            if let Some(fault) = prolog_engine.take_fault() {
+                symbolic_reasoner.note_engine_fault(fault);
+            }
         }
 
         // 本体化对话管理器（纯对话行为）：回顾、解释依据、续聊、展开、寒暄。
