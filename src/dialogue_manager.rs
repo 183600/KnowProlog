@@ -652,7 +652,7 @@ impl DialogueManager {
     }
 
     /// 带解码回执的恢复：失败原因是可回答的（io/parse/invariant），
-    /// 不再是折叠的 `false`。
+    /// 不折叠为 `false`。
     pub fn restore_from_path_report(
         &mut self,
         path: &str,
@@ -2133,7 +2133,7 @@ mod tests {
         assert_eq!(receipt.kind, "dialogue_manager");
         assert_eq!(restored.snapshot(), snapshot);
 
-        // 失败不再折叠为 false：坏字节/缺失文件都有稳定错误码
+        // 失败都带稳定错误码：坏字节/缺失文件分类明确
         let bad = std::env::temp_dir().join(format!(
             "knowprolog_dialogue_manager_bad_{}.json",
             std::process::id()

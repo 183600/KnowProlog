@@ -247,7 +247,7 @@ impl ContextImage {
 
     /// 读取镜像并返回解码回执（解析 + 版本门；哈希裁决仍由 `verify` 决定）。
     ///
-    /// 读宽容：旧 pretty 文件仍可解码（`receipt.canonical == false`），
+    /// 读宽容：pretty 排布的文件仍可解码（`receipt.canonical == false`），
     /// 下一次 `save_atomic` 自动规范。
     pub fn decode(path: &str) -> Result<(Self, DecodeReceipt), DecodeError> {
         let bytes = std::fs::read(path).map_err(|error| DecodeError::Io(error.to_string()))?;

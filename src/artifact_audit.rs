@@ -5,7 +5,7 @@
 //! 把每个文件归入四类之一：
 //!
 //! - [`ArtifactStatus::Canonical`]：磁盘字节已是规范形（幂等、可 diff）；
-//! - [`ArtifactStatus::NonCanonical`]：可解码但字节非规范（历史 pretty 遗留），
+//! - [`ArtifactStatus::NonCanonical`]：可解码但字节非规范（按 pretty 排布落盘），
 //!   `--fix` 可原子重写；
 //! - [`ArtifactStatus::Repairable`]：追加式哈希链（编年史）尾行截断——损坏
 //!   只在末尾，可信前缀无损；`--fix` 仅截掉坏尾，绝不裁剪链中；

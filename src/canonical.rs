@@ -25,7 +25,7 @@ use crate::context_image::{canonical_json, fnv1a_hex};
 /// 单件工件的默认体量上限（防御性：解码绝不因巨量输入拖垮进程）。
 pub const DEFAULT_MAX_DECODE_BYTES: usize = 16 * 1024 * 1024;
 
-/// 解码错误分类学：每一步失败都有稳定错误码，不再静默折叠为「不行」。
+/// 解码错误分类学：每一步失败都有稳定错误码（不静默折叠为「不行」）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     /// 读取字节失败（文件不存在、权限、IO）。

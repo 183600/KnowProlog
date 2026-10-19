@@ -6046,7 +6046,7 @@ impl SymbolicReasoner {
     /// 保存对话状态，并额外写入神经符号对比仲裁记忆（校准统计/待定推测/否证集）。
     ///
     /// 落盘为**规范字节**（对象键递归排序）：同一会话状态永远同一字节串，
-    /// 跨运行 diff / 审计不再受 `HashMap` 迭代序影响（L2 字节不动点）。
+    /// 跨运行 diff / 审计不受 `HashMap` 迭代序影响（L2 字节不动点）。
     pub fn save_dialogue_state_with_contrast(
         &self,
         path: &str,
@@ -6066,7 +6066,7 @@ impl SymbolicReasoner {
 
     /// 读取并解码对话状态（不做任何应用），返回快照与解码回执。
     ///
-    /// 读宽容：旧 pretty 文件仍可解码（回执 `canonical == false`）。
+    /// 读宽容：pretty 排布的文件仍可解码（回执 `canonical == false`）。
     pub fn read_dialogue_state(
         path: &str,
     ) -> Result<(DialogueSnapshot, DecodeReceipt), DecodeError> {
