@@ -133,10 +133,122 @@ fn entity_type_labels(
     Ok(labels)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct QueryResult {
     pub success: bool,
     pub data: Vec<HashMap<String, Value>>,
+}
+
+impl QueryResult {
+    /// 表格化渲染任意 SPARQL 结果（列按变量名字典序，行保持查询顺序）。
+    ///
+    /// 列宽按字符（而非字节）计算，中文实体名也能对齐；空结果给固定措辞，
+    /// 与 `ASK false`（一行 `boolean = false`）在输出上可区分。
+    pub fn render_text(&self) -> String {
+        if self.data.is_empty() {
+            return "（查询成功，无结果）".to_string();
+        }
+        let mut columns: Vec<String> = Vec::new();
+        for row in &self.data {
+            for key in row.keys() {
+                if !columns.iter().any(|column| column == key) {
+                    columns.push(key.clone());
+                }
+            }
+        }
+        columns.sort();
+        if columns.is_empty() {
+            return "（查询成功，无变量绑定）".to_string();
+        }
+        let cells: Vec<Vec<String>> = self
+            .data
+            .iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|column| match row.get(column) {
+                        Some(Value::String(text)) => text.clone(),
+                        Some(value) => value.to_string(),
+                        None => String::new(),
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut widths: Vec<usize> = columns
+            .iter()
+            .map(|column| column.chars().count())
+            .collect();
+        for row in &cells {
+            for (index, cell) in row.iter().enumerate() {
+                widths[index] = widths[index].max(cell.chars().count());
+            }
+        }
+        let mut lines = Vec::with_capacity(cells.len() + 2);
+        lines.push(render_table_row(&columns, &widths));
+        lines.push(
+            widths
+                .iter()
+                .map(|width| "-".repeat(*width))
+                .collect::<Vec<_>>()
+                .join("-+-"),
+        );
+        for row in &cells {
+            lines.push(render_table_row(row, &widths));
+        }
+        lines.join("\n")
+    }
+}
+
+/// 单行表格：单元格左对齐、按字符宽度补空格。
+fn render_table_row(cells: &[String], widths: &[usize]) -> String {
+    cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, width)| {
+            let padding = width.saturating_sub(cell.chars().count());
+            format!("{}{}", cell, " ".repeat(padding))
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// RDF 项 → JSON：IRI/空白节点用字符串；带类型的字面量按 XSD 类型映射为
+/// 数字/布尔（其它保持字符串），`SELECT` 结果可直接被下游消费。
+fn term_to_json(term: &Term) -> Value {
+    match term {
+        Term::NamedNode(node) => Value::String(node.as_str().to_string()),
+        Term::BlankNode(node) => Value::String(format!("_:{}", node.as_str())),
+        Term::Triple(triple) => Value::String(format!("<<{}>>", triple)),
+        Term::Literal(literal) => {
+            let text = literal.value();
+            match literal.datatype().as_str() {
+                "http://www.w3.org/2001/XMLSchema#integer"
+                | "http://www.w3.org/2001/XMLSchema#int"
+                | "http://www.w3.org/2001/XMLSchema#long"
+                | "http://www.w3.org/2001/XMLSchema#short"
+                | "http://www.w3.org/2001/XMLSchema#byte"
+                | "http://www.w3.org/2001/XMLSchema#nonNegativeInteger"
+                | "http://www.w3.org/2001/XMLSchema#positiveInteger"
+                | "http://www.w3.org/2001/XMLSchema#unsignedInt"
+                | "http://www.w3.org/2001/XMLSchema#unsignedLong" => text
+                    .parse::<i64>()
+                    .map(Value::from)
+                    .unwrap_or_else(|_| Value::String(text.to_string())),
+                "http://www.w3.org/2001/XMLSchema#decimal"
+                | "http://www.w3.org/2001/XMLSchema#double"
+                | "http://www.w3.org/2001/XMLSchema#float" => text
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(Value::Number)
+                    .unwrap_or_else(|| Value::String(text.to_string())),
+                "http://www.w3.org/2001/XMLSchema#boolean" => {
+                    Value::Bool(text == "true" || text == "1")
+                }
+                _ => Value::String(text.to_string()),
+            }
+        }
+    }
 }
 
 /// JSON-LD 导入统计：节点（实体）数、指向命名节点的关系边数、
@@ -1228,6 +1340,146 @@ impl OxigraphManager {
         store.load_from_reader(format, reader)?;
         let after = store.len()?;
         Ok(after.saturating_sub(before))
+    }
+
+    /// 执行任意 SPARQL 1.1 查询（SELECT / ASK / CONSTRUCT / DESCRIBE）。
+    ///
+    /// 这是命令行 `sparql` 子命令与交互模式「SPARQL：…」的公共实现：
+    /// - `SELECT`：每行解一条记录（变量名 → JSON 值，未绑定变量缺席）；
+    /// - `ASK`：单行 `boolean`；
+    /// - `CONSTRUCT` / `DESCRIBE`：每行一条三元组（`subject`/`predicate`/`object`）。
+    ///
+    /// 查询只读、不推进知识版本；语法/执行错误按错误返回，绝不静默为空结果。
+    pub async fn query_sparql(
+        &self,
+        query_text: &str,
+    ) -> Result<QueryResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.perf.bump("sparql_query");
+        let query = Query::parse(query_text, None)
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                // sparql 语法错误的多行期望 token 列表很长：只保留首行并限长，
+                // 位置信息（行:列）已足够定位，终端不被刷屏。
+                let text = error.to_string();
+                let first_line = text.lines().next().unwrap_or("未知错误");
+                let mut detail: String = first_line.chars().take(240).collect();
+                if first_line.chars().count() > 240 {
+                    detail.push('…');
+                }
+                format!("SPARQL 语法错误：{}", detail).into()
+            })?;
+        let store = self.store.lock().await;
+        let results = store
+            .query(query)
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("SPARQL 执行失败：{}", error).into()
+            })?;
+        let mut data: Vec<HashMap<String, Value>> = Vec::new();
+        match results {
+            QueryResults::Solutions(solutions) => {
+                for solution in solutions {
+                    let solution = solution.map_err(
+                        |error| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("SPARQL 求解失败：{}", error).into()
+                        },
+                    )?;
+                    let mut row = HashMap::new();
+                    for (variable, term) in solution.iter() {
+                        row.insert(variable.as_str().to_string(), term_to_json(term));
+                    }
+                    data.push(row);
+                }
+            }
+            QueryResults::Boolean(value) => {
+                data.push(HashMap::from([(
+                    "boolean".to_string(),
+                    Value::Bool(value),
+                )]));
+            }
+            QueryResults::Graph(triples) => {
+                for triple in triples {
+                    let triple = triple.map_err(
+                        |error| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("SPARQL 图求解失败：{}", error).into()
+                        },
+                    )?;
+                    data.push(HashMap::from([
+                        (
+                            "subject".to_string(),
+                            term_to_json(&Term::from(triple.subject)),
+                        ),
+                        (
+                            "predicate".to_string(),
+                            term_to_json(&Term::from(triple.predicate)),
+                        ),
+                        (
+                            "object".to_string(),
+                            term_to_json(&triple.object),
+                        ),
+                    ]));
+                }
+            }
+        }
+        Ok(QueryResult {
+            success: true,
+            data,
+        })
+    }
+
+    /// 从文件扩展名识别导出格式（ttl / nt / nq / trig / rdf / xml / jsonld）。
+    ///
+    /// 与 [`Self::detect_rdf_format`] 不同，JSON-LD 是合法导出格式
+    /// （oxigraph 序列化器支持 Streaming Profile）。
+    pub fn detect_export_format(
+        file_path: &str,
+    ) -> Result<oxigraph::io::RdfFormat, Box<dyn std::error::Error + Send + Sync>> {
+        let extension = std::path::Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        match extension.to_ascii_lowercase().as_str() {
+            "json" | "jsonld" => Ok(oxigraph::io::RdfFormat::JsonLd {
+                profile: oxigraph::io::JsonLdProfileSet::empty(),
+            }),
+            _ => oxigraph::io::RdfFormat::from_extension(extension).ok_or_else(|| {
+                format!(
+                    "无法从扩展名「{}」识别 RDF 格式（支持 ttl / nt / nq / trig / rdf / xml / jsonld）",
+                    if extension.is_empty() { "（无）" } else { extension }
+                )
+                .into()
+            }),
+        }
+    }
+
+    /// 把默认图导出为 RDF 文件，返回导出的三元组数。
+    ///
+    /// 导出只读、不推进知识版本；命名图不在导出范围内（与 RDF 导入的默认图
+    /// 语义对称）。
+    pub async fn export_rdf_file(
+        &self,
+        file_path: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let format = Self::detect_export_format(file_path)?;
+        let file = fs::File::create(file_path)?;
+        self.export_rdf_to_writer(format, file).await
+    }
+
+    /// 把默认图序列化到任意 writer，返回写出的三元组数。
+    pub async fn export_rdf_to_writer<W: std::io::Write>(
+        &self,
+        format: oxigraph::io::RdfFormat,
+        writer: W,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        self.perf.bump("rdf_export");
+        let count = store
+            .quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph))
+            .count();
+        store
+            .dump_graph_to_writer(GraphNameRef::DefaultGraph, format, writer)
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("RDF 导出失败：{}", error).into()
+            })?;
+        Ok(count)
     }
 
     pub async fn save_knowledge(&self, items: Vec<KnowledgeItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -3880,5 +4132,143 @@ mod cache_tests {
         assert_eq!(replay.entities, 2);
         assert_eq!(replay.relations, 1);
         assert_eq!(replay.triples, 0, "重复导入不新增三元组");
+    }
+
+    /// 任意 SPARQL SELECT：变量绑定转 JSON，带类型字面量映射为数字/布尔。
+    #[tokio::test]
+    async fn sparql_select_maps_typed_literals_to_json() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "age": "http://example.org/kg/age",
+                "Person": "http://example.org/kg/Person"
+            },
+            "@graph": [
+                {
+                    "@id": "http://example.org/kg/entity/小明",
+                    "@type": "Person",
+                    "name": "小明",
+                    "age": {"@value": "18", "@type": "http://www.w3.org/2001/XMLSchema#integer"}
+                }
+            ]
+        }"#;
+        manager.import_jsonld(jsonld).await.unwrap();
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?name ?age WHERE { ?s kg:name ?name . ?s kg:age ?age }"#,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].get("name"), Some(&Value::String("小明".to_string())));
+        assert_eq!(result.data[0].get("age"), Some(&serde_json::json!(18)));
+        let rendered = result.render_text();
+        assert!(rendered.contains("?age") || rendered.contains("age"), "{}", rendered);
+        assert!(rendered.contains("小明"), "{}", rendered);
+        assert!(rendered.contains("18"), "{}", rendered);
+    }
+
+    /// ASK 返回确定布尔；CONSTRUCT 按三元组逐行返回；语法错误不静默为空。
+    #[tokio::test]
+    async fn sparql_ask_construct_and_syntax_error() {
+        let (manager, _dir) = temp_manager().await;
+        manager.save_knowledge(vec![person("张三")]).await.unwrap();
+
+        let ask = manager
+            .query_sparql(r#"ASK { ?s <http://example.org/kg/name> "张三" }"#)
+            .await
+            .unwrap();
+        assert_eq!(ask.data.len(), 1);
+        assert_eq!(ask.data[0].get("boolean"), Some(&Value::Bool(true)));
+
+        let construct = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                CONSTRUCT { ?s kg:name ?name } WHERE { ?s kg:name ?name }"#,
+            )
+            .await
+            .unwrap();
+        assert!(!construct.data.is_empty());
+        for row in &construct.data {
+            assert!(row.contains_key("subject"), "{:?}", row);
+            assert!(row.contains_key("predicate"), "{:?}", row);
+            assert!(row.contains_key("object"), "{:?}", row);
+        }
+
+        let error = manager.query_sparql("SELECT ?s WHERE { ?s ?p").await;
+        assert!(error.is_err());
+        let message = error.unwrap_err().to_string();
+        assert!(message.contains("SPARQL 语法错误"), "{}", message);
+    }
+
+    /// 无结果的 SELECT 与空表渲染：固定措辞，不伪装成故障。
+    #[tokio::test]
+    async fn sparql_empty_result_and_render_are_explicit() {
+        let (manager, _dir) = temp_manager().await;
+        let result = manager
+            .query_sparql(r#"SELECT ?s WHERE { ?s <http://example.org/kg/name> "不存在" }"#)
+            .await
+            .unwrap();
+        assert!(result.data.is_empty());
+        assert_eq!(result.render_text(), "（查询成功，无结果）");
+    }
+
+    /// RDF 导出：Turtle/JSON-LD 逐条写出且能往返导入（导入计数一致）。
+    #[tokio::test]
+    async fn export_rdf_roundtrips_turtle_and_jsonld() {
+        let (manager, dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![person("张三"), person("李四")])
+            .await
+            .unwrap();
+        manager.save_knowledge(items("张三", "李四")).await.unwrap();
+
+        let turtle_path = dir.path().join("dump.ttl");
+        let exported = manager
+            .export_rdf_file(turtle_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(exported >= 4, "实体类型/名字/关系至少 4 条：{}", exported);
+        let turtle = std::fs::read_to_string(&turtle_path).unwrap();
+        assert!(turtle.contains("张三"), "{}", turtle);
+
+        let (restored, _other) = temp_manager().await;
+        let imported = restored
+            .import_rdf_file(turtle_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(imported, exported, "往返导入应写回同等数量三元组");
+        let facts = restored.load_all_facts().await.unwrap();
+        assert!(facts.iter().any(
+            |fact| matches!(fact, PrologFact::Entity { name, .. } if name == "张三")
+        ));
+
+        let jsonld_path = dir.path().join("dump.jsonld");
+        let jsonld_exported = manager
+            .export_rdf_file(jsonld_path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(jsonld_exported, exported);
+        let text = std::fs::read_to_string(&jsonld_path).unwrap();
+        assert!(
+            text.contains('\u{5f20}') || text.contains("\\\\u5f20"),
+            "JSON-LD 应包含实体文本：{}",
+            text
+        );
+    }
+
+    /// 未知扩展名拒绝导出，绝不猜测格式。
+    #[tokio::test]
+    async fn export_rdf_rejects_unknown_extension() {
+        let (manager, dir) = temp_manager().await;
+        let path = dir.path().join("dump.unknown");
+        let error = manager.export_rdf_file(path.to_str().unwrap()).await;
+        assert!(error.is_err());
+        assert!(error.unwrap_err().to_string().contains("识别"));
     }
 }

@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use clap::{Parser, Subcommand};
@@ -84,10 +84,26 @@ enum Commands {
         /// Path to the RDF file (.ttl / .nt / .nq / .trig / .rdf / .xml)
         file_path: String,
     },
+    /// Export the default graph as an RDF file (Turtle / N-Triples / N-Quads /
+    /// TriG / RDF/XML / JSON-LD; format inferred from the extension)
+    ExportRdf {
+        /// Output file path (.ttl / .nt / .nq / .trig / .rdf / .xml / .jsonld);
+        /// "-" writes Turtle to stdout
+        file_path: String,
+    },
     /// Import JSON-LD knowledge base from content
     ImportJsonldContent {
         /// JSON-LD content as string
         content: String,
+    },
+    /// Run an arbitrary SPARQL 1.1 query (SELECT / ASK / CONSTRUCT / DESCRIBE)
+    Sparql {
+        /// SPARQL query text, e.g. 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10';
+        /// "-" reads the query from stdin
+        query: String,
+        /// Print the result rows as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Evaluate symbolic embeddings (link prediction + analogy) with a
     /// deterministic holdout split and regression ratchet
@@ -330,6 +346,65 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("RDF 文件导入失败: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(Commands::ExportRdf { file_path }) => {
+            if file_path == "-" {
+                let stdout = std::io::stdout();
+                match oxigraph_manager
+                    .export_rdf_to_writer(
+                        oxigraph::io::RdfFormat::Turtle,
+                        stdout.lock(),
+                    )
+                    .await
+                {
+                    Ok(count) => eprintln!("已导出 {} 条三元组（Turtle → stdout）", count),
+                    Err(e) => {
+                        eprintln!("RDF 导出失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match oxigraph_manager.export_rdf_file(&file_path).await {
+                    Ok(count) => {
+                        println!("RDF 文件导出成功：{} 条三元组 → {}", count, file_path);
+                    }
+                    Err(e) => {
+                        eprintln!("RDF 文件导出失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Some(Commands::Sparql { query, json }) => {
+            let query_text = if query == "-" {
+                let mut buffer = String::new();
+                if let Err(e) = std::io::stdin().read_to_string(&mut buffer) {
+                    eprintln!("读取标准输入失败: {}", e);
+                    std::process::exit(1);
+                }
+                buffer
+            } else {
+                query
+            };
+            match oxigraph_manager.query_sparql(&query_text).await {
+                Ok(result) => {
+                    if json {
+                        match serde_json::to_string_pretty(&result) {
+                            Ok(text) => println!("{}", text),
+                            Err(e) => {
+                                eprintln!("SPARQL 结果序列化失败: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        println!("{}", result.render_text());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("SPARQL 查询失败: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -3041,6 +3116,44 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 导出默认图为 RDF 文件（格式按扩展名，只读）
+        if let Some(directive) = parse_export_directive(input) {
+            match directive {
+                ExportDirective::RdfFile(file_path) => {
+                    if file_path.is_empty() {
+                        println!(
+                            "请提供导出路径（.ttl / .nt / .nq / .trig / .rdf / .xml / .jsonld）"
+                        );
+                        println!();
+                        continue;
+                    }
+                    match oxigraph_manager.export_rdf_file(&file_path).await {
+                        Ok(count) => println!("导出成功：{} 条三元组 → {}", count, file_path),
+                        Err(e) => println!("导出失败：{}", e),
+                    }
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 任意 SPARQL 1.1 查询（只读，不改变知识库与推理器状态）
+        if let Some(sparql_query) = parse_sparql_command(input) {
+            if sparql_query.is_empty() {
+                println!(
+                    "请提供 SPARQL 查询，例如：SPARQL：SELECT ?s ?p ?o WHERE {{ ?s ?p ?o }} LIMIT 10"
+                );
+                println!();
+                continue;
+            }
+            match oxigraph_manager.query_sparql(sparql_query).await {
+                Ok(result) => println!("{}", result.render_text()),
+                Err(e) => println!("SPARQL 查询失败：{}", e),
+            }
+            println!();
+            continue;
+        }
+
         let mode = detect_input_mode(input, &config.nlp.import_keywords);
 
         match mode {
@@ -3847,6 +3960,57 @@ fn parse_import_directive(input: &str) -> Option<ImportDirective> {
     None
 }
 
+/// 交互式导出指令的解析结果。
+#[derive(Debug, PartialEq, Eq)]
+enum ExportDirective {
+    RdfFile(String),
+}
+
+/// 解析「导出rdf文件：路径」指令（兼容全角/半角冒号与「导出文件：」简写）。
+fn parse_export_directive(input: &str) -> Option<ExportDirective> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for keyword in ["导出rdf文件", "导出rdf", "导出文件", "export rdf"] {
+        let needle = keyword.to_ascii_lowercase();
+        for colon in [':', '：'] {
+            let prefix = format!("{}{}", needle, colon);
+            if lower.starts_with(&prefix) {
+                return Some(ExportDirective::RdfFile(
+                    trimmed[prefix.len()..].trim().to_string(),
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 解析「SPARQL：<查询>」指令（兼容全角/半角冒号与 `sparql <查询>` 空格形式）。
+///
+/// 只剥离前缀，查询正文原样保留（其中的冒号/关键词不受影响）。
+fn parse_sparql_command(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for (needle, suffix_len) in [("sparql：", "sparql：".len()), ("sparql:", "sparql:".len())] {
+        if lower.starts_with(needle) {
+            return Some(trimmed[suffix_len..].trim());
+        }
+    }
+    if lower.starts_with("sparql") {
+        let rest = &trimmed["sparql".len()..];
+        if rest.starts_with(|c: char| c.is_whitespace()) {
+            return Some(rest.trim());
+        }
+    }
+    // 中文等价的「查询sparql：」（半角/全角冒号长度不同，按实际前缀切分）
+    if lower.starts_with("查询sparql：") {
+        return Some(trimmed["查询SPARQL：".len()..].trim());
+    }
+    if lower.starts_with("查询sparql:") {
+        return Some(trimmed["查询SPARQL:".len()..].trim());
+    }
+    None
+}
+
 /// 交互模式命令速查（只列常用命令，完整命令集见各分支实现与 CLAUDE.md）。
 fn interactive_help() -> String {
     [
@@ -3857,10 +4021,12 @@ fn interactive_help() -> String {
         "  导入jsonld文件：<路径>              导入 JSON-LD 文件（简写：导入文件：）",
         "  导入jsonld内容：<JSON>              直接导入 JSON-LD 内容（简写：导入内容：）",
         "  导入rdf文件：<路径>                 导入 Turtle/N-Triples/N-Quads/TriG/RDF/XML",
+        "  导出rdf文件：<路径>                 导出默认图（按扩展名，支持 jsonld；简写：导出文件：）",
         "  撤销导入 / 导入回执 / 导入历史       导入回执与可撤销导入栈",
         "",
         "查询与推理",
         "  直接输入自然语言                    如「小明多大？」「张三和李四什么关系？」",
+        "  SPARQL：<查询>                      执行任意 SPARQL 1.1 查询（SELECT/ASK/CONSTRUCT）",
         "  判断：<陈述> / 蕴含：<陈述>         形式化语义 + 语义蕴含校验",
         "  证明：<目标> / 推理链：<目标>        归结证明与后向链推理",
         "  为什么<陈述> / 溯因：<陈述>         证明失败前沿生成候选假设",
@@ -4010,6 +4176,15 @@ fn contains_question_marker(text: &str) -> bool {
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 fn is_command_like(input: &str) -> bool {
     const COMMANDS: &[&str] = &[
+        "SPARQL",
+        "sparql",
+        "Sparql",
+        "查询SPARQL",
+        "查询sparql",
+        "导出rdf文件",
+        "导出rdf",
+        "导出文件",
+        "export rdf",
         "全息",
         "对话本体",
         "对话状态",
@@ -4920,6 +5095,8 @@ mod session_tests {
             "录入：",
             "导入jsonld文件：",
             "导入rdf文件：",
+            "导出rdf文件：",
+            "SPARQL：",
             "为什么",
             "证明：",
             "帮助",
@@ -4927,6 +5104,62 @@ mod session_tests {
         ] {
             assert!(help.contains(needle), "帮助页应包含 {}", needle);
         }
+    }
+
+    /// SPARQL 指令解析：全角/半角冒号、大小写、空格形式与正文保真
+    #[test]
+    fn sparql_command_parses_colons_case_and_keeps_body() {
+        let select = "SELECT ?s WHERE { ?s ?p ?o }";
+        assert_eq!(parse_sparql_command(&format!("SPARQL：{}", select)), Some(select));
+        assert_eq!(parse_sparql_command(&format!("sparql:{}", select)), Some(select));
+        assert_eq!(parse_sparql_command(&format!("Sparql {}", select)), Some(select));
+        assert_eq!(parse_sparql_command(&format!("sparql {}", select)), Some(select));
+        assert_eq!(
+            parse_sparql_command(&format!("查询SPARQL：{}", select)),
+            Some(select)
+        );
+        assert_eq!(
+            parse_sparql_command(&format!("查询SPARQL:{}", select)),
+            Some(select)
+        );
+        // 半角冒号的短前缀不得按全角长度切分而吃掉正文（含多字节字符）
+        assert_eq!(
+            parse_sparql_command("查询SPARQL:SELECT ?s WHERE { ?s <http://a/中> }"),
+            Some("SELECT ?s WHERE { ?s <http://a/中> }")
+        );
+        assert_eq!(parse_sparql_command("sparql："), Some(""));
+        assert_eq!(parse_sparql_command("小明多大？"), None);
+        // 正文里的冒号与关键词不被删改
+        assert_eq!(
+            parse_sparql_command("SPARQL：SELECT ?s WHERE { ?s <http://a/b> \"x:y\" }"),
+            Some("SELECT ?s WHERE { ?s <http://a/b> \"x:y\" }")
+        );
+        assert!(is_command_like("SPARQL：SELECT ?s WHERE { ?s ?p ?o }"));
+        assert!(is_command_like("sparql SELECT ?s WHERE { ?s ?p ?o }"));
+    }
+
+    /// 导出指令解析：全角/半角冒号、简写与路径保真；非指令不误判
+    #[test]
+    fn export_directive_parses_colons_aliases_and_keeps_path() {
+        assert_eq!(
+            parse_export_directive("导出rdf文件：out/data.ttl"),
+            Some(ExportDirective::RdfFile("out/data.ttl".to_string()))
+        );
+        assert_eq!(
+            parse_export_directive("导出文件: backup.jsonld"),
+            Some(ExportDirective::RdfFile("backup.jsonld".to_string()))
+        );
+        assert_eq!(
+            parse_export_directive("export rdf: dump.nt"),
+            Some(ExportDirective::RdfFile("dump.nt".to_string()))
+        );
+        assert_eq!(
+            parse_export_directive("导出rdf：导出文件：怪名.ttl"),
+            Some(ExportDirective::RdfFile("导出文件：怪名.ttl".to_string()))
+        );
+        assert_eq!(parse_export_directive("导出rdf文件"), None);
+        assert_eq!(parse_export_directive("录入：小明18岁"), None);
+        assert!(is_command_like("导出文件：dump.ttl"));
     }
 
     /// 「同义链接」命令的解析：半角/全角等号、缺端拒绝
