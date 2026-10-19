@@ -878,7 +878,7 @@ impl OxigraphManager {
     }
 
     /// 标记知识版本变化：调用方必须持有存储锁，且在本次实际写入完成之后
-    /// （version-after-write）。这样并发读者绝不会把旧数据缓存到新版本号上，
+    /// （version-after-write）。这样并发读者绝不会把过期数据缓存到新版本号上，
     /// 且重复导入不推进版本。
     fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::AcqRel);
@@ -2894,7 +2894,7 @@ mod cache_tests {
         assert_eq!(cache.get(1, "b"), None);
         assert_eq!(cache.get(1, "a"), Some(&1));
         assert_eq!(cache.get(1, "c"), Some(&3));
-        // 版本推进：全部失效，旧键不得复活
+        // 版本推进：全部失效，原键不得命中
         assert!(cache.get(2, "a").is_none());
         assert_eq!(cache.put(2, "d".to_string(), 4), 0);
         assert_eq!(cache.len(), 1, "版本变化时先清空");

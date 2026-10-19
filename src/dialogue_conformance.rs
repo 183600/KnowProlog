@@ -260,7 +260,7 @@ fn c1_focus_inherited_across_turns() {
     assert_eq!(stack.last().map(String::as_str), Some("叶莉"));
     assert!(
         stack.contains(&"姚明".to_string()),
-        "旧话题应保留在焦点栈：{:?}",
+        "先前话题应保留在焦点栈：{:?}",
         stack
     );
 
@@ -911,7 +911,7 @@ fn c15_speculation_is_evidence_backed_and_resolvable() {
     assert!(notice.question.as_deref().is_some_and(|q| !q.is_empty()));
     assert_eq!(manager.recovery_state().pending.len(), 1, "推测应挂账待确认");
 
-    // 用户否认：回执关闭、摘要改变、挂账清空、承诺不再引用
+    // 用户否认：回执关闭、摘要改变、挂账清空、承诺失效
     let open_before = manager.failure_ledger().digest();
     let refute = ask(&mut manager, &kb, "不是");
     assert!(

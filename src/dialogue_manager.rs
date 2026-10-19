@@ -751,7 +751,7 @@ impl DialogueManager {
         })
     }
 
-    /// 知识问句的生成式回答：仅在实体已知时才接管（否则让位给既有管线）。
+    /// 知识问句的生成式回答：仅在实体已知时才接管（否则让位给常规管线）。
     pub fn plan_reply(
         &mut self,
         input: &str,
@@ -912,7 +912,7 @@ impl DialogueManager {
             }
         }
 
-        // 是非问句：交给既有蕴含/溯因管线处理
+        // 是非问句：交给常规蕴含/溯因管线处理
         if stripped.ends_with('吗') {
             return UtteranceFrame {
                 raw: raw.to_string(),
@@ -924,7 +924,7 @@ impl DialogueManager {
             };
         }
 
-        // 陈述句：交给既有语义蕴含管线
+        // 陈述句：交给常规语义蕴含管线
         if !has_question && explicit.first().is_some() && stripped.contains('是') {
             return UtteranceFrame {
                 raw: raw.to_string(),
@@ -963,7 +963,7 @@ impl DialogueManager {
             .map(|name| knowledge.known_entity(name))
             .unwrap_or(false);
         // 只有属性没有实体（且无焦点）时不外抛：由策略层生成澄清问题；
-        // 实体存在但图谱不认识时让位给既有 NLU / 外部知识管线。
+        // 实体存在但图谱不认识时让位给常规 NLU / 外部知识管线。
         let attribute_only =
             matches!(frame.kind, MoveKind::AskAttribute) && entity.is_none() && frame.attribute.is_some();
 

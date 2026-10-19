@@ -9,7 +9,7 @@
 //
 // 复合问句（姚明的身高和体重是多少）解析为多个帧：第一帧照答，其余进入
 // 「挂账」（pending）等待后续输入补全；挂账有容量与轮数上限，且只在
-// 追问命中时消费（无半消费），不合法的合一逐字回退既有管线。
+// 追问命中时消费（无半消费），不合法的合一逐字回退常规管线。
 //
 // 无源可填的洞还有第 4 种合法结局：澄清（clarification）——不猜，把
 // 变量显式还给用户。用户短答（序号/实体名/都不是）被确定性解析为一次
@@ -22,7 +22,7 @@ use crate::resolution_engine::{unify_atoms, Atom, Substitution, Term};
 
 /// 帧原子谓词：问属性(实体槽, 属性槽)
 const ASK_ATTRIBUTE: &str = "问属性";
-/// 追问核心的最大字数（超限不接管，回退既有管线）
+/// 追问核心的最大字数（超限不接管，回退常规管线）
 const FOLLOWUP_MAX_CORE_CHARS: usize = 16;
 const DEFAULT_MAX_PENDING: usize = 4;
 const DEFAULT_PENDING_TTL: u64 = 6;
@@ -111,7 +111,7 @@ impl AskAttributeFrame {
         self.entity.is_some() && self.attribute.is_some()
     }
 
-    /// 完整帧的规范问句（交给既有问答管线执行）
+    /// 完整帧的规范问句（交给常规问答管线执行）
     pub fn question(&self) -> Option<String> {
         Some(format!(
             "{}的{}是什么",
@@ -298,7 +298,7 @@ pub enum ClarificationReply {
     Unmatched,
 }
 
-/// 澄清应答结果（供对话层直接消费；重放问句由调用方交给既有问答管线）
+/// 澄清应答结果（供对话层直接消费；重放问句由调用方交给常规问答管线）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClarificationOutcome {
     /// 绑定成功：question 为实例化后的原问句，note 为出处收据
@@ -496,7 +496,7 @@ impl FrameMemory {
         })
     }
 
-    /// 登记完整帧：问句已被既有管线执行后成为「上一帧」
+    /// 登记完整帧：问句已被常规管线执行后成为「上一帧」
     pub fn record_last(&mut self, frame: AskAttributeFrame) {
         if frame.is_complete() {
             self.last = Some(frame);
@@ -532,7 +532,7 @@ impl FrameMemory {
     }
 
     /// 追问补全计划：属性明确时优先补全同名属性的挂账（用户正在补它），
-    /// 其余洞由上一完整帧同槽位补入；仍不完整返回 None（调用方回退既有管线）。
+    /// 其余洞由上一完整帧同槽位补入；仍不完整返回 None（调用方回退常规管线）。
     pub fn plan_followup(&self, current: &AskAttributeFrame) -> Option<FollowUpPlan> {
         if current.entity.is_none() && current.attribute.is_none() {
             return None;

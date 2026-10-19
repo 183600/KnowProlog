@@ -1005,7 +1005,7 @@ impl SymbolicReasoner {
             values.dedup();
         }
         self.attribute_index = attribute_index;
-        // 词表变化后实体链接/实体提及的旧结果可能过时，同步失效记忆缓存
+        // 词表变化后实体链接/实体提及的缓存结果可能过时，同步失效记忆缓存
         self.link_memo.lock().clear();
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
@@ -1038,14 +1038,14 @@ impl SymbolicReasoner {
             .map(dialogue_frame::ClarificationRequest::prompt)
     }
 
-    /// 帧澄清入口：无上下文的「体重是多少」这类带洞问句在既有通道必然失败时，
+    /// 帧澄清入口：无上下文的「体重是多少」这类带洞问句在常规通道必然失败时，
     /// 不落进「无法理解」，而是挂成一次显式绑定请求（变量求解的第 4 种结局）。
     ///
     /// 开启条件（全部满足才接管）：
     ///   1) 配置启用澄清，且没有进行中的溯因/帧澄清（至多一条）；
     ///   2) 问句是无主语属性问句（`属性+是多少/是什么`），但不含「呢」
-    ///      （「体重呢」属于既有省略/对话管理器通道）；
-    ///   3) 既有通道必然失败：上一完整帧为空、挂账为空（否则应走合一补全）；
+    ///      （「体重呢」属于常规省略/对话管理器通道）；
+    ///   3) 常规通道必然失败：上一完整帧为空、挂账为空（否则应走合一补全）；
     ///   4) 候选非空：焦点实体优先，其余是知识库中确实拥有该属性的实体。
     pub fn start_frame_clarification(&mut self, input: &str) -> Option<String> {
         if !self.config.enable_clarification || self.clarification_active() {
@@ -5224,7 +5224,7 @@ impl SymbolicReasoner {
             if self.adopt_atom(lesson.head.clone()) {
                 remembered.push(rendered);
             } else {
-                refused.push(format!("「{}」此前已记住", rendered));
+                refused.push(format!("「{}」已经记住", rendered));
             }
         }
         let mut output = String::new();
@@ -6707,7 +6707,7 @@ mod tests {
             .expect("合一应补全实体洞");
         assert_eq!(rewrite.text, "姚明的体重是什么");
         assert!(!reasoner.frame_clarification_active());
-        // 「呢」省略句属于既有通道，帧澄清不得抢答
+        // 「呢」省略句属于常规通道，帧澄清不得抢答
         assert!(reasoner.start_frame_clarification("体重呢").is_none());
     }
 
@@ -8334,7 +8334,7 @@ mod tests {
         });
         reasoner.observe_facts(&extended);
         let _ = reasoner.entities_mentioned("张三的师傅是谁");
-        assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2, "版本变化后旧记忆必须失效");
+        assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2, "版本变化后过期记忆必须失效");
     }
 
     /// 多槽记忆：同一知识版本内交替询问多个文本，各自留槽、重复命中；
@@ -8348,7 +8348,7 @@ mod tests {
         let _ = reasoner.entities_mentioned("张三的师傅是谁");
         let _ = reasoner.entities_mentioned("李四的师傅是谁");
         let hits = perf.count("memo_entity_mentions_hit");
-        // 交替再问：两个文本都应命中（旧实现单槽会互相挤掉）
+        // 交替再问：两个文本都应命中（不得互相挤掉）
         let _ = reasoner.entities_mentioned("张三的师傅是谁");
         let _ = reasoner.entities_mentioned("李四的师傅是谁");
         assert_eq!(perf.count("memo_entity_mentions_hit"), hits + 2);
@@ -8361,7 +8361,7 @@ mod tests {
         let _ = reasoner.linked_mentions("李四的师傅是谁");
         assert_eq!(perf.count("memo_link_hit"), link_hits + 2);
 
-        // 知识版本推进：旧文本不得再命中
+        // 知识版本推进：原文本不得命中
         let mut extended = master_facts();
         extended.push(PrologFact::Relation {
             from: "王五".to_string(),

@@ -952,7 +952,7 @@ pub fn bound_term(term: &Term) -> BoundTerm {
 
 /// 为查询变量生成「去重键 + 字符串绑定 + 类型化绑定」三件套。
 ///
-/// 字符串绑定沿用 `render_term` 的隐式未绑定约定（`?X`），
+/// 字符串绑定采用 `render_term` 的隐式未绑定约定（`?X`），
 /// 类型化绑定则给出 [`BoundTerm::Unbound`]；两者从同一次置换解析得出，
 /// 保证两个 API 在同一解上严格对应。
 fn bind_query_vars(

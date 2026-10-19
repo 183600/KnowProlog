@@ -422,7 +422,7 @@ impl LogicProgram {
                     self.rules[index].render()
                 ));
             }
-            None => out.push(format!("{}{}  （既有事实）", prefix, node.fact.render())),
+            None => out.push(format!("{}{}  （基本事实）", prefix, node.fact.render())),
         }
         for premise in &node.premises {
             self.render_explain_node(premise, indent + 1, out);

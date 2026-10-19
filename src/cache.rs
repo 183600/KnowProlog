@@ -99,7 +99,7 @@ mod tests {
         assert_eq!(cache.get(1, "a"), Some(&10));
         // 不同纪元：整体不可命中，即使键存在
         assert!(cache.get(2, "a").is_none());
-        // 在新纪元写入会使旧条目整体失效
+        // 在新纪元写入会使所有已有条目整体失效
         cache.put(2, "b".to_string(), 20);
         assert!(cache.get(2, "a").is_none());
         assert_eq!(cache.get(2, "b"), Some(&20));

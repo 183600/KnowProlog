@@ -78,7 +78,7 @@ impl SimilarityCalculator {
             }
         }
         
-        // IDF 依赖词频统计，初始化新语料后必须失效旧缓存
+        // IDF 依赖词频统计，初始化新语料后必须使缓存失效
         self.idf_cache.write().clear();
         
         Ok(())

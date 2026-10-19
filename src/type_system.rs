@@ -384,7 +384,7 @@ impl TypeSystem {
                 }
             }
         }
-        // 子类闭包展开：每个实体的每个类型都补上其全部祖先（来源：子类闭包）
+        // 子类闭包展开：每个实体的每个类型都加入其全部祖先（来源：子类闭包）
         let seeds: Vec<(String, String)> = inferred
             .iter()
             .flat_map(|(entity, types)| {

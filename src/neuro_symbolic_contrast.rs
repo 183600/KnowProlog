@@ -304,8 +304,8 @@ impl ContrastArbiter {
         }
     }
 
-    /// 从既有 [reasoning] 配置读取阈值：软逻辑概率下限 = 谓词存在性下限，
-    /// 相似度下限沿用图嵌入配置，其余为固定值
+    /// 从 [reasoning] 配置读取阈值：软逻辑概率下限 = 谓词存在性下限，
+    /// 相似度下限取自图嵌入配置，其余为固定值
     pub fn from_reasoning_config(config: &ReasoningConfig) -> Self {
         let mut tuning = ContrastTuning::default();
         if config.soft_logic_min_probability > 0.0 {
@@ -1520,7 +1520,7 @@ mod tests {
         assert!(again.symbolic.contradicted);
         assert_eq!(again.verdict, ContrastVerdict::Agree);
         assert!(again.answer.contains("不成立"));
-        assert!(again.guess_id.is_none(), "被否认的推测不再登记");
+        assert!(again.guess_id.is_none(), "被否认的推测不予登记");
     }
 
     #[test]
@@ -1592,7 +1592,7 @@ mod tests {
         let next = arbiter.next_followup().expect("仍有第二条可追问");
         assert_eq!(next.guess_id, second_id);
         arbiter.refute_guess(second_id);
-        assert!(arbiter.next_followup().is_none(), "推测全部结算后不再追问");
+        assert!(arbiter.next_followup().is_none(), "推测全部结算后停止追问");
     }
 
     #[test]

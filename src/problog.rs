@@ -641,7 +641,7 @@ impl ProblogEngine {
         // 排序与截断只依赖概率与原子显示名，证明在截断后仅为保留的答案补算。
         for answer in &mut answers {
             if answer.from_fact {
-                // 确定事实不携带证明；概率事实沿用上限 2 的证明
+                // 确定事实不携带证明；概率事实复用上限 2 的证明
                 if compiled.probabilistic_facts.contains_key(&answer.atom) {
                     answer.proofs = compiled.proofs_for(&answer.atom, 2);
                 }

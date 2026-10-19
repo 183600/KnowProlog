@@ -825,7 +825,7 @@ impl EntityLinker {
 
     /// 显式准入一个 OOV 词面（提名的唯一出口）：按后缀表推断暂定类型并登记实体。
     ///
-    /// 幂等：已登记实体直接返回既有类型，不覆盖。返回（词面，类型）；
+    /// 幂等：已登记实体直接返回现有类型，不覆盖。返回（词面，类型）；
     /// 空词面返回 None；无后缀线索时类型为通用的 `Entity`（准入动作本身是显式的）。
     pub fn admit_entity(&mut self, surface: &str) -> Option<(String, String)> {
         let surface = surface.trim();
@@ -849,7 +849,7 @@ impl EntityLinker {
     /// 打分口径（全部符号化、可复现）：
     /// - 节点权重 = 候选置信度 × 覆盖字数（置信度 × 证据长度）；
     /// - 相邻选中实体在知识图谱中有关联时 +0.08 共现加成；
-    /// - 问题线索加成沿用 `hint_boost`（+0.1/条）；
+    /// - 问题线索加成取自 `hint_boost`（+0.1/条）；
     /// - 平局裁决：总分高 → 节点少（长词优先）→ 迭代序（确定性）。
     /// OOV 提名不进入格：没有候选就没有节点，保持「只报告、不落库」。
     pub fn link_lattice(&self, text: &str, hints: &[String]) -> Vec<LinkedMention> {

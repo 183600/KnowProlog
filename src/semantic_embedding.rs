@@ -190,7 +190,7 @@ impl SymbolicEmbedding {
     // PPMI 逐分量计算：pmi = ln( count(e,f) * total / (count(f) * mass(e)) )
     // 只保留正值，随后 L2 归一化，便于余弦相似度。
     pub fn rebuild(&mut self) {
-        // 计数未变化：沿用上次重建的向量
+        // 计数未变化：复用上次重建的向量
         if !self.dirty && !self.vectors.is_empty() {
             return;
         }

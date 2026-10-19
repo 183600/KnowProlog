@@ -45,7 +45,7 @@
 //! - `GET  /v1/prompts`            提示资产注册表（spec + lint + 覆盖）
 //! - `POST /v1/chat/completions`   OpenAI 兼容聊天补全（`stream: true` 时
 //!   按句 SSE 流式）；无扩展字段时按无状态语义重放用户消息，带
-//!   `"session_id"` 扩展时只执行最后一条用户消息并沿用服务端记忆
+//!   `"session_id"` 扩展时只执行最后一条用户消息并复用服务端记忆
 //!
 //! 设计约束：
 //! - 零新依赖：tokio 已在依赖中，HTTP/1.1 手写最小实现；
@@ -87,7 +87,7 @@ pub const DEFAULT_MODEL: &str = "knowprolog-symbolic";
 /// - `kb_revision`：知识库版本（写路径推进；无写路径时等于预热基座版本）；
 /// - `identity_epoch`：身份准入纪元（新实体/别名准入时推进）。
 ///
-/// 任何一元推进都会让旧缓存整体不可命中（[`crate::cache::RevisionLru`]）。
+/// 任何一元推进都会让全部缓存条目不可命中（[`crate::cache::RevisionLru`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheEpoch {
     pub kb_revision: u64,
@@ -693,7 +693,7 @@ enum SessionError {
 }
 
 /// 预热基座：进程启动时对 `(facts, reasoning config, synonyms)` 只做一次
-/// `observe_facts` 全量重放，之后每个会话按值分叉（字段级深拷贝），不再重放。
+/// `observe_facts` 全量重放，之后每个会话按值分叉（字段级深拷贝），不重放。
 ///
 /// 这是 LLM 权重预加载的符号等价物：知识派生状态（对齐剖面/谓词规则/关联/
 /// 向量/全息码本/链接索引）只构建一次；分叉输出与「全新观察同一批事实」
@@ -773,13 +773,13 @@ fn build_session(
 pub struct ApiState {
     facts: Arc<Vec<PrologFact>>,
     kb_fingerprint: String,
-    /// 知识派生状态的预热基座：会话从这里分叉，不再逐会话重放事实。
+    /// 知识派生状态的预热基座：会话从这里分叉，不逐会话重放事实。
     warm: Arc<WarmBase>,
     /// 无状态问答缓存：键为「按序全部用户消息 + 策略」，纪元失效（纯函数结果）。
     stateless_answers: Arc<parking_lot::Mutex<RevisionLru<TurnResponse, CacheEpoch>>>,
     /// 预热基座构建时的知识版本（缓存纪元的一部分）。
     kb_revision: u64,
-    /// 身份准入纪元：新实体/别名准入时 +1，旧缓存整体失效（可审计）。
+    /// 身份准入纪元：新实体/别名准入时 +1，全部缓存条目整体失效（可审计）。
     identity_epoch: AtomicU64,
     perf: Arc<PerfLedger>,
     /// 启动分期台账（进程启动 / 会话分叉 / 冷换入）。
@@ -861,7 +861,7 @@ impl ApiState {
         }
     }
 
-    /// 推进身份准入纪元（准入新词面后调用）：所有旧缓存整体失效。
+    /// 推进身份准入纪元（准入新词面后调用）：所有缓存条目整体失效。
     pub fn bump_identity_epoch(&self) {
         self.identity_epoch.fetch_add(1, Ordering::Relaxed);
         self.perf.bump("identity_epoch_bumps");
@@ -1632,11 +1632,11 @@ fn validate_envelope(
 /// OpenAI 兼容的聊天请求（`session_id` 为本服务的扩展字段）。
 struct ChatRequest {
     model: String,
-    /// 提供时沿用该服务端会话，只执行最后一条用户消息。
+    /// 提供时复用该服务端会话，只执行最后一条用户消息。
     session_id: Option<String>,
     /// 无状态模式下的用户消息序列（按顺序重放到一个临时会话）。
     inputs: Vec<String>,
-    /// 由 `system` / `developer` 消息解析出的会话级策略（无则沿用默认）。
+    /// 由 `system` / `developer` 消息解析出的会话级策略（无则使用默认）。
     policy: Option<SessionPolicy>,
     stream: bool,
 }
@@ -2573,7 +2573,7 @@ mod tests {
     }
 
     /// 身份准入纪元推进必须让无状态问答缓存整体失效：
-    /// 旧纪元条目不可命中（即便键相同），新纪元写入后恢复正常命中。
+    /// 非当前纪元的条目不可命中（即便键相同），新纪元写入后恢复命中。
     #[tokio::test]
     async fn identity_epoch_bump_invalidates_stateless_cache() {
         let state = test_state(4);
@@ -2601,7 +2601,7 @@ mod tests {
         assert_ne!(epoch, bumped, "身份准入必须推进纪元");
         assert!(
             state.cached_stateless_answer(bumped, &key).is_none(),
-            "旧纪元条目在新纪元下不得命中"
+            "非当前纪元的条目不得命中"
         );
 
         state.store_stateless_answer(bumped, key.clone(), response);
