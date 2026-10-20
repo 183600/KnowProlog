@@ -4739,7 +4739,8 @@ impl SymbolicReasoner {
                 predicate,
                 operator,
                 count_only,
-            } => self.answer_closure(&subject, &predicate, operator, count_only),
+                then,
+            } => self.answer_closure(&subject, &predicate, operator, count_only, &then),
             QueryPlan::CheckTriple {
                 subject_segments,
                 object,
@@ -4771,6 +4772,7 @@ impl SymbolicReasoner {
         predicate: &str,
         operator: ClosureOp,
         count_only: bool,
+        then: &[String],
     ) -> Option<String> {
         let entity = self.aligner.canonical_form(subject.trim());
         let surface = predicate.trim();
@@ -4784,6 +4786,17 @@ impl SymbolicReasoner {
         if slot.is_empty() || (!self.is_known_predicate(&slot) && !self.is_known_predicate(surface))
         {
             return None;
+        }
+        let mut then_links: Vec<(String, String, bool)> = Vec::new();
+        for raw in then {
+            let raw = raw.trim();
+            let (then_slot, then_inverted) = self.resolve_question_predicate(raw);
+            if then_slot.is_empty()
+                || (!self.is_known_predicate(&then_slot) && !self.is_known_predicate(raw))
+            {
+                return None;
+            }
+            then_links.push((raw.to_string(), then_slot, then_inverted));
         }
 
         let law = if operator.requires_transitive_law() {
@@ -4812,12 +4825,16 @@ impl SymbolicReasoner {
             None
         };
 
+        let mut budget = ClosureBudget::default();
+        if !then_links.is_empty() {
+            budget.max_witnesses = budget.max_nodes;
+        }
         let predictor = &self.predictor;
         let closure_slot = slot.clone();
         let outcome = evaluate_closure(
             &entity,
             operator,
-            ClosureBudget::default(),
+            budget,
             law.as_deref(),
             move |node| {
                 if inverted {
@@ -4828,7 +4845,157 @@ impl SymbolicReasoner {
             },
         )
         .ok()?;
-        Some(self.render_closure_answer(&entity, surface, &outcome, count_only))
+        if then_links.is_empty() {
+            return Some(self.render_closure_answer(&entity, surface, &outcome, count_only));
+        }
+        let composed = self.extend_closure_targets(&outcome, &then_links);
+        Some(self.render_closure_chain_answer(
+            &entity,
+            surface,
+            &then_links,
+            &outcome,
+            count_only,
+            &composed,
+        ))
+    }
+
+    fn extend_closure_targets(
+        &self,
+        outcome: &ClosureOutcome,
+        then: &[(String, String, bool)],
+    ) -> Vec<(String, Vec<String>)> {
+        let mut current: BTreeMap<String, Vec<String>> = outcome
+            .witnesses
+            .iter()
+            .map(|(target, path)| (target.clone(), path.clone()))
+            .collect();
+        for (_, slot, inverted) in then {
+            let mut ordered: Vec<(String, Vec<String>)> = current.into_iter().collect();
+            ordered.sort_by(|(left_name, left_path), (right_name, right_path)| {
+                left_path
+                    .len()
+                    .cmp(&right_path.len())
+                    .then_with(|| left_name.cmp(right_name))
+            });
+            let mut next: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (node, path) in ordered {
+                let mut values = if *inverted {
+                    self.predictor.subjects_of(slot, &node)
+                } else {
+                    self.predictor.objects_of(&node, slot)
+                };
+                values.sort();
+                values.dedup();
+                for value in values {
+                    let mut extended = path.clone();
+                    extended.push(value.clone());
+                    let replace = next
+                        .get(&value)
+                        .map_or(true, |existing| existing.len() > extended.len());
+                    if replace {
+                        next.insert(value, extended);
+                    }
+                }
+            }
+            current = next;
+            if current.is_empty() {
+                break;
+            }
+        }
+        let mut result: Vec<(String, Vec<String>)> = current.into_iter().collect();
+        result.sort_by(|(left_name, left_path), (right_name, right_path)| {
+            left_path
+                .len()
+                .cmp(&right_path.len())
+                .then_with(|| left_name.cmp(right_name))
+        });
+        result
+    }
+
+    fn render_closure_chain_answer(
+        &self,
+        entity: &str,
+        surface: &str,
+        then: &[(String, String, bool)],
+        outcome: &ClosureOutcome,
+        count_only: bool,
+        composed: &[(String, Vec<String>)],
+    ) -> String {
+        let suffix = then
+            .iter()
+            .map(|(name, _, _)| format!("的「{}」", name))
+            .collect::<String>();
+        let target_phrase = format!("所有「{}」{}", surface, suffix);
+        let basis = outcome
+            .law
+            .as_deref()
+            .map(|law| format!("；依据 {}", law))
+            .unwrap_or_default();
+        if composed.is_empty() {
+            if outcome.complete() {
+                return format!("根据现有知识库，「{}」没有{}。", entity, target_phrase);
+            }
+            let mut output = format!(
+                "根据知识图谱（{}{}）：「{}」暂未找到{}。",
+                outcome.operator.label(),
+                basis,
+                entity,
+                target_phrase
+            );
+            if let Some(truncation) = outcome.truncated {
+                output.push_str(&format!(
+                    "
+  说明：闭包搜索在{}处停止，不能排除仍有更多结果。",
+                    truncation.label()
+                ));
+            }
+            return output;
+        }
+
+        let count = if outcome.count_is_lower_bound() {
+            format!("至少 {} 个", composed.len())
+        } else {
+            format!("共 {} 个", composed.len())
+        };
+        let mut output = format!(
+            "根据知识图谱（{}{}）：「{}」的{} {}。",
+            outcome.operator.label(),
+            basis,
+            entity,
+            target_phrase,
+            count
+        );
+        if !count_only {
+            for (index, (target, path)) in composed.iter().take(12).enumerate() {
+                output.push_str(&format!(
+                    "
+  {}. {}（{} 跳：{}）",
+                    index + 1,
+                    target,
+                    path.len().saturating_sub(1),
+                    path.join(" → ")
+                ));
+            }
+            if composed.len() > 12 {
+                output.push_str(&format!(
+                    "
+  说明：其余 {} 个结果未展开。",
+                    composed.len() - 12
+                ));
+            }
+        } else {
+            output.push_str("
+  计数口径：不同最终节点，不按路径重复计数。");
+        }
+        if let Some(truncation) = outcome.truncated {
+            output.push_str(&format!(
+                "
+  说明：闭包搜索在{}处停止，结果不完整，上述计数是下界（至少 {} 个）。",
+                truncation.label(),
+                composed.len()
+            ));
+        }
+        output
     }
 
     fn render_closure_answer(
@@ -10522,6 +10689,43 @@ mod tests {
         assert!(answer.contains("至少 8 个"), "{}", answer);
         assert!(answer.contains("壬"), "{}", answer);
         assert!(!answer.contains("癸"), "{}", answer);
+    }
+
+    #[test]
+    fn closure_composes_with_following_relation() {
+        let mut reasoner = closure_reasoner();
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "戊".to_string(),
+            },
+            PrologFact::Relation {
+                from: "丙".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "己".to_string(),
+            },
+            PrologFact::Relation {
+                from: "丁".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "庚".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer("甲的所有上司的师傅是谁")
+            .expect("闭包后接关系应可复合");
+        assert!(answer.contains("共 3 个"), "{}", answer);
+        assert!(answer.contains("戊"), "{}", answer);
+        assert!(answer.contains("己"), "{}", answer);
+        assert!(answer.contains("庚"), "{}", answer);
+        assert!(answer.contains("甲 → 乙 → 戊"), "{}", answer);
+        assert!(answer.contains("law:transitive:上司"), "{}", answer);
+
+        let count = reasoner
+            .answer("甲的所有上司的师傅有几个")
+            .expect("复合计数");
+        assert!(count.contains("共 3 个"), "{}", count);
+        assert!(count.contains("不同最终节点"), "{}", count);
     }
 
     #[test]

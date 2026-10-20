@@ -48,6 +48,7 @@ pub enum QueryPlan {
         predicate: String,
         operator: ClosureOp,
         count_only: bool,
+        then: Vec<String>,
     },
     // 最近邻语义检索：谁和 张三 最像
     Similar { entity: String },
@@ -187,13 +188,19 @@ impl QueryPlanner {
                 predicate,
                 operator,
                 count_only,
+                then,
             } => {
                 let view = if *count_only { "计数" } else { "列出" };
+                let chain = if then.is_empty() {
+                    predicate.clone()
+                } else {
+                    format!("{} 的 {}", predicate, then.join(" 的 "))
+                };
                 format!(
                     "{}闭包：{} 的所有 {}（{}）",
                     view,
                     subject,
-                    predicate,
+                    chain,
                     operator.label()
                 )
             }
@@ -593,13 +600,22 @@ impl QueryPlanner {
             if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
                 continue;
             }
-            let (predicate, count_only) = Self::strip_closure_tail(rest);
-            let predicate = predicate.trim().trim_end_matches('的').trim();
-            if predicate.is_empty()
-                || predicate.contains('的')
-                || predicate.chars().count() > 40
-                || Self::is_question_word(predicate)
-            {
+            let (chain, count_only) = Self::strip_closure_tail(rest);
+            let parts: Vec<&str> = chain
+                .split('的')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect();
+            if parts.is_empty() || parts.len() > 6 {
+                continue;
+            }
+            if parts.iter().any(|part| {
+                part.chars().count() > 40 || Self::is_question_word(part)
+            }) {
+                continue;
+            }
+            let predicate = parts[0].trim_end_matches('的').trim();
+            if predicate.is_empty() {
                 continue;
             }
             return Some(QueryPlan::Closure {
@@ -607,6 +623,7 @@ impl QueryPlanner {
                 predicate: predicate.to_string(),
                 operator: ClosureOp::Plus,
                 count_only,
+                then: parts[1..].iter().map(|part| part.to_string()).collect(),
             });
         }
         None
@@ -932,6 +949,7 @@ mod tests {
                 predicate: "上司".to_string(),
                 operator: ClosureOp::Plus,
                 count_only: false,
+                then: Vec::new(),
             }
         );
         let list = planner()
@@ -944,6 +962,7 @@ mod tests {
                 predicate: "上司".to_string(),
                 operator: ClosureOp::Plus,
                 count_only: false,
+                then: Vec::new(),
             }
         );
         let count = planner()
@@ -956,6 +975,20 @@ mod tests {
                 predicate: "上司".to_string(),
                 operator: ClosureOp::Plus,
                 count_only: true,
+                then: Vec::new(),
+            }
+        );
+        let composed = planner()
+            .parse("李四的所有上司的师傅是谁")
+            .expect("应编译为闭包+后续关系");
+        assert_eq!(
+            composed,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: false,
+                then: vec!["师傅".to_string()],
             }
         );
     }
