@@ -592,6 +592,13 @@ struct ChainStep {
     hits: Vec<ValueHit>,
 }
 
+#[derive(Debug, Clone)]
+struct ChainRun {
+    steps: Vec<ChainStep>,
+    last_hits: Vec<ValueHit>,
+    closure_truncated: bool,
+}
+
 /// 问句链上的一个谓词环节：词面（用户问法）+ 规范槽位（存储坐标）+ 是否逆向。
 #[derive(Debug, Clone)]
 struct ChainPredicate {
@@ -3911,35 +3918,51 @@ impl SymbolicReasoner {
         node: &str,
         predicate: &ChainPredicate,
         direct_empty: bool,
-    ) -> Vec<ValueHit> {
+    ) -> (Vec<ValueHit>, bool) {
         let mut hits: Vec<ValueHit> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
+        let mut truncated = false;
+        let neighbors = |current: &str| {
+            if predicate.inverted {
+                self.predictor.subjects_of(&predicate.slot, current)
+            } else {
+                self.predictor.objects_of(current, &predicate.slot)
+            }
+        };
 
         if let Some(law) = self.laws.active_transitive(&predicate.slot) {
-            // 传递闭包：沿槽位方向逐层扩展，深度与节点数都有硬上限。
             let mut visited: HashSet<String> = HashSet::from([node.to_string()]);
             let mut frontier = vec![node.to_string()];
             let mut expanded = 0usize;
-            'closure: for _ in 0..LAW_CLOSURE_MAX_DEPTH {
+            let mut depth = 0usize;
+            loop {
+                if depth >= LAW_CLOSURE_MAX_DEPTH {
+                    truncated = frontier.iter().any(|current| {
+                        neighbors(current)
+                            .into_iter()
+                            .any(|value| value != node && !visited.contains(&value))
+                    });
+                    break;
+                }
+                depth += 1;
                 let mut next: Vec<String> = Vec::new();
                 for current in &frontier {
-                    let neighbors = if predicate.inverted {
-                        self.predictor.subjects_of(&predicate.slot, current)
-                    } else {
-                        self.predictor.objects_of(current, &predicate.slot)
-                    };
-                    for value in neighbors {
+                    for value in neighbors(current) {
                         if value == node || !visited.insert(value.clone()) {
                             continue;
                         }
                         expanded += 1;
                         if expanded > LAW_CLOSURE_MAX_NODES {
-                            break 'closure;
+                            truncated = true;
+                            break;
                         }
                         next.push(value);
                     }
+                    if truncated {
+                        break;
+                    }
                 }
-                if next.is_empty() {
+                if truncated || next.is_empty() {
                     break;
                 }
                 for value in &next {
@@ -3996,7 +4019,7 @@ impl SymbolicReasoner {
         }
 
         hits.sort_by(|a, b| a.value.cmp(&b.value));
-        hits
+        (hits, truncated)
     }
 
     /// 链上所有谓词是否都是同一个声明的传递谓词（仅词面重复时启用闭包选路）。
@@ -4017,7 +4040,7 @@ impl SymbolicReasoner {
         &self,
         entity: &str,
         predicates: &[ChainPredicate],
-    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+    ) -> Option<ChainRun> {
         self.run_chain_mode(entity, predicates, false)
     }
 
@@ -4026,7 +4049,7 @@ impl SymbolicReasoner {
         &self,
         entity: &str,
         predicates: &[ChainPredicate],
-    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+    ) -> Option<ChainRun> {
         if self.is_transitive_chain(predicates) {
             return self.run_transitive_chain_exact(entity, predicates);
         }
@@ -4039,7 +4062,7 @@ impl SymbolicReasoner {
         &self,
         entity: &str,
         predicates: &[ChainPredicate],
-    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+    ) -> Option<ChainRun> {
         let law = self.laws.active_transitive(&predicates[0].slot)?;
         let mut frontier = vec![entity.to_string()];
         let mut steps: Vec<ChainStep> = Vec::new();
@@ -4079,7 +4102,11 @@ impl SymbolicReasoner {
         if last_hits.is_empty() {
             return None;
         }
-        Some((steps, last_hits))
+        Some(ChainRun {
+            steps,
+            last_hits,
+            closure_truncated: false,
+        })
     }
 
     fn run_chain_mode(
@@ -4087,13 +4114,14 @@ impl SymbolicReasoner {
         entity: &str,
         predicates: &[ChainPredicate],
         force_closure: bool,
-    ) -> Option<(Vec<ChainStep>, Vec<ValueHit>)> {
+    ) -> Option<ChainRun> {
         if predicates.is_empty() {
             return None;
         }
         let mut frontier = vec![entity.to_string()];
         let mut steps: Vec<ChainStep> = Vec::new();
         let mut last_hits: Vec<ValueHit> = Vec::new();
+        let mut closure_truncated = false;
         for predicate in predicates {
             let mut next_frontier: Vec<String> = Vec::new();
             let mut round_hits: Vec<ValueHit> = Vec::new();
@@ -4103,7 +4131,9 @@ impl SymbolicReasoner {
             for node in &frontier {
                 let direct = self.node_hits(node, predicate);
                 let hits = if force_closure || direct.is_empty() {
-                    let expanded = self.law_hits(node, predicate, direct.is_empty());
+                    let (expanded, expanded_truncated) =
+                        self.law_hits(node, predicate, direct.is_empty());
+                    closure_truncated |= expanded_truncated;
                     if force_closure && !expanded.is_empty() {
                         // 闭包结果优先保留律归属；直接事实只补闭包未覆盖的取值。
                         let mut merged = expanded;
@@ -4148,7 +4178,11 @@ impl SymbolicReasoner {
         if last_hits.is_empty() {
             return None;
         }
-        Some((steps, last_hits))
+        Some(ChainRun {
+            steps,
+            last_hits,
+            closure_truncated,
+        })
     }
 
     fn discourse_marker(index: usize, total: usize) -> &'static str {
@@ -4188,6 +4222,7 @@ impl SymbolicReasoner {
         steps: &[ChainStep],
         last_hits: &[ValueHit],
         question: &str,
+        closure_truncated: bool,
     ) -> String {
         let expectations = Self::expected_type_keywords(question);
         let mut ordered: Vec<&ValueHit> = last_hits.iter().collect();
@@ -4205,8 +4240,10 @@ impl SymbolicReasoner {
             .zip(last_hits.iter())
             .any(|(a, b)| !std::ptr::eq(*a, b));
         // 只复述真正用到的律；直接事实不冒充「推理得出」。
-        let law_notes: Vec<String> = last_hits
+        let law_notes: Vec<String> = steps
             .iter()
+            .flat_map(|step| step.hits.iter())
+            .chain(last_hits.iter())
             .filter_map(|hit| hit.law.as_deref())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -4253,6 +4290,8 @@ impl SymbolicReasoner {
                 if let Some(explain) = self.laws.explain(law_id) {
                     output.push_str(&format!("\n  推理依据：{}", explain));
                 }
+            } else if !law_notes.is_empty() {
+                output.push_str(&format!("\n  推理依据：{}", law_notes.join("；")));
             }
         } else {
             for (index, hit) in ordered.iter().enumerate() {
@@ -4295,6 +4334,11 @@ impl SymbolicReasoner {
                     expectations.join("/")
                 ));
             }
+        }
+        if closure_truncated {
+            output.push_str(
+                "\n  说明：传递闭包扩展达到深度或节点上限，未列出的取值仍可能存在。",
+            );
         }
         output
     }
@@ -4702,13 +4746,14 @@ impl SymbolicReasoner {
                         }
                     })
                 };
-                if let Some((steps, last_hits)) = chain_result {
+                if let Some(run) = chain_result {
                     return Some(self.generate_find_object(
                         &entity,
                         &predicates,
-                        &steps,
-                        &last_hits,
+                        &run.steps,
+                        &run.last_hits,
                         question,
+                        run.closure_truncated,
                     ));
                 }
                 if self.is_known_entity(&entity)
@@ -5238,17 +5283,17 @@ impl SymbolicReasoner {
 
         let mut chain_result = self.run_chain(&entity, &intermediate);
         let need_laws = self.laws.has_inference_laws()
-            && chain_result.as_ref().map_or(true, |(_, hits)| {
-                !hits.iter().any(|hit| hit.value == object)
-            });
+            && chain_result
+                .as_ref()
+                .map_or(true, |run| !run.last_hits.iter().any(|hit| hit.value == object));
         if need_laws {
             if let Some(expanded) = self.run_chain_via_laws(&entity, &intermediate) {
                 chain_result = Some(expanded);
             }
         }
-        if let Some((steps, last_hits)) = chain_result {
-            if let Some(hit) = last_hits.iter().find(|hit| hit.value == object) {
-                let step = steps.last()?;
+        if let Some(run) = chain_result {
+            if let Some(hit) = run.last_hits.iter().find(|hit| hit.value == object) {
+                let step = run.steps.last()?;
                 return Some(match &hit.prediction {
                     None => match &hit.law {
                         Some(law_id) => format!(
@@ -5268,13 +5313,23 @@ impl SymbolicReasoner {
                     ),
                 });
             }
-            let known_values: Vec<String> = last_hits
+            let known_values: Vec<String> = run
+                .last_hits
                 .iter()
                 .filter(|hit| hit.prediction.is_none())
                 .map(|hit| hit.value.clone())
                 .collect();
             if !known_values.is_empty() {
-                let step = steps.last()?;
+                let step = run.steps.last()?;
+                if run.closure_truncated {
+                    return Some(format!(
+                        "无法确定。传递闭包扩展达到上限，未列出通往 {} 的路径；目前记录的是：{} 的 {} 是 {}。",
+                        object,
+                        step.subject,
+                        step.predicate,
+                        known_values.join("、")
+                    ));
+                }
                 return Some(format!(
                     "不是。知识图谱记录的是：{} 的 {} 是 {}。",
                     step.subject,
@@ -10706,6 +10761,55 @@ mod tests {
             ..Default::default()
         });
         registry
+    }
+
+    fn transitive_predicate_registry(predicate: &str) -> crate::predicate_registry::PredicateRegistry {
+        use crate::predicate_registry::{PredicateProfileConfig, PredicateRegistry};
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&PredicateProfileConfig {
+            name: predicate.to_string(),
+            transitive: true,
+            ..Default::default()
+        });
+        registry
+    }
+
+    #[test]
+    fn truncated_law_closure_is_disclosed_in_chain_answer() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        let mut facts = vec![PrologFact::Relation {
+            from: "甲".to_string(),
+            rel_type: "上司".to_string(),
+            to: "乙".to_string(),
+        }];
+        let names = ["乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+        for pair in names.windows(2) {
+            facts.push(PrologFact::Relation {
+                from: pair[0].to_string(),
+                rel_type: "上司".to_string(),
+                to: pair[1].to_string(),
+            });
+        }
+        facts.push(PrologFact::Relation {
+            from: "壬".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "子".to_string(),
+        });
+        reasoner.observe_facts(&facts);
+        reasoner.configure_laws(&transitive_predicate_registry("上司"));
+
+        let answer = reasoner
+            .answer("甲的上司的师傅是谁")
+            .expect("混合链应由律闭包补充");
+        assert!(
+            answer.contains("传递闭包扩展达到深度或节点上限"),
+            "{}",
+            answer
+        );
+        assert!(answer.contains("子"), "{}", answer);
+        assert!(answer.contains("law:transitive:上司"), "{}", answer);
     }
 
     #[test]
