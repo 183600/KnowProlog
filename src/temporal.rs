@@ -1,8 +1,7 @@
 //! TPWM：时序路径工作记忆的只读时间内核。
 //!
-//! 系统此前只在「句子 → 关系帧」这一层看得见时间（`relation_frame` 的
-//! `TemporalScope`），而事实层、路径层、Prolog 层都把它丢掉了。本模块把
-//! 时间补成可检查的数据：
+//! 时间在「句子 → 关系帧」层由 `relation_frame` 的 `TemporalScope` 表达；
+//! 本模块把时间落实为事实层、路径层与 Prolog 层可检查的数据：
 //!   - [`TimePoint`] / [`TimeSpan`]：规范化到年月日的闭区间，含开区间；
 //!   - [`Validity`]：一条事实的有效期，显式区分「未知」「无界（长期）」
 //!     「区间」「空」——没写时间不等于永远为真；
@@ -11,7 +10,7 @@
 //!     时返回 `UndefinedReferenceTime`，绝不猜系统时钟；
 //!   - [`TemporalConstraint`]：路径/查询上的时间约束，供路径内核统一执行。
 //!
-//! 纯符号、零训练、同输入同字节：本模块不做时区/农历/日历换算，第一版只到
+//! 纯符号、零训练、同输入同字节：本模块不做时区/农历/日历换算，只到
 //! 年月日，年粒度优先。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -494,7 +493,7 @@ impl UnknownTimePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporalConstraint {
-    /// 不约束（保持旧行为）。
+    /// 不约束。
     #[default]
     Any,
     /// 状态查询：事实必须在 `point` 时刻为真。

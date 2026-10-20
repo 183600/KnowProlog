@@ -347,7 +347,7 @@ pub struct PathBundle {
     pub expansions: usize,
     pub visited: usize,
     pub truncated: bool,
-    /// 本次枚举使用的时间约束（Any 时不序列化，保持旧输出形状）。
+    /// 本次枚举使用的时间约束（Any 时不序列化）。
     #[serde(default, skip_serializing_if = "TemporalConstraint::is_any")]
     pub temporal: TemporalConstraint,
 }
