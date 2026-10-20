@@ -290,6 +290,27 @@ impl DenseRetriever {
         self.dirty = true;
     }
 
+    /// 撤回一条已观察的三元组；下一次检索前会按需重建倒排与结构索引。
+    /// 返回是否确实移除了证据（未观察过的三元组为 false）。
+    pub fn remove_triple(&mut self, subject: &str, predicate: &str, object: &str) -> bool {
+        let subject = subject.trim();
+        let predicate = predicate.trim();
+        let object = object.trim();
+        let key = (subject.to_string(), predicate.to_string(), object.to_string());
+        if !self.seen.remove(&key) {
+            return false;
+        }
+        let before = self.docs.len();
+        self.docs.retain(|doc| {
+            doc.subject != subject || doc.predicate != predicate || doc.object != object
+        });
+        let removed = self.docs.len() != before;
+        if removed {
+            self.dirty = true;
+        }
+        removed
+    }
+
     /// 观察一个实体的类型与属性（属性逐条转成证据文档）
     pub fn observe_entity(&mut self, name: &str, entity_type: &str, properties: &[(String, String)]) {
         let name = name.trim();
@@ -350,6 +371,11 @@ impl DenseRetriever {
         let n = self.docs.len();
         self.df.clear();
         self.postings.clear();
+        self.entity_docs.clear();
+        self.by_subject.clear();
+        self.by_predicate.clear();
+        self.by_object.clear();
+        self.adjacency.clear();
         self.doc_norms = vec![0.0; n];
         self.doc_max_weights = vec![0.0; n];
         let mut term_freq: Vec<HashMap<&str, f64>> = Vec::with_capacity(n);
@@ -361,7 +387,43 @@ impl DenseRetriever {
             for term in tf.keys() {
                 *self.df.entry((*term).to_string()).or_insert(0) += 1;
             }
-            let _ = id;
+            // 全部派生索引在这里从文档正本重建：撤回后不会残留旧文档 id。
+            self.entity_docs
+                .entry(doc.subject.clone())
+                .or_default()
+                .push(id);
+            if doc.object != doc.subject {
+                self.entity_docs
+                    .entry(doc.object.clone())
+                    .or_default()
+                    .push(id);
+            }
+            self.by_subject
+                .entry(doc.subject.clone())
+                .or_default()
+                .push(id);
+            self.by_predicate
+                .entry(doc.predicate.clone())
+                .or_default()
+                .push(id);
+            self.by_object
+                .entry(doc.object.clone())
+                .or_default()
+                .push(id);
+            if doc.subject != doc.object {
+                self.adjacency
+                    .entry(doc.subject.clone())
+                    .or_default()
+                    .entry(doc.object.clone())
+                    .and_modify(|weight| *weight += 1.0)
+                    .or_insert(1.0);
+                self.adjacency
+                    .entry(doc.object.clone())
+                    .or_default()
+                    .entry(doc.subject.clone())
+                    .and_modify(|weight| *weight += 1.0)
+                    .or_insert(1.0);
+            }
             term_freq.push(tf);
         }
         // 第二遍：用 df 计算 idf 与归一化权重
@@ -1367,6 +1429,35 @@ mod tests {
         assert!(search.hits.iter().all(|hit| hit.predicate == "老师"));
         assert!(search.hits.iter().all(|hit| hit.reasons == vec!["约束精确匹配"]));
         assert!(search.receipt.certified_top_k);
+    }
+
+    #[test]
+    fn removal_drops_evidence_and_invalidates_index() {
+        let mut retriever = build_retriever();
+        assert!(retriever.remove_triple("张三", "老师", "王五"));
+        assert!(!retriever.remove_triple("张三", "老师", "王五"));
+        let removed = retriever.search(
+            "张三 老师 王五",
+            10,
+            &SearchConstraints::default(),
+            SearchBudget::unlimited(),
+        );
+        assert!(removed
+            .hits
+            .iter()
+            .all(|hit| !(hit.subject == "张三" && hit.predicate == "老师" && hit.object == "王五")));
+
+        retriever.observe_triple("张三", "老师", "王五");
+        let restored = retriever.search(
+            "张三 老师 王五",
+            10,
+            &SearchConstraints::default(),
+            SearchBudget::unlimited(),
+        );
+        assert!(restored
+            .hits
+            .iter()
+            .any(|hit| hit.subject == "张三" && hit.predicate == "老师" && hit.object == "王五"));
     }
 
     #[test]

@@ -1037,7 +1037,13 @@ impl SymbolicReasoner {
         self.lessons.clear();
         self.lessons_parsed.clear();
         self.frames = FrameMemory::new();
-        self.session_facts.clear();
+        // 会话事实可能已被索引为证据；分叉/重置时把非图谱来源的条目撤出索引。
+        let session_facts = std::mem::take(&mut self.session_facts);
+        for atom in &session_facts {
+            if !self.graph_supports_atom(atom) {
+                self.unindex_session_atom(atom);
+            }
+        }
         self.session_negative_facts.clear();
         self.session_clauses.clear();
         self.clarification = None;
@@ -2971,16 +2977,45 @@ impl SymbolicReasoner {
         ))
     }
 
+    /// 二元常原子 → 证据三元组；其他元数或含变量的原子不进入证据索引。
+    fn session_atom_triple(atom: &Atom) -> Option<(&str, &str, &str)> {
+        match atom.terms.as_slice() {
+            [Term::Const(subject), Term::Const(object)] => {
+                Some((subject.as_ref(), atom.predicate.as_ref(), object.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    fn index_session_atom(&mut self, atom: &Atom) {
+        if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+            self.retrieval
+                .lock()
+                .observe_triple(subject, predicate, object);
+        }
+    }
+
+    fn unindex_session_atom(&mut self, atom: &Atom) {
+        if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+            self.retrieval
+                .lock()
+                .remove_triple(subject, predicate, object);
+        }
+    }
+
     /// 把一条基事实从会话事实集中撤回（不触碰知识图谱）
     fn retract_atom(&mut self, atom: &Atom) -> bool {
         if !self.session_facts.iter().any(|existing| existing == atom) {
             return false;
         }
         self.session_facts.retain(|existing| existing != atom);
-        // 图谱事实始终保留；仅当图谱不再支持该原子时才从归结引擎增量删除，
-        // 避免每次撤回都重建整库（同名的图谱事实与多条会话事实互不误删）。
-        if self.config.enable_resolution && !self.graph_supports_atom(atom) {
-            self.resolver.remove_fact_atom(atom);
+        // 图谱事实始终保留；仅当图谱不再支持该原子时才从归结引擎与证据索引
+        // 增量删除，避免每次撤回都重建整库（同名的图谱事实与会话事实互不误删）。
+        if !self.graph_supports_atom(atom) {
+            self.unindex_session_atom(atom);
+            if self.config.enable_resolution {
+                self.resolver.remove_fact_atom(atom);
+            }
         }
         // 软逻辑与概率程序同源：撤回后整体重建（概率程序随软逻辑一起重放）
         if self.config.enable_soft_logic {
@@ -3000,6 +3035,7 @@ impl SymbolicReasoner {
         }
         if !self.session_facts.contains(&atom) {
             self.session_facts.push(atom.clone());
+            self.index_session_atom(&atom);
             added = true;
         }
         // 会话假设同步注入软逻辑引擎
@@ -7987,6 +8023,9 @@ impl SymbolicReasoner {
                 }
             }
             self.abduction.restore_adopted(restored.clone());
+            for atom in &restored {
+                self.index_session_atom(atom);
+            }
             self.session_facts = restored;
             if self.config.enable_resolution {
                 self.rebuild_resolver();
@@ -8638,6 +8677,36 @@ mod tests {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         assert!(reasoner.answer_by_evidence("师傅是谁").is_none());
+    }
+
+    #[test]
+    fn test_session_facts_enter_and_leave_evidence_index() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("钱七是孙八的师傅");
+
+        let present = reasoner.evidence_search(
+            "钱七 孙八 师傅",
+            8,
+            &SearchConstraints::default(),
+            SearchBudget::unlimited(),
+        );
+        assert!(present.hits.iter().any(|hit| {
+            (hit.subject == "钱七" || hit.object == "钱七")
+                && (hit.subject == "孙八" || hit.object == "孙八")
+        }));
+
+        reasoner.retract_nl_fact("钱七是孙八的师傅");
+        let absent = reasoner.evidence_search(
+            "钱七 孙八 师傅",
+            8,
+            &SearchConstraints::default(),
+            SearchBudget::unlimited(),
+        );
+        assert!(!absent.hits.iter().any(|hit| {
+            (hit.subject == "钱七" || hit.object == "钱七")
+                && (hit.subject == "孙八" || hit.object == "孙八")
+        }));
     }
 
     #[test]
