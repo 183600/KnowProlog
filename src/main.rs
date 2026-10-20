@@ -8363,6 +8363,57 @@ mod session_tests {
     }
 
     #[test]
+    fn build_kg_cli_parses_feedback_and_apply() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "build-kg",
+            "--text",
+            "张三拜李四为师。",
+            "--min-support",
+            "3",
+            "--min-purity",
+            "750",
+            "--limit",
+            "12",
+            "--feedback",
+            "feedback.txt",
+            "--apply",
+            "--json",
+        ])
+        .expect("build-kg 参数应可解析");
+        match cli.command {
+            Some(Commands::BuildKg {
+                text,
+                min_support,
+                min_purity,
+                limit,
+                feedback,
+                apply,
+                json,
+                ..
+            }) => {
+                assert_eq!(text.as_deref(), Some("张三拜李四为师。"));
+                assert_eq!(min_support, 3);
+                assert_eq!(min_purity, 750);
+                assert_eq!(limit, 12);
+                assert_eq!(feedback.as_deref(), Some("feedback.txt"));
+                assert!(apply);
+                assert!(json);
+            }
+            _ => panic!("应解析为 BuildKg 子命令"),
+        }
+        assert!(Cli::try_parse_from([
+            "knowprolog",
+            "build-kg",
+            "--text",
+            "甲",
+            "--file",
+            "corpus.txt",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn command_like_covers_trust_and_correction_commands() {
         for command in [
             "更正：姚明的身高从226改为229",
