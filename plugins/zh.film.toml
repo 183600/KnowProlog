@@ -17,15 +17,22 @@ entries = [
 [[contributions]]
 kind = "ontology"
 id = "film.ontology"
-description = "电影领域谓词别名（启动时合并进谓词对齐器）。"
+description = "电影领域本体：类型层级 + 谓词别名/互逆/定义域/值域（启动时并入统一推理器）。"
 predicates = [
-  { name = "导演", aliases = ["director"] },
+  { name = "导演", aliases = ["director"], inverse = "执导", domain = ["电影"], range = ["人物"] },
+  { name = "主演", aliases = ["演员"], domain = ["电影"], range = ["人物"] },
+]
+types = [
+  { name = "影视作品" },
+  { name = "电影", aliases = ["影片"], subclass_of = ["影视作品"] },
+  { name = "动画电影", subclass_of = ["电影"] },
+  { name = "人物" },
 ]
 
 [[contributions]]
 kind = "recipe"
 id = "film.directed_by"
-description = "作品 → 导演"
+description = "作品 → 导演（正向；答案类型约束为人物）"
 patterns = [
   "{entity}是谁导演的",
   "{entity}由谁导演",
@@ -33,20 +40,69 @@ patterns = [
 ]
 question = "{entity}的导演是什么"
 attribute = "导演"
+answer_types = ["人物"]
 template = "film.directed_by.template"
 
 [[contributions]]
-kind = "rewrite"
+kind = "recipe"
+id = "film.works_by_director"
+description = "导演 → 作品（逆向检索；答案类型约束为电影）"
+patterns = [
+  "{entity}导演过哪些电影",
+  "{entity}导演的电影有哪些",
+  "{entity}执导过哪些电影",
+]
+question = "{entity}导演过哪些作品"
+attribute = "导演"
+direction = "inverse"
+answer_types = ["电影"]
+template = "film.works.template"
+
+[[contributions]]
+kind = "recipe"
+id = "film.cast_of"
+description = "作品 → 主演（正向；多值合并）"
+patterns = [
+  "{entity}的主演是谁",
+  "{entity}由谁主演",
+  "谁主演了{entity}",
+]
+question = "{entity}的主演是谁"
+attribute = "主演"
+answer_types = ["人物"]
+template = "film.cast.template"
+
+[[contributions]]
+kind = "recipe"
 id = "film.works_by_actor"
-description = "演员 → 作品"
-pattern = "{entity}演过哪些电影"
-replacement = "{entity}的电影有哪些"
+description = "演员 → 作品（逆向检索；答案类型约束为电影）"
+patterns = [
+  "{entity}演过哪些电影",
+  "{entity}主演过哪些电影",
+]
+question = "{entity}主演过哪些作品"
+attribute = "主演"
+direction = "inverse"
+answer_types = ["电影"]
+template = "film.works.template"
 
 [[contributions]]
 kind = "template"
 id = "film.directed_by.template"
-description = "导演配方模板（所有槽位必须接地）。"
-template = "「{entity}」的导演是{answer}。"
+description = "导演配方模板（所有槽位必须接地，依据来自事实/公理闭包）。"
+template = "「{entity}」的导演是{answer}。依据：{evidence}"
+
+[[contributions]]
+kind = "template"
+id = "film.works.template"
+description = "作品配方模板（逆向检索；依据必须接地）。"
+template = "「{entity}」参与的作品有{answer}。依据：{evidence}"
+
+[[contributions]]
+kind = "template"
+id = "film.cast.template"
+description = "主演配方模板（多值合并；依据必须接地）。"
+template = "「{entity}」的主演是{answer}。依据：{evidence}"
 
 [[eval_cases]]
 input = "阿凡达是谁导演的"
@@ -57,6 +113,16 @@ expect_contains = "导演"
 [[eval_cases]]
 input = "阿凡达由谁执导"
 expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "卡梅隆导演过哪些电影"
+expect_rewrite = "卡梅隆导演过哪些作品"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "阿凡达的主演是谁"
+expect_rewrite = "阿凡达的主演是谁"
 expect_plugin = "zh.film"
 
 [[contributions]]

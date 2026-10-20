@@ -3245,6 +3245,36 @@ mod tests {
     }
 
     #[test]
+    fn reference_film_plugin_lints_and_passes_its_own_evals() {
+        let manifest: PluginManifest =
+            toml::from_str(include_str!("../plugins/zh.film.toml")).expect("参考插件应可解析");
+        let registry = PluginRegistry::from_manifests(vec![manifest]);
+        assert!(!registry.has_errors(), "{}", registry.render_issues());
+        let results = registry.evaluate();
+        assert!(!results.is_empty(), "参考插件应自带评测");
+        assert!(
+            results.iter().all(|result| result.passed),
+            "{}",
+            registry.render_eval(&results)
+        );
+        let runtime = PluginRuntime::with_settings(
+            registry,
+            &PluginSettings {
+                enabled: vec!["zh.film".to_string()],
+                ..PluginSettings::default()
+            },
+        );
+        assert!(
+            runtime.ontology_program().len() >= 7,
+            "影视插件应贡献类型层级/定义域/值域/逆关系等公理"
+        );
+        assert_eq!(
+            runtime.ontology_inverse_surfaces(),
+            vec![("执导".to_string(), "导演".to_string())]
+        );
+    }
+
+    #[test]
     fn typed_recipe_direction_and_evidence_are_parsed_and_rendered() {
         let manifest: PluginManifest = toml::from_str(
             r#"
