@@ -34,6 +34,7 @@ use know_prolog::{
         ContextualResolver,
     },
     recovery::RecoveryMode,
+    trace_graph::TraceMode,
     holographic_memory::{HoloAnalogyHit, HoloHit},
     import_journal::{ImportJournal, JournalLoad},
     perf_ledger::PerfLedger,
@@ -95,6 +96,10 @@ struct Cli {
     /// Failure recovery mode for interactive dialogue: "off", "observe", or "on"
     #[arg(long, global = true, default_value = "observe")]
     recovery: String,
+    /// Layered trace-graph mode for interactive dialogue: "off", "observe", or "on".
+    /// When omitted, the `[trace_graph] mode` from config.toml is used.
+    #[arg(long, global = true)]
+    trace: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -613,6 +618,11 @@ async fn main() {
             eprintln!("加载配置文件失败: {}", e);
             return;
         }
+    };
+    // 分层追踪模式：命令行 `--trace` 优先，缺省回落 config.toml 的 [trace_graph]。
+    let trace_mode = match cli.trace.as_deref() {
+        Some(value) => parse_trace_mode(value),
+        None => config.trace_graph.parse_mode(),
     };
 
     // 读法追踪只读配置与文本：不打开知识存储，适合在词表/分词变更前后做差分。
@@ -1691,7 +1701,7 @@ async fn main() {
         }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
-            run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode, &store_path).await;
+            run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode, trace_mode, &store_path).await;
         }
     }
 }
@@ -1852,6 +1862,13 @@ fn parse_prompt_mode(value: &str) -> PromptMode {
 fn parse_recovery_mode(value: &str) -> RecoveryMode {
     RecoveryMode::parse(value).unwrap_or_else(|| {
         eprintln!("未知的失败恢复模式「{}」：可选 off / observe / on", value);
+        std::process::exit(1);
+    })
+}
+
+fn parse_trace_mode(value: &str) -> TraceMode {
+    TraceMode::parse(value).unwrap_or_else(|| {
+        eprintln!("未知的分层追踪模式「{}」：可选 off / observe / on", value);
         std::process::exit(1);
     })
 }
@@ -2593,12 +2610,16 @@ async fn run_interactive_mode(
     oxigraph_manager: OxigraphManager,
     perf_ledger: Arc<PerfLedger>,
     recovery_mode: RecoveryMode,
+    trace_mode: TraceMode,
     store_path: &str,
 ) {
     println!("{}", config.messages.startup);
     warn_config_contract(&config);
     if !recovery_mode.eq(&RecoveryMode::Off) {
         println!("失败恢复模式：{}（失败会生成结构化回执）。", recovery_mode.label());
+    }
+    if !trace_mode.is_off() {
+        println!("分层追踪模式：{}（每轮决策写入追踪图）。", trace_mode.label());
     }
 
     // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
@@ -2847,6 +2868,8 @@ async fn run_interactive_mode(
     let dialogue_enabled = config.reasoning.enable_dialogue_manager;
     let mut dialogue_manager = DialogueManager::new();
     dialogue_manager.set_recovery_mode(recovery_mode);
+    dialogue_manager.set_trace_mode(trace_mode);
+    *dialogue_manager.trace_store_mut() = config.trace_graph.build_store();
     if dialogue_enabled {
         if let Some(state_path) = config.reasoning.dialogue_state_path.as_deref() {
             let manager_path = format!("{}.manager.json", state_path);
@@ -2976,6 +2999,28 @@ async fn run_interactive_mode(
         .as_ref()
         .map(|chronicle| chronicle.kb_revision())
         .unwrap_or(0);
+
+    // 分层追踪回放：把编年史里的 `kind="trace"` 逐轮重建为追踪工作记忆
+    //（问据栈/指代轨迹/更正覆盖），使重启后仍能承继谓词焦点与改口。
+    if !trace_mode.is_off() {
+        if let Some(chronicle) = chronicle.as_ref() {
+            let mut replayed = 0usize;
+            for entry in chronicle.replay_to(chronicle.last_seq()) {
+                if entry.kind != "trace" {
+                    continue;
+                }
+                if let Ok(trace) = serde_json::from_value::<know_prolog::trace_graph::TurnTrace>(
+                    entry.payload.clone(),
+                ) {
+                    dialogue_manager.replay_turn_trace(trace);
+                    replayed += 1;
+                }
+            }
+            if replayed > 0 {
+                println!("已回放分层追踪：{} 轮（「追踪报告」查看）。", replayed);
+            }
+        }
+    }
 
     println!("{}", config.messages.ready);
     println!("{}", config.messages.query_prompt);
@@ -3410,6 +3455,40 @@ async fn run_interactive_mode(
         if input == "对话本体" || input == "对话状态" {
             println!("{}", dialogue_manager.summary());
             println!("{}", DialogueManager::policy_source());
+            println!();
+            continue;
+        }
+
+        // 分层追踪：问据栈 / 指代轨迹 / 逐轮决策（只读；On 模式才会累积）
+        if matches!(input, "追踪报告" | "追踪状态" | "追踪图" | "trace") {
+            println!("{}", dialogue_manager.trace_report());
+            println!();
+            continue;
+        }
+
+        // 指代轨迹：当前会话的指代绑定与版本链
+        if matches!(input, "指代轨迹" | "指代报告") {
+            println!("{}", dialogue_manager.trace_store().referent_report());
+            println!();
+            continue;
+        }
+
+        // 问据栈：当前开放/已决的问据（QUD）
+        if matches!(input, "问据栈" | "问据报告" | "QUD") {
+            println!("{}", dialogue_manager.trace_store().qud_stack().report());
+            println!();
+            continue;
+        }
+
+        // 追踪为什么：沿追踪图 inputs 边回溯某编号节点的决策链
+        if let Some(id) = strip_any_prefix(input, &["追踪为什么：", "追踪为什么:", "追踪为什么"]) {
+            match id.trim().parse::<u64>() {
+                Ok(id) => match dialogue_manager.trace_why(id) {
+                    Some(text) => println!("{}", text),
+                    None => println!("追踪图里没有编号为 {} 的节点。", id),
+                },
+                Err(_) => println!("请给出节点编号，例如「追踪为什么 4」。"),
+            }
             println!();
             continue;
         }
@@ -5632,6 +5711,7 @@ async fn run_interactive_mode(
                     .map(|turn| turn.provenance.clone())
                     .unwrap_or_default();
                 log_chronicle_reply(&mut chronicle, &text, &reply.plan, &provenance);
+                log_chronicle_trace(&mut chronicle, &dialogue_manager);
                 println!();
                 continue;
             }
@@ -6155,6 +6235,7 @@ async fn run_interactive_mode(
                                 );
                             }
                             log_chronicle_reply(&mut chronicle, &text, &plan, &provenance);
+                            log_chronicle_trace(&mut chronicle, &dialogue_manager);
                             println!();
                             continue;
                         }
@@ -6179,6 +6260,7 @@ async fn run_interactive_mode(
                             .map(|turn| turn.provenance.clone())
                             .unwrap_or_default();
                         log_chronicle_reply(&mut chronicle, &text, &reply.plan, &provenance);
+                        log_chronicle_trace(&mut chronicle, &dialogue_manager);
                         println!();
                         continue;
                     }
@@ -6888,6 +6970,17 @@ fn log_chronicle_reply(
     }
 }
 
+/// 编年史轨迹归档：把对话管理器最近一轮的分层追踪写入 `kind="trace"`，
+/// 重启后可据此回放问据栈/指代轨迹（不重放决策）。
+fn log_chronicle_trace(chronicle: &mut Option<Chronicle>, manager: &DialogueManager) {
+    if manager.trace_mode().is_off() {
+        return;
+    }
+    if let (Some(chronicle), Some(trace)) = (chronicle.as_mut(), manager.last_turn_trace_json()) {
+        let _ = chronicle.append("trace", trace);
+    }
+}
+
 /// 外链候选实体：预计算实体在前、本轮解析实体在后，去重保序。
 fn external_candidates(entities: &[String], precomputed: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
@@ -7048,6 +7141,8 @@ fn interactive_help() -> String {
         "",
         "台账与报告",
         "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
+        "  追踪报告 / 指代轨迹 / 问据栈          分层追踪：问据栈、指代绑定与逐轮决策",
+        "  追踪为什么 <编号>                     沿追踪图回溯某决策的依据链",
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
@@ -7219,6 +7314,16 @@ fn is_command_like(input: &str) -> bool {
         "全息",
         "对话本体",
         "对话状态",
+        "追踪报告",
+        "追踪状态",
+        "追踪图",
+        "trace",
+        "指代轨迹",
+        "指代报告",
+        "问据栈",
+        "问据报告",
+        "QUD",
+        "追踪为什么",
         "查询板",
         "查询状态",
         "工作记忆",
@@ -8196,6 +8301,12 @@ mod session_tests {
             "帧记忆",
             "话语帧",
             "挂账",
+            "追踪报告",
+            "追踪状态",
+            "追踪图",
+            "指代轨迹",
+            "问据栈",
+            "追踪为什么 4",
             "查询剧本：examples/query_board_scenario.toml",
             "运行剧本：examples/query_board_scenario.toml",
             "默认推理：麻雀会飞",
@@ -8308,6 +8419,7 @@ mod session_tests {
             "SPARQL：",
             "为什么",
             "证明：",
+            "追踪报告",
             "帮助",
             "quit",
         ] {

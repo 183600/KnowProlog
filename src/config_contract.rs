@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::SystemConfig;
+use crate::trace_graph;
 
 /// 契约版本：字段/检查语义变化时递增，便于基线与 CI 对齐。
 pub const CONFIG_CONTRACT_VERSION: u32 = 1;
@@ -205,6 +206,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_type_system(&mut c, config);
     check_synonyms(&mut c, config);
     check_reasoning(&mut c, config);
+    check_trace_graph(&mut c, config);
     c.issues
 }
 
@@ -1639,6 +1641,41 @@ fn check_reasoning(c: &mut Collector, config: &SystemConfig) {
     }
 }
 
+fn check_trace_graph(c: &mut Collector, config: &SystemConfig) {
+    let t = &config.trace_graph;
+    if trace_graph::TraceMode::parse(&t.mode).is_none() {
+        c.error(
+            "unknown_trace_mode",
+            "trace_graph.mode",
+            format!(
+                "未知的分层追踪模式「{}」：可选 off / observe / on（非法值将回落为 off）",
+                t.mode
+            ),
+        );
+    }
+    if t.max_turns == 0 {
+        c.warn(
+            "zero_trace_turns",
+            "trace_graph.max_turns",
+            "max_turns=0：追踪图无法保留任何轮迹",
+        );
+    }
+    if t.max_nodes_per_turn == 0 {
+        c.warn(
+            "zero_trace_nodes",
+            "trace_graph.max_nodes_per_turn",
+            "max_nodes_per_turn=0：单轮不记录任何决策节点",
+        );
+    }
+    if t.max_events_per_turn == 0 {
+        c.warn(
+            "zero_trace_events",
+            "trace_graph.max_events_per_turn",
+            "max_events_per_turn=0：单轮不记录任何指代事件",
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1755,6 +1792,49 @@ process_error = "处理出错"
     fn shipped_config_has_no_errors() {
         let source = include_str!("../config.toml");
         let issues = lint_source(source);
+        assert!(
+            !has_errors(&issues),
+            "出厂 config.toml 不应有 Error：\n{}",
+            render_text(&issues)
+        );
+    }
+
+    #[test]
+    fn trace_graph_mode_is_validated() {
+        // 合法模式：不报错误。
+        for mode in ["off", "observe", "on"] {
+            let source = format!("{}\n[trace_graph]\nmode = \"{}\"\n", base(), mode);
+            let issues = lint_source(&source);
+            assert!(
+                !issues.iter().any(|issue| issue.code == "unknown_trace_mode"),
+                "模式 {} 不应报 unknown_trace_mode：{}",
+                mode,
+                render_text(&issues)
+            );
+        }
+        // 非法模式：报 unknown_trace_mode。
+        let source = format!("{}\n[trace_graph]\nmode = \"bogus\"\n", base());
+        assert_code(&lint_source(&source), "unknown_trace_mode");
+    }
+
+    #[test]
+    fn trace_graph_zero_limits_are_warnings() {
+        let source = format!(
+            "{}\n[trace_graph]\nmode = \"off\"\nmax_turns = 0\nmax_nodes_per_turn = 0\nmax_events_per_turn = 0\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "zero_trace_turns");
+        assert_code(&issues, "zero_trace_nodes");
+        assert_code(&issues, "zero_trace_events");
+    }
+
+    #[test]
+    fn shipped_config_has_no_errors_placeholder() {
+        let source = include_str!("../config.toml");
+        let issues = lint_source(source);
+        let config: SystemConfig = toml::from_str(source).expect("config.toml 应能解析");
+        let _ = &config;
         assert!(
             !has_errors(&issues),
             "出厂 config.toml 不应有 Error：\n{}",

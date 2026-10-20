@@ -145,6 +145,16 @@ sup = "人物"
 left = "人物"                          # 可证明不兼容的唯一来源（互斥兜底）
 right = "地点"
 
+# 分层追踪图（可选）：把每轮决策写入显式工作记忆，供「追踪报告」查看。
+# mode 三档与失败恢复同构：off 不记录（默认，行为完全兼容）/ observe 只记不介入 /
+# on 让追踪参与理解与生成（谓词焦点继承、用户更正覆盖旧值、失效传播）。
+# 可用命令行 `--trace off|observe|on` 覆盖本节设置。
+[trace_graph]
+mode = "off"                           # off | observe | on
+max_turns = 24                         # 会话内保留的轮迹上限
+max_nodes_per_turn = 64                # 单轮决策节点上限（超出折叠为摘要）
+max_events_per_turn = 16               # 单轮指代事件上限
+
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]
 enable_nlu = true  # 启用语义理解功能

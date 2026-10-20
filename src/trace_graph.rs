@@ -716,6 +716,11 @@ impl TraceStore {
         &self.trail
     }
 
+    /// 指代轨迹的可读报告。
+    pub fn referent_report(&self) -> String {
+        self.trail.report()
+    }
+
     pub fn predicate_focus(&self) -> Option<&str> {
         self.qud.predicate_focus()
     }
