@@ -370,7 +370,8 @@ impl ResolutionEngine {
     pub fn solve(&self, goals: &[Atom], query_vars: &[String]) -> Vec<Solution> {
         let states = self.solve_states(goals);
 
-        // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明
+        // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明；
+        // 置信度相同则按证明树的规范串取最小者，保证跨进程/跨运行稳定。
         let mut best: HashMap<String, Solution> = HashMap::new();
         for (subst, proofs) in states {
             let (key, bindings, _) = bind_query_vars(&subst, query_vars);
@@ -380,18 +381,29 @@ impl ResolutionEngine {
                 proofs,
                 confidence: confidence.clamp(0.0, 1.0),
             };
-            match best.get(&key) {
-                Some(existing) if existing.confidence >= candidate.confidence => {}
-                _ => {
-                    best.insert(key, candidate);
-                }
+            let replace = match best.get(&key) {
+                None => true,
+                Some(existing) => match existing.confidence.total_cmp(&candidate.confidence) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => {
+                        proofs_canonical_key(&candidate.proofs)
+                            < proofs_canonical_key(&existing.proofs)
+                    }
+                },
+            };
+            if replace {
+                best.insert(key, candidate);
             }
         }
         let mut solutions: Vec<Solution> = best.into_values().collect();
         solutions.sort_by(|a, b| {
             b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.confidence)
+                .then_with(|| binding_key(&a.bindings).cmp(&binding_key(&b.bindings)))
+                .then_with(|| {
+                    proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs))
+                })
         });
         solutions.truncate(self.max_solutions);
         solutions
@@ -410,18 +422,29 @@ impl ResolutionEngine {
                 proofs,
                 confidence: confidence.clamp(0.0, 1.0),
             };
-            match best.get(&key) {
-                Some(existing) if existing.confidence >= candidate.confidence => {}
-                _ => {
-                    best.insert(key, candidate);
-                }
+            let replace = match best.get(&key) {
+                None => true,
+                Some(existing) => match existing.confidence.total_cmp(&candidate.confidence) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => {
+                        proofs_canonical_key(&candidate.proofs)
+                            < proofs_canonical_key(&existing.proofs)
+                    }
+                },
+            };
+            if replace {
+                best.insert(key, candidate);
             }
         }
         let mut solutions: Vec<TypedSolution> = best.into_values().collect();
         solutions.sort_by(|a, b| {
             b.confidence
-                .partial_cmp(&a.confidence)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&a.confidence)
+                .then_with(|| typed_binding_key(&a.bindings).cmp(&typed_binding_key(&b.bindings)))
+                .then_with(|| {
+                    proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs))
+                })
         });
         solutions.truncate(self.max_solutions);
         solutions
@@ -950,6 +973,78 @@ pub fn bound_term(term: &Term) -> BoundTerm {
     }
 }
 
+/// 证明树的规范串：只含逻辑形式、来源与六位置信度，不含自然语言措辞。
+///
+/// 用于同分证明的确定性排序：`HashMap` 的迭代序不应泄漏到解的顺序里，
+/// 否则同一查询在不同运行中会给出不同的“第一条证明”。
+pub fn proof_canonical_key(node: &ProofNode) -> String {
+    let mut out = String::new();
+    write_proof_canonical_key(node, &mut out);
+    out
+}
+
+fn write_proof_canonical_key(node: &ProofNode, out: &mut String) {
+    out.push_str(&node.atom.display());
+    out.push('[');
+    match &node.source {
+        ProofSource::Fact => out.push_str("fact"),
+        ProofSource::Rule { source } => {
+            out.push_str("rule:");
+            out.push_str(source);
+        }
+    }
+    out.push('|');
+    out.push_str(&format!("{:.6}", node.confidence));
+    out.push(']');
+    for child in &node.children {
+        out.push('(');
+        write_proof_canonical_key(child, out);
+        out.push(')');
+    }
+}
+
+fn proofs_canonical_key(proofs: &[ProofNode]) -> String {
+    let mut out = String::new();
+    for (index, proof) in proofs.iter().enumerate() {
+        if index > 0 {
+            out.push(';');
+        }
+        write_proof_canonical_key(proof, &mut out);
+    }
+    out
+}
+
+fn binding_key(bindings: &HashMap<String, String>) -> String {
+    let mut pairs: Vec<(&String, &String)> = bindings.iter().collect();
+    pairs.sort_by(|left, right| left.0.cmp(right.0));
+    let mut out = String::new();
+    for (index, (name, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push('|');
+        }
+        out.push_str(name);
+        out.push('=');
+        out.push_str(value);
+    }
+    out
+}
+
+fn typed_binding_key(bindings: &BindingSet) -> String {
+    let mut out = String::new();
+    for (index, (name, value)) in bindings.iter().enumerate() {
+        if index > 0 {
+            out.push('|');
+        }
+        out.push_str(name);
+        out.push('=');
+        match value.render_raw() {
+            Some(raw) => out.push_str(&raw),
+            None => out.push_str("?unbound"),
+        }
+    }
+    out
+}
+
 /// 为查询变量生成「去重键 + 字符串绑定 + 类型化绑定」三件套。
 ///
 /// 字符串绑定采用 `render_term` 的隐式未绑定约定（`?X`），
@@ -1071,6 +1166,32 @@ mod tests {
             &Atom::rel("师傅", "张三", "李四"),
             &mut Substitution::new()
         ));
+    }
+
+    #[test]
+    fn equal_confidence_solutions_have_canonical_order() {
+        let mut engine = ResolutionEngine::new(4, 10);
+        engine.add_fact("师傅", "王五", "李四");
+        engine.add_fact("师傅", "张三", "李四");
+        let goals = vec![Atom::pattern(
+            "师傅",
+            Term::var("X"),
+            Term::constant("李四"),
+        )];
+        let solutions = engine.solve(&goals, &["X".to_string()]);
+        let names: Vec<&str> = solutions
+            .iter()
+            .map(|solution| solution.bindings.get("X").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["张三", "王五"], "同分证明必须按绑定规范序排列");
+        for _ in 0..5 {
+            let again = engine.solve(&goals, &["X".to_string()]);
+            let again_names: Vec<&str> = again
+                .iter()
+                .map(|solution| solution.bindings.get("X").map(String::as_str).unwrap_or(""))
+                .collect();
+            assert_eq!(again_names, names, "解的顺序不得依赖 HashMap 迭代序");
+        }
     }
 
     #[test]

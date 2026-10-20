@@ -401,20 +401,64 @@ impl Chronicle {
     }
 
     /// 便捷追加：一次系统回答（尽力而为；未接管的管线不记录）。
+    ///
+    /// 回答会自动关联到紧邻的上一条「查询」输入（命令/导入轮不参与），
+    /// 并写入问题键，于是日志本身就能回答「同一问题前后答得是否一致」。
     pub fn append_reply(
         &mut self,
         answer: &str,
         plan: &[String],
         provenance: &[String],
     ) -> std::io::Result<u64> {
-        self.append(
-            "reply",
-            serde_json::json!({
-                "answer": answer,
-                "plan": plan,
-                "provenance": provenance,
-            }),
-        )
+        let question = self.last_query_turn().map(str::to_string);
+        self.append_reply_with_context(question.as_deref(), answer, plan, provenance, None)
+    }
+
+    /// 带问题与证明编号的回答登记（证明携带的回答入口）。
+    pub fn append_reply_with_context(
+        &mut self,
+        question: Option<&str>,
+        answer: &str,
+        plan: &[String],
+        provenance: &[String],
+        proof_id: Option<&str>,
+    ) -> std::io::Result<u64> {
+        let mut payload = serde_json::json!({
+            "answer": answer,
+            "plan": plan,
+            "provenance": provenance,
+        });
+        if let Some(question) = question.map(str::trim).filter(|question| !question.is_empty()) {
+            payload["question"] = Value::from(question);
+            payload["question_key"] = Value::from(question_key(question));
+        }
+        if let Some(proof_id) = proof_id.map(str::trim).filter(|id| !id.is_empty()) {
+            payload["proof_id"] = Value::from(proof_id);
+        }
+        self.append("reply", payload)
+    }
+
+    /// 最近一条尚未被回答的查询输入。
+    fn last_query_turn(&self) -> Option<&str> {
+        for entry in self.entries.iter().rev() {
+            match entry.kind.as_str() {
+                "reply" => return None,
+                "turn" => {
+                    let mode = entry.payload.get("mode").and_then(Value::as_str)?;
+                    if mode != "query" {
+                        return None;
+                    }
+                    return entry
+                        .payload
+                        .get("user")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|user| !user.is_empty());
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     fn write_line(&self, entry: &ChronicleEntry) -> std::io::Result<()> {
@@ -524,6 +568,54 @@ impl Chronicle {
         }
         excerpt
     }
+}
+
+/// 问题键：忽略空白/标点与句末语气词，只保留可比较的问句骨架。
+///
+/// 例：「姚明的身高是多少？」与「姚明的身高是多少呢」得到同一个键。
+pub fn question_key(question: &str) -> String {
+    normalize_log_text(question, true)
+}
+
+/// 回答键：忽略空白/标点与 ASCII 大小写，用于判断两次回答是否同一内容。
+pub fn answer_key(answer: &str) -> String {
+    normalize_log_text(answer, false)
+}
+
+fn normalize_log_text(text: &str, strip_particles: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for character in text.chars() {
+        let mapped = match character {
+            '？' | '?' | '。' | '！' | '!' | '，' | ',' | '、' | '；' | ';' | '：' | ':'
+            | '\n' | '\r' | '\t' => ' ',
+            other => other.to_ascii_lowercase(),
+        };
+        if mapped.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(mapped);
+    }
+    let mut normalized = out.trim().to_string();
+    if strip_particles {
+        loop {
+            let before = normalized.clone();
+            for suffix in ["呢", "吗", "啊", "呀", "吧", "么"] {
+                if let Some(stripped) = normalized.strip_suffix(suffix) {
+                    normalized = stripped.trim_end().to_string();
+                }
+            }
+            if normalized == before {
+                break;
+            }
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -727,6 +819,38 @@ mod tests {
         assert!(audit.is_clean());
         assert_eq!(reloaded.len(), 2);
         assert_eq!(reloaded.replay_to(1).len(), 1);
+    }
+
+    #[test]
+    fn replies_attach_question_key_only_after_query_turns() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("keys.chronicle.jsonl");
+        let path_text = path.to_string_lossy().to_string();
+        let (mut chronicle, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+        chronicle
+            .append_turn("姚明的身高是多少？", "query", None, 0)
+            .unwrap();
+        chronicle
+            .append_reply("226 厘米。", &[], &[])
+            .unwrap();
+        let reply = chronicle.entries().last().unwrap();
+        assert_eq!(
+            reply.payload.get("question").and_then(Value::as_str),
+            Some("姚明的身高是多少？")
+        );
+        assert_eq!(
+            reply.payload.get("question_key").and_then(Value::as_str),
+            Some("姚明的身高是多少")
+        );
+
+        chronicle
+            .append_turn("编年史", "command", None, 1)
+            .unwrap();
+        chronicle.append_reply("档案状态", &[], &[]).unwrap();
+        let reply = chronicle.entries().last().unwrap();
+        assert!(reply.payload.get("question").is_none(), "命令轮不进入问答一致性视图");
+        assert_eq!(question_key("  姚明的身高是多少呢？ "), "姚明的身高是多少");
+        assert_eq!(answer_key("226 厘米。"), answer_key("226 厘米"));
     }
 
     #[test]

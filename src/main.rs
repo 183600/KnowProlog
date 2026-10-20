@@ -38,6 +38,7 @@ use know_prolog::{
     grammar_extractor::GrammarExtractor,
     prolog_engine::PrologFact,
     chronicle::{Chronicle, FsyncPolicy},
+    proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
     view_render::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
         render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
@@ -2641,6 +2642,85 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 证明日志：从编年史回放已具体化的证明凭证（稳定 id，可再叙述）
+        if matches!(input, "证明日志" | "证明档案" | "证明记录") {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let projection = JournalProjection::from_chronicle(chronicle);
+                    if projection.proofs.is_empty() {
+                        println!(
+                            "证明日志为空。先用「证明图：<目标>」生成证明，凭证会写入编年史。"
+                        );
+                    } else {
+                        println!(
+                            "证明日志：{} 条凭证（按写入顺序；id 只依赖规范逻辑形式）：",
+                            projection.proofs.len()
+                        );
+                        for proof in projection.proofs.iter().rev().take(10).rev() {
+                            let confidence = proof
+                                .confidence
+                                .map(|value| format!("，置信度 {:.2}", value))
+                                .unwrap_or_else(|| "，无置信度".to_string());
+                            let truncation = if proof.truncated {
+                                format!("，已折叠 {} 步", proof.omitted_nodes)
+                            } else {
+                                String::new()
+                            };
+                            println!(
+                                "  {}  {}（{} 步{}）{}",
+                                proof.id,
+                                proof.goal,
+                                proof.step_count,
+                                confidence,
+                                truncation
+                            );
+                        }
+                        println!("用法：证明编号：<id> 回放叙述。");
+                    }
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 按 id 回放证明叙述（Brief/Normal/Deep 由内容自适应：默认 Deep）
+        if let Some(id) = strip_any_prefix(
+            input,
+            &["证明编号：", "证明编号:", "证明编号 "],
+        ) {
+            let id = id.trim();
+            match chronicle.as_ref() {
+                Some(chronicle) if !id.is_empty() => {
+                    let projection = JournalProjection::from_chronicle(chronicle);
+                    match projection.find_proof(id) {
+                        Some(proof) => println!("{}", proof.narrate(ProofDetail::Deep)),
+                        None => println!("证明日志中没有 id 为「{}」的凭证。", id),
+                    }
+                }
+                Some(_) => println!("用法：证明编号：<id>，例如：证明编号：proof:0123456789abcdef"),
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 日志推导的一致性：同题异答 / 知识版本变更 / 过期回答 / 未答问题
+        if matches!(
+            input,
+            "一致性" | "回答一致性" | "改口检查" | "改口" | "日志视图"
+        ) {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let projection = JournalProjection::from_chronicle(chronicle);
+                    println!("{}", projection.consistency(chronicle.kb_revision()).render());
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
         // 证明图：把归结证明树渲染成 Mermaid/ASCII（看得见的推理）
         if let Some(target) = strip_any_prefix(
             input,
@@ -2663,6 +2743,13 @@ async fn run_interactive_mode(
                             println!(
                                 "未得证：深度上限 {} 内无归结反驳（开世界假设：推不出 ≠ 为假）。",
                                 view.max_depth
+                            );
+                        }
+                        let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
+                        if let Some(chronicle) = chronicle.as_mut() {
+                            let _ = know_prolog::proof_journal::record_proofs(
+                                chronicle,
+                                &certificates,
                             );
                         }
                         for (index, solution) in view.solutions.iter().enumerate() {
@@ -2689,6 +2776,12 @@ async fn run_interactive_mode(
                             println!("```mermaid");
                             println!("{}", render_proof_mermaid(&solution.proofs));
                             println!("```");
+                            if let Some(certificate) = certificates.get(index) {
+                                println!(
+                                    "证明编号：{}（已写入证明日志；用「证明编号：{}」回放）",
+                                    certificate.id, certificate.id
+                                );
+                            }
                         }
                     }
                     None => println!(
@@ -3244,6 +3337,22 @@ async fn run_interactive_mode(
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.resolution_proof_report(target));
+                if let Some(view) = symbolic_reasoner.resolution_proof_view(target) {
+                    let certificates =
+                        ProofCertificate::from_view(&view, ProofLimits::default());
+                    if let Some(chronicle) = chronicle.as_mut() {
+                        let _ = know_prolog::proof_journal::record_proofs(
+                            chronicle,
+                            &certificates,
+                        );
+                    }
+                    if let Some(certificate) = certificates.first() {
+                        println!(
+                            "证明编号：{}（已写入证明日志；用「证明编号：{}」回放）",
+                            certificate.id, certificate.id
+                        );
+                    }
+                }
             }
             println!();
             continue;
@@ -3260,6 +3369,22 @@ async fn run_interactive_mode(
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.resolution_query_report(target));
+                if let Some(view) = symbolic_reasoner.resolution_proof_view(target) {
+                    let certificates =
+                        ProofCertificate::from_view(&view, ProofLimits::default());
+                    if let Some(chronicle) = chronicle.as_mut() {
+                        let _ = know_prolog::proof_journal::record_proofs(
+                            chronicle,
+                            &certificates,
+                        );
+                    }
+                    if let Some(certificate) = certificates.first() {
+                        println!(
+                            "证明编号：{}（已写入证明日志；用「证明编号：{}」回放）",
+                            certificate.id, certificate.id
+                        );
+                    }
+                }
             }
             println!();
             continue;
@@ -5576,6 +5701,8 @@ fn interactive_help() -> String {
         "",
         "证明与视图",
         "  证明图：<目标> / 知识子图：<实体>     证明树 / 邻域子图",
+        "  证明日志 / 证明编号：<id>             回放带稳定 id 的证明凭证",
+        "  一致性 / 改口检查                     同题异答、过期回答与未答问题",
         "  时间线 / 编年史 / 回放 <N>            对话编年史审计与重建",
         "  相似实体：<实体> / 介绍：<实体>       相似度排序与生成式介绍",
         "",
@@ -5870,6 +5997,15 @@ fn is_command_like(input: &str) -> bool {
         "证明图",
         "证明树",
         "画证明",
+        "证明日志",
+        "证明档案",
+        "证明记录",
+        "证明编号",
+        "一致性",
+        "回答一致性",
+        "改口检查",
+        "改口",
+        "日志视图",
         "知识子图",
         "子图",
         "邻域",

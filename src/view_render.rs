@@ -39,7 +39,11 @@ pub enum ViewProofSource {
 /// 证明树节点：标签 + 来源 + 置信度 + 子证明。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProofViewNode {
+    /// 展示用标签（可以是自然语言）。
     pub label: String,
+    /// 规范逻辑形式（`Atom::display()`）：证明日志的稳定身份只依赖该字段，
+    /// 不受展示措辞变化影响。
+    pub canonical: String,
     pub source: ViewProofSource,
     pub confidence: f64,
     pub children: Vec<ProofViewNode>,
@@ -56,6 +60,7 @@ impl ProofViewNode {
         fn build(node: &ProofNode, render: &dyn Fn(&ProofNode) -> String) -> ProofViewNode {
             ProofViewNode {
                 label: render(node),
+                canonical: node.atom.display(),
                 source: match &node.source {
                     ProofSource::Fact => ViewProofSource::Fact,
                     ProofSource::Rule { source } => ViewProofSource::Rule(source.clone()),
@@ -944,6 +949,7 @@ mod tests {
     fn leaf(label: &str) -> ProofViewNode {
         ProofViewNode {
             label: label.to_string(),
+            canonical: label.to_string(),
             source: ViewProofSource::Fact,
             confidence: 1.0,
             children: Vec::new(),
@@ -953,12 +959,14 @@ mod tests {
     fn sample_forest() -> Vec<ProofViewNode> {
         vec![ProofViewNode {
             label: "师祖(张三, 王五)".to_string(),
+            canonical: "师祖(张三, 王五)".to_string(),
             source: ViewProofSource::Rule("链接预测规则 师傅∘师傅".to_string()),
             confidence: 0.81,
             children: vec![
                 leaf("师傅(张三, 李四)"),
                 ProofViewNode {
                     label: "师傅(李四, 王五)".to_string(),
+                    canonical: "师傅(李四, 王五)".to_string(),
                     source: ViewProofSource::Rule("用户规则".to_string()),
                     confidence: 0.9,
                     children: vec![leaf("师傅(李四, 王五)")],
@@ -1002,6 +1010,7 @@ mod tests {
     fn proof_mermaid_escapes_quotes_and_newlines() {
         let forest = vec![ProofViewNode {
             label: "带\"引号\"\n与换行".to_string(),
+            canonical: "带引号与换行".to_string(),
             source: ViewProofSource::Fact,
             confidence: 1.0,
             children: Vec::new(),

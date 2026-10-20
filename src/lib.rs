@@ -65,6 +65,7 @@ pub mod artifact_audit;
 pub mod import_journal;
 pub mod grammar_extractor;
 pub mod chronicle;
+pub mod proof_journal;
 pub mod view_render;
 pub mod embedding_eval;
 pub mod function_words;
