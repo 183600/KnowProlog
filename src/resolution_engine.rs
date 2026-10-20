@@ -409,6 +409,8 @@ struct SearchTrace {
     stats: SearchStats,
     truncations: BTreeSet<TruncationCause>,
     frontier: BTreeSet<FailureFrontier>,
+    /// 因容量上限未保留的唯一条目（重复命中只计一次）。
+    omitted_frontier: BTreeSet<FailureFrontier>,
 }
 
 impl SearchTrace {
@@ -426,7 +428,7 @@ impl SearchTrace {
             return;
         }
         if self.frontier.len() >= MAX_FRONTIER_ENTRIES {
-            self.stats.frontier_omitted += 1;
+            self.omitted_frontier.insert(entry);
             return;
         }
         self.frontier.insert(entry);
@@ -434,6 +436,7 @@ impl SearchTrace {
 
     fn finish(mut self) -> (SearchStats, Vec<TruncationCause>, Vec<FailureFrontier>) {
         self.stats.frontier_entries = self.frontier.len();
+        self.stats.frontier_omitted = self.omitted_frontier.len();
         (
             self.stats,
             self.truncations.into_iter().collect(),
@@ -1792,5 +1795,30 @@ mod tests {
         assert_eq!(first.stats.goal_attempts, second.stats.goal_attempts);
         assert!(first.stats.goal_attempts > 0);
         assert!(first.stats.fact_checks > 0);
+    }
+
+    #[test]
+    fn frontier_omitted_counts_unique_entries_only() {
+        let mut trace = SearchTrace::default();
+        for index in 0..=MAX_FRONTIER_ENTRIES {
+            let atom = Atom::rel(
+                "父母",
+                &format!("主体{}", index),
+                &format!("客体{}", index),
+            );
+            trace.frontier(&atom, 1, FrontierReason::MissingFactOrRule);
+        }
+        // 超出容量的同一条缺口被再次命中：不能重复计数。
+        let overflow = Atom::rel(
+            "父母",
+            &format!("主体{}", MAX_FRONTIER_ENTRIES),
+            &format!("客体{}", MAX_FRONTIER_ENTRIES),
+        );
+        trace.frontier(&overflow, 1, FrontierReason::MissingFactOrRule);
+        trace.frontier(&overflow, 1, FrontierReason::MissingFactOrRule);
+        let (stats, _, frontier) = trace.finish();
+        assert_eq!(frontier.len(), MAX_FRONTIER_ENTRIES);
+        assert_eq!(stats.frontier_entries, MAX_FRONTIER_ENTRIES);
+        assert_eq!(stats.frontier_omitted, 1);
     }
 }
