@@ -61,7 +61,7 @@ use know_prolog::{
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
     },
-    path_memory::{EdgeSource, TraversalGraph, TraversalOptions},
+    path_memory::{EdgeSource, PathPredicate, TraversalGraph, TraversalOptions},
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
@@ -225,14 +225,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Enumerate provenance-preserving paths between two entities (read-only)
+    /// Enumerate provenance-preserving paths between two entities, along a
+    /// predicate chain, or across a shared neighbour (read-only)
     Paths {
         /// Start entity (exact name as stored)
         #[arg(long)]
         from: String,
-        /// Goal entity (exact name as stored)
-        #[arg(long)]
-        to: String,
+        /// Goal entity (exact name as stored); required unless --via or
+        /// --common-with is given
+        #[arg(long, required_unless_present_any = ["via", "common_with"])]
+        to: Option<String>,
+        /// Follow a predicate chain from --from (repeatable), e.g.
+        /// --via 师傅 --via 师傅
+        #[arg(long = "via", value_name = "PREDICATE", conflicts_with_all = ["to", "common_with"])]
+        via: Vec<String>,
+        /// Find entities both --from and this entity point to
+        #[arg(long = "common-with", value_name = "ENTITY", conflicts_with_all = ["to", "via"])]
+        common_with: Option<String>,
         /// Maximum number of hops
         #[arg(long, default_value_t = 4)]
         max_hops: usize,
@@ -744,6 +753,8 @@ async fn main() {
         Some(Commands::Paths {
             from,
             to,
+            via,
+            common_with,
             max_hops,
             max_paths,
             json,
@@ -785,7 +796,24 @@ async fn main() {
                 max_paths: max_paths.clamp(1, 64),
                 ..TraversalOptions::default()
             };
-            let bundle = graph.enumerate_between(&from, &to, &options);
+            let bundle = if let Some(right) = common_with.as_deref() {
+                graph.common_neighbors(&from, right, &options)
+            } else if !via.is_empty() {
+                let chain: Vec<PathPredicate> = via
+                    .iter()
+                    .map(|predicate| PathPredicate::forward(predicate.trim()))
+                    .collect();
+                let chain_options = TraversalOptions {
+                    max_depth: chain.len().clamp(1, 8),
+                    ..options.clone()
+                };
+                graph.enumerate_chain(&from, &chain, &chain_options)
+            } else if let Some(goal) = to.as_deref() {
+                graph.enumerate_between(&from, goal, &options)
+            } else {
+                eprintln!("请提供 --to、--via 或 --common-with 之一。");
+                std::process::exit(2);
+            };
             if json {
                 match serde_json::to_string_pretty(&bundle) {
                     Ok(text) => println!("{}", text),
@@ -6345,7 +6373,7 @@ fn interactive_help() -> String {
         "  如果…那么… / 假设：…                 反事实推演（推演后自动回滚）",
         "  默认推理：<陈述> / 概率推理：…       非单调常识与加权可能世界",
         "  规则：<如果X的P是Y，那么X的Q是Y>    教一条 Horn 规则（占位符自动变量化）",
-        "  记住：<事实> / 忘记：<事实>          会话事实断言与撤回",
+        "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
         "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
         "",
@@ -7847,6 +7875,84 @@ mod session_tests {
         );
         assert_eq!(parse_correction_spec("姚明的身高是229"), None);
         assert_eq!(parse_correction_spec("姚明|height|226"), None);
+    }
+
+    #[test]
+    fn paths_cli_supports_between_chain_and_common_modes() {
+        let between = Cli::try_parse_from([
+            "knowprolog",
+            "paths",
+            "--from",
+            "张三",
+            "--to",
+            "王五",
+            "--max-hops",
+            "3",
+        ])
+        .expect("两点路径参数应可解析");
+        match between.command {
+            Some(Commands::Paths {
+                to,
+                via,
+                common_with,
+                max_hops,
+                ..
+            }) => {
+                assert_eq!(to.as_deref(), Some("王五"));
+                assert!(via.is_empty());
+                assert!(common_with.is_none());
+                assert_eq!(max_hops, 3);
+            }
+            _ => panic!("应解析为 Paths 子命令"),
+        }
+
+        let chain = Cli::try_parse_from([
+            "knowprolog",
+            "paths",
+            "--from",
+            "张三",
+            "--via",
+            "师傅",
+            "--via",
+            "师傅",
+        ])
+        .expect("谓词链参数应可解析");
+        match chain.command {
+            Some(Commands::Paths { to, via, .. }) => {
+                assert!(to.is_none());
+                assert_eq!(via, vec!["师傅".to_string(), "师傅".to_string()]);
+            }
+            _ => panic!("应解析为 Paths 子命令"),
+        }
+
+        let common = Cli::try_parse_from([
+            "knowprolog",
+            "paths",
+            "--from",
+            "张三",
+            "--common-with",
+            "李四",
+        ])
+        .expect("共同邻居参数应可解析");
+        match common.command {
+            Some(Commands::Paths { common_with, .. }) => {
+                assert_eq!(common_with.as_deref(), Some("李四"));
+            }
+            _ => panic!("应解析为 Paths 子命令"),
+        }
+
+        assert!(Cli::try_parse_from(["knowprolog", "paths", "--from", "张三"]).is_err());
+        assert!(Cli::try_parse_from([
+            "knowprolog",
+            "paths",
+            "--from",
+            "张三",
+            "--to",
+            "王五",
+            "--via",
+            "师傅",
+        ])
+        .is_err());
     }
 
     #[test]

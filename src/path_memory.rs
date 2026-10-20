@@ -72,12 +72,31 @@ pub struct PathStep {
 }
 
 impl PathStep {
-    pub fn render(&self) -> String {
+    pub fn display_predicate(&self) -> String {
+        let mut notes = Vec::new();
         if self.inverted {
-            format!("{} --{}(逆向)--> {}", self.from, self.predicate, self.to)
-        } else {
-            format!("{} --{}--> {}", self.from, self.predicate, self.to)
+            notes.push("逆向".to_string());
         }
+        if self.source != EdgeSource::Observed {
+            notes.push(self.source.label().to_string());
+        }
+        if self.confidence_bps < 10_000 {
+            notes.push(format!("置信度 {:.0}%", self.confidence_bps as f64 / 100.0));
+        }
+        if notes.is_empty() {
+            self.predicate.clone()
+        } else {
+            format!("{}({})", self.predicate, notes.join("，"))
+        }
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "{} --{}--> {}",
+            self.from,
+            self.display_predicate(),
+            self.to
+        )
     }
 }
 
@@ -118,11 +137,7 @@ impl PathWitness {
         };
         let mut output = first.from.clone();
         for step in &self.steps {
-            if step.inverted {
-                output.push_str(&format!(" --{}(逆向)--> {}", step.predicate, step.to));
-            } else {
-                output.push_str(&format!(" --{}--> {}", step.predicate, step.to));
-            }
+            output.push_str(&format!(" --{}--> {}", step.display_predicate(), step.to));
         }
         output
     }
@@ -167,6 +182,20 @@ pub enum BlockReason {
         from: String,
         predicate: String,
     },
+    SourceNotAllowed {
+        from: String,
+        predicate: String,
+        source: EdgeSource,
+    },
+    LowConfidence {
+        from: String,
+        predicate: String,
+        confidence_bps: u16,
+        minimum_bps: u16,
+    },
+    ForbiddenNode {
+        node: String,
+    },
     ExpectedTypeMismatch {
         node: String,
         expected: String,
@@ -188,6 +217,31 @@ impl BlockReason {
             } => format!("「{}」到「{}」的「{}」边被否定记录阻断", from, to, predicate),
             BlockReason::PredicateNotAllowed { from, predicate } => {
                 format!("「{}」的「{}」边不在允许的谓词范围内", from, predicate)
+            }
+            BlockReason::SourceNotAllowed {
+                from,
+                predicate,
+                source,
+            } => format!(
+                "「{}」的「{}」边来源为「{}」，不在允许范围内",
+                from,
+                predicate,
+                source.label()
+            ),
+            BlockReason::LowConfidence {
+                from,
+                predicate,
+                confidence_bps,
+                minimum_bps,
+            } => format!(
+                "「{}」的「{}」边置信度 {:.0}% 低于下限 {:.0}%",
+                from,
+                predicate,
+                *confidence_bps as f64 / 100.0,
+                *minimum_bps as f64 / 100.0
+            ),
+            BlockReason::ForbiddenNode { node } => {
+                format!("「{}」被约束排除，不能作为路径节点", node)
             }
             BlockReason::ExpectedTypeMismatch { node, expected } => {
                 format!("「{}」的类型与期望的「{}」不符", node, expected)
@@ -211,7 +265,7 @@ impl BlockedPath {
         }
         let mut path = self.prefix[0].from.clone();
         for step in &self.prefix {
-            path.push_str(&format!(" --{}--> {}", step.predicate, step.to));
+            path.push_str(&format!(" --{}--> {}", step.display_predicate(), step.to));
         }
         format!("{}；在「{}」处{}", path, self.at, self.reason.render())
     }
@@ -323,8 +377,10 @@ pub struct TraversalOptions {
     pub max_expansions: usize,
     pub beam_width: usize,
     pub allowed_predicates: Option<BTreeSet<String>>,
+    pub allowed_sources: Option<BTreeSet<EdgeSource>>,
     pub forbidden_nodes: BTreeSet<String>,
     pub expected_end_types: BTreeSet<String>,
+    pub min_confidence_bps: u16,
     pub include_inferred: bool,
 }
 
@@ -336,8 +392,10 @@ impl Default for TraversalOptions {
             max_expansions: DEFAULT_MAX_EXPANSIONS,
             beam_width: DEFAULT_BEAM_WIDTH,
             allowed_predicates: None,
+            allowed_sources: None,
             forbidden_nodes: BTreeSet::new(),
             expected_end_types: BTreeSet::new(),
+            min_confidence_bps: 0,
             include_inferred: true,
         }
     }
@@ -461,19 +519,69 @@ impl TraversalGraph {
         }
     }
 
-    fn step_allowed(&self, step: &PathStep, options: &TraversalOptions) -> bool {
-        if !options.include_inferred && step.source == EdgeSource::Inferred {
-            return false;
-        }
-        if options.forbidden_nodes.contains(&step.to) {
-            return false;
-        }
+    fn step_is_negated(&self, step: &PathStep) -> bool {
+        let key = if step.inverted {
+            (step.to.clone(), step.predicate.clone(), step.from.clone())
+        } else {
+            (step.from.clone(), step.predicate.clone(), step.to.clone())
+        };
+        self.negative_edges.contains(&key)
+    }
+
+    fn step_block_reason(
+        &self,
+        step: &PathStep,
+        options: &TraversalOptions,
+    ) -> Option<BlockReason> {
         if let Some(allowed) = &options.allowed_predicates {
             if !allowed.contains(&step.predicate) {
-                return false;
+                return Some(BlockReason::PredicateNotAllowed {
+                    from: step.from.clone(),
+                    predicate: step.predicate.clone(),
+                });
             }
         }
-        true
+        if let Some(allowed) = &options.allowed_sources {
+            if !allowed.contains(&step.source) {
+                return Some(BlockReason::SourceNotAllowed {
+                    from: step.from.clone(),
+                    predicate: step.predicate.clone(),
+                    source: step.source,
+                });
+            }
+        }
+        if !options.include_inferred && step.source == EdgeSource::Inferred {
+            return Some(BlockReason::SourceNotAllowed {
+                from: step.from.clone(),
+                predicate: step.predicate.clone(),
+                source: step.source,
+            });
+        }
+        if step.confidence_bps < options.min_confidence_bps {
+            return Some(BlockReason::LowConfidence {
+                from: step.from.clone(),
+                predicate: step.predicate.clone(),
+                confidence_bps: step.confidence_bps,
+                minimum_bps: options.min_confidence_bps,
+            });
+        }
+        if options.forbidden_nodes.contains(&step.to) {
+            return Some(BlockReason::ForbiddenNode {
+                node: step.to.clone(),
+            });
+        }
+        if self.step_is_negated(step) {
+            return Some(BlockReason::NegatedEdge {
+                from: step.from.clone(),
+                predicate: step.predicate.clone(),
+                to: step.to.clone(),
+            });
+        }
+        None
+    }
+
+    fn step_allowed(&self, step: &PathStep, options: &TraversalOptions) -> bool {
+        self.step_block_reason(step, options).is_none()
     }
 
     fn outgoing(&self, node: &str, link: &PathPredicate) -> Vec<PathStep> {
@@ -546,22 +654,10 @@ impl TraversalGraph {
         let mut has_allowed_edge = false;
         let candidates = self.outgoing(node, link);
         for candidate in &candidates {
-            if options.forbidden_nodes.contains(&candidate.to) {
-                continue;
+            match self.step_block_reason(candidate, options) {
+                Some(reason) => reasons.push(reason),
+                None => has_allowed_edge = true,
             }
-            if let Some(allowed) = &options.allowed_predicates {
-                if !allowed.contains(&candidate.predicate) {
-                    reasons.push(BlockReason::PredicateNotAllowed {
-                        from: node.to_string(),
-                        predicate: candidate.predicate.clone(),
-                    });
-                    continue;
-                }
-            }
-            if !options.include_inferred && candidate.source == EdgeSource::Inferred {
-                continue;
-            }
-            has_allowed_edge = true;
         }
         if !link.inverted {
             for (subject, predicate, object) in &self.negative_edges {
@@ -605,20 +701,30 @@ impl TraversalGraph {
             .any(|entity_type| options.expected_end_types.contains(entity_type))
     }
 
-    fn push_blocked(&self, bundle: &mut PathBundle, prefix: &[PathStep], reason: BlockReason) {
+    fn push_blocked_at(
+        &self,
+        bundle: &mut PathBundle,
+        prefix: &[PathStep],
+        at: String,
+        reason: BlockReason,
+    ) {
         if bundle.blocked.len() >= MAX_BLOCKED_RECORDS {
             bundle.truncated = true;
             return;
         }
-        let at = prefix
-            .last()
-            .map(|step| step.to.clone())
-            .unwrap_or_else(|| bundle.start.clone());
         bundle.blocked.push(BlockedPath {
             prefix: prefix.to_vec(),
             at,
             reason,
         });
+    }
+
+    fn push_blocked(&self, bundle: &mut PathBundle, prefix: &[PathStep], reason: BlockReason) {
+        let at = prefix
+            .last()
+            .map(|step| step.to.clone())
+            .unwrap_or_else(|| bundle.start.clone());
+        self.push_blocked_at(bundle, prefix, at, reason);
     }
 
     pub fn enumerate_chain(
@@ -641,9 +747,16 @@ impl TraversalGraph {
             });
             return bundle;
         }
-        if chain.is_empty() {
+        if chain.is_empty() || options.max_depth == 0 {
             return bundle;
         }
+        let depth = chain.len().min(options.max_depth);
+        let chain = if depth < chain.len() {
+            bundle.truncated = true;
+            &chain[..depth]
+        } else {
+            chain
+        };
 
         let mut frontier: Vec<Vec<PathStep>> = vec![Vec::new()];
         let mut expansions = 0usize;
@@ -829,7 +942,8 @@ impl TraversalGraph {
                         break;
                     }
                     for candidate in self.outgoing_all(&partial.node) {
-                        if !self.step_allowed(&candidate, options) {
+                        if let Some(reason) = self.step_block_reason(&candidate, options) {
+                            self.push_blocked(&mut bundle, &partial.steps, reason);
                             continue;
                         }
                         if expansions >= options.max_expansions {
@@ -1006,16 +1120,20 @@ impl TraversalGraph {
             return bundle;
         }
 
-        let left_steps: Vec<PathStep> = self
-            .outgoing_all(left)
-            .into_iter()
-            .filter(|step| self.step_allowed(step, options))
-            .collect();
-        let right_steps: Vec<PathStep> = self
-            .outgoing_all(right)
-            .into_iter()
-            .filter(|step| self.step_allowed(step, options))
-            .collect();
+        let mut left_steps: Vec<PathStep> = Vec::new();
+        for step in self.outgoing_all(left) {
+            match self.step_block_reason(&step, options) {
+                Some(reason) => self.push_blocked(&mut bundle, &[], reason),
+                None => left_steps.push(step),
+            }
+        }
+        let mut right_steps: Vec<PathStep> = Vec::new();
+        for step in self.outgoing_all(right) {
+            match self.step_block_reason(&step, options) {
+                Some(reason) => self.push_blocked_at(&mut bundle, &[], right.to_string(), reason),
+                None => right_steps.push(step),
+            }
+        }
 
         let mut reverse_right: BTreeMap<String, Vec<PathStep>> = BTreeMap::new();
         for step in &right_steps {
@@ -1066,6 +1184,7 @@ impl TraversalGraph {
             bundle.witnesses.truncate(options.max_paths.max(1));
             bundle.truncated = true;
         }
+        dedupe_blocked(&mut bundle);
         bundle
     }
 }
@@ -1225,6 +1344,124 @@ mod tests {
     }
 
     #[test]
+    fn negated_edge_is_not_traversed_even_if_positive_exists() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge("张三", "师傅", "李四");
+        graph.add_edge("张三", "师傅", "王五");
+        graph.add_negative_edge("张三", "师傅", "王五");
+        let bundle = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions::default(),
+        );
+        assert_eq!(bundle.witnesses.len(), 1);
+        assert_eq!(bundle.witnesses[0].end(), Some("李四"));
+        assert!(bundle
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::NegatedEdge { .. })));
+    }
+
+    #[test]
+    fn between_routes_around_negated_edge() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge("甲", "认识", "乙");
+        graph.add_edge("乙", "认识", "丁");
+        graph.add_edge("甲", "认识", "丙");
+        graph.add_edge("丙", "认识", "丁");
+        graph.add_negative_edge("乙", "认识", "丁");
+        let bundle = graph.enumerate_between(
+            "甲",
+            "丁",
+            &TraversalOptions {
+                max_depth: 3,
+                max_paths: 8,
+                ..TraversalOptions::default()
+            },
+        );
+        assert_eq!(bundle.witnesses.len(), 1);
+        assert!(bundle.witnesses[0].steps.iter().all(|step| step.to != "乙"));
+        assert!(bundle
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::NegatedEdge { .. })));
+    }
+
+    #[test]
+    fn confidence_and_source_constraints_filter_edges() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge_record(
+            PathEdge::new("张三", "师傅", "李四")
+                .with_source(EdgeSource::Custom)
+                .with_confidence_bps(5_000),
+        );
+        let low_confidence = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions {
+                min_confidence_bps: 8_000,
+                ..TraversalOptions::default()
+            },
+        );
+        assert!(low_confidence.witnesses.is_empty());
+        assert!(low_confidence
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::LowConfidence { .. })));
+
+        let source_filtered = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions {
+                allowed_sources: Some(BTreeSet::from([EdgeSource::Observed])),
+                ..TraversalOptions::default()
+            },
+        );
+        assert!(source_filtered.witnesses.is_empty());
+        assert!(source_filtered
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::SourceNotAllowed { .. })));
+    }
+
+    #[test]
+    fn expected_end_type_prunes_terminal_values() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge("张三", "师傅", "李四");
+        graph.add_edge("张三", "师傅", "某公司");
+        graph.add_entity_type("李四", "Person");
+        graph.add_entity_type("某公司", "Organization");
+        let bundle = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions {
+                expected_end_types: BTreeSet::from(["Person".to_string()]),
+                ..TraversalOptions::default()
+            },
+        );
+        assert_eq!(bundle.witnesses.len(), 1);
+        assert_eq!(bundle.witnesses[0].end(), Some("李四"));
+        assert!(bundle
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::ExpectedTypeMismatch { .. })));
+    }
+
+    #[test]
+    fn common_neighbors_skip_negated_hub() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge("张三", "认识", "王五");
+        graph.add_edge("李四", "认识", "王五");
+        graph.add_negative_edge("张三", "认识", "王五");
+        let bundle = graph.common_neighbors("张三", "李四", &TraversalOptions::default());
+        assert!(bundle.witnesses.is_empty());
+        assert!(bundle
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::NegatedEdge { .. })));
+    }
+
+    #[test]
     fn inverted_link_walks_against_edge_direction() {
         let mut graph = TraversalGraph::new();
         graph.add_edge("李四", "师傅", "张三");
@@ -1311,6 +1548,23 @@ mod tests {
             .blocked
             .iter()
             .any(|blocked| matches!(blocked.reason, BlockReason::PredicateNotAllowed { .. })));
+    }
+
+    #[test]
+    fn witness_render_marks_session_source_and_low_confidence() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge_record(
+            PathEdge::new("张三", "师傅", "李四")
+                .with_source(EdgeSource::Session)
+                .with_confidence_bps(8_500),
+        );
+        let bundle = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions::default(),
+        );
+        let text = bundle.witnesses[0].render();
+        assert!(text.contains("师傅(会话，置信度 85%)"), "实际：{}", text);
     }
 
     #[test]

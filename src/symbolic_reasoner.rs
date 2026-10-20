@@ -264,6 +264,9 @@ pub struct DialogueSnapshot {
     // 跨会话临时信念：被采纳的假设事实（会话级，不写知识图谱）
     #[serde(default)]
     pub session_facts: Vec<SnapshotAtom>,
+    // 跨会话否定事实：路径遍历中作为阻断边（会话级，不写知识图谱）
+    #[serde(default)]
+    pub session_negative_facts: Vec<SnapshotAtom>,
     // 用户用中文教过的概率知识原句（会话级，跨会话持久化后自动重放）
     #[serde(default)]
     pub lessons: Vec<String>,
@@ -479,6 +482,7 @@ impl DialogueContext {
             history: self.history.clone(),
             generation: self.generation.clone(),
             session_facts: Vec::new(),
+            session_negative_facts: Vec::new(),
             lessons: Vec::new(),
             session_clauses: Vec::new(),
             contrast: None,
@@ -681,6 +685,8 @@ pub struct SymbolicReasoner {
     frames: FrameMemory,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
     session_facts: Vec<Atom>,
+    // 会话级否定事实：路径遍历中的阻断边（不写知识图谱，可跨会话持久化）
+    session_negative_facts: Vec<Atom>,
     // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
     session_clauses: Vec<Clause>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）
@@ -751,6 +757,7 @@ impl Clone for SymbolicReasoner {
             abduction: self.abduction.clone(),
             frames: self.frames.clone(),
             session_facts: self.session_facts.clone(),
+            session_negative_facts: self.session_negative_facts.clone(),
             session_clauses: self.session_clauses.clone(),
             clarification: self.clarification.clone(),
             last_abduction_goal: self.last_abduction_goal.clone(),
@@ -906,6 +913,7 @@ impl SymbolicReasoner {
             abduction,
             frames: FrameMemory::new(),
             session_facts: Vec::new(),
+            session_negative_facts: Vec::new(),
             session_clauses: Vec::new(),
             clarification: None,
             last_abduction_goal: None,
@@ -984,6 +992,7 @@ impl SymbolicReasoner {
         self.lessons_parsed.clear();
         self.frames = FrameMemory::new();
         self.session_facts.clear();
+        self.session_negative_facts.clear();
         self.session_clauses.clear();
         self.clarification = None;
         self.last_abduction_goal = None;
@@ -4212,10 +4221,28 @@ impl SymbolicReasoner {
                 }
             }
         }
+        for atom in &self.session_negative_facts {
+            if atom.terms.len() == 2 {
+                if let (Term::Const(subject), Term::Const(object)) =
+                    (&atom.terms[0], &atom.terms[1])
+                {
+                    graph.add_negative_edge(subject, &atom.predicate, object);
+                }
+            }
+        }
         for (entity, entity_type) in self.generator.typed_entities() {
             graph.add_entity_type(&entity, &entity_type);
         }
         graph
+    }
+
+    fn session_negative_blocks(&self, subject: &str, predicate: &str, object: &str) -> bool {
+        self.session_negative_facts.iter().any(|atom| {
+            &*atom.predicate == predicate
+                && atom.terms.len() == 2
+                && atom.terms[0].name() == subject
+                && atom.terms[1].name() == object
+        })
     }
 
     fn path_entity(&self, raw: &str) -> String {
@@ -4238,6 +4265,26 @@ impl SymbolicReasoner {
         }
     }
 
+    fn path_options_for_question(&self, max_depth: usize, question: &str) -> TraversalOptions {
+        let mut options = self.path_options(max_depth);
+        let keywords = Self::expected_type_keywords(question);
+        if keywords.is_empty() {
+            return options;
+        }
+        let mut expected = BTreeSet::new();
+        for (_, entity_type) in self.generator.typed_entities() {
+            let lower = entity_type.to_lowercase();
+            if keywords
+                .iter()
+                .any(|keyword| entity_type.contains(*keyword) || lower.contains(*keyword))
+            {
+                expected.insert(entity_type);
+            }
+        }
+        options.expected_end_types = expected;
+        options
+    }
+
     fn answer_chain_with_paths(
         &self,
         entity: &str,
@@ -4255,9 +4302,17 @@ impl SymbolicReasoner {
                 inverted: predicate.inverted,
             })
             .collect();
-        let options = self.path_options(predicates.len());
+        let options = self.path_options_for_question(predicates.len(), question);
         let bundle = graph.enumerate_chain(entity, &chain, &options);
         if bundle.witnesses.is_empty() {
+            if bundle.blocked.iter().any(|blocked| {
+                matches!(
+                    blocked.reason,
+                    crate::path_memory::BlockReason::NegatedEdge { .. }
+                )
+            }) {
+                return Some(bundle.render_text());
+            }
             return None;
         }
 
@@ -4623,6 +4678,20 @@ impl SymbolicReasoner {
             inverted,
         });
 
+        if intermediate.len() == 1 {
+            let (negative_subject, negative_object) = if inverted {
+                (object.as_str(), entity.as_str())
+            } else {
+                (entity.as_str(), object.as_str())
+            };
+            if self.session_negative_blocks(negative_subject, &slot, negative_object) {
+                return Some(format!(
+                    "不是。会话中记录了否定事实：{} 的 {} 不是 {}。",
+                    entity, surface, object
+                ));
+            }
+        }
+
         // 单跳直查：逆向谓词按槽位反方向核对（triple(object, slot, entity)）
         if intermediate.len() == 1
             && (if inverted {
@@ -4635,6 +4704,66 @@ impl SymbolicReasoner {
                 "是的。根据知识图谱：{} 的 {} 是 {}。",
                 entity, surface, object
             ));
+        }
+
+        if intermediate.len() >= 2 {
+            let graph = self.traversal_graph();
+            let chain: Vec<PathPredicate> = intermediate
+                .iter()
+                .map(|predicate| PathPredicate {
+                    predicate: predicate.slot.clone(),
+                    inverted: predicate.inverted,
+                })
+                .collect();
+            let bundle =
+                graph.enumerate_chain(&entity, &chain, &self.path_options(intermediate.len()));
+            let negated_target = bundle.blocked.iter().any(|blocked| {
+                matches!(
+                    &blocked.reason,
+                    crate::path_memory::BlockReason::NegatedEdge { to, .. } if to == &object
+                )
+            });
+            if negated_target {
+                return Some(format!(
+                    "不是。会话中记录的否定事实阻断了通往 {} 的路径。",
+                    object
+                ));
+            }
+            let matched: Vec<&crate::path_memory::PathWitness> = bundle
+                .witnesses
+                .iter()
+                .filter(|witness| witness.end() == Some(object.as_str()))
+                .collect();
+            if !matched.is_empty() {
+                let chain_text = format!(
+                    "{} 的 {}",
+                    entity,
+                    intermediate
+                        .iter()
+                        .map(|predicate| predicate.surface.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" 的 ")
+                );
+                let mut output = format!("是的。根据知识图谱：{} 是 {}。\n", chain_text, object);
+                for witness in matched.iter().take(3) {
+                    output.push_str(&format!(
+                        "  路径（{} 跳）：{}\n",
+                        witness.hop_count(),
+                        witness.render()
+                    ));
+                }
+                return Some(output.trim_end().to_string());
+            }
+            if bundle.witnesses.is_empty()
+                && bundle.blocked.iter().any(|blocked| {
+                    matches!(
+                        blocked.reason,
+                        crate::path_memory::BlockReason::NegatedEdge { .. }
+                    )
+                })
+            {
+                return Some(bundle.render_text());
+            }
         }
 
         let mut chain_result = self.run_chain(&entity, &intermediate);
@@ -5890,14 +6019,92 @@ impl SymbolicReasoner {
     }
 
     /// 记住一条中文事实：解析为确定事实并加入会话归结事实集（不写知识图谱）
+    /// 解析「A 不是 B 的 P」「A 不认识 B」这类否定陈述为被阻断的正向原子。
+    fn parse_negative_atom(sentence: &str) -> Option<Atom> {
+        let sentence = sentence.trim();
+        let positive = if let Some(position) = sentence.find("不是") {
+            let mut text = String::with_capacity(sentence.len());
+            text.push_str(&sentence[..position]);
+            text.push('是');
+            text.push_str(&sentence[position + "不是".len()..]);
+            text
+        } else {
+            let (position, _) = sentence
+                .char_indices()
+                .find(|(index, character)| *index > 0 && *character == '不')?;
+            let after = &sentence[position + '不'.len_utf8()..];
+            if ![
+                "认识",
+                "喜欢",
+                "讨厌",
+                "属于",
+                "位于",
+                "出生于",
+                "隶属于",
+                "工作于",
+            ]
+            .iter()
+            .any(|verb| after.starts_with(verb))
+            {
+                return None;
+            }
+            let mut text = String::with_capacity(sentence.len());
+            text.push_str(&sentence[..position]);
+            text.push_str(after);
+            text
+        };
+        let atom = chinese_reasoning_nlu::parse_proposition(&positive)?;
+        if atom.terms.len() != 2 || !atom.is_ground() {
+            return None;
+        }
+        Some(atom)
+    }
+
+    fn assert_negative_atom(&mut self, atom: Atom) -> String {
+        self.register_atom_vocabulary(&atom);
+        let rendered = self.render_atom_nl(&atom);
+        let removed_positive = self.retract_atom(&atom);
+        let added = if self.session_negative_facts.contains(&atom) {
+            false
+        } else {
+            self.session_negative_facts.push(atom);
+            true
+        };
+        let mut output = if added {
+            format!(
+                "已记住否定事实：{}。后续多跳路径会把它作为阻断边（未写知识图谱）。",
+                rendered
+            )
+        } else {
+            format!("否定事实「{}」已经记住。", rendered)
+        };
+        if removed_positive {
+            output.push_str("已同时撤销同名会话肯定事实。");
+        }
+        output
+    }
+
+    /// 记住一条否定陈述：只作为会话级阻断边，不写知识图谱。
+    pub fn assert_negative_nl_fact(&mut self, sentence_raw: &str) -> String {
+        let sentence = sentence_raw.trim();
+        let Some(atom) = Self::parse_negative_atom(sentence) else {
+            return "没能把这句话解析为可阻断的否定事实；例如：李四不是王五的师傅".to_string();
+        };
+        self.assert_negative_atom(atom)
+    }
+
     pub fn assert_nl_fact(&mut self, sentence_raw: &str) -> String {
         let sentence = sentence_raw.trim();
         if sentence.is_empty() {
             return "请给出要记住的事实，例如：记住：张三是李四的师傅".to_string();
         }
+        if let Some(atom) = Self::parse_negative_atom(sentence) {
+            return self.assert_negative_atom(atom);
+        }
         let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
         let mut remembered: Vec<String> = Vec::new();
         let mut refused: Vec<String> = Vec::new();
+        let mut superseded_negatives: Vec<String> = Vec::new();
         for lesson in &outcome.lessons {
             if lesson.kind != LessonKind::DeterministicFact {
                 let hint = match lesson.kind {
@@ -5923,6 +6130,14 @@ impl SymbolicReasoner {
             }
             self.register_atom_vocabulary(&lesson.head);
             let rendered = self.render_atom_nl(&lesson.head);
+            if let Some(position) = self
+                .session_negative_facts
+                .iter()
+                .position(|negative| negative == &lesson.head)
+            {
+                self.session_negative_facts.remove(position);
+                superseded_negatives.push(rendered.clone());
+            }
             if self.adopt_atom(lesson.head.clone()) {
                 remembered.push(rendered);
             } else {
@@ -5944,6 +6159,11 @@ impl SymbolicReasoner {
         for reason in &refused {
             output.push_str(&format!("  跳过：{}\n", reason));
         }
+        if !superseded_negatives.is_empty() {
+            output.push_str("已撤销同名会话否定事实：");
+            output.push_str(&superseded_negatives.join("；"));
+            output.push_str("。\n");
+        }
         for error in &outcome.errors {
             output.push_str(&format!("  未解析：{}\n", error));
         }
@@ -5960,6 +6180,18 @@ impl SymbolicReasoner {
         if sentence.is_empty() {
             return "请给出要忘记的事实，例如：忘记：张三是李四的师傅".to_string();
         }
+        if let Some(atom) = Self::parse_negative_atom(sentence) {
+            let rendered = self.render_atom_nl(&atom);
+            if let Some(position) = self
+                .session_negative_facts
+                .iter()
+                .position(|existing| existing == &atom)
+            {
+                self.session_negative_facts.remove(position);
+                return format!("已撤销否定事实：{}。", rendered);
+            }
+            return format!("否定事实中没有「{}」。", rendered);
+        }
         let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
         let mut removed: Vec<String> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
@@ -5968,7 +6200,13 @@ impl SymbolicReasoner {
                 continue;
             }
             let rendered = self.render_atom_nl(&lesson.head);
-            if self.retract_atom(&lesson.head) {
+            let removed_negative = self
+                .session_negative_facts
+                .iter()
+                .position(|negative| negative == &lesson.head)
+                .map(|position| self.session_negative_facts.remove(position))
+                .is_some();
+            if self.retract_atom(&lesson.head) || removed_negative {
                 removed.push(rendered);
             } else {
                 missing.push(rendered);
@@ -6023,6 +6261,15 @@ impl SymbolicReasoner {
         } else {
             output.push_str("  会话事实（未写知识图谱）：");
             for (index, atom) in self.session_facts.iter().enumerate() {
+                if index > 0 {
+                    output.push('；');
+                }
+                output.push_str(&self.render_atom_nl(atom));
+            }
+        }
+        if !self.session_negative_facts.is_empty() {
+            output.push_str("\n  会话否定事实（多跳路径阻断边）：");
+            for (index, atom) in self.session_negative_facts.iter().enumerate() {
                 if index > 0 {
                     output.push('；');
                 }
@@ -6660,11 +6907,16 @@ impl SymbolicReasoner {
                 format!("「{}」（已讲 {} 句，{}）", state.entity, state.shown, order)
             })
             .unwrap_or_else(|| "（无）".to_string());
-        let session_info = if self.session_facts.is_empty() {
-            "（无）".to_string()
-        } else {
-            format!("{} 条", self.session_facts.len())
-        };
+        let session_info =
+            if self.session_facts.is_empty() && self.session_negative_facts.is_empty() {
+                "（无）".to_string()
+            } else {
+                format!(
+                    "{} 条，会话否定 {} 条",
+                    self.session_facts.len(),
+                    self.session_negative_facts.len()
+                )
+            };
         let clarify = self
             .clarification_progress()
             .map(|progress| format!("进行中（{}）", progress))
@@ -6715,6 +6967,19 @@ impl SymbolicReasoner {
         let mut snapshot = self.context.snapshot();
         snapshot.session_facts = self
             .session_facts
+            .iter()
+            .filter(|atom| atom.is_ground())
+            .map(|atom| SnapshotAtom {
+                predicate: atom.predicate.to_string(),
+                terms: atom
+                    .terms
+                    .iter()
+                    .map(|term| term.name().to_string())
+                    .collect(),
+            })
+            .collect();
+        snapshot.session_negative_facts = self
+            .session_negative_facts
             .iter()
             .filter(|atom| atom.is_ground())
             .map(|atom| SnapshotAtom {
@@ -6835,6 +7100,28 @@ impl SymbolicReasoner {
             if self.config.enable_resolution {
                 self.rebuild_resolver();
             }
+        }
+        // 否定事实：恢复为路径阻断边（不进入正向归结，因此不触发引擎重建）
+        let mut restored_negative: Vec<Atom> = Vec::new();
+        for entry in &snapshot.session_negative_facts {
+            if entry.predicate.is_empty() || entry.terms.len() != 2 {
+                continue;
+            }
+            let terms: Vec<Term> = entry
+                .terms
+                .iter()
+                .map(|name| Term::constant(name))
+                .collect();
+            let atom = Atom::new(&entry.predicate, terms);
+            if atom.is_ground() && !restored_negative.contains(&atom) {
+                restored_negative.push(atom);
+            }
+        }
+        if !restored_negative.is_empty() {
+            for atom in &restored_negative {
+                self.register_atom_vocabulary(atom);
+            }
+            self.session_negative_facts = restored_negative;
         }
         // 教学记忆：恢复中文概率知识原句并在概率程序中重放（不写知识图谱）
         if !snapshot.lessons.is_empty() {
@@ -9143,6 +9430,159 @@ mod tests {
         assert!(report.contains("没能把这句话解析成规则"), "实际：{}", report);
         let empty = reasoner.learn_rule_report("   ");
         assert!(empty.contains("请给出中文规则"), "实际：{}", empty);
+    }
+
+    #[test]
+    fn test_chain_answer_carries_witness_paths() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("张三的师傅的师傅是谁")
+            .expect("多跳问句应给出路径回答");
+        assert!(answer.contains("路径"), "实际：{}", answer);
+        assert!(
+            answer.contains("张三 --师傅--> 李四 --师傅--> 王五"),
+            "路径应保留每一跳：{}",
+            answer
+        );
+        assert!(
+            answer.matches("推理依据").count() <= 1,
+            "推理依据不应重复：{}",
+            answer
+        );
+    }
+
+    #[test]
+    fn test_check_triple_uses_path_witness() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("张三的师傅的师傅是王五吗")
+            .expect("多跳校验应给出证明路径");
+        assert!(answer.contains("是的"), "实际：{}", answer);
+        assert!(
+            answer.contains("张三 --师傅--> 李四 --师傅--> 王五"),
+            "校验应附带路径：{}",
+            answer
+        );
+    }
+
+    #[test]
+    fn test_session_overlay_extends_paths_and_retract_restores() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+        ]);
+        let before = reasoner
+            .answer("张三的师傅的师傅的师傅是谁")
+            .unwrap_or_default();
+        assert!(
+            !before.contains("赵六"),
+            "未断言前不应出现跨分支答案：{}",
+            before
+        );
+
+        let message = reasoner.assert_nl_fact("王五是李四的师傅");
+        assert!(message.contains("已记住"), "实际：{}", message);
+        let answer = reasoner
+            .answer("张三的师傅的师傅的师傅是谁")
+            .expect("会话事实应补齐中间边");
+        assert!(answer.contains("赵六"), "实际：{}", answer);
+        assert!(answer.contains("路径"), "实际：{}", answer);
+
+        let forgotten = reasoner.retract_nl_fact("王五是李四的师傅");
+        assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
+        let after = reasoner
+            .answer("张三的师傅的师傅的师傅是谁")
+            .unwrap_or_default();
+        assert!(!after.contains("赵六"), "撤回后路径应失效：{}", after);
+    }
+
+    #[test]
+    fn test_negative_session_fact_blocks_paths_and_can_be_retracted() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let message = reasoner.assert_nl_fact("赵六不是王五的师傅");
+        assert!(message.contains("已记住否定事实"), "实际：{}", message);
+
+        let blocked = reasoner
+            .answer("张三的师傅的师傅的师傅是谁")
+            .unwrap_or_default();
+        assert!(
+            blocked.contains("否定记录阻断"),
+            "应报告否定阻断原因：{}",
+            blocked
+        );
+
+        let checked = reasoner.answer("王五的师傅是赵六吗").unwrap_or_default();
+        assert!(
+            checked.contains("不是"),
+            "直接校验应尊重会话否定：{}",
+            checked
+        );
+
+        let forgotten = reasoner.retract_nl_fact("赵六不是王五的师傅");
+        assert!(forgotten.contains("已撤销否定事实"), "实际：{}", forgotten);
+        let restored = reasoner
+            .answer("张三的师傅的师傅的师傅是谁")
+            .expect("撤销否定后路径应恢复");
+        assert!(restored.contains("赵六"), "实际：{}", restored);
+    }
+
+    #[test]
+    fn test_positive_session_fact_supersedes_negative() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("赵六不是王五的师傅");
+        let message = reasoner.assert_nl_fact("王五的师傅是赵六");
+        assert!(
+            message.contains("已撤销同名会话否定事实"),
+            "实际：{}",
+            message
+        );
+
+        let answer = reasoner
+            .answer("张三的师傅的师傅的师傅是谁")
+            .expect("肯定事实应恢复路径");
+        assert!(answer.contains("赵六"), "实际：{}", answer);
+        assert!(!answer.contains("否定记录阻断"), "实际：{}", answer);
+        let checked = reasoner
+            .answer("王五的师傅是赵六吗")
+            .unwrap_or_default();
+        assert!(checked.contains("是的"), "实际：{}", checked);
+    }
+
+    #[test]
+    fn test_negative_session_fact_roundtrips_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("赵六不是王五的师傅");
+        let path =
+            std::env::temp_dir().join(format!("knowprolog_negative_{}.json", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
+        let answer = restored
+            .answer("张三的师傅的师傅的师傅是谁")
+            .unwrap_or_default();
+        assert!(
+            answer.contains("否定记录阻断"),
+            "恢复的否定边仍应阻断：{}",
+            answer
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
