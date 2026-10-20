@@ -11,11 +11,11 @@ use know_prolog::{
     ResponseFormatter,
     InputMode,
     KnowledgeItem,
-    create_prolog_rules,
     detect_input_mode,
     create_default_synonyms,
     extract_query_entities_from_tagged,
-    nlp::{preprocess, normalize_words, analyze_query_intent},
+    nlp::{preprocess, normalize_words},
+    pattern_ir::{self, PatternLibrary},
     lexical_trace,
     query_planner::QueryPlanner,
     nlu::NLUEngine,
@@ -2648,7 +2648,17 @@ async fn run_interactive_mode(
     let grammar_extractor = GrammarExtractor::new();
     let response_formatter = ResponseFormatter::new(config.clone());
     let nlu_engine = NLUEngine::new(&config);
-    let prolog_rules = create_prolog_rules(&config);
+    // 统一模式库：配置查询规则 + NLU 意图（同库展示、不路由）+ 跨会话教学模式。
+    let mut pattern_library = PatternLibrary::from_config(&config);
+    match oxigraph_manager.load_pattern_ledger().await {
+        Ok(entries) if !entries.is_empty() => {
+            let merged = pattern_library.merge_taught(&entries);
+            if merged > 0 {
+                println!("已恢复 {} 条教学模式（模式落图）。可用「模式路由」查看。", merged);
+            }
+        }
+        _ => {}
+    }
     let mut prolog_engine = PrologEngine::new();
     let local_semantic_adapter = {
         let nlp_config = &config.nlp;
@@ -3207,6 +3217,107 @@ async fn run_interactive_mode(
             "获取台账" | "获取报告" | "关系获取报告" | "问答获取报告" | "获取状态"
         ) {
             println!("{}", acquisition.report());
+            println!();
+            continue;
+        }
+
+        // 统一模式库（Pattern IR）：配置查询 + NLU 意图 + 教学模式同库视图
+        if matches!(input, "模式路由" | "查询模式库" | "统一模式库") {
+            println!("{}", pattern_ir::render_library_report(&pattern_library));
+            let findings = pattern_ir::lint(&pattern_library);
+            if findings.is_empty() {
+                println!("体检：无重复/冲突/遮蔽。");
+            } else {
+                println!("体检：{} 条待处理", findings.len());
+                for finding in findings.iter().take(12) {
+                    println!("  - {}", finding.detail);
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 模式匹配解释：对一句话给出胜者、命中榜与落选原因
+        if let Some(text) = strip_any_prefix(
+            input,
+            &["模式匹配：", "模式匹配:", "模式匹配 ", "匹配模式：", "匹配模式:"],
+        ) {
+            let text = text.trim();
+            if text.is_empty() {
+                println!("用法：模式匹配：<句子>，例如「模式匹配：法国的首都是哪里」。");
+            } else {
+                let tagged = preprocess(text, &config.nlp);
+                let normalized = normalize_words(tagged, &synonyms);
+                let report = pattern_library.rank(&normalized);
+                println!("{}", pattern_ir::render_match_report(text, &report));
+            }
+            println!();
+            continue;
+        }
+
+        // 教模式：<名> | <要素 要素 …> | <路由> | <优先级>
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &["教模式：", "教模式:", "教模式 ", "教学模式：", "教学模式:"],
+        ) {
+            let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
+            if parts.len() < 3 {
+                println!("用法：教模式：<名> | <要素 要素 …> | <路由> | <优先级(可选)>\n  要素：词性码（nr/ns/n/m/v…）、词面、{{槽名}}、{{槽名:排序}}、_ 任意");
+            } else {
+                let name = parts[0];
+                let pattern = parts[1];
+                let route = parts[2];
+                let priority = parts
+                    .get(3)
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .unwrap_or(10);
+                match pattern_library.teach(name, pattern, route, priority) {
+                    Ok(entry) => {
+                        println!(
+                            "已教模式「{}」→ {}（优先级 {}，IR {}）",
+                            entry.name,
+                            entry.query_type,
+                            entry.priority,
+                            entry.render()
+                        );
+                        match oxigraph_manager
+                            .sync_pattern_ledger(pattern_library.entries())
+                            .await
+                        {
+                            Ok(count) => println!("模式落图：{} 条已同步。", count),
+                            Err(error) => eprintln!("模式落图失败：{}", error),
+                        }
+                    }
+                    Err(error) => println!("教学模式失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 忘模式：<名 或 id 前缀>（只删教学模式来源）
+        if let Some(name) = strip_any_prefix(
+            input,
+            &["忘模式：", "忘模式:", "忘模式 ", "遗忘模式：", "遗忘模式:"],
+        ) {
+            let name = name.trim();
+            if name.is_empty() {
+                println!("用法：忘模式：<名 或 id 前缀>");
+            } else {
+                match pattern_library.forget(name) {
+                    Some(entry) => {
+                        println!("已遗忘教学模式「{}」（IR {}）。", entry.name, entry.render());
+                        match oxigraph_manager
+                            .sync_pattern_ledger(pattern_library.entries())
+                            .await
+                        {
+                            Ok(count) => println!("模式落图：{} 条已同步。", count),
+                            Err(error) => eprintln!("模式落图失败：{}", error),
+                        }
+                    }
+                    None => println!("没有找到可遗忘的教学模式「{}」（只删教学来源）。", name),
+                }
+            }
             println!();
             continue;
         }
@@ -6402,9 +6513,12 @@ async fn run_interactive_mode(
                                 }
                                 "知识查询" => {
                                     // 继续使用查询逻辑
-                                    if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        // 执行查询流程
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
+                                     if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(&pattern_library, &normalized_words) {
+                                         // 执行查询流程
+                                         if let Some(note) = &pattern_note {
+                                             println!("命中模式: {}", note);
+                                         }
+                                         continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
                                     } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
@@ -6427,8 +6541,11 @@ async fn run_interactive_mode(
                                 _ => {
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
-                                    if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
-                                        continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
+                                     if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(&pattern_library, &normalized_words) {
+                                         if let Some(note) = &pattern_note {
+                                             println!("命中模式: {}", note);
+                                         }
+                                         continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
                                     } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
@@ -6528,8 +6645,11 @@ async fn run_interactive_mode(
                     }
                 }
                 
-                if let Some((query_type, entities)) = analyze_query_intent(&normalized_words, &prolog_rules) {
+                if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(&pattern_library, &normalized_words) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
+                    if let Some(note) = &pattern_note {
+                        println!("命中模式: {}", note);
+                    }
                     
                     // 提取查询中的实体
                     let mut seen_entities = std::collections::HashSet::new();
@@ -7135,6 +7255,10 @@ fn interactive_help() -> String {
         "  如果…那么… / 假设：…                 反事实推演（推演后自动回滚）",
         "  默认推理：<陈述> / 概率推理：…       非单调常识与加权可能世界",
         "  规则：<如果X的P是Y，那么X的Q是Y>    教一条 Horn 规则（占位符自动变量化）",
+        "  模式路由 / 查询模式库                 统一模式库（配置查询+NLU 意图+教学模式）与体检",
+        "  模式匹配：<句子>                     查看命中模式、绑定与落选原因",
+        "  教模式：名 | 要素… | 路由 | 优先级   教一条查询模式（落图持久化，跨会话恢复）",
+        "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
         "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
@@ -7594,6 +7718,25 @@ fn is_command_like(input: &str) -> bool {
         "停用插件",
         "禁用插件",
         "为什么这么答",
+        // 统一模式库（Pattern IR）
+        "模式路由",
+        "查询模式库",
+        "统一模式库",
+        "模式匹配：",
+        "模式匹配:",
+        "模式匹配 ",
+        "匹配模式：",
+        "匹配模式:",
+        "教模式：",
+        "教模式:",
+        "教模式 ",
+        "教学模式：",
+        "教学模式:",
+        "忘模式：",
+        "忘模式:",
+        "忘模式 ",
+        "遗忘模式：",
+        "遗忘模式:",
         // 帮助与退出
         "帮助",
         "help",
@@ -7662,6 +7805,25 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     prefixes
         .iter()
         .find_map(|prefix| input.strip_prefix(prefix))
+}
+
+/// 统一模式库路由：返回（查询类型、实体、命中模式解释行）。
+///
+/// 路由语义与既有 `analyze_query_intent(&words, &rules)` 一致（同排序、同匹配、
+/// 同实体提取），额外给出「命中模式」的人类可读说明；无命中返回 `None`。
+fn route_query_with_patterns(
+    library: &PatternLibrary,
+    words: &[know_prolog::nlp::TaggedWord],
+) -> Option<(String, Vec<String>, Option<String>)> {
+    let matched = library.match_route(words)?;
+    let note = format!(
+        "{}（{}，优先级 {}，来源 {}）",
+        matched.entry.name,
+        matched.entry.render(),
+        matched.entry.priority,
+        matched.entry.source
+    );
+    Some((matched.entry.query_type.clone(), matched.entities.clone(), Some(note)))
 }
 
 /// 解析「左 = 右」形式的谓词登记参数（支持 = / ＝ / =>）
@@ -8800,6 +8962,21 @@ mod session_tests {
             "历史可信度：姚明的身高是多少",
             "可信度：姚明的身高是多少",
             "信任报告",
+        ] {
+            assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
+    }
+
+    /// 统一模式库命令：库视图 / 匹配解释 / 教学模式 / 忘模式都要被识别为命令。
+    #[test]
+    fn command_like_covers_pattern_library_commands() {
+        for command in [
+            "模式路由",
+            "查询模式库",
+            "统一模式库",
+            "模式匹配：法国的首都是哪里",
+            "教模式：老家 | {人} 的 老家 | hometown_query | 20",
+            "忘模式：老家",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
