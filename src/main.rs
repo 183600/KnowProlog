@@ -38,6 +38,7 @@ use know_prolog::{
     grammar_extractor::GrammarExtractor,
     prolog_engine::PrologFact,
     chronicle::{Chronicle, FsyncPolicy},
+    conversation_theory::{self, ConversationTheory},
     proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
     view_render::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
@@ -2721,6 +2722,113 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 对话情景理论：把编年史编译成可查询的有限 Horn 理论（CST）
+        if matches!(input, "情景" | "对话情景" | "情景理论") {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let theory = ConversationTheory::build(chronicle);
+                    println!("{}", theory.render_report());
+                    if !theory.changes().is_empty() {
+                        println!();
+                        println!("{}", theory.render_changes());
+                    }
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(input, &["情景：", "情景:"]) {
+            match (chronicle.as_ref(), spec.trim().parse::<u64>()) {
+                (Some(chronicle), Ok(seq)) => {
+                    let theory = ConversationTheory::build(chronicle);
+                    println!("{}", theory.render_situation(seq));
+                }
+                (Some(_), Err(_)) => println!("用法：情景：<seq>，例如：情景：12"),
+                (None, _) => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(query) = strip_any_prefix(
+            input,
+            &["情景历史：", "情景历史:", "情景历史 "],
+        ) {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let theory = ConversationTheory::build(chronicle);
+                    if query.trim().is_empty() {
+                        println!("{}", theory.render_report());
+                    } else {
+                        println!("{}", theory.render_history(query.trim()));
+                    }
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(query) = strip_any_prefix(
+            input,
+            &["情景归因：", "情景归因:", "情景归因 "],
+        ) {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let theory = ConversationTheory::build(chronicle);
+                    println!("{}", theory.render_causes(query.trim()));
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &["情景反事实：", "情景反事实:", "情景反事实 "],
+        ) {
+            let spec = spec.trim();
+            let (seq, query) = match spec.split_once(['：', ':']) {
+                Some((left, right)) if left.trim().parse::<u64>().is_ok() => {
+                    (left.trim().parse::<u64>().ok(), right.trim())
+                }
+                _ => (None, spec),
+            };
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let theory = ConversationTheory::build(chronicle);
+                    match seq {
+                        Some(seq) => {
+                            let report = theory.counterfactual_undo_seq(seq, query);
+                            println!("{}", theory.render_counterfactual_report(&report));
+                        }
+                        None => println!("{}", theory.render_counterfactual(query)),
+                    }
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(pattern) = strip_any_prefix(
+            input,
+            &["情景查询：", "情景查询:", "情景查询 "],
+        ) {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let theory = ConversationTheory::build(chronicle);
+                    println!("{}", theory.render_query(pattern.trim()));
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
         // 证明图：把归结证明树渲染成 Mermaid/ASCII（看得见的推理）
         if let Some(target) = strip_any_prefix(
             input,
@@ -3686,7 +3794,17 @@ async fn run_interactive_mode(
                 println!("请给出中文规则，例如：规则：如果X的师傅是Y，那么X的老师是Y");
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.learn_rule_report(target));
+                let report = symbolic_reasoner.learn_rule_report(target);
+                let learned = report.contains("已学习中文规则");
+                println!("{}", report);
+                if let Some(chronicle) = chronicle.as_mut() {
+                    let _ = conversation_theory::append_rule(
+                        chronicle,
+                        target,
+                        learned,
+                        kb_revision,
+                    );
+                }
                 sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             }
             println!();
@@ -3705,6 +3823,18 @@ async fn run_interactive_mode(
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 let answer = symbolic_reasoner.assert_nl_fact(target);
                 println!("{}", answer);
+                let effects = conversation_theory::effects_from_text(
+                    target,
+                    conversation_theory::EffectOp::Add,
+                );
+                if let Some(chronicle) = chronicle.as_mut() {
+                    let _ = conversation_theory::append_assert(
+                        chronicle,
+                        target,
+                        &effects,
+                        kb_revision,
+                    );
+                }
                 log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
             }
             println!();
@@ -3722,6 +3852,18 @@ async fn run_interactive_mode(
             } else {
                 let answer = symbolic_reasoner.retract_nl_fact(target);
                 println!("{}", answer);
+                let effects = conversation_theory::effects_from_text(
+                    target,
+                    conversation_theory::EffectOp::Remove,
+                );
+                if let Some(chronicle) = chronicle.as_mut() {
+                    let _ = conversation_theory::append_forget(
+                        chronicle,
+                        target,
+                        &effects,
+                        kb_revision,
+                    );
+                }
                 log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
             }
             println!();
@@ -4057,6 +4199,14 @@ async fn run_interactive_mode(
             match import_journal.pop() {
                 Some(receipt) => match oxigraph_manager.undo_import(&receipt).await {
                     Ok(removed) => {
+                        if let Some(chronicle) = chronicle.as_mut() {
+                            let _ = conversation_theory::append_retract(
+                                chronicle,
+                                &receipt,
+                                "撤销导入",
+                                kb_revision + 1,
+                            );
+                        }
                         reasoner_stale = true;
                         let _ = oxigraph_manager.save_predicate_registry(&registry_path);
                         let _ = import_journal.save(&journal_path);
@@ -4124,6 +4274,15 @@ async fn run_interactive_mode(
                 println!("请给出实体名，例如：外链刷新：法国");
             } else if external_knowledge_service.refresh_entity(entity) {
                 let _ = external_knowledge_service.save_ledger(&external_ledger_path);
+                if let Some(chronicle) = chronicle.as_mut() {
+                    let _ = conversation_theory::append_external(
+                        chronicle,
+                        entity,
+                        "标记刷新",
+                        "外链名册",
+                        kb_revision,
+                    );
+                }
                 println!("已标记「{}」待刷新：下次提问将重新取回外部知识。", entity);
             } else {
                 println!("外链名册中没有「{}」的条目；下次提问将直接取回。", entity);
@@ -4139,6 +4298,15 @@ async fn run_interactive_mode(
             let entity = entity.trim();
             if external_knowledge_service.forget_entity(entity) {
                 let _ = external_knowledge_service.save_ledger(&external_ledger_path);
+                if let Some(chronicle) = chronicle.as_mut() {
+                    let _ = conversation_theory::append_external(
+                        chronicle,
+                        entity,
+                        "删除缓存",
+                        "外链名册",
+                        kb_revision,
+                    );
+                }
                 println!("已从外链名册删除「{}」。", entity);
             } else {
                 println!("外链名册中没有「{}」的条目。", entity);
@@ -4156,6 +4324,15 @@ async fn run_interactive_mode(
                 Some((alias, target)) => {
                     if external_knowledge_service.confirm_alias(alias, target) {
                         let _ = external_knowledge_service.save_ledger(&external_ledger_path);
+                        if let Some(chronicle) = chronicle.as_mut() {
+                            let _ = conversation_theory::append_external(
+                                chronicle,
+                                alias,
+                                &format!("同义链接 = {}", target),
+                                "外链名册",
+                                kb_revision,
+                            );
+                        }
                         println!("已确认同义链接：「{}」= 「{}」。", alias, target);
                     } else {
                         println!("同义链接不成立：别名与规范实体不能相同或为空。");
@@ -4441,6 +4618,15 @@ async fn run_interactive_mode(
                     match oxigraph_manager.import_jsonld_from_file(&file_path).await {
                         Ok(stats) => {
                             println!("JSON-LD 文件导入成功：{}", stats.summary());
+                            if let Some(chronicle) = chronicle.as_mut() {
+                                let _ = conversation_theory::append_bulk_import(
+                                    chronicle,
+                                    "JSON-LD",
+                                    &file_path,
+                                    stats.triples,
+                                    kb_revision + 1,
+                                );
+                            }
                             reasoner_stale = true;
                         }
                         Err(e) => {
@@ -4460,6 +4646,15 @@ async fn run_interactive_mode(
                     match oxigraph_manager.import_jsonld(&jsonld_content).await {
                         Ok(stats) => {
                             println!("JSON-LD 内容导入成功：{}", stats.summary());
+                            if let Some(chronicle) = chronicle.as_mut() {
+                                let _ = conversation_theory::append_bulk_import(
+                                    chronicle,
+                                    "JSON-LD",
+                                    "内容",
+                                    stats.triples,
+                                    kb_revision + 1,
+                                );
+                            }
                             reasoner_stale = true;
                         }
                         Err(e) => {
@@ -4477,6 +4672,15 @@ async fn run_interactive_mode(
                     match oxigraph_manager.import_rdf_file(&file_path).await {
                         Ok(added) => {
                             println!("RDF 文件导入成功：新增 {} 条三元组！", added);
+                            if let Some(chronicle) = chronicle.as_mut() {
+                                let _ = conversation_theory::append_bulk_import(
+                                    chronicle,
+                                    "RDF",
+                                    &file_path,
+                                    added,
+                                    kb_revision + 1,
+                                );
+                            }
                             reasoner_stale = true;
                         }
                         Err(e) => {
@@ -4590,6 +4794,14 @@ async fn run_interactive_mode(
                             Ok(receipt) => {
                                 let summary = receipt.summary();
                                 println!("{}", summary);
+                                if let Some(chronicle) = chronicle.as_mut() {
+                                    let _ = conversation_theory::append_import(
+                                        chronicle,
+                                        &receipt,
+                                        "文本录入",
+                                        kb_revision + 1,
+                                    );
+                                }
                                 log_chronicle_reply(&mut chronicle, &summary, &[], &[]);
                                 if receipt.can_undo() {
                                     import_journal.push(receipt);
@@ -5319,16 +5531,45 @@ async fn run_interactive_mode(
                             )
                             .await
                         {
-                            Ok(outcome) => match external_outcome_text(&outcome) {
-                                Some(text) => {
-                                    println!("{}", text);
-                                    log_chronicle_reply(&mut chronicle, &text, &[], &[]);
+                            Ok(outcome) => {
+                                if let Some(chronicle) = chronicle.as_mut() {
+                                    match &outcome {
+                                        AnswerOutcome::Answered(answer) => {
+                                            let _ = conversation_theory::append_external(
+                                                chronicle,
+                                                &answer.entity,
+                                                "回答",
+                                                &answer.source_uri,
+                                                kb_revision,
+                                            );
+                                        }
+                                        AnswerOutcome::KnownAbsent {
+                                            entity,
+                                            source_uri,
+                                            ..
+                                        } => {
+                                            let _ = conversation_theory::append_external(
+                                                chronicle,
+                                                entity,
+                                                "确认未收录",
+                                                source_uri,
+                                                kb_revision,
+                                            );
+                                        }
+                                        AnswerOutcome::Unknown => {}
+                                    }
                                 }
-                                None => {
-                                    let fallback =
-                                        "很抱歉，我无法理解您的问题。请尝试重新描述。";
-                                    println!("{}", fallback);
-                                    log_chronicle_reply(&mut chronicle, fallback, &[], &[]);
+                                match external_outcome_text(&outcome) {
+                                    Some(text) => {
+                                        println!("{}", text);
+                                        log_chronicle_reply(&mut chronicle, &text, &[], &[]);
+                                    }
+                                    None => {
+                                        let fallback =
+                                            "很抱歉，我无法理解您的问题。请尝试重新描述。";
+                                        println!("{}", fallback);
+                                        log_chronicle_reply(&mut chronicle, fallback, &[], &[]);
+                                    }
                                 }
                             },
                             Err(e) => {
@@ -5671,6 +5912,11 @@ fn interactive_help() -> String {
         "  导入rdf文件：<路径>                 导入 Turtle/N-Triples/N-Quads/TriG/RDF/XML",
         "  导出rdf文件：<路径>                 导出默认图（按扩展名，支持 jsonld；简写：导出文件：）",
         "  撤销导入 / 导入回执 / 导入历史       导入回执与可撤销导入栈",
+        "  情景 / 对话情景                      把编年史编译成可查询的情景理论（CST）",
+        "  情景历史：<问题>                     同一问题在各情景下的回答与修订",
+        "  情景归因：<问题>                     改口的候选事件原因（无候选就明说）",
+        "  情景反事实：<问题>                   撤销最近语义事件后回答是否翻转（可弃权）",
+        "  情景查询：<Datalog原子>              在情景理论上执行查询，如 answered_at(S,Q,A,P)",
         "",
         "查询与推理",
         "  直接输入自然语言                    如「小明多大？」「张三和李四什么关系？」",
@@ -6006,6 +6252,13 @@ fn is_command_like(input: &str) -> bool {
         "改口检查",
         "改口",
         "日志视图",
+        "情景",
+        "对话情景",
+        "情景理论",
+        "情景历史",
+        "情景归因",
+        "情景反事实",
+        "情景查询",
         "知识子图",
         "子图",
         "邻域",
@@ -6720,6 +6973,14 @@ mod session_tests {
             "算符表",
             "提及账本",
             "外链台账",
+            "情景",
+            "对话情景",
+            "情景理论",
+            "情景：12",
+            "情景历史：姚明的身高是多少",
+            "情景归因：姚明的身高是多少",
+            "情景反事实：姚明的身高是多少",
+            "情景查询：answered_at(S,Q,A,P)",
             "外链查看：法国",
             "外链刷新：法国",
             "外链删除：法国",

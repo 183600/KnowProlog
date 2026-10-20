@@ -66,6 +66,7 @@ pub mod import_journal;
 pub mod grammar_extractor;
 pub mod chronicle;
 pub mod proof_journal;
+pub mod conversation_theory;
 pub mod view_render;
 pub mod embedding_eval;
 pub mod function_words;
