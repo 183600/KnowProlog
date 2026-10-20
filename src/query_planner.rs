@@ -14,6 +14,8 @@
 // 计划只做句法/结构的模式枚举，不接触知识库；实体/谓词的归一化与执行
 // 由 SymbolicReasoner 结合本体对齐与链接预测完成。
 
+use crate::pattern_closure::ClosureOp;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPlan {
     // 沿"的"链查找对象：张三 的 师傅 的 师傅 是谁
@@ -40,6 +42,13 @@ pub enum QueryPlan {
     Count { subject: String, predicate: String },
     // 存在性：李四 有没有 师傅
     Exist { subject: String, predicate: String },
+    // 闭包：李四 的 所有 上司（Plus 需要已启用的传递律）
+    Closure {
+        subject: String,
+        predicate: String,
+        operator: ClosureOp,
+        count_only: bool,
+    },
     // 最近邻语义检索：谁和 张三 最像
     Similar { entity: String },
     // 向量算术类比：a:b :: c:?
@@ -76,6 +85,11 @@ impl QueryPlanner {
 
         let path_question = Self::strip_particles(&raw);
         if let Some(plan) = self.parse_path_question(&path_question) {
+            return Some(plan);
+        }
+
+        // 「所有」必须先于存在句解析，否则会被「有」误判成存在性问句。
+        if let Some(plan) = self.parse_closure(&raw) {
             return Some(plan);
         }
 
@@ -123,6 +137,7 @@ impl QueryPlanner {
             QueryPlan::CheckTriple { .. } => "CheckTriple",
             QueryPlan::Count { .. } => "Count",
             QueryPlan::Exist { .. } => "Exist",
+            QueryPlan::Closure { .. } => "Closure",
             QueryPlan::Similar { .. } => "Similar",
             QueryPlan::Analogy { .. } => "Analogy",
         }
@@ -166,6 +181,21 @@ impl QueryPlanner {
             }
             QueryPlan::Exist { subject, predicate } => {
                 format!("存在性：{} 是否有 {}", subject, predicate)
+            }
+            QueryPlan::Closure {
+                subject,
+                predicate,
+                operator,
+                count_only,
+            } => {
+                let view = if *count_only { "计数" } else { "列出" };
+                format!(
+                    "{}闭包：{} 的所有 {}（{}）",
+                    view,
+                    subject,
+                    predicate,
+                    operator.label()
+                )
             }
             QueryPlan::Similar { entity } => format!("语义近邻：与 {} 最像的实体", entity),
             QueryPlan::Analogy { a, b, c } => {
@@ -554,6 +584,76 @@ impl QueryPlanner {
         None
     }
 
+    fn parse_closure(&self, raw: &str) -> Option<QueryPlan> {
+        for marker in ["的所有", "的全部", "的任意"] {
+            let Some((subject, rest)) = raw.split_once(marker) else {
+                continue;
+            };
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
+                continue;
+            }
+            let (predicate, count_only) = Self::strip_closure_tail(rest);
+            let predicate = predicate.trim().trim_end_matches('的').trim();
+            if predicate.is_empty()
+                || predicate.contains('的')
+                || predicate.chars().count() > 40
+                || Self::is_question_word(predicate)
+            {
+                continue;
+            }
+            return Some(QueryPlan::Closure {
+                subject: subject.to_string(),
+                predicate: predicate.to_string(),
+                operator: ClosureOp::Plus,
+                count_only,
+            });
+        }
+        None
+    }
+
+    fn strip_closure_tail(raw: &str) -> (String, bool) {
+        let text = Self::strip_particles(raw);
+        const TAILS: [(&str, bool); 30] = [
+            ("分别有哪些", false),
+            ("分别是什么", false),
+            ("分别是谁", false),
+            ("一共有多少个", true),
+            ("一共有几位", true),
+            ("一共有几个", true),
+            ("一共有多少", true),
+            ("共有多少个", true),
+            ("共有几位", true),
+            ("共有几个", true),
+            ("共有多少", true),
+            ("总共多少个", true),
+            ("总共几位", true),
+            ("总共几个", true),
+            ("总共多少", true),
+            ("有哪几个", false),
+            ("有哪几位", false),
+            ("有哪些", false),
+            ("都是什么", false),
+            ("都是谁", false),
+            ("都有谁", false),
+            ("是什么", false),
+            ("是谁", false),
+            ("有多少个", true),
+            ("有几位", true),
+            ("有几个", true),
+            ("有多少", true),
+            ("的总数", true),
+            ("有谁", false),
+            ("分别", false),
+        ];
+        for (tail, count_only) in TAILS {
+            if let Some(core) = text.strip_suffix(tail) {
+                return (core.trim().to_string(), count_only);
+            }
+        }
+        (text, false)
+    }
+
     fn parse_count(&self, q: &str) -> Option<QueryPlan> {
         // 「有几个/几位/几名…」：量词可省略（有几个），也可跟上其它量词（有几位）
         if let Some((head, rest)) = q.split_once("有几") {
@@ -818,6 +918,64 @@ mod tests {
             QueryPlan::Count {
                 subject: "苹果公司".to_string(),
                 predicate: "员工".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_closure_question() {
+        let plan = planner().parse("李四的所有上司是谁").expect("应编译为闭包计划");
+        assert_eq!(
+            plan,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: false,
+            }
+        );
+        let list = planner()
+            .parse("李四的全部上司分别是谁？")
+            .expect("应编译为闭包计划");
+        assert_eq!(
+            list,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: false,
+            }
+        );
+        let count = planner()
+            .parse("李四的所有上司一共有几个")
+            .expect("应编译为闭包计数");
+        assert_eq!(
+            count,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_closure_does_not_swallow_exist_or_count() {
+        let exist = planner().parse("李四有没有上司").expect("存在性问句");
+        assert_eq!(
+            exist,
+            QueryPlan::Exist {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string()
+            }
+        );
+        let count = planner().parse("李四有几个上司").expect("直接计数");
+        assert_eq!(
+            count,
+            QueryPlan::Count {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string()
             }
         );
     }

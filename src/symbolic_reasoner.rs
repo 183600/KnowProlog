@@ -33,6 +33,7 @@ use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAlign
 use crate::path_memory::{
     EdgeSource, PathPredicate, TraversalGraph, TraversalOptions,
 };
+use crate::pattern_closure::{evaluate_closure, ClosureBudget, ClosureOp, ClosureOutcome};
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
@@ -4733,6 +4734,12 @@ impl SymbolicReasoner {
             QueryPlan::Exist { subject, predicate } => {
                 self.answer_count(&subject, &predicate, true)
             }
+            QueryPlan::Closure {
+                subject,
+                predicate,
+                operator,
+                count_only,
+            } => self.answer_closure(&subject, &predicate, operator, count_only),
             QueryPlan::CheckTriple {
                 subject_segments,
                 object,
@@ -4756,6 +4763,142 @@ impl SymbolicReasoner {
             QueryPlan::Similar { entity } => self.answer_similar(&entity),
             QueryPlan::Analogy { a, b, c } => self.answer_analogy(&a, &b, &c),
         }
+    }
+
+    fn answer_closure(
+        &self,
+        subject: &str,
+        predicate: &str,
+        operator: ClosureOp,
+        count_only: bool,
+    ) -> Option<String> {
+        let entity = self.aligner.canonical_form(subject.trim());
+        let surface = predicate.trim();
+        if entity.is_empty() || surface.is_empty() {
+            return None;
+        }
+        if !self.is_known_entity(&entity) && !self.predictor.participates(&entity) {
+            return None;
+        }
+        let (slot, inverted) = self.resolve_question_predicate(surface);
+        if slot.is_empty() || (!self.is_known_predicate(&slot) && !self.is_known_predicate(surface))
+        {
+            return None;
+        }
+
+        let law = if operator.requires_transitive_law() {
+            match self.laws.active_transitive(&slot) {
+                Some(law) => Some(law.id.clone()),
+                None => {
+                    let mut direct = if inverted {
+                        self.predictor.subjects_of(&slot, &entity)
+                    } else {
+                        self.predictor.objects_of(&entity, &slot)
+                    };
+                    direct.sort();
+                    direct.dedup();
+                    let direct_text = if direct.is_empty() {
+                        "当前没有直接记录".to_string()
+                    } else {
+                        format!("当前只有直接记录：{}", direct.join("、"))
+                    };
+                    return Some(format!(
+                        "无法安全回答「{}」的所有「{}」：谓词「{}」尚未声明为传递关系。{}。若要让「所有」按可达闭包回答，请先在语义律中启用传递律。",
+                        entity, surface, slot, direct_text
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        let predictor = &self.predictor;
+        let closure_slot = slot.clone();
+        let outcome = evaluate_closure(
+            &entity,
+            operator,
+            ClosureBudget::default(),
+            law.as_deref(),
+            move |node| {
+                if inverted {
+                    predictor.subjects_of(&closure_slot, node)
+                } else {
+                    predictor.objects_of(node, &closure_slot)
+                }
+            },
+        )
+        .ok()?;
+        Some(self.render_closure_answer(&entity, surface, &outcome, count_only))
+    }
+
+    fn render_closure_answer(
+        &self,
+        entity: &str,
+        surface: &str,
+        outcome: &ClosureOutcome,
+        count_only: bool,
+    ) -> String {
+        let target_phrase = match outcome.operator {
+            ClosureOp::Exact(hops) => format!("恰好 {} 跳的「{}」", hops, surface),
+            ClosureOp::Plus => format!("所有「{}」", surface),
+            ClosureOp::Star => format!("所有（含自身）「{}」", surface),
+        };
+        if outcome.reached_count == 0 && outcome.complete() {
+            return format!("根据现有知识库，「{}」没有{}。", entity, target_phrase);
+        }
+
+        let basis = outcome
+            .law
+            .as_deref()
+            .map(|law| format!("；依据 {}", law))
+            .unwrap_or_default();
+        let count = if outcome.count_is_lower_bound() {
+            format!("至少 {} 个", outcome.reached_count)
+        } else {
+            format!("共 {} 个", outcome.reached_count)
+        };
+        let mut output = format!(
+            "根据知识图谱（{}{}）：「{}」的{} {}。",
+            outcome.operator.label(),
+            basis,
+            entity,
+            target_phrase,
+            count
+        );
+        if !count_only {
+            for (index, (target, hops)) in outcome.targets_by_distance().into_iter().enumerate() {
+                let witness = outcome
+                    .render_witness(target)
+                    .unwrap_or_else(|| target.to_string());
+                output.push_str(&format!(
+                    "
+  {}. {}（{} 跳：{}）",
+                    index + 1,
+                    target,
+                    hops,
+                    witness
+                ));
+            }
+        } else {
+            output.push_str("
+  计数口径：不同可达节点，不按路径重复计数。");
+        }
+        if outcome.witnesses_truncated {
+            output.push_str(&format!(
+                "
+  说明：见证仅保留前 {} 个，计数仍按不同节点去重。",
+                outcome.witnesses.len()
+            ));
+        }
+        if let Some(truncation) = outcome.truncated {
+            output.push_str(&format!(
+                "
+  说明：闭包搜索在{}处停止，结果不完整，上述计数是下界（至少 {} 个）。",
+                truncation.label(),
+                outcome.reached_count
+            ));
+        }
+        output
     }
 
     fn answer_count(&self, subject: &str, predicate: &str, exist: bool) -> Option<String> {
@@ -10286,6 +10429,110 @@ mod tests {
             .expect("两跳链应有答案");
         assert!(two_hops.contains("丙"), "{}", two_hops);
         assert!(!two_hops.contains("丁"), "{}", two_hops);
+    }
+
+    fn closure_reasoner() -> SymbolicReasoner {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "上司".to_string(),
+                to: "乙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "丙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丁".to_string(),
+            },
+        ]);
+        reasoner.configure_laws(&transitive_registry("上司", false));
+        reasoner
+    }
+
+    #[test]
+    fn all_quantifier_uses_closure_even_when_direct_edge_exists() {
+        let reasoner = closure_reasoner();
+        let answer = reasoner
+            .answer("甲的所有上司是谁")
+            .expect("所有问句应由闭包回答");
+        assert!(answer.contains("乙"), "{}", answer);
+        assert!(answer.contains("丙"), "{}", answer);
+        assert!(answer.contains("丁"), "{}", answer);
+        assert!(answer.contains("共 3 个"), "{}", answer);
+        assert!(answer.contains("law:transitive:上司"), "{}", answer);
+        assert!(answer.contains("甲 → 乙 → 丙"), "{}", answer);
+        assert!(!answer.contains("下界"), "{}", answer);
+    }
+
+    #[test]
+    fn all_quantifier_without_transitive_law_refuses_to_claim_closure() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "上司".to_string(),
+                to: "乙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丙".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer("甲的所有上司是谁")
+            .expect("无传递律时必须给出可解释的拒绝");
+        assert!(answer.contains("尚未声明为传递关系"), "{}", answer);
+        assert!(answer.contains("直接记录：乙"), "{}", answer);
+        assert!(!answer.contains("共 2 个"), "{}", answer);
+    }
+
+    #[test]
+    fn closure_truncation_reports_a_lower_bound() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        let names = ["甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"];
+        let facts: Vec<PrologFact> = names
+            .windows(2)
+            .map(|pair| PrologFact::Relation {
+                from: pair[0].to_string(),
+                rel_type: "上司".to_string(),
+                to: pair[1].to_string(),
+            })
+            .collect();
+        reasoner.observe_facts(&facts);
+        reasoner.configure_laws(&transitive_registry("上司", false));
+
+        let answer = reasoner
+            .answer("甲的所有上司是谁")
+            .expect("超深链仍应给出有界答案");
+        assert!(answer.contains("至少"), "{}", answer);
+        assert!(answer.contains("深度上限"), "{}", answer);
+        assert!(answer.contains("下界"), "{}", answer);
+        assert!(answer.contains("至少 8 个"), "{}", answer);
+        assert!(answer.contains("壬"), "{}", answer);
+        assert!(!answer.contains("癸"), "{}", answer);
+    }
+
+    #[test]
+    fn all_quantifier_count_uses_distinct_nodes() {
+        let reasoner = closure_reasoner();
+        let answer = reasoner
+            .answer("甲的所有上司一共有几个")
+            .expect("所有+计数应走闭包计数");
+        assert!(answer.contains("共 3 个"), "{}", answer);
+        assert!(answer.contains("不同可达节点"), "{}", answer);
+        assert!(!answer.contains("1. 乙"), "{}", answer);
     }
 
     /// 对称律补足单向事实：反向问句给出反方向取值，且说明依据。
