@@ -1839,7 +1839,18 @@ impl DialogueManager {
         if self.trace_mode.is_off() {
             return;
         }
-        let turn_no = self.trace.turn_count() + 1;
+        // 若本轮已有节点（如更正已开启本轮），复用该轮号，避免产生空轮迹。
+        let turn_no = if self
+            .trace
+            .turns()
+            .last()
+            .map(|turn| !turn.nodes.is_empty())
+            .unwrap_or(false)
+        {
+            self.trace.current_turn()
+        } else {
+            self.trace.turn_count() + 1
+        };
         let surface = self.trace.record_surface(turn_no, &frame.raw);
         let kind = format!("{:?}", frame.kind);
         let interpret = self.trace.record_interpret(
@@ -3330,6 +3341,17 @@ mod tests {
         assert!(again.text.contains("190"), "{}", again.text);
         assert!(!again.text.contains("226"), "{}", again.text);
         assert!(manager.trace_report().contains("更正"));
+        // 更正与改口回复必须落在同一轮迹（不留空轮、不拆成两轮）。
+        let correction_turn = manager
+            .trace_store()
+            .turns()
+            .find(|turn| !turn.corrections.is_empty())
+            .expect("应有更正轮迹");
+        assert!(
+            correction_turn.nodes.iter().any(|node| node.kind == "reply"),
+            "更正轮应同时含回复节点：{:?}",
+            correction_turn.nodes.iter().map(|n| &n.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]

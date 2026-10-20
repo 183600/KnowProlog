@@ -704,6 +704,11 @@ impl TraceStore {
         self.turns.len()
     }
 
+    /// 当前（最近一次 `begin_turn` 落在）的轮号；空图返回 0。
+    pub fn current_turn(&self) -> usize {
+        self.turns.back().map(|trace| trace.turn).unwrap_or(0)
+    }
+
     pub fn node_count(&self) -> usize {
         self.turns.iter().map(|turn| turn.nodes.len()).sum()
     }
