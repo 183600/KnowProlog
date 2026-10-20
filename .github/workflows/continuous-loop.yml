@@ -8,7 +8,7 @@ on:
   # 即使收尾的 self-dispatch 步骤被 GitHub 跳过（runner 宕机时连 if: always()
   # 步骤也不会执行），下一次心跳也能在 ≤5 分钟内补位续跑，链条永不断。
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
 
 concurrency:
   group: continuous-loop
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   run-opencode:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 200
     permissions:
       contents: write
       actions: write
@@ -110,6 +110,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+
+      - name: Cache npm (opencode-ai)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
 
       - name: Prefetch cargo dependencies
         run: |
@@ -290,7 +298,7 @@ jobs:
           echo "[ok] xuen 就绪（工作区 /tmp/xuen_ws，只负责产出想法；代码由直连 opencode 写）"
 
       - name: Run agent loop for ~5 hours (xuen 出想法 → opencode 写代码 → clean)
-        timeout-minutes: 300
+        timeout-minutes: 180
         env:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -299,12 +307,15 @@ jobs:
           set -o pipefail
           BRANCH="${GITHUB_REF_NAME:-master}"
           OUT=/tmp/oc_out.log
-          DEADLINE=$(( $(date +%s) + 4*3600 + 1800 ))
+          # 单次 run 的硬预算：3 小时（step 上限 180 分钟，job 上限 200 分钟，
+          # 留 10 分钟给收尾的清理 / 最终提交 / 推送）
+          RUN_HOURS=3
+          DEADLINE=$(( $(date +%s) + RUN_HOURS*3600 - 600 ))
 
           # ================= 两阶段提示词（improve -> clean） =================
           # bug / perf 阶段已移除：improve 阶段先由 xuen 产出想法，再由直连 opencode 写代码。
           XUEN_TASK='改进这个项目'
-          PROMPT_IMPROVE='改进这个项目。先通读 README.md、PLAN.md 和现有代码，理解项目目标与当前进度，然后做出实质性的改进：补全缺失的功能、完善核心实现、提升代码质量与可用性，让项目向目标推进。每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。不要输出或写入“改进了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动。'
+          PROMPT_IMPROVE='改进这个项目。先通读 README.md、PLAN.md 和现有代码，理解项目目标与当前进度，然后做出实质性的改进：补全缺失的功能、完善核心实现、提升代码质量与可用性，让项目向目标推进。每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。不要输出或写入“改进了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动。'
           PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORT*.md、临时调试脚本与调试输出等杂物；确保仓库中没有任何关于修复了哪些bug、优化或改进了哪些内容的记录（包括注释）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README*.md（含所有语言版本的 README）是项目说明文档，同样必须原样保留，不能删除或移动；tests/ 是测试套件，必须原样保留；知识库与语料等仍被项目引用或加载的数据文件（如 *.txt、*.jsonld）不属于“多余的内容”，必须保留。'
 
           # 每阶段单次调用的最大时长（秒）
@@ -335,7 +346,9 @@ jobs:
           # NVIDIA 端点 https://integrate.api.nvidia.com/v1，模型优先 glm-5.3，目录中
           # 不存在时自动改用 glm-5-3-flash；无 NVIDIA_API_KEY / 端点失效 / 无 GLM 模型时
           # 自然回落免费模型。harness 保持统一：所有 provider 一律通过同一 agent CLI 调用。
-          NVIDIA_PROB=20
+          # 实测（4 个 run、14 次 NVIDIA 阶段）：全部被阶段预算杀掉，单步 121s，
+          # 历史提交里只占约 4%。默认关闭，需要时再打开。
+          NVIDIA_PROB=0
           NVIDIA_MODEL=""
           CURRENT_PROVIDER="free"
           PROVIDER_BROKEN=""
@@ -770,6 +783,8 @@ jobs:
           run_phase() {
             local phase="$1" prompt="$2" budget="$3"
             local attempt=0
+            # 整个阶段（含所有重试）共用的硬上限
+            local phase_end=$(( $(date +%s) + budget ))
             FAIL_COUNT=0
             RATE_COUNT=0
             # 每个阶段开始时恢复优先模型（每阶段总是优先尝试 deepseek-v4.1-flash-free）
@@ -781,12 +796,21 @@ jobs:
             while [ $attempt -lt 3 ]; do
               attempt=$((attempt+1))
 
-              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              local NOW=$(date +%s)
+              if [ "$NOW" -ge "$DEADLINE" ]; then
                 echo "[info] phase=$phase 全局时间已用尽，跳过"
                 return 1
               fi
+              local budget_now=$(( phase_end - NOW ))
+              local REMAIN=$(( DEADLINE - NOW ))
+              [ "$budget_now" -gt "$REMAIN" ] && budget_now="$REMAIN"
+              if [ "$budget_now" -le 60 ]; then
+                echo "[info] phase=$phase 剩余时间不足，跳过"
+                return 1
+              fi
 
-              if ! pick_provider; then
+              # 模型只在 run 开始时挑一次；只有失败清空后才重新挑
+              if [ -z "$CURRENT_MODEL" ] && ! pick_provider; then
                 FAIL_COUNT=$((FAIL_COUNT+1))
                 echo "[warn] phase=$phase 免费池与 NVIDIA 均不可用（目录不可达），连续 $FAIL_COUNT 次，120s 后重试"
                 if [ $FAIL_COUNT -ge 3 ]; then
@@ -810,7 +834,7 @@ jobs:
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$CURRENT_MODEL effort=${EFFORT:-none} ==========="
 
               record_model "$CURRENT_MODEL"
-              timeout --kill-after=180 "$budget" opencode run -m "$CURRENT_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
+              timeout --kill-after=180 "$budget_now" opencode run -m "$CURRENT_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
 
               # 成功
@@ -842,6 +866,7 @@ jobs:
                   echo "[warn] 连续 8 次限流，放弃该阶段"
                   return 1
                 fi
+                CURRENT_MODEL=""   # 清空 → 下一轮重新挑 provider/模型
                 sleep 90
                 continue
               fi
@@ -868,6 +893,7 @@ jobs:
                 echo "[warn] 连续 3 次失败，放弃该阶段"
                 return 1
               fi
+              CURRENT_MODEL=""   # 清空 → 下一轮重新挑 provider/模型
               sleep 30
             done
 
@@ -891,7 +917,7 @@ jobs:
                 echo "[info] phase=ideas(xuen) 全局时间已用尽，跳过"
                 return 1
               fi
-              if ! pick_provider; then
+              if [ -z "$CURRENT_MODEL" ] && ! pick_provider; then
                 echo "[warn] phase=ideas(xuen) 免费池与 NVIDIA 均不可用，120s 后重试"
                 sleep 120
                 continue
@@ -927,6 +953,7 @@ jobs:
                   mark_broken nvidia
                   echo "[info] NVIDIA 命中限流，改走免费模型"
                 fi
+                CURRENT_MODEL=""   # 清空 → 下一轮重新挑模型
                 sleep 90
                 continue
               fi
@@ -958,12 +985,8 @@ jobs:
           # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main/master。
           maybe_run_tests() {
             local iter="$1"
-            local TG_ROLL=$(( (RANDOM % 100) + 1 ))
-            if [ "$TG_ROLL" -gt 20 ]; then
-              echo "[test-gate] iter #$iter 骰子 ${TG_ROLL}/100 > 20，本轮不跑测试（80%）"
-              return 0
-            fi
-            echo "[test-gate] iter #$iter 骰子 ${TG_ROLL}/100 ≤ 20，本轮执行测试（20%）"
+            # 不再按 20% 抽样：每次提交后都跑（剩余时间/依赖/超时保护仍然生效）
+            echo "[test-gate] iter #$iter 执行 cargo test"
             local TG_REMAIN=$(( DEADLINE - $(date +%s) ))
             if [ "$TG_REMAIN" -lt 1200 ]; then
               echo "[test-gate] 剩余时间不足 20 分钟，放弃本次测试"
@@ -1038,6 +1061,13 @@ jobs:
           }
 
           # ================= 主循环 =================
+          # ---- 模型只在 run 开始时探测/挑选一次，之后所有阶段复用 ----
+          if pick_provider; then
+            echo "[provider] 选定 $CURRENT_MODEL（$CURRENT_PROVIDER），本次 run 内固定使用"
+          else
+            echo "[warn] 启动时没有可用模型，第一个阶段会再试一次"
+          fi
+
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             i=$((i+1))
 
@@ -1050,7 +1080,7 @@ jobs:
             fi
 
             # ----- 两个阶段：improve -> clean（bug / perf 已移除） -----
-            for phase in improve clean; do
+            for phase in improve; do
               case "$phase" in
                 improve) P="$PROMPT_IMPROVE"; T="$IMPROVE_TIMEOUT" ;;
                 clean)   P="$PROMPT_CLEAN";   T="$CLEAN_TIMEOUT"   ;;
