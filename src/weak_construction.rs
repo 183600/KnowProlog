@@ -535,6 +535,12 @@ impl WeakConstructor {
                     frame.modality.label()
                 ));
             }
+            if let Some(temporal) = &frame.temporal {
+                accumulator.review_reasons.insert(format!(
+                    "时间限定「{}」只保留在证据中，不写成永远成立",
+                    temporal.render_text()
+                ));
+            }
         }
     }
 
@@ -566,6 +572,12 @@ impl WeakConstructor {
                 }
                 if has_speculation(sentence) {
                     accumulator.review_reasons.insert("传闻/可能语气不进入断言事实".to_string());
+                }
+                if let Some(temporal) = crate::relation_frame::parse_temporal(sentence) {
+                    accumulator.review_reasons.insert(format!(
+                        "时间限定「{}」只保留在证据中，不写成永远成立",
+                        temporal.render_text()
+                    ));
                 }
             }
         }
@@ -1298,6 +1310,29 @@ mod tests {
             .find(|item| item.candidate.contains("钱七"))
             .expect("已接受候选应能由模式生成措辞");
         assert_eq!(generated.text, "钱七的师傅是孙八");
+    }
+
+
+    #[test]
+    fn temporal_scope_forces_review() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let corpus = "张三的师傅是李四。\n王五的师傅是赵六。\n1991年，钱七的师傅是孙八。\n";
+        let report = constructor(facts, "师傅").build(corpus, &ConstructionOptions::default());
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|item| item.subject == "钱七")
+            .expect("应抽出带时间的候选");
+        assert_eq!(candidate.decision, CandidateDecision::Review);
+        assert!(
+            candidate
+                .review_reasons
+                .iter()
+                .any(|reason| reason.contains("时间限定"))
+        );
     }
 
     #[test]
