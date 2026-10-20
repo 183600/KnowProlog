@@ -415,6 +415,48 @@ mod tests {
     }
 
     #[test]
+    fn depth_budget_that_exactly_fits_is_complete() {
+        let graph = BTreeMap::from([
+            ("甲", vec!["乙"]),
+            ("乙", vec!["丙"]),
+            ("丙", vec![]),
+        ]);
+        let outcome = evaluate_closure(
+            "甲",
+            ClosureOp::Plus,
+            ClosureBudget {
+                max_depth: 2,
+                ..ClosureBudget::default()
+            },
+            Some("law"),
+            neighbors(&graph),
+        )
+        .unwrap();
+        assert!(outcome.complete());
+        assert_eq!(outcome.truncated, None);
+        assert_eq!(outcome.reached_count, 2);
+    }
+
+    #[test]
+    fn expansion_budget_stops_search_and_marks_lower_bound() {
+        let graph = graph();
+        let outcome = evaluate_closure(
+            "甲",
+            ClosureOp::Plus,
+            ClosureBudget {
+                max_expansions: 1,
+                ..ClosureBudget::default()
+            },
+            Some("law"),
+            neighbors(&graph),
+        )
+        .unwrap();
+        assert_eq!(outcome.truncated, Some(ClosureTruncation::Expansions));
+        assert!(outcome.count_is_lower_bound());
+        assert_eq!(outcome.reached_count, 1);
+    }
+
+    #[test]
     fn witness_limit_does_not_shrink_the_distinct_count() {
         let graph = graph();
         let outcome = evaluate_closure(
