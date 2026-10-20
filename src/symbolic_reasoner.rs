@@ -702,8 +702,9 @@ pub struct SymbolicReasoner {
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
-    // 统一证据索引：词面倒排 × 结构 PPR × 谓词匹配，支持约束与可审计剪枝回执
-    retrieval: DenseRetriever,
+    // 统一证据索引：词面倒排 × 结构 PPR × 谓词匹配，支持约束与可审计剪枝回执。
+    // 用 Mutex 承载惰性重建，使只读回答路径也能在不改变 &self 契约下检索。
+    retrieval: parking_lot::Mutex<DenseRetriever>,
     // 实体属性三元组（观察到的），供归结引擎编码事实
     attributes: HashSet<(String, String, String)>,
     // 属性查询索引：规范槽位 `(实体, 属性)` → 取值列表（随知识重建）
@@ -788,7 +789,7 @@ impl Clone for SymbolicReasoner {
             planner: self.planner.clone(),
             linker: self.linker.clone(),
             generator: self.generator.clone(),
-            retrieval: self.retrieval.clone(),
+            retrieval: parking_lot::Mutex::new(self.retrieval.lock().clone()),
             attributes: self.attributes.clone(),
             attribute_index: self.attribute_index.clone(),
             associations: self.associations.clone(),
@@ -948,7 +949,7 @@ impl SymbolicReasoner {
             planner: QueryPlanner::new(),
             linker,
             generator,
-            retrieval: DenseRetriever::new(8, 0.85, 12),
+            retrieval: parking_lot::Mutex::new(DenseRetriever::new(8, 0.85, 12)),
             attributes: HashSet::new(),
             attribute_index: HashMap::new(),
             associations,
@@ -1500,18 +1501,18 @@ impl SymbolicReasoner {
     /// 索引随 `observe_facts` 增量观察，首次查询时惰性重建倒排表；
     /// 结果与独立调用 `DenseRetriever::observe_facts + search` 一致。
     pub fn evidence_search(
-        &mut self,
+        &self,
         query: &str,
         k: usize,
         constraints: &SearchConstraints,
         budget: SearchBudget,
     ) -> EvidenceSearch {
-        self.retrieval.search(query, k, constraints, budget)
+        self.retrieval.lock().search(query, k, constraints, budget)
     }
 
     /// 证据检索的文本视图：排序证据 + 检索回执。
     pub fn evidence_report(
-        &mut self,
+        &self,
         query: &str,
         k: usize,
         constraints: &SearchConstraints,
@@ -1520,7 +1521,7 @@ impl SymbolicReasoner {
         let search = self.evidence_search(query, k, constraints, budget);
         format!(
             "{}\n\n{}",
-            self.retrieval.format_hits(query, &search.hits),
+            self.retrieval.lock().format_hits(query, &search.hits),
             search.receipt.render_text()
         )
     }
@@ -1630,7 +1631,7 @@ impl SymbolicReasoner {
         self.perf.bump("observe_calls");
         self.perf.bump_by("observe_facts_input", facts.len() as u64);
         // 统一证据索引与知识图谱同源观察（内部去重；重建按需惰性触发）
-        self.retrieval.observe_facts(facts);
+        self.retrieval.lock().observe_facts(facts);
         // 话语引擎：本体叙事与 DCG 生成共用同一批事实（内部去重，可反复观察）
         if self.config.enable_discourse {
             self.discourse.observe_facts(facts);
@@ -5767,7 +5768,87 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_planned(question) {
             return Some(answer);
         }
-        self.answer_by_prediction(question)
+        if let Some(answer) = self.answer_by_prediction(question) {
+            return Some(answer);
+        }
+        self.answer_by_evidence(question)
+    }
+
+    /// 最后一道接地回答：计划与链接预测都无结论时，用统一证据索引取回
+    /// 「已知实体 + 被提及谓词」的事实，并附检索回执。只引用索引中的真实
+    /// 三元组，不生成无出处内容；没有同时满足锚定与谓词条件的证据就弃权。
+    fn answer_by_evidence(&self, question: &str) -> Option<String> {
+        if !self.config.enable_generation || self.retrieval.lock().is_empty() {
+            return None;
+        }
+        let entities = self.entities_mentioned(question);
+        if entities.is_empty() {
+            return None;
+        }
+        let normalized_question = self.aligner.normalize_cow(question);
+        let mentioned_canonicals = self.mentioned_predicate_canonicals(question);
+        let mentions_predicate = !mentioned_canonicals.is_empty()
+            || self
+                .known_predicates_normalized_cache
+                .iter()
+                .any(|(_, predicate_norm)| {
+                    !predicate_norm.is_empty()
+                        && normalized_question.contains(predicate_norm.as_str())
+                });
+        if !mentions_predicate {
+            return None;
+        }
+
+        let search = self.evidence_search(
+            question,
+            self.config.max_predictions.clamp(1, 5),
+            &SearchConstraints::default(),
+            SearchBudget::default(),
+        );
+        let anchors: HashSet<&str> = entities.iter().map(String::as_str).collect();
+        let hits: Vec<_> = search
+            .hits
+            .iter()
+            .filter(|hit| {
+                let anchored =
+                    anchors.contains(hit.subject.as_str()) || anchors.contains(hit.object.as_str());
+                if !anchored || hit.score < 0.2 {
+                    return false;
+                }
+                let canonical = self.aligner.canonical_form(&hit.predicate);
+                let predicate_norm = self.aligner.normalize_cow(&hit.predicate);
+                mentioned_canonicals.contains(&hit.predicate)
+                    || mentioned_canonicals.contains(&canonical)
+                    || (!predicate_norm.is_empty()
+                        && normalized_question.contains(predicate_norm.as_ref() as &str))
+            })
+            .take(3)
+            .collect();
+        if hits.is_empty() {
+            return None;
+        }
+
+        let mut output = String::from("根据证据索引（带检索回执的符号检索）：\n");
+        for (index, hit) in hits.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}（{}）\n",
+                index + 1,
+                hit.text(),
+                hit.breakdown()
+            ));
+        }
+        output.push_str(&format!(
+            "  检索回执：候选 {}，打分 {}，上界剪枝 {}；{}。",
+            search.receipt.candidates,
+            search.receipt.scanned,
+            search.receipt.bound_pruned,
+            if search.receipt.certified_top_k {
+                "top-k 已证明"
+            } else {
+                "未证明 top-k（结果按当前预算返回）"
+            }
+        ));
+        Some(output.trim_end().to_string())
     }
 
     fn answer_by_prediction(&self, question: &str) -> Option<String> {
@@ -8536,6 +8617,27 @@ mod tests {
         assert!(!search.hits.is_empty());
         assert!(search.hits.iter().all(|hit| hit.predicate == "师傅"));
         assert!(search.receipt.constraint_pruned > 0);
+    }
+
+    #[test]
+    fn test_evidence_fallback_answers_with_citation_and_receipt() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer_by_evidence("张三的师傅是谁")
+            .expect("已锚定实体且已提及谓词时应由证据索引作答");
+        assert!(answer.contains("张三"), "{}", answer);
+        assert!(answer.contains("师傅"), "{}", answer);
+        assert!(answer.contains("李四"), "{}", answer);
+        assert!(answer.contains("检索回执"), "{}", answer);
+        assert!(answer.contains("top-k 已证明"), "{}", answer);
+    }
+
+    #[test]
+    fn test_evidence_fallback_declines_without_anchored_entity() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.answer_by_evidence("师傅是谁").is_none());
     }
 
     #[test]
