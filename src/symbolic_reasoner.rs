@@ -630,6 +630,10 @@ pub struct PluginRecipeReply {
     pub attribute: Option<String>,
     pub question: String,
     pub kind: &'static str,
+    /// 本轮结束后应进入对话焦点的实体：正向配方取答案（最后一个提及的
+    /// 实体），逆向配方保留被查询的主语。用于「这位导演还拍过什么」这类
+    /// 省略主语的下一轮追问。
+    pub focus: Option<String>,
 }
 
 /// 结构化证明视图：可视化（Mermaid/ASCII）消费的纯数据，不重复解析逻辑。
@@ -1686,6 +1690,7 @@ impl SymbolicReasoner {
             _ => recipe.question.clone(),
         };
         let mut answer = None;
+        let mut answer_values = Vec::new();
         let mut evidence = Vec::new();
         if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
             if let Some(lookup) = self.recipe_lookup(
@@ -1695,6 +1700,7 @@ impl SymbolicReasoner {
                 &recipe.answer_types,
             ) {
                 if !lookup.values.is_empty() {
+                    answer_values = lookup.values.clone();
                     answer = Some(lookup.values.join("、"));
                     evidence = lookup.evidence;
                 }
@@ -1704,6 +1710,13 @@ impl SymbolicReasoner {
             answer = self.answer(&question);
         }
         let answer = answer?;
+        // 正向问句的答案通常是下一轮的话题（阿凡达 → 卡梅隆）；逆向问句
+        // 的主语本来就是话题（卡梅隆 → 阿凡达），不能被答案覆盖。
+        let focus = if recipe.direction.is_inverse() {
+            entity.clone()
+        } else {
+            answer_values.first().cloned().or_else(|| entity.clone())
+        };
         let composed = runtime.compose_answer_with_evidence(outcome, &answer, &evidence);
         let plan = vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
         let provenance = vec![format!(
@@ -1718,6 +1731,7 @@ impl SymbolicReasoner {
             attribute: recipe.attribute,
             question,
             kind: "attribute",
+            focus,
         })
     }
 
@@ -10056,6 +10070,21 @@ template = "film.works.template"
 kind = "template"
 id = "film.works.template"
 template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
+
+[[contributions]]
+kind = "recipe"
+id = "film.directed_by"
+patterns = ["谁导演了{entity}"]
+question = "{entity}的导演是什么"
+attribute = "导演"
+direction = "forward"
+answer_types = ["人物"]
+template = "film.directed.template"
+
+[[contributions]]
+kind = "template"
+id = "film.directed.template"
+template = "「{entity}」的导演是{answer}。依据：{evidence}"
 "#,
         )
         .expect("测试清单应可解析");
@@ -10089,12 +10118,27 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .expect("焦点实体应能完成逆向配方");
         assert_eq!(reply.entity.as_deref(), Some("卡梅隆"));
         assert_eq!(reply.question, "卡梅隆导演过哪些作品");
+        assert_eq!(
+            reply.focus.as_deref(),
+            Some("卡梅隆"),
+            "逆向问句的焦点应留在被查询的主语"
+        );
         assert!(reply.text.contains("阿凡达"), "{}", reply.text);
         assert!(reply.text.contains("依据"), "{}", reply.text);
         assert!(
             reply.text.contains("属于 电影"),
             "依据应复述答案的类型约束：{}",
             reply.text
+        );
+
+        let forward = runtime.rewrite("谁导演了阿凡达");
+        let forward_reply = reasoner
+            .answer_plugin_recipe(&forward, &mut runtime, None)
+            .expect("正向配方应命中");
+        assert_eq!(
+            forward_reply.focus.as_deref(),
+            Some("卡梅隆"),
+            "正向问句的焦点应转到答案，供「这位导演」继续追问"
         );
         assert!(
             reply.plan.iter().any(|plan| plan.contains("film.works_by_director")),

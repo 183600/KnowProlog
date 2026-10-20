@@ -478,6 +478,9 @@ impl Session {
             plan.clone(),
             reply.provenance,
         );
+        if let Some(focus) = reply.focus.as_deref() {
+            self.manager.note_plugin_focus(focus);
+        }
         Some((reply.text, plan, reply.kind.to_string()))
     }
 
@@ -2623,6 +2626,108 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         // 多轮：省略主语时用对话焦点补全，再沿同一本体做逆向检索。
         let followup = state
             .take_turn(&session_id, "那他还导演过什么")
+            .await
+            .expect("追问轮次应成功");
+        assert_eq!(followup.source, "plugin", "{}", followup.reply);
+        assert!(followup.reply.contains("阿凡达"), "{}", followup.reply);
+    }
+
+    /// 正向配方回答后焦点转到答案实体：下一轮「这位导演…」可无缝续问。
+    #[tokio::test]
+    async fn plugin_forward_answer_moves_focus_for_role_followup() {
+        let manifest: crate::plugin::PluginManifest = toml::from_str(
+            r#"
+id = "test.film"
+version = "0.1.0"
+api = 1
+name = "电影包"
+default_mode = "on"
+
+[[contributions]]
+kind = "reference"
+id = "film.reference"
+quantifiers = ["这位", "那位"]
+role_words = ["导演"]
+
+[[contributions]]
+kind = "recipe"
+id = "film.directed_by"
+patterns = ["{entity}是谁导演的"]
+question = "{entity}的导演是什么"
+attribute = "导演"
+direction = "forward"
+answer_types = ["人物"]
+template = "film.directed.template"
+
+[[contributions]]
+kind = "recipe"
+id = "film.works_by_director"
+patterns = ["{entity}还拍过什么", "那{entity}还拍过什么"]
+question = "{entity}导演过哪些作品"
+attribute = "导演"
+direction = "inverse"
+answer_types = ["电影"]
+template = "film.works.template"
+
+[[contributions]]
+kind = "template"
+id = "film.directed.template"
+template = "「{entity}」的导演是{answer}。依据：{evidence}"
+
+[[contributions]]
+kind = "template"
+id = "film.works.template"
+template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
+"#,
+        )
+        .expect("测试清单应可解析");
+        let registry = crate::plugin::PluginRegistry::from_manifests(vec![manifest]);
+        let runtime = crate::plugin::PluginRuntime::with_settings(
+            registry,
+            &crate::plugin::PluginSettings::default(),
+        );
+        let facts = vec![
+            PrologFact::Entity {
+                name: "阿凡达".into(),
+                entity_type: "电影".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "卡梅隆".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "阿凡达".into(),
+                rel_type: "导演".into(),
+                to: "卡梅隆".into(),
+            },
+        ];
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: false,
+            ..ReasoningConfig::default()
+        };
+        let mut state = ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        );
+        state.set_plugin_runtime(Some(Arc::new(parking_lot::Mutex::new(runtime))));
+        let state = Arc::new(state);
+
+        let session_id = state.create_session().await.expect("会话应创建成功");
+        let first = state
+            .take_turn(&session_id, "阿凡达是谁导演的")
+            .await
+            .expect("首轮应成功");
+        assert_eq!(first.source, "plugin", "{}", first.reply);
+        assert!(first.reply.contains("卡梅隆"), "{}", first.reply);
+
+        let followup = state
+            .take_turn(&session_id, "这位导演还拍过什么")
             .await
             .expect("追问轮次应成功");
         assert_eq!(followup.source, "plugin", "{}", followup.reply);

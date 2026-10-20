@@ -6637,6 +6637,9 @@ async fn run_interactive_mode(
                                 reply.plan.clone(),
                                 reply.provenance.clone(),
                             );
+                            if let Some(focus) = reply.focus.as_deref() {
+                                dialogue_manager.note_plugin_focus(focus);
+                            }
                         }
                         log_chronicle_reply(
                             &mut chronicle,

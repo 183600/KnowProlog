@@ -771,6 +771,12 @@ impl DialogueManager {
         self.focus.last().map(String::as_str)
     }
 
+    /// 插件配方回答后标注下一轮焦点。正向问句把答案实体置顶，
+    /// 逆向问句仍保留被查询的主语；只移动焦点，不新增对话轮。
+    pub fn note_plugin_focus(&mut self, entity: &str) {
+        self.push_focus(entity.trim());
+    }
+
     pub fn focus_stack(&self) -> &[String] {
         &self.focus
     }
