@@ -68,6 +68,7 @@ use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::dialogue_manager::{
     DialogueKnowledge, DialogueManager, DialogueManagerSnapshot, MoveKind,
 };
+use crate::ontology_reasoning::OntologyProgram;
 use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime};
@@ -1015,6 +1016,13 @@ impl ApiState {
     /// 必须在启动会话 actor 之前调用；不改变任何回答文本。
     pub fn set_nlp_config(&mut self, config: NlpConfig) {
         self.warm.set_nlp_config(config);
+    }
+
+    /// 宿主注入配置态本体（`[type_system]` + `[[predicate_profiles]]` 归约的公理）：
+    /// 在建会话前调用，之后分叉的每个会话都携带同一份单一本体。
+    /// 返回新登记的公理条数（重复调用按整句去重，返回 0）。
+    pub fn configure_ontology(&self, program: &OntologyProgram) -> usize {
+        self.warm.reasoner.lock().configure_ontology_program(program)
     }
 
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
@@ -2502,6 +2510,43 @@ template = "「{entity}」的身高是{answer}。"
             max_sessions,
             StartupLedger::shared(),
         ))
+    }
+
+    /// 配置态本体注入暖基座：分叉出的每个会话同源携带，且注入幂等。
+    #[test]
+    fn configure_ontology_reaches_forked_sessions() {
+        use crate::ontology_reasoning::OntologyProgram;
+        use crate::predicate_registry::PredicateProfileConfig;
+        use crate::type_system::{TypeSubclassConfig, TypeSystemConfig};
+
+        let state = test_state(2);
+        let program = OntologyProgram::from_config(
+            &TypeSystemConfig {
+                subclasses: vec![TypeSubclassConfig {
+                    sub: "学生".into(),
+                    sup: "人物".into(),
+                }],
+                ..TypeSystemConfig::default()
+            },
+            &[PredicateProfileConfig {
+                name: "师傅".into(),
+                domain: vec!["人物".into()],
+                ..PredicateProfileConfig::default()
+            }],
+        );
+        assert_eq!(state.configure_ontology(&program), 2, "子类1 + 定义域1");
+        assert_eq!(state.configure_ontology(&program), 0, "重复注入必须去重");
+        let fork = state.warm.fork();
+        assert_eq!(
+            fork.taught_ontology_lessons().len(),
+            2,
+            "分叉会话应携带配置本体"
+        );
+        let snapshot = fork.dialogue_snapshot();
+        assert!(
+            snapshot.ontology.is_some(),
+            "配置本体应随会话快照导出（生成 = 序列化）"
+        );
     }
 
     fn test_state_with_quality() -> Arc<ApiState> {

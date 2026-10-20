@@ -398,6 +398,92 @@ pub fn canonicalize_lessons(lessons: Vec<OntologyLesson>) -> Vec<OntologyLesson>
     keyed.into_iter().map(|(_, lesson)| lesson).collect()
 }
 
+/// 配置态本体程序：把 config.toml 的 `[type_system]` 与 `[[predicate_profiles]]`
+/// 归约成同一套公理（`OntologyLesson`），与「教学本体」共用**一个**推理器与
+/// 一个胶囊——配置不再有第二套本体，重启/重建后同样保留。
+///
+/// 只并入结构性公理：子类、互斥、定义域/值域、逆关系、传递、对称。
+/// `aliases` 不入本体（别名归一由 aligner / type_system 负责，混入会造成
+/// 类身份重复）；`closure_gate` 是判定档位不是公理。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OntologyProgram {
+    pub lessons: Vec<OntologyLesson>,
+}
+
+impl OntologyProgram {
+    /// 从配置构造（公理顺序按声明序，装入时仍会被规约去重）。
+    pub fn from_config(
+        types: &crate::type_system::TypeSystemConfig,
+        profiles: &[crate::predicate_registry::PredicateProfileConfig],
+    ) -> Self {
+        let mut lessons = Vec::new();
+        for subclass in &types.subclasses {
+            lessons.push(OntologyLesson::Subclass {
+                sub: subclass.sub.clone(),
+                sup: subclass.sup.clone(),
+                original: format!("{}是一种{}", subclass.sub, subclass.sup),
+            });
+        }
+        for pair in &types.disjoint {
+            lessons.push(OntologyLesson::Disjoint {
+                left: pair.left.clone(),
+                right: pair.right.clone(),
+                original: format!("{}和{}互斥", pair.left, pair.right),
+            });
+        }
+        for profile in profiles {
+            for class in &profile.domain {
+                lessons.push(OntologyLesson::Domain {
+                    property: profile.name.clone(),
+                    class: class.clone(),
+                    original: format!("{}关系的定义域是{}", profile.name, class),
+                });
+            }
+            for class in &profile.range {
+                lessons.push(OntologyLesson::Range {
+                    property: profile.name.clone(),
+                    class: class.clone(),
+                    original: format!("{}关系的值域是{}", profile.name, class),
+                });
+            }
+            if let Some(inverse) = &profile.inverse {
+                lessons.push(OntologyLesson::Inverse {
+                    left: profile.name.clone(),
+                    right: inverse.clone(),
+                    original: format!("{}和{}互为逆关系", profile.name, inverse),
+                });
+            }
+            if profile.transitive {
+                lessons.push(OntologyLesson::Transitive {
+                    property: profile.name.clone(),
+                    original: format!("{}关系可以传递", profile.name),
+                });
+            }
+            if profile.symmetric {
+                lessons.push(OntologyLesson::Symmetric {
+                    property: profile.name.clone(),
+                    original: format!("{}是对称的", profile.name),
+                });
+            }
+        }
+        Self { lessons }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lessons.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lessons.len()
+    }
+
+    /// 合并另一份程序（公理集合求并，去重规约后返回总条数）。
+    pub fn merge(&mut self, other: &OntologyProgram) {
+        self.lessons.extend(other.lessons.iter().cloned());
+        self.lessons = canonicalize_lessons(std::mem::take(&mut self.lessons));
+    }
+}
+
 
 /// 一个属性的本体画像（供「本体推理：X关系」报告）
 #[derive(Debug, Clone, Default)]
@@ -1790,5 +1876,103 @@ mod tests {
         capsule.verify().expect("空胶囊应可校验");
         assert!(capsule.closure_matches(&OntologyClosure::default()));
         assert_eq!(capsule.version, ONTOLOGY_CAPSULE_VERSION);
+    }
+
+    /// 配置态本体：`[type_system]` 与 `[[predicate_profiles]]` 归约成同一套公理，
+    /// 且每条公理的原句都能被解析器回读成同一条公理（自描述、可审计）。
+    #[test]
+    fn config_program_roundtrips_through_lesson_parser() {
+        use crate::predicate_registry::PredicateProfileConfig;
+        use crate::type_system::{TypeDisjointConfig, TypeSubclassConfig, TypeSystemConfig};
+
+        let types = TypeSystemConfig {
+            subclasses: vec![
+                TypeSubclassConfig {
+                    sub: "学生".into(),
+                    sup: "人物".into(),
+                },
+                TypeSubclassConfig {
+                    sub: "教师".into(),
+                    sup: "人物".into(),
+                },
+            ],
+            disjoint: vec![TypeDisjointConfig {
+                left: "地点".into(),
+                right: "人物".into(),
+            }],
+            ..TypeSystemConfig::default()
+        };
+        let profiles = vec![PredicateProfileConfig {
+            name: "师傅".into(),
+            aliases: vec!["师父".into()],
+            inverse: Some("徒弟".into()),
+            functional: true,
+            transitive: true,
+            domain: vec!["人物".into()],
+            range: vec!["人物".into()],
+            description: Some("师承".into()),
+            ..PredicateProfileConfig::default()
+        }];
+        let program = OntologyProgram::from_config(&types, &profiles);
+        assert_eq!(
+            program.len(),
+            7,
+            "子类2 + 互斥1 + 域1 + 值1 + 逆1 + 传递1：{:?}",
+            program.lessons
+        );
+        assert!(!program.is_empty());
+        for lesson in &program.lessons {
+            let reparsed = parse_ontology_lesson(lesson.original())
+                .unwrap_or_else(|error| panic!("原句应可回读：{}（{}）", lesson.original(), error));
+            assert_eq!(&reparsed, lesson, "原句回读必须得到同一公理");
+        }
+        // 配置里没有的类型不入本体（别名不产生类层级）
+        let mut merged = program.clone();
+        merged.merge(&program);
+        assert_eq!(merged.lessons.len(), program.lessons.len(), "合并自身应去重");
+    }
+
+    /// 配置公理装入本体推理器：类型层级与谓词画像立即参与闭包物化。
+    #[test]
+    fn config_program_drives_closure_materialization() {
+        use crate::predicate_registry::PredicateProfileConfig;
+        use crate::type_system::TypeSubclassConfig;
+
+        let types = crate::type_system::TypeSystemConfig {
+            subclasses: vec![TypeSubclassConfig {
+                sub: "学生".into(),
+                sup: "人物".into(),
+            }],
+            ..Default::default()
+        };
+        let profiles = vec![PredicateProfileConfig {
+            name: "师傅".into(),
+            transitive: true,
+            domain: vec!["人物".into()],
+            range: vec!["人物".into()],
+            ..PredicateProfileConfig::default()
+        }];
+        let program = OntologyProgram::from_config(&types, &profiles);
+        let mut ontology = OntologyReasoner::new(6);
+        for lesson in &program.lessons {
+            apply_ontology_lesson(&mut ontology, lesson);
+        }
+        ontology.add_instance("张三", "学生");
+        ontology.add_relation("张三", "师傅", "李四");
+        let closure = ontology.materialize();
+        assert!(
+            closure.is_subclass("学生", "人物"),
+            "配置子类应参与闭包：{:?}",
+            closure.instances_snapshot()
+        );
+        assert!(
+            closure.why_instance("张三", "人物").is_some(),
+            "个体类型应沿配置子类上推"
+        );
+        assert!(
+            closure.why_instance("李四", "人物").is_some(),
+            "值域推断应生效：{:?}",
+            closure.why_instance("李四", "人物")
+        );
     }
 }

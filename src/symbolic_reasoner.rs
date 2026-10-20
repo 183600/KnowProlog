@@ -36,7 +36,7 @@ use crate::predicate_registry::PredicateRegistry;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAligner, TermKind};
-use crate::ontology_reasoning::OntologyCapsule;
+use crate::ontology_reasoning::{OntologyCapsule, OntologyLesson, OntologyProgram};
 use crate::path_memory::{
     EdgeSource, PathPredicate, TraversalGraph, TraversalOptions,
 };
@@ -2488,6 +2488,28 @@ impl SymbolicReasoner {
             return Err("请提供本体公理，例如：人是一种动物".to_string());
         }
         self.discourse.teach_axiom(trimmed)
+    }
+
+    /// 配置态本体并入**单一本体**：`[type_system]` 与 `[[predicate_profiles]]`
+    /// 归约出的公理与教学公理共用同一个本体推理器与同一个胶囊，
+    /// 落盘/重建/分叉都不丢（配置不再是第二套本体）。
+    /// 公理集合是单调的：已存在的条目按整句（含原句）去重，重复调用幂等。
+    /// 返回本次新登记的公理条数。
+    pub fn configure_ontology_program(&mut self, program: &OntologyProgram) -> usize {
+        let before = self.discourse.taught_lessons().len();
+        for lesson in &program.lessons {
+            self.discourse.install_lesson(lesson);
+        }
+        let added = self.discourse.taught_lessons().len().saturating_sub(before);
+        if added > 0 {
+            self.perf.bump_by("ontology_config_lessons", added as u64);
+        }
+        added
+    }
+
+    /// 已登记的本体公理（配置态 + 教学态同簿；供审计与断言）。
+    pub fn taught_ontology_lessons(&self) -> &[OntologyLesson] {
+        self.discourse.taught_lessons()
     }
 
     // 多轮生成：接着上一段介绍继续讲后面的句子
@@ -9610,6 +9632,83 @@ mod tests {
         target
             .restore_dialogue_snapshot(&snapshot)
             .expect("无胶囊快照不受影响");
+    }
+
+    /// 配置本体并入单一本体：注入幂等、与教学公理同簿记、
+    /// 随快照/重建/分叉一并保留（配置不再是第二套本体）。
+    #[test]
+    fn test_configure_ontology_program_merges_into_single_program() {
+        use crate::ontology_reasoning::OntologyProgram;
+        use crate::predicate_registry::PredicateProfileConfig;
+        use crate::type_system::{TypeSubclassConfig, TypeSystemConfig};
+
+        let types = TypeSystemConfig {
+            subclasses: vec![TypeSubclassConfig {
+                sub: "学生".into(),
+                sup: "人物".into(),
+            }],
+            ..TypeSystemConfig::default()
+        };
+        let profiles = vec![PredicateProfileConfig {
+            name: "师傅".into(),
+            transitive: true,
+            domain: vec!["人物".into()],
+            ..PredicateProfileConfig::default()
+        }];
+        let program = OntologyProgram::from_config(&types, &profiles);
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        assert_eq!(
+            reasoner.configure_ontology_program(&program),
+            3,
+            "子类1 + 定义域1 + 传递1"
+        );
+        assert_eq!(
+            reasoner.configure_ontology_program(&program),
+            0,
+            "重复注入必须按整句去重"
+        );
+        reasoner
+            .teach_ontology("学生是一种人物")
+            .expect("教学同一条公理应成功");
+        assert_eq!(
+            reasoner.taught_ontology_lessons().len(),
+            3,
+            "配置与教学共用一份公理簿（同原句去重）"
+        );
+
+        // 配置本体随快照走：验证 = 反序列化
+        let snapshot = reasoner.dialogue_snapshot();
+        let capsule = snapshot
+            .ontology
+            .clone()
+            .expect("配置本体应随快照携带");
+        capsule.verify().expect("胶囊应通过校验");
+        assert_eq!(capsule.lessons.len(), 3);
+
+        let mut fresh = SymbolicReasoner::new(test_config(), HashMap::new());
+        fresh
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("配置本体应可恢复");
+        assert_eq!(
+            fresh.taught_ontology_lessons().len(),
+            3,
+            "快照恢复后公理全在"
+        );
+
+        fresh.rebuild_from_graph(&master_facts());
+        assert_eq!(
+            fresh.taught_ontology_lessons().len(),
+            3,
+            "重建图谱后配置本体不得丢"
+        );
+
+        let fork = fresh.fork_session();
+        assert_eq!(
+            fork.taught_ontology_lessons().len(),
+            3,
+            "会话分叉保留单一本体"
+        );
     }
 
     #[test]

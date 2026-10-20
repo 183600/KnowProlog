@@ -25,6 +25,7 @@ use know_prolog::{
     external_knowledge::{AnswerOutcome, ExternalKnowledgeService, get_direct_answer},
     external_ledger::{ExternalLedger, LedgerLoad},
     symbolic_reasoner::SymbolicReasoner,
+    ontology_reasoning::OntologyProgram,
     dialogue_frame::ClarificationOutcome,
     neuro_symbolic_contrast::ContrastArbiter,
     dialogue_manager::{DialogueManager, MoveKind},
@@ -1637,6 +1638,14 @@ async fn main() {
             );
             // 读法观测：服务会话的失败轮同样留下有界回执，指标进共享性能台账。
             api_state.set_nlp_config(config.nlp.clone());
+            // 单一本体：配置态本体注入暖基座，之后分叉的每个会话同源携带。
+            let api_config_lessons = api_state.configure_ontology(&OntologyProgram::from_config(
+                &config.type_system,
+                &config.predicate_profiles,
+            ));
+            if api_config_lessons > 0 {
+                println!("服务已注入配置本体公理：{} 条。", api_config_lessons);
+            }
             let quality_index =
                 quality_index.with_revision(api_state.warm_revision());
             api_state.set_quality_index(Some(Arc::new(quality_index)));
@@ -2704,6 +2713,16 @@ async fn run_interactive_mode(
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
     sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
+    // 单一本体：配置里的类型层级与谓词画像并入教学本体（同一推理器、同一胶囊）
+    let config_lessons = symbolic_reasoner.configure_ontology_program(
+        &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
+    );
+    if config_lessons > 0 {
+        println!(
+            "已并入配置本体公理：{} 条（类型层级与谓词画像，随对话记忆持久保留）。",
+            config_lessons
+        );
+    }
     // 律典：显式采纳/退役决定跨重启生效；缺失文件不影响声明律。
     if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
         symbolic_reasoner.load_persisted_laws(persisted);
