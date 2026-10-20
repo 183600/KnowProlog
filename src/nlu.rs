@@ -324,6 +324,11 @@ impl NLUEngine {
     }
 }
 
+/// 默认领域/意图（供统一模式库把 NLU 意图编译成与配置查询同库的模式条目）。
+pub fn default_domains() -> Vec<DomainConfig> {
+    create_default_domains()
+}
+
 fn create_default_domains() -> Vec<DomainConfig> {
     vec![
         DomainConfig {

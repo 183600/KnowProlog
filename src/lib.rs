@@ -94,6 +94,7 @@ pub mod weak_construction;
 pub mod path_memory;
 pub mod contextual_reference;
 pub mod pattern_closure;
+pub mod pattern_ir;
 pub mod temporal;
 pub mod lexical_trace;
 pub mod trace_graph;
