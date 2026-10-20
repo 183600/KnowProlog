@@ -10691,6 +10691,51 @@ mod tests {
         assert!(!answer.contains("癸"), "{}", answer);
     }
 
+    fn inverse_transitive_registry() -> crate::predicate_registry::PredicateRegistry {
+        use crate::predicate_registry::{PredicateProfileConfig, PredicateRegistry};
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&PredicateProfileConfig {
+            name: "上司".to_string(),
+            transitive: true,
+            inverse: Some("下属".to_string()),
+            ..Default::default()
+        });
+        registry.declare(&PredicateProfileConfig {
+            name: "下属".to_string(),
+            inverse: Some("上司".to_string()),
+            ..Default::default()
+        });
+        registry
+    }
+
+    #[test]
+    fn closure_respects_inverted_predicate_direction() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "上司".to_string(),
+                to: "乙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丙".to_string(),
+            },
+        ]);
+        reasoner.configure_laws(&inverse_transitive_registry());
+        reasoner.register_predicate_query_surface("下属", "上司");
+        let answer = reasoner
+            .answer("丙的所有下属是谁")
+            .expect("逆向闭包应有答案");
+        assert!(answer.contains("甲"), "{}", answer);
+        assert!(answer.contains("乙"), "{}", answer);
+        assert!(answer.contains("共 2 个"), "{}", answer);
+        assert!(answer.contains("law:transitive:上司"), "{}", answer);
+    }
+
     #[test]
     fn closure_composes_with_following_relation() {
         let mut reasoner = closure_reasoner();
