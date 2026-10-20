@@ -5969,7 +5969,7 @@ async fn refresh_symbolic_reasoner(
     }
 }
 
-/// 重建推理器的全局知识（用于删值/更正）：保留会话态，但不再携带旧三元组。
+/// 重建推理器的全局知识（用于删值/更正）：保留会话态，只携带当前三元组。
 async fn rebuild_symbolic_reasoner(
     symbolic_reasoner: &mut SymbolicReasoner,
     oxigraph_manager: &OxigraphManager,
