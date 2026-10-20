@@ -3349,17 +3349,16 @@ async fn run_interactive_mode(
             } else {
                 match load_graph_snapshot(&oxigraph_manager).await {
                     Ok(facts) => {
-                        let mut retriever = DenseRetriever::new(8, 0.85, 12);
-                        retriever.observe_facts(&facts);
-                        let search = retriever.search(
-                            query,
-                            8,
-                            &SearchConstraints::default(),
-                            SearchBudget::default(),
+                        symbolic_reasoner.observe_facts(&facts);
+                        println!(
+                            "{}",
+                            symbolic_reasoner.evidence_report(
+                                query,
+                                8,
+                                &SearchConstraints::default(),
+                                SearchBudget::default(),
+                            )
                         );
-                        println!("{}", retriever.format_hits(query, &search.hits));
-                        println!();
-                        println!("{}", search.receipt.render_text());
                     }
                     Err(e) => println!("加载知识图谱失败: {}", e),
                 }

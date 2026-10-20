@@ -7,6 +7,11 @@
 //!   与查询实体结构相关的分布，作为「稠密」语义信号；
 //! - 谓词匹配：查询词与谓词的归一化匹配作为精确信号。
 //! 三种信号线性融合，输出可解释的证据排序，供生成式回答接地（RAG 的符号版）。
+//!
+//! [`DenseRetriever::search`] 额外提供精确约束（主体/谓词/客体/类型）与
+//! 带证书的 top-k：倒排索引中的候选先按保守上界排序，上界低于当前第 k 名
+//! 的文档整段跳过；扫描预算耗尽或候选生成被截断时，[`SearchReceipt`] 会
+//! 明确标记 `certified_top_k = false`，保证「省略」始终可审计。
 
 use std::collections::{HashMap, HashSet};
 
@@ -158,6 +163,7 @@ struct DocRecord {
 }
 
 /// 符号稠密检索器
+#[derive(Clone)]
 pub struct DenseRetriever {
     top_k: usize,
     damping: f64,

@@ -17,6 +17,9 @@ use crate::causal_tokenization::{
 use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::default_logic::{self, DefaultTheory, Literal};
+use crate::dense_retrieval::{
+    DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints,
+};
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
@@ -699,6 +702,8 @@ pub struct SymbolicReasoner {
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
+    // 统一证据索引：词面倒排 × 结构 PPR × 谓词匹配，支持约束与可审计剪枝回执
+    retrieval: DenseRetriever,
     // 实体属性三元组（观察到的），供归结引擎编码事实
     attributes: HashSet<(String, String, String)>,
     // 属性查询索引：规范槽位 `(实体, 属性)` → 取值列表（随知识重建）
@@ -783,6 +788,7 @@ impl Clone for SymbolicReasoner {
             planner: self.planner.clone(),
             linker: self.linker.clone(),
             generator: self.generator.clone(),
+            retrieval: self.retrieval.clone(),
             attributes: self.attributes.clone(),
             attribute_index: self.attribute_index.clone(),
             associations: self.associations.clone(),
@@ -942,6 +948,7 @@ impl SymbolicReasoner {
             planner: QueryPlanner::new(),
             linker,
             generator,
+            retrieval: DenseRetriever::new(8, 0.85, 12),
             attributes: HashSet::new(),
             attribute_index: HashMap::new(),
             associations,
@@ -1488,6 +1495,36 @@ impl SymbolicReasoner {
         &self.generator
     }
 
+    /// 在当前知识快照上执行带约束/预算的证据检索（含可审计回执）。
+    ///
+    /// 索引随 `observe_facts` 增量观察，首次查询时惰性重建倒排表；
+    /// 结果与独立调用 `DenseRetriever::observe_facts + search` 一致。
+    pub fn evidence_search(
+        &mut self,
+        query: &str,
+        k: usize,
+        constraints: &SearchConstraints,
+        budget: SearchBudget,
+    ) -> EvidenceSearch {
+        self.retrieval.search(query, k, constraints, budget)
+    }
+
+    /// 证据检索的文本视图：排序证据 + 检索回执。
+    pub fn evidence_report(
+        &mut self,
+        query: &str,
+        k: usize,
+        constraints: &SearchConstraints,
+        budget: SearchBudget,
+    ) -> String {
+        let search = self.evidence_search(query, k, constraints, budget);
+        format!(
+            "{}\n\n{}",
+            self.retrieval.format_hits(query, &search.hits),
+            search.receipt.render_text()
+        )
+    }
+
     /// 运行时登记谓词别名（来自谓词画像准入）：查询解析与生成词面同步归一。
     pub fn register_predicate_alias(&mut self, alias: &str, canonical: &str) -> bool {
         if alias.trim().is_empty() || canonical.trim().is_empty() || alias == canonical {
@@ -1592,6 +1629,8 @@ impl SymbolicReasoner {
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         self.perf.bump("observe_calls");
         self.perf.bump_by("observe_facts_input", facts.len() as u64);
+        // 统一证据索引与知识图谱同源观察（内部去重；重建按需惰性触发）
+        self.retrieval.observe_facts(facts);
         // 话语引擎：本体叙事与 DCG 生成共用同一批事实（内部去重，可反复观察）
         if self.config.enable_discourse {
             self.discourse.observe_facts(facts);
@@ -8461,6 +8500,42 @@ mod tests {
             .answer("姚明的身高是什么")
             .expect("属性值应沿属性槽位命中");
         assert!(answer.contains("226cm"), "属性答案：{}", answer);
+    }
+
+    #[test]
+    fn test_evidence_index_ranks_observed_facts_with_receipt() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let search = reasoner.evidence_search(
+            "张三的师傅是谁",
+            3,
+            &SearchConstraints::default(),
+            SearchBudget::unlimited(),
+        );
+        assert!(!search.hits.is_empty());
+        assert_eq!(search.hits[0].subject, "张三");
+        assert_eq!(search.hits[0].predicate, "师傅");
+        assert!(search.receipt.certified_top_k);
+        assert!(search.receipt.notes.iter().any(|note| note.contains("top-k")));
+    }
+
+    #[test]
+    fn test_evidence_index_honours_exact_constraints() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let constraints = SearchConstraints {
+            predicate: Some("师傅".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = reasoner.evidence_search(
+            "师傅",
+            8,
+            &constraints,
+            SearchBudget::unlimited(),
+        );
+        assert!(!search.hits.is_empty());
+        assert!(search.hits.iter().all(|hit| hit.predicate == "师傅"));
+        assert!(search.receipt.constraint_pruned > 0);
     }
 
     #[test]
