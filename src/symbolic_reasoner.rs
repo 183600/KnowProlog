@@ -943,9 +943,9 @@ impl SymbolicReasoner {
 
     /// 用一份新的图谱快照替换推理器的全局知识，同时保留会话态。
     ///
-    /// `observe_facts` 只增不减，不能表达「更正删掉了旧值」。这里以同一配置、
-    /// 同义词与性能台账重建基座，再恢复会话快照（焦点/历史/会话事实/规则/帧），
-    /// 从而让查询立即看到更正后的图谱，而不是继续携带旧值。
+    /// `observe_facts` 只增不减；这里以同一配置、同义词与性能台账重建基座，
+    /// 再恢复会话快照（焦点/历史/会话事实/规则/帧），
+    /// 使查询立即看到更新后的图谱。
     pub fn rebuild_from_graph(&mut self, facts: &[PrologFact]) {
         let synonyms = self.aligner.synonyms().clone();
         let snapshot = self.dialogue_snapshot();
