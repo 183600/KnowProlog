@@ -1894,6 +1894,7 @@ impl PluginRuntime {
                 // 后续普通改写改变了规范问句：先前配方的答案与当前问法不一致。
                 trace.recipe = None;
             }
+            let recipe_applied = chosen.recipe_invocation.is_some();
             let next = chosen.output.clone();
             if next == text || !seen.insert(next.clone()) {
                 trace.notes.push("改写出现环或空转，已停止。".to_string());
@@ -1901,6 +1902,11 @@ impl PluginRuntime {
             }
             text = next;
             trace.effective = text.clone();
+            // 配方输出就是规范问句，是改写链的终点；继续套用其它模式会把
+            // 「主演过…」里的「演过」再次当成槽位，叠出「主主主演」。
+            if recipe_applied {
+                break;
+            }
         }
 
         if text == match_input && text != original {
@@ -3105,6 +3111,41 @@ mod tests {
 
         let untouched = runtime.rewrite("今天天气怎么样？");
         assert_eq!(untouched.text, "今天天气怎么样？");
+    }
+
+    #[test]
+    fn recipe_output_is_terminal_for_rewrite_chain() {
+        let mut film = manifest("zh.film", PluginMode::On);
+        film.contributions.push(recipe(
+            "film.actor_works",
+            "{entity}演过什么电影",
+            "{entity}主演过哪些作品",
+            "film.actor.template",
+        ));
+        film.contributions.push(template(
+            "film.actor.template",
+            "「{entity}」主演过的作品：{answer}。",
+        ));
+        film.contributions.push(rewrite_contribution(
+            "film.actor_rewrite",
+            "{entity}演过哪些作品",
+            "{entity}主演过哪些作品",
+        ));
+        let registry = PluginRegistry::from_manifests(vec![film]);
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+
+        let outcome = runtime.rewrite("萨姆·沃辛顿演过什么电影");
+        assert_eq!(outcome.text, "萨姆·沃辛顿主演过哪些作品");
+        assert_eq!(
+            outcome
+                .trace
+                .matches
+                .iter()
+                .filter(|entry| entry.applied)
+                .count(),
+            1,
+            "配方输出已是规范问句，不应被后续改写再次拼接"
+        );
     }
 
     #[test]

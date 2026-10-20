@@ -40,11 +40,22 @@ patterns = [
   "{entity}由谁执导",
   "{entity}的导演是谁",
   "{entity}是谁拍的",
+  "{entity}是谁拍摄的",
+  "{entity}是谁执导的",
   "{entity}由谁拍摄",
+  "{entity}由谁拍摄的",
   "谁导演了{entity}",
+  "谁导演过{entity}",
   "谁执导了{entity}",
+  "谁执导过{entity}",
   "谁拍摄了{entity}",
+  "谁拍摄过{entity}",
   "谁拍了{entity}",
+  "谁拍过{entity}",
+  "谁导演的{entity}",
+  "谁执导的{entity}",
+  "谁拍摄的{entity}",
+  "谁拍的{entity}",
   "{entity}的导演是谁，依据是什么",
   "{entity}是谁导演的，为什么",
 ]
@@ -59,16 +70,30 @@ id = "film.works_by_director"
 description = "导演 → 作品（逆向检索；答案类型约束为电影）"
 patterns = [
   "{entity}导演过哪些电影",
+  "{entity}导演过哪些作品",
   "{entity}导演的电影有哪些",
   "{entity}执导过哪些电影",
+  "{entity}执导过哪些作品",
   "{entity}导演过哪些动画电影",
   "{entity}执导过哪些动画电影",
+  "{entity}导演过什么电影",
+  "{entity}执导过什么电影",
+  "{entity}导演过什么动画电影",
   "{entity}拍过哪些电影",
+  "{entity}拍过哪些作品",
   "{entity}拍过哪些动画电影",
+  "{entity}拍过什么电影",
+  "{entity}拍过什么动画电影",
   "{entity}拍摄过哪些电影",
+  "{entity}拍摄过哪些作品",
   "{entity}还导演过哪些电影",
   "{entity}还导演过什么",
+  "{entity}还执导过什么",
   "{entity}还拍过什么",
+  "{entity}都导演过哪些电影",
+  "{entity}都拍过哪些电影",
+  "哪些电影是{entity}导演的",
+  "哪些动画电影是{entity}导演的",
   "那{entity}还导演过什么",
   "那{entity}还拍过什么",
 ]
@@ -84,10 +109,17 @@ id = "film.cast_of"
 description = "作品 → 主演（正向；多值合并）"
 patterns = [
   "{entity}的主演是谁",
+  "{entity}的主演有谁",
   "{entity}由谁主演",
   "{entity}由谁出演",
+  "{entity}是谁主演的",
+  "{entity}是谁演的",
+  "{entity}由谁演的",
   "谁主演了{entity}",
   "谁出演了{entity}",
+  "谁演了{entity}",
+  "谁演的{entity}",
+  "谁主演的{entity}",
 ]
 question = "{entity}的主演是谁"
 attribute = "主演"
@@ -101,9 +133,16 @@ description = "演员 → 作品（逆向检索；答案类型约束为电影）
 patterns = [
   "{entity}演过哪些电影",
   "{entity}主演过哪些电影",
+  "{entity}演过什么电影",
+  "{entity}主演过什么电影",
   "{entity}演过哪些动画电影",
+  "{entity}演过什么",
+  "{entity}主演过什么",
   "{entity}还演过哪些电影",
   "{entity}还演过什么",
+  "{entity}都演过哪些电影",
+  "哪些电影是{entity}主演的",
+  "哪些动画电影是{entity}演的",
   "那{entity}还演过什么",
 ]
 question = "{entity}主演过哪些作品"
@@ -189,6 +228,36 @@ expect_plugin = "zh.film"
 [[eval_cases]]
 input = "这位导演还拍过什么"
 expect_rewrite = "这位导演导演过哪些作品"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "阿凡达是谁拍摄的？"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "谁拍过阿凡达"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "哪些电影是卡梅隆导演的"
+expect_rewrite = "卡梅隆导演过哪些作品"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "阿凡达的主演有谁"
+expect_rewrite = "阿凡达的主演是谁"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "萨姆·沃辛顿演过什么电影"
+expect_rewrite = "萨姆·沃辛顿主演过哪些作品"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "哪些电影是萨姆·沃辛顿主演的"
+expect_rewrite = "萨姆·沃辛顿主演过哪些作品"
 expect_plugin = "zh.film"
 
 [[contributions]]
