@@ -6621,7 +6621,18 @@ async fn run_interactive_mode(
                 // 插件配方：只读既有知识源，模板必须全部槽位接地；取不到值则让位核心管线。
                 if let Some(outcome) = plugin_outcome.as_ref() {
                     if let Some(recipe) = outcome.trace.recipe.clone() {
-                        let entity = recipe.slots.get("entity").cloned();
+                        // 回指：配方捕获到「他/这位/该」时接续当前对话焦点，
+                        // 焦点仍由对话管理器统一维护，插件不另建上下文。
+                        let entity = recipe.slots.get("entity").map(|raw| {
+                            if know_prolog::plugin::is_reference_surface(raw) {
+                                dialogue_manager
+                                    .focus_entity()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| raw.clone())
+                            } else {
+                                raw.clone()
+                            }
+                        });
                         let mut answer = None;
                         let mut evidence = Vec::new();
                         if let (Some(entity), Some(attribute)) =

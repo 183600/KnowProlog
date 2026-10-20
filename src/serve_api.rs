@@ -461,7 +461,16 @@ impl Session {
     ) -> Option<(String, Vec<String>, String)> {
         let outcome = outcome?;
         let recipe = outcome.trace.recipe.clone()?;
-        let entity = recipe.slots.get("entity").cloned();
+        let entity = recipe.slots.get("entity").map(|raw| {
+            if crate::plugin::is_reference_surface(raw) {
+                self.manager
+                    .focus_entity()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| raw.clone())
+            } else {
+                raw.clone()
+            }
+        });
         let mut answer = None;
         let mut evidence = Vec::new();
         if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
@@ -2575,7 +2584,7 @@ types = [
 [[contributions]]
 kind = "recipe"
 id = "film.works_by_director"
-patterns = ["{entity}导演过哪些电影"]
+patterns = ["{entity}导演过哪些电影", "那{entity}还导演过什么"]
 question = "{entity}导演过哪些作品"
 attribute = "导演"
 direction = "inverse"
@@ -2641,6 +2650,14 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             "依据必须接地：{}",
             turn.reply
         );
+
+        // 多轮：省略主语时用对话焦点补全，再沿同一本体做逆向检索。
+        let followup = state
+            .take_turn(&session_id, "那他还导演过什么")
+            .await
+            .expect("追问轮次应成功");
+        assert_eq!(followup.source, "plugin", "{}", followup.reply);
+        assert!(followup.reply.contains("阿凡达"), "{}", followup.reply);
     }
 
     fn test_state(max_sessions: usize) -> Arc<ApiState> {

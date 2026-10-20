@@ -1322,6 +1322,24 @@ impl RecipeDirection {
     }
 }
 
+/// 配方 `{entity}` 捕获到的是否为可回指当前焦点的指称词。
+/// 只认封闭的代词/指示词集合，不做模糊匹配，避免把实体名误当回指。
+pub fn is_reference_surface(surface: &str) -> bool {
+    matches!(
+        surface.trim(),
+        "他" | "她" | "它"
+            | "他们"
+            | "她们"
+            | "它们"
+            | "这位"
+            | "那位"
+            | "该"
+            | "这个"
+            | "那个"
+            | "其"
+    )
+}
+
 /// 配方被选中后的可执行调用信息。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecipeInvocation {
