@@ -801,6 +801,9 @@ enum SessionCommand {
     Export {
         reply: oneshot::Sender<SessionEnvelope>,
     },
+    ReadTraces {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
 }
 
 /// 会话句柄：HTTP 层可见的唯一部分（`Send + Sync`）。
@@ -1182,6 +1185,13 @@ impl ApiState {
                             envelope.seal();
                             let _ = reply.send(envelope);
                         }
+                        SessionCommand::ReadTraces { reply } => {
+                            let _ = reply.send(serde_json::json!({
+                                "session_id": session.id,
+                                "report": session.reasoner.read_trace_ledger_report(),
+                                "receipts": session.reasoner.read_trace_receipts(),
+                            }));
+                        }
                     }
                 }
             })
@@ -1382,6 +1392,16 @@ impl ApiState {
         let tx = self.session_tx(session_id).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SessionCommand::Snapshot { reply: reply_tx })
+            .await
+            .map_err(|_| SessionError::Unavailable)?;
+        reply_rx.await.map_err(|_| SessionError::Unavailable)
+    }
+
+    /// 会话级读法回执：只含 digest/计数/有限枚举，不返回原始问句。
+    async fn read_traces(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::ReadTraces { reply: reply_tx })
             .await
             .map_err(|_| SessionError::Unavailable)?;
         reply_rx.await.map_err(|_| SessionError::Unavailable)
@@ -1630,6 +1650,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "POST /sessions",
                     "GET /sessions/{id}",
                     "GET /sessions/{id}/export",
+                    "GET /sessions/{id}/read-traces",
                     "POST /sessions/import",
                     "DELETE /sessions/{id}",
                     "POST /sessions/{id}/turns",
