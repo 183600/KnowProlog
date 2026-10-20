@@ -72,6 +72,10 @@ impl TraceMode {
         !matches!(self, TraceMode::Off)
     }
 
+    pub fn is_off(self) -> bool {
+        matches!(self, TraceMode::Off)
+    }
+
     /// 是否让追踪参与理解与生成（谓词焦点继承、更正覆盖）。
     pub fn is_on(self) -> bool {
         matches!(self, TraceMode::On)
@@ -718,6 +722,11 @@ impl TraceStore {
 
     pub fn entity_focus(&self) -> Option<&str> {
         self.qud.entity_focus()
+    }
+
+    /// 当前最上方开放问据已获回答：置为 Resolved。
+    pub fn resolve_open_qud(&mut self) {
+        self.qud.resolve_open();
     }
 
     /// 会话内更正覆盖值（On 模式下先于知识图谱取值）。

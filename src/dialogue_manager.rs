@@ -32,6 +32,9 @@ use crate::recovery::{
 };
 use crate::recovery::{RecoveryNomination, ReframedReading, VerificationOutcome};
 use crate::symbolic_reasoner::SymbolicReasoner;
+use crate::trace_graph::{
+    NodeId, QudKind, ReferentSource, TraceMode, TraceStore, TurnTrace,
+};
 
 /// 一轮话语的语用类型（对话本体的「动作类」）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +136,9 @@ pub struct DialogueManagerSnapshot {
     /// 交互式查询板：当前查询程序的帧栈（工作记忆）。
     #[serde(default)]
     pub board: QueryBoard,
+    /// 分层追踪图（Off/空态时为 None，快照字节与引入追踪前逐字节一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<TraceStore>,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -537,6 +543,10 @@ pub struct DialogueManager {
     quality: Option<Arc<QualityIndex>>,
     /// 交互式查询板：记住当前查询程序、结果行与证据（随快照持久化）。
     board: QueryBoard,
+    /// 分层追踪模式（默认 Off：不记录、不介入；Observe 只记决策；On 参与理解与生成）。
+    trace_mode: TraceMode,
+    /// 分层追踪图：问据栈、指代轨迹与逐轮决策节点（随快照持久化）。
+    trace: TraceStore,
 }
 
 impl Default for DialogueManager {
@@ -561,6 +571,8 @@ impl DialogueManager {
             last_recovery: None,
             quality: None,
             board: QueryBoard::new(),
+            trace_mode: TraceMode::Off,
+            trace: TraceStore::new(),
         }
     }
 
@@ -608,6 +620,46 @@ impl DialogueManager {
 
     pub fn recovery_mode(&self) -> RecoveryMode {
         self.recovery_mode
+    }
+
+    /// 设置分层追踪模式（Off / Observe / On），支持链式调用。
+    pub fn set_trace_mode(&mut self, mode: TraceMode) -> &mut Self {
+        self.trace_mode = mode;
+        self
+    }
+
+    pub fn trace_mode(&self) -> TraceMode {
+        self.trace_mode
+    }
+
+    /// 分层追踪图（只读）：问据栈、指代轨迹与逐轮决策节点。
+    pub fn trace_store(&self) -> &TraceStore {
+        &self.trace
+    }
+
+    /// 分层追踪图（可变引用；宿主用于编年史回放重建）。
+    pub fn trace_store_mut(&mut self) -> &mut TraceStore {
+        &mut self.trace
+    }
+
+    /// 可读的追踪报告（模式、问据栈、指代轨迹与逐轮决策）。
+    pub fn trace_report(&self) -> String {
+        self.trace.render_report(self.trace_mode)
+    }
+
+    /// 「为什么」查询：沿追踪图 inputs 边回溯某节点的决策链。
+    pub fn trace_why(&self, node_id: u64) -> Option<String> {
+        self.trace.render_why(NodeId(node_id))
+    }
+
+    /// 最近一轮的完整轨迹 JSON（编年史归档用；无记录时为 None）。
+    pub fn last_turn_trace_json(&self) -> Option<serde_json::Value> {
+        self.trace.last_turn_json()
+    }
+
+    /// 从编年史回放一轮轨迹（重启后重建追踪工作记忆）。
+    pub fn replay_turn_trace(&mut self, trace: TurnTrace) {
+        self.trace.push_turn_trace(trace);
     }
 
     /// 注入质量索引（只读；`None` 时完全走常规回答路径）。
@@ -765,7 +817,7 @@ impl DialogueManager {
         self.turns.push(DialogueTurn {
             index: self.turns.len() + 1,
             user: input.trim().to_string(),
-            kind,
+            kind: kind.clone(),
             entity: entity.map(str::to_string),
             attribute: attribute.map(str::to_string),
             answer_excerpt: Some(excerpt(answer, 40)),
@@ -780,6 +832,40 @@ impl DialogueManager {
         self.last_reply = plan;
         if self.externals.last().map(String::as_str) == Some(input.trim()) {
             self.externals.pop();
+        }
+        // On/Observe 模式：插件代答也纳入分层追踪（记 Plugin 指代来源）。
+        if !self.trace_mode.is_off() {
+            let turn_no = self.trace.turn_count() + 1;
+            let surface = self.trace.record_surface(turn_no, input);
+            let kind_label = format!("{:?}", kind);
+            let interpret = self.trace.record_interpret(
+                turn_no,
+                surface,
+                &kind_label,
+                entity,
+                attribute,
+                None,
+                false,
+            );
+            if let Some(entity) = entity {
+                self.trace.record_mention(
+                    turn_no,
+                    interpret,
+                    entity,
+                    entity,
+                    ReferentSource::Plugin,
+                    "插件配方代答",
+                );
+            }
+            self.trace.record_reply(
+                turn_no,
+                entity,
+                attribute,
+                vec![interpret],
+                &[],
+                Some(answer),
+            );
+            self.trace.resolve_open_qud();
         }
     }
 
@@ -829,6 +915,11 @@ impl DialogueManager {
             last_reply: self.last_reply.clone(),
             recovery: self.recovery.clone(),
             board: self.board.clone(),
+            trace: if self.trace.is_empty() {
+                None
+            } else {
+                Some(self.trace.clone())
+            },
         }
     }
 
@@ -839,6 +930,7 @@ impl DialogueManager {
         self.last_reply = snapshot.last_reply.clone();
         self.recovery = snapshot.recovery.clone();
         self.board = snapshot.board.clone();
+        self.trace = snapshot.trace.clone().unwrap_or_default();
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -884,6 +976,9 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        if let Some(reply) = self.try_trace_correction(input, knowledge) {
+            return Some(reply);
+        }
         if !self.recovery_mode.eq(&RecoveryMode::Off) {
             if let Some(reply) = self.try_resolve_pending(input) {
                 return Some(reply);
@@ -977,6 +1072,9 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        if let Some(reply) = self.try_trace_correction(input, knowledge) {
+            return Some(reply);
+        }
         if let Some(reply) = self.plan_board_reply(input, knowledge) {
             return Some(reply);
         }
@@ -1116,6 +1214,33 @@ impl DialogueManager {
 
         // 指代问句：他/她/它+X
         if contains_pronoun(stripped) {
+            // On 模式谓词焦点继承：「他呢」在属性问据下读作「他（=<焦点实体>）的<属性>呢」，
+            // 而不是退回身份问句——上一轮问身高，这一轮仍问身高。
+            if let Some(remainder) = stripped.strip_suffix('呢') {
+                let remainder = remainder.trim();
+                if self.trace_mode.is_on()
+                    && !remainder.is_empty()
+                    && contains_pronoun(remainder)
+                {
+                    if let Some(attribute) = self.trace.predicate_focus() {
+                        let entity = self
+                            .trace
+                            .entity_focus()
+                            .map(str::to_string)
+                            .or_else(|| focus.clone());
+                        if let Some(entity) = entity {
+                            return UtteranceFrame {
+                                raw: raw.to_string(),
+                                kind: MoveKind::AskAttribute,
+                                entity: Some(entity.clone()),
+                                attribute: Some(attribute.to_string()),
+                                question: Some(format!("{}的{}是什么", entity, attribute)),
+                                inherited: true,
+                            };
+                        }
+                    }
+                }
+            }
             if let Some(entity) = focus.clone() {
                 if has_question {
                     return UtteranceFrame {
@@ -1134,6 +1259,20 @@ impl DialogueManager {
         if let Some(remainder) = stripped.strip_suffix('呢') {
             let remainder = remainder.trim();
             if let Some(entity) = explicit.first().cloned() {
+                // On 模式谓词焦点继承：「那叶莉呢」在属性问据下读作「叶莉的<属性>呢」，
+                // 而不是退回身份问句（「叶莉是什么」）。
+                if self.trace_mode.is_on() {
+                    if let Some(attribute) = self.trace.predicate_focus() {
+                        return UtteranceFrame {
+                            raw: raw.to_string(),
+                            kind: MoveKind::AskAttribute,
+                            entity: Some(entity.clone()),
+                            attribute: Some(attribute.to_string()),
+                            question: Some(format!("{}的{}是什么", entity, attribute)),
+                            inherited: false,
+                        };
+                    }
+                }
                 // 显式实体的省略问句（「那叶莉呢」）：规范化问句，保证查询可命中
                 return UtteranceFrame {
                     raw: raw.to_string(),
@@ -1328,6 +1467,16 @@ impl DialogueManager {
                 answer = knowledge.describe(name);
             }
         }
+        // On 模式：用户更正后的会话内覆盖值优先于图谱旧值（改口在本会话内立即生效）。
+        let mut used_correction = false;
+        if self.trace_mode.is_on() {
+            if let (Some(name), Some(attribute)) = (entity.as_deref(), frame.attribute.as_deref()) {
+                if let Some(value) = self.trace.value_override(name, attribute) {
+                    answer = Some(value.to_string());
+                    used_correction = true;
+                }
+            }
+        }
 
         // —— ABox：本轮的信息状态 ——
         let turn_id = format!("t{}", self.turns.len() + 1);
@@ -1489,10 +1638,13 @@ impl DialogueManager {
             answer.is_some(),
         );
 
-        let provenance = answer
+        let mut provenance = answer
             .as_deref()
             .map(classify_provenance)
             .unwrap_or_default();
+        if used_correction {
+            provenance.push("用户更正".to_string());
+        }
         // 知识/续聊轮进入对话本体实例；元话语与寒暄只影响策略，不记入"聊了什么"
         let content_turn = matches!(
             frame.kind,
@@ -1510,7 +1662,7 @@ impl DialogueManager {
                 entity: entity.clone(),
                 attribute: frame.attribute.clone(),
                 answer_excerpt: answer.as_deref().map(|text| excerpt(text, 40)),
-                provenance,
+                provenance: provenance.clone(),
                 plan: plans.clone(),
                 warrant,
                 kb_revision: self.quality.as_ref().map(|index| index.revision),
@@ -1523,11 +1675,13 @@ impl DialogueManager {
         if self.externals.last().map(String::as_str) == Some(frame.raw.trim()) {
             self.externals.pop();
         }
-        Some(DialogueReply {
-            text,
+        let reply = DialogueReply {
+            text: text.clone(),
             plan: plans,
-            kind: frame.kind,
-        })
+            kind: frame.kind.clone(),
+        };
+        self.record_turn_trace(&frame, &entity, Some(&reply), &provenance);
+        Some(reply)
     }
 
     /// 记录一次恢复动作的对外视图。
@@ -1566,6 +1720,201 @@ impl DialogueManager {
         self.focus.push(entity.to_string());
         while self.focus.len() > 5 {
             self.focus.remove(0);
+        }
+    }
+
+    /// 用户改口拦截（仅 On 模式）：识别「不对，叶莉的身高是 190」这类更正，
+    /// 覆盖会话内取值并把上一轮相关回复判为失效。
+    fn try_trace_correction(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<DialogueReply> {
+        if !self.trace_mode.is_on() {
+            return None;
+        }
+        let stripped = input
+            .trim()
+            .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+            .trim();
+        if stripped.is_empty() || stripped.chars().count() > 40 {
+            return None;
+        }
+        const PREFIXES: [&str; 6] = ["不对，", "不是，", "错了，", "更正：", "改成", "应该是"];
+        let body = PREFIXES
+            .iter()
+            .find_map(|prefix| stripped.strip_prefix(prefix))
+            .map(str::trim)?;
+        if body.is_empty() || body.contains('？') || body.contains('?') {
+            return None;
+        }
+        // 上一轮必须是有实体+属性的知识回答，改口才有对象。
+        let previous = self
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| {
+                turn.answer_excerpt.is_some() && turn.entity.is_some() && turn.attribute.is_some()
+            })
+            .cloned()?;
+        let entity = previous.entity.clone()?;
+        let attribute = previous.attribute.clone()?;
+        // 从句式里抽出更正值：「…是 190」/「…为 190」/「…190」。
+        let value = body
+            .split(['是', '为'])
+            .next_back()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| body.to_string());
+        let previous_answer = previous.answer_excerpt.clone().unwrap_or_default();
+        let turn_no = self.trace.turn_count() + 1;
+        let (correction, marked) = self.trace.record_correction(
+            turn_no,
+            previous.index,
+            &entity,
+            &attribute,
+            &value,
+            &previous_answer,
+        );
+        // 更正轮也进入对话本体实例。
+        self.turns.push(DialogueTurn {
+            index: self.turns.len() + 1,
+            user: stripped.to_string(),
+            kind: MoveKind::Assert,
+            entity: Some(entity.clone()),
+            attribute: Some(attribute.clone()),
+            answer_excerpt: Some(excerpt(&value, 40)),
+            provenance: vec!["用户更正".to_string()],
+            plan: vec!["trace_correction".to_string()],
+            warrant: None,
+            kb_revision: knowledge.revision().into(),
+        });
+        self.push_focus(&entity);
+        let text = if marked > 0 {
+            format!(
+                "收到，已把「{}」的「{}」更新为「{}」，上一轮的说法作废。",
+                entity, attribute, value
+            )
+        } else {
+            format!(
+                "收到，已记下「{}」的「{}」为「{}」。",
+                entity, attribute, value
+            )
+        };
+        let plan = vec!["trace_correction".to_string()];
+        self.last_reply = plan.clone();
+        if self.externals.last().map(String::as_str) == Some(stripped) {
+            self.externals.pop();
+        }
+        let _ = correction;
+        let reply = DialogueReply {
+            text,
+            plan,
+            kind: MoveKind::Assert,
+        };
+        let frame = UtteranceFrame {
+            raw: input.trim().to_string(),
+            kind: MoveKind::Assert,
+            entity: Some(entity),
+            attribute: Some(attribute),
+            question: None,
+            inherited: false,
+        };
+        self.record_turn_trace(&frame, &frame.entity, Some(&reply), &["用户更正".to_string()]);
+        Some(reply)
+    }
+
+    /// 把本轮决策写入分层追踪图（仅 Off 之外的模式）。
+    ///
+    /// 记录顺序：L0 表层 → L1 解读 → L2 指代/问据（谓词承继）→ L2 回答/让位。
+    /// `reply == None` 表示让位给其它管线（记 defer 节点）。
+    fn record_turn_trace(
+        &mut self,
+        frame: &UtteranceFrame,
+        entity: &Option<String>,
+        reply: Option<&DialogueReply>,
+        provenance: &[String],
+    ) {
+        if self.trace_mode.is_off() {
+            return;
+        }
+        let turn_no = self.trace.turn_count() + 1;
+        let surface = self.trace.record_surface(turn_no, &frame.raw);
+        let kind = format!("{:?}", frame.kind);
+        let interpret = self.trace.record_interpret(
+            turn_no,
+            surface,
+            &kind,
+            entity.as_deref(),
+            frame.attribute.as_deref(),
+            frame.question.as_deref(),
+            frame.inherited,
+        );
+        // 指代/省略登记：显式实体、代词、省略各有出处。
+        if let Some(entity) = entity.as_deref() {
+            let source = if frame.inherited {
+                if contains_pronoun(&frame.raw) {
+                    ReferentSource::Pronoun
+                } else {
+                    ReferentSource::Ellipsis
+                }
+            } else {
+                ReferentSource::Explicit
+            };
+            let surface_form = if frame.inherited {
+                frame.raw.trim().to_string()
+            } else {
+                entity.to_string()
+            };
+            self.trace.record_mention(
+                turn_no,
+                interpret,
+                &surface_form,
+                entity,
+                source,
+                frame.question.as_deref().unwrap_or(""),
+            );
+            self.trace.record_qud(
+                turn_no,
+                interpret,
+                match frame.kind {
+                    MoveKind::AskIdentity => QudKind::AskIdentity,
+                    MoveKind::AskBinary => QudKind::AskBinary,
+                    _ => QudKind::AskAttribute,
+                },
+                Some(entity),
+                frame.attribute.as_deref(),
+                frame.inherited,
+            );
+            if frame.inherited {
+                if let Some(attribute) = frame.attribute.as_deref() {
+                    let origin = self
+                        .trace
+                        .predicate_focus()
+                        .unwrap_or("谓词焦点")
+                        .to_string();
+                    self.trace
+                        .record_inheritance(turn_no, interpret, attribute, &origin);
+                }
+            }
+        }
+        match reply {
+            Some(reply) => {
+                let excerpt = excerpt(&reply.text, 80);
+                self.trace.record_reply(
+                    turn_no,
+                    entity.as_deref(),
+                    frame.attribute.as_deref(),
+                    vec![interpret],
+                    provenance,
+                    Some(&excerpt),
+                );
+                self.trace.resolve_open_qud();
+            }
+            None => {
+                self.trace.record_defer(turn_no, interpret, "知识管线未接管本轮输入");
+            }
         }
     }
 
@@ -2915,5 +3264,87 @@ mod tests {
             .plan_pure_dialogue("回到上一步", &knowledge)
             .expect("撤销应回到上一帧");
         assert!(undone.text.contains("已回到第"));
+    }
+
+    #[test]
+    fn test_trace_mode_off_is_byte_compatible_and_records_nothing() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        assert_eq!(manager.trace_mode(), TraceMode::Off);
+        assert!(manager.trace_store().is_empty());
+        // 默认 Off 的省略问句仍读作身份问句（既有契约）。
+        let frame = manager.analyze("那姚明呢", &knowledge);
+        assert_eq!(frame.kind, MoveKind::AskIdentity);
+        assert!(!frame.inherited);
+    }
+
+    #[test]
+    fn test_trace_on_inherits_predicate_focus_for_ellipsis() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高", "国籍"])
+            .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
+            .with_entity("叶莉", &["身高"])
+            .with_answer("叶莉的身高是什么", "叶莉的身高是 190 厘米。");
+        let mut manager = DialogueManager::new();
+        manager.set_trace_mode(TraceMode::On);
+        manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        // 「叶莉呢」在属性问据下读作「叶莉的身高呢」。
+        let frame = manager.analyze("叶莉呢", &knowledge);
+        assert_eq!(frame.kind, MoveKind::AskAttribute, "应承继谓词焦点");
+        assert_eq!(frame.entity.as_deref(), Some("叶莉"));
+        assert_eq!(frame.attribute.as_deref(), Some("身高"));
+        assert!(!frame.inherited, "实体显式出现");
+        let reply = manager.plan_reply("叶莉呢", &knowledge).unwrap();
+        assert!(reply.text.contains("190"), "{}", reply.text);
+        assert_eq!(manager.trace_store().predicate_focus(), Some("身高"));
+    }
+
+    #[test]
+    fn test_trace_on_pronoun_inherits_predicate_focus() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        manager.set_trace_mode(TraceMode::On);
+        manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        let frame = manager.analyze("他呢", &knowledge);
+        assert_eq!(frame.kind, MoveKind::AskAttribute);
+        assert_eq!(frame.entity.as_deref(), Some("姚明"));
+        assert_eq!(frame.attribute.as_deref(), Some("身高"));
+        assert!(frame.inherited);
+    }
+
+    #[test]
+    fn test_trace_on_correction_overrides_value_and_marks_stale() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        manager.set_trace_mode(TraceMode::On);
+        let first = manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        assert!(first.text.contains("226"));
+        let correction = manager
+            .plan_reply("不对，姚明的身高是 190", &knowledge)
+            .expect("改口应被拦截");
+        assert!(correction.text.contains("190"), "{}", correction.text);
+        assert!(correction.text.contains("作废"), "{}", correction.text);
+        // 会话内覆盖值优先于图谱旧值。
+        let again = manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        assert!(again.text.contains("190"), "{}", again.text);
+        assert!(!again.text.contains("226"), "{}", again.text);
+        assert!(manager.trace_report().contains("更正"));
+    }
+
+    #[test]
+    fn test_trace_snapshot_roundtrip_preserves_focus_and_overrides() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        manager.set_trace_mode(TraceMode::On);
+        manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
+        manager.plan_reply("不对，姚明的身高是 190", &knowledge).unwrap();
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.set_trace_mode(TraceMode::On);
+        restored.restore(&snapshot);
+        assert_eq!(restored.trace_store().predicate_focus(), Some("身高"));
+        assert_eq!(restored.trace_store().value_override("姚明", "身高"), Some("190"));
+        assert_eq!(restored.trace_store().turn_count(), manager.trace_store().turn_count());
     }
 }
