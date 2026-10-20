@@ -306,6 +306,15 @@ impl DenseRetriever {
         });
         let removed = self.docs.len() != before;
         if removed {
+            // 类型证据与实体类型映射同源：撤回类型文档时同步注销声明类型。
+            if predicate == "类型"
+                && self.entity_types.get(subject).map(String::as_str) == Some(object)
+            {
+                self.entity_types.remove(subject);
+                if let Some(entities) = self.type_entities.get_mut(object) {
+                    entities.remove(subject);
+                }
+            }
             self.dirty = true;
         }
         removed
@@ -1458,6 +1467,25 @@ mod tests {
             .hits
             .iter()
             .any(|hit| hit.subject == "张三" && hit.predicate == "老师" && hit.object == "王五"));
+    }
+
+    #[test]
+    fn removing_type_evidence_unregisters_declared_type() {
+        let mut retriever = build_retriever();
+        assert!(retriever.remove_triple("张三", "类型", "人"));
+        let constraints = SearchConstraints {
+            predicate: Some("职业".to_string()),
+            entity_type: Some("人".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        let subjects: HashSet<&str> = search
+            .hits
+            .iter()
+            .map(|hit| hit.subject.as_str())
+            .collect();
+        assert!(!subjects.contains("张三"));
+        assert!(subjects.contains("李四"));
     }
 
     #[test]
