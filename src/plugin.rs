@@ -1931,9 +1931,11 @@ impl PluginRuntime {
 
     /// 启动时把插件的本体贡献归约为统一本体程序（仅启用中的插件）。
     ///
-    /// 与 `ontology_aliases` 分工：别名只做词面归一，不进公理；子类、互斥、
-    /// 定义域/值域、逆关系、传递、对称全部编译成 `OntologyLesson`，交给宿主
-    /// 的单一本体推理器。重复声明由程序自身的规范去重吸收，合并是幂等的。
+    /// 别名不再只是词面归一：类型别名编译成 `别名 ⊑ 规范类`，谓词别名编译成
+    /// `别名 ⊑ 规范关系`，让**已落库的数据**使用别名书写时也能被规范词面
+    /// 查询命中；子类、互斥、定义域/值域、逆关系、传递、对称同样编译成
+    /// `OntologyLesson`，交给宿主的单一本体推理器。重复声明由程序自身的
+    /// 规范去重吸收，合并是幂等的。
     pub fn ontology_program(&self) -> OntologyProgram {
         let mut lessons = Vec::new();
         for manifest in &self.manifests {
@@ -1951,6 +1953,17 @@ impl PluginRuntime {
                     let name = entity_type.name.trim();
                     if name.is_empty() {
                         continue;
+                    }
+                    for alias in &entity_type.aliases {
+                        let alias = alias.trim();
+                        if alias.is_empty() || alias == name {
+                            continue;
+                        }
+                        lessons.push(OntologyLesson::Subclass {
+                            sub: alias.to_string(),
+                            sup: name.to_string(),
+                            original: format!("{}是{}的别名", alias, name),
+                        });
                     }
                     for sup in &entity_type.subclass_of {
                         let sup = sup.trim();
@@ -1979,6 +1992,17 @@ impl PluginRuntime {
                     let name = predicate.name.trim();
                     if name.is_empty() {
                         continue;
+                    }
+                    for alias in &predicate.aliases {
+                        let alias = alias.trim();
+                        if alias.is_empty() || alias == name {
+                            continue;
+                        }
+                        lessons.push(OntologyLesson::Subproperty {
+                            sub: alias.to_string(),
+                            sup: name.to_string(),
+                            original: format!("{}是{}的别名", alias, name),
+                        });
                     }
                     for class in &predicate.domain {
                         let class = class.trim();
@@ -3067,6 +3091,46 @@ mod tests {
                 .filter(|entry| entry.kind == "lexicon")
                 .count()
                 >= 2
+        );
+    }
+
+    #[test]
+    fn ontology_aliases_become_structural_axioms_for_stored_data() {
+        let mut film = manifest("zh.film", PluginMode::On);
+        film.contributions.push(Contribution::Ontology {
+            id: "film.ontology".to_string(),
+            description: String::new(),
+            predicates: vec![OntologyPredicate {
+                name: "导演".to_string(),
+                aliases: vec!["director".to_string()],
+                ..OntologyPredicate::default()
+            }],
+            types: vec![OntologyType {
+                name: "电影".to_string(),
+                aliases: vec!["影片".to_string()],
+                ..OntologyType::default()
+            }],
+        });
+        let registry = PluginRegistry::from_manifests(vec![film]);
+        let runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let program = runtime.ontology_program();
+        assert!(
+            program.lessons.iter().any(|lesson| matches!(
+                lesson,
+                OntologyLesson::Subclass { sub, sup, .. }
+                    if sub == "影片" && sup == "电影"
+            )),
+            "类型别名必须让已落库的别名类型满足规范类型：{:?}",
+            program.lessons
+        );
+        assert!(
+            program.lessons.iter().any(|lesson| matches!(
+                lesson,
+                OntologyLesson::Subproperty { sub, sup, .. }
+                    if sub == "director" && sup == "导演"
+            )),
+            "谓词别名必须让已落库的别名关系满足规范关系：{:?}",
+            program.lessons
         );
     }
 
