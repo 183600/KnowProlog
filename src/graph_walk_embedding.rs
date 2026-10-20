@@ -44,7 +44,7 @@ struct PprScratch {
     nodes_b: Vec<u32>,
 }
 
-/// 单源重启随机游走的索引化实现（语义与字符串哈希表版本一致）。
+/// 单源重启随机游走的索引化实现。
 ///
 /// `out` 按（量化概率降序，实体名升序）截断到 `limit` 个分量后输出。
 #[allow(clippy::too_many_arguments)]

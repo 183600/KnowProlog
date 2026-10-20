@@ -4213,7 +4213,7 @@ async fn run_interactive_mode(
                                 );
                             }
                             log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
-                            // 推理器只增不减：用更正后的图快照重建，避免旧值继续参与回答
+                            // 推理器只增不减：用更正后的图快照重建，使回答基于更新后的图谱
                             rebuild_symbolic_reasoner(
                                 &mut symbolic_reasoner,
                                 &oxigraph_manager,

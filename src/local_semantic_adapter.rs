@@ -365,8 +365,8 @@ impl LocalSemanticAdapter {
         let mut entity_names: Vec<String> = entities.iter().map(|e| e.entity.clone()).collect();
         let mut seen_entities: HashSet<String> = entity_names.iter().cloned().collect();
         
-        // 补充知识库中已知实体的识别结果：通用抽取器可能识别不出
-        // 采样知识库中已收录的实体（如"珠穆朗玛峰"），这里通过别名做最长匹配补齐
+        // 知识库已知实体的识别结果一并计入：对已收录实体（如"珠穆朗玛峰"）
+        // 通过别名做最长匹配
         let knowledge_entities = self.semantic_engine().analyze_intent(query).await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { format!("{}", e).into() })?;
         for entity_name in knowledge_entities.entities {
