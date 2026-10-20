@@ -39,6 +39,7 @@ use know_prolog::{
     prolog_engine::PrologFact,
     chronicle::{Chronicle, FsyncPolicy},
     conversation_theory::{self, ConversationTheory},
+    history_trust::TrustAssessment,
     proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
     view_render::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
@@ -2061,7 +2062,7 @@ async fn run_interactive_mode(
             format!("{}/dialogue.chronicle.jsonl", store_path)
         });
     let mut chronicle = match Chronicle::open(&chronicle_path, FsyncPolicy::EachAppend) {
-        Ok((chronicle, audit)) => {
+        Ok((mut chronicle, audit)) => {
             if !audit.is_clean() {
                 eprintln!("对话编年史{}", audit.verdict());
                 match chronicle.repair_tail() {
@@ -2822,6 +2823,42 @@ async fn run_interactive_mode(
                 Some(chronicle) => {
                     let theory = ConversationTheory::build(chronicle);
                     println!("{}", theory.render_query(pattern.trim()));
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 历史可信度：沿支持图回答「哪条回答依赖了错值、经哪条边失效」
+        if matches!(input, "历史可信度" | "回答可信度" | "信任报告") {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let assessment = TrustAssessment::from_chronicle(chronicle);
+                    println!("{}", assessment.render(None));
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(query) = strip_any_prefix(
+            input,
+            &[
+                "历史可信度：",
+                "历史可信度:",
+                "历史可信度 ",
+                "可信度：",
+                "可信度:",
+                "信任：",
+                "信任:",
+            ],
+        ) {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let assessment = TrustAssessment::from_chronicle(chronicle);
+                    println!("{}", assessment.render(Some(query.trim())));
                 }
                 None => println!("编年史不可用（打开失败，见启动警告）。"),
             }
@@ -3806,6 +3843,70 @@ async fn run_interactive_mode(
                     );
                 }
                 sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
+            }
+            println!();
+            continue;
+        }
+
+        // 更正知识：删除旧值、写入新值，并把「旧值错了」写成可追踪的事件
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "更正：", "更正:", "纠正：", "纠正:", "修正：", "修正:",
+            ],
+        ) {
+            let target = target.trim();
+            match parse_correction_spec(target) {
+                None => println!(
+                    "请给出实体、属性、旧值与新值，例如：更正：姚明的身高从226改为229（或 更正：姚明|height|226|229）。"
+                ),
+                Some((entity, predicate, old_value, new_value)) => {
+                    match oxigraph_manager
+                        .correct_object_value(&entity, &predicate, &old_value, &new_value)
+                        .await
+                    {
+                        Ok((removed, inserted)) if removed > 0 => {
+                            let correction = conversation_theory::TheoryCorrection {
+                                entity: entity.clone(),
+                                predicate: predicate.clone(),
+                                from: old_value.clone(),
+                                to: new_value.clone(),
+                            };
+                            let answer = format!(
+                                "已更正：{}.{} 由「{}」改为「{}」（移除 {} 条旧三元组，写入 {} 条新值）。",
+                                entity,
+                                predicate,
+                                old_value,
+                                new_value,
+                                removed,
+                                if inserted { 1 } else { 0 }
+                            );
+                            if let Some(chronicle) = chronicle.as_mut() {
+                                let _ = conversation_theory::append_correction(
+                                    chronicle,
+                                    target,
+                                    &[correction],
+                                    kb_revision + 1,
+                                );
+                            }
+                            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                            // 推理器只增不减：用更正后的图快照重建，避免旧值继续参与回答
+                            rebuild_symbolic_reasoner(
+                                &mut symbolic_reasoner,
+                                &oxigraph_manager,
+                            )
+                            .await;
+                            reasoner_stale = true;
+                            let _ = oxigraph_manager.save_predicate_registry(&registry_path);
+                            println!("{}", answer);
+                        }
+                        Ok(_) => println!(
+                            "没有找到「{}」的 {} = 「{}」：更正是「旧值错了」，不是无条件覆盖；未改动知识库。",
+                            entity, predicate, old_value
+                        ),
+                        Err(error) => eprintln!("更正失败：{}", error),
+                    }
+                }
             }
             println!();
             continue;
@@ -4801,6 +4902,14 @@ async fn run_interactive_mode(
                                         "文本录入",
                                         kb_revision + 1,
                                     );
+                                    if !receipt.conflicts.is_empty() {
+                                        let _ = conversation_theory::append_conflict(
+                                            chronicle,
+                                            &receipt.conflicts,
+                                            "文本录入",
+                                            kb_revision + 1,
+                                        );
+                                    }
                                 }
                                 log_chronicle_reply(&mut chronicle, &summary, &[], &[]);
                                 if receipt.can_undo() {
@@ -5641,6 +5750,17 @@ async fn refresh_symbolic_reasoner(
     }
 }
 
+/// 重建推理器的全局知识（用于删值/更正）：保留会话态，但不再携带旧三元组。
+async fn rebuild_symbolic_reasoner(
+    symbolic_reasoner: &mut SymbolicReasoner,
+    oxigraph_manager: &OxigraphManager,
+) {
+    if let Ok(facts) = load_graph_snapshot(oxigraph_manager).await {
+        symbolic_reasoner.rebuild_from_graph(&facts);
+        oxigraph_manager.observe_entity_facts(&facts);
+    }
+}
+
 /// 规则图账本同步：把当前会话规则全量重写进命名图（幂等；不推进知识版本）。
 async fn sync_rule_ledger_report(
     symbolic_reasoner: &SymbolicReasoner,
@@ -5928,6 +6048,8 @@ fn interactive_help() -> String {
         "  默认推理：<陈述> / 概率推理：…       非单调常识与加权可能世界",
         "  规则：<如果X的P是Y，那么X的Q是Y>    教一条 Horn 规则（占位符自动变量化）",
         "  记住：<事实> / 忘记：<事实>          会话事实断言与撤回",
+        "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
+        "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
         "",
         "台账与报告",
         "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
@@ -6201,6 +6323,9 @@ fn is_command_like(input: &str) -> bool {
         "记住",
         "记录",
         "断言",
+        "更正",
+        "纠正",
+        "修正",
         "忘记",
         "遗忘",
         "撤回",
@@ -6259,6 +6384,10 @@ fn is_command_like(input: &str) -> bool {
         "情景归因",
         "情景反事实",
         "情景查询",
+        "历史可信度",
+        "回答可信度",
+        "信任报告",
+        "可信度",
         "知识子图",
         "子图",
         "邻域",
@@ -6436,6 +6565,82 @@ fn parse_predicate_pair(spec: &str) -> Option<(String, String)> {
             let right = right.trim();
             if !left.is_empty() && !right.is_empty() {
                 return Some((left.to_string(), right.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// 解析更正命令：`实体|属性|旧值|新值` 或 `实体 的 属性 从 旧值 改为 新值`。
+///
+/// 只认「有旧值」的更正：修正一条不知道旧值的陈述不是更正，而是无条件覆盖。
+fn parse_correction_spec(target: &str) -> Option<(String, String, String, String)> {
+    let trimmed = target
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '。' | '！' | '!' | '；' | ';' | '，' | ','));
+    if trimmed.is_empty() {
+        return None;
+    }
+    for separator in ['|', '｜'] {
+        if trimmed.contains(separator) {
+            let parts: Vec<&str> = trimmed
+                .split(separator)
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect();
+            if parts.len() == 4 {
+                return Some((
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                ));
+            }
+        }
+    }
+    let body = trimmed
+        .strip_prefix("把")
+        .or_else(|| trimmed.strip_prefix("将"))
+        .unwrap_or(trimmed)
+        .trim();
+    for marker in ["改为", "改成", "更正为", "修正为", "变为", "换成"] {
+        let Some(position) = body.find(marker) else {
+            continue;
+        };
+        let left = body[..position].trim();
+        let new_value = body[position + marker.len()..]
+            .trim()
+            .trim_matches(|ch: char| matches!(ch, '。' | '！' | '!' | '；' | ';' | '，' | ','));
+        if new_value.is_empty() {
+            continue;
+        }
+        for old_marker in ["从", "由", "原值为", "原值", "原本为", "原本"] {
+            let Some(index) = left.rfind(old_marker) else {
+                continue;
+            };
+            let head = left[..index].trim();
+            let old_value = left[index + old_marker.len()..]
+                .trim()
+                .trim_start_matches([':', '：', '='])
+                .trim();
+            if old_value.is_empty() {
+                continue;
+            }
+            let head = head.strip_suffix('是').unwrap_or(head).trim();
+            if let Some((entity, predicate)) = head.rsplit_once('的') {
+                let entity = entity
+                    .trim()
+                    .trim_start_matches(['把', '将'])
+                    .trim();
+                let predicate = predicate.trim();
+                if !entity.is_empty() && !predicate.is_empty() {
+                    return Some((
+                        entity.to_string(),
+                        predicate.to_string(),
+                        old_value.to_string(),
+                        new_value.to_string(),
+                    ));
+                }
             }
         }
     }
@@ -7304,5 +7509,53 @@ mod session_tests {
         assert_eq!(parse_ambiguous_choice("", 5), None, "空输入回退");
         assert_eq!(parse_ambiguous_choice("苹果", 5), None, "非数字回退");
         assert_eq!(parse_ambiguous_choice("2", 1), None, "单个候选时越界");
+    }
+
+    #[test]
+    fn correction_spec_accepts_pipe_and_chinese_forms() {
+        assert_eq!(
+            parse_correction_spec("姚明|height|226|229"),
+            Some((
+                "姚明".to_string(),
+                "height".to_string(),
+                "226".to_string(),
+                "229".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_correction_spec("姚明的身高从226改为229"),
+            Some((
+                "姚明".to_string(),
+                "身高".to_string(),
+                "226".to_string(),
+                "229".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_correction_spec("把姚明的身高由 226 改成 229。"),
+            Some((
+                "姚明".to_string(),
+                "身高".to_string(),
+                "226".to_string(),
+                "229".to_string()
+            ))
+        );
+        assert_eq!(parse_correction_spec("姚明的身高是229"), None);
+        assert_eq!(parse_correction_spec("姚明|height|226"), None);
+    }
+
+    #[test]
+    fn command_like_covers_trust_and_correction_commands() {
+        for command in [
+            "更正：姚明的身高从226改为229",
+            "纠正：姚明|height|226|229",
+            "修正：姚明的身高从226改为229",
+            "历史可信度",
+            "历史可信度：姚明的身高是多少",
+            "可信度：姚明的身高是多少",
+            "信任报告",
+        ] {
+            assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
     }
 }

@@ -938,6 +938,40 @@ impl SymbolicReasoner {
         fork
     }
 
+    /// 用一份新的图谱快照替换推理器的全局知识，同时保留会话态。
+    ///
+    /// `observe_facts` 只增不减，不能表达「更正删掉了旧值」。这里以同一配置、
+    /// 同义词与性能台账重建基座，再恢复会话快照（焦点/历史/会话事实/规则/帧），
+    /// 从而让查询立即看到更正后的图谱，而不是继续携带旧值。
+    pub fn rebuild_from_graph(&mut self, facts: &[PrologFact]) {
+        let synonyms = self.aligner.synonyms().clone();
+        let snapshot = self.dialogue_snapshot();
+        let law_registry = self.law_registry.clone();
+        let persisted_laws = self.persisted_laws.clone();
+        let clarification = self.clarification.clone();
+        let last_goal = self.last_abduction_goal.clone();
+        let last_vars = self.last_abduction_vars.clone();
+        let engine_fault = self.engine_fault.clone();
+        let mut fresh = Self::with_perf_ledger(
+            self.config.clone(),
+            synonyms,
+            Arc::clone(&self.perf),
+        );
+        fresh.observe_facts(facts);
+        fresh.restore_dialogue_snapshot(&snapshot);
+        if let Some(registry) = law_registry {
+            fresh.configure_laws(&registry);
+        }
+        if let Some(persisted) = persisted_laws {
+            fresh.load_persisted_laws(persisted);
+        }
+        fresh.clarification = clarification;
+        fresh.last_abduction_goal = last_goal;
+        fresh.last_abduction_vars = last_vars;
+        fresh.engine_fault = engine_fault;
+        *self = fresh;
+    }
+
     /// 清空会话态：焦点/历史、会话事实与临时规则、澄清、教学、记忆缓存、
     /// 注入故障。知识派生状态（剖面/规则/向量/台账）原样保留。
     fn reset_session_state(&mut self) {
@@ -8759,6 +8793,30 @@ mod tests {
         assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
         let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
         assert!(proof.contains("未得证"), "撤回后不应再得证：{}", proof);
+    }
+
+    #[test]
+    fn rebuild_from_graph_drops_old_values_and_keeps_session_facts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        reasoner.assert_nl_fact("钱七是孙八的师傅");
+        let before = reasoner.answer("姚明的身高是什么").expect("重建前应可回答");
+        assert!(before.contains("226cm"), "实际：{}", before);
+
+        let mut properties = HashMap::new();
+        properties.insert("身高".to_string(), "229cm".to_string());
+        reasoner.rebuild_from_graph(&[PrologFact::Entity {
+            name: "姚明".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }]);
+
+        let after = reasoner.answer("姚明的身高是什么").expect("重建后应可回答");
+        assert!(after.contains("229cm"), "实际：{}", after);
+        assert!(!after.contains("226cm"), "旧值不应残留：{}", after);
+        assert_eq!(reasoner.session_facts().len(), 1, "会话事实应保留");
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("得证"), "会话事实应继续参与后向链：{}", proof);
     }
 
     #[test]

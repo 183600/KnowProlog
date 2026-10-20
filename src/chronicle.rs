@@ -165,6 +165,8 @@ pub struct Chronicle {
     entries: Vec<ChronicleEntry>,
     fsync: FsyncPolicy,
     kb_revision: u64,
+    /// 最近一次读/写后看到的文件长度；用于避免每次追加都重读整档。
+    disk_len: Option<u64>,
 }
 
 impl Chronicle {
@@ -172,7 +174,15 @@ impl Chronicle {
     ///
     /// 文件不存在视为空档案；存在但损坏时**只加载可信前缀**，
     /// 由调用方根据 `ChainAudit` 走截断重写或拒绝路径（绝不静默全量采信）。
+    ///
+    /// 读取期间持有共享文件锁：另一个进程正在追加时不会读到半行而误报损坏。
     pub fn open(path: &str, fsync: FsyncPolicy) -> std::io::Result<(Self, ChainAudit)> {
+        let lock_path = Self::lock_path_for(path);
+        let _lock = Self::lock_exclusive(&lock_path, false)?;
+        Self::open_unlocked(path, fsync)
+    }
+
+    fn open_unlocked(path: &str, fsync: FsyncPolicy) -> std::io::Result<(Self, ChainAudit)> {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -182,6 +192,7 @@ impl Chronicle {
                         entries: Vec::new(),
                         fsync,
                         kb_revision: 0,
+                        disk_len: None,
                     },
                     ChainAudit::default(),
                 ))
@@ -199,9 +210,93 @@ impl Chronicle {
                 entries,
                 fsync,
                 kb_revision,
+                disk_len: Some(bytes.len() as u64),
             },
             audit,
         ))
+    }
+
+    fn lock_path_for(path: &str) -> PathBuf {
+        PathBuf::from(format!("{}.lock", path))
+    }
+
+    /// 打开（或创建）锁文件并加锁。返回的句柄在 drop 时自动解锁。
+    fn lock_exclusive(lock_path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
+        if let Some(parent) = lock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        if exclusive {
+            file.lock()?;
+        } else {
+            file.lock_shared()?;
+        }
+        Ok(file)
+    }
+
+    fn lock(&self, exclusive: bool) -> std::io::Result<std::fs::File> {
+        Self::lock_exclusive(&Self::lock_path_for(&self.path.to_string_lossy()), exclusive)
+    }
+
+    /// 在持有锁的情况下把内存状态与磁盘对齐。
+    ///
+    /// 另一个进程可能刚追加了若干条记录：重新读取并校验整条链，只接受
+    /// 「内存前缀一致且磁盘更长」的并发追加；任何分叉/回退都报错，
+    /// 绝不静默覆盖他人写下的历史。
+    fn refresh_locked(&mut self) -> std::io::Result<()> {
+        let metadata = match std::fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.entries.is_empty() {
+                    self.disk_len = None;
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "编年史文件被外部删除，拒绝在丢失的历史上续写",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if self.disk_len == Some(metadata.len()) {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&self.path)?;
+        let text = String::from_utf8_lossy(&bytes);
+        let (entries, audit) = Self::verify_text(&text);
+        if !audit.is_clean() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "编年史在并发写入后链校验失败，拒绝续写：{}",
+                    audit.verdict()
+                ),
+            ));
+        }
+        if entries.len() < self.entries.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "编年史被外部截短，内存中的历史比磁盘更长，拒绝续写",
+            ));
+        }
+        if !self.entries.iter().zip(entries.iter()).all(|(local, disk)| local == disk) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "编年史出现分叉：磁盘前缀与内存不一致，拒绝续写",
+            ));
+        }
+        self.entries = entries;
+        self.disk_len = Some(bytes.len() as u64);
+        if let Some(entry) = self.entries.last() {
+            self.kb_revision = self.kb_revision.max(entry.kb_revision);
+        }
+        Ok(())
     }
 
     /// 打开并要求全链可信；任何损坏都返回错误（用于只读校验入口）。
@@ -313,6 +408,7 @@ impl Chronicle {
 
     /// 审计磁盘上的档案而不改变自身状态。
     pub fn audit_file(path: &str) -> std::io::Result<ChainAudit> {
+        let _lock = Self::lock_exclusive(&Self::lock_path_for(path), false)?;
         match std::fs::read(path) {
             Ok(bytes) => Ok(Self::verify_text(&String::from_utf8_lossy(&bytes)).1),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -363,7 +459,12 @@ impl Chronicle {
     }
 
     /// 追加一条记录；返回其 seq。写入后按策略 fsync。
+    ///
+    /// 追加在独占文件锁内完成：先与磁盘对齐（吸收其它进程刚追加的记录），
+    /// 再计算 `seq/prev/hash` 并落盘。多进程共享同一档案也不会重号或断链。
     pub fn append(&mut self, kind: &str, payload: Value) -> std::io::Result<u64> {
+        let _lock = self.lock(true)?;
+        self.refresh_locked()?;
         let seq = self.last_seq() + 1;
         let prev = self.last_hash().to_string();
         let mut entry = ChronicleEntry {
@@ -415,6 +516,10 @@ impl Chronicle {
     }
 
     /// 带问题与证明编号的回答登记（证明携带的回答入口）。
+    ///
+    /// 回答会记录读取水位：`observed_seq` 是提问时的日志序号，
+    /// `read_revision` 是提问时的知识版本，`commit_revision` 是提交时的版本。
+    /// 三者让「回答基于旧快照」成为可检测的事实，而不是事后猜测。
     pub fn append_reply_with_context(
         &mut self,
         question: Option<&str>,
@@ -423,12 +528,35 @@ impl Chronicle {
         provenance: &[String],
         proof_id: Option<&str>,
     ) -> std::io::Result<u64> {
+        let turn = self.last_query_turn_entry().map(|entry| {
+            (
+                entry.seq,
+                entry.kb_revision,
+                entry
+                    .payload
+                    .get("user")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+        });
+        let observed_seq = turn.as_ref().map(|(seq, _, _)| *seq).unwrap_or(self.last_seq());
+        let read_revision = turn
+            .as_ref()
+            .map(|(_, revision, _)| *revision)
+            .unwrap_or(self.kb_revision);
+        let commit_revision = self.kb_revision;
+        let question = question
+            .map(str::to_string)
+            .or_else(|| turn.and_then(|(_, _, user)| user));
         let mut payload = serde_json::json!({
             "answer": answer,
             "plan": plan,
             "provenance": provenance,
+            "observed_seq": observed_seq,
+            "read_revision": read_revision,
+            "commit_revision": commit_revision,
         });
-        if let Some(question) = question.map(str::trim).filter(|question| !question.is_empty()) {
+        if let Some(question) = question.as_deref().map(str::trim).filter(|question| !question.is_empty()) {
             payload["question"] = Value::from(question);
             payload["question_key"] = Value::from(question_key(question));
         }
@@ -440,6 +568,17 @@ impl Chronicle {
 
     /// 最近一条尚未被回答的查询输入。
     fn last_query_turn(&self) -> Option<&str> {
+        self.last_query_turn_entry().and_then(|entry| {
+            entry
+                .payload
+                .get("user")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|user| !user.is_empty())
+        })
+    }
+
+    fn last_query_turn_entry(&self) -> Option<&ChronicleEntry> {
         for entry in self.entries.iter().rev() {
             match entry.kind.as_str() {
                 "reply" => return None,
@@ -448,12 +587,7 @@ impl Chronicle {
                     if mode != "query" {
                         return None;
                     }
-                    return entry
-                        .payload
-                        .get("user")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|user| !user.is_empty());
+                    return Some(entry);
                 }
                 _ => {}
             }
@@ -461,7 +595,7 @@ impl Chronicle {
         None
     }
 
-    fn write_line(&self, entry: &ChronicleEntry) -> std::io::Result<()> {
+    fn write_line(&mut self, entry: &ChronicleEntry) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -478,11 +612,17 @@ impl Chronicle {
         if self.fsync == FsyncPolicy::EachAppend {
             file.sync_all()?;
         }
+        self.disk_len = Some(file.metadata()?.len());
         Ok(())
     }
 
     /// 原子重写整档（临时文件 + rename）。重写损坏尾巴 / 截断超水位后调用。
     pub fn rewrite_atomic(&self) -> std::io::Result<()> {
+        let _lock = self.lock(true)?;
+        self.rewrite_atomic_locked()
+    }
+
+    fn rewrite_atomic_locked(&self) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -505,14 +645,41 @@ impl Chronicle {
     }
 
     /// 重写：把磁盘内容重写为当前可信前缀（用于尾行截断后的续写）。
-    pub fn repair_tail(&self) -> std::io::Result<()> {
-        self.rewrite_atomic()
+    ///
+    /// 先吸收其它进程已经追加的有效记录，避免「修复尾巴」时误删并发写入。
+    pub fn repair_tail(&mut self) -> std::io::Result<()> {
+        let _lock = self.lock(true)?;
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let (disk_entries, audit) =
+            Self::verify_text(&String::from_utf8_lossy(&bytes));
+        if audit.is_clean() && disk_entries.len() >= self.entries.len() {
+            self.entries = disk_entries;
+        }
+        self.rewrite_atomic_locked()?;
+        self.disk_len = Some(std::fs::metadata(&self.path)?.len());
+        Ok(())
     }
 
     /// 截断到指定序号（含），并原子重写。返回实际保留条数。
+    ///
+    /// 截断是显式运维动作：在独占锁内读取最新档案后再裁剪，绝不拿着
+    /// 过期内存把并发追加的记录一起删掉。
     pub fn truncate_after(&mut self, seq: u64) -> std::io::Result<usize> {
+        let _lock = self.lock(true)?;
+        if let Ok(bytes) = std::fs::read(&self.path) {
+            let (disk_entries, audit) =
+                Self::verify_text(&String::from_utf8_lossy(&bytes));
+            if audit.is_clean() {
+                self.entries = disk_entries;
+            }
+        }
         self.entries.retain(|entry| entry.seq <= seq);
-        self.rewrite_atomic()?;
+        self.rewrite_atomic_locked()?;
+        self.disk_len = Some(std::fs::metadata(&self.path)?.len());
         Ok(self.entries.len())
     }
 
@@ -864,5 +1031,112 @@ mod tests {
         assert!(Chronicle::audit_file(missing.to_str().unwrap())
             .unwrap()
             .is_clean());
+    }
+
+    #[test]
+    fn stale_handle_refreshes_before_append() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.chronicle.jsonl");
+        let path_text = path.to_string_lossy().to_string();
+        let (mut first, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+        let (mut second, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+
+        assert_eq!(first.append_turn("甲", "query", None, 0).unwrap(), 1);
+        assert_eq!(
+            second.append_turn("乙", "query", None, 0).unwrap(),
+            2,
+            "第二个句柄必须先吸收磁盘上的新记录再编号"
+        );
+        assert_eq!(second.append_turn("丙", "query", None, 0).unwrap(), 3);
+        assert_eq!(
+            first.append_turn("丁", "query", None, 0).unwrap(),
+            4,
+            "过期句柄不得重号"
+        );
+
+        let verified = Chronicle::open_verified(&path_text).unwrap();
+        assert_eq!(verified.len(), 4);
+        assert_eq!(verified.last_seq(), 4);
+        let entries = verified.entries();
+        assert!(entries[0].prev.is_empty(), "首条 prev 应为空串");
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.seq, index as u64 + 1);
+            if index > 0 {
+                assert_eq!(entry.prev, entries[index - 1].hash);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_appends_form_one_chain() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("threads.chronicle.jsonl");
+        let path_text = Arc::new(path.to_string_lossy().to_string());
+        let mut handles = Vec::new();
+        for worker in 0..4u64 {
+            let path_text = Arc::clone(&path_text);
+            handles.push(thread::spawn(move || {
+                let (mut chronicle, _) =
+                    Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+                for round in 0..10u64 {
+                    chronicle
+                        .append(
+                            "note",
+                            serde_json::json!({"worker": worker, "round": round}),
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let verified = Chronicle::open_verified(&path_text).unwrap();
+        assert_eq!(verified.len(), 40, "并发追加不得丢记录");
+        let seqs: Vec<u64> = verified.entries().iter().map(|entry| entry.seq).collect();
+        assert_eq!(seqs, (1..=40).collect::<Vec<u64>>());
+        let entries = verified.entries();
+        for pair in entries.windows(2) {
+            assert_eq!(pair[1].prev, pair[0].hash, "并发追加不得断链");
+        }
+    }
+
+    #[test]
+    fn external_truncation_is_rejected_not_overwritten() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cut.chronicle.jsonl");
+        let path_text = path.to_string_lossy().to_string();
+        let (mut chronicle, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+        chronicle.append_turn("一", "query", None, 0).unwrap();
+        chronicle.append_turn("二", "query", None, 1).unwrap();
+
+        let text = std::fs::read_to_string(&path_text).unwrap();
+        let first_line = text.lines().next().unwrap().to_string();
+        std::fs::write(&path_text, format!("{}\n", first_line)).unwrap();
+
+        let error = chronicle.append_turn("三", "query", None, 2).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{}", error);
+        let (salvaged, audit) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+        assert!(audit.is_clean());
+        assert_eq!(salvaged.len(), 1, "被外部截短的历史不得被静默覆盖");
+    }
+
+    #[test]
+    fn replies_record_read_and_commit_watermarks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("watermark.chronicle.jsonl");
+        let path_text = path.to_string_lossy().to_string();
+        let (mut chronicle, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+        chronicle.append_turn("姚明的身高是多少？", "query", None, 0).unwrap();
+        chronicle.set_kb_revision(7);
+        chronicle.append_reply("226 厘米。", &[], &[]).unwrap();
+        let reply = chronicle.entries().last().unwrap();
+        assert_eq!(reply.payload["observed_seq"], 1);
+        assert_eq!(reply.payload["read_revision"], 0);
+        assert_eq!(reply.payload["commit_revision"], 7);
     }
 }

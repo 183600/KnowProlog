@@ -226,7 +226,7 @@ fn fix_chronicle(path: &str, kind: ArtifactKind) -> Result<ArtifactAudit, String
             path, reason
         )),
         ArtifactStatus::Repairable(_) => {
-            let (chronicle, _) = Chronicle::open(path, FsyncPolicy::None)
+            let (mut chronicle, _) = Chronicle::open(path, FsyncPolicy::None)
                 .map_err(|error| format!("{}: {}", path, error))?;
             chronicle
                 .repair_tail()

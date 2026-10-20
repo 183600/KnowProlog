@@ -691,6 +691,43 @@ impl PredicateRegistry {
         removed
     }
 
+    /// 把 (subject, predicate) 上的旧值更正为新值：更新画像并清理对应冲突笔记。
+    ///
+    /// 只处理非互逆的字面量属性：关系谓词的「更正」需要同时裁决两端身份，
+    /// 不在本方法的职责内，直接返回 false 交给调用方拒绝。
+    pub fn correct(&mut self, subject: &str, predicate: &str, old: &str, new: &str) -> bool {
+        let resolution = self.resolve(predicate);
+        if resolution.inverted {
+            return false;
+        }
+        let removed = self.facts.remove(&(
+            subject.to_string(),
+            resolution.canonical.clone(),
+            old.to_string(),
+        ));
+        let inserted = self.facts.insert((
+            subject.to_string(),
+            resolution.canonical.clone(),
+            new.to_string(),
+        ));
+        if removed || inserted {
+            self.recompute(&resolution.canonical);
+        }
+        if let Some(by_predicate) = self.conflict_notes.get_mut(subject) {
+            if let Some(incoming) = by_predicate.get_mut(&resolution.canonical) {
+                incoming.remove(old);
+                incoming.remove(new);
+                if incoming.is_empty() {
+                    by_predicate.remove(&resolution.canonical);
+                }
+            }
+            if by_predicate.is_empty() {
+                self.conflict_notes.remove(subject);
+            }
+        }
+        removed || inserted
+    }
+
     /// 按现存事实重算画像统计。
     fn recompute(&mut self, canonical: &str) {
         let facts: Vec<(String, String, String)> = self

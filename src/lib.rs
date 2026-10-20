@@ -67,6 +67,7 @@ pub mod grammar_extractor;
 pub mod chronicle;
 pub mod proof_journal;
 pub mod conversation_theory;
+pub mod history_trust;
 pub mod view_render;
 pub mod embedding_eval;
 pub mod function_words;
@@ -1858,6 +1859,127 @@ impl OxigraphManager {
             self.bump_revision();
         }
         Ok(removed)
+    }
+
+    /// 更正一个字面量属性：删除旧值三元组、写入新值三元组，并同步谓词画像。
+    ///
+    /// 返回 `(removed, inserted)`。旧值必须能在图谱中找到才会写入新值：
+    /// 「更正」是说旧值错了，不是无条件覆盖；找不到旧值就诚实地不改。
+    pub async fn correct_object_value(
+        &self,
+        entity: &str,
+        predicate: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> Result<(usize, bool), Box<dyn std::error::Error + Send + Sync>> {
+        let entity = entity.trim();
+        let old_value = old_value.trim();
+        let new_value = new_value.trim();
+        if entity.is_empty() || predicate.trim().is_empty() || old_value.is_empty() {
+            return Ok((0, false));
+        }
+        let (canonical, inverted) = {
+            let registry = self.predicate_registry.read();
+            let resolution = registry.resolve(predicate.trim());
+            (resolution.canonical.clone(), resolution.inverted)
+        };
+        if inverted {
+            return Ok((0, false));
+        }
+
+        let subject_iri = crate::identity::entity_uri(BASE_NS, entity);
+        let predicate_iri = format!("{}{}", BASE_NS, canonical);
+        let subject = NamedNode::new(subject_iri)?;
+        let predicate_node = NamedNode::new(predicate_iri)?;
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(
+                Some(subject.as_ref().into()),
+                Some(predicate_node.as_ref().into()),
+                None,
+                None,
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut removed = 0usize;
+        let mut had_literal = false;
+        let mut had_iri = false;
+        for quad in existing {
+            let matched = match &quad.object {
+                Term::Literal(literal) => literal.value() == old_value,
+                Term::NamedNode(node) => {
+                    node.as_str() == old_value || Self::local_kg_name(node.as_str()) == old_value
+                }
+                _ => false,
+            };
+            if !matched {
+                continue;
+            }
+            if store.remove(&quad)? {
+                removed += 1;
+                match &quad.object {
+                    Term::Literal(_) => had_literal = true,
+                    Term::NamedNode(_) => had_iri = true,
+                    _ => {}
+                }
+            }
+        }
+        if removed == 0 {
+            return Ok((0, false));
+        }
+        let mut inserted = false;
+        if !new_value.is_empty() {
+            if had_literal {
+                let new_quad = Quad::new(
+                    subject.clone(),
+                    predicate_node.clone(),
+                    Literal::new_simple_literal(new_value),
+                    GraphName::DefaultGraph,
+                );
+                if !store.contains(&new_quad)? {
+                    store.insert(&new_quad)?;
+                    inserted = true;
+                }
+            }
+            if had_iri {
+                let object = NamedNode::new(crate::identity::entity_uri(BASE_NS, new_value))?;
+                let new_quad = Quad::new(
+                    subject,
+                    predicate_node,
+                    object.clone(),
+                    GraphName::DefaultGraph,
+                );
+                if !store.contains(&new_quad)? {
+                    store.insert(&new_quad)?;
+                    inserted = true;
+                }
+                // 快照只保留「两端都有 kg:name」的关系：新宾语必须自带名称，
+                // 否则更正后的关系会在推理快照里凭空消失。
+                let name_iri = format!("{}name", BASE_NS);
+                let name_quad = Quad::new(
+                    object,
+                    NamedNode::new(name_iri)?,
+                    Literal::new_simple_literal(new_value),
+                    GraphName::DefaultGraph,
+                );
+                if !store.contains(&name_quad)? {
+                    store.insert(&name_quad)?;
+                    inserted = true;
+                }
+            }
+        }
+        drop(store);
+        self.predicate_registry.write().correct(
+            entity,
+            &canonical,
+            old_value,
+            if new_value.is_empty() {
+                old_value
+            } else {
+                new_value
+            },
+        );
+        self.bump_revision();
+        Ok((removed, inserted))
     }
 
     /// `http://example.org/kg/entity/张三` → `张三`（百分号编码无损反解），其它 IRI 原样返回。
@@ -4622,6 +4744,61 @@ mod cache_tests {
             "JSON-LD 应包含实体文本：{}",
             text
         );
+    }
+
+    /// 更正关系值：删旧宾语（实体 IRI）并写新宾语，同时补 kg:name，
+    /// 保证推理快照仍能把新宾语识别为关系端点。
+    #[tokio::test]
+    async fn correct_object_value_replaces_entity_and_keeps_relation_visible() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .save_knowledge(vec![person("姚明"), person("226")])
+            .await
+            .unwrap();
+        manager.save_knowledge(items("姚明", "226")).await.unwrap();
+        // items() 的谓词是「师傅」，这里直接改用身高关系
+        manager
+            .save_knowledge(vec![KnowledgeItem::Relationship {
+                from_label: "Person".to_string(),
+                from_id: "姚明".to_string(),
+                to_label: "Person".to_string(),
+                to_id: "226".to_string(),
+                rel_type: "身高".to_string(),
+                properties: HashMap::new(),
+            }])
+            .await
+            .unwrap();
+        let (removed, inserted) = manager
+            .correct_object_value("姚明", "身高", "226", "229")
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(inserted);
+        let facts = manager.load_graph_snapshot().await.unwrap();
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                PrologFact::Relation { from, rel_type, to }
+                    if from == "姚明" && rel_type == "身高" && to == "229"
+            )),
+            "新关系应可见：{:?}",
+            facts
+        );
+        assert!(
+            !facts.iter().any(|fact| matches!(
+                fact,
+                PrologFact::Relation { from, rel_type, to }
+                    if from == "姚明" && rel_type == "身高" && to == "226"
+            )),
+            "旧关系不应残留：{:?}",
+            facts
+        );
+        // 旧值不存在时拒绝「更正」：不能变成无条件覆盖
+        let (removed_again, inserted_again) = manager
+            .correct_object_value("姚明", "身高", "226", "230")
+            .await
+            .unwrap();
+        assert_eq!((removed_again, inserted_again), (0, false));
     }
 
     /// 未知扩展名拒绝导出，绝不猜测格式。

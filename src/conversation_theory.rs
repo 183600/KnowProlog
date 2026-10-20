@@ -64,6 +64,8 @@ pub enum EventKind {
     Rule,
     Assert,
     Forget,
+    Conflict,
+    Correct,
     Proof,
     Repair,
     Other,
@@ -80,6 +82,8 @@ impl EventKind {
             "rule" => EventKind::Rule,
             "assert" => EventKind::Assert,
             "forget" => EventKind::Forget,
+            "conflict" => EventKind::Conflict,
+            "correct" => EventKind::Correct,
             "proof" => EventKind::Proof,
             "repair" => EventKind::Repair,
             _ => EventKind::Other,
@@ -96,6 +100,8 @@ impl EventKind {
             EventKind::Rule => "rule",
             EventKind::Assert => "assert",
             EventKind::Forget => "forget",
+            EventKind::Conflict => "conflict",
+            EventKind::Correct => "correct",
             EventKind::Proof => "proof",
             EventKind::Repair => "repair",
             EventKind::Other => "other",
@@ -111,6 +117,8 @@ impl EventKind {
                 | EventKind::Rule
                 | EventKind::Assert
                 | EventKind::Forget
+                | EventKind::Conflict
+                | EventKind::Correct
                 | EventKind::Proof
                 | EventKind::Repair
         )
@@ -125,6 +133,8 @@ impl EventKind {
                 | EventKind::Rule
                 | EventKind::Assert
                 | EventKind::Forget
+                | EventKind::Conflict
+                | EventKind::Correct
                 | EventKind::Repair
         )
     }
@@ -183,6 +193,24 @@ impl TheoryEffect {
     }
 }
 
+/// 一条明确的更正：同一 (entity, predicate) 上旧值被判错、新值生效。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TheoryCorrection {
+    pub entity: String,
+    pub predicate: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// 一条未裁决的冲突：两个来源对同一 (entity, predicate) 给出不同取值。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TheoryConflict {
+    pub entity: String,
+    pub predicate: String,
+    pub existing: Vec<String>,
+    pub incoming: String,
+}
+
 /// 事件在情景理论中的具体化形态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TheoryEvent {
@@ -200,6 +228,8 @@ pub struct TheoryEvent {
     pub digest: Option<String>,
     pub removes_digest: Option<String>,
     pub answer: Option<String>,
+    pub corrections: Vec<TheoryCorrection>,
+    pub conflicts: Vec<TheoryConflict>,
 }
 
 impl TheoryEvent {
@@ -264,6 +294,8 @@ impl TheoryEvent {
             .map(str::trim)
             .filter(|focus| !focus.is_empty())
             .map(str::to_string);
+        let corrections = parse_corrections(payload);
+        let conflicts = parse_conflicts(payload);
         Self {
             seq: entry.seq,
             kind,
@@ -288,6 +320,8 @@ impl TheoryEvent {
                 .get("answer")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            corrections,
+            conflicts,
         }
     }
 
@@ -296,6 +330,16 @@ impl TheoryEvent {
         for effect in &self.effects {
             if !effect.entity.is_empty() {
                 pairs.insert((effect.entity.clone(), effect.predicate.clone()));
+            }
+        }
+        for correction in &self.corrections {
+            if !correction.entity.is_empty() {
+                pairs.insert((correction.entity.clone(), correction.predicate.clone()));
+            }
+        }
+        for conflict in &self.conflicts {
+            if !conflict.entity.is_empty() {
+                pairs.insert((conflict.entity.clone(), conflict.predicate.clone()));
             }
         }
         pairs.into_iter().collect()
@@ -307,6 +351,96 @@ fn default_op(kind: EventKind) -> EffectOp {
         EventKind::Retract | EventKind::Forget => EffectOp::Remove,
         _ => EffectOp::Add,
     }
+}
+
+fn parse_corrections(payload: &Value) -> Vec<TheoryCorrection> {
+    let Some(items) = payload.get("corrections").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut corrections = Vec::new();
+    for item in items {
+        let entity = item
+            .get("entity")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        let predicate = item
+            .get("predicate")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        let from = item
+            .get("from")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        let to = item
+            .get("to")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        if entity.is_empty() || predicate.is_empty() || (from.is_empty() && to.is_empty()) {
+            continue;
+        }
+        corrections.push(TheoryCorrection {
+            entity,
+            predicate,
+            from,
+            to,
+        });
+    }
+    corrections.sort();
+    corrections.dedup();
+    corrections
+}
+
+fn parse_conflicts(payload: &Value) -> Vec<TheoryConflict> {
+    let Some(items) = payload.get("conflicts").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut conflicts = Vec::new();
+    for item in items {
+        let entity = item
+            .get("entity")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        let predicate = item
+            .get("predicate")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        let incoming = item
+            .get("incoming")
+            .and_then(Value::as_str)
+            .map(local_name)
+            .unwrap_or_default();
+        let mut existing: Vec<String> = item
+            .get("existing")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(local_name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        existing.sort();
+        existing.dedup();
+        if entity.is_empty() || predicate.is_empty() || incoming.is_empty() {
+            continue;
+        }
+        conflicts.push(TheoryConflict {
+            entity,
+            predicate,
+            existing,
+            incoming,
+        });
+    }
+    conflicts.sort();
+    conflicts.dedup();
+    conflicts
 }
 
 fn event_label(kind: EventKind, payload: &Value) -> String {
@@ -365,6 +499,8 @@ fn event_label(kind: EventKind, payload: &Value) -> String {
         EventKind::Rule => "规则".to_string(),
         EventKind::Assert => "断言".to_string(),
         EventKind::Forget => "撤回断言".to_string(),
+        EventKind::Conflict => "冲突".to_string(),
+        EventKind::Correct => "更正".to_string(),
         EventKind::Proof => "证明".to_string(),
         EventKind::Repair => "修复".to_string(),
         EventKind::Turn => "输入".to_string(),
@@ -398,6 +534,12 @@ pub struct AnswerRecord {
     pub situation: String,
     pub focus: Option<String>,
     pub proof_id: Option<String>,
+    /// 提问时看到的编年史水位（旧日志缺省为提问序号）。
+    pub observed_seq: u64,
+    /// 提问时的知识版本。
+    pub read_revision: u64,
+    /// 提交回答时的知识版本。
+    pub commit_revision: u64,
 }
 
 /// 一条情景信念。
@@ -681,6 +823,21 @@ impl ConversationTheory {
                                 .get("proof_id")
                                 .and_then(Value::as_str)
                                 .map(str::to_string),
+                            observed_seq: entry
+                                .payload
+                                .get("observed_seq")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(question_seq),
+                            read_revision: entry
+                                .payload
+                                .get("read_revision")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(entry.kb_revision),
+                            commit_revision: entry
+                                .payload
+                                .get("commit_revision")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(entry.kb_revision),
                         });
                         situation.question = Some(question);
                         situation.focus = focus;
@@ -1311,6 +1468,27 @@ impl ConversationTheory {
             }
             if event.effects.len() > 12 {
                 lines.push(format!("  …其余 {} 条见导入日志", event.effects.len() - 12));
+            }
+        }
+        if !event.corrections.is_empty() {
+            lines.push(format!("更正（{} 条）：", event.corrections.len()));
+            for correction in event.corrections.iter().take(8) {
+                lines.push(format!(
+                    "  - {}.{}：「{}」→「{}」",
+                    correction.entity, correction.predicate, correction.from, correction.to
+                ));
+            }
+        }
+        if !event.conflicts.is_empty() {
+            lines.push(format!("未裁决冲突（{} 条）：", event.conflicts.len()));
+            for conflict in event.conflicts.iter().take(8) {
+                lines.push(format!(
+                    "  - {}.{}：已有「{}」，新值「{}」",
+                    conflict.entity,
+                    conflict.predicate,
+                    conflict.existing.join("、"),
+                    conflict.incoming
+                ));
             }
         }
         if event.kind == EventKind::Reply {
@@ -2005,6 +2183,103 @@ pub fn append_import(
             effect_count,
         ),
     )
+}
+
+/// 追加导入冲突事件（保留被拒入值；不改变可枚举信念）。
+pub fn append_conflict(
+    chronicle: &mut Chronicle,
+    conflicts: &[crate::predicate_registry::ImportConflict],
+    source: &str,
+    revision_after: u64,
+) -> io::Result<u64> {
+    let items: Vec<Value> = conflicts
+        .iter()
+        .map(|conflict| {
+            json!({
+                "entity": local_name(&conflict.subject),
+                "predicate": local_name(&conflict.predicate),
+                "existing": conflict.existing.iter().map(|value| local_name(value)).collect::<Vec<_>>(),
+                "incoming": local_name(&conflict.incoming),
+            })
+        })
+        .collect();
+    let first = conflicts.first();
+    let summary = first
+        .map(|conflict| {
+            format!(
+                "导入冲突：{}.{} 保留「{}」，拒绝「{}」",
+                local_name(&conflict.subject),
+                local_name(&conflict.predicate),
+                conflict.existing.join("、"),
+                conflict.incoming
+            )
+        })
+        .unwrap_or_else(|| "导入冲突".to_string());
+    let mut payload = event_payload(
+        &summary,
+        source,
+        revision_after,
+        &[],
+        false,
+        None,
+        None,
+        0,
+    );
+    payload["conflicts"] = Value::Array(items);
+    chronicle.append("conflict", payload)
+}
+
+/// 追加更正事件：旧值被判错，新值生效（效果可枚举、可反事实重放）。
+pub fn append_correction(
+    chronicle: &mut Chronicle,
+    text: &str,
+    corrections: &[TheoryCorrection],
+    revision_after: u64,
+) -> io::Result<u64> {
+    let mut effects = BTreeSet::new();
+    for correction in corrections {
+        if !correction.from.is_empty() && correction.from != correction.to {
+            effects.insert(TheoryEffect::remove(
+                &correction.entity,
+                &correction.predicate,
+                &correction.from,
+            ));
+        }
+        if !correction.to.is_empty() {
+            effects.insert(TheoryEffect::add(
+                &correction.entity,
+                &correction.predicate,
+                &correction.to,
+            ));
+        }
+    }
+    let effects: Vec<TheoryEffect> = effects.into_iter().collect();
+    let effect_count = effects.len();
+    let digest = effects_digest(&effects);
+    let mut payload = event_payload(
+        text,
+        "用户更正",
+        revision_after,
+        &effects,
+        true,
+        Some(digest),
+        None,
+        effect_count,
+    );
+    payload["corrections"] = Value::Array(
+        corrections
+            .iter()
+            .map(|correction| {
+                json!({
+                    "entity": correction.entity,
+                    "predicate": correction.predicate,
+                    "from": correction.from,
+                    "to": correction.to,
+                })
+            })
+            .collect(),
+    );
+    chronicle.append("correct", payload)
 }
 
 /// 追加上次导入的撤销事件（与导入共享回执摘要，可精确移除来源）。
