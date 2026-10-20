@@ -24,6 +24,9 @@ use crate::graph_ledger;
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
 use crate::law_book::{LawBook, LawStatus};
+use crate::lexical_trace::{
+    self, LexicalTrace, ReadFailureKind, ReadStage, ReadTraceLedger, TraceFidelity, TraceReceipt,
+};
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
 use crate::predicate_registry::PredicateRegistry;
@@ -50,7 +53,7 @@ use crate::temporal::{
     self, validity_from_bounds, TemporalConstraint, UnknownTimePolicy, Validity,
 };
 use crate::view_render::ProofViewNode;
-use crate::ReasoningConfig;
+use crate::{NlpConfig, ReasoningConfig};
 
 // 归结引擎内部谓词：has(E, 谓词名) / type(E, 类型名)，用于承载关联规则的物品
 const PROOF_HAS: &str = "__具有__";
@@ -749,6 +752,11 @@ pub struct SymbolicReasoner {
     dependency_stamps: BTreeMap<&'static str, u64>,
     // 操作计数台账（可与其他模块共享）
     perf: Arc<PerfLedger>,
+    // 读法观测：宿主注入 NLP 配置后，失败轮才做一次只读词法轨迹；
+    // None 时零额外分词/链接成本，回答路径逐字节不变。
+    nlp_config: Option<NlpConfig>,
+    // 有界失败回执（只含 digest/计数/有限枚举，不保存原文，不进会话快照）
+    read_traces: ReadTraceLedger,
     // 引擎层故障通道（Prolog / 存储等下游失败由宿主注入）：
     // 非空时对话管理器走 EngineFault 路径，绝不与「知识里没有」合并。
     engine_fault: Option<String>,
@@ -802,6 +810,9 @@ impl Clone for SymbolicReasoner {
             derived_stamps: self.derived_stamps.clone(),
             dependency_stamps: self.dependency_stamps.clone(),
             perf: Arc::clone(&self.perf),
+            nlp_config: self.nlp_config.clone(),
+            // 轨迹不是记忆：分叉会话从空台账开始，避免把上一会话的失败带入
+            read_traces: ReadTraceLedger::new(),
             engine_fault: self.engine_fault.clone(),
         }
     }
@@ -956,6 +967,8 @@ impl SymbolicReasoner {
             derived_stamps: BTreeMap::new(),
             dependency_stamps: BTreeMap::new(),
             perf,
+            nlp_config: None,
+            read_traces: ReadTraceLedger::new(),
             engine_fault: None,
         };
         reasoner.rebuild_knowledge_caches();
@@ -1026,6 +1039,7 @@ impl SymbolicReasoner {
         self.link_memo.lock().clear();
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
+        self.read_traces.clear();
         self.engine_fault = None;
         // 教学规则会随 lessons_parsed 重放进概率程序；只有真的教过才需要重建
         if lessons_were_taught && self.config.enable_problog {
@@ -1061,6 +1075,156 @@ impl SymbolicReasoner {
     /// 共享的性能台账（与 `OxigraphManager` 可为同一实例）。
     pub fn perf_ledger(&self) -> Arc<PerfLedger> {
         Arc::clone(&self.perf)
+    }
+
+    /// 注入 NLP 配置，启用读法观测。失败轮会留下只读轨迹回执；
+    /// 成功轮不额外分词。未注入时失败轮保持原有的零开销回答路径。
+    pub fn set_nlp_config(&mut self, config: NlpConfig) {
+        self.nlp_config = Some(config);
+        self.read_traces.clear();
+    }
+
+    /// 构建一次知识感知的读法轨迹（只读；不执行回答）。
+    pub fn lexical_trace(&self, question: &str) -> Option<LexicalTrace> {
+        let config = self.nlp_config.as_ref()?;
+        let plan = self.planner.parse(question);
+        let mut trace = lexical_trace::trace_question(question, config, plan.as_ref());
+        trace.fidelity = TraceFidelity::Reconstructed;
+        if let Some(plan) = &plan {
+            self.enrich_trace_plan_terms(&mut trace, plan);
+        }
+        self.enrich_trace_oov(&mut trace, question);
+        Some(trace)
+    }
+
+    /// 读法追踪报告：token/来源/边界/计划/失败分类，并标注回答管线是否命中。
+    pub fn lexical_trace_report(&self, question: &str) -> String {
+        let Some(mut trace) = self.lexical_trace(question) else {
+            return "读法追踪未启用：推理器没有注入 NLP 配置。".to_string();
+        };
+        let answered = self.answer_impl(question).is_some();
+        trace.answer_available = Some(answered);
+        if !answered && trace.plan.is_some() && !trace.failures.iter().any(|failure| {
+            matches!(
+                failure.kind,
+                ReadFailureKind::UnknownEntity
+                    | ReadFailureKind::UnknownPredicate
+                    | ReadFailureKind::ClosureMarkerInToken
+            )
+        }) {
+            trace.push_failure(
+                ReadStage::Execute,
+                ReadFailureKind::ExecutionMiss,
+                "计划已识别，但回答管线没有产生结果（事实缺口/缺少推理律/截断需在推理侧继续区分）",
+            );
+        }
+        self.perf.bump("lexical_trace_reports");
+        self.perf.bump_by(
+            "lexical_trace_unknown_tokens",
+            trace.unknown_tokens().count() as u64,
+        );
+        self.perf.bump_by(
+            "lexical_trace_marker_violations",
+            trace.boundary_violations() as u64,
+        );
+        self.perf.bump_by("lexical_trace_oov", trace.oov.len() as u64);
+        trace.render_report()
+    }
+
+    /// 有界失败回执台账（不含原文）；进程重启即失，不进入会话快照。
+    pub fn read_trace_ledger_report(&self) -> String {
+        self.read_traces.report()
+    }
+
+    pub fn read_trace_receipts(&self) -> Vec<TraceReceipt> {
+        self.read_traces.snapshot()
+    }
+
+    fn enrich_trace_plan_terms(&self, trace: &mut LexicalTrace, plan: &QueryPlan) {
+        let (entities, predicates) = lexical_trace::plan_terms(plan);
+        for entity in entities {
+            if !self.is_known_entity(&entity) {
+                trace.push_failure(
+                    ReadStage::Link,
+                    ReadFailureKind::UnknownEntity,
+                    format!("实体槽「{}」未在知识图谱登记", entity),
+                );
+            }
+        }
+        for predicate in predicates {
+            if !self.is_known_predicate(&predicate) {
+                trace.push_failure(
+                    ReadStage::Link,
+                    ReadFailureKind::UnknownPredicate,
+                    format!("谓词槽「{}」未在谓词画像/事实中登记", predicate),
+                );
+            }
+        }
+    }
+
+    fn enrich_trace_oov(&self, trace: &mut LexicalTrace, question: &str) {
+        let expectations = crate::function_words::answer_type_keywords(question);
+        let hints = self.link_hints(question);
+        let receipts = self.linker.mention_receipts(
+            question,
+            &hints,
+            &expectations,
+            self.context.focus(),
+        );
+        trace.oov = crate::entity_linker::oov_suspects(question, &receipts)
+            .into_iter()
+            .map(|suspect| crate::lexical_trace::OovTrace {
+                text: suspect.text,
+                start: suspect.start,
+                kind: match suspect.kind {
+                    crate::entity_linker::OovKind::Quoted => "quoted".to_string(),
+                    crate::entity_linker::OovKind::Suffix => "suffix".to_string(),
+                },
+                reason: suspect.reason,
+                suggested_type: suspect.suggested_type,
+            })
+            .collect();
+    }
+
+    /// 失败轮的只读轨迹：有界回执 + 有限枚举指标。成功轮不调用。
+    fn record_read_failure(&self, question: &str) {
+        let Some(mut trace) = self.lexical_trace(question) else {
+            return;
+        };
+        trace.answer_available = Some(false);
+        if trace.plan.is_some()
+            && trace.failures.iter().all(|failure| {
+                !matches!(
+                    failure.kind,
+                    ReadFailureKind::UnknownEntity
+                        | ReadFailureKind::UnknownPredicate
+                        | ReadFailureKind::NoQuestionShape
+                )
+            })
+        {
+            trace.push_failure(
+                ReadStage::Execute,
+                ReadFailureKind::ExecutionMiss,
+                "计划已识别，但回答管线没有产生结果",
+            );
+        }
+        let receipt = self.read_traces.record(&trace);
+        self.perf.bump("lexical_trace_failures");
+        self.perf.bump_by(
+            "lexical_trace_unknown_tokens",
+            trace.unknown_tokens().count() as u64,
+        );
+        self.perf.bump_by(
+            "lexical_trace_marker_violations",
+            trace.boundary_violations() as u64,
+        );
+        self.perf.bump_by("lexical_trace_oov", trace.oov.len() as u64);
+        for stage in &receipt.failure_stages {
+            self.perf.bump(&format!("lexical_trace_stage_{}", stage));
+        }
+        for kind in &receipt.failure_kinds {
+            self.perf.bump(&format!("lexical_trace_failure_{}", kind));
+        }
     }
 
     /// 记录一次派生重建：派生器戳上当前知识版本，并在性能台账计一次数。
@@ -5551,6 +5715,16 @@ impl SymbolicReasoner {
     }
 
     pub fn answer(&self, question: &str) -> Option<String> {
+        let answer = self.answer_impl(question);
+        if answer.is_none() {
+            // 只观测失败：成功轮不做额外分词，回答内容与原有路径逐字节一致。
+            self.record_read_failure(question);
+        }
+        answer
+    }
+
+    /// 无观测副作用的回答实现（报告路径复用，避免失败轨迹递归）。
+    fn answer_impl(&self, question: &str) -> Option<String> {
         if let Some(answer) = self.answer_planned(question) {
             return Some(answer);
         }
@@ -11142,5 +11316,78 @@ mod tests {
             .expect("查询板应支持实体比较");
         assert!(compare.text.contains("王治郅"), "{}", compare.text);
         assert!(compare.text.contains("214"), "{}", compare.text);
+    }
+
+    fn trace_nlp_config() -> NlpConfig {
+        NlpConfig {
+            import_keywords: Vec::new(),
+            pos_dict: HashMap::new(),
+            name_patterns: crate::NamePatterns {
+                prefixes: Vec::new(),
+                suffixes: Vec::new(),
+                full_names: vec!["张三".to_string(), "李四".to_string(), "王五".to_string()],
+                profession_suffix: Vec::new(),
+            },
+            enable_nlu: None,
+            nlu_confidence_threshold: None,
+            enable_local_semantic: None,
+            disable_ownthink_api: None,
+            semantic_similarity_threshold: None,
+            max_entity_candidates: None,
+            enable_advanced_entity_extraction: None,
+            enable_relation_extraction: None,
+            context_window_size: None,
+        }
+    }
+
+    #[test]
+    fn failed_answer_records_classified_read_trace_without_raw_text() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.set_nlp_config(trace_nlp_config());
+        assert!(reasoner.read_trace_receipts().is_empty());
+
+        let answer = reasoner.answer("未名科技公司的老板是谁");
+        assert!(answer.is_none(), "未知实体不应被静默猜测：{:?}", answer);
+        let receipts = reasoner.read_trace_receipts();
+        assert_eq!(receipts.len(), 1, "失败轮应留下一条有界回执");
+        let receipt = &receipts[0];
+        assert!(
+            receipt
+                .failure_kinds
+                .iter()
+                .any(|kind| kind == "unknown_entity"),
+            "失败应分类为未知实体：{:?}",
+            receipt
+        );
+        assert_eq!(receipt.answered, Some(false));
+        assert!(
+            receipt.source_counts.values().sum::<u64>() > 0,
+            "回执应记录词性来源分布"
+        );
+        let report = reasoner.read_trace_ledger_report();
+        assert!(!report.contains("未名科技"), "台账不得保存原文：{}", report);
+
+        // 成功轮不做额外失败记录（也只观测失败）。
+        let answer = reasoner.answer("张三的师傅是谁");
+        assert!(answer.is_some(), "已登记实体应正常回答");
+        assert_eq!(reasoner.read_trace_receipts().len(), 1);
+    }
+
+    #[test]
+    fn lexical_trace_report_exposes_marker_boundary_without_changing_answer() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.set_nlp_config(trace_nlp_config());
+
+        let report = reasoner.lexical_trace_report("张三的所有权归公司");
+        assert!(report.contains("读法追踪"), "{}", report);
+        assert!(report.contains("边界越界"), "{}", report);
+        assert!(report.contains("事后重建"), "{}", report);
+        assert!(!report.contains("失败分类：无"), "{}", report);
+
+        // 观测不改变回答路径：普通闭包/多跳问句仍走原实现。
+        let answer = reasoner.answer("张三的师傅的师傅是谁");
+        assert!(answer.is_some(), "原多跳回答不应被追踪改变");
     }
 }

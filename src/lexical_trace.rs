@@ -256,6 +256,8 @@ pub struct LexicalTrace {
     pub oov: Vec<OovTrace>,
     pub failures: Vec<ReadFailure>,
     pub warnings: Vec<ReadWarning>,
+    /// 宿主是否观察到回答；纯文本追踪（未访问知识库）为 None。
+    pub answer_available: Option<bool>,
 }
 
 impl LexicalTrace {
@@ -314,6 +316,13 @@ impl LexicalTrace {
             .collect();
         failure_kinds.sort();
         failure_kinds.dedup();
+        let mut failure_stages: Vec<String> = self
+            .failures
+            .iter()
+            .map(|failure| failure.stage.code().to_string())
+            .collect();
+        failure_stages.sort();
+        failure_stages.dedup();
         let mut warning_kinds: Vec<String> = self
             .warnings
             .iter()
@@ -330,10 +339,12 @@ impl LexicalTrace {
             source_counts,
             plan_kind: self.plan.as_ref().map(|plan| plan.kind.clone()),
             failure_kinds,
+            failure_stages,
             warning_kinds,
             closure_marker_violations: self.boundary_violations() as u64,
             oov_count: self.oov.len() as u64,
             fidelity: self.fidelity,
+            answered: self.answer_available,
         }
     }
 
@@ -350,6 +361,12 @@ impl LexicalTrace {
             "证据保真度：{}（事后按同一纯函数重跑，不是当时的执行现场）。\n",
             self.fidelity.label()
         ));
+        if let Some(answered) = self.answer_available {
+            output.push_str(&format!(
+                "回答管线：{}。\n",
+                if answered { "有结果" } else { "未命中" }
+            ));
+        }
 
         if self.tokens.is_empty() {
             output.push_str("token：无。\n");
@@ -468,10 +485,12 @@ pub struct TraceReceipt {
     pub source_counts: BTreeMap<String, u64>,
     pub plan_kind: Option<String>,
     pub failure_kinds: Vec<String>,
+    pub failure_stages: Vec<String>,
     pub warning_kinds: Vec<String>,
     pub closure_marker_violations: u64,
     pub oov_count: u64,
     pub fidelity: TraceFidelity,
+    pub answered: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -532,6 +551,7 @@ impl ReadTraceLedger {
             return "读法台账：暂无失败轨迹。".to_string();
         }
         let mut failures: BTreeMap<String, u64> = BTreeMap::new();
+        let mut stages: BTreeMap<String, u64> = BTreeMap::new();
         let mut plans: BTreeMap<String, u64> = BTreeMap::new();
         let mut sources: BTreeMap<String, u64> = BTreeMap::new();
         let mut unknown_tokens = 0u64;
@@ -540,6 +560,9 @@ impl ReadTraceLedger {
         for receipt in &receipts {
             for kind in &receipt.failure_kinds {
                 *failures.entry(kind.clone()).or_insert(0) += 1;
+            }
+            for stage in &receipt.failure_stages {
+                *stages.entry(stage.clone()).or_insert(0) += 1;
             }
             let plan = receipt
                 .plan_kind
@@ -558,6 +581,9 @@ impl ReadTraceLedger {
             receipts.len(),
             self.capacity
         );
+        output.push_str("失败阶段（条次）：");
+        output.push_str(&render_counts(&stages));
+        output.push('\n');
         output.push_str("失败分类（条次）：");
         output.push_str(&render_counts(&failures));
         output.push('\n');
@@ -818,6 +844,7 @@ pub fn trace_question(
         oov: Vec::new(),
         failures,
         warnings,
+        answer_available: None,
     }
 }
 
