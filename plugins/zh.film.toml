@@ -11,7 +11,6 @@ id = "film.lexicon"
 description = "电影领域词面归一。"
 entries = [
   { surface = "影片", canonical = "电影" },
-  { surface = "执导", canonical = "导演" },
 ]
 
 [[contributions]]
@@ -36,7 +35,9 @@ description = "作品 → 导演（正向；答案类型约束为人物）"
 patterns = [
   "{entity}是谁导演的",
   "{entity}由谁导演",
+  "{entity}由谁执导",
   "谁导演了{entity}",
+  "谁执导了{entity}",
 ]
 question = "{entity}的导演是什么"
 attribute = "导演"
@@ -118,6 +119,16 @@ expect_contains = "导演"
 [[eval_cases]]
 input = "阿凡达由谁执导"
 expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "谁执导了阿凡达"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "卡梅隆执导过哪些电影"
+expect_rewrite = "卡梅隆导演过哪些作品"
 expect_plugin = "zh.film"
 
 [[eval_cases]]
