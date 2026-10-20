@@ -1623,9 +1623,15 @@ impl SymbolicReasoner {
         if evidence.is_empty() {
             evidence.push(format!("图谱属性记录：{}的{}", entity, attribute));
         }
+        // 事实边优先保留，类型证明只在剩余额度内补充；不能因为答案多值
+        // 就把「哪条事实支持了这个值」挤出依据列表。
+        evidence.sort();
+        evidence.dedup();
+        evidence.truncate(6);
         // 类型约束用的不是问答模板里的猜测：把每个答案的已知类型及其推导理由
         // 一并复述，用户能看到「为什么这个值符合 answer_types」。
         if !answer_types.is_empty() {
+            let mut type_evidence = Vec::new();
             for value in &raw_values {
                 let known_types = closure.types_of(value);
                 for actual in &known_types {
@@ -1644,13 +1650,20 @@ impl SymbolicReasoner {
                     let why = closure
                         .why_instance(value, actual)
                         .unwrap_or("类型继承");
-                    evidence.push(format!("{} 属于 {}（{}）", value, actual, why));
+                    type_evidence.push(format!("{} 属于 {}（{}）", value, actual, why));
+                }
+            }
+            type_evidence.sort();
+            type_evidence.dedup();
+            for line in type_evidence {
+                if evidence.len() >= 8 {
+                    break;
+                }
+                if !evidence.contains(&line) {
+                    evidence.push(line);
                 }
             }
         }
-        evidence.sort();
-        evidence.dedup();
-        evidence.truncate(8);
 
         let values: Vec<String> = raw_values
             .into_iter()
@@ -10144,6 +10157,55 @@ template = "「{entity}」的导演是{answer}。依据：{evidence}"
             reply.plan.iter().any(|plan| plan.contains("film.works_by_director")),
             "{:?}",
             reply.plan
+        );
+    }
+
+    /// 别名公理让历史数据无需重写：谓词别名沿子关系归一，类型别名沿子类归一。
+    #[test]
+    fn recipe_lookup_reaches_alias_predicates_and_types() {
+        use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
+
+        let facts = vec![
+            PrologFact::Entity {
+                name: "阿凡达".into(),
+                entity_type: "影片".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "卡梅隆".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "阿凡达".into(),
+                rel_type: "director".into(),
+                to: "卡梅隆".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let program = OntologyProgram::from_lessons(vec![
+            OntologyLesson::Subclass {
+                sub: "影片".into(),
+                sup: "电影".into(),
+                original: "影片是电影的别名".into(),
+            },
+            OntologyLesson::Subproperty {
+                sub: "director".into(),
+                sup: "导演".into(),
+                original: "director是导演的别名".into(),
+            },
+        ]);
+        assert!(reasoner.configure_ontology_program(&program) > 0);
+
+        let inverse = reasoner
+            .recipe_lookup("卡梅隆", "导演", RecipeDirection::Inverse, &["电影".into()])
+            .expect("别名谓词与别名类型都应被规范词面命中");
+        assert_eq!(inverse.values, vec!["阿凡达".to_string()]);
+        assert!(
+            inverse.evidence.iter().any(|line| line.contains("director ⊑ 导演")),
+            "依据应说明别名归一：{:?}",
+            inverse.evidence
         );
     }
 
