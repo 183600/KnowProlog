@@ -895,11 +895,9 @@ fn learn_patterns(
         let context_pairs: usize = entry.support.values().map(BTreeSet::len).sum();
         for (predicate, pairs) in &entry.support {
             let support_pairs = pairs.len();
-            let purity_permille = if context_pairs == 0 {
-                0
-            } else {
-                (support_pairs * 1000 / context_pairs) as u32
-            };
+            let purity_permille = (support_pairs * 1000)
+                .checked_div(context_pairs)
+                .unwrap_or(0) as u32;
             let active = support_pairs >= options.min_pattern_support
                 && purity_permille >= options.min_pattern_purity
                 && discriminative_context(&middle, &suffix);
@@ -1013,7 +1011,7 @@ fn discriminative_context(middle: &str, suffix: &str) -> bool {
 
 fn endpoint_ok(value: &str) -> bool {
     let length = value.chars().count();
-    if length < MIN_ENDPOINT_CHARS || length > MAX_ENDPOINT_CHARS {
+    if !(MIN_ENDPOINT_CHARS..=MAX_ENDPOINT_CHARS).contains(&length) {
         return false;
     }
     if value
