@@ -95,6 +95,7 @@ pub mod path_memory;
 pub mod contextual_reference;
 pub mod pattern_closure;
 pub mod temporal;
+pub mod lexical_trace;
 pub mod release;
 
 #[cfg(test)]
