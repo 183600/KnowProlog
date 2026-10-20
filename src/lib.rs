@@ -93,6 +93,7 @@ pub mod relation_frame;
 pub mod weak_construction;
 pub mod path_memory;
 pub mod contextual_reference;
+pub mod pattern_closure;
 pub mod temporal;
 pub mod release;
 
