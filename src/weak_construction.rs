@@ -27,6 +27,7 @@ pub const DEFAULT_MIN_PATTERN_PURITY: u32 = 600;
 pub const MIN_ENDPOINT_CHARS: usize = 2;
 pub const MAX_ENDPOINT_CHARS: usize = 32;
 pub const DEFAULT_MAX_SEED_EDGES: usize = 4096;
+pub const MAX_RENDERED_PROPOSALS: usize = 40;
 
 const MAX_CONTEXT_CHARS: usize = 20;
 const PUNCTUATION: &[char] = &[
@@ -337,8 +338,14 @@ impl ConstructionReport {
         if !self.mint_proposals.is_empty() {
             lines.push(String::new());
             lines.push("铸型提案：".to_string());
-            for proposal in &self.mint_proposals {
+            for proposal in self.mint_proposals.iter().take(MAX_RENDERED_PROPOSALS) {
                 lines.push(format!("  {}", proposal.render_text()));
+            }
+            if self.mint_proposals.len() > MAX_RENDERED_PROPOSALS {
+                lines.push(format!(
+                    "  …其余 {} 条见 --json",
+                    self.mint_proposals.len() - MAX_RENDERED_PROPOSALS
+                ));
             }
         }
         if !self.generations.is_empty() {
