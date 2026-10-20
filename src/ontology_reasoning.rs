@@ -402,7 +402,7 @@ pub fn canonicalize_lessons(lessons: Vec<OntologyLesson>) -> Vec<OntologyLesson>
 /// 归约成同一套公理（`OntologyLesson`），与「教学本体」共用**一个**推理器与
 /// 一个胶囊——配置不再有第二套本体，重启/重建后同样保留。
 ///
-/// 只并入结构性公理：子类、互斥、定义域/值域、逆关系、传递、对称。
+/// 只并入结构性公理：子类、互斥、定义域/值域、逆关系、传递、对称、子属性。
 /// `aliases` 不入本体（别名归一由 aligner / type_system 负责，混入会造成
 /// 类身份重复）；`closure_gate` 是判定档位不是公理。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +464,16 @@ impl OntologyProgram {
                     property: profile.name.clone(),
                     original: format!("{}是对称的", profile.name),
                 });
+            }
+            if let Some(parent) = &profile.subproperty_of {
+                let parent = parent.trim();
+                if !parent.is_empty() && parent != profile.name {
+                    lessons.push(OntologyLesson::Subproperty {
+                        sub: profile.name.clone(),
+                        sup: parent.to_string(),
+                        original: format!("{}是{}的子关系", profile.name, parent),
+                    });
+                }
             }
         }
         Self { lessons }
@@ -1973,6 +1983,63 @@ mod tests {
             closure.why_instance("李四", "人物").is_some(),
             "值域推断应生效：{:?}",
             closure.why_instance("李四", "人物")
+        );
+    }
+
+    /// 配置态子属性通道：`subproperty_of` 归约为子关系公理，原句可回读，
+    /// 且子关系事实沿层级上浮到父谓词（理解召回与生成概括的共同基础）。
+    #[test]
+    fn config_program_reduces_subproperty_and_lifts_facts() {
+        use crate::predicate_registry::PredicateProfileConfig;
+
+        let profiles = vec![
+            PredicateProfileConfig {
+                name: "师傅".into(),
+                ..PredicateProfileConfig::default()
+            },
+            PredicateProfileConfig {
+                name: "师承".into(),
+                subproperty_of: Some("师傅".into()),
+                ..PredicateProfileConfig::default()
+            },
+        ];
+        let program = OntologyProgram::from_config(&Default::default(), &profiles);
+        let lesson = program
+            .lessons
+            .iter()
+            .find_map(|lesson| match lesson {
+                OntologyLesson::Subproperty { sub, sup, .. } => Some((sub.clone(), sup.clone())),
+                _ => None,
+            })
+            .expect("subproperty_of 应归约为子关系公理");
+        assert_eq!(lesson, ("师承".to_string(), "师傅".to_string()));
+        let sub_lesson = program
+            .lessons
+            .iter()
+            .find(|lesson| matches!(lesson, OntologyLesson::Subproperty { .. }))
+            .unwrap();
+        let reparsed = parse_ontology_lesson(sub_lesson.original())
+            .unwrap_or_else(|error| panic!("子关系原句应可回读：{}", error));
+        assert_eq!(&reparsed, sub_lesson);
+
+        let mut ontology = OntologyReasoner::new(6);
+        for lesson in &program.lessons {
+            apply_ontology_lesson(&mut ontology, lesson);
+        }
+        ontology.add_relation("张三", "师承", "李四");
+        let closure = ontology.materialize();
+        assert!(
+            closure.why_relation("张三", "师傅", "李四").is_some(),
+            "子关系事实应上浮到父谓词：{:?}",
+            closure.relations_snapshot()
+        );
+        assert!(
+            closure
+                .why_relation("张三", "师傅", "李四")
+                .map(|why| why.contains("师承"))
+                .unwrap_or(false),
+            "上浮推导理由应引用子关系边：{:?}",
+            closure.why_relation("张三", "师傅", "李四")
         );
     }
 }

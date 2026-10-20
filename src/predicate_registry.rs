@@ -37,6 +37,10 @@ pub struct PredicateProfileConfig {
     /// 值域：宾语允许的实体类型（空 = 不限制）
     #[serde(default)]
     pub range: Vec<String>,
+    /// 子属性声明：本谓词 ⊑ 指定的父谓词（RDFS `subPropertyOf`）。
+    /// 设定后，本谓词的事实会沿层级上浮到父谓词，查询父谓词时能召回本谓词的事实。
+    #[serde(default)]
+    pub subproperty_of: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
 }

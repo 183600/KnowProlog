@@ -538,6 +538,10 @@ impl OwlNarrator {
                 self.known.insert(left.clone());
                 self.known.insert(right.clone());
             }
+            OntologyLesson::Subproperty { sub, sup, .. } => {
+                self.known.insert(sub.clone());
+                self.known.insert(sup.clone());
+            }
             _ => {}
         }
         if !self.taught.iter().any(|known| known == lesson) {

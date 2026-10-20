@@ -948,6 +948,31 @@ fn check_predicate_profiles(
                 );
             }
         }
+        if let Some(parent) = &profile.subproperty_of {
+            let parent = parent.trim();
+            if parent.is_empty() {
+                c.warn(
+                    "empty_subproperty_of",
+                    format!("{}.subproperty_of", path),
+                    "子属性父谓词为空：该声明被忽略",
+                );
+            } else if parent == name {
+                c.error(
+                    "self_subproperty",
+                    format!("{}.subproperty_of", path),
+                    format!("谓词「{}」声明自身为其子属性", name),
+                );
+            } else if !canonical_names.contains_key(parent) {
+                c.warn(
+                    "unknown_subproperty_parent",
+                    format!("{}.subproperty_of", path),
+                    format!(
+                        "父谓词「{}」未在 predicate_profiles 中声明规范名：若为笔误将无法沿层级展开",
+                        parent
+                    ),
+                );
+            }
+        }
     }
 
     for (index, profile) in config.predicate_profiles.iter().enumerate() {
