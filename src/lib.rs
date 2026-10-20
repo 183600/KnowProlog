@@ -90,6 +90,7 @@ pub mod entity_registry;
 pub mod shape_gate;
 pub mod relation_acquisition;
 pub mod relation_frame;
+pub mod weak_construction;
 pub mod path_memory;
 pub mod contextual_reference;
 pub mod temporal;
