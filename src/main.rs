@@ -137,9 +137,13 @@ enum Commands {
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
     ReadTrace {
-        /// Question to analyse
-        question: String,
-        /// Print the trace as JSON
+        /// Question to analyse (omit when using --corpus)
+        #[arg(required_unless_present = "corpus", conflicts_with = "corpus")]
+        question: Option<String>,
+        /// UTF-8 corpus with one question per line; reports aggregated lexicon gaps
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Print the trace/report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -583,8 +587,13 @@ async fn main() {
     };
 
     // 读法追踪只读配置与文本：不打开知识存储，适合在词表/分词变更前后做差分。
-    if let Some(Commands::ReadTrace { question, json }) = &cli.command {
-        run_read_trace(question, *json, &config.nlp);
+    if let Some(Commands::ReadTrace {
+        question,
+        corpus,
+        json,
+    }) = &cli.command
+    {
+        run_read_trace(question.as_deref(), corpus.as_deref(), *json, &config.nlp);
         return;
     }
 
@@ -2050,7 +2059,34 @@ async fn run_fuse(
 }
 
 /// `read-trace`：离线观察一个问句被切成了什么、词性来自哪里、规划器看到了什么。
-fn run_read_trace(question: &str, json: bool, nlp: &know_prolog::NlpConfig) {
+/// 提供 `--corpus` 时改为聚合词表缺口（未知词形 + 标记边界），不自动改词表。
+fn run_read_trace(
+    question: Option<&str>,
+    corpus: Option<&str>,
+    json: bool,
+    nlp: &know_prolog::NlpConfig,
+) {
+    if let Some(path) = corpus {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("读取语料失败（{}）：{}", path, error);
+                return;
+            }
+        };
+        let questions: Vec<&str> = text.lines().collect();
+        let report = lexical_trace::lexicon_gap_report(questions, nlp);
+        if json {
+            match serde_json::to_string_pretty(&report) {
+                Ok(text) => println!("{}", text),
+                Err(error) => eprintln!("序列化词表缺口报告失败：{}", error),
+            }
+        } else {
+            println!("{}", report.render_report());
+        }
+        return;
+    }
+    let question = question.unwrap_or_default();
     let plan = QueryPlanner::new().parse(question);
     let trace = lexical_trace::trace_question(question, nlp, plan.as_ref());
     if json {

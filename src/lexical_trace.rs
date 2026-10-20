@@ -848,6 +848,160 @@ pub fn trace_question(
     }
 }
 
+/// 词表缺口来源：未知词形，或闭包标记词落在 token 内部。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapKind {
+    UnknownToken,
+    MarkerBoundary,
+}
+
+impl GapKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            GapKind::UnknownToken => "unknown_token",
+            GapKind::MarkerBoundary => "marker_boundary",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GapKind::UnknownToken => "未知词形",
+            GapKind::MarkerBoundary => "标记边界",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexiconGapEntry {
+    pub text: String,
+    pub kind: GapKind,
+    pub count: u64,
+    /// 首次出现的问句序号（从 1 开始，便于回到语料定位）。
+    pub first_question: usize,
+    pub suggested_type: Option<String>,
+}
+
+/// 固定语料上的词表缺口：只提名、不自动改词表；采纳与否由人决定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexiconGapReport {
+    pub questions: usize,
+    pub unknown_tokens: u64,
+    pub marker_violations: u64,
+    pub plan_missing: u64,
+    pub entries: Vec<LexiconGapEntry>,
+}
+
+impl LexiconGapReport {
+    pub fn render_report(&self) -> String {
+        let mut output = format!(
+            "词表缺口报告：{} 个问句，{} 个不同词形/边界项；未知词 {} 次，标记越界 {} 次，无计划 {} 次。\n",
+            self.questions,
+            self.entries.len(),
+            self.unknown_tokens,
+            self.marker_violations,
+            self.plan_missing
+        );
+        if self.entries.is_empty() {
+            output.push_str("没有发现词表缺口。\n");
+            return output.trim_end().to_string();
+        }
+        for kind in [GapKind::UnknownToken, GapKind::MarkerBoundary] {
+            let items: Vec<&LexiconGapEntry> = self
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == kind)
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("{}（{}）：\n", kind.label(), items.len()));
+            for entry in items {
+                let suggested = entry
+                    .suggested_type
+                    .as_deref()
+                    .map(|etype| format!("；可能类型 {}", etype))
+                    .unwrap_or_default();
+                output.push_str(&format!(
+                    "  • 「{}」×{}（首见第 {} 句{}）\n",
+                    entry.text, entry.count, entry.first_question, suggested
+                ));
+            }
+        }
+        output.trim_end().to_string()
+    }
+}
+
+/// 对固定语料做一次只读词表缺口扫描。同一问句列表必然得到同一排序：
+/// 先按缺口类别，再按次数降序，最后按词形字典序。
+pub fn lexicon_gap_report<'a, I>(questions: I, config: &NlpConfig) -> LexiconGapReport
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let planner = QueryPlanner::new();
+    let mut entries: BTreeMap<(GapKind, String), LexiconGapEntry> = BTreeMap::new();
+    let mut total_questions = 0usize;
+    let mut unknown_tokens = 0u64;
+    let mut marker_violations = 0u64;
+    let mut plan_missing = 0u64;
+    let mut record = |kind: GapKind, text: &str, question_index: usize| {
+        let key = (kind, text.to_string());
+        let entry = entries.entry(key).or_insert_with(|| LexiconGapEntry {
+            text: text.to_string(),
+            kind,
+            count: 0,
+            first_question: question_index,
+            suggested_type: crate::identity::infer_suffix_type(text)
+                .map(|(_, etype)| etype.to_string()),
+        });
+        entry.count += 1;
+    };
+    for (index, question) in questions.into_iter().enumerate() {
+        let question = question.trim();
+        if question.is_empty() {
+            continue;
+        }
+        total_questions += 1;
+        let plan = planner.parse(question);
+        if plan.is_none() {
+            plan_missing += 1;
+        }
+        let trace = trace_question(question, config, plan.as_ref());
+        for token in trace.unknown_tokens() {
+            if token.text.chars().any(|ch| ch.is_alphanumeric()) {
+                unknown_tokens += 1;
+                record(GapKind::UnknownToken, &token.text, index + 1);
+            }
+        }
+        for marker in trace
+            .markers
+            .iter()
+            .filter(|marker| marker.boundary_violation)
+        {
+            marker_violations += 1;
+            let text = marker
+                .token_text
+                .clone()
+                .unwrap_or_else(|| marker.marker.clone());
+            record(GapKind::MarkerBoundary, &text, index + 1);
+        }
+    }
+    let mut entries: Vec<LexiconGapEntry> = entries.into_values().collect();
+    entries.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(b.count.cmp(&a.count))
+            .then(a.text.cmp(&b.text))
+    });
+    LexiconGapReport {
+        questions: total_questions,
+        unknown_tokens,
+        marker_violations,
+        plan_missing,
+        entries,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,5 +1112,31 @@ mod tests {
         let plan = trace.plan.as_ref().unwrap();
         assert_eq!(plan.entities, vec!["张三".to_string()]);
         assert_eq!(plan.predicates, vec!["老板".to_string()]);
+    }
+
+    #[test]
+    fn lexicon_gap_report_groups_unknown_tokens_and_boundary_risks() {
+        let config = config();
+        let questions = [
+            "张三的所有权归谁",
+            "李四的所有权归公司",
+            "所有权归谁",
+            "",
+        ];
+        let first = lexicon_gap_report(questions, &config);
+        let second = lexicon_gap_report(questions, &config);
+        assert_eq!(first, second, "同一语料必须得到同一缺口报告");
+        assert_eq!(first.questions, 3);
+        assert!(first.unknown_tokens > 0);
+        assert!(first.marker_violations > 0);
+        let ownership = first
+            .entries
+            .iter()
+            .find(|entry| entry.text == "所有权" && entry.kind == GapKind::MarkerBoundary)
+            .expect("应提名包含标记词的 token");
+        assert_eq!(ownership.first_question, 1);
+        let rendered = first.render_report();
+        assert!(rendered.contains("词表缺口报告"));
+        assert!(rendered.contains("标记边界"));
     }
 }
