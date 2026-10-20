@@ -3305,7 +3305,11 @@ mod tests {
 
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
         let program = runtime.ontology_program();
-        assert_eq!(program.len(), 7, "子类2 + 互斥1 + 定义域1 + 值域1 + 逆1 + 传递1");
+        assert_eq!(
+            program.len(),
+            8,
+            "子类2 + 互斥1 + 定义域1 + 值域1 + 逆1 + 传递1 + 谓词别名1"
+        );
         assert!(program.lessons.iter().any(|lesson| matches!(
             lesson,
             OntologyLesson::Subclass { sub, sup, .. }
