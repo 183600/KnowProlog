@@ -16,6 +16,8 @@ use know_prolog::{
     create_default_synonyms,
     extract_query_entities_from_tagged,
     nlp::{preprocess, normalize_words, analyze_query_intent},
+    lexical_trace,
+    query_planner::QueryPlanner,
     nlu::NLUEngine,
     prolog_engine::PrologEngine,
     local_semantic_adapter::LocalSemanticAdapter,
@@ -129,6 +131,15 @@ enum Commands {
         /// "-" reads the query from stdin
         query: String,
         /// Print the result rows as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trace how a question is read: tokens, POS provenance, spans, query plan
+    /// and closure-marker boundary risks (offline; does not open the store)
+    ReadTrace {
+        /// Question to analyse
+        question: String,
+        /// Print the trace as JSON
         #[arg(long)]
         json: bool,
     },
@@ -570,6 +581,12 @@ async fn main() {
             return;
         }
     };
+
+    // 读法追踪只读配置与文本：不打开知识存储，适合在词表/分词变更前后做差分。
+    if let Some(Commands::ReadTrace { question, json }) = &cli.command {
+        run_read_trace(question, *json, &config.nlp);
+        return;
+    }
 
     // 插件清点/评测同样不依赖知识存储：清单是纯声明式资产。
     if let Some(Commands::Plugins { dir, json, eval }) = &cli.command {
@@ -1334,6 +1351,8 @@ async fn main() {
         Some(Commands::ReleaseCheck { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
         Some(Commands::PromptLint { .. }) => {}
+        // 已在打开存储前处理（见 main 顶部早期分派）
+        Some(Commands::ReadTrace { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
         Some(Commands::EvalQuality {
@@ -2028,6 +2047,20 @@ async fn run_fuse(
     Ok(())
 }
 
+/// `read-trace`：离线观察一个问句被切成了什么、词性来自哪里、规划器看到了什么。
+fn run_read_trace(question: &str, json: bool, nlp: &know_prolog::NlpConfig) {
+    let plan = QueryPlanner::new().parse(question);
+    let trace = lexical_trace::trace_question(question, nlp, plan.as_ref());
+    if json {
+        match serde_json::to_string_pretty(&trace) {
+            Ok(text) => println!("{}", text),
+            Err(error) => eprintln!("序列化读法轨迹失败：{}", error),
+        }
+    } else {
+        println!("{}", trace.render_report());
+    }
+}
+
 /// `prompt-lint`：校验提示资产注册表；存在 Error 时以非零码退出。
 fn run_prompt_lint(json: bool) {
     let specs = prompt_spec::default_specs();
@@ -2548,6 +2581,8 @@ async fn run_interactive_mode(
         synonyms.clone(),
         perf_ledger.clone(),
     );
+    // 读法观测：注入与交互/导入路径相同的 NLP 配置；失败轮才留轨迹。
+    symbolic_reasoner.set_nlp_config(config.nlp.clone());
     // 谓词归一：把画像里的别名/互逆词面同步到查询解析与生成词面。
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
@@ -4015,6 +4050,29 @@ async fn run_interactive_mode(
                 Some(text) => println!("{}", text),
                 None => println!("还没有可重述的生成内容，请先输入「介绍：实体名」。"),
             }
+            println!();
+            continue;
+        }
+
+        // 读法追踪：token/词性来源/字符边界/计划/失败分类（只读，不改回答）
+        if let Some(text) = strip_any_prefix(
+            input,
+            &["读法追踪：", "读法追踪:", "读法：", "读法:"],
+        ) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            let text = text.trim();
+            if text.is_empty() {
+                println!("请提供要追踪的问句，例如：读法追踪：张三的所有权归谁");
+            } else {
+                println!("{}", symbolic_reasoner.lexical_trace_report(text));
+            }
+            println!();
+            continue;
+        }
+
+        // 读法台账：失败轮的有限枚举计数与词性来源分布（不保存原文）
+        if matches!(input, "读法台账" | "读法报告" | "失败分类台账" | "失败分类") {
+            println!("{}", symbolic_reasoner.read_trace_ledger_report());
             println!();
             continue;
         }
