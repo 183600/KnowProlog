@@ -4814,7 +4814,7 @@ mod fusion_tests {
             .any(|winner| winner.predicate == "年龄" && winner.object == "19"));
     }
 
-    /// 历史默认图事实不被融合触碰（兼容旧路径，只增不删非托管数据）。
+    /// 历史默认图事实不被融合触碰（只增不删非托管数据）。
     #[tokio::test]
     async fn fusion_apply_keeps_legacy_default_facts() {
         let (manager, _dir) = temp_manager().await;
@@ -4842,7 +4842,7 @@ mod fusion_tests {
         let facts = manager.load_all_facts().await.unwrap();
         assert!(has_property(&facts, "小明", "name", "小明"));
 
-        // 同槽位的历史值（17）与融合赢家（18）都保留在默认图：兼容旧路径，不做静默删除
+        // 同槽位的历史值（17）与融合赢家（18）都保留在默认图：不做静默删除
         for value in ["17", "18"] {
             let ask = manager
                 .query_sparql(&format!(
