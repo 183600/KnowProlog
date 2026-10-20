@@ -100,6 +100,49 @@ impl ProofNodeRecord {
     }
 }
 
+/// 生成证明时所属搜索的确定性上下文（与证明 id 解耦，可单独变化）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchRecord {
+    pub status: String,
+    pub truncated: bool,
+    pub goals: usize,
+    pub goal_attempts: usize,
+    pub fact_checks: usize,
+    pub rule_attempts: usize,
+    pub depth_cutoffs: usize,
+    pub budget_cutoffs: usize,
+    pub solution_cutoffs: usize,
+    pub state_cutoffs: usize,
+    /// 同一搜索树的代表性失败前沿（`FailureFrontier::describe`）。
+    pub frontier: Vec<String>,
+    pub frontier_entries: usize,
+    pub frontier_omitted: usize,
+}
+
+impl SearchRecord {
+    pub fn from_view(view: &ResolutionProofView) -> Self {
+        Self {
+            status: view.search_status.label().to_string(),
+            truncated: view.search_truncated,
+            goals: view.stats.goals,
+            goal_attempts: view.stats.goal_attempts,
+            fact_checks: view.stats.fact_checks,
+            rule_attempts: view.stats.rule_attempts,
+            depth_cutoffs: view.stats.depth_cutoffs,
+            budget_cutoffs: view.stats.budget_cutoffs,
+            solution_cutoffs: view.stats.solution_cutoffs,
+            state_cutoffs: view.stats.state_cutoffs,
+            frontier: view
+                .frontier
+                .iter()
+                .map(|entry| entry.describe())
+                .collect(),
+            frontier_entries: view.stats.frontier_entries,
+            frontier_omitted: view.stats.frontier_omitted,
+        }
+    }
+}
+
 /// 一条可持久化的证明凭证。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProofCertificate {
@@ -113,6 +156,9 @@ pub struct ProofCertificate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
     pub origin: ProofOrigin,
+    /// 生成证明的搜索上下文；旧凭证没有该字段，读取时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchRecord>,
     pub nodes: Vec<ProofNodeRecord>,
     /// 完整证明的节点总数（含被折叠部分）。
     pub step_count: usize,
@@ -260,14 +306,16 @@ impl ProofCertificate {
                     .iter()
                     .map(RawProofNode::from_view)
                     .collect();
-                Self::assemble(
+                let mut certificate = Self::assemble(
                     &view.goal_display,
                     solution.bindings.clone(),
                     Some(solution.confidence),
                     ProofOrigin::Resolution,
                     roots,
                     limits,
-                )
+                );
+                certificate.search = Some(SearchRecord::from_view(view));
+                certificate
             })
             .collect()
     }
@@ -285,6 +333,7 @@ impl ProofCertificate {
             bindings: Vec::new(),
             confidence: None,
             origin,
+            search: None,
             nodes: Vec::new(),
             step_count: 0,
             truncated: false,
@@ -343,6 +392,7 @@ impl ProofCertificate {
             bindings,
             confidence,
             origin,
+            search: None,
             nodes,
             step_count,
             truncated,
@@ -408,6 +458,35 @@ impl ProofCertificate {
         }
         if detail == ProofDetail::Brief {
             return lines.join("\n");
+        }
+        if let Some(search) = &self.search {
+            lines.push(format!(
+                "搜索上下文：{}（{} 个目标、{} 次目标展开、{} 次事实检查、{} 次规则尝试；{}）",
+                search.status,
+                search.goals,
+                search.goal_attempts,
+                search.fact_checks,
+                search.rule_attempts,
+                if search.truncated {
+                    "结果可能不完整"
+                } else {
+                    "搜索完整"
+                }
+            ));
+            if !search.frontier.is_empty() {
+                let shown = search.frontier.iter().take(3).cloned().collect::<Vec<_>>();
+                let omitted = search.frontier.len().saturating_sub(shown.len())
+                    + search.frontier_omitted;
+                lines.push(format!(
+                    "同树失败前沿：{}{}",
+                    shown.join("；"),
+                    if omitted > 0 {
+                        format!("；另有 {} 条未展开", omitted)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
         }
         let limit = match detail {
             ProofDetail::Brief => 0,
@@ -909,9 +988,15 @@ mod tests {
             clauses: 0,
             max_depth: 6,
             search_status: crate::resolution_engine::SearchStatus::Proved,
-            search_truncated: false,
+            search_truncated: true,
             frontier: Vec::new(),
-            stats: crate::resolution_engine::SearchStats::default(),
+            stats: crate::resolution_engine::SearchStats {
+                goals: 1,
+                goal_attempts: 7,
+                fact_checks: 3,
+                rule_attempts: 2,
+                ..crate::resolution_engine::SearchStats::default()
+            },
             solutions: vec![ProofSolutionView {
                 bindings: vec![],
                 confidence: 1.0,
@@ -919,6 +1004,14 @@ mod tests {
             }],
         };
         let from_view = ProofCertificate::from_view(&view, ProofLimits::default());
+        let search = from_view[0].search.as_ref().expect("视图凭证应带搜索上下文");
+        assert_eq!(search.status, "得证");
+        assert!(search.truncated);
+        assert_eq!(search.goal_attempts, 7);
+        let narrative = from_view[0].narrate(ProofDetail::Normal);
+        assert!(narrative.contains("搜索上下文："), "实际：{}", narrative);
+        assert!(narrative.contains("结果可能不完整"), "实际：{}", narrative);
+
         let relabeled = {
             let mut node = view_node;
             node.label = "完全不同的措辞".to_string();
@@ -928,11 +1021,19 @@ mod tests {
                     confidence: 1.0,
                     proofs: vec![node],
                 }],
+                search_truncated: false,
+                stats: crate::resolution_engine::SearchStats {
+                    goal_attempts: 999,
+                    ..crate::resolution_engine::SearchStats::default()
+                },
                 ..view
             }
         };
         let relabeled = ProofCertificate::from_view(&relabeled, ProofLimits::default());
-        assert_eq!(from_view[0].id, relabeled[0].id, "叙述措辞不得改变证明 id");
+        assert_eq!(
+            from_view[0].id, relabeled[0].id,
+            "叙述措辞与搜索统计都不得改变证明 id"
+        );
     }
 
     #[test]
@@ -973,13 +1074,28 @@ mod tests {
         let path = dir.path().join("proof.chronicle.jsonl");
         let (mut chronicle, _) =
             Chronicle::open(path.to_str().unwrap(), FsyncPolicy::None).unwrap();
-        let certificate = ProofCertificate::from_resolution(
+        let mut certificate = ProofCertificate::from_resolution(
             "师傅(张三, 李四)",
             &std::collections::HashMap::new(),
             &[leaf("师傅")],
             1.0,
             ProofLimits::default(),
         );
+        certificate.search = Some(SearchRecord {
+            status: "得证".to_string(),
+            truncated: false,
+            goals: 1,
+            goal_attempts: 6,
+            fact_checks: 2,
+            rule_attempts: 3,
+            depth_cutoffs: 0,
+            budget_cutoffs: 0,
+            solution_cutoffs: 0,
+            state_cutoffs: 0,
+            frontier: vec!["父母(张三, ?X)（缺少事实或规则，深度 1）".to_string()],
+            frontier_entries: 1,
+            frontier_omitted: 0,
+        });
         certificate.record(&mut chronicle).unwrap();
         drop(chronicle);
 
@@ -988,6 +1104,10 @@ mod tests {
         let projection = JournalProjection::from_chronicle(&reloaded);
         assert_eq!(projection.proofs.len(), 1);
         assert_eq!(projection.proofs[0].id, certificate.id);
+        assert_eq!(
+            projection.proofs[0].search, certificate.search,
+            "搜索上下文必须随凭证持久化"
+        );
         assert!(projection.find_proof(&certificate.id).is_some());
         assert!(projection.find_proof("proof:missing").is_none());
     }
