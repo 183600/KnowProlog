@@ -31,6 +31,9 @@ fn stopwords() -> &'static HashSet<&'static str> {
 /// ——那是实例断言，由 [`DenseRetriever::observe_entity`] 处理）。
 const SUBCLASS_PREDICATES: [&str; 5] = ["子类", "子类于", "是一种", "属于", "subClassOf"];
 
+/// 图谱中表示子属性边的谓词：观察到即登记谓词层级（与子类谓词对称）。
+const SUBPROPERTY_PREDICATES: [&str; 4] = ["子关系", "子属性", "子关系于", "subPropertyOf"];
+
 /// 子类可达性的层数上限（中文领域层级很浅；上限只为防病态图）
 const MAX_SUBCLASS_DEPTH: usize = 16;
 
@@ -202,6 +205,14 @@ pub struct DenseRetriever {
     type_hierarchy: HashMap<String, HashSet<String>>,
     /// 互斥类型对（规范化为左 ≤ 右的有序对）：唯一可证明不兼容的来源。
     type_disjoint: HashSet<(String, String)>,
+    /// RDFS 谓词层级：sub → 直接父谓词集合（`sub ⊑ sup`）。
+    predicate_hierarchy: HashMap<String, HashSet<String>>,
+    /// 谓词层级的反向边：sup → 直接子谓词集合（向下召回用）。
+    predicate_children: HashMap<String, HashSet<String>>,
+    /// 谓词直接声明的定义域类型（沿父谓词继承的声明在判定时按层级展开）。
+    predicate_domain: HashMap<String, HashSet<String>>,
+    /// 谓词直接声明的值域类型。
+    predicate_range: HashMap<String, HashSet<String>>,
     adjacency: HashMap<String, HashMap<String, f64>>,
     /// 实体名按长度降序的缓存（与 `entity_docs` 的键集合同步，`rebuild` 时刷新）
     seed_candidates: Vec<String>,
@@ -232,6 +243,10 @@ impl DenseRetriever {
             type_entities: HashMap::new(),
             type_hierarchy: HashMap::new(),
             type_disjoint: HashSet::new(),
+            predicate_hierarchy: HashMap::new(),
+            predicate_children: HashMap::new(),
+            predicate_domain: HashMap::new(),
+            predicate_range: HashMap::new(),
             adjacency: HashMap::new(),
             seed_candidates: Vec::new(),
             dirty: false,
@@ -309,6 +324,10 @@ impl DenseRetriever {
         if SUBCLASS_PREDICATES.contains(&predicate) {
             self.observe_subclass(subject, object);
         }
+        // 子属性谓词顺手登记谓词层级：谓词约束按 RDFS 沿层级向下展开
+        if SUBPROPERTY_PREDICATES.contains(&predicate) {
+            self.observe_subproperty(subject, object);
+        }
         self.dirty = true;
     }
 
@@ -348,6 +367,25 @@ impl DenseRetriever {
                 };
                 if empty {
                     self.type_hierarchy.remove(subject);
+                }
+            }
+            // 子属性证据撤回时同步注销谓词层级边
+            if SUBPROPERTY_PREDICATES.contains(&predicate) {
+                let empty = match self.predicate_hierarchy.get_mut(subject) {
+                    Some(supers) => {
+                        supers.remove(object);
+                        supers.is_empty()
+                    }
+                    None => false,
+                };
+                if empty {
+                    self.predicate_hierarchy.remove(subject);
+                }
+                if let Some(children) = self.predicate_children.get_mut(object) {
+                    children.remove(subject);
+                    if children.is_empty() {
+                        self.predicate_children.remove(object);
+                    }
                 }
             }
             self.dirty = true;
@@ -479,6 +517,224 @@ impl DenseRetriever {
             .collect();
         types.sort();
         types
+    }
+
+    /// 登记一条子属性边 `sub ⊑ sup`（幂等）：谓词约束据此沿层级向下展开
+    /// （子谓词的事实沿边上浮，蕴含父谓词）。
+    pub fn observe_subproperty(&mut self, sub: &str, sup: &str) {
+        let sub = sub.trim();
+        let sup = sup.trim();
+        if sub.is_empty() || sup.is_empty() || sub == sup {
+            return;
+        }
+        self.predicate_hierarchy
+            .entry(sub.to_string())
+            .or_default()
+            .insert(sup.to_string());
+        self.predicate_children
+            .entry(sup.to_string())
+            .or_default()
+            .insert(sub.to_string());
+    }
+
+    /// 登记谓词的定义域类型（幂等）：定义域/值域是 schema 级类型约束，
+    /// 与显式互斥证据组合后可硬剪类型讲不通的证据。
+    pub fn observe_domain(&mut self, predicate: &str, class: &str) {
+        let predicate = predicate.trim();
+        let class = class.trim();
+        if predicate.is_empty() || class.is_empty() {
+            return;
+        }
+        self.predicate_domain
+            .entry(predicate.to_string())
+            .or_default()
+            .insert(class.to_string());
+    }
+
+    /// 登记谓词的值域类型（幂等）。
+    pub fn observe_range(&mut self, predicate: &str, class: &str) {
+        let predicate = predicate.trim();
+        let class = class.trim();
+        if predicate.is_empty() || class.is_empty() {
+            return;
+        }
+        self.predicate_range
+            .entry(predicate.to_string())
+            .or_default()
+            .insert(class.to_string());
+    }
+
+    /// 谓词的全部严格父谓词（传递闭包，有界 BFS，字典序）。
+    pub fn superproperties_reachable(&self, predicate: &str) -> Vec<String> {
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(predicate);
+        let mut frontier: Vec<&str> = vec![predicate];
+        let mut found: HashSet<String> = HashSet::new();
+        for _ in 0..MAX_SUBCLASS_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for node in frontier {
+                let Some(supers) = self.predicate_hierarchy.get(node) else {
+                    continue;
+                };
+                for parent in supers {
+                    if visited.insert(parent.as_str()) {
+                        found.insert(parent.clone());
+                        next.push(parent.as_str());
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let mut out: Vec<String> = found.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// 谓词的全部严格子谓词（传递闭包，有界 BFS，字典序）。
+    pub fn subproperties_reachable(&self, predicate: &str) -> Vec<String> {
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(predicate);
+        let mut frontier: Vec<&str> = vec![predicate];
+        let mut found: HashSet<String> = HashSet::new();
+        for _ in 0..MAX_SUBCLASS_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for node in frontier {
+                let Some(children) = self.predicate_children.get(node) else {
+                    continue;
+                };
+                for child in children {
+                    if visited.insert(child.as_str()) {
+                        found.insert(child.clone());
+                        next.push(child.as_str());
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let mut out: Vec<String> = found.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// 谓词蕴含：`doc` 谓词的事实是否（沿子属性上浮）蕴含 `constraint` 谓词。
+    /// 方向是单向的：子事实蕴含父谓词，父事实不蕴含子谓词。
+    pub fn predicate_entails(&self, doc: &str, constraint: &str) -> bool {
+        doc == constraint || self.superproperties_reachable(doc).iter().any(|p| p == constraint)
+    }
+
+    /// 祖先闭包感知的互斥判定：两侧各沿子类层级上溯，任一对显式互斥即成立。
+    /// 与 [`Self::types_disjoint`]（仅显式有序对）相比更强：学生 ⊑ 人物 ⊥ 地点
+    /// ⟹ 学生 ⊥ 地点。用于 schema（定义域/值域）硬剪，不改动类型约束的既有语义。
+    fn types_proven_disjoint(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return false;
+        }
+        let left_ancestors = self.type_ancestors_or_self(left);
+        let right_ancestors = self.type_ancestors_or_self(right);
+        for a in &left_ancestors {
+            for b in &right_ancestors {
+                if self.types_disjoint(a, b) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 类型自身及其全部祖先（含自身，字典序）。
+    fn type_ancestors_or_self(&self, name: &str) -> Vec<String> {
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(name);
+        let mut frontier: Vec<&str> = vec![name];
+        let mut found: HashSet<String> = HashSet::from([name.to_string()]);
+        for _ in 0..MAX_SUBCLASS_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for node in frontier {
+                let Some(supers) = self.type_hierarchy.get(node) else {
+                    continue;
+                };
+                for parent in supers {
+                    if visited.insert(parent.as_str()) {
+                        found.insert(parent.clone());
+                        next.push(parent.as_str());
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let mut out: Vec<String> = found.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// 谓词（含其祖先谓词）声明的定义域类型集合（排序去重）。
+    fn domain_types_for(&self, predicate: &str) -> Vec<String> {
+        let mut classes: HashSet<String> = self
+            .predicate_domain
+            .get(predicate)
+            .cloned()
+            .unwrap_or_default();
+        for parent in self.superproperties_reachable(predicate) {
+            if let Some(declared) = self.predicate_domain.get(&parent) {
+                classes.extend(declared.iter().cloned());
+            }
+        }
+        let mut out: Vec<String> = classes.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// 谓词（含其祖先谓词）声明的值域类型集合（排序去重）。
+    fn range_types_for(&self, predicate: &str) -> Vec<String> {
+        let mut classes: HashSet<String> = self
+            .predicate_range
+            .get(predicate)
+            .cloned()
+            .unwrap_or_default();
+        for parent in self.superproperties_reachable(predicate) {
+            if let Some(declared) = self.predicate_range.get(&parent) {
+                classes.extend(declared.iter().cloned());
+            }
+        }
+        let mut out: Vec<String> = classes.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    /// schema 硬剪：三元组某侧的声明类型与谓词定义域/值域的**全部**允许类型
+    /// 都可证明互斥（祖先闭包感知）时返回 true。开放世界：类型未知、无声明、
+    /// 或与任一允许类型不互斥都不剪。
+    fn schema_prunes_doc(&self, doc: &DocRecord) -> bool {
+        if let Some(declared) = self.entity_types.get(&doc.subject) {
+            let domains = self.domain_types_for(&doc.predicate);
+            if !domains.is_empty()
+                && domains
+                    .iter()
+                    .all(|allowed| self.types_proven_disjoint(declared, allowed))
+            {
+                return true;
+            }
+        }
+        if let Some(declared) = self.entity_types.get(&doc.object) {
+            let ranges = self.range_types_for(&doc.predicate);
+            if !ranges.is_empty()
+                && ranges
+                    .iter()
+                    .all(|allowed| self.types_proven_disjoint(declared, allowed))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// 一次性观察图谱快照（关系三元组 + 实体类型/属性）。
@@ -749,7 +1005,13 @@ impl DenseRetriever {
 
     fn predicate_matches(&self, id: usize, query: &str, query_tokens: &HashSet<String>) -> bool {
         let doc = &self.docs[id];
-        query_tokens.contains(&doc.predicate) || query.contains(doc.predicate.as_str())
+        if query_tokens.contains(&doc.predicate) || query.contains(doc.predicate.as_str()) {
+            return true;
+        }
+        // 查询提到父谓词时，子谓词证据按蕴含关系同样算命中
+        self.superproperties_reachable(&doc.predicate)
+            .iter()
+            .any(|parent| query_tokens.contains(parent) || query.contains(parent.as_str()))
     }
 
     fn score_doc(
@@ -866,7 +1128,8 @@ impl DenseRetriever {
             }
         }
         if let Some(predicate) = &constraints.predicate {
-            if doc.predicate != *predicate {
+            // RDFS 谓词语义：子谓词事实上浮蕴含父谓词（单向，父不蕴含子）。
+            if !self.predicate_entails(&doc.predicate, predicate) {
                 return false;
             }
         }
@@ -874,6 +1137,10 @@ impl DenseRetriever {
             if doc.object != *object {
                 return false;
             }
+        }
+        // schema 硬剪：声明类型与定义域/值域全部允许类型互斥的证据不入结果。
+        if self.schema_prunes_doc(doc) {
+            return false;
         }
         if let Some(entity_type) = &constraints.entity_type {
             // RDFS 语义：声明类型与约束类型相容（子类路径/开放世界，互斥硬剪）；
@@ -908,12 +1175,21 @@ impl DenseRetriever {
             }
         }
         if let Some(predicate) = &constraints.predicate {
-            let ids = match self.by_predicate.get(predicate) {
-                Some(ids) => ids,
-                None => return Vec::new(),
-            };
+            // 谓词倒排按 RDFS 向下展开：子谓词的事实上浮蕴含父谓词，一并入池。
+            let mut ids: Vec<usize> = self
+                .by_predicate
+                .get(predicate)
+                .cloned()
+                .unwrap_or_default();
+            for sub in self.subproperties_reachable(predicate) {
+                if let Some(sub_ids) = self.by_predicate.get(&sub) {
+                    ids.extend(sub_ids.iter().copied());
+                }
+            }
+            ids.sort_unstable();
+            ids.dedup();
             if base.as_ref().map_or(true, |current| ids.len() < current.len()) {
-                base = Some(ids.clone());
+                base = Some(ids);
             }
         }
         if let Some(object) = &constraints.object {
@@ -1001,6 +1277,18 @@ impl DenseRetriever {
                     "类型约束「{}」按 RDFS 展开为相容类型池（{}）；互斥类型已排除。",
                     entity_type,
                     pool.join("、")
+                ));
+            }
+        }
+
+        // 谓词约束的子属性展开写进回执：子谓词事实蕴含父谓词（单向）
+        if let Some(predicate) = &constraints.predicate {
+            let subs = self.subproperties_reachable(predicate);
+            if !subs.is_empty() {
+                receipt.notes.push(format!(
+                    "谓词约束「{}」按 RDFS 向下展开，纳入子谓词证据（{}）。",
+                    predicate,
+                    subs.join("、")
                 ));
             }
         }
@@ -1118,8 +1406,14 @@ impl DenseRetriever {
             }
             // 谓词词面直接出现在查询里时，把该谓词的全部证据纳入候选；
             // 避免「谓词命中但分词未命中」的文档被倒排表漏掉。
+            // 查询提到父谓词时，子谓词证据按蕴含关系一并纳入。
             for (predicate, ids) in &self.by_predicate {
-                if query.contains(predicate.as_str()) {
+                let mentioned = query.contains(predicate.as_str())
+                    || self
+                        .superproperties_reachable(predicate)
+                        .iter()
+                        .any(|parent| query.contains(parent.as_str()));
+                if mentioned {
                     candidate_ids.extend(ids.iter().copied());
                 }
             }
@@ -1798,5 +2092,104 @@ mod tests {
         assert!(!retriever.types_disjoint("学生", "公司"));
         assert!(retriever.types_disjoint("人物", "地点"), "顺序无关判定");
         assert!(retriever.types_disjoint("地点", "人物"));
+    }
+
+    #[test]
+    fn predicate_constraint_expands_to_subproperties() {
+        let mut retriever = DenseRetriever::new(5, 0.85, 12);
+        retriever.observe_subproperty("师承", "师傅");
+        retriever.observe_triple("张三", "师承", "李四");
+        retriever.observe_triple("王五", "师傅", "赵六");
+        assert!(retriever.predicate_entails("师承", "师傅"));
+        assert!(!retriever.predicate_entails("师傅", "师承"), "父不蕴含子");
+
+        let constraints = SearchConstraints {
+            predicate: Some("师傅".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        let pairs: HashSet<(&str, &str)> = search
+            .hits
+            .iter()
+            .map(|hit| (hit.subject.as_str(), hit.predicate.as_str()))
+            .collect();
+        assert!(
+            pairs.contains(&("张三", "师承")),
+            "子谓词事实应被父谓词约束召回：{:?}",
+            pairs
+        );
+        assert!(pairs.contains(&("王五", "师傅")), "直接事实照常召回");
+        assert!(
+            search
+                .receipt
+                .notes
+                .iter()
+                .any(|note| note.contains("子谓词")),
+            "谓词展开应写进回执：{:?}",
+            search.receipt.notes
+        );
+
+        // 单向性：子谓词约束不召回父谓词事实
+        let constraints = SearchConstraints {
+            predicate: Some("师承".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        assert!(
+            search
+                .hits
+                .iter()
+                .all(|hit| hit.subject != "王五"),
+            "父谓词事实不得混入子谓词约束：{:?}",
+            search.hits
+        );
+    }
+
+    #[test]
+    fn schema_disjoint_types_prune_evidence() {
+        let mut retriever = DenseRetriever::new(5, 0.85, 12);
+        retriever.observe_subclass("学生", "人物");
+        retriever.observe_disjoint("人物", "地点");
+        retriever.observe_domain("师傅", "人物");
+        retriever.observe_range("师傅", "人物");
+        // 主体类型（地点）与定义域（人物）可证明互斥：硬剪
+        retriever.observe_entity("故宫", "地点", &[]);
+        retriever.observe_triple("故宫", "师傅", "导游");
+        // 主体类型（学生）沿子类相容：保留
+        retriever.observe_entity("张三", "学生", &[]);
+        retriever.observe_triple("张三", "师傅", "李四");
+        // 主体类型未知：开放世界，不剪
+        retriever.observe_triple("无名氏", "师傅", "某人");
+
+        let constraints = SearchConstraints {
+            predicate: Some("师傅".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        let subjects: HashSet<&str> = search
+            .hits
+            .iter()
+            .map(|hit| hit.subject.as_str())
+            .collect();
+        assert!(
+            !subjects.contains("故宫"),
+            "定义域互斥的证据必须被硬剪：{:?}",
+            subjects
+        );
+        assert!(subjects.contains("张三"), "子类相容证据保留：{:?}", subjects);
+        assert!(
+            subjects.contains("无名氏"),
+            "未知类型不凭空剪（开放世界）：{:?}",
+            subjects
+        );
+    }
+
+    #[test]
+    fn subproperty_triples_feed_and_unfeed_hierarchy() {
+        let mut retriever = DenseRetriever::new(5, 0.85, 12);
+        retriever.observe_triple("师承", "subPropertyOf", "师傅");
+        assert!(retriever.predicate_entails("师承", "师傅"));
+        assert!(retriever.remove_triple("师承", "subPropertyOf", "师傅"));
+        assert!(!retriever.predicate_entails("师承", "师傅"));
     }
 }
