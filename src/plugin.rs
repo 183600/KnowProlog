@@ -199,6 +199,10 @@ pub enum Contribution {
         replacement: String,
     },
     /// 检索配方：问法模式 → 规范问句 + 可选模板。
+    ///
+    /// `direction` 描述「实体在关系中扮演哪一端」：`forward` 查实体 → 答案，
+    /// `inverse` 查答案 → 实体（如「卡梅隆导演过哪些电影」）。`answer_types`
+    /// 是答案的期望类型：只有已知类型冲突（显式互斥）才拒答，未知类型放行。
     Recipe {
         id: String,
         #[serde(default)]
@@ -210,6 +214,10 @@ pub enum Contribution {
         template: Option<String>,
         #[serde(default)]
         attribute: Option<String>,
+        #[serde(default)]
+        direction: RecipeDirection,
+        #[serde(default)]
+        answer_types: Vec<String>,
     },
     /// 话语策略（声明；由宿主在核心策略答不了时择优使用）。
     Policy {
@@ -625,7 +633,7 @@ impl PluginRegistry {
                         }
                     }
                     available.extend(
-                        ["answer", "attribute", "plugin", "recipe"]
+                        ["answer", "attribute", "evidence", "plugin", "recipe"]
                             .iter()
                             .map(|slot| slot.to_string()),
                     );
@@ -998,6 +1006,8 @@ fn validate_contribution(
             question,
             template,
             attribute,
+            direction,
+            answer_types,
             ..
         } => {
             if patterns.is_empty() {
@@ -1056,6 +1066,22 @@ fn validate_contribution(
                         "配方的 attribute 为空字符串，已忽略。".to_string(),
                     ));
                 }
+            }
+            for answer_type in answer_types {
+                if answer_type.trim().is_empty() {
+                    issues.push(PluginIssue::warning(
+                        plugin,
+                        id,
+                        "配方的 answer_types 含空字符串，已忽略。".to_string(),
+                    ));
+                }
+            }
+            if direction.is_inverse() && attribute.is_none() {
+                issues.push(PluginIssue::warning(
+                    plugin,
+                    id,
+                    "逆向配方没有 attribute，无法确定查询关系。".to_string(),
+                ));
             }
             if let Some(template) = template {
                 if template.trim().is_empty() {
@@ -1274,6 +1300,28 @@ pub struct PluginMatch {
     pub detail: String,
 }
 
+/// 配方查询方向：实体是关系的主语还是宾语。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipeDirection {
+    #[default]
+    Forward,
+    Inverse,
+}
+
+impl RecipeDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            RecipeDirection::Forward => "正向",
+            RecipeDirection::Inverse => "逆向",
+        }
+    }
+
+    pub fn is_inverse(self) -> bool {
+        matches!(self, RecipeDirection::Inverse)
+    }
+}
+
 /// 配方被选中后的可执行调用信息。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecipeInvocation {
@@ -1284,6 +1332,10 @@ pub struct RecipeInvocation {
     pub template: Option<String>,
     #[serde(default)]
     pub attribute: Option<String>,
+    #[serde(default)]
+    pub direction: RecipeDirection,
+    #[serde(default)]
+    pub answer_types: Vec<String>,
     #[serde(default)]
     pub slots: BTreeMap<String, String>,
 }
@@ -2164,6 +2216,8 @@ impl PluginRuntime {
                         question,
                         template,
                         attribute,
+                        direction,
+                        answer_types,
                         ..
                     } => {
                         for pattern in patterns {
@@ -2193,6 +2247,8 @@ impl PluginRuntime {
                                     question: output,
                                     template: template.clone(),
                                     attribute: attribute.clone(),
+                                    direction: *direction,
+                                    answer_types: answer_types.clone(),
                                     slots: captures,
                                 }),
                                 recipe: true,
@@ -2212,6 +2268,17 @@ impl PluginRuntime {
         outcome: &PluginOutcome,
         answer: &str,
     ) -> PluginComposedAnswer {
+        self.compose_answer_with_evidence(outcome, answer, &[])
+    }
+
+    /// 与 [`Self::compose_answer`] 相同，但额外提供 `{evidence}` 槽位。
+    /// 依据必须由调用方从事实/公理闭包取出，插件模板只能复述、不能编造。
+    pub fn compose_answer_with_evidence(
+        &mut self,
+        outcome: &PluginOutcome,
+        answer: &str,
+        evidence: &[String],
+    ) -> PluginComposedAnswer {
         let mut trace = outcome.trace.clone();
         let mut text = answer.to_string();
         let mut notes = Vec::new();
@@ -2227,6 +2294,9 @@ impl PluginRuntime {
                         }
                         if let Some(attribute) = &recipe.attribute {
                             slots.insert("attribute".to_string(), attribute.clone());
+                        }
+                        if !evidence.is_empty() {
+                            slots.insert("evidence".to_string(), evidence.join("；"));
                         }
                         slots.insert("plugin".to_string(), recipe.plugin.clone());
                         slots.insert("recipe".to_string(), recipe.contribution.clone());
@@ -2879,6 +2949,8 @@ mod tests {
             question: question.to_string(),
             template: Some(template_id.to_string()),
             attribute: Some("导演".to_string()),
+            direction: RecipeDirection::Forward,
+            answer_types: Vec::new(),
         }
     }
 

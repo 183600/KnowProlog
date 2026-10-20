@@ -34,6 +34,7 @@ use crate::ontology_reasoning::{OntologyCapsule, OntologyLesson, OntologyProgram
 use crate::path_memory::{EdgeSource, PathPredicate, TraversalGraph, TraversalOptions};
 use crate::pattern_closure::{evaluate_closure, ClosureBudget, ClosureOp, ClosureOutcome};
 use crate::perf_ledger::PerfLedger;
+use crate::plugin::RecipeDirection;
 use crate::predicate_registry::PredicateRegistry;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
@@ -606,6 +607,16 @@ struct ChainPredicate {
     surface: String,
     slot: String,
     inverted: bool,
+}
+
+/// 类型化配方的查询结果：取值 + 可复述的依据边。
+///
+/// 取值来自图谱事实或本体闭包（含逆关系/子类推断）；依据只复述实际存在的
+/// 事实边与 TBox 推导理由，取不到值时返回 `None`，绝不凭空补值。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecipeLookup {
+    pub values: Vec<String>,
+    pub evidence: Vec<String>,
 }
 
 /// 结构化证明视图：可视化（Mermaid/ASCII）消费的纯数据，不重复解析逻辑。
@@ -1490,6 +1501,123 @@ impl SymbolicReasoner {
 
     pub fn generator(&self) -> &SymbolicGenerator {
         &self.generator
+    }
+
+    /// 类型化配方查询：按方向（实体→答案 / 答案→实体）取关系值，
+    /// 用当前单一本体的物化闭包补齐逆关系与子类推断，并按答案类型做
+    /// **开放世界**过滤——未知类型放行，只有显式互斥的已知冲突才拒答。
+    ///
+    /// 返回的 `evidence` 逐条复述事实边/公理推导理由，供插件模板 `{evidence}`
+    /// 接地生成；没有取值时返回 `None`，调用方应让位核心管线。
+    pub fn recipe_lookup(
+        &mut self,
+        entity: &str,
+        attribute: &str,
+        direction: RecipeDirection,
+        answer_types: &[String],
+    ) -> Option<RecipeLookup> {
+        let entity = entity.trim();
+        let attribute = attribute.trim();
+        if entity.is_empty() || attribute.is_empty() {
+            return None;
+        }
+        let mut predicates: BTreeSet<String> = BTreeSet::new();
+        predicates.insert(attribute.to_string());
+        let canonical = self.aligner.canonical_form(attribute);
+        if !canonical.trim().is_empty() {
+            predicates.insert(canonical.trim().to_string());
+        }
+
+        let mut raw_values: BTreeSet<String> = BTreeSet::new();
+        for predicate in &predicates {
+            if direction.is_inverse() {
+                raw_values.extend(self.generator.relation_values_in(entity, predicate));
+            } else {
+                raw_values.extend(self.generator.attribute_values(entity, predicate));
+                raw_values.extend(self.generator.relation_values(entity, predicate));
+            }
+        }
+
+        let closure = self.discourse.narrator_mut().closure().clone();
+        for (predicate, object) in closure.properties_of(entity) {
+            if predicates.contains(&predicate) {
+                raw_values.insert(object);
+            }
+        }
+        if direction.is_inverse() {
+            for (subject, predicate, object) in closure.relations_snapshot() {
+                if object == entity && predicates.contains(&predicate) {
+                    raw_values.insert(subject);
+                }
+            }
+        }
+
+        if raw_values.is_empty() {
+            return None;
+        }
+        if !answer_types.is_empty() {
+            raw_values.retain(|value| {
+                let known_types = closure.types_of(value);
+                if known_types.is_empty() {
+                    return true;
+                }
+                let compatible = answer_types.iter().any(|expected| {
+                    closure.is_instance(value, expected)
+                        || known_types
+                            .iter()
+                            .any(|actual| closure.is_subclass(actual, expected))
+                });
+                if compatible {
+                    return true;
+                }
+                // 开放世界：已知类型但无互斥证据时仍放行，只有显式冲突才拒答。
+                !known_types.iter().any(|actual| {
+                    answer_types
+                        .iter()
+                        .any(|expected| closure.are_disjoint(actual, expected))
+                })
+            });
+            if raw_values.is_empty() {
+                return None;
+            }
+        }
+
+        let mut evidence: Vec<String> = Vec::new();
+        for (subject, predicate, object) in closure.relations_snapshot() {
+            if !predicates.contains(&predicate) {
+                continue;
+            }
+            let (anchor, answer) = if direction.is_inverse() {
+                (object.as_str(), subject.clone())
+            } else {
+                (subject.as_str(), object.clone())
+            };
+            if anchor != entity || !raw_values.contains(&answer) {
+                continue;
+            }
+            let why = closure
+                .why_relation(&subject, &predicate, &object)
+                .unwrap_or("直接声明");
+            evidence.push(format!(
+                "{} —{}→ {}（{}）",
+                subject, predicate, object, why
+            ));
+        }
+        if evidence.is_empty() {
+            evidence.push(format!("图谱属性记录：{}的{}", entity, attribute));
+        }
+        evidence.sort();
+        evidence.dedup();
+        evidence.truncate(8);
+
+        let values: Vec<String> = raw_values
+            .into_iter()
+            .map(|value| {
+                crate::identity::local_name(crate::identity::DEFAULT_BASE_NS, &value)
+                    .unwrap_or(value)
+            })
+            .collect();
+        Some(RecipeLookup { values, evidence })
     }
 
     /// 在当前知识快照上执行带约束/预算的证据检索（含可审计回执）。
@@ -9681,6 +9809,116 @@ mod tests {
         target
             .restore_dialogue_snapshot(&snapshot)
             .expect("无胶囊快照不受影响");
+    }
+
+    /// 类型化配方：逆方向查询、子类扩展、开放世界类型过滤与依据复述。
+    #[test]
+    fn recipe_lookup_uses_inverse_subclass_and_open_world_types() {
+        use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
+
+        let facts = vec![
+            PrologFact::Entity {
+                name: "阿凡达".into(),
+                entity_type: "电影".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "千与千寻".into(),
+                entity_type: "动画电影".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "卡梅隆".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "宫崎骏".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "阿凡达".into(),
+                rel_type: "导演".into(),
+                to: "卡梅隆".into(),
+            },
+            PrologFact::Relation {
+                from: "千与千寻".into(),
+                rel_type: "导演".into(),
+                to: "宫崎骏".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let program = OntologyProgram::from_lessons(vec![
+            OntologyLesson::Subclass {
+                sub: "动画电影".into(),
+                sup: "电影".into(),
+                original: "动画电影是一种电影".into(),
+            },
+            OntologyLesson::Subclass {
+                sub: "电影".into(),
+                sup: "影视作品".into(),
+                original: "电影是一种影视作品".into(),
+            },
+            OntologyLesson::Disjoint {
+                left: "电影".into(),
+                right: "人物".into(),
+                original: "电影和人物互斥".into(),
+            },
+            OntologyLesson::Domain {
+                property: "导演".into(),
+                class: "电影".into(),
+                original: "导演关系的定义域是电影".into(),
+            },
+            OntologyLesson::Range {
+                property: "导演".into(),
+                class: "人物".into(),
+                original: "导演关系的值域是人物".into(),
+            },
+            OntologyLesson::Inverse {
+                left: "导演".into(),
+                right: "执导".into(),
+                original: "导演和执导互为逆关系".into(),
+            },
+        ]);
+        assert!(reasoner.configure_ontology_program(&program) > 0);
+
+        let forward = reasoner
+            .recipe_lookup("阿凡达", "导演", RecipeDirection::Forward, &["人物".into()])
+            .expect("正向应命中导演");
+        assert_eq!(forward.values, vec!["卡梅隆".to_string()]);
+        assert!(
+            forward.evidence.iter().any(|line| line.contains("导演")),
+            "依据必须复述事实边：{:?}",
+            forward.evidence
+        );
+
+        let inverse = reasoner
+            .recipe_lookup("宫崎骏", "导演", RecipeDirection::Inverse, &["电影".into()])
+            .expect("逆向应命中作品");
+        assert_eq!(
+            inverse.values,
+            vec!["千与千寻".to_string()],
+            "动画电影 ⊑ 电影，答案类型必须沿子类扩展"
+        );
+
+        let unknown = reasoner
+            .recipe_lookup(
+                "卡梅隆",
+                "导演",
+                RecipeDirection::Inverse,
+                &["未知类型".into()],
+            )
+            .expect("开放世界：未知类型必须放行");
+        assert_eq!(unknown.values, vec!["阿凡达".to_string()]);
+
+        assert!(
+            reasoner
+                .recipe_lookup("卡梅隆", "导演", RecipeDirection::Inverse, &["人物".into()])
+                .is_none(),
+            "已知互斥类型（电影 ⊥ 人物）必须拒答"
+        );
     }
 
     /// 配置本体并入单一本体：注入幂等、与教学公理同簿记、
