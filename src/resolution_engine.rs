@@ -7,7 +7,7 @@
 //
 // 全程只有：项、置换、合一、深度上限与搜索预算——每一步都可解释、可回溯。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::bindings::{BindingSet, BoundTerm};
@@ -203,6 +203,171 @@ pub struct Solution {
     pub confidence: f64,
 }
 
+/// 搜索被截断的原因。按枚举顺序稳定排序，便于日志与测试比较。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TruncationCause {
+    /// 目标深度超过 `max_depth`。
+    DepthLimit,
+    /// 规则分支耗尽了本次目标的搜索预算。
+    RuleBudget,
+    /// 解的数量达到 `max_solutions`。
+    SolutionLimit,
+    /// 中间状态数量达到 `max_solutions * 4`。
+    StateLimit,
+}
+
+impl TruncationCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            TruncationCause::DepthLimit => "深度上限",
+            TruncationCause::RuleBudget => "规则搜索预算",
+            TruncationCause::SolutionLimit => "解数上限",
+            TruncationCause::StateLimit => "中间状态上限",
+        }
+    }
+}
+
+/// 失败前沿条目的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FrontierReason {
+    /// 该目标没有任何可匹配的事实，也没有可展开的规则。
+    MissingFactOrRule,
+    /// 搜索在到达该目标时被深度上限截断。
+    DepthLimit,
+    /// 搜索在到达该目标时耗尽了规则预算。
+    RuleBudget,
+    /// 中间状态数量达到上限，后续分支未展开。
+    StateLimit,
+}
+
+impl FrontierReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            FrontierReason::MissingFactOrRule => "缺少事实或规则",
+            FrontierReason::DepthLimit => "深度上限截断",
+            FrontierReason::RuleBudget => "规则预算耗尽",
+            FrontierReason::StateLimit => "中间状态上限",
+        }
+    }
+}
+
+/// 一次 SLD 搜索中实际遇到的失败叶子（同一棵搜索树，不是另行重搜）。
+///
+/// 条目只保留有限的代表：按（目标、深度、原因）去重并稳定排序。
+/// 变量名中的内部换名后缀（`#12`）在记录时去掉，避免把搜索实现细节
+/// 泄漏到面向用户的缺口报告里。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FailureFrontier {
+    pub goal: String,
+    pub depth: usize,
+    pub reason: FrontierReason,
+}
+
+impl FailureFrontier {
+    pub fn describe(&self) -> String {
+        format!(
+            "{}（{}，深度 {}）",
+            self.goal,
+            self.reason.label(),
+            self.depth
+        )
+    }
+}
+
+/// 搜索统计。全部为确定性计数，不包含耗时，可安全写入日志。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchStats {
+    /// 顶层目标数。
+    pub goals: usize,
+    /// `prove_goal` 的调用次数（含规则体展开）。
+    pub goal_attempts: usize,
+    /// 检查过的同谓词事实数。
+    pub fact_checks: usize,
+    /// 尝试过的规则分支数。
+    pub rule_attempts: usize,
+    pub depth_cutoffs: usize,
+    pub budget_cutoffs: usize,
+    pub solution_cutoffs: usize,
+    pub state_cutoffs: usize,
+    /// 实际保留的失败前沿条目数。
+    pub frontier_entries: usize,
+    /// 因前沿容量上限而未保留的唯一条目数。
+    pub frontier_omitted: usize,
+}
+
+/// 搜索结论的认识论状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStatus {
+    /// 至少找到一个解；结果集是否完整由 [`SearchOutcome::is_truncated`] 给出。
+    Proved,
+    /// 没有解，且搜索在预算内已经穷尽。
+    Exhausted,
+    /// 没有解，但搜索被深度、预算或解数上限截断——不能断言「不存在」。
+    Incomplete,
+}
+
+impl SearchStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchStatus::Proved => "得证",
+            SearchStatus::Exhausted => "无解（已穷尽）",
+            SearchStatus::Incomplete => "未得证（搜索被截断）",
+        }
+    }
+}
+
+/// `solve` 的完整结果：解 + 三态结论 + 计数 + 同一搜索树的失败前沿。
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub solutions: Vec<Solution>,
+    pub status: SearchStatus,
+    pub stats: SearchStats,
+    /// 被截断的原因（去重、稳定排序）；为空表示搜索完整。
+    pub truncations: Vec<TruncationCause>,
+    /// 从本次搜索实际失败叶子中提取的代表性知识缺口。
+    pub frontier: Vec<FailureFrontier>,
+}
+
+impl SearchOutcome {
+    pub fn is_proved(&self) -> bool {
+        self.status == SearchStatus::Proved
+    }
+
+    /// 搜索是否完整（没有触发任何截断）。
+    pub fn is_complete(&self) -> bool {
+        self.truncations.is_empty()
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        !self.is_complete()
+    }
+
+    /// 面向用户的一行结论：明确区分「没有」与「没搜完」。
+    pub fn render_status(&self) -> String {
+        match self.status {
+            SearchStatus::Proved if self.is_complete() => "得证（搜索完整）".to_string(),
+            SearchStatus::Proved => {
+                format!("得证（结果可能不完整：{}）", self.truncation_labels())
+            }
+            SearchStatus::Exhausted => "无解（搜索已穷尽）".to_string(),
+            SearchStatus::Incomplete => {
+                format!("未得证（搜索被截断：{}）", self.truncation_labels())
+            }
+        }
+    }
+
+    fn truncation_labels(&self) -> String {
+        if self.truncations.is_empty() {
+            return "无".to_string();
+        }
+        self.truncations
+            .iter()
+            .map(|cause| cause.label())
+            .collect::<Vec<_>>()
+            .join("、")
+    }
+}
+
 /// 类型化归结解：与 [`Solution`] 同构，但绑定为 [`BoundTerm`]。
 ///
 /// - 未绑定变量显式表示为 [`BoundTerm::Unbound`]（字符串 API 里的 `"?X"` 约定）；
@@ -232,6 +397,82 @@ impl Clause {
             confidence: confidence.clamp(0.0, 1.0),
             source: source.to_string(),
         }
+    }
+}
+
+/// 失败前沿最多保留的唯一条目数：诊断面有界，但计数仍诚实。
+const MAX_FRONTIER_ENTRIES: usize = 16;
+
+/// 搜索过程中的可变记录器。
+#[derive(Default)]
+struct SearchTrace {
+    stats: SearchStats,
+    truncations: BTreeSet<TruncationCause>,
+    frontier: BTreeSet<FailureFrontier>,
+}
+
+impl SearchTrace {
+    fn note(&mut self, cause: TruncationCause) {
+        self.truncations.insert(cause);
+    }
+
+    fn frontier(&mut self, atom: &Atom, depth: usize, reason: FrontierReason) {
+        let entry = FailureFrontier {
+            goal: frontier_atom_display(atom),
+            depth,
+            reason,
+        };
+        if self.frontier.contains(&entry) {
+            return;
+        }
+        if self.frontier.len() >= MAX_FRONTIER_ENTRIES {
+            self.stats.frontier_omitted += 1;
+            return;
+        }
+        self.frontier.insert(entry);
+    }
+
+    fn finish(mut self) -> (SearchStats, Vec<TruncationCause>, Vec<FailureFrontier>) {
+        self.stats.frontier_entries = self.frontier.len();
+        (
+            self.stats,
+            self.truncations.into_iter().collect(),
+            self.frontier.into_iter().collect(),
+        )
+    }
+}
+
+/// 前沿展示时去掉内部换名后缀（`?B#12` → `?B`），避免泄漏搜索实现细节。
+fn frontier_atom_display(atom: &Atom) -> String {
+    let mut out = String::with_capacity(atom.predicate.len() + 2 + atom.terms.len() * 4);
+    out.push_str(&atom.predicate);
+    out.push('(');
+    for (index, term) in atom.terms.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        match term {
+            Term::Var(name) => {
+                out.push('?');
+                out.push_str(strip_fresh_tag(name));
+            }
+            Term::Const(name) => out.push_str(name),
+        }
+    }
+    out.push(')');
+    out
+}
+
+fn strip_fresh_tag(name: &str) -> &str {
+    match name.rsplit_once('#') {
+        Some((base, suffix))
+            if !base.is_empty()
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => name,
     }
 }
 
@@ -368,7 +609,25 @@ impl ResolutionEngine {
     // 搜索预算按"每个合取目标"独立分配：规则探索耗尽预算时，事实匹配
     // （单位归结）仍会完成，避免前一个目标的规则分支拖垮后续目标。
     pub fn solve(&self, goals: &[Atom], query_vars: &[String]) -> Vec<Solution> {
-        let states = self.solve_states(goals);
+        self.solve_outcome(goals, query_vars).solutions
+    }
+
+    /// 与 [`Self::solve`] 同解，但额外返回三态结论、搜索统计与失败前沿。
+    ///
+    /// 认识论约束：
+    /// - `status == Exhausted` 表示搜索在预算内穷尽且确实无解；
+    /// - `status == Incomplete` 表示没有任何解，但搜索被截断，不能据此断言「不存在」；
+    /// - `status == Proved` 时结果集仍可能因 `max_solutions` 而不完整，
+    ///   调用方应同时检查 [`SearchOutcome::is_truncated`]。
+    pub fn solve_outcome(&self, goals: &[Atom], query_vars: &[String]) -> SearchOutcome {
+        let mut trace = SearchTrace {
+            stats: SearchStats {
+                goals: goals.len(),
+                ..SearchStats::default()
+            },
+            ..SearchTrace::default()
+        };
+        let states = self.solve_states(goals, &mut trace);
 
         // 同一组绑定可能经不同路径到达：保留置信度最高的一条证明；
         // 置信度相同则按证明树的规范串取最小者，保证跨进程/跨运行稳定。
@@ -405,14 +664,33 @@ impl ResolutionEngine {
                     proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs))
                 })
         });
-        solutions.truncate(self.max_solutions);
-        solutions
+        if solutions.len() > self.max_solutions {
+            trace.note(TruncationCause::SolutionLimit);
+            trace.stats.solution_cutoffs += 1;
+            solutions.truncate(self.max_solutions);
+        }
+        let (stats, truncations, frontier) = trace.finish();
+        let status = if !solutions.is_empty() {
+            SearchStatus::Proved
+        } else if truncations.is_empty() {
+            SearchStatus::Exhausted
+        } else {
+            SearchStatus::Incomplete
+        };
+        SearchOutcome {
+            solutions,
+            status,
+            stats,
+            truncations,
+            frontier,
+        }
     }
 
     /// 与 [`Self::solve`] 同序同解的类型化版本；字符串绑定仍由 [`Self::solve`] 提供，
     /// 调用方拿到 [`BoundTerm`]（显式未绑定 / 数值可比较）。
     pub fn solve_typed(&self, goals: &[Atom], query_vars: &[String]) -> Vec<TypedSolution> {
-        let states = self.solve_states(goals);
+        let mut trace = SearchTrace::default();
+        let states = self.solve_states(goals, &mut trace);
         let mut best: HashMap<String, TypedSolution> = HashMap::new();
         for (subst, proofs) in states {
             let (key, _, typed) = bind_query_vars(&subst, query_vars);
@@ -451,7 +729,11 @@ impl ResolutionEngine {
     }
 
     /// 求解 goals 合取，返回「置换 + 各目标证明」的全部中间状态。
-    fn solve_states(&self, goals: &[Atom]) -> Vec<(Substitution, Vec<ProofNode>)> {
+    fn solve_states(
+        &self,
+        goals: &[Atom],
+        trace: &mut SearchTrace,
+    ) -> Vec<(Substitution, Vec<ProofNode>)> {
         if goals.is_empty() {
             return Vec::new();
         }
@@ -464,11 +746,16 @@ impl ResolutionEngine {
             let mut budget = per_goal_budget;
             let mut next: Vec<(Substitution, Vec<ProofNode>)> = Vec::new();
             'states: for (subst, proofs) in &states {
-                for (solved, node) in self.prove_goal(goal, 0, subst, &mut counter, &mut budget) {
+                for (solved, node) in
+                    self.prove_goal(goal, 0, subst, &mut counter, &mut budget, trace)
+                {
                     let mut chain = proofs.clone();
                     chain.push(node);
                     next.push((solved, chain));
                     if next.len() >= self.max_solutions.saturating_mul(4) {
+                        trace.stats.state_cutoffs += 1;
+                        trace.note(TruncationCause::StateLimit);
+                        trace.frontier(&apply_atom(subst, goal), 0, FrontierReason::StateLimit);
                         break 'states;
                     }
                 }
@@ -488,16 +775,22 @@ impl ResolutionEngine {
         subst: &Substitution,
         counter: &mut usize,
         budget: &mut usize,
+        trace: &mut SearchTrace,
     ) -> Vec<(Substitution, ProofNode)> {
+        trace.stats.goal_attempts += 1;
+        let applied = apply_atom(subst, goal);
         let mut results: Vec<(Substitution, ProofNode)> = Vec::new();
         if depth > self.max_depth {
+            trace.stats.depth_cutoffs += 1;
+            trace.note(TruncationCause::DepthLimit);
+            trace.frontier(&applied, depth, FrontierReason::DepthLimit);
             return results;
         }
-        let applied = apply_atom(subst, goal);
 
         // 1) 单位归结：目标与基事实合一（代价 O(同谓词事实数)，不消耗搜索预算）
         if let Some(facts) = self.facts_by_pred.get(&applied.predicate) {
-            for fact in facts {
+            for (position, fact) in facts.iter().enumerate() {
+                trace.stats.fact_checks += 1;
                 if fact.arity() != applied.arity() {
                     continue;
                 }
@@ -506,6 +799,15 @@ impl ResolutionEngine {
                     let ground = apply_atom(&unified, &applied);
                     results.push((unified, ProofNode::fact(ground)));
                     if results.len() >= self.max_solutions {
+                        let more_facts = position + 1 < facts.len();
+                        let has_rules = self
+                            .rules_by_head
+                            .get(&applied.predicate)
+                            .is_some_and(|indices| !indices.is_empty());
+                        if more_facts || has_rules {
+                            trace.stats.solution_cutoffs += 1;
+                            trace.note(TruncationCause::SolutionLimit);
+                        }
                         return results;
                     }
                 }
@@ -516,8 +818,14 @@ impl ResolutionEngine {
         if let Some(indices) = self.rules_by_head.get(&applied.predicate) {
             for &idx in indices {
                 if *budget == 0 {
+                    trace.stats.budget_cutoffs += 1;
+                    trace.note(TruncationCause::RuleBudget);
+                    if results.is_empty() {
+                        trace.frontier(&applied, depth, FrontierReason::RuleBudget);
+                    }
                     break;
                 }
+                trace.stats.rule_attempts += 1;
                 let clause = &self.clauses[idx];
                 let tag = *counter;
                 *counter += 1;
@@ -535,7 +843,7 @@ impl ResolutionEngine {
                     .map(|atom| renamer.atom(atom))
                     .collect();
                 for (solved, children) in
-                    self.prove_body(&fresh_body, depth + 1, &unified, counter, budget)
+                    self.prove_body(&fresh_body, depth + 1, &unified, counter, budget, trace)
                 {
                     let ground = apply_atom(&solved, &applied);
                     let child_confidence: f64 =
@@ -553,10 +861,22 @@ impl ResolutionEngine {
                         },
                     ));
                     if results.len() >= self.max_solutions {
+                        // 即使当前是最后一条规则，规则体内部也可能还有未展开的分支；
+                        // 保守记录「解数上限」，避免把截断伪装成完整答案。
+                        trace.stats.solution_cutoffs += 1;
+                        trace.note(TruncationCause::SolutionLimit);
                         return results;
                     }
                 }
             }
+        }
+        if results.is_empty()
+            && !self
+                .rules_by_head
+                .get(&applied.predicate)
+                .is_some_and(|indices| !indices.is_empty())
+        {
+            trace.frontier(&applied, depth, FrontierReason::MissingFactOrRule);
         }
         results
     }
@@ -568,20 +888,23 @@ impl ResolutionEngine {
         subst: &Substitution,
         counter: &mut usize,
         budget: &mut usize,
+        trace: &mut SearchTrace,
     ) -> Vec<(Substitution, Vec<ProofNode>)> {
         if goals.is_empty() {
             return vec![(subst.clone(), Vec::new())];
         }
         let mut out: Vec<(Substitution, Vec<ProofNode>)> = Vec::new();
-        for (solved, node) in self.prove_goal(&goals[0], depth, subst, counter, budget) {
+        for (solved, node) in self.prove_goal(&goals[0], depth, subst, counter, budget, trace) {
             for (final_subst, mut rest) in
-                self.prove_body(&goals[1..], depth, &solved, counter, budget)
+                self.prove_body(&goals[1..], depth, &solved, counter, budget, trace)
             {
                 let mut proofs = Vec::with_capacity(rest.len() + 1);
                 proofs.push(node.clone());
                 proofs.append(&mut rest);
                 out.push((final_subst, proofs));
                 if out.len() >= self.max_solutions {
+                    trace.stats.solution_cutoffs += 1;
+                    trace.note(TruncationCause::SolutionLimit);
                     return out;
                 }
             }
@@ -1373,5 +1696,101 @@ mod tests {
         let solutions = engine.solve(&[Atom::rel("师祖", "李四", "赵六")], &[]);
         assert_eq!(solutions.len(), 1, "同绑定不同路径应去重");
         assert!((solutions[0].confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn search_outcome_distinguishes_exhausted_from_incomplete() {
+        let engine = master_engine();
+        // 谓词未知、无规则可展开：搜索完整地失败了，可以断言「无解」。
+        let goal = Atom::rel("父母", "张三", "李四");
+        let outcome = engine.solve_outcome(&[goal.clone()], &[]);
+        assert_eq!(outcome.status, SearchStatus::Exhausted);
+        assert!(outcome.solutions.is_empty());
+        assert!(outcome.is_complete());
+        assert!(!outcome.is_proved());
+        assert!(outcome.render_status().contains("已穷尽"));
+        assert!(outcome
+            .frontier
+            .iter()
+            .any(|entry| entry.goal.contains("父母(张三, 李四)")
+                && entry.reason == FrontierReason::MissingFactOrRule));
+
+        // 递归目标在深度上限处被截断：不能误报为「不存在」。
+        let mut engine = ResolutionEngine::new(1, 5);
+        engine.add_fact("父", "a", "b");
+        engine.add_fact("父", "b", "c");
+        engine.add_fact("父", "c", "d");
+        engine.add_clause(Clause::new(
+            Atom::pattern("祖先", Term::var("A"), Term::var("B")),
+            vec![Atom::pattern("父", Term::var("A"), Term::var("B"))],
+            1.0,
+            "祖先基础规则",
+        ));
+        engine.add_clause(Clause::new(
+            Atom::pattern("祖先", Term::var("A"), Term::var("B")),
+            vec![
+                Atom::pattern("父", Term::var("A"), Term::var("C")),
+                Atom::pattern("祖先", Term::var("C"), Term::var("B")),
+            ],
+            1.0,
+            "祖先递归规则",
+        ));
+        let outcome = engine.solve_outcome(
+            &[Atom::pattern("祖先", Term::constant("a"), Term::constant("d"))],
+            &[],
+        );
+        assert_eq!(outcome.status, SearchStatus::Incomplete);
+        assert!(outcome.solutions.is_empty());
+        assert!(outcome.is_truncated());
+        assert!(outcome.truncations.contains(&TruncationCause::DepthLimit));
+        assert!(outcome.render_status().contains("搜索被截断"));
+        assert!(outcome
+            .frontier
+            .iter()
+            .any(|entry| entry.reason == FrontierReason::DepthLimit));
+    }
+
+    #[test]
+    fn search_outcome_reports_solution_limit_without_hiding_proofs() {
+        let mut engine = ResolutionEngine::new(4, 1);
+        engine.add_fact("师傅", "张三", "李四");
+        engine.add_fact("师傅", "张三", "王五");
+        let goals = vec![Atom::pattern(
+            "师傅",
+            Term::constant("张三"),
+            Term::var("X"),
+        )];
+        let outcome = engine.solve_outcome(&goals, &["X".to_string()]);
+        assert_eq!(outcome.status, SearchStatus::Proved);
+        assert_eq!(outcome.solutions.len(), 1);
+        assert!(outcome.is_truncated());
+        assert!(outcome.truncations.contains(&TruncationCause::SolutionLimit));
+        assert!(outcome.render_status().contains("结果可能不完整"));
+        assert_eq!(
+            outcome.solutions[0].bindings.get("X").map(String::as_str),
+            Some("李四")
+        );
+        // 旧 API 与 outcome 的解完全一致，避免两条路径漂移。
+        let legacy = engine.solve(&goals, &["X".to_string()]);
+        assert_eq!(legacy.len(), outcome.solutions.len());
+        assert_eq!(legacy[0].bindings, outcome.solutions[0].bindings);
+    }
+
+    #[test]
+    fn search_outcome_frontier_comes_from_this_search_and_is_stable() {
+        let engine = master_engine();
+        let goals = vec![
+            Atom::pattern("师傅", Term::constant("张三"), Term::var("X")),
+            Atom::pattern("父母", Term::constant("张三"), Term::var("Y")),
+        ];
+        let first = engine.solve_outcome(&goals, &["X".to_string(), "Y".to_string()]);
+        let second = engine.solve_outcome(&goals, &["X".to_string(), "Y".to_string()]);
+        assert_eq!(first.status, SearchStatus::Exhausted);
+        assert!(first.frontier.iter().any(|entry| entry.goal == "父母(张三, ?Y)"));
+        assert_eq!(first.frontier, second.frontier, "前沿顺序必须确定");
+        assert_eq!(first.truncations, second.truncations);
+        assert_eq!(first.stats.goal_attempts, second.stats.goal_attempts);
+        assert!(first.stats.goal_attempts > 0);
+        assert!(first.stats.fact_checks > 0);
     }
 }
