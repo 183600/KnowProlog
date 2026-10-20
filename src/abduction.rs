@@ -592,12 +592,14 @@ impl AbductionEngine {
             .first()
             .cloned()
             .unwrap_or_else(|| Atom::unary("空目标", Term::constant("")));
-        let solutions = engine.solve(goals, query_vars);
-        if !solutions.is_empty() {
+        let outcome = engine.solve_outcome(goals, query_vars);
+        let search_status = outcome.render_status();
+        let search_truncated = outcome.is_truncated();
+        if !outcome.solutions.is_empty() {
             return AbductionReport {
                 goal,
                 provable: true,
-                solutions,
+                solutions: outcome.solutions,
                 frontier: Vec::new(),
                 hypotheses: Vec::new(),
                 notes: vec!["目标可由现有事实与规则证明（后向链成功）".to_string()],
@@ -634,6 +636,25 @@ impl AbductionEngine {
             "后向链在深度上限 {} 内未能证明目标，改走溯因：从失败前沿生成候选假设",
             self.max_depth
         )];
+        notes.push(format!("主后向链搜索结论：{}", search_status));
+        if !outcome.frontier.is_empty() {
+            notes.push(format!(
+                "本次搜索实际失败的叶子：{}",
+                outcome
+                    .frontier
+                    .iter()
+                    .take(4)
+                    .map(|entry| entry.describe())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+        if search_truncated {
+            notes.push(
+                "主后向链搜索被截断：不能据此断言目标不存在；下方失败前沿由另一条有界搜索重建，可能与该次实际路径不同"
+                    .to_string(),
+            );
+        }
         if frontier.is_empty() {
             notes.push("失败前沿为空（目标含深层循环或超出搜索预算）".to_string());
         }
@@ -1847,6 +1868,22 @@ mod tests {
         assert!(!report.provable);
         assert!(!report.frontier.is_empty());
         assert!(!report.hypotheses.is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("主后向链搜索结论")),
+            "溯因报告必须披露主搜索的三态结论：{:?}",
+            report.notes
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("已穷尽") || note.contains("搜索被截断")),
+            "溯因不能把截断伪装成无解：{:?}",
+            report.notes
+        );
         let best = report.best_hypothesis().expect("应有可采纳的假设");
         assert!(best.atom.is_ground());
         assert!(best.confidence > 0.0);

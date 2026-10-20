@@ -37,8 +37,8 @@ use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::resolution_engine::{
-    render_term, Atom, Clause, DerivedFact, ProofNode, ProofSource, ResolutionEngine, Solution,
-    Term,
+    render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
+    ResolutionEngine, SearchOutcome, SearchStatus, Solution, Term,
 };
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{
@@ -607,6 +607,12 @@ pub struct ResolutionProofView {
     pub facts: usize,
     pub clauses: usize,
     pub max_depth: usize,
+    /// 三态搜索结论：得证 / 无解（已穷尽）/ 未得证（搜索被截断）。
+    pub search_status: SearchStatus,
+    /// 搜索是否触发深度、预算、解数或状态上限。
+    pub search_truncated: bool,
+    /// 本次搜索实际遇到的代表性知识缺口。
+    pub frontier: Vec<FailureFrontier>,
     pub solutions: Vec<ProofSolutionView>,
 }
 
@@ -3153,13 +3159,14 @@ impl SymbolicReasoner {
                 }
             }
         }
-        let solutions = self.resolver.solve(&goals, &query_vars);
+        let outcome = self.resolver.solve_outcome(&goals, &query_vars);
         let goal_display = goals
             .iter()
             .map(|goal| goal.display())
             .collect::<Vec<_>>()
             .join("，");
-        let solutions = solutions
+        let solutions = outcome
+            .solutions
             .iter()
             .map(|solution| {
                 let mut bindings: Vec<(String, String)> = solution
@@ -3185,6 +3192,9 @@ impl SymbolicReasoner {
             facts: self.resolver.fact_count(),
             clauses: self.resolver.clause_count(),
             max_depth: self.resolver.max_depth(),
+            search_status: outcome.status,
+            search_truncated: outcome.is_truncated(),
+            frontier: outcome.frontier,
             solutions,
         }
     }
@@ -3282,8 +3292,35 @@ impl SymbolicReasoner {
         goals
     }
 
+    /// 把三态搜索结论与同树失败前沿附在推理报告后面：不把截断伪装成「不存在」。
+    fn render_search_diagnostics(&self, outcome: &SearchOutcome) -> String {
+        let mut output = format!("  搜索状态：{}\n", outcome.render_status());
+        if outcome.is_truncated() {
+            output.push_str(&format!(
+                "  搜索统计：{} 个目标、{} 次目标展开、{} 次事实检查、{} 次规则尝试\n",
+                outcome.stats.goals,
+                outcome.stats.goal_attempts,
+                outcome.stats.fact_checks,
+                outcome.stats.rule_attempts
+            ));
+        }
+        if outcome.solutions.is_empty() && !outcome.frontier.is_empty() {
+            const SHOWN: usize = 5;
+            output.push_str("  知识缺口（来自本次搜索的实际失败叶子）：\n");
+            for entry in outcome.frontier.iter().take(SHOWN) {
+                output.push_str(&format!("    - {}\n", entry.describe()));
+            }
+            let omitted = outcome.frontier.len().saturating_sub(SHOWN)
+                + outcome.stats.frontier_omitted;
+            if omitted > 0 {
+                output.push_str(&format!("    - ……另有 {} 条缺口未展开\n", omitted));
+            }
+        }
+        output
+    }
+
     fn render_resolution_result(&self, phrase: &str, goals: &[Atom]) -> String {
-        let solutions = self.resolver.solve(goals, &[]);
+        let outcome = self.resolver.solve_outcome(goals, &[]);
         let goal_display = goals
             .iter()
             .map(|goal| goal.display())
@@ -3296,7 +3333,7 @@ impl SymbolicReasoner {
             self.resolver.fact_count(),
             self.resolver.clause_count()
         ));
-        if let Some(solution) = solutions.first() {
+        if let Some(solution) = outcome.solutions.first() {
             output.push_str(&format!("  得证：证明置信度 {:.2}\n", solution.confidence));
             output.push_str("  证明树：\n");
             let mut lines = Vec::new();
@@ -3311,6 +3348,7 @@ impl SymbolicReasoner {
             ));
             output.push_str("  可尝试「推理链：同句式问句」查看可能的解，或先补充相关事实/规则。\n");
         }
+        output.push_str(&self.render_search_diagnostics(&outcome));
         output
     }
 
@@ -3427,7 +3465,9 @@ impl SymbolicReasoner {
         }
         let answer_var = "答案".to_string();
         let goals = self.build_question_goals(&entity, &predicates, &answer_var);
-        let solutions = self.resolver.solve(&goals, std::slice::from_ref(&answer_var));
+        let outcome = self
+            .resolver
+            .solve_outcome(&goals, std::slice::from_ref(&answer_var));
         let goal_display = goals
             .iter()
             .map(|goal| goal.display())
@@ -3450,11 +3490,12 @@ impl SymbolicReasoner {
             self.resolver.clause_count(),
             self.resolver.max_depth()
         ));
-        if solutions.is_empty() {
+        if outcome.solutions.is_empty() {
             output.push_str("  没有找到解（开世界假设：推不出 ≠ 不存在）。\n");
-            return output;
+            output.push_str(&self.render_search_diagnostics(&outcome));
+            return output.trim_end().to_string();
         }
-        for (index, solution) in solutions.iter().enumerate() {
+        for (index, solution) in outcome.solutions.iter().enumerate() {
             let answer = solution
                 .bindings
                 .get(&answer_var)
@@ -3473,6 +3514,7 @@ impl SymbolicReasoner {
             output.push_str(&lines.join("\n"));
             output.push('\n');
         }
+        output.push_str(&self.render_search_diagnostics(&outcome));
         output.trim_end().to_string()
     }
 
@@ -8695,6 +8737,12 @@ mod tests {
         assert!(report.contains("事实"));
         let failed = reasoner.resolution_proof_report("张三的师傅的师傅是赵六");
         assert!(failed.contains("未得证"), "实际：{}", failed);
+        assert!(failed.contains("搜索状态："), "失败报告应披露搜索认识论状态：{}", failed);
+        assert!(
+            failed.contains("已穷尽") || failed.contains("搜索被截断"),
+            "搜索状态必须区分无解与截断：{}",
+            failed
+        );
     }
 
     #[test]

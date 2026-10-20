@@ -3619,6 +3619,18 @@ async fn run_interactive_mode(
                                 "未得证：深度上限 {} 内无归结反驳（开世界假设：推不出 ≠ 为假）。",
                                 view.max_depth
                             );
+                            println!(
+                                "搜索状态：{}{}",
+                                view.search_status.label(),
+                                if view.search_truncated {
+                                    "（结果可能不完整）"
+                                } else {
+                                    ""
+                                }
+                            );
+                            for entry in view.frontier.iter().take(5) {
+                                println!("知识缺口：{}", entry.describe());
+                            }
                         }
                         let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
                         if let Some(chronicle) = chronicle.as_mut() {
