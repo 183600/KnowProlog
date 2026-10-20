@@ -636,6 +636,15 @@ pub struct PluginRecipeReply {
     pub focus: Option<String>,
 }
 
+/// 插件本体并入统一推理器的增量回执：本次真正新增的别名/逆向词面/公理数。
+/// 同一运行态重复应用返回全零，便于 CLI 与 HTTP 共用单调、幂等的合并路径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PluginOntologySync {
+    pub aliases: usize,
+    pub inverse_surfaces: usize,
+    pub lessons: usize,
+}
+
 /// 结构化证明视图：可视化（Mermaid/ASCII）消费的纯数据，不重复解析逻辑。
 #[derive(Debug, Clone)]
 pub struct ResolutionProofView {
@@ -1806,10 +1815,11 @@ impl SymbolicReasoner {
 
     /// 登记逆向谓词词面：问句用该词面发问时，命中规范槽位三元组的反方向
     ///（「徒弟」问句 ↔「师傅」事实）。只影响查询换向，不改词面/叙事表。
-    pub fn register_predicate_query_surface(&mut self, surface: &str, slot: &str) {
+    /// 返回是否新增/改变；重复登记返回 `false`。
+    pub fn register_predicate_query_surface(&mut self, surface: &str, slot: &str) -> bool {
         let (surface, slot) = (surface.trim(), slot.trim());
         if surface.is_empty() || slot.is_empty() || surface == slot {
-            return;
+            return false;
         }
         self.aligner.register_term(surface, TermKind::Relation);
         self.aligner.register_term(slot, TermKind::Relation);
@@ -1819,6 +1829,25 @@ impl SymbolicReasoner {
         if changed {
             self.rebuild_knowledge_caches();
         }
+        changed
+    }
+
+    /// 把已启用插件的本体贡献单调并入同一个推理器：谓词别名、互逆词面与
+    /// 结构性公理。返回本次真正新增的条数；停用插件的撤回不在本会话发生。
+    pub fn apply_plugin_runtime(&mut self, runtime: &PluginRuntime) -> PluginOntologySync {
+        let mut sync = PluginOntologySync::default();
+        for (alias, canonical) in runtime.ontology_aliases() {
+            if self.register_predicate_alias(&alias, &canonical) {
+                sync.aliases += 1;
+            }
+        }
+        for (surface, slot) in runtime.ontology_inverse_surfaces() {
+            if self.register_predicate_query_surface(&surface, &slot) {
+                sync.inverse_surfaces += 1;
+            }
+        }
+        sync.lessons = self.configure_ontology_program(&runtime.ontology_program());
+        sync
     }
 
     /// 配置律典：把谓词画像中的显式声明编译为 Active 律，并吸收当前挖掘规则。
@@ -10206,6 +10235,46 @@ template = "「{entity}」的导演是{answer}。依据：{evidence}"
             inverse.evidence.iter().any(|line| line.contains("director ⊑ 导演")),
             "依据应说明别名归一：{:?}",
             inverse.evidence
+        );
+    }
+
+    /// 运行态启用插件时增量合并本体：首次返回新增数，重复应用为零。
+    #[test]
+    fn applying_plugin_runtime_is_incremental_and_idempotent() {
+        use crate::plugin::{PluginManifest, PluginRegistry, PluginRuntime, PluginSettings};
+
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+id = "test.film"
+version = "0.1.0"
+api = 1
+default_mode = "on"
+
+[[contributions]]
+kind = "ontology"
+id = "film.ontology"
+predicates = [
+  { name = "导演", aliases = ["director"], inverse = "执导", domain = ["电影"], range = ["人物"] },
+]
+types = [
+  { name = "电影", aliases = ["影片"] },
+]
+"#,
+        )
+        .expect("测试清单应可解析");
+        let registry = PluginRegistry::from_manifests(vec![manifest]);
+        let runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+
+        let first = reasoner.apply_plugin_runtime(&runtime);
+        assert_eq!(first.aliases, 1, "谓词别名 director");
+        assert_eq!(first.inverse_surfaces, 1, "互逆词面 执导");
+        assert_eq!(first.lessons, 5, "子类1 + 别名1 + 定义域1 + 值域1 + 逆1");
+
+        assert_eq!(
+            reasoner.apply_plugin_runtime(&runtime),
+            PluginOntologySync::default(),
+            "同一运行态重复应用必须无新增"
         );
     }
 

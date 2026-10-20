@@ -2951,33 +2951,23 @@ async fn run_interactive_mode(
             eprintln!("插件：{}", issue.render());
         }
     }
-    // 本体贡献在启动时合并进既有谓词对齐器（运行中只切换词表/改写/配方/模板/风格）。
-    let mut plugin_aliases = 0;
-    for (alias, canonical) in plugin_runtime.ontology_aliases() {
-        if symbolic_reasoner.register_predicate_alias(&alias, &canonical) {
-            plugin_aliases += 1;
-        }
+    // 本体贡献按启用集合并进既有谓词对齐器与统一本体推理器（单调、幂等）。
+    let plugin_sync = symbolic_reasoner.apply_plugin_runtime(&plugin_runtime);
+    if plugin_sync.aliases > 0 {
+        println!("插件本体已合并：{} 条谓词别名。", plugin_sync.aliases);
     }
-    if plugin_aliases > 0 {
-        println!("插件本体已合并：{} 条谓词别名。", plugin_aliases);
-    }
-    // 插件的类型层级/互斥/定义域值域/逆/传递/对称并入**同一个**本体推理器：
-    // 与 [type_system]、[[predicate_profiles]]、教学公理共用闭包与本体胶囊。
-    let plugin_program = plugin_runtime.ontology_program();
-    if !plugin_program.is_empty() {
-        let plugin_lessons = symbolic_reasoner.configure_ontology_program(&plugin_program);
-        if plugin_lessons > 0 {
-            println!("插件本体已并入统一推理器：{} 条公理。", plugin_lessons);
-        }
+    if plugin_sync.lessons > 0 {
+        println!(
+            "插件本体已并入统一推理器：{} 条公理。",
+            plugin_sync.lessons
+        );
     }
     // 互逆谓词的逆向词面：发问时主宾对调（「执导」问句 ↔「导演」事实）。
-    let mut plugin_inverse_surfaces = 0;
-    for (surface, slot) in plugin_runtime.ontology_inverse_surfaces() {
-        symbolic_reasoner.register_predicate_query_surface(&surface, &slot);
-        plugin_inverse_surfaces += 1;
-    }
-    if plugin_inverse_surfaces > 0 {
-        println!("插件本体已合并：{} 条逆向查询词面。", plugin_inverse_surfaces);
+    if plugin_sync.inverse_surfaces > 0 {
+        println!(
+            "插件本体已合并：{} 条逆向查询词面。",
+            plugin_sync.inverse_surfaces
+        );
     }
     // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
     let plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
@@ -3116,9 +3106,21 @@ async fn run_interactive_mode(
         }
 
         // 声明式插件：启停、模式、诊断与自述先于一切查询处理。
+        let enabled_before = plugin_runtime.enabled_count();
         if let Some(outcome) = plugin_runtime.handle_command(input) {
             println!("{}", outcome.text);
             if outcome.state_changed {
+                let sync = symbolic_reasoner.apply_plugin_runtime(&plugin_runtime);
+                if sync.aliases > 0 || sync.lessons > 0 || sync.inverse_surfaces > 0 {
+                    println!(
+                        "插件本体已增量合并：{} 条别名、{} 条公理、{} 条逆向词面。",
+                        sync.aliases, sync.lessons, sync.inverse_surfaces
+                    );
+                } else if plugin_runtime.enabled_count() < enabled_before {
+                    println!(
+                        "提示：停用插件不撤回本会话已合并的本体与别名，重启后按当前启用集重建。"
+                    );
+                }
                 if let Err(error) = plugin_runtime.session_state().save(&plugin_state_path) {
                     eprintln!("插件会话状态保存失败（不影响本次回答）：{}", error);
                 }

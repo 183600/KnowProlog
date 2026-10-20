@@ -1054,19 +1054,16 @@ impl ApiState {
     /// 全部进入**同一个**暖基座推理器，之后分叉的每个会话同源携带。
     /// 与 `configure_ontology` 一样是单调、幂等的启动期操作。
     pub fn configure_plugin_runtime(&self, runtime: &PluginRuntime) -> PluginOntologyReceipt {
-        let mut reasoner = self.warm.reasoner.lock();
-        let mut receipt = PluginOntologyReceipt::default();
-        for (alias, canonical) in runtime.ontology_aliases() {
-            if reasoner.register_predicate_alias(&alias, &canonical) {
-                receipt.aliases += 1;
-            }
+        let sync = self
+            .warm
+            .reasoner
+            .lock()
+            .apply_plugin_runtime(runtime);
+        PluginOntologyReceipt {
+            lessons: sync.lessons,
+            aliases: sync.aliases,
+            inverse_surfaces: sync.inverse_surfaces,
         }
-        for (surface, slot) in runtime.ontology_inverse_surfaces() {
-            reasoner.register_predicate_query_surface(&surface, &slot);
-            receipt.inverse_surfaces += 1;
-        }
-        receipt.lessons = reasoner.configure_ontology_program(&runtime.ontology_program());
-        receipt
     }
 
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
