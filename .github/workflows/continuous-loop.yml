@@ -319,9 +319,9 @@ jobs:
           PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORT*.md、临时调试脚本与调试输出等杂物；确保仓库中没有任何关于修复了哪些bug、优化或改进了哪些内容的记录（包括注释）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README*.md（含所有语言版本的 README）是项目说明文档，同样必须原样保留，不能删除或移动；tests/ 是测试套件，必须原样保留；知识库与语料等仍被项目引用或加载的数据文件（如 *.txt、*.jsonld）不属于“多余的内容”，必须保留。'
 
           # 每阶段单次调用的最大时长（秒）
-          IDEA_TIMEOUT=$((20*60))     # 20m（xuen 只产出想法）
-          IMPROVE_TIMEOUT=$((60*60))  # 1h（直连 opencode 写代码）
-          CLEAN_TIMEOUT=$((30*60))    # 30m
+          IDEA_TIMEOUT=$((3*3600))     # 3h
+          IMPROVE_TIMEOUT=$((3*3600))  # 3h
+          CLEAN_TIMEOUT=$((3*3600))    # 3h
 
           # ================= 动态模型池（不写死，实时读取线上目录） =================
           # 池直接来自 `opencode models opencode` 的实时输出：模型上新自动入池、
@@ -1029,7 +1029,7 @@ jobs:
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
               return 0
             fi
-            if [ "$TG_FIX_BUDGET" -gt 2700 ]; then TG_FIX_BUDGET=2700; fi
+            if [ "$TG_FIX_BUDGET" -gt 10800 ]; then TG_FIX_BUDGET=10800; fi
             {
               echo '本仓库的测试跑不通，请修复。复现方式：在仓库根目录运行 bash /tmp/tg_run.sh。'
               echo
