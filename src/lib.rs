@@ -96,6 +96,7 @@ pub mod contextual_reference;
 pub mod pattern_closure;
 pub mod temporal;
 pub mod lexical_trace;
+pub mod trace_graph;
 pub mod release;
 
 #[cfg(test)]
@@ -316,6 +317,9 @@ pub struct SystemConfig {
     /// 声明式插件（符号专家）目录、默认启用与逐包模式
     #[serde(default)]
     pub plugins: plugin::PluginSettings,
+    /// 分层追踪图：多轮决策的显式工作记忆（问据栈/指代轨迹/更正失效）
+    #[serde(default)]
+    pub trace_graph: trace_graph::TraceGraphConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
