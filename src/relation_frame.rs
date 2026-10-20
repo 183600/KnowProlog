@@ -24,6 +24,7 @@ use crate::grammar_extractor::GrammarExtractor;
 use crate::law_book::{LawBook, LawKind};
 use crate::predicate_registry::PredicateRegistry;
 use crate::prolog_engine::PrologFact;
+use crate::temporal::{self, TimeGranularity as SpanGranularity, TimePoint, TimeSpan, Validity};
 use crate::type_system::TypeSystem;
 
 /// 关系帧方言标识。
@@ -146,6 +147,58 @@ impl TemporalScope {
         }
         text.push_str(&format!("（{}）", self.relation.label()));
         text
+    }
+
+    fn span_granularity(&self) -> SpanGranularity {
+        match self.granularity {
+            TemporalGranularity::Year => SpanGranularity::Year,
+            TemporalGranularity::Month => SpanGranularity::Month,
+            TemporalGranularity::Day => SpanGranularity::Day,
+            TemporalGranularity::Relative => SpanGranularity::Year,
+        }
+    }
+
+    fn anchor_point(&self) -> Option<TimePoint> {
+        self.normalized
+            .as_deref()
+            .and_then(temporal::parse_time_point)
+            .or_else(|| self.start_year.map(TimePoint::year))
+    }
+
+    /// 把句内时间限定转换为可做区间运算的 [`TimeSpan`]。
+    ///
+    /// 相对时间（“去年/当时”）不猜系统时钟，返回 `None`，由
+    /// [`crate::temporal::TemporalSession`] 依据会话参考时间解析。
+    pub fn to_time_span(&self) -> Option<TimeSpan> {
+        if self.granularity == TemporalGranularity::Relative {
+            return None;
+        }
+        let point = self.anchor_point()?;
+        let granularity = self.span_granularity();
+        match self.relation {
+            TemporalRelation::Point => Some(TimeSpan {
+                start: Some(point.period_start(granularity)),
+                end: Some(point.period_end(granularity)),
+                granularity,
+            }),
+            TemporalRelation::Range => {
+                let end_year = self.end_year.unwrap_or(point.year);
+                TimeSpan::from_bounds(
+                    Some(point.period_start(granularity)),
+                    Some(TimePoint::new(end_year, 12, 31)),
+                    granularity,
+                )
+            }
+            TemporalRelation::Before => Some(TimeSpan::before(point, granularity)),
+            TemporalRelation::After => Some(TimeSpan::after(point, granularity)),
+        }
+    }
+
+    /// 时间限定 → 事实有效期；无法解析时是「未知」而不是「永远」。
+    pub fn to_validity(&self) -> Validity {
+        self.to_time_span()
+            .map(Validity::Span)
+            .unwrap_or(Validity::Unknown)
     }
 }
 
@@ -1107,6 +1160,8 @@ pub struct FrameGate {
     rules: ClosureRules,
     index: ClosureIndex,
     limits: ClosureLimits,
+    /// 事实的有效期（sidecar，不改变三元组身份）；缺失即 Unknown。
+    fact_validity: BTreeMap<FrameEdge, Validity>,
 }
 
 impl FrameGate {
@@ -1133,7 +1188,17 @@ impl FrameGate {
             rules,
             index,
             limits: ClosureLimits::default(),
+            fact_validity: BTreeMap::new(),
         }
+    }
+
+    /// 注入事实有效期（sidecar）。同一个三元组以最后一次注入为准。
+    pub fn with_fact_validity(
+        mut self,
+        entries: impl IntoIterator<Item = (FrameEdge, Validity)>,
+    ) -> Self {
+        self.fact_validity = entries.into_iter().collect();
+        self
     }
 
     pub fn from_facts(
@@ -1144,6 +1209,7 @@ impl FrameGate {
     ) -> Self {
         let mut edges = Vec::new();
         let mut entity_types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut validity_by_entity: BTreeMap<String, Validity> = BTreeMap::new();
         for fact in facts {
             match fact {
                 PrologFact::Entity {
@@ -1156,6 +1222,12 @@ impl FrameGate {
                             .entry(name.clone())
                             .or_default()
                             .insert(entity_type.clone());
+                    }
+                    if let Some(validity) = temporal::validity_from_properties(properties) {
+                        validity_by_entity.insert(name.clone(), validity);
+                        if let Some(alias) = properties.get("name") {
+                            validity_by_entity.insert(alias.clone(), validity);
+                        }
                     }
                     // 实体属性（年龄、身高、首都等）在图中不是三元组关系，
                     // 但对帧而言同样是二元谓词；只收字面量值，跳过关系 IRI。
@@ -1176,7 +1248,18 @@ impl FrameGate {
                 }
             }
         }
+        let validity: Vec<(FrameEdge, Validity)> = edges
+            .iter()
+            .filter_map(|edge| {
+                validity_by_entity
+                    .get(&edge.subject)
+                    .copied()
+                    .filter(Validity::is_known)
+                    .map(|validity| (edge.clone(), validity))
+            })
+            .collect();
         Self::new(edges, Vec::new(), entity_types, registry, types, laws)
+            .with_fact_validity(validity)
     }
 
     pub fn with_limits(mut self, limits: ClosureLimits) -> Self {
@@ -1192,7 +1275,13 @@ impl FrameGate {
         let (normalized, inverted) =
             normalize_edge_detailed(&self.registry, &self.entity_types, frame);
         let negative = frame.polarity == Polarity::Negative;
-        let direct_positive = self.facts.contains(&normalized);
+        let frame_validity = frame
+            .temporal
+            .as_ref()
+            .map(TemporalScope::to_validity)
+            .unwrap_or(Validity::Unknown);
+        let direct_positive = self.facts.contains(&normalized)
+            && self.validities_compatible(frame_validity, &normalized);
         let direct_negative = self.negative_facts.contains(&normalized);
 
         let without = self.local_closure(&normalized, None);
@@ -1300,7 +1389,7 @@ impl FrameGate {
         }
 
         if !negative {
-            let values = self.functional_conflict_values(&normalized);
+            let values = self.functional_conflict_values(&normalized, frame_validity);
             if !values.is_empty() {
                 conflict = true;
                 findings.push(GateFinding::new(
@@ -1373,7 +1462,19 @@ impl FrameGate {
         }
     }
 
-    fn functional_conflict_values(&self, edge: &FrameEdge) -> Vec<String> {
+    fn validities_compatible(&self, frame_validity: Validity, edge: &FrameEdge) -> bool {
+        let fact_validity = self
+            .fact_validity
+            .get(edge)
+            .copied()
+            .unwrap_or(Validity::Unknown);
+        if frame_validity.is_unknown() || fact_validity.is_unknown() {
+            return true;
+        }
+        frame_validity.intersection(fact_validity).is_satisfiable()
+    }
+
+    fn functional_conflict_values(&self, edge: &FrameEdge, frame_validity: Validity) -> Vec<String> {
         let functional = self.rules.functional.contains(&edge.predicate)
             || self
                 .registry
@@ -1389,6 +1490,7 @@ impl FrameGate {
                 fact.subject == edge.subject
                     && fact.predicate == edge.predicate
                     && fact.object != edge.object
+                    && self.validities_compatible(frame_validity, fact)
             })
             .map(|fact| fact.object.clone())
             .collect()
@@ -1753,6 +1855,7 @@ pub fn diagnostics_digest(diagnostics: &FrameDiagnostics) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::predicate_registry::PredicateProfileConfig;
 
     fn profile(name: &str) -> PredicateProfileConfig {
@@ -1809,8 +1912,105 @@ mod tests {
 
         let relative = parse_temporal("他去年出生").expect("relative");
         assert_eq!(relative.granularity, TemporalGranularity::Relative);
+        assert!(relative.to_time_span().is_none());
+        assert_eq!(relative.to_validity(), Validity::Unknown);
         assert!(negation_cue("不丹的首都是廷布").is_none());
         assert!(negation_cue("张三不使用标注数据").is_some());
+    }
+
+    #[test]
+    fn from_facts_maps_validity_across_name_alias() {
+        let mut registry = PredicateRegistry::new();
+        let mut capital = profile("首都");
+        capital.functional = true;
+        registry.declare(&capital);
+        let laws = LawBook::from_registry(&registry);
+        let mut kyoto: HashMap<String, String> = HashMap::new();
+        kyoto.insert("name".to_string(), "京都".to_string());
+        kyoto.insert("valid_to".to_string(), "1867".to_string());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "kyoto".to_string(),
+                entity_type: "城市".to_string(),
+                properties: kyoto,
+            },
+            PrologFact::Entity {
+                name: "japan".to_string(),
+                entity_type: "国家".to_string(),
+                properties: HashMap::from([("name".to_string(), "日本".to_string())]),
+            },
+            PrologFact::Relation {
+                from: "京都".to_string(),
+                rel_type: "首都".to_string(),
+                to: "日本".to_string(),
+            },
+        ];
+        let gate = FrameGate::from_facts(&facts, registry, TypeSystem::new(), laws);
+        let frame = RelationFrame::new("日本", "首都", "京都")
+            .with_temporal(parse_temporal("1868年").expect("year"));
+        assert_eq!(gate.evaluate(&frame).verdict, GateVerdict::Unsupported);
+    }
+
+    #[test]
+    fn functional_conflicts_are_time_aware() {
+        let mut registry = PredicateRegistry::new();
+        let mut capital = profile("首都");
+        capital.functional = true;
+        registry.declare(&capital);
+        let laws = LawBook::from_registry(&registry);
+        let kyoto = FrameEdge::new("日本", "首都", "京都");
+        let tokyo = FrameEdge::new("日本", "首都", "东京");
+        let gate = FrameGate::new(
+            vec![kyoto.clone(), tokyo.clone()],
+            Vec::new(),
+            BTreeMap::new(),
+            registry,
+            TypeSystem::new(),
+            laws,
+        )
+        .with_fact_validity([
+            (kyoto, Validity::from_years(-794, 1867)),
+            (tokyo, Validity::from_years(1868, 9999)),
+        ]);
+
+        let frame = RelationFrame::new("日本", "首都", "东京")
+            .with_temporal(parse_temporal("1868年").expect("year"));
+        let report = gate.evaluate(&frame);
+        assert_eq!(report.verdict, GateVerdict::DirectSupport);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == GateFindingKind::FunctionalConflict),
+            "历史更替不应误报单值冲突：{:?}",
+            report.findings
+        );
+
+        let osaka = RelationFrame::new("日本", "首都", "大阪")
+            .with_temporal(parse_temporal("1800年").expect("year"));
+        let report = gate.evaluate(&osaka);
+        assert_eq!(report.verdict, GateVerdict::Conflict);
+        let conflict = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == GateFindingKind::FunctionalConflict)
+            .expect("1800 年与京都有效期重叠，应报冲突");
+        assert!(conflict.detail.contains("京都"));
+        assert!(!conflict.detail.contains("东京"), "{}", conflict.detail);
+    }
+
+    #[test]
+    fn temporal_scope_converts_to_interval_algebra() {
+        let year = parse_temporal("公司成立于1999年").expect("year");
+        let span = year.to_time_span().expect("year span");
+        assert!(span.contains(TimePoint::day(1999, 6, 1)));
+        assert_eq!(year.to_validity(), Validity::from_years(1999, 1999));
+
+        let range = parse_temporal("从1991年到1999年").expect("range");
+        let span = range.to_time_span().expect("range span");
+        assert!(span.contains(TimePoint::year(1995)));
+        assert!(!span.contains(TimePoint::year(2000)));
+        assert_eq!(range.to_validity(), Validity::from_years(1991, 1999));
     }
 
     #[test]

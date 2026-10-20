@@ -5,6 +5,7 @@ use scryer_prolog::machine::Machine;
 use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryResolution, Value};
 
 use crate::bindings::{BindingSet, BoundTerm};
+use crate::temporal::{TemporalFact, TimePoint, Validity};
 
 /// 查询的三态结局：有解 / 无解 / 引擎故障。
 ///
@@ -50,6 +51,8 @@ pub struct PrologEngine {
     machine: Machine,
     /// 已加载的动态事实（按规范序排序）
     loaded_facts: Vec<PrologFact>,
+    /// 已加载的时序事实（`temporal_edge/8`）
+    loaded_temporal_facts: Vec<TemporalFact>,
     /// 最近一次引擎层故障（consult / 查询错误 / 崩溃），由调用方取走上报。
     last_fault: Option<String>,
     /// 引擎是否已在崩溃后停止服务（scryer 0.9.x 的 consult 解析错误会 panic，
@@ -79,6 +82,45 @@ impl PrologEngine {
             % 动态事实谓词声明（支持 retractall 更新事实）
             :- dynamic(oxigraph_entity/3).
             :- dynamic(oxigraph_relation/3).
+
+            % 时序事实：temporal_edge(主语, 谓词, 宾语, 起, 止, 粒度, 状态/事件, 来源)
+            % 起/止为 YYYYMMDD 整数；unbounded 表示该侧无界；unknown 表示时间未知
+            % （未知不参与 holds_at，绝不伪装成永远为真）。
+            :- dynamic(temporal_edge/8).
+
+            temporal_lower(unbounded, _).
+            temporal_lower(Start, T) :- integer(Start), Start =< T.
+
+            temporal_upper(unbounded, _).
+            temporal_upper(End, T) :- integer(End), T =< End.
+
+            % 在时刻 T（YYYYMMDD 整数）为真的时序事实。
+            holds_at(S, P, O, T) :-
+                temporal_edge(S, P, O, Start, End, _, _, _),
+                temporal_lower(Start, T),
+                temporal_upper(End, T).
+
+            state_at(S, P, O, T) :-
+                temporal_edge(S, P, O, Start, End, _, state, _),
+                temporal_lower(Start, T),
+                temporal_upper(End, T).
+
+            event_at(S, P, O, T) :-
+                temporal_edge(S, P, O, Start, End, _, event, _),
+                temporal_lower(Start, T),
+                temporal_upper(End, T).
+
+            % T 之前已经成立（止点早于 T；无界/未知止点不算）。
+            temporal_before(S, P, O, T) :-
+                temporal_edge(S, P, O, _, End, _, _, _),
+                integer(End),
+                End < T.
+
+            % T 之后才开始成立（起点晚于 T）。
+            temporal_after(S, P, O, T) :-
+                temporal_edge(S, P, O, Start, _, _, _, _),
+                integer(Start),
+                Start > T.
             
             % 基础谓词定义
             entity(Name, Type, Properties) :- 
@@ -129,6 +171,7 @@ impl PrologEngine {
         let mut engine = Self {
             machine,
             loaded_facts: Vec::new(),
+            loaded_temporal_facts: Vec::new(),
             last_fault: None,
             poisoned: false,
         };
@@ -255,6 +298,116 @@ impl PrologEngine {
                 PrologFact::Relation { from: f2, rel_type: r2, to: o2 },
             ) => f1.cmp(f2).then_with(|| r1.cmp(r2)).then_with(|| o1.cmp(o2)),
         }
+    }
+
+    /// 加载时序事实到 `temporal_edge/8`；与 [`Self::load_facts`] 相互独立。
+    pub fn load_temporal_facts(&mut self, facts: Vec<TemporalFact>) {
+        if let Err(error) = self.load_temporal_facts_checked(facts) {
+            self.note_fault(format!("时序事实加载失败: {}", error));
+        }
+    }
+
+    /// 与 [`Self::load_temporal_facts`] 相同，但把 consult 失败显式交给调用方。
+    pub fn load_temporal_facts_checked(
+        &mut self,
+        facts: Vec<TemporalFact>,
+    ) -> Result<(), String> {
+        let mut facts = facts;
+        facts.sort_by(|left, right| {
+            left.sort_key()
+                .cmp(&right.sort_key())
+                .then(left.validity.render().cmp(&right.validity.render()))
+                .then(left.source.cmp(&right.source))
+        });
+        if facts == self.loaded_temporal_facts {
+            return Ok(());
+        }
+        self.clear_dynamic_temporal_facts()?;
+        let mut source = String::with_capacity(facts.len() * 96);
+        for fact in &facts {
+            let aspect = fact.aspect.tag();
+            let granularity = match fact.validity {
+                Validity::Span(span) => span.granularity.tag(),
+                _ => "year",
+            };
+            let (start, end) = match fact.validity {
+                Validity::Unknown => ("unknown".to_string(), "unknown".to_string()),
+                Validity::Never => ("never".to_string(), "never".to_string()),
+                Validity::Unbounded => ("unbounded".to_string(), "unbounded".to_string()),
+                Validity::Span(span) => (
+                    span.start
+                        .map(|point| point.to_prolog_int().to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                    span.end
+                        .map(|point| point.to_prolog_int().to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                ),
+            };
+            let source_label = if fact.source.trim().is_empty() {
+                "知识图谱"
+            } else {
+                fact.source.as_str()
+            };
+            let _ = write!(
+                source,
+                "temporal_edge('{}', '{}', '{}', {}, {}, '{}', '{}', '{}').\n",
+                escape_atom(&fact.subject),
+                escape_atom(&fact.predicate),
+                escape_atom(&fact.object),
+                start,
+                end,
+                granularity,
+                aspect,
+                escape_atom(source_label)
+            );
+        }
+        self.consult_source(source)?;
+        self.loaded_temporal_facts = facts;
+        Ok(())
+    }
+
+    fn clear_dynamic_temporal_facts(&mut self) -> Result<(), String> {
+        self.machine
+            .run_query("retractall(temporal_edge(_, _, _, _, _, _, _, _)).".to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// 已加载的时序事实条数。
+    pub fn temporal_fact_count(&self) -> usize {
+        self.loaded_temporal_facts.len()
+    }
+
+    /// 生成“某时刻成立”的 Prolog 目标。
+    pub fn holds_at_query(
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        point: TimePoint,
+    ) -> String {
+        format!(
+            "holds_at('{}', '{}', '{}', {})",
+            escape_atom(subject),
+            escape_atom(predicate),
+            escape_atom(object),
+            point.to_prolog_int()
+        )
+    }
+
+    /// 生成“T 之前成立”的 Prolog 目标。
+    pub fn temporal_before_query(
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        point: TimePoint,
+    ) -> String {
+        format!(
+            "temporal_before('{}', '{}', '{}', {})",
+            escape_atom(subject),
+            escape_atom(predicate),
+            escape_atom(object),
+            point.to_prolog_int()
+        )
     }
 
     pub fn load_relevant_facts(&mut self, facts: Vec<PrologFact>) {
@@ -654,6 +807,64 @@ mod tests {
         assert!(engine.last_fault().is_some());
         assert!(engine.take_fault().is_some());
         assert!(engine.last_fault().is_none(), "故障取走后不重复刷屏");
+    }
+
+    #[test]
+    fn temporal_facts_are_queryable_with_shared_time_variable() {
+        let mut engine = PrologEngine::new();
+        let facts = vec![
+            TemporalFact::new("张三", "师傅", "李四").with_years(1990, 1999),
+            TemporalFact::new("李四", "师傅", "王五").with_years(1995, 2000),
+            TemporalFact::new("王五", "师傅", "赵六").with_years(2001, 2010),
+        ];
+        engine.load_temporal_facts(facts);
+        assert_eq!(engine.temporal_fact_count(), 3);
+
+        // 1995 年：前两跳共享时刻，第三跳尚未开始。
+        let outcome = engine.query_outcome("holds_at('张三', '师傅', '李四', 19950601)");
+        assert!(
+            matches!(outcome, QueryOutcome::Solutions(_)),
+            "{:?}",
+            outcome
+        );
+        let outcome = engine.query_outcome(
+            "holds_at('张三', '师傅', '李四', 19950601), \
+             holds_at('李四', '师傅', '王五', 19950601)",
+        );
+        assert!(matches!(outcome, QueryOutcome::Solutions(_)));
+        let outcome = engine.query_outcome("holds_at('王五', '师傅', '赵六', 19950601)");
+        assert_eq!(outcome, QueryOutcome::NoSolution);
+
+        // 相同的 T 作为共享变量参与合一：只有 1995 年同时成立的两条边。
+        let rows = engine.query("holds_at(S, P, O, 19950601)");
+        assert_eq!(rows.len(), 2, "{:?}", rows);
+    }
+
+    #[test]
+    fn unknown_temporal_fact_is_not_always_true() {
+        let mut engine = PrologEngine::new();
+        engine.load_temporal_facts(vec![TemporalFact::new("张三", "师傅", "李四")]);
+        let outcome = engine.query_outcome("holds_at('张三', '师傅', '李四', 19950601)");
+        assert_eq!(outcome, QueryOutcome::NoSolution);
+    }
+
+    #[test]
+    fn temporal_before_and_after_queries_work() {
+        let mut engine = PrologEngine::new();
+        engine.load_temporal_facts(vec![
+            TemporalFact::new("东京", "成为首都", "日本").with_years(1868, 1868),
+        ]);
+        let before = engine.query_outcome(&PrologEngine::temporal_before_query(
+            "东京",
+            "成为首都",
+            "日本",
+            TimePoint::year(1900),
+        ));
+        assert!(matches!(before, QueryOutcome::Solutions(_)));
+        let after = engine.query_outcome("temporal_after('东京', '成为首都', '日本', 18000101)");
+        assert!(matches!(after, QueryOutcome::Solutions(_)));
+        let not_before = engine.query_outcome("temporal_before('东京', '成为首都', '日本', 18000101)");
+        assert_eq!(not_before, QueryOutcome::NoSolution);
     }
 
     #[test]

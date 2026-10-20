@@ -45,6 +45,9 @@ use crate::semantic_entailment::{
     self, EntailmentResult, Knowledge, PropositionParser, Verdict,
 };
 use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
+use crate::temporal::{
+    self, validity_from_bounds, TemporalConstraint, UnknownTimePolicy, Validity,
+};
 use crate::view_render::ProofViewNode;
 use crate::ReasoningConfig;
 
@@ -58,6 +61,12 @@ const DEFAULT_LOGIC_MAX_ROUNDS: usize = 8;
 // 语义律闭包的有界扩张：深度与节点数双上限，超限即停止（不静默扩成全集）。
 const LAW_CLOSURE_MAX_DEPTH: usize = 8;
 const LAW_CLOSURE_MAX_NODES: usize = 512;
+
+// 图谱属性里的有效时间约定字段（与 temporal::TemporalIndex 保持一致）。
+const TEMPORAL_FROM_FIELDS: &[&str] =
+    &["valid_from", "start_year", "since", "开始年份", "起始年份"];
+const TEMPORAL_TO_FIELDS: &[&str] =
+    &["valid_to", "end_year", "until", "结束年份", "终止年份"];
 
 // 会话内纯函数记忆槽容量（提及/链接/谓词）：多轮交替询问时各自留槽，
 // 知识版本推进（revision 自增）时整体失效；容量按条目数确定，LRU 序可审计。
@@ -4196,15 +4205,65 @@ impl SymbolicReasoner {
 
     fn traversal_graph(&self) -> TraversalGraph {
         let mut graph = TraversalGraph::new();
+        // 主语实体上的 valid_from/valid_to 等字段给出其出边的有效时间；
+        // 没有字段的边保持 Unknown，带时间约束的查询按宽松策略标注 caveat。
+        let mut bounds: BTreeMap<&str, (Option<&str>, Option<&str>)> = BTreeMap::new();
+        for (entity, attribute, value) in &self.attributes {
+            let entry = bounds.entry(entity.as_str()).or_default();
+            if TEMPORAL_FROM_FIELDS.contains(&attribute.as_str()) {
+                entry.0 = Some(value.as_str());
+            } else if TEMPORAL_TO_FIELDS.contains(&attribute.as_str()) {
+                entry.1 = Some(value.as_str());
+            }
+        }
+        let mut validity_by_entity: BTreeMap<&str, Validity> = bounds
+            .into_iter()
+            .filter_map(|(entity, (start, end))| {
+                let validity = validity_from_bounds(start, end);
+                (!validity.is_unknown()).then_some((entity, validity))
+            })
+            .collect();
+        // 实体键可能是 IRI 尾部，路径端点则用 name 属性字面量；登记别名，
+        // 否则从知识图谱导入的历史有效期会在路径上丢失。
+        let aliases: Vec<(&str, &str)> = self
+            .attributes
+            .iter()
+            .filter(|(_, attribute, _)| attribute == "name")
+            .map(|(entity, _, value)| (entity.as_str(), value.as_str()))
+            .collect();
+        for (entity, alias) in aliases {
+            if let Some(validity) = validity_by_entity.get(entity).copied() {
+                validity_by_entity.insert(alias, validity);
+            }
+        }
         for triple in self.predictor.triples() {
-            graph.add_edge(&triple.subject, &triple.predicate, &triple.object);
+            let validity = validity_by_entity
+                .get(triple.subject.as_str())
+                .copied()
+                .unwrap_or(Validity::Unknown);
+            graph.add_edge_record(
+                crate::path_memory::PathEdge::new(
+                    &triple.subject,
+                    &triple.predicate,
+                    &triple.object,
+                )
+                .with_validity(validity),
+            );
         }
         for (entity, attribute, value) in &self.attributes {
-            graph.add_edge_with_source(
-                entity,
-                attribute,
-                value,
-                EdgeSource::Attribute,
+            if TEMPORAL_FROM_FIELDS.contains(&attribute.as_str())
+                || TEMPORAL_TO_FIELDS.contains(&attribute.as_str())
+            {
+                continue;
+            }
+            let validity = validity_by_entity
+                .get(entity.as_str())
+                .copied()
+                .unwrap_or(Validity::Unknown);
+            graph.add_edge_record(
+                crate::path_memory::PathEdge::new(entity, attribute, value)
+                    .with_source(EdgeSource::Attribute)
+                    .with_validity(validity),
             );
         }
         for atom in &self.session_facts {
@@ -4267,6 +4326,12 @@ impl SymbolicReasoner {
 
     fn path_options_for_question(&self, max_depth: usize, question: &str) -> TraversalOptions {
         let mut options = self.path_options(max_depth);
+        if let Some(span) = temporal::parse_time_span(question) {
+            options.temporal = TemporalConstraint::from_span(span);
+            // 现有知识库大多没有 valid-time 元数据：未知时间只作背景并标注，
+            // 但已经写明有效期的边仍会被时间合一硬性阻断。
+            options.unknown_time = UnknownTimePolicy::Background;
+        }
         let keywords = Self::expected_type_keywords(question);
         if keywords.is_empty() {
             return options;

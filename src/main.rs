@@ -61,7 +61,8 @@ use know_prolog::{
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
     },
-    path_memory::{EdgeSource, PathPredicate, TraversalGraph, TraversalOptions},
+    path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
+    temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
@@ -248,7 +249,28 @@ enum Commands {
         /// Maximum number of witness paths to keep
         #[arg(long, default_value_t = 8)]
         max_paths: usize,
+        /// Restrict every path step to a valid-time point/interval,
+        /// e.g. 1995, 1995-06, 1995年, 从1991年到1999年
+        #[arg(long = "as-of", value_name = "TIME")]
+        as_of: Option<String>,
         /// Print the path bundle as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect the read-only temporal index: timeline, facts valid at a time,
+    /// and time-aware functional conflicts (no writes to the knowledge store)
+    Temporal {
+        /// Entity to inspect (omit for a whole-index summary)
+        #[arg(long)]
+        entity: Option<String>,
+        /// Point or interval, e.g. 1868, 1868-06, 1868年, 从1991年到1999年
+        #[arg(long = "at", value_name = "TIME")]
+        at: Option<String>,
+        /// Predicate treated as single-valued for temporal conflict checks
+        /// (repeatable; defaults to capital/spouse/president-style predicates)
+        #[arg(long = "functional", value_name = "PREDICATE")]
+        functional: Vec<String>,
+        /// Print the report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -757,6 +779,7 @@ async fn main() {
             common_with,
             max_hops,
             max_paths,
+            as_of,
             json,
         }) => {
             let facts = match oxigraph_manager.load_graph_snapshot().await {
@@ -766,6 +789,28 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+            let temporal_constraint = match as_of.as_deref() {
+                Some(text) => match temporal::parse_time_span(text) {
+                    Some(span) => TemporalConstraint::from_span(span),
+                    None => {
+                        eprintln!("无法解析时间「{}」（示例：1995、1995-06、1995年）", text);
+                        std::process::exit(2);
+                    }
+                },
+                None => TemporalConstraint::Any,
+            };
+            let mut validity_by_entity: std::collections::BTreeMap<String, Validity> =
+                std::collections::BTreeMap::new();
+            for fact in facts.iter() {
+                if let PrologFact::Entity { name, properties, .. } = fact {
+                    if let Some(validity) = temporal::validity_from_properties(properties) {
+                        validity_by_entity.insert(name.clone(), validity);
+                        if let Some(alias) = properties.get("name") {
+                            validity_by_entity.insert(alias.clone(), validity);
+                        }
+                    }
+                }
+            }
             let mut graph = TraversalGraph::new();
             for fact in facts.iter() {
                 match fact {
@@ -773,7 +818,16 @@ async fn main() {
                         from: subject,
                         rel_type,
                         to: object,
-                    } => graph.add_edge(subject.as_str(), rel_type.as_str(), object.as_str()),
+                    } => {
+                        let validity = validity_by_entity
+                            .get(subject.as_str())
+                            .copied()
+                            .unwrap_or(Validity::Unknown);
+                        graph.add_edge_record(
+                            PathEdge::new(subject.as_str(), rel_type.as_str(), object.as_str())
+                                .with_validity(validity),
+                        );
+                    }
                     PrologFact::Entity {
                         name,
                         entity_type,
@@ -781,6 +835,9 @@ async fn main() {
                     } => {
                         graph.add_entity_type(name.as_str(), entity_type.as_str());
                         for (key, value) in properties {
+                            if temporal::is_temporal_field(key) {
+                                continue;
+                            }
                             graph.add_edge_with_source(
                                 name.as_str(),
                                 key.as_str(),
@@ -794,6 +851,12 @@ async fn main() {
             let options = TraversalOptions {
                 max_depth: max_hops.clamp(1, 8),
                 max_paths: max_paths.clamp(1, 64),
+                temporal: temporal_constraint,
+                unknown_time: if as_of.is_some() {
+                    UnknownTimePolicy::Background
+                } else {
+                    UnknownTimePolicy::Strict
+                },
                 ..TraversalOptions::default()
             };
             let bundle = if let Some(right) = common_with.as_deref() {
@@ -824,6 +887,99 @@ async fn main() {
                 }
             } else {
                 println!("{}", bundle.render_text());
+            }
+        }
+        Some(Commands::Temporal {
+            entity,
+            at,
+            functional,
+            json,
+        }) => {
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let index = TemporalIndex::from_prolog_facts(&facts);
+            let at_span = match at.as_deref() {
+                Some(text) => match temporal::parse_time_span(text) {
+                    Some(span) => Some(span),
+                    None => {
+                        eprintln!("无法解析时间「{}」（示例：1868、1868-06、1868年）", text);
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+            let at_facts: Vec<_> = at_span
+                .as_ref()
+                .map(|span| index.overlapping(span))
+                .unwrap_or_default();
+            let entity_facts = entity
+                .as_deref()
+                .map(|name| index.for_entity(name))
+                .unwrap_or_default();
+            let functional: std::collections::BTreeSet<String> = if functional.is_empty() {
+                ["capital", "spouse", "president", "首都", "配偶", "总统"]
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect()
+            } else {
+                functional.into_iter().collect()
+            };
+            let conflicts = index.functional_conflicts(&functional);
+            if json {
+                let payload = serde_json::json!({
+                    "dialect": know_prolog::temporal::TEMPORAL_DIALECT,
+                    "facts": index.len(),
+                    "nodes": index.nodes().len(),
+                    "unknown_time": index.unknown_time_facts().len(),
+                    "entity": entity,
+                    "entity_facts": entity_facts,
+                    "at": at,
+                    "at_facts": at_facts,
+                    "functional_predicates": functional,
+                    "conflicts": conflicts,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("时序索引序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!(
+                    "时序索引：{} 条关系，{} 个实体，{} 条时间未知。",
+                    index.len(),
+                    index.nodes().len(),
+                    index.unknown_time_facts().len()
+                );
+                for fact in index.timeline() {
+                    println!("  {}", fact.render());
+                }
+                if let Some(name) = entity.as_deref() {
+                    println!("\n实体「{}」：{} 条相关事实。", name, entity_facts.len());
+                    for fact in &entity_facts {
+                        println!("  {}", fact.render());
+                    }
+                }
+                if let Some(text) = at.as_deref() {
+                    println!("\n时间「{}」内成立：{} 条。", text, at_facts.len());
+                    for fact in &at_facts {
+                        println!("  {}", fact.render());
+                    }
+                }
+                if conflicts.is_empty() {
+                    println!("\n时序单值冲突：无。");
+                } else {
+                    println!("\n时序单值冲突：{} 处。", conflicts.len());
+                    for conflict in &conflicts {
+                        println!("  {}", conflict.render());
+                    }
+                }
             }
         }
         Some(Commands::Laws {

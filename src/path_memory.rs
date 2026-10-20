@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::temporal::{TemporalConstraint, TimeSpan, UnknownTimePolicy, Validity};
+
 pub const DEFAULT_MAX_DEPTH: usize = 4;
 pub const DEFAULT_MAX_PATHS: usize = 12;
 pub const DEFAULT_MAX_EXPANSIONS: usize = 20_000;
@@ -37,6 +39,9 @@ pub struct PathEdge {
     pub object: String,
     pub source: EdgeSource,
     pub confidence_bps: u16,
+    /// 有效时间（valid time）：没写时间的边是未知，不是永远为真。
+    #[serde(default, skip_serializing_if = "Validity::is_unknown")]
+    pub validity: Validity,
 }
 
 impl PathEdge {
@@ -47,6 +52,7 @@ impl PathEdge {
             object: object.to_string(),
             source: EdgeSource::Observed,
             confidence_bps: 10_000,
+            validity: Validity::Unknown,
         }
     }
 
@@ -59,6 +65,21 @@ impl PathEdge {
         self.confidence_bps = confidence_bps.min(10_000);
         self
     }
+
+    pub fn with_validity(mut self, validity: Validity) -> Self {
+        self.validity = validity;
+        self
+    }
+
+    pub fn with_years(mut self, start_year: i32, end_year: i32) -> Self {
+        self.validity = Validity::from_years(start_year, end_year);
+        self
+    }
+
+    pub fn with_time_span(mut self, span: TimeSpan) -> Self {
+        self.validity = Validity::Span(span);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +90,8 @@ pub struct PathStep {
     pub inverted: bool,
     pub source: EdgeSource,
     pub confidence_bps: u16,
+    #[serde(default, skip_serializing_if = "Validity::is_unknown")]
+    pub validity: Validity,
 }
 
 impl PathStep {
@@ -82,6 +105,9 @@ impl PathStep {
         }
         if self.confidence_bps < 10_000 {
             notes.push(format!("置信度 {:.0}%", self.confidence_bps as f64 / 100.0));
+        }
+        if self.validity.is_known() {
+            notes.push(format!("有效期 {}", self.validity.render()));
         }
         if notes.is_empty() {
             self.predicate.clone()
@@ -104,7 +130,14 @@ impl PathStep {
 pub struct PathWitness {
     pub steps: Vec<PathStep>,
     pub confidence_bps: u16,
+    /// 全路径的有效期：所有步骤有效期的交集；任一步未知则整体未知。
+    #[serde(default, skip_serializing_if = "Validity::is_unknown")]
+    pub validity: Validity,
 }
+
+/// 带有效时间的路径见证；`PathWitness` 本身已携带 `validity`，此别名强调
+/// 「时间已进入见证」的语义。
+pub type TimedPathWitness = PathWitness;
 
 impl PathWitness {
     pub fn new(steps: Vec<PathStep>) -> Self {
@@ -113,10 +146,26 @@ impl PathWitness {
             .map(|step| step.confidence_bps)
             .min()
             .unwrap_or(10_000);
+        let validity = steps
+            .iter()
+            .fold(Validity::Unbounded, |accumulated, step| {
+                accumulated.intersection(step.validity)
+            });
         Self {
             steps,
             confidence_bps,
+            validity,
         }
+    }
+
+    /// 路径有效期时间未知（至少一步没写时间）。
+    pub fn time_uncertain(&self) -> bool {
+        self.validity.is_unknown()
+    }
+
+    /// 路径是否存在共同满足的时间点（有效期交集非空）。
+    pub fn has_common_time(&self) -> bool {
+        self.validity.is_satisfiable() && !self.validity.is_unknown()
     }
 
     pub fn start(&self) -> Option<&str> {
@@ -200,6 +249,14 @@ pub enum BlockReason {
         node: String,
         expected: String,
     },
+    /// 时间不合一：步骤有效期与请求时间不相交（跨时间假多跳的阻断点）。
+    TemporalDisjoint {
+        from: String,
+        predicate: String,
+        to: String,
+        requested: String,
+        valid: String,
+    },
     ExpansionLimit,
 }
 
@@ -246,6 +303,16 @@ impl BlockReason {
             BlockReason::ExpectedTypeMismatch { node, expected } => {
                 format!("「{}」的类型与期望的「{}」不符", node, expected)
             }
+            BlockReason::TemporalDisjoint {
+                from,
+                predicate,
+                to,
+                requested,
+                valid,
+            } => format!(
+                "「{}」--{}-->「{}」的有效期（{}）与请求时间（{}）不相交，时间不合一",
+                from, predicate, to, valid, requested
+            ),
             BlockReason::ExpansionLimit => "达到扩展上限，路径枚举提前停止".to_string(),
         }
     }
@@ -280,6 +347,9 @@ pub struct PathBundle {
     pub expansions: usize,
     pub visited: usize,
     pub truncated: bool,
+    /// 本次枚举使用的时间约束（Any 时不序列化，保持旧输出形状）。
+    #[serde(default, skip_serializing_if = "TemporalConstraint::is_any")]
+    pub temporal: TemporalConstraint,
 }
 
 impl PathBundle {
@@ -336,6 +406,23 @@ impl PathBundle {
                     witness.confidence_bps as f64 / 100.0,
                     witness.render()
                 ));
+                if witness.validity.is_known() {
+                    output.push_str(&format!("；共同有效期 {}", witness.validity.render()));
+                }
+            }
+        }
+        if !self.temporal.is_any() {
+            output.push_str(&format!("\n  时间约束：{}", self.temporal.describe()));
+            let uncertain = self
+                .witnesses
+                .iter()
+                .filter(|witness| witness.time_uncertain())
+                .count();
+            if uncertain > 0 {
+                output.push_str(&format!(
+                    "；其中 {} 条路径含时间未知的边（按背景保留，结论需保留时间 caveat）",
+                    uncertain
+                ));
             }
         }
         for blocked in &self.blocked {
@@ -382,6 +469,10 @@ pub struct TraversalOptions {
     pub expected_end_types: BTreeSet<String>,
     pub min_confidence_bps: u16,
     pub include_inferred: bool,
+    /// 路径贯穿的时间约束：AsOf/During 时每一步都要通过时间合一检查。
+    pub temporal: TemporalConstraint,
+    /// 没写时间的步骤在时间约束下如何处理（默认严格）。
+    pub unknown_time: UnknownTimePolicy,
 }
 
 impl Default for TraversalOptions {
@@ -397,7 +488,25 @@ impl Default for TraversalOptions {
             expected_end_types: BTreeSet::new(),
             min_confidence_bps: 0,
             include_inferred: true,
+            temporal: TemporalConstraint::Any,
+            unknown_time: UnknownTimePolicy::Strict,
         }
+    }
+}
+
+impl TraversalOptions {
+    pub fn with_temporal(mut self, temporal: TemporalConstraint) -> Self {
+        self.temporal = temporal;
+        self
+    }
+
+    pub fn with_unknown_time_policy(mut self, policy: UnknownTimePolicy) -> Self {
+        self.unknown_time = policy;
+        self
+    }
+
+    fn temporal_allows(&self, validity: Validity) -> bool {
+        self.temporal.allows(validity, self.unknown_time)
     }
 }
 
@@ -435,6 +544,33 @@ impl TraversalGraph {
         source: EdgeSource,
     ) {
         self.add_edge_record(PathEdge::new(subject, predicate, object).with_source(source));
+    }
+
+    /// 加入一条带有效期的边（ISO 年或年-月-日字符串均可）。
+    pub fn add_timed_edge(
+        &mut self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        validity_text: &str,
+    ) {
+        let validity = crate::temporal::parse_validity(validity_text);
+        self.add_edge_record(
+            PathEdge::new(subject, predicate, object).with_validity(validity),
+        );
+    }
+
+    pub fn add_edge_with_years(
+        &mut self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        start_year: i32,
+        end_year: i32,
+    ) {
+        self.add_edge_record(
+            PathEdge::new(subject, predicate, object).with_years(start_year, end_year),
+        );
     }
 
     pub fn add_edge_record(&mut self, edge: PathEdge) {
@@ -506,6 +642,7 @@ impl TraversalGraph {
                 inverted: true,
                 source: edge.source,
                 confidence_bps: edge.confidence_bps,
+                validity: edge.validity,
             }
         } else {
             PathStep {
@@ -515,6 +652,7 @@ impl TraversalGraph {
                 inverted: false,
                 source: edge.source,
                 confidence_bps: edge.confidence_bps,
+                validity: edge.validity,
             }
         }
     }
@@ -575,6 +713,15 @@ impl TraversalGraph {
                 from: step.from.clone(),
                 predicate: step.predicate.clone(),
                 to: step.to.clone(),
+            });
+        }
+        if !options.temporal_allows(step.validity) {
+            return Some(BlockReason::TemporalDisjoint {
+                from: step.from.clone(),
+                predicate: step.predicate.clone(),
+                to: step.to.clone(),
+                requested: options.temporal.describe(),
+                valid: step.validity.render(),
             });
         }
         None
@@ -735,6 +882,7 @@ impl TraversalGraph {
     ) -> PathBundle {
         let mut bundle = PathBundle {
             start: start.to_string(),
+            temporal: options.temporal.clone(),
             ..PathBundle::default()
         };
         if !self.known_nodes.contains(start) {
@@ -798,8 +946,11 @@ impl TraversalGraph {
                     let mut path = prefix.clone();
                     path.push(candidate);
                     if terminal {
-                        let end = path.last().map(|step| step.to.as_str()).unwrap_or_default();
-                        if !self.end_type_allowed(end, options) {
+                        let end = path
+                            .last()
+                            .map(|step| step.to.clone())
+                            .unwrap_or_default();
+                        if !self.end_type_allowed(&end, options) {
                             let expected = options
                                 .expected_end_types
                                 .iter()
@@ -810,13 +961,27 @@ impl TraversalGraph {
                                 &mut bundle,
                                 &path[..path.len().saturating_sub(1)],
                                 BlockReason::ExpectedTypeMismatch {
-                                    node: end.to_string(),
+                                    node: end.clone(),
                                     expected,
                                 },
                             );
                             continue;
                         }
                         let witness = PathWitness::new(path);
+                        if !options.temporal_allows(witness.validity) {
+                            self.push_blocked(
+                                &mut bundle,
+                                &witness.steps[..witness.steps.len().saturating_sub(1)],
+                                BlockReason::TemporalDisjoint {
+                                    from: witness.steps[0].from.clone(),
+                                    predicate: witness.steps[0].predicate.clone(),
+                                    to: end.clone(),
+                                    requested: options.temporal.describe(),
+                                    valid: witness.validity.render(),
+                                },
+                            );
+                            continue;
+                        }
                         if witness_keys.insert(witness.key()) {
                             bundle.witnesses.push(witness);
                             if bundle.witnesses.len() >= options.max_paths.max(1) {
@@ -864,6 +1029,7 @@ impl TraversalGraph {
         let mut bundle = PathBundle {
             start: start.to_string(),
             goal: Some(goal.to_string()),
+            temporal: options.temporal.clone(),
             ..PathBundle::default()
         };
         if start == goal {
@@ -975,6 +1141,24 @@ impl TraversalGraph {
                         for back in back_paths {
                             if let Some(witness) = join_bidirectional(start, goal, &partial.steps, back)
                             {
+                                if !options.temporal_allows(witness.validity) {
+                                    self.push_blocked(
+                                        &mut bundle,
+                                        &partial.steps,
+                                        BlockReason::TemporalDisjoint {
+                                            from: start.to_string(),
+                                            predicate: witness
+                                                .steps
+                                                .last()
+                                                .map(|step| step.predicate.clone())
+                                                .unwrap_or_default(),
+                                            to: goal.to_string(),
+                                            requested: options.temporal.describe(),
+                                            valid: witness.validity.render(),
+                                        },
+                                    );
+                                    continue;
+                                }
                                 if witness_keys.insert(witness.key()) {
                                     bundle.witnesses.push(witness);
                                     if bundle.witnesses.len() >= options.max_paths.max(1) {
@@ -1045,6 +1229,24 @@ impl TraversalGraph {
                             if let Some(witness) =
                                 join_bidirectional(start, goal, forward, &partial.steps)
                             {
+                                if !options.temporal_allows(witness.validity) {
+                                    self.push_blocked(
+                                        &mut bundle,
+                                        forward,
+                                        BlockReason::TemporalDisjoint {
+                                            from: start.to_string(),
+                                            predicate: witness
+                                                .steps
+                                                .last()
+                                                .map(|step| step.predicate.clone())
+                                                .unwrap_or_default(),
+                                            to: goal.to_string(),
+                                            requested: options.temporal.describe(),
+                                            valid: witness.validity.render(),
+                                        },
+                                    );
+                                    continue;
+                                }
                                 if witness_keys.insert(witness.key()) {
                                     bundle.witnesses.push(witness);
                                     if bundle.witnesses.len() >= options.max_paths.max(1) {
@@ -1096,6 +1298,7 @@ impl TraversalGraph {
         let mut bundle = PathBundle {
             start: left.to_string(),
             goal: Some(right.to_string()),
+            temporal: options.temporal.clone(),
             ..PathBundle::default()
         };
         if !self.known_nodes.contains(left) {
@@ -1147,6 +1350,7 @@ impl TraversalGraph {
                 inverted: !step.inverted,
                 source: step.source,
                 confidence_bps: step.confidence_bps,
+                validity: step.validity,
             };
             reverse_right
                 .entry(step.to.clone())
@@ -1167,6 +1371,21 @@ impl TraversalGraph {
             visited_nodes.insert(left_step.to.clone());
             for reverse in reverses {
                 let witness = PathWitness::new(vec![left_step.clone(), reverse.clone()]);
+                if !options.temporal_allows(witness.validity) {
+                    self.push_blocked_at(
+                        &mut bundle,
+                        std::slice::from_ref(left_step),
+                        left_step.to.clone(),
+                        BlockReason::TemporalDisjoint {
+                            from: left_step.from.clone(),
+                            predicate: left_step.predicate.clone(),
+                            to: right.to_string(),
+                            requested: options.temporal.describe(),
+                            valid: witness.validity.render(),
+                        },
+                    );
+                    continue;
+                }
                 if witness_keys.insert(witness.key()) {
                     bundle.witnesses.push(witness);
                 }
@@ -1225,6 +1444,7 @@ fn join_bidirectional(
             inverted: !step.inverted,
             source: step.source,
             confidence_bps: step.confidence_bps,
+            validity: step.validity,
         });
     }
     let first = steps.first()?;
@@ -1578,5 +1798,110 @@ mod tests {
         let text = bundle.witnesses[0].render();
         assert!(text.contains("张三 --师傅--> 李四 --师傅--> 王五"));
         assert_eq!(text, bundle.witnesses[0].render());
+    }
+
+    #[test]
+    fn as_of_blocks_cross_time_false_multi_hop() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge_record(PathEdge::new("张三", "师傅", "李四").with_years(1990, 1999));
+        graph.add_edge_record(PathEdge::new("李四", "师傅", "王五").with_years(2000, 2010));
+        let bundle = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
+        );
+        assert!(bundle.witnesses.is_empty());
+        assert!(bundle.blocked.iter().any(|blocked| matches!(
+            blocked.reason,
+            BlockReason::TemporalDisjoint { .. }
+        )));
+    }
+
+    #[test]
+    fn as_of_keeps_path_whose_steps_share_the_year() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge_record(PathEdge::new("张三", "师傅", "李四").with_years(1990, 2000));
+        graph.add_edge_record(PathEdge::new("李四", "师傅", "王五").with_years(1995, 1999));
+        let bundle = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
+        );
+        assert_eq!(bundle.witnesses.len(), 1);
+        assert_eq!(bundle.witnesses[0].end(), Some("王五"));
+        assert_eq!(bundle.witnesses[0].validity, Validity::from_years(1995, 1999));
+        assert!(bundle.witnesses[0].has_common_time());
+    }
+
+    #[test]
+    fn unknown_time_is_strict_by_default_but_can_be_background() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge("张三", "师傅", "李四");
+        let strict = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
+        );
+        assert!(strict.witnesses.is_empty());
+        assert!(strict.blocked.iter().any(|blocked| matches!(
+            blocked.reason,
+            BlockReason::TemporalDisjoint { .. }
+        )));
+
+        let background = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions::default()
+                .with_temporal(TemporalConstraint::as_of(1995))
+                .with_unknown_time_policy(UnknownTimePolicy::Background),
+        );
+        assert_eq!(background.witnesses.len(), 1);
+        assert!(background.witnesses[0].time_uncertain());
+    }
+
+    #[test]
+    fn during_rejects_path_without_common_intersection() {
+        let mut graph = TraversalGraph::new();
+        graph.add_edge_record(PathEdge::new("甲", "认识", "乙").with_years(1990, 1995));
+        graph.add_edge_record(PathEdge::new("乙", "认识", "丙").with_years(1994, 2000));
+        graph.add_edge_record(PathEdge::new("丙", "认识", "丁").with_years(1999, 2005));
+        let bundle = graph.enumerate_chain(
+            "甲",
+            &[
+                PathPredicate::forward("认识"),
+                PathPredicate::forward("认识"),
+                PathPredicate::forward("认识"),
+            ],
+            &TraversalOptions::default().with_temporal(TemporalConstraint::during(
+                TimeSpan::from_bounds(
+                    Some(crate::temporal::TimePoint::year(1990)),
+                    Some(crate::temporal::TimePoint::year(2005)),
+                    crate::temporal::TimeGranularity::Year,
+                )
+                .unwrap(),
+            )),
+        );
+        assert!(
+            bundle.witnesses.is_empty(),
+            "每条边都与查询区间相交，但三步没有共同时间点：{:?}",
+            bundle.witnesses
+        );
+        assert!(bundle.blocked.iter().any(|blocked| matches!(
+            blocked.reason,
+            BlockReason::TemporalDisjoint { .. }
+        )));
+    }
+
+    #[test]
+    fn timed_edge_helper_parses_chinese_validity() {
+        let mut graph = TraversalGraph::new();
+        graph.add_timed_edge("张三", "师傅", "李四", "1990年到1999年");
+        let bundle = graph.enumerate_chain(
+            "张三",
+            &[PathPredicate::forward("师傅")],
+            &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
+        );
+        assert_eq!(bundle.witnesses.len(), 1);
+        assert!(bundle.witnesses[0].render().contains("有效期 1990年"));
     }
 }

@@ -92,6 +92,7 @@ pub mod relation_acquisition;
 pub mod relation_frame;
 pub mod path_memory;
 pub mod contextual_reference;
+pub mod temporal;
 
 #[cfg(test)]
 mod dialogue_conformance;
