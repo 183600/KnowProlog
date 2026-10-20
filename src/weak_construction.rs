@@ -549,9 +549,6 @@ impl WeakConstructor {
                 .then_with(|| left.predicate.cmp(&right.predicate))
                 .then_with(|| left.object.cmp(&right.object))
         });
-        if options.max_candidates > 0 {
-            list.truncate(options.max_candidates);
-        }
         let mut mint_proposals: Vec<MintProposal> = proposals.into_values().collect();
         mint_proposals.sort_by(|left, right| {
             left.surface
@@ -568,6 +565,9 @@ impl WeakConstructor {
                 pattern.active = false;
                 pattern.retired = true;
             }
+        }
+        if options.max_candidates > 0 {
+            list.truncate(options.max_candidates);
         }
         let mut generations = Vec::new();
         for candidate in &list {
