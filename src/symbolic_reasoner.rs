@@ -2716,16 +2716,57 @@ impl SymbolicReasoner {
         changed
     }
 
-    /// 把一条基事实从会话事实集中撤回（不触碰知识图谱；软逻辑/概率程序同步重建）
+    /// 判断基原子是否已由知识图谱独立支持（三元组、属性或类型）。
+    /// 会话事实可能与图谱事实同名；撤回会话副本时不能把图谱那一份一并删掉。
+    fn graph_supports_atom(&self, atom: &Atom) -> bool {
+        let [subject, object] = atom.terms.as_slice() else {
+            return false;
+        };
+        let (Term::Const(subject), Term::Const(object)) = (subject, object) else {
+            return false;
+        };
+        let subject: &str = subject;
+        let object: &str = object;
+        let predicate: &str = &atom.predicate;
+        if predicate == PROOF_HAS {
+            return self
+                .predictor
+                .triples()
+                .iter()
+                .any(|triple| triple.subject == subject && triple.predicate == object)
+                || self
+                    .attributes
+                    .iter()
+                    .any(|(entity, key, _)| entity == subject && key == object);
+        }
+        if predicate == PROOF_TYPE {
+            return self
+                .generator
+                .typed_entities()
+                .iter()
+                .any(|(entity, etype)| entity == subject && etype == object);
+        }
+        self.predictor.triples().iter().any(|triple| {
+            triple.subject == subject
+                && triple.predicate == predicate
+                && triple.object == object
+        }) || self.attributes.contains(&(
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        ))
+    }
+
+    /// 把一条基事实从会话事实集中撤回（不触碰知识图谱）
     fn retract_atom(&mut self, atom: &Atom) -> bool {
-        // 只撤回会话事实：归结引擎里同样载入知识图谱事实，直接 remove 会误删图谱知识
         if !self.session_facts.iter().any(|existing| existing == atom) {
             return false;
         }
         self.session_facts.retain(|existing| existing != atom);
-        // 归结引擎重建后图谱事实仍在、被撤回的会话事实消失
-        if self.config.enable_resolution {
-            self.rebuild_resolver();
+        // 图谱事实始终保留；仅当图谱不再支持该原子时才从归结引擎增量删除，
+        // 避免每次撤回都重建整库（同名的图谱事实与多条会话事实互不误删）。
+        if self.config.enable_resolution && !self.graph_supports_atom(atom) {
+            self.resolver.remove_fact_atom(atom);
         }
         // 软逻辑与概率程序同源：撤回后整体重建（概率程序随软逻辑一起重放）
         if self.config.enable_soft_logic {
@@ -9714,6 +9755,40 @@ mod tests {
         assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
         let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
         assert!(proof.contains("未得证"), "撤回后不应再得证：{}", proof);
+    }
+
+    #[test]
+    fn retract_session_fact_is_incremental_and_keeps_graph_duplicates() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let perf = reasoner.perf_ledger();
+        let rebuilds = perf.count("rebuild_resolver");
+
+        let message = reasoner.assert_nl_fact("钱七是孙八的师傅");
+        assert!(message.contains("已记住"), "实际：{}", message);
+        assert_eq!(
+            perf.count("rebuild_resolver"),
+            rebuilds,
+            "采纳会话事实不应重建归结引擎"
+        );
+
+        // 与图谱同名的会话副本：撤回后图谱事实必须仍然可证
+        let duplicate = reasoner.assert_nl_fact("张三是李四的师傅");
+        assert!(duplicate.contains("已记住"), "实际：{}", duplicate);
+        let forgotten = reasoner.retract_nl_fact("张三是李四的师傅");
+        assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
+        let proof = reasoner.resolution_proof_report("李四的师傅是张三");
+        assert!(proof.contains("得证"), "同名图谱事实不得被误删：{}", proof);
+
+        let forgotten = reasoner.retract_nl_fact("钱七是孙八的师傅");
+        assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("未得证"), "撤回后不应再得证：{}", proof);
+        assert_eq!(
+            perf.count("rebuild_resolver"),
+            rebuilds,
+            "撤回会话事实应增量删除而不是整库重建"
+        );
     }
 
     #[test]
