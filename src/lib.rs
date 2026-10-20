@@ -3384,6 +3384,43 @@ impl OxigraphManager {
         Ok(graph_ledger::parse_rule_graph(quads.into_iter()))
     }
 
+    /// 同步模式账本：清空 `kg:graphs/patterns` 后全量重写（幂等；不推进知识版本）。
+    ///
+    /// 模式即数据：稳定 id + IR（JSON）+ 来源 + 路由/优先级，
+    /// 加上模式集指纹戳。返回写入的模式条数。
+    pub async fn sync_pattern_ledger(
+        &self,
+        entries: &[pattern_ir::PatternEntry],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = pattern_ir::pattern_quads(entries)?;
+        let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::PATTERNS_GRAPH)?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("pattern_ledger_sync");
+        Ok(entries.len())
+    }
+
+    /// 读取模式账本（按条目 id 升序，确定性；不触碰任何缓存）。
+    pub async fn load_pattern_ledger(
+        &self,
+    ) -> Result<Vec<pattern_ir::PatternEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::PATTERNS_GRAPH)?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("pattern_ledger_load");
+        Ok(pattern_ir::parse_pattern_graph(quads.into_iter()))
+    }
+
     /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
     ///
     /// 每条派生事实带规则来源、前提、推导轮次、置信度与物化戳
@@ -4359,6 +4396,54 @@ mod cache_tests {
         let cleared = manager.load_rule_ledger().await.unwrap();
         assert!(cleared.synced);
         assert!(cleared.entries.is_empty(), "空集同步必须清空账本");
+    }
+
+    /// 模式账本经存储往返一致；重复同步幂等；空集同步清空账本；不推进知识版本。
+    #[tokio::test]
+    async fn pattern_ledger_store_roundtrip_and_idempotent_resync() {
+        let (manager, _dir) = temp_manager().await;
+        manager.save_knowledge(items("张三", "李四")).await.unwrap();
+        let revision = manager.revision();
+
+        let config: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = crate::pattern_ir::PatternLibrary::from_config(&config);
+        assert!(!library.is_empty());
+        // 落图读回按 subject（= id）排序，与库内配置序无关 → 比较前统一按 id 排
+        let by_id = |entries: &[crate::pattern_ir::PatternEntry]| {
+            let mut v = entries.to_vec();
+            v.sort_by(|a, b| a.id().cmp(&b.id()));
+            v
+        };
+
+        assert_eq!(
+            manager
+                .sync_pattern_ledger(library.entries())
+                .await
+                .unwrap(),
+            library.len()
+        );
+        let loaded = manager.load_pattern_ledger().await.unwrap();
+        assert_eq!(
+            by_id(&loaded),
+            by_id(library.entries()),
+            "模式账本往返应逐条一致（与顺序无关）"
+        );
+        assert_eq!(manager.revision(), revision, "模式账本写入不推进知识版本");
+
+        manager
+            .sync_pattern_ledger(library.entries())
+            .await
+            .unwrap();
+        assert_eq!(
+            by_id(&manager.load_pattern_ledger().await.unwrap()),
+            by_id(library.entries()),
+            "同内容重复同步应幂等"
+        );
+
+        manager.sync_pattern_ledger(&[]).await.unwrap();
+        let cleared = manager.load_pattern_ledger().await.unwrap();
+        assert!(cleared.is_empty(), "空集同步必须清空模式账本");
     }
 
     /// 派生账本经存储往返一致，物化戳（版本 + 指纹）可审计；重物化全量替换。
