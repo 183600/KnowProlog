@@ -61,6 +61,7 @@ use know_prolog::{
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
     },
+    path_memory::{EdgeSource, TraversalGraph, TraversalOptions},
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
@@ -221,6 +222,24 @@ enum Commands {
         #[arg(long, default_value_t = 8)]
         samples: usize,
         /// Print the full report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enumerate provenance-preserving paths between two entities (read-only)
+    Paths {
+        /// Start entity (exact name as stored)
+        #[arg(long)]
+        from: String,
+        /// Goal entity (exact name as stored)
+        #[arg(long)]
+        to: String,
+        /// Maximum number of hops
+        #[arg(long, default_value_t = 4)]
+        max_hops: usize,
+        /// Maximum number of witness paths to keep
+        #[arg(long, default_value_t = 8)]
+        max_paths: usize,
+        /// Print the path bundle as JSON
         #[arg(long)]
         json: bool,
     },
@@ -720,6 +739,63 @@ async fn main() {
                     println!("  证据：{}", sample.frame.evidence.sentence);
                     println!("  {}", narrate_frame(&sample.frame, &sample.report));
                 }
+            }
+        }
+        Some(Commands::Paths {
+            from,
+            to,
+            max_hops,
+            max_paths,
+            json,
+        }) => {
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut graph = TraversalGraph::new();
+            for fact in facts.iter() {
+                match fact {
+                    PrologFact::Relation {
+                        from: subject,
+                        rel_type,
+                        to: object,
+                    } => graph.add_edge(subject.as_str(), rel_type.as_str(), object.as_str()),
+                    PrologFact::Entity {
+                        name,
+                        entity_type,
+                        properties,
+                    } => {
+                        graph.add_entity_type(name.as_str(), entity_type.as_str());
+                        for (key, value) in properties {
+                            graph.add_edge_with_source(
+                                name.as_str(),
+                                key.as_str(),
+                                value.as_str(),
+                                EdgeSource::Attribute,
+                            );
+                        }
+                    }
+                }
+            }
+            let options = TraversalOptions {
+                max_depth: max_hops.clamp(1, 8),
+                max_paths: max_paths.clamp(1, 64),
+                ..TraversalOptions::default()
+            };
+            let bundle = graph.enumerate_between(&from, &to, &options);
+            if json {
+                match serde_json::to_string_pretty(&bundle) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("路径结果序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", bundle.render_text());
             }
         }
         Some(Commands::Laws {

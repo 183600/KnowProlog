@@ -30,6 +30,9 @@ use crate::predicate_registry::PredicateRegistry;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAligner, TermKind};
+use crate::path_memory::{
+    EdgeSource, PathPredicate, TraversalGraph, TraversalOptions,
+};
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
@@ -4182,6 +4185,265 @@ impl SymbolicReasoner {
         output
     }
 
+    fn traversal_graph(&self) -> TraversalGraph {
+        let mut graph = TraversalGraph::new();
+        for triple in self.predictor.triples() {
+            graph.add_edge(&triple.subject, &triple.predicate, &triple.object);
+        }
+        for (entity, attribute, value) in &self.attributes {
+            graph.add_edge_with_source(
+                entity,
+                attribute,
+                value,
+                EdgeSource::Attribute,
+            );
+        }
+        for atom in &self.session_facts {
+            if atom.terms.len() == 2 {
+                if let (Term::Const(subject), Term::Const(object)) =
+                    (&atom.terms[0], &atom.terms[1])
+                {
+                    graph.add_edge_with_source(
+                        subject,
+                        &atom.predicate,
+                        object,
+                        EdgeSource::Session,
+                    );
+                }
+            }
+        }
+        for (entity, entity_type) in self.generator.typed_entities() {
+            graph.add_entity_type(&entity, &entity_type);
+        }
+        graph
+    }
+
+    fn path_entity(&self, raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if self.is_known_entity(trimmed) || self.predictor.participates(trimmed) {
+            trimmed.to_string()
+        } else {
+            self.aligner.canonical_form(trimmed)
+        }
+    }
+
+    fn path_options(&self, max_depth: usize) -> TraversalOptions {
+        TraversalOptions {
+            max_depth: max_depth.clamp(1, 6),
+            max_paths: 12,
+            ..TraversalOptions::default()
+        }
+    }
+
+    fn answer_chain_with_paths(
+        &self,
+        entity: &str,
+        predicates: &[ChainPredicate],
+        question: &str,
+    ) -> Option<String> {
+        if predicates.len() < 2 {
+            return None;
+        }
+        let graph = self.traversal_graph();
+        let chain: Vec<PathPredicate> = predicates
+            .iter()
+            .map(|predicate| PathPredicate {
+                predicate: predicate.slot.clone(),
+                inverted: predicate.inverted,
+            })
+            .collect();
+        let options = self.path_options(predicates.len());
+        let bundle = graph.enumerate_chain(entity, &chain, &options);
+        if bundle.witnesses.is_empty() {
+            return None;
+        }
+
+        let expectations = Self::expected_type_keywords(question);
+        let mut groups: Vec<(String, Vec<usize>)> = bundle.answer_groups().into_iter().collect();
+        groups.sort_by(|(left, _), (right, _)| {
+            let left_rank = if expectations.is_empty()
+                || self.value_matches_expectation(left, &expectations)
+            {
+                0
+            } else {
+                1
+            };
+            let right_rank = if expectations.is_empty()
+                || self.value_matches_expectation(right, &expectations)
+            {
+                0
+            } else {
+                1
+            };
+            left_rank.cmp(&right_rank).then(left.cmp(right))
+        });
+
+        let chain_text = format!(
+            "{} 的 {}",
+            entity,
+            predicates
+                .iter()
+                .map(|predicate| predicate.surface.as_str())
+                .collect::<Vec<_>>()
+                .join(" 的 ")
+        );
+        let mut output = format!(
+            "根据知识图谱（多跳路径，共 {} 条）：\n",
+            bundle.witnesses.len()
+        );
+        let mut path_index = 0usize;
+        for (value, indices) in &groups {
+            output.push_str(&format!("  结论：{} 是 {}。\n", chain_text, value));
+            for index in indices {
+                if let Some(witness) = bundle.witnesses.get(*index) {
+                    path_index += 1;
+                    output.push_str(&format!(
+                        "    路径 {}（{} 跳）：{}\n",
+                        path_index,
+                        witness.hop_count(),
+                        witness.render()
+                    ));
+                }
+            }
+        }
+        if !bundle.blocked.is_empty() {
+            let blockers: Vec<String> = bundle
+                .blocked
+                .iter()
+                .take(3)
+                .map(|blocked| blocked.render())
+                .collect();
+            output.push_str(&format!("  阻断：{}\n", blockers.join("；")));
+        }
+        let law_notes: Vec<String> = predicates
+            .iter()
+            .filter_map(|predicate| self.laws.active_transitive(&predicate.slot))
+            .map(|law| law.id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|id| self.laws.explain(&id))
+            .collect();
+        if !law_notes.is_empty() {
+            output.push_str(&format!("  推理依据：{}\n", law_notes.join("；")));
+        }
+        if bundle.truncated {
+            output.push_str("  说明：路径结果已按上限截断。\n");
+        }
+        Some(output.trim_end().to_string())
+    }
+
+    fn answer_path_between(
+        &self,
+        start: &str,
+        goal: &str,
+        max_hops: usize,
+    ) -> Option<String> {
+        let start = self.path_entity(start);
+        let goal = self.path_entity(goal);
+        if start.is_empty() || goal.is_empty() {
+            return None;
+        }
+        let graph = self.traversal_graph();
+        let bundle = graph.enumerate_between(&start, &goal, &self.path_options(max_hops));
+        Some(bundle.render_text())
+    }
+
+    fn answer_common_neighbor(&self, left: &str, right: &str) -> Option<String> {
+        let left = self.path_entity(left);
+        let right = self.path_entity(right);
+        if left.is_empty() || right.is_empty() {
+            return None;
+        }
+        let graph = self.traversal_graph();
+        let bundle = graph.common_neighbors(&left, &right, &self.path_options(2));
+        if bundle.witnesses.is_empty() {
+            return Some(bundle.render_text());
+        }
+        let mut groups: Vec<(String, Vec<usize>)> =
+            bundle.intermediary_groups().into_iter().collect();
+        groups.sort_by(|(left, left_paths), (right, right_paths)| {
+            right_paths
+                .len()
+                .cmp(&left_paths.len())
+                .then(left.cmp(right))
+        });
+        let mut output = format!("共同邻居（{} 和 {}）：\n", left, right);
+        for (hub, indices) in groups {
+            output.push_str(&format!("  {}（{} 条路径）\n", hub, indices.len()));
+            for index in indices {
+                if let Some(witness) = bundle.witnesses.get(index) {
+                    output.push_str(&format!("    {}\n", witness.render()));
+                }
+            }
+        }
+        if bundle.truncated {
+            output.push_str("  说明：结果已按上限截断。\n");
+        }
+        Some(output.trim_end().to_string())
+    }
+
+    fn answer_intermediary(
+        &self,
+        start: &str,
+        goal: &str,
+        max_hops: usize,
+    ) -> Option<String> {
+        let start = self.path_entity(start);
+        let goal = self.path_entity(goal);
+        if start.is_empty() || goal.is_empty() {
+            return None;
+        }
+        let graph = self.traversal_graph();
+        let bundle = graph.enumerate_between(&start, &goal, &self.path_options(max_hops));
+        if bundle.witnesses.is_empty() {
+            return Some(bundle.render_text());
+        }
+        let mut groups: Vec<(String, Vec<usize>)> =
+            bundle.intermediary_groups().into_iter().collect();
+        groups.sort_by(|(left, left_paths), (right, right_paths)| {
+            right_paths
+                .len()
+                .cmp(&left_paths.len())
+                .then(left.cmp(right))
+        });
+        let mut output = format!("从「{}」到「{}」的路径：\n", start, goal);
+        if groups.is_empty() {
+            output.push_str("  直接相连，不需要中间人。\n");
+        } else {
+            for (hub, indices) in groups {
+                output.push_str(&format!(
+                    "  中间人：{}（{} 条路径）\n",
+                    hub,
+                    indices.len()
+                ));
+                for index in indices {
+                    if let Some(witness) = bundle.witnesses.get(index) {
+                        output.push_str(&format!("    {}\n", witness.render()));
+                    }
+                }
+            }
+        }
+        output.push_str(&format!(
+            "  路径枚举：{} 条，扩展 {} 次，访问 {} 个节点。\n",
+            bundle.witnesses.len(),
+            bundle.expansions,
+            bundle.visited
+        ));
+        if !bundle.blocked.is_empty() {
+            let blockers: Vec<String> = bundle
+                .blocked
+                .iter()
+                .take(3)
+                .map(|blocked| blocked.render())
+                .collect();
+            output.push_str(&format!("  阻断：{}\n", blockers.join("；")));
+        }
+        Some(output.trim_end().to_string())
+    }
+
     fn answer_planned(&self, question: &str) -> Option<String> {
         let plan = self.planner.parse(question)?;
         match plan {
@@ -4203,6 +4465,13 @@ impl SymbolicReasoner {
                                 &decision,
                             ));
                         }
+                    }
+                }
+                if predicates.len() >= 2 {
+                    if let Some(answer) =
+                        self.answer_chain_with_paths(&entity, &predicates, question)
+                    {
+                        return Some(answer);
                     }
                 }
                 let chain_result = if self.is_transitive_chain(&predicates) {
@@ -4256,6 +4525,19 @@ impl SymbolicReasoner {
             QueryPlan::FindSubject { object, predicate } => {
                 self.answer_find_subject(&object, &predicate)
             }
+            QueryPlan::PathBetween {
+                start,
+                goal,
+                max_hops,
+            } => self.answer_path_between(&start, &goal, max_hops),
+            QueryPlan::CommonNeighbor { left, right } => {
+                self.answer_common_neighbor(&left, &right)
+            }
+            QueryPlan::Intermediary {
+                start,
+                goal,
+                max_hops,
+            } => self.answer_intermediary(&start, &goal, max_hops),
             QueryPlan::Similar { entity } => self.answer_similar(&entity),
             QueryPlan::Analogy { a, b, c } => self.answer_analogy(&a, &b, &c),
         }
@@ -7479,6 +7761,92 @@ mod tests {
             .expect("多跳问题应被逻辑计划执行");
         assert!(answer.contains("王五"));
         assert!(answer.contains("多跳"));
+    }
+
+    #[test]
+    fn test_planned_multi_hop_answer_keeps_path_identity() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer("张三的师傅的师傅是谁")
+            .expect("多跳问句应有路径答案");
+        assert!(answer.contains("赵六"), "{}", answer);
+        assert!(answer.contains("多跳"), "{}", answer);
+        assert!(answer.contains("共 2 条"), "{}", answer);
+        assert!(answer.contains("张三 --师傅--> 李四"), "{}", answer);
+        assert!(answer.contains("张三 --师傅--> 王五"), "{}", answer);
+    }
+
+    #[test]
+    fn test_planned_path_between_and_common_neighbor() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "认识".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "认识".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "认识".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "赵六".to_string(),
+                rel_type: "认识".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "认识".to_string(),
+                to: "王五".to_string(),
+            },
+        ]);
+        let between = reasoner
+            .answer("张三和王五之间是什么关系")
+            .expect("路径问句应返回见证路径");
+        assert!(between.contains("李四") && between.contains("赵六"), "{}", between);
+        assert!(between.contains("路径"), "{}", between);
+
+        let common = reasoner
+            .answer("张三和赵六共同认识谁")
+            .expect("共同邻居问句应返回中间实体");
+        assert!(common.contains("王五"), "{}", common);
+
+        let intermediary = reasoner
+            .answer("张三通过谁认识王五")
+            .expect("中间人问句应返回中间实体");
+        assert!(
+            intermediary.contains("李四") || intermediary.contains("赵六"),
+            "{}",
+            intermediary
+        );
     }
 
     #[test]

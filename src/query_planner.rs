@@ -20,6 +20,20 @@ pub enum QueryPlan {
     FindObject { segments: Vec<String> },
     // 反向查找主体：谁的 师傅 是 李四
     FindSubject { object: String, predicate: String },
+    // 两点之间的路径：张三和王五之间是什么关系
+    PathBetween {
+        start: String,
+        goal: String,
+        max_hops: usize,
+    },
+    // 共同邻居：张三和李四共同认识谁
+    CommonNeighbor { left: String, right: String },
+    // 路径上的中间人：张三通过谁认识王五
+    Intermediary {
+        start: String,
+        goal: String,
+        max_hops: usize,
+    },
     // 三值校验：主语链最后一个词是谓词，如 [张三, 师傅] + object=李四
     CheckTriple { subject_segments: Vec<String>, object: String },
     // 计数：李四 有几个 师傅
@@ -36,6 +50,7 @@ pub enum QueryPlan {
 pub struct QueryPlanner {
     max_question_chars: usize,
     max_chain: usize,
+    max_path_hops: usize,
 }
 
 impl Default for QueryPlanner {
@@ -49,6 +64,7 @@ impl QueryPlanner {
         Self {
             max_question_chars: 80,
             max_chain: 6,
+            max_path_hops: 4,
         }
     }
 
@@ -56,6 +72,11 @@ impl QueryPlanner {
         let raw = Self::clean(question)?;
         if raw.chars().count() > self.max_question_chars {
             return None;
+        }
+
+        let path_question = Self::strip_particles(&raw);
+        if let Some(plan) = self.parse_path_question(&path_question) {
+            return Some(plan);
         }
 
         // 存在句依赖句尾语气词（"有…吗"），必须在去语气词之前判断
@@ -96,6 +117,9 @@ impl QueryPlanner {
         match plan {
             QueryPlan::FindObject { .. } => "FindObject",
             QueryPlan::FindSubject { .. } => "FindSubject",
+            QueryPlan::PathBetween { .. } => "PathBetween",
+            QueryPlan::CommonNeighbor { .. } => "CommonNeighbor",
+            QueryPlan::Intermediary { .. } => "Intermediary",
             QueryPlan::CheckTriple { .. } => "CheckTriple",
             QueryPlan::Count { .. } => "Count",
             QueryPlan::Exist { .. } => "Exist",
@@ -112,6 +136,22 @@ impl QueryPlanner {
             QueryPlan::FindSubject { object, predicate } => {
                 format!("反查主体：谁的 {} 是 {}", predicate, object)
             }
+            QueryPlan::PathBetween {
+                start,
+                goal,
+                max_hops,
+            } => format!("路径枚举：{} → {}（最多 {} 跳）", start, goal, max_hops),
+            QueryPlan::CommonNeighbor { left, right } => {
+                format!("共同邻居：{} 和 {} 共同指向的实体", left, right)
+            }
+            QueryPlan::Intermediary {
+                start,
+                goal,
+                max_hops,
+            } => format!(
+                "中间人：{} → ? → {}（最多 {} 跳）",
+                start, goal, max_hops
+            ),
             QueryPlan::CheckTriple {
                 subject_segments,
                 object,
@@ -276,6 +316,242 @@ impl QueryPlanner {
             object: object.to_string(),
             predicate: predicate.to_string(),
         })
+    }
+
+    fn clean_name(text: &str) -> String {
+        text.trim()
+            .trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    ' ' | '的' | '是' | '，' | ',' | '。' | '?' | '？' | '！' | '!' | '、'
+                )
+            })
+            .trim()
+            .to_string()
+    }
+
+    fn valid_path_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.chars().count() <= 40
+            && !name.contains('的')
+            && !Self::is_question_word(name)
+            && !["怎么", "如何", "怎样", "关系", "路径", "路线", "中间人", "连接"]
+                .iter()
+                .any(|word| name.contains(word))
+    }
+
+    fn split_pair(text: &str) -> Option<(String, String)> {
+        for connector in ['和', '跟', '与'] {
+            if let Some((left, right)) = text.split_once(connector) {
+                let left = Self::clean_name(left);
+                let right = Self::clean_name(right);
+                if Self::valid_path_name(&left) && Self::valid_path_name(&right) {
+                    return Some((left, right));
+                }
+            }
+        }
+        None
+    }
+
+    fn cut_at_marker(text: &str, markers: &[&str]) -> String {
+        let mut earliest: Option<usize> = None;
+        for marker in markers {
+            if let Some(position) = text.find(marker) {
+                if earliest.is_none_or(|current| position < current) {
+                    earliest = Some(position);
+                }
+            }
+        }
+        let cut = earliest.unwrap_or(text.len());
+        Self::clean_name(&text[..cut])
+    }
+
+    fn strip_relation_prefix(text: &str) -> String {
+        let mut value = text.trim().to_string();
+        for _ in 0..3 {
+            let mut changed = false;
+            for prefix in [
+                "认识", "结识", "找到", "联系到", "联系", "见到", "是", "和", "与", "跟",
+            ] {
+                if let Some(rest) = value.strip_prefix(prefix) {
+                    value = rest.trim().to_string();
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for suffix in ["联系", "认识", "相连", "连接", "吗", "呢"] {
+            if let Some(rest) = value.strip_suffix(suffix) {
+                value = rest.trim().to_string();
+            }
+        }
+        value
+    }
+
+    fn parse_path_question(&self, q: &str) -> Option<QueryPlan> {
+        if let Some(plan) = self.parse_common_neighbor(q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_intermediary(q) {
+            return Some(plan);
+        }
+        self.parse_path_between(q)
+    }
+
+    fn parse_common_neighbor(&self, q: &str) -> Option<QueryPlan> {
+        const MARKERS: [&str; 7] = [
+            "共同认识",
+            "共同好友",
+            "共同的朋友",
+            "共同朋友",
+            "共同关注",
+            "都认识",
+            "同时认识",
+        ];
+        for marker in MARKERS {
+            let Some(position) = q.find(marker) else {
+                continue;
+            };
+            let before = Self::clean_name(&q[..position]);
+            let after = Self::clean_name(&q[position + marker.len()..]);
+            if let Some((left, right)) = Self::split_pair(&before) {
+                return Some(QueryPlan::CommonNeighbor { left, right });
+            }
+            if let Some((left, right)) = Self::split_pair(&after) {
+                return Some(QueryPlan::CommonNeighbor { left, right });
+            }
+        }
+        None
+    }
+
+    fn parse_intermediary(&self, q: &str) -> Option<QueryPlan> {
+        if let Some(position) = q.find("通过谁") {
+            let start = Self::clean_name(&q[..position]);
+            let goal = Self::strip_relation_prefix(&q[position + "通过谁".len()..]);
+            if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                return Some(QueryPlan::Intermediary {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        if let Some(rest) = q.strip_prefix("谁把") {
+            for marker in ["连接起来", "连起来", "联系起来", "连接", "联系"] {
+                if let Some((pair, _)) = rest.split_once(marker) {
+                    if let Some((start, goal)) = Self::split_pair(pair) {
+                        return Some(QueryPlan::Intermediary {
+                            start,
+                            goal,
+                            max_hops: self.max_path_hops,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(position) = q.find("中间人") {
+            let before = &q[..position];
+            let pair_text = before
+                .find("之间")
+                .map(|split| &before[..split])
+                .unwrap_or(before);
+            if let Some((start, goal)) = Self::split_pair(pair_text) {
+                return Some(QueryPlan::Intermediary {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_path_between(&self, q: &str) -> Option<QueryPlan> {
+        const MARKERS: [&str; 11] = [
+            "之间",
+            "什么关系",
+            "有什么关系",
+            "的关系",
+            "怎么",
+            "如何",
+            "怎样",
+            "路径",
+            "路线",
+            "连接起来",
+            "连起来",
+        ];
+        if !MARKERS.iter().any(|marker| q.contains(marker)) {
+            return None;
+        }
+        for connector in ['和', '跟', '与'] {
+            let Some((left, right)) = q.split_once(connector) else {
+                continue;
+            };
+            let start = Self::clean_name(left);
+            let goal = Self::cut_at_marker(right, &MARKERS);
+            if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                return Some(QueryPlan::PathBetween {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        for marker in ["怎么找到", "如何找到", "怎么认识", "如何认识", "怎么联系", "如何联系"] {
+            if let Some((start, rest)) = q.split_once(marker) {
+                let start = Self::clean_name(start);
+                let goal = Self::strip_relation_prefix(rest);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        for marker in ["怎么到", "如何到", "怎样到"] {
+            if let Some((start, rest)) = q.split_once(marker) {
+                let start = Self::clean_name(start);
+                let goal = Self::strip_relation_prefix(rest);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        if let Some(rest) = q.strip_prefix("从") {
+            if let Some((start, right)) = rest.split_once('到') {
+                let start = Self::clean_name(start);
+                let goal = Self::cut_at_marker(right, &MARKERS);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        if !q.contains("找到") && !q.contains("认识到") {
+            if let Some((start, right)) = q.split_once('到') {
+                let start = Self::clean_name(start);
+                let goal = Self::cut_at_marker(right, &MARKERS);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        None
     }
 
     fn parse_count(&self, q: &str) -> Option<QueryPlan> {
@@ -639,6 +915,105 @@ mod tests {
                 segments: vec!["李四".to_string(), "师祖".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn test_path_between_question() {
+        let plan = planner()
+            .parse("张三和王五之间是什么关系")
+            .expect("两点之间的问句应编译为路径计划");
+        assert_eq!(
+            plan,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "王五".to_string(),
+                max_hops: 4,
+            }
+        );
+        let plan = planner()
+            .parse("张三和李四什么关系")
+            .expect("省略是字的问句也应编译为路径计划");
+        assert_eq!(
+            plan,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "李四".to_string(),
+                max_hops: 4,
+            }
+        );
+        let plan = planner()
+            .parse("张三到王五怎么走")
+            .expect("到字问句应编译为路径计划");
+        assert_eq!(
+            plan,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "王五".to_string(),
+                max_hops: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_common_neighbor_question() {
+        let plan = planner()
+            .parse("张三和李四共同认识谁")
+            .expect("共同邻居问句应被识别");
+        assert_eq!(
+            plan,
+            QueryPlan::CommonNeighbor {
+                left: "张三".to_string(),
+                right: "李四".to_string(),
+            }
+        );
+        let plan = planner()
+            .parse("谁同时认识张三和李四")
+            .expect("问题词在前也应识别共同邻居");
+        assert_eq!(
+            plan,
+            QueryPlan::CommonNeighbor {
+                left: "张三".to_string(),
+                right: "李四".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_intermediary_question() {
+        let plan = planner()
+            .parse("张三通过谁认识王五")
+            .expect("通过谁问句应编译为中间人计划");
+        assert_eq!(
+            plan,
+            QueryPlan::Intermediary {
+                start: "张三".to_string(),
+                goal: "王五".to_string(),
+                max_hops: 4,
+            }
+        );
+        let plan = planner()
+            .parse("谁把张三和王五连接起来")
+            .expect("连接句应识别中间人");
+        assert_eq!(
+            plan,
+            QueryPlan::Intermediary {
+                start: "张三".to_string(),
+                goal: "王五".to_string(),
+                max_hops: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_path_questions_do_not_swallow_existing_plans() {
+        assert!(matches!(
+            planner().parse("李四有没有师傅"),
+            Some(QueryPlan::Exist { .. })
+        ));
+        assert!(matches!(
+            planner().parse("张三和李四是什么关系"),
+            Some(QueryPlan::PathBetween { .. })
+        ));
     }
 
     #[test]
