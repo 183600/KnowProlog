@@ -288,7 +288,11 @@ pub fn sanitize_namespace_id(raw: &str) -> String {
 
 /// 源图 IRI：`{前缀}{规范化 id}`。
 pub fn source_graph_iri(namespace: &str) -> String {
-    format!("{}{}", SOURCE_GRAPH_PREFIX, sanitize_namespace_id(namespace))
+    format!(
+        "{}{}",
+        SOURCE_GRAPH_PREFIX,
+        sanitize_namespace_id(namespace)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +372,11 @@ impl ScopedAssertion {
 
     /// 事实键：`(主语, 谓词, 宾语)`。
     pub fn key(&self) -> (&str, &str, &str) {
-        (self.subject.as_str(), self.predicate.as_str(), self.object.as_str())
+        (
+            self.subject.as_str(),
+            self.predicate.as_str(),
+            self.object.as_str(),
+        )
     }
 }
 
@@ -689,10 +697,7 @@ where
             continue; // 同一 id 的重复记录只计一次
         }
         if ns_map.contains_key(assertion.namespace.as_str()) {
-            groups
-                .entry(assertion.slot())
-                .or_default()
-                .push(assertion);
+            groups.entry(assertion.slot()).or_default().push(assertion);
         } else {
             stats.orphans += 1;
         }
@@ -723,11 +728,19 @@ where
                     .map(|assertion| assertion.namespace.as_str())
                     .collect();
                 let best = (*supporters[0]).clone();
-                let present = exists(&best.subject, &best.predicate, &best.object, best.object_kind);
+                let present = exists(
+                    &best.subject,
+                    &best.predicate,
+                    &best.object,
+                    best.object_kind,
+                );
                 ValueCluster {
                     object: object.to_string(),
                     object_kind: best.object_kind,
-                    supporters: supporters.iter().map(|assertion| (*assertion).clone()).collect(),
+                    supporters: supporters
+                        .iter()
+                        .map(|assertion| (*assertion).clone())
+                        .collect(),
                     best,
                     corroborated: distinct.len() >= 2,
                     present,
@@ -735,8 +748,7 @@ where
             })
             .collect();
         clusters.sort_by(|a, b| {
-            compare_assertions(&a.best, &b.best, &ns_map)
-                .then_with(|| a.object.cmp(&b.object))
+            compare_assertions(&a.best, &b.best, &ns_map).then_with(|| a.object.cmp(&b.object))
         });
 
         let functional = policy.is_functional(predicate);
@@ -1022,7 +1034,11 @@ fn class_quad(subject: &NamedNode, class: &str, graph: &GraphName) -> FusionResu
 }
 
 fn namespace_node(id: &str) -> FusionResult<NamedNode> {
-    named_node(&format!("{}namespace/{}", FUSION_NS, sanitize_namespace_id(id)))
+    named_node(&format!(
+        "{}namespace/{}",
+        FUSION_NS,
+        sanitize_namespace_id(id)
+    ))
 }
 
 fn assertion_node(id: &str) -> FusionResult<NamedNode> {
@@ -1057,9 +1073,24 @@ pub fn fusion_quads(ledger: &FusionLedger) -> FusionResult<Vec<Quad>> {
             &graph,
         )?);
         quads.push(literal_quad(&subject, P_LABEL, &record.label, &graph)?);
-        quads.push(literal_quad(&subject, P_KIND, record.kind.label_zh(), &graph)?);
-        quads.push(literal_quad(&subject, P_TRUST, record.trust.label_zh(), &graph)?);
-        quads.push(literal_quad(&subject, P_STATUS, record.status.label_zh(), &graph)?);
+        quads.push(literal_quad(
+            &subject,
+            P_KIND,
+            record.kind.label_zh(),
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_TRUST,
+            record.trust.label_zh(),
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_STATUS,
+            record.status.label_zh(),
+            &graph,
+        )?);
         quads.push(literal_quad(
             &subject,
             P_PRIORITY,
@@ -1082,7 +1113,12 @@ pub fn fusion_quads(ledger: &FusionLedger) -> FusionResult<Vec<Quad>> {
             &assertion.namespace,
             &graph,
         )?);
-        quads.push(literal_quad(&subject, P_SUBJECT, &assertion.subject, &graph)?);
+        quads.push(literal_quad(
+            &subject,
+            P_SUBJECT,
+            &assertion.subject,
+            &graph,
+        )?);
         quads.push(literal_quad(
             &subject,
             P_PREDICATE,
@@ -1125,7 +1161,12 @@ pub fn fusion_quads(ledger: &FusionLedger) -> FusionResult<Vec<Quad>> {
             &adjudication.rationale,
             &graph,
         )?);
-        quads.push(literal_quad(&subject, P_ORIGIN, &adjudication.origin, &graph)?);
+        quads.push(literal_quad(
+            &subject,
+            P_ORIGIN,
+            &adjudication.origin,
+            &graph,
+        )?);
     }
     for winner in &ledger.applied {
         let subject = applied_node(&winner.id)?;
@@ -1200,7 +1241,8 @@ pub fn parse_fusion_graph(quads: impl Iterator<Item = Quad>) -> FusionLedger {
         if quad.predicate.as_str() != RDF_TYPE {
             continue;
         }
-        if let (Subject::NamedNode(subject), Term::NamedNode(class)) = (&quad.subject, &quad.object) {
+        if let (Subject::NamedNode(subject), Term::NamedNode(class)) = (&quad.subject, &quad.object)
+        {
             classes.insert(subject.as_str().to_string(), class.as_str().to_string());
         }
     }
@@ -1328,18 +1370,8 @@ mod tests {
         assert!(TrustLevel::Curated.rank() > TrustLevel::Imported.rank());
         assert!(TrustLevel::Imported.rank() > TrustLevel::External.rank());
         assert!(TrustLevel::External.rank() > TrustLevel::Speculative.rank());
-        let high = NamespaceRecord::new(
-            "high",
-            "high",
-            NamespaceKind::Import,
-            TrustLevel::Curated,
-        );
-        let low = NamespaceRecord::new(
-            "low",
-            "low",
-            NamespaceKind::Import,
-            TrustLevel::External,
-        );
+        let high = NamespaceRecord::new("high", "high", NamespaceKind::Import, TrustLevel::Curated);
+        let low = NamespaceRecord::new("low", "low", NamespaceKind::Import, TrustLevel::External);
         assert!(high.precedence() < low.precedence(), "受管优先于外部");
     }
 
@@ -1350,17 +1382,13 @@ mod tests {
         assert_eq!(first.id, second.id);
         let other = literal("b", "小明", "年龄", "18");
         assert_ne!(first.id, other.id, "不同命名空间是不同断言");
-        let entity = ScopedAssertion::new(
-            "a",
-            "小明",
-            "年龄",
-            "18",
-            ObjectKind::Entity,
-            "test",
-        );
+        let entity = ScopedAssertion::new("a", "小明", "年龄", "18", ObjectKind::Entity, "test");
         assert_ne!(first.id, entity.id, "宾语种类参与身份");
         let adj = Adjudication::new("年龄", "a", "用户裁决", "user");
-        assert_eq!(adj.id, Adjudication::new("年龄", "a", "其他理由", "system").id);
+        assert_eq!(
+            adj.id,
+            Adjudication::new("年龄", "a", "其他理由", "system").id
+        );
         assert_ne!(adj.id, Adjudication::new("身高", "a", "", "").id);
     }
 
@@ -1461,7 +1489,10 @@ mod tests {
         let slot = &plan.slots[0];
         assert_eq!(slot.delta, FusionDelta::Conflict);
         assert_eq!(slot.accepted[0].object, "19", "裁决应覆盖信任排序");
-        assert_eq!(slot.adjudicated_by.as_deref(), Some(adjudication.id.as_str()));
+        assert_eq!(
+            slot.adjudicated_by.as_deref(),
+            Some(adjudication.id.as_str())
+        );
         assert_eq!(slot.quarantined[0].object, "18");
     }
 
@@ -1566,8 +1597,10 @@ mod tests {
         let assertion = literal("kb", "小明", "年龄", "18");
         ledger.set_applied(vec![AppliedWinner::from_assertion(&assertion)]);
         let quads = fusion_quads(&ledger).unwrap();
-        assert!(quads.iter().all(|quad| quad.graph_name
-            == GraphName::NamedNode(NamedNode::new(FUSION_GRAPH).unwrap())));
+        assert!(quads
+            .iter()
+            .all(|quad| quad.graph_name
+                == GraphName::NamedNode(NamedNode::new(FUSION_GRAPH).unwrap())));
         let parsed = parse_fusion_graph(quads.into_iter());
         assert!(parsed.synced);
         let mut expected = ledger.clone();
@@ -1586,7 +1619,14 @@ mod tests {
         let mut quads = fusion_quads(&ledger).unwrap();
         quads.extend(fusion_quads(&ledger).unwrap());
         let parsed = parse_fusion_graph(quads.into_iter());
-        assert_eq!(parsed.namespaces.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            parsed
+                .namespaces
+                .iter()
+                .map(|n| n.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
         assert_eq!(parsed.assertions.len(), 2);
     }
 

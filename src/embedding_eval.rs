@@ -142,9 +142,10 @@ pub fn deterministic_split(triples: &[EvalTriple], test_ratio_per_mille: u32) ->
             if indices.iter().any(|&index| assignments[index].1) {
                 continue;
             }
-            if let Some(&best) = indices.iter().min_by_key(|&&index| {
-                (assignments[index].2, assignments[index].0.clone())
-            }) {
+            if let Some(&best) = indices
+                .iter()
+                .min_by_key(|&&index| (assignments[index].2, assignments[index].0.clone()))
+            {
                 assignments[best].1 = true;
             }
         }
@@ -568,11 +569,7 @@ impl EvalReport {
             "度数", "查询", "—", "ppr", "ppmi", "holo", "rule", "fused"
         ));
         for (bucket, metrics) in &self.per_degree {
-            let queries = metrics
-                .values()
-                .next()
-                .map(|m| m.queries)
-                .unwrap_or(0);
+            let queries = metrics.values().next().map(|m| m.queries).unwrap_or(0);
             let mut row = format!("  {:<8} {:>5} {:>5}", bucket, queries, "");
             for channel in EvalChannel::ALL {
                 let value = metrics
@@ -787,8 +784,7 @@ pub fn evaluate_split(
 
         // 通道 4：Horn 规则挖掘（谓词敏感；同一客体取最高置信度）。
         let mut rule_scores = vec![i64::MIN; n];
-        for prediction in
-            predictor.predict_for_entity(&triple.subject, Some(&triple.predicate), n)
+        for prediction in predictor.predict_for_entity(&triple.subject, Some(&triple.predicate), n)
         {
             if prediction.triple.subject != triple.subject {
                 continue;
@@ -837,11 +833,26 @@ pub fn evaluate_split(
         }
 
         let ranks = [
-            (EvalChannel::Ppr, effective_rank(&ppr_ranking, object_index, non_excluded)),
-            (EvalChannel::Ppmi, effective_rank(&ppmi_ranking, object_index, non_excluded)),
-            (EvalChannel::Holo, effective_rank(&holo_ranking, object_index, non_excluded)),
-            (EvalChannel::Rule, effective_rank(&rule_ranking, object_index, non_excluded)),
-            (EvalChannel::Fused, effective_rank(&fused_ranking, object_index, non_excluded)),
+            (
+                EvalChannel::Ppr,
+                effective_rank(&ppr_ranking, object_index, non_excluded),
+            ),
+            (
+                EvalChannel::Ppmi,
+                effective_rank(&ppmi_ranking, object_index, non_excluded),
+            ),
+            (
+                EvalChannel::Holo,
+                effective_rank(&holo_ranking, object_index, non_excluded),
+            ),
+            (
+                EvalChannel::Rule,
+                effective_rank(&rule_ranking, object_index, non_excluded),
+            ),
+            (
+                EvalChannel::Fused,
+                effective_rank(&fused_ranking, object_index, non_excluded),
+            ),
         ];
         let predicate_entry = per_predicate.entry(triple.predicate.clone()).or_default();
         let degree = adjacency
@@ -855,19 +866,13 @@ pub fn evaluate_split(
                 .entry(channel.id())
                 .or_default()
                 .observe(rank);
-            degree_entry
-                .entry(channel.id())
-                .or_default()
-                .observe(rank);
+            degree_entry.entry(channel.id()).or_default().observe(rank);
         }
     }
 
     // ===== 类比评估（A:B::C:?）：已知对来自训练，待补对来自留出，过滤 (c,p,·) 已知真值 =====
-    let analogy_questions = generate_analogy_questions(
-        &split.train,
-        &split.test,
-        config.analogy_max_per_predicate,
-    );
+    let analogy_questions =
+        generate_analogy_questions(&split.train, &split.test, config.analogy_max_per_predicate);
     let mut analogy_acc: BTreeMap<&'static str, MetricAcc> = BTreeMap::new();
     {
         for question in &analogy_questions {
@@ -931,10 +936,11 @@ pub fn evaluate_split(
                 (ANALOGY_HOLO_ID, &holo_ranking),
                 (ANALOGY_FUSED_ID, &fused_ranking),
             ] {
-                analogy_acc
-                    .entry(id)
-                    .or_default()
-                    .observe(effective_rank(ranking, gold_index, non_excluded));
+                analogy_acc.entry(id).or_default().observe(effective_rank(
+                    ranking,
+                    gold_index,
+                    non_excluded,
+                ));
             }
         }
     }
@@ -946,7 +952,12 @@ pub fn evaluate_split(
     let channels = finalize_named(&overall, &EvalChannel::ALL.map(EvalChannel::id));
     let per_predicate = per_predicate
         .into_iter()
-        .map(|(predicate, map)| (predicate, finalize_named(&map, &EvalChannel::ALL.map(EvalChannel::id))))
+        .map(|(predicate, map)| {
+            (
+                predicate,
+                finalize_named(&map, &EvalChannel::ALL.map(EvalChannel::id)),
+            )
+        })
         .collect();
     let per_degree = per_degree
         .into_iter()
@@ -1167,9 +1178,21 @@ fn compare_metric_maps(
         let current_metrics = current.get(channel).cloned().unwrap_or_default();
         let pairs = [
             ("mrr", baseline_metrics.mrr, current_metrics.mrr),
-            ("hits1_rate", baseline_metrics.hits1_rate, current_metrics.hits1_rate),
-            ("hits3_rate", baseline_metrics.hits3_rate, current_metrics.hits3_rate),
-            ("hits10_rate", baseline_metrics.hits10_rate, current_metrics.hits10_rate),
+            (
+                "hits1_rate",
+                baseline_metrics.hits1_rate,
+                current_metrics.hits1_rate,
+            ),
+            (
+                "hits3_rate",
+                baseline_metrics.hits3_rate,
+                current_metrics.hits3_rate,
+            ),
+            (
+                "hits10_rate",
+                baseline_metrics.hits10_rate,
+                current_metrics.hits10_rate,
+            ),
         ];
         for (metric, baseline_value, current_value) in pairs {
             let delta = current_value - baseline_value;
@@ -1262,7 +1285,11 @@ mod tests {
         let split = deterministic_split(&triples, 1);
         // 谓词保底：即使桶不命中，每个谓词也至少有一条测试。
         for samples in split.predicate_samples.values() {
-            assert!(samples.test >= 1, "谓词保底失败: {:?}", split.predicate_samples);
+            assert!(
+                samples.test >= 1,
+                "谓词保底失败: {:?}",
+                split.predicate_samples
+            );
         }
         // 去重后 4 条，全部进测试也不会超过总数。
         assert_eq!(split.train.len() + split.test.len(), 4);
@@ -1352,7 +1379,12 @@ mod tests {
             let metrics = empty.channel_metrics(channel).unwrap();
             // 无证据候选统一记「并列最后一名」：命中为 0，MRR 只剩 1/候选数 的兜底。
             assert_eq!(metrics.hits10_rate, 0.0, "{:?} 不应有命中收益", channel);
-            assert!(metrics.mrr < 0.05, "{:?} 不应有排名收益: {}", channel, metrics.mrr);
+            assert!(
+                metrics.mrr < 0.05,
+                "{:?} 不应有排名收益: {}",
+                channel,
+                metrics.mrr
+            );
         }
         assert!(
             rich_ppr.mrr > empty.channel_metrics(EvalChannel::Ppr).unwrap().mrr,
@@ -1427,9 +1459,7 @@ mod tests {
         );
 
         let many: Vec<EvalTriple> = (0..4)
-            .map(|index| {
-                EvalTriple::new(&format!("t{index}"), "p", &format!("u{index}"))
-            })
+            .map(|index| EvalTriple::new(&format!("t{index}"), "p", &format!("u{index}")))
             .collect();
         assert_eq!(
             generate_analogy_questions(&train, &many, 2).len(),
@@ -1568,10 +1598,7 @@ mod tests {
         // 校准只统计 Holo 真正给出候选的查询，因此总数不超过查询数。
         assert!(total > 0, "应至少有一次 Holo 召回");
         assert!(total <= queries, "校准分桶数不能超过查询数");
-        assert!(report
-            .calibration
-            .iter()
-            .all(|bin| bin.hits <= bin.count));
+        assert!(report.calibration.iter().all(|bin| bin.hits <= bin.count));
     }
 
     #[test]

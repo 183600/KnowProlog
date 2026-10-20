@@ -12,98 +12,98 @@ use toml;
 use uuid::Uuid;
 
 // 使模块公开，以便 main.rs 和 tests 可以访问
-pub mod nlp;
-pub mod nlu;
-pub mod prolog_engine;
-pub mod ownthink_api;
-pub mod semantic_engine;
-pub mod similarity_calculator;
-pub mod advanced_nlu;
-pub mod entity_relation_extractor;
-pub mod local_semantic_adapter;
-pub mod question_analyzer;
-pub mod external_knowledge;
-pub mod external_ledger;
-pub mod ontology_alignment;
-pub mod link_prediction;
-pub mod semantic_embedding;
-pub mod query_planner;
-pub mod query_board;
-pub mod query_scenario;
-pub mod symbolic_reasoner;
-pub mod entity_linker;
-pub mod symbolic_generator;
-pub mod semantic_entailment;
-pub mod resolution_engine;
-pub mod dialogue_frame;
 pub mod abduction;
+pub mod advanced_nlu;
+pub mod artifact_audit;
 pub mod association_miner;
-pub mod graph_walk_embedding;
-pub mod markov_logic;
+pub mod bindings;
+pub mod cache;
+pub mod canonical;
 pub mod causal_reasoning;
 pub mod causal_tokenization;
-pub mod problog;
 pub mod chinese_reasoning_nlu;
-pub mod ontology_reasoning;
-pub mod default_logic;
-pub mod neuro_symbolic_contrast;
-pub mod discourse;
-pub mod dense_retrieval;
-pub mod formal_semantics;
-pub mod logic_program;
-pub mod dialogue_manager;
-pub mod holographic_memory;
-pub mod predicate_registry;
-pub mod law_book;
-pub mod planning;
-pub mod perf_ledger;
-pub mod startup_ledger;
-pub mod cache;
+pub mod chronicle;
 pub mod config_contract;
 pub mod context_image;
-pub mod canonical;
-pub mod plugin;
-pub mod artifact_audit;
-pub mod import_journal;
-pub mod grammar_extractor;
-pub mod chronicle;
-pub mod proof_journal;
+pub mod contextual_reference;
 pub mod conversation_theory;
-pub mod history_trust;
-pub mod view_render;
-pub mod embedding_eval;
-pub mod function_words;
-pub mod graph_ledger;
-pub mod knowledge_fusion;
+pub mod default_logic;
+pub mod dense_retrieval;
 pub mod dialogue_eval;
-pub mod serve_api;
-pub mod bindings;
-pub mod prompt_spec;
-pub mod type_system;
-pub mod quality;
+pub mod dialogue_frame;
 pub mod dialogue_fuzz;
+pub mod dialogue_manager;
+pub mod discourse;
+pub mod embedding_eval;
+pub mod entity_linker;
+pub mod entity_registry;
+pub mod entity_relation_extractor;
 pub mod epistemic;
 pub mod eval_recovery;
-pub mod recovery;
+pub mod external_knowledge;
+pub mod external_ledger;
+pub mod formal_semantics;
+pub mod function_words;
+pub mod grammar_extractor;
+pub mod graph_ledger;
+pub mod graph_walk_embedding;
+pub mod history_trust;
+pub mod holographic_memory;
 pub mod identity;
-pub mod entity_registry;
-pub mod shape_gate;
-pub mod relation_acquisition;
-pub mod relation_frame;
-pub mod weak_construction;
+pub mod import_journal;
+pub mod knowledge_fusion;
+pub mod law_book;
+pub mod lexical_trace;
+pub mod link_prediction;
+pub mod local_semantic_adapter;
+pub mod logic_program;
+pub mod markov_logic;
+pub mod neuro_symbolic_contrast;
+pub mod nlp;
+pub mod nlu;
+pub mod ontology_alignment;
+pub mod ontology_reasoning;
+pub mod ownthink_api;
 pub mod path_memory;
-pub mod contextual_reference;
 pub mod pattern_closure;
 pub mod pattern_ir;
-pub mod temporal;
-pub mod lexical_trace;
-pub mod trace_graph;
+pub mod perf_ledger;
+pub mod planning;
+pub mod plugin;
+pub mod predicate_registry;
+pub mod problog;
+pub mod prolog_engine;
+pub mod prompt_spec;
+pub mod proof_journal;
+pub mod quality;
+pub mod query_board;
+pub mod query_planner;
+pub mod query_scenario;
+pub mod question_analyzer;
+pub mod recovery;
+pub mod relation_acquisition;
+pub mod relation_frame;
 pub mod release;
+pub mod resolution_engine;
+pub mod semantic_embedding;
+pub mod semantic_engine;
+pub mod semantic_entailment;
+pub mod serve_api;
+pub mod shape_gate;
+pub mod similarity_calculator;
+pub mod startup_ledger;
+pub mod symbolic_generator;
+pub mod symbolic_reasoner;
+pub mod temporal;
+pub mod trace_graph;
+pub mod type_system;
+pub mod view_render;
+pub mod weak_construction;
 
 #[cfg(test)]
 mod dialogue_conformance;
 
-use nlp::{preprocess, normalize_words, PrologRule, pattern_from_strings, TaggedWord};
+use nlp::{normalize_words, pattern_from_strings, preprocess, PrologRule, TaggedWord};
 use prolog_engine::PrologFact;
 
 // RDF命名空间（与 identity::DEFAULT_BASE_NS 单一正本）
@@ -144,9 +144,12 @@ fn entity_type_labels(
     let subject = NamedNode::new(crate::identity::entity_uri(BASE_NS, name))?;
     let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
     let mut labels = BTreeSet::new();
-    for quad in
-        store.quads_for_pattern(Some(subject.as_ref().into()), Some(rdf_type.as_ref()), None, None)
-    {
+    for quad in store.quads_for_pattern(
+        Some(subject.as_ref().into()),
+        Some(rdf_type.as_ref()),
+        None,
+        None,
+    ) {
         if let Term::NamedNode(type_node) = quad?.object {
             if let Some(label) = type_node.as_str().strip_prefix(BASE_NS) {
                 labels.insert(label.to_string());
@@ -794,11 +797,11 @@ impl KnowledgeExtractor {
         let mut items = Vec::new();
         let tagged_words = nlp::merge_name_fragments(tagged_words);
         let tagged_words = tagged_words.as_slice();
-        
+
         for rule in &self.config.extraction_rules {
             items.extend(self.apply_extraction_rule(text, tagged_words, rule));
         }
-        
+
         if text.contains("，") || text.contains("；") || text.contains("。") {
             let parts: Vec<&str> = text.split(&['，', '；', '。'][..]).collect();
             for part in parts {
@@ -814,40 +817,51 @@ impl KnowledgeExtractor {
                 items.extend(self.extract(part, &normalized_part_tagged));
             }
         }
-        
+
         items
     }
 
-    fn apply_extraction_rule(&self, text: &str, tagged_words: &[TaggedWord], rule: &ExtractionRule) -> Vec<KnowledgeItem> {
+    fn apply_extraction_rule(
+        &self,
+        text: &str,
+        tagged_words: &[TaggedWord],
+        rule: &ExtractionRule,
+    ) -> Vec<KnowledgeItem> {
         let mut items = Vec::new();
-        
+
         for pattern in &rule.patterns {
             if let Some(item) = self.match_pattern(text, tagged_words, pattern, &rule.entity_type) {
                 items.push(item);
             }
         }
-        
+
         items
     }
 
-    fn match_pattern(&self, text: &str, tagged_words: &[TaggedWord], pattern: &PatternConfig, entity_type: &str) -> Option<KnowledgeItem> {
+    fn match_pattern(
+        &self,
+        text: &str,
+        tagged_words: &[TaggedWord],
+        pattern: &PatternConfig,
+        entity_type: &str,
+    ) -> Option<KnowledgeItem> {
         if !self.check_pos_pattern(tagged_words, &pattern.pos_pattern) {
             return None;
         }
-        
+
         // 检查关键词模式
         if let Some(keyword_patterns) = &pattern.keyword_patterns {
             if !self.check_keyword_patterns(text, keyword_patterns) {
                 return None;
             }
         }
-        
+
         let properties = self.extract_properties(tagged_words, &pattern.property_mappings);
-        
+
         if properties.is_empty() {
             return None;
         }
-        
+
         Some(KnowledgeItem::Entity {
             label: entity_type.to_string(),
             properties,
@@ -867,7 +881,7 @@ impl KnowledgeExtractor {
         if pos_pattern.len() > tagged_words.len() {
             return false;
         }
-        
+
         for i in 0..=(tagged_words.len() - pos_pattern.len()) {
             let mut matched = true;
             for (j, expected_pos) in pos_pattern.iter().enumerate() {
@@ -880,26 +894,30 @@ impl KnowledgeExtractor {
                 return true;
             }
         }
-        
+
         false
     }
 
-    fn extract_properties(&self, tagged_words: &[TaggedWord], mappings: &HashMap<String, String>) -> HashMap<String, String> {
+    fn extract_properties(
+        &self,
+        tagged_words: &[TaggedWord],
+        mappings: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
         let mut properties = HashMap::new();
-        
+
         for (prop_name, extraction_rule) in mappings {
             if let Some(value) = self.extract_property_value(tagged_words, extraction_rule) {
                 properties.insert(prop_name.clone(), value);
             }
         }
-        
+
         properties
     }
 
     fn extract_property_value(&self, tagged_words: &[TaggedWord], rule: &str) -> Option<String> {
         if rule.starts_with("pos:") {
             let pos_rule = rule.strip_prefix("pos:")?;
-            
+
             // 处理索引语法，如 pos:nr[0]
             if pos_rule.contains('[') && pos_rule.contains(']') {
                 let parts: Vec<&str> = pos_rule.split(['[', ']']).collect();
@@ -907,20 +925,20 @@ impl KnowledgeExtractor {
                     let pos = parts[0];
                     // 索引语法畸形时视为无效规则
                     let index: usize = parts[1].trim().parse().ok()?;
-                    
+
                     let mut matching_words = Vec::new();
                     for word in tagged_words {
                         if word.pos == pos {
                             matching_words.push(word.text.clone());
                         }
                     }
-                    
+
                     if index < matching_words.len() {
                         return Some(matching_words[index].clone());
                     }
                 }
             }
-            
+
             // 人名提取：相邻的 nr + 单字 unknown 已在预处理阶段合并
             // （见 nlp::merge_name_fragments），这里只取首个 nr 词，
             // 避免把「姚明身高226」这类句式里紧跟的未知属性词并进人名。
@@ -931,11 +949,12 @@ impl KnowledgeExtractor {
                     }
                 }
             }
-            
+
             // 处理通配符 *
             if pos_rule == "*" {
                 // 对于通配符，返回所有不是功能词的词的组合
-                let content_words: Vec<String> = tagged_words.iter()
+                let content_words: Vec<String> = tagged_words
+                    .iter()
                     .filter(|word| {
                         !matches!(word.pos.as_str(), "u" | "c" | "p")
                             && !matches!(word.text.as_str(), "的" | "是" | "有")
@@ -946,7 +965,7 @@ impl KnowledgeExtractor {
                     return Some(content_words.join(""));
                 }
             }
-            
+
             // 普通词性查找
             for word in tagged_words {
                 if word.pos == pos_rule {
@@ -961,7 +980,7 @@ impl KnowledgeExtractor {
                 }
             }
         }
-        
+
         None
     }
 }
@@ -1007,19 +1026,22 @@ impl OxigraphManager {
         let expanded_path = if store_path.starts_with("~/") {
             if let Some(home_dir) = std::env::var_os("HOME") {
                 let home_path = std::path::Path::new(&home_dir);
-                home_path.join(&store_path[2..]).to_string_lossy().to_string()
+                home_path
+                    .join(&store_path[2..])
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 store_path.to_string()
             }
         } else {
             store_path.to_string()
         };
-        
+
         // 如果目录不存在则创建
         if let Some(parent) = std::path::Path::new(&expanded_path).parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let store = Store::open(&expanded_path)?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
@@ -1084,7 +1106,8 @@ impl OxigraphManager {
                 if let Some(obj) = item.as_object() {
                     // 处理每个对象
                     let context = Self::extract_jsonld_context(obj);
-                    self.process_jsonld_object(store, obj, &context, stats).await?;
+                    self.process_jsonld_object(store, obj, &context, stats)
+                        .await?;
                 }
             }
         } else if let Some(obj) = jsonld.as_object() {
@@ -1095,15 +1118,18 @@ impl OxigraphManager {
                 if let Some(graph_array) = graph.as_array() {
                     for item in graph_array {
                         if let Some(inner) = item.as_object() {
-                            self.process_jsonld_object(store, inner, &context, stats).await?;
+                            self.process_jsonld_object(store, inner, &context, stats)
+                                .await?;
                         }
                     }
                 } else if let Some(inner) = graph.as_object() {
-                    self.process_jsonld_object(store, inner, &context, stats).await?;
+                    self.process_jsonld_object(store, inner, &context, stats)
+                        .await?;
                 }
             } else {
                 // 单个对象
-                self.process_jsonld_object(store, obj, &context, stats).await?;
+                self.process_jsonld_object(store, obj, &context, stats)
+                    .await?;
             }
         }
         Ok(())
@@ -1149,22 +1175,23 @@ impl OxigraphManager {
         } else {
             crate::identity::entity_uri(BASE_NS, &Uuid::new_v4().to_string())
         };
-        
+
         if subject_uri.is_empty() {
             return Ok(());
         }
         stats.entities += 1;
 
         let subject = NamedNode::new(&subject_uri)?;
-        
+
         // 处理类型信息
         if let Some(types) = obj.get("@type") {
             if let Some(type_array) = types.as_array() {
                 for type_val in type_array {
                     if let Some(type_uri) = type_val.as_str() {
                         let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
-                        let object_type = NamedNode::new(Self::expand_jsonld_term(type_uri, context))?;
-                        
+                        let object_type =
+                            NamedNode::new(Self::expand_jsonld_term(type_uri, context))?;
+
                         store.insert(&Quad::new(
                             subject.clone(),
                             rdf_type,
@@ -1176,7 +1203,7 @@ impl OxigraphManager {
             } else if let Some(type_uri) = types.as_str() {
                 let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
                 let object_type = NamedNode::new(Self::expand_jsonld_term(type_uri, context))?;
-                
+
                 store.insert(&Quad::new(
                     subject.clone(),
                     rdf_type,
@@ -1185,15 +1212,15 @@ impl OxigraphManager {
                 ))?;
             }
         }
-        
+
         // 处理属性
         for (key, value) in obj {
             if key.starts_with("@") {
                 continue; // 跳过 JSON-LD 关键字
             }
-            
+
             let predicate = NamedNode::new(Self::expand_jsonld_term(key, context))?;
-            
+
             if let Some(value_array) = value.as_array() {
                 for val in value_array {
                     self.process_property_value(store, &subject, &predicate, val, stats)?;
@@ -1202,7 +1229,7 @@ impl OxigraphManager {
                 self.process_property_value(store, &subject, &predicate, value, stats)?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -1262,7 +1289,7 @@ impl OxigraphManager {
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     };
-                    
+
                     // 处理带数据类型的值
                     let literal = if let Some(datatype) = obj.get("@type") {
                         if let Some(datatype_uri) = datatype.as_str() {
@@ -1280,7 +1307,7 @@ impl OxigraphManager {
                     } else {
                         Literal::new_simple_literal(&value_text)
                     };
-                    
+
                     store.insert(&Quad::new(
                         subject.clone(),
                         predicate.clone(),
@@ -1331,7 +1358,11 @@ impl OxigraphManager {
             _ => oxigraph::io::RdfFormat::from_extension(extension).ok_or_else(|| {
                 format!(
                     "无法从扩展名「{}」识别 RDF 格式（支持 ttl / nt / nq / trig / rdf / xml）",
-                    if extension.is_empty() { "（无）" } else { extension }
+                    if extension.is_empty() {
+                        "（无）"
+                    } else {
+                        extension
+                    }
                 )
                 .into()
             }),
@@ -1379,8 +1410,8 @@ impl OxigraphManager {
         query_text: &str,
     ) -> Result<QueryResult, Box<dyn std::error::Error + Send + Sync>> {
         self.perf.bump("sparql_query");
-        let query = Query::parse(query_text, None)
-            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+        let query = Query::parse(query_text, None).map_err(
+            |error| -> Box<dyn std::error::Error + Send + Sync> {
                 // sparql 语法错误的多行期望 token 列表很长：只保留首行并限长，
                 // 位置信息（行:列）已足够定位，终端不被刷屏。
                 let text = error.to_string();
@@ -1390,22 +1421,23 @@ impl OxigraphManager {
                     detail.push('…');
                 }
                 format!("SPARQL 语法错误：{}", detail).into()
-            })?;
+            },
+        )?;
         let store = self.store.lock().await;
-        let results = store
-            .query(query)
-            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("SPARQL 执行失败：{}", error).into()
-            })?;
+        let results =
+            store
+                .query(query)
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("SPARQL 执行失败：{}", error).into()
+                })?;
         let mut data: Vec<HashMap<String, Value>> = Vec::new();
         match results {
             QueryResults::Solutions(solutions) => {
                 for solution in solutions {
-                    let solution = solution.map_err(
-                        |error| -> Box<dyn std::error::Error + Send + Sync> {
+                    let solution =
+                        solution.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
                             format!("SPARQL 求解失败：{}", error).into()
-                        },
-                    )?;
+                        })?;
                     let mut row = HashMap::new();
                     for (variable, term) in solution.iter() {
                         row.insert(variable.as_str().to_string(), term_to_json(term));
@@ -1414,18 +1446,14 @@ impl OxigraphManager {
                 }
             }
             QueryResults::Boolean(value) => {
-                data.push(HashMap::from([(
-                    "boolean".to_string(),
-                    Value::Bool(value),
-                )]));
+                data.push(HashMap::from([("boolean".to_string(), Value::Bool(value))]));
             }
             QueryResults::Graph(triples) => {
                 for triple in triples {
-                    let triple = triple.map_err(
-                        |error| -> Box<dyn std::error::Error + Send + Sync> {
+                    let triple =
+                        triple.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
                             format!("SPARQL 图求解失败：{}", error).into()
-                        },
-                    )?;
+                        })?;
                     data.push(HashMap::from([
                         (
                             "subject".to_string(),
@@ -1435,10 +1463,7 @@ impl OxigraphManager {
                             "predicate".to_string(),
                             term_to_json(&Term::from(triple.predicate)),
                         ),
-                        (
-                            "object".to_string(),
-                            term_to_json(&triple.object),
-                        ),
+                        ("object".to_string(), term_to_json(&triple.object)),
                     ]));
                 }
             }
@@ -1506,7 +1531,10 @@ impl OxigraphManager {
         Ok(count)
     }
 
-    pub async fn save_knowledge(&self, items: Vec<KnowledgeItem>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn save_knowledge(
+        &self,
+        items: Vec<KnowledgeItem>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.save_knowledge_with_receipt(items).await.map(|_| ())
     }
 
@@ -1525,10 +1553,17 @@ impl OxigraphManager {
                     self.save_entity_with_receipt(&store, &label, &properties, &mut receipt)?;
                 }
                 KnowledgeItem::Relationship {
-                    from_id, to_id, rel_type, ..
+                    from_id,
+                    to_id,
+                    rel_type,
+                    ..
                 } => {
                     self.save_relationship_with_receipt(
-                        &store, &from_id, &to_id, &rel_type, &mut receipt,
+                        &store,
+                        &from_id,
+                        &to_id,
+                        &rel_type,
+                        &mut receipt,
                     )?;
                 }
             }
@@ -1559,17 +1594,24 @@ impl OxigraphManager {
         let entity_type_iri = format!("{}{}", BASE_NS, label);
         let entity_type = NamedNode::new(entity_type_iri.clone())?;
 
-        let type_quad = Quad::new(subject.clone(), rdf_type, entity_type, GraphName::DefaultGraph);
+        let type_quad = Quad::new(
+            subject.clone(),
+            rdf_type,
+            entity_type,
+            GraphName::DefaultGraph,
+        );
         if store.contains(&type_quad)? {
             receipt.duplicates += 1;
         } else {
             store.insert(&type_quad)?;
             receipt.added += 1;
-            receipt.actions.push(predicate_registry::ImportAction::Named {
-                subject: subject_iri.clone(),
-                predicate: format!("{}type", RDF_NS),
-                object: entity_type_iri,
-            });
+            receipt
+                .actions
+                .push(predicate_registry::ImportAction::Named {
+                    subject: subject_iri.clone(),
+                    predicate: format!("{}type", RDF_NS),
+                    object: entity_type_iri,
+                });
         }
 
         // 属性迭代顺序固定，回执与撤销动作可复现
@@ -1602,11 +1644,13 @@ impl OxigraphManager {
             } else {
                 store.insert(&quad)?;
                 receipt.added += 1;
-                receipt.actions.push(predicate_registry::ImportAction::Literal {
-                    subject: subject_iri.clone(),
-                    predicate: predicate_iri,
-                    value: value.clone(),
-                });
+                receipt
+                    .actions
+                    .push(predicate_registry::ImportAction::Literal {
+                        subject: subject_iri.clone(),
+                        predicate: predicate_iri,
+                        value: value.clone(),
+                    });
                 self.predicate_registry.write().observe(
                     &subject_name,
                     key,
@@ -1619,9 +1663,12 @@ impl OxigraphManager {
         if let Some(name) = name_literal {
             let mut types = BTreeSet::new();
             types.insert(label.to_string());
-            self.entity_registry
-                .write()
-                .observe_kb_entity(&subject_name, &types, &[name], "文本导入");
+            self.entity_registry.write().observe_kb_entity(
+                &subject_name,
+                &types,
+                &[name],
+                "文本导入",
+            );
         }
         Ok(())
     }
@@ -1757,11 +1804,13 @@ impl OxigraphManager {
         } else {
             store.insert(&quad)?;
             receipt.added += 1;
-            receipt.actions.push(predicate_registry::ImportAction::Named {
-                subject: subject_iri,
-                predicate: predicate_iri,
-                object: object_iri,
-            });
+            receipt
+                .actions
+                .push(predicate_registry::ImportAction::Named {
+                    subject: subject_iri,
+                    predicate: predicate_iri,
+                    object: object_iri,
+                });
             self.predicate_registry.write().observe(
                 subject_name,
                 &predicate_name,
@@ -1794,11 +1843,13 @@ impl OxigraphManager {
         }
         store.insert(&quad)?;
         receipt.added += 1;
-        receipt.actions.push(predicate_registry::ImportAction::Literal {
-            subject: subject_iri,
-            predicate: predicate_iri,
-            value: name.to_string(),
-        });
+        receipt
+            .actions
+            .push(predicate_registry::ImportAction::Literal {
+                subject: subject_iri,
+                predicate: predicate_iri,
+                value: name.to_string(),
+            });
         self.predicate_registry
             .write()
             .observe(name, "name", name, Some("文本导入"));
@@ -2139,7 +2190,12 @@ impl OxigraphManager {
         &self,
         predicate: &str,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let canonical = self.predicate_registry.read().resolve(predicate).canonical.clone();
+        let canonical = self
+            .predicate_registry
+            .read()
+            .resolve(predicate)
+            .canonical
+            .clone();
         let provisional = self
             .predicate_registry
             .read()
@@ -2220,7 +2276,10 @@ impl OxigraphManager {
 
     /// 确认一个别名（显式承诺：词义改写需要第二次签字）。
     pub fn confirm_entity_alias(&self, surface: &str, canonical: &str) -> bool {
-        let changed = self.entity_registry.write().confirm_alias(surface, canonical);
+        let changed = self
+            .entity_registry
+            .write()
+            .confirm_alias(surface, canonical);
         if changed {
             self.perf.bump("identity_alias_confirm");
         }
@@ -2229,7 +2288,10 @@ impl OxigraphManager {
 
     /// 拒绝一个别名提名（墓碑：不予自动提名，也不参与解析）。
     pub fn reject_entity_alias(&self, surface: &str, canonical: &str) -> bool {
-        let changed = self.entity_registry.write().reject_alias(surface, canonical);
+        let changed = self
+            .entity_registry
+            .write()
+            .reject_alias(surface, canonical);
         if changed {
             self.perf.bump("identity_alias_reject");
         }
@@ -2344,10 +2406,8 @@ impl OxigraphManager {
     pub async fn refresh_entity_registry(
         &self,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let mut observed: std::collections::BTreeMap<
-            String,
-            (BTreeSet<String>, BTreeSet<String>),
-        > = std::collections::BTreeMap::new();
+        let mut observed: std::collections::BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> =
+            std::collections::BTreeMap::new();
         {
             let store = self.store.lock().await;
             let rdf_type = NamedNode::new(format!("{}type", RDF_NS))?;
@@ -2393,10 +2453,8 @@ impl OxigraphManager {
 
     /// 从已加载的事实观测实体身份（与 `refresh_entity_registry` 等价，省一次全库扫描）。
     pub fn observe_entity_facts(&self, facts: &[PrologFact]) -> usize {
-        let mut by_name: std::collections::BTreeMap<
-            String,
-            (BTreeSet<String>, BTreeSet<String>),
-        > = std::collections::BTreeMap::new();
+        let mut by_name: std::collections::BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> =
+            std::collections::BTreeMap::new();
         for fact in facts {
             match fact {
                 PrologFact::Entity {
@@ -2446,7 +2504,11 @@ impl OxigraphManager {
         }
     }
 
-    pub async fn get_relevant_facts(&self, query_entities: &[String], max_hops: usize) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_relevant_facts(
+        &self,
+        query_entities: &[String],
+        max_hops: usize,
+    ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         if query_entities.is_empty() {
             // 使用整图快照缓存，仅保留实体事实
             let snapshot = self.load_graph_snapshot().await?;
@@ -2475,7 +2537,7 @@ impl OxigraphManager {
 
         let mut facts = Vec::new();
         let store = self.store.lock().await;
-        
+
         // 构建实体名称的匹配模式
         let mut combined_pattern = String::new();
         for (index, entity) in query_entities.iter().enumerate() {
@@ -2486,11 +2548,14 @@ impl OxigraphManager {
             combined_pattern.push_str(&regex::escape(entity));
             combined_pattern.push_str(".*");
         }
-        
+
         // 第一步：找到直接匹配的实体
-        let direct_matches = self.find_entities_by_pattern(&store, &combined_pattern).await?;
-        let mut relevant_entities: std::collections::HashSet<String> = direct_matches.into_iter().collect();
-        
+        let direct_matches = self
+            .find_entities_by_pattern(&store, &combined_pattern)
+            .await?;
+        let mut relevant_entities: std::collections::HashSet<String> =
+            direct_matches.into_iter().collect();
+
         // 第二步：扩展到相邻实体（基于指定跳数，仅扩展每轮新增的前沿节点）
         let mut frontier: Vec<String> = relevant_entities.iter().cloned().collect();
         for _hop in 0..max_hops {
@@ -2506,14 +2571,16 @@ impl OxigraphManager {
             }
             frontier = next_frontier;
         }
-        
+
         // 第三步：为相关实体构建Prolog事实
         facts.extend(self.build_entity_facts(&store, &relevant_entities).await?);
-        
+
         // 第四步：添加实体间的关系
-        let relations = self.find_relations_between(&store, &relevant_entities).await?;
+        let relations = self
+            .find_relations_between(&store, &relevant_entities)
+            .await?;
         facts.extend(relations);
-        
+
         let facts = Arc::new(facts);
         if self
             .relevant_cache
@@ -2526,7 +2593,9 @@ impl OxigraphManager {
         Ok(facts.as_ref().clone())
     }
 
-    pub async fn load_all_facts(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_all_facts(
+        &self,
+    ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         // 与 get_relevant_facts 一致：直接复用整图快照缓存中的实体事实
         let snapshot = self.load_graph_snapshot().await?;
         Ok(snapshot
@@ -2541,7 +2610,9 @@ impl OxigraphManager {
     /// 正确性依赖：所有写入口在持有存储锁期间、且在实际写入完成之后自增
     /// `revision`（version-after-write）；因此命中缓存意味着自缓存构建以来
     /// 没有任何成功写入，内容必然一致。
-    pub async fn load_graph_snapshot(&self) -> Result<Arc<Vec<PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_graph_snapshot(
+        &self,
+    ) -> Result<Arc<Vec<PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
         let revision = self.revision.load(Ordering::Acquire);
         {
             let cache = self.snapshot_cache.lock();
@@ -2612,11 +2683,14 @@ impl OxigraphManager {
                     object => {
                         let type_str = object.to_string();
                         if type_str.contains(BASE_NS) {
-                            type_str.replace(BASE_NS, "")
+                            type_str
+                                .replace(BASE_NS, "")
                                 .trim_matches(|c| c == '<' || c == '>')
                                 .to_lowercase()
                         } else {
-                            type_str.trim_matches(|c| c == '<' || c == '>').to_lowercase()
+                            type_str
+                                .trim_matches(|c| c == '<' || c == '>')
+                                .to_lowercase()
                         }
                     }
                 };
@@ -2654,7 +2728,10 @@ impl OxigraphManager {
                 None
             };
 
-            entity_props.entry(entity_name).or_default().insert(prop_name.clone(), value_str);
+            entity_props
+                .entry(entity_name)
+                .or_default()
+                .insert(prop_name.clone(), value_str);
 
             if matches!(&quad.object, Term::Literal(_)) {
                 // 字面量宾语只登记名称，不生成关系候选
@@ -2708,7 +2785,7 @@ impl OxigraphManager {
 
         (facts, relations)
     }
-    
+
     /// 直答入口：同一知识版本下同一（查询类型 + 实体）复用结果（含负缓存）。
     pub async fn get_direct_answer(&self, query_type: &str, entities: &[String]) -> Option<String> {
         let cache_key = format!("{}|{}", query_type, entities.join("\u{1}"));
@@ -2733,134 +2810,199 @@ impl OxigraphManager {
         answer
     }
 
-    async fn get_direct_answer_uncached(&self, query_type: &str, entities: &[String]) -> Option<String> {
+    async fn get_direct_answer_uncached(
+        &self,
+        query_type: &str,
+        entities: &[String],
+    ) -> Option<String> {
         let store = self.store.lock().await;
         self.perf.bump("direct_answer_query");
-        
+
         // 根据查询类型构造不同的SPARQL查询
         let query = match query_type {
             "capital_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?capital WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:capital ?capital .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "altitude_query" => {
-                let entity_name = if entities.is_empty() { return None; } else { &entities[0] };
-                format!(r#"
+                let entity_name = if entities.is_empty() {
+                    return None;
+                } else {
+                    &entities[0]
+                };
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?altitude WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:altitude ?altitude .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "chemical_formula_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?formula WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:formula ?formula .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "author_query" => {
-                let entity_name = if entities.is_empty() { return None; } else { &entities[0] };
-                format!(r#"
+                let entity_name = if entities.is_empty() {
+                    return None;
+                } else {
+                    &entities[0]
+                };
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?author WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:author ?author .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "champion_query" => {
-                let entity_name = if entities.is_empty() { return None; } else { &entities[0] };
-                format!(r#"
+                let entity_name = if entities.is_empty() {
+                    return None;
+                } else {
+                    &entities[0]
+                };
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?champion WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:champion ?champion .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "birth_year_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?year WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:birth_year ?year .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "concept_query" | "explanation_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?definition WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:definition ?definition .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "quantity_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?quantity WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:quantity ?quantity .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "planet_query" | "largest_query" => {
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?name WHERE {{
                         ?entity kg:type "planet" .
                         ?entity kg:size_rank "1" .
                         ?entity kg:name ?name .
                     }}
-                "#)
+                "#
+                )
             }
             "time_before_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?time WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:time ?time .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "principle_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?principle WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:principle ?principle .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "comparison_query" => {
-                if entities.len() < 2 { return None; }
+                if entities.len() < 2 {
+                    return None;
+                }
                 let entity1 = &entities[0];
                 let entity2 = &entities[1];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?difference WHERE {{
                         ?entity1 kg:name "{}" .
@@ -2869,24 +3011,35 @@ impl OxigraphManager {
                         ?comparison kg:entity2 ?entity2 .
                         ?comparison kg:difference ?difference .
                     }}
-                "#, sparql_literal(entity1), sparql_literal(entity2))
+                "#,
+                    sparql_literal(entity1),
+                    sparql_literal(entity2)
+                )
             }
             "philosophy_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?philosophy WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:philosophy ?philosophy .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "impact_query" => {
-                if entities.len() < 2 { return None; }
+                if entities.len() < 2 {
+                    return None;
+                }
                 let subject = &entities[0];
                 let target = &entities[1];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?impact WHERE {{
                         ?entity1 kg:name "{}" .
@@ -2894,33 +3047,46 @@ impl OxigraphManager {
                         ?entity1 kg:impact ?impact .
                         ?impact kg:target ?entity2 .
                     }}
-                "#, sparql_literal(subject), sparql_literal(target))
+                "#,
+                    sparql_literal(subject),
+                    sparql_literal(target)
+                )
             }
             "cause_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?cause WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:cause ?cause .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             "reason_query" => {
-                if entities.is_empty() { return None; }
+                if entities.is_empty() {
+                    return None;
+                }
                 let entity_name = &entities[0];
-                format!(r#"
+                format!(
+                    r#"
                     PREFIX kg: <http://example.org/kg/>
                     SELECT ?reason WHERE {{
                         ?entity kg:name "{}" .
                         ?entity kg:reason ?reason .
                     }}
-                "#, sparql_literal(entity_name))
+                "#,
+                    sparql_literal(entity_name)
+                )
             }
             _ => return None,
         };
-        
+
         // 执行SPARQL查询
         match Query::parse(&query, None) {
             Ok(query_obj) => {
@@ -2934,83 +3100,150 @@ impl OxigraphManager {
                                         let value_str = if let Term::Literal(lit) = value {
                                             lit.value().to_string()
                                         } else {
-                                            value.to_string()
+                                            value
+                                                .to_string()
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_string()
                                         };
-                                        
+
                                         // 根据查询类型格式化答案
                                         let answer = match query_type {
                                             "capital_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的首都是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "altitude_query" => {
-                                                let entity_name = if entities.is_empty() { "该地点" } else { &entities[0] };
-                                                format!("{}的海拔高度是{}米", entity_name, value_str)
-                                            },
+                                                let entity_name = if entities.is_empty() {
+                                                    "该地点"
+                                                } else {
+                                                    &entities[0]
+                                                };
+                                                format!(
+                                                    "{}的海拔高度是{}米",
+                                                    entity_name, value_str
+                                                )
+                                            }
                                             "chemical_formula_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
-                                                format!("{}的化学分子式是{}", entity_name, value_str)
-                                            },
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
+                                                format!(
+                                                    "{}的化学分子式是{}",
+                                                    entity_name, value_str
+                                                )
+                                            }
                                             "author_query" => {
-                                                let entity_name = if entities.is_empty() { "该作品" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    "该作品"
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的作者是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "champion_query" => {
-                                                let entity_name = if entities.is_empty() { "该比赛" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    "该比赛"
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的冠军是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "quantity_query" => {
-                                                let entity_name = if entities.is_empty() { "该项目" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    "该项目"
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}有{}个", entity_name, value_str)
-                                            },
+                                            }
                                             "birth_year_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}诞生于{}年", entity_name, value_str)
-                                            },
-                                            "planet_query" | "largest_query" => format!("最大的行星是{}", value_str),
+                                            }
+                                            "planet_query" | "largest_query" => {
+                                                format!("最大的行星是{}", value_str)
+                                            }
                                             "time_before_query" => {
-                                                let entity_name = if entities.is_empty() { "该事件" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    "该事件"
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}在{}年之前", entity_name, value_str)
-                                            },
+                                            }
                                             "concept_query" | "explanation_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "principle_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的工作原理是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "comparison_query" => {
                                                 if entities.len() >= 2 {
-                                                    format!("{}和{}的区别是{}", entities[0], entities[1], value_str)
+                                                    format!(
+                                                        "{}和{}的区别是{}",
+                                                        entities[0], entities[1], value_str
+                                                    )
                                                 } else {
                                                     format!("区别是{}", value_str)
                                                 }
-                                            },
+                                            }
                                             "philosophy_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的哲学思想是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "impact_query" => {
                                                 if entities.len() >= 2 {
-                                                    format!("{}对{}的影响是{}", entities[0], entities[1], value_str)
+                                                    format!(
+                                                        "{}对{}的影响是{}",
+                                                        entities[0], entities[1], value_str
+                                                    )
                                                 } else {
                                                     format!("影响是{}", value_str)
                                                 }
-                                            },
+                                            }
                                             "cause_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的原因是{}", entity_name, value_str)
-                                            },
+                                            }
                                             "reason_query" => {
-                                                let entity_name = if entities.is_empty() { "" } else { &entities[0] };
+                                                let entity_name = if entities.is_empty() {
+                                                    ""
+                                                } else {
+                                                    &entities[0]
+                                                };
                                                 format!("{}的原因是{}", entity_name, value_str)
-                                            },
+                                            }
                                             _ => value_str,
                                         };
-                                        
+
                                         return Some(answer);
                                     }
                                 }
@@ -3022,14 +3255,19 @@ impl OxigraphManager {
             }
             Err(_) => return None,
         }
-        
+
         None
     }
 
-    async fn find_entities_by_pattern(&self, store: &Store, pattern: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn find_entities_by_pattern(
+        &self,
+        store: &Store,
+        pattern: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let mut entities = Vec::new();
-        
-        let query = format!(r#"
+
+        let query = format!(
+            r#"
             PREFIX kg: <http://example.org/kg/>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             
@@ -3037,40 +3275,44 @@ impl OxigraphManager {
                 ?entity kg:name ?name .
                 FILTER(REGEX(?name, "{}", "i"))
             }}
-        "#, sparql_literal(pattern));
-        
+        "#,
+            sparql_literal(pattern)
+        );
+
         match Query::parse(&query, None) {
-            Ok(query_obj) => {
-                match store.query(query_obj) {
-                    Ok(results) => {
-                        if let QueryResults::Solutions(solutions) = results {
-                            for solution in solutions {
-                                if let Ok(solution) = solution {
-                                    if let Some(name) = solution.get("name") {
-                                        if let Term::Literal(lit) = name {
-                                            entities.push(lit.value().to_string());
-                                        }
+            Ok(query_obj) => match store.query(query_obj) {
+                Ok(results) => {
+                    if let QueryResults::Solutions(solutions) = results {
+                        for solution in solutions {
+                            if let Ok(solution) = solution {
+                                if let Some(name) = solution.get("name") {
+                                    if let Term::Literal(lit) = name {
+                                        entities.push(lit.value().to_string());
                                     }
                                 }
                             }
                         }
                     }
-                    Err(_) => {}
                 }
-            }
+                Err(_) => {}
+            },
             Err(_) => {}
         }
-        
-        Ok(entities)
-}
 
-    async fn find_neighbors(&self, store: &Store, entities: &[String]) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(entities)
+    }
+
+    async fn find_neighbors(
+        &self,
+        store: &Store,
+        entities: &[String],
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let mut neighbors = Vec::new();
-        
+
         if entities.is_empty() {
             return Ok(neighbors);
         }
-        
+
         let mut entity_filter = String::new();
         for (index, entity) in entities.iter().enumerate() {
             if index > 0 {
@@ -3080,8 +3322,9 @@ impl OxigraphManager {
             entity_filter.push_str(&sparql_literal(entity));
             entity_filter.push('"');
         }
-        
-        let query = format!(r#"
+
+        let query = format!(
+            r#"
             PREFIX kg: <http://example.org/kg/>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             
@@ -3102,40 +3345,44 @@ impl OxigraphManager {
                     FILTER(?neighbor_name NOT IN ({}))
                 }}
             }}
-        "#, entity_filter, entity_filter, entity_filter, entity_filter);
-        
+        "#,
+            entity_filter, entity_filter, entity_filter, entity_filter
+        );
+
         match Query::parse(&query, None) {
-            Ok(query_obj) => {
-                match store.query(query_obj) {
-                    Ok(results) => {
-                        if let QueryResults::Solutions(solutions) = results {
-                            for solution in solutions {
-                                if let Ok(solution) = solution {
-                                    if let Some(name) = solution.get("neighbor_name") {
-                                        if let Term::Literal(lit) = name {
-                                            neighbors.push(lit.value().to_string());
-                                        }
+            Ok(query_obj) => match store.query(query_obj) {
+                Ok(results) => {
+                    if let QueryResults::Solutions(solutions) = results {
+                        for solution in solutions {
+                            if let Ok(solution) = solution {
+                                if let Some(name) = solution.get("neighbor_name") {
+                                    if let Term::Literal(lit) = name {
+                                        neighbors.push(lit.value().to_string());
                                     }
                                 }
                             }
                         }
                     }
-                    Err(_) => {}
                 }
-            }
+                Err(_) => {}
+            },
             Err(_) => {}
         }
-        
+
         Ok(neighbors)
     }
 
-    async fn build_entity_facts(&self, store: &Store, entity_names: &HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn build_entity_facts(
+        &self,
+        store: &Store,
+        entity_names: &HashSet<String>,
+    ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         let mut facts = Vec::new();
-        
+
         if entity_names.is_empty() {
             return Ok(facts);
         }
-        
+
         let mut name_filter = String::new();
         for (index, entity) in entity_names.iter().enumerate() {
             if index > 0 {
@@ -3145,8 +3392,9 @@ impl OxigraphManager {
             name_filter.push_str(&sparql_literal(entity));
             name_filter.push('"');
         }
-        
-        let query = format!(r#"
+
+        let query = format!(
+            r#"
             PREFIX kg: <http://example.org/kg/>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             
@@ -3156,25 +3404,31 @@ impl OxigraphManager {
                 FILTER(?name IN ({}))
                 OPTIONAL {{ ?entity ?prop ?value . FILTER(?prop != rdf:type && ?prop != kg:name) }}
             }}
-        "#, name_filter);
-        
+        "#,
+            name_filter
+        );
+
         match Query::parse(&query, None) {
             Ok(query_obj) => {
                 match store.query(query_obj) {
                     Ok(results) => {
                         if let QueryResults::Solutions(solutions) = results {
-                            let mut entity_data: HashMap<String, (String, HashMap<String, String>)> = HashMap::new();
-                            
+                            let mut entity_data: HashMap<
+                                String,
+                                (String, HashMap<String, String>),
+                            > = HashMap::new();
+
                             for solution in solutions {
                                 if let Ok(solution) = solution {
                                     let entity_name = match solution.get("name") {
                                         Some(Term::Literal(lit)) => lit.value().to_string(),
                                         _ => continue,
                                     };
-                                    
-                                    let entry = entity_data.entry(entity_name)
+
+                                    let entry = entity_data
+                                        .entry(entity_name)
                                         .or_insert_with(|| (String::new(), HashMap::new()));
-                                    
+
                                     if let Some(type_term) = solution.get("type") {
                                         let type_str = match type_term {
                                             Term::NamedNode(node) => node.as_str().to_string(),
@@ -3182,7 +3436,8 @@ impl OxigraphManager {
                                         };
                                         // 后续类型覆盖先前类型
                                         entry.0 = if type_str.contains(BASE_NS) {
-                                            type_str.replace(BASE_NS, "")
+                                            type_str
+                                                .replace(BASE_NS, "")
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_lowercase()
                                         } else {
@@ -3191,33 +3446,39 @@ impl OxigraphManager {
                                                 .to_lowercase()
                                         };
                                     }
-                                    
-                                    if let (Some(prop), Some(value)) = (solution.get("prop"), solution.get("value")) {
+
+                                    if let (Some(prop), Some(value)) =
+                                        (solution.get("prop"), solution.get("value"))
+                                    {
                                         let prop_str = match prop {
                                             Term::NamedNode(node) => node.as_str().to_string(),
                                             other => other.to_string(),
                                         };
                                         let prop_name = if prop_str.contains(BASE_NS) {
-                                            prop_str.replace(BASE_NS, "")
+                                            prop_str
+                                                .replace(BASE_NS, "")
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_string()
                                         } else {
-                                            prop_str.trim_matches(|c| c == '<' || c == '>').to_string()
+                                            prop_str
+                                                .trim_matches(|c| c == '<' || c == '>')
+                                                .to_string()
                                         };
-                                        
+
                                         let value_str = if let Term::Literal(lit) = value {
                                             lit.value().to_string()
                                         } else {
-                                            value.to_string()
+                                            value
+                                                .to_string()
                                                 .trim_matches(|c| c == '<' || c == '>')
                                                 .to_string()
                                         };
-                                        
+
                                         entry.1.insert(prop_name, value_str);
                                     }
                                 }
                             }
-                            
+
                             // 按传入顺序输出，跳过没有类型信息的实体
                             for name in entity_names {
                                 if let Some((entity_type, properties)) = entity_data.remove(name) {
@@ -3237,11 +3498,13 @@ impl OxigraphManager {
             }
             Err(_) => {}
         }
-        
+
         Ok(facts)
     }
 
-    pub async fn load_all_relations(&self) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn load_all_relations(
+        &self,
+    ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         // 使用整图快照缓存
         let snapshot = self.load_graph_snapshot().await?;
         Ok(snapshot
@@ -3251,11 +3514,15 @@ impl OxigraphManager {
             .collect())
     }
 
-    async fn find_relations_between(&self, store: &Store, entities: &std::collections::HashSet<String>) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn find_relations_between(
+        &self,
+        store: &Store,
+        entities: &std::collections::HashSet<String>,
+    ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         if entities.len() < 2 {
             return Ok(Vec::new());
         }
-        
+
         let mut entity_filter = String::new();
         for (index, entity) in entities.iter().enumerate() {
             if index > 0 {
@@ -3265,8 +3532,9 @@ impl OxigraphManager {
             entity_filter.push_str(&sparql_literal(entity));
             entity_filter.push('"');
         }
-        
-        let query = format!(r#"
+
+        let query = format!(
+            r#"
             PREFIX kg: <http://example.org/kg/>
             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
             
@@ -3279,66 +3547,71 @@ impl OxigraphManager {
                 FILTER(?rel != rdf:type)
                 FILTER(?from != ?to)
             }}
-        "#, entity_filter, entity_filter);
+        "#,
+            entity_filter, entity_filter
+        );
 
         self.query_relations(store, &query).await
     }
 
-    async fn query_relations(&self, store: &Store, query: &str) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn query_relations(
+        &self,
+        store: &Store,
+        query: &str,
+    ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         let mut relations = Vec::new();
 
         match Query::parse(query, None) {
-            Ok(query_obj) => {
-                match store.query(query_obj) {
-                    Ok(results) => {
-                        if let QueryResults::Solutions(solutions) = results {
-                            for solution in solutions {
-                                if let Ok(solution) = solution {
-                                    if let (Some(from), Some(to), Some(rel)) = (
-                                        solution.get("from_name"),
-                                        solution.get("to_name"),
-                                        solution.get("rel")
-                                    ) {
-                                        let from_name = if let Term::Literal(lit) = from {
-                                            lit.value().to_string()
-                                        } else {
-                                            from.to_string()
-                                        };
-                                        
-                                        let to_name = if let Term::Literal(lit) = to {
-                                            lit.value().to_string()
-                                        } else {
-                                            to.to_string()
-                                        };
-                                        
-                                        let rel_str = match rel {
-                                            Term::NamedNode(node) => node.as_str().to_string(),
-                                            other => other.to_string(),
-                                        };
-                                        let rel_type = if rel_str.contains(BASE_NS) {
-                                            rel_str.replace(BASE_NS, "")
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_string()
-                                        } else {
-                                            rel_str.trim_matches(|c| c == '<' || c == '>').to_string()
-                                        };
-                                        
-                                        relations.push(PrologFact::Relation {
-                                            from: from_name,
-                                            rel_type,
-                                            to: to_name,
-                                        });
-                                    }
+            Ok(query_obj) => match store.query(query_obj) {
+                Ok(results) => {
+                    if let QueryResults::Solutions(solutions) = results {
+                        for solution in solutions {
+                            if let Ok(solution) = solution {
+                                if let (Some(from), Some(to), Some(rel)) = (
+                                    solution.get("from_name"),
+                                    solution.get("to_name"),
+                                    solution.get("rel"),
+                                ) {
+                                    let from_name = if let Term::Literal(lit) = from {
+                                        lit.value().to_string()
+                                    } else {
+                                        from.to_string()
+                                    };
+
+                                    let to_name = if let Term::Literal(lit) = to {
+                                        lit.value().to_string()
+                                    } else {
+                                        to.to_string()
+                                    };
+
+                                    let rel_str = match rel {
+                                        Term::NamedNode(node) => node.as_str().to_string(),
+                                        other => other.to_string(),
+                                    };
+                                    let rel_type = if rel_str.contains(BASE_NS) {
+                                        rel_str
+                                            .replace(BASE_NS, "")
+                                            .trim_matches(|c| c == '<' || c == '>')
+                                            .to_string()
+                                    } else {
+                                        rel_str.trim_matches(|c| c == '<' || c == '>').to_string()
+                                    };
+
+                                    relations.push(PrologFact::Relation {
+                                        from: from_name,
+                                        rel_type,
+                                        to: to_name,
+                                    });
                                 }
                             }
                         }
                     }
-                    Err(_) => {}
                 }
-            }
+                Err(_) => {}
+            },
             Err(_) => {}
         }
-        
+
         Ok(relations)
     }
 
@@ -3520,11 +3793,9 @@ impl OxigraphManager {
         source: &str,
     ) -> Option<knowledge_fusion::ScopedAssertion> {
         let subject = match &quad.subject {
-            Subject::NamedNode(node) => {
-                crate::identity::entity_local_name(BASE_NS, node.as_str())
-                    .or_else(|| crate::identity::local_name(BASE_NS, node.as_str()))
-                    .unwrap_or_else(|| node.as_str().to_string())
-            }
+            Subject::NamedNode(node) => crate::identity::entity_local_name(BASE_NS, node.as_str())
+                .or_else(|| crate::identity::local_name(BASE_NS, node.as_str()))
+                .unwrap_or_else(|| node.as_str().to_string()),
             _ => return None,
         };
         let predicate_iri = quad.predicate.as_str();
@@ -3549,7 +3820,12 @@ impl OxigraphManager {
             _ => return None,
         };
         Some(knowledge_fusion::ScopedAssertion::new(
-            namespace, &subject, &predicate, &object, object_kind, source,
+            namespace,
+            &subject,
+            &predicate,
+            &object,
+            object_kind,
+            source,
         ))
     }
 
@@ -3650,11 +3926,7 @@ impl OxigraphManager {
         let store = self.store.lock().await;
         let mut ledger = Self::fusion_ledger_from_store(&store)?;
         let id = knowledge_fusion::sanitize_namespace_id(namespace);
-        let Some(record) = ledger
-            .namespaces
-            .iter_mut()
-            .find(|record| record.id == id)
-        else {
+        let Some(record) = ledger.namespaces.iter_mut().find(|record| record.id == id) else {
             return Ok(false);
         };
         record.status = status;
@@ -3677,10 +3949,7 @@ impl OxigraphManager {
         store: &Store,
         policy: &knowledge_fusion::FusionPolicy,
     ) -> Result<
-        (
-            knowledge_fusion::FusionLedger,
-            knowledge_fusion::FusionPlan,
-        ),
+        (knowledge_fusion::FusionLedger, knowledge_fusion::FusionPlan),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let ledger = Self::fusion_ledger_from_store(store)?;
@@ -3689,17 +3958,15 @@ impl OxigraphManager {
             &ledger.assertions,
             &ledger.adjudications,
             policy,
-            |subject, predicate, object, object_kind| {
-                match Self::assertion_quad(
-                    subject,
-                    predicate,
-                    object,
-                    object_kind,
-                    GraphName::DefaultGraph,
-                ) {
-                    Ok(quad) => store.contains(&quad).unwrap_or(false),
-                    Err(_) => false,
-                }
+            |subject, predicate, object, object_kind| match Self::assertion_quad(
+                subject,
+                predicate,
+                object,
+                object_kind,
+                GraphName::DefaultGraph,
+            ) {
+                Ok(quad) => store.contains(&quad).unwrap_or(false),
+                Err(_) => false,
             },
         );
         Ok((ledger, plan))
@@ -3712,7 +3979,8 @@ impl OxigraphManager {
     pub async fn apply_fusion(
         &self,
         policy: &knowledge_fusion::FusionPolicy,
-    ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>>
+    {
         let store = self.store.lock().await;
         let (mut ledger, plan) = self.fusion_plan_locked(&store, policy)?;
         let winners = plan.materialize_keys();
@@ -3787,12 +4055,16 @@ pub fn extract_query_entities_from_tagged(
     let mut entities = Vec::new();
 
     for word in &tagged_words {
-        if word.pos == "nr" || word.pos == "ns" || word.pos == "nz" || 
-           word.pos == "n" || word.pos == "nt" {
+        if word.pos == "nr"
+            || word.pos == "ns"
+            || word.pos == "nz"
+            || word.pos == "n"
+            || word.pos == "nt"
+        {
             entities.push(word.text.clone());
         }
     }
-    
+
     if let Some(synonyms_config) = &config.synonyms {
         for entity in entities.iter_mut() {
             if let Some(normalized) = synonyms_config.mappings.get(entity) {
@@ -3800,7 +4072,7 @@ pub fn extract_query_entities_from_tagged(
             }
         }
     }
-    
+
     // 去重时保留首次出现顺序
     let mut seen = std::collections::HashSet::new();
     entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
@@ -3824,11 +4096,15 @@ impl ResponseFormatter {
         results[0].get(variable)
     }
 
-    pub fn format_prolog_results(&self, results: &[HashMap<String, String>], query_type: &str) -> String {
+    pub fn format_prolog_results(
+        &self,
+        results: &[HashMap<String, String>],
+        query_type: &str,
+    ) -> String {
         if results.is_empty() {
             return "根据当前知识库，无法回答您的问题。请先导入相关知识。".to_string();
         }
-        
+
         match query_type {
             "age_query" => {
                 if let Some(age) = results[0].get("Age") {
@@ -3838,11 +4114,12 @@ impl ResponseFormatter {
                 }
             }
             "relation_query" => {
-                let relations: Vec<&str> = results.iter()
+                let relations: Vec<&str> = results
+                    .iter()
                     .filter_map(|r| r.get("Relation"))
                     .map(String::as_str)
                     .collect();
-                
+
                 if relations.is_empty() {
                     "未找到关系信息".to_string()
                 } else {
@@ -3982,7 +4259,7 @@ impl ResponseFormatter {
                     "未找到行星信息".to_string()
                 }
             }
-            _ => "根据现有信息，找到了相关内容，但无法生成详细回答。".to_string()
+            _ => "根据现有信息，找到了相关内容，但无法生成详细回答。".to_string(),
         }
     }
 }
@@ -4002,22 +4279,24 @@ pub fn detect_input_mode(input: &str, keywords: &[String]) -> InputMode {
 }
 
 pub fn create_prolog_rules(config: &SystemConfig) -> Vec<PrologRule> {
-    config.prolog_rules.iter().map(|rule_cfg| {
-        PrologRule {
+    config
+        .prolog_rules
+        .iter()
+        .map(|rule_cfg| PrologRule {
             pattern: pattern_from_strings(rule_cfg.pattern.clone()),
             query_type: rule_cfg.query_type.clone(),
             priority: rule_cfg.priority,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 pub fn create_default_synonyms() -> HashMap<String, String> {
     let mut synonyms = HashMap::new();
-    
+
     // 基础同义词映射
     synonyms.insert("老婆".to_string(), "妻子".to_string());
     synonyms.insert("老公".to_string(), "丈夫".to_string());
-    
+
     synonyms
 }
 
@@ -4071,7 +4350,10 @@ mod cache_tests {
 
         let first = manager.get_direct_answer("capital_query", &entities).await;
         assert_eq!(first.as_deref(), Some("北京的首都是中国"));
-        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        assert!(manager
+            .get_direct_answer("author_query", &entities)
+            .await
+            .is_none());
         let queries = perf.count("direct_answer_query");
 
         // 两个键都在：来回询问均命中缓存
@@ -4079,7 +4361,10 @@ mod cache_tests {
             manager.get_direct_answer("capital_query", &entities).await,
             first
         );
-        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        assert!(manager
+            .get_direct_answer("author_query", &entities)
+            .await
+            .is_none());
         assert_eq!(perf.count("direct_answer_query"), queries);
         assert_eq!(perf.count("direct_answer_cache_hit"), 2);
     }
@@ -4238,7 +4523,11 @@ mod cache_tests {
         let _ = manager.load_graph_snapshot().await.unwrap();
         let scans = perf.count("graph_snapshot_scan");
         let _ = manager.load_graph_snapshot().await.unwrap();
-        assert_eq!(perf.count("graph_snapshot_scan"), scans, "同版本快照应命中缓存");
+        assert_eq!(
+            perf.count("graph_snapshot_scan"),
+            scans,
+            "同版本快照应命中缓存"
+        );
         assert!(perf.count("graph_snapshot_cache_hit") >= 1);
     }
 
@@ -4270,16 +4559,19 @@ mod cache_tests {
         assert_eq!(perf.count("direct_answer_cache_hit"), 1);
 
         // 负缓存：同版本问不存在的属性同样命中缓存
-        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        assert!(manager
+            .get_direct_answer("author_query", &entities)
+            .await
+            .is_none());
         let queries_with_negative = perf.count("direct_answer_query");
-        assert!(manager.get_direct_answer("author_query", &entities).await.is_none());
+        assert!(manager
+            .get_direct_answer("author_query", &entities)
+            .await
+            .is_none());
         assert_eq!(perf.count("direct_answer_query"), queries_with_negative);
 
         // 写入后版本变化 → 缓存失效并重查
-        manager
-            .save_knowledge(vec![person("李四")])
-            .await
-            .unwrap();
+        manager.save_knowledge(vec![person("李四")]).await.unwrap();
         let third = manager.get_direct_answer("capital_query", &entities).await;
         assert_eq!(third.as_deref(), Some("北京的首都是中国"));
         assert!(perf.count("direct_answer_query") > queries_with_negative);
@@ -4349,7 +4641,11 @@ mod cache_tests {
         let fingerprint = graph_ledger::rule_fingerprint(&[rule.clone()]);
         manager.sync_rule_ledger(&[rule]).await.unwrap();
         manager
-            .materialize_derived_ledger(&[ledger_derived_entry(revision, &fingerprint)], revision, &fingerprint)
+            .materialize_derived_ledger(
+                &[ledger_derived_entry(revision, &fingerprint)],
+                revision,
+                &fingerprint,
+            )
             .await
             .unwrap();
 
@@ -4517,7 +4813,10 @@ mod cache_tests {
             .unwrap_err()
             .to_string();
         assert!(unknown_error.contains("ttl"), "{}", unknown_error);
-        assert!(OxigraphManager::detect_rdf_format("kb").is_err(), "无扩展名应报错");
+        assert!(
+            OxigraphManager::detect_rdf_format("kb").is_err(),
+            "无扩展名应报错"
+        );
     }
 
     /// RDF 文件导入：新增三元组计数正确、重复导入幂等、数据进入知识快照。
@@ -4647,12 +4946,13 @@ mod cache_tests {
         );
 
         // 提名 → 拒绝：墓碑阻止解析；合并：改名后重定向
-        let nominations = manager.nominate_entity_aliases(&[crate::entity_registry::AliasCandidate {
-            surface: "小张".to_string(),
-            canonical: "张三".to_string(),
-            pattern: "简称".to_string(),
-            evidence: "测试".to_string(),
-        }]);
+        let nominations =
+            manager.nominate_entity_aliases(&[crate::entity_registry::AliasCandidate {
+                surface: "小张".to_string(),
+                canonical: "张三".to_string(),
+                pattern: "简称".to_string(),
+                evidence: "测试".to_string(),
+            }]);
         assert_eq!(
             nominations[0].kind,
             crate::entity_registry::NominationKind::Pending
@@ -4748,10 +5048,17 @@ mod cache_tests {
 
         assert!(result.success);
         assert_eq!(result.data.len(), 1);
-        assert_eq!(result.data[0].get("name"), Some(&Value::String("小明".to_string())));
+        assert_eq!(
+            result.data[0].get("name"),
+            Some(&Value::String("小明".to_string()))
+        );
         assert_eq!(result.data[0].get("age"), Some(&serde_json::json!(18)));
         let rendered = result.render_text();
-        assert!(rendered.contains("?age") || rendered.contains("age"), "{}", rendered);
+        assert!(
+            rendered.contains("?age") || rendered.contains("age"),
+            "{}",
+            rendered
+        );
         assert!(rendered.contains("小明"), "{}", rendered);
         assert!(rendered.contains("18"), "{}", rendered);
     }
@@ -4827,9 +5134,9 @@ mod cache_tests {
             .unwrap();
         assert_eq!(imported, exported, "往返导入应写回同等数量三元组");
         let facts = restored.load_all_facts().await.unwrap();
-        assert!(facts.iter().any(
-            |fact| matches!(fact, PrologFact::Entity { name, .. } if name == "张三")
-        ));
+        assert!(facts
+            .iter()
+            .any(|fact| matches!(fact, PrologFact::Entity { name, .. } if name == "张三")));
 
         let jsonld_path = dir.path().join("dump.jsonld");
         let jsonld_exported = manager
@@ -4935,13 +5242,27 @@ mod fusion_tests {
     }
 
     fn literal(namespace: &str, subject: &str, predicate: &str, object: &str) -> ScopedAssertion {
-        ScopedAssertion::new(namespace, subject, predicate, object, ObjectKind::Literal, "test")
+        ScopedAssertion::new(
+            namespace,
+            subject,
+            predicate,
+            object,
+            ObjectKind::Literal,
+            "test",
+        )
     }
 
     /// 一个带类型与名字的实体断言集合（实体事实的物化需要 kg:name + rdf:type）。
     fn person_assertions(namespace: &str, name: &str, age: &str) -> Vec<ScopedAssertion> {
         vec![
-            ScopedAssertion::new(namespace, name, "type", "Person", ObjectKind::Entity, "test"),
+            ScopedAssertion::new(
+                namespace,
+                name,
+                "type",
+                "Person",
+                ObjectKind::Entity,
+                "test",
+            ),
             literal(namespace, name, "name", name),
             literal(namespace, name, "年龄", age),
         ]
@@ -4970,7 +5291,11 @@ mod fusion_tests {
             .await
             .unwrap();
         assert_eq!(added, 1);
-        assert_eq!(manager.revision(), revision_before, "源图写入不推进知识版本");
+        assert_eq!(
+            manager.revision(),
+            revision_before,
+            "源图写入不推进知识版本"
+        );
         assert!(
             manager.load_all_facts().await.unwrap().is_empty(),
             "默认图不受源图写入影响"
@@ -4995,7 +5320,10 @@ mod fusion_tests {
             .await
             .unwrap();
         assert_eq!(added_again, 0, "重复导入幂等");
-        assert_eq!(manager.load_fusion_ledger().await.unwrap().assertions.len(), 1);
+        assert_eq!(
+            manager.load_fusion_ledger().await.unwrap().assertions.len(),
+            1
+        );
     }
 
     /// 功能谓词冲突：受管来源获胜、少数派隔离、默认图只写入赢家；重复融合幂等。
@@ -5164,7 +5492,10 @@ mod fusion_tests {
         let plan = manager.fusion_plan(&policy).await.unwrap();
         assert_eq!(plan.stats.namespaces, 1);
         assert_eq!(plan.stats.orphans, 1);
-        assert_eq!(plan.slots[0].delta, crate::knowledge_fusion::FusionDelta::New);
+        assert_eq!(
+            plan.slots[0].delta,
+            crate::knowledge_fusion::FusionDelta::New
+        );
         assert_eq!(plan.slots[0].accepted[0].object, "18");
         assert!(!manager
             .set_namespace_status("ghost", NamespaceStatus::Retired)
@@ -5181,8 +5512,7 @@ mod fusion_tests {
             Literal::new_simple_literal("18"),
             GraphName::DefaultGraph,
         );
-        let assertion =
-            OxigraphManager::assertion_from_rdf_quad(&quad, "alice", "a.ttl").unwrap();
+        let assertion = OxigraphManager::assertion_from_rdf_quad(&quad, "alice", "a.ttl").unwrap();
         assert_eq!(assertion.subject, "小明");
         assert_eq!(assertion.predicate, "年龄");
         assert_eq!(assertion.object, "18");

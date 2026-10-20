@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::SystemConfig;
 use crate::trace_graph;
+use crate::SystemConfig;
 
 /// 契约版本：字段/检查语义变化时递增，便于基线与 CI 对齐。
 pub const CONFIG_CONTRACT_VERSION: u32 = 1;
@@ -1806,7 +1806,9 @@ process_error = "处理出错"
             let source = format!("{}\n[trace_graph]\nmode = \"{}\"\n", base(), mode);
             let issues = lint_source(&source);
             assert!(
-                !issues.iter().any(|issue| issue.code == "unknown_trace_mode"),
+                !issues
+                    .iter()
+                    .any(|issue| issue.code == "unknown_trace_mode"),
                 "模式 {} 不应报 unknown_trace_mode：{}",
                 mode,
                 render_text(&issues)

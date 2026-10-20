@@ -385,7 +385,10 @@ impl SymbolicGenerator {
             changed = true;
         }
         if !etype.trim().is_empty() {
-            match self.entity_types.insert(name.to_string(), etype.to_string()) {
+            match self
+                .entity_types
+                .insert(name.to_string(), etype.to_string())
+            {
                 Some(previous) => {
                     if previous != etype {
                         changed = true;
@@ -550,7 +553,9 @@ impl SymbolicGenerator {
         let lines = self.profile_lines(entity, order)?;
         // offset 超出末尾时视为请求最后一页之后的内容，避免切片越界 panic
         let offset = offset.min(lines.len());
-        let end = offset.saturating_add(self.max_profile_sentences).min(lines.len());
+        let end = offset
+            .saturating_add(self.max_profile_sentences)
+            .min(lines.len());
         let shown = end.saturating_sub(offset);
         Some(ProfilePage {
             entity: entity.to_string(),
@@ -590,7 +595,7 @@ impl SymbolicGenerator {
                 if is_name_key(key) && value == entity {
                     continue;
                 }
-                lines.push(                FactLine {
+                lines.push(FactLine {
                     rank: 0.5,
                     sentence: self.lexicalize(entity, key, std::slice::from_ref(value)),
                 });
@@ -611,9 +616,7 @@ impl SymbolicGenerator {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.sentence.cmp(&b.sentence))
             }),
-            GenerationOrder::Alphabetical => {
-                lines.sort_by(|a, b| a.sentence.cmp(&b.sentence))
-            }
+            GenerationOrder::Alphabetical => lines.sort_by(|a, b| a.sentence.cmp(&b.sentence)),
         }
         Some(lines)
     }
@@ -631,7 +634,9 @@ impl SymbolicGenerator {
                 entity, type_note
             );
         }
-        let end = offset.saturating_add(self.max_profile_sentences).min(lines.len());
+        let end = offset
+            .saturating_add(self.max_profile_sentences)
+            .min(lines.len());
         let page = &lines[offset..end];
         let continuation = offset > 0;
 
@@ -690,11 +695,7 @@ impl SymbolicGenerator {
     }
 
     fn predicate_idf(&self, predicate: &str) -> f64 {
-        let count = self
-            .predicate_totals
-            .get(predicate)
-            .copied()
-            .unwrap_or(0);
+        let count = self.predicate_totals.get(predicate).copied().unwrap_or(0);
         ((1.0 + self.total_relations as f64) / (1.0 + count as f64)).ln()
     }
 
@@ -802,7 +803,8 @@ impl SymbolicGenerator {
                     // 已按计数降序，后续得分只会更低
                     break;
                 }
-                let Some((prototype, objects)) = self.prototype_for(etype, entity, predicate) else {
+                let Some((prototype, objects)) = self.prototype_for(etype, entity, predicate)
+                else {
                     continue;
                 };
                 predictions.push(CompletionPrediction {
@@ -1068,8 +1070,6 @@ fn lexical_surfaces(predicate: &str) -> &'static [&'static str] {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,7 +1118,11 @@ mod tests {
         let mut generator = sample_generator();
         generator.observe_entity("赵六", "人物", &[]);
         let completion = generator.complete("赵六的").expect("类型级回退应有预测");
-        assert!(completion.contains("类型级回退"), "实际输出：{}", completion);
+        assert!(
+            completion.contains("类型级回退"),
+            "实际输出：{}",
+            completion
+        );
         assert!(completion.contains("师傅"));
         assert!(completion.contains("参照同类实体"));
     }
@@ -1157,9 +1161,17 @@ mod tests {
         generator.observe_triple("张三", "knows", "李四");
         generator.observe_triple("李四", "age", "30");
         let profile = generator.profile("张三").unwrap();
-        assert!(profile.contains("张三认识李四"), "裸谓词应动词化：{}", profile);
+        assert!(
+            profile.contains("张三认识李四"),
+            "裸谓词应动词化：{}",
+            profile
+        );
         let profile2 = generator.profile("李四").unwrap();
-        assert!(profile2.contains("李四的年龄是30"), "英文属性应中文化：{}", profile2);
+        assert!(
+            profile2.contains("李四的年龄是30"),
+            "英文属性应中文化：{}",
+            profile2
+        );
         let surfaces = generator.predicate_surfaces();
         assert_eq!(surfaces.get("认识").map(String::as_str), Some("knows"));
         assert_eq!(surfaces.get("age").map(String::as_str), Some("age"));
@@ -1180,7 +1192,11 @@ mod tests {
             .profile_page("张三", first.next_offset, GenerationOrder::Relevance)
             .expect("第二页应可生成");
         assert_eq!(second.shown, 1);
-        assert!(second.text.contains("续：第 2–2 句"), "续页应有页码：{}", second.text);
+        assert!(
+            second.text.contains("续：第 2–2 句"),
+            "续页应有页码：{}",
+            second.text
+        );
         assert!(second.text.contains("接着，"));
         assert_ne!(first.text, second.text);
         let alphabetical_first = generator

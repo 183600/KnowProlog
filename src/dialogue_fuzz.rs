@@ -15,9 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::context_image::{canonical_json, fnv1a_hex};
-use crate::dialogue_manager::{
-    DialogueKnowledge, DialogueManager, DialogueReply, MoveKind,
-};
+use crate::dialogue_manager::{DialogueKnowledge, DialogueManager, DialogueReply, MoveKind};
 use crate::predicate_registry::PredicateRegistry;
 use crate::prolog_engine::PrologFact;
 use crate::quality::{build_report, ClaimWarrant, QualityIndex, QualityReport};
@@ -348,11 +346,8 @@ impl FuzzVerdict {
 
 /// 对比 known-gap 基线：只对基线外失败判红；未复现的基线缺口单列。
 pub fn compare_baseline(baseline: &FuzzBaseline, report: &FuzzReport) -> FuzzVerdict {
-    let known: BTreeSet<(String, String, String)> = baseline
-        .gaps
-        .iter()
-        .map(KnownFuzzGap::signature)
-        .collect();
+    let known: BTreeSet<(String, String, String)> =
+        baseline.gaps.iter().map(KnownFuzzGap::signature).collect();
     let current = report.minimal_failures();
     let current_keys: BTreeSet<(String, String, String)> =
         current.iter().map(FuzzFailure::signature).collect();
@@ -389,7 +384,11 @@ struct FuzzRng {
 impl FuzzRng {
     fn new(seed: u64) -> Self {
         FuzzRng {
-            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
         }
     }
 
@@ -442,7 +441,9 @@ impl World {
         let mut slots: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for fact in &self.facts {
             match fact {
-                PrologFact::Entity { name, properties, .. } if name == entity => {
+                PrologFact::Entity {
+                    name, properties, ..
+                } if name == entity => {
                     for (key, value) in properties {
                         slots.entry(key.clone()).or_default().push(value.clone());
                     }
@@ -594,12 +595,7 @@ fn mutate(mutation: QualityMutation) -> World {
 }
 
 fn report_for(world: &World) -> QualityReport {
-    build_report(
-        &world.facts,
-        &world.registry,
-        &world.types,
-        &entity_types(),
-    )
+    build_report(&world.facts, &world.registry, &world.types, &entity_types())
 }
 
 fn index_for(world: &World, revision: u64) -> QualityIndex {
@@ -754,7 +750,11 @@ fn check_quality_delta(
             if !after_wangwu.types.is_empty() {
                 return Err(format!("删类型后仍有类型：{:?}", after_wangwu.types));
             }
-            if !after.summary.clarify_candidates.contains(&"王五".to_string()) {
+            if !after
+                .summary
+                .clarify_candidates
+                .contains(&"王五".to_string())
+            {
                 return Err("未落型实体没有进入澄清候选".to_string());
             }
             Ok(())
@@ -781,7 +781,11 @@ fn check_quality_delta(
             if after.passport_for("王五").is_some() {
                 return Err("删除实体后护照仍存在（依赖已删事实）".to_string());
             }
-            if after.summary.clarify_candidates.contains(&"王五".to_string()) {
+            if after
+                .summary
+                .clarify_candidates
+                .contains(&"王五".to_string())
+            {
                 return Err("删除实体后仍被列为类型澄清候选".to_string());
             }
             Ok(())
@@ -809,10 +813,9 @@ fn check_speech(
     if mutation == QualityMutation::RemoveEntity && !class.is_attribute() {
         return match reply {
             None => Ok(()),
-            Some(reply) if reply.text.contains("王五") => Err(format!(
-                "已删除实体仍被当成已知身份回答：{}",
-                reply.text
-            )),
+            Some(reply) if reply.text.contains("王五") => {
+                Err(format!("已删除实体仍被当成已知身份回答：{}", reply.text))
+            }
             Some(_) => Ok(()),
         };
     }
@@ -863,25 +866,17 @@ fn check_speech(
         }
         QualityMutation::AddConflict => {
             if attribute_question {
-                if !plans
-                    .iter()
-                    .any(|plan| plan == "quality_disclose_conflict")
-                {
+                if !plans.iter().any(|plan| plan == "quality_disclose_conflict") {
                     return Err("有冲突却没有披露行为".to_string());
                 }
                 if !(text.contains("李四") && text.contains("王五")) {
-                    return Err(format!(
-                        "冲突披露未同时给出已有值与另一种说法：{}",
-                        text
-                    ));
+                    return Err(format!("冲突披露未同时给出已有值与另一种说法：{}", text));
                 }
             }
             Ok(())
         }
         QualityMutation::RemoveType => {
-            if !attribute_question
-                && !plans.iter().any(|plan| plan == "quality_clarify_type")
-            {
+            if !attribute_question && !plans.iter().any(|plan| plan == "quality_clarify_type") {
                 return Err(format!("未落型身份问句没有转类型澄清：{}", text));
             }
             Ok(())
@@ -1048,7 +1043,10 @@ pub fn warrant_probe(
 
 /// 让外部检查器知道一次问句是否走了知识问句路径。
 pub fn is_attribute_reply(kind: &MoveKind) -> bool {
-    matches!(kind, MoveKind::AskAttribute | MoveKind::AskIdentity | MoveKind::AskBinary)
+    matches!(
+        kind,
+        MoveKind::AskAttribute | MoveKind::AskIdentity | MoveKind::AskBinary
+    )
 }
 
 #[cfg(test)]
@@ -1070,10 +1068,7 @@ mod tests {
 
     #[test]
     fn full_grid_covers_every_mutation_and_question() {
-        let report = run(&FuzzConfig {
-            cases: 64,
-            seed: 7,
-        });
+        let report = run(&FuzzConfig { cases: 64, seed: 7 });
         assert_eq!(report.coverage.len(), 64);
         assert!(report.coverage.iter().all(|cell| cell.cases >= 1));
         assert_eq!(report.failed, 0, "{:?}", report.failures);
@@ -1166,10 +1161,7 @@ mod tests {
             passed: 0,
             failed: 2,
             coverage: Vec::new(),
-            failures: vec![
-                known.clone(),
-                failure("remove_source", "speech_contract"),
-            ],
+            failures: vec![known.clone(), failure("remove_source", "speech_contract")],
             digest: "c".to_string(),
         };
         let verdict = compare_baseline(&baseline, &regressed);
@@ -1262,11 +1254,7 @@ mod tests {
             "{:?}",
             review.plan
         );
-        assert!(
-            review.text.contains("不再作为当前事实"),
-            "{}",
-            review.text
-        );
+        assert!(review.text.contains("不再作为当前事实"), "{}", review.text);
     }
 
     #[test]

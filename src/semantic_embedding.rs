@@ -82,10 +82,11 @@ impl SymbolicEmbedding {
             return;
         }
         // 重复观察（快照重放）是无操作：计数与向量都不变
-        if !self
-            .seen_triples
-            .insert((subject.to_string(), predicate.to_string(), object.to_string()))
-        {
+        if !self.seen_triples.insert((
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        )) {
             return;
         }
         // 复用同一个缓冲区构造特征名
@@ -150,7 +151,11 @@ impl SymbolicEmbedding {
 
     fn add_feature(&mut self, entity: &str, feature: &str) {
         // 已存在的键直接自增
-        match self.counts.get_mut(entity).and_then(|map| map.get_mut(feature)) {
+        match self
+            .counts
+            .get_mut(entity)
+            .and_then(|map| map.get_mut(feature))
+        {
             Some(count) => *count += 1.0,
             None => {
                 let interned = self.intern_feature(feature);
@@ -204,11 +209,7 @@ impl SymbolicEmbedding {
             // 排序截断后共享特征名
             let mut weights: Vec<(Arc<str>, f64)> = Vec::with_capacity(features.len());
             for (feature, count) in features {
-                let feature_total = self
-                    .feature_totals
-                    .get(&**feature)
-                    .copied()
-                    .unwrap_or(0.0);
+                let feature_total = self.feature_totals.get(&**feature).copied().unwrap_or(0.0);
                 if feature_total <= 0.0 || *count <= 0.0 {
                     continue;
                 }
@@ -257,7 +258,11 @@ impl SymbolicEmbedding {
 
     pub fn similarity(&self, a: &str, b: &str) -> f64 {
         if a == b {
-            return if self.vectors.contains_key(a) { 1.0 } else { 0.0 };
+            return if self.vectors.contains_key(a) {
+                1.0
+            } else {
+                0.0
+            };
         }
         let (Some(va), Some(vb)) = (self.vectors.get(a), self.vectors.get(b)) else {
             return 0.0;
@@ -277,9 +282,7 @@ impl SymbolicEmbedding {
         let dot: f64 = small
             .weights
             .iter()
-            .filter_map(|(feature, weight)| {
-                large.weights.get(feature).map(|other| weight * other)
-            })
+            .filter_map(|(feature, weight)| large.weights.get(feature).map(|other| weight * other))
             .sum();
         dot / (va.norm * vb.norm)
     }
@@ -342,9 +345,7 @@ impl SymbolicEmbedding {
         let mut scored: Vec<(&str, f64)> = self
             .vectors
             .iter()
-            .filter(|(name, _)| {
-                name.as_str() != a && name.as_str() != b && name.as_str() != c
-            })
+            .filter(|(name, _)| name.as_str() != a && name.as_str() != b && name.as_str() != c)
             .map(|(name, vector)| {
                 let dot: f64 = residual
                     .iter()
@@ -409,11 +410,7 @@ impl SymbolicEmbedding {
             .map(|(feature, _)| format!("「{}」", feature))
             .collect();
         match (pos_text.is_empty(), neg_text.is_empty()) {
-            (false, false) => format!(
-                "新增 {}、减弱 {}",
-                pos_text.join(""),
-                neg_text.join("")
-            ),
+            (false, false) => format!("新增 {}、减弱 {}", pos_text.join(""), neg_text.join("")),
             (false, true) => format!("新增 {}", pos_text.join("")),
             (true, false) => format!("减弱 {}", neg_text.join("")),
             (true, true) => "角色特征几乎无变化".to_string(),
@@ -450,7 +447,10 @@ impl SymbolicEmbedding {
         let score = self.similarity(a, b);
         let shared = self.shared_features(a, b, 4);
         if shared.is_empty() {
-            return format!("「{}」与「{}」没有共同的角色特征（相似度 {:.2}）", a, b, score);
+            return format!(
+                "「{}」与「{}」没有共同的角色特征（相似度 {:.2}）",
+                a, b, score
+            );
         }
         let features: Vec<String> = shared
             .iter()
@@ -549,7 +549,11 @@ mod tests {
         assert!(!results.is_empty(), "类比应有候选");
         assert_eq!(results[0].0, "赵六");
         let direction = embedding.describe_direction("张三", "李四");
-        assert!(direction.contains("师傅"), "方向描述应包含特征名：{}", direction);
+        assert!(
+            direction.contains("师傅"),
+            "方向描述应包含特征名：{}",
+            direction
+        );
     }
 
     #[test]

@@ -118,7 +118,10 @@ pub fn render_statement(
                 "关于「{}」的「{}」，我听到了互相矛盾的说法：{}。我不替你拍板，请核实来源。",
                 entity, attribute, value
             ),
-            _ => format!("关于这件事，我听到了互相矛盾的说法：{}。需要你帮忙核实。", value),
+            _ => format!(
+                "关于这件事，我听到了互相矛盾的说法：{}。需要你帮忙核实。",
+                value
+            ),
         },
         EpistemicStatus::Absent => match (entity.is_empty(), attribute.is_empty()) {
             (false, false) => format!(
@@ -297,7 +300,10 @@ impl FailureLedger {
         while self.receipts.len() > LEDGER_CAPACITY {
             self.receipts.remove(0);
         }
-        self.receipts.last().map(|r| r.id.clone()).unwrap_or_default()
+        self.receipts
+            .last()
+            .map(|r| r.id.clone())
+            .unwrap_or_default()
     }
 
     pub fn len(&self) -> usize {
@@ -322,7 +328,10 @@ impl FailureLedger {
 
     /// 未结回执（新 → 旧）。
     pub fn open(&self) -> impl Iterator<Item = &FailureReceipt> {
-        self.receipts.iter().rev().filter(|receipt| receipt.is_open())
+        self.receipts
+            .iter()
+            .rev()
+            .filter(|receipt| receipt.is_open())
     }
 
     pub fn open_count(&self) -> usize {
@@ -331,11 +340,7 @@ impl FailureLedger {
 
     /// 裁定一条回执；返回是否裁定了未结的回执。
     pub fn resolve(&mut self, id: &str, resolution: ReceiptResolution) -> bool {
-        let Some(receipt) = self
-            .receipts
-            .iter_mut()
-            .find(|receipt| receipt.id == id)
-        else {
+        let Some(receipt) = self.receipts.iter_mut().find(|receipt| receipt.id == id) else {
             return false;
         };
         if receipt.resolution.is_some() {
@@ -497,7 +502,12 @@ mod tests {
 
     #[test]
     fn engine_fault_never_masquerades_as_unknown() {
-        let fault = render_statement(EpistemicStatus::EngineFault, Some("姚明"), Some("身高"), None);
+        let fault = render_statement(
+            EpistemicStatus::EngineFault,
+            Some("姚明"),
+            Some("身高"),
+            None,
+        );
         assert!(
             !fault.contains("没有记录"),
             "引擎故障绝不能伪装成不知道：{}",
@@ -533,19 +543,29 @@ mod tests {
             ));
         }
         assert_eq!(ledger.len(), LEDGER_CAPACITY);
-        assert!(ledger.get("r1").is_none() && ledger.get("r2").is_none(), "最旧回执应被淘汰");
+        assert!(
+            ledger.get("r1").is_none() && ledger.get("r2").is_none(),
+            "最旧回执应被淘汰"
+        );
         assert!(ledger.get("r3").is_some());
     }
 
     #[test]
     fn resolve_closes_receipt_and_digest_changes() {
         let mut ledger = FailureLedger::new();
-        let id = ledger.record(receipt(EpistemicStatus::Provisional, Some("姚明"), Some("体重")));
+        let id = ledger.record(receipt(
+            EpistemicStatus::Provisional,
+            Some("姚明"),
+            Some("体重"),
+        ));
         let before = ledger.digest();
         assert_eq!(ledger.open_count(), 1);
         assert!(ledger.resolve(&id, ReceiptResolution::Refuted));
         assert_eq!(ledger.open_count(), 0);
-        assert!(!ledger.resolve(&id, ReceiptResolution::Confirmed), "重复裁定应被拒绝");
+        assert!(
+            !ledger.resolve(&id, ReceiptResolution::Confirmed),
+            "重复裁定应被拒绝"
+        );
         assert_ne!(before, ledger.digest(), "裁定必须改变摘要");
         assert!(ledger.render_text().contains("已否认"));
     }
@@ -570,7 +590,10 @@ mod tests {
         let path = dir.path().join("failure_ledger.json");
         let path_text = path.to_str().unwrap();
 
-        assert!(matches!(FailureLedger::load(path_text), LedgerLoad::Missing));
+        assert!(matches!(
+            FailureLedger::load(path_text),
+            LedgerLoad::Missing
+        ));
 
         let mut ledger = FailureLedger::new();
         ledger.record(receipt(EpistemicStatus::Absent, Some("姚明"), Some("体重")));
@@ -579,8 +602,7 @@ mod tests {
 
         let mut value: Value =
             serde_json::from_str(&std::fs::read_to_string(path_text).unwrap()).unwrap();
-        value["sections"][LEDGER_SECTION]["receipts"][0]["status"] =
-            serde_json::json!("unknown");
+        value["sections"][LEDGER_SECTION]["receipts"][0]["status"] = serde_json::json!("unknown");
         std::fs::write(path_text, value.to_string()).unwrap();
         assert!(matches!(
             FailureLedger::load(path_text),

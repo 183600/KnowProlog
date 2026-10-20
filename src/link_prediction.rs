@@ -202,7 +202,11 @@ impl LinkPredictor {
         // 反向对 (b,a) 存在 ⟺ by_subject[b] 含 a
         let mutual = pairs
             .iter()
-            .filter(|(a, b)| by_subject.get(b).map_or(false, |objects| objects.contains(a)))
+            .filter(|(a, b)| {
+                by_subject
+                    .get(b)
+                    .map_or(false, |objects| objects.contains(a))
+            })
             .count();
         mutual >= 1 && mutual * 2 >= pairs.len()
     }
@@ -259,7 +263,12 @@ impl LinkPredictor {
         }
     }
 
-    fn common_body_pairs(&self, p1: &str, p2: &str, outgoing: bool) -> Option<HashSet<(String, String)>> {
+    fn common_body_pairs(
+        &self,
+        p1: &str,
+        p2: &str,
+        outgoing: bool,
+    ) -> Option<HashSet<(String, String)>> {
         let first = if outgoing {
             self.out_edges.get(p1)?
         } else {
@@ -426,9 +435,7 @@ impl LinkPredictor {
                 .then_with(|| b.support.cmp(&a.support))
                 .then_with(|| a.head.cmp(&b.head))
         });
-        rules.dedup_by(|a, b| {
-            a.template == b.template && a.body == b.body && a.head == b.head
-        });
+        rules.dedup_by(|a, b| a.template == b.template && a.body == b.body && a.head == b.head);
         self.rules = rules;
     }
 
@@ -521,7 +528,8 @@ impl LinkPredictor {
                     let p1 = rule.body1();
                     let p2 = rule.body2().unwrap_or("");
                     let p3 = rule.head.as_str();
-                    if let (Some(in1), Some(out2)) = (self.in_edges.get(p1), self.out_edges.get(p2)) {
+                    if let (Some(in1), Some(out2)) = (self.in_edges.get(p1), self.out_edges.get(p2))
+                    {
                         for (y, xs) in in1 {
                             let Some(zs) = out2.get(y) else { continue };
                             for x in xs {
@@ -608,7 +616,9 @@ impl LinkPredictor {
                     let p1 = rule.body1();
                     let p2 = rule.body2().unwrap_or("");
                     let p3 = rule.head.as_str();
-                    if let (Some(out1), Some(out2)) = (self.out_edges.get(p1), self.out_edges.get(p2)) {
+                    if let (Some(out1), Some(out2)) =
+                        (self.out_edges.get(p1), self.out_edges.get(p2))
+                    {
                         for (z, xs) in out1 {
                             let Some(ys) = out2.get(z) else { continue };
                             for x in xs {
@@ -685,11 +695,10 @@ impl LinkPredictor {
         predicate: Option<&str>,
         limit: usize,
     ) -> Vec<Prediction> {
-        let mut candidates =
-            self.enumerate_predictions_matching(self.max_enumeration, |triple| {
-                (triple.subject == entity || triple.object == entity)
-                    && predicate.map_or(true, |q| triple.predicate == q)
-            });
+        let mut candidates = self.enumerate_predictions_matching(self.max_enumeration, |triple| {
+            (triple.subject == entity || triple.object == entity)
+                && predicate.map_or(true, |q| triple.predicate == q)
+        });
         Self::top_candidates(&mut candidates, limit);
         candidates
             .into_iter()
@@ -801,10 +810,9 @@ mod tests {
         predictor.add_triple("李四", "配偶", "张三");
         predictor.add_triple("王五", "配偶", "赵六");
         predictor.mine_rules(1, 0.6);
-        let inverse = predictor
-            .rules()
-            .iter()
-            .find(|r| r.template == RuleTemplate::Inverse && r.body1() == "配偶" && r.head == "配偶");
+        let inverse = predictor.rules().iter().find(|r| {
+            r.template == RuleTemplate::Inverse && r.body1() == "配偶" && r.head == "配偶"
+        });
         assert!(inverse.is_some(), "对称关系应挖掘出逆向规则");
         let predictions = predictor.predict_for_entity("赵六", Some("配偶"), 5);
         assert_eq!(predictions.len(), 1);

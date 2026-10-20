@@ -201,8 +201,11 @@ impl From<&BTreeMap<String, String>> for BindingSet {
 /// 数值比较：两侧都拿到数值时给出 `Ordering`，否则 `None`
 /// （「姚明和叶莉谁更高」这类问题的最小可组合原语）。
 pub fn compare_numeric(left: &BoundTerm, right: &BoundTerm) -> Option<std::cmp::Ordering> {
-    left.numeric_value()
-        .and_then(|a| right.numeric_value().map(|b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)))
+    left.numeric_value().and_then(|a| {
+        right
+            .numeric_value()
+            .map(|b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal))
+    })
 }
 
 /// 由变量名和可选值构造绑定（`None` / 隐式未绑定串 → [`BoundTerm::Unbound`]）。
@@ -286,7 +289,10 @@ mod tests {
         env.insert("A".to_string(), "3".to_string());
         let bindings = BindingSet::from_env(&env);
         assert_eq!(bindings.names(), vec!["A", "Z"]);
-        assert_eq!(bindings.get("A").and_then(BoundTerm::numeric_value), Some(3.0));
+        assert_eq!(
+            bindings.get("A").and_then(BoundTerm::numeric_value),
+            Some(3.0)
+        );
         assert_eq!(bindings.get("Z").and_then(BoundTerm::numeric_value), None);
     }
 

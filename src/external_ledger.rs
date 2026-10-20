@@ -452,7 +452,10 @@ impl ExternalLedger {
         let mut image = ContextImage::new();
         image.set_section(LEDGER_SECTION, entries);
         image.set_section("external_ledger_aliases", aliases);
-        image.set_section("external_ledger_meta", serde_json::json!({ "tick": self.tick }));
+        image.set_section(
+            "external_ledger_meta",
+            serde_json::json!({ "tick": self.tick }),
+        );
         image.seal();
         image.save_atomic(path)
     }
@@ -583,11 +586,7 @@ mod tests {
             }
             other => panic!("应命中新鲜条目：{:?}", other),
         }
-        assert_eq!(
-            ledger.perf.count("external_ledger_store"),
-            1,
-            "写入计数"
-        );
+        assert_eq!(ledger.perf.count("external_ledger_store"), 1, "写入计数");
         assert_eq!(ledger.perf.count("external_ledger_hit"), 1);
     }
 
@@ -637,7 +636,13 @@ mod tests {
     #[test]
     fn alias_resolution_and_forget() {
         let mut ledger = ledger_with_capacity(8);
-        ledger.store_entity("ownthink:姚明", "ownthink", String::new(), Vec::new(), Vec::new());
+        ledger.store_entity(
+            "ownthink:姚明",
+            "ownthink",
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+        );
         assert!(ledger.confirm_alias("姚明", "ownthink:姚明"));
         assert!(!ledger.confirm_alias("姚明", "姚明"), "同名别名不成立");
         assert_eq!(ledger.resolve("姚明"), "ownthink:姚明");
@@ -665,7 +670,13 @@ mod tests {
         let mut ledger = ledger_with_capacity(8);
         ledger.advance_tick();
         ledger.store_entity("b", "src", "描述".to_string(), Vec::new(), Vec::new());
-        ledger.store_entity("a", "src", String::new(), Vec::new(), vec!["标签".to_string()]);
+        ledger.store_entity(
+            "a",
+            "src",
+            String::new(),
+            Vec::new(),
+            vec!["标签".to_string()],
+        );
         ledger.confirm_alias("别名", "a");
         let report = ledger.report();
         let first = report.find("「a」").unwrap();
@@ -685,7 +696,10 @@ mod tests {
         let path = dir.path().join("external_ledger.json");
         let path_text = path.to_str().unwrap();
 
-        assert!(matches!(ledger_with_capacity(8).load_into(path_text), LedgerLoad::Missing));
+        assert!(matches!(
+            ledger_with_capacity(8).load_into(path_text),
+            LedgerLoad::Missing
+        ));
 
         let mut ledger = ExternalLedger::with_config(8, 0, Arc::new(PerfLedger::new()));
         ledger.advance_tick();

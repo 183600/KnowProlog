@@ -1,8 +1,8 @@
 use jieba_rs::Jieba;
+use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use parking_lot::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentResult {
@@ -95,128 +95,155 @@ impl AdvancedNLU {
 
     fn initialize_intent_patterns() -> HashMap<String, IntentPattern> {
         let mut patterns = HashMap::new();
-        
+
         // 实体查询意图
-        patterns.insert("entity_query".to_string(), IntentPattern {
-            intent: "entity_query".to_string(),
-            patterns: vec![
-                r"(.+)是什么".to_string(),
-                r"(.+)是谁".to_string(),
-                r"介绍(.+)".to_string(),
-                r"(.+)的信息".to_string(),
-                r"关于(.+)".to_string(),
-                r"告诉我(.+)".to_string(),
-                r"(.+)简介".to_string(),
-            ],
-            entities: vec!["PERSON".to_string(), "ORGANIZATION".to_string(), "CONCEPT".to_string()],
-            required_slots: vec!["entity".to_string()],
-            examples: vec![
-                "刘德华是谁".to_string(),
-                "苹果公司是什么".to_string(),
-                "介绍一下北京".to_string(),
-            ],
-            priority: 10,
-        });
+        patterns.insert(
+            "entity_query".to_string(),
+            IntentPattern {
+                intent: "entity_query".to_string(),
+                patterns: vec![
+                    r"(.+)是什么".to_string(),
+                    r"(.+)是谁".to_string(),
+                    r"介绍(.+)".to_string(),
+                    r"(.+)的信息".to_string(),
+                    r"关于(.+)".to_string(),
+                    r"告诉我(.+)".to_string(),
+                    r"(.+)简介".to_string(),
+                ],
+                entities: vec![
+                    "PERSON".to_string(),
+                    "ORGANIZATION".to_string(),
+                    "CONCEPT".to_string(),
+                ],
+                required_slots: vec!["entity".to_string()],
+                examples: vec![
+                    "刘德华是谁".to_string(),
+                    "苹果公司是什么".to_string(),
+                    "介绍一下北京".to_string(),
+                ],
+                priority: 10,
+            },
+        );
 
         // 属性查询意图
-        patterns.insert("attribute_query".to_string(), IntentPattern {
-            intent: "attribute_query".to_string(),
-            patterns: vec![
-                r"(.+)的(.+)是什么".to_string(),
-                r"(.+)有什么(.+)".to_string(),
-                r"(.+)的(.+)".to_string(),
-                r"(.+)(.+)多少".to_string(),
-                r"(.+)多(.+)".to_string(),
-            ],
-            entities: vec!["PERSON".to_string(), "ATTRIBUTE".to_string()],
-            required_slots: vec!["entity".to_string(), "attribute".to_string()],
-            examples: vec![
-                "刘德华的年龄是多少".to_string(),
-                "北京的人口".to_string(),
-                "苹果公司的CEO".to_string(),
-            ],
-            priority: 15,
-        });
+        patterns.insert(
+            "attribute_query".to_string(),
+            IntentPattern {
+                intent: "attribute_query".to_string(),
+                patterns: vec![
+                    r"(.+)的(.+)是什么".to_string(),
+                    r"(.+)有什么(.+)".to_string(),
+                    r"(.+)的(.+)".to_string(),
+                    r"(.+)(.+)多少".to_string(),
+                    r"(.+)多(.+)".to_string(),
+                ],
+                entities: vec!["PERSON".to_string(), "ATTRIBUTE".to_string()],
+                required_slots: vec!["entity".to_string(), "attribute".to_string()],
+                examples: vec![
+                    "刘德华的年龄是多少".to_string(),
+                    "北京的人口".to_string(),
+                    "苹果公司的CEO".to_string(),
+                ],
+                priority: 15,
+            },
+        );
 
         // 关系查询意图
-        patterns.insert("relation_query".to_string(), IntentPattern {
-            intent: "relation_query".to_string(),
-            patterns: vec![
-                r"(.+)和(.+)的关系".to_string(),
-                r"(.+)与(.+)".to_string(),
-                r"(.+)认识(.+)吗".to_string(),
-                r"(.+)是(.+)的(.+)".to_string(),
-            ],
-            entities: vec!["PERSON".to_string(), "ORGANIZATION".to_string()],
-            required_slots: vec!["entity1".to_string(), "entity2".to_string()],
-            examples: vec![
-                "刘德华和张学友的关系".to_string(),
-                "苹果与微软".to_string(),
-            ],
-            priority: 12,
-        });
+        patterns.insert(
+            "relation_query".to_string(),
+            IntentPattern {
+                intent: "relation_query".to_string(),
+                patterns: vec![
+                    r"(.+)和(.+)的关系".to_string(),
+                    r"(.+)与(.+)".to_string(),
+                    r"(.+)认识(.+)吗".to_string(),
+                    r"(.+)是(.+)的(.+)".to_string(),
+                ],
+                entities: vec!["PERSON".to_string(), "ORGANIZATION".to_string()],
+                required_slots: vec!["entity1".to_string(), "entity2".to_string()],
+                examples: vec!["刘德华和张学友的关系".to_string(), "苹果与微软".to_string()],
+                priority: 12,
+            },
+        );
 
         // 比较查询意图
-        patterns.insert("comparison_query".to_string(), IntentPattern {
-            intent: "comparison_query".to_string(),
-            patterns: vec![
-                r"(.+)和(.+)哪个更(.+)".to_string(),
-                r"比较(.+)和(.+)".to_string(),
-                r"(.+)与(.+)相比".to_string(),
-                r"(.+)(.+)还是(.+)(.+)".to_string(),
-            ],
-            entities: vec!["PERSON".to_string(), "ORGANIZATION".to_string(), "CONCEPT".to_string()],
-            required_slots: vec!["entity1".to_string(), "entity2".to_string(), "aspect".to_string()],
-            examples: vec![
-                "苹果和华为哪个更好".to_string(),
-                "比较北京和上海的经济".to_string(),
-            ],
-            priority: 8,
-        });
+        patterns.insert(
+            "comparison_query".to_string(),
+            IntentPattern {
+                intent: "comparison_query".to_string(),
+                patterns: vec![
+                    r"(.+)和(.+)哪个更(.+)".to_string(),
+                    r"比较(.+)和(.+)".to_string(),
+                    r"(.+)与(.+)相比".to_string(),
+                    r"(.+)(.+)还是(.+)(.+)".to_string(),
+                ],
+                entities: vec![
+                    "PERSON".to_string(),
+                    "ORGANIZATION".to_string(),
+                    "CONCEPT".to_string(),
+                ],
+                required_slots: vec![
+                    "entity1".to_string(),
+                    "entity2".to_string(),
+                    "aspect".to_string(),
+                ],
+                examples: vec![
+                    "苹果和华为哪个更好".to_string(),
+                    "比较北京和上海的经济".to_string(),
+                ],
+                priority: 8,
+            },
+        );
 
         // 列表查询意图
-        patterns.insert("list_query".to_string(), IntentPattern {
-            intent: "list_query".to_string(),
-            patterns: vec![
-                r"有哪些(.+)".to_string(),
-                r"(.+)有哪些".to_string(),
-                r"列出(.+)".to_string(),
-                r"所有的(.+)".to_string(),
-                r"(.+)包括什么".to_string(),
-            ],
-            entities: vec!["CATEGORY".to_string(), "ORGANIZATION".to_string()],
-            required_slots: vec!["category".to_string()],
-            examples: vec![
-                "有哪些中国演员".to_string(),
-                "苹果公司有哪些产品".to_string(),
-            ],
-            priority: 9,
-        });
+        patterns.insert(
+            "list_query".to_string(),
+            IntentPattern {
+                intent: "list_query".to_string(),
+                patterns: vec![
+                    r"有哪些(.+)".to_string(),
+                    r"(.+)有哪些".to_string(),
+                    r"列出(.+)".to_string(),
+                    r"所有的(.+)".to_string(),
+                    r"(.+)包括什么".to_string(),
+                ],
+                entities: vec!["CATEGORY".to_string(), "ORGANIZATION".to_string()],
+                required_slots: vec!["category".to_string()],
+                examples: vec![
+                    "有哪些中国演员".to_string(),
+                    "苹果公司有哪些产品".to_string(),
+                ],
+                priority: 9,
+            },
+        );
 
         // 计数查询意图
-        patterns.insert("count_query".to_string(), IntentPattern {
-            intent: "count_query".to_string(),
-            patterns: vec![
-                r"有多少(.+)".to_string(),
-                r"(.+)有多少个".to_string(),
-                r"(.+)的数量".to_string(),
-                r"一共有几个(.+)".to_string(),
-            ],
-            entities: vec!["CATEGORY".to_string()],
-            required_slots: vec!["category".to_string()],
-            examples: vec![
-                "中国有多少个省".to_string(),
-                "苹果公司有多少员工".to_string(),
-            ],
-            priority: 7,
-        });
+        patterns.insert(
+            "count_query".to_string(),
+            IntentPattern {
+                intent: "count_query".to_string(),
+                patterns: vec![
+                    r"有多少(.+)".to_string(),
+                    r"(.+)有多少个".to_string(),
+                    r"(.+)的数量".to_string(),
+                    r"一共有几个(.+)".to_string(),
+                ],
+                entities: vec!["CATEGORY".to_string()],
+                required_slots: vec!["category".to_string()],
+                examples: vec![
+                    "中国有多少个省".to_string(),
+                    "苹果公司有多少员工".to_string(),
+                ],
+                priority: 7,
+            },
+        );
 
         patterns
     }
 
     fn initialize_entity_patterns() -> HashMap<String, EntityPattern> {
         let mut patterns = HashMap::new();
-        
+
         patterns.insert("PERSON".to_string(), EntityPattern {
             entity_type: "PERSON".to_string(),
             patterns: vec![
@@ -234,67 +261,115 @@ impl AdvancedNLU {
             ],
         });
 
-        patterns.insert("ORGANIZATION".to_string(), EntityPattern {
-            entity_type: "ORGANIZATION".to_string(),
-            patterns: vec![
-                r".+公司".to_string(),
-                r".+集团".to_string(),
-                r".+学院".to_string(),
-                r".+大学".to_string(),
-                r".+研究所".to_string(),
-                r".+医院".to_string(),
-                r".+银行".to_string(),
-            ],
-            keywords: vec![
-                "公司".to_string(), "集团".to_string(), "企业".to_string(), "机构".to_string(),
-                "组织".to_string(), "学校".to_string(), "大学".to_string(), "学院".to_string(),
-                "研究所".to_string(), "医院".to_string(), "银行".to_string(),
-            ],
-            context_clues: vec![
-                "成立".to_string(), "总部".to_string(), "员工".to_string(), "业务".to_string(),
-                "产品".to_string(), "服务".to_string(), "规模".to_string(),
-            ],
-        });
+        patterns.insert(
+            "ORGANIZATION".to_string(),
+            EntityPattern {
+                entity_type: "ORGANIZATION".to_string(),
+                patterns: vec![
+                    r".+公司".to_string(),
+                    r".+集团".to_string(),
+                    r".+学院".to_string(),
+                    r".+大学".to_string(),
+                    r".+研究所".to_string(),
+                    r".+医院".to_string(),
+                    r".+银行".to_string(),
+                ],
+                keywords: vec![
+                    "公司".to_string(),
+                    "集团".to_string(),
+                    "企业".to_string(),
+                    "机构".to_string(),
+                    "组织".to_string(),
+                    "学校".to_string(),
+                    "大学".to_string(),
+                    "学院".to_string(),
+                    "研究所".to_string(),
+                    "医院".to_string(),
+                    "银行".to_string(),
+                ],
+                context_clues: vec![
+                    "成立".to_string(),
+                    "总部".to_string(),
+                    "员工".to_string(),
+                    "业务".to_string(),
+                    "产品".to_string(),
+                    "服务".to_string(),
+                    "规模".to_string(),
+                ],
+            },
+        );
 
-        patterns.insert("LOCATION".to_string(), EntityPattern {
-            entity_type: "LOCATION".to_string(),
-            patterns: vec![
-                r".+省".to_string(),
-                r".+市".to_string(),
-                r".+县".to_string(),
-                r".+区".to_string(),
-                r".+镇".to_string(),
-                r".+村".to_string(),
-                r".+国".to_string(),
-            ],
-            keywords: vec![
-                "省".to_string(), "市".to_string(), "县".to_string(), "区".to_string(),
-                "镇".to_string(), "村".to_string(), "国家".to_string(), "城市".to_string(),
-                "地区".to_string(), "地方".to_string(), "位置".to_string(),
-            ],
-            context_clues: vec![
-                "位于".to_string(), "在".to_string(), "地处".to_string(), "坐落".to_string(),
-                "面积".to_string(), "人口".to_string(), "气候".to_string(),
-            ],
-        });
+        patterns.insert(
+            "LOCATION".to_string(),
+            EntityPattern {
+                entity_type: "LOCATION".to_string(),
+                patterns: vec![
+                    r".+省".to_string(),
+                    r".+市".to_string(),
+                    r".+县".to_string(),
+                    r".+区".to_string(),
+                    r".+镇".to_string(),
+                    r".+村".to_string(),
+                    r".+国".to_string(),
+                ],
+                keywords: vec![
+                    "省".to_string(),
+                    "市".to_string(),
+                    "县".to_string(),
+                    "区".to_string(),
+                    "镇".to_string(),
+                    "村".to_string(),
+                    "国家".to_string(),
+                    "城市".to_string(),
+                    "地区".to_string(),
+                    "地方".to_string(),
+                    "位置".to_string(),
+                ],
+                context_clues: vec![
+                    "位于".to_string(),
+                    "在".to_string(),
+                    "地处".to_string(),
+                    "坐落".to_string(),
+                    "面积".to_string(),
+                    "人口".to_string(),
+                    "气候".to_string(),
+                ],
+            },
+        );
 
-        patterns.insert("NUMBER".to_string(), EntityPattern {
-            entity_type: "NUMBER".to_string(),
-            patterns: vec![
-                r"\d+".to_string(),
-                r"[一二三四五六七八九十百千万亿两]+".to_string(),
-                r"\d+\.\d+".to_string(),
-            ],
-            keywords: vec![
-                "个".to_string(), "只".to_string(), "人".to_string(), "年".to_string(),
-                "月".to_string(), "日".to_string(), "元".to_string(), "万".to_string(),
-                "亿".to_string(), "千".to_string(), "百".to_string(),
-            ],
-            context_clues: vec![
-                "数量".to_string(), "年龄".to_string(), "价格".to_string(), "时间".to_string(),
-                "重量".to_string(), "长度".to_string(), "面积".to_string(),
-            ],
-        });
+        patterns.insert(
+            "NUMBER".to_string(),
+            EntityPattern {
+                entity_type: "NUMBER".to_string(),
+                patterns: vec![
+                    r"\d+".to_string(),
+                    r"[一二三四五六七八九十百千万亿两]+".to_string(),
+                    r"\d+\.\d+".to_string(),
+                ],
+                keywords: vec![
+                    "个".to_string(),
+                    "只".to_string(),
+                    "人".to_string(),
+                    "年".to_string(),
+                    "月".to_string(),
+                    "日".to_string(),
+                    "元".to_string(),
+                    "万".to_string(),
+                    "亿".to_string(),
+                    "千".to_string(),
+                    "百".to_string(),
+                ],
+                context_clues: vec![
+                    "数量".to_string(),
+                    "年龄".to_string(),
+                    "价格".to_string(),
+                    "时间".to_string(),
+                    "重量".to_string(),
+                    "长度".to_string(),
+                    "面积".to_string(),
+                ],
+            },
+        );
 
         patterns
     }
@@ -310,8 +385,14 @@ impl AdvancedNLU {
             (Regex::new(r"现在|目前|当前").unwrap(), "NOW".to_string()),
             (Regex::new(r"以前|过去|之前").unwrap(), "PAST".to_string()),
             (Regex::new(r"将来|未来|以后").unwrap(), "FUTURE".to_string()),
-            (Regex::new(r"上周|上个星期").unwrap(), "LAST_WEEK".to_string()),
-            (Regex::new(r"下周|下个星期").unwrap(), "NEXT_WEEK".to_string()),
+            (
+                Regex::new(r"上周|上个星期").unwrap(),
+                "LAST_WEEK".to_string(),
+            ),
+            (
+                Regex::new(r"下周|下个星期").unwrap(),
+                "NEXT_WEEK".to_string(),
+            ),
             (Regex::new(r"上个月").unwrap(), "LAST_MONTH".to_string()),
             (Regex::new(r"下个月").unwrap(), "NEXT_MONTH".to_string()),
             (Regex::new(r"去年").unwrap(), "LAST_YEAR".to_string()),
@@ -338,7 +419,10 @@ impl AdvancedNLU {
     fn initialize_number_patterns() -> Vec<(Regex, String)> {
         vec![
             (Regex::new(r"(\d+)").unwrap(), "ARABIC_NUMBER".to_string()),
-            (Regex::new(r"([一二三四五六七八九十百千万亿两]+)").unwrap(), "CHINESE_NUMBER".to_string()),
+            (
+                Regex::new(r"([一二三四五六七八九十百千万亿两]+)").unwrap(),
+                "CHINESE_NUMBER".to_string(),
+            ),
             (Regex::new(r"(\d+\.\d+)").unwrap(), "DECIMAL".to_string()),
             (Regex::new(r"第(\d+)").unwrap(), "ORDINAL".to_string()),
             (Regex::new(r"(\d+)%").unwrap(), "PERCENTAGE".to_string()),
@@ -347,53 +431,102 @@ impl AdvancedNLU {
 
     fn initialize_domain_keywords() -> HashMap<String, Vec<String>> {
         let mut domains = HashMap::new();
-        
-        domains.insert("ENTERTAINMENT".to_string(), vec![
-            "演员".to_string(), "歌手".to_string(), "电影".to_string(), "音乐".to_string(),
-            "导演".to_string(), "明星".to_string(), "艺人".to_string(), "作品".to_string(),
-            "专辑".to_string(), "电视剧".to_string(), "综艺".to_string(),
-        ]);
 
-        domains.insert("TECHNOLOGY".to_string(), vec![
-            "公司".to_string(), "科技".to_string(), "产品".to_string(), "软件".to_string(),
-            "硬件".to_string(), "系统".to_string(), "平台".to_string(), "应用".to_string(),
-            "技术".to_string(), "创新".to_string(), "研发".to_string(),
-        ]);
+        domains.insert(
+            "ENTERTAINMENT".to_string(),
+            vec![
+                "演员".to_string(),
+                "歌手".to_string(),
+                "电影".to_string(),
+                "音乐".to_string(),
+                "导演".to_string(),
+                "明星".to_string(),
+                "艺人".to_string(),
+                "作品".to_string(),
+                "专辑".to_string(),
+                "电视剧".to_string(),
+                "综艺".to_string(),
+            ],
+        );
 
-        domains.insert("GEOGRAPHY".to_string(), vec![
-            "国家".to_string(), "城市".to_string(), "省份".to_string(), "地区".to_string(),
-            "位置".to_string(), "气候".to_string(), "人口".to_string(), "面积".to_string(),
-            "经济".to_string(), "文化".to_string(), "历史".to_string(),
-        ]);
+        domains.insert(
+            "TECHNOLOGY".to_string(),
+            vec![
+                "公司".to_string(),
+                "科技".to_string(),
+                "产品".to_string(),
+                "软件".to_string(),
+                "硬件".to_string(),
+                "系统".to_string(),
+                "平台".to_string(),
+                "应用".to_string(),
+                "技术".to_string(),
+                "创新".to_string(),
+                "研发".to_string(),
+            ],
+        );
 
-        domains.insert("EDUCATION".to_string(), vec![
-            "学校".to_string(), "大学".to_string(), "学院".to_string(), "专业".to_string(),
-            "教授".to_string(), "学生".to_string(), "研究".to_string(), "学术".to_string(),
-            "教育".to_string(), "课程".to_string(), "学位".to_string(),
-        ]);
+        domains.insert(
+            "GEOGRAPHY".to_string(),
+            vec![
+                "国家".to_string(),
+                "城市".to_string(),
+                "省份".to_string(),
+                "地区".to_string(),
+                "位置".to_string(),
+                "气候".to_string(),
+                "人口".to_string(),
+                "面积".to_string(),
+                "经济".to_string(),
+                "文化".to_string(),
+                "历史".to_string(),
+            ],
+        );
+
+        domains.insert(
+            "EDUCATION".to_string(),
+            vec![
+                "学校".to_string(),
+                "大学".to_string(),
+                "学院".to_string(),
+                "专业".to_string(),
+                "教授".to_string(),
+                "学生".to_string(),
+                "研究".to_string(),
+                "学术".to_string(),
+                "教育".to_string(),
+                "课程".to_string(),
+                "学位".to_string(),
+            ],
+        );
 
         domains
     }
 
-    pub async fn analyze_query(&self, query: &str) -> Result<IntentResult, Box<dyn std::error::Error>> {
+    pub async fn analyze_query(
+        &self,
+        query: &str,
+    ) -> Result<IntentResult, Box<dyn std::error::Error>> {
         // 预处理查询
         let normalized_query = self.normalize_query(query);
-        
+
         // 意图识别
         let intent_info = self.recognize_intent(&normalized_query).await?;
-        
+
         // 实体抽取
         let entities = self.extract_entities(&normalized_query).await?;
-        
+
         // 槽位填充
-        let slots = self.extract_slots(&normalized_query, &intent_info, &entities).await?;
-        
+        let slots = self
+            .extract_slots(&normalized_query, &intent_info, &entities)
+            .await?;
+
         // 上下文分析
         let context = self.analyze_context(&normalized_query, &entities).await?;
-        
+
         // 保存上下文到记忆
         self.update_context_memory(&context);
-        
+
         Ok(IntentResult {
             intent: intent_info.0,
             confidence: intent_info.1,
@@ -416,10 +549,13 @@ impl AdvancedNLU {
             .collect()
     }
 
-    async fn recognize_intent(&self, query: &str) -> Result<(String, f64), Box<dyn std::error::Error>> {
+    async fn recognize_intent(
+        &self,
+        query: &str,
+    ) -> Result<(String, f64), Box<dyn std::error::Error>> {
         let mut best_intent = "unknown".to_string();
         let mut best_confidence = 0.0;
-        
+
         // 分词
         let query_words: Vec<(&str, usize)> = self
             .jieba
@@ -427,27 +563,28 @@ impl AdvancedNLU {
             .into_iter()
             .map(|word| (word, word.chars().count()))
             .collect();
-        
+
         {
             let intent_patterns = self.intent_patterns.read();
             for (intent_name, pattern_info) in intent_patterns.iter() {
                 let mut max_pattern_confidence: f64 = 0.0;
-                
+
                 for pattern in &pattern_info.patterns {
                     let confidence = self.calculate_pattern_match_confidence(&query_words, pattern);
                     max_pattern_confidence = max_pattern_confidence.max(confidence);
                 }
-                
+
                 // 考虑优先级权重
-                let weighted_confidence = max_pattern_confidence * (pattern_info.priority as f64 / 20.0);
-                
+                let weighted_confidence =
+                    max_pattern_confidence * (pattern_info.priority as f64 / 20.0);
+
                 if weighted_confidence > best_confidence {
                     best_confidence = weighted_confidence;
                     best_intent = intent_name.clone();
                 }
             }
         }
-        
+
         // 如果置信度太低，尝试基于关键词的模糊匹配
         if best_confidence < 0.3 {
             let fallback_result = self.fallback_intent_recognition(query).await?;
@@ -455,51 +592,55 @@ impl AdvancedNLU {
                 return Ok(fallback_result);
             }
         }
-        
+
         Ok((best_intent, best_confidence))
     }
 
-    async fn fallback_intent_recognition(&self, query: &str) -> Result<(String, f64), Box<dyn std::error::Error>> {
+    async fn fallback_intent_recognition(
+        &self,
+        query: &str,
+    ) -> Result<(String, f64), Box<dyn std::error::Error>> {
         let mut intent_scores = HashMap::new();
-        
+
         // 基于关键词推断意图
         if query.contains("是什么") || query.contains("是谁") || query.contains("介绍") {
             intent_scores.insert("entity_query".to_string(), 0.6);
         }
-        
+
         if query.contains("的") && (query.contains("多少") || query.contains("什么")) {
             intent_scores.insert("attribute_query".to_string(), 0.5);
         }
-        
+
         if query.contains("和") && query.contains("关系") {
             intent_scores.insert("relation_query".to_string(), 0.7);
         }
-        
+
         if query.contains("比较") || query.contains("哪个更") {
             intent_scores.insert("comparison_query".to_string(), 0.6);
         }
-        
+
         if query.contains("有哪些") || query.contains("包括") {
             intent_scores.insert("list_query".to_string(), 0.6);
         }
-        
+
         if query.contains("多少") && (query.contains("个") || query.contains("数量")) {
             intent_scores.insert("count_query".to_string(), 0.6);
         }
-        
+
         // 同分时按意图名字典序打破平局
-        let best = intent_scores.into_iter()
-            .max_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap()
-                    .then_with(|| b.0.cmp(&a.0))
-            })
+        let best = intent_scores
+            .into_iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then_with(|| b.0.cmp(&a.0)))
             .unwrap_or(("unknown".to_string(), 0.0));
-        
+
         Ok(best)
     }
 
-    fn calculate_pattern_match_confidence(&self, query_words: &[(&str, usize)], pattern: &str) -> f64 {
+    fn calculate_pattern_match_confidence(
+        &self,
+        query_words: &[(&str, usize)],
+        pattern: &str,
+    ) -> f64 {
         // 简化的模式匹配
         let mut matches = 0;
         let mut total = 0;
@@ -555,53 +696,55 @@ impl AdvancedNLU {
 
     #[cfg(test)]
     fn calculate_word_similarity(&self, word1: &str, word2: &str) -> f64 {
-        self.word_similarity_with_lens(
-            word1,
-            word1.chars().count(),
-            word2,
-            word2.chars().count(),
-        )
+        self.word_similarity_with_lens(word1, word1.chars().count(), word2, word2.chars().count())
     }
 
     fn word_similarity_with_lens(&self, word1: &str, len1: usize, word2: &str, len2: usize) -> f64 {
         if word1 == word2 {
             return 1.0;
         }
-        
+
         if len1 == 0 || len2 == 0 {
             return 0.0;
         }
-        
+
         let distance = self.levenshtein_distance_with_lens(word1, len1, word2, len2);
         let max_len = len1.max(len2);
-        
+
         1.0 - (distance as f64 / max_len as f64)
     }
 
-    fn levenshtein_distance_with_lens(&self, s1: &str, len1: usize, s2: &str, len2: usize) -> usize {
+    fn levenshtein_distance_with_lens(
+        &self,
+        s1: &str,
+        len1: usize,
+        s2: &str,
+        len2: usize,
+    ) -> usize {
         // 双行动态规划：较短字符串作为列方向，行方向逐字符迭代
         let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
         let cols: Vec<char> = cols.chars().collect();
         let col_count = cols.len();
-        
+
         let mut prev: Vec<usize> = (0..=col_count).collect();
         let mut curr = vec![0usize; col_count + 1];
-        
+
         for (i, row_char) in rows.chars().enumerate() {
             curr[0] = i + 1;
             for j in 1..=col_count {
                 let cost = if row_char == cols[j - 1] { 0 } else { 1 };
-                curr[j] = (prev[j] + 1)
-                    .min(curr[j - 1] + 1)
-                    .min(prev[j - 1] + cost);
+                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
             }
             std::mem::swap(&mut prev, &mut curr);
         }
-        
+
         prev[col_count]
     }
 
-    async fn extract_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
+    async fn extract_entities(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         {
             let entity_patterns = self.entity_patterns.read();
@@ -616,20 +759,20 @@ impl AdvancedNLU {
                 entities.extend(extracted);
             }
         }
-        
+
         // 提取时间实体
         entities.extend(self.extract_temporal_entities(query).await?);
-        
+
         // 提取空间实体
         entities.extend(self.extract_spatial_entities(query).await?);
-        
+
         // 提取数字实体
         entities.extend(self.extract_number_entities(query).await?);
-        
+
         // 去重和排序
         entities.sort_by(|a, b| a.start_pos.cmp(&b.start_pos));
         self.remove_overlapping_entities(&mut entities);
-        
+
         Ok(entities)
     }
 
@@ -641,32 +784,40 @@ impl AdvancedNLU {
                 return Some(regex.clone());
             }
         }
-        
+
         match Regex::new(pattern) {
             Ok(regex) => {
-                self.entity_regex_cache.write().insert(pattern.to_string(), regex.clone());
+                self.entity_regex_cache
+                    .write()
+                    .insert(pattern.to_string(), regex.clone());
                 Some(regex)
             }
             Err(_) => None,
         }
     }
 
-    fn extract_entities_by_type(&self, query: &str, entity_type: &str, pattern_info: &EntityPattern) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
+    fn extract_entities_by_type(
+        &self,
+        query: &str,
+        entity_type: &str,
+        pattern_info: &EntityPattern,
+    ) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        
+
         let context_hits = pattern_info
             .context_clues
             .iter()
             .filter(|clue| query.contains(clue.as_str()))
             .count();
-        
+
         // 使用正则模式匹配
         for pattern in &pattern_info.patterns {
             if let Some(regex) = self.get_compiled_entity_regex(pattern) {
                 for mat in regex.find_iter(query) {
                     let text = mat.as_str();
-                    let confidence = self.calculate_entity_confidence(text, context_hits, pattern_info);
-                    
+                    let confidence =
+                        self.calculate_entity_confidence(text, context_hits, pattern_info);
+
                     entities.push(ExtractedEntity {
                         text: text.to_string(),
                         entity_type: entity_type.to_string(),
@@ -678,12 +829,12 @@ impl AdvancedNLU {
                 }
             }
         }
-        
+
         // 基于关键词的实体识别（同一关键词的多次出现都要产出）
         for keyword in &pattern_info.keywords {
             for (start, matched) in query.match_indices(keyword.as_str()) {
                 let confidence = 0.7; // 关键词匹配的基础置信度
-                
+
                 entities.push(ExtractedEntity {
                     text: matched.to_string(),
                     entity_type: entity_type.to_string(),
@@ -694,25 +845,30 @@ impl AdvancedNLU {
                 });
             }
         }
-        
+
         Ok(entities)
     }
 
-    fn calculate_entity_confidence(&self, text: &str, context_hits: usize, pattern_info: &EntityPattern) -> f64 {
+    fn calculate_entity_confidence(
+        &self,
+        text: &str,
+        context_hits: usize,
+        pattern_info: &EntityPattern,
+    ) -> f64 {
         let mut confidence: f64 = 0.5; // 基础置信度
-        
+
         // 检查实体文本是否包含类型关键词
         for keyword in &pattern_info.keywords {
             if text.contains(keyword) {
                 confidence += 0.2;
             }
         }
-        
+
         // 上下文线索通常出现在实体以外的句中语境（如「刘德华的年龄」中的「年龄」），须在整句上匹配
         for _ in 0..context_hits {
             confidence += 0.1;
         }
-        
+
         confidence.min(1.0)
     }
 
@@ -800,10 +956,13 @@ impl AdvancedNLU {
         total.checked_add(section)?.checked_add(current)
     }
 
-    async fn extract_temporal_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
+    async fn extract_temporal_entities(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         let temporal_patterns = &self.temporal_patterns;
-        
+
         for (regex, time_type) in temporal_patterns.iter() {
             for mat in regex.find_iter(query) {
                 entities.push(ExtractedEntity {
@@ -816,14 +975,17 @@ impl AdvancedNLU {
                 });
             }
         }
-        
+
         Ok(entities)
     }
 
-    async fn extract_spatial_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
+    async fn extract_spatial_entities(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         let spatial_patterns = &self.spatial_patterns;
-        
+
         for (regex, location_type) in spatial_patterns.iter() {
             for mat in regex.find_iter(query) {
                 entities.push(ExtractedEntity {
@@ -836,14 +998,17 @@ impl AdvancedNLU {
                 });
             }
         }
-        
+
         Ok(entities)
     }
 
-    async fn extract_number_entities(&self, query: &str) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
+    async fn extract_number_entities(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ExtractedEntity>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
         let number_patterns = &self.number_patterns;
-        
+
         for (regex, _number_type) in number_patterns.iter() {
             for mat in regex.find_iter(query) {
                 let text = mat.as_str();
@@ -857,7 +1022,7 @@ impl AdvancedNLU {
                 });
             }
         }
-        
+
         Ok(entities)
     }
 
@@ -901,9 +1066,14 @@ impl AdvancedNLU {
         !(entity1.end_pos <= entity2.start_pos || entity2.end_pos <= entity1.start_pos)
     }
 
-    async fn extract_slots(&self, query: &str, intent_info: &(String, f64), entities: &[ExtractedEntity]) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    async fn extract_slots(
+        &self,
+        query: &str,
+        intent_info: &(String, f64),
+        entities: &[ExtractedEntity],
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
         let mut slots = HashMap::new();
-        
+
         {
             let intent_patterns = self.intent_patterns.read();
             if let Some(pattern_info) = intent_patterns.get(&intent_info.0) {
@@ -915,26 +1085,40 @@ impl AdvancedNLU {
                 }
             }
         }
-        
+
         Ok(slots)
     }
 
-    fn extract_slot_value(&self, query: &str, slot_name: &str, entities: &[ExtractedEntity]) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    fn extract_slot_value(
+        &self,
+        query: &str,
+        slot_name: &str,
+        entities: &[ExtractedEntity],
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         match slot_name {
             "entity" => {
                 // 查找第一个人物、组织或概念实体
                 for entity in entities {
-                    if matches!(entity.entity_type.as_str(), "PERSON" | "ORGANIZATION" | "CONCEPT") {
+                    if matches!(
+                        entity.entity_type.as_str(),
+                        "PERSON" | "ORGANIZATION" | "CONCEPT"
+                    ) {
                         return Ok(Some(entity.text.clone()));
                     }
                 }
             }
             "entity1" | "entity2" => {
                 // 查找实体对
-                let relevant_entities: Vec<_> = entities.iter()
-                    .filter(|e| matches!(e.entity_type.as_str(), "PERSON" | "ORGANIZATION" | "CONCEPT"))
+                let relevant_entities: Vec<_> = entities
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e.entity_type.as_str(),
+                            "PERSON" | "ORGANIZATION" | "CONCEPT"
+                        )
+                    })
                     .collect();
-                
+
                 if slot_name == "entity1" && !relevant_entities.is_empty() {
                     return Ok(Some(relevant_entities[0].text.clone()));
                 } else if slot_name == "entity2" && relevant_entities.len() > 1 {
@@ -943,7 +1127,9 @@ impl AdvancedNLU {
             }
             "attribute" => {
                 // 基于常见属性词汇提取
-                let attribute_keywords = ["年龄", "身高", "体重", "职业", "出生", "学历", "作品", "成就"];
+                let attribute_keywords = [
+                    "年龄", "身高", "体重", "职业", "出生", "学历", "作品", "成就",
+                ];
                 for keyword in &attribute_keywords {
                     if query.contains(keyword) {
                         return Ok(Some(keyword.to_string()));
@@ -960,17 +1146,21 @@ impl AdvancedNLU {
             }
             _ => {}
         }
-        
+
         Ok(None)
     }
 
-    async fn analyze_context(&self, query: &str, entities: &[ExtractedEntity]) -> Result<QueryContext, Box<dyn std::error::Error>> {
+    async fn analyze_context(
+        &self,
+        query: &str,
+        entities: &[ExtractedEntity],
+    ) -> Result<QueryContext, Box<dyn std::error::Error>> {
         let query_type = self.determine_query_type(query, entities).await?;
         let domain = self.determine_domain(query, entities).await?;
         let temporal_info = self.extract_temporal_context(entities);
         let spatial_info = self.extract_spatial_context(entities);
         let modifiers = self.extract_modifiers(query).await?;
-        
+
         Ok(QueryContext {
             query_type,
             domain,
@@ -980,7 +1170,11 @@ impl AdvancedNLU {
         })
     }
 
-    async fn determine_query_type(&self, query: &str, _entities: &[ExtractedEntity]) -> Result<String, Box<dyn std::error::Error>> {
+    async fn determine_query_type(
+        &self,
+        query: &str,
+        _entities: &[ExtractedEntity],
+    ) -> Result<String, Box<dyn std::error::Error>> {
         if query.contains("是什么") || query.contains("是谁") {
             Ok("definition".to_string())
         } else if query.contains("怎么") || query.contains("如何") {
@@ -996,9 +1190,13 @@ impl AdvancedNLU {
         }
     }
 
-    async fn determine_domain(&self, query: &str, entities: &[ExtractedEntity]) -> Result<String, Box<dyn std::error::Error>> {
+    async fn determine_domain(
+        &self,
+        query: &str,
+        entities: &[ExtractedEntity],
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let domain_keywords = &self.domain_keywords;
-        
+
         // 命中关键词最多的领域胜出；同分按领域名字典序打破平局
         let mut best: Option<(&String, usize)> = None;
         for (domain, keywords) in domain_keywords.iter() {
@@ -1022,7 +1220,7 @@ impl AdvancedNLU {
         if let Some((domain, _)) = best {
             return Ok(domain.clone());
         }
-        
+
         // 基于实体类型推断领域
         for entity in entities {
             match entity.entity_type.as_str() {
@@ -1032,18 +1230,29 @@ impl AdvancedNLU {
                 _ => {}
             }
         }
-        
+
         Ok("GENERAL".to_string())
     }
 
     fn extract_temporal_context(&self, entities: &[ExtractedEntity]) -> Option<TemporalInfo> {
         for entity in entities {
             if entity.entity_type == "TEMPORAL" {
-                let is_relative = matches!(entity.normalized_value.as_deref(), 
-                    Some("TODAY") | Some("TOMORROW") | Some("YESTERDAY") | Some("NOW") | Some("PAST") | Some("FUTURE")
-                    | Some("LAST_WEEK") | Some("NEXT_WEEK") | Some("LAST_MONTH") | Some("NEXT_MONTH")
-                    | Some("LAST_YEAR") | Some("NEXT_YEAR"));
-                
+                let is_relative = matches!(
+                    entity.normalized_value.as_deref(),
+                    Some("TODAY")
+                        | Some("TOMORROW")
+                        | Some("YESTERDAY")
+                        | Some("NOW")
+                        | Some("PAST")
+                        | Some("FUTURE")
+                        | Some("LAST_WEEK")
+                        | Some("NEXT_WEEK")
+                        | Some("LAST_MONTH")
+                        | Some("NEXT_MONTH")
+                        | Some("LAST_YEAR")
+                        | Some("NEXT_YEAR")
+                );
+
                 return Some(TemporalInfo {
                     time_type: entity.normalized_value.clone().unwrap_or_default(),
                     time_value: entity.text.clone(),
@@ -1057,9 +1266,11 @@ impl AdvancedNLU {
     fn extract_spatial_context(&self, entities: &[ExtractedEntity]) -> Option<SpatialInfo> {
         for entity in entities {
             if entity.entity_type == "SPATIAL" {
-                let is_relative = matches!(entity.normalized_value.as_deref(),
-                    Some("HERE") | Some("THERE") | Some("NEARBY") | Some("FAR"));
-                
+                let is_relative = matches!(
+                    entity.normalized_value.as_deref(),
+                    Some("HERE") | Some("THERE") | Some("NEARBY") | Some("FAR")
+                );
+
                 return Some(SpatialInfo {
                     location_type: entity.normalized_value.clone().unwrap_or_default(),
                     location_value: entity.text.clone(),
@@ -1070,25 +1281,29 @@ impl AdvancedNLU {
         None
     }
 
-    async fn extract_modifiers(&self, query: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    async fn extract_modifiers(
+        &self,
+        query: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let modifiers = [
-            "最", "更", "非常", "特别", "很", "极其", "相当", "十分", "比较", "稍微", "略", "大概", "大约", "可能", "也许", "或许", "一定", "肯定", "必须", "应该", "需要"
+            "最", "更", "非常", "特别", "很", "极其", "相当", "十分", "比较", "稍微", "略", "大概",
+            "大约", "可能", "也许", "或许", "一定", "肯定", "必须", "应该", "需要",
         ];
-        
+
         let mut found_modifiers = Vec::new();
         for modifier in modifiers {
             if query.contains(modifier) {
                 found_modifiers.push(modifier.to_string());
             }
         }
-        
+
         Ok(found_modifiers)
     }
 
     fn update_context_memory(&self, context: &QueryContext) {
         let mut memory = self.context_memory.write();
         memory.push(context.clone());
-        
+
         // 保持最近的10个上下文
         if memory.len() > 10 {
             memory.remove(0);
@@ -1127,7 +1342,7 @@ mod tests {
     #[tokio::test]
     async fn test_intent_recognition() {
         let nlu = AdvancedNLU::new();
-        
+
         let result = nlu.analyze_query("刘德华是谁").await.unwrap();
         assert_eq!(result.intent, "entity_query");
         assert!(result.confidence > 0.0);
@@ -1136,12 +1351,14 @@ mod tests {
     #[tokio::test]
     async fn test_entity_extraction() {
         let nlu = AdvancedNLU::new();
-        
+
         let result = nlu.analyze_query("刘德华的年龄是多少").await.unwrap();
         assert!(!result.entities.is_empty());
-        
+
         // 应该提取到人物实体
-        let person_entities: Vec<_> = result.entities.iter()
+        let person_entities: Vec<_> = result
+            .entities
+            .iter()
             .filter(|e| e.entity_type == "PERSON")
             .collect();
         assert!(!person_entities.is_empty());
@@ -1150,7 +1367,7 @@ mod tests {
     #[tokio::test]
     async fn test_slot_extraction() {
         let nlu = AdvancedNLU::new();
-        
+
         let result = nlu.analyze_query("刘德华的年龄是多少").await.unwrap();
         assert!(result.slots.contains_key("entity"));
         assert!(result.slots.contains_key("attribute"));
@@ -1159,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn test_context_analysis() {
         let nlu = AdvancedNLU::new();
-        
+
         let result = nlu.analyze_query("明天北京的天气怎么样").await.unwrap();
         assert!(result.context.temporal_info.is_some());
         assert_eq!(result.context.query_type, "how_to");
@@ -1168,10 +1385,10 @@ mod tests {
     #[test]
     fn test_word_similarity() {
         let nlu = AdvancedNLU::new();
-        
+
         let similarity = nlu.calculate_word_similarity("苹果", "苹果");
         assert_eq!(similarity, 1.0);
-        
+
         let similarity = nlu.calculate_word_similarity("苹果", "苹");
         assert!(similarity >= 0.5); // 编辑距离为1，最大长度为2，相似度为0.5
     }

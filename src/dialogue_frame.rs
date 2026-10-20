@@ -52,10 +52,16 @@ pub trait OntologyView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotOrigin {
     Explicit,
-    Inherited { turn: u64 },
-    FromPending { turn: u64 },
+    Inherited {
+        turn: u64,
+    },
+    FromPending {
+        turn: u64,
+    },
     /// 无源可填的洞由用户回答澄清问题后绑定（第几轮发起的澄清）
-    Clarified { turn: u64 },
+    Clarified {
+        turn: u64,
+    },
 }
 
 impl Default for SlotOrigin {
@@ -91,12 +97,7 @@ pub struct AskAttributeFrame {
 }
 
 impl AskAttributeFrame {
-    pub fn new(
-        raw: &str,
-        turn: u64,
-        entity: Option<String>,
-        attribute: Option<String>,
-    ) -> Self {
+    pub fn new(raw: &str, turn: u64, entity: Option<String>, attribute: Option<String>) -> Self {
         Self {
             entity,
             attribute,
@@ -260,7 +261,14 @@ impl ClarificationRequest {
             return ClarificationReply::Unmatched;
         }
         const CANCEL: [&str; 9] = [
-            "都不是", "算了", "取消", "不用了", "不查了", "不问了", "结束澄清", "停止澄清",
+            "都不是",
+            "算了",
+            "取消",
+            "不用了",
+            "不查了",
+            "不问了",
+            "结束澄清",
+            "停止澄清",
             "退出澄清",
         ];
         if CANCEL.contains(&reply) {
@@ -523,8 +531,9 @@ impl FrameMemory {
             return;
         }
         // 同实体同属性的挂账去重（保留最新）
-        self.pending
-            .retain(|pending| !(pending.entity == frame.entity && pending.attribute == frame.attribute));
+        self.pending.retain(|pending| {
+            !(pending.entity == frame.entity && pending.attribute == frame.attribute)
+        });
         self.pending.push(frame);
         while self.pending.len() > self.max_pending {
             self.pending.remove(0);
@@ -542,11 +551,9 @@ impl FrameMemory {
         let mut pending_index = None;
 
         if filled.entity.is_none() && filled.attribute.is_some() {
-            if let Some(index) = self
-                .pending
-                .iter()
-                .rposition(|pending| pending.entity.is_some() && pending.attribute == filled.attribute)
-            {
+            if let Some(index) = self.pending.iter().rposition(|pending| {
+                pending.entity.is_some() && pending.attribute == filled.attribute
+            }) {
                 let pending = &self.pending[index];
                 filled.entity = pending.entity.clone();
                 filled.entity_origin = SlotOrigin::FromPending { turn: pending.turn };
@@ -655,9 +662,7 @@ impl FrameMemory {
                     .saturating_sub(self.turn.saturating_sub(request.turn));
                 output.push_str(&format!(
                     "澄清（等待绑定，第 {} 轮发起，剩余 {} 轮）：原问句「{}」，候选：",
-                    request.turn,
-                    remaining,
-                    request.raw
+                    request.turn, remaining, request.raw
                 ));
                 let list: Vec<String> = request
                     .candidates
@@ -707,10 +712,7 @@ fn trim_tail(input: &str) -> &str {
     input
         .trim()
         .trim_end_matches(|c: char| {
-            matches!(
-                c,
-                '？' | '?' | '。' | '！' | '!' | ' ' | '～' | '~' | '…'
-            )
+            matches!(c, '？' | '?' | '。' | '！' | '!' | ' ' | '～' | '~' | '…')
         })
         .trim()
 }
@@ -778,11 +780,7 @@ fn strip_question_suffixes(mut core: &str) -> &str {
 }
 
 /// 把一个（已去壳的）核心词解析成槽位填充：实体 → 属性 → 两者
-fn parse_slots(
-    core: &str,
-    ontology: &dyn OntologyView,
-    turn: u64,
-) -> Option<AskAttributeFrame> {
+fn parse_slots(core: &str, ontology: &dyn OntologyView, turn: u64) -> Option<AskAttributeFrame> {
     if let Some((left, right)) = core.split_once('的') {
         let left = left.trim();
         let right = right.trim();
@@ -850,12 +848,7 @@ pub fn parse_bare_attribute_question(
         return None;
     }
     let attribute = ontology.canonical_attribute(stripped)?;
-    Some(AskAttributeFrame::new(
-        trimmed,
-        turn,
-        None,
-        Some(attribute),
-    ))
+    Some(AskAttributeFrame::new(trimmed, turn, None, Some(attribute)))
 }
 
 /// 复合属性问句：A的P1和P2[和P3]（是多少/分别是什么…）
@@ -878,7 +871,12 @@ pub fn parse_compound(
     let (entity_raw, rest) = core.split_once('的')?;
     let entity = ontology.canonical_entity(entity_raw.trim())?;
     let parts: Vec<&str> = rest
-        .split(|c: char| matches!(c, '和' | '与' | '跟' | '及' | '、' | '，' | ',' | '；' | ';'))
+        .split(|c: char| {
+            matches!(
+                c,
+                '和' | '与' | '跟' | '及' | '、' | '，' | ',' | '；' | ';'
+            )
+        })
         .map(str::trim)
         .filter(|part| !part.is_empty())
         .collect();
@@ -931,11 +929,7 @@ mod tests {
         }
     }
 
-    fn frame(
-        entity: Option<&str>,
-        attribute: Option<&str>,
-        turn: u64,
-    ) -> AskAttributeFrame {
+    fn frame(entity: Option<&str>, attribute: Option<&str>, turn: u64) -> AskAttributeFrame {
         AskAttributeFrame::new(
             "测试",
             turn,
@@ -1100,7 +1094,10 @@ mod tests {
         memory.begin_turn();
         let compound = parse_compound("姚明的身高和体重是多少", &ontology, memory.turn()).unwrap();
         memory.record_compound(compound.frames);
-        assert_eq!(memory.last().map(|f| f.display()).as_deref(), Some("姚明 的 身高"));
+        assert_eq!(
+            memory.last().map(|f| f.display()).as_deref(),
+            Some("姚明 的 身高")
+        );
         assert_eq!(memory.pending().len(), 1);
         memory.begin_turn();
         let fragment = parse_followup("体重呢", &ontology, memory.turn()).unwrap();
@@ -1126,12 +1123,20 @@ mod tests {
     fn pending_capacity_is_bounded() {
         let mut memory = FrameMemory::new();
         memory.begin_turn();
-        for (index, attribute) in ["身高", "体重", "师傅", "师祖", "别名"].iter().enumerate() {
-            memory.push_pending(frame(Some("姚明"), Some(attribute), memory.turn() + index as u64));
+        for (index, attribute) in ["身高", "体重", "师傅", "师祖", "别名"].iter().enumerate()
+        {
+            memory.push_pending(frame(
+                Some("姚明"),
+                Some(attribute),
+                memory.turn() + index as u64,
+            ));
         }
         assert_eq!(memory.pending().len(), DEFAULT_MAX_PENDING);
         assert_eq!(
-            memory.pending().first().and_then(|f| f.attribute.as_deref()),
+            memory
+                .pending()
+                .first()
+                .and_then(|f| f.attribute.as_deref()),
             Some("体重"),
             "容量满时丢弃最旧挂账"
         );
@@ -1165,7 +1170,11 @@ mod tests {
         let request = pending_clarification(&mut memory);
         let prompt = request.prompt();
         assert!(prompt.contains("体重是多少"), "{}", prompt);
-        assert!(prompt.contains("1. 叶莉") && prompt.contains("2. 姚明"), "{}", prompt);
+        assert!(
+            prompt.contains("1. 叶莉") && prompt.contains("2. 姚明"),
+            "{}",
+            prompt
+        );
         assert!(memory.report().contains("等待绑定"));
         assert!(memory.report().contains("1.叶莉；2.姚明"));
     }
@@ -1186,7 +1195,10 @@ mod tests {
         assert_eq!(last.entity.as_deref(), Some("姚明"));
         assert_eq!(last.attribute.as_deref(), Some("体重"));
         assert_eq!(last.entity_origin, SlotOrigin::Clarified { turn: 1 });
-        assert!(memory.clarification().is_none(), "绑定后至多一条澄清应被消费");
+        assert!(
+            memory.clarification().is_none(),
+            "绑定后至多一条澄清应被消费"
+        );
     }
 
     #[test]
@@ -1212,7 +1224,10 @@ mod tests {
         assert_eq!(request.parse_reply("8"), ClarificationReply::OutOfRange);
         assert_eq!(request.parse_reply("都不是"), ClarificationReply::Cancel);
         assert_eq!(request.parse_reply("算了"), ClarificationReply::Cancel);
-        assert_eq!(request.parse_reply("诸葛亮是谁"), ClarificationReply::Unmatched);
+        assert_eq!(
+            request.parse_reply("诸葛亮是谁"),
+            ClarificationReply::Unmatched
+        );
     }
 
     #[test]
@@ -1275,7 +1290,8 @@ mod tests {
         assert_eq!(request.candidates.len(), 2);
         // 缺少澄清字段的快照仍可读：缺省即无澄清
         let stored_json = r#"{"turn":2,"last":null,"pending":[],"max_pending":4,"pending_ttl":6,"unifications":0,"pending_closed":0}"#;
-        let stored: FrameMemory = serde_json::from_str(stored_json).expect("缺少澄清字段的快照应可反序列化");
+        let stored: FrameMemory =
+            serde_json::from_str(stored_json).expect("缺少澄清字段的快照应可反序列化");
         assert!(stored.clarification().is_none());
     }
 }

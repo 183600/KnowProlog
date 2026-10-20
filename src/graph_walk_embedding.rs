@@ -237,13 +237,10 @@ impl GraphWalkEmbedding {
             return;
         }
         // 先借用查找：重复边（快照重放）直接跳过
-        let forward_exists = self
-            .neighbors
-            .get(subject)
-            .map_or(false, |list| {
-                list.iter()
-                    .any(|(pred, target)| pred == predicate && target == object)
-            });
+        let forward_exists = self.neighbors.get(subject).map_or(false, |list| {
+            list.iter()
+                .any(|(pred, target)| pred == predicate && target == object)
+        });
         if !forward_exists {
             let forward = (predicate.to_string(), object.to_string());
             match self.neighbors.get_mut(subject) {
@@ -255,13 +252,10 @@ impl GraphWalkEmbedding {
             self.edge_count += 1;
             self.vectors_dirty.store(true, Ordering::Release);
         }
-        let backward_exists = self
-            .neighbors
-            .get(object)
-            .map_or(false, |list| {
-                list.iter()
-                    .any(|(pred, target)| pred == predicate && target == subject)
-            });
+        let backward_exists = self.neighbors.get(object).map_or(false, |list| {
+            list.iter()
+                .any(|(pred, target)| pred == predicate && target == subject)
+        });
         if !backward_exists {
             let backward = (predicate.to_string(), subject.to_string());
             match self.neighbors.get_mut(object) {
@@ -409,9 +403,7 @@ impl GraphWalkEmbedding {
         }
         let mut result: Vec<(&str, f64)> = current.into_iter().collect();
         let cmp = |a: &(&str, f64), b: &(&str, f64)| {
-            rank_key(b.1)
-                .cmp(&rank_key(a.1))
-                .then_with(|| a.0.cmp(b.0))
+            rank_key(b.1).cmp(&rank_key(a.1)).then_with(|| a.0.cmp(b.0))
         };
         if limit != usize::MAX && result.len() > limit {
             result.select_nth_unstable_by(limit, cmp);
@@ -495,9 +487,7 @@ impl GraphWalkEmbedding {
             })
             .collect();
         let cmp = |a: &(&str, f64), b: &(&str, f64)| {
-            rank_key(b.1)
-                .cmp(&rank_key(a.1))
-                .then_with(|| a.0.cmp(b.0))
+            rank_key(b.1).cmp(&rank_key(a.1)).then_with(|| a.0.cmp(b.0))
         };
         let keep = k.max(1);
         if scored.len() > keep {

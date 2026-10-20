@@ -204,7 +204,12 @@ fn named_node(iri: &str) -> LedgerResult<NamedNode> {
     Ok(NamedNode::new(iri)?)
 }
 
-fn literal_quad(subject: &NamedNode, predicate: &str, value: &str, graph: &GraphName) -> LedgerResult<Quad> {
+fn literal_quad(
+    subject: &NamedNode,
+    predicate: &str,
+    value: &str,
+    graph: &GraphName,
+) -> LedgerResult<Quad> {
     Ok(Quad::new(
         subject.clone(),
         named_node(predicate)?,
@@ -233,7 +238,12 @@ pub fn rule_quads(entries: &[RuleLedgerEntry]) -> LedgerResult<Vec<Quad>> {
             &serde_json::to_string(entry)?,
             &graph,
         )?);
-        quads.push(literal_quad(&subject, P_HEAD, &entry.head.display(), &graph)?);
+        quads.push(literal_quad(
+            &subject,
+            P_HEAD,
+            &entry.head.display(),
+            &graph,
+        )?);
         let body = entry
             .body
             .iter()
@@ -262,7 +272,12 @@ pub fn rule_quads(entries: &[RuleLedgerEntry]) -> LedgerResult<Vec<Quad>> {
         &rule_fingerprint(entries),
         &graph,
     )?);
-    quads.push(literal_quad(&stamp, P_COUNT, &entries.len().to_string(), &graph)?);
+    quads.push(literal_quad(
+        &stamp,
+        P_COUNT,
+        &entries.len().to_string(),
+        &graph,
+    )?);
     Ok(quads)
 }
 
@@ -290,7 +305,12 @@ pub fn derived_quads(
             &serde_json::to_string(entry)?,
             &graph,
         )?);
-        quads.push(literal_quad(&subject, P_ATOM, &entry.atom.display(), &graph)?);
+        quads.push(literal_quad(
+            &subject,
+            P_ATOM,
+            &entry.atom.display(),
+            &graph,
+        )?);
         quads.push(literal_quad(
             &subject,
             P_RULE_SOURCE,
@@ -298,7 +318,12 @@ pub fn derived_quads(
             &graph,
         )?);
         for premise in &entry.premises {
-            quads.push(literal_quad(&subject, P_PREMISE, &premise.display(), &graph)?);
+            quads.push(literal_quad(
+                &subject,
+                P_PREMISE,
+                &premise.display(),
+                &graph,
+            )?);
         }
         quads.push(literal_quad(
             &subject,
@@ -332,9 +357,19 @@ pub fn derived_quads(
         Term::NamedNode(named_node(STAMP_CLASS)?),
         graph.clone(),
     ));
-    quads.push(literal_quad(&stamp, P_REVISION, &revision.to_string(), &graph)?);
+    quads.push(literal_quad(
+        &stamp,
+        P_REVISION,
+        &revision.to_string(),
+        &graph,
+    )?);
     quads.push(literal_quad(&stamp, P_FINGERPRINT, fingerprint, &graph)?);
-    quads.push(literal_quad(&stamp, P_COUNT, &entries.len().to_string(), &graph)?);
+    quads.push(literal_quad(
+        &stamp,
+        P_COUNT,
+        &entries.len().to_string(),
+        &graph,
+    )?);
     Ok(quads)
 }
 
@@ -419,7 +454,11 @@ pub fn parse_derived_graph(quads: impl Iterator<Item = Quad>) -> DerivedLedger {
     if !materialized && !entries.is_empty() {
         // 无账本戳的账本：从条目自身恢复物化戳
         materialized = true;
-        revision = entries.iter().map(|entry| entry.revision).max().unwrap_or(0);
+        revision = entries
+            .iter()
+            .map(|entry| entry.revision)
+            .max()
+            .unwrap_or(0);
         fingerprint = entries
             .first()
             .map(|entry| entry.fingerprint.clone())
@@ -451,7 +490,12 @@ mod tests {
         }
     }
 
-    fn rule(head: &str, args: Vec<LedgerTerm>, body: Vec<LedgerAtom>, source: &str) -> RuleLedgerEntry {
+    fn rule(
+        head: &str,
+        args: Vec<LedgerTerm>,
+        body: Vec<LedgerAtom>,
+        source: &str,
+    ) -> RuleLedgerEntry {
         let head = LedgerAtom {
             predicate: head.to_string(),
             terms: args,
@@ -476,7 +520,10 @@ mod tests {
     fn atom_display_matches_resolution_form() {
         let display = atom("师傅", vec![var("X"), var("Y")]).display();
         assert_eq!(display, "师傅(?X, ?Y)");
-        assert_eq!(atom("是", vec![constant("张三"), constant("学生")]).display(), "是(张三, 学生)");
+        assert_eq!(
+            atom("是", vec![constant("张三"), constant("学生")]).display(),
+            "是(张三, 学生)"
+        );
     }
 
     #[test]
@@ -503,7 +550,11 @@ mod tests {
 
         let mut changed = entry_a.clone();
         changed.confidence = 0.80;
-        assert_ne!(rule_fingerprint(&[changed, entry_b]), forward, "置信度变化应改变指纹");
+        assert_ne!(
+            rule_fingerprint(&[changed, entry_b]),
+            forward,
+            "置信度变化应改变指纹"
+        );
     }
 
     #[test]
@@ -511,8 +562,10 @@ mod tests {
         let body = vec![atom("师傅", vec![var("X"), var("Y")])];
         let entry = rule("老师", vec![var("X"), var("Y")], body, "中文规则");
         let quads = rule_quads(&[entry.clone()]).unwrap();
-        assert!(quads.iter().all(|quad| quad.graph_name
-            == GraphName::NamedNode(NamedNode::new(RULES_GRAPH).unwrap())));
+        assert!(quads
+            .iter()
+            .all(|quad| quad.graph_name
+                == GraphName::NamedNode(NamedNode::new(RULES_GRAPH).unwrap())));
 
         let ledger = parse_rule_graph(quads.into_iter());
         assert!(ledger.synced);
@@ -534,8 +587,10 @@ mod tests {
             fingerprint: "abc123".to_string(),
         };
         let quads = derived_quads(&[entry.clone()], 7, "abc123").unwrap();
-        assert!(quads.iter().all(|quad| quad.graph_name
-            == GraphName::NamedNode(NamedNode::new(DERIVED_GRAPH).unwrap())));
+        assert!(quads
+            .iter()
+            .all(|quad| quad.graph_name
+                == GraphName::NamedNode(NamedNode::new(DERIVED_GRAPH).unwrap())));
 
         let ledger = parse_derived_graph(quads.into_iter());
         assert!(ledger.materialized);

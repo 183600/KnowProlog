@@ -241,7 +241,10 @@ impl Chronicle {
     }
 
     fn lock(&self, exclusive: bool) -> std::io::Result<std::fs::File> {
-        Self::lock_exclusive(&Self::lock_path_for(&self.path.to_string_lossy()), exclusive)
+        Self::lock_exclusive(
+            &Self::lock_path_for(&self.path.to_string_lossy()),
+            exclusive,
+        )
     }
 
     /// 在持有锁的情况下把内存状态与磁盘对齐。
@@ -285,7 +288,12 @@ impl Chronicle {
                 "编年史被外部截短，内存中的历史比磁盘更长，拒绝续写",
             ));
         }
-        if !self.entries.iter().zip(entries.iter()).all(|(local, disk)| local == disk) {
+        if !self
+            .entries
+            .iter()
+            .zip(entries.iter())
+            .all(|(local, disk)| local == disk)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "编年史出现分叉：磁盘前缀与内存不一致，拒绝续写",
@@ -411,9 +419,7 @@ impl Chronicle {
         let _lock = Self::lock_exclusive(&Self::lock_path_for(path), false)?;
         match std::fs::read(path) {
             Ok(bytes) => Ok(Self::verify_text(&String::from_utf8_lossy(&bytes)).1),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(ChainAudit::default())
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ChainAudit::default()),
             Err(error) => Err(error),
         }
     }
@@ -539,7 +545,10 @@ impl Chronicle {
                     .map(str::to_string),
             )
         });
-        let observed_seq = turn.as_ref().map(|(seq, _, _)| *seq).unwrap_or(self.last_seq());
+        let observed_seq = turn
+            .as_ref()
+            .map(|(seq, _, _)| *seq)
+            .unwrap_or(self.last_seq());
         let read_revision = turn
             .as_ref()
             .map(|(_, revision, _)| *revision)
@@ -556,7 +565,11 @@ impl Chronicle {
             "read_revision": read_revision,
             "commit_revision": commit_revision,
         });
-        if let Some(question) = question.as_deref().map(str::trim).filter(|question| !question.is_empty()) {
+        if let Some(question) = question
+            .as_deref()
+            .map(str::trim)
+            .filter(|question| !question.is_empty())
+        {
             payload["question"] = Value::from(question);
             payload["question_key"] = Value::from(question_key(question));
         }
@@ -654,8 +667,7 @@ impl Chronicle {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => return Err(error),
         };
-        let (disk_entries, audit) =
-            Self::verify_text(&String::from_utf8_lossy(&bytes));
+        let (disk_entries, audit) = Self::verify_text(&String::from_utf8_lossy(&bytes));
         if audit.is_clean() && disk_entries.len() >= self.entries.len() {
             self.entries = disk_entries;
         }
@@ -671,8 +683,7 @@ impl Chronicle {
     pub fn truncate_after(&mut self, seq: u64) -> std::io::Result<usize> {
         let _lock = self.lock(true)?;
         if let Ok(bytes) = std::fs::read(&self.path) {
-            let (disk_entries, audit) =
-                Self::verify_text(&String::from_utf8_lossy(&bytes));
+            let (disk_entries, audit) = Self::verify_text(&String::from_utf8_lossy(&bytes));
             if audit.is_clean() {
                 self.entries = disk_entries;
             }
@@ -754,8 +765,8 @@ fn normalize_log_text(text: &str, strip_particles: bool) -> String {
     let mut pending_space = false;
     for character in text.chars() {
         let mapped = match character {
-            '？' | '?' | '。' | '！' | '!' | '，' | ',' | '、' | '；' | ';' | '：' | ':'
-            | '\n' | '\r' | '\t' => ' ',
+            '？' | '?' | '。' | '！' | '!' | '，' | ',' | '、' | '；' | ';' | '：' | ':' | '\n'
+            | '\r' | '\t' => ' ',
             other => other.to_ascii_lowercase(),
         };
         if mapped.is_whitespace() {
@@ -795,15 +806,17 @@ mod tests {
         let path_text = path.to_string_lossy().to_string();
         let (mut chronicle, audit) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
         assert!(audit.is_clean());
-        chronicle
-            .append_turn("姚明是谁", "query", None, 0)
-            .unwrap();
+        chronicle.append_turn("姚明是谁", "query", None, 0).unwrap();
         chronicle.set_kb_revision(7);
         chronicle
             .append_turn("他的身高呢", "query", Some("姚明"), 1)
             .unwrap();
         chronicle
-            .append_reply("姚明的身高是 226 厘米。", &["direct_answer".to_string()], &["身高".to_string()])
+            .append_reply(
+                "姚明的身高是 226 厘米。",
+                &["direct_answer".to_string()],
+                &["身高".to_string()],
+            )
             .unwrap();
         (chronicle, path_text)
     }
@@ -821,7 +834,11 @@ mod tests {
         assert!(audit.is_clean(), "{}", audit.verdict());
         assert_eq!(reloaded.len(), 3);
         assert_eq!(reloaded.watermark().0, 3);
-        assert_eq!(std::fs::read(&path_text).unwrap(), bytes_before, "只读打开不得改写字节");
+        assert_eq!(
+            std::fs::read(&path_text).unwrap(),
+            bytes_before,
+            "只读打开不得改写字节"
+        );
         assert_eq!(reloaded.entries()[1].kb_revision, 7);
         assert_eq!(reloaded.kb_revision(), 7, "修订号应随链延续到重启后的会话");
     }
@@ -938,7 +955,9 @@ mod tests {
     fn search_hits_are_auditable_and_ordered() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = sample_chronicle(&dir);
-        chronicle.append_turn("姚明和叶莉的关系", "query", Some("姚明"), 3).unwrap();
+        chronicle
+            .append_turn("姚明和叶莉的关系", "query", Some("姚明"), 3)
+            .unwrap();
         let matches = chronicle.search("姚明");
         assert_eq!(matches.len(), 4, "{:?}", matches);
         assert_eq!(matches[0].seq, 1);
@@ -948,7 +967,9 @@ mod tests {
         assert!(matches[3].excerpt.contains("姚明"));
 
         // ASCII 大小写不敏感；空查询不命中
-        chronicle.append("note", serde_json::json!({"text": "Use CIM Envelope"})).unwrap();
+        chronicle
+            .append("note", serde_json::json!({"text": "Use CIM Envelope"}))
+            .unwrap();
         assert_eq!(chronicle.search("envelope").len(), 1);
         assert!(chronicle.search("   ").is_empty());
     }
@@ -957,7 +978,9 @@ mod tests {
     fn replay_and_truncate_respect_watermark() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, path_text) = sample_chronicle(&dir);
-        chronicle.append_turn("第三个问题", "query", Some("叶莉"), 3).unwrap();
+        chronicle
+            .append_turn("第三个问题", "query", Some("叶莉"), 3)
+            .unwrap();
 
         let replayed: Vec<u64> = chronicle.replay_to(2).iter().map(|e| e.seq).collect();
         assert_eq!(replayed, vec![1, 2]);
@@ -979,7 +1002,9 @@ mod tests {
         let path_text = path.to_string_lossy().to_string();
         let (mut chronicle, _) = Chronicle::open(&path_text, FsyncPolicy::EachAppend).unwrap();
         chronicle.append_turn("第一轮", "query", None, 0).unwrap();
-        chronicle.append_turn("第二轮", "query", Some("焦点"), 1).unwrap();
+        chronicle
+            .append_turn("第二轮", "query", Some("焦点"), 1)
+            .unwrap();
 
         // 模拟崩溃后重启：不调用任何保存逻辑，直接重新打开
         let (reloaded, audit) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
@@ -997,9 +1022,7 @@ mod tests {
         chronicle
             .append_turn("姚明的身高是多少？", "query", None, 0)
             .unwrap();
-        chronicle
-            .append_reply("226 厘米。", &[], &[])
-            .unwrap();
+        chronicle.append_reply("226 厘米。", &[], &[]).unwrap();
         let reply = chronicle.entries().last().unwrap();
         assert_eq!(
             reply.payload.get("question").and_then(Value::as_str),
@@ -1010,12 +1033,13 @@ mod tests {
             Some("姚明的身高是多少")
         );
 
-        chronicle
-            .append_turn("编年史", "command", None, 1)
-            .unwrap();
+        chronicle.append_turn("编年史", "command", None, 1).unwrap();
         chronicle.append_reply("档案状态", &[], &[]).unwrap();
         let reply = chronicle.entries().last().unwrap();
-        assert!(reply.payload.get("question").is_none(), "命令轮不进入问答一致性视图");
+        assert!(
+            reply.payload.get("question").is_none(),
+            "命令轮不进入问答一致性视图"
+        );
         assert_eq!(question_key("  姚明的身高是多少呢？ "), "姚明的身高是多少");
         assert_eq!(answer_key("226 厘米。"), answer_key("226 厘米"));
     }
@@ -1079,8 +1103,7 @@ mod tests {
         for worker in 0..4u64 {
             let path_text = Arc::clone(&path_text);
             handles.push(thread::spawn(move || {
-                let (mut chronicle, _) =
-                    Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
+                let (mut chronicle, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
                 for round in 0..10u64 {
                     chronicle
                         .append(
@@ -1131,7 +1154,9 @@ mod tests {
         let path = dir.path().join("watermark.chronicle.jsonl");
         let path_text = path.to_string_lossy().to_string();
         let (mut chronicle, _) = Chronicle::open(&path_text, FsyncPolicy::None).unwrap();
-        chronicle.append_turn("姚明的身高是多少？", "query", None, 0).unwrap();
+        chronicle
+            .append_turn("姚明的身高是多少？", "query", None, 0)
+            .unwrap();
         chronicle.set_kb_revision(7);
         chronicle.append_reply("226 厘米。", &[], &[]).unwrap();
         let reply = chronicle.entries().last().unwrap();

@@ -547,18 +547,10 @@ impl CausalAnalyzer {
         limit: usize,
     ) -> CounterfactualComparison {
         let limit = limit.max(1);
-        let factual = engine.infer_from_beliefs(
-            effect_pattern,
-            limit * 4,
-            factual_beliefs,
-            &HashMap::new(),
-        );
-        let counterfactual = engine.infer_from_beliefs(
-            effect_pattern,
-            limit * 4,
-            counterfactual_beliefs,
-            fixed,
-        );
+        let factual =
+            engine.infer_from_beliefs(effect_pattern, limit * 4, factual_beliefs, &HashMap::new());
+        let counterfactual =
+            engine.infer_from_beliefs(effect_pattern, limit * 4, counterfactual_beliefs, fixed);
         let mut merged: HashMap<String, CounterfactualDelta> = HashMap::new();
         for fact in &factual {
             merged.insert(

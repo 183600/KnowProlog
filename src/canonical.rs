@@ -78,11 +78,9 @@ impl std::fmt::Display for DecodeError {
                 "版本 {} 高于支持版本 {}（请升级程序）",
                 found, supported
             ),
-            DecodeError::Digest { found, expected } => write!(
-                formatter,
-                "摘要不匹配（发现 {}，期望 {}）",
-                found, expected
-            ),
+            DecodeError::Digest { found, expected } => {
+                write!(formatter, "摘要不匹配（发现 {}，期望 {}）", found, expected)
+            }
             DecodeError::Fingerprint(fields) => {
                 write!(formatter, "引擎指纹不匹配：{}", fields.join("、"))
             }
@@ -157,9 +155,8 @@ pub fn decode_json<T: DeserializeOwned + Serialize>(
             limit: max_bytes,
         });
     }
-    let value: T = serde_json::from_slice(bytes).map_err(|error| {
-        DecodeError::Parse(format!("{}", error))
-    })?;
+    let value: T =
+        serde_json::from_slice(bytes).map_err(|error| DecodeError::Parse(format!("{}", error)))?;
     let canonical_text = canonical_text(&value)?;
     let trimmed = trim_ascii_whitespace(bytes);
     let canonical = trimmed == canonical_text.as_bytes();
@@ -267,8 +264,7 @@ mod tests {
     fn decode_errors_have_stable_codes_and_never_panic() {
         let cases: Vec<(DecodeError, &str)> = vec![
             (
-                decode_json::<Sample>(b"{not json", "k", 1, 4096)
-                    .unwrap_err(),
+                decode_json::<Sample>(b"{not json", "k", 1, 4096).unwrap_err(),
                 "parse",
             ),
             (
@@ -279,22 +275,13 @@ mod tests {
                 decode_json::<Sample>(b"{\"name\":\"x\"}", "k", 1, 4).unwrap_err(),
                 "too_large",
             ),
-            (
-                DecodeError::Invariant("样例".to_string()),
-                "invariant",
-            ),
+            (DecodeError::Invariant("样例".to_string()), "invariant"),
             (
                 DecodeError::Fingerprint(vec!["kb_fingerprint".to_string()]),
                 "fingerprint",
             ),
-            (
-                DecodeError::Format("陌生格式".to_string()),
-                "format",
-            ),
-            (
-                DecodeError::Io("没有这个文件".to_string()),
-                "io",
-            ),
+            (DecodeError::Format("陌生格式".to_string()), "format"),
+            (DecodeError::Io("没有这个文件".to_string()), "io"),
             (
                 DecodeError::Version {
                     found: 9,

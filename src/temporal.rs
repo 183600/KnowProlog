@@ -145,9 +145,11 @@ impl TimePoint {
     pub fn period_end(self, granularity: TimeGranularity) -> Self {
         match granularity {
             TimeGranularity::Year => Self::new(self.year, 12, 31),
-            TimeGranularity::Month => {
-                Self::new(self.year, self.month as u32, days_in_month(self.year, self.month) as u32)
-            }
+            TimeGranularity::Month => Self::new(
+                self.year,
+                self.month as u32,
+                days_in_month(self.year, self.month) as u32,
+            ),
             TimeGranularity::Day => self,
         }
     }
@@ -422,9 +424,11 @@ impl Validity {
     pub fn is_satisfiable(self) -> bool {
         match self {
             Validity::Never => false,
-            Validity::Span(span) => span.start.is_none()
-                || span.end.is_none()
-                || matches!((span.start, span.end), (Some(s), Some(e)) if s <= e),
+            Validity::Span(span) => {
+                span.start.is_none()
+                    || span.end.is_none()
+                    || matches!((span.start, span.end), (Some(s), Some(e)) if s <= e)
+            }
             _ => true,
         }
     }
@@ -933,11 +937,9 @@ pub fn validity_from_bounds(start_text: Option<&str>, end_text: Option<&str>) ->
                 .unwrap_or(TimeGranularity::Year),
         );
     match (start, end) {
-        (Some(start), Some(end)) => {
-            TimeSpan::from_bounds(Some(start), Some(end), granularity)
-                .map(Validity::Span)
-                .unwrap_or(Validity::Never)
-        }
+        (Some(start), Some(end)) => TimeSpan::from_bounds(Some(start), Some(end), granularity)
+            .map(Validity::Span)
+            .unwrap_or(Validity::Never),
         (Some(start), None) => Validity::Span(TimeSpan {
             start: Some(start),
             end: None,
@@ -1088,16 +1090,14 @@ impl TemporalSession {
         if marker == "当时" || marker == "那时" {
             return self
                 .focus
-                .ok_or(TemporalError::UndefinedFocus {
-                    expression: marker,
-                })
+                .ok_or(TemporalError::UndefinedFocus { expression: marker })
                 .map(Some);
         }
-        let reference = self
-            .reference_day
-            .ok_or_else(|| TemporalError::UndefinedReferenceTime {
-                expression: marker.clone(),
-            })?;
+        let reference =
+            self.reference_day
+                .ok_or_else(|| TemporalError::UndefinedReferenceTime {
+                    expression: marker.clone(),
+                })?;
         let span = match marker.as_str() {
             "前年" => TimeSpan::year(reference.year - 2),
             "去年" => TimeSpan::year(reference.year - 1),
@@ -1133,8 +1133,20 @@ impl TemporalSession {
 
 fn first_relative_marker(text: &str) -> Option<String> {
     const MARKERS: &[&str] = &[
-        "大前天", "大后天", "前年", "去年", "今年", "明年", "后年", "前天", "昨天", "今天",
-        "明天", "后天", "当时", "那时",
+        "大前天",
+        "大后天",
+        "前年",
+        "去年",
+        "今年",
+        "明年",
+        "后年",
+        "前天",
+        "昨天",
+        "今天",
+        "明天",
+        "后天",
+        "当时",
+        "那时",
     ];
     MARKERS
         .iter()
@@ -1172,7 +1184,11 @@ struct DateCapture {
 
 fn capture_from_match(capture: &regex::Captures<'_>) -> Option<DateCapture> {
     let year: i32 = capture.name("year")?.as_str().parse().ok()?;
-    let year = if capture.name("bc").is_some() { -year } else { year };
+    let year = if capture.name("bc").is_some() {
+        -year
+    } else {
+        year
+    };
     let month: Option<u32> = capture
         .name("month")
         .and_then(|value| value.as_str().parse().ok());
@@ -1426,7 +1442,10 @@ mod tests {
         );
         assert_eq!(
             parse_time_span("1995年之前"),
-            Some(TimeSpan::before(TimePoint::year(1995), TimeGranularity::Year))
+            Some(TimeSpan::before(
+                TimePoint::year(1995),
+                TimeGranularity::Year
+            ))
         );
         assert_eq!(parse_time_point("公元前221年"), Some(TimePoint::year(-221)));
         assert_eq!(

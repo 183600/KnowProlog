@@ -438,7 +438,12 @@ impl Lexicon {
     /// 在字符串中寻找最长已知实体（用于问句切分）
     pub fn find_entity(&self, text: &str) -> Option<String> {
         let mut names: Vec<&String> = self.entities.iter().collect();
-        names.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
+        names.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
         names
             .into_iter()
             .find(|name| name.chars().count() >= 2 && text.contains(name.as_str()))
@@ -569,11 +574,10 @@ impl TinyModel {
         if from.is_empty() || rel_type.is_empty() || to.is_empty() {
             return;
         }
-        if !self.binary.insert((
-            from.to_string(),
-            rel_type.to_string(),
-            to.to_string(),
-        )) {
+        if !self
+            .binary
+            .insert((from.to_string(), rel_type.to_string(), to.to_string()))
+        {
             return;
         }
         self.fact_count += 1;
@@ -772,10 +776,7 @@ impl TinyModel {
 
     fn isa(&self, entity: &str, class: &str) -> bool {
         let class_variants = self.name_variants(class);
-        if class_variants
-            .iter()
-            .any(|c| c == "实体" || c == "事物")
-        {
+        if class_variants.iter().any(|c| c == "实体" || c == "事物") {
             return self.entities.contains(entity) || self.types.contains_key(entity);
         }
         let direct: BTreeSet<String> = self
@@ -996,9 +997,11 @@ impl TinyModel {
                 _ => false,
             }
         };
-        let holds = subjects
-            .iter()
-            .any(|subject| right_names.iter().any(|target| values_match(subject, target)));
+        let holds = subjects.iter().any(|subject| {
+            right_names
+                .iter()
+                .any(|target| values_match(subject, target))
+        });
         Eval::Truth(holds)
     }
 
@@ -1250,7 +1253,18 @@ pub enum QueryOutcome {
 // ---------------------------------------------------------------------------
 
 const QUESTION_WORDS: [&str; 12] = [
-    "谁", "什么", "多少", "几", "哪", "哪个", "哪些", "哪里", "何人", "怎么", "为什么", "如何",
+    "谁",
+    "什么",
+    "多少",
+    "几",
+    "哪",
+    "哪个",
+    "哪些",
+    "哪里",
+    "何人",
+    "怎么",
+    "为什么",
+    "如何",
 ];
 const ASSERTION_MARKERS: [&str; 8] = ["是", "为", "不", "没", "所有", "每个", "并且", "或者"];
 const DET_ALL: [&str; 6] = ["所有", "每个", "每一个", "任何", "全部", "一切"];
@@ -1447,7 +1461,11 @@ impl FormalSemantics {
         let right = self.chart_parse(&right_tokens, &mut right_trace)?;
         let left_term = saturate(left)?;
         let right_term = saturate(right)?;
-        trace.push(format!("条件句：{} → {}", left_term.render(), right_term.render()));
+        trace.push(format!(
+            "条件句：{} → {}",
+            left_term.render(),
+            right_term.render()
+        ));
         let term = Term::Implies(Box::new(left_term), Box::new(right_term));
         Some(LogicalForm {
             source: source.to_string(),
@@ -1506,7 +1524,8 @@ impl FormalSemantics {
         }
         // 3) 「谁 / 哪些人 / 何人 …」：实体查询
         if let Some(first) = tokens.first() {
-            if ["谁", "哪些人", "哪些", "何人", "什么人", "哪个"].contains(&first.as_str()) {
+            if ["谁", "哪些人", "哪些", "何人", "什么人", "哪个"].contains(&first.as_str())
+            {
                 let mut rest = &tokens[1..];
                 while rest
                     .first()
@@ -1605,7 +1624,8 @@ impl FormalSemantics {
         let mut best: Option<(String, String)> = None;
         for length in 1..tokens.len() {
             let prefix: String = tokens[..length].concat();
-            if !self.lexicon.is_entity_name(&prefix) && self.lexicon.find_entity(&prefix).is_none() {
+            if !self.lexicon.is_entity_name(&prefix) && self.lexicon.find_entity(&prefix).is_none()
+            {
                 continue;
             }
             let rest: Vec<String> = tokens[length..]
@@ -2055,10 +2075,12 @@ impl FormalSemantics {
 fn saturate(item: Item) -> Option<Term> {
     match &item.ty {
         Type::Truth => Some(item.term),
-        Type::Fun(dom, cod) if **dom == Type::Entity && **cod == Type::Truth => Some(Term::Exists {
-            var: "x".into(),
-            body: Box::new(Term::apply(item.term, Term::Var("x".into()))),
-        }),
+        Type::Fun(dom, cod) if **dom == Type::Entity && **cod == Type::Truth => {
+            Some(Term::Exists {
+                var: "x".into(),
+                body: Box::new(Term::apply(item.term, Term::Var("x".into()))),
+            })
+        }
         _ => None,
     }
 }
@@ -2236,7 +2258,10 @@ impl SemanticMemory {
         } else {
             self.focus_entities.join(" → ")
         };
-        let predicate = self.last_predicate.clone().unwrap_or_else(|| "（无）".to_string());
+        let predicate = self
+            .last_predicate
+            .clone()
+            .unwrap_or_else(|| "（无）".to_string());
         format!(
             "语义记忆：最近逻辑形式 {} 条，话题实体 [{}]，上一谓词「{}」。",
             self.forms.len(),

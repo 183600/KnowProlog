@@ -430,7 +430,7 @@ impl ExternalKnowledgeService {
 
     fn get_fallback_entities(&self, question: &str) -> Vec<String> {
         let mut entities = Vec::new();
-        
+
         if question.contains("首都") {
             entities.push("巴黎".to_string());
             entities.push("法国".to_string());
@@ -456,7 +456,7 @@ impl ExternalKnowledgeService {
         if question.contains("行星") {
             entities.push("木星".to_string());
         }
-        
+
         entities
     }
 
@@ -468,7 +468,7 @@ impl ExternalKnowledgeService {
                 }
             }
         }
-        
+
         if question.contains("海拔") {
             for (attr, value) in &knowledge.avp {
                 if attr.contains("海拔") || attr.contains("高度") {
@@ -476,7 +476,7 @@ impl ExternalKnowledgeService {
                 }
             }
         }
-        
+
         if question.contains("分子式") {
             for (attr, value) in &knowledge.avp {
                 if attr.contains("分子式") || attr.contains("化学式") {
@@ -484,7 +484,7 @@ impl ExternalKnowledgeService {
                 }
             }
         }
-        
+
         if question.contains("作者") {
             for (attr, value) in &knowledge.avp {
                 if attr.contains("作者") || attr.contains("创作者") {
@@ -510,7 +510,7 @@ impl ExternalKnowledgeService {
                 }
             }
         }
-        
+
         // Default response with entity description
         if let Some(desc) = &knowledge.desc {
             format!("关于{}：{}", knowledge.entity, desc)
@@ -526,9 +526,7 @@ fn asked_attribute(question: &str) -> Option<String> {
     match plan {
         // 只处理"X 的 P 是什么"这类单跳属性问句；计数/存在/反问
         // 需要不同的答案模板，不能套用"X 的 P 是 V"。
-        QueryPlan::FindObject { segments } if segments.len() >= 2 => {
-            segments.last().cloned()
-        }
+        QueryPlan::FindObject { segments } if segments.len() >= 2 => segments.last().cloned(),
         _ => None,
     }
 }
@@ -580,7 +578,10 @@ fn align_external_attribute(
         .collect::<Vec<_>>();
     if values.is_empty() {
         // 最佳候选没有取值时，选择第一个确有取值的等价候选。
-        let answer = decision.answers.iter().find(|answer| !answer.answers.is_empty())?;
+        let answer = decision
+            .answers
+            .iter()
+            .find(|answer| !answer.answers.is_empty())?;
         let candidate = decision
             .resolution
             .candidates
@@ -775,11 +776,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_entry_survives_refresh_boundary() {
-        let mut ledger = ExternalLedger::with_config(
-            8,
-            1,
-            PerfLedger::shared(),
-        );
+        let mut ledger = ExternalLedger::with_config(8, 1, PerfLedger::shared());
         ledger.advance_tick();
         ledger.store_entity(
             "法国",
@@ -861,7 +858,10 @@ mod tests {
 
     #[test]
     fn asked_attribute_reuses_query_plan() {
-        assert_eq!(asked_attribute("姚明的国籍是什么？").as_deref(), Some("国籍"));
+        assert_eq!(
+            asked_attribute("姚明的国籍是什么？").as_deref(),
+            Some("国籍")
+        );
         assert_eq!(asked_attribute("李四有几个师傅？"), None);
         assert_eq!(asked_attribute("今天天气不错"), None);
     }

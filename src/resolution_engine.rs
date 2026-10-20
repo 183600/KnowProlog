@@ -66,11 +66,7 @@ impl Atom {
 
     /// 基原子（全是常量）
     pub fn rel(predicate: &str, subject: &str, object: &str) -> Self {
-        Self::pattern(
-            predicate,
-            Term::constant(subject),
-            Term::constant(object),
-        )
+        Self::pattern(predicate, Term::constant(subject), Term::constant(object))
     }
 
     pub fn arity(&self) -> usize {
@@ -663,9 +659,7 @@ impl ResolutionEngine {
             b.confidence
                 .total_cmp(&a.confidence)
                 .then_with(|| binding_key(&a.bindings).cmp(&binding_key(&b.bindings)))
-                .then_with(|| {
-                    proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs))
-                })
+                .then_with(|| proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs)))
         });
         if solutions.len() > self.max_solutions {
             trace.note(TruncationCause::SolutionLimit);
@@ -723,9 +717,7 @@ impl ResolutionEngine {
             b.confidence
                 .total_cmp(&a.confidence)
                 .then_with(|| typed_binding_key(&a.bindings).cmp(&typed_binding_key(&b.bindings)))
-                .then_with(|| {
-                    proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs))
-                })
+                .then_with(|| proofs_canonical_key(&a.proofs).cmp(&proofs_canonical_key(&b.proofs)))
         });
         solutions.truncate(self.max_solutions);
         solutions
@@ -840,11 +832,8 @@ impl ResolutionEngine {
                     continue;
                 }
                 // 头合一失败时无需换名规则体
-                let fresh_body: Vec<Atom> = clause
-                    .body
-                    .iter()
-                    .map(|atom| renamer.atom(atom))
-                    .collect();
+                let fresh_body: Vec<Atom> =
+                    clause.body.iter().map(|atom| renamer.atom(atom)).collect();
                 for (solved, children) in
                     self.prove_body(&fresh_body, depth + 1, &unified, counter, budget, trace)
                 {
@@ -1104,11 +1093,7 @@ pub fn unify_atoms(pattern: &Atom, other: &Atom, subst: &mut Substitution) -> bo
 
 /// 记录本次合一中已处理的变量；返回 true 表示该变量重复出现或容器已满。
 #[inline]
-fn remember_var(
-    touched: &mut [Option<Arc<str>>; 4],
-    len: &mut usize,
-    name: &Arc<str>,
-) -> bool {
+fn remember_var(touched: &mut [Option<Arc<str>>; 4], len: &mut usize, name: &Arc<str>) -> bool {
     for slot in touched.iter().flatten() {
         if Arc::ptr_eq(slot, name) || **slot == **name {
             return true;
@@ -1190,7 +1175,11 @@ pub fn apply_atom(subst: &Substitution, atom: &Atom) -> Atom {
     }
     Atom {
         predicate: atom.predicate.clone(),
-        terms: atom.terms.iter().map(|term| apply_term(subst, term)).collect(),
+        terms: atom
+            .terms
+            .iter()
+            .map(|term| apply_term(subst, term))
+            .collect(),
     }
 }
 
@@ -1478,14 +1467,28 @@ mod tests {
     #[test]
     fn test_unify_terms_and_substitution_chains() {
         let mut subst = Substitution::new();
-        assert!(unify_terms(&Term::var("X"), &Term::constant("张三"), &mut subst));
+        assert!(unify_terms(
+            &Term::var("X"),
+            &Term::constant("张三"),
+            &mut subst
+        ));
         assert_eq!(subst.get("X"), Some(&Term::constant("张三")));
         // 变量链：X→Y 后，X 与常量合一应绑定到 Y，并能沿链解析出常量
         let mut subst = Substitution::new();
         subst.insert("X".to_string(), Term::var("Y"));
-        assert!(unify_terms(&Term::var("X"), &Term::constant("李四"), &mut subst));
-        assert_eq!(resolve_term(&Term::var("X"), &subst), Term::constant("李四"));
-        assert_eq!(resolve_term(&Term::var("Y"), &subst), Term::constant("李四"));
+        assert!(unify_terms(
+            &Term::var("X"),
+            &Term::constant("李四"),
+            &mut subst
+        ));
+        assert_eq!(
+            resolve_term(&Term::var("X"), &subst),
+            Term::constant("李四")
+        );
+        assert_eq!(
+            resolve_term(&Term::var("Y"), &subst),
+            Term::constant("李四")
+        );
         // 同一变量出现在两个位置时必须绑定同一常量（出现检查的等价约束）
         assert!(!unify_atoms(
             &Atom::pattern("师傅", Term::var("X"), Term::var("X")),
@@ -1535,7 +1538,10 @@ mod tests {
         let goal = Atom::pattern("师傅", Term::constant("张三"), Term::var("X"));
         let solutions = engine.solve(&[goal], &["X".to_string()]);
         assert_eq!(solutions.len(), 1);
-        assert_eq!(solutions[0].bindings.get("X").map(String::as_str), Some("李四"));
+        assert_eq!(
+            solutions[0].bindings.get("X").map(String::as_str),
+            Some("李四")
+        );
     }
 
     #[test]
@@ -1604,7 +1610,10 @@ mod tests {
         ];
         let solutions = engine.solve(&goals, &["X".to_string()]);
         assert_eq!(solutions.len(), 1);
-        assert_eq!(solutions[0].bindings.get("X").map(String::as_str), Some("王五"));
+        assert_eq!(
+            solutions[0].bindings.get("X").map(String::as_str),
+            Some("王五")
+        );
         assert_eq!(solutions[0].proofs.len(), 2);
     }
 
@@ -1739,7 +1748,11 @@ mod tests {
             "祖先递归规则",
         ));
         let outcome = engine.solve_outcome(
-            &[Atom::pattern("祖先", Term::constant("a"), Term::constant("d"))],
+            &[Atom::pattern(
+                "祖先",
+                Term::constant("a"),
+                Term::constant("d"),
+            )],
             &[],
         );
         assert_eq!(outcome.status, SearchStatus::Incomplete);
@@ -1767,7 +1780,9 @@ mod tests {
         assert_eq!(outcome.status, SearchStatus::Proved);
         assert_eq!(outcome.solutions.len(), 1);
         assert!(outcome.is_truncated());
-        assert!(outcome.truncations.contains(&TruncationCause::SolutionLimit));
+        assert!(outcome
+            .truncations
+            .contains(&TruncationCause::SolutionLimit));
         assert!(outcome.render_status().contains("结果可能不完整"));
         assert_eq!(
             outcome.solutions[0].bindings.get("X").map(String::as_str),
@@ -1789,7 +1804,10 @@ mod tests {
         let first = engine.solve_outcome(&goals, &["X".to_string(), "Y".to_string()]);
         let second = engine.solve_outcome(&goals, &["X".to_string(), "Y".to_string()]);
         assert_eq!(first.status, SearchStatus::Exhausted);
-        assert!(first.frontier.iter().any(|entry| entry.goal == "父母(张三, ?Y)"));
+        assert!(first
+            .frontier
+            .iter()
+            .any(|entry| entry.goal == "父母(张三, ?Y)"));
         assert_eq!(first.frontier, second.frontier, "前沿顺序必须确定");
         assert_eq!(first.truncations, second.truncations);
         assert_eq!(first.stats.goal_attempts, second.stats.goal_attempts);
@@ -1801,11 +1819,7 @@ mod tests {
     fn frontier_omitted_counts_unique_entries_only() {
         let mut trace = SearchTrace::default();
         for index in 0..=MAX_FRONTIER_ENTRIES {
-            let atom = Atom::rel(
-                "父母",
-                &format!("主体{}", index),
-                &format!("客体{}", index),
-            );
+            let atom = Atom::rel("父母", &format!("主体{}", index), &format!("客体{}", index));
             trace.frontier(&atom, 1, FrontierReason::MissingFactOrRule);
         }
         // 超出容量的同一条缺口被再次命中：不能重复计数。

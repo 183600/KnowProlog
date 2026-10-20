@@ -1,5 +1,5 @@
 use crate::nlp::{merge_name_fragments, normalize_words, preprocess, TaggedWord};
-use crate::{SystemConfig, NlpConfig};
+use crate::{NlpConfig, SystemConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,7 +85,11 @@ impl NLUEngine {
             }
         }
 
-        semantics.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        semantics.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         SemanticAnalysis {
             input: input.to_string(),
@@ -105,7 +109,9 @@ impl NLUEngine {
         let mut best_slots = Vec::new();
 
         for intent in &domain.intents {
-            if let Some((score, slots)) = self.match_intent(input, tagged_words, input_words, intent) {
+            if let Some((score, slots)) =
+                self.match_intent(input, tagged_words, input_words, intent)
+            {
                 if score > best_score {
                     best_score = score;
                     best_intent = Some(intent.name.clone());
@@ -204,7 +210,7 @@ impl NLUEngine {
         }
 
         let score = matched_count as f64 / total_count as f64;
-        
+
         if score > 0.6 {
             Some((score, slots))
         } else {
@@ -236,13 +242,14 @@ impl NLUEngine {
         occurrence: usize,
     ) -> Option<String> {
         match slot_config.slot_type.as_str() {
-            "城市" | "地点" => {
-                self.nth_matching_value(tagged_words, occurrence, |word| {
-                    word.pos == "ns"
-                        || word.pos == "n"
-                        || matches!(word.text.as_str(), "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉")
-                })
-            }
+            "城市" | "地点" => self.nth_matching_value(tagged_words, occurrence, |word| {
+                word.pos == "ns"
+                    || word.pos == "n"
+                    || matches!(
+                        word.text.as_str(),
+                        "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉"
+                    )
+            }),
             "日期" | "时间" => {
                 for pattern in &slot_config.patterns {
                     for word in tagged_words {
@@ -251,13 +258,20 @@ impl NLUEngine {
                         }
                     }
                 }
-                
+
                 for word in tagged_words {
-                    if word.pos == "m" && (word.text.contains("天") || word.text.contains("月") || word.text.contains("年")) {
+                    if word.pos == "m"
+                        && (word.text.contains("天")
+                            || word.text.contains("月")
+                            || word.text.contains("年"))
+                    {
                         return Some(word.text.clone());
                     }
                     // 检查常见时间词
-                    if matches!(word.text.as_str(), "明天" | "后天" | "今天" | "昨天" | "大后天") {
+                    if matches!(
+                        word.text.as_str(),
+                        "明天" | "后天" | "今天" | "昨天" | "大后天"
+                    ) {
                         return Some(word.text.clone());
                     }
                 }
@@ -265,7 +279,10 @@ impl NLUEngine {
             }
             "人名" => self.nth_matching_value(tagged_words, occurrence, |word| {
                 word.pos == "nr"
-                    || matches!(word.text.as_str(), "姚明" | "刘德华" | "张三" | "李四" | "王五" | "李明")
+                    || matches!(
+                        word.text.as_str(),
+                        "姚明" | "刘德华" | "张三" | "李四" | "王五" | "李明"
+                    )
             }),
             "数量" => self.nth_matching_value(tagged_words, occurrence, |word| {
                 word.pos == "m" || word.text.chars().all(|c| c.is_numeric())
@@ -274,7 +291,10 @@ impl NLUEngine {
                 word.pos == "nr"
                     || word.pos == "ns"
                     || word.pos == "n"
-                    || matches!(word.text.as_str(), "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五")
+                    || matches!(
+                        word.text.as_str(),
+                        "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五"
+                    )
             }),
             "属性" => {
                 // 属性是「X的Y」中的名词性成分，取最后一个名词
@@ -293,7 +313,7 @@ impl NLUEngine {
         if word1 == word2 {
             return 1.0;
         }
-        
+
         if word1.contains(word2) || word2.contains(word1) {
             // 单字包含（如「会」⊂「会不会下雨」）不构成词语相似：
             // 否则「麻雀会飞」等普通句子会被误判为天气意图，永远到不了符号推理
@@ -306,7 +326,7 @@ impl NLUEngine {
                 return 0.8;
             }
         }
-        
+
         if let Some(synonyms) = &self.synonyms {
             if let Some(normalized1) = synonyms.get(word1) {
                 if normalized1 == word2 {
@@ -319,7 +339,7 @@ impl NLUEngine {
                 }
             }
         }
-        
+
         0.0
     }
 }
@@ -348,13 +368,21 @@ fn create_default_domains() -> Vec<DomainConfig> {
                             name: "城市".to_string(),
                             slot_type: "城市".to_string(),
                             required: true,
-                            patterns: vec!["厦门".to_string(), "北京".to_string(), "上海".to_string()],
+                            patterns: vec![
+                                "厦门".to_string(),
+                                "北京".to_string(),
+                                "上海".to_string(),
+                            ],
                         },
                         SlotConfig {
                             name: "日期".to_string(),
                             slot_type: "日期".to_string(),
                             required: false,
-                            patterns: vec!["明天".to_string(), "后天".to_string(), "今天".to_string()],
+                            patterns: vec![
+                                "明天".to_string(),
+                                "后天".to_string(),
+                                "今天".to_string(),
+                            ],
                         },
                     ],
                     priority: 10,
@@ -396,14 +424,12 @@ fn create_default_domains() -> Vec<DomainConfig> {
                         "{人名} 多高".to_string(),
                         "{人名} 真正的身高".to_string(),
                     ],
-                    slots: vec![
-                        SlotConfig {
-                            name: "人名".to_string(),
-                            slot_type: "人名".to_string(),
-                            required: true,
-                            patterns: vec![],
-                        },
-                    ],
+                    slots: vec![SlotConfig {
+                        name: "人名".to_string(),
+                        slot_type: "人名".to_string(),
+                        required: true,
+                        patterns: vec![],
+                    }],
                     priority: 10,
                 },
                 IntentConfig {
@@ -413,14 +439,12 @@ fn create_default_domains() -> Vec<DomainConfig> {
                         "{人名} 多大".to_string(),
                         "{人名} 几岁".to_string(),
                     ],
-                    slots: vec![
-                        SlotConfig {
-                            name: "人名".to_string(),
-                            slot_type: "人名".to_string(),
-                            required: true,
-                            patterns: vec![],
-                        },
-                    ],
+                    slots: vec![SlotConfig {
+                        name: "人名".to_string(),
+                        slot_type: "人名".to_string(),
+                        required: true,
+                        patterns: vec![],
+                    }],
                     priority: 9,
                 },
             ],
@@ -444,11 +468,7 @@ fn create_default_domains() -> Vec<DomainConfig> {
                 },
                 IntentConfig {
                     name: "感谢".to_string(),
-                    patterns: vec![
-                        "谢谢".to_string(),
-                        "感谢".to_string(),
-                        "thanks".to_string(),
-                    ],
+                    patterns: vec!["谢谢".to_string(), "感谢".to_string(), "thanks".to_string()],
                     slots: vec![],
                     priority: 5,
                 },

@@ -233,10 +233,9 @@ fn fix_chronicle(path: &str, kind: ArtifactKind) -> Result<ArtifactAudit, String
                 .map_err(|error| format!("{}: {}", path, error))?;
             Ok(audit_chronicle(path, kind))
         }
-        ArtifactStatus::NonCanonical => Err(format!(
-            "{}: chronicle 审计不应产生 non_canonical",
-            path
-        )),
+        ArtifactStatus::NonCanonical => {
+            Err(format!("{}: chronicle 审计不应产生 non_canonical", path))
+        }
     }
 }
 
@@ -343,12 +342,8 @@ fn verify(bytes: &[u8], kind: ArtifactKind) -> Result<(String, bool), DecodeErro
             "chronicle 不以 JSON 规范重编码审计（走哈希链校验）".to_string(),
         )),
         ArtifactKind::Json => {
-            let (value, receipt) = canonical::decode_json::<serde_json::Value>(
-                bytes,
-                kind.label(),
-                1,
-                limit,
-            )?;
+            let (value, receipt) =
+                canonical::decode_json::<serde_json::Value>(bytes, kind.label(), 1, limit)?;
             Ok((canonical::canonical_text(&value)?, receipt.canonical))
         }
     }
@@ -382,7 +377,11 @@ mod tests {
     use crate::symbolic_reasoner::DialogueContext;
 
     fn temp_path(label: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("kp-artifacts-{}-{}.json", std::process::id(), label))
+        std::env::temp_dir().join(format!(
+            "kp-artifacts-{}-{}.json",
+            std::process::id(),
+            label
+        ))
     }
 
     fn sample_context_image() -> ContextImage {
@@ -426,10 +425,18 @@ mod tests {
         let before = std::fs::read(&path_text).unwrap();
 
         let audit = audit(&path_text, ArtifactKind::ContextImage);
-        assert!(matches!(audit.status, ArtifactStatus::Damaged(_)), "{}", audit.status.label());
+        assert!(
+            matches!(audit.status, ArtifactStatus::Damaged(_)),
+            "{}",
+            audit.status.label()
+        );
         let error = fix(&path_text, ArtifactKind::ContextImage).unwrap_err();
         assert!(error.contains("never rewritten"), "{}", error);
-        assert_eq!(std::fs::read(&path_text).unwrap(), before, "损坏工件不得被改写");
+        assert_eq!(
+            std::fs::read(&path_text).unwrap(),
+            before,
+            "损坏工件不得被改写"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -440,9 +447,15 @@ mod tests {
         let audit = audit(&path_text, ArtifactKind::Json);
         assert_eq!(audit.status, ArtifactStatus::Missing);
         assert!(audit.is_clean());
-        assert!(!std::path::Path::new(&path_text).exists(), "审计不得创建文件");
+        assert!(
+            !std::path::Path::new(&path_text).exists(),
+            "审计不得创建文件"
+        );
         assert!(fix(&path_text, ArtifactKind::Json).is_ok());
-        assert!(!std::path::Path::new(&path_text).exists(), "fix 不得凭空创建");
+        assert!(
+            !std::path::Path::new(&path_text).exists(),
+            "fix 不得凭空创建"
+        );
     }
 
     #[test]
@@ -478,7 +491,9 @@ mod tests {
             ArtifactStatus::NonCanonical
         );
         assert_eq!(
-            fix(&path_text, ArtifactKind::SessionEnvelope).unwrap().status,
+            fix(&path_text, ArtifactKind::SessionEnvelope)
+                .unwrap()
+                .status,
             ArtifactStatus::Canonical
         );
         // 篡改内容 → Damaged，fix 拒绝
@@ -585,7 +600,11 @@ mod tests {
             audit.status.label()
         );
         assert!(fix(&path_text, ArtifactKind::Chronicle).is_err());
-        assert_eq!(std::fs::read(&path_text).unwrap(), before, "链中损坏不得被裁剪");
+        assert_eq!(
+            std::fs::read(&path_text).unwrap(),
+            before,
+            "链中损坏不得被裁剪"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -601,7 +620,9 @@ mod tests {
             ArtifactStatus::NonCanonical
         );
         assert_eq!(
-            fix(&path_text, ArtifactKind::DialogueManager).unwrap().status,
+            fix(&path_text, ArtifactKind::DialogueManager)
+                .unwrap()
+                .status,
             ArtifactStatus::Canonical
         );
         assert_eq!(
@@ -622,7 +643,9 @@ mod tests {
             report.status.label()
         );
         assert_eq!(
-            fix(&path_text, ArtifactKind::PredicateRegistry).unwrap().status,
+            fix(&path_text, ArtifactKind::PredicateRegistry)
+                .unwrap()
+                .status,
             ArtifactStatus::Canonical
         );
         let _ = std::fs::remove_file(&path);
@@ -638,7 +661,9 @@ mod tests {
             ArtifactStatus::NonCanonical
         );
         assert_eq!(
-            fix(&path_text, ArtifactKind::EntityRegistry).unwrap().status,
+            fix(&path_text, ArtifactKind::EntityRegistry)
+                .unwrap()
+                .status,
             ArtifactStatus::Canonical
         );
         let mut future: serde_json::Value =

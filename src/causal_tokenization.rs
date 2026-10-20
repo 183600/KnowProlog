@@ -129,7 +129,10 @@ pub struct CausalTokenization {
 
 impl CausalTokenization {
     pub fn token_texts(&self) -> Vec<&str> {
-        self.tokens.iter().map(|token| token.text.as_str()).collect()
+        self.tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .collect()
     }
 
     pub fn anchored_tokens(&self) -> impl Iterator<Item = &TokenSpan> {
@@ -241,7 +244,8 @@ impl CausalTokenizer {
         if self.index.contains_key(alias) {
             return;
         }
-        self.aliases.insert(alias.to_string(), canonical.to_string());
+        self.aliases
+            .insert(alias.to_string(), canonical.to_string());
     }
 
     /// 观察一条图谱事实：登记其实体/谓词锚（不含因果质量）
@@ -675,7 +679,12 @@ mod tests {
             .collect();
         assert_eq!(alt_first, alt_second, "备选分词应确定性");
         let deduped: HashSet<&String> = alt_first.iter().collect();
-        assert_eq!(alt_first.len(), deduped.len(), "备选不应重复：{:?}", alt_first);
+        assert_eq!(
+            alt_first.len(),
+            deduped.len(),
+            "备选不应重复：{:?}",
+            alt_first
+        );
         for alt in &first.alternatives {
             assert!(alt.score <= first.score + 1e-9);
         }
@@ -693,9 +702,7 @@ mod tests {
     fn test_causal_mass_accumulates_on_anchors() {
         let engine = chain_engine();
         let tokenizer = chain_tokenizer(&engine);
-        let shifu = tokenizer
-            .resolve("师傅")
-            .expect("应登记谓词锚");
+        let shifu = tokenizer.resolve("师傅").expect("应登记谓词锚");
         assert!(shifu.anchor.causal_mass > 0.0, "谓词应累计因果质量");
         assert!(shifu.anchor.causal_edges > 0);
         let zhang = tokenizer.resolve("张三").unwrap();

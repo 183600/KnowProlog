@@ -90,26 +90,36 @@ impl OwnthinkApiClient {
         self
     }
 
-    async fn make_request_with_retry<T, R>(&self, request_fn: impl Fn() -> R) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+    async fn make_request_with_retry<T, R>(
+        &self,
+        request_fn: impl Fn() -> R,
+    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
     where
         T: serde::de::DeserializeOwned,
         R: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
     {
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-        
+
         for attempt in 0..=self.max_retries {
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
-                    
+
                     if status.is_success() {
                         match response.json::<T>().await {
                             Ok(result) => return Ok(result),
                             Err(e) => {
                                 last_error = Some(Box::new(e));
                                 if attempt < self.max_retries {
-                                    eprintln!("JSON解析失败 (尝试 {}/{}), 将重试...", attempt + 1, self.max_retries + 1);
-                                    tokio::time::sleep(std::time::Duration::from_millis(self.retry_delay_ms)).await;
+                                    eprintln!(
+                                        "JSON解析失败 (尝试 {}/{}), 将重试...",
+                                        attempt + 1,
+                                        self.max_retries + 1
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        self.retry_delay_ms,
+                                    ))
+                                    .await;
                                     continue;
                                 }
                             }
@@ -118,8 +128,16 @@ impl OwnthinkApiClient {
                         // 服务器错误或限流，可以重试
                         last_error = Some(format!("HTTP错误: {}", status).into());
                         if attempt < self.max_retries {
-                            eprintln!("服务器错误 {} (尝试 {}/{}), 将重试...", status, attempt + 1, self.max_retries + 1);
-                            tokio::time::sleep(std::time::Duration::from_millis(self.retry_delay_ms * (attempt + 1) as u64)).await;
+                            eprintln!(
+                                "服务器错误 {} (尝试 {}/{}), 将重试...",
+                                status,
+                                attempt + 1,
+                                self.max_retries + 1
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                self.retry_delay_ms * (attempt + 1) as u64,
+                            ))
+                            .await;
                             continue;
                         }
                     } else {
@@ -130,32 +148,44 @@ impl OwnthinkApiClient {
                 Err(e) => {
                     last_error = Some(Box::new(e));
                     if attempt < self.max_retries {
-                        eprintln!("网络请求失败 (尝试 {}/{}), 将重试...", attempt + 1, self.max_retries + 1);
-                        tokio::time::sleep(std::time::Duration::from_millis(self.retry_delay_ms * (attempt + 1) as u64)).await;
+                        eprintln!(
+                            "网络请求失败 (尝试 {}/{}), 将重试...",
+                            attempt + 1,
+                            self.max_retries + 1
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            self.retry_delay_ms * (attempt + 1) as u64,
+                        ))
+                        .await;
                         continue;
                     }
                 }
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| "未知错误".into()))
     }
 
     /// 获取歧义关系 - 根据名称(mention)返回可能的实体列表
-    pub async fn get_ambiguous_entities(&self, mention: &str) -> Result<AmbiguousResponse, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_ambiguous_entities(
+        &self,
+        mention: &str,
+    ) -> Result<AmbiguousResponse, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/ambiguous", self.base_url);
         let request = AmbiguousRequest {
             mention: mention.to_string(),
         };
 
-        let response: AmbiguousResponse = self.make_request_with_retry(|| {
-            self.client
-                .post(&url)
-                .json(&request)
-                .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-                .send()
-        }).await?;
-        
+        let response: AmbiguousResponse = self
+            .make_request_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&request)
+                    .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+                    .send()
+            })
+            .await?;
+
         if response.message != "success" {
             return Err(format!("API返回错误: {}", response.message).into());
         }
@@ -164,20 +194,25 @@ impl OwnthinkApiClient {
     }
 
     /// 获取实体的完整知识
-    pub async fn get_entity_knowledge(&self, entity: &str) -> Result<KnowledgeResponse, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_entity_knowledge(
+        &self,
+        entity: &str,
+    ) -> Result<KnowledgeResponse, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/knowledge", self.base_url);
         let request = KnowledgeRequest {
             entity: entity.to_string(),
         };
 
-        let response: KnowledgeResponse = self.make_request_with_retry(|| {
-            self.client
-                .post(&url)
-                .json(&request)
-                .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-                .send()
-        }).await?;
-        
+        let response: KnowledgeResponse = self
+            .make_request_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&request)
+                    .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+                    .send()
+            })
+            .await?;
+
         if response.message != "success" {
             return Err(format!("API返回错误: {}", response.message).into());
         }
@@ -186,21 +221,27 @@ impl OwnthinkApiClient {
     }
 
     /// 获取实体的特定属性值
-    pub async fn get_entity_attribute_value(&self, entity: &str, attribute: &str) -> Result<EavResponse, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_entity_attribute_value(
+        &self,
+        entity: &str,
+        attribute: &str,
+    ) -> Result<EavResponse, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/eav", self.base_url);
         let request = EavRequest {
             entity: entity.to_string(),
             attribute: attribute.to_string(),
         };
 
-        let response: EavResponse = self.make_request_with_retry(|| {
-            self.client
-                .post(&url)
-                .json(&request)
-                .timeout(std::time::Duration::from_secs(self.timeout_seconds))
-                .send()
-        }).await?;
-        
+        let response: EavResponse = self
+            .make_request_with_retry(|| {
+                self.client
+                    .post(&url)
+                    .json(&request)
+                    .timeout(std::time::Duration::from_secs(self.timeout_seconds))
+                    .send()
+            })
+            .await?;
+
         if response.message != "success" {
             return Err(format!("API返回错误: {}", response.message).into());
         }
@@ -212,19 +253,28 @@ impl OwnthinkApiClient {
     ///
     /// 未提供上下文（或上下文无法区分）时选权重最高者；
     /// 提供上下文时用 [`select_candidate_by_context`] 做确定性消歧。
-    pub async fn resolve_entity_ambiguity(&self, mention: &str, context: Option<&str>) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn resolve_entity_ambiguity(
+        &self,
+        mention: &str,
+        context: Option<&str>,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
         let ambiguous_response = self.get_ambiguous_entities(mention).await?;
-        
+
         if ambiguous_response.data.is_empty() {
             return Ok(None);
         }
 
-        Ok(select_candidate_by_context(&ambiguous_response.data, context)
-            .map(|index| ambiguous_response.data[index].0.clone()))
+        Ok(
+            select_candidate_by_context(&ambiguous_response.data, context)
+                .map(|index| ambiguous_response.data[index].0.clone()),
+        )
     }
 
     /// 获取实体的简化知识 - 转换为内部知识表示
-    pub async fn get_simplified_knowledge(&self, entity: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_simplified_knowledge(
+        &self,
+        entity: &str,
+    ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
         let knowledge_response = self.get_entity_knowledge(entity).await?;
         let mut properties = HashMap::new();
 
@@ -244,9 +294,12 @@ impl OwnthinkApiClient {
     }
 
     /// 批量解析实体歧义
-    pub async fn batch_resolve_entities(&self, mentions: &[String]) -> Result<HashMap<String, Option<String>>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn batch_resolve_entities(
+        &self,
+        mentions: &[String],
+    ) -> Result<HashMap<String, Option<String>>, Box<dyn std::error::Error + Send + Sync>> {
         let mut results = HashMap::new();
-        
+
         for mention in mentions {
             match self.resolve_entity_ambiguity(mention, None).await {
                 Ok(resolved) => {
@@ -408,13 +461,13 @@ mod tests {
     #[tokio::test]
     async fn test_ambiguous_entities() {
         let client = OwnthinkApiClient::new();
-        
+
         match client.get_ambiguous_entities("苹果").await {
             Ok(response) => {
                 assert_eq!(response.message, "success");
                 assert!(!response.data.is_empty());
                 println!("找到 {} 个相关实体", response.data.len());
-                
+
                 for (entity, weight) in &response.data[..3.min(response.data.len())] {
                     println!("  - {} (权重: {})", entity, weight);
                 }
@@ -428,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn test_entity_knowledge() {
         let client = OwnthinkApiClient::new();
-        
+
         match client.get_entity_knowledge("刘德华").await {
             Ok(response) => {
                 assert_eq!(response.message, "success");
@@ -446,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_ambiguity() {
         let client = OwnthinkApiClient::new();
-        
+
         match client.resolve_entity_ambiguity("苹果", None).await {
             Ok(Some(entity)) => {
                 println!("消歧结果: {}", entity);
@@ -491,7 +544,10 @@ mod tests {
 
     #[test]
     fn longest_common_substring_len_measures_continuous_match() {
-        assert_eq!(longest_common_substring_len("苹果公司", "苹果公司发布了新产品"), 4);
+        assert_eq!(
+            longest_common_substring_len("苹果公司", "苹果公司发布了新产品"),
+            4
+        );
         assert_eq!(longest_common_substring_len("苹果", "蔷薇科植物的果实"), 1);
         assert_eq!(longest_common_substring_len("果实", "蔷薇科植物的果实"), 2);
         assert_eq!(longest_common_substring_len("苹", "蔷薇科植物的果实"), 0);
@@ -528,7 +584,10 @@ mod tests {
         ];
         // 无上下文：选权重最高者
         assert_eq!(select_candidate_by_context(&candidates, None), Some(0));
-        assert_eq!(select_candidate_by_context(&candidates, Some("   ")), Some(0));
+        assert_eq!(
+            select_candidate_by_context(&candidates, Some("   ")),
+            Some(0)
+        );
         // 上下文与所有候选都无关：仍回退到权重最高者
         assert_eq!(
             select_candidate_by_context(&candidates, Some("今天天气不错")),

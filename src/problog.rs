@@ -494,10 +494,8 @@ impl ProblogEngine {
         if probability <= 0.0 {
             return;
         }
-        self.probabilistic_facts.push(ProbabilisticFact {
-            atom,
-            probability,
-        });
+        self.probabilistic_facts
+            .push(ProbabilisticFact { atom, probability });
         self.invalidate();
     }
 
@@ -565,12 +563,7 @@ impl ProblogEngine {
     }
 
     /// 精确查询：可能世界加权模型计数（BDD 编译，无采样）
-    pub fn query(
-        &self,
-        pattern: &Atom,
-        limit: usize,
-        min_probability: f64,
-    ) -> ProblogQuery {
+    pub fn query(&self, pattern: &Atom, limit: usize, min_probability: f64) -> ProblogQuery {
         let compiled = self.compiled();
         let mut by_atom: HashMap<Atom, ProblogAnswer> = HashMap::new();
         for fact in &self.deterministic_facts {
@@ -618,7 +611,9 @@ impl ProblogEngine {
             if !pattern_matches(pattern, atom) || probability < min_probability {
                 continue;
             }
-            if self.deterministic_facts.contains(atom) || compiled.probabilistic_facts.contains_key(atom) {
+            if self.deterministic_facts.contains(atom)
+                || compiled.probabilistic_facts.contains_key(atom)
+            {
                 continue;
             }
             by_atom.insert(
@@ -759,7 +754,12 @@ impl ProblogEngine {
                     if !head.is_ground() {
                         continue;
                     }
-                    let key = format!("r{}\u{1}{}\u{1}{}", index, head.display(), render_premises(&premises));
+                    let key = format!(
+                        "r{}\u{1}{}\u{1}{}",
+                        index,
+                        head.display(),
+                        render_premises(&premises)
+                    );
                     if !seen.insert(key) {
                         continue;
                     }
@@ -768,10 +768,7 @@ impl ProblogEngine {
                     } else {
                         let var = bdd.new_var(
                             rule.probability,
-                            format!(
-                                "规则 {}（{:.2}）",
-                                rule.source, rule.probability
-                            ),
+                            format!("规则 {}（{:.2}）", rule.source, rule.probability),
                         );
                         (bdd.literal(var, true), rule.probability)
                     };
@@ -1136,18 +1133,8 @@ mod tests {
     fn test_probabilistic_rule_chain_multiplies() {
         let mut engine = rule_engine();
         engine.add_deterministic_fact(fact("p", "x", "y"));
-        engine.add_rule(
-            fact("a", "x", "y"),
-            vec![fact("p", "x", "y")],
-            0.6,
-            "p⇒a",
-        );
-        engine.add_rule(
-            fact("b", "x", "y"),
-            vec![fact("a", "x", "y")],
-            0.5,
-            "a⇒b",
-        );
+        engine.add_rule(fact("a", "x", "y"), vec![fact("p", "x", "y")], 0.6, "p⇒a");
+        engine.add_rule(fact("b", "x", "y"), vec![fact("a", "x", "y")], 0.5, "a⇒b");
         let query = engine.query(
             &Atom::pattern("b", Term::constant("x"), Term::var("Y")),
             5,
@@ -1163,12 +1150,7 @@ mod tests {
     fn test_probabilistic_premise_fact_contributes_probability_to_proof() {
         let mut engine = rule_engine();
         engine.add_probabilistic_fact(fact("p", "x", "y"), 0.8);
-        engine.add_rule(
-            fact("a", "x", "y"),
-            vec![fact("p", "x", "y")],
-            0.5,
-            "p⇒a",
-        );
+        engine.add_rule(fact("a", "x", "y"), vec![fact("p", "x", "y")], 0.5, "p⇒a");
         let query = engine.query(&fact("a", "x", "y"), 5, 0.0);
         assert_eq!(query.answers.len(), 1);
         assert!((query.answers[0].probability - 0.4).abs() < 1e-9);
@@ -1219,18 +1201,8 @@ mod tests {
         let mut engine = rule_engine();
         engine.add_probabilistic_fact(fact("q", "x", "y"), 0.3);
         engine.add_deterministic_fact(fact("t", "x", "y"));
-        engine.add_rule(
-            fact("q", "x", "y"),
-            vec![fact("t", "x", "y")],
-            0.9,
-            "t⇒q",
-        );
-        engine.add_rule(
-            fact("r", "x", "y"),
-            vec![fact("q", "x", "y")],
-            1.0,
-            "q⇒r",
-        );
+        engine.add_rule(fact("q", "x", "y"), vec![fact("t", "x", "y")], 0.9, "t⇒q");
+        engine.add_rule(fact("r", "x", "y"), vec![fact("q", "x", "y")], 1.0, "q⇒r");
         let expected = 1.0 - (1.0 - 0.3) * (1.0 - 0.9);
         let q = engine.query(&fact("q", "x", "y"), 5, 0.0);
         assert_eq!(q.answers.len(), 1);
@@ -1255,7 +1227,10 @@ mod tests {
     fn test_annotated_disjunction_is_mutually_exclusive() {
         let mut engine = rule_engine();
         engine.add_annotated_disjunction(
-            vec![(fact("晴", "今天", "是"), 0.3), (fact("雨", "今天", "是"), 0.7)],
+            vec![
+                (fact("晴", "今天", "是"), 0.3),
+                (fact("雨", "今天", "是"), 0.7),
+            ],
             Vec::new(),
             "天气注释析取",
         );
@@ -1278,18 +1253,8 @@ mod tests {
     fn test_shared_premise_exact_correlation_via_bdd() {
         let mut engine = rule_engine();
         engine.add_probabilistic_fact(fact("c", "x", "y"), 0.5);
-        engine.add_rule(
-            fact("a", "x", "y"),
-            vec![fact("c", "x", "y")],
-            0.6,
-            "c⇒a",
-        );
-        engine.add_rule(
-            fact("b", "x", "y"),
-            vec![fact("c", "x", "y")],
-            0.5,
-            "c⇒b",
-        );
+        engine.add_rule(fact("a", "x", "y"), vec![fact("c", "x", "y")], 0.6, "c⇒a");
+        engine.add_rule(fact("b", "x", "y"), vec![fact("c", "x", "y")], 0.5, "c⇒b");
         engine.add_rule(
             fact("ab", "x", "y"),
             vec![fact("a", "x", "y"), fact("b", "x", "y")],
@@ -1315,18 +1280,8 @@ mod tests {
             0.5,
             "base⇒a",
         );
-        engine.add_rule(
-            fact("a", "x", "y"),
-            vec![fact("b", "x", "y")],
-            0.5,
-            "b⇒a",
-        );
-        engine.add_rule(
-            fact("b", "x", "y"),
-            vec![fact("a", "x", "y")],
-            0.5,
-            "a⇒b",
-        );
+        engine.add_rule(fact("a", "x", "y"), vec![fact("b", "x", "y")], 0.5, "b⇒a");
+        engine.add_rule(fact("b", "x", "y"), vec![fact("a", "x", "y")], 0.5, "a⇒b");
         let query = engine.query(
             &Atom::pattern("a", Term::constant("x"), Term::var("Y")),
             1,
@@ -1394,11 +1349,7 @@ mod tests {
         );
         // 查询元数与事实元数不同：不匹配
         assert!(query.answers.is_empty());
-        let query = engine.query(
-            &Atom::unary("能上天", Term::constant("鸟")),
-            5,
-            0.0,
-        );
+        let query = engine.query(&Atom::unary("能上天", Term::constant("鸟")), 5, 0.0);
         assert!((query.answers[0].probability - 0.72).abs() < 1e-9);
     }
 }

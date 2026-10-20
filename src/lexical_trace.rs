@@ -33,7 +33,16 @@ pub const DEFAULT_FAILURE_TRACE_CAPACITY: usize = 32;
 
 /// 闭包/精确跳数标记词：出现位置与计划解读不一致时，轨迹必须能指出来。
 const CLOSURE_MARKERS: [&str; 10] = [
-    "的任何", "的一切", "的所有", "的全部", "的任意", "所有", "全部", "恰好", "正好", "刚好",
+    "的任何",
+    "的一切",
+    "的所有",
+    "的全部",
+    "的任意",
+    "所有",
+    "全部",
+    "恰好",
+    "正好",
+    "刚好",
 ];
 
 /// 轨迹保真度。第一版只做「事后按同一纯函数重跑」，不冒充当时的执行决策。
@@ -285,13 +294,16 @@ impl LexicalTrace {
     }
 
     /// 追加失败分类；同一（阶段、类别、详情）只保留一次，避免重复扫描膨胀。
-    pub fn push_failure(&mut self, stage: ReadStage, kind: ReadFailureKind, detail: impl Into<String>) {
+    pub fn push_failure(
+        &mut self,
+        stage: ReadStage,
+        kind: ReadFailureKind,
+        detail: impl Into<String>,
+    ) {
         let detail = detail.into();
-        if self
-            .failures
-            .iter()
-            .any(|failure| failure.stage == stage && failure.kind == kind && failure.detail == detail)
-        {
+        if self.failures.iter().any(|failure| {
+            failure.stage == stage && failure.kind == kind && failure.detail == detail
+        }) {
             return;
         }
         self.failures.push(ReadFailure {
@@ -414,10 +426,7 @@ impl LexicalTrace {
         if !self.markers.is_empty() {
             output.push_str(&format!("闭包/跳数标记（{}）：\n", self.markers.len()));
             for marker in &self.markers {
-                let mut line = format!(
-                    "  • 「{}」{}..{}",
-                    marker.marker, marker.start, marker.end
-                );
+                let mut line = format!("  • 「{}」{}..{}", marker.marker, marker.start, marker.end);
                 if let Some(token) = &marker.token_text {
                     line.push_str(&format!("，位于 token「{}」", token));
                 } else {
@@ -466,7 +475,11 @@ impl LexicalTrace {
         if !self.warnings.is_empty() {
             output.push_str(&format!("风险提示（{}）：\n", self.warnings.len()));
             for warning in &self.warnings {
-                output.push_str(&format!("  • {}：{}\n", warning.kind.label(), warning.detail));
+                output.push_str(&format!(
+                    "  • {}：{}\n",
+                    warning.kind.label(),
+                    warning.detail
+                ));
             }
         }
 
@@ -1101,7 +1114,9 @@ mod tests {
         assert!(!report.contains("张三"), "台账不得保存原始问句：{}", report);
         let snapshot = ledger.snapshot();
         assert_eq!(snapshot.len(), 2);
-        assert!(snapshot.iter().all(|receipt| !receipt.question_digest.is_empty()));
+        assert!(snapshot
+            .iter()
+            .all(|receipt| !receipt.question_digest.is_empty()));
     }
 
     #[test]
@@ -1117,12 +1132,7 @@ mod tests {
     #[test]
     fn lexicon_gap_report_groups_unknown_tokens_and_boundary_risks() {
         let config = config();
-        let questions = [
-            "张三的所有权归谁",
-            "李四的所有权归公司",
-            "所有权归谁",
-            "",
-        ];
+        let questions = ["张三的所有权归谁", "李四的所有权归公司", "所有权归谁", ""];
         let first = lexicon_gap_report(questions, &config);
         let second = lexicon_gap_report(questions, &config);
         assert_eq!(first, second, "同一语料必须得到同一缺口报告");

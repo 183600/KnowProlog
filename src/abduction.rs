@@ -195,9 +195,8 @@ pub fn classify_answer(text: &str) -> AnswerKind {
     // 最长匹配优先："不确定" 优先于 "不"，"不是" 优先于 "不"
     let mut best: Option<(usize, AnswerKind)> = None;
     for (keyword, kind) in keywords {
-        let matched = trimmed.starts_with(keyword)
-            || lower.starts_with(keyword)
-            || trimmed == keyword;
+        let matched =
+            trimmed.starts_with(keyword) || lower.starts_with(keyword) || trimmed == keyword;
         if matched {
             let length = keyword.chars().count();
             if best.map(|(current, _)| length > current).unwrap_or(true) {
@@ -205,7 +204,8 @@ pub fn classify_answer(text: &str) -> AnswerKind {
             }
         }
     }
-    best.map(|(_, kind)| kind).unwrap_or(AnswerKind::Unrecognized)
+    best.map(|(_, kind)| kind)
+        .unwrap_or(AnswerKind::Unrecognized)
 }
 
 /// 一次澄清对话：逐条向用户确认待定假设，并记忆确认/否定/不确定
@@ -401,8 +401,7 @@ impl AbductionEngine {
                 if !entity_type.trim().is_empty()
                     && self.entity_types.get(name).map(String::as_str) != Some(entity_type.as_str())
                 {
-                    self.entity_types
-                        .insert(name.clone(), entity_type.clone());
+                    self.entity_types.insert(name.clone(), entity_type.clone());
                 }
             }
         }
@@ -412,9 +411,7 @@ impl AbductionEngine {
                     self.observe_triple(from, rel_type, to);
                 }
                 PrologFact::Entity {
-                    name,
-                    properties,
-                    ..
+                    name, properties, ..
                 } => {
                     // 实体类型已在第一遍登记，这里无需重复写入
                     for (key, value) in properties {
@@ -735,7 +732,12 @@ impl AbductionEngine {
     }
 
     /// 候选取值：同谓词已知取值 → 与另一侧同类型实体 → 特征最相似实体
-    fn candidate_values(&self, engine: &ResolutionEngine, atom: &Atom, var_index: usize) -> Vec<String> {
+    fn candidate_values(
+        &self,
+        engine: &ResolutionEngine,
+        atom: &Atom,
+        var_index: usize,
+    ) -> Vec<String> {
         let mut candidates: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let predicate: &str = &atom.predicate;
@@ -743,7 +745,8 @@ impl AbductionEngine {
         // 1) 同谓词已知取值（按频次降序）
         if let Some(counts) = self.pred_objects.get(predicate) {
             let mut values: Vec<(&String, &u64)> = counts.iter().collect();
-            let cmp = |a: &(&String, &u64), b: &(&String, &u64)| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0));
+            let cmp =
+                |a: &(&String, &u64), b: &(&String, &u64)| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0));
             // 取前 6 名
             if values.len() > 6 {
                 values.select_nth_unstable_by(6, cmp);
@@ -758,17 +761,13 @@ impl AbductionEngine {
         }
 
         // 另一侧的基（用于类型/特征对比）
-        let counterpart = atom
-            .terms
-            .iter()
-            .enumerate()
-            .find_map(|(index, term)| {
-                if index != var_index {
-                    constant_name(term)
-                } else {
-                    None
-                }
-            });
+        let counterpart = atom.terms.iter().enumerate().find_map(|(index, term)| {
+            if index != var_index {
+                constant_name(term)
+            } else {
+                None
+            }
+        });
 
         if let Some(base) = counterpart {
             // 2) 同类型实体（共享主体类型时最自然）
@@ -928,9 +927,10 @@ impl AbductionEngine {
 
         // 4) 特征重叠（Jaccard）
         if let (Some(subject), Some(object)) = (subject, object) {
-            if let (Some(subject_features), Some(object_features)) =
-                (self.entity_features.get(subject), self.entity_features.get(object))
-            {
+            if let (Some(subject_features), Some(object_features)) = (
+                self.entity_features.get(subject),
+                self.entity_features.get(object),
+            ) {
                 let inter = subject_features.intersection(object_features).count();
                 let union = (subject_features.len() + object_features.len())
                     .saturating_sub(inter)
@@ -985,7 +985,12 @@ impl AbductionEngine {
         if reasons.is_empty() {
             reasons.push("无同谓词历史与类型证据（低置信度假设）".to_string());
         }
-        (score.clamp(0.02, 0.95), reasons, conflicts, contradicts_known)
+        (
+            score.clamp(0.02, 0.95),
+            reasons,
+            conflicts,
+            contradicts_known,
+        )
     }
 
     /// 功能谓词：≥3 个主语且 90% 以上主语只有唯一取值
@@ -1059,8 +1064,7 @@ impl AbductionEngine {
             .map(|frontier| {
                 let size = frontier.len();
                 let support = quality(&frontier);
-                let display_len: usize =
-                    frontier.iter().map(|atom| atom.display().len()).sum();
+                let display_len: usize = frontier.iter().map(|atom| atom.display().len()).sum();
                 (frontier, size, support, display_len)
             })
             .collect();
@@ -1400,13 +1404,7 @@ struct FrontierSearch<'a> {
 }
 
 impl<'a> FrontierSearch<'a> {
-    fn run(
-        &mut self,
-        goals: &[Atom],
-        subst: &Substitution,
-        depth: usize,
-        missing: &mut Vec<Atom>,
-    ) {
+    fn run(&mut self, goals: &[Atom], subst: &Substitution, depth: usize, missing: &mut Vec<Atom>) {
         if self.budget == 0 || self.results.len() >= self.max_frontiers {
             return;
         }
@@ -1521,10 +1519,7 @@ fn render_proof_tree(
 }
 
 /// 渲染溯因报告：可证则给证明，不可证则给"失败前沿 + 候选假设"
-pub fn render_report(
-    report: &AbductionReport,
-    render: &dyn Fn(&Atom) -> String,
-) -> String {
+pub fn render_report(report: &AbductionReport, render: &dyn Fn(&Atom) -> String) -> String {
     let goal = render(&report.goal);
     if report.provable {
         let mut output = format!(
@@ -1578,10 +1573,16 @@ pub fn render_report(
         }
         output.push('\n');
         if !hypothesis.reasons.is_empty() {
-            output.push_str(&format!("        依据：{}\n", hypothesis.reasons.join("；")));
+            output.push_str(&format!(
+                "        依据：{}\n",
+                hypothesis.reasons.join("；")
+            ));
         }
         if !hypothesis.conflicts.is_empty() {
-            output.push_str(&format!("        冲突：{}\n", hypothesis.conflicts.join("；")));
+            output.push_str(&format!(
+                "        冲突：{}\n",
+                hypothesis.conflicts.join("；")
+            ));
         }
     }
     output.push_str(
@@ -1690,10 +1691,7 @@ pub fn render_clarification_summary(
     session: &ClarificationSession,
     render: &dyn Fn(&Atom) -> String,
 ) -> String {
-    let mut output = format!(
-        "【澄清结束】{}。\n",
-        session.progress_text()
-    );
+    let mut output = format!("【澄清结束】{}。\n", session.progress_text());
     for hypothesis in &session.confirmed {
         output.push_str(&format!("  ✓ 已确认：{}\n", render(&hypothesis.atom)));
     }
@@ -1707,10 +1705,7 @@ pub fn render_clarification_summary(
 }
 
 /// 渲染反事实模拟结果
-pub fn render_what_if(
-    result: &WhatIfResult,
-    render: &dyn Fn(&Atom) -> String,
-) -> String {
+pub fn render_what_if(result: &WhatIfResult, render: &dyn Fn(&Atom) -> String) -> String {
     let assumptions = result
         .assumptions
         .iter()
@@ -1742,15 +1737,13 @@ pub fn render_what_if(
 }
 
 /// 渲染待定假设清单（供「采纳假设 N」）
-pub fn render_pending(
-    pending: &[Hypothesis],
-    render: &dyn Fn(&Atom) -> String,
-) -> String {
+pub fn render_pending(pending: &[Hypothesis], render: &dyn Fn(&Atom) -> String) -> String {
     if pending.is_empty() {
         return "当前没有待定假设。可先用「溯因：<陈述>」或「假设生成：<问句>」生成候选。"
             .to_string();
     }
-    let mut output = String::from("当前待定假设（未写入知识库，可用「采纳假设 N」加入会话事实集）：\n");
+    let mut output =
+        String::from("当前待定假设（未写入知识库，可用「采纳假设 N」加入会话事实集）：\n");
     for (index, hypothesis) in pending.iter().enumerate() {
         output.push_str(&format!(
             "  {}. （可信度 {:.2}，{}）{}\n",
@@ -1844,11 +1837,7 @@ mod tests {
         let engine = engine_with_rule();
         let mut abduction = AbductionEngine::new(6, 5);
         abduction.observe_facts(&facts());
-        let report = abduction.analyze(
-            &engine,
-            &[Atom::rel("师祖", "张三", "王五")],
-            &[],
-        );
+        let report = abduction.analyze(&engine, &[Atom::rel("师祖", "张三", "王五")], &[]);
         assert!(report.provable);
         assert!(!report.solutions.is_empty());
         assert!(report.hypotheses.is_empty());
@@ -1860,11 +1849,7 @@ mod tests {
         let mut abduction = AbductionEngine::new(6, 5);
         abduction.observe_facts(&facts());
         // 师祖(张三, 赵六) 需要 师傅(李四, 赵六)（或经由其它中间人）——图中不存在
-        let report = abduction.analyze(
-            &engine,
-            &[Atom::rel("师祖", "张三", "赵六")],
-            &[],
-        );
+        let report = abduction.analyze(&engine, &[Atom::rel("师祖", "张三", "赵六")], &[]);
         assert!(!report.provable);
         assert!(!report.frontier.is_empty());
         assert!(!report.hypotheses.is_empty());
@@ -1898,7 +1883,11 @@ mod tests {
         // 开放目标：师傅(赵六, ?X)，赵六在图谱中没有师傅事实
         let report = abduction.analyze(
             &engine,
-            &[Atom::pattern("师傅", Term::constant("赵六"), Term::var("X"))],
+            &[Atom::pattern(
+                "师傅",
+                Term::constant("赵六"),
+                Term::var("X"),
+            )],
             &["X".to_string()],
         );
         assert!(!report.provable);
@@ -1909,7 +1898,9 @@ mod tests {
             .filter_map(|h| h.atom.terms.get(1).map(|t| t.name().to_string()))
             .collect();
         assert!(
-            values.iter().any(|value| value == "李四" || value == "王五" || value == "赵六"),
+            values
+                .iter()
+                .any(|value| value == "李四" || value == "王五" || value == "赵六"),
             "候选应来自同谓词已知取值，实际：{:?}",
             values
         );
@@ -1922,13 +1913,11 @@ mod tests {
         let assumption = Atom::rel("师傅", "赵六", "钱七");
         let result = abduction.what_if(&engine, &[assumption], 3, 20);
         assert!(!result.new_facts.is_empty());
-        let derived: Vec<String> = result
-            .new_facts
-            .iter()
-            .map(|atom| atom.display())
-            .collect();
+        let derived: Vec<String> = result.new_facts.iter().map(|atom| atom.display()).collect();
         assert!(
-            derived.iter().any(|fact| fact.contains("师祖") && fact.contains("钱七")),
+            derived
+                .iter()
+                .any(|fact| fact.contains("师祖") && fact.contains("钱七")),
             "应推出与钱七相关的师祖事实，实际：{:?}",
             derived
         );
@@ -1963,7 +1952,11 @@ mod tests {
         let report = abduction.analyze(&engine, &[Atom::rel("首都", "中国", "上海")], &[]);
         assert!(!report.provable);
         let best = report.best_hypothesis().expect("应有假设");
-        assert!(best.confidence < 0.1, "功能谓词冲突应被重罚：{}", best.confidence);
+        assert!(
+            best.confidence < 0.1,
+            "功能谓词冲突应被重罚：{}",
+            best.confidence
+        );
         assert!(!best.conflicts.is_empty());
     }
 
@@ -2183,7 +2176,9 @@ mod tests {
         let report = abduction.analyze(&engine, &[Atom::rel("首都", "中国", "张三")], &[]);
         let best = report.best_hypothesis().expect("应有假设");
         assert!(
-            best.conflicts.iter().any(|conflict| conflict.contains("宾体类型")),
+            best.conflicts
+                .iter()
+                .any(|conflict| conflict.contains("宾体类型")),
             "类型不相容应被记录为冲突：{:?}",
             best.conflicts
         );
@@ -2201,11 +2196,7 @@ mod tests {
         let displays: Vec<String> = hypotheses.iter().map(|h| h.atom.display()).collect();
         assert_eq!(
             displays,
-            vec![
-                "师傅(张三, 李四)",
-                "师傅(张三, 王五)",
-                "师傅(李四, 王五)"
-            ],
+            vec!["师傅(张三, 李四)", "师傅(张三, 王五)", "师傅(李四, 王五)"],
             "去重后应保持可信度降序"
         );
         assert_eq!(

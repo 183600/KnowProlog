@@ -118,8 +118,7 @@ impl OntologyClosure {
 
     /// 关系三元组快照（排序，便于确定性报告与测试）
     pub fn relations_snapshot(&self) -> Vec<(String, String, String)> {
-        let mut relations: Vec<(String, String, String)> =
-            self.relations.iter().cloned().collect();
+        let mut relations: Vec<(String, String, String)> = self.relations.iter().cloned().collect();
         relations.sort();
         relations
     }
@@ -225,9 +224,7 @@ impl OntologyClosure {
         let mut why_instances: Vec<(String, String, String)> = self
             .why_instances
             .iter()
-            .map(|((individual, class), why)| {
-                (individual.clone(), class.clone(), why.clone())
-            })
+            .map(|((individual, class), why)| (individual.clone(), class.clone(), why.clone()))
             .collect();
         why_instances.sort();
         why_instances.dedup();
@@ -279,12 +276,7 @@ impl OntologyClosure {
             why_instances: snapshot
                 .why_instances
                 .iter()
-                .map(|(individual, class, why)| {
-                    (
-                        (individual.clone(), class.clone()),
-                        why.clone(),
-                    )
-                })
+                .map(|(individual, class, why)| ((individual.clone(), class.clone()), why.clone()))
                 .collect(),
             why_relations: snapshot
                 .why_relations
@@ -494,7 +486,6 @@ impl OntologyProgram {
     }
 }
 
-
 /// 一个属性的本体画像（供「本体推理：X关系」报告）
 #[derive(Debug, Clone, Default)]
 pub struct PropertyProfile {
@@ -646,11 +637,8 @@ impl OntologyReasoner {
         if class.is_empty() || property.is_empty() || object.is_empty() {
             return;
         }
-        self.class_properties.insert((
-            class.to_string(),
-            property.to_string(),
-            object.to_string(),
-        ));
+        self.class_properties
+            .insert((class.to_string(), property.to_string(), object.to_string()));
     }
 
     pub fn declared_subclass_count(&self) -> usize {
@@ -825,7 +813,10 @@ impl OntologyReasoner {
                         &mut closure,
                         &subject,
                         class,
-                        format!("关系 {}({}, {}) 的定义域是 {}", predicate, subject, object, class),
+                        format!(
+                            "关系 {}({}, {}) 的定义域是 {}",
+                            predicate, subject, object, class
+                        ),
                         &mut changed,
                     );
                 }
@@ -837,7 +828,10 @@ impl OntologyReasoner {
                         &mut closure,
                         &object,
                         class,
-                        format!("关系 {}({}, {}) 的值域是 {}", predicate, subject, object, class),
+                        format!(
+                            "关系 {}({}, {}) 的值域是 {}",
+                            predicate, subject, object, class
+                        ),
                         &mut changed,
                     );
                 }
@@ -1008,9 +1002,7 @@ impl OntologyReasoner {
         let mut seen: HashSet<String> = HashSet::new();
         for (left, right) in &self.disjoint {
             for (individual, classes) in &classes_of {
-                let in_left = classes
-                    .iter()
-                    .any(|class| closure.is_subclass(class, left));
+                let in_left = classes.iter().any(|class| closure.is_subclass(class, left));
                 let in_right = classes
                     .iter()
                     .any(|class| closure.is_subclass(class, right));
@@ -1217,8 +1209,23 @@ fn clean_lesson_text(text: &str) -> String {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                '。' | '！' | '!' | '？' | '?' | '，' | ',' | '、' | '：' | ':' | '“' | '”' | '"'
-                    | '\'' | '\n' | '\r' | '\t' | ' '
+                '。' | '！'
+                    | '!'
+                    | '？'
+                    | '?'
+                    | '，'
+                    | ','
+                    | '、'
+                    | '：'
+                    | ':'
+                    | '“'
+                    | '”'
+                    | '"'
+                    | '\''
+                    | '\n'
+                    | '\r'
+                    | '\t'
+                    | ' '
             )
         })
         .to_string()
@@ -1227,7 +1234,9 @@ fn clean_lesson_text(text: &str) -> String {
 fn valid_name(name: &str) -> bool {
     let length = name.chars().count();
     (1..=24).contains(&length)
-        && !name.contains(['。', '，', '？', '！', '：', '；', ' ', ',', '.', '?', '!', ';'])
+        && !name.contains([
+            '。', '，', '？', '！', '：', '；', ' ', ',', '.', '?', '!', ';',
+        ])
 }
 
 fn split_pair(text: &str) -> Option<(String, String)> {
@@ -1265,7 +1274,14 @@ fn assertion_negated(text: &str, position: usize) -> bool {
         return true;
     }
     [
-        "没有", "不满足", "不构成", "不具备", "不具有", "不可以", "不能", "不会",
+        "没有",
+        "不满足",
+        "不构成",
+        "不具备",
+        "不具有",
+        "不可以",
+        "不能",
+        "不会",
     ]
     .iter()
     .any(|negation| prefix.ends_with(negation))
@@ -1319,7 +1335,8 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
         return Err(format!("「{}」是否定句，本体教学只接受肯定知识", cleaned));
     }
     // 互斥：X和Y互斥 / X与Y不相容
-    for marker in ["互不相容", "互相排斥", "彼此排斥", "互斥", "不相容", "排斥"] {
+    for marker in ["互不相容", "互相排斥", "彼此排斥", "互斥", "不相容", "排斥"]
+    {
         if let Some(position) = cleaned.find(marker) {
             if assertion_negated(&cleaned, position) {
                 continue;
@@ -1337,12 +1354,17 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
     if cleaned.contains("传递") {
         if let Some(property) = extract_property_prefix(
             &cleaned,
-            &["关系可以传递", "具有传递性", "是可以传递的", "是可传递的", "是传递的", "可以传递", "传递"],
+            &[
+                "关系可以传递",
+                "具有传递性",
+                "是可以传递的",
+                "是可传递的",
+                "是传递的",
+                "可以传递",
+                "传递",
+            ],
         ) {
-            return Ok(OntologyLesson::Transitive {
-                property,
-                original,
-            });
+            return Ok(OntologyLesson::Transitive { property, original });
         }
     }
     // 对称性
@@ -1350,10 +1372,7 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
         if let Some(property) =
             extract_property_prefix(&cleaned, &["具有对称性", "是对称的", "对称"])
         {
-            return Ok(OntologyLesson::Symmetric {
-                property,
-                original,
-            });
+            return Ok(OntologyLesson::Symmetric { property, original });
         }
     }
     // 逆关系
@@ -1444,7 +1463,9 @@ pub fn parse_ontology_lesson(text: &str) -> Result<OntologyLesson, String> {
         if let Some(position_shi) = after_de.find('是') {
             let class = cleaned[..position_de].trim().to_string();
             let property = after_de[..position_shi].trim().to_string();
-            let object = after_de[position_shi + '是'.len_utf8()..].trim().to_string();
+            let object = after_de[position_shi + '是'.len_utf8()..]
+                .trim()
+                .to_string();
             if valid_name(&class) && valid_name(&property) && valid_name(&object) {
                 return Ok(OntologyLesson::ClassProperty {
                     class,
@@ -1517,7 +1538,10 @@ pub fn apply_ontology_lesson(ontology: &mut OntologyReasoner, lesson: &OntologyL
 pub fn render_ontology_lesson_zh(lesson: &OntologyLesson) -> String {
     match lesson {
         OntologyLesson::Subclass { sub, sup, .. } => {
-            format!("「{}」是「{}」的一种（子类关系，实例与属性会沿层级继承）", sub, sup)
+            format!(
+                "「{}」是「{}」的一种（子类关系，实例与属性会沿层级继承）",
+                sub, sup
+            )
         }
         OntologyLesson::Instance {
             individual, class, ..
@@ -1527,7 +1551,10 @@ pub fn render_ontology_lesson_zh(lesson: &OntologyLesson) -> String {
             left, right
         ),
         OntologyLesson::Subproperty { sub, sup, .. } => {
-            format!("「{}」是「{}」的子关系（子关系事实自动升级为父关系事实）", sub, sup)
+            format!(
+                "「{}」是「{}」的子关系（子关系事实自动升级为父关系事实）",
+                sub, sup
+            )
         }
         OntologyLesson::Transitive { property, .. } => format!(
             "「{}」关系可以传递（a{}b、b{}c ⇒ a{}c）",
@@ -1538,7 +1565,10 @@ pub fn render_ontology_lesson_zh(lesson: &OntologyLesson) -> String {
             property, property, property
         ),
         OntologyLesson::Inverse { left, right, .. } => {
-            format!("「{}」与「{}」互为逆关系（a{}b ⇒ b{}a）", left, right, left, right)
+            format!(
+                "「{}」与「{}」互为逆关系（a{}b ⇒ b{}a）",
+                left, right, left, right
+            )
         }
         OntologyLesson::Domain {
             property, class, ..
@@ -1579,7 +1609,9 @@ mod tests {
         assert!(closure.is_subclass("企鹅", "企鹅"), "子类应自反");
         assert!(closure.ancestors_of("企鹅").contains(&"动物".to_string()));
         assert!(closure.descendants_of("鸟").contains(&"企鹅".to_string()));
-        assert!(closure.descendants_of("鸟").contains(&"皇帝企鹅".to_string()));
+        assert!(closure
+            .descendants_of("鸟")
+            .contains(&"皇帝企鹅".to_string()));
     }
 
     #[test]
@@ -1602,7 +1634,10 @@ mod tests {
         ontology.add_domain("师傅", "人");
         ontology.add_range("师傅", "人");
         let closure = ontology.materialize();
-        assert!(closure.is_instance("张三", "人"), "主体应由定义域归入「人」");
+        assert!(
+            closure.is_instance("张三", "人"),
+            "主体应由定义域归入「人」"
+        );
         assert!(closure.is_instance("李四", "人"), "客体应由值域归入「人」");
         let reason = closure.why_instance("张三", "人").unwrap_or("");
         assert!(reason.contains("定义域"), "应记录定义域推导：{}", reason);
@@ -1618,18 +1653,20 @@ mod tests {
         ontology.add_relation("张三", "师徒", "李四");
         let closure = ontology.materialize();
         assert!(
-            closure.properties_of("阿德").contains(&("栖息地".to_string(), "南极".to_string())),
+            closure
+                .properties_of("阿德")
+                .contains(&("栖息地".to_string(), "南极".to_string())),
             "类固有属性应被实例继承"
         );
         assert!(
-            closure
-                .relations_snapshot()
-                .contains(&("张三".to_string(), "师傅".to_string(), "李四".to_string())),
+            closure.relations_snapshot().contains(&(
+                "张三".to_string(),
+                "师傅".to_string(),
+                "李四".to_string()
+            )),
             "子关系事实应升级为父关系"
         );
-        let reason = closure
-            .why_relation("阿德", "栖息地", "南极")
-            .unwrap_or("");
+        let reason = closure.why_relation("阿德", "栖息地", "南极").unwrap_or("");
         assert!(reason.contains("继承"), "应记录继承来源：{}", reason);
     }
 
@@ -1738,8 +1775,17 @@ mod tests {
         let outcome = parse_ontology_lessons(
             "企鹅是一种鸟；企鹅和鱼互斥。师傅关系可以传递。张三的师傅是李四。",
         );
-        assert_eq!(outcome.lessons.len(), 4, "应解析出 4 条：{:?}", outcome.errors);
-        assert!(outcome.errors.is_empty(), "不应有失败：{:?}", outcome.errors);
+        assert_eq!(
+            outcome.lessons.len(),
+            4,
+            "应解析出 4 条：{:?}",
+            outcome.errors
+        );
+        assert!(
+            outcome.errors.is_empty(),
+            "不应有失败：{:?}",
+            outcome.errors
+        );
         let mut ontology = OntologyReasoner::new(6);
         for lesson in &outcome.lessons {
             apply_ontology_lesson(&mut ontology, lesson);
@@ -1747,11 +1793,11 @@ mod tests {
         }
         let closure = ontology.materialize();
         assert!(closure.is_subclass("企鹅", "鸟"));
-        assert!(
-            closure
-                .relations_snapshot()
-                .contains(&("张三".to_string(), "师傅".to_string(), "李四".to_string()))
-        );
+        assert!(closure.relations_snapshot().contains(&(
+            "张三".to_string(),
+            "师傅".to_string(),
+            "李四".to_string()
+        )));
         assert!(parse_ontology_lesson("这条知识是谁说的？").is_err());
         assert!(parse_ontology_lesson("完全看不懂的句子").is_err());
     }
@@ -1790,7 +1836,10 @@ mod tests {
         let restored = OntologyClosure::from_snapshot(&snapshot);
         assert_eq!(restored.snapshot(), snapshot, "快照往返应逐字一致");
         assert_eq!(restored.digest(), closure.digest(), "摘要交换（L4）");
-        assert_eq!(restored.why_instance("张三", "人物"), closure.why_instance("张三", "人物"));
+        assert_eq!(
+            restored.why_instance("张三", "人物"),
+            closure.why_instance("张三", "人物")
+        );
         assert_eq!(
             restored.why_relation("李四", "师傅", "王五"),
             closure.why_relation("李四", "师傅", "王五")
@@ -1827,8 +1876,7 @@ mod tests {
         apply_ontology_lesson(&mut ontology, &first);
         let closure = ontology.materialize();
         let forward = OntologyCapsule::new(vec![first.clone(), second.clone()], &closure);
-        let reverse =
-            OntologyCapsule::new(vec![second, first.clone(), first.clone()], &closure);
+        let reverse = OntologyCapsule::new(vec![second, first.clone(), first.clone()], &closure);
         assert_eq!(forward.lessons.len(), 2, "重复公理应去重");
         assert_eq!(forward.lessons, reverse.lessons, "规约与教学顺序无关");
         assert_eq!(forward.program_digest, reverse.program_digest);
@@ -1870,11 +1918,8 @@ mod tests {
             replay.materialize()
         };
         assert!(
-            OntologyCapsule::new(
-                vec![parse_ontology_lesson("人是一种动物").unwrap()],
-                &fresh
-            )
-            .closure_matches(&fresh),
+            OntologyCapsule::new(vec![parse_ontology_lesson("人是一种动物").unwrap()], &fresh)
+                .closure_matches(&fresh),
             "同一公理 + 同一事实应得到同一闭包摘要"
         );
     }
@@ -1939,7 +1984,11 @@ mod tests {
         // 配置里没有的类型不入本体（别名不产生类层级）
         let mut merged = program.clone();
         merged.merge(&program);
-        assert_eq!(merged.lessons.len(), program.lessons.len(), "合并自身应去重");
+        assert_eq!(
+            merged.lessons.len(),
+            program.lessons.len(),
+            "合并自身应去重"
+        );
     }
 
     /// 配置公理装入本体推理器：类型层级与谓词画像立即参与闭包物化。

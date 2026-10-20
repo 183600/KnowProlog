@@ -132,11 +132,7 @@ impl SearchRecord {
             budget_cutoffs: view.stats.budget_cutoffs,
             solution_cutoffs: view.stats.solution_cutoffs,
             state_cutoffs: view.stats.state_cutoffs,
-            frontier: view
-                .frontier
-                .iter()
-                .map(|entry| entry.describe())
-                .collect(),
+            frontier: view.frontier.iter().map(|entry| entry.describe()).collect(),
             frontier_entries: view.stats.frontier_entries,
             frontier_omitted: view.stats.frontier_omitted,
         }
@@ -257,7 +253,6 @@ impl RawProofNode {
     fn digest(&self) -> String {
         fnv1a_hex(self.canonical().as_bytes())
     }
-
 }
 
 impl ProofCertificate {
@@ -326,7 +321,10 @@ impl ProofCertificate {
             pipeline: pipeline.to_string(),
         };
         let digest = fnv1a_hex(format!("unattributed|{}", goal.trim()).as_bytes());
-        let id = format!("proof:{}", fnv1a_hex(format!("{}|{}", origin.tag(), digest).as_bytes()));
+        let id = format!(
+            "proof:{}",
+            fnv1a_hex(format!("{}|{}", origin.tag(), digest).as_bytes())
+        );
         Self {
             id,
             goal: goal.trim().to_string(),
@@ -425,10 +423,7 @@ impl ProofCertificate {
             .map(|value| format!("，置信度 {:.2}", value))
             .unwrap_or_default();
         let truncation = if self.truncated {
-            format!(
-                "，已折叠 {} 步（摘要 {}）",
-                self.omitted_nodes, self.digest
-            )
+            format!("，已折叠 {} 步（摘要 {}）", self.omitted_nodes, self.digest)
         } else {
             String::new()
         };
@@ -475,8 +470,8 @@ impl ProofCertificate {
             ));
             if !search.frontier.is_empty() {
                 let shown = search.frontier.iter().take(3).cloned().collect::<Vec<_>>();
-                let omitted = search.frontier.len().saturating_sub(shown.len())
-                    + search.frontier_omitted;
+                let omitted =
+                    search.frontier.len().saturating_sub(shown.len()) + search.frontier_omitted;
                 lines.push(format!(
                     "同树失败前沿：{}{}",
                     shown.join("；"),
@@ -602,7 +597,11 @@ fn render_tree(
         lines.push(format!(
             "{}{} …（折叠 {} 步，摘要 {}）",
             next_prefix,
-            if node.children.is_empty() { "└─" } else { "├─" },
+            if node.children.is_empty() {
+                "└─"
+            } else {
+                "├─"
+            },
             elided.omitted_nodes,
             elided.digest
         ));
@@ -744,7 +743,10 @@ impl JournalProjection {
     }
 
     pub fn unanswered(&self) -> Vec<&JournalTurn> {
-        self.turns.iter().filter(|turn| !turn.is_answered()).collect()
+        self.turns
+            .iter()
+            .filter(|turn| !turn.is_answered())
+            .collect()
     }
 
     pub fn find_proof(&self, id: &str) -> Option<&ProofCertificate> {
@@ -760,7 +762,10 @@ impl JournalProjection {
         let mut by_key: BTreeMap<&str, Vec<&JournalTurn>> = BTreeMap::new();
         for turn in &self.turns {
             if turn.is_answered() && !turn.question_key.is_empty() {
-                by_key.entry(turn.question_key.as_str()).or_default().push(turn);
+                by_key
+                    .entry(turn.question_key.as_str())
+                    .or_default()
+                    .push(turn);
             }
         }
 
@@ -886,9 +891,15 @@ impl ConsistencyReport {
             lines.push(format!(
                 "- 问题「{}」：第 {} 条（rev {}）→ 第 {} 条（rev {}），{}。前答：{}；后答：{}",
                 truncate(&finding.question, 32),
-                finding.previous.reply_seq.unwrap_or(finding.previous.turn_seq),
+                finding
+                    .previous
+                    .reply_seq
+                    .unwrap_or(finding.previous.turn_seq),
                 finding.previous.kb_revision,
-                finding.current.reply_seq.unwrap_or(finding.current.turn_seq),
+                finding
+                    .current
+                    .reply_seq
+                    .unwrap_or(finding.current.turn_seq),
                 finding.current.kb_revision,
                 finding.kind.label(),
                 truncate(finding.previous.answer.as_deref().unwrap_or(""), 48),
@@ -1004,7 +1015,10 @@ mod tests {
             }],
         };
         let from_view = ProofCertificate::from_view(&view, ProofLimits::default());
-        let search = from_view[0].search.as_ref().expect("视图凭证应带搜索上下文");
+        let search = from_view[0]
+            .search
+            .as_ref()
+            .expect("视图凭证应带搜索上下文");
         assert_eq!(search.status, "得证");
         assert!(search.truncated);
         assert_eq!(search.goal_attempts, 7);
@@ -1065,7 +1079,9 @@ mod tests {
         let proof = ProofCertificate::unattributed("姚明的身高", "外部知识 API");
         assert!(!proof.origin.is_resolution());
         assert!(proof.nodes.is_empty());
-        assert!(proof.narrate(ProofDetail::Deep).contains("没有可展开的形式证明"));
+        assert!(proof
+            .narrate(ProofDetail::Deep)
+            .contains("没有可展开的形式证明"));
     }
 
     #[test]
@@ -1161,9 +1177,7 @@ mod tests {
             chronicle
                 .append_turn("姚明的身高是多少", "query", None, index)
                 .unwrap();
-            chronicle
-                .append_reply("226 厘米", &[], &[])
-                .unwrap();
+            chronicle.append_reply("226 厘米", &[], &[]).unwrap();
         }
         let report = JournalProjection::from_chronicle(&chronicle).consistency(0);
         assert!(report.findings.is_empty());

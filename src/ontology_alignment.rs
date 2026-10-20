@@ -120,10 +120,7 @@ impl AlignmentResolution {
         self.state = Self::state_for(&self.candidates, self.ambiguity_margin);
     }
 
-    fn state_for(
-        candidates: &[AlignmentCandidate],
-        ambiguity_margin: f64,
-    ) -> AlignmentState {
+    fn state_for(candidates: &[AlignmentCandidate], ambiguity_margin: f64) -> AlignmentState {
         let Some(top) = candidates.first() else {
             return AlignmentState::Unknown;
         };
@@ -135,9 +132,7 @@ impl AlignmentResolution {
             return AlignmentState::Resolved;
         }
         match candidates.get(1) {
-            Some(second)
-                if top.pair.confidence - second.pair.confidence <= ambiguity_margin =>
-            {
+            Some(second) if top.pair.confidence - second.pair.confidence <= ambiguity_margin => {
                 AlignmentState::Ambiguous
             }
             _ => AlignmentState::Resolved,
@@ -261,7 +256,8 @@ impl OntologyAligner {
         if self.synonyms.get(alias).map(String::as_str) == Some(canonical) {
             return false;
         }
-        self.synonyms.insert(alias.to_string(), canonical.to_string());
+        self.synonyms
+            .insert(alias.to_string(), canonical.to_string());
         self.resolve_cache.write().clear();
         true
     }
@@ -716,10 +712,7 @@ impl OntologyAligner {
     }
 
     /// 全部结构相似候选（按置信度降序、剖面下标升序）。
-    fn structural_candidates(
-        &self,
-        self_idx: Option<usize>,
-    ) -> Vec<(f64, usize, Vec<String>)> {
+    fn structural_candidates(&self, self_idx: Option<usize>) -> Vec<(f64, usize, Vec<String>)> {
         let Some(idx) = self_idx else {
             return Vec::new();
         };
@@ -766,12 +759,14 @@ impl OntologyAligner {
             evidence.push(format!("Jaccard {:.2}", jaccard));
             found.push((confidence, i, evidence));
         }
-        found.sort_by(|(left_score, left_index, _), (right_score, right_index, _)| {
-            right_score
-                .partial_cmp(left_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left_index.cmp(right_index))
-        });
+        found.sort_by(
+            |(left_score, left_index, _), (right_score, right_index, _)| {
+                right_score
+                    .partial_cmp(left_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| left_index.cmp(right_index))
+            },
+        );
         found
     }
 
@@ -800,10 +795,8 @@ impl OntologyAligner {
                 Some(i),
             ));
         }
-        if let Some((confidence, i, evidence)) = self
-            .structural_candidates(self_idx)
-            .into_iter()
-            .next()
+        if let Some((confidence, i, evidence)) =
+            self.structural_candidates(self_idx).into_iter().next()
         {
             return Some((
                 AlignmentPair {
@@ -906,11 +899,7 @@ impl OntologyAligner {
 
     /// 用答案探测消解候选歧义：与最佳候选分数接近的解释若给出同一答案，
     /// 则静默采用最佳候选；只有答案集合确实不同才保留 `Ambiguous`。
-    pub fn probe_answers<F>(
-        &self,
-        resolution: AlignmentResolution,
-        probe: F,
-    ) -> AlignmentDecision
+    pub fn probe_answers<F>(&self, resolution: AlignmentResolution, probe: F) -> AlignmentDecision
     where
         F: Fn(&str) -> Vec<String>,
     {
@@ -947,7 +936,9 @@ impl OntologyAligner {
                     .unwrap_or(false)
             })
             .collect();
-        let equivalent_answers = contenders.windows(2).all(|pair| pair[0].answers == pair[1].answers);
+        let equivalent_answers = contenders
+            .windows(2)
+            .all(|pair| pair[0].answers == pair[1].answers);
         let non_empty = contenders
             .iter()
             .filter(|answer| !answer.answers.is_empty())
@@ -1032,7 +1023,11 @@ impl OntologyAligner {
 
         for (s, p, o) in triples {
             // 部分解析结果供对齐证据与规范化三元组共用
-            let resolved = [self.resolve_arc(s), self.resolve_arc(p), self.resolve_arc(o)];
+            let resolved = [
+                self.resolve_arc(s),
+                self.resolve_arc(p),
+                self.resolve_arc(o),
+            ];
             for pair in resolved.iter().flatten() {
                 if seen_pairs.insert((pair.0.source.clone(), pair.0.target.clone())) {
                     pairs.push(pair.0.clone());
@@ -1103,7 +1098,9 @@ mod tests {
     fn test_normalized_alignment() {
         let mut aligner = OntologyAligner::new(HashMap::new(), 0.9);
         aligner.register_term("Python 语言", TermKind::Entity);
-        let pair = aligner.resolve("python语言").expect("空格与大小写差异应被规范化");
+        let pair = aligner
+            .resolve("python语言")
+            .expect("空格与大小写差异应被规范化");
         assert_eq!(pair.target, "Python 语言");
         assert_eq!(pair.kind, AlignmentKind::Normalized);
     }
@@ -1112,7 +1109,9 @@ mod tests {
     fn test_similarity_alignment() {
         let mut aligner = OntologyAligner::new(HashMap::new(), 0.72);
         aligner.register_term("北京大学", TermKind::Entity);
-        let pair = aligner.resolve("北京大学校").expect("包含关系应触发相似度对齐");
+        let pair = aligner
+            .resolve("北京大学校")
+            .expect("包含关系应触发相似度对齐");
         assert_eq!(pair.target, "北京大学");
         assert_eq!(pair.kind, AlignmentKind::Similarity);
         assert!(pair.confidence >= 0.72);
@@ -1144,7 +1143,9 @@ mod tests {
         assert!(aligner.resolve("丁").is_none());
         aligner.observe_triple("甲", "关系", "丙");
         aligner.observe_triple("丁", "关系", "丙");
-        let pair = aligner.resolve("丁").expect("邻居变化后缓存应失效并触发结构对齐");
+        let pair = aligner
+            .resolve("丁")
+            .expect("邻居变化后缓存应失效并触发结构对齐");
         assert_eq!(pair.target, "甲");
         assert_eq!(pair.kind, AlignmentKind::Structural);
     }
@@ -1155,7 +1156,9 @@ mod tests {
         aligner.observe_triple("张三", "妻子", "李四");
         aligner.observe_triple("张三的老婆", "妻子", "李四");
         let pairs = aligner.align_all();
-        assert!(pairs.iter().any(|p| p.source == "张三的老婆" && p.target == "张三"));
+        assert!(pairs
+            .iter()
+            .any(|p| p.source == "张三的老婆" && p.target == "张三"));
         let triples = aligner.alignment_triples();
         assert!(triples
             .iter()
@@ -1170,7 +1173,10 @@ mod tests {
         // 目标术语比源术语更晚注册
         aligner.register_term("老婆", TermKind::Entity);
         aligner.register_term("妻子", TermKind::Entity);
-        assert_eq!(aligner.resolve("老婆").map(|p| p.target), Some("妻子".to_string()));
+        assert_eq!(
+            aligner.resolve("老婆").map(|p| p.target),
+            Some("妻子".to_string())
+        );
         let pairs = aligner.align_all();
         assert!(
             pairs
@@ -1199,15 +1205,22 @@ mod tests {
         assert_eq!(rewritten.len(), 1);
         assert_eq!(rewritten[0].0, "张三");
         assert_eq!(rewritten[0].1, "妻子");
-        assert!(pairs.iter().any(|p| p.source == "老婆" && p.target == "妻子"));
-        assert!(pairs.iter().any(|p| p.source == "张三的老婆" && p.target == "张三"));
+        assert!(pairs
+            .iter()
+            .any(|p| p.source == "老婆" && p.target == "妻子"));
+        assert!(pairs
+            .iter()
+            .any(|p| p.source == "张三的老婆" && p.target == "张三"));
     }
 
     #[test]
     fn test_unknown_term_returns_none() {
         let aligner = OntologyAligner::new(synonyms(), 0.95);
         assert!(aligner.resolve("完全不存在的术语").is_none());
-        assert_eq!(aligner.canonical_form("完全不存在的术语"), "完全不存在的术语");
+        assert_eq!(
+            aligner.canonical_form("完全不存在的术语"),
+            "完全不存在的术语"
+        );
     }
 
     fn ambiguous_aligner() -> OntologyAligner {
@@ -1225,7 +1238,9 @@ mod tests {
         assert_eq!(resolution.targets(), vec!["苹果公司", "苹果果实"]);
         assert_eq!(
             aligner.resolve("苹果").map(|pair| pair.target),
-            resolution.best().map(|candidate| candidate.target().to_string())
+            resolution
+                .best()
+                .map(|candidate| candidate.target().to_string())
         );
         assert!(resolution
             .candidates
@@ -1260,8 +1275,7 @@ mod tests {
     fn test_answer_probe_keeps_ambiguous_when_answers_differ() {
         let aligner = ambiguous_aligner();
         let resolution = aligner.resolve_candidates("苹果", 5);
-        let decision =
-            aligner.probe_answers(resolution, |target| vec![target.to_string()]);
+        let decision = aligner.probe_answers(resolution, |target| vec![target.to_string()]);
         assert!(!decision.equivalent_answers);
         assert_eq!(decision.resolution.state, AlignmentState::Ambiguous);
         assert!(decision.should_clarify());

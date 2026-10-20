@@ -72,11 +72,7 @@ impl AssociationRule {
 
     /// 形如 `类型：人物 ∧ 关系：出生地 ⇒ 关系：国籍`
     pub fn rule_text(&self) -> String {
-        format!(
-            "{} ⇒ {}",
-            self.antecedent.join(" ∧ "),
-            self.consequent
-        )
+        format!("{} ⇒ {}", self.antecedent.join(" ∧ "), self.consequent)
     }
 
     /// 形如 `支持度 3/6，置信度 0.75，提升度 2.50，杠杆率 0.17`
@@ -300,9 +296,8 @@ impl AssociationMiner {
                 .then_with(|| b.support.cmp(&a.support))
                 .then_with(|| a.consequent.cmp(&b.consequent))
         });
-        self.rules.dedup_by(|a, b| {
-            a.antecedent == b.antecedent && a.consequent == b.consequent
-        });
+        self.rules
+            .dedup_by(|a, b| a.antecedent == b.antecedent && a.consequent == b.consequent);
         // 规则数量上限：保持报告可读、后续推导可控
         self.rules.truncate(200);
     }
@@ -377,8 +372,7 @@ impl AssociationMiner {
         self.rules
             .iter()
             .filter(|rule| {
-                rule.antecedent.iter().any(|candidate| candidate == item)
-                    || rule.consequent == item
+                rule.antecedent.iter().any(|candidate| candidate == item) || rule.consequent == item
             })
             .take(limit)
             .collect()
@@ -455,11 +449,7 @@ fn intersection_count(a: &HashSet<&str>, b: &HashSet<&str>) -> usize {
     small.iter().filter(|item| large.contains(*item)).count()
 }
 
-fn triple_intersection_count(
-    a: &HashSet<&str>,
-    b: &HashSet<&str>,
-    c: &HashSet<&str>,
-) -> usize {
+fn triple_intersection_count(a: &HashSet<&str>, b: &HashSet<&str>, c: &HashSet<&str>) -> usize {
     let sets = [a, b, c];
     let smallest = sets
         .iter()
@@ -473,11 +463,7 @@ fn triple_intersection_count(
 
 fn item_atom(item: &str, has_predicate: &str, type_predicate: &str) -> Atom {
     if let Some(etype) = item.strip_prefix(TYPE_PREFIX) {
-        return Atom::pattern(
-            type_predicate,
-            Term::var("E"),
-            Term::constant(etype),
-        );
+        return Atom::pattern(type_predicate, Term::var("E"), Term::constant(etype));
     }
     let name = display_item(item);
     Atom::pattern(has_predicate, Term::var("E"), Term::constant(name))
@@ -553,7 +539,11 @@ mod tests {
                 .all(|rule| !(rule.antecedent[0] == relation_item("rA")
                     && rule.consequent == relation_item("rB"))),
             "提升度低于阈值的规则不应出现：{:?}",
-            miner.rules().iter().map(|r| r.rule_text()).collect::<Vec<_>>()
+            miner
+                .rules()
+                .iter()
+                .map(|r| r.rule_text())
+                .collect::<Vec<_>>()
         );
         // 阈值放宽后同一规则应被挖出，说明过滤发生在提升度而非支持度
         let mut relaxed = AssociationMiner::new(0.2, 0.0, 0.5);
@@ -588,7 +578,11 @@ mod tests {
                     && rule.confidence >= 0.99
             }),
             "应挖出二前件规则：{:?}",
-            miner.rules().iter().map(|r| r.rule_text()).collect::<Vec<_>>()
+            miner
+                .rules()
+                .iter()
+                .map(|r| r.rule_text())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -597,9 +591,12 @@ mod tests {
         let mut miner = sample_miner();
         miner.mine();
         let suggestions = miner.suggestions_for("赵六", 5);
-        assert!(suggestions
-            .iter()
-            .any(|rule| rule.consequent == attribute_item("国籍")), "赵六缺国籍应被建议");
+        assert!(
+            suggestions
+                .iter()
+                .any(|rule| rule.consequent == attribute_item("国籍")),
+            "赵六缺国籍应被建议"
+        );
         assert!(miner.suggestions_for("不存在的人", 5).is_empty());
     }
 

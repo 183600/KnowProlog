@@ -220,7 +220,10 @@ mod tests {
         let path = dir.path().join("import_journal.json");
         let path_text = path.to_str().unwrap();
 
-        assert!(matches!(ImportJournal::load(path_text), JournalLoad::Missing));
+        assert!(matches!(
+            ImportJournal::load(path_text),
+            JournalLoad::Missing
+        ));
 
         let mut journal = ImportJournal::new();
         journal.push(receipt(3, "x"));

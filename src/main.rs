@@ -1,88 +1,82 @@
+use clap::{Parser, Subcommand};
 use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-use clap::{Parser, Subcommand};
 
 // 从库（know_prolog）中导入所需的功能
 use know_prolog::{
-    load_config, 
-    KnowledgeExtractor, 
-    OxigraphManager,
-    ResponseFormatter,
-    InputMode,
-    KnowledgeItem,
-    detect_input_mode,
-    create_default_synonyms,
-    extract_query_entities_from_tagged,
-    nlp::{preprocess, normalize_words},
-    pattern_ir::{self, PatternLibrary},
-    lexical_trace,
-    query_planner::QueryPlanner,
-    nlu::NLUEngine,
-    prolog_engine::PrologEngine,
-    local_semantic_adapter::LocalSemanticAdapter,
-    ownthink_api::select_candidate_by_context,
-    external_knowledge::{AnswerOutcome, ExternalKnowledgeService, get_direct_answer},
-    external_ledger::{ExternalLedger, LedgerLoad},
-    symbolic_reasoner::SymbolicReasoner,
-    ontology_reasoning::OntologyProgram,
-    dialogue_frame::ClarificationOutcome,
-    neuro_symbolic_contrast::ContrastArbiter,
-    dialogue_manager::{DialogueManager, MoveKind},
+    chronicle::{Chronicle, FsyncPolicy},
+    config_contract,
     contextual_reference::{
         parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
         ContextualResolver,
     },
-    recovery::RecoveryMode,
-    trace_graph::TraceMode,
-    holographic_memory::{HoloAnalogyHit, HoloHit},
-    import_journal::{ImportJournal, JournalLoad},
-    perf_ledger::PerfLedger,
-    startup_ledger::StartupLedger,
-    grammar_extractor::GrammarExtractor,
-    prolog_engine::PrologFact,
-    resolution_engine::SearchStatus,
-    chronicle::{Chronicle, FsyncPolicy},
     conversation_theory::{self, ConversationTheory},
-    history_trust::TrustAssessment,
-    proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
-    view_render::{
-        render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
-        render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
+    create_default_synonyms,
+    dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
+    detect_input_mode,
+    dialogue_eval::{
+        compare_baseline as compare_dialogue_baseline, evaluate_seed_with, DialogueEvalBaseline,
+        EvalKnowledge,
     },
+    dialogue_frame::ClarificationOutcome,
+    dialogue_fuzz::{
+        self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
+    },
+    dialogue_manager::{DialogueManager, MoveKind},
     embedding_eval::{
         compare_baseline, evaluate, triples_from_prolog_facts, EvalBaseline, EvalConfig,
     },
-    dialogue_eval::{
-        compare_baseline as compare_dialogue_baseline, evaluate_seed_with, EvalKnowledge,
-        DialogueEvalBaseline,
-    },
+    entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
+    external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
+    external_ledger::{ExternalLedger, LedgerLoad},
+    extract_query_entities_from_tagged,
+    grammar_extractor::GrammarExtractor,
+    history_trust::TrustAssessment,
+    holographic_memory::{HoloAnalogyHit, HoloHit},
+    import_journal::{ImportJournal, JournalLoad},
+    knowledge_fusion::{Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel},
+    law_book::LawBook,
+    lexical_trace,
+    link_prediction::{LinkPredictor, Triple as LawTriple},
+    load_config,
+    local_semantic_adapter::LocalSemanticAdapter,
+    neuro_symbolic_contrast::ContrastArbiter,
+    nlp::{normalize_words, preprocess},
+    nlu::NLUEngine,
+    ontology_reasoning::OntologyProgram,
+    ownthink_api::select_candidate_by_context,
+    path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
+    pattern_ir::{self, PatternLibrary},
+    perf_ledger::PerfLedger,
+    plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
+    prolog_engine::PrologEngine,
+    prolog_engine::PrologFact,
+    prompt_spec::{self, LintSeverity, PromptMode},
+    proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
     quality::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
         render_entity_passport, QualityBaseline, QualityIndex,
     },
-    shape_gate::{RepairAction, ShapeReport, ShapeSet},
+    query_planner::QueryPlanner,
+    recovery::RecoveryMode,
     relation_acquisition::{GoalOpen, RelationAcquisition},
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
     },
-    weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
-    path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
-    dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
-    temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
-    dialogue_fuzz::{
-        self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
-    },
-    prompt_spec::{self, LintSeverity, PromptMode},
-    config_contract,
     release::{self, CheckOptions},
-    plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
-    law_book::LawBook,
-    link_prediction::{LinkPredictor, Triple as LawTriple},
-    entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
-    knowledge_fusion::{
-        Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel,
+    resolution_engine::SearchStatus,
+    shape_gate::{RepairAction, ShapeReport, ShapeSet},
+    startup_ledger::StartupLedger,
+    symbolic_reasoner::SymbolicReasoner,
+    temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
+    trace_graph::TraceMode,
+    view_render::{
+        render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
+        render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
     },
+    weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
+    InputMode, KnowledgeExtractor, KnowledgeItem, OxigraphManager, ResponseFormatter,
 };
 
 #[derive(Parser)]
@@ -542,12 +536,7 @@ async fn main() {
 
     // 配置契约 lint 必须最先处理：它恰恰要在 config.toml 损坏时可用，
     // 因此不依赖默认配置加载，也不打开知识存储。
-    if let Some(Commands::ConfigLint {
-        file,
-        json,
-        strict,
-    }) = &cli.command
-    {
+    if let Some(Commands::ConfigLint { file, json, strict }) = &cli.command {
         run_config_lint(file.as_deref(), *json, *strict);
         return;
     }
@@ -673,12 +662,7 @@ async fn main() {
             allow_regression,
             json,
         }) => {
-            run_eval_recovery(
-                baseline.clone(),
-                *update_baseline,
-                *allow_regression,
-                *json,
-            );
+            run_eval_recovery(baseline.clone(), *update_baseline, *allow_regression, *json);
             return;
         }
         Some(Commands::FuzzDialogue {
@@ -713,10 +697,8 @@ async fn main() {
 
     // 创建Oxigraph存储
     let store_start = Instant::now();
-    let oxigraph_manager = match OxigraphManager::with_perf_ledger(
-        &store_path,
-        perf_ledger.clone(),
-    ) {
+    let oxigraph_manager = match OxigraphManager::with_perf_ledger(&store_path, perf_ledger.clone())
+    {
         Ok(manager) => {
             startup_ledger.record_since("store_open", store_start);
             manager
@@ -731,7 +713,7 @@ async fn main() {
     match cli.command {
         Some(Commands::ImportJsonld { file_path }) => {
             println!("正在导入 JSON-LD 文件: {}", file_path);
-            
+
             match oxigraph_manager.import_jsonld_from_file(&file_path).await {
                 Ok(stats) => {
                     println!("JSON-LD 文件导入成功：{}", stats.summary());
@@ -744,7 +726,7 @@ async fn main() {
         }
         Some(Commands::ImportJsonldContent { content }) => {
             println!("正在导入 JSON-LD 内容...");
-            
+
             match oxigraph_manager.import_jsonld(&content).await {
                 Ok(stats) => {
                     println!("JSON-LD 内容导入成功：{}", stats.summary());
@@ -757,7 +739,7 @@ async fn main() {
         }
         Some(Commands::ImportRdf { file_path }) => {
             println!("正在导入 RDF 文件: {}", file_path);
-            
+
             match oxigraph_manager.import_rdf_file(&file_path).await {
                 Ok(added) => {
                     println!("RDF 文件导入成功：新增 {} 条三元组！", added);
@@ -772,10 +754,7 @@ async fn main() {
             if file_path == "-" {
                 let stdout = std::io::stdout();
                 match oxigraph_manager
-                    .export_rdf_to_writer(
-                        oxigraph::io::RdfFormat::Turtle,
-                        stdout.lock(),
-                    )
+                    .export_rdf_to_writer(oxigraph::io::RdfFormat::Turtle, stdout.lock())
                     .await
                 {
                     Ok(count) => eprintln!("已导出 {} 条三元组（Turtle → stdout）", count),
@@ -845,7 +824,9 @@ async fn main() {
             let registry = oxigraph_manager.predicate_registry_snapshot();
             let types = oxigraph_manager.type_system_snapshot();
             let mut laws = LawBook::from_registry(&registry);
-            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+            if let Some(persisted) =
+                LawBook::load_from_path(&format!("{}/law_book.json", store_path))
+            {
                 laws.apply_persisted(&persisted);
             }
             let facts = match oxigraph_manager.load_graph_snapshot().await {
@@ -908,7 +889,10 @@ async fn main() {
                 print!("{}", diagnostics.render_text());
                 println!(
                     "抽取统计：{} 句，{} 条帧，解析失败 {} 句；闸门事实 {} 条。",
-                    stats.sentences, stats.frames, stats.parse_errors, gate.fact_count()
+                    stats.sentences,
+                    stats.frames,
+                    stats.parse_errors,
+                    gate.fact_count()
                 );
                 for sample in &diagnostics.samples {
                     println!("\n{}", sample.frame.render_text());
@@ -937,7 +921,9 @@ async fn main() {
             let registry = oxigraph_manager.predicate_registry_snapshot();
             let types = oxigraph_manager.type_system_snapshot();
             let mut laws = LawBook::from_registry(&registry);
-            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+            if let Some(persisted) =
+                LawBook::load_from_path(&format!("{}/law_book.json", store_path))
+            {
                 laws.apply_persisted(&persisted);
             }
             let facts = match oxigraph_manager.load_graph_snapshot().await {
@@ -986,8 +972,7 @@ async fn main() {
                 },
                 None => Vec::new(),
             };
-            let constructor =
-                WeakConstructor::new(facts.as_slice(), registry, types, laws);
+            let constructor = WeakConstructor::new(facts.as_slice(), registry, types, laws);
             let report = constructor.build_with_feedback(&source, &options, &feedback_items);
             if apply {
                 let items: Vec<KnowledgeItem> = report
@@ -1062,7 +1047,10 @@ async fn main() {
             let mut validity_by_entity: std::collections::BTreeMap<String, Validity> =
                 std::collections::BTreeMap::new();
             for fact in facts.iter() {
-                if let PrologFact::Entity { name, properties, .. } = fact {
+                if let PrologFact::Entity {
+                    name, properties, ..
+                } = fact
+                {
                     if let Some(validity) = temporal::validity_from_properties(properties) {
                         validity_by_entity.insert(name.clone(), validity);
                         if let Some(alias) = properties.get("name") {
@@ -1174,12 +1162,7 @@ async fn main() {
                 object: object.map(|value| value.trim().to_string()),
                 entity_type: entity_type.map(|value| value.trim().to_string()),
             };
-            let search = retriever.search(
-                &query,
-                k,
-                &constraints,
-                SearchBudget { max_scanned },
-            );
+            let search = retriever.search(&query, k, &constraints, SearchBudget { max_scanned });
             if json {
                 let payload = serde_json::json!({
                     "query": query,
@@ -1391,59 +1374,57 @@ async fn main() {
             update_baseline,
             allow_regression,
             rrf_k,
-        }) => {
-            match oxigraph_manager.load_all_relations().await {
-                Ok(relations) => {
-                    let triples = triples_from_prolog_facts(&relations);
-                    if triples.len() < 2 {
-                        eprintln!(
-                            "知识库中的关系三元组不足（{} 条），无法评估。可先导入 JSON-LD 知识库。",
-                            triples.len()
-                        );
-                        std::process::exit(1);
-                    }
-                    let eval_config = EvalConfig {
-                        test_ratio_per_mille: test_ratio,
-                        rrf_k: rrf_k.max(1.0),
-                        ..Default::default()
-                    };
-                    let report = evaluate(&triples, &eval_config);
-                    println!("{}", report.render_text(&eval_config));
-
-                    let baseline_path = baseline
-                        .clone()
-                        .unwrap_or_else(|| "eval_baseline.json".to_string());
-                    if update_baseline {
-                        let new_baseline = EvalBaseline::from_report(&report);
-                        match new_baseline.save(&baseline_path) {
-                            Ok(()) => println!("基线已写入 {}", baseline_path),
-                            Err(e) => {
-                                eprintln!("基线写入失败: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else if baseline.is_some() {
-                        match EvalBaseline::load(&baseline_path) {
-                            Ok(old_baseline) => {
-                                let verdict = compare_baseline(&old_baseline, &report, 1e-6);
-                                print!("{}", verdict.render_text());
-                                if !verdict.passed && !allow_regression {
-                                    std::process::exit(1);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("基线读取失败: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("读取知识库失败: {}", e);
+        }) => match oxigraph_manager.load_all_relations().await {
+            Ok(relations) => {
+                let triples = triples_from_prolog_facts(&relations);
+                if triples.len() < 2 {
+                    eprintln!(
+                        "知识库中的关系三元组不足（{} 条），无法评估。可先导入 JSON-LD 知识库。",
+                        triples.len()
+                    );
                     std::process::exit(1);
                 }
+                let eval_config = EvalConfig {
+                    test_ratio_per_mille: test_ratio,
+                    rrf_k: rrf_k.max(1.0),
+                    ..Default::default()
+                };
+                let report = evaluate(&triples, &eval_config);
+                println!("{}", report.render_text(&eval_config));
+
+                let baseline_path = baseline
+                    .clone()
+                    .unwrap_or_else(|| "eval_baseline.json".to_string());
+                if update_baseline {
+                    let new_baseline = EvalBaseline::from_report(&report);
+                    match new_baseline.save(&baseline_path) {
+                        Ok(()) => println!("基线已写入 {}", baseline_path),
+                        Err(e) => {
+                            eprintln!("基线写入失败: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                } else if baseline.is_some() {
+                    match EvalBaseline::load(&baseline_path) {
+                        Ok(old_baseline) => {
+                            let verdict = compare_baseline(&old_baseline, &report, 1e-6);
+                            print!("{}", verdict.render_text());
+                            if !verdict.passed && !allow_regression {
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("基线读取失败: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
             }
-        }
+            Err(e) => {
+                eprintln!("读取知识库失败: {}", e);
+                std::process::exit(1);
+            }
+        },
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::EvalNlu { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
@@ -1624,8 +1605,7 @@ async fn main() {
                 &oxigraph_manager.type_system_snapshot(),
                 &config.entity_types,
             );
-            let quality_index =
-                QualityIndex::from_report(&quality_report, &facts, &registry);
+            let quality_index = QualityIndex::from_report(&quality_report, &facts, &registry);
             println!(
                 "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个驻留会话{}，提示模式 {}，失败恢复 {}）",
                 addr,
@@ -1656,8 +1636,7 @@ async fn main() {
             if api_config_lessons > 0 {
                 println!("服务已注入配置本体公理：{} 条。", api_config_lessons);
             }
-            let quality_index =
-                quality_index.with_revision(api_state.warm_revision());
+            let quality_index = quality_index.with_revision(api_state.warm_revision());
             api_state.set_quality_index(Some(Arc::new(quality_index)));
             if let Some(dir) = session_dir {
                 api_state.set_session_dir(dir);
@@ -1668,8 +1647,7 @@ async fn main() {
             // 配置与 <store>/plugin_state.json；HTTP 不提供热切换。
             let plugin_state_path = format!("{}/plugin_state.json", store_path);
             let plugin_registry = PluginRegistry::load_dir(&config.plugins.directory);
-            let mut plugin_runtime =
-                PluginRuntime::with_settings(plugin_registry, &config.plugins);
+            let mut plugin_runtime = PluginRuntime::with_settings(plugin_registry, &config.plugins);
             if let Some(state) = PluginSessionState::load(&plugin_state_path) {
                 plugin_runtime.restore_session_state(state);
             }
@@ -1701,7 +1679,15 @@ async fn main() {
         }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
-            run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode, trace_mode, &store_path).await;
+            run_interactive_mode(
+                config,
+                oxigraph_manager,
+                perf_ledger,
+                recovery_mode,
+                trace_mode,
+                &store_path,
+            )
+            .await;
         }
     }
 }
@@ -1730,9 +1716,7 @@ fn load_frame_corpus() -> Result<String, String> {
         }
     }
     if used == 0 {
-        return Err(
-            "未找到默认语料；请用 --text 或 --file 指定要诊断的文本".to_string(),
-        );
+        return Err("未找到默认语料；请用 --text 或 --file 指定要诊断的文本".to_string());
     }
     Ok(material)
 }
@@ -1832,11 +1816,8 @@ fn run_eval_recovery(
     } else if baseline.is_some() {
         match know_prolog::eval_recovery::EvalRecoveryBaseline::load(&baseline_path) {
             Ok(old_baseline) => {
-                let verdict = know_prolog::eval_recovery::compare_baseline(
-                    &old_baseline,
-                    &report,
-                    1e-6,
-                );
+                let verdict =
+                    know_prolog::eval_recovery::compare_baseline(&old_baseline, &report, 1e-6);
                 print!("{}", verdict.render_text());
                 if !verdict.passed && !allow_regression {
                     std::process::exit(1);
@@ -1984,7 +1965,12 @@ fn run_artifact_audit(
         for audit in &audits {
             let detail = audit.status.detail();
             if detail.is_empty() {
-                println!("- {} [{}] {}", audit.path, audit.kind.label(), audit.status.label());
+                println!(
+                    "- {} [{}] {}",
+                    audit.path,
+                    audit.kind.label(),
+                    audit.status.label()
+                );
             } else {
                 println!(
                     "- {} [{}] {} —— {}",
@@ -2114,11 +2100,9 @@ async fn run_fuse(
         }
         let namespace_id = know_prolog::knowledge_fusion::sanitize_namespace_id(namespace);
         if ledger.namespace(&namespace_id).is_none() {
-            return Err(format!(
-                "命名空间「{}」不在账本中：先导入来源，再写裁决",
-                namespace
-            )
-            .into());
+            return Err(
+                format!("命名空间「{}」不在账本中：先导入来源，再写裁决", namespace).into(),
+            );
         }
         let adjudication = Adjudication::new(predicate, &namespace_id, "命令行裁决", "user");
         ledger.record_adjudication(adjudication.clone());
@@ -2248,7 +2232,10 @@ fn run_prompt_lint(json: bool) {
             println!("{} [{}] {}", severity, issue.spec_id, issue.message);
         }
         if issues.is_empty() {
-            println!("lint 通过：{} 条示例逐字渲染一致，无错误与警告", specs.len());
+            println!(
+                "lint 通过：{} 条示例逐字渲染一致，无错误与警告",
+                specs.len()
+            );
         }
         if !composed.is_empty() {
             println!("仍由组合生成器负责的策略：{}", composed.join("、"));
@@ -2336,7 +2323,10 @@ fn run_fuzz_dialogue(
             }),
             None => serde_json::to_value(&report).unwrap_or_default(),
         };
-        println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
     } else {
         println!("{}", report.render_text());
         if let Some(verdict) = &verdict {
@@ -2445,7 +2435,10 @@ fn run_config_lint(file: Option<&str>, json: bool, strict: bool) {
                     Err(inner) => eprintln!("契约报告序列化失败: {}", inner),
                 }
             } else {
-                eprintln!("配置契约 v{}（CC）：TOML 解析失败", config_contract::CONFIG_CONTRACT_VERSION);
+                eprintln!(
+                    "配置契约 v{}（CC）：TOML 解析失败",
+                    config_contract::CONFIG_CONTRACT_VERSION
+                );
                 eprintln!("ERROR [toml_parse] {}：{}", path, e);
             }
             std::process::exit(1);
@@ -2616,10 +2609,16 @@ async fn run_interactive_mode(
     println!("{}", config.messages.startup);
     warn_config_contract(&config);
     if !recovery_mode.eq(&RecoveryMode::Off) {
-        println!("失败恢复模式：{}（失败会生成结构化回执）。", recovery_mode.label());
+        println!(
+            "失败恢复模式：{}（失败会生成结构化回执）。",
+            recovery_mode.label()
+        );
     }
     if !trace_mode.is_off() {
-        println!("分层追踪模式：{}（每轮决策写入追踪图）。", trace_mode.label());
+        println!(
+            "分层追踪模式：{}（每轮决策写入追踪图）。",
+            trace_mode.label()
+        );
     }
 
     // 谓词画像注册表：跨会话加载已确认的准入/别名/互逆，再叠加配置声明
@@ -2654,7 +2653,10 @@ async fn run_interactive_mode(
         Ok(entries) if !entries.is_empty() => {
             let merged = pattern_library.merge_taught(&entries);
             if merged > 0 {
-                println!("已恢复 {} 条教学模式（模式落图）。可用「模式路由」查看。", merged);
+                println!(
+                    "已恢复 {} 条教学模式（模式落图）。可用「模式路由」查看。",
+                    merged
+                );
             }
         }
         _ => {}
@@ -2663,11 +2665,11 @@ async fn run_interactive_mode(
     let local_semantic_adapter = {
         let nlp_config = &config.nlp;
         LocalSemanticAdapter::new(
-            nlp_config.enable_local_semantic.unwrap_or(true) && 
-            nlp_config.disable_ownthink_api.unwrap_or(false)
+            nlp_config.enable_local_semantic.unwrap_or(true)
+                && nlp_config.disable_ownthink_api.unwrap_or(false),
         )
     };
-    
+
     // 创建外部知识服务：外链名册为外部知识留册（出处 + 逻辑时刻 + 时限），
     // 跨轮、跨重启记住"从哪里、在第几轮、读到了什么"，避免重复打网。
     let external_ledger_path = config
@@ -2675,9 +2677,7 @@ async fn run_interactive_mode(
         .as_ref()
         .and_then(|api| api.external_ledger_path.clone())
         .filter(|path| !path.trim().is_empty())
-        .unwrap_or_else(|| {
-            format!("{}/external_ledger.json", store_path)
-        });
+        .unwrap_or_else(|| format!("{}/external_ledger.json", store_path));
     let external_ledger_capacity = config
         .api
         .as_ref()
@@ -2719,7 +2719,7 @@ async fn run_interactive_mode(
         }
         service
     };
-    
+
     let synonyms = if let Some(synonyms_config) = &config.synonyms {
         synonyms_config.mappings.clone()
     } else {
@@ -2765,7 +2765,10 @@ async fn run_interactive_mode(
     let reference_binding_path = format!("{}/reference_bindings.json", store_path);
     let mut crd_ledger = match BindingLedger::load_from_path(&reference_binding_path) {
         Some(ledger) if !ledger.is_empty() => {
-            println!("已恢复指称绑定账本：{} 条（「绑定账本」查看）。", ledger.len());
+            println!(
+                "已恢复指称绑定账本：{} 条（「绑定账本」查看）。",
+                ledger.len()
+            );
             ledger
         }
         _ => BindingLedger::new(),
@@ -2812,7 +2815,10 @@ async fn run_interactive_mode(
                     let contrast_snapshot = snapshot.contrast.clone();
                     match symbolic_reasoner.restore_dialogue_snapshot(&snapshot) {
                         Ok(()) => {
-                            println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
+                            println!(
+                                "已恢复上次对话记忆：{}",
+                                symbolic_reasoner.dialogue_summary()
+                            );
                         }
                         Err(error) => eprintln!(
                             "对话记忆拒绝（本体胶囊校验失败，其余状态未应用）：{}",
@@ -2821,7 +2827,10 @@ async fn run_interactive_mode(
                     }
                     if let Some(snapshot) = contrast_snapshot {
                         if contrast_arbiter.restore_snapshot(&snapshot) {
-                            println!("已恢复上次对比校准记忆：{}", contrast_arbiter.memory_summary());
+                            println!(
+                                "已恢复上次对比校准记忆：{}",
+                                contrast_arbiter.memory_summary()
+                            );
                         }
                     }
                 }
@@ -2862,7 +2871,10 @@ async fn run_interactive_mode(
             .map(|ledger| ledger.fingerprint != symbolic_reasoner.rule_fingerprint())
             .unwrap_or(true);
         if needs_sync {
-            match oxigraph_manager.sync_rule_ledger(&startup_rule_entries).await {
+            match oxigraph_manager
+                .sync_rule_ledger(&startup_rule_entries)
+                .await
+            {
                 Ok(count) => println!(
                     "规则图账本已同步：{} 条规则 → 命名图 kg:graphs/rules。",
                     count
@@ -2942,15 +2954,22 @@ async fn run_interactive_mode(
     }
     // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
     let plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
-    let plugin_reference_entries = plugin_nlp.pos_dict.len().saturating_sub(config.nlp.pos_dict.len());
+    let plugin_reference_entries = plugin_nlp
+        .pos_dict
+        .len()
+        .saturating_sub(config.nlp.pos_dict.len());
     if plugin_reference_entries > 0 {
-        println!("插件指称线索已合并：{} 条词性提示。", plugin_reference_entries);
+        println!(
+            "插件指称线索已合并：{} 条词性提示。",
+            plugin_reference_entries
+        );
     }
 
     // 问答式关系获取（QRA）：会话账本 + 覆盖层 + 对话诱导模式。
     // 只读图谱与画像，确认后才进入覆盖层；采纳后才进入会话事实集。
     let acquisition_path = format!("{}/acquisition_ledger.json", store_path);
-    let mut acquisition = RelationAcquisition::load_from_path(&acquisition_path).unwrap_or_default();
+    let mut acquisition =
+        RelationAcquisition::load_from_path(&acquisition_path).unwrap_or_default();
     if acquisition.turn_count() > 0 {
         println!(
             "已恢复关系获取账本：{} 条，诱导模式 {} 个。",
@@ -2967,9 +2986,7 @@ async fn run_interactive_mode(
         .dialogue_state_path
         .as_deref()
         .map(|path| format!("{}.chronicle.jsonl", path))
-        .unwrap_or_else(|| {
-            format!("{}/dialogue.chronicle.jsonl", store_path)
-        });
+        .unwrap_or_else(|| format!("{}/dialogue.chronicle.jsonl", store_path));
     let mut chronicle = match Chronicle::open(&chronicle_path, FsyncPolicy::EachAppend) {
         Ok((mut chronicle, audit)) => {
             if !audit.is_clean() {
@@ -3046,7 +3063,7 @@ async fn run_interactive_mode(
         let mut input = String::new();
         match stdin_reader.lock().read_line(&mut input) {
             Ok(0) => break, // EOF reached, exit the loop
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("Error reading input: {}", e);
                 break;
@@ -3138,14 +3155,14 @@ async fn run_interactive_mode(
                     InputMode::KnowledgeImport => "import",
                     InputMode::Query => "query",
                 };
-                let kind = if is_command_like(raw_input) { "command" } else { mode };
+                let kind = if is_command_like(raw_input) {
+                    "command"
+                } else {
+                    mode
+                };
                 let focus = dialogue_manager.focus_entity();
-                let _ = chronicle.append_turn(
-                    raw_input,
-                    kind,
-                    focus,
-                    dialogue_manager.turn_count(),
-                );
+                let _ =
+                    chronicle.append_turn(raw_input, kind, focus, dialogue_manager.turn_count());
             }
         }
 
@@ -3201,7 +3218,9 @@ async fn run_interactive_mode(
                             println!("{}", opening.render_text());
                             persist_acquisition(&acquisition, &acquisition_path);
                         }
-                        None => println!("形状校验没有可追问的必备属性缺口（或缺口值已在覆盖层）。"),
+                        None => {
+                            println!("形状校验没有可追问的必备属性缺口（或缺口值已在覆盖层）。")
+                        }
                     }
                 }
                 Err(error) => eprintln!("加载形状缺口失败：{}", error),
@@ -3240,7 +3259,13 @@ async fn run_interactive_mode(
         // 模式匹配解释：对一句话给出胜者、命中榜与落选原因
         if let Some(text) = strip_any_prefix(
             input,
-            &["模式匹配：", "模式匹配:", "模式匹配 ", "匹配模式：", "匹配模式:"],
+            &[
+                "模式匹配：",
+                "模式匹配:",
+                "模式匹配 ",
+                "匹配模式：",
+                "匹配模式:",
+            ],
         ) {
             let text = text.trim();
             if text.is_empty() {
@@ -3306,7 +3331,11 @@ async fn run_interactive_mode(
             } else {
                 match pattern_library.forget(name) {
                     Some(entry) => {
-                        println!("已遗忘教学模式「{}」（IR {}）。", entry.name, entry.render());
+                        println!(
+                            "已遗忘教学模式「{}」（IR {}）。",
+                            entry.name,
+                            entry.render()
+                        );
                         match oxigraph_manager
                             .sync_pattern_ledger(pattern_library.entries())
                             .await
@@ -3334,10 +3363,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(rest) = strip_any_prefix(
-            input,
-            &["确认获取", "确认关系获取", "确认问答获取"],
-        ) {
+        if let Some(rest) = strip_any_prefix(input, &["确认获取", "确认关系获取", "确认问答获取"])
+        {
             let id = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
                 .trim();
@@ -3351,7 +3378,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(rest) = strip_any_prefix(input, &["否认获取", "否认关系获取", "拒绝获取"]) {
+        if let Some(rest) = strip_any_prefix(input, &["否认获取", "否认关系获取", "拒绝获取"])
+        {
             let id = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
                 .trim();
@@ -3362,7 +3390,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(rest) = strip_any_prefix(input, &["撤回获取", "撤销获取", "撤回关系获取"]) {
+        if let Some(rest) = strip_any_prefix(input, &["撤回获取", "撤销获取", "撤回关系获取"])
+        {
             let id = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
                 .trim();
@@ -3374,7 +3403,8 @@ async fn run_interactive_mode(
         }
 
         // 采纳：Confirmed/Admitted 的条目进入会话事实集（仍不写知识图谱）。
-        if let Some(rest) = strip_any_prefix(input, &["采纳获取", "采纳关系获取", "提交获取"]) {
+        if let Some(rest) = strip_any_prefix(input, &["采纳获取", "采纳关系获取", "提交获取"])
+        {
             let id = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
                 .trim();
@@ -3400,19 +3430,16 @@ async fn run_interactive_mode(
         }
 
         // 对话诱导模式扫描：只有被两次确认激活的模式才会命中。
-        if let Some(text) = strip_any_prefix(
-            input,
-            &["模式扫描：", "模式扫描:", "模式扫描 "],
-        ) {
+        if let Some(text) = strip_any_prefix(input, &["模式扫描：", "模式扫描:", "模式扫描 "])
+        {
             let text = text.trim();
             if text.is_empty() {
                 println!("用法：模式扫描：<文本>，例如「模式扫描：王强的女儿是赵敏」。");
             } else {
                 match acquisition_context(&oxigraph_manager, &config).await {
                     Ok((facts, registry, types, shapes)) => {
-                        let outcome = acquisition.absorb_pattern_scan(
-                            text, &facts, &registry, &types, &shapes,
-                        );
+                        let outcome = acquisition
+                            .absorb_pattern_scan(text, &facts, &registry, &types, &shapes);
                         println!("{}", outcome.message);
                         persist_acquisition(&acquisition, &acquisition_path);
                     }
@@ -3423,7 +3450,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(id) = strip_any_prefix(input, &["退役模式：", "退役模式:", "退役模式 "]) {
+        if let Some(id) = strip_any_prefix(input, &["退役模式：", "退役模式:", "退役模式 "])
+        {
             let id = id.trim();
             if acquisition.retire_pattern(id) {
                 println!("已退役诱导模式 {}。", id);
@@ -3592,7 +3620,8 @@ async fn run_interactive_mode(
         }
 
         // 追踪为什么：沿追踪图 inputs 边回溯某编号节点的决策链
-        if let Some(id) = strip_any_prefix(input, &["追踪为什么：", "追踪为什么:", "追踪为什么"]) {
+        if let Some(id) = strip_any_prefix(input, &["追踪为什么：", "追踪为什么:", "追踪为什么"])
+        {
             match id.trim().parse::<u64>() {
                 Ok(id) => match dialogue_manager.trace_why(id) {
                     Some(text) => println!("{}", text),
@@ -3695,8 +3724,10 @@ async fn run_interactive_mode(
                 (Some(chronicle), until) => {
                     let until = until.unwrap_or(chronicle.last_seq());
                     let entries = chronicle.replay_to(until);
-                    let turns: Vec<TimelineTurn> =
-                        entries.iter().filter_map(|entry| TimelineTurn::from_entry(entry)).collect();
+                    let turns: Vec<TimelineTurn> = entries
+                        .iter()
+                        .filter_map(|entry| TimelineTurn::from_entry(entry))
+                        .collect();
                     println!(
                         "回放到 seq {}（记录 {} 条；当前状态不变，仅视图重建）：",
                         until,
@@ -3717,10 +3748,9 @@ async fn run_interactive_mode(
         }
 
         // 编年史检索：跨会话长程记忆（命中哪一轮、命中几次，可审计）
-        if let Some(query) = strip_any_prefix(
-            input,
-            &["聊过：", "聊过:", "聊过 ", "查档案：", "查档案:"],
-        ) {
+        if let Some(query) =
+            strip_any_prefix(input, &["聊过：", "聊过:", "聊过 ", "查档案：", "查档案:"])
+        {
             let query = query.trim();
             match (chronicle.as_ref(), query.is_empty()) {
                 (Some(chronicle), false) => {
@@ -3798,11 +3828,7 @@ async fn run_interactive_mode(
                             };
                             println!(
                                 "  {}  {}（{} 步{}）{}",
-                                proof.id,
-                                proof.goal,
-                                proof.step_count,
-                                confidence,
-                                truncation
+                                proof.id, proof.goal, proof.step_count, confidence, truncation
                             );
                         }
                         println!("用法：证明编号：<id> 回放叙述。");
@@ -3815,10 +3841,8 @@ async fn run_interactive_mode(
         }
 
         // 按 id 回放证明叙述（Brief/Normal/Deep 由内容自适应：默认 Deep）
-        if let Some(id) = strip_any_prefix(
-            input,
-            &["证明编号：", "证明编号:", "证明编号 "],
-        ) {
+        if let Some(id) = strip_any_prefix(input, &["证明编号：", "证明编号:", "证明编号 "])
+        {
             let id = id.trim();
             match chronicle.as_ref() {
                 Some(chronicle) if !id.is_empty() => {
@@ -3843,7 +3867,10 @@ async fn run_interactive_mode(
             match chronicle.as_ref() {
                 Some(chronicle) => {
                     let projection = JournalProjection::from_chronicle(chronicle);
-                    println!("{}", projection.consistency(chronicle.kb_revision()).render());
+                    println!(
+                        "{}",
+                        projection.consistency(chronicle.kb_revision()).render()
+                    );
                 }
                 None => println!("编年史不可用（打开失败，见启动警告）。"),
             }
@@ -3881,10 +3908,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(query) = strip_any_prefix(
-            input,
-            &["情景历史：", "情景历史:", "情景历史 "],
-        ) {
+        if let Some(query) = strip_any_prefix(input, &["情景历史：", "情景历史:", "情景历史 "])
+        {
             match chronicle.as_ref() {
                 Some(chronicle) => {
                     let theory = ConversationTheory::build(chronicle);
@@ -3900,10 +3925,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(query) = strip_any_prefix(
-            input,
-            &["情景归因：", "情景归因:", "情景归因 "],
-        ) {
+        if let Some(query) = strip_any_prefix(input, &["情景归因：", "情景归因:", "情景归因 "])
+        {
             match chronicle.as_ref() {
                 Some(chronicle) => {
                     let theory = ConversationTheory::build(chronicle);
@@ -3915,10 +3938,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(spec) = strip_any_prefix(
-            input,
-            &["情景反事实：", "情景反事实:", "情景反事实 "],
-        ) {
+        if let Some(spec) = strip_any_prefix(input, &["情景反事实：", "情景反事实:", "情景反事实 "])
+        {
             let spec = spec.trim();
             let (seq, query) = match spec.split_once(['：', ':']) {
                 Some((left, right)) if left.trim().parse::<u64>().is_ok() => {
@@ -3943,10 +3964,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(pattern) = strip_any_prefix(
-            input,
-            &["情景查询：", "情景查询:", "情景查询 "],
-        ) {
+        if let Some(pattern) = strip_any_prefix(input, &["情景查询：", "情景查询:", "情景查询 "])
+        {
             match chronicle.as_ref() {
                 Some(chronicle) => {
                     let theory = ConversationTheory::build(chronicle);
@@ -3998,7 +4017,12 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "证明图：", "证明图:", "证明树：", "证明树:", "画证明：", "画证明:",
+                "证明图：",
+                "证明图:",
+                "证明树：",
+                "证明树:",
+                "画证明：",
+                "画证明:",
             ],
         ) {
             let target = target.trim();
@@ -4049,12 +4073,11 @@ async fn run_interactive_mode(
                                 println!("……另有 {} 条知识缺口未展开", omitted);
                             }
                         }
-                        let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
+                        let certificates =
+                            ProofCertificate::from_view(&view, ProofLimits::default());
                         if let Some(chronicle) = chronicle.as_mut() {
-                            let _ = know_prolog::proof_journal::record_proofs(
-                                chronicle,
-                                &certificates,
-                            );
+                            let _ =
+                                know_prolog::proof_journal::record_proofs(chronicle, &certificates);
                         }
                         for (index, solution) in view.solutions.iter().enumerate() {
                             let bindings = if solution.bindings.is_empty() {
@@ -4102,7 +4125,12 @@ async fn run_interactive_mode(
         if let Some(entity) = strip_any_prefix(
             input,
             &[
-                "知识子图：", "知识子图:", "子图：", "子图:", "邻域：", "邻域:",
+                "知识子图：",
+                "知识子图:",
+                "子图：",
+                "子图:",
+                "邻域：",
+                "邻域:",
             ],
         ) {
             let entity = entity.trim();
@@ -4139,7 +4167,9 @@ async fn run_interactive_mode(
                     let mut coverage = CoverageInput::default();
                     for fact in facts.iter() {
                         match fact {
-                            PrologFact::Entity { name, properties, .. } => {
+                            PrologFact::Entity {
+                                name, properties, ..
+                            } => {
                                 coverage.entities.push(name.clone());
                                 for key in properties.keys() {
                                     coverage.attributes.push((name.clone(), key.clone()));
@@ -4180,8 +4210,14 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "对比：", "对比:", "神经符号对比：", "神经符号对比:", "双通道对比：",
-                "双通道对比:", "仲裁：", "仲裁:",
+                "对比：",
+                "对比:",
+                "神经符号对比：",
+                "神经符号对比:",
+                "双通道对比：",
+                "双通道对比:",
+                "仲裁：",
+                "仲裁:",
             ],
         ) {
             let target = target.trim();
@@ -4199,8 +4235,14 @@ async fn run_interactive_mode(
         // 对比校准报告：会话级一致率/冲突率与最近案例
         if matches!(
             input,
-            "对比报告" | "对比统计" | "校准报告" | "对比校准" | "仲裁报告" | "仲裁统计"
-                | "对比记忆" | "校准记忆"
+            "对比报告"
+                | "对比统计"
+                | "校准报告"
+                | "对比校准"
+                | "仲裁报告"
+                | "仲裁统计"
+                | "对比记忆"
+                | "校准记忆"
         ) {
             println!("{}", contrast_arbiter.memory_summary());
             println!("{}", contrast_arbiter.calibration_report());
@@ -4218,16 +4260,26 @@ async fn run_interactive_mode(
         // 确认联想推测：采信为会话事实（不修改知识图谱）
         if let Some(target) = strip_any_prefix(
             input,
-            &["对比确认", "对比确认：", "对比确认:", "对比采纳", "对比采纳：", "对比采纳:"],
+            &[
+                "对比确认",
+                "对比确认：",
+                "对比确认:",
+                "对比采纳",
+                "对比采纳：",
+                "对比采纳:",
+            ],
         ) {
             match parse_hypothesis_index(target) {
                 Some(index) => {
-                    println!("{}", contrast_arbiter
-                        .confirm_guess(index, &mut symbolic_reasoner)
-                        .unwrap_or_else(|| format!(
-                            "没有待定的联想推测 #{}；可用「待定推测」查看列表。",
-                            index
-                        )));
+                    println!(
+                        "{}",
+                        contrast_arbiter
+                            .confirm_guess(index, &mut symbolic_reasoner)
+                            .unwrap_or_else(|| format!(
+                                "没有待定的联想推测 #{}；可用「待定推测」查看列表。",
+                                index
+                            ))
+                    );
                 }
                 None => println!(
                     "请给出推测编号，例如：对比确认 1。当前待定推测：\n{}",
@@ -4241,15 +4293,26 @@ async fn run_interactive_mode(
         // 否认联想推测：加入屏蔽集，同类推测被抑制
         if let Some(target) = strip_any_prefix(
             input,
-            &["对比否认", "对比否认：", "对比否认:", "对比否决", "对比否决：", "对比否决:"],
+            &[
+                "对比否认",
+                "对比否认：",
+                "对比否认:",
+                "对比否决",
+                "对比否决：",
+                "对比否决:",
+            ],
         ) {
             match parse_hypothesis_index(target) {
                 Some(index) => {
-                    println!("{}", contrast_arbiter.refute_guess(index)
-                        .unwrap_or_else(|| format!(
-                            "没有待定的联想推测 #{}；可用「待定推测」查看列表。",
-                            index
-                        )));
+                    println!(
+                        "{}",
+                        contrast_arbiter
+                            .refute_guess(index)
+                            .unwrap_or_else(|| format!(
+                                "没有待定的联想推测 #{}；可用「待定推测」查看列表。",
+                                index
+                            ))
+                    );
                 }
                 None => println!(
                     "请给出推测编号，例如：对比否认 1。当前待定推测：\n{}",
@@ -4278,10 +4341,11 @@ async fn run_interactive_mode(
         // 对比追问进行中：把「是 / 不是 / 跳过」直接结算为确认或否认（多轮对话）
         if let Some(guess_id) = contrast_followup {
             let answer = input.trim().trim_end_matches(['。', '！', '!', '~']);
-            let affirmative = ["是", "是的", "对", "对的", "没错", "属实", "确认", "yes", "y"]
-                .contains(&answer);
-            let negative =
-                ["不是", "不对", "否", "不属实", "错", "no", "n"].contains(&answer);
+            let affirmative = [
+                "是", "是的", "对", "对的", "没错", "属实", "确认", "yes", "y",
+            ]
+            .contains(&answer);
+            let negative = ["不是", "不对", "否", "不属实", "错", "no", "n"].contains(&answer);
             if affirmative || negative {
                 let outcome = if affirmative {
                     contrast_arbiter.confirm_guess(guess_id, &mut symbolic_reasoner)
@@ -4358,7 +4422,12 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "场景：", "场景:", "联合解释：", "联合解释:", "解释场景：", "解释场景:",
+                "场景：",
+                "场景:",
+                "联合解释：",
+                "联合解释:",
+                "解释场景：",
+                "解释场景:",
             ],
         ) {
             let target = target.trim();
@@ -4376,7 +4445,14 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "判断：", "判断:", "蕴含：", "蕴含:", "校验：", "校验:", "形式化：", "形式化:",
+                "判断：",
+                "判断:",
+                "蕴含：",
+                "蕴含:",
+                "校验：",
+                "校验:",
+                "形式化：",
+                "形式化:",
             ],
         ) {
             let target = target.trim();
@@ -4394,7 +4470,10 @@ async fn run_interactive_mode(
         }
 
         // 多轮生成：接着上一段介绍继续讲
-        if matches!(input, "接着说" | "继续说" | "继续介绍" | "继续讲" | "接着讲") {
+        if matches!(
+            input,
+            "接着说" | "继续说" | "继续介绍" | "继续讲" | "接着讲"
+        ) {
             match symbolic_reasoner.continue_generation() {
                 Some(text) => println!("{}", text),
                 None => println!("还没有可续说的生成内容，请先输入「介绍：实体名」。"),
@@ -4417,10 +4496,8 @@ async fn run_interactive_mode(
         }
 
         // 读法追踪：token/词性来源/字符边界/计划/失败分类（只读，不改回答）
-        if let Some(text) = strip_any_prefix(
-            input,
-            &["读法追踪：", "读法追踪:", "读法：", "读法:"],
-        ) {
+        if let Some(text) = strip_any_prefix(input, &["读法追踪：", "读法追踪:", "读法：", "读法:"])
+        {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             let text = text.trim();
             if text.is_empty() {
@@ -4433,14 +4510,16 @@ async fn run_interactive_mode(
         }
 
         // 读法台账：失败轮的有限枚举计数与词性来源分布（不保存原文）
-        if matches!(input, "读法台账" | "读法报告" | "失败分类台账" | "失败分类") {
+        if matches!(input, "读法台账" | "读法报告" | "失败分类台账" | "失败分类")
+        {
             println!("{}", symbolic_reasoner.read_trace_ledger_report());
             println!();
             continue;
         }
 
         // 提及账本：每个指称的证据收据（边界 + 类型证据 × 疑问词期待 + 焦点先验）
-        if let Some(text) = strip_any_prefix(input, &["提及账本：", "提及账本:", "账本：", "账本:"]) {
+        if let Some(text) = strip_any_prefix(input, &["提及账本：", "提及账本:", "账本：", "账本:"])
+        {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             let text = text.trim();
             if text.is_empty() {
@@ -4469,7 +4548,8 @@ async fn run_interactive_mode(
         }
 
         // 提及格全局解码：不重叠最大证据路径（精确/别名/模糊/嵌套统一选路）
-        if let Some(text) = strip_any_prefix(input, &["提及格：", "提及格:", "格解码：", "格解码:"]) {
+        if let Some(text) = strip_any_prefix(input, &["提及格：", "提及格:", "格解码：", "格解码:"])
+        {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             let text = text.trim();
             if text.is_empty() {
@@ -4484,7 +4564,14 @@ async fn run_interactive_mode(
         // OOV 准入：提名 → 用户确认 → 写入知识库（显式词汇增长，可回溯）
         if let Some(target) = strip_any_prefix(
             input,
-            &["准入：", "准入:", "收录：", "收录:", "确认录入：", "确认录入:"],
+            &[
+                "准入：",
+                "准入:",
+                "收录：",
+                "收录:",
+                "确认录入：",
+                "确认录入:",
+            ],
         ) {
             let target = target.trim();
             if target.is_empty() {
@@ -4515,9 +4602,13 @@ async fn run_interactive_mode(
                         }];
                         match oxigraph_manager.save_knowledge(items).await {
                             Ok(()) => {
-                                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager)
-                                    .await;
-                                let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                                refresh_symbolic_reasoner(
+                                    &mut symbolic_reasoner,
+                                    &oxigraph_manager,
+                                )
+                                .await;
+                                let _ =
+                                    oxigraph_manager.save_entity_registry(&entity_registry_path);
                                 println!(
                                     "已准入：「{}」→ 类型 {}（已写入知识库，可在后续问句中被识别）。",
                                     name, etype
@@ -4533,7 +4624,10 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(entity) = strip_any_prefix(input, &["实体链接：", "实体链接:", "识别实体：", "识别实体:"]) {
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["实体链接：", "实体链接:", "识别实体：", "识别实体:"],
+        ) {
             match load_graph_snapshot(&oxigraph_manager).await {
                 Ok(facts) => symbolic_reasoner.observe_facts(&facts),
                 Err(e) => println!("加载知识图谱失败: {}", e),
@@ -4550,7 +4644,15 @@ async fn run_interactive_mode(
 
         if let Some(entity) = strip_any_prefix(
             input,
-            &["介绍：", "介绍:", "生成介绍：", "生成介绍:", "介绍一下", "讲讲", "说说"],
+            &[
+                "介绍：",
+                "介绍:",
+                "生成介绍：",
+                "生成介绍:",
+                "介绍一下",
+                "讲讲",
+                "说说",
+            ],
         ) {
             let entity = entity.trim();
             if entity.is_empty() {
@@ -4573,7 +4675,14 @@ async fn run_interactive_mode(
         // 符号主义叙述：OWL 本体定义开场 + 层级/继承推理 + DCG 文法实现的多句连贯段落
         if let Some(entity) = strip_any_prefix(
             input,
-            &["叙述：", "叙述:", "讲述：", "讲述:", "详细叙述：", "详细叙述:"],
+            &[
+                "叙述：",
+                "叙述:",
+                "讲述：",
+                "讲述:",
+                "详细叙述：",
+                "详细叙述:",
+            ],
         ) {
             let entity = entity.trim();
             if entity.is_empty() {
@@ -4591,10 +4700,13 @@ async fn run_interactive_mode(
         }
 
         // DCG 文法复述：对同一条事实给出多种合规句式（纯符号改写）
-        if let Some(spec) = strip_any_prefix(input, &["复述：", "复述:", "换个句式：", "换个句式:"]) {
+        if let Some(spec) = strip_any_prefix(input, &["复述：", "复述:", "换个句式：", "换个句式:"])
+        {
             let spec = spec.trim();
             match spec.rsplit_once('的') {
-                Some((entity, predicate)) if !entity.trim().is_empty() && !predicate.trim().is_empty() => {
+                Some((entity, predicate))
+                    if !entity.trim().is_empty() && !predicate.trim().is_empty() =>
+                {
                     refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                     match symbolic_reasoner.paraphrase_fact(entity.trim(), predicate.trim(), 4) {
                         Some(text) => println!("{}", text),
@@ -4612,10 +4724,9 @@ async fn run_interactive_mode(
         }
 
         // OWL 本体教学：把中文公理（子类/互斥/定义域/固有属性……）纳入本体推理
-        if let Some(axiom) = strip_any_prefix(
-            input,
-            &["教本体：", "教本体:", "本体教学：", "本体教学:"],
-        ) {
+        if let Some(axiom) =
+            strip_any_prefix(input, &["教本体：", "教本体:", "本体教学：", "本体教学:"])
+        {
             let axiom = axiom.trim();
             if axiom.is_empty() {
                 println!("请提供本体公理，例如：教本体：人是一种动物");
@@ -4656,7 +4767,14 @@ async fn run_interactive_mode(
         // 归结证明：对陈述句做 SLD 反驳并输出证明树（纯符号）
         if let Some(target) = strip_any_prefix(
             input,
-            &["证明：", "证明:", "归结：", "归结:", "证明目标：", "证明目标:"],
+            &[
+                "证明：",
+                "证明:",
+                "归结：",
+                "归结:",
+                "证明目标：",
+                "证明目标:",
+            ],
         ) {
             let target = target.trim();
             if target.is_empty() {
@@ -4665,13 +4783,9 @@ async fn run_interactive_mode(
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.resolution_proof_report(target));
                 if let Some(view) = symbolic_reasoner.resolution_proof_view(target) {
-                    let certificates =
-                        ProofCertificate::from_view(&view, ProofLimits::default());
+                    let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
                     if let Some(chronicle) = chronicle.as_mut() {
-                        let _ = know_prolog::proof_journal::record_proofs(
-                            chronicle,
-                            &certificates,
-                        );
+                        let _ = know_prolog::proof_journal::record_proofs(chronicle, &certificates);
                     }
                     if let Some(certificate) = certificates.first() {
                         println!(
@@ -4686,10 +4800,9 @@ async fn run_interactive_mode(
         }
 
         // 推理链：对开放目标求全部归结解，逐解展示证明链
-        if let Some(target) = strip_any_prefix(
-            input,
-            &["推理链：", "推理链:", "寻找证明：", "寻找证明:"],
-        ) {
+        if let Some(target) =
+            strip_any_prefix(input, &["推理链：", "推理链:", "寻找证明：", "寻找证明:"])
+        {
             let target = target.trim();
             if target.is_empty() {
                 println!("请提供推理目标，例如：推理链：张三的师傅的师傅是谁");
@@ -4697,13 +4810,9 @@ async fn run_interactive_mode(
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.resolution_query_report(target));
                 if let Some(view) = symbolic_reasoner.resolution_proof_view(target) {
-                    let certificates =
-                        ProofCertificate::from_view(&view, ProofLimits::default());
+                    let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
                     if let Some(chronicle) = chronicle.as_mut() {
-                        let _ = know_prolog::proof_journal::record_proofs(
-                            chronicle,
-                            &certificates,
-                        );
+                        let _ = know_prolog::proof_journal::record_proofs(chronicle, &certificates);
                     }
                     if let Some(certificate) = certificates.first() {
                         println!(
@@ -4732,10 +4841,9 @@ async fn run_interactive_mode(
         }
 
         // 联想：由关联规则推荐实体可能还具备的缺失特征
-        if let Some(entity) = strip_any_prefix(
-            input,
-            &["联想：", "联想:", "关联联想：", "关联联想:"],
-        ) {
+        if let Some(entity) =
+            strip_any_prefix(input, &["联想：", "联想:", "关联联想：", "关联联想:"])
+        {
             let entity = entity.trim();
             if entity.is_empty() {
                 println!("请提供要联想的实体，例如：联想：姚明");
@@ -4743,9 +4851,9 @@ async fn run_interactive_mode(
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 match symbolic_reasoner.association_suggestions(entity) {
                     Some(text) => println!("{}", text),
-                    None => println!(
-                        "没有可用的关联联想（实体未见过，或没有满足阈值的关联规则）。"
-                    ),
+                    None => {
+                        println!("没有可用的关联联想（实体未见过，或没有满足阈值的关联规则）。")
+                    }
                 }
             }
             println!();
@@ -4753,10 +4861,9 @@ async fn run_interactive_mode(
         }
 
         // 结构联想：RWR 图嵌入（随机游走重启）检索结构相关实体与解释路径
-        if let Some(entity) = strip_any_prefix(
-            input,
-            &["结构联想：", "结构联想:", "图游走：", "图游走:"],
-        ) {
+        if let Some(entity) =
+            strip_any_prefix(input, &["结构联想：", "结构联想:", "图游走：", "图游走:"])
+        {
             let entity = entity.trim();
             if entity.is_empty() {
                 println!("请提供要联想的实体，例如：结构联想：张三");
@@ -4788,7 +4895,12 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "全息检索：", "全息检索:", "全息查询：", "全息查询:", "全息补全：", "全息补全:",
+                "全息检索：",
+                "全息检索:",
+                "全息查询：",
+                "全息查询:",
+                "全息补全：",
+                "全息补全:",
             ],
         ) {
             match parse_holo_pair(target) {
@@ -4881,8 +4993,14 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "因果反事实：", "因果反事实:", "反事实干预：", "反事实干预:", "干预：",
-                "干预:", "do：", "do:",
+                "因果反事实：",
+                "因果反事实:",
+                "反事实干预：",
+                "反事实干预:",
+                "干预：",
+                "干预:",
+                "do：",
+                "do:",
             ],
         ) {
             let (target, value) = parse_intervention_value(target.trim());
@@ -4900,7 +5018,12 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "因果链：", "因果链:", "因果关系：", "因果关系:", "因果：", "因果:",
+                "因果链：",
+                "因果链:",
+                "因果关系：",
+                "因果关系:",
+                "因果：",
+                "因果:",
             ],
         ) {
             let target = target.trim();
@@ -4915,9 +5038,10 @@ async fn run_interactive_mode(
         }
 
         // 符号梯度归因：可微推理的纯符号版（解析求导 + 求证优先级）
-        if let Some(target) =
-            strip_any_prefix(input, &["梯度归因：", "梯度归因:", "可微推理：", "可微推理:"])
-        {
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["梯度归因：", "梯度归因:", "可微推理：", "可微推理:"],
+        ) {
             let target = target.trim();
             if target.is_empty() {
                 println!("请提供要归因的对象，例如：梯度归因：李四的师祖 或 梯度归因：张三");
@@ -4956,8 +5080,14 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "概率推理：", "概率推理:", "可能世界：", "可能世界:", "ProbLog：", "ProbLog:",
-                "probLog：", "probLog:",
+                "概率推理：",
+                "概率推理:",
+                "可能世界：",
+                "可能世界:",
+                "ProbLog：",
+                "ProbLog:",
+                "probLog：",
+                "probLog:",
             ],
         ) {
             let target = target.trim();
@@ -4985,7 +5115,14 @@ async fn run_interactive_mode(
         // 中文概率知识教学：自然语言句子 → ProbLog 概率知识（会话级，不写知识图谱）
         if let Some(target) = strip_any_prefix(
             input,
-            &["教学：", "教学:", "教我：", "教我:", "概率知识：", "概率知识:"],
+            &[
+                "教学：",
+                "教学:",
+                "教我：",
+                "教我:",
+                "概率知识：",
+                "概率知识:",
+            ],
         ) {
             let target = target.trim();
             if target.is_empty() {
@@ -5005,7 +5142,12 @@ async fn run_interactive_mode(
         if let Some(target) = strip_any_prefix(
             input,
             &[
-                "规则：", "规则:", "教规则：", "教规则:", "学习规则：", "学习规则:",
+                "规则：",
+                "规则:",
+                "教规则：",
+                "教规则:",
+                "学习规则：",
+                "学习规则:",
             ],
         ) {
             let target = target.trim();
@@ -5017,12 +5159,8 @@ async fn run_interactive_mode(
                 let learned = report.contains("已学习中文规则");
                 println!("{}", report);
                 if let Some(chronicle) = chronicle.as_mut() {
-                    let _ = conversation_theory::append_rule(
-                        chronicle,
-                        target,
-                        learned,
-                        kb_revision,
-                    );
+                    let _ =
+                        conversation_theory::append_rule(chronicle, target, learned, kb_revision);
                 }
                 sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             }
@@ -5033,9 +5171,7 @@ async fn run_interactive_mode(
         // 更正知识：删除旧值、写入新值，并把「旧值错了」写成可追踪的事件
         if let Some(target) = strip_any_prefix(
             input,
-            &[
-                "更正：", "更正:", "纠正：", "纠正:", "修正：", "修正:",
-            ],
+            &["更正：", "更正:", "纠正：", "纠正:", "修正：", "修正:"],
         ) {
             let target = target.trim();
             match parse_correction_spec(target) {
@@ -5190,7 +5326,9 @@ async fn run_interactive_mode(
                 eprintln!("刷新谓词画像失败: {}", e);
             }
             sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
-            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+            if let Some(persisted) =
+                LawBook::load_from_path(&format!("{}/law_book.json", store_path))
+            {
                 symbolic_reasoner.load_persisted_laws(persisted);
             }
             println!("{}", symbolic_reasoner.law_report());
@@ -5209,7 +5347,10 @@ async fn run_interactive_mode(
         }
 
         // 形状校验：必备属性 / 基数 / 数据类型 / 定义域值域（只读派生）
-        if matches!(input, "形状报告" | "形状校验" | "SHACL报告" | "shacl报告" | "shapes") {
+        if matches!(
+            input,
+            "形状报告" | "形状校验" | "SHACL报告" | "shacl报告" | "shapes"
+        ) {
             match shape_report_for(&oxigraph_manager, &config).await {
                 Ok((_, report)) => println!("{}", report.render_text()),
                 Err(e) => eprintln!("构建形状报告失败: {}", e),
@@ -5255,7 +5396,12 @@ async fn run_interactive_mode(
         if let Some(spec) = strip_any_prefix(
             input,
             &[
-                "登记别名：", "登记别名:", "谓词别名：", "谓词别名:", "同义谓词：", "同义谓词:",
+                "登记别名：",
+                "登记别名:",
+                "谓词别名：",
+                "谓词别名:",
+                "同义谓词：",
+                "同义谓词:",
             ],
         ) {
             match parse_predicate_pair(spec) {
@@ -5271,9 +5417,9 @@ async fn run_interactive_mode(
                         println!("未发生变化（别名已存在或与规范名相同）。");
                     }
                 }
-                None => println!(
-                    "请用「登记别名：别名 = 规范谓词」的格式，例如：登记别名：老师 = 师傅"
-                ),
+                None => {
+                    println!("请用「登记别名：别名 = 规范谓词」的格式，例如：登记别名：老师 = 师傅")
+                }
             }
             println!();
             continue;
@@ -5282,7 +5428,14 @@ async fn run_interactive_mode(
         // 登记互逆谓词：左 = 右（p(a,b) 与 q(b,a) 等价，导入自动统一方向）
         if let Some(spec) = strip_any_prefix(
             input,
-            &["登记逆谓词：", "登记逆谓词:", "逆谓词：", "逆谓词:", "互逆谓词：", "互逆谓词:"],
+            &[
+                "登记逆谓词：",
+                "登记逆谓词:",
+                "逆谓词：",
+                "逆谓词:",
+                "互逆谓词：",
+                "互逆谓词:",
+            ],
         ) {
             match parse_predicate_pair(spec) {
                 Some((left, right)) => {
@@ -5297,9 +5450,9 @@ async fn run_interactive_mode(
                         println!("未发生变化（互逆关系已存在或两侧相同）。");
                     }
                 }
-                None => println!(
-                    "请用「登记逆谓词：左 = 右」的格式，例如：登记逆谓词：师傅 = 徒弟"
-                ),
+                None => {
+                    println!("请用「登记逆谓词：左 = 右」的格式，例如：登记逆谓词：师傅 = 徒弟")
+                }
             }
             println!();
             continue;
@@ -5312,7 +5465,10 @@ async fn run_interactive_mode(
                 println!("请给出谓词名，例如：功能谓词：年龄");
             } else if oxigraph_manager.mark_predicate_functional(predicate, true) {
                 let _ = oxigraph_manager.save_predicate_registry(&registry_path);
-                println!("已标记功能谓词「{}」：同主语的新值将与原值冲突并等待裁决。", predicate);
+                println!(
+                    "已标记功能谓词「{}」：同主语的新值将与原值冲突并等待裁决。",
+                    predicate
+                );
             } else {
                 println!("「{}」已是功能谓词。", predicate);
             }
@@ -5320,9 +5476,11 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(predicate) = strip_any_prefix(input, &["取消功能谓词：", "取消功能谓词:"]) {
+        if let Some(predicate) = strip_any_prefix(input, &["取消功能谓词：", "取消功能谓词:"])
+        {
             let predicate = predicate.trim();
-            if !predicate.is_empty() && oxigraph_manager.mark_predicate_functional(predicate, false) {
+            if !predicate.is_empty() && oxigraph_manager.mark_predicate_functional(predicate, false)
+            {
                 let _ = oxigraph_manager.save_predicate_registry(&registry_path);
                 println!("已取消「{}」的功能谓词标记。", predicate);
             } else {
@@ -5339,7 +5497,10 @@ async fn run_interactive_mode(
                     if oxigraph_manager.confirm_entity_alias(&surface, &canonical) {
                         symbolic_reasoner.register_entity_alias(&surface, &canonical);
                         let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
-                        println!("已确认身份：「{}」≡「{}」（持久别名，重启后仍生效）。", surface, canonical);
+                        println!(
+                            "已确认身份：「{}」≡「{}」（持久别名，重启后仍生效）。",
+                            surface, canonical
+                        );
                     } else {
                         println!("确认未有改动（词面为空、词面即规范名或已确认）。");
                     }
@@ -5356,7 +5517,10 @@ async fn run_interactive_mode(
                     if oxigraph_manager.confirm_entity_alias(&surface, &canonical) {
                         symbolic_reasoner.register_entity_alias(&surface, &canonical);
                         let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
-                        println!("已记住身份：「{}」≡「{}」（提名即时确认并落盘）。", surface, canonical);
+                        println!(
+                            "已记住身份：「{}」≡「{}」（提名即时确认并落盘）。",
+                            surface, canonical
+                        );
                     } else {
                         println!("记住未有改动（词面为空、词面即规范名或已确认）。");
                     }
@@ -5409,20 +5573,21 @@ async fn run_interactive_mode(
 
         if let Some(spec) = strip_any_prefix(input, &["合并身份：", "合并身份:"]) {
             match parse_predicate_pair(spec) {
-                Some((from, into)) => match oxigraph_manager.merge_entity_identities(&from, &into)
-                {
-                    Ok(record) => {
-                        symbolic_reasoner.register_entity_alias(&from, &into);
-                        let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
-                        println!(
+                Some((from, into)) => {
+                    match oxigraph_manager.merge_entity_identities(&from, &into) {
+                        Ok(record) => {
+                            symbolic_reasoner.register_entity_alias(&from, &into);
+                            let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
+                            println!(
                             "已合并身份：「{}」→「{}」（迁移 {} 个别名；旧名永久重定向，URI 不回收）。",
                             record.from,
                             record.into,
                             record.moved_aliases
                         );
+                        }
+                        Err(e) => println!("合并失败：{}", e),
                     }
-                    Err(e) => println!("合并失败：{}", e),
-                },
+                }
                 None => println!("请给出合并对，例如：合并身份：苹果公司 = 苹果"),
             }
             println!();
@@ -5446,7 +5611,10 @@ async fn run_interactive_mode(
             let predicate = predicate.trim();
             if !predicate.is_empty() && oxigraph_manager.confirm_predicate(predicate) {
                 let _ = oxigraph_manager.save_predicate_registry(&registry_path);
-                println!("已确认谓词「{}」：画像转为已声明，可用于稳定推理。", predicate);
+                println!(
+                    "已确认谓词「{}」：画像转为已声明，可用于稳定推理。",
+                    predicate
+                );
             } else {
                 println!("「{}」不是待确认谓词（可能已确认或未登记）。", predicate);
             }
@@ -5464,7 +5632,10 @@ async fn run_interactive_mode(
                         reasoner_stale = true;
                         sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
                         let _ = oxigraph_manager.save_predicate_registry(&registry_path);
-                        println!("已拒绝谓词「{}」并移除 {} 条相关三元组。", predicate, removed);
+                        println!(
+                            "已拒绝谓词「{}」并移除 {} 条相关三元组。",
+                            predicate, removed
+                        );
                     }
                     Ok(_) => println!(
                         "没有可拒绝的待定谓词「{}」（仅自动准入且未确认的谓词可拒绝）。",
@@ -5631,7 +5802,10 @@ async fn run_interactive_mode(
 
         // 性能报告：存储/推理共享台账（缓存命中、图扫描、版本推进等）
         if matches!(input, "性能报告" | "性能台账" | "运行统计") {
-            println!("{}", perf_ledger.report_with_title("性能台账（本会话累计）"));
+            println!(
+                "{}",
+                perf_ledger.report_with_title("性能台账（本会话累计）")
+            );
             println!();
             continue;
         }
@@ -5776,7 +5950,14 @@ async fn run_interactive_mode(
         // 溯因·假设生成：后向链失败前沿 → 候选假设（可证明则直接给证明）
         if let Some(target) = strip_any_prefix(
             input,
-            &["溯因：", "溯因:", "假设生成：", "假设生成:", "为什么：", "为什么:"],
+            &[
+                "溯因：",
+                "溯因:",
+                "假设生成：",
+                "假设生成:",
+                "为什么：",
+                "为什么:",
+            ],
         ) {
             let target = target.trim().trim_end_matches(['？', '?', '。', ' ']);
             if target.is_empty() {
@@ -5850,8 +6031,11 @@ async fn run_interactive_mode(
         // 反事实模拟："如果……那么……" / "假设：……"，正向链推演后自动回滚
         if input.starts_with("如果")
             || input.starts_with("假如")
-            || strip_any_prefix(input, &["反事实：", "反事实:", "假设：", "假设:", "假如：", "假如:"])
-                .is_some()
+            || strip_any_prefix(
+                input,
+                &["反事实：", "反事实:", "假设：", "假设:", "假如：", "假如:"],
+            )
+            .is_some()
         {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             match symbolic_reasoner.what_if_report(input) {
@@ -5867,11 +6051,25 @@ async fn run_interactive_mode(
         // 采纳待定假设：加入本轮会话事实集（不写知识图谱）
         if let Some(target) = strip_any_prefix(
             input,
-            &["采纳假设", "采纳假设：", "采纳假设:", "确认假设", "确认假设：", "确认假设:"],
+            &[
+                "采纳假设",
+                "采纳假设：",
+                "采纳假设:",
+                "确认假设",
+                "确认假设：",
+                "确认假设:",
+            ],
         ) {
             match parse_hypothesis_index(target) {
-                Some(index) => println!("{}", symbolic_reasoner.adopt_hypothesis(index)
-                    .unwrap_or_else(|| format!("没有第 {} 条待定假设；可用「待定假设」查看列表。", index))),
+                Some(index) => println!(
+                    "{}",
+                    symbolic_reasoner
+                        .adopt_hypothesis(index)
+                        .unwrap_or_else(|| format!(
+                            "没有第 {} 条待定假设；可用「待定假设」查看列表。",
+                            index
+                        ))
+                ),
                 None => println!(
                     "请给出假设编号，例如：采纳假设 1。当前待定假设：\n{}",
                     symbolic_reasoner.pending_hypotheses_report()
@@ -5948,7 +6146,9 @@ async fn run_interactive_mode(
                 }
                 ImportDirective::RdfFile(file_path) => {
                     if file_path.is_empty() {
-                        println!("请提供 RDF 文件路径（支持 .ttl / .nt / .nq / .trig / .rdf / .xml）");
+                        println!(
+                            "请提供 RDF 文件路径（支持 .ttl / .nt / .nq / .trig / .rdf / .xml）"
+                        );
                         println!();
                         continue;
                     }
@@ -6022,8 +6222,11 @@ async fn run_interactive_mode(
                 {
                     // 知识导入逻辑
                     println!("{}", config.messages.importing);
-                    
-                    let clean_text = config.nlp.import_keywords.iter()
+
+                    let clean_text = config
+                        .nlp
+                        .import_keywords
+                        .iter()
                         .fold(input.to_string(), |text, keyword| {
                             // 关键词未出现时原样返回
                             if !text.contains(keyword.as_str()) {
@@ -6034,7 +6237,7 @@ async fn run_interactive_mode(
                         })
                         .trim()
                         .to_string();
-                    
+
                     let tagged_words = preprocess(&clean_text, &plugin_nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
@@ -6058,7 +6261,7 @@ async fn run_interactive_mode(
                             !matches!(item, KnowledgeItem::Entity { label, .. } if label == "Entity")
                         });
                     }
-                    
+
                     if items.is_empty() {
                         println!("{}", config.messages.no_knowledge_extracted);
                     } else {
@@ -6067,13 +6270,22 @@ async fn run_interactive_mode(
                                 KnowledgeItem::Entity { label, properties } => {
                                     println!("实体 - 类型: {}, 属性: {:?}", label, properties);
                                 }
-                                KnowledgeItem::Relationship { from_label, from_id, to_label, to_id, rel_type, .. } => {
-                                    println!("关系 - {}({}) -[{}]-> {}({})",
-                                        from_label, from_id, rel_type, to_label, to_id);
+                                KnowledgeItem::Relationship {
+                                    from_label,
+                                    from_id,
+                                    to_label,
+                                    to_id,
+                                    rel_type,
+                                    ..
+                                } => {
+                                    println!(
+                                        "关系 - {}({}) -[{}]-> {}({})",
+                                        from_label, from_id, rel_type, to_label, to_id
+                                    );
                                 }
                             }
                         }
-                        
+
                         match oxigraph_manager.save_knowledge_with_receipt(items).await {
                             Ok(receipt) => {
                                 let summary = receipt.summary();
@@ -6193,8 +6405,10 @@ async fn run_interactive_mode(
                                         "（语境绑定已获二次确认：「{}」≡「{}」，已登记为别名。）",
                                         outcome.surface, outcome.canonical
                                     );
-                                    let _ = symbolic_reasoner
-                                        .register_entity_alias(&outcome.surface, &outcome.canonical);
+                                    let _ = symbolic_reasoner.register_entity_alias(
+                                        &outcome.surface,
+                                        &outcome.canonical,
+                                    );
                                 }
                                 know_prolog::entity_registry::NominationKind::Pending => {
                                     println!(
@@ -6215,7 +6429,9 @@ async fn run_interactive_mode(
                     }
                 }
                 if crd_input.is_none()
-                    && (contains_question_marker(input) || input.contains('？') || input.contains('?'))
+                    && (contains_question_marker(input)
+                        || input.contains('？')
+                        || input.contains('?'))
                 {
                     let outcome = crd_resolver.resolve_text(
                         input,
@@ -6230,7 +6446,8 @@ async fn run_interactive_mode(
                         || outcome.rewrite.is_some()
                         || outcome.resolutions.iter().any(|resolution| {
                             resolution.candidates.len() > 1
-                                || resolution.verdict == know_prolog::contextual_reference::Verdict::Bound
+                                || resolution.verdict
+                                    == know_prolog::contextual_reference::Verdict::Bound
                         });
                     if show_notes {
                         for note in &outcome.notes {
@@ -6253,25 +6470,28 @@ async fn run_interactive_mode(
                 let crd_base_input = crd_input.unwrap_or_else(|| input.to_string());
 
                 // 多轮对话上下文：指代消解与省略补全（话语帧合一，符号方式，无神经网络）
-                let contextual_input = match symbolic_reasoner.contextualize_with_receipt(&crd_base_input) {
-                    Some(rewrite) => {
-                        for note in &rewrite.notes {
-                            println!("（{}）", note);
+                let contextual_input =
+                    match symbolic_reasoner.contextualize_with_receipt(&crd_base_input) {
+                        Some(rewrite) => {
+                            for note in &rewrite.notes {
+                                println!("（{}）", note);
+                            }
+                            println!("（结合对话上下文理解为：{}）", rewrite.text);
+                            rewrite.text
                         }
-                        println!("（结合对话上下文理解为：{}）", rewrite.text);
-                        rewrite.text
-                    }
-                    None => {
-                        // 无源可填的实体洞：不落进「无法理解」，转为一次显式绑定请求
-                        // （澄清 = 请求一次绑定；常规通道必然失败时才开启）。
-                        if let Some(prompt) = symbolic_reasoner.start_frame_clarification(&crd_base_input) {
-                            println!("{}", prompt);
-                            println!();
-                            continue;
+                        None => {
+                            // 无源可填的实体洞：不落进「无法理解」，转为一次显式绑定请求
+                            // （澄清 = 请求一次绑定；常规通道必然失败时才开启）。
+                            if let Some(prompt) =
+                                symbolic_reasoner.start_frame_clarification(&crd_base_input)
+                            {
+                                println!("{}", prompt);
+                                println!();
+                                continue;
+                            }
+                            crd_base_input
                         }
-                        crd_base_input
-                    }
-                };
+                    };
                 let input = contextual_input.as_str();
 
                 for note in symbolic_reasoner.entity_link_notes(input) {
@@ -6279,10 +6499,9 @@ async fn run_interactive_mode(
                 }
 
                 // 会话覆盖层优先：只回答本会话已确认的关系，绝不冒充图谱事实。
-                if let Some(answer) = acquisition.answer_from_overlay(
-                    input,
-                    &oxigraph_manager.predicate_registry_snapshot(),
-                ) {
+                if let Some(answer) = acquisition
+                    .answer_from_overlay(input, &oxigraph_manager.predicate_registry_snapshot())
+                {
                     println!("{}", answer.render_text());
                     log_chronicle_reply(&mut chronicle, &answer.render_text(), &[], &[]);
                     println!();
@@ -6326,10 +6545,8 @@ async fn run_interactive_mode(
                             let composed = plugin_runtime.compose_answer(outcome, &answer);
                             let text = composed.text;
                             println!("{}", text);
-                            let plan = vec![format!(
-                                "plugin:{}:{}",
-                                recipe.plugin, recipe.contribution
-                            )];
+                            let plan =
+                                vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
                             let provenance = vec![format!(
                                 "插件 {} / 配方 {} / 问句 {}",
                                 recipe.plugin, recipe.contribution, recipe.question
@@ -6386,18 +6603,19 @@ async fn run_interactive_mode(
                     None
                 };
                 let normalized_words = normalize_words(tagged_words, &synonyms);
-                
+
                 // 使用NLU进行语义理解
                 if config.nlp.enable_nlu.unwrap_or(false) {
                     let semantic_analysis = match nlu_tagged_words {
                         Some(tagged) => nlu_engine.analyze_tagged(input, tagged),
                         None => nlu_engine.analyze(input),
                     };
-                    
+
                     if !semantic_analysis.semantics.is_empty() {
                         let best_semantic = &semantic_analysis.semantics[0];
-                        let confidence_threshold = config.nlp.nlu_confidence_threshold.unwrap_or(0.6);
-                        
+                        let confidence_threshold =
+                            config.nlp.nlu_confidence_threshold.unwrap_or(0.6);
+
                         if best_semantic.score >= confidence_threshold {
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                             println!("NLU语义理解结果:");
@@ -6411,30 +6629,45 @@ async fn run_interactive_mode(
                                 }
                             }
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-                            
+
                             // 根据NLU结果处理查询
                             match best_semantic.domain.as_str() {
                                 "天气" => {
-                                    let city = best_semantic.slots.iter()
+                                    let city = best_semantic
+                                        .slots
+                                        .iter()
                                         .find(|(name, _)| name == "城市")
                                         .map(|(_, value)| value.clone())
                                         .unwrap_or_else(|| "未知城市".to_string());
-                                    let date = best_semantic.slots.iter()
+                                    let date = best_semantic
+                                        .slots
+                                        .iter()
                                         .find(|(name, _)| name == "日期")
                                         .map(|(_, value)| value.clone())
                                         .unwrap_or_else(|| "今天".to_string());
-                                    
+
                                     match best_semantic.intent.as_str() {
                                         "雨" | "天气查询" => {
                                             println!("正在查询{}{}的天气信息...", city, date);
                                             println!("（天气API未接入，尝试从本地知识库回答）");
                                         }
                                         _ => {
-                                            println!("暂不支持该天气查询类型: {}，尝试本地符号推理...", best_semantic.intent);
+                                            println!(
+                                                "暂不支持该天气查询类型: {}，尝试本地符号推理...",
+                                                best_semantic.intent
+                                            );
                                         }
                                     }
                                     // 天气 API 不可用时不能丢问题：回落到本地图谱/符号推理
-                                    if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                    if let Some(answer) = try_symbolic_reasoning(
+                                        &mut symbolic_reasoner,
+                                        &mut contrast_arbiter,
+                                        &oxigraph_manager,
+                                        input,
+                                        &precomputed_query_entities,
+                                    )
+                                    .await
+                                    {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
                                     } else {
@@ -6442,29 +6675,41 @@ async fn run_interactive_mode(
                                     }
                                 }
                                 "人物" => {
-                                    let person = best_semantic.slots.iter()
+                                    let person = best_semantic
+                                        .slots
+                                        .iter()
                                         .find(|(name, _)| name == "人名")
                                         .map(|(_, value)| value.clone());
-                                    
+
                                     if let Some(person_name) = person {
                                         match best_semantic.intent.as_str() {
                                             "身高查询" => {
                                                 println!("正在查询{}的身高信息...", person_name);
                                                 // 本地适配器返回了实体但没有身高/高度属性时，
                                                 // 不能就此收尾：回落到本地图谱与符号推理
-                                                let found_height = match local_semantic_adapter.get_entity_knowledge(&person_name).await {
+                                                let found_height = match local_semantic_adapter
+                                                    .get_entity_knowledge(&person_name)
+                                                    .await
+                                                {
                                                     Ok(response) => {
-                                                        println!("─────────────────────────────────");
+                                                        println!(
+                                                            "─────────────────────────────────"
+                                                        );
                                                         println!("实体: {}", response.data.entity);
                                                         println!("描述: {}", response.data.desc);
                                                         let mut found = false;
                                                         for avp in &response.data.avp {
-                                                            if avp.len() >= 2 && (avp[0].contains("身高") || avp[0].contains("高度")) {
+                                                            if avp.len() >= 2
+                                                                && (avp[0].contains("身高")
+                                                                    || avp[0].contains("高度"))
+                                                            {
                                                                 println!("身高: {}", avp[1]);
                                                                 found = true;
                                                             }
                                                         }
-                                                        println!("─────────────────────────────────");
+                                                        println!(
+                                                            "─────────────────────────────────"
+                                                        );
                                                         found
                                                     }
                                                     Err(e) => {
@@ -6473,28 +6718,73 @@ async fn run_interactive_mode(
                                                     }
                                                 };
                                                 if !found_height {
-                                                    if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                    if let Some(answer) = try_symbolic_reasoning(
+                                                        &mut symbolic_reasoner,
+                                                        &mut contrast_arbiter,
+                                                        &oxigraph_manager,
+                                                        input,
+                                                        &precomputed_query_entities,
+                                                    )
+                                                    .await
+                                                    {
                                                         println!("{}", answer);
-                                                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                                        log_chronicle_reply(
+                                                            &mut chronicle,
+                                                            &answer,
+                                                            &[],
+                                                            &[],
+                                                        );
                                                     } else {
-                                                        println!("知识库中没有{}的身高记录。", person_name);
+                                                        println!(
+                                                            "知识库中没有{}的身高记录。",
+                                                            person_name
+                                                        );
                                                     }
                                                 }
                                             }
                                             "年龄查询" => {
                                                 println!("正在查询{}的年龄信息...", person_name);
-                                                if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                if let Some(answer) = try_symbolic_reasoning(
+                                                    &mut symbolic_reasoner,
+                                                    &mut contrast_arbiter,
+                                                    &oxigraph_manager,
+                                                    input,
+                                                    &precomputed_query_entities,
+                                                )
+                                                .await
+                                                {
                                                     println!("{}", answer);
-                                                    log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                                    log_chronicle_reply(
+                                                        &mut chronicle,
+                                                        &answer,
+                                                        &[],
+                                                        &[],
+                                                    );
                                                 } else {
-                                                    println!("知识库中没有{}的年龄记录。", person_name);
+                                                    println!(
+                                                        "知识库中没有{}的年龄记录。",
+                                                        person_name
+                                                    );
                                                 }
                                             }
                                             _ => {
                                                 println!("暂不支持该人物查询类型: {}，尝试本地符号推理...", best_semantic.intent);
-                                                if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                                if let Some(answer) = try_symbolic_reasoning(
+                                                    &mut symbolic_reasoner,
+                                                    &mut contrast_arbiter,
+                                                    &oxigraph_manager,
+                                                    input,
+                                                    &precomputed_query_entities,
+                                                )
+                                                .await
+                                                {
                                                     println!("{}", answer);
-                                                    log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                                                    log_chronicle_reply(
+                                                        &mut chronicle,
+                                                        &answer,
+                                                        &[],
+                                                        &[],
+                                                    );
                                                 }
                                             }
                                         }
@@ -6504,7 +6794,9 @@ async fn run_interactive_mode(
                                 }
                                 "聊天" => {
                                     let chat_reply = match best_semantic.intent.as_str() {
-                                        "问候" => "你好！我是KnowProlog知识图谱系统，很高兴为您服务！",
+                                        "问候" => {
+                                            "你好！我是KnowProlog知识图谱系统，很高兴为您服务！"
+                                        }
                                         "感谢" => "不客气！如果您有其他问题，随时可以问我。",
                                         _ => "很高兴和您聊天！",
                                     };
@@ -6513,13 +6805,41 @@ async fn run_interactive_mode(
                                 }
                                 "知识查询" => {
                                     // 继续使用查询逻辑
-                                     if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(&pattern_library, &normalized_words) {
-                                         // 执行查询流程
-                                         if let Some(note) = &pattern_note {
-                                             println!("命中模式: {}", note);
-                                         }
-                                         continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
-                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                    if let Some((query_type, entities, pattern_note)) =
+                                        route_query_with_patterns(
+                                            &pattern_library,
+                                            &normalized_words,
+                                        )
+                                    {
+                                        // 执行查询流程
+                                        if let Some(note) = &pattern_note {
+                                            println!("命中模式: {}", note);
+                                        }
+                                        continue_original_query(
+                                            &config,
+                                            &oxigraph_manager,
+                                            &mut prolog_engine,
+                                            &response_formatter,
+                                            &local_semantic_adapter,
+                                            &external_knowledge_service,
+                                            &mut symbolic_reasoner,
+                                            &mut contrast_arbiter,
+                                            &mut plugin_runtime,
+                                            input,
+                                            &query_type,
+                                            &entities,
+                                            &precomputed_query_entities,
+                                        )
+                                        .await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(
+                                        &mut symbolic_reasoner,
+                                        &mut contrast_arbiter,
+                                        &oxigraph_manager,
+                                        input,
+                                        &precomputed_query_entities,
+                                    )
+                                    .await
+                                    {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
                                     } else if let Some((text, plan)) =
@@ -6541,12 +6861,40 @@ async fn run_interactive_mode(
                                 _ => {
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
-                                     if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(&pattern_library, &normalized_words) {
-                                         if let Some(note) = &pattern_note {
-                                             println!("命中模式: {}", note);
-                                         }
-                                         continue_original_query(&config, &oxigraph_manager, &mut prolog_engine, &response_formatter, &local_semantic_adapter, &external_knowledge_service, &mut symbolic_reasoner, &mut contrast_arbiter, &mut plugin_runtime, input, &query_type, &entities, &precomputed_query_entities).await;
-                                    } else if let Some(answer) = try_symbolic_reasoning(&mut symbolic_reasoner, &mut contrast_arbiter, &oxigraph_manager, input, &precomputed_query_entities).await {
+                                    if let Some((query_type, entities, pattern_note)) =
+                                        route_query_with_patterns(
+                                            &pattern_library,
+                                            &normalized_words,
+                                        )
+                                    {
+                                        if let Some(note) = &pattern_note {
+                                            println!("命中模式: {}", note);
+                                        }
+                                        continue_original_query(
+                                            &config,
+                                            &oxigraph_manager,
+                                            &mut prolog_engine,
+                                            &response_formatter,
+                                            &local_semantic_adapter,
+                                            &external_knowledge_service,
+                                            &mut symbolic_reasoner,
+                                            &mut contrast_arbiter,
+                                            &mut plugin_runtime,
+                                            input,
+                                            &query_type,
+                                            &entities,
+                                            &precomputed_query_entities,
+                                        )
+                                        .await;
+                                    } else if let Some(answer) = try_symbolic_reasoning(
+                                        &mut symbolic_reasoner,
+                                        &mut contrast_arbiter,
+                                        &oxigraph_manager,
+                                        input,
+                                        &precomputed_query_entities,
+                                    )
+                                    .await
+                                    {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
                                     } else if let Some((text, plan)) =
@@ -6561,20 +6909,28 @@ async fn run_interactive_mode(
                                         );
                                     } else {
                                         println!("{}", config.messages.cannot_understand);
-                                        log_chronicle_reply(&mut chronicle, &config.messages.cannot_understand, &[], &[]);
+                                        log_chronicle_reply(
+                                            &mut chronicle,
+                                            &config.messages.cannot_understand,
+                                            &[],
+                                            &[],
+                                        );
                                     }
                                 }
                             }
                             continue; // 跳过后续查询逻辑
                         }
                     }
-                    
+
                     // 如果NLU置信度不够，使用传统模式处理
                     println!("NLU置信度不足，使用传统模式处理查询...");
                 }
-                
+
                 // 检查是否是直接的实体知识查询（例如："刘德华的信息" 或 "告诉我关于刘德华"）
-                if input.contains("的信息") || input.contains("告诉我关于") || input.contains("什么是") {
+                if input.contains("的信息")
+                    || input.contains("告诉我关于")
+                    || input.contains("什么是")
+                {
                     // 提取实体名
                     let entity_name = input
                         .replace("的信息", "")
@@ -6582,11 +6938,14 @@ async fn run_interactive_mode(
                         .replace("什么是", "")
                         .trim()
                         .to_string();
-                    
+
                     if !entity_name.is_empty() {
                         println!("正在获取实体 '{}' 的知识...", entity_name);
-                        
-                        match local_semantic_adapter.get_entity_knowledge(&entity_name).await {
+
+                        match local_semantic_adapter
+                            .get_entity_knowledge(&entity_name)
+                            .await
+                        {
                             Ok(response) => {
                                 println!("─────────────────────────────────");
                                 println!("实体: {}", response.data.entity);
@@ -6609,14 +6968,17 @@ async fn run_interactive_mode(
                         }
                     }
                 }
-                
+
                 // 检查是否是实体属性查询（例如："刘德华的年龄" 或 "苹果的颜色"）
-                let attribute_re = ENTITY_ATTRIBUTE_RE.get_or_init(|| regex::Regex::new(r"(.+?)的(.+?)$").unwrap());
+                let attribute_re = ENTITY_ATTRIBUTE_RE
+                    .get_or_init(|| regex::Regex::new(r"(.+?)的(.+?)$").unwrap());
                 if let Some(captures) = attribute_re.captures(input) {
-                    if let (Some(entity_match), Some(attr_match)) = (captures.get(1), captures.get(2)) {
+                    if let (Some(entity_match), Some(attr_match)) =
+                        (captures.get(1), captures.get(2))
+                    {
                         let entity_name = entity_match.as_str().trim();
                         let attribute = attr_match.as_str().trim();
-                        
+
                         // 排除已经处理过的模式与符号推理问句（谁/吗/几/多少等）
                         if !input.contains("信息")
                             && !input.contains("什么")
@@ -6627,8 +6989,11 @@ async fn run_interactive_mode(
                             && !input.contains("多少")
                         {
                             println!("正在查询实体 '{}' 的属性 '{}'...", entity_name, attribute);
-                            
-                            match local_semantic_adapter.get_entity_attribute_value(entity_name, attribute).await {
+
+                            match local_semantic_adapter
+                                .get_entity_attribute_value(entity_name, attribute)
+                                .await
+                            {
                                 Ok(response) => {
                                     println!("─────────────────────────────────");
                                     println!("实体: {}", response.data.entity);
@@ -6644,24 +7009,25 @@ async fn run_interactive_mode(
                         }
                     }
                 }
-                
-                if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(&pattern_library, &normalized_words) {
+
+                if let Some((query_type, entities, pattern_note)) =
+                    route_query_with_patterns(&pattern_library, &normalized_words)
+                {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
                         println!("命中模式: {}", note);
                     }
-                    
+
                     // 提取查询中的实体
                     let mut seen_entities = std::collections::HashSet::new();
-                    let mut query_entities: Vec<String> = Vec::with_capacity(
-                        precomputed_query_entities.len() + entities.len(),
-                    );
+                    let mut query_entities: Vec<String> =
+                        Vec::with_capacity(precomputed_query_entities.len() + entities.len());
                     for entity in precomputed_query_entities.iter().chain(entities.iter()) {
                         if seen_entities.insert(entity.as_str()) {
                             query_entities.push(entity.clone());
                         }
                     }
-                    
+
                     // === 歧义解析 ===
                     if let Some(api_config) = &config.api {
                         if api_config.enable_entity_disambiguation {
@@ -6672,31 +7038,43 @@ async fn run_interactive_mode(
                                 &local_semantic_adapter,
                             )
                             .await;
-                            
+
                             // 使用解析后的实体进行查询
                             let final_entities = if !resolved_entities.is_empty() {
                                 resolved_entities
                             } else {
                                 entities.clone()
                             };
-                            
+
                             // 仅加载相关知识子集
                             let max_hops = 2; // 可配置的跳跃数
-                            match oxigraph_manager.get_relevant_facts(&final_entities, max_hops).await {
+                            match oxigraph_manager
+                                .get_relevant_facts(&final_entities, max_hops)
+                                .await
+                            {
                                 Ok(facts) => {
                                     println!("加载了 {} 个相关事实", facts.len());
                                     prolog_engine.load_relevant_facts(facts);
-                                    
+
                                     // 先尝试直接从RDF数据获取答案
-                                    if let Some(answer) = oxigraph_manager.get_direct_answer(&query_type, &final_entities).await {
+                                    if let Some(answer) = oxigraph_manager
+                                        .get_direct_answer(&query_type, &final_entities)
+                                        .await
+                                    {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
-                                    } else if let Some(prolog_query) = PrologEngine::generate_prolog_query(&query_type, &final_entities) {
+                                    } else if let Some(prolog_query) =
+                                        PrologEngine::generate_prolog_query(
+                                            &query_type,
+                                            &final_entities,
+                                        )
+                                    {
                                         println!("Prolog查询: {}", prolog_query);
-                                        
+
                                         let results = prolog_engine.query(&prolog_query);
-                                        
-                                        let response = response_formatter.format_prolog_results(&results, &query_type);
+
+                                        let response = response_formatter
+                                            .format_prolog_results(&results, &query_type);
                                         println!("{}", response);
                                         log_chronicle_reply(&mut chronicle, &response, &[], &[]);
                                     } else {
@@ -6710,20 +7088,29 @@ async fn run_interactive_mode(
                         } else {
                             // 歧义解析功能被禁用，直接查询
                             let max_hops = 2;
-                            match oxigraph_manager.get_relevant_facts(&query_entities, max_hops).await {
+                            match oxigraph_manager
+                                .get_relevant_facts(&query_entities, max_hops)
+                                .await
+                            {
                                 Ok(facts) => {
                                     println!("加载了 {} 个相关事实", facts.len());
                                     prolog_engine.load_relevant_facts(facts);
-                                    
-                                    if let Some(answer) = oxigraph_manager.get_direct_answer(&query_type, &entities).await {
+
+                                    if let Some(answer) = oxigraph_manager
+                                        .get_direct_answer(&query_type, &entities)
+                                        .await
+                                    {
                                         println!("{}", answer);
                                         log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
-                                    } else if let Some(prolog_query) = PrologEngine::generate_prolog_query(&query_type, &entities) {
+                                    } else if let Some(prolog_query) =
+                                        PrologEngine::generate_prolog_query(&query_type, &entities)
+                                    {
                                         println!("Prolog查询: {}", prolog_query);
-                                        
+
                                         let results = prolog_engine.query(&prolog_query);
-                                        
-                                        let response = response_formatter.format_prolog_results(&results, &query_type);
+
+                                        let response = response_formatter
+                                            .format_prolog_results(&results, &query_type);
                                         println!("{}", response);
                                         log_chronicle_reply(&mut chronicle, &response, &[], &[]);
                                     } else {
@@ -6738,20 +7125,29 @@ async fn run_interactive_mode(
                     } else {
                         // 没有API配置，直接查询
                         let max_hops = 2;
-                        match oxigraph_manager.get_relevant_facts(&query_entities, max_hops).await {
+                        match oxigraph_manager
+                            .get_relevant_facts(&query_entities, max_hops)
+                            .await
+                        {
                             Ok(facts) => {
                                 println!("加载了 {} 个相关事实", facts.len());
                                 prolog_engine.load_relevant_facts(facts);
-                                
-                                if let Some(answer) = oxigraph_manager.get_direct_answer(&query_type, &entities).await {
+
+                                if let Some(answer) = oxigraph_manager
+                                    .get_direct_answer(&query_type, &entities)
+                                    .await
+                                {
                                     println!("{}", answer);
                                     log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
-                                } else if let Some(prolog_query) = PrologEngine::generate_prolog_query(&query_type, &entities) {
+                                } else if let Some(prolog_query) =
+                                    PrologEngine::generate_prolog_query(&query_type, &entities)
+                                {
                                     println!("Prolog查询: {}", prolog_query);
-                                    
+
                                     let results = prolog_engine.query(&prolog_query);
-                                    
-                                    let response = response_formatter.format_prolog_results(&results, &query_type);
+
+                                    let response = response_formatter
+                                        .format_prolog_results(&results, &query_type);
                                     println!("{}", response);
                                     log_chronicle_reply(&mut chronicle, &response, &[], &[]);
                                 } else {
@@ -6804,10 +7200,9 @@ async fn run_interactive_mode(
                             missing_entities.first().map(String::as_str).unwrap_or("")
                         );
                     }
-                    
+
                     // 插件声明的兜底策略先于外链/常识别源；只改措辞，不伪造事实。
-                    if let Some((policy_text, policy_plan)) =
-                        plugin_runtime.policy_reply(raw_input)
+                    if let Some((policy_text, policy_plan)) = plugin_runtime.policy_reply(raw_input)
                     {
                         let text = plugin_runtime.style_wrap(&policy_text);
                         println!("{}", text);
@@ -6847,9 +7242,7 @@ async fn run_interactive_mode(
                                             );
                                         }
                                         AnswerOutcome::KnownAbsent {
-                                            entity,
-                                            source_uri,
-                                            ..
+                                            entity, source_uri, ..
                                         } => {
                                             let _ = conversation_theory::append_external(
                                                 chronicle,
@@ -6874,7 +7267,7 @@ async fn run_interactive_mode(
                                         log_chronicle_reply(&mut chronicle, fallback, &[], &[]);
                                     }
                                 }
-                            },
+                            }
                             Err(e) => {
                                 println!("查询外部知识时出错：{}。请检查网络连接。", e);
                             }
@@ -6930,7 +7323,10 @@ async fn run_interactive_mode(
 
 async fn load_graph_snapshot(
     oxigraph_manager: &OxigraphManager,
-) -> Result<Arc<Vec<know_prolog::prolog_engine::PrologFact>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    Arc<Vec<know_prolog::prolog_engine::PrologFact>>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     oxigraph_manager.load_graph_snapshot().await
 }
 
@@ -7018,9 +7414,8 @@ async fn graph_ledger_report(
     match oxigraph_manager.load_derived_ledger().await {
         Ok(ledger) => {
             if !ledger.materialized {
-                output.push_str(
-                    "■ 派生账本 kg:graphs/derived：尚未物化过（用「物化推理」写入）。\n",
-                );
+                output
+                    .push_str("■ 派生账本 kg:graphs/derived：尚未物化过（用「物化推理」写入）。\n");
             } else {
                 output.push_str(&format!(
                     "■ 派生账本 kg:graphs/derived：{} 条派生事实，物化于知识版本 {}，规则指纹 {}。\n",
@@ -7050,7 +7445,8 @@ async fn graph_ledger_report(
                 }
                 let current_revision = oxigraph_manager.revision();
                 let current_fingerprint = symbolic_reasoner.rule_fingerprint();
-                if ledger.revision == current_revision && ledger.fingerprint == current_fingerprint {
+                if ledger.revision == current_revision && ledger.fingerprint == current_fingerprint
+                {
                     output.push_str("  对账：物化戳与当前知识版本、规则集一致。\n");
                 } else {
                     output.push_str(&format!(
@@ -7148,11 +7544,21 @@ fn parse_import_directive(input: &str) -> Option<ImportDirective> {
     let lower = trimmed.to_ascii_lowercase();
     let groups: [(&[&str], fn(String) -> ImportDirective); 3] = [
         (
-            &["导入jsonld内容", "导入内容", "import jsonld content", "import content"],
+            &[
+                "导入jsonld内容",
+                "导入内容",
+                "import jsonld content",
+                "import content",
+            ],
             ImportDirective::JsonldContent,
         ),
         (
-            &["导入jsonld文件", "导入文件", "import jsonld file", "import jsonld"],
+            &[
+                "导入jsonld文件",
+                "导入文件",
+                "import jsonld file",
+                "import jsonld",
+            ],
             ImportDirective::JsonldFile,
         ),
         (
@@ -7378,7 +7784,9 @@ async fn try_symbolic_reasoning(
     if let Some(answer) = symbolic_reasoner.answer(input) {
         // 图谱无记录时，用溯因假设生成候选答案（LLM 式的"猜测 + 理由"），
         // 再追加默认逻辑（可反驳常识「通常…除非…」）补充证据
-        if answer.contains("没有记录") || answer.contains("没有相关记录") || answer.contains("数量为 0")
+        if answer.contains("没有记录")
+            || answer.contains("没有相关记录")
+            || answer.contains("数量为 0")
         {
             let mut combined = answer;
             if let Some(abduction) = symbolic_reasoner.hypothesis_answer(input) {
@@ -7823,7 +8231,11 @@ fn route_query_with_patterns(
         matched.entry.priority,
         matched.entry.source
     );
-    Some((matched.entry.query_type.clone(), matched.entities.clone(), Some(note)))
+    Some((
+        matched.entry.query_type.clone(),
+        matched.entities.clone(),
+        Some(note),
+    ))
 }
 
 /// 解析「左 = 右」形式的谓词登记参数（支持 = / ＝ / =>）
@@ -7898,10 +8310,7 @@ fn parse_correction_spec(target: &str) -> Option<(String, String, String, String
             }
             let head = head.strip_suffix('是').unwrap_or(head).trim();
             if let Some((entity, predicate)) = head.rsplit_once('的') {
-                let entity = entity
-                    .trim()
-                    .trim_start_matches(['把', '将'])
-                    .trim();
+                let entity = entity.trim().trim_start_matches(['把', '将']).trim();
                 let predicate = predicate.trim();
                 if !entity.is_empty() && !predicate.is_empty() {
                     return Some((
@@ -7999,9 +8408,7 @@ fn sync_entity_aliases(reasoner: &mut SymbolicReasoner, oxigraph_manager: &Oxigr
 /// 把全息命令参数切成若干词项：支持空白/中英文逗号/冒号分隔
 fn parse_holo_terms(target: &str, expected: usize) -> Option<Vec<String>> {
     let terms: Vec<String> = target
-        .split(|ch: char| {
-            ch.is_whitespace() || matches!(ch, '，' | ',' | '：' | ':' | '、')
-        })
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '，' | ',' | '：' | ':' | '、'))
         .filter(|term| !term.is_empty())
         .map(|term| term.to_string())
         .collect();
@@ -8068,7 +8475,10 @@ fn render_holo_analogy(a: &str, b: &str, c: &str, hits: &[HoloAnalogyHit]) -> St
             a, b, c
         );
     }
-    let mut out = format!("全息类比 {}:{} :: {}:?（关系解缠 → 迁移绑定 → 净噪）：", a, b, c);
+    let mut out = format!(
+        "全息类比 {}:{} :: {}:?（关系解缠 → 迁移绑定 → 净噪）：",
+        a, b, c
+    );
     for (index, hit) in hits.iter().enumerate() {
         let via: Vec<String> = hit
             .via
@@ -8271,10 +8681,10 @@ async fn continue_original_query(
     input: &str,
     query_type: &str,
     entities: &[String],
-    precomputed_query_entities: &[String]
+    precomputed_query_entities: &[String],
 ) {
     println!("查询类型: {}, 实体: {:?}", query_type, entities);
-    
+
     // 提取查询中的实体
     let mut seen_entities = std::collections::HashSet::new();
     let mut query_entities: Vec<String> =
@@ -8284,7 +8694,7 @@ async fn continue_original_query(
             query_entities.push(entity.clone());
         }
     }
-    
+
     // 使用歧义解析功能（如果启用）
     if let Some(api_config) = &config.api {
         if api_config.enable_entity_disambiguation {
@@ -8295,26 +8705,35 @@ async fn continue_original_query(
                 local_semantic_adapter,
             )
             .await;
-            
+
             let final_entities = if !resolved_entities.is_empty() {
                 resolved_entities
             } else {
                 entities.to_vec()
             };
-            
+
             let max_hops = 2;
-            match oxigraph_manager.get_relevant_facts(&final_entities, max_hops).await {
+            match oxigraph_manager
+                .get_relevant_facts(&final_entities, max_hops)
+                .await
+            {
                 Ok(facts) => {
                     println!("加载了 {} 个相关事实", facts.len());
                     prolog_engine.load_relevant_facts(facts);
-                    
-                    if let Some(answer) = oxigraph_manager.get_direct_answer(query_type, &final_entities).await {
+
+                    if let Some(answer) = oxigraph_manager
+                        .get_direct_answer(query_type, &final_entities)
+                        .await
+                    {
                         println!("{}", answer);
-                    } else if let Some(prolog_query) = PrologEngine::generate_prolog_query(query_type, &final_entities) {
+                    } else if let Some(prolog_query) =
+                        PrologEngine::generate_prolog_query(query_type, &final_entities)
+                    {
                         println!("Prolog查询: {}", prolog_query);
-                        
+
                         let results = prolog_engine.query(&prolog_query);
-                        let response = response_formatter.format_prolog_results(&results, query_type);
+                        let response =
+                            response_formatter.format_prolog_results(&results, query_type);
                         println!("{}", response);
                     } else {
                         println!("无法生成有效的Prolog查询");
@@ -8322,8 +8741,14 @@ async fn continue_original_query(
                 }
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
-                    if let Some(answer) =
-                        try_symbolic_reasoning(symbolic_reasoner, contrast_arbiter, oxigraph_manager, input, precomputed_query_entities).await
+                    if let Some(answer) = try_symbolic_reasoning(
+                        symbolic_reasoner,
+                        contrast_arbiter,
+                        oxigraph_manager,
+                        input,
+                        precomputed_query_entities,
+                    )
+                    .await
                     {
                         println!("{}", answer);
                     }
@@ -8332,18 +8757,27 @@ async fn continue_original_query(
         } else {
             // 歧义解析功能被禁用
             let max_hops = 2;
-            match oxigraph_manager.get_relevant_facts(&query_entities, max_hops).await {
+            match oxigraph_manager
+                .get_relevant_facts(&query_entities, max_hops)
+                .await
+            {
                 Ok(facts) => {
                     println!("加载了 {} 个相关事实", facts.len());
                     prolog_engine.load_relevant_facts(facts);
-                    
-                    if let Some(answer) = oxigraph_manager.get_direct_answer(query_type, entities).await {
+
+                    if let Some(answer) = oxigraph_manager
+                        .get_direct_answer(query_type, entities)
+                        .await
+                    {
                         println!("{}", answer);
-                    } else if let Some(prolog_query) = PrologEngine::generate_prolog_query(query_type, entities) {
+                    } else if let Some(prolog_query) =
+                        PrologEngine::generate_prolog_query(query_type, entities)
+                    {
                         println!("Prolog查询: {}", prolog_query);
-                        
+
                         let results = prolog_engine.query(&prolog_query);
-                        let response = response_formatter.format_prolog_results(&results, query_type);
+                        let response =
+                            response_formatter.format_prolog_results(&results, query_type);
                         println!("{}", response);
                     } else {
                         println!("无法生成有效的Prolog查询");
@@ -8351,8 +8785,14 @@ async fn continue_original_query(
                 }
                 Err(e) => {
                     println!("{}: {}", config.messages.process_error, e);
-                    if let Some(answer) =
-                        try_symbolic_reasoning(symbolic_reasoner, contrast_arbiter, oxigraph_manager, input, precomputed_query_entities).await
+                    if let Some(answer) = try_symbolic_reasoning(
+                        symbolic_reasoner,
+                        contrast_arbiter,
+                        oxigraph_manager,
+                        input,
+                        precomputed_query_entities,
+                    )
+                    .await
                     {
                         println!("{}", answer);
                     }
@@ -8362,16 +8802,24 @@ async fn continue_original_query(
     } else {
         // 没有API配置
         let max_hops = 2;
-        match oxigraph_manager.get_relevant_facts(&query_entities, max_hops).await {
+        match oxigraph_manager
+            .get_relevant_facts(&query_entities, max_hops)
+            .await
+        {
             Ok(facts) => {
                 println!("加载了 {} 个相关事实", facts.len());
                 prolog_engine.load_relevant_facts(facts);
-                
-                if let Some(answer) = oxigraph_manager.get_direct_answer(query_type, entities).await {
+
+                if let Some(answer) = oxigraph_manager
+                    .get_direct_answer(query_type, entities)
+                    .await
+                {
                     println!("{}", answer);
-                } else if let Some(prolog_query) = PrologEngine::generate_prolog_query(query_type, entities) {
+                } else if let Some(prolog_query) =
+                    PrologEngine::generate_prolog_query(query_type, entities)
+                {
                     println!("Prolog查询: {}", prolog_query);
-                    
+
                     let results = prolog_engine.query(&prolog_query);
                     let response = response_formatter.format_prolog_results(&results, query_type);
                     println!("{}", response);
@@ -8382,8 +8830,14 @@ async fn continue_original_query(
             Err(e) => {
                 println!("{}: {}", config.messages.process_error, e);
 
-                if let Some(answer) =
-                    try_symbolic_reasoning(symbolic_reasoner, contrast_arbiter, oxigraph_manager, input, precomputed_query_entities).await
+                if let Some(answer) = try_symbolic_reasoning(
+                    symbolic_reasoner,
+                    contrast_arbiter,
+                    oxigraph_manager,
+                    input,
+                    precomputed_query_entities,
+                )
+                .await
                 {
                     println!("{}", answer);
                 } else {
@@ -8547,7 +9001,9 @@ mod session_tests {
         );
         assert_eq!(
             parse_import_directive("import jsonld content: {\"@id\": \"x\"}"),
-            Some(ImportDirective::JsonldContent("{\"@id\": \"x\"}".to_string()))
+            Some(ImportDirective::JsonldContent(
+                "{\"@id\": \"x\"}".to_string()
+            ))
         );
         assert_eq!(
             parse_import_directive("导入rdf文件：data/sample.ttl"),
@@ -8561,7 +9017,9 @@ mod session_tests {
         // 参数正文里再出现关键词不得被删改
         assert_eq!(
             parse_import_directive("导入文件：导入文件：备份.jsonld"),
-            Some(ImportDirective::JsonldFile("导入文件：备份.jsonld".to_string()))
+            Some(ImportDirective::JsonldFile(
+                "导入文件：备份.jsonld".to_string()
+            ))
         );
 
         // 非导入指令（自然语言条目）不误判
@@ -8593,10 +9051,22 @@ mod session_tests {
     #[test]
     fn sparql_command_parses_colons_case_and_keeps_body() {
         let select = "SELECT ?s WHERE { ?s ?p ?o }";
-        assert_eq!(parse_sparql_command(&format!("SPARQL：{}", select)), Some(select));
-        assert_eq!(parse_sparql_command(&format!("sparql:{}", select)), Some(select));
-        assert_eq!(parse_sparql_command(&format!("Sparql {}", select)), Some(select));
-        assert_eq!(parse_sparql_command(&format!("sparql {}", select)), Some(select));
+        assert_eq!(
+            parse_sparql_command(&format!("SPARQL：{}", select)),
+            Some(select)
+        );
+        assert_eq!(
+            parse_sparql_command(&format!("sparql:{}", select)),
+            Some(select)
+        );
+        assert_eq!(
+            parse_sparql_command(&format!("Sparql {}", select)),
+            Some(select)
+        );
+        assert_eq!(
+            parse_sparql_command(&format!("sparql {}", select)),
+            Some(select)
+        );
         assert_eq!(
             parse_sparql_command(&format!("查询SPARQL：{}", select)),
             Some(select)
@@ -8679,11 +9149,8 @@ mod session_tests {
         let journal_path = format!("{}/import_journal.json", store_path);
 
         {
-            let manager = OxigraphManager::with_perf_ledger(
-                &store_path,
-                PerfLedger::shared(),
-            )
-            .unwrap();
+            let manager =
+                OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
             let items = vec![KnowledgeItem::Relationship {
                 from_label: "人物".to_string(),
                 from_id: "张三".to_string(),
@@ -8704,8 +9171,7 @@ mod session_tests {
         };
 
         // 模拟进程重启：新开存储 + 从信封恢复日志
-        let manager =
-            OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
+        let manager = OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
         let JournalLoad::Loaded(mut journal) = ImportJournal::load(&journal_path) else {
             panic!("应能从 ContextImage 信封恢复导入日志");
         };
@@ -8751,7 +9217,11 @@ mod session_tests {
         let prompt = reasoner
             .start_frame_clarification("体重是多少")
             .expect("应开启帧澄清");
-        assert!(prompt.contains("叶莉") && prompt.contains("姚明"), "{}", prompt);
+        assert!(
+            prompt.contains("叶莉") && prompt.contains("姚明"),
+            "{}",
+            prompt
+        );
 
         // 命令让位：放行给常规命令通道，澄清保持
         assert!(matches!(

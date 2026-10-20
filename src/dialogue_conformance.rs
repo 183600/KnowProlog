@@ -797,14 +797,20 @@ fn real_reasoner_stack_answers_and_defers() {
     assert!(profile.text.contains("姚明"));
 
     assert!(
-        manager.plan_reply("诸葛亮的身高是多少", &reasoner).is_none(),
+        manager
+            .plan_reply("诸葛亮的身高是多少", &reasoner)
+            .is_none(),
         "图谱外的实体应让位给其它管线"
     );
 
     // 教回系统生成过的句子：应记住同一条二元事实（生成→解析→记住 闭环）
     let report = reasoner.assert_nl_fact("姚明喜欢叶莉");
     assert!(report.contains("已记住"), "{}", report);
-    assert!(report.contains("姚明喜欢叶莉"), "教回应还原动词化模板：{}", report);
+    assert!(
+        report.contains("姚明喜欢叶莉"),
+        "教回应还原动词化模板：{}",
+        report
+    );
 }
 
 /// C14 失败可命名：引擎故障必须显式说「我出错了」，绝不伪装成「没有记录」；
@@ -871,8 +877,7 @@ fn c14_failures_are_named_and_never_masked() {
         absent_reply.text
     );
     assert_ne!(
-        absent_reply.text,
-        reply.text,
+        absent_reply.text, reply.text,
         "「确定没有」与「引擎故障」的措辞绝不能同形"
     );
     assert!(
@@ -887,7 +892,13 @@ fn c14_failures_are_named_and_never_masked() {
 #[test]
 fn c15_speculation_is_evidence_backed_and_resolvable() {
     let kb = scripted()
-        .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：同位置中锋体重分布")
+        .with_nomination(
+            "姚明",
+            "体重",
+            "140公斤",
+            0.72,
+            "链接预测：同位置中锋体重分布",
+        )
         .with_clue("姚明", "国籍");
     let mut manager = DialogueManager::new();
     manager.set_recovery_mode(RecoveryMode::On);
@@ -909,7 +920,11 @@ fn c15_speculation_is_evidence_backed_and_resolvable() {
     assert_eq!(notice.level, "L2");
     assert!(!notice.evidence.is_empty());
     assert!(notice.question.as_deref().is_some_and(|q| !q.is_empty()));
-    assert_eq!(manager.recovery_state().pending.len(), 1, "推测应挂账待确认");
+    assert_eq!(
+        manager.recovery_state().pending.len(),
+        1,
+        "推测应挂账待确认"
+    );
 
     // 用户否认：回执关闭、摘要改变、挂账清空、承诺失效
     let open_before = manager.failure_ledger().digest();
@@ -965,7 +980,11 @@ fn c16_recovery_is_deterministic_and_bounded() {
     let mut manager = DialogueManager::new();
     manager.set_recovery_mode(RecoveryMode::On);
     ask(&mut manager, &kb, "叶莉的体重是多少");
-    assert_eq!(manager.recovery_state().pending.len(), 1, "应挂一个澄清问题");
+    assert_eq!(
+        manager.recovery_state().pending.len(),
+        1,
+        "应挂一个澄清问题"
+    );
     for _ in 0..3 {
         ask(&mut manager, &kb, "叶莉的身高呢");
     }
@@ -974,4 +993,3 @@ fn c16_recovery_is_deterministic_and_bounded() {
         "澄清挂账应在 TTL 后过期，不留无限追问"
     );
 }
-

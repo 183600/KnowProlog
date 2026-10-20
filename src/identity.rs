@@ -24,8 +24,21 @@ fn needs_escape(ch: char) -> bool {
     ch.is_control()
         || matches!(
             ch,
-            ' ' | '/' | '?' | '#' | '%' | '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '}' | '|'
-                | '[' | ']'
+            ' ' | '/'
+                | '?'
+                | '#'
+                | '%'
+                | '"'
+                | '<'
+                | '>'
+                | '\\'
+                | '^'
+                | '`'
+                | '{'
+                | '}'
+                | '|'
+                | '['
+                | ']'
         )
 }
 
@@ -190,7 +203,11 @@ impl IdentityRegistry {
             Resolution::Canonical(id) => id,
             Resolution::Redirected { to, .. } => to,
             Resolution::Ambiguous(ids) => {
-                return Err(format!("别名目标「{}」本身歧义（{}）", canonical, ids.join(" / ")));
+                return Err(format!(
+                    "别名目标「{}」本身歧义（{}）",
+                    canonical,
+                    ids.join(" / ")
+                ));
             }
             Resolution::Unknown => {
                 self.register(canonical);
@@ -261,7 +278,10 @@ impl IdentityRegistry {
         if let Some(own) = self.aliases.remove(from) {
             for surface in own {
                 moved_aliases += 1;
-                self.aliases.entry(surface).or_default().insert(into_final.clone());
+                self.aliases
+                    .entry(surface)
+                    .or_default()
+                    .insert(into_final.clone());
             }
         }
         // 指向 from 的重定向改指 into_final
@@ -426,7 +446,12 @@ pub fn pronoun_filter(pronoun: &str) -> Option<PronounFilter> {
         "他" | "她" | "他们" | "她们" | "这个人" => Some(PronounFilter::Person),
         "它" | "它们" => Some(PronounFilter::NonPerson),
         "该公司" | "这家公司" | "那家公司" | "该企业" => {
-            Some(PronounFilter::Types(&["公司", "组织", "organization", "企业"]))
+            Some(PronounFilter::Types(&[
+                "公司",
+                "组织",
+                "organization",
+                "企业",
+            ]))
         }
         _ => None,
     }
@@ -443,8 +468,19 @@ pub fn ordinal_pronoun_index(pronoun: &str) -> Option<usize> {
 
 /// 需消解的代词表（长词面优先，避免「他们」被「他」截断）。
 pub const PRONOUNS: [&str; 13] = [
-    "这家公司", "那家公司", "这个人", "该公司", "该企业", "他们", "她们", "它们", "前者", "后者",
-    "他", "她", "它",
+    "这家公司",
+    "那家公司",
+    "这个人",
+    "该公司",
+    "该企业",
+    "他们",
+    "她们",
+    "它们",
+    "前者",
+    "后者",
+    "他",
+    "她",
+    "它",
 ];
 
 // ---------------------------------------------------------------------------
@@ -637,8 +673,12 @@ mod tests {
         let lines = registry.audit_lines();
         assert_eq!(lines, registry.audit_lines());
         assert!(lines[0].contains("身份注册表"));
-        assert!(lines.iter().any(|line| line.contains("甲公司 ← 乙公司、甲")));
-        assert!(lines.iter().any(|line| line.contains("合并：乙公司 → 甲公司")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("甲公司 ← 乙公司、甲")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("合并：乙公司 → 甲公司")));
     }
 
     #[test]
@@ -647,7 +687,10 @@ mod tests {
         assert!(type_allows(Some("Person"), PronounFilter::Person));
         assert!(type_allows(None, PronounFilter::Person), "开放世界人物放行");
         assert!(!type_allows(Some("公司"), PronounFilter::Person));
-        assert!(!type_allows(None, PronounFilter::NonPerson), "未知类型不猜「它」");
+        assert!(
+            !type_allows(None, PronounFilter::NonPerson),
+            "未知类型不猜「它」"
+        );
         assert!(type_allows(Some("公司"), PronounFilter::NonPerson));
         assert!(!type_allows(Some("人"), PronounFilter::NonPerson));
         let org = PronounFilter::Types(&["公司", "组织"]);

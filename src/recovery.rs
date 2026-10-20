@@ -222,13 +222,11 @@ impl RecoveryState {
 
     /// 最近挂账（新 → 旧中的最新；并列按会话键升序，保证确定性）。
     pub fn latest_pending(&self) -> Option<&PendingFollowup> {
-        self.pending
-            .values()
-            .max_by(|left, right| {
-                left.created_tick
-                    .cmp(&right.created_tick)
-                    .then_with(|| left.question.cmp(&right.question).reverse())
-            })
+        self.pending.values().max_by(|left, right| {
+            left.created_tick
+                .cmp(&right.created_tick)
+                .then_with(|| left.question.cmp(&right.question).reverse())
+        })
     }
 }
 
@@ -243,7 +241,11 @@ pub struct RecoveryRequest<'a> {
 }
 
 impl<'a> RecoveryRequest<'a> {
-    pub fn new(status: EpistemicStatus, entity: Option<&'a str>, attribute: Option<&'a str>) -> Self {
+    pub fn new(
+        status: EpistemicStatus,
+        entity: Option<&'a str>,
+        attribute: Option<&'a str>,
+    ) -> Self {
         RecoveryRequest {
             status,
             entity,
@@ -360,11 +362,15 @@ pub fn attempt<K: RecoveryKnowledge + ?Sized>(
     }
 
     match request.status {
-        EpistemicStatus::Certain => RecoveryAttempt::plain(EpistemicStatus::Certain, RecoveryLevel::Direct),
+        EpistemicStatus::Certain => {
+            RecoveryAttempt::plain(EpistemicStatus::Certain, RecoveryLevel::Direct)
+        }
         EpistemicStatus::EngineFault => {
-            let mut attempt = RecoveryAttempt::plain(EpistemicStatus::EngineFault, RecoveryLevel::Admit);
+            let mut attempt =
+                RecoveryAttempt::plain(EpistemicStatus::EngineFault, RecoveryLevel::Admit);
             attempt.text = render_statement(EpistemicStatus::EngineFault, None, None, None);
-            let receipt = build_receipt(state, request, RecoveryLevel::Admit, Vec::new(), None, None);
+            let receipt =
+                build_receipt(state, request, RecoveryLevel::Admit, Vec::new(), None, None);
             attempt.receipt_id = Some(state.ledger.record(receipt));
             attempt
         }
@@ -375,7 +381,8 @@ pub fn attempt<K: RecoveryKnowledge + ?Sized>(
         // 推测 / 冲突由恢复引擎自己产出，不作为输入。
         EpistemicStatus::Provisional | EpistemicStatus::Conflict => {
             let mut attempt = RecoveryAttempt::plain(request.status, RecoveryLevel::Admit);
-            attempt.text = render_statement(request.status, request.entity, request.attribute, None);
+            attempt.text =
+                render_statement(request.status, request.entity, request.attribute, None);
             attempt
         }
     }
@@ -393,9 +400,11 @@ fn recover_unparseable<K: RecoveryKnowledge + ?Sized>(
             (entity, attribute)
         }
         _ => {
-            let mut attempt = RecoveryAttempt::plain(EpistemicStatus::Unparseable, RecoveryLevel::Admit);
+            let mut attempt =
+                RecoveryAttempt::plain(EpistemicStatus::Unparseable, RecoveryLevel::Admit);
             attempt.text = render_statement(EpistemicStatus::Unparseable, None, None, None);
-            let receipt = build_receipt(state, request, RecoveryLevel::Admit, Vec::new(), None, None);
+            let receipt =
+                build_receipt(state, request, RecoveryLevel::Admit, Vec::new(), None, None);
             attempt.receipt_id = Some(state.ledger.record(receipt));
             return attempt;
         }
@@ -404,10 +413,13 @@ fn recover_unparseable<K: RecoveryKnowledge + ?Sized>(
     if mode.acts() {
         let mut readings = knowledge.reframe(entity, attribute);
         readings.sort_by(|left, right| left.question.cmp(&right.question));
-        if let Some(recovered) = readings
-            .iter()
-            .find(|reading| reading.answer.as_deref().map(str::trim).is_some_and(|text| !text.is_empty()))
-        {
+        if let Some(recovered) = readings.iter().find(|reading| {
+            reading
+                .answer
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|text| !text.is_empty())
+        }) {
             let answer = recovered.answer.clone().unwrap_or_default();
             let evidence = vec![format!("换帧重解：{}", recovered.question)];
             let receipt = build_receipt(
@@ -433,7 +445,14 @@ fn recover_unparseable<K: RecoveryKnowledge + ?Sized>(
 
     let mut attempt = RecoveryAttempt::plain(EpistemicStatus::Unparseable, RecoveryLevel::Reframe);
     attempt.text = render_statement(EpistemicStatus::Unparseable, None, None, None);
-    let receipt = build_receipt(state, request, RecoveryLevel::Reframe, Vec::new(), None, None);
+    let receipt = build_receipt(
+        state,
+        request,
+        RecoveryLevel::Reframe,
+        Vec::new(),
+        None,
+        None,
+    );
     attempt.receipt_id = Some(state.ledger.record(receipt));
     attempt
 }
@@ -498,7 +517,12 @@ fn recover_missing<K: RecoveryKnowledge + ?Sized>(
         };
         let question = "是这样吗？如果不对，请直接纠正我。".to_string();
         let text = compose(
-            render_statement(final_status, request.entity, request.attribute, Some(&nomination.value)),
+            render_statement(
+                final_status,
+                request.entity,
+                request.attribute,
+                Some(&nomination.value),
+            ),
             &evidence,
             Some(&question),
         );
@@ -634,7 +658,10 @@ pub fn resolve_by_yes(state: &mut RecoveryState, confirmed: bool) -> Option<Stri
         PendingKind::Provisional => {
             state.ledger.resolve(&followup.receipt_id, resolution);
             Some(if confirmed {
-                format!("好的，「{}」我记下了——它是会话级线索，不会写入图谱。", followup.question)
+                format!(
+                    "好的，「{}」我记下了——它是会话级线索，不会写入图谱。",
+                    followup.question
+                )
             } else {
                 "明白，这条推测作废，我不会再拿它当依据。".to_string()
             })
@@ -707,7 +734,11 @@ mod tests {
         }
     }
 
-    fn request<'a>(status: EpistemicStatus, entity: Option<&'a str>, attribute: Option<&'a str>) -> RecoveryRequest<'a> {
+    fn request<'a>(
+        status: EpistemicStatus,
+        entity: Option<&'a str>,
+        attribute: Option<&'a str>,
+    ) -> RecoveryRequest<'a> {
         RecoveryRequest::new(status, entity, attribute)
     }
 
@@ -812,7 +843,10 @@ mod tests {
             "高分提名应排在前：{:?}",
             attempt.evidence
         );
-        assert!(!attempt.evidence.iter().any(|line| line.contains("低于阈值")));
+        assert!(!attempt
+            .evidence
+            .iter()
+            .any(|line| line.contains("低于阈值")));
         assert_eq!(state.ledger.open_count(), 1);
         assert!(state.latest_pending().is_some());
 
@@ -892,8 +926,18 @@ mod tests {
         let mut state = RecoveryState::new();
         let mut request = request(EpistemicStatus::EngineFault, Some("姚明"), Some("身高"));
         request.detail = "consult failed: boom";
-        let first = attempt(&mut state, RecoveryMode::On, &request, &MockKnowledge::default());
-        let second = attempt(&mut state, RecoveryMode::On, &request, &MockKnowledge::default());
+        let first = attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request,
+            &MockKnowledge::default(),
+        );
+        let second = attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request,
+            &MockKnowledge::default(),
+        );
         assert!(!first.text.contains("没有记录"));
         assert!(first.text.contains("出错了"));
         assert_eq!(state.ledger.len(), 1, "同路径故障只报一次");
@@ -923,8 +967,15 @@ mod tests {
             &request(EpistemicStatus::Unknown, Some("姚明"), Some("体重")),
             &knowledge,
         );
-        assert_eq!(observed.level, RecoveryLevel::Admit, "Observe 不点火联想通道");
-        assert_eq!(state.ledger.status_counts(), vec![(EpistemicStatus::Unknown, 1)]);
+        assert_eq!(
+            observed.level,
+            RecoveryLevel::Admit,
+            "Observe 不点火联想通道"
+        );
+        assert_eq!(
+            state.ledger.status_counts(),
+            vec![(EpistemicStatus::Unknown, 1)]
+        );
         assert!(state.pending.is_empty());
     }
 

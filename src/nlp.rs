@@ -18,7 +18,7 @@ fn jieba() -> &'static Jieba {
 #[derive(Debug, Clone)]
 pub struct TaggedWord {
     pub text: String, // 词语文本
-    pub pos: String, // 词性标记（如n表示名词，v表示动词）
+    pub pos: String,  // 词性标记（如n表示名词，v表示动词）
 }
 
 /// 词性证据的来源。审计时最重要的不是标签本身，而是「谁给了这个标签」：
@@ -76,20 +76,20 @@ pub struct AnnotatedWord {
 #[derive(Debug, Clone)]
 pub struct PrologRule {
     pub pattern: Vec<PatternElement>, // 模式元素序列
-    pub query_type: String, // 查询类型标识
-    pub priority: i32, // 优先级，数值越大越优先
+    pub query_type: String,           // 查询类型标识
+    pub priority: i32,                // 优先级，数值越大越优先
 }
 
 // 模式元素枚举，定义模式匹配的各种元素类型
 #[derive(Debug, Clone)]
 pub enum PatternElement {
-    Pos(String), // 匹配特定词性
-    Word(String), // 匹配特定词语
-    PosOrWord(String, String), // 匹配词性或词语
-    Optional(Box<PatternElement>), // 可选元素
-    Any, // 匹配任意元素
-    Number, // 匹配数字
-    Name, // 匹配人名
+    Pos(String),                          // 匹配特定词性
+    Word(String),                         // 匹配特定词语
+    PosOrWord(String, String),            // 匹配词性或词语
+    Optional(Box<PatternElement>),        // 可选元素
+    Any,                                  // 匹配任意元素
+    Number,                               // 匹配数字
+    Name,                                 // 匹配人名
     Capture(String, Box<PatternElement>), // 捕获元素并命名
 }
 
@@ -267,10 +267,7 @@ pub fn merge_name_fragments(tagged_words: &[TaggedWord]) -> Vec<TaggedWord> {
                 .text
                 .chars()
                 .all(|ch| !ch.is_numeric() && !ch.is_whitespace() && !is_boundary_char(ch))
-            && !word
-                .text
-                .chars()
-                .all(|ch| BLOCKED_FRAGMENTS.contains(ch))
+            && !word.text.chars().all(|ch| BLOCKED_FRAGMENTS.contains(ch))
     }
 
     fn is_boundary_char(ch: char) -> bool {
@@ -319,13 +316,20 @@ fn is_name(
     patterns.prefixes.iter().any(|p| word.starts_with(p)) || // 以姓氏前缀开头
     patterns.suffixes.iter().any(|s| word.ends_with(s)) || // 以名字后缀结尾
     full_names.contains(word) || // 在常见人名列表中
-    patterns.profession_suffix.iter().any(|ps| word.ends_with(ps) && word.len() > ps.len()) // 以职业后缀结尾且不只是后缀本身
+    patterns.profession_suffix.iter().any(|ps| word.ends_with(ps) && word.len() > ps.len())
+    // 以职业后缀结尾且不只是后缀本身
 }
 
 // 分析查询意图并提取实体
-pub fn analyze_query_intent(tagged_words: &[TaggedWord], rules: &[PrologRule]) -> Option<(String, Vec<String>)> {
+pub fn analyze_query_intent(
+    tagged_words: &[TaggedWord],
+    rules: &[PrologRule],
+) -> Option<(String, Vec<String>)> {
     // 规则通常已按优先级降序排列：先做一次线性检查
-    if rules.windows(2).all(|pair| pair[0].priority >= pair[1].priority) {
+    if rules
+        .windows(2)
+        .all(|pair| pair[0].priority >= pair[1].priority)
+    {
         for rule in rules {
             if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {
                 return Some((rule.query_type.clone(), entities)); // 返回查询类型和提取的实体
@@ -336,39 +340,43 @@ pub fn analyze_query_intent(tagged_words: &[TaggedWord], rules: &[PrologRule]) -
 
     let mut sorted_rules: Vec<&PrologRule> = rules.iter().collect();
     sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority)); // 按优先级降序排序
-    
+
     // 按优先级尝试匹配每个规则
     for rule in sorted_rules {
         if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {
             return Some((rule.query_type.clone(), entities)); // 返回查询类型和提取的实体
         }
     }
-    
+
     None // 没有匹配的规则
 }
 
 // 为Prolog推理匹配模式并提取实体
-fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternElement]) -> Option<Vec<String>> {
+fn match_pattern_for_prolog(
+    tagged_words: &[TaggedWord],
+    pattern: &[PatternElement],
+) -> Option<Vec<String>> {
     let mut entities = Vec::new(); // 存储提取的实体
     let mut pos = 0; // 当前位置索引
-    
+
     // 如果模式为空，返回空实体列表
     if pattern.is_empty() {
         return Some(entities);
     }
-    
+
     // 遍历模式中的每个元素
     for (pattern_index, pattern_elem) in pattern.iter().enumerate() {
         // 跳过空白词语（标点符号等）
-        while pos < tagged_words.len() && 
-              (tagged_words[pos].text.trim().is_empty() || 
-               tagged_words[pos].text == "？" || 
-               tagged_words[pos].text == "。" ||
-               tagged_words[pos].text == "，" ||
-               tagged_words[pos].text == "、") {
+        while pos < tagged_words.len()
+            && (tagged_words[pos].text.trim().is_empty()
+                || tagged_words[pos].text == "？"
+                || tagged_words[pos].text == "。"
+                || tagged_words[pos].text == "，"
+                || tagged_words[pos].text == "、")
+        {
             pos += 1;
         }
-        
+
         if pos >= tagged_words.len() {
             // 检查剩余模式是否都是可选的，如果不是，则匹配失败
             if !matches!(pattern_elem, PatternElement::Optional(_)) {
@@ -376,13 +384,15 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
             }
             continue;
         }
-        
+
         match pattern_elem {
-            PatternElement::Pos(expected_pos) => { // 匹配词性
+            PatternElement::Pos(expected_pos) => {
+                // 匹配词性
                 if expected_pos == "nr" {
                     // 特殊处理人名：尝试组合相邻的nr和unknown词
-                    if pos < tagged_words.len() && 
-                       (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown") {
+                    if pos < tagged_words.len()
+                        && (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown")
+                    {
                         let mut name_parts = vec![tagged_words[pos].text.clone()];
                         let mut next_pos = pos + 1;
                         // 下一个模式元素若是具体词语，合并人名时不能把它吞掉
@@ -391,18 +401,19 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                             Some(PatternElement::Word(word)) => Some(word.as_str()),
                             _ => None,
                         };
-                        
+
                         // 检查后续的unknown词是否应该合并
-                        while next_pos < tagged_words.len() && 
-                              (tagged_words[next_pos].pos == "unknown" || 
-                               tagged_words[next_pos].pos == "nr") {
+                        while next_pos < tagged_words.len()
+                            && (tagged_words[next_pos].pos == "unknown"
+                                || tagged_words[next_pos].pos == "nr")
+                        {
                             if next_literal == Some(tagged_words[next_pos].text.as_str()) {
                                 break;
                             }
                             name_parts.push(tagged_words[next_pos].text.clone());
                             next_pos += 1;
                         }
-                        
+
                         entities.push(name_parts.join(""));
                         pos = next_pos;
                     } else {
@@ -418,23 +429,24 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                     return None; // 词性不匹配
                 }
             }
-            PatternElement::Word(expected_word) => { // 匹配具体词语
+            PatternElement::Word(expected_word) => {
+                // 匹配具体词语
                 // 更灵活的词语匹配
                 if pos < tagged_words.len() {
                     let current_word = &tagged_words[pos].text;
-                    
+
                     // 直接匹配
                     if current_word == expected_word {
                         pos += 1;
                         continue;
                     }
-                    
+
                     // 检查是否是被分词的复合词
                     if expected_word.len() > 1 {
                         let expected_chars: Vec<char> = expected_word.chars().collect();
                         let mut matched_count = 0usize;
                         let mut temp_pos = pos;
-                        
+
                         for expected_char in &expected_chars {
                             if temp_pos < tagged_words.len() {
                                 let word_text = tagged_words[temp_pos].text.as_str();
@@ -449,70 +461,80 @@ fn match_pattern_for_prolog(tagged_words: &[TaggedWord], pattern: &[PatternEleme
                             }
                             break;
                         }
-                        
+
                         if matched_count == expected_chars.len() {
                             pos = temp_pos;
                             continue;
                         }
                     }
-                    
+
                     // 部分匹配或包含匹配
-                    if current_word.contains(expected_word) || expected_word.contains(current_word) {
+                    if current_word.contains(expected_word) || expected_word.contains(current_word)
+                    {
                         pos += 1;
                         continue;
                     }
-                    
+
                     return None; // 词语不匹配
                 } else {
                     return None;
                 }
             }
-            PatternElement::Name => { // 匹配人名
-                if pos < tagged_words.len() && 
-                   (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown") {
+            PatternElement::Name => {
+                // 匹配人名
+                if pos < tagged_words.len()
+                    && (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown")
+                {
                     entities.push(tagged_words[pos].text.clone());
                     pos += 1;
                 } else {
                     return None; // 不是人名
                 }
             }
-            PatternElement::Number => { // 匹配数字
-                if pos < tagged_words.len() && 
-                   (tagged_words[pos].pos == "m" || tagged_words[pos].text.chars().all(|c| c.is_numeric())) {
+            PatternElement::Number => {
+                // 匹配数字
+                if pos < tagged_words.len()
+                    && (tagged_words[pos].pos == "m"
+                        || tagged_words[pos].text.chars().all(|c| c.is_numeric()))
+                {
                     entities.push(tagged_words[pos].text.clone());
                     pos += 1;
                 } else {
                     return None; // 不是数字
                 }
             }
-            _ => { // 其他情况直接跳过 (如 Any, Optional, Capture, PosOrWord)
+            _ => {
+                // 其他情况直接跳过 (如 Any, Optional, Capture, PosOrWord)
                 pos += 1;
             }
         }
     }
-    
+
     Some(entities)
 }
 
 // 从字符串数组创建模式元素
 pub fn pattern_from_strings(strings: Vec<String>) -> Vec<PatternElement> {
-    strings.into_iter().map(|s| {
-        match s.as_str() {
-            "r" => PatternElement::Pos("r".to_string()), // 代词
-            "n" => PatternElement::Pos("n".to_string()), // 名词
-            "nr" => PatternElement::Pos("nr".to_string()), // 人名
-            "ns" => PatternElement::Pos("ns".to_string()), // 地名
-            "m" => PatternElement::Pos("m".to_string()), // 数词
-            "q" => PatternElement::Pos("q".to_string()), // 量词
-            "v" => PatternElement::Pos("v".to_string()), // 动词
-            "u" => PatternElement::Pos("u".to_string()), // 助词
-            "f" => PatternElement::Pos("f".to_string()), // 方位词
-            "a" => PatternElement::Pos("a".to_string()), // 形容词
-            "d" => PatternElement::Pos("d".to_string()), // 副词
-            "*" => PatternElement::Any, // 任意匹配
-            _ => PatternElement::Word(s), // 具体词语
-        }
-    }).collect()
+    strings
+        .into_iter()
+        .map(|s| {
+            match s.as_str() {
+                "r" => PatternElement::Pos("r".to_string()),   // 代词
+                "n" => PatternElement::Pos("n".to_string()),   // 名词
+                "nr" => PatternElement::Pos("nr".to_string()), // 人名
+                "ns" => PatternElement::Pos("ns".to_string()), // 地名
+                "m" => PatternElement::Pos("m".to_string()),   // 数词
+                "q" => PatternElement::Pos("q".to_string()),   // 量词
+                "v" => PatternElement::Pos("v".to_string()),   // 动词
+                "u" => PatternElement::Pos("u".to_string()),   // 助词
+                "f" => PatternElement::Pos("f".to_string()),   // 方位词
+                "a" => PatternElement::Pos("a".to_string()),   // 形容词
+                "d" => PatternElement::Pos("d".to_string()),   // 副词
+                "*" => PatternElement::Any,                    // 任意匹配
+                _ => PatternElement::Word(s),                  // 具体词语
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

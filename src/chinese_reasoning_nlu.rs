@@ -93,7 +93,14 @@ const UNARY_VERBS: [&str; 12] = [
 /// 必须长词在前：否则「隶属于」会被「属于」抢先切成「甲隶 / 属于 / 乙」。
 /// 与符号生成器的动词化模板互逆，保证「生成→解析」往返一致。
 const RELATION_VERBS: [&str; 8] = [
-    "出生于", "隶属于", "工作于", "位于", "认识", "属于", "喜欢", "讨厌",
+    "出生于",
+    "隶属于",
+    "工作于",
+    "位于",
+    "认识",
+    "属于",
+    "喜欢",
+    "讨厌",
 ];
 
 fn default_rule_probability(kind: LessonKind) -> f64 {
@@ -108,8 +115,20 @@ fn default_rule_probability(kind: LessonKind) -> f64 {
 fn is_cn_digit(ch: char) -> bool {
     matches!(
         ch,
-        '零' | '〇' | '一' | '二' | '两' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十'
-            | '百' | '千'
+        '零' | '〇'
+            | '一'
+            | '二'
+            | '两'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
     )
 }
 
@@ -211,7 +230,10 @@ pub fn extract_probability(text: &str) -> Option<(f64, String)> {
         if !starts_digit_run {
             continue;
         }
-        let digits: String = text[pos..].chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let digits: String = text[pos..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
         let rest = &text[pos + digits.len()..];
         let percent_len = if rest.starts_with('%') {
             1
@@ -276,8 +298,23 @@ fn clean_sentence(text: &str) -> String {
         .trim_matches(|ch: char| {
             matches!(
                 ch,
-                '。' | '！' | '!' | '？' | '?' | '，' | ',' | '、' | '：' | ':' | '“' | '”' | '"'
-                    | '\'' | '\n' | '\r' | '\t' | ' '
+                '。' | '！'
+                    | '!'
+                    | '？'
+                    | '?'
+                    | '，'
+                    | ','
+                    | '、'
+                    | '：'
+                    | ':'
+                    | '“'
+                    | '”'
+                    | '"'
+                    | '\''
+                    | '\n'
+                    | '\r'
+                    | '\t'
+                    | ' '
             )
         })
         .to_string()
@@ -423,11 +460,7 @@ pub fn lesson_to_clause(lesson: &ChineseLesson) -> Option<Clause> {
     match lesson.kind {
         LessonKind::ConditionalRule | LessonKind::CausalRule => Some(Clause::new(
             generalize_atom(&lesson.head),
-            lesson
-                .body
-                .iter()
-                .map(generalize_atom)
-                .collect(),
+            lesson.body.iter().map(generalize_atom).collect(),
             lesson.probability,
             &lesson.source,
         )),
@@ -504,7 +537,10 @@ fn split_conditional(text: &str) -> Option<(LessonKind, String, String)> {
         let mut best: Option<(usize, &str)> = None;
         for &marker in markers {
             if let Some(position) = rest.find(marker) {
-                if best.map(|(best_position, _)| position < best_position).unwrap_or(true) {
+                if best
+                    .map(|(best_position, _)| position < best_position)
+                    .unwrap_or(true)
+                {
                     best = Some((position, marker));
                 }
             }
@@ -552,7 +588,10 @@ fn split_unless(text: &str) -> Option<(String, String)> {
         let mut best: Option<(usize, &str)> = None;
         for marker in ["否则", "那么就", "那么", "就", "则", "，", ","] {
             if let Some(found) = after.find(marker) {
-                if best.map(|(best_position, _)| found < best_position).unwrap_or(true) {
+                if best
+                    .map(|(best_position, _)| found < best_position)
+                    .unwrap_or(true)
+                {
                     best = Some((found, marker));
                 }
             }
@@ -598,39 +637,37 @@ fn parse_default_lesson(
     probability: Option<f64>,
     original: &str,
 ) -> Result<ChineseLesson, String> {
-    let (head, body) =
-        if let Some((_, antecedent, consequent)) = split_conditional(&strip_probability_wrappers(main))
-        {
-            let antecedent = strip_probability_wrappers(&antecedent);
-            let consequent = strip_probability_wrappers(&consequent);
-            let Some(head) = parse_proposition(&consequent) else {
-                return Err(format!(
-                    "无法解析默认结论「{}」（支持：S的P是O / S是O / S会V）",
-                    consequent
-                ));
-            };
-            let Some(premise) = parse_proposition(&antecedent) else {
-                return Err(format!(
-                    "无法解析默认前提「{}」（支持：S的P是O / S是O / S会V）",
-                    antecedent
-                ));
-            };
-            (head, vec![premise])
-        } else {
-            let main = strip_probability_wrappers(main);
-            let Some(head) = parse_proposition(&main) else {
-                return Err(format!(
-                    "无法解析默认结论「{}」（支持：S的P是O / S是O / S会V）",
-                    main
-                ));
-            };
-            (head, Vec::new())
+    let (head, body) = if let Some((_, antecedent, consequent)) =
+        split_conditional(&strip_probability_wrappers(main))
+    {
+        let antecedent = strip_probability_wrappers(&antecedent);
+        let consequent = strip_probability_wrappers(&consequent);
+        let Some(head) = parse_proposition(&consequent) else {
+            return Err(format!(
+                "无法解析默认结论「{}」（支持：S的P是O / S是O / S会V）",
+                consequent
+            ));
         };
+        let Some(premise) = parse_proposition(&antecedent) else {
+            return Err(format!(
+                "无法解析默认前提「{}」（支持：S的P是O / S是O / S会V）",
+                antecedent
+            ));
+        };
+        (head, vec![premise])
+    } else {
+        let main = strip_probability_wrappers(main);
+        let Some(head) = parse_proposition(&main) else {
+            return Err(format!(
+                "无法解析默认结论「{}」（支持：S的P是O / S是O / S会V）",
+                main
+            ));
+        };
+        (head, Vec::new())
+    };
     let mut exception_text = strip_probability_wrappers(exception);
     // 「鸟会飞，除非是企鹅」：例外省略主语时从上文继承
-    if head.arity() == 1
-        && exception_text.starts_with('是')
-        && !exception_text.starts_with("是否")
+    if head.arity() == 1 && exception_text.starts_with('是') && !exception_text.starts_with("是否")
     {
         if let Some(subject) = head.terms.first().map(|term| term.name().to_string()) {
             exception_text = format!("{}{}", subject, exception_text);
@@ -681,7 +718,10 @@ fn parse_default_lesson(
 pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
     let raw = text.trim();
     if raw.contains('？') || raw.contains('?') {
-        return Err(format!("「{}」是疑问句，不能作为知识教学", clean_sentence(text)));
+        return Err(format!(
+            "「{}」是疑问句，不能作为知识教学",
+            clean_sentence(text)
+        ));
     }
     let cleaned = clean_sentence(text);
     if cleaned.is_empty() {
@@ -706,10 +746,16 @@ pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
         let antecedent = strip_probability_wrappers(&antecedent);
         let consequent = strip_probability_wrappers(&consequent);
         let Some(head) = parse_proposition(&consequent) else {
-            return Err(format!("无法解析后件「{}」（支持：S的P是O / S是O / S会V）", consequent));
+            return Err(format!(
+                "无法解析后件「{}」（支持：S的P是O / S是O / S会V）",
+                consequent
+            ));
         };
         let Some(premise) = parse_proposition(&antecedent) else {
-            return Err(format!("无法解析前件「{}」（支持：S的P是O / S是O / S会V）", antecedent));
+            return Err(format!(
+                "无法解析前件「{}」（支持：S的P是O / S是O / S会V）",
+                antecedent
+            ));
         };
         let probability = probability.unwrap_or_else(|| default_rule_probability(kind));
         let source = match kind {
@@ -819,7 +865,10 @@ pub fn render_lesson_zh(lesson: &ChineseLesson) -> String {
     let probability = format!("{:.0}%", lesson.probability * 100.0);
     match lesson.kind {
         LessonKind::DeterministicFact => {
-            format!("「{}」为确定事实（概率 100%）", render_atom_zh(&lesson.head))
+            format!(
+                "「{}」为确定事实（概率 100%）",
+                render_atom_zh(&lesson.head)
+            )
         }
         LessonKind::ProbabilisticFact => format!(
             "「{}」的可能性为 {}",

@@ -69,16 +69,68 @@ const QUANTIFIER_TYPES: [(&str, &str); 12] = [
 
 /// 同位语角色词（「演员梁朝伟」）：默认给出「人物」类型期待。
 const ROLE_WORDS: [&str; 18] = [
-    "演员", "导演", "歌手", "作家", "诗人", "画家", "教授", "医生", "律师", "老师", "记者",
-    "运动员", "主持人", "科学家", "企业家", "音乐家", "翻译家", "运动员",
+    "演员",
+    "导演",
+    "歌手",
+    "作家",
+    "诗人",
+    "画家",
+    "教授",
+    "医生",
+    "律师",
+    "老师",
+    "记者",
+    "运动员",
+    "主持人",
+    "科学家",
+    "企业家",
+    "音乐家",
+    "翻译家",
+    "运动员",
 ];
 
 /// 关系名词（「姚明的妻子」）：描述性指称 → 路径查询。
 const RELATION_NOUNS: [&str; 40] = [
-    "妻子", "丈夫", "太太", "夫人", "配偶", "伴侣", "儿子", "女儿", "父亲", "母亲", "爸爸",
-    "妈妈", "哥哥", "弟弟", "姐姐", "妹妹", "祖父", "祖母", "爷爷", "奶奶", "外公", "外婆",
-    "岳父", "岳母", "师傅", "师父", "老师", "学生", "徒弟", "朋友", "同事", "搭档", "老板",
-    "创始人", "董事长", "总裁", "总经理", "校长", "院长", "CEO",
+    "妻子",
+    "丈夫",
+    "太太",
+    "夫人",
+    "配偶",
+    "伴侣",
+    "儿子",
+    "女儿",
+    "父亲",
+    "母亲",
+    "爸爸",
+    "妈妈",
+    "哥哥",
+    "弟弟",
+    "姐姐",
+    "妹妹",
+    "祖父",
+    "祖母",
+    "爷爷",
+    "奶奶",
+    "外公",
+    "外婆",
+    "岳父",
+    "岳母",
+    "师傅",
+    "师父",
+    "老师",
+    "学生",
+    "徒弟",
+    "朋友",
+    "同事",
+    "搭档",
+    "老板",
+    "创始人",
+    "董事长",
+    "总裁",
+    "总经理",
+    "校长",
+    "院长",
+    "CEO",
 ];
 
 /// 描述性指称的动词（「演《无间道》的演员」→ 出演）。
@@ -468,11 +520,9 @@ impl BindingLedger {
         if folded.is_empty() || entity.is_empty() {
             return None;
         }
-        if let Some(index) = self
-            .bindings
-            .iter()
-            .position(|binding| binding.active() && binding.key == folded && binding.entity == entity)
-        {
+        if let Some(index) = self.bindings.iter().position(|binding| {
+            binding.active() && binding.key == folded && binding.entity == entity
+        }) {
             let binding = &mut self.bindings[index];
             let second_signature = binding.turn != self.turn;
             binding.support += 1;
@@ -558,8 +608,11 @@ impl BindingLedger {
 
     /// 活跃绑定（按 id 稳定排序）。
     pub fn active_bindings(&self) -> Vec<&ReferenceBinding> {
-        let mut out: Vec<&ReferenceBinding> =
-            self.bindings.iter().filter(|binding| binding.active()).collect();
+        let mut out: Vec<&ReferenceBinding> = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.active())
+            .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
     }
@@ -842,11 +895,7 @@ impl ContextualResolver {
                 )
             })
             .collect();
-        votes.sort_by(|a, b| {
-            b.votes
-                .cmp(&a.votes)
-                .then_with(|| a.entity.cmp(&b.entity))
-        });
+        votes.sort_by(|a, b| b.votes.cmp(&a.votes).then_with(|| a.entity.cmp(&b.entity)));
 
         let survived: Vec<&CandidateVote> = votes.iter().filter(|vote| vote.survived()).collect();
         let question = self.plan_question(&sketch, &votes, source);
@@ -887,9 +936,7 @@ impl ContextualResolver {
                     if contested {
                         notes.push(format!(
                             "「{}」语境证据唯一指向「{}」（{} 票）",
-                            mention.mention,
-                            leader.entity,
-                            leader.votes
+                            mention.mention, leader.entity, leader.votes
                         ));
                     }
                     (Verdict::Unique, Some(leader.entity.clone()), None)
@@ -1003,10 +1050,7 @@ impl ContextualResolver {
         if hard_rejected.is_none()
             && candidate.method == LinkMethod::Fuzzy
             && looks_like_person_name(&sketch.key_surface)
-            && etype
-                .as_deref()
-                .map(is_person_type)
-                .unwrap_or(false)
+            && etype.as_deref().map(is_person_type).unwrap_or(false)
             && !shares_bigram(&sketch.key_surface, &candidate.entity)
         {
             hard_rejected = Some(format!(
@@ -1027,13 +1071,18 @@ impl ContextualResolver {
             if let Some(card) = &card {
                 let hits: Vec<&String> = hints
                     .iter()
-                    .filter(|hint| card.has_predicate(hint) || etype.as_deref() == Some(hint.as_str()))
+                    .filter(|hint| {
+                        card.has_predicate(hint) || etype.as_deref() == Some(hint.as_str())
+                    })
                     .collect();
                 if !hits.is_empty() {
                     votes += VOTE_PREDICATE_MATCH;
                     evidence.push(format!(
                         "与问题线索「{}」相容 +{}",
-                        hits.iter().map(|h| h.as_str()).collect::<Vec<_>>().join("/"),
+                        hits.iter()
+                            .map(|h| h.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/"),
                         VOTE_PREDICATE_MATCH
                     ));
                 }
@@ -1046,13 +1095,20 @@ impl ContextualResolver {
                     votes += VOTE_ANCHOR;
                     evidence.push(format!(
                         "与共现指称「{}」存在知识关联 +{}",
-                        anchor_hits.iter().map(|p| p.as_str()).collect::<Vec<_>>().join("/"),
+                        anchor_hits
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/"),
                         VOTE_ANCHOR
                     ));
                 }
                 if card.degree >= 4 {
                     votes += VOTE_DEGREE;
-                    evidence.push(format!("图谱度数 {}（常用实体）+{}", card.degree, VOTE_DEGREE));
+                    evidence.push(format!(
+                        "图谱度数 {}（常用实体）+{}",
+                        card.degree, VOTE_DEGREE
+                    ));
                 }
             } else {
                 evidence.push("实体未登记义项卡：仅按链接证据表决".to_string());
@@ -1322,10 +1378,7 @@ pub fn detect_descriptions(text: &str, source: &dyn SenseSource) -> Vec<Descript
             let Some(head) = head else {
                 continue;
             };
-            if seen
-                .iter()
-                .any(|(h, r)| h == &head && r == relation)
-            {
+            if seen.iter().any(|(h, r)| h == &head && r == relation) {
                 continue;
             }
             seen.push((head.clone(), (*relation).to_string()));
@@ -1369,7 +1422,9 @@ pub fn detect_descriptions(text: &str, source: &dyn SenseSource) -> Vec<Descript
                 let verb = if index > 0 {
                     DESCRIPTION_VERBS
                         .iter()
-                        .find(|(verb, _)| chars.get(index - 1) == Some(&verb.chars().next().unwrap()))
+                        .find(|(verb, _)| {
+                            chars.get(index - 1) == Some(&verb.chars().next().unwrap())
+                        })
                         .map(|(_, relation)| (*relation).to_string())
                         .unwrap_or_else(|| "出演".to_string())
                 } else {
@@ -1408,10 +1463,24 @@ pub fn parse_clarify_act(input: &str, question: &ClarifyQuestion) -> Option<Clar
         return None;
     }
     const DECLINE: [&str; 8] = [
-        "别问了", "不问了", "算了", "取消", "跳过", "不用了", "没事", "换个话题",
+        "别问了",
+        "不问了",
+        "算了",
+        "取消",
+        "跳过",
+        "不用了",
+        "没事",
+        "换个话题",
     ];
     const UNKNOWN: [&str; 8] = [
-        "不知道", "不清楚", "不确定", "都行", "随便", "无所谓", "你说呢", "都可能是",
+        "不知道",
+        "不清楚",
+        "不确定",
+        "都行",
+        "随便",
+        "无所谓",
+        "你说呢",
+        "都可能是",
     ];
     if DECLINE.iter().any(|marker| trimmed.contains(marker)) {
         return Some(ClarifyAct::Decline);
@@ -1443,12 +1512,8 @@ pub fn parse_clarify_act(input: &str, question: &ClarifyQuestion) -> Option<Clar
             .filter_map(|option| trimmed.find(&option.entity).map(|index| (option, index)))
             .collect();
         hits.sort_by(|a, b| {
-            a.1.cmp(&b.1).then_with(|| {
-                b.0.entity
-                    .chars()
-                    .count()
-                    .cmp(&a.0.entity.chars().count())
-            })
+            a.1.cmp(&b.1)
+                .then_with(|| b.0.entity.chars().count().cmp(&a.0.entity.chars().count()))
         });
         hits.into_iter().map(|(option, _)| option).collect()
     };
@@ -1456,7 +1521,9 @@ pub fn parse_clarify_act(input: &str, question: &ClarifyQuestion) -> Option<Clar
 
     if trimmed.contains("不是") {
         let negated = mentioned.first();
-        let affirmed = mentioned.last().filter(|option| negated.map(|n| n.entity != option.entity).unwrap_or(true));
+        let affirmed = mentioned
+            .last()
+            .filter(|option| negated.map(|n| n.entity != option.entity).unwrap_or(true));
         if let (Some(negated), Some(affirmed)) = (negated, affirmed) {
             return Some(ClarifyAct::Correct {
                 from: negated.entity.clone(),
@@ -1703,7 +1770,9 @@ fn relation_expectation(relation: &str) -> Option<&'static [&'static str]> {
     const PERSON: [&str; 2] = ["人", "person"];
     const ORG: [&str; 4] = ["组织", "公司", "机构", "organization"];
     match relation {
-        "创始人" | "董事长" | "总裁" | "总经理" | "CEO" | "校长" | "院长" => Some(&ORG),
+        "创始人" | "董事长" | "总裁" | "总经理" | "CEO" | "校长" | "院长" => {
+            Some(&ORG)
+        }
         _ => Some(&PERSON),
     }
 }
@@ -1729,7 +1798,10 @@ fn looks_like_person_name(surface: &str) -> bool {
 fn shares_bigram(a: &str, b: &str) -> bool {
     let grams = |text: &str| -> Vec<(char, char)> {
         let chars: Vec<char> = text.chars().collect();
-        chars.windows(2).map(|window| (window[0], window[1])).collect()
+        chars
+            .windows(2)
+            .map(|window| (window[0], window[1]))
+            .collect()
     };
     let a_grams = grams(a);
     let b_grams = grams(b);
@@ -1755,7 +1827,14 @@ mod tests {
     }
 
     impl MapSenseSource {
-        fn add(&mut self, entity: &str, etype: &str, out: &[&str], anchors: &[&str], degree: usize) {
+        fn add(
+            &mut self,
+            entity: &str,
+            etype: &str,
+            out: &[&str],
+            anchors: &[&str],
+            degree: usize,
+        ) {
             self.cards.insert(
                 entity.to_string(),
                 SenseCard {
@@ -1826,10 +1905,7 @@ mod tests {
         let ask = outcome.ask.expect("应升级为显式歧义");
         assert_eq!(ask.mention, "苹果");
         assert_eq!(ask.question.options.len(), 2);
-        assert!(matches!(
-            ask.question.feature,
-            DiscriminatingFeature::Type
-        ));
+        assert!(matches!(ask.question.feature, DiscriminatingFeature::Type));
         let rendered = ask.question.render();
         assert!(rendered.contains("水果"));
         assert!(rendered.contains("组织") || rendered.contains("公司"));
@@ -1900,7 +1976,10 @@ mod tests {
             .correct("苹果", "苹果果实", "用户纠错：不是苹果公司")
             .expect("改绑成功");
         assert_eq!(confirmation.binding.entity, "苹果果实");
-        assert_eq!(ledger.lookup("苹果").map(|b| b.entity.as_str()), Some("苹果果实"));
+        assert_eq!(
+            ledger.lookup("苹果").map(|b| b.entity.as_str()),
+            Some("苹果果实")
+        );
         let report = ledger.report();
         assert!(report.contains("已覆盖"));
         assert!(report.contains("苹果公司"));
@@ -2078,7 +2157,10 @@ mod tests {
                 entity: "苹果公司".to_string()
             })
         );
-        assert_eq!(parse_clarify_act("不知道", &question), Some(ClarifyAct::Unknown));
+        assert_eq!(
+            parse_clarify_act("不知道", &question),
+            Some(ClarifyAct::Unknown)
+        );
         assert_eq!(
             parse_clarify_act("别问了", &question),
             Some(ClarifyAct::Decline)
@@ -2095,10 +2177,7 @@ mod tests {
         assert_eq!(descriptions[0].kind, DescriptionKind::Relational);
         assert_eq!(descriptions[0].head.as_deref(), Some("姚明"));
         assert_eq!(descriptions[0].relation.as_deref(), Some("妻子"));
-        assert_eq!(
-            descriptions[0].rewritten.as_deref(),
-            Some("姚明的妻子是谁")
-        );
+        assert_eq!(descriptions[0].rewritten.as_deref(), Some("姚明的妻子是谁"));
 
         let descriptions = detect_descriptions("演《无间道》的演员是谁", &source);
         assert_eq!(descriptions.len(), 1);
@@ -2164,11 +2243,15 @@ mod tests {
         let outcome = resolutions("苹果是什么", &linker, &source);
         assert!(outcome.ask.is_some(), "边际不足时不应静默选一个");
         // 边际降为 1 时精确匹配足以裁决
-        let outcome = ContextualResolver::new()
-            .with_margin(1)
-            .resolve_text("苹果是什么", &linker, &source, &BindingLedger::new(), &[], None);
+        let outcome = ContextualResolver::new().with_margin(1).resolve_text(
+            "苹果是什么",
+            &linker,
+            &source,
+            &BindingLedger::new(),
+            &[],
+            None,
+        );
         assert!(outcome.ask.is_none());
         assert_eq!(outcome.resolutions[0].chosen.as_deref(), Some("苹果"));
     }
 }
-

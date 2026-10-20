@@ -19,9 +19,14 @@ use crate::pattern_closure::ClosureOp;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPlan {
     // 沿"的"链查找对象：张三 的 师傅 的 师傅 是谁
-    FindObject { segments: Vec<String> },
+    FindObject {
+        segments: Vec<String>,
+    },
     // 反向查找主体：谁的 师傅 是 李四
-    FindSubject { object: String, predicate: String },
+    FindSubject {
+        object: String,
+        predicate: String,
+    },
     // 两点之间的路径：张三和王五之间是什么关系
     PathBetween {
         start: String,
@@ -29,7 +34,10 @@ pub enum QueryPlan {
         max_hops: usize,
     },
     // 共同邻居：张三和李四共同认识谁
-    CommonNeighbor { left: String, right: String },
+    CommonNeighbor {
+        left: String,
+        right: String,
+    },
     // 路径上的中间人：张三通过谁认识王五
     Intermediary {
         start: String,
@@ -37,11 +45,20 @@ pub enum QueryPlan {
         max_hops: usize,
     },
     // 三值校验：主语链最后一个词是谓词，如 [张三, 师傅] + object=李四
-    CheckTriple { subject_segments: Vec<String>, object: String },
+    CheckTriple {
+        subject_segments: Vec<String>,
+        object: String,
+    },
     // 计数：李四 有几个 师傅
-    Count { subject: String, predicate: String },
+    Count {
+        subject: String,
+        predicate: String,
+    },
     // 存在性：李四 有没有 师傅
-    Exist { subject: String, predicate: String },
+    Exist {
+        subject: String,
+        predicate: String,
+    },
     // 闭包：李四 的 所有 上司（Plus 需要已启用的传递律）
     Closure {
         subject: String,
@@ -51,9 +68,15 @@ pub enum QueryPlan {
         then: Vec<String>,
     },
     // 最近邻语义检索：谁和 张三 最像
-    Similar { entity: String },
+    Similar {
+        entity: String,
+    },
     // 向量算术类比：a:b :: c:?
-    Analogy { a: String, b: String, c: String },
+    Analogy {
+        a: String,
+        b: String,
+        c: String,
+    },
 }
 
 #[derive(Clone)]
@@ -171,10 +194,7 @@ impl QueryPlanner {
                 start,
                 goal,
                 max_hops,
-            } => format!(
-                "中间人：{} → ? → {}（最多 {} 跳）",
-                start, goal, max_hops
-            ),
+            } => format!("中间人：{} → ? → {}（最多 {} 跳）", start, goal, max_hops),
             QueryPlan::CheckTriple {
                 subject_segments,
                 object,
@@ -314,7 +334,8 @@ impl QueryPlanner {
             } else {
                 return None;
             };
-            if subject_segments.len() >= 2 && !object.is_empty() && !Self::is_question_word(object) {
+            if subject_segments.len() >= 2 && !object.is_empty() && !Self::is_question_word(object)
+            {
                 return Some(QueryPlan::CheckTriple {
                     subject_segments,
                     object: object.to_string(),
@@ -349,7 +370,9 @@ impl QueryPlanner {
     }
 
     fn parse_find_subject(&self, q: &str) -> Option<QueryPlan> {
-        let rest = q.strip_prefix("谁的").or_else(|| q.strip_prefix("哪位的"))?;
+        let rest = q
+            .strip_prefix("谁的")
+            .or_else(|| q.strip_prefix("哪位的"))?;
         let (predicate, object) = rest.split_once('是')?;
         let predicate = predicate.trim();
         let object = object.trim();
@@ -379,9 +402,18 @@ impl QueryPlanner {
             && name.chars().count() <= 40
             && !name.contains('的')
             && !Self::is_question_word(name)
-            && !["怎么", "如何", "怎样", "关系", "路径", "路线", "中间人", "连接"]
-                .iter()
-                .any(|word| name.contains(word))
+            && ![
+                "怎么",
+                "如何",
+                "怎样",
+                "关系",
+                "路径",
+                "路线",
+                "中间人",
+                "连接",
+            ]
+            .iter()
+            .any(|word| name.contains(word))
     }
 
     fn split_pair(text: &str) -> Option<(String, String)> {
@@ -415,7 +447,16 @@ impl QueryPlanner {
         for _ in 0..3 {
             let mut changed = false;
             for prefix in [
-                "认识", "结识", "找到", "联系到", "联系", "见到", "是", "和", "与", "跟",
+                "认识",
+                "结识",
+                "找到",
+                "联系到",
+                "联系",
+                "见到",
+                "是",
+                "和",
+                "与",
+                "跟",
             ] {
                 if let Some(rest) = value.strip_prefix(prefix) {
                     value = rest.trim().to_string();
@@ -524,8 +565,9 @@ impl QueryPlanner {
 
     fn apply_hop_limit(plan: &mut QueryPlan, limit: usize) {
         match plan {
-            QueryPlan::PathBetween { max_hops, .. }
-            | QueryPlan::Intermediary { max_hops, .. } => *max_hops = limit,
+            QueryPlan::PathBetween { max_hops, .. } | QueryPlan::Intermediary { max_hops, .. } => {
+                *max_hops = limit
+            }
             _ => {}
         }
     }
@@ -629,7 +671,14 @@ impl QueryPlanner {
                 });
             }
         }
-        for marker in ["怎么找到", "如何找到", "怎么认识", "如何认识", "怎么联系", "如何联系"] {
+        for marker in [
+            "怎么找到",
+            "如何找到",
+            "怎么认识",
+            "如何认识",
+            "怎么联系",
+            "如何联系",
+        ] {
             if let Some((start, rest)) = q.split_once(marker) {
                 let start = Self::clean_name(start);
                 let goal = Self::strip_relation_prefix(rest);
@@ -702,7 +751,10 @@ impl QueryPlanner {
                 continue;
             }
             let after = rest[digits.len()..].trim_start();
-            let Some(after) = after.strip_prefix('跳').or_else(|| after.strip_prefix('步')) else {
+            let Some(after) = after
+                .strip_prefix('跳')
+                .or_else(|| after.strip_prefix('步'))
+            else {
                 continue;
             };
             let after = after.trim_start();
@@ -857,9 +909,8 @@ impl QueryPlanner {
     fn parse_count(&self, q: &str) -> Option<QueryPlan> {
         // 「有几个/几位/几名…」：量词可省略（有几个），也可跟上其它量词（有几位）
         if let Some((head, rest)) = q.split_once("有几") {
-            let stripped = rest.trim_start_matches(|c: char| {
-                matches!(c, '个' | '位' | '条' | '种' | '名' | '只')
-            });
+            let stripped = rest
+                .trim_start_matches(|c: char| matches!(c, '个' | '位' | '条' | '种' | '名' | '只'));
             if stripped.len() != rest.len() {
                 if let Some(predicate) = Self::strip_measure(stripped) {
                     if !head.is_empty() && !predicate.is_empty() {
@@ -1063,7 +1114,9 @@ mod tests {
 
     #[test]
     fn test_find_object_chain() {
-        let plan = planner().parse("张三的师傅的师傅是谁").expect("应编译为查找计划");
+        let plan = planner()
+            .parse("张三的师傅的师傅是谁")
+            .expect("应编译为查找计划");
         assert_eq!(
             plan,
             QueryPlan::FindObject {
@@ -1074,7 +1127,9 @@ mod tests {
 
     #[test]
     fn test_find_object_with_polite_prefix_and_particles() {
-        let plan = planner().parse("请问李四的师祖是什么呢？").expect("应编译为查找计划");
+        let plan = planner()
+            .parse("请问李四的师祖是什么呢？")
+            .expect("应编译为查找计划");
         assert_eq!(
             plan,
             QueryPlan::FindObject {
@@ -1085,14 +1140,18 @@ mod tests {
 
     #[test]
     fn test_find_object_with_amount_tail() {
-        let plan = planner().parse("姚明的身高是多少").expect("应编译为查找计划");
+        let plan = planner()
+            .parse("姚明的身高是多少")
+            .expect("应编译为查找计划");
         assert_eq!(
             plan,
             QueryPlan::FindObject {
                 segments: vec!["姚明".to_string(), "身高".to_string()]
             }
         );
-        let plan2 = planner().parse("李四的师傅有多少").expect("应编译为查找计划");
+        let plan2 = planner()
+            .parse("李四的师傅有多少")
+            .expect("应编译为查找计划");
         assert_eq!(
             plan2,
             QueryPlan::FindObject {
@@ -1135,7 +1194,9 @@ mod tests {
 
     #[test]
     fn test_closure_question() {
-        let plan = planner().parse("李四的所有上司是谁").expect("应编译为闭包计划");
+        let plan = planner()
+            .parse("李四的所有上司是谁")
+            .expect("应编译为闭包计划");
         assert_eq!(
             plan,
             QueryPlan::Closure {
@@ -1290,7 +1351,9 @@ mod tests {
 
     #[test]
     fn test_check_triple_yes_no() {
-        let plan = planner().parse("李四的师傅是王五吗").expect("应编译为事实校验");
+        let plan = planner()
+            .parse("李四的师傅是王五吗")
+            .expect("应编译为事实校验");
         assert_eq!(
             plan,
             QueryPlan::CheckTriple {
@@ -1302,7 +1365,9 @@ mod tests {
 
     #[test]
     fn test_check_triple_reversed() {
-        let plan = planner().parse("王五是不是李四的师傅").expect("应编译为事实校验");
+        let plan = planner()
+            .parse("王五是不是李四的师傅")
+            .expect("应编译为事实校验");
         assert_eq!(
             plan,
             QueryPlan::CheckTriple {
@@ -1321,7 +1386,9 @@ mod tests {
                 entity: "张三".to_string()
             }
         );
-        let plan2 = planner().parse("和李四最像的实体是谁？").expect("应编译为近邻检索");
+        let plan2 = planner()
+            .parse("和李四最像的实体是谁？")
+            .expect("应编译为近邻检索");
         assert_eq!(
             plan2,
             QueryPlan::Similar {
@@ -1332,7 +1399,9 @@ mod tests {
 
     #[test]
     fn test_analogy_question() {
-        let plan = planner().parse("张三对应李四，王五对应谁").expect("应编译为类比");
+        let plan = planner()
+            .parse("张三对应李四，王五对应谁")
+            .expect("应编译为类比");
         assert_eq!(
             plan,
             QueryPlan::Analogy {
@@ -1341,7 +1410,9 @@ mod tests {
                 c: "王五".to_string()
             }
         );
-        let plan2 = planner().parse("张三之于李四，王五呢").expect("应编译为类比");
+        let plan2 = planner()
+            .parse("张三之于李四，王五呢")
+            .expect("应编译为类比");
         assert_eq!(
             plan2,
             QueryPlan::Analogy {
@@ -1354,7 +1425,9 @@ mod tests {
 
     #[test]
     fn test_topic_without_question_word_is_find_object() {
-        let plan = planner().parse("李四的师祖").expect("省略问句也应给出查找计划");
+        let plan = planner()
+            .parse("李四的师祖")
+            .expect("省略问句也应给出查找计划");
         assert_eq!(
             plan,
             QueryPlan::FindObject {

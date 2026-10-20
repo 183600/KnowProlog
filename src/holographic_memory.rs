@@ -146,7 +146,10 @@ fn rotate_i8(values: &[i8], shift: isize) -> Vec<i8> {
 
 /// 两个双极向量的绑定（逐元素乘积），输出 f64 以便叠加
 fn bind_to_f64(a: &[i8], b: &[i8]) -> Vec<f64> {
-    a.iter().zip(b.iter()).map(|(x, y)| (*x * *y) as f64).collect()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x * *y) as f64)
+        .collect()
 }
 
 /// 双极绑定（逐元素乘积）：自逆、可交换
@@ -243,7 +246,11 @@ impl HolographicMemory {
     }
 
     pub fn role_counts(&self) -> (usize, usize, usize) {
-        (self.subjects.len(), self.predicates.len(), self.objects.len())
+        (
+            self.subjects.len(),
+            self.predicates.len(),
+            self.objects.len(),
+        )
     }
 
     pub fn context_len(&self) -> usize {
@@ -257,8 +264,11 @@ impl HolographicMemory {
 
     /// 硬通道：三元组是否登记
     pub fn contains_triple(&self, subject: &str, predicate: &str, object: &str) -> bool {
-        self.triples
-            .contains(&(subject.to_string(), predicate.to_string(), object.to_string()))
+        self.triples.contains(&(
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        ))
     }
 
     fn ensure_vector(&mut self, symbol: &str) {
@@ -289,20 +299,20 @@ impl HolographicMemory {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             return;
         }
-        if !self
-            .triples
-            .insert((subject.to_string(), predicate.to_string(), object.to_string()))
-        {
+        if !self.triples.insert((
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        )) {
             return;
         }
-        self.triple_order
-            .push((subject.to_string(), predicate.to_string(), object.to_string()));
+        self.triple_order.push((
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        ));
         Self::register_role(&mut self.subjects, &mut self.subject_seen, subject);
-        Self::register_role(
-            &mut self.predicates,
-            &mut self.predicate_seen,
-            predicate,
-        );
+        Self::register_role(&mut self.predicates, &mut self.predicate_seen, predicate);
         Self::register_role(&mut self.objects, &mut self.object_seen, object);
         self.symbol_set.insert(subject.to_string());
         self.symbol_set.insert(predicate.to_string());
@@ -422,10 +432,7 @@ impl HolographicMemory {
         if !self.is_known(subject) || !self.is_known(object) {
             return Vec::new();
         }
-        let key = bind_to_f64(
-            &self.lookup(subject),
-            &rotate_i8(&self.lookup(object), 2),
-        );
+        let key = bind_to_f64(&self.lookup(subject), &rotate_i8(&self.lookup(object), 2));
         let decoded = rotate(&self.unbind(&key), -1);
         self.cleanup(&decoded, &self.predicates, self.max_hits)
             .into_iter()
@@ -514,11 +521,9 @@ impl HolographicMemory {
         }
         let noisy = rotate(&self.context, -(age as isize));
         let top = self.cleanup(&noisy, &self.context_symbols, 1);
-        top.into_iter().next().map(|(symbol, score)| ContextRecall {
-            age,
-            symbol,
-            score,
-        })
+        top.into_iter()
+            .next()
+            .map(|(symbol, score)| ContextRecall { age, symbol, score })
     }
 
     /// 最近若干轮的焦点轨迹（0..max_age）
@@ -546,9 +551,12 @@ impl HolographicMemory {
                 }
                 if &top.symbol == object {
                     check.top1_exact += 1;
-                    check
-                        .examples
-                        .push((subject.clone(), predicate.clone(), object.clone(), top.score));
+                    check.examples.push((
+                        subject.clone(),
+                        predicate.clone(),
+                        object.clone(),
+                        top.score,
+                    ));
                 }
             }
         }
@@ -559,7 +567,9 @@ impl HolographicMemory {
     pub fn report(&self) -> String {
         let (subjects, predicates, objects) = self.role_counts();
         let mut out = String::new();
-        out.push_str("全息符号记忆（Vector Symbolic Architecture：绑定/叠加/置换 + 净噪，纯符号、零训练）\n");
+        out.push_str(
+            "全息符号记忆（Vector Symbolic Architecture：绑定/叠加/置换 + 净噪，纯符号、零训练）\n",
+        );
         out.push_str(&format!(
             "  维度 D={} ｜ 符号 {} 个（主体 {} / 谓词 {} / 客体 {}）｜ 三元组 {} 条 ｜ 时序记忆 {} 轮\n",
             self.dim,
@@ -576,7 +586,9 @@ impl HolographicMemory {
         out.push_str(
             "  角色用置换位置区分：解缠 ?客体 = 逆置换²( M ⊙ V(主) ⊙ 置换¹(V(谓)) )，再余弦净噪\n",
         );
-        out.push_str("  时序 C = Σ 置换^k(V(焦点))，反向置换即可按轮次回读；置换让不同轮次互不干扰\n");
+        out.push_str(
+            "  时序 C = Σ 置换^k(V(焦点))，反向置换即可按轮次回读；置换让不同轮次互不干扰\n",
+        );
         if self.triple_count() > 0 {
             let check = self.self_check(12);
             out.push_str(&format!(
@@ -615,9 +627,7 @@ impl HolographicMemory {
         out.push_str(
             "  神经符号整合：软通道（全息召回，分级余弦）只提出候选；硬通道（三元组登记）精确核查；\n",
         );
-        out.push_str(
-            "  未获核查的候选标注「未登记」，不进入结论——用符号约束抑制串扰式幻觉。\n",
-        );
+        out.push_str("  未获核查的候选标注「未登记」，不进入结论——用符号约束抑制串扰式幻觉。\n");
         out
     }
 }
@@ -679,7 +689,11 @@ mod tests {
         let objects = memory.recall_object("张三", "师傅");
         assert_eq!(objects.first().map(|h| h.symbol.as_str()), Some("李四"));
         assert!(objects[0].verified);
-        assert!(objects[0].score > 0.2, "余弦应显著为正：{}", objects[0].score);
+        assert!(
+            objects[0].score > 0.2,
+            "余弦应显著为正：{}",
+            objects[0].score
+        );
 
         let subjects = memory.recall_subject("师傅", "王五");
         assert_eq!(subjects.first().map(|h| h.symbol.as_str()), Some("李四"));

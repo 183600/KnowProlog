@@ -37,7 +37,6 @@ const SUBPROPERTY_PREDICATES: [&str; 4] = ["子关系", "子属性", "子关系�
 /// 子类可达性的层数上限（中文领域层级很浅；上限只为防病态图）
 const MAX_SUBCLASS_DEPTH: usize = 16;
 
-
 /// 单条被检索的证据（三元组或实体属性）
 #[derive(Debug, Clone, Serialize)]
 pub struct RetrievalHit {
@@ -274,7 +273,11 @@ impl DenseRetriever {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
             return;
         }
-        let key = (subject.to_string(), predicate.to_string(), object.to_string());
+        let key = (
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        );
         if !self.seen.insert(key) {
             return;
         }
@@ -289,9 +292,15 @@ impl DenseRetriever {
             object: object.to_string(),
             terms,
         });
-        self.entity_docs.entry(subject.to_string()).or_default().push(id);
+        self.entity_docs
+            .entry(subject.to_string())
+            .or_default()
+            .push(id);
         if object != subject {
-            self.entity_docs.entry(object.to_string()).or_default().push(id);
+            self.entity_docs
+                .entry(object.to_string())
+                .or_default()
+                .push(id);
         }
         self.by_subject
             .entry(subject.to_string())
@@ -337,7 +346,11 @@ impl DenseRetriever {
         let subject = subject.trim();
         let predicate = predicate.trim();
         let object = object.trim();
-        let key = (subject.to_string(), predicate.to_string(), object.to_string());
+        let key = (
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        );
         if !self.seen.remove(&key) {
             return false;
         }
@@ -394,14 +407,21 @@ impl DenseRetriever {
     }
 
     /// 观察一个实体的类型与属性（属性逐条转成证据文档）
-    pub fn observe_entity(&mut self, name: &str, entity_type: &str, properties: &[(String, String)]) {
+    pub fn observe_entity(
+        &mut self,
+        name: &str,
+        entity_type: &str,
+        properties: &[(String, String)],
+    ) {
         let name = name.trim();
         let entity_type = entity_type.trim();
         if name.is_empty() {
             return;
         }
         if !entity_type.is_empty() {
-            let previous = self.entity_types.insert(name.to_string(), entity_type.to_string());
+            let previous = self
+                .entity_types
+                .insert(name.to_string(), entity_type.to_string());
             if previous.as_deref() != Some(entity_type) {
                 if let Some(old_type) = previous {
                     if let Some(entities) = self.type_entities.get_mut(&old_type) {
@@ -625,7 +645,11 @@ impl DenseRetriever {
     /// 谓词蕴含：`doc` 谓词的事实是否（沿子属性上浮）蕴含 `constraint` 谓词。
     /// 方向是单向的：子事实蕴含父谓词，父事实不蕴含子谓词。
     pub fn predicate_entails(&self, doc: &str, constraint: &str) -> bool {
-        doc == constraint || self.superproperties_reachable(doc).iter().any(|p| p == constraint)
+        doc == constraint
+            || self
+                .superproperties_reachable(doc)
+                .iter()
+                .any(|p| p == constraint)
     }
 
     /// 祖先闭包感知的互斥判定：两侧各沿子类层级上溯，任一对显式互斥即成立。
@@ -741,11 +765,9 @@ impl DenseRetriever {
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
         for fact in facts {
             match fact {
-                PrologFact::Relation {
-                    from,
-                    rel_type,
-                    to,
-                } => self.observe_triple(from, rel_type, to),
+                PrologFact::Relation { from, rel_type, to } => {
+                    self.observe_triple(from, rel_type, to)
+                }
                 PrologFact::Entity {
                     name,
                     entity_type,
@@ -853,7 +875,12 @@ impl DenseRetriever {
         }
         // 实体名按键长降序缓存，供 `seeds_cached` 的最长优先匹配复用
         let mut names: Vec<String> = self.entity_docs.keys().cloned().collect();
-        names.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
+        names.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
         self.seed_candidates = names;
         self.dirty = false;
         self.built = true;
@@ -867,7 +894,12 @@ impl DenseRetriever {
     /// 在查询串中找出已知实体作为结构游走的种子（最长优先）
     pub fn seeds(&self, query: &str) -> Vec<String> {
         let mut names: Vec<&String> = self.entity_docs.keys().collect();
-        names.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()).then_with(|| a.cmp(b)));
+        names.sort_by(|a, b| {
+            b.chars()
+                .count()
+                .cmp(&a.chars().count())
+                .then_with(|| a.cmp(b))
+        });
         Self::seeds_from_names(&names, query)
     }
 
@@ -956,10 +988,7 @@ impl DenseRetriever {
         // 停在奇偶振荡的反相上，使距离 2 的节点压过直接邻居。达到最少轮数后继续
         // 迭代到相邻两轮分布收敛为止，并以轮数上限兜底（防止高阻尼下振荡不收敛）。
         let min_iterations = self.iterations.max(1);
-        let max_iterations = min_iterations
-            .saturating_mul(8)
-            .max(64)
-            .min(1024);
+        let max_iterations = min_iterations.saturating_mul(8).max(64).min(1024);
         for iteration in 0..max_iterations {
             let mut next: HashMap<String, f64> = personalization
                 .iter()
@@ -1035,10 +1064,7 @@ impl DenseRetriever {
         } else {
             0.0
         };
-        let structural_score = (structural
-            .get(&doc.subject)
-            .copied()
-            .unwrap_or(0.0)
+        let structural_score = (structural.get(&doc.subject).copied().unwrap_or(0.0)
             + structural.get(&doc.object).copied().unwrap_or(0.0))
         .min(1.0);
         let predicate_hit = if self.predicate_matches(id, query, query_tokens) {
@@ -1088,8 +1114,7 @@ impl DenseRetriever {
     ) -> f64 {
         let doc = &self.docs[id];
         let lexical_ub = if self.doc_norms[id] > 0.0 && query_norm > 0.0 {
-            (self.doc_max_weights[id] * dot_weight_sum / (self.doc_norms[id] * query_norm))
-                .min(1.0)
+            (self.doc_max_weights[id] * dot_weight_sum / (self.doc_norms[id] * query_norm)).min(1.0)
         } else {
             0.0
         };
@@ -1170,7 +1195,10 @@ impl DenseRetriever {
                 Some(ids) => ids,
                 None => return Vec::new(),
             };
-            if base.as_ref().map_or(true, |current| ids.len() < current.len()) {
+            if base
+                .as_ref()
+                .map_or(true, |current| ids.len() < current.len())
+            {
                 base = Some(ids.clone());
             }
         }
@@ -1188,7 +1216,10 @@ impl DenseRetriever {
             }
             ids.sort_unstable();
             ids.dedup();
-            if base.as_ref().map_or(true, |current| ids.len() < current.len()) {
+            if base
+                .as_ref()
+                .map_or(true, |current| ids.len() < current.len())
+            {
                 base = Some(ids);
             }
         }
@@ -1197,7 +1228,10 @@ impl DenseRetriever {
                 Some(ids) => ids,
                 None => return Vec::new(),
             };
-            if base.as_ref().map_or(true, |current| ids.len() < current.len()) {
+            if base
+                .as_ref()
+                .map_or(true, |current| ids.len() < current.len())
+            {
                 base = Some(ids.clone());
             }
         }
@@ -1517,7 +1551,9 @@ impl DenseRetriever {
             ));
         }
         if receipt.certified_top_k {
-            receipt.notes.push("候选完整且未被预算截断：top-k 已证明。".to_string());
+            receipt
+                .notes
+                .push("候选完整且未被预算截断：top-k 已证明。".to_string());
         }
         EvidenceSearch { hits, receipt }
     }
@@ -1589,7 +1625,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
 fn index_terms(text: &str) -> Vec<String> {
     let mut terms = tokenize(text);
     let compact = text.trim();
-    let chars: Vec<char> = compact.chars().filter(|ch| !is_punctuation_char(*ch)).collect();
+    let chars: Vec<char> = compact
+        .chars()
+        .filter(|ch| !is_punctuation_char(*ch))
+        .collect();
     if chars.len() >= 2 && chars.len() <= 24 {
         if !terms.contains(&compact.to_string()) {
             terms.push(compact.to_string());
@@ -1654,16 +1693,24 @@ mod tests {
 
     fn build_retriever() -> DenseRetriever {
         let mut retriever = DenseRetriever::new(5, 0.85, 12);
-        retriever.observe_entity("张三", "人", &[
-            ("年龄".to_string(), "30".to_string()),
-            ("职业".to_string(), "演员".to_string()),
-            ("国籍".to_string(), "中国".to_string()),
-        ]);
-        retriever.observe_entity("李四", "人", &[
-            ("年龄".to_string(), "28".to_string()),
-            ("职业".to_string(), "导演".to_string()),
-            ("国籍".to_string(), "德国".to_string()),
-        ]);
+        retriever.observe_entity(
+            "张三",
+            "人",
+            &[
+                ("年龄".to_string(), "30".to_string()),
+                ("职业".to_string(), "演员".to_string()),
+                ("国籍".to_string(), "中国".to_string()),
+            ],
+        );
+        retriever.observe_entity(
+            "李四",
+            "人",
+            &[
+                ("年龄".to_string(), "28".to_string()),
+                ("职业".to_string(), "导演".to_string()),
+                ("国籍".to_string(), "德国".to_string()),
+            ],
+        );
         retriever.observe_triple("张三", "老师", "王五");
         retriever.observe_triple("李四", "老师", "王五");
         retriever.observe_triple("王五", "职业", "教授");
@@ -1744,7 +1791,14 @@ mod tests {
             .collect();
         let mut hits: Vec<RetrievalHit> = (0..retriever.docs.len())
             .filter_map(|id| {
-                retriever.score_doc(id, &dot_terms, &query_tokens, query, query_norm, &structural)
+                retriever.score_doc(
+                    id,
+                    &dot_terms,
+                    &query_tokens,
+                    query,
+                    query_norm,
+                    &structural,
+                )
             })
             .collect();
         hits.sort_by(DenseRetriever::compare_hits);
@@ -1775,13 +1829,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(keys(&search.hits), keys(&exhaustive));
-        assert!(
-            search
-                .hits
-                .iter()
-                .zip(exhaustive.iter())
-                .all(|(left, right)| (left.score - right.score).abs() < 1e-9)
-        );
+        assert!(search
+            .hits
+            .iter()
+            .zip(exhaustive.iter())
+            .all(|(left, right)| (left.score - right.score).abs() < 1e-9));
         assert!(search.receipt.certified_top_k);
     }
 
@@ -1860,11 +1912,7 @@ mod tests {
             ..SearchConstraints::default()
         };
         let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
-        let subjects: HashSet<&str> = search
-            .hits
-            .iter()
-            .map(|hit| hit.subject.as_str())
-            .collect();
+        let subjects: HashSet<&str> = search.hits.iter().map(|hit| hit.subject.as_str()).collect();
         assert!(subjects.contains("张三"));
         assert!(subjects.contains("李四"));
         assert!(!subjects.contains("王五"));
@@ -1882,7 +1930,10 @@ mod tests {
         let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
         assert_eq!(search.hits.len(), 2);
         assert!(search.hits.iter().all(|hit| hit.predicate == "老师"));
-        assert!(search.hits.iter().all(|hit| hit.reasons == vec!["约束精确匹配"]));
+        assert!(search
+            .hits
+            .iter()
+            .all(|hit| hit.reasons == vec!["约束精确匹配"]));
         assert!(search.receipt.certified_top_k);
     }
 
@@ -1897,10 +1948,9 @@ mod tests {
             &SearchConstraints::default(),
             SearchBudget::unlimited(),
         );
-        assert!(removed
-            .hits
-            .iter()
-            .all(|hit| !(hit.subject == "张三" && hit.predicate == "老师" && hit.object == "王五")));
+        assert!(removed.hits.iter().all(|hit| !(hit.subject == "张三"
+            && hit.predicate == "老师"
+            && hit.object == "王五")));
 
         retriever.observe_triple("张三", "老师", "王五");
         let restored = retriever.search(
@@ -1925,11 +1975,7 @@ mod tests {
             ..SearchConstraints::default()
         };
         let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
-        let subjects: HashSet<&str> = search
-            .hits
-            .iter()
-            .map(|hit| hit.subject.as_str())
-            .collect();
+        let subjects: HashSet<&str> = search.hits.iter().map(|hit| hit.subject.as_str()).collect();
         assert!(!subjects.contains("张三"));
         assert!(subjects.contains("李四"));
     }
@@ -1946,32 +1992,22 @@ mod tests {
         assert!(search.receipt.budget_exhausted);
         assert!(!search.receipt.certified_top_k);
         assert!(search.receipt.scanned <= 1);
-        assert!(
-            search
-                .receipt
-                .notes
-                .iter()
-                .any(|note| note.contains("预算"))
-        );
+        assert!(search
+            .receipt
+            .notes
+            .iter()
+            .any(|note| note.contains("预算")));
     }
 
     fn rdfs_retriever() -> DenseRetriever {
         let mut retriever = DenseRetriever::new(8, 0.85, 12);
-        retriever.observe_entity(
-            "张三",
-            "学生",
-            &[("专业".to_string(), "哲学".to_string())],
-        );
+        retriever.observe_entity("张三", "学生", &[("专业".to_string(), "哲学".to_string())]);
         retriever.observe_entity(
             "李四",
             "教师",
             &[("专业".to_string(), "逻辑学".to_string())],
         );
-        retriever.observe_entity(
-            "王五",
-            "地点",
-            &[("名称".to_string(), "长安".to_string())],
-        );
+        retriever.observe_entity("王五", "地点", &[("名称".to_string(), "长安".to_string())]);
         retriever.observe_subclass("学生", "人物");
         retriever.observe_subclass("教师", "人物");
         retriever.observe_disjoint("地点", "人物");
@@ -2003,13 +2039,17 @@ mod tests {
             ..SearchConstraints::default()
         };
         let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
-        let subjects: HashSet<&str> = search
-            .hits
-            .iter()
-            .map(|hit| hit.subject.as_str())
-            .collect();
-        assert!(subjects.contains("张三"), "学生 ⊑ 人物 应命中：{:?}", subjects);
-        assert!(subjects.contains("李四"), "教师 ⊑ 人物 应命中：{:?}", subjects);
+        let subjects: HashSet<&str> = search.hits.iter().map(|hit| hit.subject.as_str()).collect();
+        assert!(
+            subjects.contains("张三"),
+            "学生 ⊑ 人物 应命中：{:?}",
+            subjects
+        );
+        assert!(
+            subjects.contains("李四"),
+            "教师 ⊑ 人物 应命中：{:?}",
+            subjects
+        );
         assert!(
             !subjects.contains("王五"),
             "互斥类型（地点）必须被排除：{:?}",
@@ -2136,10 +2176,7 @@ mod tests {
         };
         let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
         assert!(
-            search
-                .hits
-                .iter()
-                .all(|hit| hit.subject != "王五"),
+            search.hits.iter().all(|hit| hit.subject != "王五"),
             "父谓词事实不得混入子谓词约束：{:?}",
             search.hits
         );
@@ -2166,17 +2203,17 @@ mod tests {
             ..SearchConstraints::default()
         };
         let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
-        let subjects: HashSet<&str> = search
-            .hits
-            .iter()
-            .map(|hit| hit.subject.as_str())
-            .collect();
+        let subjects: HashSet<&str> = search.hits.iter().map(|hit| hit.subject.as_str()).collect();
         assert!(
             !subjects.contains("故宫"),
             "定义域互斥的证据必须被硬剪：{:?}",
             subjects
         );
-        assert!(subjects.contains("张三"), "子类相容证据保留：{:?}", subjects);
+        assert!(
+            subjects.contains("张三"),
+            "子类相容证据保留：{:?}",
+            subjects
+        );
         assert!(
             subjects.contains("无名氏"),
             "未知类型不凭空剪（开放世界）：{:?}",

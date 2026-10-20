@@ -203,10 +203,16 @@ impl MintVerdict {
     pub fn line(&self, name: &str) -> String {
         match self {
             MintVerdict::Exists { canonical, reason } => {
-                format!("「{}」：已存在身份「{}」（{}）——复用，不新铸。", name, canonical, reason)
+                format!(
+                    "「{}」：已存在身份「{}」（{}）——复用，不新铸。",
+                    name, canonical, reason
+                )
             }
             MintVerdict::Redirect { from, to } => {
-                format!("「{}」：已随「{}」重定向到「{}」——引用应走重定向。", name, from, to)
+                format!(
+                    "「{}」：已随「{}」重定向到「{}」——引用应走重定向。",
+                    name, from, to
+                )
             }
             MintVerdict::Variant { canonical, folded } => format!(
                 "「{}」：与「{}」折叠同形（{}）——只提名别名，不新铸第二个 URI。",
@@ -319,9 +325,7 @@ impl Default for EntityRegistry {
 fn fold_char(ch: char) -> Option<char> {
     match ch {
         // 全角 ASCII → 半角
-        '\u{FF01}'..='\u{FF5E}' => {
-            char::from_u32(ch as u32 - 0xFEE0).or(Some(ch))
-        }
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(ch as u32 - 0xFEE0).or(Some(ch)),
         // 表意空格 → 普通空格
         '\u{3000}' => Some(' '),
         // 零宽字符：不可见，剔除（无损于可读语义）
@@ -454,9 +458,7 @@ impl EntityRegistry {
                 continue;
             }
             for alias in record.aliases.values() {
-                if alias.status == EntityStatus::Confirmed
-                    && alias.surface != record.canonical
-                {
+                if alias.status == EntityStatus::Confirmed && alias.surface != record.canonical {
                     pairs.push((alias.surface.clone(), record.canonical.clone()));
                 }
             }
@@ -497,7 +499,12 @@ impl EntityRegistry {
         rejected
     }
 
-    fn ensure_record(&mut self, canonical: &str, origin: NominationOrigin, source: &str) -> &mut EntityRecord {
+    fn ensure_record(
+        &mut self,
+        canonical: &str,
+        origin: NominationOrigin,
+        source: &str,
+    ) -> &mut EntityRecord {
         let record = self
             .records
             .entry(canonical.to_string())
@@ -529,7 +536,8 @@ impl EntityRegistry {
             return Some(self.final_target(&record.canonical));
         }
         for record in self.records.values() {
-            if fold_surface(&record.canonical) == folded && record.status != EntityStatus::Rejected {
+            if fold_surface(&record.canonical) == folded && record.status != EntityStatus::Rejected
+            {
                 return Some(self.final_target(&record.canonical));
             }
         }
@@ -578,9 +586,13 @@ impl EntityRegistry {
         {
             let record = self.ensure_record(canonical, NominationOrigin::Kb, source);
             record.status = EntityStatus::Confirmed;
-            if !record.observed { record.observed = true; changed = true; }
+            if !record.observed {
+                record.observed = true;
+                changed = true;
+            }
             for type_name in types {
-                if !type_name.trim().is_empty() && record.types.insert(type_name.trim().to_string()) {
+                if !type_name.trim().is_empty() && record.types.insert(type_name.trim().to_string())
+                {
                     changed = true;
                 }
             }
@@ -702,14 +714,17 @@ impl EntityRegistry {
                 merged_into: None,
                 observed: false,
             });
-        let alias = record.aliases.entry(folded.clone()).or_insert_with(|| AliasRecord {
-            surface: surface_input.clone(),
-            status: EntityStatus::Pending,
-            origins: BTreeSet::new(),
-            evidence: Vec::new(),
-            nominations: 0,
-            variants: BTreeSet::new(),
-        });
+        let alias = record
+            .aliases
+            .entry(folded.clone())
+            .or_insert_with(|| AliasRecord {
+                surface: surface_input.clone(),
+                status: EntityStatus::Pending,
+                origins: BTreeSet::new(),
+                evidence: Vec::new(),
+                nominations: 0,
+                variants: BTreeSet::new(),
+            });
 
         // 墓碑：被拒绝的词面不因重复提名而复活（图谱观测例外——事实强于否决）
         if alias.status == EntityStatus::Rejected && !auto_confirm {
@@ -725,8 +740,8 @@ impl EntityRegistry {
             };
         }
         if alias.status == EntityStatus::Confirmed && !auto_confirm {
-            let new_info =
-                !alias.origins.contains(&origin) || !alias.evidence.iter().any(|e| e == evidence.trim());
+            let new_info = !alias.origins.contains(&origin)
+                || !alias.evidence.iter().any(|e| e == evidence.trim());
             if new_info {
                 alias.nominations += 1;
             }
@@ -760,7 +775,10 @@ impl EntityRegistry {
         if auto_confirm {
             alias.status = EntityStatus::Confirmed;
         }
-        if alias.status != EntityStatus::Rejected && record.status == EntityStatus::Pending && auto_confirm {
+        if alias.status != EntityStatus::Rejected
+            && record.status == EntityStatus::Pending
+            && auto_confirm
+        {
             record.status = EntityStatus::Confirmed;
         }
         NominationOutcome {
@@ -899,14 +917,9 @@ impl EntityRegistry {
         }
         match self.resolve(name) {
             EntityResolution::Canonical(canonical) => {
-                return MintVerdict::Variant {
-                    canonical,
-                    folded,
-                }
+                return MintVerdict::Variant { canonical, folded }
             }
-            EntityResolution::Redirected { from, to } => {
-                return MintVerdict::Redirect { from, to }
-            }
+            EntityResolution::Redirected { from, to } => return MintVerdict::Redirect { from, to },
             EntityResolution::Ambiguous(candidates) => {
                 return MintVerdict::Ambiguous { candidates }
             }
@@ -966,16 +979,19 @@ impl EntityRegistry {
             return changed;
         }
         let canonical_key = target.clone();
-        let record = self.records.entry(canonical_key).or_insert_with(|| EntityRecord {
-            canonical: target.clone(),
-            status: EntityStatus::Pending,
-            origins: BTreeSet::new(),
-            types: BTreeSet::new(),
-            aliases: BTreeMap::new(),
-            sources: BTreeSet::new(),
-            merged_into: None,
-            observed: false,
-        });
+        let record = self
+            .records
+            .entry(canonical_key)
+            .or_insert_with(|| EntityRecord {
+                canonical: target.clone(),
+                status: EntityStatus::Pending,
+                origins: BTreeSet::new(),
+                types: BTreeSet::new(),
+                aliases: BTreeMap::new(),
+                sources: BTreeSet::new(),
+                merged_into: None,
+                observed: false,
+            });
         let record_changed = record.status != EntityStatus::Confirmed;
         record.status = EntityStatus::Confirmed;
         record.origins.insert(origin);
@@ -1078,7 +1094,10 @@ impl EntityRegistry {
                 break;
             };
             if next == from_target {
-                return Err(format!("合并会形成重定向环：{} → … → {}", into_target, from_target));
+                return Err(format!(
+                    "合并会形成重定向环：{} → … → {}",
+                    into_target, from_target
+                ));
             }
             cursor = next;
         }
@@ -1091,19 +1110,19 @@ impl EntityRegistry {
             let origins = from_record.origins.clone();
             let moved = aliases.len();
             from_record.merged_into = Some(into_target.clone());
-            let into_record = self
-                .records
-                .entry(into_target.clone())
-                .or_insert_with(|| EntityRecord {
-                    canonical: into_target.clone(),
-                    status: EntityStatus::Confirmed,
-                    origins: BTreeSet::new(),
-                    types: BTreeSet::new(),
-                    aliases: BTreeMap::new(),
-                    sources: BTreeSet::new(),
-                    merged_into: None,
-                    observed: false,
-                });
+            let into_record =
+                self.records
+                    .entry(into_target.clone())
+                    .or_insert_with(|| EntityRecord {
+                        canonical: into_target.clone(),
+                        status: EntityStatus::Confirmed,
+                        origins: BTreeSet::new(),
+                        types: BTreeSet::new(),
+                        aliases: BTreeMap::new(),
+                        sources: BTreeSet::new(),
+                        merged_into: None,
+                        observed: false,
+                    });
             into_record.status = EntityStatus::Confirmed;
             into_record.origins.extend(origins);
             into_record.types.extend(types);
@@ -1190,7 +1209,10 @@ impl EntityRegistry {
             }
             if let EntityResolution::Canonical(id) = self.resolve(surface) {
                 if id == canonical {
-                    return (surface.to_string(), format!("回声：本会话用过「{}」", surface));
+                    return (
+                        surface.to_string(),
+                        format!("回声：本会话用过「{}」", surface),
+                    );
                 }
             }
         }
@@ -1248,7 +1270,10 @@ impl EntityRegistry {
             let types = if record.types.is_empty() {
                 String::new()
             } else {
-                format!("；类型：{}", record.types.iter().cloned().collect::<Vec<_>>().join("、"))
+                format!(
+                    "；类型：{}",
+                    record.types.iter().cloned().collect::<Vec<_>>().join("、")
+                )
             };
             let origin = if record.origins.is_empty() {
                 String::new()
@@ -1285,7 +1310,12 @@ impl EntityRegistry {
                 } else {
                     format!(
                         "；写法：{}",
-                        alias.variants.iter().cloned().collect::<Vec<_>>().join("、")
+                        alias
+                            .variants
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("、")
                     )
                 };
                 let evidence = if alias.evidence.is_empty() {
@@ -1304,13 +1334,19 @@ impl EntityRegistry {
             }
         }
         if !pending.is_empty() {
-            lines.push(format!("待确认提名 {} 条（可用「确认身份：别名 = 规范名」签字）：", pending.len()));
+            lines.push(format!(
+                "待确认提名 {} 条（可用「确认身份：别名 = 规范名」签字）：",
+                pending.len()
+            ));
             for (canonical, surface) in &pending {
                 lines.push(format!("  • 「{}」→「{}」", surface, canonical));
             }
         }
         if !rejected.is_empty() {
-            lines.push(format!("墓碑 {} 条（拒绝/忘记的别名不予自动提名）：", rejected.len()));
+            lines.push(format!(
+                "墓碑 {} 条（拒绝/忘记的别名不予自动提名）：",
+                rejected.len()
+            ));
             for (canonical, surface) in &rejected {
                 lines.push(format!("  • 「{}」✗「{}」", surface, canonical));
             }
@@ -1381,7 +1417,8 @@ pub fn extract_alias_candidates(text: &str) -> Vec<AliasCandidate> {
                 // 词缀保护：即使/即便/即刻/即将/即令/即可/即为 等不是别名模式
                 let next = text[position + keyword.len()..].chars().next();
                 if let Some(next) = next {
-                    if matches!(next, '使' | '便' | '刻' | '将' | '令' | '可' | '为' | '是') {
+                    if matches!(next, '使' | '便' | '刻' | '将' | '令' | '可' | '为' | '是')
+                    {
                         continue;
                     }
                 }
@@ -1401,8 +1438,8 @@ pub fn extract_alias_candidates(text: &str) -> Vec<AliasCandidate> {
                 continue;
             }
             let evidence_start = position.saturating_sub(12);
-            let evidence_end = (position + keyword.len() + surface.chars().count() + 4)
-                .min(text.len());
+            let evidence_end =
+                (position + keyword.len() + surface.chars().count() + 4).min(text.len());
             let mut start = evidence_start;
             while start > 0 && !text.is_char_boundary(start) {
                 start -= 1;
@@ -1418,11 +1455,9 @@ pub fn extract_alias_candidates(text: &str) -> Vec<AliasCandidate> {
                 pattern: keyword.to_string(),
                 evidence,
             };
-            if !candidates
-                .iter()
-                .any(|existing| existing.surface == candidate.surface
-                    && existing.canonical == candidate.canonical)
-            {
+            if !candidates.iter().any(|existing| {
+                existing.surface == candidate.surface && existing.canonical == candidate.canonical
+            }) {
                 candidates.push(candidate);
             }
         }
@@ -1441,9 +1476,8 @@ fn clean_canonical(prefix: &str) -> Option<String> {
         '，', ',', '。', '；', ';', '！', '!', '？', '?', '：', ':', '\n', '（', '(', '《', '「',
         '"',
     ];
-    let mut segment = prefix.trim_end_matches(|ch: char| {
-        DELIMITERS.contains(&ch) || ch.is_whitespace()
-    });
+    let mut segment =
+        prefix.trim_end_matches(|ch: char| DELIMITERS.contains(&ch) || ch.is_whitespace());
     if let Some(position) = segment.rfind(|ch| DELIMITERS.contains(&ch)) {
         segment = &segment[position + ch_len(segment, position)..];
     }
@@ -1522,11 +1556,20 @@ mod tests {
     #[test]
     fn nomination_is_pending_until_confirmed() {
         let mut registry = EntityRegistry::new();
-        let outcome = registry.nominate_alias("苹果", "苹果公司", NominationOrigin::Import, "又称模式");
+        let outcome =
+            registry.nominate_alias("苹果", "苹果公司", NominationOrigin::Import, "又称模式");
         assert_eq!(outcome.kind, NominationKind::Pending);
         assert!(outcome.changed);
-        assert_eq!(registry.resolve("苹果"), EntityResolution::Unknown, "提名不参与解析");
-        assert_eq!(registry.resolve("苹果公司"), EntityResolution::Unknown, "身份也未确认");
+        assert_eq!(
+            registry.resolve("苹果"),
+            EntityResolution::Unknown,
+            "提名不参与解析"
+        );
+        assert_eq!(
+            registry.resolve("苹果公司"),
+            EntityResolution::Unknown,
+            "身份也未确认"
+        );
 
         assert!(registry.confirm_alias("苹果", "苹果公司"));
         assert_eq!(
@@ -1579,7 +1622,11 @@ mod tests {
         registry.confirm_alias("苹果", "苹果公司");
         assert_eq!(registry.forget_alias("苹果"), vec!["苹果公司".to_string()]);
         assert_eq!(registry.resolve("苹果"), EntityResolution::Unknown);
-        assert_eq!(registry.forget_alias("苹果"), Vec::<String>::new(), "重复忘记无变化");
+        assert_eq!(
+            registry.forget_alias("苹果"),
+            Vec::<String>::new(),
+            "重复忘记无变化"
+        );
         let outcome = registry.nominate_alias("苹果", "苹果公司", NominationOrigin::Import, "模式");
         assert_eq!(outcome.kind, NominationKind::Tombstoned);
     }
@@ -1635,8 +1682,14 @@ mod tests {
             EntityResolution::Canonical("苹果公司".to_string()),
             "别名随合并搬迁"
         );
-        assert!(registry.merge("苹果公司", "苹果股份有限公司").is_err(), "成环拒绝");
-        assert!(registry.merge("苹果公司", "苹果公司").is_err(), "自合并拒绝");
+        assert!(
+            registry.merge("苹果公司", "苹果股份有限公司").is_err(),
+            "成环拒绝"
+        );
+        assert!(
+            registry.merge("苹果公司", "苹果公司").is_err(),
+            "自合并拒绝"
+        );
     }
 
     #[test]
@@ -1678,7 +1731,11 @@ mod tests {
             "模式",
             Some(&type_system),
         );
-        assert_eq!(outcome.kind, NominationKind::Pending, "词面未被占用时正常提名");
+        assert_eq!(
+            outcome.kind,
+            NominationKind::Pending,
+            "词面未被占用时正常提名"
+        );
 
         // 词面「苹果果实」要成为「苹果公司」的别名：互斥类型 → 需人工确认
         let outcome = registry.nominate_alias_with_types(
@@ -1805,7 +1862,11 @@ mod tests {
         let json = registry.to_json();
         let restored = EntityRegistry::from_json(&json).expect("往返应成功");
         assert_eq!(restored.resolve("苹果"), registry.resolve("苹果"));
-        assert_eq!(restored.to_json(), registry.to_json(), "规范 JSON 逐字节一致");
+        assert_eq!(
+            restored.to_json(),
+            registry.to_json(),
+            "规范 JSON 逐字节一致"
+        );
 
         let mut future = serde_json::to_value(&registry).unwrap();
         future["fold_version"] = serde_json::json!(FOLD_VERSION + 1);
@@ -1814,7 +1875,10 @@ mod tests {
             "高版本必须拒绝解码"
         );
         assert!(EntityRegistry::from_json("{not json").is_none());
-        assert!(EntityRegistry::from_json("{}").is_some(), "空对象按默认值解码");
+        assert!(
+            EntityRegistry::from_json("{}").is_some(),
+            "空对象按默认值解码"
+        );
     }
 
     #[test]
@@ -1822,8 +1886,13 @@ mod tests {
         let mut registry = EntityRegistry::new();
         let outcome = registry.nominate_alias("  ", "苹果公司", NominationOrigin::Import, "模式");
         assert_eq!(outcome.kind, NominationKind::Ignored);
-        let outcome = registry.nominate_alias("ＡＣＭＥ公司", "ACME公司", NominationOrigin::Import, "模式");
-        assert_eq!(outcome.kind, NominationKind::Duplicate, "折叠同形视为自别名");
+        let outcome =
+            registry.nominate_alias("ＡＣＭＥ公司", "ACME公司", NominationOrigin::Import, "模式");
+        assert_eq!(
+            outcome.kind,
+            NominationKind::Duplicate,
+            "折叠同形视为自别名"
+        );
         assert!(EntityRegistry::new().mint_check("").eq(&MintVerdict::Fresh));
     }
 

@@ -71,9 +71,7 @@ fn write_canonical(value: &Value, output: &mut String) {
                 if index > 0 {
                     output.push(',');
                 }
-                output.push_str(
-                    &serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()),
-                );
+                output.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
                 output.push(':');
                 write_canonical(&map[key], output);
             }
@@ -313,10 +311,7 @@ mod tests {
         let left = json!({"b": {"y": 1, "x": 2}, "a": [ {"q": 1, "p": 2} ]});
         let right = json!({"a": [ {"p": 2, "q": 1} ], "b": {"x": 2, "y": 1}});
         assert_eq!(canonical_json(&left), canonical_json(&right));
-        assert_eq!(
-            canonical_json(&json!({"b":1,"a":2})),
-            r#"{"a":2,"b":1}"#
-        );
+        assert_eq!(canonical_json(&json!({"b":1,"a":2})), r#"{"a":2,"b":1}"#);
     }
 
     #[test]
@@ -326,7 +321,10 @@ mod tests {
         let path = dir.path().join("context_image.json");
         let path_text = path.to_str().unwrap();
         image.save_atomic(path_text).unwrap();
-        assert!(!Path::new(&format!("{}.tmp", path_text)).exists(), "临时文件不应残留");
+        assert!(
+            !Path::new(&format!("{}.tmp", path_text)).exists(),
+            "临时文件不应残留"
+        );
 
         let loaded = ContextImage::load_verified(path_text).unwrap();
         assert_eq!(loaded, image);

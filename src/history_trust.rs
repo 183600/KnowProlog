@@ -182,7 +182,10 @@ impl TrustAssessment {
                 assess_answer(
                     answer,
                     events,
-                    answer.proof_id.as_deref().and_then(|id| proofs.get(id).copied()),
+                    answer
+                        .proof_id
+                        .as_deref()
+                        .and_then(|id| proofs.get(id).copied()),
                 )
             })
             .collect::<Vec<_>>();
@@ -268,10 +271,7 @@ impl TrustAssessment {
                 entry.verdict.label(),
                 entry.basis.label()
             ));
-            lines.push(format!(
-                "    回答：{}",
-                truncate(&entry.answer.answer, 56)
-            ));
+            lines.push(format!("    回答：{}", truncate(&entry.answer.answer, 56)));
             if entry.support.is_empty() {
                 lines.push("    支持：无（没有任何事件效果或证明叶子覆盖这条回答）".to_string());
             } else {
@@ -379,10 +379,7 @@ fn overall_basis(support: &[SupportClaim]) -> TrustBasis {
     if support.is_empty() {
         return TrustBasis::Unknown;
     }
-    if support
-        .iter()
-        .all(|claim| claim.basis == TrustBasis::Exact)
-    {
+    if support.iter().all(|claim| claim.basis == TrustBasis::Exact) {
         TrustBasis::Exact
     } else {
         TrustBasis::Inferred
@@ -519,7 +516,12 @@ fn removed_before(
             && event.seq <= visible_until
             && event.effects.iter().any(|candidate| {
                 candidate.op == crate::conversation_theory::EffectOp::Remove
-                    && same_key(&candidate.entity, &candidate.predicate, &effect.entity, &effect.predicate)
+                    && same_key(
+                        &candidate.entity,
+                        &candidate.predicate,
+                        &effect.entity,
+                        &effect.predicate,
+                    )
                     && candidate.value.eq_ignore_ascii_case(&effect.value)
             })
     })
@@ -591,7 +593,10 @@ fn collect_invalidations(
                             basis: claim.basis,
                             detail: format!(
                                 "{} 的 {} 由「{}」更正为「{}」",
-                                correction.entity, correction.predicate, correction.from, correction.to
+                                correction.entity,
+                                correction.predicate,
+                                correction.from,
+                                correction.to
                             ),
                         });
                     }
@@ -631,7 +636,8 @@ fn collect_invalidations(
         }
         for event in conflict_candidates {
             for conflict in &event.conflicts {
-                if conflict_affects(claim, conflict) && !resolved_after(event.seq, conflict, events) {
+                if conflict_affects(claim, conflict) && !resolved_after(event.seq, conflict, events)
+                {
                     invalidations.push(Invalidation {
                         event_seq: event.seq,
                         event_kind: event.kind,
@@ -687,11 +693,7 @@ fn collect_invalidations(
     invalidations
 }
 
-fn resolved_after(
-    conflict_seq: u64,
-    conflict: &TheoryConflict,
-    events: &[TheoryEvent],
-) -> bool {
+fn resolved_after(conflict_seq: u64, conflict: &TheoryConflict, events: &[TheoryEvent]) -> bool {
     events.iter().any(|event| {
         event.seq > conflict_seq
             && event.corrections.iter().any(|correction| {
@@ -750,7 +752,11 @@ fn same_key(
     }
     let left = left_predicate.to_lowercase();
     let right = right_predicate.to_lowercase();
-    left.is_empty() || right.is_empty() || left == right || left.contains(&right) || right.contains(&left)
+    left.is_empty()
+        || right.is_empty()
+        || left == right
+        || left.contains(&right)
+        || right.contains(&left)
 }
 
 fn detect_stale_read(answer: &AnswerRecord, events: &[TheoryEvent]) -> bool {
@@ -805,9 +811,7 @@ mod tests {
         append_assert, append_conflict, append_correction, append_forget, append_import,
         append_retract, EffectOp, TheoryCorrection,
     };
-    use crate::predicate_registry::{
-        ImportAction, ImportConflict, ImportReceipt,
-    };
+    use crate::predicate_registry::{ImportAction, ImportConflict, ImportReceipt};
     use crate::proof_journal::{ProofCertificate, ProofLimits};
     use crate::resolution_engine::{ProofNode, ProofSource};
     use tempfile::TempDir;
@@ -846,13 +850,7 @@ mod tests {
     fn inferred_support_is_never_clean() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "229"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "229"), "导入", 1).unwrap();
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
         answer(&mut chronicle, "姚明身高 229 厘米。");
@@ -867,13 +865,7 @@ mod tests {
     fn import_support_and_correction_invalidates_with_proof() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "226"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "226"), "导入", 1).unwrap();
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
         // 形式证明：事实叶子 height(姚明, 226)
@@ -925,13 +917,7 @@ mod tests {
     fn inferred_correction_degrades_to_suspect() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "226"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "226"), "导入", 1).unwrap();
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
         answer(&mut chronicle, "姚明身高 226 厘米。");
@@ -963,7 +949,13 @@ mod tests {
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
         let reply = chronicle
-            .append_reply_with_context(Some("姚明的身高是多少？"), "姚明身高 226 厘米。", &[], &[], None)
+            .append_reply_with_context(
+                Some("姚明的身高是多少？"),
+                "姚明身高 226 厘米。",
+                &[],
+                &[],
+                None,
+            )
             .unwrap();
         // 无证明：即使撤回，也只能降级为 Suspect
         append_retract(&mut chronicle, &bill, "撤销导入", 2).unwrap();
@@ -984,13 +976,7 @@ mod tests {
     fn conflict_marks_supported_answer_contested_only_with_proof() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "226"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "226"), "导入", 1).unwrap();
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
         let certificate = ProofCertificate::from_resolution(
@@ -1040,13 +1026,7 @@ mod tests {
     fn conflict_visible_before_answer_is_recorded() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "226"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "226"), "导入", 1).unwrap();
         append_conflict(
             &mut chronicle,
             &[ImportConflict {
@@ -1179,10 +1159,7 @@ mod tests {
         .unwrap();
         let assessment = TrustAssessment::from_chronicle(&chronicle);
         assert_eq!(assessment.answers[0].basis, TrustBasis::Unknown);
-        assert_eq!(
-            assessment.answers[0].verdict,
-            TrustVerdict::Unassessed
-        );
+        assert_eq!(assessment.answers[0].verdict, TrustVerdict::Unassessed);
     }
 
     #[test]
@@ -1204,13 +1181,7 @@ mod tests {
     fn stale_read_is_detected_from_reply_watermark() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "226"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "226"), "导入", 1).unwrap();
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
         let reply = chronicle
@@ -1235,13 +1206,7 @@ mod tests {
     fn conflict_event_does_not_change_folded_beliefs() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        append_import(
-            &mut chronicle,
-            &receipt("姚明", "height", "226"),
-            "导入",
-            1,
-        )
-        .unwrap();
+        append_import(&mut chronicle, &receipt("姚明", "height", "226"), "导入", 1).unwrap();
         append_conflict(
             &mut chronicle,
             &[ImportConflict {
@@ -1264,7 +1229,8 @@ mod tests {
     fn forget_removes_assertion_support() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
-        let effects = crate::conversation_theory::effects_from_text("姚明的身高是229", EffectOp::Add);
+        let effects =
+            crate::conversation_theory::effects_from_text("姚明的身高是229", EffectOp::Add);
         append_assert(&mut chronicle, "姚明的身高是229", &effects, 0).unwrap();
         chronicle.set_kb_revision(1);
         ask(&mut chronicle, "姚明的身高是多少？");
@@ -1272,10 +1238,7 @@ mod tests {
         append_forget(
             &mut chronicle,
             "姚明的身高是229",
-            &crate::conversation_theory::effects_from_text(
-                "姚明的身高是229",
-                EffectOp::Remove,
-            ),
+            &crate::conversation_theory::effects_from_text("姚明的身高是229", EffectOp::Remove),
             2,
         )
         .unwrap();

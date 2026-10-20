@@ -87,9 +87,18 @@ impl PromptSpec {
 /// 渲染结果：成功 / 接地失败 / 资产无效（lint 应拦住的错误）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RenderOutcome {
-    Rendered { spec_id: &'static str, text: String },
-    Ungrounded { spec_id: &'static str, missing: Vec<String> },
-    Invalid { spec_id: &'static str, message: String },
+    Rendered {
+        spec_id: &'static str,
+        text: String,
+    },
+    Ungrounded {
+        spec_id: &'static str,
+        missing: Vec<String>,
+    },
+    Invalid {
+        spec_id: &'static str,
+        message: String,
+    },
 }
 
 impl RenderOutcome {
@@ -136,11 +145,11 @@ pub fn parse_template(template: &str) -> Result<Vec<Part>, String> {
                 if name.is_empty() {
                     return Err("出现空槽位「{}」".to_string());
                 }
-                if !name
-                    .chars()
-                    .all(|ch| ch.is_alphanumeric() || ch == '_')
-                {
-                    return Err(format!("槽位名「{}」含非法字符（允许字母/数字/下划线）", name));
+                if !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+                    return Err(format!(
+                        "槽位名「{}」含非法字符（允许字母/数字/下划线）",
+                        name
+                    ));
                 }
                 parts.push(Part::Slot(name));
             }
@@ -491,10 +500,7 @@ pub fn lint_specs(specs: &[PromptSpec]) -> Vec<PromptLintIssue> {
             push(LintSeverity::Error, "id 重复".to_string());
         }
         if !POLICY_NAMES.contains(&spec.policy) {
-            push(
-                LintSeverity::Error,
-                format!("未知策略「{}」", spec.policy),
-            );
+            push(LintSeverity::Error, format!("未知策略「{}」", spec.policy));
         }
         let parts = match parse_template(spec.template) {
             Ok(parts) => parts,
@@ -544,7 +550,10 @@ pub fn lint_specs(specs: &[PromptSpec]) -> Vec<PromptLintIssue> {
         }
         // 示例即测试：实际渲染必须与期望文本逐字一致
         if spec.example_rendered.is_empty() {
-            push(LintSeverity::Error, "缺少 example_rendered（示例不可执行）".to_string());
+            push(
+                LintSeverity::Error,
+                "缺少 example_rendered（示例不可执行）".to_string(),
+            );
         } else {
             let mut bindings = BindingSet::new();
             for (name, value) in spec.example {
@@ -720,7 +729,11 @@ mod tests {
     fn test_parse_template_escapes_and_errors() {
         assert_eq!(
             parse_template("a{s}b").unwrap(),
-            vec![Part::Literal("a".into()), Part::Slot("s".into()), Part::Literal("b".into())]
+            vec![
+                Part::Literal("a".into()),
+                Part::Slot("s".into()),
+                Part::Literal("b".into())
+            ]
         );
         assert_eq!(
             parse_template("{{literal}}").unwrap(),
@@ -739,7 +752,11 @@ mod tests {
             .iter()
             .filter(|issue| issue.severity == LintSeverity::Error)
             .collect();
-        assert!(errors.is_empty(), "默认注册表不应有 lint 错误：{:#?}", errors);
+        assert!(
+            errors.is_empty(),
+            "默认注册表不应有 lint 错误：{:#?}",
+            errors
+        );
     }
 
     #[test]
@@ -751,7 +768,11 @@ mod tests {
             }
             match render_spec(spec, &bindings) {
                 RenderOutcome::Rendered { text, .. } => {
-                    assert_eq!(text, spec.example_rendered, "spec {} 示例渲染不一致", spec.id);
+                    assert_eq!(
+                        text, spec.example_rendered,
+                        "spec {} 示例渲染不一致",
+                        spec.id
+                    );
                 }
                 other => panic!("spec {} 示例应可渲染：{:?}", spec.id, other),
             }
@@ -766,14 +787,18 @@ mod tests {
         // 缺 count → 接地失败
         let outcome = render("direct_answer/more/0", &bindings);
         match outcome {
-            RenderOutcome::Ungrounded { missing, .. } => assert_eq!(missing, vec!["count".to_string()]),
+            RenderOutcome::Ungrounded { missing, .. } => {
+                assert_eq!(missing, vec!["count".to_string()])
+            }
             other => panic!("应触发接地闸门：{:?}", other),
         }
 
         // 显式 Unbound 同样视为未接地
         bindings.insert("count", BoundTerm::Unbound);
         match render("direct_answer/more/0", &bindings) {
-            RenderOutcome::Ungrounded { missing, .. } => assert_eq!(missing, vec!["count".to_string()]),
+            RenderOutcome::Ungrounded { missing, .. } => {
+                assert_eq!(missing, vec!["count".to_string()])
+            }
             other => panic!("显式 Unbound 应触发接地闸门：{:?}", other),
         }
 
@@ -807,9 +832,15 @@ mod tests {
         let issues = lint_specs(&BAD);
         let messages: Vec<&str> = issues.iter().map(|issue| issue.message.as_str()).collect();
         assert!(messages.iter().any(|message| message.contains("未知策略")));
-        assert!(messages.iter().any(|message| message.contains("未在 required/optional 中声明")));
-        assert!(messages.iter().any(|message| message.contains("未出现在模板中")));
-        assert!(messages.iter().any(|message| message.contains("example_rendered")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("未在 required/optional 中声明")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("未出现在模板中")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("example_rendered")));
     }
 
     #[test]

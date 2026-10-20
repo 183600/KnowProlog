@@ -292,8 +292,8 @@ impl LogicProgram {
                             required = required.max(*stratum.get(&atom.predicate).unwrap_or(&0));
                         }
                         LLiteral::Neg(atom) => {
-                            required =
-                                required.max(stratum.get(&atom.predicate).copied().unwrap_or(0) + 1);
+                            required = required
+                                .max(stratum.get(&atom.predicate).copied().unwrap_or(0) + 1);
                         }
                     }
                 }
@@ -637,7 +637,10 @@ pub fn parse_rule(text: &str) -> Result<LRule, ParseError> {
             }
             literals.push(parse_literal(raw)?);
         }
-        Ok(LRule { head, body: literals })
+        Ok(LRule {
+            head,
+            body: literals,
+        })
     } else {
         Ok(LRule {
             head: parse_atom(text)?,

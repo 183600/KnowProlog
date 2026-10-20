@@ -270,7 +270,11 @@ impl DialogueEvalReport {
             .iter()
             .filter(|(_, prf)| prf.tp + prf.fn_ > 0)
             .map(|(label, prf)| (label.clone(), prf.f1()))
-            .min_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     /// 标量指标摊平（相对比较用；键稳定、可扩展）。
@@ -295,7 +299,10 @@ impl DialogueEvalReport {
             "answer.answered_rate".to_string(),
             ratio(self.answers.answered, self.answers.reference_turns),
         );
-        metrics.insert("provenance.precision".to_string(), self.provenance.precision);
+        metrics.insert(
+            "provenance.precision".to_string(),
+            self.provenance.precision,
+        );
         metrics.insert("grounding.slot_rate".to_string(), self.grounding.slot_rate);
         metrics
     }
@@ -400,9 +407,15 @@ pub fn compare_baseline(
         let current_value = current_metrics.get(metric).copied().unwrap_or(0.0);
         let lower_is_better = LOWER_IS_BETTER.contains(&metric.as_str());
         let (is_regression, is_gain) = if lower_is_better {
-            (current_value > baseline_value + epsilon, current_value < baseline_value - epsilon)
+            (
+                current_value > baseline_value + epsilon,
+                current_value < baseline_value - epsilon,
+            )
         } else {
-            (current_value < baseline_value - epsilon, current_value > baseline_value + epsilon)
+            (
+                current_value < baseline_value - epsilon,
+                current_value > baseline_value + epsilon,
+            )
         };
         if is_regression {
             regressions.push(DialogueMetricDelta {
@@ -705,7 +718,10 @@ impl GoldKnowledge {
             knowledge.entities.push((*entity).to_string());
             knowledge.attributes.insert(
                 (*entity).to_string(),
-                attributes.iter().map(|(key, _)| (*key).to_string()).collect(),
+                attributes
+                    .iter()
+                    .map(|(key, _)| (*key).to_string())
+                    .collect(),
             );
             for (attribute, value) in *attributes {
                 knowledge
@@ -715,9 +731,13 @@ impl GoldKnowledge {
                     .push((*value).to_string());
             }
         }
-        knowledge
-            .entities
-            .sort_by(|left, right| right.chars().count().cmp(&left.chars().count()).then(left.cmp(right)));
+        knowledge.entities.sort_by(|left, right| {
+            right
+                .chars()
+                .count()
+                .cmp(&left.chars().count())
+                .then(left.cmp(right))
+        });
         for (entity, profile) in scenario.profiles {
             knowledge
                 .profiles
@@ -734,14 +754,9 @@ impl GoldKnowledge {
                 .values()
                 .flatten()
                 .any(|attribute| attribute == token)
-            || self
-                .values
-                .iter()
-                .any(|((entity, attribute), values)| {
-                    entity == token
-                        || attribute == token
-                        || values.iter().any(|value| value == token)
-                })
+            || self.values.iter().any(|((entity, attribute), values)| {
+                entity == token || attribute == token || values.iter().any(|value| value == token)
+            })
             || self
                 .profiles
                 .iter()
@@ -763,12 +778,10 @@ impl DialogueKnowledge for GoldKnowledge {
     }
 
     fn answer(&self, question: &str) -> Option<String> {
-        let question = question
-            .trim()
-            .trim_end_matches(['？', '?', '。'])
-            .trim();
+        let question = question.trim().trim_end_matches(['？', '?', '。']).trim();
         for (entity, profile) in &self.profiles {
-            if question == format!("{}是谁", entity) || question == format!("{}是什么", entity) {
+            if question == format!("{}是谁", entity) || question == format!("{}是什么", entity)
+            {
                 return Some(profile.clone());
             }
         }
@@ -878,7 +891,8 @@ where
             acc.observe_intent(turn, &frame);
             let predicted_entities: HashSet<String> =
                 knowledge.entities_in(turn.input).into_iter().collect();
-            acc.entity.observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
+            acc.entity
+                .observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
             let predicted_slot: HashSet<String> = frame.attribute.clone().into_iter().collect();
             acc.slot.observe_sets(
                 &set_of(turn.attribute.as_ref().into_iter().copied()),
@@ -890,7 +904,8 @@ where
             let reply = manager
                 .plan_pure_dialogue(turn.input, &*knowledge)
                 .or_else(|| manager.plan_reply(turn.input, &*knowledge));
-            acc.takeover.observe_bool(turn.expect_takeover, reply.is_some());
+            acc.takeover
+                .observe_bool(turn.expect_takeover, reply.is_some());
             let predicted_clarify = reply
                 .as_ref()
                 .map(|reply| {
@@ -949,7 +964,8 @@ pub fn evaluate_seed_with(mode: EvalKnowledge, prompt_mode: PromptMode) -> Dialo
                     acc.observe_intent(turn, &frame);
                     let predicted_entities: HashSet<String> =
                         knowledge.entities_in(turn.input).into_iter().collect();
-                    acc.entity.observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
+                    acc.entity
+                        .observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
                     let predicted_slot: HashSet<String> =
                         frame.attribute.clone().into_iter().collect();
                     acc.slot.observe_sets(
@@ -960,7 +976,8 @@ pub fn evaluate_seed_with(mode: EvalKnowledge, prompt_mode: PromptMode) -> Dialo
                     let reply = manager
                         .plan_pure_dialogue(turn.input, &knowledge)
                         .or_else(|| manager.plan_reply(turn.input, &knowledge));
-                    acc.takeover.observe_bool(turn.expect_takeover, reply.is_some());
+                    acc.takeover
+                        .observe_bool(turn.expect_takeover, reply.is_some());
                     let predicted_clarify = reply
                         .as_ref()
                         .map(|reply| {
@@ -972,7 +989,12 @@ pub fn evaluate_seed_with(mode: EvalKnowledge, prompt_mode: PromptMode) -> Dialo
                     acc.observe_clarify(turn.clarify, predicted_clarify);
                     acc.observe_answer(turn, reply.as_ref().map(|reply| reply.text.as_str()));
                     if let Some(reply) = &reply {
-                        acc.observe_provenance(&reply.text, reply.plan.first(), &knowledge, &history);
+                        acc.observe_provenance(
+                            &reply.text,
+                            reply.plan.first(),
+                            &knowledge,
+                            &history,
+                        );
                     }
                     if let Some(reply) = &reply {
                         history.push(reply.text.clone());
@@ -1001,7 +1023,8 @@ fn reevaluate_scripted(prompt_mode: PromptMode) -> DialogueEvalReport {
             acc.observe_intent(turn, &frame);
             let predicted_entities: HashSet<String> =
                 knowledge.entities_in(turn.input).into_iter().collect();
-            acc.entity.observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
+            acc.entity
+                .observe_sets(&set_of(turn.entities.iter().copied()), &predicted_entities);
             let predicted_slot: HashSet<String> = frame.attribute.clone().into_iter().collect();
             acc.slot.observe_sets(
                 &set_of(turn.attribute.as_ref().into_iter().copied()),
@@ -1011,13 +1034,15 @@ fn reevaluate_scripted(prompt_mode: PromptMode) -> DialogueEvalReport {
             let reply = manager
                 .plan_pure_dialogue(turn.input, &knowledge)
                 .or_else(|| manager.plan_reply(turn.input, &knowledge));
-            acc.takeover.observe_bool(turn.expect_takeover, reply.is_some());
+            acc.takeover
+                .observe_bool(turn.expect_takeover, reply.is_some());
             let predicted_clarify = reply
                 .as_ref()
                 .map(|reply| {
-                    reply.plan.iter().any(|plan| {
-                        plan == "clarify_entity" || plan == "clarify_entity_no_focus"
-                    })
+                    reply
+                        .plan
+                        .iter()
+                        .any(|plan| plan == "clarify_entity" || plan == "clarify_entity_no_focus")
                 })
                 .unwrap_or(false);
             acc.observe_clarify(turn.clarify, predicted_clarify);
@@ -1115,7 +1140,10 @@ impl Acc {
         knowledge: &dyn DialogueKnowledge,
         history: &[String],
     ) {
-        if matches!(leading_plan.map(String::as_str), Some("greet" | "thanks" | "farewell")) {
+        if matches!(
+            leading_plan.map(String::as_str),
+            Some("greet" | "thanks" | "farewell")
+        ) {
             return;
         }
         self.provenance_replies += 1;
@@ -1339,7 +1367,11 @@ pub fn corpus_digest(scenarios: &[GoldScenario], mode: EvalKnowledge) -> String 
             canonical.push('|');
             canonical.push_str(if turn.clarify { "clarify" } else { "-" });
             canonical.push('|');
-            canonical.push_str(if turn.expect_takeover { "takeover" } else { "defer" });
+            canonical.push_str(if turn.expect_takeover {
+                "takeover"
+            } else {
+                "defer"
+            });
             canonical.push('\n');
         }
     }
@@ -1398,7 +1430,8 @@ mod tests {
         assert_eq!(report.grounding.slot_rate, 1.0, "{}", report.render_text());
         assert_eq!(report.grounding.ungrounded, 0, "{}", report.render_text());
         assert_eq!(
-            report.grounding.parity_mismatches, 0,
+            report.grounding.parity_mismatches,
+            0,
             "{}",
             report.render_text()
         );
@@ -1415,14 +1448,18 @@ mod tests {
     fn reasoner_seed_corpus_runs_end_to_end() {
         let report = evaluate_seed(EvalKnowledge::Reasoner);
         assert_eq!(report.knowledge_mode, "reasoner");
-        assert_eq!(report.turns, seed_corpus().iter().map(|s| s.turns.len()).sum::<usize>() as u32);
+        assert_eq!(
+            report.turns,
+            seed_corpus().iter().map(|s| s.turns.len()).sum::<usize>() as u32
+        );
         assert!(
             report.intents.accuracy >= 0.9,
             "真实推理器下意图判定应稳定：{}",
             report.render_text()
         );
         assert_eq!(
-            report.provenance.precision, 1.0,
+            report.provenance.precision,
+            1.0,
             "真实推理器的回答引用必须可回溯：{}",
             report.render_text()
         );

@@ -14,7 +14,6 @@
 //! 与 `SymbolicReasoner` 的关系：管理器不重复存储领域知识，通过
 //! `DialogueKnowledge` 接口向推理器要「答案 / 实体 / 实体属性表」。
 
-
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -22,19 +21,13 @@ use serde::{Deserialize, Serialize};
 use crate::bindings::BindingSet;
 use crate::epistemic::{EpistemicStatus, LedgerLoad};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
-use crate::prompt_spec::{
-    self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION,
-};
-use crate::query_board::QueryBoard;
+use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
 use crate::quality::{ClaimWarrant, QualityIndex};
-use crate::recovery::{
-    self, PendingKind, RecoveryMode, RecoveryRequest, RecoveryState,
-};
+use crate::query_board::QueryBoard;
+use crate::recovery::{self, PendingKind, RecoveryMode, RecoveryRequest, RecoveryState};
 use crate::recovery::{RecoveryNomination, ReframedReading, VerificationOutcome};
 use crate::symbolic_reasoner::SymbolicReasoner;
-use crate::trace_graph::{
-    NodeId, QudKind, ReferentSource, TraceMode, TraceStore, TurnTrace,
-};
+use crate::trace_graph::{NodeId, QudKind, ReferentSource, TraceMode, TraceStore, TurnTrace};
 
 /// 一轮话语的语用类型（对话本体的「动作类」）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,12 +254,7 @@ pub trait DialogueKnowledge {
     }
 
     /// 恢复通道 L2：符号通道验证一条提名（缺省无结论）。
-    fn recovery_verify(
-        &self,
-        entity: &str,
-        attribute: &str,
-        value: &str,
-    ) -> VerificationOutcome {
+    fn recovery_verify(&self, entity: &str, attribute: &str, value: &str) -> VerificationOutcome {
         let _ = (entity, attribute, value);
         VerificationOutcome::NoVerdict
     }
@@ -390,12 +378,7 @@ impl DialogueKnowledge for SymbolicReasoner {
         SymbolicReasoner::recovery_nominations(self, entity, attribute)
     }
 
-    fn recovery_verify(
-        &self,
-        entity: &str,
-        attribute: &str,
-        value: &str,
-    ) -> VerificationOutcome {
+    fn recovery_verify(&self, entity: &str, attribute: &str, value: &str) -> VerificationOutcome {
         SymbolicReasoner::recovery_verify(self, entity, attribute, value)
     }
 
@@ -517,8 +500,18 @@ const ELABORATE_PATTERNS: [&str; 8] = [
 ];
 
 const GREETINGS: [&str; 12] = [
-    "你好", "您好", "你好呀", "嗨", "哈喽", "hi", "hello", "早上好", "中午好", "下午好",
-    "晚上好", "在吗",
+    "你好",
+    "您好",
+    "你好呀",
+    "嗨",
+    "哈喽",
+    "hi",
+    "hello",
+    "早上好",
+    "中午好",
+    "下午好",
+    "晚上好",
+    "在吗",
 ];
 
 /// 本体化对话管理器。
@@ -741,7 +734,11 @@ impl DialogueManager {
         format!(
             "失败恢复：模式 {}；{}；挂账 {} 个待定问题。\n{}",
             self.recovery_mode.label(),
-            format!("回执 {} 条（未结 {}）", self.recovery.ledger.len(), self.recovery.ledger.open_count()),
+            format!(
+                "回执 {} 条（未结 {}）",
+                self.recovery.ledger.len(),
+                self.recovery.ledger.open_count()
+            ),
             self.recovery.pending.len(),
             self.recovery.ledger.render_text()
         )
@@ -1034,8 +1031,24 @@ impl DialogueManager {
                 return None;
             }
             if [
-                "？", "?", "导入", "导出", "帮助", "退出", "为什么", "你怎么", "什么", "谁",
-                "哪", "多少", "几", "吗", "呢", "怎么", "吧", "哈哈",
+                "？",
+                "?",
+                "导入",
+                "导出",
+                "帮助",
+                "退出",
+                "为什么",
+                "你怎么",
+                "什么",
+                "谁",
+                "哪",
+                "多少",
+                "几",
+                "吗",
+                "呢",
+                "怎么",
+                "吧",
+                "哈哈",
             ]
             .iter()
             .any(|marker| input.contains(marker))
@@ -1125,13 +1138,22 @@ impl DialogueManager {
         let stripped = raw
             .trim_end_matches(['？', '?', '。', '！', '!', ' '])
             .trim();
-        if RECAP_PATTERNS.iter().any(|pattern| stripped.contains(pattern)) {
+        if RECAP_PATTERNS
+            .iter()
+            .any(|pattern| stripped.contains(pattern))
+        {
             return UtteranceFrame::new(raw, MoveKind::MetaRecap);
         }
-        if REVIEW_PATTERNS.iter().any(|pattern| stripped.contains(pattern)) {
+        if REVIEW_PATTERNS
+            .iter()
+            .any(|pattern| stripped.contains(pattern))
+        {
             return UtteranceFrame::new(raw, MoveKind::MetaReview);
         }
-        if WHY_PATTERNS.iter().any(|pattern| stripped.contains(pattern)) {
+        if WHY_PATTERNS
+            .iter()
+            .any(|pattern| stripped.contains(pattern))
+        {
             return UtteranceFrame::new(raw, MoveKind::MetaWhy);
         }
         if CONTINUE_PATTERNS.contains(&stripped) {
@@ -1218,10 +1240,7 @@ impl DialogueManager {
             // 而不是退回身份问句——上一轮问身高，这一轮仍问身高。
             if let Some(remainder) = stripped.strip_suffix('呢') {
                 let remainder = remainder.trim();
-                if self.trace_mode.is_on()
-                    && !remainder.is_empty()
-                    && contains_pronoun(remainder)
-                {
+                if self.trace_mode.is_on() && !remainder.is_empty() && contains_pronoun(remainder) {
                     if let Some(attribute) = self.trace.predicate_focus() {
                         let entity = self
                             .trace
@@ -1363,8 +1382,9 @@ impl DialogueManager {
             .unwrap_or(false);
         // 只有属性没有实体（且无焦点）时不外抛：由策略层生成澄清问题；
         // 实体存在但图谱不认识时让位给常规 NLU / 外部知识管线。
-        let attribute_only =
-            matches!(frame.kind, MoveKind::AskAttribute) && entity.is_none() && frame.attribute.is_some();
+        let attribute_only = matches!(frame.kind, MoveKind::AskAttribute)
+            && entity.is_none()
+            && frame.attribute.is_some();
 
         // —— 失败恢复：引擎层故障优先于一切知识判定 ——
         // On 模式下故障必须显式说「我出错了」；Observe 只入台账；Off 不介入。
@@ -1431,7 +1451,9 @@ impl DialogueManager {
             }
         }
 
-        if matches!(frame.kind, MoveKind::AskAttribute | MoveKind::AskIdentity) && !known && !attribute_only
+        if matches!(frame.kind, MoveKind::AskAttribute | MoveKind::AskIdentity)
+            && !known
+            && !attribute_only
         {
             return None;
         }
@@ -1623,20 +1645,13 @@ impl DialogueManager {
         // On 模式：恢复引擎的文本（含证据链/追问/回执 id）取代生成器措辞；
         // Observe 模式只记台账，文本不变。
         let text = match &recovery_attempt {
-            Some(attempt)
-                if self.recovery_mode == RecoveryMode::On && !attempt.text.is_empty() =>
-            {
+            Some(attempt) if self.recovery_mode == RecoveryMode::On && !attempt.text.is_empty() => {
                 attempt.text.clone()
             }
             _ => text,
         };
-        let (text, plans) = self.apply_warrant(
-            text,
-            plans,
-            warrant.as_ref(),
-            &frame.kind,
-            answer.is_some(),
-        );
+        let (text, plans) =
+            self.apply_warrant(text, plans, warrant.as_ref(), &frame.kind, answer.is_some());
 
         let mut provenance = answer
             .as_deref()
@@ -1821,7 +1836,12 @@ impl DialogueManager {
             question: None,
             inherited: false,
         };
-        self.record_turn_trace(&frame, &frame.entity, Some(&reply), &["用户更正".to_string()]);
+        self.record_turn_trace(
+            &frame,
+            &frame.entity,
+            Some(&reply),
+            &["用户更正".to_string()],
+        );
         Some(reply)
     }
 
@@ -1924,7 +1944,8 @@ impl DialogueManager {
                 self.trace.resolve_open_qud();
             }
             None => {
-                self.trace.record_defer(turn_no, interpret, "知识管线未接管本轮输入");
+                self.trace
+                    .record_defer(turn_no, interpret, "知识管线未接管本轮输入");
             }
         }
     }
@@ -2130,7 +2151,10 @@ impl DialogueManager {
             text.push_str(&format!("当前话题焦点是「{}」。", focus));
         }
         if !self.externals.is_empty() {
-            text.push_str(&format!("另外你还输入了 {} 条其他指令。", self.externals.len()));
+            text.push_str(&format!(
+                "另外你还输入了 {} 条其他指令。",
+                self.externals.len()
+            ));
         }
         text
     }
@@ -2164,8 +2188,7 @@ impl DialogueManager {
     pub fn explain_last(&self) -> String {
         let Some(turn) = self.last_answered_turn() else {
             return self.failure_self_description().unwrap_or_else(|| {
-                "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。"
-                    .to_string()
+                "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。".to_string()
             });
         };
         let provenance = if turn.provenance.is_empty() {
@@ -2215,13 +2238,18 @@ impl DialogueManager {
         };
         let attributes = knowledge.known_attributes(entity);
         for attribute in attributes.iter().filter(|attribute| {
-            !self
-                .turns
-                .iter()
-                .any(|turn| turn.entity.as_deref() == Some(entity) && turn.attribute.as_deref() == Some(attribute.as_str()))
+            !self.turns.iter().any(|turn| {
+                turn.entity.as_deref() == Some(entity)
+                    && turn.attribute.as_deref() == Some(attribute.as_str())
+            })
         }) {
             if let Some(answer) = self.lookup_attribute(knowledge, entity, attribute) {
-                return format!("接着说说「{}」的「{}」：{}", entity, attribute, answer.trim());
+                return format!(
+                    "接着说说「{}」的「{}」：{}",
+                    entity,
+                    attribute,
+                    answer.trim()
+                );
             }
         }
         format!(
@@ -2237,7 +2265,11 @@ impl DialogueManager {
         let mut parts = Vec::new();
         for attribute in knowledge.known_attributes(entity).iter().take(3) {
             if let Some(answer) = self.lookup_attribute(knowledge, entity, attribute) {
-                parts.push(format!("{}：{}", surface_attribute(attribute), answer.trim()));
+                parts.push(format!(
+                    "{}：{}",
+                    surface_attribute(attribute),
+                    answer.trim()
+                ));
             }
         }
         if parts.is_empty() {
@@ -2434,8 +2466,7 @@ impl DialogueManager {
                 Some((id, bindings))
             }
             "clarify_entity" => {
-                let candidates: Vec<String> =
-                    self.focus.iter().rev().take(3).cloned().collect();
+                let candidates: Vec<String> = self.focus.iter().rev().take(3).cloned().collect();
                 match candidates.split_last() {
                     Some((last, rest)) if !rest.is_empty() => {
                         let mut bindings = BindingSet::new();
@@ -2522,8 +2553,7 @@ impl DialogueManager {
         if self.prompt_mode == PromptMode::Off {
             return composed;
         }
-        let Some((spec_id, bindings)) =
-            self.prompt_bindings(policy, frame, entity, answer, more)
+        let Some((spec_id, bindings)) = self.prompt_bindings(policy, frame, entity, answer, more)
         else {
             self.prompt_stats.composed += 1;
             return composed;
@@ -2633,10 +2663,23 @@ fn excerpt(text: &str, limit: usize) -> String {
 }
 
 fn contains_pronoun(text: &str) -> bool {
-    let cleaned = text.replace("其他", "").replace("其中", "").replace("其实", "");
-    ["他们", "她们", "它们", "这个人", "那位", "这位", "他", "她", "它"]
-        .iter()
-        .any(|pronoun| cleaned.contains(pronoun))
+    let cleaned = text
+        .replace("其他", "")
+        .replace("其中", "")
+        .replace("其实", "");
+    [
+        "他们",
+        "她们",
+        "它们",
+        "这个人",
+        "那位",
+        "这位",
+        "他",
+        "她",
+        "它",
+    ]
+    .iter()
+    .any(|pronoun| cleaned.contains(pronoun))
 }
 
 fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
@@ -2647,7 +2690,15 @@ fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
     for _ in 0..3 {
         let mut stripped_once = false;
         for suffix in [
-            "是什么", "是多少", "是谁", "是哪个", "是哪里", "怎么样", "多少", "呢", "吗",
+            "是什么",
+            "是多少",
+            "是谁",
+            "是哪个",
+            "是哪里",
+            "怎么样",
+            "多少",
+            "呢",
+            "吗",
         ] {
             if let Some(stripped) = tail.strip_suffix(suffix) {
                 tail = stripped.trim();
@@ -2710,8 +2761,10 @@ mod tests {
         }
 
         fn with_value(mut self, entity: &str, attribute: &str, value: &str) -> Self {
-            self.values
-                .insert((entity.to_string(), attribute.to_string()), vec![value.to_string()]);
+            self.values.insert(
+                (entity.to_string(), attribute.to_string()),
+                vec![value.to_string()],
+            );
             self
         }
 
@@ -2809,10 +2862,7 @@ mod tests {
     fn test_analyze_attribute_question_ignores_emphasis_fillers() {
         let knowledge = mock();
         let manager = DialogueManager::new();
-        for input in [
-            "姚明的身高到底是多少？",
-            "姚明的身高究竟是多少呢？",
-        ] {
+        for input in ["姚明的身高到底是多少？", "姚明的身高究竟是多少呢？"] {
             let frame = manager.analyze(input, &knowledge);
             assert_eq!(frame.kind, MoveKind::AskAttribute, "{}", input);
             assert_eq!(frame.entity.as_deref(), Some("姚明"), "{}", input);
@@ -2872,7 +2922,10 @@ mod tests {
         );
         assert_eq!(manager.analyze("你好", &knowledge).kind, MoveKind::Greet);
         assert_eq!(manager.analyze("谢谢！", &knowledge).kind, MoveKind::Thanks);
-        assert_eq!(manager.analyze("还有呢", &knowledge).kind, MoveKind::ContinueRequest);
+        assert_eq!(
+            manager.analyze("还有呢", &knowledge).kind,
+            MoveKind::ContinueRequest
+        );
     }
 
     #[test]
@@ -2882,10 +2935,18 @@ mod tests {
         let reply = manager
             .plan_reply("姚明的身高是多少", &knowledge)
             .expect("已知实体且有答案时应接管");
-        assert!(reply.plan.iter().any(|plan| plan == "direct_answer"), "策略：{:?}", reply.plan);
+        assert!(
+            reply.plan.iter().any(|plan| plan == "direct_answer"),
+            "策略：{:?}",
+            reply.plan
+        );
         assert!(reply.plan.iter().any(|plan| plan == "offer_related"));
         assert!(reply.text.contains("226"));
-        assert!(reply.text.contains("国籍"), "应附带追问建议：{}", reply.text);
+        assert!(
+            reply.text.contains("国籍"),
+            "应附带追问建议：{}",
+            reply.text
+        );
         assert_eq!(manager.turn_count(), 1);
         assert_eq!(manager.focus_entity(), Some("姚明"));
     }
@@ -2911,7 +2972,9 @@ mod tests {
     fn test_unknown_entity_defers_to_other_pipelines() {
         let knowledge = mock();
         let mut manager = DialogueManager::new();
-        assert!(manager.plan_reply("诸葛亮的身高是多少", &knowledge).is_none());
+        assert!(manager
+            .plan_reply("诸葛亮的身高是多少", &knowledge)
+            .is_none());
         assert_eq!(manager.turn_count(), 0);
     }
 
@@ -2957,8 +3020,16 @@ mod tests {
         let reply = manager
             .plan_pure_dialogue("还有呢", &knowledge)
             .expect("续聊应被接管");
-        assert!(reply.plan.iter().any(|plan| plan == "continue_topic"), "{:?}", reply.plan);
-        assert!(reply.text.contains("国籍"), "应挑未问过的属性：{}", reply.text);
+        assert!(
+            reply.plan.iter().any(|plan| plan == "continue_topic"),
+            "{:?}",
+            reply.plan
+        );
+        assert!(
+            reply.text.contains("国籍"),
+            "应挑未问过的属性：{}",
+            reply.text
+        );
     }
 
     #[test]
@@ -3120,9 +3191,7 @@ mod tests {
         manager.plan_reply("姚明是谁", &knowledge).unwrap();
         let thanks = manager.plan_pure_dialogue("谢谢！", &knowledge).unwrap();
         assert!(thanks.text.contains("姚明"));
-        let farewell = manager
-            .plan_pure_dialogue("再见", &knowledge)
-            .unwrap();
+        let farewell = manager.plan_pure_dialogue("再见", &knowledge).unwrap();
         assert!(farewell.text.contains("1 轮"));
     }
 
@@ -3211,7 +3280,10 @@ mod tests {
             stats.mismatch_examples
         );
         assert_eq!(stats.ungrounded, 0, "缺槽位：{:?}", stats.missing_slots);
-        assert_eq!(stats.composed, 3, "recap/continue/elaborate 应保持组合生成器");
+        assert_eq!(
+            stats.composed, 3,
+            "recap/continue/elaborate 应保持组合生成器"
+        );
     }
 
     #[test]
@@ -3264,7 +3336,10 @@ mod tests {
         let mut restored = DialogueManager::new();
         restored.restore(&snapshot);
         assert!(restored.board().is_active());
-        assert_eq!(restored.board().frame_count(), manager.board().frame_count());
+        assert_eq!(
+            restored.board().frame_count(),
+            manager.board().frame_count()
+        );
         assert_eq!(restored.turn_count(), manager.turn_count());
 
         let sorted = restored
@@ -3348,9 +3423,16 @@ mod tests {
             .find(|turn| !turn.corrections.is_empty())
             .expect("应有更正轮迹");
         assert!(
-            correction_turn.nodes.iter().any(|node| node.kind == "reply"),
+            correction_turn
+                .nodes
+                .iter()
+                .any(|node| node.kind == "reply"),
             "更正轮应同时含回复节点：{:?}",
-            correction_turn.nodes.iter().map(|n| &n.kind).collect::<Vec<_>>()
+            correction_turn
+                .nodes
+                .iter()
+                .map(|n| &n.kind)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3360,13 +3442,21 @@ mod tests {
         let mut manager = DialogueManager::new();
         manager.set_trace_mode(TraceMode::On);
         manager.plan_reply("姚明的身高是多少", &knowledge).unwrap();
-        manager.plan_reply("不对，姚明的身高是 190", &knowledge).unwrap();
+        manager
+            .plan_reply("不对，姚明的身高是 190", &knowledge)
+            .unwrap();
         let snapshot = manager.snapshot();
         let mut restored = DialogueManager::new();
         restored.set_trace_mode(TraceMode::On);
         restored.restore(&snapshot);
         assert_eq!(restored.trace_store().predicate_focus(), Some("身高"));
-        assert_eq!(restored.trace_store().value_override("姚明", "身高"), Some("190"));
-        assert_eq!(restored.trace_store().turn_count(), manager.trace_store().turn_count());
+        assert_eq!(
+            restored.trace_store().value_override("姚明", "身高"),
+            Some("190")
+        );
+        assert_eq!(
+            restored.trace_store().turn_count(),
+            manager.trace_store().turn_count()
+        );
     }
 }

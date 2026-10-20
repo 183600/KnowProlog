@@ -56,9 +56,10 @@ impl SeedKnowledge {
             "姚明的身高是什么".to_string(),
             "姚明的身高是 226 厘米。".to_string(),
         );
-        knowledge
-            .values
-            .insert(("姚明".to_string(), "国籍".to_string()), vec!["中国".to_string()]);
+        knowledge.values.insert(
+            ("姚明".to_string(), "国籍".to_string()),
+            vec!["中国".to_string()],
+        );
         knowledge
     }
 
@@ -211,7 +212,11 @@ struct TurnObservation {
 }
 
 /// 跑一个场景（模式固定），返回逐轮观察。
-fn run_scenario(knowledge: &SeedKnowledge, mode: RecoveryMode, inputs: &[&str]) -> Vec<TurnObservation> {
+fn run_scenario(
+    knowledge: &SeedKnowledge,
+    mode: RecoveryMode,
+    inputs: &[&str],
+) -> Vec<TurnObservation> {
     let mut manager = DialogueManager::new();
     manager.set_recovery_mode(mode);
     let mut observations = Vec::new();
@@ -238,7 +243,9 @@ fn run_scenario(knowledge: &SeedKnowledge, mode: RecoveryMode, inputs: &[&str]) 
         observations.push(TurnObservation {
             status,
             level: notice.map(|notice| notice.level.clone()),
-            receipt: notice.and_then(|notice| notice.receipt_id.clone()).is_some(),
+            receipt: notice
+                .and_then(|notice| notice.receipt_id.clone())
+                .is_some(),
             evidence: notice.map(|notice| notice.evidence.len()).unwrap_or(0),
             text_len: reply.text.chars().count(),
             named: status.is_some_and(|status| status_is_named(status, &reply.text)),
@@ -297,12 +304,27 @@ impl EvalRecoveryReport {
 
     pub fn flatten_metrics(&self) -> BTreeMap<String, f64> {
         let mut metrics = BTreeMap::new();
-        metrics.insert("recovery.silent_failure_rate".to_string(), self.silent_failure_rate);
-        metrics.insert("recovery.named_failure_rate".to_string(), self.named_failure_rate);
-        metrics.insert("recovery.receipt_coverage".to_string(), self.receipt_coverage);
+        metrics.insert(
+            "recovery.silent_failure_rate".to_string(),
+            self.silent_failure_rate,
+        );
+        metrics.insert(
+            "recovery.named_failure_rate".to_string(),
+            self.named_failure_rate,
+        );
+        metrics.insert(
+            "recovery.receipt_coverage".to_string(),
+            self.receipt_coverage,
+        );
         metrics.insert("recovery.evidence_rate".to_string(), self.evidence_rate);
-        metrics.insert("recovery.ratification_rate".to_string(), self.ratification_rate);
-        metrics.insert("recovery.fault_named_rate".to_string(), self.fault_named_rate);
+        metrics.insert(
+            "recovery.ratification_rate".to_string(),
+            self.ratification_rate,
+        );
+        metrics.insert(
+            "recovery.fault_named_rate".to_string(),
+            self.fault_named_rate,
+        );
         metrics.insert("recovery.off_purity".to_string(), self.off_purity);
         for (level, count) in &self.ladder {
             metrics.insert(format!("recovery.ladder.{}.count", level), *count as f64);
@@ -338,7 +360,10 @@ pub fn evaluate_seed() -> EvalRecoveryReport {
         for observation in &observations {
             digest_inputs.push_str(name);
             digest_inputs.push_str(&observation.plan.join("+"));
-            digest_inputs.push_str(&format!("|{}|{}", observation.evidence, observation.text_len));
+            digest_inputs.push_str(&format!(
+                "|{}|{}",
+                observation.evidence, observation.text_len
+            ));
             // 裁定/接收轮是回执的关闭动作，不是新失败：只参与 ratification 统计。
             let is_closure = observation
                 .plan
@@ -410,7 +435,13 @@ pub fn evaluate_seed() -> EvalRecoveryReport {
         }
     }
 
-    let ratio = |part: usize, whole: usize| if whole == 0 { 1.0 } else { part as f64 / whole as f64 };
+    let ratio = |part: usize, whole: usize| {
+        if whole == 0 {
+            1.0
+        } else {
+            part as f64 / whole as f64
+        }
+    };
     EvalRecoveryReport {
         corpus_digest: corpus_digest(),
         scenarios: corpus.len(),

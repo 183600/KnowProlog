@@ -56,15 +56,21 @@ pub enum Elem {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ElemRepr {
-    Pos { pos: String },
-    Word { surface: String },
+    Pos {
+        pos: String,
+    },
+    Word {
+        surface: String,
+    },
     Slot {
         name: String,
         sort: String,
         hints: Vec<String>,
     },
     Any,
-    Optional { inner: serde_json::Value },
+    Optional {
+        inner: serde_json::Value,
+    },
 }
 
 impl From<&Elem> for ElemRepr {
@@ -74,11 +80,7 @@ impl From<&Elem> for ElemRepr {
             Elem::Word { surface } => ElemRepr::Word {
                 surface: surface.clone(),
             },
-            Elem::Slot {
-                name,
-                sort,
-                hints,
-            } => ElemRepr::Slot {
+            Elem::Slot { name, sort, hints } => ElemRepr::Slot {
                 name: name.clone(),
                 sort: sort.clone(),
                 hints: hints.clone(),
@@ -99,15 +101,7 @@ impl TryFrom<ElemRepr> for Elem {
         Ok(match repr {
             ElemRepr::Pos { pos } => Elem::Pos { pos },
             ElemRepr::Word { surface } => Elem::Word { surface },
-            ElemRepr::Slot {
-                name,
-                sort,
-                hints,
-            } => Elem::Slot {
-                name,
-                sort,
-                hints,
-            },
+            ElemRepr::Slot { name, sort, hints } => Elem::Slot { name, sort, hints },
             ElemRepr::Any => Elem::Any,
             ElemRepr::Optional { inner } => Elem::Optional(Box::new(
                 serde_json::from_value(inner).map_err(|e| e.to_string())?,
@@ -328,7 +322,13 @@ impl PatternEntry {
     /// 条目身份 = FNV(IR + 路由类型 + 来源)：同定义同 id，可作 RDF 主语。
     pub fn id(&self) -> String {
         fnv1a_hex(
-            format!("{}\u{0}{}\u{0}{}", self.ir_json(), self.query_type, self.source).as_bytes(),
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                self.ir_json(),
+                self.query_type,
+                self.source
+            )
+            .as_bytes(),
         )
     }
 
@@ -481,7 +481,9 @@ fn is_skippable(text: &str) -> bool {
     text.trim().is_empty() || matches!(text, "？" | "。" | "，" | "、")
 }
 
-const CITY_LITERALS: &[&str] = &["厦门", "北京", "上海", "广州", "深圳", "杭州", "南京", "武汉"];
+const CITY_LITERALS: &[&str] = &[
+    "厦门", "北京", "上海", "广州", "深圳", "杭州", "南京", "武汉",
+];
 const PERSON_LITERALS: &[&str] = &["姚明", "刘德华", "张三", "李四", "王五", "李明"];
 const DATE_WORDS: &[&str] = &["明天", "后天", "今天", "昨天", "大后天"];
 
@@ -503,9 +505,7 @@ fn sort_matches(sort: &str, hints: &[String], token: &crate::nlp::TaggedWord) ->
                         || token.text.contains('年')))
                 || hints.iter().any(|hint| token.text.contains(hint.as_str()))
         }
-        "人名" => {
-            token.pos == "nr" || PERSON_LITERALS.contains(&token.text.as_str())
-        }
+        "人名" => token.pos == "nr" || PERSON_LITERALS.contains(&token.text.as_str()),
         "数量" => token.pos == "m" || token.text.chars().all(|c| c.is_numeric()),
         "实体" => {
             token.pos == "nr"
@@ -539,7 +539,9 @@ fn attempt_elem(
 ) -> Result<Attempt, String> {
     let token = &tokens[pos];
     match elem {
-        Elem::Optional(inner) => attempt_elem(inner, pattern, index, tokens, pos).or(Ok(Attempt::Absent)),
+        Elem::Optional(inner) => {
+            attempt_elem(inner, pattern, index, tokens, pos).or(Ok(Attempt::Absent))
+        }
         Elem::Pos { pos: expected } if expected == "nr" => {
             if token.pos != "nr" && token.pos != "unknown" {
                 return Err(format!(
@@ -555,9 +557,7 @@ fn attempt_elem(
                 Some(Elem::Word { surface }) => Some(surface.as_str()),
                 _ => None,
             };
-            while end < tokens.len()
-                && (tokens[end].pos == "unknown" || tokens[end].pos == "nr")
-            {
+            while end < tokens.len() && (tokens[end].pos == "unknown" || tokens[end].pos == "nr") {
                 if next_literal == Some(tokens[end].text.as_str()) {
                     break;
                 }
@@ -1073,7 +1073,11 @@ pub fn render_match_report(input: &str, report: &MatchReport) -> String {
                     outcome.query_type,
                     span,
                     specificity,
-                    if outcome.route { "" } else { "（意图展示，不路由）" }
+                    if outcome.route {
+                        ""
+                    } else {
+                        "（意图展示，不路由）"
+                    }
                 );
             }
         }
@@ -1083,13 +1087,23 @@ pub fn render_match_report(input: &str, report: &MatchReport) -> String {
         let _ = writeln!(out, " 未命中（{}，前 3 条原因）：", report.failed.len());
         for outcome in report.failed.iter().take(3) {
             if let CandidateStatus::Failed { reason } = &outcome.status {
-                let _ = writeln!(out, "  - {}（#{}）：{}", outcome.name, &outcome.id.chars().take(8).collect::<String>(), reason);
+                let _ = writeln!(
+                    out,
+                    "  - {}（#{}）：{}",
+                    outcome.name,
+                    &outcome.id.chars().take(8).collect::<String>(),
+                    reason
+                );
             }
         }
     }
 
     for (a, b, span) in report.conflicts() {
-        let _ = writeln!(out, " 冲突：「{}」与「{}」同覆盖 {} 但路由不同。", a, b, span);
+        let _ = writeln!(
+            out,
+            " 冲突：「{}」与「{}」同覆盖 {} 但路由不同。",
+            a, b, span
+        );
     }
     out
 }
@@ -1156,9 +1170,11 @@ pub fn subsumes(a: &PatternEntry, b: &PatternEntry) -> bool {
     if a.elems.len() > b.elems.len() {
         return false;
     }
-    a.elems.iter().enumerate().all(|(i, elem)| {
-        elem_subsumes(elem, &b.elems[i])
-    }) && a.elems != b.elems
+    a.elems
+        .iter()
+        .enumerate()
+        .all(|(i, elem)| elem_subsumes(elem, &b.elems[i]))
+        && a.elems != b.elems
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1205,10 +1221,7 @@ pub fn lint(library: &PatternLibrary) -> Vec<LintFinding> {
                     LintKind::Conflict
                 };
                 let detail = if kind == LintKind::Redundant {
-                    format!(
-                        "IR 完全相同且同路由（{}），两条定义只需其一",
-                        a.query_type
-                    )
+                    format!("IR 完全相同且同路由（{}），两条定义只需其一", a.query_type)
                 } else {
                     format!(
                         "IR 完全相同但路由不同：{} vs {}",
@@ -1252,6 +1265,125 @@ pub fn lint(library: &PatternLibrary) -> Vec<LintFinding> {
 }
 
 // ---------------------------------------------------------------------------
+// 模式关系：体检结果落成图边（关系本身是可查询的数据）
+// ---------------------------------------------------------------------------
+
+/// 模式之间的关系：静态体检结论的图视角。
+///
+/// 落图后这些关系就是 `kg:graphs/patterns` 里的普通三元组，
+/// 「哪些模式互斥/冗余/互相遮蔽」由一条 SPARQL 就能问出来，
+/// 不必再靠手写遍历（见 [`relation_edges`] 与 [`relation_quads`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationKind {
+    /// 语言包含：subject 覆盖 object 的语言（评估序下 object 被遮蔽）。
+    Generalizes,
+    /// 同一模式语言且同路由，两处定义只需其一。
+    Redundant,
+    /// 同一模式语言但路由不同：命中即冲突。
+    Conflicts,
+}
+
+impl RelationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            RelationKind::Generalizes => "泛化",
+            RelationKind::Redundant => "冗余",
+            RelationKind::Conflicts => "冲突",
+        }
+    }
+
+    /// 关系谓词 IRI（`kg:ledger/` 命名空间）。
+    pub fn predicate(self) -> &'static str {
+        match self {
+            RelationKind::Generalizes => P_GENERALIZES,
+            RelationKind::Redundant => P_REDUNDANT,
+            RelationKind::Conflicts => P_CONFLICTS,
+        }
+    }
+
+    /// 是否对称（冗余/冲突双向各一条；泛化有方向）。
+    pub fn is_symmetric(self) -> bool {
+        !matches!(self, RelationKind::Generalizes)
+    }
+}
+
+/// 一条模式关系边（端点带稳定 id 与可读名）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationEdge {
+    pub kind: RelationKind,
+    pub subject_id: String,
+    pub subject_name: String,
+    pub object_id: String,
+    pub object_name: String,
+}
+
+impl RelationEdge {
+    pub fn render(&self) -> String {
+        format!(
+            "{}（{}）{}（{}）",
+            self.subject_name,
+            &self.subject_id.chars().take(8).collect::<String>(),
+            self.kind.label(),
+            self.object_name
+        )
+    }
+}
+
+/// 由条目集计算全部模式关系（即静态体检的图视角；确定性、与顺序无关的集合）。
+pub fn relation_edges(entries: &[PatternEntry]) -> Vec<RelationEdge> {
+    let library = PatternLibrary {
+        entries: entries.to_vec(),
+    };
+    lint(&library)
+        .into_iter()
+        .map(|finding| {
+            let kind = match finding.kind {
+                LintKind::Shadowed => RelationKind::Generalizes,
+                LintKind::Redundant => RelationKind::Redundant,
+                LintKind::Conflict => RelationKind::Conflicts,
+            };
+            RelationEdge {
+                kind,
+                subject_id: finding.subject_id,
+                subject_name: finding.subject_name,
+                object_id: finding.object_id,
+                object_name: finding.object_name,
+            }
+        })
+        .collect()
+}
+
+/// 按关系种类计数（图上体检摘要用）。
+pub fn relation_counts(edges: &[RelationEdge]) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for edge in edges {
+        *counts.entry(edge.kind.label()).or_insert(0usize) += 1;
+    }
+    counts
+}
+
+/// 图上体检的 SPARQL：直接在模式命名图里数三种关系的边数。
+pub fn relation_count_sparql() -> String {
+    let predicates = [
+        RelationKind::Generalizes.predicate(),
+        RelationKind::Redundant.predicate(),
+        RelationKind::Conflicts.predicate(),
+    ]
+    .iter()
+    .map(|iri| format!("<{}>", iri))
+    .collect::<Vec<_>>()
+    .join(", ");
+    format!(
+        "SELECT ?rel (COUNT(*) AS ?n) WHERE {{ \
+         GRAPH <{graph}> {{ ?subject ?rel ?object FILTER(?rel IN ({predicates})) }} \
+         }} GROUP BY ?rel",
+        graph = PATTERNS_GRAPH,
+        predicates = predicates,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // 模式落图：pattern IR → RDF 命名图（kg:graphs/patterns）
 // ---------------------------------------------------------------------------
 
@@ -1277,6 +1409,9 @@ const P_SOURCE: &str = "http://example.org/kg/ledger/source";
 const P_IR: &str = "http://example.org/kg/ledger/ir";
 const P_FINGERPRINT: &str = "http://example.org/kg/ledger/fingerprint";
 const P_COUNT: &str = "http://example.org/kg/ledger/count";
+const P_GENERALIZES: &str = "http://example.org/kg/ledger/generalizes";
+const P_REDUNDANT: &str = "http://example.org/kg/ledger/redundantWith";
+const P_CONFLICTS: &str = "http://example.org/kg/ledger/conflictsWith";
 
 fn named_node(iri: &str) -> LedgerResult<NamedNode> {
     Ok(NamedNode::new(iri)?)
@@ -1303,12 +1438,16 @@ pub fn library_fingerprint(entries: &[PatternEntry]) -> String {
     fnv1a_hex(ids.join("\n").as_bytes())
 }
 
-/// 生成模式账本的全部四元组（含物化戳）。
+/// 生成模式账本的全部四元组（含物化戳与模式关系边）。
+///
+/// 模式关系（泛化/冗余/冲突）来自 [`relation_edges`]：对称关系双向各一条，
+/// 于是「哪两个模式互斥」在图上是一条反向也走得通的三元组。
 pub fn pattern_quads(entries: &[PatternEntry]) -> LedgerResult<Vec<Quad>> {
     let graph = GraphName::NamedNode(named_node(PATTERNS_GRAPH)?);
     let rdf_type = named_node(RDF_TYPE)?;
     let pattern_class = Term::NamedNode(named_node(PATTERN_CLASS)?);
-    let mut quads: Vec<Quad> = Vec::with_capacity(entries.len() * 8 + 3);
+    let edges = relation_edges(entries);
+    let mut quads: Vec<Quad> = Vec::with_capacity(entries.len() * 8 + edges.len() * 2 + 3);
     for entry in entries {
         let subject = named_node(&format!("{}pattern/{}", LEDGER_NS, entry.id()))?;
         quads.push(Quad::new(
@@ -1338,12 +1477,21 @@ pub fn pattern_quads(entries: &[PatternEntry]) -> LedgerResult<Vec<Quad>> {
         )?);
         quads.push(literal_quad(&subject, P_SOURCE, &entry.source, &graph)?);
         quads.push(literal_quad(&subject, P_IR, &entry.render(), &graph)?);
-        quads.push(literal_quad(
-            &subject,
-            P_FINGERPRINT,
-            &entry.id(),
-            &graph,
-        )?);
+        quads.push(literal_quad(&subject, P_FINGERPRINT, &entry.id(), &graph)?);
+    }
+    for edge in &edges {
+        let subject = named_node(&format!("{}pattern/{}", LEDGER_NS, edge.subject_id))?;
+        let object = named_node(&format!("{}pattern/{}", LEDGER_NS, edge.object_id))?;
+        let predicate = named_node(edge.kind.predicate())?;
+        quads.push(Quad::new(
+            subject.clone(),
+            predicate.clone(),
+            object.clone(),
+            graph.clone(),
+        ));
+        if edge.kind.is_symmetric() {
+            quads.push(Quad::new(object, predicate, subject, graph.clone()));
+        }
     }
     let stamp = named_node(STAMP_SUBJECT)?;
     quads.push(Quad::new(
@@ -1456,14 +1604,21 @@ mod tests {
         // IR 指纹只看 IR
         assert_eq!(a.ir_fingerprint(), c.ir_fingerprint());
         // 序列不同 → 指纹不同
-        let d = PatternEntry::new("x", "config.toml#x", "q1", 1, true, vec![
-            Elem::pos("ns"),
-            Elem::word("首都"),
-        ]);
+        let d = PatternEntry::new(
+            "x",
+            "config.toml#x",
+            "q1",
+            1,
+            true,
+            vec![Elem::pos("ns"), Elem::word("首都")],
+        );
         assert_ne!(a.ir_fingerprint(), d.ir_fingerprint());
         // 指纹稳定（可逐字节断言）
         assert_eq!(a.ir_fingerprint().len(), 16);
-        assert_eq!(a.ir_fingerprint(), PatternEntry::new("y", "s", "q1", 0, true, vec![Elem::pos("ns")]).ir_fingerprint());
+        assert_eq!(
+            a.ir_fingerprint(),
+            PatternEntry::new("y", "s", "q1", 0, true, vec![Elem::pos("ns")]).ir_fingerprint()
+        );
     }
 
     #[test]
@@ -1500,7 +1655,10 @@ mod tests {
         let m = library.match_route(&tokens).expect("应命中首都查询");
         assert_eq!(m.entry.name, "首都查询");
         assert_eq!(m.entities, vec!["法国"]);
-        assert_eq!(m.bindings.get("entity.1").map(|t| t.render_raw()), Some(Some("法国".to_string())));
+        assert_eq!(
+            m.bindings.get("entity.1").map(|t| t.render_raw()),
+            Some(Some("法国".to_string()))
+        );
         assert_eq!(m.span, Span::new(0, 5));
         assert_eq!(m.entity_spans, vec![Span::new(0, 1)]);
         // 覆盖末尾标点不参与
@@ -1543,7 +1701,11 @@ mod tests {
             .into_iter()
             .find(|d| d.name == "天气")
             .expect("天气领域存在");
-        let intent = domain.intents.iter().find(|i| i.name == "天气查询").unwrap();
+        let intent = domain
+            .intents
+            .iter()
+            .find(|i| i.name == "天气查询")
+            .unwrap();
         for pattern in &intent.patterns {
             library.add(PatternEntry::from_nlu_intent(&domain, intent, pattern));
         }
@@ -1571,8 +1733,16 @@ mod tests {
             .into_iter()
             .find(|d| d.name == "天气")
             .expect("天气领域存在");
-        let intent = domain.intents.iter().find(|i| i.name == "天气查询").unwrap();
-        library.add(PatternEntry::from_nlu_intent(&domain, intent, intent.patterns[0].as_str()));
+        let intent = domain
+            .intents
+            .iter()
+            .find(|i| i.name == "天气查询")
+            .unwrap();
+        library.add(PatternEntry::from_nlu_intent(
+            &domain,
+            intent,
+            intent.patterns[0].as_str(),
+        ));
         let tokens = tagged(&[("厦门", "ns"), ("明天", "t"), ("天气", "n")]);
         let report = library.rank(&tokens);
         assert!(report.winner.is_none(), "NLU 意图不参与路由");
@@ -1603,7 +1773,11 @@ mod tests {
             CandidateStatus::Failed { reason } => reason.clone(),
             other => panic!("期望失败，得到 {:?}", other),
         };
-        assert!(reason.contains("第1要素"), "原因应指出首个失配要素：{}", reason);
+        assert!(
+            reason.contains("第1要素"),
+            "原因应指出首个失配要素：{}",
+            reason
+        );
     }
 
     #[test]
@@ -1639,9 +1813,14 @@ mod tests {
             .teach("老家", "{人} 的 老家", "hometown_query", 20)
             .expect("教学应成功");
         assert_eq!(library.route_count(), 4);
-        assert_eq!(library.get(&entry.short_id()).map(|e| e.name.as_str()), Some("老家"));
+        assert_eq!(
+            library.get(&entry.short_id()).map(|e| e.name.as_str()),
+            Some("老家")
+        );
         let tokens = tagged(&[("姚明", "nr"), ("的", "u"), ("老家", "n")]);
-        let m = library.match_route(&tokens).expect("教学模式应立即参与路由");
+        let m = library
+            .match_route(&tokens)
+            .expect("教学模式应立即参与路由");
         assert_eq!(m.entry.query_type, "hometown_query");
         assert_eq!(m.entities, vec!["姚明"]);
         // 同 id 重复教学 → 替换不新增
@@ -1657,31 +1836,57 @@ mod tests {
     #[test]
     fn lint_flags_duplicate_conflict_and_shadow() {
         let mut library = PatternLibrary::new();
-        library.add(PatternEntry::new("泛化", "config.toml#a", "q_gen", 10, true, vec![
-            Elem::slot("实体", "实体"),
-            Elem::word("的"),
-            Elem::slot("属性", "属性"),
-        ]));
-        library.add(PatternEntry::new("特化", "config.toml#b", "q_spec", 5, true, vec![
-            Elem::pos("nr"),
-            Elem::word("的"),
-            Elem::pos("n"),
-        ]));
+        library.add(PatternEntry::new(
+            "泛化",
+            "config.toml#a",
+            "q_gen",
+            10,
+            true,
+            vec![
+                Elem::slot("实体", "实体"),
+                Elem::word("的"),
+                Elem::slot("属性", "属性"),
+            ],
+        ));
+        library.add(PatternEntry::new(
+            "特化",
+            "config.toml#b",
+            "q_spec",
+            5,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
         // IR 相同、路由不同 → 冲突
-        library.add(PatternEntry::new("复刻", "taught#会话", "q_other", 3, true, vec![
-            Elem::pos("nr"),
-            Elem::word("的"),
-            Elem::pos("n"),
-        ]));
+        library.add(PatternEntry::new(
+            "复刻",
+            "taught#会话",
+            "q_other",
+            3,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
         // IR+路由+来源不同的完全重复（相对另一条同 IR 同路由）
-        library.add(PatternEntry::new("重复", "taught#会话2", "q_gen", 9, true, vec![
-            Elem::slot("实体", "实体"),
-            Elem::word("的"),
-            Elem::slot("属性", "属性"),
-        ]));
+        library.add(PatternEntry::new(
+            "重复",
+            "taught#会话2",
+            "q_gen",
+            9,
+            true,
+            vec![
+                Elem::slot("实体", "实体"),
+                Elem::word("的"),
+                Elem::slot("属性", "属性"),
+            ],
+        ));
         let findings = lint(&library);
-        assert!(findings.iter().any(|f| f.kind == LintKind::Conflict), "应检出 IR 同路由不同");
-        assert!(findings.iter().any(|f| f.kind == LintKind::Redundant), "应检出重复定义");
+        assert!(
+            findings.iter().any(|f| f.kind == LintKind::Conflict),
+            "应检出 IR 同路由不同"
+        );
+        assert!(
+            findings.iter().any(|f| f.kind == LintKind::Redundant),
+            "应检出重复定义"
+        );
         assert!(
             findings.iter().any(|f| f.kind == LintKind::Shadowed),
             "应检出泛化遮蔽特化：{:?}",
@@ -1698,7 +1903,14 @@ mod tests {
 
     #[test]
     fn subsumption_is_conservative() {
-        let general = PatternEntry::new("g", "s", "q", 1, true, vec![Elem::pos("ns"), Elem::word("首都")]);
+        let general = PatternEntry::new(
+            "g",
+            "s",
+            "q",
+            1,
+            true,
+            vec![Elem::pos("ns"), Elem::word("首都")],
+        );
         let specific = PatternEntry::new(
             "sp",
             "s",
@@ -1712,6 +1924,97 @@ mod tests {
         assert!(subsumes(&prefix, &specific));
         assert!(!subsumes(&specific, &prefix), "长不覆盖短");
         assert!(!subsumes(&prefix, &prefix), "自身不构成严格覆盖");
+    }
+
+    #[test]
+    fn relation_edges_mirror_lint_findings() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "泛化",
+            "config.toml#a",
+            "q_gen",
+            10,
+            true,
+            vec![
+                Elem::slot("实体", "实体"),
+                Elem::word("的"),
+                Elem::slot("属性", "属性"),
+            ],
+        ));
+        library.add(PatternEntry::new(
+            "特化",
+            "config.toml#b",
+            "q_spec",
+            5,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
+        library.add(PatternEntry::new(
+            "复刻",
+            "taught#会话",
+            "q_other",
+            3,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
+        let edges = relation_edges(library.entries());
+        assert!(
+            edges.iter().any(|e| e.kind == RelationKind::Generalizes),
+            "应产出泛化边：{:?}",
+            edges
+        );
+        assert!(
+            edges.iter().any(|e| e.kind == RelationKind::Conflicts),
+            "应产出冲突边：{:?}",
+            edges
+        );
+        // 与 lint 一一对应（图视角就是体检结果的另一面）
+        assert_eq!(edges.len(), lint(&library).len());
+        for edge in &edges {
+            assert_eq!(
+                library.get(&edge.subject_id).map(|e| e.name.as_str()),
+                Some(edge.subject_name.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_quads_carry_relations_and_ignore_them_on_parse() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "A",
+            "config.toml#a",
+            "q1",
+            10,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
+        library.add(PatternEntry::new(
+            "B",
+            "config.toml#b",
+            "q2",
+            5,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
+        let quads = pattern_quads(library.entries()).expect("生成四元组");
+        // IR 同、路由不同 → 冲突，对称关系双向各一条
+        let conflicts: Vec<_> = quads
+            .iter()
+            .filter(|q| q.predicate.as_str() == P_CONFLICTS)
+            .collect();
+        assert_eq!(conflicts.len(), 2, "冲突关系应对称落图");
+        // 关系边不干扰条目还原
+        let restored = parse_pattern_graph(quads.into_iter());
+        assert_eq!(restored.len(), 2);
+    }
+
+    #[test]
+    fn relation_count_sparql_targets_pattern_graph() {
+        let query = relation_count_sparql();
+        assert!(query.contains(PATTERNS_GRAPH));
+        assert!(query.contains(P_CONFLICTS));
+        assert!(query.contains("GROUP BY"));
     }
 
     #[test]
@@ -1771,10 +2074,7 @@ mod tests {
         ];
         let mut agreements = 0usize;
         for input in corpus {
-            for tokens in [
-                preprocess(input, &config.nlp),
-                manual_tokens(input),
-            ] {
+            for tokens in [preprocess(input, &config.nlp), manual_tokens(input)] {
                 let legacy = analyze_query_intent(&tokens, &legacy_rules);
                 let unified = library.route(&tokens);
                 assert_eq!(
@@ -1787,23 +2087,60 @@ mod tests {
                 }
             }
         }
-        assert!(agreements >= 8, "语料应覆盖足够多的命中样本，实得 {}", agreements);
+        assert!(
+            agreements >= 8,
+            "语料应覆盖足够多的命中样本，实得 {}",
+            agreements
+        );
     }
 
     /// 无词典依赖的确定性 token 序列（仅覆盖语料中的高频词）。
     fn manual_tokens(input: &str) -> Vec<TaggedWord> {
         const LEXICON: &[(&str, &str)] = &[
-            ("法国", "ns"), ("阿根廷", "ns"), ("北京", "ns"), ("的", "u"),
-            ("首都", "n"), ("是", "v"), ("哪里", "r"), ("小明", "nr"),
-            ("多大", "r"), ("年龄", "n"), ("张三", "nr"), ("和", "unknown"),
-            ("李四", "nr"), ("什么", "r"), ("关系", "unknown"), ("有", "v"),
-            ("多少", "m"), ("个", "q"), ("人", "n"), ("水", "n"),
-            ("化学", "n"), ("分子式", "n"), ("红楼梦", "n"), ("作者", "n"),
-            ("谁", "r"), ("光合作用", "n"), ("相对论", "n"), ("解释", "v"),
-            ("一下", "v"), ("太阳系", "ns"), ("中", "f"), ("最大", "a"),
-            ("行星", "n"), ("哪一颗", "r"), ("海拔", "n"), ("高度", "n"),
-            ("这", "r"), ("一", "m"), ("句", "q"), ("毫无", "d"),
-            ("意义", "n"), ("话", "n"), ("你好", "l"), ("谢谢", "v"),
+            ("法国", "ns"),
+            ("阿根廷", "ns"),
+            ("北京", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+            ("小明", "nr"),
+            ("多大", "r"),
+            ("年龄", "n"),
+            ("张三", "nr"),
+            ("和", "unknown"),
+            ("李四", "nr"),
+            ("什么", "r"),
+            ("关系", "unknown"),
+            ("有", "v"),
+            ("多少", "m"),
+            ("个", "q"),
+            ("人", "n"),
+            ("水", "n"),
+            ("化学", "n"),
+            ("分子式", "n"),
+            ("红楼梦", "n"),
+            ("作者", "n"),
+            ("谁", "r"),
+            ("光合作用", "n"),
+            ("相对论", "n"),
+            ("解释", "v"),
+            ("一下", "v"),
+            ("太阳系", "ns"),
+            ("中", "f"),
+            ("最大", "a"),
+            ("行星", "n"),
+            ("哪一颗", "r"),
+            ("海拔", "n"),
+            ("高度", "n"),
+            ("这", "r"),
+            ("一", "m"),
+            ("句", "q"),
+            ("毫无", "d"),
+            ("意义", "n"),
+            ("话", "n"),
+            ("你好", "l"),
+            ("谢谢", "v"),
         ];
         // 词面直配（最长优先），未命中字符归入 unknown 单字
         let mut tokens = Vec::new();

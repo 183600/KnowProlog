@@ -122,169 +122,625 @@ pub struct FunctionWord {
 /// 请求 → 语篇 → 动词 → 介词/方位 → 泛化词。渲染输出按此顺序，可 golden。
 pub static REGISTRY: &[FunctionWord] = &[
     // 结构算符
-    FunctionWord { text: "的", roles: &[Role::Attribute] },
-    FunctionWord { text: "是", roles: &[Role::TypeAssertion] },
-    FunctionWord { text: "被", roles: &[Role::Passive] },
-    FunctionWord { text: "由", roles: &[Role::Passive] },
-    FunctionWord { text: "把", roles: &[Role::Topic] },
-    FunctionWord { text: "将", roles: &[Role::Topic] },
-    FunctionWord { text: "和", roles: &[Role::Conjunction] },
-    FunctionWord { text: "与", roles: &[Role::Conjunction] },
-    FunctionWord { text: "以及", roles: &[Role::Conjunction] },
-    FunctionWord { text: "或", roles: &[Role::Conjunction] },
-    FunctionWord { text: "或者", roles: &[Role::Conjunction] },
-    FunctionWord { text: "并且", roles: &[Role::Conjunction] },
-    FunctionWord { text: "而且", roles: &[Role::Conjunction] },
-    FunctionWord { text: "还是", roles: &[Role::Conjunction] },
-    FunctionWord { text: "不", roles: &[Role::Negation] },
-    FunctionWord { text: "没", roles: &[Role::Negation] },
-    FunctionWord { text: "没有", roles: &[Role::Negation] },
-    FunctionWord { text: "无", roles: &[Role::Negation] },
-    FunctionWord { text: "未", roles: &[Role::Negation] },
+    FunctionWord {
+        text: "的",
+        roles: &[Role::Attribute],
+    },
+    FunctionWord {
+        text: "是",
+        roles: &[Role::TypeAssertion],
+    },
+    FunctionWord {
+        text: "被",
+        roles: &[Role::Passive],
+    },
+    FunctionWord {
+        text: "由",
+        roles: &[Role::Passive],
+    },
+    FunctionWord {
+        text: "把",
+        roles: &[Role::Topic],
+    },
+    FunctionWord {
+        text: "将",
+        roles: &[Role::Topic],
+    },
+    FunctionWord {
+        text: "和",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "与",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "以及",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "或",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "或者",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "并且",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "而且",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "还是",
+        roles: &[Role::Conjunction],
+    },
+    FunctionWord {
+        text: "不",
+        roles: &[Role::Negation],
+    },
+    FunctionWord {
+        text: "没",
+        roles: &[Role::Negation],
+    },
+    FunctionWord {
+        text: "没有",
+        roles: &[Role::Negation],
+    },
+    FunctionWord {
+        text: "无",
+        roles: &[Role::Negation],
+    },
+    FunctionWord {
+        text: "未",
+        roles: &[Role::Negation],
+    },
     // 句类
-    FunctionWord { text: "吗", roles: &[Role::TruthCheck] },
-    FunctionWord { text: "吧", roles: &[Role::TruthCheck] },
-    FunctionWord { text: "是不是", roles: &[Role::TruthCheck] },
-    FunctionWord { text: "是否", roles: &[Role::TruthCheck] },
-    FunctionWord { text: "有没有", roles: &[Role::TruthCheck] },
-    FunctionWord { text: "呢", roles: &[Role::FollowUp] },
-    FunctionWord { text: "啊", roles: &[Role::Mood] },
-    FunctionWord { text: "呀", roles: &[Role::Mood] },
+    FunctionWord {
+        text: "吗",
+        roles: &[Role::TruthCheck],
+    },
+    FunctionWord {
+        text: "吧",
+        roles: &[Role::TruthCheck],
+    },
+    FunctionWord {
+        text: "是不是",
+        roles: &[Role::TruthCheck],
+    },
+    FunctionWord {
+        text: "是否",
+        roles: &[Role::TruthCheck],
+    },
+    FunctionWord {
+        text: "有没有",
+        roles: &[Role::TruthCheck],
+    },
+    FunctionWord {
+        text: "呢",
+        roles: &[Role::FollowUp],
+    },
+    FunctionWord {
+        text: "啊",
+        roles: &[Role::Mood],
+    },
+    FunctionWord {
+        text: "呀",
+        roles: &[Role::Mood],
+    },
     // 疑问词
-    FunctionWord { text: "谁", roles: &[Role::WhPerson] },
-    FunctionWord { text: "何人", roles: &[Role::WhPerson] },
-    FunctionWord { text: "哪位", roles: &[Role::WhPerson] },
-    FunctionWord { text: "哪里", roles: &[Role::WhPlace] },
-    FunctionWord { text: "哪儿", roles: &[Role::WhPlace] },
-    FunctionWord { text: "何处", roles: &[Role::WhPlace] },
-    FunctionWord { text: "什么地方", roles: &[Role::WhPlace] },
-    FunctionWord { text: "什么时候", roles: &[Role::WhTime] },
-    FunctionWord { text: "哪年", roles: &[Role::WhTime] },
-    FunctionWord { text: "何时", roles: &[Role::WhTime] },
-    FunctionWord { text: "几时", roles: &[Role::WhTime] },
-    FunctionWord { text: "多少", roles: &[Role::WhQuantity] },
-    FunctionWord { text: "几", roles: &[Role::WhQuantity] },
-    FunctionWord { text: "几个", roles: &[Role::WhQuantity] },
-    FunctionWord { text: "什么", roles: &[Role::WhThing] },
-    FunctionWord { text: "哪", roles: &[Role::WhThing] },
-    FunctionWord { text: "哪个", roles: &[Role::WhThing] },
-    FunctionWord { text: "哪些", roles: &[Role::WhThing] },
-    FunctionWord { text: "为什么", roles: &[Role::WhReason] },
-    FunctionWord { text: "怎么", roles: &[Role::WhReason] },
-    FunctionWord { text: "怎样", roles: &[Role::WhReason] },
-    FunctionWord { text: "如何", roles: &[Role::WhReason] },
+    FunctionWord {
+        text: "谁",
+        roles: &[Role::WhPerson],
+    },
+    FunctionWord {
+        text: "何人",
+        roles: &[Role::WhPerson],
+    },
+    FunctionWord {
+        text: "哪位",
+        roles: &[Role::WhPerson],
+    },
+    FunctionWord {
+        text: "哪里",
+        roles: &[Role::WhPlace],
+    },
+    FunctionWord {
+        text: "哪儿",
+        roles: &[Role::WhPlace],
+    },
+    FunctionWord {
+        text: "何处",
+        roles: &[Role::WhPlace],
+    },
+    FunctionWord {
+        text: "什么地方",
+        roles: &[Role::WhPlace],
+    },
+    FunctionWord {
+        text: "什么时候",
+        roles: &[Role::WhTime],
+    },
+    FunctionWord {
+        text: "哪年",
+        roles: &[Role::WhTime],
+    },
+    FunctionWord {
+        text: "何时",
+        roles: &[Role::WhTime],
+    },
+    FunctionWord {
+        text: "几时",
+        roles: &[Role::WhTime],
+    },
+    FunctionWord {
+        text: "多少",
+        roles: &[Role::WhQuantity],
+    },
+    FunctionWord {
+        text: "几",
+        roles: &[Role::WhQuantity],
+    },
+    FunctionWord {
+        text: "几个",
+        roles: &[Role::WhQuantity],
+    },
+    FunctionWord {
+        text: "什么",
+        roles: &[Role::WhThing],
+    },
+    FunctionWord {
+        text: "哪",
+        roles: &[Role::WhThing],
+    },
+    FunctionWord {
+        text: "哪个",
+        roles: &[Role::WhThing],
+    },
+    FunctionWord {
+        text: "哪些",
+        roles: &[Role::WhThing],
+    },
+    FunctionWord {
+        text: "为什么",
+        roles: &[Role::WhReason],
+    },
+    FunctionWord {
+        text: "怎么",
+        roles: &[Role::WhReason],
+    },
+    FunctionWord {
+        text: "怎样",
+        roles: &[Role::WhReason],
+    },
+    FunctionWord {
+        text: "如何",
+        roles: &[Role::WhReason],
+    },
     // 量词
-    FunctionWord { text: "个", roles: &[Role::Quantifier] },
-    FunctionWord { text: "位", roles: &[Role::Quantifier] },
-    FunctionWord { text: "名", roles: &[Role::Quantifier] },
-    FunctionWord { text: "门", roles: &[Role::Quantifier] },
-    FunctionWord { text: "项", roles: &[Role::Quantifier] },
-    FunctionWord { text: "条", roles: &[Role::Quantifier] },
-    FunctionWord { text: "件", roles: &[Role::Quantifier] },
-    FunctionWord { text: "座", roles: &[Role::Quantifier] },
+    FunctionWord {
+        text: "个",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "位",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "名",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "门",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "项",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "条",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "件",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "座",
+        roles: &[Role::Quantifier],
+    },
     // 回指指代
-    FunctionWord { text: "我", roles: &[Role::Reference] },
-    FunctionWord { text: "你", roles: &[Role::Reference] },
-    FunctionWord { text: "他", roles: &[Role::Reference] },
-    FunctionWord { text: "她", roles: &[Role::Reference] },
-    FunctionWord { text: "它", roles: &[Role::Reference] },
-    FunctionWord { text: "们", roles: &[Role::Reference] },
-    FunctionWord { text: "自己", roles: &[Role::Reference] },
-    FunctionWord { text: "这", roles: &[Role::Reference] },
-    FunctionWord { text: "这个", roles: &[Role::Reference] },
-    FunctionWord { text: "那个", roles: &[Role::Reference] },
-    FunctionWord { text: "这些", roles: &[Role::Reference] },
-    FunctionWord { text: "那么", roles: &[Role::Reference] },
-    FunctionWord { text: "这么", roles: &[Role::Reference] },
-    FunctionWord { text: "这样", roles: &[Role::Reference] },
-    FunctionWord { text: "那样", roles: &[Role::Reference] },
+    FunctionWord {
+        text: "我",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "你",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "他",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "她",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "它",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "们",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "自己",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "这",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "这个",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "那个",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "这些",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "那么",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "这么",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "这样",
+        roles: &[Role::Reference],
+    },
+    FunctionWord {
+        text: "那样",
+        roles: &[Role::Reference],
+    },
     // 体标记
-    FunctionWord { text: "了", roles: &[Role::Aspect] },
-    FunctionWord { text: "着", roles: &[Role::Aspect] },
-    FunctionWord { text: "刚刚", roles: &[Role::Aspect] },
-    FunctionWord { text: "正在", roles: &[Role::Aspect] },
-    FunctionWord { text: "已经", roles: &[Role::Aspect] },
-    FunctionWord { text: "曾经", roles: &[Role::Aspect] },
-    FunctionWord { text: "将要", roles: &[Role::Aspect] },
+    FunctionWord {
+        text: "了",
+        roles: &[Role::Aspect],
+    },
+    FunctionWord {
+        text: "着",
+        roles: &[Role::Aspect],
+    },
+    FunctionWord {
+        text: "刚刚",
+        roles: &[Role::Aspect],
+    },
+    FunctionWord {
+        text: "正在",
+        roles: &[Role::Aspect],
+    },
+    FunctionWord {
+        text: "已经",
+        roles: &[Role::Aspect],
+    },
+    FunctionWord {
+        text: "曾经",
+        roles: &[Role::Aspect],
+    },
+    FunctionWord {
+        text: "将要",
+        roles: &[Role::Aspect],
+    },
     // 情态
-    FunctionWord { text: "可能", roles: &[Role::Modal] },
-    FunctionWord { text: "应该", roles: &[Role::Modal] },
-    FunctionWord { text: "必须", roles: &[Role::Modal] },
-    FunctionWord { text: "需要", roles: &[Role::Modal] },
-    FunctionWord { text: "要", roles: &[Role::Modal] },
-    FunctionWord { text: "会", roles: &[Role::Modal] },
-    FunctionWord { text: "能", roles: &[Role::Modal] },
+    FunctionWord {
+        text: "可能",
+        roles: &[Role::Modal],
+    },
+    FunctionWord {
+        text: "应该",
+        roles: &[Role::Modal],
+    },
+    FunctionWord {
+        text: "必须",
+        roles: &[Role::Modal],
+    },
+    FunctionWord {
+        text: "需要",
+        roles: &[Role::Modal],
+    },
+    FunctionWord {
+        text: "要",
+        roles: &[Role::Modal],
+    },
+    FunctionWord {
+        text: "会",
+        roles: &[Role::Modal],
+    },
+    FunctionWord {
+        text: "能",
+        roles: &[Role::Modal],
+    },
     // 请求包装
-    FunctionWord { text: "请问", roles: &[Role::Request] },
-    FunctionWord { text: "帮我", roles: &[Role::Request] },
-    FunctionWord { text: "告诉", roles: &[Role::Request] },
-    FunctionWord { text: "告诉我", roles: &[Role::Request] },
-    FunctionWord { text: "介绍", roles: &[Role::Request] },
-    FunctionWord { text: "你好", roles: &[Role::Request] },
-    FunctionWord { text: "一下", roles: &[Role::Request] },
-    FunctionWord { text: "一下吗", roles: &[Role::Request, Role::TruthCheck] },
+    FunctionWord {
+        text: "请问",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "帮我",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "告诉",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "告诉我",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "介绍",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "你好",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "一下",
+        roles: &[Role::Request],
+    },
+    FunctionWord {
+        text: "一下吗",
+        roles: &[Role::Request, Role::TruthCheck],
+    },
     // 语篇连接
-    FunctionWord { text: "但是", roles: &[Role::Discourse] },
-    FunctionWord { text: "只是", roles: &[Role::Discourse] },
-    FunctionWord { text: "如果", roles: &[Role::Discourse] },
-    FunctionWord { text: "因为", roles: &[Role::Discourse] },
-    FunctionWord { text: "所以", roles: &[Role::Discourse] },
-    FunctionWord { text: "然后", roles: &[Role::Discourse] },
-    FunctionWord { text: "接着", roles: &[Role::Discourse] },
-    FunctionWord { text: "最后", roles: &[Role::Discourse] },
-    FunctionWord { text: "首先", roles: &[Role::Discourse] },
-    FunctionWord { text: "其次", roles: &[Role::Discourse] },
-    FunctionWord { text: "另外", roles: &[Role::Discourse] },
-    FunctionWord { text: "此外", roles: &[Role::Discourse] },
-    FunctionWord { text: "虽然", roles: &[Role::Discourse] },
-    FunctionWord { text: "可是", roles: &[Role::Discourse] },
-    FunctionWord { text: "然而", roles: &[Role::Discourse] },
-    FunctionWord { text: "不过", roles: &[Role::Discourse] },
-    FunctionWord { text: "只要", roles: &[Role::Discourse] },
-    FunctionWord { text: "除非", roles: &[Role::Discourse] },
-    FunctionWord { text: "无论", roles: &[Role::Discourse] },
-    FunctionWord { text: "不管", roles: &[Role::Discourse] },
-    FunctionWord { text: "即使", roles: &[Role::Discourse] },
-    FunctionWord { text: "哪怕", roles: &[Role::Discourse] },
-    FunctionWord { text: "只有", roles: &[Role::Discourse] },
-    FunctionWord { text: "仅仅", roles: &[Role::Discourse] },
+    FunctionWord {
+        text: "但是",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "只是",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "如果",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "因为",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "所以",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "然后",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "接着",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "最后",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "首先",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "其次",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "另外",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "此外",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "虽然",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "可是",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "然而",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "不过",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "只要",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "除非",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "无论",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "不管",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "即使",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "哪怕",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "只有",
+        roles: &[Role::Discourse],
+    },
+    FunctionWord {
+        text: "仅仅",
+        roles: &[Role::Discourse],
+    },
     // 动词
-    FunctionWord { text: "说", roles: &[Role::LightVerb] },
-    FunctionWord { text: "看", roles: &[Role::LightVerb] },
-    FunctionWord { text: "去", roles: &[Role::LightVerb] },
-    FunctionWord { text: "来", roles: &[Role::LightVerb] },
-    FunctionWord { text: "到", roles: &[Role::LightVerb] },
-    FunctionWord { text: "有", roles: &[Role::LightVerb] },
-    FunctionWord { text: "想要", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "希望", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "愿意", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "喜欢", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "讨厌", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "觉得", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "认为", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "以为", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "知道", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "了解", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "明白", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "理解", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "发现", roles: &[Role::MentalVerb] },
-    FunctionWord { text: "意识", roles: &[Role::MentalVerb] },
+    FunctionWord {
+        text: "说",
+        roles: &[Role::LightVerb],
+    },
+    FunctionWord {
+        text: "看",
+        roles: &[Role::LightVerb],
+    },
+    FunctionWord {
+        text: "去",
+        roles: &[Role::LightVerb],
+    },
+    FunctionWord {
+        text: "来",
+        roles: &[Role::LightVerb],
+    },
+    FunctionWord {
+        text: "到",
+        roles: &[Role::LightVerb],
+    },
+    FunctionWord {
+        text: "有",
+        roles: &[Role::LightVerb],
+    },
+    FunctionWord {
+        text: "想要",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "希望",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "愿意",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "喜欢",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "讨厌",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "觉得",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "认为",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "以为",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "知道",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "了解",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "明白",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "理解",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "发现",
+        roles: &[Role::MentalVerb],
+    },
+    FunctionWord {
+        text: "意识",
+        roles: &[Role::MentalVerb],
+    },
     // 介词 / 方位
-    FunctionWord { text: "在", roles: &[Role::Preposition] },
-    FunctionWord { text: "为", roles: &[Role::Preposition] },
-    FunctionWord { text: "对", roles: &[Role::Preposition] },
-    FunctionWord { text: "里", roles: &[Role::Locative] },
-    FunctionWord { text: "后", roles: &[Role::Locative] },
-    FunctionWord { text: "下", roles: &[Role::Locative] },
+    FunctionWord {
+        text: "在",
+        roles: &[Role::Preposition],
+    },
+    FunctionWord {
+        text: "为",
+        roles: &[Role::Preposition],
+    },
+    FunctionWord {
+        text: "对",
+        roles: &[Role::Preposition],
+    },
+    FunctionWord {
+        text: "里",
+        roles: &[Role::Locative],
+    },
+    FunctionWord {
+        text: "后",
+        roles: &[Role::Locative],
+    },
+    FunctionWord {
+        text: "下",
+        roles: &[Role::Locative],
+    },
     // 泛化词
-    FunctionWord { text: "就", roles: &[Role::Generic] },
-    FunctionWord { text: "都", roles: &[Role::Generic] },
-    FunctionWord { text: "也", roles: &[Role::Generic] },
-    FunctionWord { text: "人", roles: &[Role::Generic] },
-    FunctionWord { text: "一", roles: &[Role::Generic] },
-    FunctionWord { text: "好", roles: &[Role::Generic] },
-    FunctionWord { text: "还", roles: &[Role::Generic] },
-    FunctionWord { text: "才", roles: &[Role::Generic] },
+    FunctionWord {
+        text: "就",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "都",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "也",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "人",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "一",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "好",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "还",
+        roles: &[Role::Generic],
+    },
+    FunctionWord {
+        text: "才",
+        roles: &[Role::Generic],
+    },
 ];
 
 /// 查询某词的角色；未登记返回空切片。
@@ -347,9 +803,40 @@ impl Projection {
 
 /// 稠密检索的停用词快照。
 pub const RETRIEVAL_WORDS: [&str; 34] = [
-    "的", "了", "是", "在", "和", "与", "也", "都", "就", "吗", "呢", "吧", "啊", "什么", "多少",
-    "几", "哪", "哪个", "哪些", "谁", "怎么", "为什么", "如何", "请问", "帮我", "告诉", "我",
-    "一下", "这个", "那个", "他", "她", "它", "们",
+    "的",
+    "了",
+    "是",
+    "在",
+    "和",
+    "与",
+    "也",
+    "都",
+    "就",
+    "吗",
+    "呢",
+    "吧",
+    "啊",
+    "什么",
+    "多少",
+    "几",
+    "哪",
+    "哪个",
+    "哪些",
+    "谁",
+    "怎么",
+    "为什么",
+    "如何",
+    "请问",
+    "帮我",
+    "告诉",
+    "我",
+    "一下",
+    "这个",
+    "那个",
+    "他",
+    "她",
+    "它",
+    "们",
 ];
 
 /// 问题分析的关键词停用词快照。
@@ -361,22 +848,165 @@ pub const QUESTION_WORDS: [&str; 41] = [
 
 /// 语义引擎的词面过滤快照。
 pub const SEMANTIC_WORDS: [&str; 51] = [
-    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要",
-    "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为",
-    "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是", "什么", "怎么", "为什么",
-    "哪里", "那么", "这么", "怎样", "多少", "几个", "如何",
+    "的",
+    "了",
+    "在",
+    "是",
+    "我",
+    "有",
+    "和",
+    "就",
+    "不",
+    "人",
+    "都",
+    "一",
+    "也",
+    "到",
+    "说",
+    "要",
+    "去",
+    "你",
+    "会",
+    "着",
+    "没有",
+    "看",
+    "好",
+    "自己",
+    "这",
+    "他",
+    "还",
+    "来",
+    "个",
+    "对",
+    "为",
+    "把",
+    "里",
+    "后",
+    "才",
+    "能",
+    "下",
+    "这些",
+    "但是",
+    "如果",
+    "只是",
+    "什么",
+    "怎么",
+    "为什么",
+    "哪里",
+    "那么",
+    "这么",
+    "怎样",
+    "多少",
+    "几个",
+    "如何",
 ];
 
 /// 相似度计算的词面过滤快照。
 pub const SIMILARITY_WORDS: [&str; 105] = [
-    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "也", "到", "说", "要",
-    "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "他", "还", "来", "个", "对", "为",
-    "把", "里", "后", "才", "能", "下", "这些", "但是", "如果", "只是", "什么", "怎么", "为什么",
-    "哪里", "那么", "这么", "怎样", "多少", "几个", "如何", "这个", "那个", "这样", "那样", "因为",
-    "所以", "然后", "接着", "最后", "首先", "其次", "另外", "此外", "而且", "并且", "或者", "还是",
-    "虽然", "但是", "可是", "然而", "不过", "只要", "除非", "无论", "不管", "即使", "哪怕", "只有",
-    "只是", "仅仅", "刚刚", "正在", "已经", "曾经", "将要", "可能", "应该", "必须", "需要", "想要",
-    "希望", "愿意", "喜欢", "讨厌", "觉得", "认为", "以为", "知道", "了解", "明白", "理解", "发现",
+    "的",
+    "了",
+    "在",
+    "是",
+    "我",
+    "有",
+    "和",
+    "就",
+    "不",
+    "人",
+    "都",
+    "一",
+    "也",
+    "到",
+    "说",
+    "要",
+    "去",
+    "你",
+    "会",
+    "着",
+    "没有",
+    "看",
+    "好",
+    "自己",
+    "这",
+    "他",
+    "还",
+    "来",
+    "个",
+    "对",
+    "为",
+    "把",
+    "里",
+    "后",
+    "才",
+    "能",
+    "下",
+    "这些",
+    "但是",
+    "如果",
+    "只是",
+    "什么",
+    "怎么",
+    "为什么",
+    "哪里",
+    "那么",
+    "这么",
+    "怎样",
+    "多少",
+    "几个",
+    "如何",
+    "这个",
+    "那个",
+    "这样",
+    "那样",
+    "因为",
+    "所以",
+    "然后",
+    "接着",
+    "最后",
+    "首先",
+    "其次",
+    "另外",
+    "此外",
+    "而且",
+    "并且",
+    "或者",
+    "还是",
+    "虽然",
+    "但是",
+    "可是",
+    "然而",
+    "不过",
+    "只要",
+    "除非",
+    "无论",
+    "不管",
+    "即使",
+    "哪怕",
+    "只有",
+    "只是",
+    "仅仅",
+    "刚刚",
+    "正在",
+    "已经",
+    "曾经",
+    "将要",
+    "可能",
+    "应该",
+    "必须",
+    "需要",
+    "想要",
+    "希望",
+    "愿意",
+    "喜欢",
+    "讨厌",
+    "觉得",
+    "认为",
+    "以为",
+    "知道",
+    "了解",
+    "明白",
+    "理解",
+    "发现",
     "意识",
 ];
 
@@ -385,8 +1015,20 @@ pub const EXTRACTION_WORDS: [&str; 105] = SIMILARITY_WORDS;
 
 /// 实体链接的片段级停用词快照。
 pub const LINKER_SEGMENT_WORDS: [&str; 14] = [
-    "什么", "多少", "哪里", "哪个", "哪些", "怎么", "如何", "为什么", "介绍", "一下", "告诉我",
-    "请问", "你好", "一下吗",
+    "什么",
+    "多少",
+    "哪里",
+    "哪个",
+    "哪些",
+    "怎么",
+    "如何",
+    "为什么",
+    "介绍",
+    "一下",
+    "告诉我",
+    "请问",
+    "你好",
+    "一下吗",
 ];
 
 /// 取得投影的逐词快照。
@@ -419,7 +1061,17 @@ pub fn projection_set(projection: Projection) -> &'static HashSet<&'static str> 
 
 /// 多字疑问标记：不会与普通词冲突，直接子串匹配。
 pub const QUESTION_MARKERS: [&str; 12] = [
-    "谁", "什么", "怎么", "为什么", "如何", "多少", "何人", "何时", "何处", "是不是", "是否",
+    "谁",
+    "什么",
+    "怎么",
+    "为什么",
+    "如何",
+    "多少",
+    "何人",
+    "何时",
+    "何处",
+    "是不是",
+    "是否",
     "有没有",
 ];
 
@@ -442,12 +1094,14 @@ pub fn contains_question_marker(text: &str) -> bool {
                 }
             }
             '呢' => {
-                if !(rest.starts_with('子') || rest.starts_with('绒') || rest.starts_with('喃')) {
+                if !(rest.starts_with('子') || rest.starts_with('绒') || rest.starts_with('喃'))
+                {
                     return true;
                 }
             }
             '几' => {
-                if !(rest.starts_with('乎') || rest.starts_with('何') || rest.starts_with('内')) {
+                if !(rest.starts_with('乎') || rest.starts_with('何') || rest.starts_with('内'))
+                {
                     return true;
                 }
             }
@@ -485,7 +1139,10 @@ pub fn wh_kind(text: &str) -> Option<WhKind> {
     {
         return Some(WhKind::Place);
     }
-    if text.contains("什么时候") || text.contains("哪年") || text.contains("何时") || text.contains("几时")
+    if text.contains("什么时候")
+        || text.contains("哪年")
+        || text.contains("何时")
+        || text.contains("几时")
     {
         return Some(WhKind::Time);
     }
@@ -498,7 +1155,10 @@ pub fn wh_kind(text: &str) -> Option<WhKind> {
     if text.contains("什么") {
         return Some(WhKind::Thing);
     }
-    if text.contains("为什么") || text.contains("怎么") || text.contains("怎样") || text.contains("如何")
+    if text.contains("为什么")
+        || text.contains("怎么")
+        || text.contains("怎样")
+        || text.contains("如何")
     {
         return Some(WhKind::Reason);
     }
@@ -520,7 +1180,10 @@ pub fn answer_type_keywords(question: &str) -> Vec<&'static str> {
 /// 渲染虚词算符表审计视图（确定性：同版本同字节，可 golden）。
 pub fn render_registry_report() -> String {
     let mut out = String::new();
-    out.push_str(&format!("虚词算符表（唯一正本）：{} 条词条\n", REGISTRY.len()));
+    out.push_str(&format!(
+        "虚词算符表（唯一正本）：{} 条词条\n",
+        REGISTRY.len()
+    ));
     for entry in REGISTRY {
         let roles = entry
             .roles
@@ -568,9 +1231,40 @@ mod tests {
         assert_eq!(
             RETRIEVAL_WORDS,
             [
-                "的", "了", "是", "在", "和", "与", "也", "都", "就", "吗", "呢", "吧", "啊",
-                "什么", "多少", "几", "哪", "哪个", "哪些", "谁", "怎么", "为什么", "如何",
-                "请问", "帮我", "告诉", "我", "一下", "这个", "那个", "他", "她", "它", "们"
+                "的",
+                "了",
+                "是",
+                "在",
+                "和",
+                "与",
+                "也",
+                "都",
+                "就",
+                "吗",
+                "呢",
+                "吧",
+                "啊",
+                "什么",
+                "多少",
+                "几",
+                "哪",
+                "哪个",
+                "哪些",
+                "谁",
+                "怎么",
+                "为什么",
+                "如何",
+                "请问",
+                "帮我",
+                "告诉",
+                "我",
+                "一下",
+                "这个",
+                "那个",
+                "他",
+                "她",
+                "它",
+                "们"
             ]
         );
 
@@ -587,14 +1281,8 @@ mod tests {
         assert_eq!(SIMILARITY_WORDS, EXTRACTION_WORDS);
         assert_eq!(EXTRACTION_WORDS.len(), 105);
         // 「但是」「只是」各出现两次；集合消费不受影响，快照保留原样
-        assert_eq!(
-            EXTRACTION_WORDS.iter().filter(|w| **w == "但是").count(),
-            2
-        );
-        assert_eq!(
-            EXTRACTION_WORDS.iter().filter(|w| **w == "只是").count(),
-            2
-        );
+        assert_eq!(EXTRACTION_WORDS.iter().filter(|w| **w == "但是").count(), 2);
+        assert_eq!(EXTRACTION_WORDS.iter().filter(|w| **w == "只是").count(), 2);
 
         assert_eq!(LINKER_SEGMENT_WORDS.len(), 14);
         assert!(LINKER_SEGMENT_WORDS.contains(&"一下吗"));
@@ -700,10 +1388,7 @@ mod tests {
             vec!["日期", "时间", "date", "time", "年"]
         );
         // 人优先于地点
-        assert_eq!(
-            answer_type_keywords("谁在哪里"),
-            vec!["人", "person"]
-        );
+        assert_eq!(answer_type_keywords("谁在哪里"), vec!["人", "person"]);
         // 数量/实体槽/原因不产生类型期待
         assert!(answer_type_keywords("有多少员工").is_empty());
         assert!(answer_type_keywords("什么是黑洞").is_empty());

@@ -146,11 +146,9 @@ impl PathWitness {
             .map(|step| step.confidence_bps)
             .min()
             .unwrap_or(10_000);
-        let validity = steps
-            .iter()
-            .fold(Validity::Unbounded, |accumulated, step| {
-                accumulated.intersection(step.validity)
-            });
+        let validity = steps.iter().fold(Validity::Unbounded, |accumulated, step| {
+            accumulated.intersection(step.validity)
+        });
         Self {
             steps,
             confidence_bps,
@@ -271,7 +269,10 @@ impl BlockReason {
                 from,
                 predicate,
                 to,
-            } => format!("「{}」到「{}」的「{}」边被否定记录阻断", from, to, predicate),
+            } => format!(
+                "「{}」到「{}」的「{}」边被否定记录阻断",
+                from, to, predicate
+            ),
             BlockReason::PredicateNotAllowed { from, predicate } => {
                 format!("「{}」的「{}」边不在允许的谓词范围内", from, predicate)
             }
@@ -555,9 +556,7 @@ impl TraversalGraph {
         validity_text: &str,
     ) {
         let validity = crate::temporal::parse_validity(validity_text);
-        self.add_edge_record(
-            PathEdge::new(subject, predicate, object).with_validity(validity),
-        );
+        self.add_edge_record(PathEdge::new(subject, predicate, object).with_validity(validity));
     }
 
     pub fn add_edge_with_years(
@@ -917,10 +916,7 @@ impl TraversalGraph {
             let mut next_keys: BTreeSet<String> = BTreeSet::new();
 
             for prefix in &frontier {
-                let node = prefix
-                    .last()
-                    .map(|step| step.to.as_str())
-                    .unwrap_or(start);
+                let node = prefix.last().map(|step| step.to.as_str()).unwrap_or(start);
                 let candidates = self.outgoing(node, link);
                 let reasons = self.blocked_reasons(node, link, options);
                 for reason in reasons {
@@ -934,11 +930,7 @@ impl TraversalGraph {
                         bundle.truncated = true;
                         break 'levels;
                     }
-                    if candidate.to == start
-                        || prefix
-                            .iter()
-                            .any(|step| step.to == candidate.to)
-                    {
+                    if candidate.to == start || prefix.iter().any(|step| step.to == candidate.to) {
                         continue;
                     }
                     expansions += 1;
@@ -946,10 +938,7 @@ impl TraversalGraph {
                     let mut path = prefix.clone();
                     path.push(candidate);
                     if terminal {
-                        let end = path
-                            .last()
-                            .map(|step| step.to.clone())
-                            .unwrap_or_default();
+                        let end = path.last().map(|step| step.to.clone()).unwrap_or_default();
                         if !self.end_type_allowed(&end, options) {
                             let expected = options
                                 .expected_end_types
@@ -991,8 +980,7 @@ impl TraversalGraph {
                         }
                     } else {
                         let key = witness_prefix_key(start, &path);
-                        if next_keys.insert(key)
-                            && next_frontier.len() < options.beam_width.max(1)
+                        if next_keys.insert(key) && next_frontier.len() < options.beam_width.max(1)
                         {
                             next_frontier.push(path);
                         } else if next_frontier.len() >= options.beam_width.max(1) {
@@ -1139,7 +1127,8 @@ impl TraversalGraph {
                 for partial in &next_frontier {
                     if let Some(back_paths) = backward_seen.get(&partial.node) {
                         for back in back_paths {
-                            if let Some(witness) = join_bidirectional(start, goal, &partial.steps, back)
+                            if let Some(witness) =
+                                join_bidirectional(start, goal, &partial.steps, back)
                             {
                                 if !options.temporal_allows(witness.validity) {
                                     self.push_blocked(
@@ -1419,7 +1408,10 @@ fn path_nodes(start: &str, steps: &[PathStep]) -> BTreeSet<String> {
 fn witness_prefix_key(start: &str, steps: &[PathStep]) -> String {
     let mut key = start.to_string();
     for step in steps {
-        key.push_str(&format!("[{}:{}]->{};", step.predicate, step.inverted, step.to));
+        key.push_str(&format!(
+            "[{}:{}]->{};",
+            step.predicate, step.inverted, step.to
+        ));
     }
     key
 }
@@ -1503,7 +1495,10 @@ mod tests {
         graph.add_edge("王五", "师傅", "钱七");
         let bundle = graph.enumerate_chain(
             "张三",
-            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &[
+                PathPredicate::forward("师傅"),
+                PathPredicate::forward("师傅"),
+            ],
             &TraversalOptions::default(),
         );
         assert_eq!(bundle.witnesses.len(), 2);
@@ -1535,7 +1530,10 @@ mod tests {
         graph.add_edge("王五", "师傅", "赵六");
         let bundle = graph.enumerate_chain(
             "张三",
-            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &[
+                PathPredicate::forward("师傅"),
+                PathPredicate::forward("师傅"),
+            ],
             &TraversalOptions::default(),
         );
         let groups = bundle.answer_groups();
@@ -1549,7 +1547,10 @@ mod tests {
         graph.add_negative_edge("张三", "师傅", "王五");
         let bundle = graph.enumerate_chain(
             "张三",
-            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &[
+                PathPredicate::forward("师傅"),
+                PathPredicate::forward("师傅"),
+            ],
             &TraversalOptions::default(),
         );
         assert!(bundle.witnesses.is_empty());
@@ -1723,11 +1724,7 @@ mod tests {
     #[test]
     fn between_reports_unknown_endpoints() {
         let graph = graph();
-        let bundle = graph.enumerate_between(
-            "不存在的人",
-            "王五",
-            &TraversalOptions::default(),
-        );
+        let bundle = graph.enumerate_between("不存在的人", "王五", &TraversalOptions::default());
         assert!(bundle.witnesses.is_empty());
         assert!(bundle
             .blocked
@@ -1741,11 +1738,7 @@ mod tests {
         graph.add_edge("张三", "认识", "王五");
         graph.add_edge("李四", "认识", "王五");
         graph.add_edge("张三", "认识", "赵六");
-        let bundle = graph.common_neighbors(
-            "张三",
-            "李四",
-            &TraversalOptions::default(),
-        );
+        let bundle = graph.common_neighbors("张三", "李四", &TraversalOptions::default());
         assert_eq!(bundle.witnesses.len(), 1);
         let groups = bundle.intermediary_groups();
         assert_eq!(groups.keys().cloned().collect::<Vec<_>>(), vec!["王五"]);
@@ -1758,11 +1751,7 @@ mod tests {
             allowed_predicates: Some(BTreeSet::from(["别的关系".to_string()])),
             ..TraversalOptions::default()
         };
-        let bundle = graph.enumerate_chain(
-            "张三",
-            &[PathPredicate::forward("师傅")],
-            &options,
-        );
+        let bundle = graph.enumerate_chain("张三", &[PathPredicate::forward("师傅")], &options);
         assert!(bundle.witnesses.is_empty());
         assert!(bundle
             .blocked
@@ -1792,7 +1781,10 @@ mod tests {
         let graph = graph();
         let bundle = graph.enumerate_chain(
             "张三",
-            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &[
+                PathPredicate::forward("师傅"),
+                PathPredicate::forward("师傅"),
+            ],
             &TraversalOptions::default(),
         );
         let text = bundle.witnesses[0].render();
@@ -1807,14 +1799,17 @@ mod tests {
         graph.add_edge_record(PathEdge::new("李四", "师傅", "王五").with_years(2000, 2010));
         let bundle = graph.enumerate_chain(
             "张三",
-            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &[
+                PathPredicate::forward("师傅"),
+                PathPredicate::forward("师傅"),
+            ],
             &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
         );
         assert!(bundle.witnesses.is_empty());
-        assert!(bundle.blocked.iter().any(|blocked| matches!(
-            blocked.reason,
-            BlockReason::TemporalDisjoint { .. }
-        )));
+        assert!(bundle
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::TemporalDisjoint { .. })));
     }
 
     #[test]
@@ -1824,12 +1819,18 @@ mod tests {
         graph.add_edge_record(PathEdge::new("李四", "师傅", "王五").with_years(1995, 1999));
         let bundle = graph.enumerate_chain(
             "张三",
-            &[PathPredicate::forward("师傅"), PathPredicate::forward("师傅")],
+            &[
+                PathPredicate::forward("师傅"),
+                PathPredicate::forward("师傅"),
+            ],
             &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
         );
         assert_eq!(bundle.witnesses.len(), 1);
         assert_eq!(bundle.witnesses[0].end(), Some("王五"));
-        assert_eq!(bundle.witnesses[0].validity, Validity::from_years(1995, 1999));
+        assert_eq!(
+            bundle.witnesses[0].validity,
+            Validity::from_years(1995, 1999)
+        );
         assert!(bundle.witnesses[0].has_common_time());
     }
 
@@ -1843,10 +1844,10 @@ mod tests {
             &TraversalOptions::default().with_temporal(TemporalConstraint::as_of(1995)),
         );
         assert!(strict.witnesses.is_empty());
-        assert!(strict.blocked.iter().any(|blocked| matches!(
-            blocked.reason,
-            BlockReason::TemporalDisjoint { .. }
-        )));
+        assert!(strict
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::TemporalDisjoint { .. })));
 
         let background = graph.enumerate_chain(
             "张三",
@@ -1886,10 +1887,10 @@ mod tests {
             "每条边都与查询区间相交，但三步没有共同时间点：{:?}",
             bundle.witnesses
         );
-        assert!(bundle.blocked.iter().any(|blocked| matches!(
-            blocked.reason,
-            BlockReason::TemporalDisjoint { .. }
-        )));
+        assert!(bundle
+            .blocked
+            .iter()
+            .any(|blocked| matches!(blocked.reason, BlockReason::TemporalDisjoint { .. })));
     }
 
     #[test]

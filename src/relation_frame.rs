@@ -1474,7 +1474,11 @@ impl FrameGate {
         frame_validity.intersection(fact_validity).is_satisfiable()
     }
 
-    fn functional_conflict_values(&self, edge: &FrameEdge, frame_validity: Validity) -> Vec<String> {
+    fn functional_conflict_values(
+        &self,
+        edge: &FrameEdge,
+        frame_validity: Validity,
+    ) -> Vec<String> {
         let functional = self.rules.functional.contains(&edge.predicate)
             || self
                 .registry
@@ -1855,8 +1859,8 @@ pub fn diagnostics_digest(diagnostics: &FrameDiagnostics) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::predicate_registry::PredicateProfileConfig;
+    use std::collections::HashMap;
 
     fn profile(name: &str) -> PredicateProfileConfig {
         PredicateProfileConfig {

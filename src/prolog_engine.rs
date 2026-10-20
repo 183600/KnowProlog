@@ -1,8 +1,8 @@
+use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryResolution, Value};
+use scryer_prolog::machine::Machine;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use scryer_prolog::machine::Machine;
-use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryResolution, Value};
 
 use crate::bindings::{BindingSet, BoundTerm};
 use crate::temporal::{TemporalFact, TimePoint, Validity};
@@ -74,7 +74,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 impl PrologEngine {
     pub fn new() -> Self {
         let machine = Machine::new_lib();
-        
+
         let base_rules = r#"
             % 列表谓词（member/2、length/2 等）
             :- use_module(library(lists)).
@@ -167,7 +167,7 @@ impl PrologEngine {
                 parent_of(Ancestor, Parent),
                 ancestor_of(Parent, Person).
         "#;
-        
+
         let mut engine = Self {
             machine,
             loaded_facts: Vec::new(),
@@ -248,10 +248,14 @@ impl PrologEngine {
 
         self.clear_dynamic_facts()?;
         let mut fact_string = String::with_capacity(facts.len() * 64);
-        
+
         for fact in &facts {
             match fact {
-                PrologFact::Entity { name, entity_type, properties } => {
+                PrologFact::Entity {
+                    name,
+                    entity_type,
+                    properties,
+                } => {
                     let _ = write!(
                         fact_string,
                         "oxigraph_entity('{}', '{}', [",
@@ -278,7 +282,7 @@ impl PrologEngine {
                 }
             }
         }
-        
+
         self.consult_source(fact_string)?;
         self.loaded_facts = facts;
         Ok(())
@@ -288,14 +292,30 @@ impl PrologEngine {
     fn compare_facts(a: &PrologFact, b: &PrologFact) -> Ordering {
         match (a, b) {
             (
-                PrologFact::Entity { name: n1, entity_type: t1, .. },
-                PrologFact::Entity { name: n2, entity_type: t2, .. },
+                PrologFact::Entity {
+                    name: n1,
+                    entity_type: t1,
+                    ..
+                },
+                PrologFact::Entity {
+                    name: n2,
+                    entity_type: t2,
+                    ..
+                },
             ) => n1.cmp(n2).then_with(|| t1.cmp(t2)),
             (PrologFact::Entity { .. }, PrologFact::Relation { .. }) => Ordering::Less,
             (PrologFact::Relation { .. }, PrologFact::Entity { .. }) => Ordering::Greater,
             (
-                PrologFact::Relation { from: f1, rel_type: r1, to: o1 },
-                PrologFact::Relation { from: f2, rel_type: r2, to: o2 },
+                PrologFact::Relation {
+                    from: f1,
+                    rel_type: r1,
+                    to: o1,
+                },
+                PrologFact::Relation {
+                    from: f2,
+                    rel_type: r2,
+                    to: o2,
+                },
             ) => f1.cmp(f2).then_with(|| r1.cmp(r2)).then_with(|| o1.cmp(o2)),
         }
     }
@@ -308,10 +328,7 @@ impl PrologEngine {
     }
 
     /// 与 [`Self::load_temporal_facts`] 相同，但把 consult 失败显式交给调用方。
-    pub fn load_temporal_facts_checked(
-        &mut self,
-        facts: Vec<TemporalFact>,
-    ) -> Result<(), String> {
+    pub fn load_temporal_facts_checked(&mut self, facts: Vec<TemporalFact>) -> Result<(), String> {
         let mut facts = facts;
         facts.sort_by(|left, right| {
             left.sort_key()
@@ -502,7 +519,7 @@ impl PrologEngine {
             }
         }
     }
-    
+
     pub fn generate_prolog_query(pattern: &str, entities: &[String]) -> Option<String> {
         match pattern {
             "age_query" => {
@@ -525,7 +542,10 @@ impl PrologEngine {
             }
             "count_query" => {
                 if let Some(entity_type) = entities.first() {
-                    Some(format!("count_entities('{}', Count)", escape_atom(entity_type)))
+                    Some(format!(
+                        "count_entities('{}', Count)",
+                        escape_atom(entity_type)
+                    ))
                 } else {
                     None
                 }
@@ -598,7 +618,10 @@ impl PrologEngine {
             }
             "concept_query" => {
                 if let Some(concept) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', Type, Properties)", escape_atom(concept)))
+                    Some(format!(
+                        "oxigraph_entity('{}', Type, Properties)",
+                        escape_atom(concept)
+                    ))
                 } else {
                     None
                 }
@@ -613,7 +636,10 @@ impl PrologEngine {
                     ))
                 } else if let Some(entity) = entities.first() {
                     // 单实体查询，查找所有属性
-                    Some(format!("oxigraph_entity('{}', Type, Properties)", escape_atom(entity)))
+                    Some(format!(
+                        "oxigraph_entity('{}', Type, Properties)",
+                        escape_atom(entity)
+                    ))
                 } else {
                     None
                 }
@@ -651,7 +677,9 @@ pub(crate) fn escape_atom(text: &str) -> std::borrow::Cow<'_, str> {
 /// Scryer 值 → 统一类型化绑定（字符串渲染约定只在 [`BoundTerm::render_raw`] 中体现）。
 pub fn bound_from_value(value: &Value) -> BoundTerm {
     match value {
-        Value::Integer(_) | Value::Float(_) => BoundTerm::classify(&prolog_value_to_json_string(value.clone())),
+        Value::Integer(_) | Value::Float(_) => {
+            BoundTerm::classify(&prolog_value_to_json_string(value.clone()))
+        }
         Value::Rational(_) => {
             let raw = prolog_value_to_json_string(value.clone());
             match parse_fraction(&raw) {
@@ -852,7 +880,7 @@ mod tests {
     fn temporal_before_and_after_queries_work() {
         let mut engine = PrologEngine::new();
         engine.load_temporal_facts(vec![
-            TemporalFact::new("东京", "成为首都", "日本").with_years(1868, 1868),
+            TemporalFact::new("东京", "成为首都", "日本").with_years(1868, 1868)
         ]);
         let before = engine.query_outcome(&PrologEngine::temporal_before_query(
             "东京",
@@ -863,7 +891,8 @@ mod tests {
         assert!(matches!(before, QueryOutcome::Solutions(_)));
         let after = engine.query_outcome("temporal_after('东京', '成为首都', '日本', 18000101)");
         assert!(matches!(after, QueryOutcome::Solutions(_)));
-        let not_before = engine.query_outcome("temporal_before('东京', '成为首都', '日本', 18000101)");
+        let not_before =
+            engine.query_outcome("temporal_before('东京', '成为首都', '日本', 18000101)");
         assert_eq!(not_before, QueryOutcome::NoSolution);
     }
 
@@ -882,8 +911,9 @@ mod tests {
         assert!(outcome.is_fault(), "{:?}", outcome);
         assert!(!matches!(outcome, QueryOutcome::NoSolution));
         assert!(engine.last_fault().is_some());
-        assert!(engine
-            .consult_source("p(a).")
-            .is_err(), "停止服务的引擎不接受事实");
+        assert!(
+            engine.consult_source("p(a).").is_err(),
+            "停止服务的引擎不接受事实"
+        );
     }
 }

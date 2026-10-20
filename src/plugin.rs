@@ -152,7 +152,6 @@ impl PluginManifest {
         }
         counts
     }
-
 }
 
 /// 八类声明式贡献。每个贡献都有插件内唯一的 id，并携带一种类型化资产。
@@ -585,15 +584,18 @@ impl PluginRegistry {
             .manifests
             .iter()
             .flat_map(|manifest| {
-                manifest.contributions.iter().filter_map(move |contribution| {
-                    if let Contribution::Template { id, template, .. } = contribution {
-                        parse_template(template).ok().map(|segments| {
-                            (id.clone(), (manifest.id.as_str(), segments))
-                        })
-                    } else {
-                        None
-                    }
-                })
+                manifest
+                    .contributions
+                    .iter()
+                    .filter_map(move |contribution| {
+                        if let Contribution::Template { id, template, .. } = contribution {
+                            parse_template(template)
+                                .ok()
+                                .map(|segments| (id.clone(), (manifest.id.as_str(), segments)))
+                        } else {
+                            None
+                        }
+                    })
             })
             .collect();
         for manifest in &self.manifests {
@@ -669,10 +671,7 @@ impl PluginRegistry {
         if self.issues.is_empty() {
             return "插件清单检查：通过（无问题）。".to_string();
         }
-        let mut lines = vec![format!(
-            "插件清单检查：{} 条问题。",
-            self.issues.len()
-        )];
+        let mut lines = vec![format!("插件清单检查：{} 条问题。", self.issues.len())];
         for issue in &self.issues {
             lines.push(format!("  {}", issue.render()));
         }
@@ -734,11 +733,7 @@ impl PluginRegistry {
             return "插件评测：没有包内评测用例。".to_string();
         }
         let passed = results.iter().filter(|result| result.passed).count();
-        let mut lines = vec![format!(
-            "插件评测：{}/{} 通过。",
-            passed,
-            results.len()
-        )];
+        let mut lines = vec![format!("插件评测：{}/{} 通过。", passed, results.len())];
         for result in results {
             lines.push(format!(
                 "  {} [{}] {} {}",
@@ -815,7 +810,10 @@ fn validate_manifest(manifest: &PluginManifest, file: &Path) -> Vec<PluginIssue>
     issues
 }
 
-fn validate_contribution(manifest: &PluginManifest, contribution: &Contribution) -> Vec<PluginIssue> {
+fn validate_contribution(
+    manifest: &PluginManifest,
+    contribution: &Contribution,
+) -> Vec<PluginIssue> {
     let plugin = Some(manifest.id.as_str());
     let id = contribution.id();
     let mut issues = Vec::new();
@@ -1352,13 +1350,15 @@ impl PluginRuntime {
             last_used: Vec::new(),
         };
         runtime.resolve_initial(desired);
-        runtime.activation_issues.extend(unknown.into_iter().map(|id| {
-            PluginIssue::warning(
-                Some(id),
-                "config.plugins",
-                format!("配置引用了未安装的插件「{}」，已忽略。", id),
-            )
-        }));
+        runtime
+            .activation_issues
+            .extend(unknown.into_iter().map(|id| {
+                PluginIssue::warning(
+                    Some(id),
+                    "config.plugins",
+                    format!("配置引用了未安装的插件「{}」，已忽略。", id),
+                )
+            }));
         runtime
     }
 
@@ -1492,8 +1492,7 @@ impl PluginRuntime {
         self.modes = proposed;
         self.overrides.insert(id.to_string(), mode);
         for dependency in &auto_enabled {
-            self.overrides
-                .insert(dependency.clone(), PluginMode::On);
+            self.overrides.insert(dependency.clone(), PluginMode::On);
         }
         self.resolve_activation_issues();
         if self.modes.get(id) != Some(&mode) {
@@ -1735,9 +1734,7 @@ impl PluginRuntime {
             }
             let next = chosen.output.clone();
             if next == text || !seen.insert(next.clone()) {
-                trace
-                    .notes
-                    .push("改写出现环或空转，已停止。".to_string());
+                trace.notes.push("改写出现环或空转，已停止。".to_string());
                 break;
             }
             text = next;
@@ -1840,7 +1837,6 @@ impl PluginRuntime {
     }
 
     fn lexicon_pairs(&self) -> Vec<(String, String, String, String, PluginMode)> {
-
         let mut pairs = Vec::new();
         for manifest in &self.manifests {
             let mode = self
@@ -2001,7 +1997,11 @@ impl PluginRuntime {
     }
 
     /// 用配方选中的模板渲染答案；任一槽位未接地则回退原答案并记 trace。
-    pub fn compose_answer(&mut self, outcome: &PluginOutcome, answer: &str) -> PluginComposedAnswer {
+    pub fn compose_answer(
+        &mut self,
+        outcome: &PluginOutcome,
+        answer: &str,
+    ) -> PluginComposedAnswer {
         let mut trace = outcome.trace.clone();
         let mut text = answer.to_string();
         let mut notes = Vec::new();
@@ -2077,7 +2077,12 @@ impl PluginRuntime {
                 continue;
             }
             for contribution in &manifest.contributions {
-                if let Contribution::Template { id: template_id, template, .. } = contribution {
+                if let Contribution::Template {
+                    id: template_id,
+                    template,
+                    ..
+                } = contribution
+                {
                     if template_id == id {
                         if let Ok(segments) = parse_template(template) {
                             return Some((manifest.id.clone(), mode, segments));
@@ -2099,7 +2104,10 @@ impl PluginRuntime {
                 continue;
             }
             for contribution in &manifest.contributions {
-                let Contribution::Policy { id, when, reply, .. } = contribution else {
+                let Contribution::Policy {
+                    id, when, reply, ..
+                } = contribution
+                else {
                     continue;
                 };
                 for trigger in when {
@@ -2144,10 +2152,7 @@ impl PluginRuntime {
             self.last_used.sort();
             self.last_used.dedup();
         }
-        Some((
-            reply,
-            format!("plugin:{}:{}", plugin, contribution),
-        ))
+        Some((reply, format!("plugin:{}:{}", plugin, contribution)))
     }
 
     /// 只给文本加固定前后缀；不改变事实句。非启用风格包不参与。
@@ -2170,10 +2175,7 @@ impl PluginRuntime {
             }
             for contribution in &manifest.contributions {
                 if let Contribution::Style {
-                    id,
-                    prefix,
-                    suffix,
-                    ..
+                    id, prefix, suffix, ..
                 } = contribution
                 {
                     if prefix.is_empty() && suffix.is_empty() {
@@ -2485,7 +2487,11 @@ fn render_trace_body(trace: &PluginTrace) -> String {
         format!(
             "  生效：{}{}",
             trace.effective,
-            if trace.changed() { "（已改写）" } else { "（未改写）" }
+            if trace.changed() {
+                "（已改写）"
+            } else {
+                "（未改写）"
+            }
         ),
     ];
     if trace.matches.is_empty() {
@@ -2547,10 +2553,7 @@ struct FrameCandidate {
 }
 
 fn parse_plugin_command(input: &str) -> Option<ParsedPluginCommand> {
-    let trimmed = input
-        .trim()
-        .trim_end_matches(['。', '！', '!'])
-        .trim();
+    let trimmed = input.trim().trim_end_matches(['。', '！', '!']).trim();
     let lower = trimmed.to_lowercase();
     if matches!(
         lower.as_str(),
@@ -2576,7 +2579,12 @@ fn parse_plugin_command(input: &str) -> Option<ParsedPluginCommand> {
     ) {
         return Some(ParsedPluginCommand::Why);
     }
-    for prefix in ["启用插件：", "启用插件:", "plugins enable ", "plugin enable "] {
+    for prefix in [
+        "启用插件：",
+        "启用插件:",
+        "plugins enable ",
+        "plugin enable ",
+    ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let id = rest.trim().trim_matches(['「', '」', '"', '\'']);
             if !id.is_empty() {
@@ -2584,7 +2592,14 @@ fn parse_plugin_command(input: &str) -> Option<ParsedPluginCommand> {
             }
         }
     }
-    for prefix in ["停用插件：", "停用插件:", "禁用插件：", "禁用插件:", "plugins disable ", "plugin disable "] {
+    for prefix in [
+        "停用插件：",
+        "停用插件:",
+        "禁用插件：",
+        "禁用插件:",
+        "plugins disable ",
+        "plugin disable ",
+    ] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let id = rest.trim().trim_matches(['「', '」', '"', '\'']);
             if !id.is_empty() {
@@ -2592,12 +2607,7 @@ fn parse_plugin_command(input: &str) -> Option<ParsedPluginCommand> {
             }
         }
     }
-    for prefix in [
-        "插件模式：",
-        "插件模式:",
-        "plugin mode ",
-        "plugins mode ",
-    ] {
+    for prefix in ["插件模式：", "插件模式:", "plugin mode ", "plugins mode "] {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let rest = rest.trim();
             let (id, mode) = rest
@@ -2677,8 +2687,7 @@ mod tests {
             "{entity}的导演是谁",
         ));
         let registry = PluginRegistry::from_manifests(vec![on, observe]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
 
         let outcome = runtime.rewrite("阿凡达是谁导演的");
         assert_eq!(outcome.text, "阿凡达的导演是谁");
@@ -2723,17 +2732,18 @@ mod tests {
             types: Vec::new(),
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         let outcome = runtime.rewrite("这部影片由谁执导");
         assert_eq!(outcome.text, "这部电影由谁导演");
-        assert!(outcome
-            .trace
-            .matches
-            .iter()
-            .filter(|entry| entry.kind == "lexicon")
-            .count()
-            >= 2);
+        assert!(
+            outcome
+                .trace
+                .matches
+                .iter()
+                .filter(|entry| entry.kind == "lexicon")
+                .count()
+                >= 2
+        );
     }
 
     #[test]
@@ -2766,8 +2776,7 @@ mod tests {
             suffix: "（完）".to_string(),
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         assert_eq!(runtime.style_wrap("答"), "答");
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
         assert_eq!(runtime.style_wrap("答"), "【电影】答（完）");
@@ -2784,8 +2793,7 @@ mod tests {
             surnames: vec!["卡梅隆".to_string()],
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         assert!(runtime.reference_lexicon().is_empty());
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
         assert_eq!(
@@ -2808,8 +2816,7 @@ mod tests {
             reply: "我可以帮你查电影。".to_string(),
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         assert!(runtime.policy_reply("我不懂").is_none());
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
         let (reply, plan) = runtime.policy_reply("我不懂").expect("启用后应命中策略");
@@ -2835,8 +2842,7 @@ mod tests {
             types: Vec::new(),
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         assert!(runtime.ontology_aliases().is_empty());
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
         assert_eq!(
@@ -2860,10 +2866,12 @@ mod tests {
         ));
         let registry = PluginRegistry::from_manifests(vec![film]);
         assert!(!registry.has_errors(), "{}", registry.render_issues());
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         let outcome = runtime.rewrite("阿凡达是谁导演的");
-        assert_eq!(outcome.trace.recipe.as_ref().unwrap().question, "阿凡达的导演是什么");
+        assert_eq!(
+            outcome.trace.recipe.as_ref().unwrap().question,
+            "阿凡达的导演是什么"
+        );
         let composed = runtime.compose_answer(&outcome, "詹姆斯·卡梅隆");
         assert_eq!(composed.text, "「阿凡达」的导演是詹姆斯·卡梅隆。");
         assert_eq!(composed.template.as_deref(), Some("film.directed.template"));
@@ -2879,8 +2887,7 @@ mod tests {
             suffix: String::new(),
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         let outcome = runtime.rewrite("普通问题");
         let composed = runtime.compose_answer(&outcome, "答案");
         assert_eq!(composed.text, "（电影包）答案");
@@ -2891,12 +2898,13 @@ mod tests {
         let base = manifest("zh.base", PluginMode::Off);
         let mut child = manifest("zh.child", PluginMode::Off);
         child.requires = vec!["zh.base".to_string()];
-        child
-            .contributions
-            .push(rewrite_contribution("child.rewrite", "{entity}是谁", "{entity}是什么"));
+        child.contributions.push(rewrite_contribution(
+            "child.rewrite",
+            "{entity}是谁",
+            "{entity}是什么",
+        ));
         let registry = PluginRegistry::from_manifests(vec![base, child]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         let auto = runtime.set_mode("zh.child", PluginMode::On).unwrap();
         assert_eq!(auto, vec!["zh.base".to_string()]);
         assert_eq!(runtime.mode("zh.base"), Some(PluginMode::On));
@@ -2912,8 +2920,7 @@ mod tests {
         left.conflicts = vec!["zh.right".to_string()];
         let right = manifest("zh.right", PluginMode::Off);
         let registry = PluginRegistry::from_manifests(vec![left, right]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         runtime.set_mode("zh.left", PluginMode::On).unwrap();
         let error = runtime.set_mode("zh.right", PluginMode::On).unwrap_err();
         assert!(error.contains("冲突"));
@@ -2924,8 +2931,7 @@ mod tests {
     fn session_state_round_trips_and_ignores_unknown_plugins() {
         let film = manifest("zh.film", PluginMode::Off);
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         runtime.set_mode("zh.film", PluginMode::Observe).unwrap();
         let state = runtime.session_state();
         let directory = tempfile::tempdir().unwrap();
@@ -2934,8 +2940,7 @@ mod tests {
         let restored = PluginSessionState::load(&path).unwrap();
         assert_eq!(restored.modes.get("zh.film"), Some(&PluginMode::Observe));
         let registry = PluginRegistry::from_manifests(vec![manifest("zh.film", PluginMode::Off)]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         let applied = runtime.restore_session_state(restored);
         assert_eq!(applied, 1);
         assert_eq!(runtime.mode("zh.film"), Some(PluginMode::Observe));
@@ -2945,8 +2950,7 @@ mod tests {
     fn commands_are_parsed_and_report_modes() {
         let film = manifest("zh.film", PluginMode::Off);
         let registry = PluginRegistry::from_manifests(vec![film]);
-        let mut runtime =
-            PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         let outcome = runtime.handle_command("启用插件：zh.film").unwrap();
         assert!(outcome.success && outcome.state_changed);
         assert_eq!(runtime.mode("zh.film"), Some(PluginMode::On));

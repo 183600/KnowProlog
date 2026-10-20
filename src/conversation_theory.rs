@@ -2215,16 +2215,7 @@ pub fn append_conflict(
             )
         })
         .unwrap_or_else(|| "导入冲突".to_string());
-    let mut payload = event_payload(
-        &summary,
-        source,
-        revision_after,
-        &[],
-        false,
-        None,
-        None,
-        0,
-    );
+    let mut payload = event_payload(&summary, source, revision_after, &[], false, None, None, 0);
     payload["conflicts"] = Value::Array(items);
     chronicle.append("conflict", payload)
 }

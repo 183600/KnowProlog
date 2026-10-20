@@ -42,7 +42,10 @@ impl Literal {
     }
 
     pub fn negative(atom: Atom) -> Self {
-        Self { negated: true, atom }
+        Self {
+            negated: true,
+            atom,
+        }
     }
 
     pub fn complement(&self) -> Self {
@@ -211,7 +214,10 @@ impl DefaultTheory {
             consequent,
             source: source.to_string(),
         });
-        self.rules.last().map(|rule| rule.name.clone()).unwrap_or_default()
+        self.rules
+            .last()
+            .map(|rule| rule.name.clone())
+            .unwrap_or_default()
     }
 
     /// 添加硬规则（无理由，必然应用）
@@ -229,7 +235,10 @@ impl DefaultTheory {
             consequent,
             source: source.to_string(),
         });
-        self.rules.last().map(|rule| rule.name.clone()).unwrap_or_default()
+        self.rules
+            .last()
+            .map(|rule| rule.name.clone())
+            .unwrap_or_default()
     }
 
     /// 添加已具名的默认规则；name 为空时自动补全；返回规则名
@@ -298,7 +307,10 @@ impl DefaultTheory {
                     decided[index] = true;
                     continue;
                 }
-                if extension.literals.contains(&instance.consequent.complement()) {
+                if extension
+                    .literals
+                    .contains(&instance.consequent.complement())
+                {
                     decided[index] = true;
                     extension.blocked.push(BlockedDefault {
                         rule: instance.rule.name.clone(),
@@ -394,10 +406,7 @@ impl DefaultTheory {
                                         extension.blocked.push(BlockedDefault {
                                             rule: loser.rule.name.clone(),
                                             instance: loser.consequent.clone(),
-                                            reason: format!(
-                                                "同等具体度互相压制（{}）",
-                                                conflict
-                                            ),
+                                            reason: format!("同等具体度互相压制（{}）", conflict),
                                         });
                                     }
                                 }
@@ -493,7 +502,15 @@ fn ground_rule<'a>(
         return;
     }
     let mut substitution: HashMap<String, Term> = HashMap::new();
-    enumerate_instances(rule, &variables, 0, domain, &mut substitution, output, truncated);
+    enumerate_instances(
+        rule,
+        &variables,
+        0,
+        domain,
+        &mut substitution,
+        output,
+        truncated,
+    );
 }
 
 fn enumerate_instances<'a>(
@@ -615,11 +632,7 @@ fn prerequisite_entails(
 }
 
 /// specific 是否严格比 general 更具体：本体闭包给出子类/实例/子谓词的证据
-fn literal_specializes(
-    specific: &Literal,
-    general: &Literal,
-    closure: &OntologyClosure,
-) -> bool {
+fn literal_specializes(specific: &Literal, general: &Literal, closure: &OntologyClosure) -> bool {
     if specific.negated != general.negated {
         return false;
     }
@@ -629,10 +642,8 @@ fn literal_specializes(
         && specific_atom.arity() == general_atom.arity()
     {
         let mut strict = false;
-        for (specific_term, general_term) in specific_atom
-            .terms
-            .iter()
-            .zip(general_atom.terms.iter())
+        for (specific_term, general_term) in
+            specific_atom.terms.iter().zip(general_atom.terms.iter())
         {
             if specific_term == general_term {
                 continue;
@@ -742,7 +753,9 @@ pub fn render_extension_zh(
     }
     if extension.applications.is_empty() && extension.blocked.is_empty() {
         if target.is_none() {
-            output.push_str("本次扩展没有触发任何默认，也没有发现阻断（可以先教一句「除非」默认句）。\n");
+            output.push_str(
+                "本次扩展没有触发任何默认，也没有发现阻断（可以先教一句「除非」默认句）。\n",
+            );
         }
     } else {
         output.push_str(&format!(
@@ -855,7 +868,11 @@ mod tests {
         let blocked = extension.blocked_for(&target);
         assert_eq!(blocked.len(), 1, "应有唯一阻断记录");
         assert!(blocked[0].reason.contains("例外"), "{}", blocked[0].reason);
-        assert!(blocked[0].reason.contains("蒂娜是企鹅"), "{}", blocked[0].reason);
+        assert!(
+            blocked[0].reason.contains("蒂娜是企鹅"),
+            "{}",
+            blocked[0].reason
+        );
     }
 
     fn penguin_closure() -> OntologyClosure {
@@ -895,7 +912,11 @@ mod tests {
         assert!(extension.holds(&not_fly), "企鹅不会飞应成立");
         let blocked = extension.blocked_for(&fly);
         assert_eq!(blocked.len(), 1);
-        assert!(blocked[0].reason.contains("更具体"), "{}", blocked[0].reason);
+        assert!(
+            blocked[0].reason.contains("更具体"),
+            "{}",
+            blocked[0].reason
+        );
         assert!(!extension.conflicts.is_empty(), "应记录冲突");
     }
 
@@ -941,10 +962,7 @@ mod tests {
                 "是",
                 vec![Term::var("X"), Term::constant("企鹅")],
             ))],
-            Literal::positive(Atom::new(
-                "是",
-                vec![Term::var("X"), Term::constant("鸟")],
-            )),
+            Literal::positive(Atom::new("是", vec![Term::var("X"), Term::constant("鸟")])),
             "测试默认·麻雀是鸟",
         );
         is_fly_default(&mut theory, true);
@@ -995,6 +1013,8 @@ mod tests {
         assert!(Literal::negative(unary("会飞", "企鹅一号"))
             .render_zh()
             .contains("并非"));
-        assert!(binary("是", "企鹅一号", "企鹅").display().contains("企鹅一号"));
+        assert!(binary("是", "企鹅一号", "企鹅")
+            .display()
+            .contains("企鹅一号"));
     }
 }

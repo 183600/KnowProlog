@@ -213,10 +213,7 @@ impl TypeSystem {
         }
         self.remember_display(sub);
         self.remember_display(sup);
-        self.subclasses
-            .entry(sub_key)
-            .or_default()
-            .insert(sup_key)
+        self.subclasses.entry(sub_key).or_default().insert(sup_key)
     }
 
     /// 声明互斥对；拒绝空名与自指。返回是否新登记。
@@ -388,7 +385,9 @@ impl TypeSystem {
         let seeds: Vec<(String, String)> = inferred
             .iter()
             .flat_map(|(entity, types)| {
-                types.keys().map(|type_name| (entity.clone(), type_name.clone()))
+                types
+                    .keys()
+                    .map(|type_name| (entity.clone(), type_name.clone()))
             })
             .collect();
         for (entity, type_name) in seeds {
@@ -449,11 +448,7 @@ impl TypeSystem {
                 .aliases
                 .iter()
                 .map(|(alias, canonical)| {
-                    format!(
-                        "{} = {}",
-                        self.display_key(alias),
-                        self.display(canonical)
-                    )
+                    format!("{} = {}", self.display_key(alias), self.display(canonical))
                 })
                 .collect();
             lines.push(format!("  别名：{}", aliases.join("；")));
@@ -477,11 +472,7 @@ impl TypeSystem {
                 .disjoint
                 .iter()
                 .map(|(left, right)| {
-                    format!(
-                        "{} ⊥ {}",
-                        self.display_key(left),
-                        self.display_key(right)
-                    )
+                    format!("{} ⊥ {}", self.display_key(left), self.display_key(right))
                 })
                 .collect();
             lines.push(format!("  互斥：{}", pairs.join("；")));
@@ -580,9 +571,15 @@ mod tests {
         let system = sample();
         assert!(system.types_compatible("Person", "人物"));
         assert!(system.types_compatible("学生", "人物"));
-        assert!(system.types_compatible("实体", "人物"), "上位类与下位类闭包相交");
+        assert!(
+            system.types_compatible("实体", "人物"),
+            "上位类与下位类闭包相交"
+        );
         assert!(system.types_disjoint("地点", "人物"));
-        assert!(system.types_disjoint("城市", "人物") == false, "未落型不构成互斥");
+        assert!(
+            system.types_disjoint("城市", "人物") == false,
+            "未落型不构成互斥"
+        );
 
         assert_eq!(
             system.sets_admit(&typed(&["Person"]), &typed(&["人物"])),
@@ -614,7 +611,11 @@ mod tests {
         let system = sample();
         let relations = vec![
             ("张三".to_string(), "师傅".to_string(), "李四".to_string()),
-            ("北京大学".to_string(), "位于".to_string(), "海淀".to_string()),
+            (
+                "北京大学".to_string(),
+                "位于".to_string(),
+                "海淀".to_string(),
+            ),
         ];
         let mut domains = BTreeMap::new();
         domains.insert("师傅".to_string(), typed(&["人物"]));

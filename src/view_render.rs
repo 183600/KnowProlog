@@ -482,8 +482,16 @@ impl KnowledgeSubgraph {
             self.edges.len()
         ));
         for edge in &self.edges {
-            let subject = &self.nodes[self.nodes.iter().position(|n| n.name == edge.subject).unwrap()];
-            let object = &self.nodes[self.nodes.iter().position(|n| n.name == edge.object).unwrap()];
+            let subject = &self.nodes[self
+                .nodes
+                .iter()
+                .position(|n| n.name == edge.subject)
+                .unwrap()];
+            let object = &self.nodes[self
+                .nodes
+                .iter()
+                .position(|n| n.name == edge.object)
+                .unwrap()];
             let color = if edge.highlight { "#cc3333" } else { "#999999" };
             let stroke = if edge.highlight { 3 } else { 1 };
             svg.push_str(&format!(
@@ -794,7 +802,9 @@ pub fn parse_timeline_flow(text: &str) -> Result<Vec<TimelineTurn>, String> {
                     turns.last().map(|turn| turn.seq).unwrap_or(0)
                 ));
             }
-            let open = edge.find("[\"").ok_or_else(|| format!("节点行缺少标签：{}", line))?;
+            let open = edge
+                .find("[\"")
+                .ok_or_else(|| format!("节点行缺少标签：{}", line))?;
             let seq_text = &edge[..open];
             let seq: u64 = seq_text
                 .parse()
@@ -863,7 +873,10 @@ fn push_capped(lines: &mut Vec<String>, items: &[String]) {
         lines.push(format!("    · {}", item));
     }
     if items.len() > COVERAGE_LIST_CAP {
-        lines.push(format!("    ……其余 {} 个省略", items.len() - COVERAGE_LIST_CAP));
+        lines.push(format!(
+            "    ……其余 {} 个省略",
+            items.len() - COVERAGE_LIST_CAP
+        ));
     }
 }
 
@@ -906,20 +919,24 @@ pub fn render_coverage_report(input: &CoverageInput) -> String {
             .collect();
         let isolated: Vec<String> = entities
             .iter()
-            .filter(|entity| {
-                !connected.contains(**entity) && !attributed.contains(**entity)
-            })
+            .filter(|entity| !connected.contains(**entity) && !attributed.contains(**entity))
             .map(|name| name.to_string())
             .collect();
-        lines.push(format!("  孤立实体（既无属性也无关系）：{} 个", isolated.len()));
+        lines.push(format!(
+            "  孤立实体（既无属性也无关系）：{} 个",
+            isolated.len()
+        ));
         push_capped(&mut lines, &isolated);
     }
 
     if input.registered_predicates.is_empty() {
         lines.push("  未登记谓词：谓词画像为空，检查跳过。".to_string());
     } else {
-        let registered: BTreeSet<&str> =
-            input.registered_predicates.iter().map(String::as_str).collect();
+        let registered: BTreeSet<&str> = input
+            .registered_predicates
+            .iter()
+            .map(String::as_str)
+            .collect();
         let mut unregistered: BTreeSet<&str> = BTreeSet::new();
         for (_, predicate, _) in &input.edges {
             if !registered.contains(predicate.as_str()) {
@@ -931,9 +948,11 @@ pub fn render_coverage_report(input: &CoverageInput) -> String {
                 unregistered.insert(key);
             }
         }
-        let unregistered: Vec<String> =
-            unregistered.iter().map(|name| name.to_string()).collect();
-        lines.push(format!("  未登记谓词（画像/配置均未声明）：{} 种", unregistered.len()));
+        let unregistered: Vec<String> = unregistered.iter().map(|name| name.to_string()).collect();
+        lines.push(format!(
+            "  未登记谓词（画像/配置均未声明）：{} 种",
+            unregistered.len()
+        ));
         push_capped(&mut lines, &unregistered);
     }
     lines.join("\n")
@@ -1132,11 +1151,7 @@ mod tests {
     #[test]
     fn coverage_report_finds_three_classes() {
         let input = CoverageInput {
-            entities: vec![
-                "张三".to_string(),
-                "李四".to_string(),
-                "孤立".to_string(),
-            ],
+            entities: vec!["张三".to_string(), "李四".to_string(), "孤立".to_string()],
             edges: vec![
                 ("张三".to_string(), "师傅".to_string(), "李四".to_string()),
                 ("李四".to_string(), "师父".to_string(), "王五".to_string()),
@@ -1151,7 +1166,11 @@ mod tests {
         assert!(report.contains("孤立"), "{}", report);
         assert!(report.contains("未登记谓词"), "{}", report);
         assert!(report.contains("师父"), "{}", report);
-        assert!(!report.contains("· 张三"), "已登记的实体不应误报：{}", report);
+        assert!(
+            !report.contains("· 张三"),
+            "已登记的实体不应误报：{}",
+            report
+        );
     }
 
     #[test]
@@ -1173,7 +1192,11 @@ mod tests {
             )
             .unwrap();
         chronicle
-            .append_reply("姚明的身高是 226。", &["direct_answer".to_string()], &["身高".to_string()])
+            .append_reply(
+                "姚明的身高是 226。",
+                &["direct_answer".to_string()],
+                &["身高".to_string()],
+            )
             .unwrap();
 
         let turns: Vec<TimelineTurn> = chronicle
@@ -1184,7 +1207,11 @@ mod tests {
         assert_eq!(turns.len(), 3);
         assert!(turns[1].inherited);
         let markdown = render_timeline_markdown(&turns);
-        assert!(markdown.contains("| 1 | 姚明是谁 | turn | — | — |"), "{}", markdown);
+        assert!(
+            markdown.contains("| 1 | 姚明是谁 | turn | — | — |"),
+            "{}",
+            markdown
+        );
         assert!(markdown.contains("姚明（继承）"), "{}", markdown);
         assert!(markdown.contains("答：姚明的身高是 226。"), "{}", markdown);
         let flow = render_timeline_flow(&turns);
@@ -1248,7 +1275,11 @@ mod tests {
         let text = subgraph.render_json();
         let parsed = parse_json(&text).unwrap();
         assert_eq!(parsed, subgraph, "parse(render(x)) 必须逐字段等于 x");
-        assert_eq!(parsed.render_json(), text, "解析后再渲染必须同字节（L2 不动点）");
+        assert_eq!(
+            parsed.render_json(),
+            text,
+            "解析后再渲染必须同字节（L2 不动点）"
+        );
         assert!(parse_json("{").is_err());
         assert!(parse_json("{\"focus\":1}").is_err());
     }

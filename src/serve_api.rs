@@ -69,12 +69,12 @@ use crate::dialogue_manager::{
     DialogueKnowledge, DialogueManager, DialogueManagerSnapshot, MoveKind,
 };
 use crate::ontology_reasoning::OntologyProgram;
-use crate::recovery::RecoveryMode;
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime};
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
 use crate::quality::QualityIndex;
+use crate::recovery::RecoveryMode;
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::{NlpConfig, ReasoningConfig};
@@ -164,18 +164,48 @@ pub struct SessionPolicy {
 }
 
 const STYLE_CONCISE_PHRASES: &[&str] = &[
-    "简短", "简洁", "一句话", "尽量短", "concise", "brief", "short",
+    "简短",
+    "简洁",
+    "一句话",
+    "尽量短",
+    "concise",
+    "brief",
+    "short",
 ];
 const STYLE_DETAILED_PHRASES: &[&str] = &[
-    "详细", "展开", "深入", "in depth", "detailed", "elaborate", "verbose",
+    "详细",
+    "展开",
+    "深入",
+    "in depth",
+    "detailed",
+    "elaborate",
+    "verbose",
 ];
 const EVIDENCE_PHRASES: &[&str] = &[
-    "依据", "来源", "出处", "证据", "引用", "evidence", "cite", "citation", "source",
-    "provenance", "justify",
+    "依据",
+    "来源",
+    "出处",
+    "证据",
+    "引用",
+    "evidence",
+    "cite",
+    "citation",
+    "source",
+    "provenance",
+    "justify",
 ];
 const STRICT_CLARIFY_PHRASES: &[&str] = &[
-    "澄清", "追问", "不要猜", "不要臆测", "先确认", "clarify", "ask before",
-    "do not guess", "don't guess", "no guessing", "confirm",
+    "澄清",
+    "追问",
+    "不要猜",
+    "不要臆测",
+    "先确认",
+    "clarify",
+    "ask before",
+    "do not guess",
+    "don't guess",
+    "no guessing",
+    "confirm",
 ];
 
 impl SessionPolicy {
@@ -260,7 +290,8 @@ impl SessionPolicy {
             match self.style {
                 PolicyStyle::Concise => turn.reply = first_sentence(&turn.reply),
                 PolicyStyle::Detailed => {
-                    let already_offers = turn.reply.contains("还可以") || turn.reply.contains("可继续");
+                    let already_offers =
+                        turn.reply.contains("还可以") || turn.reply.contains("可继续");
                     if !already_offers {
                         if let Some(focus) = &turn.focus {
                             let attributes = knowledge.known_attributes(focus);
@@ -483,8 +514,7 @@ impl Session {
             .manager
             .plan_pure_dialogue(&input, &self.reasoner)
             .or_else(|| self.manager.plan_reply(&input, &self.reasoner));
-        let (status, source, kind, plan, reply) = if let Some((text, plan, kind)) = plugin_answer
-        {
+        let (status, source, kind, plan, reply) = if let Some((text, plan, kind)) = plugin_answer {
             (
                 "answered".to_string(),
                 "plugin".to_string(),
@@ -683,16 +713,9 @@ impl SessionEnvelope {
     ///
     /// 任一门失败都返回带稳定错误码的 [`DecodeError`]，且不产生任何副作用；
     /// 全部通过才返回信封与 [`DecodeReceipt`]（含「字节是否已规范」）。
-    pub fn decode(
-        bytes: &[u8],
-        max_bytes: usize,
-    ) -> Result<(Self, DecodeReceipt), DecodeError> {
-        let (envelope, mut receipt) = canonical::decode_json::<Self>(
-            bytes,
-            "session_envelope",
-            ENVELOPE_VERSION,
-            max_bytes,
-        )?;
+    pub fn decode(bytes: &[u8], max_bytes: usize) -> Result<(Self, DecodeReceipt), DecodeError> {
+        let (envelope, mut receipt) =
+            canonical::decode_json::<Self>(bytes, "session_envelope", ENVELOPE_VERSION, max_bytes)?;
         if envelope.format != ENVELOPE_FORMAT {
             return Err(DecodeError::Format(truncate_chars(&envelope.format, 32)));
         }
@@ -854,8 +877,11 @@ impl WarmBase {
         startup: &StartupLedger,
     ) -> Self {
         let _span = startup.span("warm_build");
-        let mut reasoner =
-            SymbolicReasoner::with_perf_ledger(reasoning.clone(), synonyms.clone(), Arc::clone(perf));
+        let mut reasoner = SymbolicReasoner::with_perf_ledger(
+            reasoning.clone(),
+            synonyms.clone(),
+            Arc::clone(perf),
+        );
         reasoner.observe_facts(facts);
         perf.bump("warm_base_builds");
         Self {
@@ -915,8 +941,14 @@ fn build_session(
         session.manager.restore(&restore.manager);
         // 信封层已按规范字节 + 摘要把关；此处仍把本体胶囊校验失败当作
         // 「快照不可恢复」上报（零半应用），不让被改写的公理进入会话。
-        if let Err(error) = session.reasoner.restore_dialogue_snapshot(&restore.reasoner) {
-            eprintln!("会话快照拒绝（本体胶囊校验失败，其余状态未应用）：{}", error);
+        if let Err(error) = session
+            .reasoner
+            .restore_dialogue_snapshot(&restore.reasoner)
+        {
+            eprintln!(
+                "会话快照拒绝（本体胶囊校验失败，其余状态未应用）：{}",
+                error
+            );
         }
     }
     session
@@ -969,11 +1001,7 @@ impl ApiState {
         let kb_fingerprint = fingerprint_facts(&facts);
         // 预热基座：整进程唯一的全量重放点（会话创建只做字段级分叉）
         let warm = Arc::new(WarmBase::build(
-            &facts,
-            &reasoning,
-            &synonyms,
-            &perf,
-            &startup,
+            &facts, &reasoning, &synonyms, &perf, &startup,
         ));
         let kb_revision = warm.revision();
         ApiState {
@@ -1022,7 +1050,10 @@ impl ApiState {
     /// 在建会话前调用，之后分叉的每个会话都携带同一份单一本体。
     /// 返回新登记的公理条数（重复调用按整句去重，返回 0）。
     pub fn configure_ontology(&self, program: &OntologyProgram) -> usize {
-        self.warm.reasoner.lock().configure_ontology_program(program)
+        self.warm
+            .reasoner
+            .lock()
+            .configure_ontology_program(program)
     }
 
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
@@ -1054,8 +1085,7 @@ impl ApiState {
     /// 写入无状态问答缓存；返回被淘汰条目数并计入台账。
     fn store_stateless_answer(&self, epoch: CacheEpoch, key: String, response: TurnResponse) {
         let evicted = self.stateless_answers.lock().put(epoch, key, response);
-        self.perf
-            .bump_by("answer_cache_evictions", evicted as u64);
+        self.perf.bump_by("answer_cache_evictions", evicted as u64);
     }
 
     /// 设置冷会话目录（在 `Arc::new` 之前调用）。
@@ -1359,10 +1389,7 @@ impl ApiState {
         // 跳过已占用的 id：导入的信封可以使用任意 id（含 s-N），
         // 服务端生成的 id 绝不能覆盖已存在（尤其是刚导入）的会话。
         let id = loop {
-            let candidate = format!(
-                "s-{}",
-                self.next_session_id.fetch_add(1, Ordering::Relaxed)
-            );
+            let candidate = format!("s-{}", self.next_session_id.fetch_add(1, Ordering::Relaxed));
             if !sessions.contains_key(&candidate) {
                 break candidate;
             }
@@ -1397,10 +1424,7 @@ impl ApiState {
         Ok(response)
     }
 
-    async fn session_snapshot(
-        &self,
-        session_id: &str,
-    ) -> Result<serde_json::Value, SessionError> {
+    async fn session_snapshot(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
         let tx = self.session_tx(session_id).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SessionCommand::Snapshot { reply: reply_tx })
@@ -1532,9 +1556,7 @@ enum ImportError {
 pub async fn serve(state: Arc<ApiState>, addr: &str) -> std::io::Result<()> {
     let bind_start = Instant::now();
     let listener = TcpListener::bind(addr).await?;
-    state
-        .startup
-        .record_since("bind", bind_start);
+    state.startup.record_since("bind", bind_start);
     if let Some(line) = state.startup.summary_line() {
         println!("{}", line);
     }
@@ -1637,7 +1659,10 @@ async fn serve_connection(mut stream: TcpStream, state: Arc<ApiState>) -> std::i
 
 /// `POST /sessions/{id}/turns` → Some(id)。
 fn turn_route(path: &str) -> Option<String> {
-    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     match segments.as_slice() {
         ["sessions", id, "turns"] => Some((*id).to_string()),
         _ => None,
@@ -1825,7 +1850,9 @@ fn session_error_response(error: SessionError) -> Response {
 fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Response {
     state.perf.bump(&error.metric_key());
     match error {
-        DecodeError::TooLarge { .. } => Response::error(413, "envelope too large [decode_too_large]"),
+        DecodeError::TooLarge { .. } => {
+            Response::error(413, "envelope too large [decode_too_large]")
+        }
         DecodeError::Parse(message) => Response::error(
             400,
             &format!("invalid envelope JSON: {} [decode_parse]", message),
@@ -1861,11 +1888,11 @@ fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Respons
 async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
     // 信封解码一律用信封上限：导出的会话必须能原样导回，
     // 默认 256KB 体量只约束对话轮，不约束冷存储信封。
-    let (envelope, receipt) = match SessionEnvelope::decode(&request.body, SESSION_ENVELOPE_MAX_BYTES)
-    {
-        Ok(decoded) => decoded,
-        Err(error) => return import_decode_response(state, &error),
-    };
+    let (envelope, receipt) =
+        match SessionEnvelope::decode(&request.body, SESSION_ENVELOPE_MAX_BYTES) {
+            Ok(decoded) => decoded,
+            Err(error) => return import_decode_response(state, &error),
+        };
     state.perf.bump("decode_ok");
     if !receipt.canonical {
         state.perf.bump("decode_non_canonical");
@@ -1954,7 +1981,10 @@ fn parse_chat_request(request: &Request) -> Result<ChatRequest, String> {
     let mut inputs = Vec::new();
     let mut system_texts = Vec::new();
     for message in messages {
-        let role = message.get("role").and_then(|role| role.as_str()).unwrap_or("");
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("");
         if role != "user" && role != "system" && role != "developer" {
             continue;
         }
@@ -1990,7 +2020,10 @@ fn parse_chat_request(request: &Request) -> Result<ChatRequest, String> {
         } else {
             Some(SessionPolicy::from_system_texts(&system_texts))
         },
-        stream: value.get("stream").and_then(|stream| stream.as_bool()).unwrap_or(false),
+        stream: value
+            .get("stream")
+            .and_then(|stream| stream.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -2004,16 +2037,17 @@ async fn run_chat_turns(
 ) -> Result<(TurnResponse, usize), (u16, String)> {
     let prompt_chars: usize = chat.inputs.iter().map(|input| input.chars().count()).sum();
     if let Some(session_id) = &chat.session_id {
-        let input = chat.inputs.last().expect("inputs non-empty by construction");
+        let input = chat
+            .inputs
+            .last()
+            .expect("inputs non-empty by construction");
         return match state
             .take_turn_with_policy(session_id, input, chat.policy.as_ref())
             .await
         {
             Ok(turn) => Ok((turn, prompt_chars)),
             Err(SessionError::NotFound) => Err((404, "session not found".to_string())),
-            Err(SessionError::Unavailable) => {
-                Err((500, "session actor unavailable".to_string()))
-            }
+            Err(SessionError::Unavailable) => Err((500, "session actor unavailable".to_string())),
             Err(SessionError::Stale(error)) => Err((
                 409,
                 format!("session snapshot is stale (decode_{})", error.code()),
@@ -2146,7 +2180,9 @@ async fn stream_chat_completion(
         })
     };
     let mut send = async |value: &serde_json::Value| -> std::io::Result<()> {
-        stream.write_all(format!("data: {}\n\n", value).as_bytes()).await
+        stream
+            .write_all(format!("data: {}\n\n", value).as_bytes())
+            .await
     };
     send(&base(serde_json::json!({"role": "assistant"}), None)).await?;
     for chunk in sentence_chunks(&turn.reply) {
@@ -2296,7 +2332,9 @@ async fn read_request(
 
     let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
     let mut lines = header_text.split("\r\n");
-    let request_line = lines.next().ok_or_else(|| malformed("missing request line"))?;
+    let request_line = lines
+        .next()
+        .ok_or_else(|| malformed("missing request line"))?;
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
@@ -2699,12 +2737,9 @@ template = "「{entity}」的身高是{answer}。"
         wrong_format.format = "other-format".to_string();
         wrong_format.seal();
         assert_eq!(
-            SessionEnvelope::decode(
-                &canonical::canonical_bytes(&wrong_format).unwrap(),
-                1 << 20
-            )
-            .unwrap_err()
-            .code(),
+            SessionEnvelope::decode(&canonical::canonical_bytes(&wrong_format).unwrap(), 1 << 20)
+                .unwrap_err()
+                .code(),
             "format"
         );
 
@@ -2816,11 +2851,7 @@ template = "「{entity}」的身高是{answer}。"
     }
 
     fn temp_session_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "kp-serve-{}-{}",
-            std::process::id(),
-            label
-        ));
+        let dir = std::env::temp_dir().join(format!("kp-serve-{}-{}", std::process::id(), label));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -2988,13 +3019,21 @@ template = "「{entity}」的身高是{answer}。"
         assert_eq!(status, 200);
         assert!(body.contains("226"), "{}", body);
 
-        let (status, _, body) = raw_request(addr, "GET", &format!("/sessions/{}", session_id), &[], "").await;
+        let (status, _, body) =
+            raw_request(addr, "GET", &format!("/sessions/{}", session_id), &[], "").await;
         assert_eq!(status, 200);
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["turns"], 2);
         assert_eq!(value["focus_stack"][0], "姚明");
 
-        let (status, _, _) = raw_request(addr, "DELETE", &format!("/sessions/{}", session_id), &[], "").await;
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", session_id),
+            &[],
+            "",
+        )
+        .await;
         assert_eq!(status, 200);
         let (status, _, _) = raw_request(
             addr,
@@ -3384,7 +3423,11 @@ template = "「{entity}」的身高是{answer}。"
         let content = value["choices"][0]["message"]["content"].as_str().unwrap();
         assert!(content.contains("226"), "{}", content);
         assert!(content.contains("依据：对话策略"), "{}", content);
-        assert!(content.lines().count() <= 2, "简短策略不应多行：{}", content);
+        assert!(
+            content.lines().count() <= 2,
+            "简短策略不应多行：{}",
+            content
+        );
 
         // 详细策略：给出可继续了解的真实属性清单
         let payload = serde_json::json!({
@@ -3468,10 +3511,7 @@ template = "「{entity}」的身高是{answer}。"
         serde_json::from_str(&body).unwrap()
     }
 
-    async fn export_envelope(
-        addr: std::net::SocketAddr,
-        session_id: &str,
-    ) -> serde_json::Value {
+    async fn export_envelope(addr: std::net::SocketAddr, session_id: &str) -> serde_json::Value {
         let (status, _, body) = raw_request(
             addr,
             "GET",
@@ -3559,8 +3599,7 @@ template = "「{entity}」的身高是{answer}。"
         let mut tampered: SessionEnvelope = serde_json::from_value(envelope.clone()).unwrap();
         tampered.history.push("伪造的历史".to_string());
         let body = serde_json::to_string(&tampered).unwrap();
-        let (status, _, response) =
-            raw_request(addr, "POST", "/sessions/import", &[], &body).await;
+        let (status, _, response) = raw_request(addr, "POST", "/sessions/import", &[], &body).await;
         assert_eq!(status, 409, "{}", response);
         assert!(response.contains("digest"), "{}", response);
         let (_, _, metrics) = raw_request(addr, "GET", "/metrics", &[], "").await;
@@ -3572,8 +3611,7 @@ template = "「{entity}」的身高是{answer}。"
         future.version = ENVELOPE_VERSION + 1;
         future.seal();
         let body = serde_json::to_string(&future).unwrap();
-        let (status, _, response) =
-            raw_request(addr, "POST", "/sessions/import", &[], &body).await;
+        let (status, _, response) = raw_request(addr, "POST", "/sessions/import", &[], &body).await;
         assert_eq!(status, 409, "{}", response);
         assert!(response.contains("version"), "{}", response);
 
@@ -3583,8 +3621,7 @@ template = "「{entity}」的身高是{answer}。"
         foreign.engine.crate_version = "0.0.0-foreign".to_string();
         foreign.seal();
         let body = serde_json::to_string(&foreign).unwrap();
-        let (status, _, response) =
-            raw_request(addr, "POST", "/sessions/import", &[], &body).await;
+        let (status, _, response) = raw_request(addr, "POST", "/sessions/import", &[], &body).await;
         assert_eq!(status, 409, "{}", response);
         assert!(response.contains("foreign envelope"), "{}", response);
         assert!(response.contains("crate_version"), "{}", response);
@@ -3638,14 +3675,8 @@ template = "「{entity}」的身高是{answer}。"
         envelope.session_id = "s-2".to_string(); // 模拟携带 s-2 的历史信封
         envelope.seal();
 
-        let (status, _, _) = raw_request(
-            addr,
-            "DELETE",
-            &format!("/sessions/{}", original),
-            &[],
-            "",
-        )
-        .await;
+        let (status, _, _) =
+            raw_request(addr, "DELETE", &format!("/sessions/{}", original), &[], "").await;
         assert_eq!(status, 200);
         let payload = serde_json::to_string(&envelope).unwrap();
         let (status, _, body) = raw_request(
@@ -3663,11 +3694,7 @@ template = "「{entity}」的身高是{answer}。"
 
         // 导入的会话仍然可用（焦点记忆未被覆盖）
         let turn = take_turn_body(addr, &"s-2".to_string(), "他的身高呢").await;
-        assert!(
-            turn["reply"].as_str().unwrap().contains("226"),
-            "{}",
-            turn
-        );
+        assert!(turn["reply"].as_str().unwrap().contains("226"), "{}", turn);
     }
 
     /// 导出的信封必须能原样导回：超过默认 256KB 体量上限的信封
@@ -3709,11 +3736,7 @@ template = "「{entity}」的身高是{answer}。"
 
         // 大信封重建后仍可对话：焦点记忆完好
         let turn = take_turn_body(addr, &session_id, "他的身高呢").await;
-        assert!(
-            turn["reply"].as_str().unwrap().contains("226"),
-            "{}",
-            turn
-        );
+        assert!(turn["reply"].as_str().unwrap().contains("226"), "{}", turn);
     }
 
     /// 普通路由（非信封导入）体量超限时明确返回 413，而不是 400。
@@ -3776,7 +3799,10 @@ template = "「{entity}」的身高是{answer}。"
         assert_eq!(metrics["sessions"], 1);
         assert_eq!(metrics["evictions_total"], 1, "{}", metrics);
         assert_eq!(metrics["cold_sessions"], 1, "{}", metrics);
-        assert!(metrics["session_dir"].as_str().unwrap().contains("kp-serve"));
+        assert!(metrics["session_dir"]
+            .as_str()
+            .unwrap()
+            .contains("kp-serve"));
 
         take_turn_body(addr, &second, "姚明是谁").await;
 
@@ -3795,14 +3821,8 @@ template = "「{entity}」的身高是{answer}。"
         );
 
         // DELETE 清除内存与冷存储：已删除会话不得从磁盘复活
-        let (status, _, _) = raw_request(
-            addr,
-            "DELETE",
-            &format!("/sessions/{}", first),
-            &[],
-            "",
-        )
-        .await;
+        let (status, _, _) =
+            raw_request(addr, "DELETE", &format!("/sessions/{}", first), &[], "").await;
         assert_eq!(status, 200);
         assert!(
             !dir.join(format!("{}.json", first)).exists(),
@@ -3833,14 +3853,8 @@ template = "「{entity}」的身高是{answer}。"
             dir.join(format!("{}.json", second)).exists(),
             "新建 third 应换出 second"
         );
-        let (status, _, _) = raw_request(
-            addr,
-            "DELETE",
-            &format!("/sessions/{}", second),
-            &[],
-            "",
-        )
-        .await;
+        let (status, _, _) =
+            raw_request(addr, "DELETE", &format!("/sessions/{}", second), &[], "").await;
         assert_eq!(status, 200, "冷会话删除应成功");
         assert!(!dir.join(format!("{}.json", second)).exists());
         let (status, _, _) = raw_request(

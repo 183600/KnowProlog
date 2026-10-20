@@ -146,16 +146,26 @@ pub type NodePayload = BTreeMap<String, String>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "support", rename_all = "snake_case")]
 pub enum Support {
-    UserInput { excerpt: String },
+    UserInput {
+        excerpt: String,
+    },
     Fact {
         entity: String,
         predicate: String,
         value: String,
     },
-    Proof { id: String },
-    Rule { name: String },
-    Template { name: String },
-    Node { id: NodeId },
+    Proof {
+        id: String,
+    },
+    Rule {
+        name: String,
+    },
+    Template {
+        name: String,
+    },
+    Node {
+        id: NodeId,
+    },
 }
 
 /// 被拒绝的候选及拒绝理由（“为什么不是另一个”的基础）。
@@ -309,7 +319,13 @@ impl QudStack {
         attribute: impl Into<String>,
         inherited: bool,
     ) -> u64 {
-        self.push_open(turn, QudKind::AskAttribute, entity, Some(attribute.into()), inherited)
+        self.push_open(
+            turn,
+            QudKind::AskAttribute,
+            entity,
+            Some(attribute.into()),
+            inherited,
+        )
     }
 
     pub fn push_identity(&mut self, turn: usize, entity: Option<String>, inherited: bool) -> u64 {
@@ -318,7 +334,12 @@ impl QudStack {
 
     /// 当前最上方开放问据已获回答：置为 Resolved（仍留在轨迹，可承继谓词话题）。
     pub fn resolve_open(&mut self) {
-        if let Some(entry) = self.entries.iter_mut().rev().find(|e| e.status == QudStatus::Open) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.status == QudStatus::Open)
+        {
             entry.status = QudStatus::Resolved;
         }
     }
@@ -478,7 +499,9 @@ impl ReferentTrail {
             .events
             .iter_mut()
             .rev()
-            .find(|event| event.status == ReferentStatus::Active && fold_surface(&event.surface) == folded)
+            .find(|event| {
+                event.status == ReferentStatus::Active && fold_surface(&event.surface) == folded
+            })
             .map(|event| {
                 event.status = ReferentStatus::Overridden;
                 event.id
@@ -504,10 +527,9 @@ impl ReferentTrail {
     /// 当前对某说法的有效指代（最近一条 Active）。
     pub fn resolve(&self, surface: &str) -> Option<&ReferentEvent> {
         let folded = fold_surface(surface);
-        self.events
-            .iter()
-            .rev()
-            .find(|event| event.status == ReferentStatus::Active && fold_surface(&event.surface) == folded)
+        self.events.iter().rev().find(|event| {
+            event.status == ReferentStatus::Active && fold_surface(&event.surface) == folded
+        })
     }
 
     /// 某说法的完整绑定史（新在前）。
@@ -564,7 +586,14 @@ impl ReferentTrail {
             };
             lines.push(format!(
                 "  #{} 第 {} 轮 「{}」→「{}」（{}，{}{}）{}",
-                event.id, event.turn, event.surface, event.referent, event.source.label(), status, chain, note
+                event.id,
+                event.turn,
+                event.surface,
+                event.referent,
+                event.source.label(),
+                status,
+                chain,
+                note
             ));
         }
         lines.join("\n")
@@ -683,7 +712,11 @@ impl TraceStore {
         }
     }
 
-    pub fn with_limits(max_turns: usize, max_nodes_per_turn: usize, max_events_per_turn: usize) -> Self {
+    pub fn with_limits(
+        max_turns: usize,
+        max_nodes_per_turn: usize,
+        max_events_per_turn: usize,
+    ) -> Self {
         TraceStore {
             max_turns: max_turns.max(1),
             max_nodes_per_turn: max_nodes_per_turn.max(4),
@@ -741,7 +774,9 @@ impl TraceStore {
 
     /// 会话内更正覆盖值（On 模式下先于知识图谱取值）。
     pub fn value_override(&self, entity: &str, attribute: &str) -> Option<&str> {
-        self.overrides.get(&override_key(entity, attribute)).map(String::as_str)
+        self.overrides
+            .get(&override_key(entity, attribute))
+            .map(String::as_str)
     }
 
     pub fn corrections(&self) -> impl Iterator<Item = &ValueCorrection> {
@@ -751,7 +786,11 @@ impl TraceStore {
     /// 打开一轮轨迹（幂等：同轮重复调用复用同一缓冲）。
     pub fn begin_turn(&mut self, turn: usize) {
         self.turn = turn;
-        let fresh = self.turns.back().map(|trace| trace.turn != turn).unwrap_or(true);
+        let fresh = self
+            .turns
+            .back()
+            .map(|trace| trace.turn != turn)
+            .unwrap_or(true);
         if fresh {
             self.turns.push_back(TurnTrace {
                 turn,
@@ -802,7 +841,11 @@ impl TraceStore {
         let turn = self.turn;
         let max_nodes = self.max_nodes_per_turn;
         // 确保当前轮缓冲存在（索引访问拆分借用，避免与计数器更新冲突）
-        let needs_fresh = self.turns.back().map(|trace| trace.turn != turn).unwrap_or(true);
+        let needs_fresh = self
+            .turns
+            .back()
+            .map(|trace| trace.turn != turn)
+            .unwrap_or(true);
         if needs_fresh {
             self.turns.push_back(TurnTrace {
                 turn,
@@ -987,7 +1030,9 @@ impl TraceStore {
     ) -> NodeId {
         self.begin_turn(turn);
         let truncated: String = note.chars().take(60).collect();
-        let event_id = self.trail.record(turn, surface, referent, source, truncated);
+        let event_id = self
+            .trail
+            .record(turn, surface, referent, source, truncated);
         let event = self
             .trail
             .events()
@@ -1030,13 +1075,13 @@ impl TraceStore {
     ) -> NodeId {
         self.begin_turn(turn);
         let qud_id = match (kind, attribute) {
-            (QudKind::AskAttribute, Some(attribute)) => self.qud.push_attribute(
-                turn,
-                entity.map(str::to_string),
-                attribute,
-                inherited,
-            ),
-            _ => self.qud.push_identity(turn, entity.map(str::to_string), inherited),
+            (QudKind::AskAttribute, Some(attribute)) => {
+                self.qud
+                    .push_attribute(turn, entity.map(str::to_string), attribute, inherited)
+            }
+            _ => self
+                .qud
+                .push_identity(turn, entity.map(str::to_string), inherited),
         };
         let entry = self.qud.entries().find(|entry| entry.id == qud_id).cloned();
         if let (Some(entry), Some(current)) = (entry, self.current_turn_mut()) {
@@ -1090,7 +1135,11 @@ impl TraceStore {
             .collect();
         let label = format!(
             "回复：{}",
-            if excerpt.is_empty() { "（无文本）" } else { &excerpt }
+            if excerpt.is_empty() {
+                "（无文本）"
+            } else {
+                &excerpt
+            }
         );
         let mut payload = NodePayload::new();
         if let Some(entity) = entity {
@@ -1102,10 +1151,7 @@ impl TraceStore {
         if !excerpt.is_empty() {
             payload.insert("answer".to_string(), excerpt);
         }
-        payload.insert(
-            "provenance".to_string(),
-            provenance.join("、"),
-        );
+        payload.insert("provenance".to_string(), provenance.join("、"));
         self.record_node(
             TraceLayer::L2Discourse,
             "reply",
@@ -1146,7 +1192,8 @@ impl TraceStore {
         previous: &str,
     ) -> (ValueCorrection, usize) {
         self.begin_turn(turn);
-        self.overrides.insert(override_key(entity, attribute), value.to_string());
+        self.overrides
+            .insert(override_key(entity, attribute), value.to_string());
         let correction = ValueCorrection {
             turn,
             entity: entity.to_string(),
@@ -1172,7 +1219,9 @@ impl TraceStore {
                 entity, attribute, previous, value
             ),
             Vec::new(),
-            vec![Support::UserInput { excerpt: format!("{}→{}", previous, value) }],
+            vec![Support::UserInput {
+                excerpt: format!("{}→{}", previous, value),
+            }],
             TraceStatus::Ok,
             payload,
         );
@@ -1181,15 +1230,18 @@ impl TraceStore {
 
     /// 找到最近一轮带回复节点且问同一实体属性的轮号（更正定位用）。
     pub fn last_answered_turn_for(&self, entity: &str, attribute: &str) -> Option<usize> {
-        self.turns.iter().rev().find(|trace| {
-            trace
-                .nodes
-                .iter()
-                .any(|node| node.kind == "reply"
-                    && node.status == TraceStatus::Ok
-                    && node.payload.get("entity").map(String::as_str) == Some(entity)
-                    && node.payload.get("attribute").map(String::as_str) == Some(attribute))
-        }).map(|trace| trace.turn)
+        self.turns
+            .iter()
+            .rev()
+            .find(|trace| {
+                trace.nodes.iter().any(|node| {
+                    node.kind == "reply"
+                        && node.status == TraceStatus::Ok
+                        && node.payload.get("entity").map(String::as_str) == Some(entity)
+                        && node.payload.get("attribute").map(String::as_str) == Some(attribute)
+                })
+            })
+            .map(|trace| trace.turn)
     }
 
     pub fn turns(&self) -> impl Iterator<Item = &TurnTrace> {
@@ -1209,13 +1261,22 @@ impl TraceStore {
 
     /// 从编年史回放一轮轨迹：恢复节点、问据、指代与更正覆盖（不重放决策）。
     pub fn push_turn_trace(&mut self, trace: TurnTrace) {
-        self.next_node_id = self
-            .next_node_id
-            .max(trace.nodes.iter().map(|node| node.id.0 + 1).max().unwrap_or(1));
-        self.qud.next_id = self
-            .qud
-            .next_id
-            .max(trace.qud.iter().map(|entry| entry.id + 1).max().unwrap_or(1));
+        self.next_node_id = self.next_node_id.max(
+            trace
+                .nodes
+                .iter()
+                .map(|node| node.id.0 + 1)
+                .max()
+                .unwrap_or(1),
+        );
+        self.qud.next_id = self.qud.next_id.max(
+            trace
+                .qud
+                .iter()
+                .map(|entry| entry.id + 1)
+                .max()
+                .unwrap_or(1),
+        );
         self.trail.next_id = self.trail.next_id.max(
             trace
                 .referents
@@ -1268,7 +1329,9 @@ impl TraceStore {
                 if !seen.insert(node_id) {
                     continue;
                 }
-                let Some(node) = self.find_node(node_id) else { continue };
+                let Some(node) = self.find_node(node_id) else {
+                    continue;
+                };
                 chain.push(node);
                 next.extend(node.inputs.iter().copied());
             }
@@ -1329,8 +1392,12 @@ impl TraceStore {
                 stale_turns += 1;
             }
             for node in &turn.nodes {
-                *status_counts.entry(node.status.label().to_string()).or_insert(0) += 1;
-                *layer_counts.entry(node.layer.code().to_string()).or_insert(0) += 1;
+                *status_counts
+                    .entry(node.status.label().to_string())
+                    .or_insert(0) += 1;
+                *layer_counts
+                    .entry(node.layer.code().to_string())
+                    .or_insert(0) += 1;
                 *kind_counts.entry(node.kind.clone()).or_insert(0) += 1;
             }
         }
@@ -1339,7 +1406,12 @@ impl TraceStore {
             turns: self.turns.len(),
             nodes: self.node_count(),
             stale_turns,
-            qud_open: self.qud.entries.iter().filter(|e| e.status == QudStatus::Open).count(),
+            qud_open: self
+                .qud
+                .entries
+                .iter()
+                .filter(|e| e.status == QudStatus::Open)
+                .count(),
             referents_active: self.trail.active_count(),
             corrections,
             status_counts,
@@ -1363,7 +1435,11 @@ impl TraceStore {
         lines.push(self.qud.report());
         lines.push(self.trail.report());
         for turn in &self.turns {
-            let stale = if turn.stale { "（含失效回答）" } else { "" };
+            let stale = if turn.stale {
+                "（含失效回答）"
+            } else {
+                ""
+            };
             lines.push(format!(
                 "第 {} 轮{}：「{}」{}",
                 turn.turn,
@@ -1425,7 +1501,11 @@ impl TraceGraphConfig {
 
     /// 构造带本配置上限的追踪存储。
     pub fn build_store(&self) -> TraceStore {
-        TraceStore::with_limits(self.max_turns, self.max_nodes_per_turn, self.max_events_per_turn)
+        TraceStore::with_limits(
+            self.max_turns,
+            self.max_nodes_per_turn,
+            self.max_events_per_turn,
+        )
     }
 }
 
@@ -1491,10 +1571,31 @@ mod tests {
     fn why_chain_orders_inputs_from_reply_to_surface() {
         let mut store = TraceStore::new();
         let surface = store.record_surface(1, "姚明的身高是多少");
-        let interpret =
-            store.record_interpret(1, surface, "ask_attribute", Some("姚明"), Some("身高"), Some("姚明的身高是什么"), false);
-        let qud = store.record_qud(1, interpret, QudKind::AskAttribute, Some("姚明"), Some("身高"), false);
-        let reply = store.record_reply(1, Some("姚明"), Some("身高"), vec![interpret, qud], &["知识图谱中的直接事实".to_string()], Some("姚明的身高是 226 厘米。"));
+        let interpret = store.record_interpret(
+            1,
+            surface,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            Some("姚明的身高是什么"),
+            false,
+        );
+        let qud = store.record_qud(
+            1,
+            interpret,
+            QudKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            false,
+        );
+        let reply = store.record_reply(
+            1,
+            Some("姚明"),
+            Some("身高"),
+            vec![interpret, qud],
+            &["知识图谱中的直接事实".to_string()],
+            Some("姚明的身高是 226 厘米。"),
+        );
         let chain = store.why(reply);
         let ids: Vec<NodeId> = chain.iter().map(|node| node.id).collect();
         // BFS 依 inputs 声明序展开：reply ← interpret/qud ← surface
@@ -1508,8 +1609,23 @@ mod tests {
     fn correction_marks_stale_and_overrides_value() {
         let mut store = TraceStore::new();
         let surface = store.record_surface(1, "姚明的身高是多少");
-        let interpret = store.record_interpret(1, surface, "ask_attribute", Some("姚明"), Some("身高"), None, false);
-        store.record_reply(1, Some("姚明"), Some("身高"), vec![interpret], &[], Some("226"));
+        let interpret = store.record_interpret(
+            1,
+            surface,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            None,
+            false,
+        );
+        store.record_reply(
+            1,
+            Some("姚明"),
+            Some("身高"),
+            vec![interpret],
+            &[],
+            Some("226"),
+        );
         assert_eq!(store.value_override("姚明", "身高"), None);
         let (correction, marked) = store.record_correction(2, 1, "姚明", "身高", "229", "226");
         assert_eq!(correction.value, "229");
@@ -1534,7 +1650,10 @@ mod tests {
         }
         let turn = store.last_turn().expect("应有轮迹");
         assert_eq!(turn.nodes.len(), 5, "4 个决策节点 + 1 个折叠摘要");
-        assert_eq!(turn.nodes.iter().filter(|node| node.kind == "fold").count(), 1);
+        assert_eq!(
+            turn.nodes.iter().filter(|node| node.kind == "fold").count(),
+            1
+        );
     }
 
     #[test]
@@ -1544,22 +1663,46 @@ mod tests {
             store.record_surface(turn, "输入");
         }
         assert_eq!(store.turn_count(), 3);
-        assert_eq!(store.turns().map(|turn| turn.turn).collect::<Vec<_>>(), vec![4, 5, 6]);
+        assert_eq!(
+            store.turns().map(|turn| turn.turn).collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
     }
 
     #[test]
     fn snapshot_roundtrip_preserves_qud_trail_and_overrides() {
         let mut store = TraceStore::new();
         let surface = store.record_surface(1, "姚明的身高是多少");
-        let interpret = store.record_interpret(1, surface, "ask_attribute", Some("姚明"), Some("身高"), None, false);
-        store.record_qud(1, interpret, QudKind::AskAttribute, Some("姚明"), Some("身高"), false);
+        let interpret = store.record_interpret(
+            1,
+            surface,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            None,
+            false,
+        );
+        store.record_qud(
+            1,
+            interpret,
+            QudKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            false,
+        );
         store.record_mention(1, interpret, "他", "姚明", ReferentSource::Pronoun, "焦点");
         store.record_correction(2, 1, "姚明", "身高", "229", "226");
         let json = serde_json::to_string(&store).expect("应可序列化");
         let restored: TraceStore = serde_json::from_str(&json).expect("应可反序列化");
         assert_eq!(restored, store);
         assert_eq!(restored.predicate_focus(), Some("身高"));
-        assert_eq!(restored.referent_trail().resolve("他").map(|e| e.referent.as_str()), Some("姚明"));
+        assert_eq!(
+            restored
+                .referent_trail()
+                .resolve("他")
+                .map(|e| e.referent.as_str()),
+            Some("姚明")
+        );
         assert_eq!(restored.value_override("姚明", "身高"), Some("229"));
     }
 
@@ -1567,8 +1710,23 @@ mod tests {
     fn push_turn_trace_replays_state_for_restart() {
         let mut source = TraceStore::new();
         let surface = source.record_surface(1, "姚明的身高是多少");
-        let interpret = source.record_interpret(1, surface, "ask_attribute", Some("姚明"), Some("身高"), None, false);
-        source.record_qud(1, interpret, QudKind::AskAttribute, Some("姚明"), Some("身高"), false);
+        let interpret = source.record_interpret(
+            1,
+            surface,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            None,
+            false,
+        );
+        source.record_qud(
+            1,
+            interpret,
+            QudKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            false,
+        );
         source.record_mention(1, interpret, "他", "姚明", ReferentSource::Pronoun, "焦点");
         source.record_correction(2, 1, "姚明", "身高", "229", "226");
         let archived: Vec<TurnTrace> = source.turns().cloned().collect();
@@ -1579,7 +1737,13 @@ mod tests {
         }
         assert_eq!(restored.predicate_focus(), Some("身高"));
         assert_eq!(restored.value_override("姚明", "身高"), Some("229"));
-        assert_eq!(restored.referent_trail().resolve("他").map(|e| e.referent.as_str()), Some("姚明"));
+        assert_eq!(
+            restored
+                .referent_trail()
+                .resolve("他")
+                .map(|e| e.referent.as_str()),
+            Some("姚明")
+        );
         assert_eq!(restored.node_count(), source.node_count());
     }
 
@@ -1587,9 +1751,23 @@ mod tests {
     fn receipt_is_stable_and_bounded() {
         let mut store = TraceStore::new();
         let surface = store.record_surface(1, "姚明的身高是多少");
-        let interpret =
-            store.record_interpret(1, surface, "ask_attribute", Some("姚明"), Some("身高"), None, false);
-        store.record_qud(1, interpret, QudKind::AskAttribute, Some("姚明"), Some("身高"), false);
+        let interpret = store.record_interpret(
+            1,
+            surface,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            None,
+            false,
+        );
+        store.record_qud(
+            1,
+            interpret,
+            QudKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            false,
+        );
         let receipt = store.receipt();
         assert_eq!(receipt.turns, 1);
         assert_eq!(receipt.nodes, 3);
@@ -1604,9 +1782,23 @@ mod tests {
     fn report_mentions_layers_and_modes() {
         let mut store = TraceStore::new();
         let surface = store.record_surface(1, "姚明的身高是多少");
-        let interpret =
-            store.record_interpret(1, surface, "ask_attribute", Some("姚明"), Some("身高"), None, false);
-        store.record_qud(1, interpret, QudKind::AskAttribute, Some("姚明"), Some("身高"), false);
+        let interpret = store.record_interpret(
+            1,
+            surface,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            None,
+            false,
+        );
+        store.record_qud(
+            1,
+            interpret,
+            QudKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            false,
+        );
         let report = store.render_report(TraceMode::On);
         assert!(report.contains("模式 on"), "{}", report);
         assert!(report.contains("问据栈"), "{}", report);
@@ -1619,7 +1811,15 @@ mod tests {
     fn last_answered_turn_for_locates_matching_reply() {
         let mut store = TraceStore::new();
         let s1 = store.record_surface(1, "姚明的身高是多少");
-        let i1 = store.record_interpret(1, s1, "ask_attribute", Some("姚明"), Some("身高"), None, false);
+        let i1 = store.record_interpret(
+            1,
+            s1,
+            "ask_attribute",
+            Some("姚明"),
+            Some("身高"),
+            None,
+            false,
+        );
         store.record_reply(1, Some("姚明"), Some("身高"), vec![i1], &[], Some("226"));
         let s2 = store.record_surface(2, "叶莉是谁");
         let i2 = store.record_interpret(2, s2, "ask_identity", Some("叶莉"), None, None, false);

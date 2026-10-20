@@ -79,10 +79,13 @@ impl DcgGrammar {
         if !self.rules.contains_key(head) {
             self.order.push(head.to_string());
         }
-        self.rules.entry(head.to_string()).or_default().push(DcgRule {
-            head: head.to_string(),
-            body,
-        });
+        self.rules
+            .entry(head.to_string())
+            .or_default()
+            .push(DcgRule {
+                head: head.to_string(),
+                body,
+            });
     }
 
     pub fn add_terminal_rule(&mut self, head: &str, text: &str) {
@@ -520,7 +523,9 @@ impl OwlNarrator {
         }
         // 个体、属性等名字也要登记，否则 brief/叙述会误判为未知实体
         match lesson {
-            OntologyLesson::Instance { individual, class, .. } => {
+            OntologyLesson::Instance {
+                individual, class, ..
+            } => {
                 self.known.insert(individual.clone());
                 self.known.insert(class.clone());
             }
@@ -810,7 +815,10 @@ impl DiscoursePlanner {
             .entry(predicate.to_string())
             .or_default()
             .insert(object.to_string());
-        *self.predicate_freq.entry(predicate.to_string()).or_insert(0) += 1;
+        *self
+            .predicate_freq
+            .entry(predicate.to_string())
+            .or_insert(0) += 1;
         let entry = self.by_subject.entry(subject.to_string()).or_default();
         match entry.iter_mut().find(|(pred, _)| pred == predicate) {
             Some((_, objects)) => objects.push(object.to_string()),
@@ -972,7 +980,8 @@ impl DiscoursePlanner {
 
         if sentences.len() < limit {
             if let Some(focus_entity) = focus.filter(|focus_entity| *focus_entity != entity) {
-                if let Some(sentence) = self.bridge_sentence(entity, focus_entity, &brief, surfaces) {
+                if let Some(sentence) = self.bridge_sentence(entity, focus_entity, &brief, surfaces)
+                {
                     sentences.push(sentence);
                 }
             }
@@ -995,10 +1004,9 @@ impl DiscoursePlanner {
         let Some(facts) = self.by_subject.get(entity) else {
             return Vec::new();
         };
-        let Some((key, objects)) = facts
-            .iter()
-            .find(|(canonical, _)| canonical == predicate || surface_of(canonical, surfaces) == predicate)
-        else {
+        let Some((key, objects)) = facts.iter().find(|(canonical, _)| {
+            canonical == predicate || surface_of(canonical, surfaces) == predicate
+        }) else {
             return Vec::new();
         };
         let surface = surface_of(key, surfaces);
@@ -1021,12 +1029,7 @@ impl DiscoursePlanner {
         }
     }
 
-    fn definition_sentence(
-        &self,
-        subject: &str,
-        category: &str,
-        variant: usize,
-    ) -> Option<String> {
+    fn definition_sentence(&self, subject: &str, category: &str, variant: usize) -> Option<String> {
         let category = crate::symbolic_generator::localized_type_label(category);
         let mut slots = HashMap::new();
         slots.insert("s".to_string(), subject.to_string());
@@ -1105,7 +1108,10 @@ fn surface_of<'a>(predicate: &'a str, surfaces: &'a HashMap<String, String>) -> 
     if let Some(localized) = crate::symbolic_generator::localized_predicate_key(predicate) {
         return localized;
     }
-    surfaces.get(predicate).map(String::as_str).unwrap_or(predicate)
+    surfaces
+        .get(predicate)
+        .map(String::as_str)
+        .unwrap_or(predicate)
 }
 
 /// 话题匹配度：命中话题的谓词排序在前
@@ -1213,11 +1219,16 @@ mod tests {
     #[test]
     fn test_dcg_rule_parsing_and_generation() {
         let mut grammar = DcgGrammar::new();
-        grammar.parse_rule("greeting --> hello name").expect("应能解析规则");
+        grammar
+            .parse_rule("greeting --> hello name")
+            .expect("应能解析规则");
         grammar.add_terminal_rule("hello", "你好");
         grammar.add_terminal_rule("name", "{who}");
         let filled = slots(&[("who", "张三")]);
-        assert_eq!(grammar.realize("greeting", &filled).as_deref(), Some("你好张三"));
+        assert_eq!(
+            grammar.realize("greeting", &filled).as_deref(),
+            Some("你好张三")
+        );
     }
 
     #[test]
@@ -1247,7 +1258,10 @@ mod tests {
         narrator.observe_facts(&sample_facts());
         let brief = narrator.brief("张三").expect("应能生成本体画像");
         assert_eq!(brief.primary_type.as_deref(), Some("人"));
-        assert!(brief.types.contains(&"动物".to_string()), "类型应沿子类上推");
+        assert!(
+            brief.types.contains(&"动物".to_string()),
+            "类型应沿子类上推"
+        );
         assert!(brief.ancestors.contains(&"动物".to_string()));
         assert!(brief.siblings.contains(&"李四".to_string()));
         assert!(brief
@@ -1259,8 +1273,12 @@ mod tests {
     #[test]
     fn test_owl_narrator_teach_axiom_and_class_property_inheritance() {
         let mut narrator = OwlNarrator::new(4);
-        narrator.teach_axiom("人是一种动物").expect("子类公理应可学习");
-        narrator.teach_axiom("人的寿命是100年").expect("固有属性应可学习");
+        narrator
+            .teach_axiom("人是一种动物")
+            .expect("子类公理应可学习");
+        narrator
+            .teach_axiom("人的寿命是100年")
+            .expect("固有属性应可学习");
         narrator.observe_facts(&[PrologFact::Entity {
             name: "苏格拉底".to_string(),
             entity_type: "人".to_string(),
@@ -1294,8 +1312,16 @@ mod tests {
             "同谓词多值应聚合：{}",
             text
         );
-        assert!(!text.contains("子类"), "层级谓词不应作为普通事实叙述：{}", text);
-        assert!(text.matches('。').count() <= 6, "句数应受上限约束：{}", text);
+        assert!(
+            !text.contains("子类"),
+            "层级谓词不应作为普通事实叙述：{}",
+            text
+        );
+        assert!(
+            text.matches('。').count() <= 6,
+            "句数应受上限约束：{}",
+            text
+        );
     }
 
     #[test]
@@ -1304,7 +1330,11 @@ mod tests {
         let text = planner
             .narrate("张三", Some("张三"), None, 4, &HashMap::new())
             .expect("应能生成叙述");
-        assert!(text.starts_with("它是一种人"), "焦点实体应回指为“它”：{}", text);
+        assert!(
+            text.starts_with("它是一种人"),
+            "焦点实体应回指为“它”：{}",
+            text
+        );
     }
 
     #[test]
@@ -1328,7 +1358,11 @@ mod tests {
             .expect("应能生成叙述");
         let teaching_pos = text.find("任教于").expect("话题谓词应出现");
         let profession_pos = text.find("职业").expect("其它事实也应出现");
-        assert!(teaching_pos < profession_pos, "命中话题的谓词应排前：{}", text);
+        assert!(
+            teaching_pos < profession_pos,
+            "命中话题的谓词应排前：{}",
+            text
+        );
     }
 
     #[test]
@@ -1363,6 +1397,11 @@ mod tests {
         let text = planner
             .narrate("张三", None, None, 6, &HashMap::new())
             .expect("重复观察后仍应能叙述");
-        assert_eq!(text.matches("任教于").count(), 1, "事实不应重复出现：{}", text);
+        assert_eq!(
+            text.matches("任教于").count(),
+            1,
+            "事实不应重复出现：{}",
+            text
+        );
     }
 }

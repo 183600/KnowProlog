@@ -121,9 +121,10 @@ impl ClaimWarrant {
 
     /// 第一个可行动、且尚未被冲突/类型话语覆盖的缺口。
     pub fn actionable_gap(&self) -> Option<&str> {
-        self.gaps.iter().find(|gap| {
-            !gap.starts_with("未落型") && !gap.starts_with("存在未裁决冲突")
-        }).map(String::as_str)
+        self.gaps
+            .iter()
+            .find(|gap| !gap.starts_with("未落型") && !gap.starts_with("存在未裁决冲突"))
+            .map(String::as_str)
     }
 
     /// 冲突披露句（无冲突时为 None；按现有值优先，绝不覆盖）。
@@ -224,7 +225,9 @@ impl QualityIndex {
         let mut values: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
         for fact in facts {
             match fact {
-                PrologFact::Entity { name, properties, .. } => {
+                PrologFact::Entity {
+                    name, properties, ..
+                } => {
                     let slots = values.entry(name.clone()).or_default();
                     for (key, value) in properties {
                         let entry = slots.entry(key.clone()).or_default();
@@ -254,10 +257,8 @@ impl QualityIndex {
             for predicate in slots.keys() {
                 if let Some(profile) = registry.profile(predicate) {
                     if !profile.sources.is_empty() {
-                        sources.insert(
-                            predicate.clone(),
-                            profile.sources.iter().cloned().collect(),
-                        );
+                        sources
+                            .insert(predicate.clone(), profile.sources.iter().cloned().collect());
                     }
                 }
             }
@@ -355,7 +356,9 @@ pub struct QualityReport {
 
 impl QualityReport {
     pub fn passport_for(&self, entity: &str) -> Option<&EntityPassport> {
-        self.entities.iter().find(|passport| passport.name == entity)
+        self.entities
+            .iter()
+            .find(|passport| passport.name == entity)
     }
 
     /// 报告正文（确定性；低分实体与缺口清单优先展示）。
@@ -708,9 +711,8 @@ pub fn build_report(
         .filter(|passport| passport.types.is_empty() && passport.degree > 0)
         .map(|passport| (passport.degree, passport.name.clone()))
         .collect();
-    clarify_candidates.sort_by(|left, right| {
-        right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
-    });
+    clarify_candidates
+        .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     let clarify_candidates: Vec<String> = clarify_candidates
         .into_iter()
         .map(|(_, name)| name)
@@ -978,10 +980,16 @@ mod tests {
         let zhangsan = report.passport_for("张三").unwrap();
         assert_eq!(zhangsan.types, vec!["人物".to_string()]);
         assert!((zhangsan.completeness - 1.0).abs() < 1e-9);
-        assert!(zhangsan.gaps.iter().all(|gap| !gap.contains("缺少必备属性")));
+        assert!(zhangsan
+            .gaps
+            .iter()
+            .all(|gap| !gap.contains("缺少必备属性")));
 
         let lisi = report.passport_for("李四").unwrap();
-        assert!((lisi.completeness - 1.0).abs() < 1e-9, "name 必备属性已提供");
+        assert!(
+            (lisi.completeness - 1.0).abs() < 1e-9,
+            "name 必备属性已提供"
+        );
         assert!(lisi.types.contains(&"人物".to_string()));
         assert!(
             lisi.type_sources
@@ -1010,7 +1018,10 @@ mod tests {
         assert_eq!(wangwu.types, vec!["entity".to_string()]);
         assert!((wangwu.completeness - 1.0).abs() < 1e-9);
         assert!(
-            !report.summary.clarify_candidates.contains(&"王五".to_string()),
+            !report
+                .summary
+                .clarify_candidates
+                .contains(&"王五".to_string()),
             "已落型实体不追问"
         );
 
@@ -1027,7 +1038,10 @@ mod tests {
             "补型后走必备属性口径：缺少 name 记 0"
         );
         assert!(
-            zhaoliu.gaps.iter().any(|gap| gap.contains("缺少必备属性「name」")),
+            zhaoliu
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("缺少必备属性「name」")),
             "{:?}",
             zhaoliu.gaps
         );
@@ -1042,7 +1056,10 @@ mod tests {
         assert!(mystery.types.is_empty());
         assert!((mystery.completeness - NEUTRAL_COMPLETENESS).abs() < 1e-9);
         assert!(mystery.gaps.iter().any(|gap| gap.contains("未落型")));
-        assert!(report.summary.clarify_candidates.contains(&"神秘人".to_string()));
+        assert!(report
+            .summary
+            .clarify_candidates
+            .contains(&"神秘人".to_string()));
     }
 
     #[test]
@@ -1128,12 +1145,10 @@ mod tests {
         worse.summary.mean_score -= 0.1;
         let verdict = compare_baseline(&baseline, &worse, RATCHET_EPSILON);
         assert!(!verdict.passed);
-        assert!(
-            verdict
-                .deltas
-                .iter()
-                .any(|delta| delta.metric == "mean_score" && !delta.passed)
-        );
+        assert!(verdict
+            .deltas
+            .iter()
+            .any(|delta| delta.metric == "mean_score" && !delta.passed));
     }
 
     #[test]
@@ -1163,7 +1178,13 @@ mod tests {
         assert_eq!(warrant.actionable_gap(), None, "冲突不应被当成缺属性追问");
 
         assert_eq!(index.warrant_for("不存在", Some("师傅")), None);
-        assert_eq!(index.warrant_for("张三", Some("未知属性")).unwrap().known_values, Vec::<String>::new());
+        assert_eq!(
+            index
+                .warrant_for("张三", Some("未知属性"))
+                .unwrap()
+                .known_values,
+            Vec::<String>::new()
+        );
     }
 
     #[test]

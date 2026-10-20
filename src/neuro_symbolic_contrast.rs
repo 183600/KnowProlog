@@ -315,8 +315,9 @@ impl ContrastArbiter {
             tuning.embedding_floor = config.embedding_similarity_floor.clamp(0.05, 0.95);
         }
         if config.association_min_confidence > 0.0 {
-            tuning.presence_floor =
-                tuning.presence_floor.min(config.association_min_confidence.clamp(0.05, 0.95));
+            tuning.presence_floor = tuning
+                .presence_floor
+                .min(config.association_min_confidence.clamp(0.05, 0.95));
         }
         Self::with_tuning(tuning)
     }
@@ -582,7 +583,9 @@ impl ContrastArbiter {
         let mut reading = SymbolicReading::default();
         for result in reasoner.check_statement(statement) {
             reading.formalized = true;
-            reading.verdict_labels.push(result.verdict.label().to_string());
+            reading
+                .verdict_labels
+                .push(result.verdict.label().to_string());
             if !result.reason.is_empty() {
                 reading.reasons.push(result.reason.clone());
             }
@@ -615,9 +618,7 @@ impl ContrastArbiter {
         let negated = contains_negation(statement);
         if !reading.proved && !reading.contradicted && !negated {
             if let Some(atom) = &reading.atom {
-                let solutions = reasoner
-                    .resolver()
-                    .solve(std::slice::from_ref(atom), &[]);
+                let solutions = reasoner.resolver().solve(std::slice::from_ref(atom), &[]);
                 if let Some(solution) = solutions.first() {
                     reading.proved = true;
                     reading.confidence = solution.confidence;
@@ -651,7 +652,9 @@ impl ContrastArbiter {
                         "用户已在对比流程中明确否认该陈述（会话级否证，随对话记忆持久化）"
                             .to_string(),
                     );
-                    reading.verdict_labels.push("用户否认（会话记忆）".to_string());
+                    reading
+                        .verdict_labels
+                        .push("用户否认（会话记忆）".to_string());
                 }
             }
         }
@@ -713,8 +716,8 @@ impl ContrastArbiter {
         .fold(0.0f64, f64::max);
         reading.score =
             self.tuning.presence_weight * presence + self.tuning.affinity_weight * affinity;
-        reading.supported = presence >= self.tuning.presence_floor
-            && reading.score >= self.tuning.min_score;
+        reading.supported =
+            presence >= self.tuning.presence_floor && reading.score >= self.tuning.min_score;
 
         if reading.soft.is_none()
             && reading.association.is_none()
@@ -920,11 +923,7 @@ impl ContrastArbiter {
     }
 
     /// 确认推测：写入会话事实（不修改知识图谱），此后逻辑通道也能证实
-    pub fn confirm_guess(
-        &mut self,
-        id: usize,
-        reasoner: &mut SymbolicReasoner,
-    ) -> Option<String> {
+    pub fn confirm_guess(&mut self, id: usize, reasoner: &mut SymbolicReasoner) -> Option<String> {
         let index = self
             .guesses
             .iter()
@@ -1072,11 +1071,7 @@ impl ContrastArbiter {
 
     /// 简版对比结论：用于常规问答路径的自动附加（控制篇幅）
     pub fn render_case_brief(&self, case: &ContrastCase) -> String {
-        let mut output = format!(
-            "【神经符号对比 #{}·{}】",
-            case.id,
-            case.verdict.label()
-        );
+        let mut output = format!("【神经符号对比 #{}·{}】", case.id, case.verdict.label());
         match case.verdict {
             ContrastVerdict::Agree => {
                 output.push_str(&format!(
@@ -1116,7 +1111,8 @@ impl ContrastArbiter {
             .filter(|guess| guess.status == GuessStatus::Pending)
             .collect();
         if pending.is_empty() {
-            return "当前没有待定联想推测。可输入「对比：<陈述句>」生成新的双通道对比。".to_string();
+            return "当前没有待定联想推测。可输入「对比：<陈述句>」生成新的双通道对比。"
+                .to_string();
         }
         let mut output = String::from("待定联想推测（逻辑未证实；确认后成为会话事实）：\n");
         for guess in pending {
@@ -1138,7 +1134,10 @@ impl ContrastArbiter {
         let percent = |value: usize| value as f64 * 100.0 / stats.total as f64;
         let mut output = String::new();
         output.push_str("神经符号对比·会话校准报告（全程纯符号，无神经网络）：\n");
-        output.push_str(&format!("  累计会话 {} 个（跨会话持久化于对话记忆）\n", stats.sessions));
+        output.push_str(&format!(
+            "  累计会话 {} 个（跨会话持久化于对话记忆）\n",
+            stats.sessions
+        ));
         output.push_str(&format!(
             "  案例总数 {}：双通道一致 {}（{:.0}%），仅符号证实 {}，仅联想推测 {}，通道冲突 {}，双通道未知 {}\n",
             stats.total,
@@ -1179,12 +1178,7 @@ impl ContrastArbiter {
             let shown: Vec<String> = keys
                 .iter()
                 .take(5)
-                .map(|key| {
-                    key.rsplit("::")
-                        .next()
-                        .unwrap_or(key.as_str())
-                        .to_string()
-                })
+                .map(|key| key.rsplit("::").next().unwrap_or(key.as_str()).to_string())
                 .collect();
             output.push_str(&format!(
                 "  已屏蔽推测 {} 条，例如：{}\n",
@@ -1380,8 +1374,7 @@ mod tests {
     }
 
     fn reasoner() -> SymbolicReasoner {
-        let mut reasoner =
-            SymbolicReasoner::new(ReasoningConfig::default(), HashMap::new());
+        let mut reasoner = SymbolicReasoner::new(ReasoningConfig::default(), HashMap::new());
         reasoner.observe_facts(&lineage_facts());
         reasoner
     }
@@ -1431,7 +1424,10 @@ mod tests {
         assert!(case.symbolic.proved, "直接事实应被符号通道证实");
         assert_eq!(case.verdict, ContrastVerdict::Agree);
         assert!(case.answer.contains("该陈述成立"));
-        assert!(case.distributional.supported, "直接事实的谓词存在性必然成立");
+        assert!(
+            case.distributional.supported,
+            "直接事实的谓词存在性必然成立"
+        );
         let rendered = arbiter.render_case(&case);
         assert!(rendered.contains("B·符号/演绎通道"));
         assert!(rendered.contains("A·联想/分布通道"));
@@ -1531,7 +1527,10 @@ mod tests {
         arbiter.refute_guess(case.guess_id.expect("应有待定推测"));
 
         let again = arbiter.contrast_statement("李四的国籍是德国", &reasoner);
-        assert!(again.symbolic.contradicted, "用户否认应作为否证被逻辑通道采用");
+        assert!(
+            again.symbolic.contradicted,
+            "用户否认应作为否证被逻辑通道采用"
+        );
         assert!(
             again
                 .symbolic
@@ -1657,7 +1656,10 @@ mod tests {
         let mut restored = ContrastArbiter::new();
         assert!(restored.restore_snapshot(&loaded));
         assert_eq!(restored.pending_guess_count(), 1);
-        assert_eq!(restored.next_followup().map(|item| item.guess_id), Some(pending_id));
+        assert_eq!(
+            restored.next_followup().map(|item| item.guess_id),
+            Some(pending_id)
+        );
         assert_eq!(restored.stats().refuted, 1);
 
         // DialogueSnapshot 还应能被 load 路径完整消费（含对比字段）
@@ -1670,7 +1672,8 @@ mod tests {
 
     #[test]
     fn dialogue_state_without_contrast_field_still_loads() {
-        let stored = r#"{"focus_entities":["张三"],"last_predicate":"师傅","history":["张三是谁"]}"#;
+        let stored =
+            r#"{"focus_entities":["张三"],"last_predicate":"师傅","history":["张三是谁"]}"#;
         let snapshot: DialogueSnapshot =
             serde_json::from_str(stored).expect("缺少 contrast 字段的对话记忆应能反序列化");
         assert!(snapshot.contrast.is_none());

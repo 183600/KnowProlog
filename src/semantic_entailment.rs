@@ -53,10 +53,16 @@ impl Proposition {
     pub fn render(&self) -> String {
         let body = match self.kind {
             PropositionKind::Relation => {
-                format!("relation({}, {}, {})", self.subject, self.predicate, self.object)
+                format!(
+                    "relation({}, {}, {})",
+                    self.subject, self.predicate, self.object
+                )
             }
             PropositionKind::Attribute => {
-                format!("attribute({}, {}, {})", self.subject, self.predicate, self.object)
+                format!(
+                    "attribute({}, {}, {})",
+                    self.subject, self.predicate, self.object
+                )
             }
             PropositionKind::TypeMembership => {
                 format!("type({}, {})", self.subject, self.object)
@@ -456,7 +462,8 @@ impl<'a> PropositionParser<'a> {
         if subject_text.is_empty() || object_text.is_empty() {
             return;
         }
-        let Some((predicate, kind, predicate_notes)) = self.resolve_predicate(predicate_text) else {
+        let Some((predicate, kind, predicate_notes)) = self.resolve_predicate(predicate_text)
+        else {
             return;
         };
         let subject = self.resolve_entity(subject_text);
@@ -471,7 +478,10 @@ impl<'a> PropositionParser<'a> {
         notes.extend(predicate_notes);
         notes.extend(object.notes);
         if !subject.resolved {
-            notes.push(format!("实体「{}」尚未收录（按未登录实体处理）", subject.canonical));
+            notes.push(format!(
+                "实体「{}」尚未收录（按未登录实体处理）",
+                subject.canonical
+            ));
         }
         let object_is_literal = !object.resolved && looks_literal(object_text);
         props.push(Proposition {
@@ -511,7 +521,10 @@ impl<'a> PropositionParser<'a> {
         }
         let mut notes = subject.notes.clone();
         if !subject.resolved {
-            notes.push(format!("实体「{}」尚未收录（按未登录实体处理）", subject.canonical));
+            notes.push(format!(
+                "实体「{}」尚未收录（按未登录实体处理）",
+                subject.canonical
+            ));
         }
         props.push(Proposition {
             kind: PropositionKind::TypeMembership,
@@ -556,7 +569,10 @@ impl<'a> PropositionParser<'a> {
             if object.canonical.is_empty() {
                 continue;
             }
-            let kind = match self.aligner.kind_of(&self.aligner.canonical_form(predicate)) {
+            let kind = match self
+                .aligner
+                .kind_of(&self.aligner.canonical_form(predicate))
+            {
                 Some(TermKind::Attribute) => PropositionKind::Attribute,
                 _ => PropositionKind::Relation,
             };
@@ -564,7 +580,10 @@ impl<'a> PropositionParser<'a> {
             notes.push(format!("中文表述：{} = {}", surface, predicate));
             notes.extend(object.notes);
             if !subject.resolved {
-                notes.push(format!("实体「{}」尚未收录（按未登录实体处理）", subject.canonical));
+                notes.push(format!(
+                    "实体「{}」尚未收录（按未登录实体处理）",
+                    subject.canonical
+                ));
             }
             let object_is_literal = !object.resolved && looks_literal(object_text);
             props.push(Proposition {
@@ -773,7 +792,10 @@ pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> Entailmen
             .iter()
             .map(|value| {
                 if proposition.kind == PropositionKind::TypeMembership {
-                    format!("知识图谱记录「{}」的类型是「{}」", proposition.subject, value)
+                    format!(
+                        "知识图谱记录「{}」的类型是「{}」",
+                        proposition.subject, value
+                    )
                 } else {
                     format!(
                         "知识图谱记录「{}」的「{}」是「{}」",
@@ -844,7 +866,11 @@ pub fn render_results(results: &[EntailmentResult]) -> String {
         }
         output.push('\n');
         for step in &result.proof {
-            output.push_str(&format!("     证据[{}]：{}\n", step.kind.label(), step.detail));
+            output.push_str(&format!(
+                "     证据[{}]：{}\n",
+                step.kind.label(),
+                step.detail
+            ));
         }
         for evidence in &result.counter_evidence {
             output.push_str(&format!("     反证：{}\n", evidence));
@@ -876,7 +902,12 @@ mod tests {
 
             aligner.register_term("人物", TermKind::Type);
             aligner.register_term("地点", TermKind::Type);
-            for (name, etype) in [("张三", "人物"), ("李四", "人物"), ("王五", "人物"), ("北京", "地点")] {
+            for (name, etype) in [
+                ("张三", "人物"),
+                ("李四", "人物"),
+                ("王五", "人物"),
+                ("北京", "地点"),
+            ] {
                 aligner.register_term(name, TermKind::Entity);
                 linker.register_entity(name, Some(etype));
                 generator.observe_entity(name, etype, &[]);
@@ -884,7 +915,11 @@ mod tests {
             generator.observe_entity("张三", "人物", &[("年龄".to_string(), "30".to_string())]);
             aligner.register_term("年龄", TermKind::Attribute);
 
-            for (s, p, o) in [("张三", "师傅", "李四"), ("李四", "师傅", "王五"), ("张三", "出生地", "北京")] {
+            for (s, p, o) in [
+                ("张三", "师傅", "李四"),
+                ("李四", "师傅", "王五"),
+                ("张三", "出生地", "北京"),
+            ] {
                 aligner.observe_triple(s, p, o);
                 predictor.add_triple(s, p, o);
                 linker.observe_triple(s, p, o);
@@ -899,8 +934,12 @@ mod tests {
         }
 
         fn parse(&self, text: &str) -> Vec<Proposition> {
-            PropositionParser::new(&self.aligner, &self.linker, self.generator.predicate_surfaces())
-                .parse(text)
+            PropositionParser::new(
+                &self.aligner,
+                &self.linker,
+                self.generator.predicate_surfaces(),
+            )
+            .parse(text)
         }
 
         fn entail_first(&self, text: &str) -> EntailmentResult {
@@ -973,7 +1012,12 @@ mod tests {
         fixture.aligner.register_term("不锈钢", TermKind::Entity);
         fixture.linker.register_entity("不锈钢", Some("合金"));
         let props = fixture.parse("不锈钢是合金");
-        assert_eq!(props.len(), 1, "「不锈钢」中的「不」不应被当成否定：{:?}", props);
+        assert_eq!(
+            props.len(),
+            1,
+            "「不锈钢」中的「不」不应被当成否定：{:?}",
+            props
+        );
         assert!(!props[0].negative);
         assert_eq!(props[0].subject, "不锈钢");
         assert_eq!(props[0].object, "合金");
@@ -1016,7 +1060,9 @@ mod tests {
         fixture.generator.observe_triple("张三", "knows", "李四");
         let props = fixture.parse("张三认识李四");
         assert!(
-            props.iter().any(|p| p.predicate == "knows" && p.object == "李四"),
+            props
+                .iter()
+                .any(|p| p.predicate == "knows" && p.object == "李四"),
             "中文动词「认识」应映射回规范谓词 knows：{:?}",
             props.iter().map(Proposition::render).collect::<Vec<_>>()
         );
@@ -1027,9 +1073,18 @@ mod tests {
     #[test]
     fn test_entail_direct_and_attribute_and_type() {
         let fixture = Fixture::new();
-        assert_eq!(fixture.entail_first("张三的师傅是李四").verdict, Verdict::Entailed);
-        assert_eq!(fixture.entail_first("张三的年龄是30").verdict, Verdict::Entailed);
-        assert_eq!(fixture.entail_first("张三是人物").verdict, Verdict::Entailed);
+        assert_eq!(
+            fixture.entail_first("张三的师傅是李四").verdict,
+            Verdict::Entailed
+        );
+        assert_eq!(
+            fixture.entail_first("张三的年龄是30").verdict,
+            Verdict::Entailed
+        );
+        assert_eq!(
+            fixture.entail_first("张三是人物").verdict,
+            Verdict::Entailed
+        );
     }
 
     #[test]
@@ -1056,7 +1111,11 @@ mod tests {
         let fixture = Fixture::new();
         let result = fixture.entail_first("赵六的师傅是李四");
         assert_eq!(result.verdict, Verdict::Unknown);
-        assert!(result.reason.contains("尚未收录"), "实际原因：{}", result.reason);
+        assert!(
+            result.reason.contains("尚未收录"),
+            "实际原因：{}",
+            result.reason
+        );
     }
 
     #[test]

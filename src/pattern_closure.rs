@@ -113,7 +113,9 @@ impl ClosureOutcome {
     }
 
     pub fn hop_count_of(&self, target: &str) -> Option<usize> {
-        self.witnesses.get(target).map(|path| path.len().saturating_sub(1))
+        self.witnesses
+            .get(target)
+            .map(|path| path.len().saturating_sub(1))
     }
 
     pub fn render_witness(&self, target: &str) -> Option<String> {
@@ -238,7 +240,10 @@ where
         frontier = next_frontier;
     }
 
-    if !stopped_by_budget && truncated.is_none() && exact_depth.is_none() && depth >= budget.max_depth
+    if !stopped_by_budget
+        && truncated.is_none()
+        && exact_depth.is_none()
+        && depth >= budget.max_depth
     {
         let has_more = frontier.iter().any(|path| {
             let node = path.last().map(String::as_str).unwrap_or(start);
@@ -285,7 +290,9 @@ mod tests {
         ])
     }
 
-    fn neighbors<'a>(graph: &'a BTreeMap<&'static str, Vec<&'static str>>) -> impl FnMut(&str) -> Vec<String> + 'a {
+    fn neighbors<'a>(
+        graph: &'a BTreeMap<&'static str, Vec<&'static str>>,
+    ) -> impl FnMut(&str) -> Vec<String> + 'a {
         move |node| {
             graph
                 .get(node)
@@ -321,12 +328,15 @@ mod tests {
         .expect("law authorizes plus closure");
         assert_eq!(outcome.reached_count, 4);
         assert!(outcome.complete());
-        assert_eq!(outcome.witnesses.get("戊"), Some(&vec![
-            "甲".to_string(),
-            "乙".to_string(),
-            "丁".to_string(),
-            "戊".to_string()
-        ]));
+        assert_eq!(
+            outcome.witnesses.get("戊"),
+            Some(&vec![
+                "甲".to_string(),
+                "乙".to_string(),
+                "丁".to_string(),
+                "戊".to_string()
+            ])
+        );
         assert_eq!(outcome.hop_count_of("戊"), Some(3));
         assert_eq!(outcome.law.as_deref(), Some("law:transitive:上司"));
     }
@@ -416,11 +426,7 @@ mod tests {
 
     #[test]
     fn depth_budget_that_exactly_fits_is_complete() {
-        let graph = BTreeMap::from([
-            ("甲", vec!["乙"]),
-            ("乙", vec!["丙"]),
-            ("丙", vec![]),
-        ]);
+        let graph = BTreeMap::from([("甲", vec!["乙"]), ("乙", vec!["丙"]), ("丙", vec![])]);
         let outcome = evaluate_closure(
             "甲",
             ClosureOp::Plus,
@@ -490,6 +496,9 @@ mod tests {
         assert_eq!(outcome.reached_count, 5);
         let ordered = outcome.targets_by_distance();
         assert_eq!(ordered.first().map(|(name, _)| *name), Some("甲"));
-        assert_eq!(ordered.last().map(|(name, hops)| (*name, *hops)), Some(("戊", 4)));
+        assert_eq!(
+            ordered.last().map(|(name, hops)| (*name, *hops)),
+            Some(("戊", 4))
+        );
     }
 }

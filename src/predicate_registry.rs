@@ -282,7 +282,9 @@ impl PredicateRegistry {
             // 逆向命中时，其互逆谓词就是规范谓词自身
             return Some(self.profiles.get(&resolution.canonical)?.canonical.as_str());
         }
-        self.inverse_index.get(&resolution.canonical).map(String::as_str)
+        self.inverse_index
+            .get(&resolution.canonical)
+            .map(String::as_str)
     }
 
     /// 别名列表（不包含规范名自身）
@@ -297,9 +299,7 @@ impl PredicateRegistry {
     pub fn alias_pairs(&self) -> Vec<(String, String, bool)> {
         self.alias_index
             .iter()
-            .map(|(alias, (canonical, inverted))| {
-                (alias.clone(), canonical.clone(), *inverted)
-            })
+            .map(|(alias, (canonical, inverted))| (alias.clone(), canonical.clone(), *inverted))
             .collect()
     }
 
@@ -413,12 +413,14 @@ impl PredicateRegistry {
         let canonical = resolution.canonical.clone();
         let inverse = profile.inverse.clone();
         self.profiles.remove(&canonical);
-        self.alias_index.retain(|_, (target, _)| target != &canonical);
+        self.alias_index
+            .retain(|_, (target, _)| target != &canonical);
         self.inverse_index.remove(&canonical);
         if let Some(inverse) = inverse {
             self.inverse_index.remove(&inverse);
         }
-        self.facts.retain(|(_, predicate, _)| predicate != &canonical);
+        self.facts
+            .retain(|(_, predicate, _)| predicate != &canonical);
         self.conflict_notes.retain(|_, by_predicate| {
             by_predicate.remove(&canonical);
             !by_predicate.is_empty()
@@ -456,8 +458,10 @@ impl PredicateRegistry {
             }
         }
         for alias_name in &inherited {
-            self.alias_index
-                .insert(alias_name.clone(), (target.canonical.clone(), target.inverted));
+            self.alias_index.insert(
+                alias_name.clone(),
+                (target.canonical.clone(), target.inverted),
+            );
         }
         self.alias_index
             .insert(alias.to_string(), (target.canonical, target.inverted));
@@ -480,7 +484,8 @@ impl PredicateRegistry {
             .cloned()
             .collect();
         for (subject, _predicate, object) in moved {
-            self.facts.remove(&(subject.clone(), alias.to_string(), object.clone()));
+            self.facts
+                .remove(&(subject.clone(), alias.to_string(), object.clone()));
             if inverted {
                 self.facts.insert((object, canonical.to_string(), subject));
             } else {
@@ -577,10 +582,8 @@ impl PredicateRegistry {
         };
 
         let changed = self.inverse_index.get(&slot) != Some(&counterpart);
-        self.inverse_index
-            .insert(slot.clone(), counterpart.clone());
-        self.inverse_index
-            .insert(counterpart.clone(), slot.clone());
+        self.inverse_index.insert(slot.clone(), counterpart.clone());
+        self.inverse_index.insert(counterpart.clone(), slot.clone());
         // 非槽位词面以逆向别名并入槽位：画像/支撑/别名一并迁移（必要时翻转）
         self.bind_inverse_alias(&counterpart, &slot, source);
         {
@@ -1049,7 +1052,12 @@ impl PredicateRegistry {
             if !profile.domain.is_empty() {
                 traits.push(format!(
                     "定义域「{}」",
-                    profile.domain.iter().cloned().collect::<Vec<_>>().join("、")
+                    profile
+                        .domain
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("、")
                 ));
             }
             if !profile.range.is_empty() {
@@ -1329,7 +1337,10 @@ mod tests {
         assert_eq!(profile.support, 1);
         assert!(profile.values.get("李四").unwrap().contains("张三"));
         assert!(!profile.values.contains_key("张三"));
-        assert_eq!(registry.conflict("李四", "师傅", "王五"), Some(vec!["张三".to_string()]));
+        assert_eq!(
+            registry.conflict("李四", "师傅", "王五"),
+            Some(vec!["张三".to_string()])
+        );
     }
 
     #[test]
@@ -1370,10 +1381,7 @@ mod tests {
         let mut master = config("师傅");
         master.domain = vec!["人物".to_string()];
         master.range = vec!["人物".to_string()];
-        assert!(
-            !registry.declare(&master),
-            "重复声明同一画像不新增"
-        );
+        assert!(!registry.declare(&master), "重复声明同一画像不新增");
         assert!(registry.report().contains("定义域"));
     }
 
@@ -1388,7 +1396,10 @@ mod tests {
             "未标记功能谓词时不应判冲突"
         );
         assert!(registry.mark_functional("年龄", true));
-        assert_eq!(registry.conflict("小明", "年龄", "19"), Some(vec!["18".to_string()]));
+        assert_eq!(
+            registry.conflict("小明", "年龄", "19"),
+            Some(vec!["18".to_string()])
+        );
         assert!(registry.conflict("小明", "年龄", "18").is_none());
     }
 
@@ -1482,7 +1493,10 @@ mod tests {
         assert_eq!(restored.pending_admissions(), vec!["师从".to_string()]);
         assert_eq!(restored.profile("师傅").unwrap().support, 1);
         assert!(restored.report().contains("师傅"));
-        assert!(restored.findings_report().contains("候选") || restored.findings_report().contains("未发现"));
+        assert!(
+            restored.findings_report().contains("候选")
+                || restored.findings_report().contains("未发现")
+        );
     }
 
     #[test]
@@ -1582,10 +1596,7 @@ mod tests {
         // 撤销第一笔导入：动作逐条回撤，知识库回到导入前快照
         let removed = manager.undo_import(&receipt).await.unwrap();
         assert_eq!(removed, receipt.actions.len());
-        assert_eq!(
-            manager.load_all_relations().await.unwrap(),
-            before
-        );
+        assert_eq!(manager.load_all_relations().await.unwrap(), before);
     }
 
     /// C11（导入闸门·功能谓词冲突）：已确认唯一值的谓词出现矛盾值时不覆盖，
