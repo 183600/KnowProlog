@@ -271,6 +271,9 @@ enum Commands {
         /// Maximum number of candidates to report (0 = no limit)
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Apply accepted candidates whose endpoints already exist in the graph
+        #[arg(long)]
+        apply: bool,
         /// Print the full report as JSON
         #[arg(long)]
         json: bool,
@@ -851,6 +854,7 @@ async fn main() {
             min_support,
             min_purity,
             limit,
+            apply,
             json,
         }) => {
             let registry_path = format!("{}/predicate_registry.json", store_path);
@@ -899,6 +903,37 @@ async fn main() {
             let constructor =
                 WeakConstructor::new(facts.as_slice(), registry, types, laws);
             let report = constructor.build(&source, &options);
+            if apply {
+                let items: Vec<KnowledgeItem> = report
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.decision
+                            == know_prolog::weak_construction::CandidateDecision::Accepted
+                            && candidate.known_subject
+                            && candidate.known_object
+                    })
+                    .map(|candidate| KnowledgeItem::Relationship {
+                        from_label: String::new(),
+                        from_id: candidate.subject.clone(),
+                        to_label: String::new(),
+                        to_id: candidate.object.clone(),
+                        rel_type: candidate.predicate.clone(),
+                        properties: std::collections::HashMap::new(),
+                    })
+                    .collect();
+                if items.is_empty() {
+                    eprintln!("没有可落库的已接受候选（端点必须已在图谱中）。");
+                } else {
+                    match oxigraph_manager.save_knowledge_with_receipt(items).await {
+                        Ok(receipt) => eprintln!("{}", receipt.summary()),
+                        Err(e) => {
+                            eprintln!("写入知识库失败: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{}", text),

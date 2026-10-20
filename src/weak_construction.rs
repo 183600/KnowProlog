@@ -302,7 +302,7 @@ impl ConstructionReport {
     pub fn render_text(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!(
-            "WSC 双向弱监督构建（只读）：{} 句，种子边 {}，对齐 {}，模式 {}（激活 {}）。",
+            "WSC 双向弱监督构建：{} 句，种子边 {}，对齐 {}，模式 {}（激活 {}）。",
             self.stats.sentences,
             self.stats.seed_edges,
             self.stats.aligned_seed_edges,
