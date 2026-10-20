@@ -1,0 +1,1406 @@
+{
+  "lock_version": 1,
+  "language_version": "0.1.0",
+  "schema": {
+    "snapshot_version": 1,
+    "entity_types": {
+      "Entity": {
+        "examples": [
+          "通用实体"
+        ],
+        "properties": {
+          "name": {
+            "data_type": "string",
+            "required": true,
+            "extraction_patterns": []
+          },
+          "property": {
+            "data_type": "string",
+            "required": false,
+            "extraction_patterns": []
+          }
+        }
+      },
+      "Person": {
+        "examples": [
+          "人物信息"
+        ],
+        "properties": {
+          "age": {
+            "data_type": "integer",
+            "required": false,
+            "extraction_patterns": []
+          },
+          "height": {
+            "data_type": "integer",
+            "required": false,
+            "extraction_patterns": []
+          },
+          "name": {
+            "data_type": "string",
+            "required": true,
+            "extraction_patterns": []
+          },
+          "weight": {
+            "data_type": "integer",
+            "required": false,
+            "extraction_patterns": []
+          }
+        }
+      }
+    },
+    "extraction_rules": {
+      "人物信息提取": {
+        "entity_type": "Person",
+        "priority": 10,
+        "patterns": [
+          {
+            "pos": [
+              "nr",
+              "m",
+              "q"
+            ],
+            "properties": {
+              "age": "pos:m",
+              "name": "pos:nr"
+            }
+          },
+          {
+            "pos": [
+              "nr",
+              "v",
+              "m",
+              "q"
+            ],
+            "properties": {
+              "age": "pos:m",
+              "name": "pos:nr"
+            }
+          },
+          {
+            "pos": [
+              "nr",
+              "unknown",
+              "m",
+              "q"
+            ],
+            "properties": {
+              "age": "pos:m",
+              "name": "pos:nr"
+            }
+          }
+        ]
+      },
+      "身体数据提取": {
+        "entity_type": "Person",
+        "priority": 9,
+        "patterns": [
+          {
+            "pos": [
+              "nr",
+              "unknown",
+              "m",
+              "q"
+            ],
+            "keywords": [
+              "身高"
+            ],
+            "properties": {
+              "height": "pos:m",
+              "name": "pos:nr"
+            }
+          },
+          {
+            "pos": [
+              "nr",
+              "unknown",
+              "m"
+            ],
+            "keywords": [
+              "身高"
+            ],
+            "properties": {
+              "height": "pos:m",
+              "name": "pos:nr"
+            }
+          },
+          {
+            "pos": [
+              "nr",
+              "unknown",
+              "m",
+              "q"
+            ],
+            "keywords": [
+              "体重"
+            ],
+            "properties": {
+              "name": "pos:nr",
+              "weight": "pos:m"
+            }
+          },
+          {
+            "pos": [
+              "nr",
+              "unknown",
+              "m"
+            ],
+            "keywords": [
+              "体重"
+            ],
+            "properties": {
+              "name": "pos:nr",
+              "weight": "pos:m"
+            }
+          }
+        ]
+      },
+      "通用实体提取": {
+        "entity_type": "Entity",
+        "priority": 1,
+        "patterns": [
+          {
+            "pos": [
+              "nr",
+              "v",
+              "*"
+            ],
+            "properties": {
+              "name": "pos:nr",
+              "property": "pos:*"
+            }
+          },
+          {
+            "pos": [
+              "n",
+              "v",
+              "*"
+            ],
+            "properties": {
+              "name": "pos:n",
+              "property": "pos:*"
+            }
+          }
+        ]
+      }
+    },
+    "prolog_rules": {
+      "作者查询": {
+        "query_type": "author_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "的",
+          "作者",
+          "是",
+          "谁"
+        ]
+      },
+      "作者查询2": {
+        "query_type": "author_query",
+        "priority": 14,
+        "pattern": [
+          "n",
+          "作者"
+        ]
+      },
+      "关系查询": {
+        "query_type": "relation_query",
+        "priority": 10,
+        "pattern": [
+          "nr",
+          "和",
+          "nr",
+          "什么",
+          "关系"
+        ]
+      },
+      "冠军查询": {
+        "query_type": "champion_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "的",
+          "冠军",
+          "是",
+          "哪支",
+          "队伍"
+        ]
+      },
+      "冠军查询2": {
+        "query_type": "champion_query",
+        "priority": 14,
+        "pattern": [
+          "n",
+          "冠军"
+        ]
+      },
+      "化学分子式查询": {
+        "query_type": "chemical_formula_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "的",
+          "化学",
+          "分子式",
+          "是",
+          "什么"
+        ]
+      },
+      "化学分子式查询2": {
+        "query_type": "chemical_formula_query",
+        "priority": 14,
+        "pattern": [
+          "n",
+          "化学",
+          "分子式"
+        ]
+      },
+      "原因查询": {
+        "query_type": "cause_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "的",
+          "主要",
+          "原因",
+          "是",
+          "什么"
+        ]
+      },
+      "原因查询2": {
+        "query_type": "reason_query",
+        "priority": 14,
+        "pattern": [
+          "n",
+          "为何",
+          "v"
+        ]
+      },
+      "原理查询": {
+        "query_type": "principle_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "的",
+          "工作",
+          "原理",
+          "是",
+          "什么"
+        ]
+      },
+      "原理查询2": {
+        "query_type": "principle_query",
+        "priority": 14,
+        "pattern": [
+          "n",
+          "工作",
+          "原理"
+        ]
+      },
+      "哲学思想查询": {
+        "query_type": "philosophy_query",
+        "priority": 15,
+        "pattern": [
+          "nr",
+          "的",
+          "核心",
+          "哲学",
+          "思想",
+          "是",
+          "什么"
+        ]
+      },
+      "属性查询": {
+        "query_type": "property_query",
+        "priority": 5,
+        "pattern": [
+          "nr",
+          "的",
+          "n"
+        ]
+      },
+      "年龄查询": {
+        "query_type": "age_query",
+        "priority": 10,
+        "pattern": [
+          "nr",
+          "多大"
+        ]
+      },
+      "年龄查询2": {
+        "query_type": "age_query",
+        "priority": 9,
+        "pattern": [
+          "nr",
+          "的",
+          "年龄"
+        ]
+      },
+      "影响查询": {
+        "query_type": "impact_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "对",
+          "ns",
+          "产生",
+          "了",
+          "哪些",
+          "影响"
+        ]
+      },
+      "影响查询2": {
+        "query_type": "impact_query",
+        "priority": 13,
+        "pattern": [
+          "n",
+          "影响"
+        ]
+      },
+      "思想查询": {
+        "query_type": "philosophy_query",
+        "priority": 13,
+        "pattern": [
+          "nr",
+          "思想"
+        ]
+      },
+      "数量查询": {
+        "query_type": "quantity_query",
+        "priority": 15,
+        "pattern": [
+          "人体",
+          "有",
+          "多少",
+          "块",
+          "n"
+        ]
+      },
+      "数量查询2": {
+        "query_type": "quantity_query",
+        "priority": 14,
+        "pattern": [
+          "有",
+          "多少",
+          "n"
+        ]
+      },
+      "时间前查询": {
+        "query_type": "time_before_query",
+        "priority": 15,
+        "pattern": [
+          "ns",
+          "是",
+          "在",
+          "哪一年",
+          "之前"
+        ]
+      },
+      "最大查询": {
+        "query_type": "largest_query",
+        "priority": 14,
+        "pattern": [
+          "最大",
+          "的",
+          "n",
+          "是",
+          "r"
+        ]
+      },
+      "最大行星查询": {
+        "query_type": "planet_query",
+        "priority": 15,
+        "pattern": [
+          "太阳系",
+          "中",
+          "最大",
+          "的",
+          "行星",
+          "是",
+          "哪一颗"
+        ]
+      },
+      "概念查询": {
+        "query_type": "concept_query",
+        "priority": 12,
+        "pattern": [
+          "什么",
+          "是",
+          "n"
+        ]
+      },
+      "概念解释查询": {
+        "query_type": "explanation_query",
+        "priority": 15,
+        "pattern": [
+          "解释",
+          "一下",
+          "什么",
+          "是",
+          "n"
+        ]
+      },
+      "比较查询": {
+        "query_type": "comparison_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "和",
+          "n",
+          "有什么",
+          "区别"
+        ]
+      },
+      "比较查询2": {
+        "query_type": "comparison_query",
+        "priority": 14,
+        "pattern": [
+          "比较",
+          "n",
+          "和",
+          "n"
+        ]
+      },
+      "海拔查询": {
+        "query_type": "altitude_query",
+        "priority": 15,
+        "pattern": [
+          "ns",
+          "的",
+          "海拔",
+          "高度",
+          "是",
+          "多少"
+        ]
+      },
+      "海拔查询2": {
+        "query_type": "altitude_query",
+        "priority": 14,
+        "pattern": [
+          "ns",
+          "海拔",
+          "多少"
+        ]
+      },
+      "解释查询": {
+        "query_type": "explanation_query",
+        "priority": 14,
+        "pattern": [
+          "解释",
+          "n"
+        ]
+      },
+      "计数查询": {
+        "query_type": "count_query",
+        "priority": 8,
+        "pattern": [
+          "有",
+          "多少",
+          "个",
+          "n"
+        ]
+      },
+      "诞生年份查询": {
+        "query_type": "birth_year_query",
+        "priority": 15,
+        "pattern": [
+          "n",
+          "语言",
+          "是",
+          "哪一年",
+          "诞生",
+          "的"
+        ]
+      },
+      "诞生年份查询2": {
+        "query_type": "birth_year_query",
+        "priority": 14,
+        "pattern": [
+          "n",
+          "诞生",
+          "年"
+        ]
+      },
+      "配偶查询": {
+        "query_type": "spouse_query",
+        "priority": 10,
+        "pattern": [
+          "nr",
+          "的",
+          "老婆"
+        ]
+      },
+      "配偶查询2": {
+        "query_type": "spouse_query",
+        "priority": 10,
+        "pattern": [
+          "nr",
+          "的",
+          "老公"
+        ]
+      },
+      "首都查询": {
+        "query_type": "capital_query",
+        "priority": 15,
+        "pattern": [
+          "ns",
+          "的",
+          "首都",
+          "是",
+          "哪里"
+        ]
+      },
+      "首都查询2": {
+        "query_type": "capital_query",
+        "priority": 14,
+        "pattern": [
+          "ns",
+          "首都"
+        ]
+      }
+    },
+    "query_types": {
+      "age_query": {
+        "direct": false,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "年龄查询2[31]",
+          "年龄查询[30]"
+        ]
+      },
+      "altitude_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "海拔查询2[3]",
+          "海拔查询[2]"
+        ]
+      },
+      "author_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "作者查询2[7]",
+          "作者查询[6]"
+        ]
+      },
+      "birth_year_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "诞生年份查询2[11]",
+          "诞生年份查询[10]"
+        ]
+      },
+      "capital_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "首都查询2[1]",
+          "首都查询[0]"
+        ]
+      },
+      "cause_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "原因查询[28]"
+        ]
+      },
+      "champion_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "冠军查询2[9]",
+          "冠军查询[8]"
+        ]
+      },
+      "chemical_formula_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "化学分子式查询2[5]",
+          "化学分子式查询[4]"
+        ]
+      },
+      "comparison_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "比较查询2[23]",
+          "比较查询[22]"
+        ]
+      },
+      "concept_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "概念查询[17]"
+        ]
+      },
+      "count_query": {
+        "direct": false,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "计数查询[35]"
+        ]
+      },
+      "explanation_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "概念解释查询[18]",
+          "解释查询[19]"
+        ]
+      },
+      "impact_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "影响查询2[27]",
+          "影响查询[26]"
+        ]
+      },
+      "largest_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "最大查询[13]"
+        ]
+      },
+      "philosophy_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "哲学思想查询[24]",
+          "思想查询[25]"
+        ]
+      },
+      "planet_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "最大行星查询[12]"
+        ]
+      },
+      "population_query": {
+        "direct": false,
+        "generated": false,
+        "formatted": true,
+        "supported": false,
+        "declared_by": []
+      },
+      "principle_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "原理查询2[21]",
+          "原理查询[20]"
+        ]
+      },
+      "property_query": {
+        "direct": false,
+        "generated": true,
+        "formatted": false,
+        "supported": true,
+        "declared_by": [
+          "属性查询[36]"
+        ]
+      },
+      "quantity_query": {
+        "direct": true,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "数量查询2[15]",
+          "数量查询[14]"
+        ]
+      },
+      "reason_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "原因查询2[29]"
+        ]
+      },
+      "relation_query": {
+        "direct": false,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "关系查询[32]"
+        ]
+      },
+      "spouse_query": {
+        "direct": false,
+        "generated": true,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "配偶查询2[34]",
+          "配偶查询[33]"
+        ]
+      },
+      "time_before_query": {
+        "direct": true,
+        "generated": false,
+        "formatted": true,
+        "supported": true,
+        "declared_by": [
+          "时间前查询[16]"
+        ]
+      }
+    },
+    "predicate_profiles": {
+      "任职于": {
+        "aliases": [
+          "工作单位",
+          "所在单位"
+        ],
+        "inverse": null,
+        "functional": false,
+        "transitive": false,
+        "symmetric": false,
+        "domain": [],
+        "range": []
+      },
+      "出生于": {
+        "aliases": [
+          "出生地",
+          "籍贯"
+        ],
+        "inverse": null,
+        "functional": true,
+        "transitive": false,
+        "symmetric": false,
+        "domain": [],
+        "range": []
+      },
+      "居住于": {
+        "aliases": [
+          "住在",
+          "居住地"
+        ],
+        "inverse": null,
+        "functional": true,
+        "transitive": false,
+        "symmetric": false,
+        "domain": [],
+        "range": []
+      },
+      "师傅": {
+        "aliases": [
+          "师父",
+          "恩师",
+          "老师"
+        ],
+        "inverse": "徒弟",
+        "functional": false,
+        "transitive": true,
+        "symmetric": false,
+        "domain": [
+          "人物"
+        ],
+        "range": [
+          "人物"
+        ]
+      },
+      "年龄": {
+        "aliases": [
+          "岁数"
+        ],
+        "inverse": null,
+        "functional": true,
+        "transitive": false,
+        "symmetric": false,
+        "domain": [],
+        "range": []
+      },
+      "徒弟": {
+        "aliases": [
+          "学生"
+        ],
+        "inverse": "师傅",
+        "functional": false,
+        "transitive": true,
+        "symmetric": false,
+        "domain": [],
+        "range": []
+      },
+      "配偶": {
+        "aliases": [
+          "丈夫",
+          "妻子",
+          "老公",
+          "老婆"
+        ],
+        "inverse": null,
+        "functional": false,
+        "transitive": false,
+        "symmetric": true,
+        "domain": [],
+        "range": []
+      }
+    },
+    "entity_profiles": {},
+    "type_system": {
+      "closure_gate": true,
+      "aliases": {
+        "entity": "实体",
+        "person": "人物",
+        "人": "人物"
+      },
+      "subclasses": {
+        "人物": [
+          "实体"
+        ],
+        "地点": [
+          "实体"
+        ],
+        "学生": [
+          "人物"
+        ]
+      },
+      "disjoint": [
+        [
+          "人物",
+          "地点"
+        ]
+      ]
+    },
+    "lexicon": {
+      "import_keywords": [
+        "import jsonld",
+        "import jsonld content",
+        "导入",
+        "导入jsonld内容",
+        "导入jsonld文件",
+        "录入",
+        "新增",
+        "添加",
+        "记录"
+      ],
+      "pos": {
+        "2022": "m",
+        "4G": "n",
+        "5G": "n",
+        "CRISPR": "n",
+        "Python": "n",
+        "一下": "f",
+        "世界杯": "n",
+        "东京": "ns",
+        "东西方": "ns",
+        "丝绸之路": "ns",
+        "个": "q",
+        "主要": "a",
+        "之前": "f",
+        "产生": "v",
+        "享乐主义": "n",
+        "京都": "ns",
+        "人体": "n",
+        "什么": "r",
+        "作者": "n",
+        "例子": "n",
+        "光合作用": "n",
+        "关键": "a",
+        "内卷": "n",
+        "冠军": "n",
+        "几": "m",
+        "分子式": "n",
+        "分析": "v",
+        "化学分子式": "n",
+        "区别": "n",
+        "区块链": "n",
+        "历史意义": "n",
+        "原因": "n",
+        "原理": "n",
+        "发表": "v",
+        "受到": "v",
+        "古": "a",
+        "古埃及": "ns",
+        "古希腊": "ns",
+        "含义": "n",
+        "哈姆雷特": "n",
+        "哪一年": "r",
+        "哪一颗": "r",
+        "哪些": "r",
+        "哪几场": "r",
+        "哪里": "r",
+        "哲学思想": "n",
+        "场": "q",
+        "块": "q",
+        "基因编辑": "n",
+        "多大": "r",
+        "多少": "m",
+        "太阳系": "ns",
+        "孔子": "nr",
+        "定律": "n",
+        "岁": "q",
+        "工作原理": "n",
+        "年": "q",
+        "年龄": "n",
+        "建造": "v",
+        "建造目的": "n",
+        "影响": "n",
+        "思想": "n",
+        "情感": "n",
+        "惩罚": "v",
+        "战役": "n",
+        "扮演": "v",
+        "技术": "n",
+        "描述": "v",
+        "提升": "n",
+        "摩尔定律": "n",
+        "支": "q",
+        "文艺复兴": "n",
+        "斯多葛主义": "n",
+        "日本": "ns",
+        "星夜": "n",
+        "是": "v",
+        "普罗米修斯": "nr",
+        "最大": "a",
+        "机器学习": "n",
+        "核心": "a",
+        "梵高": "nr",
+        "欧洲": "ns",
+        "比较": "v",
+        "气候变化": "n",
+        "水": "n",
+        "法国": "ns",
+        "海拔": "n",
+        "海拔高度": "n",
+        "深度学习": "n",
+        "深远": "a",
+        "潜在": "a",
+        "牛顿": "nr",
+        "独立宣言": "n",
+        "现任": "a",
+        "现在": "f",
+        "珠穆朗玛峰": "ns",
+        "的": "u",
+        "相比": "v",
+        "真正": "a",
+        "神话": "n",
+        "第二次世界大战": "n",
+        "简述": "v",
+        "米": "q",
+        "经典": "a",
+        "美国": "ns",
+        "背景": "n",
+        "能解决": "v",
+        "艺术风格": "n",
+        "行星": "n",
+        "观点": "n",
+        "角色": "n",
+        "解决": "v",
+        "解释": "v",
+        "诞生": "v",
+        "语言": "n",
+        "谁": "r",
+        "起源": "n",
+        "转折点": "n",
+        "达尔文": "nr",
+        "进化论": "n",
+        "适用": "v",
+        "量子计算": "n",
+        "金字塔": "n",
+        "问题": "n",
+        "队伍": "n",
+        "风格": "n",
+        "风险": "n",
+        "首都": "n",
+        "骨头": "n",
+        "高度": "n",
+        "黑洞": "n"
+      },
+      "name_prefixes": [
+        "小",
+        "老",
+        "大"
+      ],
+      "name_suffixes": [
+        "总",
+        "哥",
+        "姐"
+      ],
+      "full_names": [
+        "张三",
+        "李四",
+        "王五",
+        "赵六"
+      ],
+      "profession_suffixes": [
+        "医生",
+        "老师",
+        "工程师"
+      ],
+      "synonyms": {
+        "老公": "丈夫",
+        "老婆": "妻子"
+      }
+    },
+    "prompts": {
+      "admit_ignorance/attribute/more": {
+        "policy": "admit_ignorance",
+        "template": "关于「{entity}」的「{attribute}」，我的知识图谱里暂时没有记录。\n不过我知道它的「{listed}」等 {count} 项信息，你想了解哪一个？",
+        "required": [
+          "entity",
+          "attribute",
+          "listed",
+          "count"
+        ],
+        "optional": []
+      },
+      "admit_ignorance/attribute/plain": {
+        "policy": "admit_ignorance",
+        "template": "关于「{entity}」的「{attribute}」，我的知识图谱里暂时没有记录。\n你可以换一种问法，或者直接告诉我相关事实，我会把它记住。",
+        "required": [
+          "entity",
+          "attribute"
+        ],
+        "optional": []
+      },
+      "admit_ignorance/identity/more": {
+        "policy": "admit_ignorance",
+        "template": "我的知识图谱里暂时没有关于「{entity}」的介绍信息。\n不过我知道它的「{listed}」等 {count} 项信息，你想了解哪一个？",
+        "required": [
+          "entity",
+          "listed",
+          "count"
+        ],
+        "optional": []
+      },
+      "admit_ignorance/identity/plain": {
+        "policy": "admit_ignorance",
+        "template": "我的知识图谱里暂时没有关于「{entity}」的介绍信息。\n你可以换一种问法，或者直接告诉我相关事实，我会把它记住。",
+        "required": [
+          "entity"
+        ],
+        "optional": []
+      },
+      "clarify_entity/multi": {
+        "policy": "clarify_entity",
+        "template": "你想问的「{attribute}」是指「{candidates}」还是「{last}」？告诉我名字我就接着答。",
+        "required": [
+          "attribute",
+          "candidates",
+          "last"
+        ],
+        "optional": []
+      },
+      "clarify_entity/single": {
+        "policy": "clarify_entity",
+        "template": "你想问谁的「{attribute}」？先告诉我实体名吧。",
+        "required": [
+          "attribute"
+        ],
+        "optional": []
+      },
+      "clarify_entity_no_focus/plain": {
+        "policy": "clarify_entity_no_focus",
+        "template": "你想问谁的「{attribute}」？先告诉我实体名吧。",
+        "required": [
+          "attribute"
+        ],
+        "optional": []
+      },
+      "continue_no_focus/plain": {
+        "policy": "continue_no_focus",
+        "template": "我还不知道你想接着聊哪个实体。先给我一个名字吧，比如「姚明」。",
+        "required": [],
+        "optional": []
+      },
+      "direct_answer/more/0": {
+        "policy": "direct_answer",
+        "template": "{answer}\n我还知道它的「{listed}」等 {count} 项信息，想了解可以直接问。",
+        "required": [
+          "answer",
+          "listed",
+          "count"
+        ],
+        "optional": []
+      },
+      "direct_answer/more/1": {
+        "policy": "direct_answer",
+        "template": "{answer}\n关于「{entity}」，我还能补充「{listed}」等 {count} 项。",
+        "required": [
+          "answer",
+          "entity",
+          "listed",
+          "count"
+        ],
+        "optional": []
+      },
+      "direct_answer/more/2": {
+        "policy": "direct_answer",
+        "template": "{answer}\n除此之外，「{entity}」的「{listed}」我也知道（共 {count} 项），继续问我就好。",
+        "required": [
+          "answer",
+          "entity",
+          "listed",
+          "count"
+        ],
+        "optional": []
+      },
+      "direct_answer/plain": {
+        "policy": "direct_answer",
+        "template": "{answer}",
+        "required": [
+          "answer"
+        ],
+        "optional": []
+      },
+      "explain_why/plain": {
+        "policy": "explain_why",
+        "template": "刚才关于{topic}的回答，依据是：{provenance}。这些结论都来自知识图谱与规则程序（逐条符号匹配、逻辑推导），没有任何神经网络参与。",
+        "required": [
+          "topic",
+          "provenance"
+        ],
+        "optional": []
+      },
+      "farewell/plain": {
+        "policy": "farewell",
+        "template": "好的，再见！这次我们聊了 {turn_count} 轮，对话本体已经记入记忆。",
+        "required": [
+          "turn_count"
+        ],
+        "optional": []
+      },
+      "greet/first": {
+        "policy": "greet",
+        "template": "你好！我是 KnowProlog 的符号主义对话层：知识来自图谱，推理依靠规则与逻辑程序，回答由模板组合生成。你可以直接问「姚明的身高是多少」这样的问题。",
+        "required": [],
+        "optional": []
+      },
+      "greet/returning_focus": {
+        "policy": "greet",
+        "template": "又见面了！我们接着聊「{focus}」也行，换个话题也行。",
+        "required": [
+          "focus"
+        ],
+        "optional": []
+      },
+      "greet/returning_plain": {
+        "policy": "greet",
+        "template": "又见面了！继续问我吧。",
+        "required": [],
+        "optional": []
+      },
+      "thanks/focus": {
+        "policy": "thanks",
+        "template": "不客气！关于「{focus}」还有想问的，随时说。",
+        "required": [
+          "focus"
+        ],
+        "optional": []
+      },
+      "thanks/plain": {
+        "policy": "thanks",
+        "template": "不客气！随时继续问我。",
+        "required": [],
+        "optional": []
+      },
+      "why_no_evidence/plain": {
+        "policy": "why_no_evidence",
+        "template": "我还没有答过什么问题，暂时没有可解释的依据。你可以先问我一个知识问题，再问我「你怎么知道的」。",
+        "required": [],
+        "optional": []
+      }
+    },
+    "plugins": {
+      "zh.film": {
+        "version": "0.1.0",
+        "api": 1,
+        "default_mode": "off",
+        "mode": "off",
+        "requires": [],
+        "conflicts": [],
+        "provides": [],
+        "contributions": {
+          "film.directed_by": {
+            "kind": "recipe",
+            "digest": "8b1ccd1807c5ec12"
+          },
+          "film.directed_by.template": {
+            "kind": "template",
+            "digest": "5b6ce800e9a931f4"
+          },
+          "film.lexicon": {
+            "kind": "lexicon",
+            "digest": "e84b6f91848963e1"
+          },
+          "film.ontology": {
+            "kind": "ontology",
+            "digest": "a42854460e528f5f"
+          },
+          "film.reference": {
+            "kind": "reference",
+            "digest": "6a2ba2c6ca9e7869"
+          },
+          "film.unknown": {
+            "kind": "policy",
+            "digest": "5b93f73812f6cf1f"
+          },
+          "film.works_by_actor": {
+            "kind": "rewrite",
+            "digest": "c2e78a3a8cfaf570"
+          }
+        },
+        "eval_cases_digest": "ff5a1de9212f6f9a"
+      }
+    },
+    "behavior": {
+      "nlp.context_window_size": "5",
+      "nlp.disable_ownthink_api": "true",
+      "nlp.enable_advanced_entity_extraction": "true",
+      "nlp.enable_local_semantic": "true",
+      "nlp.enable_nlu": "true",
+      "nlp.enable_relation_extraction": "true",
+      "nlp.max_entity_candidates": "10",
+      "nlp.nlu_confidence_threshold": "0.6",
+      "nlp.semantic_similarity_threshold": "0.7",
+      "reasoning.abduction_max_hypotheses": "5",
+      "reasoning.abduction_max_scenario_size": "2",
+      "reasoning.association_min_confidence": "0.5",
+      "reasoning.association_min_lift": "1.05",
+      "reasoning.association_min_support": "0.2",
+      "reasoning.causal_max_depth": "4",
+      "reasoning.completion_min_score": "0.3",
+      "reasoning.discourse_max_rounds": "4",
+      "reasoning.discourse_max_sentences": "6",
+      "reasoning.embedding_similarity_floor": "0.6",
+      "reasoning.enable_abduction": "true",
+      "reasoning.enable_association_rules": "true",
+      "reasoning.enable_causal_reasoning": "true",
+      "reasoning.enable_causal_tokenization": "true",
+      "reasoning.enable_clarification": "true",
+      "reasoning.enable_dialogue_manager": "true",
+      "reasoning.enable_discourse": "true",
+      "reasoning.enable_entailment": "true",
+      "reasoning.enable_generation": "true",
+      "reasoning.enable_gradient_attribution": "true",
+      "reasoning.enable_graph_walk": "true",
+      "reasoning.enable_holographic_memory": "true",
+      "reasoning.enable_link_prediction": "true",
+      "reasoning.enable_problog": "true",
+      "reasoning.enable_resolution": "true",
+      "reasoning.enable_semantic_embedding": "true",
+      "reasoning.enable_soft_logic": "true",
+      "reasoning.entailment_min_confidence": "0.5",
+      "reasoning.graph_walk_damping": "0.85",
+      "reasoning.graph_walk_iterations": "12",
+      "reasoning.holographic_dimension": "4096",
+      "reasoning.holographic_max_hits": "6",
+      "reasoning.holographic_similarity_floor": "0.01",
+      "reasoning.link_prediction_min_confidence": "0.6",
+      "reasoning.link_prediction_min_support": "2",
+      "reasoning.max_predictions": "5",
+      "reasoning.max_profile_sentences": "6",
+      "reasoning.ontology_alignment_threshold": "0.72",
+      "reasoning.problog_max_depth": "6",
+      "reasoning.problog_max_proofs": "12",
+      "reasoning.require_predicate_admission": "false",
+      "reasoning.resolution_max_depth": "6",
+      "reasoning.resolution_max_solutions": "12",
+      "reasoning.soft_logic_max_iterations": "4",
+      "reasoning.soft_logic_min_probability": "0.5",
+      "system.default_language": "zh"
+    }
+  },
+  "schema_digest": "bdde84ec284933ef",
+  "nlu": {
+    "version": 2,
+    "corpus_digest": "f7da948dd31deb12",
+    "knowledge_mode": "reasoner",
+    "metrics": {
+      "answer.answered_rate": 1.0,
+      "answer.char_f1": 0.644360902255639,
+      "answer.em_rate": 0.42857142857142855,
+      "clarify.f1": 1.0,
+      "clarify.over_ask_rate": 0.0,
+      "entity.micro_f1": 1.0,
+      "entity.precision": 1.0,
+      "entity.recall": 1.0,
+      "grounding.slot_rate": 1.0,
+      "intent.accuracy": 1.0,
+      "intent.class.ask_attribute.f1": 1.0,
+      "intent.class.ask_binary.f1": 1.0,
+      "intent.class.ask_identity.f1": 1.0,
+      "intent.class.assert.f1": 1.0,
+      "intent.class.continue.f1": 1.0,
+      "intent.class.elaborate.f1": 1.0,
+      "intent.class.farewell.f1": 1.0,
+      "intent.class.greet.f1": 1.0,
+      "intent.class.meta_recap.f1": 1.0,
+      "intent.class.meta_why.f1": 1.0,
+      "intent.class.other.f1": 1.0,
+      "intent.class.thanks.f1": 1.0,
+      "intent.macro_f1": 1.0,
+      "intent.micro_f1": 1.0,
+      "provenance.precision": 1.0,
+      "slot.micro_f1": 1.0,
+      "takeover.f1": 1.0
+    }
+  },
+  "recovery": {
+    "version": 1,
+    "corpus_digest": "9bc4d0353906640c",
+    "metrics": {
+      "recovery.evidence_rate": 1.0,
+      "recovery.fault_named_rate": 1.0,
+      "recovery.ladder.L2.count": 2.0,
+      "recovery.ladder.L3.count": 2.0,
+      "recovery.ladder.L4.count": 2.0,
+      "recovery.named_failure_rate": 1.0,
+      "recovery.off_purity": 1.0,
+      "recovery.ratification_rate": 1.0,
+      "recovery.receipt_coverage": 1.0,
+      "recovery.silent_failure_rate": 0.0
+    }
+  },
+  "fuzz": {
+    "version": 1,
+    "seed": 20261019,
+    "gaps": []
+  }
+}

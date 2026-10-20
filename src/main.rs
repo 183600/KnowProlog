@@ -68,6 +68,7 @@ use know_prolog::{
     },
     prompt_spec::{self, LintSeverity, PromptMode},
     config_contract,
+    release::{self, CheckOptions},
     plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
     law_book::LawBook,
     link_prediction::{LinkPredictor, Triple as LawTriple},
@@ -206,6 +207,31 @@ enum Commands {
         /// Also fail (exit code) on warnings
         #[arg(long)]
         strict: bool,
+    },
+    /// Compile the language assets into a schema snapshot, diff it against the
+    /// release lock, and run the offline release gates
+    ReleaseCheck {
+        /// Config file path (defaults to config.toml)
+        #[arg(long, default_value = "config.toml")]
+        config_file: String,
+        /// Release lock path (created by --update-lock)
+        #[arg(long, default_value = "release.lock.json")]
+        lock: String,
+        /// Write the current snapshot and evaluation baselines as the new lock
+        #[arg(long)]
+        update_lock: bool,
+        /// Language-pack version X.Y.Z (defaults to the locked version)
+        #[arg(long = "language-version")]
+        language_version: Option<String>,
+        /// Skip the NLU / recovery / fuzz evaluation gates
+        #[arg(long)]
+        skip_evals: bool,
+        /// Do not fail (exit code) on gate failures
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Extract proof-carrying relation frames from text/file/corpus and gate
     /// them against the current knowledge store (read-only diagnostic)
@@ -444,6 +470,30 @@ async fn main() {
     }) = &cli.command
     {
         run_config_lint(file.as_deref(), *json, *strict);
+        return;
+    }
+
+    // 发布检查只读配置与插件清单：在加载默认配置 / 打开存储之前处理，
+    // 这样即使存储不可用也能完整跑完离线门禁。
+    if let Some(Commands::ReleaseCheck {
+        config_file,
+        lock,
+        update_lock,
+        language_version,
+        skip_evals,
+        allow_regression,
+        json,
+    }) = &cli.command
+    {
+        run_release_check(
+            config_file,
+            lock,
+            *update_lock,
+            language_version.clone(),
+            *skip_evals,
+            *allow_regression,
+            *json,
+        );
         return;
     }
 
@@ -1136,6 +1186,7 @@ async fn main() {
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::EvalNlu { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
+        Some(Commands::ReleaseCheck { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
         Some(Commands::PromptLint { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
@@ -1987,6 +2038,62 @@ fn run_fuzz_dialogue(
 
 /// `config-lint`：把 config.toml 当源码做契约编译；默认 Error 非零退出，
 /// `--strict` 连 Warning 也非零退出，便于 CI 棘轮推进。
+/// `release-check`：把语言资产编译成 schema 快照并与发布锁做差分，再跑离线
+/// 语义门禁。`--update-lock` 只在全部门禁通过后原子地固化新基线。
+fn run_release_check(
+    config_file: &str,
+    lock_path: &str,
+    update_lock: bool,
+    language_version: Option<String>,
+    skip_evals: bool,
+    allow_regression: bool,
+    json: bool,
+) {
+    let source = match std::fs::read_to_string(config_file) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("读取配置文件 {} 失败: {}", config_file, error);
+            std::process::exit(1);
+        }
+    };
+    let config: know_prolog::SystemConfig = match toml::from_str(&source) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("解析配置文件 {} 失败: {}", config_file, error);
+            std::process::exit(1);
+        }
+    };
+    let registry = PluginRegistry::load_dir(&config.plugins.directory);
+    let options = CheckOptions {
+        config_file,
+        lock_path,
+        language_version: language_version.as_deref(),
+        update_lock,
+        skip_evals,
+    };
+    let report = match release::check(&config, &registry, &options) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("发布检查失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("发布报告序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render_text());
+    }
+    if !report.passed && !allow_regression {
+        std::process::exit(1);
+    }
+}
+
 fn run_config_lint(file: Option<&str>, json: bool, strict: bool) {
     let path = file.unwrap_or("config.toml");
     let source = match std::fs::read_to_string(path) {
