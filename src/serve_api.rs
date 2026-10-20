@@ -76,7 +76,7 @@ use crate::prompt_spec::{self, PromptMode};
 use crate::quality::QualityIndex;
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
-use crate::ReasoningConfig;
+use crate::{NlpConfig, ReasoningConfig};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
@@ -865,6 +865,11 @@ impl WarmBase {
         self.reasoner.lock().fork_session()
     }
 
+    /// 为后续分叉注入 NLP 配置（失败轮读法回执需要词性来源）。
+    fn set_nlp_config(&self, config: NlpConfig) {
+        self.reasoner.lock().set_nlp_config(config);
+    }
+
     /// 知识版本（分叉基座当前携带的 revision，供审计与测试）。
     pub fn revision(&self) -> u64 {
         self.reasoner.lock().revision()
@@ -997,6 +1002,12 @@ impl ApiState {
     /// 预热基座的知识版本（分叉一致性审计）。
     pub fn warm_revision(&self) -> u64 {
         self.warm.revision()
+    }
+
+    /// 注入 NLP 配置：后续分叉的会话在回答失败时记录有界读法回执。
+    /// 必须在启动会话 actor 之前调用；不改变任何回答文本。
+    pub fn set_nlp_config(&mut self, config: NlpConfig) {
+        self.warm.set_nlp_config(config);
     }
 
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。

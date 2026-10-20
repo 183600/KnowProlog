@@ -1547,6 +1547,8 @@ async fn main() {
                 max_sessions,
                 startup_ledger.clone(),
             );
+            // 读法观测：服务会话的失败轮同样留下有界回执，指标进共享性能台账。
+            api_state.set_nlp_config(config.nlp.clone());
             let quality_index =
                 quality_index.with_revision(api_state.warm_revision());
             api_state.set_quality_index(Some(Arc::new(quality_index)));
