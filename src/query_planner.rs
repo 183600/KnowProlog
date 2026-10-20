@@ -788,7 +788,16 @@ impl QueryPlanner {
 
     fn strip_closure_tail(raw: &str) -> (String, bool) {
         let text = Self::strip_particles(raw);
-        const TAILS: [(&str, bool); 45] = [
+        const TAILS: [(&str, bool); 56] = [
+            ("分别都是谁", false),
+            ("分别都是什么", false),
+            ("都有哪些人", false),
+            ("都有哪几位", false),
+            ("都有哪几个", false),
+            ("包括哪些人", false),
+            ("都是哪些人", false),
+            ("有哪几个人", false),
+            ("是什么人", false),
             ("分别是哪些人", false),
             ("分别是哪些", false),
             ("分别有哪些", false),
@@ -798,6 +807,8 @@ impl QueryPlanner {
             ("一共有多少个", true),
             ("一共有几位", true),
             ("一共有几个", true),
+            ("一共有多少位", true),
+            ("一共有多少名", true),
             ("一共有多少", true),
             ("共有多少人", true),
             ("共有多少个", true),
@@ -1179,6 +1190,32 @@ mod tests {
             .expect("量词尾的闭包计数");
         assert_eq!(
             counted,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: true,
+                then: Vec::new(),
+            }
+        );
+        let all_people = planner()
+            .parse("李四的所有上司都有哪些人")
+            .expect("「都有哪些人」尾");
+        assert_eq!(
+            all_people,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: false,
+                then: Vec::new(),
+            }
+        );
+        let people_count = planner()
+            .parse("李四的所有上司一共有多少位")
+            .expect("「一共有多少位」尾");
+        assert_eq!(
+            people_count,
             QueryPlan::Closure {
                 subject: "李四".to_string(),
                 predicate: "上司".to_string(),
