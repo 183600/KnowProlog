@@ -1,4 +1,5 @@
 use jieba_rs::Jieba; // 导入结巴分词库，用于中文分词
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap; // 导入哈希映射，用于存储键值对
 use std::sync::OnceLock;
 
@@ -18,6 +19,57 @@ fn jieba() -> &'static Jieba {
 pub struct TaggedWord {
     pub text: String, // 词语文本
     pub pos: String, // 词性标记（如n表示名词，v表示动词）
+}
+
+/// 词性证据的来源。审计时最重要的不是标签本身，而是「谁给了这个标签」：
+/// 配置词典/姓名模式是强证据，结巴兜底是启发式，未知则是待补词表的信号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagSource {
+    /// 配置 `[nlp.pos_dict]` 明确登记
+    ConfigPos,
+    /// 名字前缀/后缀/全名/职业后缀或数字规则
+    NamePattern,
+    /// 结巴的人名/地名/机构名/专名兜底
+    JiebaTag,
+    /// 全部为数字
+    Numeric,
+    /// 没有证据，保留为未知词
+    Unknown,
+}
+
+impl TagSource {
+    pub fn code(self) -> &'static str {
+        match self {
+            TagSource::ConfigPos => "config_pos",
+            TagSource::NamePattern => "name_pattern",
+            TagSource::JiebaTag => "jieba_tag",
+            TagSource::Numeric => "numeric",
+            TagSource::Unknown => "unknown",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TagSource::ConfigPos => "配置词性",
+            TagSource::NamePattern => "姓名模式",
+            TagSource::JiebaTag => "结巴兜底",
+            TagSource::Numeric => "数字规则",
+            TagSource::Unknown => "未知",
+        }
+    }
+}
+
+/// 带边界与来源证据的标注词：字符区间为半开区间 `[start, end)`。
+#[derive(Debug, Clone)]
+pub struct AnnotatedWord {
+    pub text: String,
+    pub pos: String,
+    pub source: TagSource,
+    /// 结巴原始词性（合并姓名时取首词标签），用于观察配置覆盖造成的分歧。
+    pub jieba_pos: Option<String>,
+    pub start: usize,
+    pub end: usize,
 }
 
 // Prolog推理规则结构体
@@ -44,12 +96,27 @@ pub enum PatternElement {
 // 预处理函数：分词并进行词性标注
 // 注意：crate::NlpConfig 引用的是 lib.rs 中的 NlpConfig
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
+    preprocess_annotated(text, config)
+        .into_iter()
+        .map(|word| TaggedWord {
+            text: word.text,
+            pos: word.pos,
+        })
+        .collect()
+}
+
+/// 与 [`preprocess`] 同序同标签，但保留词性来源、结巴原始标签与字符边界。
+///
+/// 这是只读证据层：不改变分词/标注决策，只把「为什么是这个标签」写下来，
+/// 供读法追踪、词表缺口与 CI 差分使用。
+pub fn preprocess_annotated(text: &str, config: &crate::NlpConfig) -> Vec<AnnotatedWord> {
     // 结巴自带词性标注（nr 人名 / ns 地名 / nt 机构名 / nz 专名）：
     // 用作未知词的兜底，让「姚明」「诸葛亮」等词无需写进配置也能落型；
     // 配置 pos_dict 与 name_patterns 的优先级更高。
     let tagged = jieba().tag(text, false);
     let words: Vec<&str> = tagged.iter().map(|tag| tag.word).collect();
     let jieba_tags: Vec<&str> = tagged.iter().map(|tag| tag.tag).collect();
+    let spans = token_spans(text, &words);
 
     // 常见人名集合
     let full_names: std::collections::HashSet<&str> = config
@@ -62,7 +129,7 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
     // 结巴分词可能把配置中的常见人名（如"张三"）切分成多个单字，
     // 这里按最长匹配合并相邻词，使 full_names 中的人名能被正确识别；
     // 合并与标注在同一次遍历内完成
-    let mut tagged_words: Vec<TaggedWord> = Vec::with_capacity(words.len());
+    let mut annotated: Vec<AnnotatedWord> = Vec::with_capacity(words.len());
     let mut i = 0;
     while i < words.len() {
         // 增量拼接候选词并记录最长匹配
@@ -76,48 +143,95 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
             }
         }
         if let Some((name, end)) = matched {
-            tagged_words.push(tag_word(name, config, &full_names, None));
+            let span = spans
+                .get(i)
+                .zip(spans.get(end.saturating_sub(1)))
+                .map(|(start, finish)| (start.0, finish.1))
+                .unwrap_or((0, 0));
+            annotated.push(annotated_word(
+                name,
+                config,
+                &full_names,
+                jieba_tags.get(i).copied(),
+                span,
+            ));
             i = end;
         } else {
-            tagged_words.push(tag_word(
+            annotated.push(annotated_word(
                 words[i].to_string(),
                 config,
                 &full_names,
                 jieba_tags.get(i).copied(),
+                spans.get(i).copied().unwrap_or((0, 0)),
             ));
             i += 1;
         }
     }
 
-    tagged_words
+    annotated
+}
+
+/// 结巴词序列在原文本中的字符区间。分词结果可能并不逐字覆盖空白，
+/// 因此按「当前游标后的首次出现」推进，找不到时退回全文搜索，绝不 panic。
+fn token_spans(text: &str, words: &[&str]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::with_capacity(words.len());
+    let mut cursor = 0usize;
+    for word in words {
+        let start_byte = text[cursor..]
+            .find(word)
+            .map(|offset| cursor + offset)
+            .or_else(|| text.find(word))
+            .unwrap_or(cursor.min(text.len()));
+        let end_byte = start_byte + word.len();
+        let start = text[..start_byte].chars().count();
+        let end = start + word.chars().count();
+        spans.push((start, end));
+        cursor = end_byte.min(text.len());
+    }
+    spans
 }
 
 // 确定单个词语的词性并封装为标注词
-fn tag_word(
+fn annotated_word(
     word: String,
     config: &crate::NlpConfig,
     full_names: &std::collections::HashSet<&str>,
     jieba_tag: Option<&str>,
-) -> TaggedWord {
-    let pos = if word.chars().all(|c| c.is_numeric()) { // 全是数字
-        "m".to_string() // m表示数词
-    } else if is_name(&word, &config.name_patterns, full_names) { // 判断是否为人名
-        "nr".to_string() // nr表示人名
-    } else if let Some(pos) = config.pos_dict.get(&word) {
-        // 从词性字典查找（配置优先）
-        pos.clone()
-    } else {
-        // 结巴标注的人名/地名/机构名/专名兜底，其余标记为unknown
-        match jieba_tag {
-            Some("nr") => "nr".to_string(),
-            Some("ns") => "ns".to_string(),
-            Some("nt") => "nt".to_string(),
-            Some("nz") => "nz".to_string(),
-            _ => "unknown".to_string(),
-        }
-    };
+    span: (usize, usize),
+) -> AnnotatedWord {
+    let (pos, source) = resolve_tag(&word, config, full_names, jieba_tag);
+    AnnotatedWord {
+        text: word,
+        pos,
+        source,
+        jieba_pos: jieba_tag.map(str::to_string),
+        start: span.0,
+        end: span.1,
+    }
+}
 
-    TaggedWord { text: word, pos }
+fn resolve_tag(
+    word: &str,
+    config: &crate::NlpConfig,
+    full_names: &std::collections::HashSet<&str>,
+    jieba_tag: Option<&str>,
+) -> (String, TagSource) {
+    if word.chars().all(|c| c.is_numeric()) {
+        return ("m".to_string(), TagSource::Numeric);
+    }
+    if is_name(word, &config.name_patterns, full_names) {
+        return ("nr".to_string(), TagSource::NamePattern);
+    }
+    if let Some(pos) = config.pos_dict.get(word) {
+        return (pos.clone(), TagSource::ConfigPos);
+    }
+    match jieba_tag {
+        Some("nr") => ("nr".to_string(), TagSource::JiebaTag),
+        Some("ns") => ("ns".to_string(), TagSource::JiebaTag),
+        Some("nt") => ("nt".to_string(), TagSource::JiebaTag),
+        Some("nz") => ("nz".to_string(), TagSource::JiebaTag),
+        _ => ("unknown".to_string(), TagSource::Unknown),
+    }
 }
 
 // 词语归一化函数，将同义词转换为标准形式
@@ -435,8 +549,68 @@ mod tests {
         assert_eq!(matched, vec!["法国".to_string()]);
     }
 
+    fn test_config() -> crate::NlpConfig {
+        crate::NlpConfig {
+            import_keywords: Vec::new(),
+            pos_dict: [
+                ("的".to_string(), "u".to_string()),
+                ("所有权".to_string(), "n".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            name_patterns: crate::NamePatterns {
+                prefixes: vec!["小".to_string()],
+                suffixes: Vec::new(),
+                full_names: vec!["张三".to_string()],
+                profession_suffix: Vec::new(),
+            },
+            enable_nlu: None,
+            nlu_confidence_threshold: None,
+            enable_local_semantic: None,
+            disable_ownthink_api: None,
+            semantic_similarity_threshold: None,
+            max_entity_candidates: None,
+            enable_advanced_entity_extraction: None,
+            enable_relation_extraction: None,
+            context_window_size: None,
+        }
+    }
+
     #[test]
-    fn test_name_merge_stops_before_literal_conjunction() {
+    fn annotated_words_keep_spans_and_sources() {
+        let config = test_config();
+        let words = preprocess_annotated("张三的所有权归谁", &config);
+        let plain = preprocess("张三的所有权归谁", &config);
+        assert_eq!(words.len(), plain.len());
+        for (annotated, tagged) in words.iter().zip(plain.iter()) {
+            assert_eq!(&annotated.text, &tagged.text);
+            assert_eq!(&annotated.pos, &tagged.pos);
+        }
+        let ownership = words
+            .iter()
+            .find(|word| word.text == "所有权")
+            .expect("配置词典词应保留原 token");
+        assert_eq!(ownership.source, TagSource::ConfigPos);
+        assert_eq!(ownership.pos, "n");
+        let text = "张三的所有权归谁";
+        let slice = |start: usize, end: usize| -> String {
+            text.chars().skip(start).take(end - start).collect()
+        };
+        assert_eq!(slice(ownership.start, ownership.end), "所有权");
+
+        let name = words
+            .iter()
+            .find(|word| word.text.contains("张三"))
+            .expect("全名应被合并");
+        assert_eq!(name.source, TagSource::NamePattern);
+        assert_eq!(slice(name.start, name.end), name.text.as_str());
+
+        let who = words.iter().find(|word| word.text == "谁").unwrap();
+        assert_eq!(who.source, TagSource::Unknown);
+    }
+
+    #[test]
+    fn name_merge_stops_before_literal_conjunction() {
         let pattern = pattern_from_strings(vec![
             "nr".to_string(),
             "和".to_string(),
