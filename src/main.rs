@@ -6620,74 +6620,33 @@ async fn run_interactive_mode(
 
                 // 插件配方：只读既有知识源，模板必须全部槽位接地；取不到值则让位核心管线。
                 if let Some(outcome) = plugin_outcome.as_ref() {
-                    if let Some(recipe) = outcome.trace.recipe.clone() {
-                        // 回指：配方捕获到「他/这位/该」时接续当前对话焦点，
-                        // 焦点仍由对话管理器统一维护，插件不另建上下文。
-                        let raw_entity = recipe.slots.get("entity").cloned();
-                        let entity = raw_entity.as_ref().map(|raw| {
-                            if plugin_runtime.is_context_reference(raw) {
-                                dialogue_manager
-                                    .focus_entity()
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| raw.clone())
-                            } else {
-                                raw.clone()
-                            }
-                        });
-                        // 回指替换后同步改写问句，核心管线兜底时不再拿「他」去检索。
-                        let question = match (raw_entity.as_deref(), entity.as_deref()) {
-                            (Some(raw), Some(resolved)) if raw != resolved => {
-                                recipe.question.replace(raw, resolved)
-                            }
-                            _ => recipe.question.clone(),
-                        };
-                        let mut answer = None;
-                        let mut evidence = Vec::new();
-                        if let (Some(entity), Some(attribute)) =
-                            (entity.as_deref(), recipe.attribute.as_deref())
-                        {
-                            if let Some(lookup) = symbolic_reasoner.recipe_lookup(
-                                entity,
-                                attribute,
-                                recipe.direction,
-                                &recipe.answer_types,
-                            ) {
-                                if !lookup.values.is_empty() {
-                                    answer = Some(lookup.values.join("、"));
-                                    evidence = lookup.evidence;
-                                }
-                            }
+                    let focus = dialogue_manager.focus_entity().map(str::to_string);
+                    if let Some(reply) = symbolic_reasoner.answer_plugin_recipe(
+                        outcome,
+                        &mut plugin_runtime,
+                        focus.as_deref(),
+                    ) {
+                        println!("{}", reply.text);
+                        if dialogue_enabled {
+                            dialogue_manager.note_plugin_turn(
+                                raw_input,
+                                MoveKind::AskAttribute,
+                                reply.entity.as_deref(),
+                                reply.attribute.as_deref(),
+                                &reply.text,
+                                reply.plan.clone(),
+                                reply.provenance.clone(),
+                            );
                         }
-                        if answer.is_none() {
-                            answer = symbolic_reasoner.answer(&question);
-                        }
-                        if let Some(answer) = answer {
-                            let composed = plugin_runtime
-                                .compose_answer_with_evidence(outcome, &answer, &evidence);
-                            let text = composed.text;
-                            println!("{}", text);
-                            let plan =
-                                vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
-                            let provenance = vec![format!(
-                                "插件 {} / 配方 {} / 问句 {}",
-                                recipe.plugin, recipe.contribution, question
-                            )];
-                            if dialogue_enabled {
-                                dialogue_manager.note_plugin_turn(
-                                    raw_input,
-                                    MoveKind::AskAttribute,
-                                    entity.as_deref(),
-                                    recipe.attribute.as_deref(),
-                                    &text,
-                                    plan.clone(),
-                                    provenance.clone(),
-                                );
-                            }
-                            log_chronicle_reply(&mut chronicle, &text, &plan, &provenance);
-                            log_chronicle_trace(&mut chronicle, &dialogue_manager);
-                            println!();
-                            continue;
-                        }
+                        log_chronicle_reply(
+                            &mut chronicle,
+                            &reply.text,
+                            &reply.plan,
+                            &reply.provenance,
+                        );
+                        log_chronicle_trace(&mut chronicle, &dialogue_manager);
+                        println!();
+                        continue;
                     }
                 }
 

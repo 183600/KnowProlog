@@ -34,7 +34,7 @@ use crate::ontology_reasoning::{OntologyCapsule, OntologyLesson, OntologyProgram
 use crate::path_memory::{EdgeSource, PathPredicate, TraversalGraph, TraversalOptions};
 use crate::pattern_closure::{evaluate_closure, ClosureBudget, ClosureOp, ClosureOutcome};
 use crate::perf_ledger::PerfLedger;
-use crate::plugin::RecipeDirection;
+use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
@@ -617,6 +617,19 @@ struct ChainPredicate {
 pub struct RecipeLookup {
     pub values: Vec<String>,
     pub evidence: Vec<String>,
+}
+
+/// 插件配方的完整回答：回答文本之外的实体/属性/问句/依据一并返回，
+/// 让 CLI 与 HTTP 共用同一条执行路径（接地、回指、模板、追踪不漂移）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRecipeReply {
+    pub text: String,
+    pub plan: Vec<String>,
+    pub provenance: Vec<String>,
+    pub entity: Option<String>,
+    pub attribute: Option<String>,
+    pub question: String,
+    pub kind: &'static str,
 }
 
 /// 结构化证明视图：可视化（Mermaid/ASCII）消费的纯数据，不重复解析逻辑。
@@ -1618,6 +1631,69 @@ impl SymbolicReasoner {
             })
             .collect();
         Some(RecipeLookup { values, evidence })
+    }
+
+    /// 执行一次插件配方：回指焦点解析 → 类型化查值（含逆关系/子类/开放世界
+    /// 类型约束）→ 核心管线兜底 → 模板接地。CLI 与 HTTP 都只调用这里，
+    /// 避免两条入口在方向、依据或回指处理上各自演化。
+    pub fn answer_plugin_recipe(
+        &mut self,
+        outcome: &PluginOutcome,
+        runtime: &mut PluginRuntime,
+        focus_entity: Option<&str>,
+    ) -> Option<PluginRecipeReply> {
+        let recipe = outcome.trace.recipe.clone()?;
+        let raw_entity = recipe.slots.get("entity").cloned();
+        let entity = raw_entity.as_ref().map(|raw| {
+            if runtime.is_context_reference(raw) {
+                focus_entity
+                    .map(str::to_string)
+                    .unwrap_or_else(|| raw.clone())
+            } else {
+                raw.clone()
+            }
+        });
+        // 回指替换后同步改写问句，核心管线兜底时不再拿「他」去检索。
+        let question = match (raw_entity.as_deref(), entity.as_deref()) {
+            (Some(raw), Some(resolved)) if raw != resolved => {
+                recipe.question.replace(raw, resolved)
+            }
+            _ => recipe.question.clone(),
+        };
+        let mut answer = None;
+        let mut evidence = Vec::new();
+        if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
+            if let Some(lookup) = self.recipe_lookup(
+                entity,
+                attribute,
+                recipe.direction,
+                &recipe.answer_types,
+            ) {
+                if !lookup.values.is_empty() {
+                    answer = Some(lookup.values.join("、"));
+                    evidence = lookup.evidence;
+                }
+            }
+        }
+        if answer.is_none() {
+            answer = self.answer(&question);
+        }
+        let answer = answer?;
+        let composed = runtime.compose_answer_with_evidence(outcome, &answer, &evidence);
+        let plan = vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
+        let provenance = vec![format!(
+            "插件 {} / 配方 {} / 问句 {}",
+            recipe.plugin, recipe.contribution, question
+        )];
+        Some(PluginRecipeReply {
+            text: composed.text,
+            plan,
+            provenance,
+            entity,
+            attribute: recipe.attribute,
+            question,
+            kind: "attribute",
+        })
     }
 
     /// 在当前知识快照上执行带约束/预算的证据检索（含可审计回执）。
@@ -9918,6 +9994,82 @@ mod tests {
                 .recipe_lookup("卡梅隆", "导演", RecipeDirection::Inverse, &["人物".into()])
                 .is_none(),
             "已知互斥类型（电影 ⊥ 人物）必须拒答"
+        );
+    }
+
+    /// 配方执行单一入口：CLI 与 HTTP 共用；角色指称接续焦点，依据随模板接地。
+    #[test]
+    fn answer_plugin_recipe_resolves_role_reference_and_grounds_evidence() {
+        use crate::plugin::{
+            PluginManifest, PluginRegistry, PluginRuntime, PluginSettings,
+        };
+
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+id = "test.film"
+version = "0.1.0"
+api = 1
+default_mode = "on"
+
+[[contributions]]
+kind = "reference"
+id = "film.reference"
+quantifiers = ["这位", "那位"]
+role_words = ["导演"]
+
+[[contributions]]
+kind = "recipe"
+id = "film.works_by_director"
+patterns = ["{entity}还拍过什么", "那{entity}还拍过什么"]
+question = "{entity}导演过哪些作品"
+attribute = "导演"
+direction = "inverse"
+answer_types = ["电影"]
+template = "film.works.template"
+
+[[contributions]]
+kind = "template"
+id = "film.works.template"
+template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
+"#,
+        )
+        .expect("测试清单应可解析");
+        let registry = PluginRegistry::from_manifests(vec![manifest]);
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+
+        let facts = vec![
+            PrologFact::Entity {
+                name: "阿凡达".into(),
+                entity_type: "电影".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "卡梅隆".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "阿凡达".into(),
+                rel_type: "导演".into(),
+                to: "卡梅隆".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let outcome = runtime.rewrite("这位导演还拍过什么");
+        assert!(outcome.trace.recipe.is_some(), "配方应命中角色指称问法");
+        let reply = reasoner
+            .answer_plugin_recipe(&outcome, &mut runtime, Some("卡梅隆"))
+            .expect("焦点实体应能完成逆向配方");
+        assert_eq!(reply.entity.as_deref(), Some("卡梅隆"));
+        assert_eq!(reply.question, "卡梅隆导演过哪些作品");
+        assert!(reply.text.contains("阿凡达"), "{}", reply.text);
+        assert!(reply.text.contains("依据"), "{}", reply.text);
+        assert!(
+            reply.plan.iter().any(|plan| plan.contains("film.works_by_director")),
+            "{:?}",
+            reply.plan
         );
     }
 

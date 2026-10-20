@@ -454,73 +454,31 @@ struct Session {
 
 impl Session {
     /// 插件配方直答：只读既有知识源，模板必须全部槽位接地；取不到值则让位核心管线。
+    /// 与 CLI 共用 [`SymbolicReasoner::answer_plugin_recipe`]，回指/方向/依据不另写一份。
     fn plugin_recipe_answer(
         &mut self,
         raw_input: &str,
         outcome: Option<&PluginOutcome>,
     ) -> Option<(String, Vec<String>, String)> {
         let outcome = outcome?;
-        let recipe = outcome.trace.recipe.clone()?;
-        let raw_entity = recipe.slots.get("entity").cloned();
-        let entity = raw_entity.as_ref().map(|raw| {
-            let is_reference = self
-                .plugin
-                .as_ref()
-                .is_some_and(|plugin| plugin.lock().is_context_reference(raw));
-            if is_reference {
-                self.manager
-                    .focus_entity()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| raw.clone())
-            } else {
-                raw.clone()
-            }
-        });
-        let question = match (raw_entity.as_deref(), entity.as_deref()) {
-            (Some(raw), Some(resolved)) if raw != resolved => {
-                recipe.question.replace(raw, resolved)
-            }
-            _ => recipe.question.clone(),
-        };
-        let mut answer = None;
-        let mut evidence = Vec::new();
-        if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
-            if let Some(lookup) = self.reasoner.recipe_lookup(
-                entity,
-                attribute,
-                recipe.direction,
-                &recipe.answer_types,
-            ) {
-                if !lookup.values.is_empty() {
-                    answer = Some(lookup.values.join("、"));
-                    evidence = lookup.evidence;
-                }
-            }
-        }
-        if answer.is_none() {
-            answer = self.reasoner.answer(&question);
-        }
-        let answer = answer?;
-        let composed = self
-            .plugin
-            .as_ref()?
-            .lock()
-            .compose_answer_with_evidence(outcome, &answer, &evidence);
-        let plan = vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
-        let provenance = vec![format!(
-            "插件 {} / 配方 {} / 问句 {}",
-            recipe.plugin, recipe.contribution, question
-        )];
+        let plugin = self.plugin.as_ref()?.clone();
+        let focus = self.manager.focus_entity().map(str::to_string);
+        let mut runtime = plugin.lock();
+        let reply = self
+            .reasoner
+            .answer_plugin_recipe(outcome, &mut runtime, focus.as_deref())?;
+        drop(runtime);
+        let plan = reply.plan.clone();
         self.manager.note_plugin_turn(
             raw_input,
             MoveKind::AskAttribute,
-            entity.as_deref(),
-            recipe.attribute.as_deref(),
-            &composed.text,
+            reply.entity.as_deref(),
+            reply.attribute.as_deref(),
+            &reply.text,
             plan.clone(),
-            provenance,
+            reply.provenance,
         );
-        Some((composed.text, plan, "attribute".to_string()))
+        Some((reply.text, plan, reply.kind.to_string()))
     }
 
     fn run_turn(&mut self, input: &str) -> TurnResponse {
