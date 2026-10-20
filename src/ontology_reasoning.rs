@@ -29,6 +29,8 @@ pub struct OntologyClosure {
     why_instances: HashMap<(String, String), String>,
     why_relations: HashMap<(String, String, String), String>,
     problems: Vec<String>,
+    /// 显式互斥类对（TBox 声明，供查询按开放世界做类型约束时使用）。
+    disjoint: Vec<(String, String)>,
     rounds: usize,
     truncated: bool,
 }
@@ -165,6 +167,18 @@ impl OntologyClosure {
             .get(&(s.to_string(), p.to_string(), o.to_string()))
             .map(|reason| reason.as_str())
     }
+
+    /// 两个类是否可证明互斥（含子类继承）。开放世界下只有显式互斥
+    /// 才算「已知冲突」，未知类型不得据此拒答。
+    pub fn are_disjoint(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return false;
+        }
+        self.disjoint.iter().any(|(div_left, div_right)| {
+            (self.is_subclass(left, div_left) && self.is_subclass(right, div_right))
+                || (self.is_subclass(left, div_right) && self.is_subclass(right, div_left))
+        })
+    }
 }
 
 /// 闭包的可序列化导出：全部集合按字典序规约，推导理由与截断标记一并带出。
@@ -289,6 +303,7 @@ impl OntologyClosure {
                 })
                 .collect(),
             problems: snapshot.problems.clone(),
+            disjoint: Vec::new(),
             rounds: snapshot.rounds,
             truncated: snapshot.truncated,
         };
@@ -469,6 +484,13 @@ impl OntologyProgram {
             }
         }
         Self { lessons }
+    }
+
+    /// 由一组公理构造（规范排序去重，与教学顺序无关）。
+    pub fn from_lessons(lessons: Vec<OntologyLesson>) -> Self {
+        Self {
+            lessons: canonicalize_lessons(lessons),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -740,6 +762,7 @@ impl OntologyReasoner {
             subproperties: transitive_closure(&self.subproperties),
             instances: self.instances.clone(),
             relations: self.relations.clone(),
+            disjoint: self.disjoint.clone(),
             ..OntologyClosure::default()
         };
         for (individual, class) in closure.instances.iter() {

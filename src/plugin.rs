@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
+
 /// 当前宿主认识的插件清单 API 版本。
 pub const PLUGIN_API_VERSION: u32 = 1;
 /// 默认插件目录（相对工作目录）。
@@ -848,23 +850,103 @@ fn validate_contribution(
                 ));
             }
             for predicate in predicates {
-                if predicate.name.trim().is_empty() {
+                let name = predicate.name.trim();
+                if name.is_empty() {
                     issues.push(PluginIssue::error(
                         plugin,
                         Some(Path::new("<manifest>")),
                         id,
                         "本体谓词 name 不能为空。".to_string(),
                     ));
+                    continue;
+                }
+                for alias in &predicate.aliases {
+                    if alias.trim().is_empty() {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体谓词「{}」声明了空别名，已忽略。", name),
+                        ));
+                    } else if alias.trim() == name {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体谓词「{}」的别名与规范名相同，已忽略。", name),
+                        ));
+                    }
+                }
+                if predicate.inverse.as_deref().map(str::trim) == Some(name) {
+                    issues.push(PluginIssue::warning(
+                        plugin,
+                        id,
+                        format!("本体谓词「{}」不能与自身互逆，已忽略该声明。", name),
+                    ));
+                }
+                for class in predicate.domain.iter().chain(predicate.range.iter()) {
+                    if class.trim().is_empty() {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体谓词「{}」声明了空的定义域/值域，已忽略。", name),
+                        ));
+                    }
                 }
             }
             for entity_type in types {
-                if entity_type.name.trim().is_empty() {
+                let name = entity_type.name.trim();
+                if name.is_empty() {
                     issues.push(PluginIssue::error(
                         plugin,
                         Some(Path::new("<manifest>")),
                         id,
                         "本体类型 name 不能为空。".to_string(),
                     ));
+                    continue;
+                }
+                for alias in &entity_type.aliases {
+                    if alias.trim().is_empty() {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体类型「{}」声明了空别名，已忽略。", name),
+                        ));
+                    } else if alias.trim() == name {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体类型「{}」的别名与规范名相同，已忽略。", name),
+                        ));
+                    }
+                }
+                for sup in &entity_type.subclass_of {
+                    if sup.trim().is_empty() {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体类型「{}」声明了空的父类，已忽略。", name),
+                        ));
+                    } else if sup.trim() == name {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体类型「{}」不能以自身为父类，已忽略。", name),
+                        ));
+                    }
+                }
+                for right in &entity_type.disjoint_with {
+                    if right.trim().is_empty() {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体类型「{}」声明了空的互斥类，已忽略。", name),
+                        ));
+                    } else if right.trim() == name {
+                        issues.push(PluginIssue::warning(
+                            plugin,
+                            id,
+                            format!("本体类型「{}」不能与自身互斥，已忽略。", name),
+                        ));
+                    }
                 }
             }
         }
@@ -1775,6 +1857,134 @@ impl PluginRuntime {
         aliases.sort();
         aliases.dedup();
         aliases
+    }
+
+    /// 启动时把插件的本体贡献归约为统一本体程序（仅启用中的插件）。
+    ///
+    /// 与 `ontology_aliases` 分工：别名只做词面归一，不进公理；子类、互斥、
+    /// 定义域/值域、逆关系、传递、对称全部编译成 `OntologyLesson`，交给宿主
+    /// 的单一本体推理器。重复声明由程序自身的规范去重吸收，合并是幂等的。
+    pub fn ontology_program(&self) -> OntologyProgram {
+        let mut lessons = Vec::new();
+        for manifest in &self.manifests {
+            if self.modes.get(&manifest.id) != Some(&PluginMode::On) {
+                continue;
+            }
+            for contribution in &manifest.contributions {
+                let Contribution::Ontology {
+                    predicates, types, ..
+                } = contribution
+                else {
+                    continue;
+                };
+                for entity_type in types {
+                    let name = entity_type.name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    for sup in &entity_type.subclass_of {
+                        let sup = sup.trim();
+                        if sup.is_empty() || sup == name {
+                            continue;
+                        }
+                        lessons.push(OntologyLesson::Subclass {
+                            sub: name.to_string(),
+                            sup: sup.to_string(),
+                            original: format!("{}是一种{}", name, sup),
+                        });
+                    }
+                    for right in &entity_type.disjoint_with {
+                        let right = right.trim();
+                        if right.is_empty() || right == name {
+                            continue;
+                        }
+                        lessons.push(OntologyLesson::Disjoint {
+                            left: name.to_string(),
+                            right: right.to_string(),
+                            original: format!("{}和{}互斥", name, right),
+                        });
+                    }
+                }
+                for predicate in predicates {
+                    let name = predicate.name.trim();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    for class in &predicate.domain {
+                        let class = class.trim();
+                        if !class.is_empty() {
+                            lessons.push(OntologyLesson::Domain {
+                                property: name.to_string(),
+                                class: class.to_string(),
+                                original: format!("{}关系的定义域是{}", name, class),
+                            });
+                        }
+                    }
+                    for class in &predicate.range {
+                        let class = class.trim();
+                        if !class.is_empty() {
+                            lessons.push(OntologyLesson::Range {
+                                property: name.to_string(),
+                                class: class.to_string(),
+                                original: format!("{}关系的值域是{}", name, class),
+                            });
+                        }
+                    }
+                    if let Some(inverse) = predicate.inverse.as_deref() {
+                        let inverse = inverse.trim();
+                        if !inverse.is_empty() && inverse != name {
+                            lessons.push(OntologyLesson::Inverse {
+                                left: name.to_string(),
+                                right: inverse.to_string(),
+                                original: format!("{}和{}互为逆关系", name, inverse),
+                            });
+                        }
+                    }
+                    if predicate.transitive {
+                        lessons.push(OntologyLesson::Transitive {
+                            property: name.to_string(),
+                            original: format!("{}关系可以传递", name),
+                        });
+                    }
+                    if predicate.symmetric {
+                        lessons.push(OntologyLesson::Symmetric {
+                            property: name.to_string(),
+                            original: format!("{}是对称的", name),
+                        });
+                    }
+                }
+            }
+        }
+        OntologyProgram::from_lessons(lessons)
+    }
+
+    /// 插件声明的互逆谓词中「需要换向查询」的词面（仅启用中的插件）。
+    /// 与 `ontology_aliases` 不同：这里登记的词面在发问时把主宾对调，
+    /// 例如「执导」问句命中「导演」事实的反方向。
+    pub fn ontology_inverse_surfaces(&self) -> Vec<(String, String)> {
+        let mut surfaces = Vec::new();
+        for manifest in &self.manifests {
+            if self.modes.get(&manifest.id) != Some(&PluginMode::On) {
+                continue;
+            }
+            for contribution in &manifest.contributions {
+                if let Contribution::Ontology { predicates, .. } = contribution {
+                    for predicate in predicates {
+                        let name = predicate.name.trim();
+                        let Some(inverse) = predicate.inverse.as_deref() else {
+                            continue;
+                        };
+                        let inverse = inverse.trim();
+                        if !name.is_empty() && !inverse.is_empty() && inverse != name {
+                            surfaces.push((inverse.to_string(), name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        surfaces.sort();
+        surfaces.dedup();
+        surfaces
     }
 
     /// 启动时合并进中文分词/词性词典的指称线索（仅启用中的插件）。
@@ -2848,6 +3058,117 @@ mod tests {
         assert_eq!(
             runtime.ontology_aliases(),
             vec![("director".to_string(), "导演".to_string())]
+        );
+    }
+
+    #[test]
+    fn ontology_program_exports_structural_axioms_only_when_enabled() {
+        let mut film = manifest("zh.film", PluginMode::Off);
+        film.contributions.push(Contribution::Ontology {
+            id: "film.ontology".to_string(),
+            description: String::new(),
+            predicates: vec![OntologyPredicate {
+                name: "导演".to_string(),
+                aliases: vec!["执导".to_string()],
+                inverse: Some("执导".to_string()),
+                transitive: true,
+                symmetric: false,
+                domain: vec!["电影".to_string()],
+                range: vec!["人物".to_string()],
+            }],
+            types: vec![
+                OntologyType {
+                    name: "电影".to_string(),
+                    aliases: Vec::new(),
+                    subclass_of: vec!["影视作品".to_string()],
+                    disjoint_with: Vec::new(),
+                },
+                OntologyType {
+                    name: "动画电影".to_string(),
+                    aliases: Vec::new(),
+                    subclass_of: vec!["电影".to_string()],
+                    disjoint_with: vec!["真人作品".to_string()],
+                },
+            ],
+        });
+        let registry = PluginRegistry::from_manifests(vec![film]);
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        assert!(runtime.ontology_program().is_empty());
+        assert!(runtime.ontology_inverse_surfaces().is_empty());
+
+        runtime.set_mode("zh.film", PluginMode::On).unwrap();
+        let program = runtime.ontology_program();
+        assert_eq!(program.len(), 7, "子类2 + 互斥1 + 定义域1 + 值域1 + 逆1 + 传递1");
+        assert!(program.lessons.iter().any(|lesson| matches!(
+            lesson,
+            OntologyLesson::Subclass { sub, sup, .. }
+                if sub == "动画电影" && sup == "电影"
+        )));
+        assert!(program.lessons.iter().any(|lesson| matches!(
+            lesson,
+            OntologyLesson::Disjoint { left, right, .. }
+                if left == "动画电影" && right == "真人作品"
+        )));
+        assert!(program.lessons.iter().any(|lesson| matches!(
+            lesson,
+            OntologyLesson::Domain { property, class, .. }
+                if property == "导演" && class == "电影"
+        )));
+        assert!(program.lessons.iter().any(|lesson| matches!(
+            lesson,
+            OntologyLesson::Range { property, class, .. }
+                if property == "导演" && class == "人物"
+        )));
+        assert!(program.lessons.iter().any(|lesson| matches!(
+            lesson,
+            OntologyLesson::Inverse { left, right, .. }
+                if left == "导演" && right == "执导"
+        )));
+        assert_eq!(
+            runtime.ontology_inverse_surfaces(),
+            vec![("执导".to_string(), "导演".to_string())]
+        );
+        assert_eq!(
+            runtime.ontology_program(),
+            program,
+            "重复导出必须幂等（规范排序去重）"
+        );
+    }
+
+    #[test]
+    fn ontology_lint_reports_degenerate_declarations_without_dropping_package() {
+        let mut film = manifest("zh.film", PluginMode::On);
+        film.contributions.push(Contribution::Ontology {
+            id: "film.ontology".to_string(),
+            description: String::new(),
+            predicates: vec![OntologyPredicate {
+                name: "导演".to_string(),
+                aliases: vec![String::new(), "导演".to_string()],
+                inverse: Some("导演".to_string()),
+                domain: vec![String::new()],
+                ..OntologyPredicate::default()
+            }],
+            types: vec![OntologyType {
+                name: "电影".to_string(),
+                aliases: vec![String::new()],
+                subclass_of: vec!["电影".to_string()],
+                disjoint_with: vec![String::new()],
+            }],
+        });
+        let registry = PluginRegistry::from_manifests(vec![film]);
+        assert!(!registry.has_errors(), "退化声明只记警告，不废整包");
+        assert!(registry
+            .issues()
+            .iter()
+            .filter(|issue| issue.severity == PluginSeverity::Warning)
+            .count()
+            >= 6);
+        let runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let program = runtime.ontology_program();
+        assert!(
+            program.lessons.is_empty(),
+            "空/自指声明不得进入统一本体：{:?}",
+            program.lessons
         );
     }
 
