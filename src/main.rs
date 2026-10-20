@@ -2509,6 +2509,21 @@ async fn run_interactive_mode(
             continue;
         }
 
+        if matches!(input, "查询板" | "查询状态" | "工作记忆") {
+            println!("{}", dialogue_manager.board_summary());
+            if let Some(frame) = dialogue_manager.board().current() {
+                println!(
+                    "当前查询：{}；{} 行；筛选/排序/翻页/选行都可用自然语言继续编辑。",
+                    frame.program,
+                    frame.rows.len()
+                );
+            } else {
+                println!("可以试试：「列出所有人的身高」「哪些实体」。");
+            }
+            println!();
+            continue;
+        }
+
         // 对话编年史：追加式哈希链档案（真相源；快照只是检查点）
         if matches!(input, "编年史" | "对话档案" | "对话编年史") {
             match chronicle.as_ref() {
@@ -6040,6 +6055,8 @@ fn interactive_help() -> String {
         "",
         "查询与推理",
         "  直接输入自然语言                    如「小明多大？」「张三和李四什么关系？」",
+        "  列出所有人的身高 / 哪些实体          查询板：集合查询后用「第二个 / 下一页 / 只看… / 按…排序 / 跟…比 / 依据」继续编辑",
+        "  查询板 / 查询状态                    查看当前查询程序、结果行数与知识版本",
         "  SPARQL：<查询>                      执行任意 SPARQL 1.1 查询（SELECT/ASK/CONSTRUCT）",
         "  判断：<陈述> / 蕴含：<陈述>         形式化语义 + 语义蕴含校验",
         "  证明：<目标> / 推理链：<目标>        归结证明与后向链推理",
@@ -6223,6 +6240,9 @@ fn is_command_like(input: &str) -> bool {
         "全息",
         "对话本体",
         "对话状态",
+        "查询板",
+        "查询状态",
+        "工作记忆",
         "溯因",
         "假设生成",
         "为什么",

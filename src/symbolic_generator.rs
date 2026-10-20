@@ -174,6 +174,62 @@ impl SymbolicGenerator {
             .collect()
     }
 
+    pub fn all_entities(&self) -> Vec<String> {
+        let mut entities: Vec<String> = self.known_entities.iter().cloned().collect();
+        entities.sort();
+        entities
+    }
+
+    pub fn all_types(&self) -> Vec<String> {
+        let mut types: Vec<String> = self.type_members.keys().cloned().collect();
+        types.sort();
+        types
+    }
+
+    pub fn entities_of_type(&self, etype: &str) -> Vec<String> {
+        let mut entities = self.type_members.get(etype).cloned().unwrap_or_default();
+        entities.sort();
+        entities.dedup();
+        entities
+    }
+
+    pub fn attribute_pairs(&self, entity: &str) -> Vec<(String, String)> {
+        let mut pairs = self.attributes.get(entity).cloned().unwrap_or_default();
+        pairs.sort();
+        pairs.dedup();
+        pairs
+    }
+
+    pub fn relation_pairs(&self, entity: &str) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = self
+            .by_subject
+            .get(entity)
+            .map(|predicates| {
+                predicates
+                    .iter()
+                    .flat_map(|(predicate, objects)| {
+                        objects
+                            .iter()
+                            .map(move |object| (predicate.clone(), object.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        pairs.sort();
+        pairs.dedup();
+        pairs
+    }
+
+    pub fn all_predicates(&self) -> Vec<String> {
+        let mut predicates: Vec<String> = self.predicate_totals.keys().cloned().collect();
+        predicates.sort();
+        predicates
+    }
+
+    pub fn canonical_predicate(&self, surface: &str) -> Option<String> {
+        self.predicate_surfaces.get(surface).cloned()
+    }
+
     /// 把一条事实渲染成自然中文句子（对外复用动词化词典）
     pub fn render_fact(&self, subject: &str, predicate: &str, objects: &[String]) -> String {
         self.lexicalize(subject, predicate, objects)

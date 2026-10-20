@@ -9337,4 +9337,41 @@ mod tests {
             rebuilt
         );
     }
+
+    #[test]
+    fn query_board_scans_reasoner_entities_and_relations() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "Person".to_string(),
+                properties: HashMap::from([("身高".to_string(), "226".to_string())]),
+            },
+            PrologFact::Entity {
+                name: "王治郅".to_string(),
+                entity_type: "Person".to_string(),
+                properties: HashMap::from([("身高".to_string(), "214".to_string())]),
+            },
+            PrologFact::Relation {
+                from: "姚明".to_string(),
+                rel_type: "球队".to_string(),
+                to: "火箭队".to_string(),
+            },
+        ]);
+        let mut manager = crate::dialogue_manager::DialogueManager::new();
+        let reply = manager
+            .plan_reply("列出所有人的身高", &reasoner)
+            .expect("查询板应读取推理器索引");
+        assert!(reply.text.contains("姚明"), "{}", reply.text);
+        assert!(reply.text.contains("226"), "{}", reply.text);
+        let selected = manager
+            .plan_reply("第一个呢", &reasoner)
+            .expect("查询板应支持序号选择");
+        assert!(selected.text.contains("当前选中"), "{}", selected.text);
+        let compare = manager
+            .plan_reply("跟王治郅比呢", &reasoner)
+            .expect("查询板应支持实体比较");
+        assert!(compare.text.contains("王治郅"), "{}", compare.text);
+        assert!(compare.text.contains("214"), "{}", compare.text);
+    }
 }

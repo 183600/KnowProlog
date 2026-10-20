@@ -25,6 +25,7 @@ use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{
     self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION,
 };
+use crate::query_board::QueryBoard;
 use crate::quality::{ClaimWarrant, QualityIndex};
 use crate::recovery::{
     self, PendingKind, RecoveryMode, RecoveryRequest, RecoveryState,
@@ -129,6 +130,9 @@ pub struct DialogueManagerSnapshot {
     /// 失败回执台账与挂账问题（认识论状态也是可观察状态的一部分）。
     #[serde(default)]
     pub recovery: RecoveryState,
+    /// 交互式查询板：当前查询程序的帧栈（工作记忆）。
+    #[serde(default)]
+    pub board: QueryBoard,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -168,6 +172,63 @@ pub trait DialogueKnowledge {
     fn attribute_values(&self, entity: &str, attribute: &str) -> Vec<String> {
         let _ = (entity, attribute);
         Vec::new()
+    }
+
+    /// 图谱中的全部规范实体（查询板扫描用；缺省不可枚举）。
+    fn all_entities(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 图谱中的全部实体类型（查询板按类型筛选用；缺省不可枚举）。
+    fn all_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// 某类型的全部成员实体（缺省不可枚举）。
+    fn entities_of_type(&self, entity_type: &str) -> Vec<String> {
+        let _ = entity_type;
+        Vec::new()
+    }
+
+    /// 实体的规范类型（缺省未知）。
+    fn entity_type(&self, entity: &str) -> Option<String> {
+        let _ = entity;
+        None
+    }
+
+    /// 实体的字面量属性对（缺省级联属性键与取值）。
+    fn entity_attributes(&self, entity: &str) -> Vec<(String, String)> {
+        let mut pairs = Vec::new();
+        for key in self.known_attributes(entity) {
+            for value in self.attribute_values(entity, &key) {
+                pairs.push((key.clone(), value));
+            }
+        }
+        pairs.sort();
+        pairs.dedup();
+        pairs
+    }
+
+    /// 实体的出向关系对（缺省为空）。
+    fn entity_relations(&self, entity: &str) -> Vec<(String, String)> {
+        let _ = entity;
+        Vec::new()
+    }
+
+    /// 谓词词面归一（缺省恒等）。
+    fn canonical_predicate(&self, surface: &str) -> Option<String> {
+        let _ = surface;
+        None
+    }
+
+    /// 谓词的人类可读词面（缺省原样返回）。
+    fn predicate_label(&self, predicate: &str) -> String {
+        predicate.to_string()
+    }
+
+    /// 知识版本（查询板据此标注过期帧；缺省 0）。
+    fn revision(&self) -> u64 {
+        0
     }
     /// 实体的生成式简介（画像段落），无法生成时缺省为 None。
     fn describe(&self, entity: &str) -> Option<String> {
@@ -265,6 +326,46 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn attribute_values(&self, entity: &str, attribute: &str) -> Vec<String> {
         self.generator().attribute_values(entity, attribute)
+    }
+
+    fn all_entities(&self) -> Vec<String> {
+        self.generator().all_entities()
+    }
+
+    fn all_types(&self) -> Vec<String> {
+        self.generator().all_types()
+    }
+
+    fn entities_of_type(&self, entity_type: &str) -> Vec<String> {
+        self.generator().entities_of_type(entity_type)
+    }
+
+    fn entity_type(&self, entity: &str) -> Option<String> {
+        self.generator().entity_type_of(entity).map(str::to_string)
+    }
+
+    fn entity_attributes(&self, entity: &str) -> Vec<(String, String)> {
+        self.generator().attribute_pairs(entity)
+    }
+
+    fn entity_relations(&self, entity: &str) -> Vec<(String, String)> {
+        self.generator().relation_pairs(entity)
+    }
+
+    fn canonical_predicate(&self, surface: &str) -> Option<String> {
+        self.generator().canonical_predicate(surface).or_else(|| {
+            crate::symbolic_generator::canonical_predicate_key(surface).map(str::to_string)
+        })
+    }
+
+    fn predicate_label(&self, predicate: &str) -> String {
+        crate::symbolic_generator::localized_predicate_key(predicate)
+            .map(str::to_string)
+            .unwrap_or_else(|| predicate.to_string())
+    }
+
+    fn revision(&self) -> u64 {
+        SymbolicReasoner::revision(self)
     }
 
     fn describe(&self, entity: &str) -> Option<String> {
@@ -434,6 +535,8 @@ pub struct DialogueManager {
     /// 质量护照索引（只读派生数据；由宿主按知识版本注入，不进快照）。
     /// 用 `Arc` 共享：多会话（HTTP actor）注入同一份索引时不复制整张查询表。
     quality: Option<Arc<QualityIndex>>,
+    /// 交互式查询板：记住当前查询程序、结果行与证据（随快照持久化）。
+    board: QueryBoard,
 }
 
 impl Default for DialogueManager {
@@ -457,6 +560,7 @@ impl DialogueManager {
             recovery: RecoveryState::new(),
             last_recovery: None,
             quality: None,
+            board: QueryBoard::new(),
         }
     }
 
@@ -626,6 +730,14 @@ impl DialogueManager {
         &self.last_reply
     }
 
+    pub fn board(&self) -> &QueryBoard {
+        &self.board
+    }
+
+    pub fn board_summary(&self) -> String {
+        self.board.summary()
+    }
+
     /// 记录一次用户输入（含被其他管线处理的命令），供回顾时统计。
     pub fn observe_input(&mut self, input: &str) {
         let trimmed = input.trim();
@@ -703,6 +815,9 @@ impl DialogueManager {
                 self.recovery.pending.len()
             ));
         }
+        if self.board.is_active() {
+            summary.push_str(&format!(" {}", self.board.summary()));
+        }
         summary
     }
 
@@ -713,6 +828,7 @@ impl DialogueManager {
             externals: self.externals.clone(),
             last_reply: self.last_reply.clone(),
             recovery: self.recovery.clone(),
+            board: self.board.clone(),
         }
     }
 
@@ -722,6 +838,7 @@ impl DialogueManager {
         self.externals = snapshot.externals.clone();
         self.last_reply = snapshot.last_reply.clone();
         self.recovery = snapshot.recovery.clone();
+        self.board = snapshot.board.clone();
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -769,6 +886,11 @@ impl DialogueManager {
     ) -> Option<DialogueReply> {
         if !self.recovery_mode.eq(&RecoveryMode::Off) {
             if let Some(reply) = self.try_resolve_pending(input) {
+                return Some(reply);
+            }
+        }
+        if self.board.is_active() {
+            if let Some(reply) = self.plan_board_reply(input, knowledge) {
                 return Some(reply);
             }
         }
@@ -855,11 +977,47 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        if let Some(reply) = self.plan_board_reply(input, knowledge) {
+            return Some(reply);
+        }
         let frame = self.analyze(input, knowledge);
         match frame.kind {
             MoveKind::AskAttribute | MoveKind::AskIdentity => self.execute(frame, knowledge),
             _ => None,
         }
+    }
+
+    pub fn plan_board_reply(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<DialogueReply> {
+        let revision = knowledge.revision();
+        let outcome = self.board.apply(input, knowledge, revision)?;
+        self.turns.push(DialogueTurn {
+            index: self.turns.len() + 1,
+            user: input.trim().to_string(),
+            kind: MoveKind::Other,
+            entity: outcome.focus.clone(),
+            attribute: None,
+            answer_excerpt: Some(excerpt(&outcome.text, 40)),
+            provenance: outcome.provenance,
+            plan: outcome.plan.clone(),
+            warrant: None,
+            kb_revision: Some(revision),
+        });
+        if let Some(entity) = outcome.focus {
+            self.push_focus(&entity);
+        }
+        self.last_reply = outcome.plan.clone();
+        if self.externals.last().map(String::as_str) == Some(input.trim()) {
+            self.externals.pop();
+        }
+        Some(DialogueReply {
+            text: outcome.text,
+            plan: outcome.plan,
+            kind: MoveKind::Other,
+        })
     }
 
     /// 本体化解读：先识别元话语与寒暄，再解析属性/身份问句与断言，
@@ -2251,6 +2409,13 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        fn all_entities(&self) -> Vec<String> {
+            let mut entities = self.entities.clone();
+            entities.sort();
+            entities.dedup();
+            entities
+        }
+
         fn describe(&self, entity: &str) -> Option<String> {
             self.profiles.get(entity).cloned()
         }
@@ -2711,5 +2876,44 @@ mod tests {
         assert!(manager.prompt_report().contains("提示资产 v1"));
         manager.reset_prompt_stats();
         assert_eq!(manager.prompt_stats().attempted(), 0);
+    }
+
+    #[test]
+    fn test_query_board_drives_multi_turn_edit_and_snapshot() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_value("姚明", "身高", "226")
+            .with_entity("王治郅", &["身高"])
+            .with_value("王治郅", "身高", "214")
+            .with_entity("易建联", &["身高"])
+            .with_value("易建联", "身高", "213");
+        let mut manager = DialogueManager::new();
+        let reply = manager
+            .plan_reply("列出所有人的身高", &knowledge)
+            .expect("查询板应接管集合查询");
+        assert!(reply.text.contains("姚明"));
+        assert!(manager.board().is_active());
+
+        let selected = manager
+            .plan_reply("第二个呢", &knowledge)
+            .expect("序号选择应留在查询板内");
+        assert!(selected.text.contains("当前选中"));
+        assert_eq!(manager.turns().last().unwrap().plan, vec!["board:select"]);
+
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        assert!(restored.board().is_active());
+        assert_eq!(restored.board().frame_count(), manager.board().frame_count());
+        assert_eq!(restored.turn_count(), manager.turn_count());
+
+        let sorted = restored
+            .plan_reply("按身高从低到高排", &knowledge)
+            .expect("排序应留在查询板内");
+        assert!(sorted.text.contains("易建联"));
+        let undone = restored
+            .plan_pure_dialogue("回到上一步", &knowledge)
+            .expect("撤销应回到上一帧");
+        assert!(undone.text.contains("已回到第"));
     }
 }

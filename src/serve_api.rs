@@ -350,6 +350,9 @@ pub struct TurnResponse {
     /// 接地清单：本轮输入中链接到知识图谱的实体（词面 ↔ URI ↔ 类型 ↔ 角色）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<GroundingCitation>,
+    /// 交互式查询板状态（空板时省略；客户端可据此继续翻页/筛选/选行）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<crate::query_board::BoardView>,
 }
 
 /// 一条接地引用：回答依据的实体身份（URI 可寻址、词面可回溯、类型可审计）。
@@ -588,6 +591,7 @@ impl Session {
             policy: self.policy.clone(),
             epistemic,
             entities,
+            board: self.manager.board().view(self.reasoner.revision()),
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
         response
@@ -3164,6 +3168,7 @@ template = "「{entity}」的身高是{answer}。"
             policy: SessionPolicy::default(),
             epistemic: None,
             entities: Vec::new(),
+            board: None,
         };
         let key = stateless_answer_key(&["姚明的身高是多少".to_string()], None);
 
