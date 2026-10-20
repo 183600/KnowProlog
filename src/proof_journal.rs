@@ -911,6 +911,7 @@ mod tests {
             search_status: crate::resolution_engine::SearchStatus::Proved,
             search_truncated: false,
             frontier: Vec::new(),
+            stats: crate::resolution_engine::SearchStats::default(),
             solutions: vec![ProofSolutionView {
                 bindings: vec![],
                 confidence: 1.0,

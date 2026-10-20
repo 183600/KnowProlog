@@ -38,7 +38,7 @@ use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::resolution_engine::{
     render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
-    ResolutionEngine, SearchOutcome, SearchStatus, Solution, Term,
+    ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
 };
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{
@@ -613,6 +613,8 @@ pub struct ResolutionProofView {
     pub search_truncated: bool,
     /// 本次搜索实际遇到的代表性知识缺口。
     pub frontier: Vec<FailureFrontier>,
+    /// 本次搜索的确定性计数（供诊断面/日志消费，不含耗时）。
+    pub stats: SearchStats,
     pub solutions: Vec<ProofSolutionView>,
 }
 
@@ -3236,6 +3238,7 @@ impl SymbolicReasoner {
             search_status: outcome.status,
             search_truncated: outcome.is_truncated(),
             frontier: outcome.frontier,
+            stats: outcome.stats,
             solutions,
         }
     }
@@ -3382,11 +3385,16 @@ impl SymbolicReasoner {
                 self.render_proof_tree(proof, &mut lines, 2);
             }
             output.push_str(&lines.join("\n"));
-        } else {
+        } else if outcome.status == SearchStatus::Incomplete {
             output.push_str(&format!(
-                "  未得证：在深度上限 {} 内未找到归结反驳（开世界假设：推不出 ≠ 为假）。\n",
+                "  未得证：在深度上限 {} 内搜索被截断，不能据此断言目标不存在（开世界假设）。\n",
                 self.resolver.max_depth()
             ));
+            output.push_str("  可尝试「推理链：同句式问句」查看可能的解，或先补充相关事实/规则。\n");
+        } else {
+            output.push_str(
+                "  未得证：搜索已穷尽所有分支，未找到归结反驳（开世界假设：推不出 ≠ 为假）。\n",
+            );
             output.push_str("  可尝试「推理链：同句式问句」查看可能的解，或先补充相关事实/规则。\n");
         }
         output.push_str(&self.render_search_diagnostics(&outcome));
@@ -3532,7 +3540,11 @@ impl SymbolicReasoner {
             self.resolver.max_depth()
         ));
         if outcome.solutions.is_empty() {
-            output.push_str("  没有找到解（开世界假设：推不出 ≠ 不存在）。\n");
+            if outcome.status == SearchStatus::Incomplete {
+                output.push_str("  没有找到解：搜索被截断，不能据此断言不存在。\n");
+            } else {
+                output.push_str("  没有找到解：搜索已穷尽所有分支（开世界假设：推不出 ≠ 不存在）。\n");
+            }
             output.push_str(&self.render_search_diagnostics(&outcome));
             return output.trim_end().to_string();
         }
@@ -8784,6 +8796,17 @@ mod tests {
             "搜索状态必须区分无解与截断：{}",
             failed
         );
+        assert!(
+            failed.contains("搜索统计："),
+            "搜索报告应披露确定性计数：{}",
+            failed
+        );
+        let view = reasoner
+            .resolution_proof_view("张三的师傅的师傅是赵六")
+            .expect("应得到结构化证明视图");
+        assert!(view.stats.goals >= 1);
+        assert!(view.stats.goal_attempts > 0);
+        assert!(!view.frontier.is_empty(), "穷尽无解应保留失败前沿");
     }
 
     #[test]

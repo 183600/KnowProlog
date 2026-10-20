@@ -37,6 +37,7 @@ use know_prolog::{
     startup_ledger::StartupLedger,
     grammar_extractor::GrammarExtractor,
     prolog_engine::PrologFact,
+    resolution_engine::SearchStatus,
     chronicle::{Chronicle, FsyncPolicy},
     conversation_theory::{self, ConversationTheory},
     history_trust::TrustAssessment,
@@ -3615,10 +3616,16 @@ async fn run_interactive_mode(
                             view.phrase, view.goal_display, view.facts, view.clauses
                         );
                         if view.solutions.is_empty() {
-                            println!(
-                                "未得证：深度上限 {} 内无归结反驳（开世界假设：推不出 ≠ 为假）。",
-                                view.max_depth
-                            );
+                            if view.search_status == SearchStatus::Incomplete {
+                                println!(
+                                    "未得证：深度上限 {} 内搜索被截断，不能据此断言目标不存在（开世界假设）。",
+                                    view.max_depth
+                                );
+                            } else {
+                                println!(
+                                    "未得证：搜索已穷尽所有分支，未找到归结反驳（开世界假设：推不出 ≠ 为假）。"
+                                );
+                            }
                             println!(
                                 "搜索状态：{}{}",
                                 view.search_status.label(),
@@ -3628,8 +3635,21 @@ async fn run_interactive_mode(
                                     ""
                                 }
                             );
-                            for entry in view.frontier.iter().take(5) {
+                            println!(
+                                "搜索统计：{} 个目标、{} 次目标展开、{} 次事实检查、{} 次规则尝试",
+                                view.stats.goals,
+                                view.stats.goal_attempts,
+                                view.stats.fact_checks,
+                                view.stats.rule_attempts
+                            );
+                            const SHOWN_GAPS: usize = 5;
+                            for entry in view.frontier.iter().take(SHOWN_GAPS) {
                                 println!("知识缺口：{}", entry.describe());
+                            }
+                            let omitted = view.frontier.len().saturating_sub(SHOWN_GAPS)
+                                + view.stats.frontier_omitted;
+                            if omitted > 0 {
+                                println!("……另有 {} 条知识缺口未展开", omitted);
                             }
                         }
                         let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
