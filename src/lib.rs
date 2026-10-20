@@ -89,6 +89,7 @@ pub mod identity;
 pub mod entity_registry;
 pub mod shape_gate;
 pub mod relation_acquisition;
+pub mod relation_frame;
 pub mod contextual_reference;
 
 #[cfg(test)]

@@ -58,6 +58,9 @@ use know_prolog::{
     },
     shape_gate::{RepairAction, ShapeReport, ShapeSet},
     relation_acquisition::{GoalOpen, RelationAcquisition},
+    relation_frame::{
+        diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
+    },
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
@@ -201,6 +204,25 @@ enum Commands {
         /// Also fail (exit code) on warnings
         #[arg(long)]
         strict: bool,
+    },
+    /// Extract proof-carrying relation frames from text/file/corpus and gate
+    /// them against the current knowledge store (read-only diagnostic)
+    Frames {
+        /// Text to analyse (mutually exclusive with --file)
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// UTF-8 text file to analyse
+        #[arg(long)]
+        file: Option<String>,
+        /// Maximum number of frames to report (0 = no limit)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Number of example frames with narration in the text report
+        #[arg(long, default_value_t = 8)]
+        samples: usize,
+        /// Print the full report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Audit the semantic law ledger: declared predicate laws + mined rules,
     /// with functional-violation and closure-gap counters
@@ -610,6 +632,96 @@ async fn main() {
                 }
             }
         }
+        Some(Commands::Frames {
+            text,
+            file,
+            limit,
+            samples,
+            json,
+        }) => {
+            // 与 Laws 相同的只读装配：先载入持久画像/律典，再从当前存储取事实。
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_type_system(&config.type_system);
+            let registry = oxigraph_manager.predicate_registry_snapshot();
+            let types = oxigraph_manager.type_system_snapshot();
+            let mut laws = LawBook::from_registry(&registry);
+            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+                laws.apply_persisted(&persisted);
+            }
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let source = match (text, file) {
+                (Some(text), _) => text,
+                (None, Some(path)) => match std::fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("读取文本失败（{}）: {}", path, e);
+                        std::process::exit(1);
+                    }
+                },
+                (None, None) => match load_frame_corpus() {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                },
+            };
+            let (mut frames, stats) = FrameExtractor::new().extract_with_stats(&source);
+            if limit > 0 {
+                frames.truncate(limit);
+            }
+            let gate = FrameGate::from_facts(facts.as_slice(), registry, types, laws);
+            let diagnostics = diagnose_frames(&frames, &gate, samples);
+            if json {
+                let reports: Vec<serde_json::Value> = frames
+                    .iter()
+                    .map(|frame| {
+                        let report = gate.evaluate(frame);
+                        serde_json::json!({
+                            "frame": frame,
+                            "report": report,
+                            "narration": narrate_frame(frame, &report),
+                        })
+                    })
+                    .collect();
+                let payload = serde_json::json!({
+                    "dialect": FRAME_DIALECT,
+                    "extraction": stats,
+                    "gate_facts": gate.fact_count(),
+                    "diagnostics": diagnostics,
+                    "frames": reports,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("关系帧序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                print!("{}", diagnostics.render_text());
+                println!(
+                    "抽取统计：{} 句，{} 条帧，解析失败 {} 句；闸门事实 {} 条。",
+                    stats.sentences, stats.frames, stats.parse_errors, gate.fact_count()
+                );
+                for sample in &diagnostics.samples {
+                    println!("\n{}", sample.frame.render_text());
+                    println!("  证据：{}", sample.frame.evidence.sentence);
+                    println!("  {}", narrate_frame(&sample.frame, &sample.report));
+                }
+            }
+        }
         Some(Commands::Laws {
             json,
             save,
@@ -1008,6 +1120,37 @@ async fn main() {
             run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode, &store_path).await;
         }
     }
+}
+
+/// 默认帧诊断语料：仓库根目录随附的文本知识库（按文件名排序，缺失即跳过）。
+fn load_frame_corpus() -> Result<String, String> {
+    const FILES: &[&str] = &[
+        "additional_knowledge.txt",
+        "basic_knowledge.txt",
+        "comprehensive_knowledge_expansion.txt",
+        "knowledge_base.txt",
+        "knowledge_base_expanded.txt",
+    ];
+    let mut material = String::new();
+    let mut used = 0usize;
+    for path in FILES {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                material.push_str(&content);
+                if !material.ends_with('\n') {
+                    material.push('\n');
+                }
+                used += 1;
+            }
+            Err(_) => continue,
+        }
+    }
+    if used == 0 {
+        return Err(
+            "未找到默认语料；请用 --text 或 --file 指定要诊断的文本".to_string(),
+        );
+    }
+    Ok(material)
 }
 
 /// `eval-nlu`：对话 NLU 金标评测 + 回归棘轮（不依赖知识存储）。
