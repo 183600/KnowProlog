@@ -3245,6 +3245,58 @@ mod tests {
     }
 
     #[test]
+    fn typed_recipe_direction_and_evidence_are_parsed_and_rendered() {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+id = "zh.film"
+version = "0.1.0"
+api = 1
+default_mode = "on"
+
+[[contributions]]
+kind = "recipe"
+id = "film.works_by_director"
+patterns = ["{entity}导演过哪些电影"]
+question = "{entity}导演过哪些作品"
+attribute = "导演"
+direction = "inverse"
+answer_types = ["电影"]
+template = "film.works.template"
+
+[[contributions]]
+kind = "template"
+id = "film.works.template"
+template = "「{entity}」导演过：{answer}。依据：{evidence}"
+"#,
+        )
+        .expect("类型化配方应可解析");
+        let registry = PluginRegistry::from_manifests(vec![manifest]);
+        assert!(!registry.has_errors(), "{}", registry.render_issues());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let outcome = runtime.rewrite("卡梅隆导演过哪些电影");
+        let recipe = outcome.trace.recipe.as_ref().expect("应命中配方");
+        assert_eq!(recipe.direction, RecipeDirection::Inverse);
+        assert_eq!(recipe.answer_types, vec!["电影".to_string()]);
+        let composed = runtime.compose_answer_with_evidence(
+            &outcome,
+            "阿凡达",
+            &["阿凡达 —导演→ 卡梅隆（直接声明）".to_string()],
+        );
+        assert_eq!(
+            composed.text,
+            "「卡梅隆」导演过：阿凡达。依据：阿凡达 —导演→ 卡梅隆（直接声明）"
+        );
+        assert!(
+            runtime
+                .last_trace()
+                .expect("应留痕")
+                .matches
+                .iter()
+                .any(|entry| entry.kind == "template" && entry.applied)
+        );
+    }
+
+    #[test]
     fn recipe_composes_grounded_template_answer() {
         let mut film = manifest("zh.film", PluginMode::On);
         film.contributions.push(recipe(

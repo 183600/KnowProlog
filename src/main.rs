@@ -1659,6 +1659,15 @@ async fn main() {
                     plugin_runtime.enabled_count()
                 );
             }
+            let plugin_receipt = api_state.configure_plugin_runtime(&plugin_runtime);
+            if !plugin_receipt.is_empty() {
+                println!(
+                    "插件本体已并入服务统一推理器：{} 条公理、{} 条别名、{} 条逆向词面。",
+                    plugin_receipt.lessons,
+                    plugin_receipt.aliases,
+                    plugin_receipt.inverse_surfaces
+                );
+            }
             let plugin_runtime = (plugin_runtime.installed_count() > 0)
                 .then(|| Arc::new(parking_lot::Mutex::new(plugin_runtime)));
             api_state.set_plugin_runtime(plugin_runtime);
@@ -2951,6 +2960,24 @@ async fn run_interactive_mode(
     }
     if plugin_aliases > 0 {
         println!("插件本体已合并：{} 条谓词别名。", plugin_aliases);
+    }
+    // 插件的类型层级/互斥/定义域值域/逆/传递/对称并入**同一个**本体推理器：
+    // 与 [type_system]、[[predicate_profiles]]、教学公理共用闭包与本体胶囊。
+    let plugin_program = plugin_runtime.ontology_program();
+    if !plugin_program.is_empty() {
+        let plugin_lessons = symbolic_reasoner.configure_ontology_program(&plugin_program);
+        if plugin_lessons > 0 {
+            println!("插件本体已并入统一推理器：{} 条公理。", plugin_lessons);
+        }
+    }
+    // 互逆谓词的逆向词面：发问时主宾对调（「执导」问句 ↔「导演」事实）。
+    let mut plugin_inverse_surfaces = 0;
+    for (surface, slot) in plugin_runtime.ontology_inverse_surfaces() {
+        symbolic_reasoner.register_predicate_query_surface(&surface, &slot);
+        plugin_inverse_surfaces += 1;
+    }
+    if plugin_inverse_surfaces > 0 {
+        println!("插件本体已合并：{} 条逆向查询词面。", plugin_inverse_surfaces);
     }
     // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
     let plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
@@ -6596,36 +6623,28 @@ async fn run_interactive_mode(
                     if let Some(recipe) = outcome.trace.recipe.clone() {
                         let entity = recipe.slots.get("entity").cloned();
                         let mut answer = None;
+                        let mut evidence = Vec::new();
                         if let (Some(entity), Some(attribute)) =
                             (entity.as_deref(), recipe.attribute.as_deref())
                         {
-                            let mut values =
-                                know_prolog::dialogue_manager::DialogueKnowledge::attribute_values(
-                                    &symbolic_reasoner,
-                                    entity,
-                                    attribute,
-                                );
-                            values = values
-                                .into_iter()
-                                .map(|value| {
-                                    know_prolog::identity::local_name(
-                                        know_prolog::identity::DEFAULT_BASE_NS,
-                                        &value,
-                                    )
-                                    .unwrap_or(value)
-                                })
-                                .collect();
-                            values.sort();
-                            values.dedup();
-                            if !values.is_empty() {
-                                answer = Some(values.join("、"));
+                            if let Some(lookup) = symbolic_reasoner.recipe_lookup(
+                                entity,
+                                attribute,
+                                recipe.direction,
+                                &recipe.answer_types,
+                            ) {
+                                if !lookup.values.is_empty() {
+                                    answer = Some(lookup.values.join("、"));
+                                    evidence = lookup.evidence;
+                                }
                             }
                         }
                         if answer.is_none() {
                             answer = symbolic_reasoner.answer(&recipe.question);
                         }
                         if let Some(answer) = answer {
-                            let composed = plugin_runtime.compose_answer(outcome, &answer);
+                            let composed = plugin_runtime
+                                .compose_answer_with_evidence(outcome, &answer, &evidence);
                             let text = composed.text;
                             println!("{}", text);
                             let plan =

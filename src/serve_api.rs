@@ -102,6 +102,20 @@ pub struct CacheEpoch {
     pub identity_epoch: u64,
 }
 
+/// 插件本体并入统一推理器的回执：公理、别名、逆向词面的新增条数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PluginOntologyReceipt {
+    pub lessons: usize,
+    pub aliases: usize,
+    pub inverse_surfaces: usize,
+}
+
+impl PluginOntologyReceipt {
+    pub fn is_empty(self) -> bool {
+        self.lessons == 0 && self.aliases == 0 && self.inverse_surfaces == 0
+    }
+}
+
 /// 无状态问答缓存键：按序的全部用户消息（trim 后）+ 生效策略。
 ///
 /// 只做「完全相等」命中，不做相似/近似匹配：键由长度前缀拼接，
@@ -449,19 +463,18 @@ impl Session {
         let recipe = outcome.trace.recipe.clone()?;
         let entity = recipe.slots.get("entity").cloned();
         let mut answer = None;
+        let mut evidence = Vec::new();
         if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
-            let mut values = DialogueKnowledge::attribute_values(&self.reasoner, entity, attribute);
-            values = values
-                .into_iter()
-                .map(|value| {
-                    crate::identity::local_name(crate::identity::DEFAULT_BASE_NS, &value)
-                        .unwrap_or(value)
-                })
-                .collect();
-            values.sort();
-            values.dedup();
-            if !values.is_empty() {
-                answer = Some(values.join("、"));
+            if let Some(lookup) = self.reasoner.recipe_lookup(
+                entity,
+                attribute,
+                recipe.direction,
+                &recipe.answer_types,
+            ) {
+                if !lookup.values.is_empty() {
+                    answer = Some(lookup.values.join("、"));
+                    evidence = lookup.evidence;
+                }
             }
         }
         if answer.is_none() {
@@ -472,7 +485,7 @@ impl Session {
             .plugin
             .as_ref()?
             .lock()
-            .compose_answer(outcome, &answer);
+            .compose_answer_with_evidence(outcome, &answer, &evidence);
         let plan = vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
         let provenance = vec![format!(
             "插件 {} / 配方 {} / 问句 {}",
@@ -1054,6 +1067,25 @@ impl ApiState {
             .reasoner
             .lock()
             .configure_ontology_program(program)
+    }
+
+    /// 宿主注入已启用插件的本体贡献：谓词别名、逆向词面与结构性公理
+    /// 全部进入**同一个**暖基座推理器，之后分叉的每个会话同源携带。
+    /// 与 `configure_ontology` 一样是单调、幂等的启动期操作。
+    pub fn configure_plugin_runtime(&self, runtime: &PluginRuntime) -> PluginOntologyReceipt {
+        let mut reasoner = self.warm.reasoner.lock();
+        let mut receipt = PluginOntologyReceipt::default();
+        for (alias, canonical) in runtime.ontology_aliases() {
+            if reasoner.register_predicate_alias(&alias, &canonical) {
+                receipt.aliases += 1;
+            }
+        }
+        for (surface, slot) in runtime.ontology_inverse_surfaces() {
+            reasoner.register_predicate_query_surface(&surface, &slot);
+            receipt.inverse_surfaces += 1;
+        }
+        receipt.lessons = reasoner.configure_ontology_program(&runtime.ontology_program());
+        receipt
     }
 
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
@@ -2515,6 +2547,99 @@ template = "「{entity}」的身高是{answer}。"
             turn.plan.iter().any(|plan| plan.contains("height.recipe")),
             "{:?}",
             turn.plan
+        );
+    }
+
+    /// 插件本体进入服务暖基座：逆向配方 + 子类类型约束 + 依据槽位都可跨会话工作。
+    #[tokio::test]
+    async fn plugin_typed_inverse_recipe_reaches_http_sessions() {
+        let manifest: crate::plugin::PluginManifest = toml::from_str(
+            r#"
+id = "test.film"
+version = "0.1.0"
+api = 1
+name = "电影包"
+default_mode = "on"
+
+[[contributions]]
+kind = "ontology"
+id = "film.ontology"
+predicates = [
+  { name = "导演", inverse = "执导", domain = ["电影"], range = ["人物"] },
+]
+types = [
+  { name = "电影", subclass_of = ["影视作品"] },
+  { name = "动画电影", subclass_of = ["电影"] },
+]
+
+[[contributions]]
+kind = "recipe"
+id = "film.works_by_director"
+patterns = ["{entity}导演过哪些电影"]
+question = "{entity}导演过哪些作品"
+attribute = "导演"
+direction = "inverse"
+answer_types = ["电影"]
+template = "film.works.template"
+
+[[contributions]]
+kind = "template"
+id = "film.works.template"
+template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
+"#,
+        )
+        .expect("测试清单应可解析");
+        let registry = crate::plugin::PluginRegistry::from_manifests(vec![manifest]);
+        let runtime = crate::plugin::PluginRuntime::with_settings(
+            registry,
+            &crate::plugin::PluginSettings::default(),
+        );
+        let facts = vec![
+            PrologFact::Entity {
+                name: "阿凡达".into(),
+                entity_type: "电影".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "卡梅隆".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "阿凡达".into(),
+                rel_type: "导演".into(),
+                to: "卡梅隆".into(),
+            },
+        ];
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: false,
+            ..ReasoningConfig::default()
+        };
+        let mut state = ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        );
+        let receipt = state.configure_plugin_runtime(&runtime);
+        assert!(receipt.lessons > 0, "插件 TBox 必须并入暖基座");
+        assert!(receipt.inverse_surfaces > 0, "逆关系词面必须登记");
+        state.set_plugin_runtime(Some(Arc::new(parking_lot::Mutex::new(runtime))));
+        let state = Arc::new(state);
+
+        let session_id = state.create_session().await.expect("会话应创建成功");
+        let turn = state
+            .take_turn(&session_id, "卡梅隆导演过哪些电影")
+            .await
+            .expect("轮次应成功");
+        assert_eq!(turn.source, "plugin", "{}", turn.reply);
+        assert!(turn.reply.contains("阿凡达"), "{}", turn.reply);
+        assert!(
+            turn.reply.contains("导演") && turn.reply.contains("依据"),
+            "依据必须接地：{}",
+            turn.reply
         );
     }
 
