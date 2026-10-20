@@ -208,6 +208,7 @@ pub struct SurfacePattern {
     pub context_pairs: usize,
     pub purity_permille: u32,
     pub active: bool,
+    pub retired: bool,
     pub examples: Vec<String>,
 }
 
@@ -223,7 +224,13 @@ impl SurfacePattern {
             self.id,
             self.support_pairs,
             self.purity_permille as f64 / 10.0,
-            if self.active { "，已激活" } else { "，未激活" }
+            if self.retired {
+                "，已因对话否认退役"
+            } else if self.active {
+                "，已激活"
+            } else {
+                "，未激活"
+            }
         )
     }
 }
@@ -482,7 +489,7 @@ impl WeakConstructor {
             );
         }
         let sentences = split_sentences(corpus);
-        let (patterns, aligned_edges) =
+        let (mut patterns, aligned_edges) =
             learn_patterns(&self.seed_edges, corpus, &self.registry, options);
         let active: Vec<&SurfacePattern> = patterns.iter().filter(|item| item.active).collect();
         let (frames, extraction) = FrameExtractor::new().extract_with_stats(corpus);
@@ -531,6 +538,17 @@ impl WeakConstructor {
                 .cmp(&right.surface)
                 .then_with(|| left.role.cmp(&right.role))
         });
+        let denied_patterns: BTreeSet<String> = list
+            .iter()
+            .filter(|candidate| candidate.rebuttals.contains(&HardRebuttal::DialogueDenied))
+            .flat_map(|candidate| candidate.patterns.iter().cloned())
+            .collect();
+        for pattern in &mut patterns {
+            if denied_patterns.contains(&pattern.id) {
+                pattern.active = false;
+                pattern.retired = true;
+            }
+        }
         let mut generations = Vec::new();
         for candidate in &list {
             if candidate.decision != CandidateDecision::Accepted {
@@ -871,6 +889,7 @@ fn learn_patterns(
                 context_pairs,
                 purity_permille,
                 active,
+                retired: false,
                 examples: entry
                     .examples
                     .get(predicate)
@@ -1495,6 +1514,29 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(items[0].confirmed);
         assert!(!items[1].confirmed);
+    }
+
+
+    #[test]
+    fn denial_retires_pattern() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let corpus = "张三拜李四为师。\n王五拜赵六为师。\n钱七拜孙八为师。\n";
+        let feedback = vec![ConstructionFeedback {
+            subject: "钱七".to_string(),
+            predicate: "师傅".to_string(),
+            object: "孙八".to_string(),
+            confirmed: false,
+        }];
+        let report = constructor(facts, "师傅").build_with_feedback(
+            corpus,
+            &ConstructionOptions::default(),
+            &feedback,
+        );
+        assert!(report.patterns.iter().any(|item| item.retired && !item.active));
+        assert!(report.generations.is_empty());
     }
 
     #[test]
