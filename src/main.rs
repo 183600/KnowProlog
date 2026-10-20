@@ -3338,6 +3338,36 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 证据检索：符号化稠密排序 + 精确约束 + 上界剪枝，并给出可审计回执
+        if let Some(query) = strip_any_prefix(
+            input,
+            &["证据检索：", "证据检索:", "检索证据：", "检索证据:"],
+        ) {
+            let query = query.trim();
+            if query.is_empty() {
+                println!("请提供要检索的问题，例如：证据检索：张三的师傅是谁");
+            } else {
+                match load_graph_snapshot(&oxigraph_manager).await {
+                    Ok(facts) => {
+                        let mut retriever = DenseRetriever::new(8, 0.85, 12);
+                        retriever.observe_facts(&facts);
+                        let search = retriever.search(
+                            query,
+                            8,
+                            &SearchConstraints::default(),
+                            SearchBudget::default(),
+                        );
+                        println!("{}", retriever.format_hits(query, &search.hits));
+                        println!();
+                        println!("{}", search.receipt.render_text());
+                    }
+                    Err(e) => println!("加载知识图谱失败: {}", e),
+                }
+            }
+            println!();
+            continue;
+        }
+
         if input == "对话记忆" {
             println!("{}", symbolic_reasoner.dialogue_summary());
             println!();
@@ -7013,6 +7043,7 @@ fn interactive_help() -> String {
         "  一致性 / 改口检查                     同题异答、过期回答与未答问题",
         "  时间线 / 编年史 / 回放 <N>            对话编年史审计与重建",
         "  相似实体：<实体> / 介绍：<实体>       相似度排序与生成式介绍",
+        "  证据检索：<问题>                    带约束与上界剪枝的证据排序及检索回执",
         "",
         "其他",
         "  帮助 / help / ?                      显示本页",
@@ -7229,6 +7260,8 @@ fn is_command_like(input: &str) -> bool {
         "形式化",
         "相似实体",
         "语义相似",
+        "证据检索",
+        "检索证据",
         "对话记忆",
         "帧记忆",
         "话语帧",
