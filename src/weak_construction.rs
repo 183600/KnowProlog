@@ -168,12 +168,11 @@ impl SurfacePattern {
 
     pub fn render_text(&self) -> String {
         format!(
-            "{}  [{}]  支持 {} 对，纯度 {}.{}‰{}",
+            "{}  [{}]  支持 {} 对，纯度 {:.1}%{}",
             self.render_template(),
             self.id,
             self.support_pairs,
-            self.purity_permille / 1000,
-            self.purity_permille % 1000,
+            self.purity_permille as f64 / 10.0,
             if self.active { "，已激活" } else { "，未激活" }
         )
     }
@@ -261,6 +260,19 @@ impl ConstructionCandidate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedUtterance {
+    pub candidate: String,
+    pub pattern: String,
+    pub text: String,
+}
+
+impl GeneratedUtterance {
+    pub fn render_text(&self) -> String {
+        format!("{}  ← {}（{}）", self.text, self.candidate, self.pattern)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConstructionStats {
     pub sentences: usize,
@@ -283,6 +295,7 @@ pub struct ConstructionReport {
     pub patterns: Vec<SurfacePattern>,
     pub candidates: Vec<ConstructionCandidate>,
     pub mint_proposals: Vec<MintProposal>,
+    pub generations: Vec<GeneratedUtterance>,
 }
 
 impl ConstructionReport {
@@ -326,6 +339,13 @@ impl ConstructionReport {
             lines.push("铸型提案：".to_string());
             for proposal in &self.mint_proposals {
                 lines.push(format!("  {}", proposal.render_text()));
+            }
+        }
+        if !self.generations.is_empty() {
+            lines.push(String::new());
+            lines.push("已接受事实的措辞（不发明事实）：".to_string());
+            for generation in &self.generations {
+                lines.push(format!("  {}", generation.render_text()));
             }
         }
         lines.join("\n")
@@ -384,7 +404,8 @@ impl WeakConstructor {
 
     pub fn build(&self, corpus: &str, options: &ConstructionOptions) -> ConstructionReport {
         let sentences = split_sentences(corpus);
-        let patterns = learn_patterns(&self.seed_edges, corpus, &self.registry, options);
+        let (patterns, aligned_edges) =
+            learn_patterns(&self.seed_edges, corpus, &self.registry, options);
         let active: Vec<&SurfacePattern> = patterns.iter().filter(|item| item.active).collect();
         let (frames, extraction) = FrameExtractor::new().extract_with_stats(corpus);
         let mut candidates: BTreeMap<(String, String, String), CandidateAccumulator> =
@@ -430,6 +451,29 @@ impl WeakConstructor {
                 .cmp(&right.surface)
                 .then_with(|| left.role.cmp(&right.role))
         });
+        let mut generations = Vec::new();
+        for candidate in &list {
+            if candidate.decision != CandidateDecision::Accepted {
+                continue;
+            }
+            let Some(pattern) = patterns.iter().find(|pattern| {
+                pattern.active && pattern.predicate == candidate.predicate
+            }) else {
+                continue;
+            };
+            generations.push(GeneratedUtterance {
+                candidate: candidate.key(),
+                pattern: pattern.id.clone(),
+                text: format!(
+                    "{}{}{}{}{}",
+                    pattern.prefix,
+                    candidate.subject,
+                    pattern.middle,
+                    candidate.object,
+                    pattern.suffix
+                ),
+            });
+        }
         let mut stats = ConstructionStats {
             sentences: sentences.len(),
             seed_edges: self.seed_edges.len(),
@@ -446,11 +490,7 @@ impl WeakConstructor {
                 CandidateDecision::Rejected => stats.rejected += 1,
             }
         }
-        stats.aligned_seed_edges = patterns
-            .iter()
-            .map(|pattern| pattern.support_pairs)
-            .max()
-            .unwrap_or(0);
+        stats.aligned_seed_edges = aligned_edges.len();
         ConstructionReport {
             dialect: CONSTRUCTION_DIALECT.to_string(),
             stats,
@@ -458,6 +498,7 @@ impl WeakConstructor {
             patterns,
             candidates: list,
             mint_proposals,
+            generations,
         }
     }
 
@@ -664,9 +705,10 @@ fn learn_patterns(
     corpus: &str,
     registry: &PredicateRegistry,
     options: &ConstructionOptions,
-) -> Vec<SurfacePattern> {
+) -> (Vec<SurfacePattern>, BTreeSet<String>) {
     let sentences = split_sentences(corpus);
     let mut contexts: BTreeMap<(String, String, String), ContextEntry> = BTreeMap::new();
+    let mut aligned_edges = BTreeSet::new();
     for sentence in &sentences {
         let sentence = normalize_sentence(sentence);
         if sentence.is_empty() || sentence.contains('？') || sentence.contains('?') {
@@ -684,6 +726,10 @@ fn learn_patterns(
             if !valid_context(&prefix, &middle, &suffix) {
                 continue;
             }
+            aligned_edges.insert(format!(
+                "{}({}, {})",
+                edge.predicate, edge.subject, edge.object
+            ));
             let entry = contexts.entry((prefix, middle, suffix)).or_default();
             let pair = format!("{}|{}", edge.subject, edge.object);
             entry
@@ -737,7 +783,7 @@ fn learn_patterns(
             .then_with(|| right.support_pairs.cmp(&left.support_pairs))
             .then_with(|| left.id.cmp(&right.id))
     });
-    patterns
+    (patterns, aligned_edges)
 }
 
 fn align_seed(sentence: &str, subject: &str, object: &str) -> Option<(String, String, String)> {
@@ -1046,6 +1092,14 @@ mod tests {
         }
     }
 
+    fn entity(name: &str, entity_type: &str) -> PrologFact {
+        PrologFact::Entity {
+            name: name.to_string(),
+            entity_type: entity_type.to_string(),
+            properties: std::collections::HashMap::new(),
+        }
+    }
+
     fn registry(predicate: &str) -> PredicateRegistry {
         let mut registry = PredicateRegistry::new();
         registry.declare(&PredicateProfileConfig {
@@ -1138,6 +1192,112 @@ mod tests {
             .map(|item| item.surface.as_str())
             .collect();
         assert!(surfaces.contains(&"钱七") || surfaces.contains(&"孙八"));
+    }
+
+
+    #[test]
+    fn functional_conflict_rejects_candidate() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&PredicateProfileConfig {
+            name: "师傅".to_string(),
+            functional: true,
+            ..PredicateProfileConfig::default()
+        });
+        let constructor =
+            WeakConstructor::new(&facts, registry, TypeSystem::new(), LawBook::new());
+        let corpus = "张三拜李四为师。\n王五拜赵六为师。\n张三拜钱七为师。\n";
+        let report = constructor.build(corpus, &ConstructionOptions::default());
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|item| item.subject == "张三" && item.object == "钱七")
+            .expect("应抽出冲突候选");
+        assert_eq!(candidate.decision, CandidateDecision::Rejected);
+        assert!(candidate.rebuttals.contains(&HardRebuttal::FunctionalConflict));
+    }
+
+    #[test]
+    fn type_disjointness_rejects_candidate() {
+        let mut facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+            entity("张三", "Person"),
+            entity("李四", "Person"),
+            entity("王五", "Person"),
+            entity("赵六", "Person"),
+            entity("钱七", "Place"),
+        ];
+        facts.push(entity("孙八", "Person"));
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&PredicateProfileConfig {
+            name: "师傅".to_string(),
+            domain: vec!["Person".to_string()],
+            range: vec!["Person".to_string()],
+            ..PredicateProfileConfig::default()
+        });
+        let mut types = TypeSystem::new();
+        types.declare_disjoint("Person", "Place");
+        let constructor = WeakConstructor::new(&facts, registry, types, LawBook::new());
+        let corpus = "张三的师傅是李四。\n王五的师傅是赵六。\n钱七的师傅是孙八。\n";
+        let report = constructor.build(corpus, &ConstructionOptions::default());
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|item| item.subject == "钱七" && item.object == "孙八")
+            .expect("应抽出类型冲突候选");
+        assert_eq!(candidate.decision, CandidateDecision::Rejected);
+        assert!(candidate.rebuttals.contains(&HardRebuttal::SchemaViolation));
+    }
+
+    #[test]
+    fn ambiguous_context_is_not_activated() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+            relation("张三", "老师", "李四"),
+            relation("王五", "老师", "赵六"),
+        ];
+        let corpus = "张三的同伴是李四。\n王五的同伴是赵六。\n";
+        let constructor = WeakConstructor::new(
+            &facts,
+            PredicateRegistry::new(),
+            TypeSystem::new(),
+            LawBook::new(),
+        );
+        let report = constructor.build(corpus, &ConstructionOptions::default());
+        assert!(report.patterns.iter().all(|item| !item.active));
+    }
+
+    #[test]
+    fn aligned_seed_edges_are_counted_once() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let corpus = "张三拜李四为师。\n张三拜李四为师。\n王五拜赵六为师。\n";
+        let report = constructor(facts, "师傅").build(corpus, &ConstructionOptions::default());
+        assert_eq!(report.stats.aligned_seed_edges, 2);
+    }
+
+
+    #[test]
+    fn accepted_candidate_can_be_rendered_from_learned_pattern() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let corpus = "张三的师傅是李四。\n王五的师傅是赵六。\n钱七的师傅是孙八。\n";
+        let report = constructor(facts, "师傅").build(corpus, &ConstructionOptions::default());
+        let generated = report
+            .generations
+            .iter()
+            .find(|item| item.candidate.contains("钱七"))
+            .expect("已接受候选应能由模式生成措辞");
+        assert_eq!(generated.text, "钱七的师傅是孙八");
     }
 
     #[test]

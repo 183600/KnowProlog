@@ -61,6 +61,7 @@ use know_prolog::{
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
     },
+    weak_construction::{ConstructionOptions, WeakConstructor},
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     dialogue_fuzz::{
@@ -248,6 +249,28 @@ enum Commands {
         /// Number of example frames with narration in the text report
         #[arg(long, default_value_t = 8)]
         samples: usize,
+        /// Print the full report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Learn surface patterns from seed facts x corpus and propose new graph
+    /// candidates with evidence families and ordinal confidence (read-only)
+    BuildKg {
+        /// Text to analyse (mutually exclusive with --file)
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// UTF-8 text file to analyse
+        #[arg(long)]
+        file: Option<String>,
+        /// Minimum distinct seed entity pairs before a pattern is activated
+        #[arg(long, default_value_t = 2)]
+        min_support: usize,
+        /// Minimum context purity in per mille (0-1000)
+        #[arg(long, default_value_t = 600)]
+        min_purity: u32,
+        /// Maximum number of candidates to report (0 = no limit)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
         /// Print the full report as JSON
         #[arg(long)]
         json: bool,
@@ -820,6 +843,72 @@ async fn main() {
                     println!("  证据：{}", sample.frame.evidence.sentence);
                     println!("  {}", narrate_frame(&sample.frame, &sample.report));
                 }
+            }
+        }
+        Some(Commands::BuildKg {
+            text,
+            file,
+            min_support,
+            min_purity,
+            limit,
+            json,
+        }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_type_system(&config.type_system);
+            let registry = oxigraph_manager.predicate_registry_snapshot();
+            let types = oxigraph_manager.type_system_snapshot();
+            let mut laws = LawBook::from_registry(&registry);
+            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+                laws.apply_persisted(&persisted);
+            }
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let source = match (text, file) {
+                (Some(text), _) => text,
+                (None, Some(path)) => match std::fs::read_to_string(&path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("读取文本失败（{}）: {}", path, e);
+                        std::process::exit(1);
+                    }
+                },
+                (None, None) => match load_frame_corpus() {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        std::process::exit(1);
+                    }
+                },
+            };
+            let options = ConstructionOptions {
+                min_pattern_support: min_support,
+                min_pattern_purity: min_purity.min(1000),
+                max_candidates: limit,
+                ..ConstructionOptions::default()
+            };
+            let constructor =
+                WeakConstructor::new(facts.as_slice(), registry, types, laws);
+            let report = constructor.build(&source, &options);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("构建报告序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", report.render_text());
             }
         }
         Some(Commands::Paths {
