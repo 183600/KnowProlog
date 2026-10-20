@@ -66,6 +66,7 @@ use know_prolog::{
     },
     weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
+    dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
@@ -325,6 +326,33 @@ enum Commands {
         #[arg(long = "as-of", value_name = "TIME")]
         as_of: Option<String>,
         /// Print the path bundle as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retrieve ranked graph evidence (TF-IDF x structural PPR x predicate)
+    /// under exact constraints, with a certificate-carrying search receipt
+    Evidence {
+        /// Question or keyword query
+        query: String,
+        /// Number of evidence rows to return
+        #[arg(long, default_value_t = 8)]
+        k: usize,
+        /// Restrict to an exact subject
+        #[arg(long)]
+        subject: Option<String>,
+        /// Restrict to an exact predicate
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Restrict to an exact object
+        #[arg(long)]
+        object: Option<String>,
+        /// Restrict to entities with this declared type
+        #[arg(long = "type", value_name = "TYPE")]
+        entity_type: Option<String>,
+        /// Maximum number of candidates to score (default: unlimited)
+        #[arg(long)]
+        max_scanned: Option<usize>,
+        /// Print hits and the receipt as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1108,6 +1136,57 @@ async fn main() {
                 }
             } else {
                 println!("{}", bundle.render_text());
+            }
+        }
+        Some(Commands::Evidence {
+            query,
+            k,
+            subject,
+            predicate,
+            object,
+            entity_type,
+            max_scanned,
+            json,
+        }) => {
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let mut retriever = DenseRetriever::new(k, 0.85, 12);
+            retriever.observe_facts(&facts);
+            let constraints = SearchConstraints {
+                subject: subject.map(|value| value.trim().to_string()),
+                predicate: predicate.map(|value| value.trim().to_string()),
+                object: object.map(|value| value.trim().to_string()),
+                entity_type: entity_type.map(|value| value.trim().to_string()),
+            };
+            let search = retriever.search(
+                &query,
+                k,
+                &constraints,
+                SearchBudget { max_scanned },
+            );
+            if json {
+                let payload = serde_json::json!({
+                    "query": query,
+                    "constraints": constraints,
+                    "hits": search.hits,
+                    "receipt": search.receipt,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(e) => {
+                        eprintln!("证据检索结果序列化失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", retriever.format_hits(&query, &search.hits));
+                println!();
+                println!("{}", search.receipt.render_text());
             }
         }
         Some(Commands::Temporal {
