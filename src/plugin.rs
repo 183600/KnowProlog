@@ -1219,6 +1219,12 @@ fn literal_length(segments: &[Segment]) -> usize {
 }
 
 /// 整串匹配模式；槽位非空，字面量按顺序出现。
+fn trim_sentence_end(text: &str) -> &str {
+    text.trim()
+        .trim_end_matches(|ch: char| matches!(ch, '？' | '?' | '。' | '！' | '!' | '；' | ';' | '，' | ','))
+        .trim_end()
+}
+
 fn match_segments(segments: &[Segment], text: &str) -> Option<BTreeMap<String, String>> {
     let mut captures = BTreeMap::new();
     let mut pos = 0usize;
@@ -1801,9 +1807,13 @@ impl PluginRuntime {
 
     /// 词法 → 改写/配方 →（可选）观察。返回生效文本与完整 trace。
     pub fn rewrite(&mut self, input: &str) -> PluginOutcome {
+        let original = input;
+        // 问句末尾的标点是排版不是语义：只用于匹配，不把「？」带进槽位。
+        // 若没有任何插件实际改写，最终仍原样返回，避免影响核心管线。
+        let match_input = trim_sentence_end(input);
         let mut trace = PluginTrace {
-            input: input.to_string(),
-            effective: input.to_string(),
+            input: original.to_string(),
+            effective: original.to_string(),
             ..PluginTrace::default()
         };
         if self.manifests.is_empty() {
@@ -1817,9 +1827,9 @@ impl PluginRuntime {
         // 1. Lexicon + ontology aliases：最长匹配、单遍替换；观察模式只记账，
         //    且匹配的是原文（不会出现「电影」再被「影」二次替换的堆叠错误）。
         let lexicon = self.lexicon_pairs();
-        let mut text = input.to_string();
+        let mut text = match_input.to_string();
         if !lexicon.is_empty() {
-            let (normalized, matches) = apply_lexicon(input, &lexicon);
+            let (normalized, matches) = apply_lexicon(match_input, &lexicon);
             text = normalized;
             trace.matches.extend(matches);
         }
@@ -1890,6 +1900,11 @@ impl PluginRuntime {
                 break;
             }
             text = next;
+            trace.effective = text.clone();
+        }
+
+        if text == match_input && text != original {
+            text = original.to_string();
             trace.effective = text.clone();
         }
 
@@ -3071,6 +3086,25 @@ mod tests {
         assert!(observed.trace.matches.iter().any(|entry| {
             entry.plugin == "zh.observe" && entry.mode == PluginMode::Observe && !entry.applied
         }));
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_ignored_for_matching() {
+        let mut on = manifest("zh.film", PluginMode::On);
+        on.contributions.push(rewrite_contribution(
+            "film.directed",
+            "{entity}是谁导演的",
+            "{entity}的导演是谁",
+        ));
+        let registry = PluginRegistry::from_manifests(vec![on]);
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+
+        let outcome = runtime.rewrite("阿凡达是谁导演的？");
+        assert_eq!(outcome.text, "阿凡达的导演是谁");
+        assert_eq!(outcome.trace.input, "阿凡达是谁导演的？");
+
+        let untouched = runtime.rewrite("今天天气怎么样？");
+        assert_eq!(untouched.text, "今天天气怎么样？");
     }
 
     #[test]
