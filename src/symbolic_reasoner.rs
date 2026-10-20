@@ -1619,6 +1619,31 @@ impl SymbolicReasoner {
         if evidence.is_empty() {
             evidence.push(format!("图谱属性记录：{}的{}", entity, attribute));
         }
+        // 类型约束用的不是问答模板里的猜测：把每个答案的已知类型及其推导理由
+        // 一并复述，用户能看到「为什么这个值符合 answer_types」。
+        if !answer_types.is_empty() {
+            for value in &raw_values {
+                let known_types = closure.types_of(value);
+                for actual in &known_types {
+                    let compatible = answer_types.iter().any(|expected| {
+                        actual == expected || closure.is_subclass(actual, expected)
+                    });
+                    if !compatible {
+                        continue;
+                    }
+                    let most_specific = !known_types.iter().any(|other| {
+                        other != actual && closure.is_subclass(other, actual)
+                    });
+                    if !most_specific {
+                        continue;
+                    }
+                    let why = closure
+                        .why_instance(value, actual)
+                        .unwrap_or("类型继承");
+                    evidence.push(format!("{} 属于 {}（{}）", value, actual, why));
+                }
+            }
+        }
         evidence.sort();
         evidence.dedup();
         evidence.truncate(8);
@@ -10066,6 +10091,11 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(reply.question, "卡梅隆导演过哪些作品");
         assert!(reply.text.contains("阿凡达"), "{}", reply.text);
         assert!(reply.text.contains("依据"), "{}", reply.text);
+        assert!(
+            reply.text.contains("属于 电影"),
+            "依据应复述答案的类型约束：{}",
+            reply.text
+        );
         assert!(
             reply.plan.iter().any(|plan| plan.contains("film.works_by_director")),
             "{:?}",
