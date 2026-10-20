@@ -912,7 +912,11 @@ fn build_session(
         session.history = restore.history;
         session.policy = restore.policy;
         session.manager.restore(&restore.manager);
-        session.reasoner.restore_dialogue_snapshot(&restore.reasoner);
+        // 信封层已按规范字节 + 摘要把关；此处仍把本体胶囊校验失败当作
+        // 「快照不可恢复」上报（零半应用），不让被改写的公理进入会话。
+        if let Err(error) = session.reasoner.restore_dialogue_snapshot(&restore.reasoner) {
+            eprintln!("会话快照拒绝（本体胶囊校验失败，其余状态未应用）：{}", error);
+        }
     }
     session
 }

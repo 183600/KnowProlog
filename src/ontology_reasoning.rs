@@ -13,6 +13,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
+use crate::canonical;
+
 const MAX_DERIVED_RELATIONS: usize = 4000;
 
 /// 物化后的本体闭包：查询与报告都基于它
@@ -163,6 +167,237 @@ impl OntologyClosure {
             .map(|reason| reason.as_str())
     }
 }
+
+/// 闭包的可序列化导出：全部集合按字典序规约，推导理由与截断标记一并带出。
+///
+/// 这是「证明离开进程」的最小工件：同一闭包永远对应同一字节串（集合迭代序
+/// 不得泄漏进字节），供胶囊缓存、跨进程审计与测试比对使用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ClosureSnapshot {
+    /// 子类边的传递闭包（超类集合已排序）
+    pub subclasses: Vec<(String, Vec<String>)>,
+    /// 子属性边的传递闭包
+    pub subproperties: Vec<(String, Vec<String>)>,
+    /// 个体归属断言（含推导）
+    pub instances: Vec<(String, String)>,
+    /// 关系三元组（含推导）
+    pub relations: Vec<(String, String, String)>,
+    /// (个体, 类, 推导理由)
+    pub why_instances: Vec<(String, String, String)>,
+    /// (主语, 谓词, 宾语, 推导理由)
+    pub why_relations: Vec<(String, String, String, String)>,
+    /// 一致性问题（排序去重）
+    pub problems: Vec<String>,
+    pub rounds: usize,
+    /// 推导关系数达到上限被截断：闭包不完整，回答不得声称「全部」
+    pub truncated: bool,
+}
+
+impl OntologyClosure {
+    /// 规约后的可序列化快照（确定性排序）。
+    pub fn snapshot(&self) -> ClosureSnapshot {
+        let mut subclasses: Vec<(String, Vec<String>)> = self
+            .subclasses
+            .iter()
+            .map(|(sub, supers)| {
+                let mut supers: Vec<String> = supers.iter().cloned().collect();
+                supers.sort();
+                (sub.clone(), supers)
+            })
+            .collect();
+        subclasses.sort();
+        let mut subproperties: Vec<(String, Vec<String>)> = self
+            .subproperties
+            .iter()
+            .map(|(sub, supers)| {
+                let mut supers: Vec<String> = supers.iter().cloned().collect();
+                supers.sort();
+                (sub.clone(), supers)
+            })
+            .collect();
+        subproperties.sort();
+        let mut instances: Vec<(String, String)> = self.instances.iter().cloned().collect();
+        instances.sort();
+        instances.dedup();
+        let mut relations: Vec<(String, String, String)> = self.relations.iter().cloned().collect();
+        relations.sort();
+        relations.dedup();
+        let mut why_instances: Vec<(String, String, String)> = self
+            .why_instances
+            .iter()
+            .map(|((individual, class), why)| {
+                (individual.clone(), class.clone(), why.clone())
+            })
+            .collect();
+        why_instances.sort();
+        why_instances.dedup();
+        let mut why_relations: Vec<(String, String, String, String)> = self
+            .why_relations
+            .iter()
+            .map(|((subject, predicate, object), why)| {
+                (
+                    subject.clone(),
+                    predicate.clone(),
+                    object.clone(),
+                    why.clone(),
+                )
+            })
+            .collect();
+        why_relations.sort();
+        why_relations.dedup();
+        let mut problems = self.problems.clone();
+        problems.sort();
+        problems.dedup();
+        ClosureSnapshot {
+            subclasses,
+            subproperties,
+            instances,
+            relations,
+            why_instances,
+            why_relations,
+            problems,
+            rounds: self.rounds,
+            truncated: self.truncated,
+        }
+    }
+
+    /// 从快照重建闭包（缓存只作核对与展示，真相源始终是公理 + 观察事实）。
+    pub fn from_snapshot(snapshot: &ClosureSnapshot) -> Self {
+        let mut closure = Self {
+            subclasses: snapshot
+                .subclasses
+                .iter()
+                .map(|(sub, supers)| (sub.clone(), supers.iter().cloned().collect()))
+                .collect(),
+            subproperties: snapshot
+                .subproperties
+                .iter()
+                .map(|(sub, supers)| (sub.clone(), supers.iter().cloned().collect()))
+                .collect(),
+            instances: snapshot.instances.iter().cloned().collect(),
+            relations: snapshot.relations.iter().cloned().collect(),
+            why_instances: snapshot
+                .why_instances
+                .iter()
+                .map(|(individual, class, why)| {
+                    (
+                        (individual.clone(), class.clone()),
+                        why.clone(),
+                    )
+                })
+                .collect(),
+            why_relations: snapshot
+                .why_relations
+                .iter()
+                .map(|(subject, predicate, object, why)| {
+                    (
+                        (subject.clone(), predicate.clone(), object.clone()),
+                        why.clone(),
+                    )
+                })
+                .collect(),
+            problems: snapshot.problems.clone(),
+            rounds: snapshot.rounds,
+            truncated: snapshot.truncated,
+        };
+        closure.problems.sort();
+        closure.problems.dedup();
+        closure
+    }
+
+    /// 闭包的确定性摘要（规范字节上的 FNV-1a）。
+    pub fn digest(&self) -> String {
+        digest_of(&self.snapshot())
+    }
+}
+
+/// 规范摘要：内容相等 ⇒ 摘要相等（L4 摘要交换）。序列化失败返回空串并
+/// 由调用方按「不可校验」处理，绝不 panic。
+fn digest_of<T: Serialize>(value: &T) -> String {
+    canonical::canonical_digest(value).unwrap_or_default()
+}
+
+/// 本体胶囊的格式版本（每升一版必须提供迁移；解码按版本门裁决）。
+pub const ONTOLOGY_CAPSULE_VERSION: u32 = 1;
+
+/// 本体胶囊：公理 + 摘要 + 闭包缓存的可序列化工件。
+///
+/// 「理解是反序列化，生成是序列化」：对话快照携带它，保存 / 分叉 / 重建之后
+/// 用户教过的本体 100% 保留；缓存是派生数据不是真相源，恢复时先校验
+/// `program_digest`（公理被改写即拒绝），闭包一律按公理重算，缓存只用于
+/// 核对（[`Self::closure_matches`]）与离开进程的证明展示。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OntologyCapsule {
+    pub version: u32,
+    /// 规范规约后的公理（排序去重，摘要与教学顺序无关）
+    pub lessons: Vec<OntologyLesson>,
+    /// 公理集合的规范摘要
+    pub program_digest: String,
+    /// 导出时刻的闭包缓存（派生数据）
+    pub closure: ClosureSnapshot,
+    /// 闭包缓存的规范摘要
+    pub closure_digest: String,
+}
+
+impl OntologyCapsule {
+    /// 用公理与当前闭包构造胶囊；公理排序去重，摘要立即计算。
+    pub fn new(lessons: Vec<OntologyLesson>, closure: &OntologyClosure) -> Self {
+        let lessons = canonicalize_lessons(lessons);
+        let program_digest = program_digest_of(&lessons);
+        let closure = closure.snapshot();
+        let closure_digest = digest_of(&closure);
+        Self {
+            version: ONTOLOGY_CAPSULE_VERSION,
+            lessons,
+            program_digest,
+            closure,
+            closure_digest,
+        }
+    }
+
+    /// 版本门 + 公理摘要校验；被改写 / 超前版本一律拒绝。
+    pub fn verify(&self) -> Result<(), String> {
+        if self.version == 0 || self.version > ONTOLOGY_CAPSULE_VERSION {
+            return Err(format!(
+                "本体胶囊版本 {} 不在支持范围 1..={}（需迁移后才能恢复）",
+                self.version, ONTOLOGY_CAPSULE_VERSION
+            ));
+        }
+        let expected = program_digest_of(&self.lessons);
+        if expected != self.program_digest {
+            return Err(format!(
+                "本体胶囊公理摘要不匹配（发现 {}，期望 {}）：公理被改写或截断",
+                self.program_digest, expected
+            ));
+        }
+        Ok(())
+    }
+
+    /// 校验缓存闭包是否与「按公理 + 事实重算」的闭包一致（缓存可核对）。
+    pub fn closure_matches(&self, closure: &OntologyClosure) -> bool {
+        digest_of(&closure.snapshot()) == self.closure_digest
+    }
+}
+
+/// 公理集合的规范摘要（对规范规约后的序列计算，与教学顺序无关）。
+pub fn program_digest_of(lessons: &[OntologyLesson]) -> String {
+    digest_of(&canonicalize_lessons(lessons.to_vec()))
+}
+
+/// 公理集合的规范规约：按规范文本排序 + 去重（摘要与教学顺序无关）。
+pub fn canonicalize_lessons(lessons: Vec<OntologyLesson>) -> Vec<OntologyLesson> {
+    let mut keyed: Vec<(String, OntologyLesson)> = lessons
+        .into_iter()
+        .map(|lesson| {
+            let key = canonical::canonical_text(&lesson).unwrap_or_default();
+            (key, lesson)
+        })
+        .collect();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    keyed.dedup_by(|left, right| left.0 == right.0);
+    keyed.into_iter().map(|(_, lesson)| lesson).collect()
+}
+
 
 /// 一个属性的本体画像（供「本体推理：X关系」报告）
 #[derive(Debug, Clone, Default)]
@@ -803,8 +1038,8 @@ fn transitive_closure(
     result
 }
 
-/// 一条从中文解析出的本体知识
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 一条从中文解析出的本体知识（可序列化：随本体胶囊跨会话携带）
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OntologyLesson {
     Subclass {
         sub: String,
@@ -1440,5 +1675,120 @@ mod tests {
         assert!(profile.inverses.contains(&"徒弟".to_string()));
         assert!(profile.subproperties.contains(&"师徒".to_string()));
         assert!(profile.closure_relations >= 1);
+    }
+
+    #[test]
+    fn closure_snapshot_roundtrip_preserves_derivation_and_digest() {
+        let mut ontology = OntologyReasoner::new(6);
+        ontology.add_subclass("学生", "人物");
+        ontology.add_instance("张三", "学生");
+        ontology.add_domain("师傅", "人物");
+        ontology.add_relation("李四", "师傅", "王五");
+        let closure = ontology.materialize();
+        assert_eq!(
+            closure.why_instance("张三", "人物"),
+            Some("学生 ⊑ 人物"),
+            "推导理由应随快照带出"
+        );
+        let snapshot = closure.snapshot();
+        let restored = OntologyClosure::from_snapshot(&snapshot);
+        assert_eq!(restored.snapshot(), snapshot, "快照往返应逐字一致");
+        assert_eq!(restored.digest(), closure.digest(), "摘要交换（L4）");
+        assert_eq!(restored.why_instance("张三", "人物"), closure.why_instance("张三", "人物"));
+        assert_eq!(
+            restored.why_relation("李四", "师傅", "王五"),
+            closure.why_relation("李四", "师傅", "王五")
+        );
+    }
+
+    #[test]
+    fn closure_snapshot_is_set_order_invariant() {
+        let mut forward = OntologyReasoner::new(6);
+        for (sub, sup) in [("学生", "人物"), ("教师", "人物"), ("人物", "实体")] {
+            forward.add_subclass(sub, sup);
+        }
+        forward.add_instance("张三", "学生");
+        let mut reverse = OntologyReasoner::new(6);
+        for (sub, sup) in [("人物", "实体"), ("教师", "人物"), ("学生", "人物")] {
+            reverse.add_subclass(sub, sup);
+        }
+        reverse.add_instance("张三", "学生");
+        let left = forward.materialize();
+        let right = reverse.materialize();
+        assert_eq!(
+            canonical::canonical_bytes(&left.snapshot()).unwrap(),
+            canonical::canonical_bytes(&right.snapshot()).unwrap(),
+            "集合迭代序不得泄漏进快照：同一闭包必须同一字节"
+        );
+        assert_eq!(left.digest(), right.digest());
+    }
+
+    #[test]
+    fn capsule_digest_ignores_lesson_order_and_duplicates() {
+        let first = parse_ontology_lesson("人是一种动物").expect("可解析");
+        let second = parse_ontology_lesson("猫是一种动物").expect("可解析");
+        let mut ontology = OntologyReasoner::new(6);
+        apply_ontology_lesson(&mut ontology, &first);
+        let closure = ontology.materialize();
+        let forward = OntologyCapsule::new(vec![first.clone(), second.clone()], &closure);
+        let reverse =
+            OntologyCapsule::new(vec![second, first.clone(), first.clone()], &closure);
+        assert_eq!(forward.lessons.len(), 2, "重复公理应去重");
+        assert_eq!(forward.lessons, reverse.lessons, "规约与教学顺序无关");
+        assert_eq!(forward.program_digest, reverse.program_digest);
+        assert_eq!(
+            canonical::canonical_bytes(&forward).unwrap(),
+            canonical::canonical_bytes(&reverse).unwrap(),
+            "同一状态同一字节"
+        );
+        forward.verify().expect("自建胶囊应通过校验");
+        reverse.verify().expect("自建胶囊应通过校验");
+    }
+
+    #[test]
+    fn capsule_rejects_tampered_lessons_and_future_version() {
+        let lesson = parse_ontology_lesson("人是一种动物").expect("可解析");
+        let mut ontology = OntologyReasoner::new(6);
+        apply_ontology_lesson(&mut ontology, &lesson);
+        let closure = ontology.materialize();
+        let mut capsule = OntologyCapsule::new(vec![lesson], &closure);
+        capsule.verify().expect("原胶囊应通过校验");
+
+        let mut tampered = capsule.clone();
+        tampered.lessons.clear();
+        let error = tampered.verify().expect_err("改写公理必须被拒绝");
+        assert!(error.contains("摘要"), "错误应说明摘要不匹配：{}", error);
+
+        let mut future = capsule.clone();
+        future.version = ONTOLOGY_CAPSULE_VERSION + 1;
+        let error = future.verify().expect_err("超前版本必须被版本门拒绝");
+        assert!(error.contains("版本"), "错误应说明版本门：{}", error);
+
+        capsule.version = 0;
+        assert!(capsule.verify().is_err(), "版本 0 视为未知格式");
+
+        // 缓存可核对：按公理重算的闭包与导出缓存一致
+        let fresh = {
+            let mut replay = OntologyReasoner::new(6);
+            apply_ontology_lesson(&mut replay, &parse_ontology_lesson("人是一种动物").unwrap());
+            replay.materialize()
+        };
+        assert!(
+            OntologyCapsule::new(
+                vec![parse_ontology_lesson("人是一种动物").unwrap()],
+                &fresh
+            )
+            .closure_matches(&fresh),
+            "同一公理 + 同一事实应得到同一闭包摘要"
+        );
+    }
+
+    #[test]
+    fn capsule_without_lessons_still_verifies_and_matches_empty_closure() {
+        let closure = OntologyClosure::default();
+        let capsule = OntologyCapsule::new(Vec::new(), &closure);
+        capsule.verify().expect("空胶囊应可校验");
+        assert!(capsule.closure_matches(&OntologyClosure::default()));
+        assert_eq!(capsule.version, ONTOLOGY_CAPSULE_VERSION);
     }
 }

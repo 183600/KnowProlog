@@ -17,8 +17,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ontology_reasoning::{
-    apply_ontology_lesson, parse_ontology_lesson, render_ontology_lesson_zh, OntologyClosure,
-    OntologyLesson, OntologyReasoner,
+    apply_ontology_lesson, parse_ontology_lesson, render_ontology_lesson_zh, OntologyCapsule,
+    OntologyClosure, OntologyLesson, OntologyReasoner,
 };
 use crate::prolog_engine::PrologFact;
 
@@ -356,7 +356,9 @@ pub struct OwlNarrator {
     seen_hierarchy: HashMap<String, HashSet<String>>,
     seen_relations: HashMap<String, HashMap<String, HashSet<String>>>,
     dirty: bool,
-    taught_axioms: usize,
+    /// 被教过的本体公理（含配置并入的结构化公理）：胶囊的公理来源，
+    /// 保存 / 分叉 / 重建后据此重放，教过的本体不会消失。
+    taught: Vec<OntologyLesson>,
 }
 
 impl OwlNarrator {
@@ -369,7 +371,7 @@ impl OwlNarrator {
             seen_hierarchy: HashMap::new(),
             seen_relations: HashMap::new(),
             dirty: false,
-            taught_axioms: 0,
+            taught: Vec::new(),
         }
     }
 
@@ -504,13 +506,20 @@ impl OwlNarrator {
     /// 教一条中文本体公理（子类/互斥/定义域/固有属性……），供继承推理与叙述使用
     pub fn teach_axiom(&mut self, text: &str) -> Result<String, String> {
         let lesson = parse_ontology_lesson(text)?;
-        apply_ontology_lesson(&mut self.ontology, &lesson);
-        self.taught_axioms += 1;
+        self.install_lesson(&lesson);
+        self.materialize_if_dirty();
+        Ok(render_ontology_lesson_zh(&lesson))
+    }
+
+    /// 写入一条公理并登记涉及的名字：教学与胶囊恢复共用的唯一入口。
+    /// 公理是单调集合，重复写入幂等（`taught` 去重，闭包按集合物化）。
+    pub fn install_lesson(&mut self, lesson: &OntologyLesson) {
+        apply_ontology_lesson(&mut self.ontology, lesson);
         for name in self.ontology.class_names() {
             self.known.insert(name);
         }
         // 个体、属性等名字也要登记，否则 brief/叙述会误判为未知实体
-        match &lesson {
+        match lesson {
             OntologyLesson::Instance { individual, class, .. } => {
                 self.known.insert(individual.clone());
                 self.known.insert(class.clone());
@@ -531,9 +540,10 @@ impl OwlNarrator {
             }
             _ => {}
         }
+        if !self.taught.iter().any(|known| known == lesson) {
+            self.taught.push(lesson.clone());
+        }
         self.dirty = true;
-        self.materialize_if_dirty();
-        Ok(render_ontology_lesson_zh(&lesson))
     }
 
     pub fn materialize_if_dirty(&mut self) {
@@ -552,8 +562,40 @@ impl OwlNarrator {
         self.known.contains(entity)
     }
 
+    /// 已登记的公理数（去重后；含配置并入的结构化公理）。
     pub fn taught_axioms(&self) -> usize {
-        self.taught_axioms
+        self.taught.len()
+    }
+
+    /// 已登记的公理（供审计与程序合并）。
+    pub fn taught_lessons(&self) -> &[OntologyLesson] {
+        &self.taught
+    }
+
+    /// 导出本体胶囊：公理 + 规范摘要 + 当前闭包缓存。
+    /// 从未教过公理时返回 `None`（旧快照的字节保持不变）。
+    /// 只读：闭包脏时就地物化一次，不改动缓存状态。
+    pub fn ontology_capsule(&self) -> Option<OntologyCapsule> {
+        if self.taught.is_empty() {
+            return None;
+        }
+        let closure = if self.dirty {
+            self.ontology.materialize()
+        } else {
+            self.closure.clone()
+        };
+        Some(OntologyCapsule::new(self.taught.clone(), &closure))
+    }
+
+    /// 恢复本体胶囊：先过版本门与公理摘要校验，再按公理重放。
+    /// 闭包一律重算（缓存只是派生数据），校验失败返回 `Err` 且不改动状态。
+    pub fn restore_ontology_capsule(&mut self, capsule: &OntologyCapsule) -> Result<(), String> {
+        capsule.verify()?;
+        for lesson in &capsule.lessons {
+            self.install_lesson(lesson);
+        }
+        self.materialize_if_dirty();
+        Ok(())
     }
 
     pub fn types_of(&mut self, entity: &str) -> Vec<String> {
@@ -774,6 +816,27 @@ impl DiscoursePlanner {
 
     pub fn teach_axiom(&mut self, text: &str) -> Result<String, String> {
         self.narrator.teach_axiom(text)
+    }
+
+    /// 直接写入一条结构化公理（配置并入单一本体程序的入口，幂等）。
+    pub fn install_lesson(&mut self, lesson: &OntologyLesson) {
+        self.narrator.install_lesson(lesson);
+        self.narrator.materialize_if_dirty();
+    }
+
+    /// 已登记的公理（供审计与程序合并）。
+    pub fn taught_lessons(&self) -> &[OntologyLesson] {
+        self.narrator.taught_lessons()
+    }
+
+    /// 导出本体胶囊（未教过公理时为 `None`）。
+    pub fn ontology_capsule(&self) -> Option<OntologyCapsule> {
+        self.narrator.ontology_capsule()
+    }
+
+    /// 恢复本体胶囊：版本门 + 公理摘要校验通过才重放。
+    pub fn restore_ontology_capsule(&mut self, capsule: &OntologyCapsule) -> Result<(), String> {
+        self.narrator.restore_ontology_capsule(capsule)
     }
 
     /// 多句连贯叙述：定义开场 → 推理/继承补充 → 事实聚合 → 焦点衔接

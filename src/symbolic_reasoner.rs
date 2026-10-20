@@ -36,6 +36,7 @@ use crate::predicate_registry::PredicateRegistry;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAligner, TermKind};
+use crate::ontology_reasoning::OntologyCapsule;
 use crate::path_memory::{
     EdgeSource, PathPredicate, TraversalGraph, TraversalOptions,
 };
@@ -295,6 +296,10 @@ pub struct DialogueSnapshot {
     // 话语帧记忆（上一帧 + 挂账），跨会话持久化后可接着补全未竟之问
     #[serde(default)]
     pub frames: Option<FrameMemory>,
+    // 本体胶囊（教过的公理 + 摘要 + 闭包缓存）：跨会话/跨重建保留教学本体；
+    // 未教过公理时缺省为 None，旧快照字节保持不变
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology: Option<OntologyCapsule>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -503,6 +508,7 @@ impl DialogueContext {
             session_clauses: Vec::new(),
             contrast: None,
             frames: None,
+            ontology: None,
         }
     }
 
@@ -1015,7 +1021,9 @@ impl SymbolicReasoner {
             Arc::clone(&self.perf),
         );
         fresh.observe_facts(facts);
-        fresh.restore_dialogue_snapshot(&snapshot);
+        // 快照来自自身：胶囊公理摘要必然通过（除非内存中的快照被外部改写）。
+        // 万一被拒，也保留新图谱与其余会话态，不让重建失败丢掉知识。
+        let _ = fresh.restore_dialogue_snapshot(&snapshot);
         if let Some(registry) = law_registry {
             fresh.configure_laws(&registry);
         }
@@ -7921,15 +7929,20 @@ impl SymbolicReasoner {
         snapshot.lessons = self.lessons.clone();
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
         snapshot.frames = Some(self.frames.clone());
+        snapshot.ontology = self.discourse.ontology_capsule();
         snapshot
     }
 
     /// 把 [`Self::dialogue_snapshot`] 的内容恢复到当前推理器上。
     ///
-    /// 恢复只重建会话级派生数据（会话事实/教学/会话规则/话语帧），全局知识
-    /// 图谱不受影响；同一快照恢复两次结果一致（幂等去重）。
-    pub fn restore_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) {
-        self.apply_dialogue_snapshot(snapshot);
+    /// 恢复只重建会话级派生数据（会话事实/教学/会话规则/话语帧/本体胶囊），
+    /// 全局知识图谱不受影响；同一快照恢复两次结果一致（幂等去重）。
+    /// 本体胶囊的版本门或公理摘要不通过时整体拒绝并返回 `Err`（零半应用）。
+    pub fn restore_dialogue_snapshot(
+        &mut self,
+        snapshot: &DialogueSnapshot,
+    ) -> Result<(), String> {
+        self.apply_dialogue_snapshot(snapshot)
     }
 
     pub fn save_dialogue_state(&self, path: &str) -> std::io::Result<()> {
@@ -7985,11 +7998,19 @@ impl SymbolicReasoner {
             return (false, None);
         };
         let contrast = snapshot.contrast.clone();
-        self.apply_dialogue_snapshot(&snapshot);
-        (true, contrast)
+        // 校验失败（版本门 / 公理摘要被改写）时零半应用，按「未加载」上报。
+        match self.apply_dialogue_snapshot(&snapshot) {
+            Ok(()) => (true, contrast),
+            Err(_) => (false, None),
+        }
     }
 
-    fn apply_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) {
+    fn apply_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) -> Result<(), String> {
+        // 本体胶囊最先恢复：版本门 / 公理摘要不通过就整体拒绝，
+        // 绝不留下「会话态已换、本体还是旧的」这种半应用状态。
+        if let Some(capsule) = &snapshot.ontology {
+            self.discourse.restore_ontology_capsule(capsule)?;
+        }
         self.context.restore(snapshot);
         // 话语帧记忆：恢复上一帧与挂账（重启后接着补全未竟之问）
         if let Some(frames) = &snapshot.frames {
@@ -8102,6 +8123,7 @@ impl SymbolicReasoner {
                 }
             }
         }
+        Ok(())
     }
 
     pub fn alignment_report(&self) -> String {
@@ -9415,6 +9437,179 @@ mod tests {
             "本体继承推理应进入叙述（定义/推导链）：{}",
             text
         );
+    }
+
+    /// 教学本体 → 快照胶囊：未教学时快照不携带胶囊（旧字节兼容），
+    /// 教学后胶囊随快照走，且能通过自身的版本门与摘要校验。
+    #[test]
+    fn test_taught_ontology_lands_in_dialogue_snapshot_capsule() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "苏格拉底".to_string(),
+            entity_type: "人".to_string(),
+            properties: HashMap::new(),
+        }]);
+        let plain = reasoner.dialogue_snapshot();
+        assert!(
+            plain.ontology.is_none(),
+            "未教学时不应携带本体胶囊（旧快照字节保持不变）"
+        );
+        let plain_text = String::from_utf8(canonical::canonical_bytes(&plain).unwrap()).unwrap();
+        assert!(
+            !plain_text.contains("ontology"),
+            "无胶囊时规范字节不得出现 ontology 键：{}",
+            plain_text
+        );
+
+        reasoner
+            .teach_ontology("人是一种动物")
+            .expect("本体公理应可学习");
+        let snapshot = reasoner.dialogue_snapshot();
+        let capsule = snapshot.ontology.expect("教学后快照应携带本体胶囊");
+        capsule.verify().expect("胶囊应通过自身校验");
+        assert_eq!(capsule.version, 1);
+        assert!(!capsule.closure_digest.is_empty(), "闭包缓存应带摘要");
+        assert!(
+            capsule.closure_matches(reasoner.discourse.narrator_mut().closure()),
+            "导出缓存应与当前闭包一致"
+        );
+    }
+
+    /// 快照恢复到全新推理器：教过的本体 100% 保留（理解 = 反序列化）。
+    #[test]
+    fn test_taught_ontology_survives_snapshot_restore_on_fresh_reasoner() {
+        let facts = [PrologFact::Entity {
+            name: "苏格拉底".to_string(),
+            entity_type: "人".to_string(),
+            properties: HashMap::new(),
+        }];
+        let mut source = SymbolicReasoner::new(test_config(), HashMap::new());
+        source.observe_facts(&facts);
+        source.teach_ontology("人是一种动物").expect("可教学");
+        let snapshot = source.dialogue_snapshot();
+
+        let mut target = SymbolicReasoner::new(test_config(), HashMap::new());
+        target.observe_facts(&facts);
+        target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("胶囊应通过校验并恢复");
+        // 幂等：同一快照恢复两次，快照内容不变
+        let after_first =
+            canonical::canonical_digest(&target.dialogue_snapshot()).expect("快照可摘要");
+        target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("重复恢复应幂等成功");
+        let after_second =
+            canonical::canonical_digest(&target.dialogue_snapshot()).expect("快照可摘要");
+        assert_eq!(after_first, after_second, "重复恢复必须幂等");
+        let text = target.narrate("苏格拉底").expect("叙述应可用");
+        assert!(
+            text.contains("动物"),
+            "恢复后本体继承推理必须仍在：{}",
+            text
+        );
+    }
+
+    /// 重建基座（rebuild_from_graph）后教过的本体不得消失。
+    #[test]
+    fn test_taught_ontology_survives_rebuild_from_graph() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "苏格拉底".to_string(),
+                entity_type: "人".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "苏格拉底".to_string(),
+                rel_type: "徒弟".to_string(),
+                to: "柏拉图".to_string(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        reasoner.teach_ontology("人是一种动物").expect("可教学");
+        reasoner.rebuild_from_graph(&facts);
+        let text = reasoner
+            .narrate("苏格拉底")
+            .expect("重建后叙述应可用");
+        assert!(
+            text.contains("动物"),
+            "重建图谱后教过的本体必须保留：{}",
+            text
+        );
+    }
+
+    /// 落盘 → 新进程读回：教过的本体随规范字节持久化。
+    #[test]
+    fn test_taught_ontology_survives_dialogue_state_file_roundtrip() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let state_path = dir.path().join("dialogue_state.json");
+        let state_path_str = state_path.to_str().expect("路径可表示");
+        let facts = [PrologFact::Entity {
+            name: "苏格拉底".to_string(),
+            entity_type: "人".to_string(),
+            properties: HashMap::new(),
+        }];
+        let mut source = SymbolicReasoner::new(test_config(), HashMap::new());
+        source.observe_facts(&facts);
+        source.teach_ontology("人是一种动物").expect("可教学");
+        source.save_dialogue_state(state_path_str).expect("应能保存");
+
+        let mut target = SymbolicReasoner::new(test_config(), HashMap::new());
+        target.observe_facts(&facts);
+        assert!(
+            target.load_dialogue_state(state_path_str),
+            "含胶囊的对话状态应可加载"
+        );
+        let text = target.narrate("苏格拉底").expect("叙述应可用");
+        assert!(text.contains("动物"), "落盘恢复后本体应保留：{}", text);
+    }
+
+    /// 被改写 / 超前版本的胶囊：整体拒绝，零半应用。
+    #[test]
+    fn test_tampered_ontology_capsule_is_rejected_without_partial_apply() {
+        let facts = [PrologFact::Entity {
+            name: "苏格拉底".to_string(),
+            entity_type: "人".to_string(),
+            properties: HashMap::new(),
+        }];
+        let mut source = SymbolicReasoner::new(test_config(), HashMap::new());
+        source.observe_facts(&facts);
+        source.teach_ontology("人是一种动物").expect("可教学");
+        source.context.record_question("苏格拉底是谁");
+        let mut snapshot = source.dialogue_snapshot();
+
+        let mut tampered = snapshot.clone();
+        {
+            let capsule = tampered.ontology.as_mut().expect("应有胶囊");
+            capsule.lessons.clear();
+        }
+        let mut target = SymbolicReasoner::new(test_config(), HashMap::new());
+        target.observe_facts(&facts);
+        let error = target
+            .restore_dialogue_snapshot(&tampered)
+            .expect_err("改写公理必须被拒绝");
+        assert!(error.contains("摘要"), "错误应说明摘要不匹配：{}", error);
+        assert!(
+            target.dialogue_snapshot().ontology.is_none(),
+            "拒绝后不得留下半应用的胶囊"
+        );
+        assert!(
+            target.context.history().is_empty(),
+            "拒绝后其余会话态也不得被应用（零半应用）"
+        );
+
+        let mut future = snapshot.clone();
+        future.ontology.as_mut().expect("应有胶囊").version = 99;
+        let error = target
+            .restore_dialogue_snapshot(&future)
+            .expect_err("超前版本必须被版本门拒绝");
+        assert!(error.contains("版本"), "错误应说明版本门：{}", error);
+
+        snapshot.ontology = None;
+        target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("无胶囊快照不受影响");
     }
 
     #[test]

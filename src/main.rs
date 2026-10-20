@@ -2760,8 +2760,15 @@ async fn run_interactive_mode(
                         );
                     }
                     let contrast_snapshot = snapshot.contrast.clone();
-                    symbolic_reasoner.restore_dialogue_snapshot(&snapshot);
-                    println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
+                    match symbolic_reasoner.restore_dialogue_snapshot(&snapshot) {
+                        Ok(()) => {
+                            println!("已恢复上次对话记忆：{}", symbolic_reasoner.dialogue_summary());
+                        }
+                        Err(error) => eprintln!(
+                            "对话记忆拒绝（本体胶囊校验失败，其余状态未应用）：{}",
+                            error
+                        ),
+                    }
                     if let Some(snapshot) = contrast_snapshot {
                         if contrast_arbiter.restore_snapshot(&snapshot) {
                             println!("已恢复上次对比校准记忆：{}", contrast_arbiter.memory_summary());
