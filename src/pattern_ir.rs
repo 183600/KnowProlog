@@ -1010,6 +1010,52 @@ pub fn render_library_report(library: &PatternLibrary) -> String {
     out
 }
 
+/// 模式关系报告：泛化/冗余/冲突的图边清单 + 一条可复现的图体检查询 + 端点 id。
+///
+/// 与 [`render_library_report`] 展示同一份体检结果，但以「模式命名图里的边」
+/// 为主视角：每条关系都是可 SPARQL 查询的数据，末尾附上计数查询与端点 id，
+/// 便于把结论复制到「SPARQL：…」里复核。
+pub fn render_relation_report(library: &PatternLibrary) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let edges = relation_edges(library.entries());
+    let counts = relation_counts(&edges);
+    let generalizes = counts.get("泛化").copied().unwrap_or(0);
+    let redundant = counts.get("冗余").copied().unwrap_or(0);
+    let conflicts = counts.get("冲突").copied().unwrap_or(0);
+    let _ = writeln!(
+        out,
+        "模式关系图 {}：{} 条边（泛化 {} + 冗余 {} + 冲突 {}）",
+        PATTERNS_GRAPH,
+        edges.len(),
+        generalizes,
+        redundant,
+        conflicts
+    );
+    if edges.is_empty() {
+        let _ = writeln!(out, "（无关系边：模式间无包含、重复或冲突）");
+    } else {
+        let _ = writeln!(
+            out,
+            " {:<6} {:<9} {:<9} {}",
+            "关系", "主语#id", "宾语#id", "端点"
+        );
+        for edge in &edges {
+            let _ = writeln!(
+                out,
+                " {:<6} {:<9} {:<9} {}",
+                edge.kind.label(),
+                &edge.subject_id.chars().take(8).collect::<String>(),
+                &edge.object_id.chars().take(8).collect::<String>(),
+                edge.render()
+            );
+        }
+    }
+    let _ = writeln!(out, "图体检查询（直接执行即得各关系计数）：");
+    let _ = writeln!(out, "  {}", relation_count_sparql());
+    out
+}
+
 /// 匹配报告渲染：胜者带绑定与区间，命中未胜带差额，失败带首个失配。
 pub fn render_match_report(input: &str, report: &MatchReport) -> String {
     use std::fmt::Write;
@@ -2015,6 +2061,31 @@ mod tests {
         assert!(query.contains(PATTERNS_GRAPH));
         assert!(query.contains(P_CONFLICTS));
         assert!(query.contains("GROUP BY"));
+    }
+
+    #[test]
+    fn relation_report_lists_edges_and_query() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "A",
+            "config.toml#a",
+            "q1",
+            10,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
+        library.add(PatternEntry::new(
+            "B",
+            "config.toml#b",
+            "q2",
+            5,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::pos("n")],
+        ));
+        let report = render_relation_report(&library);
+        assert!(report.contains(PATTERNS_GRAPH));
+        assert!(report.contains("冲突"));
+        assert!(report.contains("图体检查询"));
     }
 
     #[test]

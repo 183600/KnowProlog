@@ -3256,6 +3256,46 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 模式关系图：泛化/冗余/冲突落成可查询的边
+        if matches!(
+            input,
+            "模式关系" | "查询模式关系" | "模式关系图" | "模式图体检"
+        ) {
+            println!("{}", pattern_ir::render_relation_report(&pattern_library));
+            println!();
+            continue;
+        }
+
+        // 模式落图：把当前模式库与关系边同步到 kg:graphs/patterns 并读回校验
+        if matches!(input, "模式落图" | "同步模式图" | "保存模式库") {
+            match oxigraph_manager
+                .sync_pattern_ledger(pattern_library.entries())
+                .await
+            {
+                Ok(count) => {
+                    println!(
+                        "模式落图：{} 条已同步到 {}。",
+                        count,
+                        pattern_ir::PATTERNS_GRAPH
+                    );
+                    match oxigraph_manager.load_pattern_ledger().await {
+                        Ok(loaded) => {
+                            println!("读回校验：{} 条条目。", loaded.len());
+                        }
+                        Err(error) => println!("读回失败：{}", error),
+                    }
+                    let edges = pattern_ir::relation_edges(pattern_library.entries());
+                    println!(
+                        "关系边：{} 条（泛化/冗余/冲突各按图查询可复核）。",
+                        edges.len()
+                    );
+                }
+                Err(error) => println!("模式落图失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
         // 模式匹配解释：对一句话给出胜者、命中榜与落选原因
         if let Some(text) = strip_any_prefix(
             input,
@@ -7662,6 +7702,8 @@ fn interactive_help() -> String {
         "  默认推理：<陈述> / 概率推理：…       非单调常识与加权可能世界",
         "  规则：<如果X的P是Y，那么X的Q是Y>    教一条 Horn 规则（占位符自动变量化）",
         "  模式路由 / 查询模式库                 统一模式库（配置查询+NLU 意图+教学模式）与体检",
+        "  模式关系 / 模式关系图                 泛化/冗余/冲突落成的图边与图体检查询",
+        "  模式落图 / 同步模式图                 把模式库与关系边同步到 kg:graphs/patterns",
         "  模式匹配：<句子>                     查看命中模式、绑定与落选原因",
         "  教模式：名 | 要素… | 路由 | 优先级   教一条查询模式（落图持久化，跨会话恢复）",
         "  忘模式：<名>                         遗忘一条教学模式",
@@ -8130,6 +8172,13 @@ fn is_command_like(input: &str) -> bool {
         "模式路由",
         "查询模式库",
         "统一模式库",
+        "模式关系",
+        "查询模式关系",
+        "模式关系图",
+        "模式图体检",
+        "模式落图",
+        "同步模式图",
+        "保存模式库",
         "模式匹配：",
         "模式匹配:",
         "模式匹配 ",
@@ -9444,6 +9493,10 @@ mod session_tests {
             "模式路由",
             "查询模式库",
             "统一模式库",
+            "模式关系",
+            "模式关系图",
+            "模式落图",
+            "同步模式图",
             "模式匹配：法国的首都是哪里",
             "教模式：老家 | {人} 的 老家 | hometown_query | 20",
             "忘模式：老家",
