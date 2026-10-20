@@ -1152,6 +1152,7 @@ impl ApiState {
                                 "history": session.history,
                                 "summary": session.manager.summary(),
                                 "policy": session.policy,
+                                "board": session.manager.board().view(session.reasoner.revision()),
                             }));
                         }
                         SessionCommand::Export { reply } => {

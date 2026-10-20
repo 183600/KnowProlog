@@ -1,0 +1,60 @@
+name = "身高链自检"
+description = "列举 → 筛选 → 排序 → 选行 → 比较 → 撤销 → 知识更新标旧；用「查询剧本：examples/query_board_scenario.toml」运行"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226", "国籍" = "中国" }
+
+[[entities]]
+name = "王治郅"
+type = "Person"
+attributes = { "身高" = "214", "国籍" = "中国" }
+
+[[entities]]
+name = "易建联"
+type = "Person"
+attributes = { "身高" = "213", "国籍" = "中国" }
+
+[[entities]]
+name = "诺维茨基"
+type = "Person"
+attributes = { "身高" = "213", "国籍" = "德国" }
+
+[[relations]]
+from = "姚明"
+predicate = "球队"
+to = "火箭队"
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { op = "scan", rows = 4, board_active = true, answer_contains = ["姚明"], provenance_contains = ["身高"] }
+
+[[turns]]
+input = "只看中国的"
+expect = { op = "filter", rows = 3, answer_excludes = ["诺维茨基"] }
+
+[[turns]]
+input = "按身高从高到低排"
+expect = { op = "sort", rows = 3, answer_contains = ["姚明"] }
+
+[[turns]]
+input = "第二个呢"
+expect = { op = "select", selected = "王治郅", focus = "王治郅" }
+
+[[turns]]
+input = "跟姚明比呢"
+expect = { op = "compare", answer_contains = ["226", "214", "低 12"] }
+
+[[turns]]
+input = "回到上一步"
+expect = { op = "undo", selected = "王治郅" }
+
+[[turns]]
+input = "依据"
+expect = { op = "explain", provenance_contains = ["身高"] }
+
+[[turns]]
+set_revision = 9
+input = "依据"
+expect = { op = "explain", stale = true, answer_contains = ["v1 → v9"] }

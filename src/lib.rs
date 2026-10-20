@@ -29,6 +29,7 @@ pub mod link_prediction;
 pub mod semantic_embedding;
 pub mod query_planner;
 pub mod query_board;
+pub mod query_scenario;
 pub mod symbolic_reasoner;
 pub mod entity_linker;
 pub mod symbolic_generator;

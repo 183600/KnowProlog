@@ -346,6 +346,15 @@ enum Commands {
         #[arg(long, default_value = "observe")]
         recovery: String,
     },
+    /// Replay a query-board scenario (turn-trace contract) offline; exits
+    /// non-zero when any step fails
+    Scenario {
+        /// Scenario TOML file (facts + turns + per-turn expectations)
+        file: String,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run interactive mode (default)
     Interactive,
 }
@@ -384,6 +393,12 @@ async fn main() {
             *update_baseline,
             *allow_regression,
         );
+        return;
+    }
+
+    // 查询剧本完全离线（自带事实）：先于配置加载与存储打开处理。
+    if let Some(Commands::Scenario { file, json }) = &cli.command {
+        run_query_scenario(file, *json);
         return;
     }
 
@@ -985,6 +1000,9 @@ async fn main() {
         Some(Commands::FuzzDialogue { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
         }
+        Some(Commands::Scenario { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
+        }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
             run_interactive_mode(config, oxigraph_manager, perf_ledger, recovery_mode, &store_path).await;
@@ -1462,6 +1480,31 @@ fn run_prompt_lint(json: bool) {
         }
     }
     if errors > 0 {
+        std::process::exit(1);
+    }
+}
+
+/// `scenario`：离线回放查询板剧本；任一步失败以非零码退出（可直接进 CI）。
+fn run_query_scenario(file: &str, json: bool) {
+    let report = match know_prolog::query_scenario::run_file(file) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("查询剧本运行失败：{}", error);
+            std::process::exit(1);
+        }
+    };
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("剧本报告序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render_text());
+    }
+    if !report.passed {
         std::process::exit(1);
     }
 }
@@ -2519,6 +2562,24 @@ async fn run_interactive_mode(
                 );
             } else {
                 println!("可以试试：「列出所有人的身高」「哪些实体」。");
+            }
+            println!();
+            continue;
+        }
+
+        // 查询剧本：把多轮交互式查询写成可执行的回合轨迹契约（自包含事实，不依赖知识库）
+        if let Some(path) = strip_any_prefix(
+            input,
+            &["查询剧本：", "查询剧本:", "运行剧本：", "运行剧本:"],
+        ) {
+            let path = path.trim();
+            if path.is_empty() {
+                println!("用法：查询剧本：<剧本文件.toml>（文件自带实体事实与每轮期望）");
+            } else {
+                match know_prolog::query_scenario::run_file(path) {
+                    Ok(report) => println!("{}", report.render_text()),
+                    Err(error) => println!("查询剧本运行失败：{}", error),
+                }
             }
             println!();
             continue;
@@ -6057,6 +6118,7 @@ fn interactive_help() -> String {
         "  直接输入自然语言                    如「小明多大？」「张三和李四什么关系？」",
         "  列出所有人的身高 / 哪些实体          查询板：集合查询后用「第二个 / 下一页 / 只看… / 按…排序 / 跟…比 / 依据」继续编辑",
         "  查询板 / 查询状态                    查看当前查询程序、结果行数与知识版本",
+        "  查询剧本：<file.toml>              回放查询板剧本（每轮断言算子/行数/页码/选中/证据），自检交互行为",
         "  SPARQL：<查询>                      执行任意 SPARQL 1.1 查询（SELECT/ASK/CONSTRUCT）",
         "  判断：<陈述> / 蕴含：<陈述>         形式化语义 + 语义蕴含校验",
         "  证明：<目标> / 推理链：<目标>        归结证明与后向链推理",
@@ -6243,6 +6305,8 @@ fn is_command_like(input: &str) -> bool {
         "查询板",
         "查询状态",
         "工作记忆",
+        "查询剧本",
+        "运行剧本",
         "溯因",
         "假设生成",
         "为什么",
@@ -7213,6 +7277,8 @@ mod session_tests {
             "帧记忆",
             "话语帧",
             "挂账",
+            "查询剧本：examples/query_board_scenario.toml",
+            "运行剧本：examples/query_board_scenario.toml",
             "默认推理：麻雀会飞",
             "默认逻辑：",
             "对齐候选：老婆",

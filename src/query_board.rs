@@ -115,6 +115,9 @@ pub struct BoardView {
     pub page: usize,
     pub pages: usize,
     pub selected_row: Option<usize>,
+    /// 选中行的主语（客户端无需再取回整帧即可显示「当前选中谁」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_subject: Option<String>,
     pub revision: u64,
     pub stale: bool,
 }
@@ -176,6 +179,7 @@ impl QueryBoard {
             page: frame.page + 1,
             pages: frame.page_count(),
             selected_row: frame.selected.map(|selected| selected + 1),
+            selected_subject: frame.selected_row().map(|row| row.subject.clone()),
             revision: frame.revision,
             stale: frame.revision != revision,
         })
@@ -1240,7 +1244,13 @@ fn is_scan_request(text: &str) -> bool {
             || text.ends_with("列表")
             || text.ends_with("清单");
     }
-    if text.contains("有哪些") || text.contains("哪些有") || text.contains("哪些实体") {
+    if text.contains("有哪些")
+        || text.contains("哪些有")
+        || text.contains("哪些实体")
+        || text.contains("哪几个实体")
+        || text.contains("哪些人")
+        || text.contains("哪几个人")
+    {
         return true;
     }
     text.ends_with("列表") || text.ends_with("清单")
@@ -1398,14 +1408,29 @@ fn extract_predicate(text: &str) -> Option<String> {
 }
 
 fn normalize_predicate(candidate: &str) -> Option<String> {
-    let candidate = candidate
+    let mut candidate = candidate
         .trim()
         .trim_matches(|c: char| matches!(c, '「' | '」' | '"' | '\'' | '“' | '”'))
         .trim();
+    // 「哪些实体」「哪几个人」这类整表问法没有谓词，归一到具体谓词或 None；
+    // 否则「哪些实体」会被当成谓词去查值，结果永远为空。
+    for prefix in [
+        "哪些实体",
+        "哪几个实体",
+        "哪些",
+        "哪几个",
+        "哪几",
+        "所有的",
+        "全体",
+    ] {
+        if let Some(rest) = candidate.strip_prefix(prefix) {
+            candidate = rest.trim();
+        }
+    }
     if candidate.is_empty()
         || matches!(
             candidate,
-            "实体" | "东西" | "记录" | "数据" | "内容" | "人" | "人物"
+            "实体" | "东西" | "记录" | "数据" | "内容" | "人" | "人物" | "条目" | "成员"
         )
     {
         return None;
@@ -2017,6 +2042,38 @@ mod tests {
             .expect("中文本体类型也应能扫描");
         assert!(scan.text.contains("姚明"));
         assert_eq!(board.current().unwrap().rows.len(), 6);
+    }
+
+    #[test]
+    fn whole_table_phrases_scan_every_entity() {
+        let knowledge = TestKnowledge::new();
+        for phrase in ["哪些实体", "有哪些实体", "哪几个实体", "列出所有实体"] {
+            let mut board = board();
+            let scan = board
+                .apply(phrase, &knowledge, 7)
+                .unwrap_or_else(|| panic!("「{}」应触发整表扫描", phrase));
+            assert!(
+                scan.text.contains("姚明"),
+                "「{}」的结果缺少实体：{}",
+                phrase,
+                scan.text
+            );
+            let frame = board.current().expect("应留下查询帧");
+            assert_eq!(frame.rows.len(), 6, "「{}」应扫描全部实体", phrase);
+            assert!(frame.rows.iter().all(|row| row.predicate == "类型"));
+        }
+    }
+
+    #[test]
+    fn predicate_phrase_still_scans_after_whole_table_trim() {
+        let knowledge = TestKnowledge::new();
+        let mut board = board();
+        board
+            .apply("哪些实体有身高", &knowledge, 7)
+            .expect("带谓词的整表问法应扫描身高");
+        let frame = board.current().unwrap();
+        assert_eq!(frame.rows.len(), 6);
+        assert!(frame.rows.iter().all(|row| row.predicate == "身高"));
     }
 
     #[test]
