@@ -6623,7 +6623,8 @@ async fn run_interactive_mode(
                     if let Some(recipe) = outcome.trace.recipe.clone() {
                         // 回指：配方捕获到「他/这位/该」时接续当前对话焦点，
                         // 焦点仍由对话管理器统一维护，插件不另建上下文。
-                        let entity = recipe.slots.get("entity").map(|raw| {
+                        let raw_entity = recipe.slots.get("entity").cloned();
+                        let entity = raw_entity.as_ref().map(|raw| {
                             if know_prolog::plugin::is_reference_surface(raw) {
                                 dialogue_manager
                                     .focus_entity()
@@ -6633,6 +6634,13 @@ async fn run_interactive_mode(
                                 raw.clone()
                             }
                         });
+                        // 回指替换后同步改写问句，核心管线兜底时不再拿「他」去检索。
+                        let question = match (raw_entity.as_deref(), entity.as_deref()) {
+                            (Some(raw), Some(resolved)) if raw != resolved => {
+                                recipe.question.replace(raw, resolved)
+                            }
+                            _ => recipe.question.clone(),
+                        };
                         let mut answer = None;
                         let mut evidence = Vec::new();
                         if let (Some(entity), Some(attribute)) =
@@ -6651,7 +6659,7 @@ async fn run_interactive_mode(
                             }
                         }
                         if answer.is_none() {
-                            answer = symbolic_reasoner.answer(&recipe.question);
+                            answer = symbolic_reasoner.answer(&question);
                         }
                         if let Some(answer) = answer {
                             let composed = plugin_runtime
@@ -6662,13 +6670,13 @@ async fn run_interactive_mode(
                                 vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
                             let provenance = vec![format!(
                                 "插件 {} / 配方 {} / 问句 {}",
-                                recipe.plugin, recipe.contribution, recipe.question
+                                recipe.plugin, recipe.contribution, question
                             )];
                             if dialogue_enabled {
                                 dialogue_manager.note_plugin_turn(
                                     raw_input,
                                     MoveKind::AskAttribute,
-                                    recipe.slots.get("entity").map(String::as_str),
+                                    entity.as_deref(),
                                     recipe.attribute.as_deref(),
                                     &text,
                                     plan.clone(),

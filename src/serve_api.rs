@@ -461,7 +461,8 @@ impl Session {
     ) -> Option<(String, Vec<String>, String)> {
         let outcome = outcome?;
         let recipe = outcome.trace.recipe.clone()?;
-        let entity = recipe.slots.get("entity").map(|raw| {
+        let raw_entity = recipe.slots.get("entity").cloned();
+        let entity = raw_entity.as_ref().map(|raw| {
             if crate::plugin::is_reference_surface(raw) {
                 self.manager
                     .focus_entity()
@@ -471,6 +472,12 @@ impl Session {
                 raw.clone()
             }
         });
+        let question = match (raw_entity.as_deref(), entity.as_deref()) {
+            (Some(raw), Some(resolved)) if raw != resolved => {
+                recipe.question.replace(raw, resolved)
+            }
+            _ => recipe.question.clone(),
+        };
         let mut answer = None;
         let mut evidence = Vec::new();
         if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
@@ -487,7 +494,7 @@ impl Session {
             }
         }
         if answer.is_none() {
-            answer = self.reasoner.answer(&recipe.question);
+            answer = self.reasoner.answer(&question);
         }
         let answer = answer?;
         let composed = self
@@ -498,7 +505,7 @@ impl Session {
         let plan = vec![format!("plugin:{}:{}", recipe.plugin, recipe.contribution)];
         let provenance = vec![format!(
             "插件 {} / 配方 {} / 问句 {}",
-            recipe.plugin, recipe.contribution, recipe.question
+            recipe.plugin, recipe.contribution, question
         )];
         self.manager.note_plugin_turn(
             raw_input,
