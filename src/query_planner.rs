@@ -592,7 +592,7 @@ impl QueryPlanner {
     }
 
     fn parse_closure(&self, raw: &str) -> Option<QueryPlan> {
-        for marker in ["的所有", "的全部", "的任意"] {
+        for marker in ["的所有", "的全部", "的一切", "的任何", "的任意"] {
             let Some((subject, rest)) = raw.split_once(marker) else {
                 continue;
             };
@@ -600,68 +600,102 @@ impl QueryPlanner {
             if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
                 continue;
             }
-            let (chain, count_only) = Self::strip_closure_tail(rest);
-            let parts: Vec<&str> = chain
-                .split('的')
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .collect();
-            if parts.is_empty() || parts.len() > 6 {
+            if let Some(plan) = Self::build_closure(subject, rest) {
+                return Some(plan);
+            }
+        }
+        for marker in ["所有", "全部"] {
+            let Some((subject, rest)) = raw.split_once(marker) else {
+                continue;
+            };
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
                 continue;
             }
-            if parts.iter().any(|part| {
-                part.chars().count() > 40 || Self::is_question_word(part)
-            }) {
-                continue;
+            if let Some(plan) = Self::build_closure(subject, rest) {
+                return Some(plan);
             }
-            let predicate = parts[0].trim_end_matches('的').trim();
-            if predicate.is_empty() {
-                continue;
-            }
-            return Some(QueryPlan::Closure {
-                subject: subject.to_string(),
-                predicate: predicate.to_string(),
-                operator: ClosureOp::Plus,
-                count_only,
-                then: parts[1..].iter().map(|part| part.to_string()).collect(),
-            });
         }
         None
     }
 
+    fn build_closure(subject: &str, rest: &str) -> Option<QueryPlan> {
+        let (chain, count_only) = Self::strip_closure_tail(rest);
+        let parts: Vec<&str> = chain
+            .split('的')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() || parts.len() > 6 {
+            return None;
+        }
+        if parts
+            .iter()
+            .any(|part| part.chars().count() > 40 || Self::is_question_word(part))
+        {
+            return None;
+        }
+        let predicate = parts[0].trim_end_matches('的').trim();
+        if predicate.is_empty() {
+            return None;
+        }
+        Some(QueryPlan::Closure {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            operator: ClosureOp::Plus,
+            count_only,
+            then: parts[1..].iter().map(|part| part.to_string()).collect(),
+        })
+    }
+
     fn strip_closure_tail(raw: &str) -> (String, bool) {
         let text = Self::strip_particles(raw);
-        const TAILS: [(&str, bool); 30] = [
+        const TAILS: [(&str, bool); 45] = [
+            ("分别是哪些人", false),
+            ("分别是哪些", false),
             ("分别有哪些", false),
             ("分别是什么", false),
             ("分别是谁", false),
+            ("一共有多少人", true),
             ("一共有多少个", true),
             ("一共有几位", true),
             ("一共有几个", true),
             ("一共有多少", true),
+            ("共有多少人", true),
             ("共有多少个", true),
             ("共有几位", true),
             ("共有几个", true),
             ("共有多少", true),
+            ("总共有多少", true),
+            ("总共多少人", true),
             ("总共多少个", true),
             ("总共几位", true),
             ("总共几个", true),
             ("总共多少", true),
             ("有哪几个", false),
             ("有哪几位", false),
+            ("都有哪些", false),
+            ("包括哪些", false),
+            ("包括谁", false),
+            ("有哪些人", false),
             ("有哪些", false),
             ("都是什么", false),
             ("都是谁", false),
             ("都有谁", false),
+            ("是哪些人", false),
+            ("是哪些", false),
             ("是什么", false),
             ("是谁", false),
+            ("有多少位", true),
+            ("有多少名", true),
+            ("有多少人", true),
             ("有多少个", true),
+            ("有几个人", true),
             ("有几位", true),
             ("有几个", true),
             ("有多少", true),
             ("的总数", true),
             ("有谁", false),
-            ("分别", false),
         ];
         for (tail, count_only) in TAILS {
             if let Some(core) = text.strip_suffix(tail) {
@@ -740,7 +774,7 @@ impl QueryPlanner {
                 }
             }
         }
-        if let Some((subject, tail)) = q.split_once("有") {
+        if let Some((subject, tail)) = Self::split_has(q) {
             // 计数问句（有几个/有多少）交给 Count 分支
             if tail.starts_with('几') || tail.starts_with("多少") {
                 return None;
@@ -759,6 +793,17 @@ impl QueryPlanner {
                     });
                 }
             }
+        }
+        None
+    }
+
+    fn split_has(q: &str) -> Option<(&str, &str)> {
+        for (index, _) in q.match_indices('有') {
+            let before = &q[..index];
+            if before.ends_with('所') || before.ends_with('没') {
+                continue;
+            }
+            return Some((before, &q[index + '有'.len_utf8()..]));
         }
         None
     }
@@ -978,6 +1023,32 @@ mod tests {
                 then: Vec::new(),
             }
         );
+        let bare = planner()
+            .parse("李四所有上司是谁")
+            .expect("省略「的」的闭包问句");
+        assert_eq!(
+            bare,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: false,
+                then: Vec::new(),
+            }
+        );
+        let counted = planner()
+            .parse("李四的所有上司有多少位")
+            .expect("量词尾的闭包计数");
+        assert_eq!(
+            counted,
+            QueryPlan::Closure {
+                subject: "李四".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Plus,
+                count_only: true,
+                then: Vec::new(),
+            }
+        );
         let composed = planner()
             .parse("李四的所有上司的师傅是谁")
             .expect("应编译为闭包+后续关系");
@@ -1010,6 +1081,15 @@ mod tests {
                 subject: "李四".to_string(),
                 predicate: "上司".to_string()
             }
+        );
+        let negative = planner().parse("李四没有师傅");
+        assert!(
+            !matches!(
+                negative,
+                Some(QueryPlan::Exist { ref subject, .. }) if subject.contains('没')
+            ),
+            "{:?}",
+            negative
         );
     }
 
