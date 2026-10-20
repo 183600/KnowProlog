@@ -11,6 +11,8 @@ id = "film.lexicon"
 description = "电影领域词面归一。"
 entries = [
   { surface = "影片", canonical = "电影" },
+  { surface = "片子", canonical = "电影" },
+  { surface = "动画片", canonical = "动画电影" },
 ]
 
 [[contributions]]
@@ -36,8 +38,15 @@ patterns = [
   "{entity}是谁导演的",
   "{entity}由谁导演",
   "{entity}由谁执导",
+  "{entity}的导演是谁",
+  "{entity}是谁拍的",
+  "{entity}由谁拍摄",
   "谁导演了{entity}",
   "谁执导了{entity}",
+  "谁拍摄了{entity}",
+  "谁拍了{entity}",
+  "{entity}的导演是谁，依据是什么",
+  "{entity}是谁导演的，为什么",
 ]
 question = "{entity}的导演是什么"
 attribute = "导演"
@@ -52,9 +61,16 @@ patterns = [
   "{entity}导演过哪些电影",
   "{entity}导演的电影有哪些",
   "{entity}执导过哪些电影",
+  "{entity}导演过哪些动画电影",
+  "{entity}执导过哪些动画电影",
+  "{entity}拍过哪些电影",
+  "{entity}拍过哪些动画电影",
+  "{entity}拍摄过哪些电影",
   "{entity}还导演过哪些电影",
   "{entity}还导演过什么",
+  "{entity}还拍过什么",
   "那{entity}还导演过什么",
+  "那{entity}还拍过什么",
 ]
 question = "{entity}导演过哪些作品"
 attribute = "导演"
@@ -69,7 +85,9 @@ description = "作品 → 主演（正向；多值合并）"
 patterns = [
   "{entity}的主演是谁",
   "{entity}由谁主演",
+  "{entity}由谁出演",
   "谁主演了{entity}",
+  "谁出演了{entity}",
 ]
 question = "{entity}的主演是谁"
 attribute = "主演"
@@ -83,7 +101,9 @@ description = "演员 → 作品（逆向检索；答案类型约束为电影）
 patterns = [
   "{entity}演过哪些电影",
   "{entity}主演过哪些电影",
+  "{entity}演过哪些动画电影",
   "{entity}还演过哪些电影",
+  "{entity}还演过什么",
   "那{entity}还演过什么",
 ]
 question = "{entity}主演过哪些作品"
@@ -144,6 +164,31 @@ expect_plugin = "zh.film"
 [[eval_cases]]
 input = "阿凡达的主演是谁"
 expect_rewrite = "阿凡达的主演是谁"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "阿凡达的导演是谁"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "阿凡达是谁拍的"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "卡梅隆拍过哪些电影"
+expect_rewrite = "卡梅隆导演过哪些作品"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "宫崎骏导演过哪些动画片"
+expect_rewrite = "宫崎骏导演过哪些作品"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
+input = "这位导演还拍过什么"
+expect_rewrite = "这位导演导演过哪些作品"
 expect_plugin = "zh.film"
 
 [[contributions]]

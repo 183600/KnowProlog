@@ -2082,7 +2082,9 @@ impl PluginRuntime {
     }
 
     /// 当前启用插件声明的指称词是否可回指对话焦点。
-    /// 静态代词之外，插件 `Reference.quantifiers` 也参与判定；
+    /// 静态代词之外，插件 `Reference.quantifiers` 也参与判定；量词后紧跟
+    /// 本包 `role_words` 的偏正短语（如「这位导演」「该演员」）同样视为
+    /// 回指，而不是一个需要检索的新实体。
     /// 只认启用中的包，观察/停用包不改变消解行为。
     pub fn is_context_reference(&self, surface: &str) -> bool {
         if is_reference_surface(surface) {
@@ -2093,15 +2095,36 @@ impl PluginRuntime {
             return false;
         }
         self.manifests.iter().any(|manifest| {
-            self.modes.get(&manifest.id) == Some(&PluginMode::On)
-                && manifest.contributions.iter().any(|contribution| {
-                    let Contribution::Reference { quantifiers, .. } = contribution else {
+            if self.modes.get(&manifest.id) != Some(&PluginMode::On) {
+                return false;
+            }
+            manifest.contributions.iter().any(|contribution| {
+                let Contribution::Reference {
+                    quantifiers,
+                    role_words,
+                    ..
+                } = contribution
+                else {
+                    return false;
+                };
+                quantifiers.iter().any(|quantifier| {
+                    let quantifier = quantifier.trim();
+                    if quantifier.is_empty() {
                         return false;
-                    };
-                    quantifiers
-                        .iter()
-                        .any(|quantifier| quantifier.trim() == surface)
+                    }
+                    if quantifier == surface {
+                        return true;
+                    }
+                    surface
+                        .strip_prefix(quantifier)
+                        .map(str::trim)
+                        .is_some_and(|rest| {
+                            role_words
+                                .iter()
+                                .any(|role| !role.trim().is_empty() && role.trim() == rest)
+                        })
                 })
+            })
         })
     }
 
@@ -3187,7 +3210,9 @@ mod tests {
         assert!(!runtime.is_context_reference("本片"));
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
         assert!(runtime.is_context_reference("本片"));
+        assert!(runtime.is_context_reference("本片导演"));
         assert!(!runtime.is_context_reference("导演"));
+        assert!(!runtime.is_context_reference("本片演员"));
         assert_eq!(
             runtime.reference_lexicon(),
             vec![
