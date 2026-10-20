@@ -11015,6 +11015,16 @@ mod tests {
             .expect("复合计数");
         assert!(count.contains("共 3 个"), "{}", count);
         assert!(count.contains("不同最终节点"), "{}", count);
+
+        let blocked = reasoner.assert_nl_fact("戊不是乙的师傅");
+        assert!(blocked.contains("已记住否定事实"), "{}", blocked);
+        let after_negative = reasoner
+            .answer("甲的所有上司的师傅是谁")
+            .expect("否定边应阻断复合链");
+        assert!(!after_negative.contains("戊"), "{}", after_negative);
+        assert!(after_negative.contains("共 2 个"), "{}", after_negative);
+        assert!(after_negative.contains("己"), "{}", after_negative);
+        assert!(after_negative.contains("庚"), "{}", after_negative);
     }
 
     #[test]
