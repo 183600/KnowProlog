@@ -341,6 +341,22 @@ impl DialogueInducedPattern {
             self.statement_template
         )
     }
+
+    /// 提升为统一模式库条目（来源 `induced#<id>`）：陈述模板 → `{{主体}}/{{客体}}` 洞。
+    ///
+    /// `ir` 是教学语法串（见 [`crate::pattern_ir::parse_teach_pattern`]），
+    /// 由调用方按谓词词面生成，保持模式语言统一。
+    pub fn to_pattern_entry(&self, ir: &str) -> crate::pattern_ir::PatternEntry {
+        crate::pattern_ir::PatternEntry::new(
+            format!("诱导-{}", self.surface),
+            format!("induced#{}", self.id),
+            self.predicate.clone(),
+            8,
+            true,
+            crate::pattern_ir::parse_teach_pattern(ir)
+                .unwrap_or_else(|_| vec![crate::pattern_ir::Elem::Any]),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

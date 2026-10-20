@@ -869,15 +869,48 @@ impl PatternLibrary {
         Some(self.entries.remove(position))
     }
 
-    /// 并入外部载入的条目（仅教学来源；配置/NLU 每次启动重建）。
+    /// 并入外部载入的条目（教学与归纳来源；配置/NLU 每次启动重建）。
     pub fn merge_taught(&mut self, entries: &[PatternEntry]) -> usize {
         let mut merged = 0;
         for entry in entries {
-            if entry.source.starts_with("taught#") && self.add(entry.clone()) {
+            if (entry.source.starts_with("taught#") || entry.source.starts_with("induced#"))
+                && self.add(entry.clone())
+            {
                 merged += 1;
             }
         }
         merged
+    }
+
+    /// 归纳一条模式（来源 `induced#<seed>`；参与路由）。
+    ///
+    /// 与 [`PatternLibrary::teach`] 同一落库路径，只是来源不同：
+    /// 归纳出的模式来自对话诱导/最小泛化，而不是显式教学。
+    pub fn induce(
+        &mut self,
+        name: &str,
+        pattern: &str,
+        query_type: &str,
+        priority: i32,
+        seed: &str,
+    ) -> Result<PatternEntry, String> {
+        if name.trim().is_empty() {
+            return Err("模式名称不能为空".to_string());
+        }
+        if query_type.trim().is_empty() {
+            return Err("路由类型（query_type）不能为空".to_string());
+        }
+        let elems = parse_teach_pattern(pattern)?;
+        let entry = PatternEntry::new(
+            name.trim(),
+            format!("induced#{}", seed.trim()),
+            query_type.trim(),
+            priority,
+            true,
+            elems,
+        );
+        self.add(entry.clone());
+        Ok(entry)
     }
 
     /// 评估序：优先级降序 + 配置序（稳定排序，与既有路由一致）。

@@ -3490,6 +3490,49 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 归纳模式：把已激活的对话诱导模式（DIP）提升为统一模式库条目。
+        if matches!(input, "归纳模式" | "诱导入库" | "模式入库" | "归纳规律") {
+            let active: Vec<pattern_ir::PatternEntry> = acquisition
+                .patterns()
+                .filter(|pattern| pattern.active && !pattern.retired)
+                .map(|pattern| {
+                    let ir = format!(
+                        "{{主体}} 的 {} 是 {{客体}}",
+                        pattern.surface
+                    );
+                    pattern
+                        .to_pattern_entry(&ir)
+                })
+                .collect();
+            if active.is_empty() {
+                println!("没有可归纳的激活模式（同一谓词被两次确认后自动激活）。");
+            } else {
+                let mut added = 0usize;
+                for entry in &active {
+                    if pattern_library.add(entry.clone()) {
+                        added += 1;
+                    }
+                }
+                println!(
+                    "归纳入库：{} 条激活诱导模式，新增 {} 条（来源 induced#…）。",
+                    active.len(),
+                    added
+                );
+                for entry in &active {
+                    println!("  - {}（{}）→ {}", entry.name, entry.render(), entry.query_type);
+                }
+                match oxigraph_manager
+                    .sync_pattern_ledger(pattern_library.entries())
+                    .await
+                {
+                    Ok(count) => println!("模式落图：{} 条已同步。", count),
+                    Err(error) => eprintln!("模式落图失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
         if let Some(id) = strip_any_prefix(input, &["退役模式：", "退役模式:", "退役模式 "])
         {
             let id = id.trim();
