@@ -3796,19 +3796,34 @@ impl SymbolicReasoner {
     }
 
     fn is_known_entity(&self, name: &str) -> bool {
-        self.aligner.kind_of(name) == Some(TermKind::Entity)
+        if self.aligner.kind_of(name) == Some(TermKind::Entity) {
+            return true;
+        }
+        self.session_facts
+            .iter()
+            .chain(self.session_negative_facts.iter())
+            .any(|atom| {
+                atom.terms
+                    .iter()
+                    .any(|term| !term.is_var() && term.name() == name)
+            })
     }
 
     fn is_known_predicate(&self, name: &str) -> bool {
+        let canonical = self.aligner.canonical_form(name);
         self.aligner.kind_of(name) == Some(TermKind::Relation)
             || self.inverse_query_map.contains_key(name)
-            || self.inverse_query_map.contains_key(self.aligner.canonical_form(name).as_str())
+            || self.inverse_query_map.contains_key(canonical.as_str())
             || self.predictor.has_predicate(name)
             // 正向别名（同义词）按规范化槽位回查预测器
-            || {
-                let canonical = self.aligner.canonical_form(name);
-                canonical != name && self.predictor.has_predicate(&canonical)
-            }
+            || (canonical != name && self.predictor.has_predicate(&canonical))
+            || self
+                .session_facts
+                .iter()
+                .chain(self.session_negative_facts.iter())
+                .any(|atom| {
+                    atom.predicate.as_ref() == name || atom.predicate.as_ref() == canonical
+                })
     }
 
     fn split_chain(&self, segments: &[String]) -> Option<(String, Vec<ChainPredicate>)> {
@@ -4811,6 +4826,67 @@ impl SymbolicReasoner {
         }
     }
 
+    fn closure_adjacency(
+        &self,
+        slot: &str,
+        inverted: bool,
+    ) -> BTreeMap<String, BTreeSet<String>> {
+        fn add_edge(
+            adjacency: &mut BTreeMap<String, BTreeSet<String>>,
+            from: &str,
+            to: &str,
+        ) {
+            adjacency
+                .entry(from.to_string())
+                .or_default()
+                .insert(to.to_string());
+        }
+
+        let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for triple in self.predictor.triples() {
+            if triple.predicate != slot {
+                continue;
+            }
+            if inverted {
+                add_edge(&mut adjacency, &triple.object, &triple.subject);
+            } else {
+                add_edge(&mut adjacency, &triple.subject, &triple.object);
+            }
+        }
+        for atom in &self.session_facts {
+            if atom.predicate.as_ref() != slot || atom.terms.len() != 2 {
+                continue;
+            }
+            if let (Term::Const(subject), Term::Const(object)) =
+                (&atom.terms[0], &atom.terms[1])
+            {
+                if inverted {
+                    add_edge(&mut adjacency, object, subject);
+                } else {
+                    add_edge(&mut adjacency, subject, object);
+                }
+            }
+        }
+        for atom in &self.session_negative_facts {
+            if atom.predicate.as_ref() != slot || atom.terms.len() != 2 {
+                continue;
+            }
+            if let (Term::Const(subject), Term::Const(object)) =
+                (&atom.terms[0], &atom.terms[1])
+            {
+                let (from, to) = if inverted {
+                    (object.as_ref(), subject.as_ref())
+                } else {
+                    (subject.as_ref(), object.as_ref())
+                };
+                if let Some(values) = adjacency.get_mut(from) {
+                    values.remove(to);
+                }
+            }
+        }
+        adjacency
+    }
+
     fn answer_closure(
         &self,
         subject: &str,
@@ -4844,17 +4920,15 @@ impl SymbolicReasoner {
             then_links.push((raw.to_string(), then_slot, then_inverted));
         }
 
+        let adjacency = self.closure_adjacency(&slot, inverted);
         let law = if operator.requires_transitive_law() {
             match self.laws.active_transitive(&slot) {
                 Some(law) => Some(law.id.clone()),
                 None => {
-                    let mut direct = if inverted {
-                        self.predictor.subjects_of(&slot, &entity)
-                    } else {
-                        self.predictor.objects_of(&entity, &slot)
-                    };
-                    direct.sort();
-                    direct.dedup();
+                    let direct: Vec<String> = adjacency
+                        .get(&entity)
+                        .map(|values| values.iter().cloned().collect())
+                        .unwrap_or_default();
                     let direct_text = if direct.is_empty() {
                         "当前没有直接记录".to_string()
                     } else {
@@ -4874,19 +4948,16 @@ impl SymbolicReasoner {
         if !then_links.is_empty() {
             budget.max_witnesses = budget.max_nodes;
         }
-        let predictor = &self.predictor;
-        let closure_slot = slot.clone();
         let outcome = evaluate_closure(
             &entity,
             operator,
             budget,
             law.as_deref(),
-            move |node| {
-                if inverted {
-                    predictor.subjects_of(&closure_slot, node)
-                } else {
-                    predictor.objects_of(node, &closure_slot)
-                }
+            |node| {
+                adjacency
+                    .get(node)
+                    .map(|values| values.iter().cloned().collect())
+                    .unwrap_or_default()
             },
         )
         .ok()?;
@@ -4915,6 +4986,7 @@ impl SymbolicReasoner {
             .map(|(target, path)| (target.clone(), path.clone()))
             .collect();
         for (_, slot, inverted) in then {
+            let adjacency = self.closure_adjacency(slot, *inverted);
             let mut ordered: Vec<(String, Vec<String>)> = current.into_iter().collect();
             ordered.sort_by(|(left_name, left_path), (right_name, right_path)| {
                 left_path
@@ -4924,13 +4996,10 @@ impl SymbolicReasoner {
             });
             let mut next: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for (node, path) in ordered {
-                let mut values = if *inverted {
-                    self.predictor.subjects_of(slot, &node)
-                } else {
-                    self.predictor.objects_of(&node, slot)
-                };
-                values.sort();
-                values.dedup();
+                let values: Vec<String> = adjacency
+                    .get(&node)
+                    .map(|neighbors| neighbors.iter().cloned().collect())
+                    .unwrap_or_default();
                 for value in values {
                     let mut extended = path.clone();
                     extended.push(value.clone());
@@ -10691,6 +10760,36 @@ mod tests {
         assert!(answer.contains("law:transitive:上司"), "{}", answer);
         assert!(answer.contains("甲 → 乙 → 丙"), "{}", answer);
         assert!(!answer.contains("下界"), "{}", answer);
+    }
+
+    #[test]
+    fn closure_respects_session_negative_edges() {
+        let mut reasoner = closure_reasoner();
+        let message = reasoner.assert_nl_fact("乙不是甲的上司");
+        assert!(message.contains("已记住否定事实"), "{}", message);
+        let answer = reasoner
+            .answer("甲的所有上司是谁")
+            .expect("否定后仍应回答");
+        assert!(!answer.contains("乙"), "{}", answer);
+        assert!(!answer.contains("丙"), "{}", answer);
+        assert!(answer.contains("没有所有「上司」"), "{}", answer);
+    }
+
+    #[test]
+    fn closure_includes_session_facts_in_reachability() {
+        let mut reasoner = closure_reasoner();
+        let message = reasoner.assert_nl_fact("丙的上司是丁");
+        assert!(message.contains("已记住"), "{}", message);
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "丁".to_string(),
+            rel_type: "上司".to_string(),
+            to: "戊".to_string(),
+        }]);
+        let answer = reasoner
+            .answer("甲的所有上司是谁")
+            .expect("会话事实应参与闭包");
+        assert!(answer.contains("戊"), "{}", answer);
+        assert!(!answer.contains("共 3 个"), "{}", answer);
     }
 
     #[test]
