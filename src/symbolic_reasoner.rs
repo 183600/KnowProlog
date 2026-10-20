@@ -4945,6 +4945,9 @@ impl SymbolicReasoner {
         };
 
         let mut budget = ClosureBudget::default();
+        if let ClosureOp::Exact(hops) = operator {
+            budget.max_depth = budget.max_depth.max(hops);
+        }
         if !then_links.is_empty() {
             budget.max_witnesses = budget.max_nodes;
         }
@@ -10760,6 +10763,44 @@ mod tests {
         assert!(answer.contains("law:transitive:上司"), "{}", answer);
         assert!(answer.contains("甲 → 乙 → 丙"), "{}", answer);
         assert!(!answer.contains("下界"), "{}", answer);
+    }
+
+    #[test]
+    fn exact_hop_closure_does_not_need_transitive_law() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "上司".to_string(),
+                to: "乙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "丙".to_string(),
+                rel_type: "上司".to_string(),
+                to: "丁".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer("甲恰好两跳的上司是谁")
+            .expect("精确跳数无需传递律");
+        assert!(answer.contains("丙"), "{}", answer);
+        assert!(!answer.contains("1. 乙"), "{}", answer);
+        assert!(!answer.contains("丁"), "{}", answer);
+        assert!(answer.contains("共 1 个"), "{}", answer);
+        assert!(answer.contains("精确跳数"), "{}", answer);
+        assert!(!answer.contains("law:transitive"), "{}", answer);
+
+        let count = reasoner
+            .answer("甲恰好 2 跳的上司有几个")
+            .expect("精确跳数计数");
+        assert!(count.contains("共 1 个"), "{}", count);
     }
 
     #[test]

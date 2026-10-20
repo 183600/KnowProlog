@@ -92,6 +92,10 @@ impl QueryPlanner {
             return Some(plan);
         }
 
+        if let Some(plan) = self.parse_exact_closure(&raw) {
+            return Some(plan);
+        }
+
         // 「所有」必须先于存在句解析，否则会被「有」误判成存在性问句。
         if let Some(plan) = self.parse_closure(&raw) {
             return Some(plan);
@@ -680,6 +684,43 @@ impl QueryPlanner {
         None
     }
 
+    fn parse_exact_closure(&self, raw: &str) -> Option<QueryPlan> {
+        for marker in ["恰好", "正好", "刚好"] {
+            let Some((subject, rest)) = raw.split_once(marker) else {
+                continue;
+            };
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || Self::chinese_digit(*c).is_some())
+                .collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let after = rest[digits.len()..].trim_start();
+            let Some(after) = after.strip_prefix('跳').or_else(|| after.strip_prefix('步')) else {
+                continue;
+            };
+            let after = after.trim_start();
+            let after = after.strip_prefix('的').unwrap_or(after);
+            let Some(hops) = Self::parse_hop_number(&digits) else {
+                continue;
+            };
+            if let Some(plan) = Self::build_closure_with_operator(
+                subject,
+                after,
+                ClosureOp::Exact(hops.clamp(1, 12)),
+            ) {
+                return Some(plan);
+            }
+        }
+        None
+    }
+
     fn parse_closure(&self, raw: &str) -> Option<QueryPlan> {
         for marker in ["的所有", "的全部", "的一切", "的任何", "的任意"] {
             let Some((subject, rest)) = raw.split_once(marker) else {
@@ -709,6 +750,14 @@ impl QueryPlanner {
     }
 
     fn build_closure(subject: &str, rest: &str) -> Option<QueryPlan> {
+        Self::build_closure_with_operator(subject, rest, ClosureOp::Plus)
+    }
+
+    fn build_closure_with_operator(
+        subject: &str,
+        rest: &str,
+        operator: ClosureOp,
+    ) -> Option<QueryPlan> {
         let (chain, count_only) = Self::strip_closure_tail(rest);
         let parts: Vec<&str> = chain
             .split('的')
@@ -731,7 +780,7 @@ impl QueryPlanner {
         Some(QueryPlan::Closure {
             subject: subject.to_string(),
             predicate: predicate.to_string(),
-            operator: ClosureOp::Plus,
+            operator,
             count_only,
             then: parts[1..].iter().map(|part| part.to_string()).collect(),
         })
@@ -1310,6 +1359,36 @@ mod tests {
                 start: "张三".to_string(),
                 goal: "王五".to_string(),
                 max_hops: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_exact_hop_closure_question() {
+        let plan = planner()
+            .parse("甲恰好 2 跳的上司是谁")
+            .expect("精确跳数问句");
+        assert_eq!(
+            plan,
+            QueryPlan::Closure {
+                subject: "甲".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Exact(2),
+                count_only: false,
+                then: Vec::new(),
+            }
+        );
+        let chinese = planner()
+            .parse("甲正好两跳的上司有几个")
+            .expect("中文数字精确跳数");
+        assert_eq!(
+            chinese,
+            QueryPlan::Closure {
+                subject: "甲".to_string(),
+                predicate: "上司".to_string(),
+                operator: ClosureOp::Exact(2),
+                count_only: true,
+                then: Vec::new(),
             }
         );
     }
