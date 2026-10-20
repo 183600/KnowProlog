@@ -29,7 +29,7 @@ use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
 use crate::predicate_registry::PredicateRegistry;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::problog::{ProblogAnswer, ProblogEngine};
-use crate::ontology_alignment::{OntologyAligner, TermKind};
+use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAligner, TermKind};
 use crate::perf_ledger::PerfLedger;
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
@@ -4156,6 +4156,21 @@ impl SymbolicReasoner {
                 if predicates.is_empty() {
                     return None;
                 }
+                if self.config.enable_clarification
+                    && predicates.len() == 1
+                    && self.is_known_entity(&entity)
+                {
+                    if let Some(decision) =
+                        self.attribute_alignment_decision(&entity, &predicates[0].surface)
+                    {
+                        if decision.should_clarify() {
+                            return Some(self.render_alignment_clarification(
+                                &predicates[0].surface,
+                                &decision,
+                            ));
+                        }
+                    }
+                }
                 let chain_result = if self.is_transitive_chain(&predicates) {
                     // 重复的传递谓词：用 Closure 算子压缩链，trace 会引用该律。
                     self.run_chain_via_laws(&entity, &predicates)
@@ -6576,6 +6591,177 @@ impl SymbolicReasoner {
         if pairs.is_empty() {
             output.push_str("  （未发现跨词表对齐，可补充同义词或更多关系数据）\n");
         }
+        let ambiguous = self.aligner.ambiguous_terms(8);
+        if ambiguous.is_empty() {
+            output.push_str("对齐歧义：未发现候选分数接近的术语。\n");
+        } else {
+            output.push_str(&format!(
+                "对齐歧义：{} 个术语存在候选分数接近的对齐（可用「对齐候选：术语」查看）。\n",
+                ambiguous.len()
+            ));
+            for resolution in ambiguous {
+                output.push_str(&format!(
+                    "  • {} → {}\n",
+                    resolution.source,
+                    resolution
+                        .targets()
+                        .into_iter()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                ));
+            }
+        }
+        output
+    }
+
+    /// 只读访问本体对齐器（诊断 / 外部知识属性准入等只读消费者）。
+    pub fn aligner(&self) -> &OntologyAligner {
+        &self.aligner
+    }
+
+    /// 候选格报告：展示 top-k 对齐候选、证据与（有上下文实体时的）答案等价性。
+    pub fn alignment_candidates_report(&self, term_raw: &str) -> String {
+        let term = term_raw.trim();
+        if term.is_empty() {
+            return "请提供要对齐的术语，例如：对齐候选：老婆".to_string();
+        }
+        let resolution = self.aligner.resolve_candidates(term, 5);
+        let mut output = format!(
+            "对齐候选「{}」：状态 {}，规范化形「{}」。\n",
+            term,
+            resolution.state.label_zh(),
+            resolution.normalized
+        );
+        if resolution.is_empty() {
+            if let Some(kind) = self.aligner.kind_of(term) {
+                output.push_str(&format!(
+                    "  精确登记为 {:?}，没有其他接近候选。\n",
+                    kind
+                ));
+            } else {
+                output.push_str("  （没有达到阈值的候选）\n");
+            }
+            return output;
+        }
+        for (index, candidate) in resolution.candidates.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}（{:?}，置信度 {:.2}，证据：{}）\n",
+                index + 1,
+                candidate.target(),
+                candidate.kind(),
+                candidate.confidence(),
+                candidate.pair.evidence.join("；")
+            ));
+        }
+
+        let Some(entity) = self.context.focus() else {
+            return output;
+        };
+        let mut answerable = resolution.clone();
+        answerable.retain(|candidate| self.is_answerable_predicate(candidate.target()));
+        if answerable.is_empty() {
+            return output;
+        }
+        let decision = self
+            .aligner
+            .probe_answers(answerable, |target| self.predicate_values_for_entity(entity, target));
+        output.push_str(&format!(
+            "\n答案等价性（上下文实体「{}」）：{}\n",
+            entity,
+            if decision.equivalent_answers {
+                "候选给出相同答案，不需要澄清"
+            } else if decision.should_clarify() {
+                "候选给出不同答案，值得澄清"
+            } else {
+                "只有一种解释有答案，按最佳候选作答"
+            }
+        ));
+        for answer in &decision.answers {
+            output.push_str(&format!(
+                "  • 「{}」→ {}\n",
+                answer.target,
+                if answer.answers.is_empty() {
+                    "（没有记录）".to_string()
+                } else {
+                    answer.answers.join("、")
+                }
+            ));
+        }
+        output
+    }
+
+    /// 谓词是否能在当前知识库中产生答案（关系、属性或预测规则）。
+    fn is_answerable_predicate(&self, target: &str) -> bool {
+        self.canonical_attribute(target).is_some() || self.is_known_predicate(target)
+    }
+
+    /// 某实体在一个候选谓词下的全部取值（与正常查询同一条 `node_hits` 路径）。
+    fn predicate_values_for_entity(&self, entity: &str, target: &str) -> Vec<String> {
+        let (slot, inverted) = self.resolve_question_predicate(target);
+        if slot.is_empty() {
+            return Vec::new();
+        }
+        let predicate = ChainPredicate {
+            surface: target.to_string(),
+            slot,
+            inverted,
+        };
+        self.node_hits(entity, &predicate)
+            .into_iter()
+            .map(|hit| hit.value)
+            .collect()
+    }
+
+    /// 属性问句的对齐决策：只保留本库可作答的候选，再用答案集合判断是否真歧义。
+    /// 精确登记的谓词是用户明确给出的词面，不因模糊候选而追问。
+    fn attribute_alignment_decision(
+        &self,
+        entity: &str,
+        surface: &str,
+    ) -> Option<AlignmentDecision> {
+        if self.aligner.is_registered(surface)
+            && self.aligner.canonical_form(surface) == surface
+        {
+            return None;
+        }
+        let mut resolution = self.aligner.resolve_candidates(surface, 6);
+        if resolution.state != AlignmentState::Ambiguous {
+            return None;
+        }
+        resolution.retain(|candidate| self.is_answerable_predicate(candidate.target()));
+        if resolution.candidates.len() < 2 {
+            return None;
+        }
+        Some(
+            self.aligner
+                .probe_answers(resolution, |target| {
+                    self.predicate_values_for_entity(entity, target)
+                }),
+        )
+    }
+
+    fn render_alignment_clarification(
+        &self,
+        surface: &str,
+        decision: &AlignmentDecision,
+    ) -> String {
+        let mut output = format!(
+            "「{}」有不止一种理解，而且在现有知识中会得到不同答案：\n",
+            surface
+        );
+        for answer in decision.answers.iter().take(4) {
+            output.push_str(&format!(
+                "  • 「{}」→ {}\n",
+                answer.target,
+                if answer.answers.is_empty() {
+                    "（没有记录）".to_string()
+                } else {
+                    answer.answers.join("、")
+                }
+            ));
+        }
+        output.push_str("请确认你指的是哪一种（可以换一种更具体的说法）。");
         output
     }
 
@@ -7177,6 +7363,77 @@ mod tests {
         assert!(rules_report.contains("师傅"));
         let alignment_report = reasoner.alignment_report();
         assert!(alignment_report.contains("本体对齐报告"));
+    }
+
+    fn ambiguous_attribute_facts() -> Vec<PrologFact> {
+        vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "苹果公司".to_string(),
+                to: "甲公司".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "苹果果实".to_string(),
+                to: "红富士".to_string(),
+            },
+        ]
+    }
+
+    fn ambiguous_attribute_reasoner() -> SymbolicReasoner {
+        let mut config = test_config();
+        config.ontology_alignment_threshold = 0.5;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&ambiguous_attribute_facts());
+        reasoner
+    }
+
+    #[test]
+    fn test_ambiguous_attribute_alignment_asks_instead_of_guessing() {
+        let reasoner = ambiguous_attribute_reasoner();
+        let answer = reasoner
+            .answer("张三的苹果是谁")
+            .expect("两个候选谓词都有答案，应进入歧义决策");
+        assert!(answer.contains("不止一种理解"), "实际回答：{}", answer);
+        assert!(answer.contains("苹果公司"), "实际回答：{}", answer);
+        assert!(answer.contains("苹果果实"), "实际回答：{}", answer);
+        assert!(answer.contains("甲公司") && answer.contains("红富士"));
+    }
+
+    #[test]
+    fn test_equivalent_attribute_candidates_do_not_ask() {
+        let mut config = test_config();
+        config.ontology_alignment_threshold = 0.5;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "苹果公司".to_string(),
+                to: "红色".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "苹果果实".to_string(),
+                to: "红色".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer("张三的苹果是谁")
+            .expect("答案等价的候选应静默选一个");
+        assert!(!answer.contains("不止一种理解"), "实际回答：{}", answer);
+        assert!(answer.contains("红色"), "实际回答：{}", answer);
+    }
+
+    #[test]
+    fn test_alignment_candidates_report_explains_ambiguity() {
+        let mut reasoner = ambiguous_attribute_reasoner();
+        reasoner.context.record_entities(&["张三".to_string()]);
+        let report = reasoner.alignment_candidates_report("苹果");
+        assert!(report.contains("有歧义"), "{}", report);
+        assert!(report.contains("苹果公司"), "{}", report);
+        assert!(report.contains("苹果果实"), "{}", report);
+        assert!(report.contains("答案等价性"), "{}", report);
+        assert!(report.contains("值得澄清"), "{}", report);
     }
 
     #[test]

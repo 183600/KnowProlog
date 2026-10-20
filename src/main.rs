@@ -2426,6 +2426,26 @@ async fn run_interactive_mode(
             continue;
         }
 
+        if let Some(term) = input
+            .strip_prefix("对齐候选：")
+            .or_else(|| input.strip_prefix("对齐候选:"))
+        {
+            let term = term.trim();
+            if term.is_empty() {
+                println!("请提供要对齐的术语，例如：对齐候选：老婆");
+            } else {
+                match load_graph_snapshot(&oxigraph_manager).await {
+                    Ok(facts) => {
+                        symbolic_reasoner.observe_facts(&facts);
+                        println!("{}", symbolic_reasoner.alignment_candidates_report(term));
+                    }
+                    Err(e) => println!("加载知识图谱失败: {}", e),
+                }
+            }
+            println!();
+            continue;
+        }
+
         if input == "对齐报告" || input == "本体对齐" {
             match load_graph_snapshot(&oxigraph_manager).await {
                 Ok(facts) => {
@@ -5543,7 +5563,8 @@ fn interactive_help() -> String {
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
-        "  对齐报告 / 覆盖报告 / 质量护照        本体对齐、覆盖与数据质量",
+        "  对齐报告 / 对齐候选：<术语>          本体对齐、候选格与答案等价性",
+        "  覆盖报告 / 质量护照                   覆盖缺口与数据质量",
         "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
         "  获取缺口 / 获取模式 / 模式扫描：…    形状缺口转追问、诱导模式库与文本扫描",
         "  确认获取 / 采纳获取 / 模式扫描：…    确认、写入会话事实集、用诱导模式扫描新文本",
@@ -5740,6 +5761,7 @@ fn is_command_like(input: &str) -> bool {
         "推导发现",
         "对齐报告",
         "本体对齐",
+        "对齐候选",
         "推理规则",
         "链接预测规则",
         "实体链接",
@@ -6571,6 +6593,7 @@ mod session_tests {
             "挂账",
             "默认推理：麻雀会飞",
             "默认逻辑：",
+            "对齐候选：老婆",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }

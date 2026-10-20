@@ -3,6 +3,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// 候选分数差不超过该值时视为「分数接近」，交给答案探测决定是否澄清。
+pub const DEFAULT_AMBIGUITY_MARGIN: f64 = 0.05;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TermKind {
     #[default]
@@ -20,6 +23,19 @@ pub enum AlignmentKind {
     Structural,
 }
 
+impl AlignmentKind {
+    /// 对齐通道的确定性优先级：显式同义词 > 规范化 > 字面相似 > 结构相似。
+    /// 数值越大越优先；仅用于候选排序，不参与置信度计算。
+    pub fn priority(&self) -> u8 {
+        match self {
+            AlignmentKind::Synonym => 3,
+            AlignmentKind::Normalized => 2,
+            AlignmentKind::Similarity => 1,
+            AlignmentKind::Structural => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AlignmentPair {
     pub source: String,
@@ -27,6 +43,142 @@ pub struct AlignmentPair {
     pub kind: AlignmentKind,
     pub confidence: f64,
     pub evidence: Vec<String>,
+}
+
+/// 一个术语的对齐决策状态：有唯一最佳、存在值得澄清的候选、或完全未知。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlignmentState {
+    #[default]
+    Unknown,
+    Resolved,
+    Ambiguous,
+}
+
+impl AlignmentState {
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            AlignmentState::Unknown => "未知",
+            AlignmentState::Resolved => "已解析",
+            AlignmentState::Ambiguous => "有歧义",
+        }
+    }
+}
+
+/// 候选格中的一个对齐候选（保留来源通道、置信度、证据与剖面下标）。
+#[derive(Debug, Clone)]
+pub struct AlignmentCandidate {
+    pub pair: AlignmentPair,
+    pub index: Option<usize>,
+}
+
+impl AlignmentCandidate {
+    pub fn target(&self) -> &str {
+        &self.pair.target
+    }
+
+    pub fn kind(&self) -> AlignmentKind {
+        self.pair.kind
+    }
+
+    pub fn confidence(&self) -> f64 {
+        self.pair.confidence
+    }
+}
+
+/// 对齐候选格：`resolve` 的 additive 版本，保留 top-k 而不是只留最佳。
+///
+/// 候选按「通道优先级 → 置信度降序 → 目标字典序」稳定排序，因此同样的
+/// 术语表与查询在任何调用顺序下都得到相同结果。`state` 只表达是否存在
+/// 值得进一步处理的歧义；答案级等价性可由 [`OntologyAligner::probe_answers`]
+/// 进一步消解（两种解释给出同一答案时不打扰用户）。
+#[derive(Debug, Clone)]
+pub struct AlignmentResolution {
+    pub source: String,
+    pub normalized: String,
+    pub state: AlignmentState,
+    pub ambiguity_margin: f64,
+    pub candidates: Vec<AlignmentCandidate>,
+}
+
+impl AlignmentResolution {
+    pub fn best(&self) -> Option<&AlignmentCandidate> {
+        self.candidates.first()
+    }
+
+    pub fn targets(&self) -> Vec<&str> {
+        self.candidates
+            .iter()
+            .map(AlignmentCandidate::target)
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    fn recompute_state(&mut self) {
+        self.state = Self::state_for(&self.candidates, self.ambiguity_margin);
+    }
+
+    fn state_for(
+        candidates: &[AlignmentCandidate],
+        ambiguity_margin: f64,
+    ) -> AlignmentState {
+        let Some(top) = candidates.first() else {
+            return AlignmentState::Unknown;
+        };
+        // 显式同义词/规范化是确定性映射：即使存在相似候选也不要求澄清。
+        if matches!(
+            top.pair.kind,
+            AlignmentKind::Synonym | AlignmentKind::Normalized
+        ) {
+            return AlignmentState::Resolved;
+        }
+        match candidates.get(1) {
+            Some(second)
+                if top.pair.confidence - second.pair.confidence <= ambiguity_margin =>
+            {
+                AlignmentState::Ambiguous
+            }
+            _ => AlignmentState::Resolved,
+        }
+    }
+
+    /// 过滤候选后重新计算状态（例如只保留本知识库中真实存在的谓词）。
+    pub fn retain<F>(&mut self, predicate: F)
+    where
+        F: FnMut(&AlignmentCandidate) -> bool,
+    {
+        self.candidates.retain(predicate);
+        self.recompute_state();
+    }
+}
+
+/// 单个候选在某一实体/问题下实际得到的答案集合。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateAnswers {
+    pub target: String,
+    pub answers: Vec<String>,
+}
+
+/// 带答案探测的对齐决策：先看候选，再用「两种解释是否给出同一答案」消解歧义。
+#[derive(Debug, Clone)]
+pub struct AlignmentDecision {
+    pub resolution: AlignmentResolution,
+    pub answers: Vec<CandidateAnswers>,
+    /// 与最佳候选分数接近的所有候选是否给出完全相同的答案集合。
+    pub equivalent_answers: bool,
+}
+
+impl AlignmentDecision {
+    pub fn best(&self) -> Option<&AlignmentCandidate> {
+        self.resolution.best()
+    }
+
+    /// 只有真正会改变答案的歧义才值得打扰用户。
+    pub fn should_clarify(&self) -> bool {
+        self.resolution.state == AlignmentState::Ambiguous
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -451,44 +603,63 @@ impl OntologyAligner {
         self.resolve_arc(term).map(|resolved| (*resolved).clone())
     }
 
-    fn resolve_with_index_uncached(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
-        let normalized = self.normalize(term);
-        if let Some(target) = self.synonym_chain(term, &normalized) {
-            let target_norm = self.normalize(&target);
-            if target_norm != normalized {
-                let idx = self.index.get(&target_norm).copied();
-                return Some((
-                    AlignmentPair {
-                        source: term.to_string(),
-                        target,
-                        kind: AlignmentKind::Synonym,
-                        confidence: 0.99,
-                        evidence: vec![format!("同义词映射 {} → {}", term, self.synonyms.get(term).map(|s| s.as_str()).unwrap_or(""))],
-                    },
-                    idx,
-                ));
-            }
+    fn synonym_candidate(
+        &self,
+        term: &str,
+        normalized: &str,
+    ) -> Option<(AlignmentPair, Option<usize>)> {
+        let target = self.synonym_chain(term, normalized)?;
+        let target_norm = self.normalize(&target);
+        if target_norm == normalized {
+            return None;
         }
+        Some((
+            AlignmentPair {
+                source: term.to_string(),
+                target,
+                kind: AlignmentKind::Synonym,
+                confidence: 0.99,
+                evidence: vec![format!(
+                    "同义词映射 {} → {}",
+                    term,
+                    self.synonyms.get(term).map(|s| s.as_str()).unwrap_or("")
+                )],
+            },
+            self.index.get(&target_norm).copied(),
+        ))
+    }
 
-        let self_idx = self.index.get(&normalized).copied();
-        if let Some(idx) = self_idx {
-            let canonical = self.profiles[idx].term.clone();
-            if canonical != term {
-                return Some((
-                    AlignmentPair {
-                        source: term.to_string(),
-                        target: canonical.clone(),
-                        kind: AlignmentKind::Normalized,
-                        confidence: 0.98,
-                        evidence: vec![format!("规范化后与「{}」相同", canonical)],
-                    },
-                    Some(idx),
-                ));
-            }
+    fn normalized_candidate(
+        &self,
+        term: &str,
+        normalized: &str,
+    ) -> Option<(AlignmentPair, Option<usize>)> {
+        let idx = self.index.get(normalized).copied()?;
+        let canonical = self.profiles[idx].term.clone();
+        if canonical == term {
+            return None;
         }
+        Some((
+            AlignmentPair {
+                source: term.to_string(),
+                target: canonical.clone(),
+                kind: AlignmentKind::Normalized,
+                confidence: 0.98,
+                evidence: vec![format!("规范化后与「{}」相同", canonical)],
+            },
+            Some(idx),
+        ))
+    }
 
-        let mut best_similarity: Option<(f64, usize)> = None;
-        let mut query_keys = Self::bigram_keys(&normalized);
+    /// 全部字面相似候选（按相似度降序、剖面下标升序）。
+    /// `resolve` 取第一个；候选格保留全部，供歧义判定。
+    fn similarity_candidates(
+        &self,
+        normalized: &str,
+        self_idx: Option<usize>,
+    ) -> Vec<(f64, usize)> {
+        let mut found: Vec<(f64, usize)> = Vec::new();
+        let mut query_keys = Self::bigram_keys(normalized);
         query_keys.sort_unstable();
         let query_len = normalized.chars().count();
         let query_key_len = query_keys.len();
@@ -526,18 +697,98 @@ impl OntologyAligner {
                 }
             }
             let sim = self.similarity_normalized_with_keys(
-                &normalized,
+                normalized,
                 &query_keys,
                 &self.profile_norms[i],
                 &self.profile_keys[i],
             );
-            if sim >= self.similarity_threshold
-                && best_similarity.map_or(true, |(b, _)| sim > b)
-            {
-                best_similarity = Some((sim, i));
+            if sim >= self.similarity_threshold {
+                found.push((sim, i));
             }
         }
-        if let Some((sim, i)) = best_similarity {
+        found.sort_by(|(left_score, left_index), (right_score, right_index)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        found
+    }
+
+    /// 全部结构相似候选（按置信度降序、剖面下标升序）。
+    fn structural_candidates(
+        &self,
+        self_idx: Option<usize>,
+    ) -> Vec<(f64, usize, Vec<String>)> {
+        let Some(idx) = self_idx else {
+            return Vec::new();
+        };
+        let profile = &self.profiles[idx];
+        let mut found: Vec<(f64, usize, Vec<String>)> = Vec::new();
+        let scan_end = idx + 1;
+        let own_degree = profile.neighbors.len();
+        for (i, other) in self.profiles.iter().enumerate().take(scan_end) {
+            if i == idx || other.kind != profile.kind {
+                continue;
+            }
+            let other_degree = other.neighbors.len();
+            // 长度上界剪枝：共享数不可能达到下限或 Jaccard 不可能达标时跳过
+            let (smaller, larger) = if own_degree <= other_degree {
+                (own_degree, other_degree)
+            } else {
+                (other_degree, own_degree)
+            };
+            if smaller < self.structural_min_shared
+                || (smaller as f64) < self.structural_min_jaccard * (larger as f64)
+            {
+                continue;
+            }
+            let shared_count = profile.neighbors.intersection(&other.neighbors).count();
+            if shared_count < self.structural_min_shared {
+                continue;
+            }
+            // |A∪B| = |A| + |B| − |A∩B|
+            let union = own_degree + other_degree - shared_count;
+            if union == 0 {
+                continue;
+            }
+            let jaccard = shared_count as f64 / union as f64;
+            if jaccard < self.structural_min_jaccard {
+                continue;
+            }
+            let confidence = (0.5 + 0.5 * jaccard).min(0.95);
+            let mut evidence: Vec<String> = profile
+                .neighbors
+                .intersection(&other.neighbors)
+                .take(3)
+                .map(|n| format!("共同关系「{}」", n))
+                .collect();
+            evidence.push(format!("Jaccard {:.2}", jaccard));
+            found.push((confidence, i, evidence));
+        }
+        found.sort_by(|(left_score, left_index, _), (right_score, right_index, _)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        found
+    }
+
+    fn resolve_with_index_uncached(&self, term: &str) -> Option<(AlignmentPair, Option<usize>)> {
+        let normalized = self.normalize(term);
+        if let Some(candidate) = self.synonym_candidate(term, &normalized) {
+            return Some(candidate);
+        }
+        if let Some(candidate) = self.normalized_candidate(term, &normalized) {
+            return Some(candidate);
+        }
+        let self_idx = self.index.get(&normalized).copied();
+        if let Some((sim, i)) = self
+            .similarity_candidates(&normalized, self_idx)
+            .into_iter()
+            .next()
+        {
             return Some((
                 AlignmentPair {
                     source: term.to_string(),
@@ -549,75 +800,181 @@ impl OntologyAligner {
                 Some(i),
             ));
         }
-
-        if let Some(profile) = self_idx.map(|i| &self.profiles[i]) {
-            let mut best_structural: Option<(f64, usize, Vec<String>)> = None;
-            let structural_scan_end = self_idx.map_or(self.profiles.len(), |i| i + 1);
-            let own_degree = profile.neighbors.len();
-            for (i, other) in self.profiles.iter().enumerate().take(structural_scan_end) {
-                if Some(i) == self_idx || other.kind != profile.kind {
-                    continue;
-                }
-                let other_degree = other.neighbors.len();
-                // 长度上界剪枝：共享数不可能达到下限或 Jaccard 不可能达标时跳过
-                let (smaller, larger) = if own_degree <= other_degree {
-                    (own_degree, other_degree)
-                } else {
-                    (other_degree, own_degree)
-                };
-                if smaller < self.structural_min_shared
-                    || (smaller as f64) < self.structural_min_jaccard * (larger as f64)
-                {
-                    continue;
-                }
-                // 先统计交集大小，胜出后再重建证据
-                let shared_count = profile.neighbors.intersection(&other.neighbors).count();
-                if shared_count < self.structural_min_shared {
-                    continue;
-                }
-                // |A∪B| = |A| + |B| − |A∩B|
-                let union = own_degree + other_degree - shared_count;
-                if union == 0 {
-                    continue;
-                }
-                let jaccard = shared_count as f64 / union as f64;
-                if jaccard < self.structural_min_jaccard {
-                    continue;
-                }
-                let confidence = (0.5 + 0.5 * jaccard).min(0.95);
-                if best_structural
-                    .as_ref()
-                    .map_or(true, |(b, _, _)| confidence > *b)
-                {
-                    let mut evidence: Vec<String> = profile
-                        .neighbors
-                        .intersection(&other.neighbors)
-                        .take(3)
-                        .map(|n| format!("共同关系「{}」", n))
-                        .collect();
-                    evidence.push(format!("Jaccard {:.2}", jaccard));
-                    best_structural = Some((confidence, i, evidence));
-                }
-            }
-            if let Some((confidence, i, evidence)) = best_structural {
-                return Some((
-                    AlignmentPair {
-                        source: term.to_string(),
-                        target: self.profiles[i].term.clone(),
-                        kind: AlignmentKind::Structural,
-                        confidence,
-                        evidence,
-                    },
-                    Some(i),
-                ));
-            }
+        if let Some((confidence, i, evidence)) = self
+            .structural_candidates(self_idx)
+            .into_iter()
+            .next()
+        {
+            return Some((
+                AlignmentPair {
+                    source: term.to_string(),
+                    target: self.profiles[i].term.clone(),
+                    kind: AlignmentKind::Structural,
+                    confidence,
+                    evidence,
+                },
+                Some(i),
+            ));
         }
-
         None
     }
 
     pub fn resolve(&self, term: &str) -> Option<AlignmentPair> {
         self.resolve_with_index(term).map(|(pair, _)| pair)
+    }
+
+    /// 返回 top-k 对齐候选格（additive：不改变 [`Self::resolve`] 的结果）。
+    ///
+    /// 候选来源与 `resolve` 完全一致；同一目标只保留最高优先级的证据。
+    /// `limit == 0` 时按 1 处理，保证非未知术语至少有一个候选。
+    pub fn resolve_candidates(&self, term: &str, limit: usize) -> AlignmentResolution {
+        let normalized = self.normalize(term);
+        let self_idx = self.index.get(&normalized).copied();
+        let mut candidates: Vec<AlignmentCandidate> = Vec::new();
+        if let Some((pair, index)) = self.synonym_candidate(term, &normalized) {
+            candidates.push(AlignmentCandidate { pair, index });
+        }
+        if let Some((pair, index)) = self.normalized_candidate(term, &normalized) {
+            candidates.push(AlignmentCandidate { pair, index });
+        }
+        for (sim, i) in self.similarity_candidates(&normalized, self_idx) {
+            candidates.push(AlignmentCandidate {
+                pair: AlignmentPair {
+                    source: term.to_string(),
+                    target: self.profiles[i].term.clone(),
+                    kind: AlignmentKind::Similarity,
+                    confidence: sim,
+                    evidence: vec![format!("字面相似度 {:.2}", sim)],
+                },
+                index: Some(i),
+            });
+        }
+        for (confidence, i, evidence) in self.structural_candidates(self_idx) {
+            candidates.push(AlignmentCandidate {
+                pair: AlignmentPair {
+                    source: term.to_string(),
+                    target: self.profiles[i].term.clone(),
+                    kind: AlignmentKind::Structural,
+                    confidence,
+                    evidence,
+                },
+                index: Some(i),
+            });
+        }
+
+        // 同一目标只留证据最强的一条；显式通道优先于模糊通道。
+        let mut deduped: HashMap<String, AlignmentCandidate> = HashMap::new();
+        for candidate in candidates {
+            let target = candidate.pair.target.clone();
+            match deduped.get(&target) {
+                Some(existing)
+                    if existing.pair.kind.priority() > candidate.pair.kind.priority()
+                        || (existing.pair.kind.priority() == candidate.pair.kind.priority()
+                            && existing.pair.confidence >= candidate.pair.confidence) => {}
+                _ => {
+                    deduped.insert(target, candidate);
+                }
+            }
+        }
+        let mut candidates: Vec<AlignmentCandidate> = deduped.into_values().collect();
+        candidates.sort_by(|left, right| {
+            right
+                .pair
+                .kind
+                .priority()
+                .cmp(&left.pair.kind.priority())
+                .then_with(|| {
+                    right
+                        .pair
+                        .confidence
+                        .partial_cmp(&left.pair.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.pair.target.cmp(&right.pair.target))
+        });
+        candidates.truncate(limit.max(1));
+
+        let state = AlignmentResolution::state_for(&candidates, DEFAULT_AMBIGUITY_MARGIN);
+        AlignmentResolution {
+            source: term.to_string(),
+            normalized,
+            state,
+            ambiguity_margin: DEFAULT_AMBIGUITY_MARGIN,
+            candidates,
+        }
+    }
+
+    /// 用答案探测消解候选歧义：与最佳候选分数接近的解释若给出同一答案，
+    /// 则静默采用最佳候选；只有答案集合确实不同才保留 `Ambiguous`。
+    pub fn probe_answers<F>(
+        &self,
+        resolution: AlignmentResolution,
+        probe: F,
+    ) -> AlignmentDecision
+    where
+        F: Fn(&str) -> Vec<String>,
+    {
+        let mut resolution = resolution;
+        let answers: Vec<CandidateAnswers> = resolution
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let mut values = probe(candidate.target());
+                values.sort();
+                values.dedup();
+                CandidateAnswers {
+                    target: candidate.target().to_string(),
+                    answers: values,
+                }
+            })
+            .collect();
+
+        let top_confidence = resolution
+            .candidates
+            .first()
+            .map(AlignmentCandidate::confidence)
+            .unwrap_or(0.0);
+        let contenders: Vec<&CandidateAnswers> = answers
+            .iter()
+            .filter(|answer| {
+                resolution
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.target() == answer.target)
+                    .map(|candidate| {
+                        top_confidence - candidate.confidence() <= resolution.ambiguity_margin
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        let equivalent_answers = contenders.windows(2).all(|pair| pair[0].answers == pair[1].answers);
+        let non_empty = contenders
+            .iter()
+            .filter(|answer| !answer.answers.is_empty())
+            .count();
+
+        // 等价的解释不构成歧义；只有一种解释有答案时也优先作答而不是追问。
+        if resolution.state == AlignmentState::Ambiguous && (equivalent_answers || non_empty < 2) {
+            resolution.state = AlignmentState::Resolved;
+        }
+        AlignmentDecision {
+            resolution,
+            answers,
+            equivalent_answers,
+        }
+    }
+
+    /// 对所有术语做候选扫描，返回有歧义的项（确定性顺序，供诊断报告）。
+    pub fn ambiguous_terms(&self, limit: usize) -> Vec<AlignmentResolution> {
+        let mut found: Vec<AlignmentResolution> = self
+            .profiles
+            .iter()
+            .map(|profile| self.resolve_candidates(&profile.term, 3))
+            .filter(|resolution| resolution.state == AlignmentState::Ambiguous)
+            .collect();
+        found.sort_by(|left, right| left.source.cmp(&right.source));
+        found.truncate(limit.max(1));
+        found
     }
 
     pub fn canonical_form(&self, term: &str) -> String {
@@ -851,5 +1208,96 @@ mod tests {
         let aligner = OntologyAligner::new(synonyms(), 0.95);
         assert!(aligner.resolve("完全不存在的术语").is_none());
         assert_eq!(aligner.canonical_form("完全不存在的术语"), "完全不存在的术语");
+    }
+
+    fn ambiguous_aligner() -> OntologyAligner {
+        let mut aligner = OntologyAligner::new(HashMap::new(), 0.5);
+        aligner.register_term("苹果公司", TermKind::Entity);
+        aligner.register_term("苹果果实", TermKind::Entity);
+        aligner
+    }
+
+    #[test]
+    fn test_candidate_lattice_keeps_top_k_and_matches_resolve() {
+        let aligner = ambiguous_aligner();
+        let resolution = aligner.resolve_candidates("苹果", 5);
+        assert_eq!(resolution.state, AlignmentState::Ambiguous);
+        assert_eq!(resolution.targets(), vec!["苹果公司", "苹果果实"]);
+        assert_eq!(
+            aligner.resolve("苹果").map(|pair| pair.target),
+            resolution.best().map(|candidate| candidate.target().to_string())
+        );
+        assert!(resolution
+            .candidates
+            .iter()
+            .all(|candidate| candidate.confidence() >= 0.5));
+    }
+
+    #[test]
+    fn test_candidate_lattice_is_deterministic_and_explicit_channel_wins() {
+        let aligner = OntologyAligner::new(synonyms(), 0.72);
+        let first = aligner.resolve_candidates("老婆", 5);
+        let second = aligner.resolve_candidates("老婆", 5);
+        assert_eq!(first.targets(), second.targets());
+        let best = first.best().expect("同义词应产生候选");
+        assert_eq!(best.target(), "妻子");
+        assert_eq!(best.kind(), AlignmentKind::Synonym);
+        assert_eq!(first.state, AlignmentState::Resolved);
+    }
+
+    #[test]
+    fn test_answer_probe_collapses_equivalent_candidates() {
+        let aligner = ambiguous_aligner();
+        let resolution = aligner.resolve_candidates("苹果", 5);
+        let decision = aligner.probe_answers(resolution, |_| vec!["同一答案".to_string()]);
+        assert!(decision.equivalent_answers);
+        assert_eq!(decision.resolution.state, AlignmentState::Resolved);
+        assert!(!decision.should_clarify());
+        assert_eq!(decision.answers.len(), decision.resolution.candidates.len());
+    }
+
+    #[test]
+    fn test_answer_probe_keeps_ambiguous_when_answers_differ() {
+        let aligner = ambiguous_aligner();
+        let resolution = aligner.resolve_candidates("苹果", 5);
+        let decision =
+            aligner.probe_answers(resolution, |target| vec![target.to_string()]);
+        assert!(!decision.equivalent_answers);
+        assert_eq!(decision.resolution.state, AlignmentState::Ambiguous);
+        assert!(decision.should_clarify());
+        assert!(decision
+            .answers
+            .iter()
+            .all(|answer| !answer.answers.is_empty()));
+    }
+
+    #[test]
+    fn test_answer_probe_does_not_ask_when_only_one_interpretation_has_answers() {
+        let aligner = ambiguous_aligner();
+        let resolution = aligner.resolve_candidates("苹果", 5);
+        let decision = aligner.probe_answers(resolution, |target| {
+            if target == "苹果公司" {
+                vec!["库比蒂诺".to_string()]
+            } else {
+                Vec::new()
+            }
+        });
+        assert!(!decision.equivalent_answers);
+        assert_eq!(decision.resolution.state, AlignmentState::Resolved);
+        assert!(!decision.should_clarify());
+    }
+
+    #[test]
+    fn test_ambiguous_terms_report_is_deterministic() {
+        let mut aligner = OntologyAligner::new(HashMap::new(), 0.99);
+        for subject in ["甲", "乙", "丙"] {
+            aligner.observe_triple(subject, "关系", "目标一");
+            aligner.observe_triple(subject, "关系", "目标二");
+        }
+        let terms = aligner.ambiguous_terms(10);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].source, "丙");
+        assert_eq!(terms[0].state, AlignmentState::Ambiguous);
+        assert_eq!(aligner.ambiguous_terms(10)[0].targets(), terms[0].targets());
     }
 }

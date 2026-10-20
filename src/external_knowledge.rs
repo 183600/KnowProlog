@@ -1,7 +1,11 @@
 use reqwest;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::OnceLock;
+
+use crate::ontology_alignment::{AlignmentKind, OntologyAligner, TermKind};
+use crate::query_planner::{QueryPlan, QueryPlanner};
 
 use crate::external_ledger::{ExternalLedger, LedgerLoad, LedgerLookup};
 use crate::perf_ledger::PerfLedger;
@@ -488,6 +492,24 @@ impl ExternalKnowledgeService {
                 }
             }
         }
+
+        // 通用属性：从问句里取出属性词面，再与外部 AVP 键做符号对齐。
+        // 只在候选给出同一答案时采纳；真正有歧义时返回 None，让上层回退到
+        // 实体描述，绝不把不确定的外部属性静默当成本地事实。
+        if let Some(attribute) = asked_attribute(question) {
+            if let Some((values, _kind, _confidence)) =
+                align_external_attribute(&attribute, &knowledge.avp)
+            {
+                if !values.is_empty() {
+                    return format!(
+                        "{}的{}是{}",
+                        knowledge.entity,
+                        attribute.trim(),
+                        values.join("、")
+                    );
+                }
+            }
+        }
         
         // Default response with entity description
         if let Some(desc) = &knowledge.desc {
@@ -496,6 +518,81 @@ impl ExternalKnowledgeService {
             format!("找到了关于{}的信息", knowledge.entity)
         }
     }
+}
+
+/// 从单跳属性问句中取出属性词面（复用逻辑查询计划，不另造中文模板）。
+fn asked_attribute(question: &str) -> Option<String> {
+    let plan = QueryPlanner::new().parse(question)?;
+    match plan {
+        // 只处理"X 的 P 是什么"这类单跳属性问句；计数/存在/反问
+        // 需要不同的答案模板，不能套用"X 的 P 是 V"。
+        QueryPlan::FindObject { segments } if segments.len() >= 2 => {
+            segments.last().cloned()
+        }
+        _ => None,
+    }
+}
+
+/// 把问句属性对齐到外部 AVP 键：精确归一优先，其次字面相似；
+/// 候选答案不同则拒绝猜测（返回 None）。
+fn align_external_attribute(
+    attribute: &str,
+    avp: &[(String, String)],
+) -> Option<(Vec<String>, AlignmentKind, f64)> {
+    if avp.is_empty() {
+        return None;
+    }
+    let mut aligner = OntologyAligner::new(HashMap::new(), 0.72);
+    for (key, _) in avp {
+        aligner.register_term(key, TermKind::Attribute);
+    }
+    let normalized = aligner.normalize(attribute);
+    if let Some((key, _)) = avp
+        .iter()
+        .find(|(key, _)| aligner.normalize(key) == normalized)
+    {
+        let values = avp
+            .iter()
+            .filter(|(other, _)| other == key)
+            .map(|(_, value)| value.clone())
+            .collect();
+        return Some((values, AlignmentKind::Normalized, 1.0));
+    }
+
+    let resolution = aligner.resolve_candidates(attribute, 4);
+    if resolution.is_empty() {
+        return None;
+    }
+    let decision = aligner.probe_answers(resolution, |target| {
+        avp.iter()
+            .filter(|(key, _)| key == target)
+            .map(|(_, value)| value.clone())
+            .collect()
+    });
+    if decision.should_clarify() {
+        return None;
+    }
+    let best = decision.best()?;
+    let values = avp
+        .iter()
+        .filter(|(key, _)| key == best.target())
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        // 最佳候选没有取值时，选择第一个确有取值的等价候选。
+        let answer = decision.answers.iter().find(|answer| !answer.answers.is_empty())?;
+        let candidate = decision
+            .resolution
+            .candidates
+            .iter()
+            .find(|candidate| candidate.target() == answer.target)?;
+        return Some((
+            answer.answers.clone(),
+            candidate.kind(),
+            candidate.confidence(),
+        ));
+    }
+    Some((values, best.kind(), best.confidence()))
 }
 
 /// 网络失败 / 响应不可解析时的过期名册兜底（低置信）。
@@ -704,5 +801,68 @@ mod tests {
             Some("法国的首都是巴黎")
         );
         assert_eq!(get_direct_answer("完全无关的话"), None);
+    }
+
+    #[test]
+    fn format_answer_aligns_generic_external_attribute() {
+        let knowledge = KnowledgeData {
+            entity: "姚明".to_string(),
+            desc: None,
+            avp: vec![
+                ("国籍".to_string(), "中国".to_string()),
+                ("出生地点".to_string(), "上海".to_string()),
+            ],
+            tag: Vec::new(),
+        };
+        assert_eq!(
+            ExternalKnowledgeService::format_answer("姚明的国籍是什么？", &knowledge),
+            "姚明的国籍是中国"
+        );
+        assert_eq!(
+            ExternalKnowledgeService::format_answer("姚明的出生地是哪里？", &knowledge),
+            "姚明的出生地是上海"
+        );
+    }
+
+    #[test]
+    fn format_answer_accepts_equivalent_external_attribute_candidates() {
+        let knowledge = KnowledgeData {
+            entity: "姚明".to_string(),
+            desc: None,
+            avp: vec![
+                ("出生地点".to_string(), "上海".to_string()),
+                ("出生地址".to_string(), "上海".to_string()),
+            ],
+            tag: Vec::new(),
+        };
+        assert_eq!(
+            ExternalKnowledgeService::format_answer("姚明的出生地是哪里？", &knowledge),
+            "姚明的出生地是上海"
+        );
+    }
+
+    #[test]
+    fn format_answer_refuses_ambiguous_external_attribute() {
+        let knowledge = KnowledgeData {
+            entity: "姚明".to_string(),
+            desc: Some("篮球运动员".to_string()),
+            avp: vec![
+                ("出生地点".to_string(), "上海".to_string()),
+                ("出生地址".to_string(), "北京".to_string()),
+            ],
+            tag: Vec::new(),
+        };
+        assert_eq!(
+            ExternalKnowledgeService::format_answer("姚明的出生地是哪里？", &knowledge),
+            "关于姚明：篮球运动员",
+            "答案不同的属性候选不应被静默猜成其中一条"
+        );
+    }
+
+    #[test]
+    fn asked_attribute_reuses_query_plan() {
+        assert_eq!(asked_attribute("姚明的国籍是什么？").as_deref(), Some("国籍"));
+        assert_eq!(asked_attribute("李四有几个师傅？"), None);
+        assert_eq!(asked_attribute("今天天气不错"), None);
     }
 }
