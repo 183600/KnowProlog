@@ -85,7 +85,10 @@ impl QueryPlanner {
         }
 
         let path_question = Self::strip_particles(&raw);
-        if let Some(plan) = self.parse_path_question(&path_question) {
+        if let Some(mut plan) = self.parse_path_question(&path_question) {
+            if let Some(limit) = Self::parse_hop_limit(&path_question) {
+                Self::apply_hop_limit(&mut plan, limit);
+            }
             return Some(plan);
         }
 
@@ -435,6 +438,92 @@ impl QueryPlanner {
             return Some(plan);
         }
         self.parse_path_between(q)
+    }
+
+    fn parse_hop_limit(q: &str) -> Option<usize> {
+        for marker in ["最多", "不超过", "至多"] {
+            let Some(position) = q.find(marker) else {
+                continue;
+            };
+            let rest = q[position + marker.len()..].trim_start();
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || Self::chinese_digit(*c).is_some())
+                .collect();
+            if digits.is_empty() || !rest[digits.len()..].contains('跳') {
+                continue;
+            }
+            if let Some(limit) = Self::parse_hop_number(&digits) {
+                return Some(limit.clamp(1, 6));
+            }
+        }
+        for suffix in ["跳以内", "跳之内", "跳内"] {
+            let Some(position) = q.find(suffix) else {
+                continue;
+            };
+            let before = q[..position].trim_end();
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_ascii_digit() && Self::chinese_digit(*c).is_none())
+                .map_or(0, |(index, c)| index + c.len_utf8());
+            let digits = &before[start..];
+            if let Some(limit) = Self::parse_hop_number(digits) {
+                return Some(limit.clamp(1, 6));
+            }
+        }
+        None
+    }
+
+    fn chinese_digit(c: char) -> Option<usize> {
+        Some(match c {
+            '零' => 0,
+            '一' => 1,
+            '二' | '两' => 2,
+            '三' => 3,
+            '四' => 4,
+            '五' => 5,
+            '六' => 6,
+            '七' => 7,
+            '八' => 8,
+            '九' => 9,
+            _ => return None,
+        })
+    }
+
+    fn parse_hop_number(text: &str) -> Option<usize> {
+        if text.is_empty() {
+            return None;
+        }
+        if text.chars().all(|c| c.is_ascii_digit()) {
+            return text.parse().ok();
+        }
+        let mut total = 0usize;
+        let mut current: Option<usize> = None;
+        for c in text.chars() {
+            if c == '十' {
+                total += current.take().unwrap_or(1) * 10;
+            } else if let Some(digit) = Self::chinese_digit(c) {
+                if current.is_some() {
+                    return None;
+                }
+                current = Some(digit);
+            } else {
+                return None;
+            }
+        }
+        if let Some(current) = current {
+            total += current;
+        }
+        (total > 0).then_some(total)
+    }
+
+    fn apply_hop_limit(plan: &mut QueryPlan, limit: usize) {
+        match plan {
+            QueryPlan::PathBetween { max_hops, .. }
+            | QueryPlan::Intermediary { max_hops, .. } => *max_hops = limit,
+            _ => {}
+        }
     }
 
     fn parse_common_neighbor(&self, q: &str) -> Option<QueryPlan> {
@@ -1220,6 +1309,54 @@ mod tests {
             QueryPlan::PathBetween {
                 start: "张三".to_string(),
                 goal: "王五".to_string(),
+                max_hops: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_explicit_hop_limit_overrides_default() {
+        let plan = planner()
+            .parse("张三和李四之间最多 2 跳是什么关系")
+            .expect("路径问句");
+        assert_eq!(
+            plan,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "李四".to_string(),
+                max_hops: 2,
+            }
+        );
+        let chinese = planner()
+            .parse("张三和王五之间最多三跳的中间人是谁")
+            .expect("中间人问句");
+        assert_eq!(
+            chinese,
+            QueryPlan::Intermediary {
+                start: "张三".to_string(),
+                goal: "王五".to_string(),
+                max_hops: 3,
+            }
+        );
+        let suffix = planner()
+            .parse("张三和李四之间三跳以内是什么关系")
+            .expect("跳数后缀");
+        assert_eq!(
+            suffix,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "李四".to_string(),
+                max_hops: 3,
+            }
+        );
+        let default = planner()
+            .parse("张三和李四之间是什么关系")
+            .expect("默认路径问句");
+        assert_eq!(
+            default,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "李四".to_string(),
                 max_hops: 4,
             }
         );
