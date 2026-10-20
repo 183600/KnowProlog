@@ -35,10 +35,21 @@ const PUNCTUATION: &[char] = &[
     '）', '[', ']', '【', '】', '《', '》', '“', '”', '"', '\'', '\n', '\r', '\t',
 ];
 const LEADING_DISCOURSE: &[&str] = &[
-    "后来", "随后", "之后", "此前", "当时", "于是", "因此", "但是", "不过", "而且", "并且",
-    "同时", "如今", "过去", "从前", "据说", "听说",
+    "后来", "随后", "之后", "此前", "当时", "于是", "因此", "但是", "不过", "而且", "并且", "同时",
+    "如今", "过去", "从前", "据说", "听说",
 ];
-const INGEST_PREFIXES: &[&str] = &["录入：", "录入:", "添加：", "添加:", "新增：", "新增:", "记录：", "记录:", "导入：", "导入:"];
+const INGEST_PREFIXES: &[&str] = &[
+    "录入：",
+    "录入:",
+    "添加：",
+    "添加:",
+    "新增：",
+    "新增:",
+    "记录：",
+    "记录:",
+    "导入：",
+    "导入:",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,7 +187,10 @@ pub fn parse_feedback(text: &str) -> (Vec<ConstructionFeedback>, Vec<String>) {
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() != 4 {
-            errors.push(format!("第 {} 行：需要「确认/否认 主语 谓词 宾语」", index + 1));
+            errors.push(format!(
+                "第 {} 行：需要「确认/否认 主语 谓词 宾语」",
+                index + 1
+            ));
             continue;
         }
         let confirmed = match fields[0] {
@@ -214,7 +228,10 @@ pub struct SurfacePattern {
 
 impl SurfacePattern {
     pub fn render_template(&self) -> String {
-        format!("{} {{subject}}{}{{object}}{}", self.predicate, self.middle, self.suffix)
+        format!(
+            "{} {{subject}}{}{{object}}{}",
+            self.predicate, self.middle, self.suffix
+        )
     }
 
     pub fn render_text(&self) -> String {
@@ -307,7 +324,11 @@ impl ConstructionCandidate {
         if !self.review_reasons.is_empty() {
             output.push_str(&format!(
                 " ｜ 复核：{}",
-                self.review_reasons.iter().cloned().collect::<Vec<_>>().join("；")
+                self.review_reasons
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("；")
             ));
         }
         for sentence in self.sentences.iter().take(4) {
@@ -376,7 +397,8 @@ impl ConstructionReport {
             self.extraction.frames,
             self.extraction.parse_errors
         ));
-        let active: Vec<&SurfacePattern> = self.patterns.iter().filter(|item| item.active).collect();
+        let active: Vec<&SurfacePattern> =
+            self.patterns.iter().filter(|item| item.active).collect();
         if !active.is_empty() {
             lines.push(String::new());
             lines.push("激活模式：".to_string());
@@ -477,16 +499,8 @@ impl WeakConstructor {
     ) -> ConstructionReport {
         let mut feedback_map: BTreeMap<(String, String, String), bool> = BTreeMap::new();
         for item in feedback {
-            let edge = canonical_edge(
-                &item.subject,
-                &item.predicate,
-                &item.object,
-                &self.registry,
-            );
-            feedback_map.insert(
-                (edge.subject, edge.predicate, edge.object),
-                item.confirmed,
-            );
+            let edge = canonical_edge(&item.subject, &item.predicate, &item.object, &self.registry);
+            feedback_map.insert((edge.subject, edge.predicate, edge.object), item.confirmed);
         }
         let sentences = split_sentences(corpus);
         let (mut patterns, aligned_edges) =
@@ -503,10 +517,16 @@ impl WeakConstructor {
         let mut proposals: BTreeMap<(String, String), MintProposal> = BTreeMap::new();
         for ((subject, predicate, object), accumulator) in candidates {
             let key = (subject.clone(), predicate.clone(), object.clone());
-            let candidate =
-                self.finalize(&subject, &predicate, &object, accumulator, feedback_map.get(&key).copied());
+            let candidate = self.finalize(
+                &subject,
+                &predicate,
+                &object,
+                accumulator,
+                feedback_map.get(&key).copied(),
+            );
             if candidate.decision != CandidateDecision::Rejected {
-                for (role, surface) in [("主语", &candidate.subject), ("宾语", &candidate.object)] {
+                for (role, surface) in [("主语", &candidate.subject), ("宾语", &candidate.object)]
+                {
                     if self.nodes.contains(surface) {
                         continue;
                     }
@@ -554,9 +574,10 @@ impl WeakConstructor {
             if candidate.decision != CandidateDecision::Accepted {
                 continue;
             }
-            let Some(pattern) = patterns.iter().find(|pattern| {
-                pattern.active && pattern.predicate == candidate.predicate
-            }) else {
+            let Some(pattern) = patterns
+                .iter()
+                .find(|pattern| pattern.active && pattern.predicate == candidate.predicate)
+            else {
                 continue;
             };
             generations.push(GeneratedUtterance {
@@ -606,7 +627,12 @@ impl WeakConstructor {
         candidates: &mut BTreeMap<(String, String, String), CandidateAccumulator>,
     ) {
         for frame in frames {
-            let edge = canonical_edge(&frame.subject, &frame.predicate, &frame.object, &self.registry);
+            let edge = canonical_edge(
+                &frame.subject,
+                &frame.predicate,
+                &frame.object,
+                &self.registry,
+            );
             if edge.subject.is_empty() || edge.object.is_empty() || edge.subject == edge.object {
                 continue;
             }
@@ -616,7 +642,9 @@ impl WeakConstructor {
                 edge.object.clone(),
             );
             let accumulator = candidates.entry(key).or_default();
-            accumulator.sentences.insert(frame.evidence.sentence.clone());
+            accumulator
+                .sentences
+                .insert(frame.evidence.sentence.clone());
             if frame.polarity == Polarity::Negative {
                 accumulator.rebuttals.insert(HardRebuttal::ExplicitNegative);
                 continue;
@@ -628,10 +656,9 @@ impl WeakConstructor {
                 accumulator.families.insert(EvidenceFamily::Proposition);
             }
             if frame.modality != Modality::Asserted {
-                accumulator.review_reasons.insert(format!(
-                    "模态「{}」不进入断言事实",
-                    frame.modality.label()
-                ));
+                accumulator
+                    .review_reasons
+                    .insert(format!("模态「{}」不进入断言事实", frame.modality.label()));
             }
             if let Some(temporal) = &frame.temporal {
                 accumulator.review_reasons.insert(format!(
@@ -656,11 +683,7 @@ impl WeakConstructor {
                 let Some((subject, object)) = match_pattern(pattern, sentence) else {
                     continue;
                 };
-                let key = (
-                    subject.clone(),
-                    pattern.predicate.clone(),
-                    object.clone(),
-                );
+                let key = (subject.clone(), pattern.predicate.clone(), object.clone());
                 let accumulator = candidates.entry(key).or_default();
                 accumulator.families.insert(EvidenceFamily::SurfacePattern);
                 accumulator.patterns.insert(pattern.id.clone());
@@ -669,7 +692,9 @@ impl WeakConstructor {
                     accumulator.rebuttals.insert(HardRebuttal::ExplicitNegative);
                 }
                 if has_speculation(sentence) {
-                    accumulator.review_reasons.insert("传闻/可能语气不进入断言事实".to_string());
+                    accumulator
+                        .review_reasons
+                        .insert("传闻/可能语气不进入断言事实".to_string());
                 }
                 if let Some(temporal) = crate::relation_frame::parse_temporal(sentence) {
                     accumulator.review_reasons.insert(format!(
@@ -991,13 +1016,33 @@ fn endpoint_ok(value: &str) -> bool {
     if length < MIN_ENDPOINT_CHARS || length > MAX_ENDPOINT_CHARS {
         return false;
     }
-    if value.chars().any(|ch| ch.is_whitespace() || PUNCTUATION.contains(&ch)) {
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || PUNCTUATION.contains(&ch))
+    {
         return false;
     }
     !matches!(
         value,
-        "的" | "是" | "了" | "和" | "与" | "及" | "在" | "有" | "为" | "把" | "被" | "他"
-            | "她" | "它" | "这" | "那" | "其" | "我" | "你" | "您"
+        "的" | "是"
+            | "了"
+            | "和"
+            | "与"
+            | "及"
+            | "在"
+            | "有"
+            | "为"
+            | "把"
+            | "被"
+            | "他"
+            | "她"
+            | "它"
+            | "这"
+            | "那"
+            | "其"
+            | "我"
+            | "你"
+            | "您"
     )
 }
 
@@ -1059,7 +1104,17 @@ fn skip_leading_discourse(sentence: &str) -> usize {
 
 fn has_negation(text: &str) -> bool {
     for cue in [
-        "不是", "并非", "没有", "不属于", "不在", "未曾", "从未", "从不", "尚未", "未能", "无法",
+        "不是",
+        "并非",
+        "没有",
+        "不属于",
+        "不在",
+        "未曾",
+        "从未",
+        "从不",
+        "尚未",
+        "未能",
+        "无法",
     ] {
         if text.contains(cue) {
             return true;
@@ -1081,9 +1136,18 @@ fn has_negation(text: &str) -> bool {
 }
 
 fn has_speculation(text: &str) -> bool {
-    ["可能", "也许", "大概", "据说", "听说", "据称", "未必", "不一定"]
-        .iter()
-        .any(|cue| text.contains(cue))
+    [
+        "可能",
+        "也许",
+        "大概",
+        "据说",
+        "听说",
+        "据称",
+        "未必",
+        "不一定",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
 }
 
 fn split_sentences(text: &str) -> Vec<&str> {
@@ -1124,9 +1188,7 @@ fn edges_from_facts(facts: &[PrologFact], registry: &PredicateRegistry) -> Vec<F
     for fact in facts {
         match fact {
             PrologFact::Entity {
-                name,
-                properties,
-                ..
+                name, properties, ..
             } => {
                 for (predicate, value) in properties {
                     if predicate.trim().is_empty()
@@ -1157,7 +1219,9 @@ fn nodes_from_facts(facts: &[PrologFact]) -> BTreeSet<String> {
     let mut nodes = BTreeSet::new();
     for fact in facts {
         match fact {
-            PrologFact::Entity { name, properties, .. } => {
+            PrologFact::Entity {
+                name, properties, ..
+            } => {
                 nodes.insert(name.clone());
                 if let Some(alias) = properties.get("name") {
                     nodes.insert(alias.clone());
@@ -1182,7 +1246,10 @@ fn entity_types_from_facts(facts: &[PrologFact]) -> BTreeMap<String, BTreeSet<St
         } = fact
         {
             if !entity_type.is_empty() {
-                types.entry(name.clone()).or_default().insert(entity_type.clone());
+                types
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(entity_type.clone());
             }
             if let Some(alias) = properties.get("name") {
                 if !entity_type.is_empty() {
@@ -1285,7 +1352,10 @@ mod tests {
             .iter()
             .find(|item| item.subject == "钱七" && item.object == "孙八")
             .expect("应抽出新模式候选");
-        assert_eq!(candidate.families, BTreeSet::from([EvidenceFamily::SurfacePattern]));
+        assert_eq!(
+            candidate.families,
+            BTreeSet::from([EvidenceFamily::SurfacePattern])
+        );
         assert_eq!(candidate.grade, ConfidenceGrade::C);
         assert_eq!(candidate.decision, CandidateDecision::Review);
         assert!(candidate.known_subject == false);
@@ -1321,7 +1391,6 @@ mod tests {
         assert!(surfaces.contains(&"钱七") || surfaces.contains(&"孙八"));
     }
 
-
     #[test]
     fn functional_conflict_rejects_candidate() {
         let facts = vec![
@@ -1334,8 +1403,7 @@ mod tests {
             functional: true,
             ..PredicateProfileConfig::default()
         });
-        let constructor =
-            WeakConstructor::new(&facts, registry, TypeSystem::new(), LawBook::new());
+        let constructor = WeakConstructor::new(&facts, registry, TypeSystem::new(), LawBook::new());
         let corpus = "张三拜李四为师。\n王五拜赵六为师。\n张三拜钱七为师。\n";
         let report = constructor.build(corpus, &ConstructionOptions::default());
         let candidate = report
@@ -1344,7 +1412,9 @@ mod tests {
             .find(|item| item.subject == "张三" && item.object == "钱七")
             .expect("应抽出冲突候选");
         assert_eq!(candidate.decision, CandidateDecision::Rejected);
-        assert!(candidate.rebuttals.contains(&HardRebuttal::FunctionalConflict));
+        assert!(candidate
+            .rebuttals
+            .contains(&HardRebuttal::FunctionalConflict));
     }
 
     #[test]
@@ -1410,7 +1480,6 @@ mod tests {
         assert_eq!(report.stats.aligned_seed_edges, 2);
     }
 
-
     #[test]
     fn accepted_candidate_can_be_rendered_from_learned_pattern() {
         let facts = vec![
@@ -1427,7 +1496,6 @@ mod tests {
         assert_eq!(generated.text, "钱七的师傅是孙八");
     }
 
-
     #[test]
     fn temporal_scope_forces_review() {
         let facts = vec![
@@ -1442,14 +1510,11 @@ mod tests {
             .find(|item| item.subject == "钱七")
             .expect("应抽出带时间的候选");
         assert_eq!(candidate.decision, CandidateDecision::Review);
-        assert!(
-            candidate
-                .review_reasons
-                .iter()
-                .any(|reason| reason.contains("时间限定"))
-        );
+        assert!(candidate
+            .review_reasons
+            .iter()
+            .any(|reason| reason.contains("时间限定")));
     }
-
 
     #[test]
     fn dialogue_confirmation_promotes_pattern_candidate() {
@@ -1458,13 +1523,12 @@ mod tests {
             relation("王五", "师傅", "赵六"),
         ];
         let corpus = "张三拜李四为师。\n王五拜赵六为师。\n钱七拜孙八为师。\n";
-        let report = constructor(facts.clone(), "师傅").build(corpus, &ConstructionOptions::default());
-        assert!(
-            report
-                .candidates
-                .iter()
-                .any(|item| item.subject == "钱七" && item.decision == CandidateDecision::Review)
-        );
+        let report =
+            constructor(facts.clone(), "师傅").build(corpus, &ConstructionOptions::default());
+        assert!(report
+            .candidates
+            .iter()
+            .any(|item| item.subject == "钱七" && item.decision == CandidateDecision::Review));
         let feedback = vec![ConstructionFeedback {
             subject: "钱七".to_string(),
             predicate: "师傅".to_string(),
@@ -1481,7 +1545,9 @@ mod tests {
             .iter()
             .find(|item| item.subject == "钱七")
             .expect("应有候选");
-        assert!(candidate.families.contains(&EvidenceFamily::DialogueFeedback));
+        assert!(candidate
+            .families
+            .contains(&EvidenceFamily::DialogueFeedback));
         assert_eq!(candidate.grade, ConfidenceGrade::B);
         assert_eq!(candidate.decision, CandidateDecision::Accepted);
     }
@@ -1515,13 +1581,13 @@ mod tests {
 
     #[test]
     fn feedback_parser_reports_bad_lines() {
-        let (items, errors) = parse_feedback("确认 张三 师傅 李四\n?? 王五 师傅 赵六\n否认 张三 师傅 王五\n");
+        let (items, errors) =
+            parse_feedback("确认 张三 师傅 李四\n?? 王五 师傅 赵六\n否认 张三 师傅 王五\n");
         assert_eq!(items.len(), 2);
         assert_eq!(errors.len(), 1);
         assert!(items[0].confirmed);
         assert!(!items[1].confirmed);
     }
-
 
     #[test]
     fn denial_retires_pattern() {
@@ -1541,7 +1607,10 @@ mod tests {
             &ConstructionOptions::default(),
             &feedback,
         );
-        assert!(report.patterns.iter().any(|item| item.retired && !item.active));
+        assert!(report
+            .patterns
+            .iter()
+            .any(|item| item.retired && !item.active));
         assert!(report.generations.is_empty());
     }
 
@@ -1555,7 +1624,8 @@ mod tests {
         let report = constructor(facts, "师傅").build(corpus, &ConstructionOptions::default());
         assert!(
             report.candidates.iter().all(|item| {
-                !(item.subject == "钱七" && item.object == "孙八"
+                !(item.subject == "钱七"
+                    && item.object == "孙八"
                     && item.decision == CandidateDecision::Accepted)
             }),
             "否定句不应被接受：{:?}",
