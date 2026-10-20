@@ -26,6 +26,15 @@ fn stopwords() -> &'static HashSet<&'static str> {
     projection_set(Projection::Retrieval)
 }
 
+/// RDFS 子类谓词：观察到这类三元组时顺手登记类型层级边（与话语引擎
+/// [`crate::discourse::is_hierarchy_predicate`] 同词面，但排除「类型」/「rdf:type」
+/// ——那是实例断言，由 [`DenseRetriever::observe_entity`] 处理）。
+const SUBCLASS_PREDICATES: [&str; 5] = ["子类", "子类于", "是一种", "属于", "subClassOf"];
+
+/// 子类可达性的层数上限（中文领域层级很浅；上限只为防病态图）
+const MAX_SUBCLASS_DEPTH: usize = 16;
+
+
 /// 单条被检索的证据（三元组或实体属性）
 #[derive(Debug, Clone, Serialize)]
 pub struct RetrievalHit {
@@ -64,6 +73,9 @@ pub struct SearchConstraints {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// 实体的声明类型（主体或客体任一匹配即可）。
+    /// 按 RDFS 展开：声明类型与约束类型相等、互为子类路径均算匹配；
+    /// 仅当两类型存在显式互斥证据时才硬剪（开放世界，见
+    /// [`DenseRetriever::type_compatible`]）；未声明类型的实体仍保守剪掉。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_type: Option<String>,
 }
@@ -186,6 +198,10 @@ pub struct DenseRetriever {
     /// 实体声明类型（来自 `observe_entity`），用于类型约束与审计。
     entity_types: HashMap<String, String>,
     type_entities: HashMap<String, HashSet<String>>,
+    /// RDFS 子类层级（直接边；可达性按有界 BFS 取传递闭包）。
+    type_hierarchy: HashMap<String, HashSet<String>>,
+    /// 互斥类型对（规范化为左 ≤ 右的有序对）：唯一可证明不兼容的来源。
+    type_disjoint: HashSet<(String, String)>,
     adjacency: HashMap<String, HashMap<String, f64>>,
     /// 实体名按长度降序的缓存（与 `entity_docs` 的键集合同步，`rebuild` 时刷新）
     seed_candidates: Vec<String>,
@@ -214,6 +230,8 @@ impl DenseRetriever {
             by_object: HashMap::new(),
             entity_types: HashMap::new(),
             type_entities: HashMap::new(),
+            type_hierarchy: HashMap::new(),
+            type_disjoint: HashSet::new(),
             adjacency: HashMap::new(),
             seed_candidates: Vec::new(),
             dirty: false,
@@ -287,6 +305,10 @@ impl DenseRetriever {
                 .and_modify(|weight| *weight += 1.0)
                 .or_insert(1.0);
         }
+        // 子类谓词顺手登记类型层级：检索约束按 RDFS 沿层级展开
+        if SUBCLASS_PREDICATES.contains(&predicate) {
+            self.observe_subclass(subject, object);
+        }
         self.dirty = true;
     }
 
@@ -313,6 +335,19 @@ impl DenseRetriever {
                 self.entity_types.remove(subject);
                 if let Some(entities) = self.type_entities.get_mut(object) {
                     entities.remove(subject);
+                }
+            }
+            // 子类证据撤回时同步注销层级边（与类型断言注销对称）
+            if SUBCLASS_PREDICATES.contains(&predicate) {
+                let empty = match self.type_hierarchy.get_mut(subject) {
+                    Some(supers) => {
+                        supers.remove(object);
+                        supers.is_empty()
+                    }
+                    None => false,
+                };
+                if empty {
+                    self.type_hierarchy.remove(subject);
                 }
             }
             self.dirty = true;
@@ -346,6 +381,104 @@ impl DenseRetriever {
         for (key, value) in properties {
             self.observe_triple(name, key, value);
         }
+    }
+
+    /// 登记一条子类边 `sub ⊑ sup`（幂等）：类型约束据此沿层级展开。
+    pub fn observe_subclass(&mut self, sub: &str, sup: &str) {
+        let sub = sub.trim();
+        let sup = sup.trim();
+        if sub.is_empty() || sup.is_empty() || sub == sup {
+            return;
+        }
+        self.type_hierarchy
+            .entry(sub.to_string())
+            .or_default()
+            .insert(sup.to_string());
+    }
+
+    /// 登记一对互斥类型（幂等，顺序无关）：互斥是类型约束里唯一的硬剪证据。
+    pub fn observe_disjoint(&mut self, left: &str, right: &str) {
+        let left = left.trim();
+        let right = right.trim();
+        if left.is_empty() || right.is_empty() || left == right {
+            return;
+        }
+        let pair = if left <= right {
+            (left.to_string(), right.to_string())
+        } else {
+            (right.to_string(), left.to_string())
+        };
+        self.type_disjoint.insert(pair);
+    }
+
+    /// 子类可达（含传递闭包）：`sub ⊑* sup`。
+    pub fn subclass_reachable(&self, sub: &str, sup: &str) -> bool {
+        if sub == sup {
+            return true;
+        }
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(sub);
+        let mut frontier: Vec<&str> = vec![sub];
+        for _ in 0..MAX_SUBCLASS_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for node in frontier {
+                let Some(supers) = self.type_hierarchy.get(node) else {
+                    continue;
+                };
+                for parent in supers {
+                    if parent == sup {
+                        return true;
+                    }
+                    if visited.insert(parent.as_str()) {
+                        next.push(parent.as_str());
+                    }
+                }
+            }
+            frontier = next;
+        }
+        false
+    }
+
+    /// 两类型是否有显式互斥证据（规范化有序对判定）。
+    pub fn types_disjoint(&self, left: &str, right: &str) -> bool {
+        if left == right {
+            return false;
+        }
+        let pair = if left <= right {
+            (left.to_string(), right.to_string())
+        } else {
+            (right.to_string(), left.to_string())
+        };
+        self.type_disjoint.contains(&pair)
+    }
+
+    /// 类型相容判定（检索约束的 RDFS 语义，开放世界，与模式闸门
+    /// `closure_gate` 同一套判定）：
+    /// - 相等 → 相容；
+    /// - 存在显式互斥证据 → 不相容（**唯一**硬剪：不凭空发明不相容）；
+    /// - 其余（含子类路径、无层级证据）→ 相容。
+    /// 子类路径本身不改变布尔结论，但 [`Self::subclass_reachable`] 供上层
+    /// 逐条复述「类型为何相容」，并参与类型池展开的审计回执。
+    pub fn type_compatible(&self, declared: &str, constraint: &str) -> bool {
+        if declared == constraint {
+            return true;
+        }
+        !self.types_disjoint(declared, constraint)
+    }
+
+    /// 与约束类型相容的已声明类型（按字典序）：类型池展开用。
+    pub fn type_pool(&self, constraint: &str) -> Vec<String> {
+        let mut types: Vec<String> = self
+            .type_entities
+            .keys()
+            .filter(|declared| self.type_compatible(declared, constraint))
+            .cloned()
+            .collect();
+        types.sort();
+        types
     }
 
     /// 一次性观察图谱快照（关系三元组 + 实体类型/属性）。
@@ -743,15 +876,17 @@ impl DenseRetriever {
             }
         }
         if let Some(entity_type) = &constraints.entity_type {
+            // RDFS 语义：声明类型与约束类型相容（子类路径/开放世界，互斥硬剪）；
+            // 未声明类型的实体仍保守剪掉。
             let subject_matches = self
                 .entity_types
                 .get(&doc.subject)
-                .map(|declared| declared == entity_type)
+                .map(|declared| self.type_compatible(declared, entity_type))
                 .unwrap_or(false);
             let object_matches = self
                 .entity_types
                 .get(&doc.object)
-                .map(|declared| declared == entity_type)
+                .map(|declared| self.type_compatible(declared, entity_type))
                 .unwrap_or(false);
             if !subject_matches && !object_matches {
                 return false;
@@ -796,16 +931,21 @@ impl DenseRetriever {
                 let Some(entity_type) = &constraints.entity_type else {
                     return (0..self.docs.len()).collect();
                 };
-                let Some(entities) = self.type_entities.get(entity_type) else {
-                    return Vec::new();
-                };
+                // 类型池按相容类型展开：子类/无互斥证据的类型一并入池（开放世界）；
+                // 互斥类型不入池（唯一硬剪）。
+                let compatible = self.type_pool(entity_type);
                 let mut seen = HashSet::new();
                 let mut ids = Vec::new();
-                for entity in entities {
-                    if let Some(entity_docs) = self.entity_docs.get(entity) {
-                        for id in entity_docs {
-                            if seen.insert(*id) {
-                                ids.push(*id);
+                for declared in &compatible {
+                    let Some(entities) = self.type_entities.get(declared) else {
+                        continue;
+                    };
+                    for entity in entities {
+                        if let Some(entity_docs) = self.entity_docs.get(entity) {
+                            for id in entity_docs {
+                                if seen.insert(*id) {
+                                    ids.push(*id);
+                                }
                             }
                         }
                     }
@@ -852,6 +992,18 @@ impl DenseRetriever {
             receipt.constraint_pruned = self.docs.len().saturating_sub(ids.len());
             Some(ids)
         };
+
+        // 类型约束的 RDFS 展开写进回执：展开过程可审计（互斥已排除）
+        if let Some(entity_type) = &constraints.entity_type {
+            let pool = self.type_pool(entity_type);
+            if pool.len() > 1 {
+                receipt.notes.push(format!(
+                    "类型约束「{}」按 RDFS 展开为相容类型池（{}）；互斥类型已排除。",
+                    entity_type,
+                    pool.join("、")
+                ));
+            }
+        }
 
         if query.is_empty() {
             let mut ids = constrained.unwrap_or_default();
@@ -1507,5 +1659,144 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("预算"))
         );
+    }
+
+    fn rdfs_retriever() -> DenseRetriever {
+        let mut retriever = DenseRetriever::new(8, 0.85, 12);
+        retriever.observe_entity(
+            "张三",
+            "学生",
+            &[("专业".to_string(), "哲学".to_string())],
+        );
+        retriever.observe_entity(
+            "李四",
+            "教师",
+            &[("专业".to_string(), "逻辑学".to_string())],
+        );
+        retriever.observe_entity(
+            "王五",
+            "地点",
+            &[("名称".to_string(), "长安".to_string())],
+        );
+        retriever.observe_subclass("学生", "人物");
+        retriever.observe_subclass("教师", "人物");
+        retriever.observe_disjoint("地点", "人物");
+        retriever
+    }
+
+    #[test]
+    fn type_pool_expands_to_subclasses_and_excludes_disjoint() {
+        let retriever = rdfs_retriever();
+        let pool = retriever.type_pool("人物");
+        assert_eq!(pool, vec!["学生".to_string(), "教师".to_string()]);
+        assert!(
+            retriever.subclass_reachable("学生", "人物"),
+            "子类可达性应成立"
+        );
+        assert!(retriever.type_compatible("学生", "人物"), "子类与父类相容");
+        assert!(retriever.type_compatible("学生", "学生"), "自反相容");
+        assert!(
+            !retriever.type_compatible("地点", "人物"),
+            "互斥证据是唯一硬剪"
+        );
+    }
+
+    #[test]
+    fn type_constraint_matches_subclass_declared_types() {
+        let mut retriever = rdfs_retriever();
+        let constraints = SearchConstraints {
+            entity_type: Some("人物".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        let subjects: HashSet<&str> = search
+            .hits
+            .iter()
+            .map(|hit| hit.subject.as_str())
+            .collect();
+        assert!(subjects.contains("张三"), "学生 ⊑ 人物 应命中：{:?}", subjects);
+        assert!(subjects.contains("李四"), "教师 ⊑ 人物 应命中：{:?}", subjects);
+        assert!(
+            !subjects.contains("王五"),
+            "互斥类型（地点）必须被排除：{:?}",
+            subjects
+        );
+        assert!(
+            search
+                .receipt
+                .notes
+                .iter()
+                .any(|note| note.contains("相容类型池")),
+            "类型池展开应写进回执：{:?}",
+            search.receipt.notes
+        );
+    }
+
+    #[test]
+    fn unknown_declared_types_are_still_pruned() {
+        let mut retriever = rdfs_retriever();
+        // 主客体都未声明类型：不臆造类型，保守剪掉
+        retriever.observe_triple("赵六", "同事", "钱七");
+        let constraints = SearchConstraints {
+            entity_type: Some("人物".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        assert!(
+            search
+                .hits
+                .iter()
+                .all(|hit| hit.subject != "赵六" && hit.object != "赵六"),
+            "未声明类型不得混入类型约束结果"
+        );
+        // 一端有相容类型即可命中（主体或客体任一匹配）
+        retriever.observe_entity("钱七", "学生", &[]);
+        let search = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        assert!(
+            search
+                .hits
+                .iter()
+                .any(|hit| hit.subject == "赵六" && hit.object == "钱七"),
+            "客体类型相容（学生 ⊑ 人物）时应命中"
+        );
+    }
+
+    #[test]
+    fn subclass_predicates_from_triples_feed_hierarchy() {
+        let mut retriever = DenseRetriever::new(5, 0.85, 12);
+        retriever.observe_entity("苏格拉底", "人", &[]);
+        // 图谱里的子类三元组应被识别为层级边
+        retriever.observe_triple("人", "是一种", "动物");
+        assert!(retriever.subclass_reachable("人", "动物"));
+        let constraints = SearchConstraints {
+            entity_type: Some("动物".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = retriever.search("", 5, &constraints, SearchBudget::unlimited());
+        assert!(
+            search.hits.iter().any(|hit| hit.subject == "苏格拉底"),
+            "沿图谱子类边应命中：{:?}",
+            search.hits
+        );
+    }
+
+    #[test]
+    fn removing_subclass_triple_drops_hierarchy_edge() {
+        // 用 observe_triple 建立的层级边随三元组撤回（层级与证据同源）
+        let mut graph = DenseRetriever::new(5, 0.85, 12);
+        graph.observe_triple("学生", "是一种", "人物");
+        assert!(graph.subclass_reachable("学生", "人物"));
+        assert!(graph.remove_triple("学生", "是一种", "人物"));
+        assert!(!graph.subclass_reachable("学生", "人物"));
+    }
+
+    #[test]
+    fn unrelated_types_are_open_world_compatible() {
+        let retriever = rdfs_retriever();
+        // 无层级也无互斥证据：不凭空发明不相容（开放世界）
+        assert!(retriever.type_compatible("学生", "公司"));
+        assert!(!retriever.types_disjoint("学生", "公司"));
+        assert!(retriever.types_disjoint("人物", "地点"), "顺序无关判定");
+        assert!(retriever.types_disjoint("地点", "人物"));
     }
 }

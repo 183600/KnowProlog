@@ -2487,7 +2487,26 @@ impl SymbolicReasoner {
         if trimmed.is_empty() {
             return Err("请提供本体公理，例如：人是一种动物".to_string());
         }
-        self.discourse.teach_axiom(trimmed)
+        let summary = self.discourse.teach_axiom(trimmed)?;
+        self.sync_retrieval_type_hierarchy();
+        Ok(summary)
+    }
+
+    /// 把单一本体（教学态 + 配置态）的子类/互斥公理同步进稠密检索的类型层级：
+    /// 类型约束按 RDFS 展开（互斥是唯一硬剪证据），与本体推理器同源同簿。
+    /// 观察是幂等的（集合插入），重复同步不产生重复边。
+    fn sync_retrieval_type_hierarchy(&mut self) {
+        let lessons: Vec<OntologyLesson> = self.discourse.taught_lessons().to_vec();
+        let mut retrieval = self.retrieval.lock();
+        for lesson in &lessons {
+            match lesson {
+                OntologyLesson::Subclass { sub, sup, .. } => retrieval.observe_subclass(sub, sup),
+                OntologyLesson::Disjoint { left, right, .. } => {
+                    retrieval.observe_disjoint(left, right)
+                }
+                _ => {}
+            }
+        }
     }
 
     /// 配置态本体并入**单一本体**：`[type_system]` 与 `[[predicate_profiles]]`
@@ -2503,6 +2522,7 @@ impl SymbolicReasoner {
         let added = self.discourse.taught_lessons().len().saturating_sub(before);
         if added > 0 {
             self.perf.bump_by("ontology_config_lessons", added as u64);
+            self.sync_retrieval_type_hierarchy();
         }
         added
     }
@@ -8032,6 +8052,8 @@ impl SymbolicReasoner {
         // 绝不留下「会话态已换、本体还是旧的」这种半应用状态。
         if let Some(capsule) = &snapshot.ontology {
             self.discourse.restore_ontology_capsule(capsule)?;
+            // 胶囊公理与检索类型层级同源：恢复后同步一次（幂等）
+            self.sync_retrieval_type_hierarchy();
         }
         self.context.restore(snapshot);
         // 话语帧记忆：恢复上一帧与挂账（重启后接着补全未竟之问）
@@ -9708,6 +9730,87 @@ mod tests {
             fork.taught_ontology_lessons().len(),
             3,
             "会话分叉保留单一本体"
+        );
+    }
+
+    /// 单一本体 → 检索类型层级：教学的子类/互斥公理进入稠密检索的
+    /// 类型约束（RDFS 展开；互斥是唯一硬剪证据）。
+    #[test]
+    fn test_taught_ontology_expands_retrieval_type_constraints() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "苏格拉底".to_string(),
+                entity_type: "人".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "雅典".to_string(),
+                entity_type: "地点".to_string(),
+                properties: HashMap::new(),
+            },
+        ]);
+        reasoner.teach_ontology("人是一种动物").expect("可教学");
+        reasoner.teach_ontology("地点和动物互斥").expect("可教学");
+
+        let constraints = SearchConstraints {
+            entity_type: Some("动物".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = reasoner.evidence_search("", 8, &constraints, SearchBudget::unlimited());
+        assert!(
+            search
+                .hits
+                .iter()
+                .any(|hit| hit.subject == "苏格拉底"),
+            "人 ⊑ 动物：沿教学子类边应命中类型约束：{:?}",
+            search.hits
+        );
+        assert!(
+            search
+                .hits
+                .iter()
+                .all(|hit| hit.subject != "雅典"),
+            "互斥证据必须硬剪：{:?}",
+            search.hits
+        );
+    }
+
+    /// 配置态子类（config.toml 的 type_system）经单一本体进入检索类型层级。
+    #[test]
+    fn test_configured_subclass_expands_retrieval_type_constraints() {
+        use crate::ontology_reasoning::OntologyProgram;
+        use crate::type_system::{TypeSubclassConfig, TypeSystemConfig};
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "学生".to_string(),
+            properties: HashMap::new(),
+        }]);
+        let program = OntologyProgram::from_config(
+            &TypeSystemConfig {
+                subclasses: vec![TypeSubclassConfig {
+                    sub: "学生".into(),
+                    sup: "人物".into(),
+                }],
+                ..TypeSystemConfig::default()
+            },
+            &[],
+        );
+        assert!(reasoner.configure_ontology_program(&program) > 0);
+        let constraints = SearchConstraints {
+            entity_type: Some("人物".to_string()),
+            ..SearchConstraints::default()
+        };
+        let search = reasoner.evidence_search("", 8, &constraints, SearchBudget::unlimited());
+        assert!(
+            search
+                .hits
+                .iter()
+                .any(|hit| hit.subject == "张三"),
+            "配置子类（学生 ⊑ 人物）应展开类型约束：{:?}",
+            search.hits
         );
     }
 
