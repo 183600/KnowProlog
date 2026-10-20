@@ -6625,7 +6625,7 @@ async fn run_interactive_mode(
                         // 焦点仍由对话管理器统一维护，插件不另建上下文。
                         let raw_entity = recipe.slots.get("entity").cloned();
                         let entity = raw_entity.as_ref().map(|raw| {
-                            if know_prolog::plugin::is_reference_surface(raw) {
+                            if plugin_runtime.is_context_reference(raw) {
                                 dialogue_manager
                                     .focus_entity()
                                     .map(str::to_string)

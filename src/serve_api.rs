@@ -463,7 +463,11 @@ impl Session {
         let recipe = outcome.trace.recipe.clone()?;
         let raw_entity = recipe.slots.get("entity").cloned();
         let entity = raw_entity.as_ref().map(|raw| {
-            if crate::plugin::is_reference_surface(raw) {
+            let is_reference = self
+                .plugin
+                .as_ref()
+                .is_some_and(|plugin| plugin.lock().is_context_reference(raw));
+            if is_reference {
                 self.manager
                     .focus_entity()
                     .map(str::to_string)

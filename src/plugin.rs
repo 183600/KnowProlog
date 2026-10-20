@@ -2057,6 +2057,30 @@ impl PluginRuntime {
         surfaces
     }
 
+    /// 当前启用插件声明的指称词是否可回指对话焦点。
+    /// 静态代词之外，插件 `Reference.quantifiers` 也参与判定；
+    /// 只认启用中的包，观察/停用包不改变消解行为。
+    pub fn is_context_reference(&self, surface: &str) -> bool {
+        if is_reference_surface(surface) {
+            return true;
+        }
+        let surface = surface.trim();
+        if surface.is_empty() {
+            return false;
+        }
+        self.manifests.iter().any(|manifest| {
+            self.modes.get(&manifest.id) == Some(&PluginMode::On)
+                && manifest.contributions.iter().any(|contribution| {
+                    let Contribution::Reference { quantifiers, .. } = contribution else {
+                        return false;
+                    };
+                    quantifiers
+                        .iter()
+                        .any(|quantifier| quantifier.trim() == surface)
+                })
+        })
+    }
+
     /// 启动时合并进中文分词/词性词典的指称线索（仅启用中的插件）。
     /// 量词按代词 `r`、角色词按名词 `n`、姓氏按人名 `nr` 标注。
     pub fn reference_lexicon(&self) -> Vec<(String, String)> {
@@ -3088,20 +3112,24 @@ mod tests {
         film.contributions.push(Contribution::Reference {
             id: "film.reference".to_string(),
             description: String::new(),
-            quantifiers: vec!["这位".to_string()],
+            quantifiers: vec!["本片".to_string()],
             role_words: vec!["导演".to_string()],
             surnames: vec!["卡梅隆".to_string()],
         });
         let registry = PluginRegistry::from_manifests(vec![film]);
         let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
         assert!(runtime.reference_lexicon().is_empty());
+        assert!(runtime.is_context_reference("他"));
+        assert!(!runtime.is_context_reference("本片"));
         runtime.set_mode("zh.film", PluginMode::On).unwrap();
+        assert!(runtime.is_context_reference("本片"));
+        assert!(!runtime.is_context_reference("导演"));
         assert_eq!(
             runtime.reference_lexicon(),
             vec![
                 ("卡梅隆".to_string(), "nr".to_string()),
                 ("导演".to_string(), "n".to_string()),
-                ("这位".to_string(), "r".to_string()),
+                ("本片".to_string(), "r".to_string()),
             ]
         );
     }
