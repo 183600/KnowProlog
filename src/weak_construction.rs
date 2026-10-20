@@ -928,6 +928,12 @@ fn match_pattern(pattern: &SurfacePattern, sentence: &str) -> Option<(String, St
         skip_leading_discourse(sentence)
     } else {
         let found = sentence.find(&pattern.prefix)?;
+        if found > 0 {
+            let before = sentence[..found].chars().next_back()?;
+            if !PUNCTUATION.contains(&before) && !before.is_whitespace() {
+                return None;
+            }
+        }
         found + pattern.prefix.len()
     };
     if subject_start >= sentence.len() {
