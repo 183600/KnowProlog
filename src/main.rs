@@ -61,7 +61,7 @@ use know_prolog::{
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
     },
-    weak_construction::{ConstructionOptions, WeakConstructor},
+    weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     dialogue_fuzz::{
@@ -271,6 +271,9 @@ enum Commands {
         /// Maximum number of candidates to report (0 = no limit)
         #[arg(long, default_value_t = 200)]
         limit: usize,
+        /// Optional feedback file: lines of 「确认/否认 主语 谓词 宾语」
+        #[arg(long)]
+        feedback: Option<String>,
         /// Apply accepted candidates whose endpoints already exist in the graph
         #[arg(long)]
         apply: bool,
@@ -854,6 +857,7 @@ async fn main() {
             min_support,
             min_purity,
             limit,
+            feedback,
             apply,
             json,
         }) => {
@@ -900,9 +904,25 @@ async fn main() {
                 max_candidates: limit,
                 ..ConstructionOptions::default()
             };
+            let feedback_items = match feedback {
+                Some(path) => match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let (items, errors) = parse_feedback(&text);
+                        for error in errors {
+                            eprintln!("反馈文件 {}：{}", path, error);
+                        }
+                        items
+                    }
+                    Err(e) => {
+                        eprintln!("读取反馈文件失败（{}）: {}", path, e);
+                        std::process::exit(1);
+                    }
+                },
+                None => Vec::new(),
+            };
             let constructor =
                 WeakConstructor::new(facts.as_slice(), registry, types, laws);
-            let report = constructor.build(&source, &options);
+            let report = constructor.build_with_feedback(&source, &options, &feedback_items);
             if apply {
                 let items: Vec<KnowledgeItem> = report
                     .candidates

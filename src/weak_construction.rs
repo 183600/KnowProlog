@@ -48,6 +48,7 @@ pub enum EvidenceFamily {
     SurfacePattern,
     KnowledgeGraph,
     TypeShape,
+    DialogueFeedback,
 }
 
 impl EvidenceFamily {
@@ -58,6 +59,7 @@ impl EvidenceFamily {
             EvidenceFamily::SurfacePattern => "语料模式",
             EvidenceFamily::KnowledgeGraph => "已有图谱",
             EvidenceFamily::TypeShape => "类型形状",
+            EvidenceFamily::DialogueFeedback => "对话确认",
         }
     }
 }
@@ -69,6 +71,7 @@ pub enum HardRebuttal {
     NegativeConflict,
     FunctionalConflict,
     SchemaViolation,
+    DialogueDenied,
 }
 
 impl HardRebuttal {
@@ -78,6 +81,7 @@ impl HardRebuttal {
             HardRebuttal::NegativeConflict => "否定记录冲突",
             HardRebuttal::FunctionalConflict => "单值谓词冲突",
             HardRebuttal::SchemaViolation => "类型/形状冲突",
+            HardRebuttal::DialogueDenied => "对话否认",
         }
     }
 }
@@ -146,6 +150,51 @@ impl Default for ConstructionOptions {
             max_candidates: 500,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstructionFeedback {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub confirmed: bool,
+}
+
+impl ConstructionFeedback {
+    pub fn key(&self) -> String {
+        format!("{}({}, {})", self.predicate, self.subject, self.object)
+    }
+}
+
+pub fn parse_feedback(text: &str) -> (Vec<ConstructionFeedback>, Vec<String>) {
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 4 {
+            errors.push(format!("第 {} 行：需要「确认/否认 主语 谓词 宾语」", index + 1));
+            continue;
+        }
+        let confirmed = match fields[0] {
+            "确认" | "confirm" | "+" => true,
+            "否认" | "deny" | "-" => false,
+            _ => {
+                errors.push(format!("第 {} 行：未知动作「{}」", index + 1, fields[0]));
+                continue;
+            }
+        };
+        items.push(ConstructionFeedback {
+            subject: fields[1].to_string(),
+            predicate: fields[2].to_string(),
+            object: fields[3].to_string(),
+            confirmed,
+        });
+    }
+    (items, errors)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +459,28 @@ impl WeakConstructor {
     }
 
     pub fn build(&self, corpus: &str, options: &ConstructionOptions) -> ConstructionReport {
+        self.build_with_feedback(corpus, options, &[])
+    }
+
+    pub fn build_with_feedback(
+        &self,
+        corpus: &str,
+        options: &ConstructionOptions,
+        feedback: &[ConstructionFeedback],
+    ) -> ConstructionReport {
+        let mut feedback_map: BTreeMap<(String, String, String), bool> = BTreeMap::new();
+        for item in feedback {
+            let edge = canonical_edge(
+                &item.subject,
+                &item.predicate,
+                &item.object,
+                &self.registry,
+            );
+            feedback_map.insert(
+                (edge.subject, edge.predicate, edge.object),
+                item.confirmed,
+            );
+        }
         let sentences = split_sentences(corpus);
         let (patterns, aligned_edges) =
             learn_patterns(&self.seed_edges, corpus, &self.registry, options);
@@ -424,7 +495,9 @@ impl WeakConstructor {
         let mut list = Vec::new();
         let mut proposals: BTreeMap<(String, String), MintProposal> = BTreeMap::new();
         for ((subject, predicate, object), accumulator) in candidates {
-            let candidate = self.finalize(&subject, &predicate, &object, accumulator);
+            let key = (subject.clone(), predicate.clone(), object.clone());
+            let candidate =
+                self.finalize(&subject, &predicate, &object, accumulator, feedback_map.get(&key).copied());
             if candidate.decision != CandidateDecision::Rejected {
                 for (role, surface) in [("主语", &candidate.subject), ("宾语", &candidate.object)] {
                     if self.nodes.contains(surface) {
@@ -596,6 +669,7 @@ impl WeakConstructor {
         predicate: &str,
         object: &str,
         accumulator: CandidateAccumulator,
+        feedback: Option<bool>,
     ) -> ConstructionCandidate {
         let mut families = accumulator.families;
         let mut rebuttals = accumulator.rebuttals;
@@ -629,6 +703,15 @@ impl WeakConstructor {
             }
         }
         self.add_type_evidence(subject, predicate, object, &mut families, &mut rebuttals);
+        match feedback {
+            Some(true) => {
+                families.insert(EvidenceFamily::DialogueFeedback);
+            }
+            Some(false) => {
+                rebuttals.insert(HardRebuttal::DialogueDenied);
+            }
+            None => {}
+        }
         let grade = if rebuttals.is_empty() {
             ConfidenceGrade::from_families(families.len())
         } else {
@@ -1340,6 +1423,78 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("时间限定"))
         );
+    }
+
+
+    #[test]
+    fn dialogue_confirmation_promotes_pattern_candidate() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let corpus = "张三拜李四为师。\n王五拜赵六为师。\n钱七拜孙八为师。\n";
+        let report = constructor(facts.clone(), "师傅").build(corpus, &ConstructionOptions::default());
+        assert!(
+            report
+                .candidates
+                .iter()
+                .any(|item| item.subject == "钱七" && item.decision == CandidateDecision::Review)
+        );
+        let feedback = vec![ConstructionFeedback {
+            subject: "钱七".to_string(),
+            predicate: "师傅".to_string(),
+            object: "孙八".to_string(),
+            confirmed: true,
+        }];
+        let confirmed = constructor(facts, "师傅").build_with_feedback(
+            corpus,
+            &ConstructionOptions::default(),
+            &feedback,
+        );
+        let candidate = confirmed
+            .candidates
+            .iter()
+            .find(|item| item.subject == "钱七")
+            .expect("应有候选");
+        assert!(candidate.families.contains(&EvidenceFamily::DialogueFeedback));
+        assert_eq!(candidate.grade, ConfidenceGrade::B);
+        assert_eq!(candidate.decision, CandidateDecision::Accepted);
+    }
+
+    #[test]
+    fn dialogue_denial_rejects_candidate() {
+        let facts = vec![
+            relation("张三", "师傅", "李四"),
+            relation("王五", "师傅", "赵六"),
+        ];
+        let corpus = "张三的师傅是李四。\n王五的师傅是赵六。\n钱七的师傅是孙八。\n";
+        let feedback = vec![ConstructionFeedback {
+            subject: "钱七".to_string(),
+            predicate: "师傅".to_string(),
+            object: "孙八".to_string(),
+            confirmed: false,
+        }];
+        let report = constructor(facts, "师傅").build_with_feedback(
+            corpus,
+            &ConstructionOptions::default(),
+            &feedback,
+        );
+        let candidate = report
+            .candidates
+            .iter()
+            .find(|item| item.subject == "钱七")
+            .expect("应有候选");
+        assert_eq!(candidate.decision, CandidateDecision::Rejected);
+        assert!(candidate.rebuttals.contains(&HardRebuttal::DialogueDenied));
+    }
+
+    #[test]
+    fn feedback_parser_reports_bad_lines() {
+        let (items, errors) = parse_feedback("确认 张三 师傅 李四\n?? 王五 师傅 赵六\n否认 张三 师傅 王五\n");
+        assert_eq!(items.len(), 2);
+        assert_eq!(errors.len(), 1);
+        assert!(items[0].confirmed);
+        assert!(!items[1].confirmed);
     }
 
     #[test]
