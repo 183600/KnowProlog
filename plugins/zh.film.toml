@@ -236,6 +236,11 @@ expect_rewrite = "阿凡达的导演是什么"
 expect_plugin = "zh.film"
 
 [[eval_cases]]
+input = "请问阿凡达是谁导演的呢？"
+expect_rewrite = "阿凡达的导演是什么"
+expect_plugin = "zh.film"
+
+[[eval_cases]]
 input = "谁拍过阿凡达"
 expect_rewrite = "阿凡达的导演是什么"
 expect_plugin = "zh.film"

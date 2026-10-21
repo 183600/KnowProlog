@@ -1219,10 +1219,30 @@ fn literal_length(segments: &[Segment]) -> usize {
 }
 
 /// 整串匹配模式；槽位非空，字面量按顺序出现。
-fn trim_sentence_end(text: &str) -> &str {
-    text.trim()
-        .trim_end_matches(|ch: char| matches!(ch, '？' | '?' | '。' | '！' | '!' | '；' | ';' | '，' | ','))
-        .trim_end()
+fn trim_query_surface(text: &str) -> &str {
+    let mut text = text.trim();
+    for prefix in ["请问一下", "想问一下", "请告诉我", "请问"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim_start();
+            break;
+        }
+    }
+    loop {
+        let trimmed = text.trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                '？' | '?' | '。' | '！' | '!' | '；' | ';' | '，' | ',' | '…'
+            )
+        });
+        let trimmed = trimmed
+            .trim_end_matches(|ch: char| matches!(ch, '呢' | '吗' | '吧' | '啊' | '呀' | '嘛' | '哦' | '哈' | '啦'))
+            .trim_end();
+        if trimmed == text {
+            break;
+        }
+        text = trimmed;
+    }
+    text
 }
 
 fn match_segments(segments: &[Segment], text: &str) -> Option<BTreeMap<String, String>> {
@@ -1810,7 +1830,7 @@ impl PluginRuntime {
         let original = input;
         // 问句末尾的标点是排版不是语义：只用于匹配，不把「？」带进槽位。
         // 若没有任何插件实际改写，最终仍原样返回，避免影响核心管线。
-        let match_input = trim_sentence_end(input);
+        let match_input = trim_query_surface(input);
         let mut trace = PluginTrace {
             input: original.to_string(),
             effective: original.to_string(),
@@ -3095,7 +3115,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_sentence_punctuation_is_ignored_for_matching() {
+    fn sentence_punctuation_and_polite_wrappers_are_ignored_for_matching() {
         let mut on = manifest("zh.film", PluginMode::On);
         on.contributions.push(rewrite_contribution(
             "film.directed",
@@ -3108,6 +3128,9 @@ mod tests {
         let outcome = runtime.rewrite("阿凡达是谁导演的？");
         assert_eq!(outcome.text, "阿凡达的导演是谁");
         assert_eq!(outcome.trace.input, "阿凡达是谁导演的？");
+
+        let polite = runtime.rewrite("请问阿凡达是谁导演的呢？");
+        assert_eq!(polite.text, "阿凡达的导演是谁");
 
         let untouched = runtime.rewrite("今天天气怎么样？");
         assert_eq!(untouched.text, "今天天气怎么样？");
