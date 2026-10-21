@@ -2952,6 +2952,20 @@ async fn run_interactive_mode(
         }
         _ => {}
     }
+    // 模式经验：跨会话恢复「上次怎么理解」的记录（独立于模式定义图）。
+    let mut pattern_episodes = pattern_ir::PatternEpisodeLog::default();
+    match oxigraph_manager.load_pattern_episodes().await {
+        Ok(episodes) if !episodes.is_empty() => {
+            let merged = pattern_episodes.merge_persisted(&episodes);
+            if merged > 0 {
+                println!(
+                    "已恢复 {} 条模式经验（经验落图）。可用「模式经验」查看。",
+                    merged
+                );
+            }
+        }
+        _ => {}
+    }
     let mut prolog_engine = PrologEngine::new();
     let local_semantic_adapter = {
         let nlp_config = &config.nlp;
@@ -3589,6 +3603,60 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 模式经验：命中/未命中的可检索记忆（独立命名图）
+        if matches!(input, "模式经验" | "模式经验报告" | "经验台账") {
+            println!("{}", pattern_ir::render_episode_report(&pattern_episodes));
+            println!();
+            continue;
+        }
+
+        // 模式联想：用相似成功经验泛化出候选骨架，只确认、不直接路由
+        if let Some(text) = strip_any_prefix(
+            input,
+            &[
+                "模式联想：",
+                "模式联想:",
+                "模式联想 ",
+                "案例联想：",
+                "案例联想:",
+            ],
+        ) {
+            let text = text.trim();
+            if text.is_empty() {
+                println!("用法：模式联想：<句子>，例如「模式联想：德国的首都在哪里」。");
+            } else {
+                let tagged = preprocess(text, &config.nlp);
+                let normalized = normalize_words(tagged, &synonyms);
+                match pattern_episodes.suggest_case(
+                    &normalized,
+                    dialogue_manager.focus_entity(),
+                    0.2,
+                ) {
+                    Some(suggestion) => {
+                        println!("{}", pattern_ir::render_case_suggestion(text, &suggestion));
+                    }
+                    None => println!(
+                        "模式联想：没有足够相似的成功经验；先处理几条同类问句，或用「教模式」显式教学。"
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "清空模式经验" | "遗忘模式经验") {
+            pattern_episodes.clear();
+            match oxigraph_manager
+                .sync_pattern_episodes(pattern_episodes.entries())
+                .await
+            {
+                Ok(count) => println!("已清空模式经验（经验落图：{} 条）。", count),
+                Err(error) => println!("清空模式经验失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
         // 模式落图：把当前模式库与关系边同步到 kg:graphs/patterns 并读回校验
         if matches!(input, "模式落图" | "同步模式图" | "保存模式库") {
             match oxigraph_manager
@@ -3614,6 +3682,23 @@ async fn run_interactive_mode(
                     );
                 }
                 Err(error) => println!("模式落图失败：{}", error),
+            }
+            match oxigraph_manager
+                .sync_pattern_episodes(pattern_episodes.entries())
+                .await
+            {
+                Ok(count) => {
+                    println!(
+                        "经验落图：{} 条已同步到 {}。",
+                        count,
+                        pattern_ir::EPISODES_GRAPH
+                    );
+                    match oxigraph_manager.load_pattern_episodes().await {
+                        Ok(loaded) => println!("经验读回校验：{} 条。", loaded.len()),
+                        Err(error) => println!("经验读回失败：{}", error),
+                    }
+                }
+                Err(error) => println!("经验落图失败：{}", error),
             }
             println!();
             continue;
@@ -7385,7 +7470,11 @@ async fn run_interactive_mode(
                                     if let Some((query_type, entities, pattern_note)) =
                                         route_query_with_patterns(
                                             &pattern_library,
+                                            input,
                                             &normalized_words,
+                                            &mut pattern_episodes,
+                                            dialogue_manager.focus_entity(),
+                                            dialogue_manager.turn_count(),
                                         )
                                     {
                                         // 执行查询流程
@@ -7441,7 +7530,11 @@ async fn run_interactive_mode(
                                     if let Some((query_type, entities, pattern_note)) =
                                         route_query_with_patterns(
                                             &pattern_library,
+                                            input,
                                             &normalized_words,
+                                            &mut pattern_episodes,
+                                            dialogue_manager.focus_entity(),
+                                            dialogue_manager.turn_count(),
                                         )
                                     {
                                         if let Some(note) = &pattern_note {
@@ -7588,7 +7681,14 @@ async fn run_interactive_mode(
                 }
 
                 if let Some((query_type, entities, pattern_note)) =
-                    route_query_with_patterns(&pattern_library, &normalized_words)
+                    route_query_with_patterns(
+                        &pattern_library,
+                        input,
+                        &normalized_words,
+                        &mut pattern_episodes,
+                        dialogue_manager.focus_entity(),
+                        dialogue_manager.turn_count(),
+                    )
                 {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
@@ -8250,8 +8350,11 @@ fn interactive_help() -> String {
         "  规则：<如果X的P是Y，那么X的Q是Y>    教一条 Horn 规则（占位符自动变量化）",
         "  模式路由 / 查询模式库                 统一模式库（配置查询+NLU 意图+教学模式）与体检",
         "  模式关系 / 模式关系图                 泛化/冗余/冲突落成的图边与图体检查询",
-        "  模式落图 / 同步模式图                 把模式库与关系边同步到 kg:graphs/patterns",
+        "  模式落图 / 同步模式图                 把模式库、关系边与模式经验同步到命名图",
         "  模式匹配：<句子>                     查看命中模式、绑定与落选原因",
+        "  模式经验 / 经验台账                  查看命中/未命中的可检索理解经验",
+        "  模式联想：<句子>                     用相似成功经验泛化候选骨架（只确认，不直接回答）",
+        "  清空模式经验                         清空经验台账并同步命名图",
         "  教模式：名 | 要素… | 路由 | 优先级   教一条查询模式（落图持久化，跨会话恢复）",
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
@@ -8760,6 +8863,16 @@ fn is_command_like(input: &str) -> bool {
         "模式落图",
         "同步模式图",
         "保存模式库",
+        "模式经验",
+        "模式经验报告",
+        "经验台账",
+        "模式联想：",
+        "模式联想:",
+        "模式联想 ",
+        "案例联想：",
+        "案例联想:",
+        "清空模式经验",
+        "遗忘模式经验",
         "模式匹配：",
         "模式匹配:",
         "模式匹配 ",
@@ -8849,11 +8962,21 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
 ///
 /// 路由语义与既有 `analyze_query_intent(&words, &rules)` 一致（同排序、同匹配、
 /// 同实体提取），额外给出「命中模式」的人类可读说明；无命中返回 `None`。
+/// 每次尝试都会写入 [`pattern_ir::PatternEpisodeLog`]：成功记下命中模式与绑定，
+/// 失败也留下可检索的情境经验（不改变路由结果）。
 fn route_query_with_patterns(
     library: &PatternLibrary,
+    input: &str,
     words: &[know_prolog::nlp::TaggedWord],
+    episodes: &mut pattern_ir::PatternEpisodeLog,
+    focus: Option<&str>,
+    turn: usize,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    let matched = library.match_route(words)?;
+    let Some(matched) = library.match_route(words) else {
+        episodes.record_unmatched(input, words, focus, turn);
+        return None;
+    };
+    episodes.record_match(input, words, &matched, focus, turn);
     let note = format!(
         "{}（{}，优先级 {}，来源 {}）",
         matched.entry.name,

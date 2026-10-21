@@ -19,7 +19,7 @@
 //! 排序规则与既有 `analyze_query_intent` 一致：**优先级降序 + 配置序**
 //! （稳定排序），特化度只用于展示与体检，不改变路由结果。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -409,6 +409,450 @@ impl PatternMatch {
     pub fn entity_values(&self) -> Vec<String> {
         self.entities.clone()
     }
+}
+
+// ---------------------------------------------------------------------------
+// 模式经验：一次理解的可检索记忆
+// ---------------------------------------------------------------------------
+
+/// 一次解析尝试的结果类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeOutcome {
+    /// 可路由模式命中并给出了查询解。
+    Matched,
+    /// 没有可路由模式命中（失败经验同样可检索）。
+    Unmatched,
+}
+
+impl EpisodeOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            EpisodeOutcome::Matched => "命中",
+            EpisodeOutcome::Unmatched => "未命中",
+        }
+    }
+}
+
+/// 一次解析经验：输入、词序列、命中模式、绑定与当时的对话焦点。
+///
+/// 经验不是「背答案」：它记录的是**怎么理解**——哪条模式、绑定到什么、
+/// 在什么焦点下发生。相同经验按 [`PatternEpisode::id`] 合并并累计次数，
+/// 从而让「支持度」本身成为可查询的数据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatternEpisode {
+    pub input: String,
+    /// 规范化后的词序列（词面 + 词性），用于结构相似检索。
+    pub tokens: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winner_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<(String, String)>,
+    /// 发生时的对话焦点（无焦点为 None）；检索时作为上下文守卫的弱条件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    pub outcome: EpisodeOutcome,
+    /// 同一经验被重复观察的次数（支持度）。
+    #[serde(default = "one_u32")]
+    pub count: u32,
+    #[serde(default)]
+    pub first_turn: usize,
+    #[serde(default)]
+    pub last_turn: usize,
+}
+
+fn one_u32() -> u32 {
+    1
+}
+
+impl PatternEpisode {
+    /// 经验身份：输入 + 命中模式 + 焦点 + 结果。同一次理解反复发生只累计次数。
+    pub fn id(&self) -> String {
+        fnv1a_hex(
+            format!(
+                "{}\u{0}{}\u{0}{}\u{0}{}",
+                self.input,
+                self.winner_id.as_deref().unwrap_or(""),
+                self.focus.as_deref().unwrap_or(""),
+                self.outcome.label()
+            )
+            .as_bytes(),
+        )
+    }
+
+    pub fn short_id(&self) -> String {
+        self.id().chars().take(8).collect()
+    }
+
+    /// 词面集合（去重、排除标点/空白），供相似度与骨架泛化使用。
+    fn surface_set(&self) -> BTreeSet<&str> {
+        self.tokens
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .filter(|text| !is_skippable(text))
+            .collect()
+    }
+}
+
+/// 相似经验检索结果（只读片段，避免为报告复制整条经验）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeNeighbor {
+    pub index: usize,
+    pub score: f64,
+    /// 与当前输入共享的词面（确定性序）。
+    pub shared: Vec<String>,
+}
+
+/// 由经验泛化出的候选模式：只用于确认，不直接参与路由。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseSuggestion {
+    pub episode: PatternEpisode,
+    pub score: f64,
+    pub shared: Vec<String>,
+    /// 候选条目（`route=false`；确认后应通过教学接口显式激活）。
+    pub pattern: PatternEntry,
+}
+
+/// 有界、去重、可检索的模式经验台账。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatternEpisodeLog {
+    entries: Vec<PatternEpisode>,
+    #[serde(default = "default_episode_capacity")]
+    capacity: usize,
+    #[serde(default)]
+    clock: usize,
+}
+
+fn default_episode_capacity() -> usize {
+    64
+}
+
+impl Default for PatternEpisodeLog {
+    fn default() -> Self {
+        Self::with_capacity(default_episode_capacity())
+    }
+}
+
+impl PatternEpisodeLog {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            capacity: capacity.max(1),
+            clock: 0,
+        }
+    }
+
+    pub fn entries(&self) -> &[PatternEpisode] {
+        &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn clock(&self) -> usize {
+        self.clock
+    }
+
+    pub fn matched_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|episode| episode.outcome == EpisodeOutcome::Matched)
+            .count()
+    }
+
+    pub fn unmatched_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|episode| episode.outcome == EpisodeOutcome::Unmatched)
+            .count()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// 记录一次成功理解（同身份经验累计次数并刷新最后轮次）。
+    pub fn record_match(
+        &mut self,
+        input: &str,
+        tokens: &[crate::nlp::TaggedWord],
+        matched: &PatternMatch,
+        focus: Option<&str>,
+        turn: usize,
+    ) -> PatternEpisode {
+        let bindings = matched
+            .bindings
+            .iter()
+            .filter_map(|(name, term)| term.render_raw().map(|value| (name.clone(), value)))
+            .collect();
+        let episode = PatternEpisode {
+            input: input.to_string(),
+            tokens: token_pairs(tokens),
+            winner_id: Some(matched.entry.id()),
+            winner_name: Some(matched.entry.name.clone()),
+            query_type: Some(matched.entry.query_type.clone()),
+            entities: matched.entities.clone(),
+            bindings,
+            focus: focus.map(str::to_string),
+            outcome: EpisodeOutcome::Matched,
+            count: 1,
+            first_turn: self.effective_turn(turn),
+            last_turn: self.effective_turn(turn),
+        };
+        self.upsert(episode.clone());
+        self.entries
+            .iter()
+            .find(|entry| entry.id() == episode.id())
+            .cloned()
+            .unwrap_or(episode)
+    }
+
+    /// 记录一次未命中（用于「上次为什么没懂」与候选骨架检索）。
+    pub fn record_unmatched(
+        &mut self,
+        input: &str,
+        tokens: &[crate::nlp::TaggedWord],
+        focus: Option<&str>,
+        turn: usize,
+    ) -> PatternEpisode {
+        let episode = PatternEpisode {
+            input: input.to_string(),
+            tokens: token_pairs(tokens),
+            winner_id: None,
+            winner_name: None,
+            query_type: None,
+            entities: Vec::new(),
+            bindings: Vec::new(),
+            focus: focus.map(str::to_string),
+            outcome: EpisodeOutcome::Unmatched,
+            count: 1,
+            first_turn: self.effective_turn(turn),
+            last_turn: self.effective_turn(turn),
+        };
+        self.upsert(episode.clone());
+        self.entries
+            .iter()
+            .find(|entry| entry.id() == episode.id())
+            .cloned()
+            .unwrap_or(episode)
+    }
+
+    fn effective_turn(&mut self, turn: usize) -> usize {
+        let effective = if turn == 0 { self.clock + 1 } else { turn };
+        self.clock = self.clock.max(effective);
+        effective
+    }
+
+    fn upsert(&mut self, episode: PatternEpisode) -> bool {
+        let id = episode.id();
+        if let Some(existing) = self.entries.iter_mut().find(|entry| entry.id() == id) {
+            existing.count = existing.count.saturating_add(1);
+            existing.last_turn = existing.last_turn.max(episode.last_turn);
+            existing.tokens = episode.tokens;
+            existing.entities = episode.entities;
+            existing.bindings = episode.bindings;
+            return false;
+        }
+        self.entries.push(episode);
+        self.enforce_capacity();
+        true
+    }
+
+    fn enforce_capacity(&mut self) {
+        while self.entries.len() > self.capacity {
+            // 失败经验先被淘汰；同为失败/成功时再淘汰支持度低、最久未用的。
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, episode)| {
+                    (
+                        u8::from(episode.outcome == EpisodeOutcome::Matched),
+                        episode.count,
+                        episode.last_turn,
+                        episode.id(),
+                    )
+                })
+                .map(|(index, _)| index);
+            match victim {
+                Some(index) => {
+                    self.entries.remove(index);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// 并入从图账本恢复的经验（同身份取较大支持度与较新轮次）。
+    pub fn merge_persisted(&mut self, episodes: &[PatternEpisode]) -> usize {
+        let mut added = 0usize;
+        for episode in episodes {
+            let id = episode.id();
+            if let Some(existing) = self.entries.iter_mut().find(|entry| entry.id() == id) {
+                existing.count = existing.count.max(episode.count);
+                existing.first_turn = existing.first_turn.min(episode.first_turn);
+                existing.last_turn = existing.last_turn.max(episode.last_turn);
+            } else {
+                self.entries.push(episode.clone());
+                added += 1;
+            }
+        }
+        self.clock = self
+            .clock
+            .max(self.entries.iter().map(|episode| episode.last_turn).max().unwrap_or(0));
+        self.enforce_capacity();
+        added
+    }
+
+    /// 按共享词面 + 焦点 + 结果检索相似经验（确定性排序）。
+    pub fn nearest(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        focus: Option<&str>,
+        limit: usize,
+    ) -> Vec<EpisodeNeighbor> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let current: BTreeSet<&str> = tokens
+            .iter()
+            .map(|token| token.text.as_str())
+            .filter(|text| !is_skippable(text))
+            .collect();
+        let mut neighbors: Vec<EpisodeNeighbor> = Vec::new();
+        for (index, episode) in self.entries.iter().enumerate() {
+            let stored = episode.surface_set();
+            let shared: Vec<String> = episode
+                .tokens
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .filter(|text| current.contains(text))
+                .fold(Vec::new(), |mut acc, text| {
+                    if !acc.iter().any(|seen| seen == text) {
+                        acc.push(text.to_string());
+                    }
+                    acc
+                });
+            let union = current.union(&stored).count().max(1);
+            let overlap = current.intersection(&stored).count() as f64 / union as f64;
+            let focus_bonus = match (episode.focus.as_deref(), focus) {
+                (Some(left), Some(right)) if left == right => 0.2,
+                _ => 0.0,
+            };
+            let outcome_bonus = if episode.outcome == EpisodeOutcome::Matched {
+                0.05
+            } else {
+                0.0
+            };
+            if shared.is_empty() && focus_bonus == 0.0 {
+                continue;
+            }
+            neighbors.push(EpisodeNeighbor {
+                index,
+                score: (overlap + focus_bonus + outcome_bonus).min(1.0),
+                shared,
+            });
+        }
+        neighbors.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    self.entries[b.index]
+                        .count
+                        .cmp(&self.entries[a.index].count)
+                })
+                .then_with(|| self.entries[a.index].id().cmp(&self.entries[b.index].id()))
+        });
+        neighbors.truncate(limit);
+        neighbors
+    }
+
+    /// 由最相似的成功经验泛化出「临时模式」：共享词保留为词面，
+    /// 当前输入中的新内容词升为槽位。候选项 `route=false`，只能被确认后教学激活。
+    pub fn suggest_case(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        focus: Option<&str>,
+        min_score: f64,
+    ) -> Option<CaseSuggestion> {
+        let neighbor = self.nearest(tokens, focus, 1).into_iter().next()?;
+        if neighbor.score < min_score {
+            return None;
+        }
+        let episode = self.entries.get(neighbor.index)?.clone();
+        if episode.outcome != EpisodeOutcome::Matched {
+            return None;
+        }
+        let shared = episode.surface_set();
+        let mut elems = Vec::new();
+        let mut slot_number = 0usize;
+        for token in tokens {
+            let text = token.text.trim();
+            if text.is_empty() || is_skippable(text) {
+                continue;
+            }
+            if shared.contains(text) {
+                elems.push(Elem::word(text));
+                continue;
+            }
+            let sort = match token.pos.as_str() {
+                "nr" => "人名",
+                "ns" | "nt" => "地点",
+                "n" | "nz" | "vn" => "实体",
+                "m" => "数量",
+                _ => "",
+            };
+            if sort.is_empty() {
+                elems.push(Elem::word(text));
+            } else {
+                slot_number += 1;
+                elems.push(Elem::slot(format!("槽{}", slot_number), sort));
+            }
+        }
+        if elems.is_empty() {
+            return None;
+        }
+        let query_type = episode.query_type.clone()?;
+        let entry = PatternEntry::new(
+            format!("案例候选：{}", episode.winner_name.as_deref().unwrap_or("经验")),
+            format!("case#{}", episode.short_id()),
+            query_type,
+            5,
+            false,
+            elems,
+        );
+        // 候选必须能解释当前输入；否则宁可不出建议。
+        match_entry(&entry, tokens).ok()?;
+        Some(CaseSuggestion {
+            episode,
+            score: neighbor.score,
+            shared: neighbor.shared,
+            pattern: entry,
+        })
+    }
+}
+
+fn token_pairs(tokens: &[crate::nlp::TaggedWord]) -> Vec<(String, String)> {
+    tokens
+        .iter()
+        .map(|token| (token.text.clone(), token.pos.clone()))
+        .collect()
 }
 
 /// 单个候选的评估结果（报告用；不携带完整解，避免大对象复制）。
@@ -1193,6 +1637,122 @@ fn entity_span_for<'a>(m: &'a PatternMatch, name: &str) -> Option<&'a Span> {
     m.entity_spans.get(index.checked_sub(1)?)
 }
 
+/// 模式经验台账的文本报告（总量 + 高频 + 最近）。
+pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let total_support: u32 = log.entries().iter().map(|episode| episode.count).sum();
+    let _ = writeln!(
+        out,
+        "模式经验：{} 条（命中 {} + 未命中 {}），容量 {}，累计支持度 {}。",
+        log.len(),
+        log.matched_count(),
+        log.unmatched_count(),
+        log.capacity(),
+        total_support
+    );
+    if log.is_empty() {
+        let _ = writeln!(out, "（还没有经验：成功或失败的解析都会留下可检索的记录）");
+        return out;
+    }
+    let mut frequent: Vec<&PatternEpisode> = log.entries().iter().collect();
+    frequent.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| b.last_turn.cmp(&a.last_turn))
+            .then_with(|| a.id().cmp(&b.id()))
+    });
+    let _ = writeln!(out, " 高频经验：");
+    for episode in frequent.iter().take(5) {
+        let target = episode
+            .winner_name
+            .as_deref()
+            .map(|name| {
+                format!(
+                    "{} → {}",
+                    name,
+                    episode.query_type.as_deref().unwrap_or("")
+                )
+            })
+            .unwrap_or_else(|| "（无可路由命中）".to_string());
+        let focus = episode
+            .focus
+            .as_deref()
+            .map(|focus| format!("，焦点 {}", focus))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  {} ×{} 第{}轮{}：{}",
+            target, episode.count, episode.last_turn, focus, episode.input
+        );
+    }
+    let mut recent: Vec<&PatternEpisode> = log.entries().iter().collect();
+    recent.sort_by(|a, b| {
+        b.last_turn
+            .cmp(&a.last_turn)
+            .then_with(|| a.id().cmp(&b.id()))
+    });
+    let _ = writeln!(out, " 最近经验：");
+    for episode in recent.iter().take(5) {
+        let _ = writeln!(
+            out,
+            "  [{}] 第{}轮 {}：{}",
+            episode.outcome.label(),
+            episode.last_turn,
+            episode.short_id(),
+            episode.input
+        );
+    }
+    out
+}
+
+/// 候选骨架的文本报告：相似经验 + 候选模式 + 显式激活方式。
+pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let episode = &suggestion.episode;
+    let _ = writeln!(
+        out,
+        "模式联想「{}」：相似经验 {}（{:.2}，共享：{}）",
+        input,
+        episode.input,
+        suggestion.score,
+        if suggestion.shared.is_empty() {
+            "无".to_string()
+        } else {
+            suggestion.shared.join("、")
+        }
+    );
+    let _ = writeln!(
+        out,
+        " 经验命中：{} → {}（第{}轮，×{}）",
+        episode.winner_name.as_deref().unwrap_or("未知模式"),
+        episode.query_type.as_deref().unwrap_or("未知路由"),
+        episode.last_turn,
+        episode.count
+    );
+    let _ = writeln!(out, " 候选模式：{}", suggestion.pattern.render());
+    let _ = writeln!(
+        out,
+        " 候选路由：{}（来源 {}，未激活）",
+        suggestion.pattern.query_type,
+        suggestion.pattern.source
+    );
+    let _ = writeln!(
+        out,
+        " 确认方式：教模式：{} | {} | {} | {}",
+        suggestion.pattern.name,
+        suggestion.pattern.render(),
+        suggestion.pattern.query_type,
+        suggestion.pattern.priority
+    );
+    let _ = writeln!(
+        out,
+        " 边界：候选只用于确认，不直接回答；确认后才进入可路由模式库。"
+    );
+    out
+}
+
 // ---------------------------------------------------------------------------
 // 静态体检：重复 / 遮蔽 / 冲突
 // ---------------------------------------------------------------------------
@@ -1492,6 +2052,17 @@ const P_GENERALIZES: &str = "http://example.org/kg/ledger/generalizes";
 const P_REDUNDANT: &str = "http://example.org/kg/ledger/redundantWith";
 const P_CONFLICTS: &str = "http://example.org/kg/ledger/conflictsWith";
 
+/// 模式经验命名图：一次理解的经验与图谱/模式定义分开存放。
+pub const EPISODES_GRAPH: &str = "http://example.org/kg/graphs/pattern-episodes";
+
+const EPISODE_CLASS: &str = "http://example.org/kg/ledger/Episode";
+const EPISODE_STAMP_SUBJECT: &str = "http://example.org/kg/ledger/episodeStamp";
+
+const P_EPISODE_JSON: &str = "http://example.org/kg/ledger/episodeJson";
+const P_EPISODE_INPUT: &str = "http://example.org/kg/ledger/input";
+const P_EPISODE_OUTCOME: &str = "http://example.org/kg/ledger/outcome";
+const P_EPISODE_LAST_TURN: &str = "http://example.org/kg/ledger/lastTurn";
+
 fn named_node(iri: &str) -> LedgerResult<NamedNode> {
     Ok(NamedNode::new(iri)?)
 }
@@ -1609,6 +2180,92 @@ pub fn parse_pattern_graph(quads: impl Iterator<Item = Quad>) -> Vec<PatternEntr
     by_subject
         .into_values()
         .filter_map(|json| serde_json::from_str::<PatternEntry>(&json).ok())
+        .collect()
+}
+
+/// 经验集指纹（按经验 id 升序折叠，与插入顺序无关）。
+pub fn episode_fingerprint(episodes: &[PatternEpisode]) -> String {
+    let mut ids: Vec<String> = episodes.iter().map(PatternEpisode::id).collect();
+    ids.sort();
+    fnv1a_hex(ids.join("\n").as_bytes())
+}
+
+/// 生成模式经验账本的全部四元组（独立命名图 + 物化戳）。
+pub fn episode_quads(episodes: &[PatternEpisode]) -> LedgerResult<Vec<Quad>> {
+    let graph = GraphName::NamedNode(named_node(EPISODES_GRAPH)?);
+    let rdf_type = named_node(RDF_TYPE)?;
+    let episode_class = Term::NamedNode(named_node(EPISODE_CLASS)?);
+    let mut quads: Vec<Quad> = Vec::with_capacity(episodes.len() * 5 + 3);
+    for episode in episodes {
+        let subject = named_node(&format!("{}episode/{}", LEDGER_NS, episode.id()))?;
+        quads.push(Quad::new(
+            subject.clone(),
+            rdf_type.clone(),
+            episode_class.clone(),
+            graph.clone(),
+        ));
+        quads.push(literal_quad(
+            &subject,
+            P_EPISODE_JSON,
+            &serde_json::to_string(episode)?,
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_EPISODE_INPUT,
+            &episode.input,
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_EPISODE_OUTCOME,
+            episode.outcome.label(),
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_EPISODE_LAST_TURN,
+            &episode.last_turn.to_string(),
+            &graph,
+        )?);
+    }
+    let stamp = named_node(EPISODE_STAMP_SUBJECT)?;
+    quads.push(Quad::new(
+        stamp.clone(),
+        rdf_type,
+        Term::NamedNode(named_node(STAMP_CLASS)?),
+        graph.clone(),
+    ));
+    quads.push(literal_quad(
+        &stamp,
+        P_FINGERPRINT,
+        &episode_fingerprint(episodes),
+        &graph,
+    )?);
+    quads.push(literal_quad(
+        &stamp,
+        P_COUNT,
+        &episodes.len().to_string(),
+        &graph,
+    )?);
+    Ok(quads)
+}
+
+/// 从经验命名图还原经验（按 id 升序，确定性；物化戳忽略）。
+pub fn parse_episode_graph(quads: impl Iterator<Item = Quad>) -> Vec<PatternEpisode> {
+    let mut by_subject: BTreeMap<String, String> = BTreeMap::new();
+    for quad in quads {
+        if quad.predicate.as_str() != P_EPISODE_JSON {
+            continue;
+        }
+        let subject = quad.subject.to_string();
+        if let Term::Literal(value) = quad.object {
+            by_subject.insert(subject, value.value().to_string());
+        }
+    }
+    by_subject
+        .into_values()
+        .filter_map(|json| serde_json::from_str::<PatternEpisode>(&json).ok())
         .collect()
 }
 
@@ -2311,5 +2968,115 @@ mod tests {
         // BindingSet::bind 走分类：文本按数值/文本归类
         assert_eq!(term.render_raw().as_deref(), Some("人"));
         assert!(matches!(term, BoundTerm::Text { .. }));
+    }
+
+    #[test]
+    fn episodes_merge_repeats_and_evict_by_recency() {
+        let library = sample_library();
+        let tokens = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let m = library.match_route(&tokens).expect("应命中");
+        let mut log = PatternEpisodeLog::with_capacity(3);
+        let first = log.record_match("法国的首都是哪里", &tokens, &m, Some("法国"), 2);
+        assert_eq!(first.count, 1);
+        assert_eq!(first.outcome, EpisodeOutcome::Matched);
+        let again = log.record_match("法国的首都是哪里", &tokens, &m, Some("法国"), 3);
+        assert_eq!(again.count, 2, "同一经验应累计支持度");
+        assert_eq!(log.len(), 1, "相同经验不重复占容量");
+        assert_eq!(log.clock(), 3);
+
+        for turn in 4..8 {
+            log.record_unmatched(&format!("未知句子{}", turn), &tagged(&[("未知", "n")]), None, turn);
+        }
+        assert_eq!(log.len(), 3, "容量必须封顶");
+        assert_eq!(log.matched_count(), 1);
+        assert_eq!(log.unmatched_count(), 2);
+        assert!(
+            log.entries().iter().any(|episode| episode.input == "法国的首都是哪里"),
+            "最近使用的经验不应被淘汰"
+        );
+        let report = render_episode_report(&log);
+        assert!(report.contains("模式经验：3 条"), "{}", report);
+        assert!(report.contains("×2"), "{}", report);
+    }
+
+    #[test]
+    fn episode_quads_roundtrip_in_isolated_graph() {
+        let tokens = tagged(&[("这", "r"), ("是", "v")]);
+        let mut log = PatternEpisodeLog::with_capacity(8);
+        let left = log.record_unmatched("这是", &tokens, Some("焦点"), 1);
+        let right = log.record_unmatched("那是", &tokens, None, 2);
+        let quads = episode_quads(log.entries()).expect("生成经验四元组");
+        assert_eq!(
+            quads[0].graph_name,
+            oxigraph::model::GraphName::NamedNode(
+                oxigraph::model::NamedNode::new(EPISODES_GRAPH).unwrap()
+            )
+        );
+        let restored = parse_episode_graph(quads.into_iter());
+        assert_eq!(restored.len(), 2);
+        let mut ids: Vec<String> = restored.iter().map(PatternEpisode::id).collect();
+        ids.sort();
+        let mut expected = vec![left.id(), right.id()];
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            episode_fingerprint(&restored),
+            episode_fingerprint(log.entries()),
+            "经验集指纹与插入顺序无关"
+        );
+    }
+
+    #[test]
+    fn case_suggestion_generalizes_unseen_entity_but_stays_inactive() {
+        let library = sample_library();
+        let stored = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = library.match_route(&stored).expect("应命中");
+        let mut log = PatternEpisodeLog::default();
+        log.record_match("法国的首都是哪里", &stored, &matched, Some("法国"), 4);
+
+        let current = tagged(&[
+            ("德国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("在", "v"),
+            ("哪里", "r"),
+        ]);
+        let suggestion = log
+            .suggest_case(&current, Some("法国"), 0.2)
+            .expect("相似经验应给出候选骨架");
+        assert!(suggestion.score >= 0.2);
+        assert_eq!(suggestion.episode.winner_name.as_deref(), Some("首都查询"));
+        assert!(!suggestion.pattern.route, "候选不得直接参与路由");
+        assert_eq!(suggestion.pattern.source, format!("case#{}", suggestion.episode.short_id()));
+        assert!(
+            suggestion.pattern.render().contains("槽1:地点"),
+            "未见实体应升为地点槽：{}",
+            suggestion.pattern.render()
+        );
+        assert!(
+            match_entry(&suggestion.pattern, &current).is_ok(),
+            "候选必须能解释当前输入"
+        );
+        let report = render_case_suggestion("德国的首都在哪里", &suggestion);
+        assert!(report.contains("未激活"), "{}", report);
+        assert!(report.contains("确认方式"), "{}", report);
+
+        let unmatched = tagged(&[("今天", "t"), ("心情", "n"), ("不错", "a")]);
+        assert!(
+            log.suggest_case(&unmatched, None, 0.2).is_none(),
+            "无共享词且无焦点时不应硬造候选"
+        );
     }
 }

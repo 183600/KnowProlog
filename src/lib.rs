@@ -3773,6 +3773,41 @@ impl OxigraphManager {
         Ok(pattern_ir::parse_pattern_graph(quads.into_iter()))
     }
 
+    /// 同步模式经验账本：清空 `kg:graphs/pattern-episodes` 后全量重写
+    /// （幂等；不推进知识版本）。经验与模式定义分图存放，互不污染。
+    pub async fn sync_pattern_episodes(
+        &self,
+        episodes: &[pattern_ir::PatternEpisode],
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = pattern_ir::episode_quads(episodes)?;
+        let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::EPISODES_GRAPH)?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("pattern_episode_sync");
+        Ok(episodes.len())
+    }
+
+    /// 读取模式经验账本（按经验 id 升序，确定性；不触碰任何缓存）。
+    pub async fn load_pattern_episodes(
+        &self,
+    ) -> Result<Vec<pattern_ir::PatternEpisode>, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::EPISODES_GRAPH)?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("pattern_episode_load");
+        Ok(pattern_ir::parse_episode_graph(quads.into_iter()))
+    }
+
     /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
     ///
     /// 每条派生事实带规则来源、前提、推导轮次、置信度与物化戳
@@ -4819,6 +4854,55 @@ mod cache_tests {
         manager.sync_pattern_ledger(&[]).await.unwrap();
         let cleared = manager.load_pattern_ledger().await.unwrap();
         assert!(cleared.is_empty(), "空集同步必须清空模式账本");
+    }
+
+    /// 模式经验账本经存储往返一致；经验与模式定义分图；空集同步清空。
+    #[tokio::test]
+    async fn pattern_episode_ledger_store_roundtrip_and_isolated_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let revision = manager.revision();
+        let tokens = vec![crate::nlp::TaggedWord {
+            text: "法国".to_string(),
+            pos: "ns".to_string(),
+        }];
+        let mut log = crate::pattern_ir::PatternEpisodeLog::with_capacity(8);
+        log.record_unmatched("法国的首都是哪里", &tokens, Some("法国"), 3);
+        log.record_unmatched("这是另一句", &tokens, None, 4);
+
+        assert_eq!(
+            manager.sync_pattern_episodes(log.entries()).await.unwrap(),
+            2
+        );
+        let loaded = manager.load_pattern_episodes().await.unwrap();
+        let mut expected: Vec<_> = log.entries().to_vec();
+        expected.sort_by_key(crate::pattern_ir::PatternEpisode::id);
+        assert_eq!(loaded, expected, "经验账本往返应逐条一致");
+        assert_eq!(manager.revision(), revision, "经验写入不推进知识版本");
+
+        // 模式定义图不受经验图影响
+        let config: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = crate::pattern_ir::PatternLibrary::from_config(&config);
+        manager
+            .sync_pattern_ledger(library.entries())
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.load_pattern_ledger().await.unwrap().len(),
+            library.len()
+        );
+        assert_eq!(manager.load_pattern_episodes().await.unwrap().len(), 2);
+
+        manager.sync_pattern_episodes(&[]).await.unwrap();
+        assert!(
+            manager.load_pattern_episodes().await.unwrap().is_empty(),
+            "空集同步必须清空经验账本"
+        );
+        assert_eq!(
+            manager.load_pattern_ledger().await.unwrap().len(),
+            library.len(),
+            "清空经验不得影响模式定义"
+        );
     }
 
     /// 派生账本经存储往返一致，物化戳（版本 + 指纹）可审计；重物化全量替换。
