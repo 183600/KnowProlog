@@ -8,6 +8,7 @@ use crate::abduction::{
     Scenario,
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
+use crate::belief_revision::{BeliefState, ChangeSet, RevisionConstraints};
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
@@ -2135,6 +2136,43 @@ impl SymbolicReasoner {
         let mut book = self.laws.clone();
         let audit = book.audit(self.predictor.triples());
         format!("{}{}", book.render_text(), audit.render_text())
+    }
+
+    /// 当前会话的信念快照：复用归结引擎与已声明的谓词约束，不复制另一套事实。
+    pub fn belief_state(&self) -> BeliefState {
+        let constraints = match &self.law_registry {
+            Some(registry) => RevisionConstraints::from_registry(registry),
+            None => RevisionConstraints::from_law_book(&self.laws),
+        };
+        BeliefState::with_constraints(self.resolver.clone(), constraints)
+    }
+
+    /// 只读一致性报告：功能谓词多值、定义域/值域冲突与规则形状问题。
+    pub fn belief_check_report(&self) -> String {
+        self.belief_state().check().render_zh()
+    }
+
+    /// 更正预演：在提交到图谱之前，先展示受影响的事实/派生结论与冲突。
+    /// 只计算、不修改知识库；真正的写入仍由宿主的更正路径完成。
+    pub fn belief_revision_preview(
+        &self,
+        entity: &str,
+        predicate: &str,
+        old_value: &str,
+        new_value: &str,
+    ) -> String {
+        let entity = self.aligner.canonical_form(entity.trim());
+        let predicate = self
+            .canonical_attribute(predicate)
+            .unwrap_or_else(|| predicate.trim().to_string());
+        let state = self.belief_state();
+        let changeset = ChangeSet::new(format!(
+            "预演更正：{}.{} 由「{}」改为「{}」",
+            entity, predicate, old_value, new_value
+        ))
+        .retract(&predicate, &entity, old_value)
+        .assert(&predicate, &entity, new_value);
+        state.plan(changeset).render_zh()
     }
 
     fn rebuild_laws(&mut self) {

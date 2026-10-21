@@ -5999,6 +5999,41 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 信念一致性：提交前闸门（功能谓词多值 / 定义域 / 值域 / 规则形状）
+        if matches!(input, "信念检查" | "信念一致性" | "推理一致性") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.belief_check_report());
+            println!();
+            continue;
+        }
+
+        // 修订预演：更正落库前先展示受影响事实、派生结论与阻止级冲突；只计算不写图
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["修订预演：", "修订预演:", "提交预演：", "提交预演:"],
+        ) {
+            let target = target.trim();
+            match parse_correction_spec(target) {
+                None => println!(
+                    "请给出实体、属性、旧值与新值，例如：修订预演：姚明的身高从226改为229（或 修订预演：姚明|height|226|229）。"
+                ),
+                Some((entity, predicate, old_value, new_value)) => {
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                    println!(
+                        "{}",
+                        symbolic_reasoner.belief_revision_preview(
+                            &entity,
+                            &predicate,
+                            &old_value,
+                            &new_value
+                        )
+                    );
+                }
+            }
+            println!();
+            continue;
+        }
+
         // 更正知识：删除旧值、写入新值，并把「旧值错了」写成可追踪的事件
         if let Some(target) = strip_any_prefix(
             input,
@@ -8601,6 +8636,8 @@ fn interactive_help() -> String {
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
+        "  修订预演：<实体>|<属性>|<旧>|<新>   提交前计算影响与冲突（只计算，不写图）",
+        "  信念检查 / 信念一致性              功能谓词多值、定义域/值域与规则形状体检",
         "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
         "",
         "台账与报告",
