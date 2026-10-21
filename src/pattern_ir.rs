@@ -1162,7 +1162,7 @@ impl PatternEpisodeLog {
             return None;
         }
         let query_type = episode.query_type.clone()?;
-        let entry = PatternEntry::new(
+        let mut entry = PatternEntry::new(
             format!("案例候选：{}", episode.winner_name.as_deref().unwrap_or("经验")),
             format!("case#{}", episode.short_id()),
             query_type,
@@ -1170,6 +1170,18 @@ impl PatternEpisodeLog {
             false,
             elems,
         );
+        // 当前输入没有显式实体（靠焦点补全的省略/指代问句）时，
+        // 候选必须带上焦点守卫；确认转正后也不会在无焦点时误答。
+        let has_explicit_entity = tokens
+            .iter()
+            .any(|token| matches!(token.pos.as_str(), "nr" | "ns" | "nt"));
+        if !has_explicit_entity {
+            if let Some(sort) = &context.focus_type {
+                entry = entry.with_guard(ContextGuard::focus_type(sort.clone()));
+            } else if context.focus.is_some() {
+                entry = entry.with_guard(ContextGuard::focus());
+            }
+        }
         // 候选必须能解释当前输入；否则宁可不出建议。
         match_entry(&entry, tokens).ok()?;
         Some(CaseSuggestion {
@@ -2212,11 +2224,18 @@ pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> Strin
         let _ = writeln!(out, " 发生上下文：{}", context);
     }
     let _ = writeln!(out, " 候选模式：{}", suggestion.pattern.render());
+    let guard = suggestion
+        .pattern
+        .guard
+        .as_ref()
+        .map(|guard| format!("，守卫 {}", guard.render()))
+        .unwrap_or_default();
     let _ = writeln!(
         out,
-        " 候选路由：{}（来源 {}，未激活）",
+        " 候选路由：{}（来源 {}，未激活{}）",
         suggestion.pattern.query_type,
-        suggestion.pattern.source
+        suggestion.pattern.source,
+        guard
     );
     let _ = writeln!(
         out,
@@ -3726,6 +3745,49 @@ mod tests {
         let episode_report = render_episode_report(&log);
         assert!(episode_report.contains("上轮 ask_attribute"), "{}", episode_report);
         assert!(episode_report.contains("焦点 法国(地点)"), "{}", episode_report);
+    }
+
+    #[test]
+    fn elliptical_case_suggestion_keeps_focus_guard_after_acceptance() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "身高查询",
+            "config.toml#身高查询",
+            "height_query",
+            10,
+            true,
+            vec![Elem::pos("nr"), Elem::word("的"), Elem::word("身高")],
+        ));
+        let stored = tagged(&[("姚明", "nr"), ("的", "u"), ("身高", "n")]);
+        let matched = library.match_route(&stored).expect("应命中");
+        let focus_context = PatternContext {
+            focus: Some("姚明".to_string()),
+            focus_type: Some("人物".to_string()),
+            last_move: Some("ask_attribute".to_string()),
+            ..PatternContext::default()
+        };
+        let mut log = PatternEpisodeLog::default();
+        log.record_match_with_context("姚明的身高", &stored, &matched, &focus_context);
+
+        let elliptical = tagged(&[("身高", "n"), ("呢", "u")]);
+        let suggestion = log
+            .suggest_case_with_context(&elliptical, &focus_context, 0.2)
+            .expect("相似经验应给出省略问法候选");
+        assert_eq!(
+            suggestion.pattern.guard,
+            Some(ContextGuard::focus_type("人物")),
+            "省略问法候选必须带焦点类型守卫"
+        );
+        let mut active = library.clone();
+        active.accept_case(&suggestion).expect("确认应成功");
+        assert!(
+            active.match_route(&elliptical).is_none(),
+            "无焦点时守卫必须拦住省略问法"
+        );
+        assert_eq!(
+            active.route_with_context(&elliptical, &focus_context),
+            Some(("height_query".to_string(), Vec::new()))
+        );
     }
 
     #[test]
