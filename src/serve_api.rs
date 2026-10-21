@@ -4045,6 +4045,28 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
     }
 
     #[tokio::test]
+    async fn sse_deadline_done_event_carries_fault_and_open_turn() {
+        let (addr, _server) =
+            start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
+        let session_id = create_session(addr).await;
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[("Accept", "text/event-stream")],
+            "姚明的身高是多少",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        assert!(body.contains("\"phase\":\"prepare\""), "{}", body);
+        assert!(body.contains("\"status\":\"deadline\""), "{}", body);
+        assert!(body.contains("\"fault\""), "{}", body);
+        assert!(body.contains("\"open_turn\""), "{}", body);
+        assert!(body.contains("\"resumable\":true"), "{}", body);
+        assert!(body.contains("[DONE]"), "{}", body);
+    }
+
+    #[tokio::test]
     async fn openai_compat_models_and_completion() {
         let (addr, _server) = start_server(4);
         let (status, _, body) = raw_request(addr, "GET", "/v1/models", &[], "").await;
