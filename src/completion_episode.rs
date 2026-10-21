@@ -614,6 +614,27 @@ impl CompletionLedger {
         self.tick
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.episodes.is_empty() && self.rules.is_empty() && self.refuted_triples.is_empty()
+    }
+
+    /// 从持久化快照恢复后重新夹紧上限：快照文件不可信，不能让其中的
+    /// 超大上限把有界闭包变成无界计算。
+    pub fn clamp_limits(&mut self) {
+        self.max_candidates = self
+            .max_candidates
+            .clamp(1, DEFAULT_MAX_EPISODE_CANDIDATES);
+        self.max_closure = self.max_closure.clamp(1, DEFAULT_MAX_CLOSURE_CANDIDATES);
+        self.max_episodes = self.max_episodes.clamp(1, DEFAULT_MAX_EPISODES);
+        self.max_rules = self.max_rules.clamp(1, DEFAULT_MAX_RULES);
+        self.max_batch_entities = self
+            .max_batch_entities
+            .clamp(1, DEFAULT_MAX_BATCH_ENTITIES);
+        self.episodes.truncate(self.max_episodes);
+        self.rules.truncate(self.max_rules);
+        self.active = self.active.filter(|index| *index < self.episodes.len());
+    }
+
     pub fn rules(&self) -> &[LearnedRule] {
         &self.rules
     }

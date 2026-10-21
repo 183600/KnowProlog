@@ -307,6 +307,10 @@ pub struct DialogueSnapshot {
     // 未教过公理时缺省为 None，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ontology: Option<OntologyCapsule>,
+    // 补全回合台账（候选/裁决/规则/作用域），跨会话持久化后可继续裁定；
+    // 空台账不落盘，旧快照字节保持不变
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<CompletionLedger>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -516,6 +520,7 @@ impl DialogueContext {
             contrast: None,
             frames: None,
             ontology: None,
+            completion: None,
         }
     }
 
@@ -9193,6 +9198,7 @@ impl SymbolicReasoner {
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
         snapshot.frames = Some(self.frames.clone());
         snapshot.ontology = self.discourse.ontology_capsule();
+        snapshot.completion = (!self.completion.is_empty()).then(|| self.completion.clone());
         snapshot
     }
 
@@ -9274,6 +9280,10 @@ impl SymbolicReasoner {
             self.sync_retrieval_type_hierarchy();
         }
         self.context.restore(snapshot);
+        // 补全回合：先恢复台账，后续会话事实/规则重建时即可带上已晋升的全局规则。
+        // 旧快照没有该字段时清空，避免把上一个会话的回合串进新会话。
+        self.completion = snapshot.completion.clone().unwrap_or_default();
+        self.completion.clamp_limits();
         // 话语帧记忆：恢复上一帧与挂账（重启后接着补全未竟之问）
         if let Some(frames) = &snapshot.frames {
             self.frames = frames.clone();
@@ -9384,6 +9394,16 @@ impl SymbolicReasoner {
                 if self.config.enable_resolution {
                     self.rebuild_resolver();
                 }
+            }
+        }
+        // 只有补全台账、没有会话事实/规则时，前面的分支不会触发重建；
+        // 这里补一次，确保已晋升的全局规则立即进入归结与软逻辑。
+        if snapshot.completion.is_some() {
+            if self.config.enable_resolution {
+                self.rebuild_resolver();
+            }
+            if self.config.enable_soft_logic {
+                self.rebuild_soft_logic();
             }
         }
         Ok(())
@@ -14333,6 +14353,51 @@ types = [
             "显式晋升后规则应进入全局归结"
         );
         assert!(reasoner.completion_rules_report().contains("全局"));
+
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(
+            snapshot.completion.is_some(),
+            "非空补全台账应进入会话快照"
+        );
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("补全台账快照应可恢复");
+        assert_eq!(
+            restored.completion_ledger(),
+            reasoner.completion_ledger(),
+            "补全回合应原样跨会话恢复"
+        );
+        assert_eq!(
+            restored.completion_ledger().reasoning_clauses().len(),
+            1,
+            "恢复后已晋升的全局规则仍应参与归结"
+        );
+        assert!(
+            restored
+                .answer("孙八的师祖是谁")
+                .expect("恢复后应可回答")
+                .contains("吴十"),
+            "恢复的会话事实必须继续生效"
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "knowprolog_completion_state_{}.json",
+            std::process::id()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+        let mut loaded = SymbolicReasoner::new(test_config(), HashMap::new());
+        assert!(
+            loaded.load_dialogue_state(&path_str),
+            "补全回合应能随对话状态落盘并读回"
+        );
+        assert_eq!(
+            loaded.completion_ledger(),
+            reasoner.completion_ledger(),
+            "落盘往返后补全台账应保持不变"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
