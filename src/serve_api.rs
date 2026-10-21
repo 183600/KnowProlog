@@ -1076,18 +1076,32 @@ impl ApiState {
         let mut reasoner = self.warm.reasoner.lock();
         let applied = reasoner.align_predicate_pairs(pairs);
         reasoner.configure_laws(laws);
+        drop(reasoner);
+        // 谓词对齐与律典重配都改变选路/结论：旧的无状态答案可能按旧词面缓存，
+        // 必须整体失效（律典即使无新别名也重放，故此处无条件推进纪元）。
+        self.bump_identity_epoch();
         applied
     }
 
     /// 宿主注入实体身份注册表里已确认的持久别名（别名与规范名同权），
     /// 使 CLI 里签过字的指称在 HTTP 会话同样可解。返回生效条数。
     pub fn align_entity_aliases(&self, aliases: &[(String, String)]) -> usize {
-        self.warm.reasoner.lock().align_entity_aliases(aliases)
+        let applied = self.warm.reasoner.lock().align_entity_aliases(aliases);
+        // 新别名让旧词面指向新实体：缓存里的旧答案可能已改口。
+        if applied > 0 {
+            self.bump_identity_epoch();
+        }
+        applied
     }
 
     /// 宿主注入律典（跨重启的采纳/退役决定），返回载入的显式决定条数。
     pub fn load_law_book(&self, laws: crate::law_book::LawBook) -> usize {
-        self.warm.reasoner.lock().load_persisted_laws(laws)
+        let applied = self.warm.reasoner.lock().load_persisted_laws(laws);
+        // 采纳/退役定律会改变推理结论，缓存须随之失效。
+        if applied > 0 {
+            self.bump_identity_epoch();
+        }
+        applied
     }
 
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
@@ -3732,6 +3746,45 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(state.perf.count("identity_epoch_bumps"), 1);
         assert_eq!(state.perf.count("answer_cache_hits"), 2);
         assert_eq!(state.perf.count("answer_cache_misses"), 1);
+    }
+
+    /// 运行时注入谓词对齐/实体别名也必须推进纪元并失效无状态缓存：
+    /// CLI「确认身份」等签过字的说法在热路径注入后应立即生效且不污染旧缓存。
+    #[tokio::test]
+    async fn alignment_injection_invalidates_stateless_cache() {
+        let state = test_state(4);
+        let response = TurnResponse {
+            session_id: "s-1".to_string(),
+            turn: 1,
+            status: "answered".to_string(),
+            source: "reasoner".to_string(),
+            kind: None,
+            plan: Vec::new(),
+            reply: "旧答案".to_string(),
+            focus: None,
+            policy: SessionPolicy::default(),
+            epistemic: None,
+            entities: Vec::new(),
+            board: None,
+        };
+        let key = stateless_answer_key(&["明哥的身高是多少".to_string()], None);
+        let epoch = state.cache_epoch();
+        state.store_stateless_answer(epoch, key.clone(), response.clone());
+        assert!(state.cached_stateless_answer(epoch, &key).is_some());
+
+        state.align_entity_aliases(&[("明哥".to_string(), "姚明".to_string())]);
+        let bumped = state.cache_epoch();
+        assert_ne!(epoch, bumped);
+        assert!(state.cached_stateless_answer(bumped, &key).is_none());
+
+        state.align_predicate_pairs(
+            &[("老师".to_string(), "师傅".to_string(), false)],
+            &crate::predicate_registry::PredicateRegistry::default(),
+        );
+        let bumped2 = state.cache_epoch();
+        assert_ne!(bumped, bumped2);
+        assert!(state.cached_stateless_answer(bumped2, &key).is_none());
+        assert!(state.perf.count("identity_epoch_bumps") >= 2);
     }
 
     #[tokio::test]
