@@ -449,7 +449,7 @@ pub struct AliasNomination {
 }
 
 /// 绑定账本：会话记忆的显式承载（随快照持久化）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingLedger {
     #[serde(default)]
     turn: u64,

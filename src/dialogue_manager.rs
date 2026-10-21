@@ -20,7 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::binding_frames::{FrameMemory, FrameProgram};
 use crate::bindings::BindingSet;
+use crate::contextual_reference::{
+    parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
+    ContextualResolver, SenseSource,
+};
 use crate::derivation::Derivation;
+use crate::entity_linker::EntityLinker;
 use crate::epistemic::{EpistemicStatus, LedgerLoad};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
@@ -141,6 +146,9 @@ pub struct DialogueManagerSnapshot {
     /// 绑定帧记忆：空态省略，未启用绑定帧的会话字节不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<FrameMemory>,
+    /// 语境指称绑定：空态省略，未发生澄清的会话字节不变。
+    #[serde(default, skip_serializing_if = "BindingLedger::is_empty")]
+    pub references: BindingLedger,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -166,6 +174,25 @@ pub struct RecoveryNotice {
     pub evidence: Vec<String>,
     /// 挂账追问（如有）。
     pub question: Option<String>,
+}
+
+/// 语境指称消歧的只读视图：链接器候选 + 义项来源。
+///
+/// 只有实现方显式提供时，[`DialogueManager`] 才会走「候选 → 裁决 → 澄清 →
+/// 绑定」的链接栈；缺省（`None`）保持纯字面 `entities_in` 行为。
+pub struct ReferenceView<'a> {
+    pub linker: &'a EntityLinker,
+    pub source: &'a dyn SenseSource,
+}
+
+/// 一轮语境链接的落点。
+enum ReferenceDecision {
+    /// 候选分裂：返回澄清问题文本与指称词面。
+    Clarify(String, String),
+    /// 已裁决/已绑定：用规范实体改写后的输入继续下游。
+    Rewrite(String),
+    /// 本轮跳过链接（用户拒绝澄清或无需改写）。
+    Skip,
 }
 
 /// 管理器向知识源提出的接口（由 `SymbolicReasoner` 或测试替身实现）。
@@ -258,6 +285,11 @@ pub trait DialogueKnowledge {
         false
     }
 
+    /// 语境指称消歧视图（链接器 + 义项卡）。缺省不启用 CRD。
+    fn reference_view(&self) -> Option<ReferenceView<'_>> {
+        None
+    }
+
     /// 恢复通道 L1：换帧重解（缺省无替代问法）。
     fn recovery_reframe(&self, entity: &str, attribute: &str) -> Vec<ReframedReading> {
         let _ = (entity, attribute);
@@ -315,6 +347,13 @@ impl recovery::RecoveryKnowledge for KnowledgeRecovery<'_> {
 impl DialogueKnowledge for SymbolicReasoner {
     fn entities_in(&self, text: &str) -> Vec<String> {
         self.entities_mentioned(text)
+    }
+
+    fn reference_view(&self) -> Option<ReferenceView<'_>> {
+        Some(ReferenceView {
+            linker: self.linker(),
+            source: self,
+        })
     }
 
     fn known_entity(&self, entity: &str) -> bool {
@@ -584,6 +623,12 @@ pub struct DialogueManager {
     frame_program: Option<Arc<FrameProgram>>,
     /// 绑定帧的会话记忆（槽位环境 / 上一帧 / 待澄清帧）。
     frame_memory: FrameMemory,
+    /// 语境指称绑定账本（澄清回答 → 后续同词面直接复用）。
+    references: BindingLedger,
+    /// 待回答的歧义澄清请求（不持久化；恢复会话后需重新提问）。
+    pending_reference: Option<ClarifyRequest>,
+    /// 无状态消歧器（状态都在 `references`）。
+    reference_resolver: ContextualResolver,
 }
 
 impl Default for DialogueManager {
@@ -613,6 +658,9 @@ impl DialogueManager {
             open_turns: OpenTurnBook::new(),
             frame_program: None,
             frame_memory: FrameMemory::new(),
+            references: BindingLedger::new(),
+            pending_reference: None,
+            reference_resolver: ContextualResolver::new(),
         }
     }
 
@@ -834,6 +882,16 @@ impl DialogueManager {
 
     pub fn focus_entity(&self) -> Option<&str> {
         self.focus.last().map(String::as_str)
+    }
+
+    /// 语境指称绑定账本（只读；供宿主持久化与审计）。
+    pub fn reference_ledger(&self) -> &BindingLedger {
+        &self.references
+    }
+
+    /// 待回答的歧义澄清请求（只读；无挂起时为 None）。
+    pub fn pending_reference(&self) -> Option<&ClarifyRequest> {
+        self.pending_reference.as_ref()
     }
 
     /// 插件配方回答后标注下一轮焦点。正向问句把答案实体置顶，
@@ -1076,6 +1134,7 @@ impl DialogueManager {
             },
             open_turns: self.open_turns.clone(),
             frames: (!self.frame_memory.is_empty()).then(|| self.frame_memory.clone()),
+            references: self.references.clone(),
         }
     }
 
@@ -1089,6 +1148,8 @@ impl DialogueManager {
         self.trace = snapshot.trace.clone().unwrap_or_default();
         self.open_turns = snapshot.open_turns.clone();
         self.frame_memory = snapshot.frames.clone().unwrap_or_default();
+        self.references = snapshot.references.clone();
+        self.pending_reference = None;
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -1299,10 +1360,113 @@ impl DialogueManager {
         if let Some(reply) = self.plan_board_reply(input, knowledge) {
             return Some(reply);
         }
-        let frame = self.analyze(input, knowledge);
+        // 语境指称栈：先结算上一轮澄清，再对本轮做绑定 / 改写 / 追问。
+        // `reference_view` 缺省为 None，因此未接入链接器的知识源行为不变。
+        let effective_input = match self.resolve_reference_input(input, knowledge) {
+            Some(ReferenceDecision::Clarify(text, mention)) => {
+                return Some(self.reference_clarify_reply(input, text, mention));
+            }
+            Some(ReferenceDecision::Rewrite(text)) => text,
+            Some(ReferenceDecision::Skip) | None => input.to_string(),
+        };
+        let frame = self.analyze(&effective_input, knowledge);
         match frame.kind {
             MoveKind::AskAttribute | MoveKind::AskIdentity => self.execute(frame, knowledge),
             _ => None,
+        }
+    }
+
+    /// 一轮链接裁决的结果。
+    fn resolve_reference_input(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<ReferenceDecision> {
+        let view = knowledge.reference_view()?;
+        self.references.begin_turn();
+        if let Some(pending) = self.pending_reference.take() {
+            match parse_clarify_act(input, &pending.question) {
+                Some(ClarifyAct::Choose { entity, .. })
+                | Some(ClarifyAct::Restate { entity }) => {
+                    self.references.bind(
+                        &pending.key,
+                        &entity,
+                        BindingScope::Topic,
+                        &format!("澄清回答：{}", input.trim()),
+                    );
+                    return Some(ReferenceDecision::Rewrite(rewrite_at(
+                        &pending.original_input,
+                        pending.start,
+                        pending.mention.chars().count(),
+                        &entity,
+                    )));
+                }
+                Some(ClarifyAct::Correct { to, .. }) => {
+                    self.references.correct(
+                        &pending.key,
+                        &to,
+                        &format!("澄清纠正：{}", input.trim()),
+                    );
+                    return Some(ReferenceDecision::Rewrite(rewrite_at(
+                        &pending.original_input,
+                        pending.start,
+                        pending.mention.chars().count(),
+                        &to,
+                    )));
+                }
+                Some(ClarifyAct::Unknown) | Some(ClarifyAct::Decline) => {
+                    return Some(ReferenceDecision::Skip);
+                }
+                None => {}
+            }
+        }
+        let outcome = self.reference_resolver.resolve_text(
+            input,
+            view.linker,
+            view.source,
+            &self.references,
+            &[],
+            self.focus.last().map(String::as_str),
+        );
+        if let Some(ask) = outcome.ask {
+            let text = ask.question.render();
+            let mention = ask.mention.clone();
+            self.pending_reference = Some(ask);
+            return Some(ReferenceDecision::Clarify(text, mention));
+        }
+        if let Some(rewrite) = outcome.rewrite {
+            if rewrite != input {
+                return Some(ReferenceDecision::Rewrite(rewrite));
+            }
+        }
+        Some(ReferenceDecision::Skip)
+    }
+
+    fn reference_clarify_reply(
+        &mut self,
+        input: &str,
+        text: String,
+        mention: String,
+    ) -> DialogueReply {
+        let plans = vec!["clarify_reference".to_string()];
+        self.turns.push(DialogueTurn {
+            index: self.turns.len() + 1,
+            user: input.trim().to_string(),
+            kind: MoveKind::AskIdentity,
+            entity: Some(mention),
+            attribute: None,
+            answer_excerpt: Some(excerpt(&text, 40)),
+            provenance: Vec::new(),
+            plan: plans.clone(),
+            warrant: None,
+            kb_revision: None,
+        });
+        self.last_reply = plans.clone();
+        DialogueReply {
+            text,
+            plan: plans,
+            kind: MoveKind::AskIdentity,
+            derivation: None,
         }
     }
 
@@ -3280,6 +3444,7 @@ pub fn entity_fact(entity: &str) -> LAtom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contextual_reference::SenseCard;
     use std::collections::BTreeMap;
 
     struct MockKnowledge {
@@ -3403,6 +3568,129 @@ mod tests {
             .with_answer("姚明是谁", "姚明是中国篮球运动员。")
             .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
             .with_answer("姚明的国籍是什么", "姚明的国籍是中国。")
+    }
+
+    struct CrdKnowledge {
+        base: MockKnowledge,
+        linker: EntityLinker,
+        cards: BTreeMap<String, SenseCard>,
+    }
+
+    impl CrdKnowledge {
+        fn apple() -> Self {
+            let mut linker = EntityLinker::new();
+            linker.register_entity("苹果", Some("水果"));
+            linker.register_entity("苹果公司", Some("组织"));
+            linker.register_alias("苹果", "苹果公司");
+            let mut cards = BTreeMap::new();
+            cards.insert(
+                "苹果".to_string(),
+                SenseCard {
+                    entity: "苹果".to_string(),
+                    etype: Some("水果".to_string()),
+                    ..SenseCard::default()
+                },
+            );
+            cards.insert(
+                "苹果公司".to_string(),
+                SenseCard {
+                    entity: "苹果公司".to_string(),
+                    etype: Some("组织".to_string()),
+                    ..SenseCard::default()
+                },
+            );
+            let base = MockKnowledge::new()
+                .with_entity("苹果", &[])
+                .with_entity("苹果公司", &["创始人"])
+                .with_answer("苹果公司是什么", "苹果公司是一家组织。")
+                .with_answer("苹果公司的创始人是什么", "苹果公司的创始人是乔布斯。");
+            CrdKnowledge {
+                base,
+                linker,
+                cards,
+            }
+        }
+    }
+
+    impl SenseSource for CrdKnowledge {
+        fn sense_card(&self, entity: &str) -> Option<SenseCard> {
+            self.cards.get(entity).cloned()
+        }
+    }
+
+    impl DialogueKnowledge for CrdKnowledge {
+        fn entities_in(&self, text: &str) -> Vec<String> {
+            self.base.entities_in(text)
+        }
+
+        fn known_entity(&self, entity: &str) -> bool {
+            self.base.known_entity(entity)
+        }
+
+        fn answer(&self, question: &str) -> Option<String> {
+            self.base.answer(question)
+        }
+
+        fn known_attributes(&self, entity: &str) -> Vec<String> {
+            self.base.known_attributes(entity)
+        }
+
+        fn attribute_values(&self, entity: &str, attribute: &str) -> Vec<String> {
+            self.base.attribute_values(entity, attribute)
+        }
+
+        fn describe(&self, entity: &str) -> Option<String> {
+            self.base.describe(entity)
+        }
+
+        fn reference_view(&self) -> Option<ReferenceView<'_>> {
+            Some(ReferenceView {
+                linker: &self.linker,
+                source: self,
+            })
+        }
+    }
+
+    #[test]
+    fn reference_clarification_binds_and_is_reused() {
+        let knowledge = CrdKnowledge::apple();
+        let mut manager = DialogueManager::new();
+        let clarify = manager
+            .plan_reply("苹果是什么", &knowledge)
+            .expect("两个义项应升级为澄清");
+        assert_eq!(clarify.plan, vec!["clarify_reference".to_string()]);
+        assert!(clarify.text.contains("苹果公司"), "{}", clarify.text);
+        assert!(manager.pending_reference().is_some());
+
+        let reply = manager
+            .plan_reply("2", &knowledge)
+            .expect("澄清回答应绑定并继续原问句");
+        assert!(reply.text.contains("组织"), "{}", reply.text);
+        assert_eq!(
+            manager
+                .reference_ledger()
+                .lookup("苹果")
+                .map(|binding| binding.entity.as_str()),
+            Some("苹果公司")
+        );
+
+        let reply = manager
+            .plan_reply("苹果的创始人是谁", &knowledge)
+            .expect("绑定后的词面应直接复用");
+        assert!(reply.text.contains("乔布斯"), "{}", reply.text);
+        assert!(manager.pending_reference().is_none());
+
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.references.is_empty());
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        assert_eq!(
+            restored
+                .reference_ledger()
+                .lookup("苹果")
+                .map(|binding| binding.entity.as_str()),
+            Some("苹果公司")
+        );
     }
 
     #[test]
