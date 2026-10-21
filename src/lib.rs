@@ -30,6 +30,7 @@ pub mod contextual_reference;
 pub mod conversation_theory;
 pub mod default_logic;
 pub mod dense_retrieval;
+pub mod derivation;
 pub mod dialogue_eval;
 pub mod dialogue_frame;
 pub mod dialogue_fuzz;

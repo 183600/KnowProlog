@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binding_frames::{FrameMemory, FrameProgram};
 use crate::bindings::BindingSet;
+use crate::derivation::Derivation;
 use crate::epistemic::{EpistemicStatus, LedgerLoad};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
@@ -173,6 +174,12 @@ pub trait DialogueKnowledge {
     fn known_entity(&self, entity: &str) -> bool;
     /// 对规范化问句作答。
     fn answer(&self, question: &str) -> Option<String>;
+    /// 为问句重建一条有界推导；`expected_answer` 用于把证明锚定到上一轮
+    /// 的实际回答，匹配不上时返回 None（宁可不解释，也不挂错证明）。
+    fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
+        let _ = (question, expected_answer);
+        None
+    }
     /// 实体已知的属性键/关系谓词（供追问建议）。
     fn known_attributes(&self, entity: &str) -> Vec<String>;
     /// 字面量属性的取值（结构化检索，缺省为空）。
@@ -314,6 +321,10 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn answer(&self, question: &str) -> Option<String> {
         SymbolicReasoner::answer(self, question)
+    }
+
+    fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
+        SymbolicReasoner::answer_derivation(self, question, expected_answer)
     }
 
     fn known_attributes(&self, entity: &str) -> Vec<String> {
@@ -473,7 +484,7 @@ const REVIEW_PATTERNS: [&str; 10] = [
     "有没有变化",
 ];
 
-const WHY_PATTERNS: [&str; 9] = [
+const WHY_PATTERNS: [&str; 13] = [
     "你怎么知道",
     "你凭什么",
     "为什么这么说",
@@ -483,6 +494,10 @@ const WHY_PATTERNS: [&str; 9] = [
     "依据是什么",
     "有什么依据",
     "怎么得出结论",
+    "怎么推出来的",
+    "怎么推导",
+    "推导过程",
+    "证明过程",
 ];
 
 const CONTINUE_PATTERNS: [&str; 8] = [
@@ -1752,7 +1767,7 @@ impl DialogueManager {
                 plans.push(tag.to_string());
                 text
             }
-            "explain_why" => self.explain_last(),
+            "explain_why" => self.explain_last_with(knowledge),
             "why_no_evidence" => self
                 .failure_self_description()
                 .unwrap_or_else(|| {
@@ -2361,7 +2376,20 @@ impl DialogueManager {
     }
 
     /// 元话语：解释上一轮回答的依据（把推理出处「讲」出来）。
+    ///
+    /// 该入口不依赖知识源，保留给只读调用方；带知识源的路径见
+    /// [`Self::explain_last_with`]，会优先重建一条可展开的推导。
     pub fn explain_last(&self) -> String {
+        self.explain_last_inner(None)
+    }
+
+    /// 带知识源的依据解释：先尝试从上一轮问句重建有界推导，
+    /// 重建不到（或证明与回答不匹配）时诚实退回出处标签。
+    pub fn explain_last_with(&self, knowledge: &dyn DialogueKnowledge) -> String {
+        self.explain_last_inner(Some(knowledge))
+    }
+
+    fn explain_last_inner(&self, knowledge: Option<&dyn DialogueKnowledge>) -> String {
         let Some(turn) = self.last_answered_turn() else {
             return self.failure_self_description().unwrap_or_else(|| {
                 "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。".to_string()
@@ -2377,11 +2405,103 @@ impl DialogueManager {
             (Some(entity), None) => format!("「{}」", entity),
             _ => format!("「{}」", excerpt(&turn.user, 16)),
         };
+        if let Some(knowledge) = knowledge {
+            if let Some(derivation) = self.explain_derivation(turn, knowledge) {
+                let mut text = format!(
+                    "刚才关于{}的回答，{}",
+                    topic,
+                    derivation.render_explanation()
+                );
+                if let Some(recorded) = turn.kb_revision {
+                    let current = knowledge.revision();
+                    if recorded != current {
+                        text.push_str(&format!(
+                            "\n说明：这条证明按当前知识版本 v{} 重建（回答时是 v{}）；若知识已变化，原回答仍保留在对话记忆里。",
+                            current, recorded
+                        ));
+                    }
+                }
+                text.push_str(&format!("\n出处标签：{}。", provenance.join("、")));
+                return text;
+            }
+        }
         format!(
             "刚才关于{}的回答，依据是：{}。这些结论都来自知识图谱与规则程序（逐条符号匹配、逻辑推导），没有任何神经网络参与。",
             topic,
             provenance.join("、")
         )
+    }
+
+    /// 为上一轮回答重建一条与实际答案锚定的推导：
+    /// 先走知识源的归结证明；没有形式证明时，再按实体属性/关系边
+    /// 组装直接事实链（只取回答文本中确实出现的取值）。
+    fn explain_derivation(
+        &self,
+        turn: &DialogueTurn,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<Derivation> {
+        let question = match (&turn.entity, &turn.attribute) {
+            (Some(entity), Some(attribute)) => Some(format!("{}的{}是什么", entity, attribute)),
+            (Some(entity), None) if turn.kind == MoveKind::AskIdentity => {
+                Some(format!("{}是谁", entity))
+            }
+            _ => None,
+        };
+        let expected = turn.answer_excerpt.as_deref();
+        if let Some(question) = question.as_deref() {
+            if let Some(derivation) = knowledge.derivation(question, expected) {
+                if derivation.is_proved() {
+                    return Some(derivation);
+                }
+            }
+        }
+        self.direct_fact_derivation(turn, knowledge)
+    }
+
+    fn direct_fact_derivation(
+        &self,
+        turn: &DialogueTurn,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<Derivation> {
+        let entity = turn.entity.as_deref()?;
+        let attribute = turn.attribute.as_deref()?;
+        let expected = turn.answer_excerpt.as_deref()?;
+        let mut facts: Vec<(String, String, String)> = Vec::new();
+
+        for value in knowledge.attribute_values(entity, attribute) {
+            if !value.is_empty() && expected.contains(value.as_str()) {
+                facts.push((
+                    entity.to_string(),
+                    surface_attribute(attribute).to_string(),
+                    value,
+                ));
+            }
+        }
+        let canonical = knowledge
+            .canonical_predicate(attribute)
+            .unwrap_or_else(|| attribute.to_string());
+        for (predicate, object) in knowledge.entity_relations(entity) {
+            if object.is_empty() || !expected.contains(object.as_str()) {
+                continue;
+            }
+            let label = knowledge.predicate_label(&predicate);
+            if predicate == attribute || label == attribute || predicate == canonical {
+                facts.push((entity.to_string(), label, object));
+            }
+        }
+        facts.sort();
+        facts.dedup();
+        if facts.is_empty() {
+            return None;
+        }
+        Some(Derivation::from_direct_facts(
+            format!(
+                "{} 的 {}",
+                entity,
+                surface_attribute(attribute)
+            ),
+            facts,
+        ))
     }
 
     /// 单条属性的结构化作答：先走推导链/预测，再退到字面量取值检索。
@@ -2922,6 +3042,7 @@ mod tests {
         answers: BTreeMap<String, String>,
         values: BTreeMap<(String, String), Vec<String>>,
         profiles: BTreeMap<String, String>,
+        derivations: BTreeMap<String, Derivation>,
     }
 
     impl MockKnowledge {
@@ -2933,6 +3054,7 @@ mod tests {
                 answers: BTreeMap::new(),
                 values: BTreeMap::new(),
                 profiles: BTreeMap::new(),
+                derivations: BTreeMap::new(),
             }
         }
 
@@ -2965,6 +3087,12 @@ mod tests {
                 .insert(question.to_string(), answer.to_string());
             self
         }
+
+        fn with_derivation(mut self, question: &str, derivation: Derivation) -> Self {
+            self.derivations
+                .insert(question.to_string(), derivation);
+            self
+        }
     }
 
     impl DialogueKnowledge for MockKnowledge {
@@ -2985,6 +3113,18 @@ mod tests {
 
         fn answer(&self, question: &str) -> Option<String> {
             self.answers.get(question).cloned()
+        }
+
+        fn derivation(&self, question: &str, expected: Option<&str>) -> Option<Derivation> {
+            let derivation = self.derivations.get(question)?;
+            if let Some(expected) = expected {
+                if let Some(value) = derivation.answer_value() {
+                    if !expected.contains(value) {
+                        return None;
+                    }
+                }
+            }
+            Some(derivation.clone())
         }
 
         fn known_attributes(&self, entity: &str) -> Vec<String> {
@@ -3186,6 +3326,50 @@ mod tests {
             .expect("依据元话语应被接管");
         assert!(why.text.contains("依据"));
         assert!(why.text.contains("知识图谱"));
+    }
+
+    #[test]
+    fn test_explain_why_rebuilds_a_real_derivation() {
+        let derivation = Derivation::from_direct_facts(
+            "姚明的身高",
+            vec![(
+                "姚明".to_string(),
+                "身高".to_string(),
+                "226 厘米".to_string(),
+            )],
+        );
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
+            .with_derivation("姚明的身高是什么", derivation);
+        let mut manager = DialogueManager::new();
+        manager
+            .plan_reply("姚明的身高是多少", &knowledge)
+            .expect("属性问句应被接管");
+        let why = manager
+            .plan_pure_dialogue("怎么推出来的？", &knowledge)
+            .expect("推导追问应被接管");
+        assert!(why.text.contains("证明步骤"), "{}", why.text);
+        assert!(why.text.contains("226 厘米"), "{}", why.text);
+        assert!(why.text.contains("事实"), "{}", why.text);
+        assert!(why.text.contains("出处标签"), "{}", why.text);
+    }
+
+    #[test]
+    fn test_explain_why_falls_back_to_direct_fact_edges() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_value("姚明", "身高", "226 厘米")
+            .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。");
+        let mut manager = DialogueManager::new();
+        manager
+            .plan_reply("姚明的身高是多少", &knowledge)
+            .expect("属性问句应被接管");
+        let why = manager
+            .plan_pure_dialogue("依据是什么？", &knowledge)
+            .expect("依据追问应被接管");
+        assert!(why.text.contains("证明步骤"), "{}", why.text);
+        assert!(why.text.contains("姚明 的 身高 是 226 厘米"), "{}", why.text);
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
+use crate::derivation::Derivation;
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
@@ -6232,6 +6233,19 @@ impl SymbolicReasoner {
         answer
     }
 
+    /// 为问句重建有界推导视图（与回答共用同一份事实、规则与归结搜索）。
+    ///
+    /// 这是惰性通道：只在用户追问依据时调用，不进入回答热路径，也不写入
+    /// 会话快照；没有可形式化的证明时返回 None，由调用方诚实降级。
+    pub fn answer_derivation(
+        &self,
+        question: &str,
+        expected_answer: Option<&str>,
+    ) -> Option<Derivation> {
+        let view = self.resolution_proof_view(question)?;
+        Derivation::from_resolution_view(&view, expected_answer)
+    }
+
     /// 无观测副作用的回答实现（报告路径复用，避免失败轨迹递归）。
     fn answer_impl(&self, question: &str) -> Option<String> {
         if let Some(answer) = self.answer_planned(question) {
@@ -11104,6 +11118,29 @@ types = [
 
         // 不可形式化：None，而不是伪造空证明
         assert!(reasoner.resolution_proof_view("@@@").is_none());
+    }
+
+    #[test]
+    fn test_answer_derivation_is_bounded_and_anchored_to_answer() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        let derivation = reasoner
+            .answer_derivation("张三的师傅的师傅是谁", Some("王五是张三的师祖"))
+            .expect("应能从同一份归结数据重建推导");
+        assert!(derivation.is_proved());
+        assert_eq!(derivation.answer_value(), Some("王五"));
+        assert!(!derivation.steps.is_empty());
+        let text = derivation.render_explanation();
+        assert!(text.contains("王五"), "{}", text);
+        assert!(text.contains("证明步骤"), "{}", text);
+
+        // 证明与上一轮回答不匹配时宁可不解释
+        assert!(reasoner
+            .answer_derivation("张三的师傅的师傅是谁", Some("赵六"))
+            .is_none());
+        // 无法形式化时诚实返回 None
+        assert!(reasoner.answer_derivation("@@@", None).is_none());
     }
 
     #[test]
