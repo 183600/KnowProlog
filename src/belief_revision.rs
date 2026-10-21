@@ -663,8 +663,10 @@ pub struct RevisionPlan {
     pub base_revision: u64,
     pub changeset: ChangeSet,
     pub strict: bool,
+    pub applied_ops: usize,
     pub conflicts: Vec<RevisionConflict>,
     pub impact: ImpactReport,
+    effective_ops: Vec<ChangeOp>,
     candidate: ResolutionEngine,
 }
 
@@ -917,6 +919,7 @@ impl BeliefState {
                     base_revision: self.revision,
                     changeset,
                     strict: self.strict,
+                    applied_ops: 0,
                     conflicts: vec![RevisionConflict::new(
                         ConflictKind::StalePlan,
                         ConflictSeverity::Blocking,
@@ -927,6 +930,7 @@ impl BeliefState {
                         Vec::new(),
                     )],
                     impact: ImpactReport::default(),
+                    effective_ops: Vec::new(),
                     candidate: self.engine.clone(),
                 };
             }
@@ -970,7 +974,16 @@ impl BeliefState {
             }
         }
 
-        conflicts.extend(rule_shape_conflicts(&candidate));
+        let base_rule_conflicts = rule_shape_conflicts(&self.engine);
+        let base_rule_signatures: BTreeSet<String> = base_rule_conflicts
+            .iter()
+            .map(RevisionConflict::signature)
+            .collect();
+        for conflict in rule_shape_conflicts(&candidate) {
+            if !base_rule_signatures.contains(&conflict.signature()) {
+                conflicts.push(conflict);
+            }
+        }
         conflicts.extend(resurrection_conflicts(
             &changeset.ops,
             &candidate_closure,
@@ -1024,8 +1037,10 @@ impl BeliefState {
             base_revision: self.revision,
             changeset,
             strict: self.strict,
+            applied_ops: effects.applied,
             conflicts,
             impact,
+            effective_ops: effects.effective_ops.clone(),
             candidate,
         }
     }
@@ -1065,15 +1080,10 @@ impl BeliefState {
             label: plan.changeset.label.clone(),
             base_revision: self.revision,
             revision: new_revision,
-            applied_ops: plan
-                .changeset
-                .ops
-                .iter()
-                .filter(|op| op_changes_state(op))
-                .count(),
+            applied_ops: plan.applied_ops,
             impact: plan.impact.clipped(MAX_RECEIPT_ITEMS),
             conflicts: plan.conflicts.clone(),
-            ops: plan.changeset.ops.clone(),
+            ops: plan.effective_ops.clone(),
             digest,
         };
         self.engine = plan.candidate;
@@ -1229,6 +1239,7 @@ impl Closure {
 
 #[derive(Debug, Default)]
 struct OpEffects {
+    effective_ops: Vec<ChangeOp>,
     added_facts: Vec<String>,
     removed_facts: Vec<String>,
     added_rule_sources: BTreeSet<String>,
@@ -1245,12 +1256,14 @@ fn apply_ops(engine: &mut ResolutionEngine, ops: &[ChangeOp]) -> OpEffects {
             ChangeOp::AssertFact(atom) => {
                 if engine.add_fact_atom(atom.clone()) {
                     effects.added_facts.push(atom_key(atom));
+                    effects.effective_ops.push(ChangeOp::AssertFact(atom.clone()));
                     effects.applied += 1;
                 }
             }
             ChangeOp::RetractFact(atom) => {
                 if engine.remove_fact_atom(atom) {
                     effects.removed_facts.push(atom_key(atom));
+                    effects.effective_ops.push(ChangeOp::RetractFact(atom.clone()));
                     effects.applied += 1;
                 }
             }
@@ -1266,21 +1279,27 @@ fn apply_ops(engine: &mut ResolutionEngine, ops: &[ChangeOp]) -> OpEffects {
                     effects
                         .added_rule_shapes
                         .push(rule_shape_key(clause));
+                    effects.effective_ops.push(ChangeOp::AddRule(clause.clone()));
                     effects.applied += 1;
                 }
             }
             ChangeOp::RemoveRule(clause) => {
                 let shape = rule_shape_key(clause);
-                let sources: BTreeSet<String> = engine
+                let matched: Vec<Clause> = engine
                     .all_clauses()
                     .iter()
                     .filter(|existing| rule_shape_key(existing) == shape)
-                    .map(|existing| existing.source.clone())
+                    .cloned()
                     .collect();
                 let removed = engine.remove_clauses(|existing| rule_shape_key(existing) == shape);
                 if removed > 0 {
-                    effects.removed_rule_sources.extend(sources);
+                    effects
+                        .removed_rule_sources
+                        .extend(matched.iter().map(|existing| existing.source.clone()));
                     effects.removed_rule_shapes.push(shape);
+                    for actual in matched {
+                        effects.effective_ops.push(ChangeOp::RemoveRule(actual));
+                    }
                     effects.applied += removed;
                 }
             }
@@ -1728,13 +1747,6 @@ fn build_impact(
     }
 }
 
-fn op_changes_state(op: &ChangeOp) -> bool {
-    matches!(
-        op,
-        ChangeOp::AssertFact(_) | ChangeOp::RetractFact(_) | ChangeOp::AddRule(_)
-    ) || matches!(op, ChangeOp::RemoveRule(_))
-}
-
 fn sort_conflicts(conflicts: &mut Vec<RevisionConflict>) {
     conflicts.sort_by(|left, right| {
         right
@@ -2058,6 +2070,36 @@ mod tests {
         assert_eq!(state.rule_count(), 0);
         let closure = state.closure(state.engine());
         assert!(!closure.derived.contains_key("teacher_of(张三, 李四)"));
+    }
+
+    #[test]
+    fn undo_does_not_invert_no_op_operations() {
+        let mut engine = ResolutionEngine::new(8, 16);
+        engine.add_fact("p", "a", "b");
+        let mut state = BeliefState::new(engine).with_strict(false);
+        let receipt = state
+            .apply(ChangeSet::new("重复断言").assert("p", "a", "b"))
+            .expect("commit");
+        assert_eq!(receipt.applied_ops, 0);
+        state.undo_last().expect("undo");
+        assert!(state.engine().has_fact(&Atom::rel("p", "a", "b")));
+    }
+
+    #[test]
+    fn pre_existing_duplicate_rule_does_not_block_unrelated_commit() {
+        let mut engine = ResolutionEngine::new(8, 16);
+        engine.add_fact("teaches", "张三", "李四");
+        engine.add_clause(var_rule("teacher_of", "teaches", "规则甲"));
+        engine.add_clause(var_rule("teacher_of", "teaches", "规则乙"));
+        let mut state = BeliefState::new(engine);
+        assert!(!state.check().is_clean());
+        let receipt = state
+            .apply(ChangeSet::new("无关新增").assert("teaches", "王五", "赵六"))
+            .expect("pre-existing duplicate must not block");
+        assert!(!receipt
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.kind == ConflictKind::DuplicateRule));
     }
 
     #[test]
