@@ -97,6 +97,7 @@ pub mod semantic_engine;
 pub mod semantic_entailment;
 pub mod serve_api;
 pub mod shape_dialogue;
+pub mod shape_eval;
 pub mod shape_gate;
 pub mod similarity_calculator;
 pub mod startup_ledger;

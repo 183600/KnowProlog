@@ -5,6 +5,7 @@ use std::time::Instant;
 
 // 从库（know_prolog）中导入所需的功能
 use know_prolog::{
+    binding_frames::FrameProgram,
     chronicle::{Chronicle, FsyncPolicy},
     config_contract,
     contextual_reference::{
@@ -19,7 +20,6 @@ use know_prolog::{
         compare_baseline as compare_dialogue_baseline, evaluate_seed_with, DialogueEvalBaseline,
         EvalKnowledge,
     },
-    binding_frames::FrameProgram,
     dialogue_frame::ClarificationOutcome,
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
@@ -71,6 +71,11 @@ use know_prolog::{
     },
     release::{self, CheckOptions},
     resolution_engine::SearchStatus,
+    shape_dialogue::ShapeDialogue,
+    shape_eval::{
+        compare_baseline as compare_shape_eval_baseline, evaluate_seed as evaluate_shape_dialogue,
+        ShapeEvalBaseline,
+    },
     shape_gate::{RepairAction, ShapeReport, ShapeSet},
     startup_ledger::StartupLedger,
     symbolic_reasoner::SymbolicReasoner,
@@ -487,6 +492,22 @@ enum Commands {
         /// Exit non-zero when any Violation-severity finding is reported
         #[arg(long)]
         strict: bool,
+    },
+    /// Evaluate shape-filling dialogue (gap / acquisition / generation / session)
+    /// on the built-in scripted corpus with a regression ratchet
+    EvalShapeDialogue {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Run deterministic quality-delta dialogue fuzzing offline (no store I/O),
     /// with an optional known-gap baseline regression ratchet
@@ -1584,6 +1605,52 @@ async fn main() {
                 }
             }
         }
+        Some(Commands::EvalShapeDialogue {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            let report = evaluate_shape_dialogue();
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("形状对话评测序列化失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", report.render_text());
+            }
+            if update_baseline {
+                let path = baseline
+                    .clone()
+                    .unwrap_or_else(|| "shape_dialogue_baseline.json".to_string());
+                let baseline_value = ShapeEvalBaseline::from_report(&report);
+                match baseline_value.save(&path) {
+                    Ok(_) => println!("评测基线已写入 {}", path),
+                    Err(error) => {
+                        eprintln!("评测基线写入失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(path) = baseline.as_deref() {
+                match ShapeEvalBaseline::load(path) {
+                    Ok(old_baseline) => {
+                        let verdict = compare_shape_eval_baseline(&old_baseline, &report, 1e-9);
+                        println!("{}", verdict.render_text());
+                        if !verdict.passed && !allow_regression {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("基线读取失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
         Some(Commands::Fuse {
             apply,
             prefer,
@@ -1714,7 +1781,8 @@ async fn main() {
                     aligned_predicates, aligned_entities
                 );
             }
-            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path))
+            if let Some(persisted) =
+                LawBook::load_from_path(&format!("{}/law_book.json", store_path))
             {
                 let decided = api_state.load_law_book(persisted);
                 if decided > 0 {
@@ -1748,9 +1816,7 @@ async fn main() {
             if !plugin_receipt.is_empty() {
                 println!(
                     "插件本体已并入服务统一推理器：{} 条公理、{} 条别名、{} 条逆向词面。",
-                    plugin_receipt.lessons,
-                    plugin_receipt.aliases,
-                    plugin_receipt.inverse_surfaces
+                    plugin_receipt.lessons, plugin_receipt.aliases, plugin_receipt.inverse_surfaces
                 );
             }
             let plugin_runtime = (plugin_runtime.installed_count() > 0)
@@ -2792,6 +2858,12 @@ fn persist_acquisition(acquisition: &RelationAcquisition, path: &str) {
     }
 }
 
+fn persist_shape_dialogue(dialogue: &ShapeDialogue, path: &str) {
+    if let Err(error) = dialogue.save_to_path(path) {
+        eprintln!("形状对话状态保存失败：{}", error);
+    }
+}
+
 /// 把质量护照注入对话管理器；仅在知识版本推进时重建（离线派生，不写图谱）。
 async fn refresh_dialogue_quality(
     dialogue_manager: &mut DialogueManager,
@@ -3168,10 +3240,7 @@ async fn run_interactive_mode(
         println!("插件本体已合并：{} 条谓词别名。", plugin_sync.aliases);
     }
     if plugin_sync.lessons > 0 {
-        println!(
-            "插件本体已并入统一推理器：{} 条公理。",
-            plugin_sync.lessons
-        );
+        println!("插件本体已并入统一推理器：{} 条公理。", plugin_sync.lessons);
     }
     // 互逆谓词的逆向词面：发问时主宾对调（「执导」问句 ↔「导演」事实）。
     if plugin_sync.inverse_surfaces > 0 {
@@ -3203,6 +3272,20 @@ async fn run_interactive_mode(
             "已恢复关系获取账本：{} 条，诱导模式 {} 个。",
             acquisition.claims().count(),
             acquisition.patterns().count()
+        );
+    }
+    let shape_dialogue_path = format!("{}/shape_dialogue.json", store_path);
+    let mut shape_dialogue =
+        ShapeDialogue::load_from_path(&shape_dialogue_path).unwrap_or_default();
+    if shape_dialogue.turn_count() > 0 {
+        println!(
+            "已恢复形状填充对话：轮次 {}，{}。",
+            shape_dialogue.turn_count(),
+            if shape_dialogue.has_pending() {
+                "有一个待答问题"
+            } else {
+                "没有待答问题"
+            }
         );
     }
 
@@ -3736,12 +3819,8 @@ async fn run_interactive_mode(
                 .patterns()
                 .filter(|pattern| pattern.active && !pattern.retired)
                 .map(|pattern| {
-                    let ir = format!(
-                        "{{主体}} 的 {} 是 {{客体}}",
-                        pattern.surface
-                    );
-                    pattern
-                        .to_pattern_entry(&ir)
+                    let ir = format!("{{主体}} 的 {} 是 {{客体}}", pattern.surface);
+                    pattern.to_pattern_entry(&ir)
                 })
                 .collect();
             if active.is_empty() {
@@ -3759,7 +3838,12 @@ async fn run_interactive_mode(
                     added
                 );
                 for entry in &active {
-                    println!("  - {}（{}）→ {}", entry.name, entry.render(), entry.query_type);
+                    println!(
+                        "  - {}（{}）→ {}",
+                        entry.name,
+                        entry.render(),
+                        entry.query_type
+                    );
                 }
                 match oxigraph_manager
                     .sync_pattern_ledger(pattern_library.entries())
@@ -3781,6 +3865,125 @@ async fn run_interactive_mode(
                 persist_acquisition(&acquisition, &acquisition_path);
             } else {
                 println!("没有找到诱导模式 {}。", id);
+            }
+            println!();
+            continue;
+        }
+
+        // 形状填充对话：把形状报告编译成议程，问到缺口后回到原问题。
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["形状画像：", "形状画像:", "对话画像：", "对话画像:"],
+        ) {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("用法：形状画像：<实体>，例如「形状画像：刘德华」。");
+            } else {
+                match acquisition_context(&oxigraph_manager, &config).await {
+                    Ok((facts, registry, types, shapes)) => {
+                        let turn = shape_dialogue.start_profile(
+                            entity,
+                            input,
+                            &facts,
+                            &registry,
+                            &types,
+                            &shapes,
+                            &mut acquisition,
+                        );
+                        println!("{}", turn.message);
+                        persist_acquisition(&acquisition, &acquisition_path);
+                        persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
+                    }
+                    Err(error) => eprintln!("加载形状画像上下文失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "形状对话报告" | "形状对话状态" | "形状对话") {
+            println!("{}", shape_dialogue.report_text());
+            println!();
+            continue;
+        }
+
+        if matches!(input, "形状议程" | "形状缺口议程") {
+            match acquisition_context(&oxigraph_manager, &config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    let effective = know_prolog::shape_dialogue::effective_facts(
+                        &facts,
+                        &acquisition.overlay(),
+                    );
+                    let report = shapes.validate(&effective, &registry, &types);
+                    let agenda =
+                        know_prolog::shape_dialogue::ShapeAgenda::compile(&report, &registry);
+                    println!("{}", agenda.render_text());
+                }
+                Err(error) => eprintln!("加载形状议程失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "下一个形状问题" | "下一个缺口问题") {
+            match acquisition_context(&oxigraph_manager, &config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    match shape_dialogue.ask_next(
+                        &facts,
+                        &registry,
+                        &types,
+                        &shapes,
+                        &mut acquisition,
+                    ) {
+                        Some(turn) => {
+                            println!("{}", turn.message);
+                            persist_acquisition(&acquisition, &acquisition_path);
+                            persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
+                        }
+                        None => println!(
+                            "形状议程没有可追问的缺口（可能已完成、已达提问上限，或已有待答问题）。"
+                        ),
+                    }
+                }
+                Err(error) => eprintln!("加载形状议程失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        if input == "形状对话重置" {
+            shape_dialogue.reset(&mut acquisition);
+            persist_acquisition(&acquisition, &acquisition_path);
+            persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
+            println!("形状填充对话状态已重置（关系获取账本与知识图谱保持不变）。");
+            println!();
+            continue;
+        }
+
+        if shape_dialogue.has_pending()
+            && !is_command_like(input)
+            && RelationAcquisition::looks_like_answer(input)
+            && !matches!(
+                detect_input_mode(input, &config.nlp.import_keywords),
+                InputMode::KnowledgeImport
+            )
+        {
+            match acquisition_context(&oxigraph_manager, &config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    if let Some(turn) = shape_dialogue.respond(
+                        input,
+                        &facts,
+                        &registry,
+                        &types,
+                        &shapes,
+                        &mut acquisition,
+                    ) {
+                        println!("{}", turn.message);
+                    }
+                    persist_acquisition(&acquisition, &acquisition_path);
+                    persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
+                }
+                Err(error) => eprintln!("加载形状画像上下文失败：{}", error),
             }
             println!();
             continue;
@@ -7624,6 +7827,7 @@ async fn run_interactive_mode(
     }
 
     persist_acquisition(&acquisition, &acquisition_path);
+    persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
     println!("系统已退出。");
 }
 
@@ -8063,8 +8267,9 @@ async fn try_symbolic_reasoning(
     if !query_entities.is_empty() {
         match oxigraph_manager.get_relevant_facts(query_entities, 2).await {
             Ok(facts) => symbolic_reasoner.observe_facts(&facts),
-            Err(error) => symbolic_reasoner
-                .note_engine_fault(format!("知识库读取相关事实失败：{}", error)),
+            Err(error) => {
+                symbolic_reasoner.note_engine_fault(format!("知识库读取相关事实失败：{}", error))
+            }
         }
     }
     // 陈述句优先：形式化语义 + 语义蕴含判定（校验用户断言）；
@@ -8395,6 +8600,13 @@ fn is_command_like(input: &str) -> bool {
         "SHACL报告",
         "shacl报告",
         "shapes",
+        "形状画像",
+        "对话画像",
+        "形状对话",
+        "形状议程",
+        "形状缺口议程",
+        "下一个形状问题",
+        "下一个缺口问题",
         "质量报告",
         "质量护照",
         "质量总览",
@@ -9530,8 +9742,7 @@ mod session_tests {
     async fn serve_facts_include_relations_alongside_entities() {
         let dir = tempfile::TempDir::new().unwrap();
         let store_path = dir.path().to_str().unwrap().to_string();
-        let manager =
-            OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
+        let manager = OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
         let items = vec![
             KnowledgeItem::Entity {
                 label: "人物".to_string(),
