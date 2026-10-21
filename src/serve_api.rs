@@ -1033,6 +1033,9 @@ enum SessionCommand {
         cancel: CancelToken,
         reply: oneshot::Sender<Result<TurnResponse, SessionError>>,
     },
+    DiscardOpenTurn {
+        reply: oneshot::Sender<Option<OpenTurn>>,
+    },
     Snapshot {
         reply: oneshot::Sender<serde_json::Value>,
     },
@@ -1499,6 +1502,9 @@ impl ApiState {
                             let response = session.resume_turn(cancel);
                             let _ = reply.send(response);
                         }
+                        SessionCommand::DiscardOpenTurn { reply } => {
+                            let _ = reply.send(session.manager.dismiss_open_turn());
+                        }
                         SessionCommand::Snapshot { reply } => {
                             let _ = reply.send(serde_json::json!({
                                 "session_id": session.id,
@@ -1766,6 +1772,19 @@ impl ApiState {
                 Err(SessionError::Timeout)
             }
         }
+    }
+
+    /// 显式放弃最新未完成轮次；返回被放弃的轮次（没有则 `None`）。
+    async fn discard_open_turn(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<OpenTurn>, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::DiscardOpenTurn { reply: reply_tx })
+            .await
+            .map_err(|_| SessionError::Unavailable)?;
+        reply_rx.await.map_err(|_| SessionError::Unavailable)
     }
 
     async fn session_snapshot(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
@@ -2036,6 +2055,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "DELETE /sessions/{id}",
                     "POST /sessions/{id}/turns",
                     "POST /sessions/{id}/resume",
+                    "DELETE /sessions/{id}/open-turn",
                     "GET /v1/models",
                     "GET /v1/prompts",
                     "POST /v1/chat/completions"
@@ -2115,6 +2135,16 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             Ok(turn) => Response::json(
                 200,
                 &serde_json::to_value(&turn).unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            Err(error) => session_error_response(error),
+        },
+        ("DELETE", ["sessions", id, "open-turn"]) => match state.discard_open_turn(id).await {
+            Ok(discarded) => Response::json(
+                200,
+                &serde_json::json!({
+                    "discarded": discarded.is_some(),
+                    "open_turn": discarded,
+                }),
             ),
             Err(error) => session_error_response(error),
         },
@@ -4784,6 +4814,55 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         .await;
         assert_eq!(status, 409, "{}", body);
         assert!(body.contains("resumable"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn discard_open_turn_route_clears_resume_state() {
+        let (addr, _server) =
+            start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
+        let session_id = create_session(addr).await;
+        let turn = take_turn_body(addr, &session_id, "姚明的身高是多少").await;
+        assert_eq!(turn["status"], "deadline", "{}", turn);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}/open-turn", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let discarded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(discarded["discarded"], true, "{}", body);
+        assert_eq!(
+            discarded["open_turn"]["input"], "姚明的身高是多少",
+            "{}",
+            body
+        );
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(snapshot["open_turn"].is_null(), "{}", body);
+        assert_eq!(snapshot["resumable"], false, "{}", body);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/resume", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 409, "{}", body);
     }
 
     #[tokio::test]
