@@ -338,6 +338,11 @@ fn split_exclusion_tail(text: &str) -> Option<(&str, &str)> {
     let mut best: Option<(usize, usize)> = None;
     for marker in ["以外", "之外", "外", "，", ","] {
         if let Some(position) = text.find(marker) {
+            // 句首的「外」多半是地名/机构名的第一个字（外滩、外交部）；
+            // 单独出现的「外」只有在排除项之后才当边界。
+            if marker == "外" && position == 0 {
+                continue;
+            }
             let candidate = (position, marker.len());
             if best.is_none_or(|current| {
                 candidate.0 < current.0
@@ -1164,7 +1169,7 @@ mod tests {
     impl RelationLexicon for FakeLexicon {
         fn canonical_entity(&self, raw: &str) -> Option<String> {
             match raw {
-                "张三" | "李四" | "王五" | "赵六" => Some(raw.to_string()),
+                "张三" | "李四" | "王五" | "赵六" | "外滩" => Some(raw.to_string()),
                 _ => None,
             }
         }
@@ -1485,6 +1490,12 @@ mod tests {
         assert_eq!(infix.rule, "except-wh-object");
 
         assert!(parse("除了未名，谁认识张三").is_none());
+        assert_eq!(
+            parse("除了外滩，还有谁认识张三")
+                .expect("排除项以「外」开头时不应误切")
+                .rule,
+            "except-wh-subject"
+        );
     }
 
     #[test]
