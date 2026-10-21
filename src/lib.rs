@@ -25,6 +25,7 @@ pub mod causal_reasoning;
 pub mod causal_tokenization;
 pub mod chinese_reasoning_nlu;
 pub mod chronicle;
+pub mod completion_episode;
 pub mod config_contract;
 pub mod context_image;
 pub mod contextual_reference;
