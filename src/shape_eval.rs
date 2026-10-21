@@ -135,7 +135,13 @@ impl ShapeEvalReport {
             || !self.session_isolation
             || self.wrong_accepts > 0
             || self.repeat_questions > 0
-            || self.cross_session_leaks > 0;
+            || self.cross_session_leaks > 0
+            || self.gap_precision() < 1.0
+            || self.claim_precision() < 1.0
+            || self.grounded_rate() < 1.0
+            || self.required_coverage_after() < 1.0
+            || self.conflict_disclosure_rate() < 1.0
+            || self.abstain_rate() < 1.0;
         lines.insert(
             1,
             format!("判定：{}", if failed { "未通过" } else { "通过" }),
@@ -958,6 +964,16 @@ mod tests {
         assert!(report.gap_questions >= 4, "{}", report.render_text());
         assert!(report.claims_confirmed >= 4, "{}", report.render_text());
         assert!(report.render_text().contains("判定：通过"));
+    }
+
+    #[test]
+    fn degraded_quality_metrics_fail_the_default_verdict() {
+        let mut report = evaluate_seed();
+        assert!(report.render_text().contains("通过"));
+        report.conflicts_disclosed = 0;
+        let text = report.render_text();
+        assert!(text.contains("未通过"));
+        assert!(text.contains("冲突披露 0/"));
     }
 
     #[test]
