@@ -1028,6 +1028,8 @@ impl ShapeDialogue {
         {
             self.pending = None;
             acquisition.clear_goal();
+            self.attempts
+                .insert(pending.gap.id.clone(), MAX_ASK_ATTEMPTS);
             let (answer, report) = self.build_answer(
                 &pending.gap.entity,
                 facts,
@@ -1037,7 +1039,8 @@ impl ShapeDialogue {
                 acquisition,
             );
             self.agenda = ShapeAgenda::compile(&report, registry);
-            message.push_str("\n本会话画像保持不变；未确认的取值不会进入回答。");
+            message
+                .push_str("\n本会话画像保持不变；未确认的取值不会进入回答，也不会重复追问该缺口。");
             return Some(SfdTurn {
                 answer,
                 consultation: None,
@@ -2339,6 +2342,49 @@ mod tests {
             next.consultation.unwrap().gap.predicate,
             "出生地",
             "已裁定的职业冲突不应继续阻塞议程"
+        );
+    }
+
+    #[test]
+    fn declined_gap_is_not_asked_again() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![entity("王五", "Person", &[("name", "王五")])];
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let first = dialogue.start_profile(
+            "王五",
+            "王五是谁？",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+            &mut acquisition,
+        );
+        assert_eq!(first.answer.status, AnswerStatus::Partial);
+        let gap_id = first.consultation.unwrap().gap.id;
+        let declined = dialogue
+            .respond(
+                "我不知道",
+                &facts,
+                &registry,
+                &types,
+                &shapes,
+                &mut acquisition,
+            )
+            .unwrap();
+        assert!(declined.consultation.is_none());
+        assert!(declined.message.contains("不会重复追问"));
+        assert_eq!(
+            dialogue.attempts.get(&gap_id).copied(),
+            Some(MAX_ASK_ATTEMPTS)
+        );
+        assert!(
+            dialogue
+                .ask_next(&facts, &registry, &types, &shapes, &mut acquisition)
+                .is_none(),
+            "用户已明确不知道，不应再次把同一缺口抛回去"
         );
     }
 
