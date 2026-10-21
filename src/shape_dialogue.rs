@@ -812,6 +812,9 @@ impl ShapeDialogue {
         shapes: &ShapeSet,
         acquisition: &mut RelationAcquisition,
     ) -> Option<SfdTurn> {
+        if self.pending.is_some() {
+            return None;
+        }
         self.turn += 1;
         let effective = effective_facts(facts, &acquisition.overlay());
         let report = shapes.validate(&effective, registry, types);

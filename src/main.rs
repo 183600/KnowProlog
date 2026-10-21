@@ -3881,9 +3881,10 @@ async fn run_interactive_mode(
             } else {
                 match acquisition_context(&oxigraph_manager, &config).await {
                     Ok((facts, registry, types, shapes)) => {
+                        let question = format!("{}是谁？", entity);
                         let turn = shape_dialogue.start_profile(
                             entity,
-                            input,
+                            &question,
                             &facts,
                             &registry,
                             &types,
