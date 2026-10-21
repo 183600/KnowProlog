@@ -25,6 +25,7 @@ use crate::eval_recovery::{self, EvalRecoveryBaseline};
 use crate::identity_eval::{self, IdentityEvalBaseline};
 use crate::plugin::{PluginRegistry, PluginRuntime};
 use crate::prompt_spec::{self, LintSeverity, PromptMode};
+use crate::shape_eval;
 use crate::SystemConfig;
 
 pub const SCHEMA_SNAPSHOT_VERSION: u32 = 1;
@@ -2098,6 +2099,10 @@ pub fn check(
             "fuzz_dialogue",
             "已跳过（--skip-evals）",
         ));
+        gates.push(GateReport::skipped(
+            "eval_shape_dialogue",
+            "已跳过（--skip-evals）",
+        ));
     } else {
         let nlu_report = dialogue_eval::evaluate_seed_with(EvalKnowledge::Reasoner, PromptMode::On);
         let (passed, summary, detail) = match &nlu_baseline {
@@ -2269,6 +2274,28 @@ pub fn check(
             fuzz_baseline = Some(FuzzBaseline::from_report(&fuzz_report));
         }
     }
+
+    let shape_report = shape_eval::evaluate_seed();
+    let shape_passed = shape_report.passed();
+    gates.push(
+        GateReport::new(
+            "eval_shape_dialogue",
+            shape_passed,
+            shape_report.digest.clone(),
+            format!(
+                "缺口精度 {:.4} / 承认精度 {:.4} / 冲突披露 {:.4} / 未知克制 {:.4}",
+                shape_report.gap_precision(),
+                shape_report.claim_precision(),
+                shape_report.conflict_disclosure_rate(),
+                shape_report.abstain_rate()
+            ),
+        )
+        .with_detail(if shape_passed {
+            Vec::new()
+        } else {
+            vec![shape_report.render_text()]
+        }),
+    );
 
     let passed = gates.iter().all(|gate| gate.passed);
     let mut lock_updated = false;

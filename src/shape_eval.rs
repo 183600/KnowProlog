@@ -91,6 +91,21 @@ impl ShapeEvalReport {
         ratio(checks.iter().filter(|check| **check).count(), checks.len())
     }
 
+    pub fn passed(&self) -> bool {
+        self.resumed_original
+            && self.snapshot_restored
+            && self.session_isolation
+            && self.wrong_accepts == 0
+            && self.repeat_questions == 0
+            && self.cross_session_leaks == 0
+            && self.gap_precision() >= 1.0
+            && self.claim_precision() >= 1.0
+            && self.grounded_rate() >= 1.0
+            && self.required_coverage_after() >= 1.0
+            && self.conflict_disclosure_rate() >= 1.0
+            && self.abstain_rate() >= 1.0
+    }
+
     pub fn render_text(&self) -> String {
         let mut lines = vec![
             "形状填充对话评测（SFD eval）".to_string(),
@@ -130,21 +145,9 @@ impl ShapeEvalReport {
             ),
             format!("报告摘要：{}", self.digest),
         ];
-        let failed = !self.resumed_original
-            || !self.snapshot_restored
-            || !self.session_isolation
-            || self.wrong_accepts > 0
-            || self.repeat_questions > 0
-            || self.cross_session_leaks > 0
-            || self.gap_precision() < 1.0
-            || self.claim_precision() < 1.0
-            || self.grounded_rate() < 1.0
-            || self.required_coverage_after() < 1.0
-            || self.conflict_disclosure_rate() < 1.0
-            || self.abstain_rate() < 1.0;
         lines.insert(
             1,
-            format!("判定：{}", if failed { "未通过" } else { "通过" }),
+            format!("判定：{}", if self.passed() { "通过" } else { "未通过" }),
         );
         lines.join("\n")
     }
@@ -969,8 +972,10 @@ mod tests {
     #[test]
     fn degraded_quality_metrics_fail_the_default_verdict() {
         let mut report = evaluate_seed();
+        assert!(report.passed());
         assert!(report.render_text().contains("通过"));
         report.conflicts_disclosed = 0;
+        assert!(!report.passed());
         let text = report.render_text();
         assert!(text.contains("未通过"));
         assert!(text.contains("冲突披露 0/"));
