@@ -1683,7 +1683,7 @@ fn is_name_key(key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::predicate_registry::PredicateProfileConfig;
-    use crate::relation_acquisition::SessionOverlay;
+    use crate::relation_acquisition::{SessionOverlay, SessionOverlayRow};
     use crate::shape_gate::ShapeSet;
     use crate::type_system::{TypeAliasConfig, TypeDisjointConfig, TypeSystemConfig};
     use crate::{EntityTypeConfig, PropertyConfig};
@@ -2305,6 +2305,54 @@ mod tests {
         assert_eq!(turn.answer.status, AnswerStatus::Complete);
         assert_eq!(turn.answer.value_of("职业"), vec!["演员"]);
         assert_eq!(dialogue.focus(), Some("刘德华"));
+    }
+
+    #[test]
+    fn ruling_can_select_a_session_value_and_suppress_the_graph_value() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![
+            entity(
+                "刘德华",
+                "Person",
+                &[("name", "刘德华"), ("职业", "演员"), ("出生地", "香港")],
+            ),
+            relation("刘德华", "职业", "导演"),
+        ];
+        let overlay = SessionOverlay {
+            rows: vec![SessionOverlayRow {
+                subject: "刘德华".to_string(),
+                predicate: "职业".to_string(),
+                object: "歌手".to_string(),
+                claim_id: "c_session".to_string(),
+                status: AcquisitionStatus::Admitted,
+            }],
+        };
+        let rulings = vec![ConflictRuling {
+            entity: "刘德华".to_string(),
+            predicate: "职业".to_string(),
+            value: "歌手".to_string(),
+            turn: 1,
+        }];
+        let (answer, report) = ShapeAnswer::build_resolved(
+            "刘德华",
+            &facts,
+            &overlay,
+            &shapes,
+            &registry,
+            &types,
+            &rulings,
+        );
+        assert_eq!(
+            answer.status,
+            AnswerStatus::Complete,
+            "{}",
+            answer.render_text()
+        );
+        assert_eq!(answer.value_of("职业"), vec!["歌手"]);
+        assert_eq!(answer.conflicts.len(), 0);
+        assert!(report.conforms);
     }
 
     #[test]
