@@ -846,6 +846,9 @@ pub struct PatternEpisodeLog {
     capacity: usize,
     #[serde(default)]
     clock: usize,
+    /// 进程内变更计数（不序列化）：供调用方判断是否需要增量落图。
+    #[serde(skip)]
+    revision: u64,
 }
 
 fn default_episode_capacity() -> usize {
@@ -864,6 +867,7 @@ impl PatternEpisodeLog {
             entries: Vec::new(),
             capacity: capacity.max(1),
             clock: 0,
+            revision: 0,
         }
     }
 
@@ -887,6 +891,15 @@ impl PatternEpisodeLog {
         self.clock
     }
 
+    /// 进程内变更计数：任何增删改（含反馈）都会推进；用于决定是否落图。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn matched_count(&self) -> usize {
         self.entries
             .iter()
@@ -902,7 +915,10 @@ impl PatternEpisodeLog {
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        if !self.entries.is_empty() {
+            self.entries.clear();
+            self.touch();
+        }
     }
 
     /// 删除单条经验：按完整 id、短 id、完整原句或至少 4 位十六进制 id 前缀匹配。
@@ -923,7 +939,11 @@ impl PatternEpisodeLog {
                 || episode.input.trim() == needle
                 || (prefix && id.starts_with(needle)))
         });
-        before - self.entries.len()
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            self.touch();
+        }
+        removed
     }
 
     /// 记录一次成功理解（同身份经验累计次数并刷新最后轮次）。
@@ -1049,10 +1069,12 @@ impl PatternEpisodeLog {
             existing.bindings = episode.bindings;
             existing.acceptances = existing.acceptances.max(episode.acceptances);
             existing.rejections = existing.rejections.max(episode.rejections);
+            self.touch();
             return false;
         }
         self.entries.push(episode);
         self.enforce_capacity();
+        self.touch();
         true
     }
 
@@ -1101,6 +1123,9 @@ impl PatternEpisodeLog {
             .clock
             .max(self.entries.iter().map(|episode| episode.last_turn).max().unwrap_or(0));
         self.enforce_capacity();
+        if !episodes.is_empty() {
+            self.touch();
+        }
         added
     }
 
@@ -1306,6 +1331,7 @@ impl PatternEpisodeLog {
         let id = suggestion.episode.id();
         if let Some(episode) = self.entries.iter_mut().find(|entry| entry.id() == id) {
             episode.acceptances = episode.acceptances.saturating_add(1);
+            self.touch();
             return true;
         }
         false
@@ -1316,6 +1342,7 @@ impl PatternEpisodeLog {
         let id = suggestion.episode.id();
         if let Some(episode) = self.entries.iter_mut().find(|entry| entry.id() == id) {
             episode.rejections = episode.rejections.saturating_add(1);
+            self.touch();
             return true;
         }
         false
@@ -4240,5 +4267,27 @@ mod tests {
         log.record_match("法国的首都是哪里", &stored, &matched, None, 2);
         assert_eq!(log.forget("法国的首都是哪里"), 1);
         assert!(log.is_empty(), "按完整原句也应删除单条经验");
+    }
+
+    #[test]
+    fn episode_revision_advances_on_mutation_but_not_on_lookup() {
+        let library = sample_library();
+        let tokens = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = library.match_route(&tokens).expect("应命中");
+        let mut log = PatternEpisodeLog::default();
+        assert_eq!(log.revision(), 0);
+        let episode = log.record_match("法国的首都是哪里", &tokens, &matched, None, 1);
+        let after_record = log.revision();
+        assert!(after_record > 0, "记录经验应推进版本");
+        let _ = log.nearest(&tokens, None, 5);
+        assert_eq!(log.revision(), after_record, "只读检索不应推进版本");
+        assert_eq!(log.forget(&episode.short_id()), 1);
+        assert!(log.revision() > after_record, "删除经验应推进版本");
     }
 }

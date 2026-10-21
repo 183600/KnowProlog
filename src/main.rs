@@ -2966,6 +2966,11 @@ async fn run_interactive_mode(
         }
         _ => {}
     }
+    // 经验检查点：交互中每 8 轮把变化过的经验台账落图一次，
+    // 避免进程被中断时丢掉整段会话的确认/否定反馈（退出时仍会兜底落图）。
+    let mut synced_episodes_revision = pattern_episodes.revision();
+    let mut turns_since_episode_sync = 0usize;
+
     let mut prolog_engine = PrologEngine::new();
     let local_semantic_adapter = {
         let nlp_config = &config.nlp;
@@ -3385,6 +3390,22 @@ async fn run_interactive_mode(
 
     let stdin_reader = std::io::stdin();
     loop {
+        turns_since_episode_sync += 1;
+        if turns_since_episode_sync >= 8 {
+            turns_since_episode_sync = 0;
+            let revision = pattern_episodes.revision();
+            if revision != synced_episodes_revision {
+                match oxigraph_manager
+                    .sync_pattern_episodes(pattern_episodes.entries())
+                    .await
+                {
+                    Ok(_) => synced_episodes_revision = revision,
+                    Err(error) => {
+                        eprintln!("模式经验检查点落图失败（下次重试）：{}", error);
+                    }
+                }
+            }
+        }
         print!("> ");
         std::io::stdout().flush().unwrap();
 
