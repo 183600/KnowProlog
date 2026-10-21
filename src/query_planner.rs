@@ -148,11 +148,22 @@ impl QueryPlanner {
             return Some(plan);
         }
 
+        let particle_free = Self::strip_particles(&raw);
+
+        // 程度问句里的「有」是脚手架（姚明有多高），必须先于存在句识别，
+        // 否则会被误读成「姚明 有 多高」。其余存在句仍依赖句尾语气词。
+        if let Some(plan) = self.parse_degree_attribute(&particle_free) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_age_suffix(&particle_free) {
+            return Some(plan);
+        }
+
         // 存在句依赖句尾语气词（"有…吗"），必须在去语气词之前判断
         if let Some(plan) = self.parse_exist(&raw) {
             return Some(plan);
         }
-        let q = Self::strip_particles(&raw);
+        let q = particle_free;
 
         if let Some(plan) = self.parse_analogy(&q) {
             return Some(plan);
@@ -166,7 +177,6 @@ impl QueryPlanner {
         if let Some(plan) = self.parse_find_subject(&q) {
             return Some(plan);
         }
-
         let (core, had_tail) = Self::strip_question_tail(&q);
         if had_tail {
             return self.build_find_object(core);
@@ -430,6 +440,68 @@ impl QueryPlanner {
         ]
         .iter()
         .any(|word| text.contains(word))
+    }
+
+    /// 程度形容词 → 属性名。只收录能稳定落到已登记属性上的几个：
+    /// 多高 / 多重 / 多大（几岁）。其余程度问句交回规划器弃权，避免把
+    /// 「地球多大」之类的开放问题硬映射成人物属性。
+    fn parse_degree_attribute(&self, q: &str) -> Option<QueryPlan> {
+        const DEGREE_ATTRIBUTES: [(&str, &str); 4] = [
+            ("多高", "身高"),
+            ("多重", "体重"),
+            ("多大", "年龄"),
+            ("几岁", "年龄"),
+        ];
+        for (marker, attribute) in DEGREE_ATTRIBUTES {
+            let prefix = match q.strip_suffix(marker) {
+                Some(prefix) => prefix.trim(),
+                None => continue,
+            };
+            // 「姚明有多高」里的「有」只是程度问句的脚手架，不是实体的一部分。
+            let prefix = prefix.strip_suffix('有').unwrap_or(prefix).trim();
+            // 「姚明的身高有多高」允许重复属性词，去掉后仍然指向同一属性。
+            let prefix = prefix
+                .strip_suffix(attribute)
+                .unwrap_or(prefix)
+                .trim();
+            if prefix.is_empty() || Self::is_question_word(prefix) {
+                continue;
+            }
+            let mut segments = Self::segments_of(prefix);
+            if segments.is_empty() {
+                continue;
+            }
+            if segments
+                .iter()
+                .any(|segment| Self::is_question_word(segment))
+            {
+                continue;
+            }
+            segments.push(attribute.to_string());
+            if segments.len() < 2 || segments.len() > self.max_chain {
+                continue;
+            }
+            return Some(QueryPlan::FindObject { segments });
+        }
+        None
+    }
+
+    /// 多问句尾巴「多少岁」：与「多大」等价，放在候选末尾。
+    fn parse_age_suffix(&self, q: &str) -> Option<QueryPlan> {
+        let prefix = q.strip_suffix("多少岁")?.trim();
+        let prefix = prefix.strip_suffix('有').unwrap_or(prefix).trim();
+        if prefix.is_empty() || Self::is_question_word(prefix) {
+            return None;
+        }
+        let mut segments = Self::segments_of(prefix);
+        if segments.is_empty() {
+            return None;
+        }
+        segments.push("年龄".to_string());
+        if segments.len() < 2 || segments.len() > self.max_chain {
+            return None;
+        }
+        Some(QueryPlan::FindObject { segments })
     }
 
     fn parse_find_subject(&self, q: &str) -> Option<QueryPlan> {
@@ -1199,6 +1271,46 @@ mod tests {
                 segments: vec!["李四".to_string(), "师祖".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn test_degree_attribute_questions_compile_to_attribute_chain() {
+        for (question, subject, attribute) in [
+            ("姚明多高", "姚明", "身高"),
+            ("姚明有多高", "姚明", "身高"),
+            ("姚明的身高有多高", "姚明", "身高"),
+            ("姚明多重？", "姚明", "体重"),
+            ("张三多大", "张三", "年龄"),
+            ("李四几岁", "李四", "年龄"),
+            ("王五多少岁", "王五", "年龄"),
+        ] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("程度问句应编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: vec![subject.to_string(), attribute.to_string()]
+                },
+                "{}",
+                question
+            );
+        }
+        let chained = planner()
+            .parse("姚明的儿子多高")
+            .expect("关系链上的程度问句应保留链");
+        assert_eq!(
+            chained,
+            QueryPlan::FindObject {
+                segments: vec![
+                    "姚明".to_string(),
+                    "儿子".to_string(),
+                    "身高".to_string()
+                ]
+            }
+        );
+        assert!(planner().parse("今天天气怎么样").is_none());
+        assert!(planner().parse("地球多大").is_some(), "映射后仍需由知识侧决定是否有「年龄」");
     }
 
     #[test]
