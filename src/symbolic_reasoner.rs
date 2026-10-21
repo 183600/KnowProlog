@@ -5093,6 +5093,32 @@ impl SymbolicReasoner {
                 });
             }
         }
+        // 会话事实（用户确认的补全、采纳的假设）与图谱事实同权参与当前轮的
+        // 直接命中；它们不写图谱，但必须能在下一轮回答里被用上。
+        for atom in &self.session_facts {
+            if atom.predicate.as_ref() != predicate.slot {
+                continue;
+            }
+            let [subject, object] = atom.terms.as_slice() else {
+                continue;
+            };
+            let value = match (predicate.inverted, subject, object) {
+                (false, Term::Const(subject), Term::Const(object)) if subject.as_ref() == node => {
+                    object.as_ref()
+                }
+                (true, Term::Const(subject), Term::Const(object)) if object.as_ref() == node => {
+                    subject.as_ref()
+                }
+                _ => continue,
+            };
+            if seen.insert(value.to_string()) {
+                hits.push(ValueHit {
+                    value: value.to_string(),
+                    prediction: None,
+                    law: None,
+                });
+            }
+        }
         // 实体属性（非关系型三元组）同样沿属性槽位命中：属性查询与关系查询
         // 走同一条链，逆向（反查主体）暂不支持属性。
         if !predicate.inverted {
@@ -14285,6 +14311,12 @@ types = [
                     && atom.terms.iter().any(|term| term.name() == "孙八")
                     && atom.terms.iter().any(|term| term.name() == "吴十")),
             "确认的补全应成为会话事实"
+        );
+        let answer = reasoner.answer("孙八的师祖是谁").expect("确认后应可回答");
+        assert!(
+            answer.contains("吴十"),
+            "确认的补全必须在下一轮回答中生效：{}",
+            answer
         );
         assert_eq!(
             reasoner.completion_ledger().reasoning_clauses().len(),
