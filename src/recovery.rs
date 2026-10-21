@@ -40,6 +40,8 @@ pub const MIN_NOMINATION_SCORE: f64 = 0.45;
 pub const CLARIFY_TTL_TURNS: u64 = 3;
 /// 同时挂账的问题上限。
 pub const MAX_PENDING: usize = 8;
+/// 会话层确认事实的上限（超出后淘汰最旧条目）。
+pub const MAX_CONFIRMED_FACTS: usize = 64;
 /// 定点化标尺（排序确定性）。
 pub const SCORE_FIXED_SCALE: f64 = 1_000_000.0;
 
@@ -184,10 +186,46 @@ pub struct PendingFollowup {
     pub entity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribute: Option<String>,
+    /// 推测值：用户确认后进入会话事实层；旧快照缺省为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
     pub question: String,
     pub kind: PendingKind,
     pub status: EpistemicStatus,
     pub created_tick: u64,
+}
+
+/// 用户确认后进入会话层的一条事实（永不写基础图谱）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmedFact {
+    pub entity: String,
+    pub attribute: String,
+    pub value: String,
+    /// 产生该确认的回执 id（可审计、可撤回）。
+    pub receipt_id: String,
+    /// 逻辑轮次水位（确定性，不依赖挂钟）。
+    pub tick: u64,
+    /// 确认来源（推测确认 / 澄清回答 / 更正）。
+    pub source: ConfirmationSource,
+}
+
+/// 会话事实的来源分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfirmationSource {
+    Provisional,
+    Clarification,
+    Correction,
+}
+
+impl ConfirmationSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConfirmationSource::Provisional => "推测确认",
+            ConfirmationSource::Clarification => "澄清回答",
+            ConfirmationSource::Correction => "用户更正",
+        }
+    }
 }
 
 /// 恢复引擎的会话状态（随对话快照持久化，保证状态充分性）。
@@ -200,6 +238,9 @@ pub struct RecoveryState {
     pub ledger: FailureLedger,
     #[serde(default)]
     pub pending: BTreeMap<String, PendingFollowup>,
+    /// 会话层已确认事实（旧快照缺省为空，保持字节兼容）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed: Vec<ConfirmedFact>,
 }
 
 impl RecoveryState {
@@ -227,6 +268,46 @@ impl RecoveryState {
                 .cmp(&right.created_tick)
                 .then_with(|| left.question.cmp(&right.question).reverse())
         })
+    }
+
+    /// 记录一条会话层确认事实（同 (实体, 属性) 后者覆盖，保留审计条目）。
+    pub fn record_confirmed(
+        &mut self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+        receipt_id: &str,
+        source: ConfirmationSource,
+    ) {
+        let entity = entity.trim();
+        let attribute = attribute.trim();
+        let value = value.trim();
+        if entity.is_empty() || attribute.is_empty() || value.is_empty() {
+            return;
+        }
+        self.confirmed.retain(|fact| {
+            !(fact.entity == entity && fact.attribute == attribute && fact.value == value)
+        });
+        self.confirmed.push(ConfirmedFact {
+            entity: entity.to_string(),
+            attribute: attribute.to_string(),
+            value: value.to_string(),
+            receipt_id: receipt_id.to_string(),
+            tick: self.tick,
+            source,
+        });
+        if self.confirmed.len() > MAX_CONFIRMED_FACTS {
+            let overflow = self.confirmed.len() - MAX_CONFIRMED_FACTS;
+            self.confirmed.drain(0..overflow);
+        }
+    }
+
+    /// 最近一次确认的取值（会话事实优先于图谱旧值）。
+    pub fn confirmed_value(&self, entity: &str, attribute: &str) -> Option<&ConfirmedFact> {
+        self.confirmed
+            .iter()
+            .rev()
+            .find(|fact| fact.entity == entity.trim() && fact.attribute == attribute.trim())
     }
 }
 
@@ -542,6 +623,7 @@ fn recover_missing<K: RecoveryKnowledge + ?Sized>(
             state,
             entity,
             attribute,
+            Some(&nomination.value),
             &receipt_id,
             &question,
             PendingKind::Provisional,
@@ -578,6 +660,7 @@ fn recover_missing<K: RecoveryKnowledge + ?Sized>(
             state,
             entity,
             attribute,
+            None,
             &receipt_id,
             &question,
             PendingKind::Clarification,
@@ -620,6 +703,7 @@ fn push_pending(
     state: &mut RecoveryState,
     entity: &str,
     attribute: &str,
+    value: Option<&str>,
     receipt_id: &str,
     question: &str,
     kind: PendingKind,
@@ -632,6 +716,7 @@ fn push_pending(
             receipt_id: receipt_id.to_string(),
             entity: Some(entity.to_string()),
             attribute: Some(attribute.to_string()),
+            value: value.map(str::to_string),
             question: question.to_string(),
             kind,
             status,
@@ -657,14 +742,32 @@ pub fn resolve_by_yes(state: &mut RecoveryState, confirmed: bool) -> Option<Stri
     match followup.kind {
         PendingKind::Provisional => {
             state.ledger.resolve(&followup.receipt_id, resolution);
-            Some(if confirmed {
-                format!(
-                    "好的，「{}」我记下了——它是会话级线索，不会写入图谱。",
-                    followup.question
-                )
+            if confirmed {
+                if let (Some(entity), Some(attribute), Some(value)) = (
+                    followup.entity.as_deref(),
+                    followup.attribute.as_deref(),
+                    followup.value.as_deref(),
+                ) {
+                    state.record_confirmed(
+                        entity,
+                        attribute,
+                        value,
+                        &followup.receipt_id,
+                        ConfirmationSource::Provisional,
+                    );
+                    Some(format!(
+                        "好的，已把「{}」的「{}」=「{}」记入本会话（来源：推测确认；未写入图谱）。后续回答会把它当作会话级前提。",
+                        entity, attribute, value
+                    ))
+                } else {
+                    Some(format!(
+                        "好的，「{}」我记下了——它是会话级线索，不会写入图谱。",
+                        followup.question
+                    ))
+                }
             } else {
-                "明白，这条推测作废，我不会再拿它当依据。".to_string()
-            })
+                Some("明白，这条推测作废，我不会再拿它当依据。".to_string())
+            }
         }
         PendingKind::Clarification => {
             // 重新挂回（等具体事实），不结算回执。
@@ -687,11 +790,83 @@ pub fn resolve_clarification(state: &mut RecoveryState, answer: &str) -> Option<
     state
         .ledger
         .resolve(&followup.receipt_id, ReceiptResolution::Acknowledged);
+    let answer = answer.trim();
+    if let (Some(entity), Some(attribute)) = (
+        followup.entity.as_deref(),
+        followup.attribute.as_deref(),
+    ) {
+        state.record_confirmed(
+            entity,
+            attribute,
+            answer,
+            &followup.receipt_id,
+            ConfirmationSource::Clarification,
+        );
+    }
     Some(format!(
         "谢谢，我把「{}」这条线索记在会话里了（{}）。",
-        answer.trim(),
-        followup.question
+        answer, followup.question
     ))
+}
+
+/// 用户否认推测并给出更正值：原推测作废，更正值进入会话事实层。
+pub fn resolve_by_correction(state: &mut RecoveryState, correction: &str) -> Option<String> {
+    let key = {
+        let latest = state.latest_pending()?;
+        if latest.kind != PendingKind::Provisional {
+            return None;
+        }
+        RecoveryState::pending_key(latest.entity.as_deref(), latest.attribute.as_deref())
+    };
+    let followup = state.pending.remove(&key)?;
+    state
+        .ledger
+        .resolve(&followup.receipt_id, ReceiptResolution::Refuted);
+    let value = extract_correction_value(correction)?;
+    let (Some(entity), Some(attribute)) = (
+        followup.entity.as_deref(),
+        followup.attribute.as_deref(),
+    ) else {
+        return Some("明白，这条推测作废，我不会再拿它当依据。".to_string());
+    };
+    state.record_confirmed(
+        entity,
+        attribute,
+        &value,
+        &followup.receipt_id,
+        ConfirmationSource::Correction,
+    );
+    Some(format!(
+        "明白，刚才的推测作废。已按你的更正把「{}」的「{}」记为「{}」（会话级，未写入图谱）。",
+        entity, attribute, value
+    ))
+}
+
+fn extract_correction_value(correction: &str) -> Option<String> {
+    let mut body = correction.trim().trim_matches(['，', ',', '：', ':']).trim();
+    for prefix in [
+        "不是", "不对", "错了", "不", "更正：", "更正:", "应该是", "而是", "是",
+    ] {
+        if let Some(rest) = body.strip_prefix(prefix) {
+            body = rest.trim().trim_matches(['，', ',', '：', ':']).trim();
+            break;
+        }
+    }
+    if body.is_empty() {
+        return None;
+    }
+    let value = body
+        .split(['是', '为'])
+        .next_back()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(body)
+        .trim_matches(['。', '！', '!', '？', '?', ' ']);
+    if value.is_empty() || value == "不是" || value == "不对" {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1007,5 +1182,99 @@ mod tests {
             (state.ledger.digest(), attempt.text)
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn confirming_provisional_lands_in_session_facts() {
+        let knowledge = MockKnowledge {
+            nominations: vec![RecoveryNomination {
+                value: "90".to_string(),
+                score: 0.8,
+                evidence: vec!["链接预测：体重".to_string()],
+            }],
+            ..Default::default()
+        };
+        let mut state = RecoveryState::new();
+        attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request(EpistemicStatus::Absent, Some("姚明"), Some("体重")),
+            &knowledge,
+        );
+        assert_eq!(
+            state.latest_pending().and_then(|pending| pending.value.as_deref()),
+            Some("90"),
+            "推测值必须随挂账保存，确认后才能落地"
+        );
+        let reply = resolve_by_yes(&mut state, true).expect("应结算推测");
+        assert!(reply.contains("记入本会话"), "{}", reply);
+        let fact = state
+            .confirmed_value("姚明", "体重")
+            .expect("确认必须进入会话事实层");
+        assert_eq!(fact.value, "90");
+        assert_eq!(fact.source, ConfirmationSource::Provisional);
+        assert_eq!(state.ledger.open_count(), 0);
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn correction_refutes_and_records_the_right_value() {
+        let knowledge = MockKnowledge {
+            nominations: vec![RecoveryNomination {
+                value: "赵六".to_string(),
+                score: 0.62,
+                evidence: vec!["师傅链".to_string()],
+            }],
+            ..Default::default()
+        };
+        let mut state = RecoveryState::new();
+        attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request(EpistemicStatus::Absent, Some("张三"), Some("师祖")),
+            &knowledge,
+        );
+        let reply = resolve_by_correction(&mut state, "不对，张三的师祖是孙八").unwrap();
+        assert!(reply.contains("作废") && reply.contains("孙八"), "{}", reply);
+        let fact = state
+            .confirmed_value("张三", "师祖")
+            .expect("更正必须进入会话事实层");
+        assert_eq!(fact.value, "孙八");
+        assert_eq!(fact.source, ConfirmationSource::Correction);
+        assert_eq!(state.ledger.open_count(), 0);
+        assert!(
+            !state
+                .confirmed
+                .iter()
+                .any(|fact| fact.value == "赵六"),
+            "被否认的推测不得进入会话事实"
+        );
+    }
+
+    #[test]
+    fn confirmed_facts_survive_snapshot_and_stay_bounded() {
+        let mut state = RecoveryState::new();
+        for index in 0..(MAX_CONFIRMED_FACTS + 3) {
+            state.record_confirmed(
+                "姚明",
+                &format!("属性{}", index),
+                &format!("值{}", index),
+                "r",
+                ConfirmationSource::Clarification,
+            );
+        }
+        assert_eq!(state.confirmed.len(), MAX_CONFIRMED_FACTS);
+        assert!(state.confirmed_value("姚明", "属性0").is_none());
+        assert_eq!(
+            state.confirmed_value("姚明", "属性3").map(|fact| fact.value.as_str()),
+            Some("值3")
+        );
+        let encoded = serde_json::to_string(&state).unwrap();
+        let decoded: RecoveryState = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, state);
+
+        let legacy: RecoveryState =
+            serde_json::from_str(r#"{"tick":2,"ledger":{"receipts":[]},"pending":{}}"#).unwrap();
+        assert!(legacy.confirmed.is_empty(), "旧快照缺字段应按空恢复");
     }
 }
