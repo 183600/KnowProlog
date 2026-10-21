@@ -121,6 +121,15 @@ pub struct SlotConflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerIssue {
+    pub predicate: String,
+    pub surface: String,
+    pub message: String,
+    pub expected: Vec<String>,
+    pub actual: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShapeAnswer {
     pub entity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +138,7 @@ pub struct ShapeAnswer {
     pub facts: Vec<AnswerFact>,
     pub missing: Vec<MissingSlot>,
     pub conflicts: Vec<SlotConflict>,
+    pub issues: Vec<AnswerIssue>,
     pub graph_facts: usize,
     pub session_facts: usize,
     pub digest: String,
@@ -317,6 +327,7 @@ impl ShapeAnswer {
 
         let mut missing = Vec::new();
         let mut conflicts = Vec::new();
+        let mut issues = Vec::new();
         for violation in &report.violations {
             if violation.focus_node != entity {
                 continue;
@@ -337,18 +348,32 @@ impl ShapeAnswer {
                 } => {
                     conflicts.push(slot_conflict(property, values, &answer_facts));
                 }
-                _ => {}
+                _ => issues.push(AnswerIssue {
+                    predicate: violation.path.clone(),
+                    surface: display_predicate(&violation.path),
+                    message: violation.message.clone(),
+                    expected: violation.expected.clone(),
+                    actual: violation.actual.clone(),
+                }),
             }
         }
         missing.sort_by(|left, right| left.predicate.cmp(&right.predicate));
         missing.dedup_by(|left, right| left.predicate == right.predicate);
         conflicts.sort_by(|left, right| left.predicate.cmp(&right.predicate));
         conflicts.dedup_by(|left, right| left.predicate == right.predicate);
+        issues.sort_by(|left, right| {
+            left.predicate
+                .cmp(&right.predicate)
+                .then_with(|| left.message.cmp(&right.message))
+        });
+        issues.dedup_by(|left, right| {
+            left.predicate == right.predicate && left.message == right.message
+        });
 
         known = known || graph_nodes.contains(entity);
         let status = if !known {
             AnswerStatus::Unknown
-        } else if !conflicts.is_empty() {
+        } else if !conflicts.is_empty() || !issues.is_empty() {
             AnswerStatus::Conflict
         } else if !missing.is_empty() {
             AnswerStatus::Partial
@@ -371,6 +396,7 @@ impl ShapeAnswer {
                 "facts": &answer_facts,
                 "missing": &missing,
                 "conflicts": &conflicts,
+                "issues": &issues,
             });
             fnv1a_hex(canonical_json(&value).as_bytes())
         };
@@ -381,6 +407,7 @@ impl ShapeAnswer {
             facts: answer_facts,
             missing,
             conflicts,
+            issues,
             graph_facts,
             session_facts,
             digest,
@@ -467,6 +494,15 @@ impl ShapeAnswer {
             lines.push(format!(
                 "  缺失：{} —— 知识图谱与本会话都没有记录，系统不会编造。",
                 slots
+            ));
+        }
+        for issue in &self.issues {
+            lines.push(format!(
+                "  类型问题：{}（{}）；期望：{}；实际：{}。系统不会把不合形状的取值当作确定事实。",
+                issue.surface,
+                issue.message,
+                issue.expected.join("、"),
+                issue.actual.join("、")
             ));
         }
         if !self.conflicts.is_empty() {
@@ -1411,6 +1447,50 @@ mod tests {
         assert!(turn.message.contains("冲突"));
         assert!(turn.message.contains("不替你选"));
         assert!(turn.consultation.is_none(), "冲突不能变成普通填空追问");
+    }
+
+    #[test]
+    fn datatype_violation_is_disclosed_instead_of_claimed_complete() {
+        let registry = registry();
+        let types = types();
+        let shapes = ShapeSet::from_schema(
+            &[EntityTypeConfig {
+                label: "Person".to_string(),
+                examples: Vec::new(),
+                properties: vec![PropertyConfig {
+                    name: "年龄".to_string(),
+                    data_type: "integer".to_string(),
+                    required: false,
+                    extraction_patterns: Vec::new(),
+                }],
+            }],
+            &registry,
+            &types,
+        );
+        let facts = vec![entity(
+            "刘德华",
+            "Person",
+            &[("name", "刘德华"), ("年龄", "十八")],
+        )];
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let turn = dialogue.start_profile(
+            "刘德华",
+            "刘德华是谁？",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+            &mut acquisition,
+        );
+        assert_eq!(turn.answer.status, AnswerStatus::Conflict);
+        assert!(!turn.answer.issues.is_empty());
+        assert!(turn.message.contains("类型问题"));
+        assert!(turn.message.contains("不会把不合形状的取值当作确定事实"));
+        assert!(
+            turn.consultation.is_none(),
+            "类型问题不能被当作普通缺口继续追问"
+        );
     }
 
     #[test]
