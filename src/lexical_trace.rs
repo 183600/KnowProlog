@@ -923,6 +923,33 @@ pub fn trace_question(
     }
 
     let mut reading_state = reading::diagnose(trimmed, plan);
+    if plan.is_none() {
+        // 没有计划时，未登录词是「为什么读不懂」的直接证据；只在此分支
+        // 报告，成功计划里的程度词/量词不会制造噪声。结构助词不是词表缺口。
+        for token in tokens.iter().filter(|token| token.source == TagSource::Unknown) {
+            let text = token.text.trim();
+            if text.is_empty()
+                || !text.chars().any(char::is_alphanumeric)
+                || matches!(
+                    text,
+                    "的" | "呢" | "吗" | "吧" | "啊" | "呀" | "了" | "着" | "过" | "是" | "有"
+                )
+            {
+                continue;
+            }
+            reading_state.push(
+                Residual::new(
+                    ResidualKind::UnknownToken,
+                    ResidualStage::Tag,
+                    ResidualSeverity::Warning,
+                    RepairKind::RewriteQuestion,
+                    format!("未登录词「{}」不在词表/本体中", text),
+                )
+                .surface(trimmed, TextSpan::new(token.start, token.end))
+                .expected("词表/本体中的实体或谓词"),
+            );
+        }
+    }
     for marker in markers.iter().filter(|marker| marker.boundary_violation) {
         // 标记词落在别的 token 内部却已经被当前计划消费，说明计划本身可能
         // 建立在子串误读上（「所有权」不是「所有」）；这种残差必须阻断，
@@ -1252,6 +1279,23 @@ mod tests {
         let receipt = trace.receipt();
         assert_eq!(receipt.closure_marker_violations, 1);
         assert_eq!(receipt.plan_kind.as_deref(), Some("Closure"));
+    }
+
+    #[test]
+    fn unplanned_question_reports_unknown_token_with_span() {
+        let config = config();
+        let trace = trace_question("所有权归谁", &config, None);
+        let residual = trace
+            .reading
+            .residuals
+            .iter()
+            .find(|residual| residual.kind == ResidualKind::UnknownToken)
+            .expect("无计划时应定位未登录词");
+        assert_eq!(residual.stage, ResidualStage::Tag);
+        assert_eq!(residual.span, Some(TextSpan::new(3, 4)));
+        assert_eq!(residual.surface.as_deref(), Some("归"));
+        assert_eq!(residual.severity, ResidualSeverity::Warning);
+        assert_eq!(residual.repair, RepairKind::RewriteQuestion);
     }
 
     #[test]
