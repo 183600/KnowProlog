@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::predicate_registry::PredicateRegistry;
 use crate::prolog_engine::PrologFact;
-use crate::relation_acquisition::{AcquisitionStatus, AnswerAct, GoalOpen, RelationAcquisition};
+use crate::relation_acquisition::{
+    AcquisitionStatus, AnswerAct, GoalOpen, GoalOrigin, RelationAcquisition,
+};
 use crate::shape_gate::{
     ConstraintKind, RepairAction, Severity, ShapeReport, ShapeSet, ShapeViolation,
 };
@@ -768,6 +770,13 @@ impl ShapeDialogue {
         self.focus = Some(entity.to_string());
         self.original_question = Some(question.trim().to_string());
         self.pending = None;
+        if acquisition
+            .active_goal()
+            .map(|goal| goal.origin == GoalOrigin::ShapeRepair)
+            .unwrap_or(false)
+        {
+            acquisition.clear_goal();
+        }
 
         let (answer, report) = ShapeAnswer::build(
             entity,
@@ -852,6 +861,7 @@ impl ShapeDialogue {
 
         if committed {
             self.pending = None;
+            acquisition.clear_goal();
             self.resolved.insert(pending.gap.id.clone());
             let (answer, report) = ShapeAnswer::build(
                 &pending.gap.entity,
@@ -1267,6 +1277,7 @@ mod tests {
     fn registry() -> PredicateRegistry {
         let mut registry = PredicateRegistry::new();
         registry.declare(&profile("出生地", false, &["人物"], &[]));
+        registry.declare(&profile("国籍", false, &["人物"], &[]));
         registry.declare(&profile("职业", true, &[], &[]));
         registry.declare(&profile("女儿", false, &["人物"], &["人物"]));
         registry
@@ -1552,6 +1563,65 @@ mod tests {
         );
         attempts.insert(missing.id.clone(), MAX_ASK_ATTEMPTS);
         assert_eq!(agenda.next_for("王五", &attempts), None);
+    }
+
+    #[test]
+    fn confirmation_advances_to_the_next_gap_without_repeating() {
+        let registry = registry();
+        let types = types();
+        let shapes = ShapeSet::from_schema(
+            &[EntityTypeConfig {
+                label: "Person".to_string(),
+                examples: Vec::new(),
+                properties: vec![
+                    PropertyConfig {
+                        name: "出生地".to_string(),
+                        data_type: "string".to_string(),
+                        required: true,
+                        extraction_patterns: Vec::new(),
+                    },
+                    PropertyConfig {
+                        name: "国籍".to_string(),
+                        data_type: "string".to_string(),
+                        required: true,
+                        extraction_patterns: Vec::new(),
+                    },
+                ],
+            }],
+            &registry,
+            &types,
+        );
+        let facts = vec![entity("刘德华", "Person", &[("name", "刘德华")])];
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let first = dialogue.start_profile(
+            "刘德华",
+            "刘德华是谁？",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+            &mut acquisition,
+        );
+        assert!(first.answer.missing.len() >= 2);
+        let first_gap = first.consultation.unwrap().gap.predicate;
+        let value = if first_gap == "出生地" {
+            "香港"
+        } else {
+            "中国"
+        };
+        let _ = dialogue.respond(value, &facts, &registry, &types, &shapes, &mut acquisition);
+        let second = dialogue
+            .respond("确认", &facts, &registry, &types, &shapes, &mut acquisition)
+            .unwrap();
+        assert_eq!(second.answer.status, AnswerStatus::Partial);
+        let next = second.consultation.expect("补一个缺口后应继续问下一个");
+        assert_ne!(next.gap.predicate, first_gap);
+        assert_eq!(
+            dialogue.attempts.get(&next.gap.id).copied(),
+            Some(1),
+            "每个缺口只问一次"
+        );
     }
 
     #[test]
