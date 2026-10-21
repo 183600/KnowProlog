@@ -1146,8 +1146,12 @@ impl ApiState {
     /// 注入插件运行时（在 `Arc::new` 之前调用）。
     ///
     /// 运行时被所有会话共享：词表/本体/改写/配方/风格一致地作用于每个会话，
-    /// 而对话记忆仍按会话隔离。模式在注入时确定，运行中不提供 HTTP 热切换。
+    /// 而对话记忆仍按会话隔离。注入时自动把已启用插件的本体贡献并入暖基座
+    /// （幂等）；模式在注入时确定，运行中不提供 HTTP 热切换。
     pub fn set_plugin_runtime(&mut self, runtime: Option<Arc<parking_lot::Mutex<PluginRuntime>>>) {
+        if let Some(runtime) = &runtime {
+            self.configure_plugin_runtime(&runtime.lock());
+        }
         self.plugin = runtime;
     }
 
