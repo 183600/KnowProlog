@@ -1329,6 +1329,12 @@ impl ShapeDialogue {
                 self.attempts.get(&pending.gap.id).copied().unwrap_or(0)
             ));
         }
+        if !self.rulings.is_empty() {
+            lines.push(format!("会话裁定 {} 条：", self.rulings.len()));
+            for ruling in &self.rulings {
+                lines.push(format!("  {}", ruling.render_text()));
+            }
+        }
         lines.push(self.agenda.render_text());
         lines.push(format!(
             "已收敛缺口 {} 个；提问次数 {}。",
