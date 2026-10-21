@@ -386,9 +386,33 @@ pub fn rewrite(
         return None;
     }
     let text = strip_trailing_particles(&text);
-    let (text, yes_no) = strip_yes_no(&text);
+    let (mut text, mut yes_no) = strip_yes_no(&text);
     if text.chars().count() < 2 {
         return None;
+    }
+    for marker in ["有没有", "是否"] {
+        if let Some(position) = text.find(marker) {
+            text = format!("{}{}", &text[..position], &text[position + marker.len()..]);
+            yes_no = true;
+            break;
+        }
+    }
+    text = text.trim().to_string();
+
+    for suffix in ["的是哪些人", "的是哪位", "的是哪个", "的是谁"] {
+        if let Some(rest) = text.strip_suffix(suffix) {
+            let (surface, predicate, object) = split_predicate_object(rest, lexicon)?;
+            return Some(build(
+                QueryPlan::FindSubject {
+                    object,
+                    predicate: predicate.clone(),
+                },
+                RelationShape::ActiveWhSubject,
+                "relative-agent",
+                surface,
+                predicate,
+            ));
+        }
     }
 
     if let Some((position, length)) = marker_position(&text, &["被"]) {
@@ -666,6 +690,29 @@ mod tests {
         assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
         assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
         assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn existence_marker_and_relative_clause() {
+        let existence = parse("张三有没有教过李四").expect("有没有是非问");
+        assert_eq!(
+            existence.plan,
+            QueryPlan::CheckRelation {
+                subject: "张三".to_string(),
+                predicate: "教".to_string(),
+                object: "李四".to_string()
+            }
+        );
+
+        let relative = parse("教过张三的是谁").expect("关系从句问施事");
+        assert_eq!(relative.rule, "relative-agent");
+        assert_eq!(
+            relative.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
     }
 
     #[test]

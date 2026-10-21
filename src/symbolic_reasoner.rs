@@ -908,21 +908,29 @@ impl SymbolicReasoner {
 
         impl RelationLexicon for View<'_> {
             fn canonical_entity(&self, raw: &str) -> Option<String> {
-                let canonical = self.0.aligner.canonical_form(raw);
-                if self.0.is_known_entity(raw) {
-                    Some(canonical)
-                } else if self.0.is_known_entity(&canonical) {
-                    Some(canonical)
-                } else {
-                    None
-                }
+                // 只接受精确登记的词面/会话事实；不用模糊对齐把整个短语
+                // （如「张三的师傅」）误吸附到一个短实体上。
+                self.0
+                    .is_known_entity(raw)
+                    .then(|| self.0.aligner.canonical_form(raw))
             }
 
             fn canonical_predicate(&self, raw: &str) -> Option<String> {
-                if !self.0.is_known_predicate(raw) {
-                    return None;
-                }
-                Some(self.0.resolve_question_predicate(raw).0)
+                // 谓词同样先做精确判定：已登记关系、精确事实谓词、逆谓词
+                // 或同义词别名，任一成立才归一；模糊对齐不参与边界切分。
+                let canonical = self.0.aligner.canonical_form(raw);
+                let alias = canonical != raw
+                    && self
+                        .0
+                        .aligner
+                        .synonyms()
+                        .get(raw)
+                        .is_some_and(|target| target == &canonical);
+                let exact = self.0.predictor.has_predicate(raw)
+                    || self.0.aligner.kind_of(raw) == Some(TermKind::Relation)
+                    || self.0.inverse_query_map.contains_key(raw)
+                    || alias;
+                exact.then(|| self.0.resolve_question_predicate(raw).0)
             }
         }
 
@@ -4171,10 +4179,13 @@ impl SymbolicReasoner {
         if trimmed.is_empty() {
             return None;
         }
-        if let Some(plan) = self.planner.parse(trimmed).or_else(|| {
-            query_rewrite::rewrite(trimmed, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
-        }) {
+        if let Some(plan) = self.planner.parse(trimmed) {
             if let Some(view) = self.relation_plan_view(&plan) {
+                return Some(view);
+            }
+        }
+        if let Some(rewritten) = query_rewrite::rewrite(trimmed, &self.relation_lexicon()) {
+            if let Some(view) = self.relation_plan_view(&rewritten.plan) {
                 return Some(view);
             }
         }
@@ -5463,9 +5474,24 @@ impl SymbolicReasoner {
     }
 
     fn answer_planned(&self, question: &str) -> Option<String> {
-        let plan = self.planner.parse(question).or_else(|| {
-            query_rewrite::rewrite(question, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
-        })?;
+        let parsed = self.planner.parse(question);
+        if let Some(answer) = parsed
+            .as_ref()
+            .and_then(|plan| self.answer_plan(plan, question))
+        {
+            return Some(answer);
+        }
+        // 已有计划可能只解析了句子的前半段（例如「X 有没有 V Y」被误读成
+        // 存在性问句）。此时用句法重写器再编译一次，词表校验不过就弃权。
+        let rewritten = query_rewrite::rewrite(question, &self.relation_lexicon())?;
+        if parsed.as_ref() == Some(&rewritten.plan) {
+            return None;
+        }
+        self.answer_plan(&rewritten.plan, question)
+    }
+
+    fn answer_plan(&self, plan: &QueryPlan, question: &str) -> Option<String> {
+        let plan = plan.clone();
         match plan {
             QueryPlan::FindObject { segments } => {
                 let (entity, predicates) = self.split_chain(&segments)?;
@@ -13381,6 +13407,14 @@ types = [
         assert!(passive_subject.contains("李四"), "{}", passive_subject);
         let passive_yes = reasoner.answer("张三被李四认识吗").expect("被字句是非问");
         assert!(passive_yes.contains("是的"), "{}", passive_yes);
+        let existence = reasoner
+            .answer("张三有没有认识王五")
+            .expect("有没有是非问");
+        assert!(existence.contains("是的"), "{}", existence);
+        let relative = reasoner
+            .answer("认识张三的是谁")
+            .expect("关系从句问施事");
+        assert!(relative.contains("李四"), "{}", relative);
 
         let receipt = reasoner
             .query_rewrite_receipt("谁被张三认识")
