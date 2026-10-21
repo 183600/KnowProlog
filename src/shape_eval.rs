@@ -367,6 +367,7 @@ pub fn evaluate_seed() -> ShapeEvalReport {
     run_completion(&mut tally);
     run_two_gaps(&mut tally);
     run_conflict(&mut tally);
+    run_type_issue(&mut tally);
     run_unknown(&mut tally);
     run_snapshot(&mut tally);
     run_isolation(&mut tally);
@@ -588,6 +589,46 @@ fn run_conflict(tally: &mut EvalTally) {
     }
 }
 
+fn run_type_issue(tally: &mut EvalTally) {
+    let registry = registry();
+    let types = types();
+    let shapes = ShapeSet::from_schema(
+        &[EntityTypeConfig {
+            label: "Person".to_string(),
+            examples: Vec::new(),
+            properties: vec![optional_property("年龄", "integer")],
+        }],
+        &registry,
+        &types,
+    );
+    let facts = vec![entity(
+        "刘德华",
+        "Person",
+        &[("name", "刘德华"), ("年龄", "十八")],
+    )];
+    let mut acquisition = RelationAcquisition::new();
+    let mut dialogue = ShapeDialogue::new();
+    let turn = dialogue.start_profile(
+        "刘德华",
+        "刘德华是谁？",
+        &facts,
+        &registry,
+        &types,
+        &shapes,
+        &mut acquisition,
+    );
+    tally.conflicts += 1;
+    if turn.answer.status == AnswerStatus::Conflict
+        && !turn.answer.issues.is_empty()
+        && turn.consultation.is_none()
+        && turn.message.contains("类型问题")
+        && turn.message.contains("不会把不合形状的取值当作确定事实")
+        && dialogue.agenda().blocked.contains("刘德华")
+    {
+        tally.conflicts_disclosed += 1;
+    }
+}
+
 fn run_unknown(tally: &mut EvalTally) {
     let registry = registry();
     let types = types();
@@ -788,6 +829,15 @@ fn required_property(name: &str) -> PropertyConfig {
         name: name.to_string(),
         data_type: "string".to_string(),
         required: true,
+        extraction_patterns: Vec::new(),
+    }
+}
+
+fn optional_property(name: &str, data_type: &str) -> PropertyConfig {
+    PropertyConfig {
+        name: name.to_string(),
+        data_type: data_type.to_string(),
+        required: false,
         extraction_patterns: Vec::new(),
     }
 }
