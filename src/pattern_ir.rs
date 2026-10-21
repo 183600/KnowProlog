@@ -823,7 +823,8 @@ pub fn classify_case_reply(input: &str) -> CaseReply {
         "yes", "y", "true",
     ];
     let reject = [
-        "不是", "不对", "否", "不要", "不用", "别", "错", "算了", "no", "n", "false",
+        "不是", "不对", "没有", "否", "不", "不要", "不用", "别", "错", "算了", "no", "n",
+        "false",
     ];
     let unclear = ["不知道", "不确定", "不清楚", "跳过", "下一个", "随便"];
     if accept.contains(&lower.as_str()) {
@@ -902,6 +903,27 @@ impl PatternEpisodeLog {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// 删除单条经验：按完整 id、短 id、完整原句或至少 4 位十六进制 id 前缀匹配。
+    /// 返回删除条数；用于撤销误确认/误否定而不清空整本经验。
+    pub fn forget(&mut self, needle: &str) -> usize {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return 0;
+        }
+        let prefix = needle.chars().count() >= 4
+            && needle.chars().all(|ch| ch.is_ascii_hexdigit())
+            && needle.chars().count() < 16;
+        let before = self.entries.len();
+        self.entries.retain(|episode| {
+            let id = episode.id();
+            !(id == needle
+                || episode.short_id() == needle
+                || episode.input.trim() == needle
+                || (prefix && id.starts_with(needle)))
+        });
+        before - self.entries.len()
     }
 
     /// 记录一次成功理解（同身份经验累计次数并刷新最后轮次）。
@@ -2349,8 +2371,14 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
         };
         let _ = writeln!(
             out,
-            "  {} ×{} 第{}轮{}{}：{}",
-            target, episode.count, episode.last_turn, context, feedback, episode.input
+            "  [{}] {} ×{} 第{}轮{}{}：{}",
+            episode.short_id(),
+            target,
+            episode.count,
+            episode.last_turn,
+            context,
+            feedback,
+            episode.input
         );
     }
     let mut recent: Vec<&PatternEpisode> = log.entries().iter().collect();
@@ -2375,6 +2403,10 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
             episode.input
         );
     }
+    let _ = writeln!(
+        out,
+        "（可用「忘经验：<短 id 或原句>」删除单条经验，撤销误确认/误否定。）"
+    );
     out
 }
 
@@ -4112,7 +4144,7 @@ mod tests {
                 answer
             );
         }
-        for answer in ["不是", "不对！", "算了", "不要", "no", "否吧"] {
+        for answer in ["不是", "不对！", "不", "没有", "算了", "不要", "no", "否吧"] {
             assert_eq!(
                 classify_case_reply(answer),
                 CaseReply::Reject,
@@ -4185,5 +4217,28 @@ mod tests {
             log.suggest_case(&current, Some("法国"), 0.2).is_some(),
             "确认抵消净否定后应允许再次联想"
         );
+    }
+
+    #[test]
+    fn forget_removes_single_episode_by_short_id_or_exact_input() {
+        let library = sample_library();
+        let stored = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = library.match_route(&stored).expect("应命中");
+        let mut log = PatternEpisodeLog::default();
+        let episode = log.record_match("法国的首都是哪里", &stored, &matched, None, 1);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.forget("deadbeef"), 0, "未知 id 不应误删");
+        assert_eq!(log.forget(&episode.short_id()), 1);
+        assert!(log.is_empty(), "按短 id 应删除单条经验");
+
+        log.record_match("法国的首都是哪里", &stored, &matched, None, 2);
+        assert_eq!(log.forget("法国的首都是哪里"), 1);
+        assert!(log.is_empty(), "按完整原句也应删除单条经验");
     }
 }

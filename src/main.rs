@@ -3714,6 +3714,32 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 忘经验：按短 id / 完整 id / 原句删除单条经验（撤销误确认或误否定）
+        if let Some(needle) = strip_any_prefix(
+            input,
+            &["忘经验：", "忘经验:", "忘经验 ", "遗忘经验：", "遗忘经验:"],
+        ) {
+            let needle = needle.trim();
+            if needle.is_empty() {
+                println!("用法：忘经验：<短 id 或原句>，短 id 见「模式经验」。");
+                println!();
+                continue;
+            }
+            let removed = pattern_episodes.forget(needle);
+            match oxigraph_manager
+                .sync_pattern_episodes(pattern_episodes.entries())
+                .await
+            {
+                Ok(count) => println!(
+                    "已删除 {} 条模式经验（经验落图：{} 条）。",
+                    removed, count
+                ),
+                Err(error) => println!("删除 {} 条模式经验，但经验落图失败：{}", removed, error),
+            }
+            println!();
+            continue;
+        }
+
         if matches!(input, "清空模式经验" | "遗忘模式经验") {
             pattern_episodes.clear();
             match oxigraph_manager
@@ -8548,6 +8574,7 @@ fn interactive_help() -> String {
         "  模式联想：<句子>                     用相似成功经验泛化候选骨架（只确认，不直接回答）",
         "  确认联想：<句子>                     用户确认候选骨架，转正为可路由模式并落图",
         "  是 / 不是                            直接结算上一轮模式联想；否定记入负向反馈",
+        "  忘经验：<短 id 或原句>               删除单条经验（撤销误确认/误否定）",
         "  清空模式经验                         清空经验台账并同步命名图",
         "  教模式：名 | 要素… | 路由 | 优先级 | 守卫  教一条模式（可选上下文守卫，落图持久化）",
         "  忘模式：<名>                         遗忘一条教学模式",
@@ -9074,6 +9101,11 @@ fn is_command_like(input: &str) -> bool {
         "案例转正：",
         "案例转正:",
         "案例转正 ",
+        "忘经验：",
+        "忘经验:",
+        "忘经验 ",
+        "遗忘经验：",
+        "遗忘经验:",
         "清空模式经验",
         "遗忘模式经验",
         "模式匹配：",
@@ -10499,6 +10531,8 @@ mod session_tests {
             "模式联想：德国的首都在哪里",
             "确认联想：德国的首都在哪里",
             "采纳联想：德国的首都在哪里",
+            "忘经验：a1b2c3d4",
+            "遗忘经验：法国首都查询",
             "清空模式经验",
             "教模式：老家 | {人} 的 老家 | hometown_query | 20 | 焦点",
             "忘模式：老家",
