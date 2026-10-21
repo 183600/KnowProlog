@@ -5691,6 +5691,96 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 补全回合：打开一次可确认、可归纳、可批量闭包的学习回合
+        if let Some(entity) =
+            strip_any_prefix(input, &["补全回合：", "补全回合:", "学习回合：", "学习回合:"])
+        {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                println!("请提供要补全的实体，例如：补全回合：张三");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.completion_open(entity));
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(selector) =
+            strip_any_prefix(input, &["确认补全：", "确认补全:", "采纳补全：", "采纳补全:"])
+        {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                println!("请给出候选序号、候选 id 或 主体|谓词|客体，例如：确认补全：1");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.completion_confirm(selector));
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(selector) =
+            strip_any_prefix(input, &["否定补全：", "否定补全:", "驳回补全：", "驳回补全:"])
+        {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                println!("请给出候选序号、候选 id 或 主体|谓词|客体，例如：否定补全：2");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.completion_refute(selector));
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "补全规则" | "补全规则报告" | "补全台账") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.completion_rules_report());
+            println!();
+            continue;
+        }
+
+        if matches!(input, "补全报告" | "补全回合报告" | "补全状态") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            println!("{}", symbolic_reasoner.completion_report());
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &[
+                "晋升补全规则：",
+                "晋升补全规则:",
+                "补全规则晋升：",
+                "补全规则晋升:",
+            ],
+        ) {
+            let spec = spec.trim();
+            let parsed = spec
+                .split_once('|')
+                .or_else(|| spec.split_once('｜'))
+                .or_else(|| spec.rsplit_once(' '));
+            match parsed {
+                Some((rule_id, scope))
+                    if !rule_id.trim().is_empty() && !scope.trim().is_empty() =>
+                {
+                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                    println!(
+                        "{}",
+                        symbolic_reasoner
+                            .completion_promote(rule_id.trim(), scope.trim())
+                    );
+                }
+                _ => println!(
+                    "用法：晋升补全规则：<规则id>|<作用域>，作用域为本例/本批/命名空间/全局"
+                ),
+            }
+            println!();
+            continue;
+        }
+
         // 结构联想：RWR 图嵌入（随机游走重启）检索结构相关实体与解释路径
         if let Some(entity) =
             strip_any_prefix(input, &["结构联想：", "结构联想:", "图游走：", "图游走:"])
@@ -8664,6 +8754,10 @@ fn interactive_help() -> String {
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
+        "  补全回合：<实体>                     打开一次学习回合：收集候选、确认归纳、本批闭包",
+        "  确认补全：<序号> / 否定补全：<序号>   裁定候选；确认事实只进会话，不写图谱",
+        "  补全规则 / 补全报告                   已归纳规则与本回合候选（默认本批作用域）",
+        "  晋升补全规则：<id>|<作用域>           显式升到命名空间/全局，才进入全局归结",
         "  对齐报告 / 对齐候选：<术语>          本体对齐、候选格与答案等价性",
         "  覆盖报告 / 质量护照                   覆盖缺口与数据质量",
         "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
@@ -8899,6 +8993,13 @@ fn is_command_like(input: &str) -> bool {
         "续写",
         "接龙",
         "补全",
+        "补全回合",
+        "确认补全",
+        "否定补全",
+        "驳回补全",
+        "补全规则",
+        "补全报告",
+        "晋升补全规则",
         "关联规则",
         "关联联想",
         "联想",

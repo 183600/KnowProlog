@@ -14,6 +14,7 @@ use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
+use crate::completion_episode::{CompletionLedger, RuleScope};
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
@@ -727,6 +728,8 @@ pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
     predictor: LinkPredictor,
+    // 补全回合：确认 → 归纳批次规则 → 有界闭包；默认不写图谱、不全局生效。
+    completion: CompletionLedger,
     // 律典：声明律 + 挖掘律的统一台账；仅 Active 的传递/对称/互逆律参与查询扩展。
     laws: LawBook,
     // 律典的声明来源快照；知识变化时据此重建，避免把配置知识散落在查询路径。
@@ -822,6 +825,7 @@ impl Clone for SymbolicReasoner {
             config: self.config.clone(),
             aligner: self.aligner.clone(),
             predictor: self.predictor.clone(),
+            completion: self.completion.clone(),
             laws: self.laws.clone(),
             law_registry: self.law_registry.clone(),
             persisted_laws: self.persisted_laws.clone(),
@@ -1020,6 +1024,7 @@ impl SymbolicReasoner {
             config,
             aligner,
             predictor: LinkPredictor::new(),
+            completion: CompletionLedger::new(),
             laws: LawBook::new(),
             law_registry: None,
             persisted_laws: None,
@@ -2416,6 +2421,11 @@ impl SymbolicReasoner {
         for clause in &self.session_clauses {
             engine.add_clause(clause.clone());
         }
+        // 只有用户显式晋升到命名空间/全局的补全规则才进入全局归结；
+        // 本批/本例规则留在回合内，不污染其他实体的回答。
+        for clause in self.completion.reasoning_clauses() {
+            engine.add_clause(clause);
+        }
         self.resolver = engine;
         self.stamp_rebuild("resolver");
     }
@@ -2456,6 +2466,14 @@ impl SymbolicReasoner {
         }
         for rule in self.predictor.rules() {
             let clause = clause_from_path_rule(rule);
+            engine.add_rule(WeightedRule::new(
+                clause.head,
+                clause.body,
+                MarkovLogicEngine::weight_from_confidence(clause.confidence),
+                &clause.source,
+            ));
+        }
+        for clause in self.completion.reasoning_clauses() {
             engine.add_rule(WeightedRule::new(
                 clause.head,
                 clause.body,
@@ -4646,6 +4664,211 @@ impl SymbolicReasoner {
             ));
         }
         Some(output.trim_end().to_string())
+    }
+
+    /// 补全回合的只读视图（供命令、评测与会话快照复用）。
+    pub fn completion_ledger(&self) -> &CompletionLedger {
+        &self.completion
+    }
+
+    /// 本批范围：焦点实体 + 同类型实体 + 一跳邻居 + 与焦点共享谓词的实体。
+    /// 有界且确定；无类型数据时仍能覆盖同一关系族的其他实体。
+    fn completion_batch_scope(&self, entity: &str) -> Vec<String> {
+        let mut scope: BTreeSet<String> = BTreeSet::new();
+        scope.insert(entity.to_string());
+        if let Some(etype) = self.generator.entity_type_of(entity) {
+            for other in self.generator.entities_of_type(etype).into_iter().take(32) {
+                scope.insert(other);
+            }
+        }
+        let mut predicates: BTreeSet<String> = self
+            .generator
+            .relation_predicates(entity)
+            .into_iter()
+            .collect();
+        predicates.extend(self.generator.relation_predicates_in(entity));
+        for predicate in &predicates {
+            for value in self
+                .generator
+                .relation_values(entity, predicate)
+                .into_iter()
+                .take(8)
+            {
+                scope.insert(value);
+            }
+            for value in self
+                .generator
+                .relation_values_in(entity, predicate)
+                .into_iter()
+                .take(8)
+            {
+                scope.insert(value);
+            }
+        }
+        for triple in self.predictor.triples() {
+            if !predicates.contains(&triple.predicate) {
+                continue;
+            }
+            if scope.len() >= 64 {
+                break;
+            }
+            scope.insert(triple.subject.clone());
+            scope.insert(triple.object.clone());
+        }
+        scope.into_iter().take(64).collect()
+    }
+
+    /// 打开一个补全回合：收集链接预测候选，建立本批范围。
+    pub fn completion_open(&mut self, entity_raw: &str) -> String {
+        let entity = self.resolve_known_entity(entity_raw).unwrap_or_else(|| {
+            self.aligner.canonical_form(entity_raw.trim())
+        });
+        if entity.is_empty() {
+            return "请提供要补全的实体，例如：补全回合：张三".to_string();
+        }
+        if !self.predictor.participates(&entity) {
+            return format!(
+                "「{}」不在知识图谱的关系中：补全回合需要至少一条已导入关系。",
+                entity
+            );
+        }
+        let limit = self.config.max_predictions.saturating_mul(3).clamp(6, 24);
+        let predictions = self
+            .predictor
+            .predict_for_entity(&entity, None, limit);
+        let scope = self.completion_batch_scope(&entity);
+        self.completion.open_episode(&entity, None);
+        self.completion.set_batch_scope(scope);
+        for prediction in &predictions {
+            let rule = self.predictor.rules().get(prediction.rule_index);
+            let explanation = self.predictor.explain(prediction);
+            self.completion.add_prediction(prediction, rule, explanation);
+        }
+        if predictions.is_empty() {
+            self.completion.note(
+                "当前没有满足阈值的链接预测候选：可导入更多同类实体或降低推理阈值。",
+            );
+        }
+        self.completion.render_episode()
+    }
+
+    /// 确认一条补全：归纳本批规则、做有界闭包，并把确认事实加入本轮会话事实。
+    /// 会话事实不会写入知识图谱；规则默认也只在本批生效。
+    pub fn completion_confirm(&mut self, selector: &str) -> String {
+        let facts = self.predictor.triples().to_vec();
+        let outcome = match self.completion.confirm(selector, &facts) {
+            Ok(outcome) => outcome,
+            Err(error) => return error.to_string(),
+        };
+        let atom = Atom::rel(
+            &outcome.candidate.predicate,
+            &outcome.candidate.subject,
+            &outcome.candidate.object,
+        );
+        let adopted = self.adopt_atom(atom);
+        self.completion.note(if adopted {
+            "确认结果已加入本轮会话事实（未写入知识图谱）。"
+        } else {
+            "确认结果已在会话事实中。"
+        });
+        let mut output = format!(
+            "已确认补全：{}({}, {})。\n",
+            outcome.candidate.predicate,
+            outcome.candidate.subject,
+            outcome.candidate.object
+        );
+        if outcome.learned {
+            output.push_str(&format!(
+                "  已归纳候选规则（作用域：{}），本批新补全 {} 条{}。\n",
+                outcome
+                    .rule_scope
+                    .map(RuleScope::label)
+                    .unwrap_or("本批"),
+                outcome.new_candidates,
+                if outcome.closure_truncated {
+                    "（达到上限，未补全部分不等于不存在）"
+                } else {
+                    ""
+                }
+            ));
+        } else {
+            output.push_str("  该候选没有可归纳的规则，只记录这一条会话事实。\n");
+        }
+        output.push('\n');
+        output.push_str(&self.completion.render_episode());
+        output
+    }
+
+    /// 驳回一条补全：写入负例；同一规则反复被驳回会自动隔离。
+    pub fn completion_refute(&mut self, selector: &str) -> String {
+        let outcome = match self.completion.refute(selector) {
+            Ok(outcome) => outcome,
+            Err(error) => return error.to_string(),
+        };
+        let mut output = format!(
+            "已驳回补全：{}({}, {})。\n",
+            outcome.candidate.predicate,
+            outcome.candidate.subject,
+            outcome.candidate.object
+        );
+        if let Some(status) = outcome.rule_status {
+            output.push_str(&format!("  相关规则状态：{}。\n", status.label()));
+        }
+        if outcome.quarantined {
+            output.push_str(&format!(
+                "  规则已被隔离，并撤回同一规则的 {} 条待定候选。\n",
+                outcome.removed_pending
+            ));
+        }
+        output.push('\n');
+        output.push_str(&self.completion.render_episode());
+        output
+    }
+
+    /// 显式晋升补全规则的作用域；只有命名空间/全局规则进入全局归结。
+    pub fn completion_promote(&mut self, rule_id: &str, scope: &str) -> String {
+        let target = match scope.trim().to_lowercase().as_str() {
+            "example" | "本例" => RuleScope::Example,
+            "batch" | "本批" => RuleScope::Batch,
+            "namespace" | "命名空间" => RuleScope::Namespace,
+            "global" | "全局" => RuleScope::Global,
+            _ => {
+                return "作用域只支持：本例 / 本批 / 命名空间 / 全局".to_string();
+            }
+        };
+        let outcome = match self.completion.promote(rule_id, target) {
+            Ok(outcome) => outcome,
+            Err(error) => return error.to_string(),
+        };
+        if target.rank() >= RuleScope::Namespace.rank() {
+            if self.config.enable_resolution {
+                self.rebuild_resolver();
+            }
+            if self.config.enable_soft_logic {
+                self.rebuild_soft_logic();
+            }
+        }
+        let mut output = format!(
+            "补全规则 {} 作用域已从「{}」晋升为「{}」。\n",
+            rule_id,
+            outcome.from.label(),
+            outcome.to.label()
+        );
+        if let Some(warning) = outcome.warning {
+            output.push_str(&format!("  注意：{}。\n", warning));
+        }
+        if target.rank() >= RuleScope::Namespace.rank() {
+            output.push_str("  该规则已进入全局归结与软逻辑；回答仍会标注归纳来源。\n");
+        }
+        output
+    }
+
+    pub fn completion_report(&self) -> String {
+        self.completion.render_episode()
+    }
+
+    pub fn completion_rules_report(&self) -> String {
+        self.completion.render_rules()
     }
 
     /// 恢复通道 L2：联想提名（链接预测）——「(实体, 属性) 还可能是哪个值」。
@@ -14019,6 +14242,65 @@ types = [
         // 观测不改变回答路径：普通闭包/多跳问句仍走原实现。
         let answer = reasoner.answer("张三的师傅的师傅是谁");
         assert!(answer.is_some(), "原多跳回答不应被追踪改变");
+    }
+
+    #[test]
+    fn completion_episode_confirms_batch_and_promotes_to_global_rule() {
+        let mut config = test_config();
+        config.link_prediction_min_confidence = 0.1;
+        let mut facts = master_facts();
+        for (from, to) in [
+            ("孙八", "周九"),
+            ("周九", "吴十"),
+            ("郑十一", "钱十二"),
+            ("钱十二", "孙十三"),
+        ] {
+            facts.push(PrologFact::Relation {
+                from: from.to_string(),
+                rel_type: "师傅".to_string(),
+                to: to.to_string(),
+            });
+        }
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let opened = reasoner.completion_open("孙八");
+        assert!(opened.contains("补全回合"), "{}", opened);
+        assert!(opened.contains("孙八"), "{}", opened);
+        assert!(opened.contains("师祖"), "{}", opened);
+
+        let confirmed = reasoner.completion_confirm("孙八|师祖|吴十");
+        assert!(confirmed.contains("已确认补全"), "{}", confirmed);
+        assert!(confirmed.contains("本批"), "{}", confirmed);
+        assert!(
+            confirmed.contains("郑十一"),
+            "批次闭包应覆盖同一关系族的其他实体：{}",
+            confirmed
+        );
+        assert!(
+            reasoner
+                .session_facts()
+                .iter()
+                .any(|atom| atom.predicate.as_ref() == "师祖"
+                    && atom.terms.iter().any(|term| term.name() == "孙八")
+                    && atom.terms.iter().any(|term| term.name() == "吴十")),
+            "确认的补全应成为会话事实"
+        );
+        assert_eq!(
+            reasoner.completion_ledger().reasoning_clauses().len(),
+            0,
+            "本批规则不应自动进入全局归结"
+        );
+
+        let rule_id = reasoner.completion_ledger().rules()[0].id.clone();
+        let promoted = reasoner.completion_promote(&rule_id, "全局");
+        assert!(promoted.contains("全局"), "{}", promoted);
+        assert_eq!(
+            reasoner.completion_ledger().reasoning_clauses().len(),
+            1,
+            "显式晋升后规则应进入全局归结"
+        );
+        assert!(reasoner.completion_rules_report().contains("全局"));
     }
 
     #[test]
