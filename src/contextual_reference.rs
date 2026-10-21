@@ -2231,12 +2231,30 @@ mod tests {
         let mut source = MapSenseSource::default();
         source.add("张三丰", "人物", &["徒弟"], &[], 1);
         source.add("张三丰演员", "人物", &["演员"], &[], 1);
+        source.add_value("张三丰", "徒弟", "太极");
+        source.add_value("张三丰演员", "演员", "无间道");
         let outcome = resolutions("张三丰是谁", &linker, &source);
         let ask = outcome.ask.expect("同类型候选应由谓词区分");
         assert!(matches!(
             ask.question.feature,
             DiscriminatingFeature::Predicate { .. }
         ));
+        let labels: Vec<&str> = ask
+            .question
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect();
+        assert!(
+            labels.iter().any(|label| label.contains("徒弟=太极")),
+            "谓词取值应出现在澄清选项里：{:?}",
+            labels
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("人物")),
+            "无取值候选应回退到类型标签：{:?}",
+            labels
+        );
     }
 
     #[test]
