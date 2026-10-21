@@ -149,6 +149,8 @@ pub struct DialogueReply {
     pub text: String,
     pub plan: Vec<String>,
     pub kind: MoveKind,
+    /// 元解释轮附带的有界推导（普通回答为 None，不进入会话快照）。
+    pub derivation: Option<Derivation>,
 }
 
 /// 最近一次恢复动作的对外视图（不持久化；派生于台账与挂账）。
@@ -1238,6 +1240,7 @@ impl DialogueManager {
             text,
             plan: vec![plan.to_string()],
             kind: MoveKind::Other,
+            derivation: None,
         })
     }
 
@@ -1277,6 +1280,7 @@ impl DialogueManager {
             text: outcome.text,
             plan: outcome.plan,
             kind: outcome.kind,
+            derivation: None,
         })
     }
 
@@ -1332,6 +1336,7 @@ impl DialogueManager {
             text: outcome.text,
             plan: outcome.plan,
             kind: MoveKind::Other,
+            derivation: None,
         })
     }
 
@@ -1662,6 +1667,7 @@ impl DialogueManager {
                         text,
                         plan: plans,
                         kind: frame.kind.clone(),
+                        derivation: None,
                     });
                 }
                 recovery_attempt = Some(attempt);
@@ -1796,6 +1802,7 @@ impl DialogueManager {
                 .and_then(|name| index.warrant_for(name, frame.attribute.as_deref()))
         });
 
+        let mut explanation = None;
         let text = match chosen.as_str() {
             "recap" => self.recap_text(),
             "review_answer" => {
@@ -1804,18 +1811,20 @@ impl DialogueManager {
                 text
             }
             "explain_why" => {
-                if frame.question.as_deref() == Some("why_not") {
-                    self.explain_last_failure(knowledge)
+                let (text, derivation) = if frame.question.as_deref() == Some("why_not") {
+                    self.explain_last_failure_capture(knowledge)
                 } else if let Some(step) = frame
                     .question
                     .as_deref()
                     .and_then(|question| question.strip_prefix("step:"))
                     .and_then(|step| step.parse::<usize>().ok())
                 {
-                    self.explain_step(knowledge, step)
+                    self.explain_step_capture(knowledge, step)
                 } else {
-                    self.explain_last_with(knowledge)
-                }
+                    self.explain_last_inner(Some(knowledge))
+                };
+                explanation = derivation;
+                text
             }
             "why_no_evidence" => self
                 .failure_self_description()
@@ -1934,6 +1943,7 @@ impl DialogueManager {
             text: text.clone(),
             plan: plans,
             kind: frame.kind.clone(),
+            derivation: explanation,
         };
         self.record_turn_trace(&frame, &entity, Some(&reply), &provenance);
         Some(reply)
@@ -2067,6 +2077,7 @@ impl DialogueManager {
             text,
             plan,
             kind: MoveKind::Assert,
+            derivation: None,
         };
         let frame = UtteranceFrame {
             raw: input.trim().to_string(),
@@ -2429,20 +2440,27 @@ impl DialogueManager {
     /// 该入口不依赖知识源，保留给只读调用方；带知识源的路径见
     /// [`Self::explain_last_with`]，会优先重建一条可展开的推导。
     pub fn explain_last(&self) -> String {
-        self.explain_last_inner(None)
+        self.explain_last_inner(None).0
     }
 
     /// 带知识源的依据解释：先尝试从上一轮问句重建有界推导，
     /// 重建不到（或证明与回答不匹配）时诚实退回出处标签。
     pub fn explain_last_with(&self, knowledge: &dyn DialogueKnowledge) -> String {
-        self.explain_last_inner(Some(knowledge))
+        self.explain_last_inner(Some(knowledge)).0
     }
 
-    fn explain_last_inner(&self, knowledge: Option<&dyn DialogueKnowledge>) -> String {
+    fn explain_last_inner(
+        &self,
+        knowledge: Option<&dyn DialogueKnowledge>,
+    ) -> (String, Option<Derivation>) {
         let Some(turn) = self.last_answered_turn() else {
-            return self.failure_self_description().unwrap_or_else(|| {
-                "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。".to_string()
-            });
+            return (
+                self.failure_self_description().unwrap_or_else(|| {
+                    "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。"
+                        .to_string()
+                }),
+                None,
+            );
         };
         let provenance = if turn.provenance.is_empty() {
             vec!["知识图谱中的事实".to_string()]
@@ -2471,19 +2489,29 @@ impl DialogueManager {
                     }
                 }
                 text.push_str(&format!("\n出处标签：{}。", provenance.join("、")));
-                return text;
+                return (text, Some(derivation));
             }
         }
-        format!(
-            "刚才关于{}的回答，依据是：{}。这些结论都来自知识图谱与规则程序（逐条符号匹配、逻辑推导），没有任何神经网络参与。",
-            topic,
-            provenance.join("、")
+        (
+            format!(
+                "刚才关于{}的回答，依据是：{}。这些结论都来自知识图谱与规则程序（逐条符号匹配、逻辑推导），没有任何神经网络参与。",
+                topic,
+                provenance.join("、")
+            ),
+            None,
         )
     }
 
     /// 「为什么没有/查不到」：不改口，也不把失败说成不存在；
     /// 只展开最近一次未答上的知识问句所对应的失败前沿。
     pub fn explain_last_failure(&self, knowledge: &dyn DialogueKnowledge) -> String {
+        self.explain_last_failure_capture(knowledge).0
+    }
+
+    fn explain_last_failure_capture(
+        &self,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> (String, Option<Derivation>) {
         let Some(turn) = self.turns.iter().rev().find(|turn| {
             turn.answer_excerpt.is_none()
                 && matches!(
@@ -2491,7 +2519,10 @@ impl DialogueManager {
                     MoveKind::AskAttribute | MoveKind::AskIdentity | MoveKind::AskBinary
                 )
         }) else {
-            return "最近没有没答上的知识问句；上一轮是有结论的，可以问「怎么推出来的」。".to_string();
+            return (
+                "最近没有没答上的知识问句；上一轮是有结论的，可以问「怎么推出来的」。".to_string(),
+                None,
+            );
         };
         let topic = match (&turn.entity, &turn.attribute) {
             (Some(entity), Some(attribute)) => format!("「{}」的「{}」", entity, attribute),
@@ -2499,9 +2530,12 @@ impl DialogueManager {
             _ => format!("「{}」", excerpt(&turn.user, 16)),
         };
         let Some(question) = turn_question(turn) else {
-            return format!(
-                "刚才关于{}的问题没有结论；这个问句没有可形式化的实体与属性槽位，因此没有可展开的失败前沿。",
-                topic
+            return (
+                format!(
+                    "刚才关于{}的问题没有结论；这个问句没有可形式化的实体与属性槽位，因此没有可展开的失败前沿。",
+                    topic
+                ),
+                None,
             );
         };
         match knowledge.derivation(&question, None) {
@@ -2521,23 +2555,37 @@ impl DialogueManager {
                     }
                 }
                 text.push_str("\n失败前沿只说明当前事实或规则的缺口，不是「它不存在」的证明。");
-                text
+                (text, Some(derivation))
             }
-            None => format!(
-                "刚才关于{}没有作答；这个问句无法形式化为归结目标，因此没有可展开的失败前沿（属于检索或模板管线未命中）。",
-                topic
+            None => (
+                format!(
+                    "刚才关于{}没有作答；这个问句无法形式化为归结目标，因此没有可展开的失败前沿（属于检索或模板管线未命中）。",
+                    topic
+                ),
+                None,
             ),
         }
     }
 
     /// 单步追问：只展开上一轮推导的第 `step` 步（从 1 开始）。
     pub fn explain_step(&self, knowledge: &dyn DialogueKnowledge, step: usize) -> String {
+        self.explain_step_capture(knowledge, step).0
+    }
+
+    fn explain_step_capture(
+        &self,
+        knowledge: &dyn DialogueKnowledge,
+        step: usize,
+    ) -> (String, Option<Derivation>) {
         let Some(derivation) = self.last_derivation(knowledge) else {
-            return "上一轮没有可展开的推导，暂时不能按步骤解释。可以先问「怎么推出来的」。"
-                .to_string();
+            return (
+                "上一轮没有可展开的推导，暂时不能按步骤解释。可以先问「怎么推出来的」。"
+                    .to_string(),
+                None,
+            );
         };
         let total = derivation.steps.len();
-        match derivation.render_step(step) {
+        let text = match derivation.render_step(step) {
             Some(line) => {
                 let mut text = line;
                 if derivation.alternatives > 0 {
@@ -2557,7 +2605,8 @@ impl DialogueManager {
                 "上一轮推导只展开了 {} 步，没有第 {} 步；可以问「怎么推出来的」查看全貌。",
                 total, step
             ),
-        }
+        };
+        (text, Some(derivation))
     }
 
     /// 只读：为最近一条已答轮次重建推导（与 [`Self::explain_last_with`] 同源）。

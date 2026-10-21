@@ -725,36 +725,40 @@ impl Session {
             .or_else(|| self.manager.plan_reply(&input, &self.reasoner));
 
         control.enter(TurnPhase::Reason)?;
-        let (status, source, kind, plan, reply) = if let Some((text, plan, kind)) = plugin_answer {
-            (
-                "answered".to_string(),
-                "plugin".to_string(),
-                Some(kind),
-                plan,
-                text,
-            )
-        } else if let Some(reply) = dialogue {
-            let text = self
-                .plugin
-                .as_ref()
-                .map(|runtime| runtime.lock().style_wrap(&reply.text))
-                .unwrap_or(reply.text);
-            (
-                "answered".to_string(),
-                "dialogue".to_string(),
-                Some(reply.kind.label().to_string()),
-                reply.plan,
-                text,
-            )
-        } else if let Some(answer) = self.reasoner.answer(&input) {
-            (
-                "answered".to_string(),
-                "reasoner".to_string(),
-                None,
-                Vec::new(),
-                answer,
-            )
-        } else if let Some((text, plan)) = self
+        let (status, source, kind, plan, reply, derivation) =
+            if let Some((text, plan, kind)) = plugin_answer {
+                (
+                    "answered".to_string(),
+                    "plugin".to_string(),
+                    Some(kind),
+                    plan,
+                    text,
+                    None,
+                )
+            } else if let Some(reply) = dialogue {
+                let text = self
+                    .plugin
+                    .as_ref()
+                    .map(|runtime| runtime.lock().style_wrap(&reply.text))
+                    .unwrap_or(reply.text);
+                (
+                    "answered".to_string(),
+                    "dialogue".to_string(),
+                    Some(reply.kind.label().to_string()),
+                    reply.plan,
+                    text,
+                    reply.derivation,
+                )
+            } else if let Some(answer) = self.reasoner.answer(&input) {
+                (
+                    "answered".to_string(),
+                    "reasoner".to_string(),
+                    None,
+                    Vec::new(),
+                    answer,
+                    None,
+                )
+            } else if let Some((text, plan)) = self
             .plugin
             .as_ref()
             .and_then(|runtime| runtime.lock().policy_reply(&input))
@@ -770,6 +774,7 @@ impl Session {
                 Some("policy".to_string()),
                 vec![plan],
                 text,
+                None,
             )
         } else {
             // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
@@ -780,6 +785,7 @@ impl Session {
                 None,
                 Vec::new(),
                 String::new(),
+                None,
             )
         };
         control.enter(TurnPhase::Generate)?;
@@ -839,12 +845,9 @@ impl Session {
             open_turn: self.open_turn_view(),
             resumed: false,
             resumable: self.open_turn_resumable(),
-            derivation: None,
+            derivation,
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
-        if response.kind.as_deref() == Some("meta_why") {
-            response.derivation = self.manager.last_derivation(&self.reasoner);
-        }
         control.enter(TurnPhase::Commit)?;
         Ok(response)
     }
