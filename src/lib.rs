@@ -1106,8 +1106,7 @@ impl OxigraphManager {
                 if let Some(obj) = item.as_object() {
                     // 处理每个对象
                     let context = Self::extract_jsonld_context(obj);
-                    self.process_jsonld_object(store, obj, &context, stats)
-                        .await?;
+                    self.process_jsonld_object(store, obj, &context, stats)?;
                 }
             }
         } else if let Some(obj) = jsonld.as_object() {
@@ -1118,60 +1117,119 @@ impl OxigraphManager {
                 if let Some(graph_array) = graph.as_array() {
                     for item in graph_array {
                         if let Some(inner) = item.as_object() {
-                            self.process_jsonld_object(store, inner, &context, stats)
-                                .await?;
+                            self.process_jsonld_object(store, inner, &context, stats)?;
                         }
                     }
                 } else if let Some(inner) = graph.as_object() {
-                    self.process_jsonld_object(store, inner, &context, stats)
-                        .await?;
+                    self.process_jsonld_object(store, inner, &context, stats)?;
                 }
             } else {
                 // 单个对象
-                self.process_jsonld_object(store, obj, &context, stats)
-                    .await?;
+                self.process_jsonld_object(store, obj, &context, stats)?;
             }
         }
         Ok(())
     }
 
-    /// 提取顶层 @context 中的字符串映射（term -> IRI），供类型与属性名展开使用
+    /// 提取 @context 中的映射（term -> IRI / @base / @vocab），供类型与属性名展开使用。
+    ///
+    /// 支持三种常见写法：
+    /// - 字符串映射：`"name": "http://example.org/kg/name"`
+    /// - 上下文数组：`"@context": [{...}, {...}]`（后者覆盖前者）
+    /// - 对象映射：`"ex": { "@id": "http://example.org/kg/" }`
     fn extract_jsonld_context(obj: &serde_json::Map<String, Value>) -> HashMap<String, String> {
         let mut context = HashMap::new();
-        if let Some(ctx) = obj.get("@context").and_then(|c| c.as_object()) {
+        let Some(ctx) = obj.get("@context") else {
+            return context;
+        };
+        let apply = |ctx: &serde_json::Map<String, Value>,
+                         context: &mut HashMap<String, String>| {
             for (term, value) in ctx {
                 if let Some(iri) = value.as_str() {
                     context.insert(term.clone(), iri.to_string());
+                } else if let Some(iri) = value
+                    .as_object()
+                    .and_then(|definition| definition.get("@id"))
+                    .and_then(Value::as_str)
+                {
+                    context.insert(term.clone(), iri.to_string());
+                }
+            }
+        };
+        if let Some(ctx) = ctx.as_object() {
+            apply(ctx, &mut context);
+        } else if let Some(items) = ctx.as_array() {
+            for item in items {
+                if let Some(ctx) = item.as_object() {
+                    apply(ctx, &mut context);
                 }
             }
         }
         context
     }
 
-    /// 按 @context 展开 JSON-LD 词项：已是 IRI 的保留，映射词项替换为对应 IRI，否则回退到 @vocab
+    /// 按 @context 展开 JSON-LD 词项：已是 IRI 的保留，映射词项替换为对应 IRI，否则回退到 @vocab。
+    ///
+    /// 支持前缀映射（`ex:name`）与「词项 → 紧凑 IRI → 绝对 IRI」的链式展开；
+    /// 设深度上限避免自引用上下文导致死循环。
     fn expand_jsonld_term(term: &str, context: &HashMap<String, String>) -> String {
-        if term.contains(':') {
-            return term.to_string();
+        let mut current = term.to_string();
+        for _ in 0..8 {
+            if let Some((prefix, suffix)) = current.split_once(':') {
+                if let Some(base) = context.get(prefix) {
+                    return format!("{}{}", base, suffix);
+                }
+                return current;
+            }
+            let Some(iri) = context.get(&current) else {
+                break;
+            };
+            if iri == &current {
+                break;
+            }
+            current = iri.clone();
         }
-        if let Some(iri) = context.get(term) {
-            return iri.clone();
+        if !current.contains(':') {
+            if let Some(vocab) = context.get("@vocab") {
+                return format!("{}{}", vocab, current);
+            }
         }
-        if let Some(vocab) = context.get("@vocab") {
-            return format!("{}{}", vocab, term);
-        }
-        term.to_string()
+        current
     }
 
-    async fn process_jsonld_object(
+    /// 展开节点 `@id`：裸标识符按 `@base` 解析为绝对 IRI（JSON-LD 文档相对 IRI 语义）。
+    fn expand_jsonld_id(id: &str, context: &HashMap<String, String>) -> String {
+        if id.contains(':') || context.contains_key(id) {
+            return Self::expand_jsonld_term(id, context);
+        }
+        if let Some(base) = context.get("@base") {
+            return format!("{}{}", base, id);
+        }
+        id.to_string()
+    }
+
+    fn process_jsonld_object(
         &self,
         store: &Store,
         obj: &serde_json::Map<String, Value>,
         context: &HashMap<String, String>,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // 节点级 @context 是作用域上下文：只影响本节点及其嵌套值。
+        let mut context = context.clone();
+        if obj.contains_key("@context") {
+            context.extend(Self::extract_jsonld_context(obj));
+        }
+        let context = &context;
+
         // 获取主语 (subject)
         let subject_uri = if let Some(id) = obj.get("@id") {
-            id.as_str().unwrap_or("").to_string()
+            let id = id.as_str().unwrap_or("");
+            if id.is_empty() {
+                String::new()
+            } else {
+                Self::expand_jsonld_id(id, context)
+            }
         } else {
             crate::identity::entity_uri(BASE_NS, &Uuid::new_v4().to_string())
         };
@@ -1223,10 +1281,10 @@ impl OxigraphManager {
 
             if let Some(value_array) = value.as_array() {
                 for val in value_array {
-                    self.process_property_value(store, &subject, &predicate, val, stats)?;
+                    self.process_property_value(store, &subject, &predicate, val, context, stats)?;
                 }
             } else {
-                self.process_property_value(store, &subject, &predicate, value, stats)?;
+                self.process_property_value(store, &subject, &predicate, value, context, stats)?;
             }
         }
 
@@ -1239,6 +1297,7 @@ impl OxigraphManager {
         subject: &NamedNode,
         predicate: &NamedNode,
         value: &Value,
+        context: &HashMap<String, String>,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match value {
@@ -1273,7 +1332,8 @@ impl OxigraphManager {
                 // 处理嵌套对象
                 if let Some(id) = obj.get("@id") {
                     if let Some(uri) = id.as_str() {
-                        let object = NamedNode::new(uri)?;
+                        let uri = Self::expand_jsonld_id(uri, context);
+                        let object = NamedNode::new(&uri)?;
                         store.insert(&Quad::new(
                             subject.clone(),
                             predicate.clone(),
@@ -1282,6 +1342,14 @@ impl OxigraphManager {
                         ))?;
                         // 对象属性指向另一实体（命名节点）时计一条关系
                         stats.relations += 1;
+                        // 嵌套对象除 @id 外还带类型/属性时，它本身也是一个节点
+                        // （JSON-LD 展开语义），继续落库而不是丢掉这些描述。
+                        if obj
+                            .keys()
+                            .any(|key| key != "@id" && key != "@context")
+                        {
+                            self.process_jsonld_object(store, obj, context, stats)?;
+                        }
                     }
                 } else if let Some(val) = obj.get("@value") {
                     // 字符串值取其内容本身，其他类型使用 JSON 表示
@@ -1293,7 +1361,10 @@ impl OxigraphManager {
                     // 处理带数据类型的值
                     let literal = if let Some(datatype) = obj.get("@type") {
                         if let Some(datatype_uri) = datatype.as_str() {
-                            let dt = NamedNode::new(datatype_uri)?;
+                            let dt = NamedNode::new(Self::expand_jsonld_term(
+                                datatype_uri,
+                                context,
+                            ))?;
                             Literal::new_typed_literal(&value_text, dt)
                         } else {
                             Literal::new_simple_literal(&value_text)
@@ -5015,6 +5086,87 @@ mod cache_tests {
         assert_eq!(replay.entities, 2);
         assert_eq!(replay.relations, 1);
         assert_eq!(replay.triples, 0, "重复导入不新增三元组");
+    }
+
+    /// JSON-LD：前缀/对象上下文、@base 相对 @id，以及带属性的嵌套节点都要落库。
+    #[tokio::test]
+    async fn import_jsonld_expands_context_and_nested_nodes() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "ex": "http://example.org/kg/",
+                "Person": { "@id": "ex:Person" },
+                "@base": "http://example.org/kg/entity/",
+                "name": "ex:name",
+                "friend": { "@id": "ex:friend", "@type": "@id" }
+            },
+            "@graph": [
+                {
+                    "@id": "张三",
+                    "@type": "Person",
+                    "name": "张三",
+                    "friend": {
+                        "@id": "李四",
+                        "@type": "Person",
+                        "name": "李四"
+                    }
+                }
+            ]
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 2, "嵌套命名节点也应计为实体");
+        assert_eq!(stats.relations, 1);
+        assert_eq!(stats.triples, 5, "类型 2 + 名字 2 + 好友关系 1");
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?friendName WHERE {
+                    <http://example.org/kg/entity/张三> kg:friend ?friend .
+                    ?friend kg:name ?friendName
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1, "{:?}", result.data);
+        assert_eq!(
+            result.data[0].get("friendName"),
+            Some(&Value::String("李四".to_string()))
+        );
+    }
+
+    /// 节点级 @context 只作用于该节点：嵌套节点可用不同词项映射。
+    #[tokio::test]
+    async fn import_jsonld_respects_scoped_context() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "ex": "http://example.org/kg/",
+                "name": "ex:name"
+            },
+            "@id": "http://example.org/kg/entity/甲",
+            "ex:parent": {
+                "@context": { "name": "http://example.org/kg/childName" },
+                "@id": "http://example.org/kg/entity/乙",
+                "name": "乙"
+            }
+        }"#;
+
+        manager.import_jsonld(jsonld).await.unwrap();
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?childName WHERE {
+                    <http://example.org/kg/entity/乙> kg:childName ?childName
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.data[0].get("childName"),
+            Some(&Value::String("乙".to_string()))
+        );
     }
 
     /// 任意 SPARQL SELECT：变量绑定转 JSON，带类型字面量映射为数字/布尔。
