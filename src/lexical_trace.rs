@@ -1037,6 +1037,15 @@ pub struct LexiconGapReport {
     pub unknown_tokens: u64,
     pub marker_violations: u64,
     pub plan_missing: u64,
+    /// 读法状态分布（ready / partial / unreadable）。
+    #[serde(default)]
+    pub reading_statuses: BTreeMap<String, u64>,
+    /// 残差类别分布（稳定闭集代码）。
+    #[serde(default)]
+    pub residual_kinds: BTreeMap<String, u64>,
+    /// 修复动作分布（稳定闭集代码）。
+    #[serde(default)]
+    pub repair_kinds: BTreeMap<String, u64>,
     pub entries: Vec<LexiconGapEntry>,
 }
 
@@ -1050,6 +1059,12 @@ impl LexiconGapReport {
             self.marker_violations,
             self.plan_missing
         );
+        output.push_str(&format!(
+            "读法状态：{}；残差：{}；修复：{}。\n",
+            render_counts(&self.reading_statuses),
+            render_counts(&self.residual_kinds),
+            render_counts(&self.repair_kinds)
+        ));
         if self.entries.is_empty() {
             output.push_str("没有发现词表缺口。\n");
             return output.trim_end().to_string();
@@ -1092,6 +1107,9 @@ where
     let mut unknown_tokens = 0u64;
     let mut marker_violations = 0u64;
     let mut plan_missing = 0u64;
+    let mut reading_statuses: BTreeMap<String, u64> = BTreeMap::new();
+    let mut residual_kinds: BTreeMap<String, u64> = BTreeMap::new();
+    let mut repair_kinds: BTreeMap<String, u64> = BTreeMap::new();
     let mut record = |kind: GapKind, text: &str, question_index: usize| {
         let key = (kind, text.to_string());
         let entry = entries.entry(key).or_insert_with(|| LexiconGapEntry {
@@ -1115,6 +1133,15 @@ where
             plan_missing += 1;
         }
         let trace = trace_question(question, config, plan.as_ref());
+        *reading_statuses
+            .entry(trace.reading.status().code().to_string())
+            .or_insert(0) += 1;
+        for kind in trace.reading.residual_kinds() {
+            *residual_kinds.entry(kind).or_insert(0) += 1;
+        }
+        for repair in trace.reading.repair_kinds() {
+            *repair_kinds.entry(repair).or_insert(0) += 1;
+        }
         for token in trace.unknown_tokens() {
             if token.text.chars().any(|ch| ch.is_alphanumeric()) {
                 unknown_tokens += 1;
@@ -1146,6 +1173,9 @@ where
         unknown_tokens,
         marker_violations,
         plan_missing,
+        reading_statuses,
+        residual_kinds,
+        repair_kinds,
         entries,
     }
 }
@@ -1283,5 +1313,8 @@ mod tests {
         let rendered = first.render_report();
         assert!(rendered.contains("词表缺口报告"));
         assert!(rendered.contains("标记边界"));
+        assert!(rendered.contains("读法状态"));
+        assert!(first.residual_kinds.contains_key("token_boundary"));
+        assert!(first.repair_kinds.contains_key("split_token"));
     }
 }
