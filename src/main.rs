@@ -3625,12 +3625,14 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：模式联想：<句子>，例如「模式联想：德国的首都在哪里」。");
             } else {
+                let context =
+                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 match suggest_case_for_text(
                     text,
                     &config,
                     &synonyms,
                     &pattern_episodes,
-                    dialogue_manager.focus_entity(),
+                    &context,
                 ) {
                     Some(suggestion) => {
                         println!("{}", pattern_ir::render_case_suggestion(text, &suggestion));
@@ -3663,12 +3665,14 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：确认联想：<句子>，例如「确认联想：德国的首都在哪里」。");
             } else {
+                let context =
+                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 match suggest_case_for_text(
                     text,
                     &config,
                     &synonyms,
                     &pattern_episodes,
-                    dialogue_manager.focus_entity(),
+                    &context,
                 ) {
                     Some(suggestion) => match pattern_library.accept_case(&suggestion) {
                         Ok(entry) => {
@@ -3782,20 +3786,8 @@ async fn run_interactive_mode(
             } else {
                 let tagged = preprocess(text, &config.nlp);
                 let normalized = normalize_words(tagged, &synonyms);
-                let focus = dialogue_manager.focus_entity().map(str::to_string);
-                let context = pattern_ir::PatternContext {
-                    focus_type: focus
-                        .as_deref()
-                        .and_then(|entity| symbolic_reasoner.context().focus_type(entity))
-                        .map(str::to_string),
-                    focus,
-                    last_move: dialogue_manager
-                        .turns()
-                        .last()
-                        .map(|turn| turn.kind.label().to_string()),
-                    pending_clarify: dialogue_manager.pending_reference().is_some(),
-                    turn: dialogue_manager.turn_count(),
-                };
+                let context =
+                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 let report = pattern_library.rank_with_context(&normalized, &context);
                 println!("{}", pattern_ir::render_match_report(text, &report));
             }
@@ -7357,23 +7349,8 @@ async fn run_interactive_mode(
                 };
                 let normalized_words = normalize_words(tagged_words, &synonyms);
                 // 路由上下文：让带守卫的模式只在相应对话状态下参与匹配。
-                let route_context = {
-                    let focus = dialogue_manager.focus_entity().map(str::to_string);
-                    let focus_type = focus
-                        .as_deref()
-                        .and_then(|entity| symbolic_reasoner.context().focus_type(entity))
-                        .map(str::to_string);
-                    pattern_ir::PatternContext {
-                        focus,
-                        focus_type,
-                        last_move: dialogue_manager
-                            .turns()
-                            .last()
-                            .map(|turn| turn.kind.label().to_string()),
-                        pending_clarify: dialogue_manager.pending_reference().is_some(),
-                        turn: dialogue_manager.turn_count(),
-                    }
-                };
+                let route_context =
+                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
 
                 // 使用NLU进行语义理解
                 if config.nlp.enable_nlu.unwrap_or(false) {
@@ -9085,17 +9062,38 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
         .find_map(|prefix| input.strip_prefix(prefix))
 }
 
+/// 当前对话状态快照：供模式守卫、经验检索与案例联想共用同一口径。
+fn dialogue_pattern_context(
+    dialogue_manager: &DialogueManager,
+    symbolic_reasoner: &SymbolicReasoner,
+) -> pattern_ir::PatternContext {
+    let focus = dialogue_manager.focus_entity().map(str::to_string);
+    pattern_ir::PatternContext {
+        focus_type: focus
+            .as_deref()
+            .and_then(|entity| symbolic_reasoner.context().focus_type(entity))
+            .map(str::to_string),
+        focus,
+        last_move: dialogue_manager
+            .turns()
+            .last()
+            .map(|turn| turn.kind.label().to_string()),
+        pending_clarify: dialogue_manager.pending_reference().is_some(),
+        turn: dialogue_manager.turn_count(),
+    }
+}
+
 /// 用相似成功经验为一句输入生成候选骨架（确认前不参与路由）。
 fn suggest_case_for_text(
     text: &str,
     config: &know_prolog::SystemConfig,
     synonyms: &std::collections::HashMap<String, String>,
     episodes: &pattern_ir::PatternEpisodeLog,
-    focus: Option<&str>,
+    context: &pattern_ir::PatternContext,
 ) -> Option<pattern_ir::CaseSuggestion> {
     let tagged = preprocess(text, &config.nlp);
     let normalized = normalize_words(tagged, synonyms);
-    episodes.suggest_case(&normalized, focus, 0.2)
+    episodes.suggest_case_with_context(&normalized, context, 0.2)
 }
 
 /// 统一模式库路由：返回（查询类型、实体、命中模式解释行）。
@@ -9111,16 +9109,14 @@ fn route_query_with_patterns(
     episodes: &mut pattern_ir::PatternEpisodeLog,
     context: &pattern_ir::PatternContext,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    let focus = context.focus.as_deref();
-    let turn = context.turn;
     let Some(matched) = library
         .match_route_with_context(words, context)
         .or_else(|| library.match_fallback_with_context(words, context))
     else {
-        episodes.record_unmatched(input, words, focus, turn);
+        episodes.record_unmatched_with_context(input, words, context);
         return None;
     };
-    episodes.record_match(input, words, &matched, focus, turn);
+    episodes.record_match_with_context(input, words, &matched, context);
     let guard = matched
         .entry
         .guard

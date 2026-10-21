@@ -649,6 +649,15 @@ pub struct PatternEpisode {
     /// 发生时的对话焦点（无焦点为 None）；检索时作为上下文守卫的弱条件。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
+    /// 焦点实体的类型（人物/地点/…），用于区分同一词面在不同类型下的经验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_type: Option<String>,
+    /// 上一轮的对话动作（`ask_attribute` / `ask_identity` …）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_move: Option<String>,
+    /// 当时是否存在待澄清请求（None = 旧账本未记录）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_clarify: Option<bool>,
     pub outcome: EpisodeOutcome,
     /// 同一经验被重复观察的次数（支持度）。
     #[serde(default = "one_u32")]
@@ -664,18 +673,76 @@ fn one_u32() -> u32 {
 }
 
 impl PatternEpisode {
-    /// 经验身份：输入 + 命中模式 + 焦点 + 结果。同一次理解反复发生只累计次数。
+    /// 经验身份：输入 + 命中模式 + 完整对话上下文 + 结果。
+    /// 同一问法在不同焦点/上轮动作下是不同经验，避免上下文被后一次覆盖。
     pub fn id(&self) -> String {
         fnv1a_hex(
             format!(
-                "{}\u{0}{}\u{0}{}\u{0}{}",
+                "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
                 self.input,
                 self.winner_id.as_deref().unwrap_or(""),
                 self.focus.as_deref().unwrap_or(""),
+                self.focus_type.as_deref().unwrap_or(""),
+                self.last_move.as_deref().unwrap_or(""),
+                self.pending_clarify
+                    .map(|pending| if pending { "1" } else { "0" })
+                    .unwrap_or(""),
                 self.outcome.label()
             )
             .as_bytes(),
         )
+    }
+
+    /// 人类可读的上下文说明（无上下文字段时为 None）。
+    pub fn context_note(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        match (&self.focus, &self.focus_type) {
+            (Some(focus), Some(sort)) => parts.push(format!("焦点 {}({})", focus, sort)),
+            (Some(focus), None) => parts.push(format!("焦点 {}", focus)),
+            (None, Some(sort)) => parts.push(format!("焦点类型 {}", sort)),
+            (None, None) => {}
+        }
+        if let Some(movement) = &self.last_move {
+            parts.push(format!("上轮 {}", movement));
+        }
+        if let Some(true) = self.pending_clarify {
+            parts.push("待澄清".to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("，"))
+        }
+    }
+
+    /// 上下文与当前对话状态的亲和度（只做弱加分，不压过词面结构）。
+    fn context_affinity(&self, context: &PatternContext) -> f64 {
+        let mut bonus = 0.0;
+        if let (Some(left), Some(right)) = (self.focus.as_deref(), context.focus.as_deref()) {
+            if left == right {
+                bonus += 0.2;
+            }
+        }
+        if let (Some(left), Some(right)) =
+            (self.focus_type.as_deref(), context.focus_type.as_deref())
+        {
+            if left == right {
+                bonus += 0.1;
+            }
+        }
+        if let (Some(left), Some(right)) =
+            (self.last_move.as_deref(), context.last_move.as_deref())
+        {
+            if left == right {
+                bonus += 0.1;
+            }
+        }
+        if let Some(pending) = self.pending_clarify {
+            if pending == context.pending_clarify {
+                bonus += 0.05;
+            }
+        }
+        bonus
     }
 
     pub fn short_id(&self) -> String {
@@ -787,6 +854,22 @@ impl PatternEpisodeLog {
         focus: Option<&str>,
         turn: usize,
     ) -> PatternEpisode {
+        let context = PatternContext {
+            focus: focus.map(str::to_string),
+            turn,
+            ..PatternContext::default()
+        };
+        self.record_match_with_context(input, tokens, matched, &context)
+    }
+
+    /// 记录一次带完整对话上下文的成功理解。
+    pub fn record_match_with_context(
+        &mut self,
+        input: &str,
+        tokens: &[crate::nlp::TaggedWord],
+        matched: &PatternMatch,
+        context: &PatternContext,
+    ) -> PatternEpisode {
         let bindings = matched
             .bindings
             .iter()
@@ -800,11 +883,14 @@ impl PatternEpisodeLog {
             query_type: Some(matched.entry.query_type.clone()),
             entities: matched.entities.clone(),
             bindings,
-            focus: focus.map(str::to_string),
+            focus: context.focus.clone(),
+            focus_type: context.focus_type.clone(),
+            last_move: context.last_move.clone(),
+            pending_clarify: Some(context.pending_clarify),
             outcome: EpisodeOutcome::Matched,
             count: 1,
-            first_turn: self.effective_turn(turn),
-            last_turn: self.effective_turn(turn),
+            first_turn: self.effective_turn(context.turn),
+            last_turn: self.effective_turn(context.turn),
         };
         self.upsert(episode.clone());
         self.entries
@@ -822,6 +908,21 @@ impl PatternEpisodeLog {
         focus: Option<&str>,
         turn: usize,
     ) -> PatternEpisode {
+        let context = PatternContext {
+            focus: focus.map(str::to_string),
+            turn,
+            ..PatternContext::default()
+        };
+        self.record_unmatched_with_context(input, tokens, &context)
+    }
+
+    /// 记录一次带完整对话上下文的未命中。
+    pub fn record_unmatched_with_context(
+        &mut self,
+        input: &str,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+    ) -> PatternEpisode {
         let episode = PatternEpisode {
             input: input.to_string(),
             tokens: token_pairs(tokens),
@@ -830,11 +931,14 @@ impl PatternEpisodeLog {
             query_type: None,
             entities: Vec::new(),
             bindings: Vec::new(),
-            focus: focus.map(str::to_string),
+            focus: context.focus.clone(),
+            focus_type: context.focus_type.clone(),
+            last_move: context.last_move.clone(),
+            pending_clarify: Some(context.pending_clarify),
             outcome: EpisodeOutcome::Unmatched,
             count: 1,
-            first_turn: self.effective_turn(turn),
-            last_turn: self.effective_turn(turn),
+            first_turn: self.effective_turn(context.turn),
+            last_turn: self.effective_turn(context.turn),
         };
         self.upsert(episode.clone());
         self.entries
@@ -918,6 +1022,23 @@ impl PatternEpisodeLog {
         focus: Option<&str>,
         limit: usize,
     ) -> Vec<EpisodeNeighbor> {
+        let context = PatternContext {
+            focus: focus.map(str::to_string),
+            ..PatternContext::default()
+        };
+        self.nearest_with_context(tokens, &context, limit)
+    }
+
+    /// 按共享词面 + 完整对话上下文 + 结果检索相似经验（确定性排序）。
+    ///
+    /// 上下文是**加性弱条件**：词面结构仍是主信号，焦点/类型/上轮动作/
+    /// 待澄清只在相近结构之间做消歧，避免同句式在错误对话状态下被召回。
+    pub fn nearest_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+        limit: usize,
+    ) -> Vec<EpisodeNeighbor> {
         if limit == 0 {
             return Vec::new();
         }
@@ -942,21 +1063,18 @@ impl PatternEpisodeLog {
                 });
             let union = current.union(&stored).count().max(1);
             let overlap = current.intersection(&stored).count() as f64 / union as f64;
-            let focus_bonus = match (episode.focus.as_deref(), focus) {
-                (Some(left), Some(right)) if left == right => 0.2,
-                _ => 0.0,
-            };
+            let context_bonus = episode.context_affinity(context);
             let outcome_bonus = if episode.outcome == EpisodeOutcome::Matched {
                 0.05
             } else {
                 0.0
             };
-            if shared.is_empty() && focus_bonus == 0.0 {
+            if shared.is_empty() && context_bonus == 0.0 {
                 continue;
             }
             neighbors.push(EpisodeNeighbor {
                 index,
-                score: (overlap + focus_bonus + outcome_bonus).min(1.0),
+                score: (overlap + context_bonus + outcome_bonus).min(1.0),
                 shared,
             });
         }
@@ -964,6 +1082,12 @@ impl PatternEpisodeLog {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    self.entries[b.index]
+                        .context_affinity(context)
+                        .partial_cmp(&self.entries[a.index].context_affinity(context))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .then_with(|| {
                     self.entries[b.index]
                         .count
@@ -983,7 +1107,24 @@ impl PatternEpisodeLog {
         focus: Option<&str>,
         min_score: f64,
     ) -> Option<CaseSuggestion> {
-        let neighbor = self.nearest(tokens, focus, 1).into_iter().next()?;
+        let context = PatternContext {
+            focus: focus.map(str::to_string),
+            ..PatternContext::default()
+        };
+        self.suggest_case_with_context(tokens, &context, min_score)
+    }
+
+    /// 带完整对话上下文的案例联想。
+    pub fn suggest_case_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+        min_score: f64,
+    ) -> Option<CaseSuggestion> {
+        let neighbor = self
+            .nearest_with_context(tokens, context, 1)
+            .into_iter()
+            .next()?;
         if neighbor.score < min_score {
             return None;
         }
@@ -2007,15 +2148,14 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
                 )
             })
             .unwrap_or_else(|| "（无可路由命中）".to_string());
-        let focus = episode
-            .focus
-            .as_deref()
-            .map(|focus| format!("，焦点 {}", focus))
+        let context = episode
+            .context_note()
+            .map(|note| format!("，{}", note))
             .unwrap_or_default();
         let _ = writeln!(
             out,
             "  {} ×{} 第{}轮{}：{}",
-            target, episode.count, episode.last_turn, focus, episode.input
+            target, episode.count, episode.last_turn, context, episode.input
         );
     }
     let mut recent: Vec<&PatternEpisode> = log.entries().iter().collect();
@@ -2026,12 +2166,17 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
     });
     let _ = writeln!(out, " 最近经验：");
     for episode in recent.iter().take(5) {
+        let context = episode
+            .context_note()
+            .map(|note| format!("，{}", note))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "  [{}] 第{}轮 {}：{}",
+            "  [{}] 第{}轮 {}{}：{}",
             episode.outcome.label(),
             episode.last_turn,
             episode.short_id(),
+            context,
             episode.input
         );
     }
@@ -2063,6 +2208,9 @@ pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> Strin
         episode.last_turn,
         episode.count
     );
+    if let Some(context) = episode.context_note() {
+        let _ = writeln!(out, " 发生上下文：{}", context);
+    }
     let _ = writeln!(out, " 候选模式：{}", suggestion.pattern.render());
     let _ = writeln!(
         out,
@@ -3514,6 +3662,70 @@ mod tests {
         assert_eq!(loaded.source, entry.source);
 
         assert!(active.forget(&entry.name).is_some(), "确认模式应可遗忘");
+    }
+
+    #[test]
+    fn episode_context_scopes_retrieval_and_suggestion() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "首都查询",
+            "config.toml#首都查询",
+            "capital_query",
+            15,
+            true,
+            vec![
+                Elem::pos("ns"),
+                Elem::word("的"),
+                Elem::word("首都"),
+                Elem::word("是"),
+                Elem::word("哪里"),
+            ],
+        ));
+        let stored = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = library.match_route(&stored).expect("应命中");
+        let mut log = PatternEpisodeLog::default();
+        let asked = PatternContext {
+            focus: Some("法国".to_string()),
+            focus_type: Some("地点".to_string()),
+            last_move: Some("ask_attribute".to_string()),
+            pending_clarify: false,
+            turn: 3,
+        };
+        let greet = PatternContext {
+            focus: Some("法国".to_string()),
+            focus_type: Some("地点".to_string()),
+            last_move: Some("greet".to_string()),
+            pending_clarify: false,
+            turn: 4,
+        };
+        log.record_match_with_context("法国的首都是哪里", &stored, &matched, &asked);
+        log.record_match_with_context("法国的首都是哪里", &stored, &matched, &greet);
+        assert_eq!(log.len(), 2, "不同上轮动作应保留为不同上下文经验");
+        assert_ne!(log.entries()[0].id(), log.entries()[1].id());
+
+        let neighbors = log.nearest_with_context(&stored, &asked, 2);
+        assert_eq!(neighbors.len(), 2);
+        assert_eq!(
+            log.entries()[neighbors[0].index].last_move.as_deref(),
+            Some("ask_attribute"),
+            "上下文匹配的经验应排前"
+        );
+        let suggestion = log
+            .suggest_case_with_context(&stored, &greet, 0.2)
+            .expect("相似成功经验应给出候选");
+        assert_eq!(suggestion.episode.last_move.as_deref(), Some("greet"));
+        let report = render_case_suggestion("法国的首都是哪里", &suggestion);
+        assert!(report.contains("发生上下文"), "{}", report);
+        assert!(report.contains("上轮 greet"), "{}", report);
+        let episode_report = render_episode_report(&log);
+        assert!(episode_report.contains("上轮 ask_attribute"), "{}", episode_report);
+        assert!(episode_report.contains("焦点 法国(地点)"), "{}", episode_report);
     }
 
     #[test]
