@@ -7190,10 +7190,13 @@ async fn run_interactive_mode(
                                     {
                                         println!("Prolog查询: {}", prolog_query);
 
-                                        let results = prolog_engine.query(&prolog_query);
-
-                                        let response = response_formatter
-                                            .format_prolog_results(&results, &query_type);
+                                        let response = run_prolog_query(
+                                            &mut prolog_engine,
+                                            &mut symbolic_reasoner,
+                                            &prolog_query,
+                                            &query_type,
+                                            &response_formatter,
+                                        );
                                         println!("{}", response);
                                         log_chronicle_reply(&mut chronicle, &response, &[], &[]);
                                     } else {
@@ -7226,10 +7229,13 @@ async fn run_interactive_mode(
                                     {
                                         println!("Prolog查询: {}", prolog_query);
 
-                                        let results = prolog_engine.query(&prolog_query);
-
-                                        let response = response_formatter
-                                            .format_prolog_results(&results, &query_type);
+                                        let response = run_prolog_query(
+                                            &mut prolog_engine,
+                                            &mut symbolic_reasoner,
+                                            &prolog_query,
+                                            &query_type,
+                                            &response_formatter,
+                                        );
                                         println!("{}", response);
                                         log_chronicle_reply(&mut chronicle, &response, &[], &[]);
                                     } else {
@@ -7263,10 +7269,13 @@ async fn run_interactive_mode(
                                 {
                                     println!("Prolog查询: {}", prolog_query);
 
-                                    let results = prolog_engine.query(&prolog_query);
-
-                                    let response = response_formatter
-                                        .format_prolog_results(&results, &query_type);
+                                    let response = run_prolog_query(
+                                        &mut prolog_engine,
+                                        &mut symbolic_reasoner,
+                                        &prolog_query,
+                                        &query_type,
+                                        &response_formatter,
+                                    );
                                     println!("{}", response);
                                     log_chronicle_reply(&mut chronicle, &response, &[], &[]);
                                 } else {
@@ -7874,8 +7883,10 @@ async fn try_symbolic_reasoning(
     query_entities: &[String],
 ) -> Option<String> {
     if !query_entities.is_empty() {
-        if let Ok(facts) = oxigraph_manager.get_relevant_facts(query_entities, 2).await {
-            symbolic_reasoner.observe_facts(&facts);
+        match oxigraph_manager.get_relevant_facts(query_entities, 2).await {
+            Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+            Err(error) => symbolic_reasoner
+                .note_engine_fault(format!("知识库读取相关事实失败：{}", error)),
         }
     }
     // 陈述句优先：形式化语义 + 语义蕴含判定（校验用户断言）；
@@ -7936,6 +7947,23 @@ async fn try_symbolic_reasoning(
     symbolic_reasoner
         .narrate(&entity)
         .or_else(|| symbolic_reasoner.generate_about(&entity))
+}
+
+/// 同一轮内区分「查无结果」与「引擎故障」：故障显式回执并写入会话故障状态。
+fn run_prolog_query(
+    prolog_engine: &mut PrologEngine,
+    symbolic_reasoner: &mut SymbolicReasoner,
+    prolog_query: &str,
+    query_type: &str,
+    response_formatter: &ResponseFormatter,
+) -> String {
+    match prolog_engine.query_checked(prolog_query) {
+        Ok(results) => response_formatter.format_prolog_results(&results, query_type),
+        Err(error) => {
+            symbolic_reasoner.note_engine_fault(error.clone());
+            format!("推理引擎故障（不是查无记录）：{}", error)
+        }
+    }
 }
 
 fn contains_question_marker(text: &str) -> bool {
@@ -8850,9 +8878,13 @@ async fn continue_original_query(
                     {
                         println!("Prolog查询: {}", prolog_query);
 
-                        let results = prolog_engine.query(&prolog_query);
-                        let response =
-                            response_formatter.format_prolog_results(&results, query_type);
+                        let response = run_prolog_query(
+                            prolog_engine,
+                            symbolic_reasoner,
+                            &prolog_query,
+                            query_type,
+                            response_formatter,
+                        );
                         println!("{}", response);
                     } else {
                         println!("无法生成有效的Prolog查询");
@@ -8894,9 +8926,13 @@ async fn continue_original_query(
                     {
                         println!("Prolog查询: {}", prolog_query);
 
-                        let results = prolog_engine.query(&prolog_query);
-                        let response =
-                            response_formatter.format_prolog_results(&results, query_type);
+                        let response = run_prolog_query(
+                            prolog_engine,
+                            symbolic_reasoner,
+                            &prolog_query,
+                            query_type,
+                            response_formatter,
+                        );
                         println!("{}", response);
                     } else {
                         println!("无法生成有效的Prolog查询");
@@ -8939,8 +8975,13 @@ async fn continue_original_query(
                 {
                     println!("Prolog查询: {}", prolog_query);
 
-                    let results = prolog_engine.query(&prolog_query);
-                    let response = response_formatter.format_prolog_results(&results, query_type);
+                    let response = run_prolog_query(
+                        prolog_engine,
+                        symbolic_reasoner,
+                        &prolog_query,
+                        query_type,
+                        response_formatter,
+                    );
                     println!("{}", response);
                 } else {
                     println!("无法生成有效的Prolog查询");

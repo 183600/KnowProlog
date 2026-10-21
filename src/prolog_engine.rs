@@ -661,6 +661,34 @@ impl PrologEngine {
         self.query_outcome(query).into_solutions()
     }
 
+    /// 带故障回执的字符串查询：无解仍是 `Ok(空 Vec)`，引擎故障是 `Err`。
+    ///
+    /// 这是给「同一轮必须区分查无与引擎故障」的调用方准备的；[`Self::query`]
+    /// 保留为兼容视图（故障信息仍可在 [`Self::last_fault`] 取走）。
+    pub fn query_checked(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<HashMap<String, String>>, String> {
+        match self.query_outcome(query) {
+            QueryOutcome::Solutions(solutions) => Ok(solutions
+                .into_iter()
+                .map(|bindings| {
+                    bindings
+                        .iter()
+                        .map(|(name, term)| {
+                            (
+                                name.clone(),
+                                term.render_raw().unwrap_or_else(|| "null".to_string()),
+                            )
+                        })
+                        .collect()
+                })
+                .collect()),
+            QueryOutcome::NoSolution => Ok(Vec::new()),
+            QueryOutcome::EngineFault(message) => Err(message),
+        }
+    }
+
     /// 三态查询：有解 / 无解 / 引擎故障——`query` 与 `query_typed` 的公共真值层。
     ///
     /// 引擎崩溃（scryer 内部 panic）也被收进 `EngineFault`：崩溃后的实例
@@ -999,6 +1027,20 @@ mod tests {
     fn test_bound_from_value_keeps_raw_rendering() {
         assert_eq!(bound_from_value(&Value::Var), BoundTerm::Unbound);
         assert_eq!(BoundTerm::Unbound.render_raw(), None);
+    }
+
+    #[test]
+    fn query_checked_keeps_faults_out_of_empty_results() {
+        let mut engine = PrologEngine::new();
+        assert_eq!(
+            engine.query_checked("entity(不存在的人, person, _)"),
+            Ok(Vec::new()),
+            "无解必须是 Ok(空结果)"
+        );
+        let fault = engine
+            .query_checked("definitely_not_a_predicate_xyz(1, 2)")
+            .expect_err("引擎故障必须显式返回 Err");
+        assert!(fault.contains("definitely_not_a_predicate_xyz") || !fault.is_empty());
     }
 
     #[test]
