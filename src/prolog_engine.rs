@@ -53,11 +53,25 @@ pub struct PrologEngine {
     loaded_facts: Vec<PrologFact>,
     /// 已加载的时序事实（`temporal_edge/8`）
     loaded_temporal_facts: Vec<TemporalFact>,
+    /// 事实增量装载统计（全量重灌 vs 差量 assert/retract）。
+    fact_load_stats: FactLoadStats,
     /// 最近一次引擎层故障（consult / 查询错误 / 崩溃），由调用方取走上报。
     last_fault: Option<String>,
     /// 引擎是否已在崩溃后停止服务（scryer 0.9.x 的 consult 解析错误会 panic，
     /// 崩溃后的内部状态不可信：此后一律返回 EngineFault，绝不静默当作无解）。
     poisoned: bool,
+}
+
+/// 动态事实装载统计：区分「整段重灌」与「只动差量」。
+///
+/// `last_added`/`last_removed` 记录最近一次实际写入引擎的正负事实条数；
+/// 事实集未变化时两者都为 0。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactLoadStats {
+    pub full_loads: u64,
+    pub incremental_loads: u64,
+    pub last_added: usize,
+    pub last_removed: usize,
 }
 
 /// 从 panic payload 提取可读消息。
@@ -172,6 +186,7 @@ impl PrologEngine {
             machine,
             loaded_facts: Vec::new(),
             loaded_temporal_facts: Vec::new(),
+            fact_load_stats: FactLoadStats::default(),
             last_fault: None,
             poisoned: false,
         };
@@ -232,60 +247,238 @@ impl PrologEngine {
         }
     }
 
-    /// 与 [`Self::load_facts`] 相同，但把 consult 失败显式交给调用方。
-    pub fn load_facts_checked(&mut self, facts: Vec<PrologFact>) -> Result<(), String> {
-        if facts == self.loaded_facts {
-            return Ok(());
-        }
+    /// 最近一次事实装载统计（用于观测差量装载是否真的生效）。
+    pub fn fact_load_stats(&self) -> FactLoadStats {
+        self.fact_load_stats
+    }
 
+    /// 与 [`Self::load_facts`] 相同，但把 consult 失败显式交给调用方。
+    ///
+    /// 两次事实集之间只写差量：新事实 `consult`，被撤回的事实按谓词
+    /// `retractall`，不再「清空 + 全量重灌」。事实集未变化时零写入。
+    /// 实体事实以 `(名称, 类型)` 为撤回粒度（属性列表不参与 retract 合一），
+    /// 因此该键下未变化的事实会被重新断言；关系事实则可精确撤回。
+    pub fn load_facts_checked(&mut self, facts: Vec<PrologFact>) -> Result<(), String> {
         // 按规范序排序，使相同事实集在不同调用间可直接比较（与加载顺序无关）
         let mut facts = facts;
         facts.sort_by(Self::compare_facts);
 
         if facts == self.loaded_facts {
+            self.fact_load_stats.last_added = 0;
+            self.fact_load_stats.last_removed = 0;
             return Ok(());
         }
 
-        self.clear_dynamic_facts()?;
-        let mut fact_string = String::with_capacity(facts.len() * 64);
+        let previous = std::mem::take(&mut self.loaded_facts);
+        let previous_counts = Self::count_facts(&previous);
+        let target_counts = Self::count_facts(&facts);
 
-        for fact in &facts {
+        // 需要撤回的实体键与关系键（BTreeSet 保证写入顺序确定，便于测试/复现）
+        let mut reset_entity_keys: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let mut reset_relation_keys: std::collections::BTreeSet<(String, String, String)> =
+            std::collections::BTreeSet::new();
+        let mut removed_count = 0usize;
+        for (fact, before) in previous_counts.values() {
+            let after = target_counts
+                .get(&Self::fact_key(fact))
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            if *before <= after {
+                continue;
+            }
+            removed_count += before - after;
             match fact {
                 PrologFact::Entity {
-                    name,
-                    entity_type,
-                    properties,
+                    name, entity_type, ..
                 } => {
-                    let _ = write!(
-                        fact_string,
-                        "oxigraph_entity('{}', '{}', [",
-                        escape_atom(name),
-                        escape_atom(entity_type)
-                    );
-                    for (i, (k, v)) in properties.iter().enumerate() {
-                        if i > 0 {
-                            fact_string.push_str(", ");
-                        }
-                        // 属性为 '键'-'值' 复合项
-                        let _ = write!(fact_string, "'{}'-'{}'", escape_atom(k), escape_atom(v));
-                    }
-                    fact_string.push_str("]).\n");
+                    reset_entity_keys.insert((name.clone(), entity_type.clone()));
                 }
                 PrologFact::Relation { from, rel_type, to } => {
-                    let _ = write!(
-                        fact_string,
-                        "oxigraph_relation('{}', '{}', '{}').\n",
-                        escape_atom(from),
-                        escape_atom(rel_type),
-                        escape_atom(to)
-                    );
+                    reset_relation_keys.insert((from.clone(), rel_type.clone(), to.clone()));
                 }
             }
         }
 
-        self.consult_source(fact_string)?;
-        self.loaded_facts = facts;
-        Ok(())
+        let mut retract_goals = Vec::with_capacity(
+            reset_entity_keys.len() + reset_relation_keys.len(),
+        );
+        for (name, entity_type) in &reset_entity_keys {
+            retract_goals.push(format!(
+                "retractall(oxigraph_entity('{}', '{}', _))",
+                escape_atom(name),
+                escape_atom(entity_type)
+            ));
+        }
+        for (from, rel_type, to) in &reset_relation_keys {
+            retract_goals.push(format!(
+                "retractall(oxigraph_relation('{}', '{}', '{}'))",
+                escape_atom(from),
+                escape_atom(rel_type),
+                escape_atom(to)
+            ));
+        }
+
+        // 被撤回的实体/关系键在 retractall 后需要整体补回目标中该键的现存事实；
+        // 其余键只补「目标比原先多出来」的重复条数。
+        let mut added_count = 0usize;
+        let mut additions: Vec<&PrologFact> = Vec::new();
+        for (fact, after) in target_counts.values() {
+            let before = previous_counts
+                .get(&Self::fact_key(fact))
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            let reset = match fact {
+                PrologFact::Entity {
+                    name, entity_type, ..
+                } => reset_entity_keys.contains(&(name.clone(), entity_type.clone())),
+                PrologFact::Relation { from, rel_type, to } => {
+                    reset_relation_keys.contains(&(from.clone(), rel_type.clone(), to.clone()))
+                }
+            };
+            added_count += after.saturating_sub(before);
+            let to_write = if reset {
+                *after
+            } else {
+                after.saturating_sub(before)
+            };
+            additions.extend(std::iter::repeat(fact).take(to_write));
+        }
+
+        let result = (|| {
+            if !retract_goals.is_empty() {
+                self.run_goal_checked(&retract_goals.join(", "))?;
+            }
+            if !additions.is_empty() {
+                let mut fact_string = String::with_capacity(additions.len() * 64);
+                for fact in &additions {
+                    Self::write_fact_source(&mut fact_string, fact);
+                }
+                self.consult_source(fact_string)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if previous.is_empty() {
+                    self.fact_load_stats.full_loads += 1;
+                } else {
+                    self.fact_load_stats.incremental_loads += 1;
+                }
+                self.fact_load_stats.last_added = added_count;
+                self.fact_load_stats.last_removed = removed_count;
+                self.loaded_facts = facts;
+                Ok(())
+            }
+            Err(error) => {
+                // 引擎可能已部分撤回：清空已加载事实，迫使下一次同目标事实
+                // 走完整装载，绝不因「记录里看着已加载」而提前返回。
+                let _ = self.clear_dynamic_facts();
+                self.loaded_facts.clear();
+                self.fact_load_stats.last_added = 0;
+                self.fact_load_stats.last_removed = 0;
+                Err(error)
+            }
+        }
+    }
+
+    /// 事实的无碰撞规范键：属性按键排序，与 HashMap 迭代序无关。
+    fn fact_key(fact: &PrologFact) -> String {
+        fn push_part(buffer: &mut String, part: &str) {
+            let _ = write!(buffer, "{}:{}", part.len(), part);
+        }
+        let mut key = String::new();
+        match fact {
+            PrologFact::Entity {
+                name,
+                entity_type,
+                properties,
+            } => {
+                key.push('E');
+                push_part(&mut key, name);
+                push_part(&mut key, entity_type);
+                let mut entries: Vec<_> = properties.iter().collect();
+                entries.sort_unstable();
+                for (property, value) in entries {
+                    push_part(&mut key, property);
+                    push_part(&mut key, value);
+                }
+            }
+            PrologFact::Relation { from, rel_type, to } => {
+                key.push('R');
+                push_part(&mut key, from);
+                push_part(&mut key, rel_type);
+                push_part(&mut key, to);
+            }
+        }
+        key
+    }
+
+    fn count_facts(facts: &[PrologFact]) -> HashMap<String, (PrologFact, usize)> {
+        let mut counts: HashMap<String, (PrologFact, usize)> =
+            HashMap::with_capacity(facts.len());
+        for fact in facts {
+            let entry = counts
+                .entry(Self::fact_key(fact))
+                .or_insert_with(|| (fact.clone(), 0));
+            entry.1 += 1;
+        }
+        counts
+    }
+
+    fn write_fact_source(fact_string: &mut String, fact: &PrologFact) {
+        match fact {
+            PrologFact::Entity {
+                name,
+                entity_type,
+                properties,
+            } => {
+                let _ = write!(
+                    fact_string,
+                    "oxigraph_entity('{}', '{}', [",
+                    escape_atom(name),
+                    escape_atom(entity_type)
+                );
+                for (i, (k, v)) in properties.iter().enumerate() {
+                    if i > 0 {
+                        fact_string.push_str(", ");
+                    }
+                    // 属性为 '键'-'值' 复合项
+                    let _ = write!(fact_string, "'{}'-'{}'", escape_atom(k), escape_atom(v));
+                }
+                fact_string.push_str("]).\n");
+            }
+            PrologFact::Relation { from, rel_type, to } => {
+                let _ = write!(
+                    fact_string,
+                    "oxigraph_relation('{}', '{}', '{}').\n",
+                    escape_atom(from),
+                    escape_atom(rel_type),
+                    escape_atom(to)
+                );
+            }
+        }
+    }
+
+    /// 执行一个确定性目标；scryer 内部 panic 与查询路径同样被收进故障态。
+    fn run_goal_checked(&mut self, goal: &str) -> Result<(), String> {
+        if self.poisoned {
+            return Err("引擎已因先前的崩溃停止服务（需重建实例）".to_string());
+        }
+        let goal = format!("{}.", goal.trim_end_matches('.'));
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.machine.run_query(goal)
+        })) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(payload) => {
+                self.poisoned = true;
+                let message = format!("目标执行触发引擎崩溃：{}", panic_message(payload));
+                self.note_fault(message.clone());
+                Err(message)
+            }
+        }
     }
 
     /// 事实的规范比较顺序：先实体后关系，各自按字段字典序
@@ -433,12 +626,10 @@ impl PrologEngine {
 
     fn clear_dynamic_facts(&mut self) -> Result<(), String> {
         for goal in [
-            "retractall(oxigraph_entity(_, _, _)).",
-            "retractall(oxigraph_relation(_, _, _)).",
+            "retractall(oxigraph_entity(_, _, _))",
+            "retractall(oxigraph_relation(_, _, _))",
         ] {
-            self.machine
-                .run_query(goal.to_string())
-                .map_err(|error| error.to_string())?;
+            self.run_goal_checked(goal)?;
         }
         Ok(())
     }
@@ -709,7 +900,7 @@ fn parse_fraction(raw: &str) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrologFact {
     Entity {
         name: String,
@@ -894,6 +1085,104 @@ mod tests {
         let not_before =
             engine.query_outcome("temporal_before('东京', '成为首都', '日本', 18000101)");
         assert_eq!(not_before, QueryOutcome::NoSolution);
+    }
+
+    #[test]
+    fn incremental_reload_asserts_and_retracts_only_deltas() {
+        let mut engine = PrologEngine::new();
+        let entity_v1 = PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "person".to_string(),
+            properties: {
+                let mut props = HashMap::new();
+                props.insert("age".to_string(), "18".to_string());
+                props
+            },
+        };
+        let edge = PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "teacher_of".to_string(),
+            to: "李四".to_string(),
+        };
+        engine
+            .load_facts_checked(vec![entity_v1, edge.clone()])
+            .unwrap();
+        let stats = engine.fact_load_stats();
+        assert_eq!(stats.full_loads, 1);
+        assert_eq!(stats.incremental_loads, 0);
+
+        // 只改属性：未变化的关系必须仍在，属性必须被替换而不是并存。
+        let entity_v2 = PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "person".to_string(),
+            properties: {
+                let mut props = HashMap::new();
+                props.insert("age".to_string(), "19".to_string());
+                props
+            },
+        };
+        engine
+            .load_facts_checked(vec![entity_v2, edge.clone()])
+            .unwrap();
+        let stats = engine.fact_load_stats();
+        assert_eq!(stats.full_loads, 1, "差量装载不应退化成全量重灌");
+        assert_eq!(stats.incremental_loads, 1);
+        assert_eq!((stats.last_added, stats.last_removed), (1, 1));
+        let ages = engine.query("age_of('张三', Age)");
+        assert_eq!(ages.len(), 1, "{:?}", ages);
+        assert_eq!(ages[0].get("Age").map(String::as_str), Some("19"));
+        let edges = engine.query("oxigraph_relation(From, Type, To)");
+        assert_eq!(edges.len(), 1, "未变化的关系不应被误删：{:?}", edges);
+
+        // 相同事实集重复装载：零写入、零重复。
+        engine
+            .load_facts_checked(vec![
+                PrologFact::Entity {
+                    name: "张三".to_string(),
+                    entity_type: "person".to_string(),
+                    properties: {
+                        let mut props = HashMap::new();
+                        props.insert("age".to_string(), "19".to_string());
+                        props
+                    },
+                },
+                edge,
+            ])
+            .unwrap();
+        let stats = engine.fact_load_stats();
+        assert_eq!(stats.incremental_loads, 1);
+        assert_eq!((stats.last_added, stats.last_removed), (0, 0));
+
+        // 撤回关系：精确 retract，不残留。
+        engine.load_facts_checked(Vec::new()).unwrap();
+        let stats = engine.fact_load_stats();
+        assert_eq!(stats.incremental_loads, 2);
+        assert_eq!(stats.last_removed, 2);
+        let outcome = engine.query_outcome("oxigraph_relation(_, _, _)");
+        assert_eq!(outcome, QueryOutcome::NoSolution);
+    }
+
+    #[test]
+    fn incremental_reload_preserves_duplicate_relation_multiplicity() {
+        let mut engine = PrologEngine::new();
+        let edge = PrologFact::Relation {
+            from: "A".to_string(),
+            rel_type: "knows".to_string(),
+            to: "B".to_string(),
+        };
+        engine
+            .load_facts_checked(vec![edge.clone(), edge.clone()])
+            .unwrap();
+        let count = engine.query("findall(To, oxigraph_relation('A', knows, To), Toes), length(Toes, N)");
+        assert_eq!(count[0].get("N").map(String::as_str), Some("2"));
+
+        engine.load_facts_checked(vec![edge]).unwrap();
+        let count = engine.query("findall(To, oxigraph_relation('A', knows, To), Toes), length(Toes, N)");
+        assert_eq!(
+            count[0].get("N").map(String::as_str),
+            Some("1"),
+            "撤回重复事实后应只剩目标条数"
+        );
     }
 
     #[test]
