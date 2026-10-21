@@ -2810,6 +2810,18 @@ async fn stream_turn(
             }
         }
     };
+    // 回执可能先于进度事件被 select 选中：先把已排队的阶段事件全部补发，
+    // 保证客户端总能在正文之前看到 prepare/rewrite/... 的阶段回执。
+    while let Ok(phase) = progress.try_recv() {
+        let event = serde_json::json!({
+            "session_id": session_id,
+            "phase": phase.code(),
+            "phase_label": phase.label(),
+        });
+        stream
+            .write_all(format!("data: {}\n\n", event).as_bytes())
+            .await?;
+    }
     state.turns_total.fetch_add(1, Ordering::Relaxed);
     for chunk in sentence_chunks(&turn.reply) {
         let event = serde_json::json!({
