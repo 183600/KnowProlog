@@ -191,6 +191,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Evaluate session-level entity linking (candidates / clarification /
+    /// binding memory / chain consistency) on the built-in gold corpus with a
+    /// regression ratchet
+    EvalLink {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Evaluate failure recovery (silent-failure / receipt / evidence rates) on
     /// the built-in seed scenarios with a regression ratchet
     EvalRecovery {
@@ -655,6 +672,15 @@ async fn main() {
                 *allow_regression,
                 *json,
             );
+            return;
+        }
+        Some(Commands::EvalLink {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            run_eval_link(baseline.clone(), *update_baseline, *allow_regression, *json);
             return;
         }
         Some(Commands::EvalRecovery {
@@ -1428,6 +1454,7 @@ async fn main() {
         },
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::EvalNlu { .. }) => {}
+        Some(Commands::EvalLink { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
         Some(Commands::ReleaseCheck { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
@@ -1805,6 +1832,56 @@ fn run_eval_nlu(
         match DialogueEvalBaseline::load(&baseline_path) {
             Ok(old_baseline) => {
                 let verdict = compare_dialogue_baseline(&old_baseline, &report, 1e-6);
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `eval-link`：会话级实体链接金标评测 + 回归棘轮（不依赖知识存储）。
+fn run_eval_link(
+    baseline: Option<String>,
+    update_baseline: bool,
+    allow_regression: bool,
+    json: bool,
+) {
+    let report = know_prolog::link_eval::evaluate_seed();
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("链接评测序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline
+        .clone()
+        .unwrap_or_else(|| "link_eval_baseline.json".to_string());
+    if update_baseline {
+        let new_baseline = know_prolog::link_eval::LinkEvalBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => println!("链接基线已写入 {}", baseline_path),
+            Err(e) => {
+                eprintln!("基线写入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match know_prolog::link_eval::LinkEvalBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                let verdict =
+                    know_prolog::link_eval::compare_baseline(&old_baseline, &report, 1e-6);
                 print!("{}", verdict.render_text());
                 if !verdict.passed && !allow_regression {
                     std::process::exit(1);
