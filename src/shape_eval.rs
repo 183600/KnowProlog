@@ -35,6 +35,8 @@ pub struct ShapeEvalReport {
     pub required_slots_after: usize,
     pub conflicts: usize,
     pub conflicts_disclosed: usize,
+    pub ruling_cases: usize,
+    pub rulings_applied: usize,
     pub unknown_cases: usize,
     pub unknown_abstained: usize,
     pub resumed_original: bool,
@@ -78,6 +80,10 @@ impl ShapeEvalReport {
         ratio(self.conflicts_disclosed, self.conflicts)
     }
 
+    pub fn conflict_resolution_rate(&self) -> f64 {
+        ratio(self.rulings_applied, self.ruling_cases)
+    }
+
     pub fn abstain_rate(&self) -> f64 {
         ratio(self.unknown_abstained, self.unknown_cases)
     }
@@ -103,6 +109,7 @@ impl ShapeEvalReport {
             && self.grounded_rate() >= 1.0
             && self.required_coverage_after() >= 1.0
             && self.conflict_disclosure_rate() >= 1.0
+            && self.conflict_resolution_rate() >= 1.0
             && self.abstain_rate() >= 1.0
     }
 
@@ -125,13 +132,15 @@ impl ShapeEvalReport {
                 self.claim_precision()
             ),
             format!(
-                "生成层：陈述 {}/{} 有来源（{:.3}）；必备槽覆盖 {:.3}；冲突披露 {}/{}；未知克制 {}/{}",
+                "生成层：陈述 {}/{} 有来源（{:.3}）；必备槽覆盖 {:.3}；冲突披露 {}/{}；冲突裁定 {}/{}；未知克制 {}/{}",
                 self.grounded_claims,
                 self.answer_claims,
                 self.grounded_rate(),
                 self.required_coverage_after(),
                 self.conflicts_disclosed,
                 self.conflicts,
+                self.rulings_applied,
+                self.ruling_cases,
                 self.unknown_abstained,
                 self.unknown_cases
             ),
@@ -162,6 +171,8 @@ pub struct ShapeEvalBaseline {
     pub grounded_rate: f64,
     pub required_coverage_after: f64,
     pub conflict_disclosure_rate: f64,
+    #[serde(default = "perfect_rate")]
+    pub conflict_resolution_rate: f64,
     pub abstain_rate: f64,
     pub session_check_rate: f64,
 }
@@ -176,6 +187,7 @@ impl ShapeEvalBaseline {
             grounded_rate: report.grounded_rate(),
             required_coverage_after: report.required_coverage_after(),
             conflict_disclosure_rate: report.conflict_disclosure_rate(),
+            conflict_resolution_rate: report.conflict_resolution_rate(),
             abstain_rate: report.abstain_rate(),
             session_check_rate: report.session_check_rate(),
         }
@@ -297,6 +309,12 @@ pub fn compare_baseline(
         true,
     );
     push(
+        "conflict_resolution_rate",
+        baseline.conflict_resolution_rate,
+        current.conflict_resolution_rate(),
+        true,
+    );
+    push(
         "abstain_rate",
         baseline.abstain_rate,
         current.abstain_rate(),
@@ -331,6 +349,8 @@ struct EvalTally {
     required_slots_after: usize,
     conflicts: usize,
     conflicts_disclosed: usize,
+    ruling_cases: usize,
+    rulings_applied: usize,
     unknown_cases: usize,
     unknown_abstained: usize,
     resumed_original: bool,
@@ -376,6 +396,7 @@ pub fn evaluate_seed() -> ShapeEvalReport {
     run_completion(&mut tally);
     run_two_gaps(&mut tally);
     run_conflict(&mut tally);
+    run_conflict_ruling(&mut tally);
     run_type_issue(&mut tally);
     run_unknown(&mut tally);
     run_snapshot(&mut tally);
@@ -395,6 +416,8 @@ pub fn evaluate_seed() -> ShapeEvalReport {
             "after": tally.required_slots_after,
             "conflicts": tally.conflicts,
             "disclosed": tally.conflicts_disclosed,
+            "ruling_cases": tally.ruling_cases,
+            "rulings_applied": tally.rulings_applied,
             "unknown": tally.unknown_cases,
             "abstained": tally.unknown_abstained,
             "resumed": tally.resumed_original,
@@ -418,6 +441,8 @@ pub fn evaluate_seed() -> ShapeEvalReport {
         required_slots_after: tally.required_slots_after,
         conflicts: tally.conflicts,
         conflicts_disclosed: tally.conflicts_disclosed,
+        ruling_cases: tally.ruling_cases,
+        rulings_applied: tally.rulings_applied,
         unknown_cases: tally.unknown_cases,
         unknown_abstained: tally.unknown_abstained,
         resumed_original: tally.resumed_original,
@@ -595,6 +620,64 @@ fn run_conflict(tally: &mut EvalTally) {
         && text.contains("不替你选")
     {
         tally.conflicts_disclosed += 1;
+    }
+}
+
+fn run_conflict_ruling(tally: &mut EvalTally) {
+    let registry = registry();
+    let types = types();
+    let shapes = base_shapes(&registry, &types);
+    let facts = vec![
+        entity(
+            "刘德华",
+            "Person",
+            &[("name", "刘德华"), ("出生地", "香港"), ("职业", "演员")],
+        ),
+        relation("刘德华", "职业", "导演"),
+    ];
+    let mut acquisition = RelationAcquisition::new();
+    let mut dialogue = ShapeDialogue::new();
+    let first = dialogue.start_profile(
+        "刘德华",
+        "刘德华是谁？",
+        &facts,
+        &registry,
+        &types,
+        &shapes,
+        &mut acquisition,
+    );
+    if first.answer.status != AnswerStatus::Conflict {
+        return;
+    }
+    tally.ruling_cases += 1;
+    let Ok(turn) = dialogue.resolve_conflict(
+        "刘德华",
+        "职业",
+        "演员",
+        &facts,
+        &registry,
+        &types,
+        &shapes,
+        &mut acquisition,
+    ) else {
+        return;
+    };
+    let (raw, _) = ShapeAnswer::build(
+        "刘德华",
+        &facts,
+        &acquisition.overlay(),
+        &shapes,
+        &registry,
+        &types,
+    );
+    if turn.answer.status == AnswerStatus::Complete
+        && turn.answer.value_of("职业") == vec!["演员"]
+        && turn.answer.rulings.len() == 1
+        && turn.message.contains("本会话裁定")
+        && raw.status == AnswerStatus::Conflict
+        && acquisition.overlay().is_empty()
+    {
+        tally.rulings_applied += 1;
     }
 }
 
@@ -817,6 +900,10 @@ fn grounded_facts(
         .count()
 }
 
+fn perfect_rate() -> f64 {
+    1.0
+}
+
 fn ratio(numerator: usize, denominator: usize) -> f64 {
     if denominator == 0 {
         1.0
@@ -961,9 +1048,16 @@ mod tests {
             "{}",
             report.render_text()
         );
+        assert_eq!(
+            report.conflict_resolution_rate(),
+            1.0,
+            "{}",
+            report.render_text()
+        );
         assert_eq!(report.abstain_rate(), 1.0, "{}", report.render_text());
         assert_eq!(report.session_check_rate(), 1.0, "{}", report.render_text());
         assert_eq!(report.cross_session_leaks, 0);
+        assert!(report.ruling_cases >= 1, "{}", report.render_text());
         assert!(report.gap_questions >= 4, "{}", report.render_text());
         assert!(report.claims_confirmed >= 4, "{}", report.render_text());
         assert!(report.render_text().contains("判定：通过"));
