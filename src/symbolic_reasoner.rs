@@ -13551,6 +13551,13 @@ types = [
             .expect("关系从句问主语");
         assert!(relative_subject.contains("李四"), "{}", relative_subject);
 
+        let count = reasoner
+            .answer("张三教过多少个学生")
+            .expect("关系计数问句");
+        assert!(count.contains("共有 2 个"), "{}", count);
+        assert!(count.contains("李四"), "{}", count);
+        assert!(count.contains("王五"), "{}", count);
+
         let receipt = reasoner
             .query_rewrite_receipt("张三教过的学生是谁")
             .expect("关系从句回执");

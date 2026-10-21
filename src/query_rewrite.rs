@@ -41,6 +41,7 @@ pub enum RelationShape {
     ActiveYesNo,
     PassiveYesNo,
     BaYesNo,
+    CountRelation,
 }
 
 impl RelationShape {
@@ -55,6 +56,7 @@ impl RelationShape {
             RelationShape::ActiveYesNo => "主动句·是非问",
             RelationShape::PassiveYesNo => "被字句·是非问",
             RelationShape::BaYesNo => "把字句·是非问",
+            RelationShape::CountRelation => "关系·计数",
         }
     }
 }
@@ -268,6 +270,60 @@ fn split_wh_np_prefix_predicate<'a>(
     split_wh_np_prefix_candidates(text)
         .into_iter()
         .find_map(|(_, tail)| predicate(tail, lexicon).map(|_| tail))
+}
+
+/// 关系计数：「张三教过多少个学生」「张三教过几个」。
+/// 量词后的类型名词只用于说明问的是一类对象，计数仍按关系命中执行；
+/// 谓词必须是关系词表登记过的实义关系，避免把「有几个师傅」误当计数。
+fn parse_relation_count(
+    text: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<RelationRewrite> {
+    const MEASURES: [&str; 14] = [
+        "个", "位", "名", "本", "部", "家", "门", "只", "种", "条", "张", "所", "件", "次",
+    ];
+    let mut candidates: Vec<(usize, &str)> = Vec::new();
+    for marker in ["多少", "几"] {
+        let mut offset = 0;
+        while let Some(position) = text[offset..].find(marker) {
+            let position = offset + position;
+            candidates.push((position, marker));
+            offset = position + marker.len();
+        }
+    }
+    candidates.sort_by_key(|(position, _)| *position);
+    for (position, marker) in candidates {
+        let head = text[..position].trim();
+        let mut after = text[position + marker.len()..].trim();
+        for measure in MEASURES {
+            if let Some(rest) = after.strip_prefix(measure) {
+                after = rest.trim();
+                break;
+            }
+        }
+        if !after.is_empty() && !valid_type_noun(after) {
+            continue;
+        }
+        let Some((subject, surface, predicate, negated)) =
+            split_entity_predicate(head, lexicon)
+        else {
+            continue;
+        };
+        if negated || matches!(predicate.as_str(), "有" | "是") {
+            continue;
+        }
+        return Some(build(
+            QueryPlan::Count {
+                subject,
+                predicate: predicate.clone(),
+            },
+            RelationShape::CountRelation,
+            "relation-count",
+            surface,
+            predicate,
+        ));
+    }
+    None
 }
 
 /// 「张三教过的学生是谁」「教过张三的老师有哪些」：
@@ -620,6 +676,10 @@ pub fn rewrite(
     text = text.trim().to_string();
 
     if let Some(rewrite) = parse_relative_wh(&text, lexicon) {
+        return Some(rewrite);
+    }
+
+    if let Some(rewrite) = parse_relation_count(&text, lexicon) {
         return Some(rewrite);
     }
 
@@ -1189,6 +1249,25 @@ mod tests {
                 predicate: "教".to_string()
             }
         );
+    }
+
+    #[test]
+    fn relation_counts_use_the_count_plan() {
+        for question in ["张三教过多少个学生", "张三教过几个学生", "张三教过多少"] {
+            let rewrite = parse(question).expect(question);
+            assert_eq!(rewrite.rule, "relation-count");
+            assert_eq!(rewrite.predicate, "教");
+            assert_eq!(
+                rewrite.plan,
+                QueryPlan::Count {
+                    subject: "张三".to_string(),
+                    predicate: "教".to_string()
+                },
+                "{}",
+                question
+            );
+        }
+        assert!(parse("张三有几个师傅").is_none());
     }
 
     #[test]
