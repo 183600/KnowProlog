@@ -829,6 +829,9 @@ impl ShapeDialogue {
             registry,
             types,
         );
+        if self.focus.as_deref() != Some(entity.as_str()) || self.original_question.is_none() {
+            self.original_question = Some(format!("{}是谁？", entity));
+        }
         self.focus = Some(entity);
         let mut message = consultation.question.clone();
         if let Some(original) = &self.original_question {
@@ -1624,6 +1627,32 @@ mod tests {
             dialogue.attempts.get(&next.gap.id).copied(),
             Some(1),
             "每个缺口只问一次"
+        );
+    }
+
+    #[test]
+    fn global_agenda_question_carries_its_own_original_task() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = facts();
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let turn = dialogue
+            .ask_next(&facts, &registry, &types, &shapes, &mut acquisition)
+            .expect("全局议程应能打开一个缺口");
+        let consultation = turn.consultation.unwrap();
+        assert_eq!(dialogue.focus(), Some(consultation.gap.entity.as_str()));
+        assert_eq!(
+            dialogue.original_question(),
+            Some(format!("{}是谁？", consultation.gap.entity).as_str())
+        );
+        assert!(!acquisition.has_pending_goal() || dialogue.has_pending());
+        assert!(
+            dialogue
+                .ask_next(&facts, &registry, &types, &shapes, &mut acquisition)
+                .is_none(),
+            "已有待答问题时不应覆盖"
         );
     }
 
