@@ -17,6 +17,7 @@ pub mod advanced_nlu;
 pub mod artifact_audit;
 pub mod association_miner;
 pub mod bindings;
+pub mod binding_frames;
 pub mod cache;
 pub mod canonical;
 pub mod causal_reasoning;
@@ -325,6 +326,9 @@ pub struct SystemConfig {
     /// 分层追踪图：多轮决策的显式工作记忆（问据栈/指代轨迹/更正失效）
     #[serde(default)]
     pub trace_graph: trace_graph::TraceGraphConfig,
+    /// 配置编译的绑定帧：模式 -> 槽位 -> 目标 -> 措辞（默认关闭）。
+    #[serde(default)]
+    pub dialogue_frames: binding_frames::DialogueFramesConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]

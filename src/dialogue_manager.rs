@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::binding_frames::{FrameMemory, FrameProgram};
 use crate::bindings::BindingSet;
 use crate::epistemic::{EpistemicStatus, LedgerLoad};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
@@ -136,6 +137,9 @@ pub struct DialogueManagerSnapshot {
     /// 未完成轮次（取消 / 超时 / 故障）：空态省略，旧快照字节不变。
     #[serde(default, skip_serializing_if = "OpenTurnBook::is_empty")]
     pub open_turns: OpenTurnBook,
+    /// 绑定帧记忆：空态省略，未启用绑定帧的会话字节不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<FrameMemory>,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -546,6 +550,10 @@ pub struct DialogueManager {
     trace: TraceStore,
     /// 未完成轮次台账：让「上一问停在推理阶段」成为可继续的一等记忆。
     open_turns: OpenTurnBook,
+    /// 配置编译的绑定帧程序（None：完全不接管）。
+    frame_program: Option<Arc<FrameProgram>>,
+    /// 绑定帧的会话记忆（槽位环境 / 上一帧 / 待澄清帧）。
+    frame_memory: FrameMemory,
 }
 
 impl Default for DialogueManager {
@@ -573,6 +581,8 @@ impl DialogueManager {
             trace_mode: TraceMode::Off,
             trace: TraceStore::new(),
             open_turns: OpenTurnBook::new(),
+            frame_program: None,
+            frame_memory: FrameMemory::new(),
         }
     }
 
@@ -677,6 +687,24 @@ impl DialogueManager {
 
     pub fn quality_index(&self) -> Option<&QualityIndex> {
         self.quality.as_deref()
+    }
+
+    /// 注入配置编译的绑定帧程序；None 或空程序时完全走常规管线。
+    pub fn set_frame_program(&mut self, program: Option<Arc<FrameProgram>>) -> &mut Self {
+        self.frame_program = program;
+        self
+    }
+
+    pub fn frame_program(&self) -> Option<&FrameProgram> {
+        self.frame_program.as_deref()
+    }
+
+    pub fn frame_memory(&self) -> &FrameMemory {
+        &self.frame_memory
+    }
+
+    pub fn frame_report(&self) -> String {
+        self.frame_memory.report()
     }
 
     /// 当前索引对应的知识版本（未注入时为 None）。
@@ -1014,6 +1042,7 @@ impl DialogueManager {
                 Some(self.trace.clone())
             },
             open_turns: self.open_turns.clone(),
+            frames: (!self.frame_memory.is_empty()).then(|| self.frame_memory.clone()),
         }
     }
 
@@ -1026,6 +1055,7 @@ impl DialogueManager {
         self.board = snapshot.board.clone();
         self.trace = snapshot.trace.clone().unwrap_or_default();
         self.open_turns = snapshot.open_turns.clone();
+        self.frame_memory = snapshot.frames.clone().unwrap_or_default();
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -1072,6 +1102,9 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         if let Some(reply) = self.try_trace_correction(input, knowledge) {
+            return Some(reply);
+        }
+        if let Some(reply) = self.plan_frame_reply(input, knowledge) {
             return Some(reply);
         }
         if !self.recovery_mode.eq(&RecoveryMode::Off) {
@@ -1177,6 +1210,45 @@ impl DialogueManager {
         })
     }
 
+    /// 绑定帧回答：模式 -> 槽位绑定 -> 结构化目标 -> 模板措辞。
+    /// 任何一步不成立都返回 None，调用方继续常规管线（零状态变化）。
+    fn plan_frame_reply(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<DialogueReply> {
+        let program = self.frame_program.clone()?;
+        if program.is_empty() || !program.is_enabled() {
+            return None;
+        }
+        let turn = self.turns.len() as u64 + 1;
+        let outcome = program.plan(&mut self.frame_memory, input, knowledge, turn)?;
+        self.turns.push(DialogueTurn {
+            index: self.turns.len() + 1,
+            user: input.trim().to_string(),
+            kind: outcome.kind.clone(),
+            entity: outcome.entity.clone(),
+            attribute: outcome.attribute.clone(),
+            answer_excerpt: Some(excerpt(&outcome.text, 40)),
+            provenance: outcome.provenance.clone(),
+            plan: outcome.plan.clone(),
+            warrant: None,
+            kb_revision: Some(knowledge.revision()),
+        });
+        if let Some(entity) = outcome.entity.as_deref() {
+            self.push_focus(entity);
+        }
+        self.last_reply = outcome.plan.clone();
+        if self.externals.last().map(String::as_str) == Some(input.trim()) {
+            self.externals.pop();
+        }
+        Some(DialogueReply {
+            text: outcome.text,
+            plan: outcome.plan,
+            kind: outcome.kind,
+        })
+    }
+
     /// 知识问句的生成式回答：仅在实体已知时才接管（否则让位给常规管线）。
     pub fn plan_reply(
         &mut self,
@@ -1184,6 +1256,9 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         if let Some(reply) = self.try_trace_correction(input, knowledge) {
+            return Some(reply);
+        }
+        if let Some(reply) = self.plan_frame_reply(input, knowledge) {
             return Some(reply);
         }
         if let Some(reply) = self.plan_board_reply(input, knowledge) {
@@ -3601,5 +3676,65 @@ mod tests {
             manager.begin_turn();
         }
         assert!(manager.latest_open_turn().is_none());
+    }
+
+    #[test]
+    fn frame_program_survives_snapshot_and_inherits_entity() {
+        let source = r#"
+enabled = true
+
+[[frames]]
+id = "person.attribute"
+patterns = ["{entity}的{attribute}是什么", "{attribute}呢"]
+realize = { answer = "{entity}的{attribute}是{values}。" }
+
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+inherit = true
+candidates = "entities"
+
+[[frames.slots]]
+name = "attribute"
+sort = "attribute"
+required = true
+inherit = true
+candidates = "attributes"
+
+[[frames.slots]]
+name = "value"
+sort = "text"
+
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "attribute"
+output = "value"
+"#;
+        let config: crate::binding_frames::DialogueFramesConfig =
+            toml::from_str(source).expect("帧配置应可解析");
+        let program = Arc::new(FrameProgram::compile(&config).expect("帧配置应可编译"));
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高", "体重"])
+            .with_value("姚明", "身高", "226")
+            .with_value("姚明", "体重", "140");
+        let mut manager = DialogueManager::new();
+        manager.set_frame_program(Some(program.clone()));
+        let reply = manager
+            .plan_reply("姚明的身高是什么", &knowledge)
+            .expect("完整绑定应直接回答");
+        assert!(reply.text.contains("226"), "{}", reply.text);
+
+        let snapshot = manager.snapshot();
+        assert!(snapshot.frames.is_some());
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        restored.set_frame_program(Some(program));
+        let reply = restored
+            .plan_reply("体重呢", &knowledge)
+            .expect("恢复后应继承实体");
+        assert!(reply.text.contains("140"), "{}", reply.text);
+        assert!(restored.frame_report().contains("回答 2 次"));
     }
 }

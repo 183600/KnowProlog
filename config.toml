@@ -155,6 +155,105 @@ max_turns = 24                         # 会话内保留的轮迹上限
 max_nodes_per_turn = 64                # 单轮决策节点上限（超出折叠为摘要）
 max_events_per_turn = 16               # 单轮指代事件上限
 
+# 配置编译的绑定帧（可选）：把「模式 -> 槽位 -> 目标 -> 措辞」声明在配置里，
+# 启动时编译成只读程序；运行期只做通用绑定，不硬编码具体属性词。
+# 任一帧不匹配时零状态变化，自动回退常规管线。
+[dialogue_frames]
+enabled = true
+
+# 人物属性：完整问句、省略实体的追问、从上一轮继承实体。
+[[dialogue_frames.frames]]
+id = "person.attribute"
+priority = 20
+patterns = ["{entity}的{attribute}是什么", "{attribute}呢", "{attribute}是多少"]
+realize = { answer = "{entity}的{attribute}是{values}。" }
+
+[[dialogue_frames.frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+inherit = true
+candidates = "entities"
+ask = "你想问谁的「{slot}」？"
+
+[[dialogue_frames.frames.slots]]
+name = "attribute"
+sort = "attribute"
+required = true
+inherit = true
+candidates = "attributes"
+
+[[dialogue_frames.frames.slots]]
+name = "value"
+sort = "text"
+
+[dialogue_frames.frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "attribute"
+output = "value"
+
+# 数值比较：显式绑定左右实体与属性，输出胜者与两侧取值。
+[[dialogue_frames.frames]]
+id = "person.compare"
+priority = 30
+patterns = ["{left}和{right}的{attribute}谁更高"]
+realize = { answer = "{left}的{attribute}是{left_value}，{right}的{attribute}是{right_value}；{comparison}。" }
+
+[[dialogue_frames.frames.slots]]
+name = "left"
+sort = "entity"
+required = true
+candidates = "entities"
+
+[[dialogue_frames.frames.slots]]
+name = "right"
+sort = "entity"
+required = true
+candidates = "entities"
+
+[[dialogue_frames.frames.slots]]
+name = "attribute"
+sort = "attribute"
+required = true
+inherit = true
+candidates = "attributes"
+
+[[dialogue_frames.frames.slots]]
+name = "winner"
+sort = "text"
+
+[dialogue_frames.frames.goal]
+kind = "compare"
+left = "left"
+right = "right"
+attribute = "attribute"
+output = "winner"
+
+# 首都查询：常量属性 + 单槽绑定，演示 const: 目标写法。
+[[dialogue_frames.frames]]
+id = "geo.capital"
+priority = 10
+patterns = ["{entity}的首都是哪里", "{entity}的首都在哪"]
+realize = { answer = "{entity}的首都是{value}。" }
+
+[[dialogue_frames.frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+candidates = "entities"
+ask = "你想问哪个地方的首都？"
+
+[[dialogue_frames.frames.slots]]
+name = "value"
+sort = "text"
+
+[dialogue_frames.frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:capital"
+output = "value"
+
 [nlp]
 import_keywords = ["录入", "添加", "新增", "记录", "导入", "导入jsonld文件", "导入jsonld内容", "import jsonld", "import jsonld content"]
 enable_nlu = true  # 启用语义理解功能

@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::binding_frames::FrameProgram;
 use crate::trace_graph;
 use crate::SystemConfig;
 
@@ -207,6 +208,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_synonyms(&mut c, config);
     check_reasoning(&mut c, config);
     check_trace_graph(&mut c, config);
+    check_dialogue_frames(&mut c, config);
     c.issues
 }
 
@@ -1684,6 +1686,25 @@ fn check_trace_graph(c: &mut Collector, config: &SystemConfig) {
             "trace_graph.max_events_per_turn",
             "max_events_per_turn=0：单轮不记录任何指代事件",
         );
+    }
+}
+
+fn check_dialogue_frames(c: &mut Collector, config: &SystemConfig) {
+    let frames = &config.dialogue_frames;
+    if frames.frames.is_empty() {
+        if frames.enabled {
+            c.warn(
+                "empty_dialogue_frames",
+                "dialogue_frames.frames",
+                "enabled=true 但未声明任何帧：绑定帧层不会接管任何输入",
+            );
+        }
+        return;
+    }
+    if let Err(errors) = FrameProgram::compile(frames) {
+        for error in errors {
+            c.error(error.code, error.path, error.message);
+        }
     }
 }
 

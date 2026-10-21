@@ -19,6 +19,7 @@ use know_prolog::{
         compare_baseline as compare_dialogue_baseline, evaluate_seed_with, DialogueEvalBaseline,
         EvalKnowledge,
     },
+    binding_frames::FrameProgram,
     dialogue_frame::ClarificationOutcome,
     dialogue_fuzz::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
@@ -1572,6 +1573,7 @@ async fn main() {
             let prompt_mode = parse_prompt_mode(&prompt_mode);
             let recovery_mode = parse_recovery_mode(&recovery);
             warn_config_contract(&config);
+            let frame_program = compile_frame_program(&config);
             let facts_start = Instant::now();
             let facts = match serve_facts(&oxigraph_manager).await {
                 Ok(facts) => {
@@ -1634,6 +1636,7 @@ async fn main() {
             );
             // 读法观测：服务会话的失败轮同样留下有界回执，指标进共享性能台账。
             api_state.set_nlp_config(config.nlp.clone());
+            api_state.set_frame_program(frame_program.clone());
             // 单一本体：配置态本体注入暖基座，之后分叉的每个会话同源携带。
             let api_config_lessons = api_state.configure_ontology(&OntologyProgram::from_config(
                 &config.type_system,
@@ -2543,6 +2546,22 @@ fn run_plugins(settings: &PluginSettings, directory: Option<&str>, json: bool, e
 
 /// 启动时的静默断链提醒：只在契约存在 Error 时打一行 stderr，
 /// 说明去哪里看明细；不改变任何运行路径（观察，不接管）。
+fn compile_frame_program(config: &know_prolog::SystemConfig) -> Option<Arc<FrameProgram>> {
+    if !config.dialogue_frames.enabled {
+        return None;
+    }
+    match FrameProgram::compile(&config.dialogue_frames) {
+        Ok(program) => Some(Arc::new(program)),
+        Err(errors) => {
+            eprintln!("绑定帧配置无法编译（已停用，回退常规管线）：");
+            for error in errors {
+                eprintln!("  {}", error);
+            }
+            None
+        }
+    }
+}
+
 fn warn_config_contract(config: &know_prolog::SystemConfig) {
     let issues = config_contract::lint(config);
     let errors = config_contract::error_count(&issues);
@@ -2651,6 +2670,7 @@ async fn run_interactive_mode(
 ) {
     println!("{}", config.messages.startup);
     warn_config_contract(&config);
+    let frame_program = compile_frame_program(&config);
     if !recovery_mode.eq(&RecoveryMode::Off) {
         println!(
             "失败恢复模式：{}（失败会生成结构化回执）。",
@@ -2932,6 +2952,7 @@ async fn run_interactive_mode(
     // 本体化对话管理器：把每轮对话实例化为对话本体，用 Horn 规则策略推导回答方式
     let dialogue_enabled = config.reasoning.enable_dialogue_manager;
     let mut dialogue_manager = DialogueManager::new();
+    dialogue_manager.set_frame_program(frame_program);
     dialogue_manager.set_recovery_mode(recovery_mode);
     dialogue_manager.set_trace_mode(trace_mode);
     *dialogue_manager.trace_store_mut() = config.trace_graph.build_store();

@@ -65,6 +65,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::binding_frames::FrameProgram;
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::dialogue_manager::{
@@ -1153,6 +1154,7 @@ fn build_session(
     recovery_mode: RecoveryMode,
     quality: Option<Arc<QualityIndex>>,
     plugin: Option<Arc<parking_lot::Mutex<PluginRuntime>>>,
+    frame_program: Option<Arc<FrameProgram>>,
     turn_budget: TurnBudget,
     restore: Option<SessionRestore>,
 ) -> Session {
@@ -1161,6 +1163,7 @@ fn build_session(
     let mut manager = DialogueManager::new();
     manager.set_prompt_mode(prompt_mode);
     manager.set_recovery_mode(recovery_mode);
+    manager.set_frame_program(frame_program);
     // 质量担保是只读派生数据：多会话共享同一份索引，不写图谱、不进快照。
     manager.set_quality_index_shared(quality);
     let mut session = Session {
@@ -1227,6 +1230,8 @@ pub struct ApiState {
     max_body_bytes: usize,
     prompt_mode: PromptMode,
     recovery_mode: RecoveryMode,
+    /// 配置编译的绑定帧程序（多会话共享只读程序，记忆按会话隔离）。
+    frame_program: Option<Arc<FrameProgram>>,
     /// 每轮预算（复制给每个会话 actor；默认 30 秒 Enforce）。
     turn_budget: TurnBudget,
 }
@@ -1269,6 +1274,7 @@ impl ApiState {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             prompt_mode: PromptMode::On,
             recovery_mode: RecoveryMode::Observe,
+            frame_program: None,
             turn_budget: TurnBudget::enforced(crate::turn_runtime::DEFAULT_TURN_BUDGET),
         }
     }
@@ -1439,6 +1445,16 @@ impl ApiState {
         self.quality.as_deref()
     }
 
+    /// 注入配置编译的绑定帧程序（在 `Arc::new` 之前调用）。
+    /// 程序只读且跨会话共享，绑定记忆仍在各自 [`DialogueManager`] 内。
+    pub fn set_frame_program(&mut self, program: Option<Arc<FrameProgram>>) {
+        self.frame_program = program;
+    }
+
+    pub fn frame_program(&self) -> Option<&FrameProgram> {
+        self.frame_program.as_deref()
+    }
+
     /// 注入插件运行时（在 `Arc::new` 之前调用）。
     ///
     /// 运行时被所有会话共享：词表/本体/改写/配方/风格一致地作用于每个会话，
@@ -1476,6 +1492,7 @@ impl ApiState {
         let recovery_mode = self.recovery_mode;
         let quality = self.quality.clone();
         let plugin = self.plugin.clone();
+        let frame_program = self.frame_program.clone();
         let turn_budget = self.turn_budget;
         let engine = Arc::new(self.engine_stamp());
         let thread_name = format!("kp-session-{}", id);
@@ -1494,6 +1511,7 @@ impl ApiState {
                         recovery_mode,
                         quality,
                         plugin,
+                        frame_program,
                         turn_budget,
                         restore,
                     )
@@ -4857,6 +4875,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             &state.perf,
             state.prompt_mode,
             state.recovery_mode,
+            None,
             None,
             None,
             budget,
