@@ -4817,8 +4817,17 @@ mod cache_tests {
 
         let config: crate::SystemConfig =
             toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
-        let library = crate::pattern_ir::PatternLibrary::from_config(&config);
+        let mut library = crate::pattern_ir::PatternLibrary::from_config(&config);
         assert!(!library.is_empty());
+        library
+            .teach_with_guard(
+                "省略身高",
+                "身高 呢",
+                "height_query",
+                30,
+                Some(crate::pattern_ir::ContextGuard::focus()),
+            )
+            .expect("守卫模式应可教学");
         // 落图读回按 subject（= id）排序，与库内配置序无关 → 比较前统一按 id 排
         let by_id = |entries: &[crate::pattern_ir::PatternEntry]| {
             let mut v = entries.to_vec();
@@ -4838,6 +4847,14 @@ mod cache_tests {
             by_id(&loaded),
             by_id(library.entries()),
             "模式账本往返应逐条一致（与顺序无关）"
+        );
+        assert_eq!(
+            loaded
+                .iter()
+                .find(|entry| entry.name == "省略身高")
+                .and_then(|entry| entry.guard.as_ref()),
+            Some(&crate::pattern_ir::ContextGuard::focus()),
+            "上下文守卫必须随模式账本持久化"
         );
         assert_eq!(manager.revision(), revision, "模式账本写入不推进知识版本");
 
