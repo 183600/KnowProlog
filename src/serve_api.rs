@@ -2658,6 +2658,10 @@ async fn stream_turn(
         "kind": turn.kind,
         "focus": turn.focus,
         "entities": turn.entities,
+        "fault": turn.fault,
+        "open_turn": turn.open_turn,
+        "resumed": turn.resumed,
+        "resumable": turn.resumable,
     });
     stream
         .write_all(format!("data: {}\n\ndata: [DONE]\n\n", done).as_bytes())
@@ -3267,7 +3271,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             enable_link_prediction: false,
             ..ReasoningConfig::default()
         };
-        let mut state = ApiState::new(
+        let state = ApiState::new(
             facts,
             reasoning,
             HashMap::new(),
