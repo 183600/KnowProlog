@@ -165,7 +165,7 @@ enabled = true
 [[dialogue_frames.frames]]
 id = "person.attribute"
 priority = 20
-patterns = ["{entity}的{attribute}是什么", "{attribute}呢", "{attribute}是多少"]
+patterns = ["{entity}的{attribute}是什么", "{entity}的{attribute}是多少", "{attribute}呢", "{attribute}是多少"]
 realize = { answer = "{entity}的{attribute}是{values}。" }
 
 [[dialogue_frames.frames.slots]]
@@ -174,7 +174,7 @@ sort = "entity"
 required = true
 inherit = true
 candidates = "entities"
-ask = "你想问谁的「{slot}」？"
+ask = "请问你说的是谁？"
 
 [[dialogue_frames.frames.slots]]
 name = "attribute"
