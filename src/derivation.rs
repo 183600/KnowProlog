@@ -81,7 +81,7 @@ pub struct DerivationStep {
 }
 
 impl DerivationStep {
-    fn source_text(&self) -> String {
+    pub fn source_text(&self) -> String {
         match &self.source {
             DerivationSource::Fact => "事实".to_string(),
             DerivationSource::Rule { source } => {
@@ -347,6 +347,18 @@ impl Derivation {
             }
         }
         truncate_chars(output.trim_end().to_string(), MAX_EXPLANATION_CHARS)
+    }
+
+    /// 单步解释（`step` 从 1 开始）：只展开一个节点及其直接来源。
+    pub fn render_step(&self, step: usize) -> Option<String> {
+        let node = self.steps.get(step.checked_sub(1)?)?;
+        Some(format!(
+            "第 {} 步：{}（{}，证明树深度 {}）。",
+            step,
+            node.claim,
+            node.source_text(),
+            node.depth
+        ))
     }
 
     fn render_frontier(&self, output: &mut String) {

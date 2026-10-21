@@ -423,7 +423,8 @@ respond(recap) :- kind(T, meta_recap).
 respond(review_answer) :- kind(T, meta_review).
 respond(explain_why) :- kind(T, meta_why), has_evidence(T).
 respond(explain_why) :- kind(T, meta_why), why_not(T).
-respond(why_no_evidence) :- kind(T, meta_why), not has_evidence(T), not why_not(T).
+respond(explain_why) :- kind(T, meta_why), step_request(T).
+respond(why_no_evidence) :- kind(T, meta_why), not has_evidence(T), not why_not(T), not step_request(T).
 # 对话控制：继续说 / 展开细节
 respond(elaborate) :- kind(T, elaborate), has_focus(T).
 respond(continue_topic) :- kind(T, continue), has_focus(T).
@@ -1353,6 +1354,11 @@ impl DialogueManager {
         {
             return UtteranceFrame::new(raw, MoveKind::MetaReview);
         }
+        if let Some(step) = parse_step_request(stripped) {
+            let mut frame = UtteranceFrame::new(raw, MoveKind::MetaWhy);
+            frame.question = Some(format!("step:{}", step));
+            return frame;
+        }
         if WHY_NOT_PATTERNS
             .iter()
             .any(|pattern| stripped.contains(pattern))
@@ -1739,6 +1745,13 @@ impl DialogueManager {
         if frame.question.as_deref() == Some("why_not") {
             abox.push(format!("why_not({})", turn_id));
         }
+        if frame
+            .question
+            .as_deref()
+            .is_some_and(|question| question.starts_with("step:"))
+        {
+            abox.push(format!("step_request({})", turn_id));
+        }
         if known {
             abox.push(format!("entity_known({})", turn_id));
         }
@@ -1793,6 +1806,13 @@ impl DialogueManager {
             "explain_why" => {
                 if frame.question.as_deref() == Some("why_not") {
                     self.explain_last_failure(knowledge)
+                } else if let Some(step) = frame
+                    .question
+                    .as_deref()
+                    .and_then(|question| question.strip_prefix("step:"))
+                    .and_then(|step| step.parse::<usize>().ok())
+                {
+                    self.explain_step(knowledge, step)
                 } else {
                     self.explain_last_with(knowledge)
                 }
@@ -2510,6 +2530,36 @@ impl DialogueManager {
         }
     }
 
+    /// 单步追问：只展开上一轮推导的第 `step` 步（从 1 开始）。
+    pub fn explain_step(&self, knowledge: &dyn DialogueKnowledge, step: usize) -> String {
+        let Some(derivation) = self.last_derivation(knowledge) else {
+            return "上一轮没有可展开的推导，暂时不能按步骤解释。可以先问「怎么推出来的」。"
+                .to_string();
+        };
+        let total = derivation.steps.len();
+        match derivation.render_step(step) {
+            Some(line) => {
+                let mut text = line;
+                if derivation.alternatives > 0 {
+                    text.push_str(&format!(
+                        "\n完整证明共 {} 步；另有 {} 条独立证明未展开。",
+                        total, derivation.alternatives
+                    ));
+                } else {
+                    text.push_str(&format!("\n完整证明共 {} 步。", total));
+                }
+                if derivation.truncated || derivation.omitted_steps > 0 {
+                    text.push_str("部分节点因预算未展开，步骤数可能少于真实证明。");
+                }
+                text
+            }
+            None => format!(
+                "上一轮推导只展开了 {} 步，没有第 {} 步；可以问「怎么推出来的」查看全貌。",
+                total, step
+            ),
+        }
+    }
+
     /// 只读：为最近一条已答轮次重建推导（与 [`Self::explain_last_with`] 同源）。
     /// 供 HTTP/CLI 在「为什么」轮次返回结构化证明，不写入会话状态。
     pub fn last_derivation(&self, knowledge: &dyn DialogueKnowledge) -> Option<Derivation> {
@@ -2895,7 +2945,12 @@ impl DialogueManager {
             "why_no_evidence" => Some(("why_no_evidence/plain", BindingSet::new())),
             "continue_no_focus" => Some(("continue_no_focus/plain", BindingSet::new())),
             "explain_why" => {
-                if frame.question.as_deref() == Some("why_not") {
+                if frame.question.as_deref() == Some("why_not")
+                    || frame
+                        .question
+                        .as_deref()
+                        .is_some_and(|question| question.starts_with("step:"))
+                {
                     return None;
                 }
                 let turn = self.last_answered_turn()?;
@@ -3029,6 +3084,51 @@ fn classify_provenance(answer: &str) -> Vec<String> {
         tags.push("知识图谱中的直接事实".to_string());
     }
     tags
+}
+
+/// 解析「第 N 步」追问（阿拉伯数字与 1–99 的中文数字）。
+fn parse_step_request(text: &str) -> Option<usize> {
+    let start = text.find('第')?;
+    let tail = &text[start + '第'.len_utf8()..];
+    let end = tail.find('步')?;
+    let raw = tail[..end].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(step) = raw.parse::<usize>() {
+        return (step > 0).then_some(step);
+    }
+    let digit = |ch: char| match ch {
+        '零' => Some(0),
+        '一' => Some(1),
+        '二' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    };
+    if let Some(pos) = raw.find('十') {
+        let tens = if pos == 0 {
+            1
+        } else {
+            raw[..pos].chars().next().and_then(digit)?
+        };
+        let ones = if pos + '十'.len_utf8() == raw.len() {
+            0
+        } else {
+            raw[pos + '十'.len_utf8()..].chars().next().and_then(digit)?
+        };
+        return Some(tens * 10 + ones).filter(|step| *step > 0);
+    }
+    let mut value = 0usize;
+    for ch in raw.chars() {
+        value = value * 10 + digit(ch)?;
+    }
+    (value > 0).then_some(value)
 }
 
 fn turn_question(turn: &DialogueTurn) -> Option<String> {
@@ -3451,6 +3551,44 @@ mod tests {
         assert!(why.text.contains("226 厘米"), "{}", why.text);
         assert!(why.text.contains("事实"), "{}", why.text);
         assert!(why.text.contains("出处标签"), "{}", why.text);
+    }
+
+    #[test]
+    fn test_step_followup_explains_one_proof_node() {
+        let derivation = Derivation::from_direct_facts(
+            "姚明的身高",
+            vec![
+                (
+                    "姚明".to_string(),
+                    "身高".to_string(),
+                    "226 厘米".to_string(),
+                ),
+                (
+                    "姚明".to_string(),
+                    "体重".to_string(),
+                    "140 公斤".to_string(),
+                ),
+            ],
+        );
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
+            .with_derivation("姚明的身高是什么", derivation);
+        let mut manager = DialogueManager::new();
+        manager
+            .plan_reply("姚明的身高是多少", &knowledge)
+            .expect("属性问句应被接管");
+        let step = manager
+            .plan_pure_dialogue("第二步是什么？", &knowledge)
+            .expect("步骤追问应被接管");
+        assert!(step.text.contains("第 2 步"), "{}", step.text);
+        assert!(step.text.contains("140 公斤"), "{}", step.text);
+        assert!(step.text.contains("完整证明共 2 步"), "{}", step.text);
+
+        let out_of_range = manager
+            .plan_pure_dialogue("第九步呢？", &knowledge)
+            .expect("越界步骤也应给出可行动作");
+        assert!(out_of_range.text.contains("没有第 9 步"), "{}", out_of_range.text);
     }
 
     #[test]
