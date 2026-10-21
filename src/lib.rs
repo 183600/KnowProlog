@@ -53,6 +53,7 @@ pub mod history_trust;
 pub mod holographic_memory;
 pub mod identity;
 pub mod identity_dialogue;
+pub mod identity_eval;
 pub mod import_journal;
 pub mod knowledge_fusion;
 pub mod law_book;

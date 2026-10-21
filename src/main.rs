@@ -35,6 +35,10 @@ use know_prolog::{
     grammar_extractor::GrammarExtractor,
     history_trust::TrustAssessment,
     holographic_memory::{HoloAnalogyHit, HoloHit},
+    identity_eval::{
+        compare_baseline as compare_identity_baseline, evaluate_seed as evaluate_identity,
+        IdentityEvalBaseline,
+    },
     import_journal::{ImportJournal, JournalLoad},
     knowledge_fusion::{Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel},
     law_book::LawBook,
@@ -195,6 +199,22 @@ enum Commands {
     /// binding memory / chain consistency) on the built-in gold corpus with a
     /// regression ratchet
     EvalLink {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate identity acts / cards / scopes / session ledgers on the built-in
+    /// gold corpus with a regression ratchet
+    EvalIdentity {
         /// Baseline JSON path; enables the regression ratchet
         #[arg(long)]
         baseline: Option<String>,
@@ -681,6 +701,15 @@ async fn main() {
             json,
         }) => {
             run_eval_link(baseline.clone(), *update_baseline, *allow_regression, *json);
+            return;
+        }
+        Some(Commands::EvalIdentity {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            run_eval_identity(baseline.clone(), *update_baseline, *allow_regression, *json);
             return;
         }
         Some(Commands::EvalRecovery {
@@ -1455,6 +1484,7 @@ async fn main() {
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::EvalNlu { .. }) => {}
         Some(Commands::EvalLink { .. }) => {}
+        Some(Commands::EvalIdentity { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
         Some(Commands::ReleaseCheck { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
@@ -1882,6 +1912,55 @@ fn run_eval_link(
             Ok(old_baseline) => {
                 let verdict =
                     know_prolog::link_eval::compare_baseline(&old_baseline, &report, 1e-6);
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `eval-identity`：身份作用域 / 身份卡 / 会话台账金标评测 + 回归棘轮。
+fn run_eval_identity(
+    baseline: Option<String>,
+    update_baseline: bool,
+    allow_regression: bool,
+    json: bool,
+) {
+    let report = evaluate_identity();
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("身份评测序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline
+        .clone()
+        .unwrap_or_else(|| "identity_eval_baseline.json".to_string());
+    if update_baseline {
+        let new_baseline = IdentityEvalBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => println!("身份基线已写入 {}", baseline_path),
+            Err(e) => {
+                eprintln!("基线写入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match IdentityEvalBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                let verdict = compare_identity_baseline(&old_baseline, &report, 1e-6);
                 print!("{}", verdict.render_text());
                 if !verdict.passed && !allow_regression {
                     std::process::exit(1);
