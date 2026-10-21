@@ -426,8 +426,20 @@ impl UserIdentityLedger {
 }
 
 const SELF_PREFIXES: [&str; 14] = [
-    "你好，", "你好,", "您好，", "您好,", "请记住，", "请记住,", "记住，", "记住,",
-    "不对，", "不对,", "不是，", "不是,", "更正：", "更正:",
+    "你好，",
+    "你好,",
+    "您好，",
+    "您好,",
+    "请记住，",
+    "请记住,",
+    "记住，",
+    "记住,",
+    "不对，",
+    "不对,",
+    "不是，",
+    "不是,",
+    "更正：",
+    "更正:",
 ];
 
 const SELF_MARKERS: [&str; 11] = [
@@ -490,7 +502,8 @@ const FORGET_MARKERS: [&str; 8] = [
 ];
 
 fn strip_sentence_end(text: &str) -> &str {
-    text.trim().trim_end_matches(['？', '?', '。', '！', '!', ' ', '～', '~'])
+    text.trim()
+        .trim_end_matches(['？', '?', '。', '！', '!', ' ', '～', '~'])
         .trim()
 }
 
@@ -541,9 +554,7 @@ fn extract_self_name(text: &str) -> Option<String> {
     if name.is_empty() || name.chars().count() > 24 {
         return None;
     }
-    if name.chars().any(|ch| ch.is_whitespace())
-        && name.split_whitespace().count() != 2
-    {
+    if name.chars().any(|ch| ch.is_whitespace()) && name.split_whitespace().count() != 2 {
         return None;
     }
     const REJECT: [&str; 10] = ["？", "?", "谁", "什么", "哪", "吗", "呢", "的", "是", "叫"];
@@ -637,7 +648,8 @@ pub fn system_card() -> IdentityCard {
             "系统宪法",
         ),
     ];
-    IdentityCard::new(IdentityScope::System, "KnowProlog", IdentityStatus::Known).with_claims(claims)
+    IdentityCard::new(IdentityScope::System, "KnowProlog", IdentityStatus::Known)
+        .with_claims(claims)
 }
 
 /// 用户身份卡：只读会话台账；未知 / 已遗忘时不给任何身份 claim。
@@ -656,7 +668,13 @@ pub fn user_card(ledger: &UserIdentityLedger) -> IdentityCard {
     } else {
         "用户明确自述，仅本会话".to_string()
     };
-    let claim = IdentityClaim::new("user:name", "会话内称呼", name, ClaimSource::UserStatement, evidence);
+    let claim = IdentityClaim::new(
+        "user:name",
+        "会话内称呼",
+        name,
+        ClaimSource::UserStatement,
+        evidence,
+    );
     IdentityCard::new(IdentityScope::User, subject, status).with_claims(vec![claim])
 }
 
@@ -667,15 +685,13 @@ pub fn entity_card(knowledge: &dyn DialogueKnowledge, entity: &str) -> IdentityC
         return IdentityCard::new(IdentityScope::Entity, entity, IdentityStatus::Unknown);
     }
 
-    let aliases = knowledge
-        .reference_view()
-        .map(|view| {
-            let registry = view.linker.identity_registry();
-            match registry.resolve(entity) {
-                crate::identity::Resolution::Ambiguous(ids) => Err(ids),
-                _ => Ok(registry.surfaces_of(entity)),
-            }
-        });
+    let aliases = knowledge.reference_view().map(|view| {
+        let registry = view.linker.identity_registry();
+        match registry.resolve(entity) {
+            crate::identity::Resolution::Ambiguous(ids) => Err(ids),
+            _ => Ok(registry.surfaces_of(entity)),
+        }
+    });
     let aliases = match aliases {
         Some(Err(candidates)) => {
             let mut card =
@@ -886,7 +902,11 @@ mod tests {
             entities: vec!["姚明".to_string()],
             types: vec![("姚明".to_string(), "人物".to_string())],
             attributes: vec![("姚明".to_string(), "身高".to_string(), "226".to_string())],
-            relations: vec![("姚明".to_string(), "效力于".to_string(), "火箭队".to_string())],
+            relations: vec![(
+                "姚明".to_string(),
+                "效力于".to_string(),
+                "火箭队".to_string(),
+            )],
         };
         let card = entity_card(&knowledge, "姚明");
         assert_eq!(card.status, IdentityStatus::Known);

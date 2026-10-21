@@ -327,7 +327,10 @@ impl IdentityEvalKnowledge {
     fn canonical(&self, surface: &str) -> Option<&str> {
         let surface = surface.trim();
         if self.entities.contains_key(surface) {
-            return self.entities.get_key_value(surface).map(|(name, _)| name.as_str());
+            return self
+                .entities
+                .get_key_value(surface)
+                .map(|(name, _)| name.as_str());
         }
         self.aliases
             .get(surface)
@@ -505,10 +508,7 @@ impl IdentityEvalReport {
             "身份识别评测：{} 个场景 / {} 轮，语料摘要 {}。\n",
             self.scenarios, self.turns, self.corpus_digest
         ));
-        out.push_str(&format!(
-            "act：作用域准确率 {:.4}\n",
-            self.act_accuracy
-        ));
+        out.push_str(&format!("act：作用域准确率 {:.4}\n", self.act_accuracy));
         for (gold, predicted) in &self.act_confusion {
             for (label, count) in predicted {
                 if gold == label || *count == 0 {
@@ -561,7 +561,10 @@ impl IdentityEvalReport {
             "identity.evidence_coverage".to_string(),
             self.evidence_coverage,
         );
-        metrics.insert("identity.missing_cards".to_string(), self.missing_cards as f64);
+        metrics.insert(
+            "identity.missing_cards".to_string(),
+            self.missing_cards as f64,
+        );
         metrics.insert(
             "identity.session_retention_rate".to_string(),
             self.session_retention_rate,
@@ -730,10 +733,10 @@ fn observe_turn(
         crate::identity_dialogue::IdentityAct::AskEntity => {
             let _ = manager.plan_pure_dialogue(turn.input, knowledge);
             let _ = manager.plan_reply(turn.input, knowledge);
-            manager.last_identity_card().cloned().or_else(|| {
-                turn.subject
-                    .map(|subject| entity_card(knowledge, subject))
-            })
+            manager
+                .last_identity_card()
+                .cloned()
+                .or_else(|| turn.subject.map(|subject| entity_card(knowledge, subject)))
         }
         crate::identity_dialogue::IdentityAct::AskSystem
         | crate::identity_dialogue::IdentityAct::AskUser
@@ -999,12 +1002,14 @@ mod tests {
         assert_eq!(report.evidence_coverage, 1.0, "{}", report.render_text());
         assert_eq!(report.missing_cards, 0, "{}", report.render_text());
         assert_eq!(
-            report.session_retention_rate, 1.0,
+            report.session_retention_rate,
+            1.0,
             "{}",
             report.render_text()
         );
         assert_eq!(
-            report.cross_session_leak_rate, 0.0,
+            report.cross_session_leak_rate,
+            0.0,
             "{}",
             report.render_text()
         );
