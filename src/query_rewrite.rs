@@ -135,7 +135,7 @@ fn clean_question(question: &str) -> Option<String> {
 
 fn strip_yes_no(text: &str) -> (String, bool) {
     let trimmed = text.trim_end();
-    for suffix in ["吗", "嘛"] {
+    for suffix in ["吗", "嘛", "没有"] {
         if let Some(rest) = trimmed.strip_suffix(suffix) {
             return (rest.trim_end().to_string(), true);
         }
@@ -771,6 +771,20 @@ mod tests {
         assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
         assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
         assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn trailing_meiyou_is_yes_no() {
+        let rewrite = parse("张三认识李四没有").expect("句尾「没有」应识别为是非问");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::CheckRelation {
+                subject: "张三".to_string(),
+                predicate: "认识".to_string(),
+                object: "李四".to_string(),
+                negated: false
+            }
+        );
     }
 
     #[test]
