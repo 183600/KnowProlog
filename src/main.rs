@@ -3902,6 +3902,78 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 会话级冲突裁定：只收敛本会话画像，不写图谱。
+        if let Some(body) = strip_any_prefix(
+            input,
+            &[
+                "裁定：",
+                "裁定:",
+                "冲突裁定：",
+                "冲突裁定:",
+                "会话裁定：",
+                "会话裁定:",
+            ],
+        ) {
+            match know_prolog::shape_dialogue::parse_ruling(body) {
+                Some((entity, predicate, value)) => {
+                    match acquisition_context(&oxigraph_manager, &config).await {
+                        Ok((facts, registry, types, shapes)) => {
+                            match shape_dialogue.resolve_conflict(
+                                &entity,
+                                &predicate,
+                                &value,
+                                &facts,
+                                &registry,
+                                &types,
+                                &shapes,
+                                &mut acquisition,
+                            ) {
+                                Ok(turn) => println!("{}", turn.message),
+                                Err(message) => println!("{}", message),
+                            }
+                            persist_acquisition(&acquisition, &acquisition_path);
+                            persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
+                        }
+                        Err(error) => eprintln!("加载形状画像上下文失败：{}", error),
+                    }
+                }
+                None => println!(
+                    "用法：裁定：<实体> 的 <谓词> = <值>，例如「裁定：刘德华 的 职业 = 演员」。"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        // 口语化裁定：只在上一条画像留下待裁定冲突且没有待答缺口时接管。
+        if !shape_dialogue.has_pending()
+            && ShapeDialogue::looks_like_conflict_ruling(input)
+            && !is_command_like(input)
+        {
+            match acquisition_context(&oxigraph_manager, &config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    if let Some(result) = shape_dialogue.resolve_conflict_text(
+                        input,
+                        &facts,
+                        &registry,
+                        &types,
+                        &shapes,
+                        &mut acquisition,
+                    ) {
+                        match result {
+                            Ok(turn) => println!("{}", turn.message),
+                            Err(message) => println!("{}", message),
+                        }
+                        persist_acquisition(&acquisition, &acquisition_path);
+                        persist_shape_dialogue(&shape_dialogue, &shape_dialogue_path);
+                        println!();
+                        continue;
+                    }
+                }
+                Err(error) => eprintln!("加载形状画像上下文失败：{}", error),
+            }
+        }
+
         if matches!(input, "形状对话报告" | "形状对话状态" | "形状对话") {
             println!("{}", shape_dialogue.report_text());
             println!();
@@ -8196,6 +8268,7 @@ fn interactive_help() -> String {
         "  确认获取 / 采纳获取 / 模式扫描：…    确认、写入会话事实集、用诱导模式扫描新文本",
         "  形状报告 / 形状校验                  必备属性、基数、类型与定义域/值域校验",
         "  形状画像：<实体>                     形状完整画像：已知/缺失/冲突/未知 + 一次缺口追问",
+        "  裁定：<实体> 的 <谓词> = <值>         会话内收敛冲突（不写图谱）",
         "  下一个形状问题 / 形状议程             按严重度继续追问，或查看当前形状缺口议程",
         "  形状对话报告 / 形状对话重置           会话补全进度与记忆状态",
         "  对比报告 / 待定推测 / 性能报告        神经符号双通道、校准与运行统计",
@@ -8611,6 +8684,9 @@ fn is_command_like(input: &str) -> bool {
         "形状缺口议程",
         "下一个形状问题",
         "下一个缺口问题",
+        "裁定",
+        "冲突裁定",
+        "会话裁定",
         "质量报告",
         "质量护照",
         "质量总览",

@@ -587,6 +587,10 @@ impl ShapeAnswer {
                     "  冲突：「{}」有多个取值：{}；系统不替你选，需先裁定。",
                     conflict.surface, values
                 ));
+                lines.push(format!(
+                    "  可输入「裁定：{} 的 {} = <值>」在本会话内收敛该冲突（不改写知识图谱）。",
+                    self.entity, conflict.surface
+                ));
             }
         }
         lines.push(format!(
@@ -1076,6 +1080,54 @@ impl ShapeDialogue {
         )
     }
 
+    /// 识别口语化的冲突裁定，例如「以香港为准」「不是深圳，是香港」。
+    pub fn looks_like_conflict_ruling(input: &str) -> bool {
+        let text = input.trim();
+        (text.starts_with('以') && text.contains("为准"))
+            || (text.starts_with("不是") && text.contains('是'))
+            || text.starts_with("采用")
+    }
+
+    /// 把口语裁定落到当前焦点实体的某个冲突槽位；没有命中时返回 `None` 让出常规管线。
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_conflict_text(
+        &mut self,
+        input: &str,
+        facts: &[PrologFact],
+        registry: &PredicateRegistry,
+        types: &TypeSystem,
+        shapes: &ShapeSet,
+        acquisition: &mut RelationAcquisition,
+    ) -> Option<Result<SfdTurn, String>> {
+        let entity = self.focus.clone()?;
+        let value = conflict_ruling_value(input)?;
+        let (raw, _) = ShapeAnswer::build(
+            &entity,
+            facts,
+            &acquisition.overlay(),
+            shapes,
+            registry,
+            types,
+        );
+        let conflict = raw.conflicts.iter().find(|conflict| {
+            conflict
+                .values
+                .iter()
+                .any(|candidate| candidate.value == value)
+        })?;
+        let predicate = conflict.predicate.clone();
+        Some(self.resolve_conflict(
+            &entity,
+            &predicate,
+            &value,
+            facts,
+            registry,
+            types,
+            shapes,
+            acquisition,
+        ))
+    }
+
     /// 记录一条会话级冲突裁定，并重新生成画像。
     ///
     /// 只允许裁定当前确实存在冲突的取值；裁定不写图谱，也不进入 QRA 覆盖层。
@@ -1281,6 +1333,28 @@ impl ShapeDialogue {
         lines.push(format!("对话摘要：{}", self.digest()));
         lines.join("\n")
     }
+}
+
+/// 从「以香港为准」「不是深圳，是香港」「采用香港」中提取裁定值。
+fn conflict_ruling_value(input: &str) -> Option<String> {
+    let text = input
+        .trim()
+        .trim_end_matches(['。', '！', '!', '；', ';'])
+        .trim();
+    let value = if let Some(rest) = text.strip_prefix('以') {
+        rest.strip_suffix("为准")?
+    } else if let Some(rest) = text.strip_prefix("不是") {
+        let position = rest.find('是')?;
+        &rest[position + '是'.len_utf8()..]
+    } else if let Some(rest) = text.strip_prefix("采用") {
+        rest
+    } else {
+        return None;
+    };
+    let value = value
+        .trim()
+        .trim_matches(['「', '」', '“', '”', '"', '\'', '，', ',', '：', ':']);
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// 解析显式裁定命令的主体：
@@ -2170,6 +2244,54 @@ mod tests {
         );
         assert_eq!(resolved.status, AnswerStatus::Complete);
         assert_eq!(resolved.value_of("职业"), vec!["演员"]);
+    }
+
+    #[test]
+    fn colloquial_conflict_ruling_resolves_the_focused_slot() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![
+            entity(
+                "刘德华",
+                "Person",
+                &[("name", "刘德华"), ("职业", "演员"), ("出生地", "香港")],
+            ),
+            relation("刘德华", "职业", "导演"),
+        ];
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let first = dialogue.start_profile(
+            "刘德华",
+            "刘德华是谁？",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+            &mut acquisition,
+        );
+        assert_eq!(first.answer.status, AnswerStatus::Conflict);
+        assert!(first.message.contains("裁定："));
+        assert!(ShapeDialogue::looks_like_conflict_ruling("以演员为准"));
+        assert!(ShapeDialogue::looks_like_conflict_ruling(
+            "不是导演，是演员"
+        ));
+        assert!(!ShapeDialogue::looks_like_conflict_ruling("刘德华是谁？"));
+
+        let turn = dialogue
+            .resolve_conflict_text(
+                "不是导演，是演员",
+                &facts,
+                &registry,
+                &types,
+                &shapes,
+                &mut acquisition,
+            )
+            .expect("应命中当前职业冲突")
+            .expect("演员是列出的冲突值");
+        assert_eq!(turn.answer.status, AnswerStatus::Complete);
+        assert_eq!(turn.answer.value_of("职业"), vec!["演员"]);
+        assert_eq!(dialogue.focus(), Some("刘德华"));
     }
 
     #[test]
