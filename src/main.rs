@@ -7970,6 +7970,20 @@ async fn run_interactive_mode(
                         );
                     }
 
+                    // 问法未命中但存在相似成功经验：给出可确认的候选骨架，
+                    // 把「没听懂」变成一次可复用的上下文学习机会。
+                    if let Some(suggestion) = pattern_episodes.suggest_case_with_context(
+                        &normalized_words,
+                        &route_context,
+                        0.2,
+                    ) {
+                        println!(
+                            "模式联想：{}（确认后可直接路由：确认联想：{}）",
+                            suggestion.pattern.render(),
+                            input
+                        );
+                    }
+
                     // 插件声明的兜底策略先于外链/常识别源；只改措辞，不伪造事实。
                     if let Some((policy_text, policy_plan)) = plugin_runtime.policy_reply(raw_input)
                     {
