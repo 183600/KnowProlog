@@ -419,6 +419,10 @@ pub struct TurnResponse {
     /// 未完成轮次是否仍可继续（TTL 与尝试次数均未耗尽）。
     #[serde(default)]
     pub resumable: bool,
+    /// 「为什么」轮次的有界推导视图：事实/规则边、绑定与失败前沿。
+    /// 只在元解释轮出现，且与回答一样受节点/深度/字节预算约束。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<crate::derivation::Derivation>,
 }
 
 /// 一条接地引用：回答依据的实体身份（URI 可寻址、词面可回溯、类型可审计）。
@@ -685,6 +689,7 @@ impl Session {
             open_turn,
             resumed,
             resumable,
+            derivation: None,
         }
     }
 
@@ -834,8 +839,12 @@ impl Session {
             open_turn: self.open_turn_view(),
             resumed: false,
             resumable: self.open_turn_resumable(),
+            derivation: None,
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
+        if response.kind.as_deref() == Some("meta_why") {
+            response.derivation = self.manager.last_derivation(&self.reasoner);
+        }
         control.enter(TurnPhase::Commit)?;
         Ok(response)
     }
@@ -4243,6 +4252,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             open_turn: None,
             resumed: false,
             resumable: false,
+            derivation: None,
         };
         let key = stateless_answer_key(&["姚明的身高是多少".to_string()], None);
 
@@ -4290,6 +4300,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             open_turn: None,
             resumed: false,
             resumable: false,
+            derivation: None,
         };
         let key = stateless_answer_key(&["明哥的身高是多少".to_string()], None);
         let epoch = state.cache_epoch();
@@ -4945,6 +4956,30 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert!(response.fault.is_none());
         assert!(response.open_turn.is_none());
         assert_eq!(session.manager.turn_count(), 1);
+    }
+
+    #[test]
+    fn why_turn_carries_bounded_derivation_over_http_response() {
+        let mut session = test_session(TurnBudget::unlimited());
+        let answer = session.run_turn("姚明的身高是多少");
+        assert_eq!(answer.status, "answered", "{}", answer.reply);
+        assert!(answer.derivation.is_none(), "普通回答不附带证明");
+
+        let why = session.run_turn("怎么推出来的？");
+        assert_eq!(why.kind.as_deref(), Some("meta_why"), "{}", why.reply);
+        let derivation = why.derivation.as_ref().expect("元解释轮应返回结构化推导");
+        assert!(derivation.is_proved(), "{}", why.reply);
+        assert!(
+            derivation
+                .steps
+                .iter()
+                .any(|step| step.claim.contains("226")),
+            "{:?}",
+            derivation.steps
+        );
+        let encoded = serde_json::to_string(derivation).expect("推导视图应可序列化");
+        assert!(encoded.contains("steps"));
+        assert!(encoded.len() < crate::derivation::MAX_DERIVATION_BYTES);
     }
 
     #[test]

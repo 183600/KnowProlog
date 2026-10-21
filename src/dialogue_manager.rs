@@ -2432,6 +2432,13 @@ impl DialogueManager {
         )
     }
 
+    /// 只读：为最近一条已答轮次重建推导（与 [`Self::explain_last_with`] 同源）。
+    /// 供 HTTP/CLI 在「为什么」轮次返回结构化证明，不写入会话状态。
+    pub fn last_derivation(&self, knowledge: &dyn DialogueKnowledge) -> Option<Derivation> {
+        let turn = self.last_answered_turn()?;
+        self.explain_derivation(turn, knowledge)
+    }
+
     /// 为上一轮回答重建一条与实际答案锚定的推导：
     /// 先走知识源的归结证明；没有形式证明时，再按实体属性/关系边
     /// 组装直接事实链（只取回答文本中确实出现的取值）。
@@ -2950,7 +2957,15 @@ fn classify_provenance(answer: &str) -> Vec<String> {
 }
 
 fn excerpt(text: &str, limit: usize) -> String {
-    let first_line = text.lines().next().unwrap_or("").trim();
+    // 推理器的多行回答常以「根据知识图谱：」这类标题开头；摘要取第一条
+    // 实质内容行，避免「依据」只剩标题、无法与答案取值对齐。
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    let first_line = lines
+        .iter()
+        .copied()
+        .find(|line| !line.is_empty() && !line.ends_with('：') && !line.ends_with(':'))
+        .or_else(|| lines.iter().copied().find(|line| !line.is_empty()))
+        .unwrap_or("");
     let mut out: String = first_line.chars().take(limit).collect();
     if first_line.chars().count() > limit {
         out.push('…');
