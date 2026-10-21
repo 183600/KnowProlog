@@ -16,8 +16,8 @@ pub mod abduction;
 pub mod advanced_nlu;
 pub mod artifact_audit;
 pub mod association_miner;
-pub mod bindings;
 pub mod binding_frames;
+pub mod bindings;
 pub mod cache;
 pub mod canonical;
 pub mod causal_reasoning;
@@ -96,6 +96,7 @@ pub mod semantic_embedding;
 pub mod semantic_engine;
 pub mod semantic_entailment;
 pub mod serve_api;
+pub mod shape_dialogue;
 pub mod shape_gate;
 pub mod similarity_calculator;
 pub mod startup_ledger;
@@ -1154,7 +1155,7 @@ impl OxigraphManager {
             return context;
         };
         let apply = |ctx: &serde_json::Map<String, Value>,
-                         context: &mut HashMap<String, String>| {
+                     context: &mut HashMap<String, String>| {
             for (term, value) in ctx {
                 if let Some(iri) = value.as_str() {
                     context.insert(term.clone(), iri.to_string());
@@ -1355,10 +1356,7 @@ impl OxigraphManager {
                         stats.relations += 1;
                         // 嵌套对象除 @id 外还带类型/属性时，它本身也是一个节点
                         // （JSON-LD 展开语义），继续落库而不是丢掉这些描述。
-                        if obj
-                            .keys()
-                            .any(|key| key != "@id" && key != "@context")
-                        {
+                        if obj.keys().any(|key| key != "@id" && key != "@context") {
                             self.process_jsonld_object(store, obj, context, stats)?;
                         }
                     }
@@ -1372,10 +1370,8 @@ impl OxigraphManager {
                     // 处理带数据类型的值
                     let literal = if let Some(datatype) = obj.get("@type") {
                         if let Some(datatype_uri) = datatype.as_str() {
-                            let dt = NamedNode::new(Self::expand_jsonld_term(
-                                datatype_uri,
-                                context,
-                            ))?;
+                            let dt =
+                                NamedNode::new(Self::expand_jsonld_term(datatype_uri, context))?;
                             Literal::new_typed_literal(&value_text, dt)
                         } else {
                             Literal::new_simple_literal(&value_text)
