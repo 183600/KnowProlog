@@ -662,6 +662,12 @@ pub struct PatternEpisode {
     /// 同一经验被重复观察的次数（支持度）。
     #[serde(default = "one_u32")]
     pub count: u32,
+    /// 用户确认「案例联想」的次数（正向反馈）。
+    #[serde(default)]
+    pub acceptances: u32,
+    /// 用户否定「案例联想」的次数（负向反馈；被否定的骨架不再主动推荐）。
+    #[serde(default)]
+    pub rejections: u32,
     #[serde(default)]
     pub first_turn: usize,
     #[serde(default)]
@@ -778,6 +784,59 @@ pub struct CaseSuggestion {
     pub pattern: PatternEntry,
 }
 
+/// 用户对「模式联想」的回答类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseReply {
+    /// 确认候选骨架，应转正为可路由模式。
+    Accept,
+    /// 否定候选骨架，应记入负向反馈。
+    Reject,
+    /// 暂不确定：关闭本次联想，但不记否定。
+    Unclear,
+    /// 不是对联想提问的回答（按新输入继续处理）。
+    NewInput,
+}
+
+/// 把一轮输入分类为对案例联想的确认/否定/不确定。
+///
+/// 只接受**整句短答**（可带句末语气词），避免把「是什么」「是的，首都在哪」
+/// 这类新问题误当成对上一轮候选的确认。
+pub fn classify_case_reply(input: &str) -> CaseReply {
+    let trimmed = input
+        .trim()
+        .trim_start_matches(['：', ':', ' ', '，', ','])
+        .trim_end_matches(['。', '！', '!', '~', '～', ' ', '？', '?', '，', ',']);
+    if trimmed.is_empty() {
+        return CaseReply::NewInput;
+    }
+    let mut core = trimmed;
+    for suffix in ['吧', '啊', '呀', '呢', '哦'] {
+        if let Some(stripped) = core.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                core = stripped;
+            }
+        }
+    }
+    let lower = core.to_lowercase();
+    let accept = [
+        "是", "是的", "对", "对的", "没错", "确认", "好", "好的", "好呀", "可以", "嗯",
+        "yes", "y", "true",
+    ];
+    let reject = [
+        "不是", "不对", "否", "不要", "不用", "别", "错", "算了", "no", "n", "false",
+    ];
+    let unclear = ["不知道", "不确定", "不清楚", "跳过", "下一个", "随便"];
+    if accept.contains(&lower.as_str()) {
+        CaseReply::Accept
+    } else if reject.contains(&lower.as_str()) {
+        CaseReply::Reject
+    } else if unclear.contains(&lower.as_str()) {
+        CaseReply::Unclear
+    } else {
+        CaseReply::NewInput
+    }
+}
+
 /// 有界、去重、可检索的模式经验台账。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PatternEpisodeLog {
@@ -889,6 +948,8 @@ impl PatternEpisodeLog {
             pending_clarify: Some(context.pending_clarify),
             outcome: EpisodeOutcome::Matched,
             count: 1,
+            acceptances: 0,
+            rejections: 0,
             first_turn: self.effective_turn(context.turn),
             last_turn: self.effective_turn(context.turn),
         };
@@ -937,6 +998,8 @@ impl PatternEpisodeLog {
             pending_clarify: Some(context.pending_clarify),
             outcome: EpisodeOutcome::Unmatched,
             count: 1,
+            acceptances: 0,
+            rejections: 0,
             first_turn: self.effective_turn(context.turn),
             last_turn: self.effective_turn(context.turn),
         };
@@ -962,6 +1025,8 @@ impl PatternEpisodeLog {
             existing.tokens = episode.tokens;
             existing.entities = episode.entities;
             existing.bindings = episode.bindings;
+            existing.acceptances = existing.acceptances.max(episode.acceptances);
+            existing.rejections = existing.rejections.max(episode.rejections);
             return false;
         }
         self.entries.push(episode);
@@ -1001,6 +1066,8 @@ impl PatternEpisodeLog {
             let id = episode.id();
             if let Some(existing) = self.entries.iter_mut().find(|entry| entry.id() == id) {
                 existing.count = existing.count.max(episode.count);
+                existing.acceptances = existing.acceptances.max(episode.acceptances);
+                existing.rejections = existing.rejections.max(episode.rejections);
                 existing.first_turn = existing.first_turn.min(episode.first_turn);
                 existing.last_turn = existing.last_turn.max(episode.last_turn);
             } else {
@@ -1069,12 +1136,20 @@ impl PatternEpisodeLog {
             } else {
                 0.0
             };
+            // 被用户否定过的成功经验仍可检索（解释为什么不再推荐），
+            // 但排序时扣分；净否定越多扣得越重，最多扣到 0。
+            let rejection_penalty = episode
+                .rejections
+                .saturating_sub(episode.acceptances)
+                .min(3) as f64
+                * 0.2;
             if shared.is_empty() && context_bonus == 0.0 {
                 continue;
             }
             neighbors.push(EpisodeNeighbor {
                 index,
-                score: (overlap + context_bonus + outcome_bonus).min(1.0),
+                score: (overlap + context_bonus + outcome_bonus - rejection_penalty)
+                    .clamp(0.0, 1.0),
                 shared,
             });
         }
@@ -1121,75 +1196,107 @@ impl PatternEpisodeLog {
         context: &PatternContext,
         min_score: f64,
     ) -> Option<CaseSuggestion> {
-        let neighbor = self
-            .nearest_with_context(tokens, context, 1)
-            .into_iter()
-            .next()?;
-        if neighbor.score < min_score {
-            return None;
-        }
-        let episode = self.entries.get(neighbor.index)?.clone();
-        if episode.outcome != EpisodeOutcome::Matched {
-            return None;
-        }
-        let shared = episode.surface_set();
-        let mut elems = Vec::new();
-        let mut slot_number = 0usize;
-        for token in tokens {
-            let text = token.text.trim();
-            if text.is_empty() || is_skippable(text) {
-                continue;
+        // 取前若干个邻居逐个尝试：最近的一条可能是否定过的骨架、
+        // 未命中的经验，或泛化后无法解释当前输入；不应因此放弃次近的经验。
+        for neighbor in self.nearest_with_context(tokens, context, 5) {
+            if neighbor.score < min_score {
+                break;
             }
-            if shared.contains(text) {
-                elems.push(Elem::word(text));
+            let Some(episode) = self.entries.get(neighbor.index).cloned() else {
                 continue;
-            }
-            let sort = match token.pos.as_str() {
-                "nr" => "人名",
-                "ns" | "nt" => "地点",
-                "n" | "nz" | "vn" => "实体",
-                "m" => "数量",
-                _ => "",
             };
-            if sort.is_empty() {
-                elems.push(Elem::word(text));
-            } else {
-                slot_number += 1;
-                elems.push(Elem::slot(format!("槽{}", slot_number), sort));
+            if episode.outcome != EpisodeOutcome::Matched
+                || episode.rejections > episode.acceptances
+            {
+                continue;
             }
-        }
-        if elems.is_empty() {
-            return None;
-        }
-        let query_type = episode.query_type.clone()?;
-        let mut entry = PatternEntry::new(
-            format!("案例候选：{}", episode.winner_name.as_deref().unwrap_or("经验")),
-            format!("case#{}", episode.short_id()),
-            query_type,
-            5,
-            false,
-            elems,
-        );
-        // 当前输入没有显式实体（靠焦点补全的省略/指代问句）时，
-        // 候选必须带上焦点守卫；确认转正后也不会在无焦点时误答。
-        let has_explicit_entity = tokens
-            .iter()
-            .any(|token| matches!(token.pos.as_str(), "nr" | "ns" | "nt"));
-        if !has_explicit_entity {
-            if let Some(sort) = &context.focus_type {
-                entry = entry.with_guard(ContextGuard::focus_type(sort.clone()));
-            } else if context.focus.is_some() {
-                entry = entry.with_guard(ContextGuard::focus());
+            let shared = episode.surface_set();
+            let mut elems = Vec::new();
+            let mut slot_number = 0usize;
+            for token in tokens {
+                let text = token.text.trim();
+                if text.is_empty() || is_skippable(text) {
+                    continue;
+                }
+                if shared.contains(text) {
+                    elems.push(Elem::word(text));
+                    continue;
+                }
+                let sort = match token.pos.as_str() {
+                    "nr" => "人名",
+                    "ns" | "nt" => "地点",
+                    "n" | "nz" | "vn" => "实体",
+                    "m" => "数量",
+                    _ => "",
+                };
+                if sort.is_empty() {
+                    elems.push(Elem::word(text));
+                } else {
+                    slot_number += 1;
+                    elems.push(Elem::slot(format!("槽{}", slot_number), sort));
+                }
             }
+            if elems.is_empty() {
+                continue;
+            }
+            let Some(query_type) = episode.query_type.clone() else {
+                continue;
+            };
+            let mut entry = PatternEntry::new(
+                format!(
+                    "案例候选：{}",
+                    episode.winner_name.as_deref().unwrap_or("经验")
+                ),
+                format!("case#{}", episode.short_id()),
+                query_type,
+                5,
+                false,
+                elems,
+            );
+            // 当前输入没有显式实体（靠焦点补全的省略/指代问句）时，
+            // 候选必须带上焦点守卫；确认转正后也不会在无焦点时误答。
+            let has_explicit_entity = tokens
+                .iter()
+                .any(|token| matches!(token.pos.as_str(), "nr" | "ns" | "nt"));
+            if !has_explicit_entity {
+                if let Some(sort) = &context.focus_type {
+                    entry = entry.with_guard(ContextGuard::focus_type(sort.clone()));
+                } else if context.focus.is_some() {
+                    entry = entry.with_guard(ContextGuard::focus());
+                }
+            }
+            // 候选必须能解释当前输入；否则继续看下一条经验。
+            if match_entry(&entry, tokens).is_err() {
+                continue;
+            }
+            return Some(CaseSuggestion {
+                episode,
+                score: neighbor.score,
+                shared: neighbor.shared,
+                pattern: entry,
+            });
         }
-        // 候选必须能解释当前输入；否则宁可不出建议。
-        match_entry(&entry, tokens).ok()?;
-        Some(CaseSuggestion {
-            episode,
-            score: neighbor.score,
-            shared: neighbor.shared,
-            pattern: entry,
-        })
+        None
+    }
+
+    /// 记录用户确认了某条案例联想（正向反馈，随经验账本持久化）。
+    pub fn confirm_case(&mut self, suggestion: &CaseSuggestion) -> bool {
+        let id = suggestion.episode.id();
+        if let Some(episode) = self.entries.iter_mut().find(|entry| entry.id() == id) {
+            episode.acceptances = episode.acceptances.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    /// 记录用户否定了某条案例联想（负向反馈；净否定的骨架不再主动推荐）。
+    pub fn reject_case(&mut self, suggestion: &CaseSuggestion) -> bool {
+        let id = suggestion.episode.id();
+        if let Some(episode) = self.entries.iter_mut().find(|entry| entry.id() == id) {
+            episode.rejections = episode.rejections.saturating_add(1);
+            return true;
+        }
+        false
     }
 }
 
@@ -2168,10 +2275,18 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
             .context_note()
             .map(|note| format!("，{}", note))
             .unwrap_or_default();
+        let feedback = if episode.acceptances > 0 || episode.rejections > 0 {
+            format!(
+                "，确认×{} 否定×{}",
+                episode.acceptances, episode.rejections
+            )
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "  {} ×{} 第{}轮{}：{}",
-            target, episode.count, episode.last_turn, context, episode.input
+            "  {} ×{} 第{}轮{}{}：{}",
+            target, episode.count, episode.last_turn, context, feedback, episode.input
         );
     }
     let mut recent: Vec<&PatternEpisode> = log.entries().iter().collect();
@@ -2224,6 +2339,13 @@ pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> Strin
         episode.last_turn,
         episode.count
     );
+    if episode.acceptances > 0 || episode.rejections > 0 {
+        let _ = writeln!(
+            out,
+            " 用户反馈：确认 ×{}，否定 ×{}（净否定的骨架不再主动推荐）",
+            episode.acceptances, episode.rejections
+        );
+    }
     if let Some(context) = episode.context_note() {
         let _ = writeln!(out, " 发生上下文：{}", context);
     }
@@ -2253,6 +2375,7 @@ pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> Strin
         out,
         " 边界：候选只用于确认，不直接回答；确认后才进入可路由模式库。"
     );
+    let _ = writeln!(out, " 口语确认：直接回答「是」或「不是」即可。");
     out
 }
 
@@ -3860,5 +3983,90 @@ mod tests {
         );
         let restored = parse_pattern_graph(quads.into_iter());
         assert_eq!(restored[0].guard, guarded.guard);
+    }
+
+    #[test]
+    fn case_reply_only_accepts_whole_short_answers() {
+        for answer in ["是", "是的。", "对呀", "好的", "确认", "YES", "没错啊"] {
+            assert_eq!(
+                classify_case_reply(answer),
+                CaseReply::Accept,
+                "「{}」应视为确认",
+                answer
+            );
+        }
+        for answer in ["不是", "不对！", "算了", "不要", "no", "否吧"] {
+            assert_eq!(
+                classify_case_reply(answer),
+                CaseReply::Reject,
+                "「{}」应视为否定",
+                answer
+            );
+        }
+        for answer in ["不知道", "不确定", "跳过", "下一个"] {
+            assert_eq!(
+                classify_case_reply(answer),
+                CaseReply::Unclear,
+                "「{}」应视为暂不确定",
+                answer
+            );
+        }
+        for answer in ["是什么", "是的，首都在哪里", "帮助", "", "确认联想：德国"] {
+            assert_eq!(
+                classify_case_reply(answer),
+                CaseReply::NewInput,
+                "「{}」不是对联想提问的短答",
+                answer
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_case_is_not_reoffered_and_feedback_persists() {
+        let library = sample_library();
+        let stored = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = library.match_route(&stored).expect("应命中");
+        let mut log = PatternEpisodeLog::default();
+        log.record_match("法国的首都是哪里", &stored, &matched, Some("法国"), 4);
+        let current = tagged(&[
+            ("德国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("在", "v"),
+            ("哪里", "r"),
+        ]);
+        let suggestion = log
+            .suggest_case(&current, Some("法国"), 0.2)
+            .expect("首次应给出候选");
+        assert!(log.reject_case(&suggestion), "否定应命中经验");
+        assert!(
+            log.suggest_case(&current, Some("法国"), 0.2).is_none(),
+            "净否定后的骨架不应再次主动推荐"
+        );
+        let latest = log.entries().last().expect("经验仍在账本中");
+        assert_eq!(latest.rejections, 1);
+        let report = render_episode_report(&log);
+        assert!(report.contains("否定×1"), "{}", report);
+
+        let quads = episode_quads(log.entries()).expect("反馈计数应可落图");
+        let restored = parse_episode_graph(quads.into_iter());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].rejections, 1);
+
+        assert!(log.confirm_case(&suggestion), "确认也应命中经验");
+        assert_eq!(
+            log.entries().last().map(|episode| episode.acceptances),
+            Some(1)
+        );
+        assert!(
+            log.suggest_case(&current, Some("法国"), 0.2).is_some(),
+            "确认抵消净否定后应允许再次联想"
+        );
     }
 }

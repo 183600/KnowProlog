@@ -3036,6 +3036,9 @@ async fn run_interactive_mode(
     let mut contrast_arbiter = ContrastArbiter::from_reasoning_config(&config.reasoning);
     // 对比追问进行中：记录当前提问对应的待定推测编号，用户答「是/不是」即结算
     let mut contrast_followup: Option<usize> = None;
+    // 模式联想待确认：一次未命中解析给出的候选骨架。下一轮用户可直接答
+    // 「是/不是」来转正或否决；否定记入负向反馈，避免同一骨架反复打扰。
+    let mut pending_case: Option<(String, pattern_ir::CaseSuggestion)> = None;
 
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
     let mut symbolic_reasoner = SymbolicReasoner::with_perf_ledger(
@@ -7113,6 +7116,76 @@ async fn run_interactive_mode(
                 }
             }
             InputMode::Query => {
+                // 待确认的模式联想：先结算「是/不是」短答，再把原问句重放一次。
+                // 未识别为短答时静默丢弃待确认状态，按新输入继续处理。
+                let mut case_replay: Option<String> = None;
+                if let Some((origin, suggestion)) = pending_case.take() {
+                    let mut handled = true;
+                    match pattern_ir::classify_case_reply(input) {
+                        pattern_ir::CaseReply::Accept => {
+                            match pattern_library.accept_case(&suggestion) {
+                                Ok(entry) => {
+                                    pattern_episodes.confirm_case(&suggestion);
+                                    println!(
+                                        "已确认案例：{}（来源 {}，路由 {}）。",
+                                        entry.name, entry.source, entry.query_type
+                                    );
+                                    match oxigraph_manager
+                                        .sync_pattern_ledger(pattern_library.entries())
+                                        .await
+                                    {
+                                        Ok(count) => println!("模式落图：{} 条已同步。", count),
+                                        Err(error) => {
+                                            eprintln!("模式落图失败：{}", error);
+                                        }
+                                    }
+                                    match oxigraph_manager
+                                        .sync_pattern_episodes(pattern_episodes.entries())
+                                        .await
+                                    {
+                                        Ok(count) => {
+                                            println!("经验落图：{} 条已同步。", count)
+                                        }
+                                        Err(error) => {
+                                            eprintln!("经验落图失败：{}", error);
+                                        }
+                                    }
+                                    println!("正在用确认后的模式重新理解原问题…");
+                                    case_replay = Some(origin);
+                                    handled = false;
+                                }
+                                Err(error) => println!("确认联想失败：{}", error),
+                            }
+                        }
+                        pattern_ir::CaseReply::Reject => {
+                            if pattern_episodes.reject_case(&suggestion) {
+                                println!(
+                                    "好的，已记下这次否定；该骨架不会再被主动推荐。"
+                                );
+                            } else {
+                                println!("好的，已关闭这次模式联想。");
+                            }
+                            if let Err(error) = oxigraph_manager
+                                .sync_pattern_episodes(pattern_episodes.entries())
+                                .await
+                            {
+                                eprintln!("经验落图失败：{}", error);
+                            }
+                        }
+                        pattern_ir::CaseReply::Unclear => {
+                            println!("好的，先不确认；这次联想已关闭。");
+                        }
+                        pattern_ir::CaseReply::NewInput => {
+                            handled = false;
+                        }
+                    }
+                    if handled {
+                        println!();
+                        continue;
+                    }
+                }
+                let input = case_replay.as_deref().unwrap_or(input);
+
                 // 语境指称消歧（CRD）：先结算上一轮反问，再对本轮做绑定/改写/追问。
                 crd_ledger.begin_turn();
                 let mut crd_input: Option<String> = None;
@@ -7978,10 +8051,11 @@ async fn run_interactive_mode(
                         0.2,
                     ) {
                         println!(
-                            "模式联想：{}（确认后可直接路由：确认联想：{}）",
+                            "模式联想：{}（你是在问这个意思吗？答「是」确认，答「不是」否定；也可用「确认联想：{}」）",
                             suggestion.pattern.render(),
                             input
                         );
+                        pending_case = Some((input.to_string(), suggestion));
                     }
 
                     // 插件声明的兜底策略先于外链/常识别源；只改措辞，不伪造事实。
@@ -8463,6 +8537,7 @@ fn interactive_help() -> String {
         "  模式经验 / 经验台账                  查看命中/未命中的可检索理解经验",
         "  模式联想：<句子>                     用相似成功经验泛化候选骨架（只确认，不直接回答）",
         "  确认联想：<句子>                     用户确认候选骨架，转正为可路由模式并落图",
+        "  是 / 不是                            直接结算上一轮模式联想；否定记入负向反馈",
         "  清空模式经验                         清空经验台账并同步命名图",
         "  教模式：名 | 要素… | 路由 | 优先级 | 守卫  教一条模式（可选上下文守卫，落图持久化）",
         "  忘模式：<名>                         遗忘一条教学模式",
