@@ -4870,6 +4870,59 @@ impl SymbolicReasoner {
         output
     }
 
+    /// 显式退役补全规则：停止派生新结论；已确认的会话事实保留。
+    pub fn completion_retire(&mut self, rule_id: &str) -> String {
+        let outcome = match self.completion.retire(rule_id) {
+            Ok(outcome) => outcome,
+            Err(error) => return error.to_string(),
+        };
+        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+            if self.config.enable_resolution {
+                self.rebuild_resolver();
+            }
+            if self.config.enable_soft_logic {
+                self.rebuild_soft_logic();
+            }
+        }
+        let mut output = format!(
+            "补全规则 {} 已退役（原状态：{}，作用域：{}）。\n",
+            outcome.rule_id,
+            outcome.previous.label(),
+            outcome.scope.label()
+        );
+        output.push_str("  已确认的会话事实保留；该规则不再派生新结论。\n");
+        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+            output.push_str("  已从全局归结与软逻辑中移除。\n");
+        }
+        output
+    }
+
+    /// 恢复已退役补全规则：按确认次数回到候选或生效状态。
+    pub fn completion_reactivate(&mut self, rule_id: &str) -> String {
+        let outcome = match self.completion.reactivate(rule_id) {
+            Ok(outcome) => outcome,
+            Err(error) => return error.to_string(),
+        };
+        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+            if self.config.enable_resolution {
+                self.rebuild_resolver();
+            }
+            if self.config.enable_soft_logic {
+                self.rebuild_soft_logic();
+            }
+        }
+        let mut output = format!(
+            "补全规则 {} 已恢复为「{}」（作用域：{}）。\n",
+            outcome.rule_id,
+            outcome.current.label(),
+            outcome.scope.label()
+        );
+        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+            output.push_str("  该规则重新进入全局归结与软逻辑。\n");
+        }
+        output
+    }
+
     pub fn completion_report(&self) -> String {
         self.completion.render_episode()
     }
@@ -14355,6 +14408,29 @@ types = [
             "显式晋升后规则应进入全局归结"
         );
         assert!(reasoner.completion_rules_report().contains("全局"));
+
+        let short = &rule_id[..rule_id.len().min(21)];
+        let retired = reasoner.completion_retire(short);
+        assert!(retired.contains("已退役"), "{}", retired);
+        assert_eq!(
+            reasoner.completion_ledger().reasoning_clauses().len(),
+            0,
+            "退役后规则不得继续参与全局归结"
+        );
+        assert!(
+            reasoner
+                .answer("孙八的师祖是谁")
+                .expect("会话事实应保留")
+                .contains("吴十"),
+            "退役规则不得撤回已确认的会话事实"
+        );
+        let restored_rule = reasoner.completion_reactivate(&rule_id);
+        assert!(restored_rule.contains("已恢复"), "{}", restored_rule);
+        assert_eq!(
+            reasoner.completion_ledger().reasoning_clauses().len(),
+            1,
+            "恢复后规则应重新参与全局归结"
+        );
 
         let snapshot = reasoner.dialogue_snapshot();
         assert!(

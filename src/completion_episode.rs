@@ -515,6 +515,15 @@ pub struct PromotionOutcome {
     pub warning: Option<String>,
 }
 
+/// 规则退役 / 恢复的结果：保留前后状态，便于回执审计。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleLifecycleOutcome {
+    pub rule_id: String,
+    pub scope: RuleScope,
+    pub previous: RuleStatus,
+    pub current: RuleStatus,
+}
+
 /// 回合操作错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EpisodeError {
@@ -523,7 +532,10 @@ pub enum EpisodeError {
     AmbiguousSelector { selector: String, count: usize },
     CandidateAlreadyClosed(String),
     RuleNotFound(String),
+    AmbiguousRuleSelector { selector: String, count: usize },
     RuleUnavailable(String),
+    RuleAlreadyRetired(String),
+    RuleNotRetired(String),
     PromotionNotHigher {
         from: RuleScope,
         to: RuleScope,
@@ -549,8 +561,19 @@ impl fmt::Display for EpisodeError {
                 write!(f, "候选「{}」已有确认/驳回结论，不能再次裁定", selector)
             }
             EpisodeError::RuleNotFound(id) => write!(f, "找不到补全规则「{}」", id),
+            EpisodeError::AmbiguousRuleSelector { selector, count } => write!(
+                f,
+                "规则前缀「{}」匹配 {} 条，请改用更长的规则 id",
+                selector, count
+            ),
             EpisodeError::RuleUnavailable(id) => {
                 write!(f, "补全规则「{}」已隔离或退役，不能继续使用", id)
+            }
+            EpisodeError::RuleAlreadyRetired(id) => {
+                write!(f, "补全规则「{}」已经退役", id)
+            }
+            EpisodeError::RuleNotRetired(id) => {
+                write!(f, "补全规则「{}」未退役，无需恢复", id)
             }
             EpisodeError::PromotionNotHigher { from, to } => write!(
                 f,
@@ -1058,6 +1081,32 @@ impl CompletionLedger {
         })
     }
 
+    /// 按完整 id 或唯一前缀查找规则（展示层给的是短 id）。
+    fn find_rule_index(&self, selector: &str) -> Result<usize, EpisodeError> {
+        let selector = selector.trim().trim_start_matches('#');
+        if selector.is_empty() {
+            return Err(EpisodeError::RuleNotFound(selector.to_string()));
+        }
+        if let Some(position) = self.rules.iter().position(|rule| rule.id == selector) {
+            return Ok(position);
+        }
+        let prefix_matches: Vec<usize> = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.id.starts_with(selector))
+            .map(|(position, _)| position)
+            .collect();
+        match prefix_matches.as_slice() {
+            [] => Err(EpisodeError::RuleNotFound(selector.to_string())),
+            [position] => Ok(*position),
+            _ => Err(EpisodeError::AmbiguousRuleSelector {
+                selector: selector.to_string(),
+                count: prefix_matches.len(),
+            }),
+        }
+    }
+
     /// 显式晋升规则作用域。晋升是用户动作，但仍拒绝已隔离/退役的规则。
     pub fn promote(
         &mut self,
@@ -1065,13 +1114,10 @@ impl CompletionLedger {
         target: RuleScope,
     ) -> Result<PromotionOutcome, EpisodeError> {
         let tick = self.tick;
-        let rule = self
-            .rules
-            .iter_mut()
-            .find(|rule| rule.id == rule_id)
-            .ok_or_else(|| EpisodeError::RuleNotFound(rule_id.to_string()))?;
+        let position = self.find_rule_index(rule_id)?;
+        let rule = &mut self.rules[position];
         if !rule.is_usable() {
-            return Err(EpisodeError::RuleUnavailable(rule_id.to_string()));
+            return Err(EpisodeError::RuleUnavailable(rule.id.clone()));
         }
         if target.rank() <= rule.scope.rank() {
             return Err(EpisodeError::PromotionNotHigher {
@@ -1107,6 +1153,51 @@ impl CompletionLedger {
             from,
             to: target,
             warning,
+        })
+    }
+
+    /// 显式退役规则：停止参与闭包与全局归结，但保留审计记录。
+    ///
+    /// 已确认的补全事实属于会话事实，不会因规则退役而被撤回；
+    /// 退役只阻止该规则继续派生新结论。
+    pub fn retire(&mut self, rule_id: &str) -> Result<RuleLifecycleOutcome, EpisodeError> {
+        let position = self.find_rule_index(rule_id)?;
+        let tick = self.tick;
+        let rule = &mut self.rules[position];
+        if rule.status == RuleStatus::Retired {
+            return Err(EpisodeError::RuleAlreadyRetired(rule.id.clone()));
+        }
+        let previous = rule.status;
+        rule.status = RuleStatus::Retired;
+        rule.updated_tick = tick;
+        Ok(RuleLifecycleOutcome {
+            rule_id: rule.id.clone(),
+            scope: rule.scope,
+            previous,
+            current: rule.status,
+        })
+    }
+
+    /// 恢复已退役规则：按确认次数回到候选（<2）或生效（>=2）。
+    pub fn reactivate(&mut self, rule_id: &str) -> Result<RuleLifecycleOutcome, EpisodeError> {
+        let position = self.find_rule_index(rule_id)?;
+        let tick = self.tick;
+        let rule = &mut self.rules[position];
+        if rule.status != RuleStatus::Retired {
+            return Err(EpisodeError::RuleNotRetired(rule.id.clone()));
+        }
+        let previous = rule.status;
+        rule.status = if rule.confirmations >= 2 {
+            RuleStatus::Active
+        } else {
+            RuleStatus::Candidate
+        };
+        rule.updated_tick = tick;
+        Ok(RuleLifecycleOutcome {
+            rule_id: rule.id.clone(),
+            scope: rule.scope,
+            previous,
+            current: rule.status,
         })
     }
 
@@ -1810,6 +1901,52 @@ mod tests {
         assert_eq!(ledger.rule(&rule_id).unwrap().scope, RuleScope::Namespace);
         assert_eq!(ledger.reasoning_clauses().len(), 1);
         assert!(ledger.promote(&rule_id, RuleScope::Batch).is_err());
+    }
+
+    #[test]
+    fn retire_and_reactivate_rule_with_short_id() {
+        let predictor = chain_predictor();
+        let facts = predictor.triples().to_vec();
+        let mut ledger = CompletionLedger::new();
+        open_with_predictions(&mut ledger, &predictor, "孙八");
+        ledger.set_batch_scope(["孙八", "周九", "吴十"].into_iter().map(str::to_string));
+        ledger
+            .confirm("孙八|师祖|吴十", &facts)
+            .expect("确认应成功");
+        let rule_id = ledger.rules()[0].id.clone();
+        ledger
+            .promote(&rule_id, RuleScope::Namespace)
+            .expect("晋升应成功");
+        assert_eq!(ledger.reasoning_clauses().len(), 1);
+
+        let short = &rule_id[..rule_id.len().min(21)];
+        let retired = ledger.retire(short).expect("短 id 应能定位规则");
+        assert_eq!(retired.rule_id, rule_id);
+        assert_eq!(retired.previous, RuleStatus::Candidate);
+        assert_eq!(retired.current, RuleStatus::Retired);
+        assert!(ledger.reasoning_clauses().is_empty());
+        assert!(matches!(
+            ledger.retire(&rule_id),
+            Err(EpisodeError::RuleAlreadyRetired(_))
+        ));
+        assert!(matches!(
+            ledger.promote(&rule_id, RuleScope::Global),
+            Err(EpisodeError::RuleUnavailable(_))
+        ));
+
+        let restored = ledger.reactivate(short).expect("恢复应成功");
+        assert_eq!(restored.previous, RuleStatus::Retired);
+        assert_eq!(restored.current, RuleStatus::Candidate);
+        assert_eq!(ledger.reasoning_clauses().len(), 1);
+        assert!(matches!(
+            ledger.reactivate(&rule_id),
+            Err(EpisodeError::RuleNotRetired(_))
+        ));
+        assert!(matches!(
+            ledger.retire("rule-missing"),
+            Err(EpisodeError::RuleNotFound(_))
+        ));
+        assert!(ledger.render_rules().contains("命名空间"));
     }
 
     #[test]

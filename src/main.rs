@@ -5781,6 +5781,46 @@ async fn run_interactive_mode(
             continue;
         }
 
+        if let Some(rule_id) = strip_any_prefix(
+            input,
+            &[
+                "退役补全规则：",
+                "退役补全规则:",
+                "补全规则退役：",
+                "补全规则退役:",
+            ],
+        ) {
+            let rule_id = rule_id.trim();
+            if rule_id.is_empty() {
+                println!("用法：退役补全规则：<规则id>");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.completion_retire(rule_id));
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(rule_id) = strip_any_prefix(
+            input,
+            &[
+                "恢复补全规则：",
+                "恢复补全规则:",
+                "补全规则恢复：",
+                "补全规则恢复:",
+            ],
+        ) {
+            let rule_id = rule_id.trim();
+            if rule_id.is_empty() {
+                println!("用法：恢复补全规则：<规则id>");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.completion_reactivate(rule_id));
+            }
+            println!();
+            continue;
+        }
+
         // 结构联想：RWR 图嵌入（随机游走重启）检索结构相关实体与解释路径
         if let Some(entity) =
             strip_any_prefix(input, &["结构联想：", "结构联想:", "图游走：", "图游走:"])
@@ -8758,6 +8798,7 @@ fn interactive_help() -> String {
         "  确认补全：<序号> / 否定补全：<序号>   裁定候选；确认事实只进会话，不写图谱",
         "  补全规则 / 补全报告                   已归纳规则与本回合候选（默认本批作用域）",
         "  晋升补全规则：<id>|<作用域>           显式升到命名空间/全局，才进入全局归结",
+        "  退役补全规则：<id> / 恢复补全规则：<id>  停用或恢复规则；已确认的会话事实保留",
         "  对齐报告 / 对齐候选：<术语>          本体对齐、候选格与答案等价性",
         "  覆盖报告 / 质量护照                   覆盖缺口与数据质量",
         "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
@@ -9000,6 +9041,10 @@ fn is_command_like(input: &str) -> bool {
         "补全规则",
         "补全报告",
         "晋升补全规则",
+        "退役补全规则",
+        "补全规则退役",
+        "恢复补全规则",
+        "补全规则恢复",
         "关联规则",
         "关联联想",
         "联想",
@@ -10139,6 +10184,12 @@ mod session_tests {
             "默认推理：麻雀会飞",
             "默认逻辑：",
             "对齐候选：老婆",
+            "补全回合：张三",
+            "确认补全：1",
+            "否定补全：1",
+            "晋升补全规则：rule-abc|全局",
+            "退役补全规则：rule-abc",
+            "恢复补全规则：rule-abc",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
