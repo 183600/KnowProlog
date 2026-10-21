@@ -272,6 +272,17 @@ fn check_system(c: &mut Collector, config: &SystemConfig) {
             "默认语言为空",
         );
     }
+    // `oxigraph_endpoint` 曾被读进 SystemSettings，却没有任何运行路径消费它：
+    // 存储始终走内嵌 Oxigraph（`oxigraph_store_path`），HTTP 端点从未被拨号。
+    // 保留字段是为了兼容既有 config.toml，但必须如实告诉作者它不会生效，
+    // 否则「配了却不说」会让人误以为在指定远程存储。
+    if !config.system.oxigraph_endpoint.trim().is_empty() {
+        c.warn(
+            "inert_oxigraph_endpoint",
+            "system.oxigraph_endpoint",
+            "该端点在运行时不生效：存储始终使用内嵌 Oxigraph（见 system.oxigraph_store_path），此字段仅作兼容保留",
+        );
+    }
 }
 
 fn check_messages(c: &mut Collector, config: &SystemConfig) {
@@ -2111,6 +2122,29 @@ process_error = "处理出错"
             .iter()
             .filter(|issue| issue.code == "value_will_be_clamped")
             .all(|issue| issue.severity == ContractSeverity::Warning));
+    }
+
+    #[test]
+    fn inert_oxigraph_endpoint_is_warning() {
+        let issues = lint_source(&base());
+        assert_code(&issues, "inert_oxigraph_endpoint");
+        assert!(issues
+            .iter()
+            .filter(|issue| issue.code == "inert_oxigraph_endpoint")
+            .all(|issue| issue.severity == ContractSeverity::Warning));
+
+        let blanked = base().replace(
+            "oxigraph_endpoint = \"http://localhost:7878\"",
+            "oxigraph_endpoint = \"\"",
+        );
+        let issues = lint_source(&blanked);
+        assert!(
+            !codes(&issues)
+                .iter()
+                .any(|code| code == "inert_oxigraph_endpoint"),
+            "留空后不应再提示：{}",
+            render_text(&issues)
+        );
     }
 
     #[test]

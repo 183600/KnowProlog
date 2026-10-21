@@ -2088,12 +2088,7 @@ async fn run_chat_turns(
             .await
         {
             Ok(turn) => Ok((turn, prompt_chars)),
-            Err(SessionError::NotFound) => Err((404, "session not found".to_string())),
-            Err(SessionError::Unavailable) => Err((500, "session actor unavailable".to_string())),
-            Err(SessionError::Stale(error)) => Err((
-                409,
-                format!("session snapshot is stale (decode_{})", error.code()),
-            )),
+            Err(error) => Err(session_error_http(error)),
         };
     }
     // 无状态路径是纯函数：键完全相等才命中缓存（纪元不符一律未命中）。
@@ -2113,17 +2108,42 @@ async fn run_chat_turns(
         .await
         .map_err(|message| (429, message.to_string()))?;
     let mut last = None;
+    let mut failure: Option<(u16, String)> = None;
     for input in &chat.inputs {
-        last = state
+        match state
             .take_turn_with_policy(&temp_id, input, chat.policy.as_ref())
             .await
-            .ok();
+        {
+            Ok(turn) => last = Some(turn),
+            // 临时会话刚建好就不可用，说明 actor 已退出；保留分类而不是折叠成
+            // 无区分度的 "turn failed"，让无状态路径与会话路径的错误保真一致。
+            Err(error) => {
+                failure = Some(session_error_http(error));
+                break;
+            }
+        }
     }
     state.close_session(&temp_id).await;
+    if let Some(error) = failure {
+        return Err(error);
+    }
     let turn = last.ok_or_else(|| (500, "turn failed".to_string()))?;
     // 只缓存纯函数结果：无会话状态残留，命中与重算逐字节一致
     state.store_stateless_answer(epoch, key, turn.clone());
     Ok((turn, prompt_chars))
+}
+
+/// 会话访问错误的 HTTP 归类：会话路径与无状态路径共用同一张表，
+/// 避免两处各自硬编码导致同一原因返回不同状态码/措辞。
+fn session_error_http(error: SessionError) -> (u16, String) {
+    match error {
+        SessionError::NotFound => (404, "session not found".to_string()),
+        SessionError::Unavailable => (500, "session actor unavailable".to_string()),
+        SessionError::Stale(error) => (
+            409,
+            format!("session snapshot is stale (decode_{})", error.code()),
+        ),
+    }
 }
 
 fn completion_id(session_id: &str, turn: u32) -> String {
