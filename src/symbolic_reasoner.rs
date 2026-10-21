@@ -40,6 +40,7 @@ use crate::predicate_registry::PredicateRegistry;
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
+use crate::query_rewrite::{self, RelationLexicon};
 use crate::resolution_engine::{
     render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
@@ -900,6 +901,33 @@ impl SenseSource for SymbolicReasoner {
 }
 
 impl SymbolicReasoner {
+    /// 把本体的实体/谓词登记转成句法重写器可用的词表视图：
+    /// 只有已登记项才放行，未登记的一律返回 None（保守弃权）。
+    fn relation_lexicon(&self) -> impl RelationLexicon + '_ {
+        struct View<'a>(&'a SymbolicReasoner);
+
+        impl RelationLexicon for View<'_> {
+            fn canonical_entity(&self, raw: &str) -> Option<String> {
+                let canonical = self.0.aligner.canonical_form(raw);
+                if self.0.is_known_entity(raw) {
+                    Some(canonical)
+                } else if self.0.is_known_entity(&canonical) {
+                    Some(canonical)
+                } else {
+                    None
+                }
+            }
+
+            fn canonical_predicate(&self, raw: &str) -> Option<String> {
+                if !self.0.is_known_predicate(raw) {
+                    return None;
+                }
+                Some(self.0.resolve_question_predicate(raw).0)
+            }
+        }
+
+        View(self)
+    }
     /// 审计辅助：词条是否是任一实体的属性键、取值或实体名本身。
     /// 供对话忠信度检查（回答引用必须可回溯）使用。
     pub fn attribute_token_known(&self, token: &str) -> bool {
@@ -5370,7 +5398,9 @@ impl SymbolicReasoner {
     }
 
     fn answer_planned(&self, question: &str) -> Option<String> {
-        let plan = self.planner.parse(question)?;
+        let plan = self.planner.parse(question).or_else(|| {
+            query_rewrite::rewrite(question, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
+        })?;
         match plan {
             QueryPlan::FindObject { segments } => {
                 let (entity, predicates) = self.split_chain(&segments)?;
@@ -5455,8 +5485,16 @@ impl SymbolicReasoner {
                 subject_segments,
                 object,
             } => self.answer_check(&subject_segments, &object),
+            QueryPlan::CheckRelation {
+                subject,
+                predicate,
+                object,
+            } => self.answer_check_relation(&subject, &predicate, &object),
             QueryPlan::FindSubject { object, predicate } => {
                 self.answer_find_subject(&object, &predicate)
+            }
+            QueryPlan::FindObjectByPredicate { subject, predicate } => {
+                self.answer_relation_objects(&subject, &predicate)
             }
             QueryPlan::PathBetween {
                 start,
@@ -6101,6 +6139,100 @@ impl SymbolicReasoner {
         subjects
     }
 
+    fn answer_relation_objects(&self, subject_raw: &str, predicate_raw: &str) -> Option<String> {
+        let entity = self.aligner.canonical_form(subject_raw.trim());
+        let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
+        let surface = predicate_raw.trim().to_string();
+        if entity.is_empty() || slot.is_empty() {
+            return None;
+        }
+        if !self.is_known_entity(&entity) || !self.is_known_predicate(&surface) {
+            return None;
+        }
+        let predicate = ChainPredicate {
+            surface: surface.clone(),
+            slot,
+            inverted,
+        };
+        let mut hits = self.node_hits(&entity, &predicate);
+        hits.sort_by(|left, right| left.value.cmp(&right.value));
+        hits.dedup_by(|left, right| left.value == right.value);
+        if hits.is_empty() {
+            return Some(format!(
+                "根据现有知识库，没有记录「{}{}…」。",
+                entity, surface
+            ));
+        }
+        let values: Vec<String> = hits.iter().map(|hit| hit.value.clone()).collect();
+        let mut output = if inverted {
+            format!("根据知识图谱：「{}」的「{}」是：{}。", entity, surface, values.join("、"))
+        } else if values.len() == 1 {
+            format!("根据知识图谱：{}{}{}。", entity, surface, values[0])
+        } else {
+            format!(
+                "根据知识图谱：{}{}的有：{}。",
+                entity,
+                surface,
+                values.join("、")
+            )
+        };
+        if let Some(prediction) = hits.iter().find_map(|hit| hit.prediction.as_ref()) {
+            output.push_str(&format!(
+                "\n其中为符号推断结果（例如置信度 {:.2}）：{}",
+                prediction.confidence,
+                self.predictor.explain(prediction)
+            ));
+        }
+        Some(output)
+    }
+
+    fn answer_check_relation(
+        &self,
+        subject_raw: &str,
+        predicate_raw: &str,
+        object_raw: &str,
+    ) -> Option<String> {
+        let subject = self.aligner.canonical_form(subject_raw.trim());
+        let object = self.aligner.canonical_form(object_raw.trim());
+        let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
+        let surface = predicate_raw.trim().to_string();
+        if subject.is_empty() || object.is_empty() || slot.is_empty() {
+            return None;
+        }
+        if !self.is_known_entity(&subject)
+            || !self.is_known_entity(&object)
+            || !self.is_known_predicate(&surface)
+        {
+            return None;
+        }
+        let (negative_subject, negative_object) = if inverted {
+            (object.as_str(), subject.as_str())
+        } else {
+            (subject.as_str(), object.as_str())
+        };
+        if self.session_negative_blocks(negative_subject, &slot, negative_object) {
+            return Some(format!(
+                "不是。会话中记录了否定事实：{} {} {}。",
+                subject, surface, object
+            ));
+        }
+        let holds = if inverted {
+            self.predictor.has_triple(&object, &slot, &subject)
+        } else {
+            self.predictor.has_triple(&subject, &slot, &object)
+        };
+        if holds {
+            return Some(format!(
+                "是的。根据知识图谱，该关系成立：{} {} {}。",
+                subject, surface, object
+            ));
+        }
+        Some(format!(
+            "不是。根据现有知识图谱，没有记录「{} {} {}」。",
+            subject, surface, object
+        ))
+    }
+
     fn answer_find_subject(&self, object_raw: &str, predicate_raw: &str) -> Option<String> {
         let object = self.aligner.canonical_form(object_raw.trim());
         let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
@@ -6231,6 +6363,13 @@ impl SymbolicReasoner {
             self.record_read_failure(question);
         }
         answer
+    }
+
+    /// 句法重写回执：展示「哪种句法外壳被压成哪个逻辑计划」。
+    /// 只读；未命中或词表校验失败时返回 None。
+    pub fn query_rewrite_receipt(&self, question: &str) -> Option<String> {
+        query_rewrite::rewrite(question, &self.relation_lexicon())
+            .map(|rewrite| rewrite.receipt())
     }
 
     /// 为问句重建有界推导视图（与回答共用同一份事实、规则与归结搜索）。
@@ -13125,6 +13264,64 @@ types = [
             .expect("查询板应支持实体比较");
         assert!(compare.text.contains("王治郅"), "{}", compare.text);
         assert!(compare.text.contains("214"), "{}", compare.text);
+    }
+
+    #[test]
+    fn svo_and_passive_questions_compile_to_shared_relation_plans() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "王五".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "李四".into(),
+                rel_type: "认识".into(),
+                to: "张三".into(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "认识".into(),
+                to: "王五".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let object = reasoner.answer("张三认识谁").expect("正向问宾语");
+        assert!(object.contains("王五"), "{}", object);
+        assert!(!object.contains("李四"), "{}", object);
+
+        let subject = reasoner.answer("谁认识张三").expect("正向问主语");
+        assert!(subject.contains("李四"), "{}", subject);
+
+        let yes = reasoner.answer("张三认识王五吗").expect("是非问");
+        assert!(yes.contains("是的"), "{}", yes);
+        let no = reasoner.answer("张三认识李四吗").expect("是非问");
+        assert!(no.contains("不是"), "{}", no);
+
+        let passive_object = reasoner.answer("谁被张三认识").expect("被字句问受事");
+        assert!(passive_object.contains("王五"), "{}", passive_object);
+        let passive_subject = reasoner.answer("张三被谁认识").expect("被字句问施事");
+        assert!(passive_subject.contains("李四"), "{}", passive_subject);
+        let passive_yes = reasoner.answer("张三被李四认识吗").expect("被字句是非问");
+        assert!(passive_yes.contains("是的"), "{}", passive_yes);
+
+        let receipt = reasoner
+            .query_rewrite_receipt("谁被张三认识")
+            .expect("重写回执");
+        assert!(receipt.contains("passive-wh-patient"), "{}", receipt);
+        assert!(receipt.contains("FindObjectByPredicate"), "{}", receipt);
     }
 
     fn trace_nlp_config() -> NlpConfig {

@@ -687,6 +687,10 @@ pub fn plan_terms(plan: &QueryPlan) -> (Vec<String>, Vec<String>) {
             push_entity(object);
             predicates.push(predicate.clone());
         }
+        QueryPlan::FindObjectByPredicate { subject, predicate } => {
+            push_entity(subject);
+            predicates.push(predicate.clone());
+        }
         QueryPlan::PathBetween { start, goal, .. } => {
             push_entity(start);
             push_entity(goal);
@@ -706,6 +710,15 @@ pub fn plan_terms(plan: &QueryPlan) -> (Vec<String>, Vec<String>) {
                 push_entity(subject);
             }
             predicates.extend(subject_segments.iter().skip(1).cloned());
+        }
+        QueryPlan::CheckRelation {
+            subject,
+            predicate,
+            object,
+        } => {
+            push_entity(subject);
+            push_entity(object);
+            predicates.push(predicate.clone());
         }
         QueryPlan::Count { subject, predicate } | QueryPlan::Exist { subject, predicate } => {
             push_entity(subject);

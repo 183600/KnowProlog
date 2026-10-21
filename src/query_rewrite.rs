@@ -1,0 +1,701 @@
+// 句法驱动的查询重写（Query Rewrite）
+//
+// 目标不是记住句子，而是把同一关系问题的不同句法外壳压到同一个逻辑计划：
+//
+//   张三认识谁          ┐
+//   谁被张三认识        ├→ FindObjectByPredicate { subject: 张三, predicate: 认识 }
+//   谁被张三认识呢      ┘
+//
+//   谁认识张三          ┐
+//   张三被谁认识        ├→ FindSubject { object: 张三, predicate: 认识 }
+//   张三被谁认识过      ┘
+//
+//   张三认识李四吗      ┐
+//   李四被张三认识吗    ├→ CheckRelation { subject: 张三, predicate: 认识, object: 李四 }
+//   张三把李四认识了吗  ┘
+//
+// 解析只做保守的、可解释的结构切分：被/把标记 + wh 位置 + 词表边界搜索。
+// 不依赖固定词性表；每个候选边界都必须同时通过 `RelationLexicon` 的实体/
+// 谓词登记校验，多个候选按「主语最长、谓词最长」稳定排序。校验不通过就
+// 弃权（返回 None），交回现有管线，绝不硬猜。
+// 每次重写都带规则 id 与等价说明，可打印、可审计。
+
+use crate::query_planner::{QueryPlan, QueryPlanner};
+
+/// 关系词表视图：调用方用本体/谓词画像做最终校验。
+pub trait RelationLexicon {
+    /// 归一化实体名；未登记返回 None。
+    fn canonical_entity(&self, raw: &str) -> Option<String>;
+    /// 归一化谓词词面；未登记返回 None。
+    fn canonical_predicate(&self, raw: &str) -> Option<String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationShape {
+    ActiveWhSubject,
+    ActiveWhObject,
+    PassiveWhAgent,
+    PassiveWhPatient,
+    BaWhSubject,
+    BaWhObject,
+    ActiveYesNo,
+    PassiveYesNo,
+    BaYesNo,
+}
+
+impl RelationShape {
+    pub fn label(self) -> &'static str {
+        match self {
+            RelationShape::ActiveWhSubject => "主动句·问主语",
+            RelationShape::ActiveWhObject => "主动句·问宾语",
+            RelationShape::PassiveWhAgent => "被字句·问施事",
+            RelationShape::PassiveWhPatient => "被字句·问受事",
+            RelationShape::BaWhSubject => "把字句·问主语",
+            RelationShape::BaWhObject => "把字句·问受事",
+            RelationShape::ActiveYesNo => "主动句·是非问",
+            RelationShape::PassiveYesNo => "被字句·是非问",
+            RelationShape::BaYesNo => "把字句·是非问",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationRewrite {
+    pub plan: QueryPlan,
+    pub shape: RelationShape,
+    /// 稳定的规则 id，用于回执与回归测试。
+    pub rule: &'static str,
+    /// 原句中的谓词词面（可能带体标记，如「教过」）。
+    pub predicate_surface: String,
+    /// 词表归一后的谓词。
+    pub predicate: String,
+}
+
+impl RelationRewrite {
+    /// 可打印的等价重写回执：规则、词面、逻辑计划。
+    pub fn receipt(&self) -> String {
+        format!(
+            "{}({})（{}）：{} → {}",
+            self.rule,
+            QueryPlanner::kind(&self.plan),
+            self.shape.label(),
+            self.predicate_surface,
+            QueryPlanner::format_plan(&self.plan)
+        )
+    }
+}
+
+const WH_PREFIXES: [&str; 8] = ["什么人", "哪些人", "哪位", "哪个", "谁", "何人", "什么", "啥"];
+const WH_SUFFIXES: [&str; 9] = [
+    "什么人", "哪些人", "哪位", "哪个", "谁", "何人", "什么", "啥", "哪些",
+];
+const POLITE_PREFIXES: [&str; 11] = [
+    "请问一下",
+    "请问",
+    "请告诉我一下",
+    "请告诉我",
+    "我想知道",
+    "我想问一下",
+    "帮我查一下",
+    "帮我查查",
+    "麻烦问一下",
+    "麻烦你",
+    "告诉我",
+];
+const ENTITY_PREFIXES: [&str; 8] = ["的", "了", "着", "过", "于", "给", "向", "往"];
+const ENTITY_SUFFIXES: [&str; 8] = ["的", "了", "着", "过", "吗", "呢", "吧", "啊"];
+const PREDICATE_PREFIXES: [&str; 12] = [
+    "曾经", "已经", "一直", "正在", "也", "都", "还", "就", "将", "会", "能", "可以",
+];
+const PREDICATE_SUFFIXES: [&str; 6] = ["起来", "下去", "了", "过", "着", "吗"];
+
+fn clean_question(question: &str) -> Option<String> {
+    let mut text = question.trim().to_string();
+    for prefix in POLITE_PREFIXES {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim().to_string();
+            break;
+        }
+    }
+    let text = text
+        .trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '？' | '?' | '。' | '！' | '!' | '，' | ',' | '；' | ';' | '~' | ' '
+            )
+        })
+        .trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn strip_yes_no(text: &str) -> (String, bool) {
+    let trimmed = text.trim_end();
+    for suffix in ["吗", "嘛"] {
+        if let Some(rest) = trimmed.strip_suffix(suffix) {
+            return (rest.trim_end().to_string(), true);
+        }
+    }
+    if let Some(rest) = trimmed.strip_suffix('么') {
+        // 「什么/怎么/那么/这么/多么/为什么」里的「么」不是是非问语气词。
+        let blocked = ["什", "怎", "那", "这", "多", "为"];
+        if !blocked.iter().any(|prefix| rest.ends_with(prefix)) {
+            return (rest.trim_end().to_string(), true);
+        }
+    }
+    (trimmed.to_string(), false)
+}
+
+fn strip_trailing_particles(text: &str) -> String {
+    text.trim_end_matches(['呢', '吧', '啊', '呀', ' '])
+        .trim()
+        .to_string()
+}
+
+fn is_wh(text: &str) -> bool {
+    WH_SUFFIXES.iter().any(|word| text.contains(word))
+}
+
+fn strip_entity_affixes(mut text: &str) -> &str {
+    loop {
+        if let Some(rest) = ENTITY_PREFIXES
+            .iter()
+            .find_map(|prefix| text.strip_prefix(prefix))
+        {
+            text = rest;
+            continue;
+        }
+        if let Some(rest) = ENTITY_SUFFIXES
+            .iter()
+            .find_map(|suffix| text.strip_suffix(suffix))
+        {
+            text = rest;
+            continue;
+        }
+        break;
+    }
+    text
+}
+
+fn entity(
+    raw: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || is_wh(raw) {
+        return None;
+    }
+    if let Some(canonical) = lexicon.canonical_entity(raw) {
+        return Some(canonical);
+    }
+    let stripped = strip_entity_affixes(raw);
+    if stripped != raw && !stripped.is_empty() && !is_wh(stripped) {
+        return lexicon.canonical_entity(stripped);
+    }
+    None
+}
+
+fn predicate(
+    raw: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<(String, String)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    let mut current = raw.to_string();
+    candidates.push(current.clone());
+    for prefix in PREDICATE_PREFIXES {
+        if let Some(rest) = current.strip_prefix(prefix) {
+            current = rest.trim().to_string();
+            candidates.push(current.clone());
+        }
+    }
+    let mut trimmed = current.clone();
+    loop {
+        let mut changed = false;
+        for suffix in PREDICATE_SUFFIXES {
+            if let Some(rest) = trimmed.strip_suffix(suffix) {
+                if !rest.is_empty() {
+                    trimmed = rest.to_string();
+                    candidates.push(trimmed.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for candidate in candidates {
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Some(canonical) = lexicon.canonical_predicate(&candidate) {
+            return Some((candidate, canonical));
+        }
+    }
+    None
+}
+
+fn wh_prefix(text: &str) -> Option<usize> {
+    WH_PREFIXES
+        .iter()
+        .find(|word| text.starts_with(*word))
+        .map(|word| word.len())
+}
+
+fn wh_suffix(text: &str) -> Option<usize> {
+    WH_SUFFIXES
+        .iter()
+        .find(|word| text.ends_with(*word))
+        .map(|word| text.len() - word.len())
+}
+
+/// 把「谓词 + 宾语」切成两段：谓词在左、宾语在右。
+/// 谓词按长度从长到短尝试，优先保留完整词形（如「毕业于」）。
+fn split_predicate_object<'a>(
+    text: &'a str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<(String, String, String)> {
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
+    for (index, _) in text.char_indices().skip(1) {
+        let left = &text[..index];
+        let right = &text[index..];
+        let Some((surface, predicate)) = predicate(left, lexicon) else {
+            continue;
+        };
+        let Some(object) = entity(right, lexicon) else {
+            continue;
+        };
+        candidates.push((surface, predicate, object));
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .chars()
+            .count()
+            .cmp(&left.0.chars().count())
+            .then(left.1.cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    candidates.into_iter().next()
+}
+
+/// 把「实体 + 谓词」切成两段：实体在左、谓词在右。
+fn split_entity_predicate<'a>(
+    text: &'a str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<(String, String, String)> {
+    let mut candidates: Vec<(String, String, String)> = Vec::new();
+    for (index, _) in text.char_indices().skip(1) {
+        let left = &text[..index];
+        let right = &text[index..];
+        let Some(entity) = entity(left, lexicon) else {
+            continue;
+        };
+        let Some((surface, predicate)) = predicate(right, lexicon) else {
+            continue;
+        };
+        candidates.push((entity, surface, predicate));
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .chars()
+            .count()
+            .cmp(&left.0.chars().count())
+            .then(right.1.chars().count().cmp(&left.1.chars().count()))
+    });
+    candidates.into_iter().next()
+}
+
+/// 把「主语 + 谓词 + 宾语」切成三段（是非问）。
+fn split_svo<'a>(
+    text: &'a str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<(String, String, String, String)> {
+    let mut candidates: Vec<(String, String, String, String)> = Vec::new();
+    let boundaries: Vec<usize> = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    for &subject_end in boundaries.iter().skip(1) {
+        let Some(subject) = entity(&text[..subject_end], lexicon) else {
+            continue;
+        };
+        for &object_start in boundaries.iter().filter(|&&index| index > subject_end) {
+            let predicate_text = &text[subject_end..object_start];
+            let Some((surface, predicate)) = predicate(predicate_text, lexicon) else {
+                continue;
+            };
+            let Some(object) = entity(&text[object_start..], lexicon) else {
+                continue;
+            };
+            candidates.push((subject.clone(), surface, predicate, object));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .chars()
+            .count()
+            .cmp(&left.0.chars().count())
+            .then(right.1.chars().count().cmp(&left.1.chars().count()))
+            .then(right.3.chars().count().cmp(&left.3.chars().count()))
+    });
+    candidates.into_iter().next()
+}
+
+fn marker_position(text: &str, markers: &[&str]) -> Option<(usize, usize)> {
+    for marker in markers {
+        if let Some(position) = text.find(marker) {
+            return Some((position, marker.len()));
+        }
+    }
+    None
+}
+
+fn build(
+    plan: QueryPlan,
+    shape: RelationShape,
+    rule: &'static str,
+    predicate_surface: String,
+    predicate: String,
+) -> RelationRewrite {
+    RelationRewrite {
+        plan,
+        shape,
+        rule,
+        predicate_surface,
+        predicate,
+    }
+}
+
+pub fn rewrite(
+    question: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<RelationRewrite> {
+    let text = clean_question(question)?;
+    let text = strip_trailing_particles(&text);
+    let (text, yes_no) = strip_yes_no(&text);
+    if text.chars().count() < 2 {
+        return None;
+    }
+
+    if let Some((position, length)) = marker_position(&text, &["被"]) {
+        let patient_text = text[..position].trim();
+        let right = text[position + length..].trim();
+        if patient_text.is_empty() || right.is_empty() {
+            return None;
+        }
+        if is_wh(patient_text) {
+            let (agent, surface, predicate) = split_entity_predicate(right, lexicon)?;
+            return Some(build(
+                QueryPlan::FindObjectByPredicate {
+                    subject: agent,
+                    predicate: predicate.clone(),
+                },
+                RelationShape::PassiveWhPatient,
+                "passive-wh-patient",
+                surface,
+                predicate,
+            ));
+        }
+        let patient = entity(patient_text, lexicon)?;
+        if let Some(rest) = right.strip_prefix_wh() {
+            let (surface, predicate) = predicate(rest, lexicon)?;
+            return Some(build(
+                QueryPlan::FindSubject {
+                    object: patient,
+                    predicate: predicate.clone(),
+                },
+                RelationShape::PassiveWhAgent,
+                "passive-wh-agent",
+                surface,
+                predicate,
+            ));
+        }
+        if !yes_no {
+            return None;
+        }
+        let (agent, surface, predicate) = split_entity_predicate(right, lexicon)?;
+        return Some(build(
+            QueryPlan::CheckRelation {
+                subject: agent,
+                predicate: predicate.clone(),
+                object: patient,
+            },
+            RelationShape::PassiveYesNo,
+            "passive-yes-no",
+            surface,
+            predicate,
+        ));
+    }
+
+    if let Some((position, length)) = marker_position(&text, &["把", "将"]) {
+        let subject_text = text[..position].trim();
+        let right = text[position + length..].trim();
+        if subject_text.is_empty() || right.is_empty() {
+            return None;
+        }
+        if is_wh(subject_text) {
+            let (patient, surface, predicate) = split_entity_predicate(right, lexicon)?;
+            return Some(build(
+                QueryPlan::FindSubject {
+                    object: patient,
+                    predicate: predicate.clone(),
+                },
+                RelationShape::BaWhSubject,
+                "ba-wh-subject",
+                surface,
+                predicate,
+            ));
+        }
+        let subject = entity(subject_text, lexicon)?;
+        if let Some(rest) = right.strip_prefix_wh() {
+            let (surface, predicate) = predicate(rest, lexicon)?;
+            return Some(build(
+                QueryPlan::FindObjectByPredicate {
+                    subject,
+                    predicate: predicate.clone(),
+                },
+                RelationShape::BaWhObject,
+                "ba-wh-object",
+                surface,
+                predicate,
+            ));
+        }
+        if !yes_no {
+            return None;
+        }
+        let (patient, surface, predicate) = split_entity_predicate(right, lexicon)?;
+        return Some(build(
+            QueryPlan::CheckRelation {
+                subject,
+                predicate: predicate.clone(),
+                object: patient,
+            },
+            RelationShape::BaYesNo,
+            "ba-yes-no",
+            surface,
+            predicate,
+        ));
+    }
+
+    if let Some(prefix) = wh_prefix(&text) {
+        let rest = &text[prefix..];
+        let (surface, predicate, object) = split_predicate_object(rest, lexicon)?;
+        return Some(build(
+            QueryPlan::FindSubject {
+                object,
+                predicate: predicate.clone(),
+            },
+            RelationShape::ActiveWhSubject,
+            "active-wh-subject",
+            surface,
+            predicate,
+        ));
+    }
+
+    if let Some(suffix) = wh_suffix(&text) {
+        let rest = &text[..suffix];
+        let Some((subject, surface, predicate)) = split_entity_predicate(rest, lexicon) else {
+            return None;
+        };
+        return Some(build(
+            QueryPlan::FindObjectByPredicate {
+                subject,
+                predicate: predicate.clone(),
+            },
+            RelationShape::ActiveWhObject,
+            "active-wh-object",
+            surface,
+            predicate,
+        ));
+    }
+
+    if !yes_no {
+        return None;
+    }
+    let (subject, surface, predicate, object) = split_svo(&text, lexicon)?;
+    Some(build(
+        QueryPlan::CheckRelation {
+            subject,
+            predicate: predicate.clone(),
+            object,
+        },
+        RelationShape::ActiveYesNo,
+        "active-yes-no",
+        surface,
+        predicate,
+    ))
+}
+
+trait StripWhPrefix {
+    fn strip_prefix_wh(&self) -> Option<&str>;
+}
+
+impl StripWhPrefix for str {
+    fn strip_prefix_wh(&self) -> Option<&str> {
+        WH_PREFIXES
+            .iter()
+            .find_map(|word| self.strip_prefix(*word))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeLexicon;
+
+    impl RelationLexicon for FakeLexicon {
+        fn canonical_entity(&self, raw: &str) -> Option<String> {
+            match raw {
+                "张三" | "李四" | "王五" | "赵六" => Some(raw.to_string()),
+                _ => None,
+            }
+        }
+
+        fn canonical_predicate(&self, raw: &str) -> Option<String> {
+            match raw {
+                "认识" | "教" | "教过" => Some(if raw == "教过" {
+                    "教".to_string()
+                } else {
+                    raw.to_string()
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    fn parse(question: &str) -> Option<RelationRewrite> {
+        rewrite(question, &FakeLexicon)
+    }
+
+    #[test]
+    fn active_wh_object() {
+        let rewrite = parse("张三认识谁").expect("主动问宾语应可重写");
+        assert_eq!(rewrite.rule, "active-wh-object");
+        assert_eq!(rewrite.predicate, "认识");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "认识".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn active_wh_subject() {
+        let rewrite = parse("谁教过张三").expect("主动问主语应可重写");
+        assert_eq!(rewrite.rule, "active-wh-subject");
+        assert_eq!(rewrite.predicate_surface, "教过");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn passive_both_directions() {
+        let patient = parse("谁被张三教过").expect("被字句问受事");
+        assert_eq!(patient.rule, "passive-wh-patient");
+        assert_eq!(
+            patient.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+
+        let agent = parse("张三被谁教过").expect("被字句问施事");
+        assert_eq!(agent.rule, "passive-wh-agent");
+        assert_eq!(
+            agent.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn ba_both_directions() {
+        let object = parse("张三把谁教过").expect("把字句问受事");
+        assert_eq!(object.rule, "ba-wh-object");
+        assert_eq!(
+            object.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+
+        let subject = parse("谁把张三教过").expect("把字句问主语");
+        assert_eq!(subject.rule, "ba-wh-subject");
+        assert_eq!(
+            subject.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn yes_no_forms_share_one_plan() {
+        let expected = QueryPlan::CheckRelation {
+            subject: "张三".to_string(),
+            predicate: "教".to_string(),
+            object: "李四".to_string(),
+        };
+        assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
+        assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
+        assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn polite_prefix_and_punctuation_are_ignored() {
+        let rewrite = parse("请问谁认识张三？").expect("礼貌前缀应被剥离");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "认识".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_terms_are_not_guessed() {
+        assert!(parse("张三认识未名").is_none());
+        assert!(parse("张三折腾谁").is_none());
+    }
+
+    #[test]
+    fn non_relation_questions_abstain() {
+        assert!(parse("什么是知识图谱").is_none());
+        assert!(parse("今天天气怎么样").is_none());
+        assert!(parse("张三认识李四").is_none());
+    }
+
+    #[test]
+    fn receipt_is_human_readable() {
+        let rewrite = parse("谁被张三教过").unwrap();
+        let receipt = rewrite.receipt();
+        assert!(receipt.contains("passive-wh-patient"), "{}", receipt);
+        assert!(receipt.contains("张三"), "{}", receipt);
+        assert!(receipt.contains("教"), "{}", receipt);
+    }
+}

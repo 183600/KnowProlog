@@ -27,6 +27,11 @@ pub enum QueryPlan {
         object: String,
         predicate: String,
     },
+    // 正向关系查找：张三 认识 谁 / 谁被张三认识
+    FindObjectByPredicate {
+        subject: String,
+        predicate: String,
+    },
     // 两点之间的路径：张三和王五之间是什么关系
     PathBetween {
         start: String,
@@ -47,6 +52,12 @@ pub enum QueryPlan {
     // 三值校验：主语链最后一个词是谓词，如 [张三, 师傅] + object=李四
     CheckTriple {
         subject_segments: Vec<String>,
+        object: String,
+    },
+    // 直接关系校验：张三 认识 李四 吗
+    CheckRelation {
+        subject: String,
+        predicate: String,
         object: String,
     },
     // 计数：李四 有几个 师傅
@@ -162,10 +173,12 @@ impl QueryPlanner {
         match plan {
             QueryPlan::FindObject { .. } => "FindObject",
             QueryPlan::FindSubject { .. } => "FindSubject",
+            QueryPlan::FindObjectByPredicate { .. } => "FindObjectByPredicate",
             QueryPlan::PathBetween { .. } => "PathBetween",
             QueryPlan::CommonNeighbor { .. } => "CommonNeighbor",
             QueryPlan::Intermediary { .. } => "Intermediary",
             QueryPlan::CheckTriple { .. } => "CheckTriple",
+            QueryPlan::CheckRelation { .. } => "CheckRelation",
             QueryPlan::Count { .. } => "Count",
             QueryPlan::Exist { .. } => "Exist",
             QueryPlan::Closure { .. } => "Closure",
@@ -181,6 +194,9 @@ impl QueryPlanner {
             }
             QueryPlan::FindSubject { object, predicate } => {
                 format!("反查主体：谁的 {} 是 {}", predicate, object)
+            }
+            QueryPlan::FindObjectByPredicate { subject, predicate } => {
+                format!("关系查找：{} {} 的对象", subject, predicate)
             }
             QueryPlan::PathBetween {
                 start,
@@ -204,6 +220,11 @@ impl QueryPlanner {
                 subject_segments.last().cloned().unwrap_or_default(),
                 object
             ),
+            QueryPlan::CheckRelation {
+                subject,
+                predicate,
+                object,
+            } => format!("校验关系：{} {} {}", subject, predicate, object),
             QueryPlan::Count { subject, predicate } => {
                 format!("计数：{} 的 {} 个数", subject, predicate)
             }

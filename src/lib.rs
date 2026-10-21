@@ -80,6 +80,7 @@ pub mod proof_journal;
 pub mod quality;
 pub mod query_board;
 pub mod query_planner;
+pub mod query_rewrite;
 pub mod query_scenario;
 pub mod question_analyzer;
 pub mod recovery;
