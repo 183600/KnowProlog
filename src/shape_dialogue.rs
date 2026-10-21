@@ -1346,10 +1346,8 @@ fn conflict_ruling_value(input: &str) -> Option<String> {
     } else if let Some(rest) = text.strip_prefix("不是") {
         let position = rest.find('是')?;
         &rest[position + '是'.len_utf8()..]
-    } else if let Some(rest) = text.strip_prefix("采用") {
-        rest
     } else {
-        return None;
+        text.strip_prefix("采用")?
     };
     let value = value
         .trim()
@@ -1377,7 +1375,11 @@ pub fn parse_ruling(input: &str) -> Option<(String, String, String)> {
             if position == 0 {
                 continue;
             }
-            if split.map_or(true, |(best, _)| position < best) {
+            let better = match split {
+                Some((best, _)) => position < best,
+                None => true,
+            };
+            if better {
                 split = Some((position, separator));
             }
         }
