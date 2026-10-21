@@ -361,6 +361,22 @@ impl RevisionConflict {
 // 影响报告
 // ---------------------------------------------------------------------------
 
+/// 影响条目的全量计数（回执裁剪向量时仍保留真实总数）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImpactCounts {
+    pub direct_added: usize,
+    pub direct_removed: usize,
+    pub derived_added: usize,
+    pub derived_retracted: usize,
+    pub newly_believed: usize,
+    pub no_longer_believed: usize,
+    pub predicted_derived_added: usize,
+    pub predicted_derived_retracted: usize,
+    pub unpredicted_added: usize,
+    pub unpredicted_retracted: usize,
+    pub affected_predicates: usize,
+}
+
 /// 一次修订的影响。`predicted_*` 来自理由图，`*_added/retracted` 是完整前向
 /// 重算的事实；`unpredicted_*` 非空时说明理由图没覆盖住，必须标记回退。
 #[derive(Debug, Clone, Default)]
@@ -381,20 +397,22 @@ pub struct ImpactReport {
     pub fallback_full_recompute: bool,
     pub complete: bool,
     pub note: Option<String>,
+    /// 全量计数；回执裁剪向量后仍可据此报告真实影响规模。
+    pub counts: ImpactCounts,
     /// 回执裁剪时省略的条数（计划中的报告不裁剪）。
     pub omitted_items: usize,
 }
 
 impl ImpactReport {
     pub fn is_empty(&self) -> bool {
-        self.direct_added.is_empty()
-            && self.direct_removed.is_empty()
-            && self.derived_added.is_empty()
-            && self.derived_retracted.is_empty()
+        self.counts.direct_added == 0
+            && self.counts.direct_removed == 0
+            && self.counts.derived_added == 0
+            && self.counts.derived_retracted == 0
     }
 
     pub fn changed_atom_count(&self) -> usize {
-        self.newly_believed.len() + self.no_longer_believed.len()
+        self.counts.newly_believed + self.counts.no_longer_believed
     }
 
     fn clipped(mut self, max: usize) -> Self {
@@ -424,38 +442,48 @@ impl ImpactReport {
     pub fn render_zh(&self) -> String {
         let mut lines = vec![format!(
             "影响：直接 +{} / -{}；派生 +{} / -{}；净相信 +{} / -{}",
-            self.direct_added.len(),
-            self.direct_removed.len(),
-            self.derived_added.len(),
-            self.derived_retracted.len(),
-            self.newly_believed.len(),
-            self.no_longer_believed.len()
+            self.counts.direct_added,
+            self.counts.direct_removed,
+            self.counts.derived_added,
+            self.counts.derived_retracted,
+            self.counts.newly_believed,
+            self.counts.no_longer_believed
         )];
-        let push_items = |title: &str, items: &[String], lines: &mut Vec<String>| {
-            if items.is_empty() {
-                return;
-            }
-            lines.push(format!("{}（{}）：", title, items.len()));
-            for item in items.iter().take(MAX_RENDER_ITEMS) {
-                lines.push(format!("  · {}", item));
-            }
-            if items.len() > MAX_RENDER_ITEMS {
-                lines.push(format!("  …另有 {} 条", items.len() - MAX_RENDER_ITEMS));
-            }
-        };
-        push_items("新增相信", &self.newly_believed, &mut lines);
-        push_items("不再相信", &self.no_longer_believed, &mut lines);
+        let push_items =
+            |title: &str, items: &[String], total: usize, lines: &mut Vec<String>| {
+                if total == 0 {
+                    return;
+                }
+                lines.push(format!("{}（{}）：", title, total));
+                for item in items.iter().take(MAX_RENDER_ITEMS) {
+                    lines.push(format!("  · {}", item));
+                }
+                if total > MAX_RENDER_ITEMS {
+                    lines.push(format!("  …另有 {} 条", total - MAX_RENDER_ITEMS));
+                }
+            };
+        push_items(
+            "新增相信",
+            &self.newly_believed,
+            self.counts.newly_believed,
+            &mut lines,
+        );
+        push_items(
+            "不再相信",
+            &self.no_longer_believed,
+            self.counts.no_longer_believed,
+            &mut lines,
+        );
         if !self.affected_predicates.is_empty() {
             lines.push(format!(
                 "受影响谓词：{}",
                 self.affected_predicates.join("、")
             ));
         }
-        if !self.unpredicted_added.is_empty() || !self.unpredicted_retracted.is_empty() {
+        if self.counts.unpredicted_added > 0 || self.counts.unpredicted_retracted > 0 {
             lines.push(format!(
                 "理由图未覆盖：新增 {} 条、撤回 {} 条（已回退完整重算）",
-                self.unpredicted_added.len(),
-                self.unpredicted_retracted.len()
+                self.counts.unpredicted_added, self.counts.unpredicted_retracted
             ));
         }
         lines.push(if self.fallback_full_recompute {
@@ -1728,6 +1756,21 @@ fn build_impact(
         None
     };
 
+    let affected_predicates: Vec<String> = affected.into_iter().collect();
+    let counts = ImpactCounts {
+        direct_added: direct_added.len(),
+        direct_removed: direct_removed.len(),
+        derived_added: derived_added.len(),
+        derived_retracted: derived_retracted.len(),
+        newly_believed: newly_believed.len(),
+        no_longer_believed: no_longer_believed.len(),
+        predicted_derived_added: predicted_added.len(),
+        predicted_derived_retracted: predicted_retracted.len(),
+        unpredicted_added: unpredicted_added.len(),
+        unpredicted_retracted: unpredicted_retracted.len(),
+        affected_predicates: affected_predicates.len(),
+    };
+
     ImpactReport {
         direct_added,
         direct_removed,
@@ -1739,10 +1782,11 @@ fn build_impact(
         predicted_derived_retracted: predicted_retracted,
         unpredicted_added,
         unpredicted_retracted,
-        affected_predicates: affected.into_iter().collect(),
+        affected_predicates,
         fallback_full_recompute: fallback,
         complete: !fallback,
         note,
+        counts,
         omitted_items: 0,
     }
 }
@@ -2122,6 +2166,24 @@ mod tests {
         let book = LawBook::from_registry(&registry);
         let from_book = RevisionConstraints::from_law_book(&book);
         assert!(from_book.functional.contains("mentor"));
+    }
+
+    #[test]
+    fn clipped_receipt_keeps_full_impact_counts() {
+        let mut state = BeliefState::new(ResolutionEngine::new(8, 16));
+        let mut changeset = ChangeSet::new("批量新增");
+        for index in 0..100 {
+            changeset.push(ChangeOp::AssertFact(Atom::rel(
+                "p",
+                "a",
+                &format!("v{}", index),
+            )));
+        }
+        let receipt = state.apply(changeset).expect("commit");
+        assert_eq!(receipt.impact.counts.direct_added, 100);
+        assert_eq!(receipt.impact.counts.newly_believed, 100);
+        assert!(receipt.impact.direct_added.len() <= MAX_RECEIPT_ITEMS);
+        assert_eq!(receipt.changed_beliefs(), 100);
     }
 
     #[test]
