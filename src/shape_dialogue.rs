@@ -581,15 +581,22 @@ impl ShapeGap {
 pub struct ShapeAgenda {
     #[serde(default)]
     pub gaps: Vec<ShapeGap>,
+    #[serde(default)]
+    pub blocked: BTreeSet<String>,
 }
 
 impl ShapeAgenda {
     pub fn compile(report: &ShapeReport, registry: &PredicateRegistry) -> Self {
         let mut gaps = Vec::new();
+        let mut blocked = BTreeSet::new();
         for violation in &report.violations {
             let Some(gap) = compile_gap(violation, registry) else {
+                blocked.insert(violation.focus_node.clone());
                 continue;
             };
+            if gap.kind == GapKind::Conflict {
+                blocked.insert(gap.entity.clone());
+            }
             gaps.push(gap);
         }
         gaps.sort_by(|left, right| {
@@ -607,7 +614,7 @@ impl ShapeAgenda {
                 && left.kind == right.kind
         });
         gaps.truncate(MAX_AGENDA_GAPS);
-        Self { gaps }
+        Self { gaps, blocked }
     }
 
     pub fn len(&self) -> usize {
@@ -619,6 +626,9 @@ impl ShapeAgenda {
     }
 
     pub fn next_for(&self, entity: &str, attempts: &BTreeMap<String, usize>) -> Option<&ShapeGap> {
+        if self.blocked.contains(entity) {
+            return None;
+        }
         self.gaps.iter().find(|gap| {
             gap.is_askable()
                 && gap.entity == entity
@@ -628,7 +638,9 @@ impl ShapeAgenda {
 
     pub fn next_global(&self, attempts: &BTreeMap<String, usize>) -> Option<&ShapeGap> {
         self.gaps.iter().find(|gap| {
-            gap.is_askable() && attempts.get(&gap.id).copied().unwrap_or(0) < MAX_ASK_ATTEMPTS
+            gap.is_askable()
+                && !self.blocked.contains(&gap.entity)
+                && attempts.get(&gap.id).copied().unwrap_or(0) < MAX_ASK_ATTEMPTS
         })
     }
 
@@ -647,6 +659,12 @@ impl ShapeAgenda {
         }
         for gap in &self.gaps {
             lines.push(gap.render_text());
+        }
+        if !self.blocked.is_empty() {
+            lines.push(format!(
+                "  待处理实体：{}（存在冲突或类型问题，先披露、不继续追问）。",
+                self.blocked.iter().cloned().collect::<Vec<_>>().join("、")
+            ));
         }
         lines.join("\n")
     }
@@ -1485,6 +1503,8 @@ mod tests {
         );
         assert_eq!(turn.answer.status, AnswerStatus::Conflict);
         assert!(!turn.answer.issues.is_empty());
+        assert!(dialogue.agenda().blocked.contains("刘德华"));
+        assert!(dialogue.agenda().next_global(&BTreeMap::new()).is_none());
         assert!(turn.message.contains("类型问题"));
         assert!(turn.message.contains("不会把不合形状的取值当作确定事实"));
         assert!(
@@ -1640,6 +1660,7 @@ mod tests {
             .gaps
             .iter()
             .any(|gap| gap.entity == "刘德华" && gap.kind == GapKind::Conflict));
+        assert!(agenda.blocked.contains("刘德华"));
 
         let mut attempts = BTreeMap::new();
         assert_eq!(
