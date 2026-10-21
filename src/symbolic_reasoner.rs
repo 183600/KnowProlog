@@ -1845,12 +1845,18 @@ impl SymbolicReasoner {
 
     /// 登记实体别名（来自实体身份注册表已确认的持久别名）：链接器按别名识别，
     /// 与 KB 里的规范名同权；歧义词面如实保留多候选，不静默择一。
+    ///
+    /// 已确认别名同时进对齐器：问答路径按规范名归一实体（「确认身份」签过字
+    /// 的说法要能直接答出来），链接器仍负责候选枚举与接地引用，两处同源。
     pub fn register_entity_alias(&mut self, alias: &str, canonical: &str) -> bool {
         let (alias, canonical) = (alias.trim(), canonical.trim());
         if alias.is_empty() || canonical.is_empty() || alias == canonical {
             return false;
         }
         self.linker.register_alias(alias, canonical);
+        self.aligner.register_term(canonical, TermKind::Entity);
+        self.aligner.register_term(alias, TermKind::Entity);
+        self.aligner.register_synonym(alias, canonical);
         self.link_memo.lock().clear();
         true
     }
@@ -1890,6 +1896,38 @@ impl SymbolicReasoner {
         }
         sync.lessons = self.configure_ontology_program(&runtime.ontology_program());
         sync
+    }
+
+    /// 谓词对齐批量注入（交互与服务共用同一入口）：三元组
+    /// `(词面, 规范槽位, 是否换向)`；正向走别名归一，换向只登记查询转置。
+    /// 返回本次真正生效的条数（重复/退化条目不计）。
+    pub fn align_predicate_pairs(&mut self, pairs: &[(String, String, bool)]) -> usize {
+        let mut applied = 0usize;
+        for (surface, slot, inverted) in pairs {
+            if surface == slot {
+                continue;
+            }
+            let registered = if *inverted {
+                self.register_predicate_query_surface(surface, slot)
+            } else {
+                self.register_predicate_alias(surface, slot)
+            };
+            if registered {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// 实体身份别名批量注入（已确认的持久别名与规范名同权），返回生效条数。
+    pub fn align_entity_aliases(&mut self, aliases: &[(String, String)]) -> usize {
+        let mut applied = 0usize;
+        for (surface, canonical) in aliases {
+            if self.register_entity_alias(surface, canonical) {
+                applied += 1;
+            }
+        }
+        applied
     }
 
     /// 配置律典：把谓词画像中的显式声明编译为 Active 律，并吸收当前挖掘规则。
@@ -10791,6 +10829,59 @@ types = [
             reasoner.answer("谁的身高是999").is_none(),
             "没有该取值时不应编造主体"
         );
+    }
+
+    /// 批量对齐入口（交互与服务共用）：别名/换向词面即时参与回答，
+    /// 实体持久别名与规范名同权进入链接；退化与重复条目不计入生效数。
+    #[test]
+    fn test_batch_alignment_entry_points() {
+        let facts = vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([("身高".to_string(), "226".to_string())]),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let applied = reasoner.align_predicate_pairs(&[
+            ("老师".to_string(), "师傅".to_string(), false),
+            ("徒弟".to_string(), "师傅".to_string(), true),
+            ("老师".to_string(), "老师".to_string(), false),
+            ("  ".to_string(), "师傅".to_string(), false),
+        ]);
+        assert_eq!(applied, 2, "自指与空词面不计生效");
+
+        let forward = reasoner
+            .answer("张三的老师是谁")
+            .expect("正向别名应命中师傅事实");
+        assert!(forward.contains("李四"), "{}", forward);
+
+        let inverse = reasoner
+            .answer("李四的徒弟是谁")
+            .expect("换向词面应按反方向检索");
+        assert!(inverse.contains("张三"), "{}", inverse);
+
+        let entities = reasoner.align_entity_aliases(&[
+            ("明哥".to_string(), "姚明".to_string()),
+            ("明哥".to_string(), "明哥".to_string()),
+        ]);
+        assert_eq!(entities, 1, "自指别名不计生效");
+        assert_eq!(
+            reasoner.best_linked_entity("明哥").as_deref(),
+            Some("姚明"),
+            "持久别名应与规范名同权参与链接"
+        );
+        let alias_answer = reasoner
+            .answer("明哥的身高是多少")
+            .expect("已确认的实体别名应能直接作答");
+        assert!(alias_answer.contains("226"), "{}", alias_answer);
     }
 
     #[test]

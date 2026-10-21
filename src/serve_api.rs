@@ -1066,6 +1066,30 @@ impl ApiState {
         }
     }
 
+    /// 宿主注入谓词对齐（与交互启动同一注册入口）：画像别名/换向词面生效后，
+    /// 谓词画像律典一并接入选路。必须在建会话前调用；返回生效的对齐条数。
+    pub fn align_predicate_pairs(
+        &self,
+        pairs: &[(String, String, bool)],
+        laws: &crate::predicate_registry::PredicateRegistry,
+    ) -> usize {
+        let mut reasoner = self.warm.reasoner.lock();
+        let applied = reasoner.align_predicate_pairs(pairs);
+        reasoner.configure_laws(laws);
+        applied
+    }
+
+    /// 宿主注入实体身份注册表里已确认的持久别名（别名与规范名同权），
+    /// 使 CLI 里签过字的指称在 HTTP 会话同样可解。返回生效条数。
+    pub fn align_entity_aliases(&self, aliases: &[(String, String)]) -> usize {
+        self.warm.reasoner.lock().align_entity_aliases(aliases)
+    }
+
+    /// 宿主注入律典（跨重启的采纳/退役决定），返回载入的显式决定条数。
+    pub fn load_law_book(&self, laws: crate::law_book::LawBook) -> usize {
+        self.warm.reasoner.lock().load_persisted_laws(laws)
+    }
+
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
     pub fn cache_epoch(&self) -> CacheEpoch {
         CacheEpoch {
@@ -2870,6 +2894,74 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(
             state.quality_index().map(|index| index.revision),
             Some(state.warm_revision())
+        );
+    }
+
+    /// 注册表对齐（谓词别名/换向词面 + 实体持久别名）必须进暖基座：
+    /// CLI 里签过字的说法，走 HTTP 发问同样要能命中同一份知识。
+    #[tokio::test]
+    async fn registry_alignment_reaches_http_sessions() {
+        let mut yao = HashMap::new();
+        yao.insert("身高".to_string(), "226".to_string());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "人物".to_string(),
+                properties: yao,
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+        ];
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: false,
+            ..ReasoningConfig::default()
+        };
+        let mut state = ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        );
+        let applied = state.align_predicate_pairs(
+            &[
+                ("老师".to_string(), "师傅".to_string(), false),
+                ("徒弟".to_string(), "师傅".to_string(), true),
+            ],
+            &crate::predicate_registry::PredicateRegistry::default(),
+        );
+        assert_eq!(applied, 2, "正向别名与换向词面都应生效");
+        let entities = state.align_entity_aliases(&[("明哥".to_string(), "姚明".to_string())]);
+        assert_eq!(entities, 1, "实体持久别名应生效");
+        let state = Arc::new(state);
+
+        let session_id = state.create_session().await.expect("会话应创建成功");
+        let forward = state
+            .take_turn(&session_id, "张三的老师是谁")
+            .await
+            .expect("正向别名轮次应成功");
+        assert!(forward.reply.contains("李四"), "{}", forward.reply);
+
+        let inverse = state
+            .take_turn(&session_id, "李四的徒弟是谁")
+            .await
+            .expect("换向词面轮次应成功");
+        assert!(inverse.reply.contains("张三"), "{}", inverse.reply);
+
+        let alias = state
+            .take_turn(&session_id, "明哥的身高是多少")
+            .await
+            .expect("实体别名轮次应成功");
+        assert!(
+            alias.reply.contains("226"),
+            "{:?} / {:?} / {}",
+            alias.source,
+            alias.plan,
+            alias.reply
         );
     }
 

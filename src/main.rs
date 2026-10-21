@@ -1596,6 +1596,12 @@ async fn main() {
                 &config.predicate_profiles,
                 config.reasoning.require_predicate_admission,
             );
+            // 实体身份注册表：CLI 里签过字的持久别名同样要对齐进服务暖基座，
+            // 否则同一个指称在命令行能解、走 HTTP 却查无此人。
+            let entity_registry_path = format!("{}/entity_registry.json", store_path);
+            if oxigraph_manager.load_entity_registry(&entity_registry_path) {
+                println!("已恢复实体身份注册表（服务会话同源携带）。");
+            }
             oxigraph_manager.configure_entities(&config.entity_profiles);
             oxigraph_manager.configure_type_system(&config.type_system);
             let registry = oxigraph_manager.predicate_registry_snapshot();
@@ -1635,6 +1641,25 @@ async fn main() {
             ));
             if api_config_lessons > 0 {
                 println!("服务已注入配置本体公理：{} 条。", api_config_lessons);
+            }
+            // 知识对齐：谓词别名/换向词面 + 画像律典 + 实体持久别名 + 律典的
+            // 跨重启采纳/退役决定，与交互启动同一套注册入口，建会话前完成。
+            let aligned_predicates = api_state
+                .align_predicate_pairs(&oxigraph_manager.predicate_query_pairs(), &registry);
+            let aligned_entities =
+                api_state.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
+            if aligned_predicates > 0 || aligned_entities > 0 {
+                println!(
+                    "服务已对齐知识注册表：{} 条谓词别名/换向词面、{} 条实体别名。",
+                    aligned_predicates, aligned_entities
+                );
+            }
+            if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path))
+            {
+                let decided = api_state.load_law_book(persisted);
+                if decided > 0 {
+                    println!("服务已载入律典显式决定：{} 条。", decided);
+                }
             }
             let quality_index = quality_index.with_revision(api_state.warm_revision());
             api_state.set_quality_index(Some(Arc::new(quality_index)));
@@ -8488,24 +8513,15 @@ fn extract_relationships_from_text(
 /// 正向词面（别名 → 槽位）走别名通道（对齐同义词 + 生成词面表），
 /// 逆向词面只登记查询换向（不改生成叙事词面，避免叙事错向）。
 fn sync_predicate_pairs(reasoner: &mut SymbolicReasoner, oxigraph_manager: &OxigraphManager) {
-    for (surface, slot, inverted) in oxigraph_manager.predicate_query_pairs() {
-        if surface == slot {
-            continue;
-        } else if inverted {
-            reasoner.register_predicate_query_surface(&surface, &slot);
-        } else {
-            reasoner.register_predicate_alias(&surface, &slot);
-        }
-    }
+    // 别名/换向词面与画像律典走同一注入入口（服务启动复用同一实现）
+    reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
     // 谓词画像的显式声明同步进律典：传递/对称/互逆律从此进入查询选路。
     reasoner.configure_laws(&oxigraph_manager.predicate_registry_snapshot());
 }
 
 /// 把实体身份注册表里已确认的持久别名同步进链接器（别名与规范名同权）。
 fn sync_entity_aliases(reasoner: &mut SymbolicReasoner, oxigraph_manager: &OxigraphManager) {
-    for (surface, canonical) in oxigraph_manager.confirmed_entity_aliases() {
-        reasoner.register_entity_alias(&surface, &canonical);
-    }
+    reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
 }
 
 /// 把全息命令参数切成若干词项：支持空白/中英文逗号/冒号分隔
