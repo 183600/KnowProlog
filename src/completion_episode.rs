@@ -520,6 +520,7 @@ pub struct PromotionOutcome {
 pub enum EpisodeError {
     NoActiveEpisode,
     CandidateNotFound(String),
+    AmbiguousSelector { selector: String, count: usize },
     CandidateAlreadyClosed(String),
     RuleNotFound(String),
     RuleUnavailable(String),
@@ -539,6 +540,11 @@ impl fmt::Display for EpisodeError {
             EpisodeError::CandidateNotFound(selector) => {
                 write!(f, "找不到候选「{}」（可用序号、候选 id 或 主体|谓词|客体）", selector)
             }
+            EpisodeError::AmbiguousSelector { selector, count } => write!(
+                f,
+                "候选前缀「{}」匹配 {} 条，请改用序号或更长的候选 id",
+                selector, count
+            ),
             EpisodeError::CandidateAlreadyClosed(selector) => {
                 write!(f, "候选「{}」已有确认/驳回结论，不能再次裁定", selector)
             }
@@ -872,12 +878,22 @@ impl CompletionLedger {
         {
             return Ok(position);
         }
-        if let Some(position) = episode
+        let prefix_matches: Vec<usize> = episode
             .candidates
             .iter()
-            .position(|candidate| candidate.id.starts_with(selector))
-        {
-            return Ok(position);
+            .enumerate()
+            .filter(|(_, candidate)| candidate.id.starts_with(selector))
+            .map(|(position, _)| position)
+            .collect();
+        match prefix_matches.as_slice() {
+            [] => {}
+            [position] => return Ok(*position),
+            _ => {
+                return Err(EpisodeError::AmbiguousSelector {
+                    selector: selector.to_string(),
+                    count: prefix_matches.len(),
+                });
+            }
         }
         if let Some((subject, predicate, object)) = parse_triple_selector(selector) {
             if let Some(position) = episode.candidates.iter().position(|candidate| {
@@ -1862,5 +1878,47 @@ mod tests {
         assert_eq!(ledger.max_rules, DEFAULT_MAX_RULES);
         assert_eq!(ledger.max_batch_entities, DEFAULT_MAX_BATCH_ENTITIES);
         assert_eq!(ledger.active, None, "越界活动索引应被清掉");
+    }
+
+    #[test]
+    fn ambiguous_candidate_prefix_is_rejected_instead_of_guessed() {
+        let mut ledger = CompletionLedger::new();
+        ledger.open_episode("甲", None);
+        assert!(ledger.add_candidate(
+            Triple::new("甲", "r", "乙"),
+            Warrant::Induced,
+            0.5,
+            Vec::new(),
+            "候选一".to_string(),
+        ));
+        assert!(ledger.add_candidate(
+            Triple::new("甲", "r", "丙"),
+            Warrant::Induced,
+            0.5,
+            Vec::new(),
+            "候选二".to_string(),
+        ));
+        {
+            let episode = ledger.current_episode_mut().expect("回合应打开");
+            episode.candidates[0].id = "cand-shared-a".to_string();
+            episode.candidates[1].id = "cand-shared-b".to_string();
+        }
+        let error = ledger
+            .confirm("cand-shared", &[])
+            .expect_err("歧义前缀不得静默选择第一条");
+        assert!(
+            matches!(
+                error,
+                EpisodeError::AmbiguousSelector { count: 2, .. }
+            ),
+            "{error:?}"
+        );
+        let episode = ledger.current_episode().expect("回合应打开");
+        assert_eq!(
+            episode.candidates[0].status,
+            CandidateStatus::Pending,
+            "歧义失败不得改变候选状态"
+        );
+        assert_eq!(episode.candidates[1].status, CandidateStatus::Pending);
     }
 }
