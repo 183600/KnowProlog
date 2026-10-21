@@ -13455,6 +13455,10 @@ types = [
             .answer("张三不认识李四吗")
             .expect("否定是非问");
         assert!(negated_true.starts_with("是的"), "{}", negated_true);
+        let a_not_a = reasoner
+            .answer("张三认不认识王五")
+            .expect("A 不 A 是非问");
+        assert!(a_not_a.starts_with("是的"), "{}", a_not_a);
 
         let receipt = reasoner
             .query_rewrite_receipt("谁被张三认识")

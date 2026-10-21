@@ -160,6 +160,28 @@ fn is_wh(text: &str) -> bool {
     WH_SUFFIXES.iter().any(|word| text.contains(word))
 }
 
+/// A 不 A / A 不 AB 型正反问：「认不认识」「教不教」「喜不喜欢」。
+/// 这类问句本身不含否定命题，只需要识别为是非问。
+fn has_a_not_a(text: &str) -> bool {
+    let mut offset = 0;
+    while let Some(position) = text[offset..].find('不') {
+        let position = offset + position;
+        let left: Vec<char> = text[..position].chars().collect();
+        let right = &text[position + '不'.len_utf8()..];
+        // 只看紧邻的 1~2 个字：A 不 A / A 不 AB 都会让右侧复用左侧词头。
+        for len in [2, 1] {
+            if left.len() >= len {
+                let word: String = left[left.len() - len..].iter().collect();
+                if right.starts_with(&word) {
+                    return true;
+                }
+            }
+        }
+        offset = position + '不'.len_utf8();
+    }
+    false
+}
+
 fn strip_entity_affixes(mut text: &str) -> &str {
     loop {
         if let Some(rest) = ENTITY_PREFIXES
@@ -210,6 +232,13 @@ fn predicate(
     let mut candidates: Vec<(String, bool)> = Vec::new();
     let mut current = raw.to_string();
     candidates.push((current.clone(), false));
+    if let Some(position) = current.find('不') {
+        let left = &current[..position];
+        let right = &current[position + '不'.len_utf8()..];
+        if !left.is_empty() && right.starts_with(left) {
+            candidates.push((right.to_string(), false));
+        }
+    }
     for prefix in PREDICATE_PREFIXES {
         if let Some(rest) = current.strip_prefix(prefix) {
             current = rest.trim().to_string();
@@ -399,6 +428,7 @@ pub fn rewrite(
     if text.chars().count() < 2 {
         return None;
     }
+    yes_no |= has_a_not_a(&text);
     for marker in ["有没有", "是否"] {
         if let Some(position) = text.find(marker) {
             text = format!("{}{}", &text[..position], &text[position + marker.len()..]);
@@ -741,6 +771,21 @@ mod tests {
         assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
         assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
         assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn a_not_a_questions_are_yes_no_without_negation() {
+        let rewrite = parse("张三认不认识李四").expect("A 不 A 应识别为是非问");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::CheckRelation {
+                subject: "张三".to_string(),
+                predicate: "认识".to_string(),
+                object: "李四".to_string(),
+                negated: false
+            }
+        );
+        assert_eq!(parse("张三教不教李四").expect("单字 A 不 A").predicate, "教");
     }
 
     #[test]
