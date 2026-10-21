@@ -333,6 +333,13 @@ impl TurnControl {
         Self::starting_at(turn, budget, Instant::now())
     }
 
+    /// 使用外部取消句柄（HTTP 客户端断开 / 服务关闭时由等待方触发）。
+    pub fn with_cancel(turn: u64, budget: TurnBudget, cancel: CancelToken) -> Self {
+        let mut control = Self::new(turn, budget);
+        control.cancel = cancel;
+        control
+    }
+
     /// 测试与重放可注入起点；生产路径只用 [`Self::new`]。
     pub fn starting_at(turn: u64, budget: TurnBudget, started: Instant) -> Self {
         Self {

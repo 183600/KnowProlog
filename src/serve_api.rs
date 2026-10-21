@@ -40,7 +40,9 @@
 //! - `POST /sessions/import`       导入会话信封重建会话
 //! - `DELETE /sessions/{id}`       关闭会话
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
-//!   或 `?stream=1` 时按句 SSE 流式返回
+//!   或 `?stream=1` 时按句 SSE 流式返回。轮次有墙钟预算（默认 30 秒 Enforce），
+//!   失败/取消/超时会回滚可观察状态并留下可继续的未完成轮次
+//! - `POST /sessions/{id}/resume`  继续最近的未完成轮次（消费一次，失败 attempts+1）
 //! - `GET  /v1/models`             OpenAI 兼容：模型清单
 //! - `GET  /v1/prompts`            提示资产注册表（spec + lint + 覆盖）
 //! - `POST /v1/chat/completions`   OpenAI 兼容聊天补全（`stream: true` 时
@@ -77,6 +79,9 @@ use crate::quality::QualityIndex;
 use crate::recovery::RecoveryMode;
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
+use crate::turn_runtime::{
+    CancelToken, OpenTurn, TurnBudget, TurnControl, TurnFault, TurnFaultKind, TurnPhase,
+};
 use crate::{NlpConfig, ReasoningConfig};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -84,6 +89,8 @@ const DEFAULT_MAX_BODY_BYTES: usize = 256 * 1024;
 /// 冷存储信封的体量上限（解码绝不因巨量输入拖垮进程）。
 const SESSION_ENVELOPE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// 等待会话 actor 返回的硬上限；超时先触发协作取消，再报 504。
+const TURN_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
 const HISTORY_LIMIT: usize = 64;
 /// 无状态问答缓存容量（条目数）；纯函数结果，命中与重算必须逐字节一致。
 const STATELESS_CACHE_CAPACITY: usize = 64;
@@ -399,6 +406,18 @@ pub struct TurnResponse {
     /// 交互式查询板状态（空板时省略；客户端可据此继续翻页/筛选/选行）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board: Option<crate::query_board::BoardView>,
+    /// 运行时故障（取消 / 超时 / 存储 / 引擎 / 崩溃 / 快照）；正常轮省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<TurnFault>,
+    /// 未完成轮次（原始输入、失败阶段、尝试次数）；可显式继续。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_turn: Option<OpenTurn>,
+    /// 本轮是否由继续未完成轮次触发。
+    #[serde(default)]
+    pub resumed: bool,
+    /// 未完成轮次是否仍可继续（TTL 与尝试次数均未耗尽）。
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 /// 一条接地引用：回答依据的实体身份（URI 可寻址、词面可回溯、类型可审计）。
@@ -450,6 +469,19 @@ struct Session {
     policy: SessionPolicy,
     /// 服务级插件运行时（多会话共享；模式在服务启动时确定，HTTP 不提供热切换）。
     plugin: Option<Arc<parking_lot::Mutex<PluginRuntime>>>,
+    /// 本轮预算（默认 30 秒 Enforce；测试可注入过期预算）。
+    turn_budget: TurnBudget,
+    /// 回滚失败后的会话毒化标记：绝不带着半状态继续推理。
+    poisoned: Option<String>,
+}
+
+/// 一轮开始前的可观察状态：失败轮必须原样回滚，不能出现「回答没给出，焦点却跳走」。
+struct SessionCheckpoint {
+    turns: u32,
+    history: Vec<String>,
+    policy: SessionPolicy,
+    manager: DialogueManagerSnapshot,
+    reasoner: DialogueSnapshot,
 }
 
 impl Session {
@@ -484,9 +516,171 @@ impl Session {
         Some((reply.text, plan, reply.kind.to_string()))
     }
 
+    fn checkpoint(&self) -> SessionCheckpoint {
+        SessionCheckpoint {
+            turns: self.turns,
+            history: self.history.clone(),
+            policy: self.policy.clone(),
+            manager: self.manager.snapshot(),
+            reasoner: self.reasoner.dialogue_snapshot(),
+        }
+    }
+
+    fn rollback(&mut self, checkpoint: SessionCheckpoint) -> Result<(), String> {
+        self.turns = checkpoint.turns;
+        self.history = checkpoint.history;
+        self.policy = checkpoint.policy;
+        self.manager.restore(&checkpoint.manager);
+        self.reasoner
+            .restore_dialogue_snapshot(&checkpoint.reasoner)
+            .map_err(|error| format!("轮次回滚失败：{}", error))
+    }
+
+    fn open_turn_view(&self) -> Option<OpenTurn> {
+        self.manager.latest_open_turn().cloned()
+    }
+
+    fn open_turn_resumable(&self) -> bool {
+        self.open_turn_view()
+            .map(|open| open.can_resume(self.manager.open_turns().tick()))
+            .unwrap_or(false)
+    }
+
+    /// 普通一轮：默认预算 + 独立取消句柄（测试与直接调用路径）。
+    #[cfg(test)]
     fn run_turn(&mut self, input: &str) -> TurnResponse {
+        self.run_turn_with_cancel(input, CancelToken::new())
+    }
+
+    fn run_turn_with_cancel(&mut self, input: &str, cancel: CancelToken) -> TurnResponse {
+        self.manager.begin_turn();
+        let mut control = TurnControl::with_cancel(
+            u64::from(self.turns).saturating_add(1),
+            self.turn_budget,
+            cancel,
+        );
+        self.run_turn_checked(input, &mut control, false, 1)
+    }
+
+    /// 继续最近一次未完成轮次：先取走再重放；失败后以 attempts+1 重建。
+    fn resume_turn(&mut self, cancel: CancelToken) -> Result<TurnResponse, SessionError> {
+        self.manager.begin_turn();
+        let tick = self.manager.open_turns().tick();
+        let can_resume = self
+            .manager
+            .latest_open_turn()
+            .map(|open| open.can_resume(tick))
+            .unwrap_or(false);
+        if !can_resume {
+            return Err(SessionError::NoOpenTurn);
+        }
+        let open = self
+            .manager
+            .take_open_turn()
+            .ok_or(SessionError::NoOpenTurn)?;
+        let mut control = TurnControl::with_cancel(
+            u64::from(self.turns).saturating_add(1),
+            self.turn_budget,
+            cancel,
+        );
+        let mut response = self.run_turn_checked(
+            &open.input,
+            &mut control,
+            true,
+            open.attempts.saturating_add(1),
+        );
+        response.resumed = true;
+        Ok(response)
+    }
+
+    fn run_turn_checked(
+        &mut self,
+        input: &str,
+        control: &mut TurnControl,
+        resumed: bool,
+        attempts: u32,
+    ) -> TurnResponse {
+        self.turns = self.turns.saturating_add(1);
+        if let Some(detail) = self.poisoned.clone() {
+            let fault = TurnFault::new(
+                TurnFaultKind::Snapshot,
+                control.phase(),
+                detail,
+                control.elapsed_ms(),
+            );
+            let focus = self.manager.focus_entity().map(str::to_string);
+            return self.fault_response(input, fault, focus, attempts, resumed);
+        }
+        let checkpoint = self.checkpoint();
+        let focus_before = self.manager.focus_entity().map(str::to_string);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_turn_inner(input, control)
+        }));
+        match outcome {
+            Ok(Ok(response)) => response,
+            Ok(Err(fault)) => {
+                let rollback = self.rollback(checkpoint);
+                if let Err(error) = rollback {
+                    self.poisoned = Some(error);
+                }
+                self.fault_response(input, fault, focus_before, attempts, resumed)
+            }
+            Err(payload) => {
+                let detail = panic_payload(payload.as_ref());
+                let fault = TurnFault::panic(control.phase(), &detail, control.elapsed_ms());
+                if let Err(error) = self.rollback(checkpoint) {
+                    self.poisoned = Some(error);
+                }
+                self.fault_response(input, fault, focus_before, attempts, resumed)
+            }
+        }
+    }
+
+    fn fault_response(
+        &mut self,
+        input: &str,
+        fault: TurnFault,
+        focus_before: Option<String>,
+        attempts: u32,
+        resumed: bool,
+    ) -> TurnResponse {
+        self.manager.record_open_turn_attempts(
+            input,
+            u64::from(self.turns),
+            &fault,
+            focus_before.as_deref(),
+            None,
+            attempts,
+        );
+        let open_turn = self.open_turn_view();
+        let resumable = self.open_turn_resumable();
+        TurnResponse {
+            session_id: self.id.clone(),
+            turn: self.turns,
+            status: fault.status().to_string(),
+            source: "runtime".to_string(),
+            kind: None,
+            plan: vec![format!("turn_{}", fault.status())],
+            reply: fault.render(),
+            focus: self.manager.focus_entity().map(str::to_string),
+            policy: self.policy.clone(),
+            epistemic: None,
+            entities: Vec::new(),
+            board: self.manager.board().view(self.reasoner.revision()),
+            fault: Some(fault),
+            open_turn,
+            resumed,
+            resumable,
+        }
+    }
+
+    fn run_turn_inner(
+        &mut self,
+        input: &str,
+        control: &mut TurnControl,
+    ) -> Result<TurnResponse, TurnFault> {
+        control.enter(TurnPhase::Prepare)?;
         let raw_input = input.trim().to_string();
-        self.turns += 1;
         if self.history.len() >= HISTORY_LIMIT {
             self.history.remove(0);
         }
@@ -498,16 +692,20 @@ impl Session {
             .plugin
             .as_ref()
             .map(|runtime| runtime.lock().rewrite(&raw_input));
+        control.enter(TurnPhase::Rewrite)?;
         let input = plugin_outcome
             .as_ref()
             .map(|outcome| outcome.trace.effective.clone())
             .unwrap_or_else(|| raw_input.clone());
         let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
+        control.enter(TurnPhase::Recall)?;
         let dialogue = self
             .manager
             .plan_pure_dialogue(&input, &self.reasoner)
             .or_else(|| self.manager.plan_reply(&input, &self.reasoner));
+
+        control.enter(TurnPhase::Reason)?;
         let (status, source, kind, plan, reply) = if let Some((text, plan, kind)) = plugin_answer {
             (
                 "answered".to_string(),
@@ -565,6 +763,7 @@ impl Session {
                 String::new(),
             )
         };
+        control.enter(TurnPhase::Generate)?;
         if !reply.is_empty() && self.history.len() < HISTORY_LIMIT {
             self.history.push(reply.clone());
         }
@@ -617,9 +816,25 @@ impl Session {
             epistemic,
             entities,
             board: self.manager.board().view(self.reasoner.revision()),
+            fault: None,
+            open_turn: self.open_turn_view(),
+            resumed: false,
+            resumable: self.open_turn_resumable(),
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
-        response
+        control.enter(TurnPhase::Commit)?;
+        Ok(response)
+    }
+}
+
+/// 从 panic payload 提取可读消息（actor 必须存活，错误不能吞掉）。
+fn panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "未知 panic".to_string()
     }
 }
 
@@ -811,7 +1026,12 @@ enum SessionCommand {
     Turn {
         input: String,
         policy: Option<SessionPolicy>,
+        cancel: CancelToken,
         reply: oneshot::Sender<TurnResponse>,
+    },
+    Resume {
+        cancel: CancelToken,
+        reply: oneshot::Sender<Result<TurnResponse, SessionError>>,
     },
     Snapshot {
         reply: oneshot::Sender<serde_json::Value>,
@@ -845,6 +1065,12 @@ impl SessionHandle {
 enum SessionError {
     NotFound,
     Unavailable,
+    /// 会话收件箱已满：拒绝排队，让客户端退避后重试。
+    Busy,
+    /// 等待 actor 超过硬上限：已触发协作取消。
+    Timeout,
+    /// 没有可继续的未完成轮次（或已过期 / 尝试次数耗尽）。
+    NoOpenTurn,
     Stale(DecodeError),
 }
 
@@ -910,6 +1136,7 @@ fn build_session(
     recovery_mode: RecoveryMode,
     quality: Option<Arc<QualityIndex>>,
     plugin: Option<Arc<parking_lot::Mutex<PluginRuntime>>>,
+    turn_budget: TurnBudget,
     restore: Option<SessionRestore>,
 ) -> Session {
     let reasoner = warm.fork();
@@ -927,6 +1154,8 @@ fn build_session(
         history: Vec::new(),
         policy: SessionPolicy::default(),
         plugin,
+        turn_budget,
+        poisoned: None,
     };
     if let Some(restore) = restore {
         session.turns = restore.turns;
@@ -981,6 +1210,8 @@ pub struct ApiState {
     max_body_bytes: usize,
     prompt_mode: PromptMode,
     recovery_mode: RecoveryMode,
+    /// 每轮预算（复制给每个会话 actor；默认 30 秒 Enforce）。
+    turn_budget: TurnBudget,
 }
 
 impl ApiState {
@@ -1021,6 +1252,7 @@ impl ApiState {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             prompt_mode: PromptMode::On,
             recovery_mode: RecoveryMode::Observe,
+            turn_budget: TurnBudget::enforced(crate::turn_runtime::DEFAULT_TURN_BUDGET),
         }
     }
 
@@ -1169,6 +1401,15 @@ impl ApiState {
         self.recovery_mode
     }
 
+    /// 注入轮次预算（须在 `Arc::new` 之前；之后创建的会话继承该预算）。
+    pub fn set_turn_budget(&mut self, budget: TurnBudget) {
+        self.turn_budget = budget;
+    }
+
+    pub fn turn_budget(&self) -> TurnBudget {
+        self.turn_budget
+    }
+
     /// 注入质量护照索引（在 `Arc::new` 之前调用）。
     ///
     /// 索引只影响「怎么说」（出处/冲突披露/缺口追问），不改变真值与存储；
@@ -1218,6 +1459,7 @@ impl ApiState {
         let recovery_mode = self.recovery_mode;
         let quality = self.quality.clone();
         let plugin = self.plugin.clone();
+        let turn_budget = self.turn_budget;
         let engine = Arc::new(self.engine_stamp());
         let thread_name = format!("kp-session-{}", id);
         std::thread::Builder::new()
@@ -1235,6 +1477,7 @@ impl ApiState {
                         recovery_mode,
                         quality,
                         plugin,
+                        turn_budget,
                         restore,
                     )
                 };
@@ -1243,12 +1486,17 @@ impl ApiState {
                         SessionCommand::Turn {
                             input,
                             policy,
+                            cancel,
                             reply,
                         } => {
                             if let Some(policy) = policy {
                                 session.policy = policy;
                             }
-                            let response = session.run_turn(&input);
+                            let response = session.run_turn_with_cancel(&input, cancel);
+                            let _ = reply.send(response);
+                        }
+                        SessionCommand::Resume { cancel, reply } => {
+                            let response = session.resume_turn(cancel);
                             let _ = reply.send(response);
                         }
                         SessionCommand::Snapshot { reply } => {
@@ -1261,6 +1509,7 @@ impl ApiState {
                                 "summary": session.manager.summary(),
                                 "policy": session.policy,
                                 "board": session.manager.board().view(session.reasoner.revision()),
+                                "open_turn": session.manager.latest_open_turn(),
                             }));
                         }
                         SessionCommand::Export { reply } => {
@@ -1456,6 +1705,8 @@ impl ApiState {
     }
 
     /// 执行一轮；给出 `policy` 时先更新会话策略再执行。
+    ///
+    /// 收件箱满时立即拒绝（429），不无限排队；等待超时先触发协作取消再报 504。
     async fn take_turn_with_policy(
         &self,
         session_id: &str,
@@ -1463,17 +1714,56 @@ impl ApiState {
         policy: Option<&SessionPolicy>,
     ) -> Result<TurnResponse, SessionError> {
         let tx = self.session_tx(session_id).await?;
+        let cancel = CancelToken::new();
         let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(SessionCommand::Turn {
+        match tx.try_send(SessionCommand::Turn {
             input: input.to_string(),
             policy: policy.cloned(),
+            cancel: cancel.clone(),
             reply: reply_tx,
-        })
-        .await
-        .map_err(|_| SessionError::Unavailable)?;
-        let response = reply_rx.await.map_err(|_| SessionError::Unavailable)?;
-        self.turns_total.fetch_add(1, Ordering::Relaxed);
-        Ok(response)
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(SessionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(SessionError::Unavailable),
+        }
+        match tokio::time::timeout(TURN_WAIT_TIMEOUT, reply_rx).await {
+            Ok(Ok(response)) => {
+                self.turns_total.fetch_add(1, Ordering::Relaxed);
+                Ok(response)
+            }
+            Ok(Err(_)) => Err(SessionError::Unavailable),
+            Err(_) => {
+                cancel.cancel();
+                Err(SessionError::Timeout)
+            }
+        }
+    }
+
+    /// 继续会话里最近的未完成轮次（消费一次；失败后 attempts+1 重建）。
+    async fn take_resume(&self, session_id: &str) -> Result<TurnResponse, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let cancel = CancelToken::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        match tx.try_send(SessionCommand::Resume {
+            cancel: cancel.clone(),
+            reply: reply_tx,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(SessionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(SessionError::Unavailable),
+        }
+        match tokio::time::timeout(TURN_WAIT_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(turn))) => {
+                self.turns_total.fetch_add(1, Ordering::Relaxed);
+                Ok(turn)
+            }
+            Ok(Ok(Err(error))) => Err(error),
+            Ok(Err(_)) => Err(SessionError::Unavailable),
+            Err(_) => {
+                cancel.cancel();
+                Err(SessionError::Timeout)
+            }
+        }
     }
 
     async fn session_snapshot(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
@@ -1743,6 +2033,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "POST /sessions/import",
                     "DELETE /sessions/{id}",
                     "POST /sessions/{id}/turns",
+                    "POST /sessions/{id}/resume",
                     "GET /v1/models",
                     "GET /v1/prompts",
                     "POST /v1/chat/completions"
@@ -1818,6 +2109,13 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 Err(error) => session_error_response(error),
             }
         }
+        ("POST", ["sessions", id, "resume"]) => match state.take_resume(id).await {
+            Ok(turn) => Response::json(
+                200,
+                &serde_json::to_value(&turn).unwrap_or_else(|_| serde_json::json!({})),
+            ),
+            Err(error) => session_error_response(error),
+        },
         ("GET", ["v1", "models"]) => Response::json(
             200,
             &serde_json::json!({
@@ -1892,6 +2190,12 @@ fn session_error_response(error: SessionError) -> Response {
     match error {
         SessionError::NotFound => Response::error(404, "session not found"),
         SessionError::Unavailable => Response::error(500, "session actor unavailable"),
+        SessionError::Busy => Response::error(429, "session busy; retry shortly"),
+        SessionError::Timeout => Response::error(504, "turn deadline exceeded; cancellation requested"),
+        SessionError::NoOpenTurn => Response::error(
+            409,
+            "no resumable turn (none, expired, or attempts exhausted)",
+        ),
         SessionError::Stale(error) => Response::error(
             409,
             &format!(
@@ -2153,6 +2457,15 @@ fn session_error_http(error: SessionError) -> (u16, String) {
     match error {
         SessionError::NotFound => (404, "session not found".to_string()),
         SessionError::Unavailable => (500, "session actor unavailable".to_string()),
+        SessionError::Busy => (429, "session busy; retry shortly".to_string()),
+        SessionError::Timeout => (
+            504,
+            "turn deadline exceeded; cancellation requested".to_string(),
+        ),
+        SessionError::NoOpenTurn => (
+            409,
+            "no resumable turn (none, expired, or attempts exhausted)".to_string(),
+        ),
         SessionError::Stale(error) => (
             409,
             format!("session snapshot is stale (decode_{})", error.code()),
@@ -2489,6 +2802,7 @@ fn status_reason(status: u16) -> &'static str {
         409 => "Conflict",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
+        504 => "Gateway Timeout",
         _ => "Internal Server Error",
     }
 }
@@ -3723,6 +4037,10 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             epistemic: None,
             entities: Vec::new(),
             board: None,
+            fault: None,
+            open_turn: None,
+            resumed: false,
+            resumable: false,
         };
         let key = stateless_answer_key(&["姚明的身高是多少".to_string()], None);
 
@@ -3766,6 +4084,10 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             epistemic: None,
             entities: Vec::new(),
             board: None,
+            fault: None,
+            open_turn: None,
+            resumed: false,
+            resumable: false,
         };
         let key = stateless_answer_key(&["明哥的身高是多少".to_string()], None);
         let epoch = state.cache_epoch();
@@ -4341,5 +4663,109 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let _ = third;
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_session(budget: TurnBudget) -> Session {
+        let state = test_state(4);
+        build_session(
+            "s-test".to_string(),
+            &state.warm,
+            &state.perf,
+            state.prompt_mode,
+            state.recovery_mode,
+            None,
+            None,
+            budget,
+            None,
+        )
+    }
+
+    #[test]
+    fn deadline_rolls_back_and_keeps_a_resumable_turn() {
+        let budget = TurnBudget::enforced(Duration::from_millis(1));
+        let mut session = test_session(budget);
+        let mut control = TurnControl::starting_at(
+            1,
+            budget,
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("测试起点"),
+        );
+        let response = session.run_turn_checked("姚明的身高是多少", &mut control, false, 1);
+        assert_eq!(response.status, "deadline", "{}", response.reply);
+        assert!(response.fault.is_some());
+        let open = response.open_turn.as_ref().expect("超时轮必须留下未完成记忆");
+        assert_eq!(open.input, "姚明的身高是多少");
+        assert_eq!(open.attempts, 1);
+        assert!(response.resumable);
+        assert_eq!(session.turns, 1, "失败轮仍占一个轮号");
+        assert!(
+            session.manager.focus_entity().is_none(),
+            "失败轮不得提交焦点"
+        );
+        assert_eq!(session.manager.turn_count(), 0, "失败轮不得进入对话本体");
+
+        // 预算恢复后继续同一问：先取走再重放，成功即清空未完成记忆。
+        session.turn_budget = TurnBudget::unlimited();
+        let resumed = session
+            .resume_turn(CancelToken::new())
+            .expect("未完成轮次应可继续");
+        assert!(resumed.resumed);
+        assert_eq!(resumed.status, "answered", "{}", resumed.reply);
+        assert!(resumed.reply.contains("226"), "{}", resumed.reply);
+        assert!(resumed.open_turn.is_none());
+        assert!(session.manager.latest_open_turn().is_none());
+    }
+
+    #[test]
+    fn cancellation_is_typed_and_rolls_back_observable_state() {
+        let mut session = test_session(TurnBudget::unlimited());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let response = session.run_turn_with_cancel("姚明的身高是多少", cancel);
+        assert_eq!(response.status, "cancelled", "{}", response.reply);
+        assert_eq!(
+            response.fault.as_ref().map(|fault| fault.kind),
+            Some(TurnFaultKind::Cancelled)
+        );
+        assert!(response.open_turn.is_some());
+        assert!(session.manager.focus_entity().is_none());
+        assert_eq!(session.manager.turn_count(), 0);
+    }
+
+    #[test]
+    fn plain_turn_still_commits_with_default_budget() {
+        let mut session = test_session(TurnBudget::unlimited());
+        let response = session.run_turn("姚明的身高是多少");
+        assert_eq!(response.status, "answered", "{}", response.reply);
+        assert!(response.reply.contains("226"), "{}", response.reply);
+        assert!(response.fault.is_none());
+        assert!(response.open_turn.is_none());
+        assert_eq!(session.manager.turn_count(), 1);
+    }
+
+    #[test]
+    fn resume_without_open_turn_is_rejected() {
+        let mut session = test_session(TurnBudget::unlimited());
+        assert!(matches!(
+            session.resume_turn(CancelToken::new()),
+            Err(SessionError::NoOpenTurn)
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_route_reports_missing_open_turn() {
+        let (addr, _server) = start_server(1);
+        let session_id = create_session(addr).await;
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/resume", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 409, "{}", body);
+        assert!(body.contains("resumable"), "{}", body);
     }
 }
