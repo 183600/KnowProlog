@@ -2103,6 +2103,28 @@ mod tests {
     }
 
     #[test]
+    fn constraints_compile_from_registry_and_law_book() {
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&crate::predicate_registry::PredicateProfileConfig {
+            name: "mentor".to_string(),
+            functional: true,
+            domain: vec!["Person".to_string()],
+            range: vec!["Person".to_string()],
+            ..Default::default()
+        });
+        let constraints = RevisionConstraints::from_registry(&registry);
+        assert!(constraints.functional.contains("mentor"));
+        assert_eq!(
+            constraints.domain.get("mentor"),
+            Some(&BTreeSet::from(["Person".to_string()]))
+        );
+
+        let book = LawBook::from_registry(&registry);
+        let from_book = RevisionConstraints::from_law_book(&book);
+        assert!(from_book.functional.contains("mentor"));
+    }
+
+    #[test]
     fn empty_changeset_is_warned_but_commits() {
         let mut state = BeliefState::new(ResolutionEngine::new(8, 16));
         let receipt = state.apply(ChangeSet::new("空")).expect("commit");
