@@ -1191,8 +1191,25 @@ impl SymbolicReasoner {
         if let Some(plan) = &plan {
             self.enrich_trace_plan_terms(&mut trace, plan, question);
         }
+        self.enrich_trace_context(&mut trace);
         self.enrich_trace_oov(&mut trace, question);
         Some(trace)
+    }
+
+    /// 用会话上下文给「省略/缺实体」残差补充候选：上一轮谓词可以补
+    /// 「李四呢」的谓词，当前焦点可以补「体重是多少」的实体。只补候选，
+    /// 不替用户做选择；是否采用由调用方/追问流程决定。
+    fn enrich_trace_context(&self, trace: &mut LexicalTrace) {
+        if let Some(predicate) = self.context.last_predicate() {
+            trace
+                .reading
+                .add_candidates(ResidualKind::Ellipsis, [predicate.to_string()]);
+        }
+        if let Some(focus) = self.context.focus() {
+            trace
+                .reading
+                .add_candidates(ResidualKind::MissingEntity, [focus.to_string()]);
+        }
     }
 
     /// 只返回读法残差表（不渲染 token 全文），供 API/评测直接使用。
@@ -13868,6 +13885,38 @@ types = [
         assert!(report.contains("读法状态：部分可读"), "{}", report);
         assert!(report.contains("未知实体"), "{}", report);
         assert!(report.contains("0..6"), "{}", report);
+    }
+
+    #[test]
+    fn reading_uses_dialogue_context_to_fill_residual_candidates() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.set_nlp_config(trace_nlp_config());
+        reasoner.contextualize("张三的师傅是谁");
+
+        let ellipsis = reasoner.read_question("李四呢").expect("读法");
+        let residual = ellipsis
+            .residuals
+            .iter()
+            .find(|residual| residual.kind == ResidualKind::Ellipsis)
+            .expect("省略残差");
+        assert!(
+            residual.candidates.iter().any(|candidate| candidate == "师傅"),
+            "上一轮谓词应成为候选：{:?}",
+            residual.candidates
+        );
+
+        let missing = reasoner.read_question("身高是多少").expect("读法");
+        let residual = missing
+            .residuals
+            .iter()
+            .find(|residual| residual.kind == ResidualKind::MissingEntity)
+            .expect("缺实体残差");
+        assert!(
+            residual.candidates.iter().any(|candidate| candidate == "张三"),
+            "当前焦点应成为候选：{:?}",
+            residual.candidates
+        );
     }
 
     #[test]

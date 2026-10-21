@@ -446,6 +446,38 @@ impl Reading {
         }
     }
 
+    /// 给某类残差补充候选（例如用上一轮焦点给省略问句补实体/谓词）。
+    /// 保持去重、有界与稳定排序；找不到对应残差时静默返回。
+    pub fn add_candidates<I, S>(&mut self, kind: ResidualKind, candidates: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let Some(residual) = self
+            .residuals
+            .iter_mut()
+            .find(|residual| residual.kind == kind)
+        else {
+            return;
+        };
+        let mut seen: BTreeSet<String> = residual.candidates.iter().cloned().collect();
+        for candidate in candidates {
+            let candidate = candidate.into();
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                continue;
+            }
+            seen.insert(candidate.to_string());
+            if seen.len() >= MAX_CANDIDATES {
+                break;
+            }
+        }
+        residual.candidates = seen.into_iter().collect();
+        if !residual.candidates.is_empty() && residual.repair == RepairKind::None {
+            residual.repair = RepairKind::ChooseCandidate;
+        }
+    }
+
     /// 读法状态：有阻断残差 → Partial；没有计划 → Unreadable；否则 Ready。
     pub fn status(&self) -> ReadingStatus {
         if self.plan_kind.is_none()
@@ -920,6 +952,20 @@ mod tests {
         assert_eq!(reading.status(), ReadingStatus::Ready);
         assert!(reading.residuals.is_empty());
         assert_eq!(reading.plan_kind.as_deref(), Some("FindObject"));
+    }
+
+    #[test]
+    fn context_candidates_can_be_added_to_an_existing_residual() {
+        let mut reading = diagnose("李四呢", None);
+        reading.add_candidates(ResidualKind::Ellipsis, ["身高", "体重", "身高"]);
+        let residual = &reading.residuals[0];
+        assert_eq!(residual.candidates, vec!["体重", "身高"]);
+        assert_eq!(residual.repair, RepairKind::BindEllipsis);
+        reading.add_candidates(ResidualKind::MissingEntity, ["姚明"]);
+        assert!(reading
+            .residuals
+            .iter()
+            .all(|residual| residual.kind != ResidualKind::MissingEntity));
     }
 
     #[test]
