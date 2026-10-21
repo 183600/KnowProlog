@@ -110,9 +110,9 @@ pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
 /// 这是只读证据层：不改变分词/标注决策，只把「为什么是这个标签」写下来，
 /// 供读法追踪、词表缺口与 CI 差分使用。
 pub fn preprocess_annotated(text: &str, config: &crate::NlpConfig) -> Vec<AnnotatedWord> {
-    // 结巴自带词性标注（nr 人名 / ns 地名 / nt 机构名 / nz 专名）：
-    // 用作未知词的兜底，让「姚明」「诸葛亮」等词无需写进配置也能落型；
-    // 配置 pos_dict 与 name_patterns 的优先级更高。
+    // 结巴自带词性标注（nr 人名 / ns 地名 / nt 机构名 / nz 专名 /
+    // n 普通名词 / vn 名动词）：用作未知词的兜底，让「姚明」「苹果」
+    // 等词无需写进配置也能落型；配置 pos_dict 与 name_patterns 的优先级更高。
     let tagged = jieba().tag(text, false);
     let words: Vec<&str> = tagged.iter().map(|tag| tag.word).collect();
     let jieba_tags: Vec<&str> = tagged.iter().map(|tag| tag.tag).collect();
@@ -230,6 +230,11 @@ fn resolve_tag(
         Some("ns") => ("ns".to_string(), TagSource::JiebaTag),
         Some("nt") => ("nt".to_string(), TagSource::JiebaTag),
         Some("nz") => ("nz".to_string(), TagSource::JiebaTag),
+        // 普通名词与名动词是实体/属性槽的主要候选：只看配置词表会让
+        // 「苹果的颜色是什么」里的「苹果」「颜色」双双落成 unknown，
+        // NLU 与关系抽取都无法把它们当作槽位值。形容词等高歧义标签
+        // 仍保持 unknown，避免把「明的」这类碎片误当名词。
+        Some("n") | Some("vn") => ("n".to_string(), TagSource::JiebaTag),
         _ => ("unknown".to_string(), TagSource::Unknown),
     }
 }
@@ -629,6 +634,19 @@ mod tests {
 
         let who = words.iter().find(|word| word.text == "谁").unwrap();
         assert_eq!(who.source, TagSource::Unknown);
+    }
+
+    #[test]
+    fn jieba_common_nouns_fill_unknown_slots() {
+        let config = test_config();
+        let words = preprocess_annotated("苹果的颜色是什么", &config);
+        let apple = words.iter().find(|word| word.text == "苹果").unwrap();
+        let color = words.iter().find(|word| word.text == "颜色").unwrap();
+        assert_eq!(apple.pos, "n");
+        assert_eq!(apple.source, TagSource::JiebaTag);
+        assert_eq!(color.pos, "n");
+        assert_eq!(color.source, TagSource::JiebaTag);
+        assert_eq!(apple.jieba_pos.as_deref(), Some("n"));
     }
 
     #[test]
