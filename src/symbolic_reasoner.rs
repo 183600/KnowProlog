@@ -908,11 +908,20 @@ impl SymbolicReasoner {
 
         impl RelationLexicon for View<'_> {
             fn canonical_entity(&self, raw: &str) -> Option<String> {
-                // 只接受精确登记的词面/会话事实；不用模糊对齐把整个短语
-                // （如「张三的师傅」）误吸附到一个短实体上。
-                self.0
-                    .is_known_entity(raw)
-                    .then(|| self.0.aligner.canonical_form(raw))
+                // 只接受精确登记的词面/会话事实或显式同义词；不用模糊对齐
+                // 把整个短语（如「张三的师傅」）误吸附到一个短实体上。
+                let canonical = self.0.aligner.canonical_form(raw);
+                if self.0.is_known_entity(raw) {
+                    return Some(canonical);
+                }
+                let alias = canonical != raw
+                    && self
+                        .0
+                        .aligner
+                        .synonyms()
+                        .get(raw)
+                        .is_some_and(|target| target == &canonical);
+                (alias && self.0.is_known_entity(&canonical)).then_some(canonical)
             }
 
             fn canonical_predicate(&self, raw: &str) -> Option<String> {
@@ -13459,6 +13468,12 @@ types = [
             .answer("张三认不认识王五")
             .expect("A 不 A 是非问");
         assert!(a_not_a.starts_with("是的"), "{}", a_not_a);
+
+        let synonyms = HashMap::from([("老张".to_string(), "张三".to_string())]);
+        let mut aliased = SymbolicReasoner::new(test_config(), synonyms);
+        aliased.observe_facts(&facts);
+        let alias = aliased.answer("老张认识谁").expect("同义词别名问句");
+        assert!(alias.contains("王五"), "{}", alias);
 
         let receipt = reasoner
             .query_rewrite_receipt("谁被张三认识")
