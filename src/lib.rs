@@ -1322,6 +1322,61 @@ impl OxigraphManager {
             }
         }
 
+        // @reverse：值里的节点是主语，当前节点是宾语（JSON-LD 反向属性）。
+        if let Some(reverse) = obj.get("@reverse").and_then(Value::as_object) {
+            for (key, value) in reverse {
+                if key.starts_with("@") {
+                    continue;
+                }
+                let predicate = NamedNode::new(Self::expand_jsonld_term(key, context))?;
+                if let Some(value_array) = value.as_array() {
+                    for val in value_array {
+                        self.process_reverse_value(
+                            store, &subject, &predicate, val, context, stats,
+                        )?;
+                    }
+                } else {
+                    self.process_reverse_value(
+                        store, &subject, &predicate, value, context, stats,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 处理 `@reverse` 中的节点引用：节点 → 谓词 → 当前节点。
+    fn process_reverse_value(
+        &self,
+        store: &Store,
+        subject: &NamedOrBlankNode,
+        predicate: &NamedNode,
+        value: &Value,
+        context: &HashMap<String, String>,
+        stats: &mut JsonldImportStats,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let Some(obj) = value.as_object() else {
+            return Ok(());
+        };
+        let Some(id) = obj.get("@id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if id.is_empty() {
+            return Ok(());
+        }
+        let object = Self::jsonld_node(id, context)?;
+        store.insert(&Quad::new(
+            object.clone(),
+            predicate.clone(),
+            subject.clone(),
+            GraphName::DefaultGraph,
+        ))?;
+        stats.relations += 1;
+        // 带额外属性的反向节点本身也是节点（与正向嵌套对象一致）。
+        if obj.keys().any(|key| key != "@id" && key != "@context") {
+            self.process_jsonld_object(store, obj, context, stats)?;
+        }
         Ok(())
     }
 
@@ -1363,6 +1418,21 @@ impl OxigraphManager {
                 ))?;
             }
             Value::Object(obj) => {
+                // @set 只是数组容器：逐个展开，不产生额外节点。
+                if let Some(set) = obj.get("@set") {
+                    if let Some(items) = set.as_array() {
+                        for item in items {
+                            self.process_property_value(
+                                store, subject, predicate, item, context, stats,
+                            )?;
+                        }
+                    } else {
+                        self.process_property_value(
+                            store, subject, predicate, set, context, stats,
+                        )?;
+                    }
+                    return Ok(());
+                }
                 // 处理嵌套对象
                 if let Some(id) = obj.get("@id") {
                     if let Some(uri) = id.as_str() {
@@ -5320,6 +5390,98 @@ mod cache_tests {
 
         let replay = manager.import_jsonld(jsonld).await.unwrap();
         assert_eq!(replay.triples, 0, "重复导入不应新增三元组");
+    }
+
+    /// JSON-LD @reverse 与 @set：反向边方向正确，集合值逐项展开。
+    #[tokio::test]
+    async fn import_jsonld_supports_reverse_and_set_values() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "nick": "http://example.org/kg/nick",
+                "parent_of": "http://example.org/kg/parent_of",
+                "knows": "http://example.org/kg/knows"
+            },
+            "@id": "http://example.org/kg/entity/甲",
+            "name": "甲",
+            "nick": { "@set": ["阿甲", "甲哥"] },
+            "@reverse": {
+                "parent_of": { "@id": "http://example.org/kg/entity/乙" },
+                "knows": {
+                    "@id": "http://example.org/kg/entity/丙",
+                    "name": "丙"
+                }
+            }
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 2, "甲与带属性的反向节点丙");
+        assert_eq!(stats.relations, 2, "两条反向边");
+        assert_eq!(stats.triples, 6, "name 2 + nick 2 + 反向边 2");
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?s ?p ?o WHERE {
+                    ?s ?p ?o .
+                    FILTER(?p IN (kg:parent_of, kg:knows))
+                }"#,
+            )
+            .await
+            .unwrap();
+        let pairs: Vec<(String, String)> = result
+            .data
+            .iter()
+            .map(|row| {
+                (
+                    match row.get("s") {
+                        Some(Value::String(text)) => text.clone(),
+                        other => format!("{:?}", other),
+                    },
+                    match row.get("o") {
+                        Some(Value::String(text)) => text.clone(),
+                        other => format!("{:?}", other),
+                    },
+                )
+            })
+            .collect();
+        assert!(
+            pairs.contains(&(
+                "http://example.org/kg/entity/乙".to_string(),
+                "http://example.org/kg/entity/甲".to_string()
+            )),
+            "反向边应为 乙 parent_of 甲：{:?}",
+            pairs
+        );
+        assert!(
+            pairs.contains(&(
+                "http://example.org/kg/entity/丙".to_string(),
+                "http://example.org/kg/entity/甲".to_string()
+            )),
+            "反向边应为 丙 knows 甲：{:?}",
+            pairs
+        );
+
+        let nicks = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?nick WHERE {
+                    <http://example.org/kg/entity/甲> kg:nick ?nick
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(nicks.data.len(), 2, "{:?}", nicks.data);
+        assert_eq!(
+            manager
+                .import_jsonld(jsonld)
+                .await
+                .unwrap()
+                .triples,
+            0,
+            "重复导入保持幂等"
+        );
     }
 
     /// 节点级 @context 只作用于该节点：嵌套节点可用不同词项映射。
