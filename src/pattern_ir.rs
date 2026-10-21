@@ -1604,8 +1604,12 @@ impl PatternLibrary {
         self.entries.iter().filter(|entry| entry.route).count()
     }
 
+    /// 未对齐到可执行路由的 NLU 意图数（回退条目单独计入 [`Self::fallback_count`]）。
     pub fn nlu_count(&self) -> usize {
-        self.entries.iter().filter(|entry| !entry.route).count()
+        self.entries
+            .iter()
+            .filter(|entry| !entry.route && !entry.fallback)
+            .count()
     }
 
     pub fn fallback_count(&self) -> usize {
