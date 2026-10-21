@@ -32,6 +32,18 @@ pub enum QueryPlan {
         subject: String,
         predicate: String,
     },
+    // 关系查找 + 集合差：除了李四，张三还认识谁
+    FindObjectExcept {
+        subject: String,
+        predicate: String,
+        excluded: Vec<String>,
+    },
+    // 反查主体 + 集合差：除了张三，还有谁认识李四
+    FindSubjectExcept {
+        object: String,
+        predicate: String,
+        excluded: Vec<String>,
+    },
     // 两点之间的路径：张三和王五之间是什么关系
     PathBetween {
         start: String,
@@ -175,6 +187,8 @@ impl QueryPlanner {
             QueryPlan::FindObject { .. } => "FindObject",
             QueryPlan::FindSubject { .. } => "FindSubject",
             QueryPlan::FindObjectByPredicate { .. } => "FindObjectByPredicate",
+            QueryPlan::FindObjectExcept { .. } => "FindObjectExcept",
+            QueryPlan::FindSubjectExcept { .. } => "FindSubjectExcept",
             QueryPlan::PathBetween { .. } => "PathBetween",
             QueryPlan::CommonNeighbor { .. } => "CommonNeighbor",
             QueryPlan::Intermediary { .. } => "Intermediary",
@@ -199,6 +213,26 @@ impl QueryPlanner {
             QueryPlan::FindObjectByPredicate { subject, predicate } => {
                 format!("关系查找：{} {} 的对象", subject, predicate)
             }
+            QueryPlan::FindObjectExcept {
+                subject,
+                predicate,
+                excluded,
+            } => format!(
+                "关系查找（排除 {}）：{} {} 的对象",
+                excluded.join("、"),
+                subject,
+                predicate
+            ),
+            QueryPlan::FindSubjectExcept {
+                object,
+                predicate,
+                excluded,
+            } => format!(
+                "反查主体（排除 {}）：谁的 {} 是 {}",
+                excluded.join("、"),
+                predicate,
+                object
+            ),
             QueryPlan::PathBetween {
                 start,
                 goal,

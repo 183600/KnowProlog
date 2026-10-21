@@ -201,6 +201,38 @@ fn valid_type_noun(text: &str) -> bool {
         && !is_wh(text)
 }
 
+/// 关系从句里的「实体 + 谓词」切分：实体不能以「的」结尾，
+/// 否则「张三的师傅的师傅」会被误读成「张三 + 师傅」的一跳关系。
+fn split_relative_entity_predicate(
+    text: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<(String, String, String, bool)> {
+    let mut candidates: Vec<(String, String, String, bool)> = Vec::new();
+    for (index, _) in text.char_indices().skip(1) {
+        let left = &text[..index];
+        if left.ends_with('的') {
+            continue;
+        }
+        let right = &text[index..];
+        let Some(entity) = entity(left, lexicon) else {
+            continue;
+        };
+        let Some((surface, predicate, negated)) = predicate(right, lexicon) else {
+            continue;
+        };
+        candidates.push((entity, surface, predicate, negated));
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .chars()
+            .count()
+            .cmp(&left.0.chars().count())
+            .then(right.1.chars().count().cmp(&left.1.chars().count()))
+    });
+    candidates.into_iter().next()
+}
+
 /// 关系从句：「V 过/了 的 N」「被 V 的 N」「V N 的 N」。
 /// 返回（从句核心，类型名词），无「的」或名词不合法时弃权。
 fn split_relative_clause(text: &str) -> Option<(&str, &str)> {
@@ -272,6 +304,143 @@ fn split_wh_np_prefix_predicate<'a>(
         .find_map(|(_, tail)| predicate(tail, lexicon).map(|_| tail))
 }
 
+/// 集合差问句：「除了李四，张三还认识谁」「除了张三，还有谁认识李四」。
+/// 排除项必须是词表登记过的实体；内层问句仍交给同一个重写器编译，
+/// 只接受可反向包裹的主体/客体关系计划，其余一律弃权。
+fn parse_excluded_list(
+    raw: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<Vec<String>> {
+    let raw = raw.trim().trim_end_matches('等').trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some(entity) = entity(raw, lexicon) {
+        return Some(vec![entity]);
+    }
+    let mut excluded: Vec<String> = Vec::new();
+    for part in raw.split(|c| matches!(c, '、' | '和' | '与' | '及' | '跟' | '，' | ',')) {
+        let part = part.trim().trim_end_matches('等').trim();
+        if part.is_empty() {
+            continue;
+        }
+        let entity = entity(part, lexicon)?;
+        if !excluded.contains(&entity) {
+            excluded.push(entity);
+        }
+    }
+    (!excluded.is_empty()).then_some(excluded)
+}
+
+/// 切出排除项与后续问句：优先显式边界（以外/之外/外/逗号），
+/// 没有边界时退到「还有/还/也/另外/又」这类继续标记。
+fn split_exclusion_tail(text: &str) -> Option<(&str, &str)> {
+    let mut best: Option<(usize, usize)> = None;
+    for marker in ["以外", "之外", "外", "，", ","] {
+        if let Some(position) = text.find(marker) {
+            let candidate = (position, marker.len());
+            if best.is_none_or(|current| {
+                candidate.0 < current.0
+                    || (candidate.0 == current.0 && candidate.1 > current.1)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    if let Some((position, length)) = best {
+        return Some((&text[..position], &text[position + length..]));
+    }
+    for marker in ["还有", "另外", "还", "也", "又"] {
+        if let Some(position) = text.find(marker) {
+            return Some((&text[..position], &text[position + marker.len()..]));
+        }
+    }
+    None
+}
+
+fn strip_continuation_prefix(text: &str) -> &str {
+    let mut text = text.trim_start_matches(['，', ',', '、', ' ']);
+    for marker in ["还有", "另外", "又"] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            text = rest.trim_start_matches(['，', ',', '、', ' ']);
+        }
+    }
+    text
+}
+
+fn wrap_except_plan(inner: RelationRewrite, excluded: Vec<String>) -> Option<RelationRewrite> {
+    match inner.plan {
+        QueryPlan::FindObjectByPredicate { subject, predicate } => Some(build(
+            QueryPlan::FindObjectExcept {
+                subject,
+                predicate: predicate.clone(),
+                excluded,
+            },
+            inner.shape,
+            "except-wh-object",
+            inner.predicate_surface,
+            predicate,
+        )),
+        QueryPlan::FindSubject { object, predicate } => Some(build(
+            QueryPlan::FindSubjectExcept {
+                object,
+                predicate: predicate.clone(),
+                excluded,
+            },
+            inner.shape,
+            "except-wh-subject",
+            inner.predicate_surface,
+            predicate,
+        )),
+        _ => None,
+    }
+}
+
+fn parse_except_question(
+    text: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<RelationRewrite> {
+    if let Some(after) = text.strip_prefix("除了") {
+        let (excluded_text, rest) = split_exclusion_tail(after)?;
+        let excluded = parse_excluded_list(excluded_text, lexicon)?;
+        let rest = strip_continuation_prefix(rest);
+        if rest.is_empty() || rest.contains('除') {
+            return None;
+        }
+        let inner = rewrite(rest, lexicon)?;
+        return wrap_except_plan(inner, excluded);
+    }
+    if let Some(after) = text.strip_prefix('除') {
+        if after.starts_with('非') {
+            return None;
+        }
+        let (excluded_text, rest) = split_exclusion_tail(after)?;
+        let excluded = parse_excluded_list(excluded_text, lexicon)?;
+        let rest = strip_continuation_prefix(rest);
+        if rest.is_empty() || rest.contains('除') {
+            return None;
+        }
+        let inner = rewrite(rest, lexicon)?;
+        return wrap_except_plan(inner, excluded);
+    }
+    let position = text.find("除了")?;
+    let subject_text = text[..position].trim();
+    if subject_text.is_empty() || subject_text.contains('除') {
+        return None;
+    }
+    let subject = entity(subject_text, lexicon)?;
+    let after = &text[position + "除了".len()..];
+    let (excluded_text, rest) = split_exclusion_tail(after)?;
+    let excluded = parse_excluded_list(excluded_text, lexicon)?;
+    let rest = strip_continuation_prefix(rest);
+    if rest.is_empty() || rest.contains('除') {
+        return None;
+    }
+    let combined = format!("{}{}", subject, rest);
+    let inner = rewrite(&combined, lexicon)?;
+    wrap_except_plan(inner, excluded)
+}
+
 /// 关系计数：「张三教过多少个学生」「张三教过几个」。
 /// 量词后的类型名词只用于说明问的是一类对象，计数仍按关系命中执行；
 /// 谓词必须是关系词表登记过的实义关系，避免把「有几个师傅」误当计数。
@@ -338,7 +507,8 @@ fn parse_relative_wh(
     let (head, _noun) = split_relative_clause(core)?;
 
     if let Some(inner) = head.strip_prefix('被') {
-        let (agent, surface, predicate, negated) = split_entity_predicate(inner, lexicon)?;
+        let (agent, surface, predicate, negated) =
+            split_relative_entity_predicate(inner, lexicon)?;
         if negated {
             return None;
         }
@@ -355,7 +525,7 @@ fn parse_relative_wh(
     }
 
     if let Some((subject, surface, predicate, negated)) =
-        split_entity_predicate(head, lexicon)
+        split_relative_entity_predicate(head, lexicon)
     {
         if !negated {
             return Some(build(
@@ -675,6 +845,10 @@ pub fn rewrite(
     }
     text = text.trim().to_string();
 
+    if let Some(rewrite) = parse_except_question(&text, lexicon) {
+        return Some(rewrite);
+    }
+
     if let Some(rewrite) = parse_relative_wh(&text, lexicon) {
         return Some(rewrite);
     }
@@ -971,7 +1145,7 @@ mod tests {
 
         fn canonical_predicate(&self, raw: &str) -> Option<String> {
             match raw {
-                "认识" | "教" | "教过" => Some(if raw == "教过" {
+                "认识" | "教" | "教过" | "师傅" => Some(if raw == "教过" {
                     "教".to_string()
                 } else {
                     raw.to_string()
@@ -1252,6 +1426,42 @@ mod tests {
     }
 
     #[test]
+    fn exception_questions_compile_to_set_difference_plans() {
+        let object = parse("除了李四，张三还认识谁").expect("排除已知宾语");
+        assert_eq!(object.rule, "except-wh-object");
+        assert_eq!(
+            object.plan,
+            QueryPlan::FindObjectExcept {
+                subject: "张三".to_string(),
+                predicate: "认识".to_string(),
+                excluded: vec!["李四".to_string()]
+            }
+        );
+
+        let subject = parse("除了张三，还有谁认识李四").expect("排除已知主语");
+        assert_eq!(subject.rule, "except-wh-subject");
+        assert_eq!(
+            subject.plan,
+            QueryPlan::FindSubjectExcept {
+                object: "李四".to_string(),
+                predicate: "认识".to_string(),
+                excluded: vec!["张三".to_string()]
+            }
+        );
+
+        let list = parse("除了张三和李四，还有谁认识王五").expect("多个排除项");
+        let QueryPlan::FindSubjectExcept { excluded, .. } = list.plan else {
+            panic!("应编译为集合差计划");
+        };
+        assert_eq!(excluded, vec!["张三".to_string(), "李四".to_string()]);
+
+        let infix = parse("张三除了李四还认识谁").expect("排除项在句中");
+        assert_eq!(infix.rule, "except-wh-object");
+
+        assert!(parse("除了未名，谁认识张三").is_none());
+    }
+
+    #[test]
     fn relation_counts_use_the_count_plan() {
         for question in ["张三教过多少个学生", "张三教过几个学生", "张三教过多少"] {
             let rewrite = parse(question).expect(question);
@@ -1273,6 +1483,7 @@ mod tests {
     #[test]
     fn relative_clause_without_relation_words_abstains() {
         assert!(parse("张三的师傅是谁").is_none());
+        assert!(parse("张三的师傅的师傅是谁").is_none());
         assert!(parse("张三教过的学生").is_none());
     }
 

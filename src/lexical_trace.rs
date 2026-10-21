@@ -691,6 +691,28 @@ pub fn plan_terms(plan: &QueryPlan) -> (Vec<String>, Vec<String>) {
             push_entity(subject);
             predicates.push(predicate.clone());
         }
+        QueryPlan::FindObjectExcept {
+            subject,
+            predicate,
+            excluded,
+        } => {
+            push_entity(subject);
+            predicates.push(predicate.clone());
+            for entity in excluded {
+                push_entity(entity);
+            }
+        }
+        QueryPlan::FindSubjectExcept {
+            object,
+            predicate,
+            excluded,
+        } => {
+            push_entity(object);
+            predicates.push(predicate.clone());
+            for entity in excluded {
+                push_entity(entity);
+            }
+        }
         QueryPlan::PathBetween { start, goal, .. } => {
             push_entity(start);
             push_entity(goal);

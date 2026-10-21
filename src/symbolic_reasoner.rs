@@ -5603,6 +5603,16 @@ impl SymbolicReasoner {
             QueryPlan::FindObjectByPredicate { subject, predicate } => {
                 self.answer_relation_objects(&subject, &predicate)
             }
+            QueryPlan::FindObjectExcept {
+                subject,
+                predicate,
+                excluded,
+            } => self.answer_relation_objects_filtered(&subject, &predicate, &excluded),
+            QueryPlan::FindSubjectExcept {
+                object,
+                predicate,
+                excluded,
+            } => self.answer_find_subject_filtered(&object, &predicate, &excluded),
             QueryPlan::PathBetween {
                 start,
                 goal,
@@ -6247,6 +6257,15 @@ impl SymbolicReasoner {
     }
 
     fn answer_relation_objects(&self, subject_raw: &str, predicate_raw: &str) -> Option<String> {
+        self.answer_relation_objects_filtered(subject_raw, predicate_raw, &[])
+    }
+
+    fn answer_relation_objects_filtered(
+        &self,
+        subject_raw: &str,
+        predicate_raw: &str,
+        excluded: &[String],
+    ) -> Option<String> {
         let entity = self.aligner.canonical_form(subject_raw.trim());
         let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
         let surface = predicate_raw.trim().to_string();
@@ -6256,6 +6275,11 @@ impl SymbolicReasoner {
         if !self.is_known_entity(&entity) || !self.is_known_predicate(&surface) {
             return None;
         }
+        let excluded_display: Vec<String> = excluded.to_vec();
+        let excluded_set: HashSet<String> = excluded
+            .iter()
+            .map(|item| self.aligner.canonical_form(item.trim()))
+            .collect();
         let predicate = ChainPredicate {
             surface: surface.clone(),
             slot,
@@ -6264,7 +6288,19 @@ impl SymbolicReasoner {
         let mut hits = self.node_hits(&entity, &predicate);
         hits.sort_by(|left, right| left.value.cmp(&right.value));
         hits.dedup_by(|left, right| left.value == right.value);
+        let had_hits = !hits.is_empty();
+        if !excluded_set.is_empty() {
+            hits.retain(|hit| !excluded_set.contains(&hit.value));
+        }
         if hits.is_empty() {
+            if had_hits && !excluded_display.is_empty() {
+                return Some(format!(
+                    "根据现有知识库，除「{}」外，没有其他记录「{}{}…」。",
+                    excluded_display.join("、"),
+                    entity,
+                    surface
+                ));
+            }
             return Some(format!(
                 "根据现有知识库，没有记录「{}{}…」。",
                 entity, surface
@@ -6283,6 +6319,9 @@ impl SymbolicReasoner {
                 values.join("、")
             )
         };
+        if !excluded_display.is_empty() {
+            output.push_str(&format!("\n已排除：{}。", excluded_display.join("、")));
+        }
         if let Some(prediction) = hits.iter().find_map(|hit| hit.prediction.as_ref()) {
             output.push_str(&format!(
                 "\n其中为符号推断结果（例如置信度 {:.2}）：{}",
@@ -6362,12 +6401,26 @@ impl SymbolicReasoner {
     }
 
     fn answer_find_subject(&self, object_raw: &str, predicate_raw: &str) -> Option<String> {
+        self.answer_find_subject_filtered(object_raw, predicate_raw, &[])
+    }
+
+    fn answer_find_subject_filtered(
+        &self,
+        object_raw: &str,
+        predicate_raw: &str,
+        excluded: &[String],
+    ) -> Option<String> {
         let object = self.aligner.canonical_form(object_raw.trim());
         let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
         if object.is_empty() || slot.is_empty() {
             return None;
         }
         let surface = predicate_raw.trim().to_string();
+        let excluded_display: Vec<String> = excluded.to_vec();
+        let excluded_set: HashSet<String> = excluded
+            .iter()
+            .map(|item| self.aligner.canonical_form(item.trim()))
+            .collect();
         // 反查主体：正向找槽位三元组的主语；逆向词面（如「徒弟」）语义即
         // "谁的槽位值是 object"，等价于找槽位三元组的宾语（object 作为主语）
         let mut subjects: Vec<String> = if inverted {
@@ -6391,7 +6444,10 @@ impl SymbolicReasoner {
                 .predictor
                 .predict_for_entity(&object, Some(&slot), limit)
             {
-                if prediction.triple.object == object && prediction.triple.subject != object {
+                if prediction.triple.object == object
+                    && prediction.triple.subject != object
+                    && !excluded_set.contains(&prediction.triple.subject)
+                {
                     if seen_subjects.insert(prediction.triple.subject.clone()) {
                         subjects.push(prediction.triple.subject.clone());
                     }
@@ -6399,7 +6455,21 @@ impl SymbolicReasoner {
                 }
             }
         }
+        if !excluded_set.is_empty() {
+            subjects.retain(|subject| !excluded_set.contains(subject));
+        }
         if subjects.is_empty() {
+            if !excluded_display.is_empty()
+                && self.is_known_entity(&object)
+                && self.is_known_predicate(&surface)
+            {
+                return Some(format!(
+                    "根据现有知识库，除「{}」外，没有其他记录「谁的 {} 是 {}」。",
+                    excluded_display.join("、"),
+                    surface,
+                    object
+                ));
+            }
             if self.is_known_entity(&object) && self.is_known_predicate(&surface) {
                 return Some(format!(
                     "根据现有知识库，没有记录「谁的 {} 是 {}」。",
@@ -6415,6 +6485,9 @@ impl SymbolicReasoner {
             surface,
             object
         );
+        if !excluded_display.is_empty() {
+            output.push_str(&format!("\n已排除：{}。", excluded_display.join("、")));
+        }
         if !evidence.is_empty() {
             output.push_str(&format!("\n推理依据：{}", evidence.join("；")));
         }
@@ -13525,6 +13598,21 @@ types = [
                 rel_type: "教".into(),
                 to: "张三".into(),
             },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "认识".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "认识".into(),
+                to: "王五".into(),
+            },
+            PrologFact::Relation {
+                from: "王五".into(),
+                rel_type: "认识".into(),
+                to: "李四".into(),
+            },
         ];
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&facts);
@@ -13558,10 +13646,26 @@ types = [
         assert!(count.contains("李四"), "{}", count);
         assert!(count.contains("王五"), "{}", count);
 
+        let except_object = reasoner
+            .answer("除了李四，张三还认识谁")
+            .expect("集合差问宾语");
+        assert!(except_object.contains("王五"), "{}", except_object);
+        assert!(except_object.contains("已排除：李四"), "{}", except_object);
+
+        let except_subject = reasoner
+            .answer("除了张三，还有谁认识李四")
+            .expect("集合差问主语");
+        assert!(except_subject.contains("王五"), "{}", except_subject);
+        assert!(except_subject.contains("已排除：张三"), "{}", except_subject);
+
         let receipt = reasoner
             .query_rewrite_receipt("张三教过的学生是谁")
             .expect("关系从句回执");
         assert!(receipt.contains("typed-relative-object"), "{}", receipt);
+        let except_receipt = reasoner
+            .query_rewrite_receipt("除了李四，张三还认识谁")
+            .expect("集合差回执");
+        assert!(except_receipt.contains("except-wh-object"), "{}", except_receipt);
     }
 
     fn trace_nlp_config() -> NlpConfig {
