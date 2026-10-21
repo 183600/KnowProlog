@@ -1223,6 +1223,28 @@ impl OxigraphManager {
         id.to_string()
     }
 
+    /// 把 JSON-LD 节点引用解析为命名节点或空白节点。
+    ///
+    /// `_:label` 是 JSON-LD 的空白节点标识符（不是 IRI）。同一标签在重复导入时
+    /// 必须映射到同一空白节点，才能保持导入幂等；标签含非法字符时用稳定哈希兜底。
+    fn jsonld_node(
+        id: &str,
+        context: &HashMap<String, String>,
+    ) -> Result<NamedOrBlankNode, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(label) = id.strip_prefix("_:") {
+            if let Ok(node) = BlankNode::new(label.to_string()) {
+                return Ok(node.into());
+            }
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in label.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            return Ok(BlankNode::new(format!("b{:016x}", hash))?.into());
+        }
+        Ok(NamedNode::new(Self::expand_jsonld_id(id, context))?.into())
+    }
+
     fn process_jsonld_object(
         &self,
         store: &Store,
@@ -1237,24 +1259,21 @@ impl OxigraphManager {
         }
         let context = &context;
 
-        // 获取主语 (subject)
-        let subject_uri = if let Some(id) = obj.get("@id") {
+        // 获取主语 (subject)：@id 可以是 IRI，也可以是 `_:label` 空白节点。
+        let subject: NamedOrBlankNode = if let Some(id) = obj.get("@id") {
             let id = id.as_str().unwrap_or("");
             if id.is_empty() {
-                String::new()
-            } else {
-                Self::expand_jsonld_id(id, context)
+                return Ok(());
             }
+            Self::jsonld_node(id, context)?
         } else {
-            crate::identity::entity_uri(BASE_NS, &Uuid::new_v4().to_string())
+            NamedNode::new(crate::identity::entity_uri(
+                BASE_NS,
+                &Uuid::new_v4().to_string(),
+            ))?
+            .into()
         };
-
-        if subject_uri.is_empty() {
-            return Ok(());
-        }
         stats.entities += 1;
-
-        let subject = NamedNode::new(&subject_uri)?;
 
         // 处理类型信息
         if let Some(types) = obj.get("@type") {
@@ -1309,7 +1328,7 @@ impl OxigraphManager {
     fn process_property_value(
         &self,
         store: &Store,
-        subject: &NamedNode,
+        subject: &NamedOrBlankNode,
         predicate: &NamedNode,
         value: &Value,
         context: &HashMap<String, String>,
@@ -1347,8 +1366,7 @@ impl OxigraphManager {
                 // 处理嵌套对象
                 if let Some(id) = obj.get("@id") {
                     if let Some(uri) = id.as_str() {
-                        let uri = Self::expand_jsonld_id(uri, context);
-                        let object = NamedNode::new(&uri)?;
+                        let object = Self::jsonld_node(uri, context)?;
                         store.insert(&Quad::new(
                             subject.clone(),
                             predicate.clone(),
@@ -5245,6 +5263,63 @@ mod cache_tests {
             result.data[0].get("friendName"),
             Some(&Value::String("李四".to_string()))
         );
+    }
+
+    /// JSON-LD 空白节点：`_:label` 作为主语与宾语都落库，重复导入保持幂等。
+    #[tokio::test]
+    async fn import_jsonld_supports_blank_node_ids_and_references() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "knows": "http://example.org/kg/knows",
+                "Person": "http://example.org/kg/Person"
+            },
+            "@graph": [
+                {
+                    "@id": "_:a",
+                    "@type": "Person",
+                    "name": "匿名甲",
+                    "knows": { "@id": "_:b" }
+                },
+                {
+                    "@id": "_:b",
+                    "@type": "Person",
+                    "name": "匿名乙"
+                }
+            ]
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 2);
+        assert_eq!(stats.relations, 1);
+        assert_eq!(stats.triples, 5, "类型 2 + 名字 2 + 关系 1");
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?subject ?targetName WHERE {
+                    ?subject kg:name "匿名甲" ;
+                             kg:knows ?target .
+                    ?target kg:name ?targetName
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1, "{:?}", result.data);
+        assert_eq!(
+            result.data[0].get("subject"),
+            Some(&Value::String("_:a".to_string())),
+            "空白节点应保留 `_:` 形式：{:?}",
+            result.data
+        );
+        assert_eq!(
+            result.data[0].get("targetName"),
+            Some(&Value::String("匿名乙".to_string()))
+        );
+
+        let replay = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(replay.triples, 0, "重复导入不应新增三元组");
     }
 
     /// 节点级 @context 只作用于该节点：嵌套节点可用不同词项映射。
