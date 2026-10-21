@@ -1433,6 +1433,17 @@ impl OxigraphManager {
                     }
                     return Ok(());
                 }
+                // @list：编码为 RDF 集合（rdf:first / rdf:rest / rdf:nil）。
+                if let Some(list) = obj.get("@list") {
+                    let items: Vec<Value> = match list {
+                        Value::Array(items) => items.clone(),
+                        other => vec![other.clone()],
+                    };
+                    self.process_jsonld_list(
+                        store, subject, predicate, &items, context, stats,
+                    )?;
+                    return Ok(());
+                }
                 // 处理嵌套对象
                 if let Some(id) = obj.get("@id") {
                     if let Some(uri) = id.as_str() {
@@ -1497,6 +1508,119 @@ impl OxigraphManager {
             }
         }
         Ok(())
+    }
+
+    /// 把 `@list` 编码为 RDF 集合，并接到当前主语上。
+    ///
+    /// 单元格使用内容哈希命名：同一文档重复导入仍指向同一组空白节点，
+    /// 不会因为每次生成随机空白节点而破坏幂等。
+    fn process_jsonld_list(
+        &self,
+        store: &Store,
+        subject: &NamedOrBlankNode,
+        predicate: &NamedNode,
+        items: &[Value],
+        context: &HashMap<String, String>,
+        stats: &mut JsonldImportStats,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let rdf_nil = NamedNode::new(format!("{}nil", RDF_NS))?;
+        if items.is_empty() {
+            store.insert(&Quad::new(
+                subject.clone(),
+                predicate.clone(),
+                rdf_nil,
+                GraphName::DefaultGraph,
+            ))?;
+            return Ok(());
+        }
+        let rdf_first = NamedNode::new(format!("{}first", RDF_NS))?;
+        let rdf_rest = NamedNode::new(format!("{}rest", RDF_NS))?;
+        let cells: Vec<NamedOrBlankNode> = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                let material = format!("{}|{}|{}|{}", subject, predicate.as_str(), index, item);
+                for byte in material.as_bytes() {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                BlankNode::new(format!("l{:016x}", hash))
+                    .expect("生成的集合单元格标签必须合法")
+                    .into()
+            })
+            .collect();
+        store.insert(&Quad::new(
+            subject.clone(),
+            predicate.clone(),
+            cells[0].clone(),
+            GraphName::DefaultGraph,
+        ))?;
+        for (index, cell) in cells.iter().enumerate() {
+            let item = self.process_jsonld_list_item(store, &items[index], context, stats)?;
+            store.insert(&Quad::new(
+                cell.clone(),
+                rdf_first.clone(),
+                item,
+                GraphName::DefaultGraph,
+            ))?;
+            let rest: NamedOrBlankNode = cells
+                .get(index + 1)
+                .cloned()
+                .unwrap_or_else(|| rdf_nil.clone().into());
+            store.insert(&Quad::new(
+                cell.clone(),
+                rdf_rest.clone(),
+                rest,
+                GraphName::DefaultGraph,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// 集合项：节点引用保持节点身份，值对象按字面量落库。
+    fn process_jsonld_list_item(
+        &self,
+        store: &Store,
+        item: &Value,
+        context: &HashMap<String, String>,
+        stats: &mut JsonldImportStats,
+    ) -> Result<Term, Box<dyn std::error::Error + Send + Sync>> {
+        match item {
+            Value::String(text) => Ok(Literal::new_simple_literal(text).into()),
+            Value::Number(number) => Ok(Literal::new_simple_literal(&number.to_string()).into()),
+            Value::Bool(value) => Ok(Literal::new_simple_literal(&value.to_string()).into()),
+            Value::Object(obj) => {
+                if let Some(id) = obj.get("@id").and_then(Value::as_str) {
+                    if id.is_empty() {
+                        return Ok(Literal::new_simple_literal("").into());
+                    }
+                    let node = Self::jsonld_node(id, context)?;
+                    // 带描述的对象同时作为独立节点落库。
+                    if obj.keys().any(|key| key != "@id" && key != "@context") {
+                        self.process_jsonld_object(store, obj, context, stats)?;
+                    }
+                    return Ok(node.into());
+                }
+                if let Some(value) = obj.get("@value") {
+                    let text = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    if let Some(datatype) = obj.get("@type").and_then(Value::as_str) {
+                        let datatype =
+                            NamedNode::new(Self::expand_jsonld_term(datatype, context))?;
+                        return Ok(Literal::new_typed_literal(&text, datatype).into());
+                    }
+                    if let Some(language) = obj.get("@language").and_then(Value::as_str) {
+                        return Ok(Literal::new_language_tagged_literal(&text, language)?.into());
+                    }
+                    return Ok(Literal::new_simple_literal(&text).into());
+                }
+                Ok(Literal::new_simple_literal(&item.to_string()).into())
+            }
+            other => Ok(Literal::new_simple_literal(&other.to_string()).into()),
+        }
     }
 
     pub async fn import_jsonld_from_file(
@@ -5481,6 +5605,61 @@ mod cache_tests {
                 .triples,
             0,
             "重复导入保持幂等"
+        );
+    }
+
+    /// JSON-LD @list：编码为 rdf:first/rdf:rest 链，空表指向 rdf:nil，重复导入幂等。
+    #[tokio::test]
+    async fn import_jsonld_supports_rdf_lists() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "items": "http://example.org/kg/items",
+                "friend": "http://example.org/kg/friend"
+            },
+            "@id": "http://example.org/kg/entity/甲",
+            "items": { "@list": ["一", "二"] },
+            "friend": { "@list": [] }
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.triples, 6, "非空表 1+4 条，空表 1 条");
+
+        let firsts = manager
+            .query_sparql(
+                r#"PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                SELECT ?value WHERE { ?cell rdf:first ?value }"#,
+            )
+            .await
+            .unwrap();
+        let mut values: Vec<String> = firsts
+            .data
+            .iter()
+            .filter_map(|row| match row.get("value") {
+                Some(Value::String(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, vec!["一".to_string(), "二".to_string()]);
+
+        let empty = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+                SELECT ?tail WHERE {
+                    <http://example.org/kg/entity/甲> kg:friend ?tail .
+                    FILTER(?tail = rdf:nil)
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty.data.len(), 1, "{:?}", empty.data);
+
+        assert_eq!(
+            manager.import_jsonld(jsonld).await.unwrap().triples,
+            0,
+            "集合单元格按内容命名，重复导入不应新增三元组"
         );
     }
 
