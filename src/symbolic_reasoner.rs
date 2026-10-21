@@ -13645,6 +13645,10 @@ types = [
         assert!(count.contains("共有 2 个"), "{}", count);
         assert!(count.contains("李四"), "{}", count);
         assert!(count.contains("王五"), "{}", count);
+        let relative_count = reasoner
+            .answer("张三教过的学生有多少")
+            .expect("关系从句计数问句");
+        assert!(relative_count.contains("共有 2 个"), "{}", relative_count);
 
         let except_object = reasoner
             .answer("除了李四，张三还认识谁")

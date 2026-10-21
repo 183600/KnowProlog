@@ -473,12 +473,38 @@ fn parse_relation_count(
         if !after.is_empty() && !valid_type_noun(after) {
             continue;
         }
-        let Some((subject, surface, predicate, negated)) =
+        if let Some((subject, surface, predicate, negated)) =
             split_entity_predicate(head, lexicon)
+        {
+            if !negated && !matches!(predicate.as_str(), "有" | "是") {
+                return Some(build(
+                    QueryPlan::Count {
+                        subject,
+                        predicate: predicate.clone(),
+                    },
+                    RelationShape::CountRelation,
+                    "relation-count",
+                    surface,
+                    predicate,
+                ));
+            }
+        }
+        // 关系从句计数：「张三教过的学生有多少」「被张三教过的学生有几个」。
+        // 只支持问宾语的从句；问主语的「教过张三的老师有多少」需要另一类
+        // 计数计划，这里保守弃权。
+        let Some(relative_core) = head.strip_suffix('有') else {
+            continue;
+        };
+        let Some((clause, _noun)) = split_relative_clause(relative_core) else {
+            continue;
+        };
+        let clause = clause.strip_prefix('被').unwrap_or(clause);
+        let Some((subject, surface, predicate, negated)) =
+            split_relative_entity_predicate(clause, lexicon)
         else {
             continue;
         };
-        if negated || matches!(predicate.as_str(), "有" | "是") {
+        if negated {
             continue;
         }
         return Some(build(
@@ -487,7 +513,7 @@ fn parse_relation_count(
                 predicate: predicate.clone(),
             },
             RelationShape::CountRelation,
-            "relation-count",
+            "relative-count",
             surface,
             predicate,
         ));
@@ -1478,6 +1504,21 @@ mod tests {
             );
         }
         assert!(parse("张三有几个师傅").is_none());
+
+        let relative = parse("张三教过的学生有多少").expect("关系从句计数");
+        assert_eq!(relative.rule, "relative-count");
+        assert_eq!(
+            relative.plan,
+            QueryPlan::Count {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+        assert_eq!(
+            parse("被张三教过的学生有几个").expect("被字关系从句计数").rule,
+            "relative-count"
+        );
+        assert!(parse("教过张三的老师有多少").is_none());
     }
 
     #[test]
