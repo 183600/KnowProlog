@@ -5969,6 +5969,22 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 规则预演：解析但不入会话规则库，先看重复/不安全变量/功能冲突与派生影响
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["规则预演：", "规则预演:", "教规则预演：", "教规则预演:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请给出中文规则，例如：规则预演：如果X的师傅是Y，那么X的老师是Y");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.belief_rule_preview(target));
+            }
+            println!();
+            continue;
+        }
+
         // 中文规则学习：教一条 Horn 规则（含占位符自动变量化），直接进入后向链
         if let Some(target) = strip_any_prefix(
             input,
@@ -8637,6 +8653,7 @@ fn interactive_help() -> String {
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
         "  修订预演：<实体>|<属性>|<旧>|<新>   提交前计算影响与冲突（只计算，不写图）",
+        "  规则预演：<如果…那么…>              教规则前检查重复/不安全变量/功能冲突与影响",
         "  信念检查 / 信念一致性              功能谓词多值、定义域/值域与规则形状体检",
         "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
         "",

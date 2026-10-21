@@ -2152,6 +2152,35 @@ impl SymbolicReasoner {
         self.belief_state().check().render_zh()
     }
 
+    /// 规则提交预演：把中文规则解析成 Horn 子句后，先检查不安全变量、重复规则、
+    /// 功能谓词冲突与派生影响；只计算，不把规则放进会话规则库。
+    pub fn belief_rule_preview(&self, sentence_raw: &str) -> String {
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请给出中文规则，例如：规则预演：如果X的师傅是Y，那么X的老师是Y"
+                .to_string();
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let clauses: Vec<Clause> = outcome
+            .lessons
+            .iter()
+            .filter_map(chinese_reasoning_nlu::lesson_to_clause)
+            .collect();
+        if clauses.is_empty() {
+            let mut output = String::from("没能把这句话解析成规则：\n");
+            for error in &outcome.errors {
+                output.push_str(&format!("  · {}\n", error));
+            }
+            return output.trim_end().to_string();
+        }
+        let state = self.belief_state();
+        let mut changeset = ChangeSet::new(format!("规则预演：{}", sentence));
+        for clause in clauses {
+            changeset.push(crate::belief_revision::ChangeOp::AddRule(clause));
+        }
+        state.plan(changeset).render_zh()
+    }
+
     /// 更正预演：在提交到图谱之前，先展示受影响的事实/派生结论与冲突。
     /// 只计算、不修改知识库；真正的写入仍由宿主的更正路径完成。
     pub fn belief_revision_preview(
@@ -13990,5 +14019,20 @@ types = [
         // 观测不改变回答路径：普通闭包/多跳问句仍走原实现。
         let answer = reasoner.answer("张三的师傅的师傅是谁");
         assert!(answer.is_some(), "原多跳回答不应被追踪改变");
+    }
+
+    #[test]
+    fn belief_rule_preview_reports_plan_without_teaching() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let before = reasoner.resolver.clause_count();
+        let report = reasoner.belief_rule_preview("如果X的师傅是Y，那么X的老师是Y");
+        assert!(report.contains("修订计划"), "{}", report);
+        assert!(report.contains("影响"), "{}", report);
+        assert_eq!(
+            reasoner.resolver.clause_count(),
+            before,
+            "预演不得把规则放进会话规则库"
+        );
     }
 }
