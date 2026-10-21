@@ -2243,6 +2243,11 @@ impl PluginRuntime {
                 match contribution {
                     Contribution::Lexicon { id, entries, .. } => {
                         for entry in entries {
+                            // 空词面永远匹配（starts_with("")恒真）却不推进游标，
+                            // 会让单遍替换原地打转：校验层已按 Error 废包，这里再兜底。
+                            if entry.surface.trim().is_empty() || entry.canonical.trim().is_empty() {
+                                continue;
+                            }
                             pairs.push((
                                 entry.surface.clone(),
                                 entry.canonical.clone(),
@@ -2259,10 +2264,20 @@ impl PluginRuntime {
                         ..
                     } => {
                         for predicate in predicates {
+                            let name = predicate.name.trim();
+                            if name.is_empty() {
+                                continue;
+                            }
                             for alias in &predicate.aliases {
+                                let alias = alias.trim();
+                                // 与校验层「空别名/自指别名已忽略」的承诺保持一致：
+                                // 这些词面不进词法替换，既不空转也不产生假命中。
+                                if alias.is_empty() || alias == name {
+                                    continue;
+                                }
                                 pairs.push((
-                                    alias.clone(),
-                                    predicate.name.clone(),
+                                    alias.to_string(),
+                                    name.to_string(),
                                     manifest.id.clone(),
                                     id.clone(),
                                     mode,
@@ -2270,10 +2285,18 @@ impl PluginRuntime {
                             }
                         }
                         for entity_type in types {
+                            let name = entity_type.name.trim();
+                            if name.is_empty() {
+                                continue;
+                            }
                             for alias in &entity_type.aliases {
+                                let alias = alias.trim();
+                                if alias.is_empty() || alias == name {
+                                    continue;
+                                }
                                 pairs.push((
-                                    alias.clone(),
-                                    entity_type.name.clone(),
+                                    alias.to_string(),
+                                    name.to_string(),
                                     manifest.id.clone(),
                                     id.clone(),
                                     mode,
@@ -2852,11 +2875,13 @@ fn apply_lexicon(input: &str, pairs: &[LexiconPair]) -> (String, Vec<PluginMatch
     let mut pos = 0usize;
     while pos < input.len() {
         let rest = &input[pos..];
-        let on_match = pairs
-            .iter()
-            .find(|(surface, _, _, _, mode)| *mode == PluginMode::On && rest.starts_with(surface));
+        // 空词面必须排除：starts_with("") 恒真且 len()==0 不推进 pos，
+        // 哪怕上游漏过滤也会在这里兜底，保证每轮至少吐一个字符。
+        let on_match = pairs.iter().find(|(surface, _, _, _, mode)| {
+            *mode == PluginMode::On && !surface.is_empty() && rest.starts_with(surface.as_str())
+        });
         let observe_match = pairs.iter().find(|(surface, _, _, _, mode)| {
-            *mode == PluginMode::Observe && rest.starts_with(surface)
+            *mode == PluginMode::Observe && !surface.is_empty() && rest.starts_with(surface.as_str())
         });
         if let Some((surface, canonical, plugin, contribution, mode)) = on_match {
             out.push_str(canonical);
@@ -3212,6 +3237,99 @@ mod tests {
                 .filter(|entry| entry.kind == "lexicon")
                 .count()
                 >= 2
+        );
+    }
+
+    /// 空词面绝不能进单遍替换：`starts_with("")` 恒真且 `len()==0` 不推进
+    /// 游标，一旦混入就会原地打转（进程挂死 + 无限分配）。
+    #[test]
+    fn apply_lexicon_ignores_empty_surfaces_and_always_terminates() {
+        let pairs = vec![
+            (
+                String::new(),
+                "电影".to_string(),
+                "zh.broken".to_string(),
+                "broken.lexicon".to_string(),
+                PluginMode::On,
+            ),
+            (
+                String::new(),
+                "人物".to_string(),
+                "zh.broken".to_string(),
+                "broken.lexicon".to_string(),
+                PluginMode::Observe,
+            ),
+        ];
+        let (text, matches) = apply_lexicon("阿凡达是谁导演的", &pairs);
+        assert_eq!(text, "阿凡达是谁导演的");
+        assert!(
+            matches.is_empty(),
+            "空词面不应产生命中记录：{:?}",
+            matches
+        );
+
+        // 空词面与真实词面混排时，真实词面仍要生效。
+        let mixed = vec![
+            (
+                "影片".to_string(),
+                "电影".to_string(),
+                "zh.film".to_string(),
+                "film.lexicon".to_string(),
+                PluginMode::On,
+            ),
+            (
+                String::new(),
+                "垃圾".to_string(),
+                "zh.broken".to_string(),
+                "broken.lexicon".to_string(),
+                PluginMode::On,
+            ),
+        ];
+        let (text, matches) = apply_lexicon("这部影片很好", &mixed);
+        assert_eq!(text, "这部电影很好");
+        assert_eq!(matches.len(), 1);
+    }
+
+    /// 本体空别名/自指别名只记警告不废包：它们必须真的被「已忽略」，
+    /// 既不进词法替换（否则挂死），也不产生自指改写噪声。
+    #[test]
+    fn degenerate_ontology_aliases_are_dropped_from_lexicon_pass() {
+        let mut film = manifest("zh.film", PluginMode::On);
+        film.contributions.push(Contribution::Ontology {
+            id: "film.ontology".to_string(),
+            description: String::new(),
+            predicates: vec![OntologyPredicate {
+                name: "导演".to_string(),
+                aliases: vec![String::new(), "导演".to_string(), "执导".to_string()],
+                ..OntologyPredicate::default()
+            }],
+            types: vec![OntologyType {
+                name: "电影".to_string(),
+                aliases: vec![String::new(), "影片".to_string()],
+                ..OntologyType::default()
+            }],
+        });
+        let registry = PluginRegistry::from_manifests(vec![film]);
+        assert!(!registry.has_errors(), "{}", registry.render_issues());
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+
+        let outcome = runtime.rewrite("这部影片是谁执导的");
+        assert_eq!(
+            outcome.text, "这部电影是谁导演的",
+            "有效别名照常生效，空/自指别名被忽略"
+        );
+        let mut details: Vec<&str> = outcome
+            .trace
+            .matches
+            .iter()
+            .filter(|entry| entry.kind == "lexicon")
+            .map(|entry| entry.detail.as_str())
+            .collect();
+        details.sort();
+        assert_eq!(
+            details,
+            vec!["影片 → 电影", "执导 → 导演"],
+            "空别名与自指别名都不得产生命中"
         );
     }
 
