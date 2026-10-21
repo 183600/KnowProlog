@@ -8,7 +8,7 @@
 //! 规则约束版本号。
 //!
 //! [`check`] 是发布总闸门：config lint → prompt lint → plugin eval → schema
-//! diff → NLU 评测 → 恢复评测 → 质量差分模糊测试。所有报告只含确定性数据
+//! diff → NLU 评测 → 恢复评测 → 身份评测 → 质量差分模糊测试。所有报告只含确定性数据
 //! （BTreeMap 排序、无时间戳），同一资产必然得到同一摘要。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +22,7 @@ use crate::config_contract;
 use crate::dialogue_eval::{self, DialogueEvalBaseline, EvalKnowledge};
 use crate::dialogue_fuzz::{self, FuzzBaseline, FuzzConfig};
 use crate::eval_recovery::{self, EvalRecoveryBaseline};
+use crate::identity_eval::{self, IdentityEvalBaseline};
 use crate::plugin::{PluginRegistry, PluginRuntime};
 use crate::prompt_spec::{self, LintSeverity, PromptMode};
 use crate::SystemConfig;
@@ -1857,6 +1858,8 @@ pub struct ReleaseLock {
     #[serde(default)]
     pub recovery: Option<EvalRecoveryBaseline>,
     #[serde(default)]
+    pub identity: Option<IdentityEvalBaseline>,
+    #[serde(default)]
     pub fuzz: Option<FuzzBaseline>,
 }
 
@@ -2078,12 +2081,17 @@ pub fn check(
 
     let mut nlu_baseline = old_lock.as_ref().and_then(|lock| lock.nlu.clone());
     let mut recovery_baseline = old_lock.as_ref().and_then(|lock| lock.recovery.clone());
+    let mut identity_baseline = old_lock.as_ref().and_then(|lock| lock.identity.clone());
     let mut fuzz_baseline = old_lock.as_ref().and_then(|lock| lock.fuzz.clone());
 
     if options.skip_evals {
         gates.push(GateReport::skipped("eval_nlu", "已跳过（--skip-evals）"));
         gates.push(GateReport::skipped(
             "eval_recovery",
+            "已跳过（--skip-evals）",
+        ));
+        gates.push(GateReport::skipped(
+            "eval_identity",
             "已跳过（--skip-evals）",
         ));
         gates.push(GateReport::skipped(
@@ -2172,6 +2180,49 @@ pub fn check(
             recovery_baseline = Some(EvalRecoveryBaseline::from_report(&recovery_report));
         }
 
+        let identity_report = identity_eval::evaluate_seed();
+        let (passed, summary, detail) = match &identity_baseline {
+            Some(baseline) => {
+                let verdict = identity_eval::compare_baseline(baseline, &identity_report, 1e-6);
+                (
+                    verdict.passed,
+                    format!(
+                        "作用域准确率 {:.4} / claim F1 {:.4} / 越权率 {:.4}",
+                        identity_report.act_accuracy,
+                        identity_report.claim_f1,
+                        identity_report.overclaim_rate
+                    ),
+                    verdict
+                        .regressions
+                        .iter()
+                        .map(|delta| {
+                            format!(
+                                "{}: {:.6} → {:.6}",
+                                delta.metric, delta.baseline, delta.current
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            None if options.update_lock => (
+                true,
+                "首次运行：以当前身份报告作为基线".to_string(),
+                Vec::new(),
+            ),
+            None => (
+                false,
+                "发布锁没有身份基线；先运行 release-check --update-lock".to_string(),
+                Vec::new(),
+            ),
+        };
+        gates.push(
+            GateReport::new("eval_identity", passed, digest(&identity_report), summary)
+                .with_detail(detail),
+        );
+        if options.update_lock {
+            identity_baseline = Some(IdentityEvalBaseline::from_report(&identity_report));
+        }
+
         let fuzz_report = dialogue_fuzz::run(&FuzzConfig::default());
         let (passed, summary, detail) = match &fuzz_baseline {
             Some(baseline) => {
@@ -2229,6 +2280,7 @@ pub fn check(
             schema_digest: schema_digest.clone(),
             nlu: nlu_baseline,
             recovery: recovery_baseline,
+            identity: identity_baseline,
             fuzz: fuzz_baseline,
         };
         lock.save(options.lock_path)?;
@@ -2397,6 +2449,7 @@ mod tests {
             schema: snapshot,
             nlu: None,
             recovery: None,
+            identity: None,
             fuzz: None,
         };
         lock.save(&path).unwrap();

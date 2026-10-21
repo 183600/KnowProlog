@@ -1398,6 +1398,26 @@
       "recovery.silent_failure_rate": 0.0
     }
   },
+  "identity": {
+    "version": 1,
+    "corpus_digest": "6037595a4e8d696c",
+    "metrics": {
+      "identity.abstain_rate": 1.0,
+      "identity.act_accuracy": 1.0,
+      "identity.claim_f1": 1.0,
+      "identity.claim_precision": 1.0,
+      "identity.claim_recall": 1.0,
+      "identity.cross_session_leak_rate": 0.0,
+      "identity.evidence_coverage": 1.0,
+      "identity.forget_clear_rate": 1.0,
+      "identity.missing_cards": 0.0,
+      "identity.overclaim_rate": 0.0,
+      "identity.scope_leak_rate": 0.0,
+      "identity.session_retention_rate": 1.0,
+      "identity.stale_mention_rate": 0.0,
+      "identity.status_accuracy": 1.0
+    }
+  },
   "fuzz": {
     "version": 1,
     "seed": 20261019,
