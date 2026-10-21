@@ -502,7 +502,7 @@ impl ShapeAnswer {
         }
         for issue in &self.issues {
             lines.push(format!(
-                "  类型问题：{}（{}）；期望：{}；实际：{}。系统不会把不合形状的取值当作确定事实。",
+                "  形状问题：{}（{}）；期望：{}；实际：{}。系统不会把不合形状的取值当作确定事实。",
                 issue.surface,
                 issue.message,
                 issue.expected.join("、"),
@@ -1528,7 +1528,7 @@ mod tests {
         assert!(!turn.answer.issues.is_empty());
         assert!(dialogue.agenda().blocked.contains("刘德华"));
         assert!(dialogue.agenda().next_global(&BTreeMap::new()).is_none());
-        assert!(turn.message.contains("类型问题"));
+        assert!(turn.message.contains("形状问题"));
         assert!(turn.message.contains("不会把不合形状的取值当作确定事实"));
         assert!(
             turn.consultation.is_none(),

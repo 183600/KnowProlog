@@ -630,7 +630,7 @@ fn run_type_issue(tally: &mut EvalTally) {
     if turn.answer.status == AnswerStatus::Conflict
         && !turn.answer.issues.is_empty()
         && turn.consultation.is_none()
-        && turn.message.contains("类型问题")
+        && turn.message.contains("形状问题")
         && turn.message.contains("不会把不合形状的取值当作确定事实")
         && dialogue.agenda().blocked.contains("刘德华")
     {
