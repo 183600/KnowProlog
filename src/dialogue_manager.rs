@@ -26,8 +26,10 @@ use crate::contextual_reference::{
 };
 use crate::derivation::Derivation;
 use crate::entity_linker::EntityLinker;
-use crate::identity_dialogue::{self, IdentityAct, IdentityCard, IdentityStatus, UserIdentityLedger};
 use crate::epistemic::{EpistemicStatus, LedgerLoad};
+use crate::identity_dialogue::{
+    self, IdentityAct, IdentityCard, IdentityStatus, UserIdentityLedger,
+};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
 use crate::quality::{ClaimWarrant, QualityIndex};
@@ -1443,12 +1445,7 @@ impl DialogueManager {
                     IdentityStatus::Forgotten => "identity_user_forgotten",
                     _ => "identity_user_known",
                 };
-                (
-                    card,
-                    plan.to_string(),
-                    MoveKind::AskIdentity,
-                    String::new(),
-                )
+                (card, plan.to_string(), MoveKind::AskIdentity, String::new())
             }
             IdentityAct::Introduce { name } => {
                 let outcome = self.identity.remember(&name, turn_no);
@@ -1476,22 +1473,24 @@ impl DialogueManager {
                 (card, plan.to_string(), MoveKind::Assert, text)
             }
             IdentityAct::ForgetUser => {
+                let had_identity = !self.identity.is_empty();
                 self.identity.forget();
                 let card = identity_dialogue::user_card(&self.identity);
+                let text = if had_identity {
+                    String::new()
+                } else {
+                    "你还没有在这个会话里告诉我你的名字；我仍然不会保留任何称呼。".to_string()
+                };
                 (
                     card,
                     "identity_user_forget".to_string(),
                     MoveKind::Assert,
-                    String::new(),
+                    text,
                 )
             }
             IdentityAct::AskEntity | IdentityAct::Other => return None,
         };
-        let text = if text.is_empty() {
-            card.render()
-        } else {
-            text
-        };
+        let text = if text.is_empty() { card.render() } else { text };
         let plans = vec![plan];
         self.turns.push(DialogueTurn {
             index: turn_no,
@@ -1528,8 +1527,7 @@ impl DialogueManager {
         self.references.begin_turn();
         if let Some(pending) = self.pending_reference.take() {
             match parse_clarify_act(input, &pending.question) {
-                Some(ClarifyAct::Choose { entity, .. })
-                | Some(ClarifyAct::Restate { entity }) => {
+                Some(ClarifyAct::Choose { entity, .. }) | Some(ClarifyAct::Restate { entity }) => {
                     self.references.bind(
                         &pending.key,
                         &entity,
@@ -2806,8 +2804,7 @@ impl DialogueManager {
         let Some(turn) = self.last_answered_turn() else {
             return (
                 self.failure_self_description().unwrap_or_else(|| {
-                    "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。"
-                        .to_string()
+                    "我还没有答过什么问题，暂时没有可解释的依据。先问我一个知识问题吧。".to_string()
                 }),
                 None,
             );
@@ -3023,11 +3020,7 @@ impl DialogueManager {
             return None;
         }
         Some(Derivation::from_direct_facts(
-            format!(
-                "{} 的 {}",
-                entity,
-                surface_attribute(attribute)
-            ),
+            format!("{} 的 {}", entity, surface_attribute(attribute)),
             facts,
         ))
     }
@@ -3519,7 +3512,10 @@ fn parse_step_request(text: &str) -> Option<usize> {
         let ones = if pos + '十'.len_utf8() == raw.len() {
             0
         } else {
-            raw[pos + '十'.len_utf8()..].chars().next().and_then(digit)?
+            raw[pos + '十'.len_utf8()..]
+                .chars()
+                .next()
+                .and_then(digit)?
         };
         return Some(tens * 10 + ones).filter(|step| *step > 0);
     }
@@ -3687,8 +3683,7 @@ mod tests {
         }
 
         fn with_derivation(mut self, question: &str, derivation: Derivation) -> Self {
-            self.derivations
-                .insert(question.to_string(), derivation);
+            self.derivations.insert(question.to_string(), derivation);
             self
         }
     }
@@ -4111,7 +4106,11 @@ mod tests {
         let out_of_range = manager
             .plan_pure_dialogue("第九步呢？", &knowledge)
             .expect("越界步骤也应给出可行动作");
-        assert!(out_of_range.text.contains("没有第 9 步"), "{}", out_of_range.text);
+        assert!(
+            out_of_range.text.contains("没有第 9 步"),
+            "{}",
+            out_of_range.text
+        );
     }
 
     #[test]
@@ -4128,7 +4127,11 @@ mod tests {
             .plan_pure_dialogue("依据是什么？", &knowledge)
             .expect("依据追问应被接管");
         assert!(why.text.contains("证明步骤"), "{}", why.text);
-        assert!(why.text.contains("姚明 的 身高 是 226 厘米"), "{}", why.text);
+        assert!(
+            why.text.contains("姚明 的 身高 是 226 厘米"),
+            "{}",
+            why.text
+        );
     }
 
     #[test]
@@ -4770,6 +4773,19 @@ output = "value"
             .plan_pure_dialogue("我是谁", &knowledge)
             .expect("新会话也应回答");
         assert!(fresh_reply.text.contains("还没有"), "{}", fresh_reply.text);
+        let fresh_forget = fresh
+            .plan_pure_dialogue("忘记我的名字", &knowledge)
+            .expect("空台账的遗忘也应被确认");
+        assert!(
+            fresh_forget.text.contains("还没有"),
+            "{}",
+            fresh_forget.text
+        );
+        assert!(
+            !fresh_forget.text.contains("已经忘记"),
+            "{}",
+            fresh_forget.text
+        );
 
         let forgotten = manager
             .plan_pure_dialogue("忘记我的名字", &knowledge)
@@ -4784,6 +4800,12 @@ output = "value"
             manager.last_identity_card().map(|card| card.status),
             Some(crate::identity_dialogue::IdentityStatus::Forgotten)
         );
+
+        let reintro = manager
+            .plan_pure_dialogue("我叫王五", &knowledge)
+            .expect("遗忘后可以重新自述");
+        assert!(reintro.text.contains("王五"), "{}", reintro.text);
+        assert_eq!(manager.identity_ledger().current(), Some("王五"));
     }
 
     #[test]
@@ -4813,14 +4835,10 @@ output = "value"
         assert!(reply.text.contains("【身份卡·实体】"), "{}", reply.text);
         assert!(reply.text.contains("依据：图谱属性 身高"), "{}", reply.text);
         let card = manager.last_identity_card().expect("应留下结构化身份卡");
-        assert_eq!(
-            card.scope,
-            crate::identity_dialogue::IdentityScope::Entity
-        );
+        assert_eq!(card.scope, crate::identity_dialogue::IdentityScope::Entity);
         assert_eq!(card.status, crate::identity_dialogue::IdentityStatus::Known);
         assert_eq!(card.scope_leaks(), 0);
         assert_eq!(card.missing_evidence(), 0);
         assert_eq!(manager.focus_entity(), Some("姚明"));
     }
-
 }
