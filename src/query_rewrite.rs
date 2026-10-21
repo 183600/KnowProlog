@@ -89,6 +89,29 @@ const WH_PREFIXES: [&str; 8] = ["什么人", "哪些人", "哪位", "哪个", "�
 const WH_SUFFIXES: [&str; 9] = [
     "什么人", "哪些人", "哪位", "哪个", "谁", "何人", "什么", "啥", "哪些",
 ];
+/// 疑问词后还可以带类型名词：「哪些学生」「哪位老师」「什么书」。
+/// 这类名词只约束答案类型，不参与谓词词表校验。
+const WH_NP_HEADS: [&str; 8] = ["哪些", "哪个", "哪位", "哪家", "哪门", "哪几", "什么", "啥"];
+/// 关系从句后的问句尾巴：「张三教过的学生有哪些」。
+/// 按长度从长到短排列，避免「是哪些人」被「是谁」抢先剥离。
+const RELATIVE_WH_TAILS: [&str; 16] = [
+    "分别是哪些人",
+    "分别是哪些",
+    "分别是谁",
+    "都有哪些",
+    "都有谁",
+    "有哪些人",
+    "有哪些",
+    "是哪些人",
+    "是哪些",
+    "是哪个",
+    "是哪位",
+    "是什么",
+    "是谁",
+    "有谁",
+    "哪些人",
+    "哪些",
+];
 const POLITE_PREFIXES: [&str; 11] = [
     "请问一下",
     "请问",
@@ -158,6 +181,154 @@ fn strip_trailing_particles(text: &str) -> String {
 
 fn is_wh(text: &str) -> bool {
     WH_SUFFIXES.iter().any(|word| text.contains(word))
+}
+
+/// 类型名词的保守边界：短、无功能词、无体标记。
+/// 解析器只借它界定「哪些学生」的范围，不要求本体登记。
+fn valid_type_noun(text: &str) -> bool {
+    let chars = text.chars().count();
+    (1..=10).contains(&chars)
+        && !text.chars().any(|c| {
+            matches!(
+                c,
+                '的' | '是' | '被' | '把' | '将' | '吗' | '呢' | '吧' | '啊' | '过' | '了'
+                    | '着' | '不' | '没' | '和' | '跟' | '与' | '还' | '也' | '都' | '，'
+                    | ',' | '？' | '?' | '。' | '！' | '!' | ' '
+            )
+        })
+        && !is_wh(text)
+}
+
+/// 关系从句：「V 过/了 的 N」「被 V 的 N」「V N 的 N」。
+/// 返回（从句核心，类型名词），无「的」或名词不合法时弃权。
+fn split_relative_clause(text: &str) -> Option<(&str, &str)> {
+    let (head, noun) = text.rsplit_once('的')?;
+    let head = head.trim();
+    let noun = noun.trim();
+    if head.is_empty() || !valid_type_noun(noun) {
+        return None;
+    }
+    Some((head, noun))
+}
+
+/// 「哪些学生」「哪位老师」这类疑问名词短语必须整体消费到句尾；
+/// 返回（左侧关系部分，右侧疑问名词短语）。
+fn split_wh_np_suffix(text: &str) -> Option<(&str, &str)> {
+    let mut best: Option<(usize, &str)> = None;
+    for head in WH_NP_HEADS {
+        let Some(position) = text.rfind(head) else {
+            continue;
+        };
+        if position == 0 || best.is_some_and(|(current, _)| current >= position) {
+            continue;
+        }
+        let noun = &text[position + head.len()..];
+        if valid_type_noun(noun) {
+            best = Some((position, head));
+        }
+    }
+    let (position, _) = best?;
+    Some((&text[..position], &text[position..]))
+}
+
+/// 疑问名词短语在句首时，枚举「疑问词 + 类型名词 + 谓词…」的切法。
+/// 只返回通过词表校验的最长名词候选，保证「哪些老师教过张三」不把
+/// 「老师教过」整体误当名词。
+fn split_wh_np_prefix_candidates<'a>(text: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut candidates: Vec<(&str, &str)> = Vec::new();
+    for head in WH_NP_HEADS {
+        let Some(rest) = text.strip_prefix(head) else {
+            continue;
+        };
+        for (index, _) in rest.char_indices().skip(1) {
+            let noun = &rest[..index];
+            let tail = &rest[index..];
+            if valid_type_noun(noun) {
+                candidates.push((noun, tail));
+            }
+        }
+    }
+    candidates.sort_by(|left, right| right.0.chars().count().cmp(&left.0.chars().count()));
+    candidates
+}
+
+fn split_wh_np_prefix_object<'a>(
+    text: &'a str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<&'a str> {
+    split_wh_np_prefix_candidates(text)
+        .into_iter()
+        .find_map(|(_, tail)| split_predicate_object(tail, lexicon).map(|_| tail))
+}
+
+fn split_wh_np_prefix_predicate<'a>(
+    text: &'a str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<&'a str> {
+    split_wh_np_prefix_candidates(text)
+        .into_iter()
+        .find_map(|(_, tail)| predicate(tail, lexicon).map(|_| tail))
+}
+
+/// 「张三教过的学生是谁」「教过张三的老师有哪些」：
+/// 关系从句先压成关系查找，再由现成的关系回答器执行。
+fn parse_relative_wh(
+    text: &str,
+    lexicon: &dyn RelationLexicon,
+) -> Option<RelationRewrite> {
+    let core = RELATIVE_WH_TAILS
+        .iter()
+        .find_map(|tail| text.strip_suffix(tail))?;
+    let (head, _noun) = split_relative_clause(core)?;
+
+    if let Some(inner) = head.strip_prefix('被') {
+        let (agent, surface, predicate, negated) = split_entity_predicate(inner, lexicon)?;
+        if negated {
+            return None;
+        }
+        return Some(build(
+            QueryPlan::FindObjectByPredicate {
+                subject: agent,
+                predicate: predicate.clone(),
+            },
+            RelationShape::PassiveWhPatient,
+            "typed-relative-passive-patient",
+            surface,
+            predicate,
+        ));
+    }
+
+    if let Some((subject, surface, predicate, negated)) =
+        split_entity_predicate(head, lexicon)
+    {
+        if !negated {
+            return Some(build(
+                QueryPlan::FindObjectByPredicate {
+                    subject,
+                    predicate: predicate.clone(),
+                },
+                RelationShape::ActiveWhObject,
+                "typed-relative-object",
+                surface,
+                predicate,
+            ));
+        }
+    }
+
+    let (surface, predicate, object, negated) = split_predicate_object(head, lexicon)?;
+    if negated {
+        return None;
+    }
+    Some(build(
+        QueryPlan::FindSubject {
+            object,
+            predicate: predicate.clone(),
+        },
+        RelationShape::ActiveWhSubject,
+        "typed-relative-subject",
+        surface,
+        predicate,
+    ))
 }
 
 /// A 不 A / A 不 AB 型正反问：「认不认识」「教不教」「喜不喜欢」。
@@ -448,6 +619,10 @@ pub fn rewrite(
     }
     text = text.trim().to_string();
 
+    if let Some(rewrite) = parse_relative_wh(&text, lexicon) {
+        return Some(rewrite);
+    }
+
     for suffix in ["的是哪些人", "的是哪位", "的是哪个", "的是谁"] {
         if let Some(rest) = text.strip_suffix(suffix) {
             if let Some(inner) = rest.strip_prefix('被') {
@@ -509,7 +684,9 @@ pub fn rewrite(
             ));
         }
         let patient = entity(patient_text, lexicon)?;
-        if let Some(rest) = right.strip_prefix_wh() {
+        if let Some(rest) = split_wh_np_prefix_predicate(right, lexicon)
+            .or_else(|| right.strip_prefix_wh())
+        {
             if marker_negated {
                 return None;
             }
@@ -573,7 +750,9 @@ pub fn rewrite(
             ));
         }
         let subject = entity(subject_text, lexicon)?;
-        if let Some(rest) = right.strip_prefix_wh() {
+        if let Some(rest) = split_wh_np_prefix_predicate(right, lexicon)
+            .or_else(|| right.strip_prefix_wh())
+        {
             if marker_negated {
                 return None;
             }
@@ -611,6 +790,23 @@ pub fn rewrite(
         ));
     }
 
+    if let Some(rest) = split_wh_np_prefix_object(&text, lexicon) {
+        let (surface, predicate, object, negated) = split_predicate_object(rest, lexicon)?;
+        if negated {
+            return None;
+        }
+        return Some(build(
+            QueryPlan::FindSubject {
+                object,
+                predicate: predicate.clone(),
+            },
+            RelationShape::ActiveWhSubject,
+            "active-wh-np-subject",
+            surface,
+            predicate,
+        ));
+    }
+
     if let Some(prefix) = wh_prefix(&text) {
         let rest = &text[prefix..];
         let (surface, predicate, object, negated) = split_predicate_object(rest, lexicon)?;
@@ -627,6 +823,25 @@ pub fn rewrite(
             surface,
             predicate,
         ));
+    }
+
+    if let Some((head, _np)) = split_wh_np_suffix(&text) {
+        if let Some((subject, surface, predicate, negated)) =
+            split_entity_predicate(head, lexicon)
+        {
+            if !negated {
+                return Some(build(
+                    QueryPlan::FindObjectByPredicate {
+                        subject,
+                        predicate: predicate.clone(),
+                    },
+                    RelationShape::ActiveWhObject,
+                    "active-wh-np-object",
+                    surface,
+                    predicate,
+                ));
+            }
+        }
     }
 
     if let Some(suffix) = wh_suffix(&text) {
@@ -901,6 +1116,85 @@ mod tests {
                 predicate: "教".to_string()
             }
         );
+    }
+
+    #[test]
+    fn quantified_noun_phrases_compile_like_bare_wh() {
+        let object = parse("张三教过哪些学生").expect("问宾语的名词短语");
+        assert_eq!(object.rule, "active-wh-np-object");
+        assert_eq!(
+            object.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+
+        let subject = parse("哪些老师教过张三").expect("问主语的名词短语");
+        assert_eq!(subject.rule, "active-wh-np-subject");
+        assert_eq!(
+            subject.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+
+        let passive = parse("张三被哪些老师教过").expect("被字句中的名词短语");
+        assert_eq!(
+            passive.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+        let ba = parse("张三把哪些学生教过").expect("把字句中的名词短语");
+        assert_eq!(
+            ba.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn relative_clauses_compile_to_relation_lookups() {
+        let object = parse("张三教过的学生是谁").expect("关系从句问宾语");
+        assert_eq!(object.rule, "typed-relative-object");
+        assert_eq!(
+            object.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+
+        let subject = parse("教过张三的老师有哪些").expect("关系从句问主语");
+        assert_eq!(subject.rule, "typed-relative-subject");
+        assert_eq!(
+            subject.plan,
+            QueryPlan::FindSubject {
+                object: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+
+        let passive = parse("被张三教过的学生是谁").expect("被字关系从句");
+        assert_eq!(passive.rule, "typed-relative-passive-patient");
+        assert_eq!(
+            passive.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "教".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn relative_clause_without_relation_words_abstains() {
+        assert!(parse("张三的师傅是谁").is_none());
+        assert!(parse("张三教过的学生").is_none());
     }
 
     #[test]

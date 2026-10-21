@@ -13492,6 +13492,71 @@ types = [
         assert_eq!(derivation.answer_value(), Some("王五"));
     }
 
+    #[test]
+    fn quantified_and_relative_questions_use_relation_plans() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".into(),
+                entity_type: "老师".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".into(),
+                entity_type: "学生".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "王五".into(),
+                entity_type: "学生".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "教".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "教".into(),
+                to: "王五".into(),
+            },
+            PrologFact::Relation {
+                from: "李四".into(),
+                rel_type: "教".into(),
+                to: "张三".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let objects = reasoner
+            .answer("张三教过哪些学生")
+            .expect("量词名词短语问宾语");
+        assert!(objects.contains("李四"), "{}", objects);
+        assert!(objects.contains("王五"), "{}", objects);
+
+        let subjects = reasoner
+            .answer("哪些老师教过张三")
+            .expect("量词名词短语问主语");
+        assert!(subjects.contains("李四"), "{}", subjects);
+
+        let relative_object = reasoner
+            .answer("张三教过的学生是谁")
+            .expect("关系从句问宾语");
+        assert!(relative_object.contains("李四"), "{}", relative_object);
+        assert!(relative_object.contains("王五"), "{}", relative_object);
+
+        let relative_subject = reasoner
+            .answer("教过张三的老师有哪些")
+            .expect("关系从句问主语");
+        assert!(relative_subject.contains("李四"), "{}", relative_subject);
+
+        let receipt = reasoner
+            .query_rewrite_receipt("张三教过的学生是谁")
+            .expect("关系从句回执");
+        assert!(receipt.contains("typed-relative-object"), "{}", receipt);
+    }
+
     fn trace_nlp_config() -> NlpConfig {
         NlpConfig {
             import_keywords: Vec::new(),
