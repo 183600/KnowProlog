@@ -449,6 +449,10 @@ impl ShapeAnswer {
             ));
             return lines.join("\n");
         }
+        if self.entity_type.is_none() {
+            lines
+                .push("  类型未声明：无法对应形状，系统不会替它推断类型或编造必备槽。".to_string());
+        }
         for (direction, title) in [
             (FactDirection::Attribute, "属性"),
             (FactDirection::Forward, "关系"),
@@ -1295,6 +1299,7 @@ fn is_name_key(key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::predicate_registry::PredicateProfileConfig;
+    use crate::relation_acquisition::SessionOverlay;
     use crate::shape_gate::ShapeSet;
     use crate::type_system::{TypeAliasConfig, TypeDisjointConfig, TypeSystemConfig};
     use crate::{EntityTypeConfig, PropertyConfig};
@@ -1465,6 +1470,24 @@ mod tests {
         assert!(turn.message.contains("冲突"));
         assert!(turn.message.contains("不替你选"));
         assert!(turn.consultation.is_none(), "冲突不能变成普通填空追问");
+    }
+
+    #[test]
+    fn dangling_relation_node_is_not_silently_typed() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![relation("刘德华", "出生地", "香港")];
+        let (answer, _) = ShapeAnswer::build(
+            "香港",
+            &facts,
+            &SessionOverlay::default(),
+            &shapes,
+            &registry,
+            &types,
+        );
+        assert!(answer.entity_type.is_none());
+        assert!(answer.render_text().contains("类型未声明"));
     }
 
     #[test]
