@@ -1510,6 +1510,8 @@ impl ApiState {
                                 "policy": session.policy,
                                 "board": session.manager.board().view(session.reasoner.revision()),
                                 "open_turn": session.manager.latest_open_turn(),
+                                "resumable": session.open_turn_resumable(),
+                                "poisoned": session.poisoned,
                             }));
                         }
                         SessionCommand::Export { reply } => {
@@ -3438,7 +3440,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
     async fn tampered_cold_session_surfaces_decode_code_without_side_effects() {
         let dir = temp_session_dir("decode");
         let (addr, _server) =
-            start_server_with_options(1, RecoveryMode::Observe, Some(dir.clone()));
+            start_server_with_options(1, RecoveryMode::Observe, Some(dir.clone()), None);
         let first = create_session(addr).await;
         take_turn_body(addr, &first, "姚明是谁").await;
         let _second = create_session(addr).await;
@@ -3484,7 +3486,14 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         max_sessions: usize,
         recovery: RecoveryMode,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
-        start_server_with_options(max_sessions, recovery, None)
+        start_server_with_options(max_sessions, recovery, None, None)
+    }
+
+    fn start_server_with_budget(
+        max_sessions: usize,
+        budget: TurnBudget,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        start_server_with_options(max_sessions, RecoveryMode::Observe, None, Some(budget))
     }
 
     /// 与服务启动路径一致：给暖基座注入 NLP 配置，失败轮才能生成读法回执。
@@ -3514,6 +3523,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         max_sessions: usize,
         recovery: RecoveryMode,
         session_dir: Option<std::path::PathBuf>,
+        turn_budget: Option<TurnBudget>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -3532,6 +3542,9 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
                 inner.set_nlp_config(test_nlp_config());
                 if let Some(dir) = session_dir {
                     inner.set_session_dir(dir);
+                }
+                if let Some(budget) = turn_budget {
+                    inner.set_turn_budget(budget);
                 }
                 let _ = run(listener, state).await;
             });
@@ -4581,7 +4594,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
     async fn cold_sessions_freeze_and_resume_across_capacity() {
         let dir = temp_session_dir("cold");
         let (addr, _server) =
-            start_server_with_options(1, RecoveryMode::Observe, Some(dir.clone()));
+            start_server_with_options(1, RecoveryMode::Observe, Some(dir.clone()), None);
         let first = create_session(addr).await;
         take_turn_body(addr, &first, "姚明是谁").await;
 
@@ -4771,5 +4784,63 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         .await;
         assert_eq!(status, 409, "{}", body);
         assert!(body.contains("resumable"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn http_deadline_is_resumable_until_attempts_exhausted() {
+        let (addr, _server) =
+            start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
+        let session_id = create_session(addr).await;
+        let turn = take_turn_body(addr, &session_id, "姚明的身高是多少").await;
+        assert_eq!(turn["status"], "deadline", "{}", turn);
+        assert_eq!(turn["resumable"], true, "{}", turn);
+        assert_eq!(turn["open_turn"]["input"], "姚明的身高是多少", "{}", turn);
+        assert_eq!(turn["open_turn"]["attempts"], 1, "{}", turn);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(snapshot["open_turn"]["attempts"], 1, "{}", body);
+        assert_eq!(snapshot["resumable"], true, "{}", body);
+
+        for attempts in 2..=3 {
+            let (status, _, body) = raw_request(
+                addr,
+                "POST",
+                &format!("/sessions/{}/resume", session_id),
+                &[],
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{}", body);
+            let resumed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(resumed["status"], "deadline", "{}", body);
+            assert_eq!(resumed["resumed"], true, "{}", body);
+            assert_eq!(resumed["open_turn"]["attempts"], attempts, "{}", body);
+            assert_eq!(
+                resumed["resumable"],
+                attempts < 3,
+                "attempts={} body={}",
+                attempts,
+                body
+            );
+        }
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/resume", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 409, "{}", body);
     }
 }
