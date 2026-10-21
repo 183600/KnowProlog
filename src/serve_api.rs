@@ -1756,6 +1756,10 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             ),
             Err(error) => session_error_response(error),
         },
+        ("GET", ["sessions", id, "read-traces"]) => match state.read_traces(id).await {
+            Ok(report) => Response::json(200, &report),
+            Err(error) => session_error_response(error),
+        },
         ("DELETE", ["sessions", id]) => {
             if state.close_session(id).await {
                 Response::json(200, &serde_json::json!({"closed": id}))
@@ -3039,6 +3043,29 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         start_server_with_options(max_sessions, recovery, None)
     }
 
+    /// 与服务启动路径一致：给暖基座注入 NLP 配置，失败轮才能生成读法回执。
+    fn test_nlp_config() -> NlpConfig {
+        NlpConfig {
+            import_keywords: Vec::new(),
+            pos_dict: HashMap::new(),
+            name_patterns: crate::NamePatterns {
+                prefixes: Vec::new(),
+                suffixes: Vec::new(),
+                full_names: Vec::new(),
+                profession_suffix: Vec::new(),
+            },
+            enable_nlu: None,
+            nlu_confidence_threshold: None,
+            enable_local_semantic: None,
+            disable_ownthink_api: None,
+            semantic_similarity_threshold: None,
+            max_entity_candidates: None,
+            enable_advanced_entity_extraction: None,
+            enable_relation_extraction: None,
+            context_window_size: None,
+        }
+    }
+
     fn start_server_with_options(
         max_sessions: usize,
         recovery: RecoveryMode,
@@ -3058,6 +3085,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
                 // Arc::get_mut 不适用（已 Arc）：状态在启动前唯一持有，先解包
                 let inner = Arc::get_mut(&mut state).expect("测试启动前状态唯一");
                 inner.set_recovery_mode(recovery);
+                inner.set_nlp_config(test_nlp_config());
                 if let Some(dir) = session_dir {
                     inner.set_session_dir(dir);
                 }
@@ -3143,6 +3171,68 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let (status, _, body) = raw_request(addr, "GET", "/", &[], "").await;
         assert_eq!(status, 200);
         assert!(body.contains("knowprolog"));
+    }
+
+    #[tokio::test]
+    async fn read_traces_route_returns_bounded_receipts_without_raw_question() {
+        let (addr, _server) = start_server(4);
+        let session_id = create_session(addr).await;
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/read-traces", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["session_id"], session_id);
+        assert!(value["report"]
+            .as_str()
+            .is_some_and(|report| report.contains("读法台账")));
+        assert_eq!(value["receipts"].as_array().map(Vec::len), Some(0));
+
+        let question = "未名科技公司的老板是谁";
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/turns", session_id),
+            &[("Content-Type", "application/json")],
+            &serde_json::json!({ "input": question }).to_string(),
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/read-traces", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let receipts = value["receipts"].as_array().expect("回执必须是数组");
+        assert_eq!(receipts.len(), 1, "失败轮应留下一条回执：{}", body);
+        assert_eq!(receipts[0]["answered"], false);
+        assert!(
+            receipts[0]["failure_kinds"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "unknown_entity")),
+            "未知实体应被分类：{}",
+            body
+        );
+        assert!(
+            !body.contains(question),
+            "读法回执不得泄露原始问句：{}",
+            body
+        );
+
+        let (status, _, _) = raw_request(addr, "GET", "/sessions/nope/read-traces", &[], "").await;
+        assert_eq!(status, 404);
     }
 
     #[tokio::test]
