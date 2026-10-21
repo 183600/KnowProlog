@@ -425,7 +425,7 @@ impl UserIdentityLedger {
     }
 }
 
-const SELF_PREFIXES: [&str; 14] = [
+const SELF_PREFIXES: &[&str] = &[
     "你好，",
     "你好,",
     "您好，",
@@ -442,7 +442,7 @@ const SELF_PREFIXES: [&str; 14] = [
     "更正:",
 ];
 
-const SELF_MARKERS: [&str; 11] = [
+const SELF_MARKERS: &[&str] = &[
     "我的名字改成",
     "我的名字叫",
     "我的名字是",
@@ -453,10 +453,11 @@ const SELF_MARKERS: [&str; 11] = [
     "请叫我",
     "你叫我",
     "叫我",
+    "我名叫",
     "我叫",
 ];
 
-const USER_QUESTION_MARKERS: [&str; 10] = [
+const USER_QUESTION_MARKERS: &[&str] = &[
     "我是谁",
     "我叫什么",
     "我的名字是什么",
@@ -467,11 +468,14 @@ const USER_QUESTION_MARKERS: [&str; 10] = [
     "知道我是谁",
     "我姓什么",
     "我叫什么名字",
+    "我叫啥",
+    "我的名字叫啥",
 ];
 
-const SYSTEM_QUESTION_MARKERS: [&str; 18] = [
+const SYSTEM_QUESTION_MARKERS: &[&str] = &[
     "你是谁",
     "你叫什么",
+    "你叫啥",
     "你的名字",
     "你是什么",
     "你是做什么",
@@ -483,22 +487,30 @@ const SYSTEM_QUESTION_MARKERS: [&str; 18] = [
     "你有意识",
     "你有自我意识",
     "你是人吗",
+    "你是真人",
     "你是机器人吗",
+    "你是人工智能",
+    "你是AI",
+    "你是一个程序",
     "介绍一下你自己",
     "介绍你自己",
     "自我介绍",
     "你了解你自己",
 ];
 
-const FORGET_MARKERS: [&str; 8] = [
+const FORGET_MARKERS: &[&str] = &[
     "忘记我的名字",
     "忘掉我的名字",
     "忘了我的名字",
+    "清除我的名字",
+    "清空我的名字",
+    "删除我的名字",
     "忘记我",
     "忘掉我",
     "忘了我",
     "不要记住我",
     "别记得我",
+    "不要再记得我",
 ];
 
 fn strip_sentence_end(text: &str) -> &str {
@@ -523,11 +535,48 @@ fn strip_self_prefix(mut body: &str) -> &str {
     }
 }
 
+fn is_marker_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '，' | ','
+                | '。'
+                | '！'
+                | '!'
+                | '？'
+                | '?'
+                | '；'
+                | ';'
+                | '：'
+                | ':'
+                | '、'
+                | '～'
+                | '~'
+        )
+}
+
+fn last_bounded_marker(body: &str, marker: &str) -> Option<usize> {
+    let mut from = 0;
+    let mut found = None;
+    while let Some(offset) = body[from..].find(marker) {
+        let index = from + offset;
+        let bounded = body[..index]
+            .chars()
+            .next_back()
+            .is_none_or(is_marker_boundary);
+        if bounded {
+            found = Some(index);
+        }
+        from = index + marker.len();
+    }
+    found
+}
+
 fn extract_self_name(text: &str) -> Option<String> {
     let body = strip_self_prefix(text);
     let mut found: Option<(usize, &str)> = None;
     for marker in SELF_MARKERS {
-        if let Some(index) = body.rfind(marker) {
+        if let Some(index) = last_bounded_marker(body, marker) {
             match found {
                 Some((best, _)) if best >= index => {}
                 _ => found = Some((index, marker)),
@@ -827,6 +876,8 @@ mod tests {
         assert_eq!(classify("你有意识吗"), IdentityAct::AskSystem);
         assert_eq!(classify("我是谁"), IdentityAct::AskUser);
         assert_eq!(classify("你记得我叫什么吗"), IdentityAct::AskUser);
+        assert_eq!(classify("你叫啥？"), IdentityAct::AskSystem);
+        assert_eq!(classify("你是AI吗"), IdentityAct::AskSystem);
         assert_eq!(classify("姚明是谁"), IdentityAct::AskEntity);
         assert_eq!(classify("什么是量子力学"), IdentityAct::AskEntity);
         assert_eq!(classify("姚明的身高是多少"), IdentityAct::Other);
@@ -858,7 +909,21 @@ mod tests {
                 name: "王五".to_string()
             }
         );
+        assert_eq!(
+            classify("我名叫赵六"),
+            IdentityAct::Introduce {
+                name: "赵六".to_string()
+            }
+        );
+        assert_eq!(
+            classify("你可以叫我老周"),
+            IdentityAct::Introduce {
+                name: "老周".to_string()
+            }
+        );
         assert_eq!(classify("我叫什么"), IdentityAct::AskUser);
+        assert_eq!(classify("我叫啥"), IdentityAct::AskUser);
+        assert_eq!(classify("清除我的名字"), IdentityAct::ForgetUser);
         assert_eq!(classify("我叫你别走"), IdentityAct::Other);
     }
 

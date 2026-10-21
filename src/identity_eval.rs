@@ -495,10 +495,15 @@ pub struct IdentityEvalReport {
     pub scope_leak_rate: f64,
     pub evidence_coverage: f64,
     pub missing_cards: u32,
+    pub unexpected_cards: u32,
     pub session_retention_rate: f64,
+    pub session_retention_checks: u32,
     pub cross_session_leak_rate: f64,
+    pub cross_session_checks: u32,
     pub stale_mention_rate: f64,
+    pub stale_checks: u32,
     pub forget_clear_rate: f64,
+    pub forget_checks: u32,
 }
 
 impl IdentityEvalReport {
@@ -528,21 +533,26 @@ impl IdentityEvalReport {
             self.status_accuracy
         ));
         out.push_str(&format!(
-            "scope：abstain {}/{}（{:.4}），overclaim {:.4}，scope leak {:.4}，证据覆盖 {:.4}，缺失身份卡 {}\n",
+            "scope：abstain {}/{}（{:.4}），overclaim {:.4}，scope leak {:.4}，证据覆盖 {:.4}，缺失身份卡 {}，越界身份卡 {}\n",
             self.abstain_correct,
             self.abstain_expected,
             self.abstain_rate,
             self.overclaim_rate,
             self.scope_leak_rate,
             self.evidence_coverage,
-            self.missing_cards
+            self.missing_cards,
+            self.unexpected_cards
         ));
         out.push_str(&format!(
-            "session：快照保留 {:.4}，跨会话泄漏 {:.4}，旧名残留 {:.4}，遗忘清空 {:.4}\n",
+            "session：快照保留率 {:.4}（{} 次检查），跨会话泄漏 {:.4}（{} 次检查），旧名残留 {:.4}（{} 个旧名），遗忘清空率 {:.4}（{} 次检查）\n",
             self.session_retention_rate,
+            self.session_retention_checks,
             self.cross_session_leak_rate,
+            self.cross_session_checks,
             self.stale_mention_rate,
-            self.forget_clear_rate
+            self.stale_checks,
+            self.forget_clear_rate,
+            self.forget_checks
         ));
         out
     }
@@ -586,10 +596,11 @@ impl IdentityEvalReport {
 }
 
 /// 越大越差的指标。
-pub const LOWER_IS_BETTER: [&str; 5] = [
+pub const LOWER_IS_BETTER: [&str; 6] = [
     "identity.overclaim_rate",
     "identity.scope_leak_rate",
     "identity.missing_cards",
+    "identity.unexpected_cards",
     "identity.cross_session_leak_rate",
     "identity.stale_mention_rate",
 ];
@@ -955,8 +966,6 @@ pub fn evaluate(scenarios: &[IdentityGoldScenario]) -> IdentityEvalReport {
     } else {
         2.0 * claim_precision * claim_recall / (claim_precision + claim_recall)
     };
-    let _ = unexpected_cards;
-
     IdentityEvalReport {
         corpus_digest: fnv1a_hex(digest_input.as_bytes()),
         scenarios: scenarios.len() as u32,
@@ -977,10 +986,15 @@ pub fn evaluate(scenarios: &[IdentityGoldScenario]) -> IdentityEvalReport {
         scope_leak_rate: ratio(scope_leaks, claim_total),
         evidence_coverage: ratio(claim_total - evidence_missing, claim_total),
         missing_cards,
+        unexpected_cards,
         session_retention_rate: ratio(retention_correct, retention_expected),
+        session_retention_checks: retention_expected,
         cross_session_leak_rate: ratio(cross_leaks, cross_expected),
+        cross_session_checks: cross_expected,
         stale_mention_rate: ratio(stale_hits, stale_expected),
+        stale_checks: stale_expected,
         forget_clear_rate: ratio(forget_correct, forget_expected),
+        forget_checks: forget_expected,
     }
 }
 
@@ -1001,6 +1015,15 @@ mod tests {
         assert_eq!(report.scope_leak_rate, 0.0, "{}", report.render_text());
         assert_eq!(report.evidence_coverage, 1.0, "{}", report.render_text());
         assert_eq!(report.missing_cards, 0, "{}", report.render_text());
+        assert_eq!(report.unexpected_cards, 0, "{}", report.render_text());
+        assert!(report.claim_tp >= 30, "{}", report.render_text());
+        assert!(
+            report.session_retention_checks >= 1,
+            "{}",
+            report.render_text()
+        );
+        assert!(report.stale_checks >= 2, "{}", report.render_text());
+        assert!(report.forget_checks >= 1, "{}", report.render_text());
         assert_eq!(
             report.session_retention_rate,
             1.0,

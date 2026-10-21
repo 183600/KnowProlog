@@ -1426,6 +1426,7 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        self.last_recovery = None;
         let act = identity_dialogue::classify(input);
         let turn_no = self.turns.len() + 1;
         let (card, plan, kind, text) = match act {
