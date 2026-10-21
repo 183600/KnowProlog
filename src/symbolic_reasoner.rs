@@ -1155,7 +1155,9 @@ impl SymbolicReasoner {
     /// 构建一次知识感知的读法轨迹（只读；不执行回答）。
     pub fn lexical_trace(&self, question: &str) -> Option<LexicalTrace> {
         let config = self.nlp_config.as_ref()?;
-        let plan = self.planner.parse(question);
+        let plan = self.planner.parse(question).or_else(|| {
+            query_rewrite::rewrite(question, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
+        });
         let mut trace = lexical_trace::trace_question(question, config, plan.as_ref());
         trace.fidelity = TraceFidelity::Reconstructed;
         if let Some(plan) = &plan {
@@ -3983,6 +3985,62 @@ impl SymbolicReasoner {
         Some((format!("{} 具有 {}", entity, predicate), goals))
     }
 
+    /// 把主谓宾/被字句/把字句计划直接转成归结目标，供「为什么」重建证明。
+    fn relation_plan_view(&self, plan: &QueryPlan) -> Option<ResolutionProofView> {
+        let answer = || Term::var("答案");
+        let (phrase, goals) = match plan {
+            QueryPlan::FindObjectByPredicate { subject, predicate } => {
+                let entity = self.resolve_known_entity(subject)?;
+                let (slot, inverted) = self.resolve_question_predicate(predicate);
+                if slot.is_empty() {
+                    return None;
+                }
+                let goal = if inverted {
+                    Atom::pattern(&slot, answer(), Term::constant(&entity))
+                } else {
+                    Atom::pattern(&slot, Term::constant(&entity), answer())
+                };
+                (format!("{} {} 谁", entity, predicate), vec![goal])
+            }
+            QueryPlan::FindSubject { object, predicate } => {
+                let target = self.resolve_known_entity(object)?;
+                let (slot, inverted) = self.resolve_question_predicate(predicate);
+                if slot.is_empty() {
+                    return None;
+                }
+                let goal = if inverted {
+                    Atom::pattern(&slot, Term::constant(&target), answer())
+                } else {
+                    Atom::pattern(&slot, answer(), Term::constant(&target))
+                };
+                (format!("谁 {} {}", predicate, target), vec![goal])
+            }
+            QueryPlan::CheckRelation {
+                subject,
+                predicate,
+                object,
+            } => {
+                let subject = self.resolve_known_entity(subject)?;
+                let object = self.resolve_known_entity(object)?;
+                let (slot, inverted) = self.resolve_question_predicate(predicate);
+                if slot.is_empty() {
+                    return None;
+                }
+                let goal = if inverted {
+                    Atom::rel(&slot, &object, &subject)
+                } else {
+                    Atom::rel(&slot, &subject, &object)
+                };
+                (
+                    format!("{} {} {}", subject, predicate, object),
+                    vec![goal],
+                )
+            }
+            _ => return None,
+        };
+        Some(self.build_resolution_view(phrase, goals))
+    }
+
     /// 开放问句的谓词链目标构造（"X的P…是谁"），答案变量固定为「答案」。
     fn build_question_goals(
         &self,
@@ -4112,6 +4170,13 @@ impl SymbolicReasoner {
             .trim_end_matches(['？', '?', '。', '！', '!', ' ']);
         if trimmed.is_empty() {
             return None;
+        }
+        if let Some(plan) = self.planner.parse(trimmed).or_else(|| {
+            query_rewrite::rewrite(trimmed, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
+        }) {
+            if let Some(view) = self.relation_plan_view(&plan) {
+                return Some(view);
+            }
         }
         // 开放问句优先：剥离问句后缀（"…是谁/是什么/…"）后按谓词链处理。
         // 否则 "张三的师傅的师傅是谁" 会被误判为陈述，把「谁」当常量求证。
@@ -13322,6 +13387,12 @@ types = [
             .expect("重写回执");
         assert!(receipt.contains("passive-wh-patient"), "{}", receipt);
         assert!(receipt.contains("FindObjectByPredicate"), "{}", receipt);
+
+        let derivation = reasoner
+            .answer_derivation("张三认识谁", Some("王五"))
+            .expect("关系问句应可重建证明");
+        assert!(derivation.is_proved(), "{:?}", derivation);
+        assert_eq!(derivation.answer_value(), Some("王五"));
     }
 
     fn trace_nlp_config() -> NlpConfig {

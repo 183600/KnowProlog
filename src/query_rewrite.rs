@@ -382,6 +382,9 @@ pub fn rewrite(
     lexicon: &dyn RelationLexicon,
 ) -> Option<RelationRewrite> {
     let text = clean_question(question)?;
+    if text.chars().count() > 80 {
+        return None;
+    }
     let text = strip_trailing_particles(&text);
     let (text, yes_no) = strip_yes_no(&text);
     if text.chars().count() < 2 {
