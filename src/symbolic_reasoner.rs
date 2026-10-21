@@ -4515,10 +4515,21 @@ impl SymbolicReasoner {
         // 实体属性（非关系型三元组）同样沿属性槽位命中：属性查询与关系查询
         // 走同一条链，逆向（反查主体）暂不支持属性。
         if !predicate.inverted {
-            if let Some(values) = self
-                .attribute_index
-                .get(&(node.to_string(), predicate.slot.clone()))
-            {
+            let key = (node.to_string(), predicate.slot.clone());
+            let mut values = self.attribute_index.get(&key);
+            if values.is_none() {
+                // 图谱里常见英文属性键（JSON-LD 的 name/age/height…），
+                // 用户却按中文词面提问（姓名/年龄/身高…）。仅在中文槽位
+                // 无命中时回退到对照表，避免覆盖真实的中文谓词。
+                if let Some(canonical) =
+                    crate::symbolic_generator::canonical_predicate_key(&predicate.surface)
+                {
+                    values = self
+                        .attribute_index
+                        .get(&(node.to_string(), canonical.to_string()));
+                }
+            }
+            if let Some(values) = values {
                 for value in values {
                     if seen.insert(value.clone()) {
                         hits.push(ValueHit {
@@ -10669,6 +10680,31 @@ types = [
             "裸谓词生成应通过自检：{}",
             profile
         );
+    }
+
+    /// 英文属性键（JSON-LD 常见）应能按中文词面直接检索，且中文键仍优先。
+    #[test]
+    fn test_english_attribute_keys_answer_chinese_labels() {
+        let facts = vec![PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "person".to_string(),
+            properties: HashMap::from([
+                ("name".to_string(), "张三".to_string()),
+                ("age".to_string(), "25".to_string()),
+                ("height".to_string(), "180".to_string()),
+            ]),
+        }];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let age = reasoner.answer("张三的年龄是多少").expect("中文标签应命中 age");
+        assert!(age.contains("25"), "{}", age);
+        let height = reasoner
+            .answer("张三的身高是多少")
+            .expect("中文标签应命中 height");
+        assert!(height.contains("180"), "{}", height);
+        let english = reasoner.answer("张三的age是多少").expect("英文键也应可查");
+        assert!(english.contains("25"), "{}", english);
     }
 
     #[test]
