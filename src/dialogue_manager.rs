@@ -1279,6 +1279,9 @@ impl DialogueManager {
         const YES: [&str; 6] = ["是", "是的", "对", "对的", "没错", "嗯"];
         const NO: [&str; 5] = ["不是", "不对", "错了", "错", "不"];
         let pending = self.recovery.latest_pending().cloned()?;
+        let correction = (pending.kind == PendingKind::Provisional)
+            .then(|| negative_correction_body(stripped))
+            .flatten();
         let (text, plan) = if YES.contains(&stripped) {
             (
                 recovery::resolve_by_yes(&mut self.recovery, true)?,
@@ -1288,6 +1291,11 @@ impl DialogueManager {
             (
                 recovery::resolve_by_yes(&mut self.recovery, false)?,
                 "recovery_refute",
+            )
+        } else if let Some(correction) = correction {
+            (
+                recovery::resolve_by_correction(&mut self.recovery, correction)?,
+                "recovery_correct",
             )
         } else {
             // 澄清回答：排除问句与命令式输入，只收短陈述。
@@ -2059,6 +2067,16 @@ impl DialogueManager {
                 }
             }
         }
+        // 会话层确认事实优先于图谱与预测：用户确认/更正过的取值在后续轮次生效。
+        let mut used_confirmation = false;
+        if known {
+            if let (Some(name), Some(attribute)) = (entity.as_deref(), frame.attribute.as_deref()) {
+                if let Some(fact) = self.recovery.confirmed_value(name, attribute) {
+                    answer = Some(fact.value.clone());
+                    used_confirmation = true;
+                }
+            }
+        }
 
         // —— ABox：本轮的信息状态 ——
         let turn_id = format!("t{}", self.turns.len() + 1);
@@ -2250,12 +2268,22 @@ impl DialogueManager {
             self.last_identity_card = Some(card.clone());
         }
 
+        if used_confirmation && !text.contains("本会话") {
+            if !text.trim().is_empty() {
+                text.push('\n');
+            }
+            text.push_str("（来源：本会话确认；未写入图谱）");
+        }
+
         let mut provenance = answer
             .as_deref()
             .map(classify_provenance)
             .unwrap_or_default();
         if used_correction {
             provenance.push("用户更正".to_string());
+        }
+        if used_confirmation {
+            provenance.push("本会话确认".to_string());
         }
         // 知识/续聊轮进入对话本体实例；元话语与寒暄只影响策略，不记入"聊了什么"
         let content_turn = matches!(
@@ -3441,6 +3469,20 @@ impl DialogueManager {
     }
 }
 
+fn negative_correction_body(input: &str) -> Option<&str> {
+    for prefix in ["不是", "不对", "错了"] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            let rest = rest
+                .trim_start_matches(['，', ',', '：', ':', ' '])
+                .trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
+    }
+    None
+}
+
 fn raw_input(frame: &UtteranceFrame) -> String {
     frame.raw.trim().to_string()
 }
@@ -3637,6 +3679,7 @@ mod tests {
         values: BTreeMap<(String, String), Vec<String>>,
         profiles: BTreeMap<String, String>,
         derivations: BTreeMap<String, Derivation>,
+        nominations: BTreeMap<(String, String), Vec<RecoveryNomination>>,
     }
 
     impl MockKnowledge {
@@ -3649,7 +3692,27 @@ mod tests {
                 values: BTreeMap::new(),
                 profiles: BTreeMap::new(),
                 derivations: BTreeMap::new(),
+                nominations: BTreeMap::new(),
             }
+        }
+
+        fn with_nomination(
+            mut self,
+            entity: &str,
+            attribute: &str,
+            value: &str,
+            score: f64,
+            evidence: &str,
+        ) -> Self {
+            self.nominations
+                .entry((entity.to_string(), attribute.to_string()))
+                .or_default()
+                .push(RecoveryNomination {
+                    value: value.to_string(),
+                    score,
+                    evidence: vec![evidence.to_string()],
+                });
+            self
         }
 
         fn with_value(mut self, entity: &str, attribute: &str, value: &str) -> Self {
@@ -3740,6 +3803,17 @@ mod tests {
 
         fn describe(&self, entity: &str) -> Option<String> {
             self.profiles.get(entity).cloned()
+        }
+
+        fn recovery_nominations(
+            &self,
+            entity: &str,
+            attribute: &str,
+        ) -> Vec<RecoveryNomination> {
+            self.nominations
+                .get(&(entity.to_string(), attribute.to_string()))
+                .cloned()
+                .unwrap_or_default()
         }
     }
 
@@ -4840,5 +4914,48 @@ output = "value"
         assert_eq!(card.scope_leaks(), 0);
         assert_eq!(card.missing_evidence(), 0);
         assert_eq!(manager.focus_entity(), Some("姚明"));
+    }
+
+    #[test]
+    fn confirmed_provisional_becomes_next_turn_premise_and_correction_revises() {
+        let knowledge = mock()
+            .with_entity("姚明", &["体重"])
+            .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据");
+        let mut manager = DialogueManager::new();
+        manager.set_recovery_mode(RecoveryMode::On);
+
+        let first = manager
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("推测轮应被接管");
+        assert!(first.text.contains("140公斤"), "{}", first.text);
+        assert!(first.text.contains("推测"), "{}", first.text);
+
+        let correction = manager
+            .plan_pure_dialogue("不对，姚明的体重是 135 公斤", &knowledge)
+            .expect("更正应结算推测挂账");
+        assert!(correction.text.contains("作废"), "{}", correction.text);
+        assert!(correction.text.contains("135 公斤"), "{}", correction.text);
+        let fact = manager
+            .recovery_state()
+            .confirmed_value("姚明", "体重")
+            .expect("更正必须进入会话事实层");
+        assert_eq!(fact.value, "135 公斤");
+
+        let revised = manager
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("确认后的下一轮应直接作答");
+        assert!(revised.text.contains("135 公斤"), "{}", revised.text);
+        assert!(
+            !revised.text.contains("140公斤"),
+            "被否认的推测不得再次出现：{}",
+            revised.text
+        );
+        assert!(revised.text.contains("本会话确认"), "{}", revised.text);
+        let last = manager.turns.last().expect("应记录修订轮");
+        assert!(
+            last.provenance.iter().any(|tag| tag == "本会话确认"),
+            "{:?}",
+            last.provenance
+        );
     }
 }
