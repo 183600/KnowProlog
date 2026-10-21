@@ -1848,4 +1848,19 @@ mod tests {
         let (limited, truncated) = apply_rule(&spec, &facts, &filter, 0);
         assert!(limited.is_empty() && !truncated);
     }
+
+    #[test]
+    fn clamp_limits_rejects_untrusted_unbounded_snapshot() {
+        let mut ledger =
+            CompletionLedger::with_limits(usize::MAX, usize::MAX, usize::MAX, usize::MAX);
+        ledger.open_episode("甲", None);
+        ledger.active = Some(999);
+        ledger.clamp_limits();
+        assert_eq!(ledger.max_candidates, DEFAULT_MAX_EPISODE_CANDIDATES);
+        assert_eq!(ledger.max_closure, DEFAULT_MAX_CLOSURE_CANDIDATES);
+        assert_eq!(ledger.max_episodes, DEFAULT_MAX_EPISODES);
+        assert_eq!(ledger.max_rules, DEFAULT_MAX_RULES);
+        assert_eq!(ledger.max_batch_entities, DEFAULT_MAX_BATCH_ENTITIES);
+        assert_eq!(ledger.active, None, "越界活动索引应被清掉");
+    }
 }
