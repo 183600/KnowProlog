@@ -41,6 +41,7 @@ use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::query_rewrite::{self, RelationLexicon};
+use crate::reading::{Reading, RepairKind, Residual, ResidualKind, ResidualSeverity, ResidualStage, TextSpan};
 use crate::resolution_engine::{
     render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
@@ -57,6 +58,16 @@ use crate::{NlpConfig, ReasoningConfig};
 // 归结引擎内部谓词：has(E, 谓词名) / type(E, 类型名)，用于承载关联规则的物品
 const PROOF_HAS: &str = "__具有__";
 const PROOF_TYPE: &str = "__类型__";
+
+/// 在原始问句中定位词面，返回 Unicode 字符区间（供读法残差定位）。
+fn term_span(question: &str, term: &str) -> Option<TextSpan> {
+    if term.is_empty() {
+        return None;
+    }
+    let byte_index = question.find(term)?;
+    let start = question[..byte_index].chars().count();
+    Some(TextSpan::new(start, start + term.chars().count()))
+}
 
 // 默认逻辑（可反驳常识）的最大接地推导轮数
 const DEFAULT_LOGIC_MAX_ROUNDS: usize = 8;
@@ -1178,10 +1189,15 @@ impl SymbolicReasoner {
         let mut trace = lexical_trace::trace_question(question, config, plan.as_ref());
         trace.fidelity = TraceFidelity::Reconstructed;
         if let Some(plan) = &plan {
-            self.enrich_trace_plan_terms(&mut trace, plan);
+            self.enrich_trace_plan_terms(&mut trace, plan, question);
         }
         self.enrich_trace_oov(&mut trace, question);
         Some(trace)
+    }
+
+    /// 只返回读法残差表（不渲染 token 全文），供 API/评测直接使用。
+    pub fn read_question(&self, question: &str) -> Option<Reading> {
+        self.lexical_trace(question).map(|trace| trace.reading)
     }
 
     /// 读法追踪报告：token/来源/边界/计划/失败分类，并标注回答管线是否命中。
@@ -1207,6 +1223,16 @@ impl SymbolicReasoner {
                 ReadFailureKind::ExecutionMiss,
                 "计划已识别，但回答管线没有产生结果（事实缺口/缺少推理律/截断需在推理侧继续区分）",
             );
+            trace.reading.push(
+                Residual::new(
+                    ResidualKind::ExecutionMiss,
+                    ResidualStage::Execute,
+                    ResidualSeverity::Blocking,
+                    RepairKind::AcquireFact,
+                    "计划已识别，但执行阶段没有产生结果",
+                )
+                .expected("事实、推理律或可执行预算"),
+            );
         }
         self.perf.bump("lexical_trace_reports");
         self.perf.bump_by(
@@ -1231,25 +1257,100 @@ impl SymbolicReasoner {
         self.read_traces.snapshot()
     }
 
-    fn enrich_trace_plan_terms(&self, trace: &mut LexicalTrace, plan: &QueryPlan) {
+    fn enrich_trace_plan_terms(
+        &self,
+        trace: &mut LexicalTrace,
+        plan: &QueryPlan,
+        question: &str,
+    ) {
         let (entities, predicates) = lexical_trace::plan_terms(plan);
         for entity in entities {
-            if !self.is_known_entity(&entity) {
-                trace.push_failure(
-                    ReadStage::Link,
-                    ReadFailureKind::UnknownEntity,
-                    format!("实体槽「{}」未在知识图谱登记", entity),
-                );
+            let resolution = self.aligner.resolve_candidates(&entity, 3);
+            let candidates: Vec<String> = resolution
+                .candidates
+                .iter()
+                .map(|candidate| candidate.target().to_string())
+                .filter(|candidate| candidate != &entity && self.is_known_entity(candidate))
+                .collect();
+            if self.is_known_entity(&entity) {
+                // 只有真正存在多个可链接读法时才报歧义；模糊匹配到的单一候选
+                // 只是对齐证据，不构成「需要澄清」。
+                if resolution.state == AlignmentState::Ambiguous && candidates.len() >= 2 {
+                    let mut residual = Residual::new(
+                        ResidualKind::AmbiguousEntity,
+                        ResidualStage::Link,
+                        ResidualSeverity::Blocking,
+                        RepairKind::ChooseCandidate,
+                        "实体有多个会改变答案的候选读法",
+                    )
+                    .expected("一个确定的实体")
+                    .candidates(candidates);
+                    if let Some(span) = term_span(question, &entity) {
+                        residual = residual.surface(question, span);
+                    }
+                    trace.reading.push(residual);
+                }
+                continue;
             }
+
+            trace.push_failure(
+                ReadStage::Link,
+                ReadFailureKind::UnknownEntity,
+                format!("实体槽「{}」未在知识图谱登记", entity),
+            );
+            let repair = if candidates.is_empty() {
+                RepairKind::SupplyEntity
+            } else {
+                RepairKind::ChooseCandidate
+            };
+            let mut residual = Residual::new(
+                ResidualKind::UnknownEntity,
+                ResidualStage::Link,
+                ResidualSeverity::Blocking,
+                repair,
+                format!("实体槽「{}」未在知识图谱登记", entity),
+            )
+            .expected("已登记实体")
+            .candidates(candidates);
+            if let Some(span) = term_span(question, &entity) {
+                residual = residual.surface(question, span);
+            }
+            trace.reading.push(residual);
         }
         for predicate in predicates {
-            if !self.is_known_predicate(&predicate) {
-                trace.push_failure(
-                    ReadStage::Link,
-                    ReadFailureKind::UnknownPredicate,
-                    format!("谓词槽「{}」未在谓词画像/事实中登记", predicate),
-                );
+            if self.is_known_predicate(&predicate) {
+                continue;
             }
+            trace.push_failure(
+                ReadStage::Link,
+                ReadFailureKind::UnknownPredicate,
+                format!("谓词槽「{}」未在谓词画像/事实中登记", predicate),
+            );
+            let resolution = self.aligner.resolve_candidates(&predicate, 3);
+            let candidates: Vec<String> = resolution
+                .candidates
+                .iter()
+                .map(|candidate| candidate.target().to_string())
+                .filter(|candidate| candidate != &predicate && self.is_known_predicate(candidate))
+                .collect();
+            let repair = if candidates.is_empty() {
+                RepairKind::SupplyPredicate
+            } else {
+                RepairKind::ChooseCandidate
+            };
+            let mut residual = Residual::new(
+                ResidualKind::UnknownPredicate,
+                ResidualStage::Link,
+                ResidualSeverity::Blocking,
+                repair,
+                format!("谓词槽「{}」未在谓词画像/事实中登记", predicate),
+            )
+            .expected("已登记谓词/关系")
+            .candidates(candidates);
+            if let Some(span) = term_span(question, &predicate) {
+                residual = residual.surface(question, span);
+            }
+            trace.reading.push(residual);
         }
     }
 
@@ -1294,6 +1395,16 @@ impl SymbolicReasoner {
                 ReadStage::Execute,
                 ReadFailureKind::ExecutionMiss,
                 "计划已识别，但回答管线没有产生结果",
+            );
+            trace.reading.push(
+                Residual::new(
+                    ResidualKind::ExecutionMiss,
+                    ResidualStage::Execute,
+                    ResidualSeverity::Blocking,
+                    RepairKind::AcquireFact,
+                    "计划已识别，但执行阶段没有产生结果",
+                )
+                .expected("事实、推理律或可执行预算"),
             );
         }
         let receipt = self.read_traces.record(&trace);
@@ -13726,6 +13837,50 @@ types = [
         let answer = reasoner.answer("张三的师傅是谁");
         assert!(answer.is_some(), "已登记实体应正常回答");
         assert_eq!(reasoner.read_trace_receipts().len(), 1);
+    }
+
+    #[test]
+    fn reading_residual_locates_unknown_entity_and_names_repair() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.set_nlp_config(trace_nlp_config());
+
+        let reading = reasoner
+            .read_question("未名科技公司的老板是谁")
+            .expect("应返回读法残差表");
+        assert_eq!(reading.status(), crate::reading::ReadingStatus::Partial);
+        let residual = reading
+            .residuals
+            .iter()
+            .find(|residual| residual.kind == ResidualKind::UnknownEntity)
+            .expect("应定位到未知实体残差");
+        assert_eq!(residual.stage, ResidualStage::Link);
+        assert_eq!(residual.span, Some(TextSpan::new(0, 6)));
+        assert_eq!(residual.surface.as_deref(), Some("未名科技公司"));
+        assert_eq!(residual.expected.as_deref(), Some("已登记实体"));
+        assert_eq!(residual.repair, RepairKind::SupplyEntity);
+        assert!(reading
+            .residual_kinds()
+            .iter()
+            .any(|kind| kind == "unknown_entity"));
+
+        let report = reasoner.lexical_trace_report("未名科技公司的老板是谁");
+        assert!(report.contains("读法状态：部分可读"), "{}", report);
+        assert!(report.contains("未知实体"), "{}", report);
+        assert!(report.contains("0..6"), "{}", report);
+    }
+
+    #[test]
+    fn degree_question_reaches_attribute_answer_path() {
+        let facts = vec![PrologFact::Entity {
+            name: "姚明".to_string(),
+            entity_type: "Person".to_string(),
+            properties: HashMap::from([("身高".to_string(), "226cm".to_string())]),
+        }];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let answer = reasoner.answer("姚明多高").expect("程度问句应可回答");
+        assert!(answer.contains("226cm"), "实际回答：{}", answer);
     }
 
     #[test]

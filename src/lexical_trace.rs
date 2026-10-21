@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::canonical;
 use crate::nlp::{preprocess_annotated, TagSource};
+use crate::reading::{self, Reading, RepairKind, Residual, ResidualKind, ResidualSeverity, ResidualStage, TextSpan};
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::NlpConfig;
 
@@ -265,6 +266,10 @@ pub struct LexicalTrace {
     pub oov: Vec<OovTrace>,
     pub failures: Vec<ReadFailure>,
     pub warnings: Vec<ReadWarning>,
+    /// 读法残差表：带 span/候选/修复动作的部分理解；与 failures 并存，
+    /// failures 保持旧回执兼容，reading 供新诊断与修复计划使用。
+    #[serde(default)]
+    pub reading: Reading,
     /// 宿主是否观察到回答；纯文本追踪（未访问知识库）为 None。
     pub answer_available: Option<bool>,
 }
@@ -355,6 +360,11 @@ impl LexicalTrace {
             warning_kinds,
             closure_marker_violations: self.boundary_violations() as u64,
             oov_count: self.oov.len() as u64,
+            reading_status: self.reading.status().code().to_string(),
+            residual_kinds: self.reading.residual_kinds(),
+            residual_stages: self.reading.residual_stages(),
+            blocking_residuals: self.reading.blocking_count() as u64,
+            repair_kinds: self.reading.repair_kinds(),
             fidelity: self.fidelity,
             answered: self.answer_available,
         }
@@ -458,6 +468,11 @@ impl LexicalTrace {
             }
         }
 
+        for line in self.reading.render_lines() {
+            output.push_str(&line);
+            output.push('\n');
+        }
+
         if self.failures.is_empty() {
             output.push_str("失败分类：无（本轨迹只做观测）。\n");
         } else {
@@ -502,6 +517,21 @@ pub struct TraceReceipt {
     pub warning_kinds: Vec<String>,
     pub closure_marker_violations: u64,
     pub oov_count: u64,
+    /// 读法状态：ready / partial / unreadable（旧快照缺省为空）。
+    #[serde(default)]
+    pub reading_status: String,
+    /// 残差类别（稳定闭集代码，已排序去重）。
+    #[serde(default)]
+    pub residual_kinds: Vec<String>,
+    /// 残差阶段（稳定闭集代码，已排序去重）。
+    #[serde(default)]
+    pub residual_stages: Vec<String>,
+    /// 阻断性残差条数。
+    #[serde(default)]
+    pub blocking_residuals: u64,
+    /// 可执行的修复动作（稳定闭集代码，已排序去重）。
+    #[serde(default)]
+    pub repair_kinds: Vec<String>,
     pub fidelity: TraceFidelity,
     pub answered: Option<bool>,
 }
@@ -567,9 +597,13 @@ impl ReadTraceLedger {
         let mut stages: BTreeMap<String, u64> = BTreeMap::new();
         let mut plans: BTreeMap<String, u64> = BTreeMap::new();
         let mut sources: BTreeMap<String, u64> = BTreeMap::new();
+        let mut statuses: BTreeMap<String, u64> = BTreeMap::new();
+        let mut residual_kinds: BTreeMap<String, u64> = BTreeMap::new();
+        let mut repairs: BTreeMap<String, u64> = BTreeMap::new();
         let mut unknown_tokens = 0u64;
         let mut marker_violations = 0u64;
         let mut oov = 0u64;
+        let mut blocking_residuals = 0u64;
         for receipt in &receipts {
             for kind in &receipt.failure_kinds {
                 *failures.entry(kind.clone()).or_insert(0) += 1;
@@ -585,9 +619,23 @@ impl ReadTraceLedger {
             for (source, count) in &receipt.source_counts {
                 *sources.entry(source.clone()).or_insert(0) += count;
             }
+            *statuses
+                .entry(if receipt.reading_status.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    receipt.reading_status.clone()
+                })
+                .or_insert(0) += 1;
+            for kind in &receipt.residual_kinds {
+                *residual_kinds.entry(kind.clone()).or_insert(0) += 1;
+            }
+            for repair in &receipt.repair_kinds {
+                *repairs.entry(repair.clone()).or_insert(0) += 1;
+            }
             unknown_tokens += receipt.unknown_tokens;
             marker_violations += receipt.closure_marker_violations;
             oov += receipt.oov_count;
+            blocking_residuals += receipt.blocking_residuals;
         }
         let mut output = format!(
             "读法台账：{} 条有界回执（容量 {}，不保存原文）。\n",
@@ -603,12 +651,21 @@ impl ReadTraceLedger {
         output.push_str("计划分布（条次）：");
         output.push_str(&render_counts(&plans));
         output.push('\n');
+        output.push_str("读法状态（条次）：");
+        output.push_str(&render_counts(&statuses));
+        output.push('\n');
+        output.push_str("残差类别（条次）：");
+        output.push_str(&render_counts(&residual_kinds));
+        output.push('\n');
+        output.push_str("修复动作（条次）：");
+        output.push_str(&render_counts(&repairs));
+        output.push('\n');
         output.push_str("词性来源（token 数）：");
         output.push_str(&render_counts(&sources));
         output.push('\n');
         output.push_str(&format!(
-            "未知词：{}；标记边界越界：{}；OOV 提名：{}。\n",
-            unknown_tokens, marker_violations, oov
+            "未知词：{}；标记边界越界：{}；OOV 提名：{}；阻断残差：{}。\n",
+            unknown_tokens, marker_violations, oov, blocking_residuals
         ));
         if let Some(last) = receipts.last() {
             output.push_str(&format!(
@@ -865,12 +922,53 @@ pub fn trace_question(
         });
     }
 
+    let mut reading_state = reading::diagnose(trimmed, plan);
+    for marker in markers.iter().filter(|marker| marker.boundary_violation) {
+        // 标记词落在别的 token 内部却已经被当前计划消费，说明计划本身可能
+        // 建立在子串误读上（「所有权」不是「所有」）；这种残差必须阻断，
+        // 而普通边界提示只需警告。
+        let consumed = marker.plan_consumed;
+        reading_state.push(
+            Residual::new(
+                ResidualKind::TokenBoundary,
+                ResidualStage::Tokenize,
+                if consumed {
+                    ResidualSeverity::Blocking
+                } else {
+                    ResidualSeverity::Warning
+                },
+                RepairKind::SplitToken,
+                format!(
+                    "标记词「{}」没有对齐 token 边界，{}",
+                    marker.marker,
+                    if consumed {
+                        "但已被当前闭包计划消费，读法可疑"
+                    } else {
+                        "可能把词内子串当成语法标记"
+                    }
+                ),
+            )
+            .surface(trimmed, TextSpan::new(marker.start, marker.end))
+            .expected("与标记词语义一致的 token 边界"),
+        );
+    }
+
     let mut failures = Vec::new();
     if trimmed.is_empty() {
         failures.push(ReadFailure {
             stage: ReadStage::Input,
             kind: ReadFailureKind::EmptyInput,
             detail: "问句为空".to_string(),
+        });
+    } else if question_chars > reading::MAX_QUESTION_CHARS {
+        failures.push(ReadFailure {
+            stage: ReadStage::Input,
+            kind: ReadFailureKind::InputTooLong,
+            detail: format!(
+                "问句 {} 字，超过 {} 字上限",
+                question_chars,
+                reading::MAX_QUESTION_CHARS
+            ),
         });
     } else if plan.is_none() {
         failures.push(ReadFailure {
@@ -893,6 +991,7 @@ pub fn trace_question(
         oov: Vec::new(),
         failures,
         warnings,
+        reading: reading_state,
         answer_available: None,
     }
 }

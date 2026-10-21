@@ -695,7 +695,7 @@ pub fn diagnose(question: &str, plan: Option<&QueryPlan>) -> Reading {
                 ResidualStage::Plan,
                 ResidualSeverity::Blocking,
                 RepairKind::AddParticle,
-                "是非问缺少可校验的谓词或关系",
+                format!("是非问缺少可校验的谓词或关系（触发词「{}」）", marker),
             )
             .surface(trimmed, span)
             .expected("「X 的 <属性> 是 Y 吗」或「X <关系> Y 吗」"),
