@@ -743,8 +743,7 @@ impl ShapeDialogue {
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)?;
         }
-        let text = serde_json::to_string_pretty(&self.snapshot())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
+        let text = serde_json::to_string_pretty(&self.snapshot()).map_err(std::io::Error::other)?;
         fs::write(path, format!("{}\n", text))
     }
 
@@ -755,6 +754,7 @@ impl ShapeDialogue {
         dialogue.restore(&snapshot).then_some(dialogue)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start_profile(
         &mut self,
         entity: &str,
