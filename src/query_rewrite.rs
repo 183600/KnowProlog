@@ -203,6 +203,16 @@ fn strip_entity_affixes(mut text: &str) -> &str {
     text
 }
 
+fn strip_negation_suffix(text: &str) -> (&str, bool) {
+    if let Some(rest) = text.strip_suffix("没有") {
+        return (rest.trim_end(), true);
+    }
+    if let Some(rest) = text.strip_suffix('没') {
+        return (rest.trim_end(), true);
+    }
+    (text, false)
+}
+
 fn entity(
     raw: &str,
     lexicon: &dyn RelationLexicon,
@@ -474,12 +484,15 @@ pub fn rewrite(
     }
 
     if let Some((position, length)) = marker_position(&text, &["被"]) {
-        let patient_text = text[..position].trim();
+        let (patient_text, marker_negated) = strip_negation_suffix(text[..position].trim());
         let right = text[position + length..].trim();
         if patient_text.is_empty() || right.is_empty() {
             return None;
         }
         if is_wh(patient_text) {
+            if marker_negated {
+                return None;
+            }
             let (agent, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
             if negated {
                 return None;
@@ -497,6 +510,9 @@ pub fn rewrite(
         }
         let patient = entity(patient_text, lexicon)?;
         if let Some(rest) = right.strip_prefix_wh() {
+            if marker_negated {
+                return None;
+            }
             let (surface, predicate, negated) = predicate(rest, lexicon)?;
             if negated {
                 return None;
@@ -515,13 +531,14 @@ pub fn rewrite(
         if !yes_no {
             return None;
         }
-        let (agent, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
+        let (agent, surface, predicate, predicate_negated) =
+            split_entity_predicate(right, lexicon)?;
         return Some(build(
             QueryPlan::CheckRelation {
                 subject: agent,
                 predicate: predicate.clone(),
                 object: patient,
-                negated,
+                negated: predicate_negated ^ marker_negated,
             },
             RelationShape::PassiveYesNo,
             "passive-yes-no",
@@ -531,12 +548,15 @@ pub fn rewrite(
     }
 
     if let Some((position, length)) = marker_position(&text, &["把", "将"]) {
-        let subject_text = text[..position].trim();
+        let (subject_text, marker_negated) = strip_negation_suffix(text[..position].trim());
         let right = text[position + length..].trim();
         if subject_text.is_empty() || right.is_empty() {
             return None;
         }
         if is_wh(subject_text) {
+            if marker_negated {
+                return None;
+            }
             let (patient, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
             if negated {
                 return None;
@@ -554,6 +574,9 @@ pub fn rewrite(
         }
         let subject = entity(subject_text, lexicon)?;
         if let Some(rest) = right.strip_prefix_wh() {
+            if marker_negated {
+                return None;
+            }
             let (surface, predicate, negated) = predicate(rest, lexicon)?;
             if negated {
                 return None;
@@ -572,13 +595,14 @@ pub fn rewrite(
         if !yes_no {
             return None;
         }
-        let (patient, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
+        let (patient, surface, predicate, predicate_negated) =
+            split_entity_predicate(right, lexicon)?;
         return Some(build(
             QueryPlan::CheckRelation {
                 subject,
                 predicate: predicate.clone(),
                 object: patient,
-                negated,
+                negated: predicate_negated ^ marker_negated,
             },
             RelationShape::BaYesNo,
             "ba-yes-no",
@@ -771,6 +795,19 @@ mod tests {
         assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
         assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
         assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn marker_negation_before_bei_or_ba_is_preserved() {
+        let expected = QueryPlan::CheckRelation {
+            subject: "张三".to_string(),
+            predicate: "教".to_string(),
+            object: "李四".to_string(),
+            negated: true,
+        };
+        assert_eq!(parse("李四没有被张三教过吗").unwrap().plan, expected);
+        assert_eq!(parse("张三没有把李四教过吗").unwrap().plan, expected);
+        assert!(parse("谁没有被张三教过").is_none());
     }
 
     #[test]

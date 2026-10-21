@@ -13468,6 +13468,10 @@ types = [
             .answer("张三认不认识王五")
             .expect("A 不 A 是非问");
         assert!(a_not_a.starts_with("是的"), "{}", a_not_a);
+        let passive_negated = reasoner
+            .answer("张三没有被李四认识吗")
+            .expect("被字句标记否定");
+        assert!(passive_negated.starts_with("不是"), "{}", passive_negated);
 
         let synonyms = HashMap::from([("老张".to_string(), "张三".to_string())]);
         let mut aliased = SymbolicReasoner::new(test_config(), synonyms);
