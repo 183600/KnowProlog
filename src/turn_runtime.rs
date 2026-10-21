@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 
 /// 未完成轮次上限（超出丢弃最旧）。
 pub const OPEN_TURN_CAPACITY: usize = 8;
@@ -325,6 +326,7 @@ pub struct TurnControl {
     started: Instant,
     phase: TurnPhase,
     cancel: CancelToken,
+    progress: Option<UnboundedSender<TurnPhase>>,
     observed_overrun: Option<TurnPhase>,
 }
 
@@ -340,6 +342,12 @@ impl TurnControl {
         control
     }
 
+    /// 阶段进度回执：每个阶段入口向等待方发送一次（有界？无界但阶段数固定）。
+    pub fn with_progress(mut self, progress: UnboundedSender<TurnPhase>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
     /// 测试与重放可注入起点；生产路径只用 [`Self::new`]。
     pub fn starting_at(turn: u64, budget: TurnBudget, started: Instant) -> Self {
         Self {
@@ -348,6 +356,7 @@ impl TurnControl {
             started,
             phase: TurnPhase::Prepare,
             cancel: CancelToken::new(),
+            progress: None,
             observed_overrun: None,
         }
     }
@@ -392,6 +401,9 @@ impl TurnControl {
     /// 阶段入口：先切换阶段，再做一次取消 / 预算检查。
     pub fn enter(&mut self, phase: TurnPhase) -> Result<(), TurnFault> {
         self.phase = phase;
+        if let Some(progress) = &self.progress {
+            let _ = progress.send(phase);
+        }
         self.check()
     }
 
@@ -633,6 +645,23 @@ mod tests {
         );
         control.enter(TurnPhase::Recall).expect("Observe 不中止");
         assert_eq!(control.observed_overrun(), Some(TurnPhase::Recall));
+    }
+
+    #[tokio::test]
+    async fn phase_progress_is_emitted_at_each_boundary() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut control = TurnControl::new(1, TurnBudget::unlimited()).with_progress(tx);
+        for phase in [TurnPhase::Rewrite, TurnPhase::Recall, TurnPhase::Reason] {
+            control.enter(phase).expect("无限预算不应失败");
+        }
+        let mut seen = Vec::new();
+        while let Ok(phase) = rx.try_recv() {
+            seen.push(phase);
+        }
+        assert_eq!(
+            seen,
+            vec![TurnPhase::Rewrite, TurnPhase::Recall, TurnPhase::Reason]
+        );
     }
 
     #[test]

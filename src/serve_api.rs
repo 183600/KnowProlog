@@ -552,13 +552,26 @@ impl Session {
         self.run_turn_with_cancel(input, CancelToken::new())
     }
 
+    #[cfg(test)]
     fn run_turn_with_cancel(&mut self, input: &str, cancel: CancelToken) -> TurnResponse {
+        self.run_turn_with_cancel_and_progress(input, cancel, None)
+    }
+
+    fn run_turn_with_cancel_and_progress(
+        &mut self,
+        input: &str,
+        cancel: CancelToken,
+        progress: Option<mpsc::UnboundedSender<TurnPhase>>,
+    ) -> TurnResponse {
         self.manager.begin_turn();
         let mut control = TurnControl::with_cancel(
             u64::from(self.turns).saturating_add(1),
             self.turn_budget,
             cancel,
         );
+        if let Some(progress) = progress {
+            control = control.with_progress(progress);
+        }
         self.run_turn_checked(input, &mut control, false, 1)
     }
 
@@ -1027,6 +1040,7 @@ enum SessionCommand {
         input: String,
         policy: Option<SessionPolicy>,
         cancel: CancelToken,
+        progress: Option<mpsc::UnboundedSender<TurnPhase>>,
         reply: oneshot::Sender<TurnResponse>,
     },
     Resume {
@@ -1490,12 +1504,14 @@ impl ApiState {
                             input,
                             policy,
                             cancel,
+                            progress,
                             reply,
                         } => {
                             if let Some(policy) = policy {
                                 session.policy = policy;
                             }
-                            let response = session.run_turn_with_cancel(&input, cancel);
+                            let response = session
+                                .run_turn_with_cancel_and_progress(&input, cancel, progress);
                             let _ = reply.send(response);
                         }
                         SessionCommand::Resume { cancel, reply } => {
@@ -1728,6 +1744,7 @@ impl ApiState {
             input: input.to_string(),
             policy: policy.cloned(),
             cancel: cancel.clone(),
+            progress: None,
             reply: reply_tx,
         }) {
             Ok(()) => {}
@@ -1785,6 +1802,37 @@ impl ApiState {
             .await
             .map_err(|_| SessionError::Unavailable)?;
         reply_rx.await.map_err(|_| SessionError::Unavailable)
+    }
+
+    /// 启动一轮并返回阶段进度接收端；调用方负责等待最终回执并计量轮次。
+    async fn take_turn_stream(
+        &self,
+        session_id: &str,
+        input: &str,
+    ) -> Result<
+        (
+            mpsc::UnboundedReceiver<TurnPhase>,
+            oneshot::Receiver<TurnResponse>,
+            CancelToken,
+        ),
+        SessionError,
+    > {
+        let tx = self.session_tx(session_id).await?;
+        let cancel = CancelToken::new();
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        match tx.try_send(SessionCommand::Turn {
+            input: input.to_string(),
+            policy: None,
+            cancel: cancel.clone(),
+            progress: Some(progress_tx),
+            reply: reply_tx,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(SessionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(SessionError::Unavailable),
+        }
+        Ok((progress_rx, reply_rx, cancel))
     }
 
     async fn session_snapshot(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
@@ -2661,8 +2709,8 @@ async fn stream_turn(
             return Ok(());
         }
     };
-    let turn = match state.take_turn(session_id, &input).await {
-        Ok(turn) => turn,
+    let (mut progress, mut reply, cancel) = match state.take_turn_stream(session_id, &input).await {
+        Ok(parts) => parts,
         Err(error) => {
             write_response(stream, session_error_response(error)).await?;
             return Ok(());
@@ -2671,6 +2719,68 @@ async fn stream_turn(
 
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     stream.write_all(header.as_bytes()).await?;
+    let deadline = tokio::time::sleep(TURN_WAIT_TIMEOUT);
+    tokio::pin!(deadline);
+    let mut progress_open = true;
+    let turn = loop {
+        tokio::select! {
+            phase = progress.recv(), if progress_open => {
+                match phase {
+                    Some(phase) => {
+                        let event = serde_json::json!({
+                            "session_id": session_id,
+                            "phase": phase.code(),
+                            "phase_label": phase.label(),
+                        });
+                        if let Err(error) = stream
+                            .write_all(format!("data: {}\n\n", event).as_bytes())
+                            .await
+                        {
+                            cancel.cancel();
+                            return Err(error);
+                        }
+                    }
+                    None => progress_open = false,
+                }
+            }
+            result = &mut reply => {
+                match result {
+                    Ok(turn) => break turn,
+                    Err(_) => {
+                        let event = serde_json::json!({
+                            "session_id": session_id,
+                            "done": true,
+                            "error": "session unavailable",
+                        });
+                        stream
+                            .write_all(
+                                format!("data: {}\n\ndata: [DONE]\n\n", event).as_bytes(),
+                            )
+                            .await?;
+                        stream.flush().await?;
+                        let _ = stream.shutdown().await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = &mut deadline => {
+                cancel.cancel();
+                let event = serde_json::json!({
+                    "session_id": session_id,
+                    "done": true,
+                    "error": "turn timeout",
+                    "status": "timeout",
+                });
+                stream
+                    .write_all(format!("data: {}\n\ndata: [DONE]\n\n", event).as_bytes())
+                    .await?;
+                stream.flush().await?;
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+        }
+    };
+    state.turns_total.fetch_add(1, Ordering::Relaxed);
     for chunk in sentence_chunks(&turn.reply) {
         let event = serde_json::json!({
             "session_id": turn.session_id,
@@ -3927,6 +4037,11 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert!(body.contains("data: "), "{}", body);
         assert!(body.contains("[DONE]"), "{}", body);
         assert!(body.contains("226"), "{}", body);
+        assert!(
+            body.contains("\"phase\":\"prepare\""),
+            "SSE 必须先回执阶段进度：{}",
+            body
+        );
     }
 
     #[tokio::test]
