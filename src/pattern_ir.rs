@@ -408,6 +408,13 @@ pub struct PatternEntry {
     /// 可选的对话上下文守卫；不满足时该模式在本次路由中落选。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard: Option<ContextGuard>,
+    /// 是否作为 NLU 回退模式：主路由全部未命中时才参与。
+    ///
+    /// 配置查询规则始终优先；NLU 意图只有在与同名配置规则对齐出
+    /// 可执行的 `query_type` 后才具备回退资格，避免把天气/聊天意图
+    /// 误接进知识查询。
+    #[serde(default)]
+    pub fallback: bool,
 }
 
 impl PatternEntry {
@@ -427,6 +434,7 @@ impl PatternEntry {
             route,
             elems,
             guard: None,
+            fallback: false,
         }
     }
 
@@ -1407,10 +1415,20 @@ impl PatternLibrary {
         let mut library = Self::from_prolog_rules(&config.prolog_rules);
         for domain in crate::nlu::default_domains() {
             for intent in &domain.intents {
+                // NLU 意图与同名配置规则对齐时，复用配置的 query_type，
+                // 作为主路由未命中后的回退（route=false 仍不抢配置匹配）。
+                let aligned_type = config
+                    .prolog_rules
+                    .iter()
+                    .find(|rule| rule.name == intent.name)
+                    .map(|rule| rule.query_type.clone());
                 for pattern in &intent.patterns {
-                    library
-                        .entries
-                        .push(PatternEntry::from_nlu_intent(&domain, intent, pattern));
+                    let mut entry = PatternEntry::from_nlu_intent(&domain, intent, pattern);
+                    if let Some(query_type) = &aligned_type {
+                        entry.query_type = query_type.clone();
+                        entry.fallback = true;
+                    }
+                    library.entries.push(entry);
                 }
             }
         }
@@ -1435,6 +1453,10 @@ impl PatternLibrary {
 
     pub fn nlu_count(&self) -> usize {
         self.entries.iter().filter(|entry| !entry.route).count()
+    }
+
+    pub fn fallback_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.fallback).count()
     }
 
     /// 按来源前缀计数（`taught#` / `config.toml#` / `nlu#` …）。
@@ -1694,6 +1716,29 @@ impl PatternLibrary {
         None
     }
 
+    /// NLU 回退路由：仅当主路由无命中时使用，按同样优先级与守卫评估。
+    pub fn match_fallback(&self, tokens: &[crate::nlp::TaggedWord]) -> Option<PatternMatch> {
+        self.match_fallback_with_context(tokens, &PatternContext::default())
+    }
+
+    /// 带上下文守卫的 NLU 回退路由。
+    pub fn match_fallback_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+    ) -> Option<PatternMatch> {
+        for index in self.evaluation_order() {
+            let entry = &self.entries[index];
+            if !entry.fallback || !entry.context_satisfied(context) {
+                continue;
+            }
+            if let Ok(m) = match_entry(entry, tokens) {
+                return Some(m);
+            }
+        }
+        None
+    }
+
     /// 与既有 `nlp::analyze_query_intent` 同构的路由口。
     pub fn route(&self, tokens: &[crate::nlp::TaggedWord]) -> Option<(String, Vec<String>)> {
         self.match_route(tokens)
@@ -1730,9 +1775,10 @@ pub fn render_library_report(library: &PatternLibrary) -> String {
     let taught = library.count_with_source_prefix("taught#");
     let _ = writeln!(
         out,
-        "模式库：{} 条（可路由查询 {} + NLU 意图 {} + 教学 {}）",
+        "模式库：{} 条（可路由查询 {} + NLU 回退 {} + NLU 意图 {} + 教学 {}）",
         library.len(),
         library.route_count(),
+        library.fallback_count(),
         library.nlu_count(),
         taught
     );
@@ -3096,6 +3142,36 @@ mod tests {
         assert_eq!(
             library_fingerprint(library.entries()),
             library_fingerprint(&right)
+        );
+    }
+
+    #[test]
+    fn nlu_intent_only_routes_as_fallback_when_config_misses() {
+        let config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        let legacy_rules = create_prolog_rules(&config);
+        assert!(library.fallback_count() > 0, "应有与配置规则对齐的 NLU 回退意图");
+
+        let tokens = preprocess("姚明年龄", &config.nlp);
+        assert!(
+            analyze_query_intent(&tokens, &legacy_rules).is_none(),
+            "配置规则不应命中这个问法"
+        );
+        assert!(library.match_route(&tokens).is_none(), "主路由不应命中");
+        let fallback = library
+            .match_fallback(&tokens)
+            .expect("NLU 意图应作为回退命中");
+        assert_eq!(fallback.entry.query_type, "age_query");
+        assert_eq!(fallback.entities, vec!["姚明".to_string()]);
+        assert!(fallback.entry.source.starts_with("nlu#"), "{}", fallback.entry.source);
+
+        // 配置能命中的问法仍走主路由，回退不改变既有行为。
+        let configured = preprocess("小明的年龄", &config.nlp);
+        assert!(library.match_route(&configured).is_some());
+        assert_eq!(
+            library.route(&configured),
+            analyze_query_intent(&configured, &legacy_rules)
         );
     }
 

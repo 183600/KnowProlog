@@ -9113,7 +9113,10 @@ fn route_query_with_patterns(
 ) -> Option<(String, Vec<String>, Option<String>)> {
     let focus = context.focus.as_deref();
     let turn = context.turn;
-    let Some(matched) = library.match_route_with_context(words, context) else {
+    let Some(matched) = library
+        .match_route_with_context(words, context)
+        .or_else(|| library.match_fallback_with_context(words, context))
+    else {
         episodes.record_unmatched(input, words, focus, turn);
         return None;
     };
