@@ -1366,6 +1366,23 @@ pub fn detect_descriptions(text: &str, source: &dyn SenseSource) -> Vec<Descript
             if index == 0 || chars[index - 1] != '的' {
                 continue;
             }
+            // 只有关系名词处于问句尾部时才是描述性指称。
+            // 「张三的师傅的师傅是谁」中的第一个「的师傅」是链式路径的一环，
+            // 若在此改写会把两跳问句截成单跳，必须放行给推理器。
+            let tail: String = chars[index + rel_len..].iter().collect();
+            let tail = tail
+                .trim()
+                .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+                .trim_end_matches('呢')
+                .trim_end_matches(['？', '?', '。', '！', '!', ' ']);
+            if !tail.is_empty()
+                && !matches!(
+                    tail,
+                    "是谁" | "是什么" | "是哪个" | "是哪位" | "是哪里" | "叫什么" | "叫啥"
+                )
+            {
+                continue;
+            }
             let de_index = index - 1;
             let mut head: Option<String> = None;
             for head_len in (1..=4.min(de_index)).rev() {
@@ -2178,6 +2195,21 @@ mod tests {
         assert_eq!(descriptions[0].head.as_deref(), Some("姚明"));
         assert_eq!(descriptions[0].relation.as_deref(), Some("妻子"));
         assert_eq!(descriptions[0].rewritten.as_deref(), Some("姚明的妻子是谁"));
+
+        let nested = detect_descriptions("姚明的妻子的丈夫是谁", &source);
+        assert!(
+            nested
+                .iter()
+                .all(|description| description.kind != DescriptionKind::Relational),
+            "{nested:?}"
+        );
+        let assertion = detect_descriptions("姚明的妻子是叶莉", &source);
+        assert!(
+            assertion
+                .iter()
+                .all(|description| description.kind != DescriptionKind::Relational),
+            "{assertion:?}"
+        );
 
         let descriptions = detect_descriptions("演《无间道》的演员是谁", &source);
         assert_eq!(descriptions.len(), 1);
