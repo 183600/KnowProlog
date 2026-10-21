@@ -26,6 +26,7 @@ use crate::contextual_reference::{
 };
 use crate::derivation::Derivation;
 use crate::entity_linker::EntityLinker;
+use crate::identity_dialogue::{self, IdentityAct, IdentityCard, IdentityStatus, UserIdentityLedger};
 use crate::epistemic::{EpistemicStatus, LedgerLoad};
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
 use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
@@ -149,6 +150,9 @@ pub struct DialogueManagerSnapshot {
     /// 语境指称绑定：空态省略，未发生澄清的会话字节不变。
     #[serde(default, skip_serializing_if = "BindingLedger::is_empty")]
     pub references: BindingLedger,
+    /// 用户身份台账：只存用户明确自述的名字；空态省略，旧快照字节不变。
+    #[serde(default, skip_serializing_if = "UserIdentityLedger::is_empty")]
+    pub identity: UserIdentityLedger,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -635,6 +639,10 @@ pub struct DialogueManager {
     frame_memory: FrameMemory,
     /// 语境指称绑定账本（澄清回答 → 后续同词面直接复用）。
     references: BindingLedger,
+    /// 用户身份台账（随快照持久化；不写入图谱）。
+    identity: UserIdentityLedger,
+    /// 最近一次身份卡（运行时只读视图，不进快照）。
+    last_identity_card: Option<IdentityCard>,
     /// 待回答的歧义澄清请求（不持久化；恢复会话后需重新提问）。
     pending_reference: Option<ClarifyRequest>,
     /// 无状态消歧器（状态都在 `references`）。
@@ -669,6 +677,8 @@ impl DialogueManager {
             frame_program: None,
             frame_memory: FrameMemory::new(),
             references: BindingLedger::new(),
+            identity: UserIdentityLedger::new(),
+            last_identity_card: None,
             pending_reference: None,
             reference_resolver: ContextualResolver::new(),
         }
@@ -897,6 +907,16 @@ impl DialogueManager {
     /// 语境指称绑定账本（只读；供宿主持久化与审计）。
     pub fn reference_ledger(&self) -> &BindingLedger {
         &self.references
+    }
+
+    /// 用户身份台账（只读；名字只在本会话内有效）。
+    pub fn identity_ledger(&self) -> &UserIdentityLedger {
+        &self.identity
+    }
+
+    /// 最近一轮身份回答的结构化身份卡（运行时视图，不进快照）。
+    pub fn last_identity_card(&self) -> Option<&IdentityCard> {
+        self.last_identity_card.as_ref()
     }
 
     /// 待回答的歧义澄清请求（只读；无挂起时为 None）。
@@ -1145,6 +1165,7 @@ impl DialogueManager {
             open_turns: self.open_turns.clone(),
             frames: (!self.frame_memory.is_empty()).then(|| self.frame_memory.clone()),
             references: self.references.clone(),
+            identity: self.identity.clone(),
         }
     }
 
@@ -1159,6 +1180,8 @@ impl DialogueManager {
         self.open_turns = snapshot.open_turns.clone();
         self.frame_memory = snapshot.frames.clone().unwrap_or_default();
         self.references = snapshot.references.clone();
+        self.identity = snapshot.identity.clone();
+        self.last_identity_card = None;
         self.pending_reference = None;
     }
 
@@ -1205,6 +1228,10 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        self.last_identity_card = None;
+        if let Some(reply) = self.plan_identity_dialogue(input, knowledge) {
+            return Some(reply);
+        }
         if let Some(reply) = self.try_trace_correction(input, knowledge) {
             return Some(reply);
         }
@@ -1361,6 +1388,10 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        self.last_identity_card = None;
+        if let Some(reply) = self.plan_identity_dialogue(input, knowledge) {
+            return Some(reply);
+        }
         if let Some(reply) = self.try_trace_correction(input, knowledge) {
             return Some(reply);
         }
@@ -1384,6 +1415,106 @@ impl DialogueManager {
             MoveKind::AskAttribute | MoveKind::AskIdentity => self.execute(frame, knowledge),
             _ => None,
         }
+    }
+
+    /// 身份域对话：系统 / 用户身份完全在对话层闭合；实体身份交给知识管线。
+    ///
+    /// 第一/第二人称绝不进入实体焦点栈，也不会被当作图谱实体查询；用户自述
+    /// 只写入会话台账（随快照持久化），不触碰图谱。
+    fn plan_identity_dialogue(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<DialogueReply> {
+        let act = identity_dialogue::classify(input);
+        let turn_no = self.turns.len() + 1;
+        let (card, plan, kind, text) = match act {
+            IdentityAct::AskSystem => (
+                identity_dialogue::system_card(),
+                "identity_system".to_string(),
+                MoveKind::AskIdentity,
+                String::new(),
+            ),
+            IdentityAct::AskUser => {
+                let card = identity_dialogue::user_card(&self.identity);
+                let plan = match card.status {
+                    IdentityStatus::Unknown => "identity_user_unknown",
+                    IdentityStatus::Forgotten => "identity_user_forgotten",
+                    _ => "identity_user_known",
+                };
+                (
+                    card,
+                    plan.to_string(),
+                    MoveKind::AskIdentity,
+                    String::new(),
+                )
+            }
+            IdentityAct::Introduce { name } => {
+                let outcome = self.identity.remember(&name, turn_no);
+                let card = identity_dialogue::user_card(&self.identity);
+                let (plan, text) = match outcome {
+                    identity_dialogue::RememberOutcome::Corrected { .. } => (
+                        "identity_user_correct",
+                        format!(
+                            "收到，已把称呼更正为「{}」。之前的称呼在本会话里不再使用。",
+                            name
+                        ),
+                    ),
+                    identity_dialogue::RememberOutcome::Unchanged => (
+                        "identity_user_unchanged",
+                        format!("我记得，你叫「{}」。", name),
+                    ),
+                    identity_dialogue::RememberOutcome::Remembered => (
+                        "identity_user_remember",
+                        format!(
+                            "好，我记住了：你叫「{}」。这个称呼只保存在本会话里，你可以随时让我忘记。",
+                            name
+                        ),
+                    ),
+                };
+                (card, plan.to_string(), MoveKind::Assert, text)
+            }
+            IdentityAct::ForgetUser => {
+                self.identity.forget();
+                let card = identity_dialogue::user_card(&self.identity);
+                (
+                    card,
+                    "identity_user_forget".to_string(),
+                    MoveKind::Assert,
+                    String::new(),
+                )
+            }
+            IdentityAct::AskEntity | IdentityAct::Other => return None,
+        };
+        let text = if text.is_empty() {
+            card.render()
+        } else {
+            text
+        };
+        let plans = vec![plan];
+        self.turns.push(DialogueTurn {
+            index: turn_no,
+            user: input.trim().to_string(),
+            kind: kind.clone(),
+            entity: None,
+            attribute: None,
+            answer_excerpt: Some(excerpt(&text, 40)),
+            provenance: Vec::new(),
+            plan: plans.clone(),
+            warrant: None,
+            kb_revision: Some(knowledge.revision()),
+        });
+        self.last_reply = plans.clone();
+        self.last_identity_card = Some(card);
+        if self.externals.last().map(String::as_str) == Some(input.trim()) {
+            self.externals.pop();
+        }
+        Some(DialogueReply {
+            text,
+            plan: plans,
+            kind,
+            derivation: None,
+        })
     }
 
     /// 一轮链接裁决的结果。
@@ -1576,6 +1707,31 @@ impl DialogueManager {
             return UtteranceFrame::new(raw, MoveKind::Farewell);
         }
 
+        // 第一/第二人称身份问句先于实体链接：它们不是图谱实体，也不应污染焦点栈。
+        match identity_dialogue::classify(stripped) {
+            IdentityAct::AskSystem => {
+                let mut frame = UtteranceFrame::new(raw, MoveKind::AskIdentity);
+                frame.question = Some("identity:system".to_string());
+                return frame;
+            }
+            IdentityAct::AskUser => {
+                let mut frame = UtteranceFrame::new(raw, MoveKind::AskIdentity);
+                frame.question = Some("identity:user".to_string());
+                return frame;
+            }
+            IdentityAct::Introduce { name } => {
+                let mut frame = UtteranceFrame::new(raw, MoveKind::Assert);
+                frame.question = Some(format!("identity:introduce:{}", name));
+                return frame;
+            }
+            IdentityAct::ForgetUser => {
+                let mut frame = UtteranceFrame::new(raw, MoveKind::Assert);
+                frame.question = Some("identity:forget".to_string());
+                return frame;
+            }
+            IdentityAct::AskEntity | IdentityAct::Other => {}
+        }
+
         let explicit: Vec<String> = knowledge.entities_in(raw);
         let focus = self.focus.last().cloned();
         let question_markers = ["谁", "什么", "哪", "多少", "几", "吗", "呢", "怎么"];
@@ -1760,6 +1916,7 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_recovery = None;
+        let mut identity_card: Option<IdentityCard> = None;
         let mut entity = frame.entity.clone();
         let pure_dialogue = matches!(
             frame.kind,
@@ -1885,6 +2042,12 @@ impl DialogueManager {
         if answer.is_none() && known && matches!(frame.kind, MoveKind::AskIdentity) {
             if let Some(name) = entity.as_deref() {
                 answer = knowledge.describe(name);
+            }
+        }
+        // 实体身份卡：结构化 claim 随回答追加（首个实质行仍是旧答案，兼容旧口径）。
+        if known && matches!(frame.kind, MoveKind::AskIdentity) {
+            if let Some(name) = entity.as_deref() {
+                identity_card = Some(identity_dialogue::entity_card(knowledge, name));
             }
         }
         // On 模式：用户更正后的会话内覆盖值优先于图谱旧值（改口在本会话内立即生效）。
@@ -2076,6 +2239,17 @@ impl DialogueManager {
         };
         let (text, plans) =
             self.apply_warrant(text, plans, warrant.as_ref(), &frame.kind, answer.is_some());
+        let mut text = text;
+        if let Some(card) = &identity_card {
+            let extension = card.render();
+            if !extension.is_empty() && !text.contains("【身份卡·实体】") {
+                if !text.trim().is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&extension);
+            }
+            self.last_identity_card = Some(card.clone());
+        }
 
         let mut provenance = answer
             .as_deref()
@@ -4535,4 +4709,117 @@ output = "value"
         assert!(restored.frame_report().contains("回答 2 次"));
         assert!(restored.summary().contains("绑定帧记忆"));
     }
+
+    #[test]
+    fn identity_scopes_stay_in_the_dialogue_layer() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+
+        let system = manager
+            .plan_pure_dialogue("你是谁？", &knowledge)
+            .expect("系统身份应被接管");
+        assert!(system.text.contains("KnowProlog"), "{}", system.text);
+        assert_eq!(
+            manager.last_identity_card().map(|card| card.scope),
+            Some(crate::identity_dialogue::IdentityScope::System)
+        );
+        assert_eq!(manager.focus_entity(), None, "第二人称不得进入实体焦点");
+
+        let unknown = manager
+            .plan_pure_dialogue("我是谁", &knowledge)
+            .expect("用户身份应被接管");
+        assert!(unknown.text.contains("还没有"), "{}", unknown.text);
+        assert_eq!(
+            manager.last_identity_card().map(|card| card.status),
+            Some(crate::identity_dialogue::IdentityStatus::Unknown)
+        );
+
+        let intro = manager
+            .plan_pure_dialogue("我叫张三", &knowledge)
+            .expect("显式自述应被记住");
+        assert!(intro.text.contains("张三"), "{}", intro.text);
+        assert_eq!(manager.identity_ledger().current(), Some("张三"));
+        assert_eq!(manager.focus_entity(), None, "用户自述不得进入实体焦点");
+
+        let recall = manager
+            .plan_pure_dialogue("你记得我叫什么吗", &knowledge)
+            .expect("用户身份应可回忆");
+        assert!(recall.text.contains("张三"), "{}", recall.text);
+
+        let corrected = manager
+            .plan_pure_dialogue("不对，我叫李四", &knowledge)
+            .expect("更正应被接受");
+        assert!(corrected.text.contains("李四"), "{}", corrected.text);
+        assert!(!corrected.text.contains("张三"), "旧称呼应立即失效");
+        assert_eq!(
+            manager.last_identity_card().map(|card| card.status),
+            Some(crate::identity_dialogue::IdentityStatus::Corrected)
+        );
+
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        let recalled = restored
+            .plan_pure_dialogue("我是谁", &knowledge)
+            .expect("恢复后应保留用户身份");
+        assert!(recalled.text.contains("李四"), "{}", recalled.text);
+
+        let mut fresh = DialogueManager::new();
+        let fresh_reply = fresh
+            .plan_pure_dialogue("我是谁", &knowledge)
+            .expect("新会话也应回答");
+        assert!(fresh_reply.text.contains("还没有"), "{}", fresh_reply.text);
+
+        let forgotten = manager
+            .plan_pure_dialogue("忘记我的名字", &knowledge)
+            .expect("遗忘请求应被确认");
+        assert!(forgotten.text.contains("忘记"), "{}", forgotten.text);
+        assert!(!forgotten.text.contains("李四"), "遗忘后不得再出现旧名字");
+        let after = manager
+            .plan_pure_dialogue("我是谁", &knowledge)
+            .expect("遗忘后仍应回答");
+        assert!(!after.text.contains("李四"), "{}", after.text);
+        assert_eq!(
+            manager.last_identity_card().map(|card| card.status),
+            Some(crate::identity_dialogue::IdentityStatus::Forgotten)
+        );
+    }
+
+    #[test]
+    fn entity_identity_appends_an_auditable_card_without_changing_the_answer_head() {
+        let knowledge = mock()
+            .with_entity("姚明", &["身高"])
+            .with_value("姚明", "身高", "226")
+            .with_profile("姚明", "姚明是中国篮球运动员。");
+        let mut manager = DialogueManager::new();
+        assert_eq!(
+            manager.analyze("你是谁", &knowledge).question.as_deref(),
+            Some("identity:system")
+        );
+        assert_eq!(
+            manager.analyze("我是谁", &knowledge).question.as_deref(),
+            Some("identity:user")
+        );
+
+        let reply = manager
+            .plan_reply("姚明是谁", &knowledge)
+            .expect("已知实体应回落到画像");
+        assert!(
+            reply.text.starts_with("姚明是中国篮球运动员。"),
+            "旧答案首行必须保留：{}",
+            reply.text
+        );
+        assert!(reply.text.contains("【身份卡·实体】"), "{}", reply.text);
+        assert!(reply.text.contains("依据：图谱属性 身高"), "{}", reply.text);
+        let card = manager.last_identity_card().expect("应留下结构化身份卡");
+        assert_eq!(
+            card.scope,
+            crate::identity_dialogue::IdentityScope::Entity
+        );
+        assert_eq!(card.status, crate::identity_dialogue::IdentityStatus::Known);
+        assert_eq!(card.scope_leaks(), 0);
+        assert_eq!(card.missing_evidence(), 0);
+        assert_eq!(manager.focus_entity(), Some("姚明"));
+    }
+
 }
