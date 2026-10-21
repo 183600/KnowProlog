@@ -28,6 +28,7 @@ use crate::recovery::{self, PendingKind, RecoveryMode, RecoveryRequest, Recovery
 use crate::recovery::{RecoveryNomination, ReframedReading, VerificationOutcome};
 use crate::symbolic_reasoner::SymbolicReasoner;
 use crate::trace_graph::{NodeId, QudKind, ReferentSource, TraceMode, TraceStore, TurnTrace};
+use crate::turn_runtime::{OpenTurn, OpenTurnBook, TurnFault};
 
 /// 一轮话语的语用类型（对话本体的「动作类」）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,6 +133,9 @@ pub struct DialogueManagerSnapshot {
     /// 分层追踪图（Off/空态时为 None，快照字节与引入追踪前逐字节一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<TraceStore>,
+    /// 未完成轮次（取消 / 超时 / 故障）：空态省略，旧快照字节不变。
+    #[serde(default, skip_serializing_if = "OpenTurnBook::is_empty")]
+    pub open_turns: OpenTurnBook,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -540,6 +544,8 @@ pub struct DialogueManager {
     trace_mode: TraceMode,
     /// 分层追踪图：问据栈、指代轨迹与逐轮决策节点（随快照持久化）。
     trace: TraceStore,
+    /// 未完成轮次台账：让「上一问停在推理阶段」成为可继续的一等记忆。
+    open_turns: OpenTurnBook,
 }
 
 impl Default for DialogueManager {
@@ -566,6 +572,7 @@ impl DialogueManager {
             board: QueryBoard::new(),
             trace_mode: TraceMode::Off,
             trace: TraceStore::new(),
+            open_turns: OpenTurnBook::new(),
         }
     }
 
@@ -794,11 +801,14 @@ impl DialogueManager {
     }
 
     /// 记录一次用户输入（含被其他管线处理的命令），供回顾时统计。
+    ///
+    /// 同时推进未完成轮次的逻辑时钟：TTL 按轮次而不是挂钟计算。
     pub fn observe_input(&mut self, input: &str) {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return;
         }
+        self.begin_turn();
         self.externals.push(trimmed.to_string());
         if self.externals.len() > 24 {
             self.externals.remove(0);
@@ -872,6 +882,77 @@ impl DialogueManager {
         }
     }
 
+    /// 推进一个逻辑轮次：未完成轮次按 TTL 过期。
+    pub fn begin_turn(&mut self) -> usize {
+        self.open_turns.begin_tick()
+    }
+
+    /// 未完成轮次台账（只读）。
+    pub fn open_turns(&self) -> &OpenTurnBook {
+        &self.open_turns
+    }
+
+    /// 最新的未完成轮次。
+    pub fn latest_open_turn(&self) -> Option<&OpenTurn> {
+        self.open_turns.latest()
+    }
+
+    /// 记录一次运行时失败：原始输入、阶段、故障与焦点都进入一等记忆。
+    pub fn record_open_turn(
+        &mut self,
+        input: &str,
+        turn: u64,
+        fault: &TurnFault,
+        focus: Option<&str>,
+        attribute: Option<&str>,
+    ) -> u64 {
+        self.open_turns.record(
+            input,
+            turn,
+            fault.phase,
+            fault.kind,
+            &fault.detail,
+            focus,
+            attribute,
+        )
+    }
+
+    /// 重放失败后重建未完成轮次（attempts 递增）。
+    pub fn record_open_turn_attempts(
+        &mut self,
+        input: &str,
+        turn: u64,
+        fault: &TurnFault,
+        focus: Option<&str>,
+        attribute: Option<&str>,
+        attempts: u32,
+    ) -> u64 {
+        self.open_turns.record_attempts(
+            input,
+            turn,
+            fault.phase,
+            fault.kind,
+            &fault.detail,
+            focus,
+            attribute,
+            attempts,
+        )
+    }
+
+    /// 取走最新未完成轮次（继续语义：先消费，再重放）。
+    pub fn take_open_turn(&mut self) -> Option<OpenTurn> {
+        self.open_turns.take_latest()
+    }
+
+    /// 放弃最新未完成轮次。
+    pub fn dismiss_open_turn(&mut self) -> Option<OpenTurn> {
+        self.open_turns.dismiss_latest()
+    }
+
+    pub fn clear_open_turns(&mut self) {
+        self.open_turns.clear();
+    }
+
     /// 对话管理器的对外自述（对话本体状态）。
     pub fn summary(&self) -> String {
         let focus = if self.focus.is_empty() {
@@ -907,6 +988,15 @@ impl DialogueManager {
         if self.board.is_active() {
             summary.push_str(&format!(" {}", self.board.summary()));
         }
+        if let Some(open) = self.latest_open_turn() {
+            summary.push_str(&format!(
+                " 未完成轮次：{} 个；最新停在「{}」（{}，第 {} 次）。",
+                self.open_turns.len(),
+                open.phase.label(),
+                open.fault.label(),
+                open.attempts
+            ));
+        }
         summary
     }
 
@@ -923,6 +1013,7 @@ impl DialogueManager {
             } else {
                 Some(self.trace.clone())
             },
+            open_turns: self.open_turns.clone(),
         }
     }
 
@@ -934,6 +1025,7 @@ impl DialogueManager {
         self.recovery = snapshot.recovery.clone();
         self.board = snapshot.board.clone();
         self.trace = snapshot.trace.clone().unwrap_or_default();
+        self.open_turns = snapshot.open_turns.clone();
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -3464,5 +3556,50 @@ mod tests {
             restored.trace_store().turn_count(),
             manager.trace_store().turn_count()
         );
+    }
+
+    #[test]
+    fn open_turn_is_recorded_and_survives_snapshot() {
+        let mut manager = DialogueManager::new();
+        manager.begin_turn();
+        let fault = crate::turn_runtime::TurnFault::new(
+            crate::turn_runtime::TurnFaultKind::Deadline,
+            crate::turn_runtime::TurnPhase::Reason,
+            "超出预算",
+            12,
+        );
+        manager.record_open_turn("姚明的身高是多少", 1, &fault, Some("姚明"), Some("身高"));
+        let open = manager.latest_open_turn().expect("应记录未完成轮次");
+        assert_eq!(open.input, "姚明的身高是多少");
+        assert!(manager.summary().contains("未完成轮次"));
+
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        assert_eq!(
+            restored.latest_open_turn().map(|open| open.fault),
+            Some(crate::turn_runtime::TurnFaultKind::Deadline)
+        );
+
+        let taken = restored.take_open_turn().expect("应可取走");
+        assert_eq!(taken.attempts, 1);
+        assert!(restored.latest_open_turn().is_none());
+    }
+
+    #[test]
+    fn open_turns_expire_after_ttl_ticks() {
+        let mut manager = DialogueManager::new();
+        manager.begin_turn();
+        let fault = crate::turn_runtime::TurnFault::new(
+            crate::turn_runtime::TurnFaultKind::Store,
+            crate::turn_runtime::TurnPhase::Recall,
+            "",
+            1,
+        );
+        manager.record_open_turn("姚明是谁", 1, &fault, None, None);
+        for _ in 0..crate::turn_runtime::OPEN_TURN_TTL_TURNS {
+            manager.begin_turn();
+        }
+        assert!(manager.latest_open_turn().is_none());
     }
 }
