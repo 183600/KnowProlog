@@ -108,6 +108,7 @@ const PREDICATE_PREFIXES: [&str; 12] = [
     "曾经", "已经", "一直", "正在", "也", "都", "还", "就", "将", "会", "能", "可以",
 ];
 const PREDICATE_SUFFIXES: [&str; 6] = ["起来", "下去", "了", "过", "着", "吗"];
+const NEGATION_PREFIXES: [&str; 3] = ["没有", "没", "不"];
 
 fn clean_question(question: &str) -> Option<String> {
     let mut text = question.trim().to_string();
@@ -201,28 +202,36 @@ fn entity(
 fn predicate(
     raw: &str,
     lexicon: &dyn RelationLexicon,
-) -> Option<(String, String)> {
+) -> Option<(String, String, bool)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
-    let mut candidates: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, bool)> = Vec::new();
     let mut current = raw.to_string();
-    candidates.push(current.clone());
+    candidates.push((current.clone(), false));
     for prefix in PREDICATE_PREFIXES {
         if let Some(rest) = current.strip_prefix(prefix) {
             current = rest.trim().to_string();
-            candidates.push(current.clone());
+            candidates.push((current.clone(), false));
+        }
+    }
+    for prefix in NEGATION_PREFIXES {
+        if let Some(rest) = current.strip_prefix(prefix) {
+            current = rest.trim().to_string();
+            candidates.push((current.clone(), true));
+            break;
         }
     }
     let mut trimmed = current.clone();
+    let negated = candidates.last().is_some_and(|(_, negated)| *negated);
     loop {
         let mut changed = false;
         for suffix in PREDICATE_SUFFIXES {
             if let Some(rest) = trimmed.strip_suffix(suffix) {
                 if !rest.is_empty() {
                     trimmed = rest.to_string();
-                    candidates.push(trimmed.clone());
+                    candidates.push((trimmed.clone(), negated));
                     changed = true;
                 }
             }
@@ -231,12 +240,12 @@ fn predicate(
             break;
         }
     }
-    for candidate in candidates {
+    for (candidate, negated) in candidates {
         if candidate.is_empty() {
             continue;
         }
         if let Some(canonical) = lexicon.canonical_predicate(&candidate) {
-            return Some((candidate, canonical));
+            return Some((candidate, canonical, negated));
         }
     }
     None
@@ -261,18 +270,18 @@ fn wh_suffix(text: &str) -> Option<usize> {
 fn split_predicate_object<'a>(
     text: &'a str,
     lexicon: &dyn RelationLexicon,
-) -> Option<(String, String, String)> {
-    let mut candidates: Vec<(String, String, String)> = Vec::new();
+) -> Option<(String, String, String, bool)> {
+    let mut candidates: Vec<(String, String, String, bool)> = Vec::new();
     for (index, _) in text.char_indices().skip(1) {
         let left = &text[..index];
         let right = &text[index..];
-        let Some((surface, predicate)) = predicate(left, lexicon) else {
+        let Some((surface, predicate, negated)) = predicate(left, lexicon) else {
             continue;
         };
         let Some(object) = entity(right, lexicon) else {
             continue;
         };
-        candidates.push((surface, predicate, object));
+        candidates.push((surface, predicate, object, negated));
     }
     candidates.sort_by(|left, right| {
         right
@@ -290,18 +299,18 @@ fn split_predicate_object<'a>(
 fn split_entity_predicate<'a>(
     text: &'a str,
     lexicon: &dyn RelationLexicon,
-) -> Option<(String, String, String)> {
-    let mut candidates: Vec<(String, String, String)> = Vec::new();
+) -> Option<(String, String, String, bool)> {
+    let mut candidates: Vec<(String, String, String, bool)> = Vec::new();
     for (index, _) in text.char_indices().skip(1) {
         let left = &text[..index];
         let right = &text[index..];
         let Some(entity) = entity(left, lexicon) else {
             continue;
         };
-        let Some((surface, predicate)) = predicate(right, lexicon) else {
+        let Some((surface, predicate, negated)) = predicate(right, lexicon) else {
             continue;
         };
-        candidates.push((entity, surface, predicate));
+        candidates.push((entity, surface, predicate, negated));
     }
     candidates.sort_by(|left, right| {
         right
@@ -318,8 +327,8 @@ fn split_entity_predicate<'a>(
 fn split_svo<'a>(
     text: &'a str,
     lexicon: &dyn RelationLexicon,
-) -> Option<(String, String, String, String)> {
-    let mut candidates: Vec<(String, String, String, String)> = Vec::new();
+) -> Option<(String, String, String, String, bool)> {
+    let mut candidates: Vec<(String, String, String, String, bool)> = Vec::new();
     let boundaries: Vec<usize> = text
         .char_indices()
         .map(|(index, _)| index)
@@ -331,13 +340,13 @@ fn split_svo<'a>(
         };
         for &object_start in boundaries.iter().filter(|&&index| index > subject_end) {
             let predicate_text = &text[subject_end..object_start];
-            let Some((surface, predicate)) = predicate(predicate_text, lexicon) else {
+            let Some((surface, predicate, negated)) = predicate(predicate_text, lexicon) else {
                 continue;
             };
             let Some(object) = entity(&text[object_start..], lexicon) else {
                 continue;
             };
-            candidates.push((subject.clone(), surface, predicate, object));
+            candidates.push((subject.clone(), surface, predicate, object, negated));
         }
     }
     candidates.sort_by(|left, right| {
@@ -402,7 +411,10 @@ pub fn rewrite(
     for suffix in ["的是哪些人", "的是哪位", "的是哪个", "的是谁"] {
         if let Some(rest) = text.strip_suffix(suffix) {
             if let Some(inner) = rest.strip_prefix('被') {
-                let (agent, surface, predicate) = split_entity_predicate(inner, lexicon)?;
+                let (agent, surface, predicate, negated) = split_entity_predicate(inner, lexicon)?;
+                if negated {
+                    return None;
+                }
                 return Some(build(
                     QueryPlan::FindObjectByPredicate {
                         subject: agent,
@@ -414,7 +426,10 @@ pub fn rewrite(
                     predicate,
                 ));
             }
-            let (surface, predicate, object) = split_predicate_object(rest, lexicon)?;
+            let (surface, predicate, object, negated) = split_predicate_object(rest, lexicon)?;
+            if negated {
+                return None;
+            }
             return Some(build(
                 QueryPlan::FindSubject {
                     object,
@@ -435,7 +450,10 @@ pub fn rewrite(
             return None;
         }
         if is_wh(patient_text) {
-            let (agent, surface, predicate) = split_entity_predicate(right, lexicon)?;
+            let (agent, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
+            if negated {
+                return None;
+            }
             return Some(build(
                 QueryPlan::FindObjectByPredicate {
                     subject: agent,
@@ -449,7 +467,10 @@ pub fn rewrite(
         }
         let patient = entity(patient_text, lexicon)?;
         if let Some(rest) = right.strip_prefix_wh() {
-            let (surface, predicate) = predicate(rest, lexicon)?;
+            let (surface, predicate, negated) = predicate(rest, lexicon)?;
+            if negated {
+                return None;
+            }
             return Some(build(
                 QueryPlan::FindSubject {
                     object: patient,
@@ -464,12 +485,13 @@ pub fn rewrite(
         if !yes_no {
             return None;
         }
-        let (agent, surface, predicate) = split_entity_predicate(right, lexicon)?;
+        let (agent, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
         return Some(build(
             QueryPlan::CheckRelation {
                 subject: agent,
                 predicate: predicate.clone(),
                 object: patient,
+                negated,
             },
             RelationShape::PassiveYesNo,
             "passive-yes-no",
@@ -485,7 +507,10 @@ pub fn rewrite(
             return None;
         }
         if is_wh(subject_text) {
-            let (patient, surface, predicate) = split_entity_predicate(right, lexicon)?;
+            let (patient, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
+            if negated {
+                return None;
+            }
             return Some(build(
                 QueryPlan::FindSubject {
                     object: patient,
@@ -499,7 +524,10 @@ pub fn rewrite(
         }
         let subject = entity(subject_text, lexicon)?;
         if let Some(rest) = right.strip_prefix_wh() {
-            let (surface, predicate) = predicate(rest, lexicon)?;
+            let (surface, predicate, negated) = predicate(rest, lexicon)?;
+            if negated {
+                return None;
+            }
             return Some(build(
                 QueryPlan::FindObjectByPredicate {
                     subject,
@@ -514,12 +542,13 @@ pub fn rewrite(
         if !yes_no {
             return None;
         }
-        let (patient, surface, predicate) = split_entity_predicate(right, lexicon)?;
+        let (patient, surface, predicate, negated) = split_entity_predicate(right, lexicon)?;
         return Some(build(
             QueryPlan::CheckRelation {
                 subject,
                 predicate: predicate.clone(),
                 object: patient,
+                negated,
             },
             RelationShape::BaYesNo,
             "ba-yes-no",
@@ -530,7 +559,10 @@ pub fn rewrite(
 
     if let Some(prefix) = wh_prefix(&text) {
         let rest = &text[prefix..];
-        let (surface, predicate, object) = split_predicate_object(rest, lexicon)?;
+        let (surface, predicate, object, negated) = split_predicate_object(rest, lexicon)?;
+        if negated {
+            return None;
+        }
         return Some(build(
             QueryPlan::FindSubject {
                 object,
@@ -545,9 +577,13 @@ pub fn rewrite(
 
     if let Some(suffix) = wh_suffix(&text) {
         let rest = &text[..suffix];
-        let Some((subject, surface, predicate)) = split_entity_predicate(rest, lexicon) else {
+        let Some((subject, surface, predicate, negated)) = split_entity_predicate(rest, lexicon)
+        else {
             return None;
         };
+        if negated {
+            return None;
+        }
         return Some(build(
             QueryPlan::FindObjectByPredicate {
                 subject,
@@ -563,12 +599,13 @@ pub fn rewrite(
     if !yes_no {
         return None;
     }
-    let (subject, surface, predicate, object) = split_svo(&text, lexicon)?;
+    let (subject, surface, predicate, object, negated) = split_svo(&text, lexicon)?;
     Some(build(
         QueryPlan::CheckRelation {
             subject,
             predicate: predicate.clone(),
             object,
+            negated,
         },
         RelationShape::ActiveYesNo,
         "active-yes-no",
@@ -699,10 +736,37 @@ mod tests {
             subject: "张三".to_string(),
             predicate: "教".to_string(),
             object: "李四".to_string(),
+            negated: false,
         };
         assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
         assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
         assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn negated_yes_no_keeps_polarity() {
+        let rewrite = parse("张三不认识李四吗").expect("否定是非问应可重写");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::CheckRelation {
+                subject: "张三".to_string(),
+                predicate: "认识".to_string(),
+                object: "李四".to_string(),
+                negated: true
+            }
+        );
+        let rewrite = parse("张三没有教过李四吗").expect("没有否定是非问应可重写");
+        assert_eq!(rewrite.predicate, "教");
+        assert!(matches!(
+            rewrite.plan,
+            QueryPlan::CheckRelation { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn negated_wh_questions_abstain() {
+        assert!(parse("张三不认识谁").is_none());
+        assert!(parse("谁不认识张三").is_none());
     }
 
     #[test]
@@ -727,7 +791,8 @@ mod tests {
             QueryPlan::CheckRelation {
                 subject: "张三".to_string(),
                 predicate: "教".to_string(),
-                object: "李四".to_string()
+                object: "李四".to_string(),
+                negated: false
             }
         );
 

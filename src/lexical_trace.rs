@@ -715,6 +715,7 @@ pub fn plan_terms(plan: &QueryPlan) -> (Vec<String>, Vec<String>) {
             subject,
             predicate,
             object,
+            negated: _,
         } => {
             push_entity(subject);
             push_entity(object);

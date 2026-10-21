@@ -4027,7 +4027,13 @@ impl SymbolicReasoner {
                 subject,
                 predicate,
                 object,
+                negated,
             } => {
+                if *negated {
+                    // 否定问句的证明需要否定即失败语义；共享的归结视图
+                    // 只重建肯定事实，这里保守弃权。
+                    return None;
+                }
                 let subject = self.resolve_known_entity(subject)?;
                 let object = self.resolve_known_entity(object)?;
                 let (slot, inverted) = self.resolve_question_predicate(predicate);
@@ -5580,7 +5586,8 @@ impl SymbolicReasoner {
                 subject,
                 predicate,
                 object,
-            } => self.answer_check_relation(&subject, &predicate, &object),
+                negated,
+            } => self.answer_check_relation(&subject, &predicate, &object, negated),
             QueryPlan::FindSubject { object, predicate } => {
                 self.answer_find_subject(&object, &predicate)
             }
@@ -6282,6 +6289,7 @@ impl SymbolicReasoner {
         subject_raw: &str,
         predicate_raw: &str,
         object_raw: &str,
+        negated: bool,
     ) -> Option<String> {
         let subject = self.aligner.canonical_form(subject_raw.trim());
         let object = self.aligner.canonical_form(object_raw.trim());
@@ -6302,16 +6310,36 @@ impl SymbolicReasoner {
             (subject.as_str(), object.as_str())
         };
         if self.session_negative_blocks(negative_subject, &slot, negative_object) {
-            return Some(format!(
-                "不是。会话中记录了否定事实：{} {} {}。",
-                subject, surface, object
-            ));
+            return Some(if negated {
+                format!(
+                    "是的。会话中记录了否定事实：{} {} {}。",
+                    subject, surface, object
+                )
+            } else {
+                format!(
+                    "不是。会话中记录了否定事实：{} {} {}。",
+                    subject, surface, object
+                )
+            });
         }
         let holds = if inverted {
             self.predictor.has_triple(&object, &slot, &subject)
         } else {
             self.predictor.has_triple(&subject, &slot, &object)
         };
+        if negated {
+            return Some(if holds {
+                format!(
+                    "不是。根据知识图谱，该关系成立：{} {} {}。",
+                    subject, surface, object
+                )
+            } else {
+                format!(
+                    "是的。根据现有知识图谱，没有记录「{} {} {}」，与否定问法一致。",
+                    subject, surface, object
+                )
+            });
+        }
         if holds {
             return Some(format!(
                 "是的。根据知识图谱，该关系成立：{} {} {}。",
@@ -13419,6 +13447,14 @@ types = [
             .answer("被张三认识的是谁")
             .expect("被字关系从句问受事");
         assert!(passive_relative.contains("王五"), "{}", passive_relative);
+        let negated_false = reasoner
+            .answer("张三不认识王五吗")
+            .expect("否定是非问");
+        assert!(negated_false.starts_with("不是"), "{}", negated_false);
+        let negated_true = reasoner
+            .answer("张三不认识李四吗")
+            .expect("否定是非问");
+        assert!(negated_true.starts_with("是的"), "{}", negated_true);
 
         let receipt = reasoner
             .query_rewrite_receipt("谁被张三认识")

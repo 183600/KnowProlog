@@ -54,11 +54,12 @@ pub enum QueryPlan {
         subject_segments: Vec<String>,
         object: String,
     },
-    // 直接关系校验：张三 认识 李四 吗
+    // 直接关系校验：张三 认识 李四 吗 / 张三不认识李四吗
     CheckRelation {
         subject: String,
         predicate: String,
         object: String,
+        negated: bool,
     },
     // 计数：李四 有几个 师傅
     Count {
@@ -224,7 +225,14 @@ impl QueryPlanner {
                 subject,
                 predicate,
                 object,
-            } => format!("校验关系：{} {} {}", subject, predicate, object),
+                negated,
+            } => {
+                let polarity = if *negated { "否定" } else { "肯定" };
+                format!(
+                    "校验关系（{}）：{} {} {}",
+                    polarity, subject, predicate, object
+                )
+            }
             QueryPlan::Count { subject, predicate } => {
                 format!("计数：{} 的 {} 个数", subject, predicate)
             }
