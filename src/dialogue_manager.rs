@@ -1025,6 +1025,9 @@ impl DialogueManager {
                 open.attempts
             ));
         }
+        if !self.frame_memory.is_empty() {
+            summary.push_str(&format!(" {}", self.frame_memory.report()));
+        }
         summary
     }
 
@@ -3736,5 +3739,6 @@ output = "value"
             .expect("恢复后应继承实体");
         assert!(reply.text.contains("140"), "{}", reply.text);
         assert!(restored.frame_report().contains("回答 2 次"));
+        assert!(restored.summary().contains("绑定帧记忆"));
     }
 }
