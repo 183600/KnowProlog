@@ -16,6 +16,7 @@ pub mod abduction;
 pub mod advanced_nlu;
 pub mod artifact_audit;
 pub mod association_miner;
+pub mod belief_revision;
 pub mod binding_frames;
 pub mod bindings;
 pub mod cache;

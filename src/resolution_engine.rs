@@ -486,7 +486,7 @@ pub struct DerivedFact {
     pub depth: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ResolutionEngine {
     facts: HashSet<Atom>,
     facts_by_pred: HashMap<Arc<str>, Vec<Atom>>,
@@ -542,6 +542,34 @@ impl ResolutionEngine {
             .into_iter()
             .flatten()
             .map(move |&index| &self.clauses[index])
+    }
+
+    /// 全部规则（按加入顺序）。供信念修订/规则账本做只读快照与一致性检查。
+    pub fn all_clauses(&self) -> &[Clause] {
+        &self.clauses
+    }
+
+    /// 删除满足条件的规则，并重建头部索引；返回删除条数。
+    ///
+    /// 只影响规则集，不动事实；调用方负责随后重新推导（`forward_chain`/`solve`
+    /// 每次都用当前规则集，因此无需额外的失效标记）。
+    pub fn remove_clauses<F>(&mut self, mut predicate: F) -> usize
+    where
+        F: FnMut(&Clause) -> bool,
+    {
+        let before = self.clauses.len();
+        self.clauses.retain(|clause| !predicate(clause));
+        let removed = before - self.clauses.len();
+        if removed > 0 {
+            self.rules_by_head.clear();
+            for (index, clause) in self.clauses.iter().enumerate() {
+                self.rules_by_head
+                    .entry(clause.head.predicate.clone())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        removed
     }
 
     /// 是否为已知基事实
