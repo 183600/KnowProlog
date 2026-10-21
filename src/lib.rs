@@ -1259,6 +1259,25 @@ impl OxigraphManager {
         }
         let context = &context;
 
+        // 纯图容器（只有 @graph/@included 等关键字）本身不是实体：
+        // 直接展开其中的节点，避免生成随机空白实体。
+        let has_node_payload =
+            obj.contains_key("@type") || obj.keys().any(|key| !key.starts_with("@"));
+        if !has_node_payload {
+            let graph = obj.get("@graph");
+            let included = obj.get("@included");
+            if graph.is_none() && included.is_none() {
+                return Ok(());
+            }
+            if let Some(graph) = graph {
+                self.process_jsonld_graph(store, graph, context, stats)?;
+            }
+            if let Some(included) = included {
+                self.process_jsonld_graph(store, included, context, stats)?;
+            }
+            return Ok(());
+        }
+
         // 获取主语 (subject)：@id 可以是 IRI，也可以是 `_:label` 空白节点。
         let subject: NamedOrBlankNode = if let Some(id) = obj.get("@id") {
             let id = id.as_str().unwrap_or("");
@@ -1343,6 +1362,37 @@ impl OxigraphManager {
             }
         }
 
+        // 带 @id/属性的节点也可以顺带承载命名图或 @included 节点；
+        // 知识库只使用默认图，这里把其内容展开到默认图而不是丢弃。
+        if let Some(graph) = obj.get("@graph") {
+            self.process_jsonld_graph(store, graph, context, stats)?;
+        }
+        if let Some(included) = obj.get("@included") {
+            self.process_jsonld_graph(store, included, context, stats)?;
+        }
+
+        Ok(())
+    }
+
+    /// 展开 `@graph` / `@included` 的值：接受单个节点或节点数组。
+    fn process_jsonld_graph(
+        &self,
+        store: &Store,
+        value: &Value,
+        context: &HashMap<String, String>,
+        stats: &mut JsonldImportStats,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(obj) = item.as_object() {
+                        self.process_jsonld_object(store, obj, context, stats)?;
+                    }
+                }
+            }
+            Value::Object(obj) => self.process_jsonld_object(store, obj, context, stats)?,
+            _ => {}
+        }
         Ok(())
     }
 
@@ -5660,6 +5710,48 @@ mod cache_tests {
             manager.import_jsonld(jsonld).await.unwrap().triples,
             0,
             "集合单元格按内容命名，重复导入不应新增三元组"
+        );
+    }
+
+    /// 嵌套 @graph 与 @included：内容展开到默认图，纯图容器不生成实体。
+    #[tokio::test]
+    async fn import_jsonld_supports_nested_graphs_and_included() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": { "name": "http://example.org/kg/name" },
+            "@graph": [
+                {
+                    "@id": "http://example.org/kg/graph/outer",
+                    "@graph": [
+                        { "@id": "http://example.org/kg/entity/甲", "name": "甲" }
+                    ]
+                },
+                {
+                    "@id": "http://example.org/kg/entity/乙",
+                    "name": "乙",
+                    "@included": [
+                        { "@id": "http://example.org/kg/entity/丙", "name": "丙" }
+                    ]
+                }
+            ]
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 3, "纯图容器不计实体，只统计甲乙丙");
+        assert_eq!(stats.triples, 3);
+
+        let names = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?name WHERE { ?entity kg:name ?name }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(names.data.len(), 3, "{:?}", names.data);
+        assert_eq!(
+            manager.import_jsonld(jsonld).await.unwrap().triples,
+            0,
+            "重复导入保持幂等"
         );
     }
 
