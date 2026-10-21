@@ -129,6 +129,26 @@ pub struct AnswerIssue {
     pub actual: Vec<String>,
 }
 
+/// 会话级冲突裁定：只影响本会话的画像与回答，不改写知识图谱。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ConflictRuling {
+    pub entity: String,
+    pub predicate: String,
+    pub value: String,
+    pub turn: usize,
+}
+
+impl ConflictRuling {
+    pub fn render_text(&self) -> String {
+        format!(
+            "会话裁定：「{}」的「{}」采用「{}」（仅本会话，知识图谱未被改写）",
+            self.entity,
+            display_predicate(&self.predicate),
+            self.value
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShapeAnswer {
     pub entity: String,
@@ -139,6 +159,8 @@ pub struct ShapeAnswer {
     pub missing: Vec<MissingSlot>,
     pub conflicts: Vec<SlotConflict>,
     pub issues: Vec<AnswerIssue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rulings: Vec<ConflictRuling>,
     pub graph_facts: usize,
     pub session_facts: usize,
     pub digest: String,
@@ -157,6 +179,41 @@ impl ShapeAnswer {
         let report = shapes.validate(&effective, registry, types);
         let answer = Self::from_report(entity, facts, overlay, &report, shapes, registry, types);
         (answer, report)
+    }
+
+    /// 先按会话裁定裁剪互相冲突的取值，再生成画像；图谱本身保持不变。
+    pub fn build_resolved(
+        entity: &str,
+        facts: &[PrologFact],
+        overlay: &crate::relation_acquisition::SessionOverlay,
+        shapes: &ShapeSet,
+        registry: &PredicateRegistry,
+        types: &TypeSystem,
+        rulings: &[ConflictRuling],
+    ) -> (Self, ShapeReport) {
+        let (facts, overlay) = apply_rulings(facts, overlay, rulings, registry);
+        let (mut answer, report) = Self::build(entity, &facts, &overlay, shapes, registry, types);
+        answer.rulings = rulings
+            .iter()
+            .filter(|ruling| ruling.entity == entity)
+            .cloned()
+            .collect();
+        answer.refresh_digest();
+        (answer, report)
+    }
+
+    pub fn refresh_digest(&mut self) {
+        let value = serde_json::json!({
+            "entity": &self.entity,
+            "entity_type": &self.entity_type,
+            "status": self.status,
+            "facts": &self.facts,
+            "missing": &self.missing,
+            "conflicts": &self.conflicts,
+            "issues": &self.issues,
+            "rulings": &self.rulings,
+        });
+        self.digest = fnv1a_hex(canonical_json(&value).as_bytes());
     }
 
     fn from_report(
@@ -388,19 +445,7 @@ impl ShapeAnswer {
             .iter()
             .filter(|fact| fact.sources.contains(&FactSource::Session))
             .count();
-        let digest = {
-            let value = serde_json::json!({
-                "entity": entity,
-                "entity_type": &entity_type,
-                "status": status,
-                "facts": &answer_facts,
-                "missing": &missing,
-                "conflicts": &conflicts,
-                "issues": &issues,
-            });
-            fnv1a_hex(canonical_json(&value).as_bytes())
-        };
-        Self {
+        let mut answer = Self {
             entity: entity.to_string(),
             entity_type,
             status,
@@ -408,10 +453,13 @@ impl ShapeAnswer {
             missing,
             conflicts,
             issues,
+            rulings: Vec::new(),
             graph_facts,
             session_facts,
-            digest,
-        }
+            digest: String::new(),
+        };
+        answer.refresh_digest();
+        answer
     }
 
     pub fn missing_predicates(&self) -> Vec<&str> {
@@ -508,6 +556,9 @@ impl ShapeAnswer {
                 issue.expected.join("、"),
                 issue.actual.join("、")
             ));
+        }
+        for ruling in &self.rulings {
+            lines.push(format!("  {}", ruling.render_text()));
         }
         if !self.conflicts.is_empty() {
             for conflict in &self.conflicts {
@@ -700,6 +751,8 @@ pub struct SfdSnapshot {
     pub attempts: BTreeMap<String, usize>,
     #[serde(default)]
     pub resolved: BTreeSet<String>,
+    #[serde(default)]
+    pub rulings: Vec<ConflictRuling>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -724,6 +777,7 @@ pub struct ShapeDialogue {
     pending: Option<Consultation>,
     attempts: BTreeMap<String, usize>,
     resolved: BTreeSet<String>,
+    rulings: Vec<ConflictRuling>,
 }
 
 impl ShapeDialogue {
@@ -755,6 +809,10 @@ impl ShapeDialogue {
         self.pending.is_some()
     }
 
+    pub fn rulings(&self) -> &[ConflictRuling] {
+        &self.rulings
+    }
+
     pub fn clear_pending(&mut self, acquisition: &mut RelationAcquisition) {
         self.pending = None;
         acquisition.clear_goal();
@@ -775,6 +833,7 @@ impl ShapeDialogue {
             pending: self.pending.clone(),
             attempts: self.attempts.clone(),
             resolved: self.resolved.clone(),
+            rulings: self.rulings.clone(),
         }
     }
 
@@ -794,6 +853,7 @@ impl ShapeDialogue {
         self.pending = snapshot.pending.clone();
         self.attempts = snapshot.attempts.clone();
         self.resolved = snapshot.resolved.clone();
+        self.rulings = snapshot.rulings.clone();
         true
     }
 
@@ -836,14 +896,8 @@ impl ShapeDialogue {
             acquisition.clear_goal();
         }
 
-        let (answer, report) = ShapeAnswer::build(
-            entity,
-            facts,
-            &acquisition.overlay(),
-            shapes,
-            registry,
-            types,
-        );
+        let (answer, report) =
+            self.build_answer(entity, facts, registry, types, shapes, acquisition);
         self.agenda = ShapeAgenda::compile(&report, registry);
         let consultation = if answer.status == AnswerStatus::Partial {
             self.open_next(entity, facts, registry, types, shapes, acquisition)
@@ -879,14 +933,7 @@ impl ShapeDialogue {
         self.agenda = ShapeAgenda::compile(&report, registry);
         let consultation = self.open_next_global(facts, registry, types, shapes, acquisition)?;
         let entity = consultation.gap.entity.clone();
-        let (answer, _) = ShapeAnswer::build(
-            &entity,
-            facts,
-            &acquisition.overlay(),
-            shapes,
-            registry,
-            types,
-        );
+        let (answer, _) = self.build_answer(&entity, facts, registry, types, shapes, acquisition);
         if self.focus.as_deref() != Some(entity.as_str()) || self.original_question.is_none() {
             self.original_question = Some(format!("{}是谁？", entity));
         }
@@ -927,13 +974,13 @@ impl ShapeDialogue {
             self.pending = None;
             acquisition.clear_goal();
             self.resolved.insert(pending.gap.id.clone());
-            let (answer, report) = ShapeAnswer::build(
+            let (answer, report) = self.build_answer(
                 &pending.gap.entity,
                 facts,
-                &acquisition.overlay(),
-                shapes,
                 registry,
                 types,
+                shapes,
+                acquisition,
             );
             self.agenda = ShapeAgenda::compile(&report, registry);
             let next = if answer.status == AnswerStatus::Partial {
@@ -975,13 +1022,13 @@ impl ShapeDialogue {
         {
             self.pending = None;
             acquisition.clear_goal();
-            let (answer, report) = ShapeAnswer::build(
+            let (answer, report) = self.build_answer(
                 &pending.gap.entity,
                 facts,
-                &acquisition.overlay(),
-                shapes,
                 registry,
                 types,
+                shapes,
+                acquisition,
             );
             self.agenda = ShapeAgenda::compile(&report, registry);
             message.push_str("\n本会话画像保持不变；未确认的取值不会进入回答。");
@@ -992,19 +1039,150 @@ impl ShapeDialogue {
             });
         }
 
-        let (answer, report) = ShapeAnswer::build(
+        let (answer, report) = self.build_answer(
             &pending.gap.entity,
             facts,
-            &acquisition.overlay(),
-            shapes,
             registry,
             types,
+            shapes,
+            acquisition,
         );
         self.agenda = ShapeAgenda::compile(&report, registry);
         message.push_str("\n（补全尚未生效：只有确认后的取值才会进入本会话画像。）");
         Some(SfdTurn {
             answer,
             consultation: Some(pending),
+            message,
+        })
+    }
+
+    fn build_answer(
+        &self,
+        entity: &str,
+        facts: &[PrologFact],
+        registry: &PredicateRegistry,
+        types: &TypeSystem,
+        shapes: &ShapeSet,
+        acquisition: &RelationAcquisition,
+    ) -> (ShapeAnswer, ShapeReport) {
+        ShapeAnswer::build_resolved(
+            entity,
+            facts,
+            &acquisition.overlay(),
+            shapes,
+            registry,
+            types,
+            &self.rulings,
+        )
+    }
+
+    /// 记录一条会话级冲突裁定，并重新生成画像。
+    ///
+    /// 只允许裁定当前确实存在冲突的取值；裁定不写图谱，也不进入 QRA 覆盖层。
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_conflict(
+        &mut self,
+        entity: &str,
+        predicate: &str,
+        value: &str,
+        facts: &[PrologFact],
+        registry: &PredicateRegistry,
+        types: &TypeSystem,
+        shapes: &ShapeSet,
+        acquisition: &mut RelationAcquisition,
+    ) -> Result<SfdTurn, String> {
+        let entity = entity.trim();
+        let value = value.trim();
+        if entity.is_empty() || value.is_empty() {
+            return Err("裁定需要实体与取值，例如「裁定：刘德华 的 职业 = 演员」。".to_string());
+        }
+        let canonical = registry.resolve(predicate).canonical;
+        if canonical.is_empty() {
+            return Err(format!("谓词「{}」为空，无法裁定。", predicate.trim()));
+        }
+        let (raw, _) = ShapeAnswer::build(
+            entity,
+            facts,
+            &acquisition.overlay(),
+            shapes,
+            registry,
+            types,
+        );
+        let conflict = raw
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.predicate == canonical)
+            .ok_or_else(|| {
+                format!(
+                    "「{}」当前没有「{}」的冲突需要裁定。",
+                    entity,
+                    display_predicate(&canonical)
+                )
+            })?;
+        if !conflict
+            .values
+            .iter()
+            .any(|candidate| candidate.value == value)
+        {
+            let values = conflict
+                .values
+                .iter()
+                .map(|candidate| candidate.value.as_str())
+                .collect::<Vec<_>>()
+                .join("、");
+            return Err(format!(
+                "「{}」的「{}」只有这些冲突值：{}；不能裁定为「{}」。",
+                entity, conflict.surface, values, value
+            ));
+        }
+
+        self.turn += 1;
+        self.pending = None;
+        acquisition.clear_goal();
+        self.focus = Some(entity.to_string());
+        if self.original_question.is_none() {
+            self.original_question = Some(format!("{}是谁？", entity));
+        }
+        self.rulings
+            .retain(|ruling| !(ruling.entity == entity && ruling.predicate == canonical));
+        self.rulings.push(ConflictRuling {
+            entity: entity.to_string(),
+            predicate: canonical.clone(),
+            value: value.to_string(),
+            turn: self.turn,
+        });
+        self.rulings.sort();
+
+        let (answer, report) =
+            self.build_answer(entity, facts, registry, types, shapes, acquisition);
+        self.agenda = ShapeAgenda::compile(&report, registry);
+        let mut message = format!(
+            "已在本会话裁定：「{}」的「{}」采用「{}」。知识图谱事实未被改写。",
+            entity,
+            display_predicate(&canonical),
+            value
+        );
+        match answer.status {
+            AnswerStatus::Conflict => {
+                message.push_str("\n画像仍有未裁定的冲突或形状问题，系统不会替你做进一步选择。");
+            }
+            AnswerStatus::Partial => {
+                message.push_str(
+                    "\n该冲突已收敛，但画像仍有缺失槽位；可继续用「下一个形状问题」补全。",
+                );
+            }
+            AnswerStatus::Unknown => {
+                message.push_str("\n裁定后仍没有可用事实。");
+            }
+            AnswerStatus::Complete => {
+                message.push_str("\n该冲突已收敛，画像恢复完整。");
+            }
+        }
+        message.push('\n');
+        message.push_str(&answer.render_text());
+        Ok(SfdTurn {
+            answer,
+            consultation: None,
             message,
         })
     }
@@ -1105,6 +1283,47 @@ impl ShapeDialogue {
     }
 }
 
+/// 解析显式裁定命令的主体：
+/// `实体 的 谓词 = 值`、`实体 的 谓词 是 值` 或 `实体|谓词|值`。
+pub fn parse_ruling(input: &str) -> Option<(String, String, String)> {
+    let text = input.trim().trim_end_matches(['。', '；', ';']).trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some((entity, rest)) = text.split_once('|') {
+        let (predicate, value) = rest.split_once('|')?;
+        return ruling_parts(entity, predicate, value);
+    }
+    let (entity, rest) = text.split_once('的')?;
+    let rest = rest.trim();
+    let separators = ["=", "＝", "采用", "改为", "为", "是"];
+    let mut split: Option<(usize, &str)> = None;
+    for separator in separators {
+        if let Some(position) = rest.find(separator) {
+            if position == 0 {
+                continue;
+            }
+            if split.map_or(true, |(best, _)| position < best) {
+                split = Some((position, separator));
+            }
+        }
+    }
+    let (position, separator) = split?;
+    let predicate = &rest[..position];
+    let value = &rest[position + separator.len()..];
+    ruling_parts(entity, predicate, value)
+}
+
+fn ruling_parts(entity: &str, predicate: &str, value: &str) -> Option<(String, String, String)> {
+    let entity = entity.trim();
+    let predicate = predicate.trim();
+    let value = value.trim();
+    if entity.is_empty() || predicate.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some((entity.to_string(), predicate.to_string(), value.to_string()))
+}
+
 pub fn effective_facts(
     facts: &[PrologFact],
     overlay: &crate::relation_acquisition::SessionOverlay,
@@ -1120,6 +1339,84 @@ pub fn effective_facts(
         });
     }
     effective
+}
+
+/// 按会话裁定过滤图谱事实与会话覆盖层：只保留被裁定的取值。
+///
+/// 返回的新事实集用于形状校验与画像生成；原图谱不会被修改。
+pub fn apply_rulings(
+    facts: &[PrologFact],
+    overlay: &crate::relation_acquisition::SessionOverlay,
+    rulings: &[ConflictRuling],
+    registry: &PredicateRegistry,
+) -> (Vec<PrologFact>, crate::relation_acquisition::SessionOverlay) {
+    if rulings.is_empty() {
+        return (facts.to_vec(), overlay.clone());
+    }
+    let mut filtered = Vec::with_capacity(facts.len());
+    for fact in facts {
+        match fact {
+            PrologFact::Entity {
+                name,
+                entity_type,
+                properties,
+            } => {
+                let mut kept = std::collections::HashMap::new();
+                for (key, value) in properties {
+                    let canonical = registry.resolve(key).canonical;
+                    let ruled = ruling_for(rulings, name, &canonical);
+                    if ruled.is_some_and(|ruling| value.trim() != ruling.value) {
+                        continue;
+                    }
+                    kept.insert(key.clone(), value.clone());
+                }
+                filtered.push(PrologFact::Entity {
+                    name: name.clone(),
+                    entity_type: entity_type.clone(),
+                    properties: kept,
+                });
+            }
+            PrologFact::Relation { from, rel_type, to } => {
+                let resolution = registry.resolve(rel_type);
+                let (subject, object) = if resolution.inverted {
+                    (to.as_str(), from.as_str())
+                } else {
+                    (from.as_str(), to.as_str())
+                };
+                if ruling_for(rulings, subject, &resolution.canonical)
+                    .is_some_and(|ruling| object.trim() != ruling.value)
+                {
+                    continue;
+                }
+                filtered.push(fact.clone());
+            }
+        }
+    }
+
+    let mut rows = Vec::with_capacity(overlay.rows.len());
+    for row in &overlay.rows {
+        let canonical = registry.resolve(&row.predicate).canonical;
+        if ruling_for(rulings, &row.subject, &canonical)
+            .is_some_and(|ruling| row.object.trim() != ruling.value)
+        {
+            continue;
+        }
+        rows.push(row.clone());
+    }
+    (
+        filtered,
+        crate::relation_acquisition::SessionOverlay { rows },
+    )
+}
+
+fn ruling_for<'a>(
+    rulings: &'a [ConflictRuling],
+    entity: &str,
+    predicate: &str,
+) -> Option<&'a ConflictRuling> {
+    rulings
+        .iter()
+        .find(|ruling| ruling.entity == entity && ruling.predicate == predicate)
 }
 
 fn compile_gap(violation: &ShapeViolation, registry: &PredicateRegistry) -> Option<ShapeGap> {
@@ -1778,6 +2075,123 @@ mod tests {
                 .is_none(),
             "已有待答问题时不应覆盖"
         );
+    }
+
+    #[test]
+    fn conflict_ruling_requires_a_listed_value_and_converges_only_in_session() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![
+            entity(
+                "刘德华",
+                "Person",
+                &[("name", "刘德华"), ("职业", "演员"), ("出生地", "香港")],
+            ),
+            relation("刘德华", "职业", "导演"),
+        ];
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let first = dialogue.start_profile(
+            "刘德华",
+            "刘德华是谁？",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+            &mut acquisition,
+        );
+        assert_eq!(first.answer.status, AnswerStatus::Conflict);
+
+        let error = dialogue
+            .resolve_conflict(
+                "刘德华",
+                "职业",
+                "歌手",
+                &facts,
+                &registry,
+                &types,
+                &shapes,
+                &mut acquisition,
+            )
+            .expect_err("不能裁定为不在冲突列表里的值");
+        assert!(error.contains("只有这些冲突值"), "{}", error);
+
+        let turn = dialogue
+            .resolve_conflict(
+                "刘德华",
+                "职业",
+                "演员",
+                &facts,
+                &registry,
+                &types,
+                &shapes,
+                &mut acquisition,
+            )
+            .expect("列出的冲突值应可裁定");
+        assert_eq!(turn.answer.status, AnswerStatus::Complete);
+        assert_eq!(turn.answer.value_of("职业"), vec!["演员"]);
+        assert!(turn
+            .answer
+            .value_of("职业")
+            .iter()
+            .all(|value| *value != "导演"));
+        assert_eq!(turn.answer.rulings.len(), 1);
+        assert!(turn.message.contains("本会话裁定"));
+        assert!(turn.answer.render_text().contains("知识图谱未被改写"));
+        assert!(acquisition.overlay().is_empty());
+
+        let (raw, _) = ShapeAnswer::build(
+            "刘德华",
+            &facts,
+            &acquisition.overlay(),
+            &shapes,
+            &registry,
+            &types,
+        );
+        assert_eq!(
+            raw.status,
+            AnswerStatus::Conflict,
+            "会话裁定不能改写图谱事实"
+        );
+
+        let snapshot = dialogue.snapshot();
+        let mut restored = ShapeDialogue::new();
+        assert!(restored.restore(&snapshot));
+        assert_eq!(restored.rulings().len(), 1);
+        let (resolved, _) = ShapeAnswer::build_resolved(
+            "刘德华",
+            &facts,
+            &acquisition.overlay(),
+            &shapes,
+            &registry,
+            &types,
+            restored.rulings(),
+        );
+        assert_eq!(resolved.status, AnswerStatus::Complete);
+        assert_eq!(resolved.value_of("职业"), vec!["演员"]);
+    }
+
+    #[test]
+    fn parse_ruling_accepts_explicit_command_forms() {
+        assert_eq!(
+            parse_ruling("刘德华 的 职业 = 演员"),
+            Some(("刘德华".to_string(), "职业".to_string(), "演员".to_string()))
+        );
+        assert_eq!(
+            parse_ruling("刘德华的出生地是香港。"),
+            Some((
+                "刘德华".to_string(),
+                "出生地".to_string(),
+                "香港".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_ruling("刘德华|职业|导演"),
+            Some(("刘德华".to_string(), "职业".to_string(), "导演".to_string()))
+        );
+        assert!(parse_ruling("刘德华").is_none());
+        assert!(parse_ruling("刘德华 的 职业 = ").is_none());
     }
 
     #[test]
