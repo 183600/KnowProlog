@@ -31,6 +31,10 @@ pub struct OntologyClosure {
     problems: Vec<String>,
     /// 显式互斥类对（TBox 声明，供查询按开放世界做类型约束时使用）。
     disjoint: Vec<(String, String)>,
+    /// 属性 → 定义域类集（TBox 声明；供配方做主语侧类型约束）。
+    domains: HashMap<String, HashSet<String>>,
+    /// 属性 → 值域类集（TBox 声明）。
+    ranges: HashMap<String, HashSet<String>>,
     rounds: usize,
     truncated: bool,
 }
@@ -179,6 +183,16 @@ impl OntologyClosure {
                 || (self.is_subclass(left, div_right) && self.is_subclass(right, div_left))
         })
     }
+
+    /// 属性 p 的全部定义域类（沿上位属性继承；排序去重）。
+    pub fn domain_classes(&self, property: &str) -> Vec<String> {
+        classes_of(&self.domains, &self.subproperties, property)
+    }
+
+    /// 属性 p 的全部值域类（沿上位属性继承；排序去重）。
+    pub fn range_classes(&self, property: &str) -> Vec<String> {
+        classes_of(&self.ranges, &self.subproperties, property)
+    }
 }
 
 /// 闭包的可序列化导出：全部集合按字典序规约，推导理由与截断标记一并带出。
@@ -304,6 +318,8 @@ impl OntologyClosure {
                 .collect(),
             problems: snapshot.problems.clone(),
             disjoint: Vec::new(),
+            domains: HashMap::new(),
+            ranges: HashMap::new(),
             rounds: snapshot.rounds,
             truncated: snapshot.truncated,
         };
@@ -763,6 +779,8 @@ impl OntologyReasoner {
             instances: self.instances.clone(),
             relations: self.relations.clone(),
             disjoint: self.disjoint.clone(),
+            domains: self.domains.clone(),
+            ranges: self.ranges.clone(),
             ..OntologyClosure::default()
         };
         for (individual, class) in closure.instances.iter() {
@@ -986,15 +1004,7 @@ impl OntologyReasoner {
         property: &str,
         subproperties: &HashMap<String, HashSet<String>>,
     ) -> Vec<String> {
-        let mut classes: HashSet<String> = HashSet::new();
-        for candidate in supers_of(subproperties, property) {
-            if let Some(direct) = self.domains.get(&candidate) {
-                classes.extend(direct.iter().cloned());
-            }
-        }
-        let mut result: Vec<String> = classes.into_iter().collect();
-        result.sort();
-        result
+        classes_of(&self.domains, subproperties, property)
     }
 
     fn range_classes(
@@ -1002,15 +1012,7 @@ impl OntologyReasoner {
         property: &str,
         subproperties: &HashMap<String, HashSet<String>>,
     ) -> Vec<String> {
-        let mut classes: HashSet<String> = HashSet::new();
-        for candidate in supers_of(subproperties, property) {
-            if let Some(direct) = self.ranges.get(&candidate) {
-                classes.extend(direct.iter().cloned());
-            }
-        }
-        let mut result: Vec<String> = classes.into_iter().collect();
-        result.sort();
-        result
+        classes_of(&self.ranges, subproperties, property)
     }
 
     /// 一致性检查：互斥类冲突 + 不可满足类
@@ -1107,6 +1109,23 @@ fn supers_of(closure_map: &HashMap<String, HashSet<String>>, name: &str) -> Vec<
     }
     supers.sort();
     supers
+}
+
+/// 属性沿上位属性继承的类集（定义域/值域共用；排序去重）。
+fn classes_of(
+    declared: &HashMap<String, HashSet<String>>,
+    subproperties: &HashMap<String, HashSet<String>>,
+    property: &str,
+) -> Vec<String> {
+    let mut classes: HashSet<String> = HashSet::new();
+    for candidate in supers_of(subproperties, property) {
+        if let Some(direct) = declared.get(&candidate) {
+            classes.extend(direct.iter().cloned());
+        }
+    }
+    let mut result: Vec<String> = classes.into_iter().collect();
+    result.sort();
+    result
 }
 
 /// 自反 + 传递闭包（迭代扩展直到不动点）

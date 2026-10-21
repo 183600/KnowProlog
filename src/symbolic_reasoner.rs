@@ -1554,6 +1554,49 @@ impl SymbolicReasoner {
             predicates.insert(canonical.trim().to_string());
         }
 
+        let closure = self.discourse.narrator_mut().closure().clone();
+        // 主语侧类型约束：正向问句的实体应落在谓词定义域内，逆向问句的
+        // 实体应落在值域内。由「关系定义域/值域反推」得到的类型是循环
+        // 证据（类型恰由被查关系自身反推），不作数；开放世界下有效类型
+        // 未知即放行，已知类型与全部允许类互斥才拒答——减少「关系同名
+        // 但类型不符」的误答。
+        let mut expected_anchor_types: BTreeSet<String> = BTreeSet::new();
+        for predicate in &predicates {
+            if direction.is_inverse() {
+                expected_anchor_types.extend(closure.range_classes(predicate));
+            } else {
+                expected_anchor_types.extend(closure.domain_classes(predicate));
+            }
+        }
+        if !expected_anchor_types.is_empty() {
+            let declared_types: Vec<String> = closure
+                .types_of(entity)
+                .into_iter()
+                .filter(|class| {
+                    !closure
+                        .why_instance(entity, class)
+                        .map(|reason| reason.contains("的定义域是") || reason.contains("的值域是"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if !declared_types.is_empty() {
+                let compatible = declared_types.iter().any(|actual| {
+                    expected_anchor_types
+                        .iter()
+                        .any(|expected| actual == expected || closure.is_subclass(actual, expected))
+                });
+                if !compatible
+                    && declared_types.iter().any(|actual| {
+                        expected_anchor_types
+                            .iter()
+                            .any(|expected| closure.are_disjoint(actual, expected))
+                    })
+                {
+                    return None;
+                }
+            }
+        }
+
         let mut raw_values: BTreeSet<String> = BTreeSet::new();
         for predicate in &predicates {
             if direction.is_inverse() {
@@ -1564,7 +1607,6 @@ impl SymbolicReasoner {
             }
         }
 
-        let closure = self.discourse.narrator_mut().closure().clone();
         for (predicate, object) in closure.properties_of(entity) {
             if predicates.contains(&predicate) {
                 raw_values.insert(object);
@@ -10076,6 +10118,97 @@ mod tests {
                 .is_none(),
             "已知互斥类型（电影 ⊥ 人物）必须拒答"
         );
+    }
+
+    /// 主语侧类型约束：正向问句查定义域、逆向问句查值域；由关系反推的
+    /// 循环类型不作数，未知类型放行，已知互斥才拒答。
+    #[test]
+    fn recipe_lookup_gates_subject_types_by_domain_and_range() {
+        use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
+
+        let facts = vec![
+            PrologFact::Entity {
+                name: "阿凡达".into(),
+                entity_type: "电影".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "卡梅隆".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "阿凡达".into(),
+                rel_type: "导演".into(),
+                to: "卡梅隆".into(),
+            },
+            // 反向错录：把人物记成了导演关系的主语、把电影记成了宾语——
+            // 同名关系用在了类型不符的实体上，主语侧门控必须挡住两侧误答。
+            PrologFact::Relation {
+                from: "卡梅隆".into(),
+                rel_type: "导演".into(),
+                to: "阿凡达".into(),
+            },
+            // 类型完全未知的关系主语：开放世界必须放行而不是猜测拒答。
+            PrologFact::Relation {
+                from: "某无名氏".into(),
+                rel_type: "导演".into(),
+                to: "卡梅隆".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let program = OntologyProgram::from_lessons(vec![
+            OntologyLesson::Domain {
+                property: "导演".into(),
+                class: "电影".into(),
+                original: "导演关系的定义域是电影".into(),
+            },
+            OntologyLesson::Range {
+                property: "导演".into(),
+                class: "人物".into(),
+                original: "导演关系的值域是人物".into(),
+            },
+            OntologyLesson::Disjoint {
+                left: "电影".into(),
+                right: "人物".into(),
+                original: "电影和人物互斥".into(),
+            },
+        ]);
+        assert!(reasoner.configure_ontology_program(&program) > 0);
+
+        let forward = reasoner
+            .recipe_lookup("阿凡达", "导演", RecipeDirection::Forward, &["人物".into()])
+            .expect("声明类型与定义域相符的正向查询应命中");
+        assert_eq!(forward.values, vec!["卡梅隆".to_string()]);
+
+        let inverse = reasoner
+            .recipe_lookup("卡梅隆", "导演", RecipeDirection::Inverse, &["电影".into()])
+            .expect("声明类型与值域相符的逆向查询应命中");
+        assert!(inverse.values.contains(&"阿凡达".to_string()));
+
+        assert!(
+            reasoner
+                .recipe_lookup("卡梅隆", "导演", RecipeDirection::Forward, &["人物".into()])
+                .is_none(),
+            "人物作为导演关系的主语与定义域电影互斥，正向误答必须拒答"
+        );
+        assert!(
+            reasoner
+                .recipe_lookup("阿凡达", "导演", RecipeDirection::Inverse, &["电影".into()])
+                .is_none(),
+            "电影作为导演关系的宾语与值域人物互斥，逆向误答必须拒答"
+        );
+
+        let unknown = reasoner
+            .recipe_lookup(
+                "某无名氏",
+                "导演",
+                RecipeDirection::Forward,
+                &["人物".into()],
+            )
+            .expect("有效类型未知（关系反推的循环类型不作数）时必须放行");
+        assert_eq!(unknown.values, vec!["卡梅隆".to_string()]);
     }
 
     /// 配方执行单一入口：CLI 与 HTTP 共用；角色指称接续焦点，依据随模板接地。
