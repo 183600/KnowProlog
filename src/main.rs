@@ -3639,6 +3639,8 @@ async fn run_interactive_mode(
                 ) {
                     Some(suggestion) => {
                         println!("{}", pattern_ir::render_case_suggestion(text, &suggestion));
+                        println!("（可直接回答「是」确认，或回答「不是」否定这次联想。）");
+                        pending_case = Some((text.to_string(), suggestion));
                     }
                     None => println!(
                         "模式联想：没有足够相似的成功经验；先处理几条同类问句，或用「教模式」显式教学。"
@@ -3793,6 +3795,14 @@ async fn run_interactive_mode(
                     dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 let report = pattern_library.rank_with_context(&normalized, &context);
                 println!("{}", pattern_ir::render_match_report(text, &report));
+                let scan = pattern_library.scan_route_with_context(&normalized, &context);
+                println!(
+                    "快速路由扫描：完整评估 {} 条，首要素预筛跳过 {} 条（可路由 {} 条，扫描 {} 条）。",
+                    scan.evaluated,
+                    scan.skipped,
+                    pattern_library.route_count(),
+                    scan.scanned()
+                );
             }
             println!();
             continue;

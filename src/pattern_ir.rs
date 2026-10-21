@@ -1332,6 +1332,22 @@ pub enum CandidateStatus {
     Failed { reason: String },
 }
 
+/// 快速路由的一次扫描：胜者 + 实际完整评估/被首要素预筛跳过的条数。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteScan {
+    pub winner: Option<PatternMatch>,
+    /// 进入完整 `match_entry` 的候选数。
+    pub evaluated: usize,
+    /// 首要素必然失配、无需完整匹配的候选数。
+    pub skipped: usize,
+}
+
+impl RouteScan {
+    pub fn scanned(&self) -> usize {
+        self.evaluated + self.skipped
+    }
+}
+
 /// 一次匹配的完整账目：胜者、全部命中、全部失败原因。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchReport {
@@ -1646,6 +1662,24 @@ fn match_entry(
         elem_spans,
         span: Span::new(span_start.unwrap_or(0), span_end),
     })
+}
+
+/// 首要素预筛：只判断「首要素是否必然失配」，成功集必须是完整匹配的超集。
+///
+/// 复用 [`attempt_elem`] 的匹配语义（含人名合并、逐字跨词、包含匹配），
+/// 因此不会把本可命中的条目误跳过；可选首要素一律保守放行。
+fn first_elem_may_miss(entry: &PatternEntry, tokens: &[crate::nlp::TaggedWord]) -> bool {
+    let Some(first) = entry.elems.first() else {
+        return false;
+    };
+    let mut pos = 0usize;
+    while pos < tokens.len() && is_skippable(tokens[pos].text.as_str()) {
+        pos += 1;
+    }
+    if pos >= tokens.len() {
+        return !matches!(first, Elem::Optional(_));
+    }
+    attempt_elem(first, &entry.elems, 0, tokens, pos).is_err()
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,16 +2002,16 @@ impl PatternLibrary {
         tokens: &[crate::nlp::TaggedWord],
         context: &PatternContext,
     ) -> Option<PatternMatch> {
-        for index in self.evaluation_order() {
-            let entry = &self.entries[index];
-            if !entry.route || !entry.context_satisfied(context) {
-                continue;
-            }
-            if let Ok(m) = match_entry(entry, tokens) {
-                return Some(m);
-            }
-        }
-        None
+        self.scan_with_context(tokens, context, false).winner
+    }
+
+    /// 快速路由并返回扫描统计（首要素预筛省掉了多少次完整匹配）。
+    pub fn scan_route_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+    ) -> RouteScan {
+        self.scan_with_context(tokens, context, false)
     }
 
     /// NLU 回退路由：仅当主路由无命中时使用，按同样优先级与守卫评估。
@@ -1991,16 +2025,46 @@ impl PatternLibrary {
         tokens: &[crate::nlp::TaggedWord],
         context: &PatternContext,
     ) -> Option<PatternMatch> {
+        self.scan_with_context(tokens, context, true).winner
+    }
+
+    /// 主路由/回退路由共用的扫描器：保留评估序，首要素必然失配的直接跳过。
+    fn scan_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+        fallback: bool,
+    ) -> RouteScan {
+        let mut evaluated = 0usize;
+        let mut skipped = 0usize;
         for index in self.evaluation_order() {
             let entry = &self.entries[index];
-            if !entry.fallback || !entry.context_satisfied(context) {
+            let eligible = if fallback {
+                entry.fallback
+            } else {
+                entry.route
+            };
+            if !eligible || !entry.context_satisfied(context) {
                 continue;
             }
+            if first_elem_may_miss(entry, tokens) {
+                skipped += 1;
+                continue;
+            }
+            evaluated += 1;
             if let Ok(m) = match_entry(entry, tokens) {
-                return Some(m);
+                return RouteScan {
+                    winner: Some(m),
+                    evaluated,
+                    skipped,
+                };
             }
         }
-        None
+        RouteScan {
+            winner: None,
+            evaluated,
+            skipped,
+        }
     }
 
     /// 与既有 `nlp::analyze_query_intent` 同构的路由口。
@@ -3512,6 +3576,59 @@ mod tests {
             agreements >= 8,
             "语料应覆盖足够多的命中样本，实得 {}",
             agreements
+        );
+    }
+
+    #[test]
+    fn first_elem_prefilter_is_conservative_and_reduces_scan() {
+        let config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        let context = PatternContext::default();
+        let corpus = [
+            "法国的首都是哪里",
+            "姚明的年龄",
+            "张三和李四什么关系",
+            "水的化学分子式是什么",
+            "有多少个人",
+            "你好",
+            "这是一句毫无意义的话",
+        ];
+        for input in corpus {
+            let tokens = preprocess(input, &config.nlp);
+            let scan = library.scan_route_with_context(&tokens, &context);
+            let mut reference = None;
+            for index in library.evaluation_order() {
+                let entry = &library.entries[index];
+                if !entry.route || !entry.context_satisfied(&context) {
+                    continue;
+                }
+                if let Ok(matched) = match_entry(entry, &tokens) {
+                    reference = Some(matched);
+                    break;
+                }
+            }
+            assert_eq!(
+                scan.winner, reference,
+                "预筛不得改变路由结果：输入「{}」",
+                input
+            );
+            assert!(
+                scan.scanned() <= library.route_count(),
+                "扫描数不能超过可路由条目数：输入「{}」",
+                input
+            );
+        }
+
+        let tokens = preprocess("姚明的年龄", &config.nlp);
+        let scan = library.scan_route_with_context(&tokens, &context);
+        assert!(scan.winner.is_some(), "该问法应可路由");
+        assert!(scan.skipped > 0, "首要素预筛应跳过部分条目");
+        assert!(
+            scan.evaluated < library.route_count(),
+            "完整评估数应少于全库：{} >= {}",
+            scan.evaluated,
+            library.route_count()
         );
     }
 
