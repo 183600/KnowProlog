@@ -6032,6 +6032,36 @@ impl SymbolicReasoner {
         None
     }
 
+    /// 属性倒排反查：给定属性槽位与取值，返回属性值等于它的实体。
+    ///
+    /// literal 属性（身高/年龄/国籍…）不会成为关系边，因此 `predictor`
+    /// 里查不到，只能扫 `attribute_index`。槽位键先用对齐后的规范词面，
+    /// 再回退英文属性键对照表（与 `node_hits` 的正向回退同一套规则）。
+    fn attribute_subjects(&self, slot: &str, surface: &str, value: &str) -> Vec<String> {
+        let value = value.trim();
+        if slot.is_empty() || value.is_empty() {
+            return Vec::new();
+        }
+        let mut keys = vec![slot.to_string()];
+        if let Some(canonical) = crate::symbolic_generator::canonical_predicate_key(surface) {
+            if canonical != slot {
+                keys.push(canonical.to_string());
+            }
+        }
+        let mut subjects: Vec<String> = self
+            .attribute_index
+            .iter()
+            .filter(|((_, key), values)| {
+                keys.iter().any(|candidate| candidate == key)
+                    && values.iter().any(|stored| stored.trim() == value)
+            })
+            .map(|((entity, _), _)| entity.clone())
+            .collect();
+        subjects.sort();
+        subjects.dedup();
+        subjects
+    }
+
     fn answer_find_subject(&self, object_raw: &str, predicate_raw: &str) -> Option<String> {
         let object = self.aligner.canonical_form(object_raw.trim());
         let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
@@ -6046,6 +6076,13 @@ impl SymbolicReasoner {
         } else {
             self.predictor.subjects_of(&slot, &object)
         };
+        // 实体属性（身高/年龄/国籍…）不进关系三元组索引，literal 取值只能
+        // 走属性倒排反查；没有这一步，「谁的身高是226」永远查不到人。
+        if !inverted {
+            subjects.extend(self.attribute_subjects(&slot, &surface, &object));
+        }
+        subjects.sort();
+        subjects.dedup();
         let mut evidence: Vec<String> = Vec::new();
         if !inverted && self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
@@ -10705,6 +10742,55 @@ types = [
         assert!(height.contains("180"), "{}", height);
         let english = reasoner.answer("张三的age是多少").expect("英文键也应可查");
         assert!(english.contains("25"), "{}", english);
+    }
+
+    /// literal 属性（不进关系三元组）也必须支持「谁的X是Y」反查主体，
+    /// 且只回属性值真正相等的那个实体；英文属性键同样按中文词面反查。
+    #[test]
+    fn test_find_subject_by_attribute_value() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([
+                    ("身高".to_string(), "226".to_string()),
+                    ("国籍".to_string(), "中国".to_string()),
+                ]),
+            },
+            PrologFact::Entity {
+                name: "叶莉".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([("身高".to_string(), "190".to_string())]),
+            },
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([("height".to_string(), "180".to_string())]),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let hit = reasoner
+            .answer("谁的身高是226")
+            .expect("属性反查应给出主体");
+        assert!(hit.contains("姚明"), "{}", hit);
+        assert!(!hit.contains("叶莉"), "{}", hit);
+
+        let chinese_key = reasoner
+            .answer("谁的国籍是中国")
+            .expect("文本型属性同样可反查");
+        assert!(chinese_key.contains("姚明"), "{}", chinese_key);
+
+        let english_key = reasoner
+            .answer("谁的身高是180")
+            .expect("英文属性键按中文词面反查");
+        assert!(english_key.contains("张三"), "{}", english_key);
+
+        assert!(
+            reasoner.answer("谁的身高是999").is_none(),
+            "没有该取值时不应编造主体"
+        );
     }
 
     #[test]
