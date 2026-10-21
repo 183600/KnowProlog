@@ -13415,6 +13415,10 @@ types = [
             .answer("认识张三的是谁")
             .expect("关系从句问施事");
         assert!(relative.contains("李四"), "{}", relative);
+        let passive_relative = reasoner
+            .answer("被张三认识的是谁")
+            .expect("被字关系从句问受事");
+        assert!(passive_relative.contains("王五"), "{}", passive_relative);
 
         let receipt = reasoner
             .query_rewrite_receipt("谁被张三认识")

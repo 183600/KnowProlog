@@ -401,6 +401,19 @@ pub fn rewrite(
 
     for suffix in ["的是哪些人", "的是哪位", "的是哪个", "的是谁"] {
         if let Some(rest) = text.strip_suffix(suffix) {
+            if let Some(inner) = rest.strip_prefix('被') {
+                let (agent, surface, predicate) = split_entity_predicate(inner, lexicon)?;
+                return Some(build(
+                    QueryPlan::FindObjectByPredicate {
+                        subject: agent,
+                        predicate: predicate.clone(),
+                    },
+                    RelationShape::PassiveWhPatient,
+                    "passive-relative-patient",
+                    surface,
+                    predicate,
+                ));
+            }
             let (surface, predicate, object) = split_predicate_object(rest, lexicon)?;
             return Some(build(
                 QueryPlan::FindSubject {
@@ -690,6 +703,20 @@ mod tests {
         assert_eq!(parse("张三教过李四吗").unwrap().plan, expected);
         assert_eq!(parse("李四被张三教过吗").unwrap().plan, expected);
         assert_eq!(parse("张三把李四教过吗").unwrap().plan, expected);
+    }
+
+    #[test]
+    fn passive_relative_clause() {
+        let rewrite = parse("被张三认识的是谁").expect("被字关系从句应可重写");
+        assert_eq!(rewrite.rule, "passive-relative-patient");
+        assert_eq!(rewrite.predicate, "认识");
+        assert_eq!(
+            rewrite.plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "认识".to_string()
+            }
+        );
     }
 
     #[test]
