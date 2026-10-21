@@ -1457,6 +1457,37 @@ impl PatternLibrary {
         }
     }
 
+    /// 用户确认一条案例候选：把 `route=false` 的临时骨架转正为可路由模式。
+    ///
+    /// 转正后的来源为 `taught#案例#<经验 id>`，因此与显式教学一样：
+    /// - 参与后续路由与匹配解释；
+    /// - 随模式账本落图、跨会话恢复；
+    /// - 可被 [`PatternLibrary::forget`] 遗忘。
+    ///
+    /// 候选本身不可路由（避免未经确认的泛化直接答题）；重复确认同一案例
+    /// 幂等（同 id 原地替换）。
+    pub fn accept_case(&mut self, suggestion: &CaseSuggestion) -> Result<PatternEntry, String> {
+        if suggestion.pattern.route {
+            return Err("案例候选已经处于可路由状态".to_string());
+        }
+        if suggestion.pattern.elems.is_empty() {
+            return Err("案例候选没有模式要素".to_string());
+        }
+        if suggestion.pattern.query_type.trim().is_empty() {
+            return Err("案例候选缺少路由类型".to_string());
+        }
+        let mut entry = suggestion.pattern.clone();
+        entry.route = true;
+        entry.source = format!("taught#案例#{}", suggestion.episode.short_id());
+        entry.name = entry
+            .name
+            .strip_prefix("案例候选：")
+            .map(|name| format!("案例确认：{}", name))
+            .unwrap_or_else(|| format!("案例确认：{}", entry.name));
+        self.add(entry.clone());
+        Ok(entry)
+    }
+
     /// 教一条模式（运行时即刻参与匹配与路由；来源 `taught#会话`）。
     pub fn teach(
         &mut self,
@@ -1995,7 +2026,7 @@ pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> Strin
     );
     let _ = writeln!(
         out,
-        " 确认方式：教模式：{} | {} | {} | {}",
+        " 确认方式：确认联想：<句子>（或 教模式：{} | {} | {} | {}）",
         suggestion.pattern.name,
         suggestion.pattern.render(),
         suggestion.pattern.query_type,
@@ -3337,6 +3368,76 @@ mod tests {
             log.suggest_case(&unmatched, None, 0.2).is_none(),
             "无共享词且无焦点时不应硬造候选"
         );
+    }
+
+    #[test]
+    fn accepted_case_becomes_routable_taught_pattern() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "首都查询",
+            "config.toml#首都查询",
+            "capital_query",
+            15,
+            true,
+            vec![
+                Elem::pos("ns"),
+                Elem::word("的"),
+                Elem::word("首都"),
+                Elem::word("是"),
+                Elem::word("哪里"),
+            ],
+        ));
+        let stored = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("是", "v"),
+            ("哪里", "r"),
+        ]);
+        let matched = library.match_route(&stored).expect("应命中");
+        let mut log = PatternEpisodeLog::default();
+        log.record_match("法国的首都是哪里", &stored, &matched, Some("法国"), 4);
+
+        let current = tagged(&[
+            ("德国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("在", "v"),
+            ("哪里", "r"),
+        ]);
+        let suggestion = log
+            .suggest_case(&current, Some("法国"), 0.2)
+            .expect("相似经验应给出候选骨架");
+        assert!(library.match_route(&current).is_none(), "确认前不应路由");
+
+        let mut active = library.clone();
+        let entry = active.accept_case(&suggestion).expect("确认案例应成功");
+        assert!(entry.route, "确认后必须可路由");
+        assert_eq!(entry.query_type, "capital_query");
+        assert!(entry.source.starts_with("taught#案例#"), "{}", entry.source);
+        assert_eq!(
+            active.accept_case(&suggestion).expect("重复确认幂等"),
+            entry
+        );
+        assert_eq!(
+            active.count_with_source_prefix("taught#"),
+            1,
+            "重复确认不得重复登记"
+        );
+        let routed = active.match_route(&current).expect("确认后应命中新实体");
+        assert_eq!(routed.entry.name, entry.name);
+        assert_eq!(routed.entities, vec!["德国".to_string()]);
+
+        let quads = pattern_quads(active.entries()).expect("确认模式应可落图");
+        let restored = parse_pattern_graph(quads.into_iter());
+        let loaded = restored
+            .iter()
+            .find(|candidate| candidate.id() == entry.id())
+            .expect("确认模式应随账本恢复");
+        assert!(loaded.route);
+        assert_eq!(loaded.source, entry.source);
+
+        assert!(active.forget(&entry.name).is_some(), "确认模式应可遗忘");
     }
 
     #[test]

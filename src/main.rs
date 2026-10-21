@@ -3625,18 +3625,79 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：模式联想：<句子>，例如「模式联想：德国的首都在哪里」。");
             } else {
-                let tagged = preprocess(text, &config.nlp);
-                let normalized = normalize_words(tagged, &synonyms);
-                match pattern_episodes.suggest_case(
-                    &normalized,
+                match suggest_case_for_text(
+                    text,
+                    &config,
+                    &synonyms,
+                    &pattern_episodes,
                     dialogue_manager.focus_entity(),
-                    0.2,
                 ) {
                     Some(suggestion) => {
                         println!("{}", pattern_ir::render_case_suggestion(text, &suggestion));
                     }
                     None => println!(
                         "模式联想：没有足够相似的成功经验；先处理几条同类问句，或用「教模式」显式教学。"
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 确认联想：把当前输入的候选骨架转正为可路由模式并落图
+        if let Some(text) = strip_any_prefix(
+            input,
+            &[
+                "确认联想：",
+                "确认联想:",
+                "确认联想 ",
+                "采纳联想：",
+                "采纳联想:",
+                "采纳联想 ",
+                "案例转正：",
+                "案例转正:",
+                "案例转正 ",
+            ],
+        ) {
+            let text = text.trim();
+            if text.is_empty() {
+                println!("用法：确认联想：<句子>，例如「确认联想：德国的首都在哪里」。");
+            } else {
+                match suggest_case_for_text(
+                    text,
+                    &config,
+                    &synonyms,
+                    &pattern_episodes,
+                    dialogue_manager.focus_entity(),
+                ) {
+                    Some(suggestion) => match pattern_library.accept_case(&suggestion) {
+                        Ok(entry) => {
+                            println!(
+                                "已确认案例：{}（来源 {}，路由 {}，优先级 {}）。",
+                                entry.name,
+                                entry.source,
+                                entry.query_type,
+                                entry.priority
+                            );
+                            println!("候选模式：{}", entry.render());
+                            match oxigraph_manager
+                                .sync_pattern_ledger(pattern_library.entries())
+                                .await
+                            {
+                                Ok(count) => {
+                                    println!(
+                                        "模式落图：{} 条已同步到 {}。",
+                                        count,
+                                        pattern_ir::PATTERNS_GRAPH
+                                    )
+                                }
+                                Err(error) => println!("确认后落图失败：{}", error),
+                            }
+                        }
+                        Err(error) => println!("确认联想失败：{}", error),
+                    },
+                    None => println!(
+                        "确认联想：没有足够相似的成功经验；请先用「模式联想：<句子>」确认候选，或使用「教模式」显式教学。"
                     ),
                 }
             }
@@ -8410,6 +8471,7 @@ fn interactive_help() -> String {
         "  模式匹配：<句子>                     查看命中模式、绑定与落选原因",
         "  模式经验 / 经验台账                  查看命中/未命中的可检索理解经验",
         "  模式联想：<句子>                     用相似成功经验泛化候选骨架（只确认，不直接回答）",
+        "  确认联想：<句子>                     用户确认候选骨架，转正为可路由模式并落图",
         "  清空模式经验                         清空经验台账并同步命名图",
         "  教模式：名 | 要素… | 路由 | 优先级 | 守卫  教一条模式（可选上下文守卫，落图持久化）",
         "  忘模式：<名>                         遗忘一条教学模式",
@@ -8927,6 +8989,15 @@ fn is_command_like(input: &str) -> bool {
         "模式联想 ",
         "案例联想：",
         "案例联想:",
+        "确认联想：",
+        "确认联想:",
+        "确认联想 ",
+        "采纳联想：",
+        "采纳联想:",
+        "采纳联想 ",
+        "案例转正：",
+        "案例转正:",
+        "案例转正 ",
         "清空模式经验",
         "遗忘模式经验",
         "模式匹配：",
@@ -9012,6 +9083,19 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
     prefixes
         .iter()
         .find_map(|prefix| input.strip_prefix(prefix))
+}
+
+/// 用相似成功经验为一句输入生成候选骨架（确认前不参与路由）。
+fn suggest_case_for_text(
+    text: &str,
+    config: &know_prolog::SystemConfig,
+    synonyms: &std::collections::HashMap<String, String>,
+    episodes: &pattern_ir::PatternEpisodeLog,
+    focus: Option<&str>,
+) -> Option<pattern_ir::CaseSuggestion> {
+    let tagged = preprocess(text, &config.nlp);
+    let normalized = normalize_words(tagged, synonyms);
+    episodes.suggest_case(&normalized, focus, 0.2)
 }
 
 /// 统一模式库路由：返回（查询类型、实体、命中模式解释行）。
@@ -10315,6 +10399,8 @@ mod session_tests {
             "模式经验",
             "经验台账",
             "模式联想：德国的首都在哪里",
+            "确认联想：德国的首都在哪里",
+            "采纳联想：德国的首都在哪里",
             "清空模式经验",
             "教模式：老家 | {人} 的 老家 | hometown_query | 20 | 焦点",
             "忘模式：老家",
