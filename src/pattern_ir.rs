@@ -223,6 +223,172 @@ pub fn parse_teach_pattern(pattern: &str) -> Result<Vec<Elem>, String> {
 // 模式条目
 // ---------------------------------------------------------------------------
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// 模式所需的对话上下文（可选守卫）。
+///
+/// 守卫把「这句话什么时候成立」从手写分支移进模式本身：省略/指代问句只有在
+/// 焦点、上轮动作或澄清挂账满足时才参与路由；完整句通常不声明守卫。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextGuard {
+    /// 需要已有焦点实体。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub focus_required: bool,
+    /// 焦点实体的类型（同时蕴含 `focus_required`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_type: Option<String>,
+    /// 上一轮对话动作（`ask_attribute` / `assert` …）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_move: Option<String>,
+    /// 是否必须存在（或必须不存在）待回答的澄清。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_clarify: Option<bool>,
+}
+
+impl ContextGuard {
+    pub fn focus() -> Self {
+        Self {
+            focus_required: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn focus_type(sort: impl Into<String>) -> Self {
+        Self {
+            focus_required: true,
+            focus_type: Some(sort.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn last_move(movement: impl Into<String>) -> Self {
+        Self {
+            last_move: Some(movement.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn pending(pending: bool) -> Self {
+        Self {
+            pending_clarify: Some(pending),
+            ..Self::default()
+        }
+    }
+
+    /// 是否被当前对话上下文满足。
+    pub fn satisfied(&self, context: &PatternContext) -> bool {
+        if self.focus_required && context.focus.is_none() {
+            return false;
+        }
+        if let Some(focus_type) = &self.focus_type {
+            if context.focus_type.as_deref() != Some(focus_type.as_str()) {
+                return false;
+            }
+        }
+        if let Some(last_move) = &self.last_move {
+            if context.last_move.as_deref() != Some(last_move.as_str()) {
+                return false;
+            }
+        }
+        if let Some(pending) = self.pending_clarify {
+            if context.pending_clarify != pending {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 人类可读渲染（报告 / 图上的守卫说明）。
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        if self.focus_required || self.focus_type.is_some() {
+            match &self.focus_type {
+                Some(sort) => parts.push(format!("焦点类型={}", sort)),
+                None => parts.push("焦点".to_string()),
+            }
+        }
+        if let Some(movement) = &self.last_move {
+            parts.push(format!("上轮={}", movement));
+        }
+        if let Some(pending) = self.pending_clarify {
+            parts.push(if pending {
+                "待澄清".to_string()
+            } else {
+                "无待澄清".to_string()
+            });
+        }
+        if parts.is_empty() {
+            "（无守卫）".to_string()
+        } else {
+            parts.join("；")
+        }
+    }
+}
+
+/// 路由时可见的对话上下文快照。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PatternContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_move: Option<String>,
+    #[serde(default)]
+    pub pending_clarify: bool,
+    #[serde(default)]
+    pub turn: usize,
+}
+
+/// 解析教学命令里的守卫串：`焦点`、`焦点:人物`、`上轮:ask_attribute`、
+/// `待澄清`/`无待澄清`，多项用逗号或分号分隔。
+pub fn parse_context_guard(spec: &str) -> Result<ContextGuard, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Err("守卫不能为空".to_string());
+    }
+    let mut guard = ContextGuard::default();
+    for part in spec.split([',', '，', ';', '；']) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (kind, value) = part
+            .split_once([':', '：', '=', '＝'])
+            .map(|(kind, value)| (kind.trim(), Some(value.trim())))
+            .unwrap_or((part, None));
+        match (kind, value) {
+            ("焦点", None) | ("focus", None) => guard.focus_required = true,
+            ("焦点类型", Some(sort)) | ("类型", Some(sort)) | ("focus_type", Some(sort)) => {
+                if sort.is_empty() {
+                    return Err("焦点类型不能为空".to_string());
+                }
+                guard.focus_required = true;
+                guard.focus_type = Some(sort.to_string());
+            }
+            ("上轮", Some(movement))
+            | ("动作", Some(movement))
+            | ("last_move", Some(movement)) => {
+                if movement.is_empty() {
+                    return Err("上轮动作不能为空".to_string());
+                }
+                guard.last_move = Some(movement.to_string());
+            }
+            ("待澄清", None) | ("pending", None) => guard.pending_clarify = Some(true),
+            ("无待澄清", None) | ("不待澄清", None) | ("no_pending", None) => {
+                guard.pending_clarify = Some(false)
+            }
+            _ => return Err(format!("无法识别的守卫：{}", part)),
+        }
+    }
+    if guard == ContextGuard::default() {
+        return Err("守卫至少要限定一个条件".to_string());
+    }
+    Ok(guard)
+}
+
 /// 一条有稳定身份的模式：IR + 来源 + 路由 + 优先级。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PatternEntry {
@@ -239,6 +405,9 @@ pub struct PatternEntry {
     pub route: bool,
     /// 模式 IR（序列）。
     pub elems: Vec<Elem>,
+    /// 可选的对话上下文守卫；不满足时该模式在本次路由中落选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<ContextGuard>,
 }
 
 impl PatternEntry {
@@ -257,7 +426,22 @@ impl PatternEntry {
             priority,
             route,
             elems,
+            guard: None,
         }
+    }
+
+    /// 附加上下文守卫（链式；教学命令与测试使用）。
+    pub fn with_guard(mut self, guard: ContextGuard) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    /// 条目的上下文是否满足（无守卫恒满足）。
+    pub fn context_satisfied(&self, context: &PatternContext) -> bool {
+        self.guard
+            .as_ref()
+            .map(|guard| guard.satisfied(context))
+            .unwrap_or(true)
     }
 
     /// 由配置的一条 `[[prolog_rules]]` 编译。
@@ -1281,6 +1465,18 @@ impl PatternLibrary {
         query_type: &str,
         priority: i32,
     ) -> Result<PatternEntry, String> {
+        self.teach_with_guard(name, pattern, query_type, priority, None)
+    }
+
+    /// 教学并附带上下文守卫（省略/指代模式只在相应对话状态下成立）。
+    pub fn teach_with_guard(
+        &mut self,
+        name: &str,
+        pattern: &str,
+        query_type: &str,
+        priority: i32,
+        guard: Option<ContextGuard>,
+    ) -> Result<PatternEntry, String> {
         if name.trim().is_empty() {
             return Err("模式名称不能为空".to_string());
         }
@@ -1288,7 +1484,7 @@ impl PatternLibrary {
             return Err("路由类型（query_type）不能为空".to_string());
         }
         let elems = parse_teach_pattern(pattern)?;
-        let entry = PatternEntry::new(
+        let mut entry = PatternEntry::new(
             name.trim(),
             "taught#会话",
             query_type.trim(),
@@ -1296,6 +1492,9 @@ impl PatternLibrary {
             true,
             elems,
         );
+        if let Some(guard) = guard {
+            entry = entry.with_guard(guard);
+        }
         self.add(entry.clone());
         Ok(entry)
     }
@@ -1366,6 +1565,15 @@ impl PatternLibrary {
 
     /// 全量评估：胜者（第一条可路由的命中）+ 命中榜 + 失败原因榜。
     pub fn rank(&self, tokens: &[crate::nlp::TaggedWord]) -> MatchReport {
+        self.rank_with_context(tokens, &PatternContext::default())
+    }
+
+    /// 带对话上下文的全量评估：守卫不满足的模式进入失败榜并给出原因。
+    pub fn rank_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+    ) -> MatchReport {
         let mut winner: Option<PatternMatch> = None;
         let mut matched = Vec::new();
         let mut failed = Vec::new();
@@ -1373,6 +1581,25 @@ impl PatternLibrary {
 
         for index in self.evaluation_order() {
             let entry = &self.entries[index];
+            if !entry.context_satisfied(context) {
+                let guard = entry
+                    .guard
+                    .as_ref()
+                    .map(ContextGuard::render)
+                    .unwrap_or_default();
+                failed.push(CandidateOutcome {
+                    id: entry.id(),
+                    name: entry.name.clone(),
+                    query_type: entry.query_type.clone(),
+                    source: entry.source.clone(),
+                    priority: entry.priority,
+                    route: entry.route,
+                    status: CandidateStatus::Failed {
+                        reason: format!("上下文守卫不满足（{}）", guard),
+                    },
+                });
+                continue;
+            }
             match match_entry(entry, tokens) {
                 Ok(m) => {
                     if winner.is_none() && entry.route {
@@ -1415,9 +1642,18 @@ impl PatternLibrary {
 
     /// 取第一条可路由的命中（查询路径热路径；不必算完整报告）。
     pub fn match_route(&self, tokens: &[crate::nlp::TaggedWord]) -> Option<PatternMatch> {
+        self.match_route_with_context(tokens, &PatternContext::default())
+    }
+
+    /// 带上下文守卫的路由：守卫不满足的模式在本次路由中被跳过。
+    pub fn match_route_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+    ) -> Option<PatternMatch> {
         for index in self.evaluation_order() {
             let entry = &self.entries[index];
-            if !entry.route {
+            if !entry.route || !entry.context_satisfied(context) {
                 continue;
             }
             if let Ok(m) = match_entry(entry, tokens) {
@@ -1430,6 +1666,16 @@ impl PatternLibrary {
     /// 与既有 `nlp::analyze_query_intent` 同构的路由口。
     pub fn route(&self, tokens: &[crate::nlp::TaggedWord]) -> Option<(String, Vec<String>)> {
         self.match_route(tokens)
+            .map(|m| (m.entry.query_type.clone(), m.entities.clone()))
+    }
+
+    /// 带上下文守卫的路由口。
+    pub fn route_with_context(
+        &self,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+    ) -> Option<(String, Vec<String>)> {
+        self.match_route_with_context(tokens, context)
             .map(|m| (m.entry.query_type.clone(), m.entities.clone()))
     }
 
@@ -1465,14 +1711,20 @@ pub fn render_library_report(library: &PatternLibrary) -> String {
         "#id", "优先", "路由", "名称", "模式"
     );
     for entry in library.entries() {
+        let guard = entry
+            .guard
+            .as_ref()
+            .map(|guard| format!("  [守卫：{}]", guard.render()))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            " {:<9} {:>4} {:<22} {:<12} {}",
+            " {:<9} {:>4} {:<22} {:<12} {}{}",
             entry.short_id(),
             entry.priority,
             entry.query_type,
             entry.name,
-            entry.render()
+            entry.render(),
+            guard
         );
     }
     let findings = lint(library);
@@ -1551,6 +1803,9 @@ pub fn render_match_report(input: &str, report: &MatchReport) -> String {
                 winner.span,
                 winner.entry.specificity()
             );
+            if let Some(guard) = &winner.entry.guard {
+                let _ = writeln!(out, " 上下文守卫：{}", guard.render());
+            }
             let bindings: Vec<String> = winner
                 .bindings
                 .iter()
@@ -2046,6 +2301,7 @@ const P_QUERY_TYPE: &str = "http://example.org/kg/ledger/queryType";
 const P_PRIORITY: &str = "http://example.org/kg/ledger/priority";
 const P_SOURCE: &str = "http://example.org/kg/ledger/source";
 const P_IR: &str = "http://example.org/kg/ledger/ir";
+const P_GUARD: &str = "http://example.org/kg/ledger/contextGuard";
 const P_FINGERPRINT: &str = "http://example.org/kg/ledger/fingerprint";
 const P_COUNT: &str = "http://example.org/kg/ledger/count";
 const P_GENERALIZES: &str = "http://example.org/kg/ledger/generalizes";
@@ -2128,6 +2384,9 @@ pub fn pattern_quads(entries: &[PatternEntry]) -> LedgerResult<Vec<Quad>> {
         quads.push(literal_quad(&subject, P_SOURCE, &entry.source, &graph)?);
         quads.push(literal_quad(&subject, P_IR, &entry.render(), &graph)?);
         quads.push(literal_quad(&subject, P_FINGERPRINT, &entry.id(), &graph)?);
+        if let Some(guard) = &entry.guard {
+            quads.push(literal_quad(&subject, P_GUARD, &guard.render(), &graph)?);
+        }
     }
     for edge in &edges {
         let subject = named_node(&format!("{}pattern/{}", LEDGER_NS, edge.subject_id))?;
@@ -3078,5 +3337,73 @@ mod tests {
             log.suggest_case(&unmatched, None, 0.2).is_none(),
             "无共享词且无焦点时不应硬造候选"
         );
+    }
+
+    #[test]
+    fn context_guard_parses_and_gates_routing() {
+        assert_eq!(
+            parse_context_guard("焦点").unwrap(),
+            ContextGuard::focus()
+        );
+        assert_eq!(
+            parse_context_guard("焦点类型：人物").unwrap(),
+            ContextGuard::focus_type("人物")
+        );
+        assert_eq!(
+            parse_context_guard("上轮=ask_attribute；无待澄清").unwrap(),
+            ContextGuard {
+                focus_required: false,
+                focus_type: None,
+                last_move: Some("ask_attribute".to_string()),
+                pending_clarify: Some(false),
+            }
+        );
+        assert!(parse_context_guard("").is_err());
+        assert!(parse_context_guard("未知守卫").is_err());
+
+        let mut library = PatternLibrary::new();
+        library
+            .teach_with_guard(
+                "省略身高",
+                "身高 呢",
+                "height_query",
+                30,
+                Some(ContextGuard::focus()),
+            )
+            .unwrap();
+        let tokens = tagged(&[("身高", "n"), ("呢", "u")]);
+        assert!(
+            library.match_route(&tokens).is_none(),
+            "无焦点时守卫必须拦住省略问句"
+        );
+        let blocked = library.rank(&tokens);
+        assert!(blocked.winner.is_none());
+        assert!(
+            blocked.failed.iter().any(|outcome| matches!(
+                &outcome.status,
+                CandidateStatus::Failed { reason } if reason.contains("上下文守卫")
+            )),
+            "失败榜应披露守卫原因"
+        );
+        let context = PatternContext {
+            focus: Some("姚明".to_string()),
+            focus_type: Some("人物".to_string()),
+            ..PatternContext::default()
+        };
+        assert_eq!(
+            library.route_with_context(&tokens, &context),
+            Some(("height_query".to_string(), Vec::new()))
+        );
+        let report = render_match_report("身高呢", &library.rank_with_context(&tokens, &context));
+        assert!(report.contains("上下文守卫：焦点"), "{}", report);
+
+        let guarded = &library.entries()[0];
+        let quads = pattern_quads(library.entries()).expect("守卫条目应可落图");
+        assert!(
+            quads.iter().any(|quad| quad.predicate.as_str() == P_GUARD),
+            "守卫应作为可查询字面量落图"
+        );
+        let restored = parse_pattern_graph(quads.into_iter());
+        assert_eq!(restored[0].guard, guarded.guard);
     }
 }

@@ -3721,7 +3721,21 @@ async fn run_interactive_mode(
             } else {
                 let tagged = preprocess(text, &config.nlp);
                 let normalized = normalize_words(tagged, &synonyms);
-                let report = pattern_library.rank(&normalized);
+                let focus = dialogue_manager.focus_entity().map(str::to_string);
+                let context = pattern_ir::PatternContext {
+                    focus_type: focus
+                        .as_deref()
+                        .and_then(|entity| symbolic_reasoner.context().focus_type(entity))
+                        .map(str::to_string),
+                    focus,
+                    last_move: dialogue_manager
+                        .turns()
+                        .last()
+                        .map(|turn| turn.kind.label().to_string()),
+                    pending_clarify: dialogue_manager.pending_reference().is_some(),
+                    turn: dialogue_manager.turn_count(),
+                };
+                let report = pattern_library.rank_with_context(&normalized, &context);
                 println!("{}", pattern_ir::render_match_report(text, &report));
             }
             println!();
@@ -3735,7 +3749,7 @@ async fn run_interactive_mode(
         ) {
             let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
             if parts.len() < 3 {
-                println!("用法：教模式：<名> | <要素 要素 …> | <路由> | <优先级(可选)>\n  要素：词性码（nr/ns/n/m/v…）、词面、{{槽名}}、{{槽名:排序}}、_ 任意");
+                println!("用法：教模式：<名> | <要素 要素 …> | <路由> | <优先级(可选)> | <守卫(可选)>\n  要素：词性码（nr/ns/n/m/v…）、词面、{{槽名}}、{{槽名:排序}}、_ 任意\n  守卫：焦点 / 焦点:人物 / 上轮:ask_attribute / 待澄清 / 无待澄清，多项用逗号分隔");
             } else {
                 let name = parts[0];
                 let pattern = parts[1];
@@ -3744,14 +3758,30 @@ async fn run_interactive_mode(
                     .get(3)
                     .and_then(|p| p.parse::<i32>().ok())
                     .unwrap_or(10);
-                match pattern_library.teach(name, pattern, route, priority) {
+                let guard = match parts.get(4).filter(|part| !part.is_empty()) {
+                    Some(spec) => match pattern_ir::parse_context_guard(spec) {
+                        Ok(guard) => Some(guard),
+                        Err(error) => {
+                            println!("教学模式失败：{}", error);
+                            println!();
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                match pattern_library.teach_with_guard(name, pattern, route, priority, guard) {
                     Ok(entry) => {
                         println!(
-                            "已教模式「{}」→ {}（优先级 {}，IR {}）",
+                            "已教模式「{}」→ {}（优先级 {}，IR {}{}）",
                             entry.name,
                             entry.query_type,
                             entry.priority,
-                            entry.render()
+                            entry.render(),
+                            entry
+                                .guard
+                                .as_ref()
+                                .map(|guard| format!("，守卫：{}", guard.render()))
+                                .unwrap_or_default()
                         );
                         match oxigraph_manager
                             .sync_pattern_ledger(pattern_library.entries())
@@ -7265,6 +7295,24 @@ async fn run_interactive_mode(
                     None
                 };
                 let normalized_words = normalize_words(tagged_words, &synonyms);
+                // 路由上下文：让带守卫的模式只在相应对话状态下参与匹配。
+                let route_context = {
+                    let focus = dialogue_manager.focus_entity().map(str::to_string);
+                    let focus_type = focus
+                        .as_deref()
+                        .and_then(|entity| symbolic_reasoner.context().focus_type(entity))
+                        .map(str::to_string);
+                    pattern_ir::PatternContext {
+                        focus,
+                        focus_type,
+                        last_move: dialogue_manager
+                            .turns()
+                            .last()
+                            .map(|turn| turn.kind.label().to_string()),
+                        pending_clarify: dialogue_manager.pending_reference().is_some(),
+                        turn: dialogue_manager.turn_count(),
+                    }
+                };
 
                 // 使用NLU进行语义理解
                 if config.nlp.enable_nlu.unwrap_or(false) {
@@ -7473,8 +7521,7 @@ async fn run_interactive_mode(
                                             input,
                                             &normalized_words,
                                             &mut pattern_episodes,
-                                            dialogue_manager.focus_entity(),
-                                            dialogue_manager.turn_count(),
+                                            &route_context,
                                         )
                                     {
                                         // 执行查询流程
@@ -7533,8 +7580,7 @@ async fn run_interactive_mode(
                                             input,
                                             &normalized_words,
                                             &mut pattern_episodes,
-                                            dialogue_manager.focus_entity(),
-                                            dialogue_manager.turn_count(),
+                                            &route_context,
                                         )
                                     {
                                         if let Some(note) = &pattern_note {
@@ -7686,8 +7732,7 @@ async fn run_interactive_mode(
                         input,
                         &normalized_words,
                         &mut pattern_episodes,
-                        dialogue_manager.focus_entity(),
-                        dialogue_manager.turn_count(),
+                        &route_context,
                     )
                 {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
@@ -8355,7 +8400,7 @@ fn interactive_help() -> String {
         "  模式经验 / 经验台账                  查看命中/未命中的可检索理解经验",
         "  模式联想：<句子>                     用相似成功经验泛化候选骨架（只确认，不直接回答）",
         "  清空模式经验                         清空经验台账并同步命名图",
-        "  教模式：名 | 要素… | 路由 | 优先级   教一条查询模式（落图持久化，跨会话恢复）",
+        "  教模式：名 | 要素… | 路由 | 优先级 | 守卫  教一条模式（可选上下文守卫，落图持久化）",
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
@@ -8969,20 +9014,28 @@ fn route_query_with_patterns(
     input: &str,
     words: &[know_prolog::nlp::TaggedWord],
     episodes: &mut pattern_ir::PatternEpisodeLog,
-    focus: Option<&str>,
-    turn: usize,
+    context: &pattern_ir::PatternContext,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    let Some(matched) = library.match_route(words) else {
+    let focus = context.focus.as_deref();
+    let turn = context.turn;
+    let Some(matched) = library.match_route_with_context(words, context) else {
         episodes.record_unmatched(input, words, focus, turn);
         return None;
     };
     episodes.record_match(input, words, &matched, focus, turn);
+    let guard = matched
+        .entry
+        .guard
+        .as_ref()
+        .map(|guard| format!("，守卫：{}", guard.render()))
+        .unwrap_or_default();
     let note = format!(
-        "{}（{}，优先级 {}，来源 {}）",
+        "{}（{}，优先级 {}，来源 {}{}）",
         matched.entry.name,
         matched.entry.render(),
         matched.entry.priority,
-        matched.entry.source
+        matched.entry.source,
+        guard
     );
     Some((
         matched.entry.query_type.clone(),
@@ -10248,7 +10301,11 @@ mod session_tests {
             "模式落图",
             "同步模式图",
             "模式匹配：法国的首都是哪里",
-            "教模式：老家 | {人} 的 老家 | hometown_query | 20",
+            "模式经验",
+            "经验台账",
+            "模式联想：德国的首都在哪里",
+            "清空模式经验",
+            "教模式：老家 | {人} 的 老家 | hometown_query | 20 | 焦点",
             "忘模式：老家",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
