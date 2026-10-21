@@ -3983,10 +3983,14 @@ async fn run_interactive_mode(
         if matches!(input, "形状议程" | "形状缺口议程") {
             match acquisition_context(&oxigraph_manager, &config).await {
                 Ok((facts, registry, types, shapes)) => {
-                    let effective = know_prolog::shape_dialogue::effective_facts(
+                    let (ruled_facts, ruled_overlay) = know_prolog::shape_dialogue::apply_rulings(
                         &facts,
                         &acquisition.overlay(),
+                        shape_dialogue.rulings(),
+                        &registry,
                     );
+                    let effective =
+                        know_prolog::shape_dialogue::effective_facts(&ruled_facts, &ruled_overlay);
                     let report = shapes.validate(&effective, &registry, &types);
                     let agenda =
                         know_prolog::shape_dialogue::ShapeAgenda::compile(&report, &registry);

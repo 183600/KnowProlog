@@ -932,7 +932,9 @@ impl ShapeDialogue {
             return None;
         }
         self.turn += 1;
-        let effective = effective_facts(facts, &acquisition.overlay());
+        let (ruled_facts, ruled_overlay) =
+            apply_rulings(facts, &acquisition.overlay(), &self.rulings, registry);
+        let effective = effective_facts(&ruled_facts, &ruled_overlay);
         let report = shapes.validate(&effective, registry, types);
         self.agenda = ShapeAgenda::compile(&report, registry);
         let consultation = self.open_next_global(facts, registry, types, shapes, acquisition)?;
@@ -2294,6 +2296,50 @@ mod tests {
         assert_eq!(turn.answer.status, AnswerStatus::Complete);
         assert_eq!(turn.answer.value_of("职业"), vec!["演员"]);
         assert_eq!(dialogue.focus(), Some("刘德华"));
+    }
+
+    #[test]
+    fn agenda_after_ruling_does_not_stay_blocked_by_the_resolved_conflict() {
+        let registry = registry();
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![
+            entity("刘德华", "Person", &[("name", "刘德华"), ("职业", "演员")]),
+            relation("刘德华", "职业", "导演"),
+        ];
+        let mut acquisition = RelationAcquisition::new();
+        let mut dialogue = ShapeDialogue::new();
+        let first = dialogue.start_profile(
+            "刘德华",
+            "刘德华是谁？",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+            &mut acquisition,
+        );
+        assert_eq!(first.answer.status, AnswerStatus::Conflict);
+        let ruled = dialogue
+            .resolve_conflict(
+                "刘德华",
+                "职业",
+                "演员",
+                &facts,
+                &registry,
+                &types,
+                &shapes,
+                &mut acquisition,
+            )
+            .unwrap();
+        assert_eq!(ruled.answer.status, AnswerStatus::Partial);
+        let next = dialogue
+            .ask_next(&facts, &registry, &types, &shapes, &mut acquisition)
+            .expect("裁定后应能继续追问剩余缺失槽位");
+        assert_eq!(
+            next.consultation.unwrap().gap.predicate,
+            "出生地",
+            "已裁定的职业冲突不应继续阻塞议程"
+        );
     }
 
     #[test]
