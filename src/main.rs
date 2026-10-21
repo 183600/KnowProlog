@@ -8038,6 +8038,17 @@ async fn run_interactive_mode(
         }
     }
 
+    // 模式经验落图：会话中积累的命中/未命中经验跨重启可检索。
+    if !pattern_episodes.is_empty() {
+        match oxigraph_manager
+            .sync_pattern_episodes(pattern_episodes.entries())
+            .await
+        {
+            Ok(count) => println!("模式经验已保存（经验落图：{} 条）。", count),
+            Err(error) => eprintln!("保存模式经验失败：{}", error),
+        }
+    }
+
     // 外链名册落盘：跨重启保留取回的外部知识（出处 + 逻辑时刻）
     match external_knowledge_service.save_ledger(&external_ledger_path) {
         Ok(_) => println!(
