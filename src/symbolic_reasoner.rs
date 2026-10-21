@@ -1139,6 +1139,8 @@ impl SymbolicReasoner {
         }
         self.session_negative_facts.clear();
         self.session_clauses.clear();
+        // 补全回合属于会话态：分叉/重置不得把已确认候选与规则带进新会话。
+        self.completion = CompletionLedger::new();
         self.clarification = None;
         self.last_abduction_goal = None;
         self.last_abduction_vars.clear();
@@ -14398,6 +14400,17 @@ types = [
             "落盘往返后补全台账应保持不变"
         );
         let _ = std::fs::remove_file(&path);
+
+        let fork = reasoner.fork_session();
+        assert!(
+            fork.completion_ledger().is_empty(),
+            "分叉会话不得继承补全回合"
+        );
+        assert_eq!(
+            fork.completion_ledger().reasoning_clauses().len(),
+            0,
+            "分叉后已晋升规则不得残留"
+        );
     }
 
     #[test]
