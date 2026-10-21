@@ -1,6 +1,6 @@
 {
   "lock_version": 1,
-  "language_version": "0.1.0",
+  "language_version": "0.2.0",
   "schema": {
     "snapshot_version": 1,
     "entity_types": {
@@ -1257,21 +1257,29 @@
         "conflicts": [],
         "provides": [],
         "contributions": {
+          "film.cast.template": {
+            "kind": "template",
+            "digest": "77f7e6cecf1bfd4a"
+          },
+          "film.cast_of": {
+            "kind": "recipe",
+            "digest": "06858f4c8dc2659c"
+          },
           "film.directed_by": {
             "kind": "recipe",
-            "digest": "8b1ccd1807c5ec12"
+            "digest": "4cd5810ba596d36a"
           },
           "film.directed_by.template": {
             "kind": "template",
-            "digest": "5b6ce800e9a931f4"
+            "digest": "89373e021758722b"
           },
           "film.lexicon": {
             "kind": "lexicon",
-            "digest": "e84b6f91848963e1"
+            "digest": "e6c79deff7714c37"
           },
           "film.ontology": {
             "kind": "ontology",
-            "digest": "a42854460e528f5f"
+            "digest": "fd97683bb620b7d2"
           },
           "film.reference": {
             "kind": "reference",
@@ -1281,12 +1289,20 @@
             "kind": "policy",
             "digest": "5b93f73812f6cf1f"
           },
+          "film.works.template": {
+            "kind": "template",
+            "digest": "0edd61e393710da9"
+          },
           "film.works_by_actor": {
-            "kind": "rewrite",
-            "digest": "c2e78a3a8cfaf570"
+            "kind": "recipe",
+            "digest": "80b62e9064d1a47a"
+          },
+          "film.works_by_director": {
+            "kind": "recipe",
+            "digest": "4a09c98eca5ae03a"
           }
         },
-        "eval_cases_digest": "ff5a1de9212f6f9a"
+        "eval_cases_digest": "66341b8fe2ad53fc"
       }
     },
     "behavior": {
@@ -1347,7 +1363,7 @@
       "system.default_language": "zh"
     }
   },
-  "schema_digest": "bdde84ec284933ef",
+  "schema_digest": "82cdb5cf2a20cde7",
   "nlu": {
     "version": 2,
     "corpus_digest": "f7da948dd31deb12",
