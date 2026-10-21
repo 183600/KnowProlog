@@ -290,6 +290,12 @@ pub trait DialogueKnowledge {
         None
     }
 
+    /// 问题谓词/类型线索（供 CRD 表决）。缺省无线索。
+    fn reference_hints(&self, text: &str) -> Vec<String> {
+        let _ = text;
+        Vec::new()
+    }
+
     /// 恢复通道 L1：换帧重解（缺省无替代问法）。
     fn recovery_reframe(&self, entity: &str, attribute: &str) -> Vec<ReframedReading> {
         let _ = (entity, attribute);
@@ -354,6 +360,10 @@ impl DialogueKnowledge for SymbolicReasoner {
             linker: self.linker(),
             source: self,
         })
+    }
+
+    fn reference_hints(&self, text: &str) -> Vec<String> {
+        SymbolicReasoner::reference_hints(self, text)
     }
 
     fn known_entity(&self, entity: &str) -> bool {
@@ -1420,12 +1430,13 @@ impl DialogueManager {
                 None => {}
             }
         }
+        let hints = knowledge.reference_hints(input);
         let outcome = self.reference_resolver.resolve_text(
             input,
             view.linker,
             view.source,
             &self.references,
-            &[],
+            &hints,
             self.focus.last().map(String::as_str),
         );
         if let Some(ask) = outcome.ask {

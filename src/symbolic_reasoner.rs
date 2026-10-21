@@ -2831,6 +2831,11 @@ impl SymbolicReasoner {
             .map(|(_, entity)| entity)
     }
 
+    /// 问题谓词/类型线索（只读；供语境指称消歧表决使用）。
+    pub fn reference_hints(&self, text: &str) -> Vec<String> {
+        self.link_hints(text)
+    }
+
     pub fn entity_link_report(&self, text: &str) -> String {
         let mentions = self.linked_mentions(text);
         self.linker.report_for_mentions(text, mentions.as_slice())

@@ -6677,12 +6677,13 @@ async fn run_interactive_mode(
                         || input.contains('？')
                         || input.contains('?'))
                 {
+                    let crd_hints = symbolic_reasoner.reference_hints(input);
                     let outcome = crd_resolver.resolve_text(
                         input,
                         symbolic_reasoner.linker(),
                         &symbolic_reasoner,
                         &crd_ledger,
-                        &[],
+                        &crd_hints,
                         dialogue_manager.focus_entity(),
                     );
                     // 只在确有竞争/绑定/追问/描述改写时展示证据，避免每问都刷屏
