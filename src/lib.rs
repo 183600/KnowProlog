@@ -83,6 +83,7 @@ pub mod query_planner;
 pub mod query_rewrite;
 pub mod query_scenario;
 pub mod question_analyzer;
+pub mod reading;
 pub mod recovery;
 pub mod relation_acquisition;
 pub mod relation_frame;
