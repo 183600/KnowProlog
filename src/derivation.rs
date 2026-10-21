@@ -120,6 +120,9 @@ pub struct Derivation {
     /// 节点/深度/字节预算是否截断了证明。
     #[serde(default)]
     pub truncated: bool,
+    /// 同一目标的其他独立证明数（只计数，不展开，避免解释无界增长）。
+    #[serde(default)]
+    pub alternatives: usize,
 }
 
 impl Derivation {
@@ -188,6 +191,7 @@ impl Derivation {
             rules: view.clauses,
             omitted_steps: 0,
             truncated: view.search_truncated,
+            alternatives: view.solutions.len().saturating_sub(1),
         };
 
         if let Some(solution) = selected {
@@ -246,6 +250,7 @@ impl Derivation {
             rules: 0,
             omitted_steps: 0,
             truncated: false,
+            alternatives: 0,
         }
     }
 
@@ -298,6 +303,12 @@ impl Derivation {
                 }
                 if let Some(confidence) = self.confidence {
                     output.push_str(&format!("  证明置信度：{:.2}。\n", confidence));
+                }
+                if self.alternatives > 0 {
+                    output.push_str(&format!(
+                        "  另有 {} 条独立证明（同一目标的不同解，本次只展开一条）。\n",
+                        self.alternatives
+                    ));
                 }
             }
             DerivationStatus::NoSolution => {
@@ -462,6 +473,24 @@ mod tests {
         assert!(text.contains("链接预测规则#7"), "{}", text);
         assert!(text.contains("李四"), "{}", text);
         assert!(text.contains("证明置信度"), "{}", text);
+    }
+
+    #[test]
+    fn counts_alternative_proofs_without_expanding_them() {
+        let proof = |value: &str| ProofSolutionView {
+            bindings: vec![("答案".to_string(), value.to_string())],
+            confidence: 1.0,
+            proofs: vec![node(value, ViewProofSource::Fact, Vec::new())],
+        };
+        let view = view(
+            SearchStatus::Proved,
+            vec![proof("王五"), proof("赵六"), proof("孙七")],
+        );
+        let derivation =
+            Derivation::from_resolution_view(&view, Some("王五")).expect("应选到匹配答案的解");
+        assert_eq!(derivation.answer_value(), Some("王五"));
+        assert_eq!(derivation.alternatives, 2);
+        assert!(derivation.render_explanation().contains("另有 2 条独立证明"));
     }
 
     #[test]

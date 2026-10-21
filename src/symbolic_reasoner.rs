@@ -11144,6 +11144,24 @@ types = [
     }
 
     #[test]
+    fn test_dialogue_why_uses_resolution_proof_end_to_end() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let mut manager = crate::dialogue_manager::DialogueManager::new();
+        let answer = manager
+            .plan_reply("张三的师傅的师傅是谁", &reasoner)
+            .expect("链式问句应被对话管理器接管");
+        assert!(answer.text.contains("王五"), "{}", answer.text);
+
+        let why = manager
+            .plan_pure_dialogue("怎么推出来的？", &reasoner)
+            .expect("推导追问应被接管");
+        assert!(why.text.contains("证明步骤"), "{}", why.text);
+        assert!(why.text.contains("事实"), "{}", why.text);
+        assert!(why.text.contains("王五"), "{}", why.text);
+    }
+
+    #[test]
     fn test_resolution_proves_existence_via_association_rule() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&nationality_facts());
