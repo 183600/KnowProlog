@@ -205,6 +205,26 @@ impl Derivation {
         Some(derivation)
     }
 
+    /// 没有证明的显式视图：用于「为什么没有记录」这类追问，
+    /// 只携带本次检索/搜索实际遇到的缺口，不伪造任何步骤。
+    pub fn missing(goal: impl Into<String>, frontier: Vec<String>) -> Self {
+        let omitted = frontier.len().saturating_sub(MAX_RENDER_FRONTIER);
+        Derivation {
+            goal: goal.into(),
+            status: DerivationStatus::NoSolution,
+            confidence: None,
+            bindings: Vec::new(),
+            steps: Vec::new(),
+            frontier: frontier.into_iter().take(MAX_RENDER_FRONTIER).collect(),
+            frontier_omitted: omitted,
+            facts: 0,
+            rules: 0,
+            omitted_steps: 0,
+            truncated: false,
+            alternatives: 0,
+        }
+    }
+
     /// 直接事实链：每个 `(subject, predicate, object)` 是一条图谱事实边。
     /// 用于解释「查表/检索得到的属性值」这类没有归结规则参与的答案。
     pub fn from_direct_facts(

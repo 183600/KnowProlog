@@ -422,7 +422,8 @@ pub const POLICY_SOURCE: &str = r#"
 respond(recap) :- kind(T, meta_recap).
 respond(review_answer) :- kind(T, meta_review).
 respond(explain_why) :- kind(T, meta_why), has_evidence(T).
-respond(why_no_evidence) :- kind(T, meta_why), not has_evidence(T).
+respond(explain_why) :- kind(T, meta_why), why_not(T).
+respond(why_no_evidence) :- kind(T, meta_why), not has_evidence(T), not why_not(T).
 # 对话控制：继续说 / 展开细节
 respond(elaborate) :- kind(T, elaborate), has_focus(T).
 respond(continue_topic) :- kind(T, continue), has_focus(T).
@@ -482,6 +483,17 @@ const REVIEW_PATTERNS: [&str; 10] = [
     "复核一下",
     "复核",
     "有没有变化",
+];
+
+const WHY_NOT_PATTERNS: [&str; 8] = [
+    "为什么没有",
+    "为什么查不到",
+    "为什么不知道",
+    "为什么找不到",
+    "怎么没有记录",
+    "为什么推不出",
+    "为什么无法回答",
+    "为什么答不上",
 ];
 
 const WHY_PATTERNS: [&str; 13] = [
@@ -1341,6 +1353,14 @@ impl DialogueManager {
         {
             return UtteranceFrame::new(raw, MoveKind::MetaReview);
         }
+        if WHY_NOT_PATTERNS
+            .iter()
+            .any(|pattern| stripped.contains(pattern))
+        {
+            let mut frame = UtteranceFrame::new(raw, MoveKind::MetaWhy);
+            frame.question = Some("why_not".to_string());
+            return frame;
+        }
         if WHY_PATTERNS
             .iter()
             .any(|pattern| stripped.contains(pattern))
@@ -1716,6 +1736,9 @@ impl DialogueManager {
         if self.last_answered_turn().is_some() {
             abox.push(format!("has_evidence({})", turn_id));
         }
+        if frame.question.as_deref() == Some("why_not") {
+            abox.push(format!("why_not({})", turn_id));
+        }
         if known {
             abox.push(format!("entity_known({})", turn_id));
         }
@@ -1767,7 +1790,13 @@ impl DialogueManager {
                 plans.push(tag.to_string());
                 text
             }
-            "explain_why" => self.explain_last_with(knowledge),
+            "explain_why" => {
+                if frame.question.as_deref() == Some("why_not") {
+                    self.explain_last_failure(knowledge)
+                } else {
+                    self.explain_last_with(knowledge)
+                }
+            }
             "why_no_evidence" => self
                 .failure_self_description()
                 .unwrap_or_else(|| {
@@ -2432,6 +2461,55 @@ impl DialogueManager {
         )
     }
 
+    /// 「为什么没有/查不到」：不改口，也不把失败说成不存在；
+    /// 只展开最近一次未答上的知识问句所对应的失败前沿。
+    pub fn explain_last_failure(&self, knowledge: &dyn DialogueKnowledge) -> String {
+        let Some(turn) = self.turns.iter().rev().find(|turn| {
+            turn.answer_excerpt.is_none()
+                && matches!(
+                    turn.kind,
+                    MoveKind::AskAttribute | MoveKind::AskIdentity | MoveKind::AskBinary
+                )
+        }) else {
+            return "最近没有没答上的知识问句；上一轮是有结论的，可以问「怎么推出来的」。".to_string();
+        };
+        let topic = match (&turn.entity, &turn.attribute) {
+            (Some(entity), Some(attribute)) => format!("「{}」的「{}」", entity, attribute),
+            (Some(entity), None) => format!("「{}」", entity),
+            _ => format!("「{}」", excerpt(&turn.user, 16)),
+        };
+        let Some(question) = turn_question(turn) else {
+            return format!(
+                "刚才关于{}的问题没有结论；这个问句没有可形式化的实体与属性槽位，因此没有可展开的失败前沿。",
+                topic
+            );
+        };
+        match knowledge.derivation(&question, None) {
+            Some(derivation) => {
+                let mut text = format!(
+                    "刚才关于{}没有作答，这里不改口：{}",
+                    topic,
+                    derivation.render_explanation()
+                );
+                if let Some(recorded) = turn.kb_revision {
+                    let current = knowledge.revision();
+                    if recorded != current {
+                        text.push_str(&format!(
+                            "\n说明：失败前沿按当前知识版本 v{} 重建（当时是 v{}）。",
+                            current, recorded
+                        ));
+                    }
+                }
+                text.push_str("\n失败前沿只说明当前事实或规则的缺口，不是「它不存在」的证明。");
+                text
+            }
+            None => format!(
+                "刚才关于{}没有作答；这个问句无法形式化为归结目标，因此没有可展开的失败前沿（属于检索或模板管线未命中）。",
+                topic
+            ),
+        }
+    }
+
     /// 只读：为最近一条已答轮次重建推导（与 [`Self::explain_last_with`] 同源）。
     /// 供 HTTP/CLI 在「为什么」轮次返回结构化证明，不写入会话状态。
     pub fn last_derivation(&self, knowledge: &dyn DialogueKnowledge) -> Option<Derivation> {
@@ -2447,13 +2525,7 @@ impl DialogueManager {
         turn: &DialogueTurn,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<Derivation> {
-        let question = match (&turn.entity, &turn.attribute) {
-            (Some(entity), Some(attribute)) => Some(format!("{}的{}是什么", entity, attribute)),
-            (Some(entity), None) if turn.kind == MoveKind::AskIdentity => {
-                Some(format!("{}是谁", entity))
-            }
-            _ => None,
-        };
+        let question = turn_question(turn);
         let expected = turn.answer_excerpt.as_deref();
         if let Some(question) = question.as_deref() {
             if let Some(derivation) = knowledge.derivation(question, expected) {
@@ -2823,6 +2895,9 @@ impl DialogueManager {
             "why_no_evidence" => Some(("why_no_evidence/plain", BindingSet::new())),
             "continue_no_focus" => Some(("continue_no_focus/plain", BindingSet::new())),
             "explain_why" => {
+                if frame.question.as_deref() == Some("why_not") {
+                    return None;
+                }
                 let turn = self.last_answered_turn()?;
                 let provenance = if turn.provenance.is_empty() {
                     vec!["知识图谱中的事实".to_string()]
@@ -2954,6 +3029,14 @@ fn classify_provenance(answer: &str) -> Vec<String> {
         tags.push("知识图谱中的直接事实".to_string());
     }
     tags
+}
+
+fn turn_question(turn: &DialogueTurn) -> Option<String> {
+    match (&turn.entity, &turn.attribute, &turn.kind) {
+        (Some(entity), Some(attribute), _) => Some(format!("{}的{}是什么", entity, attribute)),
+        (Some(entity), None, MoveKind::AskIdentity) => Some(format!("{}是谁", entity)),
+        _ => None,
+    }
 }
 
 fn excerpt(text: &str, limit: usize) -> String {
@@ -3385,6 +3468,32 @@ mod tests {
             .expect("依据追问应被接管");
         assert!(why.text.contains("证明步骤"), "{}", why.text);
         assert!(why.text.contains("姚明 的 身高 是 226 厘米"), "{}", why.text);
+    }
+
+    #[test]
+    fn test_explain_why_not_uses_failure_frontier_without_prior_answer() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
+            .with_derivation(
+                "姚明的体重是什么",
+                Derivation::missing(
+                    "姚明的体重",
+                    vec!["体重(姚明, ?X)（缺少事实或规则，深度 0）".to_string()],
+                ),
+            );
+        let mut manager = DialogueManager::new();
+        let reply = manager
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("已知实体即使无答案也应坦白");
+        assert!(reply.text.contains("没有记录"), "{}", reply.text);
+        let why = manager
+            .plan_pure_dialogue("为什么没有记录？", &knowledge)
+            .expect("失败追问应被接管");
+        assert!(why.text.contains("没有作答"), "{}", why.text);
+        assert!(why.text.contains("体重"), "{}", why.text);
+        assert!(why.text.contains("知识缺口"), "{}", why.text);
+        assert!(why.text.contains("不是「它不存在」"), "{}", why.text);
     }
 
     #[test]
