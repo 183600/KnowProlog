@@ -1573,7 +1573,7 @@ async fn main() {
             let recovery_mode = parse_recovery_mode(&recovery);
             warn_config_contract(&config);
             let facts_start = Instant::now();
-            let facts = match oxigraph_manager.load_all_facts().await {
+            let facts = match serve_facts(&oxigraph_manager).await {
                 Ok(facts) => {
                     startup_ledger.record_since("facts_load", facts_start);
                     facts
@@ -2542,6 +2542,15 @@ async fn quality_report_for(
         &oxigraph_manager.type_system_snapshot(),
         &config.entity_types,
     ))
+}
+
+/// `serve` 的知识装载：与交互模式同源，取整图快照（实体属性 + 关系）。
+/// 只喂实体事实会让服务会话的全部关系问法（谁是X的师傅 / 两人什么关系）
+/// 与关系派生的索引静默落空，而属性问法却照常有答案，极难被发现。
+async fn serve_facts(
+    manager: &OxigraphManager,
+) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok((*manager.load_graph_snapshot().await?).clone())
 }
 
 /// 编译并执行形状校验（`eval-shapes` 与交互命令共用同一确定性路径）。
@@ -9278,6 +9287,49 @@ mod session_tests {
             snapshot.is_empty(),
             "撤销后图谱应回到导入前状态，实际剩余 {} 条",
             snapshot.len()
+        );
+    }
+
+    /// 服务会话的知识装载必须含关系事实：只有实体会让关系问法静默落空。
+    #[tokio::test]
+    async fn serve_facts_include_relations_alongside_entities() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().to_str().unwrap().to_string();
+        let manager =
+            OxigraphManager::with_perf_ledger(&store_path, PerfLedger::shared()).unwrap();
+        let items = vec![
+            KnowledgeItem::Entity {
+                label: "人物".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), "张三".to_string()),
+                    ("age".to_string(), "25".to_string()),
+                ]),
+            },
+            KnowledgeItem::Relationship {
+                from_label: "人物".to_string(),
+                from_id: "张三".to_string(),
+                to_label: "人物".to_string(),
+                to_id: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                properties: HashMap::new(),
+            },
+        ];
+        manager.save_knowledge(items).await.unwrap();
+
+        let facts = serve_facts(&manager).await.unwrap();
+        assert!(
+            facts
+                .iter()
+                .any(|fact| matches!(fact, PrologFact::Entity { .. })),
+            "实体事实应保留：{:?}",
+            facts
+        );
+        assert!(
+            facts.iter().any(
+                |fact| matches!(fact, PrologFact::Relation { rel_type, .. } if rel_type == "师傅")
+            ),
+            "关系事实必须随服务启动一并装载：{:?}",
+            facts
         );
     }
 
