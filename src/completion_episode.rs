@@ -1805,13 +1805,14 @@ impl CompletionLedger {
             return id;
         }
         if self.rules.len() >= self.max_rules {
-            if let Some(position) = self
+            let position = self
                 .rules
                 .iter()
-                .position(|rule| matches!(rule.status, RuleStatus::Quarantined | RuleStatus::Retired))
-            {
-                self.rules.remove(position);
-            }
+                .position(|rule| {
+                    matches!(rule.status, RuleStatus::Quarantined | RuleStatus::Retired)
+                })
+                .unwrap_or(0);
+            self.rules.remove(position);
         }
         self.rules.push(LearnedRule {
             id: id.clone(),
@@ -1829,9 +1830,6 @@ impl CompletionLedger {
             source_episode: episode_id.to_string(),
             promoted_tick: None,
         });
-        if self.rules.len() > self.max_rules {
-            self.rules.remove(0);
-        }
         id
     }
 
@@ -2593,6 +2591,40 @@ mod tests {
         assert_eq!(ledger.max_rules, DEFAULT_MAX_RULES);
         assert_eq!(ledger.max_batch_entities, DEFAULT_MAX_BATCH_ENTITIES);
         assert_eq!(ledger.active, None, "越界活动索引应被清掉");
+    }
+
+    #[test]
+    fn rule_cap_evicts_before_insert_so_returned_id_stays_live() {
+        let mut ledger = CompletionLedger::with_limits(8, 8, 8, 1);
+        ledger.open_episode("甲", None);
+        let first = RuleSpec {
+            pattern: RulePattern::Compose,
+            body: vec!["r".to_string(), "r".to_string()],
+            head: "s".to_string(),
+        };
+        let second = RuleSpec {
+            pattern: RulePattern::Compose,
+            body: vec!["r".to_string(), "r".to_string()],
+            head: "t".to_string(),
+        };
+        let first_id = ledger.upsert_rule(
+            first,
+            &Triple::new("甲", "s", "乙"),
+            "ep-1",
+            0.7,
+            1,
+        );
+        let second_id = ledger.upsert_rule(
+            second,
+            &Triple::new("甲", "t", "乙"),
+            "ep-2",
+            0.7,
+            2,
+        );
+        assert_eq!(ledger.rules().len(), 1);
+        assert_ne!(first_id, second_id);
+        assert!(ledger.rule(&second_id).is_some(), "返回值必须是仍在台账中的规则");
+        assert!(ledger.rule(&first_id).is_none());
     }
 
     #[test]
