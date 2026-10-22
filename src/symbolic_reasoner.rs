@@ -20,7 +20,8 @@ use crate::contextual_rag::{
 };
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::conversational_graph::{
-    ConversationalGraph, GraphFact, GraphReply, MatchOptions, PatternOutcome,
+    ConversationalGraph, GraphCommand, GraphFact, GraphPattern, GraphReply, MatchOptions,
+    PatternOutcome,
 };
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
@@ -31,6 +32,9 @@ use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_diagnosis::diagnose_failure;
 use crate::graph_ledger;
 use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
+use crate::graph_repair::{
+    parse_repair_intent, suggest_repairs, RepairHints, RepairIntent, RepairSuggestion,
+};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
 use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
@@ -999,6 +1003,46 @@ impl OntologyView for FrameOntology<'_> {
 struct GraphSession {
     compiled: CompiledGraphQuestion,
     conversation: ConversationalGraph,
+    /// 首次编译出的原模式：用于「恢复原条件」，与逐轮回撤栈相互独立。
+    base_pattern: GraphPattern,
+    /// 最近一次零解诊断生成的有界放宽候选（尚未生效）。
+    repairs: Vec<RepairSuggestion>,
+    /// 当前结果是否建立在已确认的放宽上；恢复原条件后清空。
+    relaxed: Option<RepairSuggestion>,
+}
+
+impl RepairHints for SymbolicReasoner {
+    fn predicate_alternatives(&self, predicate: &str) -> Vec<(String, String)> {
+        let retrieval = self.retrieval.lock();
+        let mut alternatives = Vec::new();
+        for parent in retrieval.superproperties_reachable(predicate) {
+            alternatives.push((
+                parent.clone(),
+                format!("「{}」是声明式中更一般的「{}」", predicate, parent),
+            ));
+        }
+        for child in retrieval.subproperties_reachable(predicate) {
+            alternatives.push((
+                child.clone(),
+                format!("「{}」是「{}」的声明子属性", child, predicate),
+            ));
+        }
+        alternatives
+    }
+
+    fn type_supertypes(&self, entity_type: &str) -> Vec<(String, String)> {
+        self.retrieval
+            .lock()
+            .type_ancestors(entity_type)
+            .into_iter()
+            .map(|parent| {
+                (
+                    parent.clone(),
+                    format!("「{}」的父类型是「{}」", entity_type, parent),
+                )
+            })
+            .collect()
+    }
 }
 
 pub struct SymbolicReasoner {
@@ -7489,24 +7533,44 @@ impl SymbolicReasoner {
         let options = MatchOptions::default();
         let mut guard = self.graph_session.lock();
         if let Some(session) = guard.as_mut() {
+            if let Some(intent) = parse_repair_intent(question) {
+                return Some(match intent {
+                    RepairIntent::RestoreOriginal => {
+                        self.restore_graph_original(session, &facts, options)
+                    }
+                    RepairIntent::Adopt(index) => {
+                        self.adopt_graph_repair(session, index, &facts, options)
+                    }
+                });
+            }
             if let Some(result) = session
                 .conversation
                 .interpret(question, &lexicon, &facts, options)
             {
                 return Some(match result {
                     Ok(reply) => {
+                        session.compiled.pattern = session.conversation.pattern().clone();
+                        if session.conversation.pattern() == &session.base_pattern {
+                            session.relaxed = None;
+                        }
                         let mut answer = self.render_graph_reply(
                             &session.compiled,
                             &session.conversation,
                             &reply,
                             &facts,
                         );
-                        self.append_graph_failure(
-                            &mut answer,
-                            &session.conversation,
-                            &facts,
-                            options,
-                        );
+                        if let Some(relaxed) = &session.relaxed {
+                            answer = format!("{}{}", self.relaxed_graph_note(relaxed), answer);
+                        }
+                        if let Some((failure, repairs)) =
+                            self.graph_failure_parts(&session.conversation, &facts, options)
+                        {
+                            answer.push('\n');
+                            answer.push_str(&failure);
+                            session.repairs = repairs;
+                        } else {
+                            session.repairs.clear();
+                        }
                         answer
                     }
                     Err(error) => format!("图谱追问无法执行：{}。", error),
@@ -7516,31 +7580,169 @@ impl SymbolicReasoner {
         let compiled = lexicon.compile(question)?;
         let conversation =
             ConversationalGraph::new(compiled.pattern.clone(), &facts, options).ok()?;
+        let base_pattern = compiled.pattern.clone();
         let mut answer = self.render_graph_question(&compiled, conversation.outcome(), &facts);
-        self.append_graph_failure(&mut answer, &conversation, &facts, options);
+        let (failure, repairs) = match self.graph_failure_parts(&conversation, &facts, options) {
+            Some(parts) => parts,
+            None => (String::new(), Vec::new()),
+        };
+        if !failure.is_empty() {
+            answer.push('\n');
+            answer.push_str(&failure);
+        }
         *guard = Some(GraphSession {
             compiled,
             conversation,
+            base_pattern,
+            repairs,
+            relaxed: None,
         });
         Some(answer)
     }
 
-    /// 零解时把「为什么没有」追加到回答后面；有解或搜索预算未定时不插话。
-    fn append_graph_failure(
+    /// 零解时的「失败诊断 + 有界放宽候选」；有解、预算未定或无法诊断时返回 `None`。
+    fn graph_failure_parts(
         &self,
-        answer: &mut String,
         conversation: &ConversationalGraph,
         facts: &[GraphFact],
         options: MatchOptions,
-    ) {
+    ) -> Option<(String, Vec<RepairSuggestion>)> {
         if !conversation.outcome().is_empty() {
-            return;
+            return None;
         }
-        let Some(diagnosis) = diagnose_failure(conversation.pattern(), facts, options) else {
-            return;
+        let diagnosis = diagnose_failure(conversation.pattern(), facts, options)?;
+        let mut text = diagnosis.render(conversation.pattern());
+        let repairs = suggest_repairs(
+            conversation.pattern(),
+            facts,
+            options,
+            &diagnosis,
+            self,
+            3,
+        );
+        if !repairs.is_empty() {
+            text.push('\n');
+            text.push_str(&self.render_graph_repairs(&repairs));
+        }
+        Some((text, repairs))
+    }
+
+    fn render_graph_repairs(&self, repairs: &[RepairSuggestion]) -> String {
+        let mut output = String::from("可尝试的放宽（尚未生效，回复「放宽 1」确认）：");
+        for (index, repair) in repairs.iter().enumerate() {
+            let lower_bound = if repair.lower_bound { "，下界" } else { "" };
+            let examples = if repair.sample_rows.is_empty() {
+                String::new()
+            } else {
+                format!("，例如 {}", repair.sample_rows.join("、"))
+            };
+            output.push_str(&format!(
+                "\n  {}. {}：{}（{} 项{}{}）",
+                index + 1,
+                repair.label(),
+                repair.rationale,
+                repair.total,
+                lower_bound,
+                examples
+            ));
+        }
+        output
+    }
+
+    fn relaxed_graph_note(&self, relaxed: &RepairSuggestion) -> String {
+        format!(
+            "（当前为放宽结果：{}。回复「恢复原条件」可回到原问题。）\n",
+            relaxed.label()
+        )
+    }
+
+    fn adopt_graph_repair(
+        &self,
+        session: &mut GraphSession,
+        index: usize,
+        facts: &[GraphFact],
+        options: MatchOptions,
+    ) -> String {
+        let Some(suggestion) = session.repairs.get(index).cloned() else {
+            if session.repairs.is_empty() {
+                return "当前没有待确认的放宽候选；请先把问题问完整。".to_string();
+            }
+            return format!(
+                "没有第 {} 条放宽候选；当前有 {} 条，可回复「放宽 1」到「放宽 {}」。",
+                index + 1,
+                session.repairs.len(),
+                session.repairs.len()
+            );
         };
-        answer.push('\n');
-        answer.push_str(&diagnosis.render(conversation.pattern()));
+        let Some(relaxed_pattern) = suggestion
+            .op
+            .apply(session.conversation.pattern())
+        else {
+            return "这条放宽已经无法应用到当前模式，请重新提问。".to_string();
+        };
+        match session.conversation.apply(
+            GraphCommand::Replace(relaxed_pattern.clone()),
+            facts,
+            options,
+        ) {
+            Ok(_) => {
+                session.compiled.pattern = relaxed_pattern;
+                session.relaxed = Some(suggestion.clone());
+                session.repairs.clear();
+                let mut answer = format!(
+                    "已采用放宽：{}。以下结果基于放宽后的条件，不是原问题在当前知识下的严格答案。\n",
+                    suggestion.rationale
+                );
+                answer.push_str(&self.render_graph_question(
+                    &session.compiled,
+                    session.conversation.outcome(),
+                    facts,
+                ));
+                if let Some((failure, repairs)) =
+                    self.graph_failure_parts(&session.conversation, facts, options)
+                {
+                    answer.push('\n');
+                    answer.push_str(&failure);
+                    session.repairs = repairs;
+                }
+                answer
+            }
+            Err(error) => format!("放宽无法执行：{}。", error),
+        }
+    }
+
+    fn restore_graph_original(
+        &self,
+        session: &mut GraphSession,
+        facts: &[GraphFact],
+        options: MatchOptions,
+    ) -> String {
+        match session.conversation.apply(
+            GraphCommand::Replace(session.base_pattern.clone()),
+            facts,
+            options,
+        ) {
+            Ok(_) => {
+                session.compiled.pattern = session.base_pattern.clone();
+                session.relaxed = None;
+                session.repairs.clear();
+                let mut answer = String::from("已恢复原条件。\n");
+                answer.push_str(&self.render_graph_question(
+                    &session.compiled,
+                    session.conversation.outcome(),
+                    facts,
+                ));
+                if let Some((failure, repairs)) =
+                    self.graph_failure_parts(&session.conversation, facts, options)
+                {
+                    answer.push('\n');
+                    answer.push_str(&failure);
+                    session.repairs = repairs;
+                }
+                answer
+            }
+            Err(error) => format!("恢复原条件失败：{}。", error),
+        }
     }
 
     fn render_graph_reply(
@@ -18088,6 +18290,57 @@ types = [
         assert!(answer.contains("失败诊断"), "{}", answer);
         assert!(answer.contains("连接冲突"), "{}", answer);
         assert!(answer.contains("最小冲突组"), "{}", answer);
+    }
+
+    #[test]
+    fn graph_question_offers_and_adopts_a_bounded_relaxation() {
+        let reasoner = graph_pattern_reasoner();
+        let first = reasoner
+            .answer("谁既导演过科幻片，又主演过中国人？")
+            .expect("零解问句应给出诊断与放宽候选");
+        assert!(first.contains("可尝试的放宽"), "{}", first);
+        let adopted = reasoner.answer("放宽 1").expect("应能确认第一条放宽");
+        assert!(adopted.contains("已采用放宽"), "{}", adopted);
+        assert!(!adopted.contains("失败诊断"), "{}", adopted);
+        let restored = reasoner
+            .answer("恢复原条件")
+            .expect("应能恢复原条件");
+        assert!(restored.contains("已恢复原条件"), "{}", restored);
+        assert!(restored.contains("失败诊断"), "{}", restored);
+    }
+
+    #[test]
+    fn graph_question_relaxation_survives_followups_and_can_be_withdrawn() {
+        let reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer("谁既导演过科幻片，又主演过中国人？")
+            .expect("零解问句应建立会话");
+        let adopted = reasoner.answer("放宽 1").expect("应能确认放宽");
+        assert!(adopted.contains("已采用放宽"), "{}", adopted);
+        let count = reasoner.answer("一共多少个").expect("放宽后仍可计数");
+        assert!(count.contains("共匹配"), "{}", count);
+        assert!(count.starts_with("（当前为放宽结果"), "{}", count);
+        let withdrawn = reasoner.answer("撤回").expect("应能撤回放宽");
+        // 撤回只回退一步；放宽标签必须随模式变化同步清除。
+        assert!(!withdrawn.contains("当前为放宽结果"), "{}", withdrawn);
+    }
+
+    #[test]
+    fn graph_question_can_withdraw_a_conflicting_refinement() {
+        let reasoner = graph_pattern_reasoner();
+        let first = reasoner
+            .answer("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应成功");
+        assert!(first.contains("张三"), "{}", first);
+        let narrowed = reasoner.answer("只看李四").expect("限定追问应执行");
+        assert!(narrowed.contains("约束冲突"), "{}", narrowed);
+        assert!(narrowed.contains("可尝试的放宽"), "{}", narrowed);
+        let adopted = reasoner.answer("放宽 1").expect("应能撤回冲突约束");
+        assert!(adopted.contains("已采用放宽"), "{}", adopted);
+        assert!(adopted.contains("张三"), "{}", adopted);
+        let restored = reasoner.answer("恢复原条件").expect("应能恢复原条件");
+        assert!(restored.contains("张三"), "{}", restored);
+        assert!(!restored.contains("失败诊断"), "{}", restored);
     }
 
     #[test]
