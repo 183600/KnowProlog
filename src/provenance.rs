@@ -665,6 +665,37 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    /// 从支撑树计算覆盖率：派生事实的来源在支撑树上，而不是事实台账里。
+    pub fn from_supports(facts: &[FactRef], supports: &BTreeMap<String, Support>) -> Coverage {
+        let unique: BTreeSet<&FactRef> = facts.iter().collect();
+        let total = unique.len();
+        let unregistered: Vec<FactRef> = unique
+            .iter()
+            .filter(|fact| {
+                supports
+                    .get(&fact.key())
+                    .map(|support| {
+                        support
+                            .all_sources()
+                            .iter()
+                            .all(|source| !source.is_registered())
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|fact| (*fact).clone())
+            .collect();
+        Coverage {
+            total,
+            registered: total.saturating_sub(unregistered.len()),
+            ratio: if total == 0 {
+                0.0
+            } else {
+                (total - unregistered.len()) as f64 / total as f64
+            },
+            unregistered,
+        }
+    }
+
     pub fn render_zh(&self) -> String {
         let mut line = format!(
             "来源覆盖：{}/{} 条事实已登记（{:.1}%）。",
@@ -1907,6 +1938,27 @@ mod tests {
         assert!(parse_provenance_tsv("a\tb\tc\ttypo\td").is_err());
         assert!(parse_provenance_tsv("a\tb\tc\tunknown\td").is_err());
         assert!(parse_provenance_tsv("a\tb\tc").is_err());
+    }
+
+    #[test]
+    fn support_coverage_counts_derived_rule_sources() {
+        let premise = supported(fact("姚明", "出生年", "1986"), &[source("档案", "1986")]);
+        let derived = Support::derived(
+            fact("姚明", "年龄", "38"),
+            source("规则甲", "甲"),
+            "R1",
+            0.9,
+            vec![premise],
+        );
+        let mut supports = BTreeMap::new();
+        supports.insert(derived.fact.key(), derived);
+        let coverage = Coverage::from_supports(&[fact("姚明", "年龄", "38")], &supports);
+        assert_eq!(coverage.registered, 1);
+        assert!(coverage.unregistered.is_empty());
+
+        drop(supports);
+        let coverage = Coverage::from_supports(&[fact("姚明", "年龄", "38")], &BTreeMap::new());
+        assert_eq!(coverage.registered, 0);
     }
 
     #[test]

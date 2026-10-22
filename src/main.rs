@@ -1516,6 +1516,10 @@ async fn main() {
                     }
                 });
             let supports = provenance::build_supports(&facts, &ledger, &rules, &derived);
+            // 派生事实通常只在命名图里：把它们也纳入已见证冲突的候选结论。
+            facts.extend(supports.values().map(|support| support.fact.clone()));
+            facts.sort();
+            facts.dedup();
             let mut certificates = provenance::detect_witnessed(&facts, &supports, &schema);
             if latent {
                 let clauses: Vec<know_prolog::resolution_engine::Clause> = rules
@@ -1525,7 +1529,7 @@ async fn main() {
                     .collect();
                 certificates.extend(provenance::detect_latent(&clauses, &schema));
             }
-            let coverage = ledger.coverage(&facts);
+            let coverage = provenance::Coverage::from_supports(&facts, &supports);
             let report = ConflictReport::new(certificates, coverage);
             if json {
                 println!("{}", report.to_json());
