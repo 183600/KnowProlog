@@ -4529,8 +4529,9 @@ impl SymbolicReasoner {
                             session.retry(hypothesis);
                         }
                         Some(format!(
-                            "该假设未写入会话事实，澄清问题保留：\n{}",
-                            blocked
+                            "该假设未写入会话事实，澄清问题保留：\n{}\n{}",
+                            blocked,
+                            self.render_clarification_prompt()
                         ))
                     }
                     Ok(added) => {
@@ -4576,8 +4577,10 @@ impl SymbolicReasoner {
                             session.retry(confirmed);
                         }
                         Some(format!(
-                            "✗ 已排除原假设：{}。\n但更正后的假设未写入会话事实，问题保留：\n{}",
-                            rejected_rendered, blocked
+                            "✗ 已排除原假设：{}。\n但更正后的假设未写入会话事实，问题保留：\n{}\n{}",
+                            rejected_rendered,
+                            blocked,
+                            self.render_clarification_prompt()
                         ))
                     }
                     Ok(added) => {
@@ -14345,6 +14348,42 @@ types = [
             !reasoner.session_revision_report().contains("session:"),
             "拒绝的采纳不得生成回执"
         );
+    }
+
+    #[test]
+    fn blocked_clarification_confirmation_reasks_the_same_question() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut registry = PredicateRegistry::new();
+        registry.observe("张三", "年龄", "30", None);
+        assert!(registry.mark_functional("年龄", true));
+        reasoner.configure_laws(&registry);
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "人".to_string(),
+            properties: [("年龄".to_string(), "30".to_string())]
+                .into_iter()
+                .collect(),
+        }]);
+        reasoner.abduction.set_pending(vec![Hypothesis {
+            atom: Atom::rel("年龄", "张三", "31"),
+            goal: Atom::rel("年龄", "张三", "31"),
+            kind: HypothesisKind::MissingFact,
+            confidence: 0.9,
+            reasons: vec!["测试冲突".to_string()],
+            conflicts: Vec::new(),
+            contradicts_known: false,
+        }]);
+        reasoner.start_clarification().expect("应开始澄清");
+        let output = reasoner
+            .answer_clarification("是")
+            .expect("应处理回答");
+        assert!(output.contains("最小冲突核"), "{}", output);
+        assert!(
+            output.contains("是否成立"),
+            "写入被阻止后必须再次展示同一个问题：{}",
+            output
+        );
+        assert!(reasoner.clarification_active(), "澄清会话不能静默推进");
     }
 
     #[test]

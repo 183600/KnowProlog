@@ -399,14 +399,13 @@ impl ClarificationSession {
         };
     }
 
-    /// 把一条尚未写入的假设放回队首：预检被拒绝时保留问题，避免静默丢弃。
+    /// 把一条尚未写入的假设重新设为当前问题：预检被拒绝时保留问题并再次展示，
+    /// 避免会话已推进到下一问、用户却在回答一个从未看到的提问。
     pub fn retry(&mut self, hypothesis: Hypothesis) {
-        if self.current.is_some() {
-            self.queue.insert(0, hypothesis);
-            return;
+        if let Some(next) = self.current.take() {
+            self.queue.insert(0, next);
         }
-        self.queue.insert(0, hypothesis);
-        self.advance();
+        self.current = Some(hypothesis);
     }
 
     /// 回答里是否**肯定地**提到了某个取值（排除「不是X」「并非X」这类否定出现）。
@@ -2356,6 +2355,37 @@ mod tests {
             .hypotheses
             .iter()
             .all(|hypothesis| hypothesis.atom != goal)));
+    }
+
+    #[test]
+    fn retry_keeps_the_rejected_question_current() {
+        let first = hyp("师傅", "张三", "李四", 0.8);
+        let second = hyp("师傅", "张三", "王五", 0.5);
+        let mut session = ClarificationSession::start(&[first.clone(), second.clone()]);
+        // 模拟一次失败写入：会话已经推进到第二问。
+        let reply = session.respond("是");
+        assert!(matches!(reply, ClarificationReply::Confirmed(_)));
+        assert_eq!(
+            session
+                .current()
+                .map(|hypothesis| hypothesis.atom.display()),
+            Some(second.atom.display())
+        );
+
+        session.retry(first.clone());
+        assert_eq!(
+            session.current().map(|hypothesis| hypothesis.atom.clone()),
+            Some(first.atom),
+            "被预检拒绝的问题必须重新成为当前问题"
+        );
+        assert_eq!(
+            session
+                .queue()
+                .first()
+                .map(|hypothesis| hypothesis.atom.clone()),
+            Some(second.atom),
+            "原本的下一问回到队列，不能丢失"
+        );
     }
 
     #[test]
