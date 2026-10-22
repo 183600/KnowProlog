@@ -21,7 +21,7 @@ use crate::contextual_rag::{
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::conversational_graph::{
     ConversationalGraph, GraphCommand, GraphFact, GraphPattern, GraphReply, MatchOptions,
-    PatternOutcome,
+    PatternError, PatternOutcome,
 };
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
@@ -7570,6 +7570,18 @@ impl SymbolicReasoner {
                             session.repairs = repairs;
                         } else {
                             session.repairs.clear();
+                        }
+                        answer
+                    }
+                    Err(PatternError::NoRowsToExplain) => {
+                        let mut answer =
+                            "当前没有匹配结果，无法给出见证子图。".to_string();
+                        if let Some((failure, repairs)) =
+                            self.graph_failure_parts(&session.conversation, &facts, options)
+                        {
+                            answer.push('\n');
+                            answer.push_str(&failure);
+                            session.repairs = repairs;
                         }
                         answer
                     }
@@ -18341,6 +18353,18 @@ types = [
         let restored = reasoner.answer("恢复原条件").expect("应能恢复原条件");
         assert!(restored.contains("张三"), "{}", restored);
         assert!(!restored.contains("失败诊断"), "{}", restored);
+    }
+
+    #[test]
+    fn graph_question_explains_a_zero_result_instead_of_erroring() {
+        let reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer("谁既导演过科幻片，又主演过中国人？")
+            .expect("零解问句应建立会话");
+        let why = reasoner.answer("为什么").expect("零解时也应能回答为什么");
+        assert!(why.contains("无法给出见证子图"), "{}", why);
+        assert!(why.contains("失败诊断"), "{}", why);
+        assert!(why.contains("可尝试的放宽"), "{}", why);
     }
 
     #[test]
