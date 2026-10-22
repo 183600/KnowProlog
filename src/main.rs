@@ -54,7 +54,7 @@ use know_prolog::{
     ontology_reasoning::OntologyProgram,
     ownthink_api::select_candidate_by_context,
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
-    pattern_forge::{self, PatternForge},
+    pattern_forge::{self, ForgeRequest, PatternForge},
     pattern_ir::{self, PatternLibrary},
     perf_ledger::PerfLedger,
     plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
@@ -173,6 +173,31 @@ enum Commands {
         #[arg(long, requires = "lexicon")]
         definitions: Option<String>,
         /// Print the trace/report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forge a token pattern from positive/negative examples and preview the
+    /// expanded IR (offline; does not open the knowledge store)
+    Forge {
+        /// Human-readable rule name
+        #[arg(long)]
+        name: String,
+        /// Query route (query_type) the forged patterns should answer
+        #[arg(long)]
+        route: String,
+        /// Positive example (repeat for same-shape surface variants)
+        #[arg(long = "positive", required = true)]
+        positives: Vec<String>,
+        /// Negative example that must stay excluded (repeatable)
+        #[arg(long = "negative")]
+        negatives: Vec<String>,
+        /// Pattern priority (default 10)
+        #[arg(long, default_value_t = 10)]
+        priority: i32,
+        /// Materialize the candidate as active patterns (preview only)
+        #[arg(long)]
+        activate: bool,
+        /// Print the forged pattern/probes as JSON
         #[arg(long)]
         json: bool,
     },
@@ -807,6 +832,30 @@ async fn main() {
         Some(value) => parse_trace_mode(value),
         None => config.trace_graph.parse_mode(),
     };
+
+    // 模式锻造只读配置与例子：不打开知识存储，适合脚本化预览与回归。
+    if let Some(Commands::Forge {
+        name,
+        route,
+        positives,
+        negatives,
+        priority,
+        activate,
+        json,
+    }) = &cli.command
+    {
+        run_pattern_forge(
+            &config,
+            name,
+            route,
+            positives,
+            negatives,
+            *priority,
+            *activate,
+            *json,
+        );
+        return;
+    }
 
     // 读法追踪只读配置与文本：不打开知识存储，适合在词表/分词变更前后做差分。
     if let Some(Commands::ReadTrace {
@@ -1961,8 +2010,9 @@ async fn main() {
         Some(Commands::ReleaseCheck { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
         Some(Commands::PromptLint { .. }) => {}
-        // 已在打开存储前处理（见 main 顶部早期分派）
+        // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::ReadTrace { .. }) => {}
+        Some(Commands::Forge { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
         // 已在加载默认配置前处理（见 main 顶部早期分派）
@@ -2955,6 +3005,85 @@ async fn run_fuse(
         }
     }
     Ok(())
+}
+
+/// `forge`：离线从正例/反例归纳 token 正则，打印展开与探针结果。
+/// 只读配置与例子，不打开存储、不写台账；`--activate` 仅预览物化条目。
+fn run_pattern_forge(
+    config: &SystemConfig,
+    name: &str,
+    route: &str,
+    positives: &[String],
+    negatives: &[String],
+    priority: i32,
+    activate: bool,
+    json: bool,
+) {
+    let Some(primary) = positives.first() else {
+        eprintln!("锻造至少需要一个 --positive 例子");
+        std::process::exit(2);
+    };
+    let mut request = ForgeRequest::new(name, primary, route).with_priority(priority);
+    for positive in positives.iter().skip(1) {
+        request = request.with_positive(positive.clone());
+    }
+    for negative in negatives {
+        request = request.with_negative(negative.clone());
+    }
+    let mut forge = PatternForge::new();
+    let outcome = match forge.forge(&request, &config.nlp) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            eprintln!("锻造失败：{}", error);
+            std::process::exit(1);
+        }
+    };
+    let activation = if activate {
+        match forge.activate(&outcome.pattern.id) {
+            Ok(activation) => Some(activation),
+            Err(error) => {
+                eprintln!("激活失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let mut outcome = outcome;
+    if let Some(activation) = &activation {
+        outcome.pattern.status = activation.pattern.status;
+    }
+    if json {
+        let payload = serde_json::json!({
+            "created": outcome.created,
+            "pattern": &outcome.pattern,
+            "active": activation.is_some(),
+            "entries": activation.as_ref().map(|activation| &activation.entries),
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => eprintln!("序列化锻造结果失败：{}", error),
+        }
+        return;
+    }
+    println!("{}", outcome.render());
+    if let Some(activation) = activation {
+        println!(
+            "已物化 {} 条无分支模式（预览；未写入存储）：",
+            activation.entries.len()
+        );
+        for entry in &activation.entries {
+            println!(
+                "  - {}（{}）→ {} · 来源 {}",
+                entry.name,
+                entry.render(),
+                entry.query_type,
+                entry.source
+            );
+        }
+    } else {
+        println!("（预览：加 --activate 可查看展开后的路由条目）");
+    }
 }
 
 /// `read-trace`：离线观察一个问句被切成了什么、词性来自哪里、规划器看到了什么。
