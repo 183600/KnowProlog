@@ -19,7 +19,9 @@ use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
 };
 use crate::contextual_reference::{SenseCard, SenseSource};
-use crate::conversational_graph::{GraphFact, MatchOptions, PatternOutcome};
+use crate::conversational_graph::{
+    ConversationalGraph, GraphFact, GraphReply, MatchOptions, PatternOutcome,
+};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
 use crate::derivation::Derivation;
@@ -992,6 +994,12 @@ impl OntologyView for FrameOntology<'_> {
     }
 }
 
+#[derive(Clone)]
+struct GraphSession {
+    compiled: CompiledGraphQuestion,
+    conversation: ConversationalGraph,
+}
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -1036,6 +1044,8 @@ pub struct SymbolicReasoner {
     abduction: AbductionEngine,
     // 话语帧记忆：带洞查询帧 + 挂账（合一式多轮消解，跨会话持久化）
     frames: FrameMemory,
+    // 结构型多轮：当前图谱模式、结果与翻页位置（会话态，不进知识图谱）
+    graph_session: parking_lot::Mutex<Option<GraphSession>>,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
     session_facts: Vec<Atom>,
     // 当前假设世界：临时前提只在世界内参与推理，退出/分叉时整体丢弃
@@ -1121,6 +1131,7 @@ impl Clone for SymbolicReasoner {
             resolver: self.resolver.clone(),
             abduction: self.abduction.clone(),
             frames: self.frames.clone(),
+            graph_session: parking_lot::Mutex::new(self.graph_session.lock().clone()),
             session_facts: self.session_facts.clone(),
             assumption_world: self.assumption_world.clone(),
             session_negative_facts: self.session_negative_facts.clone(),
@@ -1323,6 +1334,7 @@ impl SymbolicReasoner {
             resolver,
             abduction,
             frames: FrameMemory::new(),
+            graph_session: parking_lot::Mutex::new(None),
             session_facts: Vec::new(),
             assumption_world: None,
             session_negative_facts: Vec::new(),
@@ -1408,6 +1420,7 @@ impl SymbolicReasoner {
         self.lessons.clear();
         self.lessons_parsed.clear();
         self.frames = FrameMemory::new();
+        *self.graph_session.lock() = None;
         // 会话事实可能已被索引为证据；分叉/重置时把非图谱来源的条目撤出索引。
         let session_facts = std::mem::take(&mut self.session_facts);
         for atom in &session_facts {
@@ -7469,13 +7482,90 @@ impl SymbolicReasoner {
 
     fn answer_graph_question(&self, question: &str) -> Option<String> {
         let lexicon = self.graph_lexicon();
-        let compiled = lexicon.compile(question)?;
         let facts = self.graph_facts();
-        let outcome = compiled
-            .pattern
-            .evaluate(&facts, MatchOptions::default())
-            .ok()?;
-        Some(self.render_graph_question(&compiled, &outcome, &facts))
+        let options = MatchOptions::default();
+        let mut guard = self.graph_session.lock();
+        if let Some(session) = guard.as_mut() {
+            if let Some(result) = session
+                .conversation
+                .interpret(question, &lexicon, &facts, options)
+            {
+                return Some(match result {
+                    Ok(reply) => self.render_graph_reply(
+                        &session.compiled,
+                        &session.conversation,
+                        &reply,
+                        &facts,
+                    ),
+                    Err(error) => format!("图谱追问无法执行：{}。", error),
+                });
+            }
+        }
+        let compiled = lexicon.compile(question)?;
+        let conversation =
+            ConversationalGraph::new(compiled.pattern.clone(), &facts, options).ok()?;
+        let answer = self.render_graph_question(&compiled, conversation.outcome(), &facts);
+        *guard = Some(GraphSession {
+            compiled,
+            conversation,
+        });
+        Some(answer)
+    }
+
+    fn render_graph_reply(
+        &self,
+        compiled: &CompiledGraphQuestion,
+        conversation: &ConversationalGraph,
+        reply: &GraphReply,
+        facts: &[GraphFact],
+    ) -> String {
+        match reply {
+            GraphReply::Page {
+                page,
+                pages,
+                total,
+                lower_bound,
+                rows,
+            } => {
+                let select = &conversation.pattern().select;
+                let values: Vec<String> = rows
+                    .iter()
+                    .map(|solution| solution.row(select))
+                    .filter(|row| !row.is_empty())
+                    .collect();
+                let mut output = if values.is_empty() {
+                    format!(
+                        "第 {}/{} 页没有更多结果（共 {} 项）。",
+                        page + 1,
+                        pages,
+                        total
+                    )
+                } else {
+                    format!(
+                        "第 {}/{} 页（共 {} 项）：{}。",
+                        page + 1,
+                        pages,
+                        total,
+                        values.join("、")
+                    )
+                };
+                if *lower_bound {
+                    output.push_str("（搜索预算已用尽，结果为下界）");
+                }
+                output
+            }
+            GraphReply::Explanation(text) => text.clone(),
+            GraphReply::Count { count, lower_bound } => {
+                if *lower_bound {
+                    format!("当前至少匹配 {} 项（搜索预算已用尽，结果为下界）。", count)
+                } else {
+                    format!("当前共匹配 {} 项。", count)
+                }
+            }
+            GraphReply::Changed { .. } => {
+                self.render_graph_question(compiled, conversation.outcome(), facts)
+            }
+        }
     }
 
     fn graph_lexicon(&self) -> PatternLexicon {
@@ -17847,5 +17937,37 @@ types = [
             .graph_lexicon()
             .compile("张三的师傅是谁？")
             .is_none());
+    }
+
+    #[test]
+    fn graph_question_supports_structural_followups() {
+        let reasoner = graph_pattern_reasoner();
+        let first = reasoner
+            .answer("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应建立图谱模式会话");
+        assert!(first.contains("张三"), "{}", first);
+        let explanation = reasoner.answer("为什么").expect("追问依据应成功");
+        assert!(explanation.contains("见证子图"), "{}", explanation);
+        assert!(explanation.contains("[E1]"), "{}", explanation);
+        let narrowed = reasoner.answer("只看张三").expect("限定追问应成功");
+        assert!(narrowed.contains("张三"), "{}", narrowed);
+        let relaxed = reasoner.answer("去掉这个条件").expect("放松追问应成功");
+        assert!(relaxed.contains("张三"), "{}", relaxed);
+        let count = reasoner.answer("一共多少个").expect("计数追问应成功");
+        assert!(count.contains("共匹配 1 项"), "{}", count);
+        reasoner.answer("只看张三").expect("再次限定应成功");
+        let withdrawn = reasoner.answer("撤回").expect("撤回应成功");
+        assert!(withdrawn.contains("张三"), "{}", withdrawn);
+    }
+
+    #[test]
+    fn graph_question_session_is_cleared_on_fork() {
+        let reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应建立图谱模式会话");
+        let fork = reasoner.fork_session();
+        assert!(fork.graph_session.lock().is_none());
+        assert!(fork.answer("为什么").is_none());
     }
 }
