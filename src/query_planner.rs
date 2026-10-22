@@ -579,6 +579,9 @@ impl QueryPlanner {
             .strip_prefix("除了")
             .or_else(|| q.strip_prefix("除"))?
             .trim_start_matches(['，', ',', '、', ' ']);
+        if after.starts_with('非') {
+            return None;
+        }
         let (excluded_text, inner) = ["还有哪些人", "还有哪个人", "还有哪些", "还有谁", "还有"]
             .iter()
             .find_map(|marker| {
