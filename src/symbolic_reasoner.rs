@@ -43,7 +43,9 @@ use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::query_rewrite::{self, RelationLexicon};
-use crate::reading::{Reading, RepairKind, Residual, ResidualKind, ResidualSeverity, ResidualStage, TextSpan};
+use crate::reading::{
+    Reading, RepairKind, Residual, ResidualKind, ResidualSeverity, ResidualStage, TextSpan,
+};
 use crate::resolution_engine::{
     render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
@@ -1287,12 +1289,7 @@ impl SymbolicReasoner {
         self.read_traces.snapshot()
     }
 
-    fn enrich_trace_plan_terms(
-        &self,
-        trace: &mut LexicalTrace,
-        plan: &QueryPlan,
-        question: &str,
-    ) {
+    fn enrich_trace_plan_terms(&self, trace: &mut LexicalTrace, plan: &QueryPlan, question: &str) {
         let (entities, predicates) = lexical_trace::plan_terms(plan);
         for entity in entities {
             let resolution = self.aligner.resolve_candidates(&entity, 3);
@@ -1855,10 +1852,7 @@ impl SymbolicReasoner {
             let why = closure
                 .why_relation(&subject, &predicate, &object)
                 .unwrap_or("直接声明");
-            evidence.push(format!(
-                "{} —{}→ {}（{}）",
-                subject, predicate, object, why
-            ));
+            evidence.push(format!("{} —{}→ {}（{}）", subject, predicate, object, why));
         }
         if evidence.is_empty() {
             evidence.push(format!("图谱属性记录：{}的{}", entity, attribute));
@@ -1881,15 +1875,13 @@ impl SymbolicReasoner {
                     if !compatible {
                         continue;
                     }
-                    let most_specific = !known_types.iter().any(|other| {
-                        other != actual && closure.is_subclass(other, actual)
-                    });
+                    let most_specific = !known_types
+                        .iter()
+                        .any(|other| other != actual && closure.is_subclass(other, actual));
                     if !most_specific {
                         continue;
                     }
-                    let why = closure
-                        .why_instance(value, actual)
-                        .unwrap_or("类型继承");
+                    let why = closure.why_instance(value, actual).unwrap_or("类型继承");
                     type_evidence.push(format!("{} 属于 {}（{}）", value, actual, why));
                 }
             }
@@ -1946,12 +1938,9 @@ impl SymbolicReasoner {
         let mut answer_values = Vec::new();
         let mut evidence = Vec::new();
         if let (Some(entity), Some(attribute)) = (entity.as_deref(), recipe.attribute.as_deref()) {
-            if let Some(lookup) = self.recipe_lookup(
-                entity,
-                attribute,
-                recipe.direction,
-                &recipe.answer_types,
-            ) {
+            if let Some(lookup) =
+                self.recipe_lookup(entity, attribute, recipe.direction, &recipe.answer_types)
+            {
                 if !lookup.values.is_empty() {
                     answer_values = lookup.values.clone();
                     answer = Some(lookup.values.join("、"));
@@ -2169,8 +2158,7 @@ impl SymbolicReasoner {
     pub fn belief_rule_preview(&self, sentence_raw: &str) -> String {
         let sentence = sentence_raw.trim();
         if sentence.is_empty() {
-            return "请给出中文规则，例如：规则预演：如果X的师傅是Y，那么X的老师是Y"
-                .to_string();
+            return "请给出中文规则，例如：规则预演：如果X的师傅是Y，那么X的老师是Y".to_string();
         }
         let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
         let clauses: Vec<Clause> = outcome
@@ -4279,10 +4267,7 @@ impl SymbolicReasoner {
                 } else {
                     Atom::rel(&slot, &subject, &object)
                 };
-                (
-                    format!("{} {} {}", subject, predicate, object),
-                    vec![goal],
-                )
+                (format!("{} {} {}", subject, predicate, object), vec![goal])
             }
             _ => return None,
         };
@@ -4727,9 +4712,9 @@ impl SymbolicReasoner {
 
     /// 打开一个补全回合：收集链接预测候选，建立本批范围。
     pub fn completion_open(&mut self, entity_raw: &str) -> String {
-        let entity = self.resolve_known_entity(entity_raw).unwrap_or_else(|| {
-            self.aligner.canonical_form(entity_raw.trim())
-        });
+        let entity = self
+            .resolve_known_entity(entity_raw)
+            .unwrap_or_else(|| self.aligner.canonical_form(entity_raw.trim()));
         if entity.is_empty() {
             return "请提供要补全的实体，例如：补全回合：张三".to_string();
         }
@@ -4740,21 +4725,19 @@ impl SymbolicReasoner {
             );
         }
         let limit = self.config.max_predictions.saturating_mul(3).clamp(6, 24);
-        let predictions = self
-            .predictor
-            .predict_for_entity(&entity, None, limit);
+        let predictions = self.predictor.predict_for_entity(&entity, None, limit);
         let scope = self.completion_batch_scope(&entity);
         self.completion.open_episode(&entity, None);
         self.completion.set_batch_scope(scope);
         for prediction in &predictions {
             let rule = self.predictor.rules().get(prediction.rule_index);
             let explanation = self.predictor.explain(prediction);
-            self.completion.add_prediction(prediction, rule, explanation);
+            self.completion
+                .add_prediction(prediction, rule, explanation);
         }
         if predictions.is_empty() {
-            self.completion.note(
-                "当前没有满足阈值的链接预测候选：可导入更多同类实体或降低推理阈值。",
-            );
+            self.completion
+                .note("当前没有满足阈值的链接预测候选：可导入更多同类实体或降低推理阈值。");
         }
         self.completion.render_episode()
     }
@@ -4780,17 +4763,12 @@ impl SymbolicReasoner {
         });
         let mut output = format!(
             "已确认补全：{}({}, {})。\n",
-            outcome.candidate.predicate,
-            outcome.candidate.subject,
-            outcome.candidate.object
+            outcome.candidate.predicate, outcome.candidate.subject, outcome.candidate.object
         );
         if outcome.learned {
             output.push_str(&format!(
                 "  已归纳候选规则（作用域：{}），本批新补全 {} 条{}。\n",
-                outcome
-                    .rule_scope
-                    .map(RuleScope::label)
-                    .unwrap_or("本批"),
+                outcome.rule_scope.map(RuleScope::label).unwrap_or("本批"),
                 outcome.new_candidates,
                 if outcome.closure_truncated {
                     "（达到上限，未补全部分不等于不存在）"
@@ -4814,9 +4792,7 @@ impl SymbolicReasoner {
         };
         let mut output = format!(
             "已驳回补全：{}({}, {})。\n",
-            outcome.candidate.predicate,
-            outcome.candidate.subject,
-            outcome.candidate.object
+            outcome.candidate.predicate, outcome.candidate.subject, outcome.candidate.object
         );
         if let Some(status) = outcome.rule_status {
             output.push_str(&format!("  相关规则状态：{}。\n", status.label()));
@@ -6818,7 +6794,12 @@ impl SymbolicReasoner {
         }
         let values: Vec<String> = hits.iter().map(|hit| hit.value.clone()).collect();
         let mut output = if inverted {
-            format!("根据知识图谱：「{}」的「{}」是：{}。", entity, surface, values.join("、"))
+            format!(
+                "根据知识图谱：「{}」的「{}」是：{}。",
+                entity,
+                surface,
+                values.join("、")
+            )
         } else if values.len() == 1 {
             format!("根据知识图谱：{}{}{}。", entity, surface, values[0])
         } else {
@@ -7092,8 +7073,7 @@ impl SymbolicReasoner {
     /// 句法重写回执：展示「哪种句法外壳被压成哪个逻辑计划」。
     /// 只读；未命中或词表校验失败时返回 None。
     pub fn query_rewrite_receipt(&self, question: &str) -> Option<String> {
-        query_rewrite::rewrite(question, &self.relation_lexicon())
-            .map(|rewrite| rewrite.receipt())
+        query_rewrite::rewrite(question, &self.relation_lexicon()).map(|rewrite| rewrite.receipt())
     }
 
     /// 为问句重建有界推导视图（与回答共用同一份事实、规则与归结搜索）。
@@ -8355,12 +8335,7 @@ impl SymbolicReasoner {
     /// 供对话层的确认/更正回执桥接到推理层：用户确认的取值不仅覆盖直接
     /// 属性回答，还会与图谱事实同权参与多跳链、证明与会话快照恢复。
     /// 返回 `true` 表示本次确实新增了会话事实（重复调用幂等）。
-    pub fn adopt_session_triple(
-        &mut self,
-        subject: &str,
-        predicate: &str,
-        object: &str,
-    ) -> bool {
+    pub fn adopt_session_triple(&mut self, subject: &str, predicate: &str, object: &str) -> bool {
         let subject = subject.trim();
         let predicate = predicate.trim();
         let object = object.trim();
@@ -10128,7 +10103,11 @@ mod tests {
         restored.observe_facts(&master_facts());
         restored.restore_dialogue_snapshot(&snapshot).unwrap();
         let proof = restored.resolution_proof_report("王五的师傅是赵六");
-        assert!(!proof.contains("未得证"), "跨快照后会话事实应继续参与证明：{}", proof);
+        assert!(
+            !proof.contains("未得证"),
+            "跨快照后会话事实应继续参与证明：{}",
+            proof
+        );
     }
 
     #[test]
@@ -11246,9 +11225,7 @@ mod tests {
     /// 配方执行单一入口：CLI 与 HTTP 共用；角色指称接续焦点，依据随模板接地。
     #[test]
     fn answer_plugin_recipe_resolves_role_reference_and_grounds_evidence() {
-        use crate::plugin::{
-            PluginManifest, PluginRegistry, PluginRuntime, PluginSettings,
-        };
+        use crate::plugin::{PluginManifest, PluginRegistry, PluginRuntime, PluginSettings};
 
         let manifest: PluginManifest = toml::from_str(
             r#"
@@ -11348,7 +11325,10 @@ template = "「{entity}」的导演是{answer}。依据：{evidence}"
             "正向问句的焦点应转到答案，供「这位导演」继续追问"
         );
         assert!(
-            reply.plan.iter().any(|plan| plan.contains("film.works_by_director")),
+            reply
+                .plan
+                .iter()
+                .any(|plan| plan.contains("film.works_by_director")),
             "{:?}",
             reply.plan
         );
@@ -11397,7 +11377,10 @@ template = "「{entity}」的导演是{answer}。依据：{evidence}"
             .expect("别名谓词与别名类型都应被规范词面命中");
         assert_eq!(inverse.values, vec!["阿凡达".to_string()]);
         assert!(
-            inverse.evidence.iter().any(|line| line.contains("director ⊑ 导演")),
+            inverse
+                .evidence
+                .iter()
+                .any(|line| line.contains("director ⊑ 导演")),
             "依据应说明别名归一：{:?}",
             inverse.evidence
         );
@@ -11718,7 +11701,9 @@ types = [
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&facts);
 
-        let age = reasoner.answer("张三的年龄是多少").expect("中文标签应命中 age");
+        let age = reasoner
+            .answer("张三的年龄是多少")
+            .expect("中文标签应命中 age");
         assert!(age.contains("25"), "{}", age);
         let height = reasoner
             .answer("张三的身高是多少")
@@ -14109,29 +14094,19 @@ types = [
         assert!(passive_subject.contains("李四"), "{}", passive_subject);
         let passive_yes = reasoner.answer("张三被李四认识吗").expect("被字句是非问");
         assert!(passive_yes.contains("是的"), "{}", passive_yes);
-        let existence = reasoner
-            .answer("张三有没有认识王五")
-            .expect("有没有是非问");
+        let existence = reasoner.answer("张三有没有认识王五").expect("有没有是非问");
         assert!(existence.contains("是的"), "{}", existence);
-        let relative = reasoner
-            .answer("认识张三的是谁")
-            .expect("关系从句问施事");
+        let relative = reasoner.answer("认识张三的是谁").expect("关系从句问施事");
         assert!(relative.contains("李四"), "{}", relative);
         let passive_relative = reasoner
             .answer("被张三认识的是谁")
             .expect("被字关系从句问受事");
         assert!(passive_relative.contains("王五"), "{}", passive_relative);
-        let negated_false = reasoner
-            .answer("张三不认识王五吗")
-            .expect("否定是非问");
+        let negated_false = reasoner.answer("张三不认识王五吗").expect("否定是非问");
         assert!(negated_false.starts_with("不是"), "{}", negated_false);
-        let negated_true = reasoner
-            .answer("张三不认识李四吗")
-            .expect("否定是非问");
+        let negated_true = reasoner.answer("张三不认识李四吗").expect("否定是非问");
         assert!(negated_true.starts_with("是的"), "{}", negated_true);
-        let a_not_a = reasoner
-            .answer("张三认不认识王五")
-            .expect("A 不 A 是非问");
+        let a_not_a = reasoner.answer("张三认不认识王五").expect("A 不 A 是非问");
         assert!(a_not_a.starts_with("是的"), "{}", a_not_a);
         let passive_negated = reasoner
             .answer("张三没有被李四认识吗")
@@ -14231,9 +14206,7 @@ types = [
             .expect("关系从句问主语");
         assert!(relative_subject.contains("李四"), "{}", relative_subject);
 
-        let count = reasoner
-            .answer("张三教过多少个学生")
-            .expect("关系计数问句");
+        let count = reasoner.answer("张三教过多少个学生").expect("关系计数问句");
         assert!(count.contains("共有 2 个"), "{}", count);
         assert!(count.contains("李四"), "{}", count);
         assert!(count.contains("王五"), "{}", count);
@@ -14252,7 +14225,11 @@ types = [
             .answer("除了张三，还有谁认识李四")
             .expect("集合差问主语");
         assert!(except_subject.contains("王五"), "{}", except_subject);
-        assert!(except_subject.contains("已排除：张三"), "{}", except_subject);
+        assert!(
+            except_subject.contains("已排除：张三"),
+            "{}",
+            except_subject
+        );
 
         let receipt = reasoner
             .query_rewrite_receipt("张三教过的学生是谁")
@@ -14261,7 +14238,11 @@ types = [
         let except_receipt = reasoner
             .query_rewrite_receipt("除了李四，张三还认识谁")
             .expect("集合差回执");
-        assert!(except_receipt.contains("except-wh-object"), "{}", except_receipt);
+        assert!(
+            except_receipt.contains("except-wh-object"),
+            "{}",
+            except_receipt
+        );
     }
 
     fn trace_nlp_config() -> NlpConfig {
@@ -14365,7 +14346,10 @@ types = [
             .find(|residual| residual.kind == ResidualKind::Ellipsis)
             .expect("省略残差");
         assert!(
-            residual.candidates.iter().any(|candidate| candidate == "师傅"),
+            residual
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "师傅"),
             "上一轮谓词应成为候选：{:?}",
             residual.candidates
         );
@@ -14377,7 +14361,10 @@ types = [
             .find(|residual| residual.kind == ResidualKind::MissingEntity)
             .expect("缺实体残差");
         assert!(
-            residual.candidates.iter().any(|candidate| candidate == "张三"),
+            residual
+                .candidates
+                .iter()
+                .any(|candidate| candidate == "张三"),
             "当前焦点应成为候选：{:?}",
             residual.candidates
         );
@@ -14591,10 +14578,7 @@ types = [
         );
 
         let snapshot = reasoner.dialogue_snapshot();
-        assert!(
-            snapshot.completion.is_some(),
-            "非空补全台账应进入会话快照"
-        );
+        assert!(snapshot.completion.is_some(), "非空补全台账应进入会话快照");
         let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
         restored
             .restore_dialogue_snapshot(&snapshot)

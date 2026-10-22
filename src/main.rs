@@ -3507,6 +3507,10 @@ async fn run_interactive_mode(
                 chronicle.set_kb_revision(kb_revision);
             }
         }
+        // 对话层的确认/更正必须成为推理层前提：刷新图谱后再同步，避免被重建覆盖。
+        if dialogue_enabled {
+            sync_recovery_confirmed_facts(&dialogue_manager, &mut symbolic_reasoner);
+        }
 
         // 编年史写前日志：用户输入先落盘再处理；记录当轮开始时的焦点与对话水位，
         // 重启后据此回放/重建上下文（崩溃语义：最多丢进行中的一轮）。
@@ -3649,8 +3653,7 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：模式联想：<句子>，例如「模式联想：德国的首都在哪里」。");
             } else {
-                let context =
-                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
+                let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 match suggest_case_for_text(
                     text,
                     &config,
@@ -3691,8 +3694,7 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：确认联想：<句子>，例如「确认联想：德国的首都在哪里」。");
             } else {
-                let context =
-                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
+                let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 match suggest_case_for_text(
                     text,
                     &config,
@@ -3751,10 +3753,7 @@ async fn run_interactive_mode(
                 .sync_pattern_episodes(pattern_episodes.entries())
                 .await
             {
-                Ok(count) => println!(
-                    "已删除 {} 条模式经验（经验落图：{} 条）。",
-                    removed, count
-                ),
+                Ok(count) => println!("已删除 {} 条模式经验（经验落图：{} 条）。", removed, count),
                 Err(error) => println!("删除 {} 条模式经验，但经验落图失败：{}", removed, error),
             }
             println!();
@@ -3838,8 +3837,7 @@ async fn run_interactive_mode(
             } else {
                 let tagged = preprocess(text, &config.nlp);
                 let normalized = normalize_words(tagged, &synonyms);
-                let context =
-                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
+                let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 let report = pattern_library.rank_with_context(&normalized, &context);
                 println!("{}", pattern_ir::render_match_report(text, &report));
                 let scan = pattern_library.scan_route_with_context(&normalized, &context);
@@ -5692,9 +5690,10 @@ async fn run_interactive_mode(
         }
 
         // 补全回合：打开一次可确认、可归纳、可批量闭包的学习回合
-        if let Some(entity) =
-            strip_any_prefix(input, &["补全回合：", "补全回合:", "学习回合：", "学习回合:"])
-        {
+        if let Some(entity) = strip_any_prefix(
+            input,
+            &["补全回合：", "补全回合:", "学习回合：", "学习回合:"],
+        ) {
             let entity = entity.trim();
             if entity.is_empty() {
                 println!("请提供要补全的实体，例如：补全回合：张三");
@@ -5706,9 +5705,10 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(selector) =
-            strip_any_prefix(input, &["确认补全：", "确认补全:", "采纳补全：", "采纳补全:"])
-        {
+        if let Some(selector) = strip_any_prefix(
+            input,
+            &["确认补全：", "确认补全:", "采纳补全：", "采纳补全:"],
+        ) {
             let selector = selector.trim();
             if selector.is_empty() {
                 println!("请给出候选序号、候选 id 或 主体|谓词|客体，例如：确认补全：1");
@@ -5720,9 +5720,10 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if let Some(selector) =
-            strip_any_prefix(input, &["否定补全：", "否定补全:", "驳回补全：", "驳回补全:"])
-        {
+        if let Some(selector) = strip_any_prefix(
+            input,
+            &["否定补全：", "否定补全:", "驳回补全：", "驳回补全:"],
+        ) {
             let selector = selector.trim();
             if selector.is_empty() {
                 println!("请给出候选序号、候选 id 或 主体|谓词|客体，例如：否定补全：2");
@@ -5769,8 +5770,7 @@ async fn run_interactive_mode(
                     refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                     println!(
                         "{}",
-                        symbolic_reasoner
-                            .completion_promote(rule_id.trim(), scope.trim())
+                        symbolic_reasoner.completion_promote(rule_id.trim(), scope.trim())
                     );
                 }
                 _ => println!(
@@ -7397,9 +7397,7 @@ async fn run_interactive_mode(
                         }
                         pattern_ir::CaseReply::Reject => {
                             if pattern_episodes.reject_case(&suggestion) {
-                                println!(
-                                    "好的，已记下这次否定；该骨架不会再被主动推荐。"
-                                );
+                                println!("好的，已记下这次否定；该骨架不会再被主动推荐。");
                             } else {
                                 println!("好的，已关闭这次模式联想。");
                             }
@@ -7660,8 +7658,7 @@ async fn run_interactive_mode(
                 };
                 let normalized_words = normalize_words(tagged_words, &synonyms);
                 // 路由上下文：让带守卫的模式只在相应对话状态下参与匹配。
-                let route_context =
-                    dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
+                let route_context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
 
                 // 使用NLU进行语义理解
                 if config.nlp.enable_nlu.unwrap_or(false) {
@@ -8075,15 +8072,13 @@ async fn run_interactive_mode(
                     }
                 }
 
-                if let Some((query_type, entities, pattern_note)) =
-                    route_query_with_patterns(
-                        &pattern_library,
-                        input,
-                        &normalized_words,
-                        &mut pattern_episodes,
-                        &route_context,
-                    )
-                {
+                if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(
+                    &pattern_library,
+                    input,
+                    &normalized_words,
+                    &mut pattern_episodes,
+                    &route_context,
+                ) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
                         println!("命中模式: {}", note);
@@ -8435,6 +8430,22 @@ async fn load_graph_snapshot(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     oxigraph_manager.load_graph_snapshot().await
+}
+
+/// 把对话层已确认的会话事实桥接为推理前提（幂等；永不写知识图谱）。
+///
+/// 确认/更正发生在对话管理器里，推理器需要同一组事实才能让多跳链、
+/// 证明与会话快照看到它们；返回本轮新增条数。
+fn sync_recovery_confirmed_facts(
+    dialogue_manager: &DialogueManager,
+    reasoner: &mut SymbolicReasoner,
+) -> usize {
+    dialogue_manager
+        .recovery_state()
+        .confirmed
+        .iter()
+        .filter(|fact| reasoner.adopt_session_triple(&fact.entity, &fact.attribute, &fact.value))
+        .count()
 }
 
 async fn refresh_symbolic_reasoner(
@@ -10739,6 +10750,43 @@ mod session_tests {
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
+    }
+
+    #[test]
+    fn recovery_confirmation_bridges_into_reasoner_premises() {
+        use know_prolog::recovery::{ConfirmationSource, RecoveryState};
+
+        let mut state = RecoveryState::new();
+        state.record_confirmed(
+            "王五",
+            "师傅",
+            "赵六",
+            "receipt-1",
+            ConfirmationSource::Provisional,
+        );
+        let mut manager = DialogueManager::new();
+        let mut snapshot = manager.snapshot();
+        snapshot.recovery = state;
+        manager.restore(&snapshot);
+
+        let mut reasoner =
+            SymbolicReasoner::new(know_prolog::ReasoningConfig::default(), HashMap::new());
+        assert_eq!(
+            sync_recovery_confirmed_facts(&manager, &mut reasoner),
+            1,
+            "首次同步应写入一条会话事实"
+        );
+        assert!(reasoner
+            .session_facts()
+            .iter()
+            .any(|atom| atom.display() == "师傅(王五, 赵六)"));
+        assert_eq!(
+            sync_recovery_confirmed_facts(&manager, &mut reasoner),
+            0,
+            "重复同步必须幂等"
+        );
+        let proof = reasoner.resolution_proof_report("王五的师傅是赵六");
+        assert!(!proof.contains("未得证"), "{}", proof);
     }
 
     /// 统一模式库命令：库视图 / 匹配解释 / 教学模式 / 忘模式都要被识别为命令。

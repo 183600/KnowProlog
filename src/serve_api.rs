@@ -521,6 +521,18 @@ impl Session {
         Some((reply.text, plan, reply.kind.to_string()))
     }
 
+    /// 把对话层的确认/更正同步为推理前提（幂等；不写知识图谱）。
+    fn sync_recovery_confirmed_facts(&mut self) -> usize {
+        let facts = self.manager.recovery_state().confirmed.clone();
+        facts
+            .iter()
+            .filter(|fact| {
+                self.reasoner
+                    .adopt_session_triple(&fact.entity, &fact.attribute, &fact.value)
+            })
+            .count()
+    }
+
     fn checkpoint(&self) -> SessionCheckpoint {
         SessionCheckpoint {
             turns: self.turns,
@@ -705,6 +717,8 @@ impl Session {
         }
         self.history.push(raw_input.clone());
         self.manager.clear_last_recovery();
+        // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
+        self.sync_recovery_confirmed_facts();
 
         // 插件改写预通道：词表/本体归一只影响管线输入，原始措辞仍用于接地引用。
         let plugin_outcome: Option<PluginOutcome> = self
@@ -759,35 +773,35 @@ impl Session {
                     None,
                 )
             } else if let Some((text, plan)) = self
-            .plugin
-            .as_ref()
-            .and_then(|runtime| runtime.lock().policy_reply(&input))
-        {
-            let text = self
                 .plugin
                 .as_ref()
-                .map(|runtime| runtime.lock().style_wrap(&text))
-                .unwrap_or(text);
-            (
-                "answered".to_string(),
-                "plugin".to_string(),
-                Some("policy".to_string()),
-                vec![plan],
-                text,
-                None,
-            )
-        } else {
-            // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
-            self.manager.note_deferred(&input, &self.reasoner);
-            (
-                "deferred".to_string(),
-                "none".to_string(),
-                None,
-                Vec::new(),
-                String::new(),
-                None,
-            )
-        };
+                .and_then(|runtime| runtime.lock().policy_reply(&input))
+            {
+                let text = self
+                    .plugin
+                    .as_ref()
+                    .map(|runtime| runtime.lock().style_wrap(&text))
+                    .unwrap_or(text);
+                (
+                    "answered".to_string(),
+                    "plugin".to_string(),
+                    Some("policy".to_string()),
+                    vec![plan],
+                    text,
+                    None,
+                )
+            } else {
+                // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
+                self.manager.note_deferred(&input, &self.reasoner);
+                (
+                    "deferred".to_string(),
+                    "none".to_string(),
+                    None,
+                    Vec::new(),
+                    String::new(),
+                    None,
+                )
+            };
         control.enter(TurnPhase::Generate)?;
         if !reply.is_empty() && self.history.len() < HISTORY_LIMIT {
             self.history.push(reply.clone());
@@ -1321,11 +1335,7 @@ impl ApiState {
     /// 全部进入**同一个**暖基座推理器，之后分叉的每个会话同源携带。
     /// 与 `configure_ontology` 一样是单调、幂等的启动期操作。
     pub fn configure_plugin_runtime(&self, runtime: &PluginRuntime) -> PluginOntologyReceipt {
-        let sync = self
-            .warm
-            .reasoner
-            .lock()
-            .apply_plugin_runtime(runtime);
+        let sync = self.warm.reasoner.lock().apply_plugin_runtime(runtime);
         PluginOntologyReceipt {
             lessons: sync.lessons,
             aliases: sync.aliases,
@@ -1540,8 +1550,8 @@ impl ApiState {
                             if let Some(policy) = policy {
                                 session.policy = policy;
                             }
-                            let response = session
-                                .run_turn_with_cancel_and_progress(&input, cancel, progress);
+                            let response =
+                                session.run_turn_with_cancel_and_progress(&input, cancel, progress);
                             let _ = reply.send(response);
                         }
                         SessionCommand::Resume { cancel, reply } => {
@@ -1822,10 +1832,7 @@ impl ApiState {
     }
 
     /// 显式放弃最新未完成轮次；返回被放弃的轮次（没有则 `None`）。
-    async fn discard_open_turn(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<OpenTurn>, SessionError> {
+    async fn discard_open_turn(&self, session_id: &str) -> Result<Option<OpenTurn>, SessionError> {
         let tx = self.session_tx(session_id).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SessionCommand::DiscardOpenTurn { reply: reply_tx })
@@ -4088,8 +4095,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
 
     #[tokio::test]
     async fn sse_deadline_done_event_carries_fault_and_open_turn() {
-        let (addr, _server) =
-            start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
+        let (addr, _server) = start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
         let session_id = create_session(addr).await;
         let (status, _, body) = raw_request(
             addr,
@@ -4923,7 +4929,10 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let response = session.run_turn_checked("姚明的身高是多少", &mut control, false, 1);
         assert_eq!(response.status, "deadline", "{}", response.reply);
         assert!(response.fault.is_some());
-        let open = response.open_turn.as_ref().expect("超时轮必须留下未完成记忆");
+        let open = response
+            .open_turn
+            .as_ref()
+            .expect("超时轮必须留下未完成记忆");
         assert_eq!(open.input, "姚明的身高是多少");
         assert_eq!(open.attempts, 1);
         assert!(response.resumable);
@@ -5024,8 +5033,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
 
     #[tokio::test]
     async fn discard_open_turn_route_clears_resume_state() {
-        let (addr, _server) =
-            start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
+        let (addr, _server) = start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
         let session_id = create_session(addr).await;
         let turn = take_turn_body(addr, &session_id, "姚明的身高是多少").await;
         assert_eq!(turn["status"], "deadline", "{}", turn);
@@ -5047,14 +5055,8 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             body
         );
 
-        let (status, _, body) = raw_request(
-            addr,
-            "GET",
-            &format!("/sessions/{}", session_id),
-            &[],
-            "",
-        )
-        .await;
+        let (status, _, body) =
+            raw_request(addr, "GET", &format!("/sessions/{}", session_id), &[], "").await;
         assert_eq!(status, 200, "{}", body);
         let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(snapshot["open_turn"].is_null(), "{}", body);
@@ -5073,8 +5075,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
 
     #[tokio::test]
     async fn http_deadline_is_resumable_until_attempts_exhausted() {
-        let (addr, _server) =
-            start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
+        let (addr, _server) = start_server_with_budget(1, TurnBudget::enforced(Duration::ZERO));
         let session_id = create_session(addr).await;
         let turn = take_turn_body(addr, &session_id, "姚明的身高是多少").await;
         assert_eq!(turn["status"], "deadline", "{}", turn);
@@ -5082,14 +5083,8 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(turn["open_turn"]["input"], "姚明的身高是多少", "{}", turn);
         assert_eq!(turn["open_turn"]["attempts"], 1, "{}", turn);
 
-        let (status, _, body) = raw_request(
-            addr,
-            "GET",
-            &format!("/sessions/{}", session_id),
-            &[],
-            "",
-        )
-        .await;
+        let (status, _, body) =
+            raw_request(addr, "GET", &format!("/sessions/{}", session_id), &[], "").await;
         assert_eq!(status, 200, "{}", body);
         let snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(snapshot["open_turn"]["attempts"], 1, "{}", body);
