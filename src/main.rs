@@ -466,6 +466,11 @@ enum Commands {
         /// no instance yet); off by default to avoid O(R²) noise
         #[arg(long)]
         latent: bool,
+        /// Include assertions from fusion source namespaces (they are
+        /// normally isolated from the default graph); sources become
+        /// per-namespace identities instead of "未登记"
+        #[arg(long)]
+        namespaces: bool,
         /// Maximum certificates printed in text mode (0 = all)
         #[arg(long, default_value_t = 40)]
         limit: usize,
@@ -1389,6 +1394,7 @@ async fn main() {
         Some(Commands::Conflicts {
             provenance,
             latent,
+            namespaces,
             limit,
             json,
         }) => {
@@ -1399,7 +1405,7 @@ async fn main() {
                 config.reasoning.require_predicate_admission,
             );
             oxigraph_manager.configure_type_system(&config.type_system);
-            let facts = match oxigraph_manager.load_fact_refs().await {
+            let mut facts = match oxigraph_manager.load_fact_refs().await {
                 Ok(facts) => facts,
                 Err(error) => {
                     eprintln!("读取知识库失败: {}", error);
@@ -1416,14 +1422,41 @@ async fn main() {
             }
 
             let mut ledger = ProvenanceLedger::new();
+            // 跨会话导入日志：给文本导入的事实补上「第几笔 + 内容摘要」身份。
+            let journal_path = format!("{}/import_journal.json", store_path);
+            if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
+                ledger.seed_from_import_journal(&journal);
+            }
+            if namespaces {
+                match oxigraph_manager.load_fusion_ledger().await {
+                    Ok(fusion) => {
+                        ledger.seed_from_fusion_ledger(&fusion);
+                        for assertion in &fusion.assertions {
+                            facts.push(provenance::FactRef::new(
+                                &assertion.subject,
+                                &assertion.predicate,
+                                &assertion.object,
+                            ));
+                        }
+                        facts.sort();
+                        facts.dedup();
+                        for fact in &facts {
+                            if schema.type_predicates.contains(&fact.predicate) {
+                                schema.observe_type(&types, &fact.value);
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!("读取融合账本失败：{}", error),
+                }
+            }
             if let Some(path) = provenance.as_deref() {
                 match ProvenanceLedger::load(path) {
-                    ProvenanceLoad::Loaded(loaded) => ledger = loaded,
+                    ProvenanceLoad::Loaded(loaded) => ledger.merge(&loaded),
                     ProvenanceLoad::Missing => {
-                        eprintln!("来源台账不存在：{}（按未登记来源报告）", path)
+                        eprintln!("来源台账不存在：{}（按已回填来源报告）", path)
                     }
                     ProvenanceLoad::Damaged(error) => {
-                        eprintln!("来源台账损坏：{}（按未登记来源报告）", error)
+                        eprintln!("来源台账损坏：{}（按已回填来源报告）", error)
                     }
                 }
             }

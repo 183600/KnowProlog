@@ -30,6 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::context_image::{canonical_json, fnv1a_hex, ContextImage};
 use crate::graph_ledger::{DerivedLedger, LedgerAtom, RuleLedger};
+use crate::import_journal::ImportJournal;
+use crate::knowledge_fusion::FusionLedger;
+use crate::predicate_registry::ImportAction;
 use crate::predicate_registry::PredicateRegistry;
 use crate::resolution_engine::{unify_atoms, Atom, Clause, Substitution, Term};
 use crate::type_system::TypeSystem;
@@ -512,6 +515,75 @@ impl ProvenanceLedger {
         }
     }
 
+    /// 从跨会话导入日志回填事实级来源。
+    ///
+    /// 日志是**有界**的（默认最近 32 笔），所以覆盖率必须如实报：更早的导入
+    /// 无从回溯，不能默认 100%。每笔导入的身份 = 序号 + 回执内容摘要；同一
+    /// 事实被多笔导入写入时保留多个来源（join 语义）。
+    pub fn seed_from_import_journal(&mut self, journal: &ImportJournal) -> usize {
+        let mut recorded = 0usize;
+        for (index, receipt) in journal.entries().iter().enumerate() {
+            let content = serde_json::to_string(receipt).unwrap_or_default();
+            let source = SourceId::new(
+                SourceKind::Import,
+                &format!("导入日志#{}", index + 1),
+                &content,
+            );
+            for action in &receipt.actions {
+                let fact = match action {
+                    ImportAction::Named {
+                        subject,
+                        predicate,
+                        object,
+                    } => FactRef::new(
+                        &local_from_iri(subject),
+                        &predicate_from_iri(predicate),
+                        &local_from_iri(object),
+                    ),
+                    ImportAction::Literal {
+                        subject,
+                        predicate,
+                        value,
+                    } => FactRef::new(
+                        &local_from_iri(subject),
+                        &predicate_from_iri(predicate),
+                        value,
+                    ),
+                };
+                self.record(fact, source.clone());
+                recorded += 1;
+            }
+        }
+        recorded
+    }
+
+    /// 从融合账本的命名空间断言回填来源。
+    ///
+    /// 每个命名空间就是一批来源：定位符取「命名空间标签 @ 证据指针」，
+    /// 内容摘要取断言稳定 id。调用方决定是否把命名空间事实纳入冲突检测
+    /// （默认图与隔离源图是两套视图，不能静默混在一起）。
+    pub fn seed_from_fusion_ledger(&mut self, ledger: &FusionLedger) -> usize {
+        let mut recorded = 0usize;
+        for assertion in &ledger.assertions {
+            let label = ledger
+                .namespace(&assertion.namespace)
+                .map(|record| record.label.clone())
+                .unwrap_or_else(|| assertion.namespace.clone());
+            let locator = if assertion.source.is_empty() {
+                label
+            } else {
+                format!("{}@{}", label, assertion.source)
+            };
+            let source = SourceId::new(SourceKind::Import, &locator, &assertion.id);
+            self.record(
+                FactRef::new(&assertion.subject, &assertion.predicate, &assertion.object),
+                source,
+            );
+            recorded += 1;
+        }
+        recorded
+    }
+
     /// 规范 JSON（确定性摘要/审计用）。
     pub fn to_json(&self) -> String {
         let entries: Vec<&ProvenanceEntry> = self.entries.values().collect();
@@ -603,6 +675,23 @@ impl ConflictPoint {
                 "disjoint\u{1}{}\u{1}{}\u{1}{}",
                 entity, left_type, right_type
             ),
+        }
+    }
+
+    /// 冲突点所在的槽（同一槽的多个取值只算一个冲突点）。
+    ///
+    /// 一个功能槽出现 3 个值时会生成 3 张两两证书，但只有 1 个冲突点、
+    /// 最少删 2 条事实即可修复。计数与代价必须分开报告。
+    pub fn slot_key(&self) -> String {
+        match self {
+            ConflictPoint::Functional {
+                subject,
+                predicate,
+                ..
+            } => format!("functional\u{1}{}\u{1}{}", subject, predicate),
+            ConflictPoint::DisjointTypes { entity, .. } => {
+                format!("disjoint\u{1}{}", entity)
+            }
         }
     }
 
@@ -860,14 +949,6 @@ impl ConflictCertificate {
             ));
         }
         lines.push(format!("  {}", self.attribution.render_zh()));
-        if self.retraction.resolved == 0
-            && self.retraction.unresolved == 0
-            && self.retraction.facts.is_empty()
-        {
-            lines.push("  最小撤回集：由报告统一计算。".to_string());
-        } else {
-            lines.push(format!("  {}", self.retraction.render_zh()));
-        }
         lines.join("\n")
     }
 }
@@ -950,6 +1031,15 @@ impl ConflictReport {
         }
     }
 
+    /// 去重后的冲突点数（与两两证书数分开）。
+    pub fn conflict_points(&self) -> usize {
+        self.certificates
+            .iter()
+            .map(|certificate| certificate.point.slot_key())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
     pub fn witnessed(&self) -> usize {
         self.certificates.iter().filter(|cert| !cert.latent).count()
     }
@@ -967,8 +1057,9 @@ impl ConflictReport {
 
     pub fn render_text(&self) -> String {
         let mut lines = vec![format!(
-            "冲突证书：{} 个（已见证 {} / 潜在 {}），其中归因不足 {} 个。",
+            "冲突证书：{} 张，覆盖 {} 个冲突点（已见证 {} / 潜在 {}），其中归因不足 {} 张。",
             self.certificates.len(),
+            self.conflict_points(),
             self.witnessed(),
             self.latent(),
             self.insufficient_attribution()
@@ -1615,6 +1706,21 @@ fn ledger_term_name(term: &crate::graph_ledger::LedgerTerm) -> String {
     }
 }
 
+fn local_from_iri(iri: &str) -> String {
+    let base = crate::identity::DEFAULT_BASE_NS;
+    crate::identity::entity_local_name(base, iri)
+        .or_else(|| crate::identity::local_name(base, iri))
+        .unwrap_or_else(|| iri.to_string())
+}
+
+fn predicate_from_iri(iri: &str) -> String {
+    if iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
+        "type".to_string()
+    } else {
+        local_from_iri(iri)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,6 +2129,94 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.to_json(), second.to_json());
         assert!(!first.certificates[0].id.is_empty());
+    }
+
+    #[test]
+    fn import_journal_seeding_uses_real_batch_identity() {
+        use crate::import_journal::ImportJournal;
+        use crate::predicate_registry::{ImportAction, ImportReceipt};
+
+        let receipt = ImportReceipt {
+            added: 2,
+            actions: vec![
+                ImportAction::Literal {
+                    subject: "http://example.org/kg/entity/姚明".to_string(),
+                    predicate: "http://example.org/kg/年龄".to_string(),
+                    value: "38".to_string(),
+                },
+                ImportAction::Named {
+                    subject: "http://example.org/kg/entity/姚明".to_string(),
+                    predicate: "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string(),
+                    object: "http://example.org/kg/Person".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let journal = ImportJournal::from_entries(vec![receipt]);
+        let mut ledger = ProvenanceLedger::new();
+        assert_eq!(ledger.seed_from_import_journal(&journal), 2);
+
+        let age = fact("姚明", "年龄", "38");
+        let sources = ledger.sources(&age);
+        assert_eq!(sources.len(), 1);
+        let source = sources.iter().next().unwrap();
+        assert_eq!(source.kind, SourceKind::Import);
+        assert!(source.locator.starts_with("导入日志#1"));
+        assert!(source.is_registered());
+        assert!(ledger.sources(&FactRef::type_assertion("姚明", "Person")).len() == 1);
+    }
+
+    #[test]
+    fn fusion_seeding_keeps_namespace_and_evidence_pointer() {
+        use crate::knowledge_fusion::{
+            FusionLedger, NamespaceKind, NamespaceRecord, ObjectKind, ScopedAssertion, TrustLevel,
+        };
+
+        let namespace = NamespaceRecord::new("batch-a", "甲批", NamespaceKind::Import, TrustLevel::Imported);
+        let assertion = ScopedAssertion::new(
+            "batch-a",
+            "姚明",
+            "年龄",
+            "40",
+            ObjectKind::Literal,
+            "/data/ns.ttl",
+        );
+        let mut fusion = FusionLedger::new();
+        fusion.upsert_namespace(namespace);
+        fusion.record_assertion(assertion);
+        let mut ledger = ProvenanceLedger::new();
+        assert_eq!(ledger.seed_from_fusion_ledger(&fusion), 1);
+        let sources = ledger.sources(&fact("姚明", "年龄", "40"));
+        assert_eq!(sources.len(), 1);
+        let source = sources.iter().next().unwrap();
+        assert!(source.locator.contains("甲批"));
+        assert!(source.locator.contains("/data/ns.ttl"));
+        assert!(source.render().contains("导入:甲批"));
+    }
+
+    #[test]
+    fn three_values_make_three_certificates_but_one_conflict_point() {
+        let mut facts = Vec::new();
+        let mut ledger = ProvenanceLedger::new();
+        for value in ["38", "39", "40"] {
+            let fact = fact("姚明", "年龄", value);
+            ledger.record(fact.clone(), source("批", value));
+            facts.push(fact);
+        }
+        let supports = build_supports(
+            &facts,
+            &ledger,
+            &empty_rules(),
+            &empty_derived(),
+        );
+        let report = ConflictReport::new(
+            detect_witnessed(&facts, &supports, &schema()),
+            ledger.coverage(&facts),
+        );
+        assert_eq!(report.certificates.len(), 3, "两两证书");
+        assert_eq!(report.conflict_points(), 1, "但只有一个功能槽冲突点");
+        assert_eq!(report.retraction.facts.len(), 2, "修复代价是删 2 条，不是 3 条");
+        assert!(report.render_text().contains("覆盖 1 个冲突点"));
     }
 
     #[test]
