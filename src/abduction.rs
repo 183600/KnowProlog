@@ -320,6 +320,28 @@ impl ClarificationSession {
             self.remaining()
         )
     }
+
+    /// 尚未提问的队列（快照导出用；保持原有顺序）。
+    pub fn queue(&self) -> &[Hypothesis] {
+        &self.queue
+    }
+
+    /// 从快照部件重建会话（快照恢复用；不做重新排序，保持中断时的问题顺序）。
+    pub fn from_parts(
+        queue: Vec<Hypothesis>,
+        current: Option<Hypothesis>,
+        confirmed: Vec<Hypothesis>,
+        rejected: Vec<Hypothesis>,
+        deferred: Vec<Hypothesis>,
+    ) -> Self {
+        Self {
+            queue,
+            current,
+            confirmed,
+            rejected,
+            deferred,
+        }
+    }
 }
 
 /// 澄清回答的处理结论

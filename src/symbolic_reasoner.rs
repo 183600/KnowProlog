@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::abduction::{
     self, AbductionEngine, AbductionReport, ClarificationReply, ClarificationSession, Hypothesis,
-    Scenario,
+    HypothesisKind, Scenario,
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::belief_revision::{
@@ -182,32 +182,33 @@ fn snapshot_clause(clause: &Clause) -> SnapshotClause {
     }
 }
 
+fn restore_snapshot_clause_atom(atom: &SnapshotClauseAtom) -> Option<Atom> {
+    if atom.predicate.is_empty() || atom.terms.is_empty() {
+        return None;
+    }
+    let terms: Vec<Term> = atom
+        .terms
+        .iter()
+        .filter(|term| !term.name.is_empty())
+        .map(|term| {
+            if term.is_var {
+                Term::var(&term.name)
+            } else {
+                Term::constant(&term.name)
+            }
+        })
+        .collect();
+    if terms.len() != atom.terms.len() {
+        return None;
+    }
+    Some(Atom::new(&atom.predicate, terms))
+}
+
 fn restore_clause(snapshot: &SnapshotClause) -> Option<Clause> {
-    let restore_atom = |atom: &SnapshotClauseAtom| -> Option<Atom> {
-        if atom.predicate.is_empty() || atom.terms.is_empty() {
-            return None;
-        }
-        let terms: Vec<Term> = atom
-            .terms
-            .iter()
-            .filter(|term| !term.name.is_empty())
-            .map(|term| {
-                if term.is_var {
-                    Term::var(&term.name)
-                } else {
-                    Term::constant(&term.name)
-                }
-            })
-            .collect();
-        if terms.len() != atom.terms.len() {
-            return None;
-        }
-        Some(Atom::new(&atom.predicate, terms))
-    };
-    let head = restore_atom(&snapshot.head)?;
+    let head = restore_snapshot_clause_atom(&snapshot.head)?;
     let mut body = Vec::with_capacity(snapshot.body.len());
     for atom in &snapshot.body {
-        body.push(restore_atom(atom)?);
+        body.push(restore_snapshot_clause_atom(atom)?);
     }
     Some(Clause::new(
         head,
@@ -215,6 +216,64 @@ fn restore_clause(snapshot: &SnapshotClause) -> Option<Clause> {
         snapshot.confidence,
         &snapshot.source,
     ))
+}
+
+fn snapshot_hypothesis(hypothesis: &Hypothesis) -> SnapshotHypothesis {
+    SnapshotHypothesis {
+        atom: snapshot_clause_atom(&hypothesis.atom),
+        goal: snapshot_clause_atom(&hypothesis.goal),
+        kind: match hypothesis.kind {
+            HypothesisKind::MissingFact => "missing_fact".to_string(),
+            HypothesisKind::CandidateValue => "candidate_value".to_string(),
+        },
+        confidence: hypothesis.confidence,
+        reasons: hypothesis.reasons.clone(),
+        conflicts: hypothesis.conflicts.clone(),
+        contradicts_known: hypothesis.contradicts_known,
+    }
+}
+
+fn restore_hypothesis(snapshot: &SnapshotHypothesis) -> Option<Hypothesis> {
+    if !snapshot.confidence.is_finite() {
+        return None;
+    }
+    let kind = match snapshot.kind.as_str() {
+        "missing_fact" => HypothesisKind::MissingFact,
+        "candidate_value" => HypothesisKind::CandidateValue,
+        _ => return None,
+    };
+    Some(Hypothesis {
+        atom: restore_snapshot_clause_atom(&snapshot.atom)?,
+        goal: restore_snapshot_clause_atom(&snapshot.goal)?,
+        kind,
+        confidence: snapshot.confidence.clamp(0.0, 1.0),
+        reasons: snapshot.reasons.clone(),
+        conflicts: snapshot.conflicts.clone(),
+        contradicts_known: snapshot.contradicts_known,
+    })
+}
+
+fn snapshot_clarification(session: &ClarificationSession) -> SnapshotClarification {
+    SnapshotClarification {
+        queue: session.queue().iter().map(snapshot_hypothesis).collect(),
+        current: session.current().map(snapshot_hypothesis),
+        confirmed: session.confirmed.iter().map(snapshot_hypothesis).collect(),
+        rejected: session.rejected.iter().map(snapshot_hypothesis).collect(),
+        deferred: session.deferred.iter().map(snapshot_hypothesis).collect(),
+    }
+}
+
+fn restore_clarification(snapshot: &SnapshotClarification) -> ClarificationSession {
+    let restore = |items: &[SnapshotHypothesis]| -> Vec<Hypothesis> {
+        items.iter().filter_map(restore_hypothesis).collect()
+    };
+    ClarificationSession::from_parts(
+        restore(&snapshot.queue),
+        snapshot.current.as_ref().and_then(restore_hypothesis),
+        restore(&snapshot.confirmed),
+        restore(&snapshot.rejected),
+        restore(&snapshot.deferred),
+    )
 }
 
 fn snapshot_atom(atom: &Atom) -> SnapshotAtom {
@@ -332,6 +391,37 @@ pub struct SnapshotRevision {
     pub restore_lessons: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remove_lessons: Vec<String>,
+}
+
+/// 待定假设的持久化形式：原子可含变量（不可采纳的假设也要原样恢复）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotHypothesis {
+    pub atom: SnapshotClauseAtom,
+    pub goal: SnapshotClauseAtom,
+    /// `missing_fact` / `candidate_value`
+    pub kind: String,
+    pub confidence: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<String>,
+    #[serde(default)]
+    pub contradicts_known: bool,
+}
+
+/// 澄清会话的持久化形式：保留当前问题、未问队列与已裁决清单。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotClarification {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue: Vec<SnapshotHypothesis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<SnapshotHypothesis>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed: Vec<SnapshotHypothesis>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<SnapshotHypothesis>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<SnapshotHypothesis>,
 }
 
 /// 一次会话写入的修订回执：真实生效的操作 + 可一并恢复的教学原句。
@@ -455,6 +545,17 @@ pub struct DialogueSnapshot {
     // 会话修订回执：跨重启仍可撤销最新写入；空回执不落盘
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_receipts: Vec<SnapshotRevision>,
+    // 溯因待定假设：跨重启保留候选，可继续「采纳假设 / 澄清」；空池不落盘
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_hypotheses: Vec<SnapshotHypothesis>,
+    // 进行中的澄清会话：保留当前问题与队列，重启后不重复已答问题
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clarification: Option<SnapshotClarification>,
+    // 最近一次溯因目标与查询变量：澄清确认后据此复核目标是否已可证
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_abduction_goal: Vec<SnapshotClauseAtom>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_abduction_vars: Vec<String>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -667,6 +768,10 @@ impl DialogueContext {
             completion: None,
             assumptions: Vec::new(),
             session_receipts: Vec::new(),
+            pending_hypotheses: Vec::new(),
+            clarification: None,
+            last_abduction_goal: Vec::new(),
+            last_abduction_vars: Vec::new(),
         }
     }
 
@@ -10683,6 +10788,20 @@ impl SymbolicReasoner {
             .iter()
             .map(SessionRevisionReceipt::to_snapshot)
             .collect();
+        snapshot.pending_hypotheses = self
+            .abduction
+            .pending()
+            .iter()
+            .map(snapshot_hypothesis)
+            .collect();
+        snapshot.clarification = self.clarification.as_ref().map(snapshot_clarification);
+        snapshot.last_abduction_goal = self
+            .last_abduction_goal
+            .iter()
+            .flat_map(|goals| goals.iter())
+            .map(snapshot_clause_atom)
+            .collect();
+        snapshot.last_abduction_vars = self.last_abduction_vars.clone();
         snapshot
     }
 
@@ -10926,6 +11045,28 @@ impl SymbolicReasoner {
             let excess = self.session_receipts.len() - MAX_SESSION_RECEIPTS;
             self.session_receipts.drain(0..excess);
         }
+        // 溯因接口状态：待定假设、澄清会话与最近目标都随快照恢复；
+        // 旧快照没有这些字段时按空状态处理（字节兼容）。
+        let pending: Vec<Hypothesis> = snapshot
+            .pending_hypotheses
+            .iter()
+            .filter_map(restore_hypothesis)
+            .collect();
+        self.abduction.set_pending(pending);
+        self.clarification = snapshot
+            .clarification
+            .as_ref()
+            .map(restore_clarification)
+            .filter(|session| !session.is_finished());
+        self.last_abduction_goal = {
+            let goals: Vec<Atom> = snapshot
+                .last_abduction_goal
+                .iter()
+                .filter_map(restore_snapshot_clause_atom)
+                .collect();
+            (!goals.is_empty()).then_some(goals)
+        };
+        self.last_abduction_vars = snapshot.last_abduction_vars.clone();
         Ok(())
     }
 
@@ -14101,6 +14242,72 @@ types = [
             restored.dialogue_summary()
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_hypotheses_and_clarification_survive_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let empty = String::from_utf8(
+            canonical::canonical_bytes(&reasoner.dialogue_snapshot()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !empty.contains("pending_hypotheses") && !empty.contains("last_abduction_goal"),
+            "空会话不应把溯因字段写进快照：{}",
+            empty
+        );
+
+        let _ = reasoner
+            .abduce_statement("张三的师祖是赵六")
+            .expect("应能溯因");
+        let pending_before: Vec<String> = reasoner
+            .pending_hypotheses()
+            .iter()
+            .map(|hypothesis| hypothesis.atom.display())
+            .collect();
+        assert!(!pending_before.is_empty());
+        let question = reasoner.start_clarification().expect("应能开始澄清");
+        assert!(reasoner.clarification_active());
+
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(!snapshot.pending_hypotheses.is_empty());
+        assert!(snapshot.clarification.is_some());
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("快照应可恢复");
+        let pending_after: Vec<String> = restored
+            .pending_hypotheses()
+            .iter()
+            .map(|hypothesis| hypothesis.atom.display())
+            .collect();
+        assert_eq!(pending_before, pending_after, "待定假设应按原序恢复");
+        assert!(restored.clarification_active(), "澄清会话应跨快照继续");
+        assert_eq!(
+            restored
+                .clarification_progress()
+                .expect("澄清进度应存在"),
+            reasoner.clarification_progress().expect("澄清进度应存在")
+        );
+
+        let response = restored
+            .answer_clarification("是的")
+            .expect("恢复后的澄清应可作答");
+        assert!(response.contains("已确认假设"), "{}", response);
+        assert!(
+            restored
+                .resolution_proof_report("张三的师祖是赵六")
+                .contains("得证"),
+            "恢复的澄清确认应能证出原目标"
+        );
+        assert!(
+            question.contains("请确认") || question.contains("是否成立"),
+            "{}",
+            question
+        );
     }
 
     #[test]
