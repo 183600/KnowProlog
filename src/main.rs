@@ -1186,7 +1186,16 @@ async fn main() {
             json,
             strict,
         }) => {
-            run_ask(&config, &oxigraph_manager, &store_path, question, json, strict).await;
+            run_ask(
+                &config,
+                &oxigraph_manager,
+                &store_path,
+                recovery_mode,
+                question,
+                json,
+                strict,
+            )
+            .await;
         }
         Some(Commands::Frames {
             text,
@@ -3970,6 +3979,7 @@ async fn run_ask(
     config: &SystemConfig,
     oxigraph_manager: &OxigraphManager,
     store_path: &str,
+    recovery_mode: RecoveryMode,
     question: Option<String>,
     json: bool,
     strict: bool,
@@ -4040,6 +4050,7 @@ async fn run_ask(
     // 与交互/服务同一条对话前通道：查询板、指代、澄清与身份回合都在
     // reasoner.answer 之前；一次 ask 的多行输入共享同一会话记忆。
     let mut dialogue = DialogueManager::new();
+    dialogue.set_recovery_mode(recovery_mode);
     let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
     for question in questions {
         // 管道输入常沿用交互脚本的收尾行：不要把它当成待回答的问题。
