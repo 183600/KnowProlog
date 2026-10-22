@@ -338,11 +338,14 @@ impl ClarificationSession {
         goals: &[Atom],
         query_vars: &[String],
     ) {
-        if goals.is_empty() || self.queue.len() < 2 {
+        if goals.is_empty() {
             return;
         }
+        // 当前已取出的下一问必须回到候选池，否则重排会把这条问题丢掉。
+        if let Some(current) = self.current.take() {
+            self.queue.push(current);
+        }
         Self::sort_by_goal(&mut self.queue, engine, goals, query_vars);
-        self.current = None;
         self.advance();
     }
 
@@ -2239,6 +2242,31 @@ mod tests {
         assert_eq!(
             ClarificationSession::discrimination(&engine, &goals, &[], &decisive),
             2
+        );
+    }
+
+    #[test]
+    fn reprioritize_keeps_the_pending_question_in_the_pool() {
+        let mut engine = ResolutionEngine::new(8, 16);
+        engine.add_fact("师傅", "张三", "李四");
+        engine.add_clause(teacher_clause());
+        let goals = [Atom::rel("师祖", "张三", "赵六")];
+        let decisive = hyp("师傅", "李四", "赵六", 0.2);
+        let noisy = hyp("师傅", "张三", "钱七", 0.9);
+        let mut session = ClarificationSession::start_with_goal(
+            &[noisy, decisive],
+            &engine,
+            &goals,
+            &[],
+        );
+        let before = session.remaining();
+        let reply = session.respond("不是");
+        assert!(matches!(reply, ClarificationReply::Rejected(_)));
+        session.reprioritize(&engine, &goals, &[]);
+        assert_eq!(
+            session.remaining(),
+            before - 1,
+            "重排不得丢失尚未回答的问题"
         );
     }
 
