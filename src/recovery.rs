@@ -42,6 +42,8 @@ pub const CLARIFY_TTL_TURNS: u64 = 3;
 pub const MAX_PENDING: usize = 8;
 /// 会话层确认事实的上限（超出后淘汰最旧条目）。
 pub const MAX_CONFIRMED_FACTS: usize = 64;
+/// 会话层否定证据的上限（超出后淘汰最旧条目）。
+pub const MAX_REFUTED_CANDIDATES: usize = 64;
 /// 定点化标尺（排序确定性）。
 pub const SCORE_FIXED_SCALE: f64 = 1_000_000.0;
 
@@ -209,6 +211,16 @@ pub struct ConfirmedFact {
     pub source: ConfirmationSource,
 }
 
+/// 被用户否认过的候选（同会话内不再重复提名）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefutedCandidate {
+    pub entity: String,
+    pub attribute: String,
+    pub value: String,
+    pub receipt_id: String,
+    pub tick: u64,
+}
+
 /// 会话事实的来源分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +253,9 @@ pub struct RecoveryState {
     /// 会话层已确认事实（旧快照缺省为空，保持字节兼容）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub confirmed: Vec<ConfirmedFact>,
+    /// 会话层否定证据（旧快照缺省为空，保持字节兼容）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refuted: Vec<RefutedCandidate>,
 }
 
 impl RecoveryState {
@@ -288,6 +303,11 @@ impl RecoveryState {
         self.confirmed.retain(|fact| {
             !(fact.entity == entity && fact.attribute == attribute && fact.value == value)
         });
+        self.refuted.retain(|candidate| {
+            !(candidate.entity == entity
+                && candidate.attribute == attribute
+                && candidate.value == value)
+        });
         self.confirmed.push(ConfirmedFact {
             entity: entity.to_string(),
             attribute: attribute.to_string(),
@@ -308,6 +328,49 @@ impl RecoveryState {
             .iter()
             .rev()
             .find(|fact| fact.entity == entity.trim() && fact.attribute == attribute.trim())
+    }
+
+    /// 记录一条会话层否定证据（同一候选只保留一条）。
+    pub fn record_refuted(
+        &mut self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+        receipt_id: &str,
+    ) {
+        let entity = entity.trim();
+        let attribute = attribute.trim();
+        let value = value.trim();
+        if entity.is_empty() || attribute.is_empty() || value.is_empty() {
+            return;
+        }
+        self.confirmed
+            .retain(|fact| !(fact.entity == entity && fact.attribute == attribute && fact.value == value));
+        self.refuted.retain(|candidate| {
+            !(candidate.entity == entity
+                && candidate.attribute == attribute
+                && candidate.value == value)
+        });
+        self.refuted.push(RefutedCandidate {
+            entity: entity.to_string(),
+            attribute: attribute.to_string(),
+            value: value.to_string(),
+            receipt_id: receipt_id.to_string(),
+            tick: self.tick,
+        });
+        if self.refuted.len() > MAX_REFUTED_CANDIDATES {
+            let overflow = self.refuted.len() - MAX_REFUTED_CANDIDATES;
+            self.refuted.drain(0..overflow);
+        }
+    }
+
+    /// 某候选是否已被用户在本会话内否认。
+    pub fn is_refuted(&self, entity: &str, attribute: &str, value: &str) -> bool {
+        self.refuted.iter().any(|candidate| {
+            candidate.entity == entity.trim()
+                && candidate.attribute == attribute.trim()
+                && candidate.value == value.trim()
+        })
     }
 }
 
@@ -566,8 +629,12 @@ fn recover_missing<K: RecoveryKnowledge + ?Sized>(
         return attempt;
     };
 
-    // L2：A 提名 → B 验证。
-    let nominations = prepare_nominations(knowledge.nominations(entity, attribute));
+    // L2：A 提名 → B 验证（本会话已否认的候选不再重复提名）。
+    let nominations: Vec<RecoveryNomination> =
+        prepare_nominations(knowledge.nominations(entity, attribute))
+            .into_iter()
+            .filter(|nomination| !state.is_refuted(entity, attribute, &nomination.value))
+            .collect();
     if !nominations.is_empty() {
         let mut chosen: Option<(&RecoveryNomination, VerificationOutcome)> = None;
         for nomination in &nominations {
@@ -766,6 +833,13 @@ pub fn resolve_by_yes(state: &mut RecoveryState, confirmed: bool) -> Option<Stri
                     ))
                 }
             } else {
+                if let (Some(entity), Some(attribute), Some(value)) = (
+                    followup.entity.as_deref(),
+                    followup.attribute.as_deref(),
+                    followup.value.as_deref(),
+                ) {
+                    state.record_refuted(entity, attribute, value, &followup.receipt_id);
+                }
                 Some("明白，这条推测作废，我不会再拿它当依据。".to_string())
             }
         }
@@ -829,6 +903,9 @@ pub fn resolve_by_correction(state: &mut RecoveryState, correction: &str) -> Opt
     ) else {
         return Some("明白，这条推测作废，我不会再拿它当依据。".to_string());
     };
+    if let Some(original) = followup.value.as_deref() {
+        state.record_refuted(entity, attribute, original, &followup.receipt_id);
+    }
     state.record_confirmed(
         entity,
         attribute,
@@ -1248,6 +1325,41 @@ mod tests {
                 .iter()
                 .any(|fact| fact.value == "赵六"),
             "被否认的推测不得进入会话事实"
+        );
+    }
+
+    #[test]
+    fn refuted_candidate_is_not_nominated_again_in_the_same_session() {
+        let knowledge = MockKnowledge {
+            nominations: vec![RecoveryNomination {
+                value: "赵六".to_string(),
+                score: 0.8,
+                evidence: vec!["师傅链".to_string()],
+            }],
+            ..Default::default()
+        };
+        let mut state = RecoveryState::new();
+        let first = attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request(EpistemicStatus::Absent, Some("张三"), Some("师祖")),
+            &knowledge,
+        );
+        assert_eq!(first.level, RecoveryLevel::Associate);
+        resolve_by_yes(&mut state, false).unwrap();
+        assert!(state.is_refuted("张三", "师祖", "赵六"));
+
+        let second = attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request(EpistemicStatus::Absent, Some("张三"), Some("师祖")),
+            &knowledge,
+        );
+        assert_ne!(second.level, RecoveryLevel::Associate);
+        assert!(
+            !second.text.contains("赵六"),
+            "被否认的候选不得重复提名：{}",
+            second.text
         );
     }
 
