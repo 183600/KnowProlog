@@ -491,6 +491,22 @@ impl LearnedRule {
             false
         }
     }
+
+    /// 用户更正了此前的否决：撤回对应负例，并在证据允许时解除隔离。
+    fn note_reinstatement(&mut self, example: &Triple, tick: u64) {
+        self.negative_examples.retain(|triple| triple != example);
+        self.refutations = self.refutations.saturating_sub(1);
+        self.updated_tick = tick;
+        if self.status == RuleStatus::Quarantined
+            && (self.refutations < 2 || self.refutations < self.confirmations)
+        {
+            self.status = if self.confirmations >= 2 {
+                RuleStatus::Active
+            } else {
+                RuleStatus::Candidate
+            };
+        }
+    }
 }
 
 /// 用户裁决的方向。
@@ -1312,6 +1328,10 @@ impl CompletionLedger {
             self.regression_tests
                 .retain(|test| !(test.triple == triple && test.verdict == RegressionVerdict::Refuted));
             if let Some(spec) = valid_rule.clone() {
+                let id = spec.id();
+                if let Some(rule) = self.rules.iter_mut().find(|rule| rule.id == id) {
+                    rule.note_reinstatement(&triple, tick);
+                }
                 let episode_ref = format!("外部裁决:{}:{}", source.trim(), source_id);
                 self.upsert_rule(spec, &triple, &episode_ref, 0.8, tick);
             }
@@ -2720,6 +2740,57 @@ mod tests {
         assert_eq!(ledger.rules()[0].confirmations, 1, "同一回执不得重复计数");
         assert!(ledger.is_adjudicated(&prediction.triple));
         assert!(ledger.render_regression_report().contains("确认 1"));
+    }
+
+    #[test]
+    fn correction_reinstates_quarantined_rule_and_clears_negative_example() {
+        let predictor = chain_predictor();
+        let prediction = predictor
+            .predict_for_entity("孙八", None, 8)
+            .into_iter()
+            .find(|prediction| prediction.triple == Triple::new("孙八", "师祖", "吴十"))
+            .expect("应有一条师祖预测");
+        let spec = RuleSpec::from_horn(&predictor.rules()[prediction.rule_index])
+            .expect("预测规则应可归纳");
+        let mut ledger = CompletionLedger::new();
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            true,
+            Some(spec.clone()),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-20",
+        ));
+        for receipt in ["receipt-21", "receipt-22"] {
+            assert!(ledger.record_external_verdict(
+                prediction.triple.clone(),
+                false,
+                Some(spec.clone()),
+                prediction.evidence.clone(),
+                "恢复阶梯",
+                receipt,
+            ));
+        }
+        assert_eq!(ledger.rules()[0].status, RuleStatus::Quarantined);
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            true,
+            Some(spec),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-23",
+        ));
+        let rule = &ledger.rules()[0];
+        assert_eq!(rule.status, RuleStatus::Active, "更正后应解除隔离并重新生效");
+        assert_eq!(rule.refutations, 1);
+        assert!(!rule.negative_examples.contains(&prediction.triple));
+        assert!(
+            ledger
+                .replay_rule(&rule.id)
+                .expect("规则应存在")
+                .passed(),
+            "更正后运行期测试应通过"
+        );
     }
 
     #[test]
