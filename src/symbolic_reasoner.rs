@@ -9922,7 +9922,7 @@ impl SymbolicReasoner {
 
     /// 是否还有未答之问（悬问）。
     pub fn has_pending_question(&self) -> bool {
-        !self.pending_questions.is_empty()
+        self.pending_questions.has_active()
     }
 
     /// 悬问台账报告：列出「哪个目标缺哪条前提」。
@@ -9932,22 +9932,12 @@ impl SymbolicReasoner {
 
     /// 原问句已在正常路径上得到确证回答：关闭同题悬问（不影响其他悬问）。
     pub fn dismiss_pending_question(&mut self, question: &str) -> bool {
-        let question = question.trim();
-        let before = self.pending_questions.len();
-        let kept: Vec<PendingQuestion> = self
-            .pending_questions
-            .questions()
-            .iter()
-            .filter(|pending| pending.question != question)
-            .cloned()
-            .collect();
-        self.pending_questions.replace(kept);
-        self.pending_questions.len() < before
+        self.pending_questions.dismiss_question(question)
     }
 
     /// 显式放弃全部悬问。忘记必须是显式动作，不设 TTL。
     pub fn abandon_pending_questions(&mut self) -> String {
-        let count = self.pending_questions.len();
+        let count = self.pending_questions.len() + self.pending_questions.shelved_len();
         self.pending_questions.clear();
         if count == 0 {
             "悬问台账本来就是空的。".to_string()
@@ -9957,6 +9947,23 @@ impl SymbolicReasoner {
                 count
             )
         }
+    }
+
+    /// 显式重开用户先前说「不知道」而搁置的悬问，并重新追问当前洞。
+    pub fn reopen_pending_questions(&mut self) -> String {
+        let count = self.pending_questions.reopen_shelved();
+        if count == 0 {
+            return "没有搁置的悬问；当前台账里的问题仍在追问中。".to_string();
+        }
+        let Some(pending) = self.pending_questions.active().cloned() else {
+            return "已恢复搁置的悬问。".to_string();
+        };
+        self.pending_questions.mark_asked(pending.id);
+        format!(
+            "已重新打开 {} 条搁置的悬问。\n{}",
+            count,
+            PendingQuestionLedger::render_ask(&pending)
+        )
     }
 
     /// 本轮没有把输入当作短答：关闭「仅紧接一轮可裸答」的窗口。
@@ -9983,10 +9990,10 @@ impl SymbolicReasoner {
                 None
             }
             AnswerBinding::Unknown => {
-                self.pending_questions.remove(pending.id);
+                self.pending_questions.suspend(pending.id);
                 self.pending_questions.clear_awaiting();
                 Some(format!(
-                    "好，「{}」先悬着。\n「不知道」只是暂时没有信息，不会被记成否定事实；需要时可以重新问我。",
+                    "好，「{}」先悬着并移入搁置区。\n「不知道」只是暂时没有信息，不会被记成否定事实；输入「重开悬问」可以继续追问。",
                     pending.hole.phrase()
                 ))
             }
@@ -12844,7 +12851,7 @@ impl SymbolicReasoner {
             }
         };
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}，话语帧 {}，悬问 {} 条。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}，话语帧 {}，悬问 {} 条（搁置 {}）。",
             focus,
             predicate,
             generation,
@@ -12854,7 +12861,8 @@ impl SymbolicReasoner {
             clarify,
             lesson_info,
             frame_info,
-            self.pending_questions.len()
+            self.pending_questions.len(),
+            self.pending_questions.shelved_len()
         )
     }
 
@@ -14970,6 +14978,58 @@ mod tests {
         assert!(reasoner
             .try_answer_pending_question("回答悬问：王五")
             .is_some());
+    }
+
+    #[test]
+    fn pending_question_unknown_is_shelved_and_explicitly_reopenable() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        let reply = reasoner
+            .try_answer_pending_question("不知道")
+            .expect("明确不知道应显式搁置");
+        assert!(reply.contains("先悬着"), "{}", reply);
+        assert!(!reasoner.has_pending_question());
+        assert!(reasoner.pending_question_report().contains("已搁置 1 条"));
+
+        let reopened = reasoner.reopen_pending_questions();
+        assert!(reopened.contains("已重新打开 1 条"), "{}", reopened);
+        assert!(reopened.contains("李四 的 师傅"), "{}", reopened);
+        assert!(reasoner.has_pending_question());
+        let deferred = reasoner
+            .try_answer_pending_question("王五")
+            .expect("重开后短答应可回填");
+        assert!(deferred.contains("王五"), "{}", deferred);
+        assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
+    fn shelved_pending_question_survives_snapshot_roundtrip() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        reasoner.try_answer_pending_question("不知道");
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(
+            snapshot.pending_questions.is_some(),
+            "搁置的悬问也必须随快照落盘"
+        );
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&pair_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("快照应能恢复");
+        assert!(!restored.has_pending_question());
+        assert!(restored.pending_question_report().contains("已搁置 1 条"));
+        assert!(restored.reopen_pending_questions().contains("已重新打开"));
+        assert!(restored
+            .try_answer_pending_question("王五")
+            .is_some_and(|reply| reply.contains("王五")));
     }
 
     #[test]

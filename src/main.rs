@@ -8857,6 +8857,11 @@ async fn run_interactive_mode(
             println!();
             continue;
         }
+        if matches!(input, "重开悬问" | "恢复悬问" | "重开未答之问") {
+            println!("{}", symbolic_reasoner.reopen_pending_questions());
+            println!();
+            continue;
+        }
 
         let mode = detect_input_mode(input, &config.nlp.import_keywords);
 
@@ -10470,6 +10475,7 @@ fn interactive_help() -> String {
         "台账与报告",
         "  悬问 / 未答之问 / 悬问报告           欠用户答案的目标与缺失前提",
         "  回答悬问：<取值>                     回填上一轮追问的缺失前提",
+        "  重开悬问 / 恢复悬问                  重新追问被「不知道」搁置的问题",
         "  放弃悬问 / 清空悬问                  显式放弃全部悬问（不写否定事实）",
         "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
         "  追踪报告 / 指代轨迹 / 问据栈          分层追踪：问据栈、指代绑定与逐轮决策",
@@ -10914,6 +10920,9 @@ fn is_command_like(input: &str) -> bool {
         "未答之问",
         "放弃悬问",
         "清空悬问",
+        "重开悬问",
+        "恢复悬问",
+        "重开未答之问",
         "一致性",
         "回答一致性",
         "改口检查",
@@ -12119,7 +12128,16 @@ mod session_tests {
     /// 各命令（谓词裁决 / 澄清子命令 / 帮助退出等）都要被 is_command_like 识别
     #[test]
     fn command_like_covers_pending_question_commands() {
-        for command in ["悬问", "悬问台账", "未答之问", "放弃悬问", "清空悬问"] {
+        for command in [
+            "悬问",
+            "悬问台账",
+            "未答之问",
+            "放弃悬问",
+            "清空悬问",
+            "重开悬问",
+            "恢复悬问",
+            "重开未答之问",
+        ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
         assert!(is_no_record_text("根据现有知识库，没有记录「张三 的 师傅」。"));

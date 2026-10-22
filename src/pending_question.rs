@@ -17,6 +17,9 @@ use crate::function_words::contains_question_marker;
 /// 同时挂起的悬问上限：超出后淘汰最早的一条，避免会话状态无限增长。
 pub const MAX_PENDING_QUESTIONS: usize = 8;
 
+/// 显式说「不知道」后搁置的悬问上限。
+pub const MAX_SHELVED_QUESTIONS: usize = 8;
+
 /// 裸回答允许的最大字符数（再长就不再当作短答，避免吞掉正常语句）。
 pub const MAX_BARE_ANSWER_CHARS: usize = 32;
 
@@ -86,6 +89,9 @@ pub struct PendingQuestionLedger {
     questions: Vec<PendingQuestion>,
     #[serde(default, skip_serializing_if = "is_zero")]
     next_id: u64,
+    /// 用户明确说「不知道」后搁置的悬问：不自动重开，但保留可重开。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shelved: Vec<PendingQuestion>,
     /// 最近一次真正追问过的悬问编号。
     ///
     /// 台账里可能同时挂着多条未答之问；裸回答必须绑定到「刚刚被问到的」
@@ -111,15 +117,27 @@ impl PendingQuestionLedger {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.questions.is_empty()
+        self.questions.is_empty() && self.shelved.is_empty()
     }
 
     pub fn len(&self) -> usize {
         self.questions.len()
     }
 
+    pub fn shelved_len(&self) -> usize {
+        self.shelved.len()
+    }
+
+    pub fn has_active(&self) -> bool {
+        !self.questions.is_empty()
+    }
+
     pub fn questions(&self) -> &[PendingQuestion] {
         &self.questions
+    }
+
+    pub fn shelved(&self) -> &[PendingQuestion] {
+        &self.shelved
     }
 
     pub fn first(&self) -> Option<&PendingQuestion> {
@@ -172,6 +190,7 @@ impl PendingQuestionLedger {
 
     pub fn clear(&mut self) {
         self.questions.clear();
+        self.shelved.clear();
         self.active_id = None;
         self.awaiting_answer = false;
     }
@@ -210,6 +229,13 @@ impl PendingQuestionLedger {
             support,
             asks: 1,
         };
+        // 用户重新问起一条已搁置的悬问：以新的活动条目为准，不保留重复副本。
+        self.shelved.retain(|shelved| {
+            !(shelved.question == pending.question
+                && shelved.hole.subject == pending.hole.subject
+                && shelved.hole.predicate == pending.hole.predicate
+                && shelved.hole.inverted == pending.hole.inverted)
+        });
         self.active_id = Some(pending.id);
         self.questions.push(pending.clone());
         pending
@@ -220,6 +246,47 @@ impl PendingQuestionLedger {
         let removed = self.questions.remove(position);
         self.normalize_active();
         Some(removed)
+    }
+
+    /// 用户明确说「不知道」：移入搁置区，保留原目标与洞，等待显式重开。
+    pub fn suspend(&mut self, id: u64) -> Option<PendingQuestion> {
+        let removed = self.remove(id)?;
+        self.shelved.push(removed.clone());
+        if self.shelved.len() > MAX_SHELVED_QUESTIONS {
+            let excess = self.shelved.len() - MAX_SHELVED_QUESTIONS;
+            self.shelved.drain(0..excess);
+        }
+        Some(removed)
+    }
+
+    /// 显式重开全部搁置悬问，返回重开的条数。
+    pub fn reopen_shelved(&mut self) -> usize {
+        if self.shelved.is_empty() {
+            return 0;
+        }
+        let count = self.shelved.len();
+        let mut revived = std::mem::take(&mut self.shelved);
+        for pending in &mut revived {
+            pending.asks = pending.asks.saturating_add(1);
+        }
+        self.questions.append(&mut revived);
+        if self.questions.len() > MAX_PENDING_QUESTIONS {
+            let excess = self.questions.len() - MAX_PENDING_QUESTIONS;
+            self.questions.drain(0..excess);
+        }
+        self.awaiting_answer = false;
+        self.normalize_active();
+        count
+    }
+
+    /// 按原问句移除悬问（活动区与搁置区都收），返回是否删除了条目。
+    pub fn dismiss_question(&mut self, question: &str) -> bool {
+        let question = question.trim();
+        let before = self.questions.len() + self.shelved.len();
+        self.questions.retain(|pending| pending.question != question);
+        self.shelved.retain(|pending| pending.question != question);
+        self.normalize_active();
+        self.questions.len() + self.shelved.len() < before
     }
 
     pub fn remove_first(&mut self) -> Option<PendingQuestion> {
@@ -251,14 +318,21 @@ impl PendingQuestionLedger {
             let excess = restored.questions.len() - MAX_PENDING_QUESTIONS;
             restored.questions.drain(0..excess);
         }
-        restored.next_id = saved.next_id.max(
-            restored
-                .questions
-                .iter()
-                .map(|pending| pending.id)
-                .max()
-                .unwrap_or(0),
-        );
+        if restored.shelved.len() > MAX_SHELVED_QUESTIONS {
+            let excess = restored.shelved.len() - MAX_SHELVED_QUESTIONS;
+            restored.shelved.drain(0..excess);
+        }
+        restored.next_id = saved
+            .next_id
+            .max(
+                restored
+                    .questions
+                    .iter()
+                    .chain(restored.shelved.iter())
+                    .map(|pending| pending.id)
+                    .max()
+                    .unwrap_or(0),
+            );
         restored.normalize_active();
         *self = restored;
     }
@@ -294,10 +368,14 @@ impl PendingQuestionLedger {
 
     /// 台账报告：列出所有未答之问，供用户查看或显式放弃。
     pub fn render_report(&self) -> String {
-        if self.questions.is_empty() {
+        if self.is_empty() {
             return "悬问台账为空：当前没有欠用户答案的问题。".to_string();
         }
-        let mut output = format!("悬问台账：{} 条未答之问。\n", self.questions.len());
+        let mut output = if self.questions.is_empty() {
+            "悬问台账：当前没有正在追问的问题。\n".to_string()
+        } else {
+            format!("悬问台账：{} 条未答之问。\n", self.questions.len())
+        };
         for pending in &self.questions {
             let marker = if self.active_id == Some(pending.id) {
                 if self.awaiting_answer {
@@ -316,6 +394,18 @@ impl PendingQuestionLedger {
                 pending.asks,
                 marker
             ));
+        }
+        if !self.shelved.is_empty() {
+            output.push_str(&format!("已搁置 {} 条（不自动重开）：\n", self.shelved.len()));
+            for pending in &self.shelved {
+                output.push_str(&format!(
+                    "  {}. 「{}」缺「{}」\n",
+                    pending.id,
+                    pending.question,
+                    pending.hole.phrase()
+                ));
+            }
+            output.push_str("输入「重开悬问」可恢复搁置的问题。\n");
         }
         output.push_str("回复取值即可回填当前追问；输入「放弃悬问」清空台账。");
         output
@@ -614,5 +704,37 @@ mod tests {
             interpret_answer("回答悬问：王五", &hole()),
             AnswerBinding::Fill("王五".to_string())
         );
+    }
+
+    #[test]
+    fn shelved_question_is_kept_but_not_active_until_reopened() {
+        let mut ledger = PendingQuestionLedger::new();
+        let pending = ledger.record(
+            "张三的师傅的师傅是谁？",
+            "张三 的 师傅 的 师傅",
+            hole(),
+            Vec::new(),
+        );
+        ledger.mark_asked(pending.id);
+        ledger.suspend(pending.id);
+        assert!(!ledger.has_active());
+        assert!(!ledger.is_empty(), "搁置不等于忘记");
+        assert_eq!(ledger.shelved_len(), 1);
+        assert!(!ledger.awaiting_answer());
+        assert!(ledger.render_report().contains("已搁置 1 条"));
+
+        let encoded = serde_json::to_value(&ledger).unwrap();
+        assert_equal_roundtrip(&ledger, &encoded);
+
+        assert_eq!(ledger.reopen_shelved(), 1);
+        assert!(ledger.has_active());
+        assert!(ledger.shelved().is_empty());
+        assert!(!ledger.awaiting_answer(), "重开后还需要再追问一次");
+        assert_eq!(ledger.active().map(|item| item.id), Some(pending.id));
+    }
+
+    fn assert_equal_roundtrip(ledger: &PendingQuestionLedger, value: &serde_json::Value) {
+        let decoded: PendingQuestionLedger = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(&decoded, ledger);
     }
 }
