@@ -32,6 +32,7 @@ use know_prolog::{
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
     extract_query_entities_from_tagged,
+    fulfillment,
     grammar_extractor::GrammarExtractor,
     history_trust::TrustAssessment,
     holographic_memory::{HoloAnalogyHit, HoloHit},
@@ -89,6 +90,7 @@ use know_prolog::{
     },
     weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
     InputMode, KnowledgeExtractor, KnowledgeItem, OxigraphManager, ResponseFormatter,
+    SystemConfig,
 };
 
 #[derive(Parser)]
@@ -298,6 +300,27 @@ enum Commands {
         /// Also fail (exit code) on warnings
         #[arg(long)]
         strict: bool,
+    },
+    /// Check whether declared predicate laws are actually fulfilled by the
+    /// runtime: generate minimal probes from config + graph witnesses and run
+    /// them through the real answer pipeline (read-only; never writes the KB)
+    ConfigFulfillment {
+        /// Config file path (defaults to config.toml)
+        #[arg(long)]
+        file: Option<String>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Also fail (exit code) on gaps (honest unknown / unchecked / no
+        /// witness / unregistered predicate), not only on wrong answers
+        #[arg(long)]
+        strict: bool,
+        /// Show fulfilled obligations too
+        #[arg(long)]
+        verbose: bool,
+        /// Maximum number of obligations to generate
+        #[arg(long)]
+        max_obligations: Option<usize>,
     },
     /// Compile the language assets into a schema snapshot, diff it against the
     /// release lock, and run the offline release gates
@@ -627,6 +650,28 @@ async fn main() {
     // 因此不依赖默认配置加载，也不打开知识存储。
     if let Some(Commands::ConfigLint { file, json, strict }) = &cli.command {
         run_config_lint(file.as_deref(), *json, *strict);
+        return;
+    }
+
+    // 配置兑现只读配置与图：在加载默认配置/打开交互存储之前处理，
+    // 这样空图或存储路径覆盖也能得到一份可复现的报告。
+    if let Some(Commands::ConfigFulfillment {
+        file,
+        json,
+        strict,
+        verbose,
+        max_obligations,
+    }) = &cli.command
+    {
+        run_config_fulfillment(
+            file.as_deref(),
+            cli.store.as_deref(),
+            *json,
+            *strict,
+            *verbose,
+            max_obligations.unwrap_or(fulfillment::DEFAULT_MAX_OBLIGATIONS),
+        )
+        .await;
         return;
     }
 
@@ -1570,6 +1615,8 @@ async fn main() {
         Some(Commands::ReadTrace { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
+        // 已在加载默认配置前处理（见 main 顶部早期分派）
+        Some(Commands::ConfigFulfillment { .. }) => {}
         Some(Commands::EvalQuality {
             baseline,
             update_baseline,
@@ -2897,6 +2944,84 @@ fn run_config_lint(file: Option<&str>, json: bool, strict: bool) {
         println!("{}", config_contract::render_text(&issues));
     }
     if errors > 0 || (strict && warnings > 0) {
+        std::process::exit(1);
+    }
+}
+
+/// `config-fulfillment`：把配置里的蕴涵声明编译成证明义务，用图上的见证
+/// 生成最小问句，再走真实回答管线判定「兑现 / 诚实不知道 / 说错 / 未检验」。
+/// 只读：不写知识库、不改变交互路径；图里未登记的谓词单独列出。
+async fn run_config_fulfillment(
+    file: Option<&str>,
+    store: Option<&str>,
+    json: bool,
+    strict: bool,
+    verbose: bool,
+    max_obligations: usize,
+) {
+    let path = file.unwrap_or("config.toml");
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("读取配置文件 {} 失败: {}", path, error);
+            std::process::exit(1);
+        }
+    };
+    let config: SystemConfig = match toml::from_str(&source) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("解析配置文件 {} 失败: {}", path, error);
+            std::process::exit(1);
+        }
+    };
+
+    let mut registry = know_prolog::predicate_registry::PredicateRegistry::new();
+    registry.set_strict_admission(config.reasoning.require_predicate_admission);
+    for profile in &config.predicate_profiles {
+        registry.declare(profile);
+    }
+
+    let store_path = store.unwrap_or(&config.system.oxigraph_store_path);
+    let manager = match OxigraphManager::new(store_path) {
+        Ok(manager) => manager,
+        Err(error) => {
+            eprintln!("打开知识存储 {} 失败: {}", store_path, error);
+            std::process::exit(1);
+        }
+    };
+    let facts = match manager.load_graph_snapshot().await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识图谱快照失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+
+    let report = fulfillment::evaluate_with_config(
+        &registry,
+        facts.as_slice(),
+        &config.reasoning,
+        max_obligations,
+    );
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("兑现报告序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("配置文件：{}", path);
+        println!("知识存储：{}", store_path);
+        println!("{}", report.render_text(verbose));
+    }
+
+    if !report.is_clean() {
+        std::process::exit(1);
+    }
+    if strict && report.has_gaps() {
         std::process::exit(1);
     }
 }
