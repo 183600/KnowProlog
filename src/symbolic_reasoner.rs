@@ -28,6 +28,7 @@ use crate::derivation::Derivation;
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
+use crate::graph_diagnosis::diagnose_failure;
 use crate::graph_ledger;
 use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
@@ -7493,12 +7494,21 @@ impl SymbolicReasoner {
                 .interpret(question, &lexicon, &facts, options)
             {
                 return Some(match result {
-                    Ok(reply) => self.render_graph_reply(
-                        &session.compiled,
-                        &session.conversation,
-                        &reply,
-                        &facts,
-                    ),
+                    Ok(reply) => {
+                        let mut answer = self.render_graph_reply(
+                            &session.compiled,
+                            &session.conversation,
+                            &reply,
+                            &facts,
+                        );
+                        self.append_graph_failure(
+                            &mut answer,
+                            &session.conversation,
+                            &facts,
+                            options,
+                        );
+                        answer
+                    }
                     Err(error) => format!("图谱追问无法执行：{}。", error),
                 });
             }
@@ -7506,12 +7516,31 @@ impl SymbolicReasoner {
         let compiled = lexicon.compile(question)?;
         let conversation =
             ConversationalGraph::new(compiled.pattern.clone(), &facts, options).ok()?;
-        let answer = self.render_graph_question(&compiled, conversation.outcome(), &facts);
+        let mut answer = self.render_graph_question(&compiled, conversation.outcome(), &facts);
+        self.append_graph_failure(&mut answer, &conversation, &facts, options);
         *guard = Some(GraphSession {
             compiled,
             conversation,
         });
         Some(answer)
+    }
+
+    /// 零解时把「为什么没有」追加到回答后面；有解或搜索预算未定时不插话。
+    fn append_graph_failure(
+        &self,
+        answer: &mut String,
+        conversation: &ConversationalGraph,
+        facts: &[GraphFact],
+        options: MatchOptions,
+    ) {
+        if !conversation.outcome().is_empty() {
+            return;
+        }
+        let Some(diagnosis) = diagnose_failure(conversation.pattern(), facts, options) else {
+            return;
+        };
+        answer.push('\n');
+        answer.push_str(&diagnosis.render(conversation.pattern()));
     }
 
     fn render_graph_reply(
@@ -18048,6 +18077,17 @@ types = [
             .answer_graph_question("小巨人和刘翔出生在同一个城市吗？")
             .expect("已确认实体别名应进入图谱词表");
         assert!(aliased.contains("上海"), "{}", aliased);
+    }
+
+    #[test]
+    fn graph_question_reports_why_a_conjunction_fails() {
+        let reasoner = graph_pattern_reasoner();
+        let answer = reasoner
+            .answer_graph_question("谁既导演过科幻片，又主演过中国人？")
+            .expect("图谱问句应仍由模式管线回答");
+        assert!(answer.contains("失败诊断"), "{}", answer);
+        assert!(answer.contains("连接冲突"), "{}", answer);
+        assert!(answer.contains("最小冲突组"), "{}", answer);
     }
 
     #[test]

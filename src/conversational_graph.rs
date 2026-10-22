@@ -428,7 +428,7 @@ impl<'a> GraphIndex<'a> {
         self.facts.is_empty()
     }
 
-    fn candidates(
+    pub fn candidates(
         &self,
         subject: Option<&str>,
         predicate: &str,
@@ -460,8 +460,24 @@ impl<'a> GraphIndex<'a> {
         }
     }
 
-    fn predicate_count(&self, predicate: &str) -> usize {
+    pub fn predicate_count(&self, predicate: &str) -> usize {
         self.by_p.get(predicate).map(Vec::len).unwrap_or(0)
+    }
+
+    /// 指定主语/谓词的事实数（宾语不参与过滤）。
+    pub fn subject_predicate_count(&self, subject: &str, predicate: &str) -> usize {
+        self.by_sp
+            .get(&(subject, predicate))
+            .map(Vec::len)
+            .unwrap_or(0)
+    }
+
+    /// 指定谓词/宾语的事实数（主语不参与过滤）。
+    pub fn predicate_object_count(&self, predicate: &str, object: &str) -> usize {
+        self.by_po
+            .get(&(predicate, object))
+            .map(Vec::len)
+            .unwrap_or(0)
     }
 }
 

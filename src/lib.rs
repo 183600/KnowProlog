@@ -51,6 +51,7 @@ pub mod external_ledger;
 pub mod formal_semantics;
 pub mod function_words;
 pub mod grammar_extractor;
+pub mod graph_diagnosis;
 pub mod graph_ledger;
 pub mod graph_question;
 pub mod graph_walk_embedding;
