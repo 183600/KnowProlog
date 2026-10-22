@@ -3964,6 +3964,12 @@ impl SymbolicReasoner {
         if self.config.enable_resolution {
             self.resolver.add_fact_atom(atom.clone());
         }
+        if self.config.enable_soft_logic {
+            self.soft.add_fact(atom.clone());
+        }
+        if self.config.enable_problog {
+            self.problog.add_deterministic_fact(atom.clone());
+        }
         self.index_session_atom(atom);
     }
 
@@ -10495,6 +10501,25 @@ mod tests {
             !answer.contains("假设世界"),
             "已并入会话层后不应再标假设：{}",
             answer
+        );
+    }
+
+    #[test]
+    fn test_assumption_world_feeds_soft_logic_and_exit_removes_it() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner
+            .enter_assumption_world("赵六的师傅是钱七")
+            .expect("假设世界应可进入");
+        let inside = reasoner.soft_inference_report("赵六的师傅");
+        assert!(inside.contains("钱七"), "假设世界应进入软逻辑：{}", inside);
+
+        reasoner.exit_assumption_world().expect("应可退出");
+        let outside = reasoner.soft_inference_report("赵六的师傅");
+        assert!(
+            !outside.contains("钱七"),
+            "退出后软逻辑不得残留假设：{}",
+            outside
         );
     }
 
