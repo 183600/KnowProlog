@@ -823,7 +823,11 @@ async fn main() {
     }) = &cli.command
     {
         run_release_check(
-            config_file,
+            if config_file == "config.toml" {
+                &cli.config
+            } else {
+                config_file
+            },
             lock,
             *update_lock,
             language_version.clone(),
