@@ -2706,6 +2706,36 @@ mod tests {
     }
 
     #[test]
+    fn numeric_filter_compares_units_not_raw_numbers() {
+        let mut knowledge = TestKnowledge::new();
+        for (entity, value) in [
+            ("姚明", "226厘米"),
+            ("王治郅", "2.14米"),
+            ("易建联", "2.13米"),
+            ("诺维茨基", "2.13米"),
+            ("加索尔", "216厘米"),
+            ("奥尼尔", "2.16米"),
+        ] {
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![("身高".to_string(), value.to_string())],
+            );
+        }
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        let outcome = board.apply("只看身高超过2.15米", &knowledge, 7).unwrap();
+        assert!(outcome.text.contains("226厘米"), "{}", outcome.text);
+        let frame = board.current().unwrap();
+        assert_eq!(frame.rows.len(), 3);
+        let subjects: Vec<&str> = frame.rows.iter().map(|row| row.subject.as_str()).collect();
+        assert!(subjects.contains(&"姚明"));
+        assert!(subjects.contains(&"加索尔"));
+        assert!(subjects.contains(&"奥尼尔"));
+        assert!(!subjects.contains(&"王治郅"), "2.14 米不应超过 2.15 米");
+        assert!(!subjects.contains(&"易建联"));
+    }
+
+    #[test]
     fn sort_uses_unit_conversion_not_raw_numbers() {
         let mut knowledge = TestKnowledge::new();
         for (entity, value) in [
