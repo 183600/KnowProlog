@@ -757,6 +757,33 @@ impl std::fmt::Display for MatchFailure {
 
 impl std::error::Error for MatchFailure {}
 
+/// 一条失败经验里保存的「最近决策前沿」快照。
+///
+/// 经验账本记原句与词序列还不够：同一句「没懂」可能离命中只差一个词面，
+/// 也可能结构完全不对。把最近的受阻模式与失配要素一起落账，后续才能按
+/// 「缺口类型」聚合排序，而不是逐句重放。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeFrontier {
+    pub pattern_id: String,
+    pub pattern_name: String,
+    pub query_type: String,
+    /// 已覆盖前缀比例（0..=1）。
+    pub coverage: f64,
+    pub failure: MatchFailure,
+}
+
+impl EpisodeFrontier {
+    pub fn render(&self) -> String {
+        format!(
+            "最近受阻「{}」（{}，覆盖 {:.0}%）：{}",
+            self.pattern_name,
+            self.query_type,
+            self.coverage * 100.0,
+            self.failure.render()
+        )
+    }
+}
+
 /// 单要素层面的失配（由 [`attempt_elem`] 产生，由 [`match_entry_detailed`]
 /// 补全为带覆盖信息的 [`MatchFailure`]）。
 #[derive(Debug, Clone, PartialEq)]
@@ -851,6 +878,9 @@ pub struct PatternEpisode {
     pub first_turn: usize,
     #[serde(default)]
     pub last_turn: usize,
+    /// 未命中时最近一条受阻模式及其决策前沿；命中时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier: Option<EpisodeFrontier>,
 }
 
 fn one_u32() -> u32 {
@@ -1173,6 +1203,7 @@ impl PatternEpisodeLog {
             rejections: 0,
             first_turn: self.effective_turn(context.turn),
             last_turn: self.effective_turn(context.turn),
+            frontier: None,
         };
         self.upsert(episode.clone());
         self.entries
@@ -1205,6 +1236,20 @@ impl PatternEpisodeLog {
         tokens: &[crate::nlp::TaggedWord],
         context: &PatternContext,
     ) -> PatternEpisode {
+        self.record_unmatched_with_frontier(input, tokens, context, None)
+    }
+
+    /// 记录未命中，并保存最近受阻模式的决策前沿。
+    ///
+    /// `frontier` 只描述**为什么没懂**（停在哪个要素、期望/实见什么），
+    /// 不参与经验身份与检索排序；旧账本没有该字段时按 `None` 恢复。
+    pub fn record_unmatched_with_frontier(
+        &mut self,
+        input: &str,
+        tokens: &[crate::nlp::TaggedWord],
+        context: &PatternContext,
+        frontier: Option<EpisodeFrontier>,
+    ) -> PatternEpisode {
         let episode = PatternEpisode {
             input: input.to_string(),
             tokens: token_pairs(tokens),
@@ -1223,6 +1268,7 @@ impl PatternEpisodeLog {
             rejections: 0,
             first_turn: self.effective_turn(context.turn),
             last_turn: self.effective_turn(context.turn),
+            frontier,
         };
         self.upsert(episode.clone());
         self.entries
@@ -1248,6 +1294,9 @@ impl PatternEpisodeLog {
             existing.bindings = episode.bindings;
             existing.acceptances = existing.acceptances.max(episode.acceptances);
             existing.rejections = existing.rejections.max(episode.rejections);
+            if episode.frontier.is_some() {
+                existing.frontier = episode.frontier;
+            }
             self.touch();
             return false;
         }
@@ -1293,6 +1342,9 @@ impl PatternEpisodeLog {
                 existing.rejections = existing.rejections.max(episode.rejections);
                 existing.first_turn = existing.first_turn.min(episode.first_turn);
                 existing.last_turn = existing.last_turn.max(episode.last_turn);
+                if episode.frontier.is_some() {
+                    existing.frontier = episode.frontier.clone();
+                }
             } else {
                 self.entries.push(episode.clone());
                 added += 1;
@@ -1662,6 +1714,8 @@ fn sort_matches(sort: &str, hints: &[String], token: &crate::nlp::TaggedWord) ->
 enum Attempt {
     Consumed {
         new_pos: usize,
+        /// 停留在 `new_pos` 这个 token 内的字节偏移（0 = 已越过 token 边界）。
+        new_offset: usize,
         span: Span,
         entity: Option<String>,
         binding: Option<(String, String)>,
@@ -1670,20 +1724,33 @@ enum Attempt {
     Absent,
 }
 
+/// 当前 token 是否是「下一个词面要素」的开头片段。
+///
+/// 用于人名/人名槽的跨词合并：结巴把「张三多大」切成 `张三/nr 多/unknown
+/// 大/nr` 时，若不看下一个词面，`nr` 会把「多」「大」一起吞掉。
+fn next_literal_starts_with(next_literal: Option<&str>, token: &str) -> bool {
+    next_literal
+        .map(|literal| literal.len() > token.len() && literal.starts_with(token))
+        .unwrap_or(false)
+}
+
 fn attempt_elem(
     elem: &Elem,
     pattern: &[Elem],
     index: usize,
     tokens: &[crate::nlp::TaggedWord],
     pos: usize,
+    offset: usize,
 ) -> Result<Attempt, ElemFailure> {
     let token = &tokens[pos];
+    let remainder = token.text.get(offset..).unwrap_or("");
     match elem {
         Elem::Optional(inner) => {
-            attempt_elem(inner, pattern, index, tokens, pos).or(Ok(Attempt::Absent))
+            attempt_elem(inner, pattern, index, tokens, pos, offset).or(Ok(Attempt::Absent))
         }
         Elem::Pos { pos: expected } if expected == "nr" => {
-            if token.pos != "nr" && token.pos != "unknown" {
+            // 人名/整词词性只能从 token 边界开始，避免把半个词当人名。
+            if offset != 0 || (token.pos != "nr" && token.pos != "unknown") {
                 return Err(ElemFailure::new(
                     MatchFailureKind::PosMismatch,
                     "期望人名(nr)",
@@ -1697,7 +1764,11 @@ fn attempt_elem(
                 _ => None,
             };
             while end < tokens.len() && (tokens[end].pos == "unknown" || tokens[end].pos == "nr") {
-                if next_literal == Some(tokens[end].text.as_str()) {
+                if next_literal == Some(tokens[end].text.as_str())
+                    || next_literal_starts_with(next_literal, tokens[end].text.as_str())
+                {
+                    // 「张三多大」被切成 `张三/nr 多/unknown 大/nr` 时，
+                    // 人名合并不能把下一个词面的首字吞进名字。
                     break;
                 }
                 parts.push(tokens[end].text.clone());
@@ -1705,13 +1776,14 @@ fn attempt_elem(
             }
             Ok(Attempt::Consumed {
                 new_pos: end,
+                new_offset: 0,
                 span: Span::new(pos, end),
                 entity: Some(parts.join("")),
                 binding: None,
             })
         }
         Elem::Pos { pos: expected } => {
-            if token.pos != *expected {
+            if offset != 0 || token.pos != *expected {
                 return Err(ElemFailure::new(
                     MatchFailureKind::PosMismatch,
                     format!("期望词性「{}」", expected),
@@ -1725,51 +1797,76 @@ fn attempt_elem(
             };
             Ok(Attempt::Consumed {
                 new_pos: pos + 1,
+                new_offset: 0,
                 span: Span::new(pos, pos + 1),
                 entity,
                 binding: None,
             })
         }
         Elem::Word { surface } => {
-            let current = token.text.as_str();
-            if current == surface {
+            // 同一 token 内已经消费过前缀时，只允许从剩余部分继续；
+            // 这样「解释一下」可以先吃「解释」再吃「一下」。
+            if remainder == surface {
                 return Ok(Attempt::Consumed {
                     new_pos: pos + 1,
+                    new_offset: 0,
                     span: Span::new(pos, pos + 1),
                     entity: None,
                     binding: None,
                 });
             }
-            // 逐字跨词：词面被切成单字 token 序列时按字推进
-            if surface.len() > 1 {
-                let chars: Vec<char> = surface.chars().collect();
-                let mut temp = pos;
-                let mut matched = 0usize;
-                for expected_char in &chars {
-                    if temp < tokens.len() {
-                        let word = tokens[temp].text.as_str();
-                        if word.len() == expected_char.len_utf8()
-                            && word.starts_with(*expected_char)
-                        {
-                            matched += 1;
-                            temp += 1;
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                if matched == chars.len() {
+            if !remainder.is_empty() && remainder.starts_with(surface.as_str()) {
+                let new_offset = offset + surface.len();
+                if new_offset >= token.text.len() {
                     return Ok(Attempt::Consumed {
-                        new_pos: temp,
-                        span: Span::new(pos, temp),
+                        new_pos: pos + 1,
+                        new_offset: 0,
+                        span: Span::new(pos, pos + 1),
                         entity: None,
                         binding: None,
                     });
                 }
+                return Ok(Attempt::Consumed {
+                    new_pos: pos,
+                    new_offset,
+                    span: Span::new(pos, pos + 1),
+                    entity: None,
+                    binding: None,
+                });
             }
-            if current.contains(surface.as_str()) || surface.contains(current) {
+            // 跨词拼接：词面被分词器切成多个 token 时，按 token 边界
+            // 累积，只有**恰好拼成完整词面**才消费。这样「多大」可以是
+            // `多 + 大`，「有什么」可以是 `有 + 什么`；但不会把只是
+            // 前缀相同的 token 误吞（例如「什么」对「什么关系」）。
+            if surface.chars().count() > 1 {
+                let mut concat = String::from(remainder);
+                let mut temp = pos + 1;
+                while temp < tokens.len() {
+                    concat.push_str(tokens[temp].text.as_str());
+                    temp += 1;
+                    if concat == surface.as_str() {
+                        return Ok(Attempt::Consumed {
+                            new_pos: temp,
+                            new_offset: 0,
+                            span: Span::new(pos, temp),
+                            entity: None,
+                            binding: None,
+                        });
+                    }
+                    if !surface.starts_with(concat.as_str()) {
+                        break;
+                    }
+                }
+            }
+            // 兼容既有「包含匹配」：只在 token 边界且没有更精确解时使用；
+            // 它会消费整个 token，因此把词面拆到同一 token 内时优先走上面的
+            // 前缀/跨词路径。
+            if offset == 0
+                && (token.text.contains(surface.as_str()) || surface.contains(&token.text))
+            {
                 return Ok(Attempt::Consumed {
                     new_pos: pos + 1,
+                    new_offset: 0,
                     span: Span::new(pos, pos + 1),
                     entity: None,
                     binding: None,
@@ -1782,7 +1879,7 @@ fn attempt_elem(
             ))
         }
         Elem::Slot { name, sort, hints } => {
-            if sort_matches(sort, hints, token) {
+            if offset == 0 && sort_matches(sort, hints, token) {
                 // 人名槽与 `nr` 一样要能跨过结巴切开的后续字：
                 // 「王强」可能分成「王/nr」「强/unknown」，但槽仍应绑定
                 // 完整词面，而不是只吃掉第一个字后让后续要素失配。
@@ -1797,6 +1894,7 @@ fn attempt_elem(
                         if is_skippable(next.text.as_str())
                             || !(next.pos == "unknown" || next.pos == "nr")
                             || next_literal == Some(next.text.as_str())
+                            || next_literal_starts_with(next_literal, next.text.as_str())
                         {
                             break;
                         }
@@ -1809,6 +1907,7 @@ fn attempt_elem(
                     .collect();
                 Ok(Attempt::Consumed {
                     new_pos: end,
+                    new_offset: 0,
                     span: Span::new(pos, end),
                     entity: Some(surface.clone()),
                     binding: Some((name.clone(), surface)),
@@ -1823,6 +1922,7 @@ fn attempt_elem(
         }
         Elem::Any => Ok(Attempt::Consumed {
             new_pos: pos + 1,
+            new_offset: 0,
             span: Span::new(pos, pos + 1),
             entity: None,
             binding: None,
@@ -1853,6 +1953,7 @@ pub fn match_entry_detailed(
     }
 
     let mut pos = 0usize;
+    let mut offset = 0usize;
     let mut bindings = BindingSet::new();
     let mut entities = Vec::new();
     let mut entity_spans = Vec::new();
@@ -1862,8 +1963,12 @@ pub fn match_entry_detailed(
     let mut entity_counter = 0usize;
 
     for (index, elem) in elems.iter().enumerate() {
-        while pos < tokens.len() && is_skippable(tokens[pos].text.as_str()) {
+        while pos < tokens.len() && offset == 0 && is_skippable(tokens[pos].text.as_str()) {
             pos += 1;
+        }
+        if pos < tokens.len() && offset >= tokens[pos].text.len() {
+            pos += 1;
+            offset = 0;
         }
         if pos >= tokens.len() {
             if matches!(elem, Elem::Optional(_)) {
@@ -1883,7 +1988,7 @@ pub fn match_entry_detailed(
             });
         }
 
-        let attempt = match attempt_elem(elem, elems, index, tokens, pos) {
+        let attempt = match attempt_elem(elem, elems, index, tokens, pos, offset) {
             Ok(attempt) => attempt,
             Err(error) => {
                 return Err(MatchFailure {
@@ -1903,6 +2008,7 @@ pub fn match_entry_detailed(
             Attempt::Absent => elem_spans.push(None),
             Attempt::Consumed {
                 new_pos,
+                new_offset,
                 span,
                 entity,
                 binding,
@@ -1920,6 +2026,7 @@ pub fn match_entry_detailed(
                 span_start.get_or_insert(span.start);
                 span_end = span_end.max(span.end);
                 pos = new_pos;
+                offset = new_offset;
                 elem_spans.push(Some(span));
             }
         }
@@ -1959,7 +2066,7 @@ fn first_elem_may_miss(entry: &PatternEntry, tokens: &[crate::nlp::TaggedWord]) 
     if pos >= tokens.len() {
         return !matches!(first, Elem::Optional(_));
     }
-    attempt_elem(first, &entry.elems, 0, tokens, pos).is_err()
+    attempt_elem(first, &entry.elems, 0, tokens, pos, 0).is_err()
 }
 
 // ---------------------------------------------------------------------------
@@ -2662,6 +2769,9 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
             feedback,
             episode.input
         );
+        if let Some(frontier) = &episode.frontier {
+            let _ = writeln!(out, "      ↳ {}", frontier.render());
+        }
     }
     let mut recent: Vec<&PatternEpisode> = log.entries().iter().collect();
     recent.sort_by(|a, b| {
@@ -3439,6 +3549,36 @@ mod tests {
     }
 
     #[test]
+    fn person_merge_stops_before_next_word_element() {
+        let config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        // 结巴把它切成 `张三/nr 多/unknown 大/nr`：人名合并不能吞掉「多大」。
+        let tokens = preprocess("张三多大", &config.nlp);
+        assert_eq!(
+            tokens.iter().map(|word| word.text.as_str()).collect::<Vec<_>>(),
+            vec!["张三", "多", "大"]
+        );
+        let matched = library.match_route(&tokens).expect("年龄规则应命中");
+        assert_eq!(matched.entry.query_type, "age_query");
+        assert_eq!(matched.entities, vec!["张三".to_string()]);
+    }
+
+    #[test]
+    fn multi_token_literal_is_joined_across_token_boundaries() {
+        let config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        let tokens = preprocess("苹果和书有什么区别", &config.nlp);
+        let matched = library.match_route(&tokens).expect("比较规则应命中");
+        assert_eq!(matched.entry.query_type, "comparison_query");
+        assert_eq!(
+            matched.entities,
+            vec!["苹果".to_string(), "书".to_string()]
+        );
+    }
+
+    #[test]
     fn slot_bindings_come_from_sort_constraints() {
         let mut library = PatternLibrary::new();
         let domain = crate::nlu::default_domains()
@@ -3961,12 +4101,16 @@ mod tests {
             for tokens in [preprocess(input, &config.nlp), manual_tokens(input)] {
                 let legacy = analyze_query_intent(&tokens, &legacy_rules);
                 let unified = library.route(&tokens);
-                assert_eq!(
-                    legacy, unified,
-                    "路由不一致：输入「{}」legacy={:?} unified={:?}",
-                    input, legacy, unified
-                );
-                if legacy.is_some() {
+                // 统一匹配器是旧匹配器的超集：旧路由能命中的必须逐字一致；
+                // 旧匹配器因「复合词不拆」而漏掉的（如「海拔高度」），
+                // 统一匹配器允许新增命中，这是本轮的有意改进。
+                if let Some(legacy_route) = legacy {
+                    assert_eq!(
+                        Some(legacy_route),
+                        unified,
+                        "统一匹配器不得改变旧路由：输入「{}」",
+                        input
+                    );
                     agreements += 1;
                 }
             }
@@ -4179,6 +4323,50 @@ mod tests {
         let report = render_episode_report(&log);
         assert!(report.contains("模式经验：3 条"), "{}", report);
         assert!(report.contains("×2"), "{}", report);
+    }
+
+    #[test]
+    fn unmatched_episode_keeps_the_decision_frontier() {
+        let library = sample_library();
+        let entry = library.entries()[0].clone();
+        let tokens = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("在", "v"),
+            ("哪里", "r"),
+        ]);
+        let failure = match_entry_detailed(&entry, &tokens).expect_err("「在」不应命中「是」");
+        let snapshot = EpisodeFrontier {
+            pattern_id: entry.id(),
+            pattern_name: entry.name.clone(),
+            query_type: entry.query_type.clone(),
+            coverage: failure.coverage(),
+            failure,
+        };
+        let mut log = PatternEpisodeLog::with_capacity(4);
+        let episode = log.record_unmatched_with_frontier(
+            "法国的首都在哪里",
+            &tokens,
+            &PatternContext::default(),
+            Some(snapshot.clone()),
+        );
+        assert_eq!(episode.frontier.as_ref(), Some(&snapshot));
+        assert_eq!(episode.outcome, EpisodeOutcome::Unmatched);
+
+        // 落图/序列化后前沿仍然可恢复；旧账本没有该字段也应按 None 读入。
+        let json = serde_json::to_string(&episode).expect("序列化经验");
+        let restored: PatternEpisode = serde_json::from_str(&json).expect("反序列化经验");
+        assert_eq!(restored.frontier.as_ref(), Some(&snapshot));
+        let legacy: PatternEpisode = serde_json::from_str(
+            r#"{"input":"旧句","tokens":[],"outcome":"unmatched"}"#,
+        )
+        .expect("旧账本应兼容");
+        assert!(legacy.frontier.is_none());
+
+        let report = render_episode_report(&log);
+        assert!(report.contains("最近受阻"), "{}", report);
+        assert!(report.contains("第4要素"), "{}", report);
     }
 
     #[test]

@@ -553,7 +553,15 @@ fn match_pattern_for_prolog(
                             && (tagged_words[next_pos].pos == "unknown"
                                 || tagged_words[next_pos].pos == "nr")
                         {
-                            if next_literal == Some(tagged_words[next_pos].text.as_str()) {
+                            let next_text = tagged_words[next_pos].text.as_str();
+                            if next_literal == Some(next_text)
+                                || next_literal
+                                    .map(|literal| {
+                                        literal.len() > next_text.len()
+                                            && literal.starts_with(next_text)
+                                    })
+                                    .unwrap_or(false)
+                            {
                                 break;
                             }
                             name_parts.push(tagged_words[next_pos].text.clone());
@@ -587,29 +595,23 @@ fn match_pattern_for_prolog(
                         continue;
                     }
 
-                    // 检查是否是被分词的复合词
-                    if expected_word.len() > 1 {
-                        let expected_chars: Vec<char> = expected_word.chars().collect();
-                        let mut matched_count = 0usize;
+                    // 检查是否是被分词的复合词：按 token 边界累积，
+                    // 恰好拼成完整词面才消费（「有什么」= 有 + 什么）。
+                    if expected_word.chars().count() > 1 {
+                        let mut concat = String::new();
                         let mut temp_pos = pos;
-
-                        for expected_char in &expected_chars {
-                            if temp_pos < tagged_words.len() {
-                                let word_text = tagged_words[temp_pos].text.as_str();
-                                // 等价于 word_text == expected_char.to_string()
-                                if word_text.len() == expected_char.len_utf8()
-                                    && word_text.starts_with(*expected_char)
-                                {
-                                    matched_count += 1;
-                                    temp_pos += 1;
-                                    continue;
-                                }
+                        while temp_pos < tagged_words.len() {
+                            concat.push_str(tagged_words[temp_pos].text.as_str());
+                            temp_pos += 1;
+                            if concat == expected_word.as_str() {
+                                pos = temp_pos;
+                                break;
                             }
-                            break;
+                            if !expected_word.starts_with(concat.as_str()) {
+                                break;
+                            }
                         }
-
-                        if matched_count == expected_chars.len() {
-                            pos = temp_pos;
+                        if pos == temp_pos && concat == expected_word.as_str() {
                             continue;
                         }
                     }
