@@ -87,6 +87,7 @@ pub mod predicate_registry;
 pub mod problog;
 pub mod prolog_engine;
 pub mod prompt_spec;
+pub mod proof_bench;
 pub mod proof_journal;
 pub mod quality;
 pub mod query_board;

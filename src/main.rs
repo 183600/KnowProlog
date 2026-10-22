@@ -58,6 +58,7 @@ use know_prolog::{
     prolog_engine::PrologEngine,
     prolog_engine::PrologFact,
     prompt_spec::{self, LintSeverity, PromptMode},
+    proof_bench::{self, ProofBenchBaseline},
     proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
     quality::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
@@ -245,6 +246,26 @@ enum Commands {
         /// Do not fail (exit code) on regressions
         #[arg(long)]
         allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the ProofBench corpus: structured readings, proof obligations,
+    /// counterfactual twins and bounded proof-distance estimates (offline;
+    /// does not open the knowledge store)
+    ProofBench {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Write the auditable Prolog corpus to this path
+        #[arg(long)]
+        emit_prolog: Option<String>,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -740,6 +761,22 @@ async fn main() {
             json,
         }) => {
             run_eval_recovery(baseline.clone(), *update_baseline, *allow_regression, *json);
+            return;
+        }
+        Some(Commands::ProofBench {
+            baseline,
+            update_baseline,
+            allow_regression,
+            emit_prolog,
+            json,
+        }) => {
+            run_proof_bench(
+                baseline.clone(),
+                *update_baseline,
+                *allow_regression,
+                emit_prolog.as_deref(),
+                *json,
+            );
             return;
         }
         Some(Commands::FuzzDialogue {
@@ -1507,6 +1544,7 @@ async fn main() {
         Some(Commands::EvalLink { .. }) => {}
         Some(Commands::EvalIdentity { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
+        Some(Commands::ProofBench { .. }) => {}
         Some(Commands::ReleaseCheck { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派）
         Some(Commands::PromptLint { .. }) => {}
@@ -2084,6 +2122,70 @@ fn run_eval_recovery(
             }
             Err(e) => {
                 eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `proof-bench`：证明义务 / 反事实孪生 / 证距评测 + 回归棘轮（不依赖知识存储）。
+fn run_proof_bench(
+    baseline: Option<String>,
+    update_baseline: bool,
+    allow_regression: bool,
+    emit_prolog: Option<&str>,
+    json: bool,
+) {
+    let report = proof_bench::evaluate_seed();
+    if let Some(path) = emit_prolog {
+        let corpus = proof_bench::render_prolog(proof_bench::seed_corpus());
+        match std::fs::write(path, corpus) {
+            Ok(()) => {
+                if !json {
+                    println!("可审计 Prolog 语料已写入 {}", path);
+                }
+            }
+            Err(error) => {
+                eprintln!("Prolog 语料写入失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("ProofBench 报告序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline
+        .clone()
+        .unwrap_or_else(|| "proof_bench_baseline.json".to_string());
+    if update_baseline {
+        let new_baseline = ProofBenchBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => println!("ProofBench 基线已写入 {}", baseline_path),
+            Err(error) => {
+                eprintln!("基线写入失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match ProofBenchBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                let verdict = proof_bench::compare_baseline(&old_baseline, &report, 1e-6);
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("基线读取失败: {}", error);
                 std::process::exit(1);
             }
         }
