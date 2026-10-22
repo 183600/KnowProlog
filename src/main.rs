@@ -1983,8 +1983,13 @@ async fn main() {
                 }
             });
             let report =
-                match quality_report_for_with_provenance(&oxigraph_manager, &config, ledger.as_ref())
-                    .await
+                match quality_report_for_with_provenance(
+                    &oxigraph_manager,
+                    &config,
+                    ledger.as_ref(),
+                    Some(&store_path),
+                )
+                .await
                 {
                     Ok(report) => report,
                     Err(e) => {
@@ -3480,31 +3485,45 @@ fn ledger_entry_to_clause(
 async fn quality_report_for(
     oxigraph_manager: &OxigraphManager,
     config: &know_prolog::SystemConfig,
+    store_path: &str,
 ) -> Result<know_prolog::quality::QualityReport, Box<dyn std::error::Error + Send + Sync>> {
-    quality_report_for_with_provenance(oxigraph_manager, config, None).await
+    quality_report_for_with_provenance(oxigraph_manager, config, None, Some(store_path)).await
 }
 
 async fn quality_report_for_with_provenance(
     oxigraph_manager: &OxigraphManager,
     config: &know_prolog::SystemConfig,
     provenance: Option<&ProvenanceLedger>,
+    store_path: Option<&str>,
 ) -> Result<know_prolog::quality::QualityReport, Box<dyn std::error::Error + Send + Sync>> {
     let facts = oxigraph_manager.load_graph_snapshot().await?;
     let registry = oxigraph_manager.predicate_registry_snapshot();
     let types = oxigraph_manager.type_system_snapshot();
+    // 事实级来源：外部台账 ∪ 导入日志回填。即使为空也显式传入，让
+    // 「谓词被声明过」不再冒充「这条事实有出处」。
+    let mut ledger = ProvenanceLedger::new();
+    if let Some(store_path) = store_path {
+        let journal_path = format!("{}/import_journal.json", store_path);
+        if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
+            ledger.seed_from_import_journal(&journal);
+        }
+    }
+    if let Some(external) = provenance {
+        ledger.merge(external);
+    }
     let mut report = know_prolog::quality::build_report_with_provenance(
         &facts,
         &registry,
         &types,
         &config.entity_types,
-        provenance,
+        Some(&ledger),
     );
     // 快照折叠多值；质量护照必须再用无损事实表回填已见证的功能槽冲突。
     if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
         know_prolog::quality::apply_witnessed_conflicts(
             &mut report,
             &fact_refs,
-            provenance,
+            Some(&ledger),
             &registry,
             &types,
         );
@@ -6962,7 +6981,7 @@ async fn run_interactive_mode(
 
         // 质量护照：确定性可信向量（低分只用于排序/措辞/追问，不写回、不删事实）
         if matches!(input, "质量护照" | "质量总览" | "护照总览") {
-            match quality_report_for(&oxigraph_manager, &config).await {
+            match quality_report_for(&oxigraph_manager, &config, &store_path).await {
                 Ok(report) => println!("{}", report.render_text()),
                 Err(e) => eprintln!("构建质量护照失败: {}", e),
             }
@@ -6989,7 +7008,7 @@ async fn run_interactive_mode(
             if entity.is_empty() {
                 println!("请给出实体名，例如：质量护照：张三");
             } else {
-                match quality_report_for(&oxigraph_manager, &config).await {
+                match quality_report_for(&oxigraph_manager, &config, &store_path).await {
                     Ok(report) => match report.passport_for(entity) {
                         Some(passport) => println!("{}", render_entity_passport(passport)),
                         None => println!(
