@@ -1,0 +1,6 @@
+target/
+.git/
+.github/
+oxigraph_data/
+release.lock.json
+*.log
