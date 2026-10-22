@@ -15088,6 +15088,25 @@ mod tests {
     }
 
     #[test]
+    fn shelved_pending_question_is_not_auto_reopened_by_new_facts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        reasoner
+            .try_answer_pending_question("不知道")
+            .expect("明确不知道应搁置");
+        reasoner.observe_facts(&master_facts());
+        assert!(
+            reasoner.resolve_pending_after_assertion().is_none(),
+            "搁置的悬问不应被新事实自动重开"
+        );
+        assert!(!reasoner.has_pending_question());
+        assert!(reasoner.pending_question_report().contains("已搁置 1 条"));
+    }
+
+    #[test]
     fn pending_question_resolves_after_new_graph_facts_arrive() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&pair_facts());

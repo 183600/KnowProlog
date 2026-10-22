@@ -210,7 +210,8 @@ impl PendingQuestionLedger {
                 && pending.hole.inverted == hole.inverted
         }) {
             existing.asks = existing.asks.saturating_add(1);
-            if existing.support.is_empty() && !support.is_empty() {
+            // 支持边按当前知识重算：用户补过前提后，旧前缀可能已不是最新。
+            if !support.is_empty() {
                 existing.support = support;
             }
             let id = existing.id;
