@@ -1466,7 +1466,8 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
         "排名依据：{} 的 {} 是 {}。",
         selected.subject, label, selected.value
     );
-    let mut evidence = vec![selected.evidence.clone()];
+    // 选中行的出处已由 apply_explain 放入 provenance，这里只补相邻名次。
+    let mut evidence = Vec::new();
     match (previous, next) {
         (None, None) => {
             text.push_str("没有其他同量纲记录可以比较，名次由唯一可比取值决定。");
