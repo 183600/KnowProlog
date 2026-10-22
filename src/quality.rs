@@ -1014,6 +1014,12 @@ pub struct QualityBaseline {
     pub mean_score: f64,
     pub low_score: usize,
     pub conflicts: usize,
+    /// 已见证冲突点数（旧基线缺省为 0）。
+    #[serde(default)]
+    pub witnessed_conflicts: usize,
+    /// 修复已见证冲突的最少删除数（旧基线缺省为 0）。
+    #[serde(default)]
+    pub witnessed_retraction_cost: usize,
 }
 
 impl QualityBaseline {
@@ -1025,6 +1031,8 @@ impl QualityBaseline {
             mean_score: report.summary.mean_score,
             low_score: report.summary.low_score,
             conflicts: report.summary.conflicts,
+            witnessed_conflicts: report.summary.witnessed_conflicts,
+            witnessed_retraction_cost: report.summary.witnessed_retraction_cost,
         }
     }
 
@@ -1135,6 +1143,18 @@ pub fn compare_baseline(
         "conflicts",
         baseline.conflicts as f64,
         current.summary.conflicts as f64,
+        false,
+    );
+    push(
+        "witnessed_conflicts",
+        baseline.witnessed_conflicts as f64,
+        current.summary.witnessed_conflicts as f64,
+        false,
+    );
+    push(
+        "witnessed_retraction_cost",
+        baseline.witnessed_retraction_cost as f64,
+        current.summary.witnessed_retraction_cost as f64,
         false,
     );
     let passed = deltas.iter().all(|delta| delta.passed);
@@ -1402,6 +1422,31 @@ mod tests {
             .deltas
             .iter()
             .any(|delta| delta.metric == "mean_score" && !delta.passed));
+    }
+
+    #[test]
+    fn ratchet_rejects_new_witnessed_conflicts() {
+        let registry = registry_with_master();
+        let facts = vec![entity("张三", "Person", &[("name", "张三")])];
+        let base_report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let baseline = QualityBaseline::from_report(&base_report);
+        let mut worse = base_report.clone();
+        worse.summary.witnessed_conflicts = 1;
+        worse.summary.witnessed_retraction_cost = 1;
+        let verdict = compare_baseline(&baseline, &worse, RATCHET_EPSILON);
+        assert!(!verdict.passed);
+        assert!(verdict.deltas.iter().any(|delta| {
+            delta.metric == "witnessed_conflicts" && !delta.passed
+        }));
+
+        // 旧基线 JSON 没有新字段：默认 0，不因反序列化失败而丢失棘轮。
+        let old: QualityBaseline = serde_json::from_str(
+            r#"{"digest":"d","entities":1,"typed_rate":1.0,"mean_score":1.0,
+                "low_score":0,"conflicts":0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.witnessed_conflicts, 0);
+        assert_eq!(old.witnessed_retraction_cost, 0);
     }
 
     #[test]

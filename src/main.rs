@@ -474,6 +474,9 @@ enum Commands {
         /// Maximum certificates printed in text mode (0 = all)
         #[arg(long, default_value_t = 40)]
         limit: usize,
+        /// Exit non-zero when any certificate is reported (CI gate)
+        #[arg(long)]
+        strict: bool,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -1396,6 +1399,7 @@ async fn main() {
             latent,
             namespaces,
             limit,
+            strict,
             json,
         }) => {
             let registry_path = format!("{}/predicate_registry.json", store_path);
@@ -1506,6 +1510,9 @@ async fn main() {
                         shown.certificates.len()
                     );
                 }
+            }
+            if strict && !report.certificates.is_empty() {
+                std::process::exit(1);
             }
         }
         Some(Commands::Temporal {
