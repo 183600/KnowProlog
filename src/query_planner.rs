@@ -453,7 +453,8 @@ impl QueryPlanner {
 
     fn is_question_word(text: &str) -> bool {
         [
-            "谁", "什么", "哪个", "哪位", "哪里", "啥", "何人", "几点", "多少", "几",
+            "谁", "什么", "哪个", "哪些", "哪一些", "哪几个", "哪位", "哪里", "啥", "何人",
+            "几点", "多少", "几",
         ]
         .iter()
         .any(|word| text.contains(word))
@@ -522,10 +523,29 @@ impl QueryPlanner {
     }
 
     fn parse_find_subject(&self, q: &str) -> Option<QueryPlan> {
-        let rest = q
+        if let Some(rest) = q
             .strip_prefix("谁的")
-            .or_else(|| q.strip_prefix("哪位的"))?;
-        let (predicate, object) = rest.split_once('是')?;
+            .or_else(|| q.strip_prefix("哪位的"))
+        {
+            if let Some((predicate, object)) = rest.split_once('是') {
+                return Self::find_subject_plan(predicate, object);
+            }
+        }
+        // 「身高是226的人是谁」把谓词放在句首：与「谁的身高是226」
+        // 是同一逻辑计划，只是表层语序不同。
+        for suffix in ["的人是谁", "的人有谁", "的人有哪些", "的人分别是谁"] {
+            let Some(rest) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let split = rest.split_once('是').or_else(|| rest.split_once('为'));
+            if let Some((predicate, object)) = split {
+                return Self::find_subject_plan(predicate, object);
+            }
+        }
+        None
+    }
+
+    fn find_subject_plan(predicate: &str, object: &str) -> Option<QueryPlan> {
         let predicate = predicate.trim();
         let object = object.trim();
         if predicate.is_empty() || object.is_empty() || Self::is_question_word(object) {
@@ -1118,7 +1138,10 @@ impl QueryPlanner {
     fn parse_exist(&self, q: &str) -> Option<QueryPlan> {
         if let Some((subject, predicate)) = q.split_once("有没有") {
             if let Some(predicate) = Self::strip_measure(predicate) {
-                if !subject.trim().is_empty() && !predicate.is_empty() {
+                if !subject.trim().is_empty()
+                    && !predicate.is_empty()
+                    && !Self::is_question_word(&predicate)
+                {
                     return Some(QueryPlan::Exist {
                         subject: subject.to_string(),
                         predicate,
@@ -1138,7 +1161,7 @@ impl QueryPlanner {
                 return None;
             }
             if let Some(predicate) = Self::strip_measure(tail) {
-                if !predicate.is_empty() {
+                if !predicate.is_empty() && !Self::is_question_word(&predicate) {
                     return Some(QueryPlan::Exist {
                         subject: subject.to_string(),
                         predicate,
@@ -1384,6 +1407,28 @@ mod tests {
                 predicate: "师傅".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_find_subject_pattern_accepts_predicate_first_phrasing() {
+        for (question, predicate, object) in [
+            ("身高是226的人是谁", "身高", "226"),
+            ("身高为226的人有谁", "身高", "226"),
+            ("国籍是中国的人有哪些", "国籍", "中国"),
+        ] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("应编译为反查主体：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindSubject {
+                    object: object.to_string(),
+                    predicate: predicate.to_string()
+                },
+                "{}",
+                question
+            );
+        }
     }
 
     #[test]
