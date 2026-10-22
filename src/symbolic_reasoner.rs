@@ -17180,6 +17180,32 @@ types = [
     }
 
     #[test]
+    fn copula_statement_answer_preserves_direction() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        let false_claim = reasoner
+            .answer("张三是李四的师傅吗")
+            .expect("是非问应给出判定");
+        assert!(false_claim.contains("不是"), "实际：{}", false_claim);
+        assert!(
+            !false_claim.contains("张三 的 师傅 是 李四"),
+            "不得把问题方向翻转成另一个查询：{}",
+            false_claim
+        );
+
+        let true_claim = reasoner
+            .answer("李四是张三的师傅吗")
+            .expect("反向是非问应给出判定");
+        assert!(true_claim.contains("是的"), "实际：{}", true_claim);
+
+        let statement = reasoner
+            .answer("张三是李四的师傅")
+            .expect("陈述句应给出校验判定");
+        assert!(statement.contains("不是"), "实际：{}", statement);
+    }
+
+    #[test]
     fn test_session_overlay_extends_paths_and_retract_restores() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&[

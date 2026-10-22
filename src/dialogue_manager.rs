@@ -1425,6 +1425,11 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
+        // 「A 是 B 的 C」交给蕴含/校验管线；指代重写会把 A 误当成待消解
+        // 的称谓并改写成「B 的 C」，从而翻转判断方向。
+        if is_entity_copula_relation_statement(input, knowledge) {
+            return None;
+        }
         if let Some(reply) = self.plan_identity_dialogue(input, knowledge) {
             return Some(reply);
         }
@@ -1650,6 +1655,11 @@ impl DialogueManager {
         input: &str,
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
+        // 「A 是 B 的 C」属于真值判断，不能让查询板按「B 的 C」重扫一遍：
+        // 否则「张三是李四的师傅吗」会被答成「李四的师傅是王五」。
+        if is_entity_copula_relation_statement(input, knowledge) {
+            return None;
+        }
         let revision = knowledge.revision();
         let attribute_hint = self
             .turns
@@ -1780,7 +1790,8 @@ impl DialogueManager {
 
         // 属性问句：S的P（是什么/是多少/是谁/怎么样/呢……），
         // 也接受"姚明的身高"这类无问词的简写，但不吸收含"是"的陈述。
-        if has_question || !stripped.contains('是') {
+        // 「A 是 B 的 C」是系表判断（校验方向），不是「A是B」的属性问句。
+        if (has_question || !stripped.contains('是')) && !is_copula_relation_statement(stripped) {
             if let Some((head, attribute)) = split_entity_attribute(stripped) {
                 let head_entity = explicit
                     .iter()
@@ -3653,6 +3664,36 @@ fn contains_pronoun(text: &str) -> bool {
     .any(|pronoun| cleaned.contains(pronoun))
 }
 
+/// 「A 是 B 的 C」：判断句把 C 作为 B 的属性来校验，而不是问 A 的属性。
+fn is_copula_relation_statement(text: &str) -> bool {
+    let text = text
+        .trim()
+        .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+        .trim_end_matches('吗')
+        .trim();
+    let Some((left, right)) = text.split_once('是') else {
+        return false;
+    };
+    !left.trim().is_empty() && !left.contains('的') && right.contains('的')
+}
+
+/// 同样的形状，但左侧必须是已登记实体；用于拦截查询板的「B 的 C」重扫，
+/// 避免把「列出身高是226的人」这类板查询也一并挡掉。
+fn is_entity_copula_relation_statement(text: &str, knowledge: &dyn DialogueKnowledge) -> bool {
+    if !is_copula_relation_statement(text) {
+        return false;
+    }
+    let text = text
+        .trim()
+        .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+        .trim_end_matches('吗')
+        .trim();
+    let Some((left, _)) = text.split_once('是') else {
+        return false;
+    };
+    !knowledge.entities_in(left.trim()).is_empty()
+}
+
 fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
     let index = text.find('的')?;
     let head = text[..index].trim();
@@ -4002,6 +4043,27 @@ mod tests {
         assert_eq!(frame.kind, MoveKind::AskAttribute);
         assert_eq!(frame.entity.as_deref(), Some("姚明"));
         assert_eq!(frame.attribute.as_deref(), Some("身高"));
+    }
+
+    #[test]
+    fn copula_relation_question_is_binary_not_attribute() {
+        let knowledge = mock();
+        let mut manager = DialogueManager::new();
+        let frame = manager.analyze("姚明是叶莉的师傅吗", &knowledge);
+        assert_eq!(frame.kind, MoveKind::AskBinary, "{:?}", frame);
+        assert_eq!(
+            frame.question.as_deref(),
+            Some("姚明是叶莉的师傅吗"),
+            "是非问必须原样交给蕴含管线，不能改写成属性查询"
+        );
+        let statement = manager.analyze("姚明是叶莉的师傅", &knowledge);
+        assert_eq!(statement.kind, MoveKind::Assert, "{:?}", statement);
+        assert!(
+            manager
+                .plan_reply("姚明是叶莉的师傅", &knowledge)
+                .is_none(),
+            "查询板不得把系表判断重扫成「叶莉的师傅」"
+        );
     }
 
     #[test]

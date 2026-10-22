@@ -439,6 +439,24 @@ impl QueryPlanner {
             }
             return None;
         }
+        if let Some((left, right)) = q.split_once('是') {
+            // 形式三：A 是 B 的 C → 校验 B 的 C 是否为 A
+            let left = left.trim();
+            let right = right.trim();
+            if !left.is_empty()
+                && !Self::is_question_word(left)
+                && right.contains('的')
+                && !Self::is_question_word(right)
+            {
+                let subject_segments = Self::segments_of(right);
+                if subject_segments.len() >= 2 && subject_segments.len() <= self.max_chain {
+                    return Some(QueryPlan::CheckTriple {
+                        subject_segments,
+                        object: left.to_string(),
+                    });
+                }
+            }
+        }
         if let Some((left, right)) = q.rsplit_once('是') {
             let left = left.trim();
             let object = right.trim();
@@ -561,12 +579,16 @@ impl QueryPlanner {
     }
 
     /// 「身高是226的人是谁」把谓词放在句首：与「谁的身高是226」
-    /// 是同一逻辑计划，只是表层语序不同。
+    /// 是同一逻辑计划，只是表层语序不同。必须带「的人是谁」类后缀，
+    /// 否则陈述句「张三是李四的师傅」会被误编译成反查。
     fn parse_predicate_object_plan(&self, q: &str) -> Option<QueryPlan> {
         let core = ["的人是谁", "的人有谁", "的人有哪些", "的人分别是谁"]
             .iter()
-            .find_map(|suffix| q.strip_suffix(suffix))
-            .unwrap_or(q);
+            .find_map(|suffix| q.strip_suffix(suffix))?;
+        Self::copula_subject_plan(core)
+    }
+
+    fn copula_subject_plan(core: &str) -> Option<QueryPlan> {
         let (predicate, object) = core
             .split_once('是')
             .or_else(|| core.split_once('为'))?;
@@ -604,7 +626,7 @@ impl QueryPlanner {
         if inner.is_empty() {
             return None;
         }
-        let QueryPlan::FindSubject { object, predicate } = self.parse_predicate_object_plan(inner)?
+        let QueryPlan::FindSubject { object, predicate } = Self::copula_subject_plan(inner)?
         else {
             return None;
         };
@@ -1524,6 +1546,34 @@ mod tests {
                 predicate: "师傅".to_string()
             }
         );
+    }
+
+    #[test]
+    fn copula_statements_are_not_mistaken_for_subject_lookup() {
+        for question in [
+            "张三是李四的师傅",
+            "张三是李四的师傅吗",
+            "姚明是中国人",
+        ] {
+            let plan = planner().parse(question);
+            assert!(
+                !matches!(plan, Some(QueryPlan::FindSubject { .. })),
+                "陈述句不得编译成反查：{} → {:?}",
+                question,
+                plan
+            );
+        }
+        for question in ["张三是李四的师傅", "张三是李四的师傅吗"] {
+            assert_eq!(
+                planner().parse(question),
+                Some(QueryPlan::CheckTriple {
+                    subject_segments: vec!["李四".to_string(), "师傅".to_string()],
+                    object: "张三".to_string(),
+                }),
+                "{}",
+                question
+            );
+        }
     }
 
     #[test]

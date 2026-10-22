@@ -11891,6 +11891,51 @@ mod session_tests {
     }
 
     #[test]
+    fn ask_pipeline_does_not_turn_copula_statement_into_attribute_query() {
+        let mut reasoner = SymbolicReasoner::new(
+            know_prolog::ReasoningConfig::default(),
+            std::collections::HashMap::new(),
+        );
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "王五".to_string(),
+            },
+        ]);
+        let mut manager = DialogueManager::new();
+        let frame = manager.analyze("张三是李四的师傅", &reasoner);
+        assert_eq!(
+            frame.kind,
+            MoveKind::Assert,
+            "frame={:?} question={:?}",
+            frame.kind,
+            frame.question
+        );
+        for input in ["张三是李四的师傅", "张三是李四的师傅吗"] {
+            if let Some(reply) = manager.plan_pure_dialogue(input, &reasoner) {
+                panic!(
+                    "{} 被纯对话层接管：kind={:?} plan={:?} text={}",
+                    input, reply.kind, reply.plan, reply.text
+                );
+            }
+            if let Some(reply) = manager.plan_reply(input, &reasoner) {
+                panic!(
+                    "{} 被对话层接管：kind={:?} plan={:?} text={}",
+                    input, reply.kind, reply.plan, reply.text
+                );
+            }
+        }
+        let answer = reasoner.answer("张三是李四的师傅").unwrap();
+        assert!(answer.contains("不是"), "{}", answer);
+    }
+
+    #[test]
     fn config_override_is_global_and_defaults_to_config_toml() {
         let cli = Cli::try_parse_from([
             "knowprolog",
