@@ -263,11 +263,10 @@ impl ClarificationSession {
         if !trial.solve(goals, query_vars).is_empty() {
             return 2;
         }
-        if goals.iter().any(|goal| {
-            !trial
-                .solve(std::slice::from_ref(goal), &[])
-                .is_empty()
-        }) {
+        if goals
+            .iter()
+            .any(|goal| !trial.solve(std::slice::from_ref(goal), &[]).is_empty())
+        {
             return 1;
         }
         0
@@ -294,12 +293,15 @@ impl ClarificationSession {
             let right_key = right.atom.display();
             let left_gain = gains.get(&left_key).copied().unwrap_or(0);
             let right_gain = gains.get(&right_key).copied().unwrap_or(0);
-            right_gain.cmp(&left_gain).then_with(|| {
-                right
-                    .confidence
-                    .partial_cmp(&left.confidence)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }).then_with(|| left_key.cmp(&right_key))
+            right_gain
+                .cmp(&left_gain)
+                .then_with(|| {
+                    right
+                        .confidence
+                        .partial_cmp(&left.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left_key.cmp(&right_key))
         });
     }
 
@@ -487,6 +489,8 @@ pub struct AbductionEngine {
     entity_features: HashMap<String, HashSet<String>>,
     /// 实体 → 参与过的谓词频次
     entity_predicates: HashMap<String, HashMap<String, u64>>,
+    /// 已观察过的三元组：重复观察（快照重放 / 增量重载同一批事实）不得重复计数
+    observed_triples: HashSet<String>,
     /// 本轮会话暂存的候选假设（供「采纳假设 N」）
     pending: Vec<Hypothesis>,
     /// 本轮会话已采纳的假设（加入归结事实集，但不写知识图谱）
@@ -507,6 +511,7 @@ impl AbductionEngine {
             entity_types: HashMap::new(),
             entity_features: HashMap::new(),
             entity_predicates: HashMap::new(),
+            observed_triples: HashSet::new(),
             pending: Vec::new(),
             adopted: Vec::new(),
         }
@@ -573,6 +578,17 @@ impl AbductionEngine {
 
     fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            return;
+        }
+        // 同一三元组只观察一次：`observe_facts` 会在导入/快照重放后反复调用，
+        // 重复累计会把「出现次数」变成「被观察次数」，让理由里的计数失真。
+        let mut key = String::with_capacity(subject.len() + predicate.len() + object.len() + 2);
+        key.push_str(subject);
+        key.push('\u{1f}');
+        key.push_str(predicate);
+        key.push('\u{1f}');
+        key.push_str(object);
+        if !self.observed_triples.insert(key) {
             return;
         }
         // 已存在的计数直接自增
@@ -2051,6 +2067,42 @@ mod tests {
     }
 
     #[test]
+    fn repeated_observations_do_not_inflate_counts_or_change_confidence() {
+        let engine = engine_with_rule();
+        let mut abduction = AbductionEngine::new(6, 5);
+        abduction.observe_facts(&facts());
+        let first = abduction.analyze(&engine, &[Atom::rel("师祖", "张三", "赵六")], &[]);
+        // 快照重放 / 增量重载会再次提交同一批事实：统计必须保持不变。
+        abduction.observe_facts(&facts());
+        abduction.observe_facts(&facts());
+        let second = abduction.analyze(&engine, &[Atom::rel("师祖", "张三", "赵六")], &[]);
+
+        let before: Vec<_> = first
+            .hypotheses
+            .iter()
+            .map(|hypothesis| {
+                (
+                    hypothesis.atom.display(),
+                    hypothesis.confidence,
+                    hypothesis.reasons.clone(),
+                )
+            })
+            .collect();
+        let after: Vec<_> = second
+            .hypotheses
+            .iter()
+            .map(|hypothesis| {
+                (
+                    hypothesis.atom.display(),
+                    hypothesis.confidence,
+                    hypothesis.reasons.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(before, after, "重复观察不得改变候选、置信度或计数理由");
+    }
+
+    #[test]
     fn what_if_derives_new_facts_and_rolls_back() {
         let engine = engine_with_rule();
         let abduction = AbductionEngine::new(6, 5);
@@ -2265,12 +2317,8 @@ mod tests {
         let goals = [Atom::rel("师祖", "张三", "赵六")];
         let decisive = hyp("师傅", "李四", "赵六", 0.2);
         let noisy = hyp("师傅", "张三", "钱七", 0.9);
-        let mut session = ClarificationSession::start_with_goal(
-            &[noisy, decisive],
-            &engine,
-            &goals,
-            &[],
-        );
+        let mut session =
+            ClarificationSession::start_with_goal(&[noisy, decisive], &engine, &goals, &[]);
         let before = session.remaining();
         let reply = session.respond("不是");
         assert!(matches!(reply, ClarificationReply::Rejected(_)));
