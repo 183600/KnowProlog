@@ -4120,7 +4120,7 @@ async fn run_ask(
         reasoner.clear_pending_awaiting();
         let intro_entity = intro_request_entity(&question, &reasoner);
         let mut answer = if let Some(entity) = intro_entity {
-            reasoner
+            let generated = reasoner
                 .generate_about(&entity)
                 .or_else(|| reasoner.narrate(&entity))
                 .or_else(|| {
@@ -4128,7 +4128,12 @@ async fn run_ask(
                         "知识图谱中没有关于「{}」的可生成事实。",
                         entity
                     ))
-                })
+                });
+            if generated.is_some() {
+                // 介绍轮也推进焦点栈：下一轮「它的人口呢」必须能接上实体。
+                dialogue.note_plugin_focus(&entity);
+            }
+            generated
         } else {
             dialogue
                 .plan_pure_dialogue(&question, &reasoner)
@@ -12054,6 +12059,14 @@ mod session_tests {
         }
         assert_eq!(intro_request_entity("介绍一下你自己", &reasoner), None);
         assert_eq!(intro_request_entity("介绍不存在的地方", &reasoner), None);
+
+        // 介绍轮把实体推入焦点栈，后续代词问句才能继承。
+        let mut dialogue = DialogueManager::new();
+        dialogue.note_plugin_focus("北京");
+        let frame = dialogue.analyze("它的人口呢？", &reasoner);
+        assert_eq!(frame.kind, MoveKind::AskAttribute, "{:?}", frame);
+        assert_eq!(frame.entity.as_deref(), Some("北京"));
+        assert_eq!(frame.attribute.as_deref(), Some("人口"));
     }
 
     #[test]
