@@ -4122,6 +4122,29 @@ impl SymbolicReasoner {
         added
     }
 
+    /// 在会话事实层写入一条断言：先经 [`RevisionGuard`] 预检，冲突时只返回
+    /// 最小冲突核且不改变任何状态；通过后才镜像到会话事实并记修订回执。
+    ///
+    /// 返回值：`Ok(true)` 表示确有新增，`Ok(false)` 表示幂等命中已有事实，
+    /// `Err(text)` 表示预检拒绝（调用方必须原样展示并可重试）。
+    fn commit_session_assertion(&mut self, label: String, atom: &Atom) -> Result<bool, String> {
+        if !atom.is_ground() {
+            return Err("该假设仍含未绑定变量，无法写入会话事实。".to_string());
+        }
+        let mut changeset = ChangeSet::new(label.clone());
+        changeset.push(ChangeOp::AssertFact(atom.clone()));
+        let plan = self.revision_guard().plan(changeset);
+        if plan.is_blocked() {
+            return Err(self.render_guard_block(&plan));
+        }
+        self.register_atom_vocabulary(atom);
+        let added = self.adopt_atom(atom.clone());
+        if added {
+            self.record_session_revision(label, vec![ChangeOp::AssertFact(atom.clone())], Vec::new(), Vec::new());
+        }
+        Ok(added)
+    }
+
     /// 采纳第 index（1 起）条待定假设：加入会话归结事实集（不写知识图谱）
     pub fn adopt_hypothesis(&mut self, index: usize) -> Option<String> {
         // 先检查可采纳性再取用：不可采纳的假设不能从待定列表中丢失
@@ -4134,16 +4157,38 @@ impl SymbolicReasoner {
                 index, rendered
             ));
         }
-        let hypothesis = self.abduction.take_pending(index)?;
+        // 预检失败时保留待定假设：冲突核需要用户裁决，不能静默丢弃。
+        let hypothesis = self.abduction.pending().get(position)?.clone();
         let atom = hypothesis.atom.clone();
         let rendered = self.render_atom_nl(&atom);
-        self.adopt_atom(atom);
-        let reasons = hypothesis.reasons.join("；");
-        self.abduction.adopt(hypothesis);
-        Some(format!(
-            "已采纳假设 {}：{}。该事实已加入本轮会话的归结事实集（未写入知识图谱），后续「证明/推理链/溯因」会使用它。\n  依据：{}",
-            index, rendered, reasons
-        ))
+        let label = format!("采纳假设 {}：{}", index, rendered);
+        match self.commit_session_assertion(label, &atom) {
+            Err(blocked) => Some(format!(
+                "无法采纳假设 {}「{}」：\n{}",
+                index, rendered, blocked
+            )),
+            Ok(added) => {
+                let reasons = hypothesis.reasons.join("；");
+                self.abduction.take_pending(index);
+                self.abduction.adopt(hypothesis);
+                let status = if added {
+                    "该事实已加入本轮会话的归结事实集（未写入知识图谱），后续「证明/推理链/溯因」会使用它。"
+                } else {
+                    "该事实已在会话事实集中；本次为幂等采纳，未重复写入。"
+                };
+                let receipt = self
+                    .session_receipts
+                    .last()
+                    .map(|receipt| receipt.id.clone())
+                    .filter(|_| added)
+                    .map(|id| format!("\n  修订回执：{}（可用「撤销修订」撤回）", id))
+                    .unwrap_or_default();
+                Some(format!(
+                    "已采纳假设 {}：{}。{}{}\n  依据：{}",
+                    index, rendered, status, receipt, reasons
+                ))
+            }
+        }
     }
 
     pub fn pending_hypotheses_report(&self) -> String {
@@ -4199,16 +4244,46 @@ impl SymbolicReasoner {
         };
         match reply {
             ClarificationReply::Confirmed(hypothesis) => {
-                self.adopt_atom(hypothesis.atom.clone());
-                let mut output = format!(
-                    "✓ 已确认假设：{}。已加入会话事实集（未写知识图谱）。",
-                    self.render_atom_nl(&hypothesis.atom)
-                );
-                if !hypothesis.reasons.is_empty() {
-                    output.push_str(&format!("\n  依据：{}", hypothesis.reasons.join("；")));
+                let rendered = self.render_atom_nl(&hypothesis.atom);
+                let label = format!("澄清确认：{}", rendered);
+                match self.commit_session_assertion(label, &hypothesis.atom) {
+                    Err(blocked) => {
+                        if let Some(session) = self.clarification.as_mut() {
+                            session.retry(hypothesis);
+                        }
+                        Some(format!(
+                            "该假设未写入会话事实，澄清问题保留：\n{}",
+                            blocked
+                        ))
+                    }
+                    Ok(added) => {
+                        let mut output = format!(
+                            "✓ 已确认假设：{}。{}",
+                            rendered,
+                            if added {
+                                "已加入会话事实集（未写知识图谱）。"
+                            } else {
+                                "该事实已在会话事实集中（幂等确认）。"
+                            }
+                        );
+                        if !hypothesis.reasons.is_empty() {
+                            output.push_str(&format!(
+                                "\n  依据：{}",
+                                hypothesis.reasons.join("；")
+                            ));
+                        }
+                        if added {
+                            if let Some(receipt) = self.session_receipts.last() {
+                                output.push_str(&format!(
+                                    "\n  修订回执：{}（可用「撤销修订」撤回）",
+                                    receipt.id
+                                ));
+                            }
+                        }
+                        output.push_str(&self.clarification_follow_up());
+                        Some(output)
+                    }
                 }
-                output.push_str(&self.clarification_follow_up());
-                Some(output)
             }
             ClarificationReply::Rejected(hypothesis) => Some(format!(
                 "✗ 已排除假设：{}。{}",
@@ -13781,6 +13856,40 @@ types = [
         let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
         assert!(proof.contains("得证"), "实际：{}", proof);
         assert!(proof.contains("赵六"));
+    }
+
+    #[test]
+    fn adopted_hypothesis_is_receipted_and_undoable() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.abduce_statement("张三的师祖是赵六");
+        let adopted_atom = reasoner.pending_hypotheses()[0].atom.clone();
+        let message = reasoner.adopt_hypothesis(1).expect("应能采纳第 1 条假设");
+        assert!(message.contains("修订回执"), "采纳应生成回执：{}", message);
+        assert!(
+            reasoner.session_revision_report().contains("采纳假设 1"),
+            "回执应记录假设来源：{}",
+            reasoner.session_revision_report()
+        );
+        assert!(reasoner
+            .resolution_proof_report("张三的师祖是赵六")
+            .contains("得证"));
+
+        let undone = reasoner.undo_last_session_revision();
+        assert!(undone.contains("已撤销会话修订"), "{}", undone);
+        assert!(
+            reasoner
+                .resolution_proof_report("张三的师祖是赵六")
+                .contains("未得证"),
+            "撤销采纳后不应再得证"
+        );
+        assert!(
+            !reasoner
+                .pending_hypotheses()
+                .iter()
+                .any(|hypothesis| hypothesis.atom == adopted_atom),
+            "采纳过的假设不应回到待定池"
+        );
     }
 
     #[test]

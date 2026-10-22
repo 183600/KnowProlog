@@ -270,6 +270,16 @@ impl ClarificationSession {
         };
     }
 
+    /// 把一条尚未写入的假设放回队首：预检被拒绝时保留问题，避免静默丢弃。
+    pub fn retry(&mut self, hypothesis: Hypothesis) {
+        if self.current.is_some() {
+            self.queue.insert(0, hypothesis);
+            return;
+        }
+        self.queue.insert(0, hypothesis);
+        self.advance();
+    }
+
     /// 处理用户回答：返回该回答的结论，并推进到下一问
     pub fn respond(&mut self, text: &str) -> ClarificationReply {
         let kind = classify_answer(text);
