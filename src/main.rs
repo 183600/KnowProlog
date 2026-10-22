@@ -4078,6 +4078,8 @@ async fn run_ask(
                 if let Some(prompt) = reasoner.open_pending_question(&question) {
                     answer = Some(format!("{}\n{}", text, prompt));
                 }
+            } else {
+                reasoner.dismiss_pending_question(&question);
             }
         }
         answers.push(AskAnswer {
@@ -9266,6 +9268,8 @@ async fn run_interactive_mode(
                                 text.push('\n');
                                 text.push_str(&prompt);
                             }
+                        } else {
+                            symbolic_reasoner.dismiss_pending_question(input);
                         }
                         println!("{}", text);
                         let provenance: Vec<String> = dialogue_manager
@@ -10612,6 +10616,7 @@ async fn try_symbolic_reasoning(
             }
             return Some(combined);
         }
+        symbolic_reasoner.dismiss_pending_question(input);
         return Some(answer);
     }
     // 开放问句无直接答案：尝试溯因生成候选假设
@@ -12107,6 +12112,16 @@ mod session_tests {
     }
 
     /// 各命令（谓词裁决 / 澄清子命令 / 帮助退出等）都要被 is_command_like 识别
+    #[test]
+    fn command_like_covers_pending_question_commands() {
+        for command in ["悬问", "悬问台账", "未答之问", "放弃悬问", "清空悬问"] {
+            assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
+        assert!(is_no_record_text("根据现有知识库，没有记录「张三 的 师傅」。"));
+        assert!(is_no_record_text("未能回答：当前知识库中没有可用依据。"));
+        assert!(!is_no_record_text("张三 的 师傅 是 李四。"));
+    }
+
     #[test]
     fn command_like_covers_help_predicate_and_clarification_commands() {
         for command in [

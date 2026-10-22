@@ -9930,6 +9930,21 @@ impl SymbolicReasoner {
         self.pending_questions.render_report()
     }
 
+    /// 原问句已在正常路径上得到确证回答：关闭同题悬问（不影响其他悬问）。
+    pub fn dismiss_pending_question(&mut self, question: &str) -> bool {
+        let question = question.trim();
+        let before = self.pending_questions.len();
+        let kept: Vec<PendingQuestion> = self
+            .pending_questions
+            .questions()
+            .iter()
+            .filter(|pending| pending.question != question)
+            .cloned()
+            .collect();
+        self.pending_questions.replace(kept);
+        self.pending_questions.len() < before
+    }
+
     /// 显式放弃全部悬问。忘记必须是显式动作，不设 TTL。
     pub fn abandon_pending_questions(&mut self) -> String {
         let count = self.pending_questions.len();
@@ -10043,6 +10058,9 @@ impl SymbolicReasoner {
             || text.contains("没有相关记录")
             || text.contains("数量为 0")
             || text.contains("无法证明")
+            // 链接预测/溯因候选不是已证明的答案：悬问只接受确证证明。
+            || text.contains("（推断")
+            || text.contains("链接预测")
     }
 
     /// 把洞的取值写入会话事实（逆向谓词按存储方向翻转）。
@@ -12802,7 +12820,7 @@ impl SymbolicReasoner {
             }
         };
         format!(
-            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}，话语帧 {}。",
+            "对话记忆：焦点实体栈 [{}]，上一轮谓词「{}」，上一段生成 {}，历史问题 {} 条，会话假设 {}，会话规则 {} 条，澄清 {}，中文概率知识 {}，话语帧 {}，悬问 {} 条。",
             focus,
             predicate,
             generation,
@@ -12811,7 +12829,8 @@ impl SymbolicReasoner {
             self.session_clauses.len(),
             clarify,
             lesson_info,
-            frame_info
+            frame_info,
+            self.pending_questions.len()
         )
     }
 
@@ -14804,6 +14823,19 @@ mod tests {
             .try_answer_pending_question("王五")
             .expect("恢复后短答仍应能回填");
         assert!(deferred.contains("王五"), "{}", deferred);
+    }
+
+    #[test]
+    fn pending_question_is_visible_in_summary_and_can_be_dismissed() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        assert!(reasoner.dialogue_summary().contains("悬问 1 条"));
+        assert!(reasoner.dismiss_pending_question("张三的师傅的师傅是谁"));
+        assert!(!reasoner.has_pending_question());
+        assert!(reasoner.dialogue_summary().contains("悬问 0 条"));
     }
 
     #[test]
