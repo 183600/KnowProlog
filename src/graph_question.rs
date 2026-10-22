@@ -44,6 +44,26 @@ impl CompiledGraphQuestion {
     }
 }
 
+/// 编译失败但结构可辨认时的缺口：哪些分句已经读懂，哪些没能解析。
+///
+/// 这不是「放宽」——它不猜测用户原意，只把「部分理解」摊开，避免把
+/// 读不懂的合取句静默交给其他管线后给出另一份答案。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileGap {
+    pub complete_clauses: Vec<String>,
+    pub unresolved_clauses: Vec<String>,
+}
+
+impl CompileGap {
+    pub fn render(&self) -> String {
+        format!(
+            "我只读懂了「{}」这部分条件，无法解析「{}」。请确认其中的实体、类型或谓词是否已录入知识库，或换一种说法。",
+            self.complete_clauses.join("；"),
+            self.unresolved_clauses.join("；")
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SurfaceMatch {
     start: usize,
@@ -71,6 +91,12 @@ impl SurfaceMatch {
                 .unwrap_or(surface)
         }
     }
+}
+
+struct ConjunctionClause {
+    predicate: String,
+    object: String,
+    object_is_type: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -293,6 +319,58 @@ impl PatternLexicon {
         self.compile_shared_object(&normalized)
     }
 
+    /// 解析合取问句中的一个条件分句；只接受谓词 + 已知实体/类型 + 纯外壳。
+    fn parse_conjunction_clause(&self, clause: &str) -> Option<ConjunctionClause> {
+        let clause = trim_clause(clause);
+        if clause.is_empty() {
+            return None;
+        }
+        let (_, predicate_match, predicate) = self.longest_predicate(&clause)?;
+        let after = &clause[predicate_match.end()..];
+        let object = self.longest_object(after)?;
+        let surface = &after[object.start..object.end()];
+        let canonical = object.canonical(self, surface).to_string();
+        let tail = trim_clause(&after[object.end()..]);
+        if !tail.is_empty() && !self.is_scaffolding(&tail) {
+            return None;
+        }
+        Some(ConjunctionClause {
+            predicate,
+            object: canonical,
+            object_is_type: object.is_type,
+        })
+    }
+
+    /// 结构化问句编译失败时，返回可渲染的「部分理解」缺口。
+    /// 只处理合取句：这是最容易出现「丢掉一个分句也能凑出答案」的形状。
+    pub fn compile_gap(&self, question: &str) -> Option<CompileGap> {
+        if self.compile(question).is_some() {
+            return None;
+        }
+        let normalized = normalize_question(question)?;
+        let clauses = split_conjunctive(&normalized)?;
+        let mut complete_clauses = Vec::new();
+        let mut unresolved_clauses = Vec::new();
+        for clause in clauses {
+            let clause = trim_clause(&clause);
+            if clause.is_empty() || self.is_scaffolding(&clause) {
+                continue;
+            }
+            if self.parse_conjunction_clause(&clause).is_some() {
+                complete_clauses.push(clause);
+            } else {
+                unresolved_clauses.push(clause);
+            }
+        }
+        if complete_clauses.is_empty() || unresolved_clauses.is_empty() {
+            return None;
+        }
+        Some(CompileGap {
+            complete_clauses,
+            unresolved_clauses,
+        })
+    }
+
     fn compile_conjunction(&self, question: &str) -> Option<CompiledGraphQuestion> {
         let clauses = split_conjunctive(question)?;
         let subject = "x".to_string();
@@ -304,28 +382,20 @@ impl PatternLexicon {
             if clause.is_empty() {
                 continue;
             }
-            let Some((_, predicate_match, predicate)) = self.longest_predicate(&clause) else {
+            let Some(parts) = self.parse_conjunction_clause(&clause) else {
                 unparsed.push(clause);
                 continue;
             };
-            let after = &clause[predicate_match.end()..];
-            let Some(object) = self.longest_object(after) else {
-                unparsed.push(clause);
-                continue;
-            };
-            let surface = &after[object.start..object.end()];
-            let canonical = object.canonical(self, surface).to_string();
-            let tail = trim_clause(&after[object.end()..]);
-            if !tail.is_empty() && !self.is_scaffolding(&tail) {
-                unparsed.push(clause);
-                continue;
-            }
-            if object.is_type {
+            if parts.object_is_type {
                 let object_var = format!("v{}", edges.len());
-                edges.push(EdgePattern::var_var(&subject, predicate, &object_var));
-                edges.push(EdgePattern::var_const(&object_var, "type", canonical));
+                edges.push(EdgePattern::var_var(&subject, parts.predicate, &object_var));
+                edges.push(EdgePattern::var_const(&object_var, "type", parts.object));
             } else {
-                edges.push(EdgePattern::var_const(&subject, predicate, canonical));
+                edges.push(EdgePattern::var_const(
+                    &subject,
+                    parts.predicate,
+                    parts.object,
+                ));
             }
             parsed_clauses += 1;
         }
@@ -889,6 +959,36 @@ mod tests {
         assert!(lexicon
             .compile("有多少人既导演过科幻片，又拿过金棕榈？")
             .is_some());
+    }
+
+    #[test]
+    fn partially_understood_conjunction_reports_the_gap() {
+        let lexicon = lexicon();
+        let gap = lexicon
+            .compile_gap("谁既导演过科幻片，又喜欢姚明？")
+            .expect("读懂一半的合取句应报告缺口");
+        assert!(
+            gap.complete_clauses
+                .iter()
+                .any(|clause| clause.contains("导演过科幻片")),
+            "{:?}",
+            gap
+        );
+        assert!(
+            gap.unresolved_clauses
+                .iter()
+                .any(|clause| clause.contains("喜欢姚明")),
+            "{:?}",
+            gap
+        );
+        let text = gap.render();
+        assert!(text.contains("无法解析"), "{}", text);
+        assert!(text.contains("喜欢姚明"), "{}", text);
+        // 完全读懂或完全读不懂时都不应伪造「部分理解」。
+        assert!(lexicon
+            .compile_gap("谁既导演过科幻片，又拿过金棕榈？")
+            .is_none());
+        assert!(lexicon.compile_gap("这台机器怎么启动？").is_none());
     }
 
     #[test]

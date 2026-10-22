@@ -7617,7 +7617,17 @@ impl SymbolicReasoner {
                 });
             }
         }
-        let compiled = lexicon.compile(question)?;
+        let compiled = match lexicon.compile(question) {
+            Some(compiled) => compiled,
+            None => {
+                // 结构上像合取问句、但有一处没读懂时，明确说出缺口；
+                // 不认识词与「图谱里没有」是两种不同的失败，不能都落到
+                // 其他管线后给出一份看似完整的答案。
+                return lexicon
+                    .compile_gap(question)
+                    .map(|gap| gap.render());
+            }
+        };
         let conversation =
             ConversationalGraph::new(compiled.pattern.clone(), &facts, options).ok()?;
         let ledger = RepairLedger::new(compiled.pattern.clone());
@@ -18398,6 +18408,17 @@ types = [
         assert!(why.contains("无法给出见证子图"), "{}", why);
         assert!(why.contains("失败诊断"), "{}", why);
         assert!(why.contains("可尝试的放宽"), "{}", why);
+    }
+
+    #[test]
+    fn graph_question_explains_a_partially_understood_conjunction() {
+        let reasoner = graph_pattern_reasoner();
+        let answer = reasoner
+            .answer("谁既导演过科幻片，又喜欢姚明？")
+            .expect("读懂一半的图谱问句应说明缺口");
+        assert!(answer.contains("只读懂了"), "{}", answer);
+        assert!(answer.contains("喜欢姚明"), "{}", answer);
+        assert!(answer.contains("无法解析"), "{}", answer);
     }
 
     #[test]
