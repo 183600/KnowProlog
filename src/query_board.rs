@@ -328,8 +328,22 @@ impl QueryBoard {
                 revision,
             );
             self.push_frame(frame);
+            let mut text =
+                "你想按哪个属性排名？例如「谁的身高最高」或直接回答「身高」。".to_string();
+            let candidates = rankable_attributes(knowledge);
+            if !candidates.is_empty() {
+                text.push_str(&format!(
+                    "\n当前可排名的属性：{}。",
+                    candidates
+                        .iter()
+                        .take(6)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("、")
+                ));
+            }
             return Some(BoardOutcome {
-                text: "你想按哪个属性排名？例如「谁的身高最高」或直接回答「身高」。".to_string(),
+                text,
                 plan: vec!["board:rank_pending".to_string()],
                 provenance: vec!["查询板：排名请求缺少属性，未做任何猜测".to_string()],
                 focus: None,
@@ -1621,6 +1635,22 @@ fn rank_summary(
         ));
     }
     output
+}
+
+/// 当前知识里至少有一个可解析数值的属性，供「按哪个属性排名」的澄清列出，
+/// 避免用户面对一个不知道有哪些可选项的空问题。
+fn rankable_attributes(knowledge: &dyn DialogueKnowledge) -> Vec<String> {
+    let mut labels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entity in knowledge.all_entities() {
+        let mut facts = knowledge.entity_attributes(&entity);
+        facts.extend(knowledge.entity_relations(&entity));
+        for (key, value) in facts {
+            if quantity::parse_quantity(&value).is_some() {
+                labels.insert(knowledge.predicate_label(&key));
+            }
+        }
+    }
+    labels.into_iter().collect()
 }
 
 /// 把「身高」这类短答解析成图谱中的谓词键；找不到就返回 None。
@@ -3028,6 +3058,16 @@ mod tests {
         let mut board = board();
         let pending = board.apply("谁最高", &knowledge, 7).expect("应发起属性澄清");
         assert!(pending.text.contains("哪个属性"), "{}", pending.text);
+        assert!(
+            pending.text.contains("身高"),
+            "澄清应列出可排名属性：{}",
+            pending.text
+        );
+        assert!(
+            !pending.text.contains("国籍"),
+            "非数值属性不应冒充可排名项：{}",
+            pending.text
+        );
         assert!(matches!(
             board.current().unwrap().source,
             QuerySource::RankPending { descending: true }
