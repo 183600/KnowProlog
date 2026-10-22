@@ -164,6 +164,11 @@ impl TypeSystem {
         self.disjoint.len()
     }
 
+    /// 已声明的互斥对（规范名、字典序），供冲突检测等消费方只读枚举。
+    pub fn disjoint_pairs(&self) -> Vec<(String, String)> {
+        self.disjoint.iter().cloned().collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.aliases.is_empty() && self.subclasses.is_empty() && self.disjoint.is_empty()
     }
