@@ -4721,6 +4721,13 @@ impl SymbolicReasoner {
                 Ok(transition) => {
                     if transition.changed_state() {
                         self.sync_slot_projection(&subject, &predicate);
+                        if let Some(position) = self
+                            .session_negative_facts
+                            .iter()
+                            .position(|negative| negative == &lesson.head)
+                        {
+                            self.session_negative_facts.remove(position);
+                        }
                         self.adopt_atom(lesson.head.clone());
                     }
                     transitions.push(transition);
@@ -13066,6 +13073,23 @@ mod tests {
         let answer = reasoner.answer("姚明的身高是什么").expect("应有图谱答案");
         assert!(answer.contains("226cm"), "应回落到图谱值：{}", answer);
         assert!(!answer.contains("229cm"), "{}", answer);
+    }
+
+    #[test]
+    fn explicit_correction_clears_the_matching_negative_fact() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        reasoner.assert_negative_nl_fact("姚明的身高不是229cm");
+        assert_eq!(reasoner.session_negative_facts.len(), 1);
+        reasoner.correct_nl_fact("姚明的身高是229cm");
+        assert!(
+            reasoner.session_negative_facts.is_empty(),
+            "改口为肯定事实时应撤销同一原子的否定"
+        );
+        assert!(reasoner
+            .session_facts()
+            .iter()
+            .any(|atom| atom.display() == "身高(姚明, 229cm)"));
     }
 
     #[test]
