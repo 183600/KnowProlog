@@ -4374,19 +4374,37 @@ impl SymbolicReasoner {
     /// 返回值：`Ok(true)` 表示确有新增，`Ok(false)` 表示幂等命中已有事实，
     /// `Err(text)` 表示预检拒绝（调用方必须原样展示并可重试）。
     fn commit_session_assertion(&mut self, label: String, atom: &Atom) -> Result<bool, String> {
-        if !atom.is_ground() {
-            return Err("该假设仍含未绑定变量，无法写入会话事实。".to_string());
+        self.commit_session_assertions(label, std::slice::from_ref(atom))
+            .map(|added| added > 0)
+    }
+
+    /// 批量版本：整批一次预检、一次回执；任一条含变量或触发冲突都零写入。
+    fn commit_session_assertions(
+        &mut self,
+        label: String,
+        atoms: &[Atom],
+    ) -> Result<usize, String> {
+        if atoms.iter().any(|atom| !atom.is_ground()) {
+            return Err("存在含未绑定变量的假设，无法写入会话事实。".to_string());
         }
         let mut changeset = ChangeSet::new(label.clone());
-        changeset.push(ChangeOp::AssertFact(atom.clone()));
+        for atom in atoms {
+            changeset.push(ChangeOp::AssertFact(atom.clone()));
+        }
         let plan = self.revision_guard().plan(changeset);
         if plan.is_blocked() {
             return Err(self.render_guard_block(&plan));
         }
-        self.register_atom_vocabulary(atom);
-        let added = self.adopt_atom(atom.clone());
-        if added {
-            self.record_session_revision(label, vec![ChangeOp::AssertFact(atom.clone())], Vec::new(), Vec::new());
+        let mut added_ops = Vec::new();
+        for atom in atoms {
+            self.register_atom_vocabulary(atom);
+            if self.adopt_atom(atom.clone()) {
+                added_ops.push(ChangeOp::AssertFact(atom.clone()));
+            }
+        }
+        let added = added_ops.len();
+        if !added_ops.is_empty() {
+            self.record_session_revision(label, added_ops, Vec::new(), Vec::new());
         }
         Ok(added)
     }
@@ -4825,15 +4843,31 @@ impl SymbolicReasoner {
 
     /// 把当前假设世界的临时前提并入会话事实层（仍不写知识图谱）。
     pub fn remember_assumption_world(&mut self) -> Option<String> {
-        let world = self.assumption_world.take()?;
-        for atom in &world.assumptions {
-            self.adopt_atom(atom.clone());
+        // 世界先保留：预检失败时用户仍可修正或退出，不静默丢弃假设。
+        let world = self.assumption_world.as_ref()?.clone();
+        let label = format!("记住假设世界 {}", world.id);
+        match self.commit_session_assertions(label, &world.assumptions) {
+            Err(blocked) => Some(format!(
+                "假设世界未并入会话事实（世界仍保留）：\n{}",
+                blocked
+            )),
+            Ok(added) => {
+                self.assumption_world = None;
+                let receipt = self
+                    .session_receipts
+                    .last()
+                    .filter(|_| added > 0)
+                    .map(|receipt| format!("；修订回执 {}", receipt.id))
+                    .unwrap_or_default();
+                Some(format!(
+                    "已把 {} 条假设并入会话事实层（新增 {} 条，仍未写入图谱；来源：假设世界 {}{}）。后续回答会把它当作会话前提。",
+                    world.assumptions.len(),
+                    added,
+                    world.id,
+                    receipt
+                ))
+            }
         }
-        Some(format!(
-            "已把 {} 条假设并入会话事实层（仍未写入图谱；来源：假设世界 {}）。后续回答会把它当作会话前提。",
-            world.assumptions.len(),
-            world.id
-        ))
     }
 
     /// 假设世界的可见状态（无世界时也给出明确说明）。
@@ -12037,6 +12071,30 @@ mod tests {
             after.as_deref().map_or(true, |text| !text.contains("钱七")),
             "退出后临时前提必须消失：{:?}",
             after
+        );
+    }
+
+    #[test]
+    fn remembered_assumption_world_is_receipted_and_undoable() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.enter_assumption_world("赵六的师傅是钱七").unwrap();
+        let remembered = reasoner.remember_assumption_world().expect("应可记住");
+        assert!(remembered.contains("修订回执"), "{}", remembered);
+        assert!(reasoner.assumption_world().is_none());
+        assert!(reasoner
+            .session_facts()
+            .iter()
+            .any(|atom| atom.display() == "师傅(赵六, 钱七)"));
+
+        let undone = reasoner.undo_last_session_revision();
+        assert!(undone.contains("已撤销会话修订"), "{}", undone);
+        assert!(
+            !reasoner
+                .session_facts()
+                .iter()
+                .any(|atom| atom.display() == "师傅(赵六, 钱七)"),
+            "撤销后假设世界不再留在会话事实层"
         );
     }
 
