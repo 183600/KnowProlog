@@ -261,17 +261,22 @@ impl PatternLexicon {
     }
 
     fn compile_conjunction(&self, question: &str) -> Option<CompiledGraphQuestion> {
-        let (prefix, clauses) = split_conjunctive(question)?;
+        let clauses = split_conjunctive(question)?;
         let subject = "x".to_string();
         let mut edges = Vec::new();
+        let mut parsed_clauses = 0usize;
         for clause in &clauses {
             let clause = trim_clause(clause);
             if clause.is_empty() {
                 continue;
             }
-            let (_, predicate_match, predicate) = self.longest_predicate(&clause)?;
+            let Some((_, predicate_match, predicate)) = self.longest_predicate(&clause) else {
+                continue;
+            };
             let after = &clause[predicate_match.end()..];
-            let object = self.longest_object(after)?;
+            let Some(object) = self.longest_object(after) else {
+                continue;
+            };
             let surface = &after[object.start..object.end()];
             let canonical = object.canonical(self, surface).to_string();
             if object.is_type {
@@ -281,13 +286,15 @@ impl PatternLexicon {
             } else {
                 edges.push(EdgePattern::var_const(&subject, predicate, canonical));
             }
+            parsed_clauses += 1;
         }
-        if edges.len() < 2 {
+        if parsed_clauses < 2 {
             return None;
         }
-        let asks = contains_question_word(question) || contains_question_word(&prefix);
-        let pattern =
-            self.finish_pattern(edges, if asks { vec![subject.clone()] } else { vec![] })?;
+        if !contains_question_word(question) {
+            return None;
+        }
+        let pattern = self.finish_pattern(edges, vec![subject.clone()])?;
         Some(CompiledGraphQuestion {
             kind: GraphQuestionKind::Conjunction,
             pattern,
@@ -523,28 +530,27 @@ fn find_marker<'a>(text: &'a str, markers: &[&'a str]) -> Option<(&'a str, &'a s
     Some((&text[position + marker.len()..], marker))
 }
 
-fn split_conjunctive(question: &str) -> Option<(String, Vec<String>)> {
-    const MARKERS: [&str; 5] = ["既", "又", "并且", "而且", "同时"];
+fn split_conjunctive(question: &str) -> Option<Vec<String>> {
+    const MARKERS: [&str; 5] = ["并且", "而且", "同时", "又", "既"];
     if !MARKERS.iter().any(|marker| question.contains(marker)) {
         return None;
     }
     let mut normalized = question.to_string();
+    // 「既然」不是合取标记，先保护起来，避免被拆成「然…」。
+    normalized = normalized.replace("既然", "\u{2}");
     for marker in MARKERS {
         normalized = normalized.replace(marker, "\u{1}");
     }
-    let mut parts: Vec<String> = normalized.split('\u{1}').map(str::to_string).collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let prefix = parts.remove(0);
-    let clauses: Vec<String> = parts
-        .into_iter()
+    normalized = normalized.replace('\u{2}', "既然");
+    let parts: Vec<String> = normalized
+        .split('\u{1}')
+        .map(str::to_string)
         .filter(|clause| !trim_clause(clause).is_empty())
         .collect();
-    if clauses.len() < 2 {
+    if parts.len() < 2 {
         return None;
     }
-    Some((prefix, clauses))
+    Some(parts)
 }
 
 fn trim_clause(clause: &str) -> String {
@@ -685,6 +691,53 @@ mod tests {
         assert_eq!(compiled.pattern.edges.len(), 2);
         assert_eq!(compiled.pattern.edges[0].predicate, "认识");
         assert_eq!(compiled.pattern.select, vec!["object".to_string()]);
+    }
+
+    #[test]
+    fn conjunction_keeps_the_clause_before_the_marker() {
+        let lexicon = lexicon();
+        for question in [
+            "谁导演过科幻片，又拿过金棕榈？",
+            "谁导演过科幻片并且拿过金棕榈？",
+            "谁导演过科幻片而且拿过金棕榈？",
+            "谁导演过科幻片同时拿过金棕榈？",
+        ] {
+            let compiled = lexicon.compile(question).expect("合取问句应可编译");
+            assert_eq!(
+                compiled.kind,
+                GraphQuestionKind::Conjunction,
+                "{}",
+                question
+            );
+            assert!(
+                compiled
+                    .pattern
+                    .edges
+                    .iter()
+                    .any(|edge| edge.predicate == "导演"),
+                "{}",
+                question
+            );
+            assert!(
+                compiled
+                    .pattern
+                    .edges
+                    .iter()
+                    .any(|edge| edge.predicate == "获奖"),
+                "{}",
+                question
+            );
+        }
+    }
+
+    #[test]
+    fn declarative_conjunction_is_not_mistaken_for_a_question() {
+        assert!(lexicon()
+            .compile("张三既导演过科幻片，又拿过金棕榈")
+            .is_none());
+        assert!(lexicon()
+            .compile("既然张三导演过科幻片，那就算了")
+            .is_none());
     }
 
     #[test]
