@@ -385,7 +385,10 @@ pub enum SlotDelta {
     /// 显式更正替换了功能槽的采用值。
     Corrected { from: Vec<String> },
     /// 直陈与当前采用值（或图谱基值）冲突，未写入。
-    NeedsConfirmation { current: Vec<String> },
+    NeedsConfirmation {
+        current: Vec<String>,
+        requested: String,
+    },
     /// 传闻只进证据区。
     HearsayRecorded,
     /// 撤回了一个采用值。
@@ -479,13 +482,13 @@ impl SlotTransition {
                 self.after.join(" / "),
                 self.step
             ),
-            SlotDelta::NeedsConfirmation { current } => format!(
+            SlotDelta::NeedsConfirmation { current, requested } => format!(
                 "「{}」当前采用「{}」，与新的取值「{}」冲突；本次未写入。若确认改口，请用「改口：{} = {}」。",
                 self.slot_label(),
                 current.join(" / "),
-                self.key.predicate,
+                requested,
                 self.key.subject,
-                self.key.predicate
+                requested
             ),
             SlotDelta::HearsayRecorded => format!(
                 "已把传闻记为证据：{} = {}（不进入回答，也不覆盖当前取值）。",
@@ -806,6 +809,39 @@ impl SlotLedger {
             ));
         }
 
+        // 新值正是图谱基值（且基值唯一）：这不是冲突，而是把图谱已支持的
+        // 取值显式纳入会话投影；直陈与更正都允许。
+        if before.is_empty() && base_values.len() == 1 && base_values[0] == assertion.object {
+            let step = {
+                self.step += 1;
+                self.step
+            };
+            state.accepted.push(SlotValue::new(
+                &assertion.object,
+                &assertion.source,
+                assertion.strength,
+                step,
+            ));
+            let event = SlotEvent {
+                step,
+                kind: SlotEventKind::Assert,
+                object: assertion.object.clone(),
+                strength: assertion.strength,
+                source: assertion.source.clone(),
+                before: Vec::new(),
+                after: state.accepted_objects(),
+            };
+            state.history.push(event);
+            return Ok(Self::transition(
+                key,
+                functional,
+                SlotDelta::Added,
+                Vec::new(),
+                state,
+                step,
+            ));
+        }
+
         // 同值：多来源佐证或幂等重复。
         if before.iter().any(|value| value == &assertion.object) {
             let step = {
@@ -851,6 +887,7 @@ impl SlotLedger {
                     functional,
                     delta: SlotDelta::NeedsConfirmation {
                         current: current.clone(),
+                        requested: assertion.object.clone(),
                     },
                     before: before.clone(),
                     after: current.clone(),
@@ -914,6 +951,7 @@ impl SlotLedger {
                     functional,
                     delta: SlotDelta::NeedsConfirmation {
                         current: base_values.clone(),
+                        requested: assertion.object.clone(),
                     },
                     before: Vec::new(),
                     after: base_values,
@@ -1368,6 +1406,18 @@ mod tests {
         assert_eq!(transition.delta, SlotDelta::HearsayRecorded);
         assert!(ledger.accepted("姚明", "身高").is_empty());
         assert_eq!(ledger.evidence("姚明", "身高"), vec!["230"]);
+    }
+
+    #[test]
+    fn direct_assertion_of_the_only_graph_value_is_not_a_conflict() {
+        let mut ledger = SlotLedger::new();
+        let base = vec!["226".to_string()];
+        let transition = ledger
+            .apply(direct("姚明", "身高", "226", "记住"), &base)
+            .unwrap();
+        assert_eq!(transition.delta, SlotDelta::Added);
+        assert_eq!(ledger.accepted("姚明", "身高"), vec!["226"]);
+        assert!(ledger.suppressed("姚明", "身高").is_empty());
     }
 
     #[test]

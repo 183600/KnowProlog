@@ -2372,7 +2372,29 @@ impl SymbolicReasoner {
         constraints: &SearchConstraints,
         budget: SearchBudget,
     ) -> EvidenceSearch {
-        self.retrieval.lock().search(query, k, constraints, budget)
+        let mut search = self.retrieval.lock().search(query, k, constraints, budget);
+        // 证据索引同样尊重槽级压制：功能槽已有会话赢家时，图谱旧值不再
+        // 作为候选证据；旧值仍在图谱与账本里，可审计、可恢复。
+        search.hits.retain(|hit| {
+            !self.is_suppressed_slot_value(&hit.subject, &hit.predicate, &hit.object)
+        });
+        search
+    }
+
+    /// 某个 `(主语, 谓词, 取值)` 是否被当前会话槽赢家压制。
+    ///
+    /// 只有「该槽确有会话赢家且新值不是它」时才算压制；槽为空时图谱值
+    /// 正常可见（撤回改口后自然回落到图谱）。
+    pub fn is_suppressed_slot_value(&self, subject: &str, predicate: &str, value: &str) -> bool {
+        let (subject, predicate) = self.slot_identity(subject, predicate);
+        let accepted = self.slots.accepted(&subject, &predicate);
+        if accepted.is_empty() || accepted.iter().any(|candidate| candidate == value) {
+            return false;
+        }
+        self.slots
+            .suppressed(&subject, &predicate)
+            .iter()
+            .any(|candidate| candidate == value)
     }
 
     /// 证据检索的文本视图：排序证据 + 检索回执。
@@ -7467,6 +7489,13 @@ impl SymbolicReasoner {
             }
         }
         for triple in self.predictor.triples() {
+            if self.is_suppressed_slot_value(
+                &triple.subject,
+                &triple.predicate,
+                &triple.object,
+            ) {
+                continue;
+            }
             let validity = validity_by_entity
                 .get(triple.subject.as_str())
                 .copied()
@@ -7484,6 +7513,9 @@ impl SymbolicReasoner {
             if TEMPORAL_FROM_FIELDS.contains(&attribute.as_str())
                 || TEMPORAL_TO_FIELDS.contains(&attribute.as_str())
             {
+                continue;
+            }
+            if self.is_suppressed_slot_value(entity, attribute, value) {
                 continue;
             }
             let validity = validity_by_entity
@@ -8160,6 +8192,11 @@ impl SymbolicReasoner {
                 ));
             }
         }
+        // 槽级压制同样作用于结构化图谱问答：会话赢家存在时，图谱旧值
+        // 不参与匹配；它仍保留在图谱/账本里，撤回改口后自动恢复可见。
+        facts.retain(|fact| {
+            !self.is_suppressed_slot_value(&fact.subject, &fact.predicate, &fact.object)
+        });
         // 类型闭包只在本轮图谱匹配中物化，不写回知识图谱：查询「电影」
         // 能命中显式断言的「科幻片」，依据仍是检索层已登记的子类边。
         let mut inferred = Vec::new();
@@ -9700,6 +9737,13 @@ impl SymbolicReasoner {
                 self.predictor
                     .predict_for_entity(entity, None, self.config.max_predictions * 4)
             {
+                if self.is_suppressed_slot_value(
+                    &prediction.triple.subject,
+                    &prediction.triple.predicate,
+                    &prediction.triple.object,
+                ) {
+                    continue;
+                }
                 if self.predicate_mentioned_normalized_with(
                     normalized_question.as_ref(),
                     &prediction.triple.predicate,
@@ -12956,6 +13000,24 @@ mod tests {
         let answer = reasoner.answer("姚明的身高是什么").expect("应有属性答案");
         assert!(answer.contains("229cm"), "新值应生效：{}", answer);
         assert!(!answer.contains("226cm"), "旧值应被视图压制：{}", answer);
+        let evidence = reasoner.evidence_search(
+            "姚明的身高",
+            8,
+            &SearchConstraints::default(),
+            SearchBudget::unlimited(),
+        );
+        assert!(
+            !evidence
+                .hits
+                .iter()
+                .any(|hit| hit.object == "226cm"),
+            "证据索引不得再返回被压制的旧值：{:?}",
+            evidence
+                .hits
+                .iter()
+                .map(|hit| hit.text())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
