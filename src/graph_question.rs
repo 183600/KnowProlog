@@ -409,7 +409,8 @@ impl PatternLexicon {
     }
 
     fn compile_equality(&self, question: &str) -> Option<CompiledGraphQuestion> {
-        let (position, marker) = find_position(question, &["同一个", "同一", "共同"])?;
+        let (position, marker) =
+            find_position(question, &["同一个", "同一", "共同", "相同", "一样", "一致"])?;
         let left = &question[..position];
         let right = &question[position + marker.len()..];
         let mentions = self.entity_mentions(left);
@@ -731,6 +732,29 @@ mod tests {
         assert_eq!(compiled.pattern.edges.len(), 2);
         assert_eq!(compiled.pattern.edges[0].predicate, "出生地");
         assert_eq!(compiled.pattern.edges[1].predicate, "出生地");
+    }
+
+    #[test]
+    fn equality_accepts_shared_attribute_phrasings() {
+        let lexicon = lexicon();
+        for question in [
+            "姚明和刘翔的出生地相同吗？",
+            "姚明和刘翔出生在一样的城市吗？",
+            "姚明和刘翔的出生地是否一致？",
+        ] {
+            let compiled = lexicon.compile(question).expect("等值问句应可编译");
+            assert_eq!(compiled.kind, GraphQuestionKind::Equality, "{}", question);
+            assert_eq!(compiled.pattern.edges.len(), 2, "{}", question);
+            assert!(
+                compiled
+                    .pattern
+                    .edges
+                    .iter()
+                    .all(|edge| edge.predicate == "出生地"),
+                "{}",
+                question
+            );
+        }
     }
 
     #[test]
