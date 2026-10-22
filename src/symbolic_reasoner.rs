@@ -8447,6 +8447,11 @@ impl SymbolicReasoner {
         entity: &str,
         predicate: &ChainPredicate,
     ) -> Option<String> {
+        // 统计挖掘出的链接/关联规则只产生候选，不构成「已经证明」的答案；
+        // 它们继续走原有的候选通道，不能被包装成确定性推导。
+        if !Self::derived_rule_is_assertoric(&fact.rule_source) {
+            return None;
+        }
         let fact_predicate = self.aligner.canonical_form(fact.atom.predicate.as_ref());
         let slot_key = self.aligner.canonical_form(&predicate.slot);
         let surface_key = self.aligner.canonical_form(&predicate.surface);
@@ -8467,6 +8472,11 @@ impl SymbolicReasoner {
             }
             _ => None,
         }
+    }
+
+    /// 只有教学/补全/手工规则算「证明」；统计挖掘规则仍只算候选。
+    fn derived_rule_is_assertoric(source: &str) -> bool {
+        !source.starts_with("链接预测规则") && !source.starts_with("关联规则")
     }
 
     /// 在当前前向闭包里找一条能证明 `entity 的 predicate 是 expected` 的推导。
