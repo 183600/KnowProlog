@@ -686,23 +686,38 @@ fn parse_number_prefix(text: &str) -> Option<f64> {
     Some(sign * value)
 }
 
-/// 格式化数值：整数不带小数点，小数最多两位且去掉尾零。
+/// 格式化数值：整数不带小数点；小数去掉尾零，并保留小量级的有效数字。
+///
+/// 差值常落在毫米、毫升这类小数上，固定两位会把 `0.001` 显示成 `0`；
+/// 因此按量级增加小数位，极小值用科学计数法兜底。
 pub fn format_number(value: f64) -> String {
     if !value.is_finite() {
         return value.to_string();
     }
     if (value - value.round()).abs() < 1e-9 {
-        format!("{}", value.round() as i64)
-    } else {
-        let mut text = format!("{:.2}", value);
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-        text
+        return format!("{}", value.round());
     }
+    let magnitude = value.abs();
+    let decimals = if magnitude >= 1.0 {
+        2
+    } else if magnitude >= 0.01 {
+        4
+    } else if magnitude >= 1e-6 {
+        8
+    } else {
+        return format!("{:e}", value);
+    };
+    let mut text = format!("{:.*}", decimals, value);
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    if text == "0" || text == "-0" {
+        return format!("{:e}", value);
+    }
+    text
 }
 
 /// 排序请求：方向 + 页码式偏移 + 条数。
@@ -978,6 +993,18 @@ mod tests {
         assert!(tall
             .difference_in_own_unit(&parse_quantity("8848平方公里").unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn small_values_keep_significant_digits() {
+        assert_eq!(format_number(0.001), "0.001");
+        assert_eq!(format_number(0.000_001), "0.000001");
+        assert_eq!(format_number(1e-9), "1e-9");
+        assert_eq!(
+            parse_quantity("1毫米").unwrap().format_canonical(),
+            "0.001米"
+        );
+        assert_eq!(format_number(1.2345), "1.23");
     }
 
     #[test]
