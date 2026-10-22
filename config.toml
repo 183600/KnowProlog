@@ -27,6 +27,7 @@ enable_semantic_embedding = true       # 是否启用符号化知识嵌入（PPM
 embedding_similarity_floor = 0.6       # 近邻检索的最低余弦相似度
 dialogue_state_path = "oxigraph_data/dialogue_state.json"  # 对话记忆持久化文件（跨会话）
 enable_generation = true               # 是否启用符号化生成（实体链接 + 介绍生成 + 统计续写）
+enable_contextual_rag = false          # 对话级证据装配（焦点帧 × 全息召回 × 证据束；默认关闭）
 max_profile_sentences = 6              # 单次生成介绍段落的最大事实句数
 completion_min_score = 0.3             # 类型级/全局级谓词回退的最低统计支持度
 enable_entailment = true               # 是否启用形式化语义与语义蕴含判定（陈述句校验/生成自检）

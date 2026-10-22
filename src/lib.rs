@@ -435,6 +435,9 @@ pub struct ReasoningConfig {
     pub holographic_similarity_floor: f64,
     #[serde(default = "default_holographic_max_hits")]
     pub holographic_max_hits: usize,
+    /// 对话级证据装配（焦点帧 × 全息召回 × 证据束生成）；默认关闭。
+    #[serde(default)]
+    pub enable_contextual_rag: bool,
     /// 严格谓词准入：未登记谓词不自动准入、其事实不落库（默认自动准入 + 待确认）
     #[serde(default)]
     pub require_predicate_admission: bool,
@@ -664,6 +667,7 @@ impl Default for ReasoningConfig {
             holographic_dimension: default_holographic_dimension(),
             holographic_similarity_floor: default_holographic_similarity_floor(),
             holographic_max_hits: default_holographic_max_hits(),
+            enable_contextual_rag: false,
             require_predicate_admission: false,
         }
     }

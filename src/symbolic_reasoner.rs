@@ -16,6 +16,7 @@ use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, 
 use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::completion_episode::{CandidateStatus, CompletionLedger, RuleScope};
 use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
+use crate::contextual_rag::{self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame};
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
@@ -775,6 +776,8 @@ pub struct SymbolicReasoner {
     // 统一证据索引：词面倒排 × 结构 PPR × 谓词匹配，支持约束与可审计剪枝回执。
     // 用 Mutex 承载惰性重建，使只读回答路径也能在不改变 &self 契约下检索。
     retrieval: parking_lot::Mutex<DenseRetriever>,
+    // 对话级证据装配器的会话记忆：上次回答引用过的证据（追问去重、防复述）
+    contextual_last: parking_lot::Mutex<Option<(String, Vec<EvidenceKey>)>>,
     // 实体属性三元组（观察到的），供归结引擎编码事实
     attributes: HashSet<(String, String, String)>,
     // 属性查询索引：规范槽位 `(实体, 属性)` → 取值列表（随知识重建）
@@ -863,6 +866,7 @@ impl Clone for SymbolicReasoner {
             linker: self.linker.clone(),
             generator: self.generator.clone(),
             retrieval: parking_lot::Mutex::new(self.retrieval.lock().clone()),
+            contextual_last: parking_lot::Mutex::new(self.contextual_last.lock().clone()),
             attributes: self.attributes.clone(),
             attribute_index: self.attribute_index.clone(),
             associations: self.associations.clone(),
@@ -1063,6 +1067,7 @@ impl SymbolicReasoner {
             linker,
             generator,
             retrieval: parking_lot::Mutex::new(DenseRetriever::new(8, 0.85, 12)),
+            contextual_last: parking_lot::Mutex::new(None),
             attributes: HashSet::new(),
             attribute_index: HashMap::new(),
             associations,
@@ -1146,6 +1151,7 @@ impl SymbolicReasoner {
     /// 注入故障。知识派生状态（剖面/规则/向量/台账）原样保留。
     fn reset_session_state(&mut self) {
         self.context.clear();
+        *self.contextual_last.lock() = None;
         // 假设世界是会话态：分叉/重置时整体丢弃，不带走任何临时前提。
         self.discard_assumption_world();
         let lessons_were_taught = !self.lessons_parsed.is_empty();
@@ -7550,7 +7556,10 @@ impl SymbolicReasoner {
                 return Some(self.annotate_assumption_world(answer));
             }
         }
-        self.answer_by_evidence(question)
+        if let Some(answer) = self.answer_by_evidence(question) {
+            return Some(self.annotate_assumption_world(answer));
+        }
+        self.answer_contextual(question)
             .map(|answer| self.annotate_assumption_world(answer))
     }
 
@@ -7581,7 +7590,160 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_by_prediction(question) {
             return Some(answer);
         }
-        self.answer_by_evidence(question)
+        if let Some(answer) = self.answer_by_evidence(question) {
+            return Some(answer);
+        }
+        self.answer_contextual(question)
+    }
+
+    /// 对话级证据装配（默认关闭）：把问句、焦点栈、上一谓词与已引用证据
+    /// 编译成查询帧，融合稠密检索与全息召回，返回逐条引用的证据束。
+    pub fn contextual_evidence(&self, question: &str) -> Option<EvidenceAssembly> {
+        if !self.config.enable_contextual_rag
+            || !self.config.enable_generation
+            || self.retrieval.lock().is_empty()
+            || !contextual_rag::looks_like_question(question)
+        {
+            return None;
+        }
+        let normalized_question = self.aligner.normalize_cow(question);
+        let mentioned_canonicals = self.mentioned_predicate_canonicals(question);
+        let explicit_predicate = self.first_mentioned_known_predicate(
+            normalized_question.as_ref(),
+            &mentioned_canonicals,
+        );
+        let explicit_anchors = self.entities_mentioned(question);
+        let continuation = contextual_rag::is_continuation(question);
+        let referenced = if continuation {
+            self.contextual_last
+                .lock()
+                .as_ref()
+                .map(|(_, keys)| keys.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let focus = self.context.focus_entities().to_vec();
+        let frame = QueryFrame::compile(FrameInput {
+            question,
+            explicit_anchors,
+            explicit_predicate,
+            focus: &focus,
+            last_predicate: self.context.last_predicate(),
+            referenced: &referenced,
+        });
+        if frame.is_empty_request() {
+            return None;
+        }
+        let max_items = self.config.max_predictions.clamp(3, 8);
+        let query = if frame.explicit_anchors.is_empty() {
+            match (frame.anchors.first(), frame.predicate.as_deref()) {
+                (Some(anchor), Some(predicate)) => format!("{} {}", anchor, predicate),
+                (Some(anchor), None) => anchor.clone(),
+                (None, Some(predicate)) => predicate.to_string(),
+                (None, None) => question.trim().to_string(),
+            }
+        } else {
+            question.trim().to_string()
+        };
+        let mut dense_hits = Vec::new();
+        let mut holo_hits = Vec::new();
+        let two_anchors = frame.anchors.len() >= 2;
+        for anchor in frame.anchors.iter().take(2) {
+            let constraints = SearchConstraints {
+                subject: Some(anchor.clone()),
+                predicate: frame.predicate.clone(),
+                ..SearchConstraints::default()
+            };
+            dense_hits.extend(
+                self.evidence_search(
+                    &query,
+                    max_items.max(4),
+                    &constraints,
+                    SearchBudget::unlimited(),
+                )
+                .hits,
+            );
+            // 双锚点路径/对比：补一次入边检索，避免只看到锚点的出向事实。
+            if two_anchors && frame.predicate.is_none() {
+                let incoming = SearchConstraints {
+                    object: Some(anchor.clone()),
+                    ..SearchConstraints::default()
+                };
+                dense_hits.extend(
+                    self.evidence_search(
+                        &query,
+                        max_items.max(4),
+                        &incoming,
+                        SearchBudget::unlimited(),
+                    )
+                    .hits,
+                );
+            }
+            if self.config.enable_holographic_memory {
+                if let Some(predicate) = &frame.predicate {
+                    for hit in self.holo.recall_object(anchor, predicate) {
+                        holo_hits.push(HoloEvidence {
+                            subject: anchor.clone(),
+                            predicate: predicate.clone(),
+                            object: hit.symbol,
+                            score: hit.score,
+                            verified: hit.verified,
+                        });
+                    }
+                }
+            }
+        }
+        if frame.anchors.is_empty() {
+            if let Some(predicate) = &frame.predicate {
+                let constraints = SearchConstraints {
+                    predicate: Some(predicate.clone()),
+                    ..SearchConstraints::default()
+                };
+                dense_hits.extend(
+                    self.evidence_search(
+                        &query,
+                        max_items.max(4),
+                        &constraints,
+                        SearchBudget::unlimited(),
+                    )
+                    .hits,
+                );
+            }
+        }
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        dense_hits.retain(|hit| {
+            seen.insert((hit.subject.clone(), hit.predicate.clone(), hit.object.clone()))
+        });
+        let mut type_hints: HashMap<String, String> = HashMap::new();
+        for hit in &dense_hits {
+            if let Some(entity_type) = self.linker.entity_type(&hit.object) {
+                type_hints
+                    .entry(hit.object.clone())
+                    .or_insert_with(|| entity_type.to_string());
+            }
+        }
+        let assembly = contextual_rag::assemble(
+            &frame,
+            &dense_hits,
+            &holo_hits,
+            &type_hints,
+            max_items,
+        );
+        if assembly.bundle.is_none() {
+            return None;
+        }
+        let keys = assembly.selected_keys();
+        if !keys.is_empty() {
+            *self.contextual_last.lock() = Some((question.trim().to_string(), keys));
+        }
+        Some(assembly)
+    }
+
+    /// 对话级证据装配的文本回答：只引用已核实证据，证据不足时弃权。
+    pub fn answer_contextual(&self, question: &str) -> Option<String> {
+        self.contextual_evidence(question)
+            .and_then(|assembly| assembly.answer().map(str::to_string))
     }
 
     /// 最后一道接地回答：计划与链接预测都无结论时，用统一证据索引取回
@@ -10264,6 +10426,7 @@ mod tests {
             holographic_dimension: 4096,
             holographic_similarity_floor: 0.01,
             holographic_max_hits: 6,
+            enable_contextual_rag: false,
             require_predicate_admission: false,
         }
     }
@@ -10568,6 +10731,129 @@ mod tests {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         assert!(reasoner.answer_by_evidence("师傅是谁").is_none());
+    }
+
+    fn contextual_config() -> ReasoningConfig {
+        let mut config = test_config();
+        config.enable_contextual_rag = true;
+        config
+    }
+
+    #[test]
+    fn test_contextual_rag_followup_uses_focus_and_last_predicate() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.context.record_entities(&["张三".to_string()]);
+        reasoner.context.record_predicate("师傅");
+
+        let assembly = reasoner
+            .contextual_evidence("还有呢")
+            .expect("追问应能沿用焦点与上一谓词");
+        let bundle = assembly.bundle.as_ref().expect("应有证据束");
+        assert!(bundle.answer.contains("李四"), "{}", bundle.answer);
+        assert!(bundle.answer.contains("[E1]"), "{}", bundle.answer);
+        assert_eq!(bundle.kind, contextual_rag::BundleKind::Single);
+
+        let no_more = reasoner
+            .contextual_evidence("还有呢")
+            .expect("重复追问应诚实说明没有新证据");
+        assert_eq!(
+            no_more.bundle.as_ref().map(|bundle| bundle.kind),
+            Some(contextual_rag::BundleKind::NoMore)
+        );
+        assert!(no_more.answer().unwrap_or_default().contains("没有新的已核实证据"));
+    }
+
+    #[test]
+    fn test_contextual_rag_switches_focus_with_explicit_entity() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.context.record_entities(&["张三".to_string()]);
+        reasoner.context.record_predicate("师傅");
+
+        let answer = reasoner
+            .answer_contextual("那李四呢")
+            .expect("显式实体追问应切到李四并沿用师傅");
+        assert!(answer.contains("王五"), "{}", answer);
+        assert!(answer.contains("李四"), "{}", answer);
+    }
+
+    #[test]
+    fn test_contextual_rag_profile_without_predicate() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer_contextual("介绍一下张三")
+            .expect("无谓词画像问题应装配实体画像");
+        assert!(answer.contains("实体画像"), "{}", answer);
+        assert!(answer.contains("李四"), "{}", answer);
+        assert!(answer.contains("王五"), "{}", answer);
+        assert!(answer.contains("[E1]"), "{}", answer);
+    }
+
+    #[test]
+    fn test_contextual_rag_records_verified_holographic_channel() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let assembly = reasoner
+            .contextual_evidence("张三的师傅是谁")
+            .expect("应能装配证据");
+        assert!(
+            assembly.receipt.holographic_support > 0,
+            "同一事实的全息硬核查候选应计入通道回执"
+        );
+        assert!(!assembly.receipt.certified);
+    }
+
+    #[test]
+    fn test_contextual_rag_reports_multiple_values_without_collapsing() {
+        let mut facts = vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "王五".to_string(),
+            },
+        ];
+        facts.extend(master_facts());
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let answer = reasoner
+            .answer_contextual("张三的师傅是谁")
+            .expect("多值槽位应全部列出");
+        assert!(answer.contains("李四"), "{}", answer);
+        assert!(answer.contains("王五"), "{}", answer);
+        assert!(answer.contains("多个登记取值"), "{}", answer);
+    }
+
+    #[test]
+    fn test_contextual_rag_auto_answer_path_is_enabled_by_config() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.context.record_entities(&["张三".to_string()]);
+        reasoner.context.record_predicate("师傅");
+        let answer = reasoner
+            .answer("还有呢")
+            .expect("自动回答路径应在配置开启时接管追问");
+        assert!(answer.contains("李四"), "{}", answer);
+    }
+
+    #[test]
+    fn test_contextual_rag_is_off_by_default() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.answer_contextual("张三的师傅是谁").is_none());
+    }
+
+    #[test]
+    fn test_contextual_rag_abstains_without_anchor_or_predicate() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.answer_contextual("介绍一下不存在的人").is_none());
     }
 
     #[test]
