@@ -1171,8 +1171,14 @@ impl SymbolicReasoner {
         self.predicate_canonicals_memo.lock().clear();
         self.read_traces.clear();
         self.engine_fault = None;
-        // 教学规则会随 lessons_parsed 重放进概率程序；只有真的教过才需要重建
-        if lessons_were_taught && self.config.enable_problog {
+        // 会话事实/规则可能已注入归结、软逻辑与概率程序；分叉后必须用
+        // 纯图谱基座重建，否则新会话仍能推出上一会话的临时前提。
+        if self.config.enable_resolution {
+            self.rebuild_resolver();
+        }
+        if self.config.enable_soft_logic {
+            self.rebuild_soft_logic();
+        } else if lessons_were_taught && self.config.enable_problog {
             self.rebuild_problog();
         }
     }
@@ -13921,6 +13927,40 @@ types = [
         assert_eq!(
             format!("{:?}", forked.context.focus_entities()),
             format!("{:?}", fresh.context.focus_entities())
+        );
+    }
+
+    /// 分叉不得把上一会话的临时事实与假设前提留在归结引擎里。
+    #[test]
+    fn fork_session_drops_session_and_assumption_premises() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner.adopt_session_triple("李四", "师傅", "钱七"));
+        reasoner
+            .enter_assumption_world("赵六的师傅是钱八")
+            .expect("假设世界应可进入");
+        let session_atom = Atom::rel("师傅", "李四", "钱七");
+        let assumption_atom = Atom::rel("师傅", "赵六", "钱八");
+        assert!(reasoner.resolver().has_fact(&session_atom));
+        assert!(reasoner.resolver().has_fact(&assumption_atom));
+
+        let forked = reasoner.fork_session();
+        assert!(forked.session_facts().is_empty(), "分叉不得继承会话事实");
+        assert!(forked.assumption_world().is_none(), "分叉不得继承假设世界");
+        assert!(
+            !forked.resolver().has_fact(&session_atom),
+            "分叉归结引擎不得残留会话事实"
+        );
+        assert!(
+            !forked.resolver().has_fact(&assumption_atom),
+            "分叉归结引擎不得残留假设事实"
+        );
+        assert!(
+            !forked
+                .answer("李四的师傅是谁")
+                .unwrap_or_default()
+                .contains("钱七"),
+            "分叉后的回答不得引用会话临时事实"
         );
     }
 
