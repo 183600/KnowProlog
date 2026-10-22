@@ -713,8 +713,23 @@ pub fn rank<T: Clone>(items: Vec<(T, Quantity)>, spec: &RankSpec) -> RankOutcome
     for (_, quantity) in &items {
         *counts.entry(quantity.dimension()).or_insert(0) += 1;
     }
-    let dimension = counts
-        .iter()
+    // 有显式单位时优先按单位量纲排名：缺单位数字（Count）通常来自抽取
+    // 丢单位，不能让它们凭数量优势把真正可比的带单位值全部挤进 skipped。
+    let preferred: Vec<(&Dimension, &usize)> = if counts.len() > 1 {
+        let with_units: Vec<(&Dimension, &usize)> = counts
+            .iter()
+            .filter(|(dimension, _)| **dimension != Dimension::Count)
+            .collect();
+        if with_units.is_empty() {
+            counts.iter().collect()
+        } else {
+            with_units
+        }
+    } else {
+        counts.iter().collect()
+    };
+    let dimension = preferred
+        .into_iter()
         .max_by(|(left_dimension, left), (right_dimension, right)| {
             left.cmp(right)
                 .then_with(|| right_dimension.cmp(left_dimension))
@@ -907,6 +922,30 @@ mod tests {
         );
         assert_eq!(outcome.entries[0].rank, 3, "并列第一后下一名是第三");
         assert_eq!(outcome.entries[0].item, "丙");
+    }
+
+    #[test]
+    fn rank_prefers_unit_bearing_dimension_over_bare_counts() {
+        let items = vec![
+            ("甲".to_string(), parse_quantity("2.26米").unwrap()),
+            ("乙".to_string(), parse_quantity("1.90米").unwrap()),
+            ("丙".to_string(), parse_quantity("226").unwrap()),
+            ("丁".to_string(), parse_quantity("190").unwrap()),
+            ("戊".to_string(), parse_quantity("180").unwrap()),
+        ];
+        let outcome = rank(
+            items,
+            &RankSpec {
+                descending: true,
+                offset: 0,
+                limit: 2,
+            },
+        );
+        assert_eq!(outcome.dimension, Some(Dimension::Length));
+        assert_eq!(outcome.entries.len(), 2);
+        assert_eq!(outcome.entries[0].item, "甲");
+        assert_eq!(outcome.entries[1].item, "乙");
+        assert_eq!(outcome.skipped.len(), 3);
     }
 
     #[test]
