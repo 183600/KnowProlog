@@ -228,7 +228,8 @@ pub static UNITS: &[(&str, Unit)] = &[
     ("个百分点", unit(Dimension::Ratio, 1.0, 0.0)),
     ("%", unit(Dimension::Ratio, 1.0, 0.0)),
     ("％", unit(Dimension::Ratio, 1.0, 0.0)),
-    ("倍", unit(Dimension::Ratio, 1.0, 0.0)),
+    // 基准是百分点：1 倍 = 100%，0.5 倍 = 50%。
+    ("倍", unit(Dimension::Ratio, 100.0, 0.0)),
     // 货币（不做跨币种换算）
     ("人民币", unit(Dimension::Currency, 1.0, 0.0)),
     ("元", unit(Dimension::Currency, 1.0, 0.0)),
@@ -907,6 +908,27 @@ mod tests {
             parse_quantity("20岁左右").unwrap().exactness(),
             Exactness::Approximate
         );
+    }
+
+    #[test]
+    fn ratio_normalizes_multiple_and_percent() {
+        let twice = parse_quantity("2倍").unwrap();
+        let percent = parse_quantity("200%").unwrap();
+        assert_eq!(twice.dimension(), Dimension::Ratio);
+        assert_eq!(twice.compare(&percent), Comparison::Equal);
+        assert_eq!(
+            parse_quantity("0.5倍")
+                .unwrap()
+                .compare(&parse_quantity("50%").unwrap()),
+            Comparison::Equal
+        );
+        assert_eq!(
+            parse_quantity("2倍")
+                .unwrap()
+                .compare(&parse_quantity("150%").unwrap()),
+            Comparison::Greater
+        );
+        assert_eq!(twice.format_canonical(), "200%");
     }
 
     #[test]
