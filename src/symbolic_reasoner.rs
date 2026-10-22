@@ -3445,6 +3445,49 @@ impl SymbolicReasoner {
             })
     }
 
+    /// 从问句结构提取**目标谓词**（最后一个「的」后的中心词）。
+    ///
+    /// 例：「姚明的配偶的体重」→「体重」，「姚明的配偶是谁」→「配偶」。
+    /// 泛化中心词（资料/信息/关系……）不构成目标限制，返回 None。
+    /// 属性谓词未必出现在 [`Self::known_predicates_normalized_cache`] 中，
+    /// 因此这里按词面结构判断，而不是只查已知关系谓词。
+    fn target_predicate_surface(&self, normalized_text: &str) -> Option<String> {
+        let mut core = normalized_text
+            .trim()
+            .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+            .trim();
+        let mut stripped = true;
+        while stripped {
+            stripped = false;
+            for suffix in [
+                "是多少", "是什么", "是谁", "是哪里", "是哪个", "是哪儿", "是哪位", "是哪些",
+                "是几", "呢", "吗",
+            ] {
+                if let Some(rest) = core.strip_suffix(suffix) {
+                    core = rest.trim();
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        // 没有「的」的句子（如「姚明和叶莉什么关系」）不构成链式目标限制。
+        if !core.contains('的') {
+            return None;
+        }
+        let segment = core.rsplit('的').next()?.trim();
+        if segment.is_empty() {
+            return None;
+        }
+        const GENERIC: &[&str] = &[
+            "资料", "信息", "情况", "介绍", "关系", "内容", "属性", "特征", "数据", "详情",
+            "细节", "知识", "事实", "谁", "什么", "多少", "哪儿", "哪里",
+        ];
+        if GENERIC.contains(&segment) {
+            return None;
+        }
+        Some(self.aligner.canonical_form(segment))
+    }
+
     /// 判断谓词是否被文本提及（等价于 predicate_mentioned_normalized）
     fn predicate_mentioned_normalized_with(
         &self,
@@ -9389,6 +9432,10 @@ impl SymbolicReasoner {
         if !mentions_predicate {
             return None;
         }
+        // 话题谓词（如「配偶」）不等于目标谓词（如「体重」）。证据索引
+        // 只允许用问句最后一个「的」后的中心词作答，否则会把
+        // 「配偶是谁」的证据当成「配偶的体重」的答案，制造无证明的确定回答。
+        let target_predicate = self.target_predicate_surface(normalized_question.as_ref());
 
         let search = self.evidence_search(
             question,
@@ -9408,10 +9455,15 @@ impl SymbolicReasoner {
                 }
                 let canonical = self.aligner.canonical_form(&hit.predicate);
                 let predicate_norm = self.aligner.normalize_cow(&hit.predicate);
-                mentioned_canonicals.contains(&hit.predicate)
-                    || mentioned_canonicals.contains(&canonical)
-                    || (!predicate_norm.is_empty()
-                        && normalized_question.contains(predicate_norm.as_ref() as &str))
+                let matches_target = target_predicate.as_ref().map_or(true, |target| {
+                    canonical.as_str() == target.as_str()
+                        || hit.predicate.as_str() == target.as_str()
+                });
+                matches_target
+                    && (mentioned_canonicals.contains(&hit.predicate)
+                        || mentioned_canonicals.contains(&canonical)
+                        || (!predicate_norm.is_empty()
+                            && normalized_question.contains(predicate_norm.as_ref() as &str)))
             })
             .take(3)
             .collect();
@@ -17575,6 +17627,60 @@ types = [
             reasoner.answer_certain("孙八的师祖是谁").is_none(),
             "确认前的预测不得走确证通道"
         );
+    }
+
+    #[test]
+    fn evidence_answer_requires_the_target_predicate() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::from([("身高".to_string(), "226".to_string())]),
+            },
+            PrologFact::Entity {
+                name: "叶莉".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::from([("身高".to_string(), "190".to_string())]),
+            },
+            PrologFact::Entity {
+                name: "李娜".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::from([("体重".to_string(), "55".to_string())]),
+            },
+            PrologFact::Relation {
+                from: "姚明".to_string(),
+                rel_type: "配偶".to_string(),
+                to: "叶莉".to_string(),
+            },
+            PrologFact::Relation {
+                from: "叶莉".to_string(),
+                rel_type: "配偶".to_string(),
+                to: "姚明".to_string(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        // 「配偶」只是话题；目标是「体重」。不能拿配偶证据冒充确定答案。
+        assert!(
+            reasoner
+                .answer_certain("姚明的配偶的体重是多少")
+                .is_none(),
+            "无目标谓词证据时必须弃权"
+        );
+        assert!(
+            reasoner.answer_certain("姚明的女儿的体重是多少").is_none(),
+            "同类链式未知也必须弃权"
+        );
+        // 目标谓词确有证据时仍需正常作答，不能把闸门做成一律弃权。
+        let relation = reasoner
+            .answer_certain("姚明的配偶是谁")
+            .expect("配偶关系本身可证");
+        assert!(relation.contains("叶莉"), "{}", relation);
+        let attribute = reasoner
+            .answer_certain("姚明的配偶的身高是多少")
+            .expect("配偶身高可经多跳证明");
+        assert!(attribute.contains("190"), "{}", attribute);
     }
 
     #[test]

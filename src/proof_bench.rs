@@ -720,19 +720,24 @@ pub fn seed_corpus() -> &'static [Scenario] {
             family: Family::Unknown,
             facts: &[
                 Fact::Attribute {
-                    entity: "王五",
+                    entity: "姚明",
                     key: "身高",
-                    value: "170",
+                    value: "226",
                 },
                 Fact::Attribute {
-                    entity: "王五",
+                    entity: "姚明",
                     key: "国籍",
                     value: "中国",
                 },
                 Fact::Attribute {
-                    entity: "赵六",
+                    entity: "叶莉",
                     key: "身高",
-                    value: "165",
+                    value: "190",
+                },
+                Fact::Attribute {
+                    entity: "叶莉",
+                    key: "国籍",
+                    value: "中国",
                 },
                 Fact::Attribute {
                     entity: "李娜",
@@ -740,25 +745,25 @@ pub fn seed_corpus() -> &'static [Scenario] {
                     value: "55",
                 },
                 Fact::Relation {
-                    from: "张三",
+                    from: "姚明",
                     relation: "配偶",
-                    to: "李四",
+                    to: "叶莉",
                 },
                 Fact::Relation {
-                    from: "李四",
-                    relation: "师傅",
-                    to: "王五",
+                    from: "叶莉",
+                    relation: "配偶",
+                    to: "姚明",
                 },
             ],
             turns: &[BenchTurn::probe(
-                "王五的配偶的体重是多少",
+                "姚明的配偶的体重是多少",
                 Probe::Unknown {
-                    entity: "王五",
+                    entity: "姚明",
                     attribute: "配偶的体重",
                     goals: &[
                         Goal {
                             predicate: "配偶",
-                            subject: TermSpec::Entity("王五"),
+                            subject: TermSpec::Entity("姚明"),
                             object: TermSpec::Var("V1"),
                         },
                         Goal {
@@ -1402,6 +1407,7 @@ impl ProofBenchReport {
 
 #[derive(Debug, Clone)]
 struct TurnReading {
+    input: String,
     normalized_question: Option<String>,
     entity: Option<String>,
     attribute: Option<String>,
@@ -1570,6 +1576,7 @@ fn run_scenario(
             .plan_pure_dialogue(turn.input, &reasoner)
             .or_else(|| manager.plan_reply(turn.input, &reasoner));
         readings.push(TurnReading {
+            input: turn.input.to_string(),
             normalized_question: frame.question,
             entity: frame.entity,
             attribute: frame.attribute,
@@ -1787,10 +1794,22 @@ fn evaluate_unknown(
             distance: Some(compute_distance(facts, goals)),
         };
     }
+    // 形式证明为空还不够：回答管线也不能把别的话题证据包装成确定答案。
+    if let Some(answer) = reasoner.answer_certain(&reading.input) {
+        return ProbeOutcome {
+            verdict: Verdict::Failed,
+            observed: Some(clip(&answer, 120)),
+            detail: format!(
+                "归结搜索已穷尽且无解，但回答管线仍给出确定答案（目标：{}）",
+                view.goal_display
+            ),
+            distance: Some(compute_distance(facts, goals)),
+        };
+    }
     ProbeOutcome {
         verdict: Verdict::Passed,
         observed: None,
-        detail: format!("搜索已穷尽且无解：{}", view.goal_display),
+        detail: format!("搜索已穷尽且无解，且没有确定回答：{}", view.goal_display),
         distance: Some(compute_distance(facts, goals)),
     }
 }
@@ -2601,6 +2620,24 @@ mod tests {
                 .any(|distance| distance.minimum_hypotheses.is_some()),
             "至少应有一个预算内可验证的证距估计"
         );
+    }
+
+    #[test]
+    fn unknown_bridge_rejects_off_topic_evidence() {
+        let report = evaluate_seed();
+        let result = report
+            .results
+            .iter()
+            .find(|result| result.scenario == "未知桥接")
+            .expect("语料必须包含未知桥接场景");
+        assert_eq!(
+            result.verdict,
+            Verdict::Passed,
+            "「配偶」的话题证据不能冒充「配偶的体重」的确定答案：{}",
+            result.detail
+        );
+        let distance = result.distance.as_ref().expect("应报告证距");
+        assert!(distance.verified, "{:?}", distance);
     }
 
     #[test]
