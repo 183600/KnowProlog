@@ -8484,11 +8484,32 @@ impl SymbolicReasoner {
         !source.starts_with("链接预测规则") && !source.starts_with("关联规则")
     }
 
-    /// 推导的结论或任一前提是否被会话否定事实阻断。
+    /// 推导的结论或任一前提是否已被否定事实/槽压制排除。
     fn derived_fact_is_blocked(&self, fact: &DerivedFact) -> bool {
         std::iter::once(&fact.atom)
             .chain(fact.premises.iter())
-            .any(|atom| self.negative_atom_blocks(atom))
+            .any(|atom| self.negative_atom_blocks(atom) || self.atom_suppressed_by_slot(atom))
+    }
+
+    /// 槽账本里已有更新的赢家时，图谱写下的旧值只是被压制，不是被删除；
+    /// 推导层必须和直接回答看到同一套可见取值，否则会把旧值重新推出来。
+    fn atom_suppressed_by_slot(&self, atom: &Atom) -> bool {
+        let [Term::Const(subject), Term::Const(object)] = atom.terms.as_slice() else {
+            return false;
+        };
+        let (slot_subject, slot_predicate) = self.slot_identity(subject, atom.predicate.as_ref());
+        let accepted = self.slots.accepted(&slot_subject, &slot_predicate);
+        if accepted.is_empty() {
+            return false;
+        }
+        let object = self.aligner.canonical_form(object);
+        self.slots
+            .suppressed(&slot_subject, &slot_predicate)
+            .iter()
+            .any(|value| self.aligner.canonical_form(value) == object)
+            && !accepted
+                .iter()
+                .any(|value| self.aligner.canonical_form(value) == object)
     }
 
     /// 规范化比较的否定阻断：词面同义词不应让阻断边漏过去。
@@ -14085,6 +14106,55 @@ mod tests {
             .answer("张三的师祖是王五吗")
             .expect("已知实体与谓词应给出可读回答");
         assert!(!check.contains("是的"), "{}", check);
+    }
+
+    #[test]
+    fn test_derived_answer_respects_suppressed_graph_value() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        config.enable_association_rules = false;
+        config.enable_clarification = false;
+        config.enable_soft_logic = false;
+        config.enable_problog = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        // 王五是图谱里的旧值；改口后它仍在图谱中，只是被会话槽压制。
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "李四".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "王五".to_string(),
+        }]);
+        reasoner.slots.policy_mut().declare_functional("师傅", true);
+        reasoner.assert_nl_fact("张三的师傅是李四");
+        reasoner
+            .aligner
+            .register_term("师祖", TermKind::Relation);
+        reasoner.session_clauses.push(Clause::new(
+            Atom::pattern("师祖", Term::var("X"), Term::var("Z")),
+            vec![
+                Atom::pattern("师傅", Term::var("X"), Term::var("Y")),
+                Atom::pattern("师傅", Term::var("Y"), Term::var("Z")),
+            ],
+            0.99,
+            "测试：师祖是师傅的两跳",
+        ));
+        reasoner.rebuild_knowledge_caches();
+        reasoner.rebuild_resolver();
+
+        let before = reasoner.answer("张三的师祖是谁").expect("应能推出王五");
+        assert!(before.contains("王五"), "{}", before);
+
+        reasoner.correct_nl_fact("改口：李四的师傅是赵六");
+        let after = reasoner
+            .answer("张三的师祖是谁")
+            .expect("改口后应能推出新值");
+        assert!(after.contains("赵六"), "{}", after);
+        assert!(
+            !after.contains("王五"),
+            "被槽账本压制的图谱旧值不得重新进入推导：{}",
+            after
+        );
+        // 图谱本身没有被推导或改口改写。
+        assert!(reasoner.predictor.has_triple("李四", "师傅", "王五"));
     }
 
     #[test]
