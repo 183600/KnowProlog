@@ -279,15 +279,27 @@ impl ClarificationSession {
         goals: &[Atom],
         query_vars: &[String],
     ) {
+        // 判别力只算一次：排序比较器里反复克隆引擎会把澄清变成 O(n log n) 次证明。
+        let gains: HashMap<String, u8> = queue
+            .iter()
+            .map(|hypothesis| {
+                (
+                    hypothesis.atom.display(),
+                    Self::discrimination(engine, goals, query_vars, hypothesis),
+                )
+            })
+            .collect();
         queue.sort_by(|left, right| {
-            let left_gain = Self::discrimination(engine, goals, query_vars, left);
-            let right_gain = Self::discrimination(engine, goals, query_vars, right);
+            let left_key = left.atom.display();
+            let right_key = right.atom.display();
+            let left_gain = gains.get(&left_key).copied().unwrap_or(0);
+            let right_gain = gains.get(&right_key).copied().unwrap_or(0);
             right_gain.cmp(&left_gain).then_with(|| {
                 right
                     .confidence
                     .partial_cmp(&left.confidence)
                     .unwrap_or(std::cmp::Ordering::Equal)
-            }).then_with(|| left.atom.display().cmp(&right.atom.display()))
+            }).then_with(|| left_key.cmp(&right_key))
         });
     }
 
