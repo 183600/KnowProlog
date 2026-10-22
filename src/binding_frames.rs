@@ -2535,8 +2535,8 @@ output = "value"
             .expect("带单位的值应能比较");
         assert!(outcome.text.contains("姚明更高"), "{}", outcome.text);
         assert!(
-            outcome.text.contains("相差0.36米"),
-            "比较应给出同量纲差值：{}",
+            outcome.text.contains("相差36厘米"),
+            "比较应给出原始单位的同量纲差值：{}",
             outcome.text
         );
     }
