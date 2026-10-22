@@ -112,11 +112,20 @@ pub struct Claim {
     pub subject: String,
     pub predicate: String,
     pub object: String,
+    /// 断言本身是否带否定（「不是……」）。概率始终按**肯定原子**查询，
+    /// 否定断言的概率由 `1 - P(atom)` 得到，绝不在查询前把主语和宾语对调。
+    pub negated: bool,
 }
 
 impl Claim {
     pub fn render(&self) -> String {
-        format!("{} 的 {} 是 {}", self.subject, self.predicate, self.object)
+        format!(
+            "{} 的 {} {} {}",
+            self.subject,
+            self.predicate,
+            if self.negated { "不是" } else { "是" },
+            self.object
+        )
     }
 }
 
@@ -578,7 +587,12 @@ fn contains_interrogative(text: &str) -> bool {
 fn parse_claim(raw: &str) -> Option<Claim> {
     let text = strip_question_tail(raw);
     let (left, right) = text.split_once('是')?;
-    let left = left.trim();
+    let mut left = left.trim();
+    let mut negated = false;
+    if let Some(rest) = left.strip_suffix('不') {
+        left = rest.trim();
+        negated = true;
+    }
     let right = right.trim();
     if left.is_empty() || right.is_empty() || left.contains('是') || right.contains('是') {
         return None;
@@ -607,6 +621,7 @@ fn parse_claim(raw: &str) -> Option<Claim> {
         subject: subject.to_string(),
         predicate: predicate.to_string(),
         object: object.to_string(),
+        negated,
     })
 }
 
@@ -779,11 +794,13 @@ fn parse_comparison(raw: &str, cues: &[EpistemicCue]) -> Option<EpistemicTarget>
         subject: left_subject.to_string(),
         predicate: predicate.clone(),
         object: anchor.clone(),
+        negated: false,
     };
     let right = Claim {
         subject: right_subject.to_string(),
         predicate,
         object: anchor,
+        negated: false,
     };
     Some(EpistemicTarget::Comparison { left, right })
 }
@@ -869,6 +886,7 @@ mod tests {
                 subject: "李四".to_string(),
                 predicate: "师傅".to_string(),
                 object: "王五".to_string(),
+                negated: false,
             }))
         );
         assert!(intent.confidence > 0.85);
@@ -885,6 +903,7 @@ mod tests {
                 subject: "李四".to_string(),
                 predicate: "师傅".to_string(),
                 object: "王五".to_string(),
+                negated: false,
             }))
         );
     }
@@ -899,6 +918,7 @@ mod tests {
                 subject: "李四".to_string(),
                 predicate: "师傅".to_string(),
                 object: "王五".to_string(),
+                negated: false,
             }))
         );
         assert!(intent.threshold >= 0.95);
@@ -956,8 +976,22 @@ mod tests {
                 subject: "李四".to_string(),
                 predicate: "师傅".to_string(),
                 object: "王五".to_string(),
+                negated: false,
             }))
         );
+    }
+
+    #[test]
+    fn copula_negation_stays_inside_the_claim() {
+        let intent = ProbabilisticQueryIntent::analyze("李四一定不是王五的师傅吗").unwrap();
+        assert_eq!(intent.mode, EpistemicMode::Certainty);
+        let Some(EpistemicTarget::GroundClaim(claim)) = intent.target else {
+            panic!("应抽出带否定的基原子");
+        };
+        assert_eq!(claim.subject, "李四");
+        assert_eq!(claim.predicate, "师傅");
+        assert_eq!(claim.object, "王五");
+        assert!(claim.negated);
     }
 
     #[test]

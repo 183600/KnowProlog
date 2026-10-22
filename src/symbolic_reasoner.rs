@@ -55,6 +55,9 @@ use crate::pending_question::{
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
+use crate::probabilistic_query_intent::{
+    Claim, EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
+};
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
 use crate::query_planner::{QueryPlan, QueryPlanner};
@@ -9905,6 +9908,12 @@ impl SymbolicReasoner {
     /// 对话层用它与恢复阶梯衔接：确证失败后由 L2 提名、验证、追问，
     /// 而不是把候选列表直接当结论输出。
     pub fn answer_certain(&self, question: &str) -> Option<String> {
+        // 情态问句的答案不是「确证事实」，但它把不确定性与阈值显式写在脸上；
+        // 对话恢复层（answer_certain）同样必须看得见它，否则「可能」会被
+        // 悄悄降级成普通确证回答。
+        if let Some(answer) = self.answer_probabilistic_intent(question) {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_planned(question) {
             if !answer.contains("置信度") && !answer.contains("链接预测") {
                 return Some(self.annotate_assumption_world(answer));
@@ -10229,6 +10238,9 @@ impl SymbolicReasoner {
 
     /// 无观测副作用的回答实现（报告路径复用，避免失败轨迹递归）。
     fn answer_impl(&self, question: &str) -> Option<String> {
+        if let Some(answer) = self.answer_probabilistic_intent(question) {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_planned(question) {
             return Some(answer);
         }
@@ -12585,6 +12597,570 @@ impl SymbolicReasoner {
             }
         }
         output.trim_end().to_string()
+    }
+
+    /// 自然语言情态问句 → ProbLog 概率算子。
+    ///
+    /// 只接管**明确带情态线索**的问句；普通问句返回 `None`，继续走原有管线。
+    /// 输出永远是双账本：先给 PQI 的理解后验，再给 ProbLog 的知识概率，
+    /// 两者都不相乘、不互相替代。
+    pub fn answer_probabilistic_intent(&self, question: &str) -> Option<String> {
+        if !self.config.enable_problog || !self.config.enable_soft_logic {
+            return None;
+        }
+        let intent = ProbabilisticQueryIntent::analyze(question)?;
+        let target = match intent.target.clone() {
+            Some(target) => self.normalize_epistemic_target(target),
+            None => self.epistemic_target_from_core(&intent.core_question)?,
+        };
+        self.render_probabilistic_intent(&intent, &target)
+    }
+
+    fn canonical_epistemic_entity(&self, raw: &str) -> String {
+        let raw = raw.trim();
+        if !raw.is_empty() && self.is_known_entity(raw) {
+            self.aligner.canonical_form(raw)
+        } else {
+            raw.to_string()
+        }
+    }
+
+    /// 词面目标 → 图谱槽位；逆向谓词交换主宾语，而不是改写否定作用域。
+    fn normalize_epistemic_claim(&self, claim: &Claim) -> Claim {
+        let subject = self.canonical_epistemic_entity(&claim.subject);
+        let object = self.canonical_epistemic_entity(&claim.object);
+        let (predicate, inverted) = self.resolve_question_predicate(&claim.predicate);
+        let (subject, object) = if inverted {
+            (object, subject)
+        } else {
+            (subject, object)
+        };
+        Claim {
+            subject,
+            predicate,
+            object,
+            negated: claim.negated,
+        }
+    }
+
+    fn orient_epistemic_target(&self, subject: &str, predicate: &str) -> EpistemicTarget {
+        let subject = self.canonical_epistemic_entity(subject);
+        let (predicate, inverted) = self.resolve_question_predicate(predicate);
+        if inverted {
+            EpistemicTarget::SubjectsOf {
+                object: subject,
+                predicate,
+            }
+        } else {
+            EpistemicTarget::ObjectsOf { subject, predicate }
+        }
+    }
+
+    fn normalize_epistemic_target(&self, target: EpistemicTarget) -> EpistemicTarget {
+        match target {
+            EpistemicTarget::GroundClaim(claim) => {
+                EpistemicTarget::GroundClaim(self.normalize_epistemic_claim(&claim))
+            }
+            EpistemicTarget::ObjectsOf { subject, predicate } => {
+                self.orient_epistemic_target(&subject, &predicate)
+            }
+            EpistemicTarget::SubjectsOf { object, predicate } => {
+                let (predicate, inverted) = self.resolve_question_predicate(&predicate);
+                let object = self.canonical_epistemic_entity(&object);
+                if inverted {
+                    EpistemicTarget::ObjectsOf {
+                        subject: object,
+                        predicate,
+                    }
+                } else {
+                    EpistemicTarget::SubjectsOf { object, predicate }
+                }
+            }
+            EpistemicTarget::Comparison { left, right } => EpistemicTarget::Comparison {
+                left: self.normalize_epistemic_claim(&left),
+                right: self.normalize_epistemic_claim(&right),
+            },
+        }
+    }
+
+    /// 情态剥离后的指称问句 → 结构化目标。只接受单跳目标；多跳链让位给
+    /// 原有推理管线，避免把中间实体的概率误当成整条链的概率。
+    fn epistemic_target_from_core(&self, question: &str) -> Option<EpistemicTarget> {
+        let plan = self.planner.parse(question)?;
+        match plan {
+            QueryPlan::FindObject { segments } => {
+                let (entity, predicates) = self.split_chain(&segments)?;
+                if predicates.len() != 1 {
+                    return None;
+                }
+                let predicate = &predicates[0];
+                if predicate.inverted {
+                    Some(EpistemicTarget::SubjectsOf {
+                        object: entity,
+                        predicate: predicate.slot.clone(),
+                    })
+                } else {
+                    Some(EpistemicTarget::ObjectsOf {
+                        subject: entity,
+                        predicate: predicate.slot.clone(),
+                    })
+                }
+            }
+            QueryPlan::FindSubject { object, predicate } => {
+                let (slot, inverted) = self.resolve_question_predicate(&predicate);
+                let object = self.canonical_epistemic_entity(&object);
+                if inverted {
+                    Some(EpistemicTarget::ObjectsOf {
+                        subject: object,
+                        predicate: slot,
+                    })
+                } else {
+                    Some(EpistemicTarget::SubjectsOf {
+                        object,
+                        predicate: slot,
+                    })
+                }
+            }
+            QueryPlan::CheckTriple {
+                subject_segments,
+                object,
+            } => {
+                let (entity, predicates) = self.split_chain(&subject_segments)?;
+                if predicates.len() != 1 {
+                    return None;
+                }
+                let predicate = &predicates[0];
+                let object = self.canonical_epistemic_entity(&object);
+                let (subject, object) = if predicate.inverted {
+                    (object, entity)
+                } else {
+                    (entity, object)
+                };
+                Some(EpistemicTarget::GroundClaim(Claim {
+                    subject,
+                    predicate: predicate.slot.clone(),
+                    object,
+                    negated: false,
+                }))
+            }
+            QueryPlan::CheckRelation {
+                subject,
+                predicate,
+                object,
+                negated,
+            } => Some(EpistemicTarget::GroundClaim(
+                self.normalize_epistemic_claim(&Claim {
+                    subject,
+                    predicate,
+                    object,
+                    negated,
+                }),
+            )),
+            _ => None,
+        }
+    }
+
+    fn render_probabilistic_intent(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        target: &EpistemicTarget,
+    ) -> Option<String> {
+        match target {
+            EpistemicTarget::GroundClaim(claim) => {
+                self.render_epistemic_claim(intent, claim)
+            }
+            EpistemicTarget::ObjectsOf { subject, predicate } => Some(
+                self.render_epistemic_ranking(intent, Some(subject), None, predicate),
+            ),
+            EpistemicTarget::SubjectsOf { object, predicate } => Some(
+                self.render_epistemic_ranking(intent, None, Some(object), predicate),
+            ),
+            EpistemicTarget::Comparison { left, right } => {
+                self.render_epistemic_comparison(intent, left, right)
+            }
+        }
+    }
+
+    fn epistemic_label(probability: f64) -> &'static str {
+        if probability >= 0.999 {
+            "已确证"
+        } else if probability <= 0.001 {
+            "已排除"
+        } else {
+            MarkovLogicEngine::hedge(probability)
+        }
+    }
+
+    fn render_problog_stats(
+        &self,
+        stats: (usize, usize, usize, usize, bool),
+    ) -> String {
+        let (choice_variables, bdd_nodes, ground_instances, ground_rounds, exact) = stats;
+        format!(
+            "ProbLog 编译：{} 轮基化 / {} 条规则实例 / {} 个选择变量 / {} 个 BDD 节点；{}",
+            ground_rounds,
+            ground_instances,
+            choice_variables,
+            bdd_nodes,
+            if exact {
+                "加权模型计数精确"
+            } else {
+                "超出编译上限，按证明路径上界近似"
+            }
+        )
+    }
+
+    fn render_epistemic_proofs(&self, answer: &ProblogAnswer, limit: usize) -> String {
+        if answer.proofs.is_empty() {
+            return String::new();
+        }
+        let mut output = String::from("  依据：\n");
+        for (index, proof) in answer.proofs.iter().take(limit).enumerate() {
+            let steps = proof
+                .steps
+                .iter()
+                .map(|step| {
+                    let premises = if step.premises.is_empty() {
+                        "（无条件）".to_string()
+                    } else {
+                        step.premises
+                            .iter()
+                            .map(|premise| self.render_atom_nl(premise))
+                            .collect::<Vec<_>>()
+                            .join(" 且 ")
+                    };
+                    format!(
+                        "{} —[P={:.2}]→ {}（来源：{}）",
+                        premises,
+                        step.probability,
+                        self.render_atom_nl(&step.head),
+                        step.source
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("；");
+            output.push_str(&format!(
+                "   • 证明 {}（联合概率 {:.3}）：{}\n",
+                index + 1,
+                proof.probability,
+                steps
+            ));
+        }
+        output
+    }
+
+    /// 对一个基原子求精确概率；已知谓词/实体但无证明时按当前概率程序记 P=0，
+    /// 未知谓词或未知实体则返回 `None`（交给普通管线，不把「没学过」说成「很假」）。
+    fn epistemic_claim_probability(
+        &self,
+        claim: &Claim,
+    ) -> Option<(f64, Option<ProblogAnswer>, (usize, usize, usize, usize, bool))> {
+        let atom = Atom::rel(&claim.predicate, &claim.subject, &claim.object);
+        let query = self.problog.query(&atom, 4, 0.0);
+        let stats = (
+            query.choice_variables,
+            query.bdd_nodes,
+            query.ground_instances,
+            query.ground_rounds,
+            query.exact,
+        );
+        if let Some(answer) = query.answers.into_iter().next() {
+            return Some((answer.probability, Some(answer), stats));
+        }
+        let known = self.is_known_predicate(&claim.predicate)
+            && self.is_known_entity(&claim.subject)
+            && self.is_known_entity(&claim.object);
+        known.then_some((0.0, None, stats))
+    }
+
+    fn render_epistemic_claim(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        claim: &Claim,
+    ) -> Option<String> {
+        let (atom_probability, answer, stats) = self.epistemic_claim_probability(claim)?;
+        let probability = if claim.negated {
+            1.0 - atom_probability
+        } else {
+            atom_probability
+        };
+        let mut output = intent.render_ledger();
+        output.push('\n');
+        output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
+        output.push_str("知识概率（ProbLog 加权模型计数，无采样）：\n");
+        if claim.negated {
+            output.push_str(&format!(
+                "  P({} {} {})={:.3}；因此 P({})={:.3}（{}）\n",
+                claim.subject,
+                claim.predicate,
+                claim.object,
+                atom_probability,
+                claim.render(),
+                probability,
+                Self::epistemic_label(probability)
+            ));
+        } else {
+            output.push_str(&format!(
+                "  {} — {}（P={:.3}）\n",
+                claim.render(),
+                Self::epistemic_label(probability),
+                probability
+            ));
+        }
+        if let Some(answer) = &answer {
+            let source = if answer.from_fact {
+                if self.soft.has_fact(&answer.atom) {
+                    "图谱事实"
+                } else {
+                    "概率事实/会话事实"
+                }
+            } else {
+                "由概率规则编译推出"
+            };
+            output.push_str(&format!("  来源：{}\n", source));
+            output.push_str(&self.render_epistemic_proofs(answer, 2));
+        } else {
+            output.push_str(
+                "  来源：当前概率程序中没有该原子的证明（图谱是开放世界，P=0 表示在此程序中不可证，不表示现实一定为假）\n",
+            );
+        }
+        match intent.mode {
+            EpistemicMode::Certainty => {
+                let confirmed = probability >= intent.threshold;
+                output.push_str(&format!(
+                    "  确定检查：P={:.3} {} 阈值 {:.2} → {}\n",
+                    probability,
+                    if confirmed { "≥" } else { "<" },
+                    intent.threshold,
+                    if confirmed {
+                        "可以确认"
+                    } else {
+                        "不足以确认，只能保留为可能"
+                    }
+                ));
+            }
+            EpistemicMode::Possibility if intent.negated => {
+                let consistent = probability <= intent.threshold;
+                output.push_str(&format!(
+                    "  否定可能检查：P={:.3} {} 阈值 {:.2} → {}\n",
+                    probability,
+                    if consistent { "≤" } else { ">" },
+                    intent.threshold,
+                    if consistent {
+                        "与「不可能」一致"
+                    } else {
+                        "概率并不低，不能断言「不可能」"
+                    }
+                ));
+            }
+            EpistemicMode::Possibility => {
+                let reached = probability >= intent.threshold;
+                output.push_str(&format!(
+                    "  可能阈值：P={:.3} {} τ={:.2} → {}\n",
+                    probability,
+                    if reached { "≥" } else { "<" },
+                    intent.threshold,
+                    if reached {
+                        "进入可能候选"
+                    } else {
+                        "低于阈值，只能算弱可能"
+                    }
+                ));
+            }
+            EpistemicMode::Probability => {
+                output.push_str("  概率值问：以上为基原子的精确概率；理解置信度与知识概率分账展示。\n");
+            }
+            EpistemicMode::MostLikely => {}
+            EpistemicMode::Plain | EpistemicMode::Comparison => {}
+        }
+        output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
+        Some(output.trim_end().to_string())
+    }
+
+    fn render_epistemic_ranking(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        subject: Option<&str>,
+        object: Option<&str>,
+        predicate: &str,
+    ) -> String {
+        let pattern = match (subject, object) {
+            (Some(subject), None) => Atom::pattern(
+                predicate,
+                Term::constant(subject),
+                Term::var("X"),
+            ),
+            (None, Some(object)) => Atom::pattern(
+                predicate,
+                Term::var("X"),
+                Term::constant(object),
+            ),
+            _ => {
+                return format!(
+                    "{}\n知识概率：候选目标不完整，无法排序。",
+                    intent.render_ledger()
+                )
+            }
+        };
+        let query = self.problog.query(&pattern, 8, 0.0);
+        let stats = (
+            query.choice_variables,
+            query.bdd_nodes,
+            query.ground_instances,
+            query.ground_rounds,
+            query.exact,
+        );
+        let mut answers = query.answers;
+        answers.retain(|answer| answer.atom.arity() == pattern.arity());
+        let mut output = intent.render_ledger();
+        output.push('\n');
+        output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
+        output.push_str("知识概率（ProbLog 加权模型计数，无采样）：\n");
+        if answers.is_empty() {
+            output.push_str("  没有可排序的候选：当前概率程序中该谓词没有可证实例。\n");
+            output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
+            return output.trim_end().to_string();
+        }
+        let mut kept: Vec<&ProblogAnswer> = Vec::new();
+        if intent.mode == EpistemicMode::Possibility {
+            if intent.negated {
+                kept.extend(
+                    answers
+                        .iter()
+                        .filter(|answer| answer.probability <= intent.threshold),
+                );
+            } else {
+                kept.extend(
+                    answers
+                        .iter()
+                        .filter(|answer| answer.probability >= intent.threshold),
+                );
+            }
+        }
+        if kept.is_empty() {
+            kept.extend(answers.iter().take(3));
+        }
+        if intent.mode == EpistemicMode::MostLikely {
+            kept.extend(answers.iter().take(3));
+        }
+        if kept.is_empty() {
+            kept.extend(answers.iter().take(3));
+        }
+        if intent.mode == EpistemicMode::MostLikely {
+            let top = kept[0];
+            output.push_str(&format!(
+                "  最可能：{}（P={:.3}，{}）\n",
+                self.epistemic_candidate(top),
+                top.probability,
+                Self::epistemic_label(top.probability)
+            ));
+            if kept.len() > 1 {
+                let alternatives = kept
+                    .iter()
+                    .skip(1)
+                    .map(|answer| {
+                        format!(
+                            "{}（P={:.3}）",
+                            self.epistemic_candidate(answer),
+                            answer.probability
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("，");
+                output.push_str(&format!("  次选：{}\n", alternatives));
+            }
+            output.push_str(&self.render_epistemic_proofs(top, 1));
+        } else {
+            for (index, answer) in kept.iter().take(5).enumerate() {
+                output.push_str(&format!(
+                    "  {}. {}（P={:.3}，{}）\n",
+                    index + 1,
+                    self.epistemic_candidate(answer),
+                    answer.probability,
+                    Self::epistemic_label(answer.probability)
+                ));
+            }
+            if let Some(top) = kept.first() {
+                output.push_str(&self.render_epistemic_proofs(top, 1));
+            }
+        }
+        output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
+        output.trim_end().to_string()
+    }
+
+    fn epistemic_candidate(&self, answer: &ProblogAnswer) -> String {
+        answer
+            .atom
+            .terms
+            .last()
+            .map(|term| self.canonical_epistemic_entity(term.name()))
+            .unwrap_or_else(|| self.render_atom_nl(&answer.atom))
+    }
+
+    fn render_epistemic_comparison(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        left: &Claim,
+        right: &Claim,
+    ) -> Option<String> {
+        let (left_atom, left_answer, left_stats) = self.epistemic_claim_probability(left)?;
+        let (right_atom, right_answer, right_stats) = self.epistemic_claim_probability(right)?;
+        let left_probability = if left.negated {
+            1.0 - left_atom
+        } else {
+            left_atom
+        };
+        let right_probability = if right.negated {
+            1.0 - right_atom
+        } else {
+            right_atom
+        };
+        let mut output = intent.render_ledger();
+        output.push('\n');
+        output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
+        output.push_str("知识概率（ProbLog 加权模型计数，无采样）：\n");
+        for (claim, answer, probability) in [
+            (left, &left_answer, left_probability),
+            (right, &right_answer, right_probability),
+        ] {
+            output.push_str(&format!(
+                "  {} — {}（P={:.3}）\n",
+                claim.render(),
+                Self::epistemic_label(probability),
+                probability
+            ));
+            if let Some(answer) = answer {
+                output.push_str(&self.render_epistemic_proofs(answer, 1));
+            }
+        }
+        let winner = if (left_probability - right_probability).abs() <= 1e-9 {
+            None
+        } else if left_probability > right_probability {
+            Some((left, left_probability, right_probability))
+        } else {
+            Some((right, right_probability, left_probability))
+        };
+        match winner {
+            Some((claim, winner_p, loser_p)) => output.push_str(&format!(
+                "  比较结论：更可能是「{}」（P={:.3} vs {:.3}）。\n",
+                claim.render(),
+                winner_p,
+                loser_p
+            )),
+            None => output.push_str(&format!(
+                "  比较结论：两者概率相同（P={:.3} vs {:.3}），不做任意拍板。\n",
+                left_probability, right_probability
+            )),
+        }
+        let stats = (
+            left_stats.0.max(right_stats.0),
+            left_stats.1.max(right_stats.1),
+            left_stats.2.max(right_stats.2),
+            left_stats.3.max(right_stats.3),
+            left_stats.4 && right_stats.4,
+        );
+        output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
+        Some(output.trim_end().to_string())
     }
 
     /// 从当前会话知识构建默认理论：图谱三元组/属性/实体类型 + 会话事实为事实，
@@ -20818,5 +21394,98 @@ types = [
         }]);
         assert!(reasoner.graph_session.lock().is_none());
         assert!(reasoner.answer("为什么").is_none());
+    }
+
+    #[test]
+    fn epistemic_possibility_uses_problog_and_keeps_two_ledgers() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李四的师傅可能是谁")
+            .expect("情态问句应接入 ProbLog");
+        assert!(answer.contains("PQI"), "缺少理解账：{}", answer);
+        assert!(answer.contains("理解置信度"), "缺少理解账：{}", answer);
+        assert!(answer.contains("知识概率"), "缺少知识账：{}", answer);
+        assert!(answer.contains("王五"), "应给出候选：{}", answer);
+        assert!(answer.contains("P=1.000"), "图谱事实概率应为 1：{}", answer);
+        let certain = reasoner
+            .answer_certain("李四的师傅可能是谁")
+            .expect("对话恢复通道同样应看见情态");
+        assert!(certain.contains("PQI"), "恢复通道丢失情态：{}", certain);
+    }
+
+    #[test]
+    fn epistemic_certainty_compares_probability_with_threshold() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let confirmed = reasoner
+            .answer("张三一定是李四的师傅吗")
+            .expect("确定问应可回答");
+        assert!(confirmed.contains("可以确认"), "{}", confirmed);
+        let refuted = reasoner
+            .answer("李四一定是赵六的师傅吗")
+            .expect("确定问应可回答");
+        assert!(refuted.contains("不足以确认"), "{}", refuted);
+        assert!(refuted.contains("P=0.000"), "{}", refuted);
+    }
+
+    #[test]
+    fn epistemic_probability_frame_extracts_the_ground_atom() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李四有多大的可能是王五的师傅")
+            .expect("概率值问应可回答");
+        assert!(answer.contains("概率值问"), "{}", answer);
+        assert!(answer.contains("李四 的 师傅 是 王五"), "{}", answer);
+        assert!(answer.contains("P=1.000"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_comparison_uses_the_same_ground_predicate() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("张三和李四谁更可能是王五的师傅")
+            .expect("比较问应可回答");
+        assert!(answer.contains("比较结论"), "{}", answer);
+        assert!(answer.contains("更可能是「李四"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_negation_stays_in_scope() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李四一定不是赵六的师傅吗")
+            .expect("否定确定问应可回答");
+        assert!(answer.contains("因此 P(李四 的 师傅 不是 赵六)=1.000"), "{}", answer);
+        assert!(answer.contains("可以确认"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_channel_does_not_hijack_plain_questions_or_unknown_entities() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let plain = reasoner.answer("李四的师傅是谁").expect("普通问句应可回答");
+        assert!(!plain.contains("PQI"), "普通问句不应进入情态层：{}", plain);
+        assert!(
+            reasoner
+                .answer_probabilistic_intent("无名氏一定不是王五的师傅吗")
+                .is_none(),
+            "未知实体应让位给普通管线"
+        );
+    }
+
+    #[test]
+    fn epistemic_probability_reads_taught_probabilistic_facts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.teach_report("李四的喜欢是赵六的可能性是百分之八十");
+        let answer = reasoner
+            .answer("李四的喜欢是赵六的概率是多少")
+            .expect("教过的概率事实应可回答");
+        assert!(answer.contains("P=0.800"), "{}", answer);
+        assert!(answer.contains("概率事实"), "{}", answer);
     }
 }
