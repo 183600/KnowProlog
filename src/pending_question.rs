@@ -292,7 +292,7 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
     let value = value.trim();
     if value.is_empty()
         || value.chars().count() > MAX_BARE_ANSWER_CHARS
-        || value.contains(|ch: char| matches!(ch, '是' | '为' | '，' | ',' | '：' | ':' | '；' | ';'))
+        || value.contains(['是', '为', '，', ',', '：', ':', '；', ';'])
     {
         return AnswerBinding::NotAnAnswer;
     }
