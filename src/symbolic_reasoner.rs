@@ -33,8 +33,7 @@ use crate::graph_diagnosis::diagnose_failure;
 use crate::graph_ledger;
 use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
 use crate::graph_repair::{
-    parse_repair_intent, suggest_repairs, RepairHints, RepairIntent, RepairLedger,
-    RepairSuggestion,
+    parse_repair_intent, suggest_repairs, RepairHints, RepairIntent, RepairLedger, RepairSuggestion,
 };
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
@@ -67,6 +66,9 @@ use crate::resolution_engine::{
 use crate::revision_guard::{GuardPlan, RevisionGuard};
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{self, EntailmentResult, Knowledge, PropositionParser, Verdict};
+use crate::slot_ledger::{
+    AssertionStrength, SlotAssertion, SlotLedger, SlotPolicy, SlotTransition,
+};
 use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
 use crate::temporal::{
     self, validity_from_bounds, TemporalConstraint, UnknownTimePolicy, Validity,
@@ -530,6 +532,10 @@ pub struct DialogueSnapshot {
     // 跨会话否定事实：路径遍历中作为阻断边（会话级，不写知识图谱）
     #[serde(default)]
     pub session_negative_facts: Vec<SnapshotAtom>,
+    // 会话槽账本（改口史/压制值）；旧快照缺省时从 session_facts 重建，
+    // 空账本不落盘以保持旧快照字节不变
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slots: Option<SlotLedger>,
     // 用户用中文教过的概率知识原句（会话级，跨会话持久化后自动重放）
     #[serde(default)]
     pub lessons: Vec<String>,
@@ -772,6 +778,7 @@ impl DialogueContext {
             generation: self.generation.clone(),
             session_facts: Vec::new(),
             session_negative_facts: Vec::new(),
+            slots: None,
             lessons: Vec::new(),
             session_clauses: Vec::new(),
             contrast: None,
@@ -1124,6 +1131,9 @@ pub struct SymbolicReasoner {
     graph_session: parking_lot::Mutex<Option<GraphSession>>,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
     session_facts: Vec<Atom>,
+    // 会话槽账本：把 session_facts 看成 (主语,谓词) 槽账本的投影，
+    // 记录功能槽的 before/after 改口史（压制不等于否定，可撤销）。
+    slots: SlotLedger,
     // 当前假设世界：临时前提只在世界内参与推理，退出/分叉时整体丢弃
     assumption_world: Option<AssumptionWorld>,
     // 会话级否定事实：路径遍历中的阻断边（不写知识图谱，可跨会话持久化）
@@ -1209,6 +1219,7 @@ impl Clone for SymbolicReasoner {
             frames: self.frames.clone(),
             graph_session: parking_lot::Mutex::new(self.graph_session.lock().clone()),
             session_facts: self.session_facts.clone(),
+            slots: self.slots.clone(),
             assumption_world: self.assumption_world.clone(),
             session_negative_facts: self.session_negative_facts.clone(),
             session_clauses: self.session_clauses.clone(),
@@ -1412,6 +1423,7 @@ impl SymbolicReasoner {
             frames: FrameMemory::new(),
             graph_session: parking_lot::Mutex::new(None),
             session_facts: Vec::new(),
+            slots: SlotLedger::new(),
             assumption_world: None,
             session_negative_facts: Vec::new(),
             session_clauses: Vec::new(),
@@ -1505,6 +1517,7 @@ impl SymbolicReasoner {
             }
         }
         self.session_negative_facts.clear();
+        self.slots = SlotLedger::new();
         self.session_clauses.clear();
         // 补全回合属于会话态：分叉/重置不得把已确认候选与规则带进新会话。
         self.completion = CompletionLedger::new();
@@ -2740,6 +2753,7 @@ impl SymbolicReasoner {
             match op {
                 ChangeOp::AssertFact(atom) => {
                     if self.retract_atom(atom) {
+                        self.note_slot_retract(atom);
                         facts_changed += 1;
                         inverse_ops.push(ChangeOp::RetractFact(atom.clone()));
                     }
@@ -2747,6 +2761,7 @@ impl SymbolicReasoner {
                 ChangeOp::RetractFact(atom) => {
                     self.register_atom_vocabulary(atom);
                     if self.adopt_atom(atom.clone()) {
+                        self.note_slot_adopt(atom, AssertionStrength::Correction, "撤销修订");
                         facts_changed += 1;
                         inverse_ops.push(ChangeOp::AssertFact(atom.clone()));
                     }
@@ -3460,8 +3475,17 @@ impl SymbolicReasoner {
         while stripped {
             stripped = false;
             for suffix in [
-                "是多少", "是什么", "是谁", "是哪里", "是哪个", "是哪儿", "是哪位", "是哪些",
-                "是几", "呢", "吗",
+                "是多少",
+                "是什么",
+                "是谁",
+                "是哪里",
+                "是哪个",
+                "是哪儿",
+                "是哪位",
+                "是哪些",
+                "是几",
+                "呢",
+                "吗",
             ] {
                 if let Some(rest) = core.strip_suffix(suffix) {
                     core = rest.trim();
@@ -3479,8 +3503,8 @@ impl SymbolicReasoner {
             return None;
         }
         const GENERIC: &[&str] = &[
-            "资料", "信息", "情况", "介绍", "关系", "内容", "属性", "特征", "数据", "详情",
-            "细节", "知识", "事实", "谁", "什么", "多少", "哪儿", "哪里",
+            "资料", "信息", "情况", "介绍", "关系", "内容", "属性", "特征", "数据", "详情", "细节",
+            "知识", "事实", "谁", "什么", "多少", "哪儿", "哪里",
         ];
         if GENERIC.contains(&segment) {
             return None;
@@ -4540,6 +4564,9 @@ impl SymbolicReasoner {
         let mut added_ops = Vec::new();
         for atom in atoms {
             self.register_atom_vocabulary(atom);
+            // 确认/采纳是显式裁决：功能槽上以「更正」语义替换旧赢家，
+            // 不让两个取值同时进入会话事实。
+            self.note_slot_adopt(atom, AssertionStrength::Correction, "采纳假设");
             if self.adopt_atom(atom.clone()) {
                 added_ops.push(ChangeOp::AssertFact(atom.clone()));
             }
@@ -4610,6 +4637,156 @@ impl SymbolicReasoner {
     /// 会话级假设事实（被采纳、跨会话持久化的临时信念）
     pub fn session_facts(&self) -> &[Atom] {
         &self.session_facts
+    }
+
+    /// 槽账本报告：每个槽的当前赢家、被压制值与仅证据值。
+    pub fn slot_ledger_report(&self) -> String {
+        self.slots.render_report()
+    }
+
+    /// 单个槽的改口史（第几次记录、before/after、压制而非否定）。
+    pub fn slot_history_report(&self, subject: &str, predicate: &str) -> String {
+        let (subject, predicate) = self.slot_identity(subject, predicate);
+        self.slots.render_history(&subject, &predicate)
+    }
+
+    /// 显式改口：用「更正」语义替换功能槽的当前赢家，并记录 before/after。
+    ///
+    /// 与 `assert_nl_fact` 的分工：直陈遇到功能槽冲突只问不写；本方法代表
+    /// 用户已经作出裁决，因此允许压制旧值。旧值仍在账本里，可撤销、可解释。
+    pub fn correct_nl_fact(&mut self, sentence_raw: &str) -> String {
+        let sentence = sentence_raw.trim();
+        if sentence.is_empty() {
+            return "请给出改口内容，例如：改口：姚明的身高是229".to_string();
+        }
+        let (_, content) = AssertionStrength::classify(sentence);
+        let outcome = chinese_reasoning_nlu::parse_lessons(content);
+        if outcome.lessons.is_empty() {
+            return format!("没能把「{}」解析为可更正的确定事实。", sentence);
+        }
+        let before_facts = self.session_facts.clone();
+        let mut transitions: Vec<SlotTransition> = Vec::new();
+        let mut refused: Vec<String> = Vec::new();
+        for lesson in &outcome.lessons {
+            if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
+                refused.push(format!("「{}」不是可更正的确定事实", lesson.original));
+                continue;
+            }
+            self.register_atom_vocabulary(&lesson.head);
+            let Some((subject, predicate, object)) =
+                Self::session_atom_triple(&lesson.head).map(|(subject, predicate, object)| {
+                    (
+                        subject.to_string(),
+                        predicate.to_string(),
+                        object.to_string(),
+                    )
+                })
+            else {
+                refused.push(format!("「{}」不是二元事实，无法按槽更正", lesson.original));
+                continue;
+            };
+            match self.apply_session_slot(
+                &subject,
+                &predicate,
+                &object,
+                AssertionStrength::Correction,
+                "改口",
+            ) {
+                Ok(transition) => {
+                    if transition.changed_state() {
+                        self.sync_slot_projection(&subject, &predicate);
+                        self.adopt_atom(lesson.head.clone());
+                    }
+                    transitions.push(transition);
+                }
+                Err(error) => refused.push(format!("「{}」未写入：{}", lesson.original, error)),
+            }
+        }
+        // 以事实集的实际增减生成回执，确保撤销能逐字恢复。
+        let mut revision_ops: Vec<ChangeOp> = Vec::new();
+        for atom in &before_facts {
+            if !self.session_facts.contains(atom) {
+                revision_ops.push(ChangeOp::RetractFact(atom.clone()));
+            }
+        }
+        for atom in &self.session_facts {
+            if !before_facts.contains(atom) {
+                revision_ops.push(ChangeOp::AssertFact(atom.clone()));
+            }
+        }
+        if !revision_ops.is_empty() {
+            self.record_session_revision(
+                format!("改口：{}", sentence),
+                revision_ops,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        let mut output = String::new();
+        if transitions.is_empty() {
+            output.push_str("没有产生任何槽状态转移。\n");
+        }
+        for transition in &transitions {
+            output.push_str(&transition.render_zh());
+            output.push('\n');
+        }
+        for reason in &refused {
+            output.push_str(&format!("  跳过：{}\n", reason));
+        }
+        if let Some(first) = transitions.first() {
+            output.push('\n');
+            output.push_str(&self.slot_history_report(&first.key.subject, &first.key.predicate));
+            output.push('\n');
+        }
+        if let Some(receipt) = self.session_receipts.last() {
+            if receipt.label == format!("改口：{}", sentence) {
+                output.push_str(&format!(
+                    "修订回执：{}（可用「撤销修订」恢复改口前的取值）。\n",
+                    receipt.id
+                ));
+            }
+        }
+        output.push_str(&format!("会话事实共 {} 条。", self.session_facts.len()));
+        output
+    }
+
+    /// 传闻处理：只进槽账本的证据区，不写会话事实、不进入回答。
+    fn note_hearsay_nl_fact(&mut self, sentence: &str) -> String {
+        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let mut recorded: Vec<SlotTransition> = Vec::new();
+        for lesson in &outcome.lessons {
+            if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
+                continue;
+            }
+            let Some((subject, predicate, object)) =
+                Self::session_atom_triple(&lesson.head).map(|(subject, predicate, object)| {
+                    (
+                        subject.to_string(),
+                        predicate.to_string(),
+                        object.to_string(),
+                    )
+                })
+            else {
+                continue;
+            };
+            if let Ok(transition) = self.apply_session_slot(
+                &subject,
+                &predicate,
+                &object,
+                AssertionStrength::Hearsay,
+                "传闻",
+            ) {
+                recorded.push(transition);
+            }
+        }
+        if recorded.is_empty() {
+            return format!("没能把「{}」记录为可追溯的传闻证据。", sentence);
+        }
+        let mut output = String::from("已把传闻记为证据（不进入回答、不覆盖当前取值）：\n");
+        for transition in &recorded {
+            output.push_str(&format!("  {}\n", transition.render_zh()));
+        }
+        output.trim_end().to_string()
     }
 
     // ------------------------- 对话式澄清（以问代猜） -------------------------
@@ -6815,6 +6992,23 @@ impl SymbolicReasoner {
                 }
             }
         }
+        // 槽级压制只影响视图：当会话槽已有赢家时，图谱写下的同一槽旧值
+        // 不再进入答案；旧值仍保留在图谱与账本里（压制不等于否定）。
+        if !predicate.inverted {
+            let (slot_subject, slot_predicate) = self.slot_identity(node, &predicate.slot);
+            let accepted = self.slots.accepted(&slot_subject, &slot_predicate);
+            if !accepted.is_empty() {
+                let suppressed: HashSet<String> = self
+                    .slots
+                    .suppressed(&slot_subject, &slot_predicate)
+                    .into_iter()
+                    .collect();
+                hits.retain(|hit| {
+                    !suppressed.contains(&hit.value)
+                        || accepted.iter().any(|value| value == &hit.value)
+                });
+            }
+        }
         hits.sort_by(|a, b| a.value.cmp(&b.value));
         hits
     }
@@ -7645,8 +7839,7 @@ impl SymbolicReasoner {
                         answer
                     }
                     Err(PatternError::NoRowsToExplain) => {
-                        let mut answer =
-                            "当前没有匹配结果，无法给出见证子图。".to_string();
+                        let mut answer = "当前没有匹配结果，无法给出见证子图。".to_string();
                         if let Some((failure, repairs)) =
                             self.graph_failure_parts(&session.conversation, &facts, options)
                         {
@@ -7666,9 +7859,7 @@ impl SymbolicReasoner {
                 // 结构上像合取问句、但有一处没读懂时，明确说出缺口；
                 // 不认识词与「图谱里没有」是两种不同的失败，不能都落到
                 // 其他管线后给出一份看似完整的答案。
-                return lexicon
-                    .compile_gap(question)
-                    .map(|gap| gap.render());
+                return lexicon.compile_gap(question).map(|gap| gap.render());
             }
         };
         let conversation =
@@ -7704,14 +7895,7 @@ impl SymbolicReasoner {
         }
         let diagnosis = diagnose_failure(conversation.pattern(), facts, options)?;
         let mut text = diagnosis.render(conversation.pattern());
-        let repairs = suggest_repairs(
-            conversation.pattern(),
-            facts,
-            options,
-            &diagnosis,
-            self,
-            3,
-        );
+        let repairs = suggest_repairs(conversation.pattern(), facts, options, &diagnosis, self, 3);
         if !repairs.is_empty() {
             text.push('\n');
             text.push_str(&self.render_graph_repairs(&repairs));
@@ -7759,10 +7943,7 @@ impl SymbolicReasoner {
                 session.repairs.len()
             );
         };
-        let Some(relaxed_pattern) = suggestion
-            .op
-            .apply(session.conversation.pattern())
-        else {
+        let Some(relaxed_pattern) = suggestion.op.apply(session.conversation.pattern()) else {
             return "这条放宽已经无法应用到当前模式，请重新提问。".to_string();
         };
         match session.conversation.apply(
@@ -8170,10 +8351,7 @@ impl SymbolicReasoner {
                 // 单个传递谓词的直接问句也必须并入有界闭包：否则
                 // 「A 的 P 是谁」只返回直接边，声明的传递性在回答里没有兑现。
                 let single_transitive = predicates.len() == 1
-                    && self
-                        .laws
-                        .active_transitive(&predicates[0].slot)
-                        .is_some();
+                    && self.laws.active_transitive(&predicates[0].slot).is_some();
                 let chain_result = if self.is_transitive_chain(&predicates) || single_transitive {
                     // 重复的传递谓词：用 Closure 算子压缩链，trace 会引用该律。
                     self.run_chain_via_laws(&entity, &predicates)
@@ -10649,6 +10827,9 @@ impl SymbolicReasoner {
         self.register_atom_vocabulary(&atom);
         let rendered = self.render_atom_nl(&atom);
         let removed_positive = self.retract_atom(&atom);
+        if removed_positive {
+            self.note_slot_retract(&atom);
+        }
         let added = if self.session_negative_facts.contains(&atom) {
             false
         } else {
@@ -10678,11 +10859,125 @@ impl SymbolicReasoner {
         self.assert_negative_atom(atom)
     }
 
+    /// 槽身份：把实体/谓词归一成读模型使用的规范词面，保证「写入的槽」
+    /// 与 `node_hits` 查询时看到的槽是同一个键。
+    fn slot_identity(&self, subject: &str, predicate: &str) -> (String, String) {
+        let subject = self.aligner.canonical_form(subject.trim());
+        let predicate = self.aligner.canonical_form(predicate.trim());
+        let predicate = self.canonical_attribute(&predicate).unwrap_or(predicate);
+        (subject, predicate)
+    }
+
+    /// 同一槽上来自知识图谱的只读基值（不把会话事实算进去）。
+    fn slot_base_values(&self, subject: &str, predicate: &str) -> Vec<String> {
+        let (subject, predicate) = self.slot_identity(subject, predicate);
+        let mut values: BTreeSet<String> = BTreeSet::new();
+        for triple in self.predictor.triples() {
+            if self.aligner.canonical_form(&triple.subject) == subject
+                && self.aligner.canonical_form(&triple.predicate) == predicate
+            {
+                values.insert(triple.object.clone());
+            }
+        }
+        if let Some(stored) = self
+            .attribute_index
+            .get(&(subject.clone(), predicate.clone()))
+        {
+            values.extend(stored.iter().cloned());
+        }
+        for (entity, attribute, value) in &self.attributes {
+            if self.aligner.canonical_form(entity) == subject
+                && self.aligner.canonical_form(attribute) == predicate
+            {
+                values.insert(value.clone());
+            }
+        }
+        values.into_iter().collect()
+    }
+
+    /// 在槽账本上应用一条断言，返回状态转移；不直接改会话事实。
+    fn apply_session_slot(
+        &mut self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        strength: AssertionStrength,
+        source: &str,
+    ) -> Result<SlotTransition, String> {
+        let (canonical_subject, canonical_predicate) = self.slot_identity(subject, predicate);
+        let base = self.slot_base_values(&canonical_subject, &canonical_predicate);
+        let assertion = SlotAssertion::new(
+            &canonical_subject,
+            &canonical_predicate,
+            object,
+            strength,
+            source,
+        );
+        self.slots.apply(assertion, &base)
+    }
+
+    /// 把槽账本投影回会话事实：删掉该槽上不再是当前赢家的旧原子。
+    ///
+    /// 这是「`session_facts` 是槽账本投影」的落地点；调用方随后只需把新的
+    /// 赢家原子加入会话事实。
+    fn sync_slot_projection(&mut self, subject: &str, predicate: &str) {
+        let (canonical_subject, canonical_predicate) = self.slot_identity(subject, predicate);
+        let accepted = self
+            .slots
+            .accepted(&canonical_subject, &canonical_predicate);
+        let stale: Vec<Atom> = self
+            .session_facts
+            .iter()
+            .filter(|atom| {
+                if !atom.is_ground() {
+                    return false;
+                }
+                let Some((atom_subject, atom_predicate, atom_object)) =
+                    Self::session_atom_triple(atom)
+                else {
+                    return false;
+                };
+                self.aligner.canonical_form(atom_subject) == canonical_subject
+                    && self.aligner.canonical_form(atom_predicate) == canonical_predicate
+                    && !accepted.iter().any(|value| value == atom_object)
+            })
+            .cloned()
+            .collect();
+        for atom in stale {
+            self.retract_atom(&atom);
+        }
+    }
+
+    /// 会话事实被撤回后同步槽账本（不重写事实）。
+    fn note_slot_retract(&mut self, atom: &Atom) {
+        let Some((subject, predicate, object)) = Self::session_atom_triple(atom) else {
+            return;
+        };
+        let (subject, predicate) = self.slot_identity(subject, predicate);
+        self.slots.retract(&subject, &predicate, Some(object));
+    }
+
+    /// 会话事实被写入后同步槽账本，并把功能槽的此前赢家撤出事实集。
+    fn note_slot_adopt(&mut self, atom: &Atom, strength: AssertionStrength, source: &str) {
+        let Some((subject, predicate, object)) = Self::session_atom_triple(atom) else {
+            return;
+        };
+        let Ok(transition) = self.apply_session_slot(subject, predicate, object, strength, source)
+        else {
+            return;
+        };
+        if transition.should_confirm() {
+            return;
+        }
+        self.sync_slot_projection(subject, predicate);
+    }
+
     /// 把一条结构化会话事实加入推理前提（不写知识图谱）。
     ///
     /// 供对话层的确认/更正回执桥接到推理层：用户确认的取值不仅覆盖直接
     /// 属性回答，还会与图谱事实同权参与多跳链、证明与会话快照恢复。
-    /// 返回 `true` 表示本次确实新增了会话事实（重复调用幂等）。
+    /// 功能槽上的新取值会以「更正」语义替换旧赢家；返回 `true` 表示本次
+    /// 确实新增了会话事实（重复调用幂等）。
     pub fn adopt_session_triple(&mut self, subject: &str, predicate: &str, object: &str) -> bool {
         let subject = subject.trim();
         let predicate = predicate.trim();
@@ -10698,6 +10993,19 @@ impl SymbolicReasoner {
         }) {
             return false;
         }
+        let Ok(transition) = self.apply_session_slot(
+            subject,
+            predicate,
+            object,
+            AssertionStrength::Correction,
+            "采纳",
+        ) else {
+            return false;
+        };
+        if transition.should_confirm() || !transition.after.iter().any(|value| value == object) {
+            return false;
+        }
+        self.sync_slot_projection(subject, predicate);
         let atom = Atom::rel(predicate, subject, object);
         self.register_atom_vocabulary(&atom);
         self.adopt_atom(atom)
@@ -10711,7 +11019,14 @@ impl SymbolicReasoner {
         if let Some(atom) = Self::parse_negative_atom(sentence) {
             return self.assert_negative_atom(atom);
         }
-        let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        let (strength, content) = AssertionStrength::classify(sentence);
+        if strength == AssertionStrength::Hearsay {
+            return self.note_hearsay_nl_fact(content);
+        }
+        if strength == AssertionStrength::Correction && content != sentence {
+            return self.correct_nl_fact(content);
+        }
+        let outcome = chinese_reasoning_nlu::parse_lessons(content);
         // 写入前守门：先按当前会话世界试算，冲突时只问一个最小问题。
         let mut preflight = ChangeSet::new(format!("记住：{}", sentence));
         for lesson in &outcome.lessons {
@@ -10761,9 +11076,43 @@ impl SymbolicReasoner {
                 self.session_negative_facts.remove(position);
                 superseded_negatives.push(rendered.clone());
             }
+            // 槽级门控：功能槽上的直陈遇到不同取值时只问一句、零写入；
+            // 显式更正（「改口：」）才允许替换赢家。非二元原子回退到原子追加。
+            let triple =
+                Self::session_atom_triple(&lesson.head).map(|(subject, predicate, object)| {
+                    (
+                        subject.to_string(),
+                        predicate.to_string(),
+                        object.to_string(),
+                    )
+                });
+            let has_slot_triple = triple.is_some();
+            if let Some((subject, predicate, object)) = triple {
+                match self.apply_session_slot(
+                    &subject,
+                    &predicate,
+                    &object,
+                    AssertionStrength::Direct,
+                    "记住",
+                ) {
+                    Ok(transition) if transition.should_confirm() => {
+                        refused.push(transition.render_zh());
+                        continue;
+                    }
+                    Ok(_) => {
+                        self.sync_slot_projection(&subject, &predicate);
+                    }
+                    Err(error) => {
+                        refused.push(format!("「{}」未写入：{}", rendered, error));
+                        continue;
+                    }
+                }
+            }
             if self.adopt_atom(lesson.head.clone()) {
                 revision_ops.push(ChangeOp::AssertFact(lesson.head.clone()));
                 remembered.push(rendered);
+            } else if has_slot_triple {
+                refused.push(format!("「{}」已经记住（本次为幂等写入）", rendered));
             } else {
                 refused.push(format!("「{}」已经记住", rendered));
             }
@@ -10869,6 +11218,7 @@ impl SymbolicReasoner {
                 .map(|position| self.session_negative_facts.remove(position))
                 .is_some();
             if self.retract_atom(&lesson.head) {
+                self.note_slot_retract(&lesson.head);
                 revision_ops.push(ChangeOp::RetractFact(lesson.head.clone()));
                 removed.push(rendered);
             } else if removed_negative {
@@ -11741,6 +12091,7 @@ impl SymbolicReasoner {
                     .collect(),
             })
             .collect();
+        snapshot.slots = (!self.slots.is_empty()).then(|| self.slots.clone());
         snapshot.lessons = self.lessons.clone();
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
         snapshot.frames = Some(self.frames.clone());
@@ -11893,6 +12244,22 @@ impl SymbolicReasoner {
                 restored.push(atom);
             }
         }
+        // 旧会话事实在加载快照时必须被替换，而不是与新快照并集；
+        // 仅当快照为空时才走这条清理路径（非空快照下面整体覆盖）。
+        if restored.is_empty() && !self.session_facts.is_empty() {
+            let stale = std::mem::take(&mut self.session_facts);
+            for atom in &stale {
+                if !self.graph_supports_atom(atom) {
+                    self.unindex_session_atom(atom);
+                    if self.config.enable_resolution {
+                        self.resolver.remove_fact_atom(atom);
+                    }
+                }
+            }
+            if self.config.enable_resolution {
+                self.rebuild_resolver();
+            }
+        }
         if !restored.is_empty() {
             // 与 adopt_atom 保持一致：恢复的会话事实同样注入软逻辑/概率程序，
             // 否则恢复后 soft_inference_report 与 problog_report 缺少这些事实
@@ -11913,6 +12280,25 @@ impl SymbolicReasoner {
                 self.rebuild_resolver();
             }
         }
+        // 槽账本：新快照直接恢复历史；旧快照从会话事实重建当前投影。
+        // 重建只保证「账本 = 事实集」逐字一致，不伪造历史。
+        self.slots = match &snapshot.slots {
+            Some(ledger) => ledger.clone(),
+            None => {
+                let mut policy = SlotPolicy::with_defaults();
+                policy.adopt_functional(self.session_revision_constraints().functional.iter());
+                let facts: Vec<(String, String, String)> = self
+                    .session_facts
+                    .iter()
+                    .filter_map(|atom| {
+                        let (subject, predicate, object) = Self::session_atom_triple(atom)?;
+                        let (subject, predicate) = self.slot_identity(subject, predicate);
+                        Some((subject, predicate, object.to_string()))
+                    })
+                    .collect();
+                SlotLedger::rebuild_from_facts(facts, policy)
+            }
+        };
         // 否定事实：恢复为路径阻断边（不进入正向归结，因此不触发引擎重建）
         let mut restored_negative: Vec<Atom> = Vec::new();
         for entry in &snapshot.session_negative_facts {
@@ -12549,6 +12935,100 @@ mod tests {
             .answer(&second.text)
             .expect("结清的问句应能命中属性索引");
         assert!(answer2.contains("140kg"), "第二问答案：{}", answer2);
+    }
+
+    #[test]
+    fn slot_correction_replaces_graph_value_in_the_session_view() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        assert!(reasoner.adopt_session_triple("姚明", "身高", "229cm"));
+        assert!(reasoner
+            .session_facts()
+            .iter()
+            .any(|atom| atom.display() == "身高(姚明, 229cm)"));
+        assert!(
+            !reasoner
+                .session_facts()
+                .iter()
+                .any(|atom| atom.display() == "身高(姚明, 226cm)"),
+            "旧值不应同时留在会话事实里"
+        );
+        let answer = reasoner.answer("姚明的身高是什么").expect("应有属性答案");
+        assert!(answer.contains("229cm"), "新值应生效：{}", answer);
+        assert!(!answer.contains("226cm"), "旧值应被视图压制：{}", answer);
+    }
+
+    #[test]
+    fn direct_conflict_asks_then_explicit_correction_records_history() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        let asked = reasoner.assert_nl_fact("姚明的身高是229cm");
+        assert!(asked.contains("改口"), "直陈冲突应先问：{}", asked);
+        assert!(reasoner.session_facts().is_empty(), "提问阶段必须零写入");
+
+        let corrected = reasoner.correct_nl_fact("姚明的身高是229cm");
+        assert!(
+            corrected.contains("226cm"),
+            "回执应给出 before：{}",
+            corrected
+        );
+        assert!(
+            corrected.contains("229cm"),
+            "回执应给出 after：{}",
+            corrected
+        );
+        let history = reasoner.slot_history_report("姚明", "身高");
+        assert!(history.contains("第 1 次记录"), "{}", history);
+        assert!(history.contains("不等于否定"), "{}", history);
+
+        let answer = reasoner.answer("姚明的身高是什么").expect("应有属性答案");
+        assert!(answer.contains("229cm"), "{}", answer);
+        assert!(!answer.contains("226cm"), "{}", answer);
+    }
+
+    #[test]
+    fn forgetting_a_correction_falls_back_to_the_graph_value() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        reasoner.correct_nl_fact("姚明的身高是229cm");
+        let forgotten = reasoner.retract_nl_fact("姚明的身高是229cm");
+        assert!(forgotten.contains("已忘记"), "{}", forgotten);
+        let answer = reasoner.answer("姚明的身高是什么").expect("应有图谱答案");
+        assert!(answer.contains("226cm"), "应回落到图谱值：{}", answer);
+        assert!(!answer.contains("229cm"), "{}", answer);
+    }
+
+    #[test]
+    fn slot_ledger_and_history_survive_dialogue_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        reasoner.correct_nl_fact("姚明的身高是229cm");
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(snapshot.slots.is_some(), "非空槽账本应随快照导出");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&attribute_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("快照恢复应成功");
+        assert!(restored
+            .slot_history_report("姚明", "身高")
+            .contains("第 1 次记录"));
+        let answer = restored.answer("姚明的身高是什么").expect("应有属性答案");
+        assert!(answer.contains("229cm"), "{}", answer);
+        assert!(!answer.contains("226cm"), "{}", answer);
+    }
+
+    #[test]
+    fn hearsay_is_recorded_as_evidence_but_not_answered() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        let output = reasoner.assert_nl_fact("据说姚明的身高是230cm");
+        assert!(output.contains("证据"), "{}", output);
+        assert!(reasoner.session_facts().is_empty(), "传闻不得写会话事实");
+        let answer = reasoner.answer("姚明的身高是什么").expect("应有属性答案");
+        assert!(answer.contains("226cm"), "{}", answer);
+        assert!(!answer.contains("230cm"), "传闻不得进入回答：{}", answer);
     }
 
     #[test]
@@ -17670,9 +18150,7 @@ types = [
 
         // 「配偶」只是话题；目标是「体重」。不能拿配偶证据冒充确定答案。
         assert!(
-            reasoner
-                .answer_certain("姚明的配偶的体重是多少")
-                .is_none(),
+            reasoner.answer_certain("姚明的配偶的体重是多少").is_none(),
             "无目标谓词证据时必须弃权"
         );
         assert!(
@@ -18434,9 +18912,7 @@ types = [
         let adopted = reasoner.answer("放宽 1").expect("应能确认第一条放宽");
         assert!(adopted.contains("已采用放宽"), "{}", adopted);
         assert!(!adopted.contains("失败诊断"), "{}", adopted);
-        let restored = reasoner
-            .answer("恢复原条件")
-            .expect("应能恢复原条件");
+        let restored = reasoner.answer("恢复原条件").expect("应能恢复原条件");
         assert!(restored.contains("已恢复原条件"), "{}", restored);
         assert!(restored.contains("失败诊断"), "{}", restored);
     }
@@ -18482,11 +18958,7 @@ types = [
             "「张三」和「李四」"
         );
         assert_eq!(
-            describe_graph_subjects(&[
-                "张三".to_string(),
-                "李四".to_string(),
-                "王五".to_string()
-            ]),
+            describe_graph_subjects(&["张三".to_string(), "李四".to_string(), "王五".to_string()]),
             "「张三」、「李四」、「王五」"
         );
     }
@@ -18504,9 +18976,7 @@ types = [
         let second = reasoner.answer("放宽 1").expect("应能采用第二步放宽");
         assert!(second.contains("第 1 步"), "{}", second);
         assert!(second.contains("第 2 步"), "{}", second);
-        let restored = reasoner
-            .answer("恢复原条件")
-            .expect("应能一次恢复到原问题");
+        let restored = reasoner.answer("恢复原条件").expect("应能一次恢复到原问题");
         assert!(restored.contains("已恢复原条件"), "{}", restored);
         assert!(!restored.contains("当前为放宽结果"), "{}", restored);
     }
@@ -18597,8 +19067,7 @@ types = [
                 to: "金奖".to_string(),
             },
         ]);
-        let alternatives =
-            <SymbolicReasoner as RepairHints>::entity_alternatives(&reasoner, "甲");
+        let alternatives = <SymbolicReasoner as RepairHints>::entity_alternatives(&reasoner, "甲");
         assert!(
             alternatives.iter().any(|(name, _)| name == "乙"),
             "结构相同的实体应成为候选：{:?}",

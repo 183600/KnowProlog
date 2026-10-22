@@ -594,7 +594,10 @@ impl SlotState {
 }
 
 /// 会话槽账本：`(主语, 谓词)` → 采用值 / 压制值 / 证据值 / 事件历史。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 内部用 `BTreeMap` 保证确定性遍历；序列化时展开为有序数组，避免 JSON
+/// 对象键必须是字符串的限制（槽键是结构体）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotLedger {
     policy: SlotPolicy,
     slots: BTreeMap<SlotKey, SlotState>,
@@ -604,6 +607,45 @@ pub struct SlotLedger {
 impl Default for SlotLedger {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SlotLedgerSnapshot {
+    policy: SlotPolicy,
+    step: u64,
+    slots: Vec<(SlotKey, SlotState)>,
+}
+
+impl Serialize for SlotLedger {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let snapshot = SlotLedgerSnapshot {
+            policy: self.policy.clone(),
+            step: self.step,
+            slots: self
+                .slots
+                .iter()
+                .map(|(key, state)| (key.clone(), state.clone()))
+                .collect(),
+        };
+        snapshot.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SlotLedger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let snapshot = SlotLedgerSnapshot::deserialize(deserializer)?;
+        Ok(Self {
+            policy: snapshot.policy,
+            slots: snapshot.slots.into_iter().collect(),
+            step: snapshot.step,
+        })
     }
 }
 

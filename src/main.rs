@@ -31,9 +31,7 @@ use know_prolog::{
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
-    extract_query_entities_from_tagged,
-    frontier,
-    fulfillment,
+    extract_query_entities_from_tagged, frontier, fulfillment,
     grammar_extractor::GrammarExtractor,
     history_trust::TrustAssessment,
     holographic_memory::{HoloAnalogyHit, HoloHit},
@@ -44,8 +42,7 @@ use know_prolog::{
     import_journal::{ImportJournal, JournalLoad},
     knowledge_fusion::{Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel},
     law_book::LawBook,
-    lex_gate,
-    lexical_trace,
+    lex_gate, lexical_trace,
     link_prediction::{LinkPredictor, Triple as LawTriple},
     load_config,
     local_semantic_adapter::LocalSemanticAdapter,
@@ -96,8 +93,7 @@ use know_prolog::{
         render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
     },
     weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
-    InputMode, KnowledgeExtractor, KnowledgeItem, OxigraphManager, ResponseFormatter,
-    SystemConfig,
+    InputMode, KnowledgeExtractor, KnowledgeItem, OxigraphManager, ResponseFormatter, SystemConfig,
 };
 
 #[derive(Parser)]
@@ -883,14 +879,7 @@ async fn main() {
     }) = &cli.command
     {
         run_pattern_forge(
-            &config,
-            name,
-            route,
-            positives,
-            negatives,
-            *priority,
-            *activate,
-            *json,
+            &config, name, route, positives, negatives, *priority, *activate, *json,
         );
         return;
     }
@@ -1621,14 +1610,17 @@ async fn main() {
                     }
                 }
             }
-            let rules = oxigraph_manager.load_rule_ledger().await.unwrap_or_else(|error| {
-                eprintln!("读取规则账本失败：{}", error);
-                know_prolog::graph_ledger::RuleLedger {
-                    synced: false,
-                    fingerprint: String::new(),
-                    entries: Vec::new(),
-                }
-            });
+            let rules = oxigraph_manager
+                .load_rule_ledger()
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("读取规则账本失败：{}", error);
+                    know_prolog::graph_ledger::RuleLedger {
+                        synced: false,
+                        fingerprint: String::new(),
+                        entries: Vec::new(),
+                    }
+                });
             let derived = oxigraph_manager
                 .load_derived_ledger()
                 .await
@@ -1648,11 +1640,8 @@ async fn main() {
             facts.dedup();
             let mut certificates = provenance::detect_witnessed(&facts, &supports, &schema);
             if latent {
-                let clauses: Vec<know_prolog::resolution_engine::Clause> = rules
-                    .entries
-                    .iter()
-                    .map(ledger_entry_to_clause)
-                    .collect();
+                let clauses: Vec<know_prolog::resolution_engine::Clause> =
+                    rules.entries.iter().map(ledger_entry_to_clause).collect();
                 certificates.extend(provenance::detect_latent(&clauses, &schema));
             }
             let coverage = provenance::Coverage::from_supports(&facts, &supports);
@@ -2109,34 +2098,34 @@ async fn main() {
                 config.reasoning.require_predicate_admission,
             );
             oxigraph_manager.configure_type_system(&config.type_system);
-            let ledger = provenance.as_deref().and_then(|path| {
-                match ProvenanceLedger::load(path) {
-                    ProvenanceLoad::Loaded(ledger) => Some(ledger),
-                    ProvenanceLoad::Missing => {
-                        eprintln!("来源台账不存在：{}（按未登记来源计分）", path);
-                        None
-                    }
-                    ProvenanceLoad::Damaged(error) => {
-                        eprintln!("来源台账损坏：{}（按未登记来源计分）", error);
-                        None
-                    }
+            let ledger =
+                provenance
+                    .as_deref()
+                    .and_then(|path| match ProvenanceLedger::load(path) {
+                        ProvenanceLoad::Loaded(ledger) => Some(ledger),
+                        ProvenanceLoad::Missing => {
+                            eprintln!("来源台账不存在：{}（按未登记来源计分）", path);
+                            None
+                        }
+                        ProvenanceLoad::Damaged(error) => {
+                            eprintln!("来源台账损坏：{}（按未登记来源计分）", error);
+                            None
+                        }
+                    });
+            let report = match quality_report_for_with_provenance(
+                &oxigraph_manager,
+                &config,
+                ledger.as_ref(),
+                Some(&store_path),
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("读取知识库失败: {}", e);
+                    std::process::exit(1);
                 }
-            });
-            let report =
-                match quality_report_for_with_provenance(
-                    &oxigraph_manager,
-                    &config,
-                    ledger.as_ref(),
-                    Some(&store_path),
-                )
-                .await
-                {
-                    Ok(report) => report,
-                    Err(e) => {
-                        eprintln!("读取知识库失败: {}", e);
-                        std::process::exit(1);
-                    }
-                };
+            };
             if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{}", text),
@@ -2336,8 +2325,13 @@ async fn main() {
             let registry = oxigraph_manager.predicate_registry_snapshot();
             let types = oxigraph_manager.type_system_snapshot();
             let ledger = provenance_seed_for_store(Some(&store_path), None);
-            let mut quality_report =
-                build_report_with_provenance(&facts, &registry, &types, &config.entity_types, Some(&ledger));
+            let mut quality_report = build_report_with_provenance(
+                &facts,
+                &registry,
+                &types,
+                &config.entity_types,
+                Some(&ledger),
+            );
             if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
                 know_prolog::quality::apply_witnessed_conflicts(
                     &mut quality_report,
@@ -3177,7 +3171,10 @@ fn run_frontier(
     config: &know_prolog::SystemConfig,
 ) {
     if !(0.0..=1.0).contains(&near_miss) || !near_miss.is_finite() {
-        eprintln!("--near-miss 必须在 0 到 1 之间（含端点），实得 {}", near_miss);
+        eprintln!(
+            "--near-miss 必须在 0 到 1 之间（含端点），实得 {}",
+            near_miss
+        );
         std::process::exit(2);
     }
     let synonyms = config
@@ -3196,13 +3193,8 @@ fn run_frontier(
             }
         };
         let questions: Vec<&str> = text.lines().collect();
-        let report = frontier::analyze_corpus(
-            questions,
-            &library,
-            &config.nlp,
-            &synonyms,
-            near_miss,
-        );
+        let report =
+            frontier::analyze_corpus(questions, &library, &config.nlp, &synonyms, near_miss);
         if json {
             match serde_json::to_string_pretty(&report) {
                 Ok(text) => println!("{}", text),
@@ -3215,13 +3207,8 @@ fn run_frontier(
     }
 
     let question = question.unwrap_or_default();
-    let report = frontier::analyze_with_threshold(
-        question,
-        &library,
-        &config.nlp,
-        &synonyms,
-        near_miss,
-    );
+    let report =
+        frontier::analyze_with_threshold(question, &library, &config.nlp, &synonyms, near_miss);
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{}", text),
@@ -3245,7 +3232,10 @@ fn run_eval_recall(
     config: &know_prolog::SystemConfig,
 ) {
     if !(0.0..=1.0).contains(&near_miss) || !near_miss.is_finite() {
-        eprintln!("--near-miss 必须在 0 到 1 之间（含端点），实得 {}", near_miss);
+        eprintln!(
+            "--near-miss 必须在 0 到 1 之间（含端点），实得 {}",
+            near_miss
+        );
         std::process::exit(2);
     }
     let report = know_prolog::recall_audit::evaluate_config(config, near_miss);
@@ -3274,11 +3264,8 @@ fn run_eval_recall(
     } else if baseline.is_some() {
         match know_prolog::recall_audit::RecallBaseline::load(baseline_path) {
             Ok(old_baseline) => {
-                let verdict = know_prolog::recall_audit::compare_baseline(
-                    &old_baseline,
-                    &report,
-                    1e-6,
-                );
+                let verdict =
+                    know_prolog::recall_audit::compare_baseline(&old_baseline, &report, 1e-6);
                 print!("{}", verdict.render_text());
                 if !verdict.passed && !allow_regression {
                     std::process::exit(1);
@@ -3338,11 +3325,8 @@ fn run_read_trace(
         };
         let questions: Vec<&str> = text.lines().collect();
         if let Some(inventory) = &inventory {
-            let report = lexical_trace::coverage_report_with_inventory(
-                questions,
-                &config.nlp,
-                inventory,
-            );
+            let report =
+                lexical_trace::coverage_report_with_inventory(questions, &config.nlp, inventory);
             if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{}", text),
@@ -3998,8 +3982,13 @@ async fn refresh_dialogue_quality(
     let registry = oxigraph_manager.predicate_registry_snapshot();
     let types = oxigraph_manager.type_system_snapshot();
     let ledger = provenance_seed_for_store(Some(store_path), None);
-    let mut report =
-        build_report_with_provenance(&facts, &registry, &types, &config.entity_types, Some(&ledger));
+    let mut report = build_report_with_provenance(
+        &facts,
+        &registry,
+        &types,
+        &config.entity_types,
+        Some(&ledger),
+    );
     if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
         know_prolog::quality::apply_witnessed_conflicts(
             &mut report,
@@ -4009,8 +3998,9 @@ async fn refresh_dialogue_quality(
             &types,
         );
     }
-    let index = QualityIndex::from_report_with_provenance(&report, &facts, &registry, Some(&ledger))
-        .with_revision(revision);
+    let index =
+        QualityIndex::from_report_with_provenance(&report, &facts, &registry, Some(&ledger))
+            .with_revision(revision);
     dialogue_manager.set_quality_index(Some(index));
 }
 
@@ -5037,7 +5027,13 @@ async fn run_interactive_mode(
         // 确认锻造：候选转正，展开为无分支模式并入统一模式库。
         if let Some(rest) = strip_any_prefix(
             input,
-            &["确认锻造：", "确认锻造:", "确认锻造 ", "采纳锻造：", "采纳锻造:"],
+            &[
+                "确认锻造：",
+                "确认锻造:",
+                "确认锻造 ",
+                "采纳锻造：",
+                "采纳锻造:",
+            ],
         ) {
             let key = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
@@ -5090,7 +5086,13 @@ async fn run_interactive_mode(
         // 否认锻造：记录一次反驳；达到阈值自动退役并撤出模式库。
         if let Some(rest) = strip_any_prefix(
             input,
-            &["否认锻造：", "否认锻造:", "否认锻造 ", "否决锻造：", "否决锻造:"],
+            &[
+                "否认锻造：",
+                "否认锻造:",
+                "否认锻造 ",
+                "否决锻造：",
+                "否决锻造:",
+            ],
         ) {
             let key = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
@@ -5130,7 +5132,13 @@ async fn run_interactive_mode(
         // 退役锻造：停止路由并保留出生档案（可再遗忘）。
         if let Some(rest) = strip_any_prefix(
             input,
-            &["退役锻造：", "退役锻造:", "退役锻造 ", "停用锻造：", "停用锻造:"],
+            &[
+                "退役锻造：",
+                "退役锻造:",
+                "退役锻造 ",
+                "停用锻造：",
+                "停用锻造:",
+            ],
         ) {
             let key = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
@@ -5160,7 +5168,13 @@ async fn run_interactive_mode(
         // 遗忘锻造：彻底删除非激活记录（激活规则必须先退役）。
         if let Some(rest) = strip_any_prefix(
             input,
-            &["遗忘锻造：", "遗忘锻造:", "遗忘锻造 ", "删除锻造：", "删除锻造:"],
+            &[
+                "遗忘锻造：",
+                "遗忘锻造:",
+                "遗忘锻造 ",
+                "删除锻造：",
+                "删除锻造:",
+            ],
         ) {
             let key = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
@@ -5201,7 +5215,13 @@ async fn run_interactive_mode(
         }
         if let Some(rest) = strip_any_prefix(
             input,
-            &["锻造探针：", "锻造探针:", "锻造探针 ", "复核锻造：", "复核锻造:"],
+            &[
+                "锻造探针：",
+                "锻造探针:",
+                "锻造探针 ",
+                "复核锻造：",
+                "复核锻造:",
+            ],
         ) {
             let key = rest
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
@@ -5218,10 +5238,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if matches!(
-            input,
-            "锻造台账" | "锻造报告" | "锻造状态" | "模式锻造台账"
-        ) {
+        if matches!(input, "锻造台账" | "锻造报告" | "锻造状态" | "模式锻造台账")
+        {
             println!("{}", pattern_forge.report());
             println!();
             continue;
@@ -7075,7 +7093,10 @@ async fn run_interactive_mode(
         }
 
         // 知识容器层次清单：把回答所依赖的四层前提摊开，供逐层审计。
-        if matches!(input, "知识层次" | "层次清单" | "容器清单" | "会话镜像" | "回答层次") {
+        if matches!(
+            input,
+            "知识层次" | "层次清单" | "容器清单" | "会话镜像" | "回答层次"
+        ) {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             println!("{}", symbolic_reasoner.knowledge_layers_report());
             println!();
@@ -7415,24 +7436,76 @@ async fn run_interactive_mode(
         }
 
         // 会话修订回执：查看最近写入及其可撤销操作
-        if matches!(
-            input,
-            "修订回执" | "修订记录" | "会话修订" | "写入回执"
-        ) {
+        if matches!(input, "修订回执" | "修订记录" | "会话修订" | "写入回执") {
             println!("{}", symbolic_reasoner.session_revision_report());
             println!();
             continue;
         }
 
         // 撤销最新一次会话修订：按回执逆操作恢复事实/规则/教学原句
-        if matches!(
-            input,
-            "撤销修订" | "撤销上次修订" | "撤回修订" | "撤销写入"
-        ) {
+        if matches!(input, "撤销修订" | "撤销上次修订" | "撤回修订" | "撤销写入")
+        {
             let report = symbolic_reasoner.undo_last_session_revision();
             println!("{}", report);
             sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             log_chronicle_reply(&mut chronicle, &report, &[], &[]);
+            println!();
+            continue;
+        }
+
+        // 会话改口：显式更正一个功能槽，记录 before/after，不写知识图谱
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "改口：",
+                "改口:",
+                "更正记忆：",
+                "更正记忆:",
+                "纠正记忆：",
+                "纠正记忆:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请给出改口内容，例如：改口：姚明的身高是229cm");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                let report = symbolic_reasoner.correct_nl_fact(target);
+                println!("{}", report);
+                log_chronicle_reply(&mut chronicle, &report, &[], &[]);
+            }
+            println!();
+            continue;
+        }
+
+        // 会话槽账本：当前赢家 / 压制值 / 仅证据值
+        if matches!(input, "槽账本" | "槽位账本" | "改口账本") {
+            println!("{}", symbolic_reasoner.slot_ledger_report());
+            println!();
+            continue;
+        }
+
+        // 单个槽的改口史：改口史：姚明 身高 / 改口史：姚明的身高
+        if let Some(target) =
+            strip_any_prefix(input, &["改口史：", "改口史:", "槽历史：", "槽历史:"])
+        {
+            let target = target.trim();
+            let pair = target
+                .split_once('|')
+                .or_else(|| target.split_once('的'))
+                .map(|(subject, predicate)| (subject.trim(), predicate.trim()))
+                .filter(|(subject, predicate)| !subject.is_empty() && !predicate.is_empty());
+            match pair {
+                Some((subject, predicate)) => {
+                    println!(
+                        "{}",
+                        symbolic_reasoner.slot_history_report(subject, predicate)
+                    );
+                }
+                None => {
+                    println!("请给出主语和谓词，例如：改口史：姚明 身高（或 改口史：姚明的身高）")
+                }
+            }
             println!();
             continue;
         }
@@ -9168,11 +9241,7 @@ async fn run_interactive_mode(
                                         // 执行查询流程
                                         if let Some(note) = &pattern_note {
                                             println!("命中模式: {}", note);
-                                            record_forge_hit(
-                                                &mut pattern_forge,
-                                                note,
-                                                &forge_path,
-                                            );
+                                            record_forge_hit(&mut pattern_forge, note, &forge_path);
                                         }
                                         continue_original_query(
                                             &config,
@@ -9231,11 +9300,7 @@ async fn run_interactive_mode(
                                     {
                                         if let Some(note) = &pattern_note {
                                             println!("命中模式: {}", note);
-                                            record_forge_hit(
-                                                &mut pattern_forge,
-                                                note,
-                                                &forge_path,
-                                            );
+                                            record_forge_hit(&mut pattern_forge, note, &forge_path);
                                         }
                                         continue_original_query(
                                             &config,
@@ -10121,6 +10186,8 @@ fn interactive_help() -> String {
         "  锻造探针 [id]                       重跑正例/反例/逆生成探针，发现悄悄失效的规则",
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
+        "  改口：<事实>                        显式更正会话槽（记录 before/after，可撤销，不写图）",
+        "  槽账本 / 改口史：<实体>的<属性>      查看当前赢家、压制值与逐次改口史",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
         "  修订预演：<实体>|<属性>|<旧>|<新>   提交前计算影响与冲突（只计算，不写图）",
         "  修订回执 / 撤销修订                查看最近写入回执 / 按逆操作恢复最新一笔",
@@ -10879,13 +10946,15 @@ fn route_query_with_patterns(
         // 失败也要留下可行动的粒度：记录最近受阻模式停在哪一要素。
         let frontier_report = frontier::analyze_tokens(input, words, library, context);
         let snapshot = frontier_report.closest_blocked().and_then(|row| {
-            row.failure.as_ref().map(|failure| pattern_ir::EpisodeFrontier {
-                pattern_id: row.id.clone(),
-                pattern_name: row.name.clone(),
-                query_type: row.query_type.clone(),
-                coverage: row.coverage(),
-                failure: failure.clone(),
-            })
+            row.failure
+                .as_ref()
+                .map(|failure| pattern_ir::EpisodeFrontier {
+                    pattern_id: row.id.clone(),
+                    pattern_name: row.name.clone(),
+                    query_type: row.query_type.clone(),
+                    coverage: row.coverage(),
+                    failure: failure.clone(),
+                })
         });
         episodes.record_unmatched_with_frontier(input, words, context, snapshot);
         return None;
