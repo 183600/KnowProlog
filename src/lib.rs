@@ -91,6 +91,7 @@ pub mod query_board;
 pub mod query_planner;
 pub mod query_rewrite;
 pub mod query_scenario;
+pub mod quantity;
 pub mod question_analyzer;
 pub mod reading;
 pub mod recovery;
