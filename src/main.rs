@@ -3622,6 +3622,24 @@ fn persist_pattern_forge(forge: &PatternForge, path: &str) {
     }
 }
 
+/// 模式命中回执里若来源是锻造规则，则给该规则记一次成功使用。
+///
+/// 只做计数，不改变回答；台账按需落盘，避免每轮都写 JSON。
+fn record_forge_hit(forge: &mut PatternForge, note: &str, path: &str) {
+    let Some(rest) = note.split("来源 ").nth(1) else {
+        return;
+    };
+    let source = rest
+        .split('，')
+        .next()
+        .unwrap_or(rest)
+        .trim()
+        .trim_end_matches(['）', ')']);
+    if source.starts_with(pattern_forge::FORGE_SOURCE_PREFIX) && forge.record_hit(source) {
+        persist_pattern_forge(forge, path);
+    }
+}
+
 fn persist_shape_dialogue(dialogue: &ShapeDialogue, path: &str) {
     if let Err(error) = dialogue.save_to_path(path) {
         eprintln!("形状对话状态保存失败：{}", error);
@@ -4703,6 +4721,46 @@ async fn run_interactive_mode(
                     }
                     Err(error) => println!("确认锻造失败：{}", error),
                 }
+            }
+            println!();
+            continue;
+        }
+
+        // 否认锻造：记录一次反驳；达到阈值自动退役并撤出模式库。
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["否认锻造：", "否认锻造:", "否认锻造 ", "否决锻造：", "否决锻造:"],
+        ) {
+            let key = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            match pattern_forge.refute(key) {
+                Ok((pattern, retired)) => {
+                    if retired {
+                        let removed = pattern_library.remove_source(&pattern.source());
+                        println!(
+                            "锻造规则 {}「{}」累计被反驳 {} 次，已自动退役并移除 {} 条展开。",
+                            pattern.id, pattern.name, pattern.refutations, removed
+                        );
+                        match oxigraph_manager
+                            .sync_pattern_ledger(pattern_library.entries())
+                            .await
+                        {
+                            Ok(count) => println!("模式落图：{} 条已同步。", count),
+                            Err(error) => eprintln!("模式落图失败：{}", error),
+                        }
+                    } else {
+                        println!(
+                            "已记下对锻造规则 {}「{}」的反驳：{}/{} 次。",
+                            pattern.id,
+                            pattern.name,
+                            pattern.refutations,
+                            pattern_forge::MAX_REFUTATIONS
+                        );
+                    }
+                    persist_pattern_forge(&pattern_forge, &forge_path);
+                }
+                Err(error) => println!("否认锻造失败：{}", error),
             }
             println!();
             continue;
@@ -8711,6 +8769,11 @@ async fn run_interactive_mode(
                                         // 执行查询流程
                                         if let Some(note) = &pattern_note {
                                             println!("命中模式: {}", note);
+                                            record_forge_hit(
+                                                &mut pattern_forge,
+                                                note,
+                                                &forge_path,
+                                            );
                                         }
                                         continue_original_query(
                                             &config,
@@ -8769,6 +8832,11 @@ async fn run_interactive_mode(
                                     {
                                         if let Some(note) = &pattern_note {
                                             println!("命中模式: {}", note);
+                                            record_forge_hit(
+                                                &mut pattern_forge,
+                                                note,
+                                                &forge_path,
+                                            );
                                         }
                                         continue_original_query(
                                             &config,
@@ -8920,6 +8988,7 @@ async fn run_interactive_mode(
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
                         println!("命中模式: {}", note);
+                        record_forge_hit(&mut pattern_forge, note, &forge_path);
                     }
 
                     // 提取查询中的实体
@@ -9648,7 +9717,7 @@ fn interactive_help() -> String {
         "  清空模式经验                         清空经验台账并同步命名图",
         "  教模式：名 | 要素… | 路由 | 优先级 | 守卫  教一条模式（可选上下文守卫，落图持久化）",
         "  锻造模式：名 | 正例(多个用;分隔) | 反例(可空，多个用;分隔) | 路由 | 优先级 | 守卫",
-        "  确认锻造 <id> / 退役锻造 <id> / 遗忘锻造 <id>  候选转正、停止路由、彻底删除",
+        "  确认锻造 <id> / 否认锻造 <id> / 退役锻造 <id> / 遗忘锻造 <id>  转正、记反驳、停用、删除",
         "  锻造台账                            例子、正则、探针、命中/反驳与生命周期",
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
@@ -10252,6 +10321,11 @@ fn is_command_like(input: &str) -> bool {
         "确认锻造 ",
         "采纳锻造：",
         "采纳锻造:",
+        "否认锻造：",
+        "否认锻造:",
+        "否认锻造 ",
+        "否决锻造：",
+        "否决锻造:",
         "退役锻造：",
         "退役锻造:",
         "退役锻造 ",

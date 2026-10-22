@@ -1144,6 +1144,18 @@ impl PatternForge {
         false
     }
 
+    /// 按 id/前缀/名称记录一次反驳，返回记录与是否触发自动退役。
+    pub fn refute(&mut self, key: &str) -> Result<(ForgedPattern, bool), ForgeError> {
+        let id = self.resolve(key)?;
+        let source = format!("{}{}", FORGE_SOURCE_PREFIX, id);
+        let retired = self.record_refutation(&source).unwrap_or(false);
+        let pattern = self
+            .patterns
+            .get(&id)
+            .ok_or_else(|| ForgeError::NotFound(key.to_string()))?;
+        Ok((pattern.clone(), retired))
+    }
+
     /// 记录一次反驳；达到 [`MAX_REFUTATIONS`] 时自动退役。
     ///
     /// 返回 `Some(retired)` 表示找到了规则，`retired` 说明本次是否触发了
@@ -1157,7 +1169,7 @@ impl PatternForge {
         let pattern = self.patterns.get_mut(id)?;
         pattern.refutations += 1;
         pattern.last_used_turn = turn;
-        if pattern.refutations >= MAX_REFUTATIONS && pattern.status == ForgeStatus::Active {
+        if pattern.refutations >= MAX_REFUTATIONS && pattern.status != ForgeStatus::Retired {
             pattern.status = ForgeStatus::Retired;
             return Some(true);
         }
@@ -1476,10 +1488,13 @@ mod tests {
             )
             .expect("应当学会");
         forge.activate(&outcome.pattern.id).expect("激活");
+        let prefix = &outcome.pattern.id[..outcome.pattern.id.len().min(10)];
         for _ in 0..MAX_REFUTATIONS - 1 {
-            assert_eq!(forge.record_refutation(&outcome.pattern.id), Some(false));
+            let (_, retired) = forge.refute(prefix).expect("按前缀找到规则");
+            assert!(!retired);
         }
-        assert_eq!(forge.record_refutation(&outcome.pattern.id), Some(true));
+        let (_, retired) = forge.refute(prefix).expect("按前缀找到规则");
+        assert!(retired);
         assert_eq!(
             forge
                 .get(&outcome.pattern.id)
@@ -1491,12 +1506,13 @@ mod tests {
     #[test]
     fn spec_parser_reads_negatives_priority_and_guard() {
         let request = parse_forge_spec(
-            "女儿问法 | 姚明的女儿是谁 | 姚明今年几岁;姚明的儿子是谁 | daughter_query | 30 | 焦点",
+            "女儿问法 | 姚明的女儿是谁;姚明的闺女是谁 | 姚明今年几岁;姚明的儿子是谁 | daughter_query | 30 | 焦点",
         )
         .expect("应当解析");
         assert_eq!(request.name, "女儿问法");
         assert_eq!(request.query_type, "daughter_query");
         assert_eq!(request.priority, 30);
+        assert_eq!(request.positives().len(), 2);
         assert_eq!(request.negatives.len(), 2);
         assert_eq!(request.guard, Some(crate::pattern_ir::ContextGuard::focus()));
         assert!(parse_forge_spec("只有名字").is_err());
