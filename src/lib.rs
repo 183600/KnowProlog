@@ -31,6 +31,7 @@ pub mod context_image;
 pub mod contextual_rag;
 pub mod contextual_reference;
 pub mod conversation_theory;
+pub mod conversational_graph;
 pub mod default_logic;
 pub mod dense_retrieval;
 pub mod derivation;
