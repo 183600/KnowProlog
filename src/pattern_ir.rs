@@ -368,9 +368,8 @@ pub fn parse_context_guard(spec: &str) -> Result<ContextGuard, String> {
                 guard.focus_required = true;
                 guard.focus_type = Some(sort.to_string());
             }
-            ("上轮", Some(movement))
-            | ("动作", Some(movement))
-            | ("last_move", Some(movement)) => {
+            ("上轮", Some(movement)) | ("动作", Some(movement)) | ("last_move", Some(movement)) =>
+            {
                 if movement.is_empty() {
                     return Err("上轮动作不能为空".to_string());
                 }
@@ -945,8 +944,7 @@ impl PatternEpisode {
                 bonus += 0.1;
             }
         }
-        if let (Some(left), Some(right)) =
-            (self.last_move.as_deref(), context.last_move.as_deref())
+        if let (Some(left), Some(right)) = (self.last_move.as_deref(), context.last_move.as_deref())
         {
             if left == right {
                 bonus += 0.1;
@@ -1028,12 +1026,11 @@ pub fn classify_case_reply(input: &str) -> CaseReply {
     }
     let lower = core.to_lowercase();
     let accept = [
-        "是", "是的", "对", "对的", "没错", "确认", "好", "好的", "好呀", "可以", "嗯",
-        "yes", "y", "true",
+        "是", "是的", "对", "对的", "没错", "确认", "好", "好的", "好呀", "可以", "嗯", "yes", "y",
+        "true",
     ];
     let reject = [
-        "不是", "不对", "没有", "否", "不", "不要", "不用", "别", "错", "算了", "no", "n",
-        "false",
+        "不是", "不对", "没有", "否", "不", "不要", "不用", "别", "错", "算了", "no", "n", "false",
     ];
     let unclear = ["不知道", "不确定", "不清楚", "跳过", "下一个", "随便"];
     if accept.contains(&lower.as_str()) {
@@ -1350,9 +1347,13 @@ impl PatternEpisodeLog {
                 added += 1;
             }
         }
-        self.clock = self
-            .clock
-            .max(self.entries.iter().map(|episode| episode.last_turn).max().unwrap_or(0));
+        self.clock = self.clock.max(
+            self.entries
+                .iter()
+                .map(|episode| episode.last_turn)
+                .max()
+                .unwrap_or(0),
+        );
         self.enforce_capacity();
         if !episodes.is_empty() {
             self.touch();
@@ -1673,6 +1674,41 @@ fn is_skippable(text: &str) -> bool {
     text.trim().is_empty() || matches!(text, "？" | "。" | "，" | "、")
 }
 
+/// 句首礼貌/话语标记：不承载查询语义，但会破坏锚定匹配。
+///
+/// 只在**句首**跳过，且当模式首要素正好需要该词面时不跳；避免把
+/// 「那一年」里的「那」当成可丢弃填充词。
+const LEADING_FILLERS: &[&str] = &[
+    "请问",
+    "请问一下",
+    "我想问",
+    "想问",
+    "问一下",
+    "麻烦",
+    "那么",
+    "嗯",
+    "呃",
+];
+
+fn skip_leading_fillers(entry: &PatternEntry, tokens: &[crate::nlp::TaggedWord]) -> usize {
+    let first_literal = match entry.elems.first() {
+        Some(Elem::Word { surface }) => Some(surface.as_str()),
+        _ => None,
+    };
+    let mut pos = 0usize;
+    while pos < tokens.len() {
+        let text = tokens[pos].text.as_str();
+        if !LEADING_FILLERS.contains(&text) {
+            break;
+        }
+        if first_literal == Some(text) {
+            break;
+        }
+        pos += 1;
+    }
+    pos
+}
+
 const CITY_LITERALS: &[&str] = &[
     "厦门", "北京", "上海", "广州", "深圳", "杭州", "南京", "武汉",
 ];
@@ -1952,7 +1988,7 @@ pub fn match_entry_detailed(
         });
     }
 
-    let mut pos = 0usize;
+    let mut pos = skip_leading_fillers(entry, tokens);
     let mut offset = 0usize;
     let mut bindings = BindingSet::new();
     let mut entities = Vec::new();
@@ -2059,7 +2095,7 @@ fn first_elem_may_miss(entry: &PatternEntry, tokens: &[crate::nlp::TaggedWord]) 
     let Some(first) = entry.elems.first() else {
         return false;
     };
-    let mut pos = 0usize;
+    let mut pos = skip_leading_fillers(entry, tokens);
     while pos < tokens.len() && is_skippable(tokens[pos].text.as_str()) {
         pos += 1;
     }
@@ -2738,23 +2774,14 @@ pub fn render_episode_report(log: &PatternEpisodeLog) -> String {
         let target = episode
             .winner_name
             .as_deref()
-            .map(|name| {
-                format!(
-                    "{} → {}",
-                    name,
-                    episode.query_type.as_deref().unwrap_or("")
-                )
-            })
+            .map(|name| format!("{} → {}", name, episode.query_type.as_deref().unwrap_or("")))
             .unwrap_or_else(|| "（无可路由命中）".to_string());
         let context = episode
             .context_note()
             .map(|note| format!("，{}", note))
             .unwrap_or_default();
         let feedback = if episode.acceptances > 0 || episode.rejections > 0 {
-            format!(
-                "，确认×{} 否定×{}",
-                episode.acceptances, episode.rejections
-            )
+            format!("，确认×{} 否定×{}", episode.acceptances, episode.rejections)
         } else {
             String::new()
         };
@@ -2847,9 +2874,7 @@ pub fn render_case_suggestion(input: &str, suggestion: &CaseSuggestion) -> Strin
     let _ = writeln!(
         out,
         " 候选路由：{}（来源 {}，未激活{}）",
-        suggestion.pattern.query_type,
-        suggestion.pattern.source,
-        guard
+        suggestion.pattern.query_type, suggestion.pattern.source, guard
     );
     let _ = writeln!(
         out,
@@ -3556,11 +3581,42 @@ mod tests {
         // 结巴把它切成 `张三/nr 多/unknown 大/nr`：人名合并不能吞掉「多大」。
         let tokens = preprocess("张三多大", &config.nlp);
         assert_eq!(
-            tokens.iter().map(|word| word.text.as_str()).collect::<Vec<_>>(),
+            tokens
+                .iter()
+                .map(|word| word.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["张三", "多", "大"]
         );
         let matched = library.match_route(&tokens).expect("年龄规则应命中");
         assert_eq!(matched.entry.query_type, "age_query");
+        assert_eq!(matched.entities, vec!["张三".to_string()]);
+    }
+
+    #[test]
+    fn leading_politeness_is_skipped_but_never_stolen_from_a_pattern() {
+        let config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        for question in ["请问张三多大", "麻烦，张三多大？", "那么张三多大"] {
+            let tokens = preprocess(question, &config.nlp);
+            let matched = library
+                .match_route(&tokens)
+                .unwrap_or_else(|| panic!("礼貌前缀不应破坏路由：{} {:?}", question, tokens));
+            assert_eq!(matched.entry.query_type, "age_query", "{}", question);
+        }
+
+        // 模式首要素就是「请问」时，它必须自己消费，而不是被当作填充词跳过。
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "请问查询",
+            "taught#test",
+            "ask_query",
+            10,
+            true,
+            vec![Elem::word("请问"), Elem::pos("nr")],
+        ));
+        let tokens = tagged(&[("请问", "v"), ("张三", "nr")]);
+        let matched = library.match_route(&tokens).expect("首要素词面应保留");
         assert_eq!(matched.entities, vec!["张三".to_string()]);
     }
 
@@ -3572,10 +3628,7 @@ mod tests {
         let tokens = preprocess("苹果和书有什么区别", &config.nlp);
         let matched = library.match_route(&tokens).expect("比较规则应命中");
         assert_eq!(matched.entry.query_type, "comparison_query");
-        assert_eq!(
-            matched.entities,
-            vec!["苹果".to_string(), "书".to_string()]
-        );
+        assert_eq!(matched.entities, vec!["苹果".to_string(), "书".to_string()]);
     }
 
     #[test]
@@ -4048,7 +4101,10 @@ mod tests {
             toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
         let library = PatternLibrary::from_config(&config);
         let legacy_rules = create_prolog_rules(&config);
-        assert!(library.fallback_count() > 0, "应有与配置规则对齐的 NLU 回退意图");
+        assert!(
+            library.fallback_count() > 0,
+            "应有与配置规则对齐的 NLU 回退意图"
+        );
 
         let tokens = preprocess("姚明年龄", &config.nlp);
         assert!(
@@ -4061,7 +4117,11 @@ mod tests {
             .expect("NLU 意图应作为回退命中");
         assert_eq!(fallback.entry.query_type, "age_query");
         assert_eq!(fallback.entities, vec!["姚明".to_string()]);
-        assert!(fallback.entry.source.starts_with("nlu#"), "{}", fallback.entry.source);
+        assert!(
+            fallback.entry.source.starts_with("nlu#"),
+            "{}",
+            fallback.entry.source
+        );
 
         // 配置能命中的问法仍走主路由，回退不改变既有行为。
         let configured = preprocess("小明的年龄", &config.nlp);
@@ -4311,13 +4371,20 @@ mod tests {
         assert_eq!(log.clock(), 3);
 
         for turn in 4..8 {
-            log.record_unmatched(&format!("未知句子{}", turn), &tagged(&[("未知", "n")]), None, turn);
+            log.record_unmatched(
+                &format!("未知句子{}", turn),
+                &tagged(&[("未知", "n")]),
+                None,
+                turn,
+            );
         }
         assert_eq!(log.len(), 3, "容量必须封顶");
         assert_eq!(log.matched_count(), 1);
         assert_eq!(log.unmatched_count(), 2);
         assert!(
-            log.entries().iter().any(|episode| episode.input == "法国的首都是哪里"),
+            log.entries()
+                .iter()
+                .any(|episode| episode.input == "法国的首都是哪里"),
             "最近使用的经验不应被淘汰"
         );
         let report = render_episode_report(&log);
@@ -4358,10 +4425,9 @@ mod tests {
         let json = serde_json::to_string(&episode).expect("序列化经验");
         let restored: PatternEpisode = serde_json::from_str(&json).expect("反序列化经验");
         assert_eq!(restored.frontier.as_ref(), Some(&snapshot));
-        let legacy: PatternEpisode = serde_json::from_str(
-            r#"{"input":"旧句","tokens":[],"outcome":"unmatched"}"#,
-        )
-        .expect("旧账本应兼容");
+        let legacy: PatternEpisode =
+            serde_json::from_str(r#"{"input":"旧句","tokens":[],"outcome":"unmatched"}"#)
+                .expect("旧账本应兼容");
         assert!(legacy.frontier.is_none());
 
         let report = render_episode_report(&log);
@@ -4423,7 +4489,10 @@ mod tests {
         assert!(suggestion.score >= 0.2);
         assert_eq!(suggestion.episode.winner_name.as_deref(), Some("首都查询"));
         assert!(!suggestion.pattern.route, "候选不得直接参与路由");
-        assert_eq!(suggestion.pattern.source, format!("case#{}", suggestion.episode.short_id()));
+        assert_eq!(
+            suggestion.pattern.source,
+            format!("case#{}", suggestion.episode.short_id())
+        );
         assert!(
             suggestion.pattern.render().contains("槽1:地点"),
             "未见实体应升为地点槽：{}",
@@ -4574,8 +4643,16 @@ mod tests {
         assert!(report.contains("发生上下文"), "{}", report);
         assert!(report.contains("上轮 greet"), "{}", report);
         let episode_report = render_episode_report(&log);
-        assert!(episode_report.contains("上轮 ask_attribute"), "{}", episode_report);
-        assert!(episode_report.contains("焦点 法国(地点)"), "{}", episode_report);
+        assert!(
+            episode_report.contains("上轮 ask_attribute"),
+            "{}",
+            episode_report
+        );
+        assert!(
+            episode_report.contains("焦点 法国(地点)"),
+            "{}",
+            episode_report
+        );
     }
 
     #[test]
@@ -4623,10 +4700,7 @@ mod tests {
 
     #[test]
     fn context_guard_parses_and_gates_routing() {
-        assert_eq!(
-            parse_context_guard("焦点").unwrap(),
-            ContextGuard::focus()
-        );
+        assert_eq!(parse_context_guard("焦点").unwrap(), ContextGuard::focus());
         assert_eq!(
             parse_context_guard("焦点类型：人物").unwrap(),
             ContextGuard::focus_type("人物")
@@ -4715,7 +4789,8 @@ mod tests {
                 answer
             );
         }
-        for answer in ["是什么", "是的，首都在哪里", "帮助", "", "确认联想：德国"] {
+        for answer in ["是什么", "是的，首都在哪里", "帮助", "", "确认联想：德国"]
+        {
             assert_eq!(
                 classify_case_reply(answer),
                 CaseReply::NewInput,

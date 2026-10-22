@@ -49,6 +49,8 @@ pub enum CaseVariant {
     Entity,
     /// 追加语气尾缀。
     Suffix,
+    /// 加句首礼貌/话语标记。
+    Prefix,
 }
 
 impl CaseVariant {
@@ -58,6 +60,7 @@ impl CaseVariant {
             CaseVariant::Synonym => "同义词",
             CaseVariant::Entity => "实体替换",
             CaseVariant::Suffix => "语气尾缀",
+            CaseVariant::Prefix => "礼貌前缀",
         }
     }
 }
@@ -578,6 +581,23 @@ pub fn construct_cases(
                 },
             );
         }
+
+        // 礼貌前缀：真实用户常加，匹配器必须在句首跳过而不改变语义。
+        if !question.starts_with("请问") {
+            insert_case(
+                &mut canonical,
+                &mut ambiguous,
+                RecallCase {
+                    question: format!("请问{}", question),
+                    expected_query_type: entry.query_type.clone(),
+                    rule_name: entry.name.clone(),
+                    expected_pattern: entry.render(),
+                    priority: entry.priority,
+                    variant: CaseVariant::Prefix,
+                    seen: false,
+                },
+            );
+        }
     }
 
     (canonical.into_values().collect(), ambiguous)
@@ -873,6 +893,7 @@ mod tests {
             .iter()
             .any(|case| case.variant == CaseVariant::Synonym));
         assert!(cases.iter().any(|case| case.variant == CaseVariant::Suffix));
+        assert!(cases.iter().any(|case| case.variant == CaseVariant::Prefix));
         // 分母必须确定：同一配置重复构造得到同一序列。
         let (again, _) = construct_cases(&library, &synonyms);
         assert_eq!(cases, again);
