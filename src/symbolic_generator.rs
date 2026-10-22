@@ -9,7 +9,7 @@
 //
 // 全程零神经网络、零梯度：只有计数、排序与模板组合。
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,349 @@ struct CompletionPrediction {
 struct FactLine {
     rank: f64,
     sentence: String,
+}
+
+/// 一句话的稳定身份：排序、插入顺序或同谓词对象增减都不会改变它。
+///
+/// 关系句按谓词成句，所以对象变化只改内容指纹、不换 key；属性句按
+/// `(key, value)` 成句，每个取值都有自己的身份；反向句按谓词成句。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ClauseKey {
+    pub entity: String,
+    pub kind: ClauseKind,
+    pub predicate: String,
+    /// 属性句的取值；关系/反向句为空。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub qualifier: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ClauseKind {
+    Relation,
+    Attribute,
+    Reverse,
+}
+
+impl ClauseKey {
+    fn encode(&self) -> String {
+        let kind = match self.kind {
+            ClauseKind::Relation => "r",
+            ClauseKind::Attribute => "a",
+            ClauseKind::Reverse => "v",
+        };
+        format!(
+            "{}#{}#{}#{}#{}#{}#",
+            self.entity.len(),
+            self.predicate.len(),
+            self.qualifier.len(),
+            kind,
+            self.entity,
+            self.predicate
+        ) + &self.qualifier
+    }
+}
+
+/// 一条当前可生成的命题（句子 + 稳定键 + 内容指纹）。
+#[derive(Debug, Clone)]
+pub struct ProfileClause {
+    pub key: ClauseKey,
+    pub sentence: String,
+    /// 是否含会话层事实（自检时可把这些句子视为已证事实）
+    pub from_overlay: bool,
+    rank_milli: i64,
+}
+
+impl ProfileClause {
+    pub fn fingerprint(&self) -> &str {
+        &self.sentence
+    }
+}
+
+/// 生成时的分层事实视图：图谱值 ∪ 会话值，先压制、再替换。
+///
+/// `replace` 用于功能槽（会话已有唯一赢家）；`add` 是普通会话事实；
+/// `suppress` 是被更正/否定掉的取值；`hide` 让整个谓词不再出现在介绍里。
+#[derive(Debug, Clone, Default)]
+pub struct GenerationOverlay {
+    pub add: BTreeMap<(String, String), BTreeSet<String>>,
+    pub replace: BTreeMap<(String, String), Vec<String>>,
+    pub suppress: BTreeMap<(String, String), BTreeSet<String>>,
+    pub hide: BTreeSet<(String, String)>,
+}
+
+impl GenerationOverlay {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty()
+            && self.replace.is_empty()
+            && self.suppress.is_empty()
+            && self.hide.is_empty()
+    }
+
+    fn touches(&self, subject: &str, predicate: &str) -> bool {
+        let key = (subject.to_string(), predicate.to_string());
+        self.add.contains_key(&key) || self.replace.contains_key(&key)
+    }
+}
+
+/// 已经对用户说出口的一句话：只记身份、内容指纹与原句，不记整份生成计划。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpokenRecord {
+    pub key: ClauseKey,
+    pub fingerprint: String,
+    pub sentence: String,
+    pub seq: u64,
+}
+
+/// 话语账本：按稳定键记住「说过什么、说时是什么内容」。
+///
+/// 它随对话快照持久化，恢复后不依赖当时的排序结果；每轮从当前知识
+/// 重建命题并与账本做差分，得到「新讲 / 更新 / 撤回」三类补丁。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationCursor {
+    pub entity: String,
+    pub order: GenerationOrder,
+    #[serde(default)]
+    pub spoken: BTreeMap<String, SpokenRecord>,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub turns: u64,
+    #[serde(default)]
+    pub last_index: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorLine {
+    pub text: String,
+    pub correction: bool,
+    pub trusted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorAdvance {
+    pub lines: Vec<CursorLine>,
+    pub total_lines: usize,
+    pub fresh: usize,
+    pub corrected: usize,
+    pub removed: usize,
+    pub span: Option<(usize, usize)>,
+    pub continuation: bool,
+    pub next_offset: usize,
+}
+
+impl GenerationCursor {
+    pub fn new(entity: &str, order: GenerationOrder) -> Self {
+        Self {
+            entity: entity.to_string(),
+            order,
+            spoken: BTreeMap::new(),
+            seq: 0,
+            turns: 0,
+            last_index: 0,
+        }
+    }
+
+    /// 显式「换个角度说」：同一实体重新叙述，账本从零开始。
+    pub fn reset_for_order(&mut self, order: GenerationOrder) {
+        self.order = order;
+        self.spoken.clear();
+        self.seq = 0;
+        self.turns = 0;
+        self.last_index = 0;
+    }
+
+    pub fn spoken_count(&self) -> usize {
+        self.spoken.len()
+    }
+
+    /// 旧快照只有 `shown` 位置、没有账本时，把当时已讲过的前 N 句补记为已说，
+    /// 避免升级后的第一次「接着说」重复用户已经听过的内容。
+    pub fn seed_spoken(&mut self, clauses: &[ProfileClause], shown: usize) {
+        for clause in clauses.iter().take(shown) {
+            self.seq += 1;
+            self.spoken.insert(
+                clause.key.encode(),
+                SpokenRecord {
+                    key: clause.key.clone(),
+                    fingerprint: clause.fingerprint().to_string(),
+                    sentence: clause.sentence.clone(),
+                    seq: self.seq,
+                },
+            );
+        }
+        self.last_index = shown.min(clauses.len());
+    }
+
+    /// 从当前命题重建视图并与账本差分，产出本轮补丁式叙述。
+    ///
+    /// 已说过的 key 不会作为新句重复出现；内容指纹变化会生成更正；
+    /// 消失的 key 会生成撤回声明。更正有上限，未播出的更正留在账本差异里，
+    /// 下一轮继续播（不会静默丢失）。
+    pub fn advance(&mut self, clauses: &[ProfileClause], limit: usize) -> CursorAdvance {
+        let limit = limit.max(1);
+        let continuation = !(self.spoken.is_empty() && self.turns == 0);
+        let current: BTreeMap<String, &ProfileClause> = clauses
+            .iter()
+            .map(|clause| (clause.key.encode(), clause))
+            .collect();
+        let mut order_index: BTreeMap<String, usize> = BTreeMap::new();
+        for (index, clause) in clauses.iter().enumerate() {
+            order_index.insert(clause.key.encode(), index);
+        }
+
+        let mut updates: Vec<(String, &ProfileClause)> = self
+            .spoken
+            .iter()
+            .filter_map(|(encoded, record)| {
+                let clause = current.get(encoded)?;
+                (record.fingerprint != clause.fingerprint())
+                    .then(|| (encoded.clone(), *clause))
+            })
+            .collect();
+        updates.sort_by_key(|(encoded, _)| order_index.get(encoded).copied().unwrap_or(usize::MAX));
+
+        let mut removals: Vec<(String, SpokenRecord)> = self
+            .spoken
+            .iter()
+            .filter(|(encoded, _)| !current.contains_key(*encoded))
+            .map(|(encoded, record)| (encoded.clone(), record.clone()))
+            .collect();
+        removals.sort_by_key(|(_, record)| record.seq);
+
+        let fresh_count = clauses
+            .iter()
+            .filter(|clause| !self.spoken.contains_key(&clause.key.encode()))
+            .count();
+        // 有补讲任务时给新句子留一半版面，避免更正把新知识永远挤在后面。
+        let correction_budget = if fresh_count > 0 {
+            limit.div_ceil(2).max(1)
+        } else {
+            limit
+        };
+
+        let mut lines: Vec<CursorLine> = Vec::new();
+        let mut corrected = 0usize;
+        let mut removed = 0usize;
+
+        for (encoded, clause) in updates {
+            if lines.len() >= correction_budget {
+                break;
+            }
+            let Some(record) = self.spoken.get(&encoded).cloned() else {
+                continue;
+            };
+            let old = record.sentence.trim().trim_end_matches('。');
+            let new = clause.sentence.trim().trim_end_matches('。');
+            lines.push(CursorLine {
+                text: format!("更正：此前说「{}」；现在更新为「{}」。", old, new),
+                correction: true,
+                trusted: false,
+            });
+            corrected += 1;
+            self.seq += 1;
+            if let Some(record) = self.spoken.get_mut(&encoded) {
+                record.fingerprint = clause.fingerprint().to_string();
+                record.sentence = clause.sentence.clone();
+                record.seq = self.seq;
+            }
+        }
+
+        for (encoded, record) in removals {
+            if lines.len() >= correction_budget {
+                break;
+            }
+            let old = record.sentence.trim().trim_end_matches('。');
+            lines.push(CursorLine {
+                text: format!("更正：此前说「{}」；该说法已不再成立。", old),
+                correction: true,
+                trusted: false,
+            });
+            removed += 1;
+            self.spoken.remove(&encoded);
+        }
+
+        let mut fresh = 0usize;
+        let mut selected_indices: Vec<usize> = Vec::new();
+        let mut trusted_lines: Vec<String> = Vec::new();
+        for (index, clause) in clauses.iter().enumerate() {
+            if lines.len() >= limit {
+                break;
+            }
+            let encoded = clause.key.encode();
+            if self.spoken.contains_key(&encoded) {
+                continue;
+            }
+            self.seq += 1;
+            self.spoken.insert(
+                encoded,
+                SpokenRecord {
+                    key: clause.key.clone(),
+                    fingerprint: clause.fingerprint().to_string(),
+                    sentence: clause.sentence.clone(),
+                    seq: self.seq,
+                },
+            );
+            if clause.from_overlay {
+                trusted_lines.push(clause.sentence.clone());
+            }
+            lines.push(CursorLine {
+                text: clause.sentence.clone(),
+                correction: false,
+                trusted: clause.from_overlay,
+            });
+            selected_indices.push(index);
+            fresh += 1;
+        }
+
+        let span = if selected_indices.is_empty() {
+            None
+        } else {
+            let start = selected_indices[0];
+            let end = selected_indices[selected_indices.len() - 1] + 1;
+            self.last_index = end;
+            Some((start, end))
+        };
+        let next_offset = span
+            .map(|(_, end)| end)
+            .unwrap_or_else(|| self.last_index.min(clauses.len()));
+        if !lines.is_empty() {
+            self.turns += 1;
+        }
+        // 供调用方在自检中信任会话层生成的句子（按整句精确匹配）。
+        if !trusted_lines.is_empty() {
+            for line in &mut lines {
+                if trusted_lines.iter().any(|sentence| sentence == &line.text) {
+                    line.trusted = true;
+                }
+            }
+        }
+        CursorAdvance {
+            lines,
+            total_lines: clauses.len(),
+            fresh,
+            corrected,
+            removed,
+            span,
+            continuation,
+            next_offset,
+        }
+    }
+}
+
+/// 一页带账本的分页结果（`text` 已含话语标记与页眉）。
+#[derive(Debug, Clone)]
+pub struct CursorPage {
+    pub entity: String,
+    pub text: String,
+    pub total_lines: usize,
+    pub shown: usize,
+    pub next_offset: usize,
+    pub fresh: usize,
+    pub corrected: usize,
+    pub removed: usize,
+    pub done: bool,
+    /// 含会话层事实、已由账本背书的句子（自检白名单）
+    pub trusted: Vec<String>,
 }
 
 pub struct SymbolicGenerator {
@@ -662,6 +1005,309 @@ impl SymbolicGenerator {
             shown,
             next_offset: end,
         })
+    }
+
+    /// 当前可生成的稳定命题列表（纯图谱视图，等价于空叠加层）。
+    pub fn profile_clauses(
+        &self,
+        entity: &str,
+        order: GenerationOrder,
+    ) -> Option<Vec<ProfileClause>> {
+        self.profile_clauses_with_overlay(entity, order, &GenerationOverlay::default())
+    }
+
+    /// 图谱视图 ∪ 会话视图，生成稳定命题列表。
+    ///
+    /// 功能槽已有会话赢家时以赢家为准（`replace`），否则取并集；被更正/
+    /// 否定的取值先删除（`suppress`）。这样生成器本身保持「图谱视图」，
+    /// 会话层的裁决由调用方以叠加层传入，避免两份事实互相污染。
+    pub fn profile_clauses_with_overlay(
+        &self,
+        entity: &str,
+        order: GenerationOrder,
+        overlay: &GenerationOverlay,
+    ) -> Option<Vec<ProfileClause>> {
+        if !self.is_known_entity(entity) {
+            return None;
+        }
+        let mut predicates: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(relations) = self.by_subject.get(entity) {
+            for (predicate, objects) in relations {
+                predicates
+                    .entry(predicate.clone())
+                    .or_default()
+                    .extend(objects.iter().cloned());
+            }
+        }
+        if let Some(attributes) = self.attributes.get(entity) {
+            for (key, value) in attributes {
+                let relation = self
+                    .by_subject
+                    .get(entity)
+                    .map_or(false, |relations| relations.contains_key(key));
+                if !relation {
+                    predicates
+                        .entry(key.clone())
+                        .or_default()
+                        .push(value.clone());
+                }
+            }
+        }
+        for ((subject, predicate), values) in &overlay.add {
+            if subject == entity {
+                predicates
+                    .entry(predicate.clone())
+                    .or_default()
+                    .extend(values.iter().cloned());
+            }
+        }
+        for ((subject, predicate), values) in &overlay.replace {
+            if subject == entity {
+                predicates
+                    .entry(predicate.clone())
+                    .or_default()
+                    .extend(values.iter().cloned());
+            }
+        }
+
+        let mut clauses: Vec<ProfileClause> = Vec::new();
+        for (predicate, values) in predicates {
+            let slot = (entity.to_string(), predicate.clone());
+            if overlay.hide.contains(&slot) {
+                continue;
+            }
+            let mut values = match overlay.replace.get(&slot) {
+                Some(replacement) => replacement.clone(),
+                None => values,
+            };
+            if let Some(suppressed) = overlay.suppress.get(&slot) {
+                values.retain(|value| !suppressed.contains(value));
+            }
+            values.sort();
+            values.dedup();
+            if values.is_empty() {
+                continue;
+            }
+            let relation = self
+                .by_subject
+                .get(entity)
+                .map_or(false, |relations| relations.contains_key(&predicate));
+            let attribute = !relation
+                && self.attributes.get(entity).map_or(false, |attributes| {
+                    attributes.iter().any(|(key, _)| key == &predicate)
+                });
+            let from_overlay = overlay.touches(entity, &predicate);
+            if attribute {
+                for value in values {
+                    if is_name_key(&predicate) && value == entity {
+                        continue;
+                    }
+                    let key = ClauseKey {
+                        entity: entity.to_string(),
+                        kind: ClauseKind::Attribute,
+                        predicate: predicate.clone(),
+                        qualifier: value.clone(),
+                    };
+                    let sentence =
+                        self.lexicalize(entity, &predicate, std::slice::from_ref(&value));
+                    clauses.push(ProfileClause {
+                        key,
+                        sentence,
+                        from_overlay,
+                        rank_milli: 500,
+                    });
+                }
+            } else {
+                let key = ClauseKey {
+                    entity: entity.to_string(),
+                    kind: ClauseKind::Relation,
+                    predicate: predicate.clone(),
+                    qualifier: String::new(),
+                };
+                let sentence = self.lexicalize(entity, &predicate, &values);
+                clauses.push(ProfileClause {
+                    key,
+                    sentence,
+                    from_overlay,
+                    rank_milli: (self.predicate_idf(&predicate) * 1000.0).round() as i64,
+                });
+            }
+        }
+
+        // 反向句：只补「主语→本实体」的入向事实，且谓词已在正向出现时跳过。
+        let mut reverse: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut reverse_overlay: BTreeSet<String> = BTreeSet::new();
+        if let Some(relations) = self.by_object.get(entity) {
+            for (predicate, subjects) in relations {
+                let duplicated = self
+                    .by_subject
+                    .get(entity)
+                    .map_or(false, |forward| forward.contains_key(predicate));
+                if duplicated {
+                    continue;
+                }
+                reverse
+                    .entry(predicate.clone())
+                    .or_default()
+                    .extend(subjects.iter().cloned());
+            }
+        }
+        for ((subject, predicate), values) in &overlay.add {
+            if subject != entity && values.contains(entity) {
+                reverse
+                    .entry(predicate.clone())
+                    .or_default()
+                    .insert(subject.clone());
+                reverse_overlay.insert(predicate.clone());
+            }
+        }
+        for ((subject, predicate), values) in &overlay.suppress {
+            if subject != entity && values.contains(entity) {
+                if let Some(subjects) = reverse.get_mut(predicate) {
+                    subjects.remove(subject);
+                }
+            }
+        }
+        for (predicate, subjects) in reverse.into_iter().take(2) {
+            let duplicated = self
+                .by_subject
+                .get(entity)
+                .map_or(false, |forward| forward.contains_key(&predicate));
+            if duplicated || subjects.is_empty() {
+                continue;
+            }
+            let subject_list: Vec<String> = subjects.into_iter().collect();
+            let key = ClauseKey {
+                entity: entity.to_string(),
+                kind: ClauseKind::Reverse,
+                predicate: predicate.clone(),
+                qualifier: String::new(),
+            };
+            let sentence = self.lexicalize(
+                &subject_list.join("、"),
+                &predicate,
+                std::slice::from_ref(&entity.to_string()),
+            );
+            clauses.push(ProfileClause {
+                key,
+                sentence,
+                from_overlay: reverse_overlay.contains(&predicate),
+                rank_milli: -1000,
+            });
+        }
+
+        match order {
+            GenerationOrder::Relevance => clauses.sort_by(|a, b| {
+                b.rank_milli
+                    .cmp(&a.rank_milli)
+                    .then_with(|| a.sentence.cmp(&b.sentence))
+                    .then_with(|| a.key.cmp(&b.key))
+            }),
+            GenerationOrder::Alphabetical => clauses.sort_by(|a, b| {
+                a.sentence
+                    .cmp(&b.sentence)
+                    .then_with(|| a.key.cmp(&b.key))
+            }),
+        }
+        Some(clauses)
+    }
+
+    /// 用话语账本生成一页：先补更正/撤回，再讲尚未说过的命题。
+    pub fn cursor_page(
+        &self,
+        entity: &str,
+        order: GenerationOrder,
+        overlay: &GenerationOverlay,
+        cursor: &mut GenerationCursor,
+    ) -> Option<CursorPage> {
+        let clauses = self.profile_clauses_with_overlay(entity, order, overlay)?;
+        let advance = cursor.advance(&clauses, self.max_profile_sentences);
+        let text = if advance.lines.is_empty() {
+            if clauses.is_empty() {
+                format!(
+                    "关于「{}」的知识（{}符号检索生成）：知识图谱中暂无可用事实。",
+                    entity,
+                    self.type_note(entity)
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            self.render_cursor_advance(entity, &advance)
+        };
+        let trusted: Vec<String> = advance
+            .lines
+            .iter()
+            .filter(|line| line.trusted)
+            .map(|line| line.text.clone())
+            .collect();
+        let done = clauses.is_empty()
+            || (advance.fresh == 0 && advance.corrected == 0 && advance.removed == 0);
+        Some(CursorPage {
+            entity: entity.to_string(),
+            text,
+            total_lines: advance.total_lines,
+            shown: advance.lines.len(),
+            next_offset: advance.next_offset,
+            fresh: advance.fresh,
+            corrected: advance.corrected,
+            removed: advance.removed,
+            done,
+            trusted,
+        })
+    }
+
+    fn type_note(&self, entity: &str) -> String {
+        self.entity_types
+            .get(entity)
+            .filter(|t| t.as_str() != "Entity" && t.as_str() != "实体")
+            .map(|t| format!("类型：{}；", localized_type_label(t)))
+            .unwrap_or_default()
+    }
+
+    fn render_cursor_advance(&self, entity: &str, advance: &CursorAdvance) -> String {
+        let mut body = String::new();
+        let mut fresh_ordinal = 0usize;
+        for line in &advance.lines {
+            body.push_str("  ");
+            if line.correction {
+                body.push_str(&line.text);
+            } else {
+                if advance.continuation && fresh_ordinal == 0 {
+                    body.push_str("接着，");
+                } else {
+                    body.push_str(Self::discourse_marker(fresh_ordinal, advance.fresh));
+                }
+                body.push_str(&line.text);
+                fresh_ordinal += 1;
+            }
+            body.push('\n');
+        }
+        let header = if advance.continuation {
+            match advance.span {
+                Some((start, end)) => format!(
+                    "关于「{}」的知识（续：第 {}–{} 句，共 {} 条事实）：\n",
+                    entity,
+                    start + 1,
+                    end,
+                    advance.total_lines
+                ),
+                None => format!(
+                    "关于「{}」的知识（续：更正 {} 条，共 {} 条事实）：\n",
+                    entity,
+                    advance.corrected + advance.removed,
+                    advance.total_lines
+                ),
+            }
+        } else {
+            format!(
+                "关于「{}」的知识（{}符号检索生成，共 {} 条事实）：\n",
+                entity,
+                self.type_note(entity),
+                advance.lines.len()
+            )
+        };
+        format!("{}{}", header, body.trim_end())
     }
 
     fn profile_lines(&self, entity: &str, order: GenerationOrder) -> Option<Vec<FactLine>> {
@@ -1326,6 +1972,163 @@ mod tests {
         assert!(completion.contains("全局回退"), "实际：{}", completion);
         assert!(completion.contains("丙"), "原型不应指向幽灵实体：{}", completion);
         assert!(!completion.contains("甲的朋友"), "{}", completion);
+    }
+
+    #[test]
+    fn test_cursor_does_not_repeat_when_insertion_reorders() {
+        let mut generator = SymbolicGenerator::new(1, 0.3);
+        generator.observe_entity("张三", "人物", &[]);
+        generator.observe_triple("张三", "师傅", "李四");
+        generator.observe_triple("张三", "师祖", "王五");
+        let clauses = generator
+            .profile_clauses("张三", GenerationOrder::Relevance)
+            .unwrap();
+        let mut cursor = GenerationCursor::new("张三", GenerationOrder::Relevance);
+        let first = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut cursor,
+            )
+            .unwrap();
+        assert_eq!(first.shown, 1);
+        let first_sentence = first.trusted.first().cloned().unwrap_or_else(|| {
+            first
+                .text
+                .lines()
+                .find(|line| line.contains('。'))
+                .unwrap()
+                .trim()
+                .to_string()
+        });
+
+        // 新事实插入到排序最前，旧实现会让 offset 指向另一句，导致重复/漏讲。
+        generator.observe_triple("张三", "朋友", "赵六");
+        let second = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut cursor,
+            )
+            .unwrap();
+        assert_eq!(second.shown, 1);
+        assert!(
+            !second.text.contains(first_sentence.trim_start_matches("接着，")),
+            "已说过的句子不应重复：第一页={}；第二页={}",
+            first.text,
+            second.text
+        );
+        assert!(second.text.contains("接着，"), "{}", second.text);
+        // 两轮之后仍未讲完，账本里不能有重复 key。
+        assert_eq!(cursor.spoken_count(), 2);
+        assert_eq!(clauses.len(), 2);
+    }
+
+    #[test]
+    fn test_cursor_reports_updates_and_removals() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("张三", "人物", &[]);
+        generator.observe_triple("张三", "师傅", "李四");
+        let mut cursor = GenerationCursor::new("张三", GenerationOrder::Relevance);
+        let first = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut cursor,
+            )
+            .unwrap();
+        assert!(first.text.contains("李四"));
+
+        assert!(generator.retract_triple("张三", "师傅", "李四"));
+        generator.observe_triple("张三", "师傅", "王五");
+        let second = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut cursor,
+            )
+            .unwrap();
+        assert!(second.text.contains("更正"), "{}", second.text);
+        assert!(second.text.contains("此前说"), "{}", second.text);
+        assert!(second.text.contains("现在更新为"), "{}", second.text);
+        assert!(second.text.contains("王五"), "{}", second.text);
+
+        assert!(generator.retract_triple("张三", "师傅", "王五"));
+        let third = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut cursor,
+            )
+            .unwrap();
+        assert!(third.text.contains("已不再成立"), "{}", third.text);
+    }
+
+    #[test]
+    fn test_cursor_uses_layered_session_overlay() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("张三", "人物", &[]);
+        generator.observe_triple("张三", "师傅", "李四");
+        let mut overlay = GenerationOverlay::default();
+        overlay
+            .replace
+            .insert(("张三".to_string(), "师傅".to_string()), vec!["王五".to_string()]);
+        overlay
+            .suppress
+            .entry(("张三".to_string(), "师傅".to_string()))
+            .or_default()
+            .insert("李四".to_string());
+
+        let clauses = generator
+            .profile_clauses_with_overlay("张三", GenerationOrder::Relevance, &overlay)
+            .unwrap();
+        assert_eq!(clauses.len(), 1);
+        assert!(clauses[0].sentence.contains("王五"));
+        assert!(!clauses[0].sentence.contains("李四"));
+        assert!(clauses[0].from_overlay);
+
+        let mut cursor = GenerationCursor::new("张三", GenerationOrder::Relevance);
+        let page = generator
+            .cursor_page("张三", GenerationOrder::Relevance, &overlay, &mut cursor)
+            .unwrap();
+        assert!(page.text.contains("王五"));
+        assert!(!page.text.contains("李四"));
+        assert_eq!(page.trusted.len(), 1);
+    }
+
+    #[test]
+    fn test_cursor_survives_serialization_and_continues_without_repeat() {
+        let mut generator = SymbolicGenerator::new(1, 0.3);
+        generator.observe_triple("张三", "师傅", "李四");
+        generator.observe_triple("张三", "师祖", "王五");
+        let mut cursor = GenerationCursor::new("张三", GenerationOrder::Relevance);
+        let first = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut cursor,
+            )
+            .unwrap();
+        let encoded = serde_json::to_string(&cursor).expect("账本应可序列化");
+        let mut restored: GenerationCursor = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.spoken_count(), 1);
+        let second = generator
+            .cursor_page(
+                "张三",
+                GenerationOrder::Relevance,
+                &GenerationOverlay::default(),
+                &mut restored,
+            )
+            .unwrap();
+        assert_ne!(first.text, second.text);
+        assert!(second.text.contains("续：第 2–2 句"), "{}", second.text);
+        assert!(!second.text.contains(first.text.lines().last().unwrap()));
     }
 
     #[test]
