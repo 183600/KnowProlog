@@ -1912,6 +1912,23 @@ impl PatternLibrary {
         Some(self.entries.remove(position))
     }
 
+    /// 按精确来源移除条目（如一条锻造规则的全部展开）。
+    pub fn remove_source(&mut self, source: &str) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.source != source);
+        before - self.entries.len()
+    }
+
+    /// 按来源前缀移除条目（如 `induced#forge#` 的全部会话规则）。
+    ///
+    /// 只影响运行时模式库；调用方仍负责同步落图与台账。
+    pub fn remove_source_prefix(&mut self, prefix: &str) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| !entry.source.starts_with(prefix));
+        before - self.entries.len()
+    }
+
     /// 并入外部载入的条目（教学与归纳来源；配置/NLU 每次启动重建）。
     pub fn merge_taught(&mut self, entries: &[PatternEntry]) -> usize {
         let mut merged = 0;

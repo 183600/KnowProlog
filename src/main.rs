@@ -54,6 +54,7 @@ use know_prolog::{
     ontology_reasoning::OntologyProgram,
     ownthink_api::select_candidate_by_context,
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
+    pattern_forge::{self, PatternForge},
     pattern_ir::{self, PatternLibrary},
     perf_ledger::PerfLedger,
     plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
@@ -3615,6 +3616,12 @@ fn persist_acquisition(acquisition: &RelationAcquisition, path: &str) {
     }
 }
 
+fn persist_pattern_forge(forge: &PatternForge, path: &str) {
+    if let Err(error) = forge.save_to_path(path) {
+        eprintln!("锻造台账保存失败：{}", error);
+    }
+}
+
 fn persist_shape_dialogue(dialogue: &ShapeDialogue, path: &str) {
     if let Err(error) = dialogue.save_to_path(path) {
         eprintln!("形状对话状态保存失败：{}", error);
@@ -3717,6 +3724,22 @@ async fn run_interactive_mode(
             }
         }
         _ => {}
+    }
+    // 锻造台账：以会话账本的 active 状态为准，重建模式库里的锻造来源。
+    // 模式落图可能比锻造台账旧（例如上次激活后未同步），先清掉再按 active
+    // 重新物化，避免已退役规则在重启后“复活”。
+    let forge_path = format!("{}/pattern_forge.json", store_path);
+    let mut pattern_forge = PatternForge::load_from_path(&forge_path).unwrap_or_default();
+    pattern_library.remove_source_prefix(pattern_forge::FORGE_SOURCE_PREFIX);
+    for entry in pattern_forge.active_entries() {
+        pattern_library.add(entry);
+    }
+    if !pattern_forge.is_empty() {
+        println!(
+            "已恢复锻造台账：{} 条（激活 {} 条）。可用「锻造台账」查看。",
+            pattern_forge.len(),
+            pattern_forge.active_count()
+        );
     }
     // 模式经验：跨会话恢复「上次怎么理解」的记录（独立于模式定义图）。
     let mut pattern_episodes = pattern_ir::PatternEpisodeLog::default();
@@ -4615,6 +4638,134 @@ async fn run_interactive_mode(
                     scan.scanned()
                 );
             }
+            println!();
+            continue;
+        }
+
+        // 锻造模式：从正例/反例归纳 token 正则，候选需显式确认才参与路由。
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &[
+                "锻造模式：",
+                "锻造模式:",
+                "锻造模式 ",
+                "模式锻造：",
+                "模式锻造:",
+            ],
+        ) {
+            match pattern_forge::parse_forge_spec(spec.trim())
+                .and_then(|request| pattern_forge.forge(&request, &config.nlp))
+            {
+                Ok(outcome) => {
+                    println!("{}", outcome.render());
+                    persist_pattern_forge(&pattern_forge, &forge_path);
+                }
+                Err(error) => println!("锻造失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 确认锻造：候选转正，展开为无分支模式并入统一模式库。
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["确认锻造：", "确认锻造:", "确认锻造 ", "采纳锻造：", "采纳锻造:"],
+        ) {
+            let key = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            if key.is_empty() {
+                println!("用法：确认锻造 <id>（先用「锻造台账」查看候选 id）。");
+            } else {
+                match pattern_forge.activate(key) {
+                    Ok(activation) => {
+                        pattern_library.remove_source(&activation.pattern.source());
+                        for entry in &activation.entries {
+                            pattern_library.add(entry.clone());
+                        }
+                        println!(
+                            "已激活锻造规则 {}「{}」：{} 条展开参与路由（仅本会话来源，可用「退役锻造」撤销）。",
+                            activation.pattern.id,
+                            activation.pattern.name,
+                            activation.entries.len()
+                        );
+                        for entry in &activation.entries {
+                            println!("  - {}（{}）", entry.name, entry.render());
+                        }
+                        match oxigraph_manager
+                            .sync_pattern_ledger(pattern_library.entries())
+                            .await
+                        {
+                            Ok(count) => println!("模式落图：{} 条已同步。", count),
+                            Err(error) => eprintln!("模式落图失败：{}", error),
+                        }
+                        persist_pattern_forge(&pattern_forge, &forge_path);
+                    }
+                    Err(error) => println!("确认锻造失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 退役锻造：停止路由并保留出生档案（可再遗忘）。
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["退役锻造：", "退役锻造:", "退役锻造 ", "停用锻造：", "停用锻造:"],
+        ) {
+            let key = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            match pattern_forge.retire(key) {
+                Ok(pattern) => {
+                    let removed = pattern_library.remove_source(&pattern.source());
+                    println!(
+                        "已退役锻造规则 {}「{}」；从模式库移除 {} 条展开。",
+                        pattern.id, pattern.name, removed
+                    );
+                    match oxigraph_manager
+                        .sync_pattern_ledger(pattern_library.entries())
+                        .await
+                    {
+                        Ok(count) => println!("模式落图：{} 条已同步。", count),
+                        Err(error) => eprintln!("模式落图失败：{}", error),
+                    }
+                    persist_pattern_forge(&pattern_forge, &forge_path);
+                }
+                Err(error) => println!("退役锻造失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 遗忘锻造：彻底删除非激活记录（激活规则必须先退役）。
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["遗忘锻造：", "遗忘锻造:", "遗忘锻造 ", "删除锻造：", "删除锻造:"],
+        ) {
+            let key = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            match pattern_forge.forget(key) {
+                Ok(pattern) => {
+                    let removed = pattern_library.remove_source(&pattern.source());
+                    println!(
+                        "已遗忘锻造规则 {}「{}」（移除 {} 条展开）。",
+                        pattern.id, pattern.name, removed
+                    );
+                    persist_pattern_forge(&pattern_forge, &forge_path);
+                }
+                Err(error) => println!("遗忘锻造失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(
+            input,
+            "锻造台账" | "锻造报告" | "锻造状态" | "模式锻造台账"
+        ) {
+            println!("{}", pattern_forge.report());
             println!();
             continue;
         }
@@ -9496,6 +9647,9 @@ fn interactive_help() -> String {
         "  忘经验：<短 id 或原句>               删除单条经验（撤销误确认/误否定）",
         "  清空模式经验                         清空经验台账并同步命名图",
         "  教模式：名 | 要素… | 路由 | 优先级 | 守卫  教一条模式（可选上下文守卫，落图持久化）",
+        "  锻造模式：名 | 正例 | 反例(可空) | 路由 | 优先级 | 守卫  从例子归纳 token 正则（候选）",
+        "  确认锻造 <id> / 退役锻造 <id> / 遗忘锻造 <id>  候选转正、停止路由、彻底删除",
+        "  锻造台账                            例子、正则、探针、命中/反驳与生命周期",
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
@@ -10088,6 +10242,30 @@ fn is_command_like(input: &str) -> bool {
         "教模式 ",
         "教学模式：",
         "教学模式:",
+        "锻造模式：",
+        "锻造模式:",
+        "锻造模式 ",
+        "模式锻造：",
+        "模式锻造:",
+        "确认锻造：",
+        "确认锻造:",
+        "确认锻造 ",
+        "采纳锻造：",
+        "采纳锻造:",
+        "退役锻造：",
+        "退役锻造:",
+        "退役锻造 ",
+        "停用锻造：",
+        "停用锻造:",
+        "遗忘锻造：",
+        "遗忘锻造:",
+        "遗忘锻造 ",
+        "删除锻造：",
+        "删除锻造:",
+        "锻造台账",
+        "锻造报告",
+        "锻造状态",
+        "模式锻造台账",
         "忘模式：",
         "忘模式:",
         "忘模式 ",
