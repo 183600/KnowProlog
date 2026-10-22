@@ -891,69 +891,7 @@ impl AdvancedNLU {
     }
 
     fn chinese_numeral_to_arabic(text: &str) -> Option<u64> {
-        fn digit(ch: char) -> Option<u64> {
-            match ch {
-                '零' | '〇' => Some(0),
-                '一' | '壹' => Some(1),
-                '二' | '两' | '贰' => Some(2),
-                '三' | '叁' => Some(3),
-                '四' | '肆' => Some(4),
-                '五' | '伍' => Some(5),
-                '六' | '陆' => Some(6),
-                '七' | '柒' => Some(7),
-                '八' | '捌' => Some(8),
-                '九' | '玖' => Some(9),
-                _ => None,
-            }
-        }
-        fn unit(ch: char) -> Option<u64> {
-            match ch {
-                '十' | '拾' => Some(10),
-                '百' | '佰' => Some(100),
-                '千' | '仟' => Some(1000),
-                _ => None,
-            }
-        }
-        if text.is_empty() {
-            return None;
-        }
-        let mut total: u64 = 0;
-        let mut section: u64 = 0;
-        let mut current: u64 = 0;
-        for ch in text.chars() {
-            if let Some(d) = digit(ch) {
-                // 连续数字按位拼接（「一九九八」→ 1998），而非只保留最后一位
-                current = current.checked_mul(10)?.checked_add(d)?;
-            } else if let Some(u) = unit(ch) {
-                if current == 0 {
-                    current = 1;
-                }
-                section = section.checked_add(current.checked_mul(u)?)?;
-                current = 0;
-            } else if ch == '万' {
-                // 与十/百/千 一致：整串只有「万」时省略的前导数字按 1 计
-                // （累计值非零时「一万亿」等写法已有前导数值，不能补 1）
-                if total == 0 && section == 0 && current == 0 {
-                    current = 1;
-                }
-                section = section.checked_add(current)?;
-                total = total.checked_add(section.checked_mul(10000)?)?;
-                section = 0;
-                current = 0;
-            } else if ch == '亿' {
-                // 亿作用于其之前累积的整个数值段（如「一万亿」= 1 万亿）
-                if total == 0 && section == 0 && current == 0 {
-                    current = 1;
-                }
-                section = section.checked_add(current)?;
-                total = total.checked_add(section)?.checked_mul(100_000_000)?;
-                section = 0;
-                current = 0;
-            } else {
-                return None;
-            }
-        }
-        total.checked_add(section)?.checked_add(current)
+        crate::chinese_reasoning_nlu::parse_chinese_number_u64(text)
     }
 
     async fn extract_temporal_entities(

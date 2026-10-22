@@ -132,60 +132,92 @@ fn is_cn_digit(ch: char) -> bool {
     )
 }
 
-/// 中文数字 → 整数（支持到千位：十五、二十、八十五、一百零八、九十九…）
-pub fn parse_chinese_number(text: &str) -> Option<u32> {
+/// 中文数字 → 整数（支持十五、一百零八、一九九八、一万二千、三亿…）。
+///
+/// 连续数字按位拼接（「一九九八」→ 1998），十/百/千按位值累加，
+/// 万/亿作为节权：`亿` 作用于其之前累计的整个数值段。
+/// 返回 `None` 表示不是可解析的数字，调用方不得把未知文本猜成 0。
+pub fn parse_chinese_number_u64(text: &str) -> Option<u64> {
+    fn digit(ch: char) -> Option<u64> {
+        match ch {
+            '零' | '〇' => Some(0),
+            '一' | '壹' => Some(1),
+            '二' | '两' | '贰' => Some(2),
+            '三' | '叁' => Some(3),
+            '四' | '肆' => Some(4),
+            '五' | '伍' => Some(5),
+            '六' | '陆' => Some(6),
+            '七' | '柒' => Some(7),
+            '八' | '捌' => Some(8),
+            '九' | '玖' => Some(9),
+            _ => None,
+        }
+    }
+    fn unit(ch: char) -> Option<u64> {
+        match ch {
+            '十' | '拾' => Some(10),
+            '百' | '佰' => Some(100),
+            '千' | '仟' => Some(1000),
+            _ => None,
+        }
+    }
+
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
     if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        return trimmed.parse::<u32>().ok();
+        return trimmed.parse::<u64>().ok();
     }
-    let mut result: u32 = 0;
-    let mut current: u32 = 0;
-    let mut seen_digit = false;
+
+    let mut total: u64 = 0;
+    let mut section: u64 = 0;
+    let mut current: u64 = 0;
+    let mut seen = false;
     for ch in trimmed.chars() {
-        let digit = match ch {
-            '零' | '〇' => {
-                seen_digit = true;
-                continue;
+        if let Some(value) = digit(ch) {
+            current = current.checked_mul(10)?.checked_add(value)?;
+            seen = true;
+        } else if let Some(scale) = unit(ch) {
+            if current == 0 {
+                current = 1;
             }
-            '一' => 1,
-            '二' | '两' => 2,
-            '三' => 3,
-            '四' => 4,
-            '五' => 5,
-            '六' => 6,
-            '七' => 7,
-            '八' => 8,
-            '九' => 9,
-            '十' => {
-                result += if current == 0 { 10 } else { current * 10 };
-                current = 0;
-                seen_digit = true;
-                continue;
+            section = section.checked_add(current.checked_mul(scale)?)?;
+            current = 0;
+            seen = true;
+        } else if ch == '万' {
+            // 「万」只对当前节生效；整串只有「万」时省略的前导数字按 1 计。
+            if current == 0 && section == 0 {
+                current = 1;
             }
-            '百' => {
-                result += if current == 0 { 100 } else { current * 100 };
-                current = 0;
-                seen_digit = true;
-                continue;
+            section = section.checked_add(current)?;
+            total = total.checked_add(section.checked_mul(10_000)?)?;
+            section = 0;
+            current = 0;
+            seen = true;
+        } else if ch == '亿' {
+            // 「亿」作用于其之前累计的整个数值段（「一万亿」= 1 万亿）。
+            if total == 0 && section == 0 && current == 0 {
+                current = 1;
             }
-            '千' => {
-                result += if current == 0 { 1000 } else { current * 1000 };
-                current = 0;
-                seen_digit = true;
-                continue;
-            }
-            _ => return None,
-        };
-        if seen_digit && current != 0 {
+            section = section.checked_add(current)?;
+            total = total.checked_add(section)?.checked_mul(100_000_000)?;
+            section = 0;
+            current = 0;
+            seen = true;
+        } else {
             return None;
         }
-        current = digit;
-        seen_digit = true;
     }
-    Some(result + current)
+    if !seen {
+        return None;
+    }
+    total.checked_add(section)?.checked_add(current)
+}
+
+/// 中文数字 → u32（保持旧 API；超出 u32 范围时返回 `None`）。
+pub fn parse_chinese_number(text: &str) -> Option<u32> {
+    u32::try_from(parse_chinese_number_u64(text)?).ok()
 }
 
 /// 从句子中抽取概率（显式百分数优先于模糊量词），返回（概率, 去掉概率词后的句子）
@@ -951,6 +983,20 @@ mod tests {
         assert_eq!(parse_chinese_number("一百零八"), Some(108));
         assert_eq!(parse_chinese_number("80"), Some(80));
         assert_eq!(parse_chinese_number("汉"), None);
+        // 逐位读法与节权：一九九八 / 二〇二四 / 一万二千 / 三亿
+        assert_eq!(parse_chinese_number_u64("一九九八"), Some(1998));
+        assert_eq!(parse_chinese_number_u64("二〇二四"), Some(2024));
+        assert_eq!(parse_chinese_number_u64("一万二千"), Some(12_000));
+        assert_eq!(parse_chinese_number_u64("三亿"), Some(300_000_000));
+        assert_eq!(parse_chinese_number_u64("一万亿"), Some(1_000_000_000_000));
+        assert_eq!(parse_chinese_number_u64("壹佰贰拾"), Some(120));
+        assert_eq!(parse_chinese_number_u64("五十亿"), Some(5_000_000_000));
+        assert_eq!(
+            parse_chinese_number("五十亿"),
+            None,
+            "超出 u32 的中文数字不应被截断"
+        );
+        assert_eq!(parse_chinese_number_u64("汉"), None);
     }
 
     #[test]
