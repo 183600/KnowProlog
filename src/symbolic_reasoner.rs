@@ -10062,7 +10062,7 @@ impl SymbolicReasoner {
     ///
     /// 不新增事实，也不把链接预测候选当成答案；只使用可确证的证明路径。
     pub fn resolve_pending_after_assertion(&mut self) -> Option<String> {
-        if self.pending_questions.is_empty() {
+        if !self.pending_questions.has_active() {
             return None;
         }
         let pending = self.pending_questions.questions().to_vec();
