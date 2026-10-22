@@ -483,11 +483,12 @@ impl SlotTransition {
                 self.step
             ),
             SlotDelta::NeedsConfirmation { current, requested } => format!(
-                "「{}」当前采用「{}」，与新的取值「{}」冲突；本次未写入。若确认改口，请用「改口：{} = {}」。",
+                "「{}」当前采用「{}」，与新的取值「{}」冲突；本次未写入。若确认改口，请用「改口：{}的{}是{}」。",
                 self.slot_label(),
                 current.join(" / "),
                 requested,
                 self.key.subject,
+                self.key.predicate,
                 requested
             ),
             SlotDelta::HearsayRecorded => format!(
@@ -1363,6 +1364,11 @@ mod tests {
         assert_eq!(ledger.accepted("姚明", "身高"), vec!["226"]);
         assert_eq!(ledger.step(), step_before, "提问不得推进状态");
         assert!(transition.render_zh().contains("改口"));
+        assert!(
+            transition.render_zh().contains("改口：姚明的身高是229"),
+            "建议命令必须可直接执行：{}",
+            transition.render_zh()
+        );
     }
 
     #[test]
