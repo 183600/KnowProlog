@@ -637,9 +637,17 @@ impl QueryPlanner {
         if subject.is_empty() || Self::is_question_word(&subject) {
             return None;
         }
-        Some(QueryPlan::FindObject {
-            segments: vec![subject, label.to_string()],
-        })
+        // 主体本身可以是「叶莉的先生」这样的链：必须按「的」拆成段，
+        // 否则整条链会被当成一个实体名，多跳证据闸门也会失效。
+        let mut segments = Self::segments_of(&subject);
+        if segments.is_empty() {
+            return None;
+        }
+        segments.push(label.to_string());
+        if segments.len() < 2 || segments.len() > self.max_chain {
+            return None;
+        }
+        Some(QueryPlan::FindObject { segments })
     }
 
     fn parse_find_subject(&self, q: &str) -> Option<QueryPlan> {
@@ -2258,6 +2266,20 @@ mod tests {
             QueryPlan::FindObject {
                 segments: vec!["李四".to_string(), "出生地".to_string()]
             }
+        );
+        let chain = planner()
+            .parse("叶莉的先生的身高是多少")
+            .expect("多跳属性问句应可解析");
+        assert_eq!(
+            chain,
+            QueryPlan::FindObject {
+                segments: vec![
+                    "叶莉".to_string(),
+                    "先生".to_string(),
+                    "身高".to_string()
+                ]
+            },
+            "主体链必须按「的」拆段"
         );
     }
 
