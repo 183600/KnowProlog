@@ -5596,7 +5596,8 @@ impl SymbolicReasoner {
             output.push_str(&format!("  {} 是 {}。", chain_text, hit.value));
             if let Some(prediction) = &hit.prediction {
                 output.push_str(&format!(
-                    "\n  推理依据：{}",
+                    "\n  推理依据（推断，待确认，置信度 {:.2}）：{}",
+                    prediction.confidence,
                     self.predictor.explain(prediction)
                 ));
             } else if let Some(law_id) = &hit.law {
@@ -7073,6 +7074,19 @@ impl SymbolicReasoner {
             self.record_read_failure(question);
         }
         answer
+    }
+
+    /// 只要可确证的回答：不把链接预测列表当作确定答案。
+    ///
+    /// 对话层用它与恢复阶梯衔接：确证失败后由 L2 提名、验证、追问，
+    /// 而不是把候选列表直接当结论输出。
+    pub fn answer_certain(&self, question: &str) -> Option<String> {
+        if let Some(answer) = self.answer_planned(question) {
+            if !answer.contains("置信度") && !answer.contains("链接预测") {
+                return Some(answer);
+            }
+        }
+        self.answer_by_evidence(question)
     }
 
     /// 句法重写回执：展示「哪种句法外壳被压成哪个逻辑计划」。
@@ -14343,6 +14357,35 @@ types = [
         // 观测不改变回答路径：普通闭包/多跳问句仍走原实现。
         let answer = reasoner.answer("张三的师傅的师傅是谁");
         assert!(answer.is_some(), "原多跳回答不应被追踪改变");
+    }
+
+    #[test]
+    fn answer_certain_does_not_treat_link_prediction_as_answer() {
+        let mut config = test_config();
+        config.link_prediction_min_confidence = 0.1;
+        let mut facts = master_facts();
+        for (from, to) in [("孙八", "周九"), ("周九", "吴十")] {
+            facts.push(PrologFact::Relation {
+                from: from.to_string(),
+                rel_type: "师傅".to_string(),
+                to: to.to_string(),
+            });
+        }
+        let reasoner = {
+            let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+            reasoner.observe_facts(&facts);
+            reasoner
+        };
+        let full = reasoner.answer("孙八的师祖是谁").expect("预测通道应有候选");
+        assert!(
+            full.contains("待确认") && full.contains("置信度"),
+            "{}",
+            full
+        );
+        assert!(
+            reasoner.answer_certain("孙八的师祖是谁").is_none(),
+            "确认前的预测不得走确证通道"
+        );
     }
 
     #[test]

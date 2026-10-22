@@ -207,8 +207,14 @@ pub trait DialogueKnowledge {
     fn entities_in(&self, text: &str) -> Vec<String>;
     /// 实体是否在本体/图谱中登记。
     fn known_entity(&self, entity: &str) -> bool;
-    /// 对规范化问句作答。
+    /// 对规范化问句作答（可包含链接预测等推测性内容）。
     fn answer(&self, question: &str) -> Option<String>;
+
+    /// 只返回可确证的回答；推测内容留给恢复阶梯以「候选 + 确认」呈现。
+    /// 缺省与 [`Self::answer`] 相同，保持既有知识源行为不变。
+    fn answer_certain(&self, question: &str) -> Option<String> {
+        self.answer(question)
+    }
     /// 为问句重建一条有界推导；`expected_answer` 用于把证明锚定到上一轮
     /// 的实际回答，匹配不上时返回 None（宁可不解释，也不挂错证明）。
     fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
@@ -378,6 +384,10 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn answer(&self, question: &str) -> Option<String> {
         SymbolicReasoner::answer(self, question)
+    }
+
+    fn answer_certain(&self, question: &str) -> Option<String> {
+        SymbolicReasoner::answer_certain(self, question)
     }
 
     fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
@@ -2032,10 +2042,13 @@ impl DialogueManager {
             .cloned()
             .collect();
         let mut answer: Option<String> = if known {
-            frame
-                .question
-                .as_deref()
-                .and_then(|question| knowledge.answer(question))
+            frame.question.as_deref().and_then(|question| {
+                if self.recovery_mode.acts() {
+                    knowledge.answer_certain(question)
+                } else {
+                    knowledge.answer(question)
+                }
+            })
         } else {
             None
         };
@@ -3061,7 +3074,12 @@ impl DialogueManager {
         attribute: &str,
     ) -> Option<String> {
         let question = format!("{}的{}是什么", entity, attribute);
-        if let Some(answer) = knowledge.answer(&question) {
+        let answer = if self.recovery_mode.acts() {
+            knowledge.answer_certain(&question)
+        } else {
+            knowledge.answer(&question)
+        };
+        if let Some(answer) = answer {
             return Some(answer);
         }
         let values = knowledge.attribute_values(entity, attribute);
@@ -4914,6 +4932,88 @@ output = "value"
         assert_eq!(card.scope_leaks(), 0);
         assert_eq!(card.missing_evidence(), 0);
         assert_eq!(manager.focus_entity(), Some("姚明"));
+    }
+
+    struct TentativeKnowledge {
+        base: MockKnowledge,
+    }
+
+    impl DialogueKnowledge for TentativeKnowledge {
+        fn entities_in(&self, text: &str) -> Vec<String> {
+            self.base.entities_in(text)
+        }
+
+        fn known_entity(&self, entity: &str) -> bool {
+            self.base.known_entity(entity)
+        }
+
+        fn answer(&self, _question: &str) -> Option<String> {
+            Some("根据知识图谱的链接预测（符号推理）：\n  • 体重(姚明, 140公斤)".to_string())
+        }
+
+        fn answer_certain(&self, _question: &str) -> Option<String> {
+            None
+        }
+
+        fn known_attributes(&self, entity: &str) -> Vec<String> {
+            self.base.known_attributes(entity)
+        }
+
+        fn attribute_values(&self, entity: &str, attribute: &str) -> Vec<String> {
+            self.base.attribute_values(entity, attribute)
+        }
+
+        fn recovery_nominations(
+            &self,
+            entity: &str,
+            attribute: &str,
+        ) -> Vec<RecoveryNomination> {
+            self.base.recovery_nominations(entity, attribute)
+        }
+    }
+
+    #[test]
+    fn prediction_is_not_treated_as_certain_in_recovery_mode() {
+        let knowledge = TentativeKnowledge {
+            base: mock()
+                .with_entity("姚明", &["体重"])
+                .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据"),
+        };
+
+        let mut off = DialogueManager::new();
+        let direct = off
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("Off 模式保持既有输出");
+        assert!(direct.text.contains("链接预测"), "{}", direct.text);
+        assert!(
+            off.last_recovery().is_none(),
+            "Off 模式不应产生恢复视图"
+        );
+
+        let mut on = DialogueManager::new();
+        on.set_recovery_mode(RecoveryMode::On);
+        let reply = on
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("推测轮应被接管");
+        assert!(
+            reply.text.contains("推测") && reply.text.contains("140公斤"),
+            "预测必须以推测 + 候选呈现：{}",
+            reply.text
+        );
+        assert!(
+            reply.text.contains("依据") && reply.text.contains("链接预测"),
+            "推测必须带证据：{}",
+            reply.text
+        );
+        assert!(
+            !reply.text.starts_with("根据知识图谱的链接预测"),
+            "候选列表不得原样冒充确定答案：{}",
+            reply.text
+        );
+        let notice = on.last_recovery().expect("应产生恢复视图");
+        assert_eq!(notice.status, EpistemicStatus::Provisional);
+        assert_eq!(notice.level, "L2");
+        assert_eq!(on.recovery_state().pending.len(), 1);
     }
 
     #[test]
