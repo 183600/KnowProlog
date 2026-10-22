@@ -177,6 +177,9 @@ impl QueryPlanner {
         if let Some(plan) = self.parse_count(&q) {
             return Some(plan);
         }
+        if let Some(plan) = self.parse_find_subject_except(&q) {
+            return Some(plan);
+        }
         if let Some(plan) = self.parse_find_subject(&q) {
             return Some(plan);
         }
@@ -554,18 +557,59 @@ impl QueryPlanner {
                 return Self::find_subject_plan(predicate, object);
             }
         }
-        // 「身高是226的人是谁」把谓词放在句首：与「谁的身高是226」
-        // 是同一逻辑计划，只是表层语序不同。
-        for suffix in ["的人是谁", "的人有谁", "的人有哪些", "的人分别是谁"] {
-            let Some(rest) = q.strip_suffix(suffix) else {
-                continue;
-            };
-            let split = rest.split_once('是').or_else(|| rest.split_once('为'));
-            if let Some((predicate, object)) = split {
-                return Self::find_subject_plan(predicate, object);
-            }
+        self.parse_predicate_object_plan(q)
+    }
+
+    /// 「身高是226的人是谁」把谓词放在句首：与「谁的身高是226」
+    /// 是同一逻辑计划，只是表层语序不同。
+    fn parse_predicate_object_plan(&self, q: &str) -> Option<QueryPlan> {
+        let core = ["的人是谁", "的人有谁", "的人有哪些", "的人分别是谁"]
+            .iter()
+            .find_map(|suffix| q.strip_suffix(suffix))
+            .unwrap_or(q);
+        let (predicate, object) = core
+            .split_once('是')
+            .or_else(|| core.split_once('为'))?;
+        Self::find_subject_plan(predicate, object)
+    }
+
+    /// 「除了姚明还有谁身高是213」：排除项 + 主体反查。
+    fn parse_find_subject_except(&self, q: &str) -> Option<QueryPlan> {
+        let after = q
+            .strip_prefix("除了")
+            .or_else(|| q.strip_prefix("除"))?
+            .trim_start_matches(['，', ',', '、', ' ']);
+        let (excluded_text, inner) = ["还有哪些人", "还有哪个人", "还有哪些", "还有谁", "还有"]
+            .iter()
+            .find_map(|marker| {
+                after
+                    .find(marker)
+                    .map(|position| (&after[..position], &after[position + marker.len()..]))
+            })?;
+        let excluded: Vec<String> = excluded_text
+            .split(['、', '和', '与', '及', '跟'])
+            .map(|entity| entity.trim().trim_matches(['，', ',', '、', ' ']))
+            .filter(|entity| !entity.is_empty())
+            .map(str::to_string)
+            .collect();
+        if excluded.is_empty() {
+            return None;
         }
-        None
+        let inner = inner.trim_start_matches(['，', ',', '、', ' ']);
+        let inner = inner.strip_prefix('谁').unwrap_or(inner);
+        let inner = inner.trim_start_matches('的').trim();
+        if inner.is_empty() {
+            return None;
+        }
+        let QueryPlan::FindSubject { object, predicate } = self.parse_predicate_object_plan(inner)?
+        else {
+            return None;
+        };
+        Some(QueryPlan::FindSubjectExcept {
+            object,
+            predicate,
+            excluded,
+        })
     }
 
     fn find_subject_plan(predicate: &str, object: &str) -> Option<QueryPlan> {
@@ -1396,6 +1440,32 @@ mod tests {
         );
         assert!(planner().parse("今天天气怎么样").is_none());
         assert!(planner().parse("地球多大").is_some(), "映射后仍需由知识侧决定是否有「年龄」");
+    }
+
+    #[test]
+    fn test_find_subject_except_accepts_predicate_first_phrasing() {
+        let plan = planner()
+            .parse("除了姚明还有谁身高是213")
+            .expect("应编译为带排除项的主体反查");
+        assert_eq!(
+            plan,
+            QueryPlan::FindSubjectExcept {
+                object: "213".to_string(),
+                predicate: "身高".to_string(),
+                excluded: vec!["姚明".to_string()],
+            }
+        );
+        let multiple = planner()
+            .parse("除了姚明和王治郅，还有谁的身高是213")
+            .expect("多个排除项应可解析");
+        assert_eq!(
+            multiple,
+            QueryPlan::FindSubjectExcept {
+                object: "213".to_string(),
+                predicate: "身高".to_string(),
+                excluded: vec!["姚明".to_string(), "王治郅".to_string()],
+            }
+        );
     }
 
     #[test]

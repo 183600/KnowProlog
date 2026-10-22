@@ -15624,6 +15624,11 @@ types = [
                 properties: HashMap::from([("身高".to_string(), "190".to_string())]),
             },
             PrologFact::Entity {
+                name: "易建联".to_string(),
+                entity_type: "person".to_string(),
+                properties: HashMap::from([("身高".to_string(), "213".to_string())]),
+            },
+            PrologFact::Entity {
                 name: "张三".to_string(),
                 entity_type: "person".to_string(),
                 properties: HashMap::from([("height".to_string(), "180".to_string())]),
@@ -15653,6 +15658,17 @@ types = [
             .answer("姚明是哪国人")
             .expect("国籍问法应落到国籍属性");
         assert!(nationality.contains("中国"), "{}", nationality);
+
+        let except = reasoner
+            .answer("除了姚明还有谁身高是213")
+            .expect("带排除项的主体反查应可回答");
+        assert!(except.contains("易建联"), "{}", except);
+        assert!(
+            !except.lines().next().unwrap_or_default().contains("姚明"),
+            "排除项不得出现在答案主体中：{}",
+            except
+        );
+        assert!(except.contains("已排除：姚明"), "{}", except);
 
         let english_key = reasoner
             .answer("谁的身高是180")
