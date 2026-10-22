@@ -10022,7 +10022,9 @@ impl SymbolicReasoner {
         let mut unresolved: Vec<PendingQuestion> = Vec::new();
         let mut resolved: Vec<String> = Vec::new();
         for question in pending {
-            match self.answer_certain(&question.question) {
+            // 只用原目标的可确证计划回答，避免把「证据索引」的邻近事实
+            // 伪装成延期回答；候选列表也不进入此路径。
+            match self.answer_planned(&question.question) {
                 Some(answer) if !Self::is_pending_failure(&answer) => {
                     resolved.push(format!(
                         "你之前问的「{}」，现在可以回答了：\n{}",
@@ -14774,6 +14776,11 @@ mod tests {
             .expect("新断言补上洞后应给出延期回答");
         assert!(deferred.contains("现在可以回答了"), "{}", deferred);
         assert!(deferred.contains("王五"), "{}", deferred);
+        assert!(
+            deferred.contains("路径") || deferred.contains("结论"),
+            "延期回答必须是原目标的证明，而不是邻近证据：{}",
+            deferred
+        );
         assert!(!reasoner.has_pending_question());
     }
 

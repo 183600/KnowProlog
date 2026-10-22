@@ -4057,11 +4057,29 @@ async fn run_ask(
         if is_ask_terminator(&question) {
             break;
         }
-        let answer = dialogue
+        // 悬问回填：脚本输入里的下一行短答直接绑定到上一轮缺失前提。
+        if reasoner.has_pending_question() {
+            if let Some(deferred) = reasoner.try_answer_pending_question(&question) {
+                answers.push(AskAnswer {
+                    question,
+                    status: "answered",
+                    answer: Some(deferred),
+                });
+                continue;
+            }
+        }
+        let mut answer = dialogue
             .plan_pure_dialogue(&question, &reasoner)
             .or_else(|| dialogue.plan_reply(&question, &reasoner))
             .map(|reply| reply.text)
             .or_else(|| reasoner.answer(&question));
+        if let Some(text) = &answer {
+            if is_no_record_text(text) {
+                if let Some(prompt) = reasoner.open_pending_question(&question) {
+                    answer = Some(format!("{}\n{}", text, prompt));
+                }
+            }
+        }
         answers.push(AskAnswer {
             question,
             status: if answer.is_some() {
@@ -5595,6 +5613,9 @@ async fn run_interactive_mode(
                 Some(proposal) => {
                     let answer = symbolic_reasoner.assert_nl_fact(&proposal.sentence);
                     println!("{}", answer);
+                    if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
+                        println!("{}", deferred);
+                    }
                     if acquisition.mark_admitted(&proposal.claim_id) {
                         println!(
                             "已采纳 {}：{}（会话覆盖层仍可回溯；未写入知识图谱）。",
@@ -6815,6 +6836,9 @@ async fn run_interactive_mode(
                 Some(text) => println!("{}", text),
                 None => println!("（澄清会话已结束）"),
             }
+            if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
+                println!("{}", deferred);
+            }
             println!();
             continue;
         }
@@ -7813,6 +7837,10 @@ async fn run_interactive_mode(
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 let answer = symbolic_reasoner.assert_nl_fact(target);
                 println!("{}", answer);
+                if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
+                    println!("{}", deferred);
+                    log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                }
                 let effects = conversation_theory::effects_from_text(
                     target,
                     conversation_theory::EffectOp::Add,
@@ -8642,15 +8670,20 @@ async fn run_interactive_mode(
             ],
         ) {
             match parse_hypothesis_index(target) {
-                Some(index) => println!(
-                    "{}",
-                    symbolic_reasoner
-                        .adopt_hypothesis(index)
-                        .unwrap_or_else(|| format!(
-                            "没有第 {} 条待定假设；可用「待定假设」查看列表。",
-                            index
-                        ))
-                ),
+                Some(index) => {
+                    println!(
+                        "{}",
+                        symbolic_reasoner
+                            .adopt_hypothesis(index)
+                            .unwrap_or_else(|| format!(
+                                "没有第 {} 条待定假设；可用「待定假设」查看列表。",
+                                index
+                            ))
+                    );
+                    if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
+                        println!("{}", deferred);
+                    }
+                }
                 None => println!(
                     "请给出假设编号，例如：采纳假设 1。当前待定假设：\n{}",
                     symbolic_reasoner.pending_hypotheses_report()
@@ -8792,6 +8825,29 @@ async fn run_interactive_mode(
                 Ok(result) => println!("{}", result.render_text()),
                 Err(e) => println!("SPARQL 查询失败：{}", e),
             }
+            println!();
+            continue;
+        }
+
+        // 悬问回填：上一轮追问过「缺哪条前提」，本轮短答直接绑定并延期回答。
+        // 命令、新问句与导入行一律放行，避免劫持正常对话。
+        if symbolic_reasoner.has_pending_question() && !is_command_like(input) {
+            if let Some(deferred) = symbolic_reasoner.try_answer_pending_question(input) {
+                println!("{}", deferred);
+                log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                println!();
+                continue;
+            }
+        }
+
+        // 悬问台账：欠用户答案的问题与缺失前提；可显式放弃（不设 TTL）。
+        if matches!(input, "悬问" | "未答之问" | "悬问报告" | "悬问台账") {
+            println!("{}", symbolic_reasoner.pending_question_report());
+            println!();
+            continue;
+        }
+        if matches!(input, "放弃悬问" | "清空悬问" | "放弃未答之问") {
+            println!("{}", symbolic_reasoner.abandon_pending_questions());
             println!();
             continue;
         }
@@ -9204,7 +9260,13 @@ async fn run_interactive_mode(
                     )
                     .await;
                     if let Some(reply) = dialogue_manager.plan_reply(input, &symbolic_reasoner) {
-                        let text = plugin_runtime.style_wrap(&reply.text);
+                        let mut text = plugin_runtime.style_wrap(&reply.text);
+                        if is_no_record_text(&text) {
+                            if let Some(prompt) = symbolic_reasoner.open_pending_question(input) {
+                                text.push('\n');
+                                text.push_str(&prompt);
+                            }
+                        }
                         println!("{}", text);
                         let provenance: Vec<String> = dialogue_manager
                             .turns()
@@ -10398,6 +10460,8 @@ fn interactive_help() -> String {
         "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
         "",
         "台账与报告",
+        "  悬问 / 未答之问 / 悬问报告           欠用户答案的目标与缺失前提",
+        "  放弃悬问 / 清空悬问                  显式放弃全部悬问（不写否定事实）",
         "  对话记忆 / 帧记忆 / 对话本体          对话状态、挂账帧与策略程序",
         "  追踪报告 / 指代轨迹 / 问据栈          分层追踪：问据栈、指代绑定与逐轮决策",
         "  追踪为什么 <编号>                     沿追踪图回溯某决策的依据链",
@@ -10541,6 +10605,11 @@ async fn try_symbolic_reasoning(
                 combined.push('\n');
                 combined.push_str(&supplement);
             }
+            // 失败即立悬问：记住「目标 + 缺哪条前提」，下一轮补上后延期回答。
+            if let Some(prompt) = symbolic_reasoner.open_pending_question(input) {
+                combined.push('\n');
+                combined.push_str(&prompt);
+            }
             return Some(combined);
         }
         return Some(answer);
@@ -10552,6 +10621,10 @@ async fn try_symbolic_reasoning(
     // 仍无结果时：默认逻辑（非单调常识）补充证据，避免结果抽取断层
     if let Some(supplement) = symbolic_reasoner.default_logic_supplement(input) {
         return Some(supplement);
+    }
+    // 逻辑问答失败时，先记住缺哪条前提（悬问），再尝试连贯叙述。
+    if let Some(prompt) = symbolic_reasoner.open_pending_question(input) {
+        return Some(prompt);
     }
     // 逻辑问答失败时，优先用 OWL+DCG 话语引擎做连贯叙述，
     // 再回退到"知识图谱即语言模型"的统计生成式介绍
@@ -10581,6 +10654,14 @@ fn run_prolog_query(
 fn contains_question_marker(text: &str) -> bool {
     // 疑问词识别走虚词算符表（含同形守卫）
     know_prolog::function_words::contains_question_marker(text)
+}
+
+/// 回答是否表示「知识库没有依据」：只有这种失败才立悬问。
+fn is_no_record_text(text: &str) -> bool {
+    text.contains("没有记录")
+        || text.contains("没有相关记录")
+        || text.contains("没有可用依据")
+        || text.contains("数量为 0")
 }
 
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
@@ -10819,6 +10900,10 @@ fn is_command_like(input: &str) -> bool {
         "证明档案",
         "证明记录",
         "证明编号",
+        "悬问",
+        "未答之问",
+        "放弃悬问",
+        "清空悬问",
         "一致性",
         "回答一致性",
         "改口检查",
