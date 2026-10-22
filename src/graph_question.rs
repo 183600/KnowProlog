@@ -432,52 +432,45 @@ impl PatternLexicon {
         let left = &question[..position];
         let right = &question[position + marker.len()..];
         let mentions = self.entity_mentions(left);
-        let (first, second, second_variable) = match mentions.as_slice() {
-            [first, second, ..] => {
-                let surface = &left[first.start..first.end()];
-                let canonical = first.canonical(self, surface).to_string();
-                let second_surface = &left[second.start..second.end()];
-                let second_canonical = second.canonical(self, second_surface).to_string();
-                (canonical, second_canonical, None)
-            }
-            [first] if contains_question_word(&left[first.end()..]) => {
-                let surface = &left[first.start..first.end()];
-                let canonical = first.canonical(self, surface).to_string();
-                (
-                    canonical,
-                    "person2".to_string(),
-                    Some("person2".to_string()),
-                )
-            }
-            _ => return None,
-        };
-
-        let tail = if mentions.len() >= 2 {
-            &left[mentions[1].end()..]
-        } else {
-            right
-        };
+        if mentions.is_empty() {
+            return None;
+        }
+        // 所有列出的实体都必须进入同一组等值边。「张三、李四和王五的
+        // 出生地相同吗」不能只比较前两个人而静默丢掉王五。
+        let canonicals: Vec<String> = mentions
+            .iter()
+            .map(|mention| {
+                let surface = &left[mention.start..mention.end()];
+                mention.canonical(self, surface).to_string()
+            })
+            .collect();
+        let asks_for_other = mentions.len() == 1
+            && contains_question_word(&left[mentions[0].end()..]);
+        if mentions.len() == 1 && !asks_for_other {
+            return None;
+        }
+        let tail = &left[mentions[mentions.len() - 1].end()..];
         let (_, _, predicate) = self
             .longest_predicate(tail)
             .or_else(|| self.longest_predicate(right))?;
         let value = "value".to_string();
-        let mut edges = vec![EdgePattern::const_var(&first, &predicate, &value)];
-        if let Some(variable) = &second_variable {
-            edges.push(EdgePattern::var_var(variable, &predicate, &value));
+        let mut edges = Vec::new();
+        let mut subjects = Vec::new();
+        let mut select = vec![value.clone()];
+        if asks_for_other {
+            let variable = "person2".to_string();
+            edges.push(EdgePattern::const_var(&canonicals[0], &predicate, &value));
+            edges.push(EdgePattern::var_var(&variable, &predicate, &value));
+            subjects.push(canonicals[0].clone());
+            subjects.push(variable.clone());
+            select = vec![variable];
         } else {
-            edges.push(EdgePattern::const_var(&second, &predicate, &value));
+            for canonical in &canonicals {
+                edges.push(EdgePattern::const_var(canonical, &predicate, &value));
+            }
+            subjects.extend(canonicals.iter().cloned());
         }
-        let select = second_variable
-            .clone()
-            .map(|variable| vec![variable])
-            .unwrap_or_else(|| vec![value.clone()]);
         let pattern = self.finish_pattern(edges, select)?;
-        let mut subjects = vec![first];
-        if let Some(variable) = second_variable {
-            subjects.push(variable);
-        } else {
-            subjects.push(second);
-        }
         Some(CompiledGraphQuestion {
             kind: GraphQuestionKind::Equality,
             pattern,
@@ -761,6 +754,40 @@ mod tests {
         assert_eq!(compiled.pattern.edges.len(), 2);
         assert_eq!(compiled.pattern.edges[0].predicate, "出生地");
         assert_eq!(compiled.pattern.edges[1].predicate, "出生地");
+    }
+
+    #[test]
+    fn equality_keeps_every_listed_entity() {
+        let compiled = lexicon()
+            .compile("张三、李四和王五的出生地相同吗？")
+            .expect("多实体等值问句应可编译");
+        assert_eq!(compiled.kind, GraphQuestionKind::Equality);
+        assert_eq!(compiled.pattern.edges.len(), 3);
+        assert_eq!(compiled.subject_variables.len(), 3);
+        assert!(compiled
+            .pattern
+            .edges
+            .iter()
+            .all(|edge| edge.predicate == "出生地"));
+        assert_eq!(
+            compiled.pattern.select,
+            vec!["value".to_string()],
+            "应投影共享的取值"
+        );
+
+        let facts = vec![
+            GraphFact::relation("张三", "出生地", "上海"),
+            GraphFact::relation("李四", "出生地", "上海"),
+            GraphFact::relation("王五", "出生地", "北京"),
+        ];
+        let outcome = compiled
+            .pattern
+            .evaluate(&facts, MatchOptions::default())
+            .unwrap();
+        assert!(
+            outcome.solutions.is_empty(),
+            "第三个人不同城时必须判为不相同，而不是退回只比较前两人"
+        );
     }
 
     #[test]
