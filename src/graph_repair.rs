@@ -32,6 +32,12 @@ pub trait RepairHints {
     fn type_supertypes(&self, _entity_type: &str) -> Vec<(String, String)> {
         Vec::new()
     }
+
+    /// 结构近邻实体 + 理由。实体替换比谓词/类型放宽更激进：实现方应只返回
+    /// 可解释的候选，最终是否成立仍由子图匹配裁决。
+    fn entity_alternatives(&self, _entity: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// 不提供任何外部提示：只允许结构性的删边/去约束。
@@ -63,6 +69,12 @@ pub enum RepairOp {
         position: TermPosition,
         value: String,
     },
+    /// 实体近邻替换：只作为候选提出，不改变「相似 = 为真」。
+    ReplaceEntity {
+        edge: usize,
+        position: TermPosition,
+        value: String,
+    },
 }
 
 impl RepairOp {
@@ -72,6 +84,9 @@ impl RepairOp {
             RepairOp::ReplacePredicate { .. } | RepairOp::ReplaceConstant { .. } => 1,
             RepairOp::DropConstraint { .. } => 2,
             RepairOp::DropEdge { .. } => 3,
+            // 换掉一个实体等于改写用户指称，风险高于撤回结构条件；
+            // 始终排在声明式本体与删边之后，只供用户显式确认。
+            RepairOp::ReplaceEntity { .. } => 4,
         }
     }
 
@@ -99,6 +114,11 @@ impl RepairOp {
                 pattern_edge.predicate = predicate.clone();
             }
             RepairOp::ReplaceConstant {
+                edge,
+                position,
+                value,
+            }
+            | RepairOp::ReplaceEntity {
                 edge,
                 position,
                 value,
@@ -153,6 +173,22 @@ impl RepairSuggestion {
                 };
                 format!("把第 {} 条边的{}放宽为「{}」", edge + 1, slot, value)
             }
+            RepairOp::ReplaceEntity {
+                edge,
+                position,
+                value,
+            } => {
+                let slot = match position {
+                    TermPosition::Subject => "主语",
+                    TermPosition::Object => "宾语",
+                };
+                format!(
+                    "把第 {} 条边的{}实体替换为「{}」（仅建议）",
+                    edge + 1,
+                    slot,
+                    value
+                )
+            }
         }
     }
 }
@@ -201,7 +237,7 @@ pub fn suggest_repairs(
         ));
     }
 
-    // 声明式本体提示：谓词/类型的单步替换。
+    // 外部提示：声明式本体优先，结构近邻只作为最后一档候选。
     for (edge_index, edge) in pattern.edges.iter().enumerate() {
         for (alternative, reason) in hints.predicate_alternatives(&edge.predicate) {
             if alternative == edge.predicate {
@@ -215,24 +251,48 @@ pub fn suggest_repairs(
                 reason,
             ));
         }
-        if edge.predicate != "type" {
-            continue;
+        // 类型边的宾语是类型标签而不是实体，不能拿实体近邻去替换，
+        // 否则会把「科幻片」换成某个人。
+        if edge.predicate == "type" {
+            if let PatternTerm::Const(current) = &edge.object {
+                for (supertype, reason) in hints.type_supertypes(current) {
+                    if supertype == *current {
+                        continue;
+                    }
+                    candidates.push((
+                        RepairOp::ReplaceConstant {
+                            edge: edge_index,
+                            position: TermPosition::Object,
+                            value: supertype,
+                        },
+                        reason,
+                    ));
+                }
+            }
         }
-        let PatternTerm::Const(current) = &edge.object else {
-            continue;
-        };
-        for (supertype, reason) in hints.type_supertypes(current) {
-            if supertype == *current {
+        for (position, term) in [
+            (TermPosition::Subject, &edge.subject),
+            (TermPosition::Object, &edge.object),
+        ] {
+            if edge.predicate == "type" && position == TermPosition::Object {
                 continue;
             }
-            candidates.push((
-                RepairOp::ReplaceConstant {
-                    edge: edge_index,
-                    position: TermPosition::Object,
-                    value: supertype,
-                },
-                reason,
-            ));
+            let PatternTerm::Const(current) = term else {
+                continue;
+            };
+            for (alternative, reason) in hints.entity_alternatives(current) {
+                if alternative == *current {
+                    continue;
+                }
+                candidates.push((
+                    RepairOp::ReplaceEntity {
+                        edge: edge_index,
+                        position,
+                        value: alternative,
+                    },
+                    reason,
+                ));
+            }
         }
     }
 
@@ -537,5 +597,70 @@ mod tests {
     fn negative_ordinals_are_rejected() {
         assert_eq!(parse_repair_intent("放宽 0"), None);
         assert_eq!(parse_repair_intent("放宽 很多"), None);
+    }
+
+    #[test]
+    fn entity_neighbors_are_offered_only_after_revalidation() {
+        struct Hints;
+        impl RepairHints for Hints {
+            fn entity_alternatives(&self, entity: &str) -> Vec<(String, String)> {
+                if entity == "李四" {
+                    vec![(
+                        "张三".to_string(),
+                        "「李四」与「张三」的结构角色相近（候选，不自动替换）".to_string(),
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        // 李四导演电影A不存在；换成结构相近的张三后，整条边才有见证。
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::const_const("李四", "导演", "电影A")],
+            vec![],
+        );
+        let options = MatchOptions::default();
+        let diagnosis = diagnose_failure(&pattern, &facts(), options).unwrap();
+        let repairs = suggest_repairs(&pattern, &facts(), options, &diagnosis, &Hints, 8);
+        let entity = repairs
+            .iter()
+            .find(|repair| matches!(repair.op, RepairOp::ReplaceEntity { .. }))
+            .expect("结构近邻应产生实体替换候选");
+        assert!(entity.label().contains("仅建议"), "{}", entity.label());
+        assert!(entity.sample_rows.is_empty(), "模式没有投影时不应伪造结果行");
+        let relaxed = entity.op.apply(&pattern).unwrap();
+        assert_eq!(
+            relaxed.edges[0].subject,
+            PatternTerm::constant("张三"),
+            "替换必须真正应用到模式上"
+        );
+        assert!(relaxed.evaluate(&facts(), options).unwrap().len() == 1);
+    }
+
+    #[test]
+    fn type_labels_are_not_treated_as_entities() {
+        struct Hints;
+        impl RepairHints for Hints {
+            fn entity_alternatives(&self, _entity: &str) -> Vec<(String, String)> {
+                vec![("张三".to_string(), "不应作用于类型标签".to_string())]
+            }
+        }
+        let pattern = GraphPattern::new(
+            vec![
+                EdgePattern::var_const("film", "type", "科幻片"),
+                EdgePattern::var_const("film", "主演", "中国人"),
+            ],
+            vec!["film".to_string()],
+        );
+        let options = MatchOptions::default();
+        let diagnosis = diagnose_failure(&pattern, &facts(), options).unwrap();
+        let repairs = suggest_repairs(&pattern, &facts(), options, &diagnosis, &Hints, 8);
+        assert!(
+            repairs
+                .iter()
+                .all(|repair| !matches!(repair.op, RepairOp::ReplaceEntity { .. })),
+            "类型标签不能走实体替换：{:?}",
+            repairs
+        );
     }
 }

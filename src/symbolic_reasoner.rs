@@ -1043,6 +1043,26 @@ impl RepairHints for SymbolicReasoner {
             })
             .collect()
     }
+
+    fn entity_alternatives(&self, entity: &str) -> Vec<(String, String)> {
+        if !self.config.enable_semantic_embedding || !self.embedding.is_embedded(entity) {
+            return Vec::new();
+        }
+        self.embedding
+            .nearest(entity, 2)
+            .into_iter()
+            .filter(|(candidate, _)| candidate != entity && self.is_known_entity(candidate))
+            .map(|(candidate, score)| {
+                (
+                    candidate.clone(),
+                    format!(
+                        "「{}」与「{}」的结构角色相近（相似度 {:.2}）；这只是候选，需确认",
+                        entity, candidate, score
+                    ),
+                )
+            })
+            .collect()
+    }
 }
 
 pub struct SymbolicReasoner {
@@ -18403,6 +18423,47 @@ types = [
         reasoner.answer("只看张三").expect("再次限定应成功");
         let withdrawn = reasoner.answer("撤回").expect("撤回应成功");
         assert!(withdrawn.contains("张三"), "{}", withdrawn);
+    }
+
+    #[test]
+    fn graph_repair_uses_structural_neighbors_only_as_candidates() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "甲".to_string(),
+                entity_type: "Person".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "乙".to_string(),
+                entity_type: "Person".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "获奖".to_string(),
+                to: "金奖".to_string(),
+            },
+            PrologFact::Relation {
+                from: "乙".to_string(),
+                rel_type: "获奖".to_string(),
+                to: "金奖".to_string(),
+            },
+        ]);
+        let alternatives =
+            <SymbolicReasoner as RepairHints>::entity_alternatives(&reasoner, "甲");
+        assert!(
+            alternatives.iter().any(|(name, _)| name == "乙"),
+            "结构相同的实体应成为候选：{:?}",
+            alternatives
+        );
+        assert!(
+            alternatives
+                .iter()
+                .all(|(_, reason)| reason.contains("需确认") && reason.contains("相似度")),
+            "候选理由必须标明相似度与不确定性：{:?}",
+            alternatives
+        );
     }
 
     #[test]
