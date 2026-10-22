@@ -12149,6 +12149,21 @@ mod session_tests {
         assert_eq!(frame.kind, MoveKind::AskAttribute, "{:?}", frame);
         assert_eq!(frame.entity.as_deref(), Some("北京"));
         assert_eq!(frame.attribute.as_deref(), Some("面积"));
+
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "北京".to_string(),
+            entity_type: "City".to_string(),
+            properties: std::collections::HashMap::from([
+                ("name".to_string(), "北京".to_string()),
+                ("population".to_string(), "2189万".to_string()),
+            ]),
+        }]);
+        for input in ["北京有多少人？", "北京的人口有多少人？", "北京有多少人口？"] {
+            let frame = dialogue.analyze(input, &reasoner);
+            assert_eq!(frame.kind, MoveKind::AskAttribute, "{} {:?}", input, frame);
+            assert_eq!(frame.entity.as_deref(), Some("北京"), "{}", input);
+            assert_eq!(frame.attribute.as_deref(), Some("人口"), "{}", input);
+        }
     }
 
     #[test]

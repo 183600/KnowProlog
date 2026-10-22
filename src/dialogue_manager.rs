@@ -1820,6 +1820,40 @@ impl DialogueManager {
             }
         }
 
+        // 地点类实体的「有多少人」问的是人口，不是计数未知名词。
+        for marker in ["有多少人口", "有多少人", "多少人口"] {
+            let Some(prefix) = stripped.strip_suffix(marker) else {
+                continue;
+            };
+            let subject = prefix.trim().trim_end_matches('有').trim();
+            let entity = explicit
+                .iter()
+                .find(|entity| !subject.is_empty() && subject.contains(entity.as_str()))
+                .cloned()
+                .or_else(|| {
+                    if subject.is_empty() || contains_pronoun(subject) {
+                        focus.clone()
+                    } else {
+                        None
+                    }
+                });
+            if let Some(entity) = entity {
+                if knowledge
+                    .entity_type(&entity)
+                    .is_some_and(|etype| is_place_type(&etype))
+                {
+                    return UtteranceFrame {
+                        raw: raw.to_string(),
+                        kind: MoveKind::AskAttribute,
+                        entity: Some(entity.clone()),
+                        attribute: Some("人口".to_string()),
+                        question: Some(format!("{}的人口是多少", entity)),
+                        inherited: false,
+                    };
+                }
+            }
+        }
+
         // 属性问句：S的P（是什么/是多少/是谁/怎么样/呢……），
         // 也接受"姚明的身高"这类无问词的简写，但不吸收含"是"的陈述。
         // 「A 是 B 的 C」是系表判断（校验方向），不是「A是B」的属性问句。
