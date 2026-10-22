@@ -76,6 +76,20 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
+    /// 解析人读/配置写法；未知写法返回 `None`（调用方应拒绝而不是当成 Unknown）。
+    pub fn parse(raw: &str) -> Option<SourceKind> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "config" | "配置" | "配置声明" => Some(SourceKind::Config),
+            "import" | "导入" => Some(SourceKind::Import),
+            "manual" | "人工" | "人工确认" => Some(SourceKind::Manual),
+            "conversation" | "对话" | "对话录入" => Some(SourceKind::Conversation),
+            "rule" | "规则" => Some(SourceKind::Rule),
+            "derived" | "派生" => Some(SourceKind::Derived),
+            "unknown" | "未登记" => Some(SourceKind::Unknown),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SourceKind::Config => "配置声明",
@@ -594,6 +608,51 @@ impl ProvenanceLedger {
         let entries: Vec<&ProvenanceEntry> = self.entries.values().collect();
         fnv1a_hex(canonical_json(&serde_json::json!(entries)).as_bytes())
     }
+}
+
+/// 解析来源台账 TSV：`主语\t谓词\t取值\t类别\t定位符[\t内容]`。
+///
+/// 空行与 `#` 注释跳过；类别只接受 [`SourceKind::parse`] 认识的写法，且拒绝
+/// `unknown`（登记一个「未登记来源」没有意义）。内容列缺省时只用定位符，
+/// 此时同一批次的所有事实共享同一来源身份——这正是「批次号」该有的语义。
+pub fn parse_provenance_tsv(text: &str) -> Result<Vec<(FactRef, SourceId)>, String> {
+    let mut out = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 5 || fields.len() > 6 {
+            return Err(format!(
+                "第 {} 行应为 5-6 个制表符分隔字段（主语/谓词/取值/类别/定位符[/内容]），实际 {} 个",
+                index + 1,
+                fields.len()
+            ));
+        }
+        if fields[0].trim().is_empty() || fields[1].trim().is_empty() {
+            return Err(format!("第 {} 行主语或谓词为空", index + 1));
+        }
+        let kind = SourceKind::parse(fields[3]).ok_or_else(|| {
+            format!(
+                "第 {} 行类别「{}」无法识别（import/manual/conversation/config/rule/derived）",
+                index + 1,
+                fields[3]
+            )
+        })?;
+        if kind == SourceKind::Unknown {
+            return Err(format!(
+                "第 {} 行类别不能是 unknown：登记「未登记来源」没有意义",
+                index + 1
+            ));
+        }
+        let content = fields.get(5).copied().unwrap_or("");
+        out.push((
+            FactRef::new(fields[0], fields[1], fields[2]),
+            SourceId::new(kind, fields[4], content),
+        ));
+    }
+    Ok(out)
 }
 
 /// 来源覆盖率（诚实报数：未登记就写未登记，不默认 100%）。
@@ -1810,6 +1869,15 @@ mod tests {
     }
 
     #[test]
+    fn source_kind_parses_human_labels_and_rejects_typos() {
+        assert_eq!(SourceKind::parse("import"), Some(SourceKind::Import));
+        assert_eq!(SourceKind::parse("导入"), Some(SourceKind::Import));
+        assert_eq!(SourceKind::parse("人工确认"), Some(SourceKind::Manual));
+        assert_eq!(SourceKind::parse("unknown"), Some(SourceKind::Unknown));
+        assert_eq!(SourceKind::parse("导入n"), None);
+    }
+
+    #[test]
     fn ledger_joins_sources_and_reports_honest_coverage() {
         let first = fact("张三", "年龄", "38");
         let second = fact("张三", "师傅", "李四");
@@ -1826,6 +1894,19 @@ mod tests {
         assert_eq!(coverage.unregistered, vec![second]);
         assert!((coverage.ratio - 0.5).abs() < 1e-9);
         assert!(coverage.render_zh().contains("1/2"));
+    }
+
+    #[test]
+    fn tsv_parser_rejects_malformed_rows_and_accepts_batches() {
+        let text = "# comment\n姚明\t年龄\t38\timport\t体测表\t姚明38\n张三\t师傅\t李四\tmanual\t人工确认\n";
+        let rows = parse_provenance_tsv(text).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, fact("姚明", "年龄", "38"));
+        assert_eq!(rows[0].1.kind, SourceKind::Import);
+        assert!(rows[0].1.render().contains("体测表"));
+        assert!(parse_provenance_tsv("a\tb\tc\ttypo\td").is_err());
+        assert!(parse_provenance_tsv("a\tb\tc\tunknown\td").is_err());
+        assert!(parse_provenance_tsv("a\tb\tc").is_err());
     }
 
     #[test]
