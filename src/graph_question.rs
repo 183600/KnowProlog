@@ -29,11 +29,18 @@ pub struct CompiledGraphQuestion {
     pub pattern: GraphPattern,
     pub subject_variables: Vec<String>,
     pub focus_predicate: Option<String>,
+    /// 「有多少 / 几个」类问句只要计数，不展开结果行。
+    #[serde(default)]
+    pub count_only: bool,
 }
 
 impl CompiledGraphQuestion {
     pub fn asks_for_entity(&self) -> bool {
         !self.pattern.select.is_empty()
+    }
+
+    pub fn asks_for_count(&self) -> bool {
+        self.count_only
     }
 }
 
@@ -326,11 +333,20 @@ impl PatternLexicon {
             pattern,
             subject_variables: vec![subject],
             focus_predicate: None,
+            count_only: contains_count_word(question),
         })
     }
 
     fn compile_existential(&self, question: &str) -> Option<CompiledGraphQuestion> {
-        let (rest, _) = find_marker(question, &["有没有", "是否有", "存在"])?;
+        let (rest, marker) = find_marker(
+            question,
+            &["有没有", "是否有", "存在", "有多少", "有几个", "有几部"],
+        )?;
+        // 「有多少人既…又…」是计数合取句：前件里的类型词容易被误读成
+        // 被量化的主体类型，因此把整句交给合取编译器。
+        if marker == "有多少" && split_conjunctive(question).is_some() {
+            return None;
+        }
         let rest = trim_clause(rest);
         if rest.is_empty() {
             return None;
@@ -388,6 +404,7 @@ impl PatternLexicon {
             pattern,
             subject_variables: vec![item],
             focus_predicate: None,
+            count_only: contains_count_word(question),
         })
     }
 
@@ -447,6 +464,7 @@ impl PatternLexicon {
             pattern,
             subject_variables: subjects,
             focus_predicate: Some(predicate),
+            count_only: contains_count_word(question),
         })
     }
 
@@ -484,6 +502,7 @@ impl PatternLexicon {
             pattern,
             subject_variables: subjects,
             focus_predicate: Some(predicate),
+            count_only: contains_count_word(question),
         })
     }
 
@@ -524,6 +543,12 @@ fn longest_surface(
         }
     }
     best
+}
+
+fn contains_count_word(text: &str) -> bool {
+    ["多少", "几个", "几部", "几位", "几项", "几种"]
+        .iter()
+        .any(|word| text.contains(word))
 }
 
 fn normalize_question(question: &str) -> Option<String> {
@@ -754,6 +779,23 @@ mod tests {
                 question
             );
         }
+    }
+
+    #[test]
+    fn count_questions_are_marked_without_changing_constraints() {
+        let lexicon = lexicon();
+        let conjunction = lexicon
+            .compile("有多少人既导演过科幻片，又拿过金棕榈？")
+            .expect("计数合取问句应可编译");
+        assert!(conjunction.asks_for_count());
+        assert_eq!(conjunction.pattern.edges.len(), 3);
+
+        let existential = lexicon
+            .compile("有多少部电影，导演是中国人，主演是美国人？")
+            .expect("计数存在问句应可编译");
+        assert_eq!(existential.kind, GraphQuestionKind::Existential);
+        assert!(existential.asks_for_count());
+        assert_eq!(existential.pattern.edges.len(), 5);
     }
 
     #[test]

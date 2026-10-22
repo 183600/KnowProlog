@@ -7656,6 +7656,56 @@ impl SymbolicReasoner {
         facts: &[GraphFact],
     ) -> String {
         let select = &compiled.pattern.select;
+        let total = outcome.solutions.len();
+        if compiled.asks_for_count() {
+            let mut output = match compiled.kind {
+                GraphQuestionKind::Conjunction => {
+                    if total == 0 {
+                        "没有找到同时满足这些条件的实体。".to_string()
+                    } else {
+                        format!("满足全部条件的共有 {} 个。", total)
+                    }
+                }
+                GraphQuestionKind::Existential => {
+                    if total == 0 {
+                        "没有找到满足这些条件的实体。".to_string()
+                    } else {
+                        format!("满足条件的实体共有 {} 个。", total)
+                    }
+                }
+                GraphQuestionKind::Equality => {
+                    let left = compiled
+                        .subject_variables
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "前者".to_string());
+                    let right = compiled
+                        .subject_variables
+                        .get(1)
+                        .cloned()
+                        .unwrap_or_else(|| "后者".to_string());
+                    let predicate = compiled.focus_predicate.as_deref().unwrap_or("共同值");
+                    if total == 0 {
+                        format!("「{}」和「{}」没有共同的{}。", left, right, predicate)
+                    } else {
+                        format!("「{}」和「{}」共有 {} 个共同的{}。", left, right, total, predicate)
+                    }
+                }
+                GraphQuestionKind::SharedObject => {
+                    let subjects = compiled.subject_variables.join("、");
+                    let predicate = compiled.focus_predicate.as_deref().unwrap_or("指向");
+                    if total == 0 {
+                        format!("没有找到「{}」都{}的对象。", subjects, predicate)
+                    } else {
+                        format!("「{}」都{}的对象共有 {} 个。", subjects, predicate, total)
+                    }
+                }
+            };
+            if outcome.truncated {
+                output.push_str("（搜索预算已用尽，结果为下界）");
+            }
+            return output;
+        }
         let mut rows: Vec<String> = outcome
             .solutions
             .iter()
@@ -7665,7 +7715,6 @@ impl SymbolicReasoner {
         const MAX_ROWS: usize = 12;
         let hidden = rows.len().saturating_sub(MAX_ROWS);
         rows.truncate(MAX_ROWS);
-        let total = outcome.solutions.len();
         let mut output = match compiled.kind {
             GraphQuestionKind::Conjunction => {
                 if rows.is_empty() {
@@ -17922,6 +17971,16 @@ types = [
             .expect("共享对象问句应由图谱模式回答");
         assert!(answer.contains("王五"), "{}", answer);
         assert!(!answer.contains("赵六"), "{}", answer);
+    }
+
+    #[test]
+    fn graph_question_answers_count_questions_without_listing_rows() {
+        let reasoner = graph_pattern_reasoner();
+        let answer = reasoner
+            .answer_graph_question("有多少人既导演过科幻片，又拿过金棕榈？")
+            .expect("计数问句应由图谱模式回答");
+        assert!(answer.contains("共有 1 个"), "{}", answer);
+        assert!(!answer.contains("张三"), "{}", answer);
     }
 
     #[test]
