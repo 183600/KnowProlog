@@ -14264,6 +14264,42 @@ types = [
     }
 
     #[test]
+    fn conflicting_hypothesis_is_blocked_and_kept_for_reconsideration() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut registry = PredicateRegistry::new();
+        registry.observe("张三", "年龄", "30", None);
+        assert!(registry.mark_functional("年龄", true));
+        reasoner.configure_laws(&registry);
+        let mut properties = HashMap::new();
+        properties.insert("年龄".to_string(), "30".to_string());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }]);
+        let hypothesis = Hypothesis {
+            atom: Atom::rel("年龄", "张三", "31"),
+            goal: Atom::rel("年龄", "张三", "31"),
+            kind: HypothesisKind::MissingFact,
+            confidence: 0.8,
+            reasons: vec!["测试冲突".to_string()],
+            conflicts: Vec::new(),
+            contradicts_known: false,
+        };
+        reasoner.abduction.set_pending(vec![hypothesis]);
+        let before = reasoner.session_facts().len();
+        let blocked = reasoner.adopt_hypothesis(1).expect("应给出拒绝回执");
+        assert!(blocked.contains("最小冲突核"), "{}", blocked);
+        assert!(blocked.contains("30") && blocked.contains("31"), "{}", blocked);
+        assert_eq!(reasoner.session_facts().len(), before, "拒绝时零写入");
+        assert_eq!(reasoner.pending_hypotheses().len(), 1, "拒绝后假设保留");
+        assert!(
+            !reasoner.session_revision_report().contains("session:"),
+            "拒绝的采纳不得生成回执"
+        );
+    }
+
+    #[test]
     fn abduction_target_covers_check_find_subject_and_count() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
