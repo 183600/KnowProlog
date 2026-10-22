@@ -52,6 +52,27 @@ pub const LOW_SCORE_THRESHOLD: f64 = 0.5;
 /// 报告正文中清单类字段的最大展示条数。
 pub const REPORT_LIST_CAP: usize = 12;
 
+/// 一条已见证的功能槽冲突（结构化，供担保/对话直接消费）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessedConflict {
+    pub predicate: String,
+    pub values: Vec<String>,
+    /// 让该槽只保留一个取值的最少删除数（取值数 − 1）。
+    pub minimal_retraction: usize,
+}
+
+impl WitnessedConflict {
+    pub fn render_zh(&self) -> String {
+        format!(
+            "{} 有 {} 个取值（{}），修复至少删 {} 条（低分≠假，事实仍可查询）",
+            self.predicate,
+            self.values.len(),
+            self.values.join("、"),
+            self.minimal_retraction
+        )
+    }
+}
+
 /// 单个实体的质量护照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntityPassport {
@@ -72,6 +93,9 @@ pub struct EntityPassport {
     pub gaps: Vec<String>,
     /// 与该实体相关的冲突笔记（导入时被拒的入值）。
     pub conflicts: Vec<ImportConflict>,
+    /// 该实体的已见证功能槽冲突（结构化；空表示没有多值冲突）。
+    #[serde(default)]
+    pub witnessed_conflicts: Vec<WitnessedConflict>,
     /// 该实体涉及谓词的来源标签并集（确定性排序）。
     ///
     /// 这是护照里唯一直接面向「怎么引用」的字段：无来源时为空，
@@ -402,15 +426,14 @@ impl QualityIndex {
             None => passport.conflicts.clone(),
         };
         let witnessed_conflicts: Vec<String> = passport
-            .gaps
+            .witnessed_conflicts
             .iter()
-            .filter(|gap| gap.starts_with("存在已见证冲突："))
-            .filter(|gap| {
+            .filter(|conflict| {
                 canonical_attribute
                     .as_ref()
-                    .map_or(true, |attribute| gap.contains(attribute))
+                    .map_or(true, |attribute| conflict.predicate == *attribute)
             })
-            .cloned()
+            .map(WitnessedConflict::render_zh)
             .collect();
         // 来源必须按断言（谓词）取，不能回退到实体级并集：
         // 「另一个属性有出处」不能给本属性背书。身份问句（无属性）才用实体并集。
@@ -865,6 +888,7 @@ pub fn build_report_with_provenance(
             degree,
             gaps,
             conflicts: entity_conflicts,
+            witnessed_conflicts: Vec::new(),
             source_tags: source_tags.into_iter().collect(),
         });
     }
@@ -996,6 +1020,7 @@ pub fn apply_witnessed_conflicts(
         };
         let mut cost = 0usize;
         let mut notes = Vec::new();
+        let mut structured = Vec::new();
         for (predicate, values) in predicates {
             if values.len() <= 1 {
                 continue;
@@ -1004,13 +1029,13 @@ pub fn apply_witnessed_conflicts(
             cost += remove;
             witnessed_points += 1;
             witnessed_cost += remove;
-            notes.push(format!(
-                "存在已见证冲突：{} 有 {} 个取值（{}），修复至少删 {} 条（低分≠假，事实仍可查询）",
-                predicate,
-                values.len(),
-                values.iter().cloned().collect::<Vec<_>>().join("、"),
-                remove
-            ));
+            let conflict = WitnessedConflict {
+                predicate: predicate.clone(),
+                values: values.iter().cloned().collect(),
+                minimal_retraction: remove,
+            };
+            notes.push(format!("存在已见证冲突：{}", conflict.render_zh()));
+            structured.push(conflict);
         }
         if cost == 0 {
             continue;
@@ -1021,6 +1046,7 @@ pub fn apply_witnessed_conflicts(
                 passport.gaps.push(note);
             }
         }
+        passport.witnessed_conflicts = structured;
         passport.score = WEIGHT_COMPLETENESS * passport.completeness
             + WEIGHT_CONSISTENCY * passport.consistency
             + WEIGHT_PROVENANCE * passport.provenance
@@ -1758,6 +1784,9 @@ mod tests {
             "{:?}",
             after.gaps
         );
+        assert_eq!(after.witnessed_conflicts.len(), 1);
+        assert_eq!(after.witnessed_conflicts[0].predicate, "师傅");
+        assert_eq!(after.witnessed_conflicts[0].minimal_retraction, 1);
         assert!(after.score < before.score, "冲突必须进入综合分");
         assert!(
             (report.summary.mean_score
