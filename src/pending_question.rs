@@ -449,12 +449,18 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
     if text.is_empty() {
         return AnswerBinding::NotAnAnswer;
     }
-    let normalized = text.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '。' | '！' | '!'));
+    let normalized = text.trim_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '。' | '！' | '!' | '，' | ',' | '；' | ';' | '、')
+    });
     if matches!(
         normalized,
         "不知道" | "不清楚" | "不确定" | "没有" | "没信息" | "不知道答案" | "放弃"
     ) {
         return AnswerBinding::Unknown;
+    }
+    // 「王五呢」「王五吗」是追问/确认，不是取值。
+    if normalized.ends_with('呢') || normalized.ends_with('吗') {
+        return AnswerBinding::NotAnAnswer;
     }
     if contains_question_marker(text) || text.contains('?') || text.contains('？') {
         return AnswerBinding::NotAnAnswer;
@@ -500,6 +506,7 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
     if value.is_empty()
         || value.chars().count() > MAX_BARE_ANSWER_CHARS
         || value.contains(['是', '为', '，', ',', '：', ':', '；', ';', '叫'])
+        || value.ends_with('的')
         || value.contains(hole.subject.as_str())
         || (!hole.predicate.is_empty() && value.contains(hole.predicate.as_str()))
     {
@@ -601,6 +608,18 @@ mod tests {
         assert_eq!(
             interpret_answer("王五吧", &hole()),
             AnswerBinding::Fill("王五".to_string())
+        );
+        assert_eq!(
+            interpret_answer("王五，", &hole()),
+            AnswerBinding::Fill("王五".to_string())
+        );
+        assert_eq!(
+            interpret_answer("王五呢", &hole()),
+            AnswerBinding::NotAnAnswer
+        );
+        assert_eq!(
+            interpret_answer("王五的", &hole()),
+            AnswerBinding::NotAnAnswer
         );
     }
 
