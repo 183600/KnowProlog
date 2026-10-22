@@ -24,7 +24,7 @@ use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::predicate_registry::{ImportConflict, PredicateRegistry};
 use crate::prolog_engine::PrologFact;
 use crate::provenance::{
-    detect_witnessed, ConflictPoint, ConflictSchema, FactRef, ProvenanceLedger,
+    detect_witnessed, ConflictPoint, ConflictSchema, FactRef, ProvenanceLedger, SourceId,
 };
 use crate::type_system::TypeSystem;
 use crate::EntityTypeConfig;
@@ -98,8 +98,11 @@ pub struct ClaimWarrant {
     pub types: Vec<String>,
     /// 该实体在该属性上的已知取值（排序、去重）。
     pub known_values: Vec<String>,
-    /// 该断言可引用的来源标签。
+    /// 该断言可引用的来源标签（谓词级口径，旧字段）。
     pub source_tags: Vec<String>,
+    /// 该断言相关事实的**事实级**来源身份（优先于谓词标签用于引用）。
+    #[serde(default)]
+    pub source_ids: Vec<SourceId>,
     /// 与该断言相关的冲突笔记（导入时被拒的入值）。
     pub conflicts: Vec<ImportConflict>,
     /// 与该断言相关的已见证冲突（图上两个取值都在，最少撤回集可计算）。
@@ -117,7 +120,7 @@ pub struct ClaimWarrant {
 
 impl ClaimWarrant {
     pub fn has_source(&self) -> bool {
-        !self.source_tags.is_empty()
+        !self.source_ids.is_empty() || !self.source_tags.is_empty()
     }
 
     /// 是否需要先澄清类型（未落型且问的是身份）。
@@ -178,12 +181,16 @@ impl ClaimWarrant {
         !self.conflicts.is_empty() || !self.witnessed_conflicts.is_empty()
     }
 
-    /// 引用说明：有来源就列出，没有来源就如实说明（不改变真值）。
+    /// 引用说明：优先列事实级来源；只有谓词标签时显式标注口径；都没有则如实说明。
     pub fn citation_note(&self) -> String {
+        if !self.source_ids.is_empty() {
+            let sources: Vec<String> = self.source_ids.iter().map(SourceId::render).collect();
+            return format!("（出处：{}）", sources.join("、"));
+        }
         if self.source_tags.is_empty() {
             "（据现有记录，该信息尚未登记来源）".to_string()
         } else {
-            format!("（出处：{}）", self.source_tags.join("、"))
+            format!("（谓词级出处：{}）", self.source_tags.join("、"))
         }
     }
 }
@@ -203,6 +210,9 @@ pub struct QualityIndex {
     predicate_sources: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     /// 非逆向别名 → 规范谓词（让「师父/老师」问句也享受同一份担保）。
     attribute_aliases: BTreeMap<String, String>,
+    /// 实体 → 谓词 → 事实级来源身份（只保存已登记来源）。
+    #[serde(default)]
+    source_ids: BTreeMap<String, BTreeMap<String, Vec<SourceId>>>,
 }
 
 impl QualityIndex {
@@ -214,6 +224,7 @@ impl QualityIndex {
             values: BTreeMap::new(),
             predicate_sources: BTreeMap::new(),
             attribute_aliases: BTreeMap::new(),
+            source_ids: BTreeMap::new(),
         }
     }
 
@@ -239,6 +250,16 @@ impl QualityIndex {
         report: &QualityReport,
         facts: &[PrologFact],
         registry: &PredicateRegistry,
+    ) -> Self {
+        Self::from_report_with_provenance(report, facts, registry, None)
+    }
+
+    /// 构建索引，并把事实级来源台账投影进来（引用时优先使用真实出处）。
+    pub fn from_report_with_provenance(
+        report: &QualityReport,
+        facts: &[PrologFact],
+        registry: &PredicateRegistry,
+        ledger: Option<&ProvenanceLedger>,
     ) -> Self {
         let entities: BTreeMap<String, EntityPassport> = report
             .entities
@@ -273,6 +294,56 @@ impl QualityIndex {
                 entry.dedup();
             }
         }
+        let mut source_ids: BTreeMap<String, BTreeMap<String, Vec<SourceId>>> = BTreeMap::new();
+        if let Some(ledger) = ledger {
+            let mut add = |entity: &str, predicate: &str, fact: FactRef| {
+                let registered: Vec<SourceId> = ledger
+                    .sources(&fact)
+                    .into_iter()
+                    .filter(SourceId::is_registered)
+                    .collect();
+                if registered.is_empty() {
+                    return;
+                }
+                let slot = source_ids
+                    .entry(entity.to_string())
+                    .or_default()
+                    .entry(predicate.to_string())
+                    .or_default();
+                slot.extend(registered);
+            };
+            for fact in facts {
+                match fact {
+                    PrologFact::Entity {
+                        name,
+                        entity_type,
+                        properties,
+                    } => {
+                        add(
+                            name,
+                            "type",
+                            FactRef::type_assertion(name, entity_type),
+                        );
+                        for (key, value) in properties {
+                            add(name, key, FactRef::attribute(name, key, value));
+                        }
+                    }
+                    PrologFact::Relation { from, rel_type, to } => {
+                        let relation = FactRef::relation(from, rel_type, to);
+                        add(from, rel_type, relation.clone());
+                        if from != to {
+                            add(to, rel_type, relation);
+                        }
+                    }
+                }
+            }
+            for slots in source_ids.values_mut() {
+                for sources in slots.values_mut() {
+                    sources.sort();
+                    sources.dedup();
+                }
+            }
+        }
         let mut predicate_sources: BTreeMap<String, BTreeMap<String, Vec<String>>> =
             BTreeMap::new();
         for (entity, slots) in &values {
@@ -302,6 +373,7 @@ impl QualityIndex {
             values,
             predicate_sources,
             attribute_aliases,
+            source_ids,
         }
     }
 
@@ -351,12 +423,31 @@ impl QualityIndex {
                 .unwrap_or_default(),
             None => passport.source_tags.clone(),
         };
+        let source_ids: Vec<SourceId> = match canonical_attribute.as_ref() {
+            Some(attribute) => self
+                .source_ids
+                .get(entity)
+                .and_then(|sources| sources.get(attribute))
+                .cloned()
+                .unwrap_or_default(),
+            None => {
+                let mut all: Vec<SourceId> = self
+                    .source_ids
+                    .get(entity)
+                    .map(|sources| sources.values().flatten().cloned().collect())
+                    .unwrap_or_default();
+                all.sort();
+                all.dedup();
+                all
+            }
+        };
         Some(ClaimWarrant {
             entity: entity.to_string(),
             attribute: canonical_attribute,
             types: passport.types.clone(),
             known_values,
             source_tags,
+            source_ids,
             conflicts,
             witnessed_conflicts,
             gaps: passport.gaps.clone(),
@@ -1515,6 +1606,46 @@ mod tests {
         // 身份问句问的是整个实体，可以用实体级来源并集。
         let identity = index.warrant_for("张三", None).unwrap();
         assert!(identity.has_source());
+    }
+
+    #[test]
+    fn warrant_citation_prefers_fact_level_source_identity() {
+        use crate::provenance::{FactRef, ProvenanceLedger, SourceId, SourceKind};
+
+        let mut registry = registry_with_master();
+        registry.observe("张三", "师傅", "李四", Some("知识图谱"));
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三"), ("age", "30")]),
+            relation("张三", "师傅", "李四"),
+        ];
+        let mut ledger = ProvenanceLedger::new();
+        ledger.record(
+            FactRef::relation("张三", "师傅", "李四"),
+            SourceId::new(SourceKind::Import, "师门谱", "张三 李四"),
+        );
+        let report = build_report_with_provenance(
+            &facts,
+            &registry,
+            &type_system(),
+            &entity_config(),
+            Some(&ledger),
+        );
+        let index = QualityIndex::from_report_with_provenance(
+            &report,
+            &facts,
+            &registry,
+            Some(&ledger),
+        );
+        let warrant = index.warrant_for("张三", Some("师傅")).unwrap();
+        assert_eq!(warrant.source_ids.len(), 1);
+        let citation = warrant.citation_note();
+        assert!(citation.contains("师门谱"), "{}", citation);
+        assert!(!citation.contains("谓词级"), "{}", citation);
+
+        // age 没有事实级来源：不能借用师傅的出处。
+        let age = index.warrant_for("张三", Some("age")).unwrap();
+        assert!(age.source_ids.is_empty(), "{:?}", age.source_ids);
+        assert!(age.citation_note().contains("未登记来源"));
     }
 
     #[test]

@@ -67,8 +67,9 @@ use know_prolog::{
         ProvenanceLoad,
     },
     quality::{
-        build_report as build_quality_report, compare_baseline as compare_quality_baseline,
-        render_entity_passport, QualityBaseline, QualityIndex,
+        build_report as build_quality_report, build_report_with_provenance,
+        compare_baseline as compare_quality_baseline, render_entity_passport, QualityBaseline,
+        QualityIndex,
     },
     query_planner::QueryPlanner,
     recovery::RecoveryMode,
@@ -2194,13 +2195,29 @@ async fn main() {
             oxigraph_manager.configure_entities(&config.entity_profiles);
             oxigraph_manager.configure_type_system(&config.type_system);
             let registry = oxigraph_manager.predicate_registry_snapshot();
-            let quality_report = build_quality_report(
+            let types = oxigraph_manager.type_system_snapshot();
+            let mut ledger = ProvenanceLedger::new();
+            let journal_path = format!("{}/import_journal.json", store_path);
+            if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
+                ledger.seed_from_import_journal(&journal);
+            }
+            let mut quality_report =
+                build_report_with_provenance(&facts, &registry, &types, &config.entity_types, Some(&ledger));
+            if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
+                know_prolog::quality::apply_witnessed_conflicts(
+                    &mut quality_report,
+                    &fact_refs,
+                    Some(&ledger),
+                    &registry,
+                    &types,
+                );
+            }
+            let quality_index = QualityIndex::from_report_with_provenance(
+                &quality_report,
                 &facts,
                 &registry,
-                &oxigraph_manager.type_system_snapshot(),
-                &config.entity_types,
+                Some(&ledger),
             );
-            let quality_index = QualityIndex::from_report(&quality_report, &facts, &registry);
             println!(
                 "KnowProlog 会话服务已启动：http://{}（{} 条事实，最多 {} 个驻留会话{}，提示模式 {}，失败恢复 {}）",
                 addr,
@@ -3591,6 +3608,7 @@ async fn refresh_dialogue_quality(
     oxigraph_manager: &OxigraphManager,
     config: &know_prolog::SystemConfig,
     revision: u64,
+    store_path: &str,
 ) {
     if dialogue_manager.quality_revision() == Some(revision) {
         return;
@@ -3599,13 +3617,25 @@ async fn refresh_dialogue_quality(
         return;
     };
     let registry = oxigraph_manager.predicate_registry_snapshot();
-    let report = build_quality_report(
-        &facts,
-        &registry,
-        &oxigraph_manager.type_system_snapshot(),
-        &config.entity_types,
-    );
-    let index = QualityIndex::from_report(&report, &facts, &registry).with_revision(revision);
+    let types = oxigraph_manager.type_system_snapshot();
+    let mut ledger = ProvenanceLedger::new();
+    let journal_path = format!("{}/import_journal.json", store_path);
+    if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
+        ledger.seed_from_import_journal(&journal);
+    }
+    let mut report =
+        build_report_with_provenance(&facts, &registry, &types, &config.entity_types, Some(&ledger));
+    if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
+        know_prolog::quality::apply_witnessed_conflicts(
+            &mut report,
+            &fact_refs,
+            Some(&ledger),
+            &registry,
+            &types,
+        );
+    }
+    let index = QualityIndex::from_report_with_provenance(&report, &facts, &registry, Some(&ledger))
+        .with_revision(revision);
     dialogue_manager.set_quality_index(Some(index));
 }
 
@@ -7643,6 +7673,7 @@ async fn run_interactive_mode(
                 &oxigraph_manager,
                 &config,
                 symbolic_reasoner.revision(),
+                &store_path,
             )
             .await;
             if let Some(reply) = dialogue_manager.plan_pure_dialogue(input, &symbolic_reasoner) {
@@ -8271,6 +8302,7 @@ async fn run_interactive_mode(
                         &oxigraph_manager,
                         &config,
                         symbolic_reasoner.revision(),
+                        &store_path,
                     )
                     .await;
                     if let Some(reply) = dialogue_manager.plan_reply(input, &symbolic_reasoner) {
