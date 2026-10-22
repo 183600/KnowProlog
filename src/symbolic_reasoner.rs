@@ -10089,8 +10089,11 @@ impl SymbolicReasoner {
     fn is_pending_failure(text: &str) -> bool {
         text.contains("没有记录")
             || text.contains("没有相关记录")
+            || text.contains("没有可用依据")
+            || text.contains("未能回答")
             || text.contains("数量为 0")
             || text.contains("无法证明")
+            || text.contains("不止一种理解")
             // 链接预测/溯因候选不是已证明的答案：悬问只接受确证证明。
             || text.contains("（推断")
             || text.contains("链接预测")
