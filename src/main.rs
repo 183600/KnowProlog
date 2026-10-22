@@ -3975,6 +3975,57 @@ fn is_ask_terminator(question: &str) -> bool {
 ///
 /// 只读知识存储，不写对话记忆；事实、谓词画像、实体别名与律典的装配顺序
 /// 与 `serve`/交互模式一致，保证同一问题在三种入口得到同一结论。
+/// ask 一次性会话中的生成控制：接着讲 / 换个角度重述。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationFollowup {
+    Continue,
+    SwitchAngle,
+}
+
+fn generation_followup(input: &str) -> Option<GenerationFollowup> {
+    let stripped = input
+        .trim()
+        .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+        .trim();
+    const CONTINUE: [&str; 20] = [
+        "接着说",
+        "继续说",
+        "继续介绍",
+        "继续讲",
+        "接着讲",
+        "再讲讲",
+        "还有呢",
+        "还有吗",
+        "再多说点",
+        "再多说些",
+        "再说说",
+        "再说点",
+        "展开说说",
+        "展开讲",
+        "详细一点",
+        "详细说说",
+        "具体说说",
+        "具体一点",
+        "说说细节",
+        "讲讲细节",
+    ];
+    const SWITCH: [&str; 6] = [
+        "换个角度说",
+        "换个说法",
+        "换个角度",
+        "换一个角度",
+        "重新介绍",
+        "重新说",
+    ];
+    if CONTINUE.contains(&stripped) {
+        return Some(GenerationFollowup::Continue);
+    }
+    if SWITCH.contains(&stripped) {
+        return Some(GenerationFollowup::SwitchAngle);
+    }
+    None
+}
+
 /// 识别「介绍一下北京 / 北京介绍 / 说说北京」这类纯自然语言介绍请求，
 /// 返回已被知识库接地的实体。不是已知实体时返回 None，让位给普通问答，
 /// 避免把「介绍一下你自己」误当成实体介绍。
@@ -4118,8 +4169,18 @@ async fn run_ask(
         }
         // 一次性问答同样只给紧接的一轮开裸回答窗口。
         reasoner.clear_pending_awaiting();
-        let intro_entity = intro_request_entity(&question, &reasoner);
-        let mut answer = if let Some(entity) = intro_entity {
+        let followup = generation_followup(&question);
+        let intro_entity = if followup.is_none() {
+            intro_request_entity(&question, &reasoner)
+        } else {
+            None
+        };
+        let mut answer = if let Some(request) = followup {
+            match request {
+                GenerationFollowup::Continue => reasoner.continue_generation(),
+                GenerationFollowup::SwitchAngle => reasoner.switch_generation_angle(),
+            }
+        } else if let Some(entity) = intro_entity {
             let generated = reasoner
                 .generate_about(&entity)
                 .or_else(|| reasoner.narrate(&entity))
@@ -12067,6 +12128,28 @@ mod session_tests {
         assert_eq!(frame.kind, MoveKind::AskAttribute, "{:?}", frame);
         assert_eq!(frame.entity.as_deref(), Some("北京"));
         assert_eq!(frame.attribute.as_deref(), Some("人口"));
+    }
+
+    #[test]
+    fn ask_generation_followup_recognizes_continue_and_switch() {
+        for input in ["继续介绍", "接着说。", "展开说说", "详细一点？"] {
+            assert_eq!(
+                generation_followup(input),
+                Some(GenerationFollowup::Continue),
+                "{}",
+                input
+            );
+        }
+        for input in ["换个角度说", "重新介绍？"] {
+            assert_eq!(
+                generation_followup(input),
+                Some(GenerationFollowup::SwitchAngle),
+                "{}",
+                input
+            );
+        }
+        assert_eq!(generation_followup("介绍一下北京"), None);
+        assert_eq!(generation_followup("北京的人口是多少"), None);
     }
 
     #[test]
