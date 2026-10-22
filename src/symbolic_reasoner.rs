@@ -1064,6 +1064,18 @@ impl RepairHints for SymbolicReasoner {
     }
 }
 
+fn describe_graph_subjects(subjects: &[String]) -> String {
+    match subjects {
+        [] => "「前者」和「后者」".to_string(),
+        [only] => format!("「{}」", only),
+        [left, right] => format!("「{}」和「{}」", left, right),
+        many => {
+            let quoted: Vec<String> = many.iter().map(|name| format!("「{}」", name)).collect();
+            quoted.join("、")
+        }
+    }
+}
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -7972,21 +7984,12 @@ impl SymbolicReasoner {
                     }
                 }
                 GraphQuestionKind::Equality => {
-                    let left = compiled
-                        .subject_variables
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "前者".to_string());
-                    let right = compiled
-                        .subject_variables
-                        .get(1)
-                        .cloned()
-                        .unwrap_or_else(|| "后者".to_string());
+                    let subjects = describe_graph_subjects(&compiled.subject_variables);
                     let predicate = compiled.focus_predicate.as_deref().unwrap_or("共同值");
                     if total == 0 {
-                        format!("「{}」和「{}」没有共同的{}。", left, right, predicate)
+                        format!("{}没有共同的{}。", subjects, predicate)
                     } else {
-                        format!("「{}」和「{}」共有 {} 个共同的{}。", left, right, total, predicate)
+                        format!("{}共有 {} 个共同的{}。", subjects, total, predicate)
                     }
                 }
                 GraphQuestionKind::SharedObject => {
@@ -8030,27 +8033,12 @@ impl SymbolicReasoner {
                 }
             }
             GraphQuestionKind::Equality => {
-                let left = compiled
-                    .subject_variables
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "前者".to_string());
-                let right = compiled
-                    .subject_variables
-                    .get(1)
-                    .cloned()
-                    .unwrap_or_else(|| "后者".to_string());
+                let subjects = describe_graph_subjects(&compiled.subject_variables);
                 let predicate = compiled.focus_predicate.as_deref().unwrap_or("共同值");
                 if rows.is_empty() {
-                    format!("没有找到「{}」和「{}」共同的{}。", left, right, predicate)
+                    format!("没有找到{}共同的{}。", subjects, predicate)
                 } else {
-                    format!(
-                        "「{}」和「{}」共同的{}：{}。",
-                        left,
-                        right,
-                        predicate,
-                        rows.join("、")
-                    )
+                    format!("{}共同的{}：{}。", subjects, predicate, rows.join("、"))
                 }
             }
             GraphQuestionKind::SharedObject => {
@@ -18362,6 +18350,22 @@ types = [
         let restored = reasoner.answer("恢复原条件").expect("应能恢复原条件");
         assert!(restored.contains("张三"), "{}", restored);
         assert!(!restored.contains("失败诊断"), "{}", restored);
+    }
+
+    #[test]
+    fn equality_answers_name_every_compared_entity() {
+        assert_eq!(
+            describe_graph_subjects(&["张三".to_string(), "李四".to_string()]),
+            "「张三」和「李四」"
+        );
+        assert_eq!(
+            describe_graph_subjects(&[
+                "张三".to_string(),
+                "李四".to_string(),
+                "王五".to_string()
+            ]),
+            "「张三」、「李四」、「王五」"
+        );
     }
 
     #[test]
