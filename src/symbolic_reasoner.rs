@@ -14389,6 +14389,67 @@ types = [
     }
 
     #[test]
+    fn dialogue_confirmation_turns_prediction_into_next_turn_premise() {
+        let mut config = test_config();
+        config.link_prediction_min_confidence = 0.1;
+        let mut facts = master_facts();
+        for (from, to) in [("孙八", "周九"), ("周九", "吴十")] {
+            facts.push(PrologFact::Relation {
+                from: from.to_string(),
+                rel_type: "师傅".to_string(),
+                to: to.to_string(),
+            });
+        }
+        for (a, b, c) in [
+            ("郑十一", "钱十二", "孙十三"),
+            ("钱十三", "李十四", "周十五"),
+            ("吴十六", "郑十七", "王十八"),
+        ] {
+            for (from, to) in [(a, b), (b, c)] {
+                facts.push(PrologFact::Relation {
+                    from: from.to_string(),
+                    rel_type: "师傅".to_string(),
+                    to: to.to_string(),
+                });
+            }
+            facts.push(PrologFact::Relation {
+                from: a.to_string(),
+                rel_type: "师祖".to_string(),
+                to: c.to_string(),
+            });
+        }
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let mut manager = crate::dialogue_manager::DialogueManager::new();
+        manager.set_recovery_mode(crate::recovery::RecoveryMode::On);
+        let first = manager
+            .plan_reply("孙八的师祖是谁", &reasoner)
+            .expect("预测轮应被对话层接管");
+        assert!(first.text.contains("推测"), "{}", first.text);
+        assert!(first.text.contains("吴十"), "{}", first.text);
+        assert_eq!(manager.recovery_state().pending.len(), 1);
+
+        let confirmed = manager
+            .plan_pure_dialogue("对", &reasoner)
+            .expect("确认应结算挂账");
+        assert!(confirmed.text.contains("记入本会话"), "{}", confirmed.text);
+        assert_eq!(
+            manager
+                .recovery_state()
+                .confirmed_value("孙八", "师祖")
+                .map(|fact| fact.value.as_str()),
+            Some("吴十")
+        );
+
+        let second = manager
+            .plan_reply("孙八的师祖是谁", &reasoner)
+            .expect("确认后下一轮应作答");
+        assert!(second.text.contains("吴十"), "{}", second.text);
+        assert!(second.text.contains("本会话确认"), "{}", second.text);
+    }
+
+    #[test]
     fn completion_episode_confirms_batch_and_promotes_to_global_rule() {
         let mut config = test_config();
         config.link_prediction_min_confidence = 0.1;
