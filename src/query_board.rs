@@ -1472,7 +1472,6 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &quantity,
                 next_row,
                 &next_quantity,
-                *descending,
                 &word,
             ));
             evidence.push(next_row.evidence.clone());
@@ -1483,7 +1482,6 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &previous_quantity,
                 selected,
                 &quantity,
-                *descending,
                 &word,
             ));
             evidence.push(previous_row.evidence.clone());
@@ -1494,7 +1492,6 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &previous_quantity,
                 selected,
                 &quantity,
-                *descending,
                 &word,
             ));
             text.push(' ');
@@ -1503,7 +1500,6 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &quantity,
                 next_row,
                 &next_quantity,
-                *descending,
                 &word,
             ));
             evidence.push(previous_row.evidence.clone());
@@ -1519,10 +1515,8 @@ fn relation_words(
     before_quantity: &Quantity,
     after: &QueryRow,
     after_quantity: &Quantity,
-    descending: bool,
     word: &str,
 ) -> String {
-    let direction = if descending { "高" } else { "低" };
     match before_quantity.compare(after_quantity) {
         Comparison::Greater | Comparison::Less => {
             let (difference, unit) = before_quantity
@@ -1535,7 +1529,7 @@ fn relation_words(
                 before.value,
                 after.subject,
                 after.value,
-                direction,
+                word,
                 quantity::format_number(difference),
                 unit
             )
