@@ -15953,6 +15953,42 @@ types = [
     }
 
     #[test]
+    fn test_continue_generation_reports_functional_correction() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.slots.policy_mut().declare_functional("师傅", true);
+        reasoner.observe_facts(&master_facts());
+        let first = reasoner.generate_about("李四").expect("第一页应可生成");
+        assert!(first.contains("王五"), "{}", first);
+
+        reasoner.correct_nl_fact("改口：李四的师傅是赵六");
+        let corrected = reasoner.continue_generation().expect("应输出更正");
+        assert!(corrected.contains("更正"), "{}", corrected);
+        assert!(corrected.contains("现在更新为"), "{}", corrected);
+        assert!(corrected.contains("赵六"), "{}", corrected);
+        assert!(
+            corrected.contains("李四的师傅是赵六"),
+            "更正应给出新说法：{}",
+            corrected
+        );
+        assert!(!corrected.contains("未通过"), "更正不应被自检误报：{}", corrected);
+    }
+
+    #[test]
+    fn test_generation_can_introduce_session_only_entity() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.assert_nl_fact("钱七是孙八的师傅");
+        let profile = reasoner.generate_about("钱七").expect("会话层新实体也应可介绍");
+        assert!(
+            profile.contains("钱七") && profile.contains("孙八") && profile.contains("师傅"),
+            "教学回执={}；介绍={}",
+            taught,
+            profile
+        );
+        assert!(profile.contains("零幻觉"), "{}", profile);
+    }
+
+    #[test]
     fn test_generation_cursor_survives_snapshot_and_restores_identically() {
         let mut config = test_config();
         config.max_profile_sentences = 1;

@@ -1027,7 +1027,18 @@ impl SymbolicGenerator {
         order: GenerationOrder,
         overlay: &GenerationOverlay,
     ) -> Option<Vec<ProfileClause>> {
-        if !self.is_known_entity(entity) {
+        // 会话层可能引入图谱尚未收录的实体：它既可能是新事实的主语，
+        // 也可能只作为宾语出现（此时生成反向句）。
+        let overlay_has_entity = overlay
+            .add
+            .iter()
+            .any(|((subject, _), values)| {
+                subject == entity || values.iter().any(|value| value == entity)
+            })
+            || overlay.replace.iter().any(|((subject, _), values)| {
+                subject == entity || values.iter().any(|value| value == entity)
+            });
+        if !self.is_known_entity(entity) && !overlay_has_entity {
             return None;
         }
         let mut predicates: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1168,7 +1179,11 @@ impl SymbolicGenerator {
                 }
             }
         }
-        for (predicate, subjects) in reverse.into_iter().take(2) {
+        let mut reverse_added = 0usize;
+        for (predicate, subjects) in reverse {
+            if reverse_added >= 2 {
+                break;
+            }
             let duplicated = self
                 .by_subject
                 .get(entity)
@@ -1194,6 +1209,7 @@ impl SymbolicGenerator {
                 from_overlay: reverse_overlay.contains(&predicate),
                 rank_milli: -1000,
             });
+            reverse_added += 1;
         }
 
         match order {
