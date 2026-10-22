@@ -346,8 +346,24 @@ impl QueryBoard {
                 .cloned()
                 .collect();
             if !matching.is_empty() {
+                let ranking = rank_rows(
+                    matching,
+                    &SortSpec {
+                        column: Some(attribute.clone()),
+                        descending: spec.descending,
+                    },
+                    knowledge,
+                );
+                let skipped = ranking.skipped;
+                let summary = rank_summary(
+                    &ranking.ranked,
+                    spec.limit,
+                    &attribute,
+                    spec.descending,
+                    knowledge,
+                );
                 let mut next = frame;
-                next.rows = matching;
+                next.rows = ranking.rows;
                 next.selected = None;
                 next.page = 0;
                 next.op = "rank".to_string();
@@ -355,14 +371,7 @@ impl QueryBoard {
                     predicate: attribute.clone(),
                     descending: spec.descending,
                 };
-                let skipped =
-                    sort_rows_by_quantity(&mut next.rows, &SortSpec {
-                        column: Some(attribute.clone()),
-                        descending: spec.descending,
-                    }, knowledge);
                 next.program = describe_rank(&attribute, spec.descending, skipped, knowledge);
-                let summary =
-                    rank_summary(&next.rows, spec.limit, &attribute, spec.descending, knowledge);
                 let text = format!("{}\n{}", summary, render_frame(&next, revision));
                 let focus = next.rows.first().map(|row| row.subject.clone());
                 let provenance = provenance_for(&next, next.rows.first());
@@ -411,26 +420,32 @@ impl QueryBoard {
         if rows.is_empty() {
             return None;
         }
-        let mut frame = BoardFrame::new(
-            "rank",
-            describe_rank(&attribute, descending, 0, knowledge),
-            QuerySource::Rank {
-                predicate: attribute.clone(),
-                descending,
-            },
+        let ranking = rank_rows(
             rows,
-            revision,
-        );
-        let skipped = sort_rows_by_quantity(
-            &mut frame.rows,
             &SortSpec {
                 column: Some(attribute.clone()),
                 descending,
             },
             knowledge,
         );
-        frame.program = describe_rank(&attribute, descending, skipped, knowledge);
-        let summary = rank_summary(&frame.rows, limit, &attribute, descending, knowledge);
+        let skipped = ranking.skipped;
+        let summary = rank_summary(
+            &ranking.ranked,
+            limit,
+            &attribute,
+            descending,
+            knowledge,
+        );
+        let mut frame = BoardFrame::new(
+            "rank",
+            describe_rank(&attribute, descending, skipped, knowledge),
+            QuerySource::Rank {
+                predicate: attribute.clone(),
+                descending,
+            },
+            ranking.rows,
+            revision,
+        );
         let text = format!("{}\n{}", summary, render_frame(&frame, revision));
         let focus = frame.rows.first().map(|row| row.subject.clone());
         let provenance = provenance_for(&frame, frame.rows.first());
@@ -1385,52 +1400,44 @@ fn superlative_word(dimension: Dimension, attribute: &str, descending: bool) -> 
     }
 }
 
-/// 生成排名结论。每一行都绑定原始取值；约数区间重叠时明确说「不确定」。
+/// 生成排名结论。直接消费 [`quantity::rank`] 产出的名次元数据，
+/// 不再自行重排一遍；不可比行不会混进前 N 名。
 fn rank_summary(
-    rows: &[QueryRow],
+    entries: &[quantity::Ranked<QueryRow>],
     limit: usize,
     attribute: &str,
     descending: bool,
     knowledge: &dyn DialogueKnowledge,
 ) -> String {
     let label = knowledge.predicate_label(attribute);
-    let Some(first) = rows.first() else {
+    let Some(first) = entries.first() else {
         return format!("没有可用于排名的「{}」记录。", label);
     };
-    let Some(first_quantity) = quantity::parse_quantity(&first.value) else {
-        return format!("「{}」的取值不是数值，无法排名。", label);
-    };
-    let word = superlative_word(first_quantity.dimension(), &label, descending);
+    let word = superlative_word(first.quantity.dimension(), &label, descending);
     let limit = limit.max(1);
 
     if limit == 1 {
-        let mut cohort = vec![first];
-        let mut uncertain = false;
-        for row in rows.iter().skip(1) {
-            let Some(quantity) = quantity::parse_quantity(&row.value) else {
-                break;
-            };
-            match first_quantity.compare(&quantity) {
-                Comparison::Equal => cohort.push(row),
-                Comparison::Uncertain => {
-                    cohort.push(row);
-                    uncertain = true;
-                }
-                _ => break,
+        if first.tied {
+            let cohort: Vec<&quantity::Ranked<QueryRow>> = entries
+                .iter()
+                .take_while(|entry| entry.rank == first.rank)
+                .collect();
+            let names: Vec<&str> = cohort
+                .iter()
+                .map(|entry| entry.item.subject.as_str())
+                .collect();
+            if first.uncertain {
+                return format!(
+                    "「{}」的「{}」约数区间重叠，无法确定谁最{}。",
+                    names.join("」「"),
+                    label,
+                    word
+                );
             }
-        }
-        if uncertain {
-            let names: Vec<&str> = cohort.iter().map(|row| row.subject.as_str()).collect();
-            return format!(
-                "「{}」的「{}」约数区间重叠，无法确定谁最{}。",
-                names.join("」「"),
-                label,
-                word
-            );
-        }
-        if cohort.len() > 1 {
-            let names: Vec<&str> = cohort.iter().map(|row| row.subject.as_str()).collect();
-            let values: Vec<&str> = cohort.iter().map(|row| row.value.as_str()).collect();
+            let values: Vec<&str> = cohort
+                .iter()
+                .map(|entry| entry.item.value.as_str())
+                .collect();
             return format!(
                 "「{}」并列最{}（{}）。",
                 names.join("」「"),
@@ -1440,7 +1447,7 @@ fn rank_summary(
         }
         return format!(
             "「{}」的「{}」最{}（{}）。",
-            first.subject, label, word, first.value
+            first.item.subject, label, word, first.item.value
         );
     }
 
@@ -1454,33 +1461,19 @@ fn rank_summary(
         },
         limit
     );
-    let mut rank = 1;
-    let mut previous: Option<Quantity> = None;
-    for (index, row) in rows.iter().take(limit).enumerate() {
-        let quantity = quantity::parse_quantity(&row.value);
-        let (shown_rank, tied, uncertain) = match (previous.as_ref(), quantity.as_ref()) {
-            (Some(previous), Some(quantity)) => match previous.compare(quantity) {
-                Comparison::Equal => (rank, true, false),
-                Comparison::Uncertain => (rank, true, true),
-                _ => {
-                    rank = index + 1;
-                    (rank, false, false)
-                }
-            },
-            _ => (index + 1, false, false),
-        };
-        let marker = if uncertain {
+    // 名次是竞赛式名次：并列后跳号；按名次截止可把并列项完整列出。
+    for entry in entries.iter().take_while(|entry| entry.rank <= limit) {
+        let marker = if entry.uncertain {
             "（约数，不确定）"
-        } else if tied {
+        } else if entry.tied {
             "（并列）"
         } else {
             ""
         };
         output.push_str(&format!(
             "\n  {}. {}{}（{}）",
-            shown_rank, row.subject, marker, row.value
+            entry.rank, entry.item.subject, marker, entry.item.value
         ));
-        previous = quantity;
     }
     output
 }
@@ -1713,18 +1706,24 @@ fn sort_value(row: &QueryRow, sort: &SortSpec, _knowledge: &dyn DialogueKnowledg
     row.value.clone()
 }
 
+/// 一次数量排序的完整结果：展示行 + 保留名次元数据的可比项 + 跳过数。
+struct QuantityRanking {
+    /// 可比项（已排序）在前，跨量纲与非数值行在后。
+    rows: Vec<QueryRow>,
+    /// 可比项及其名次/并列/不确定标记，排名摘要只消费这一份。
+    ranked: Vec<quantity::Ranked<QueryRow>>,
+    skipped: usize,
+}
+
 /// 按数量语义排序：同量纲内换算后比较，跨量纲/非数值行显式排到末尾。
-///
-/// 返回未参与数值排序的行数，调用方把它写进程序描述，避免「看起来排过序」
-/// 却把不可比值混进名次。
-fn sort_rows_by_quantity(
-    rows: &mut Vec<QueryRow>,
+fn rank_rows(
+    rows: Vec<QueryRow>,
     sort: &SortSpec,
     knowledge: &dyn DialogueKnowledge,
-) -> usize {
+) -> QuantityRanking {
     let mut parsed: Vec<(QueryRow, Quantity)> = Vec::new();
     let mut unparsed: Vec<QueryRow> = Vec::new();
-    for row in rows.drain(..) {
+    for row in rows {
         let raw = sort_value(&row, sort, knowledge);
         match quantity::parse_quantity(&raw) {
             Some(value) => parsed.push((row, value)),
@@ -1740,11 +1739,26 @@ fn sort_rows_by_quantity(
         },
     );
     let skipped = outcome.skipped.len() + unparsed.len();
-    let mut sorted: Vec<QueryRow> = outcome.entries.into_iter().map(|entry| entry.item).collect();
+    let ranked = outcome.entries;
+    let mut sorted: Vec<QueryRow> = ranked.iter().map(|entry| entry.item.clone()).collect();
     sorted.extend(outcome.skipped);
     sorted.extend(unparsed);
-    *rows = sorted;
-    skipped
+    QuantityRanking {
+        rows: sorted,
+        ranked,
+        skipped,
+    }
+}
+
+/// 排序并返回未参与数值排序的行数；名次摘要走 [`rank_rows`] 的元数据。
+fn sort_rows_by_quantity(
+    rows: &mut Vec<QueryRow>,
+    sort: &SortSpec,
+    knowledge: &dyn DialogueKnowledge,
+) -> usize {
+    let ranking = rank_rows(std::mem::take(rows), sort, knowledge);
+    *rows = ranking.rows;
+    ranking.skipped
 }
 
 fn clean(input: &str) -> String {
@@ -2883,6 +2897,42 @@ mod tests {
             .expect("「城市面积」应归一为图谱谓词「面积」");
         assert!(outcome.text.contains("王治郅"), "{}", outcome.text);
         assert!(outcome.text.contains("面积"), "{}", outcome.text);
+    }
+
+    #[test]
+    fn rank_top_n_never_fills_up_with_incomparable_rows() {
+        let mut knowledge = TestKnowledge::new();
+        knowledge.attributes.insert(
+            "姚明".to_string(),
+            vec![
+                ("身高".to_string(), "2.26米".to_string()),
+                ("居住面积".to_string(), "300平方米".to_string()),
+            ],
+        );
+        knowledge.attributes.insert(
+            "王治郅".to_string(),
+            vec![("身高".to_string(), "2.14米".to_string())],
+        );
+        knowledge.attributes.insert(
+            "易建联".to_string(),
+            vec![("身高".to_string(), "2.13米".to_string())],
+        );
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        let outcome = board.apply("前两名", &knowledge, 7).unwrap();
+        let summary = outcome
+            .text
+            .split("\n查询板")
+            .next()
+            .expect("排名摘要应在前");
+        assert!(summary.contains("姚明"), "{}", summary);
+        assert!(summary.contains("王治郅"), "{}", summary);
+        assert!(
+            !summary.contains("300平方米"),
+            "跨量纲行不能补进前两名：{}",
+            summary
+        );
+        assert!(!summary.contains("易建联"), "{}", summary);
     }
 
     #[test]
