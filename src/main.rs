@@ -32,6 +32,7 @@ use know_prolog::{
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
     extract_query_entities_from_tagged,
+    frontier,
     fulfillment,
     grammar_extractor::GrammarExtractor,
     history_trust::TrustAssessment,
@@ -173,6 +174,23 @@ enum Commands {
         #[arg(long, requires = "lexicon")]
         definitions: Option<String>,
         /// Print the trace/report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the decision frontier of every routing candidate: which element
+    /// blocked, what was expected/seen, and how much prefix was covered
+    /// (offline; does not open the knowledge store)
+    Frontier {
+        /// Question to analyse (omit when using --corpus)
+        #[arg(required_unless_present = "corpus", conflicts_with = "corpus")]
+        question: Option<String>,
+        /// UTF-8 corpus with one question per line; aggregates the closest gaps
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Coverage threshold for treating an unmatched candidate as a near miss
+        #[arg(long, default_value_t = 0.75)]
+        near_miss: f64,
+        /// Print the frontier report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -871,6 +889,24 @@ async fn main() {
             corpus.as_deref(),
             *lexicon,
             definitions.as_deref(),
+            *json,
+            &config,
+        );
+        return;
+    }
+
+    // 决策前沿只读配置与文本：复用运行时路由的同一匹配器，不打开存储。
+    if let Some(Commands::Frontier {
+        question,
+        corpus,
+        near_miss,
+        json,
+    }) = &cli.command
+    {
+        run_frontier(
+            question.as_deref(),
+            corpus.as_deref(),
+            *near_miss,
             *json,
             &config,
         );
@@ -2012,6 +2048,7 @@ async fn main() {
         Some(Commands::PromptLint { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::ReadTrace { .. }) => {}
+        Some(Commands::Frontier { .. }) => {}
         Some(Commands::Forge { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
@@ -3084,6 +3121,67 @@ fn run_pattern_forge(
         }
     } else {
         println!("（预览：加 --activate 可查看展开后的路由条目）");
+    }
+}
+
+/// `frontier`：离线查看每条候选模式停在哪个要素、期望/实见什么、覆盖多少前缀。
+///
+/// 与运行时同序：先 `preprocess`，再按 `[synonyms.mappings]` 归一，最后调用
+/// 模式库的同一匹配器；因此报告里的失败点就是线上失败点，不是另写一遍的近似。
+fn run_frontier(
+    question: Option<&str>,
+    corpus: Option<&str>,
+    near_miss: f64,
+    json: bool,
+    config: &know_prolog::SystemConfig,
+) {
+    if !(0.0..=1.0).contains(&near_miss) || !near_miss.is_finite() {
+        eprintln!("--near-miss 必须在 0 到 1 之间（含端点），实得 {}", near_miss);
+        std::process::exit(2);
+    }
+    let synonyms = config
+        .synonyms
+        .as_ref()
+        .map(|synonyms| synonyms.mappings.clone())
+        .unwrap_or_default();
+    let library = PatternLibrary::from_config(config);
+
+    if let Some(path) = corpus {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("读取语料失败（{}）：{}", path, error);
+                return;
+            }
+        };
+        let questions: Vec<&str> = text.lines().collect();
+        let report = frontier::analyze_corpus(
+            questions,
+            &library,
+            &config.nlp,
+            &synonyms,
+            near_miss,
+        );
+        if json {
+            match serde_json::to_string_pretty(&report) {
+                Ok(text) => println!("{}", text),
+                Err(error) => eprintln!("序列化决策前沿失败：{}", error),
+            }
+        } else {
+            println!("{}", report.render_report());
+        }
+        return;
+    }
+
+    let question = question.unwrap_or_default();
+    let report = frontier::analyze(question, &library, &config.nlp, &synonyms);
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => eprintln!("序列化决策前沿失败：{}", error),
+        }
+    } else {
+        println!("{}", report.render_report());
     }
 }
 

@@ -620,7 +620,7 @@ impl PatternMatch {
 
 /// 单要素失配的类别。分类本身就是可行动信息：词面不符可以补别名，
 /// 词性不符要改槽位排序，输入耗尽则要看是否缺少尾缀/成分。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchFailureKind {
     /// 输入在到达该要素前已耗尽。

@@ -49,6 +49,7 @@ pub mod eval_recovery;
 pub mod external_knowledge;
 pub mod external_ledger;
 pub mod formal_semantics;
+pub mod frontier;
 pub mod fulfillment;
 pub mod function_words;
 pub mod grammar_extractor;
