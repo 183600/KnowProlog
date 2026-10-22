@@ -4474,6 +4474,7 @@ async fn run_interactive_mode(
     };
     // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部）
     let mut reasoner_stale = false;
+    let mut graph_refreshed = false;
     if let Ok(facts) = load_graph_snapshot(&oxigraph_manager).await {
         symbolic_reasoner.observe_facts(&facts);
         oxigraph_manager.observe_entity_facts(&facts);
@@ -4867,6 +4868,7 @@ async fn run_interactive_mode(
         {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             reasoner_stale = false;
+            graph_refreshed = true;
             kb_revision += 1;
             if let Some(chronicle) = chronicle.as_mut() {
                 chronicle.set_kb_revision(kb_revision);
@@ -8845,6 +8847,16 @@ async fn run_interactive_mode(
         }
         // 裸回答窗口只开一轮：本轮没有绑定成功，后续输入不得再被旧追问劫持。
         symbolic_reasoner.clear_pending_awaiting();
+
+        // 图谱刚吸收新知识：重放悬问，能证就立即给出延期回答（仍不猜）。
+        if graph_refreshed && symbolic_reasoner.has_pending_question() {
+            if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
+                println!("{}", deferred);
+                log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                println!();
+            }
+            graph_refreshed = false;
+        }
 
         // 悬问台账：欠用户答案的问题与缺失前提；可显式放弃（不设 TTL）。
         if matches!(input, "悬问" | "未答之问" | "悬问报告" | "悬问台账") {
