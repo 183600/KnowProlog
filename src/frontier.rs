@@ -471,7 +471,8 @@ where
             examples: Vec::new(),
         });
         entry.count += 1;
-        if entry.examples.len() < GAP_EXAMPLES && !entry.examples.iter().any(|item| item == question)
+        if entry.examples.len() < GAP_EXAMPLES
+            && !entry.examples.iter().any(|item| item == question)
         {
             entry.examples.push(question.to_string());
         }
@@ -563,12 +564,7 @@ mod tests {
     fn aggregate_ranks_repeated_gaps_and_counts_near_misses() {
         let nlp = nlp();
         let report = analyze_corpus(
-            [
-                "法国的首都在哪里",
-                "德国的首都在哪里",
-                "德国首都",
-                "你好",
-            ],
+            ["法国的首都在哪里", "德国的首都在哪里", "德国首都", "你好"],
             &library(),
             &nlp,
             &HashMap::new(),
