@@ -330,6 +330,8 @@ pub struct SnapshotRevision {
     pub ops: Vec<SnapshotRevisionOp>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub restore_lessons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remove_lessons: Vec<String>,
 }
 
 /// 一次会话写入的修订回执：真实生效的操作 + 可一并恢复的教学原句。
@@ -340,6 +342,7 @@ struct SessionRevisionReceipt {
     revision: u64,
     ops: Vec<ChangeOp>,
     restore_lessons: Vec<String>,
+    remove_lessons: Vec<String>,
 }
 
 impl SessionRevisionReceipt {
@@ -375,6 +378,7 @@ impl SessionRevisionReceipt {
                 })
                 .collect(),
             restore_lessons: self.restore_lessons.clone(),
+            remove_lessons: self.remove_lessons.clone(),
         }
     }
 
@@ -396,6 +400,7 @@ impl SessionRevisionReceipt {
             revision: snapshot.revision,
             ops,
             restore_lessons: snapshot.restore_lessons.clone(),
+            remove_lessons: snapshot.remove_lessons.clone(),
         })
     }
 }
@@ -2394,8 +2399,9 @@ impl SymbolicReasoner {
         label: impl Into<String>,
         ops: Vec<ChangeOp>,
         restore_lessons: Vec<String>,
+        remove_lessons: Vec<String>,
     ) {
-        if ops.is_empty() && restore_lessons.is_empty() {
+        if ops.is_empty() && restore_lessons.is_empty() && remove_lessons.is_empty() {
             return;
         }
         let revision = self
@@ -2421,6 +2427,7 @@ impl SymbolicReasoner {
             revision,
             ops,
             restore_lessons,
+            remove_lessons,
         });
     }
 
@@ -2539,7 +2546,14 @@ impl SymbolicReasoner {
                 lessons_restored += 1;
             }
         }
-        if lessons_restored > 0 {
+        let mut lessons_removed = 0usize;
+        for lesson in &receipt.remove_lessons {
+            if let Some(position) = self.lessons.iter().position(|item| item == lesson) {
+                self.lessons.remove(position);
+                lessons_removed += 1;
+            }
+        }
+        if lessons_restored > 0 || lessons_removed > 0 {
             self.lessons_parsed = self
                 .lessons
                 .iter()
@@ -2551,7 +2565,7 @@ impl SymbolicReasoner {
                 self.rebuild_problog();
             }
         }
-        if inverse_ops.is_empty() && lessons_restored == 0 {
+        if inverse_ops.is_empty() && lessons_restored == 0 && lessons_removed == 0 {
             return format!(
                 "回执 {} 在当前会话没有可恢复的改动（可能已被后续操作覆盖）。",
                 receipt.id
@@ -2560,6 +2574,7 @@ impl SymbolicReasoner {
         self.record_session_revision(
             format!("撤销 {}", receipt.id),
             inverse_ops,
+            receipt.remove_lessons.clone(),
             receipt.restore_lessons.clone(),
         );
         let new_id = self
@@ -2568,12 +2583,13 @@ impl SymbolicReasoner {
             .map(|item| item.id.clone())
             .unwrap_or_default();
         format!(
-            "已撤销会话修订 {}（{}）：恢复事实 {} 条、规则 {} 条、教学原句 {} 条。新回执：{}。",
+            "已撤销会话修订 {}（{}）：恢复事实 {} 条、规则 {} 条、教学原句 +{} / -{} 条。新回执：{}。",
             receipt.id,
             receipt.label,
             facts_changed,
             clauses_changed,
             lessons_restored,
+            lessons_removed,
             new_id
         )
     }
@@ -9378,7 +9394,12 @@ impl SymbolicReasoner {
                 .into_iter()
                 .map(ChangeOp::AddRule)
                 .collect::<Vec<_>>();
-            self.record_session_revision(format!("学习规则：{}", sentence), ops, Vec::new());
+            self.record_session_revision(
+                format!("学习规则：{}", sentence),
+                ops,
+                Vec::new(),
+                Vec::new(),
+            );
             if let Some(receipt) = self.session_receipts.last() {
                 output.push_str(&format!("  修订回执：{}。", receipt.id));
             }
@@ -9559,6 +9580,7 @@ impl SymbolicReasoner {
                 format!("记住：{}", sentence),
                 revision_ops,
                 Vec::new(),
+                Vec::new(),
             );
         }
         let mut output = String::new();
@@ -9661,6 +9683,7 @@ impl SymbolicReasoner {
             self.record_session_revision(
                 format!("忘记：{}", sentence),
                 revision_ops,
+                Vec::new(),
                 Vec::new(),
             );
         }
@@ -9963,6 +9986,7 @@ impl SymbolicReasoner {
                 format!("忘记规则：{}", sentence),
                 ops,
                 removed_lessons,
+                Vec::new(),
             );
             if let Some(receipt) = self.session_receipts.last() {
                 output.push_str(&format!(
@@ -16517,10 +16541,15 @@ types = [
         let undone = reasoner.undo_last_session_revision();
         assert!(undone.contains("恢复事实 0 条"), "{}", undone);
         assert!(undone.contains("规则 1 条"), "{}", undone);
-        assert!(undone.contains("教学原句 1 条"), "{}", undone);
+        assert!(undone.contains("教学原句 +1"), "{}", undone);
         assert_eq!(reasoner.rule_ledger_entries().len(), 1);
         assert!(!reasoner.lessons().is_empty());
         let proof = reasoner.resolution_proof_report("李四的老师是王五");
         assert!(proof.contains("得证"), "撤销忘记后规则应恢复：{}", proof);
+
+        let redone = reasoner.undo_last_session_revision();
+        assert!(redone.contains("教学原句 +0 / -1"), "{}", redone);
+        assert!(reasoner.rule_ledger_entries().is_empty(), "重做后规则应再次撤回");
+        assert!(reasoner.lessons().is_empty(), "重做后教学原句也应撤回");
     }
 }
