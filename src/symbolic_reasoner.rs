@@ -14804,6 +14804,19 @@ mod tests {
     }
 
     #[test]
+    fn old_snapshot_without_pending_questions_still_loads() {
+        let json = r#"{"focus_entities":[],"focus_types":{},"last_predicate":null,"history":[]}"#;
+        let snapshot: DialogueSnapshot = serde_json::from_str(json).expect("旧快照应可解码");
+        assert!(snapshot.pending_questions.is_none());
+        let encoded = serde_json::to_string(&snapshot).expect("应可编码");
+        assert!(
+            !encoded.contains("pending_questions"),
+            "空悬问不得改变旧快照字节：{}",
+            encoded
+        );
+    }
+
+    #[test]
     fn pending_question_survives_snapshot_roundtrip() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&pair_facts());
