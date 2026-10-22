@@ -3732,6 +3732,21 @@ fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
             }
         }
     }
+    // 明写属性 + 程度词（面积多大 / 身高有多高）：属性词面优先于程度词，
+    // 否则「多大」会被当成属性名，问题被改写成「面积多大是什么」。
+    for marker in ["多大", "多高", "多重", "几岁"] {
+        let Some(candidate) = tail.strip_suffix(marker) else {
+            continue;
+        };
+        let candidate = candidate.trim().trim_end_matches('有').trim();
+        if !candidate.is_empty()
+            && (crate::symbolic_generator::canonical_predicate_key(candidate).is_some()
+                || candidate == "年龄")
+        {
+            tail = candidate;
+            break;
+        }
+    }
     if tail.is_empty() || tail.contains('是') || tail.chars().count() > 16 {
         return None;
     }
@@ -4064,6 +4079,23 @@ mod tests {
                 .is_none(),
             "查询板不得把系表判断重扫成「叶莉的师傅」"
         );
+    }
+
+    #[test]
+    fn test_analyze_attribute_question_keeps_explicit_attribute_before_degree_word() {
+        let knowledge = mock();
+        let manager = DialogueManager::new();
+        for (input, attribute) in [
+            ("姚明的身高有多高？", "身高"),
+            ("姚明的身高多高", "身高"),
+            ("姚明的年龄多大？", "年龄"),
+            ("姚明的出生地是哪里？", "出生地"),
+        ] {
+            let frame = manager.analyze(input, &knowledge);
+            assert_eq!(frame.kind, MoveKind::AskAttribute, "{}", input);
+            assert_eq!(frame.entity.as_deref(), Some("姚明"), "{}", input);
+            assert_eq!(frame.attribute.as_deref(), Some(attribute), "{}", input);
+        }
     }
 
     #[test]
