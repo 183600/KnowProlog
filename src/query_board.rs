@@ -1563,6 +1563,9 @@ fn parse_extreme(text: &str, board_active: bool) -> Option<ExtremeSpec> {
                 | '呢'
                 | '吗'
                 | '啊'
+                | '呀'
+                | '哦'
+                | '嘛'
                 | '个'
                 | '名'
                 | '位'
@@ -1589,7 +1592,11 @@ fn parse_extreme(text: &str, board_active: bool) -> Option<ExtremeSpec> {
     }
 
     let mut candidate = text[..position].trim();
-    while let Some(stripped) = candidate.strip_suffix('的') {
+    while let Some(stripped) = candidate
+        .strip_suffix('的')
+        .or_else(|| candidate.strip_suffix('是'))
+        .or_else(|| candidate.strip_suffix('为'))
+    {
         candidate = stripped.trim_end();
     }
     for marker in ["请问", "那么", "到底", "究竟", "帮我看看", "看看"] {
@@ -1608,7 +1615,9 @@ fn parse_extreme(text: &str, board_active: bool) -> Option<ExtremeSpec> {
         "什么",
     ] {
         while let Some(stripped) = candidate.strip_prefix(marker) {
-            candidate = stripped.trim_start_matches(['的', ' ']).trim();
+            candidate = stripped
+                .trim_start_matches(['的', '是', '为', ' '])
+                .trim();
         }
     }
     let attribute = if candidate.is_empty() {
@@ -2814,6 +2823,17 @@ mod tests {
     #[test]
     fn extreme_parser_rejects_non_rank_words_and_normalizes_attribute() {
         assert!(parse_extreme("谁最高", false).is_some());
+        assert_eq!(
+            parse_extreme("谁是最高的", false).unwrap().attribute,
+            None
+        );
+        assert_eq!(
+            parse_extreme("谁的身高是最高的", false)
+                .unwrap()
+                .attribute
+                .as_deref(),
+            Some("身高")
+        );
         assert!(parse_extreme("谁最高兴", false).is_none());
         assert!(parse_extreme("最大的行星", false).is_none());
         assert!(parse_extreme("前三名", false).is_some());
