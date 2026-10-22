@@ -3975,6 +3975,54 @@ fn is_ask_terminator(question: &str) -> bool {
 ///
 /// 只读知识存储，不写对话记忆；事实、谓词画像、实体别名与律典的装配顺序
 /// 与 `serve`/交互模式一致，保证同一问题在三种入口得到同一结论。
+/// 识别「介绍一下北京 / 北京介绍 / 说说北京」这类纯自然语言介绍请求，
+/// 返回已被知识库接地的实体。不是已知实体时返回 None，让位给普通问答，
+/// 避免把「介绍一下你自己」误当成实体介绍。
+fn intro_request_entity(input: &str, reasoner: &SymbolicReasoner) -> Option<String> {
+    let stripped = input
+        .trim()
+        .trim_end_matches(['？', '?', '。', '！', '!', ' '])
+        .trim();
+    let mut candidates: Vec<&str> = Vec::new();
+    for prefix in [
+        "详细介绍",
+        "详细介绍一下",
+        "概述一下",
+        "介绍一下",
+        "介绍下",
+        "生成介绍",
+        "讲讲",
+        "说说",
+        "叙述一下",
+        "叙述",
+        "讲述",
+        "介绍",
+    ] {
+        if let Some(rest) = stripped.strip_prefix(prefix) {
+            candidates.push(rest.trim());
+        }
+    }
+    if let Some(rest) = stripped.strip_suffix("介绍") {
+        candidates.push(rest.trim());
+    }
+    for rest in candidates {
+        let rest = rest
+            .trim_start_matches(['：', ':', '，', ',', ' ', '\u{3000}'])
+            .trim();
+        if rest.is_empty() || rest.chars().count() > 24 {
+            continue;
+        }
+        let mut mentioned = reasoner.entities_mentioned(rest);
+        if mentioned.len() == 1 {
+            return mentioned.pop();
+        }
+        if let Some(entity) = reasoner.best_linked_entity(rest) {
+            return Some(entity);
+        }
+    }
+    None
+}
+
 async fn run_ask(
     config: &SystemConfig,
     oxigraph_manager: &OxigraphManager,
@@ -4070,11 +4118,24 @@ async fn run_ask(
         }
         // 一次性问答同样只给紧接的一轮开裸回答窗口。
         reasoner.clear_pending_awaiting();
-        let mut answer = dialogue
-            .plan_pure_dialogue(&question, &reasoner)
-            .or_else(|| dialogue.plan_reply(&question, &reasoner))
-            .map(|reply| reply.text)
-            .or_else(|| reasoner.answer(&question));
+        let intro_entity = intro_request_entity(&question, &reasoner);
+        let mut answer = if let Some(entity) = intro_entity {
+            reasoner
+                .generate_about(&entity)
+                .or_else(|| reasoner.narrate(&entity))
+                .or_else(|| {
+                    Some(format!(
+                        "知识图谱中没有关于「{}」的可生成事实。",
+                        entity
+                    ))
+                })
+        } else {
+            dialogue
+                .plan_pure_dialogue(&question, &reasoner)
+                .or_else(|| dialogue.plan_reply(&question, &reasoner))
+                .map(|reply| reply.text)
+                .or_else(|| reasoner.answer(&question))
+        };
         if let Some(text) = &answer {
             if is_no_record_text(text) {
                 if let Some(prompt) = reasoner.open_pending_question(&question) {
@@ -11967,6 +12028,32 @@ mod session_tests {
         let mut missing = None;
         isolate_dialogue_state_path(&mut missing, "/tmp/kp-alt");
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn ask_intro_request_targets_known_entity() {
+        let mut reasoner = SymbolicReasoner::new(
+            know_prolog::ReasoningConfig::default(),
+            std::collections::HashMap::new(),
+        );
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "北京".to_string(),
+            entity_type: "City".to_string(),
+            properties: std::collections::HashMap::from([
+                ("name".to_string(), "北京".to_string()),
+                ("population".to_string(), "2189万".to_string()),
+            ]),
+        }]);
+        for input in ["介绍一下北京", "北京介绍", "说说北京", "介绍：北京"] {
+            assert_eq!(
+                intro_request_entity(input, &reasoner).as_deref(),
+                Some("北京"),
+                "{}",
+                input
+            );
+        }
+        assert_eq!(intro_request_entity("介绍一下你自己", &reasoner), None);
+        assert_eq!(intro_request_entity("介绍不存在的地方", &reasoner), None);
     }
 
     #[test]
