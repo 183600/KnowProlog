@@ -4826,6 +4826,11 @@ async fn run_interactive_mode(
             } else {
                 match pattern_forge.activate(key) {
                     Ok(activation) => {
+                        let backend_known = pattern_library.entries().iter().any(|entry| {
+                            entry.route
+                                && entry.query_type == activation.pattern.query_type
+                                && !entry.source.starts_with(pattern_forge::FORGE_SOURCE_PREFIX)
+                        });
                         pattern_library.remove_source(&activation.pattern.source());
                         for entry in &activation.entries {
                             pattern_library.add(entry.clone());
@@ -4836,6 +4841,12 @@ async fn run_interactive_mode(
                             activation.pattern.name,
                             activation.entries.len()
                         );
+                        if !backend_known {
+                            println!(
+                                "  提示：路由「{}」目前没有其它可执行模式。锻造只让这类问法被认出，后端查询仍需在 config.toml 或 PL 规则中提供。",
+                                activation.pattern.query_type
+                            );
+                        }
                         for entry in &activation.entries {
                             println!("  - {}（{}）", entry.name, entry.render());
                         }
