@@ -1361,7 +1361,7 @@ pub fn detect_witnessed(
 /// - 主语位置必须可合一，且体部没有可直接检出的常量冲突。
 pub fn detect_latent(rules: &[Clause], schema: &ConflictSchema) -> Vec<ConflictCertificate> {
     let mut sorted: Vec<&Clause> = rules.iter().collect();
-    sorted.sort_by(|left, right| clause_key(left).cmp(&clause_key(right)));
+    sorted.sort_by_key(|clause| clause_key(clause));
 
     let mut out: BTreeMap<String, ConflictCertificate> = BTreeMap::new();
     for (index, left) in sorted.iter().enumerate() {
@@ -1771,7 +1771,7 @@ fn build_support_with(
             let premises: Vec<Support> = entry
                 .premises
                 .iter()
-                .filter_map(|atom| ledger_atom_fact(atom))
+                .filter_map(ledger_atom_fact)
                 .map(|premise| {
                     build_support_with(
                         &premise,
