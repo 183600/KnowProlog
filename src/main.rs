@@ -4952,6 +4952,13 @@ async fn run_interactive_mode(
                         "已遗忘锻造规则 {}「{}」（移除 {} 条展开）。",
                         pattern.id, pattern.name, removed
                     );
+                    match oxigraph_manager
+                        .sync_pattern_ledger(pattern_library.entries())
+                        .await
+                    {
+                        Ok(count) => println!("模式落图：{} 条已同步。", count),
+                        Err(error) => eprintln!("模式落图失败：{}", error),
+                    }
                     persist_pattern_forge(&pattern_forge, &forge_path);
                 }
                 Err(error) => println!("遗忘锻造失败：{}", error),
