@@ -855,6 +855,10 @@ impl QueryBoard {
         let mut frame = self.current()?.clone();
         let old_selection = frame.selected_row().cloned();
         let skipped = sort_rows_by_quantity(&mut frame.rows, &sort, knowledge);
+        // 排名帧被重新排序后，「为什么」必须按新的方向解释，不能沿用旧方向。
+        if let QuerySource::Rank { descending, .. } = &mut frame.source {
+            *descending = sort.descending;
+        }
         frame.selected =
             old_selection.and_then(|selected| frame.rows.iter().position(|row| *row == selected));
         if let Some(selected) = frame.selected {
@@ -1455,6 +1459,7 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
         .find(|row| matches_dimension(row))
         .and_then(|row| quantity::parse_quantity(&row.value).map(|value| (row, value)));
     let label = knowledge.predicate_label(predicate);
+    let positive = quantity.dimension().comparative_word(&label);
     let word = superlative_word(quantity.dimension(), &label, *descending);
 
     let mut text = format!(
@@ -1472,6 +1477,7 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &quantity,
                 next_row,
                 &next_quantity,
+                positive,
                 &word,
             ));
             evidence.push(next_row.evidence.clone());
@@ -1482,6 +1488,7 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &previous_quantity,
                 selected,
                 &quantity,
+                positive,
                 &word,
             ));
             evidence.push(previous_row.evidence.clone());
@@ -1492,6 +1499,7 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &previous_quantity,
                 selected,
                 &quantity,
+                positive,
                 &word,
             ));
             text.push(' ');
@@ -1500,6 +1508,7 @@ fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<
                 &quantity,
                 next_row,
                 &next_quantity,
+                positive,
                 &word,
             ));
             evidence.push(previous_row.evidence.clone());
@@ -1515,14 +1524,22 @@ fn relation_words(
     before_quantity: &Quantity,
     after: &QueryRow,
     after_quantity: &Quantity,
-    word: &str,
+    positive: &str,
+    superlative: &str,
 ) -> String {
-    match before_quantity.compare(after_quantity) {
+    let comparison = before_quantity.compare(after_quantity);
+    match comparison {
         Comparison::Greater | Comparison::Less => {
             let (difference, unit) = before_quantity
                 .difference_in_own_unit(after_quantity)
                 .map(|(value, unit)| (value.abs(), unit.unwrap_or("")))
                 .unwrap_or((0.0, ""));
+            // 方向由实际比较结果决定，不依赖可能已过时的排序方向。
+            let word = if comparison == Comparison::Greater {
+                positive
+            } else {
+                comparison_lower_word(positive)
+            };
             format!(
                 "{}（{}）比 {}（{}）{}，相差 {}{}。",
                 before.subject,
@@ -1536,11 +1553,11 @@ fn relation_words(
         }
         Comparison::Equal => format!(
             "{}（{}）与 {}（{}）并列最{}，取值相同。",
-            before.subject, before.value, after.subject, after.value, word
+            before.subject, before.value, after.subject, after.value, superlative
         ),
         Comparison::Uncertain => format!(
             "{}（{}）与 {}（{}）的约数区间重叠，无法确定谁更{}。",
-            before.subject, before.value, after.subject, after.value, word
+            before.subject, before.value, after.subject, after.value, superlative
         ),
         Comparison::Incomparable(reason) => format!(
             "{}（{}）与 {}（{}）不可比（{}）。",
@@ -3149,6 +3166,36 @@ mod tests {
         assert!(
             why.text.contains("相差 10厘米"),
             "真实单位差值应保留厘米：{}",
+            why.text
+        );
+    }
+
+    #[test]
+    fn rank_explanation_follows_resorted_direction() {
+        let mut knowledge = TestKnowledge::new();
+        for (entity, value) in [
+            ("姚明", "226厘米"),
+            ("王治郅", "214厘米"),
+            ("易建联", "213厘米"),
+        ] {
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![("身高".to_string(), value.to_string())],
+            );
+        }
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        board.apply("谁最高", &knowledge, 7).unwrap();
+        board.apply("按身高从低到高排", &knowledge, 7).unwrap();
+        let why = board.apply("为什么", &knowledge, 7).unwrap();
+        assert!(
+            why.text.contains("低，相差 1厘米"),
+            "倒序后解释应说「低」且换算正确：{}",
+            why.text
+        );
+        assert!(
+            !why.text.contains("高，相差 1厘米"),
+            "不能沿用旧方向：{}",
             why.text
         );
     }
