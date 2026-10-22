@@ -3078,8 +3078,8 @@ impl SymbolicReasoner {
         for clause in &self.session_clauses {
             engine.add_clause(clause.clone());
         }
-        // 只有用户显式晋升到命名空间/全局的补全规则才进入全局归结；
-        // 本批/本例规则留在回合内，不污染其他实体的回答。
+        // 只有用户显式晋升到全局的补全规则才进入全局归结；本批/本例/
+        // 命名空间规则留在回合内，避免没有事实级命名空间标签的引擎跨域 join。
         for clause in self.completion.reasoning_clauses() {
             engine.add_clause(clause);
         }
@@ -6336,7 +6336,10 @@ impl SymbolicReasoner {
         output
     }
 
-    /// 显式晋升补全规则的作用域；只有命名空间/全局规则进入全局归结。
+    /// 显式晋升补全规则的作用域；只有全局规则进入全局归结。
+    ///
+    /// 命名空间规则留在补全回合内按实体范围使用；要让它参与全局问答，
+    /// 必须再晋升到「全局」。这样命名空间不会被静默地当成全局。
     pub fn completion_promote(&mut self, rule_id: &str, scope: &str) -> String {
         let target = match scope.trim().to_lowercase().as_str() {
             "example" | "本例" => RuleScope::Example,
@@ -6351,7 +6354,7 @@ impl SymbolicReasoner {
             Ok(outcome) => outcome,
             Err(error) => return error.to_string(),
         };
-        if target.rank() >= RuleScope::Namespace.rank() {
+        if target == RuleScope::Global {
             if self.config.enable_resolution {
                 self.rebuild_resolver();
             }
@@ -6368,8 +6371,14 @@ impl SymbolicReasoner {
         if let Some(warning) = outcome.warning {
             output.push_str(&format!("  注意：{}。\n", warning));
         }
-        if target.rank() >= RuleScope::Namespace.rank() {
-            output.push_str("  该规则已进入全局归结与软逻辑；回答仍会标注归纳来源。\n");
+        match target {
+            RuleScope::Global => output.push_str(
+                "  该规则已进入全局归结与软逻辑；回答仍会标注归纳来源。\n",
+            ),
+            RuleScope::Namespace => output.push_str(
+                "  该规则只在补全回合内按命名空间范围参与候选生成，尚未进入全局归结；要参与全局问答请再晋升到「全局」。\n",
+            ),
+            _ => {}
         }
         output
     }
@@ -6380,7 +6389,7 @@ impl SymbolicReasoner {
             Ok(outcome) => outcome,
             Err(error) => return error.to_string(),
         };
-        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+        if outcome.scope == RuleScope::Global {
             if self.config.enable_resolution {
                 self.rebuild_resolver();
             }
@@ -6395,7 +6404,7 @@ impl SymbolicReasoner {
             outcome.scope.label()
         );
         output.push_str("  已确认的会话事实保留；该规则不再派生新结论。\n");
-        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+        if outcome.scope == RuleScope::Global {
             output.push_str("  已从全局归结与软逻辑中移除。\n");
         }
         output
@@ -6407,7 +6416,7 @@ impl SymbolicReasoner {
             Ok(outcome) => outcome,
             Err(error) => return error.to_string(),
         };
-        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+        if outcome.scope == RuleScope::Global {
             if self.config.enable_resolution {
                 self.rebuild_resolver();
             }
@@ -6421,7 +6430,7 @@ impl SymbolicReasoner {
             outcome.current.label(),
             outcome.scope.label()
         );
-        if outcome.scope.rank() >= RuleScope::Namespace.rank() {
+        if outcome.scope == RuleScope::Global {
             output.push_str("  该规则重新进入全局归结与软逻辑。\n");
         }
         output
@@ -18843,12 +18852,24 @@ types = [
         );
 
         let rule_id = reasoner.completion_ledger().rules()[0].id.clone();
+        let namespaced = reasoner.completion_promote(&rule_id, "命名空间");
+        assert!(namespaced.contains("命名空间"), "{}", namespaced);
+        assert!(
+            namespaced.contains("尚未进入全局归结"),
+            "命名空间晋升不得冒充全局：{}",
+            namespaced
+        );
+        assert_eq!(
+            reasoner.completion_ledger().reasoning_clauses().len(),
+            0,
+            "命名空间规则不得静默进入全局归结"
+        );
         let promoted = reasoner.completion_promote(&rule_id, "全局");
         assert!(promoted.contains("全局"), "{}", promoted);
         assert_eq!(
             reasoner.completion_ledger().reasoning_clauses().len(),
             1,
-            "显式晋升后规则应进入全局归结"
+            "显式晋升到全局后规则才进入全局归结"
         );
         assert!(reasoner.completion_rules_report().contains("全局"));
 

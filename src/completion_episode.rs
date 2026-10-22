@@ -14,6 +14,8 @@
 //! 纪律：
 //! - 只有 `Entailed` 是确定答案；`Induced`/`Analogical` 必须带 hedge；
 //! - 归纳规则默认 `Batch` 作用域，不自动晋升为全局；
+//! - `Namespace` 规则只在补全回合内按实体范围使用；只有显式 `Global`
+//!   才进入全局归结，避免没有事实级命名空间标签的引擎跨域 join；
 //! - 开放世界：缺失不是否定；负例只来自用户驳回；
 //! - 闭包有候选数、扫描数与规则数上限，溢出时明确标注「本批未补全」；
 //! - 候选 id 与批次 id 由规范形式哈希得出，与插入顺序无关；
@@ -1773,14 +1775,15 @@ impl CompletionLedger {
         })
     }
 
-    /// 晋升到命名空间/全局的规则才进入全局归结与软逻辑；本批规则留在回合内。
+    /// 只有显式晋升到全局的规则才进入全局归结与软逻辑。
+    ///
+    /// 命名空间规则继续在补全回合内按实体范围参与候选生成，但不进入
+    /// 全局归结：归结引擎目前没有事实级命名空间标签，把命名空间规则倒进
+    /// 全局引擎会让它跨域 join，等于把「命名空间」退化成全局。
     pub fn reasoning_clauses(&self) -> Vec<Clause> {
         self.rules
             .iter()
-            .filter(|rule| {
-                rule.is_usable()
-                    && matches!(rule.scope, RuleScope::Namespace | RuleScope::Global)
-            })
+            .filter(|rule| rule.is_usable() && rule.scope == RuleScope::Global)
             .filter_map(|rule| {
                 rule.spec.to_clause(
                     rule.confidence,
@@ -2449,7 +2452,7 @@ mod tests {
     }
 
     #[test]
-    fn promotion_expands_scope_and_feeds_global_reasoning() {
+    fn promotion_separates_namespace_from_global_reasoning() {
         let predictor = chain_predictor();
         let facts = predictor.triples().to_vec();
         let mut ledger = CompletionLedger::new();
@@ -2478,6 +2481,14 @@ mod tests {
         assert_eq!(outcome.to, RuleScope::Namespace);
         assert!(outcome.warning.is_none());
         assert_eq!(ledger.rule(&rule_id).unwrap().scope, RuleScope::Namespace);
+        assert!(
+            ledger.reasoning_clauses().is_empty(),
+            "命名空间规则不得静默进入全局归结"
+        );
+        let global = ledger
+            .promote(&rule_id, RuleScope::Global)
+            .expect("再次晋升到全局应成功");
+        assert_eq!(global.from, RuleScope::Namespace);
         assert_eq!(ledger.reasoning_clauses().len(), 1);
         assert!(ledger.promote(&rule_id, RuleScope::Batch).is_err());
     }
@@ -2496,6 +2507,13 @@ mod tests {
         ledger
             .promote(&rule_id, RuleScope::Namespace)
             .expect("晋升应成功");
+        assert!(
+            ledger.reasoning_clauses().is_empty(),
+            "命名空间规则只在本回合范围内使用"
+        );
+        ledger
+            .promote(&rule_id, RuleScope::Global)
+            .expect("全局晋升应成功");
         assert_eq!(ledger.reasoning_clauses().len(), 1);
 
         let short = &rule_id[..rule_id.len().min(21)];
@@ -2525,7 +2543,7 @@ mod tests {
             ledger.retire("rule-missing"),
             Err(EpisodeError::RuleNotFound(_))
         ));
-        assert!(ledger.render_rules().contains("命名空间"));
+        assert!(ledger.render_rules().contains("全局"));
     }
 
     #[test]
