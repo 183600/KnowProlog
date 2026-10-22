@@ -327,14 +327,31 @@ impl QueryPlanner {
                 text = rest.trim().to_string();
             }
         }
-        let trimmed = text
+        let mut trimmed = text
             .trim_end_matches(|c: char| {
                 matches!(
                     c,
                     '？' | '?' | '。' | '！' | '!' | '，' | ',' | '；' | ';' | '~' | '、' | ' '
                 )
             })
-            .trim();
+            .trim()
+            .to_string();
+        // 情态与迟疑词不改变查询目标：「李四的老师应该是谁」与「李四的老师是谁」
+        // 编译成同一计划；只在系词/存在词前吸收，避免误伤实体名。
+        for (from, to) in [
+            ("应该是", "是"),
+            ("可能是", "是"),
+            ("也许是", "是"),
+            ("大概是", "是"),
+            ("或许是", "是"),
+            ("估计是", "是"),
+            ("应该有", "有"),
+            ("可能有", "有"),
+        ] {
+            trimmed = trimmed.replace(from, to);
+        }
+        trimmed = trimmed.replace("到底", "").replace("究竟", "");
+        let trimmed = trimmed.trim();
         if trimmed.is_empty() {
             return None;
         }
@@ -1258,6 +1275,28 @@ mod tests {
                 segments: vec!["张三".to_string(), "师傅".to_string(), "师傅".to_string()]
             }
         );
+    }
+
+    #[test]
+    fn test_modal_words_do_not_change_the_query_goal() {
+        for question in [
+            "李四的老师应该是谁",
+            "李四的老师可能是谁呢？",
+            "李四的老师到底是谁",
+            "李四的老师究竟是谁",
+        ] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("情态问句应可编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: vec!["李四".to_string(), "老师".to_string()]
+                },
+                "{}",
+                question
+            );
+        }
     }
 
     #[test]
