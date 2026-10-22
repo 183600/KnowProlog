@@ -1209,7 +1209,7 @@ impl LexicalCoverage {
                 .map(|span| format!(" {}..{}", span.start, span.end))
                 .unwrap_or_default();
             lines.push(format!(
-                "  • 「{}」{}{}/{}（{}，修复：{}）：{}",
+                "  • 「{}」{} {} /{}（{}，修复：{}）：{}",
                 gap.text,
                 span,
                 gap.layer.label(),
