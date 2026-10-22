@@ -4819,6 +4819,37 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 锻造探针：重新跑正例/反例/逆生成句，防止正则在分词变化后悄悄失效。
+        if matches!(input, "锻造探针" | "复核锻造" | "锻造探针报告") {
+            match pattern_forge.verify_probes(None, &config.nlp) {
+                Ok(report) => {
+                    println!("{}", report.render(None));
+                    persist_pattern_forge(&pattern_forge, &forge_path);
+                }
+                Err(error) => println!("锻造探针失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["锻造探针：", "锻造探针:", "锻造探针 ", "复核锻造：", "复核锻造:"],
+        ) {
+            let key = rest
+                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
+                .trim();
+            let key = (!key.is_empty()).then_some(key);
+            match pattern_forge.verify_probes(key, &config.nlp) {
+                Ok(report) => {
+                    println!("{}", report.render(key));
+                    persist_pattern_forge(&pattern_forge, &forge_path);
+                }
+                Err(error) => println!("锻造探针失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
         if matches!(
             input,
             "锻造台账" | "锻造报告" | "锻造状态" | "模式锻造台账"
@@ -9719,6 +9750,7 @@ fn interactive_help() -> String {
         "  锻造模式：名 | 正例(多个用;分隔) | 反例(可空，多个用;分隔) | 路由 | 优先级 | 守卫",
         "  确认锻造 <id> / 否认锻造 <id> / 退役锻造 <id> / 遗忘锻造 <id>  转正、记反驳、停用、删除",
         "  锻造台账                            例子、正则、探针、命中/反驳与生命周期",
+        "  锻造探针 [id]                       重跑正例/反例/逆生成探针，发现悄悄失效的规则",
         "  忘模式：<名>                         遗忘一条教学模式",
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
@@ -10340,6 +10372,14 @@ fn is_command_like(input: &str) -> bool {
         "锻造报告",
         "锻造状态",
         "模式锻造台账",
+        "锻造探针",
+        "复核锻造",
+        "锻造探针报告",
+        "锻造探针：",
+        "锻造探针:",
+        "锻造探针 ",
+        "复核锻造：",
+        "复核锻造:",
         "忘模式：",
         "忘模式:",
         "忘模式 ",

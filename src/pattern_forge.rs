@@ -306,6 +306,37 @@ impl ForgeRequest {
     }
 }
 
+/// 一次探针复核的结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeVerification {
+    pub checked: usize,
+    pub passed: usize,
+    pub failures: Vec<ForgeProbe>,
+}
+
+impl ProbeVerification {
+    pub fn ok(&self) -> bool {
+        self.checked == self.passed
+    }
+
+    pub fn render(&self, key: Option<&str>) -> String {
+        let scope = key.unwrap_or("全部锻造规则");
+        let mut text = format!(
+            "锻造探针（{}）：检查 {} 条，通过 {} 条。",
+            scope, self.checked, self.passed
+        );
+        if self.failures.is_empty() {
+            text.push_str("\n所有正例仍命中、反例仍被排除。");
+        } else {
+            text.push_str("\n未通过的探针：");
+            for probe in &self.failures {
+                text.push_str(&format!("\n  - {}", probe.render()));
+            }
+        }
+        text
+    }
+}
+
 /// 一条判别探针：正例应命中，反例应被排除，逆生成句应命中。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgeProbe {
@@ -1201,6 +1232,45 @@ impl PatternForge {
             .collect()
     }
 
+    /// 重新跑一遍存下来的正例/反例/逆生成探针，并刷新通过标记。
+    ///
+    /// 探针不是一次性的学习日志：正则或分词变化后，它仍应可复核。
+    pub fn verify_probes(
+        &mut self,
+        key: Option<&str>,
+        config: &NlpConfig,
+    ) -> Result<ProbeVerification, ForgeError> {
+        let ids: Vec<String> = match key {
+            Some(key) => vec![self.resolve(key)?],
+            None => self.patterns.keys().cloned().collect(),
+        };
+        let mut checked = 0usize;
+        let mut passed = 0usize;
+        let mut failures = Vec::new();
+        for id in ids {
+            let Some(pattern) = self.patterns.get_mut(&id) else {
+                continue;
+            };
+            let regex = pattern.regex.clone();
+            for probe in &mut pattern.probes {
+                let actual = regex.matches(&preprocess(&probe.sentence, config));
+                let ok = actual == probe.expect_match;
+                probe.passed = ok;
+                checked += 1;
+                if ok {
+                    passed += 1;
+                } else {
+                    failures.push(probe.clone());
+                }
+            }
+        }
+        Ok(ProbeVerification {
+            checked,
+            passed,
+            failures,
+        })
+    }
+
     pub fn report(&self) -> String {
         let mut lines = vec![format!(
             "锻造台账（{}）：{} 条（候选 {} / 激活 {} / 退役 {}），轮次 {}",
@@ -1391,6 +1461,40 @@ mod tests {
         assert!(library
             .route(&preprocess("王强的妻子是谁", &config))
             .is_none());
+    }
+
+    #[test]
+    fn probes_can_be_reaudited_and_failures_are_reported() {
+        let config = nlp_config();
+        let mut forge = PatternForge::new();
+        let outcome = forge
+            .forge(
+                &ForgeRequest::new("女儿问法", "姚明的女儿是谁", "daughter_query")
+                    .with_negative("姚明今年几岁"),
+                &config,
+            )
+            .expect("应当学会");
+        let report = forge
+            .verify_probes(Some(&outcome.pattern.id), &config)
+            .expect("复核");
+        assert!(report.ok(), "{:?}", report.failures);
+        assert!(report.checked >= 2);
+        forge
+            .patterns
+            .get_mut(&outcome.pattern.id)
+            .expect("记录存在")
+            .probes
+            .push(ForgeProbe {
+                sentence: "姚明今年几岁".to_string(),
+                expect_match: true,
+                passed: true,
+                origin: ProbeOrigin::Generated,
+            });
+        let report = forge
+            .verify_probes(Some(&outcome.pattern.id), &config)
+            .expect("复核");
+        assert!(!report.ok());
+        assert_eq!(report.failures.len(), 1);
     }
 
     #[test]
