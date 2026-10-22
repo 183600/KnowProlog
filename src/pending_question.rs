@@ -474,6 +474,11 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
                 return AnswerBinding::Fill(object);
             }
         }
+        // 逆向洞也接受按存储方向陈述的事实：问「王五的徒弟」时，
+        // 「赵六的师傅是王五」与「王五的徒弟是赵六」是同一回事。
+        if let Some(object) = inverted_fact_subject(left, right, hole) {
+            return AnswerBinding::Fill(object);
+        }
         // 是完整陈述句但填的不是这个洞：让位，不把它当裸取值。
         return AnswerBinding::NotAnAnswer;
     }
@@ -532,6 +537,38 @@ fn left_matches_hole(left: &str, hole: &PendingHole) -> bool {
         expected.push(format!("{}{}", subject, compact(&hole.slot)));
     }
     expected.iter().any(|phrase| phrase == &left)
+}
+
+/// 逆向洞的存储方向陈述：「赵六的师傅是王五」→ 取值「赵六」。
+fn inverted_fact_subject(left: &str, right: &str, hole: &PendingHole) -> Option<String> {
+    if !hole.inverted {
+        return None;
+    }
+    fn compact(text: &str) -> String {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '的'))
+            .collect()
+    }
+    if compact(right) != compact(&hole.subject) {
+        return None;
+    }
+    let slot = compact(if hole.slot.is_empty() {
+        &hole.predicate
+    } else {
+        &hole.slot
+    });
+    if slot.is_empty() {
+        return None;
+    }
+    let compacted = compact(left);
+    let object = compacted
+        .strip_suffix(slot.as_str())?
+        .trim()
+        .to_string();
+    if object.is_empty() || object == compact(&hole.subject) {
+        return None;
+    }
+    Some(object)
 }
 
 fn clean_value(value: &str) -> String {
@@ -761,6 +798,28 @@ mod tests {
         assert_eq!(
             interpret_answer("回答悬问：王五", &hole()),
             AnswerBinding::Fill("王五".to_string())
+        );
+    }
+
+    #[test]
+    fn inverted_hole_accepts_both_statement_directions() {
+        let inverted = PendingHole::new("王五", "徒弟", "师傅", true);
+        assert_eq!(
+            interpret_answer("王五的徒弟是赵六", &inverted),
+            AnswerBinding::Fill("赵六".to_string())
+        );
+        assert_eq!(
+            interpret_answer("赵六的师傅是王五", &inverted),
+            AnswerBinding::Fill("赵六".to_string())
+        );
+        assert_eq!(
+            interpret_answer("赵六的徒弟是王五", &inverted),
+            AnswerBinding::NotAnAnswer,
+            "反方向语句不等价，不能回填"
+        );
+        assert_eq!(
+            interpret_answer("赵六的师傅是李四", &inverted),
+            AnswerBinding::NotAnAnswer
         );
     }
 

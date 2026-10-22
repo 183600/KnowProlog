@@ -15063,6 +15063,31 @@ mod tests {
     }
 
     #[test]
+    fn pending_question_handles_inverted_predicate_hole() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner.register_predicate_query_surface("徒弟", "师傅");
+        let ask = reasoner
+            .open_pending_question("王五的徒弟是谁")
+            .expect("逆向谓词缺边也应立悬问");
+        assert!(ask.contains("王五 的 徒弟"), "{}", ask);
+
+        let deferred = reasoner
+            .try_answer_pending_question("赵六的师傅是王五")
+            .expect("按存储方向陈述也应回填逆向洞");
+        assert!(deferred.contains("赵六"), "{}", deferred);
+        assert!(
+            reasoner.session_facts.iter().any(|atom| {
+                atom.predicate.as_ref() == "师傅"
+                    && atom.terms[0].name() == "赵六"
+                    && atom.terms[1].name() == "王五"
+            }),
+            "逆向回填应按存储方向写入会话事实"
+        );
+        assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
     fn pending_question_resolves_after_new_graph_facts_arrive() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&pair_facts());
