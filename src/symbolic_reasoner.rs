@@ -15649,6 +15649,11 @@ types = [
         assert!(predicate_first.contains("姚明"), "{}", predicate_first);
         assert!(!predicate_first.contains("叶莉"), "{}", predicate_first);
 
+        let nationality = reasoner
+            .answer("姚明是哪国人")
+            .expect("国籍问法应落到国籍属性");
+        assert!(nationality.contains("中国"), "{}", nationality);
+
         let english_key = reasoner
             .answer("谁的身高是180")
             .expect("英文属性键按中文词面反查");

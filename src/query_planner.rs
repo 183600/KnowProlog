@@ -155,6 +155,9 @@ impl QueryPlanner {
         if let Some(plan) = self.parse_degree_attribute(&particle_free) {
             return Some(plan);
         }
+        if let Some(plan) = self.parse_nationality_question(&particle_free) {
+            return Some(plan);
+        }
         if let Some(plan) = self.parse_age_suffix(&particle_free) {
             return Some(plan);
         }
@@ -499,6 +502,26 @@ impl QueryPlanner {
             if segments.len() < 2 || segments.len() > self.max_chain {
                 continue;
             }
+            return Some(QueryPlan::FindObject { segments });
+        }
+        None
+    }
+
+    /// 国籍问法：「姚明是哪国人」与「姚明的国籍是什么」指向同一属性。
+    fn parse_nationality_question(&self, q: &str) -> Option<QueryPlan> {
+        for suffix in ["是哪国人", "是哪个国家的人", "来自哪个国家", "来自哪里", "来自哪儿"] {
+            let Some(prefix) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let subject = prefix.trim();
+            if subject.is_empty() || Self::is_question_word(subject) {
+                continue;
+            }
+            let mut segments = Self::segments_of(subject);
+            if segments.is_empty() || segments.len() > self.max_chain {
+                continue;
+            }
+            segments.push("国籍".to_string());
             return Some(QueryPlan::FindObject { segments });
         }
         None
@@ -1373,6 +1396,27 @@ mod tests {
         );
         assert!(planner().parse("今天天气怎么样").is_none());
         assert!(planner().parse("地球多大").is_some(), "映射后仍需由知识侧决定是否有「年龄」");
+    }
+
+    #[test]
+    fn test_nationality_questions_compile_to_nationality_attribute() {
+        for question in [
+            "姚明是哪国人",
+            "姚明是哪个国家的人？",
+            "姚明来自哪里",
+        ] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("国籍问句应编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: vec!["姚明".to_string(), "国籍".to_string()]
+                },
+                "{}",
+                question
+            );
+        }
     }
 
     #[test]
