@@ -11889,6 +11889,50 @@ mod session_tests {
     }
 
     #[test]
+    fn forge_cli_parses_repeated_examples_and_activation() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "forge",
+            "--name",
+            "女儿问法",
+            "--route",
+            "daughter_query",
+            "--positive",
+            "姚明的女儿是谁",
+            "--positive",
+            "姚明的闺女是谁",
+            "--negative",
+            "姚明今年几岁",
+            "--priority",
+            "30",
+            "--activate",
+            "--json",
+        ])
+        .expect("锻造参数应可解析");
+        match cli.command {
+            Some(Commands::Forge {
+                name,
+                route,
+                positives,
+                negatives,
+                priority,
+                activate,
+                json,
+            }) => {
+                assert_eq!(name, "女儿问法");
+                assert_eq!(route, "daughter_query");
+                assert_eq!(positives.len(), 2);
+                assert_eq!(negatives, vec!["姚明今年几岁".to_string()]);
+                assert_eq!(priority, 30);
+                assert!(activate);
+                assert!(json);
+            }
+            _ => panic!("应解析为 Forge 子命令"),
+        }
+        assert!(Cli::try_parse_from(["knowprolog", "forge", "--name", "空"]).is_err());
+    }
+
+    #[test]
     fn build_kg_cli_parses_feedback_and_apply() {
         let cli = Cli::try_parse_from([
             "knowprolog",
@@ -12013,6 +12057,14 @@ mod session_tests {
             "清空模式经验",
             "教模式：老家 | {人} 的 老家 | hometown_query | 20 | 焦点",
             "忘模式：老家",
+            "锻造模式：女儿问法 | 姚明的女儿是谁 | 姚明今年几岁 | daughter_query",
+            "锻造模式",
+            "确认锻造 forge_abc123",
+            "否认锻造 abc123",
+            "退役锻造 abc123",
+            "遗忘锻造 abc123",
+            "锻造台账",
+            "锻造探针",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
