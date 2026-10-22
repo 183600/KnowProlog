@@ -3859,7 +3859,35 @@ impl SymbolicReasoner {
         atoms
     }
 
-    /// 把问句/陈述解析为溯因目标（开放问句 → 谓词链目标；陈述句 → 单原子目标）
+    /// 把一条谓词链落成归结目标；`final_term` 为链尾（常量或答案变量）。
+    fn chain_goals_to(
+        entity: &str,
+        predicates: &[ChainPredicate],
+        final_term: Term,
+    ) -> Vec<Atom> {
+        let mut goals = Vec::new();
+        let mut previous = Term::constant(entity);
+        for (index, predicate) in predicates.iter().enumerate() {
+            let next = if index + 1 == predicates.len() {
+                final_term.clone()
+            } else {
+                Term::var(&format!("V{}", index + 2))
+            };
+            let atom = if predicate.inverted {
+                Atom::pattern(&predicate.slot, next.clone(), previous.clone())
+            } else {
+                Atom::pattern(&predicate.slot, previous.clone(), next.clone())
+            };
+            goals.push(atom);
+            previous = next;
+        }
+        goals
+    }
+
+    /// 把问句/陈述解析为溯因目标（开放问句 → 谓词链目标；陈述句 → 单原子目标）。
+    ///
+    /// 覆盖的计划类型刻意与普通问答一致：开放问句、校验句、反查句和计数句
+    /// 都能在证不出时进入同一条失败前沿，而不是只有 `FindObject/Exist` 能溯因。
     fn abduction_target(&self, trimmed: &str) -> Option<(Vec<Atom>, Vec<String>, String)> {
         if let Some(plan) = self.planner.parse(trimmed) {
             match plan {
@@ -3872,23 +3900,11 @@ impl SymbolicReasoner {
                                 .all(|p| self.is_known_predicate(&p.surface))
                         {
                             let answer_var = "答案".to_string();
-                            let mut goals = Vec::new();
-                            let mut previous = Term::constant(&entity);
-                            for (index, predicate) in predicates.iter().enumerate() {
-                                let next = if index + 1 == predicates.len() {
-                                    Term::var(&answer_var)
-                                } else {
-                                    Term::var(&format!("V{}", index + 1))
-                                };
-                                // 逆向环节以槽位反方向成立：slot(next, previous)
-                                let atom = if predicate.inverted {
-                                    Atom::pattern(&predicate.slot, next.clone(), previous.clone())
-                                } else {
-                                    Atom::pattern(&predicate.slot, previous.clone(), next.clone())
-                                };
-                                goals.push(atom);
-                                previous = next;
-                            }
+                            let goals = Self::chain_goals_to(
+                                &entity,
+                                &predicates,
+                                Term::var(&answer_var),
+                            );
                             let phrase = format!(
                                 "{}的{}是谁",
                                 entity,
@@ -3916,6 +3932,131 @@ impl SymbolicReasoner {
                             vec!["答案".to_string()],
                             format!("{}的{}是否存在", entity, slot),
                         ));
+                    }
+                }
+                QueryPlan::FindObjectByPredicate { subject, predicate } => {
+                    let entity = self.aligner.canonical_form(subject.trim());
+                    let (slot, inverted) = self.resolve_question_predicate(&predicate);
+                    if !entity.is_empty()
+                        && !slot.is_empty()
+                        && self.is_known_entity(&entity)
+                        && self.is_known_predicate(&predicate)
+                    {
+                        let atom = if inverted {
+                            Atom::pattern(&slot, Term::var("答案"), Term::constant(&entity))
+                        } else {
+                            Atom::pattern(&slot, Term::constant(&entity), Term::var("答案"))
+                        };
+                        return Some((
+                            vec![atom],
+                            vec!["答案".to_string()],
+                            format!("{}的{}是谁", entity, predicate.trim()),
+                        ));
+                    }
+                }
+                QueryPlan::FindSubject { object, predicate } => {
+                    let object = self.aligner.canonical_form(object.trim());
+                    let (slot, inverted) = self.resolve_question_predicate(&predicate);
+                    if !object.is_empty()
+                        && !slot.is_empty()
+                        && self.is_known_entity(&object)
+                        && self.is_known_predicate(&predicate)
+                    {
+                        // 正常词面：答案在主语位；逆向词面（徒弟↔师傅）：答案在宾语位。
+                        let atom = if inverted {
+                            Atom::pattern(&slot, Term::constant(&object), Term::var("答案"))
+                        } else {
+                            Atom::pattern(&slot, Term::var("答案"), Term::constant(&object))
+                        };
+                        return Some((
+                            vec![atom],
+                            vec!["答案".to_string()],
+                            format!("谁的{}是{}", predicate.trim(), object),
+                        ));
+                    }
+                }
+                QueryPlan::Count { subject, predicate } => {
+                    let entity = self.aligner.canonical_form(subject.trim());
+                    let (slot, inverted) = self.resolve_question_predicate(&predicate);
+                    if !entity.is_empty()
+                        && !slot.is_empty()
+                        && self.is_known_entity(&entity)
+                        && self.is_known_predicate(&predicate)
+                    {
+                        let atom = if inverted {
+                            Atom::pattern(&slot, Term::var("答案"), Term::constant(&entity))
+                        } else {
+                            Atom::pattern(&slot, Term::constant(&entity), Term::var("答案"))
+                        };
+                        return Some((
+                            vec![atom],
+                            vec!["答案".to_string()],
+                            format!("{}的{}有几个", entity, predicate.trim()),
+                        ));
+                    }
+                }
+                QueryPlan::CheckTriple {
+                    subject_segments,
+                    object,
+                } => {
+                    let statement = format!("{}是{}", subject_segments.join("的"), object);
+                    if let Some((entity, predicates, object)) =
+                        self.parse_chain_statement(&statement)
+                    {
+                        if !predicates.is_empty()
+                            && self.is_known_entity(&entity)
+                            && predicates
+                                .iter()
+                                .all(|predicate| self.is_known_predicate(&predicate.surface))
+                        {
+                            let phrase = format!(
+                                "{}的{}是{}",
+                                entity,
+                                predicates
+                                    .iter()
+                                    .map(|predicate| predicate.surface.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("的"),
+                                object
+                            );
+                            let goals = Self::chain_goals_to(
+                                &entity,
+                                &predicates,
+                                Term::constant(&object),
+                            );
+                            return Some((goals, Vec::new(), phrase));
+                        }
+                    }
+                }
+                QueryPlan::CheckRelation {
+                    subject,
+                    predicate,
+                    object,
+                    negated,
+                } => {
+                    // 否定校验不能靠“补一条事实”解释：缺的是否定证据，不是正向前提。
+                    if !negated {
+                        let subject = self.aligner.canonical_form(subject.trim());
+                        let object = self.aligner.canonical_form(object.trim());
+                        let (slot, inverted) = self.resolve_question_predicate(&predicate);
+                        if !subject.is_empty()
+                            && !object.is_empty()
+                            && !slot.is_empty()
+                            && self.is_known_entity(&subject)
+                            && self.is_known_entity(&object)
+                            && self.is_known_predicate(&predicate)
+                        {
+                            let atom = if inverted {
+                                Atom::pattern(&slot, Term::constant(&object), Term::constant(&subject))
+                            } else {
+                                Atom::pattern(&slot, Term::constant(&subject), Term::constant(&object))
+                            };
+                            return Some((
+                                vec![atom],
+                                Vec::new(),
+                                format!("{}的{}是{}", subject, predicate.trim(), object),
+                            ));
+                        }
                     }
                 }
                 _ => {}
@@ -14057,6 +14198,25 @@ types = [
                 .any(|hypothesis| hypothesis.atom == adopted_atom),
             "采纳过的假设不应回到待定池"
         );
+    }
+
+    #[test]
+    fn abduction_target_covers_check_find_subject_and_count() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        for question in ["赵六的师傅是张三吗", "谁的师祖是赵六", "赵六有几个师傅"] {
+            let report = reasoner
+                .hypothesis_answer(question)
+                .unwrap_or_else(|| panic!("「{}」应能进入溯因目标", question));
+            assert!(
+                report.contains("假设生成")
+                    || report.contains("后向链得证")
+                    || report.contains("已证明"),
+                "「{}」应给出证明或候选解释：{}",
+                question,
+                report
+            );
+        }
     }
 
     #[test]
