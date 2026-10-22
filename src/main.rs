@@ -4800,6 +4800,12 @@ async fn run_interactive_mode(
         }
 
         // 锻造模式：从正例/反例归纳 token 正则，候选需显式确认才参与路由。
+        if matches!(input, "锻造模式" | "模式锻造") {
+            println!("用法：锻造模式：<名> | <正例(多个用;分隔)> | <反例(可空，多个用;分隔)> | <路由> | <优先级(可选)> | <守卫(可选)>");
+            println!("示例：锻造模式：女儿问法 | 姚明的女儿是谁 | 姚明今年几岁 | daughter_query");
+            println!();
+            continue;
+        }
         if let Some(spec) = strip_any_prefix(
             input,
             &[
@@ -10503,8 +10509,10 @@ fn is_command_like(input: &str) -> bool {
         "锻造模式：",
         "锻造模式:",
         "锻造模式 ",
+        "锻造模式",
         "模式锻造：",
         "模式锻造:",
+        "模式锻造",
         "确认锻造：",
         "确认锻造:",
         "确认锻造 ",
