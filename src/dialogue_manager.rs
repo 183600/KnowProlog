@@ -5023,6 +5023,38 @@ output = "value"
     }
 
     #[test]
+    fn session_confirmed_facts_survive_snapshot_roundtrip() {
+        let knowledge = mock()
+            .with_entity("姚明", &["体重"])
+            .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据");
+        let mut manager = DialogueManager::new();
+        manager.set_recovery_mode(RecoveryMode::On);
+        manager
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("推测轮应被接管");
+        manager
+            .plan_pure_dialogue("对", &knowledge)
+            .expect("确认应结算挂账");
+
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.set_recovery_mode(RecoveryMode::On);
+        restored.restore(&snapshot);
+        assert_eq!(
+            restored
+                .recovery_state()
+                .confirmed_value("姚明", "体重")
+                .map(|fact| fact.value.as_str()),
+            Some("140公斤")
+        );
+        let reply = restored
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("恢复后应直接使用会话事实");
+        assert!(reply.text.contains("140公斤"), "{}", reply.text);
+        assert!(reply.text.contains("本会话确认"), "{}", reply.text);
+    }
+
+    #[test]
     fn confirmed_provisional_becomes_next_turn_premise_and_correction_revises() {
         let knowledge = mock()
             .with_entity("姚明", &["体重"])
