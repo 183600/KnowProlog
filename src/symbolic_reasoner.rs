@@ -8364,10 +8364,7 @@ impl SymbolicReasoner {
             return None;
         }
         let predicate = &predicates[0];
-        let entity_key = self.aligner.canonical_form(entity);
-        let slot_key = self.aligner.canonical_form(&predicate.slot);
-        let surface_key = self.aligner.canonical_form(&predicate.surface);
-        if entity_key.is_empty() || slot_key.is_empty() {
+        if entity.trim().is_empty() || predicate.slot.trim().is_empty() {
             return None;
         }
         let derived = self.resolver.forward_chain(3, 100);
@@ -8379,26 +8376,17 @@ impl SymbolicReasoner {
         for fact in &derived {
             by_atom.entry(&fact.atom).or_insert(fact);
         }
-        let mut matches: Vec<&DerivedFact> = derived
+        let mut matches: Vec<(&DerivedFact, String)> = derived
             .iter()
-            .filter(|fact| {
-                let fact_predicate = self.aligner.canonical_form(fact.atom.predicate.as_ref());
-                if fact_predicate != slot_key && fact_predicate != surface_key {
-                    return false;
-                }
-                match fact.atom.terms.as_slice() {
-                    [Term::Const(left), Term::Const(right)] => {
-                        let anchor = if predicate.inverted { right } else { left };
-                        self.aligner.canonical_form(anchor) == entity_key
-                    }
-                    _ => false,
-                }
+            .filter_map(|fact| {
+                self.derived_value_for(fact, entity, predicate)
+                    .map(|value| (fact, value))
             })
             .collect();
         if matches.is_empty() {
             return None;
         }
-        matches.sort_by(|a, b| {
+        matches.sort_by(|(a, a_value), (b, b_value)| {
             a.depth
                 .cmp(&b.depth)
                 .then_with(|| {
@@ -8406,14 +8394,13 @@ impl SymbolicReasoner {
                         .partial_cmp(&a.confidence)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
-                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+                .then_with(|| a_value.cmp(b_value))
         });
         let mut seen: HashSet<String> = HashSet::new();
-        matches.retain(|fact| seen.insert(Self::derived_answer_value(fact, predicate.inverted)));
+        matches.retain(|(_, value)| seen.insert(value.clone()));
         let limit = 3usize;
         let mut output = String::from("根据当前规则现算的推导（未写入知识图谱）：\n");
-        for (index, fact) in matches.iter().take(limit).enumerate() {
-            let value = Self::derived_answer_value(fact, predicate.inverted);
+        for (index, (fact, value)) in matches.iter().take(limit).enumerate() {
             if matches.len() == 1 {
                 output.push_str(&format!(
                     "  {} 的 {} 是 {}。\n",
@@ -8453,17 +8440,66 @@ impl SymbolicReasoner {
         Some(output)
     }
 
-    fn derived_answer_value(fact: &DerivedFact, inverted: bool) -> String {
+    /// 一条推导是否以 `entity` 为锚点、目标谓词，并返回用户要的取值。
+    fn derived_value_for(
+        &self,
+        fact: &DerivedFact,
+        entity: &str,
+        predicate: &ChainPredicate,
+    ) -> Option<String> {
+        let fact_predicate = self.aligner.canonical_form(fact.atom.predicate.as_ref());
+        let slot_key = self.aligner.canonical_form(&predicate.slot);
+        let surface_key = self.aligner.canonical_form(&predicate.surface);
+        if fact_predicate != slot_key && fact_predicate != surface_key {
+            return None;
+        }
         match fact.atom.terms.as_slice() {
             [Term::Const(left), Term::Const(right)] => {
-                if inverted {
+                let anchor = if predicate.inverted { right } else { left };
+                if self.aligner.canonical_form(anchor) != self.aligner.canonical_form(entity) {
+                    return None;
+                }
+                Some(if predicate.inverted {
                     left.as_ref().to_string()
                 } else {
                     right.as_ref().to_string()
-                }
+                })
             }
-            _ => fact.atom.display(),
+            _ => None,
         }
+    }
+
+    /// 在当前前向闭包里找一条能证明 `entity 的 predicate 是 expected` 的推导。
+    fn derived_fact_for(
+        &self,
+        entity: &str,
+        predicate: &ChainPredicate,
+        expected: &str,
+    ) -> Option<DerivedFact> {
+        if !self.config.enable_resolution {
+            return None;
+        }
+        let expected_key = self.aligner.canonical_form(expected);
+        self.resolver.forward_chain(3, 100).into_iter().find(|fact| {
+            self.derived_value_for(fact, entity, predicate)
+                .map(|value| self.aligner.canonical_form(&value) == expected_key)
+                .unwrap_or(false)
+        })
+    }
+
+    /// 判断/是非问句里的一行推导回执：证明依据与规则来源，不写回知识。
+    fn render_derived_support(&self, fact: &DerivedFact) -> String {
+        let supports: Vec<String> = fact
+            .premises
+            .iter()
+            .map(|premise| self.render_atom_nl(premise))
+            .collect();
+        format!(
+            "  依据：{}。\n  规则：{}（第 {} 轮推导，按需重算）。",
+            supports.join("；"),
+            fact.rule_source,
+            fact.depth
+        )
     }
 
     fn answer_planned(&self, question: &str) -> Option<String> {
@@ -9204,6 +9240,20 @@ impl SymbolicReasoner {
             }
         }
 
+        // 直接边与图谱取值都没有命中；若规则能现算出目标取值，按推导确认，
+        // 同时把前提和规则来源一起交代，避免「是」成为无出处的判断。
+        if intermediate.len() == 1 {
+            if let Some(fact) = self.derived_fact_for(&entity, &intermediate[0], &object) {
+                return Some(format!(
+                    "是的。根据当前规则现算的推导（未写入知识图谱）：{} 的 {} 是 {}。\n{}",
+                    entity,
+                    surface,
+                    object,
+                    self.render_derived_support(&fact)
+                ));
+            }
+        }
+
         if self.is_known_entity(&entity) && self.is_known_predicate(&surface) {
             return Some(format!(
                 "根据现有知识库，无法确认「{} 的 {} 是 {}」（没有相关记录）。",
@@ -9280,6 +9330,15 @@ impl SymbolicReasoner {
             hits.retain(|hit| !excluded_set.contains(&hit.value));
         }
         if hits.is_empty() {
+            // 直接命中为空时，规则推导的取值同样可以回答「A 的 P 是谁」，
+            // 但只返回本次推导与依据，不把新取值写进图谱。
+            if excluded_set.is_empty() {
+                if let Some(answer) =
+                    self.answer_by_derivation(&entity, std::slice::from_ref(&predicate), "")
+                {
+                    return Some(answer);
+                }
+            }
             if had_hits && !excluded_display.is_empty() {
                 return Some(format!(
                     "根据现有知识库，除「{}」外，没有其他记录「{}{}…」。",
@@ -9367,6 +9426,24 @@ impl SymbolicReasoner {
         } else {
             self.predictor.has_triple(&subject, &slot, &object)
         };
+        if !holds {
+            let predicate = ChainPredicate {
+                surface: surface.clone(),
+                slot: slot.clone(),
+                inverted,
+            };
+            if let Some(fact) = self.derived_fact_for(&subject, &predicate, &object) {
+                let verdict = if negated { "不是" } else { "是的" };
+                return Some(format!(
+                    "{}。根据当前规则现算的推导（未写入知识图谱），该关系成立：{} {} {}。\n{}",
+                    verdict,
+                    subject,
+                    surface,
+                    object,
+                    self.render_derived_support(&fact)
+                ));
+            }
+        }
         if negated {
             return Some(if holds {
                 format!(
@@ -13914,6 +13991,25 @@ mod tests {
         assert!(answer.contains("推导"), "{}", answer);
         assert!(answer.contains("未写入知识图谱"), "{}", answer);
         assert!(answer.contains("依据"), "{}", answer);
+        // 确证通道也必须接受带证明的推导，而不是把它当成链接预测拒掉。
+        let certain = reasoner
+            .answer_certain("张三的师祖是谁")
+            .expect("推导答案应进入确证通道");
+        assert!(certain.contains("李四"), "{}", certain);
+        // 是非问句与直接关系查询走同一份前向闭包，不能各说各话。
+        let yes = reasoner
+            .answer("张三的师祖是李四吗")
+            .expect("是非问句应能用推导确认");
+        assert!(yes.contains("是的"), "{}", yes);
+        assert!(yes.contains("依据"), "{}", yes);
+        let no = reasoner
+            .answer("张三的师祖是王五吗")
+            .expect("未知取值应诚实回答，而不是伪造确认");
+        assert!(!no.contains("是的"), "{}", no);
+        let objects = reasoner
+            .answer_relation_objects("张三", "师祖")
+            .expect("直接关系查询也应看到推导");
+        assert!(objects.contains("李四"), "{}", objects);
         // 推导只是读模型：不能悄悄变成图谱边或会话事实。
         assert!(!reasoner.predictor.has_triple("张三", "师祖", "李四"));
         assert!(!reasoner
