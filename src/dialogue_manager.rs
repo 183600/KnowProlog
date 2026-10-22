@@ -4615,6 +4615,25 @@ mod tests {
     }
 
     #[test]
+    fn test_superlative_question_normalizes_real_unit_values() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_value("姚明", "身高", "226 厘米")
+            .with_entity("叶莉", &["身高"])
+            .with_value("叶莉", "身高", "1.90 米");
+        let mut manager = DialogueManager::new();
+        manager
+            .plan_reply("姚明的身高是多少", &knowledge)
+            .expect("先回答单个属性");
+        let reply = manager
+            .plan_reply("谁最高", &knowledge)
+            .expect("同一量纲的带单位值应能排名");
+        assert!(reply.text.contains("姚明"), "{}", reply.text);
+        assert!(reply.text.contains("226 厘米"), "{}", reply.text);
+        assert!(!reply.text.contains("叶莉」的「身高」最"), "{}", reply.text);
+    }
+
+    #[test]
     fn test_superlative_question_uses_previous_attribute_and_ranks() {
         let knowledge = MockKnowledge::new()
             .with_entity("姚明", &["身高"])

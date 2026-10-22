@@ -3117,6 +3117,49 @@ mod tests {
     }
 
     #[test]
+    fn rank_answers_real_unit_values_without_string_ordering() {
+        let mut knowledge = TestKnowledge::new();
+        for (entity, value) in [
+            ("姚明", "226厘米"),
+            ("王治郅", "2.14米"),
+            ("易建联", "2.13米"),
+            ("诺维茨基", "2.13米"),
+            ("加索尔", "2.16米"),
+            ("奥尼尔", "2.16米"),
+        ] {
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![
+                    ("身高".to_string(), value.to_string()),
+                    ("国籍".to_string(), "未知".to_string()),
+                ],
+            );
+        }
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        let highest = board.apply("谁最高", &knowledge, 7).expect("应回答最高者");
+        assert!(highest.text.contains("姚明"), "{}", highest.text);
+        assert!(highest.text.contains("226厘米"), "{}", highest.text);
+
+        let second = board.apply("第二高呢", &knowledge, 7).unwrap();
+        assert_eq!(
+            board
+                .current()
+                .and_then(|frame| frame.selected_row())
+                .map(|row| row.subject.as_str()),
+            Some("加索尔")
+        );
+        assert!(second.text.contains("当前选中"), "{}", second.text);
+
+        let why = board.apply("为什么姚明最高", &knowledge, 7).unwrap();
+        assert!(
+            why.text.contains("相差 10厘米"),
+            "真实单位差值应保留厘米：{}",
+            why.text
+        );
+    }
+
+    #[test]
     fn rank_top_n_never_fills_up_with_incomparable_rows() {
         let mut knowledge = TestKnowledge::new();
         knowledge.attributes.insert(
