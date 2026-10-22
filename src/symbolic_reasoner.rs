@@ -8,20 +8,18 @@ use crate::abduction::{
     HypothesisKind, Scenario,
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
-use crate::belief_revision::{
-    BeliefState, ChangeOp, ChangeSet, RevisionConstraints,
-};
+use crate::belief_revision::{BeliefState, ChangeOp, ChangeSet, RevisionConstraints};
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
-use crate::completion_episode::{
-    CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope,
+use crate::completion_episode::{CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope};
+use crate::contextual_rag::{
+    self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
 };
-use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
-use crate::contextual_rag::{self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame};
 use crate::contextual_reference::{SenseCard, SenseSource};
+use crate::conversational_graph::{GraphFact, MatchOptions, PatternOutcome};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
 use crate::derivation::Derivation;
@@ -29,8 +27,10 @@ use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::graph_ledger;
+use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
+use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
 use crate::law_book::{LawBook, LawStatus};
 use crate::lexical_trace::{
     self, LexicalTrace, ReadFailureKind, ReadStage, ReadTraceLedger, TraceFidelity, TraceReceipt,
@@ -279,7 +279,11 @@ fn restore_clarification(snapshot: &SnapshotClarification) -> ClarificationSessi
 fn snapshot_atom(atom: &Atom) -> SnapshotAtom {
     SnapshotAtom {
         predicate: atom.predicate.to_string(),
-        terms: atom.terms.iter().map(|term| term.name().to_string()).collect(),
+        terms: atom
+            .terms
+            .iter()
+            .map(|term| term.name().to_string())
+            .collect(),
     }
 }
 
@@ -2611,15 +2615,18 @@ impl SymbolicReasoner {
     }
 
     fn add_session_clause(&mut self, clause: &Clause) -> bool {
-        if self.session_clauses.iter().any(|existing| {
-            existing.head == clause.head && existing.body == clause.body
-        }) {
+        if self
+            .session_clauses
+            .iter()
+            .any(|existing| existing.head == clause.head && existing.body == clause.body)
+        {
             return false;
         }
         let mut new_predicates = false;
         for atom in std::iter::once(&clause.head).chain(clause.body.iter()) {
             if !self.aligner.is_registered(&atom.predicate) {
-                self.aligner.register_term(&atom.predicate, TermKind::Relation);
+                self.aligner
+                    .register_term(&atom.predicate, TermKind::Relation);
                 new_predicates = true;
             }
         }
@@ -2692,9 +2699,7 @@ impl SymbolicReasoner {
             self.lessons_parsed = self
                 .lessons
                 .iter()
-                .flat_map(|sentence| {
-                    chinese_reasoning_nlu::parse_lessons(sentence).lessons
-                })
+                .flat_map(|sentence| chinese_reasoning_nlu::parse_lessons(sentence).lessons)
                 .collect();
             if self.config.enable_problog && self.config.enable_soft_logic {
                 self.rebuild_problog();
@@ -3860,11 +3865,7 @@ impl SymbolicReasoner {
     }
 
     /// 把一条谓词链落成归结目标；`final_term` 为链尾（常量或答案变量）。
-    fn chain_goals_to(
-        entity: &str,
-        predicates: &[ChainPredicate],
-        final_term: Term,
-    ) -> Vec<Atom> {
+    fn chain_goals_to(entity: &str, predicates: &[ChainPredicate], final_term: Term) -> Vec<Atom> {
         let mut goals = Vec::new();
         let mut previous = Term::constant(entity);
         for (index, predicate) in predicates.iter().enumerate() {
@@ -3900,11 +3901,8 @@ impl SymbolicReasoner {
                                 .all(|p| self.is_known_predicate(&p.surface))
                         {
                             let answer_var = "答案".to_string();
-                            let goals = Self::chain_goals_to(
-                                &entity,
-                                &predicates,
-                                Term::var(&answer_var),
-                            );
+                            let goals =
+                                Self::chain_goals_to(&entity, &predicates, Term::var(&answer_var));
                             let phrase = format!(
                                 "{}的{}是谁",
                                 entity,
@@ -4019,11 +4017,8 @@ impl SymbolicReasoner {
                                     .join("的"),
                                 object
                             );
-                            let goals = Self::chain_goals_to(
-                                &entity,
-                                &predicates,
-                                Term::constant(&object),
-                            );
+                            let goals =
+                                Self::chain_goals_to(&entity, &predicates, Term::constant(&object));
                             return Some((goals, Vec::new(), phrase));
                         }
                     }
@@ -4047,9 +4042,17 @@ impl SymbolicReasoner {
                             && self.is_known_predicate(&predicate)
                         {
                             let atom = if inverted {
-                                Atom::pattern(&slot, Term::constant(&object), Term::constant(&subject))
+                                Atom::pattern(
+                                    &slot,
+                                    Term::constant(&object),
+                                    Term::constant(&subject),
+                                )
                             } else {
-                                Atom::pattern(&slot, Term::constant(&subject), Term::constant(&object))
+                                Atom::pattern(
+                                    &slot,
+                                    Term::constant(&subject),
+                                    Term::constant(&object),
+                                )
                             };
                             return Some((
                                 vec![atom],
@@ -6113,13 +6116,9 @@ impl SymbolicReasoner {
     }
 
     fn completion_ask_line(&mut self) -> Option<String> {
-        self.completion.next_question().map(|question| {
-            format!(
-                "  下一问（{}）：{}\n",
-                question.kind.label(),
-                question.text
-            )
-        })
+        self.completion
+            .next_question()
+            .map(|question| format!("  下一问（{}）：{}\n", question.kind.label(), question.text))
     }
 
     /// 把恢复阶梯（或宿主脚本）的一次用户裁决写入补全台账。
@@ -6182,9 +6181,11 @@ impl SymbolicReasoner {
                 )
             })
             .collect();
-        base.extend(self.attributes.iter().map(|(entity, attribute, value)| {
-            format!("{} --{}--> {}", entity, attribute, value)
-        }));
+        base.extend(
+            self.attributes.iter().map(|(entity, attribute, value)| {
+                format!("{} --{}--> {}", entity, attribute, value)
+            }),
+        );
 
         let mut session = Vec::new();
         for atom in &self.session_facts {
@@ -6344,10 +6345,8 @@ impl SymbolicReasoner {
                     {
                         self.completion_promote(rule_id.trim(), scope.trim())
                     }
-                    _ => {
-                        "用法：晋升补全规则：<规则id>|<作用域>，作用域为本例/本批/命名空间/全局"
-                            .to_string()
-                    }
+                    _ => "用法：晋升补全规则：<规则id>|<作用域>，作用域为本例/本批/命名空间/全局"
+                        .to_string(),
                 });
             }
         }
@@ -7468,6 +7467,178 @@ impl SymbolicReasoner {
         Some(output.trim_end().to_string())
     }
 
+    fn answer_graph_question(&self, question: &str) -> Option<String> {
+        let lexicon = self.graph_lexicon();
+        let compiled = lexicon.compile(question)?;
+        let facts = self.graph_facts();
+        let outcome = compiled
+            .pattern
+            .evaluate(&facts, MatchOptions::default())
+            .ok()?;
+        Some(self.render_graph_question(&compiled, &outcome, &facts))
+    }
+
+    fn graph_lexicon(&self) -> PatternLexicon {
+        let mut lexicon = PatternLexicon::new();
+        let predicates = self.generator.all_predicates();
+        for entity in self.generator.all_entities() {
+            lexicon.add_entity(&entity, &entity);
+        }
+        for entity_type in self.generator.all_types() {
+            lexicon.add_type(&entity_type, &entity_type);
+        }
+        for (entity, entity_type) in self.generator.typed_entities() {
+            if !entity_type.trim().is_empty() {
+                lexicon.add_type(&entity_type, &entity_type);
+            }
+            lexicon.add_entity(&entity, &entity);
+        }
+        for predicate in &predicates {
+            lexicon.add_predicate(predicate, predicate);
+        }
+        for (surface, canonical) in self.generator.predicate_surfaces() {
+            lexicon.add_predicate(surface, canonical);
+        }
+        for (surface, (canonical, inverted)) in &self.inverse_query_map {
+            if !*inverted {
+                lexicon.add_predicate(surface, canonical);
+            }
+        }
+        for (alias, canonical) in self.aligner.synonyms() {
+            if predicates.iter().any(|predicate| predicate == canonical)
+                || self.predictor.has_predicate(canonical)
+            {
+                lexicon.add_predicate(alias, canonical);
+            }
+        }
+        lexicon
+    }
+
+    fn graph_facts(&self) -> Vec<GraphFact> {
+        let mut facts = GraphFact::from_triples(self.predictor.triples());
+        for (entity, entity_type) in self.generator.typed_entities() {
+            if !entity_type.trim().is_empty() {
+                facts.push(GraphFact::type_assertion(entity, entity_type));
+            }
+        }
+        for ((entity, key), values) in &self.attribute_index {
+            for value in values {
+                facts.push(GraphFact::attribute(entity, key, value));
+            }
+        }
+        for atom in self.positive_session_atoms() {
+            if atom.terms.len() == 2
+                && !atom.terms[0].is_var()
+                && !atom.terms[1].is_var()
+                && atom.predicate.as_ref() != PROOF_TYPE
+            {
+                facts.push(GraphFact::relation(
+                    atom.terms[0].name(),
+                    atom.predicate.as_ref(),
+                    atom.terms[1].name(),
+                ));
+            }
+        }
+        facts.sort_by(|left, right| {
+            (
+                &left.subject,
+                &left.predicate,
+                &left.object,
+                left.source as u8,
+            )
+                .cmp(&(
+                    &right.subject,
+                    &right.predicate,
+                    &right.object,
+                    right.source as u8,
+                ))
+        });
+        facts.dedup();
+        facts
+    }
+
+    fn render_graph_question(
+        &self,
+        compiled: &CompiledGraphQuestion,
+        outcome: &PatternOutcome,
+        facts: &[GraphFact],
+    ) -> String {
+        let select = &compiled.pattern.select;
+        let mut rows: Vec<String> = outcome
+            .solutions
+            .iter()
+            .map(|solution| solution.row(select))
+            .filter(|row| !row.is_empty())
+            .collect();
+        const MAX_ROWS: usize = 12;
+        let hidden = rows.len().saturating_sub(MAX_ROWS);
+        rows.truncate(MAX_ROWS);
+        let total = outcome.solutions.len();
+        let mut output = match compiled.kind {
+            GraphQuestionKind::Conjunction => {
+                if rows.is_empty() {
+                    "没有找到同时满足这些条件的实体。".to_string()
+                } else {
+                    format!("满足全部条件的有 {} 个：{}。", total, rows.join("、"))
+                }
+            }
+            GraphQuestionKind::Existential => {
+                if rows.is_empty() {
+                    "没有找到满足这些条件的实体。".to_string()
+                } else {
+                    format!("存在满足条件的实体 {} 个：{}。", total, rows.join("、"))
+                }
+            }
+            GraphQuestionKind::Equality => {
+                let left = compiled
+                    .subject_variables
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "前者".to_string());
+                let right = compiled
+                    .subject_variables
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| "后者".to_string());
+                let predicate = compiled.focus_predicate.as_deref().unwrap_or("共同值");
+                if rows.is_empty() {
+                    format!("没有找到「{}」和「{}」共同的{}。", left, right, predicate)
+                } else {
+                    format!(
+                        "「{}」和「{}」共同的{}：{}。",
+                        left,
+                        right,
+                        predicate,
+                        rows.join("、")
+                    )
+                }
+            }
+            GraphQuestionKind::SharedObject => {
+                let subjects = compiled.subject_variables.join("、");
+                let predicate = compiled.focus_predicate.as_deref().unwrap_or("指向");
+                if rows.is_empty() {
+                    format!("没有找到「{}」都{}的对象。", subjects, predicate)
+                } else {
+                    format!("「{}」都{}：{}。", subjects, predicate, rows.join("、"))
+                }
+            }
+        };
+        if hidden > 0 {
+            output.push_str(&format!("（另有 {} 项未展开）", hidden));
+        }
+        if outcome.truncated {
+            output.push_str("（搜索预算已用尽，结果为下界）");
+        }
+        if total <= 3 && !outcome.solutions.is_empty() {
+            let lines = outcome.solutions[0].witness_lines(facts);
+            if !lines.is_empty() {
+                output.push_str("\n依据：");
+                output.push_str(&lines.join("；"));
+            }
+        }
+        output
+    }
+
     fn answer_planned(&self, question: &str) -> Option<String> {
         let parsed = self.planner.parse(question);
         if let Some(answer) = parsed
@@ -8563,6 +8734,9 @@ impl SymbolicReasoner {
                 return Some(self.annotate_assumption_world(answer));
             }
         }
+        if let Some(answer) = self.answer_graph_question(question) {
+            return Some(self.annotate_assumption_world(answer));
+        }
         if let Some(answer) = self.answer_by_evidence(question) {
             return Some(self.annotate_assumption_world(answer));
         }
@@ -8594,6 +8768,9 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_planned(question) {
             return Some(answer);
         }
+        if let Some(answer) = self.answer_graph_question(question) {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_by_prediction(question) {
             return Some(answer);
         }
@@ -8615,10 +8792,8 @@ impl SymbolicReasoner {
         }
         let normalized_question = self.aligner.normalize_cow(question);
         let mentioned_canonicals = self.mentioned_predicate_canonicals(question);
-        let explicit_predicate = self.first_mentioned_known_predicate(
-            normalized_question.as_ref(),
-            &mentioned_canonicals,
-        );
+        let explicit_predicate = self
+            .first_mentioned_known_predicate(normalized_question.as_ref(), &mentioned_canonicals);
         let explicit_anchors = self.entities_mentioned(question);
         let continuation = contextual_rag::is_continuation(question);
         let referenced = if continuation {
@@ -8720,7 +8895,11 @@ impl SymbolicReasoner {
         }
         let mut seen: HashSet<(String, String, String)> = HashSet::new();
         dense_hits.retain(|hit| {
-            seen.insert((hit.subject.clone(), hit.predicate.clone(), hit.object.clone()))
+            seen.insert((
+                hit.subject.clone(),
+                hit.predicate.clone(),
+                hit.object.clone(),
+            ))
         });
         let mut type_hints: HashMap<String, String> = HashMap::new();
         for hit in &dense_hits {
@@ -8730,13 +8909,8 @@ impl SymbolicReasoner {
                     .or_insert_with(|| entity_type.to_string());
             }
         }
-        let assembly = contextual_rag::assemble(
-            &frame,
-            &dense_hits,
-            &holo_hits,
-            &type_hints,
-            max_items,
-        );
+        let assembly =
+            contextual_rag::assemble(&frame, &dense_hits, &holo_hits, &type_hints, max_items);
         if assembly.bundle.is_none() {
             return None;
         }
@@ -9910,10 +10084,7 @@ impl SymbolicReasoner {
             output.push_str("  （以上规则已存在，未重复添加）\n");
         } else {
             output.push_str(&format!("  新增 {} 条会话规则。", added.len()));
-            let ops = added
-                .into_iter()
-                .map(ChangeOp::AddRule)
-                .collect::<Vec<_>>();
+            let ops = added.into_iter().map(ChangeOp::AddRule).collect::<Vec<_>>();
             self.record_session_revision(
                 format!("学习规则：{}", sentence),
                 ops,
@@ -11977,7 +12148,10 @@ mod tests {
             no_more.bundle.as_ref().map(|bundle| bundle.kind),
             Some(contextual_rag::BundleKind::NoMore)
         );
-        assert!(no_more.answer().unwrap_or_default().contains("没有新的已核实证据"));
+        assert!(no_more
+            .answer()
+            .unwrap_or_default()
+            .contains("没有新的已核实证据"));
     }
 
     #[test]
@@ -14393,7 +14567,11 @@ types = [
         let before = reasoner.session_facts().len();
         let blocked = reasoner.adopt_hypothesis(1).expect("应给出拒绝回执");
         assert!(blocked.contains("最小冲突核"), "{}", blocked);
-        assert!(blocked.contains("30") && blocked.contains("31"), "{}", blocked);
+        assert!(
+            blocked.contains("30") && blocked.contains("31"),
+            "{}",
+            blocked
+        );
         assert_eq!(reasoner.session_facts().len(), before, "拒绝时零写入");
         assert_eq!(reasoner.pending_hypotheses().len(), 1, "拒绝后假设保留");
         assert!(
@@ -14480,7 +14658,11 @@ types = [
             .answer_clarification("全部确认")
             .expect("应处理批量回答");
         assert!(output.contains("整批零写入"), "{}", output);
-        assert!(output.contains("是否成立"), "被拒绝后必须重新提问：{}", output);
+        assert!(
+            output.contains("是否成立"),
+            "被拒绝后必须重新提问：{}",
+            output
+        );
         assert_eq!(reasoner.session_facts().len(), before);
         assert!(reasoner.clarification_active(), "整批应恢复为待问");
     }
@@ -14509,9 +14691,7 @@ types = [
             contradicts_known: false,
         }]);
         reasoner.start_clarification().expect("应开始澄清");
-        let output = reasoner
-            .answer_clarification("是")
-            .expect("应处理回答");
+        let output = reasoner.answer_clarification("是").expect("应处理回答");
         assert!(output.contains("最小冲突核"), "{}", output);
         assert!(
             output.contains("是否成立"),
@@ -14564,7 +14744,8 @@ types = [
     fn abduction_target_covers_check_find_subject_and_count() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
-        for question in ["赵六的师傅是张三吗", "谁的师祖是赵六", "赵六有几个师傅"] {
+        for question in ["赵六的师傅是张三吗", "谁的师祖是赵六", "赵六有几个师傅"]
+        {
             let report = reasoner
                 .hypothesis_answer(question)
                 .unwrap_or_else(|| panic!("「{}」应能进入溯因目标", question));
@@ -14819,10 +15000,9 @@ types = [
     fn pending_hypotheses_and_clarification_survive_snapshot() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
-        let empty = String::from_utf8(
-            canonical::canonical_bytes(&reasoner.dialogue_snapshot()).unwrap(),
-        )
-        .unwrap();
+        let empty =
+            String::from_utf8(canonical::canonical_bytes(&reasoner.dialogue_snapshot()).unwrap())
+                .unwrap();
         assert!(
             !empty.contains("pending_hypotheses") && !empty.contains("last_abduction_goal"),
             "空会话不应把溯因字段写进快照：{}",
@@ -14858,9 +15038,7 @@ types = [
         assert_eq!(pending_before, pending_after, "待定假设应按原序恢复");
         assert!(restored.clarification_active(), "澄清会话应跨快照继续");
         assert_eq!(
-            restored
-                .clarification_progress()
-                .expect("澄清进度应存在"),
+            restored.clarification_progress().expect("澄清进度应存在"),
             reasoner.clarification_progress().expect("澄清进度应存在")
         );
 
@@ -17218,7 +17396,11 @@ types = [
             .handle_completion_command("晋升补全规则：")
             .expect("空参数应给出用法")
             .contains("用法"));
-        assert!(opened.contains("下一问"), "打开回合应给出一个提问：{}", opened);
+        assert!(
+            opened.contains("下一问"),
+            "打开回合应给出一个提问：{}",
+            opened
+        );
         assert!(reasoner
             .handle_completion_command("补全提问")
             .expect("提问命令应被接管")
@@ -17264,38 +17446,16 @@ types = [
                 .any(|nomination| nomination.value == "吴十"),
             "确认前应可提名吴十"
         );
-        assert!(reasoner.note_dialogue_verdict(
-            "孙八",
-            "师祖",
-            "吴十",
-            true,
-            "receipt-1"
-        ));
+        assert!(reasoner.note_dialogue_verdict("孙八", "师祖", "吴十", true, "receipt-1"));
         assert_eq!(reasoner.completion_ledger().rules().len(), 1);
         assert!(
-            reasoner
-                .recovery_nominations("孙八", "师祖")
-                .is_empty(),
+            reasoner.recovery_nominations("孙八", "师祖").is_empty(),
             "已确认的候选不应再次追问"
         );
-        assert!(reasoner
-            .completion_regression_report()
-            .contains("确认 1"));
-        assert!(!reasoner.note_dialogue_verdict(
-            "孙八",
-            "师祖",
-            "吴十",
-            true,
-            "receipt-1"
-        ));
+        assert!(reasoner.completion_regression_report().contains("确认 1"));
+        assert!(!reasoner.note_dialogue_verdict("孙八", "师祖", "吴十", true, "receipt-1"));
 
-        assert!(reasoner.note_dialogue_verdict(
-            "郑十一",
-            "师祖",
-            "孙十三",
-            false,
-            "receipt-2"
-        ));
+        assert!(reasoner.note_dialogue_verdict("郑十一", "师祖", "孙十三", false, "receipt-2"));
         assert!(
             reasoner
                 .recovery_nominations("郑十一", "师祖")
@@ -17327,10 +17487,18 @@ types = [
         reasoner.observe_facts(&facts);
 
         let manifest = reasoner.knowledge_layer_manifest();
-        assert_eq!(manifest.revision, reasoner.revision(), "清单必须锚定知识版本");
+        assert_eq!(
+            manifest.revision,
+            reasoner.revision(),
+            "清单必须锚定知识版本"
+        );
         assert_eq!(manifest.layers.len(), 4);
         assert_eq!(
-            manifest.layers.iter().map(|layer| layer.id.as_str()).collect::<Vec<_>>(),
+            manifest
+                .layers
+                .iter()
+                .map(|layer| layer.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["L0", "L1", "L2", "L3"],
             "层次顺序必须稳定"
         );
@@ -17364,7 +17532,10 @@ types = [
             with_session.layer("L1").expect("会话层").count > 0,
             "确认后的会话事实必须与基础层分列"
         );
-        assert_ne!(manifest.digest, with_session.digest, "状态变化必须改变合成摘要");
+        assert_ne!(
+            manifest.digest, with_session.digest,
+            "状态变化必须改变合成摘要"
+        );
         let text = reasoner.knowledge_layers_report();
         assert!(text.contains("知识容器层次清单"), "{}", text);
         assert!(text.contains("L3 假设层"), "{}", text);
@@ -17509,7 +17680,172 @@ types = [
 
         let redone = reasoner.undo_last_session_revision();
         assert!(redone.contains("教学原句 +0 / -1"), "{}", redone);
-        assert!(reasoner.rule_ledger_entries().is_empty(), "重做后规则应再次撤回");
+        assert!(
+            reasoner.rule_ledger_entries().is_empty(),
+            "重做后规则应再次撤回"
+        );
         assert!(reasoner.lessons().is_empty(), "重做后教学原句也应撤回");
+    }
+
+    fn graph_pattern_facts() -> Vec<PrologFact> {
+        let empty = HashMap::new();
+        let mut yao = HashMap::new();
+        yao.insert("出生地".to_string(), "上海".to_string());
+        let mut liu = HashMap::new();
+        liu.insert("出生地".to_string(), "上海".to_string());
+        vec![
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "Person".to_string(),
+                properties: empty.clone(),
+            },
+            PrologFact::Entity {
+                name: "李四".to_string(),
+                entity_type: "Person".to_string(),
+                properties: empty.clone(),
+            },
+            PrologFact::Entity {
+                name: "张艺谋".to_string(),
+                entity_type: "中国人".to_string(),
+                properties: empty.clone(),
+            },
+            PrologFact::Entity {
+                name: "电影A".to_string(),
+                entity_type: "科幻片".to_string(),
+                properties: empty.clone(),
+            },
+            PrologFact::Entity {
+                name: "电影B".to_string(),
+                entity_type: "剧情片".to_string(),
+                properties: empty.clone(),
+            },
+            PrologFact::Entity {
+                name: "金棕榈".to_string(),
+                entity_type: "奖项".to_string(),
+                properties: empty.clone(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "导演".to_string(),
+                to: "电影A".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "获奖".to_string(),
+                to: "金棕榈".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "获奖".to_string(),
+                to: "金棕榈".to_string(),
+            },
+            PrologFact::Relation {
+                from: "电影A".to_string(),
+                rel_type: "主演".to_string(),
+                to: "张艺谋".to_string(),
+            },
+            PrologFact::Relation {
+                from: "电影B".to_string(),
+                rel_type: "主演".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Entity {
+                name: "姚明".to_string(),
+                entity_type: "Person".to_string(),
+                properties: yao,
+            },
+            PrologFact::Entity {
+                name: "刘翔".to_string(),
+                entity_type: "Person".to_string(),
+                properties: liu,
+            },
+        ]
+    }
+
+    fn graph_pattern_reasoner() -> SymbolicReasoner {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.register_predicate_alias("拿过", "获奖");
+        reasoner.observe_facts(&graph_pattern_facts());
+        reasoner
+    }
+
+    #[test]
+    fn graph_question_answers_conjunction_over_kg() {
+        let reasoner = graph_pattern_reasoner();
+        let answer = reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("合取问句应由图谱模式回答");
+        assert!(answer.contains("张三"), "{}", answer);
+        assert!(!answer.contains("李四"), "{}", answer);
+        assert!(answer.contains("依据"), "{}", answer);
+        let via_answer = reasoner
+            .answer("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("回答管线应接入图谱模式");
+        assert!(via_answer.contains("张三"), "{}", via_answer);
+    }
+
+    #[test]
+    fn graph_question_answers_existential_over_kg() {
+        let reasoner = graph_pattern_reasoner();
+        let answer = reasoner
+            .answer_graph_question("有没有一部科幻片，主演是中国人？")
+            .expect("存在问句应由图谱模式回答");
+        assert!(answer.contains("电影A"), "{}", answer);
+        assert!(!answer.contains("电影B"), "{}", answer);
+        assert!(answer.contains("存在"), "{}", answer);
+    }
+
+    #[test]
+    fn graph_question_answers_equality_over_attributes() {
+        let reasoner = graph_pattern_reasoner();
+        let answer = reasoner
+            .answer_graph_question("姚明和刘翔出生在同一个城市吗？")
+            .expect("等值问句应由图谱模式回答");
+        assert!(answer.contains("上海"), "{}", answer);
+        assert!(answer.contains("共同的出生地"), "{}", answer);
+    }
+
+    #[test]
+    fn graph_question_answers_shared_object() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "认识".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "认识".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "认识".to_string(),
+                to: "赵六".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer_graph_question("张三和李四都认识谁？")
+            .expect("共享对象问句应由图谱模式回答");
+        assert!(answer.contains("王五"), "{}", answer);
+        assert!(!answer.contains("赵六"), "{}", answer);
+    }
+
+    #[test]
+    fn graph_question_keeps_unrelated_questions_on_existing_pipeline() {
+        let reasoner = graph_pattern_reasoner();
+        assert!(reasoner
+            .graph_lexicon()
+            .compile("谁既导演过科幻片，又拿过金棕榈？")
+            .is_some());
+        assert!(reasoner
+            .graph_lexicon()
+            .compile("这台机器怎么启动？")
+            .is_none());
+        assert!(reasoner
+            .graph_lexicon()
+            .compile("张三的师傅是谁？")
+            .is_none());
     }
 }

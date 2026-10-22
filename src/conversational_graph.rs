@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::graph_question::PatternLexicon;
 use crate::link_prediction::Triple;
 use crate::prolog_engine::PrologFact;
 
@@ -21,6 +22,7 @@ pub enum PatternError {
     NoRowsToExplain,
     NoPreviousPattern,
     CannotDropLastEdge,
+    CannotDropLastConstraint,
 }
 
 impl fmt::Display for PatternError {
@@ -42,6 +44,7 @@ impl fmt::Display for PatternError {
             PatternError::NoRowsToExplain => write!(f, "当前没有可解释的匹配结果"),
             PatternError::NoPreviousPattern => write!(f, "没有可撤回的上一次模式"),
             PatternError::CannotDropLastEdge => write!(f, "至少保留一条模式边"),
+            PatternError::CannotDropLastConstraint => write!(f, "当前没有可去掉的约束"),
         }
     }
 }
@@ -697,6 +700,7 @@ pub enum GraphCommand {
     Explain,
     Count,
     DropLastEdge,
+    DropLastConstraint,
     AddEdge(EdgePattern),
     AddConstraint(PatternConstraint),
     Withdraw,
@@ -827,6 +831,14 @@ impl ConversationalGraph {
                 next.edges.pop();
                 self.replace(next, facts, options)
             }
+            GraphCommand::DropLastConstraint => {
+                if self.pattern.constraints.is_empty() {
+                    return Err(PatternError::CannotDropLastConstraint);
+                }
+                let mut next = self.pattern.clone();
+                next.constraints.pop();
+                self.replace(next, facts, options)
+            }
             GraphCommand::AddEdge(edge) => {
                 let mut next = self.pattern.clone();
                 next.edges.push(edge);
@@ -889,6 +901,113 @@ impl ConversationalGraph {
             lower_bound: self.outcome.count_is_lower_bound(),
             rows: self.current_rows().to_vec(),
         }
+    }
+
+    pub fn interpret(
+        &mut self,
+        text: &str,
+        lexicon: &PatternLexicon,
+        facts: &[GraphFact],
+        options: MatchOptions,
+    ) -> Option<Result<GraphReply, PatternError>> {
+        let command = self.command_from_text(text, lexicon)?;
+        Some(self.apply(command, facts, options))
+    }
+
+    fn command_from_text(&self, text: &str, lexicon: &PatternLexicon) -> Option<GraphCommand> {
+        let text = text
+            .trim()
+            .trim_end_matches(['？', '?', '！', '!', '。', '.', ' ']);
+        if text.is_empty() {
+            return None;
+        }
+        if [
+            "还有呢",
+            "还有吗",
+            "还有别的",
+            "还有",
+            "继续",
+            "下一页",
+            "下一个",
+        ]
+        .iter()
+        .any(|phrase| text == *phrase || text.starts_with(phrase))
+        {
+            return Some(GraphCommand::NextPage);
+        }
+        if ["上一页", "前一页", "往回翻", "返回上一页"]
+            .iter()
+            .any(|phrase| text == *phrase || text.starts_with(phrase))
+        {
+            return Some(GraphCommand::PreviousPage);
+        }
+        if ["为什么", "依据", "证据", "解释", "怎么知道", "凭什么"]
+            .iter()
+            .any(|phrase| text.contains(phrase))
+        {
+            return Some(GraphCommand::Explain);
+        }
+        if ["多少", "几个", "总数", "一共", "数量"]
+            .iter()
+            .any(|phrase| text.contains(phrase))
+        {
+            return Some(GraphCommand::Count);
+        }
+        if ["撤回", "撤销", "回到上一个", "恢复上一个"]
+            .iter()
+            .any(|phrase| text.contains(phrase))
+        {
+            return Some(GraphCommand::Withdraw);
+        }
+        let drops_condition = ["去掉", "删除", "取消", "少一个", "不要"]
+            .iter()
+            .any(|phrase| text.contains(phrase))
+            && ["条件", "约束", "这条", "最后"]
+                .iter()
+                .any(|phrase| text.contains(phrase));
+        if drops_condition {
+            if self.pattern.constraints.is_empty() {
+                return Some(GraphCommand::DropLastEdge);
+            }
+            return Some(GraphCommand::DropLastConstraint);
+        }
+        for prefix in ["只看", "只要", "限定", "仅看", "只保留"] {
+            if let Some(rest) = text.strip_prefix(prefix) {
+                let rest = rest.trim_start_matches(['是', '有', '要', ' ']);
+                let rest = rest.trim_end_matches(['的', '吧', '呢', ' ']);
+                if rest.is_empty() {
+                    return None;
+                }
+                let variable = self.focus_variable()?;
+                let (value, is_type) = lexicon.resolve_object(rest)?;
+                if is_type {
+                    return Some(GraphCommand::AddEdge(EdgePattern::var_const(
+                        variable, "type", value,
+                    )));
+                }
+                return Some(GraphCommand::AddConstraint(PatternConstraint::Equal {
+                    variable,
+                    value,
+                }));
+            }
+        }
+        None
+    }
+
+    fn focus_variable(&self) -> Option<String> {
+        if let Some(variable) = self.pattern.select.first() {
+            return Some(variable.clone());
+        }
+        self.pattern
+            .edges
+            .iter()
+            .find_map(|edge| match &edge.subject {
+                PatternTerm::Var(name) => Some(name.clone()),
+                PatternTerm::Const(_) => match &edge.object {
+                    PatternTerm::Var(name) => Some(name.clone()),
+                    PatternTerm::Const(_) => None,
+                },
+            })
     }
 }
 
@@ -1293,6 +1412,104 @@ mod tests {
                 count: 1,
                 lower_bound: true
             }
+        ));
+    }
+
+    fn interpretation_lexicon() -> PatternLexicon {
+        let mut lexicon = PatternLexicon::new();
+        for entity in ["张三", "李四", "王五", "赵六", "金棕榈"] {
+            lexicon.add_entity(entity, entity);
+        }
+        lexicon.add_predicate("获奖", "获奖");
+        lexicon.add_type("科幻片", "科幻片");
+        lexicon
+    }
+
+    #[test]
+    fn interpret_pages_explains_and_counts() {
+        let facts = sample_facts();
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::var_const("person", "获奖", "金棕榈")],
+            vec!["person".to_string()],
+        );
+        let mut conversation = ConversationalGraph::new(pattern, &facts, MatchOptions::default())
+            .unwrap()
+            .with_page_size(2);
+        let lexicon = interpretation_lexicon();
+        let page = conversation
+            .interpret("还有呢", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(page, GraphReply::Page { page: 1, .. }));
+        let explanation = conversation
+            .interpret("为什么", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(explanation, GraphReply::Explanation(_)));
+        let count = conversation
+            .interpret("一共多少个", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(count, GraphReply::Count { count: 3, .. }));
+    }
+
+    #[test]
+    fn interpret_restricts_and_drops_conditions() {
+        let facts = sample_facts();
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::var_const("person", "获奖", "金棕榈")],
+            vec!["person".to_string()],
+        );
+        let mut conversation =
+            ConversationalGraph::new(pattern, &facts, MatchOptions::default()).unwrap();
+        let lexicon = interpretation_lexicon();
+        let narrowed = conversation
+            .interpret("只看张三", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(narrowed, GraphReply::Changed { total: 1, .. }));
+        assert_eq!(conversation.pattern().constraints.len(), 1);
+        let relaxed = conversation
+            .interpret("去掉这个条件", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(relaxed, GraphReply::Changed { total: 3, .. }));
+        assert!(conversation.pattern().constraints.is_empty());
+        assert!(matches!(
+            conversation
+                .interpret("去掉这个条件", &lexicon, &facts, MatchOptions::default())
+                .unwrap(),
+            Err(PatternError::CannotDropLastEdge)
+        ));
+        assert!(conversation
+            .interpret("随便说点什么", &lexicon, &facts, MatchOptions::default())
+            .is_none());
+    }
+
+    #[test]
+    fn interpret_type_restriction_adds_type_edge() {
+        let facts = sample_facts();
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::var_var("film", "type", "kind")],
+            vec!["film".to_string()],
+        );
+        let mut conversation =
+            ConversationalGraph::new(pattern, &facts, MatchOptions::default()).unwrap();
+        let lexicon = interpretation_lexicon();
+        let narrowed = conversation
+            .interpret("只看科幻片", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(narrowed, GraphReply::Changed { total: 1, .. }));
+        assert_eq!(conversation.pattern().edges.len(), 2);
+        assert_eq!(conversation.pattern().edges[1].predicate, "type");
+        assert!(matches!(
+            conversation.apply(
+                GraphCommand::DropLastConstraint,
+                &facts,
+                MatchOptions::default()
+            ),
+            Err(PatternError::CannotDropLastConstraint)
         ));
     }
 
