@@ -1773,6 +1773,8 @@ const PREDICATE_LABELS: &[(&str, &str)] = &[
     ("weight", "体重"),
     ("birthDate", "出生日期"),
     ("capital", "首都"),
+    ("population", "人口"),
+    ("area", "面积"),
     ("author", "作者"),
     ("founder", "创始人"),
     ("location", "所在地"),
@@ -1815,6 +1817,8 @@ fn lexical_surfaces(predicate: &str) -> &'static [&'static str] {
         "knows" | "认识" => &["认识"],
         "age" | "年龄" => &["年龄"],
         "capital" | "首都" => &["首都"],
+        "population" | "人口" => &["人口"],
+        "area" | "面积" => &["面积"],
         "author" | "作者" => &["作者"],
         "birthPlace" | "出生地" | "出生于" => &["出生地", "出生于"],
         "founder" | "创始人" => &["创始人"],
@@ -1935,6 +1939,15 @@ mod tests {
         let surfaces = generator.predicate_surfaces();
         assert_eq!(surfaces.get("认识").map(String::as_str), Some("knows"));
         assert_eq!(surfaces.get("age").map(String::as_str), Some("age"));
+    }
+
+    #[test]
+    fn test_chinese_attribute_alias_reaches_english_key() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("北京", "City", &[("population".to_string(), "2189万".to_string())]);
+        assert_eq!(canonical_predicate_key("人口"), Some("population"));
+        assert_eq!(localized_predicate_key("population"), Some("人口"));
+        assert_eq!(generator.attribute_values("北京", "人口"), vec!["2189万"]);
     }
 
     #[test]
