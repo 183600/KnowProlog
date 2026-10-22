@@ -409,12 +409,91 @@ impl ClarificationSession {
         self.advance();
     }
 
-    /// 处理用户回答：返回该回答的结论，并推进到下一问
+    /// 回答里是否**肯定地**提到了某个取值（排除「不是X」「并非X」这类否定出现）。
+    fn mentions_affirmed(text: &str, value: &str) -> bool {
+        if value.is_empty() {
+            return false;
+        }
+        let mut cursor = 0usize;
+        while let Some(offset) = text[cursor..].find(value) {
+            let start = cursor + offset;
+            let before = &text[..start];
+            let negated = ["不是", "并非", "没有", "不", "没", "非"]
+                .iter()
+                .any(|prefix| before.ends_with(prefix));
+            if !negated {
+                return true;
+            }
+            cursor = start + value.len();
+        }
+        false
+    }
+
+    /// 从队列里找出用户更正到的替代假设：同谓词、同元数，且只有一个常量不同，
+    /// 且该常量在回答中被肯定地提到。多个匹配时取最长取值，避免「李」抢先于「李四」。
+    fn correction_target(&self, text: &str, current: &Hypothesis) -> Option<usize> {
+        let mut best: Option<(usize, usize)> = None;
+        for (index, candidate) in self.queue.iter().enumerate() {
+            if candidate.atom.predicate != current.atom.predicate
+                || candidate.atom.terms.len() != current.atom.terms.len()
+            {
+                continue;
+            }
+            let mut replacements: Vec<(&str, &str)> = Vec::new();
+            let mut compatible = true;
+            for (old, new) in current.atom.terms.iter().zip(&candidate.atom.terms) {
+                if old == new {
+                    continue;
+                }
+                match new {
+                    Term::Const(value) => replacements.push((old.name(), value)),
+                    Term::Var(_) => {
+                        compatible = false;
+                        break;
+                    }
+                }
+            }
+            if !compatible || replacements.is_empty() {
+                continue;
+            }
+            for (old_value, new_value) in replacements {
+                if old_value == new_value || !Self::mentions_affirmed(text, new_value) {
+                    continue;
+                }
+                // 回答同时肯定旧值时无法确定用户到底选哪个，宁可回退到普通是否判定。
+                if Self::mentions_affirmed(text, old_value) {
+                    continue;
+                }
+                let length = new_value.chars().count();
+                if best.map(|(_, best_len)| length > best_len).unwrap_or(true) {
+                    best = Some((index, length));
+                }
+            }
+        }
+        best.map(|(index, _)| index)
+    }
+
+    /// 处理用户回答：返回该回答的结论，并推进到下一问。
+    ///
+    /// 除了是 / 不是 / 不知道，还支持从当前候选里选择更正取值：
+    /// 「不是，是王五」会否定当前假设并直接确认队列中的「王五」假设。
     pub fn respond(&mut self, text: &str) -> ClarificationReply {
         let kind = classify_answer(text);
         let Some(current) = self.current.take() else {
             return ClarificationReply::Finished;
         };
+        if kind != AnswerKind::Unknown {
+            if let Some(index) = self.correction_target(text, &current) {
+                let confirmed = self.queue.remove(index);
+                self.rejected.push(current.clone());
+                self.confirmed.push(confirmed.clone());
+                self.advance();
+                return ClarificationReply::Corrected {
+                    rejected: current,
+                    confirmed,
+                };
+            }
+        }
         match kind {
             AnswerKind::Yes => {
                 self.confirmed.push(current.clone());
@@ -479,6 +558,11 @@ pub enum ClarificationReply {
     Confirmed(Hypothesis),
     Rejected(Hypothesis),
     Deferred(Hypothesis),
+    /// 用户否定了当前假设，并从候选中更正到另一条取值
+    Corrected {
+        rejected: Hypothesis,
+        confirmed: Hypothesis,
+    },
     Unrecognized,
     Finished,
 }
@@ -1852,7 +1936,7 @@ pub fn render_clarification_question(
 ) -> String {
     match session.current() {
         Some(hypothesis) => format!(
-            "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？\n  请回答：是 / 不是 / 不知道（剩余 {} 条）。",
+            "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？\n  请回答：是 / 不是 / 不知道；若是别的取值可答「不是，是<取值>」（剩余 {} 条）。",
             hypothesis.confidence,
             render(&hypothesis.atom),
             session.remaining()
@@ -2272,6 +2356,51 @@ mod tests {
             .hypotheses
             .iter()
             .all(|hypothesis| hypothesis.atom != goal)));
+    }
+
+    #[test]
+    fn clarification_correction_switches_to_another_candidate() {
+        let current = hyp("师傅", "张三", "李四", 0.8);
+        let alternative = hyp("师傅", "张三", "王五", 0.5);
+        let other_subject = hyp("师傅", "王五", "李四", 0.5);
+        let mut session =
+            ClarificationSession::start(&[current, alternative.clone(), other_subject]);
+
+        let reply = session.respond("不是，是王五");
+        match reply {
+            ClarificationReply::Corrected {
+                rejected,
+                confirmed,
+            } => {
+                assert_eq!(rejected.atom.display(), "师傅(张三, 李四)");
+                assert_eq!(confirmed.atom, alternative.atom);
+            }
+            other => panic!("应识别为更正，实际：{:?}", other),
+        }
+        assert_eq!(session.confirmed.len(), 1);
+        assert_eq!(session.rejected.len(), 1);
+        assert_eq!(
+            session
+                .current()
+                .map(|hypothesis| hypothesis.atom.display()),
+            Some("师傅(王五, 李四)".to_string()),
+            "已更正的候选必须从队列中移除"
+        );
+        assert_eq!(session.confirmed[0].atom.display(), "师傅(张三, 王五)");
+    }
+
+    #[test]
+    fn clarification_negated_alternative_is_not_a_correction() {
+        let current = hyp("师傅", "张三", "李四", 0.8);
+        let alternative = hyp("师傅", "张三", "王五", 0.5);
+        let mut session = ClarificationSession::start(&[current, alternative]);
+        let reply = session.respond("不是王五");
+        assert!(
+            matches!(reply, ClarificationReply::Rejected(_)),
+            "否定的是替代取值而不是当前取值时应保持普通否定：{:?}",
+            reply
+        );
+        assert!(session.confirmed.is_empty());
     }
 
     #[test]

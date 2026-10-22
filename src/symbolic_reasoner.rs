@@ -4563,6 +4563,54 @@ impl SymbolicReasoner {
                     }
                 }
             }
+            ClarificationReply::Corrected {
+                rejected,
+                confirmed,
+            } => {
+                let rejected_rendered = self.render_atom_nl(&rejected.atom);
+                let rendered = self.render_atom_nl(&confirmed.atom);
+                let label = format!("澄清更正：{}", rendered);
+                match self.commit_session_assertion(label, &confirmed.atom) {
+                    Err(blocked) => {
+                        if let Some(session) = self.clarification.as_mut() {
+                            session.retry(confirmed);
+                        }
+                        Some(format!(
+                            "✗ 已排除原假设：{}。\n但更正后的假设未写入会话事实，问题保留：\n{}",
+                            rejected_rendered, blocked
+                        ))
+                    }
+                    Ok(added) => {
+                        let mut output = format!(
+                            "✗ 已排除原假设：{}。\n✓ 已确认更正：{}。{}",
+                            rejected_rendered,
+                            rendered,
+                            if added {
+                                "已加入会话事实集（未写知识图谱）。"
+                            } else {
+                                "该事实已在会话事实集中（幂等确认）。"
+                            }
+                        );
+                        if !confirmed.reasons.is_empty() {
+                            output.push_str(&format!(
+                                "\n  依据：{}",
+                                confirmed.reasons.join("；")
+                            ));
+                        }
+                        if added {
+                            if let Some(receipt) = self.session_receipts.last() {
+                                output.push_str(&format!(
+                                    "\n  修订回执：{}（可用「撤销修订」撤回）",
+                                    receipt.id
+                                ));
+                            }
+                        }
+                        self.reprioritize_clarification();
+                        output.push_str(&self.clarification_follow_up());
+                        Some(output)
+                    }
+                }
+            }
             ClarificationReply::Rejected(hypothesis) => {
                 self.reprioritize_clarification();
                 Some(format!(
@@ -4580,7 +4628,7 @@ impl SymbolicReasoner {
                 ))
             }
             ClarificationReply::Unrecognized => Some(format!(
-                "没有理解回答（请用「是 / 不是 / 不知道」）。\n{}",
+                "没有理解回答（请用「是 / 不是 / 不知道」，或「不是，是<取值>」更正）。\n{}",
                 self.render_clarification_prompt()
             )),
             ClarificationReply::Finished => Some(self.finish_clarification_session()),
@@ -14297,6 +14345,45 @@ types = [
             !reasoner.session_revision_report().contains("session:"),
             "拒绝的采纳不得生成回执"
         );
+    }
+
+    #[test]
+    fn clarification_correction_commits_the_alternative() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let current = Hypothesis {
+            atom: Atom::rel("师傅", "张三", "李四"),
+            goal: Atom::rel("师傅", "张三", "李四"),
+            kind: HypothesisKind::MissingFact,
+            confidence: 0.8,
+            reasons: vec!["当前假设".to_string()],
+            conflicts: Vec::new(),
+            contradicts_known: false,
+        };
+        let alternative = Hypothesis {
+            atom: Atom::rel("师傅", "张三", "王五"),
+            goal: Atom::rel("师傅", "张三", "王五"),
+            kind: HypothesisKind::CandidateValue,
+            confidence: 0.5,
+            reasons: vec!["候选取值".to_string()],
+            conflicts: Vec::new(),
+            contradicts_known: false,
+        };
+        reasoner.abduction.set_pending(vec![current, alternative]);
+        let prompt = reasoner.start_clarification().expect("应开始澄清");
+        assert!(prompt.contains("李四"), "{}", prompt);
+
+        let output = reasoner
+            .answer_clarification("不是，是王五")
+            .expect("应处理更正回答");
+        assert!(output.contains("更正"), "{}", output);
+        assert!(reasoner
+            .session_facts()
+            .iter()
+            .any(|atom| atom == &Atom::rel("师傅", "张三", "王五")));
+        assert!(!reasoner
+            .session_facts()
+            .iter()
+            .any(|atom| atom == &Atom::rel("师傅", "张三", "李四")));
     }
 
     #[test]
