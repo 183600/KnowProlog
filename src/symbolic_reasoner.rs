@@ -49,6 +49,9 @@ use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAlign
 use crate::ontology_reasoning::{OntologyCapsule, OntologyLesson, OntologyProgram};
 use crate::path_memory::{EdgeSource, PathPredicate, TraversalGraph, TraversalOptions};
 use crate::pattern_closure::{evaluate_closure, ClosureBudget, ClosureOp, ClosureOutcome};
+use crate::pending_question::{
+    self, AnswerBinding, PendingHole, PendingQuestion, PendingQuestionLedger,
+};
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
@@ -553,6 +556,9 @@ pub struct DialogueSnapshot {
     // 话语帧记忆（上一帧 + 挂账），跨会话持久化后可接着补全未竟之问
     #[serde(default)]
     pub frames: Option<FrameMemory>,
+    // 悬问账本：没答上的目标 + 缺失前提；空账本不落盘，旧快照字节保持不变
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_questions: Option<PendingQuestionLedger>,
     // 本体胶囊（教过的公理 + 摘要 + 闭包缓存）：跨会话/跨重建保留教学本体；
     // 未教过公理时缺省为 None，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -802,6 +808,7 @@ impl DialogueContext {
             session_clauses: Vec::new(),
             contrast: None,
             frames: None,
+            pending_questions: None,
             ontology: None,
             completion: None,
             assumptions: Vec::new(),
@@ -1146,6 +1153,8 @@ pub struct SymbolicReasoner {
     abduction: AbductionEngine,
     // 话语帧记忆：带洞查询帧 + 挂账（合一式多轮消解，跨会话持久化）
     frames: FrameMemory,
+    // 悬问账本：没答上的目标 + 缺失前提；用户补上后重解原目标并延期回答。
+    pending_questions: PendingQuestionLedger,
     // 结构型多轮：当前图谱模式、结果与翻页位置（会话态，不进知识图谱）
     graph_session: parking_lot::Mutex<Option<GraphSession>>,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
@@ -1236,6 +1245,7 @@ impl Clone for SymbolicReasoner {
             resolver: self.resolver.clone(),
             abduction: self.abduction.clone(),
             frames: self.frames.clone(),
+            pending_questions: self.pending_questions.clone(),
             graph_session: parking_lot::Mutex::new(self.graph_session.lock().clone()),
             session_facts: self.session_facts.clone(),
             slots: self.slots.clone(),
@@ -1440,6 +1450,7 @@ impl SymbolicReasoner {
             resolver,
             abduction,
             frames: FrameMemory::new(),
+            pending_questions: PendingQuestionLedger::new(),
             graph_session: parking_lot::Mutex::new(None),
             session_facts: Vec::new(),
             slots: SlotLedger::new(),
@@ -1527,6 +1538,7 @@ impl SymbolicReasoner {
         self.lessons.clear();
         self.lessons_parsed.clear();
         self.frames = FrameMemory::new();
+        self.pending_questions.clear();
         *self.graph_session.lock() = None;
         // 会话事实可能已被索引为证据；分叉/重置时把非图谱来源的条目撤出索引。
         let session_facts = std::mem::take(&mut self.session_facts);
@@ -9908,6 +9920,238 @@ impl SymbolicReasoner {
             .map(|answer| self.annotate_assumption_world(answer))
     }
 
+    /// 是否还有未答之问（悬问）。
+    pub fn has_pending_question(&self) -> bool {
+        !self.pending_questions.is_empty()
+    }
+
+    /// 悬问台账报告：列出「哪个目标缺哪条前提」。
+    pub fn pending_question_report(&self) -> String {
+        self.pending_questions.render_report()
+    }
+
+    /// 显式放弃全部悬问。忘记必须是显式动作，不设 TTL。
+    pub fn abandon_pending_questions(&mut self) -> String {
+        let count = self.pending_questions.len();
+        self.pending_questions.clear();
+        if count == 0 {
+            "悬问台账本来就是空的。".to_string()
+        } else {
+            format!(
+                "已放弃 {} 条悬问；原问题不会自动重开，相关知识仍留在图谱与会话事实里。",
+                count
+            )
+        }
+    }
+
+    /// 回答悬问：把本轮输入绑定到队首的洞，补入会话事实后重解原目标。
+    ///
+    /// 只在系统上一轮刚追问过这个洞时调用；无法判定为回答时返回 `None`，
+    /// 让位给正常对话管线（绝不劫持新问句/命令）。
+    pub fn try_answer_pending_question(&mut self, input: &str) -> Option<String> {
+        let pending = self.pending_questions.first()?.clone();
+        match pending_question::interpret_answer(input, &pending.hole) {
+            AnswerBinding::NotAnAnswer => None,
+            AnswerBinding::Unknown => {
+                self.pending_questions.remove(pending.id);
+                Some(format!(
+                    "好，「{}」先悬着。\n「不知道」只是暂时没有信息，不会被记成否定事实；需要时可以重新问我。",
+                    pending.hole.phrase()
+                ))
+            }
+            AnswerBinding::Fill(object) => {
+                let adopted = self.adopt_hole_fill(&pending.hole, &object);
+                self.pending_questions.remove(pending.id);
+                let answer = self
+                    .answer(&pending.question)
+                    .filter(|text| !Self::is_pending_failure(text));
+                let Some(answer) = answer else {
+                    // 补上一条前提仍不足以证明：按当前失败前沿继续找下一个洞。
+                    if let Some(prompt) = self.open_pending_question(&pending.question) {
+                        return Some(format!(
+                            "已记住「{}」（会话事实，不写知识图谱）。\n原问题还差前提：\n{}",
+                            pending.hole.fill_sentence(&object),
+                            prompt
+                        ));
+                    }
+                    return Some(format!(
+                        "收到「{}」，但原问题仍无法证明；没有把推测当作答案。",
+                        pending.hole.fill_sentence(&object)
+                    ));
+                };
+                let mut output = format!(
+                    "你刚才问的「{}」，补上「{}」后现在可以回答了：\n{}",
+                    pending.question,
+                    pending.hole.fill_sentence(&object),
+                    answer
+                );
+                if !answer.contains("路径") && !answer.contains("依据") {
+                    let mut support = pending.support.clone();
+                    support.push(pending.hole.fill_sentence(&object));
+                    output.push_str(&format!("\n依据：{}。", support.join("；")));
+                }
+                if !adopted && !self.session_facts.iter().any(|atom| {
+                    atom.terms.iter().any(|term| term.name() == object)
+                }) {
+                    output.push_str("\n（该取值已在图谱或已有会话事实中，未重复写入。）");
+                }
+                Some(output)
+            }
+        }
+    }
+
+    /// 失败目标 → 悬问：从多跳链的第一个缺口生成一条「目标 + 洞」。
+    ///
+    /// 只在回答确实失败时调用；返回追问话术并写入悬问账本。
+    pub fn open_pending_question(&mut self, question: &str) -> Option<String> {
+        let (goal, hole, support) = self.diagnose_chain_hole(question)?;
+        let pending = self
+            .pending_questions
+            .record(question, &goal, hole, support);
+        Some(PendingQuestionLedger::render_ask(&pending))
+    }
+
+    /// 任何新断言到达后，重放悬问：原目标已可证则给出延期回答并关闭悬问。
+    ///
+    /// 不新增事实，也不把链接预测候选当成答案；只使用可确证的证明路径。
+    pub fn resolve_pending_after_assertion(&mut self) -> Option<String> {
+        if self.pending_questions.is_empty() {
+            return None;
+        }
+        let pending = self.pending_questions.questions().to_vec();
+        let mut unresolved: Vec<PendingQuestion> = Vec::new();
+        let mut resolved: Vec<String> = Vec::new();
+        for question in pending {
+            match self.answer_certain(&question.question) {
+                Some(answer) if !Self::is_pending_failure(&answer) => {
+                    resolved.push(format!(
+                        "你之前问的「{}」，现在可以回答了：\n{}",
+                        question.question, answer
+                    ));
+                }
+                _ => unresolved.push(question),
+            }
+        }
+        self.pending_questions.replace(unresolved);
+        (!resolved.is_empty()).then(|| resolved.join("\n"))
+    }
+
+    fn is_pending_failure(text: &str) -> bool {
+        text.contains("没有记录")
+            || text.contains("没有相关记录")
+            || text.contains("数量为 0")
+            || text.contains("无法证明")
+    }
+
+    /// 把洞的取值写入会话事实（逆向谓词按存储方向翻转）。
+    fn adopt_hole_fill(&mut self, hole: &PendingHole, object: &str) -> bool {
+        if hole.inverted {
+            self.adopt_session_triple(object, &hole.slot, &hole.subject)
+        } else {
+            self.adopt_session_triple(&hole.subject, &hole.slot, object)
+        }
+    }
+
+    fn pending_expected_type(&self, slot: &str) -> Option<String> {
+        let registry = self.law_registry.as_ref()?;
+        let profile = registry.profile(slot)?;
+        profile.range.iter().next().cloned()
+    }
+
+    /// 模拟一次多跳链，返回（目标串，缺口，已走通的边）。
+    fn diagnose_chain_hole(
+        &self,
+        question: &str,
+    ) -> Option<(String, PendingHole, Vec<String>)> {
+        let plan = self.planner.parse(question)?;
+        let QueryPlan::FindObject { segments } = plan else {
+            return None;
+        };
+        let (entity, predicates) = self.split_chain(&segments)?;
+        if predicates.len() < 2
+            || entity.is_empty()
+            || predicates
+                .iter()
+                .any(|predicate| predicate.slot.is_empty())
+            || !self.is_known_entity(&entity)
+            || !predicates
+                .iter()
+                .all(|predicate| self.is_known_predicate(&predicate.surface))
+        {
+            return None;
+        }
+        let goal = format!(
+            "{} 的 {}",
+            entity,
+            predicates
+                .iter()
+                .map(|predicate| predicate.surface.as_str())
+                .collect::<Vec<_>>()
+                .join(" 的 ")
+        );
+        let mut frontier = vec![entity.clone()];
+        let mut support: Vec<String> = Vec::new();
+        for (index, predicate) in predicates.iter().enumerate() {
+            let mut next: Vec<String> = Vec::new();
+            let mut step_support: Vec<String> = Vec::new();
+            for node in &frontier {
+                let hits = self.pending_simulation_hits(node, predicate);
+                for hit in hits {
+                    if !next.iter().any(|value| value == &hit.value) {
+                        next.push(hit.value.clone());
+                    }
+                    step_support.push(format!(
+                        "{} 的 {} 是 {}",
+                        node, predicate.surface, hit.value
+                    ));
+                }
+            }
+            if next.is_empty() {
+                let subject = if index == 0 {
+                    entity.clone()
+                } else {
+                    let mut candidates = frontier.clone();
+                    candidates.sort();
+                    candidates.into_iter().next()?
+                };
+                let mut hole = PendingHole::new(
+                    &subject,
+                    &predicate.surface,
+                    &predicate.slot,
+                    predicate.inverted,
+                );
+                hole.expected_type = self.pending_expected_type(&predicate.slot);
+                return Some((goal, hole, support));
+            }
+            for line in step_support {
+                if !support.contains(&line) {
+                    support.push(line);
+                }
+            }
+            frontier = next;
+        }
+        None
+    }
+
+    /// 悬问诊断用的边：只认已知事实/会话事实/声明的律，不认链接预测候选。
+    fn pending_simulation_hits(
+        &self,
+        node: &str,
+        predicate: &ChainPredicate,
+    ) -> Vec<ValueHit> {
+        let mut hits: Vec<ValueHit> = self
+            .node_hits(node, predicate)
+            .into_iter()
+            .filter(|hit| hit.prediction.is_none())
+            .collect();
+        if hits.is_empty() && self.laws.has_inference_laws() {
+            let (mut expanded, _) = self.law_hits(node, predicate, true);
+            expanded.retain(|hit| hit.prediction.is_none());
+            hits = expanded;
+        }
+        hits
+    }
+
     /// 句法重写回执：展示「哪种句法外壳被压成哪个逻辑计划」。
     /// 只读；未命中或词表校验失败时返回 None。
     pub fn query_rewrite_receipt(&self, question: &str) -> Option<String> {
@@ -12605,6 +12849,8 @@ impl SymbolicReasoner {
         snapshot.lessons = self.lessons.clone();
         snapshot.session_clauses = self.session_clauses.iter().map(snapshot_clause).collect();
         snapshot.frames = Some(self.frames.clone());
+        snapshot.pending_questions =
+            (!self.pending_questions.is_empty()).then(|| self.pending_questions.clone());
         snapshot.ontology = self.discourse.ontology_capsule();
         snapshot.completion = (!self.completion.is_empty()).then(|| self.completion.clone());
         snapshot.assumptions = self
@@ -12738,6 +12984,12 @@ impl SymbolicReasoner {
         if let Some(frames) = &snapshot.frames {
             self.frames = frames.clone();
         }
+        // 悬问账本：旧快照没有该字段时按空账本恢复；损坏的超额条目在 replace 内裁剪。
+        let mut pending_questions = PendingQuestionLedger::new();
+        if let Some(saved) = &snapshot.pending_questions {
+            pending_questions.replace(saved.questions().to_vec());
+        }
+        self.pending_questions = pending_questions;
         // 跨会话临时信念：恢复被采纳的会话假设（仍不写知识图谱）
         let mut restored: Vec<Atom> = Vec::new();
         for entry in &snapshot.session_facts {
@@ -14433,6 +14685,131 @@ mod tests {
     fn test_answer_returns_none_without_facts() {
         let reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         assert!(reasoner.answer("李四的师祖是谁").is_none());
+    }
+
+    #[test]
+    fn pending_question_names_missing_premise_for_two_hop_chain() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        let baseline = reasoner
+            .answer("张三的师傅的师傅是谁")
+            .expect("缺中间前提时仍应给出诚实的无记录回答");
+        assert!(baseline.contains("没有记录"), "{}", baseline);
+
+        let ask = reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("两跳缺一条前提时应立悬问");
+        assert!(ask.contains("李四 的 师傅"), "{}", ask);
+        assert!(ask.contains("张三 的 师傅 是 李四"), "{}", ask);
+        assert!(!ask.contains("王五"), "不得把未知取值说成已知：{}", ask);
+        assert!(reasoner.has_pending_question());
+        assert!(reasoner.pending_question_report().contains("张三的师傅的师傅是谁"));
+    }
+
+    #[test]
+    fn pending_question_bare_answer_defers_and_closes() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+
+        let deferred = reasoner
+            .try_answer_pending_question("王五")
+            .expect("裸回答应绑定到洞并给出延期回答");
+        assert!(deferred.contains("张三的师傅的师傅是谁"), "{}", deferred);
+        assert!(deferred.contains("李四 的 师傅 是 王五"), "{}", deferred);
+        assert!(deferred.contains("王五"), "{}", deferred);
+        assert!(!reasoner.has_pending_question(), "回填成功后悬问应关闭");
+        assert!(
+            reasoner.session_facts.iter().any(|atom| {
+                atom.predicate.as_ref() == "师傅"
+                    && atom.terms[0].name() == "李四"
+                    && atom.terms[1].name() == "王五"
+            }),
+            "补上的前提应成为会话事实"
+        );
+    }
+
+    #[test]
+    fn pending_question_does_not_hijack_questions_or_commands() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        assert!(reasoner.try_answer_pending_question("王五是谁").is_none());
+        assert!(reasoner.try_answer_pending_question("记住：李四的师傅是王五").is_none());
+        assert!(reasoner.has_pending_question());
+    }
+
+    #[test]
+    fn pending_question_unknown_defers_without_negative_fact() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        let reply = reasoner
+            .try_answer_pending_question("不知道")
+            .expect("明确不知道应显式搁置");
+        assert!(reply.contains("先悬着"), "{}", reply);
+        assert!(!reasoner.has_pending_question());
+        assert!(
+            reasoner.session_negative_facts.is_empty(),
+            "「不知道」不得写成否定事实"
+        );
+    }
+
+    #[test]
+    fn pending_question_resolves_after_explicit_assertion() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        reasoner.assert_nl_fact("李四的师傅是王五");
+        let deferred = reasoner
+            .resolve_pending_after_assertion()
+            .expect("新断言补上洞后应给出延期回答");
+        assert!(deferred.contains("现在可以回答了"), "{}", deferred);
+        assert!(deferred.contains("王五"), "{}", deferred);
+        assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
+    fn pending_question_survives_snapshot_roundtrip() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(snapshot.pending_questions.is_some(), "悬问应随快照落盘");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&pair_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("快照应能恢复");
+        assert!(restored.has_pending_question(), "恢复后仍应记得未答之问");
+        let deferred = restored
+            .try_answer_pending_question("王五")
+            .expect("恢复后短答仍应能回填");
+        assert!(deferred.contains("王五"), "{}", deferred);
+    }
+
+    #[test]
+    fn pending_question_does_not_open_without_a_real_gap() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(
+            reasoner
+                .open_pending_question("张三的师傅的师傅是谁")
+                .is_none(),
+            "链路已通时不得凭空立悬问"
+        );
+        assert!(!reasoner.has_pending_question());
     }
 
     #[test]
