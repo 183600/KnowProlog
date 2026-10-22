@@ -2771,6 +2771,26 @@ mod tests {
     }
 
     #[test]
+    fn rank_frames_and_pending_state_survive_snapshot() {
+        let knowledge = TestKnowledge::new();
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        board.apply("谁最高", &knowledge, 7).unwrap();
+        let json = serde_json::to_string(&board).unwrap();
+        let mut restored: QueryBoard = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_active());
+        let second = restored.apply("第二高呢", &knowledge, 7).unwrap();
+        assert!(second.text.contains("当前选中"));
+
+        let mut pending_board = QueryBoard::new();
+        pending_board.apply("谁最高", &knowledge, 7).unwrap();
+        let json = serde_json::to_string(&pending_board).unwrap();
+        let mut restored: QueryBoard = serde_json::from_str(&json).unwrap();
+        let outcome = restored.apply("身高", &knowledge, 7).unwrap();
+        assert!(outcome.text.contains("姚明"), "{}", outcome.text);
+    }
+
+    #[test]
     fn rank_without_attribute_asks_once_then_resolves_short_answer() {
         let knowledge = TestKnowledge::new();
         let mut board = board();
