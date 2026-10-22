@@ -18,7 +18,7 @@
 //!   - 稳定：报告排序确定、摘要只含稳定字段；原始问句只出现在本地渲染，
 //!     回执只保留 digest、计数与有限枚举。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ use crate::canonical;
 use crate::nlp::{preprocess_annotated, TagSource};
 use crate::reading::{self, Reading, RepairKind, Residual, ResidualKind, ResidualSeverity, ResidualStage, TextSpan};
 use crate::query_planner::{QueryPlan, QueryPlanner};
-use crate::NlpConfig;
+use crate::{NlpConfig, SystemConfig};
 
 pub const LEXICAL_TRACE_VERSION: u32 = 1;
 pub const DEFAULT_FAILURE_TRACE_CAPACITY: usize = 32;
@@ -270,6 +270,10 @@ pub struct LexicalTrace {
     /// failures 保持旧回执兼容，reading 供新诊断与修复计划使用。
     #[serde(default)]
     pub reading: Reading,
+    /// 静态词表覆盖审计（仅在显式请求 `--lexicon` 时生成）：把「计划可执行
+    /// 但谓词/实体没有定义」的沉默缺口显式化。默认追踪为 None，保持旧行为。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<LexicalCoverage>,
     /// 宿主是否观察到回答；纯文本追踪（未访问知识库）为 None。
     pub answer_available: Option<bool>,
 }
@@ -365,6 +369,11 @@ impl LexicalTrace {
             residual_stages: self.reading.residual_stages(),
             blocking_residuals: self.reading.blocking_count() as u64,
             repair_kinds: self.reading.repair_kinds(),
+            coverage_gaps: self.coverage.as_ref().map_or(0, |coverage| coverage.gaps.len() as u64),
+            coverage_blocking: self
+                .coverage
+                .as_ref()
+                .map_or(0, |coverage| coverage.blocking_count() as u64),
             fidelity: self.fidelity,
             answered: self.answer_available,
         }
@@ -473,6 +482,13 @@ impl LexicalTrace {
             output.push('\n');
         }
 
+        if let Some(coverage) = &self.coverage {
+            for line in coverage.render_lines() {
+                output.push_str(&line);
+                output.push('\n');
+            }
+        }
+
         if self.failures.is_empty() {
             output.push_str("失败分类：无（本轨迹只做观测）。\n");
         } else {
@@ -532,6 +548,12 @@ pub struct TraceReceipt {
     /// 可执行的修复动作（稳定闭集代码，已排序去重）。
     #[serde(default)]
     pub repair_kinds: Vec<String>,
+    /// 静态词表覆盖缺口条数（仅在显式审计时非零）。
+    #[serde(default)]
+    pub coverage_gaps: u64,
+    /// 静态词表覆盖阻断缺口条数。
+    #[serde(default)]
+    pub coverage_blocking: u64,
     pub fidelity: TraceFidelity,
     pub answered: Option<bool>,
 }
@@ -604,6 +626,8 @@ impl ReadTraceLedger {
         let mut marker_violations = 0u64;
         let mut oov = 0u64;
         let mut blocking_residuals = 0u64;
+        let mut coverage_gaps = 0u64;
+        let mut coverage_blocking = 0u64;
         for receipt in &receipts {
             for kind in &receipt.failure_kinds {
                 *failures.entry(kind.clone()).or_insert(0) += 1;
@@ -636,6 +660,8 @@ impl ReadTraceLedger {
             marker_violations += receipt.closure_marker_violations;
             oov += receipt.oov_count;
             blocking_residuals += receipt.blocking_residuals;
+            coverage_gaps += receipt.coverage_gaps;
+            coverage_blocking += receipt.coverage_blocking;
         }
         let mut output = format!(
             "读法台账：{} 条有界回执（容量 {}，不保存原文）。\n",
@@ -667,6 +693,12 @@ impl ReadTraceLedger {
             "未知词：{}；标记边界越界：{}；OOV 提名：{}；阻断残差：{}。\n",
             unknown_tokens, marker_violations, oov, blocking_residuals
         ));
+        if coverage_gaps > 0 {
+            output.push_str(&format!(
+                "静态覆盖缺口：{} 条（阻断 {} 条）。\n",
+                coverage_gaps, coverage_blocking
+            ));
+        }
         if let Some(last) = receipts.last() {
             output.push_str(&format!(
                 "最近一条：digest={}，计划={}，失败={}。\n",
@@ -1019,7 +1051,733 @@ pub fn trace_question(
         failures,
         warnings,
         reading: reading_state,
+        coverage: None,
         answer_available: None,
+    }
+}
+
+/// 静态词表覆盖审计（Lexical Coverage）。
+///
+/// `trace_question` 只报告「没有计划时」的未登录词，因此成功计划里的生词
+/// （「曾祖父」被结巴标成 nr、「儿子叫」被拼成一个谓词）不会留下证据。
+/// 覆盖审计把计划槽位重新对回文本 span，并用配置里可执行的词表（谓词画像、
+/// 查询规则字面量、抽取关键词、词性词典、同义词）判定：
+///
+///   - [`LexGapLayer::Sense`]：词形认识，但没有可执行定义（谓词缺口）；
+///   - [`LexGapLayer::World`]：词形未登记，需要登记实体/补事实（世界缺口）；
+///   - [`LexGapLayer::Form`]：切词/词形本身没有被解释（词表缺口）。
+///
+/// 这是只读审计：不改变分词、链接、规划或回答；只有显式请求时才把缺口并入
+/// 读法残差，便于 `read-trace --lexicon` 与语料报告使用。
+
+pub const LEXICAL_COVERAGE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexGapLayer {
+    Form,
+    Sense,
+    World,
+}
+
+impl LexGapLayer {
+    pub fn code(self) -> &'static str {
+        match self {
+            LexGapLayer::Form => "form",
+            LexGapLayer::Sense => "sense",
+            LexGapLayer::World => "world",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LexGapLayer::Form => "词形",
+            LexGapLayer::Sense => "词义",
+            LexGapLayer::World => "世界",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LexGapRole {
+    Entity,
+    Predicate,
+    Type,
+    Token,
+}
+
+impl LexGapRole {
+    pub fn code(self) -> &'static str {
+        match self {
+            LexGapRole::Entity => "entity",
+            LexGapRole::Predicate => "predicate",
+            LexGapRole::Type => "type",
+            LexGapRole::Token => "token",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LexGapRole::Entity => "实体",
+            LexGapRole::Predicate => "谓词",
+            LexGapRole::Type => "类型",
+            LexGapRole::Token => "未归属词",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexCoverageGap {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<TextSpan>,
+    pub layer: LexGapLayer,
+    pub role: LexGapRole,
+    pub severity: ResidualSeverity,
+    pub repair: RepairKind,
+    /// 为什么判定为缺口（确定性文本，不含随机构造）。
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalCoverage {
+    pub version: u32,
+    /// 计划槽位中能在静态词表里找到定义的词数。
+    pub known_terms: u64,
+    /// 计划引入、原句中没有字面出现的词数（如「多大」→「年龄」）。
+    pub introduced_terms: u64,
+    /// 未被任何计划槽位消费的内容 token 数。
+    pub unbound_tokens: u64,
+    pub gaps: Vec<LexCoverageGap>,
+}
+
+impl LexicalCoverage {
+    pub fn blocking_count(&self) -> usize {
+        self.gaps
+            .iter()
+            .filter(|gap| gap.severity == ResidualSeverity::Blocking)
+            .count()
+    }
+
+    pub fn warning_count(&self) -> usize {
+        self.gaps
+            .iter()
+            .filter(|gap| gap.severity == ResidualSeverity::Warning)
+            .count()
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.gaps.is_empty()
+    }
+
+    pub fn render_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "词表覆盖审计：{} 个已知槽位，{} 个计划引入词，{} 个未归属 token；缺口 {} 条（阻断 {}）。",
+            self.known_terms,
+            self.introduced_terms,
+            self.unbound_tokens,
+            self.gaps.len(),
+            self.blocking_count()
+        )];
+        if self.gaps.is_empty() {
+            lines.push("覆盖结论：计划槽位均能在静态词表中找到定义。".to_string());
+            return lines;
+        }
+        for gap in &self.gaps {
+            let span = gap
+                .span
+                .map(|span| format!(" {}..{}", span.start, span.end))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  • 「{}」{}{}/{}（{}，修复：{}）：{}",
+                gap.text,
+                span,
+                gap.layer.label(),
+                gap.role.label(),
+                gap.severity.label(),
+                gap.repair.label(),
+                gap.evidence
+            ));
+        }
+        lines
+    }
+}
+
+/// 静态词表：从配置中提取「系统已经承诺认识」的词。
+///
+/// 这不是完整本体：它只包含配置里能离线读到的可执行词表。知识库里的实体/
+/// 谓词仍需由链接阶段确认，因此世界缺口只作警告，词义缺口才阻断。
+#[derive(Debug, Clone)]
+pub struct LexiconInventory {
+    predicates: BTreeSet<String>,
+    entities: BTreeSet<String>,
+    types: BTreeSet<String>,
+}
+
+const QUESTION_MARKERS: [&str; 34] = [
+    "谁", "什么", "哪里", "哪儿", "哪个", "哪些", "多少", "几", "怎么", "怎样", "如何",
+    "为什么", "为何", "什么样", "什么时候", "多大", "多久", "多高", "多重", "多远", "吗",
+    "呢", "吧", "啊", "呀", "嘛", "请问", "是否", "是不是", "有没有", "对不对", "好不好",
+    "行不行", "可以吗",
+];
+
+const FUNCTION_WORDS: [&str; 40] = [
+    "的", "是", "和", "与", "及", "以及", "或", "或者", "在", "有", "被", "把", "对", "给",
+    "让", "从", "到", "向", "往", "为", "了", "着", "过", "得", "地", "最", "更", "还", "也",
+    "都", "就", "才", "又", "再", "个", "位", "名", "次", "个", "种",
+];
+
+fn is_content_pos(tag: &str) -> bool {
+    matches!(
+        tag,
+        "n" | "nr" | "ns" | "nt" | "nz" | "ng" | "v" | "vn" | "vd" | "a" | "an"
+            | "i" | "l" | "j" | "eng"
+    )
+}
+
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+}
+
+fn is_content_word(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && text.chars().any(char::is_alphanumeric)
+        && !FUNCTION_WORDS.contains(&text)
+        && !QUESTION_MARKERS.contains(&text)
+}
+
+impl LexiconInventory {
+    pub fn from_config(config: &SystemConfig) -> Self {
+        let mut predicates = BTreeSet::new();
+        let mut entities = BTreeSet::new();
+        let mut types = BTreeSet::new();
+
+        // 1) 谓词画像：规范名与别名是系统最明确的谓词承诺。
+        for profile in &config.predicate_profiles {
+            for word in std::iter::once(&profile.name).chain(profile.aliases.iter()) {
+                if is_content_word(word) {
+                    predicates.insert(word.clone());
+                }
+            }
+            types.extend(profile.domain.iter().cloned());
+            types.extend(profile.range.iter().cloned());
+        }
+
+        // 2) 查询规则里的中文字面量（「首都」「作者」「身高」「关系」等）。
+        //    POS 标签（nr/n/ns...）不是词条，不进入词表。
+        for rule in &config.prolog_rules {
+            for pattern in &rule.pattern {
+                if has_cjk(pattern) && is_content_word(pattern) {
+                    predicates.insert(pattern.clone());
+                }
+            }
+        }
+
+        // 3) 抽取规则关键词与属性名。
+        for rule in &config.extraction_rules {
+            for pattern in &rule.patterns {
+                if let Some(keywords) = &pattern.keyword_patterns {
+                    for keyword in keywords {
+                        if is_content_word(keyword) {
+                            predicates.insert(keyword.clone());
+                        }
+                    }
+                }
+                for property in pattern.property_mappings.keys() {
+                    if is_content_word(property) {
+                        predicates.insert(property.clone());
+                    }
+                }
+            }
+        }
+        for entity_type in &config.entity_types {
+            types.insert(entity_type.label.clone());
+            for property in &entity_type.properties {
+                if is_content_word(&property.name) {
+                    predicates.insert(property.name.clone());
+                }
+            }
+        }
+
+        // 4) 词性词典中的内容词：这是分词器之外系统显式承诺认识的词。
+        for (word, tag) in &config.nlp.pos_dict {
+            if is_content_pos(tag) && is_content_word(word) {
+                predicates.insert(word.clone());
+            }
+        }
+
+        // 5) 同义词映射：两侧都是系统认识的词形。
+        if let Some(synonyms) = &config.synonyms {
+            for (from, to) in &synonyms.mappings {
+                if is_content_word(from) {
+                    predicates.insert(from.clone());
+                }
+                if is_content_word(to) {
+                    predicates.insert(to.clone());
+                }
+            }
+        }
+
+        // 6) 实体身份：显式声明的规范名/别名与姓名模式。
+        for profile in &config.entity_profiles {
+            for word in std::iter::once(&profile.name).chain(profile.aliases.iter()) {
+                if is_content_word(word) {
+                    entities.insert(word.clone());
+                }
+            }
+            types.extend(profile.etype.iter().cloned());
+        }
+        for name in &config.nlp.name_patterns.full_names {
+            if is_content_word(name) {
+                entities.insert(name.clone());
+            }
+        }
+        for alias in &config.type_system.aliases {
+            types.insert(alias.alias.clone());
+            types.insert(alias.canonical.clone());
+        }
+
+        predicates.retain(|word| word.chars().count() > 0);
+        entities.retain(|word| word.chars().count() > 0);
+        types.retain(|word| word.chars().count() > 0);
+        Self {
+            predicates,
+            entities,
+            types,
+        }
+    }
+
+    pub fn predicate_count(&self) -> usize {
+        self.predicates.len()
+    }
+
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    pub fn type_count(&self) -> usize {
+        self.types.len()
+    }
+
+    pub fn is_predicate(&self, term: &str) -> bool {
+        let term = term.trim();
+        self.predicates.contains(term) || self.predicates.contains(term.trim_end_matches('的'))
+    }
+
+    pub fn is_entity(&self, term: &str) -> bool {
+        self.entities.contains(term.trim())
+    }
+
+    pub fn is_type(&self, term: &str) -> bool {
+        self.types.contains(term.trim())
+    }
+}
+
+fn ignorable_token(text: &str) -> bool {
+    let text = text.trim();
+    text.is_empty()
+        || !text.chars().any(char::is_alphanumeric)
+        || FUNCTION_WORDS.contains(&text)
+        || QUESTION_MARKERS.contains(&text)
+        || text.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn locate_term(chars: &[char], term: &str, used: &mut [bool]) -> Option<TextSpan> {
+    let term_chars: Vec<char> = term.trim().chars().collect();
+    if term_chars.is_empty() || term_chars.len() > chars.len() {
+        return None;
+    }
+    for start in 0..=chars.len() - term_chars.len() {
+        let matches = term_chars
+            .iter()
+            .enumerate()
+            .all(|(offset, ch)| chars[start + offset] == *ch && !used[start + offset]);
+        if !matches {
+            continue;
+        }
+        for offset in 0..term_chars.len() {
+            used[start + offset] = true;
+        }
+        return Some(TextSpan::new(start, start + term_chars.len()));
+    }
+    None
+}
+
+fn tokens_in_span<'a>(
+    tokens: &'a [TraceToken],
+    span: TextSpan,
+) -> impl Iterator<Item = &'a TraceToken> {
+    tokens
+        .iter()
+        .filter(move |token| token.start < span.end && span.start < token.end)
+}
+
+fn span_has_unknown_token(tokens: &[TraceToken], span: TextSpan) -> bool {
+    tokens_in_span(tokens, span).any(|token| {
+        token.source == TagSource::Unknown && token.text.chars().any(char::is_alphanumeric)
+    })
+}
+
+/// 实体 span 是否得到姓名证据支持：规划器的跨度恢复把「叶」「莉」拼回
+/// 「叶莉」时，其中一个 token 已被词性标注为人名；离线审计不应再把这种
+/// 已被消费的碎片报成世界缺口。
+fn span_has_name_evidence(tokens: &[TraceToken], span: TextSpan) -> bool {
+    tokens_in_span(tokens, span).any(|token| token.pos.starts_with("nr"))
+}
+
+fn span_unknown_surfaces(tokens: &[TraceToken], span: TextSpan) -> Vec<String> {
+    let mut surfaces: Vec<String> = tokens_in_span(tokens, span)
+        .filter(|token| {
+            token.source == TagSource::Unknown && token.text.chars().any(char::is_alphanumeric)
+        })
+        .map(|token| token.text.clone())
+        .collect();
+    surfaces.sort();
+    surfaces.dedup();
+    surfaces
+}
+
+/// 对单个已解析计划做静态覆盖审计。
+pub fn audit_lexical_coverage(
+    question: &str,
+    tokens: &[TraceToken],
+    plan: &QueryPlan,
+    inventory: &LexiconInventory,
+) -> LexicalCoverage {
+    let chars: Vec<char> = question.chars().collect();
+    let mut used = vec![false; chars.len()];
+    let mut gaps = Vec::new();
+    let mut known_terms = 0u64;
+    let mut introduced_terms = 0u64;
+
+    let (entities, predicates) = plan_terms(plan);
+    for predicate in &predicates {
+        let span = locate_term(&chars, predicate, &mut used);
+        if inventory.is_predicate(predicate) {
+            known_terms += 1;
+            continue;
+        }
+        let Some(span) = span else {
+            introduced_terms += 1;
+            gaps.push(LexCoverageGap {
+                text: predicate.clone(),
+                span: None,
+                layer: LexGapLayer::Sense,
+                role: LexGapRole::Predicate,
+                severity: ResidualSeverity::Warning,
+                repair: RepairKind::SupplyPredicate,
+                evidence: format!(
+                    "计划引入的谓词「{}」不在谓词画像/查询规则/词性词典中；可能是属性归一结果，但没有可执行定义",
+                    predicate
+                ),
+            });
+            continue;
+        };
+        let unknown = span_unknown_surfaces(tokens, span);
+        let evidence = if unknown.is_empty() {
+            format!(
+                "谓词槽「{}」不在静态词表（谓词画像、查询规则、抽取关键词、词性词典）中；槽位已填满但没有可执行定义",
+                predicate
+            )
+        } else {
+            format!(
+                "谓词槽「{}」包含未登录 token「{}」，且不在静态词表中；槽位已填满但没有可执行定义",
+                predicate,
+                unknown.join("」「")
+            )
+        };
+        gaps.push(LexCoverageGap {
+            text: predicate.clone(),
+            span: Some(span),
+            layer: LexGapLayer::Sense,
+            role: LexGapRole::Predicate,
+            severity: ResidualSeverity::Blocking,
+            repair: RepairKind::SupplyPredicate,
+            evidence,
+        });
+    }
+
+    for entity in &entities {
+        let Some(span) = locate_term(&chars, entity, &mut used) else {
+            continue;
+        };
+        if inventory.is_entity(entity)
+            || span_has_name_evidence(tokens, span)
+            || !span_has_unknown_token(tokens, span)
+        {
+            // 没有静态词表命中、但 token 全部有词性或其中有人名证据时，
+            // 不能离线断言世界缺口：实体可能已存在于知识库，或已由规划器
+            // 的跨度恢复消费。只有未登录词形才足以构成世界缺口证据。
+            known_terms += 1;
+            continue;
+        }
+        let unknown = span_unknown_surfaces(tokens, span);
+        gaps.push(LexCoverageGap {
+            text: entity.clone(),
+            span: Some(span),
+            layer: LexGapLayer::World,
+            role: LexGapRole::Entity,
+            severity: ResidualSeverity::Warning,
+            repair: RepairKind::SupplyEntity,
+            evidence: format!(
+                "实体槽「{}」包含未登录 token「{}」，且不在实体名册/姓名模式中；需要登记实体或补充事实",
+                entity,
+                unknown.join("」「")
+            ),
+        });
+    }
+
+    let mut unbound_tokens = 0u64;
+    for token in tokens {
+        let span = TextSpan::new(token.start, token.end);
+        if (span.start..span.end).any(|index| used.get(index).copied().unwrap_or(false)) {
+            continue;
+        }
+        if ignorable_token(&token.text) {
+            continue;
+        }
+        unbound_tokens += 1;
+        if token.source != TagSource::Unknown {
+            continue;
+        }
+        gaps.push(LexCoverageGap {
+            text: token.text.clone(),
+            span: Some(span),
+            layer: LexGapLayer::Form,
+            role: LexGapRole::Token,
+            severity: ResidualSeverity::Warning,
+            repair: RepairKind::AddWord,
+            evidence: format!(
+                "内容 token「{}」既没有被任何计划槽位消费，也不在静态词表中；可能需要补词或调整分词",
+                token.text
+            ),
+        });
+    }
+
+    gaps.sort_by(|a, b| {
+        a.layer
+            .cmp(&b.layer)
+            .then(a.role.cmp(&b.role))
+            .then(b.severity.cmp(&a.severity))
+            .then(a.text.cmp(&b.text))
+    });
+    gaps.dedup_by(|a, b| {
+        a.text == b.text && a.layer == b.layer && a.role == b.role && a.span == b.span
+    });
+    LexicalCoverage {
+        version: LEXICAL_COVERAGE_VERSION,
+        known_terms,
+        introduced_terms,
+        unbound_tokens,
+        gaps,
+    }
+}
+
+/// 带静态词表审计的读法追踪：默认行为不变，只是额外生成 [`LexicalCoverage`]
+/// 并把缺口并入读法残差（仍不改变回答管线）。
+pub fn trace_question_with_lexicon(
+    question: &str,
+    config: &SystemConfig,
+    plan: Option<&QueryPlan>,
+) -> LexicalTrace {
+    let inventory = LexiconInventory::from_config(config);
+    trace_question_with_inventory(question, &config.nlp, plan, &inventory)
+}
+
+pub fn trace_question_with_inventory(
+    question: &str,
+    nlp: &NlpConfig,
+    plan: Option<&QueryPlan>,
+    inventory: &LexiconInventory,
+) -> LexicalTrace {
+    let mut trace = trace_question(question, nlp, plan);
+    let Some(plan) = plan else {
+        return trace;
+    };
+    let trimmed = question.trim();
+    let coverage = audit_lexical_coverage(trimmed, &trace.tokens, plan, inventory);
+    for gap in &coverage.gaps {
+        let (kind, stage, expected) = match (gap.layer, gap.role) {
+            (LexGapLayer::Sense, LexGapRole::Predicate) => (
+                ResidualKind::UnknownPredicate,
+                ResidualStage::Plan,
+                "谓词画像/查询规则中的可执行定义",
+            ),
+            (LexGapLayer::World, LexGapRole::Entity) => (
+                ResidualKind::UnknownEntity,
+                ResidualStage::Link,
+                "已登记实体或实体名册/姓名模式",
+            ),
+            _ => (
+                ResidualKind::UnknownToken,
+                ResidualStage::Tag,
+                "词表或可对齐的分词边界",
+            ),
+        };
+        let mut residual = Residual::new(
+            kind,
+            stage,
+            gap.severity,
+            gap.repair,
+            format!("{}（静态词表覆盖审计）", gap.evidence),
+        )
+        .expected(expected);
+        if let Some(span) = gap.span {
+            residual = residual.surface(trimmed, span);
+        }
+        trace.reading.push(residual);
+    }
+    trace.coverage = Some(coverage);
+    trace
+}
+
+/// 语料级静态覆盖条目：按（层级、角色、词面）聚合。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexCoverageEntry {
+    pub text: String,
+    pub layer: LexGapLayer,
+    pub role: LexGapRole,
+    pub severity: ResidualSeverity,
+    pub repair: RepairKind,
+    pub count: u64,
+    pub first_question: usize,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexCoverageReport {
+    pub version: u32,
+    pub questions: usize,
+    pub plan_ready: u64,
+    pub plan_missing: u64,
+    pub unknown_tokens: u64,
+    pub blocking_gaps: u64,
+    #[serde(default)]
+    pub reading_statuses: BTreeMap<String, u64>,
+    pub entries: Vec<LexCoverageEntry>,
+}
+
+impl LexCoverageReport {
+    pub fn render_report(&self) -> String {
+        let mut output = format!(
+            "词表覆盖审计：{} 个问句，可执行计划 {}，无计划 {}；缺口条目 {}，阻断 {} 条，未登录 token {} 个。\n",
+            self.questions,
+            self.plan_ready,
+            self.plan_missing,
+            self.entries.len(),
+            self.blocking_gaps,
+            self.unknown_tokens
+        );
+        output.push_str(&format!(
+            "读法状态：{}。\n",
+            render_counts(&self.reading_statuses)
+        ));
+        if self.entries.is_empty() {
+            output.push_str("覆盖结论：没有发现计划内缺口。\n");
+            return output.trim_end().to_string();
+        }
+        for layer in [LexGapLayer::Sense, LexGapLayer::World, LexGapLayer::Form] {
+            let items: Vec<&LexCoverageEntry> = self
+                .entries
+                .iter()
+                .filter(|entry| entry.layer == layer)
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("{}缺口（{}）：\n", layer.label(), items.len()));
+            for entry in items {
+                output.push_str(&format!(
+                    "  • 「{}」/{}/{}×{}（首见第 {} 句，修复：{}）：{}\n",
+                    entry.text,
+                    entry.role.label(),
+                    entry.severity.label(),
+                    entry.count,
+                    entry.first_question,
+                    entry.repair.label(),
+                    entry.evidence
+                ));
+            }
+        }
+        output.trim_end().to_string()
+    }
+}
+
+/// 对固定语料做一次只读覆盖审计；只审计已解析计划，未解析问句单独计数。
+pub fn coverage_report<'a, I>(questions: I, config: &SystemConfig) -> LexCoverageReport
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let inventory = LexiconInventory::from_config(config);
+    let planner = QueryPlanner::new();
+    let mut questions_count = 0usize;
+    let mut plan_ready = 0u64;
+    let mut plan_missing = 0u64;
+    let mut unknown_tokens = 0u64;
+    let mut blocking_gaps = 0u64;
+    let mut reading_statuses: BTreeMap<String, u64> = BTreeMap::new();
+    let mut entries: BTreeMap<(LexGapLayer, LexGapRole, String), LexCoverageEntry> =
+        BTreeMap::new();
+    for (index, question) in questions.into_iter().enumerate() {
+        let question = question.trim();
+        if question.is_empty() {
+            continue;
+        }
+        questions_count += 1;
+        let plan = planner.parse(question);
+        let Some(plan) = plan else {
+            plan_missing += 1;
+            let trace = trace_question(question, &config.nlp, None);
+            unknown_tokens += trace.unknown_tokens().count() as u64;
+            *reading_statuses
+                .entry(trace.reading.status().code().to_string())
+                .or_insert(0) += 1;
+            continue;
+        };
+        plan_ready += 1;
+        let trace = trace_question_with_inventory(question, &config.nlp, Some(&plan), &inventory);
+        *reading_statuses
+            .entry(trace.reading.status().code().to_string())
+            .or_insert(0) += 1;
+        unknown_tokens += trace.unknown_tokens().count() as u64;
+        if let Some(coverage) = &trace.coverage {
+            blocking_gaps += coverage.blocking_count() as u64;
+            for gap in &coverage.gaps {
+                let key = (gap.layer, gap.role, gap.text.clone());
+                let entry = entries.entry(key).or_insert_with(|| LexCoverageEntry {
+                    text: gap.text.clone(),
+                    layer: gap.layer,
+                    role: gap.role,
+                    severity: gap.severity,
+                    repair: gap.repair,
+                    count: 0,
+                    first_question: index + 1,
+                    evidence: gap.evidence.clone(),
+                });
+                entry.count += 1;
+            }
+        }
+    }
+    let mut entries: Vec<LexCoverageEntry> = entries.into_values().collect();
+    entries.sort_by(|a, b| {
+        a.layer
+            .cmp(&b.layer)
+            .then(a.role.cmp(&b.role))
+            .then(b.severity.cmp(&a.severity))
+            .then(b.count.cmp(&a.count))
+            .then(a.text.cmp(&b.text))
+    });
+    LexCoverageReport {
+        version: LEXICAL_COVERAGE_VERSION,
+        questions: questions_count,
+        plan_ready,
+        plan_missing,
+        unknown_tokens,
+        blocking_gaps,
+        reading_statuses,
+        entries,
     }
 }
 
@@ -1360,5 +2118,128 @@ mod tests {
         assert!(rendered.contains("读法状态"));
         assert!(first.residual_kinds.contains_key("token_boundary"));
         assert!(first.repair_kinds.contains_key("split_token"));
+    }
+
+    fn system_config() -> SystemConfig {
+        toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析")
+    }
+
+    #[test]
+    fn lexicon_audit_flags_silent_oov_predicate_without_changing_default_trace() {
+        let config = system_config();
+        let question = "姚明的曾祖父是谁？";
+        let plan = QueryPlanner::new()
+            .parse(question)
+            .expect("成功计划是沉默缺口的前提");
+        let default = trace_question(question, &config.nlp, Some(&plan));
+        assert!(default.coverage.is_none(), "默认追踪不应生成覆盖审计");
+        assert!(default.reading.is_ready(), "默认读法保持可执行");
+
+        let trace = trace_question_with_lexicon(question, &config, Some(&plan));
+        let coverage = trace.coverage.as_ref().expect("应生成覆盖审计");
+        let gap = coverage
+            .gaps
+            .iter()
+            .find(|gap| gap.text == "曾祖父")
+            .expect("曾祖父未被词表解释");
+        assert_eq!(gap.layer, LexGapLayer::Sense);
+        assert_eq!(gap.role, LexGapRole::Predicate);
+        assert_eq!(gap.severity, ResidualSeverity::Blocking);
+        assert!(gap.span.is_some());
+        assert_eq!(coverage.blocking_count(), 1);
+        assert!(trace.reading.blocking_count() >= 1);
+        assert!(trace.render_report().contains("词表覆盖审计"));
+    }
+
+    #[test]
+    fn lexicon_audit_accepts_a_configured_predicate() {
+        let config = system_config();
+        let plan = QueryPlanner::new()
+            .parse("姚明的配偶是谁")
+            .expect("配偶问句应可解析");
+        let trace = trace_question_with_lexicon("姚明的配偶是谁", &config, Some(&plan));
+        let coverage = trace.coverage.as_ref().unwrap();
+        assert!(
+            coverage.gaps.is_empty(),
+            "配偶已在谓词画像中：{:?}",
+            coverage.gaps
+        );
+        assert!(coverage.known_terms >= 1);
+    }
+
+    #[test]
+    fn lexicon_audit_separates_world_gap_from_sense_gap() {
+        let config = system_config();
+        let question = "未名科技公司的 CEO 是谁？";
+        let plan = QueryPlanner::new().parse(question).unwrap();
+        let coverage = trace_question_with_lexicon(question, &config, Some(&plan))
+            .coverage
+            .unwrap();
+        let entity = coverage
+            .gaps
+            .iter()
+            .find(|gap| gap.text == "未名科技公司")
+            .expect("未登记实体是独立的世界缺口");
+        let predicate = coverage
+            .gaps
+            .iter()
+            .find(|gap| gap.text == "CEO")
+            .expect("CEO 没有可执行定义");
+        assert_eq!(entity.layer, LexGapLayer::World);
+        assert_eq!(entity.role, LexGapRole::Entity);
+        assert_eq!(entity.severity, ResidualSeverity::Warning);
+        assert_eq!(predicate.layer, LexGapLayer::Sense);
+        assert_eq!(predicate.role, LexGapRole::Predicate);
+        assert_eq!(predicate.severity, ResidualSeverity::Blocking);
+        assert_eq!(coverage.blocking_count(), 1);
+    }
+
+    #[test]
+    fn lexicon_audit_does_not_report_recovered_name_fragment() {
+        let config = system_config();
+        let question = "姚明和叶莉是什么关系？";
+        let plan = QueryPlanner::new().parse(question).unwrap();
+        let coverage = trace_question_with_lexicon(question, &config, Some(&plan))
+            .coverage
+            .unwrap();
+        assert!(
+            coverage.gaps.is_empty(),
+            "已由实体跨度恢复消费的人名碎片不应报世界缺口：{:?}",
+            coverage.gaps
+        );
+    }
+
+    #[test]
+    fn coverage_report_aggregates_layers_and_is_deterministic() {
+        let config = system_config();
+        let questions = [
+            "姚明的曾祖父是谁？",
+            "姚明的曾祖父是谁？",
+            "未名科技公司的 CEO 是谁？",
+            "姚明的配偶是谁",
+            "",
+        ];
+        let first = coverage_report(questions, &config);
+        let second = coverage_report(questions, &config);
+        assert_eq!(first, second, "同一语料必须得到同一覆盖报告");
+        assert_eq!(first.questions, 4);
+        assert_eq!(first.plan_ready, 4);
+        assert_eq!(first.plan_missing, 0);
+        assert!(first.blocking_gaps >= 3);
+        let ancestor = first
+            .entries
+            .iter()
+            .find(|entry| entry.text == "曾祖父")
+            .expect("聚合应保留首次出现序号");
+        assert_eq!(ancestor.count, 2);
+        assert_eq!(ancestor.first_question, 1);
+        assert_eq!(ancestor.layer, LexGapLayer::Sense);
+        assert!(first.entries.iter().any(|entry| {
+            entry.text == "未名科技公司" && entry.layer == LexGapLayer::World
+        }));
+        let rendered = first.render_report();
+        assert!(rendered.contains("词表覆盖审计"));
+        assert!(rendered.contains("词义缺口"));
+        assert!(rendered.contains("世界缺口"));
     }
 }

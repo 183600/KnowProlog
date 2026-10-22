@@ -155,6 +155,10 @@ enum Commands {
         /// UTF-8 corpus with one question per line; reports aggregated lexicon gaps
         #[arg(long)]
         corpus: Option<String>,
+        /// Also run the static lexical coverage audit: flag plan slots that have
+        /// no executable definition in the configured lexicon (read-only)
+        #[arg(long)]
+        lexicon: bool,
         /// Print the trace/report as JSON
         #[arg(long)]
         json: bool,
@@ -698,10 +702,17 @@ async fn main() {
     if let Some(Commands::ReadTrace {
         question,
         corpus,
+        lexicon,
         json,
     }) = &cli.command
     {
-        run_read_trace(question.as_deref(), corpus.as_deref(), *json, &config.nlp);
+        run_read_trace(
+            question.as_deref(),
+            corpus.as_deref(),
+            *lexicon,
+            *json,
+            &config,
+        );
         return;
     }
 
@@ -2510,11 +2521,14 @@ async fn run_fuse(
 
 /// `read-trace`：离线观察一个问句被切成了什么、词性来自哪里、规划器看到了什么。
 /// 提供 `--corpus` 时改为聚合词表缺口（未知词形 + 标记边界），不自动改词表。
+/// 加 `--lexicon` 时额外做静态覆盖审计：把「计划可执行但谓词/实体没有定义」
+/// 的沉默缺口显式化；仍不改变分词、链接、规划或回答。
 fn run_read_trace(
     question: Option<&str>,
     corpus: Option<&str>,
+    lexicon: bool,
     json: bool,
-    nlp: &know_prolog::NlpConfig,
+    config: &know_prolog::SystemConfig,
 ) {
     if let Some(path) = corpus {
         let text = match std::fs::read_to_string(path) {
@@ -2525,7 +2539,19 @@ fn run_read_trace(
             }
         };
         let questions: Vec<&str> = text.lines().collect();
-        let report = lexical_trace::lexicon_gap_report(questions, nlp);
+        if lexicon {
+            let report = lexical_trace::coverage_report(questions, config);
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => eprintln!("序列化词表覆盖报告失败：{}", error),
+                }
+            } else {
+                println!("{}", report.render_report());
+            }
+            return;
+        }
+        let report = lexical_trace::lexicon_gap_report(questions, &config.nlp);
         if json {
             match serde_json::to_string_pretty(&report) {
                 Ok(text) => println!("{}", text),
@@ -2538,7 +2564,11 @@ fn run_read_trace(
     }
     let question = question.unwrap_or_default();
     let plan = QueryPlanner::new().parse(question);
-    let trace = lexical_trace::trace_question(question, nlp, plan.as_ref());
+    let trace = if lexicon {
+        lexical_trace::trace_question_with_lexicon(question, config, plan.as_ref())
+    } else {
+        lexical_trace::trace_question(question, &config.nlp, plan.as_ref())
+    };
     if json {
         match serde_json::to_string_pretty(&trace) {
             Ok(text) => println!("{}", text),
