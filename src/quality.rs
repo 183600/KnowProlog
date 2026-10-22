@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::predicate_registry::{ImportConflict, PredicateRegistry};
 use crate::prolog_engine::PrologFact;
-use crate::provenance::{FactRef, ProvenanceLedger};
+use crate::provenance::{
+    detect_witnessed, ConflictPoint, ConflictSchema, FactRef, ProvenanceLedger,
+};
 use crate::type_system::TypeSystem;
 use crate::EntityTypeConfig;
 
@@ -341,7 +343,14 @@ pub struct QualitySummary {
     pub typed_rate: f64,
     pub mean_score: f64,
     pub low_score: usize,
+    /// 导入时被拒的冲突笔记条数（旧口径）。
     pub conflicts: usize,
+    /// 已见证的功能槽冲突点数（同一槽多个取值只算一个点）。
+    #[serde(default)]
+    pub witnessed_conflicts: usize,
+    /// 修复已见证冲突的最少删除事实数（取值数 − 1 之和）。
+    #[serde(default)]
+    pub witnessed_retraction_cost: usize,
     /// 未落型且在图中有连接的实体（最值得问「这是人物还是地点？」的清单）。
     pub clarify_candidates: Vec<String>,
 }
@@ -366,13 +375,15 @@ impl QualityReport {
     pub fn render_text(&self) -> String {
         let summary = &self.summary;
         let mut lines = vec![format!(
-            "质量护照：实体 {} 个（已落型 {}，落型率 {:.3}），平均分 {:.3}，低分 {} 个，冲突笔记 {} 条。",
+            "质量护照：实体 {} 个（已落型 {}，落型率 {:.3}），平均分 {:.3}，低分 {} 个，冲突笔记 {} 条，已见证冲突 {} 点（最少撤回 {} 条）。",
             summary.entities,
             summary.typed_entities,
             summary.typed_rate,
             summary.mean_score,
             summary.low_score,
-            summary.conflicts
+            summary.conflicts,
+            summary.witnessed_conflicts,
+            summary.witnessed_retraction_cost
         )];
         if !summary.clarify_candidates.is_empty() {
             lines.push(format!(
@@ -777,6 +788,8 @@ pub fn build_report_with_provenance(
         mean_score,
         low_score,
         conflicts,
+        witnessed_conflicts: 0,
+        witnessed_retraction_cost: 0,
         clarify_candidates,
     };
     let digest = {
@@ -791,6 +804,166 @@ pub fn build_report_with_provenance(
         summary,
         digest,
     }
+}
+
+// ---------------------------------------------------------------------------
+// 已见证冲突回填
+// ---------------------------------------------------------------------------
+
+/// 把「已见证的功能槽多值」回填进质量护照。
+///
+/// 图谱快照把实体属性折叠成 `HashMap`，同一谓词的多个取值会互相覆盖；质量
+/// 护照如果只读快照，就永远看不见这类冲突。调用方传入无损事实表后，本函数：
+/// - 按功能谓词分组，用**最少删除数**（取值数 − 1）而不是两两冲突条数扣分；
+/// - 在护照缺口里写明「已见证冲突」及全部取值，供对话层披露；
+/// - 重算综合分、语料汇总与摘要。
+///
+/// 返回被改写的实体数。互斥类型冲突已由 `build_report` 处理，这里不重复扣分。
+pub fn apply_witnessed_conflicts(
+    report: &mut QualityReport,
+    facts: &[FactRef],
+    ledger: Option<&ProvenanceLedger>,
+    registry: &PredicateRegistry,
+    types: &TypeSystem,
+) -> usize {
+    let mut schema = ConflictSchema::from_registry_and_types(registry, types);
+    for fact in facts {
+        if schema.type_predicates.contains(&fact.predicate) {
+            schema.observe_type(types, &fact.value);
+        }
+    }
+    let supports = match ledger {
+        Some(ledger) => facts
+            .iter()
+            .map(|fact| (fact.key(), ledger.support(fact.clone())))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+    let certificates = detect_witnessed(facts, &supports, &schema);
+
+    // 实体 → 谓词 → 全部取值。
+    let mut slots: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+    for certificate in &certificates {
+        if let ConflictPoint::Functional {
+            subject,
+            predicate,
+            left_value,
+            right_value,
+        } = &certificate.point
+        {
+            slots
+                .entry(subject.clone())
+                .or_default()
+                .entry(predicate.clone())
+                .or_default()
+                .extend([left_value.clone(), right_value.clone()]);
+        }
+    }
+
+    let mut changed = 0usize;
+    let mut witnessed_points = 0usize;
+    let mut witnessed_cost = 0usize;
+    for (entity, predicates) in slots {
+        let Some(passport) = report
+            .entities
+            .iter_mut()
+            .find(|passport| passport.name == entity)
+        else {
+            continue;
+        };
+        let mut cost = 0usize;
+        let mut notes = Vec::new();
+        for (predicate, values) in predicates {
+            if values.len() <= 1 {
+                continue;
+            }
+            let remove = values.len() - 1;
+            cost += remove;
+            witnessed_points += 1;
+            witnessed_cost += remove;
+            notes.push(format!(
+                "存在已见证冲突：{} 有 {} 个取值（{}），修复至少删 {} 条（低分≠假，事实仍可查询）",
+                predicate,
+                values.len(),
+                values.iter().cloned().collect::<Vec<_>>().join("、"),
+                remove
+            ));
+        }
+        if cost == 0 {
+            continue;
+        }
+        passport.consistency = (passport.consistency - CONFLICT_PENALTY * cost as f64).max(0.0);
+        for note in notes {
+            if !passport.gaps.contains(&note) {
+                passport.gaps.push(note);
+            }
+        }
+        passport.score = WEIGHT_COMPLETENESS * passport.completeness
+            + WEIGHT_CONSISTENCY * passport.consistency
+            + WEIGHT_PROVENANCE * passport.provenance
+            + WEIGHT_CONNECTIVITY * passport.connectivity;
+        changed += 1;
+    }
+    if changed > 0 {
+        refresh_summary(report);
+        report.summary.witnessed_conflicts = witnessed_points;
+        report.summary.witnessed_retraction_cost = witnessed_cost;
+        let value = serde_json::json!({
+            "entities": &report.entities,
+            "summary": &report.summary,
+        });
+        report.digest = fnv1a_hex(canonical_json(&value).as_bytes());
+    }
+    changed
+}
+
+fn refresh_summary(report: &mut QualityReport) {
+    let entity_count = report.entities.len();
+    let typed_entities = report
+        .entities
+        .iter()
+        .filter(|passport| !passport.types.is_empty())
+        .count();
+    report.summary.entities = entity_count;
+    report.summary.typed_entities = typed_entities;
+    report.summary.typed_rate = if entity_count == 0 {
+        0.0
+    } else {
+        typed_entities as f64 / entity_count as f64
+    };
+    report.summary.mean_score = if entity_count == 0 {
+        0.0
+    } else {
+        report
+            .entities
+            .iter()
+            .map(|passport| passport.score)
+            .sum::<f64>()
+            / entity_count as f64
+    };
+    report.summary.low_score = report
+        .entities
+        .iter()
+        .filter(|passport| passport.score < LOW_SCORE_THRESHOLD)
+        .count();
+    report.summary.conflicts = report
+        .entities
+        .iter()
+        .map(|passport| passport.conflicts.len())
+        .sum();
+    let mut clarify: Vec<(usize, String)> = report
+        .entities
+        .iter()
+        .filter(|passport| passport.types.is_empty() && passport.degree > 0)
+        .map(|passport| (passport.degree, passport.name.clone()))
+        .collect();
+    clarify.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    report.summary.clarify_candidates = clarify.into_iter().map(|(_, name)| name).collect();
+    let value = serde_json::json!({
+        "entities": &report.entities,
+        "summary": &report.summary,
+    });
+    report.digest = fnv1a_hex(canonical_json(&value).as_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,6 +1507,100 @@ mod tests {
             legacy.passport_for("张三").unwrap().provenance,
             legacy.passport_for("李四").unwrap().provenance
         );
+    }
+
+    #[test]
+    fn witnessed_functional_conflicts_backfill_consistency_and_gaps() {
+        use crate::provenance::FactRef;
+
+        let registry = registry_with_master();
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三")]),
+            entity("李四", "Person", &[("name", "李四")]),
+            entity("王五", "Person", &[("name", "王五")]),
+            relation("张三", "师傅", "李四"),
+            relation("张三", "师傅", "王五"),
+        ];
+        let mut report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let before = report.passport_for("张三").unwrap().clone();
+        assert!((before.consistency - 1.0).abs() < 1e-9);
+        let fact_refs = vec![
+            FactRef::type_assertion("张三", "Person"),
+            FactRef::attribute("张三", "name", "张三"),
+            FactRef::relation("张三", "师傅", "李四"),
+            FactRef::relation("张三", "师傅", "王五"),
+        ];
+        let changed =
+            apply_witnessed_conflicts(&mut report, &fact_refs, None, &registry, &type_system());
+        assert_eq!(changed, 1, "只有张三被改写");
+        let after = report.passport_for("张三").unwrap();
+        assert!(
+            (after.consistency - 0.5).abs() < 1e-9,
+            "两个取值、最少删 1 条：{}",
+            after.consistency
+        );
+        assert!(
+            after
+                .gaps
+                .iter()
+                .any(|gap| gap.contains("已见证冲突")
+                    && gap.contains("李四")
+                    && gap.contains("王五")
+                    && gap.contains("至少删 1 条")),
+            "{:?}",
+            after.gaps
+        );
+        assert!(after.score < before.score, "冲突必须进入综合分");
+        assert!(
+            (report.summary.mean_score
+                - report
+                    .entities
+                    .iter()
+                    .map(|passport| passport.score)
+                    .sum::<f64>()
+                    / report.entities.len() as f64)
+                .abs()
+                < 1e-9,
+            "汇总均值必须随回填重算"
+        );
+        assert_ne!(report.digest, String::new());
+        assert_eq!(report.summary.witnessed_conflicts, 1);
+        assert_eq!(report.summary.witnessed_retraction_cost, 1);
+        assert!(report.render_text().contains("已见证冲突 1 点"), "{}", report.render_text());
+    }
+
+    #[test]
+    fn three_witnessed_values_cost_two_not_three() {
+        use crate::provenance::FactRef;
+
+        let registry = registry_with_master();
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三")]),
+            entity("李四", "Person", &[("name", "李四")]),
+            entity("王五", "Person", &[("name", "王五")]),
+            entity("赵六", "Person", &[("name", "赵六")]),
+        ];
+        let mut report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let fact_refs = vec![
+            FactRef::type_assertion("张三", "Person"),
+            FactRef::attribute("张三", "name", "张三"),
+            FactRef::relation("张三", "师傅", "李四"),
+            FactRef::relation("张三", "师傅", "王五"),
+            FactRef::relation("张三", "师傅", "赵六"),
+        ];
+        apply_witnessed_conflicts(&mut report, &fact_refs, None, &registry, &type_system());
+        let passport = report.passport_for("张三").unwrap();
+        assert!(
+            passport.consistency.abs() < 1e-9,
+            "3 个取值 → 删 2 条 → 一致性触底：{}",
+            passport.consistency
+        );
+        assert!(passport
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("至少删 2 条")), "{:?}", passport.gaps);
+        assert_eq!(report.summary.witnessed_conflicts, 1, "3 个取值仍只有 1 个冲突点");
+        assert_eq!(report.summary.witnessed_retraction_cost, 2, "修复代价是 2 条");
     }
 
     #[test]

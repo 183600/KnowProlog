@@ -3300,15 +3300,26 @@ async fn quality_report_for_with_provenance(
     provenance: Option<&ProvenanceLedger>,
 ) -> Result<know_prolog::quality::QualityReport, Box<dyn std::error::Error + Send + Sync>> {
     let facts = oxigraph_manager.load_graph_snapshot().await?;
-    Ok(
-        know_prolog::quality::build_report_with_provenance(
-            &facts,
-            &oxigraph_manager.predicate_registry_snapshot(),
-            &oxigraph_manager.type_system_snapshot(),
-            &config.entity_types,
+    let registry = oxigraph_manager.predicate_registry_snapshot();
+    let types = oxigraph_manager.type_system_snapshot();
+    let mut report = know_prolog::quality::build_report_with_provenance(
+        &facts,
+        &registry,
+        &types,
+        &config.entity_types,
+        provenance,
+    );
+    // 快照折叠多值；质量护照必须再用无损事实表回填已见证的功能槽冲突。
+    if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
+        know_prolog::quality::apply_witnessed_conflicts(
+            &mut report,
+            &fact_refs,
             provenance,
-        ),
-    )
+            &registry,
+            &types,
+        );
+    }
+    Ok(report)
 }
 
 /// `serve` 的知识装载：与交互模式同源，取整图快照（实体属性 + 关系）。
