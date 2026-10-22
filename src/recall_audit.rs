@@ -165,6 +165,8 @@ pub struct RecallReport {
     pub fallback_correct: usize,
     /// 同一问句被多条规则声称、且预期类型不同的情况（已按优先级去重）。
     pub ambiguous: usize,
+    /// 未命中问句中，最近受阻候选已覆盖大前缀（≥ 阈值）的条数。
+    pub near_miss_misses: usize,
     pub seen: RecallSlice,
     pub unseen: RecallSlice,
     /// seen_recall - unseen_recall；正数表示表面泛化有损失。
@@ -225,6 +227,18 @@ impl RecallReport {
             self.unseen.cases,
             self.unseen.recall * 100.0,
             self.generalization_gap * 100.0
+        ));
+        let missed = self.wrong_route + self.unanswered;
+        output.push_str(&format!(
+            "未命中中的近似命中（覆盖率 ≥ {:.0}%）：{}/{}（{:.1}%）\n",
+            self.near_miss_threshold * 100.0,
+            self.near_miss_misses,
+            missed,
+            if missed == 0 {
+                0.0
+            } else {
+                self.near_miss_misses as f64 / missed as f64 * 100.0
+            }
         ));
         if !self.by_route.is_empty() {
             output.push_str("按路由：\n");
@@ -303,6 +317,7 @@ pub fn evaluate(
     let mut seen_correct = 0usize;
     let mut unseen_cases = 0usize;
     let mut unseen_correct = 0usize;
+    let mut near_miss_misses = 0usize;
     let mut routes: BTreeMap<String, RouteRecall> = BTreeMap::new();
     let mut gaps: BTreeMap<(String, String, crate::pattern_ir::MatchFailureKind), GapCount> =
         BTreeMap::new();
@@ -375,6 +390,9 @@ pub fn evaluate(
                 .closest_blocked()
                 .and_then(|row| row.failure.clone());
             let coverage = failure.as_ref().map(MatchFailure::coverage).unwrap_or(0.0);
+            if coverage >= near_miss_threshold {
+                near_miss_misses += 1;
+            }
             if let Some(failure) = &failure {
                 let key = (
                     failure.expected.clone(),
@@ -448,6 +466,7 @@ pub fn evaluate(
         primary_correct,
         fallback_correct,
         ambiguous,
+        near_miss_misses,
         generalization_gap: seen.recall - unseen.recall,
         seen,
         unseen,
@@ -869,6 +888,7 @@ mod tests {
             report.correct + report.wrong_route + report.unanswered,
             report.cases
         );
+        assert!(report.near_miss_misses <= report.wrong_route + report.unanswered);
         assert_eq!(report.corpus_digest.len(), 16);
         let baseline = RecallBaseline::from_report(&report);
         let verdict = compare_baseline(&baseline, &report, 0.0);
