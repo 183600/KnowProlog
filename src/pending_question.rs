@@ -468,10 +468,7 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
     }
     // 显式整句：「李四的师傅是王五」。
     if let Some((left, right)) = split_fact(text) {
-        let subject_matches = left.contains(hole.subject.as_str());
-        let predicate_matches = left.contains(hole.predicate.as_str())
-            || (!hole.slot.is_empty() && left.contains(hole.slot.as_str()));
-        if subject_matches && predicate_matches {
+        if left_matches_hole(left, hole) {
             let object = clean_value(right);
             if !object.is_empty() {
                 return AnswerBinding::Fill(object);
@@ -515,6 +512,28 @@ fn split_fact(text: &str) -> Option<(&str, &str)> {
     Some((left.trim(), right.trim()))
 }
 
+/// 陈述句左侧是否恰好就是悬问的那个洞。
+///
+/// 用整句包含关系判断会把「李四的师傅的爸爸是王五」误当成
+/// 「李四的师傅是王五」；这里要求去掉空白后逐字相等。
+fn left_matches_hole(left: &str, hole: &PendingHole) -> bool {
+    fn compact(text: &str) -> String {
+        text.chars()
+            .filter(|ch| !ch.is_whitespace() && !matches!(ch, '的'))
+            .collect()
+    }
+    let left = compact(left);
+    let subject = compact(&hole.subject);
+    if left.is_empty() || subject.is_empty() {
+        return false;
+    }
+    let mut expected = vec![format!("{}{}", subject, compact(&hole.predicate))];
+    if !hole.slot.is_empty() && hole.slot != hole.predicate {
+        expected.push(format!("{}{}", subject, compact(&hole.slot)));
+    }
+    expected.iter().any(|phrase| phrase == &left)
+}
+
 fn clean_value(value: &str) -> String {
     value
         .trim()
@@ -556,6 +575,11 @@ mod tests {
         assert_eq!(
             interpret_answer("张三的师傅是李四", &hole()),
             AnswerBinding::NotAnAnswer
+        );
+        assert_eq!(
+            interpret_answer("李四的师傅的爸爸是王五", &hole()),
+            AnswerBinding::NotAnAnswer,
+            "复合陈述不能冒充洞的直接填充"
         );
     }
 
