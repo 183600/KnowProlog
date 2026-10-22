@@ -546,6 +546,21 @@ impl PatternEntry {
         let total: f64 = self.elems.iter().map(Elem::weight).sum();
         total / self.elems.len() as f64
     }
+
+    /// 把词面要素归一到同义词表的规范形。
+    ///
+    /// 运行时先 [`crate::nlp::normalize_words`] 再路由，因此模式里的词面
+    /// 也必须用同一个规范形；否则配置写「老婆」、输入归一成「妻子」后，
+    /// 规则永远等不到自己的字面。只做一遍替换，与 `normalize_words` 同口径。
+    pub fn normalize_literals(&mut self, synonyms: &std::collections::HashMap<String, String>) {
+        for elem in &mut self.elems {
+            if let Elem::Word { surface } = elem {
+                if let Some(canonical) = synonyms.get(surface.as_str()) {
+                    *surface = canonical.clone();
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +615,170 @@ impl PatternMatch {
     /// 实体序列（与 `nlp::analyze_query_intent` 的返回同构）。
     pub fn entity_values(&self) -> Vec<String> {
         self.entities.clone()
+    }
+}
+
+/// 单要素失配的类别。分类本身就是可行动信息：词面不符可以补别名，
+/// 词性不符要改槽位排序，输入耗尽则要看是否缺少尾缀/成分。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchFailureKind {
+    /// 输入在到达该要素前已耗尽。
+    InputExhausted,
+    /// 词性不符（含人名 `nr`）。
+    PosMismatch,
+    /// 固定词面不符。
+    WordMismatch,
+    /// 槽位排序不符。
+    SortMismatch,
+}
+
+impl MatchFailureKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            MatchFailureKind::InputExhausted => "输入耗尽",
+            MatchFailureKind::PosMismatch => "词性不符",
+            MatchFailureKind::WordMismatch => "词面不符",
+            MatchFailureKind::SortMismatch => "排序不符",
+        }
+    }
+}
+
+/// 一次**决策前沿**（decision frontier）：匹配器停在哪个要素、期望什么、
+/// 实际见到什么，以及此前已经覆盖了哪些要素。
+///
+/// 这是与 [`PatternMatch`] 对称的失败解。日志/评估一旦拿到它，就能把
+/// 「没懂」分解成「第几个要素、缺哪类词面、离命中还差多少」，而不是只留
+/// 一句不可行动的失败原因。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatchFailure {
+    /// 失配要素下标（0 起）。
+    pub index: usize,
+    /// 模式要素总数。
+    pub total_elems: usize,
+    /// 失配发生在输入 token 序列的哪个位置。
+    pub position: usize,
+    /// 失配类别。
+    pub kind: MatchFailureKind,
+    /// 期望的要素（人类可读，如 `是`、`人名(nr)`、`{城市:城市}`）。
+    pub expected: String,
+    /// 实际见到的 token 词面（输入耗尽时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    /// 实际见到的 token 词性（输入耗尽时为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_pos: Option<String>,
+    /// 失配前已经覆盖的要素区间（`None` = 可选要素未占位）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_elems: Vec<Option<Span>>,
+    /// 失配位置之后还剩多少 token（含当前 token）。
+    pub remaining_tokens: usize,
+}
+
+impl MatchFailure {
+    /// 已完整覆盖的要素数（可选未占位也计入，因为它是被有意跳过的）。
+    pub fn covered_elems(&self) -> usize {
+        self.matched_elems.len()
+    }
+
+    /// 前缀覆盖率：已覆盖要素 / 总要素。用于识别「一步之遥」的缺口。
+    pub fn coverage(&self) -> f64 {
+        if self.total_elems == 0 {
+            return 1.0;
+        }
+        self.covered_elems() as f64 / self.total_elems as f64
+    }
+
+    /// 是否属于「大部分结构已对上」的近似命中（阈值由调用方给定，
+    /// 评估侧默认用 [`crate::recall_audit::NEAR_MISS_COVERAGE`]）。
+    ///
+    /// 线性匹配器只报第一个失配点，因此覆盖率是**前缀**覆盖率；它不宣称
+    /// 后缀一定可匹配，只负责把「离命中还差多少」变成可排序的数。
+    pub fn is_near_miss(&self, threshold: f64) -> bool {
+        self.coverage() >= threshold
+    }
+
+    /// 人类可读的一行说明（日志与 CLI 共用）。
+    pub fn render(&self) -> String {
+        let actual = match (&self.actual, &self.actual_pos) {
+            (Some(text), Some(pos)) => format!("「{}」({})", text, pos),
+            (Some(text), None) => format!("「{}」", text),
+            (None, _) => "输入结束".to_string(),
+        };
+        format!(
+            "第{}要素「{}」未匹配（{}）：实见 {}；此前 {}/{} 要素已覆盖，剩余 {} token",
+            self.index + 1,
+            self.expected,
+            self.kind.label(),
+            actual,
+            self.covered_elems(),
+            self.total_elems,
+            self.remaining_tokens
+        )
+    }
+}
+
+impl std::fmt::Display for MatchFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 保持旧版失败原因逐字不变：调用方/测试把它当稳定文案。
+        match self.kind {
+            MatchFailureKind::InputExhausted => write!(
+                formatter,
+                "第{}要素「{}」未匹配：输入已耗尽",
+                self.index + 1,
+                self.expected
+            ),
+            MatchFailureKind::PosMismatch => write!(
+                formatter,
+                "第{}要素{}，实得词性「{}」（「{}」）",
+                self.index + 1,
+                self.expected,
+                self.actual_pos.as_deref().unwrap_or(""),
+                self.actual.as_deref().unwrap_or("")
+            ),
+            MatchFailureKind::WordMismatch => write!(
+                formatter,
+                "第{}要素期望词「{}」，实得「{}」",
+                self.index + 1,
+                self.expected,
+                self.actual.as_deref().unwrap_or("")
+            ),
+            MatchFailureKind::SortMismatch => write!(
+                formatter,
+                "第{}要素{}，实得词性「{}」（「{}」）",
+                self.index + 1,
+                self.expected,
+                self.actual_pos.as_deref().unwrap_or(""),
+                self.actual.as_deref().unwrap_or("")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MatchFailure {}
+
+/// 单要素层面的失配（由 [`attempt_elem`] 产生，由 [`match_entry_detailed`]
+/// 补全为带覆盖信息的 [`MatchFailure`]）。
+#[derive(Debug, Clone, PartialEq)]
+struct ElemFailure {
+    kind: MatchFailureKind,
+    expected: String,
+    actual: Option<String>,
+    actual_pos: Option<String>,
+}
+
+impl ElemFailure {
+    fn new(
+        kind: MatchFailureKind,
+        expected: impl Into<String>,
+        token: &crate::nlp::TaggedWord,
+    ) -> Self {
+        Self {
+            kind,
+            expected: expected.into(),
+            actual: Some(token.text.clone()),
+            actual_pos: Some(token.pos.clone()),
+        }
     }
 }
 
@@ -1497,7 +1676,7 @@ fn attempt_elem(
     index: usize,
     tokens: &[crate::nlp::TaggedWord],
     pos: usize,
-) -> Result<Attempt, String> {
+) -> Result<Attempt, ElemFailure> {
     let token = &tokens[pos];
     match elem {
         Elem::Optional(inner) => {
@@ -1505,11 +1684,10 @@ fn attempt_elem(
         }
         Elem::Pos { pos: expected } if expected == "nr" => {
             if token.pos != "nr" && token.pos != "unknown" {
-                return Err(format!(
-                    "第{}要素期望人名(nr)，实得词性「{}」（「{}」）",
-                    index + 1,
-                    token.pos,
-                    token.text
+                return Err(ElemFailure::new(
+                    MatchFailureKind::PosMismatch,
+                    "期望人名(nr)",
+                    token,
                 ));
             }
             let mut parts = vec![token.text.clone()];
@@ -1534,12 +1712,10 @@ fn attempt_elem(
         }
         Elem::Pos { pos: expected } => {
             if token.pos != *expected {
-                return Err(format!(
-                    "第{}要素期望词性「{}」，实得「{}」（「{}」）",
-                    index + 1,
-                    expected,
-                    token.pos,
-                    token.text
+                return Err(ElemFailure::new(
+                    MatchFailureKind::PosMismatch,
+                    format!("期望词性「{}」", expected),
+                    token,
                 ));
             }
             let entity = if matches!(expected.as_str(), "n" | "nr" | "ns") {
@@ -1599,11 +1775,10 @@ fn attempt_elem(
                     binding: None,
                 });
             }
-            Err(format!(
-                "第{}要素期望词「{}」，实得「{}」",
-                index + 1,
-                surface,
-                current
+            Err(ElemFailure::new(
+                MatchFailureKind::WordMismatch,
+                surface.clone(),
+                token,
             ))
         }
         Elem::Slot { name, sort, hints } => {
@@ -1639,13 +1814,10 @@ fn attempt_elem(
                     binding: Some((name.clone(), surface)),
                 })
             } else {
-                Err(format!(
-                    "第{}要素词槽「{}」排序不匹配（期望{}，实得词性「{}」（「{}」））",
-                    index + 1,
-                    name,
-                    sort,
-                    token.pos,
-                    token.text
+                Err(ElemFailure::new(
+                    MatchFailureKind::SortMismatch,
+                    format!("词槽「{}」排序不匹配（期望{}）", name, sort),
+                    token,
                 ))
             }
         }
@@ -1658,11 +1830,15 @@ fn attempt_elem(
     }
 }
 
-/// 对一条模式做锚定匹配：成功给解，失败给「第几要素、期望什么」。
-fn match_entry(
+/// 对一条模式做锚定匹配，失败时返回结构化的决策前沿。
+///
+/// 这是匹配语义的**唯一实现**：日志、评估和路由都从这里取结果，避免
+/// 「解释器」与「匹配器」各写一遍而漂移。旧的字符串失败原因只是它的
+/// [`Display`] 投影。
+pub fn match_entry_detailed(
     entry: &PatternEntry,
     tokens: &[crate::nlp::TaggedWord],
-) -> Result<PatternMatch, String> {
+) -> Result<PatternMatch, MatchFailure> {
     let elems = &entry.elems;
     if elems.is_empty() {
         // 与既有语义一致：空模式命中空解
@@ -1694,14 +1870,36 @@ fn match_entry(
                 elem_spans.push(None);
                 continue;
             }
-            return Err(format!(
-                "第{}要素「{}」未匹配：输入已耗尽",
-                index + 1,
-                elem.render()
-            ));
+            return Err(MatchFailure {
+                index,
+                total_elems: elems.len(),
+                position: pos,
+                kind: MatchFailureKind::InputExhausted,
+                expected: elem.render(),
+                actual: None,
+                actual_pos: None,
+                matched_elems: elem_spans,
+                remaining_tokens: 0,
+            });
         }
 
-        match attempt_elem(elem, elems, index, tokens, pos)? {
+        let attempt = match attempt_elem(elem, elems, index, tokens, pos) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Err(MatchFailure {
+                    index,
+                    total_elems: elems.len(),
+                    position: pos,
+                    kind: error.kind,
+                    expected: error.expected,
+                    actual: error.actual,
+                    actual_pos: error.actual_pos,
+                    matched_elems: elem_spans,
+                    remaining_tokens: tokens.len().saturating_sub(pos),
+                });
+            }
+        };
+        match attempt {
             Attempt::Absent => elem_spans.push(None),
             Attempt::Consumed {
                 new_pos,
@@ -1735,6 +1933,15 @@ fn match_entry(
         elem_spans,
         span: Span::new(span_start.unwrap_or(0), span_end),
     })
+}
+
+/// 内部路由/报告使用的字符串失败口；语义完全来自
+/// [`match_entry_detailed`]。
+fn match_entry(
+    entry: &PatternEntry,
+    tokens: &[crate::nlp::TaggedWord],
+) -> Result<PatternMatch, String> {
+    match_entry_detailed(entry, tokens).map_err(|failure| failure.to_string())
 }
 
 /// 首要素预筛：只判断「首要素是否必然失配」，成功集必须是完整匹配的超集。
@@ -1797,6 +2004,13 @@ impl PatternLibrary {
                     }
                     library.entries.push(entry);
                 }
+            }
+        }
+        // 输入在路由前已归一化；模式词面必须落在同一规范形上，否则
+        // 「老婆 → 妻子」这类映射会让规则永远匹配不到自己的词面。
+        if let Some(synonyms) = &config.synonyms {
+            for entry in &mut library.entries {
+                entry.normalize_literals(&synonyms.mappings);
             }
         }
         library
@@ -3308,6 +3522,91 @@ mod tests {
             "原因应指出首个失配要素：{}",
             reason
         );
+    }
+
+    #[test]
+    fn detailed_failure_exposes_frontier_not_just_a_string() {
+        let entry = PatternEntry::new(
+            "首都查询",
+            "config.toml#首都查询",
+            "capital_query",
+            15,
+            true,
+            vec![
+                Elem::pos("ns"),
+                Elem::word("的"),
+                Elem::word("首都"),
+                Elem::word("是"),
+                Elem::word("哪里"),
+            ],
+        );
+        let tokens = tagged(&[
+            ("法国", "ns"),
+            ("的", "u"),
+            ("首都", "n"),
+            ("在", "v"),
+            ("哪里", "r"),
+        ]);
+        let failure = match_entry_detailed(&entry, &tokens).expect_err("「在」不应命中「是」");
+        assert_eq!(failure.index, 3);
+        assert_eq!(failure.kind, MatchFailureKind::WordMismatch);
+        assert_eq!(failure.expected, "是");
+        assert_eq!(failure.actual.as_deref(), Some("在"));
+        assert_eq!(failure.actual_pos.as_deref(), Some("v"));
+        assert_eq!(failure.covered_elems(), 3);
+        assert!((failure.coverage() - 0.6).abs() < f64::EPSILON);
+        assert_eq!(failure.matched_elems.len(), 3);
+        assert_eq!(failure.remaining_tokens, 2);
+        // 稳定的字符串投影：旧调用方继续拿到同一句原因。
+        assert_eq!(failure.to_string(), "第4要素期望词「是」，实得「在」");
+        assert!(failure.render().contains("此前 3/5 要素已覆盖"));
+        // 5 个要素覆盖 3 个：按 0.6 阈值算近似命中，按 0.75 则不算。
+        assert!(failure.is_near_miss(0.6));
+        assert!(!failure.is_near_miss(0.75));
+    }
+
+    #[test]
+    fn exhausted_input_reports_zero_remaining_tokens() {
+        let entry = PatternEntry::new(
+            "年龄查询",
+            "config.toml#年龄查询",
+            "age_query",
+            10,
+            true,
+            vec![Elem::pos("nr"), Elem::word("多大")],
+        );
+        let tokens = tagged(&[("张三", "nr")]);
+        let failure = match_entry_detailed(&entry, &tokens).expect_err("缺少「多大」");
+        assert_eq!(failure.kind, MatchFailureKind::InputExhausted);
+        assert_eq!(failure.index, 1);
+        assert_eq!(failure.covered_elems(), 1);
+        assert_eq!(failure.remaining_tokens, 0);
+        assert_eq!(failure.to_string(), "第2要素「多大」未匹配：输入已耗尽");
+    }
+
+    #[test]
+    fn config_literals_follow_synonym_normalization() {
+        let config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        let synonyms = config
+            .synonyms
+            .as_ref()
+            .expect("配置应包含同义词表")
+            .mappings
+            .clone();
+        let tagged = preprocess("张三的老婆", &config.nlp);
+        let normalized = crate::nlp::normalize_words(tagged, &synonyms);
+        assert!(
+            normalized.iter().any(|word| word.text == "妻子"),
+            "输入应先归一化为规范词：{:?}",
+            normalized
+        );
+        let matched = library
+            .match_route(&normalized)
+            .expect("配偶规则应命中归一化后的词面");
+        assert_eq!(matched.entry.query_type, "spouse_query");
+        assert_eq!(matched.entities, vec!["张三".to_string()]);
     }
 
     #[test]
