@@ -2391,10 +2391,14 @@ impl SymbolicReasoner {
         if accepted.is_empty() || accepted.iter().any(|candidate| candidate == value) {
             return false;
         }
-        self.slots
-            .suppressed(&subject, &predicate)
-            .iter()
-            .any(|candidate| candidate == value)
+        // 功能槽只允许一个视图赢家：会话已有赢家时，图谱后来新增/变化的同槽
+        // 取值也不得绕过压制进入回答；非功能槽只压制账本明确记录的落选值。
+        self.slots.is_functional(&predicate)
+            || self
+                .slots
+                .suppressed(&subject, &predicate)
+                .iter()
+                .any(|candidate| candidate == value)
     }
 
     /// 证据检索的文本视图：排序证据 + 检索回执。
@@ -12996,6 +13000,10 @@ mod tests {
                 .iter()
                 .any(|atom| atom.display() == "身高(姚明, 226cm)"),
             "旧值不应同时留在会话事实里"
+        );
+        assert!(
+            reasoner.is_suppressed_slot_value("姚明", "身高", "230cm"),
+            "功能槽有会话赢家时，任何其他同槽取值都应被视图压制"
         );
         let answer = reasoner.answer("姚明的身高是什么").expect("应有属性答案");
         assert!(answer.contains("229cm"), "新值应生效：{}", answer);
