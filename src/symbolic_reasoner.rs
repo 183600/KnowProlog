@@ -18864,12 +18864,28 @@ types = [
             0,
             "命名空间规则不得静默进入全局归结"
         );
+        assert!(
+            !reasoner
+                .resolver()
+                .all_clauses()
+                .iter()
+                .any(|clause| clause.source.contains("命名空间")),
+            "命名空间规则不得出现在全局归结引擎里"
+        );
         let promoted = reasoner.completion_promote(&rule_id, "全局");
         assert!(promoted.contains("全局"), "{}", promoted);
         assert_eq!(
             reasoner.completion_ledger().reasoning_clauses().len(),
             1,
             "显式晋升到全局后规则才进入全局归结"
+        );
+        assert!(
+            reasoner
+                .resolver()
+                .all_clauses()
+                .iter()
+                .any(|clause| clause.source.contains("全局")),
+            "晋升到全局后规则应真正进入归结引擎"
         );
         assert!(reasoner.completion_rules_report().contains("全局"));
 
