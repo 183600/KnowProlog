@@ -10015,9 +10015,10 @@ impl SymbolicReasoner {
         }
     }
 
-    /// 失败目标 → 悬问：从多跳链的第一个缺口生成一条「目标 + 洞」。
+    /// 失败目标 → 悬问：从链式目标的第一个缺口生成一条「目标 + 洞」。
     ///
-    /// 只在回答确实失败时调用；返回追问话术并写入悬问账本。
+    /// 单跳缺边与多跳缺中间前提同样处理；只在回答确实失败时调用，
+    /// 返回追问话术并写入悬问账本。
     pub fn open_pending_question(&mut self, question: &str) -> Option<String> {
         let (goal, hole, support) = self.diagnose_chain_hole(question)?;
         let pending = self
@@ -10088,7 +10089,7 @@ impl SymbolicReasoner {
             return None;
         };
         let (entity, predicates) = self.split_chain(&segments)?;
-        if predicates.len() < 2
+        if predicates.is_empty()
             || entity.is_empty()
             || predicates
                 .iter()
@@ -14801,6 +14802,21 @@ mod tests {
             deferred
         );
         assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
+    fn pending_question_handles_single_missing_hop() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        let ask = reasoner
+            .open_pending_question("李四的师傅是谁")
+            .expect("单跳缺边同样应立悬问");
+        assert!(ask.contains("李四 的 师傅"), "{}", ask);
+        let deferred = reasoner
+            .try_answer_pending_question("王五")
+            .expect("短答应回填");
+        assert!(deferred.contains("李四 的 师傅 是 王五"), "{}", deferred);
+        assert!(deferred.contains("王五"), "{}", deferred);
     }
 
     #[test]
