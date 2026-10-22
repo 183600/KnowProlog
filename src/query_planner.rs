@@ -15,6 +15,7 @@
 // 由 SymbolicReasoner 结合本体对齐与链接预测完成。
 
 use crate::pattern_closure::ClosureOp;
+use crate::symbolic_generator::predicate_labels;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryPlan {
@@ -159,6 +160,9 @@ impl QueryPlanner {
             return Some(plan);
         }
         if let Some(plan) = self.parse_age_suffix(&particle_free) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_attribute_quantity(&particle_free) {
             return Some(plan);
         }
 
@@ -564,6 +568,56 @@ impl QueryPlanner {
             return None;
         }
         Some(QueryPlan::FindObject { segments })
+    }
+
+    /// 「实体 + 属性 + 多少」的省略问法：北京人口多少 / 北京人口是多少 /
+    /// 北京有多少人口。属性词面必须命中内置属性词表，主体部分留在「的」
+    /// 之前；这样不引入模糊对齐，也不会把「中国有多少人」硬映射成属性。
+    fn parse_attribute_quantity(&self, q: &str) -> Option<QueryPlan> {
+        const SUFFIXES: [&str; 5] = ["是多少", "有多少", "为多少", "多少", "是几"];
+        for suffix in SUFFIXES {
+            let Some(prefix) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let prefix = prefix.trim().trim_end_matches('有').trim();
+            if let Some(plan) = self.attribute_find_object(prefix) {
+                return Some(plan);
+            }
+        }
+        if let Some((left, right)) = q.split_once("有多少") {
+            let right = right.trim().trim_end_matches('的').trim();
+            if let Some((_, label)) = predicate_labels()
+                .iter()
+                .find(|(_, label)| *label == right)
+            {
+                if let Some(plan) = self.build_attribute_plan(left, label) {
+                    return Some(plan);
+                }
+            }
+        }
+        None
+    }
+
+    /// 从「主体+属性词面」构造查找计划：最长属性词面优先，主体不能为空
+    /// 或含疑问词。
+    fn attribute_find_object(&self, prefix: &str) -> Option<QueryPlan> {
+        let prefix = prefix.trim().trim_end_matches('的').trim();
+        let (_, label) = predicate_labels()
+            .iter()
+            .filter(|(_, label)| prefix.ends_with(label))
+            .max_by_key(|(_, label)| label.chars().count())?;
+        let subject = prefix.strip_suffix(label)?.trim().trim_end_matches('的').trim();
+        self.build_attribute_plan(subject, label)
+    }
+
+    fn build_attribute_plan(&self, raw_subject: &str, label: &str) -> Option<QueryPlan> {
+        let subject = Self::clean_name(raw_subject);
+        if subject.is_empty() || Self::is_question_word(&subject) {
+            return None;
+        }
+        Some(QueryPlan::FindObject {
+            segments: vec![subject, label.to_string()],
+        })
     }
 
     fn parse_find_subject(&self, q: &str) -> Option<QueryPlan> {
@@ -2066,6 +2120,39 @@ mod tests {
             planner().parse("张三和李四是什么关系"),
             Some(QueryPlan::PathBetween { .. })
         ));
+    }
+
+    #[test]
+    fn test_attribute_quantity_without_particles() {
+        for question in ["北京人口多少", "北京人口是多少", "北京有多少人口"] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("省略问法应可编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: vec!["北京".to_string(), "人口".to_string()]
+                },
+                "{}",
+                question
+            );
+        }
+        // 没有命中属性词表时仍交给原有计数解析，不能把任意名词当属性。
+        assert!(matches!(
+            planner().parse("北京有多少光年"),
+            Some(QueryPlan::Count { .. })
+        ));
+    }
+
+    #[test]
+    fn test_attribute_quantity_keeps_longest_label() {
+        let plan = planner().parse("李四出生地是多少").expect("应命中出生地");
+        assert_eq!(
+            plan,
+            QueryPlan::FindObject {
+                segments: vec!["李四".to_string(), "出生地".to_string()]
+            }
+        );
     }
 
     #[test]

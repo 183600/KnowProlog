@@ -1765,6 +1765,12 @@ pub fn canonical_predicate_key(label: &str) -> Option<&'static str> {
         .map(|(canonical, _)| *canonical)
 }
 
+/// 图谱属性键与中文词面的对照表只读视图（英文键 → 中文），
+/// 供查询规划器识别「实体 + 属性 + 多少」这类省略「的/是」的问法。
+pub fn predicate_labels() -> &'static [(&'static str, &'static str)] {
+    PREDICATE_LABELS
+}
+
 /// 图谱属性键与中文词面的对照表（英文键 → 中文）。
 const PREDICATE_LABELS: &[(&str, &str)] = &[
     ("name", "姓名"),
