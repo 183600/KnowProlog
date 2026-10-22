@@ -1608,11 +1608,35 @@ fn attempt_elem(
         }
         Elem::Slot { name, sort, hints } => {
             if sort_matches(sort, hints, token) {
+                // 人名槽与 `nr` 一样要能跨过结巴切开的后续字：
+                // 「王强」可能分成「王/nr」「强/unknown」，但槽仍应绑定
+                // 完整词面，而不是只吃掉第一个字后让后续要素失配。
+                let mut end = pos + 1;
+                if sort == "人名" {
+                    let next_literal = match pattern.get(index + 1) {
+                        Some(Elem::Word { surface }) => Some(surface.as_str()),
+                        _ => None,
+                    };
+                    while end < tokens.len() {
+                        let next = &tokens[end];
+                        if is_skippable(next.text.as_str())
+                            || !(next.pos == "unknown" || next.pos == "nr")
+                            || next_literal == Some(next.text.as_str())
+                        {
+                            break;
+                        }
+                        end += 1;
+                    }
+                }
+                let surface: String = tokens[pos..end]
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect();
                 Ok(Attempt::Consumed {
-                    new_pos: pos + 1,
-                    span: Span::new(pos, pos + 1),
-                    entity: Some(token.text.clone()),
-                    binding: Some((name.clone(), token.text.clone())),
+                    new_pos: end,
+                    span: Span::new(pos, end),
+                    entity: Some(surface.clone()),
+                    binding: Some((name.clone(), surface)),
                 })
             } else {
                 Err(format!(

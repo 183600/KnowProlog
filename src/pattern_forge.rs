@@ -925,7 +925,13 @@ impl PatternForge {
         let matches: Vec<String> = self
             .patterns
             .values()
-            .filter(|pattern| pattern.id.starts_with(key) || pattern.name == key)
+            .filter(|pattern| {
+                let short = pattern
+                    .id
+                    .strip_prefix("forge_")
+                    .unwrap_or(pattern.id.as_str());
+                pattern.id.starts_with(key) || short.starts_with(key) || pattern.name == key
+            })
             .map(|pattern| pattern.id.clone())
             .collect();
         match matches.len() {
@@ -1434,6 +1440,35 @@ mod tests {
     }
 
     #[test]
+    fn person_slot_joins_names_split_by_the_segmenter() {
+        let mut config = nlp_config();
+        config.name_patterns.full_names =
+            vec!["李明".to_string(), "张三".to_string(), "李四".to_string()];
+        let mut forge = PatternForge::new();
+        let outcome = forge
+            .forge(
+                &ForgeRequest::new("女儿问法", "姚明的女儿是谁", "daughter_query")
+                    .with_negative("姚明今年几岁"),
+                &config,
+            )
+            .expect("应当学会");
+        let activation = forge.activate(&outcome.pattern.id).expect("激活");
+        let mut library = PatternLibrary::new();
+        for entry in &activation.entries {
+            library.add(entry.clone());
+        }
+        let tokens = preprocess("王强的女儿是谁", &config);
+        assert!(
+            tokens.len() > 5,
+            "测试前提：未登记的王强应被切开：{:?}",
+            tokens
+        );
+        let routed = library.route(&tokens).expect("跨 token 人名也应该命中");
+        assert_eq!(routed.0, "daughter_query");
+        assert!(routed.1.contains(&"王强".to_string()), "{:?}", routed.1);
+    }
+
+    #[test]
     fn multiple_positives_learn_surface_choices() {
         let config = nlp_config();
         let request = ForgeRequest::new("女儿问法", "姚明的女儿是谁", "daughter_query")
@@ -1522,7 +1557,12 @@ mod tests {
                 &config,
             )
             .expect("应当学会");
-        let activation = forge.activate(&outcome.pattern.id).expect("应当激活");
+        let short = outcome
+            .pattern
+            .id
+            .strip_prefix("forge_")
+            .expect("锻造 id 前缀");
+        let activation = forge.activate(short).expect("短 id 也应当能激活");
         assert_eq!(activation.entries.len(), outcome.pattern.expansions.len());
         let mut library = PatternLibrary::new();
         for entry in &activation.entries {
