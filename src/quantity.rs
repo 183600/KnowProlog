@@ -237,10 +237,15 @@ pub static UNITS: &[(&str, Unit)] = &[
 
 /// 查单位。返回静态引用，比较时无需再分配字符串。
 pub fn lookup_unit(text: &str) -> Option<&'static Unit> {
+    lookup_unit_entry(text).map(|(_, unit)| unit)
+}
+
+/// 同时取出单位写法与定义；写法用于把差值写回用户熟悉的单位。
+fn lookup_unit_entry(text: &str) -> Option<(&'static str, &'static Unit)> {
     UNITS
         .iter()
         .find(|(alias, _)| *alias == text)
-        .map(|(_, unit)| unit)
+        .map(|(alias, unit)| (*alias, unit))
 }
 
 /// 数值的精确度。区间语义让「约」不再被当成精确值。
@@ -291,6 +296,8 @@ pub struct Quantity {
     dimension: Dimension,
     /// 原始单位；无单位数字为 `None`。
     unit: Option<&'static Unit>,
+    /// 单位在 [`UNITS`] 中的原始写法，用于把差值写回用户熟悉的单位。
+    unit_alias: Option<&'static str>,
     exactness: Exactness,
 }
 
@@ -311,6 +318,11 @@ impl Quantity {
 
     pub fn unit(&self) -> Option<&'static Unit> {
         self.unit
+    }
+
+    /// 单位原始写法（如 `厘米`、`cm`）；无单位数字为 `None`。
+    pub fn unit_alias(&self) -> Option<&'static str> {
+        self.unit_alias
     }
 
     pub fn exactness(&self) -> Exactness {
@@ -361,6 +373,24 @@ impl Quantity {
             });
         }
         Ok(self.base - other.base)
+    }
+
+    /// 同量纲差值，换算回 `self` 的原始单位，供「相差 10 厘米」这类解释使用。
+    ///
+    /// 返回 `(差值, 单位写法)`；无单位计数返回 `None` 作单位，调用方不必
+    /// 强行补一个「个」。跨量纲仍显式拒绝。
+    pub fn difference_in_own_unit(
+        &self,
+        other: &Quantity,
+    ) -> Result<(f64, Option<&'static str>), Incomparable> {
+        let difference = self.difference(other)?;
+        match (self.unit, self.unit_alias) {
+            (Some(unit), Some(alias)) if unit.factor != 0.0 => {
+                Ok((difference / unit.factor, Some(alias)))
+            }
+            _ if self.dimension == Dimension::Count => Ok((difference, None)),
+            _ => Ok((difference, Some(self.dimension.canonical_unit()))),
+        }
     }
 
     /// 换算后的规范写法，如 `226厘米` → `2.26米`。
@@ -486,16 +516,18 @@ pub fn parse_quantity(raw: &str) -> Option<Quantity> {
             base: value,
             dimension: Dimension::Count,
             unit: None,
+            unit_alias: None,
             exactness,
         });
     }
 
-    let unit = lookup_unit(rest)?;
+    let (unit_alias, unit) = lookup_unit_entry(rest)?;
     Some(Quantity {
         raw: raw.to_string(),
         base: value * unit.factor + unit.offset,
         dimension: unit.dimension,
         unit: Some(unit),
+        unit_alias: Some(unit_alias),
         exactness,
     })
 }
@@ -875,6 +907,25 @@ mod tests {
             parse_quantity("20岁左右").unwrap().exactness(),
             Exactness::Approximate
         );
+    }
+
+    #[test]
+    fn difference_is_reported_in_the_original_unit() {
+        let tall = parse_quantity("226厘米").unwrap();
+        let short = parse_quantity("2.16米").unwrap();
+        let (value, unit) = tall.difference_in_own_unit(&short).unwrap();
+        assert!((value - 10.0).abs() < 1e-9);
+        assert_eq!(unit, Some("厘米"));
+        // 无单位计数不编造「个」。
+        let (value, unit) = parse_quantity("20")
+            .unwrap()
+            .difference_in_own_unit(&parse_quantity("18").unwrap())
+            .unwrap();
+        assert_eq!(value, 2.0);
+        assert_eq!(unit, None);
+        assert!(tall
+            .difference_in_own_unit(&parse_quantity("8848米").unwrap())
+            .is_err());
     }
 
     #[test]
