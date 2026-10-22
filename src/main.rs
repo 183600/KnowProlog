@@ -154,6 +154,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Answer one question through the symbolic reasoner (read-only; no
+    /// interactive banners). Omit the question to read one per line from stdin
+    Ask {
+        /// Question to answer; omit to read newline-delimited questions from stdin
+        question: Option<String>,
+        /// Print a JSON array of {question, status, answer}
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero when any question is left unanswered
+        #[arg(long)]
+        strict: bool,
+    },
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
     ReadTrace {
@@ -1162,6 +1174,13 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Commands::Ask {
+            question,
+            json,
+            strict,
+        }) => {
+            run_ask(&config, &oxigraph_manager, &store_path, question, json, strict).await;
         }
         Some(Commands::Frames {
             text,
@@ -3923,6 +3942,128 @@ async fn serve_facts(
     manager: &OxigraphManager,
 ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
     Ok((*manager.load_graph_snapshot().await?).clone())
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AskAnswer {
+    question: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    answer: Option<String>,
+}
+
+/// `ask`：把交互模式的核心符号推理做成一次性、无横幅的脚本接口。
+///
+/// 只读知识存储，不写对话记忆；事实、谓词画像、实体别名与律典的装配顺序
+/// 与 `serve`/交互模式一致，保证同一问题在三种入口得到同一结论。
+async fn run_ask(
+    config: &SystemConfig,
+    oxigraph_manager: &OxigraphManager,
+    store_path: &str,
+    question: Option<String>,
+    json: bool,
+    strict: bool,
+) {
+    let facts = match serve_facts(oxigraph_manager).await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识库失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let questions: Vec<String> = match question {
+        Some(question) => vec![question],
+        None => {
+            let mut buffer = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut buffer) {
+                eprintln!("读取标准输入失败: {}", error);
+                std::process::exit(1);
+            }
+            buffer
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+    };
+    if questions.is_empty() {
+        eprintln!("没有问题可回答：请提供问句参数，或从标准输入逐行输入。");
+        std::process::exit(1);
+    }
+
+    let registry_path = format!("{}/predicate_registry.json", store_path);
+    let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+    oxigraph_manager.configure_predicates(
+        &config.predicate_profiles,
+        config.reasoning.require_predicate_admission,
+    );
+    let _ = oxigraph_manager.load_entity_registry(&format!(
+        "{}/entity_registry.json",
+        store_path
+    ));
+    oxigraph_manager.configure_entities(&config.entity_profiles);
+    oxigraph_manager.configure_type_system(&config.type_system);
+
+    let synonyms = config
+        .synonyms
+        .as_ref()
+        .map(|synonyms| synonyms.mappings.clone())
+        .unwrap_or_else(create_default_synonyms);
+    let mut reasoner = SymbolicReasoner::with_perf_ledger(
+        config.reasoning.clone(),
+        synonyms,
+        PerfLedger::shared(),
+    );
+    reasoner.set_nlp_config(config.nlp.clone());
+    reasoner.configure_ontology_program(&OntologyProgram::from_config(
+        &config.type_system,
+        &config.predicate_profiles,
+    ));
+    reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
+    reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
+    if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+        reasoner.load_persisted_laws(persisted);
+    }
+    reasoner.observe_facts(&facts);
+
+    let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
+    for question in questions {
+        let answer = reasoner.answer(&question);
+        answers.push(AskAnswer {
+            question,
+            status: if answer.is_some() {
+                "answered"
+            } else {
+                "unanswered"
+            },
+            answer,
+        });
+    }
+
+    if json {
+        match serde_json::to_string_pretty(&answers) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("回答序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        for (index, answer) in answers.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            println!("> {}", answer.question);
+            match &answer.answer {
+                Some(text) => println!("{}", text),
+                None => println!("未能回答：当前知识库中没有可用依据。"),
+            }
+        }
+    }
+    if strict && answers.iter().any(|answer| answer.answer.is_none()) {
+        std::process::exit(1);
+    }
 }
 
 /// 编译并执行形状校验（`eval-shapes` 与交互命令共用同一确定性路径）。
@@ -11678,6 +11819,39 @@ mod session_tests {
         let mut missing = None;
         isolate_dialogue_state_path(&mut missing, "/tmp/kp-alt");
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn ask_cli_accepts_question_and_stdin_modes() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "ask",
+            "张三的师傅是谁",
+            "--json",
+            "--strict",
+        ])
+        .expect("ask 参数应可解析");
+        match cli.command {
+            Some(Commands::Ask {
+                question,
+                json,
+                strict,
+            }) => {
+                assert_eq!(question.as_deref(), Some("张三的师傅是谁"));
+                assert!(json);
+                assert!(strict);
+            }
+            _ => panic!("应解析为 Ask 子命令"),
+        }
+        let cli = Cli::try_parse_from(["knowprolog", "ask"]).expect("无问句时应读 stdin");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Ask {
+                question: None,
+                json: false,
+                strict: false
+            })
+        ));
     }
 
     /// 各命令必须被 is_command_like 识别，避免澄清追问时被吞掉
