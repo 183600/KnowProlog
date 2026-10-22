@@ -8,7 +8,9 @@ use crate::abduction::{
     Scenario,
 };
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
-use crate::belief_revision::{BeliefState, ChangeSet, RevisionConstraints};
+use crate::belief_revision::{
+    BeliefState, ChangeOp, ChangeSet, RevisionConstraints,
+};
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
@@ -54,6 +56,7 @@ use crate::resolution_engine::{
     render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
 };
+use crate::revision_guard::{GuardPlan, RevisionGuard};
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{self, EntailmentResult, Knowledge, PropositionParser, Verdict};
 use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
@@ -92,6 +95,9 @@ const TEMPORAL_TO_FIELDS: &[&str] = &["valid_to", "end_year", "until", "结束�
 // 会话内纯函数记忆槽容量（提及/链接/谓词）：多轮交替询问时各自留槽，
 // 知识版本推进（revision 自增）时整体失效；容量按条目数确定，LRU 序可审计。
 const MEMO_CAPACITY: usize = 16;
+
+// 会话修订回执容量：只保留最近若干次可撤销写入，历史仍可在对话编年史里查。
+const MAX_SESSION_RECEIPTS: usize = 32;
 
 // 中文教学知识类型的展示名
 fn lesson_kind_label(kind: LessonKind) -> &'static str {
@@ -211,6 +217,30 @@ fn restore_clause(snapshot: &SnapshotClause) -> Option<Clause> {
     ))
 }
 
+fn snapshot_atom(atom: &Atom) -> SnapshotAtom {
+    SnapshotAtom {
+        predicate: atom.predicate.to_string(),
+        terms: atom.terms.iter().map(|term| term.name().to_string()).collect(),
+    }
+}
+
+fn restore_snapshot_atom(snapshot: &SnapshotAtom) -> Option<Atom> {
+    if snapshot.predicate.is_empty() || snapshot.terms.is_empty() {
+        return None;
+    }
+    if snapshot.terms.iter().any(|term| term.is_empty()) {
+        return None;
+    }
+    Some(Atom::new(
+        &snapshot.predicate,
+        snapshot
+            .terms
+            .iter()
+            .map(|term| Term::constant(term))
+            .collect(),
+    ))
+}
+
 /// 归结原子 → 图账本原子（规则/派生物化为 RDF 时的结构载体）。
 fn ledger_atom(atom: &Atom) -> graph_ledger::LedgerAtom {
     graph_ledger::LedgerAtom {
@@ -281,6 +311,95 @@ pub struct SnapshotClause {
     pub source: String,
 }
 
+/// 修订操作的持久化形式：事实用 `atom`，规则用 `clause`，二者按 `kind` 取用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotRevisionOp {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom: Option<SnapshotAtom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clause: Option<SnapshotClause>,
+}
+
+/// 一条可跨会话撤销的修订回执；空回执不落盘，旧快照字节保持不变。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotRevision {
+    pub id: String,
+    pub label: String,
+    pub revision: u64,
+    pub ops: Vec<SnapshotRevisionOp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore_lessons: Vec<String>,
+}
+
+/// 一次会话写入的修订回执：真实生效的操作 + 可一并恢复的教学原句。
+#[derive(Debug, Clone)]
+struct SessionRevisionReceipt {
+    id: String,
+    label: String,
+    revision: u64,
+    ops: Vec<ChangeOp>,
+    restore_lessons: Vec<String>,
+}
+
+impl SessionRevisionReceipt {
+    fn to_snapshot(&self) -> SnapshotRevision {
+        SnapshotRevision {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            revision: self.revision,
+            ops: self
+                .ops
+                .iter()
+                .map(|op| match op {
+                    ChangeOp::AssertFact(atom) => SnapshotRevisionOp {
+                        kind: "assert".to_string(),
+                        atom: Some(snapshot_atom(atom)),
+                        clause: None,
+                    },
+                    ChangeOp::RetractFact(atom) => SnapshotRevisionOp {
+                        kind: "retract".to_string(),
+                        atom: Some(snapshot_atom(atom)),
+                        clause: None,
+                    },
+                    ChangeOp::AddRule(clause) => SnapshotRevisionOp {
+                        kind: "add_rule".to_string(),
+                        atom: None,
+                        clause: Some(snapshot_clause(clause)),
+                    },
+                    ChangeOp::RemoveRule(clause) => SnapshotRevisionOp {
+                        kind: "remove_rule".to_string(),
+                        atom: None,
+                        clause: Some(snapshot_clause(clause)),
+                    },
+                })
+                .collect(),
+            restore_lessons: self.restore_lessons.clone(),
+        }
+    }
+
+    fn from_snapshot(snapshot: &SnapshotRevision) -> Option<Self> {
+        let mut ops = Vec::with_capacity(snapshot.ops.len());
+        for op in &snapshot.ops {
+            let restored = match op.kind.as_str() {
+                "assert" => ChangeOp::AssertFact(restore_snapshot_atom(op.atom.as_ref()?)?),
+                "retract" => ChangeOp::RetractFact(restore_snapshot_atom(op.atom.as_ref()?)?),
+                "add_rule" => ChangeOp::AddRule(restore_clause(op.clause.as_ref()?)?),
+                "remove_rule" => ChangeOp::RemoveRule(restore_clause(op.clause.as_ref()?)?),
+                _ => return None,
+            };
+            ops.push(restored);
+        }
+        Some(Self {
+            id: snapshot.id.clone(),
+            label: snapshot.label.clone(),
+            revision: snapshot.revision,
+            ops,
+            restore_lessons: snapshot.restore_lessons.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueSnapshot {
     pub focus_entities: Vec<String>,
@@ -321,6 +440,9 @@ pub struct DialogueSnapshot {
     // 空世界不落盘，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assumptions: Vec<SnapshotAtom>,
+    // 会话修订回执：跨重启仍可撤销最新写入；空回执不落盘
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_receipts: Vec<SnapshotRevision>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -532,6 +654,7 @@ impl DialogueContext {
             ontology: None,
             completion: None,
             assumptions: Vec::new(),
+            session_receipts: Vec::new(),
         }
     }
 
@@ -800,6 +923,8 @@ pub struct SymbolicReasoner {
     session_negative_facts: Vec<Atom>,
     // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
     session_clauses: Vec<Clause>,
+    // 会话写入的修订回执（预检通过后才记录；支持按最新回执撤销）
+    session_receipts: Vec<SessionRevisionReceipt>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）
     clarification: Option<ClarificationSession>,
     // 最近一次溯因的目标合取与查询变量（澄清确认真后验证整个目标是否得证）
@@ -879,6 +1004,7 @@ impl Clone for SymbolicReasoner {
             assumption_world: self.assumption_world.clone(),
             session_negative_facts: self.session_negative_facts.clone(),
             session_clauses: self.session_clauses.clone(),
+            session_receipts: self.session_receipts.clone(),
             clarification: self.clarification.clone(),
             last_abduction_goal: self.last_abduction_goal.clone(),
             last_abduction_vars: self.last_abduction_vars.clone(),
@@ -1080,6 +1206,7 @@ impl SymbolicReasoner {
             assumption_world: None,
             session_negative_facts: Vec::new(),
             session_clauses: Vec::new(),
+            session_receipts: Vec::new(),
             clarification: None,
             last_abduction_goal: None,
             last_abduction_vars: Vec::new(),
@@ -2175,11 +2302,7 @@ impl SymbolicReasoner {
 
     /// 当前会话的信念快照：复用归结引擎与已声明的谓词约束，不复制另一套事实。
     pub fn belief_state(&self) -> BeliefState {
-        let constraints = match &self.law_registry {
-            Some(registry) => RevisionConstraints::from_registry(registry),
-            None => RevisionConstraints::from_law_book(&self.laws),
-        };
-        BeliefState::with_constraints(self.resolver.clone(), constraints)
+        BeliefState::with_constraints(self.resolver.clone(), self.session_revision_constraints())
     }
 
     /// 只读一致性报告：功能谓词多值、定义域/值域冲突与规则形状问题。
@@ -2236,6 +2359,223 @@ impl SymbolicReasoner {
         .retract(&predicate, &entity, old_value)
         .assert(&predicate, &entity, new_value);
         state.plan(changeset).render_zh()
+    }
+
+    fn session_revision_constraints(&self) -> RevisionConstraints {
+        match &self.law_registry {
+            Some(registry) => RevisionConstraints::from_registry(registry),
+            None => RevisionConstraints::from_law_book(&self.laws),
+        }
+    }
+
+    /// 会话写入守门器：以当前归结引擎为基座，先计划再决定是否落笔。
+    pub fn revision_guard(&self) -> RevisionGuard {
+        RevisionGuard::new(self.resolver.clone(), self.session_revision_constraints())
+    }
+
+    /// 预检一批会话级变更（事实/规则），返回带最小冲突核的计划报告。
+    pub fn preview_session_change(&self, label: &str, ops: Vec<ChangeOp>) -> GuardPlan {
+        let mut changeset = ChangeSet::new(label.to_string());
+        for op in ops {
+            changeset.push(op);
+        }
+        self.revision_guard().plan(changeset)
+    }
+
+    fn render_guard_block(&self, plan: &GuardPlan) -> String {
+        format!(
+            "{}\n本次写入未提交：会话事实、会话规则与教学记忆均未改变。",
+            plan.render_zh()
+        )
+    }
+
+    fn record_session_revision(
+        &mut self,
+        label: impl Into<String>,
+        ops: Vec<ChangeOp>,
+        restore_lessons: Vec<String>,
+    ) {
+        if ops.is_empty() && restore_lessons.is_empty() {
+            return;
+        }
+        let revision = self
+            .session_receipts
+            .last()
+            .map(|receipt| receipt.revision + 1)
+            .unwrap_or(1);
+        let material = ops
+            .iter()
+            .map(ChangeOp::describe)
+            .collect::<Vec<_>>()
+            .join("|");
+        let digest = material.bytes().fold(2_166_136_261u32, |acc, byte| {
+            (acc ^ u32::from(byte)).wrapping_mul(16_777_619)
+        });
+        let id = format!("session:{}:{:08x}", revision, digest);
+        if self.session_receipts.len() >= MAX_SESSION_RECEIPTS {
+            self.session_receipts.remove(0);
+        }
+        self.session_receipts.push(SessionRevisionReceipt {
+            id,
+            label: label.into(),
+            revision,
+            ops,
+            restore_lessons,
+        });
+    }
+
+    /// 会话修订回执：最近的可撤销写入，以及每笔写入的真实操作数。
+    pub fn session_revision_report(&self) -> String {
+        let mut lines = vec![format!(
+            "会话修订回执：{} 条（最多保留 {} 条）",
+            self.session_receipts.len(),
+            MAX_SESSION_RECEIPTS
+        )];
+        if self.session_receipts.is_empty() {
+            lines.push("  （还没有可撤销的会话写入）".to_string());
+            return lines.join("\n");
+        }
+        for receipt in self.session_receipts.iter().rev().take(5) {
+            lines.push(format!(
+                "  · {} 〔{}；{} 个操作；版本 {}〕",
+                receipt.id,
+                receipt.label,
+                receipt.ops.len(),
+                receipt.revision
+            ));
+            for op in receipt.ops.iter().take(4) {
+                lines.push(format!("      {}", op.describe()));
+            }
+            if receipt.ops.len() > 4 {
+                lines.push(format!("      …另有 {} 个操作", receipt.ops.len() - 4));
+            }
+        }
+        lines.push("可用「撤销修订」撤回最新一条回执。".to_string());
+        lines.join("\n")
+    }
+
+    fn remove_session_clause(&mut self, clause: &Clause) -> bool {
+        match self
+            .session_clauses
+            .iter()
+            .position(|existing| existing.head == clause.head && existing.body == clause.body)
+        {
+            Some(position) => {
+                self.session_clauses.remove(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn add_session_clause(&mut self, clause: &Clause) -> bool {
+        if self.session_clauses.iter().any(|existing| {
+            existing.head == clause.head && existing.body == clause.body
+        }) {
+            return false;
+        }
+        let mut new_predicates = false;
+        for atom in std::iter::once(&clause.head).chain(clause.body.iter()) {
+            if !self.aligner.is_registered(&atom.predicate) {
+                self.aligner.register_term(&atom.predicate, TermKind::Relation);
+                new_predicates = true;
+            }
+        }
+        self.session_clauses.push(clause.clone());
+        if new_predicates {
+            self.rebuild_knowledge_caches();
+        }
+        true
+    }
+
+    /// 撤销最新一条会话修订回执：按逆操作恢复事实/规则/教学原句。
+    /// 撤销本身也记为新回执，历史不回写。
+    pub fn undo_last_session_revision(&mut self) -> String {
+        let Some(receipt) = self.session_receipts.last().cloned() else {
+            return "没有可撤销的会话修订。".to_string();
+        };
+        let mut inverse_ops: Vec<ChangeOp> = Vec::new();
+        let mut facts_changed = 0usize;
+        let mut clauses_changed = 0usize;
+        let mut clause_touched = false;
+        for op in receipt.ops.iter().rev() {
+            match op {
+                ChangeOp::AssertFact(atom) => {
+                    if self.retract_atom(atom) {
+                        facts_changed += 1;
+                        inverse_ops.push(ChangeOp::RetractFact(atom.clone()));
+                    }
+                }
+                ChangeOp::RetractFact(atom) => {
+                    self.register_atom_vocabulary(atom);
+                    if self.adopt_atom(atom.clone()) {
+                        facts_changed += 1;
+                        inverse_ops.push(ChangeOp::AssertFact(atom.clone()));
+                    }
+                }
+                ChangeOp::AddRule(clause) => {
+                    if self.remove_session_clause(clause) {
+                        clauses_changed += 1;
+                        clause_touched = true;
+                        inverse_ops.push(ChangeOp::RemoveRule(clause.clone()));
+                    }
+                }
+                ChangeOp::RemoveRule(clause) => {
+                    if self.add_session_clause(clause) {
+                        clauses_changed += 1;
+                        clause_touched = true;
+                        inverse_ops.push(ChangeOp::AddRule(clause.clone()));
+                    }
+                }
+            }
+        }
+        if clause_touched {
+            self.rebuild_resolver();
+        }
+        let mut lessons_restored = 0usize;
+        for lesson in &receipt.restore_lessons {
+            if !self.lessons.contains(lesson) {
+                self.lessons.push(lesson.clone());
+                lessons_restored += 1;
+            }
+        }
+        if lessons_restored > 0 {
+            self.lessons_parsed = self
+                .lessons
+                .iter()
+                .flat_map(|sentence| {
+                    chinese_reasoning_nlu::parse_lessons(sentence).lessons
+                })
+                .collect();
+            if self.config.enable_problog && self.config.enable_soft_logic {
+                self.rebuild_problog();
+            }
+        }
+        if inverse_ops.is_empty() && lessons_restored == 0 {
+            return format!(
+                "回执 {} 在当前会话没有可恢复的改动（可能已被后续操作覆盖）。",
+                receipt.id
+            );
+        }
+        self.record_session_revision(
+            format!("撤销 {}", receipt.id),
+            inverse_ops,
+            receipt.restore_lessons.clone(),
+        );
+        let new_id = self
+            .session_receipts
+            .last()
+            .map(|item| item.id.clone())
+            .unwrap_or_default();
+        format!(
+            "已撤销会话修订 {}（{}）：恢复事实 {} 条、规则 {} 条、教学原句 {} 条。新回执：{}。",
+            receipt.id,
+            receipt.label,
+            facts_changed,
+            clauses_changed,
+            lessons_restored,
+            new_id
+        )
     }
 
     fn rebuild_laws(&mut self) {
@@ -8888,10 +9228,10 @@ impl SymbolicReasoner {
         }
         // 条件/因果知识同时登记为会话 Horn 子句：后向链（判断/证明/为什么/推理链）直接可用
         let added_clauses = self.register_lesson_clauses(&outcome.lessons);
-        if added_clauses > 0 {
+        if !added_clauses.is_empty() {
             output.push_str(&format!(
                 "  其中 {} 条规则已进入会话后向链规则库（含占位符的自动变量化，可用「判断/为什么/推理链」验证）。\n",
-                added_clauses
+                added_clauses.len()
             ));
         }
         self.lessons.push(sentence.to_string());
@@ -8907,15 +9247,15 @@ impl SymbolicReasoner {
     }
 
     /// 把教过的条件/因果知识登记为会话 Horn 子句（含占位符的自动变量化），
-    /// 重建归结算子库；返回新增子句条数
+    /// 重建归结算子库；返回实际新增的子句（供修订回执精确记录）。
     fn register_lesson_clauses(
         &mut self,
         lessons: &[chinese_reasoning_nlu::ChineseLesson],
-    ) -> usize {
+    ) -> Vec<Clause> {
         if !self.config.enable_resolution {
-            return 0;
+            return Vec::new();
         }
-        let mut added = 0;
+        let mut added: Vec<Clause> = Vec::new();
         let mut new_predicates: Vec<String> = Vec::new();
         for lesson in lessons {
             let Some(clause) = chinese_reasoning_nlu::lesson_to_clause(lesson) else {
@@ -8937,10 +9277,10 @@ impl SymbolicReasoner {
                     new_predicates.push(atom.predicate.to_string());
                 }
             }
-            self.session_clauses.push(clause);
-            added += 1;
+            self.session_clauses.push(clause.clone());
+            added.push(clause);
         }
-        if added > 0 {
+        if !added.is_empty() {
             // 新谓词登记为关系：命题解析/意图规划才能识别规则里的谓词（如"老师"）
             for predicate in &new_predicates {
                 self.aligner.register_term(predicate, TermKind::Relation);
@@ -8994,6 +9334,16 @@ impl SymbolicReasoner {
             }
             return output.trim_end().to_string();
         }
+        // 写入前守门：规则可能推出与现有事实冲突的结论（如功能谓词第二取值），
+        // 冲突时只问一个最小问题，绝不先教后报。
+        let mut preview = ChangeSet::new(format!("学习规则：{}", sentence));
+        for (_, clause) in &rules {
+            preview.push(ChangeOp::AddRule(clause.clone()));
+        }
+        let plan = self.revision_guard().plan(preview);
+        if plan.is_blocked() {
+            return self.render_guard_block(&plan);
+        }
         let mut output =
             String::from("已学习中文规则（纯符号解析 → Horn 子句，直接进入后向链）：\n");
         for (index, (lesson, clause)) in rules.iter().enumerate() {
@@ -9020,13 +9370,21 @@ impl SymbolicReasoner {
             output.push_str(&format!("  未学习：{}\n", error));
         }
         let added = self.register_lesson_clauses(&outcome.lessons);
-        if added == 0 {
+        if added.is_empty() {
             output.push_str("  （以上规则已存在，未重复添加）\n");
         } else {
-            output.push_str(&format!("  新增 {} 条会话规则。", added));
+            output.push_str(&format!("  新增 {} 条会话规则。", added.len()));
+            let ops = added
+                .into_iter()
+                .map(ChangeOp::AddRule)
+                .collect::<Vec<_>>();
+            self.record_session_revision(format!("学习规则：{}", sentence), ops, Vec::new());
+            if let Some(receipt) = self.session_receipts.last() {
+                output.push_str(&format!("  修订回执：{}。", receipt.id));
+            }
         }
         output.push_str(&format!(
-            "会话规则库现有 {} 条子句、{} 条事实；可用「判断/为什么/推理链/推理发现」验证后向链。",
+            "\n会话规则库现有 {} 条子句、{} 条事实；可用「判断/为什么/推理链/推理发现」验证后向链。",
             self.resolver.clause_count(),
             self.resolver.fact_count()
         ));
@@ -9142,9 +9500,23 @@ impl SymbolicReasoner {
             return self.assert_negative_atom(atom);
         }
         let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        // 写入前守门：先按当前会话世界试算，冲突时只问一个最小问题。
+        let mut preflight = ChangeSet::new(format!("记住：{}", sentence));
+        for lesson in &outcome.lessons {
+            if lesson.kind == LessonKind::DeterministicFact && lesson.head.is_ground() {
+                preflight.push(ChangeOp::AssertFact(lesson.head.clone()));
+            }
+        }
+        if !preflight.is_empty() {
+            let plan = self.revision_guard().plan(preflight);
+            if plan.is_blocked() {
+                return self.render_guard_block(&plan);
+            }
+        }
         let mut remembered: Vec<String> = Vec::new();
         let mut refused: Vec<String> = Vec::new();
         let mut superseded_negatives: Vec<String> = Vec::new();
+        let mut revision_ops: Vec<ChangeOp> = Vec::new();
         for lesson in &outcome.lessons {
             if lesson.kind != LessonKind::DeterministicFact {
                 let hint = match lesson.kind {
@@ -9176,10 +9548,18 @@ impl SymbolicReasoner {
                 superseded_negatives.push(rendered.clone());
             }
             if self.adopt_atom(lesson.head.clone()) {
+                revision_ops.push(ChangeOp::AssertFact(lesson.head.clone()));
                 remembered.push(rendered);
             } else {
                 refused.push(format!("「{}」已经记住", rendered));
             }
+        }
+        if !revision_ops.is_empty() {
+            self.record_session_revision(
+                format!("记住：{}", sentence),
+                revision_ops,
+                Vec::new(),
+            );
         }
         let mut output = String::new();
         if remembered.is_empty() {
@@ -9203,6 +9583,14 @@ impl SymbolicReasoner {
         }
         for error in &outcome.errors {
             output.push_str(&format!("  未解析：{}\n", error));
+        }
+        if let Some(receipt) = self.session_receipts.last() {
+            if receipt.label == format!("记住：{}", sentence) {
+                output.push_str(&format!(
+                    "修订回执：{}（可用「撤销修订」撤回本次写入）。\n",
+                    receipt.id
+                ));
+            }
         }
         output.push_str(&format!(
             "会话事实共 {} 条；后续「判断/为什么/推理链」会使用它们。",
@@ -9230,8 +9618,25 @@ impl SymbolicReasoner {
             return format!("否定事实中没有「{}」。", rendered);
         }
         let outcome = chinese_reasoning_nlu::parse_lessons(sentence);
+        // 写入前守门：撤回后若规则仍能推出同一事实，先问清是撤事实还是停规则。
+        let mut preflight = ChangeSet::new(format!("忘记：{}", sentence));
+        for lesson in &outcome.lessons {
+            if lesson.kind == LessonKind::DeterministicFact
+                && lesson.head.is_ground()
+                && self.session_facts.contains(&lesson.head)
+            {
+                preflight.push(ChangeOp::RetractFact(lesson.head.clone()));
+            }
+        }
+        if !preflight.is_empty() {
+            let plan = self.revision_guard().plan(preflight);
+            if plan.is_blocked() {
+                return self.render_guard_block(&plan);
+            }
+        }
         let mut removed: Vec<String> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
+        let mut revision_ops: Vec<ChangeOp> = Vec::new();
         for lesson in &outcome.lessons {
             if lesson.kind != LessonKind::DeterministicFact || !lesson.head.is_ground() {
                 continue;
@@ -9243,11 +9648,21 @@ impl SymbolicReasoner {
                 .position(|negative| negative == &lesson.head)
                 .map(|position| self.session_negative_facts.remove(position))
                 .is_some();
-            if self.retract_atom(&lesson.head) || removed_negative {
+            if self.retract_atom(&lesson.head) {
+                revision_ops.push(ChangeOp::RetractFact(lesson.head.clone()));
+                removed.push(rendered);
+            } else if removed_negative {
                 removed.push(rendered);
             } else {
                 missing.push(rendered);
             }
+        }
+        if !revision_ops.is_empty() {
+            self.record_session_revision(
+                format!("忘记：{}", sentence),
+                revision_ops,
+                Vec::new(),
+            );
         }
         let mut output = String::new();
         if removed.is_empty() && missing.is_empty() {
@@ -9266,6 +9681,14 @@ impl SymbolicReasoner {
         }
         for error in &outcome.errors {
             output.push_str(&format!("未解析：{}\n", error));
+        }
+        if let Some(receipt) = self.session_receipts.last() {
+            if receipt.label == format!("忘记：{}", sentence) {
+                output.push_str(&format!(
+                    "修订回执：{}（可用「撤销修订」恢复本次撤回）。\n",
+                    receipt.id
+                ));
+            }
         }
         output.push_str(&format!("会话事实剩余 {} 条。", self.session_facts.len()));
         output
@@ -9441,12 +9864,33 @@ impl SymbolicReasoner {
         let same_clause =
             |left: &Clause, right: &Clause| left.head == right.head && left.body == right.body;
 
+        // 写入前守门：只对确实存在的会话规则做撤回预检。
+        let existing_targets: Vec<Clause> = targets
+            .iter()
+            .filter(|target| {
+                self.session_clauses
+                    .iter()
+                    .any(|clause| same_clause(target, clause))
+            })
+            .cloned()
+            .collect();
+        if !existing_targets.is_empty() {
+            let mut preflight = ChangeSet::new(format!("忘记规则：{}", sentence));
+            for clause in &existing_targets {
+                preflight.push(ChangeOp::RemoveRule(clause.clone()));
+            }
+            let plan = self.revision_guard().plan(preflight);
+            if plan.is_blocked() {
+                return self.render_guard_block(&plan);
+            }
+        }
+
         let existing_clauses = std::mem::take(&mut self.session_clauses);
         let mut removed_targets: Vec<Clause> = Vec::new();
         let mut kept_clauses: Vec<Clause> = Vec::new();
         for clause in existing_clauses {
             match targets.iter().find(|target| same_clause(target, &clause)) {
-                Some(target) => removed_targets.push(target.clone()),
+                Some(_) => removed_targets.push(clause),
                 None => kept_clauses.push(clause),
             }
         }
@@ -9454,6 +9898,7 @@ impl SymbolicReasoner {
 
         // 教学原句撤回：解析结果命中同一规则的整句一并移除
         let mut lessons_removed = 0usize;
+        let mut removed_lessons: Vec<String> = Vec::new();
         let mut kept_lessons: Vec<String> = Vec::new();
         for lesson_sentence in &self.lessons {
             let matches = chinese_reasoning_nlu::parse_lessons(lesson_sentence)
@@ -9463,6 +9908,7 @@ impl SymbolicReasoner {
                 .any(|parsed| targets.iter().any(|target| same_clause(target, &parsed)));
             if matches {
                 lessons_removed += 1;
+                removed_lessons.push(lesson_sentence.clone());
             } else {
                 kept_lessons.push(lesson_sentence.clone());
             }
@@ -9506,6 +9952,24 @@ impl SymbolicReasoner {
                 "同时撤回 {} 条对应教学原句（防止重启重放复活）。\n",
                 lessons_removed
             ));
+        }
+        if !removed_targets.is_empty() || !removed_lessons.is_empty() {
+            let ops = removed_targets
+                .iter()
+                .cloned()
+                .map(ChangeOp::RemoveRule)
+                .collect::<Vec<_>>();
+            self.record_session_revision(
+                format!("忘记规则：{}", sentence),
+                ops,
+                removed_lessons,
+            );
+            if let Some(receipt) = self.session_receipts.last() {
+                output.push_str(&format!(
+                    "修订回执：{}（可用「撤销修订」恢复本次撤回）。\n",
+                    receipt.id
+                ));
+            }
         }
         output.push_str(&format!(
             "会话规则库现有 {} 条子句。",
@@ -10066,6 +10530,11 @@ impl SymbolicReasoner {
                     .collect(),
             })
             .collect();
+        snapshot.session_receipts = self
+            .session_receipts
+            .iter()
+            .map(SessionRevisionReceipt::to_snapshot)
+            .collect();
         snapshot
     }
 
@@ -10299,6 +10768,12 @@ impl SymbolicReasoner {
                 self.rebuild_soft_logic();
             }
         }
+        // 修订回执：旧快照没有该字段时清空；损坏的单条回执跳过，不影响会话恢复。
+        self.session_receipts = snapshot
+            .session_receipts
+            .iter()
+            .filter_map(SessionRevisionReceipt::from_snapshot)
+            .collect();
         Ok(())
     }
 
@@ -15944,5 +16419,108 @@ types = [
             before,
             "预演不得把规则放进会话规则库"
         );
+    }
+
+    #[test]
+    fn assert_nl_fact_blocks_functional_conflict_with_minimal_question() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut registry = PredicateRegistry::new();
+        registry.observe("张三", "年龄", "30", None);
+        assert!(registry.mark_functional("年龄", true));
+        reasoner.configure_laws(&registry);
+        let mut properties = HashMap::new();
+        properties.insert("年龄".to_string(), "30".to_string());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }]);
+        let before = reasoner.session_facts().len();
+
+        let blocked = reasoner.assert_nl_fact("张三的年龄是31");
+        assert!(blocked.contains("最小冲突核"), "{}", blocked);
+        assert!(blocked.contains("未提交"), "{}", blocked);
+        assert!(blocked.contains("30"), "{}", blocked);
+        assert!(blocked.contains("31"), "{}", blocked);
+        assert_eq!(
+            reasoner.session_facts().len(),
+            before,
+            "被阻止的写入不得留下会话事实"
+        );
+        let answer = reasoner.answer("张三的年龄是多少").unwrap_or_default();
+        assert!(!answer.contains("31"), "冲突值不得进入回答：{}", answer);
+
+        let accepted = reasoner.assert_nl_fact("张三的年龄是30");
+        assert!(accepted.contains("修订回执"), "{}", accepted);
+    }
+
+    #[test]
+    fn session_revision_undo_restores_fact_and_can_redo() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let added = reasoner.assert_nl_fact("钱七是孙八的师傅");
+        assert!(added.contains("修订回执"), "{}", added);
+        assert_eq!(reasoner.session_facts().len(), 1);
+        assert!(reasoner.session_revision_report().contains("session:"));
+
+        let undone = reasoner.undo_last_session_revision();
+        assert!(undone.contains("已撤销会话修订"), "{}", undone);
+        assert!(reasoner.session_facts().is_empty(), "撤销后事实应清空");
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("未得证"), "撤销后不应再得证：{}", proof);
+
+        let redone = reasoner.undo_last_session_revision();
+        assert!(redone.contains("恢复事实 1 条"), "{}", redone);
+        assert_eq!(reasoner.session_facts().len(), 1, "再次撤销应恢复事实");
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("得证"), "恢复后应重新得证：{}", proof);
+    }
+
+    #[test]
+    fn session_receipts_survive_snapshot_and_support_undo() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("钱七是孙八的师傅");
+        let path =
+            std::env::temp_dir().join(format!("knowprolog_receipts_{}.json", std::process::id()));
+        let path_str = path.to_string_lossy().to_string();
+        reasoner.save_dialogue_state(&path_str).expect("应能保存");
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        assert!(restored.load_dialogue_state(&path_str), "应能恢复对话状态");
+        assert_eq!(restored.session_facts().len(), 1);
+        assert!(
+            restored.session_revision_report().contains("session:"),
+            "修订回执应随快照恢复：{}",
+            restored.session_revision_report()
+        );
+        let undone = restored.undo_last_session_revision();
+        assert!(undone.contains("已撤销会话修订"), "{}", undone);
+        assert!(restored.session_facts().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_rule_undo_restores_clause_and_lesson() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.teach_report("如果X的师傅是Y，那么X的老师是Y");
+        assert_eq!(reasoner.rule_ledger_entries().len(), 1);
+        assert!(!reasoner.lessons().is_empty());
+
+        let forgotten = reasoner.forget_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        assert!(forgotten.contains("修订回执"), "{}", forgotten);
+        assert!(reasoner.rule_ledger_entries().is_empty());
+        assert!(reasoner.lessons().is_empty());
+
+        let undone = reasoner.undo_last_session_revision();
+        assert!(undone.contains("恢复事实 0 条"), "{}", undone);
+        assert!(undone.contains("规则 1 条"), "{}", undone);
+        assert!(undone.contains("教学原句 1 条"), "{}", undone);
+        assert_eq!(reasoner.rule_ledger_entries().len(), 1);
+        assert!(!reasoner.lessons().is_empty());
+        let proof = reasoner.resolution_proof_report("李四的老师是王五");
+        assert!(proof.contains("得证"), "撤销忘记后规则应恢复：{}", proof);
     }
 }

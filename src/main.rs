@@ -6040,6 +6040,29 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 会话修订回执：查看最近写入及其可撤销操作
+        if matches!(
+            input,
+            "修订回执" | "修订记录" | "会话修订" | "写入回执"
+        ) {
+            println!("{}", symbolic_reasoner.session_revision_report());
+            println!();
+            continue;
+        }
+
+        // 撤销最新一次会话修订：按回执逆操作恢复事实/规则/教学原句
+        if matches!(
+            input,
+            "撤销修订" | "撤销上次修订" | "撤回修订" | "撤销写入"
+        ) {
+            let report = symbolic_reasoner.undo_last_session_revision();
+            println!("{}", report);
+            sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
+            log_chronicle_reply(&mut chronicle, &report, &[], &[]);
+            println!();
+            continue;
+        }
+
         // 修订预演：更正落库前先展示受影响事实、派生结论与阻止级冲突；只计算不写图
         if let Some(target) = strip_any_prefix(
             input,
@@ -8709,6 +8732,7 @@ fn interactive_help() -> String {
         "  记住：<事实> / 忘记：<事实>          会话事实/否定断言与撤回（否定只阻断路径，不写图）",
         "  更正：<实体>的<属性>从<旧>改为<新>  删除旧值、写入新值，并记录可追踪的更正事件",
         "  修订预演：<实体>|<属性>|<旧>|<新>   提交前计算影响与冲突（只计算，不写图）",
+        "  修订回执 / 撤销修订                查看最近写入回执 / 按逆操作恢复最新一笔",
         "  规则预演：<如果…那么…>              教规则前检查重复/不安全变量/功能冲突与影响",
         "  信念检查 / 信念一致性              功能谓词多值、定义域/值域与规则形状体检",
         "  历史可信度：<问题>                   沿支持图查看回答是可信/可疑/失效/未评估",
