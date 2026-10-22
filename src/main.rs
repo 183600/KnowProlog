@@ -1478,14 +1478,20 @@ async fn main() {
                     Err(error) => eprintln!("读取融合账本失败：{}", error),
                 }
             }
+            let default_ledger_path = format!("{}/provenance.json", store_path);
+            if let ProvenanceLoad::Loaded(loaded) = ProvenanceLedger::load(&default_ledger_path) {
+                ledger.merge(&loaded);
+            }
             if let Some(path) = provenance.as_deref() {
-                match ProvenanceLedger::load(path) {
-                    ProvenanceLoad::Loaded(loaded) => ledger.merge(&loaded),
-                    ProvenanceLoad::Missing => {
-                        eprintln!("来源台账不存在：{}（按已回填来源报告）", path)
-                    }
-                    ProvenanceLoad::Damaged(error) => {
-                        eprintln!("来源台账损坏：{}（按已回填来源报告）", error)
+                if path != default_ledger_path {
+                    match ProvenanceLedger::load(path) {
+                        ProvenanceLoad::Loaded(loaded) => ledger.merge(&loaded),
+                        ProvenanceLoad::Missing => {
+                            eprintln!("来源台账不存在：{}（按已回填来源报告）", path)
+                        }
+                        ProvenanceLoad::Damaged(error) => {
+                            eprintln!("来源台账损坏：{}（按已回填来源报告）", error)
+                        }
                     }
                 }
             }
@@ -2196,11 +2202,7 @@ async fn main() {
             oxigraph_manager.configure_type_system(&config.type_system);
             let registry = oxigraph_manager.predicate_registry_snapshot();
             let types = oxigraph_manager.type_system_snapshot();
-            let mut ledger = ProvenanceLedger::new();
-            let journal_path = format!("{}/import_journal.json", store_path);
-            if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
-                ledger.seed_from_import_journal(&journal);
-            }
+            let ledger = provenance_seed_for_store(Some(&store_path), None);
             let mut quality_report =
                 build_report_with_provenance(&facts, &registry, &types, &config.entity_types, Some(&ledger));
             if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
@@ -3499,6 +3501,28 @@ fn ledger_entry_to_clause(
     )
 }
 
+/// 组装事实级来源：导入日志回填 ∪ `<store>/provenance.json` ∪ 调用方台账。
+fn provenance_seed_for_store(
+    store_path: Option<&str>,
+    extra: Option<&ProvenanceLedger>,
+) -> ProvenanceLedger {
+    let mut ledger = ProvenanceLedger::new();
+    if let Some(store_path) = store_path {
+        let journal_path = format!("{}/import_journal.json", store_path);
+        if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
+            ledger.seed_from_import_journal(&journal);
+        }
+        let ledger_path = format!("{}/provenance.json", store_path);
+        if let ProvenanceLoad::Loaded(loaded) = ProvenanceLedger::load(&ledger_path) {
+            ledger.merge(&loaded);
+        }
+    }
+    if let Some(extra) = extra {
+        ledger.merge(extra);
+    }
+    ledger
+}
+
 async fn quality_report_for(
     oxigraph_manager: &OxigraphManager,
     config: &know_prolog::SystemConfig,
@@ -3516,18 +3540,9 @@ async fn quality_report_for_with_provenance(
     let facts = oxigraph_manager.load_graph_snapshot().await?;
     let registry = oxigraph_manager.predicate_registry_snapshot();
     let types = oxigraph_manager.type_system_snapshot();
-    // 事实级来源：外部台账 ∪ 导入日志回填。即使为空也显式传入，让
-    // 「谓词被声明过」不再冒充「这条事实有出处」。
-    let mut ledger = ProvenanceLedger::new();
-    if let Some(store_path) = store_path {
-        let journal_path = format!("{}/import_journal.json", store_path);
-        if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
-            ledger.seed_from_import_journal(&journal);
-        }
-    }
-    if let Some(external) = provenance {
-        ledger.merge(external);
-    }
+    // 事实级来源：导入日志 ∪ 默认台账 ∪ 外部台账。即使为空也显式传入，
+    // 让「谓词被声明过」不再冒充「这条事实有出处」。
+    let ledger = provenance_seed_for_store(store_path, provenance);
     let mut report = know_prolog::quality::build_report_with_provenance(
         &facts,
         &registry,
@@ -3618,11 +3633,7 @@ async fn refresh_dialogue_quality(
     };
     let registry = oxigraph_manager.predicate_registry_snapshot();
     let types = oxigraph_manager.type_system_snapshot();
-    let mut ledger = ProvenanceLedger::new();
-    let journal_path = format!("{}/import_journal.json", store_path);
-    if let JournalLoad::Loaded(journal) = ImportJournal::load(&journal_path) {
-        ledger.seed_from_import_journal(&journal);
-    }
+    let ledger = provenance_seed_for_store(Some(store_path), None);
     let mut report =
         build_report_with_provenance(&facts, &registry, &types, &config.entity_types, Some(&ledger));
     if let Ok(fact_refs) = oxigraph_manager.load_fact_refs().await {
