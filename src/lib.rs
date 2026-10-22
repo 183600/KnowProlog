@@ -82,6 +82,7 @@ pub mod ontology_reasoning;
 pub mod ownthink_api;
 pub mod path_memory;
 pub mod pattern_closure;
+pub mod pending_question;
 pub mod pattern_forge;
 pub mod pattern_ir;
 pub mod perf_ledger;
