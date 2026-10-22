@@ -918,6 +918,24 @@ impl QueryPlanner {
             "连接起来",
             "连起来",
         ];
+        // 「张三是李四的什么人」：系表式关系问法，方向由「是」两侧给出。
+        for suffix in ["的什么人", "的什么关系", "的谁"] {
+            let Some(rest) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let Some((left, right)) = rest.split_once('是') else {
+                continue;
+            };
+            let start = Self::clean_name(left);
+            let goal = Self::clean_name(right);
+            if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                return Some(QueryPlan::PathBetween {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
         if !MARKERS.iter().any(|marker| q.contains(marker)) {
             return None;
         }
@@ -1864,6 +1882,17 @@ mod tests {
 
     #[test]
     fn test_path_between_question() {
+        let copula = planner()
+            .parse("张三是李四的什么人")
+            .expect("系表式关系问法应编译为路径计划");
+        assert_eq!(
+            copula,
+            QueryPlan::PathBetween {
+                start: "张三".to_string(),
+                goal: "李四".to_string(),
+                max_hops: 4,
+            }
+        );
         let plan = planner()
             .parse("张三和王五之间是什么关系")
             .expect("两点之间的问句应编译为路径计划");
