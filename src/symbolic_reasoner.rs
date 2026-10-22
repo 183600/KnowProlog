@@ -4318,7 +4318,15 @@ impl SymbolicReasoner {
         if !self.config.enable_abduction || !self.config.enable_clarification {
             return None;
         }
-        let session = ClarificationSession::start(self.abduction.pending());
+        let session = match &self.last_abduction_goal {
+            Some(goals) if !goals.is_empty() => ClarificationSession::start_with_goal(
+                self.abduction.pending(),
+                &self.resolver,
+                goals,
+                &self.last_abduction_vars,
+            ),
+            _ => ClarificationSession::start(self.abduction.pending()),
+        };
         if session.is_finished() {
             return None;
         }
@@ -4385,26 +4393,44 @@ impl SymbolicReasoner {
                                 ));
                             }
                         }
+                        self.reprioritize_clarification();
                         output.push_str(&self.clarification_follow_up());
                         Some(output)
                     }
                 }
             }
-            ClarificationReply::Rejected(hypothesis) => Some(format!(
-                "✗ 已排除假设：{}。{}",
-                self.render_atom_nl(&hypothesis.atom),
-                self.clarification_follow_up()
-            )),
-            ClarificationReply::Deferred(hypothesis) => Some(format!(
-                "？暂记为不确定：{}。{}",
-                self.render_atom_nl(&hypothesis.atom),
-                self.clarification_follow_up()
-            )),
+            ClarificationReply::Rejected(hypothesis) => {
+                self.reprioritize_clarification();
+                Some(format!(
+                    "✗ 已排除假设：{}。{}",
+                    self.render_atom_nl(&hypothesis.atom),
+                    self.clarification_follow_up()
+                ))
+            }
+            ClarificationReply::Deferred(hypothesis) => {
+                self.reprioritize_clarification();
+                Some(format!(
+                    "？暂记为不确定：{}。{}",
+                    self.render_atom_nl(&hypothesis.atom),
+                    self.clarification_follow_up()
+                ))
+            }
             ClarificationReply::Unrecognized => Some(format!(
                 "没有理解回答（请用「是 / 不是 / 不知道」）。\n{}",
                 self.render_clarification_prompt()
             )),
             ClarificationReply::Finished => Some(self.finish_clarification_session()),
+        }
+    }
+
+    /// 按最新会话世界重排剩余澄清问题（信息增益优先，可信度为平手）。
+    fn reprioritize_clarification(&mut self) {
+        let Some(goals) = self.last_abduction_goal.clone() else {
+            return;
+        };
+        let vars = self.last_abduction_vars.clone();
+        if let Some(session) = self.clarification.as_mut() {
+            session.reprioritize(&self.resolver, &goals, &vars);
         }
     }
 

@@ -222,8 +222,7 @@ pub struct ClarificationSession {
 }
 
 impl ClarificationSession {
-    /// 用待定假设开启澄清：按可信度降序逐条提问
-    pub fn start(hypotheses: &[Hypothesis]) -> Self {
+    fn pool(hypotheses: &[Hypothesis]) -> Vec<Hypothesis> {
         let mut queue: Vec<Hypothesis> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for hypothesis in hypotheses {
@@ -234,10 +233,68 @@ impl ClarificationSession {
                 queue.push(hypothesis.clone());
             }
         }
+        queue
+    }
+
+    fn sort_by_confidence(queue: &mut [Hypothesis]) {
         queue.sort_by_cached_key(|hypothesis| ConfidenceDisplayKey {
             confidence: hypothesis.confidence,
             display: hypothesis.atom.display(),
         });
+    }
+
+    /// 假说对当前目标的判别力：采纳它之后目标是否更接近可证。
+    ///
+    /// 2 = 单独采纳即可证明整个目标；1 = 至少能让一个子目标可证；
+    /// 0 = 对当前目标没有直接推进。用确定性克隆验证，不产生任何副作用。
+    fn discrimination(
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+        hypothesis: &Hypothesis,
+    ) -> u8 {
+        if goals.is_empty() || !hypothesis.is_adoptable() {
+            return 0;
+        }
+        let mut trial = engine.clone();
+        if !trial.add_fact_atom(hypothesis.atom.clone()) {
+            return 0;
+        }
+        if !trial.solve(goals, query_vars).is_empty() {
+            return 2;
+        }
+        if goals.iter().any(|goal| {
+            !trial
+                .solve(std::slice::from_ref(goal), &[])
+                .is_empty()
+        }) {
+            return 1;
+        }
+        0
+    }
+
+    fn sort_by_goal(
+        queue: &mut [Hypothesis],
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) {
+        queue.sort_by(|left, right| {
+            let left_gain = Self::discrimination(engine, goals, query_vars, left);
+            let right_gain = Self::discrimination(engine, goals, query_vars, right);
+            right_gain.cmp(&left_gain).then_with(|| {
+                right
+                    .confidence
+                    .partial_cmp(&left.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }).then_with(|| left.atom.display().cmp(&right.atom.display()))
+        });
+    }
+
+    /// 用待定假设开启澄清：按可信度降序逐条提问
+    pub fn start(hypotheses: &[Hypothesis]) -> Self {
+        let mut queue = Self::pool(hypotheses);
+        Self::sort_by_confidence(&mut queue);
         let mut session = Self {
             queue,
             current: None,
@@ -247,6 +304,46 @@ impl ClarificationSession {
         };
         session.advance();
         session
+    }
+
+    /// 带目标的澄清：优先问“采纳后最能区分/证明当前目标”的假设，
+    /// 可信度只作为同信息量时的排序依据。目标为空时退化为 [`Self::start`]。
+    pub fn start_with_goal(
+        hypotheses: &[Hypothesis],
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> Self {
+        let mut queue = Self::pool(hypotheses);
+        if goals.is_empty() {
+            Self::sort_by_confidence(&mut queue);
+        } else {
+            Self::sort_by_goal(&mut queue, engine, goals, query_vars);
+        }
+        let mut session = Self {
+            queue,
+            current: None,
+            confirmed: Vec::new(),
+            rejected: Vec::new(),
+            deferred: Vec::new(),
+        };
+        session.advance();
+        session
+    }
+
+    /// 一次回答之后按最新世界重排剩余问题：已采纳的事实时常改变最优提问。
+    pub fn reprioritize(
+        &mut self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) {
+        if goals.is_empty() || self.queue.len() < 2 {
+            return;
+        }
+        Self::sort_by_goal(&mut self.queue, engine, goals, query_vars);
+        self.current = None;
+        self.advance();
     }
 
     pub fn current(&self) -> Option<&Hypothesis> {
@@ -2122,6 +2219,27 @@ mod tests {
         let reply = session.respond("不知道");
         assert!(matches!(reply, ClarificationReply::Deferred(_)));
         assert!(session.is_finished());
+    }
+
+    #[test]
+    fn clarification_prefers_hypothesis_that_decides_the_goal() {
+        let mut engine = ResolutionEngine::new(8, 16);
+        engine.add_fact("师傅", "张三", "李四");
+        engine.add_clause(teacher_clause());
+        let decisive = hyp("师傅", "李四", "赵六", 0.2);
+        let noisy = hyp("师傅", "张三", "钱七", 0.9);
+        let goals = [Atom::rel("师祖", "张三", "赵六")];
+        let session =
+            ClarificationSession::start_with_goal(&[noisy, decisive.clone()], &engine, &goals, &[]);
+        assert_eq!(
+            session.current().map(|hypothesis| hypothesis.clone().atom),
+            Some(decisive.atom.clone()),
+            "应优先问能直接让目标可证的假设，即使它可信度更低"
+        );
+        assert_eq!(
+            ClarificationSession::discrimination(&engine, &goals, &[], &decisive),
+            2
+        );
     }
 
     #[test]
