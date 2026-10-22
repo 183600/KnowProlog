@@ -8349,6 +8349,123 @@ impl SymbolicReasoner {
         output
     }
 
+    /// 直接链没有命中时，把前向推理的产物当作**本会话内的推导**回答。
+    ///
+    /// 推导只读、按需重算：不写回图谱、会话事实或槽账本。前提被更正后，
+    /// 旧结论会随下一次 `forward_chain` 自然消失，而不是留下无法撤销的幽灵
+    /// 事实。这里只接受单谓词问句，避免把多跳链的中间结论误当成最终答案。
+    fn answer_by_derivation(
+        &self,
+        entity: &str,
+        predicates: &[ChainPredicate],
+        _question: &str,
+    ) -> Option<String> {
+        if !self.config.enable_resolution || predicates.len() != 1 {
+            return None;
+        }
+        let predicate = &predicates[0];
+        let entity_key = self.aligner.canonical_form(entity);
+        let slot_key = self.aligner.canonical_form(&predicate.slot);
+        let surface_key = self.aligner.canonical_form(&predicate.surface);
+        if entity_key.is_empty() || slot_key.is_empty() {
+            return None;
+        }
+        let derived = self.resolver.forward_chain(3, 100);
+        if derived.is_empty() {
+            return None;
+        }
+        // 只为解释「这个结论从哪来」保留一层前提→推导的索引，不把推导当事实。
+        let mut by_atom: HashMap<&Atom, &DerivedFact> = HashMap::new();
+        for fact in &derived {
+            by_atom.entry(&fact.atom).or_insert(fact);
+        }
+        let mut matches: Vec<&DerivedFact> = derived
+            .iter()
+            .filter(|fact| {
+                let fact_predicate = self.aligner.canonical_form(fact.atom.predicate.as_ref());
+                if fact_predicate != slot_key && fact_predicate != surface_key {
+                    return false;
+                }
+                match fact.atom.terms.as_slice() {
+                    [Term::Const(left), Term::Const(right)] => {
+                        let anchor = if predicate.inverted { right } else { left };
+                        self.aligner.canonical_form(anchor) == entity_key
+                    }
+                    _ => false,
+                }
+            })
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+        matches.sort_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.atom.display().cmp(&b.atom.display()))
+        });
+        let mut seen: HashSet<String> = HashSet::new();
+        matches.retain(|fact| seen.insert(Self::derived_answer_value(fact, predicate.inverted)));
+        let limit = 3usize;
+        let mut output = String::from("根据当前规则现算的推导（未写入知识图谱）：\n");
+        for (index, fact) in matches.iter().take(limit).enumerate() {
+            let value = Self::derived_answer_value(fact, predicate.inverted);
+            if matches.len() == 1 {
+                output.push_str(&format!(
+                    "  {} 的 {} 是 {}。\n",
+                    entity, predicate.surface, value
+                ));
+            } else {
+                output.push_str(&format!(
+                    "  {}. {} 的 {} 是 {}。\n",
+                    index + 1,
+                    entity,
+                    predicate.surface,
+                    value
+                ));
+            }
+            let supports: Vec<String> = fact
+                .premises
+                .iter()
+                .map(|premise| {
+                    let rendered = self.render_atom_nl(premise);
+                    match by_atom.get(premise) {
+                        Some(parent) if parent.depth >= 2 => {
+                            format!("{}（第 {} 轮推出）", rendered, parent.depth)
+                        }
+                        _ => format!("{}（事实）", rendered),
+                    }
+                })
+                .collect();
+            output.push_str(&format!("     依据：{}。\n", supports.join("；")));
+            output.push_str(&format!(
+                "     规则：{}（第 {} 轮推导，按需重算）。\n",
+                fact.rule_source, fact.depth
+            ));
+        }
+        output.push_str(
+            "  说明：推导只对本次回答有效；前提被更正后会重新证明，不写入图谱或会话事实。",
+        );
+        Some(output)
+    }
+
+    fn derived_answer_value(fact: &DerivedFact, inverted: bool) -> String {
+        match fact.atom.terms.as_slice() {
+            [Term::Const(left), Term::Const(right)] => {
+                if inverted {
+                    left.as_ref().to_string()
+                } else {
+                    right.as_ref().to_string()
+                }
+            }
+            _ => fact.atom.display(),
+        }
+    }
+
     fn answer_planned(&self, question: &str) -> Option<String> {
         let parsed = self.planner.parse(question);
         if let Some(answer) = parsed
@@ -8421,6 +8538,11 @@ impl SymbolicReasoner {
                         question,
                         run.closure_truncated,
                     ));
+                }
+                // 直接边/链接预测都没有命中时，再问一次归结引擎：规则推出来的
+                // 结论也可以当答案，但只作为本轮推导，不物化成事实。
+                if let Some(answer) = self.answer_by_derivation(&entity, &predicates, question) {
+                    return Some(answer);
                 }
                 if self.is_known_entity(&entity)
                     && predicates
@@ -13770,6 +13892,84 @@ mod tests {
         assert!(answer.contains("赵六"));
         assert!(answer.contains("师傅"));
         assert!(answer.contains("置信度"));
+    }
+
+    #[test]
+    fn test_derived_rule_can_answer_without_materializing() {
+        let mut config = test_config();
+        // 隔离变量：让回答只可能来自会话规则的前向推导，而不是链接预测。
+        config.enable_link_prediction = false;
+        config.enable_association_rules = false;
+        config.enable_clarification = false;
+        config.enable_soft_logic = false;
+        config.enable_problog = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.assert_nl_fact("张三的师傅是李四");
+        reasoner.learn_rule_report("如果X的师傅是Y，那么X的师祖是Y");
+
+        let answer = reasoner
+            .answer("张三的师祖是谁")
+            .expect("规则推导应能回答问题");
+        assert!(answer.contains("李四"), "{}", answer);
+        assert!(answer.contains("推导"), "{}", answer);
+        assert!(answer.contains("未写入知识图谱"), "{}", answer);
+        assert!(answer.contains("依据"), "{}", answer);
+        // 推导只是读模型：不能悄悄变成图谱边或会话事实。
+        assert!(!reasoner.predictor.has_triple("张三", "师祖", "李四"));
+        assert!(!reasoner
+            .session_facts
+            .iter()
+            .any(|atom| atom.predicate.as_ref() == "师祖"));
+    }
+
+    #[test]
+    fn test_derived_answer_is_recomputed_after_premise_correction() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        config.enable_association_rules = false;
+        config.enable_clarification = false;
+        config.enable_soft_logic = false;
+        config.enable_problog = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        // 「师傅」按功能槽处理，改口才会撤回旧前提；这也是对话里最常见的情形。
+        reasoner.slots.policy_mut().declare_functional("师傅", true);
+        reasoner.assert_nl_fact("张三的师傅是李四");
+        reasoner.assert_nl_fact("李四的师傅是王五");
+        reasoner
+            .aligner
+            .register_term("师祖", TermKind::Relation);
+        reasoner.session_clauses.push(Clause::new(
+            Atom::pattern("师祖", Term::var("X"), Term::var("Z")),
+            vec![
+                Atom::pattern("师傅", Term::var("X"), Term::var("Y")),
+                Atom::pattern("师傅", Term::var("Y"), Term::var("Z")),
+            ],
+            0.99,
+            "测试：师祖是师傅的两跳",
+        ));
+        reasoner.rebuild_knowledge_caches();
+        reasoner.rebuild_resolver();
+
+        let before = reasoner
+            .answer("张三的师祖是谁")
+            .expect("两跳规则应能回答");
+        assert!(before.contains("王五"), "{}", before);
+        assert!(!before.contains("赵六"), "{}", before);
+
+        reasoner.correct_nl_fact("改口：李四的师傅是赵六");
+        let after = reasoner
+            .answer("张三的师祖是谁")
+            .expect("前提更正后应重新证明");
+        assert!(after.contains("赵六"), "{}", after);
+        assert!(
+            !after.contains("王五"),
+            "前提被更正后，旧推导不得残留为答案：{}",
+            after
+        );
+        assert!(!reasoner
+            .session_facts
+            .iter()
+            .any(|atom| atom.predicate.as_ref() == "师祖"));
     }
 
     #[test]
