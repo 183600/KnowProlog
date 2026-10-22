@@ -194,6 +194,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Evaluate constructed surface recall: turn every configured route into
+    /// canonical/synonym/entity/suffix variants, then measure seen vs unseen
+    /// recall with a regression ratchet (offline; does not open the store)
+    EvalRecall {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Coverage threshold for the near-miss slice
+        #[arg(long, default_value_t = 0.75)]
+        near_miss: f64,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Forge a token pattern from positive/negative examples and preview the
     /// expanded IR (offline; does not open the knowledge store)
     Forge {
@@ -906,6 +926,26 @@ async fn main() {
         run_frontier(
             question.as_deref(),
             corpus.as_deref(),
+            *near_miss,
+            *json,
+            &config,
+        );
+        return;
+    }
+
+    // 构念召回评估只读配置：分母由规则与同义词表生成，不打开存储。
+    if let Some(Commands::EvalRecall {
+        baseline,
+        update_baseline,
+        allow_regression,
+        near_miss,
+        json,
+    }) = &cli.command
+    {
+        run_eval_recall(
+            baseline.as_deref(),
+            *update_baseline,
+            *allow_regression,
             *near_miss,
             *json,
             &config,
@@ -2049,6 +2089,7 @@ async fn main() {
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::ReadTrace { .. }) => {}
         Some(Commands::Frontier { .. }) => {}
+        Some(Commands::EvalRecall { .. }) => {}
         Some(Commands::Forge { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
@@ -3182,6 +3223,66 @@ fn run_frontier(
         }
     } else {
         println!("{}", report.render_report());
+    }
+}
+
+/// `eval-recall`：构念表面召回 + 基线棘轮。
+///
+/// 分母来自配置声称可答的路由规则及其表面变体；`seen` 与 `unseen` 分开，
+/// 避免用「字面命中」冒充泛化。只读配置，不打开知识存储。
+fn run_eval_recall(
+    baseline: Option<&str>,
+    update_baseline: bool,
+    allow_regression: bool,
+    near_miss: f64,
+    json: bool,
+    config: &know_prolog::SystemConfig,
+) {
+    if !(0.0..=1.0).contains(&near_miss) || !near_miss.is_finite() {
+        eprintln!("--near-miss 必须在 0 到 1 之间（含端点），实得 {}", near_miss);
+        std::process::exit(2);
+    }
+    let report = know_prolog::recall_audit::evaluate_config(config, near_miss);
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("构念召回序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline.unwrap_or("recall_baseline.json");
+    if update_baseline {
+        let new_baseline = know_prolog::recall_audit::RecallBaseline::from_report(&report);
+        match new_baseline.save(baseline_path) {
+            Ok(()) => println!("召回基线已写入 {}", baseline_path),
+            Err(error) => {
+                eprintln!("基线写入失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match know_prolog::recall_audit::RecallBaseline::load(baseline_path) {
+            Ok(old_baseline) => {
+                let verdict = know_prolog::recall_audit::compare_baseline(
+                    &old_baseline,
+                    &report,
+                    1e-6,
+                );
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(error) => {
+                eprintln!("基线读取失败：{}", error);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -10769,7 +10870,18 @@ fn route_query_with_patterns(
         .match_route_with_context(words, context)
         .or_else(|| library.match_fallback_with_context(words, context))
     else {
-        episodes.record_unmatched_with_context(input, words, context);
+        // 失败也要留下可行动的粒度：记录最近受阻模式停在哪一要素。
+        let frontier_report = frontier::analyze_tokens(input, words, library, context);
+        let snapshot = frontier_report.closest_blocked().and_then(|row| {
+            row.failure.as_ref().map(|failure| pattern_ir::EpisodeFrontier {
+                pattern_id: row.id.clone(),
+                pattern_name: row.name.clone(),
+                query_type: row.query_type.clone(),
+                coverage: row.coverage(),
+                failure: failure.clone(),
+            })
+        });
+        episodes.record_unmatched_with_frontier(input, words, context, snapshot);
         return None;
     };
     episodes.record_match_with_context(input, words, &matched, context);

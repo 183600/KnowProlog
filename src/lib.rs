@@ -102,6 +102,7 @@ pub mod query_scenario;
 pub mod quantity;
 pub mod question_analyzer;
 pub mod reading;
+pub mod recall_audit;
 pub mod recovery;
 pub mod relation_acquisition;
 pub mod relation_frame;
