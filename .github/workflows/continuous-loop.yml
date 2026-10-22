@@ -101,7 +101,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -173,87 +173,18 @@ jobs:
           swapon --show
           df -h /
 
-      - name: Install opencode
-        run: npm i -g opencode-ai
-
-      - name: Configure opencode (free models + tamper protection)
-        env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      - name: Install DeepSeek Harness (dsh)
         run: |
-          # opencode 自带的 OpenCode Zen 免费 provider 无需任何 API key；
-          # 如需更高限额，可在仓库 secrets 里可选配置 OPENCODE_API_KEY。
-          if [ -n "$OPENCODE_API_KEY" ]; then
-            echo "[info] OPENCODE_API_KEY 已配置（用于提升免费模型限额）"
-          else
-            echo "[info] 未配置 OPENCODE_API_KEY，匿名使用免费模型（有速率限制）"
-          fi
-          mkdir -p ~/.config/opencode
-          # 免费模型路径的基准配置（权限锁定）；NVIDIA 路径的配置由主循环的探测脚本
-          # 以本文件为基础合并生成 opencode.nvidia.json（保留同样的权限锁定）。
-          cat > ~/.config/opencode/opencode.free.json <<'EOF'
-          {
-            "$schema": "https://opencode.ai/config.json",
-            "permission": {
-              "*": "allow",
-              "edit": {
-                "*": "allow",
-                ".github/**": "deny",
-                "**/.github/**": "deny",
-                "LICENSE": "deny",
-                "LICENSE.*": "deny",
-                "**/LICENSE": "deny",
-                "**/LICENSE.*": "deny",
-                "tests/**": "deny",
-                "**/tests/**": "deny"
-              },
-              "bash": {
-                "*": "allow",
-                "rm -rf .github*": "deny",
-                "rm -r .github*": "deny",
-                "rm .github*": "deny",
-                "mv .github*": "deny",
-                "git rm -r .github*": "deny",
-                "rm *LICENSE*": "deny",
-                "mv *LICENSE*": "deny",
-                "cp *LICENSE*": "deny",
-                "git rm *LICENSE*": "deny",
-                "git mv *LICENSE*": "deny",
-                "shred *LICENSE*": "deny",
-                "truncate *LICENSE*": "deny",
-                "unlink *LICENSE*": "deny",
-                "dd *of=LICENSE*": "deny",
-                "find * -name *LICENSE*": "deny",
-                "rm *PLAN.md": "deny",
-                "mv *PLAN.md": "deny",
-                "git rm *PLAN.md": "deny",
-                "rm -r tests*": "deny",
-                "rm -rf tests*": "deny",
-                "mv tests*": "deny",
-                "git rm -r tests*": "deny",
-                "git push*": "deny",
-                "git checkout --orphan*": "deny",
-                "git switch --orphan*": "deny",
-                "git filter-branch*": "deny",
-                "git rebase*": "deny",
-                "git branch -D*": "deny",
-                "git update-ref*": "deny",
-                "git symbolic-ref*": "deny",
-                "git reflog*": "deny",
-                "git gc*": "deny",
-                "git remote add*": "deny",
-                "git remote remove*": "deny",
-                "git remote set-url*": "deny"
-              }
-            }
-          }
-          EOF
-          cp -f ~/.config/opencode/opencode.free.json ~/.config/opencode/opencode.json
-          echo "[guard] opencode 权限已锁定：edit/bash 对 .github/** 与 LICENSE 禁止操作"
+          npm i -g @deepseek-ai/dsh@0.2.1-rc.2
+          dsh --version
 
-          echo "=== OpenCode Zen 可用模型目录 ==="
-          opencode models opencode 2>/dev/null \
-            || opencode models 2>/dev/null | grep -F 'opencode/' \
-            || echo "[warn] 暂时无法获取模型列表，将在运行时重试"
+      - name: Configure dsh (DeepSeek official API)
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -e
+          [ -n "$DEEPSEEK_API_KEY" ] || { echo "[error] secrets.DEEPSEEK_API_KEY 未配置" >&2; exit 1; }
+          echo "[info] dsh $(dsh --version) | provider=deepseek-official | model=deepseek-flash"
 
       - name: Configure git
         run: |
@@ -274,11 +205,11 @@ jobs:
           agent:
             # 由主循环在启动 xuen 前导出 XUEN_MODEL / XUEN_MODEL_FLAGS，
             # 这里经 shell 环境变量展开，保证与 opencode 直连路径同一套动态选模。
-            command: 'opencode run -m "$XUEN_MODEL" $XUEN_MODEL_FLAGS "$prompt"'
+            command: 'dsh --profile headless "$prompt"'
             timeout: 600
           extra_notes: |
             你是「灵感与研究」agent：只负责产出想法、方案与下一步计划，不要修改、新增或删除
-            项目仓库里的任何文件——真正的代码改动由后续另一个 agent（直连 opencode）负责落实。
+            项目仓库里的任何文件——真正的代码改动由后续另一个 agent（直连 dsh）负责落实。
             每轮结束时把本轮的想法写进想法区，把可落地的方案（接口、数据结构、伪代码、步骤）
             写进产物区。
             改进方向：让系统像 LLM 一样具备自然语言理解与生成能力（多轮对话、上下文记忆、
@@ -295,13 +226,12 @@ jobs:
           color: false
           workspace: /tmp/xuen_ws
           EOF
-          echo "[ok] xuen 就绪（工作区 /tmp/xuen_ws，只负责产出想法；代码由直连 opencode 写）"
+          echo "[ok] xuen 就绪（工作区 /tmp/xuen_ws，只负责产出想法；代码由直连 dsh 写）"
 
       - name: Run agent loop for ~5 hours (xuen 出想法 → opencode 写代码 → clean)
         timeout-minutes: 180
         env:
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
           set +e
           set -o pipefail
@@ -313,7 +243,7 @@ jobs:
           DEADLINE=$(( $(date +%s) + RUN_HOURS*3600 - 600 ))
 
           # ================= 两阶段提示词（improve -> clean） =================
-          # bug / perf 阶段已移除：improve 阶段先由 xuen 产出想法，再由直连 opencode 写代码。
+          # bug / perf 阶段已移除：improve 阶段先由 xuen 产出想法，再由直连 dsh 写代码。
           XUEN_TASK='改进这个项目'
           PROMPT_IMPROVE='改进这个项目。先通读 README.md、PLAN.md 和现有代码，理解项目目标与当前进度，然后做出实质性的改进：补全缺失的功能、完善核心实现、提升代码质量与可用性，让项目向目标推进。每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。不要输出或写入“改进了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动。'
           PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORT*.md、临时调试脚本与调试输出等杂物；确保仓库中没有任何关于修复了哪些bug、优化或改进了哪些内容的记录（包括注释）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README*.md（含所有语言版本的 README）是项目说明文档，同样必须原样保留，不能删除或移动；tests/ 是测试套件，必须原样保留；知识库与语料等仍被项目引用或加载的数据文件（如 *.txt、*.jsonld）不属于“多余的内容”，必须保留。'
@@ -780,6 +710,27 @@ jobs:
             esac
           }
 
+          # ================= harness: DeepSeek Harness (dsh) + DeepSeek 官方 API =================
+          # 固定 provider=deepseek-official、model=deepseek-flash；API key 从启动环境
+          # DEEPSEEK_API_KEY 读取（headless profile 不读 GUI 凭据库）。
+          # 覆盖上方模型池/探测实现：不再探测 NVIDIA / opencode Zen 免费池。
+          SELECTED_MODEL="deepseek-official/deepseek-flash"
+          SELECTED_PROVIDER="deepseek-official"
+          CURRENT_MODEL="$SELECTED_MODEL"
+          CURRENT_PROVIDER="$SELECTED_PROVIDER"
+          pick_model() {
+            CURRENT_MODEL="deepseek-official/deepseek-flash"
+            CURRENT_PROVIDER="deepseek-official"
+            return 0
+          }
+          pick_provider() {
+            CURRENT_MODEL="deepseek-official/deepseek-flash"
+            CURRENT_PROVIDER="deepseek-official"
+            return 0
+          }
+          smoke_test() {
+            timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+          }
           # ---------- 单阶段执行（带重试 + 随机换模型） ----------
           # 参数: phase_name  prompt  timeout_seconds
           # 返回: 0 成功 / 124|137|143 超时被杀 / 1 放弃
@@ -837,7 +788,7 @@ jobs:
               echo "=========== iter #$i | phase=$phase | attempt=$attempt | provider=$CURRENT_PROVIDER | model=$CURRENT_MODEL effort=${EFFORT:-none} ==========="
 
               record_model "$CURRENT_MODEL"
-              timeout --kill-after=180 "$budget_now" opencode run -m "$CURRENT_MODEL" ${VARFLAG[@]+"${VARFLAG[@]}"} "$prompt" 2>&1 | tee "$OUT"
+              timeout --kill-after=180 "$budget_now" dsh --profile headless "$prompt" 2>&1 | tee "$OUT"
               local EC=$?
 
               # 成功
@@ -905,7 +856,7 @@ jobs:
 
           # ---------- xuen 灵感阶段（只产出想法，不写代码） ----------
           # xuen 内部自带「每轮超时 + 连续 3 次失败中止」；外层 timeout 只做该阶段
-          # 的总预算兜底。xuen 退出后清理可能残留的 opencode 孤儿进程，避免与
+          # 的总预算兜底。xuen 退出后清理可能残留的 dsh 孤儿进程，避免与
           # 后面的写代码阶段并发。模型选择与 opencode 直连路径共用 pick_provider。
           run_xuen_ideas() {
             local budget="$1" task="$2"
@@ -939,10 +890,10 @@ jobs:
               # 纯灵感阶段没必要，省下的时间留给后面的写代码阶段）
               timeout --kill-after=120 "$budget" python3 /tmp/xuen/main.py "$task" --no-tui --no-rounds -c /tmp/xuen/config.yaml 2>&1 | tee "$OUT"
               local EC=${PIPESTATUS[0]}
-              # 清理可能残留的 opencode 孤儿进程
-              pkill -f "opencode run" 2>/dev/null || true
+              # 清理可能残留的 dsh 孤儿进程
+              pkill -f "dsh --profile headless" 2>/dev/null || true
               sleep 2
-              pkill -9 -f "opencode run" 2>/dev/null || true
+              pkill -9 -f "dsh --profile headless" 2>/dev/null || true
               if [ $EC -eq 0 ]; then
                 return 0
               fi
@@ -966,7 +917,7 @@ jobs:
             return 1
           }
 
-          # ---------- 读取 xuen 想法区（research.md 的 IDEA 区块），供直连 opencode 参考 ----------
+          # ---------- 读取 xuen 想法区（research.md 的 IDEA 区块），供直连 dsh 参考 ----------
           collect_ideas() {
             python3 - <<'PYIDEA' 2>/dev/null || true
           import pathlib, re
@@ -985,7 +936,7 @@ jobs:
           # ================= 新增：概率测试门（20% 执行 / 80% 跳过）=================
           # 在「修复 bug 的 opencode 调用」提交之后触发（调用点见主循环 phase=bug 守卫）。
           # 掷骰子 1..100：≤20 才执行本步（80% 直接跳过）——跑一遍本仓库的测试；
-          # 跑不通 → 调用 opencode 修复 → 修复结果按本仓库既有提交路径落到 main/master。
+          # 跑不通 → 调用 dsh 修复 → 修复结果按本仓库既有提交路径落到 main/master。
           maybe_run_tests() {
             local iter="$1"
             # 不再按 20% 抽样：每次提交后都跑（剩余时间/依赖/超时保护仍然生效）
@@ -1023,7 +974,7 @@ jobs:
               echo "[test-gate] 测试超时/被中断 (exit=$TG_EC)，结果不确定，本轮不修复"
               return 0
             fi
-            echo "[test-gate] 测试未通过 (exit=$TG_EC)，调用 opencode 修复"
+            echo "[test-gate] 测试未通过 (exit=$TG_EC)，调用 dsh 修复"
             local TG_FIX_BUDGET=$(( DEADLINE - $(date +%s) - 900 ))
             if [ "$TG_FIX_BUDGET" -lt 900 ]; then
               echo "[test-gate] 剩余时间不足以安排修复，仅记录失败"
@@ -1104,7 +1055,7 @@ jobs:
                 IT="$IDEA_TIMEOUT"
                 if [ "$IT" -gt "$T" ]; then IT="$T"; fi
                 run_xuen_ideas "$IT" "$XUEN_TASK"
-                # 2) 直连 opencode 写代码：把 xuen 的想法区作为参考塞进 prompt
+                # 2) 直连 dsh 写代码：把 xuen 的想法区作为参考塞进 prompt
                 IDEAS="$(collect_ideas)"
                 if [ -n "$IDEAS" ]; then
                   P="$PROMPT_IMPROVE"$'\n\n''【xuen 本轮产出的想法（参考，可采纳也可否定；仍以项目目标为准）】'$'\n'"$IDEAS"
