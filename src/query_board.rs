@@ -436,7 +436,7 @@ impl QueryBoard {
             descending,
             knowledge,
         );
-        let mut frame = BoardFrame::new(
+        let frame = BoardFrame::new(
             "rank",
             describe_rank(&attribute, descending, skipped, knowledge),
             QuerySource::Rank {
@@ -561,7 +561,7 @@ impl QueryBoard {
 
     fn apply_explain(
         &self,
-        _knowledge: &dyn DialogueKnowledge,
+        knowledge: &dyn DialogueKnowledge,
         revision: u64,
     ) -> Option<BoardOutcome> {
         let frame = self.current()?;
@@ -577,6 +577,21 @@ impl QueryBoard {
             ),
             None => "查询板当前没有可解释的结果行。".to_string(),
         };
+        let mut provenance = vec![
+            format!(
+                "查询板第 {} 帧：{}",
+                self.cursor.map_or(0, |i| i + 1),
+                frame.program
+            ),
+            row.map(|row| row.evidence.clone())
+                .unwrap_or_else(|| "无结果行".to_string()),
+        ];
+        // 排名帧不只报「出处」，还要给出与相邻名次的取值和差值。
+        if let Some(reason) = rank_reason(frame, knowledge) {
+            text.push_str("\n");
+            text.push_str(&reason.text);
+            provenance.extend(reason.evidence);
+        }
         if row.is_some() && frame.revision != revision {
             text.push_str(&format!(
                 "\n[知识版本 v{} → v{}：该证据来自旧版本，当前查询应重新计算。]",
@@ -586,15 +601,7 @@ impl QueryBoard {
         Some(BoardOutcome {
             text,
             plan: vec!["board:explain".to_string()],
-            provenance: vec![
-                format!(
-                    "查询板第 {} 帧：{}",
-                    self.cursor.map_or(0, |i| i + 1),
-                    frame.program
-                ),
-                row.map(|row| row.evidence.clone())
-                    .unwrap_or_else(|| "无结果行".to_string()),
-            ],
+            provenance,
             focus: row.map(|row| row.subject.clone()),
             revision,
         })
@@ -1397,6 +1404,144 @@ fn superlative_word(dimension: Dimension, attribute: &str, descending: bool) -> 
         "年长" => "年轻",
         "久" => "短",
         _ => "小",
+    }
+}
+
+struct RankReason {
+    text: String,
+    evidence: Vec<String>,
+}
+
+/// 为排名帧生成「为什么排在这里」：相邻名次的取值、换算后差值与原始出处。
+///
+/// 只比较同量纲行；约数区间重叠时明确说无法确定差距，而不是硬算一个数。
+fn rank_reason(frame: &BoardFrame, knowledge: &dyn DialogueKnowledge) -> Option<RankReason> {
+    let QuerySource::Rank {
+        predicate,
+        descending,
+    } = &frame.source
+    else {
+        return None;
+    };
+    let selected = frame.selected_row().or_else(|| frame.rows.first())?;
+    let index = frame.rows.iter().position(|row| row == selected)?;
+    let quantity = quantity::parse_quantity(&selected.value)?;
+    let matches_dimension = |row: &QueryRow| {
+        quantity::parse_quantity(&row.value)
+            .map(|candidate| candidate.dimension() == quantity.dimension())
+            .unwrap_or(false)
+    };
+    let previous = frame.rows[..index]
+        .iter()
+        .rev()
+        .find(|row| matches_dimension(row))
+        .and_then(|row| quantity::parse_quantity(&row.value).map(|value| (row, value)));
+    let next = frame.rows[index + 1..]
+        .iter()
+        .find(|row| matches_dimension(row))
+        .and_then(|row| quantity::parse_quantity(&row.value).map(|value| (row, value)));
+    let label = knowledge.predicate_label(predicate);
+    let word = superlative_word(quantity.dimension(), &label, *descending);
+
+    let mut text = format!(
+        "排名依据：{} 的 {} 是 {}。",
+        selected.subject, label, selected.value
+    );
+    let mut evidence = vec![selected.evidence.clone()];
+    match (previous, next) {
+        (None, None) => {
+            text.push_str("没有其他同量纲记录可以比较，名次由唯一可比取值决定。");
+        }
+        (None, Some((next_row, next_quantity))) => {
+            text.push_str(&relation_words(
+                selected,
+                &quantity,
+                next_row,
+                &next_quantity,
+                *descending,
+                &word,
+            ));
+            evidence.push(next_row.evidence.clone());
+        }
+        (Some((previous_row, previous_quantity)), None) => {
+            text.push_str(&relation_words(
+                previous_row,
+                &previous_quantity,
+                selected,
+                &quantity,
+                *descending,
+                &word,
+            ));
+            evidence.push(previous_row.evidence.clone());
+        }
+        (Some((previous_row, previous_quantity)), Some((next_row, next_quantity))) => {
+            text.push_str(&relation_words(
+                previous_row,
+                &previous_quantity,
+                selected,
+                &quantity,
+                *descending,
+                &word,
+            ));
+            text.push(' ');
+            text.push_str(&relation_words(
+                selected,
+                &quantity,
+                next_row,
+                &next_quantity,
+                *descending,
+                &word,
+            ));
+            evidence.push(previous_row.evidence.clone());
+            evidence.push(next_row.evidence.clone());
+        }
+    }
+    Some(RankReason { text, evidence })
+}
+
+/// 描述「前一行的取值相对后一行」的确定关系与差值。
+fn relation_words(
+    before: &QueryRow,
+    before_quantity: &Quantity,
+    after: &QueryRow,
+    after_quantity: &Quantity,
+    descending: bool,
+    word: &str,
+) -> String {
+    let direction = if descending { "高" } else { "低" };
+    match before_quantity.compare(after_quantity) {
+        Comparison::Greater | Comparison::Less => {
+            let (difference, unit) = before_quantity
+                .difference_in_own_unit(after_quantity)
+                .map(|(value, unit)| (value.abs(), unit.unwrap_or("")))
+                .unwrap_or((0.0, ""));
+            format!(
+                "{}（{}）比 {}（{}）{}，相差 {}{}。",
+                before.subject,
+                before.value,
+                after.subject,
+                after.value,
+                direction,
+                quantity::format_number(difference),
+                unit
+            )
+        }
+        Comparison::Equal => format!(
+            "{}（{}）与 {}（{}）并列最{}，取值相同。",
+            before.subject, before.value, after.subject, after.value, word
+        ),
+        Comparison::Uncertain => format!(
+            "{}（{}）与 {}（{}）的约数区间重叠，无法确定谁更{}。",
+            before.subject, before.value, after.subject, after.value, word
+        ),
+        Comparison::Incomparable(reason) => format!(
+            "{}（{}）与 {}（{}）不可比（{}）。",
+            before.subject,
+            before.value,
+            after.subject,
+            after.value,
+            reason.describe()
+        ),
     }
 }
 
@@ -2823,6 +2968,38 @@ mod tests {
 
         let why = board.apply("为什么姚明最高", &knowledge, 7).unwrap();
         assert!(why.text.contains("证据"), "{}", why.text);
+        assert!(why.text.contains("排名依据"), "{}", why.text);
+        assert!(
+            why.text.contains("姚明（226）比 加索尔（216）高，相差 10"),
+            "解释应给出次席与差值：{}",
+            why.text
+        );
+        assert!(
+            why.provenance.iter().any(|line| line.contains("216")),
+            "次席证据也应进入出处：{:?}",
+            why.provenance
+        );
+    }
+
+    #[test]
+    fn rank_explanation_refuses_a_fake_difference_for_approximations() {
+        let mut knowledge = TestKnowledge::new();
+        for (entity, value) in [("地球", "46亿年"), ("月球", "约46亿年")] {
+            knowledge.entities.push(entity.to_string());
+            knowledge
+                .types
+                .push((entity.to_string(), "天体".to_string()));
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![("年龄".to_string(), value.to_string())],
+            );
+        }
+        let mut board = board();
+        board.apply("列出所有人的年龄", &knowledge, 7).unwrap();
+        board.apply("谁最年长", &knowledge, 7).unwrap();
+        let why = board.apply("为什么", &knowledge, 7).unwrap();
+        assert!(why.text.contains("约数区间重叠"), "{}", why.text);
+        assert!(!why.text.contains("相差"), "{}", why.text);
     }
 
     #[test]
