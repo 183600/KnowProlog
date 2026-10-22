@@ -1173,13 +1173,14 @@ fn render_frame(frame: &BoardFrame, revision: u64) -> String {
 fn render_comparison(
     left: &QueryRow,
     right: &QueryRow,
-    _knowledge: &dyn DialogueKnowledge,
+    knowledge: &dyn DialogueKnowledge,
 ) -> String {
+    let label = knowledge.predicate_label(&left.predicate);
     let mut output = format!(
         "对比「{}」与「{}」的 {}：\n  {}：{}\n  {}：{}",
         left.subject,
         right.subject,
-        left.predicate,
+        label,
         left.subject,
         left.value,
         right.subject,
@@ -1195,9 +1196,7 @@ fn render_comparison(
     match left_quantity.compare(&right_quantity) {
         Comparison::Equal => output.push_str("\n  两者数值相同。"),
         Comparison::Less | Comparison::Greater => {
-            let word = left_quantity
-                .dimension()
-                .comparative_word(&left.predicate);
+            let word = left_quantity.dimension().comparative_word(&label);
             let difference = left_quantity
                 .difference(&right_quantity)
                 .map(|value| value.abs())
