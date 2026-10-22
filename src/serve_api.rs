@@ -799,11 +799,29 @@ impl Session {
         self.history.push(raw_input.clone());
         self.manager.clear_last_recovery();
         // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
-        self.sync_recovery_confirmed_facts();
+        let adopted = self.sync_recovery_confirmed_facts();
         // 补全回合与假设世界命令使用原始措辞，避免被插件改写；
         // 带「那么」的一次性反事实句仍让位给 what-if 管线。
         let completion_command = self.reasoner.handle_completion_command(&raw_input);
         let assumption_command = self.reasoner.handle_assumption_command(&raw_input);
+
+        // 悬问回填：上一轮刚追问过的洞，本轮短答直接绑定并重解原目标。
+        // 系统命令/补全命令不参与裸回答，避免劫持正常控制流。
+        let pending_answer = if completion_command.is_none() && assumption_command.is_none() {
+            self.reasoner.try_answer_pending_question(&raw_input)
+        } else {
+            None
+        };
+        if pending_answer.is_none() {
+            // 裸回答窗口只开一轮：本轮没绑定成功，后续输入不得被旧追问劫持。
+            self.reasoner.clear_pending_awaiting();
+        }
+        // 上一轮的确认/更正若补上了悬问的洞，立即给出延期回答。
+        let deferred_after_adopt = if adopted > 0 {
+            self.reasoner.resolve_pending_after_assertion()
+        } else {
+            None
+        };
 
         // 插件改写预通道：词表/本体归一只影响管线输入，原始措辞仍用于接地引用。
         let plugin_outcome: Option<PluginOutcome> = self
@@ -827,7 +845,7 @@ impl Session {
         };
 
         control.enter(TurnPhase::Reason)?;
-        let (status, source, kind, plan, reply, derivation) =
+        let (status, source, kind, plan, mut reply, derivation) =
         if let Some(text) = completion_command {
             (
                 "answered".to_string(),
@@ -843,6 +861,15 @@ impl Session {
                 "assumption".to_string(),
                 Some("assumption_world".to_string()),
                 vec!["assumption_world".to_string()],
+                text,
+                None,
+            )
+        } else if let Some(text) = pending_answer {
+            (
+                "answered".to_string(),
+                "pending_question".to_string(),
+                Some("pending_question".to_string()),
+                vec!["pending_question".to_string()],
                 text,
                 None,
             )
@@ -899,15 +926,44 @@ impl Session {
         } else {
             // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
             self.manager.note_deferred(&input, &self.reasoner);
-            (
-                "deferred".to_string(),
-                "none".to_string(),
-                None,
-                Vec::new(),
-                String::new(),
-                None,
-            )
+            if let Some(prompt) = self.reasoner.open_pending_question(&input) {
+                (
+                    "deferred".to_string(),
+                    "pending_question".to_string(),
+                    Some("pending_question".to_string()),
+                    vec!["pending_question".to_string()],
+                    prompt,
+                    None,
+                )
+            } else {
+                (
+                    "deferred".to_string(),
+                    "none".to_string(),
+                    None,
+                    Vec::new(),
+                    String::new(),
+                    None,
+                )
+            }
         };
+        // 失败即立悬问：回答/对话路径诚实报告「没有记录」时，把
+        // 「目标 + 缺哪条前提」留给下一轮；成功回答则关闭同题悬问。
+        if (source == "reasoner" || source == "dialogue") && !reply.is_empty() {
+            if is_no_record_answer(&reply) {
+                if let Some(prompt) = self.reasoner.open_pending_question(&input) {
+                    reply.push('\n');
+                    reply.push_str(&prompt);
+                }
+            } else {
+                self.reasoner.dismiss_pending_question(&input);
+            }
+        }
+        if let Some(deferred) = deferred_after_adopt {
+            if !reply.is_empty() {
+                reply.push('\n');
+            }
+            reply.push_str(&deferred);
+        }
         control.enter(TurnPhase::Generate)?;
         if !reply.is_empty() && self.history.len() < HISTORY_LIMIT {
             self.history.push(reply.clone());
@@ -3143,6 +3199,14 @@ fn status_reason(status: u16) -> &'static str {
         504 => "Gateway Timeout",
         _ => "Internal Server Error",
     }
+}
+
+/// 回答是否表示「知识库没有依据」：只有这种失败才立悬问。
+fn is_no_record_answer(text: &str) -> bool {
+    text.contains("没有记录")
+        || text.contains("没有相关记录")
+        || text.contains("没有可用依据")
+        || text.contains("数量为 0")
 }
 
 async fn write_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {
@@ -5399,6 +5463,54 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         )
         .await;
         assert_eq!(status, 409, "{}", body);
+    }
+
+    #[tokio::test]
+    async fn pending_question_roundtrip_over_http_session_turns() {
+        let facts = vec![
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师傅".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "王五".into(),
+                rel_type: "师傅".into(),
+                to: "赵六".into(),
+            },
+        ];
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: false,
+            ..ReasoningConfig::default()
+        };
+        let state = Arc::new(ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            2,
+            StartupLedger::shared(),
+        ));
+        let session_id = state.create_session().await.expect("会话应创建成功");
+
+        let ask = state
+            .take_turn(&session_id, "张三的师傅的师傅是谁")
+            .await
+            .expect("缺失前提时应返回追问");
+        assert!(ask.reply.contains("李四 的 师傅"), "{}", ask.reply);
+        assert!(
+            ask.reply.contains("没有记录"),
+            "先诚实报告缺依据，再追问：{}",
+            ask.reply
+        );
+
+        let answered = state
+            .take_turn(&session_id, "王五")
+            .await
+            .expect("短答应回填悬问");
+        assert_eq!(answered.source, "pending_question", "{}", answered.reply);
+        assert!(answered.reply.contains("现在可以回答了"), "{}", answered.reply);
+        assert!(answered.reply.contains("王五"), "{}", answered.reply);
     }
 
     #[tokio::test]
