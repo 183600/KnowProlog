@@ -4711,9 +4711,33 @@ impl ResponseFormatter {
 }
 
 pub async fn load_config() -> Result<SystemConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let config_content = fs::read_to_string("config.toml")?;
+    load_config_from("config.toml").await
+}
+
+/// 从显式路径加载配置；交互与所有子命令共用同一份解析/校验语义。
+pub async fn load_config_from(
+    path: &str,
+) -> Result<SystemConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let config_content = fs::read_to_string(path)?;
     let config: SystemConfig = toml::from_str(&config_content)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod config_path_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_config_path_is_loaded_and_missing_path_is_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("alternate.toml");
+        fs::write(&path, include_str!("../config.toml")).unwrap();
+        let config = load_config_from(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(config.system.default_language, "zh");
+        assert!(load_config_from(dir.path().join("missing.toml").to_str().unwrap())
+            .await
+            .is_err());
+    }
 }
 
 pub fn detect_input_mode(input: &str, keywords: &[String]) -> InputMode {

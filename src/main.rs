@@ -44,7 +44,7 @@ use know_prolog::{
     law_book::LawBook,
     lex_gate, lexical_trace,
     link_prediction::{LinkPredictor, Triple as LawTriple},
-    load_config,
+    load_config_from,
     local_semantic_adapter::LocalSemanticAdapter,
     neuro_symbolic_contrast::ContrastArbiter,
     nlp::{normalize_words, preprocess},
@@ -105,6 +105,9 @@ struct Cli {
     /// configured path is relative, so `--store` never mixes session state.
     #[arg(long, global = true)]
     store: Option<String>,
+    /// Configuration file path (defaults to config.toml in the working directory)
+    #[arg(long, global = true, default_value = "config.toml")]
+    config: String,
     /// Failure recovery mode for interactive dialogue: "off", "observe", or "on"
     #[arg(long, global = true, default_value = "observe")]
     recovery: String,
@@ -781,7 +784,7 @@ async fn main() {
     // 配置契约 lint 必须最先处理：它恰恰要在 config.toml 损坏时可用，
     // 因此不依赖默认配置加载，也不打开知识存储。
     if let Some(Commands::ConfigLint { file, json, strict }) = &cli.command {
-        run_config_lint(file.as_deref(), *json, *strict);
+        run_config_lint(Some(file.as_deref().unwrap_or(&cli.config)), *json, *strict);
         return;
     }
 
@@ -796,7 +799,7 @@ async fn main() {
     }) = &cli.command
     {
         run_config_fulfillment(
-            file.as_deref(),
+            Some(file.as_deref().unwrap_or(&cli.config)),
             cli.store.as_deref(),
             *json,
             *strict,
@@ -864,13 +867,13 @@ async fn main() {
     // 各相耗时只观测不断言；serve 分支打印摘要，/metrics 输出明细。
     let startup_ledger = StartupLedger::shared();
     let config_start = Instant::now();
-    let mut config = match load_config().await {
+    let mut config = match load_config_from(&cli.config).await {
         Ok(cfg) => {
             startup_ledger.record_since("config_load", config_start);
             cfg
         }
         Err(e) => {
-            eprintln!("加载配置文件失败: {}", e);
+            eprintln!("加载配置文件失败（{}）: {}", cli.config, e);
             return;
         }
     };
@@ -11870,6 +11873,21 @@ mod session_tests {
             assert!(is_ask_terminator(terminator), "{}", terminator);
         }
         assert!(!is_ask_terminator("为什么退出假设"));
+    }
+
+    #[test]
+    fn config_override_is_global_and_defaults_to_config_toml() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "--config",
+            "conf/alt.toml",
+            "ask",
+            "张三的师傅是谁",
+        ])
+        .expect("全局 --config 应可解析");
+        assert_eq!(cli.config, "conf/alt.toml");
+        let default = Cli::try_parse_from(["knowprolog", "ask", "问题"]).unwrap();
+        assert_eq!(default.config, "config.toml");
     }
 
     /// 各命令必须被 is_command_like 识别，避免澄清追问时被吞掉
