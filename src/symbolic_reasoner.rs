@@ -2464,13 +2464,22 @@ impl SymbolicReasoner {
             return lines.join("\n");
         }
         for receipt in self.session_receipts.iter().rev().take(5) {
-            lines.push(format!(
-                "  · {} 〔{}；{} 个操作；版本 {}〕",
+            let mut summary = format!(
+                "  · {} 〔{}；{} 个操作；版本 {}",
                 receipt.id,
                 receipt.label,
                 receipt.ops.len(),
                 receipt.revision
-            ));
+            );
+            if !receipt.restore_lessons.is_empty() || !receipt.remove_lessons.is_empty() {
+                summary.push_str(&format!(
+                    "；教学原句 +{} / -{}",
+                    receipt.restore_lessons.len(),
+                    receipt.remove_lessons.len()
+                ));
+            }
+            summary.push('〕');
+            lines.push(summary);
             for op in receipt.ops.iter().take(4) {
                 lines.push(format!("      {}", op.describe()));
             }
@@ -16514,6 +16523,10 @@ types = [
             reasoner.session_facts().len(),
             before,
             "被阻止的写入不得留下会话事实"
+        );
+        assert!(
+            !reasoner.session_revision_report().contains("session:"),
+            "被阻止的写入不得生成修订回执"
         );
         let answer = reasoner.answer("张三的年龄是多少").unwrap_or_default();
         assert!(!answer.contains("31"), "冲突值不得进入回答：{}", answer);
