@@ -8167,7 +8167,14 @@ impl SymbolicReasoner {
                         return Some(answer);
                     }
                 }
-                let chain_result = if self.is_transitive_chain(&predicates) {
+                // 单个传递谓词的直接问句也必须并入有界闭包：否则
+                // 「A 的 P 是谁」只返回直接边，声明的传递性在回答里没有兑现。
+                let single_transitive = predicates.len() == 1
+                    && self
+                        .laws
+                        .active_transitive(&predicates[0].slot)
+                        .is_some();
+                let chain_result = if self.is_transitive_chain(&predicates) || single_transitive {
                     // 重复的传递谓词：用 Closure 算子压缩链，trace 会引用该律。
                     self.run_chain_via_laws(&entity, &predicates)
                 } else {

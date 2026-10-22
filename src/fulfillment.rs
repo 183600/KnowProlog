@@ -847,6 +847,21 @@ fn normalize_value(value: &str) -> String {
         .to_string()
 }
 
+/// 把实体 IRI 还原成局部名，避免同一实体以「王五」和
+/// `http://example.org/kg/entity/王五` 两种写法各生成一条义务。
+fn normalize_entity(value: &str) -> String {
+    let value = value.trim();
+    for prefix in [
+        "http://example.org/kg/entity/",
+        "https://example.org/kg/entity/",
+    ] {
+        if let Some(local) = value.strip_prefix(prefix) {
+            return local.to_string();
+        }
+    }
+    value.to_string()
+}
+
 fn is_honest_unknown_answer(answer: &str) -> bool {
     [
         "没有记录",
@@ -989,14 +1004,18 @@ impl NormalizedGraph {
 
     fn insert(&mut self, predicate: &str, subject: &str, object: &str) {
         self.fact_count += 1;
+        let subject = normalize_entity(subject);
+        let object = normalize_entity(object);
         self.edges
             .entry(predicate.to_string())
             .or_default()
-            .insert((subject.to_string(), object.to_string()));
+            .insert((subject, object));
     }
 
     fn observe_unregistered(&mut self, predicate: &str, subject: &str, object: &str) {
         self.fact_count += 1;
+        let subject = normalize_entity(subject);
+        let object = normalize_entity(object);
         let entry = self
             .unregistered
             .entry(predicate.to_string())
@@ -1007,8 +1026,8 @@ impl NormalizedGraph {
                 samples: Vec::new(),
             });
         entry.occurrences += 1;
-        if entry.subjects.len() < MAX_SAMPLES && !entry.subjects.iter().any(|s| s == subject) {
-            entry.subjects.push(subject.to_string());
+        if entry.subjects.len() < MAX_SAMPLES && !entry.subjects.iter().any(|s| s == &subject) {
+            entry.subjects.push(subject.clone());
         }
         if entry.samples.len() < MAX_SAMPLES {
             let sample = Fact::new(subject, predicate, object);
@@ -1199,6 +1218,25 @@ mod tests {
     }
 
     #[test]
+    fn entity_iris_are_collapsed_to_local_names() {
+        let facts = vec![relation(
+            "http://example.org/kg/entity/叶莉",
+            "配偶",
+            "http://example.org/kg/entity/姚明",
+        )];
+        let plan = plan(&registry(), &facts, DEFAULT_MAX_OBLIGATIONS);
+        let symmetric = plan
+            .obligations
+            .iter()
+            .find(|o| o.kind == ObligationKind::Symmetric)
+            .expect("应有对称义务");
+        assert_eq!(symmetric.expected, vec!["叶莉"]);
+        assert_eq!(symmetric.probe.as_ref().unwrap().query, "姚明的配偶是谁");
+        assert_eq!(symmetric.witness[0].subject, "叶莉");
+        assert_eq!(symmetric.witness[0].object, "姚明");
+    }
+
+    #[test]
     fn symmetric_and_inverse_obligations_are_fulfilled_by_pipeline() {
         let facts = vec![
             relation("叶莉", "配偶", "姚明"),
@@ -1235,9 +1273,9 @@ mod tests {
     }
 
     #[test]
-    fn transitive_closure_gap_is_reported_as_wrong() {
-        // 当前回答管线在有直接事实时只返回直接取值，不把传递闭包并入。
-        // 这条测试固定的是「审计能看见这个缺口」，不是把这个缺口当成正确。
+    fn transitive_closure_is_fulfilled_by_runtime() {
+        // 单谓词的直接问句必须并入有界传递闭包，否则「师傅」的传递声明
+        // 只在两跳链里成立，在「A 的 P 是谁」里没有兑现。
         let facts = vec![
             relation("张三", "师傅", "李四"),
             relation("李四", "师傅", "王五"),
@@ -1256,12 +1294,12 @@ mod tests {
         );
         assert_eq!(
             transitive.verdict,
-            Verdict::Wrong,
-            "直接回答只有李四时应判为未兑现：{:?}",
+            Verdict::Fulfilled,
+            "闭包中的王五应出现在张三的师傅里：{:?}",
             transitive
         );
-        assert!(report.wrong >= 1);
-        assert!(!report.is_clean());
+        assert_eq!(report.wrong, 0);
+        assert!(report.is_clean());
     }
 
     #[test]
@@ -1351,13 +1389,14 @@ mod tests {
     }
 
     #[test]
-    fn render_text_groups_non_fulfilled_results() {
-        let facts = vec![relation("张三", "师傅", "李四"), relation("李四", "师傅", "王五")];
+    fn render_text_reports_gaps_and_unregistered_predicates() {
+        let facts = vec![relation("张三", "暗恋", "李四")];
         let report = evaluate(&registry(), &facts, DEFAULT_MAX_OBLIGATIONS);
         let text = report.render_text(false);
         assert!(text.contains("配置兑现"));
-        assert!(text.contains("说错"));
-        assert!(text.contains("传递"));
-        assert!(text.contains("当前回答管线") || text.contains("直接回答"));
+        assert!(text.contains("无见证"));
+        assert!(text.contains("未登记"));
+        assert!(text.contains("暗恋"));
+        assert!(text.contains("截断不等于通过") || text.contains("digest"));
     }
 }
