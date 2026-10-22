@@ -789,9 +789,11 @@ impl SymbolicGenerator {
             if *surface == predicate {
                 continue;
             }
+            // 图谱里实际出现的内置词面优先于先前登记的配置别名：例如配置
+            // 把「年龄」登记成谓词画像后，再观察属性键 age 时，必须把
+            // 「年龄」重新指回 age，否则形式化语义会把属性误判成关系。
             self.predicate_surfaces
-                .entry(surface.to_string())
-                .or_insert_with(|| predicate.to_string());
+                .insert(surface.to_string(), predicate.to_string());
         }
         true
     }
@@ -1945,6 +1947,18 @@ mod tests {
         let surfaces = generator.predicate_surfaces();
         assert_eq!(surfaces.get("认识").map(String::as_str), Some("knows"));
         assert_eq!(surfaces.get("age").map(String::as_str), Some("age"));
+    }
+
+    #[test]
+    fn test_observed_attribute_surface_overrides_earlier_alias() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        // 配置谓词画像先登记「岁数 → 年龄」。
+        assert!(generator.register_predicate_alias("岁数", "年龄"));
+        assert_eq!(generator.canonical_predicate("年龄").as_deref(), Some("年龄"));
+        // 随后图谱出现英文属性 age：内置中文词面「年龄」应重新指回 age。
+        generator.observe_entity("张三", "人物", &[("age".to_string(), "30".to_string())]);
+        assert_eq!(generator.canonical_predicate("年龄").as_deref(), Some("age"));
+        assert_eq!(generator.canonical_predicate("岁数").as_deref(), Some("年龄"));
     }
 
     #[test]

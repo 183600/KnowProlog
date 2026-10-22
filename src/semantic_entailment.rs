@@ -666,9 +666,20 @@ fn positive_proof(prop: &Proposition, knowledge: &Knowledge<'_>) -> Option<(Proo
             None
         }
         PropositionKind::Attribute => {
-            if knowledge
-                .generator
-                .has_attribute(&prop.subject, &prop.predicate, &prop.object)
+            // 中文词面（年龄/身高）与图谱英文键（age/height）可能同时存在：
+            // 配置里的谓词画像会把中文规范名登记为独立谓词，但属性记录仍
+            // 以导入时的英文键存储。两条路径都查，避免自检把真事实判成幻觉。
+            let mut keys = vec![prop.predicate.as_str()];
+            if let Some(canonical) =
+                crate::symbolic_generator::canonical_predicate_key(&prop.predicate)
+            {
+                if canonical != prop.predicate {
+                    keys.push(canonical);
+                }
+            }
+            if keys
+                .iter()
+                .any(|key| knowledge.generator.has_attribute(&prop.subject, key, &prop.object))
             {
                 return Some((
                     ProofStep::new(
@@ -703,9 +714,26 @@ fn known_values(prop: &Proposition, knowledge: &Knowledge<'_>) -> Vec<String> {
         PropositionKind::Relation => knowledge
             .predictor
             .objects_of(&prop.subject, &prop.predicate),
-        PropositionKind::Attribute => knowledge
-            .generator
-            .attribute_values(&prop.subject, &prop.predicate),
+        PropositionKind::Attribute => {
+            let mut values =
+                knowledge
+                    .generator
+                    .attribute_values(&prop.subject, &prop.predicate);
+            if let Some(canonical) =
+                crate::symbolic_generator::canonical_predicate_key(&prop.predicate)
+            {
+                if canonical != prop.predicate {
+                    values.extend(
+                        knowledge
+                            .generator
+                            .attribute_values(&prop.subject, canonical),
+                    );
+                }
+            }
+            values.sort();
+            values.dedup();
+            values
+        }
         PropositionKind::TypeMembership => knowledge
             .generator
             .entity_type_of(&prop.subject)
@@ -955,6 +983,40 @@ mod tests {
                 },
             )
         }
+    }
+
+    #[test]
+    fn test_attribute_entailment_falls_back_to_english_graph_key() {
+        let fixture = Fixture::new();
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity(
+            "张三",
+            "人物",
+            &[("age".to_string(), "30".to_string())],
+        );
+        // 模拟配置谓词画像把中文「年龄」登记成独立规范谓词，覆盖了
+        // 内置词面表里「年龄」→ age 的映射。
+        generator.register_predicate_alias("岁数", "年龄");
+        let props = PropositionParser::new(
+            &fixture.aligner,
+            &fixture.linker,
+            generator.predicate_surfaces(),
+        )
+        .parse("张三的年龄是30。");
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].kind, PropositionKind::Attribute);
+        assert_eq!(props[0].predicate, "年龄");
+        let result = entail(
+            &props[0],
+            &Knowledge {
+                predictor: &fixture.predictor,
+                generator: &generator,
+                min_rule_confidence: 0.5,
+                max_rule_candidates: 16,
+            },
+        );
+        assert_eq!(result.verdict, Verdict::Entailed, "{}", result.reason);
+        assert_eq!(result.proof[0].kind, ProofKind::AttributeRecord);
     }
 
     #[test]
