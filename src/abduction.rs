@@ -224,13 +224,28 @@ pub struct ClarificationSession {
 impl ClarificationSession {
     fn pool(hypotheses: &[Hypothesis]) -> Vec<Hypothesis> {
         let mut queue: Vec<Hypothesis> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
         for hypothesis in hypotheses {
             if !hypothesis.is_adoptable() {
                 continue;
             }
-            if seen.insert(hypothesis.atom.display()) {
-                queue.push(hypothesis.clone());
+            let key = hypothesis.atom.display();
+            match seen.get(&key).copied() {
+                // 同一原子可能来自不同前沿：保留可信度更高、理由更充分的那条，
+                // 否则先出现的弱重复会把后面的强证据挡在澄清队列之外。
+                Some(index) => {
+                    let existing = &mut queue[index];
+                    if hypothesis.confidence > existing.confidence
+                        || (hypothesis.confidence == existing.confidence
+                            && hypothesis.reasons.len() > existing.reasons.len())
+                    {
+                        *existing = hypothesis.clone();
+                    }
+                }
+                None => {
+                    seen.insert(key, queue.len());
+                    queue.push(hypothesis.clone());
+                }
             }
         }
         queue
@@ -2257,6 +2272,17 @@ mod tests {
             .hypotheses
             .iter()
             .all(|hypothesis| hypothesis.atom != goal)));
+    }
+
+    #[test]
+    fn clarification_pool_keeps_the_strongest_duplicate() {
+        let weak = hyp("师傅", "李四", "赵六", 0.3);
+        let strong = hyp("师傅", "李四", "赵六", 0.8);
+        let session = ClarificationSession::start(&[weak, strong]);
+        assert_eq!(session.remaining(), 1, "同一原子只应提问一次");
+        let current = session.current().expect("应有当前问题");
+        assert_eq!(current.atom.display(), "师傅(李四, 赵六)");
+        assert_eq!(current.confidence, 0.8, "应保留可信度更高的重复假设");
     }
 
     #[test]
