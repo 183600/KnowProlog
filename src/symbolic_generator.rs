@@ -9,7 +9,7 @@
 //
 // 全程零神经网络、零梯度：只有计数、排序与模板组合。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +65,7 @@ pub struct SymbolicGenerator {
     known_entities: HashSet<String>,
     entity_types: HashMap<String, String>,
     // 类型 → 成员实体索引
-    type_members: HashMap<String, Vec<String>>,
+    type_members: HashMap<String, BTreeSet<String>>,
     attributes: HashMap<String, Vec<(String, String)>>,
     by_subject: HashMap<String, HashMap<String, Vec<String>>>,
     by_object: HashMap<String, HashMap<String, Vec<String>>>,
@@ -187,10 +187,10 @@ impl SymbolicGenerator {
     }
 
     pub fn entities_of_type(&self, etype: &str) -> Vec<String> {
-        let mut entities = self.type_members.get(etype).cloned().unwrap_or_default();
-        entities.sort();
-        entities.dedup();
-        entities
+        self.type_members
+            .get(etype)
+            .map(|members| members.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn attribute_pairs(&self, entity: &str) -> Vec<(String, String)> {
@@ -393,14 +393,15 @@ impl SymbolicGenerator {
                     if previous != etype {
                         changed = true;
                         if let Some(members) = self.type_members.get_mut(&previous) {
-                            if let Some(pos) = members.iter().position(|m| m == name) {
-                                members.swap_remove(pos);
+                            members.remove(name);
+                            if members.is_empty() {
+                                self.type_members.remove(&previous);
                             }
                         }
                         self.type_members
                             .entry(etype.to_string())
                             .or_default()
-                            .push(name.to_string());
+                            .insert(name.to_string());
                     }
                 }
                 None => {
@@ -408,7 +409,7 @@ impl SymbolicGenerator {
                     self.type_members
                         .entry(etype.to_string())
                         .or_default()
-                        .push(name.to_string());
+                        .insert(name.to_string());
                 }
             }
         }
@@ -525,6 +526,103 @@ impl SymbolicGenerator {
         self.total_relations += 1;
 
         self.register_predicate_surface(predicate);
+    }
+
+    /// 从生成器索引中撤回一条三元组（知识图谱侧删除后调用）。
+    ///
+    /// 与 `observe_triple` 严格对称：计数、正/反向倒排、谓词原型一起回退，
+    /// 重复撤回返回 `false` 且不改变任何状态（幂等）。实体本身保留，
+    /// 因为同名的属性/类型证据可能仍然存在。
+    pub fn retract_triple(&mut self, subject: &str, predicate: &str, object: &str) -> bool {
+        if !self.triples.remove(&triple_key(subject, predicate, object)) {
+            return false;
+        }
+        self.revision += 1;
+
+        if let Some(subjects) = self.by_subject.get_mut(subject) {
+            if let Some(objects) = subjects.get_mut(predicate) {
+                if let Some(position) = objects.iter().position(|existing| existing == object) {
+                    objects.remove(position);
+                }
+                if objects.is_empty() {
+                    subjects.remove(predicate);
+                }
+            }
+            if subjects.is_empty() {
+                self.by_subject.remove(subject);
+            }
+        }
+        if let Some(bucket) = self.by_object.get_mut(object) {
+            if let Some(subjects) = bucket.get_mut(predicate) {
+                if let Some(position) = subjects.iter().position(|existing| existing == subject) {
+                    subjects.remove(position);
+                }
+                if subjects.is_empty() {
+                    bucket.remove(predicate);
+                }
+            }
+            if bucket.is_empty() {
+                self.by_object.remove(object);
+            }
+        }
+
+        let mut predicate_gone = false;
+        if let Some(total) = self.predicate_totals.get_mut(predicate) {
+            *total = total.saturating_sub(1);
+            if *total == 0 {
+                self.predicate_totals.remove(predicate);
+                predicate_gone = true;
+            }
+        }
+        if let Some(counts) = self.entity_predicate_counts.get_mut(subject) {
+            if let Some(count) = counts.get_mut(predicate) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(predicate);
+                }
+            }
+            if counts.is_empty() {
+                self.entity_predicate_counts.remove(subject);
+            }
+        }
+        if let Some(total) = self.entity_relation_total.get_mut(subject) {
+            *total = total.saturating_sub(1);
+            if *total == 0 {
+                self.entity_relation_total.remove(subject);
+            }
+        }
+        self.total_relations = self.total_relations.saturating_sub(1);
+
+        // 原型主体只能从现存主体中重新选取：只增不减会让回退指向幽灵实体。
+        if predicate_gone || !self.predicate_min_entity.contains_key(predicate) {
+            self.refresh_predicate_min_entity(predicate);
+        } else if self.predicate_min_entity.get(predicate).map(String::as_str) == Some(subject) {
+            self.refresh_predicate_min_entity(predicate);
+        }
+        true
+    }
+
+    /// 重算某谓词的全局回退原型（字典序最小的现存主体）。
+    fn refresh_predicate_min_entity(&mut self, predicate: &str) {
+        let min = self
+            .by_subject
+            .iter()
+            .filter(|(_, predicates)| {
+                predicates
+                    .get(predicate)
+                    .map_or(false, |objects| !objects.is_empty())
+            })
+            .map(|(subject, _)| subject.clone())
+            .min();
+        match min {
+            Some(subject) => {
+                self.predicate_min_entity
+                    .insert(predicate.to_string(), subject);
+            }
+            None => {
+                self.predicate_min_entity.remove(predicate);
+            }
+        }
     }
 
     // 谓词动词化：把裸谓词（含 JSON-LD 英文谓词）渲染成自然中文句子
@@ -1207,5 +1305,38 @@ mod tests {
             .profile_page("张三", 2, GenerationOrder::Relevance)
             .expect("翻到末页应返回空页");
         assert_eq!(done.shown, 0);
+    }
+
+    #[test]
+    fn test_retract_triple_is_incremental_and_idempotent() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_triple("甲", "朋友", "乙");
+        generator.observe_triple("丙", "朋友", "丁");
+        assert_eq!(generator.relation_count(), 2);
+
+        assert!(generator.retract_triple("甲", "朋友", "乙"));
+        assert_eq!(generator.relation_count(), 1);
+        assert!(generator.relation_values("甲", "朋友").is_empty());
+        // 反向索引同步撤回，不再把甲当作「丁的朋友」
+        assert!(generator.relation_values_in("丁", "朋友").contains(&"丙".to_string()));
+        assert!(!generator.retract_triple("甲", "朋友", "乙"));
+
+        // 全局回退原型必须从现存主体重算，不能指向已撤回的甲。
+        let completion = generator.complete("甲的").expect("仍应给出全局回退");
+        assert!(completion.contains("全局回退"), "实际：{}", completion);
+        assert!(completion.contains("丙"), "原型不应指向幽灵实体：{}", completion);
+        assert!(!completion.contains("甲的朋友"), "{}", completion);
+    }
+
+    #[test]
+    fn test_type_members_are_ordered_and_follow_type_changes() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("乙", "人物", &[]);
+        generator.observe_entity("甲", "人物", &[]);
+        assert_eq!(generator.entities_of_type("人物"), vec!["乙", "甲"]);
+
+        generator.observe_entity("乙", "组织", &[]);
+        assert_eq!(generator.entities_of_type("人物"), vec!["甲"]);
+        assert_eq!(generator.entities_of_type("组织"), vec!["乙"]);
     }
 }
