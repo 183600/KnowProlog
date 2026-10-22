@@ -193,6 +193,104 @@ impl RepairSuggestion {
     }
 }
 
+/// 一次已被用户确认的放宽。保留应用后的完整模式，既用于累计展示，
+/// 也用于「撤回」到某一步时核对当前模式是否仍建立在假设之上。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedRepair {
+    pub op: RepairOp,
+    pub rationale: String,
+    pub label: String,
+    pub total: usize,
+    pub lower_bound: bool,
+    pub pattern: GraphPattern,
+}
+
+/// 会话级放宽账本：原模式 + 逐步确认的修正。
+///
+/// 账本只描述「本次检索放宽了什么」，不是知识，也不进 `session_facts`；
+/// 知识版本变化时整个图谱会话会被作废，账本随之丢弃。当前模式若回到
+/// 原模式，账本不再渲染标签；若撤回到中间某一步，只展示到该步为止。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairLedger {
+    base: GraphPattern,
+    applied: Vec<AppliedRepair>,
+}
+
+impl RepairLedger {
+    pub fn new(base: GraphPattern) -> Self {
+        Self {
+            base,
+            applied: Vec::new(),
+        }
+    }
+
+    pub fn base(&self) -> &GraphPattern {
+        &self.base
+    }
+
+    pub fn applied(&self) -> &[AppliedRepair] {
+        &self.applied
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.applied.is_empty()
+    }
+
+    /// 记录一次已确认的放宽；`pattern` 必须是该候选实际应用后的模式。
+    pub fn adopt(&mut self, suggestion: &RepairSuggestion, pattern: GraphPattern) {
+        self.applied.push(AppliedRepair {
+            op: suggestion.op.clone(),
+            rationale: suggestion.rationale.clone(),
+            label: suggestion.label(),
+            total: suggestion.total,
+            lower_bound: suggestion.lower_bound,
+            pattern,
+        });
+    }
+
+    /// 原模式副本，供「恢复原条件」使用。
+    pub fn restore(&self) -> GraphPattern {
+        self.base.clone()
+    }
+
+    /// 当前模式实际承接的步数。回到原模式为 0；回到中间某一步为该步
+    /// 及之前的步数；在当前放宽结果上继续限定则保留全部步骤。
+    pub fn active_steps(&self, current: &GraphPattern) -> usize {
+        if current == &self.base {
+            return 0;
+        }
+        self.applied
+            .iter()
+            .rposition(|step| &step.pattern == current)
+            .map(|index| index + 1)
+            .unwrap_or(self.applied.len())
+    }
+
+    /// 当前模式的累计放宽说明；没有生效的放宽时返回 `None`。
+    pub fn note(&self, current: &GraphPattern) -> Option<String> {
+        let active = self.active_steps(current);
+        if active == 0 {
+            return None;
+        }
+        let steps: Vec<String> = self.applied[..active]
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                format!(
+                    "第 {} 步：{}（{}）",
+                    index + 1,
+                    step.label,
+                    step.rationale
+                )
+            })
+            .collect();
+        Some(format!(
+            "（当前为放宽结果：{}。回复「恢复原条件」可回到原问题。）\n",
+            steps.join("；")
+        ))
+    }
+}
+
 /// 根据诊断生成至多 `limit` 条可验证的单步放宽。
 ///
 /// 每个候选都会重新求值；无解或模式非法的候选不会进入结果。
@@ -591,6 +689,57 @@ mod tests {
         );
         assert_eq!(parse_repair_intent("还有呢"), None);
         assert_eq!(parse_repair_intent("为什么"), None);
+    }
+
+    #[test]
+    fn ledger_accumulates_steps_and_only_marks_active_ones() {
+        let base = GraphPattern::new(
+            vec![
+                EdgePattern::var_const("person", "导演", "电影A"),
+                EdgePattern::var_const("person", "获奖", "金棕榈"),
+                EdgePattern::const_var("电影A", "主演", "person"),
+            ],
+            vec!["person".to_string()],
+        );
+        let first_op = RepairOp::DropEdge { edge: 0 };
+        let first_pattern = first_op.apply(&base).unwrap();
+        let second_op = RepairOp::DropEdge { edge: 0 };
+        let second_pattern = second_op.apply(&first_pattern).unwrap();
+
+        let mut ledger = RepairLedger::new(base.clone());
+        ledger.adopt(
+            &RepairSuggestion {
+                op: first_op,
+                rationale: "先保留能回答的部分".to_string(),
+                total: 1,
+                lower_bound: false,
+                sample_rows: vec!["张三".to_string()],
+            },
+            first_pattern.clone(),
+        );
+        ledger.adopt(
+            &RepairSuggestion {
+                op: second_op,
+                rationale: "再撤回一个条件".to_string(),
+                total: 2,
+                lower_bound: false,
+                sample_rows: Vec::new(),
+            },
+            second_pattern.clone(),
+        );
+
+        assert_eq!(ledger.applied().len(), 2);
+        assert_eq!(ledger.active_steps(&base), 0);
+        assert_eq!(ledger.active_steps(&first_pattern), 1);
+        assert_eq!(ledger.active_steps(&second_pattern), 2);
+        assert!(ledger.note(&base).is_none());
+        let first_note = ledger.note(&first_pattern).unwrap();
+        assert!(first_note.contains("第 1 步"), "{}", first_note);
+        assert!(!first_note.contains("第 2 步"), "{}", first_note);
+        let second_note = ledger.note(&second_pattern).unwrap();
+        assert!(second_note.contains("第 1 步"), "{}", second_note);
+        assert!(second_note.contains("第 2 步"), "{}", second_note);
+        assert_eq!(ledger.restore(), base);
     }
 
     #[test]

@@ -33,7 +33,8 @@ use crate::graph_diagnosis::diagnose_failure;
 use crate::graph_ledger;
 use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
 use crate::graph_repair::{
-    parse_repair_intent, suggest_repairs, RepairHints, RepairIntent, RepairSuggestion,
+    parse_repair_intent, suggest_repairs, RepairHints, RepairIntent, RepairLedger,
+    RepairSuggestion,
 };
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
@@ -1003,12 +1004,10 @@ impl OntologyView for FrameOntology<'_> {
 struct GraphSession {
     compiled: CompiledGraphQuestion,
     conversation: ConversationalGraph,
-    /// 首次编译出的原模式：用于「恢复原条件」，与逐轮回撤栈相互独立。
-    base_pattern: GraphPattern,
+    /// 首次编译出的原模式与后续已确认的放宽，供累计标注与「恢复原条件」。
+    ledger: RepairLedger,
     /// 最近一次零解诊断生成的有界放宽候选（尚未生效）。
     repairs: Vec<RepairSuggestion>,
-    /// 当前结果是否建立在已确认的放宽上；恢复原条件后清空。
-    relaxed: Option<RepairSuggestion>,
 }
 
 impl RepairHints for SymbolicReasoner {
@@ -7570,17 +7569,14 @@ impl SymbolicReasoner {
                 return Some(match result {
                     Ok(reply) => {
                         session.compiled.pattern = session.conversation.pattern().clone();
-                        if session.conversation.pattern() == &session.base_pattern {
-                            session.relaxed = None;
-                        }
                         let mut answer = self.render_graph_reply(
                             &session.compiled,
                             &session.conversation,
                             &reply,
                             &facts,
                         );
-                        if let Some(relaxed) = &session.relaxed {
-                            answer = format!("{}{}", self.relaxed_graph_note(relaxed), answer);
+                        if let Some(note) = session.ledger.note(session.conversation.pattern()) {
+                            answer = format!("{}{}", note, answer);
                         }
                         if let Some((failure, repairs)) =
                             self.graph_failure_parts(&session.conversation, &facts, options)
@@ -7612,7 +7608,7 @@ impl SymbolicReasoner {
         let compiled = lexicon.compile(question)?;
         let conversation =
             ConversationalGraph::new(compiled.pattern.clone(), &facts, options).ok()?;
-        let base_pattern = compiled.pattern.clone();
+        let ledger = RepairLedger::new(compiled.pattern.clone());
         let mut answer = self.render_graph_question(&compiled, conversation.outcome(), &facts);
         let (failure, repairs) = match self.graph_failure_parts(&conversation, &facts, options) {
             Some(parts) => parts,
@@ -7625,9 +7621,8 @@ impl SymbolicReasoner {
         *guard = Some(GraphSession {
             compiled,
             conversation,
-            base_pattern,
+            ledger,
             repairs,
-            relaxed: None,
         });
         Some(answer)
     }
@@ -7681,13 +7676,6 @@ impl SymbolicReasoner {
         output
     }
 
-    fn relaxed_graph_note(&self, relaxed: &RepairSuggestion) -> String {
-        format!(
-            "（当前为放宽结果：{}。回复「恢复原条件」可回到原问题。）\n",
-            relaxed.label()
-        )
-    }
-
     fn adopt_graph_repair(
         &self,
         session: &mut GraphSession,
@@ -7718,13 +7706,15 @@ impl SymbolicReasoner {
             options,
         ) {
             Ok(_) => {
+                session.ledger.adopt(&suggestion, relaxed_pattern.clone());
                 session.compiled.pattern = relaxed_pattern;
-                session.relaxed = Some(suggestion.clone());
                 session.repairs.clear();
-                let mut answer = format!(
-                    "已采用放宽：{}。以下结果基于放宽后的条件，不是原问题在当前知识下的严格答案。\n",
-                    suggestion.rationale
+                let mut answer = String::from(
+                    "已采用放宽。以下结果基于放宽后的条件，不是原问题在当前知识下的严格答案。\n",
                 );
+                if let Some(note) = session.ledger.note(session.conversation.pattern()) {
+                    answer.push_str(&note);
+                }
                 answer.push_str(&self.render_graph_question(
                     &session.compiled,
                     session.conversation.outcome(),
@@ -7750,13 +7740,12 @@ impl SymbolicReasoner {
         options: MatchOptions,
     ) -> String {
         match session.conversation.apply(
-            GraphCommand::Replace(session.base_pattern.clone()),
+            GraphCommand::Replace(session.ledger.restore()),
             facts,
             options,
         ) {
             Ok(_) => {
-                session.compiled.pattern = session.base_pattern.clone();
-                session.relaxed = None;
+                session.compiled.pattern = session.ledger.base().clone();
                 session.repairs.clear();
                 let mut answer = String::from("已恢复原条件。\n");
                 answer.push_str(&self.render_graph_question(
@@ -18373,6 +18362,26 @@ types = [
         let restored = reasoner.answer("恢复原条件").expect("应能恢复原条件");
         assert!(restored.contains("张三"), "{}", restored);
         assert!(!restored.contains("失败诊断"), "{}", restored);
+    }
+
+    #[test]
+    fn graph_question_ledger_accumulates_adopted_repairs() {
+        let reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer("谁既导演过科幻片，又主演过中国人？")
+            .expect("零解问句应建立会话");
+        let first = reasoner.answer("放宽 1").expect("应能采用第一条放宽");
+        assert!(first.contains("第 1 步"), "{}", first);
+        let narrowed = reasoner.answer("只看李四").expect("放宽后仍可继续限定");
+        assert!(narrowed.contains("可尝试的放宽"), "{}", narrowed);
+        let second = reasoner.answer("放宽 1").expect("应能采用第二步放宽");
+        assert!(second.contains("第 1 步"), "{}", second);
+        assert!(second.contains("第 2 步"), "{}", second);
+        let restored = reasoner
+            .answer("恢复原条件")
+            .expect("应能一次恢复到原问题");
+        assert!(restored.contains("已恢复原条件"), "{}", restored);
+        assert!(!restored.contains("当前为放宽结果"), "{}", restored);
     }
 
     #[test]
