@@ -10000,9 +10000,13 @@ impl SymbolicReasoner {
                     pending.hole.fill_sentence(&object),
                     answer
                 );
-                if !answer.contains("路径") && !answer.contains("依据") {
+                let fill_sentence = pending.hole.fill_sentence(&object);
+                if !answer.contains("路径")
+                    && !answer.contains("依据")
+                    && !answer.contains(&fill_sentence)
+                {
                     let mut support = pending.support.clone();
-                    support.push(pending.hole.fill_sentence(&object));
+                    support.push(fill_sentence);
                     output.push_str(&format!("\n依据：{}。", support.join("；")));
                 }
                 if !adopted && !self.session_facts.iter().any(|atom| {
