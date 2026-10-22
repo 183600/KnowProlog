@@ -749,14 +749,11 @@ fn run_probe(reasoner: &SymbolicReasoner, probe: &Probe) -> ProbeResult {
         .as_deref()
         .map(is_honest_unknown_answer)
         .unwrap_or(false);
-    let contains_expected = answer.as_deref().map_or(false, |text| {
-        !contains_negation(text)
-            && expected
-                .iter()
-                .all(|item| text.contains(item.as_str()))
-    });
 
-    let (verdict, detail) = if matched || contains_expected {
+    // 只认从回答模板里抽出的取值或归结解里的绑定，不做全文字串匹配：
+    // 否则一句「叶莉 的 配偶 是 姚明」会因为提到叶莉而被误判成
+    // 「姚明的配偶」已兑现。
+    let (verdict, detail) = if matched {
         (
             Verdict::Fulfilled,
             format!(
@@ -874,10 +871,6 @@ fn is_honest_unknown_answer(answer: &str) -> bool {
     ]
     .iter()
     .any(|marker| answer.contains(marker))
-}
-
-fn contains_negation(answer: &str) -> bool {
-    answer.contains("不是") || answer.contains("并非")
 }
 
 fn answer_binding(bindings: &[(String, String)]) -> Option<&str> {
