@@ -7242,7 +7242,8 @@ impl SymbolicReasoner {
         candidates.retain(|p| seen.insert(p.triple.clone()));
 
         let limit = self.config.max_predictions.clamp(1, 5);
-        let mut output = String::from("根据知识图谱的链接预测（符号推理）：\n");
+        let mut output =
+            String::from("根据知识图谱的链接预测（符号推理；以下为待确认候选，不是确定答案）：\n");
         for prediction in candidates.iter().take(limit) {
             output.push_str("  • ");
             output.push_str(&self.predictor.explain(prediction));
