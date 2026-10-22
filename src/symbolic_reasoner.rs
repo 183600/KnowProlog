@@ -4076,6 +4076,11 @@ impl SymbolicReasoner {
         query_vars: &[String],
     ) -> String {
         if report.provable {
+            // 目标已可证：上一轮的待定假设与澄清问题全部过期，不能继续追问。
+            self.abduction.clear_pending();
+            self.clarification = None;
+            self.last_abduction_goal = None;
+            self.last_abduction_vars.clear();
             let render = |atom: &Atom| self.render_atom_nl(atom);
             let mut output = abduction::render_report(&report, &render);
             if !phrase.is_empty() {
@@ -14317,6 +14322,31 @@ types = [
         // 模拟回滚：原知识库不能被改变
         let proof = reasoner.resolution_proof_report("张三的师祖是赵六");
         assert!(proof.contains("未得证"), "反事实模拟必须回滚：{}", proof);
+    }
+
+    #[test]
+    fn proved_goal_clears_stale_pending_questions() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let report = reasoner
+            .abduce_statement("张三的师祖是赵六")
+            .expect("第一次应生成候选");
+        assert!(report.contains("假设生成"));
+        assert!(!reasoner.pending_hypotheses().is_empty());
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "师祖".to_string(),
+            to: "赵六".to_string(),
+        }]);
+        let proved = reasoner
+            .abduce_statement("张三的师祖是赵六")
+            .expect("补全后应可证");
+        assert!(proved.contains("得证"), "{}", proved);
+        assert!(
+            reasoner.pending_hypotheses().is_empty(),
+            "目标已证后不得继续保留过期假设"
+        );
+        assert!(!reasoner.clarification_active());
     }
 
     #[test]
