@@ -383,6 +383,13 @@ impl SessionRevisionReceipt {
     }
 
     fn from_snapshot(snapshot: &SnapshotRevision) -> Option<Self> {
+        if snapshot.id.trim().is_empty()
+            || (snapshot.ops.is_empty()
+                && snapshot.restore_lessons.is_empty()
+                && snapshot.remove_lessons.is_empty())
+        {
+            return None;
+        }
         let mut ops = Vec::with_capacity(snapshot.ops.len());
         for op in &snapshot.ops {
             let restored = match op.kind.as_str() {
@@ -10798,6 +10805,10 @@ impl SymbolicReasoner {
             .iter()
             .filter_map(SessionRevisionReceipt::from_snapshot)
             .collect();
+        if self.session_receipts.len() > MAX_SESSION_RECEIPTS {
+            let excess = self.session_receipts.len() - MAX_SESSION_RECEIPTS;
+            self.session_receipts.drain(0..excess);
+        }
         Ok(())
     }
 
