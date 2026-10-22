@@ -2869,6 +2869,8 @@ impl SymbolicReasoner {
             self.perf.bump("observe_no_change");
             return;
         }
+        // 图谱变化后，上一张模式的见证下标与结果页不再可信：整体作废。
+        *self.graph_session.lock() = None;
         self.revision += 1;
         self.perf.bump("observe_changed");
         if triples_added {
@@ -17969,5 +17971,20 @@ types = [
         let fork = reasoner.fork_session();
         assert!(fork.graph_session.lock().is_none());
         assert!(fork.answer("为什么").is_none());
+    }
+
+    #[test]
+    fn graph_question_session_is_invalidated_by_new_facts() {
+        let mut reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应建立图谱模式会话");
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "王五".to_string(),
+            rel_type: "获奖".to_string(),
+            to: "金棕榈".to_string(),
+        }]);
+        assert!(reasoner.graph_session.lock().is_none());
+        assert!(reasoner.answer("为什么").is_none());
     }
 }
