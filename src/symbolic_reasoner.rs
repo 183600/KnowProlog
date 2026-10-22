@@ -14809,6 +14809,20 @@ mod tests {
     }
 
     #[test]
+    fn pending_question_accepts_explicit_answer_prefix() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        let deferred = reasoner
+            .try_answer_pending_question("回答悬问：王五")
+            .expect("显式前缀应可回填");
+        assert!(deferred.contains("王五"), "{}", deferred);
+        assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
     fn pending_question_handles_single_missing_hop() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&pair_facts());
