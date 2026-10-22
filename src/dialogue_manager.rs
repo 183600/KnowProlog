@@ -877,7 +877,7 @@ impl DialogueManager {
     /// 可读的失败恢复状态行（无回执时为确定性空态描述）。
     pub fn recovery_report(&self) -> String {
         format!(
-            "失败恢复：模式 {}；{}；挂账 {} 个待定问题。\n{}",
+            "失败恢复：模式 {}；{}；挂账 {} 个待定问题；会话确认 {} 条；否定证据 {} 条。\n{}",
             self.recovery_mode.label(),
             format!(
                 "回执 {} 条（未结 {}）",
@@ -885,6 +885,8 @@ impl DialogueManager {
                 self.recovery.ledger.open_count()
             ),
             self.recovery.pending.len(),
+            self.recovery.confirmed.len(),
+            self.recovery.refuted.len(),
             self.recovery.ledger.render_text()
         )
     }
@@ -1134,13 +1136,17 @@ impl DialogueManager {
         if !self.recovery_mode.eq(&RecoveryMode::Off)
             || !self.recovery.ledger.is_empty()
             || !self.recovery.pending.is_empty()
+            || !self.recovery.confirmed.is_empty()
+            || !self.recovery.refuted.is_empty()
         {
             summary.push_str(&format!(
-                " 失败恢复：模式 {}，回执 {} 条（未结 {}），挂账 {} 个。",
+                " 失败恢复：模式 {}，回执 {} 条（未结 {}），挂账 {} 个，会话确认 {} 条，否定证据 {} 条。",
                 self.recovery_mode.label(),
                 self.recovery.ledger.len(),
                 self.recovery.ledger.open_count(),
-                self.recovery.pending.len()
+                self.recovery.pending.len(),
+                self.recovery.confirmed.len(),
+                self.recovery.refuted.len()
             ));
         }
         if self.board.is_active() {
@@ -5040,6 +5046,11 @@ output = "value"
             .confirmed_value("姚明", "体重")
             .expect("更正必须进入会话事实层");
         assert_eq!(fact.value, "135 公斤");
+        assert!(
+            manager.recovery_report().contains("会话确认 1 条"),
+            "{}",
+            manager.recovery_report()
+        );
 
         let revised = manager
             .plan_reply("姚明的体重是多少", &knowledge)
