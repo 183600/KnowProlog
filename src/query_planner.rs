@@ -178,6 +178,9 @@ impl QueryPlanner {
         if let Some(plan) = self.parse_similar(&q) {
             return Some(plan);
         }
+        if let Some(plan) = self.parse_which_relations(&q) {
+            return Some(plan);
+        }
         if let Some(plan) = self.parse_count(&q) {
             return Some(plan);
         }
@@ -489,8 +492,9 @@ impl QueryPlanner {
     }
 
     /// 程度形容词 → 属性名。只收录能稳定落到已登记属性上的几个：
-    /// 多高 / 多重 / 多大（几岁）。其余程度问句交回规划器弃权，避免把
-    /// 「地球多大」之类的开放问题硬映射成人物属性。
+    /// 多高 / 多重 / 多大（几岁）。若问句里已经明写属性词（面积/人口/
+    /// 出生地等），以明写属性为准，避免把「北京面积多大」误读成年龄。
+    /// 其余没有属性词的程度问句交回规划器弃权，不硬映射。
     fn parse_degree_attribute(&self, q: &str) -> Option<QueryPlan> {
         const DEGREE_ATTRIBUTES: [(&str, &str); 4] = [
             ("多高", "身高"),
@@ -498,18 +502,36 @@ impl QueryPlanner {
             ("多大", "年龄"),
             ("几岁", "年龄"),
         ];
-        for (marker, attribute) in DEGREE_ATTRIBUTES {
+        for (marker, default_attribute) in DEGREE_ATTRIBUTES {
             let prefix = match q.strip_suffix(marker) {
                 Some(prefix) => prefix.trim(),
                 None => continue,
             };
             // 「姚明有多高」里的「有」只是程度问句的脚手架，不是实体的一部分。
             let prefix = prefix.strip_suffix('有').unwrap_or(prefix).trim();
-            // 「姚明的身高有多高」允许重复属性词，去掉后仍然指向同一属性。
-            let prefix = prefix
-                .strip_suffix(attribute)
-                .unwrap_or(prefix)
-                .trim();
+            let explicit = predicate_labels()
+                .iter()
+                .filter(|(_, label)| *label != default_attribute && prefix.ends_with(label))
+                .max_by_key(|(_, label)| label.chars().count());
+            let (prefix, attribute) = match explicit {
+                Some((_, label)) => (
+                    prefix
+                        .strip_suffix(label)
+                        .unwrap_or(prefix)
+                        .trim_end_matches('的')
+                        .trim(),
+                    *label,
+                ),
+                // 「姚明的身高有多高」允许重复属性词，去掉后仍指向同一属性。
+                None => (
+                    prefix
+                        .strip_suffix(default_attribute)
+                        .unwrap_or(prefix)
+                        .trim_end_matches('的')
+                        .trim(),
+                    default_attribute,
+                ),
+            };
             if prefix.is_empty() || Self::is_question_word(prefix) {
                 continue;
             }
@@ -1240,6 +1262,44 @@ impl QueryPlanner {
             }
         }
         (text, false)
+    }
+
+    /// 复数问法「S 有哪些 P / S 的 P 有哪些」：编译成同一条链查找，
+    /// 由执行层枚举全部对象；「哪些」不是谓词的一部分。
+    fn parse_which_relations(&self, q: &str) -> Option<QueryPlan> {
+        const MARKERS: [&str; 4] = ["有哪些", "有哪几个", "有哪几位", "有哪几种"];
+        for marker in MARKERS {
+            let Some((left, right)) = q.split_once(marker) else {
+                continue;
+            };
+            let left = left.trim().trim_end_matches('都').trim();
+            let right = Self::strip_measure(right.trim());
+            // 含「是」的左侧属于反查主体/系表判断，交给更专门的解析器，
+            // 不能被当成「S 的 P」链。
+            if left.is_empty() || left.contains('是') || Self::is_question_word(left) {
+                continue;
+            }
+            if let Some(predicate) = right {
+                if predicate.is_empty() || Self::is_question_word(&predicate) {
+                    continue;
+                }
+                let mut segments = Self::segments_of(left);
+                if segments.is_empty() || segments.len() >= self.max_chain {
+                    continue;
+                }
+                // 左侧若已是「S 的 P」，右侧只能是空的复数尾巴。
+                if segments.len() > 1 {
+                    continue;
+                }
+                segments.push(predicate);
+                if segments.len() >= 2 {
+                    return Some(QueryPlan::FindObject { segments });
+                }
+            } else if left.contains('的') {
+                return self.build_find_object(left);
+            }
+        }
+        None
     }
 
     fn parse_count(&self, q: &str) -> Option<QueryPlan> {
@@ -2119,6 +2179,52 @@ mod tests {
         assert!(matches!(
             planner().parse("张三和李四是什么关系"),
             Some(QueryPlan::PathBetween { .. })
+        ));
+    }
+
+    #[test]
+    fn test_degree_question_uses_explicit_attribute() {
+        for question in ["北京的面积多大", "北京面积多大", "北京的面积有多大"] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("程度问句应可编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: vec!["北京".to_string(), "面积".to_string()]
+                },
+                "{}",
+                question
+            );
+        }
+        // 明写属性优先于「多大」的默认年龄语义。
+        let plan = planner().parse("李四的出生地有多大").expect("应命中出生地");
+        assert_eq!(
+            plan,
+            QueryPlan::FindObject {
+                segments: vec!["李四".to_string(), "出生地".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn test_which_relations_compile_to_plain_chain() {
+        for question in ["李四有哪些徒弟", "李四的徒弟有哪些", "李四都有哪些徒弟"] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("复数问法应可编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: vec!["李四".to_string(), "徒弟".to_string()]
+                },
+                "{}",
+                question
+            );
+        }
+        assert!(matches!(
+            planner().parse("李四有几个徒弟"),
+            Some(QueryPlan::Count { .. })
         ));
     }
 

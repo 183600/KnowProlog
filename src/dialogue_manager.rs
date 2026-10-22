@@ -3708,6 +3708,10 @@ fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
             "是哪个",
             "是哪里",
             "怎么样",
+            "有哪些",
+            "有哪几个",
+            "有哪几位",
+            "有哪几种",
             "多少",
             "呢",
             "吗",
@@ -4090,6 +4094,7 @@ mod tests {
             ("姚明的身高多高", "身高"),
             ("姚明的年龄多大？", "年龄"),
             ("姚明的出生地是哪里？", "出生地"),
+            ("姚明的师傅有哪些？", "师傅"),
         ] {
             let frame = manager.analyze(input, &knowledge);
             assert_eq!(frame.kind, MoveKind::AskAttribute, "{}", input);
