@@ -12131,6 +12131,27 @@ mod session_tests {
     }
 
     #[test]
+    fn place_degree_question_compiles_to_area() {
+        let mut reasoner = SymbolicReasoner::new(
+            know_prolog::ReasoningConfig::default(),
+            std::collections::HashMap::new(),
+        );
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "北京".to_string(),
+            entity_type: "City".to_string(),
+            properties: std::collections::HashMap::from([
+                ("name".to_string(), "北京".to_string()),
+                ("area".to_string(), "16410平方公里".to_string()),
+            ]),
+        }]);
+        let dialogue = DialogueManager::new();
+        let frame = dialogue.analyze("北京有多大？", &reasoner);
+        assert_eq!(frame.kind, MoveKind::AskAttribute, "{:?}", frame);
+        assert_eq!(frame.entity.as_deref(), Some("北京"));
+        assert_eq!(frame.attribute.as_deref(), Some("面积"));
+    }
+
+    #[test]
     fn ask_generation_followup_recognizes_continue_and_switch() {
         for input in ["继续介绍", "接着说。", "展开说说", "详细一点？"] {
             assert_eq!(

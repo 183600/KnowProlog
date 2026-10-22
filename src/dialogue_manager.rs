@@ -1788,6 +1788,38 @@ impl DialogueManager {
             .iter()
             .any(|marker| stripped.contains(marker));
 
+        // 地点类实体的「多大」问的是面积而不是年龄：北京有多大。
+        // 类型未知时仍交给通用规划器（人物默认年龄），不猜测。
+        if let Some(prefix) = stripped.strip_suffix("多大") {
+            let subject = prefix.trim().trim_end_matches('有').trim();
+            let entity = explicit
+                .iter()
+                .find(|entity| !subject.is_empty() && subject.contains(entity.as_str()))
+                .cloned()
+                .or_else(|| {
+                    if subject.is_empty() || contains_pronoun(subject) {
+                        focus.clone()
+                    } else {
+                        None
+                    }
+                });
+            if let Some(entity) = entity {
+                if knowledge
+                    .entity_type(&entity)
+                    .is_some_and(|etype| is_place_type(&etype))
+                {
+                    return UtteranceFrame {
+                        raw: raw.to_string(),
+                        kind: MoveKind::AskAttribute,
+                        entity: Some(entity.clone()),
+                        attribute: Some("面积".to_string()),
+                        question: Some(format!("{}的面积是多少", entity)),
+                        inherited: false,
+                    };
+                }
+            }
+        }
+
         // 属性问句：S的P（是什么/是多少/是谁/怎么样/呢……），
         // 也接受"姚明的身高"这类无问词的简写，但不吸收含"是"的陈述。
         // 「A 是 B 的 C」是系表判断（校验方向），不是「A是B」的属性问句。
@@ -3692,6 +3724,29 @@ fn is_entity_copula_relation_statement(text: &str, knowledge: &dyn DialogueKnowl
         return false;
     };
     !knowledge.entities_in(left.trim()).is_empty()
+}
+
+/// 地点类类型标签（大小写无关）：这些实体的「多大」默认问面积。
+fn is_place_type(etype: &str) -> bool {
+    matches!(
+        etype.trim().to_ascii_lowercase().as_str(),
+        "city"
+            | "country"
+            | "location"
+            | "place"
+            | "region"
+            | "province"
+            | "state"
+            | "island"
+            | "城市"
+            | "国家"
+            | "地点"
+            | "地区"
+            | "省份"
+            | "省"
+            | "岛屿"
+            | "行政区"
+    )
 }
 
 fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
