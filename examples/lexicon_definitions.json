@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "surface": "先生",
+      "kind": "alias",
+      "canonical": "配偶",
+      "sense": "丈夫（需结合上下文；对男性的尊称不在本词条范围）",
+      "evidence": "离线示例：配偶已在 predicate_profiles 中登记"
+    },
+    {
+      "surface": "内人",
+      "kind": "alias",
+      "canonical": "配偶",
+      "sense": "妻子"
+    },
+    {
+      "surface": "师祖",
+      "kind": "compose",
+      "chain": ["师傅", "师傅"],
+      "sense": "师傅的师傅"
+    }
+  ]
+}
