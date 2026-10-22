@@ -100,8 +100,11 @@ pub struct ClaimWarrant {
     pub known_values: Vec<String>,
     /// 该断言可引用的来源标签。
     pub source_tags: Vec<String>,
-    /// 与该断言相关的冲突笔记。
+    /// 与该断言相关的冲突笔记（导入时被拒的入值）。
     pub conflicts: Vec<ImportConflict>,
+    /// 与该断言相关的已见证冲突（图上两个取值都在，最少撤回集可计算）。
+    #[serde(default)]
+    pub witnessed_conflicts: Vec<String>,
     /// 护照缺口（未落型 / 缺必备属性 / 冲突 / 互斥类型）。
     pub gaps: Vec<String>,
     /// 是否有明确类型。
@@ -126,7 +129,11 @@ impl ClaimWarrant {
     pub fn actionable_gap(&self) -> Option<&str> {
         self.gaps
             .iter()
-            .find(|gap| !gap.starts_with("未落型") && !gap.starts_with("存在未裁决冲突"))
+            .find(|gap| {
+                !gap.starts_with("未落型")
+                    && !gap.starts_with("存在未裁决冲突")
+                    && !gap.starts_with("存在已见证冲突")
+            })
             .map(String::as_str)
     }
 
@@ -134,10 +141,10 @@ impl ClaimWarrant {
     ///
     /// 多条冲突全部列出，避免只披露第一条而静默隐藏其余说法。
     pub fn conflict_note(&self) -> Option<String> {
-        if self.conflicts.is_empty() {
+        if self.conflicts.is_empty() && self.witnessed_conflicts.is_empty() {
             return None;
         }
-        let notes: Vec<String> = self
+        let mut notes: Vec<String> = self
             .conflicts
             .iter()
             .map(|conflict| {
@@ -152,10 +159,23 @@ impl ClaimWarrant {
                 )
             })
             .collect();
+        for witnessed in &self.witnessed_conflicts {
+            notes.push(
+                witnessed
+                    .strip_prefix("存在已见证冲突：")
+                    .unwrap_or(witnessed)
+                    .to_string(),
+            );
+        }
         Some(format!(
             "{}；我暂按已有记录回答，你可以确认哪个为准。",
             notes.join("；")
         ))
+    }
+
+    /// 是否存在任何形式的未裁决冲突（导入冲突或已见证多值）。
+    pub fn has_conflict(&self) -> bool {
+        !self.conflicts.is_empty() || !self.witnessed_conflicts.is_empty()
     }
 
     /// 引用说明：有来源就列出，没有来源就如实说明（不改变真值）。
@@ -309,6 +329,17 @@ impl QualityIndex {
                 .collect(),
             None => passport.conflicts.clone(),
         };
+        let witnessed_conflicts: Vec<String> = passport
+            .gaps
+            .iter()
+            .filter(|gap| gap.starts_with("存在已见证冲突："))
+            .filter(|gap| {
+                canonical_attribute
+                    .as_ref()
+                    .map_or(true, |attribute| gap.contains(attribute))
+            })
+            .cloned()
+            .collect();
         // 来源必须按断言（谓词）取，不能回退到实体级并集：
         // 「另一个属性有出处」不能给本属性背书。身份问句（无属性）才用实体并集。
         let source_tags = match canonical_attribute.as_ref() {
@@ -327,6 +358,7 @@ impl QualityIndex {
             known_values,
             source_tags,
             conflicts,
+            witnessed_conflicts,
             gaps: passport.gaps.clone(),
             typed: !passport.types.is_empty(),
             complete: passport.gaps.is_empty(),
@@ -1601,6 +1633,40 @@ mod tests {
             .any(|gap| gap.contains("至少删 2 条")), "{:?}", passport.gaps);
         assert_eq!(report.summary.witnessed_conflicts, 1, "3 个取值仍只有 1 个冲突点");
         assert_eq!(report.summary.witnessed_retraction_cost, 2, "修复代价是 2 条");
+    }
+
+    #[test]
+    fn warrant_discloses_witnessed_conflicts() {
+        use crate::provenance::FactRef;
+
+        let registry = registry_with_master();
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三")]),
+            entity("李四", "Person", &[("name", "李四")]),
+            entity("王五", "Person", &[("name", "王五")]),
+            relation("张三", "师傅", "李四"),
+            relation("张三", "师傅", "王五"),
+        ];
+        let mut report = build_report(&facts, &registry, &type_system(), &entity_config());
+        let fact_refs = vec![
+            FactRef::type_assertion("张三", "Person"),
+            FactRef::attribute("张三", "name", "张三"),
+            FactRef::relation("张三", "师傅", "李四"),
+            FactRef::relation("张三", "师傅", "王五"),
+        ];
+        apply_witnessed_conflicts(&mut report, &fact_refs, None, &registry, &type_system());
+        let index = QualityIndex::from_report(&report, &facts, &registry);
+        let warrant = index.warrant_for("张三", Some("师傅")).unwrap();
+        assert!(warrant.has_conflict());
+        assert_eq!(warrant.witnessed_conflicts.len(), 1);
+        let note = warrant.conflict_note().unwrap();
+        assert!(note.contains("2 个取值"), "{}", note);
+        assert!(note.contains("李四") && note.contains("王五"), "{}", note);
+        assert_eq!(warrant.actionable_gap(), None, "冲突不应被当成缺属性追问");
+
+        // 别的属性不能借用师傅的已见证冲突。
+        let age = index.warrant_for("张三", Some("name")).unwrap();
+        assert!(!age.has_conflict(), "{:?}", age.witnessed_conflicts);
     }
 
     #[test]
