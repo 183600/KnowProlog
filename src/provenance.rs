@@ -1097,6 +1097,9 @@ pub struct ConflictSchema {
     /// 输入类型名 → 规范类型名（别名归一；空表时按原样比较）。
     #[serde(default)]
     pub type_aliases: BTreeMap<String, String>,
+    /// 输入谓词名 → 规范谓词名（别名归一；逆向别名不参与方向换算）。
+    #[serde(default)]
+    pub predicate_aliases: BTreeMap<String, String>,
 }
 
 impl ConflictSchema {
@@ -1109,6 +1112,7 @@ impl ConflictSchema {
                 .map(|name| name.to_string())
                 .collect(),
             type_aliases: BTreeMap::new(),
+            predicate_aliases: BTreeMap::new(),
         }
     }
 
@@ -1116,8 +1120,19 @@ impl ConflictSchema {
     pub fn from_registry_and_types(registry: &PredicateRegistry, types: &TypeSystem) -> Self {
         let mut schema = Self::new();
         for predicate in registry.canonical_names() {
+            schema
+                .predicate_aliases
+                .insert(predicate.to_string(), predicate.to_string());
             if registry.is_functional(predicate) {
                 schema.functional.insert(predicate.to_string());
+            }
+        }
+        for (alias, canonical, inverted) in registry.alias_pairs() {
+            // 逆向别名交换主宾语，不能按同一方向归组；保留原名，避免误判。
+            if !inverted {
+                schema
+                    .predicate_aliases
+                    .insert(alias, canonical);
             }
         }
         for (left, right) in types.disjoint_pairs() {
@@ -1130,6 +1145,18 @@ impl ConflictSchema {
     pub fn observe_type(&mut self, types: &TypeSystem, name: &str) {
         self.type_aliases
             .insert(name.to_string(), types.canonical(name));
+    }
+
+    pub fn canonical_predicate(&self, name: &str) -> String {
+        self.predicate_aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// 谓词是否为声明的功能谓词（先做别名归一）。
+    pub fn is_functional(&self, name: &str) -> bool {
+        self.functional.contains(&self.canonical_predicate(name))
     }
 
     pub fn canonical_type(&self, name: &str) -> String {
@@ -1165,20 +1192,26 @@ pub fn detect_witnessed(
 
     let mut out = Vec::new();
 
-    // 功能槽：按（谓词， 主语）分组，取值两两成证书。
-    let mut groups: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    // 功能槽：按（规范谓词， 主语）分组，取值两两成证书。
+    // 保留每条原始事实引用，别名谓词也能找回自己的支撑树。
+    let mut groups: BTreeMap<(String, String), BTreeMap<String, FactRef>> = BTreeMap::new();
     for fact in facts {
-        if schema.functional.contains(&fact.predicate) {
-            groups
-                .entry((fact.predicate.clone(), fact.subject.clone()))
-                .or_default()
-                .insert(fact.value.clone());
+        if !schema.is_functional(&fact.predicate) {
+            continue;
         }
+        groups
+            .entry((
+                schema.canonical_predicate(&fact.predicate),
+                fact.subject.clone(),
+            ))
+            .or_default()
+            .entry(fact.value.clone())
+            .or_insert_with(|| fact.clone());
     }
     for ((predicate, subject), values) in groups {
-        let values: Vec<String> = values.into_iter().collect();
-        for (index, left_value) in values.iter().enumerate() {
-            for right_value in values.iter().skip(index + 1) {
+        let values: Vec<(String, FactRef)> = values.into_iter().collect();
+        for (index, (left_value, left_fact)) in values.iter().enumerate() {
+            for (right_value, right_fact) in values.iter().skip(index + 1) {
                 let point = ConflictPoint::Functional {
                     subject: subject.clone(),
                     predicate: predicate.clone(),
@@ -1186,9 +1219,9 @@ pub fn detect_witnessed(
                     right_value: right_value.clone(),
                 };
                 out.push(ConflictCertificate::new(
-                    point.clone(),
-                    lookup(&point.left_fact()),
-                    lookup(&point.right_fact()),
+                    point,
+                    lookup(left_fact),
+                    lookup(right_fact),
                     false,
                 ));
             }
@@ -1272,7 +1305,7 @@ fn latent_pair(left: &Clause, right: &Clause, schema: &ConflictSchema) -> Option
     let left_value = &left.head.terms[1];
     let right_value = &right_head.terms[1];
 
-    let point = if schema.functional.contains(&predicate) {
+    let point = if schema.is_functional(&predicate) {
         let (Term::Const(left_constant), Term::Const(right_constant)) = (left_value, right_value)
         else {
             return None;
@@ -1967,6 +2000,30 @@ mod tests {
         assert_eq!(plan.facts.len(), 1, "两个共用 B 的证书只需撤回 B");
         assert_eq!(plan.facts, vec![fact("B", "p", "1")]);
         assert_eq!(plan.resolved, 2);
+    }
+
+    #[test]
+    fn predicate_aliases_join_the_same_functional_slot() {
+        let mut schema = schema();
+        schema
+            .predicate_aliases
+            .insert("岁数".to_string(), "年龄".to_string());
+        let first = fact("姚明", "年龄", "38");
+        let second = fact("姚明", "岁数", "39");
+        let supports = BTreeMap::new();
+        let certificates = detect_witnessed(&[first.clone(), second.clone()], &supports, &schema);
+        assert_eq!(certificates.len(), 1, "别名必须并入同一功能槽");
+        assert_eq!(
+            certificates[0].point,
+            ConflictPoint::Functional {
+                subject: "姚明".to_string(),
+                predicate: "年龄".to_string(),
+                left_value: "38".to_string(),
+                right_value: "39".to_string(),
+            }
+        );
+        assert_eq!(certificates[0].left.fact, first);
+        assert_eq!(certificates[0].right.fact, second);
     }
 
     #[test]
