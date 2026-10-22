@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::predicate_registry::{ImportConflict, PredicateRegistry};
 use crate::prolog_engine::PrologFact;
+use crate::provenance::{FactRef, ProvenanceLedger};
 use crate::type_system::TypeSystem;
 use crate::EntityTypeConfig;
 
@@ -474,9 +475,25 @@ pub fn build_report(
     types: &TypeSystem,
     entity_types: &[EntityTypeConfig],
 ) -> QualityReport {
+    build_report_with_provenance(facts, registry, types, entity_types, None)
+}
+
+/// 构建质量护照，可选注入**事实级**来源台账。
+///
+/// 传入台账时，`provenance` 维度不再由「谓词是否被声明」决定，而是该实体
+/// 事实中登记了来源的比例：同一谓词下，逐条事实有没有出处会被区分。
+/// 未传台账时保持旧的谓词标签口径（向后兼容）。
+pub fn build_report_with_provenance(
+    facts: &[PrologFact],
+    registry: &PredicateRegistry,
+    types: &TypeSystem,
+    entity_types: &[EntityTypeConfig],
+    provenance: Option<&ProvenanceLedger>,
+) -> QualityReport {
     let mut explicit: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut properties: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut relations: Vec<(String, String, String)> = Vec::new();
+    let mut entity_facts: BTreeMap<String, BTreeSet<FactRef>> = BTreeMap::new();
     for fact in facts {
         match fact {
             PrologFact::Entity {
@@ -491,10 +508,26 @@ pub fn build_report(
                 let slot = properties.entry(name.clone()).or_default();
                 for (key, value) in props {
                     slot.insert(key.clone(), value.clone());
+                    entity_facts
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(FactRef::attribute(name, key, value));
                 }
+                entity_facts
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(FactRef::type_assertion(name, entity_type));
             }
             PrologFact::Relation { from, rel_type, to } => {
                 relations.push((from.clone(), rel_type.clone(), to.clone()));
+                let relation = FactRef::relation(from, rel_type, to);
+                entity_facts
+                    .entry(from.clone())
+                    .or_default()
+                    .insert(relation.clone());
+                if from != to {
+                    entity_facts.entry(to.clone()).or_default().insert(relation);
+                }
             }
         }
     }
@@ -660,10 +693,25 @@ pub fn build_report(
                 source_tags.extend(profile.sources.iter().cloned());
             }
         }
-        let provenance = match source_tags.len() {
-            0 => PROV_NO_SOURCE,
-            1 => PROV_SINGLE_SOURCE,
-            _ => PROV_MULTI_SOURCE,
+        // 有事实级台账时按事实覆盖计分：同一谓词下「有出处」与「无出处」的
+        // 事实不再共享同一个档位；台账为空的事实保留无来源先验。
+        let provenance = match provenance {
+            Some(ledger) => {
+                let facts: Vec<FactRef> = entity_facts
+                    .get(name)
+                    .map(|facts| facts.iter().cloned().collect())
+                    .unwrap_or_default();
+                if facts.is_empty() {
+                    PROV_NO_SOURCE
+                } else {
+                    ledger.coverage(&facts).ratio
+                }
+            }
+            None => match source_tags.len() {
+                0 => PROV_NO_SOURCE,
+                1 => PROV_SINGLE_SOURCE,
+                _ => PROV_MULTI_SOURCE,
+            },
         };
 
         let connectivity = (degree as f64 / CONNECTIVITY_FULL_DEGREE).min(1.0);
@@ -1235,6 +1283,57 @@ mod tests {
         assert_eq!(warrant.attribute.as_deref(), Some("师傅"));
         assert_eq!(warrant.known_values, vec!["李四".to_string()]);
         assert_eq!(warrant.conflicts.len(), 1, "别名问句也必须披露同一冲突");
+    }
+
+    #[test]
+    fn fact_level_provenance_distinguishes_facts_under_same_predicate() {
+        use crate::provenance::{FactRef, ProvenanceLedger, SourceId, SourceKind};
+
+        let registry = registry_with_master();
+        let facts = vec![
+            entity("张三", "Person", &[("name", "张三"), ("age", "30")]),
+            entity("李四", "Person", &[("name", "李四"), ("age", "30")]),
+        ];
+        let mut ledger = ProvenanceLedger::new();
+        let source = SourceId::new(SourceKind::Import, "人事表", "张三 30");
+        for fact in [
+            FactRef::attribute("张三", "name", "张三"),
+            FactRef::attribute("张三", "age", "30"),
+            FactRef::type_assertion("张三", "Person"),
+        ] {
+            ledger.record(fact, source.clone());
+        }
+        let report = build_report_with_provenance(
+            &facts,
+            &registry,
+            &type_system(),
+            &entity_config(),
+            Some(&ledger),
+        );
+        let zhangsan = report.passport_for("张三").unwrap();
+        let lisi = report.passport_for("李四").unwrap();
+        assert!(
+            (zhangsan.provenance - 1.0).abs() < 1e-9,
+            "张三的事实都有出处：{:?}",
+            zhangsan
+        );
+        assert!(
+            lisi.provenance.abs() < 1e-9,
+            "李四的同一谓词事实没有出处，不能借用谓词标签档位：{:?}",
+            lisi
+        );
+        assert!(
+            zhangsan.score > lisi.score,
+            "事实级溯源必须进入综合分：{} vs {}",
+            zhangsan.score,
+            lisi.score
+        );
+        // 未注入台账时保持旧口径：同一谓词下两个实体同档。
+        let legacy = build_report(&facts, &registry, &type_system(), &entity_config());
+        assert_eq!(
+            legacy.passport_for("张三").unwrap().provenance,
+            legacy.passport_for("李四").unwrap().provenance
+        );
     }
 
     #[test]

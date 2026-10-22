@@ -62,6 +62,7 @@ use know_prolog::{
     prompt_spec::{self, LintSeverity, PromptMode},
     proof_bench::{self, ProofBenchBaseline},
     proof_journal::{JournalProjection, ProofCertificate, ProofDetail, ProofLimits},
+    provenance::{self, ConflictReport, ConflictSchema, ProvenanceLedger, ProvenanceLoad},
     quality::{
         build_report as build_quality_report, compare_baseline as compare_quality_baseline,
         render_entity_passport, QualityBaseline, QualityIndex,
@@ -452,6 +453,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Detect conflict certificates over the knowledge graph: witnessed
+    /// functional-slot multi-values and disjoint types; optional fact-level
+    /// provenance yields attribution and a minimal retraction plan (read-only)
+    Conflicts {
+        /// Fact-level provenance ledger (ContextImage JSON, section
+        /// "fact_provenance"); without it every base fact is honestly
+        /// reported as "来源未登记"
+        #[arg(long)]
+        provenance: Option<String>,
+        /// Also report latent rule conflicts (rules that can clash but have
+        /// no instance yet); off by default to avoid O(R²) noise
+        #[arg(long)]
+        latent: bool,
+        /// Maximum certificates printed in text mode (0 = all)
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the read-only temporal index: timeline, facts valid at a time,
     /// and time-aware functional conflicts (no writes to the knowledge store)
     Temporal {
@@ -532,6 +553,11 @@ enum Commands {
         /// Do not fail (exit code) on regressions
         #[arg(long)]
         allow_regression: bool,
+        /// Fact-level provenance ledger (created by `provenance` tooling);
+        /// when given, the provenance dimension uses per-fact source coverage
+        /// instead of predicate-level source tags
+        #[arg(long)]
+        provenance: Option<String>,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -1360,6 +1386,95 @@ async fn main() {
                 println!("{}", search.receipt.render_text());
             }
         }
+        Some(Commands::Conflicts {
+            provenance,
+            latent,
+            limit,
+            json,
+        }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_type_system(&config.type_system);
+            let facts = match oxigraph_manager.load_fact_refs().await {
+                Ok(facts) => facts,
+                Err(error) => {
+                    eprintln!("读取知识库失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            let registry = oxigraph_manager.predicate_registry_snapshot();
+            let types = oxigraph_manager.type_system_snapshot();
+            let mut schema = ConflictSchema::from_registry_and_types(&registry, &types);
+            for fact in &facts {
+                if schema.type_predicates.contains(&fact.predicate) {
+                    schema.observe_type(&types, &fact.value);
+                }
+            }
+
+            let mut ledger = ProvenanceLedger::new();
+            if let Some(path) = provenance.as_deref() {
+                match ProvenanceLedger::load(path) {
+                    ProvenanceLoad::Loaded(loaded) => ledger = loaded,
+                    ProvenanceLoad::Missing => {
+                        eprintln!("来源台账不存在：{}（按未登记来源报告）", path)
+                    }
+                    ProvenanceLoad::Damaged(error) => {
+                        eprintln!("来源台账损坏：{}（按未登记来源报告）", error)
+                    }
+                }
+            }
+            let rules = oxigraph_manager.load_rule_ledger().await.unwrap_or_else(|error| {
+                eprintln!("读取规则账本失败：{}", error);
+                know_prolog::graph_ledger::RuleLedger {
+                    synced: false,
+                    fingerprint: String::new(),
+                    entries: Vec::new(),
+                }
+            });
+            let derived = oxigraph_manager
+                .load_derived_ledger()
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("读取派生账本失败：{}", error);
+                    know_prolog::graph_ledger::DerivedLedger {
+                        materialized: false,
+                        revision: 0,
+                        fingerprint: String::new(),
+                        entries: Vec::new(),
+                    }
+                });
+            let supports = provenance::build_supports(&facts, &ledger, &rules, &derived);
+            let mut certificates = provenance::detect_witnessed(&facts, &supports, &schema);
+            if latent {
+                let clauses: Vec<know_prolog::resolution_engine::Clause> = rules
+                    .entries
+                    .iter()
+                    .map(ledger_entry_to_clause)
+                    .collect();
+                certificates.extend(provenance::detect_latent(&clauses, &schema));
+            }
+            let coverage = ledger.coverage(&facts);
+            let report = ConflictReport::new(certificates, coverage);
+            if json {
+                println!("{}", report.to_json());
+            } else {
+                let mut shown = report.clone();
+                if limit > 0 && shown.certificates.len() > limit {
+                    shown.certificates.truncate(limit);
+                }
+                println!("{}", shown.render_text());
+                if shown.certificates.len() < report.certificates.len() {
+                    println!(
+                        "（仅显示前 {} 个证书；用 --limit 0 查看全部）",
+                        shown.certificates.len()
+                    );
+                }
+            }
+        }
         Some(Commands::Temporal {
             entity,
             at,
@@ -1621,6 +1736,7 @@ async fn main() {
             baseline,
             update_baseline,
             allow_regression,
+            provenance,
             json,
         }) => {
             let registry_path = format!("{}/predicate_registry.json", store_path);
@@ -1630,13 +1746,29 @@ async fn main() {
                 config.reasoning.require_predicate_admission,
             );
             oxigraph_manager.configure_type_system(&config.type_system);
-            let report = match quality_report_for(&oxigraph_manager, &config).await {
-                Ok(report) => report,
-                Err(e) => {
-                    eprintln!("读取知识库失败: {}", e);
-                    std::process::exit(1);
+            let ledger = provenance.as_deref().and_then(|path| {
+                match ProvenanceLedger::load(path) {
+                    ProvenanceLoad::Loaded(ledger) => Some(ledger),
+                    ProvenanceLoad::Missing => {
+                        eprintln!("来源台账不存在：{}（按未登记来源计分）", path);
+                        None
+                    }
+                    ProvenanceLoad::Damaged(error) => {
+                        eprintln!("来源台账损坏：{}（按未登记来源计分）", error);
+                        None
+                    }
                 }
-            };
+            });
+            let report =
+                match quality_report_for_with_provenance(&oxigraph_manager, &config, ledger.as_ref())
+                    .await
+                {
+                    Ok(report) => report,
+                    Err(e) => {
+                        eprintln!("读取知识库失败: {}", e);
+                        std::process::exit(1);
+                    }
+                };
             if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{}", text),
@@ -3094,17 +3226,56 @@ fn warn_config_contract(config: &know_prolog::SystemConfig) {
 }
 
 /// 构建质量护照（`eval-quality` 与交互命令共用同一确定性路径）。
+/// 规则账本条目 → 归结子句（潜在冲突检测的输入）。
+fn ledger_entry_to_clause(
+    entry: &know_prolog::graph_ledger::RuleLedgerEntry,
+) -> know_prolog::resolution_engine::Clause {
+    use know_prolog::resolution_engine::{Atom, Clause, Term};
+    fn atom(atom: &know_prolog::graph_ledger::LedgerAtom) -> Atom {
+        Atom::new(
+            &atom.predicate,
+            atom.terms
+                .iter()
+                .map(|term| {
+                    if term.is_var {
+                        Term::var(&term.name)
+                    } else {
+                        Term::constant(&term.name)
+                    }
+                })
+                .collect(),
+        )
+    }
+    Clause::new(
+        atom(&entry.head),
+        entry.body.iter().map(atom).collect(),
+        entry.confidence,
+        &entry.source,
+    )
+}
+
 async fn quality_report_for(
     oxigraph_manager: &OxigraphManager,
     config: &know_prolog::SystemConfig,
 ) -> Result<know_prolog::quality::QualityReport, Box<dyn std::error::Error + Send + Sync>> {
+    quality_report_for_with_provenance(oxigraph_manager, config, None).await
+}
+
+async fn quality_report_for_with_provenance(
+    oxigraph_manager: &OxigraphManager,
+    config: &know_prolog::SystemConfig,
+    provenance: Option<&ProvenanceLedger>,
+) -> Result<know_prolog::quality::QualityReport, Box<dyn std::error::Error + Send + Sync>> {
     let facts = oxigraph_manager.load_graph_snapshot().await?;
-    Ok(build_quality_report(
-        &facts,
-        &oxigraph_manager.predicate_registry_snapshot(),
-        &oxigraph_manager.type_system_snapshot(),
-        &config.entity_types,
-    ))
+    Ok(
+        know_prolog::quality::build_report_with_provenance(
+            &facts,
+            &oxigraph_manager.predicate_registry_snapshot(),
+            &oxigraph_manager.type_system_snapshot(),
+            &config.entity_types,
+            provenance,
+        ),
+    )
 }
 
 /// `serve` 的知识装载：与交互模式同源，取整图快照（实体属性 + 关系）。

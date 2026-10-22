@@ -2997,6 +2997,54 @@ impl OxigraphManager {
         Ok(snapshot)
     }
 
+    /// 读取默认图的**全部**事实引用（不做主谓折叠、不丢多值）。
+    ///
+    /// `load_graph_snapshot` 把实体属性放进 `HashMap`，同一谓词的多个取值会
+    /// 互相覆盖——这对回答路径是历史兼容行为，但会让「同一主语的两个取值」
+    /// 在冲突检测里结构上不可见。本方法保留每一行，供溯源/冲突证书消费。
+    pub async fn load_fact_refs(
+        &self,
+    ) -> Result<Vec<crate::provenance::FactRef>, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let mut out: Vec<crate::provenance::FactRef> = Vec::new();
+        for quad in store.iter() {
+            let quad = match quad {
+                Ok(quad) => quad,
+                Err(_) => continue,
+            };
+            if quad.graph_name != GraphName::DefaultGraph {
+                continue;
+            }
+            let subject = match &quad.subject {
+                Subject::NamedNode(node) => Self::entity_key_from_iri(node.as_str()),
+                _ => {
+                    let text = quad.subject.to_string();
+                    Self::entity_key_from_iri(text.trim_matches(|c| c == '<' || c == '>'))
+                }
+            };
+            let predicate = if quad.predicate.as_str() == RDF_TYPE_IRI {
+                "type".to_string()
+            } else if quad.predicate.as_str().contains(BASE_NS) {
+                quad.predicate.as_str().replace(BASE_NS, "")
+            } else {
+                quad.predicate.as_str().to_string()
+            };
+            let value = match &quad.object {
+                Term::Literal(literal) => literal.value().to_string(),
+                Term::NamedNode(node) => Self::entity_key_from_iri(node.as_str()),
+                object => object
+                    .to_string()
+                    .trim_matches(|c| c == '<' || c == '>')
+                    .to_string(),
+            };
+            out.push(crate::provenance::FactRef::new(&subject, &predicate, &value));
+        }
+        out.sort();
+        out.dedup();
+        self.perf.bump("fact_ref_scan");
+        Ok(out)
+    }
+
     /// 单次遍历存储，同时构建整图的实体事实与关系事实。
     ///
     /// 语义与 `load_all_facts` + `load_all_relations` 的组合保持一致：
@@ -4828,6 +4876,48 @@ mod cache_tests {
             label: "Person".to_string(),
             properties: HashMap::from([("name".to_string(), name.to_string())]),
         }
+    }
+
+    /// 快照会把同一谓词的多值折叠进 `HashMap`，无损读取必须保留每一行；
+    /// 否则「同一主语两个取值」在冲突检测里结构上不可见。
+    #[tokio::test]
+    async fn fact_refs_preserve_values_that_snapshot_collapses() {
+        let (manager, _dir) = temp_manager().await;
+        let turtle = r#"
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            <http://example.org/kg/entity/姚明> rdf:type <http://example.org/kg/Person> .
+            <http://example.org/kg/entity/姚明> <http://example.org/kg/name> "姚明" .
+            <http://example.org/kg/entity/姚明> <http://example.org/kg/年龄> "38" .
+            <http://example.org/kg/entity/姚明> <http://example.org/kg/年龄> "39" .
+        "#;
+        manager
+            .import_rdf_reader(oxigraph::io::RdfFormat::Turtle, turtle.as_bytes())
+            .await
+            .unwrap();
+
+        let snapshot = manager.load_graph_snapshot().await.unwrap();
+        let ages: Vec<&String> = snapshot
+            .iter()
+            .filter_map(|fact| match fact {
+                PrologFact::Entity {
+                    name, properties, ..
+                } if name == "姚明" => properties.get("年龄"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ages.len(), 1, "快照只保留最后一个取值（历史兼容行为）");
+
+        let refs = manager.load_fact_refs().await.unwrap();
+        let values: BTreeSet<String> = refs
+            .iter()
+            .filter(|fact| fact.subject == "姚明" && fact.predicate == "年龄")
+            .map(|fact| fact.value.clone())
+            .collect();
+        assert_eq!(
+            values,
+            ["38".to_string(), "39".to_string()].into_iter().collect(),
+            "无损读取必须保留两个取值"
+        );
     }
 
     /// 身份 URI 往返：名字含 `/`、空格时 IRI 合法，且图谱键能无损反解（编码/解码往返律）。
