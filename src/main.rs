@@ -4068,6 +4068,8 @@ async fn run_ask(
                 continue;
             }
         }
+        // 一次性问答同样只给紧接的一轮开裸回答窗口。
+        reasoner.clear_pending_awaiting();
         let mut answer = dialogue
             .plan_pure_dialogue(&question, &reasoner)
             .or_else(|| dialogue.plan_reply(&question, &reasoner))
@@ -8841,6 +8843,8 @@ async fn run_interactive_mode(
                 continue;
             }
         }
+        // 裸回答窗口只开一轮：本轮没有绑定成功，后续输入不得再被旧追问劫持。
+        symbolic_reasoner.clear_pending_awaiting();
 
         // 悬问台账：欠用户答案的问题与缺失前提；可显式放弃（不设 TTL）。
         if matches!(input, "悬问" | "未答之问" | "悬问报告" | "悬问台账") {

@@ -9959,16 +9959,32 @@ impl SymbolicReasoner {
         }
     }
 
-    /// 回答悬问：把本轮输入绑定到队首的洞，补入会话事实后重解原目标。
+    /// 本轮没有把输入当作短答：关闭「仅紧接一轮可裸答」的窗口。
+    pub fn clear_pending_awaiting(&mut self) {
+        self.pending_questions.clear_awaiting();
+    }
+
+    /// 回答悬问：把本轮输入绑定到当前追问的洞，补入会话事实后重解原目标。
     ///
-    /// 只在系统上一轮刚追问过这个洞时调用；无法判定为回答时返回 `None`，
+    /// 只有在系统上一轮刚追问过某个洞时才接受裸取值；其他轮次只接受
+    /// 「回答悬问：…」这样的显式回填。无法判定为回答时返回 `None`，
     /// 让位给正常对话管线（绝不劫持新问句/命令）。
     pub fn try_answer_pending_question(&mut self, input: &str) -> Option<String> {
-        let pending = self.pending_questions.first()?.clone();
-        match pending_question::interpret_answer(input, &pending.hole) {
-            AnswerBinding::NotAnAnswer => None,
+        let pending = self.pending_questions.active()?.clone();
+        let binding = pending_question::interpret_answer(input, &pending.hole);
+        let explicit = pending_question::has_explicit_answer_prefix(input);
+        if !self.pending_questions.awaiting_answer() && !explicit {
+            self.pending_questions.clear_awaiting();
+            return None;
+        }
+        match binding {
+            AnswerBinding::NotAnAnswer => {
+                self.pending_questions.clear_awaiting();
+                None
+            }
             AnswerBinding::Unknown => {
                 self.pending_questions.remove(pending.id);
+                self.pending_questions.clear_awaiting();
                 Some(format!(
                     "好，「{}」先悬着。\n「不知道」只是暂时没有信息，不会被记成否定事实；需要时可以重新问我。",
                     pending.hole.phrase()
@@ -9977,6 +9993,7 @@ impl SymbolicReasoner {
             AnswerBinding::Fill(object) => {
                 let adopted = self.adopt_hole_fill(&pending.hole, &object);
                 self.pending_questions.remove(pending.id);
+                self.pending_questions.clear_awaiting();
                 let answer = self
                     .answer(&pending.question)
                     .filter(|text| !Self::is_pending_failure(text));
@@ -10028,6 +10045,7 @@ impl SymbolicReasoner {
         let pending = self
             .pending_questions
             .record(question, &goal, hole, support);
+        self.pending_questions.mark_asked(pending.id);
         Some(PendingQuestionLedger::render_ask(&pending))
     }
 
@@ -10054,6 +10072,7 @@ impl SymbolicReasoner {
                 _ => unresolved.push(question),
             }
         }
+        self.pending_questions.clear_awaiting();
         self.pending_questions.replace(unresolved);
         (!resolved.is_empty()).then(|| resolved.join("\n"))
     }
@@ -13013,7 +13032,7 @@ impl SymbolicReasoner {
         // 悬问账本：旧快照没有该字段时按空账本恢复；损坏的超额条目在 replace 内裁剪。
         let mut pending_questions = PendingQuestionLedger::new();
         if let Some(saved) = &snapshot.pending_questions {
-            pending_questions.replace(saved.questions().to_vec());
+            pending_questions.restore_from(saved);
         }
         self.pending_questions = pending_questions;
         // 跨会话临时信念：恢复被采纳的会话假设（仍不写知识图谱）
@@ -14895,6 +14914,77 @@ mod tests {
                 .is_none(),
             "链路已通时不得凭空立悬问"
         );
+        assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
+    fn pending_question_binds_the_last_asked_hole_not_the_oldest() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("第一条悬问");
+        reasoner
+            .open_pending_question("王五的师傅的师傅是谁")
+            .expect("第二条悬问");
+
+        // 后问的是「赵六 的 师傅」，裸回答必须落在这一条上。
+        let deferred = reasoner
+            .try_answer_pending_question("孙七")
+            .expect("裸回答应绑定到最近追问的洞");
+        assert!(deferred.contains("孙七"), "{}", deferred);
+        assert!(
+            reasoner.session_facts.iter().any(|atom| {
+                atom.predicate.as_ref() == "师傅"
+                    && atom.terms[0].name() == "赵六"
+                    && atom.terms[1].name() == "孙七"
+            }),
+            "回填应落在第二条悬问的洞上"
+        );
+        assert!(reasoner.has_pending_question(), "第一条悬问仍应挂着");
+        assert!(reasoner.pending_question_report().contains("张三的师傅的师傅是谁"));
+
+        // 追问窗口已过：裸回答不再绑定，但显式前缀仍可回填旧悬问。
+        assert!(reasoner.try_answer_pending_question("王五").is_none());
+        let deferred = reasoner
+            .try_answer_pending_question("回答悬问：王五")
+            .expect("显式前缀应能回填旧悬问");
+        assert!(deferred.contains("王五"), "{}", deferred);
+        assert!(!reasoner.has_pending_question());
+    }
+
+    #[test]
+    fn pending_question_bare_answer_only_opens_for_one_turn() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+
+        assert!(reasoner.try_answer_pending_question("张三是谁").is_none());
+        assert!(
+            reasoner.try_answer_pending_question("王五").is_none(),
+            "隔了一轮之后，裸取值不得再被旧追问吞掉"
+        );
+        assert!(reasoner.has_pending_question());
+        assert!(reasoner
+            .try_answer_pending_question("回答悬问：王五")
+            .is_some());
+    }
+
+    #[test]
+    fn pending_question_resolves_after_new_graph_facts_arrive() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        reasoner
+            .open_pending_question("张三的师傅的师傅是谁")
+            .expect("应先立悬问");
+        reasoner.observe_facts(&master_facts());
+        let deferred = reasoner
+            .resolve_pending_after_assertion()
+            .expect("图谱补上缺边后应给出延期回答");
+        assert!(deferred.contains("现在可以回答了"), "{}", deferred);
+        assert!(deferred.contains("王五"), "{}", deferred);
         assert!(!reasoner.has_pending_question());
     }
 

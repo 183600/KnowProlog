@@ -86,10 +86,23 @@ pub struct PendingQuestionLedger {
     questions: Vec<PendingQuestion>,
     #[serde(default, skip_serializing_if = "is_zero")]
     next_id: u64,
+    /// 最近一次真正追问过的悬问编号。
+    ///
+    /// 台账里可能同时挂着多条未答之问；裸回答必须绑定到「刚刚被问到的」
+    /// 那一条，而不是最早的一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_id: Option<u64>,
+    /// 上一轮是否刚把追问说出口。只有紧接的一轮才接受裸回答。
+    #[serde(default, skip_serializing_if = "is_false")]
+    awaiting_answer: bool,
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl PendingQuestionLedger {
@@ -113,8 +126,54 @@ impl PendingQuestionLedger {
         self.questions.first()
     }
 
+    /// 当前被追问的悬问：优先取最近追问过的那条，否则退回最早的一条。
+    pub fn active(&self) -> Option<&PendingQuestion> {
+        self.active_id
+            .and_then(|id| self.questions.iter().find(|pending| pending.id == id))
+            .or_else(|| self.questions.first())
+    }
+
+    pub fn active_id(&self) -> Option<u64> {
+        self.active().map(|pending| pending.id)
+    }
+
+    /// 上一轮是否刚追问过某个洞；只有此时裸取值才允许绑定。
+    pub fn awaiting_answer(&self) -> bool {
+        self.awaiting_answer && self.active().is_some()
+    }
+
+    /// 把某条悬问标为「刚刚问过」，下一轮短答将绑定到它。
+    pub fn mark_asked(&mut self, id: u64) {
+        if self.questions.iter().any(|pending| pending.id == id) {
+            self.active_id = Some(id);
+            self.awaiting_answer = true;
+        }
+    }
+
+    /// 本轮没有再追问：关闭裸回答窗口，但保留悬问本身。
+    pub fn clear_awaiting(&mut self) {
+        self.awaiting_answer = false;
+    }
+
+    fn normalize_active(&mut self) {
+        if self.questions.is_empty() {
+            self.active_id = None;
+            self.awaiting_answer = false;
+            return;
+        }
+        let valid = self
+            .active_id
+            .is_some_and(|id| self.questions.iter().any(|pending| pending.id == id));
+        if !valid {
+            self.active_id = self.questions.first().map(|pending| pending.id);
+            self.awaiting_answer = false;
+        }
+    }
+
     pub fn clear(&mut self) {
         self.questions.clear();
+        self.active_id = None;
+        self.awaiting_answer = false;
     }
 
     /// 记录一条悬问。同一「目标 + 洞」重复失败时只累计追问次数，不重复入账。
@@ -135,6 +194,8 @@ impl PendingQuestionLedger {
             if existing.support.is_empty() && !support.is_empty() {
                 existing.support = support;
             }
+            let id = existing.id;
+            self.active_id = Some(id);
             return existing.clone();
         }
         if self.questions.len() >= MAX_PENDING_QUESTIONS {
@@ -149,20 +210,25 @@ impl PendingQuestionLedger {
             support,
             asks: 1,
         };
+        self.active_id = Some(pending.id);
         self.questions.push(pending.clone());
         pending
     }
 
     pub fn remove(&mut self, id: u64) -> Option<PendingQuestion> {
         let position = self.questions.iter().position(|pending| pending.id == id)?;
-        Some(self.questions.remove(position))
+        let removed = self.questions.remove(position);
+        self.normalize_active();
+        Some(removed)
     }
 
     pub fn remove_first(&mut self) -> Option<PendingQuestion> {
         if self.questions.is_empty() {
             None
         } else {
-            Some(self.questions.remove(0))
+            let removed = self.questions.remove(0);
+            self.normalize_active();
+            Some(removed)
         }
     }
 
@@ -175,6 +241,26 @@ impl PendingQuestionLedger {
             let excess = self.questions.len() - MAX_PENDING_QUESTIONS;
             self.questions.drain(0..excess);
         }
+        self.normalize_active();
+    }
+
+    /// 恢复快照时连同「当前追问」与「是否等待短答」一起恢复。
+    pub fn restore_from(&mut self, saved: &Self) {
+        let mut restored = saved.clone();
+        if restored.questions.len() > MAX_PENDING_QUESTIONS {
+            let excess = restored.questions.len() - MAX_PENDING_QUESTIONS;
+            restored.questions.drain(0..excess);
+        }
+        restored.next_id = saved.next_id.max(
+            restored
+                .questions
+                .iter()
+                .map(|pending| pending.id)
+                .max()
+                .unwrap_or(0),
+        );
+        restored.normalize_active();
+        *self = restored;
     }
 
     /// 追问话术：把「缺哪条前提」说成一个用户可以短答的问题。
@@ -213,15 +299,25 @@ impl PendingQuestionLedger {
         }
         let mut output = format!("悬问台账：{} 条未答之问。\n", self.questions.len());
         for pending in &self.questions {
+            let marker = if self.active_id == Some(pending.id) {
+                if self.awaiting_answer {
+                    " ← 当前追问（可直接回短答）"
+                } else {
+                    " ← 上次追问"
+                }
+            } else {
+                ""
+            };
             output.push_str(&format!(
-                "  {}. 「{}」缺「{}」（已追问 {} 次）\n",
+                "  {}. 「{}」缺「{}」（已追问 {} 次）{}\n",
                 pending.id,
                 pending.question,
                 pending.hole.phrase(),
-                pending.asks
+                pending.asks,
+                marker
             ));
         }
-        output.push_str("回复取值即可回填；输入「放弃悬问」清空台账。");
+        output.push_str("回复取值即可回填当前追问；输入「放弃悬问」清空台账。");
         output
     }
 }
@@ -235,6 +331,17 @@ pub enum AnswerBinding {
     Unknown,
     /// 不是对悬问的回答：让位给正常对话管线。
     NotAnAnswer,
+}
+
+/// 用户是否用了显式回填前缀（例如「回答悬问：王五」）。
+///
+/// 显式前缀不受「仅紧接一轮可裸答」的限制：用户可以在任何时候主动
+/// 指名回填，而不必等系统再次追问。
+pub fn has_explicit_answer_prefix(raw: &str) -> bool {
+    let text = raw.trim();
+    ["回答悬问：", "回答悬问:", "回填悬问：", "回填悬问:"]
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
 }
 
 /// 把用户的一轮输入解释为对某个洞的回答。
@@ -438,5 +545,74 @@ mod tests {
         let ledger = PendingQuestionLedger::new();
         let value = serde_json::to_value(&ledger).unwrap();
         assert_eq!(value, serde_json::json!({}));
+    }
+
+    #[test]
+    fn active_question_is_the_last_one_asked() {
+        let mut ledger = PendingQuestionLedger::new();
+        let first = ledger.record(
+            "张三的师傅的师傅是谁？",
+            "张三 的 师傅 的 师傅",
+            hole(),
+            Vec::new(),
+        );
+        ledger.mark_asked(first.id);
+        let second = ledger.record(
+            "王五的师傅的师傅是谁？",
+            "王五 的 师傅 的 师傅",
+            PendingHole::new("赵六", "师傅", "师傅", false),
+            Vec::new(),
+        );
+        ledger.mark_asked(second.id);
+        assert_eq!(ledger.active().map(|pending| pending.id), Some(second.id));
+        assert!(ledger.awaiting_answer());
+
+        // 追问窗口未关闭时，裸回答瞄向最后问过的那条。
+        ledger.clear_awaiting();
+        assert!(!ledger.awaiting_answer());
+        assert_eq!(
+            ledger.active().map(|pending| pending.hole.subject.as_str()),
+            Some("赵六")
+        );
+
+        // 删除当前追问后，活动项回退到仍挂着的那条，且不再接受裸回答。
+        ledger.remove(second.id);
+        assert_eq!(ledger.active().map(|pending| pending.id), Some(first.id));
+        assert!(!ledger.awaiting_answer());
+    }
+
+    #[test]
+    fn restore_keeps_awaiting_state_and_normalizes_dangling_active() {
+        let mut ledger = PendingQuestionLedger::new();
+        let pending = ledger.record(
+            "张三的师傅的师傅是谁？",
+            "张三 的 师傅 的 师傅",
+            hole(),
+            Vec::new(),
+        );
+        ledger.mark_asked(pending.id);
+        let mut restored = PendingQuestionLedger::new();
+        restored.restore_from(&ledger);
+        assert!(restored.awaiting_answer());
+        assert_eq!(restored.active().map(|item| item.id), Some(pending.id));
+
+        let mut dangling = ledger.clone();
+        dangling.active_id = Some(pending.id + 99);
+        dangling.awaiting_answer = true;
+        let mut normalized = PendingQuestionLedger::new();
+        normalized.restore_from(&dangling);
+        assert!(!normalized.awaiting_answer());
+        assert_eq!(normalized.active().map(|item| item.id), Some(pending.id));
+    }
+
+    #[test]
+    fn explicit_prefix_is_recognized_without_awaiting_window() {
+        assert!(has_explicit_answer_prefix("回答悬问：王五"));
+        assert!(has_explicit_answer_prefix(" 回填悬问:王五 "));
+        assert!(!has_explicit_answer_prefix("王五"));
+        assert_eq!(
+            interpret_answer("回答悬问：王五", &hole()),
+            AnswerBinding::Fill("王五".to_string())
+        );
     }
 }
