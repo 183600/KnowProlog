@@ -14081,6 +14081,11 @@ mod tests {
             .answer_relation_objects("张三", "师祖")
             .expect("直接关系查询也应看到推导");
         assert!(objects.contains("李四"), "{}", objects);
+        // 「为什么」通道应能用同一份规则/事实证明同一答案。
+        let derivation = reasoner
+            .answer_derivation("张三的师祖是谁", Some("李四"))
+            .expect("推导答案应可解释");
+        assert_eq!(derivation.answer_value(), Some("李四"));
         // 推导只是读模型：不能悄悄变成图谱边或会话事实。
         assert!(!reasoner.predictor.has_triple("张三", "师祖", "李四"));
         assert!(!reasoner
