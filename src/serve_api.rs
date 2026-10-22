@@ -4997,6 +4997,26 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
     }
 
     #[test]
+    fn assumption_world_spans_turns_and_rolls_back_on_exit() {
+        let mut session = test_session(TurnBudget::unlimited());
+        let entered = session.run_turn("假设：姚明的身高是230");
+        assert_eq!(entered.status, "answered", "{}", entered.reply);
+        assert_eq!(entered.source, "assumption", "{}", entered.reply);
+        assert!(entered.reply.contains("假设世界"), "{}", entered.reply);
+
+        let inside = session.run_turn("姚明的身高是多少");
+        assert_eq!(inside.status, "answered", "{}", inside.reply);
+        assert!(inside.reply.contains("230"), "{}", inside.reply);
+
+        let exited = session.run_turn("退出假设");
+        assert_eq!(exited.source, "assumption", "{}", exited.reply);
+        assert!(exited.reply.contains("已退出"), "{}", exited.reply);
+        let outside = session.run_turn("姚明的身高是多少");
+        assert!(outside.reply.contains("226"), "{}", outside.reply);
+        assert!(!outside.reply.contains("230"), "{}", outside.reply);
+    }
+
+    #[test]
     fn why_turn_carries_bounded_derivation_over_http_response() {
         let mut session = test_session(TurnBudget::unlimited());
         let answer = session.run_turn("姚明的身高是多少");
