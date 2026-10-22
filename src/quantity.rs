@@ -494,8 +494,17 @@ pub fn parse_quantity(raw: &str) -> Option<Quantity> {
         return None;
     }
     let (mut exactness, body) = strip_exactness(&compact);
-    let (number_text, rest) = split_number(&body)?;
-    let value = parse_number_prefix(number_text)?;
+    // 「零下 10 摄氏度」是负数写法，不能当成 +10；去掉前缀后再交给同一套
+    // 数字/单位解析，换算 offset 才会落在正确的温度区间。
+    let (body, negative) = match body.strip_prefix("零下") {
+        Some(rest) => (rest.trim_start(), true),
+        None => (body.as_str(), false),
+    };
+    let (number_text, rest) = split_number(body)?;
+    let mut value = parse_number_prefix(number_text)?;
+    if negative {
+        value = -value.abs();
+    }
     if !value.is_finite() {
         return None;
     }
@@ -929,6 +938,27 @@ mod tests {
             Comparison::Greater
         );
         assert_eq!(twice.format_canonical(), "200%");
+    }
+
+    #[test]
+    fn negative_temperature_prefix_is_honored() {
+        let zero_below = parse_quantity("零下10摄氏度").unwrap();
+        assert_eq!(zero_below.dimension(), Dimension::Temperature);
+        assert!((zero_below.base_value() - -10.0).abs() < 1e-9);
+        assert_eq!(
+            zero_below.compare(&parse_quantity("-10℃").unwrap()),
+            Comparison::Equal
+        );
+        assert_eq!(
+            parse_quantity("零下40摄氏度")
+                .unwrap()
+                .compare(&parse_quantity("零下10摄氏度").unwrap()),
+            Comparison::Less
+        );
+        assert!((parse_quantity("零下40华氏度").unwrap().base_value()
+            - (-40.0 * 5.0 / 9.0 - 32.0 * 5.0 / 9.0))
+            .abs()
+            < 1e-9);
     }
 
     #[test]
