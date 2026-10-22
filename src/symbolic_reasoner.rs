@@ -7712,7 +7712,8 @@ impl SymbolicReasoner {
             .map(|solution| solution.row(select))
             .filter(|row| !row.is_empty())
             .collect();
-        const MAX_ROWS: usize = 12;
+        // 首屏与后续翻页共用同一页大小，避免「还有呢」重复展示上一屏末尾。
+        const MAX_ROWS: usize = crate::conversational_graph::DEFAULT_PAGE_SIZE;
         let hidden = rows.len().saturating_sub(MAX_ROWS);
         rows.truncate(MAX_ROWS);
         let mut output = match compiled.kind {
