@@ -1651,7 +1651,13 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         let revision = knowledge.revision();
-        let outcome = self.board.apply(input, knowledge, revision)?;
+        let attribute_hint = self
+            .turns
+            .last()
+            .and_then(|turn| turn.attribute.clone());
+        let outcome =
+            self.board
+                .apply_with_hint(input, knowledge, revision, attribute_hint.as_deref())?;
         self.turns.push(DialogueTurn {
             index: self.turns.len() + 1,
             user: input.trim().to_string(),
@@ -4606,6 +4612,32 @@ mod tests {
             .plan_pure_dialogue("回到上一步", &knowledge)
             .expect("撤销应回到上一帧");
         assert!(undone.text.contains("已回到第"));
+    }
+
+    #[test]
+    fn test_superlative_question_uses_previous_attribute_and_ranks() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("姚明", &["身高"])
+            .with_value("姚明", "身高", "226")
+            .with_entity("王治郅", &["身高"])
+            .with_value("王治郅", "身高", "214")
+            .with_entity("易建联", &["身高"])
+            .with_value("易建联", "身高", "213");
+        let mut manager = DialogueManager::new();
+        manager
+            .plan_reply("姚明的身高是多少", &knowledge)
+            .expect("先回答单个属性");
+        let reply = manager
+            .plan_reply("谁最高", &knowledge)
+            .expect("上一轮属性应补全排名请求");
+        assert!(reply.text.contains("姚明"), "{}", reply.text);
+        assert!(reply.text.contains("最"), "{}", reply.text);
+        assert_eq!(reply.plan, vec!["board:rank"]);
+
+        let second = manager
+            .plan_reply("第二高呢", &knowledge)
+            .expect("排名后应能取第二名");
+        assert!(second.text.contains("当前选中"), "{}", second.text);
     }
 
     #[test]

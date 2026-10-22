@@ -17,8 +17,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bindings::{compare_numeric, BoundTerm};
 use crate::dialogue_manager::{DialogueKnowledge, MoveKind};
+use crate::quantity::{self, Comparison, Quantity};
 
 /// 继承槽位的逻辑轮次时限。
 pub const FRAME_ENV_TTL: u64 = 8;
@@ -962,15 +962,13 @@ impl FrameProgram {
                 let right_values = knowledge.attribute_values(&right, &attribute);
                 let left_value = left_values.first()?;
                 let right_value = right_values.first()?;
-                let ordering = compare_numeric(
-                    &BoundTerm::classify(left_value),
-                    &BoundTerm::classify(right_value),
-                )?;
-                let (winner, comparison) = match ordering {
-                    std::cmp::Ordering::Greater => (left.clone(), format!("{}更高", left)),
-                    std::cmp::Ordering::Less => (right.clone(), format!("{}更高", right)),
-                    std::cmp::Ordering::Equal => (left.clone(), format!("{}和{}一样", left, right)),
-                };
+                let attribute_label = display_value(&attribute, knowledge);
+                let evaluated =
+                    compare_attribute_values(&left, &right, &attribute_label, left_value, right_value);
+                let winner = evaluated
+                    .winner
+                    .clone()
+                    .unwrap_or_else(|| "无法比较".to_string());
                 let mut bindings = resolved.bindings.clone();
                 bindings.insert(output.clone(), winner.clone());
                 let vars = self.render_vars(frame, &bindings, knowledge);
@@ -987,22 +985,23 @@ impl FrameProgram {
                             right,
                             display_value(&attribute, knowledge),
                             right_value,
-                            comparison
+                            evaluated.comparison
                         )
                     });
                 Some(Executed {
                     text,
                     bindings,
                     evidence: vec![format!(
-                        "比较：{} 的 {}={}，{} 的 {}={}",
+                        "比较：{} 的 {}={}，{} 的 {}={}；{}",
                         left,
                         display_value(&attribute, knowledge),
                         left_value,
                         right,
                         display_value(&attribute, knowledge),
-                        right_value
+                        right_value,
+                        evaluated.comparison
                     )],
-                    entity: Some(winner),
+                    entity: evaluated.winner,
                     attribute: Some(attribute),
                 })
             }
@@ -1109,25 +1108,19 @@ impl FrameProgram {
                     knowledge.attribute_values(&left, &attribute).first(),
                     knowledge.attribute_values(&right, &attribute).first(),
                 ) {
+                    let evaluated = compare_attribute_values(
+                        &left,
+                        &right,
+                        &display_value(&attribute, knowledge),
+                        left_value,
+                        right_value,
+                    );
                     vars.insert("left_value".to_string(), left_value.clone());
                     vars.insert("right_value".to_string(), right_value.clone());
-                    vars.insert(
-                        "comparison".to_string(),
-                        if let Some(ordering) = compare_numeric(
-                            &BoundTerm::classify(left_value),
-                            &BoundTerm::classify(right_value),
-                        ) {
-                            match ordering {
-                                std::cmp::Ordering::Greater => format!("{}更高", left),
-                                std::cmp::Ordering::Less => format!("{}更高", right),
-                                std::cmp::Ordering::Equal => {
-                                    format!("{}和{}一样", left, right)
-                                }
-                            }
-                        } else {
-                            String::new()
-                        },
-                    );
+                    vars.insert("comparison".to_string(), evaluated.comparison);
+                    if let Some(winner) = evaluated.winner {
+                        vars.insert("winner".to_string(), winner);
+                    }
                 }
             }
         }
@@ -1892,9 +1885,7 @@ fn normalize_slot_value(
                     .next()
             }
         }
-        SlotSort::Number => BoundTerm::classify(raw)
-            .numeric_value()
-            .map(|_| raw.to_string()),
+        SlotSort::Number => quantity::parse_quantity(raw).map(|_| raw.to_string()),
         SlotSort::Predicate | SlotSort::Attribute => Some(
             knowledge
                 .canonical_predicate(raw)
@@ -1906,6 +1897,95 @@ fn normalize_slot_value(
 
 fn display_value(raw: &str, knowledge: &dyn DialogueKnowledge) -> String {
     knowledge.predicate_label(raw)
+}
+
+/// 比较结论与胜者。胜者为 `None` 表示不可比或约数区间重叠，调用方不得
+/// 把它渲染成任何一方获胜。
+struct AttributeComparison {
+    winner: Option<String>,
+    comparison: String,
+}
+
+/// 属性比较的唯一出口：单位换算、量纲校验、约数不确定性与差异量都在这里。
+fn compare_attribute_values(
+    left: &str,
+    right: &str,
+    attribute_label: &str,
+    left_raw: &str,
+    right_raw: &str,
+) -> AttributeComparison {
+    let (Some(left_quantity), Some(right_quantity)) =
+        (quantity::parse_quantity(left_raw), quantity::parse_quantity(right_raw))
+    else {
+        return AttributeComparison {
+            winner: None,
+            comparison: format!(
+                "「{}」和「{}」的{}至少一侧不是数值，无法比较",
+                left, right, attribute_label
+            ),
+        };
+    };
+    let word = left_quantity.dimension().comparative_word(attribute_label);
+    match left_quantity.compare(&right_quantity) {
+        Comparison::Greater => {
+            winner_with_difference(left, word, &left_quantity, &right_quantity)
+        }
+        Comparison::Less => {
+            winner_with_difference(right, word, &right_quantity, &left_quantity)
+        }
+        Comparison::Equal => AttributeComparison {
+            winner: Some(left.to_string()),
+            comparison: format!("{}和{}一样{}", left, right, word),
+        },
+        Comparison::Uncertain => AttributeComparison {
+            winner: None,
+            comparison: format!(
+                "「{}」和「{}」的{}约数区间重叠，无法确定谁更{}",
+                left, right, attribute_label, word
+            ),
+        },
+        Comparison::Incomparable(reason) => AttributeComparison {
+            winner: None,
+            comparison: format!(
+                "「{}」和「{}」的{}不可比（{}）",
+                left,
+                right,
+                attribute_label,
+                reason.describe()
+            ),
+        },
+    }
+}
+
+fn winner_with_difference(
+    winner: &str,
+    word: &str,
+    winner_quantity: &Quantity,
+    loser_quantity: &Quantity,
+) -> AttributeComparison {
+    let difference = winner_quantity.difference(loser_quantity).ok().map(|value| {
+        (
+            value.abs(),
+            winner_quantity.dimension().canonical_unit(),
+        )
+    });
+    let detail = difference
+        .filter(|(value, _)| *value > 1e-9)
+        .map(|(value, unit)| {
+            let suffix = if winner_quantity.dimension() == quantity::Dimension::Count
+                && !winner_quantity.has_unit()
+            {
+                ""
+            } else {
+                unit
+            };
+            format!("（相差{}{}）", quantity::format_number(value), suffix)
+        })
+        .unwrap_or_default();
+    AttributeComparison {
+        winner: Some(winner.to_string()),
+        comparison: format!("{}更{}{}", winner, word, detail),
+    }
 }
 
 fn relation_objects(
@@ -2398,6 +2478,97 @@ output = "value"
         assert!(outcome.text.contains("226"), "{}", outcome.text);
         assert!(outcome.text.contains("190"), "{}", outcome.text);
         assert!(outcome.text.contains("姚明更高"), "{}", outcome.text);
+    }
+
+    struct UnitKnowledge;
+
+    impl DialogueKnowledge for UnitKnowledge {
+        fn entities_in(&self, text: &str) -> Vec<String> {
+            ["姚明", "叶莉"]
+                .iter()
+                .filter(|entity| text.contains(**entity))
+                .map(|entity| (*entity).to_string())
+                .collect()
+        }
+
+        fn known_entity(&self, entity: &str) -> bool {
+            matches!(entity, "姚明" | "叶莉")
+        }
+
+        fn answer(&self, _question: &str) -> Option<String> {
+            None
+        }
+
+        fn known_attributes(&self, entity: &str) -> Vec<String> {
+            match entity {
+                "姚明" | "叶莉" => vec!["height".to_string()],
+                _ => Vec::new(),
+            }
+        }
+
+        fn attribute_values(&self, entity: &str, attribute: &str) -> Vec<String> {
+            match (entity, attribute) {
+                ("姚明", "height") => vec!["226 厘米".to_string()],
+                ("叶莉", "height") => vec!["1.90 米".to_string()],
+                _ => Vec::new(),
+            }
+        }
+
+        fn all_entities(&self) -> Vec<String> {
+            vec!["姚明".to_string(), "叶莉".to_string()]
+        }
+
+        fn canonical_predicate(&self, surface: &str) -> Option<String> {
+            crate::symbolic_generator::canonical_predicate_key(surface).map(str::to_string)
+        }
+
+        fn predicate_label(&self, predicate: &str) -> String {
+            crate::symbolic_generator::localized_predicate_key(predicate)
+                .map(str::to_string)
+                .unwrap_or_else(|| predicate.to_string())
+        }
+    }
+
+    #[test]
+    fn compare_parses_units_from_real_knowledge_values() {
+        let program = program();
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(
+                &mut memory,
+                "姚明和叶莉的身高谁更高",
+                &UnitKnowledge,
+                1,
+            )
+            .expect("带单位的值应能比较");
+        assert!(outcome.text.contains("姚明更高"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("相差0.36米"),
+            "比较应给出同量纲差值：{}",
+            outcome.text
+        );
+    }
+
+    #[test]
+    fn compare_refuses_cross_dimension_and_uncertain_approximations() {
+        let cross = compare_attribute_values(
+            "法国",
+            "珠峰",
+            "面积",
+            "67万平方公里",
+            "8848米",
+        );
+        assert!(cross.winner.is_none());
+        assert!(cross.comparison.contains("量纲不同"), "{}", cross.comparison);
+
+        let approximate =
+            compare_attribute_values("甲", "乙", "年龄", "46亿年", "约46亿年");
+        assert!(approximate.winner.is_none());
+        assert!(
+            approximate.comparison.contains("无法确定"),
+            "{}",
+            approximate.comparison
+        );
     }
 
     #[test]

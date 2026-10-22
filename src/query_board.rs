@@ -1,8 +1,9 @@
-use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::dialogue_manager::DialogueKnowledge;
+use crate::quantity::{self, Comparison, Dimension, Quantity, RankSpec};
 
 const PAGE_SIZE: usize = 5;
 const MAX_ROWS: usize = 500;
@@ -46,6 +47,13 @@ pub enum QuerySource {
         right: String,
         attribute: String,
     },
+    /// 极值/排序结果：属性、方向与名次范围。
+    Rank {
+        predicate: String,
+        descending: bool,
+    },
+    /// 等待用户补全「按哪个属性排名」。
+    RankPending { descending: bool },
     Manual,
 }
 
@@ -198,9 +206,33 @@ impl QueryBoard {
         knowledge: &dyn DialogueKnowledge,
         revision: u64,
     ) -> Option<BoardOutcome> {
+        self.apply_with_hint(input, knowledge, revision, None)
+    }
+
+    /// 与 [`Self::apply`] 相同，但允许调用方提供上一轮属性作为省略补全。
+    ///
+    /// 「姚明的身高是多少？」之后直接问「谁最高」时，属性由对话历史给出，
+    /// 查询板不必再猜。
+    pub fn apply_with_hint(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+        revision: u64,
+        attribute_hint: Option<&str>,
+    ) -> Option<BoardOutcome> {
         let text = clean(input);
         if text.is_empty() {
             return None;
+        }
+        if let Some(outcome) = self.resolve_pending_rank(&text, knowledge, revision) {
+            return Some(outcome);
+        }
+        if let Some(spec) = parse_extreme(&text, self.is_active()) {
+            if let Some(outcome) =
+                self.apply_extreme(spec, knowledge, revision, attribute_hint)
+            {
+                return Some(outcome);
+            }
         }
         if !self.is_active() {
             let spec = parse_scan(&text, knowledge)?;
@@ -250,6 +282,175 @@ impl QueryBoard {
             return self.start_scan(spec, knowledge, revision);
         }
         None
+    }
+
+    /// 待澄清的排名请求：用户下一句只回答属性词时，直接开始排名。
+    fn resolve_pending_rank(
+        &mut self,
+        text: &str,
+        knowledge: &dyn DialogueKnowledge,
+        revision: u64,
+    ) -> Option<BoardOutcome> {
+        let descending = match self.current().map(|frame| &frame.source) {
+            Some(QuerySource::RankPending { descending }) => *descending,
+            _ => return None,
+        };
+        let answer = text.trim_matches(|ch: char| {
+            matches!(ch, '。' | '，' | ',' | '！' | '!' | '？' | '?' | ' ')
+        });
+        if answer.is_empty() || answer.chars().count() > 12 {
+            return None;
+        }
+        let attribute = resolve_attribute_hint(answer, knowledge)?;
+        self.start_rank(attribute, descending, 1, knowledge, revision)
+    }
+
+    fn apply_extreme(
+        &mut self,
+        spec: ExtremeSpec,
+        knowledge: &dyn DialogueKnowledge,
+        revision: u64,
+        attribute_hint: Option<&str>,
+    ) -> Option<BoardOutcome> {
+        let attribute = spec
+            .attribute
+            .clone()
+            .or_else(|| attribute_hint.map(str::to_string))
+            .or_else(|| self.current_rank_attribute());
+        let Some(attribute) = attribute else {
+            let frame = BoardFrame::new(
+                "rank_pending",
+                "等待补全排名属性".to_string(),
+                QuerySource::RankPending {
+                    descending: spec.descending,
+                },
+                Vec::new(),
+                revision,
+            );
+            self.push_frame(frame);
+            return Some(BoardOutcome {
+                text: "你想按哪个属性排名？例如「谁的身高最高」或直接回答「身高」。".to_string(),
+                plan: vec!["board:rank_pending".to_string()],
+                provenance: vec!["查询板：排名请求缺少属性，未做任何猜测".to_string()],
+                focus: None,
+                revision,
+            });
+        };
+
+        if self.is_active() {
+            let frame = self.current()?.clone();
+            let matching: Vec<QueryRow> = frame
+                .rows
+                .iter()
+                .filter(|row| same_predicate(&row.predicate, &attribute, knowledge))
+                .cloned()
+                .collect();
+            if !matching.is_empty() {
+                let mut next = frame;
+                next.rows = matching;
+                next.selected = None;
+                next.page = 0;
+                next.op = "rank".to_string();
+                next.source = QuerySource::Rank {
+                    predicate: attribute.clone(),
+                    descending: spec.descending,
+                };
+                let skipped =
+                    sort_rows_by_quantity(&mut next.rows, &SortSpec {
+                        column: Some(attribute.clone()),
+                        descending: spec.descending,
+                    }, knowledge);
+                next.program = describe_rank(&attribute, spec.descending, skipped, knowledge);
+                let summary =
+                    rank_summary(&next.rows, spec.limit, &attribute, spec.descending, knowledge);
+                let text = format!("{}\n{}", summary, render_frame(&next, revision));
+                let focus = next.rows.first().map(|row| row.subject.clone());
+                let provenance = provenance_for(&next, next.rows.first());
+                self.push_frame(next);
+                return Some(BoardOutcome {
+                    text,
+                    plan: vec!["board:rank".to_string()],
+                    provenance,
+                    focus,
+                    revision,
+                });
+            }
+        }
+        self.start_rank(attribute, spec.descending, spec.limit, knowledge, revision)
+    }
+
+    fn start_rank(
+        &mut self,
+        attribute: String,
+        descending: bool,
+        limit: usize,
+        knowledge: &dyn DialogueKnowledge,
+        revision: u64,
+    ) -> Option<BoardOutcome> {
+        let spec = ScanSpec {
+            predicate: Some(attribute.clone()),
+            entity_type: None,
+        };
+        let rows = scan_rows(&spec, knowledge);
+        if rows.is_empty() {
+            return None;
+        }
+        let mut frame = BoardFrame::new(
+            "rank",
+            describe_rank(&attribute, descending, 0, knowledge),
+            QuerySource::Rank {
+                predicate: attribute.clone(),
+                descending,
+            },
+            rows,
+            revision,
+        );
+        let skipped = sort_rows_by_quantity(
+            &mut frame.rows,
+            &SortSpec {
+                column: Some(attribute.clone()),
+                descending,
+            },
+            knowledge,
+        );
+        frame.program = describe_rank(&attribute, descending, skipped, knowledge);
+        let summary = rank_summary(&frame.rows, limit, &attribute, descending, knowledge);
+        let text = format!("{}\n{}", summary, render_frame(&frame, revision));
+        let focus = frame.rows.first().map(|row| row.subject.clone());
+        let provenance = provenance_for(&frame, frame.rows.first());
+        self.push_frame(frame);
+        Some(BoardOutcome {
+            text,
+            plan: vec!["board:rank".to_string()],
+            provenance,
+            focus,
+            revision,
+        })
+    }
+
+    fn current_rank_attribute(&self) -> Option<String> {
+        let frame = self.current()?;
+        match &frame.source {
+            QuerySource::Scan {
+                predicate: Some(predicate),
+                ..
+            }
+            | QuerySource::Rank { predicate, .. } => Some(predicate.clone()),
+            _ => {
+                let first = frame.rows.first()?;
+                if frame
+                    .rows
+                    .iter()
+                    .all(|row| row.predicate == first.predicate)
+                {
+                    Some(first.predicate.clone())
+                } else {
+                    frame
+                        .selected_row()
+                        .map(|row| row.predicate.clone())
+                }
+            }
+        }
     }
 
     fn start_scan(
@@ -570,8 +771,8 @@ impl QueryBoard {
                     .map(|column| same_predicate(&row.predicate, column, knowledge))
                     .unwrap_or(true);
                 predicate_matches
-                    && numeric_value(&row.value)
-                        .map(|value| op.apply(value, *threshold))
+                    && quantity::parse_quantity(&row.value)
+                        .map(|value| op.matches(value.compare(threshold)))
                         .unwrap_or(false)
             }
         });
@@ -601,20 +802,7 @@ impl QueryBoard {
     ) -> Option<BoardOutcome> {
         let mut frame = self.current()?.clone();
         let old_selection = frame.selected_row().cloned();
-        frame.rows.sort_by(|left, right| {
-            let left_value = sort_value(left, &sort, knowledge);
-            let right_value = sort_value(right, &sort, knowledge);
-            let ordering = compare_values(&left_value, &right_value);
-            let ordering = if sort.descending {
-                ordering.reverse()
-            } else {
-                ordering
-            };
-            ordering
-                .then_with(|| left.subject.cmp(&right.subject))
-                .then_with(|| left.predicate.cmp(&right.predicate))
-                .then_with(|| left.value.cmp(&right.value))
-        });
+        let skipped = sort_rows_by_quantity(&mut frame.rows, &sort, knowledge);
         frame.selected =
             old_selection.and_then(|selected| frame.rows.iter().position(|row| *row == selected));
         if let Some(selected) = frame.selected {
@@ -623,7 +811,12 @@ impl QueryBoard {
             frame.page = 0;
         }
         frame.op = "sort".to_string();
-        frame.program = format!("{} · {}", frame.program, sort.describe());
+        let note = if skipped > 0 {
+            format!(" · {} 行量纲不同或非数值，未参与数值排序", skipped)
+        } else {
+            String::new()
+        };
+        frame.program = format!("{} · {}{}", frame.program, sort.describe(), note);
         let text = render_frame(&frame, revision);
         let provenance = provenance_for(&frame, frame.selected_row());
         let focus = frame.selected_row().map(|row| row.subject.clone());
@@ -964,7 +1157,7 @@ fn render_frame(frame: &BoardFrame, revision: u64) -> String {
 fn render_comparison(
     left: &QueryRow,
     right: &QueryRow,
-    knowledge: &dyn DialogueKnowledge,
+    _knowledge: &dyn DialogueKnowledge,
 ) -> String {
     let mut output = format!(
         "对比「{}」与「{}」的 {}：\n  {}：{}\n  {}：{}",
@@ -976,33 +1169,53 @@ fn render_comparison(
         right.subject,
         right.value
     );
-    match (quantity(&left.value), quantity(&right.value)) {
-        (Some((left_value, left_unit)), Some((right_value, right_unit)))
-            if left_unit == right_unit =>
-        {
-            let difference = left_value - right_value;
-            if difference.abs() < f64::EPSILON {
-                output.push_str("\n  两者数值相同。");
+    let (Some(left_quantity), Some(right_quantity)) = (
+        quantity::parse_quantity(&left.value),
+        quantity::parse_quantity(&right.value),
+    ) else {
+        output.push_str("\n  数值不可比较（至少一侧不是数值）。");
+        return output;
+    };
+    match left_quantity.compare(&right_quantity) {
+        Comparison::Equal => output.push_str("\n  两者数值相同。"),
+        Comparison::Less | Comparison::Greater => {
+            let word = left_quantity
+                .dimension()
+                .comparative_word(&left.predicate);
+            let difference = left_quantity
+                .difference(&right_quantity)
+                .map(|value| value.abs())
+                .unwrap_or_default();
+            let unit = if left_quantity.dimension() == Dimension::Count
+                && !left_quantity.has_unit()
+            {
+                ""
             } else {
-                let direction = if difference > 0.0 { "高" } else { "低" };
-                output.push_str(&format!(
-                    "\n  「{}」比「{}」{} {}{}。",
-                    left.subject,
-                    right.subject,
-                    direction,
-                    format_number(difference.abs()),
-                    left_unit
-                ));
-            }
+                left_quantity.dimension().canonical_unit()
+            };
+            let direction_word = match left_quantity.compare(&right_quantity) {
+                Comparison::Greater => word,
+                _ => comparison_lower_word(word),
+            };
+            output.push_str(&format!(
+                "\n  「{}」比「{}」{} {}{}。",
+                left.subject,
+                right.subject,
+                direction_word,
+                quantity::format_number(difference),
+                unit
+            ));
         }
-        (Some(_), Some(_)) => {
-            output.push_str("\n  两者单位不同，无法直接相减；上面分别保留了原始取值。");
-        }
-        _ => {
-            output.push_str("\n  数值不可比较（至少一侧不是数值）。");
+        Comparison::Uncertain => output.push_str(
+            "\n  约数区间重叠，无法确定谁更大；上面分别保留了原始取值。",
+        ),
+        Comparison::Incomparable(reason) => {
+            output.push_str(&format!(
+                "\n  两者单位不同（{}），无法直接相减；上面分别保留了原始取值。",
+                reason.describe()
+            ));
         }
     }
-    let _ = knowledge;
     output
 }
 
@@ -1023,7 +1236,7 @@ enum FilterSpec {
     Numeric {
         column: Option<String>,
         op: CompareOp,
-        threshold: f64,
+        threshold: Quantity,
     },
 }
 
@@ -1039,7 +1252,7 @@ impl FilterSpec {
                 "{} {} {}",
                 column.as_deref().unwrap_or("数值"),
                 op.label(),
-                format_number(*threshold)
+                threshold.raw()
             ),
         }
     }
@@ -1055,13 +1268,16 @@ enum CompareOp {
 }
 
 impl CompareOp {
-    fn apply(self, left: f64, right: f64) -> bool {
-        match self {
-            CompareOp::Lt => left < right,
-            CompareOp::Le => left <= right,
-            CompareOp::Gt => left > right,
-            CompareOp::Ge => left >= right,
-            CompareOp::Eq => (left - right).abs() < f64::EPSILON,
+    /// 只接受确定的同量纲比较；`Uncertain`/`Incomparable` 一律不命中，
+    /// 避免「约值区间重叠」被当成严格大于。
+    fn matches(self, comparison: Comparison) -> bool {
+        match (self, comparison) {
+            (CompareOp::Lt, Comparison::Less) => true,
+            (CompareOp::Le, Comparison::Less | Comparison::Equal) => true,
+            (CompareOp::Gt, Comparison::Greater) => true,
+            (CompareOp::Ge, Comparison::Greater | Comparison::Equal) => true,
+            (CompareOp::Eq, Comparison::Equal) => true,
+            (_, _) => false,
         }
     }
 
@@ -1096,6 +1312,350 @@ impl SortSpec {
     }
 }
 
+/// 极值/排名请求：属性可省略，方向与条数显式。
+#[derive(Debug, Clone)]
+struct ExtremeSpec {
+    attribute: Option<String>,
+    descending: bool,
+    limit: usize,
+}
+
+fn describe_rank(
+    attribute: &str,
+    descending: bool,
+    skipped: usize,
+    knowledge: &dyn DialogueKnowledge,
+) -> String {
+    let label = knowledge.predicate_label(attribute);
+    let direction = if descending {
+        "从高到低"
+    } else {
+        "从低到高"
+    };
+    let note = if skipped > 0 {
+        format!(" · {} 行量纲不同或非数值，未参与排名", skipped)
+    } else {
+        String::new()
+    };
+    format!("排名：{}（{}）{}", label, direction, note)
+}
+
+/// 比较级里「更低」的用词。`矮` 只用于「谁最矮」，差值句习惯说「低」。
+fn comparison_lower_word(positive: &str) -> &'static str {
+    match positive {
+        "高" => "低",
+        "重" => "轻",
+        "大" => "小",
+        "多" => "少",
+        "长" => "短",
+        "远" => "近",
+        "快" => "慢",
+        "年长" => "年轻",
+        "久" => "短",
+        _ => "小",
+    }
+}
+
+fn superlative_word(dimension: Dimension, attribute: &str, descending: bool) -> &'static str {
+    let positive = dimension.comparative_word(attribute);
+    if descending {
+        return positive;
+    }
+    match positive {
+        "高" => "矮",
+        "重" => "轻",
+        "大" => "小",
+        "多" => "少",
+        "长" => "短",
+        "远" => "近",
+        "快" => "慢",
+        "年长" => "年轻",
+        "久" => "短",
+        _ => "小",
+    }
+}
+
+/// 生成排名结论。每一行都绑定原始取值；约数区间重叠时明确说「不确定」。
+fn rank_summary(
+    rows: &[QueryRow],
+    limit: usize,
+    attribute: &str,
+    descending: bool,
+    knowledge: &dyn DialogueKnowledge,
+) -> String {
+    let label = knowledge.predicate_label(attribute);
+    let Some(first) = rows.first() else {
+        return format!("没有可用于排名的「{}」记录。", label);
+    };
+    let Some(first_quantity) = quantity::parse_quantity(&first.value) else {
+        return format!("「{}」的取值不是数值，无法排名。", label);
+    };
+    let word = superlative_word(first_quantity.dimension(), &label, descending);
+    let limit = limit.max(1);
+
+    if limit == 1 {
+        let mut cohort = vec![first];
+        let mut uncertain = false;
+        for row in rows.iter().skip(1) {
+            let Some(quantity) = quantity::parse_quantity(&row.value) else {
+                break;
+            };
+            match first_quantity.compare(&quantity) {
+                Comparison::Equal => cohort.push(row),
+                Comparison::Uncertain => {
+                    cohort.push(row);
+                    uncertain = true;
+                }
+                _ => break,
+            }
+        }
+        if uncertain {
+            let names: Vec<&str> = cohort.iter().map(|row| row.subject.as_str()).collect();
+            return format!(
+                "「{}」的「{}」约数区间重叠，无法确定谁最{}。",
+                names.join("」「"),
+                label,
+                word
+            );
+        }
+        if cohort.len() > 1 {
+            let names: Vec<&str> = cohort.iter().map(|row| row.subject.as_str()).collect();
+            let values: Vec<&str> = cohort.iter().map(|row| row.value.as_str()).collect();
+            return format!(
+                "「{}」并列最{}（{}）。",
+                names.join("」「"),
+                word,
+                values.join("、")
+            );
+        }
+        return format!(
+            "「{}」的「{}」最{}（{}）。",
+            first.subject, label, word, first.value
+        );
+    }
+
+    let mut output = format!(
+        "按「{}」{}的前{}名：",
+        label,
+        if descending {
+            "从高到低"
+        } else {
+            "从低到高"
+        },
+        limit
+    );
+    let mut rank = 1;
+    let mut previous: Option<Quantity> = None;
+    for (index, row) in rows.iter().take(limit).enumerate() {
+        let quantity = quantity::parse_quantity(&row.value);
+        let (shown_rank, tied, uncertain) = match (previous.as_ref(), quantity.as_ref()) {
+            (Some(previous), Some(quantity)) => match previous.compare(quantity) {
+                Comparison::Equal => (rank, true, false),
+                Comparison::Uncertain => (rank, true, true),
+                _ => {
+                    rank = index + 1;
+                    (rank, false, false)
+                }
+            },
+            _ => (index + 1, false, false),
+        };
+        let marker = if uncertain {
+            "（约数，不确定）"
+        } else if tied {
+            "（并列）"
+        } else {
+            ""
+        };
+        output.push_str(&format!(
+            "\n  {}. {}{}（{}）",
+            shown_rank, row.subject, marker, row.value
+        ));
+        previous = quantity;
+    }
+    output
+}
+
+/// 把「身高」这类短答解析成图谱中的谓词键；找不到就返回 None。
+fn resolve_attribute_hint(text: &str, knowledge: &dyn DialogueKnowledge) -> Option<String> {
+    let cleaned = text.trim_matches(|ch: char| {
+        matches!(ch, '。' | '，' | ',' | '！' | '!' | '？' | '?' | ' ' | '的')
+    });
+    if cleaned.is_empty() {
+        return None;
+    }
+    let mut attributes: BTreeMap<String, String> = BTreeMap::new();
+    for entity in knowledge.all_entities() {
+        for (key, _) in knowledge.entity_attributes(&entity) {
+            attributes
+                .entry(key.clone())
+                .or_insert_with(|| knowledge.predicate_label(&key));
+        }
+        for (key, _) in knowledge.entity_relations(&entity) {
+            attributes
+                .entry(key.clone())
+                .or_insert_with(|| knowledge.predicate_label(&key));
+        }
+    }
+    if let Some(canonical) = knowledge.canonical_predicate(cleaned) {
+        if attributes.contains_key(&canonical) {
+            return Some(canonical);
+        }
+    }
+    for (key, label) in &attributes {
+        if key == cleaned || label == cleaned || cleaned.contains(label.as_str()) {
+            return Some(key.clone());
+        }
+    }
+    None
+}
+
+fn has_rank_interrogative(text: &str) -> bool {
+    ["谁", "哪个", "哪个人", "哪位", "哪些", "什么"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+fn parse_extreme(text: &str, board_active: bool) -> Option<ExtremeSpec> {
+    if let Some((limit, attribute)) = parse_top_n(text) {
+        return Some(ExtremeSpec {
+            attribute,
+            descending: true,
+            limit,
+        });
+    }
+    let position = text.find('最')?;
+    let after = &text[position + '最'.len_utf8()..];
+    let (descending, consumed) = if after.starts_with("年长") {
+        (true, "年长".len())
+    } else if after.starts_with("年轻") {
+        (false, "年轻".len())
+    } else {
+        let character = after.chars().next()?;
+        let descending = match character {
+            '高' | '大' | '重' | '多' | '长' | '远' | '快' | '强' | '贵' | '早' | '深'
+            | '厚' | '宽' => true,
+            '矮' | '小' | '轻' | '少' | '短' | '近' | '慢' | '弱' | '晚' | '浅' | '薄'
+            | '窄' | '便' => false,
+            _ => return None,
+        };
+        (descending, character.len_utf8())
+    };
+    if !board_active && !has_rank_interrogative(text) {
+        return None;
+    }
+
+    let mut candidate = text[..position].trim();
+    while let Some(stripped) = candidate.strip_suffix('的') {
+        candidate = stripped.trim_end();
+    }
+    for marker in ["请问", "那么", "到底", "究竟", "帮我看看", "看看"] {
+        if let Some(stripped) = candidate.strip_prefix(marker) {
+            candidate = stripped.trim_start();
+        }
+    }
+    for marker in [
+        "哪几个人",
+        "哪个人",
+        "哪一位",
+        "哪几个",
+        "哪位",
+        "哪个",
+        "谁",
+        "什么",
+    ] {
+        while let Some(stripped) = candidate.strip_prefix(marker) {
+            candidate = stripped.trim_start_matches(['的', ' ']).trim();
+        }
+    }
+    let attribute = if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    };
+    let limit = parse_rank_limit(&after[consumed..]).unwrap_or(1);
+    Some(ExtremeSpec {
+        attribute,
+        descending,
+        limit,
+    })
+}
+
+fn parse_top_n(text: &str) -> Option<(usize, Option<String>)> {
+    let position = text.find('前')?;
+    let after = &text[position + '前'.len_utf8()..];
+    let (limit, consumed) = leading_count(after)?;
+    let suffix = &after[consumed..];
+    if !(suffix.is_empty()
+        || suffix.starts_with(['名', '个', '位', '条', '项', '种', '人', '是']))
+    {
+        return None;
+    }
+    let mut candidate = text[..position].trim();
+    while let Some(stripped) = candidate.strip_suffix('的') {
+        candidate = stripped.trim_end();
+    }
+    for marker in ["哪几个人", "哪个人", "哪一位", "哪几个", "哪位", "哪个", "谁"] {
+        while let Some(stripped) = candidate.strip_prefix(marker) {
+            candidate = stripped.trim_start_matches(['的', ' ']).trim();
+        }
+    }
+    let attribute = if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    };
+    Some((limit, attribute))
+}
+
+fn parse_rank_limit(after: &str) -> Option<usize> {
+    let rest = after.trim_start_matches(['的', ' ']);
+    let (limit, consumed) = leading_count(rest)?;
+    let suffix = &rest[consumed..];
+    if suffix.starts_with(['个', '名', '位', '条', '项', '种', '人']) {
+        Some(limit)
+    } else {
+        None
+    }
+}
+
+fn leading_count(text: &str) -> Option<(usize, usize)> {
+    let mut end = 0;
+    for (index, character) in text.char_indices() {
+        let is_number = character.is_ascii_digit()
+            || matches!(
+                character,
+                '零' | '〇'
+                    | '一'
+                    | '二'
+                    | '两'
+                    | '三'
+                    | '四'
+                    | '五'
+                    | '六'
+                    | '七'
+                    | '八'
+                    | '九'
+                    | '十'
+                    | '百'
+                    | '千'
+            );
+        if is_number {
+            end = index + character.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let quantity = quantity::parse_quantity(&text[..end])?;
+    let value = quantity.base_value();
+    if value <= 0.0 || value.fract().abs() > 1e-9 || value > 100.0 {
+        return None;
+    }
+    Some((value as usize, end))
+}
+
 fn sort_value(row: &QueryRow, sort: &SortSpec, _knowledge: &dyn DialogueKnowledge) -> String {
     if let Some(column) = &sort.column {
         if row.predicate.contains(column) || column.contains(row.predicate.as_str()) {
@@ -1105,14 +1665,38 @@ fn sort_value(row: &QueryRow, sort: &SortSpec, _knowledge: &dyn DialogueKnowledg
     row.value.clone()
 }
 
-fn compare_values(left: &str, right: &str) -> Ordering {
-    match (numeric_value(left), numeric_value(right)) {
-        (Some(left), Some(right)) => left
-            .partial_cmp(&right)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.to_string().cmp(&right.to_string())),
-        _ => left.cmp(right),
+/// 按数量语义排序：同量纲内换算后比较，跨量纲/非数值行显式排到末尾。
+///
+/// 返回未参与数值排序的行数，调用方把它写进程序描述，避免「看起来排过序」
+/// 却把不可比值混进名次。
+fn sort_rows_by_quantity(
+    rows: &mut Vec<QueryRow>,
+    sort: &SortSpec,
+    knowledge: &dyn DialogueKnowledge,
+) -> usize {
+    let mut parsed: Vec<(QueryRow, Quantity)> = Vec::new();
+    let mut unparsed: Vec<QueryRow> = Vec::new();
+    for row in rows.drain(..) {
+        let raw = sort_value(&row, sort, knowledge);
+        match quantity::parse_quantity(&raw) {
+            Some(value) => parsed.push((row, value)),
+            None => unparsed.push(row),
+        }
     }
+    let outcome = quantity::rank(
+        parsed,
+        &RankSpec {
+            descending: sort.descending,
+            offset: 0,
+            limit: usize::MAX,
+        },
+    );
+    let skipped = outcome.skipped.len() + unparsed.len();
+    let mut sorted: Vec<QueryRow> = outcome.entries.into_iter().map(|entry| entry.item).collect();
+    sorted.extend(outcome.skipped);
+    sorted.extend(unparsed);
+    *rows = sorted;
+    skipped
 }
 
 fn clean(input: &str) -> String {
@@ -1153,6 +1737,8 @@ fn is_explain(text: &str) -> bool {
         "来源是什么",
         "怎么得出",
         "根据什么",
+        "为什么",
+        "凭什么",
     ]
     .iter()
     .any(|marker| text.contains(marker))
@@ -1483,7 +2069,7 @@ fn parse_numeric_filter(text: &str) -> Option<FilterSpec> {
     ];
     for (marker, op) in OPERATORS {
         if let Some((column, value)) = text.split_once(marker) {
-            if let Some(threshold) = numeric_value(value) {
+            if let Some(threshold) = quantity::parse_quantity(value) {
                 let column = column
                     .trim()
                     .trim_end_matches('的')
@@ -1507,7 +2093,7 @@ fn parse_numeric_filter(text: &str) -> Option<FilterSpec> {
         ("=", CompareOp::Eq),
     ] {
         if let Some((column, value)) = text.split_once(marker) {
-            if let Some(threshold) = numeric_value(value) {
+            if let Some(threshold) = quantity::parse_quantity(value) {
                 let column = column.trim().trim_end_matches('的').trim();
                 return Some(FilterSpec::Numeric {
                     column: if column.is_empty() {
@@ -1598,7 +2184,32 @@ fn parse_ordinal(text: &str) -> Option<usize> {
     let rest = &text[index + '第'.len_utf8()..];
     let digits: String = rest
         .chars()
-        .take_while(|c| !matches!(c, '个' | '条' | '行' | '位' | '页' | '呢' | '的' | ' '))
+        .take_while(|c| {
+            !matches!(
+                c,
+                '个' | '条'
+                    | '行'
+                    | '位'
+                    | '页'
+                    | '呢'
+                    | '的'
+                    | ' '
+                    | '高'
+                    | '矮'
+                    | '大'
+                    | '小'
+                    | '重'
+                    | '轻'
+                    | '多'
+                    | '少'
+                    | '长'
+                    | '短'
+                    | '远'
+                    | '近'
+                    | '快'
+                    | '慢'
+            )
+        })
         .collect();
     chinese_number(digits.trim()).map(|ordinal| ordinal.saturating_sub(1))
 }
@@ -1709,91 +2320,6 @@ fn chinese_number(raw: &str) -> Option<usize> {
         return None;
     }
     Some(total + current)
-}
-
-fn numeric_value(raw: &str) -> Option<f64> {
-    let text = raw.trim();
-    let mut number = String::new();
-    let mut started = false;
-    for (index, character) in text.char_indices() {
-        let is_sign = matches!(character, '-' | '+') && !started && index == 0;
-        if character.is_ascii_digit() || character == '.' || is_sign {
-            number.push(character);
-            if character.is_ascii_digit() {
-                started = true;
-            }
-        } else if started {
-            break;
-        }
-    }
-    let value: f64 = number.parse().ok()?;
-    if text.contains('万') {
-        Some(value * 10_000.0)
-    } else if text.contains('亿') {
-        Some(value * 100_000_000.0)
-    } else {
-        Some(value)
-    }
-}
-
-fn quantity(raw: &str) -> Option<(f64, String)> {
-    let value = numeric_value(raw)?;
-    let unit = numeric_unit(raw).unwrap_or_default();
-    let (value, unit) = match unit.as_str() {
-        "" => (value, String::new()),
-        "cm" | "厘米" => (value * 0.01, "米".to_string()),
-        "mm" | "毫米" => (value * 0.001, "米".to_string()),
-        "m" | "米" | "公尺" => (value, "米".to_string()),
-        "km" | "千米" | "公里" => (value * 1000.0, "米".to_string()),
-        "kg" | "公斤" | "千克" => (value, "千克".to_string()),
-        "g" | "克" => (value * 0.001, "千克".to_string()),
-        "斤" => (value * 0.5, "千克".to_string()),
-        _ => (value, unit.clone()),
-    };
-    Some((value, unit))
-}
-
-fn numeric_unit(raw: &str) -> Option<String> {
-    let text = raw.trim();
-    let mut number = String::new();
-    let mut started = false;
-    let mut unit = String::new();
-    for (index, character) in text.char_indices() {
-        let is_sign = matches!(character, '-' | '+') && !started && index == 0;
-        if character.is_ascii_digit() || character == '.' || is_sign {
-            number.push(character);
-            if character.is_ascii_digit() {
-                started = true;
-            }
-        } else if started {
-            if character == '万' || character == '亿' {
-                continue;
-            }
-            if !character.is_whitespace() {
-                unit.push(character);
-            }
-        }
-    }
-    if unit.is_empty() {
-        Some(String::new())
-    } else {
-        Some(unit)
-    }
-}
-
-fn format_number(value: f64) -> String {
-    if (value - value.round()).abs() < 1e-9 {
-        format!("{}", value.round() as i64)
-    } else {
-        let mut text = format!("{:.2}", value);
-        while text.ends_with('0') {
-            text.pop();
-        }
-        if text.ends_with('.') {
-            text.pop();
-        }
-        text
-    }
 }
 
 #[cfg(test)]
@@ -2100,25 +2626,152 @@ mod tests {
 
     #[test]
     fn compare_op_matches_thresholds() {
-        assert!(CompareOp::Gt.apply(2.0, 1.0));
-        assert!(CompareOp::Le.apply(1.0, 1.0));
-        assert!(CompareOp::Eq.apply(1.0, 1.0));
+        assert!(CompareOp::Gt.matches(Comparison::Greater));
+        assert!(CompareOp::Le.matches(Comparison::Equal));
+        assert!(CompareOp::Eq.matches(Comparison::Equal));
+        assert!(!CompareOp::Gt.matches(Comparison::Uncertain));
+        assert!(!CompareOp::Ge.matches(Comparison::Incomparable(
+            crate::quantity::Incomparable::NotAQuantity
+        )));
     }
 
     #[test]
     fn quantity_normalizes_common_units_and_refuses_mixed_units() {
-        let (left, left_unit) = quantity("2.26米").unwrap();
-        let (right, right_unit) = quantity("226厘米").unwrap();
-        assert_eq!(left_unit, right_unit);
-        assert!((left - right).abs() < 1e-9);
+        let left = quantity::parse_quantity("2.26米").unwrap();
+        let right = quantity::parse_quantity("226厘米").unwrap();
+        assert_eq!(left.dimension(), right.dimension());
+        assert!((left.base_value() - right.base_value()).abs() < 1e-9);
 
-        let (weight, weight_unit) = quantity("100斤").unwrap();
-        assert_eq!(weight_unit, "千克");
-        assert!((weight - 50.0).abs() < 1e-9);
+        let weight = quantity::parse_quantity("100斤").unwrap();
+        assert_eq!(weight.dimension(), Dimension::Mass);
+        assert!((weight.base_value() - 50.0).abs() < 1e-9);
 
         let left = QueryRow::new("甲", "身高", "226");
         let right = QueryRow::new("乙", "身高", "2.26米");
         let text = render_comparison(&left, &right, &TestKnowledge::new());
         assert!(text.contains("单位不同"));
+    }
+
+    #[test]
+    fn sort_uses_unit_conversion_not_raw_numbers() {
+        let mut knowledge = TestKnowledge::new();
+        for (entity, value) in [
+            ("姚明", "2.26米"),
+            ("王治郅", "214厘米"),
+            ("易建联", "2.13米"),
+            ("诺维茨基", "2.13米"),
+            ("加索尔", "2.16米"),
+            ("奥尼尔", "2.16米"),
+        ] {
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![("身高".to_string(), value.to_string())],
+            );
+        }
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        board.apply("按身高从高到低排", &knowledge, 7).unwrap();
+        let frame = board.current().unwrap();
+        assert_eq!(frame.rows.first().unwrap().subject, "姚明");
+        assert_eq!(frame.rows.get(1).unwrap().subject, "加索尔");
+        let values: Vec<f64> = frame
+            .rows
+            .iter()
+            .map(|row| quantity::parse_quantity(&row.value).unwrap().base_value())
+            .collect();
+        assert!(
+            values.windows(2).all(|pair| pair[0] >= pair[1]),
+            "换算后应按米降序：{:?}",
+            values
+        );
+        assert!((values.last().copied().unwrap() - 2.13).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rank_answers_who_is_highest_and_second_highest() {
+        let knowledge = TestKnowledge::new();
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        let highest = board.apply("谁最高", &knowledge, 7).expect("应回答最高者");
+        assert!(highest.text.contains("姚明"), "{}", highest.text);
+        assert!(highest.text.contains("最"), "{}", highest.text);
+        assert!(highest
+            .provenance
+            .iter()
+            .any(|note| note.contains("226")));
+        assert!(matches!(
+            board.current().unwrap().source,
+            QuerySource::Rank {
+                descending: true,
+                ..
+            }
+        ));
+
+        let second = board.apply("第二高呢", &knowledge, 7).unwrap();
+        assert_eq!(
+            board
+                .current()
+                .and_then(|frame| frame.selected_row())
+                .map(|row| row.subject.as_str()),
+            Some("加索尔")
+        );
+        assert!(second.text.contains("当前选中"));
+
+        let top3 = board.apply("前三名", &knowledge, 7).unwrap();
+        assert!(top3.text.contains("姚明"), "{}", top3.text);
+        assert!(top3.text.contains("加索尔"), "{}", top3.text);
+        assert!(top3.text.contains("王治郅"), "{}", top3.text);
+
+        let why = board.apply("为什么姚明最高", &knowledge, 7).unwrap();
+        assert!(why.text.contains("证据"), "{}", why.text);
+    }
+
+    #[test]
+    fn rank_without_attribute_asks_once_then_resolves_short_answer() {
+        let knowledge = TestKnowledge::new();
+        let mut board = board();
+        let pending = board.apply("谁最高", &knowledge, 7).expect("应发起属性澄清");
+        assert!(pending.text.contains("哪个属性"), "{}", pending.text);
+        assert!(matches!(
+            board.current().unwrap().source,
+            QuerySource::RankPending { descending: true }
+        ));
+
+        let resolved = board
+            .apply("身高", &knowledge, 7)
+            .expect("短答属性应完成排名");
+        assert!(resolved.text.contains("姚明"), "{}", resolved.text);
+        assert!(matches!(
+            board.current().unwrap().source,
+            QuerySource::Rank { .. }
+        ));
+    }
+
+    #[test]
+    fn rank_skips_cross_dimension_values() {
+        let mut knowledge = TestKnowledge::new();
+        for (entity, value) in [
+            ("姚明", "2.26米"),
+            ("王治郅", "67万平方公里"),
+            ("易建联", "2.13米"),
+            ("诺维茨基", "2.13米"),
+            ("加索尔", "2.16米"),
+            ("奥尼尔", "2.16米"),
+        ] {
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![("身高".to_string(), value.to_string())],
+            );
+        }
+        let mut board = board();
+        board.apply("列出所有人的身高", &knowledge, 7).unwrap();
+        let outcome = board.apply("谁最高", &knowledge, 7).unwrap();
+        assert!(outcome.text.contains("姚明"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("未参与排名"),
+            "跨量纲行必须显式说明：{}",
+            outcome.text
+        );
+        assert_eq!(board.current().unwrap().rows.first().unwrap().subject, "姚明");
     }
 }

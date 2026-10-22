@@ -19,6 +19,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::quantity::{self, Comparison, Quantity};
+
 /// 类型化绑定值。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -75,10 +77,25 @@ impl BoundTerm {
     }
 
     /// 数值视图：`Number` 直接给出，可解析为有限数值的 `Text` 也给数值。
+    ///
+    /// 这里只返回裸数值，不负责单位换算；带单位的比较请用
+    /// [`BoundTerm::quantity`] / [`compare_quantity`]。
     pub fn numeric_value(&self) -> Option<f64> {
         match self {
             BoundTerm::Number { value, .. } => Some(*value),
             BoundTerm::Text { raw } => raw.parse::<f64>().ok().filter(|value| value.is_finite()),
+            _ => None,
+        }
+    }
+
+    /// 数量视图：把 `Number` 或 `Text` 交给统一的 [`quantity::parse_quantity`]。
+    ///
+    /// `"226 厘米"` 这类绑定不再是「文本」，而是「长度 2.26 米」。
+    pub fn quantity(&self) -> Option<Quantity> {
+        match self {
+            BoundTerm::Number { raw, .. } | BoundTerm::Text { raw } => {
+                quantity::parse_quantity(raw)
+            }
             _ => None,
         }
     }
@@ -198,14 +215,20 @@ impl From<&BTreeMap<String, String>> for BindingSet {
     }
 }
 
-/// 数值比较：两侧都拿到数值时给出 `Ordering`，否则 `None`
+/// 数量比较：同量纲内换算后给出三值结果；跨量纲、缺单位歧义或约数
+/// 区间重叠时返回 [`Comparison::Uncertain`] / [`Comparison::Incomparable`]，
+/// 调用方必须显式处理，不能退化成字典序。
+pub fn compare_quantity(left: &BoundTerm, right: &BoundTerm) -> Comparison {
+    match (left.quantity(), right.quantity()) {
+        (Some(left), Some(right)) => left.compare(&right),
+        _ => Comparison::Incomparable(crate::quantity::Incomparable::NotAQuantity),
+    }
+}
+
+/// 数值比较：只在数量语义给出确定序时返回 `Ordering`，否则 `None`
 /// （「姚明和叶莉谁更高」这类问题的最小可组合原语）。
 pub fn compare_numeric(left: &BoundTerm, right: &BoundTerm) -> Option<std::cmp::Ordering> {
-    left.numeric_value().and_then(|a| {
-        right
-            .numeric_value()
-            .map(|b| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal))
-    })
+    compare_quantity(left, right).ordering()
 }
 
 /// 由变量名和可选值构造绑定（`None` / 隐式未绑定串 → [`BoundTerm::Unbound`]）。
@@ -264,6 +287,42 @@ mod tests {
         // 字符串字典序会给出错误答案，数值比较不会
         assert!(compare_numeric(&short, &tall) == Some(std::cmp::Ordering::Less));
         assert_eq!(compare_numeric(&BoundTerm::text("张三"), &tall), None);
+    }
+
+    #[test]
+    fn quantity_compare_normalizes_units_and_refuses_cross_dimension() {
+        // 真实知识库写作「226 厘米」，旧 classify 会把它当文本而失配。
+        let tall = BoundTerm::classify("226 厘米");
+        let short = BoundTerm::classify("1.90 米");
+        assert_eq!(
+            compare_quantity(&tall, &short),
+            Comparison::Greater,
+            "226 厘米应高于 1.90 米"
+        );
+        assert_eq!(
+            compare_quantity(
+                &BoundTerm::classify("2.26米"),
+                &BoundTerm::classify("226厘米")
+            ),
+            Comparison::Equal
+        );
+
+        // 跨量纲不可比：不能按 670000 > 8848 判「面积大于高度」。
+        let area = BoundTerm::classify("67万平方公里");
+        let height = BoundTerm::classify("8848米");
+        assert!(matches!(
+            compare_quantity(&area, &height),
+            Comparison::Incomparable(_)
+        ));
+        assert_eq!(compare_numeric(&area, &height), None);
+    }
+
+    #[test]
+    fn approximate_quantity_is_uncertain_not_a_fake_winner() {
+        let exact = BoundTerm::classify("46亿年");
+        let approximate = BoundTerm::classify("约46亿年");
+        assert_eq!(compare_quantity(&exact, &approximate), Comparison::Uncertain);
+        assert_eq!(compare_numeric(&exact, &approximate), None);
     }
 
     #[test]
