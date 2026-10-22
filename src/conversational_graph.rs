@@ -479,6 +479,27 @@ impl<'a> GraphIndex<'a> {
             .map(Vec::len)
             .unwrap_or(0)
     }
+    /// 指定主语/谓词下出现过的宾语（去重、稳定排序）。
+    pub fn objects_for(&self, subject: &str, predicate: &str) -> Vec<&str> {
+        let mut values: BTreeSet<&str> = BTreeSet::new();
+        if let Some(indices) = self.by_sp.get(&(subject, predicate)) {
+            for index in indices {
+                values.insert(self.facts[*index].object.as_str());
+            }
+        }
+        values.into_iter().collect()
+    }
+
+    /// 指定谓词/宾语下出现过的主语（去重、稳定排序）。
+    pub fn subjects_for(&self, predicate: &str, object: &str) -> Vec<&str> {
+        let mut values: BTreeSet<&str> = BTreeSet::new();
+        if let Some(indices) = self.by_po.get(&(predicate, object)) {
+            for index in indices {
+                values.insert(self.facts[*index].subject.as_str());
+            }
+        }
+        values.into_iter().collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
