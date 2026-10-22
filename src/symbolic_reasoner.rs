@@ -5198,6 +5198,55 @@ impl SymbolicReasoner {
         self.completion.render_rules()
     }
 
+    pub fn completion_regression_report(&self) -> String {
+        self.completion.render_regression_report()
+    }
+
+    /// 把恢复阶梯（或宿主脚本）的一次用户裁决写入补全台账。
+    ///
+    /// 若该三元组可由链接预测解释，就把预测规则一并登记；确认会归纳出
+    /// 本批规则，否决会进入全局拒绝集。只写会话台账，不写知识图谱。
+    pub fn note_dialogue_verdict(
+        &mut self,
+        entity: &str,
+        attribute: &str,
+        value: &str,
+        confirmed: bool,
+        source_id: &str,
+    ) -> bool {
+        let triple = crate::link_prediction::Triple::new(entity, attribute, value);
+        if triple.subject.trim().is_empty()
+            || triple.predicate.trim().is_empty()
+            || triple.object.trim().is_empty()
+        {
+            return false;
+        }
+        let limit = self.config.max_predictions.saturating_mul(2).max(4);
+        let prediction = self
+            .predictor
+            .predict_for_entity(&triple.subject, Some(&triple.predicate), limit)
+            .into_iter()
+            .find(|prediction| prediction.triple == triple);
+        let (rule, evidence) = prediction
+            .map(|prediction| {
+                let rule = self
+                    .predictor
+                    .rules()
+                    .get(prediction.rule_index)
+                    .and_then(crate::completion_episode::RuleSpec::from_horn);
+                (rule, prediction.evidence)
+            })
+            .unwrap_or((None, Vec::new()));
+        self.completion.record_external_verdict(
+            triple,
+            confirmed,
+            rule,
+            evidence,
+            "恢复阶梯",
+            source_id,
+        )
+    }
+
     /// 导出四层知识容器清单：基础层 / 会话层 / 推测层 / 假设层。
     ///
     /// 每层只读当前状态，不做推理；摘要覆盖该层全量条目，样例有界。
@@ -5322,6 +5371,12 @@ impl SymbolicReasoner {
         if matches!(trimmed, "补全报告" | "补全回合报告" | "补全状态") {
             return Some(self.completion_report());
         }
+        if matches!(
+            trimmed,
+            "补全测试" | "补全回归" | "知识回归" | "补全测试报告"
+        ) {
+            return Some(self.completion_regression_report());
+        }
         for prefix in [
             "晋升补全规则：",
             "晋升补全规则:",
@@ -5399,6 +5454,9 @@ impl SymbolicReasoner {
             .predict_for_entity(entity, Some(attribute), limit)
         {
             if prediction.triple.subject != entity || prediction.triple.predicate != attribute {
+                continue;
+            }
+            if self.completion.is_adjudicated(&prediction.triple) {
                 continue;
             }
             nominations.push(crate::recovery::RecoveryNomination {
@@ -15640,6 +15698,75 @@ types = [
             .handle_completion_command("晋升补全规则：")
             .expect("空参数应给出用法")
             .contains("用法"));
+    }
+
+    #[test]
+    fn dialogue_verdict_feeds_completion_ledger_and_stops_renomination() {
+        let mut config = test_config();
+        config.link_prediction_min_confidence = 0.1;
+        let mut facts = master_facts();
+        for (from, to) in [
+            ("孙八", "周九"),
+            ("周九", "吴十"),
+            ("郑十一", "钱十二"),
+            ("钱十二", "孙十三"),
+        ] {
+            facts.push(PrologFact::Relation {
+                from: from.to_string(),
+                rel_type: "师傅".to_string(),
+                to: to.to_string(),
+            });
+        }
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        assert!(
+            reasoner
+                .recovery_nominations("孙八", "师祖")
+                .iter()
+                .any(|nomination| nomination.value == "吴十"),
+            "确认前应可提名吴十"
+        );
+        assert!(reasoner.note_dialogue_verdict(
+            "孙八",
+            "师祖",
+            "吴十",
+            true,
+            "receipt-1"
+        ));
+        assert_eq!(reasoner.completion_ledger().rules().len(), 1);
+        assert!(
+            reasoner
+                .recovery_nominations("孙八", "师祖")
+                .is_empty(),
+            "已确认的候选不应再次追问"
+        );
+        assert!(reasoner
+            .completion_regression_report()
+            .contains("确认 1"));
+        assert!(!reasoner.note_dialogue_verdict(
+            "孙八",
+            "师祖",
+            "吴十",
+            true,
+            "receipt-1"
+        ));
+
+        assert!(reasoner.note_dialogue_verdict(
+            "郑十一",
+            "师祖",
+            "孙十三",
+            false,
+            "receipt-2"
+        ));
+        assert!(
+            reasoner
+                .recovery_nominations("郑十一", "师祖")
+                .iter()
+                .all(|nomination| nomination.value != "孙十三"),
+            "已否决的候选不得再次提名"
+        );
+        assert!(reasoner.completion_regression_report().contains("驳回 1"));
     }
 
     #[test]

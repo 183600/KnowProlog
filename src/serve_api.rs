@@ -524,8 +524,27 @@ impl Session {
 
     /// 把对话层的确认/更正同步为推理前提（幂等；不写知识图谱）。
     fn sync_recovery_confirmed_facts(&mut self) -> usize {
-        let facts = self.manager.recovery_state().confirmed.clone();
-        facts
+        let state = self.manager.recovery_state().clone();
+        for fact in &state.confirmed {
+            self.reasoner.note_dialogue_verdict(
+                &fact.entity,
+                &fact.attribute,
+                &fact.value,
+                true,
+                &fact.receipt_id,
+            );
+        }
+        for candidate in &state.refuted {
+            self.reasoner.note_dialogue_verdict(
+                &candidate.entity,
+                &candidate.attribute,
+                &candidate.value,
+                false,
+                &candidate.receipt_id,
+            );
+        }
+        state
+            .confirmed
             .iter()
             .filter(|fact| {
                 self.reasoner

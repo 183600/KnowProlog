@@ -8336,8 +8336,26 @@ fn sync_recovery_confirmed_facts(
     dialogue_manager: &DialogueManager,
     reasoner: &mut SymbolicReasoner,
 ) -> usize {
-    dialogue_manager
-        .recovery_state()
+    let state = dialogue_manager.recovery_state();
+    for fact in &state.confirmed {
+        reasoner.note_dialogue_verdict(
+            &fact.entity,
+            &fact.attribute,
+            &fact.value,
+            true,
+            &fact.receipt_id,
+        );
+    }
+    for candidate in &state.refuted {
+        reasoner.note_dialogue_verdict(
+            &candidate.entity,
+            &candidate.attribute,
+            &candidate.value,
+            false,
+            &candidate.receipt_id,
+        );
+    }
+    state
         .confirmed
         .iter()
         .filter(|fact| reasoner.adopt_session_triple(&fact.entity, &fact.attribute, &fact.value))
