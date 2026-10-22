@@ -152,6 +152,7 @@ impl EdgePattern {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PatternConstraint {
     Equal { variable: String, value: String },
+    NotEqual { variable: String, value: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,15 +202,15 @@ impl GraphPattern {
             }
         }
         for constraint in &self.constraints {
-            match constraint {
-                PatternConstraint::Equal { variable, .. } => {
-                    if !variables.contains(variable.as_str()) {
-                        return Err(PatternError::UnknownVariable {
-                            name: variable.clone(),
-                            at: "等值约束".to_string(),
-                        });
-                    }
-                }
+            let (variable, at) = match constraint {
+                PatternConstraint::Equal { variable, .. } => (variable, "等值约束"),
+                PatternConstraint::NotEqual { variable, .. } => (variable, "排除约束"),
+            };
+            if !variables.contains(variable.as_str()) {
+                return Err(PatternError::UnknownVariable {
+                    name: variable.clone(),
+                    at: at.to_string(),
+                });
             }
         }
         let mut selected = BTreeSet::new();
@@ -251,10 +252,8 @@ impl GraphPattern {
         };
         let mut binding = BTreeMap::new();
         for constraint in &self.constraints {
-            match constraint {
-                PatternConstraint::Equal { variable, value } => {
-                    binding.insert(variable.clone(), value.clone());
-                }
+            if let PatternConstraint::Equal { variable, value } = constraint {
+                binding.insert(variable.clone(), value.clone());
             }
         }
         let remaining: Vec<usize> = (0..self.edges.len()).collect();
@@ -616,6 +615,17 @@ struct Evaluator<'a> {
 }
 
 impl<'a> Evaluator<'a> {
+    fn constraints_hold(&self, binding: &BTreeMap<String, String>) -> bool {
+        self.pattern.constraints.iter().all(|constraint| match constraint {
+            PatternConstraint::Equal { variable, value } => {
+                binding.get(variable) == Some(value)
+            }
+            PatternConstraint::NotEqual { variable, value } => {
+                binding.get(variable) != Some(value)
+            }
+        })
+    }
+
     fn search(
         &mut self,
         binding: BTreeMap<String, String>,
@@ -627,6 +637,9 @@ impl<'a> Evaluator<'a> {
             return;
         }
         if remaining.is_empty() {
+            if !self.constraints_hold(&binding) {
+                return;
+            }
             let row = self.project(&binding);
             if self.pattern.distinct && !self.seen.insert(row) {
                 return;
@@ -984,6 +997,16 @@ impl ConversationalGraph {
             }
             return Some(GraphCommand::DropLastConstraint);
         }
+        if let Some(target) = exclusion_target(text) {
+            let variable = self.focus_variable()?;
+            let (value, is_type) = lexicon.resolve_refinement(target)?;
+            if !is_type {
+                return Some(GraphCommand::AddConstraint(PatternConstraint::NotEqual {
+                    variable,
+                    value,
+                }));
+            }
+        }
         for prefix in ["只看", "只要", "限定", "仅看", "只保留"] {
             if let Some(rest) = text.strip_prefix(prefix) {
                 return self.refinement_command(rest, lexicon);
@@ -1040,6 +1063,35 @@ impl ConversationalGraph {
                     PatternTerm::Const(_) => None,
                 },
             })
+    }
+}
+
+fn exclusion_target(text: &str) -> Option<&str> {
+    let mut rest = None;
+    for prefix in ["除了", "除去", "排除", "不要", "不是"] {
+        if let Some(stripped) = text.strip_prefix(prefix) {
+            rest = Some(stripped.trim());
+            break;
+        }
+    }
+    let mut rest = rest?;
+    loop {
+        let before = rest;
+        rest = rest.trim_end_matches(['了', '的', '呢', '吧', '吗', ' ', '？', '?']);
+        for suffix in ["还有谁", "还有哪些", "还有别的", "还有", "其他", "其它"] {
+            if let Some(stripped) = rest.strip_suffix(suffix) {
+                rest = stripped.trim();
+                break;
+            }
+        }
+        if rest == before {
+            break;
+        }
+    }
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest)
     }
 }
 
@@ -1620,6 +1672,41 @@ mod tests {
             .edges
             .iter()
             .any(|edge| edge.predicate == "type" && edge.object == PatternTerm::constant("中国人")));
+    }
+
+    #[test]
+    fn interpret_exclusion_removes_entity_from_current_results() {
+        let facts = sample_facts();
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::var_const("person", "获奖", "金棕榈")],
+            vec!["person".to_string()],
+        );
+        let mut conversation =
+            ConversationalGraph::new(pattern, &facts, MatchOptions::default()).unwrap();
+        let lexicon = interpretation_lexicon();
+        let reduced = conversation
+            .interpret("除了张三还有谁", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(reduced, GraphReply::Changed { total: 2, .. }));
+        assert_eq!(conversation.pattern().constraints.len(), 1);
+        assert!(conversation
+            .pattern()
+            .constraints
+            .contains(&PatternConstraint::NotEqual {
+                variable: "person".to_string(),
+                value: "张三".to_string(),
+            }));
+        let outcome = conversation.outcome();
+        assert!(outcome
+            .solutions
+            .iter()
+            .all(|solution| solution.binding.get("person").map(String::as_str) != Some("张三")));
+        let restored = conversation
+            .interpret("撤回", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(restored, GraphReply::Changed { total: 3, .. }));
     }
 
     #[test]
