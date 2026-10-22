@@ -6819,7 +6819,14 @@ impl SymbolicReasoner {
             return "归结推理未启用（config.toml [reasoning] enable_resolution = false）。"
                 .to_string();
         }
-        let derived = self.resolver.forward_chain(3, 100);
+        // 报告与回答共用同一套可见性：被否定或被槽压制的推导不再作为
+        // 「推理发现」展示，否则用户会在报告里看到回答已经排除的幽灵结论。
+        let derived: Vec<DerivedFact> = self
+            .resolver
+            .forward_chain(3, 100)
+            .into_iter()
+            .filter(|fact| !self.derived_fact_is_blocked(fact))
+            .collect();
         let mut output = String::from("推理发现（前向饱和，多跳优先；均可回溯前提）：\n");
         output.push_str(&format!(
             "  现有 {} 条事实、{} 条规则，本轮推出 {} 条新事实。\n",
@@ -11880,7 +11887,12 @@ impl SymbolicReasoner {
             return Vec::new();
         }
         let fingerprint = self.rule_fingerprint();
-        let derived = self.resolver.forward_chain(3, 100);
+        let derived: Vec<DerivedFact> = self
+            .resolver
+            .forward_chain(3, 100)
+            .into_iter()
+            .filter(|fact| !self.derived_fact_is_blocked(fact))
+            .collect();
         let mut items: Vec<&DerivedFact> = derived.iter().collect();
         items.sort_by(|a, b| {
             b.depth
@@ -14106,6 +14118,12 @@ mod tests {
             .answer("张三的师祖是王五吗")
             .expect("已知实体与谓词应给出可读回答");
         assert!(!check.contains("是的"), "{}", check);
+        let report = reasoner.derived_facts_report(10);
+        assert!(
+            !report.contains("王五"),
+            "推理发现不应展示被否定前提推出的结论：{}",
+            report
+        );
     }
 
     #[test]
@@ -14155,6 +14173,13 @@ mod tests {
         );
         // 图谱本身没有被推导或改口改写。
         assert!(reasoner.predictor.has_triple("李四", "师傅", "王五"));
+        let report = reasoner.derived_facts_report(10);
+        assert!(
+            !report.contains("王五"),
+            "推理发现不应展示被槽压制的旧前提推出的结论：{}",
+            report
+        );
+        assert!(report.contains("赵六"), "{}", report);
     }
 
     #[test]
