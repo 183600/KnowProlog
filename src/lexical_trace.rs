@@ -1141,6 +1141,13 @@ pub struct LexCoverageGap {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexResolvedTerm {
+    pub text: String,
+    /// 离线准入的规范谓词链（「先生」→ [「配偶」]，「师祖」→ [「师傅」,「师傅」]）。
+    pub expansion: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LexicalCoverage {
     pub version: u32,
     /// 计划槽位中能在静态词表里找到定义的词数。
@@ -1149,6 +1156,9 @@ pub struct LexicalCoverage {
     pub introduced_terms: u64,
     /// 未被任何计划槽位消费的内容 token 数。
     pub unbound_tokens: u64,
+    /// 由离线定义准入解析掉的词面（仅 `--definitions` 时非空）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved: Vec<LexResolvedTerm>,
     pub gaps: Vec<LexCoverageGap>,
 }
 
@@ -1180,6 +1190,15 @@ impl LexicalCoverage {
             self.gaps.len(),
             self.blocking_count()
         )];
+        if !self.resolved.is_empty() {
+            let resolved = self
+                .resolved
+                .iter()
+                .map(|term| format!("{} → {}", term.text, term.expansion.join(" ∘ ")))
+                .collect::<Vec<_>>()
+                .join("；");
+            lines.push(format!("定义解析：{}。", resolved));
+        }
         if self.gaps.is_empty() {
             lines.push("覆盖结论：计划槽位均能在静态词表中找到定义。".to_string());
             return lines;
@@ -1213,6 +1232,8 @@ pub struct LexiconInventory {
     predicates: BTreeSet<String>,
     entities: BTreeSet<String>,
     types: BTreeSet<String>,
+    /// 离线准入的定义展开（surface -> 规范谓词链），来自 [`crate::lex_gate`]。
+    definitions: BTreeMap<String, Vec<String>>,
 }
 
 const QUESTION_MARKERS: [&str; 34] = [
@@ -1346,7 +1367,26 @@ impl LexiconInventory {
             predicates,
             entities,
             types,
+            definitions: BTreeMap::new(),
         }
+    }
+
+    /// 登记一条已通过准入的定义展开；surface 同时成为可识别的谓词词面。
+    pub fn insert_definition(&mut self, surface: &str, expansion: Vec<String>) {
+        let surface = surface.trim();
+        if surface.is_empty() || expansion.is_empty() {
+            return;
+        }
+        self.predicates.insert(surface.to_string());
+        self.definitions.insert(surface.to_string(), expansion);
+    }
+
+    pub fn definition_expansion(&self, term: &str) -> Option<&[String]> {
+        self.definitions.get(term.trim()).map(Vec::as_slice)
+    }
+
+    pub fn definition_count(&self) -> usize {
+        self.definitions.len()
     }
 
     pub fn predicate_count(&self) -> usize {
@@ -1449,6 +1489,7 @@ pub fn audit_lexical_coverage(
     let chars: Vec<char> = question.chars().collect();
     let mut used = vec![false; chars.len()];
     let mut gaps = Vec::new();
+    let mut resolved = Vec::new();
     let mut known_terms = 0u64;
     let mut introduced_terms = 0u64;
 
@@ -1457,6 +1498,12 @@ pub fn audit_lexical_coverage(
         let span = locate_term(&chars, predicate, &mut used);
         if inventory.is_predicate(predicate) {
             known_terms += 1;
+            if let Some(expansion) = inventory.definition_expansion(predicate) {
+                resolved.push(LexResolvedTerm {
+                    text: predicate.clone(),
+                    expansion: expansion.to_vec(),
+                });
+            }
             continue;
         }
         let Some(span) = span else {
@@ -1571,6 +1618,7 @@ pub fn audit_lexical_coverage(
         known_terms,
         introduced_terms,
         unbound_tokens,
+        resolved,
         gaps,
     }
 }
@@ -1711,6 +1759,17 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let inventory = LexiconInventory::from_config(config);
+    coverage_report_with_inventory(questions, &config.nlp, &inventory)
+}
+
+pub fn coverage_report_with_inventory<'a, I>(
+    questions: I,
+    nlp: &NlpConfig,
+    inventory: &LexiconInventory,
+) -> LexCoverageReport
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let planner = QueryPlanner::new();
     let mut questions_count = 0usize;
     let mut plan_ready = 0u64;
@@ -1729,19 +1788,25 @@ where
         let plan = planner.parse(question);
         let Some(plan) = plan else {
             plan_missing += 1;
-            let trace = trace_question(question, &config.nlp, None);
-            unknown_tokens += trace.unknown_tokens().count() as u64;
+            let trace = trace_question(question, nlp, None);
+            unknown_tokens += trace
+                .unknown_tokens()
+                .filter(|token| token.text.chars().any(char::is_alphanumeric))
+                .count() as u64;
             *reading_statuses
                 .entry(trace.reading.status().code().to_string())
                 .or_insert(0) += 1;
             continue;
         };
         plan_ready += 1;
-        let trace = trace_question_with_inventory(question, &config.nlp, Some(&plan), &inventory);
+        let trace = trace_question_with_inventory(question, nlp, Some(&plan), inventory);
         *reading_statuses
             .entry(trace.reading.status().code().to_string())
             .or_insert(0) += 1;
-        unknown_tokens += trace.unknown_tokens().count() as u64;
+        unknown_tokens += trace
+            .unknown_tokens()
+            .filter(|token| token.text.chars().any(char::is_alphanumeric))
+            .count() as u64;
         if let Some(coverage) = &trace.coverage {
             blocking_gaps += coverage.blocking_count() as u64;
             for gap in &coverage.gaps {
@@ -2165,6 +2230,38 @@ mod tests {
             coverage.gaps
         );
         assert!(coverage.known_terms >= 1);
+    }
+
+    #[test]
+    fn admitted_alias_resolves_a_silent_predicate_gap() {
+        let config = system_config();
+        let mut inventory = LexiconInventory::from_config(&config);
+        let admission = crate::lex_gate::admit_json(
+            r#"[{"surface": "先生", "kind": "alias", "canonical": "配偶"}]"#,
+            &inventory,
+        )
+        .expect("定义文件应可解析");
+        assert_eq!(admission.accepted.len(), 1, "{:?}", admission.rejected);
+        admission.apply(&mut inventory);
+
+        let question = "叶莉的先生的身高是多少？";
+        let plan = QueryPlanner::new().parse(question).unwrap();
+        let trace =
+            trace_question_with_inventory(question, &config.nlp, Some(&plan), &inventory);
+        let coverage = trace.coverage.as_ref().unwrap();
+        assert!(
+            !coverage.gaps.iter().any(|gap| gap.text == "先生"),
+            "已准入的定义应解析掉先生：{:?}",
+            coverage.gaps
+        );
+        let resolved = coverage
+            .resolved
+            .iter()
+            .find(|term| term.text == "先生")
+            .expect("应记录定义解析证据");
+        assert_eq!(resolved.expansion, vec!["配偶".to_string()]);
+        assert!(coverage.blocking_count() == 0);
+        assert!(trace.render_report().contains("先生 → 配偶"));
     }
 
     #[test]

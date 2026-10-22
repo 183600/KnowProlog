@@ -65,6 +65,7 @@ pub mod import_journal;
 pub mod knowledge_fusion;
 pub mod knowledge_layers;
 pub mod law_book;
+pub mod lex_gate;
 pub mod lexical_trace;
 pub mod link_eval;
 pub mod link_prediction;

@@ -42,6 +42,7 @@ use know_prolog::{
     import_journal::{ImportJournal, JournalLoad},
     knowledge_fusion::{Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel},
     law_book::LawBook,
+    lex_gate,
     lexical_trace,
     link_prediction::{LinkPredictor, Triple as LawTriple},
     load_config,
@@ -159,6 +160,10 @@ enum Commands {
         /// no executable definition in the configured lexicon (read-only)
         #[arg(long)]
         lexicon: bool,
+        /// JSON definition file (alias / compose) to admit before the audit;
+        /// accepted entries resolve coverage gaps without writing the KB
+        #[arg(long, requires = "lexicon")]
+        definitions: Option<String>,
         /// Print the trace/report as JSON
         #[arg(long)]
         json: bool,
@@ -703,6 +708,7 @@ async fn main() {
         question,
         corpus,
         lexicon,
+        definitions,
         json,
     }) = &cli.command
     {
@@ -710,6 +716,7 @@ async fn main() {
             question.as_deref(),
             corpus.as_deref(),
             *lexicon,
+            definitions.as_deref(),
             *json,
             &config,
         );
@@ -2522,14 +2529,39 @@ async fn run_fuse(
 /// `read-trace`：离线观察一个问句被切成了什么、词性来自哪里、规划器看到了什么。
 /// 提供 `--corpus` 时改为聚合词表缺口（未知词形 + 标记边界），不自动改词表。
 /// 加 `--lexicon` 时额外做静态覆盖审计：把「计划可执行但谓词/实体没有定义」
-/// 的沉默缺口显式化；仍不改变分词、链接、规划或回答。
+/// 的沉默缺口显式化；`--definitions` 可先通过词门准入 alias/compose 定义。
+/// 全过程只读：不写知识库、不改变分词、链接、规划或回答。
 fn run_read_trace(
     question: Option<&str>,
     corpus: Option<&str>,
     lexicon: bool,
+    definitions: Option<&str>,
     json: bool,
     config: &know_prolog::SystemConfig,
 ) {
+    let mut inventory = lexicon.then(|| lexical_trace::LexiconInventory::from_config(config));
+    let mut admission = None;
+    if let (Some(path), Some(inventory)) = (definitions, inventory.as_mut()) {
+        match lex_gate::load_file(path, inventory) {
+            Ok(report) => {
+                report.apply(inventory);
+                admission = Some(report);
+            }
+            Err(error) => {
+                eprintln!("读取定义失败：{}", error);
+                return;
+            }
+        }
+    }
+    if let Some(admission) = &admission {
+        // JSON 模式下报告走 stderr，保证 stdout 仍是单个合法 JSON 文档。
+        if json {
+            eprintln!("{}", admission.render_report());
+        } else {
+            println!("{}", admission.render_report());
+        }
+    }
+
     if let Some(path) = corpus {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -2539,8 +2571,12 @@ fn run_read_trace(
             }
         };
         let questions: Vec<&str> = text.lines().collect();
-        if lexicon {
-            let report = lexical_trace::coverage_report(questions, config);
+        if let Some(inventory) = &inventory {
+            let report = lexical_trace::coverage_report_with_inventory(
+                questions,
+                &config.nlp,
+                inventory,
+            );
             if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{}", text),
@@ -2564,10 +2600,14 @@ fn run_read_trace(
     }
     let question = question.unwrap_or_default();
     let plan = QueryPlanner::new().parse(question);
-    let trace = if lexicon {
-        lexical_trace::trace_question_with_lexicon(question, config, plan.as_ref())
-    } else {
-        lexical_trace::trace_question(question, &config.nlp, plan.as_ref())
+    let trace = match &inventory {
+        Some(inventory) => lexical_trace::trace_question_with_inventory(
+            question,
+            &config.nlp,
+            plan.as_ref(),
+            inventory,
+        ),
+        None => lexical_trace::trace_question(question, &config.nlp, plan.as_ref()),
     };
     if json {
         match serde_json::to_string_pretty(&trace) {
