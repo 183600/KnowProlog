@@ -5689,136 +5689,15 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 补全回合：打开一次可确认、可归纳、可批量闭包的学习回合
-        if let Some(entity) = strip_any_prefix(
-            input,
-            &["补全回合：", "补全回合:", "学习回合：", "学习回合:"],
-        ) {
-            let entity = entity.trim();
-            if entity.is_empty() {
-                println!("请提供要补全的实体，例如：补全回合：张三");
-            } else {
-                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.completion_open(entity));
-            }
-            println!();
-            continue;
-        }
-
-        if let Some(selector) = strip_any_prefix(
-            input,
-            &["确认补全：", "确认补全:", "采纳补全：", "采纳补全:"],
-        ) {
-            let selector = selector.trim();
-            if selector.is_empty() {
-                println!("请给出候选序号、候选 id 或 主体|谓词|客体，例如：确认补全：1");
-            } else {
-                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.completion_confirm(selector));
-            }
-            println!();
-            continue;
-        }
-
-        if let Some(selector) = strip_any_prefix(
-            input,
-            &["否定补全：", "否定补全:", "驳回补全：", "驳回补全:"],
-        ) {
-            let selector = selector.trim();
-            if selector.is_empty() {
-                println!("请给出候选序号、候选 id 或 主体|谓词|客体，例如：否定补全：2");
-            } else {
-                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.completion_refute(selector));
-            }
-            println!();
-            continue;
-        }
-
-        if matches!(input, "补全规则" | "补全规则报告" | "补全台账") {
+        // 补全回合：打开一次可确认、可归纳、可批量闭包的学习回合。
+        // 解析与 HTTP 服务共用同一入口，避免两套命令文法漂移。
+        if input.contains("补全") || input.starts_with("学习回合") {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-            println!("{}", symbolic_reasoner.completion_rules_report());
-            println!();
-            continue;
-        }
-
-        if matches!(input, "补全报告" | "补全回合报告" | "补全状态") {
-            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-            println!("{}", symbolic_reasoner.completion_report());
-            println!();
-            continue;
-        }
-
-        if let Some(spec) = strip_any_prefix(
-            input,
-            &[
-                "晋升补全规则：",
-                "晋升补全规则:",
-                "补全规则晋升：",
-                "补全规则晋升:",
-            ],
-        ) {
-            let spec = spec.trim();
-            let parsed = spec
-                .split_once('|')
-                .or_else(|| spec.split_once('｜'))
-                .or_else(|| spec.rsplit_once(' '));
-            match parsed {
-                Some((rule_id, scope))
-                    if !rule_id.trim().is_empty() && !scope.trim().is_empty() =>
-                {
-                    refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                    println!(
-                        "{}",
-                        symbolic_reasoner.completion_promote(rule_id.trim(), scope.trim())
-                    );
-                }
-                _ => println!(
-                    "用法：晋升补全规则：<规则id>|<作用域>，作用域为本例/本批/命名空间/全局"
-                ),
+            if let Some(text) = symbolic_reasoner.handle_completion_command(input) {
+                println!("{}", text);
+                println!();
+                continue;
             }
-            println!();
-            continue;
-        }
-
-        if let Some(rule_id) = strip_any_prefix(
-            input,
-            &[
-                "退役补全规则：",
-                "退役补全规则:",
-                "补全规则退役：",
-                "补全规则退役:",
-            ],
-        ) {
-            let rule_id = rule_id.trim();
-            if rule_id.is_empty() {
-                println!("用法：退役补全规则：<规则id>");
-            } else {
-                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.completion_retire(rule_id));
-            }
-            println!();
-            continue;
-        }
-
-        if let Some(rule_id) = strip_any_prefix(
-            input,
-            &[
-                "恢复补全规则：",
-                "恢复补全规则:",
-                "补全规则恢复：",
-                "补全规则恢复:",
-            ],
-        ) {
-            let rule_id = rule_id.trim();
-            if rule_id.is_empty() {
-                println!("用法：恢复补全规则：<规则id>");
-            } else {
-                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.completion_reactivate(rule_id));
-            }
-            println!();
-            continue;
         }
 
         // 结构联想：RWR 图嵌入（随机游走重启）检索结构相关实体与解释路径

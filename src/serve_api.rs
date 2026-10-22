@@ -719,7 +719,9 @@ impl Session {
         self.manager.clear_last_recovery();
         // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
         self.sync_recovery_confirmed_facts();
-        // 假设世界命令使用原始措辞，避免被插件改写；带「那么」的一次性反事实句让位。
+        // 补全回合与假设世界命令使用原始措辞，避免被插件改写；
+        // 带「那么」的一次性反事实句仍让位给 what-if 管线。
+        let completion_command = self.reasoner.handle_completion_command(&raw_input);
         let assumption_command = self.reasoner.handle_assumption_command(&raw_input);
 
         // 插件改写预通道：词表/本体归一只影响管线输入，原始措辞仍用于接地引用。
@@ -735,7 +737,7 @@ impl Session {
         let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
         control.enter(TurnPhase::Recall)?;
-        let dialogue = if assumption_command.is_some() {
+        let dialogue = if completion_command.is_some() || assumption_command.is_some() {
             None
         } else {
             self.manager
@@ -744,8 +746,17 @@ impl Session {
         };
 
         control.enter(TurnPhase::Reason)?;
-        let (status, source, kind, plan, reply, derivation) = if let Some(text) = assumption_command
-        {
+        let (status, source, kind, plan, reply, derivation) =
+        if let Some(text) = completion_command {
+            (
+                "answered".to_string(),
+                "completion".to_string(),
+                Some("completion_command".to_string()),
+                vec!["completion_command".to_string()],
+                text,
+                None,
+            )
+        } else if let Some(text) = assumption_command {
             (
                 "answered".to_string(),
                 "assumption".to_string(),
@@ -5014,6 +5025,88 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let outside = session.run_turn("姚明的身高是多少");
         assert!(outside.reply.contains("226"), "{}", outside.reply);
         assert!(!outside.reply.contains("230"), "{}", outside.reply);
+    }
+
+    #[test]
+    fn completion_commands_are_available_over_session_turns() {
+        let mut facts = vec![
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师傅".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "李四".into(),
+                rel_type: "师傅".into(),
+                to: "王五".into(),
+            },
+            PrologFact::Relation {
+                from: "王五".into(),
+                rel_type: "师傅".into(),
+                to: "赵六".into(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师祖".into(),
+                to: "王五".into(),
+            },
+        ];
+        for (from, to) in [
+            ("孙八", "周九"),
+            ("周九", "吴十"),
+            ("郑十一", "钱十二"),
+            ("钱十二", "孙十三"),
+        ] {
+            facts.push(PrologFact::Relation {
+                from: from.into(),
+                rel_type: "师傅".into(),
+                to: to.into(),
+            });
+        }
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: true,
+            link_prediction_min_confidence: 0.1,
+            link_prediction_min_support: 1,
+            completion_min_score: 0.3,
+            ..ReasoningConfig::default()
+        };
+        let state = Arc::new(ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        ));
+        let mut session = build_session(
+            "s-test".to_string(),
+            &state.warm,
+            &state.perf,
+            state.prompt_mode,
+            state.recovery_mode,
+            None,
+            None,
+            None,
+            TurnBudget::unlimited(),
+            None,
+        );
+
+        let opened = session.run_turn("补全回合：孙八");
+        assert_eq!(opened.source, "completion", "{}", opened.reply);
+        assert!(opened.reply.contains("补全回合"), "{}", opened.reply);
+        assert!(opened.reply.contains("师祖"), "{}", opened.reply);
+
+        let confirmed = session.run_turn("确认补全：孙八|师祖|吴十");
+        assert_eq!(confirmed.source, "completion", "{}", confirmed.reply);
+        assert!(confirmed.reply.contains("已确认补全"), "{}", confirmed.reply);
+
+        let answer = session.run_turn("孙八的师祖是谁");
+        assert_eq!(answer.status, "answered", "{}", answer.reply);
+        assert!(answer.reply.contains("吴十"), "{}", answer.reply);
+
+        let report = session.run_turn("补全报告");
+        assert_eq!(report.source, "completion", "{}", report.reply);
+        assert!(report.reply.contains("已确认 1"), "{}", report.reply);
     }
 
     #[test]

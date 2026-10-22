@@ -5191,6 +5191,109 @@ impl SymbolicReasoner {
         self.completion.render_rules()
     }
 
+    /// 解析并执行补全回合命令（打开 / 确认 / 驳回 / 报告 / 规则生命周期）。
+    ///
+    /// 交互命令行与 HTTP 服务共用这一入口，避免两套解析漂移；返回 `None`
+    /// 表示不是补全命令，调用方应继续常规管线。
+    pub fn handle_completion_command(&mut self, input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        for prefix in ["补全回合：", "补全回合:", "学习回合：", "学习回合:"] {
+            if let Some(entity) = trimmed.strip_prefix(prefix) {
+                let entity = entity.trim();
+                return Some(if entity.is_empty() {
+                    "请提供要补全的实体，例如：补全回合：张三".to_string()
+                } else {
+                    self.completion_open(entity)
+                });
+            }
+        }
+        for prefix in ["确认补全：", "确认补全:", "采纳补全：", "采纳补全:"] {
+            if let Some(selector) = trimmed.strip_prefix(prefix) {
+                let selector = selector.trim();
+                return Some(if selector.is_empty() {
+                    "请给出候选序号、候选 id 或 主体|谓词|客体，例如：确认补全：1".to_string()
+                } else {
+                    self.completion_confirm(selector)
+                });
+            }
+        }
+        for prefix in ["否定补全：", "否定补全:", "驳回补全：", "驳回补全:"] {
+            if let Some(selector) = trimmed.strip_prefix(prefix) {
+                let selector = selector.trim();
+                return Some(if selector.is_empty() {
+                    "请给出候选序号、候选 id 或 主体|谓词|客体，例如：否定补全：2".to_string()
+                } else {
+                    self.completion_refute(selector)
+                });
+            }
+        }
+        if matches!(trimmed, "补全规则" | "补全规则报告" | "补全台账") {
+            return Some(self.completion_rules_report());
+        }
+        if matches!(trimmed, "补全报告" | "补全回合报告" | "补全状态") {
+            return Some(self.completion_report());
+        }
+        for prefix in [
+            "晋升补全规则：",
+            "晋升补全规则:",
+            "补全规则晋升：",
+            "补全规则晋升:",
+        ] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let parsed = spec
+                    .trim()
+                    .split_once('|')
+                    .or_else(|| spec.trim().split_once('｜'))
+                    .or_else(|| spec.trim().rsplit_once(' '));
+                return Some(match parsed {
+                    Some((rule_id, scope))
+                        if !rule_id.trim().is_empty() && !scope.trim().is_empty() =>
+                    {
+                        self.completion_promote(rule_id.trim(), scope.trim())
+                    }
+                    _ => {
+                        "用法：晋升补全规则：<规则id>|<作用域>，作用域为本例/本批/命名空间/全局"
+                            .to_string()
+                    }
+                });
+            }
+        }
+        for prefix in [
+            "退役补全规则：",
+            "退役补全规则:",
+            "补全规则退役：",
+            "补全规则退役:",
+        ] {
+            if let Some(rule_id) = trimmed.strip_prefix(prefix) {
+                let rule_id = rule_id.trim();
+                return Some(if rule_id.is_empty() {
+                    "用法：退役补全规则：<规则id>".to_string()
+                } else {
+                    self.completion_retire(rule_id)
+                });
+            }
+        }
+        for prefix in [
+            "恢复补全规则：",
+            "恢复补全规则:",
+            "补全规则恢复：",
+            "补全规则恢复:",
+        ] {
+            if let Some(rule_id) = trimmed.strip_prefix(prefix) {
+                let rule_id = rule_id.trim();
+                return Some(if rule_id.is_empty() {
+                    "用法：恢复补全规则：<规则id>".to_string()
+                } else {
+                    self.completion_reactivate(rule_id)
+                });
+            }
+        }
+        None
+    }
+
     /// 恢复通道 L2：联想提名（链接预测）——「(实体, 属性) 还可能是哪个值」。
     ///
     /// 只提名、不下结论；每条附规则证据。返回顺序由预测器确定，
@@ -15090,6 +15193,63 @@ types = [
             0,
             "分叉后已晋升规则不得残留"
         );
+    }
+
+    #[test]
+    fn completion_command_entry_point_matches_cli_semantics() {
+        let mut config = test_config();
+        config.link_prediction_min_confidence = 0.1;
+        let mut facts = master_facts();
+        for (from, to) in [
+            ("孙八", "周九"),
+            ("周九", "吴十"),
+            ("郑十一", "钱十二"),
+            ("钱十二", "孙十三"),
+        ] {
+            facts.push(PrologFact::Relation {
+                from: from.to_string(),
+                rel_type: "师傅".to_string(),
+                to: to.to_string(),
+            });
+        }
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        assert!(reasoner
+            .handle_completion_command("姚明的身高是多少")
+            .is_none());
+        let opened = reasoner
+            .handle_completion_command("补全回合：孙八")
+            .expect("打开回合应被命令入口接管");
+        assert!(opened.contains("补全回合"), "{}", opened);
+        assert!(opened.contains("师祖"), "{}", opened);
+
+        let confirmed = reasoner
+            .handle_completion_command("确认补全：孙八|师祖|吴十")
+            .expect("确认命令应被接管");
+        assert!(confirmed.contains("已确认补全"), "{}", confirmed);
+        assert!(
+            reasoner
+                .session_facts()
+                .iter()
+                .any(|atom| atom.predicate.as_ref() == "师祖"
+                    && atom.terms.iter().any(|term| term.name() == "孙八")
+                    && atom.terms.iter().any(|term| term.name() == "吴十")),
+            "命令入口确认的候选必须落地为会话事实"
+        );
+
+        let rules = reasoner
+            .handle_completion_command("补全规则")
+            .expect("规则报告应被接管");
+        assert!(rules.contains("补全规则"), "{}", rules);
+        assert!(reasoner
+            .handle_completion_command("补全报告")
+            .expect("回合报告应被接管")
+            .contains("孙八"));
+        assert!(reasoner
+            .handle_completion_command("晋升补全规则：")
+            .expect("空参数应给出用法")
+            .contains("用法"));
     }
 
     #[test]
