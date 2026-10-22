@@ -3888,6 +3888,15 @@ async fn run_interactive_mode(
             pattern_forge.len(),
             pattern_forge.active_count()
         );
+        // 图谱可能还留着上次退役/遗忘前的锻造条目；按台账重建后再同步一次，
+        // 让「退役后重启又复活」在数据层也不存在。
+        match oxigraph_manager
+            .sync_pattern_ledger(pattern_library.entries())
+            .await
+        {
+            Ok(count) => println!("锻造模式落图校准：{} 条已同步。", count),
+            Err(error) => eprintln!("锻造模式落图校准失败：{}", error),
+        }
     }
     // 模式经验：跨会话恢复「上次怎么理解」的记录（独立于模式定义图）。
     let mut pattern_episodes = pattern_ir::PatternEpisodeLog::default();
