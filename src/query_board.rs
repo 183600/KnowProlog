@@ -381,7 +381,7 @@ impl QueryBoard {
 
     fn start_rank(
         &mut self,
-        attribute: String,
+        mut attribute: String,
         descending: bool,
         limit: usize,
         knowledge: &dyn DialogueKnowledge,
@@ -391,7 +391,23 @@ impl QueryBoard {
             predicate: Some(attribute.clone()),
             entity_type: None,
         };
-        let rows = scan_rows(&spec, knowledge);
+        let mut rows = scan_rows(&spec, knowledge);
+        if rows.is_empty() {
+            // 「哪个城市面积最大」里的属性词面是「城市面积」，图谱谓词却是
+            // 「面积」；只在原词面查不到时做一次受控归一，不猜新谓词。
+            if let Some(resolved) = resolve_attribute_hint(&attribute, knowledge) {
+                if resolved != attribute {
+                    attribute = resolved;
+                    rows = scan_rows(
+                        &ScanSpec {
+                            predicate: Some(attribute.clone()),
+                            entity_type: None,
+                        },
+                        knowledge,
+                    );
+                }
+            }
+        }
         if rows.is_empty() {
             return None;
         }
@@ -1540,6 +1556,35 @@ fn parse_extreme(text: &str, board_active: bool) -> Option<ExtremeSpec> {
         };
         (descending, character.len_utf8())
     };
+    // 「谁最高兴」不是排名：「高」后面必须是一个句法边界，而不是另一个实词。
+    if let Some(next) = after[consumed..].chars().next() {
+        if !matches!(
+            next,
+            '的' | '是'
+                | '呢'
+                | '吗'
+                | '啊'
+                | '个'
+                | '名'
+                | '位'
+                | '条'
+                | '项'
+                | '种'
+                | '人'
+                | '中'
+                | '里'
+                | '在'
+                | '有'
+                | '？'
+                | '?'
+                | '。'
+                | '，'
+                | ','
+                | ' '
+        ) {
+            return None;
+        }
+    }
     if !board_active && !has_rank_interrogative(text) {
         return None;
     }
@@ -2745,6 +2790,28 @@ mod tests {
             board.current().unwrap().source,
             QuerySource::Rank { .. }
         ));
+    }
+
+    #[test]
+    fn extreme_parser_rejects_non_rank_words_and_normalizes_attribute() {
+        assert!(parse_extreme("谁最高", false).is_some());
+        assert!(parse_extreme("谁最高兴", false).is_none());
+        assert!(parse_extreme("最大的行星", false).is_none());
+        assert!(parse_extreme("前三名", false).is_some());
+
+        let mut knowledge = TestKnowledge::new();
+        for (entity, area) in [("姚明", "100平方米"), ("王治郅", "200平方米")] {
+            knowledge.attributes.insert(
+                entity.to_string(),
+                vec![("面积".to_string(), area.to_string())],
+            );
+        }
+        let mut board = board();
+        let outcome = board
+            .apply("哪个城市面积最大", &knowledge, 7)
+            .expect("「城市面积」应归一为图谱谓词「面积」");
+        assert!(outcome.text.contains("王治郅"), "{}", outcome.text);
+        assert!(outcome.text.contains("面积"), "{}", outcome.text);
     }
 
     #[test]
