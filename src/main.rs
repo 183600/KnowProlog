@@ -3215,7 +3215,13 @@ fn run_frontier(
     }
 
     let question = question.unwrap_or_default();
-    let report = frontier::analyze(question, &library, &config.nlp, &synonyms);
+    let report = frontier::analyze_with_threshold(
+        question,
+        &library,
+        &config.nlp,
+        &synonyms,
+        near_miss,
+    );
     if json {
         match serde_json::to_string_pretty(&report) {
             Ok(text) => println!("{}", text),

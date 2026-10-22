@@ -98,6 +98,8 @@ pub struct FrontierReport {
     pub winner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winner_query_type: Option<String>,
+    /// 生成 `near_misses` 时使用的覆盖率阈值。
+    pub near_miss_threshold: f64,
     /// 覆盖率降序的近似命中（只含未命中候选）。
     pub near_misses: Vec<FrontierRow>,
 }
@@ -159,12 +161,12 @@ impl FrontierReport {
         if self.near_misses.is_empty() {
             output.push_str(&format!(
                 "近似命中（覆盖率 ≥ {:.0}%）：0\n",
-                NEAR_MISS_COVERAGE * 100.0
+                self.near_miss_threshold * 100.0
             ));
         } else {
             output.push_str(&format!(
                 "近似命中（覆盖率 ≥ {:.0}%）：{}\n",
-                NEAR_MISS_COVERAGE * 100.0,
+                self.near_miss_threshold * 100.0,
                 self.near_misses.len()
             ));
             for row in self.near_misses.iter().take(SHOWN_NEAR_MISSES) {
@@ -292,7 +294,25 @@ pub fn analyze(
     nlp: &NlpConfig,
     synonyms: &HashMap<String, String>,
 ) -> FrontierReport {
-    analyze_with_context(question, library, nlp, synonyms, &PatternContext::default())
+    analyze_with_threshold(question, library, nlp, synonyms, NEAR_MISS_COVERAGE)
+}
+
+/// 分析单句，并指定「近似命中」的覆盖率阈值。
+pub fn analyze_with_threshold(
+    question: &str,
+    library: &PatternLibrary,
+    nlp: &NlpConfig,
+    synonyms: &HashMap<String, String>,
+    near_miss_threshold: f64,
+) -> FrontierReport {
+    analyze_with_context_and_threshold(
+        question,
+        library,
+        nlp,
+        synonyms,
+        &PatternContext::default(),
+        near_miss_threshold,
+    )
 }
 
 /// 带对话上下文的前沿分析（守卫不满足的候选不进入报告）。
@@ -303,9 +323,28 @@ pub fn analyze_with_context(
     synonyms: &HashMap<String, String>,
     context: &PatternContext,
 ) -> FrontierReport {
+    analyze_with_context_and_threshold(
+        question,
+        library,
+        nlp,
+        synonyms,
+        context,
+        NEAR_MISS_COVERAGE,
+    )
+}
+
+/// 带上下文与自定义阈值的完整入口。
+pub fn analyze_with_context_and_threshold(
+    question: &str,
+    library: &PatternLibrary,
+    nlp: &NlpConfig,
+    synonyms: &HashMap<String, String>,
+    context: &PatternContext,
+    near_miss_threshold: f64,
+) -> FrontierReport {
     let tagged = preprocess(question, nlp);
     let tokens = normalize_words(tagged, synonyms);
-    analyze_tokens(question, &tokens, library, context)
+    analyze_tokens_with_threshold(question, &tokens, library, context, near_miss_threshold)
 }
 
 /// 已有词序列时的前沿分析（调用方负责与运行时保持同样的归一化）。
@@ -314,6 +353,17 @@ pub fn analyze_tokens(
     tokens: &[TaggedWord],
     library: &PatternLibrary,
     context: &PatternContext,
+) -> FrontierReport {
+    analyze_tokens_with_threshold(question, tokens, library, context, NEAR_MISS_COVERAGE)
+}
+
+/// 已有词序列时的前沿分析，并指定近似命中阈值。
+pub fn analyze_tokens_with_threshold(
+    question: &str,
+    tokens: &[TaggedWord],
+    library: &PatternLibrary,
+    context: &PatternContext,
+    near_miss_threshold: f64,
 ) -> FrontierReport {
     let tokens_view: Vec<TokenView> = tokens
         .iter()
@@ -377,7 +427,7 @@ pub fn analyze_tokens(
 
     let mut near_misses: Vec<FrontierRow> = blocked
         .iter()
-        .filter(|row| row.is_near_miss(NEAR_MISS_COVERAGE))
+        .filter(|row| row.is_near_miss(near_miss_threshold))
         .cloned()
         .collect();
     near_misses.sort_by(|left, right| {
@@ -404,6 +454,7 @@ pub fn analyze_tokens(
         blocked,
         winner: winner_name,
         winner_query_type,
+        near_miss_threshold,
         near_misses,
     }
 }
@@ -558,6 +609,22 @@ mod tests {
         assert_eq!(failure.actual.as_deref(), Some("在"));
         assert_eq!(failure.covered_elems(), 3);
         assert!(report.render_report().contains("第4要素"));
+        assert_eq!(report.near_miss_threshold, NEAR_MISS_COVERAGE);
+        assert!(
+            report.near_misses.is_empty(),
+            "0.6 覆盖率低于默认 0.75 阈值"
+        );
+
+        // 阈值必须真正作用于单句报告，而不只是聚合报告。
+        let loose = analyze_tokens_with_threshold(
+            "法国的首都在哪里",
+            &tokens,
+            &library(),
+            &Default::default(),
+            0.5,
+        );
+        assert_eq!(loose.near_miss_threshold, 0.5);
+        assert!(loose.near_misses.iter().any(|row| row.name == "首都查询"));
     }
 
     #[test]
