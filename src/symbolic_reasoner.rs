@@ -4614,6 +4614,58 @@ impl SymbolicReasoner {
                     }
                 }
             }
+            ClarificationReply::ConfirmedAll(batch) => {
+                let atoms: Vec<Atom> = batch.iter().map(|h| h.atom.clone()).collect();
+                match self.commit_session_assertions("澄清批量确认".to_string(), &atoms) {
+                    Err(blocked) => {
+                        if let Some(session) = self.clarification.as_mut() {
+                            session.restore_batch(batch);
+                        }
+                        Some(format!(
+                            "批量确认未写入会话事实（整批零写入），问题保留：\n{}\n{}",
+                            blocked,
+                            self.render_clarification_prompt()
+                        ))
+                    }
+                    Ok(added) => {
+                        let mut output = format!("✓ 已批量确认 {} 条假设：", batch.len());
+                        for hypothesis in &batch {
+                            output.push_str(&format!(
+                                "\n  ✓ {}",
+                                self.render_atom_nl(&hypothesis.atom)
+                            ));
+                        }
+                        output.push_str(if added > 0 {
+                            "\n已加入会话事实集（未写知识图谱）。"
+                        } else {
+                            "\n这些事实均已在会话事实集中（幂等确认）。"
+                        });
+                        if added > 0 {
+                            if let Some(receipt) = self.session_receipts.last() {
+                                output.push_str(&format!(
+                                    "\n  修订回执：{}（可用「撤销修订」撤回）",
+                                    receipt.id
+                                ));
+                            }
+                        }
+                        self.reprioritize_clarification();
+                        output.push_str(&self.clarification_follow_up());
+                        Some(output)
+                    }
+                }
+            }
+            ClarificationReply::RejectedAll(batch) => {
+                let mut output = format!("✗ 已批量排除 {} 条假设：", batch.len());
+                for hypothesis in &batch {
+                    output.push_str(&format!(
+                        "\n  ✗ {}",
+                        self.render_atom_nl(&hypothesis.atom)
+                    ));
+                }
+                self.reprioritize_clarification();
+                output.push_str(&self.clarification_follow_up());
+                Some(output)
+            }
             ClarificationReply::Rejected(hypothesis) => {
                 self.reprioritize_clarification();
                 Some(format!(
@@ -4631,7 +4683,7 @@ impl SymbolicReasoner {
                 ))
             }
             ClarificationReply::Unrecognized => Some(format!(
-                "没有理解回答（请用「是 / 不是 / 不知道」，或「不是，是<取值>」更正）。\n{}",
+                "没有理解回答（请用「是 / 不是 / 不知道」，「不是，是<取值>」更正，或「全部确认」/「全部否定」批量处理）。\n{}",
                 self.render_clarification_prompt()
             )),
             ClarificationReply::Finished => Some(self.finish_clarification_session()),
@@ -14348,6 +14400,89 @@ types = [
             !reasoner.session_revision_report().contains("session:"),
             "拒绝的采纳不得生成回执"
         );
+    }
+
+    #[test]
+    fn batch_clarification_confirmation_commits_all_and_finishes() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let pending = vec![
+            Hypothesis {
+                atom: Atom::rel("颜色", "苹果", "红"),
+                goal: Atom::rel("颜色", "苹果", "红"),
+                kind: HypothesisKind::MissingFact,
+                confidence: 0.8,
+                reasons: vec!["测试".to_string()],
+                conflicts: Vec::new(),
+                contradicts_known: false,
+            },
+            Hypothesis {
+                atom: Atom::rel("颜色", "苹果", "青"),
+                goal: Atom::rel("颜色", "苹果", "青"),
+                kind: HypothesisKind::MissingFact,
+                confidence: 0.6,
+                reasons: vec!["测试".to_string()],
+                conflicts: Vec::new(),
+                contradicts_known: false,
+            },
+        ];
+        reasoner.abduction.set_pending(pending);
+        reasoner.start_clarification().expect("应开始澄清");
+        let before = reasoner.session_facts().len();
+        let output = reasoner
+            .answer_clarification("全部确认")
+            .expect("应处理批量回答");
+        assert!(output.contains("批量确认"), "{}", output);
+        assert_eq!(reasoner.session_facts().len(), before + 2);
+        assert!(
+            !reasoner.clarification_active(),
+            "全部确认后会话应结束：{}",
+            output
+        );
+    }
+
+    #[test]
+    fn blocked_batch_confirmation_restores_every_question() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut registry = PredicateRegistry::new();
+        registry.observe("张三", "年龄", "30", None);
+        assert!(registry.mark_functional("年龄", true));
+        reasoner.configure_laws(&registry);
+        let mut properties = HashMap::new();
+        properties.insert("年龄".to_string(), "30".to_string());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }]);
+        reasoner.abduction.set_pending(vec![
+            Hypothesis {
+                atom: Atom::rel("年龄", "张三", "31"),
+                goal: Atom::rel("年龄", "张三", "31"),
+                kind: HypothesisKind::MissingFact,
+                confidence: 0.9,
+                reasons: vec!["测试冲突".to_string()],
+                conflicts: Vec::new(),
+                contradicts_known: false,
+            },
+            Hypothesis {
+                atom: Atom::rel("颜色", "苹果", "红"),
+                goal: Atom::rel("颜色", "苹果", "红"),
+                kind: HypothesisKind::MissingFact,
+                confidence: 0.5,
+                reasons: vec!["测试".to_string()],
+                conflicts: Vec::new(),
+                contradicts_known: false,
+            },
+        ]);
+        reasoner.start_clarification().expect("应开始澄清");
+        let before = reasoner.session_facts().len();
+        let output = reasoner
+            .answer_clarification("全部确认")
+            .expect("应处理批量回答");
+        assert!(output.contains("整批零写入"), "{}", output);
+        assert!(output.contains("是否成立"), "被拒绝后必须重新提问：{}", output);
+        assert_eq!(reasoner.session_facts().len(), before);
+        assert!(reasoner.clarification_active(), "整批应恢复为待问");
     }
 
     #[test]

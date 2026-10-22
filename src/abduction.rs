@@ -143,6 +143,36 @@ pub enum AnswerKind {
     Unrecognized,
 }
 
+/// 「全部确认 / 全部否定」这类批量回答的作用域。
+///
+/// 只有同时出现整体量词（都 / 全 / 全部）才算批量，普通「不是」仍然只否定当前一条。
+pub fn clarification_batch_scope(text: &str) -> Option<AnswerKind> {
+    let trimmed = text
+        .trim()
+        .trim_start_matches(['：', ':', ' '])
+        .trim_end_matches(['。', '！', '!', '~', '～', ' ', '？', '?']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    const REJECT: &[&str] = &[
+        "全都不", "全不是", "都不", "都不对", "都不是", "全都不是", "全部不是", "全部不", "都不成立",
+        "全部成立不", "都否", "全否", "全都否", "全部否", "都否定", "全部否定", "全都否定", "都错",
+        "全错", "都排除", "全部排除", "全都排除",
+    ];
+    const CONFIRM: &[&str] = &[
+        "全都确认", "全部确认", "全确认", "都确认", "全都对", "全部对", "全对", "都对", "都是",
+        "全部是", "全都是", "全是的", "都成立", "全部成立", "全都成立", "都采纳", "全采纳",
+        "全都采纳", "全部采纳",
+    ];
+    if REJECT.iter().any(|phrase| trimmed.contains(phrase)) {
+        return Some(AnswerKind::No);
+    }
+    if CONFIRM.iter().any(|phrase| trimmed.contains(phrase)) {
+        return Some(AnswerKind::Yes);
+    }
+    None
+}
+
 /// 把用户对澄清提问的回答分类为 是 / 不是 / 不确定
 pub fn classify_answer(text: &str) -> AnswerKind {
     let trimmed = text
@@ -408,6 +438,21 @@ impl ClarificationSession {
         self.current = Some(hypothesis);
     }
 
+    /// 批量写入被预检整体拒绝时，把整批假设按原顺序恢复为待问状态。
+    pub fn restore_batch(&mut self, batch: Vec<Hypothesis>) {
+        let mut iter = batch.into_iter();
+        let Some(first) = iter.next() else {
+            return;
+        };
+        if let Some(next) = self.current.take() {
+            self.queue.insert(0, next);
+        }
+        self.current = Some(first);
+        for hypothesis in iter.collect::<Vec<_>>().into_iter().rev() {
+            self.queue.insert(0, hypothesis);
+        }
+    }
+
     /// 回答里是否**肯定地**提到了某个取值（排除「不是X」「并非X」这类否定出现）。
     fn mentions_affirmed(text: &str, value: &str) -> bool {
         if value.is_empty() {
@@ -481,6 +526,24 @@ impl ClarificationSession {
         let Some(current) = self.current.take() else {
             return ClarificationReply::Finished;
         };
+        // 批量回答只在还有多条待问时生效；只剩一条时按普通是/不是处理。
+        if !self.queue.is_empty() {
+            if let Some(scope) = clarification_batch_scope(text) {
+                let mut batch = vec![current];
+                batch.append(&mut self.queue);
+                return match scope {
+                    AnswerKind::Yes => {
+                        self.confirmed.extend(batch.iter().cloned());
+                        ClarificationReply::ConfirmedAll(batch)
+                    }
+                    AnswerKind::No => {
+                        self.rejected.extend(batch.iter().cloned());
+                        ClarificationReply::RejectedAll(batch)
+                    }
+                    _ => ClarificationReply::Unrecognized,
+                };
+            }
+        }
         if kind != AnswerKind::Unknown {
             if let Some(index) = self.correction_target(text, &current) {
                 let confirmed = self.queue.remove(index);
@@ -562,6 +625,10 @@ pub enum ClarificationReply {
         rejected: Hypothesis,
         confirmed: Hypothesis,
     },
+    /// 批量确认：当前问题与剩余队列一次性全部确认
+    ConfirmedAll(Vec<Hypothesis>),
+    /// 批量否定：当前问题与剩余队列一次性全部否定
+    RejectedAll(Vec<Hypothesis>),
     Unrecognized,
     Finished,
 }
@@ -1935,7 +2002,7 @@ pub fn render_clarification_question(
 ) -> String {
     match session.current() {
         Some(hypothesis) => format!(
-            "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？\n  请回答：是 / 不是 / 不知道；若是别的取值可答「不是，是<取值>」（剩余 {} 条）。",
+            "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？\n  请回答：是 / 不是 / 不知道；若是别的取值可答「不是，是<取值>」；也可答「全部确认」/「全部否定」处理剩余全部（剩余 {} 条）。",
             hypothesis.confidence,
             render(&hypothesis.atom),
             session.remaining()
@@ -2355,6 +2422,47 @@ mod tests {
             .hypotheses
             .iter()
             .all(|hypothesis| hypothesis.atom != goal)));
+    }
+
+    #[test]
+    fn batch_confirmation_answers_all_remaining_questions() {
+        let hypotheses = vec![
+            hyp("师傅", "张三", "李四", 0.9),
+            hyp("师傅", "张三", "王五", 0.6),
+            hyp("师傅", "张三", "赵六", 0.4),
+        ];
+        let mut session = ClarificationSession::start(&hypotheses);
+        let reply = session.respond("全部确认");
+        let ClarificationReply::ConfirmedAll(batch) = reply else {
+            panic!("应识别为批量确认：{:?}", reply)
+        };
+        assert_eq!(batch.len(), 3);
+        assert!(session.is_finished());
+        assert!(session.queue().is_empty());
+        assert_eq!(
+            session.confirmed.len(),
+            3,
+            "批量确认要全部记入已确认"
+        );
+    }
+
+    #[test]
+    fn plain_no_still_rejects_only_the_current_question() {
+        let hypotheses = vec![
+            hyp("师傅", "张三", "李四", 0.9),
+            hyp("师傅", "张三", "王五", 0.6),
+        ];
+        let mut session = ClarificationSession::start(&hypotheses);
+        let reply = session.respond("不是");
+        assert!(matches!(reply, ClarificationReply::Rejected(_)));
+        assert_eq!(session.rejected.len(), 1);
+        assert_eq!(session.remaining(), 1, "普通否定不应批量排除剩余问题");
+
+        let mut session = ClarificationSession::start(&hypotheses);
+        let reply = session.respond("都不是");
+        assert!(matches!(reply, ClarificationReply::RejectedAll(_)));
+        assert!(session.is_finished());
+        assert_eq!(session.rejected.len(), 2);
     }
 
     #[test]
