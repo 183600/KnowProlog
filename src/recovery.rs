@@ -865,6 +865,7 @@ pub fn resolve_clarification(state: &mut RecoveryState, answer: &str) -> Option<
         .ledger
         .resolve(&followup.receipt_id, ReceiptResolution::Acknowledged);
     let answer = answer.trim();
+    let value = extract_correction_value(answer).unwrap_or_else(|| answer.to_string());
     if let (Some(entity), Some(attribute)) = (
         followup.entity.as_deref(),
         followup.attribute.as_deref(),
@@ -872,7 +873,7 @@ pub fn resolve_clarification(state: &mut RecoveryState, answer: &str) -> Option<
         state.record_confirmed(
             entity,
             attribute,
-            answer,
+            &value,
             &followup.receipt_id,
             ConfirmationSource::Clarification,
         );
@@ -1326,6 +1327,25 @@ mod tests {
                 .any(|fact| fact.value == "赵六"),
             "被否认的推测不得进入会话事实"
         );
+    }
+
+    #[test]
+    fn clarification_answer_extracts_value_and_lands_in_session_facts() {
+        let mut state = RecoveryState::new();
+        let attempt = attempt(
+            &mut state,
+            RecoveryMode::On,
+            &request(EpistemicStatus::Absent, Some("姚明"), Some("体重")),
+            &MockKnowledge::default(),
+        );
+        assert_eq!(attempt.level, RecoveryLevel::Clarify);
+        let reply = resolve_clarification(&mut state, "姚明的体重是 90 公斤").unwrap();
+        assert!(reply.contains("记在会话里"), "{}", reply);
+        let fact = state
+            .confirmed_value("姚明", "体重")
+            .expect("澄清回答应进入会话事实层");
+        assert_eq!(fact.value, "90 公斤");
+        assert_eq!(fact.source, ConfirmationSource::Clarification);
     }
 
     #[test]

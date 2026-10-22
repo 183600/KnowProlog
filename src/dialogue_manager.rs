@@ -1295,9 +1295,14 @@ impl DialogueManager {
         const YES: [&str; 6] = ["是", "是的", "对", "对的", "没错", "嗯"];
         const NO: [&str; 5] = ["不是", "不对", "错了", "错", "不"];
         let pending = self.recovery.latest_pending().cloned()?;
-        let correction = (pending.kind == PendingKind::Provisional)
+        let negative_body = (pending.kind == PendingKind::Provisional)
             .then(|| negative_correction_body(stripped))
             .flatten();
+        let correction = negative_body.filter(|body| {
+            body.contains('是')
+                || body.contains('为')
+                || pending.value.as_deref().map(str::trim) != Some(*body)
+        });
         let (text, plan) = if YES.contains(&stripped) {
             (
                 recovery::resolve_by_yes(&mut self.recovery, true)?,
@@ -1312,6 +1317,11 @@ impl DialogueManager {
             (
                 recovery::resolve_by_correction(&mut self.recovery, correction)?,
                 "recovery_correct",
+            )
+        } else if negative_body.is_some() {
+            (
+                recovery::resolve_by_yes(&mut self.recovery, false)?,
+                "recovery_refute",
             )
         } else {
             // 澄清回答：排除问句与命令式输入，只收短陈述。
@@ -5020,6 +5030,32 @@ output = "value"
         assert_eq!(notice.status, EpistemicStatus::Provisional);
         assert_eq!(notice.level, "L2");
         assert_eq!(on.recovery_state().pending.len(), 1);
+    }
+
+    #[test]
+    fn denying_the_same_candidate_is_refutation_not_correction() {
+        let knowledge = mock()
+            .with_entity("姚明", &["体重"])
+            .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据");
+        let mut manager = DialogueManager::new();
+        manager.set_recovery_mode(RecoveryMode::On);
+        manager
+            .plan_reply("姚明的体重是多少", &knowledge)
+            .expect("推测轮应被接管");
+        let reply = manager
+            .plan_pure_dialogue("不是140公斤", &knowledge)
+            .expect("否认应结算挂账");
+        assert!(reply.text.contains("作废"), "{}", reply.text);
+        assert!(
+            manager
+                .recovery_state()
+                .confirmed_value("姚明", "体重")
+                .is_none(),
+            "单纯否认不得把被否认的候选写进会话事实"
+        );
+        assert!(manager
+            .recovery_state()
+            .is_refuted("姚明", "体重", "140公斤"));
     }
 
     #[test]
