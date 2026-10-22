@@ -7,8 +7,8 @@
 //!     收缩成**最小操作核**，并生成一个可回答的中文裁决问题；
 //!   - 重复规则/重复断言等提示级冲突不阻止写入，真正危险的冲突才会拒绝。
 //!
-//! 设计边界：冲突核通过「逐个删除操作后重新计划」得到 1-最小核；操作数超过
-//! [`MAX_KERNEL_OPS`] 时不再收缩并显式标记 `minimal = false`，不假装最小。
+//! 设计边界：每个冲突独立通过「逐个删除操作后重新计划」得到 1-最小核；操作数
+//! 超过 [`MAX_KERNEL_OPS`] 时不再收缩并显式标记 `minimal = false`，不假装最小。
 
 use crate::belief_revision::{
     BeliefState, ChangeOp, ChangeSet, CommitError, CommitReceipt, ConflictKind, ConflictSeverity,
@@ -198,32 +198,47 @@ fn subset(changeset: &ChangeSet, ops: &[ChangeOp]) -> ChangeSet {
 }
 
 fn extract_kernels(state: &BeliefState, plan: &RevisionPlan) -> Vec<ConflictKernel> {
-    if !plan.conflicts.iter().any(write_blocking) {
+    let blocking: Vec<&RevisionConflict> = plan
+        .conflicts
+        .iter()
+        .filter(|conflict| write_blocking(conflict))
+        .collect();
+    if blocking.is_empty() {
         return Vec::new();
     }
-    let (ops, minimal) = shrink_ops(state, plan);
-    let minimized = if ops.len() < plan.changeset.ops.len() {
-        state.plan(subset(&plan.changeset, &ops))
-    } else {
-        plan.clone()
-    };
-    let mut kernels = Vec::new();
-    for conflict in minimized.conflicts.iter().filter(|conflict| write_blocking(conflict)) {
-        let involved: Vec<String> = ops
+    let mut kernels: Vec<ConflictKernel> = Vec::new();
+    for conflict in blocking {
+        let mut candidates: Vec<ChangeOp> = plan
+            .changeset
+            .ops
             .iter()
             .filter(|op| op_touches(op, conflict))
-            .map(ChangeOp::describe)
+            .cloned()
             .collect();
-        let ops = if involved.is_empty() {
-            ops.iter().map(ChangeOp::describe).collect()
-        } else {
-            involved
-        };
+        if candidates.is_empty() || candidates.len() == plan.changeset.ops.len() {
+            candidates = plan.changeset.ops.clone();
+        } else if !state
+            .plan(subset(&plan.changeset, &candidates))
+            .conflicts
+            .iter()
+            .any(|candidate| same_conflict(candidate, conflict))
+        {
+            // 单个操作本身不足以复现该核时，退回全量候选再收缩。
+            candidates = plan.changeset.ops.clone();
+        }
+        let (ops, minimal) = shrink_ops_for(state, &plan.changeset, candidates, conflict);
+        if kernels.iter().any(|kernel| {
+            kernel.kind == conflict.kind
+                && kernel.atoms == conflict.atoms
+                && (!kernel.atoms.is_empty() || kernel.detail == conflict.detail)
+        }) {
+            continue;
+        }
         kernels.push(ConflictKernel {
             kind: conflict.kind,
             severity: conflict.severity,
             detail: conflict.detail.clone(),
-            ops,
+            ops: ops.iter().map(ChangeOp::describe).collect(),
             atoms: conflict.atoms.clone(),
             minimal,
             question: question_for(conflict),
@@ -235,9 +250,19 @@ fn extract_kernels(state: &BeliefState, plan: &RevisionPlan) -> Vec<ConflictKern
     kernels
 }
 
-/// 删除法收缩：反复尝试删掉一个操作，只要仍有写入级冲突就保留删除结果。
-fn shrink_ops(state: &BeliefState, plan: &RevisionPlan) -> (Vec<ChangeOp>, bool) {
-    let mut current = plan.changeset.ops.clone();
+fn same_conflict(left: &RevisionConflict, right: &RevisionConflict) -> bool {
+    left.kind == right.kind
+        && left.atoms == right.atoms
+        && (!left.atoms.is_empty() || left.detail == right.detail)
+}
+
+/// 删除法收缩：反复尝试删掉一个操作，只要目标冲突仍存在就保留删除结果。
+fn shrink_ops_for(
+    state: &BeliefState,
+    changeset: &ChangeSet,
+    mut current: Vec<ChangeOp>,
+    target: &RevisionConflict,
+) -> (Vec<ChangeOp>, bool) {
     if current.len() > MAX_KERNEL_OPS {
         return (current, false);
     }
@@ -248,8 +273,12 @@ fn shrink_ops(state: &BeliefState, plan: &RevisionPlan) -> (Vec<ChangeOp>, bool)
         }
         let mut trial = current.clone();
         trial.remove(index);
-        let trial_plan = state.plan(subset(&plan.changeset, &trial));
-        if trial_plan.conflicts.iter().any(write_blocking) {
+        let trial_plan = state.plan(subset(changeset, &trial));
+        if trial_plan
+            .conflicts
+            .iter()
+            .any(|conflict| same_conflict(conflict, target))
+        {
             current = trial;
         } else {
             index += 1;
@@ -399,6 +428,25 @@ mod tests {
         assert_eq!(guard.revision(), 2, "撤销是一次新的提交");
         assert_eq!(guard.facts(), facts_before, "撤销必须逐字恢复事实集");
         assert_eq!(guard.rule_count(), rules_before, "撤销必须恢复规则数");
+    }
+
+    #[test]
+    fn independent_conflicts_each_get_a_one_op_kernel() {
+        let (mut engine, constraints) = engine_with_functional_age();
+        engine.add_fact("年龄", "李四", "30");
+        let guard = RevisionGuard::new(engine, constraints);
+        let plan = guard.plan(
+            ChangeSet::new("两个冲突")
+                .assert("年龄", "张三", "31")
+                .assert("年龄", "李四", "32"),
+        );
+        assert!(plan.is_blocked());
+        assert_eq!(plan.kernels.len(), 2, "两个独立冲突应各成一个核");
+        for kernel in &plan.kernels {
+            assert_eq!(kernel.kind, ConflictKind::FunctionalViolation);
+            assert!(kernel.minimal, "每个核都应独立收缩到 1-最小");
+            assert_eq!(kernel.ops.len(), 1, "每个核只应保留自己的冲突操作");
+        }
     }
 
     #[test]
