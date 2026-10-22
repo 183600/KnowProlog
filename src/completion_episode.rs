@@ -587,6 +587,7 @@ pub struct CompletionQuestion {
 /// 一次重放中的失败项。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegressionFailure {
+    pub rule_id: String,
     pub test_id: String,
     pub triple: Triple,
     pub reason: String,
@@ -1364,6 +1365,38 @@ impl CompletionLedger {
         Ok(self.replay_rule_at(position))
     }
 
+    /// 重放全部可用规则；任何违反历史裁决的规则立即隔离。
+    ///
+    /// 用于快照恢复、导入或显式自检：宁可少一条规则，也不让系统
+    /// 带着与用户裁决冲突的知识继续回答。
+    pub fn enforce_regression(&mut self) -> RegressionReport {
+        let positions: Vec<usize> = self
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(_, rule)| rule.is_usable())
+            .map(|(position, _)| position)
+            .collect();
+        let mut report = RegressionReport::default();
+        let mut failing = Vec::new();
+        for position in positions {
+            let current = self.replay_rule_at(position);
+            report.checked += current.checked;
+            if !current.passed() {
+                report.failures.extend(current.failures);
+                failing.push(position);
+            }
+        }
+        let tick = self.tick;
+        for position in failing {
+            if let Some(rule) = self.rules.get_mut(position) {
+                rule.status = RuleStatus::Quarantined;
+                rule.updated_tick = tick;
+            }
+        }
+        report
+    }
+
     fn replay_rule_at(&self, position: usize) -> RegressionReport {
         let Some(rule) = self.rules.get(position) else {
             return RegressionReport::default();
@@ -1382,6 +1415,7 @@ impl CompletionLedger {
                         && rule_derives(&rule.spec, &test.evidence, &test.triple);
                     if rule_matches || rederives {
                         report.failures.push(RegressionFailure {
+                            rule_id: rule.id.clone(),
                             test_id: test.id.clone(),
                             triple: test.triple.clone(),
                             reason: if rederives {
@@ -1398,6 +1432,7 @@ impl CompletionLedger {
                         && !rule_derives(&rule.spec, &test.evidence, &test.triple)
                     {
                         report.failures.push(RegressionFailure {
+                            rule_id: rule.id.clone(),
                             test_id: test.id.clone(),
                             triple: test.triple.clone(),
                             reason: "规则不再能从确认证据推出已确认事实".to_string(),
@@ -2740,6 +2775,41 @@ mod tests {
         assert_eq!(ledger.rules()[0].confirmations, 1, "同一回执不得重复计数");
         assert!(ledger.is_adjudicated(&prediction.triple));
         assert!(ledger.render_regression_report().contains("确认 1"));
+    }
+
+    #[test]
+    fn enforce_regression_quarantines_rules_that_contradict_oracle() {
+        let predictor = chain_predictor();
+        let prediction = predictor
+            .predict_for_entity("孙八", None, 8)
+            .into_iter()
+            .find(|prediction| prediction.triple == Triple::new("孙八", "师祖", "吴十"))
+            .expect("应有一条师祖预测");
+        let spec = RuleSpec::from_horn(&predictor.rules()[prediction.rule_index])
+            .expect("预测规则应可归纳");
+        let mut ledger = CompletionLedger::new();
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            true,
+            Some(spec.clone()),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-30",
+        ));
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            false,
+            Some(spec),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-31",
+        ));
+        assert_eq!(ledger.rules()[0].status, RuleStatus::Candidate);
+        let report = ledger.enforce_regression();
+        assert!(!report.passed());
+        assert_eq!(report.failures[0].rule_id, ledger.rules()[0].id);
+        assert_eq!(ledger.rules()[0].status, RuleStatus::Quarantined);
+        assert!(ledger.enforce_regression().passed(), "重复重放应稳定");
     }
 
     #[test]

@@ -5422,6 +5422,12 @@ impl SymbolicReasoner {
         ) {
             return Some(self.completion_regression_report());
         }
+        if matches!(trimmed, "补全重放" | "重放补全测试" | "补全测试重放") {
+            let report = self.completion.enforce_regression();
+            let mut output = format!("{}\n", report.summary());
+            output.push_str(&self.completion.render_regression_report());
+            return Some(output);
+        }
         if matches!(
             trimmed,
             "补全提问" | "下一个问题" | "该问什么" | "主动提问" | "问我"
@@ -10147,6 +10153,13 @@ impl SymbolicReasoner {
         // 旧快照没有该字段时清空，避免把上一个会话的回合串进新会话。
         self.completion = snapshot.completion.clone().unwrap_or_default();
         self.completion.clamp_limits();
+        let regression = self.completion.enforce_regression();
+        if !regression.passed() {
+            self.completion.note(format!(
+                "快照恢复时运行期回归未通过：{}；相关规则已隔离",
+                regression.summary()
+            ));
+        }
         // 话语帧记忆：恢复上一帧与挂账（重启后接着补全未竟之问）
         if let Some(frames) = &snapshot.frames {
             self.frames = frames.clone();
