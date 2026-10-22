@@ -3121,7 +3121,12 @@ impl OxigraphManager {
                 lit.value().to_string()
             } else {
                 match &quad.object {
-                    Term::NamedNode(node) => node.as_str().to_string(),
+                    // kg 实体宾语在快照里统一用本地名，与关系事实的可读取值
+                    // 一致；外部 IRI 原样保留，避免把别人的命名空间截断。
+                    Term::NamedNode(node) => {
+                        crate::identity::entity_local_name(BASE_NS, node.as_str())
+                            .unwrap_or_else(|| node.as_str().to_string())
+                    }
                     object => object
                         .to_string()
                         .trim_matches(|c| c == '<' || c == '>')
@@ -4897,6 +4902,60 @@ mod cache_tests {
             rel_type: "师傅".to_string(),
             properties: HashMap::new(),
         }]
+    }
+
+    /// 关系宾语在实体属性快照里也必须用本地名，与关系事实的取值一致；
+    /// 外部命名空间的 IRI 不能被截断。
+    #[tokio::test]
+    async fn graph_snapshot_uses_local_names_for_kg_relation_objects() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "师傅": "http://example.org/kg/师傅",
+                "external": "http://example.org/kg/external"
+            },
+            "@graph": [
+                {
+                    "@id": "http://example.org/kg/entity/张三",
+                    "@type": "http://example.org/kg/Person",
+                    "name": "张三",
+                    "师傅": { "@id": "http://example.org/kg/entity/李四" },
+                    "external": { "@id": "https://other.example/entity/王五" }
+                },
+                {
+                    "@id": "http://example.org/kg/entity/李四",
+                    "@type": "http://example.org/kg/Person",
+                    "name": "李四"
+                }
+            ]
+        }"#;
+        manager.import_jsonld(jsonld).await.unwrap();
+        let facts = manager.load_graph_snapshot().await.unwrap();
+        let properties = facts
+            .iter()
+            .find_map(|fact| match fact {
+                PrologFact::Entity {
+                    name, properties, ..
+                } if name == "张三" => Some(properties),
+                _ => None,
+            })
+            .expect("应载入张三");
+        assert_eq!(properties.get("师傅").map(String::as_str), Some("李四"));
+        assert_eq!(
+            properties.get("external").map(String::as_str),
+            Some("https://other.example/entity/王五"),
+            "外部 IRI 必须原样保留"
+        );
+        assert!(
+            facts.iter().any(|fact| matches!(
+                fact,
+                PrologFact::Relation { from, rel_type, to }
+                    if from == "张三" && rel_type == "师傅" && to == "李四"
+            )),
+            "关系事实仍应存在：{:?}",
+            facts
+        );
     }
 
     fn person(name: &str) -> KnowledgeItem {
