@@ -14,7 +14,9 @@ use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
-use crate::completion_episode::{CandidateStatus, CompletionLedger, RuleScope};
+use crate::completion_episode::{
+    CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope,
+};
 use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
 use crate::contextual_rag::{self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame};
 use crate::contextual_reference::{SenseCard, SenseSource};
@@ -5030,7 +5032,12 @@ impl SymbolicReasoner {
             self.completion
                 .note("当前没有满足阈值的链接预测候选：可导入更多同类实体或降低推理阈值。");
         }
-        self.completion.render_episode()
+        let mut output = self.completion.render_episode();
+        if let Some(question) = self.completion_ask_line() {
+            output.push('\n');
+            output.push_str(question.trim_end());
+        }
+        output
     }
 
     /// 确认一条补全：归纳本批规则、做有界闭包，并把确认事实加入本轮会话事实。
@@ -5072,6 +5079,10 @@ impl SymbolicReasoner {
         }
         output.push('\n');
         output.push_str(&self.completion.render_episode());
+        if let Some(question) = self.completion_ask_line() {
+            output.push('\n');
+            output.push_str(question.trim_end());
+        }
         output
     }
 
@@ -5096,6 +5107,10 @@ impl SymbolicReasoner {
         }
         output.push('\n');
         output.push_str(&self.completion.render_episode());
+        if let Some(question) = self.completion_ask_line() {
+            output.push('\n');
+            output.push_str(question.trim_end());
+        }
         output
     }
 
@@ -5200,6 +5215,36 @@ impl SymbolicReasoner {
 
     pub fn completion_regression_report(&self) -> String {
         self.completion.render_regression_report()
+    }
+
+    /// 选一个候选向用户追问；每轮最多一个，重复候选会被降权。
+    pub fn completion_next_question(&mut self) -> Option<CompletionQuestion> {
+        self.completion.next_question()
+    }
+
+    pub fn completion_question_report(&mut self) -> String {
+        if self.completion.questions_muted() {
+            return "主动追问已静音。用「允许提问」恢复。".to_string();
+        }
+        match self.completion.next_question() {
+            Some(question) => format!(
+                "补全提问（{}，效用 {:.1}）：{}",
+                question.kind.label(),
+                question.utility,
+                question.text
+            ),
+            None => "当前没有值得追问的候选（证据不足、已裁定或已静音）。".to_string(),
+        }
+    }
+
+    fn completion_ask_line(&mut self) -> Option<String> {
+        self.completion.next_question().map(|question| {
+            format!(
+                "  下一问（{}）：{}\n",
+                question.kind.label(),
+                question.text
+            )
+        })
     }
 
     /// 把恢复阶梯（或宿主脚本）的一次用户裁决写入补全台账。
@@ -5376,6 +5421,29 @@ impl SymbolicReasoner {
             "补全测试" | "补全回归" | "知识回归" | "补全测试报告"
         ) {
             return Some(self.completion_regression_report());
+        }
+        if matches!(
+            trimmed,
+            "补全提问" | "下一个问题" | "该问什么" | "主动提问" | "问我"
+        ) {
+            return Some(self.completion_question_report());
+        }
+        if matches!(trimmed, "别问了" | "不要追问" | "静音补全提问" | "停止提问") {
+            let changed = self.completion.mute_questions();
+            return Some(if changed {
+                "好，主动追问已静音；已有候选仍可用「补全报告」查看。说「允许提问」可恢复。"
+                    .to_string()
+            } else {
+                "主动追问已经是静音状态。".to_string()
+            });
+        }
+        if matches!(trimmed, "允许提问" | "恢复提问" | "解除静音") {
+            let changed = self.completion.unmute_questions();
+            return Some(if changed {
+                "已恢复主动追问。".to_string()
+            } else {
+                "主动追问本来就是开启的。".to_string()
+            });
         }
         for prefix in [
             "晋升补全规则：",
@@ -15698,6 +15766,23 @@ types = [
             .handle_completion_command("晋升补全规则：")
             .expect("空参数应给出用法")
             .contains("用法"));
+        assert!(opened.contains("下一问"), "打开回合应给出一个提问：{}", opened);
+        assert!(reasoner
+            .handle_completion_command("补全提问")
+            .expect("提问命令应被接管")
+            .contains("补全提问"));
+        assert!(reasoner
+            .handle_completion_command("别问了")
+            .expect("静音命令应被接管")
+            .contains("静音"));
+        assert!(reasoner
+            .handle_completion_command("补全提问")
+            .expect("静音后仍应回执")
+            .contains("已静音"));
+        assert!(reasoner
+            .handle_completion_command("允许提问")
+            .expect("恢复提问应被接管")
+            .contains("已恢复"));
     }
 
     #[test]

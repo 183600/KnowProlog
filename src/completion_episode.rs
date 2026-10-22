@@ -40,6 +40,12 @@ pub const DEFAULT_MAX_RULES: usize = 64;
 pub const DEFAULT_MAX_BATCH_ENTITIES: usize = 256;
 /// 运行期裁决测试集的数量上限。
 pub const DEFAULT_MAX_TESTS: usize = 256;
+/// 低于该效用的候选不值得打扰用户。
+pub const QUESTION_MIN_UTILITY: f64 = 12.0;
+/// 每重复提问一次扣减的效用。
+pub const QUESTION_REPEAT_PENALTY: f64 = 18.0;
+/// 同一候选最多主动追问的次数。
+pub const QUESTION_MAX_REPEATS: u64 = 2;
 
 /// 一条补全的证据强度。强度顺序：Entailed > Induced > Analogical。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -532,6 +538,36 @@ impl CompletionTest {
     }
 }
 
+/// 提问形式：是非、二选一，或没有候选时的开放问。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionKind {
+    Confirm,
+    Choice,
+    Open,
+}
+
+impl QuestionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            QuestionKind::Confirm => "是非",
+            QuestionKind::Choice => "选择",
+            QuestionKind::Open => "开放",
+        }
+    }
+}
+
+/// 一次经过效用排序的提问。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletionQuestion {
+    pub candidate_id: String,
+    pub triple: Triple,
+    pub kind: QuestionKind,
+    pub utility: f64,
+    pub text: String,
+    pub alternatives: Vec<String>,
+}
+
 /// 一次重放中的失败项。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegressionFailure {
@@ -690,6 +726,10 @@ pub struct CompletionLedger {
     confirmed_triples: BTreeSet<Triple>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     regression_tests: Vec<CompletionTest>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    asked_questions: BTreeMap<String, u64>,
+    #[serde(default)]
+    question_muted: bool,
     tick: u64,
     max_candidates: usize,
     max_closure: usize,
@@ -727,6 +767,8 @@ impl CompletionLedger {
             refuted_triples: BTreeSet::new(),
             confirmed_triples: BTreeSet::new(),
             regression_tests: Vec::new(),
+            asked_questions: BTreeMap::new(),
+            question_muted: false,
             tick: 0,
             max_candidates: max_candidates.max(1),
             max_closure: max_closure.max(1),
@@ -746,6 +788,8 @@ impl CompletionLedger {
             && self.refuted_triples.is_empty()
             && self.confirmed_triples.is_empty()
             && self.regression_tests.is_empty()
+            && self.asked_questions.is_empty()
+            && !self.question_muted
     }
 
     /// 从持久化快照恢复后重新夹紧上限：快照文件不可信，不能让其中的
@@ -762,8 +806,10 @@ impl CompletionLedger {
             .clamp(1, DEFAULT_MAX_BATCH_ENTITIES);
         self.episodes.truncate(self.max_episodes);
         self.rules.truncate(self.max_rules);
-        self.regression_tests
-            .truncate(DEFAULT_MAX_TESTS);
+        self.regression_tests.truncate(DEFAULT_MAX_TESTS);
+        if self.asked_questions.len() > DEFAULT_MAX_TESTS {
+            self.asked_questions.clear();
+        }
         self.active = self.active.filter(|index| *index < self.episodes.len());
     }
 
@@ -808,6 +854,141 @@ impl CompletionLedger {
     /// 该三元组是否被用户否决过（任何通道）。
     pub fn is_refuted(&self, triple: &Triple) -> bool {
         self.refuted_triples.contains(triple)
+    }
+
+    pub fn questions_muted(&self) -> bool {
+        self.question_muted
+    }
+
+    /// 用户说「别问了」：长期静音主动追问（随快照持久化）。
+    pub fn mute_questions(&mut self) -> bool {
+        if self.question_muted {
+            return false;
+        }
+        self.question_muted = true;
+        true
+    }
+
+    pub fn unmute_questions(&mut self) -> bool {
+        if !self.question_muted {
+            return false;
+        }
+        self.question_muted = false;
+        true
+    }
+
+    /// 选一个最有判别力的问题；每轮最多一个，重复提问会被扣分。
+    ///
+    /// 效用是确定性的：置信度 + 证据强度 + 规则杠杆 - 重复惩罚。
+    /// 没有候选、证据太弱或已静音时返回 `None`，绝不为了追问而追问。
+    pub fn next_question(&mut self) -> Option<CompletionQuestion> {
+        if self.question_muted {
+            return None;
+        }
+        let episode = self.current_episode()?;
+        let mut scored: Vec<(f64, &CompletionCandidate)> = episode
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.status == CandidateStatus::Pending)
+            .filter(|candidate| !self.is_adjudicated(&candidate.triple))
+            .filter_map(|candidate| {
+                let asked = self
+                    .asked_questions
+                    .get(&candidate.id)
+                    .copied()
+                    .unwrap_or(0);
+                if asked >= QUESTION_MAX_REPEATS {
+                    return None;
+                }
+                let mut utility = candidate.confidence.clamp(0.0, 1.0) * 60.0;
+                utility += match candidate.warrant {
+                    Warrant::Entailed => 12.0,
+                    Warrant::Induced => 8.0,
+                    Warrant::Analogical => 0.0,
+                };
+                utility += match candidate.origin {
+                    CandidateOrigin::BatchClosure => 4.0,
+                    CandidateOrigin::PathPrediction => 2.0,
+                    CandidateOrigin::Manual => 1.0,
+                    CandidateOrigin::Analogical => 0.0,
+                };
+                if candidate.rule.is_some() {
+                    utility += 5.0;
+                }
+                if candidate
+                    .rule_id
+                    .as_deref()
+                    .and_then(|id| self.rule(id))
+                    .is_some_and(|rule| rule.confirmations > 0)
+                {
+                    utility += 3.0;
+                }
+                utility += (candidate.evidence.len().min(3) as f64) * 0.5;
+                utility -= asked as f64 * QUESTION_REPEAT_PENALTY;
+                (utility >= QUESTION_MIN_UTILITY).then_some((utility, candidate))
+            })
+            .collect();
+        scored.sort_by(|(left_utility, left), (right_utility, right)| {
+            right_utility
+                .total_cmp(left_utility)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let (utility, candidate) = scored.first().map(|(utility, candidate)| (*utility, *candidate))?;
+        let alternatives: Vec<String> = episode
+            .candidates
+            .iter()
+            .filter(|other| {
+                other.status == CandidateStatus::Pending
+                    && other.id != candidate.id
+                    && other.triple.subject == candidate.triple.subject
+                    && other.triple.predicate == candidate.triple.predicate
+                    && other.triple.object != candidate.triple.object
+                    && !self.is_adjudicated(&other.triple)
+            })
+            .map(|other| other.triple.object.clone())
+            .collect();
+        let kind = if alternatives.is_empty() {
+            QuestionKind::Confirm
+        } else {
+            QuestionKind::Choice
+        };
+        let text = match kind {
+            QuestionKind::Confirm => format!(
+                "「{}」的「{}」是「{}」吗？（{}来源，置信度 {:.2}；确认补全：{} / 否定补全：{}）",
+                candidate.triple.subject,
+                candidate.triple.predicate,
+                candidate.triple.object,
+                candidate.origin.label(),
+                candidate.confidence,
+                short_id(&candidate.id),
+                short_id(&candidate.id)
+            ),
+            QuestionKind::Choice => format!(
+                "「{}」的「{}」更可能是「{}」还是「{}」？（确认补全：{}）",
+                candidate.triple.subject,
+                candidate.triple.predicate,
+                candidate.triple.object,
+                alternatives.join("」/「"),
+                short_id(&candidate.id)
+            ),
+            QuestionKind::Open => format!(
+                "「{}」的「{}」应该是多少？",
+                candidate.triple.subject, candidate.triple.predicate
+            ),
+        };
+        let question = CompletionQuestion {
+            candidate_id: candidate.id.clone(),
+            triple: candidate.triple.clone(),
+            kind,
+            utility,
+            text,
+            alternatives,
+        };
+        *self
+            .asked_questions
+            .entry(question.candidate_id.clone())
+            .or_insert(0) += 1;
+        Some(question)
     }
 
     /// 推进逻辑轮次（无挂钟，TTL/审计均用此计数）。
@@ -2452,6 +2633,58 @@ mod tests {
         ledger
             .promote(&rule_id, RuleScope::Namespace)
             .expect("更正后应可晋升");
+    }
+
+    #[test]
+    fn question_policy_picks_one_discriminative_candidate_and_respects_mute() {
+        let predictor = chain_predictor();
+        let mut ledger = CompletionLedger::new();
+        open_with_predictions(&mut ledger, &predictor, "孙八");
+        let first = ledger.next_question().expect("应有可追问候选");
+        assert_eq!(first.triple.subject, "孙八");
+        assert!(first.utility >= QUESTION_MIN_UTILITY);
+        assert!(first.text.contains("孙八"));
+        assert!(matches!(
+            first.kind,
+            QuestionKind::Confirm | QuestionKind::Choice
+        ));
+        let count = ledger.current_episode().unwrap().pending_count();
+        let mut asked = 1usize;
+        while asked < count.saturating_mul(QUESTION_MAX_REPEATS as usize) {
+            if ledger.next_question().is_none() {
+                break;
+            }
+            asked += 1;
+        }
+        assert!(ledger.next_question().is_none(), "重复追问应被预算截停");
+        assert!(ledger
+            .asked_questions
+            .values()
+            .all(|count| *count <= QUESTION_MAX_REPEATS));
+        assert!(ledger.mute_questions());
+        assert!(ledger.next_question().is_none());
+    }
+
+    #[test]
+    fn question_policy_uses_choice_when_multiple_values_compete() {
+        let mut ledger = CompletionLedger::new();
+        ledger.open_episode("甲", None);
+        for object in ["乙", "丙"] {
+            assert!(ledger.add_candidate(
+                Triple::new("甲", "朋友", object),
+                Warrant::Induced,
+                0.6,
+                vec![Triple::new(object, "同类", "甲")],
+                format!("候选{}", object),
+            ));
+        }
+        let question = ledger.next_question().expect("应有选择问");
+        assert_eq!(question.kind, QuestionKind::Choice);
+        assert_eq!(question.alternatives.len(), 1);
+        assert!(question.text.contains("更可能是"));
+        assert!(!ledger.unmute_questions(), "未静音时恢复应无变化");
+        assert!(ledger.mute_questions());
+        assert!(ledger.unmute_questions());
     }
 
     #[test]
