@@ -3009,6 +3009,7 @@ async fn run_fuse(
 
 /// `forge`：离线从正例/反例归纳 token 正则，打印展开与探针结果。
 /// 只读配置与例子，不打开存储、不写台账；`--activate` 仅预览物化条目。
+#[allow(clippy::too_many_arguments)]
 fn run_pattern_forge(
     config: &SystemConfig,
     name: &str,

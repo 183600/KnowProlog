@@ -546,6 +546,7 @@ pub enum ForgeError {
     NotFound(String),
     Ambiguous(String),
     NotActive(String),
+    StillActive(String),
     AlreadyRetired(String),
     BadSpec(String),
 }
@@ -591,6 +592,9 @@ impl std::fmt::Display for ForgeError {
                 write!(f, "锻造规则「{}」前缀不唯一，请给出更长的 id", key)
             }
             ForgeError::NotActive(id) => write!(f, "锻造规则 {} 尚未激活", id),
+            ForgeError::StillActive(id) => {
+                write!(f, "锻造规则 {} 仍在激活中；请先退役再遗忘", id)
+            }
             ForgeError::AlreadyRetired(id) => write!(f, "锻造规则 {} 已经退役", id),
             ForgeError::BadSpec(detail) => write!(f, "锻造指令格式错误：{}", detail),
         }
@@ -1153,10 +1157,7 @@ impl PatternForge {
             .map(|pattern| pattern.status == ForgeStatus::Active)
             .unwrap_or(false)
         {
-            return Err(ForgeError::NotActive(format!(
-                "{}（请先退役再遗忘）",
-                id
-            )));
+            return Err(ForgeError::StillActive(id));
         }
         self.turn += 1;
         self.patterns
@@ -1303,6 +1304,7 @@ impl PatternForge {
         lines.join("\n")
     }
 
+    #[allow(clippy::io_other_error)] // 保持 Rust 1.70 兼容：io::Error::other 是更晚的稳定项
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)?;
@@ -1365,7 +1367,7 @@ pub fn parse_forge_spec(spec: &str) -> Result<ForgeRequest, ForgeError> {
     let guard = match parts.get(5).filter(|part| !part.is_empty()) {
         Some(part) => Some(
             crate::pattern_ir::parse_context_guard(part)
-                .map_err(|error| ForgeError::BadSpec(error))?,
+                .map_err(ForgeError::BadSpec)?,
         ),
         None => None,
     };
