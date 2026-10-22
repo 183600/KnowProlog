@@ -526,6 +526,19 @@ impl ClarificationSession {
         let Some(current) = self.current.take() else {
             return ClarificationReply::Finished;
         };
+        // 更正优先于批量：「都不是，是王五」仍按更正处理，不能误否定全部。
+        if kind != AnswerKind::Unknown {
+            if let Some(index) = self.correction_target(text, &current) {
+                let confirmed = self.queue.remove(index);
+                self.rejected.push(current.clone());
+                self.confirmed.push(confirmed.clone());
+                self.advance();
+                return ClarificationReply::Corrected {
+                    rejected: current,
+                    confirmed,
+                };
+            }
+        }
         // 批量回答只在还有多条待问时生效；只剩一条时按普通是/不是处理。
         if !self.queue.is_empty() {
             if let Some(scope) = clarification_batch_scope(text) {
@@ -541,18 +554,6 @@ impl ClarificationSession {
                         ClarificationReply::RejectedAll(batch)
                     }
                     _ => ClarificationReply::Unrecognized,
-                };
-            }
-        }
-        if kind != AnswerKind::Unknown {
-            if let Some(index) = self.correction_target(text, &current) {
-                let confirmed = self.queue.remove(index);
-                self.rejected.push(current.clone());
-                self.confirmed.push(confirmed.clone());
-                self.advance();
-                return ClarificationReply::Corrected {
-                    rejected: current,
-                    confirmed,
                 };
             }
         }
@@ -2444,6 +2445,28 @@ mod tests {
             3,
             "批量确认要全部记入已确认"
         );
+    }
+
+    #[test]
+    fn correction_wins_over_batch_rejection() {
+        let hypotheses = vec![
+            hyp("师傅", "张三", "李四", 0.9),
+            hyp("师傅", "张三", "王五", 0.6),
+        ];
+        let mut session = ClarificationSession::start(&hypotheses);
+        let reply = session.respond("都不是，是王五");
+        let ClarificationReply::Corrected {
+            rejected,
+            confirmed,
+        } = reply
+        else {
+            panic!("应识别为更正而不是批量否定：{:?}", reply)
+        };
+        assert_eq!(rejected.atom.display(), hypotheses[0].atom.display());
+        assert_eq!(confirmed.atom.display(), hypotheses[1].atom.display());
+        assert!(session.is_finished());
+        assert_eq!(session.rejected.len(), 1);
+        assert_eq!(session.confirmed.len(), 1);
     }
 
     #[test]
