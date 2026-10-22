@@ -78,6 +78,7 @@ use crate::plugin::{PluginOutcome, PluginRuntime};
 use crate::prolog_engine::PrologFact;
 use crate::prompt_spec::{self, PromptMode};
 use crate::quality::QualityIndex;
+use crate::reading::{Reading, Residual};
 use crate::recovery::RecoveryMode;
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
@@ -402,6 +403,11 @@ pub struct TurnResponse {
     /// 本轮的认识论定性（仅恢复模式开启且本轮发生失败/恢复动作时出现）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic: Option<EpistemicView>,
+    /// 本轮的结构化读法诊断：区分「没这个词」「没这个实体」「没这条事实」。
+    /// 只在让位/失败轮生成（成功轮不额外分词）；客户端据此决定补词、登记
+    /// 实体、补事实还是改写问句，而不是只看到「让位了」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical: Option<LexicalView>,
     /// 接地清单：本轮输入中链接到知识图谱的实体（词面 ↔ URI ↔ 类型 ↔ 角色）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<GroundingCitation>,
@@ -424,6 +430,60 @@ pub struct TurnResponse {
     /// 只在元解释轮出现，且与回答一样受节点/深度/字节预算约束。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derivation: Option<crate::derivation::Derivation>,
+}
+
+/// 一条结构化的读法残差：稳定枚举代码 + 局部文本 + 可执行修复动作。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalResidualView {
+    /// 稳定类别（`unknown_token` / `unknown_entity` / `unknown_predicate` / ...）。
+    pub kind: String,
+    pub label: String,
+    /// 失败阶段（`tag` / `plan` / `link` / `execute` / ...）。
+    pub stage: String,
+    /// `info` / `warning` / `blocking`。
+    pub severity: String,
+    /// 稳定修复动作（`add_word` / `supply_entity` / `supply_predicate` / ...）。
+    pub repair: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    pub detail: String,
+}
+
+/// 一轮的读法状态与有界残差表；回答内容不变，只把「为什么读不懂」外化。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LexicalView {
+    /// `ready` / `partial` / `unreadable`。
+    pub status: String,
+    pub label: String,
+    pub blocking: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub residuals: Vec<LexicalResidualView>,
+}
+
+impl LexicalView {
+    pub fn from_reading(reading: &Reading) -> Self {
+        Self {
+            status: reading.status().code().to_string(),
+            label: reading.status().label().to_string(),
+            blocking: reading.blocking_count(),
+            residuals: reading.residuals.iter().map(Self::residual).collect(),
+        }
+    }
+
+    fn residual(residual: &Residual) -> LexicalResidualView {
+        LexicalResidualView {
+            kind: residual.kind.code().to_string(),
+            label: residual.kind.label().to_string(),
+            stage: residual.stage.code().to_string(),
+            severity: residual.severity.code().to_string(),
+            repair: residual.repair.code().to_string(),
+            surface: residual.surface.clone(),
+            expected: residual.expected.clone(),
+            detail: residual.detail.clone(),
+        }
+    }
 }
 
 /// 一条接地引用：回答依据的实体身份（URI 可寻址、词面可回溯、类型可审计）。
@@ -715,6 +775,7 @@ impl Session {
             focus: self.manager.focus_entity().map(str::to_string),
             policy: self.policy.clone(),
             epistemic: None,
+            lexical: None,
             entities: Vec::new(),
             board: self.manager.board().view(self.reasoner.revision()),
             fault: Some(fault),
@@ -865,6 +926,14 @@ impl Session {
             None => None,
         };
         let focus = self.manager.focus_entity().map(str::to_string);
+        // 让位轮才做结构化读法诊断：成功轮不额外分词，回答路径保持零开销。
+        let lexical = if status == "deferred" {
+            self.reasoner
+                .read_question(&input)
+                .map(|reading| LexicalView::from_reading(&reading))
+        } else {
+            None
+        };
         // 接地引用：本轮输入链接到的实体（与回答同源，可审计、可寻址）
         let entities = self
             .reasoner
@@ -898,6 +967,7 @@ impl Session {
             focus,
             policy: self.policy.clone(),
             epistemic,
+            lexical,
             entities,
             board: self.manager.board().view(self.reasoner.revision()),
             fault: None,
@@ -2703,6 +2773,7 @@ fn chat_completion_response(
             "focus": turn.focus,
             "policy": turn.policy,
             "entities": turn.entities,
+            "lexical": turn.lexical,
         }
     })
 }
@@ -2920,6 +2991,7 @@ async fn stream_turn(
         "kind": turn.kind,
         "focus": turn.focus,
         "entities": turn.entities,
+        "lexical": turn.lexical,
         "fault": turn.fault,
         "open_turn": turn.open_turn,
         "resumed": turn.resumed,
@@ -4370,6 +4442,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             focus: None,
             policy: SessionPolicy::default(),
             epistemic: None,
+            lexical: None,
             entities: Vec::new(),
             board: None,
             fault: None,
@@ -4418,6 +4491,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             focus: None,
             policy: SessionPolicy::default(),
             epistemic: None,
+            lexical: None,
             entities: Vec::new(),
             board: None,
             fault: None,
@@ -4527,6 +4601,55 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert!(empty.is_default());
         let detailed = SessionPolicy::from_system_texts(&["请详细展开".to_string()]);
         assert_eq!(detailed.style, PolicyStyle::Detailed);
+    }
+
+    #[tokio::test]
+    async fn deferred_turn_exposes_structured_lexical_diagnosis() {
+        let (addr, _server) = start_server(2);
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": "今天天气怎么样"}]
+        })
+        .to_string();
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let lexical = &value["knowprolog"]["lexical"];
+        assert_eq!(lexical["status"], "unreadable", "{}", body);
+        assert!(lexical["blocking"].as_u64().unwrap_or(0) >= 1);
+        let residuals = lexical["residuals"].as_array().expect("应附残差表");
+        assert!(residuals.iter().any(|residual| {
+            residual["kind"] == "unsupported_question" && residual["repair"] == "rewrite_question"
+        }));
+        assert!(residuals
+            .iter()
+            .any(|residual| residual["kind"] == "unknown_token"));
+
+        // 成功轮不额外分词，因而不带 lexical 字段。
+        let payload = serde_json::json!({
+            "messages": [{"role": "user", "content": "姚明的身高是多少"}]
+        })
+        .to_string();
+        let (_, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            &[("Content-Type", "application/json")],
+            &payload,
+        )
+        .await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            value["knowprolog"]["lexical"].is_null(),
+            "成功轮不应生成读法诊断：{}",
+            body
+        );
     }
 
     #[tokio::test]
