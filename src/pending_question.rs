@@ -458,6 +458,10 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
     if contains_question_marker(text) || text.contains('?') || text.contains('？') {
         return AnswerBinding::NotAnAnswer;
     }
+    // 否定陈述不能被读成肯定回填：「李四不是王五的师傅」不是答案。
+    if text.contains("不是") || text.contains("并非") || text.contains("没有") {
+        return AnswerBinding::NotAnAnswer;
+    }
     // 带前缀的命令式输入（「记住：…」「教学：…」）不是对悬问的短答。
     if text.contains('：') || text.contains(':') {
         return AnswerBinding::NotAnAnswer;
@@ -476,10 +480,13 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
         // 是完整陈述句但填的不是这个洞：让位，不把它当裸取值。
         return AnswerBinding::NotAnAnswer;
     }
-    // 短答「是王五」。
+    // 短答「是王五」/「叫王五」。
     let mut value = normalized;
-    if let Some(rest) = value.strip_prefix('是') {
-        value = rest.trim();
+    for prefix in ["就是", "叫做", "叫", "是"] {
+        if let Some(rest) = value.strip_prefix(prefix) {
+            value = rest.trim();
+            break;
+        }
     }
     for suffix in ["吧", "呀", "啊"] {
         if let Some(rest) = value.strip_suffix(suffix) {
@@ -489,7 +496,9 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
     let value = value.trim();
     if value.is_empty()
         || value.chars().count() > MAX_BARE_ANSWER_CHARS
-        || value.contains(['是', '为', '，', ',', '：', ':', '；', ';'])
+        || value.contains(['是', '为', '，', ',', '：', ':', '；', ';', '叫'])
+        || value.contains(hole.subject.as_str())
+        || (!hole.predicate.is_empty() && value.contains(hole.predicate.as_str()))
     {
         return AnswerBinding::NotAnAnswer;
     }
@@ -563,6 +572,31 @@ mod tests {
         assert_eq!(
             interpret_answer("记住：李四的师傅是王五", &hole()),
             AnswerBinding::NotAnAnswer
+        );
+    }
+
+    #[test]
+    fn negation_and_full_statement_are_not_swallowed_as_bare_values() {
+        assert_eq!(
+            interpret_answer("李四的师傅不是王五", &hole()),
+            AnswerBinding::NotAnAnswer
+        );
+        assert_eq!(
+            interpret_answer("李四的师傅是不是王五", &hole()),
+            AnswerBinding::NotAnAnswer
+        );
+        assert_eq!(
+            interpret_answer("李四没有师傅", &hole()),
+            AnswerBinding::NotAnAnswer
+        );
+        assert_eq!(
+            interpret_answer("李四的师傅叫王五", &hole()),
+            AnswerBinding::NotAnAnswer,
+            "不是「X 是 Y」的整句也不该被当成裸取值"
+        );
+        assert_eq!(
+            interpret_answer("叫王五", &hole()),
+            AnswerBinding::Fill("王五".to_string())
         );
     }
 
