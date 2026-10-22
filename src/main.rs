@@ -3952,6 +3952,10 @@ struct AskAnswer {
     answer: Option<String>,
 }
 
+fn is_ask_terminator(question: &str) -> bool {
+    matches!(question.trim(), "quit" | "exit" | "退出" | "q")
+}
+
 /// `ask`：把交互模式的核心符号推理做成一次性、无横幅的脚本接口。
 ///
 /// 只读知识存储，不写对话记忆；事实、谓词画像、实体别名与律典的装配顺序
@@ -4027,9 +4031,20 @@ async fn run_ask(
     }
     reasoner.observe_facts(&facts);
 
+    // 与交互/服务同一条对话前通道：查询板、指代、澄清与身份回合都在
+    // reasoner.answer 之前；一次 ask 的多行输入共享同一会话记忆。
+    let mut dialogue = DialogueManager::new();
     let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
     for question in questions {
-        let answer = reasoner.answer(&question);
+        // 管道输入常沿用交互脚本的收尾行：不要把它当成待回答的问题。
+        if is_ask_terminator(&question) {
+            break;
+        }
+        let answer = dialogue
+            .plan_pure_dialogue(&question, &reasoner)
+            .or_else(|| dialogue.plan_reply(&question, &reasoner))
+            .map(|reply| reply.text)
+            .or_else(|| reasoner.answer(&question));
         answers.push(AskAnswer {
             question,
             status: if answer.is_some() {
@@ -11852,6 +11867,10 @@ mod session_tests {
                 strict: false
             })
         ));
+        for terminator in ["quit", "exit", "退出", "q", " 退出 "] {
+            assert!(is_ask_terminator(terminator), "{}", terminator);
+        }
+        assert!(!is_ask_terminator("为什么退出假设"));
     }
 
     /// 各命令必须被 is_command_like 识别，避免澄清追问时被吞掉
