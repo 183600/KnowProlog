@@ -719,6 +719,8 @@ impl Session {
         self.manager.clear_last_recovery();
         // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
         self.sync_recovery_confirmed_facts();
+        // 假设世界命令使用原始措辞，避免被插件改写；带「那么」的一次性反事实句让位。
+        let assumption_command = self.reasoner.handle_assumption_command(&raw_input);
 
         // 插件改写预通道：词表/本体归一只影响管线输入，原始措辞仍用于接地引用。
         let plugin_outcome: Option<PluginOutcome> = self
@@ -733,75 +735,87 @@ impl Session {
         let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
         control.enter(TurnPhase::Recall)?;
-        let dialogue = self
-            .manager
-            .plan_pure_dialogue(&input, &self.reasoner)
-            .or_else(|| self.manager.plan_reply(&input, &self.reasoner));
+        let dialogue = if assumption_command.is_some() {
+            None
+        } else {
+            self.manager
+                .plan_pure_dialogue(&input, &self.reasoner)
+                .or_else(|| self.manager.plan_reply(&input, &self.reasoner))
+        };
 
         control.enter(TurnPhase::Reason)?;
-        let (status, source, kind, plan, reply, derivation) =
-            if let Some((text, plan, kind)) = plugin_answer {
-                (
-                    "answered".to_string(),
-                    "plugin".to_string(),
-                    Some(kind),
-                    plan,
-                    text,
-                    None,
-                )
-            } else if let Some(reply) = dialogue {
-                let text = self
-                    .plugin
-                    .as_ref()
-                    .map(|runtime| runtime.lock().style_wrap(&reply.text))
-                    .unwrap_or(reply.text);
-                (
-                    "answered".to_string(),
-                    "dialogue".to_string(),
-                    Some(reply.kind.label().to_string()),
-                    reply.plan,
-                    text,
-                    reply.derivation,
-                )
-            } else if let Some(answer) = self.reasoner.answer(&input) {
-                (
-                    "answered".to_string(),
-                    "reasoner".to_string(),
-                    None,
-                    Vec::new(),
-                    answer,
-                    None,
-                )
-            } else if let Some((text, plan)) = self
+        let (status, source, kind, plan, reply, derivation) = if let Some(text) = assumption_command
+        {
+            (
+                "answered".to_string(),
+                "assumption".to_string(),
+                Some("assumption_world".to_string()),
+                vec!["assumption_world".to_string()],
+                text,
+                None,
+            )
+        } else if let Some((text, plan, kind)) = plugin_answer {
+            (
+                "answered".to_string(),
+                "plugin".to_string(),
+                Some(kind),
+                plan,
+                text,
+                None,
+            )
+        } else if let Some(reply) = dialogue {
+            let text = self
                 .plugin
                 .as_ref()
-                .and_then(|runtime| runtime.lock().policy_reply(&input))
-            {
-                let text = self
-                    .plugin
-                    .as_ref()
-                    .map(|runtime| runtime.lock().style_wrap(&text))
-                    .unwrap_or(text);
-                (
-                    "answered".to_string(),
-                    "plugin".to_string(),
-                    Some("policy".to_string()),
-                    vec![plan],
-                    text,
-                    None,
-                )
-            } else {
-                // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
-                self.manager.note_deferred(&input, &self.reasoner);
-                (
-                    "deferred".to_string(),
-                    "none".to_string(),
-                    None,
-                    Vec::new(),
-                    String::new(),
-                    None,
-                )
-            };
+                .map(|runtime| runtime.lock().style_wrap(&reply.text))
+                .unwrap_or(reply.text);
+            (
+                "answered".to_string(),
+                "dialogue".to_string(),
+                Some(reply.kind.label().to_string()),
+                reply.plan,
+                text,
+                reply.derivation,
+            )
+        } else if let Some(answer) = self.reasoner.answer(&input) {
+            (
+                "answered".to_string(),
+                "reasoner".to_string(),
+                None,
+                Vec::new(),
+                answer,
+                None,
+            )
+        } else if let Some((text, plan)) = self
+            .plugin
+            .as_ref()
+            .and_then(|runtime| runtime.lock().policy_reply(&input))
+        {
+            let text = self
+                .plugin
+                .as_ref()
+                .map(|runtime| runtime.lock().style_wrap(&text))
+                .unwrap_or(text);
+            (
+                "answered".to_string(),
+                "plugin".to_string(),
+                Some("policy".to_string()),
+                vec![plan],
+                text,
+                None,
+            )
+        } else {
+            // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
+            self.manager.note_deferred(&input, &self.reasoner);
+            (
+                "deferred".to_string(),
+                "none".to_string(),
+                None,
+                Vec::new(),
+                String::new(),
+                None,
+            )
+        };
         control.enter(TurnPhase::Generate)?;
         if !reply.is_empty() && self.history.len() < HISTORY_LIMIT {
             self.history.push(reply.clone());

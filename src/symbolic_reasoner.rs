@@ -313,6 +313,10 @@ pub struct DialogueSnapshot {
     // 空台账不落盘，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<CompletionLedger>,
+    // 当前假设世界的临时假设（未确认、未写入会话事实层）；
+    // 空世界不落盘，旧快照字节保持不变
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<SnapshotAtom>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -523,6 +527,7 @@ impl DialogueContext {
             frames: None,
             ontology: None,
             completion: None,
+            assumptions: Vec::new(),
         }
     }
 
@@ -710,6 +715,14 @@ impl ContextRewrite {
     }
 }
 
+/// 一个有界的临时假设世界：跨轮追问共享同一组假设，退出即整体丢弃。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssumptionWorld {
+    /// 由假设规范形哈希得到的稳定 id（与插入顺序无关）。
+    pub id: String,
+    pub assumptions: Vec<Atom>,
+}
+
 /// 本体视图适配器：帧解析与合一期间只读消费对齐器/谓词清单（排序判定）
 struct FrameOntology<'a>(&'a SymbolicReasoner);
 
@@ -775,6 +788,8 @@ pub struct SymbolicReasoner {
     frames: FrameMemory,
     // 会话级临时事实（被采纳的假设；跨会话持久化，但永不写知识图谱）
     session_facts: Vec<Atom>,
+    // 当前假设世界：临时前提只在世界内参与推理，退出/分叉时整体丢弃
+    assumption_world: Option<AssumptionWorld>,
     // 会话级否定事实：路径遍历中的阻断边（不写知识图谱，可跨会话持久化）
     session_negative_facts: Vec<Atom>,
     // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
@@ -854,6 +869,7 @@ impl Clone for SymbolicReasoner {
             abduction: self.abduction.clone(),
             frames: self.frames.clone(),
             session_facts: self.session_facts.clone(),
+            assumption_world: self.assumption_world.clone(),
             session_negative_facts: self.session_negative_facts.clone(),
             session_clauses: self.session_clauses.clone(),
             clarification: self.clarification.clone(),
@@ -1053,6 +1069,7 @@ impl SymbolicReasoner {
             abduction,
             frames: FrameMemory::new(),
             session_facts: Vec::new(),
+            assumption_world: None,
             session_negative_facts: Vec::new(),
             session_clauses: Vec::new(),
             clarification: None,
@@ -1128,6 +1145,8 @@ impl SymbolicReasoner {
     /// 注入故障。知识派生状态（剖面/规则/向量/台账）原样保留。
     fn reset_session_state(&mut self) {
         self.context.clear();
+        // 假设世界是会话态：分叉/重置时整体丢弃，不带走任何临时前提。
+        self.discard_assumption_world();
         let lessons_were_taught = !self.lessons_parsed.is_empty();
         self.lessons.clear();
         self.lessons_parsed.clear();
@@ -2409,7 +2428,7 @@ impl SymbolicReasoner {
             engine.add_clause(clause_from_path_rule(rule));
         }
         // 会话级假设事实必须在重建后重新注入（否则刷新知识图谱会丢失"采纳的假设"）
-        for atom in &self.session_facts {
+        for atom in self.positive_session_atoms() {
             engine.add_fact_atom(atom.clone());
         }
         // 会话级 Horn 规则同样在重建后重新注入（教过的一般规则不能因刷新而丢失）
@@ -2446,7 +2465,7 @@ impl SymbolicReasoner {
         for (entity, etype) in self.generator.typed_entities() {
             engine.add_fact(Atom::rel(PROOF_TYPE, &entity, &etype));
         }
-        for atom in &self.session_facts {
+        for atom in self.positive_session_atoms() {
             engine.add_fact(atom.clone());
         }
         if self.config.enable_association_rules {
@@ -3920,6 +3939,259 @@ impl SymbolicReasoner {
         Some(abduction::render_what_if(&result, &render))
     }
 
+    /// 当前假设世界（只读）。
+    pub fn assumption_world(&self) -> Option<&AssumptionWorld> {
+        self.assumption_world.as_ref()
+    }
+
+    /// 会话事实 + 假设世界的正向原子（提供者顺序稳定，便于确定性遍历）。
+    fn positive_session_atoms(&self) -> impl Iterator<Item = &Atom> {
+        self.session_facts.iter().chain(
+            self.assumption_world
+                .iter()
+                .flat_map(|world| world.assumptions.iter()),
+        )
+    }
+
+    fn inject_assumption_atom(&mut self, atom: &Atom) {
+        self.register_atom_vocabulary(atom);
+        if self.config.enable_resolution {
+            self.resolver.add_fact_atom(atom.clone());
+        }
+        self.index_session_atom(atom);
+    }
+
+    /// 丢弃当前假设世界：只撤回本世界注入且不被图谱/会话事实支持的原子。
+    fn discard_assumption_world(&mut self) -> Option<AssumptionWorld> {
+        let world = self.assumption_world.take()?;
+        for atom in &world.assumptions {
+            if self.graph_supports_atom(atom) || self.session_facts.contains(atom) {
+                continue;
+            }
+            self.unindex_session_atom(atom);
+            if self.config.enable_resolution {
+                self.resolver.remove_fact_atom(atom);
+            }
+        }
+        if self.config.enable_soft_logic {
+            self.rebuild_soft_logic();
+        }
+        Some(world)
+    }
+
+    fn assumption_world_id(atoms: &[Atom]) -> String {
+        let mut keys: Vec<String> = atoms.iter().map(Atom::display).collect();
+        keys.sort();
+        keys.dedup();
+        let digest = canonical::canonical_digest(&keys).unwrap_or_default();
+        format!("w-{}", &digest[..digest.len().min(8)])
+    }
+
+    fn restore_assumption_world(&mut self, atoms: Vec<Atom>) {
+        if atoms.is_empty() {
+            return;
+        }
+        let mut unique: Vec<Atom> = Vec::new();
+        for atom in atoms {
+            if atom.is_ground() && !unique.contains(&atom) {
+                unique.push(atom);
+            }
+        }
+        if unique.is_empty() {
+            return;
+        }
+        let id = Self::assumption_world_id(&unique);
+        for atom in &unique {
+            self.inject_assumption_atom(atom);
+        }
+        self.assumption_world = Some(AssumptionWorld {
+            id,
+            assumptions: unique,
+        });
+    }
+
+    /// 进入一个跨轮假设世界：假设只在本世界内参与推理，退出即整体丢弃。
+    ///
+    /// 支持句式与反事实模拟一致（「S的P是O」「S是类型」等），条件之间可用
+    /// `；` / `，` 分隔。返回可见回执；解析失败时返回可读原因。
+    pub fn enter_assumption_world(&mut self, condition: &str) -> Result<String, String> {
+        let condition = condition
+            .trim()
+            .trim_matches(['，', ',', '：', ':', '。', ' ']);
+        if condition.is_empty() {
+            return Err("请给出假设内容，例如：假设张三是李四的师傅。".to_string());
+        }
+        let mut atoms: Vec<Atom> = Vec::new();
+        for atom in self.condition_atoms(condition) {
+            if !atom.is_ground() {
+                return Err(format!(
+                    "假设「{}」含未绑定变量，无法作为跨轮前提。",
+                    self.render_atom_nl(&atom)
+                ));
+            }
+            if !atoms.contains(&atom) {
+                atoms.push(atom);
+            }
+        }
+        if atoms.is_empty() {
+            return Err(format!(
+                "无法把「{}」形式化为可模拟的假设。支持句式：假设张三是李四的师傅。",
+                condition
+            ));
+        }
+        self.discard_assumption_world();
+        for atom in &atoms {
+            self.inject_assumption_atom(atom);
+        }
+        let id = Self::assumption_world_id(&atoms);
+        let rendered = atoms
+            .iter()
+            .map(|atom| self.render_atom_nl(atom))
+            .collect::<Vec<_>>()
+            .join("；");
+        self.assumption_world = Some(AssumptionWorld {
+            id: id.clone(),
+            assumptions: atoms,
+        });
+        Ok(format!(
+            "已进入假设世界 {}（假设：{}）。\n  本世界内的后续追问会把它当作临时前提；问答与图谱均不写入。\n  可以继续追问，或说「退出假设」丢弃，或说「记住这个假设」并入会话层。",
+            id, rendered
+        ))
+    }
+
+    /// 退出当前假设世界：临时前提整体丢弃，基础图谱与会话事实不受影响。
+    pub fn exit_assumption_world(&mut self) -> Option<String> {
+        let world = self.discard_assumption_world()?;
+        Some(format!(
+            "已退出假设世界 {}，{} 条临时假设已丢弃（未写入图谱）。",
+            world.id,
+            world.assumptions.len()
+        ))
+    }
+
+    /// 把当前假设世界的临时前提并入会话事实层（仍不写知识图谱）。
+    pub fn remember_assumption_world(&mut self) -> Option<String> {
+        let world = self.assumption_world.take()?;
+        for atom in &world.assumptions {
+            self.adopt_atom(atom.clone());
+        }
+        Some(format!(
+            "已把 {} 条假设并入会话事实层（仍未写入图谱；来源：假设世界 {}）。后续回答会把它当作会话前提。",
+            world.assumptions.len(),
+            world.id
+        ))
+    }
+
+    /// 假设世界的可见状态（无世界时也给出明确说明）。
+    pub fn assumption_world_report(&self) -> String {
+        match &self.assumption_world {
+            Some(world) => {
+                let rendered = world
+                    .assumptions
+                    .iter()
+                    .map(|atom| self.render_atom_nl(atom))
+                    .collect::<Vec<_>>()
+                    .join("；");
+                format!(
+                    "假设世界 {}（{} 条临时假设）：{}。\n  该世界内的事实不写图谱；可说「退出假设」或「记住这个假设」。",
+                    world.id,
+                    world.assumptions.len(),
+                    rendered
+                )
+            }
+            None => {
+                "当前不在假设世界。可用「假设：张三是李四的师傅」进入一个跨轮假设世界。".to_string()
+            }
+        }
+    }
+
+    /// 解析假设世界命令：进入 / 退出 / 记住 / 查看。
+    ///
+    /// 带「那么/则」的一次性反事实句不在此接管，仍交给 `what_if_report`。
+    pub fn handle_assumption_command(&mut self, input: &str) -> Option<String> {
+        let trimmed = input
+            .trim()
+            .trim_end_matches(['。', '！', '!', '？', '?', ' '])
+            .trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if matches!(
+            trimmed,
+            "退出假设" | "退出假设世界" | "回到现实" | "离开假设" | "退出假定"
+        ) {
+            return Some(
+                self.exit_assumption_world()
+                    .unwrap_or_else(|| "当前不在假设世界，无需退出。".to_string()),
+            );
+        }
+        if matches!(
+            trimmed,
+            "记住假设" | "记住这个假设" | "采纳假设世界" | "采纳这个假设" | "确认这个假设"
+        ) {
+            return Some(
+                self.remember_assumption_world()
+                    .unwrap_or_else(|| "当前没有可记住的假设世界。".to_string()),
+            );
+        }
+        if matches!(trimmed, "假设世界" | "当前假设" | "假设状态" | "查看假设") {
+            return Some(self.assumption_world_report());
+        }
+        for prefix in [
+            "假设世界：",
+            "假设世界:",
+            "进入假设：",
+            "进入假设:",
+            "假设：",
+            "假设:",
+        ] {
+            if let Some(condition) = trimmed.strip_prefix(prefix) {
+                if condition.contains("那么") || condition.contains("则") {
+                    return None;
+                }
+                return Some(match self.enter_assumption_world(condition) {
+                    Ok(text) => text,
+                    Err(reason) => reason,
+                });
+            }
+        }
+        for prefix in ["假设", "假如"] {
+            if let Some(condition) = trimmed.strip_prefix(prefix) {
+                if condition.contains("那么")
+                    || condition.contains("则")
+                    || condition.contains('？')
+                    || condition.contains('?')
+                {
+                    return None;
+                }
+                if condition.trim().is_empty() {
+                    return Some(self.assumption_world_report());
+                }
+                // 裸「假设」可能与普通名词短语冲突：解析失败时让位给常规管线，
+                // 只有成功形式化后才接管。
+                return self.enter_assumption_world(condition).ok();
+            }
+        }
+        None
+    }
+
+    /// 给回答追加假设世界标签（没有世界时逐字节不变）。
+    fn annotate_assumption_world(&self, answer: String) -> String {
+        let Some(world) = &self.assumption_world else {
+            return answer;
+        };
+        let rendered = world
+            .assumptions
+            .iter()
+            .map(|atom| self.render_atom_nl(atom))
+            .collect::<Vec<_>>()
+            .join("；");
+        format!(
+            "{}\n（在假设世界 {} 内；临时前提：{}；未写入图谱）",
+            answer, world.id, rendered
+        )
+    }
+
     // 生成自检：逐句回译为命题并验证是否被知识图谱蕴含（对抗"幻觉"）
     fn generation_self_check(&self, text: &str) -> Option<String> {
         if !self.config.enable_entailment {
@@ -5046,8 +5318,7 @@ impl SymbolicReasoner {
         if self.aligner.kind_of(name) == Some(TermKind::Entity) {
             return true;
         }
-        self.session_facts
-            .iter()
+        self.positive_session_atoms()
             .chain(self.session_negative_facts.iter())
             .any(|atom| {
                 atom.terms
@@ -5065,8 +5336,7 @@ impl SymbolicReasoner {
             // 正向别名（同义词）按规范化槽位回查预测器
             || (canonical != name && self.predictor.has_predicate(&canonical))
             || self
-                .session_facts
-                .iter()
+                .positive_session_atoms()
                 .chain(self.session_negative_facts.iter())
                 .any(|atom| {
                     atom.predicate.as_ref() == name || atom.predicate.as_ref() == canonical
@@ -5131,7 +5401,7 @@ impl SymbolicReasoner {
         }
         // 会话事实（用户确认的补全、采纳的假设）与图谱事实同权参与当前轮的
         // 直接命中；它们不写图谱，但必须能在下一轮回答里被用上。
-        for atom in &self.session_facts {
+        for atom in self.positive_session_atoms() {
             if atom.predicate.as_ref() != predicate.slot {
                 continue;
             }
@@ -5705,6 +5975,22 @@ impl SymbolicReasoner {
                 }
             }
         }
+        if let Some(world) = &self.assumption_world {
+            for atom in &world.assumptions {
+                if atom.terms.len() == 2 {
+                    if let (Term::Const(subject), Term::Const(object)) =
+                        (&atom.terms[0], &atom.terms[1])
+                    {
+                        graph.add_edge_with_source(
+                            subject,
+                            &atom.predicate,
+                            object,
+                            EdgeSource::Assumption,
+                        );
+                    }
+                }
+            }
+        }
         for atom in &self.session_negative_facts {
             if atom.terms.len() == 2 {
                 if let (Term::Const(subject), Term::Const(object)) =
@@ -6134,7 +6420,7 @@ impl SymbolicReasoner {
                 add_edge(&mut adjacency, &triple.subject, &triple.object);
             }
         }
-        for atom in &self.session_facts {
+        for atom in self.positive_session_atoms() {
             if atom.predicate.as_ref() != slot || atom.terms.len() != 2 {
                 continue;
             }
@@ -7049,7 +7335,9 @@ impl SymbolicReasoner {
     }
 
     pub fn answer(&self, question: &str) -> Option<String> {
-        let answer = self.answer_impl(question);
+        let answer = self
+            .answer_impl(question)
+            .map(|answer| self.annotate_assumption_world(answer));
         if answer.is_none() {
             // 只观测失败：成功轮不做额外分词，回答内容与原有路径逐字节一致。
             self.record_read_failure(question);
@@ -7064,10 +7352,11 @@ impl SymbolicReasoner {
     pub fn answer_certain(&self, question: &str) -> Option<String> {
         if let Some(answer) = self.answer_planned(question) {
             if !answer.contains("置信度") && !answer.contains("链接预测") {
-                return Some(answer);
+                return Some(self.annotate_assumption_world(answer));
             }
         }
         self.answer_by_evidence(question)
+            .map(|answer| self.annotate_assumption_world(answer))
     }
 
     /// 句法重写回执：展示「哪种句法外壳被压成哪个逻辑计划」。
@@ -8974,7 +9263,7 @@ impl SymbolicReasoner {
                 theory.add_fact_atom(Atom::rel("是", &entity, &entity_type));
             }
         }
-        for atom in &self.session_facts {
+        for atom in self.positive_session_atoms() {
             theory.add_fact_atom(atom.clone());
         }
         for lesson in &self.lessons_parsed {
@@ -9274,6 +9563,20 @@ impl SymbolicReasoner {
         snapshot.frames = Some(self.frames.clone());
         snapshot.ontology = self.discourse.ontology_capsule();
         snapshot.completion = (!self.completion.is_empty()).then(|| self.completion.clone());
+        snapshot.assumptions = self
+            .assumption_world
+            .iter()
+            .flat_map(|world| world.assumptions.iter())
+            .filter(|atom| atom.is_ground())
+            .map(|atom| SnapshotAtom {
+                predicate: atom.predicate.to_string(),
+                terms: atom
+                    .terms
+                    .iter()
+                    .map(|term| term.name().to_string())
+                    .collect(),
+            })
+            .collect();
         snapshot
     }
 
@@ -9347,6 +9650,8 @@ impl SymbolicReasoner {
     }
 
     fn apply_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) -> Result<(), String> {
+        // 先丢弃旧假设世界：快照要么恢复一组新的，要么保持无世界。
+        self.discard_assumption_world();
         // 本体胶囊最先恢复：版本门 / 公理摘要不通过就整体拒绝，
         // 绝不留下「会话态已换、本体还是旧的」这种半应用状态。
         if let Some(capsule) = &snapshot.ontology {
@@ -9471,6 +9776,23 @@ impl SymbolicReasoner {
                 }
             }
         }
+        // 假设世界：恢复为与图谱/会话事实分离的临时前提，可继续追问或退出。
+        let mut restored_assumptions: Vec<Atom> = Vec::new();
+        for entry in &snapshot.assumptions {
+            if entry.predicate.is_empty() || entry.terms.is_empty() {
+                continue;
+            }
+            let terms: Vec<Term> = entry
+                .terms
+                .iter()
+                .map(|name| Term::constant(name))
+                .collect();
+            let atom = Atom::new(&entry.predicate, terms);
+            if atom.is_ground() && !restored_assumptions.contains(&atom) {
+                restored_assumptions.push(atom);
+            }
+        }
+        self.restore_assumption_world(restored_assumptions);
         // 只有补全台账、没有会话事实/规则时，前面的分支不会触发重建；
         // 这里补一次，确保已晋升的全局规则立即进入归结与软逻辑。
         if snapshot.completion.is_some() {
@@ -10108,6 +10430,80 @@ mod tests {
             "跨快照后会话事实应继续参与证明：{}",
             proof
         );
+    }
+
+    #[test]
+    fn test_assumption_world_supports_followup_and_exit() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let receipt = reasoner
+            .enter_assumption_world("赵六的师傅是钱七")
+            .expect("假设世界应可进入");
+        assert!(receipt.contains("假设世界"), "{}", receipt);
+        assert!(reasoner.assumption_world().is_some());
+
+        let answer = reasoner.answer("赵六的师傅是谁").expect("世界内应能回答");
+        assert!(answer.contains("钱七"), "{}", answer);
+        assert!(
+            answer.contains("假设世界"),
+            "回答应标注当前世界：{}",
+            answer
+        );
+
+        let exit = reasoner.exit_assumption_world().expect("应可退出");
+        assert!(exit.contains("已退出"), "{}", exit);
+        assert!(reasoner.assumption_world().is_none());
+        let after = reasoner.answer("赵六的师傅是谁");
+        assert!(
+            after.as_deref().map_or(true, |text| !text.contains("钱七")),
+            "退出后临时前提必须消失：{:?}",
+            after
+        );
+    }
+
+    #[test]
+    fn test_assumption_world_survives_snapshot_and_can_be_remembered() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.enter_assumption_world("赵六的师傅是钱七").unwrap();
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(!snapshot.assumptions.is_empty());
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored.restore_dialogue_snapshot(&snapshot).unwrap();
+        assert!(restored.assumption_world().is_some());
+        let answer = restored.answer("赵六的师傅是谁").expect("恢复后应能回答");
+        assert!(answer.contains("钱七"), "{}", answer);
+
+        let remembered = restored.remember_assumption_world().expect("应可记住");
+        assert!(remembered.contains("会话事实层"), "{}", remembered);
+        assert!(restored.assumption_world().is_none());
+        assert!(restored
+            .session_facts()
+            .iter()
+            .any(|atom| atom.display() == "师傅(赵六, 钱七)"));
+        let answer = restored.answer("赵六的师傅是谁").expect("记住后仍应能回答");
+        assert!(answer.contains("钱七"), "{}", answer);
+        assert!(
+            !answer.contains("假设世界"),
+            "已并入会话层后不应再标假设：{}",
+            answer
+        );
+    }
+
+    #[test]
+    fn test_assumption_world_command_does_not_swallow_one_shot_counterfactual() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner
+            .handle_assumption_command("假设赵六的师傅是钱七，那么李四的师傅是谁？")
+            .is_none());
+        assert!(reasoner.assumption_world().is_none());
+        let report = reasoner
+            .handle_assumption_command("假设：赵六的师傅是钱七")
+            .expect("带冒号的假设应进入世界");
+        assert!(report.contains("假设世界"), "{}", report);
     }
 
     #[test]

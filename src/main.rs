@@ -6996,6 +6996,14 @@ async fn run_interactive_mode(
             }
         }
 
+        // 假设世界命令先于挂账结算：避免「退出假设」「记住这个假设」被
+        // 当成澄清答案吞掉。带「那么/则」的一次性反事实句仍走下方通道。
+        if let Some(text) = symbolic_reasoner.handle_assumption_command(input) {
+            println!("{}", text);
+            println!();
+            continue;
+        }
+
         // 本体化对话管理器（纯对话行为）：回顾、解释依据、续聊、展开、寒暄。
         // 用对话本体 + 逻辑程序策略推导话语行为，再由模板组合生成回答。
         if dialogue_enabled {
@@ -7043,6 +7051,7 @@ async fn run_interactive_mode(
         // 反事实模拟："如果……那么……" / "假设：……"，正向链推演后自动回滚
         if input.starts_with("如果")
             || input.starts_with("假如")
+            || input.starts_with("假设")
             || strip_any_prefix(
                 input,
                 &["反事实：", "反事实:", "假设：", "假设:", "假如：", "假如:"],

@@ -16,6 +16,7 @@ pub enum EdgeSource {
     Observed,
     Attribute,
     Session,
+    Assumption,
     Inferred,
     Custom,
 }
@@ -26,6 +27,7 @@ impl EdgeSource {
             EdgeSource::Observed => "事实",
             EdgeSource::Attribute => "属性",
             EdgeSource::Session => "会话",
+            EdgeSource::Assumption => "假设",
             EdgeSource::Inferred => "推断",
             EdgeSource::Custom => "外部",
         }
