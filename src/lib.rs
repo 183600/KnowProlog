@@ -89,6 +89,7 @@ pub mod perf_ledger;
 pub mod planning;
 pub mod plugin;
 pub mod predicate_registry;
+pub mod probabilistic_query_intent;
 pub mod problog;
 pub mod prolog_engine;
 pub mod prompt_spec;
