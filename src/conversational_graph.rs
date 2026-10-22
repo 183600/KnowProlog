@@ -563,7 +563,18 @@ impl PatternOutcome {
     }
 
     pub fn explain(&self, select: &[String], facts: &[GraphFact]) -> Option<String> {
-        let solution = self.solutions.first()?;
+        self.explain_at(0, select, facts)
+    }
+
+    /// 解释指定下标的匹配结果；翻页后「为什么」应指向当前页第一条，
+    /// 而不是永远回到整张结果集的第一条。
+    pub fn explain_at(
+        &self,
+        index: usize,
+        select: &[String],
+        facts: &[GraphFact],
+    ) -> Option<String> {
+        let solution = self.solutions.get(index)?;
         let mut output = String::new();
         if !select.is_empty() {
             let assignments: Vec<String> = select
@@ -811,11 +822,13 @@ impl ConversationalGraph {
                 self.page = self.page.saturating_sub(1);
                 Ok(self.page_reply())
             }
-            GraphCommand::Explain => self
-                .outcome
-                .explain(&self.pattern.select, facts)
-                .map(GraphReply::Explanation)
-                .ok_or(PatternError::NoRowsToExplain),
+            GraphCommand::Explain => {
+                let index = self.page.saturating_mul(self.page_size);
+                self.outcome
+                    .explain_at(index, &self.pattern.select, facts)
+                    .map(GraphReply::Explanation)
+                    .ok_or(PatternError::NoRowsToExplain)
+            }
             GraphCommand::Count => {
                 let outcome = self.pattern.evaluate(facts, options)?;
                 Ok(GraphReply::Count {
@@ -1328,6 +1341,33 @@ mod tests {
             .apply(GraphCommand::PreviousPage, &facts, MatchOptions::default())
             .unwrap();
         assert!(matches!(back, GraphReply::Page { page: 1, .. }));
+    }
+
+    #[test]
+    fn explain_after_paging_targets_the_current_page() {
+        let facts: Vec<GraphFact> = (0..7)
+            .map(|index| GraphFact::relation(format!("p{}", index), "获奖", "金棕榈"))
+            .collect();
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::var_const("person", "获奖", "金棕榈")],
+            vec!["person".to_string()],
+        );
+        let mut conversation = ConversationalGraph::new(pattern, &facts, MatchOptions::default())
+            .unwrap()
+            .with_page_size(2);
+        conversation
+            .apply(GraphCommand::NextPage, &facts, MatchOptions::default())
+            .unwrap();
+        let explanation = conversation
+            .apply(GraphCommand::Explain, &facts, MatchOptions::default())
+            .unwrap();
+        match explanation {
+            GraphReply::Explanation(text) => {
+                assert!(text.contains("person = p2"), "{}", text);
+                assert!(!text.contains("person = p0"), "{}", text);
+            }
+            other => panic!("unexpected reply: {:?}", other),
+        }
     }
 
     #[test]
