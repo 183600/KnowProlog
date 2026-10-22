@@ -553,8 +553,9 @@ impl AdvancedNLU {
         &self,
         query: &str,
     ) -> Result<(String, f64), Box<dyn std::error::Error>> {
-        let mut best_intent = "unknown".to_string();
-        let mut best_confidence = 0.0;
+        // 置信度降序、同分按意图名字典序：HashMap 的迭代序不稳定，
+        // 若同分只做 `>` 比较，实际胜者会随进程随机化漂移。
+        let mut best: Option<(String, f64)> = None;
 
         // 分词
         let query_words: Vec<(&str, usize)> = self
@@ -578,18 +579,22 @@ impl AdvancedNLU {
                 let weighted_confidence =
                     max_pattern_confidence * (pattern_info.priority as f64 / 20.0);
 
-                if weighted_confidence > best_confidence {
-                    best_confidence = weighted_confidence;
-                    best_intent = intent_name.clone();
-                }
+                prefer_intent_candidate(
+                    &mut best,
+                    (intent_name.clone(), weighted_confidence),
+                );
             }
         }
+
+        let (mut best_intent, mut best_confidence) =
+            best.unwrap_or_else(|| ("unknown".to_string(), 0.0));
 
         // 如果置信度太低，尝试基于关键词的模糊匹配
         if best_confidence < 0.3 {
             let fallback_result = self.fallback_intent_recognition(query).await?;
             if fallback_result.1 > best_confidence {
-                return Ok(fallback_result);
+                best_intent = fallback_result.0;
+                best_confidence = fallback_result.1;
             }
         }
 
@@ -1267,6 +1272,24 @@ impl AdvancedNLU {
     }
 }
 
+/// 选择更可信的意图候选：置信度高者胜；同分时名字典序小者胜。
+///
+/// `HashMap` 的迭代序不稳定，显式 tie-break 才能让同一问句在任何进程里
+/// 得到同一个标签。使用 `total_cmp` 而非 `partial_cmp().unwrap()`，避免
+/// 异常分数（NaN）触发 panic。
+fn prefer_intent_candidate(best: &mut Option<(String, f64)>, candidate: (String, f64)) {
+    let replace = match best {
+        None => true,
+        Some((best_name, best_score)) => {
+            candidate.1.total_cmp(best_score).is_gt()
+                || (candidate.1.total_cmp(best_score).is_eq() && candidate.0 < *best_name)
+        }
+    };
+    if replace {
+        *best = Some(candidate);
+    }
+}
+
 impl Default for AdvancedNLU {
     fn default() -> Self {
         Self::new()
@@ -1329,5 +1352,26 @@ mod tests {
 
         let similarity = nlu.calculate_word_similarity("苹果", "苹");
         assert!(similarity >= 0.5); // 编辑距离为1，最大长度为2，相似度为0.5
+    }
+
+    #[test]
+    fn test_tied_intents_are_ordered_by_name() {
+        let mut best = None;
+        prefer_intent_candidate(&mut best, ("zeta".to_string(), 0.8));
+        prefer_intent_candidate(&mut best, ("alpha".to_string(), 0.8));
+        assert_eq!(best, Some(("alpha".to_string(), 0.8)));
+
+        // 高分候选始终胜过低分候选，与字典序无关。
+        prefer_intent_candidate(&mut best, ("zeta".to_string(), 0.9));
+        assert_eq!(best, Some(("zeta".to_string(), 0.9)));
+    }
+
+    #[tokio::test]
+    async fn test_intent_recognition_is_repeatable() {
+        let nlu = AdvancedNLU::new();
+        let first = nlu.recognize_intent("刘德华是谁").await.unwrap();
+        for _ in 0..32 {
+            assert_eq!(nlu.recognize_intent("刘德华是谁").await.unwrap(), first);
+        }
     }
 }
