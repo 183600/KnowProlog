@@ -15982,6 +15982,53 @@ types = [
     }
 
     #[test]
+    fn test_legacy_generation_state_without_cursor_migrates_without_repeat() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let first = reasoner.generate_about("张三").expect("第一页应可生成");
+        let first_body = first
+            .lines()
+            .find(|line| line.trim().ends_with('。'))
+            .expect("第一页应有一句事实")
+            .trim()
+            .to_string();
+        let first_sentence = first_body
+            .split_once('，')
+            .map(|(_, sentence)| sentence.to_string())
+            .unwrap_or(first_body);
+        // 模拟旧快照：只有位置，没有话语账本。
+        reasoner
+            .context
+            .record_generation("张三", 1, GenerationOrder::Relevance);
+        assert!(reasoner
+            .context
+            .generation_state()
+            .unwrap()
+            .cursor
+            .is_none());
+        let second = reasoner.continue_generation().expect("应继续生成");
+        assert!(
+            !second.contains(first_sentence.trim_end_matches('。')),
+            "旧快照迁移后不应重复：第一页={}；第二页={}",
+            first,
+            second
+        );
+
+        // 缺省 cursor 的旧 JSON 必须能解码（serde default，不破坏旧存档）。
+        let legacy = r#"{
+            "focus_entities": ["张三"],
+            "last_predicate": null,
+            "history": [],
+            "generation": {"entity": "张三", "shown": 1, "order": "Relevance"}
+        }"#;
+        let snapshot: DialogueSnapshot =
+            serde_json::from_str(legacy).expect("旧快照应可解码");
+        assert!(snapshot.generation.unwrap().cursor.is_none());
+    }
+
+    #[test]
     fn test_continue_generation_and_switch_angle() {
         let mut config = test_config();
         config.max_profile_sentences = 1;
