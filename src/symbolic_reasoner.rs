@@ -8350,6 +8350,36 @@ impl SymbolicReasoner {
         self.assert_negative_atom(atom)
     }
 
+    /// 把一条结构化会话事实加入推理前提（不写知识图谱）。
+    ///
+    /// 供对话层的确认/更正回执桥接到推理层：用户确认的取值不仅覆盖直接
+    /// 属性回答，还会与图谱事实同权参与多跳链、证明与会话快照恢复。
+    /// 返回 `true` 表示本次确实新增了会话事实（重复调用幂等）。
+    pub fn adopt_session_triple(
+        &mut self,
+        subject: &str,
+        predicate: &str,
+        object: &str,
+    ) -> bool {
+        let subject = subject.trim();
+        let predicate = predicate.trim();
+        let object = object.trim();
+        if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            return false;
+        }
+        if self.session_facts.iter().any(|atom| {
+            atom.predicate.as_ref() == predicate
+                && atom.terms.len() == 2
+                && atom.terms[0].name() == subject
+                && atom.terms[1].name() == object
+        }) {
+            return false;
+        }
+        let atom = Atom::rel(predicate, subject, object);
+        self.register_atom_vocabulary(&atom);
+        self.adopt_atom(atom)
+    }
+
     pub fn assert_nl_fact(&mut self, sentence_raw: &str) -> String {
         let sentence = sentence_raw.trim();
         if sentence.is_empty() {
@@ -10076,6 +10106,29 @@ mod tests {
             (hit.subject == "钱七" || hit.object == "钱七")
                 && (hit.subject == "孙八" || hit.object == "孙八")
         }));
+    }
+
+    #[test]
+    fn test_adopted_session_triple_feeds_proof_and_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(
+            reasoner.adopt_session_triple("王五", "师傅", "赵六"),
+            "首次采纳应返回 true"
+        );
+        assert!(
+            !reasoner.adopt_session_triple("王五", "师傅", "赵六"),
+            "重复采纳必须幂等"
+        );
+        let proof = reasoner.resolution_proof_report("王五的师傅是赵六");
+        assert!(!proof.contains("未得证"), "{}", proof);
+
+        let snapshot = reasoner.dialogue_snapshot();
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored.restore_dialogue_snapshot(&snapshot).unwrap();
+        let proof = restored.resolution_proof_report("王五的师傅是赵六");
+        assert!(!proof.contains("未得证"), "跨快照后会话事实应继续参与证明：{}", proof);
     }
 
     #[test]
