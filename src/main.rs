@@ -66,9 +66,8 @@ use know_prolog::{
         ProvenanceLoad,
     },
     quality::{
-        build_report as build_quality_report, build_report_with_provenance,
-        compare_baseline as compare_quality_baseline, render_entity_passport, QualityBaseline,
-        QualityIndex,
+        build_report_with_provenance, compare_baseline as compare_quality_baseline,
+        render_entity_passport, QualityBaseline, QualityIndex,
     },
     query_planner::QueryPlanner,
     recovery::RecoveryMode,

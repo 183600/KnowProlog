@@ -20,8 +20,8 @@ use crate::contextual_rag::{
 };
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::conversational_graph::{
-    ConversationalGraph, GraphCommand, GraphFact, GraphPattern, GraphReply, MatchOptions,
-    PatternError, PatternOutcome,
+    ConversationalGraph, GraphCommand, GraphFact, GraphReply, MatchOptions, PatternError,
+    PatternOutcome,
 };
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};

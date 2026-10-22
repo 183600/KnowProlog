@@ -501,7 +501,13 @@ impl EntityRelationExtractor {
         sentence_id: usize,
     ) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut entities = Vec::new();
-        let entity_types = self.entity_types.read();
+        // 异步抽取期间不持有类型表读锁：快照后立即释放，避免写者被 await 阻塞。
+        let entity_types: Vec<(String, EntityType)> = self
+            .entity_types
+            .read()
+            .iter()
+            .map(|(name, entity_type)| (name.clone(), entity_type.clone()))
+            .collect();
 
         // 分词与字节偏移供所有实体类型的上下文关键词匹配使用
         let words: Vec<&str> = self.jieba.cut(sentence, false).into_iter().collect();
@@ -512,7 +518,7 @@ impl EntityRelationExtractor {
         }
 
         // 使用每种实体类型的模式进行匹配
-        for (type_name, entity_type) in entity_types.iter() {
+        for (type_name, entity_type) in &entity_types {
             let type_entities = self
                 .extract_entities_by_type(
                     sentence,
@@ -1092,8 +1098,13 @@ impl EntityRelationExtractor {
         entities: Vec<EntityExtraction>,
     ) -> Result<Vec<EntityExtraction>, Box<dyn std::error::Error>> {
         let mut linked_entities = Vec::with_capacity(entities.len());
-        // 一次性持有类型表读锁
-        let entity_types = self.entity_types.read();
+        // 只快照属性列表，规范化 await 期间不持有类型表读锁。
+        let properties_by_type: HashMap<String, Vec<String>> = self
+            .entity_types
+            .read()
+            .iter()
+            .map(|(name, entity_type)| (name.clone(), entity_type.properties.clone()))
+            .collect();
 
         for mut entity in entities {
             // 实体规范化
@@ -1103,8 +1114,8 @@ impl EntityRelationExtractor {
 
             // 提取实体属性
             let mut attributes = HashMap::new();
-            if let Some(entity_type) = entity_types.get(&entity.entity_type) {
-                for property in &entity_type.properties {
+            if let Some(properties) = properties_by_type.get(&entity.entity_type) {
+                for property in properties {
                     attributes.insert(property.clone(), vec![]);
                 }
             }
