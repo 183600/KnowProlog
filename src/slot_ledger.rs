@@ -470,10 +470,9 @@ impl SlotTransition {
                 self.after.join(" / ")
             ),
             SlotDelta::Corroborated => format!(
-                "「{} = {}」得到多来源佐证（{}）。",
+                "「{} = {}」得到多来源佐证，当前仍采用该值。",
                 self.slot_label(),
-                self.after.join(" / "),
-                self.suppressed.join(" / ")
+                self.after.join(" / ")
             ),
             SlotDelta::Corrected { from } => format!(
                 "已按你的更正更新：{} 由「{}」改为「{}」（第 {} 次记录；旧值被压制但未否定，可用「撤销修订」恢复）。",
