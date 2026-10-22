@@ -10831,6 +10831,30 @@ mod tests {
     }
 
     #[test]
+    fn test_contextual_rag_path_between_two_anchors() {
+        let facts = vec![
+            PrologFact::Relation {
+                from: "甲".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "丙".to_string(),
+            },
+            PrologFact::Relation {
+                from: "丙".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "乙".to_string(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let answer = reasoner
+            .answer_contextual("甲和乙是什么关系")
+            .expect("双锚点应装配显式路径");
+        assert!(answer.contains("显式路径"), "{}", answer);
+        assert!(answer.contains("甲 —师傅→ 丙"), "{}", answer);
+        assert!(answer.contains("丙 —师傅→ 乙"), "{}", answer);
+    }
+
+    #[test]
     fn test_contextual_rag_auto_answer_path_is_enabled_by_config() {
         let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
