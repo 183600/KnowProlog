@@ -924,7 +924,7 @@ mod tests {
         assert_eq!(value, 2.0);
         assert_eq!(unit, None);
         assert!(tall
-            .difference_in_own_unit(&parse_quantity("8848米").unwrap())
+            .difference_in_own_unit(&parse_quantity("8848平方公里").unwrap())
             .is_err());
     }
 
