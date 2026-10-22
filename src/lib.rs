@@ -96,6 +96,7 @@ pub mod relation_acquisition;
 pub mod relation_frame;
 pub mod release;
 pub mod resolution_engine;
+pub mod revision_guard;
 pub mod semantic_embedding;
 pub mod semantic_engine;
 pub mod semantic_entailment;
