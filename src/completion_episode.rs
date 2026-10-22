@@ -38,6 +38,8 @@ pub const DEFAULT_MAX_EPISODES: usize = 32;
 pub const DEFAULT_MAX_RULES: usize = 64;
 /// 批次实体的数量上限。
 pub const DEFAULT_MAX_BATCH_ENTITIES: usize = 256;
+/// 运行期裁决测试集的数量上限。
+pub const DEFAULT_MAX_TESTS: usize = 256;
 
 /// 一条补全的证据强度。强度顺序：Entailed > Induced > Analogical。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -485,6 +487,91 @@ impl LearnedRule {
     }
 }
 
+/// 用户裁决的方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegressionVerdict {
+    Confirmed,
+    Refuted,
+}
+
+impl RegressionVerdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            RegressionVerdict::Confirmed => "确认",
+            RegressionVerdict::Refuted => "驳回",
+        }
+    }
+}
+
+/// 一次可重放的运行期知识测试。
+///
+/// 测试不是开发期回归，而是用户裁决留下的「错误记忆」：规则晋升、
+/// 恢复或导入时重放，防止系统重新提出已被否决的候选，也防止规则
+/// 悄悄丢掉已经确认的依据。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CompletionTest {
+    pub id: String,
+    pub triple: Triple,
+    pub verdict: RegressionVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<RuleSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<Triple>,
+    pub source: String,
+    pub source_id: String,
+    pub created_tick: u64,
+}
+
+impl CompletionTest {
+    pub fn display_line(&self) -> String {
+        format!(
+            "[{}] {}({}, {})",
+            self.verdict.label(), self.triple.predicate, self.triple.subject, self.triple.object
+        )
+    }
+}
+
+/// 一次重放中的失败项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegressionFailure {
+    pub test_id: String,
+    pub triple: Triple,
+    pub reason: String,
+}
+
+/// 规则重放结果。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RegressionReport {
+    pub checked: usize,
+    pub failures: Vec<RegressionFailure>,
+}
+
+impl RegressionReport {
+    pub fn passed(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn summary(&self) -> String {
+        if self.passed() {
+            return format!("运行期测试 {} 条全部通过", self.checked);
+        }
+        let details = self
+            .failures
+            .iter()
+            .take(3)
+            .map(|failure| format!("{}：{}", failure.triple.object, failure.reason))
+            .collect::<Vec<_>>()
+            .join("；");
+        format!(
+            "运行期测试 {} 条中有 {} 条失败（{}）",
+            self.checked,
+            self.failures.len(),
+            details
+        )
+    }
+}
+
 /// 确认一条候选后的回执。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfirmOutcome {
@@ -541,6 +628,7 @@ pub enum EpisodeError {
         to: RuleScope,
     },
     PromotionBlocked(String),
+    RegressionBlocked(String),
 }
 
 impl fmt::Display for EpisodeError {
@@ -582,6 +670,9 @@ impl fmt::Display for EpisodeError {
                 to.label()
             ),
             EpisodeError::PromotionBlocked(reason) => write!(f, "规则晋升被拒绝：{}", reason),
+            EpisodeError::RegressionBlocked(reason) => {
+                write!(f, "运行期知识回归未通过：{}", reason)
+            }
         }
     }
 }
@@ -595,6 +686,10 @@ pub struct CompletionLedger {
     active: Option<usize>,
     rules: Vec<LearnedRule>,
     refuted_triples: BTreeSet<Triple>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    confirmed_triples: BTreeSet<Triple>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    regression_tests: Vec<CompletionTest>,
     tick: u64,
     max_candidates: usize,
     max_closure: usize,
@@ -630,6 +725,8 @@ impl CompletionLedger {
             active: None,
             rules: Vec::new(),
             refuted_triples: BTreeSet::new(),
+            confirmed_triples: BTreeSet::new(),
+            regression_tests: Vec::new(),
             tick: 0,
             max_candidates: max_candidates.max(1),
             max_closure: max_closure.max(1),
@@ -644,7 +741,11 @@ impl CompletionLedger {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.episodes.is_empty() && self.rules.is_empty() && self.refuted_triples.is_empty()
+        self.episodes.is_empty()
+            && self.rules.is_empty()
+            && self.refuted_triples.is_empty()
+            && self.confirmed_triples.is_empty()
+            && self.regression_tests.is_empty()
     }
 
     /// 从持久化快照恢复后重新夹紧上限：快照文件不可信，不能让其中的
@@ -661,6 +762,8 @@ impl CompletionLedger {
             .clamp(1, DEFAULT_MAX_BATCH_ENTITIES);
         self.episodes.truncate(self.max_episodes);
         self.rules.truncate(self.max_rules);
+        self.regression_tests
+            .truncate(DEFAULT_MAX_TESTS);
         self.active = self.active.filter(|index| *index < self.episodes.len());
     }
 
@@ -687,6 +790,24 @@ impl CompletionLedger {
 
     pub fn refuted_triples(&self) -> &BTreeSet<Triple> {
         &self.refuted_triples
+    }
+
+    pub fn confirmed_triples(&self) -> &BTreeSet<Triple> {
+        &self.confirmed_triples
+    }
+
+    pub fn regression_tests(&self) -> &[CompletionTest] {
+        &self.regression_tests
+    }
+
+    /// 该三元组是否已经被用户裁定过（确认或否决）。
+    pub fn is_adjudicated(&self, triple: &Triple) -> bool {
+        self.confirmed_triples.contains(triple) || self.refuted_triples.contains(triple)
+    }
+
+    /// 该三元组是否被用户否决过（任何通道）。
+    pub fn is_refuted(&self, triple: &Triple) -> bool {
+        self.refuted_triples.contains(triple)
     }
 
     /// 推进逻辑轮次（无挂钟，TTL/审计均用此计数）。
@@ -827,7 +948,7 @@ impl CompletionLedger {
         rule_id: Option<String>,
         origin: CandidateOrigin,
     ) -> bool {
-        if self.refuted_triples.contains(&triple) {
+        if self.is_adjudicated(&triple) {
             return false;
         }
         let tick = self.tick;
@@ -930,6 +1051,190 @@ impl CompletionLedger {
         Err(EpisodeError::CandidateNotFound(selector.to_string()))
     }
 
+    fn push_regression_test(
+        &mut self,
+        triple: Triple,
+        verdict: RegressionVerdict,
+        rule: Option<RuleSpec>,
+        evidence: Vec<Triple>,
+        source: &str,
+        source_id: &str,
+    ) -> String {
+        let id = stable_id(
+            "test-",
+            &format!(
+                "{}|{}|{}|{}",
+                verdict.label(),
+                triple.subject,
+                triple.predicate,
+                triple.object
+            ),
+        );
+        self.regression_tests
+            .retain(|test| test.triple != triple && test.id != id);
+        self.regression_tests.push(CompletionTest {
+            id: id.clone(),
+            triple,
+            verdict,
+            rule,
+            evidence,
+            source: source.to_string(),
+            source_id: source_id.to_string(),
+            created_tick: self.tick,
+        });
+        if self.regression_tests.len() > DEFAULT_MAX_TESTS {
+            let overflow = self.regression_tests.len() - DEFAULT_MAX_TESTS;
+            self.regression_tests.drain(0..overflow);
+        }
+        id
+    }
+
+    /// 记录一次来自补全回合之外的裁决（恢复阶梯、导入检查或宿主脚本）。
+    ///
+    /// 确认会撤销同一三元组的旧否决并把归纳规则纳入台账；否决会把三元组
+    /// 加入全局拒绝集，后续任何回合都不再提名。返回台账是否发生变化。
+    pub fn record_external_verdict(
+        &mut self,
+        triple: Triple,
+        confirmed: bool,
+        rule: Option<RuleSpec>,
+        evidence: Vec<Triple>,
+        source: &str,
+        source_id: &str,
+    ) -> bool {
+        if triple.subject.trim().is_empty()
+            || triple.predicate.trim().is_empty()
+            || triple.object.trim().is_empty()
+        {
+            return false;
+        }
+        let verdict = if confirmed {
+            RegressionVerdict::Confirmed
+        } else {
+            RegressionVerdict::Refuted
+        };
+        let source_id = if source_id.trim().is_empty() {
+            source.trim()
+        } else {
+            source_id.trim()
+        };
+        if self.regression_tests.iter().any(|test| {
+            test.triple == triple && test.verdict == verdict && test.source_id == source_id
+        }) {
+            return false;
+        }
+        let tick = self.tick;
+        let valid_rule = rule.filter(RuleSpec::is_valid);
+        if confirmed {
+            self.refuted_triples.remove(&triple);
+            self.confirmed_triples.insert(triple.clone());
+            self.regression_tests
+                .retain(|test| !(test.triple == triple && test.verdict == RegressionVerdict::Refuted));
+            if let Some(spec) = valid_rule.clone() {
+                let episode_ref = format!("外部裁决:{}:{}", source.trim(), source_id);
+                self.upsert_rule(spec, &triple, &episode_ref, 0.8, tick);
+            }
+        } else {
+            self.confirmed_triples.remove(&triple);
+            self.refuted_triples.insert(triple.clone());
+            self.regression_tests
+                .retain(|test| !(test.triple == triple && test.verdict == RegressionVerdict::Confirmed));
+            if let Some(spec) = valid_rule.clone() {
+                let id = spec.id();
+                if let Some(rule) = self.rules.iter_mut().find(|rule| rule.id == id) {
+                    rule.note_refutation(&triple, tick);
+                }
+            }
+        }
+        self.push_regression_test(
+            triple,
+            verdict,
+            valid_rule,
+            evidence,
+            source.trim(),
+            source_id,
+        );
+        true
+    }
+
+    /// 重放该规则相关的运行期知识测试。
+    pub fn replay_rule(&self, rule_id: &str) -> Result<RegressionReport, EpisodeError> {
+        let position = self.find_rule_index(rule_id)?;
+        Ok(self.replay_rule_at(position))
+    }
+
+    fn replay_rule_at(&self, position: usize) -> RegressionReport {
+        let Some(rule) = self.rules.get(position) else {
+            return RegressionReport::default();
+        };
+        let mut report = RegressionReport::default();
+        for test in &self.regression_tests {
+            report.checked += 1;
+            let rule_matches = test
+                .rule
+                .as_ref()
+                .map(|spec| spec.id() == rule.id)
+                .unwrap_or(false);
+            match test.verdict {
+                RegressionVerdict::Refuted => {
+                    let rederives = !test.evidence.is_empty()
+                        && rule_derives(&rule.spec, &test.evidence, &test.triple);
+                    if rule_matches || rederives {
+                        report.failures.push(RegressionFailure {
+                            test_id: test.id.clone(),
+                            triple: test.triple.clone(),
+                            reason: if rederives {
+                                "规则会从当前证据重新推出已被否决的候选".to_string()
+                            } else {
+                                "规则曾产出被用户否决的候选".to_string()
+                            },
+                        });
+                    }
+                }
+                RegressionVerdict::Confirmed => {
+                    if rule_matches
+                        && !test.evidence.is_empty()
+                        && !rule_derives(&rule.spec, &test.evidence, &test.triple)
+                    {
+                        report.failures.push(RegressionFailure {
+                            test_id: test.id.clone(),
+                            triple: test.triple.clone(),
+                            reason: "规则不再能从确认证据推出已确认事实".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    pub fn render_regression_report(&self) -> String {
+        if self.regression_tests.is_empty() {
+            return "还没有运行期知识测试。用户确认或驳回补全候选后会自动登记。"
+                .to_string();
+        }
+        let confirmed = self
+            .regression_tests
+            .iter()
+            .filter(|test| test.verdict == RegressionVerdict::Confirmed)
+            .count();
+        let mut output = format!(
+            "运行期知识测试 {} 条（确认 {} / 驳回 {}）\n",
+            self.regression_tests.len(),
+            confirmed,
+            self.regression_tests.len() - confirmed
+        );
+        for test in self.regression_tests.iter().rev().take(10) {
+            output.push_str(&format!(
+                "  {}（来源：{}，轮次 {}）\n",
+                test.display_line(),
+                test.source,
+                test.created_tick
+            ));
+        }
+        output.trim_end().to_string()
+    }
+
     /// 确认一条候选：标记状态、归纳规则，并在本批范围上做有界闭包。
     pub fn confirm(
         &mut self,
@@ -958,6 +1263,16 @@ impl CompletionLedger {
         };
         self.episodes[active].candidates[position].status = CandidateStatus::Confirmed;
         self.episodes[active].candidates[position].rule_id = rule_id.clone();
+        self.refuted_triples.remove(&candidate.triple);
+        self.confirmed_triples.insert(candidate.triple.clone());
+        self.push_regression_test(
+            candidate.triple.clone(),
+            RegressionVerdict::Confirmed,
+            candidate.rule.clone(),
+            candidate.evidence.clone(),
+            "补全回合",
+            &episode_id,
+        );
         let rule_scope = rule_id
             .as_deref()
             .and_then(|id| self.rule(id))
@@ -1046,6 +1361,16 @@ impl CompletionLedger {
         let tick = self.tick;
         self.episodes[active].candidates[position].status = CandidateStatus::Refuted;
         self.refuted_triples.insert(candidate.triple.clone());
+        self.confirmed_triples.remove(&candidate.triple);
+        let episode_id = self.episodes[active].id.clone();
+        self.push_regression_test(
+            candidate.triple.clone(),
+            RegressionVerdict::Refuted,
+            candidate.rule.clone(),
+            candidate.evidence.clone(),
+            "补全回合",
+            &episode_id,
+        );
         let mut quarantined = false;
         let mut rule_id = candidate.rule_id.clone();
         if rule_id.is_none() {
@@ -1115,9 +1440,13 @@ impl CompletionLedger {
     ) -> Result<PromotionOutcome, EpisodeError> {
         let tick = self.tick;
         let position = self.find_rule_index(rule_id)?;
+        let regression = self.replay_rule_at(position);
         let rule = &mut self.rules[position];
         if !rule.is_usable() {
             return Err(EpisodeError::RuleUnavailable(rule.id.clone()));
+        }
+        if !regression.passed() {
+            return Err(EpisodeError::PromotionBlocked(regression.summary()));
         }
         if target.rank() <= rule.scope.rank() {
             return Err(EpisodeError::PromotionNotHigher {
@@ -1181,6 +1510,10 @@ impl CompletionLedger {
     /// 恢复已退役规则：按确认次数回到候选（<2）或生效（>=2）。
     pub fn reactivate(&mut self, rule_id: &str) -> Result<RuleLifecycleOutcome, EpisodeError> {
         let position = self.find_rule_index(rule_id)?;
+        let regression = self.replay_rule_at(position);
+        if !regression.passed() {
+            return Err(EpisodeError::RegressionBlocked(regression.summary()));
+        }
         let tick = self.tick;
         let rule = &mut self.rules[position];
         if rule.status != RuleStatus::Retired {
@@ -1641,6 +1974,15 @@ fn apply_rule(
     )
 }
 
+/// 在给定证据上验证规则是否能推出目标三元组。
+fn rule_derives(spec: &RuleSpec, evidence: &[Triple], target: &Triple) -> bool {
+    if !spec.is_valid() {
+        return false;
+    }
+    let (hits, _) = apply_rule(spec, evidence, &ScopeFilter::All, 8);
+    hits.iter().any(|hit| &hit.triple == target)
+}
+
 fn merge_evidence(current: &mut Vec<Triple>, incoming: Vec<Triple>) {
     for triple in incoming {
         if !current.contains(&triple) {
@@ -2057,5 +2399,137 @@ mod tests {
             "歧义失败不得改变候选状态"
         );
         assert_eq!(episode.candidates[1].status, CandidateStatus::Pending);
+    }
+
+    #[test]
+    fn refuted_closure_blocks_promotion_and_external_correction_clears_it() {
+        let predictor = chain_predictor();
+        let facts = predictor.triples().to_vec();
+        let mut ledger = CompletionLedger::new();
+        open_with_predictions(&mut ledger, &predictor, "孙八");
+        ledger.set_batch_scope(
+            ["孙八", "周九", "吴十", "郑十一", "钱十二", "孙十三"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        ledger
+            .confirm("孙八|师祖|吴十", &facts)
+            .expect("确认应成功");
+        let rule_id = ledger.rules()[0].id.clone();
+        ledger
+            .refute("郑十一|师祖|孙十三")
+            .expect("驳回应成功");
+        let regression = ledger.replay_rule(&rule_id).expect("规则应存在");
+        assert!(!regression.passed(), "被否决候选应进入运行期测试");
+        let blocked = ledger
+            .promote(&rule_id, RuleScope::Namespace)
+            .expect_err("有未通过测试的规则不得晋升");
+        assert!(
+            matches!(&blocked, EpisodeError::PromotionBlocked(reason) if reason.contains("运行期测试")),
+            "{blocked:?}"
+        );
+
+        let reopened = ledger
+            .record_external_verdict(
+                Triple::new("郑十一", "师祖", "孙十三"),
+                true,
+                ledger.rule(&rule_id).map(|rule| rule.spec.clone()),
+                vec![
+                    Triple::new("郑十一", "师傅", "钱十二"),
+                    Triple::new("钱十二", "师傅", "孙十三"),
+                ],
+                "恢复阶梯",
+                "receipt-1",
+            );
+        assert!(reopened, "更正裁决应写入台账");
+        assert!(
+            ledger
+                .replay_rule(&rule_id)
+                .expect("规则应存在")
+                .passed(),
+            "更正后运行期测试应通过"
+        );
+        ledger
+            .promote(&rule_id, RuleScope::Namespace)
+            .expect("更正后应可晋升");
+    }
+
+    #[test]
+    fn external_verdict_learns_rule_and_is_idempotent() {
+        let predictor = chain_predictor();
+        let prediction = predictor
+            .predict_for_entity("孙八", None, 8)
+            .into_iter()
+            .find(|prediction| prediction.triple == Triple::new("孙八", "师祖", "吴十"))
+            .expect("应有一条师祖预测");
+        let spec = RuleSpec::from_horn(&predictor.rules()[prediction.rule_index])
+            .expect("预测规则应可归纳");
+        let mut ledger = CompletionLedger::new();
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            true,
+            Some(spec.clone()),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-9",
+        ));
+        assert_eq!(ledger.rules().len(), 1);
+        assert_eq!(ledger.rules()[0].confirmations, 1);
+        assert_eq!(ledger.rules()[0].scope, RuleScope::Batch);
+        assert!(!ledger.record_external_verdict(
+            prediction.triple.clone(),
+            true,
+            Some(spec),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-9",
+        ));
+        assert_eq!(ledger.rules()[0].confirmations, 1, "同一回执不得重复计数");
+        assert!(ledger.is_adjudicated(&prediction.triple));
+        assert!(ledger.render_regression_report().contains("确认 1"));
+    }
+
+    #[test]
+    fn external_refutation_is_never_reproposed_and_blocks_reactivation() {
+        let predictor = chain_predictor();
+        let prediction = predictor
+            .predict_for_entity("孙八", None, 8)
+            .into_iter()
+            .find(|prediction| prediction.triple == Triple::new("孙八", "师祖", "吴十"))
+            .expect("应有一条师祖预测");
+        let spec = RuleSpec::from_horn(&predictor.rules()[prediction.rule_index])
+            .expect("预测规则应可归纳");
+        let mut ledger = CompletionLedger::new();
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            true,
+            Some(spec.clone()),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-10",
+        ));
+        assert!(ledger.record_external_verdict(
+            prediction.triple.clone(),
+            false,
+            Some(spec),
+            prediction.evidence.clone(),
+            "恢复阶梯",
+            "receipt-11",
+        ));
+        assert!(ledger.is_refuted(&prediction.triple));
+        ledger.open_episode("孙八", None);
+        assert!(
+            !ledger.add_prediction(&prediction, None, String::new()),
+            "外部否决过的三元组不得重新成为候选"
+        );
+        let rule_id = ledger.rules()[0].id.clone();
+        ledger.retire(&rule_id).expect("退役应成功");
+        let blocked = ledger
+            .reactivate(&rule_id)
+            .expect_err("重放失败的规则不得恢复");
+        assert!(
+            matches!(blocked, EpisodeError::RegressionBlocked(_)),
+            "{blocked:?}"
+        );
     }
 }
