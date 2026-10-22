@@ -298,20 +298,28 @@ impl PatternLexicon {
         let subject = "x".to_string();
         let mut edges = Vec::new();
         let mut parsed_clauses = 0usize;
+        let mut unparsed = Vec::new();
         for clause in &clauses {
             let clause = trim_clause(clause);
             if clause.is_empty() {
                 continue;
             }
             let Some((_, predicate_match, predicate)) = self.longest_predicate(&clause) else {
+                unparsed.push(clause);
                 continue;
             };
             let after = &clause[predicate_match.end()..];
             let Some(object) = self.longest_object(after) else {
+                unparsed.push(clause);
                 continue;
             };
             let surface = &after[object.start..object.end()];
             let canonical = object.canonical(self, surface).to_string();
+            let tail = trim_clause(&after[object.end()..]);
+            if !tail.is_empty() && !self.is_scaffolding(&tail) {
+                unparsed.push(clause);
+                continue;
+            }
             if object.is_type {
                 let object_var = format!("v{}", edges.len());
                 edges.push(EdgePattern::var_var(&subject, predicate, &object_var));
@@ -320,6 +328,12 @@ impl PatternLexicon {
                 edges.push(EdgePattern::var_const(&subject, predicate, canonical));
             }
             parsed_clauses += 1;
+        }
+        // 只允许丢掉纯问句外壳（如「有多少人」）；含有已知实体/类型或
+        // 谓词的残句意味着「有一部分没看懂」，此时宁可放弃编译，也不能
+        // 把用户没问的子集当成完整答案。
+        if unparsed.iter().any(|clause| !self.is_scaffolding(clause)) {
+            return None;
         }
         if parsed_clauses < 2 {
             return None;
@@ -387,6 +401,10 @@ impl PatternLexicon {
             let object = self.longest_object(after)?;
             let surface = &after[object.start..object.end()];
             let canonical = object.canonical(self, surface).to_string();
+            let tail = trim_clause(&after[object.end()..]);
+            if !tail.is_empty() && !self.is_scaffolding(&tail) {
+                return None;
+            }
             if object.is_type {
                 let object_var = format!("o{}", edges.len());
                 edges.push(EdgePattern::var_var(&item, predicate, &object_var));
@@ -505,6 +523,17 @@ impl PatternLexicon {
             focus_predicate: Some(predicate),
             count_only: contains_count_word(question),
         })
+    }
+
+    fn is_scaffolding(&self, clause: &str) -> bool {
+        if self.longest_predicate(clause).is_some()
+            || self.longest_type(clause).is_some()
+            || !self.entity_mentions(clause).is_empty()
+        {
+            return false;
+        }
+        contains_question_word(clause)
+            || ["那", "那么", "呢", "吧", "的"].contains(&clause.trim())
     }
 
     fn finish_pattern(&self, edges: Vec<EdgePattern>, select: Vec<String>) -> Option<GraphPattern> {
@@ -820,6 +849,19 @@ mod tests {
         assert_eq!(existential.kind, GraphQuestionKind::Existential);
         assert!(existential.asks_for_count());
         assert_eq!(existential.pattern.edges.len(), 5);
+    }
+
+    #[test]
+    fn conjunction_rejects_partially_understood_clauses() {
+        let lexicon = lexicon();
+        // 第三个分句含已知实体「姚明」，不能因为谓词「喜欢」不在词表就静默丢弃。
+        assert!(lexicon
+            .compile("谁既导演过科幻片，又拿过金棕榈，还喜欢姚明？")
+            .is_none());
+        // 纯计数外壳可以跳过，剩余两个条件仍是一份完整解释。
+        assert!(lexicon
+            .compile("有多少人既导演过科幻片，又拿过金棕榈？")
+            .is_some());
     }
 
     #[test]
