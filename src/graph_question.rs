@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +118,32 @@ impl PatternLexicon {
         let found = self.longest_object(text)?;
         let surface = text.get(found.start..found.end())?;
         Some((found.canonical(self, surface).to_string(), found.is_type))
+    }
+
+    /// 解析追问里的限定词：先按实体/类型词面精确命中，再允许唯一类型前缀
+    ///（「中国」→「中国人」、「科幻」→「科幻片」）。歧义时返回 None，
+    /// 不替用户猜测限定范围。
+    pub fn resolve_refinement(&self, text: &str) -> Option<(String, bool)> {
+        let mut text = text.trim();
+        text = text.trim_start_matches(['是', '有', '要', ' ']);
+        text = text.trim_end_matches(['的', '呢', '吧', ' ']);
+        if text.is_empty() {
+            return None;
+        }
+        if let Some(found) = self.resolve_object(text) {
+            return Some(found);
+        }
+        let mut matched: BTreeSet<&str> = BTreeSet::new();
+        for (surface, canonical) in &self.types {
+            if surface.contains(text) || canonical.contains(text) || text.contains(surface) {
+                matched.insert(canonical.as_str());
+            }
+        }
+        if matched.len() == 1 {
+            let canonical = matched.into_iter().next()?;
+            return Some((canonical.to_string(), true));
+        }
+        None
     }
 
     fn longest_type(&self, text: &str) -> Option<SurfaceMatch> {

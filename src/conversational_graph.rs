@@ -973,25 +973,44 @@ impl ConversationalGraph {
         }
         for prefix in ["只看", "只要", "限定", "仅看", "只保留"] {
             if let Some(rest) = text.strip_prefix(prefix) {
-                let rest = rest.trim_start_matches(['是', '有', '要', ' ']);
-                let rest = rest.trim_end_matches(['的', '吧', '呢', ' ']);
-                if rest.is_empty() {
-                    return None;
-                }
-                let variable = self.focus_variable()?;
-                let (value, is_type) = lexicon.resolve_object(rest)?;
-                if is_type {
-                    return Some(GraphCommand::AddEdge(EdgePattern::var_const(
-                        variable, "type", value,
-                    )));
-                }
-                return Some(GraphCommand::AddConstraint(PatternConstraint::Equal {
-                    variable,
-                    value,
-                }));
+                return self.refinement_command(rest, lexicon);
             }
         }
-        None
+        let core = if let Some(rest) = text.strip_prefix("那") {
+            rest.strip_suffix('呢')
+        } else {
+            text.strip_suffix('呢')
+        }?;
+        self.refinement_command(core, lexicon)
+    }
+
+    fn refinement_command(
+        &self,
+        core: &str,
+        lexicon: &PatternLexicon,
+    ) -> Option<GraphCommand> {
+        let mut core = core.trim();
+        for prefix in ["如果", "要是", "若是", "那么"] {
+            if let Some(rest) = core.strip_prefix(prefix) {
+                core = rest.trim();
+            }
+        }
+        let core = core.trim_start_matches(['是', '有', '要', ' ']);
+        let core = core.trim_end_matches(['的', '吧', '呢', ' ']);
+        if core.is_empty() {
+            return None;
+        }
+        let variable = self.focus_variable()?;
+        let (value, is_type) = lexicon.resolve_refinement(core)?;
+        if is_type {
+            return Some(GraphCommand::AddEdge(EdgePattern::var_const(
+                variable, "type", value,
+            )));
+        }
+        Some(GraphCommand::AddConstraint(PatternConstraint::Equal {
+            variable,
+            value,
+        }))
     }
 
     fn focus_variable(&self) -> Option<String> {
@@ -1511,6 +1530,56 @@ mod tests {
             ),
             Err(PatternError::CannotDropLastConstraint)
         ));
+    }
+
+    #[test]
+    fn interpret_elliptical_followup_adds_restriction() {
+        let facts = sample_facts();
+        let pattern = GraphPattern::new(
+            vec![
+                EdgePattern::var_var("film", "type", "kind"),
+                EdgePattern::var_var("director", "导演", "film"),
+            ],
+            vec!["film".to_string()],
+        );
+        let mut conversation =
+            ConversationalGraph::new(pattern, &facts, MatchOptions::default()).unwrap();
+        let lexicon = interpretation_lexicon();
+        let narrowed = conversation
+            .interpret("那科幻片呢", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(narrowed, GraphReply::Changed { total: 1, .. }), "{:?}", narrowed);
+        assert_eq!(conversation.pattern().edges.len(), 3);
+        assert!(conversation
+            .pattern()
+            .edges
+            .iter()
+            .any(|edge| edge.predicate == "type" && edge.object == PatternTerm::constant("科幻片")));
+    }
+
+    #[test]
+    fn interpret_unique_type_prefix_narrows_followup() {
+        let mut facts = sample_facts();
+        facts.push(GraphFact::type_assertion("张三", "中国人"));
+        let mut lexicon = interpretation_lexicon();
+        lexicon.add_type("中国人", "中国人");
+        let pattern = GraphPattern::new(
+            vec![EdgePattern::var_const("person", "获奖", "金棕榈")],
+            vec!["person".to_string()],
+        );
+        let mut conversation =
+            ConversationalGraph::new(pattern, &facts, MatchOptions::default()).unwrap();
+        let narrowed = conversation
+            .interpret("只看中国的", &lexicon, &facts, MatchOptions::default())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(narrowed, GraphReply::Changed { total: 1, .. }));
+        assert!(conversation
+            .pattern()
+            .edges
+            .iter()
+            .any(|edge| edge.predicate == "type" && edge.object == PatternTerm::constant("中国人")));
     }
 
     #[test]
