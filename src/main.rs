@@ -101,7 +101,9 @@ use know_prolog::{
 #[command(about = "KnowProlog - Chinese knowledge graph system")]
 #[command(version)]
 struct Cli {
-    /// Override the configured Oxigraph store path (all subcommands)
+    /// Override the configured Oxigraph store path (all subcommands).
+    /// Interactive dialogue memory follows the overridden store when its
+    /// configured path is relative, so `--store` never mixes session state.
     #[arg(long, global = true)]
     store: Option<String>,
     /// Failure recovery mode for interactive dialogue: "off", "observe", or "on"
@@ -851,16 +853,26 @@ async fn main() {
     // 各相耗时只观测不断言；serve 分支打印摘要，/metrics 输出明细。
     let startup_ledger = StartupLedger::shared();
     let config_start = Instant::now();
-    let config = match load_config().await {
+    let mut config = match load_config().await {
         Ok(cfg) => {
             startup_ledger.record_since("config_load", config_start);
-            Arc::new(cfg)
+            cfg
         }
         Err(e) => {
             eprintln!("加载配置文件失败: {}", e);
             return;
         }
     };
+    // 存储路径可被 --store 覆盖（便于对独立知识库做导入/评估而不动主库）。
+    // 覆盖时相对对话状态路径也要落到新存储下，否则会话记忆会跨库串台。
+    let store_path = cli
+        .store
+        .clone()
+        .unwrap_or_else(|| config.system.oxigraph_store_path.clone());
+    if cli.store.is_some() {
+        isolate_dialogue_state_path(&mut config.reasoning.dialogue_state_path, &store_path);
+    }
+    let config = Arc::new(config);
     // 分层追踪模式：命令行 `--trace` 优先，缺省回落 config.toml 的 [trace_graph]。
     let trace_mode = match cli.trace.as_deref() {
         Some(value) => parse_trace_mode(value),
@@ -1039,12 +1051,6 @@ async fn main() {
 
     // 会话级性能台账：存储与推理共享同一实例，报告覆盖整条链路
     let perf_ledger = PerfLedger::shared();
-
-    // 存储路径可被 --store 覆盖（便于对独立知识库做导入/评估而不动主库）
-    let store_path = cli
-        .store
-        .clone()
-        .unwrap_or_else(|| config.system.oxigraph_store_path.clone());
 
     // 创建Oxigraph存储
     let store_start = Instant::now();
@@ -2784,6 +2790,29 @@ fn parse_trace_mode(value: &str) -> TraceMode {
         eprintln!("未知的分层追踪模式「{}」：可选 off / observe / on", value);
         std::process::exit(1);
     })
+}
+
+/// `--store` 覆盖存储时，把相对的对话状态路径重定位到新存储根目录。
+///
+/// 配置默认写成 `oxigraph_data/dialogue_state.json`；若原样保留，独立
+/// 存储下的会话会与主库共享记忆（焦点、槽账本、改口史全部串台）。绝对
+/// 路径视为用户显式指定，保持不动。
+fn isolate_dialogue_state_path(path: &mut Option<String>, store_path: &str) {
+    let Some(current) = path.as_deref() else {
+        return;
+    };
+    if current.trim().is_empty() || std::path::Path::new(current).is_absolute() {
+        return;
+    }
+    let file = std::path::Path::new(current)
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("dialogue_state.json"));
+    *path = Some(
+        std::path::Path::new(store_path)
+            .join(file)
+            .to_string_lossy()
+            .into_owned(),
+    );
 }
 
 /// `artifacts`：工件审计（知识版 `rustfmt --check`）。
@@ -11627,6 +11656,29 @@ async fn continue_original_query(
 mod session_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn store_override_isolates_relative_dialogue_state() {
+        let mut path = Some("oxigraph_data/dialogue_state.json".to_string());
+        isolate_dialogue_state_path(&mut path, "/tmp/kp-alt");
+        assert_eq!(
+            path.as_deref(),
+            Some("/tmp/kp-alt/dialogue_state.json"),
+            "相对状态路径必须跟随 --store"
+        );
+
+        let mut absolute = Some("/var/lib/kp/state.json".to_string());
+        isolate_dialogue_state_path(&mut absolute, "/tmp/kp-alt");
+        assert_eq!(
+            absolute.as_deref(),
+            Some("/var/lib/kp/state.json"),
+            "绝对路径是用户显式指定，不得改写"
+        );
+
+        let mut missing = None;
+        isolate_dialogue_state_path(&mut missing, "/tmp/kp-alt");
+        assert_eq!(missing, None);
+    }
 
     /// 各命令必须被 is_command_like 识别，避免澄清追问时被吞掉
     #[test]
