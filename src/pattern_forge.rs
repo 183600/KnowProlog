@@ -247,13 +247,15 @@ pub fn expansions_match(expansions: &[Vec<Elem>], tokens: &[TaggedWord]) -> bool
 // 请求、结果与错误
 // ---------------------------------------------------------------------------
 
-/// 一次锻造请求：一个正例、零到多个反例、目标路由。
+/// 一次锻造请求：一个主正例、可选同句式正例、零到多个反例、目标路由。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeRequest {
     pub name: String,
     pub query_type: String,
     pub priority: i32,
     pub positive: String,
+    /// 同句式的更多正例：只在 token 数相同的位置上合并词面选择。
+    pub extra_positives: Vec<String>,
     pub negatives: Vec<String>,
     pub guard: Option<crate::pattern_ir::ContextGuard>,
 }
@@ -269,9 +271,23 @@ impl ForgeRequest {
             query_type: query_type.into(),
             priority: 10,
             positive: positive.into(),
+            extra_positives: Vec::new(),
             negatives: Vec::new(),
             guard: None,
         }
+    }
+
+    /// 追加一个同句式正例（如「姚明的女儿是谁」与「姚明的闺女是谁」）。
+    pub fn with_positive(mut self, positive: impl Into<String>) -> Self {
+        self.extra_positives.push(positive.into());
+        self
+    }
+
+    /// 所有正例：主正例在前。
+    pub fn positives(&self) -> Vec<&str> {
+        std::iter::once(self.positive.as_str())
+            .chain(self.extra_positives.iter().map(String::as_str))
+            .collect()
     }
 
     pub fn with_negative(mut self, negative: impl Into<String>) -> Self {
@@ -492,6 +508,8 @@ pub enum ForgeError {
     TooManyExpansions,
     NegativeAccepted { negative: String, pattern: String },
     SelfReject,
+    PositiveShapeMismatch { positive: String },
+    PositiveNotCovered { positive: String },
     BudgetExhausted { max: usize },
     ActiveBudgetExhausted { max: usize },
     NotFound(String),
@@ -521,6 +539,16 @@ impl std::fmt::Display for ForgeError {
                 negative, pattern
             ),
             ForgeError::SelfReject => write!(f, "归纳出的模式没有命中正例，拒绝学习"),
+            ForgeError::PositiveShapeMismatch { positive } => write!(
+                f,
+                "正例「{}」与主正例的 token 数不同；请先用同一句式，或拆成两条规则",
+                positive
+            ),
+            ForgeError::PositiveNotCovered { positive } => write!(
+                f,
+                "合并后的模式没有覆盖正例「{}」，拒绝学习",
+                positive
+            ),
             ForgeError::BudgetExhausted { max } => {
                 write!(f, "锻造记录已达上限 {} 条；请先退役或遗忘不用的规则", max)
             }
@@ -628,6 +656,85 @@ fn learn_regex(tokens: &[TaggedWord]) -> (TokenRegex, BTreeMap<String, String>) 
         atoms.push(atom);
     }
     (TokenRegex::new(atoms), fills)
+}
+
+fn push_unique_atom(options: &mut Vec<ForgeAtom>, atom: ForgeAtom) {
+    if !options.contains(&atom) {
+        options.push(atom);
+    }
+}
+
+/// 合并同一个位置上的两种写法：词面差异进入有限选择，实体槽保持类型约束。
+fn merge_atom(left: &ForgeAtom, right: &ForgeAtom) -> ForgeAtom {
+    if left == right {
+        return left.clone();
+    }
+    match (left, right) {
+        (ForgeAtom::Alt { options }, ForgeAtom::Alt { options: more }) => {
+            let mut merged = options.clone();
+            for atom in more {
+                push_unique_atom(&mut merged, atom.clone());
+            }
+            ForgeAtom::Alt { options: merged }
+        }
+        (ForgeAtom::Alt { options }, atom) => {
+            let mut merged = options.clone();
+            push_unique_atom(&mut merged, atom.clone());
+            ForgeAtom::Alt { options: merged }
+        }
+        (atom, ForgeAtom::Alt { options }) => {
+            let mut merged = vec![atom.clone()];
+            for option in options {
+                push_unique_atom(&mut merged, option.clone());
+            }
+            ForgeAtom::Alt { options: merged }
+        }
+        (
+            ForgeAtom::Slot { name, sort, hints },
+            ForgeAtom::Slot {
+                sort: other_sort, ..
+            },
+        ) if sort == other_sort => ForgeAtom::Slot {
+            name: name.clone(),
+            sort: sort.clone(),
+            hints: hints.clone(),
+        },
+        (
+            ForgeAtom::Slot { name, sort, hints },
+            ForgeAtom::Literal { .. },
+        )
+        | (
+            ForgeAtom::Literal { .. },
+            ForgeAtom::Slot { name, sort, hints },
+        ) => ForgeAtom::Slot {
+            name: name.clone(),
+            sort: sort.clone(),
+            hints: hints.clone(),
+        },
+        (left, right) => ForgeAtom::Alt {
+            options: vec![left.clone(), right.clone()],
+        },
+    }
+}
+
+/// 合并两个同长度正例的 token 正则。
+fn merge_regex(
+    left: &TokenRegex,
+    right: &TokenRegex,
+    extra_positive: &str,
+) -> Result<TokenRegex, ForgeError> {
+    if left.atoms.len() != right.atoms.len() {
+        return Err(ForgeError::PositiveShapeMismatch {
+            positive: extra_positive.to_string(),
+        });
+    }
+    let atoms = left
+        .atoms
+        .iter()
+        .zip(&right.atoms)
+        .map(|(left, right)| merge_atom(left, right))
+        .collect();
+    Ok(TokenRegex::new(atoms))
 }
 
 fn alternative_value(sort: &str, current: &str, config: &NlpConfig) -> Option<String> {
@@ -797,7 +904,7 @@ impl PatternForge {
         }
     }
 
-    /// 从一个正例和零到多个反例锻造候选；反例命中即拒绝。
+    /// 从一个主正例、同句式补充正例与零到多个反例锻造候选；反例命中即拒绝。
     pub fn forge(
         &mut self,
         request: &ForgeRequest,
@@ -805,21 +912,40 @@ impl PatternForge {
     ) -> Result<ForgeOutcome, ForgeError> {
         let name = request.name.trim();
         let query_type = request.query_type.trim();
-        let positive = request.positive.trim();
+        let positives: Vec<String> = request
+            .positives()
+            .into_iter()
+            .map(str::trim)
+            .filter(|positive| !positive.is_empty())
+            .map(str::to_string)
+            .collect();
+        let Some(positive) = positives.first().map(String::as_str) else {
+            return Err(ForgeError::EmptyPositive);
+        };
         if name.is_empty() {
             return Err(ForgeError::EmptyName);
         }
         if query_type.is_empty() {
             return Err(ForgeError::EmptyRoute);
         }
-        if positive.is_empty() {
-            return Err(ForgeError::EmptyPositive);
-        }
         let positive_tokens = preprocess(positive, config);
         if positive_tokens.is_empty() {
             return Err(ForgeError::NoTokens);
         }
-        let (regex, slot_fills) = learn_regex(&positive_tokens);
+        let (mut regex, slot_fills) = learn_regex(&positive_tokens);
+        for extra in positives.iter().skip(1) {
+            let tokens = preprocess(extra, config);
+            if tokens.is_empty() {
+                return Err(ForgeError::NoTokens);
+            }
+            let (extra_regex, _) = learn_regex(&tokens);
+            regex = merge_regex(&regex, &extra_regex, extra)?;
+            if !regex.matches(&tokens) {
+                return Err(ForgeError::PositiveNotCovered {
+                    positive: extra.clone(),
+                });
+            }
+        }
         let expansions = regex.expand()?;
         if !expansions_match(&expansions, &positive_tokens) {
             return Err(ForgeError::SelfReject);
@@ -862,12 +988,15 @@ impl PatternForge {
             format!("forge_{}", fnv1a_hex(seed.as_bytes()))
         });
 
-        let mut probes = vec![ForgeProbe {
-            sentence: positive.to_string(),
-            expect_match: true,
-            passed: true,
-            origin: ProbeOrigin::Positive,
-        }];
+        let mut probes: Vec<ForgeProbe> = positives
+            .iter()
+            .map(|positive| ForgeProbe {
+                sentence: positive.clone(),
+                expect_match: true,
+                passed: true,
+                origin: ProbeOrigin::Positive,
+            })
+            .collect();
         for negative in &negatives {
             probes.push(ForgeProbe {
                 sentence: negative.clone(),
@@ -880,7 +1009,7 @@ impl PatternForge {
             &regex,
             &slot_fills,
             config,
-            &[positive.to_string()],
+            &positives,
             &negatives,
         ));
 
@@ -895,8 +1024,10 @@ impl PatternForge {
                         pattern.negatives.push(example.clone());
                     }
                 }
-                if !pattern.positives.iter().any(|example| example == positive) {
-                    pattern.positives.push(positive.to_string());
+                for positive in &positives {
+                    if !pattern.positives.contains(positive) {
+                        pattern.positives.push(positive.clone());
+                    }
                 }
                 for probe in &probes {
                     if !pattern
@@ -916,7 +1047,7 @@ impl PatternForge {
                 regex: regex.clone(),
                 expansions: expansions.clone(),
                 slot_fills: slot_fills.clone(),
-                positives: vec![positive.to_string()],
+                positives: positives.clone(),
                 negatives: negatives.clone(),
                 probes,
                 status: ForgeStatus::Candidate,
@@ -1105,7 +1236,7 @@ impl PatternForge {
 // ---------------------------------------------------------------------------
 
 /// 解析交互指令：
-/// `<名> | <正例> | <反例(可空，多个用 ; 分隔)> | <路由> | <优先级(可选)> | <守卫(可选)>`
+/// `<名> | <正例(多个用 ; 分隔)> | <反例(可空，多个用 ; 分隔)> | <路由> | <优先级(可选)> | <守卫(可选)>`
 pub fn parse_forge_spec(spec: &str) -> Result<ForgeRequest, ForgeError> {
     let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
     if parts.len() < 4 {
@@ -1114,13 +1245,19 @@ pub fn parse_forge_spec(spec: &str) -> Result<ForgeRequest, ForgeError> {
         ));
     }
     let name = parts[0];
-    let positive = parts[1];
+    let positives = parts[1]
+        .split([';', '；'])
+        .map(str::trim)
+        .filter(|positive| !positive.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     if name.is_empty() {
         return Err(ForgeError::EmptyName);
     }
-    if positive.is_empty() {
+    let Some(positive) = positives.first().cloned() else {
         return Err(ForgeError::EmptyPositive);
-    }
+    };
+    let extra_positives = positives.into_iter().skip(1).collect();
     let negatives = parts[2]
         .split([';', '；'])
         .map(str::trim)
@@ -1148,7 +1285,8 @@ pub fn parse_forge_spec(spec: &str) -> Result<ForgeRequest, ForgeError> {
         name: name.to_string(),
         query_type: query_type.to_string(),
         priority,
-        positive: positive.to_string(),
+        positive,
+        extra_positives,
         negatives,
         guard,
     })
@@ -1211,6 +1349,50 @@ mod tests {
             .probes
             .iter()
             .any(|probe| probe.origin == ProbeOrigin::Generated && probe.passed));
+    }
+
+    #[test]
+    fn multiple_positives_learn_surface_choices() {
+        let config = nlp_config();
+        let request = ForgeRequest::new("女儿问法", "姚明的女儿是谁", "daughter_query")
+            .with_positive("姚明的闺女是谁")
+            .with_negative("姚明的妻子是谁");
+        let mut forge = PatternForge::new();
+        let outcome = forge.forge(&request, &config).expect("应当学会两种写法");
+        assert_eq!(outcome.pattern.positives.len(), 2);
+        assert_eq!(outcome.pattern.expansions.len(), 2);
+        let regex = outcome.pattern.regex.render();
+        assert!(regex.contains("女儿"), "{}", regex);
+        assert!(regex.contains("闺女"), "{}", regex);
+        let activation = forge.activate(&outcome.pattern.id).expect("激活");
+        let mut library = PatternLibrary::new();
+        for entry in &activation.entries {
+            library.add(entry.clone());
+        }
+        for sentence in ["王强的女儿是谁", "王强的闺女是谁"] {
+            let routed = library
+                .route(&preprocess(sentence, &config))
+                .expect("两种写法都应当路由");
+            assert_eq!(routed.0, "daughter_query", "{}", sentence);
+            assert!(routed.1.contains(&"王强".to_string()), "{}", sentence);
+        }
+        assert!(library
+            .route(&preprocess("王强的妻子是谁", &config))
+            .is_none());
+    }
+
+    #[test]
+    fn mixed_length_positives_are_refused_instead_of_silently_dropped() {
+        let config = nlp_config();
+        let mut forge = PatternForge::new();
+        let error = forge
+            .forge(
+                &ForgeRequest::new("女儿问法", "姚明的女儿是谁", "daughter_query")
+                    .with_positive("姚明的闺女现在是谁"),
+                &config,
+            )
+            .expect_err("不同 token 数应当明确拒绝");
+        assert!(matches!(error, ForgeError::PositiveShapeMismatch { .. }));
     }
 
     #[test]
