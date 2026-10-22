@@ -10001,8 +10001,10 @@ impl SymbolicReasoner {
                 let adopted = self.adopt_hole_fill(&pending.hole, &object);
                 self.pending_questions.remove(pending.id);
                 self.pending_questions.clear_awaiting();
+                // 延期回答只走可确证的计划路径：证据索引的邻近事实、
+                // 链接预测候选与上下文叙述都不能冒充原目标的答案。
                 let answer = self
-                    .answer(&pending.question)
+                    .answer_planned(&pending.question)
                     .filter(|text| !Self::is_pending_failure(text));
                 let Some(answer) = answer else {
                     // 补上一条前提仍不足以证明：按当前失败前沿继续找下一个洞。
@@ -15030,6 +15032,34 @@ mod tests {
         assert!(restored
             .try_answer_pending_question("王五")
             .is_some_and(|reply| reply.contains("王五")));
+    }
+
+    #[test]
+    fn pending_question_walks_multiple_holes_one_at_a_time() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&pair_facts());
+        let ask = reasoner
+            .open_pending_question("张三的师傅的师傅的师傅的师傅是谁")
+            .expect("四跳缺边应立悬问");
+        assert!(ask.contains("李四 的 师傅"), "{}", ask);
+
+        let next = reasoner
+            .try_answer_pending_question("王五")
+            .expect("补上第一条洞后应继续追问");
+        assert!(next.contains("还差前提"), "{}", next);
+        assert!(next.contains("赵六 的 师傅"), "{}", next);
+        assert!(reasoner.has_pending_question(), "四跳仍未走通，悬问不能关闭");
+
+        let done = reasoner
+            .try_answer_pending_question("孙七")
+            .expect("补上第二条洞后应回答原问题");
+        assert!(done.contains("孙七"), "{}", done);
+        assert!(
+            done.contains("张三 的 师傅 的 师傅 的 师傅 的 师傅"),
+            "{}",
+            done
+        );
+        assert!(!reasoner.has_pending_question());
     }
 
     #[test]
