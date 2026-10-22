@@ -95,11 +95,11 @@ pub mod proof_bench;
 pub mod proof_journal;
 pub mod provenance;
 pub mod quality;
-pub mod quantity;
 pub mod query_board;
 pub mod query_planner;
 pub mod query_rewrite;
 pub mod query_scenario;
+pub mod quantity;
 pub mod question_analyzer;
 pub mod reading;
 pub mod recall_audit;
@@ -1375,7 +1375,9 @@ impl OxigraphManager {
                         )?;
                     }
                 } else {
-                    self.process_reverse_value(store, &subject, &predicate, value, context, stats)?;
+                    self.process_reverse_value(
+                        store, &subject, &predicate, value, context, stats,
+                    )?;
                 }
             }
         }
@@ -1507,7 +1509,9 @@ impl OxigraphManager {
                         Value::Array(items) => items.clone(),
                         other => vec![other.clone()],
                     };
-                    self.process_jsonld_list(store, subject, predicate, &items, context, stats)?;
+                    self.process_jsonld_list(
+                        store, subject, predicate, &items, context, stats,
+                    )?;
                     return Ok(());
                 }
                 // 处理嵌套对象
@@ -1674,7 +1678,8 @@ impl OxigraphManager {
                         other => other.to_string(),
                     };
                     if let Some(datatype) = obj.get("@type").and_then(Value::as_str) {
-                        let datatype = NamedNode::new(Self::expand_jsonld_term(datatype, context))?;
+                        let datatype =
+                            NamedNode::new(Self::expand_jsonld_term(datatype, context))?;
                         return Ok(Literal::new_typed_literal(&text, datatype).into());
                     }
                     if let Some(language) = obj.get("@language").and_then(Value::as_str) {
@@ -3036,9 +3041,7 @@ impl OxigraphManager {
                     .trim_matches(|c| c == '<' || c == '>')
                     .to_string(),
             };
-            out.push(crate::provenance::FactRef::new(
-                &subject, &predicate, &value,
-            ));
+            out.push(crate::provenance::FactRef::new(&subject, &predicate, &value));
         }
         out.sort();
         out.dedup();
@@ -5755,7 +5758,11 @@ mod cache_tests {
             .unwrap();
         assert_eq!(nicks.data.len(), 2, "{:?}", nicks.data);
         assert_eq!(
-            manager.import_jsonld(jsonld).await.unwrap().triples,
+            manager
+                .import_jsonld(jsonld)
+                .await
+                .unwrap()
+                .triples,
             0,
             "重复导入保持幂等"
         );
