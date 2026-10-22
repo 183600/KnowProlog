@@ -7041,6 +7041,19 @@ impl SymbolicReasoner {
                 }
             }
         }
+        // 同一取值可能从两条通道到达：关系索引保存的是本地名，而实体属性
+        // 保存的是导入时的宾语 IRI（如 `kg:entity/李四`）。显示与计数前把
+        // kg 实体 IRI 还原成本地名并按值去重；外部 IRI 原样保留，绝不猜测。
+        for hit in &mut hits {
+            if let Some(local) = crate::identity::entity_local_name(
+                crate::identity::DEFAULT_BASE_NS,
+                &hit.value,
+            ) {
+                hit.value = local;
+            }
+        }
+        let mut distinct: HashSet<String> = HashSet::new();
+        hits.retain(|hit| distinct.insert(hit.value.clone()));
         // 槽级压制只影响视图：当会话槽已有赢家时，图谱写下的同一槽旧值
         // 不再进入答案；旧值仍保留在图谱与账本里（压制不等于否定）。
         if !predicate.inverted {
@@ -18636,6 +18649,36 @@ types = [
         reasoner.observe_facts(&facts);
         let answer = reasoner.answer("姚明多高").expect("程度问句应可回答");
         assert!(answer.contains("226cm"), "实际回答：{}", answer);
+    }
+
+    #[test]
+    fn relation_answer_normalizes_entity_iri_and_dedups_channels() {
+        let mut facts = master_facts();
+        facts.push(PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "Person".to_string(),
+            properties: HashMap::from([
+                ("name".to_string(), "张三".to_string()),
+                (
+                    "师傅".to_string(),
+                    crate::identity::entity_uri(crate::identity::DEFAULT_BASE_NS, "李四"),
+                ),
+            ]),
+        });
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let answer = reasoner.answer("张三的师傅是谁").expect("应回答直接关系");
+        assert!(
+            !answer.contains("http://example.org/kg/entity/李四"),
+            "实体 IRI 不应作为取值展示：{}",
+            answer
+        );
+        assert_eq!(
+            answer.matches("李四").count(),
+            1,
+            "关系索引与属性索引的同一取值应去重：{}",
+            answer
+        );
     }
 
     #[test]
