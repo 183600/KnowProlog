@@ -7570,14 +7570,41 @@ impl SymbolicReasoner {
         }
     }
 
+    /// 图谱问句词表：实体、类型、谓词的规范形与已确认别名。
+    ///
+    /// 别名只在“规范形确实是图中的实体/类型/谓词”时才登记，避免把
+    /// 关系别名误当实体、或把未落图的配置名伪装成已知词。
     fn graph_lexicon(&self) -> PatternLexicon {
         let mut lexicon = PatternLexicon::new();
         let predicates = self.generator.all_predicates();
+        let mut known_types: BTreeSet<String> = self.generator.all_types().into_iter().collect();
+        known_types.extend(
+            self.generator
+                .typed_entities()
+                .into_iter()
+                .map(|(_, entity_type)| entity_type)
+                .filter(|entity_type| !entity_type.trim().is_empty()),
+        );
+        for triple in self.predictor.triples() {
+            if triple.predicate == "type" && !triple.object.trim().is_empty() {
+                known_types.insert(triple.object.clone());
+            }
+        }
+        // 己登记的子类父类型也要进词表，否则「电影」问句会在编译期就失配，
+        // 根本走不到类型闭包已经支持的那一步。
+        {
+            let retrieval = self.retrieval.lock();
+            let supertypes: Vec<String> = known_types
+                .iter()
+                .flat_map(|known| retrieval.type_ancestors(known))
+                .collect();
+            known_types.extend(supertypes);
+        }
         for entity in self.generator.all_entities() {
             lexicon.add_entity(&entity, &entity);
         }
-        for entity_type in self.generator.all_types() {
-            lexicon.add_type(&entity_type, &entity_type);
+        for entity_type in &known_types {
+            lexicon.add_type(entity_type, entity_type);
         }
         for (entity, entity_type) in self.generator.typed_entities() {
             if !entity_type.trim().is_empty() {
@@ -7597,7 +7624,11 @@ impl SymbolicReasoner {
             }
         }
         for (alias, canonical) in self.aligner.synonyms() {
-            if predicates.iter().any(|predicate| predicate == canonical)
+            if self.is_known_entity(canonical) {
+                lexicon.add_entity(alias, canonical);
+            } else if known_types.contains(canonical) {
+                lexicon.add_type(alias, canonical);
+            } else if predicates.iter().any(|predicate| predicate == canonical)
                 || self.predictor.has_predicate(canonical)
             {
                 lexicon.add_predicate(alias, canonical);
@@ -7631,6 +7662,21 @@ impl SymbolicReasoner {
                 ));
             }
         }
+        // 类型闭包只在本轮图谱匹配中物化，不写回知识图谱：查询「电影」
+        // 能命中显式断言的「科幻片」，依据仍是检索层已登记的子类边。
+        let mut inferred = Vec::new();
+        {
+            let retrieval = self.retrieval.lock();
+            for fact in &facts {
+                if fact.predicate != "type" {
+                    continue;
+                }
+                for ancestor in retrieval.type_ancestors(&fact.object) {
+                    inferred.push(GraphFact::type_assertion(&fact.subject, ancestor));
+                }
+            }
+        }
+        facts.extend(inferred);
         facts.sort_by(|left, right| {
             (
                 &left.subject,
@@ -17982,6 +18028,26 @@ types = [
             .expect("计数问句应由图谱模式回答");
         assert!(answer.contains("共有 1 个"), "{}", answer);
         assert!(!answer.contains("张三"), "{}", answer);
+    }
+
+    #[test]
+    fn graph_question_uses_type_closure_and_confirmed_entity_aliases() {
+        let mut reasoner = graph_pattern_reasoner();
+        // 「电影A」显式断言的是「科幻片」；闭包让查询「电影」也能命中。
+        reasoner
+            .teach_ontology("科幻片是一种电影")
+            .expect("可教学子类公理");
+        let typed = reasoner
+            .answer_graph_question("有没有一部电影，主演是中国人？")
+            .expect("父类型问句应可编译");
+        assert!(typed.contains("电影A"), "{}", typed);
+        assert!(!typed.contains("电影B"), "{}", typed);
+
+        reasoner.register_entity_alias("小巨人", "姚明");
+        let aliased = reasoner
+            .answer_graph_question("小巨人和刘翔出生在同一个城市吗？")
+            .expect("已确认实体别名应进入图谱词表");
+        assert!(aliased.contains("上海"), "{}", aliased);
     }
 
     #[test]

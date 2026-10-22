@@ -500,6 +500,42 @@ impl DenseRetriever {
         false
     }
 
+    /// 全部严格父类型（传递闭包，有界 BFS，字典序）。
+    ///
+    /// 与 [`Self::type_pool`] 的向下展开互补：这里给出「已知类型上浮到
+    /// 哪些父类型」，供图谱问句在只读匹配里物化类型闭包。
+    pub fn type_ancestors(&self, name: &str) -> Vec<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Vec::new();
+        }
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(name);
+        let mut frontier: Vec<&str> = vec![name];
+        let mut found: HashSet<String> = HashSet::new();
+        for _ in 0..MAX_SUBCLASS_DEPTH {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for node in frontier {
+                let Some(supers) = self.type_hierarchy.get(node) else {
+                    continue;
+                };
+                for parent in supers {
+                    if visited.insert(parent.as_str()) {
+                        found.insert(parent.clone());
+                        next.push(parent.as_str());
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let mut result: Vec<String> = found.into_iter().collect();
+        result.sort();
+        result
+    }
+
     /// 两类型是否有显式互斥证据（规范化有序对判定）。
     pub fn types_disjoint(&self, left: &str, right: &str) -> bool {
         if left == right {
