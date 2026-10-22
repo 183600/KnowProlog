@@ -1197,17 +1197,12 @@ fn render_comparison(
         Comparison::Equal => output.push_str("\n  两者数值相同。"),
         Comparison::Less | Comparison::Greater => {
             let word = left_quantity.dimension().comparative_word(&label);
-            let difference = left_quantity
-                .difference(&right_quantity)
-                .map(|value| value.abs())
-                .unwrap_or_default();
-            let unit = if left_quantity.dimension() == Dimension::Count
-                && !left_quantity.has_unit()
-            {
-                ""
-            } else {
-                left_quantity.dimension().canonical_unit()
-            };
+            // 差值写回左侧的原始单位：226 厘米 vs 216 厘米说「10 厘米」，
+            // 而不是让用户自己把 0.1 米换算回去。
+            let (difference, unit) = left_quantity
+                .difference_in_own_unit(&right_quantity)
+                .map(|(value, unit)| (value.abs(), unit.unwrap_or("")))
+                .unwrap_or((0.0, ""));
             let direction_word = match left_quantity.compare(&right_quantity) {
                 Comparison::Greater => word,
                 _ => comparison_lower_word(word),
@@ -2703,6 +2698,13 @@ mod tests {
         let right = QueryRow::new("乙", "身高", "2.26米");
         let text = render_comparison(&left, &right, &TestKnowledge::new());
         assert!(text.contains("单位不同"));
+
+        // 差值保留用户熟悉的原始单位，而不是一律折算成基准单位。
+        let left = QueryRow::new("甲", "身高", "226厘米");
+        let right = QueryRow::new("乙", "身高", "216厘米");
+        let text = render_comparison(&left, &right, &TestKnowledge::new());
+        assert!(text.contains("10厘米"), "{}", text);
+        assert!(!text.contains("0.1米"), "{}", text);
     }
 
     #[test]

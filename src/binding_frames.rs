@@ -1963,23 +1963,15 @@ fn winner_with_difference(
     winner_quantity: &Quantity,
     loser_quantity: &Quantity,
 ) -> AttributeComparison {
-    let difference = winner_quantity.difference(loser_quantity).ok().map(|value| {
-        (
-            value.abs(),
-            winner_quantity.dimension().canonical_unit(),
-        )
-    });
+    // 差值写回胜者的原始单位（226 厘米 vs 216 厘米 → 10 厘米）。
+    let difference = winner_quantity
+        .difference_in_own_unit(loser_quantity)
+        .ok()
+        .map(|(value, unit)| (value.abs(), unit.unwrap_or("")));
     let detail = difference
         .filter(|(value, _)| *value > 1e-9)
         .map(|(value, unit)| {
-            let suffix = if winner_quantity.dimension() == quantity::Dimension::Count
-                && !winner_quantity.has_unit()
-            {
-                ""
-            } else {
-                unit
-            };
-            format!("（相差{}{}）", quantity::format_number(value), suffix)
+            format!("（相差{}{}）", quantity::format_number(value), unit)
         })
         .unwrap_or_default();
     AttributeComparison {
