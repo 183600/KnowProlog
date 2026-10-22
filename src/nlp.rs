@@ -34,6 +34,8 @@ pub enum TagSource {
     JiebaTag,
     /// 全部为数字
     Numeric,
+    /// 数词 + 量词被结巴粘成一个 token，按语义拆分
+    NumeralMeasure,
     /// 没有证据，保留为未知词
     Unknown,
 }
@@ -45,6 +47,7 @@ impl TagSource {
             TagSource::NamePattern => "name_pattern",
             TagSource::JiebaTag => "jieba_tag",
             TagSource::Numeric => "numeric",
+            TagSource::NumeralMeasure => "numeral_measure",
             TagSource::Unknown => "unknown",
         }
     }
@@ -55,6 +58,7 @@ impl TagSource {
             TagSource::NamePattern => "姓名模式",
             TagSource::JiebaTag => "结巴兜底",
             TagSource::Numeric => "数字规则",
+            TagSource::NumeralMeasure => "数词量词拆分",
             TagSource::Unknown => "未知",
         }
     }
@@ -157,13 +161,20 @@ pub fn preprocess_annotated(text: &str, config: &crate::NlpConfig) -> Vec<Annota
             ));
             i = end;
         } else {
-            annotated.push(annotated_word(
-                words[i].to_string(),
-                config,
-                &full_names,
-                jieba_tags.get(i).copied(),
-                spans.get(i).copied().unwrap_or((0, 0)),
-            ));
+            let span = spans.get(i).copied().unwrap_or((0, 0));
+            if let Some(parts) =
+                split_numeral_measure(words[i], config, jieba_tags.get(i).copied(), span)
+            {
+                annotated.extend(parts);
+            } else {
+                annotated.push(annotated_word(
+                    words[i].to_string(),
+                    config,
+                    &full_names,
+                    jieba_tags.get(i).copied(),
+                    span,
+                ));
+            }
             i += 1;
         }
     }
@@ -191,6 +202,106 @@ fn token_spans(text: &str, words: &[&str]) -> Vec<(usize, usize)> {
     spans
 }
 
+/// 把一个「数词 + 量词/单位」token 按语义拆开。
+///
+/// 结巴会把「十八岁」标成一个 m token，而配置里的年龄规则是
+/// `nr + m + q`；不拆分就永远命不中量词槽。单位（米、公斤）不拆，
+/// 只把整个 token 认作数字；「十分」「万一」等词由黑名单保护。
+fn split_numeral_measure(
+    word: &str,
+    config: &crate::NlpConfig,
+    jieba_tag: Option<&str>,
+    span: (usize, usize),
+) -> Option<Vec<AnnotatedWord>> {
+    if jieba_tag != Some("m")
+        || NUMERAL_WORD_BLOCKLIST.contains(&word)
+        || config.pos_dict.contains_key(word)
+    {
+        return None;
+    }
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+    let jieba_pos = jieba_tag.map(str::to_string);
+    let mut split: Option<(usize, usize)> = None;
+    for cut in 1..chars.len() {
+        let prefix: String = chars[..cut].iter().collect();
+        if crate::chinese_reasoning_nlu::parse_chinese_number_u64(&prefix).is_none() {
+            continue;
+        }
+        let rest = &chars[cut..];
+        for measure in COUNT_MEASURES {
+            let measure_chars: Vec<char> = measure.chars().collect();
+            if rest.starts_with(&measure_chars) {
+                split = Some((cut, measure_chars.len()));
+            }
+        }
+    }
+    if let Some((cut, measure_len)) = split {
+        let prefix: String = chars[..cut].iter().collect();
+        let measure: String = chars[cut..cut + measure_len].iter().collect();
+        let remainder: String = chars[cut + measure_len..].iter().collect();
+        let mut parts = Vec::with_capacity(3);
+        parts.push(AnnotatedWord {
+            text: prefix,
+            pos: "m".to_string(),
+            source: TagSource::Numeric,
+            jieba_pos: jieba_pos.clone(),
+            start: span.0,
+            end: span.0 + cut,
+        });
+        parts.push(AnnotatedWord {
+            text: measure,
+            pos: "q".to_string(),
+            source: TagSource::NumeralMeasure,
+            jieba_pos: jieba_pos.clone(),
+            start: span.0 + cut,
+            end: span.0 + cut + measure_len,
+        });
+        if !remainder.is_empty() {
+            let (pos, source) =
+                if crate::chinese_reasoning_nlu::parse_chinese_number_u64(&remainder).is_some() {
+                    ("m", TagSource::Numeric)
+                } else {
+                    ("unknown", TagSource::Unknown)
+                };
+            parts.push(AnnotatedWord {
+                text: remainder,
+                pos: pos.to_string(),
+                source,
+                jieba_pos,
+                start: span.0 + cut + measure_len,
+                end: span.1,
+            });
+        }
+        return Some(parts);
+    }
+
+    // 数词 + 计量单位（「一米」「三公斤」）：保留整体，但认作数字。
+    for cut in 1..chars.len() {
+        let prefix: String = chars[..cut].iter().collect();
+        if crate::chinese_reasoning_nlu::parse_chinese_number_u64(&prefix).is_none() {
+            continue;
+        }
+        let rest: String = chars[cut..].iter().collect();
+        if NUMERAL_UNITS
+            .iter()
+            .any(|unit| rest.starts_with(unit))
+        {
+            return Some(vec![AnnotatedWord {
+                text: word.to_string(),
+                pos: "m".to_string(),
+                source: TagSource::NumeralMeasure,
+                jieba_pos,
+                start: span.0,
+                end: span.1,
+            }]);
+        }
+    }
+    None
+}
+
 // 确定单个词语的词性并封装为标注词
 fn annotated_word(
     word: String,
@@ -210,6 +321,33 @@ fn annotated_word(
     }
 }
 
+/// 中文数字里常见、但作为词时并非数字的写法（「万一」「十分」等）。
+/// 仅靠字形无法区分，必须显式排除，避免把副词当数量。
+const NUMERAL_WORD_BLOCKLIST: &[&str] =
+    &["万一", "千万", "万万", "亿万", "十分", "万分", "百分", "千分"];
+
+/// 可以跟数词构成「数量短语」的量词；结巴常把「十八岁」粘成一个 m token，
+/// 拆开后才能命中提取规则里的 nr + m + q。
+const COUNT_MEASURES: &[&str] = &[
+    "岁", "年", "月", "日", "天", "个", "人", "次", "元", "块", "只", "头", "名", "位", "件",
+    "条", "张", "本", "辆", "架", "门", "间", "层", "页", "篇",
+];
+
+/// 计量单位：数词与单位粘在一起时保留为整体数字 token（如「一米」），
+/// 不拆成 m + q，避免破坏身高/体重等「数值可带单位」的槽位。
+const NUMERAL_UNITS: &[&str] = &[
+    "公斤", "公里", "厘米", "毫米", "平方米", "立方米", "小时", "分钟", "米", "斤", "克", "吨",
+    "度", "分", "秒", "升", "毫升",
+];
+
+fn is_chinese_numeral_word(word: &str) -> bool {
+    !NUMERAL_WORD_BLOCKLIST.contains(&word)
+        && crate::chinese_reasoning_nlu::parse_chinese_number_u64(word).is_some()
+        && word
+            .chars()
+            .all(|ch| "零〇一二两三四五六七八九十百千万亿壹贰叁肆伍陆柒捌玖拾佰仟".contains(ch))
+}
+
 fn resolve_tag(
     word: &str,
     config: &crate::NlpConfig,
@@ -217,6 +355,9 @@ fn resolve_tag(
     jieba_tag: Option<&str>,
 ) -> (String, TagSource) {
     if word.chars().all(|c| c.is_numeric()) {
+        return ("m".to_string(), TagSource::Numeric);
+    }
+    if is_chinese_numeral_word(word) {
         return ("m".to_string(), TagSource::Numeric);
     }
     if is_name(word, &config.name_patterns, full_names) {
@@ -601,6 +742,47 @@ mod tests {
             enable_relation_extraction: None,
             context_window_size: None,
         }
+    }
+
+    #[test]
+    fn numeral_measure_tokens_are_split_for_extraction() {
+        let config = test_config();
+        let words = preprocess_annotated("小明十八岁", &config);
+        let numeral = words
+            .iter()
+            .position(|word| word.text == "十八")
+            .expect("结巴「十八岁」应拆出数词");
+        assert_eq!(words[numeral].pos, "m");
+        assert_eq!(words[numeral].source, TagSource::Numeric);
+        assert_eq!(words[numeral + 1].text, "岁");
+        assert_eq!(words[numeral + 1].pos, "q");
+        assert_eq!(words[numeral + 1].source, TagSource::NumeralMeasure);
+        let text = "小明十八岁";
+        let slice = |start: usize, end: usize| -> String {
+            text.chars().skip(start).take(end - start).collect()
+        };
+        assert_eq!(slice(words[numeral].start, words[numeral].end), "十八");
+        assert_eq!(
+            slice(words[numeral + 1].start, words[numeral + 1].end),
+            "岁"
+        );
+    }
+
+    #[test]
+    fn numeral_words_do_not_swallow_adverbs_or_units() {
+        let config = test_config();
+        for word in ["万一", "十分", "千万"] {
+            let words = preprocess_annotated(word, &config);
+            assert_eq!(words.len(), 1, "{} 不应被拆开", word);
+            assert_eq!(words[0].pos, "unknown", "{} 不是数量词", word);
+        }
+        let words = preprocess_annotated("张三身高一米", &config);
+        let unit = words
+            .iter()
+            .find(|word| word.text == "一米")
+            .expect("数词+单位应保留整体");
+        assert_eq!(unit.pos, "m");
+        assert_eq!(unit.source, TagSource::NumeralMeasure);
     }
 
     #[test]
