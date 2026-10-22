@@ -8452,6 +8452,11 @@ impl SymbolicReasoner {
         if !Self::derived_rule_is_assertoric(&fact.rule_source) {
             return None;
         }
+        // 会话否定事实是阻断边：被否定的前提不能推出结论，被否定的结论
+        // 也不能因为规则链而复活。
+        if self.derived_fact_is_blocked(fact) {
+            return None;
+        }
         let fact_predicate = self.aligner.canonical_form(fact.atom.predicate.as_ref());
         let slot_key = self.aligner.canonical_form(&predicate.slot);
         let surface_key = self.aligner.canonical_form(&predicate.surface);
@@ -8477,6 +8482,29 @@ impl SymbolicReasoner {
     /// 只有教学/补全/手工规则算「证明」；统计挖掘规则仍只算候选。
     fn derived_rule_is_assertoric(source: &str) -> bool {
         !source.starts_with("链接预测规则") && !source.starts_with("关联规则")
+    }
+
+    /// 推导的结论或任一前提是否被会话否定事实阻断。
+    fn derived_fact_is_blocked(&self, fact: &DerivedFact) -> bool {
+        std::iter::once(&fact.atom)
+            .chain(fact.premises.iter())
+            .any(|atom| self.negative_atom_blocks(atom))
+    }
+
+    /// 规范化比较的否定阻断：词面同义词不应让阻断边漏过去。
+    fn negative_atom_blocks(&self, atom: &Atom) -> bool {
+        let [Term::Const(subject), Term::Const(object)] = atom.terms.as_slice() else {
+            return false;
+        };
+        let subject = self.aligner.canonical_form(subject);
+        let predicate = self.aligner.canonical_form(atom.predicate.as_ref());
+        let object = self.aligner.canonical_form(object);
+        self.session_negative_facts.iter().any(|negative| {
+            negative.terms.len() == 2
+                && self.aligner.canonical_form(negative.predicate.as_ref()) == predicate
+                && self.aligner.canonical_form(negative.terms[0].name()) == subject
+                && self.aligner.canonical_form(negative.terms[1].name()) == object
+        })
     }
 
     /// 在当前前向闭包里找一条能证明 `entity 的 predicate 是 expected` 的推导。
@@ -14026,6 +14054,37 @@ mod tests {
             .session_facts
             .iter()
             .any(|atom| atom.predicate.as_ref() == "师祖"));
+    }
+
+    #[test]
+    fn test_derived_answer_respects_session_negative_premise() {
+        let mut config = test_config();
+        config.enable_link_prediction = false;
+        config.enable_association_rules = false;
+        config.enable_clarification = false;
+        config.enable_soft_logic = false;
+        config.enable_problog = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.assert_nl_fact("张三的师傅是李四");
+        reasoner.assert_nl_fact("李四的师傅是王五");
+        reasoner.learn_rule_report("如果X的师傅是Y，那么X的师祖是Y");
+        // 否定「李四的师傅是王五」：规则仍会在前向闭包里产出中间结论，
+        // 但回答层必须把这条被阻断的前提过滤掉。
+        reasoner.assert_negative_atom(Atom::rel("师傅", "李四", "王五"));
+
+        let answer = reasoner.answer("张三的师祖是谁");
+        assert!(
+            answer
+                .as_deref()
+                .map(|text| !text.contains("王五"))
+                .unwrap_or(true),
+            "{:?}",
+            answer
+        );
+        let check = reasoner
+            .answer("张三的师祖是王五吗")
+            .expect("已知实体与谓词应给出可读回答");
+        assert!(!check.contains("是的"), "{}", check);
     }
 
     #[test]
