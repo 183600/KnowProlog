@@ -14,7 +14,8 @@ use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
-use crate::completion_episode::{CompletionLedger, RuleScope};
+use crate::completion_episode::{CandidateStatus, CompletionLedger, RuleScope};
+use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
 use crate::contextual_reference::{SenseCard, SenseSource};
 use crate::default_logic::{self, DefaultTheory, Literal};
 use crate::dense_retrieval::{DenseRetriever, EvidenceSearch, SearchBudget, SearchConstraints};
@@ -5189,6 +5190,85 @@ impl SymbolicReasoner {
 
     pub fn completion_rules_report(&self) -> String {
         self.completion.render_rules()
+    }
+
+    /// 导出四层知识容器清单：基础层 / 会话层 / 推测层 / 假设层。
+    ///
+    /// 每层只读当前状态，不做推理；摘要覆盖该层全量条目，样例有界。
+    pub fn knowledge_layer_manifest(&self) -> KnowledgeLayerManifest {
+        let mut base: Vec<String> = self
+            .predictor
+            .triples()
+            .iter()
+            .map(|triple| {
+                format!(
+                    "{} --{}--> {}",
+                    triple.subject, triple.predicate, triple.object
+                )
+            })
+            .collect();
+        base.extend(self.attributes.iter().map(|(entity, attribute, value)| {
+            format!("{} --{}--> {}", entity, attribute, value)
+        }));
+
+        let mut session = Vec::new();
+        for atom in &self.session_facts {
+            session.push(format!("+ {}", atom.display()));
+        }
+        for atom in &self.session_negative_facts {
+            session.push(format!("- {}", atom.display()));
+        }
+
+        let mut speculative = Vec::new();
+        for episode in self.completion.episodes() {
+            for candidate in &episode.candidates {
+                if candidate.status == CandidateStatus::Pending {
+                    speculative.push(format!(
+                        "{} [{}，置信度 {:.2}，回合 {}]",
+                        candidate.display_triple(),
+                        candidate.warrant.label(),
+                        candidate.confidence,
+                        &episode.id[..episode.id.len().min(21)]
+                    ));
+                }
+            }
+        }
+        for rule in self.completion.rules() {
+            if rule.is_usable() {
+                speculative.push(format!(
+                    "规则[{}] {}",
+                    rule.status.label(),
+                    rule.spec.rule_text()
+                ));
+            }
+        }
+
+        let hypotheses: Vec<String> = self
+            .assumption_world
+            .as_ref()
+            .map(|world| {
+                world
+                    .assumptions
+                    .iter()
+                    .map(|atom| atom.display())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        KnowledgeLayerManifest::new(
+            self.revision,
+            vec![
+                LayerEntry::new("L0", "基础层", "只读", base),
+                LayerEntry::new("L1", "会话层", "会话可写", session),
+                LayerEntry::new("L2", "推测层", "待确认", speculative),
+                LayerEntry::new("L3", "假设层", "临时", hypotheses),
+            ],
+        )
+    }
+
+    /// 人读的层次清单（命令行与宿主自检共用）。
+    pub fn knowledge_layers_report(&self) -> String {
+        self.knowledge_layer_manifest().render_text()
     }
 
     /// 解析并执行补全回合命令（打开 / 确认 / 驳回 / 报告 / 规则生命周期）。
@@ -15250,6 +15330,70 @@ types = [
             .handle_completion_command("晋升补全规则：")
             .expect("空参数应给出用法")
             .contains("用法"));
+    }
+
+    #[test]
+    fn knowledge_layer_manifest_separates_base_session_and_speculation() {
+        let mut config = test_config();
+        config.link_prediction_min_confidence = 0.1;
+        let mut facts = master_facts();
+        for (from, to) in [
+            ("孙八", "周九"),
+            ("周九", "吴十"),
+            ("郑十一", "钱十二"),
+            ("钱十二", "孙十三"),
+        ] {
+            facts.push(PrologFact::Relation {
+                from: from.to_string(),
+                rel_type: "师傅".to_string(),
+                to: to.to_string(),
+            });
+        }
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let manifest = reasoner.knowledge_layer_manifest();
+        assert_eq!(manifest.revision, reasoner.revision(), "清单必须锚定知识版本");
+        assert_eq!(manifest.layers.len(), 4);
+        assert_eq!(
+            manifest.layers.iter().map(|layer| layer.id.as_str()).collect::<Vec<_>>(),
+            vec!["L0", "L1", "L2", "L3"],
+            "层次顺序必须稳定"
+        );
+        let base = manifest.layer("L0").expect("基础层必须存在");
+        assert!(base.count > 0, "母版事实应进入基础层");
+        assert_eq!(base.digest.len(), 16, "摘要应是 16 位十六进制");
+        assert!(manifest.layer("L1").expect("会话层").empty);
+        assert_eq!(manifest.digest.len(), 16);
+        assert_eq!(
+            manifest,
+            reasoner.knowledge_layer_manifest(),
+            "只读导出必须确定"
+        );
+
+        let opened = reasoner
+            .handle_completion_command("补全回合：孙八")
+            .expect("打开回合");
+        assert!(opened.contains("补全回合"), "{}", opened);
+        let with_candidates = reasoner.knowledge_layer_manifest();
+        assert!(
+            with_candidates.layer("L2").expect("推测层").count > 0,
+            "待确认候选必须出现在推测层"
+        );
+
+        let confirmed = reasoner
+            .handle_completion_command("确认补全：孙八|师祖|吴十")
+            .expect("确认候选");
+        assert!(confirmed.contains("已确认补全"), "{}", confirmed);
+        let with_session = reasoner.knowledge_layer_manifest();
+        assert!(
+            with_session.layer("L1").expect("会话层").count > 0,
+            "确认后的会话事实必须与基础层分列"
+        );
+        assert_ne!(manifest.digest, with_session.digest, "状态变化必须改变合成摘要");
+        let text = reasoner.knowledge_layers_report();
+        assert!(text.contains("知识容器层次清单"), "{}", text);
+        assert!(text.contains("L3 假设层"), "{}", text);
     }
 
     #[test]

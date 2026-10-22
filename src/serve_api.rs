@@ -36,6 +36,7 @@
 //! - `GET  /metrics`               会话数 / 轮数 / 性能台账 / 启动分期明细
 //! - `POST /sessions`              新建会话 → `{"session_id": "s-1"}`
 //! - `GET  /sessions/{id}`         会话快照（焦点栈 / 历史摘要 / 策略）
+//! - `GET  /sessions/{id}/layers`  四层知识容器清单（基础/会话/推测/假设）
 //! - `GET  /sessions/{id}/export`  导出会话信封（可移植 JSON）
 //! - `POST /sessions/import`       导入会话信封重建会话
 //! - `DELETE /sessions/{id}`       关闭会话
@@ -1111,6 +1112,9 @@ enum SessionCommand {
     ReadTraces {
         reply: oneshot::Sender<serde_json::Value>,
     },
+    Layers {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
 }
 
 /// 会话句柄：HTTP 层可见的唯一部分（`Send + Sync`）。
@@ -1624,6 +1628,14 @@ impl ApiState {
                                 "receipts": session.reasoner.read_trace_receipts(),
                             }));
                         }
+                        SessionCommand::Layers { reply } => {
+                            let manifest = session.reasoner.knowledge_layer_manifest();
+                            let _ = reply.send(serde_json::json!({
+                                "session_id": session.id,
+                                "turns": session.turns,
+                                "manifest": manifest,
+                            }));
+                        }
                     }
                 }
             })
@@ -1906,6 +1918,16 @@ impl ApiState {
         reply_rx.await.map_err(|_| SessionError::Unavailable)
     }
 
+    /// 四层知识容器清单（基础 / 会话 / 推测 / 假设）。
+    async fn session_layers(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::Layers { reply: reply_tx })
+            .await
+            .map_err(|_| SessionError::Unavailable)?;
+        reply_rx.await.map_err(|_| SessionError::Unavailable)
+    }
+
     /// 会话级读法回执：只含 digest/计数/有限枚举，不返回原始问句。
     async fn read_traces(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
         let tx = self.session_tx(session_id).await?;
@@ -2159,6 +2181,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "GET /metrics",
                     "POST /sessions",
                     "GET /sessions/{id}",
+                    "GET /sessions/{id}/layers",
                     "GET /sessions/{id}/export",
                     "GET /sessions/{id}/read-traces",
                     "POST /sessions/import",
@@ -2208,6 +2231,10 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
         ("POST", ["sessions", "import"]) => handle_import(state, request).await,
         ("GET", ["sessions", id]) => match state.session_snapshot(id).await {
             Ok(snapshot) => Response::json(200, &snapshot),
+            Err(error) => session_error_response(error),
+        },
+        ("GET", ["sessions", id, "layers"]) => match state.session_layers(id).await {
+            Ok(layers) => Response::json(200, &layers),
             Err(error) => session_error_response(error),
         },
         ("GET", ["sessions", id, "export"]) => match state.export_session(id).await {
@@ -3965,6 +3992,38 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(value["status"], "deferred", "{}", body);
         assert_eq!(value["epistemic"]["status"], "unknown", "{}", body);
         assert!(value["epistemic"]["receipt"].as_str().is_some(), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn session_layers_expose_four_level_manifest() {
+        let (addr, _server) = start_server(4);
+        let session_id = create_session(addr).await;
+        take_turn_body(addr, &session_id, "姚明是谁").await;
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/layers", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["session_id"], session_id);
+        let manifest = &value["manifest"];
+        assert_eq!(manifest["manifest_version"], 1);
+        let layers = manifest["layers"].as_array().expect("layers 数组");
+        assert_eq!(layers.len(), 4);
+        assert_eq!(layers[0]["id"], "L0");
+        assert!(layers[0]["count"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(layers[3]["id"], "L3");
+        assert_eq!(
+            manifest["digest"].as_str().map(str::len),
+            Some(16),
+            "{}",
+            body
+        );
     }
 
     #[tokio::test]
