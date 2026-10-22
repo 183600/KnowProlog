@@ -69,7 +69,9 @@ use crate::semantic_entailment::{self, EntailmentResult, Knowledge, PropositionP
 use crate::slot_ledger::{
     AssertionStrength, SlotAssertion, SlotLedger, SlotPolicy, SlotTransition,
 };
-use crate::symbolic_generator::{GenerationOrder, SymbolicGenerator};
+use crate::symbolic_generator::{
+    GenerationCursor, GenerationOrder, GenerationOverlay, SymbolicGenerator,
+};
 use crate::temporal::{
     self, validity_from_bounds, TemporalConstraint, UnknownTimePolicy, Validity,
 };
@@ -354,6 +356,9 @@ pub struct GenerationState {
     pub entity: String,
     pub shown: usize,
     pub order: GenerationOrder,
+    /// 增量话语账本：记住已经说出口的命题。旧快照缺省时从 `shown` 迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<GenerationCursor>,
 }
 
 // 会话事实的持久化快照（定义域：全部为基事实，故只存谓词+常量名）
@@ -766,6 +771,20 @@ impl DialogueContext {
             entity: entity.to_string(),
             shown,
             order,
+            cursor: None,
+        });
+    }
+
+    /// 记录一段生成及其话语账本；`shown` 由账本派生，保持旧字段可读。
+    pub fn record_generation_with_cursor(&mut self, cursor: GenerationCursor) {
+        if cursor.entity.trim().is_empty() {
+            return;
+        }
+        self.generation = Some(GenerationState {
+            entity: cursor.entity.clone(),
+            shown: cursor.spoken_count(),
+            order: cursor.order,
+            cursor: Some(cursor),
         });
     }
 
@@ -3678,6 +3697,57 @@ impl SymbolicReasoner {
             .collect()
     }
 
+    /// 把会话事实与槽账本裁决投影为生成叠加层。
+    ///
+    /// 生成器本身只持有图谱视图；会话层在每次生成时合并进来，功能槽以
+    /// 会话赢家为准，其余槽取并集并删掉被更正/否定的取值。这样两份记忆
+    /// 不会互相写入或产生撤回歧义。
+    fn generation_overlay(&self) -> GenerationOverlay {
+        let mut overlay = GenerationOverlay::default();
+        for atom in &self.session_facts {
+            if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+                overlay
+                    .add
+                    .entry((subject.to_string(), predicate.to_string()))
+                    .or_default()
+                    .insert(object.to_string());
+            }
+        }
+        for key in self.slots.keys() {
+            let accepted = self.slots.accepted(&key.subject, &key.predicate);
+            if accepted.is_empty() {
+                continue;
+            }
+            let slot = (key.subject.clone(), key.predicate.clone());
+            if self.slots.is_functional(&key.predicate) {
+                overlay.replace.insert(slot.clone(), accepted.clone());
+            } else {
+                overlay
+                    .add
+                    .entry(slot.clone())
+                    .or_default()
+                    .extend(accepted.iter().cloned());
+            }
+            for suppressed in self.slots.suppressed(&key.subject, &key.predicate) {
+                overlay
+                    .suppress
+                    .entry(slot.clone())
+                    .or_default()
+                    .insert(suppressed);
+            }
+        }
+        for atom in &self.session_negative_facts {
+            if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+                overlay
+                    .suppress
+                    .entry((subject.to_string(), predicate.to_string()))
+                    .or_default()
+                    .insert(object.to_string());
+            }
+        }
+        overlay
+    }
+
     // 生成式介绍：把实体的相关事实组合成连贯段落（无神经网络）
     // 生成后自动做语义蕴含自检，并记录"上一段生成"以便多轮续说。
     pub fn generate_about(&mut self, entity_raw: &str) -> Option<String> {
@@ -3694,13 +3764,17 @@ impl SymbolicReasoner {
         } else {
             canonical
         };
-        let page = self
-            .generator
-            .profile_page(&entity, 0, GenerationOrder::Relevance)?;
-        self.context
-            .record_generation(&entity, page.next_offset, GenerationOrder::Relevance);
+        let overlay = self.generation_overlay();
+        let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
+        let page = self.generator.cursor_page(
+            &entity,
+            GenerationOrder::Relevance,
+            &overlay,
+            &mut cursor,
+        )?;
+        self.context.record_generation_with_cursor(cursor);
         let mut text = page.text;
-        if let Some(note) = self.generation_self_check(&text) {
+        if let Some(note) = self.generation_self_check(&text, &page.trusted) {
             text.push('\n');
             text.push_str(&note);
         }
@@ -3854,25 +3928,40 @@ impl SymbolicReasoner {
         self.discourse.taught_lessons()
     }
 
-    // 多轮生成：接着上一段介绍继续讲后面的句子
+    // 多轮生成：接着上一段介绍继续讲尚未说过的命题，并先播更正/撤回
     pub fn continue_generation(&mut self) -> Option<String> {
         if !self.config.enable_generation {
             return None;
         }
         let state = self.context.generation_state()?.clone();
-        let page = self
-            .generator
-            .profile_page(&state.entity, state.shown, state.order)?;
+        let overlay = self.generation_overlay();
+        let mut cursor = match state.cursor.clone() {
+            Some(cursor) if cursor.entity == state.entity => cursor,
+            _ => {
+                // 旧快照只有位置：把当时已讲过的前 N 句补记为已说，避免重复。
+                let mut cursor = GenerationCursor::new(&state.entity, state.order);
+                if let Some(clauses) = self.generator.profile_clauses_with_overlay(
+                    &state.entity,
+                    state.order,
+                    &overlay,
+                ) {
+                    cursor.seed_spoken(&clauses, state.shown);
+                }
+                cursor
+            }
+        };
+        let page =
+            self.generator
+                .cursor_page(&state.entity, state.order, &overlay, &mut cursor)?;
         if page.shown == 0 {
             return Some(format!(
                 "关于「{}」的知识已经介绍完毕。可以输入「换个角度说」按不同顺序重述，或介绍其它实体。",
                 state.entity
             ));
         }
-        self.context
-            .record_generation(&state.entity, page.next_offset, state.order);
+        self.context.record_generation_with_cursor(cursor);
         let mut text = page.text;
-        if let Some(note) = self.generation_self_check(&text) {
+        if let Some(note) = self.generation_self_check(&text, &page.trusted) {
             text.push('\n');
             text.push_str(&note);
         }
@@ -3889,12 +3978,20 @@ impl SymbolicReasoner {
             GenerationOrder::Relevance => GenerationOrder::Alphabetical,
             GenerationOrder::Alphabetical => GenerationOrder::Relevance,
         };
-        let page = self.generator.profile_page(&state.entity, 0, order)?;
+        let overlay = self.generation_overlay();
+        let mut cursor = state
+            .cursor
+            .clone()
+            .unwrap_or_else(|| GenerationCursor::new(&state.entity, order));
+        // 「换个角度说」是显式重述：账本从零开始，但排序角度更新。
+        cursor.reset_for_order(order);
+        let page =
+            self.generator
+                .cursor_page(&state.entity, order, &overlay, &mut cursor)?;
         if page.shown == 0 {
             return Some(format!("关于「{}」暂无可重述的事实。", state.entity));
         }
-        self.context
-            .record_generation(&state.entity, page.next_offset, order);
+        self.context.record_generation_with_cursor(cursor);
         let label = match order {
             GenerationOrder::Relevance => "信息量排序（由稀有谓词到常见谓词）",
             GenerationOrder::Alphabetical => "主题排序（按谓词字典序）",
@@ -3903,7 +4000,7 @@ impl SymbolicReasoner {
             "换个角度介绍「{}」（{}）：\n{}",
             state.entity, label, page.text
         );
-        if let Some(note) = self.generation_self_check(&text) {
+        if let Some(note) = self.generation_self_check(&text, &page.trusted) {
             text.push('\n');
             text.push_str(&note);
         }
@@ -5435,13 +5532,65 @@ impl SymbolicReasoner {
         )
     }
 
-    // 生成自检：逐句回译为命题并验证是否被知识图谱蕴含（对抗"幻觉"）
-    fn generation_self_check(&self, text: &str) -> Option<String> {
+    /// 会话增广的知识视图：自检与生成看到同一批会话事实。
+    ///
+    /// 只在会话层非空时克隆一次图谱视图；会话三元组同时登记为关系和属性，
+    /// 以适配形式化解析器对谓词类型的不同归类。
+    fn session_aware_generation_knowledge(&self) -> (LinkPredictor, SymbolicGenerator) {
+        let mut predictor = self.predictor.clone();
+        let mut generator = self.generator.clone();
+        let mut triples: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for atom in &self.session_facts {
+            if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+                triples.insert((
+                    subject.to_string(),
+                    predicate.to_string(),
+                    object.to_string(),
+                ));
+            }
+        }
+        for (subject, predicate, object) in self.slots.projection() {
+            triples.insert((subject, predicate, object));
+        }
+        for (subject, predicate, object) in triples {
+            predictor.add_triple(&subject, &predicate, &object);
+            generator.observe_triple(&subject, &predicate, &object);
+            let etype = self
+                .generator
+                .entity_type_of(&subject)
+                .unwrap_or("")
+                .to_string();
+            generator.observe_entity(
+                &subject,
+                &etype,
+                &[(predicate.clone(), object.clone())],
+            );
+        }
+        (predictor, generator)
+    }
+
+    // 生成自检：逐句回译为命题并验证是否被知识图谱（∪ 会话层）蕴含。
+    // `trusted` 是账本背书的会话层原句：整句精确命中即视为已证，
+    // 避免把「刚教的事实」误报为幻觉。
+    fn generation_self_check(&self, text: &str, trusted: &[String]) -> Option<String> {
         if !self.config.enable_entailment {
             return None;
         }
         let parser = self.proposition_parser();
-        let knowledge = self.knowledge();
+        let augmented = if self.session_facts.is_empty() && self.slots.is_empty() {
+            None
+        } else {
+            Some(self.session_aware_generation_knowledge())
+        };
+        let knowledge = match &augmented {
+            Some((predictor, generator)) => semantic_entailment::Knowledge {
+                predictor,
+                generator,
+                min_rule_confidence: self.config.entailment_min_confidence,
+                max_rule_candidates: 16,
+            },
+            None => self.knowledge(),
+        };
         let mut total = 0usize;
         let mut entailed = 0usize;
         let mut failed: Vec<String> = Vec::new();
@@ -5450,14 +5599,28 @@ impl SymbolicReasoner {
             if !sentence.ends_with('。') {
                 continue;
             }
+            // 更正句是账本差分的元叙述，不是对新事实的断言。
+            if sentence.starts_with("更正：") || sentence.starts_with("补充：") {
+                continue;
+            }
+            let normalized = sentence.trim_end_matches('。');
+            let trusted_hit = trusted
+                .iter()
+                .any(|known| known.trim().trim_end_matches('。') == normalized);
             let propositions = parser.parse(sentence);
             if propositions.is_empty() {
+                if trusted_hit {
+                    total += 1;
+                    entailed += 1;
+                }
                 continue;
             }
             total += 1;
-            let supported = propositions.iter().any(|proposition| {
-                semantic_entailment::entail(proposition, &knowledge).verdict == Verdict::Entailed
-            });
+            let supported = trusted_hit
+                || propositions.iter().any(|proposition| {
+                    semantic_entailment::entail(proposition, &knowledge).verdict
+                        == Verdict::Entailed
+                });
             if supported {
                 entailed += 1;
             } else {
@@ -15732,6 +15895,90 @@ types = [
             .answer("明哥的身高是多少")
             .expect("已确认的实体别名应能直接作答");
         assert!(alias_answer.contains("226"), "{}", alias_answer);
+    }
+
+    #[test]
+    fn test_continue_generation_does_not_repeat_after_insertion() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let first = reasoner.generate_about("张三").expect("第一页应可生成");
+        let first_body = first
+            .lines()
+            .find(|line| line.trim().ends_with('。'))
+            .expect("第一页应有一句事实")
+            .trim()
+            .to_string();
+        let first_sentence: String = first_body
+            .split_once('，')
+            .map(|(_, sentence)| sentence.to_string())
+            .unwrap_or(first_body);
+
+        // 新事实插入后，旧实现按 offset 取句会漂移，续说可能重复第一句。
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "朋友".to_string(),
+            to: "赵六".to_string(),
+        }]);
+        let second = reasoner.continue_generation().expect("应继续生成");
+        assert!(second.contains("接着，"), "{}", second);
+        assert!(
+            !second.contains(first_sentence.trim_end_matches('。')),
+            "已说过的句子不应重复：第一页={}；第二页={}",
+            first,
+            second
+        );
+        let state = reasoner.context().generation_state().unwrap();
+        assert_eq!(
+            state.cursor.as_ref().map(|cursor| cursor.spoken_count()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_generation_includes_taught_session_fact_and_self_check_is_clean() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.assert_nl_fact("张三的徒弟是钱七");
+        let profile = reasoner.generate_about("张三").expect("应能生成介绍");
+        assert!(
+            profile.contains("徒弟") && profile.contains("钱七"),
+            "教过的会话事实应进入介绍：教学回执={}；介绍={}",
+            taught,
+            profile
+        );
+        assert!(profile.contains("零幻觉"), "自检不应误报：{}", profile);
+        assert!(!profile.contains("未通过"), "{}", profile);
+    }
+
+    #[test]
+    fn test_generation_cursor_survives_snapshot_and_restores_identically() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config.clone(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("第一页应可生成");
+        let snapshot = reasoner.dialogue_snapshot();
+
+        let mut restored = SymbolicReasoner::new(config, HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("对话快照应可恢复");
+        let update = [PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "朋友".to_string(),
+            to: "赵六".to_string(),
+        }];
+        reasoner.observe_facts(&update);
+        restored.observe_facts(&update);
+
+        assert_eq!(
+            reasoner.continue_generation(),
+            restored.continue_generation(),
+            "存档→恢复→知识更新→接着说 应与不中断会话一致"
+        );
     }
 
     #[test]
