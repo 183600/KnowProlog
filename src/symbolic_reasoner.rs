@@ -2401,6 +2401,20 @@ impl SymbolicReasoner {
         )
     }
 
+    fn render_guard_impact(plan: &GuardPlan) -> Option<String> {
+        let counts = &plan.plan.impact.counts;
+        if counts.derived_added == 0 && counts.derived_retracted == 0 {
+            return None;
+        }
+        Some(format!(
+            "预检影响：派生 +{} / -{}，净相信 +{} / -{}。\n",
+            counts.derived_added,
+            counts.derived_retracted,
+            counts.newly_believed,
+            counts.no_longer_believed
+        ))
+    }
+
     fn record_session_revision(
         &mut self,
         label: impl Into<String>,
@@ -9367,6 +9381,7 @@ impl SymbolicReasoner {
         if plan.is_blocked() {
             return self.render_guard_block(&plan);
         }
+        let impact = Self::render_guard_impact(&plan);
         let mut output =
             String::from("已学习中文规则（纯符号解析 → Horn 子句，直接进入后向链）：\n");
         for (index, (lesson, clause)) in rules.iter().enumerate() {
@@ -9410,6 +9425,9 @@ impl SymbolicReasoner {
             if let Some(receipt) = self.session_receipts.last() {
                 output.push_str(&format!("  修订回执：{}。", receipt.id));
             }
+        }
+        if let Some(impact) = impact {
+            output.push_str(&format!("  {}", impact));
         }
         output.push_str(&format!(
             "\n会话规则库现有 {} 条子句、{} 条事实；可用「判断/为什么/推理链/推理发现」验证后向链。",
@@ -9535,11 +9553,13 @@ impl SymbolicReasoner {
                 preflight.push(ChangeOp::AssertFact(lesson.head.clone()));
             }
         }
+        let mut impact = None;
         if !preflight.is_empty() {
             let plan = self.revision_guard().plan(preflight);
             if plan.is_blocked() {
                 return self.render_guard_block(&plan);
             }
+            impact = Self::render_guard_impact(&plan);
         }
         let mut remembered: Vec<String> = Vec::new();
         let mut refused: Vec<String> = Vec::new();
@@ -9610,6 +9630,9 @@ impl SymbolicReasoner {
             output.push_str(&superseded_negatives.join("；"));
             output.push_str("。\n");
         }
+        if let Some(impact) = impact {
+            output.push_str(&impact);
+        }
         for error in &outcome.errors {
             output.push_str(&format!("  未解析：{}\n", error));
         }
@@ -9657,11 +9680,13 @@ impl SymbolicReasoner {
                 preflight.push(ChangeOp::RetractFact(lesson.head.clone()));
             }
         }
+        let mut impact = None;
         if !preflight.is_empty() {
             let plan = self.revision_guard().plan(preflight);
             if plan.is_blocked() {
                 return self.render_guard_block(&plan);
             }
+            impact = Self::render_guard_impact(&plan);
         }
         let mut removed: Vec<String> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
@@ -9708,6 +9733,9 @@ impl SymbolicReasoner {
                 "会话事实中没有「{}」（知识图谱事实不在此处撤回）。\n",
                 fact
             ));
+        }
+        if let Some(impact) = impact {
+            output.push_str(&impact);
         }
         for error in &outcome.errors {
             output.push_str(&format!("未解析：{}\n", error));
@@ -9904,6 +9932,7 @@ impl SymbolicReasoner {
             })
             .cloned()
             .collect();
+        let mut impact = None;
         if !existing_targets.is_empty() {
             let mut preflight = ChangeSet::new(format!("忘记规则：{}", sentence));
             for clause in &existing_targets {
@@ -9913,6 +9942,7 @@ impl SymbolicReasoner {
             if plan.is_blocked() {
                 return self.render_guard_block(&plan);
             }
+            impact = Self::render_guard_impact(&plan);
         }
 
         let existing_clauses = std::mem::take(&mut self.session_clauses);
@@ -9995,6 +10025,9 @@ impl SymbolicReasoner {
                 removed_lessons,
                 Vec::new(),
             );
+            if let Some(impact) = impact {
+                output.push_str(&impact);
+            }
             if let Some(receipt) = self.session_receipts.last() {
                 output.push_str(&format!(
                     "修订回执：{}（可用「撤销修订」恢复本次撤回）。\n",
@@ -16487,6 +16520,22 @@ types = [
 
         let accepted = reasoner.assert_nl_fact("张三的年龄是30");
         assert!(accepted.contains("修订回执"), "{}", accepted);
+    }
+
+    #[test]
+    fn accepted_fact_reports_derived_impact() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let learned = reasoner.learn_rule_report("如果X的师傅是Y，那么X的老师是Y");
+        assert!(learned.contains("已学习"), "{}", learned);
+
+        let added = reasoner.assert_nl_fact("钱七是孙八的师傅");
+        assert!(added.contains("修订回执"), "{}", added);
+        assert!(
+            added.contains("预检影响：派生 +1"),
+            "接受写入时应报告规则派生影响：{}",
+            added
+        );
     }
 
     #[test]
