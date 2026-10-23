@@ -344,6 +344,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Evaluate answer-probed reference resolution (grounding certificates /
+    /// repair recall / over-ask / truncation safety) on the built-in gold corpus
+    /// with a regression ratchet
+    EvalGrounding {
+        /// Baseline JSON path; enables the regression ratchet
+        #[arg(long)]
+        baseline: Option<String>,
+        /// Write current metrics to the baseline path
+        #[arg(long)]
+        update_baseline: bool,
+        /// Do not fail (exit code) on regressions
+        #[arg(long)]
+        allow_regression: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Evaluate identity acts / cards / scopes / session ledgers on the built-in
     /// gold corpus with a regression ratchet
     EvalIdentity {
@@ -1166,6 +1183,15 @@ async fn main() {
             json,
         }) => {
             run_eval_link(baseline.clone(), *update_baseline, *allow_regression, *json);
+            return;
+        }
+        Some(Commands::EvalGrounding {
+            baseline,
+            update_baseline,
+            allow_regression,
+            json,
+        }) => {
+            run_eval_grounding(baseline.clone(), *update_baseline, *allow_regression, *json);
             return;
         }
         Some(Commands::EvalIdentity {
@@ -2352,6 +2378,7 @@ async fn main() {
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::EvalNlu { .. }) => {}
         Some(Commands::EvalLink { .. }) => {}
+        Some(Commands::EvalGrounding { .. }) => {}
         Some(Commands::EvalIdentity { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
         Some(Commands::ProofBench { .. }) => {}
@@ -2872,6 +2899,56 @@ fn run_eval_link(
             Ok(old_baseline) => {
                 let verdict =
                     know_prolog::link_eval::compare_baseline(&old_baseline, &report, 1e-6);
+                print!("{}", verdict.render_text());
+                if !verdict.passed && !allow_regression {
+                    std::process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("基线读取失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `eval-grounding`：答案探测式指称消解金标评测 + 回归棘轮。
+fn run_eval_grounding(
+    baseline: Option<String>,
+    update_baseline: bool,
+    allow_regression: bool,
+    json: bool,
+) {
+    let report = reference_probe::evaluate_seed();
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(e) => {
+                eprintln!("接地评测序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", report.render_text());
+    }
+
+    let baseline_path = baseline
+        .clone()
+        .unwrap_or_else(|| "grounding_eval_baseline.json".to_string());
+    if update_baseline {
+        let new_baseline = reference_probe::GroundingEvalBaseline::from_report(&report);
+        match new_baseline.save(&baseline_path) {
+            Ok(()) => println!("接地基线已写入 {}", baseline_path),
+            Err(e) => {
+                eprintln!("基线写入失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if baseline.is_some() {
+        match reference_probe::GroundingEvalBaseline::load(&baseline_path) {
+            Ok(old_baseline) => {
+                let verdict =
+                    reference_probe::compare_baseline(&old_baseline, &report, 1e-6);
                 print!("{}", verdict.render_text());
                 if !verdict.passed && !allow_regression {
                     std::process::exit(1);
@@ -11493,6 +11570,7 @@ fn interactive_help() -> String {
         "  追踪为什么 <编号>                     沿追踪图回溯某决策的依据链",
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
+        "  接地证书                              答案探测式消歧的候选、答案指纹与敏感度证书",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
         "  补全回合：<实体>                     打开一次学习回合：收集候选、确认归纳、本批闭包",
         "  确认补全：<序号> / 否定补全：<序号>   裁定候选；确认事实只进会话，不写图谱",
@@ -13375,6 +13453,7 @@ mod session_tests {
             "追踪报告",
             "改口：",
             "槽账本",
+            "接地证书",
             "帮助",
             "quit",
         ] {

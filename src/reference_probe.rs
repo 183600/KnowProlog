@@ -1,11 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::contextual_reference::{
-    rewrite_at, ClarifyQuestion, ClarifyRequest, MentionResolution,
+    rewrite_at, ClarifyOption, ClarifyQuestion, ClarifyRequest, DiscriminatingFeature,
+    MentionResolution,
 };
 
 pub const GROUNDING_CERTIFICATE_VERSION: u32 = 1;
@@ -610,6 +612,540 @@ fn certificate_for(
     certificate
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptedProbe {
+    Answers(&'static [&'static str]),
+    NoAnswer,
+    Truncated,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoldProbeAction {
+    Bind(&'static str),
+    Repair(&'static str),
+    Clarify,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeGoldCase {
+    pub name: &'static str,
+    pub question: &'static str,
+    pub mention: &'static str,
+    pub start: usize,
+    pub options: &'static [&'static str],
+    pub script: &'static [(&'static str, ScriptedProbe)],
+    pub expected_action: GoldProbeAction,
+    pub expected_sensitivity: ProbeSensitivity,
+}
+
+pub fn seed_cases() -> &'static [ProbeGoldCase] {
+    static SEED: &[ProbeGoldCase] = &[
+        ProbeGoldCase {
+            name: "同一答案静默绑定",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色"])),
+                ("苹果公司", ScriptedProbe::Answers(&["红色"])),
+            ],
+            expected_action: GoldProbeAction::Bind("苹果"),
+            expected_sensitivity: ProbeSensitivity::Stable,
+        },
+        ProbeGoldCase {
+            name: "只有最高分义项可答",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色"])),
+                ("苹果公司", ScriptedProbe::NoAnswer),
+            ],
+            expected_action: GoldProbeAction::Bind("苹果"),
+            expected_sensitivity: ProbeSensitivity::LinkSensitive,
+        },
+        ProbeGoldCase {
+            name: "不同答案保留澄清",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色"])),
+                ("苹果公司", ScriptedProbe::Answers(&["库克"])),
+            ],
+            expected_action: GoldProbeAction::Clarify,
+            expected_sensitivity: ProbeSensitivity::LinkSensitive,
+        },
+        ProbeGoldCase {
+            name: "替代义项可修复",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::NoAnswer),
+                ("苹果公司", ScriptedProbe::Answers(&["库克"])),
+            ],
+            expected_action: GoldProbeAction::Repair("苹果公司"),
+            expected_sensitivity: ProbeSensitivity::Repairable,
+        },
+        ProbeGoldCase {
+            name: "多个替代义项同答",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司", "苹果唱片"],
+            script: &[
+                ("苹果", ScriptedProbe::NoAnswer),
+                ("苹果公司", ScriptedProbe::Answers(&["库克"])),
+                ("苹果唱片", ScriptedProbe::Answers(&["库克"])),
+            ],
+            expected_action: GoldProbeAction::Repair("苹果公司"),
+            expected_sensitivity: ProbeSensitivity::Repairable,
+        },
+        ProbeGoldCase {
+            name: "全部无答案不宣称不存在",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::NoAnswer),
+                ("苹果公司", ScriptedProbe::NoAnswer),
+            ],
+            expected_action: GoldProbeAction::Clarify,
+            expected_sensitivity: ProbeSensitivity::Uninformative,
+        },
+        ProbeGoldCase {
+            name: "截断不得宣称稳定",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色"])),
+                ("苹果公司", ScriptedProbe::Truncated),
+            ],
+            expected_action: GoldProbeAction::Clarify,
+            expected_sensitivity: ProbeSensitivity::OutcomeAmbiguous,
+        },
+        ProbeGoldCase {
+            name: "替代义项答案冲突",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司", "苹果唱片"],
+            script: &[
+                ("苹果", ScriptedProbe::NoAnswer),
+                ("苹果公司", ScriptedProbe::Answers(&["库克"])),
+                ("苹果唱片", ScriptedProbe::Answers(&["唱片"])),
+            ],
+            expected_action: GoldProbeAction::Clarify,
+            expected_sensitivity: ProbeSensitivity::OutcomeAmbiguous,
+        },
+        ProbeGoldCase {
+            name: "空白差异仍是同一答案",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色 多汁"])),
+                ("苹果公司", ScriptedProbe::Answers(&["红色\n多汁"])),
+            ],
+            expected_action: GoldProbeAction::Bind("苹果"),
+            expected_sensitivity: ProbeSensitivity::Stable,
+        },
+        ProbeGoldCase {
+            name: "不支持探测不得静默绑定",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色"])),
+                ("苹果公司", ScriptedProbe::Unsupported),
+            ],
+            expected_action: GoldProbeAction::Clarify,
+            expected_sensitivity: ProbeSensitivity::OutcomeAmbiguous,
+        },
+        ProbeGoldCase {
+            name: "三个义项同答",
+            question: "苹果是什么",
+            mention: "苹果",
+            start: 0,
+            options: &["苹果", "苹果公司", "苹果唱片"],
+            script: &[
+                ("苹果", ScriptedProbe::Answers(&["红色"])),
+                ("苹果公司", ScriptedProbe::Answers(&["红色"])),
+                ("苹果唱片", ScriptedProbe::Answers(&["红色"])),
+            ],
+            expected_action: GoldProbeAction::Bind("苹果"),
+            expected_sensitivity: ProbeSensitivity::Stable,
+        },
+    ];
+    SEED
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundingEvalReport {
+    pub corpus_digest: String,
+    pub cases: u32,
+    pub action_accuracy: f64,
+    pub sensitivity_accuracy: f64,
+    pub repair_recall: f64,
+    pub over_ask_rate: f64,
+    pub silent_bind_rate: f64,
+    pub truncation_safety: f64,
+    pub preview_coverage: f64,
+    pub certificate_replay_rate: f64,
+}
+
+impl GroundingEvalReport {
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "指称接地评测：{} 个金标场景，语料摘要 {}。",
+            self.cases, self.corpus_digest
+        );
+        let _ = writeln!(
+            out,
+            "action_accuracy {:.4}；sensitivity_accuracy {:.4}；repair_recall {:.4}",
+            self.action_accuracy, self.sensitivity_accuracy, self.repair_recall
+        );
+        let _ = writeln!(
+            out,
+            "over_ask_rate {:.4}；silent_bind_rate {:.4}；truncation_safety {:.4}",
+            self.over_ask_rate, self.silent_bind_rate, self.truncation_safety
+        );
+        let _ = writeln!(
+            out,
+            "preview_coverage {:.4}；certificate_replay_rate {:.4}",
+            self.preview_coverage, self.certificate_replay_rate
+        );
+        out.trim_end().to_string()
+    }
+
+    pub fn flatten_metrics(&self) -> BTreeMap<String, f64> {
+        let mut metrics = BTreeMap::new();
+        metrics.insert(
+            "grounding.action_accuracy".to_string(),
+            self.action_accuracy,
+        );
+        metrics.insert(
+            "grounding.sensitivity_accuracy".to_string(),
+            self.sensitivity_accuracy,
+        );
+        metrics.insert("grounding.repair_recall".to_string(), self.repair_recall);
+        metrics.insert("grounding.over_ask_rate".to_string(), self.over_ask_rate);
+        metrics.insert(
+            "grounding.silent_bind_rate".to_string(),
+            self.silent_bind_rate,
+        );
+        metrics.insert(
+            "grounding.truncation_safety".to_string(),
+            self.truncation_safety,
+        );
+        metrics.insert(
+            "grounding.preview_coverage".to_string(),
+            self.preview_coverage,
+        );
+        metrics.insert(
+            "grounding.certificate_replay_rate".to_string(),
+            self.certificate_replay_rate,
+        );
+        metrics
+    }
+}
+
+pub const GROUNDING_LOWER_IS_BETTER: [&str; 2] = [
+    "grounding.over_ask_rate",
+    "grounding.silent_bind_rate",
+];
+
+fn eval_ratio(numerator: u32, denominator: u32) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn case_request(case: &ProbeGoldCase) -> ClarifyRequest {
+    ClarifyRequest {
+        original_input: case.question.to_string(),
+        mention: case.mention.to_string(),
+        start: case.start,
+        key: case.mention.to_string(),
+        question: ClarifyQuestion {
+            mention: case.mention.to_string(),
+            feature: DiscriminatingFeature::Names,
+            options: case
+                .options
+                .iter()
+                .map(|entity| ClarifyOption {
+                    entity: (*entity).to_string(),
+                    label: (*entity).to_string(),
+                    etype: None,
+                })
+                .collect(),
+        },
+    }
+}
+
+fn scripted_status(case: &ProbeGoldCase, entity: &str) -> ProbeStatus {
+    match case
+        .script
+        .iter()
+        .find(|(name, _)| *name == entity)
+        .map(|(_, script)| *script)
+    {
+        Some(ScriptedProbe::Answers(values)) => {
+            ProbeStatus::Answered(values.iter().map(|value| (*value).to_string()).collect())
+        }
+        Some(ScriptedProbe::Truncated) => ProbeStatus::Truncated,
+        Some(ScriptedProbe::Unsupported) => ProbeStatus::Unsupported,
+        Some(ScriptedProbe::NoAnswer) | None => ProbeStatus::NoAnswer,
+    }
+}
+
+fn action_matches(expected: GoldProbeAction, decision: &ProbeDecision) -> bool {
+    match (expected, decision) {
+        (GoldProbeAction::Bind(expected), ProbeDecision::Bind { entity, .. }) => expected == entity,
+        (GoldProbeAction::Repair(expected), ProbeDecision::Repair { entity, .. }) => {
+            expected == entity
+        }
+        (GoldProbeAction::Clarify, ProbeDecision::Clarify { .. }) => true,
+        _ => false,
+    }
+}
+
+pub fn evaluate_seed() -> GroundingEvalReport {
+    evaluate(seed_cases())
+}
+
+pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
+    let mut digest_input = String::new();
+    let mut action_hits = 0u32;
+    let mut sensitivity_hits = 0u32;
+    let mut repair_expected = 0u32;
+    let mut repair_hits = 0u32;
+    let mut bind_expected = 0u32;
+    let mut over_asks = 0u32;
+    let mut clarify_expected = 0u32;
+    let mut silent_binds = 0u32;
+    let mut unresolved_cases = 0u32;
+    let mut truncation_safe = 0u32;
+    let mut preview_expected = 0u32;
+    let mut preview_hits = 0u32;
+    let mut replay_hits = 0u32;
+
+    for case in cases {
+        digest_input.push_str(case.name);
+        digest_input.push('\u{1}');
+        digest_input.push_str(case.question);
+        digest_input.push('\u{2}');
+        let request = case_request(case);
+        let report = probe_clarification(&request, None, 1, MAX_PROBE_CANDIDATES, |entity, _| {
+            scripted_status(case, entity)
+        });
+        let replay = probe_clarification(&request, None, 1, MAX_PROBE_CANDIDATES, |entity, _| {
+            scripted_status(case, entity)
+        });
+        if action_matches(case.expected_action, &report.decision) {
+            action_hits += 1;
+        }
+        if report.sensitivity == case.expected_sensitivity {
+            sensitivity_hits += 1;
+        }
+        match case.expected_action {
+            GoldProbeAction::Bind(_) => {
+                bind_expected += 1;
+                if matches!(report.decision, ProbeDecision::Clarify { .. }) {
+                    over_asks += 1;
+                }
+            }
+            GoldProbeAction::Repair(_) => {
+                repair_expected += 1;
+                if matches!(report.decision, ProbeDecision::Repair { .. }) {
+                    repair_hits += 1;
+                }
+            }
+            GoldProbeAction::Clarify => {
+                clarify_expected += 1;
+                if matches!(report.decision, ProbeDecision::Bind { .. }) {
+                    silent_binds += 1;
+                }
+            }
+        }
+        let unresolved = case
+            .script
+            .iter()
+            .any(|(_, script)| matches!(script, ScriptedProbe::Truncated | ScriptedProbe::Unsupported));
+        if unresolved {
+            unresolved_cases += 1;
+            if !matches!(report.decision, ProbeDecision::Bind { .. }) {
+                truncation_safe += 1;
+            }
+        }
+        let has_answer = report
+            .observations
+            .iter()
+            .any(|observation| observation.answerable());
+        if has_answer && !matches!(case.expected_action, GoldProbeAction::Bind(_)) {
+            preview_expected += 1;
+            if report
+                .question
+                .options
+                .iter()
+                .any(|option| option.label.contains("→"))
+            {
+                preview_hits += 1;
+            }
+        }
+        if report.certificate.verify()
+            && replay.certificate.verify()
+            && report.certificate.canonical_text() == replay.certificate.canonical_text()
+        {
+            replay_hits += 1;
+        }
+    }
+
+    let total = cases.len() as u32;
+    GroundingEvalReport {
+        corpus_digest: fnv1a_hex(digest_input.as_bytes()),
+        cases: total,
+        action_accuracy: eval_ratio(action_hits, total),
+        sensitivity_accuracy: eval_ratio(sensitivity_hits, total),
+        repair_recall: eval_ratio(repair_hits, repair_expected),
+        over_ask_rate: eval_ratio(over_asks, bind_expected),
+        silent_bind_rate: eval_ratio(silent_binds, clarify_expected),
+        truncation_safety: eval_ratio(truncation_safe, unresolved_cases),
+        preview_coverage: eval_ratio(preview_hits, preview_expected),
+        certificate_replay_rate: eval_ratio(replay_hits, total),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundingEvalBaseline {
+    pub version: u32,
+    pub corpus_digest: String,
+    pub metrics: BTreeMap<String, f64>,
+}
+
+pub const GROUNDING_BASELINE_VERSION: u32 = 1;
+
+impl GroundingEvalBaseline {
+    pub fn from_report(report: &GroundingEvalReport) -> Self {
+        Self {
+            version: GROUNDING_BASELINE_VERSION,
+            corpus_digest: report.corpus_digest.clone(),
+            metrics: report.flatten_metrics(),
+        }
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), std::io::Error> {
+        let mut text = serde_json::to_string_pretty(self)?;
+        text.push('\n');
+        std::fs::write(path, text)
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&text)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundingMetricDelta {
+    pub metric: String,
+    pub baseline: f64,
+    pub current: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroundingRatchetVerdict {
+    pub passed: bool,
+    pub digest_matches: bool,
+    pub regressions: Vec<GroundingMetricDelta>,
+    pub gains: Vec<GroundingMetricDelta>,
+}
+
+impl GroundingRatchetVerdict {
+    pub fn render_text(&self) -> String {
+        if self.passed {
+            return "指称接地棘轮检查通过：无指标低于基线。\n".to_string();
+        }
+        let mut out = String::from("指称接地棘轮检查未通过：\n");
+        if !self.digest_matches {
+            out.push_str("  - 语料摘要不匹配：金标语料已漂移，基线不可直接比较\n");
+        }
+        for regression in &self.regressions {
+            let direction = if GROUNDING_LOWER_IS_BETTER.contains(&regression.metric.as_str()) {
+                "（越低越好）"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "  - {}: {:.6} → {:.6}{}\n",
+                regression.metric, regression.baseline, regression.current, direction
+            ));
+        }
+        out
+    }
+}
+
+pub fn compare_baseline(
+    baseline: &GroundingEvalBaseline,
+    current: &GroundingEvalReport,
+    epsilon: f64,
+) -> GroundingRatchetVerdict {
+    let digest_matches = baseline.corpus_digest == current.corpus_digest;
+    let current_metrics = current.flatten_metrics();
+    let mut regressions = Vec::new();
+    let mut gains = Vec::new();
+    for (metric, baseline_value) in &baseline.metrics {
+        let current_value = current_metrics.get(metric).copied().unwrap_or(0.0);
+        let lower_is_better = GROUNDING_LOWER_IS_BETTER.contains(&metric.as_str());
+        let (is_regression, is_gain) = if lower_is_better {
+            (
+                current_value > baseline_value + epsilon,
+                current_value < baseline_value - epsilon,
+            )
+        } else {
+            (
+                current_value < baseline_value - epsilon,
+                current_value > baseline_value + epsilon,
+            )
+        };
+        if is_regression {
+            regressions.push(GroundingMetricDelta {
+                metric: metric.clone(),
+                baseline: *baseline_value,
+                current: current_value,
+            });
+        } else if is_gain {
+            gains.push(GroundingMetricDelta {
+                metric: metric.clone(),
+                baseline: *baseline_value,
+                current: current_value,
+            });
+        }
+    }
+    GroundingRatchetVerdict {
+        passed: digest_matches && regressions.is_empty(),
+        digest_matches,
+        regressions,
+        gains,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +1371,45 @@ mod tests {
         assert_eq!(restored.len(), ledger.len());
         assert!(restored.latest().map(GroundingCertificate::verify).unwrap_or(false));
         assert!(restored.report().contains("指称接地证书"));
+    }
+
+    #[test]
+    fn seed_eval_is_perfect_and_deterministic() {
+        let first = evaluate_seed();
+        let second = evaluate_seed();
+        assert_eq!(first, second);
+        assert_eq!(first.action_accuracy, 1.0, "{}", first.render_text());
+        assert_eq!(
+            first.sensitivity_accuracy, 1.0,
+            "{}",
+            first.render_text()
+        );
+        assert_eq!(first.repair_recall, 1.0, "{}", first.render_text());
+        assert_eq!(first.over_ask_rate, 0.0, "{}", first.render_text());
+        assert_eq!(first.silent_bind_rate, 0.0, "{}", first.render_text());
+        assert_eq!(first.truncation_safety, 1.0, "{}", first.render_text());
+        assert_eq!(first.preview_coverage, 1.0, "{}", first.render_text());
+        assert_eq!(
+            first.certificate_replay_rate, 1.0,
+            "{}",
+            first.render_text()
+        );
+    }
+
+    #[test]
+    fn ratchet_rejects_over_ask_regression() {
+        let report = evaluate_seed();
+        let mut baseline = GroundingEvalBaseline::from_report(&report);
+        baseline
+            .metrics
+            .insert("grounding.over_ask_rate".to_string(), 0.0);
+        let mut broken = report.clone();
+        broken.over_ask_rate = 0.5;
+        let verdict = compare_baseline(&baseline, &broken, 1e-6);
+        assert!(!verdict.passed);
+        assert!(verdict
+            .regressions
+            .iter()
+            .any(|delta| delta.metric == "grounding.over_ask_rate"));
     }
 }
