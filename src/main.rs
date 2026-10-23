@@ -76,6 +76,7 @@ use know_prolog::{
     },
     query_planner::QueryPlanner,
     recovery::RecoveryMode,
+    reference_probe::{self, GroundingLedger, ProbeDecision, ProbeStatus},
     relation_acquisition::{GoalOpen, RelationAcquisition},
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
@@ -5224,6 +5225,9 @@ async fn run_interactive_mode(
     let crd_resolver = ContextualResolver::new();
     // 进行中的澄清请求：下一轮优先按「选哪个/不是A是B」结算
     let mut crd_pending: Option<ClarifyRequest> = None;
+    let grounding_certificate_path = format!("{}/grounding_certificates.json", store_path);
+    let mut grounding_ledger =
+        GroundingLedger::load_from_path(&grounding_certificate_path).unwrap_or_default();
     // 导入日志：跨重启的有界撤销栈
     let journal_path = format!("{}/import_journal.json", store_path);
     let mut import_journal = match ImportJournal::load(&journal_path) {
@@ -7935,6 +7939,13 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 指称接地证书：答案探测式消歧留下的可核对记录
+        if matches!(input, "接地证书" | "指称证书" | "接地台账" | "指称接地") {
+            println!("{}", grounding_ledger.report());
+            println!();
+            continue;
+        }
+
         // 提及格全局解码：不重叠最大证据路径（精确/别名/模糊/嵌套统一选路）
         if let Some(text) = strip_any_prefix(input, &["提及格：", "提及格:", "格解码：", "格解码:"])
         {
@@ -10129,10 +10140,50 @@ async fn run_interactive_mode(
                         }
                     }
                     if let Some(ask) = outcome.ask {
-                        println!("{}", ask.question.render());
-                        crd_pending = Some(ask);
-                        println!();
-                        continue;
+                        let resolution = outcome.resolutions.iter().find(|resolution| {
+                            resolution.sketch.start == ask.start && resolution.key == ask.key
+                        });
+                        let report = reference_probe::probe_clarification(
+                            &ask,
+                            resolution,
+                            symbolic_reasoner.revision(),
+                            reference_probe::MAX_PROBE_CANDIDATES,
+                            |entity, rewritten| {
+                                probe_reference_answer(&symbolic_reasoner, entity, rewritten)
+                            },
+                        );
+                        grounding_ledger.push(report.certificate.clone());
+                        if let Err(error) =
+                            grounding_ledger.save_to_path(&grounding_certificate_path)
+                        {
+                            eprintln!("接地证书落盘失败（不影响本轮回答）：{}", error);
+                        }
+                        for note in &report.notes {
+                            println!("（{}）", note);
+                        }
+                        match report.decision {
+                            ProbeDecision::Bind { entity, .. } => {
+                                let rewrite = rewrite_at(
+                                    &ask.original_input,
+                                    ask.start,
+                                    ask.mention.chars().count(),
+                                    &entity,
+                                );
+                                if rewrite != input {
+                                    println!("（语境改写：{}）", rewrite);
+                                }
+                                crd_input = Some(rewrite);
+                            }
+                            _ => {
+                                println!("{}", report.question.render());
+                                crd_pending = Some(ClarifyRequest {
+                                    question: report.question,
+                                    ..ask
+                                });
+                                println!();
+                                continue;
+                            }
+                        }
                     }
                     if let Some(rewrite) = outcome.rewrite {
                         if rewrite != input {
@@ -11640,6 +11691,19 @@ fn is_no_record_text(text: &str) -> bool {
         || text.contains("数量为 0")
 }
 
+fn probe_reference_answer(
+    reasoner: &SymbolicReasoner,
+    _entity: &str,
+    rewritten: &str,
+) -> ProbeStatus {
+    match reasoner.answer_certain(rewritten) {
+        Some(text) if !text.trim().is_empty() && !is_no_record_text(&text) => {
+            ProbeStatus::Answered(vec![text])
+        }
+        _ => ProbeStatus::NoAnswer,
+    }
+}
+
 /// 判断输入是否以系统命令开头：澄清进行中时遇到命令应让位给常规处理
 /// 插件声明式兜底：返回（可直接打印的文本，贡献路径）。
 fn plugin_policy_text(
@@ -11759,6 +11823,10 @@ fn is_command_like(input: &str) -> bool {
         "绑定账本",
         "指称账本",
         "语境账本",
+        "接地证书",
+        "指称证书",
+        "接地台账",
+        "指称接地",
         "身份报告",
         "确认身份",
         "记住身份",
