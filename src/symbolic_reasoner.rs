@@ -4036,13 +4036,28 @@ impl SymbolicReasoner {
         PropositionParser::with_surfaces(&self.aligner, &self.linker, &self.proposition_surfaces)
     }
 
-    // 形式化语义 + 语义蕴含：把陈述句解析为命题并逐条判定蕴含/矛盾/未知
+    // 形式化语义 + 语义蕴含：把陈述句解析为命题并逐条判定蕴含/矛盾/未知。
+    // 判定视图与生成自检共用同一份「图谱 ∪ 会话层」，刚记住的事实应能立即
+    // 通过校验，而不是生成时可见、判断时却报未知。
     pub fn check_statement(&self, text: &str) -> Vec<EntailmentResult> {
         if !self.config.enable_entailment {
             return Vec::new();
         }
         let parser = self.proposition_parser();
-        let knowledge = self.knowledge();
+        let augmented = if self.session_facts.is_empty() && self.slots.is_empty() {
+            None
+        } else {
+            Some(self.session_aware_knowledge())
+        };
+        let knowledge = match &augmented {
+            Some((predictor, generator)) => semantic_entailment::Knowledge {
+                predictor,
+                generator,
+                min_rule_confidence: self.config.entailment_min_confidence,
+                max_rule_candidates: 16,
+            },
+            None => self.knowledge(),
+        };
         parser
             .parse(text)
             .into_iter()
@@ -5548,11 +5563,11 @@ impl SymbolicReasoner {
         )
     }
 
-    /// 会话增广的知识视图：自检与生成看到同一批会话事实。
+    /// 会话增广的知识视图：蕴含判定、自检与生成看到同一批会话事实。
     ///
     /// 只在会话层非空时克隆一次图谱视图；会话三元组同时登记为关系和属性，
     /// 以适配形式化解析器对谓词类型的不同归类。
-    fn session_aware_generation_knowledge(&self) -> (LinkPredictor, SymbolicGenerator) {
+    fn session_aware_knowledge(&self) -> (LinkPredictor, SymbolicGenerator) {
         let mut predictor = self.predictor.clone();
         let mut generator = self.generator.clone();
         let mut triples: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -5596,7 +5611,7 @@ impl SymbolicReasoner {
         let augmented = if self.session_facts.is_empty() && self.slots.is_empty() {
             None
         } else {
-            Some(self.session_aware_generation_knowledge())
+            Some(self.session_aware_knowledge())
         };
         let knowledge = match &augmented {
             Some((predictor, generator)) => semantic_entailment::Knowledge {
@@ -17201,6 +17216,30 @@ types = [
         );
 
         assert!(reasoner.check_statement("张三的师傅是谁").is_empty());
+    }
+
+    #[test]
+    fn test_check_statement_sees_session_facts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let taught = reasoner.assert_nl_fact("张三的徒弟是钱七");
+        assert!(taught.contains("已记住"), "{}", taught);
+        let results = reasoner.check_statement("张三的徒弟是钱七");
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].verdict,
+            Verdict::Entailed,
+            "会话层事实应立即通过蕴含判定：{:?}",
+            results[0]
+        );
+        assert_eq!(
+            results[0].proof[0].kind,
+            semantic_entailment::ProofKind::DirectFact
+        );
+        // 反向对照：未教过的实体仍应为未知，而不是被会话层整体放行。
+        let unknown = reasoner.check_statement("钱八的徒弟是钱七");
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].verdict, Verdict::Unknown);
     }
 
     #[test]
