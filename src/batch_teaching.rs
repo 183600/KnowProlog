@@ -21,6 +21,7 @@ pub const DEFAULT_MIN_PURITY: u32 = 800;
 pub const DEFAULT_MAX_CANDIDATES: usize = 64;
 pub const DEFAULT_MAX_EVIDENCE: usize = 3;
 pub const MAX_EPISODES: usize = 16;
+pub const MAX_ACTIVE_RULES: usize = 16;
 
 const INGEST_PREFIXES: &[&str] = &[
     "录入：", "录入:", "添加：", "添加:", "新增：", "新增:", "记录：", "记录:", "导入：", "导入:",
@@ -392,7 +393,9 @@ impl BatchTeacher {
         let mut unsupported = Vec::new();
         let mut negative_hits = Vec::new();
         for (sentence, tokens) in corpus {
-            let found = match_atoms(&key.atoms, tokens);
+            let found = match_atoms(&key.atoms, tokens)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             for (subject, value) in found {
                 matches += 1;
                 let pair = (subject.clone(), value.clone());
@@ -874,6 +877,23 @@ impl BatchTeachingLedger {
 
     pub fn adopt(&mut self, selector: &str, config: &SystemConfig) -> Result<Vec<String>, String> {
         let selectors = self.select_targets(selector)?;
+        let active_ids = self
+            .active_rules()
+            .into_iter()
+            .map(|rule| rule.id.clone())
+            .collect::<BTreeSet<_>>();
+        let additions = selectors
+            .iter()
+            .filter(|id| !active_ids.contains(*id))
+            .count();
+        if active_ids.len() + additions > MAX_ACTIVE_RULES {
+            return Err(format!(
+                "活动规则上限为 {} 条，当前已有 {} 条，本次尝试新增 {} 条",
+                MAX_ACTIVE_RULES,
+                active_ids.len(),
+                additions
+            ));
+        }
         let mut adopted = Vec::new();
         for id in selectors {
             let latest = self
