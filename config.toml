@@ -66,6 +66,54 @@ holographic_similarity_floor = 0.01    # 召回候选的余弦下限（低于视
 holographic_max_hits = 6               # 单次全息召回的最大候选数
 require_predicate_admission = false    # 严格准入：只允许画像中已登记的谓词入库（false=未知谓词自动待确认准入）
 
+# 可携带证明的置信度层（PCC）：原始证据 → PAV 校准断点 → log-odds 融合
+# → 四档决策（回答/含糊/澄清/拒答）→ 双词表回执。
+# 关闭 enabled 即逐字节回到旧回答路径；启用时 config-lint 会重算风险证书。
+[reasoning.confidence]
+enabled = true
+prior = 0.5                            # 融合前的基准正确率（log-odds 原点）
+answer_threshold = 0.86                # 校准后 ≥ 此值才允许正常回答
+hedge_threshold = 0.62                 # [hedge, answer) 之间只给含糊回答
+clarify_threshold = 0.55               # 理解置信度低于此值先澄清，不硬答
+near_margin = 0.06                     # P 与判定阈值相距多近算边界样本
+approximate_evidence = 0.55            # BDD 超限近似时证据源的原始分
+# 风险证书：n 个已标注「被回答」样本中 errors 个错误；
+# Clopper-Pearson 单侧上界必须 ≤ max_error_rate，claimed_upper_bound 必须能复算。
+# 当前为保守基线计数；换标注集或改阈值时必须同步更新 n/errors/上界。
+certificate = { n = 240, errors = 4, alpha = 0.05, delta = 0.001, max_error_rate = 0.05, claimed_upper_bound = 0.0377 }
+
+[[reasoning.confidence.sources]]
+name = "intent"                        # PQI 意图后验：我有多懂你在问什么
+gamma = 0.50                           # 与证据源相关，折扣后计票
+calibration = [
+  { score = 0.00, probability = 0.05 },
+  { score = 0.50, probability = 0.55 },
+  { score = 0.70, probability = 0.72 },
+  { score = 0.85, probability = 0.85 },
+  { score = 0.95, probability = 0.94 },
+  { score = 1.00, probability = 0.99 },
+]
+
+[[reasoning.confidence.sources]]
+name = "evidence"                      # 推理证据：精确 BDD 计数 vs 超限近似
+gamma = 0.40
+calibration = [
+  { score = 0.00, probability = 0.05 },
+  { score = 0.55, probability = 0.62 },
+  { score = 0.70, probability = 0.78 },
+  { score = 1.00, probability = 0.98 },
+]
+
+[[reasoning.confidence.sources]]
+name = "margin"                        # 与判定阈值的距离：贴边时降级
+gamma = 0.30
+calibration = [
+  { score = 0.00, probability = 0.02 },
+  { score = 0.25, probability = 0.40 },
+  { score = 0.50, probability = 0.65 },
+  { score = 1.00, probability = 0.95 },
+]
+
 # 声明式插件（符号专家）：每个包是一份带类型贡献的 TOML 清单，
 # 不加载动态库、不执行插件代码；交互模式用「插件」查看，用「启用插件：<id>」切换。
 [plugins]

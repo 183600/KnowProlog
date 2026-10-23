@@ -2208,6 +2208,16 @@ process_error = "处理出错"
     }
 
     #[test]
+    fn stale_confidence_certificate_is_an_error() {
+        let source = format!(
+            "{}\n[reasoning.confidence]\nenabled = true\nanswer_threshold = 0.86\nhedge_threshold = 0.62\nclarify_threshold = 0.55\ncertificate = {{ n = 240, errors = 4, alpha = 0.05, delta = 0.001, max_error_rate = 0.05, claimed_upper_bound = 0.0100 }}\n\n[[reasoning.confidence.sources]]\nname = \"intent\"\ngamma = 1.0\ncalibration = [{{ score = 0.5, probability = 0.7 }}, {{ score = 0.9, probability = 0.9 }}]\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "confidence_certificate_invalid");
+    }
+
+    #[test]
     fn parse_errors_are_returned() {
         assert!(lint_str("this is not toml = = =").is_err());
     }

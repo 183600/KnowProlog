@@ -55,6 +55,7 @@ use crate::pending_question::{
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
+use crate::confidence::{ConfidenceDecision, DecisionRecord};
 use crate::probabilistic_query_intent::{
     Claim, EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
 };
@@ -12907,6 +12908,126 @@ impl SymbolicReasoner {
         known.then_some((0.0, None, stats))
     }
 
+    /// 判定「P 与阈值差多近」才算边界样本。只有比较类情态才有阈值语义，
+    /// 纯概率值问没有边界，直接按满边界处理。
+    fn confidence_near_boundary(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        probability: f64,
+    ) -> bool {
+        if !self.config.confidence.enabled {
+            return false;
+        }
+        let threshold_relevant = intent.threshold_explicit
+            || matches!(
+                intent.mode,
+                EpistemicMode::Certainty | EpistemicMode::Possibility
+            );
+        threshold_relevant
+            && (probability - intent.threshold).abs()
+                <= self.config.confidence.near_margin
+    }
+
+    /// 边界证据分：贴阈值时为 0，离开边界带为 1，中间线性过渡。
+    fn confidence_margin_score(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        probability: f64,
+    ) -> f64 {
+        let threshold_relevant = intent.threshold_explicit
+            || matches!(
+                intent.mode,
+                EpistemicMode::Certainty | EpistemicMode::Possibility
+            );
+        if !threshold_relevant {
+            return 1.0;
+        }
+        let margin = self.config.confidence.near_margin.max(1e-9);
+        ((probability - intent.threshold).abs() / margin).clamp(0.0, 1.0)
+    }
+
+    /// 只给已配置的来源提供观测；没配置的来源保持缺失，不被算成 0。
+    fn confidence_observations(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        exact: bool,
+        margin: f64,
+    ) -> Vec<(&str, f64)> {
+        let evidence = if exact {
+            1.0
+        } else {
+            self.config.confidence.approximate_evidence
+        };
+        self.config
+            .confidence
+            .sources
+            .iter()
+            .filter_map(|source| match source.name.as_str() {
+                "intent" => Some(("intent", intent.confidence)),
+                "evidence" => Some(("evidence", evidence)),
+                "margin" => Some(("margin", margin)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 统一的四档决策入口；配置关闭时返回 None，旧路径逐字节不变。
+    fn confidence_record(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        probability: f64,
+        exact: bool,
+    ) -> Option<DecisionRecord> {
+        if !self.config.confidence.enabled {
+            return None;
+        }
+        let near_boundary = self.confidence_near_boundary(intent, probability);
+        let margin = self.confidence_margin_score(intent, probability);
+        self.confidence_record_with_margin(
+            intent,
+            exact,
+            margin,
+            near_boundary,
+        )
+    }
+
+    /// 排序/比较路径可以自己给「边界强度」，不套用单原子的阈值距离。
+    fn confidence_record_with_margin(
+        &self,
+        intent: &ProbabilisticQueryIntent,
+        exact: bool,
+        margin: f64,
+        near_boundary: bool,
+    ) -> Option<DecisionRecord> {
+        if !self.config.confidence.enabled {
+            return None;
+        }
+        let observations =
+            self.confidence_observations(intent, exact, margin.clamp(0.0, 1.0));
+        Some(
+            self.config
+                .confidence
+                .decide(intent.confidence, &observations, near_boundary),
+        )
+    }
+
+    /// 决策为澄清/拒答时，不再把后面的结论当作确定事实铺开。
+    fn confidence_blocked_note(
+        record: &DecisionRecord,
+        core_question: &str,
+    ) -> Option<String> {
+        match record.decision {
+            ConfidenceDecision::Clarify => Some(format!(
+                "  为避免误导，先确认你问的是不是「{}」，或换一种更明确的问法。",
+                core_question
+            )),
+            ConfidenceDecision::Abstain => Some(
+                "  证据不足以给出可靠结论：本次拒答，不把猜测伪装成答案。".to_string(),
+            ),
+            _ => None,
+        }
+    }
+
     fn render_epistemic_claim(
         &self,
         intent: &ProbabilisticQueryIntent,
@@ -12918,6 +13039,19 @@ impl SymbolicReasoner {
         } else {
             atom_probability
         };
+        let record = self.confidence_record(intent, probability, stats.4);
+        if let Some(record) = &record {
+            if let Some(note) =
+                Self::confidence_blocked_note(record, &intent.core_question)
+            {
+                let mut output = intent.render_ledger();
+                output.push('\n');
+                output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
+                output.push_str(&format!("  {}\n", record.render_receipt()));
+                output.push_str(&note);
+                return Some(output.trim_end().to_string());
+            }
+        }
         let mut output = intent.render_ledger();
         output.push('\n');
         output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
@@ -13027,6 +13161,14 @@ impl SymbolicReasoner {
                 EpistemicMode::Plain | EpistemicMode::Comparison => {}
             }
         }
+        if let Some(record) = &record {
+            output.push_str(&format!("  {}\n", record.render_receipt()));
+            if record.decision == ConfidenceDecision::Hedge {
+                output.push_str(
+                    "  说明：置信度一般，以上结论请结合来源核对，不宜当作确定事实。\n",
+                );
+            }
+        }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
         Some(output.trim_end().to_string())
     }
@@ -13105,6 +13247,37 @@ impl SymbolicReasoner {
                 intent.threshold
             ));
         }
+        let top_probability = kept[0].probability;
+        let (margin, near_boundary) = if intent.mode == EpistemicMode::MostLikely {
+            match kept.get(1) {
+                Some(second) => {
+                    let gap = (top_probability - second.probability).max(0.0);
+                    let window = self.config.confidence.near_margin.max(1e-9);
+                    ((gap / window).clamp(0.0, 1.0), gap <= window)
+                }
+                None => (1.0, false),
+            }
+        } else {
+            (
+                self.confidence_margin_score(intent, top_probability),
+                self.confidence_near_boundary(intent, top_probability),
+            )
+        };
+        let record = self.confidence_record_with_margin(
+            intent,
+            stats.4,
+            margin,
+            near_boundary,
+        );
+        if let Some(record) = &record {
+            if let Some(note) =
+                Self::confidence_blocked_note(record, &intent.core_question)
+            {
+                output.push_str(&format!("  {}\n", record.render_receipt()));
+                output.push_str(&note);
+                return output.trim_end().to_string();
+            }
+        }
         if intent.mode == EpistemicMode::MostLikely {
             let top = kept[0];
             output.push_str(&format!(
@@ -13141,6 +13314,14 @@ impl SymbolicReasoner {
             }
             if let Some(top) = kept.first() {
                 output.push_str(&self.render_epistemic_proofs(top, 1));
+            }
+        }
+        if let Some(record) = &record {
+            output.push_str(&format!("  {}\n", record.render_receipt()));
+            if record.decision == ConfidenceDecision::Hedge {
+                output.push_str(
+                    "  说明：候选之间或与阈值过于接近，以上排序请结合来源核对。\n",
+                );
             }
         }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
@@ -13227,6 +13408,27 @@ impl SymbolicReasoner {
             left_stats.3.max(right_stats.3),
             left_stats.4 && right_stats.4,
         );
+        let gap = (left_probability - right_probability).abs();
+        let window = self.config.confidence.near_margin.max(1e-9);
+        let record = self.confidence_record_with_margin(
+            intent,
+            stats.4,
+            (gap / window).clamp(0.0, 1.0),
+            gap <= window,
+        );
+        if let Some(record) = &record {
+            output.push_str(&format!("  {}\n", record.render_receipt()));
+            if let Some(note) =
+                Self::confidence_blocked_note(record, &intent.core_question)
+            {
+                output.push_str(&note);
+                output.push('\n');
+            } else if record.decision == ConfidenceDecision::Hedge {
+                output.push_str(
+                    "  说明：两者概率过于接近，比较结论请结合来源核对。\n",
+                );
+            }
+        }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
         Some(output.trim_end().to_string())
     }
@@ -14164,6 +14366,14 @@ mod tests {
             require_predicate_admission: false,
             confidence: crate::confidence::ConfidenceConfig::default(),
         }
+    }
+
+    fn pcc_config() -> ReasoningConfig {
+        let full: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let mut config = test_config();
+        config.confidence = full.reasoning.confidence;
+        config
     }
 
     fn master_facts() -> Vec<PrologFact> {
@@ -21628,6 +21838,45 @@ types = [
         );
         assert!(modal.contains("P=0.000"), "{}", modal);
         assert!(modal.contains("不足以确认"), "{}", modal);
+    }
+
+    #[test]
+    fn epistemic_pcc_receipt_carries_a_verified_certificate() {
+        let mut reasoner = SymbolicReasoner::new(pcc_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("王五一定是李四的师傅吗")
+            .expect("启用了置信度层也应可回答");
+        assert!(answer.contains("置信度决策（PCC）"), "{}", answer);
+        assert!(answer.contains("决策=回答"), "{}", answer);
+        assert!(answer.contains("理解措辞=很有把握"), "{}", answer);
+        assert!(answer.contains("风险证书"), "{}", answer);
+        assert!(answer.contains("上界=0.0377"), "{}", answer);
+        assert!(answer.contains("已验证"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_pcc_degrades_a_threshold_boundary_answer_to_hedge() {
+        let mut reasoner = SymbolicReasoner::new(pcc_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.teach_report("李四的喜欢是赵六的可能性是百分之八十");
+        let answer = reasoner
+            .answer("李四的喜欢是赵六的概率超过百分之八十吗")
+            .expect("边界样本应可回答");
+        assert!(answer.contains("边界=接近判定阈值"), "{}", answer);
+        assert!(answer.contains("决策=含糊回答"), "{}", answer);
+        assert!(answer.contains("结合来源核对"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_pcc_is_off_by_default_and_keeps_legacy_output() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("王五一定是李四的师傅吗")
+            .expect("旧路径应可回答");
+        assert!(!answer.contains("置信度决策（PCC）"), "{}", answer);
+        assert!(!answer.contains("风险证书"), "{}", answer);
     }
 
     #[test]
