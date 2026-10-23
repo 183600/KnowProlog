@@ -46,6 +46,7 @@
 //! - `POST /sessions/{id}/resume`  继续最近的未完成轮次（消费一次，失败 attempts+1）
 //! - `GET  /v1/models`             OpenAI 兼容：模型清单
 //! - `GET  /v1/prompts`            提示资产注册表（spec + lint + 覆盖）
+//! - `POST /v1/events`             无状态事件图抽取 / 事件焦点问答
 //! - `POST /v1/chat/completions`   OpenAI 兼容聊天补全（`stream: true` 时
 //!   按句 SSE 流式）；无扩展字段时按无状态语义重放用户消息，带
 //!   `"session_id"` 扩展时只执行最后一条用户消息并复用服务端记忆
@@ -72,6 +73,7 @@ use crate::canonical::{self, DecodeError, DecodeReceipt};
 use crate::dialogue_manager::{
     DialogueKnowledge, DialogueManager, DialogueManagerSnapshot, MoveKind,
 };
+use crate::event_graph::{EventDialogue, EventGraph};
 use crate::ontology_reasoning::OntologyProgram;
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime};
@@ -846,106 +848,106 @@ impl Session {
 
         control.enter(TurnPhase::Reason)?;
         let (status, source, kind, plan, mut reply, derivation) =
-        if let Some(text) = completion_command {
-            (
-                "answered".to_string(),
-                "completion".to_string(),
-                Some("completion_command".to_string()),
-                vec!["completion_command".to_string()],
-                text,
-                None,
-            )
-        } else if let Some(text) = assumption_command {
-            (
-                "answered".to_string(),
-                "assumption".to_string(),
-                Some("assumption_world".to_string()),
-                vec!["assumption_world".to_string()],
-                text,
-                None,
-            )
-        } else if let Some(text) = pending_answer {
-            (
-                "answered".to_string(),
-                "pending_question".to_string(),
-                Some("pending_question".to_string()),
-                vec!["pending_question".to_string()],
-                text,
-                None,
-            )
-        } else if let Some((text, plan, kind)) = plugin_answer {
-            (
-                "answered".to_string(),
-                "plugin".to_string(),
-                Some(kind),
-                plan,
-                text,
-                None,
-            )
-        } else if let Some(reply) = dialogue {
-            let text = self
-                .plugin
-                .as_ref()
-                .map(|runtime| runtime.lock().style_wrap(&reply.text))
-                .unwrap_or(reply.text);
-            (
-                "answered".to_string(),
-                "dialogue".to_string(),
-                Some(reply.kind.label().to_string()),
-                reply.plan,
-                text,
-                reply.derivation,
-            )
-        } else if let Some(answer) = self.reasoner.answer(&input) {
-            (
-                "answered".to_string(),
-                "reasoner".to_string(),
-                None,
-                Vec::new(),
-                answer,
-                None,
-            )
-        } else if let Some((text, plan)) = self
-            .plugin
-            .as_ref()
-            .and_then(|runtime| runtime.lock().policy_reply(&input))
-        {
-            let text = self
-                .plugin
-                .as_ref()
-                .map(|runtime| runtime.lock().style_wrap(&text))
-                .unwrap_or(text);
-            (
-                "answered".to_string(),
-                "plugin".to_string(),
-                Some("policy".to_string()),
-                vec![plan],
-                text,
-                None,
-            )
-        } else {
-            // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
-            self.manager.note_deferred(&input, &self.reasoner);
-            if let Some(prompt) = self.reasoner.open_pending_question(&input) {
+            if let Some(text) = completion_command {
                 (
-                    "deferred".to_string(),
+                    "answered".to_string(),
+                    "completion".to_string(),
+                    Some("completion_command".to_string()),
+                    vec!["completion_command".to_string()],
+                    text,
+                    None,
+                )
+            } else if let Some(text) = assumption_command {
+                (
+                    "answered".to_string(),
+                    "assumption".to_string(),
+                    Some("assumption_world".to_string()),
+                    vec!["assumption_world".to_string()],
+                    text,
+                    None,
+                )
+            } else if let Some(text) = pending_answer {
+                (
+                    "answered".to_string(),
                     "pending_question".to_string(),
                     Some("pending_question".to_string()),
                     vec!["pending_question".to_string()],
-                    prompt,
+                    text,
+                    None,
+                )
+            } else if let Some((text, plan, kind)) = plugin_answer {
+                (
+                    "answered".to_string(),
+                    "plugin".to_string(),
+                    Some(kind),
+                    plan,
+                    text,
+                    None,
+                )
+            } else if let Some(reply) = dialogue {
+                let text = self
+                    .plugin
+                    .as_ref()
+                    .map(|runtime| runtime.lock().style_wrap(&reply.text))
+                    .unwrap_or(reply.text);
+                (
+                    "answered".to_string(),
+                    "dialogue".to_string(),
+                    Some(reply.kind.label().to_string()),
+                    reply.plan,
+                    text,
+                    reply.derivation,
+                )
+            } else if let Some(answer) = self.reasoner.answer(&input) {
+                (
+                    "answered".to_string(),
+                    "reasoner".to_string(),
+                    None,
+                    Vec::new(),
+                    answer,
+                    None,
+                )
+            } else if let Some((text, plan)) = self
+                .plugin
+                .as_ref()
+                .and_then(|runtime| runtime.lock().policy_reply(&input))
+            {
+                let text = self
+                    .plugin
+                    .as_ref()
+                    .map(|runtime| runtime.lock().style_wrap(&text))
+                    .unwrap_or(text);
+                (
+                    "answered".to_string(),
+                    "plugin".to_string(),
+                    Some("policy".to_string()),
+                    vec![plan],
+                    text,
                     None,
                 )
             } else {
-                (
-                    "deferred".to_string(),
-                    "none".to_string(),
-                    None,
-                    Vec::new(),
-                    String::new(),
-                    None,
-                )
-            }
-        };
+                // 让位也是失败：以 Unknown 回执记账（Off 模式零副作用）
+                self.manager.note_deferred(&input, &self.reasoner);
+                if let Some(prompt) = self.reasoner.open_pending_question(&input) {
+                    (
+                        "deferred".to_string(),
+                        "pending_question".to_string(),
+                        Some("pending_question".to_string()),
+                        vec!["pending_question".to_string()],
+                        prompt,
+                        None,
+                    )
+                } else {
+                    (
+                        "deferred".to_string(),
+                        "none".to_string(),
+                        None,
+                        Vec::new(),
+                        String::new(),
+                        None,
+                    )
+                }
+            };
         // 失败即立悬问：回答/对话路径诚实报告「没有记录」时，把
         // 「目标 + 缺哪条前提」留给下一轮；成功回答则关闭同题悬问。
         if (source == "reasoner" || source == "dialogue") && !reply.is_empty() {
@@ -2336,6 +2338,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "DELETE /sessions/{id}/open-turn",
                     "GET /v1/models",
                     "GET /v1/prompts",
+                    "POST /v1/events",
                     "POST /v1/chat/completions"
                 ]
             }),
@@ -2374,6 +2377,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             Err(message) => Response::error(429, message),
         },
         ("POST", ["sessions", "import"]) => handle_import(state, request).await,
+        ("POST", ["v1", "events"]) => handle_events(request).await,
         ("GET", ["sessions", id]) => match state.session_snapshot(id).await {
             Ok(snapshot) => Response::json(200, &snapshot),
             Err(error) => session_error_response(error),
@@ -2559,6 +2563,43 @@ fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Respons
 
 /// 导入信封：解码（解析/格式/版本/摘要/尺寸）→ 校验（会话 id/引擎）→
 /// 零副作用重建会话。解码回执随 201 响应返回（可审计的接收凭据）。
+/// 无状态事件抽取/问答：`POST /v1/events`。
+///
+/// 请求：`{"text":"...","question":"..."}`；`question` 可省略，省略时只返回事件图。
+/// 事件图按请求现算，不写入会话或默认 RDF 图；N-Quads 需调用 CLI `events --nquads`。
+async fn handle_events(request: &Request) -> Response {
+    let payload: serde_json::Value = match serde_json::from_str(&request.body_text()) {
+        Ok(value) => value,
+        Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
+    };
+    let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) else {
+        return Response::error(400, "missing string field: text");
+    };
+    if text.trim().is_empty() {
+        return Response::error(400, "text must not be empty");
+    }
+    let graph = EventGraph::build(text);
+    let Some(question) = payload.get("question") else {
+        return Response::json(200, &serde_json::json!({"status": "ok", "graph": graph}));
+    };
+    let Some(question) = question.as_str() else {
+        return Response::error(400, "question must be a string");
+    };
+    if question.trim().is_empty() {
+        return Response::error(400, "question must not be empty");
+    }
+    let mut dialogue = EventDialogue::new(graph.clone());
+    let answer = dialogue.ask(question);
+    Response::json(
+        200,
+        &serde_json::json!({
+            "status": answer.status.tag(),
+            "answer": answer,
+            "graph": graph,
+        }),
+    )
+}
+
 async fn handle_import(state: &Arc<ApiState>, request: &Request) -> Response {
     // 信封解码一律用信封上限：导出的会话必须能原样导回，
     // 默认 256KB 体量只约束对话轮，不约束冷存储信封。
@@ -5363,7 +5404,11 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
 
         let confirmed = session.run_turn("确认补全：孙八|师祖|吴十");
         assert_eq!(confirmed.source, "completion", "{}", confirmed.reply);
-        assert!(confirmed.reply.contains("已确认补全"), "{}", confirmed.reply);
+        assert!(
+            confirmed.reply.contains("已确认补全"),
+            "{}",
+            confirmed.reply
+        );
 
         let answer = session.run_turn("孙八的师祖是谁");
         assert_eq!(answer.status, "answered", "{}", answer.reply);
@@ -5509,7 +5554,11 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .await
             .expect("短答应回填悬问");
         assert_eq!(answered.source, "pending_question", "{}", answered.reply);
-        assert!(answered.reply.contains("现在可以回答了"), "{}", answered.reply);
+        assert!(
+            answered.reply.contains("现在可以回答了"),
+            "{}",
+            answered.reply
+        );
         assert!(answered.reply.contains("王五"), "{}", answered.reply);
     }
 
@@ -5562,5 +5611,28 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         )
         .await;
         assert_eq!(status, 409, "{}", body);
+    }
+    #[tokio::test]
+    async fn events_endpoint_extracts_and_answers() {
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/v1/events".to_string(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            body: r#"{"text":"1991年，张三认识李四。","question":"谁认识李四"}"#
+                .as_bytes()
+                .to_vec(),
+        };
+        let response = handle_events(&request).await;
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["status"], "answered");
+        assert!(value["answer"]["answer"].as_str().unwrap().contains("张三"));
+        assert_eq!(value["graph"]["events"].as_array().unwrap().len(), 1);
     }
 }
