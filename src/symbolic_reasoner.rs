@@ -4044,6 +4044,7 @@ impl SymbolicReasoner {
             generator: &self.generator,
             min_rule_confidence: self.config.entailment_min_confidence,
             max_rule_candidates: 16,
+            slot_policy: Some(self.slots.policy()),
         }
     }
 
@@ -4070,6 +4071,7 @@ impl SymbolicReasoner {
                 generator,
                 min_rule_confidence: self.config.entailment_min_confidence,
                 max_rule_candidates: 16,
+                slot_policy: Some(self.slots.policy()),
             },
             None => self.knowledge(),
         };
@@ -5644,6 +5646,7 @@ impl SymbolicReasoner {
                 generator,
                 min_rule_confidence: self.config.entailment_min_confidence,
                 max_rule_candidates: 16,
+                slot_policy: Some(self.slots.policy()),
             },
             None => self.knowledge(),
         };
@@ -17232,12 +17235,15 @@ types = [
             semantic_entailment::ProofKind::DirectFact
         );
 
-        let contradicted = reasoner.check_statement("李四的师傅是张三");
-        assert_eq!(contradicted[0].verdict, Verdict::Contradicted);
-        assert!(contradicted[0]
-            .counter_evidence
-            .iter()
-            .any(|evidence| evidence.contains("王五")));
+        // 「师傅」是多值谓词：图谱里已有王五，并不能排除张三也是师傅，
+        // 因此不再按功能谓词的封闭世界规则误判为矛盾。
+        let multi_value = reasoner.check_statement("李四的师傅是张三");
+        assert_eq!(multi_value[0].verdict, Verdict::Unknown);
+        assert!(
+            multi_value[0].reason.contains("多值") && multi_value[0].reason.contains("王五"),
+            "实际原因：{}",
+            multi_value[0].reason
+        );
 
         let unknown = reasoner.check_statement("钱七的师傅是李四");
         assert_eq!(unknown[0].verdict, Verdict::Unknown);
@@ -17248,6 +17254,32 @@ types = [
         );
 
         assert!(reasoner.check_statement("张三的师傅是谁").is_empty());
+    }
+
+    #[test]
+    fn test_check_statement_functional_predicate_still_contradicts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&attribute_facts());
+        let contradicted = reasoner.check_statement("姚明的身高是180cm");
+        assert_eq!(contradicted.len(), 1);
+        assert_eq!(
+            contradicted[0].verdict,
+            Verdict::Contradicted,
+            "功能谓词的不同取值仍应判矛盾：{:?}",
+            contradicted[0]
+        );
+        assert!(contradicted[0]
+            .counter_evidence
+            .iter()
+            .any(|evidence| evidence.contains("226cm")));
+
+        let negative = reasoner.check_statement("姚明的身高不是180cm");
+        assert_eq!(negative.len(), 1);
+        assert_eq!(negative[0].verdict, Verdict::Entailed);
+        assert_eq!(
+            negative[0].proof[0].kind,
+            semantic_entailment::ProofKind::ClosedWorld
+        );
     }
 
     #[test]

@@ -143,6 +143,21 @@ pub struct Knowledge<'a> {
     pub generator: &'a SymbolicGenerator,
     pub min_rule_confidence: f64,
     pub max_rule_candidates: usize,
+    /// 功能谓词策略：同一主语-谓词只允许一个取值。`None` 表示沿用旧版
+    /// 封闭世界行为（任何已知取值都视为唯一），用于不关心槽语义的调用方；
+    /// `Some(policy)` 时只有被声明为功能谓词的槽才做单值矛盾判定，多值
+    /// 谓词上「另一个合法取值」不会被误报为矛盾。
+    pub slot_policy: Option<&'a crate::slot_ledger::SlotPolicy>,
+}
+
+fn is_functional(prop: &Proposition, knowledge: &Knowledge<'_>) -> bool {
+    if prop.kind == PropositionKind::TypeMembership {
+        return true;
+    }
+    match knowledge.slot_policy {
+        Some(policy) => policy.is_functional(&prop.predicate),
+        None => true,
+    }
 }
 
 const FUZZY_ACCEPT: f64 = 0.5;
@@ -767,7 +782,10 @@ pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> Entailmen
         }
         // 仅在需要封闭世界假设证据时才收集图谱取值
         let values = known_values(proposition, knowledge);
-        if !values.is_empty() && !values.iter().any(|value| value == &proposition.object) {
+        if !values.is_empty()
+            && !values.iter().any(|value| value == &proposition.object)
+            && is_functional(proposition, knowledge)
+        {
             return EntailmentResult {
                 proposition: proposition.clone(),
                 verdict: Verdict::Entailed,
@@ -815,7 +833,7 @@ pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> Entailmen
     }
 
     let values = known_values(proposition, knowledge);
-    if !values.is_empty() {
+    if !values.is_empty() && is_functional(proposition, knowledge) {
         let mut counter: Vec<String> = values
             .iter()
             .map(|value| {
@@ -849,6 +867,30 @@ pub fn entail(proposition: &Proposition, knowledge: &Knowledge<'_>) -> Entailmen
             )],
             counter_evidence: counter,
             reason: "与知识图谱已记录的取值不符".to_string(),
+        };
+    }
+    if !values.is_empty() {
+        return EntailmentResult {
+            proposition: proposition.clone(),
+            verdict: Verdict::Unknown,
+            confidence: 0.0,
+            proof: Vec::new(),
+            counter_evidence: Vec::new(),
+            reason: if values.iter().any(|value| value == &proposition.object) {
+                format!(
+                    "「{}」的「{}」已记录取值 {}，但该谓词允许多值，当前证据不足以断言",
+                    proposition.subject,
+                    proposition.predicate,
+                    values.join("、")
+                )
+            } else {
+                format!(
+                    "「{}」的「{}」已记录取值：{}；该谓词允许多值，不再据此判定矛盾",
+                    proposition.subject,
+                    proposition.predicate,
+                    values.join("、")
+                )
+            },
         };
     }
 
@@ -980,6 +1022,7 @@ mod tests {
                     generator: &self.generator,
                     min_rule_confidence: 0.5,
                     max_rule_candidates: 16,
+                    slot_policy: None,
                 },
             )
         }
@@ -1013,6 +1056,7 @@ mod tests {
                 generator: &generator,
                 min_rule_confidence: 0.5,
                 max_rule_candidates: 16,
+                slot_policy: None,
             },
         );
         assert_eq!(result.verdict, Verdict::Entailed, "{}", result.reason);
@@ -1155,6 +1199,36 @@ mod tests {
         let result = fixture.entail_first("张三的师傅是王五");
         assert_eq!(result.verdict, Verdict::Contradicted);
         assert!(result.counter_evidence.iter().any(|e| e.contains("李四")));
+    }
+
+    #[test]
+    fn test_multi_value_policy_avoids_false_contradiction() {
+        let fixture = Fixture::new();
+        let policy = crate::slot_ledger::SlotPolicy::new().with_functional(["年龄"]);
+        let knowledge = Knowledge {
+            predictor: &fixture.predictor,
+            generator: &fixture.generator,
+            min_rule_confidence: 0.5,
+            max_rule_candidates: 16,
+            slot_policy: Some(&policy),
+        };
+        let parse = |text: &str| fixture.parse(text).remove(0);
+
+        let other_teacher = entail(&parse("张三的师傅是王五"), &knowledge);
+        assert_eq!(
+            other_teacher.verdict,
+            Verdict::Unknown,
+            "多值谓词不应把另一个合法取值判成矛盾：{:?}",
+            other_teacher
+        );
+        assert!(other_teacher.counter_evidence.is_empty());
+
+        let negative = entail(&parse("张三的师傅不是王五"), &knowledge);
+        assert_eq!(negative.verdict, Verdict::Unknown);
+
+        let wrong_age = entail(&parse("张三的年龄是31"), &knowledge);
+        assert_eq!(wrong_age.verdict, Verdict::Contradicted);
+        assert!(!wrong_age.counter_evidence.is_empty());
     }
 
     #[test]
