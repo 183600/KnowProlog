@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::entity_linker::{EntityLinker, LinkCandidate, LinkMethod, LinkedMention};
 use crate::entity_registry::fold_surface;
+use crate::function_words::{roles_of, Role};
 use crate::identity::infer_suffix_type;
+use crate::lexical_memory::LexicalMemory;
 
 /// 领先次优多少票算「唯一」（默认边际）。低于边际即升级为显式歧义。
 pub const DEFAULT_MARGIN_VOTES: i32 = 2;
@@ -734,6 +736,21 @@ impl ContextualResolver {
         hints: &[String],
         focus: Option<&str>,
     ) -> CrdOutcome {
+        self.resolve_text_with_memory(text, linker, source, ledger, hints, focus, None)
+    }
+
+    /// 与 [`Self::resolve_text`] 相同，但允许用跨会话词法记忆补充量词期待。
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_text_with_memory(
+        &self,
+        text: &str,
+        linker: &EntityLinker,
+        source: &dyn SenseSource,
+        ledger: &BindingLedger,
+        hints: &[String],
+        focus: Option<&str>,
+        memory: Option<&LexicalMemory>,
+    ) -> CrdOutcome {
         let mentions = linker.link_lattice(text, hints);
         let descriptions = detect_descriptions(text, source);
         let global_expectations: Vec<String> = crate::function_words::answer_type_keywords(text)
@@ -753,7 +770,7 @@ impl ContextualResolver {
         let provisional: Vec<Option<String>> = mentions
             .iter()
             .map(|mention| {
-                self.evaluate(
+                self.evaluate_with_memory(
                     mention,
                     linker,
                     text,
@@ -763,6 +780,7 @@ impl ContextualResolver {
                     focus,
                     &[],
                     &global_expectations,
+                    memory,
                 )
                 .chosen
             })
@@ -770,7 +788,7 @@ impl ContextualResolver {
         let peers: Vec<String> = provisional.iter().flatten().cloned().collect();
 
         for mention in &mentions {
-            let resolution = self.evaluate(
+            let resolution = self.evaluate_with_memory(
                 mention,
                 linker,
                 text,
@@ -780,6 +798,7 @@ impl ContextualResolver {
                 focus,
                 &peers,
                 &global_expectations,
+                memory,
             );
             if outcome.ask.is_none() && resolution.verdict == Verdict::Ambiguous {
                 if let Some(question) = resolution.question.clone() {
@@ -841,7 +860,36 @@ impl ContextualResolver {
         peers: &[String],
         global_expectations: &[String],
     ) -> MentionResolution {
-        let sketch = sketch_mention(text, mention);
+        self.evaluate_with_memory(
+            mention,
+            linker,
+            text,
+            source,
+            ledger,
+            hints,
+            focus,
+            peers,
+            global_expectations,
+            None,
+        )
+    }
+
+    /// 与 [`Self::evaluate`] 相同，但可注入词法记忆补充量词期待。
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_memory(
+        &self,
+        mention: &LinkedMention,
+        linker: &EntityLinker,
+        text: &str,
+        source: &dyn SenseSource,
+        ledger: &BindingLedger,
+        hints: &[String],
+        focus: Option<&str>,
+        peers: &[String],
+        global_expectations: &[String],
+        memory: Option<&LexicalMemory>,
+    ) -> MentionResolution {
+        let sketch = sketch_mention_with_memory(text, mention, memory);
         let key = fold_surface(&sketch.key_surface);
         let mut notes: Vec<String> = Vec::new();
 
@@ -1250,8 +1298,69 @@ impl ContextualResolver {
     }
 }
 
+/// 从词法记忆学习到的量词期待中找出紧邻指称的量词短语。
+///
+/// 先看指称前 2/1 字窗口，再看指称内部前缀；只在记忆里确有该量词期待时
+/// 才返回，避免把任意「指别 + 名词」误当量词短语。
+fn learned_quantifier(
+    chars: &[char],
+    start: usize,
+    mention: &str,
+    memory: &LexicalMemory,
+) -> Option<(String, String, usize)> {
+    for len in [2usize, 1] {
+        if start >= len {
+            let word: String = chars[start - len..start].iter().collect();
+            if let Some(classifier) = classifier_of(&word) {
+                if let Some(expectation) = memory.classifier_expectation(&classifier) {
+                    return Some((word, expectation.expected_type, 0));
+                }
+            }
+        }
+    }
+    for len in [2usize, 1] {
+        let word: String = mention.chars().take(len).collect();
+        if word.chars().count() != len {
+            continue;
+        }
+        if let Some(classifier) = classifier_of(&word) {
+            if let Some(expectation) = memory.classifier_expectation(&classifier) {
+                return Some((word, expectation.expected_type, len));
+            }
+        }
+    }
+    None
+}
+
+/// 量词短语 → 量词词面（「那位」→「位」；独立「位」原样返回）。
+fn classifier_of(word: &str) -> Option<String> {
+    let mut chars = word.chars();
+    let first = chars.next()?;
+    let suffix: String = chars.collect();
+    if suffix.is_empty() {
+        let single = first.to_string();
+        return roles_of(&single)
+            .contains(&Role::Quantifier)
+            .then_some(single);
+    }
+    if !matches!(first, '这' | '那' | '哪' | '每' | '某' | '几' | '数') {
+        return None;
+    }
+    (suffix.chars().count() == 1 && roles_of(&suffix).contains(&Role::Quantifier))
+        .then_some(suffix)
+}
+
 /// 指称素描：从提及及其前后文抽中文特征。
 pub fn sketch_mention(text: &str, mention: &LinkedMention) -> MentionSketch {
+    sketch_mention_with_memory(text, mention, None)
+}
+
+/// 与 [`sketch_mention`] 相同，但允许用词法记忆补充量词期待。
+pub fn sketch_mention_with_memory(
+    text: &str,
+    mention: &LinkedMention,
+    memory: Option<&LexicalMemory>,
+) -> MentionSketch {
     let chars: Vec<char> = text.chars().collect();
     let start = mention.start.min(chars.len());
     let mut expectation_types: Vec<String> = Vec::new();
@@ -1283,6 +1392,22 @@ pub fn sketch_mention(text: &str, mention: &LinkedMention) -> MentionSketch {
             if !etype.is_empty() {
                 expectation_types.push((*etype).to_string());
             }
+        }
+    }
+    // 词法记忆：已学到的量词期待不依赖硬编码表；只补充，不覆盖既有证据。
+    if let Some(memory) = memory {
+        if let Some(word) = quantifier.as_deref() {
+            if let Some(classifier) = classifier_of(word) {
+                if let Some(expectation) = memory.classifier_expectation(&classifier) {
+                    expectation_types.push(expectation.expected_type);
+                }
+            }
+        } else if let Some((word, expected, offset)) =
+            learned_quantifier(&chars, start, &mention.mention, memory)
+        {
+            quantifier = Some(word);
+            key_offset += offset;
+            expectation_types.push(expected);
         }
     }
 
@@ -2111,6 +2236,39 @@ mod tests {
         let mention = &linker.link_lattice("演员梁朝伟是谁", &[])[0];
         let sketch = sketch_mention("演员梁朝伟是谁", mention);
         assert_eq!(sketch.appositive_role.as_deref(), Some("演员"));
+        assert!(sketch.expectation_types.contains(&"人物".to_string()));
+    }
+
+    #[test]
+    fn learned_classifier_supplements_quantifier_expectation() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("梁朝伟", Some("人物"));
+        linker.register_entity("梁朝伟公司", Some("组织"));
+        linker.register_alias("梁朝伟", "梁朝伟公司");
+        let mut memory = LexicalMemory::new(16);
+        memory.observe_annotated(
+            1,
+            &[
+                crate::lexical_memory::annotated_word(
+                    "名",
+                    "q",
+                    crate::nlp::TagSource::JiebaTag,
+                    0,
+                    1,
+                ),
+                crate::lexical_memory::annotated_word(
+                    "教授",
+                    "n",
+                    crate::nlp::TagSource::JiebaTag,
+                    1,
+                    3,
+                ),
+            ],
+        );
+        let text = "那名梁朝伟是谁";
+        let mention = &linker.link_lattice(text, &[])[0];
+        let sketch = sketch_mention_with_memory(text, mention, Some(&memory));
+        assert_eq!(sketch.quantifier.as_deref(), Some("那名"));
         assert!(sketch.expectation_types.contains(&"人物".to_string()));
     }
 
