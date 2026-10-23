@@ -1776,6 +1776,9 @@ pub fn predicate_labels() -> &'static [(&'static str, &'static str)] {
 /// 图谱属性键与中文词面的对照表（英文键 → 中文）。
 const PREDICATE_LABELS: &[(&str, &str)] = &[
     ("name", "姓名"),
+    // 「名字」是同一属性的口语词面；保留「姓名」为规范展示面，
+    // 两个词面都能回落到图谱里的 name 键。
+    ("name", "名字"),
     ("gender", "性别"),
     ("height", "身高"),
     ("weight", "体重"),
@@ -1959,6 +1962,13 @@ mod tests {
         generator.observe_entity("张三", "人物", &[("age".to_string(), "30".to_string())]);
         assert_eq!(generator.canonical_predicate("年龄").as_deref(), Some("age"));
         assert_eq!(generator.canonical_predicate("岁数").as_deref(), Some("年龄"));
+    }
+
+    #[test]
+    fn colloquial_name_surface_reaches_name_key() {
+        assert_eq!(canonical_predicate_key("名字"), Some("name"));
+        assert_eq!(canonical_predicate_key("姓名"), Some("name"));
+        assert_eq!(localized_predicate_key("name"), Some("姓名"));
     }
 
     #[test]

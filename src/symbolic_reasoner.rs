@@ -21841,6 +21841,45 @@ types = [
     }
 
     #[test]
+    fn colloquial_name_question_answers_with_full_chain() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut facts = master_facts();
+        for (name, master) in [("张三", "李四"), ("李四", "王五")] {
+            facts.push(PrologFact::Entity {
+                name: name.to_string(),
+                entity_type: "Person".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), name.to_string()),
+                    ("师傅".to_string(), master.to_string()),
+                ]),
+            });
+        }
+        reasoner.observe_facts(&facts);
+        for question in [
+            "张三的师傅叫什么名字",
+            "张三的师傅的名字是什么",
+            "张三的师傅名字是什么",
+        ] {
+            let answer = reasoner
+                .answer(question)
+                .unwrap_or_else(|| panic!("姓名问句应可回答：{}", question));
+            assert!(
+                answer.contains("张三 的 师傅"),
+                "{} → {}",
+                question,
+                answer
+            );
+            assert!(answer.contains("李四"), "{} → {}", question, answer);
+            assert!(
+                !answer.contains("师傅叫什么名字 是"),
+                "{} 不应把问句残片当成谓词：{}",
+                question,
+                answer
+            );
+        }
+    }
+
+    #[test]
     fn epistemic_pcc_receipt_carries_a_verified_certificate() {
         let mut reasoner = SymbolicReasoner::new(pcc_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());

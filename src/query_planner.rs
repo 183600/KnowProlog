@@ -165,6 +165,9 @@ impl QueryPlanner {
         if let Some(plan) = self.parse_attribute_quantity(&particle_free) {
             return Some(plan);
         }
+        if let Some(plan) = self.parse_name_question(&particle_free) {
+            return Some(plan);
+        }
 
         // 存在句依赖句尾语气词（"有…吗"），必须在去语气词之前判断
         if let Some(plan) = self.parse_exist(&raw) {
@@ -619,6 +622,38 @@ impl QueryPlanner {
                     return Some(plan);
                 }
             }
+        }
+        None
+    }
+
+    /// 「X 叫什么名字 / X 的名字是什么 / X 姓名是什么」统一编译为
+    /// 「X 的姓名」属性链。只认完整的姓名问句框架，避免把「什么是X」
+    /// 这类定义问句误当属性查询。
+    fn parse_name_question(&self, q: &str) -> Option<QueryPlan> {
+        const SUFFIXES: [&str; 8] = [
+            "叫什么名字",
+            "叫啥名字",
+            "叫什麼名字",
+            "的名字是什么",
+            "的姓名是什么",
+            "名字是什么",
+            "姓名是什么",
+            "叫啥",
+        ];
+        for suffix in SUFFIXES {
+            let Some(prefix) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let subject = prefix.trim().trim_end_matches('的').trim();
+            if subject.is_empty() || Self::is_question_word(subject) {
+                continue;
+            }
+            let mut segments = Self::segments_of(subject);
+            if segments.is_empty() || segments.len() + 1 > self.max_chain {
+                continue;
+            }
+            segments.push("姓名".to_string());
+            return Some(QueryPlan::FindObject { segments });
         }
         None
     }
@@ -1714,6 +1749,37 @@ mod tests {
                 predicate: "师傅".to_string()
             }
         );
+    }
+
+    #[test]
+    fn name_questions_compile_to_name_attribute_chain() {
+        for question in [
+            "张三叫什么名字",
+            "张三叫啥名字",
+            "张三的名字是什么",
+            "张三姓名是什么",
+            "张三的师傅叫什么名字",
+            "张三的师傅的名字是什么",
+            "张三的师傅姓名是什么",
+            "张三的师傅的姓名是什么",
+        ] {
+            let expected_segments = if question.contains("师傅") {
+                vec!["张三".to_string(), "师傅".to_string(), "姓名".to_string()]
+            } else {
+                vec!["张三".to_string(), "姓名".to_string()]
+            };
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("姓名问句应可编译：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindObject {
+                    segments: expected_segments
+                },
+                "{}",
+                question
+            );
+        }
     }
 
     #[test]
