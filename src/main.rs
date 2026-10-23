@@ -5421,6 +5421,7 @@ async fn run_interactive_mode(
     println!();
 
     let stdin_reader = std::io::stdin();
+    let mut event_dialogue: Option<EventDialogue> = None;
     loop {
         turns_since_episode_sync += 1;
         if turns_since_episode_sync >= 8 {
@@ -5458,6 +5459,77 @@ async fn run_interactive_mode(
 
         if matches!(input, "帮助" | "help" | "?" | "？" | "h") {
             println!("{}", interactive_help());
+            println!();
+            continue;
+        }
+
+        if let Some(text) = strip_any_prefix(input, &["事件图：", "事件图:"]) {
+            let text = text.trim();
+            if text.is_empty() {
+                println!("用法：事件图：<文本>");
+                println!();
+                continue;
+            }
+            let graph = EventGraph::build(text);
+            print!("{}", graph.render_text());
+            event_dialogue = Some(EventDialogue::new(graph));
+            println!();
+            continue;
+        }
+
+        if let Some(question) = strip_any_prefix(
+            input,
+            &[
+                "事件问答：",
+                "事件问答:",
+                "事件问：",
+                "事件问:",
+                "事件追问：",
+                "事件追问:",
+            ],
+        ) {
+            let question = question.trim();
+            if question.is_empty() {
+                println!("用法：事件问答：<问题>");
+                println!();
+                continue;
+            }
+            match event_dialogue.as_mut() {
+                Some(dialogue) => {
+                    let answer = dialogue.ask(question);
+                    print!("{}", answer.render_text());
+                }
+                None => {
+                    println!("还没有事件图。先用「事件图：<文本>」建立事件焦点。");
+                }
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "事件事实" | "事件rdf" | "事件RDF" | "事件nquads") {
+            match event_dialogue.as_ref() {
+                Some(dialogue) => print!("{}", dialogue.graph().to_nquads()),
+                None => println!("还没有事件图。先用「事件图：<文本>」建立事件焦点。"),
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "事件焦点" | "事件焦点栈") {
+            match event_dialogue.as_ref() {
+                Some(dialogue) if !dialogue.focus().is_empty() => {
+                    println!("事件焦点（最近在下）：");
+                    for id in dialogue.focus().ids() {
+                        match dialogue.graph().event(id) {
+                            Some(event) => println!("  [{}] {}", id, event.render_text()),
+                            None => println!("  [{}]（图内已无此事件）", id),
+                        }
+                    }
+                }
+                Some(_) => println!("事件焦点为空。"),
+                None => println!("还没有事件图。先用「事件图：<文本>」建立事件焦点。"),
+            }
             println!();
             continue;
         }
@@ -11196,6 +11268,9 @@ fn interactive_help() -> String {
         "  情景归因：<问题>                     改口的候选事件原因（无候选就明说）",
         "  情景反事实：<问题>                   撤销最近语义事件后回答是否翻转（可弃权）",
         "  情景查询：<Datalog原子>              在情景理论上执行查询，如 answered_at(S,Q,A,P)",
+        "  事件图：<文本>                      抽取事件节点、角色、时间、因果与先后链接",
+        "  事件问答：<问题>                    事件焦点多轮追问（谁/何时/何地/为什么/后来/还有谁/是否）",
+        "  事件事实 / 事件焦点                 导出事件命名图 N-Quads / 查看事件焦点栈",
         "",
         "查询与推理",
         "  直接输入自然语言                    如「小明多大？」「张三和李四什么关系？」",
