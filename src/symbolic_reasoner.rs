@@ -1113,6 +1113,12 @@ fn describe_graph_subjects(subjects: &[String]) -> String {
     }
 }
 
+/// 生成审计结果：`text` 只包含通过蕴含校验的行，`note` 为可回放的审计回执。
+struct GenerationAudit {
+    text: String,
+    note: Option<String>,
+}
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -3789,9 +3795,12 @@ impl SymbolicReasoner {
             &mut cursor,
         )?;
         self.context.record_generation_with_cursor(cursor);
-        let mut text = page.text;
-        if let Some(note) = self.generation_self_check(&text, &page.trusted) {
-            text.push('\n');
+        let audit = self.audit_generation(&page.text, &page.trusted);
+        let mut text = audit.text;
+        if let Some(note) = audit.note {
+            if !text.is_empty() {
+                text.push('\n');
+            }
             text.push_str(&note);
         }
         Some(text)
@@ -3976,9 +3985,12 @@ impl SymbolicReasoner {
             ));
         }
         self.context.record_generation_with_cursor(cursor);
-        let mut text = page.text;
-        if let Some(note) = self.generation_self_check(&text, &page.trusted) {
-            text.push('\n');
+        let audit = self.audit_generation(&page.text, &page.trusted);
+        let mut text = audit.text;
+        if let Some(note) = audit.note {
+            if !text.is_empty() {
+                text.push('\n');
+            }
             text.push_str(&note);
         }
         Some(text)
@@ -4012,11 +4024,14 @@ impl SymbolicReasoner {
             GenerationOrder::Relevance => "信息量排序（由稀有谓词到常见谓词）",
             GenerationOrder::Alphabetical => "主题排序（按谓词字典序）",
         };
-        let mut text = format!(
-            "换个角度介绍「{}」（{}）：\n{}",
-            state.entity, label, page.text
-        );
-        if let Some(note) = self.generation_self_check(&text, &page.trusted) {
+        let heading = format!("换个角度介绍「{}」（{}）：", state.entity, label);
+        let audit = self.audit_generation(&page.text, &page.trusted);
+        let mut text = if audit.text.is_empty() {
+            heading
+        } else {
+            format!("{}\n{}", heading, audit.text)
+        };
+        if let Some(note) = audit.note {
             text.push('\n');
             text.push_str(&note);
         }
@@ -5600,12 +5615,22 @@ impl SymbolicReasoner {
         (predictor, generator)
     }
 
-    // 生成自检：逐句回译为命题并验证是否被知识图谱（∪ 会话层）蕴含。
+    // 生成审计：逐句回译为命题并验证是否被知识图谱（∪ 会话层）蕴含。
     // `trusted` 是账本背书的会话层原句：整句精确命中即视为已证，
     // 避免把「刚教的事实」误报为幻觉。
-    fn generation_self_check(&self, text: &str, trusted: &[String]) -> Option<String> {
+    //
+    // 与旧版自检的关键区别：
+    //   • 一句话形式化出多个子句时必须**全部**被蕴含，任一子句失败即整句
+    //     丢弃，堵住「真事实 + 假事实」拼接的幻觉后门；
+    //   • 无法形式化且不在 trusted 白名单里的句子不再静默跳过，而是计入
+    //     失败并丢弃（宁可少说，不冒充事实）；
+    //   • 未通过的句子不进入最终输出，审计只报告实际保留下来的句子。
+    fn audit_generation(&self, text: &str, trusted: &[String]) -> GenerationAudit {
         if !self.config.enable_entailment {
-            return None;
+            return GenerationAudit {
+                text: text.to_string(),
+                note: None,
+            };
         }
         let parser = self.proposition_parser();
         let augmented = if self.session_facts.is_empty() && self.slots.is_empty() {
@@ -5622,16 +5647,19 @@ impl SymbolicReasoner {
             },
             None => self.knowledge(),
         };
+        let mut kept: Vec<&str> = Vec::new();
         let mut total = 0usize;
         let mut entailed = 0usize;
         let mut failed: Vec<String> = Vec::new();
         for raw_line in text.lines() {
             let sentence = semantic_entailment::strip_discourse_markers(raw_line.trim());
             if !sentence.ends_with('。') {
+                kept.push(raw_line);
                 continue;
             }
             // 更正句是账本差分的元叙述，不是对新事实的断言。
             if sentence.starts_with("更正：") || sentence.starts_with("补充：") {
+                kept.push(raw_line);
                 continue;
             }
             let normalized = sentence.trim_end_matches('。');
@@ -5639,39 +5667,43 @@ impl SymbolicReasoner {
                 .iter()
                 .any(|known| known.trim().trim_end_matches('。') == normalized);
             let propositions = parser.parse(sentence);
-            if propositions.is_empty() {
-                if trusted_hit {
-                    total += 1;
-                    entailed += 1;
-                }
-                continue;
-            }
+            let supported = if trusted_hit {
+                Some(())
+            } else if propositions.is_empty() {
+                None
+            } else if propositions.iter().all(|proposition| {
+                semantic_entailment::entail(proposition, &knowledge).verdict == Verdict::Entailed
+            }) {
+                Some(())
+            } else {
+                None
+            };
             total += 1;
-            let supported = trusted_hit
-                || propositions.iter().any(|proposition| {
-                    semantic_entailment::entail(proposition, &knowledge).verdict
-                        == Verdict::Entailed
-                });
-            if supported {
+            if supported.is_some() {
                 entailed += 1;
+                kept.push(raw_line);
             } else {
                 failed.push(sentence.to_string());
             }
         }
-        if total == 0 {
-            return None;
-        }
-        let mut note = format!("（生成自检：{}/{} 句可由知识图谱蕴含", entailed, total);
-        if failed.is_empty() {
-            note.push_str("，零幻觉）");
+        let text = kept.join("\n");
+        let note = if total == 0 {
+            None
+        } else if failed.is_empty() {
+            Some(format!(
+                "（生成自检：{}/{} 句可由知识图谱蕴含，零幻觉）",
+                entailed, total
+            ))
         } else {
-            note.push_str(&format!(
-                "，未通过 {} 句：{}）",
+            Some(format!(
+                "（生成自检：{}/{} 句可由知识图谱蕴含，未通过 {} 句并已丢弃：{}）",
+                entailed,
+                total,
                 failed.len(),
                 failed.join("；")
-            ));
-        }
-        Some(note)
+            ))
+        };
+        GenerationAudit { text, note }
     }
 
     // 符号续写：对「X的」做谓词预测，支持实体级→类型级→全局回退
@@ -17287,6 +17319,45 @@ types = [
                 .map(|s| s.entity.as_str()),
             Some("张三")
         );
+    }
+
+    #[test]
+    fn test_generation_audit_drops_unsupported_and_unparsed_sentences() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let audit = reasoner.audit_generation(
+            "张三的师傅是李四。\n张三的师傅是赵六。\n今天天气不错。",
+            &[],
+        );
+        assert!(audit.text.contains("张三的师傅是李四"), "{}", audit.text);
+        assert!(
+            !audit.text.contains("张三的师傅是赵六"),
+            "与图谱矛盾的句子必须被丢弃：{}",
+            audit.text
+        );
+        assert!(
+            !audit.text.contains("今天天气不错"),
+            "无法形式化的句子不得冒充事实：{}",
+            audit.text
+        );
+        let note = audit.note.expect("应有审计回执");
+        assert!(note.contains("1/3"), "{}", note);
+        assert!(note.contains("未通过 2 句"), "{}", note);
+        assert!(
+            note.contains("张三的师傅是赵六") && note.contains("今天天气不错"),
+            "{}",
+            note
+        );
+    }
+
+    #[test]
+    fn test_generation_audit_accepts_trusted_unparsed_line() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let line = "张三的师傅是李四。";
+        let audit = reasoner.audit_generation(line, &[line.to_string()]);
+        assert_eq!(audit.text, line);
+        assert!(audit.note.unwrap().contains("零幻觉"));
     }
 
     #[test]
