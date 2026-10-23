@@ -13098,6 +13098,32 @@ mod session_tests {
     }
 
     #[test]
+    fn probe_reference_answer_separates_records_from_absence() {
+        let mut reasoner = SymbolicReasoner::new(
+            know_prolog::ReasoningConfig::default(),
+            std::collections::HashMap::new(),
+        );
+        assert_eq!(
+            probe_reference_answer(&reasoner, "苹果", "苹果的颜色是什么"),
+            ProbeStatus::NoAnswer
+        );
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "苹果".to_string(),
+            entity_type: "水果".to_string(),
+            properties: std::collections::HashMap::from([
+                ("name".to_string(), "苹果".to_string()),
+                ("颜色".to_string(), "红色".to_string()),
+            ]),
+        }]);
+        let status = probe_reference_answer(&reasoner, "苹果", "苹果的颜色是什么");
+        assert!(
+            matches!(status, ProbeStatus::Answered(ref values) if !values.is_empty()),
+            "{:?}",
+            status
+        );
+    }
+
+    #[test]
     fn place_degree_question_compiles_to_area() {
         let mut reasoner = SymbolicReasoner::new(
             know_prolog::ReasoningConfig::default(),
