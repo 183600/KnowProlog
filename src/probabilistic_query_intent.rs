@@ -719,11 +719,11 @@ fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<Epistemi
         .find(|cue| cue.kind == CueKind::MostLikely)?;
     let prefix = clean_question(&raw[..cue.start]);
     let suffix = clean_question(&raw[cue.end..]);
-    let suffix = trim_leading_phrases(&suffix, &["是", "为", "成为", "当", "做"]);
+    let suffix = trim_leading_phrases(&suffix, &["的是", "是", "为", "成为", "当", "做"]);
     if suffix.is_empty() {
         return None;
     }
-    // 谁最可能是 X 的 P / 最可能是 X 的 P
+    // 谁最可能是 X 的 P / 最可能是 X 的 P / 最可能的是 X 的 P
     if prefix.is_empty() || prefix == "谁" {
         if let Some((subject, predicate)) = parse_possessive(suffix) {
             if subject != "谁" && !contains_interrogative(&subject) && !contains_interrogative(&predicate)
@@ -792,7 +792,7 @@ fn parse_comparison(raw: &str, cues: &[EpistemicCue]) -> Option<EpistemicTarget>
         return None;
     }
     let suffix = clean_question(&raw[cue.end..]);
-    let suffix = trim_leading_phrases(&suffix, &["是", "为", "成为", "当", "做"]);
+    let suffix = trim_leading_phrases(&suffix, &["的是", "是", "为", "成为", "当", "做"]);
     let (anchor, predicate) = parse_possessive(suffix)?;
     if anchor == "谁" || predicate.is_empty() {
         return None;
@@ -935,6 +935,18 @@ mod tests {
     fn most_likely_ranks_the_objects_of_a_predicate() {
         let intent = ProbabilisticQueryIntent::analyze("谁最可能是李四的师傅").unwrap();
         assert_eq!(intent.mode, EpistemicMode::MostLikely);
+        assert_eq!(
+            intent.target,
+            Some(EpistemicTarget::ObjectsOf {
+                subject: "李四".to_string(),
+                predicate: "师傅".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn most_likely_accepts_the_shi_de_frame() {
+        let intent = ProbabilisticQueryIntent::analyze("最可能的是李四的师傅").unwrap();
         assert_eq!(
             intent.target,
             Some(EpistemicTarget::ObjectsOf {
