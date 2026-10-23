@@ -72,6 +72,7 @@ pub mod knowledge_fusion;
 pub mod knowledge_layers;
 pub mod law_book;
 pub mod lex_gate;
+pub mod lexical_memory;
 pub mod lexical_trace;
 pub mod link_eval;
 pub mod link_prediction;
@@ -4154,6 +4155,45 @@ impl OxigraphManager {
             .collect::<Result<Vec<_>, _>>()?;
         self.perf.bump("pattern_episode_load");
         Ok(pattern_ir::parse_episode_graph(quads.into_iter()))
+    }
+
+    /// 同步词法记忆：清空 `kg:graphs/lexical-memory` 后全量重写
+    /// （幂等；不推进知识版本）。词法证据是账本，不是事实。
+    pub async fn sync_lexical_memory(
+        &self,
+        memory: &lexical_memory::LexicalMemory,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = memory.to_quads()?;
+        let graph =
+            GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("lexical_memory_sync");
+        Ok(memory.len())
+    }
+
+    /// 读取词法记忆（按条目 id 升序，确定性；不触碰任何缓存）。
+    pub async fn load_lexical_memory(
+        &self,
+    ) -> Result<lexical_memory::LexicalMemory, Box<dyn std::error::Error + Send + Sync>> {
+        let graph =
+            GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("lexical_memory_load");
+        Ok(lexical_memory::LexicalMemory::from_quads(
+            quads.into_iter(),
+        ))
     }
 
     /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
