@@ -176,10 +176,10 @@ impl LexicalMemory {
         }
 
         for (index, word) in words.iter().enumerate() {
-            if !is_classifier(word) {
+            let Some(classifier) = classifier_surface(word) else {
                 continue;
-            }
-            if GENERIC_CLASSIFIERS.contains(&word.text.as_str()) {
+            };
+            if GENERIC_CLASSIFIERS.contains(&classifier.as_str()) {
                 summary.skipped_classifiers += 1;
                 continue;
             }
@@ -196,7 +196,7 @@ impl LexicalMemory {
             }
             let key = token_key(next);
             for expected in types {
-                self.record_classifier(&word.text, &expected, turn);
+                self.record_classifier(&classifier, &expected, turn);
                 if let Some(entry) = self.tokens.get_mut(&key) {
                     *entry.type_votes.entry(expected).or_insert(0) += 1;
                 }
@@ -651,8 +651,8 @@ fn is_content_word(word: &AnnotatedWord) -> bool {
     let text = word.text.trim();
     if text.is_empty()
         || !text.chars().any(char::is_alphanumeric)
-        || roles_of(text).contains(&Role::Quantifier)
-        || (crate::function_words::is_registered(text) && !is_classifier(word))
+        || classifier_surface(word).is_some()
+        || crate::function_words::is_registered(text)
     {
         return false;
     }
@@ -667,8 +667,29 @@ fn is_nounish(word: &AnnotatedWord) -> bool {
     word.pos.starts_with('n') || word.pos == "vn"
 }
 
-fn is_classifier(word: &AnnotatedWord) -> bool {
-    word.pos == "q" || roles_of(&word.text).contains(&Role::Quantifier)
+/// 指别/数量前缀：结巴常把「那位」「这家」粘成一个 r 标签的 token。
+const CLASSIFIER_PREFIXES: [char; 7] = ['这', '那', '哪', '每', '某', '几', '数'];
+
+/// 取出量词词面：独立量词直接返回；粘连 token 只在「指别/数量前缀 + 量词」
+/// 形态下剥离后缀（「那位」→「位」），避免把「画家」「国家」误当量词。
+fn classifier_surface(word: &AnnotatedWord) -> Option<String> {
+    let text = word.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if word.pos == "q" || roles_of(text).contains(&Role::Quantifier) {
+        return Some(text.to_string());
+    }
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    if !CLASSIFIER_PREFIXES.contains(&first) {
+        return None;
+    }
+    let suffix: String = chars.collect();
+    if suffix.chars().count() != 1 || !roles_of(&suffix).contains(&Role::Quantifier) {
+        return None;
+    }
+    Some(suffix)
 }
 
 fn infer_word_types(word: &AnnotatedWord) -> Vec<String> {
@@ -808,6 +829,21 @@ mod tests {
             .expect("量词期待应被学习");
         assert_eq!(expectation.expected_type, "人物");
         assert!(!expectation.conflict);
+    }
+
+    #[test]
+    fn glued_demonstrative_classifier_is_recognized() {
+        let mut memory = LexicalMemory::new(16);
+        let words = vec![
+            word("那位", "unknown", TagSource::Unknown),
+            word("教授", "n", TagSource::JiebaTag),
+        ];
+        let summary = memory.observe_annotated(1, &words);
+        assert_eq!(summary.classifiers, 1);
+        assert_eq!(
+            memory.classifier_expectation("位").map(|e| e.expected_type),
+            Some("人物".to_string())
+        );
     }
 
     #[test]

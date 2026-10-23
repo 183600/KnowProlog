@@ -47,7 +47,7 @@ use know_prolog::{
     import_journal::{ImportJournal, JournalLoad},
     knowledge_fusion::{Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel},
     law_book::LawBook,
-    lex_gate, lexical_trace,
+    lex_gate, lexical_memory, lexical_trace,
     link_prediction::{LinkPredictor, Triple as LawTriple},
     load_config_from,
     local_semantic_adapter::LocalSemanticAdapter,
@@ -203,6 +203,22 @@ enum Commands {
         #[arg(long, requires = "lexicon")]
         definitions: Option<String>,
         /// Print the trace/report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or extend the persistent lexical memory: POS evidence and
+    /// classifier→type expectations stored in their own named graph
+    LexicalMemory {
+        /// Text to tokenize and remember (repeatable; each text is one turn)
+        #[arg(long = "learn")]
+        learn: Vec<String>,
+        /// Look up one word or classifier and print its soft type expectation
+        #[arg(long)]
+        query: Option<String>,
+        /// Drop all remembered evidence before applying --learn
+        #[arg(long)]
+        forget: bool,
+        /// Print the report/query as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1302,6 +1318,78 @@ async fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+        }
+        Some(Commands::LexicalMemory {
+            learn,
+            query,
+            forget,
+            json,
+        }) => {
+            let mut memory = match oxigraph_manager.load_lexical_memory().await {
+                Ok(memory) => memory,
+                Err(error) => {
+                    eprintln!("词法记忆读取失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            let previous_turn = memory.turn;
+            if forget {
+                memory = lexical_memory::LexicalMemory::new(memory.capacity);
+                memory.turn = previous_turn;
+            }
+            let mut summaries = Vec::with_capacity(learn.len());
+            for text in &learn {
+                let turn = memory.turn.saturating_add(1);
+                summaries.push(memory.observe_text(turn, text, &config.nlp));
+            }
+            if forget || !learn.is_empty() {
+                if let Err(error) = oxigraph_manager.sync_lexical_memory(&memory).await {
+                    eprintln!("词法记忆写入失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+            if let Some(word) = query {
+                let expectation = memory
+                    .type_expectation(&word)
+                    .or_else(|| memory.classifier_expectation(&word));
+                if json {
+                    let payload = serde_json::json!({
+                        "query": word,
+                        "expectation": expectation,
+                        "tokens": memory.len(),
+                        "classifiers": memory.classifiers.len(),
+                    });
+                    match serde_json::to_string_pretty(&payload) {
+                        Ok(text) => println!("{}", text),
+                        Err(error) => eprintln!("JSON 序列化失败: {}", error),
+                    }
+                } else {
+                    match expectation {
+                        Some(expectation) => println!(
+                            "「{}」→ {}（{}/{}，支持度 {:.2}{}）",
+                            word,
+                            expectation.expected_type,
+                            expectation.votes,
+                            expectation.total,
+                            expectation.confidence(),
+                            if expectation.conflict { "，冲突" } else { "" }
+                        ),
+                        None => println!("「{}」没有词法类型证据。", word),
+                    }
+                }
+            } else if json {
+                let payload = serde_json::json!({
+                    "summary": summaries,
+                    "forgot": forget,
+                    "memory": memory,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => eprintln!("JSON 序列化失败: {}", error),
+                }
+            } else {
+                print!("{}", memory.render_report());
             }
         }
         Some(Commands::Sparql { query, json }) => {

@@ -353,6 +353,58 @@ pub static REGISTRY: &[FunctionWord] = &[
         text: "座",
         roles: &[Role::Quantifier],
     },
+    FunctionWord {
+        text: "家",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "所",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "本",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "部",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "辆",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "台",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "架",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "艘",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "匹",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "头",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "只",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "张",
+        roles: &[Role::Quantifier],
+    },
+    FunctionWord {
+        text: "间",
+        roles: &[Role::Quantifier],
+    },
     // 回指指代
     FunctionWord {
         text: "我",
