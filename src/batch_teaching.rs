@@ -891,10 +891,9 @@ impl BatchTeachingLedger {
                 additions
             ));
         }
-        let mut adopted = Vec::new();
-        for id in selectors {
+        for id in &selectors {
             let latest = self
-                .latest_rule(&id)
+                .latest_rule(id)
                 .ok_or_else(|| format!("找不到规则 {}", id))?;
             if !rule_declared(config, latest) {
                 return Err(format!(
@@ -910,6 +909,9 @@ impl BatchTeachingLedger {
                     latest.reasons.join("；")
                 ));
             }
+        }
+        let mut adopted = Vec::new();
+        for id in selectors {
             for episode in &mut self.episodes {
                 for rule in &mut episode.candidates {
                     if rule.id == id {

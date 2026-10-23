@@ -494,7 +494,8 @@ enum Commands {
     /// Learn attribute extraction rules from seed facts x corpus; only
     /// explicitly adopted rules are persisted and reused by text imports
     BatchTeach {
-        /// Seed facts file (TSV: subject<TAB>predicate<TAB>value[<TAB>entity_type], or JSONL)
+        /// Seed facts file (TSV: subject<TAB>predicate<TAB>value[<TAB>entity_type], or JSONL;
+        /// predicate must name a configured property or its canonical predicate)
         #[arg(long)]
         facts: Option<String>,
         /// Corpus file with natural-language sentences
@@ -521,7 +522,7 @@ enum Commands {
         /// Ledger path (defaults to <store>/batch_teaching.json)
         #[arg(long)]
         ledger: Option<String>,
-        /// List active learned rules and exit (does not open the knowledge store)
+        /// List active rules and pending candidates, then exit (does not open the store)
         #[arg(long)]
         list: bool,
         /// Print the result as JSON
