@@ -39,6 +39,7 @@ use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
 use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
 use crate::law_book::{LawBook, LawStatus};
+use crate::lexical_memory::{LexicalMemory, ObservationSummary, TypeExpectation};
 use crate::lexical_trace::{
     self, LexicalTrace, ReadFailureKind, ReadStage, ReadTraceLedger, TraceFidelity, TraceReceipt,
 };
@@ -1220,6 +1221,8 @@ pub struct SymbolicReasoner {
     nlp_config: Option<NlpConfig>,
     // 有界失败回执（只含 digest/计数/有限枚举，不保存原文，不进会话快照）
     read_traces: ReadTraceLedger,
+    // 跨会话词法记忆：词性来源证据 + 量词→类型期待（软约束；由宿主落图）
+    lexical_memory: LexicalMemory,
     // 引擎层故障通道（Prolog / 存储等下游失败由宿主注入）：
     // 非空时对话管理器走 EngineFault 路径，绝不与「知识里没有」合并。
     engine_fault: Option<String>,
@@ -1284,6 +1287,7 @@ impl Clone for SymbolicReasoner {
             nlp_config: self.nlp_config.clone(),
             // 轨迹不是记忆：分叉会话从空台账开始，避免把上一会话的失败带入
             read_traces: ReadTraceLedger::new(),
+            lexical_memory: self.lexical_memory.clone(),
             engine_fault: self.engine_fault.clone(),
         }
     }
@@ -1486,6 +1490,7 @@ impl SymbolicReasoner {
             perf,
             nlp_config: None,
             read_traces: ReadTraceLedger::new(),
+            lexical_memory: LexicalMemory::default(),
             engine_fault: None,
         };
         reasoner.rebuild_knowledge_caches();
@@ -1518,9 +1523,11 @@ impl SymbolicReasoner {
         let last_goal = self.last_abduction_goal.clone();
         let last_vars = self.last_abduction_vars.clone();
         let engine_fault = self.engine_fault.clone();
+        let lexical_memory = self.lexical_memory.clone();
         let mut fresh =
             Self::with_perf_ledger(self.config.clone(), synonyms, Arc::clone(&self.perf));
         fresh.observe_facts(facts);
+        fresh.lexical_memory = lexical_memory;
         // 快照来自自身：胶囊公理摘要必然通过（除非内存中的快照被外部改写）。
         // 万一被拒，也保留新图谱与其余会话态，不让重建失败丢掉知识。
         let _ = fresh.restore_dialogue_snapshot(&snapshot);
@@ -1618,6 +1625,30 @@ impl SymbolicReasoner {
     pub fn set_nlp_config(&mut self, config: NlpConfig) {
         self.nlp_config = Some(config);
         self.read_traces.clear();
+    }
+
+    /// 恢复跨会话词法记忆（宿主从命名图读取后注入）。
+    pub fn set_lexical_memory(&mut self, memory: LexicalMemory) {
+        self.lexical_memory = memory;
+    }
+
+    /// 当前词法记忆（宿主据此落图）。
+    pub fn lexical_memory(&self) -> &LexicalMemory {
+        &self.lexical_memory
+    }
+
+    /// 观察一轮原文，更新词形证据与量词期待；未注入 NLP 配置时不增加成本。
+    pub fn observe_lexical_text(&mut self, text: &str) -> Option<ObservationSummary> {
+        let config = self.nlp_config.as_ref()?;
+        let turn = self.lexical_memory.turn.saturating_add(1);
+        Some(self.lexical_memory.observe_text(turn, text, config))
+    }
+
+    /// 某个词面的弱类型期待（不写 `rdf:type`，只作软约束）。
+    pub fn lexical_type_expectation(&self, surface: &str) -> Option<TypeExpectation> {
+        self.lexical_memory
+            .type_expectation(surface)
+            .or_else(|| self.lexical_memory.classifier_expectation(surface))
     }
 
     /// 构建一次知识感知的读法轨迹（只读；不执行回答）。
@@ -1825,6 +1856,14 @@ impl SymbolicReasoner {
                 suggested_type: suspect.suggested_type,
             })
             .collect();
+        for oov in &mut trace.oov {
+            if oov.suggested_type.is_some() {
+                continue;
+            }
+            if let Some(expectation) = self.lexical_memory.type_expectation(&oov.text) {
+                oov.suggested_type = Some(expectation.expected_type);
+            }
+        }
     }
 
     /// 失败轮的只读轨迹：有界回执 + 有限枚举指标。成功轮不调用。

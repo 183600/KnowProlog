@@ -5168,6 +5168,21 @@ async fn run_interactive_mode(
     );
     // 读法观测：注入与交互/导入路径相同的 NLP 配置；失败轮才留轨迹。
     symbolic_reasoner.set_nlp_config(config.nlp.clone());
+    // 跨会话词法记忆：从独立命名图恢复词性证据与量词期待（只作软约束）。
+    match oxigraph_manager.load_lexical_memory().await {
+        Ok(memory) if !memory.is_empty() => {
+            println!(
+                "已恢复词法记忆：{} 词条，{} 量词期待（「lexical-memory」查看）。",
+                memory.len(),
+                memory.classifiers.len()
+            );
+            symbolic_reasoner.set_lexical_memory(memory);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("词法记忆读取失败（已忽略，不影响知识库）：{}", error);
+        }
+    }
     // 谓词归一：把画像里的别名/互逆词面同步到查询解析与生成词面。
     // 正向词面走别名（alias → 槽位，可参与生成叙事）；逆向词面只登记
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
@@ -5506,7 +5521,17 @@ async fn run_interactive_mode(
 
     let stdin_reader = std::io::stdin();
     let mut event_dialogue: Option<EventDialogue> = None;
+    let mut lexical_memory_dirty = false;
     loop {
+        if lexical_memory_dirty {
+            let memory = symbolic_reasoner.lexical_memory().clone();
+            match oxigraph_manager.sync_lexical_memory(&memory).await {
+                Ok(_) => lexical_memory_dirty = false,
+                Err(error) => {
+                    eprintln!("词法记忆检查点落图失败（下次重试）：{}", error);
+                }
+            }
+        }
         turns_since_episode_sync += 1;
         if turns_since_episode_sync >= 8 {
             turns_since_episode_sync = 0;
@@ -5545,6 +5570,12 @@ async fn run_interactive_mode(
             println!("{}", interactive_help());
             println!();
             continue;
+        }
+
+        if let Some(summary) = symbolic_reasoner.observe_lexical_text(input) {
+            if summary.tokens > 0 || summary.classifiers > 0 {
+                lexical_memory_dirty = true;
+            }
         }
 
         if let Some(text) = strip_any_prefix(input, &["事件图：", "事件图:"]) {
