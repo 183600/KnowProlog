@@ -32,6 +32,8 @@ pub const DEFAULT_MAX_EVENTS: usize = 256;
 pub const DEFAULT_MAX_LINKS: usize = 2048;
 /// 事件焦点栈的最大深度。
 pub const DEFAULT_FOCUS_DEPTH: usize = 16;
+/// 事件图默认落入的命名图前缀（默认图保持只读，不被事件层改写）。
+pub const EVENT_GRAPH_NS: &str = "http://example.org/kg/eventGraph/";
 
 const CAUSE_MARKERS: &[&str] = &["因为", "由于", "鉴于"];
 const RESULT_MARKERS: &[&str] = &["所以", "因此", "于是", "因而", "故而", "结果"];
@@ -788,6 +790,110 @@ impl EventGraph {
         EventAnswer::answered(EventQuestionKind::Did, primary, focused, implicit, text)
     }
 
+    /// 默认命名图 IRI：按来源文本指纹生成，重复导入可幂等覆盖。
+    pub fn default_graph_iri(&self) -> String {
+        format!("{}{}", EVENT_GRAPH_NS, self.source_fingerprint)
+    }
+
+    /// 事件图 → N-Quads（命名图）。默认图不写，调用方可整图替换。
+    pub fn to_nquads(&self) -> String {
+        self.to_nquads_in_graph(&self.default_graph_iri())
+    }
+
+    pub fn to_nquads_in_graph(&self, graph: &str) -> String {
+        let mut output = String::new();
+        let graph_term = format!("<{}>", graph);
+        for event in &self.events {
+            let event_iri = format!("<{}>", event_iri(&event.id));
+            let mut triples: Vec<(String, String)> = vec![
+                (
+                    format!("<{}>", rdf_type_iri()),
+                    format!("<{}>", event_class_iri()),
+                ),
+                (
+                    format!("<{}>", event_property_iri("type")),
+                    nquad_literal(&event.event_type),
+                ),
+                (
+                    format!("<{}>", event_property_iri("trigger")),
+                    nquad_literal(&event.trigger),
+                ),
+                (
+                    format!("<{}>", event_property_iri("polarity")),
+                    nquad_literal(polarity_key(event.polarity)),
+                ),
+                (
+                    format!("<{}>", event_property_iri("modality")),
+                    nquad_literal(modality_key(event.modality)),
+                ),
+                (
+                    format!("<{}>", event_property_iri("evidence")),
+                    nquad_literal(&event.evidence.sentence),
+                ),
+                (
+                    format!("<{}>", event_property_iri("confidence")),
+                    nquad_literal(&format!("{:.2}", event.confidence)),
+                ),
+            ];
+            for argument in &event.arguments {
+                triples.push((
+                    format!("<{}>", event_property_iri(argument.role.tag())),
+                    nquad_literal(&argument.value),
+                ));
+            }
+            if let Some(time) = event.time_text() {
+                triples.push((
+                    format!("<{}>", event_property_iri("time")),
+                    nquad_literal(&time),
+                ));
+            }
+            let projection_iri = format!("<{}>", event_projection_iri(&event.id));
+            triples.push((
+                format!("<{}>", event_property_iri("projectsTo")),
+                projection_iri.clone(),
+            ));
+            triples.push((
+                format!("<{}>", rdf_type_iri()),
+                format!("<{}>", statement_class_iri()),
+            ));
+            triples.push((
+                format!("<{}>", statement_property_iri("subject")),
+                nquad_literal(&event.projection.subject),
+            ));
+            triples.push((
+                format!("<{}>", statement_property_iri("predicate")),
+                nquad_literal(&event.projection.predicate),
+            ));
+            triples.push((
+                format!("<{}>", statement_property_iri("object")),
+                nquad_literal(&event.projection.object),
+            ));
+            for (predicate, object) in triples {
+                let subject = if predicate == format!("<{}>", rdf_type_iri())
+                    && object == format!("<{}>", statement_class_iri())
+                {
+                    projection_iri.clone()
+                } else {
+                    event_iri.clone()
+                };
+                output.push_str(&format!(
+                    "{} {} {} {} .\n",
+                    subject, predicate, object, graph_term
+                ));
+            }
+        }
+        for link in &self.links {
+            output.push_str(&format!(
+                "<{}> <{}> <{}> {} .\n",
+                event_iri(&link.from),
+                event_link_iri(link.kind),
+                event_iri(&link.to),
+                graph_term
+            ));
+        }
+        output
+    }
+
     /// 事件图 → Prolog 事实行（不含命名图前缀，便于调用方自行决定装载位置）。
     pub fn to_prolog_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
@@ -916,6 +1022,70 @@ fn render_arguments_key(arguments: &[EventArgument]) -> String {
         .map(|argument| format!("{}:{}", argument.role.tag(), argument.value))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn event_iri(id: &str) -> String {
+    format!(
+        "http://example.org/kg/event/{}",
+        id.strip_prefix("evt:").unwrap_or(id)
+    )
+}
+
+fn event_projection_iri(id: &str) -> String {
+    format!(
+        "http://example.org/kg/event-projection/{}",
+        id.strip_prefix("evt:").unwrap_or(id)
+    )
+}
+
+fn event_property_iri(name: &str) -> String {
+    format!("http://example.org/kg/event#{}", name)
+}
+
+fn event_link_iri(kind: EventLinkKind) -> String {
+    format!("http://example.org/kg/event#{}", kind.tag())
+}
+
+fn event_class_iri() -> String {
+    "http://example.org/kg/event#Event".to_string()
+}
+
+fn rdf_type_iri() -> String {
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string()
+}
+
+fn statement_class_iri() -> String {
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#Statement".to_string()
+}
+
+fn statement_property_iri(name: &str) -> String {
+    format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{}", name)
+}
+
+fn modality_key(modality: Modality) -> &'static str {
+    match modality {
+        Modality::Asserted => "asserted",
+        Modality::Possible => "possible",
+        Modality::Necessary => "necessary",
+        Modality::Uncertain => "uncertain",
+    }
+}
+
+fn nquad_literal(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len() + 2);
+    escaped.push('"');
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn event_start_ordinal(event: &EventNode) -> Option<i64> {
@@ -2137,6 +2307,24 @@ mod tests {
         assert_eq!(next.status, EventAnswerStatus::Answered, "{:?}", next);
         assert!(next.answer.contains("加入"), "{:?}", next);
         assert!(dialogue.focus().ids().len() >= 2);
+    }
+
+    #[test]
+    fn nquads_materialize_only_into_a_named_event_graph() {
+        let graph = EventGraph::build("1991年，张三认识李四。");
+        let nquads = graph.to_nquads();
+        let graph_iri = graph.default_graph_iri();
+        assert!(nquads.contains(&graph_iri));
+        assert!(nquads.contains("event#Event"));
+        assert!(nquads.contains("rdf-syntax-ns#Statement"));
+        assert!(nquads.contains("event#projectsTo"));
+        assert!(nquads
+            .lines()
+            .all(|line| line.trim_end().ends_with(&format!("<{}> .", graph_iri))));
+        let custom = graph.to_nquads_in_graph("http://example.org/custom");
+        assert!(custom
+            .lines()
+            .all(|line| line.ends_with("<http://example.org/custom> .")));
     }
 
     #[test]

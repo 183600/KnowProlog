@@ -487,6 +487,13 @@ enum Commands {
         /// Also print the event graph as Prolog facts
         #[arg(long)]
         prolog: bool,
+        /// Print only the event graph as N-Quads in a named graph
+        /// (default graph untouched; conflicts with --question/--json)
+        #[arg(long, conflicts_with_all = ["question", "json"])]
+        nquads: bool,
+        /// Named graph IRI for --nquads (default: derived from the source fingerprint)
+        #[arg(long, requires = "nquads")]
+        graph: Option<String>,
     },
     /// Learn surface patterns from seed facts x corpus and propose new graph
     /// candidates with evidence families and ordinal confidence (read-only)
@@ -1098,6 +1105,8 @@ async fn main() {
             limit,
             json,
             prolog,
+            nquads,
+            graph,
         }) => {
             run_events(
                 text.as_deref(),
@@ -1106,6 +1115,8 @@ async fn main() {
                 *limit,
                 *json,
                 *prolog,
+                *nquads,
+                graph.as_deref(),
             );
             return;
         }
@@ -3766,6 +3777,8 @@ fn run_events(
     limit: usize,
     json: bool,
     prolog: bool,
+    nquads: bool,
+    graph_iri: Option<&str>,
 ) {
     let source = match (text, file) {
         (Some(text), _) => text.to_string(),
@@ -3790,6 +3803,19 @@ fn run_events(
         std::process::exit(2);
     }
     let graph = EventGraph::build_with_limits(&source, limit);
+    if nquads {
+        let rendered = match graph_iri {
+            Some(iri) if !iri.trim().is_empty() => graph.to_nquads_in_graph(iri.trim()),
+            _ => graph.to_nquads(),
+        };
+        print!("{}", rendered);
+        if prolog {
+            for line in graph.to_prolog_lines() {
+                println!("{}", line);
+            }
+        }
+        return;
+    }
     if let Some(question) = question {
         let questions: Vec<&str> = question
             .lines()
