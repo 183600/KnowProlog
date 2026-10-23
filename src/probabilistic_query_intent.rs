@@ -171,8 +171,12 @@ pub struct ProbabilisticQueryIntent {
     pub core_question: String,
     /// 结构化目标；无法结构化时为 `None`，由调用方用 `core_question` 兜底。
     pub target: Option<EpistemicTarget>,
-    /// 判定「可能/确定」时使用的阈值；概率值问固定为 0.5 仅作展示。
+    /// 判定「可能/确定」时使用的阈值；用户显式给出时采用其值。
     pub threshold: f64,
+    /// 阈值是否来自用户明写的「超过/低于 80%」等表达式。
+    pub threshold_explicit: bool,
+    /// 显式阈值的方向：true 表示「至少/超过」，false 表示「至多/低于」。
+    pub threshold_at_least: bool,
 }
 
 impl ProbabilisticQueryIntent {
@@ -197,7 +201,11 @@ impl ProbabilisticQueryIntent {
             .any(|cue| cue.negated);
         let core_question = normalize_core(&text, &cues, mode);
         let target = extract_target(&text, &cues, mode);
-        let threshold = threshold_for(mode, &cues, negated);
+        let (threshold, threshold_explicit, threshold_at_least) =
+            match parse_threshold_expression(&text) {
+                Some((value, at_least)) => (value, true, at_least),
+                None => (threshold_for(mode, &cues, negated), false, true),
+            };
         Some(Self {
             mode,
             confidence,
@@ -207,6 +215,8 @@ impl ProbabilisticQueryIntent {
             core_question,
             target,
             threshold,
+            threshold_explicit,
+            threshold_at_least,
         })
     }
 
@@ -251,6 +261,11 @@ impl ProbabilisticQueryIntent {
             EpistemicMode::Possibility => {
                 format!("可能算子：取 P ≥ {:.2} 的候选", self.threshold)
             }
+            EpistemicMode::Probability if self.threshold_explicit => format!(
+                "概率阈值算子：检查 P {} {:.2}",
+                if self.threshold_at_least { "≥" } else { "≤" },
+                self.threshold
+            ),
             EpistemicMode::Probability => "概率算子：返回基原子的精确 P".to_string(),
             EpistemicMode::MostLikely => "最可能算子：在候选上取 P 的 argmax".to_string(),
             EpistemicMode::Certainty => {
@@ -280,6 +295,147 @@ fn threshold_for(mode: EpistemicMode, cues: &[EpistemicCue], negated: bool) -> f
         }
         _ => 0.50,
     }
+}
+
+/// 用户明写的概率阈值：「概率超过 80%」「可能性不低于百分之八十」「八成以上」。
+/// 返回 `(阈值, 是否要求 P ≥ 阈值)`。
+///
+/// 只在已识别出情态线索后调用；没有数字时返回 None，沿用情态默认阈值。
+fn parse_threshold_expression(text: &str) -> Option<(f64, bool)> {
+    const UPPER: [&str; 10] = [
+        "不低于", "不小于", "至少", "超过", "大于", "高于", "达到", "以上", "≥", ">=",
+    ];
+    const LOWER: [&str; 10] = [
+        "不超过", "不大于", "至多", "低于", "小于", "不足", "不到", "以下", "≤", "<=",
+    ];
+    let mut marker: Option<(usize, usize, bool)> = None;
+    for (list, at_least) in [(UPPER.as_slice(), true), (LOWER.as_slice(), false)] {
+        for phrase in list {
+            if let Some(position) = text.find(phrase) {
+                let candidate = (position, phrase.len(), at_least);
+                if marker.map_or(true, |current| candidate.0 < current.0) {
+                    marker = Some(candidate);
+                }
+            }
+        }
+    }
+    let Some((position, length, at_least)) = marker else {
+        // 没有比较词时，「八成」「80%」这类明写概率仍然比默认阈值更具体；
+        // 只有确实出现概率表达式才标记为显式。
+        if text.contains(['%', '％', '成']) || text.contains("百分之") {
+            return parse_probability_value(text).map(|value| (value, true));
+        }
+        return None;
+    };
+    let after = &text[position + length..];
+    parse_probability_value(after)
+        .or_else(|| parse_probability_value(text))
+        .map(|value| (value, at_least))
+}
+
+/// 支持 `80%`、`0.8`、`百分之八十`、`八成` 四种常见写法。
+fn parse_probability_value(text: &str) -> Option<f64> {
+    if let Some(position) = text.find("百分之") {
+        let raw = &text[position + "百分之".len()..];
+        if let Some(number) = parse_chinese_number(raw) {
+            return Some((number / 100.0).clamp(0.0, 1.0));
+        }
+    }
+    if let Some(position) = text.find(['%', '％']) {
+        let prefix = &text[..position];
+        let digits: String = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(number) = digits.parse::<f64>() {
+            return Some((number / 100.0).clamp(0.0, 1.0));
+        }
+    }
+    if let Some(position) = text.find('成') {
+        let prefix = &text[..position];
+        let numeral: String = prefix
+            .chars()
+            .rev()
+            .take_while(|ch| {
+                ch.is_ascii_digit()
+                    || *ch == '.'
+                    || matches!(ch, '零' | '一' | '二' | '两' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百')
+            })
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Some(number) = parse_chinese_number(&numeral) {
+            return Some((number / 10.0).clamp(0.0, 1.0));
+        }
+    }
+    // 小数直接当作概率；大于 1 的裸数字（如「超过 80」）按百分数理解。
+    let digits: String = text
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit() && *ch != '.')
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    let number = digits.parse::<f64>().ok()?;
+    if number > 1.0 {
+        Some((number / 100.0).clamp(0.0, 1.0))
+    } else {
+        Some(number.clamp(0.0, 1.0))
+    }
+}
+
+fn parse_chinese_number(text: &str) -> Option<f64> {
+    fn digit(ch: char) -> Option<i32> {
+        Some(match ch {
+            '零' => 0,
+            '一' => 1,
+            '二' | '两' => 2,
+            '三' => 3,
+            '四' => 4,
+            '五' => 5,
+            '六' => 6,
+            '七' => 7,
+            '八' => 8,
+            '九' => 9,
+            _ => return None,
+        })
+    }
+    let mut total = 0i32;
+    let mut current = 0i32;
+    let mut seen = false;
+    for ch in text.chars() {
+        if let Some(value) = digit(ch) {
+            current = value;
+            seen = true;
+            continue;
+        }
+        match ch {
+            '十' => {
+                if current == 0 {
+                    current = 1;
+                }
+                total += current * 10;
+                current = 0;
+                seen = true;
+            }
+            '百' => {
+                if current == 0 {
+                    current = 1;
+                }
+                total += current * 100;
+                current = 0;
+                seen = true;
+            }
+            _ => break,
+        }
+    }
+    if !seen {
+        return None;
+    }
+    Some((total + current) as f64)
 }
 
 /// 线索目录：先匹配长词，再匹配短词。只收录明确的框架，宁可漏检不可误检。
@@ -1146,6 +1302,33 @@ mod tests {
                 predicate: "师傅".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn explicit_threshold_parses_percent_and_direction() {
+        let upper =
+            ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率超过百分之八十吗").unwrap();
+        assert!(upper.threshold_explicit);
+        assert!(upper.threshold_at_least);
+        assert!((upper.threshold - 0.80).abs() < 1e-9, "{}", upper.threshold);
+
+        let lower =
+            ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率低于80%吗").unwrap();
+        assert!(lower.threshold_explicit);
+        assert!(!lower.threshold_at_least);
+        assert!((lower.threshold - 0.80).abs() < 1e-9, "{}", lower.threshold);
+
+        let cheng = ProbabilisticQueryIntent::analyze("李四有八成的可能是王五的师傅").unwrap();
+        assert!(cheng.threshold_explicit);
+        assert!((cheng.threshold - 0.80).abs() < 1e-9, "{}", cheng.threshold);
+    }
+
+    #[test]
+    fn plain_probability_question_keeps_the_default_threshold() {
+        let intent =
+            ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率是多少").unwrap();
+        assert!(!intent.threshold_explicit);
+        assert!((intent.threshold - 0.50).abs() < 1e-9);
     }
 
     #[test]

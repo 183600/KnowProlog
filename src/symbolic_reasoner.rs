@@ -12958,54 +12958,74 @@ impl SymbolicReasoner {
                 "  来源：当前概率程序中没有该原子的证明（图谱是开放世界，P=0 表示在此程序中不可证，不表示现实一定为假）\n",
             );
         }
-        match intent.mode {
-            EpistemicMode::Certainty => {
-                let confirmed = probability >= intent.threshold;
-                output.push_str(&format!(
-                    "  确定检查：P={:.3} {} 阈值 {:.2} → {}\n",
-                    probability,
-                    if confirmed { "≥" } else { "<" },
-                    intent.threshold,
-                    if confirmed {
-                        "可以确认"
-                    } else {
-                        "不足以确认，只能保留为可能"
-                    }
-                ));
+        if intent.threshold_explicit {
+            let met = if intent.threshold_at_least {
+                probability >= intent.threshold
+            } else {
+                probability <= intent.threshold
+            };
+            output.push_str(&format!(
+                "  显式阈值检查：P={:.3} {} {:.2} → {}\n",
+                probability,
+                if intent.threshold_at_least { "≥" } else { "≤" },
+                intent.threshold,
+                if met { "条件成立" } else { "条件不成立" }
+            ));
+            if intent.mode == EpistemicMode::Probability {
+                output.push_str(
+                    "  概率值问：以上为基原子的精确概率；理解置信度与知识概率分账展示。\n",
+                );
             }
-            EpistemicMode::Possibility if intent.negated => {
-                let consistent = probability <= intent.threshold;
-                output.push_str(&format!(
-                    "  否定可能检查：P={:.3} {} 阈值 {:.2} → {}\n",
-                    probability,
-                    if consistent { "≤" } else { ">" },
-                    intent.threshold,
-                    if consistent {
-                        "与「不可能」一致"
-                    } else {
-                        "概率并不低，不能断言「不可能」"
-                    }
-                ));
+        } else {
+            match intent.mode {
+                EpistemicMode::Certainty => {
+                    let confirmed = probability >= intent.threshold;
+                    output.push_str(&format!(
+                        "  确定检查：P={:.3} {} 阈值 {:.2} → {}\n",
+                        probability,
+                        if confirmed { "≥" } else { "<" },
+                        intent.threshold,
+                        if confirmed {
+                            "可以确认"
+                        } else {
+                            "不足以确认，只能保留为可能"
+                        }
+                    ));
+                }
+                EpistemicMode::Possibility if intent.negated => {
+                    let consistent = probability <= intent.threshold;
+                    output.push_str(&format!(
+                        "  否定可能检查：P={:.3} {} 阈值 {:.2} → {}\n",
+                        probability,
+                        if consistent { "≤" } else { ">" },
+                        intent.threshold,
+                        if consistent {
+                            "与「不可能」一致"
+                        } else {
+                            "概率并不低，不能断言「不可能」"
+                        }
+                    ));
+                }
+                EpistemicMode::Possibility => {
+                    let reached = probability >= intent.threshold;
+                    output.push_str(&format!(
+                        "  可能阈值：P={:.3} {} τ={:.2} → {}\n",
+                        probability,
+                        if reached { "≥" } else { "<" },
+                        intent.threshold,
+                        if reached {
+                            "进入可能候选"
+                        } else {
+                            "低于阈值，只能算弱可能"
+                        }
+                    ));
+                }
+                EpistemicMode::Probability => {
+                    output.push_str("  概率值问：以上为基原子的精确概率；理解置信度与知识概率分账展示。\n");
+                }
+                EpistemicMode::MostLikely => {}
+                EpistemicMode::Plain | EpistemicMode::Comparison => {}
             }
-            EpistemicMode::Possibility => {
-                let reached = probability >= intent.threshold;
-                output.push_str(&format!(
-                    "  可能阈值：P={:.3} {} τ={:.2} → {}\n",
-                    probability,
-                    if reached { "≥" } else { "<" },
-                    intent.threshold,
-                    if reached {
-                        "进入可能候选"
-                    } else {
-                        "低于阈值，只能算弱可能"
-                    }
-                ));
-            }
-            EpistemicMode::Probability => {
-                output.push_str("  概率值问：以上为基原子的精确概率；理解置信度与知识概率分账展示。\n");
-            }
-            EpistemicMode::MostLikely => {}
-            EpistemicMode::Plain | EpistemicMode::Comparison => {}
         }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
         Some(output.trim_end().to_string())
@@ -21566,6 +21586,27 @@ types = [
             .expect("「谁的师傅」应查反主宾的候选");
         assert!(answer.contains("最可能：张三"), "{}", answer);
         assert!(!answer.contains("最可能：王五"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_explicit_threshold_compares_in_the_requested_direction() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let met = reasoner
+            .answer("李四的师傅是王五的概率超过百分之八十吗")
+            .expect("显式阈值问应可回答");
+        assert!(met.contains("显式阈值检查"), "{}", met);
+        assert!(met.contains("P=1.000 ≥ 0.80"), "{}", met);
+        assert!(met.contains("条件成立"), "{}", met);
+        let missed = reasoner
+            .answer("李四的师傅是张三的概率超过百分之八十吗")
+            .expect("显式阈值问应可回答");
+        assert!(missed.contains("条件不成立"), "{}", missed);
+        let below = reasoner
+            .answer("李四的师傅是张三的概率低于80%吗")
+            .expect("下界方向也应可回答");
+        assert!(below.contains("P=0.000 ≤ 0.80"), "{}", below);
+        assert!(below.contains("条件成立"), "{}", below);
     }
 
     #[test]
