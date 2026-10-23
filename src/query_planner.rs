@@ -178,6 +178,9 @@ impl QueryPlanner {
         if let Some(plan) = self.parse_similar(&q) {
             return Some(plan);
         }
+        if let Some(plan) = self.parse_inverse_possessive(&q) {
+            return Some(plan);
+        }
         if let Some(plan) = self.parse_which_relations(&q) {
             return Some(plan);
         }
@@ -660,6 +663,31 @@ impl QueryPlanner {
             }
         }
         self.parse_predicate_object_plan(q)
+    }
+
+    /// 「张三是谁的徒弟」与「谁的徒弟是张三」是同一个反查主体计划，
+    /// 只是把已知主体放到了系词左边。只接受「实体 + 是谁的 + 谓词」这种
+    /// 完整框架：实体或谓词含疑问词/多跳链时交回普通解析，避免把
+    /// 「李四的师傅是谁的徒弟」误读成单个实体反查。
+    fn parse_inverse_possessive(&self, q: &str) -> Option<QueryPlan> {
+        let (entity, predicate) = q
+            .split_once("是谁的")
+            .or_else(|| q.split_once("是哪位的"))?;
+        let entity = Self::clean_name(entity);
+        let predicate = Self::clean_name(predicate);
+        if entity.is_empty()
+            || predicate.is_empty()
+            || entity.contains('的')
+            || predicate.contains('的')
+            || Self::is_question_word(&entity)
+            || Self::is_question_word(&predicate)
+        {
+            return None;
+        }
+        Some(QueryPlan::FindSubject {
+            object: entity,
+            predicate,
+        })
     }
 
     /// 「身高是226的人是谁」把谓词放在句首：与「谁的身高是226」
@@ -1685,6 +1713,31 @@ mod tests {
                 object: "李四".to_string(),
                 predicate: "师傅".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn inverse_possessive_question_compiles_to_subject_lookup() {
+        for question in ["张三是谁的徒弟", "张三是哪位的徒弟？"] {
+            let plan = planner()
+                .parse(question)
+                .unwrap_or_else(|| panic!("应编译为反查主体：{}", question));
+            assert_eq!(
+                plan,
+                QueryPlan::FindSubject {
+                    object: "张三".to_string(),
+                    predicate: "徒弟".to_string()
+                },
+                "{}",
+                question
+            );
+        }
+        assert!(
+            !matches!(
+                planner().parse("李四的师傅是谁的徒弟"),
+                Some(QueryPlan::FindSubject { .. })
+            ),
+            "多跳链不应被压成单个实体反查"
         );
     }
 
