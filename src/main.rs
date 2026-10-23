@@ -3302,7 +3302,24 @@ async fn run_batch_import(
         None
     } else {
         match manager.save_knowledge_with_receipt(items.clone()).await {
-            Ok(receipt) => Some(receipt),
+            Ok(receipt) => {
+                if receipt.can_undo() {
+                    let journal_path = format!("{}/import_journal.json", store_path);
+                    let mut journal = match ImportJournal::load(&journal_path) {
+                        JournalLoad::Loaded(journal) => journal,
+                        JournalLoad::Missing => ImportJournal::new(),
+                        JournalLoad::Damaged(error) => {
+                            eprintln!("导入日志损坏（{}），本轮按空日志重建：{}", journal_path, error);
+                            ImportJournal::new()
+                        }
+                    };
+                    journal.push(receipt.clone());
+                    if let Err(error) = journal.save(&journal_path) {
+                        eprintln!("批量导入已写入，但保存导入日志失败：{}", error);
+                    }
+                }
+                Some(receipt)
+            }
             Err(error) => {
                 eprintln!("批量导入写入知识库失败：{}", error);
                 std::process::exit(1);
