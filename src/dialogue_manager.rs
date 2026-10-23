@@ -31,9 +31,13 @@ use crate::identity_dialogue::{
     self, IdentityAct, IdentityCard, IdentityStatus, UserIdentityLedger,
 };
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
+use crate::probabilistic_query_intent::{
+    EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
+};
 use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
 use crate::quality::{ClaimWarrant, QualityIndex};
 use crate::query_board::QueryBoard;
+use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::recovery::{self, PendingKind, RecoveryMode, RecoveryRequest, RecoveryState};
 use crate::recovery::{RecoveryNomination, ReframedReading, VerificationOutcome};
 use crate::symbolic_reasoner::SymbolicReasoner;
@@ -155,6 +159,10 @@ pub struct DialogueManagerSnapshot {
     /// 用户身份台账：只存用户明确自述的名字；空态省略，旧快照字节不变。
     #[serde(default, skip_serializing_if = "UserIdentityLedger::is_empty")]
     pub identity: UserIdentityLedger,
+    /// 上一轮情态问句的算子与槽位：让「那王五呢」沿用「可能/最可能」，
+    /// 而不是退化成一次普通身份追问。空态省略，旧快照字节不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_followup: Option<EpistemicFollowup>,
 }
 
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
@@ -617,6 +625,189 @@ const GREETINGS: [&str; 12] = [
     "在吗",
 ];
 
+/// 多轮情态承接的记忆：只保存重建问句所需的算子与槽位，不保存答案。
+///
+/// 这是对话状态而非知识状态：它绝不能参与事实概率计算，也不能替代
+/// `ProbabilisticQueryIntent` 对当前轮的理解。它的唯一用途是当用户说
+/// 「那王五呢」时，把上一轮的情态算子与谓词槽位重新施加到新实体上。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpistemicFollowup {
+    /// [`EpistemicMode::code`] 的字符串形式（快照可读、可审计）。
+    pub mode: String,
+    /// 基原子问句的固定主语；ranking 问句的主语槽位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub predicate: String,
+    /// 基原子问句的固定宾语；`SubjectsOf` 的宾语槽位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub negated: bool,
+    /// true：候选排序（`ObjectsOf` / `SubjectsOf`）；false：基原子。
+    #[serde(default)]
+    pub ranking: bool,
+}
+
+impl EpistemicFollowup {
+    fn from_intent(intent: &ProbabilisticQueryIntent) -> Option<Self> {
+        let mode = intent.mode.code().to_string();
+        match &intent.target {
+            Some(EpistemicTarget::GroundClaim(claim)) => Some(Self {
+                mode,
+                subject: Some(claim.subject.clone()),
+                predicate: claim.predicate.clone(),
+                object: Some(claim.object.clone()),
+                negated: claim.negated,
+                ranking: false,
+            }),
+            Some(EpistemicTarget::ObjectsOf { subject, predicate }) => Some(Self {
+                mode,
+                subject: Some(subject.clone()),
+                predicate: predicate.clone(),
+                object: None,
+                negated: false,
+                ranking: true,
+            }),
+            Some(EpistemicTarget::SubjectsOf { object, predicate }) => Some(Self {
+                mode,
+                subject: None,
+                predicate: predicate.clone(),
+                object: Some(object.clone()),
+                negated: false,
+                ranking: true,
+            }),
+            // 比较问需要同时替换两个具名候选，单实体省略无法无歧义补全。
+            Some(EpistemicTarget::Comparison { .. }) => None,
+            None => Self::from_core(&intent.core_question, mode),
+        }
+    }
+
+    /// 情态层只抽出了算子、没抽出目标时，用与推理器相同的 QueryPlanner
+    /// 读指称计划；只接受单跳目标，多跳链留给普通管线。
+    fn from_core(question: &str, mode: String) -> Option<Self> {
+        let plan = QueryPlanner::new().parse(question)?;
+        match plan {
+            QueryPlan::FindObject { segments } if segments.len() == 2 => Some(Self {
+                mode,
+                subject: Some(segments[0].clone()),
+                predicate: segments[1].clone(),
+                object: None,
+                negated: false,
+                ranking: true,
+            }),
+            QueryPlan::FindObjectByPredicate { subject, predicate } => Some(Self {
+                mode,
+                subject: Some(subject),
+                predicate,
+                object: None,
+                negated: false,
+                ranking: true,
+            }),
+            QueryPlan::FindSubject { object, predicate } => Some(Self {
+                mode,
+                subject: None,
+                predicate,
+                object: Some(object),
+                negated: false,
+                ranking: true,
+            }),
+            QueryPlan::CheckTriple {
+                subject_segments,
+                object,
+            } if subject_segments.len() == 2 => Some(Self {
+                mode,
+                subject: Some(subject_segments[0].clone()),
+                predicate: subject_segments[1].clone(),
+                object: Some(object),
+                negated: false,
+                ranking: false,
+            }),
+            QueryPlan::CheckRelation {
+                subject,
+                predicate,
+                object,
+                negated,
+            } => Some(Self {
+                mode,
+                subject: Some(subject),
+                predicate,
+                object: Some(object),
+                negated,
+                ranking: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// 把新实体代回上一轮槽位，重建一条完整情态问句。
+    fn render_followup(&self, entity: &str) -> Option<String> {
+        let mode = EpistemicMode::from_code(&self.mode)?;
+        let predicate = self.predicate.trim();
+        if predicate.is_empty() {
+            return None;
+        }
+        if self.ranking {
+            if self.subject.is_some() {
+                return match mode {
+                    EpistemicMode::Possibility => {
+                        Some(format!("{}的{}可能是谁", entity, predicate))
+                    }
+                    EpistemicMode::MostLikely => {
+                        Some(format!("谁最可能是{}的{}", entity, predicate))
+                    }
+                    _ => None,
+                };
+            }
+            if self.object.is_some() {
+                return match mode {
+                    EpistemicMode::Possibility => {
+                        Some(format!("{}可能是谁的{}", entity, predicate))
+                    }
+                    EpistemicMode::MostLikely => {
+                        Some(format!("{}最可能是谁的{}", entity, predicate))
+                    }
+                    _ => None,
+                };
+            }
+            return None;
+        }
+        let subject = self.subject.as_deref()?;
+        let negated = self.negated;
+        match mode {
+            EpistemicMode::Probability => Some(format!(
+                "{}有多大的可能{}是{}的{}",
+                subject,
+                if negated { "不" } else { "" },
+                entity,
+                predicate
+            )),
+            EpistemicMode::Certainty => Some(format!(
+                "{}{}{}的{}吗",
+                subject,
+                if negated { "一定不是" } else { "一定是" },
+                entity,
+                predicate
+            )),
+            EpistemicMode::Possibility => Some(format!(
+                "{}{}{}的{}吗",
+                subject,
+                if negated { "不可能" } else { "可能" },
+                entity,
+                predicate
+            )),
+            EpistemicMode::MostLikely => Some(format!(
+                "{}{}{}的{}吗",
+                subject,
+                if negated { "最不可能" } else { "最可能" },
+                entity,
+                predicate
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// 本体化对话管理器。
 pub struct DialogueManager {
     turns: Vec<DialogueTurn>,
@@ -653,6 +844,8 @@ pub struct DialogueManager {
     references: BindingLedger,
     /// 用户身份台账（随快照持久化；不写入图谱）。
     identity: UserIdentityLedger,
+    /// 上一轮情态问句的算子与槽位（随快照持久化）。
+    epistemic_followup: Option<EpistemicFollowup>,
     /// 最近一次身份卡（运行时只读视图，不进快照）。
     last_identity_card: Option<IdentityCard>,
     /// 待回答的歧义澄清请求（不持久化；恢复会话后需重新提问）。
@@ -690,6 +883,7 @@ impl DialogueManager {
             frame_memory: FrameMemory::new(),
             references: BindingLedger::new(),
             identity: UserIdentityLedger::new(),
+            epistemic_followup: None,
             last_identity_card: None,
             pending_reference: None,
             reference_resolver: ContextualResolver::new(),
@@ -1184,6 +1378,7 @@ impl DialogueManager {
             frames: (!self.frame_memory.is_empty()).then(|| self.frame_memory.clone()),
             references: self.references.clone(),
             identity: self.identity.clone(),
+            epistemic_followup: self.epistemic_followup.clone(),
         }
     }
 
@@ -1199,6 +1394,7 @@ impl DialogueManager {
         self.frame_memory = snapshot.frames.clone().unwrap_or_default();
         self.references = snapshot.references.clone();
         self.identity = snapshot.identity.clone();
+        self.epistemic_followup = snapshot.epistemic_followup.clone();
         self.last_identity_card = None;
         self.pending_reference = None;
     }
@@ -1237,6 +1433,107 @@ impl DialogueManager {
         self.restore_from_path_report(path).is_ok()
     }
 
+    /// 记录上一轮情态问句的算子与槽位；只保存可回答的已知实体问句。
+    fn remember_epistemic_followup(&mut self, input: &str, knowledge: &dyn DialogueKnowledge) {
+        let Some(intent) = ProbabilisticQueryIntent::analyze(input) else {
+            return;
+        };
+        let Some(memory) = EpistemicFollowup::from_intent(&intent) else {
+            self.epistemic_followup = None;
+            return;
+        };
+        let anchors = [memory.subject.as_deref(), memory.object.as_deref()];
+        if anchors
+            .into_iter()
+            .flatten()
+            .any(|entity| !knowledge.known_entity(entity))
+        {
+            self.epistemic_followup = None;
+            return;
+        }
+        self.epistemic_followup = Some(memory);
+    }
+
+    /// 「那王五呢」：沿用上一轮的情态算子与谓词槽位，换掉锚点实体。
+    ///
+    /// 只接受「(那/换成)? 实体 呢」这种纯省略，不接「那王五的师傅呢」这类
+    /// 新属性问句；重建后还会再跑一次 PQI，确认情态没有被模板降级。
+    fn plan_epistemic_followup(
+        &mut self,
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<DialogueReply> {
+        let memory = self.epistemic_followup.clone()?;
+        let entity = Self::epistemic_followup_entity(input, knowledge)?;
+        let question = memory.render_followup(&entity)?;
+        let intent = ProbabilisticQueryIntent::analyze(&question)?;
+        let mode = EpistemicMode::from_code(&memory.mode)?;
+        if intent.mode != mode {
+            return None;
+        }
+        let text = knowledge
+            .answer_certain(&question)
+            .or_else(|| knowledge.answer(&question))?;
+        let plan = vec!["epistemic_followup".to_string(), memory.mode.clone()];
+        let provenance = vec![format!("承接上一轮{}：{}", mode.label(), question)];
+        self.turns.push(DialogueTurn {
+            index: self.turns.len() + 1,
+            user: input.trim().to_string(),
+            kind: MoveKind::AskBinary,
+            entity: Some(entity.clone()),
+            attribute: Some(memory.predicate.clone()),
+            answer_excerpt: Some(excerpt(&text, 40)),
+            provenance,
+            plan: plan.clone(),
+            warrant: None,
+            kb_revision: Some(knowledge.revision()),
+        });
+        self.push_focus(&entity);
+        self.last_reply = plan.clone();
+        if self.externals.last().map(String::as_str) == Some(input.trim()) {
+            self.externals.pop();
+        }
+        self.remember_epistemic_followup(&question, knowledge);
+        Some(DialogueReply {
+            text,
+            plan,
+            kind: MoveKind::AskBinary,
+            derivation: None,
+        })
+    }
+
+    fn epistemic_followup_entity(
+        input: &str,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<String> {
+        let stripped = input
+            .trim()
+            .trim_end_matches(['？', '?', '！', '!', '。', '.', '，', ',', ' '])
+            .trim();
+        let mut body = stripped.strip_suffix('呢')?.trim();
+        let mut marked = false;
+        for prefix in ["如果换成", "要是换成", "那换成", "换成", "换为", "那么", "那"] {
+            if let Some(rest) = body.strip_prefix(prefix) {
+                body = rest.trim();
+                marked = true;
+            }
+        }
+        // 裸「王五呢」仍交给普通省略/身份管线；只有明确的承接标记
+        //（那/那么/换成…）才把它读成上一轮情态问句的换槽。
+        if !marked || body.is_empty()
+            || body.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '谁' | '什' | '么' | '哪' | '吗' | '的' | '是' | '怎' | '几' | '多' | '？' | '?'
+                )
+            })
+        {
+            return None;
+        }
+        let entities = knowledge.entities_in(body);
+        (entities.len() == 1 && entities[0] == body).then(|| body.to_string())
+    }
+
     /// 纯对话行为（元话语 / 续聊 / 展开 / 寒暄）：可在管线早段拦截。
     ///
     /// 恢复模式开启时，先尝试结算挂账（「是/不是」确认推测、具体线索关闭澄清），
@@ -1247,6 +1544,10 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
+        if let Some(reply) = self.plan_epistemic_followup(input, knowledge) {
+            return Some(reply);
+        }
+        self.remember_epistemic_followup(input, knowledge);
         if let Some(reply) = self.plan_identity_dialogue(input, knowledge) {
             return Some(reply);
         }
@@ -1425,6 +1726,10 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
+        if let Some(reply) = self.plan_epistemic_followup(input, knowledge) {
+            return Some(reply);
+        }
+        self.remember_epistemic_followup(input, knowledge);
         // 「A 是 B 的 C」交给蕴含/校验管线；指代重写会把 A 误当成待消解
         // 的称谓并改写成「B 的 C」，从而翻转判断方向。
         if is_entity_copula_relation_statement(input, knowledge) {
@@ -4308,6 +4613,64 @@ mod tests {
         let mut manager = DialogueManager::new();
         assert!(manager
             .plan_reply("诸葛亮的身高是多少", &knowledge)
+            .is_none());
+        assert_eq!(manager.turn_count(), 0);
+    }
+
+    #[test]
+    fn test_epistemic_followup_keeps_mode_and_predicate() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("李四", &[])
+            .with_entity("王五", &[])
+            .with_entity("张三", &[])
+            .with_answer("王五的师傅可能是谁", "PQI：王五的师傅概率")
+            .with_answer("张三的师傅可能是谁", "PQI：张三的师傅概率");
+        let mut manager = DialogueManager::new();
+        assert!(manager
+            .plan_pure_dialogue("李四的师傅可能是谁", &knowledge)
+            .is_none());
+        let reply = manager
+            .plan_pure_dialogue("那王五呢", &knowledge)
+            .expect("省略追问应承接上一轮情态与谓词");
+        assert_eq!(reply.kind, MoveKind::AskBinary);
+        assert!(
+            reply.plan.iter().any(|plan| plan == "epistemic_followup"),
+            "策略：{:?}",
+            reply.plan
+        );
+        assert!(reply.text.contains("PQI"), "{}", reply.text);
+        assert_eq!(manager.turn_count(), 1);
+        assert_eq!(manager.focus_entity(), Some("王五"));
+
+        // 情态记忆属于可观察对话状态：快照恢复后仍能接住下一条省略追问。
+        let snapshot = manager.snapshot();
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        let reply = restored
+            .plan_pure_dialogue("那张三呢", &knowledge)
+            .expect("恢复后仍应承接情态");
+        assert!(reply.text.contains("PQI"), "{}", reply.text);
+    }
+
+    #[test]
+    fn test_epistemic_followup_does_not_hijack_new_questions() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("李四", &[])
+            .with_entity("王五", &[])
+            .with_answer("王五的师傅可能是谁", "PQI：王五的师傅概率");
+        let mut manager = DialogueManager::new();
+        // 没有上一轮情态记忆时，「那王五呢」仍是普通省略问句。
+        assert!(manager.plan_pure_dialogue("那王五呢", &knowledge).is_none());
+        assert_eq!(manager.turn_count(), 0);
+
+        assert!(manager
+            .plan_pure_dialogue("李四的师傅可能是谁", &knowledge)
+            .is_none());
+        // 裸「王五呢」没有被「那」标记，不抢普通省略/身份问句。
+        assert!(manager.plan_pure_dialogue("王五呢", &knowledge).is_none());
+        // 含「的」的追问不是纯实体省略，不能套用上一轮谓词。
+        assert!(manager
+            .plan_pure_dialogue("那王五的师傅呢", &knowledge)
             .is_none());
         assert_eq!(manager.turn_count(), 0);
     }

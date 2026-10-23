@@ -68,6 +68,19 @@ impl EpistemicMode {
             EpistemicMode::Comparison => "比较问",
         }
     }
+
+    /// 与 [`Self::code`] 互逆；用于把会话快照里的情态字符串恢复成算子。
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "plain" => Some(EpistemicMode::Plain),
+            "possibility" => Some(EpistemicMode::Possibility),
+            "probability" => Some(EpistemicMode::Probability),
+            "most_likely" => Some(EpistemicMode::MostLikely),
+            "certainty" => Some(EpistemicMode::Certainty),
+            "comparison" => Some(EpistemicMode::Comparison),
+            _ => None,
+        }
+    }
 }
 
 /// 线索类别。后验只依赖类别与线索强度，不依赖具体词面。

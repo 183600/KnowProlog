@@ -21639,6 +21639,29 @@ types = [
     }
 
     #[test]
+    fn epistemic_followup_keeps_modality_across_turns() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let mut dialogue = crate::dialogue_manager::DialogueManager::new();
+        let first = dialogue
+            .plan_pure_dialogue("李四的师傅可能是谁", &reasoner)
+            .or_else(|| dialogue.plan_reply("李四的师傅可能是谁", &reasoner))
+            .map(|reply| reply.text)
+            .or_else(|| reasoner.answer("李四的师傅可能是谁"))
+            .expect("首轮情态问句应可回答");
+        assert!(first.contains("PQI"), "{}", first);
+        let follow = dialogue
+            .plan_pure_dialogue("那王五呢", &reasoner)
+            .or_else(|| dialogue.plan_reply("那王五呢", &reasoner))
+            .map(|reply| reply.text)
+            .or_else(|| reasoner.answer("那王五呢"))
+            .expect("省略追问应承接情态");
+        assert!(follow.contains("PQI"), "{}", follow);
+        assert!(follow.contains("知识概率"), "{}", follow);
+        assert!(follow.contains("赵六"), "王五的师傅应为赵六：{}", follow);
+    }
+
+    #[test]
     fn epistemic_question_survives_dialogue_frame_normalization() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
