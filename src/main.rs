@@ -4629,7 +4629,7 @@ async fn run_interactive_mode(
 
     let knowledge_extractor = KnowledgeExtractor::new(config.clone());
     let batch_teaching_path = format!("{}/{}", store_path, batch_teaching::LEDGER_FILE);
-    let batch_teaching = match BatchTeachingLedger::load(&batch_teaching_path) {
+    let mut batch_teaching = match BatchTeachingLedger::load(&batch_teaching_path) {
         BatchLedgerLoad::Loaded(ledger) => ledger,
         BatchLedgerLoad::Missing => BatchTeachingLedger::default(),
         BatchLedgerLoad::Damaged(error) => {
@@ -5584,6 +5584,83 @@ async fn run_interactive_mode(
                     pattern_library.route_count(),
                     scan.scanned()
                 );
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(
+            input,
+            "批量教学" | "批量教学台账" | "教学规则" | "属性教学"
+        ) {
+            println!("{}", batch_teaching.render_active());
+            println!();
+            continue;
+        }
+        if let Some(selector) = strip_any_prefix(
+            input,
+            &[
+                "采纳教学：",
+                "采纳教学:",
+                "采纳教学 ",
+                "确认教学：",
+                "确认教学:",
+                "确认教学 ",
+            ],
+        ) {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                println!("用法：采纳教学 <规则id>（用「批量教学」查看；all 采纳全部可采纳候选）。");
+            } else {
+                match batch_teaching.adopt(selector, &config) {
+                    Ok(ids) if ids.is_empty() => println!("没有可采纳的候选规则。"),
+                    Ok(ids) => {
+                        match batch_teaching.save(&batch_teaching_path) {
+                            Ok(()) => println!(
+                                "已采纳 {} 条批量教学规则：{}（立即用于文本录入）。",
+                                ids.len(),
+                                ids.join(", ")
+                            ),
+                            Err(error) => eprintln!(
+                                "采纳已生效，但写入台账失败（{}）：{}",
+                                batch_teaching_path, error
+                            ),
+                        }
+                    }
+                    Err(error) => println!("采纳教学失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+        if let Some(selector) = strip_any_prefix(
+            input,
+            &[
+                "退役教学：",
+                "退役教学:",
+                "退役教学 ",
+                "撤销教学：",
+                "撤销教学:",
+                "撤销教学 ",
+            ],
+        ) {
+            let selector = selector.trim();
+            if selector.is_empty() {
+                println!("用法：退役教学 <规则id>（用「批量教学」查看活动规则）。");
+            } else {
+                match batch_teaching.retire(selector) {
+                    Ok(ids) if ids.is_empty() => println!("没有匹配的规则。"),
+                    Ok(ids) => {
+                        match batch_teaching.save(&batch_teaching_path) {
+                            Ok(()) => println!("已退役 {} 条规则：{}。", ids.len(), ids.join(", ")),
+                            Err(error) => eprintln!(
+                                "退役已生效，但写入台账失败（{}）：{}",
+                                batch_teaching_path, error
+                            ),
+                        }
+                    }
+                    Err(error) => println!("退役教学失败：{}", error),
+                }
             }
             println!();
             continue;
