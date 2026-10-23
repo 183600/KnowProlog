@@ -4743,6 +4743,11 @@ async fn run_ask(
         PerfLedger::shared(),
     );
     reasoner.set_nlp_config(config.nlp.clone());
+    if let Ok(memory) = oxigraph_manager.load_lexical_memory().await {
+        if !memory.is_empty() {
+            reasoner.set_lexical_memory(memory);
+        }
+    }
     reasoner.configure_ontology_program(&OntologyProgram::from_config(
         &config.type_system,
         &config.predicate_profiles,
