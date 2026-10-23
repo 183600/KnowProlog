@@ -1438,5 +1438,16 @@
     "version": 1,
     "seed": 20261019,
     "gaps": []
+  },
+  "entailment": {
+    "version": 1,
+    "corpus_digest": "03c5515adeeb2739",
+    "metrics": {
+      "gold.accuracy": 1.0,
+      "gold.contradicted_rate": 0.15,
+      "gold.entailed_rate": 0.6,
+      "gold.unknown_rate": 0.25,
+      "metamorphic.pass_rate": 1.0
+    }
   }
 }

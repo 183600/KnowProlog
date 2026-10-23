@@ -21,6 +21,7 @@ use crate::canonical;
 use crate::config_contract;
 use crate::dialogue_eval::{self, DialogueEvalBaseline, EvalKnowledge};
 use crate::dialogue_fuzz::{self, FuzzBaseline, FuzzConfig};
+use crate::entailment_eval::{self, EntailmentEvalBaseline};
 use crate::eval_recovery::{self, EvalRecoveryBaseline};
 use crate::identity_eval::{self, IdentityEvalBaseline};
 use crate::plugin::{PluginRegistry, PluginRuntime};
@@ -1862,6 +1863,8 @@ pub struct ReleaseLock {
     pub identity: Option<IdentityEvalBaseline>,
     #[serde(default)]
     pub fuzz: Option<FuzzBaseline>,
+    #[serde(default)]
+    pub entailment: Option<EntailmentEvalBaseline>,
 }
 
 impl ReleaseLock {
@@ -2297,6 +2300,57 @@ pub fn check(
         }),
     );
 
+    let entailment_report = entailment_eval::evaluate_seed();
+    let entailment_baseline = old_lock.as_ref().and_then(|lock| lock.entailment.clone());
+    let (entailment_passed, entailment_summary, entailment_detail) = match &entailment_baseline {
+        Some(baseline) => {
+            let verdict = entailment_eval::compare_baseline(baseline, &entailment_report, 1e-9);
+            (
+                verdict.passed,
+                format!(
+                    "金标准确率 {:.4} / 变形关系通过率 {:.4}",
+                    entailment_report.gold_accuracy(),
+                    entailment_report.metamorphic_pass_rate()
+                ),
+                verdict
+                    .regressions
+                    .iter()
+                    .map(|delta| {
+                        format!(
+                            "{}: {:.6} → {:.6}",
+                            delta.metric, delta.baseline, delta.current
+                        )
+                    })
+                    .chain(if verdict.digest_matches {
+                        Vec::new()
+                    } else {
+                        vec!["蕴含语料摘要漂移：基线不可直接比较".to_string()]
+                    })
+                    .chain(entailment_report.failures.iter().cloned())
+                    .collect::<Vec<_>>(),
+            )
+        }
+        None if options.update_lock => (
+            true,
+            "首次运行：以当前蕴含评测作为基线".to_string(),
+            Vec::new(),
+        ),
+        None => (
+            false,
+            "发布锁没有蕴含基线；先运行 release-check --update-lock".to_string(),
+            Vec::new(),
+        ),
+    };
+    gates.push(
+        GateReport::new(
+            "eval_entailment",
+            entailment_passed,
+            entailment_report.digest(),
+            entailment_summary,
+        )
+        .with_detail(entailment_detail),
+    );
+
     let passed = gates.iter().all(|gate| gate.passed);
     let mut lock_updated = false;
     if options.update_lock && passed {
@@ -2309,6 +2363,7 @@ pub fn check(
             recovery: recovery_baseline,
             identity: identity_baseline,
             fuzz: fuzz_baseline,
+            entailment: Some(EntailmentEvalBaseline::from_report(&entailment_report)),
         };
         lock.save(options.lock_path)?;
         lock_updated = true;
@@ -2478,6 +2533,7 @@ mod tests {
             recovery: None,
             identity: None,
             fuzz: None,
+            entailment: None,
         };
         lock.save(&path).unwrap();
         assert_eq!(ReleaseLock::load(&path).unwrap(), lock);
@@ -2505,6 +2561,11 @@ mod tests {
         assert!(report.passed, "{}", report.render_text());
         assert!(report.lock_updated);
         assert!(lock_path.exists());
+        let lock = ReleaseLock::load(&lock_path).unwrap();
+        assert!(
+            lock.entailment.is_some(),
+            "首次固化基线应包含蕴含评测"
+        );
 
         let second = check(&config, &registry, &options).unwrap();
         assert!(second.passed, "{}", second.render_text());
