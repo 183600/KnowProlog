@@ -13406,6 +13406,78 @@ mod session_tests {
     }
 
     #[test]
+    fn batch_teach_cli_parses_seed_corpus_and_decisions() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "batch-teach",
+            "--facts",
+            "facts.tsv",
+            "--corpus",
+            "corpus.txt",
+            "--negatives",
+            "negatives.txt",
+            "--min-support",
+            "3",
+            "--min-purity",
+            "900",
+            "--max-candidates",
+            "8",
+            "--adopt",
+            "bt-1234",
+            "--retire",
+            "bt-5678",
+            "--json",
+        ])
+        .expect("batch-teach 参数应可解析");
+        match cli.command {
+            Some(Commands::BatchTeach {
+                facts,
+                corpus,
+                negatives,
+                min_support,
+                min_purity,
+                max_candidates,
+                adopt,
+                retire,
+                json,
+                ..
+            }) => {
+                assert_eq!(facts.as_deref(), Some("facts.tsv"));
+                assert_eq!(corpus.as_deref(), Some("corpus.txt"));
+                assert_eq!(negatives.as_deref(), Some("negatives.txt"));
+                assert_eq!(min_support, 3);
+                assert_eq!(min_purity, 900);
+                assert_eq!(max_candidates, 8);
+                assert_eq!(adopt, vec!["bt-1234".to_string()]);
+                assert_eq!(retire, vec!["bt-5678".to_string()]);
+                assert!(json);
+            }
+            _ => panic!("应解析为 BatchTeach 子命令"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "batch-import",
+            "corpus.txt",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("batch-import 参数应可解析");
+        match cli.command {
+            Some(Commands::BatchImport {
+                file_path,
+                dry_run,
+                json,
+            }) => {
+                assert_eq!(file_path, "corpus.txt");
+                assert!(dry_run);
+                assert!(json);
+            }
+            _ => panic!("应解析为 BatchImport 子命令"),
+        }
+    }
+
+    #[test]
     fn command_like_covers_trust_and_correction_commands() {
         for command in [
             "更正：姚明的身高从226改为229",
