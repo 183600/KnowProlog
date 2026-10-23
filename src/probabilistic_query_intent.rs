@@ -313,7 +313,7 @@ fn parse_threshold_expression(text: &str) -> Option<(f64, bool)> {
         for phrase in list {
             if let Some(position) = text.find(phrase) {
                 let candidate = (position, phrase.len(), at_least);
-                if marker.map_or(true, |current| candidate.0 < current.0) {
+                if marker.is_none_or(|current| candidate.0 < current.0) {
                     marker = Some(candidate);
                 }
             }
@@ -893,7 +893,7 @@ fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<Epistemi
     let prefix = strip_comparison_question_suffix(&prefix).to_string();
     let suffix = clean_question(&raw[cue.end..]);
     let suffix = trim_leading_phrases(&suffix, &["的是", "是", "为", "成为", "当", "做"]);
-    let suffix = strip_most_likely_tail(&suffix).to_string();
+    let suffix = strip_most_likely_tail(suffix).to_string();
     if suffix.is_empty() {
         return None;
     }
@@ -979,7 +979,7 @@ fn parse_comparison(raw: &str, cues: &[EpistemicCue]) -> Option<EpistemicTarget>
     let (left_subject, right_subject) = split_comparison_subjects(prefix)?;
     let suffix = clean_question(&raw[cue.end..]);
     let suffix = trim_leading_phrases(&suffix, &["的是", "是", "为", "成为", "当", "做"]);
-    let (anchor, predicate) = parse_possessive(&suffix)?;
+    let (anchor, predicate) = parse_possessive(suffix)?;
     if anchor == "谁" || predicate.is_empty() {
         return None;
     }
