@@ -753,10 +753,18 @@ impl ContextualResolver {
     ) -> CrdOutcome {
         let mentions = linker.link_lattice(text, hints);
         let descriptions = detect_descriptions(text, source);
-        let global_expectations: Vec<String> = crate::function_words::answer_type_keywords(text)
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let mut global_expectations: Vec<String> =
+            crate::function_words::answer_type_keywords(text)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+        if let Some(memory) = memory {
+            for (_, expectation) in memory.expectations_in_text(text) {
+                global_expectations.push(expectation.expected_type);
+            }
+            global_expectations.sort();
+            global_expectations.dedup();
+        }
         let mut outcome = CrdOutcome {
             descriptions,
             ..CrdOutcome::default()

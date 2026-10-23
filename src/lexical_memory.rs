@@ -321,6 +321,31 @@ impl LexicalMemory {
             .and_then(ClassifierEvidence::expectation)
     }
 
+    /// 扫描原文中出现的已学量词，返回 `(量词, 类型期待)`。
+    ///
+    /// 这是给理解侧使用的只读投影：不依赖分词器，也不会把未学过的量词
+    /// 当成证据。结果按量词排序去重，便于稳定断言。
+    pub fn expectations_in_text(&self, text: &str) -> Vec<(String, TypeExpectation)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut found: BTreeMap<String, TypeExpectation> = BTreeMap::new();
+        for (index, ch) in chars.iter().enumerate() {
+            if is_classifier_char(*ch) {
+                if let Some(expectation) = self.classifier_expectation(&ch.to_string()) {
+                    found.entry(ch.to_string()).or_insert(expectation);
+                }
+            }
+            let Some(next) = chars.get(index + 1) else {
+                continue;
+            };
+            if CLASSIFIER_PREFIXES.contains(ch) && is_classifier_char(*next) {
+                if let Some(expectation) = self.classifier_expectation(&next.to_string()) {
+                    found.entry(next.to_string()).or_insert(expectation);
+                }
+            }
+        }
+        found.into_iter().collect()
+    }
+
     /// 量词期待中显式记录冲突的条目（用于报告与调试）。
     pub fn classifier_conflicts(&self) -> Vec<(String, TypeExpectation)> {
         self.classifiers
@@ -667,6 +692,11 @@ fn is_nounish(word: &AnnotatedWord) -> bool {
     word.pos.starts_with('n') || word.pos == "vn"
 }
 
+fn is_classifier_char(ch: char) -> bool {
+    let mut buffer = [0u8; 4];
+    roles_of(ch.encode_utf8(&mut buffer)).contains(&Role::Quantifier)
+}
+
 /// 指别/数量前缀：结巴常把「那位」「这家」粘成一个 r 标签的 token。
 const CLASSIFIER_PREFIXES: [char; 7] = ['这', '那', '哪', '每', '某', '几', '数'];
 
@@ -844,6 +874,22 @@ mod tests {
             memory.classifier_expectation("位").map(|e| e.expected_type),
             Some("人物".to_string())
         );
+    }
+
+    #[test]
+    fn expectations_are_projected_back_into_text() {
+        let mut memory = LexicalMemory::new(16);
+        memory.observe_annotated(
+            1,
+            &[
+                word("名", "q", TagSource::JiebaTag),
+                word("教授", "n", TagSource::JiebaTag),
+            ],
+        );
+        let found = memory.expectations_in_text("那名教授是谁");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "名");
+        assert_eq!(found[0].1.expected_type, "人物");
     }
 
     #[test]
