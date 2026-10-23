@@ -16,6 +16,7 @@ pub mod abduction;
 pub mod advanced_nlu;
 pub mod artifact_audit;
 pub mod association_miner;
+pub mod batch_teaching;
 pub mod belief_revision;
 pub mod binding_frames;
 pub mod bindings;
@@ -812,7 +813,7 @@ pub enum InputMode {
     KnowledgeImport,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum KnowledgeItem {
     Entity {
         label: String,
