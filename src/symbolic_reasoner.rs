@@ -21849,7 +21849,9 @@ types = [
             .expect("启用了置信度层也应可回答");
         assert!(answer.contains("置信度决策（PCC）"), "{}", answer);
         assert!(answer.contains("决策=回答"), "{}", answer);
-        assert!(answer.contains("理解措辞=很有把握"), "{}", answer);
+        // PQI 的单位置确定线索后验约 0.60，按理解置信度词表应落到「建议核对」；
+        // 回答置信度（融合后 0.913）不能冒充理解置信度。
+        assert!(answer.contains("理解措辞=建议核对"), "{}", answer);
         assert!(answer.contains("风险证书"), "{}", answer);
         assert!(answer.contains("上界=0.0377"), "{}", answer);
         assert!(answer.contains("已验证"), "{}", answer);
