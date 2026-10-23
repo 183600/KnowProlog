@@ -973,14 +973,49 @@ impl BatchTeachingLedger {
         items
     }
 
-    pub fn render_active(&self) -> String {
-        let rules = self.active_rules();
-        if rules.is_empty() {
-            return "批量教学：没有已采纳的活动规则。".to_string();
+    pub fn visible_rules(&self) -> Vec<&LearnedRule> {
+        let mut seen = HashSet::new();
+        let mut rules = Vec::new();
+        for episode in self.episodes.iter().rev() {
+            for rule in &episode.candidates {
+                if rule.status != RuleStatus::Retired && seen.insert(rule.id.clone()) {
+                    rules.push(rule);
+                }
+            }
         }
-        let mut text = format!("批量教学：{} 条活动规则。", rules.len());
-        for rule in rules {
+        rules.sort_by(|a, b| {
+            b.status
+                .cmp(&a.status)
+                .then_with(|| b.support.cmp(&a.support))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        rules
+    }
+
+    pub fn render_ledger(&self) -> String {
+        let active = self
+            .active_rules()
+            .into_iter()
+            .map(|rule| rule.id.clone())
+            .collect::<HashSet<_>>();
+        let visible = self.visible_rules();
+        if visible.is_empty() {
+            return "批量教学台账：没有活动规则或候选。".to_string();
+        }
+        let candidates = visible
+            .iter()
+            .filter(|rule| !active.contains(&rule.id))
+            .count();
+        let mut text = format!(
+            "批量教学台账：活动 {} 条，候选 {} 条。",
+            active.len(),
+            candidates
+        );
+        for rule in visible {
             text.push_str(&format!("\n  {}", rule.render_text().replace('\n', "\n  ")));
+        }
+        if candidates > 0 {
+            text.push_str("\n候选需显式采纳后才参与抽取（batch-teach --adopt <id> 或「采纳教学 <id>」）。");
         }
         text
     }
@@ -1201,6 +1236,8 @@ process_error = ""
         let adopted = ledger.adopt(&id, &config).expect("规则应可采纳");
         assert_eq!(adopted, vec![id]);
         assert_eq!(ledger.active_rules().len(), 1);
+        assert_eq!(ledger.visible_rules()[0].status, RuleStatus::Active);
+        assert!(ledger.render_ledger().contains("活动 1 条，候选 0 条"));
 
         let tokens = tokenize("王五的年龄是20岁。", &config);
         let items = ledger.extract_active(&config, "王五的年龄是20岁。", &tokens);
@@ -1237,8 +1274,14 @@ process_error = ""
         let facts = "张三\tage\t18\n李四\tage\t19\n";
         let corpus = "张三的年龄是18岁。李四的年龄是19岁。";
         let episode = teacher.teach(facts, corpus, "", &options(2));
+        let id = episode.candidates[0].id.clone();
         let mut ledger = BatchTeachingLedger::default();
         ledger.record(episode);
+        let visible = ledger.visible_rules();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, id);
+        assert_eq!(visible[0].status, RuleStatus::Candidate);
+        assert!(ledger.render_ledger().contains("候选 1 条"));
         let tokens = tokenize("王五的年龄是23岁。", &config);
         assert!(ledger
             .extract_active(&config, "王五的年龄是23岁。", &tokens)

@@ -3384,7 +3384,7 @@ fn run_batch_teach(
     };
     if list {
         if json {
-            match serde_json::to_string_pretty(&ledger.active_rules()) {
+            match serde_json::to_string_pretty(&ledger.visible_rules()) {
                 Ok(text) => println!("{}", text),
                 Err(error) => {
                     eprintln!("批量教学台账序列化失败：{}", error);
@@ -3392,7 +3392,7 @@ fn run_batch_teach(
                 }
             }
         } else {
-            println!("{}", ledger.render_active());
+            println!("{}", ledger.render_ledger());
         }
         return;
     }
@@ -5733,7 +5733,7 @@ async fn run_interactive_mode(
             input,
             "批量教学" | "批量教学台账" | "教学规则" | "属性教学"
         ) {
-            println!("{}", batch_teaching.render_active());
+            println!("{}", batch_teaching.render_ledger());
             println!();
             continue;
         }
