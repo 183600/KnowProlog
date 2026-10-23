@@ -766,8 +766,6 @@ fn match_atoms(atoms: &[RuleAtom], tokens: &[TaggedWord]) -> Vec<(String, String
                             break;
                         }
                         value = Some(tokens[position].text.clone());
-                        position += 1;
-                        let _ = position;
                         break;
                     }
                 }
