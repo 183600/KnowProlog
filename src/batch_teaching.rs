@@ -668,6 +668,10 @@ fn resolve_property(
     None
 }
 
+pub fn tokenize_sentence(text: &str, config: &SystemConfig) -> Vec<TaggedWord> {
+    tokenize(text, config)
+}
+
 fn tokenize(text: &str, config: &SystemConfig) -> Vec<TaggedWord> {
     let words = merge_name_fragments(&preprocess(text, &config.nlp));
     match &config.synonyms {

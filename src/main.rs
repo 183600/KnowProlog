@@ -139,6 +139,18 @@ enum Commands {
         /// Path to the RDF file (.ttl / .nt / .nq / .trig / .rdf / .xml)
         file_path: String,
     },
+    /// Batch-import natural-language sentences with the explicitly adopted
+    /// batch-teaching rules (base extraction rules still run first)
+    BatchImport {
+        /// Corpus file (one or more sentences per line)
+        file_path: String,
+        /// Extract and report without writing to the knowledge store
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Export the default graph as an RDF file (Turtle / N-Triples / N-Quads /
     /// TriG / RDF/XML / JSON-LD; format inferred from the extension)
     ExportRdf {
@@ -1196,6 +1208,21 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(Commands::BatchImport {
+            file_path,
+            dry_run,
+            json,
+        }) => {
+            run_batch_import(
+                &config,
+                &oxigraph_manager,
+                &store_path,
+                &file_path,
+                dry_run,
+                json,
+            )
+            .await;
         }
         Some(Commands::ExportRdf { file_path }) => {
             if file_path == "-" {
@@ -3213,6 +3240,102 @@ async fn run_fuse(
         }
     }
     Ok(())
+}
+
+async fn run_batch_import(
+    config: &Arc<SystemConfig>,
+    manager: &OxigraphManager,
+    store_path: &str,
+    file_path: &str,
+    dry_run: bool,
+    json: bool,
+) {
+    let ledger_path = format!("{}/{}", store_path, batch_teaching::LEDGER_FILE);
+    let ledger = match BatchTeachingLedger::load(&ledger_path) {
+        BatchLedgerLoad::Loaded(ledger) => ledger,
+        BatchLedgerLoad::Missing => {
+            eprintln!(
+                "没有批量教学台账：{}（先用 batch-teach 学习并 --adopt 采纳规则）",
+                ledger_path
+            );
+            std::process::exit(1);
+        }
+        BatchLedgerLoad::Damaged(error) => {
+            eprintln!("批量教学台账损坏（{}）：{}", ledger_path, error);
+            std::process::exit(1);
+        }
+    };
+    if ledger.active_rules().is_empty() {
+        eprintln!(
+            "批量教学台账里没有已采纳的活动规则（用 batch-teach --adopt 采纳后再导入）"
+        );
+        std::process::exit(1);
+    }
+    let text = match std::fs::read_to_string(file_path) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("读取批量语料失败（{}）：{}", file_path, error);
+            std::process::exit(1);
+        }
+    };
+    let sentences = batch_teaching::split_sentences(&text);
+    if sentences.is_empty() {
+        eprintln!("批量语料没有任何句子（{}）", file_path);
+        std::process::exit(1);
+    }
+    let extractor = KnowledgeExtractor::new(config.clone());
+    let mut items = Vec::new();
+    let mut extracted = 0usize;
+    for sentence in &sentences {
+        let tokens = batch_teaching::tokenize_sentence(sentence, config);
+        let mut sentence_items = extractor.extract(sentence, &tokens);
+        sentence_items.retain(|item| {
+            !matches!(item, KnowledgeItem::Entity { label, .. } if label == "Entity")
+        });
+        extracted += sentence_items.len();
+        let learned = ledger.extract_active(config, sentence, &tokens);
+        extracted += learned.len();
+        append_learned_items(&mut sentence_items, learned);
+        append_learned_items(&mut items, sentence_items);
+    }
+    let receipt = if dry_run {
+        None
+    } else {
+        match manager.save_knowledge_with_receipt(items.clone()).await {
+            Ok(receipt) => Some(receipt),
+            Err(error) => {
+                eprintln!("批量导入写入知识库失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    };
+    if json {
+        let payload = serde_json::json!({
+            "sentences": sentences.len(),
+            "extracted": extracted,
+            "unique": items.len(),
+            "dry_run": dry_run,
+            "ledger": ledger_path,
+            "receipt": receipt,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => eprintln!("批量导入结果序列化失败：{}", error),
+        }
+        return;
+    }
+    println!(
+        "批量导入{}：{} 句，抽取 {} 条，去重后 {} 条。",
+        if dry_run { "（预览）" } else { "" },
+        sentences.len(),
+        extracted,
+        items.len()
+    );
+    if let Some(receipt) = &receipt {
+        println!("{}", receipt.summary());
+    } else {
+        println!("预览模式：未写入知识库。");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
