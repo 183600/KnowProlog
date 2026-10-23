@@ -267,10 +267,11 @@ impl BatchTeacher {
                 Ok((key, subject, value, sentence)) => {
                     usable += 1;
                     let group = groups.entry(key).or_default();
+                    group
+                        .examples
+                        .entry((subject.clone(), value.clone()))
+                        .or_insert(sentence);
                     group.pairs.insert((subject, value));
-                    if group.examples.len() < options.max_evidence.max(1) {
-                        group.examples.push(sentence);
-                    }
                 }
                 Err(reason) => skipped.push(SkippedFact {
                     fact: fact_label(fact),
@@ -481,21 +482,19 @@ impl BatchTeacher {
         let extractor = KnowledgeExtractor::new(self.config.clone());
         let total = group.pairs.len();
         let mut covered = 0usize;
-        for sentence in &group.examples {
+        for ((subject, value), sentence) in &group.examples {
             let tokens = tokenize(sentence, &self.config);
             let items = extractor.extract(sentence, &tokens);
-            let found = group.pairs.iter().filter(|(subject, value)| {
-                items.iter().any(|item| {
-                    matches!(
-                        item,
-                        KnowledgeItem::Entity { label, properties }
-                            if label == &key.entity_type
-                                && properties.get(&key.subject_property) == Some(subject)
-                                && properties.get(&key.value_property) == Some(value)
-                    )
-                })
+            let found = items.iter().any(|item| {
+                matches!(
+                    item,
+                    KnowledgeItem::Entity { label, properties }
+                        if label == &key.entity_type
+                            && properties.get(&key.subject_property) == Some(subject)
+                            && properties.get(&key.value_property) == Some(value)
+                )
             });
-            if found.count() > 0 {
+            if found {
                 covered += 1;
             }
         }
@@ -537,7 +536,7 @@ impl Ord for RuleAtom {
 #[derive(Debug, Default)]
 struct Group {
     pairs: BTreeSet<(String, String)>,
-    examples: Vec<String>,
+    examples: BTreeMap<(String, String), String>,
 }
 
 pub fn parse_seed_facts(text: &str) -> (Vec<SeedFact>, Vec<String>) {
@@ -1040,7 +1039,12 @@ pub fn append_learned_items(base: &mut Vec<KnowledgeItem>, learned: Vec<Knowledg
                     label: right_label,
                     properties: right_properties,
                 },
-            ) => left_label == right_label && left_properties == right_properties,
+            ) => {
+                left_label == right_label
+                    && right_properties
+                        .iter()
+                        .all(|(key, value)| left_properties.get(key) == Some(value))
+            }
             _ => false,
         });
         if !duplicate {
