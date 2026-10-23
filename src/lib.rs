@@ -111,6 +111,7 @@ pub mod question_analyzer;
 pub mod reading;
 pub mod recall_audit;
 pub mod recovery;
+pub mod reference_probe;
 pub mod relation_acquisition;
 pub mod relation_frame;
 pub mod release;
