@@ -4092,6 +4092,14 @@ fn split_entity_attribute(text: &str) -> Option<(&str, &str)> {
     let index = text.find('的')?;
     let head = text[..index].trim();
     let mut tail = text[index + '的'.len_utf8()..].trim();
+    // 口语姓名问句的「叫什么名字」不是属性词面：整句交给查询规划器
+    // 编译成「…的姓名」链，避免被改写成「师傅叫什么名字是什么」。
+    if ["叫什么名字", "叫啥名字", "叫什麼名字", "叫啥"]
+        .iter()
+        .any(|suffix| tail.contains(suffix))
+    {
+        return None;
+    }
     // 连续剥离（「…到底是多少呢」需要先剥「呢」再剥「是多少」）。
     for _ in 0..3 {
         let mut stripped_once = false;
@@ -4707,6 +4715,26 @@ mod tests {
             .expect("依据元话语应被接管");
         assert!(why.text.contains("依据"));
         assert!(why.text.contains("知识图谱"));
+    }
+
+    #[test]
+    fn colloquial_name_questions_are_left_to_the_query_planner() {
+        for question in [
+            "张三的师傅叫什么名字",
+            "张三的师傅叫啥名字",
+            "张三叫什么名字",
+            "张三叫啥",
+        ] {
+            assert!(
+                split_entity_attribute(question).is_none(),
+                "{} 不应被对话层拆成实体+属性",
+                question
+            );
+        }
+        assert_eq!(
+            split_entity_attribute("张三的姓名是什么"),
+            Some(("张三", "姓名"))
+        );
     }
 
     #[test]
