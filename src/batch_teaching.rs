@@ -930,7 +930,7 @@ impl BatchTeachingLedger {
         let tokens = if tagged_words.is_empty() {
             tokenize(text, config)
         } else {
-            tagged_words.to_vec()
+            merge_name_fragments(tagged_words)
         };
         let mut items = Vec::new();
         let mut seen = HashSet::new();

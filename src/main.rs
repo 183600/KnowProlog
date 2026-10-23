@@ -6,7 +6,8 @@ use std::time::Instant;
 // 从库（know_prolog）中导入所需的功能
 use know_prolog::{
     batch_teaching::{
-        self, BatchOptions, BatchTeacher, BatchTeachingLedger, LedgerLoad as BatchLedgerLoad,
+        self, append_learned_items, BatchOptions, BatchTeacher, BatchTeachingLedger,
+        LedgerLoad as BatchLedgerLoad,
     },
     binding_frames::FrameProgram,
     chronicle::{Chronicle, FsyncPolicy},
@@ -4627,6 +4628,21 @@ async fn run_interactive_mode(
     oxigraph_manager.configure_type_system(&config.type_system);
 
     let knowledge_extractor = KnowledgeExtractor::new(config.clone());
+    let batch_teaching_path = format!("{}/{}", store_path, batch_teaching::LEDGER_FILE);
+    let batch_teaching = match BatchTeachingLedger::load(&batch_teaching_path) {
+        BatchLedgerLoad::Loaded(ledger) => ledger,
+        BatchLedgerLoad::Missing => BatchTeachingLedger::default(),
+        BatchLedgerLoad::Damaged(error) => {
+            eprintln!("批量教学台账损坏（{}）：{}", batch_teaching_path, error);
+            BatchTeachingLedger::default()
+        }
+    };
+    if !batch_teaching.active_rules().is_empty() {
+        println!(
+            "已恢复批量教学规则 {} 条。可用 batch-teach --list 查看。",
+            batch_teaching.active_rules().len()
+        );
+    }
     // 文法式关系抽取器：DCG 语言器官，词库由谓词画像注册表注入
     let grammar_extractor = GrammarExtractor::new();
     let response_formatter = ResponseFormatter::new(config.clone());
@@ -9254,6 +9270,15 @@ async fn run_interactive_mode(
                     let tagged_words = preprocess(&clean_text, &plugin_nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
+                    let learned = batch_teaching.extract_active(
+                        &config,
+                        &clean_text,
+                        &normalized_words,
+                    );
+                    let learned_added = append_learned_items(&mut items, learned);
+                    if learned_added > 0 {
+                        println!("批量教学规则命中 {} 条。", learned_added);
+                    }
                     // 中文关系句 → 关系三元组（如「张三是李四的师傅」），
                     // 叠加 DCG 文法抽取（被字句/把字句/并列/所有格换向）
                     grammar_extractor
