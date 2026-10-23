@@ -921,4 +921,30 @@ mod tests {
         assert!(summary.tokens > 0, "应至少观察到一个内容词");
         assert!(!memory.is_empty());
     }
+
+    #[tokio::test]
+    async fn manager_roundtrip_stays_in_its_named_graph() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = crate::OxigraphManager::new(dir.path().to_str().unwrap()).unwrap();
+        let mut memory = LexicalMemory::new(32);
+        memory.observe_annotated(
+            4,
+            &[
+                word("那位", "unknown", TagSource::Unknown),
+                word("教授", "n", TagSource::JiebaTag),
+            ],
+        );
+        manager.sync_lexical_memory(&memory).await.unwrap();
+        let loaded = manager.load_lexical_memory().await.unwrap();
+        assert_eq!(loaded.fingerprint(), memory.fingerprint());
+        assert!(
+            manager.load_graph_snapshot().await.unwrap().is_empty(),
+            "词法账本不得写入默认图"
+        );
+        manager
+            .sync_lexical_memory(&LexicalMemory::new(8))
+            .await
+            .unwrap();
+        assert!(manager.load_lexical_memory().await.unwrap().is_empty());
+    }
 }
