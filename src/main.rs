@@ -33,6 +33,7 @@ use know_prolog::{
         compare_baseline, evaluate, triples_from_prolog_facts, EvalBaseline, EvalConfig,
     },
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
+    event_graph::{EventDialogue, EventGraph},
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
     extract_query_entities_from_tagged, frontier, fulfillment,
@@ -462,6 +463,30 @@ enum Commands {
         /// Print the full report as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// Build an event-projection graph from text and optionally answer
+    /// who/when/where/why/what-next/participants/did questions (read-only;
+    /// does not open the knowledge store)
+    Events {
+        /// Text to analyse (mutually exclusive with --file)
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        /// UTF-8 text file to analyse
+        #[arg(long)]
+        file: Option<String>,
+        /// Event question; repeat by separating questions with newlines.
+        /// Omit to print the graph and its evidence
+        #[arg(long)]
+        question: Option<String>,
+        /// Maximum number of events to keep (0 = no limit)
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print the graph or answers as JSON
+        #[arg(long)]
+        json: bool,
+        /// Also print the event graph as Prolog facts
+        #[arg(long)]
+        prolog: bool,
     },
     /// Learn surface patterns from seed facts x corpus and propose new graph
     /// candidates with evidence families and ordinal confidence (read-only)
@@ -1066,6 +1091,24 @@ async fn main() {
     // 无需知识存储的子命令先行处理：只跑提示词 lint / NLU 评测时，
     // 即使 Oxigraph 库路径不可用也不受影响（不创建存储、不读知识库）。
     match &cli.command {
+        Some(Commands::Events {
+            text,
+            file,
+            question,
+            limit,
+            json,
+            prolog,
+        }) => {
+            run_events(
+                text.as_deref(),
+                file.as_deref(),
+                question.as_deref(),
+                *limit,
+                *json,
+                *prolog,
+            );
+            return;
+        }
         Some(Commands::PromptLint { json }) => {
             run_prompt_lint(*json);
             return;
@@ -2216,6 +2259,7 @@ async fn main() {
         // 已在打开存储前处理（见 main 顶部早期分派）
         Some(Commands::PromptLint { .. }) => {}
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
+        Some(Commands::Events { .. }) => {}
         Some(Commands::ReadTrace { .. }) => {}
         Some(Commands::Frontier { .. }) => {}
         Some(Commands::EvalRecall { .. }) => {}
@@ -3715,6 +3759,92 @@ fn run_eval_recall(
 /// 加 `--lexicon` 时额外做静态覆盖审计：把「计划可执行但谓词/实体没有定义」
 /// 的沉默缺口显式化；`--definitions` 可先通过词门准入 alias/compose 定义。
 /// 全过程只读：不写知识库、不改变分词、链接、规划或回答。
+fn run_events(
+    text: Option<&str>,
+    file: Option<&str>,
+    question: Option<&str>,
+    limit: usize,
+    json: bool,
+    prolog: bool,
+) {
+    let source = match (text, file) {
+        (Some(text), _) => text.to_string(),
+        (None, Some(path)) => match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("读取文本失败（{}）: {}", path, e);
+                std::process::exit(1);
+            }
+        },
+        (None, None) => {
+            let mut content = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut content) {
+                eprintln!("读取标准输入失败: {}", e);
+                std::process::exit(1);
+            }
+            content
+        }
+    };
+    if source.trim().is_empty() {
+        eprintln!("事件抽取需要 --text、--file 或标准输入中的非空文本。");
+        std::process::exit(2);
+    }
+    let graph = EventGraph::build_with_limits(&source, limit);
+    if let Some(question) = question {
+        let questions: Vec<&str> = question
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let mut dialogue = EventDialogue::new(graph.clone());
+        let mut answers = Vec::new();
+        for one in &questions {
+            let answer = dialogue.ask(one);
+            if json {
+                answers.push(serde_json::json!({
+                    "question": one,
+                    "answer": answer,
+                }));
+            } else {
+                println!("问：{}", one);
+                print!("{}", answer.render_text());
+                println!();
+            }
+        }
+        if json {
+            let payload = serde_json::json!({
+                "dialect": know_prolog::event_graph::EVENT_DIALECT,
+                "source_fingerprint": &graph.source_fingerprint,
+                "stats": &graph.stats,
+                "answers": answers,
+                "focus": dialogue.focus().ids(),
+            });
+            match serde_json::to_string_pretty(&payload) {
+                Ok(rendered) => println!("{}", rendered),
+                Err(e) => {
+                    eprintln!("事件问答序列化失败: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    } else if json {
+        match serde_json::to_string_pretty(&graph) {
+            Ok(rendered) => println!("{}", rendered),
+            Err(e) => {
+                eprintln!("事件图序列化失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print!("{}", graph.render_text());
+    }
+    if prolog {
+        for line in graph.to_prolog_lines() {
+            println!("{}", line);
+        }
+    }
+}
+
 fn run_read_trace(
     question: Option<&str>,
     corpus: Option<&str>,
