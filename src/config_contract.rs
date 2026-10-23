@@ -207,6 +207,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_type_system(&mut c, config);
     check_synonyms(&mut c, config);
     check_reasoning(&mut c, config);
+    check_confidence(&mut c, config);
     check_trace_graph(&mut c, config);
     check_dialogue_frames(&mut c, config);
     c.issues
@@ -1650,6 +1651,23 @@ fn check_reasoning(c: &mut Collector, config: &SystemConfig) {
                 "reasoning.dialogue_state_path",
                 "对话记忆路径为空：跨会话记忆无法落盘",
             );
+        }
+    }
+}
+
+fn check_confidence(c: &mut Collector, config: &SystemConfig) {
+    for issue in config.reasoning.confidence.validate() {
+        match issue.severity {
+            crate::confidence::ConfidenceSeverity::Error => c.error(
+                &issue.code,
+                issue.path,
+                issue.message,
+            ),
+            crate::confidence::ConfidenceSeverity::Warning => c.warn(
+                &issue.code,
+                issue.path,
+                issue.message,
+            ),
         }
     }
 }

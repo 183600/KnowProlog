@@ -253,21 +253,12 @@ impl MarkovLogicEngine {
             .clamp(-LOG_ODDS_CLAMP, LOG_ODDS_CLAMP)
     }
 
-    /// 概率 → 中文模糊限定词（生成"不确定但可解释"的回答）
+    /// 概率 → 中文模糊限定词（生成"不确定但可解释"的回答）。
+    ///
+    /// 词表放在 [`crate::confidence::proposition_wording`]，与 PQI 的置信度回执
+    /// 共用；这里只保留旧入口，避免同一个 P 在两条通道里被说成两个程度。
     pub fn hedge(probability: f64) -> &'static str {
-        if probability >= 0.9 {
-            "极有可能"
-        } else if probability >= 0.75 {
-            "很可能"
-        } else if probability >= 0.6 {
-            "比较可能"
-        } else if probability >= 0.5 {
-            "有可能"
-        } else if probability >= 0.35 {
-            "不太确定，或许"
-        } else {
-            "可能性较低"
-        }
+        crate::confidence::proposition_wording(probability)
     }
 
     fn sigmoid(x: f64) -> f64 {

@@ -26,6 +26,7 @@ pub mod causal_tokenization;
 pub mod chinese_reasoning_nlu;
 pub mod chronicle;
 pub mod completion_episode;
+pub mod confidence;
 pub mod config_contract;
 pub mod context_image;
 pub mod contextual_rag;
@@ -457,6 +458,10 @@ pub struct ReasoningConfig {
     /// 严格谓词准入：未登记谓词不自动准入、其事实不落库（默认自动准入 + 待确认）
     #[serde(default)]
     pub require_predicate_admission: bool,
+    /// 可携带证明的置信度层（PCC）：校准断点、log-odds 融合、风险证书与四档决策。
+    /// 默认关闭；只有显式启用且证书通过校验时才接管情态回答。
+    #[serde(default)]
+    pub confidence: confidence::ConfidenceConfig,
 }
 
 fn default_enable_holographic_memory() -> bool {
@@ -685,6 +690,7 @@ impl Default for ReasoningConfig {
             holographic_max_hits: default_holographic_max_hits(),
             enable_contextual_rag: false,
             require_predicate_admission: false,
+            confidence: confidence::ConfidenceConfig::default(),
         }
     }
 }

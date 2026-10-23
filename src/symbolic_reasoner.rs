@@ -14162,6 +14162,7 @@ mod tests {
             holographic_max_hits: 6,
             enable_contextual_rag: false,
             require_predicate_admission: false,
+            confidence: crate::confidence::ConfidenceConfig::default(),
         }
     }
 
