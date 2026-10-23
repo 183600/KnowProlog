@@ -13018,6 +13018,7 @@ impl SymbolicReasoner {
         object: Option<&str>,
         predicate: &str,
     ) -> String {
+        let fixed = subject.or(object);
         let pattern = match (subject, object) {
             (Some(subject), None) => Atom::pattern(
                 predicate,
@@ -13046,6 +13047,8 @@ impl SymbolicReasoner {
         );
         let mut answers = query.answers;
         answers.retain(|answer| answer.atom.arity() == pattern.arity());
+        let mut seen_atoms: HashSet<String> = HashSet::new();
+        answers.retain(|answer| seen_atoms.insert(answer.atom.display()));
         let mut output = intent.render_ledger();
         output.push('\n');
         output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
@@ -13055,36 +13058,38 @@ impl SymbolicReasoner {
             output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
             return output.trim_end().to_string();
         }
-        let mut kept: Vec<&ProblogAnswer> = Vec::new();
-        if intent.mode == EpistemicMode::Possibility {
-            if intent.negated {
-                kept.extend(
-                    answers
-                        .iter()
-                        .filter(|answer| answer.probability <= intent.threshold),
-                );
-            } else {
-                kept.extend(
-                    answers
-                        .iter()
-                        .filter(|answer| answer.probability >= intent.threshold),
-                );
-            }
-        }
-        if kept.is_empty() {
-            kept.extend(answers.iter().take(3));
-        }
-        if intent.mode == EpistemicMode::MostLikely {
-            kept.extend(answers.iter().take(3));
-        }
-        if kept.is_empty() {
-            kept.extend(answers.iter().take(3));
+        // 每个候选只选一次：MostLikely 曾在这里连续填充两遍，导致
+        // 「最可能：李四 / 次选：李四」这种同义重复。阈值过滤与尾部兜底
+        // 也合并成一次决策，避免多个分支互相覆盖。
+        let filtered: Vec<&ProblogAnswer> = match intent.mode {
+            EpistemicMode::Possibility if intent.negated => answers
+                .iter()
+                .filter(|answer| answer.probability <= intent.threshold)
+                .collect(),
+            EpistemicMode::Possibility => answers
+                .iter()
+                .filter(|answer| answer.probability >= intent.threshold)
+                .collect(),
+            EpistemicMode::MostLikely => answers.iter().take(3).collect(),
+            _ => answers.iter().take(5).collect(),
+        };
+        let threshold_missed = filtered.is_empty() && !answers.is_empty();
+        let kept: Vec<&ProblogAnswer> = if filtered.is_empty() {
+            answers.iter().take(3).collect()
+        } else {
+            filtered
+        };
+        if threshold_missed {
+            output.push_str(&format!(
+                "  没有候选达到 τ={:.2}；以下只是当前概率最高的弱候选\n",
+                intent.threshold
+            ));
         }
         if intent.mode == EpistemicMode::MostLikely {
             let top = kept[0];
             output.push_str(&format!(
                 "  最可能：{}（P={:.3}，{}）\n",
-                self.epistemic_candidate(top),
+                self.epistemic_candidate(top, fixed),
                 top.probability,
                 Self::epistemic_label(top.probability)
             ));
@@ -13095,7 +13100,7 @@ impl SymbolicReasoner {
                     .map(|answer| {
                         format!(
                             "{}（P={:.3}）",
-                            self.epistemic_candidate(answer),
+                            self.epistemic_candidate(answer, fixed),
                             answer.probability
                         )
                     })
@@ -13109,7 +13114,7 @@ impl SymbolicReasoner {
                 output.push_str(&format!(
                     "  {}. {}（P={:.3}，{}）\n",
                     index + 1,
-                    self.epistemic_candidate(answer),
+                    self.epistemic_candidate(answer, fixed),
                     answer.probability,
                     Self::epistemic_label(answer.probability)
                 ));
@@ -13122,13 +13127,22 @@ impl SymbolicReasoner {
         output.trim_end().to_string()
     }
 
-    fn epistemic_candidate(&self, answer: &ProblogAnswer) -> String {
-        answer
-            .atom
-            .terms
-            .last()
+    /// 候选出现在变量槽，不能永远读最后一个词项：`师傅(?X, 李四)` 的答案
+    /// 是第一个词项；读末尾会把固定锚点「李四」当成候选，反向问句永远
+    /// 只能答出锚点本身。
+    fn epistemic_candidate(&self, answer: &ProblogAnswer, fixed: Option<&str>) -> String {
+        let term = fixed
+            .and_then(|anchor| {
+                answer
+                    .atom
+                    .terms
+                    .iter()
+                    .find(|term| term.name() != anchor)
+            })
+            .or_else(|| answer.atom.terms.last())
             .map(|term| self.canonical_epistemic_entity(term.name()))
-            .unwrap_or_else(|| self.render_atom_nl(&answer.atom))
+            .unwrap_or_else(|| self.render_atom_nl(&answer.atom));
+        term
     }
 
     fn render_epistemic_comparison(
@@ -21453,11 +21467,11 @@ types = [
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         let confirmed = reasoner
-            .answer("张三一定是李四的师傅吗")
+            .answer("王五一定是李四的师傅吗")
             .expect("确定问应可回答");
         assert!(confirmed.contains("可以确认"), "{}", confirmed);
         let refuted = reasoner
-            .answer("李四一定是赵六的师傅吗")
+            .answer("赵六一定是李四的师傅吗")
             .expect("确定问应可回答");
         assert!(refuted.contains("不足以确认"), "{}", refuted);
         assert!(refuted.contains("P=0.000"), "{}", refuted);
@@ -21468,7 +21482,7 @@ types = [
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         let answer = reasoner
-            .answer("李四有多大的可能是王五的师傅")
+            .answer("王五有多大的可能是李四的师傅")
             .expect("概率值问应可回答");
         assert!(answer.contains("概率值问"), "{}", answer);
         assert!(answer.contains("李四 的 师傅 是 王五"), "{}", answer);
@@ -21480,10 +21494,10 @@ types = [
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         let answer = reasoner
-            .answer("张三和李四谁更可能是王五的师傅")
+            .answer("李四和王五谁更可能是张三的师傅")
             .expect("比较问应可回答");
         assert!(answer.contains("比较结论"), "{}", answer);
-        assert!(answer.contains("更可能是「李四"), "{}", answer);
+        assert!(answer.contains("更可能是「张三 的 师傅 是 李四"), "{}", answer);
     }
 
     #[test]
@@ -21491,12 +21505,12 @@ types = [
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         let answer = reasoner
-            .answer("李四一定不是赵六的师傅吗")
+            .answer("张三一定不是李四的师傅吗")
             .expect("否定确定问应可回答");
-        assert!(answer.contains("因此 P(李四 的 师傅 不是 赵六)=1.000"), "{}", answer);
+        assert!(answer.contains("因此 P(李四 的 师傅 不是 张三)=1.000"), "{}", answer);
         assert!(answer.contains("可以确认"), "{}", answer);
         let denied = reasoner
-            .answer("李四有多大的可能不是王五的师傅")
+            .answer("王五有多大的可能不是李四的师傅")
             .expect("否定概率问句应可回答");
         assert!(denied.contains("因此 P(李四 的 师傅 不是 王五)=0.000"), "{}", denied);
         assert!(denied.contains("已排除"), "{}", denied);
@@ -21541,6 +21555,87 @@ types = [
             .expect("教过的概率事实应可回答");
         assert!(answer.contains("P=0.800"), "{}", answer);
         assert!(answer.contains("概率事实"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_inverted_most_likely_reads_the_object_slot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李四最可能是谁的师傅")
+            .expect("「谁的师傅」应查反主宾的候选");
+        assert!(answer.contains("最可能：张三"), "{}", answer);
+        assert!(!answer.contains("最可能：王五"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_copula_orientation_matches_plain_check() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let plain = reasoner
+            .answer("张三是李四的师傅吗")
+            .expect("普通是非问应可回答");
+        assert!(!plain.contains("是的"), "{}", plain);
+        let modal = reasoner
+            .answer("张三一定是李四的师傅吗")
+            .expect("情态是非问应可回答");
+        assert!(
+            modal.contains("李四 的 师傅 是 张三"),
+            "「A 是 B 的 P」应读成 P(B, A)，与普通校验一致：{}",
+            modal
+        );
+        assert!(modal.contains("P=0.000"), "{}", modal);
+        assert!(modal.contains("不足以确认"), "{}", modal);
+    }
+
+    #[test]
+    fn epistemic_most_likely_lists_each_candidate_once() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "张三".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "王五".to_string(),
+            },
+        ]);
+        let answer = reasoner
+            .answer("谁最可能是李四的师傅")
+            .expect("最可能问应可排序");
+        assert_eq!(
+            answer.matches("P=1.000").count(),
+            2,
+            "两个候选应各出现一次（最可能 + 次选），不能重复填充：{}",
+            answer
+        );
+        assert_eq!(answer.matches("次选：").count(), 1, "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_comparison_accepts_gen_separator() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李四跟王五谁更可能是张三的师傅")
+            .expect("「跟」也应读作比较");
+        assert!(answer.contains("比较结论"), "{}", answer);
+        assert!(answer.contains("更可能是「张三 的 师傅 是 李四"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_most_likely_compares_two_named_candidates() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let answer = reasoner
+            .answer("李四和王五谁最可能是张三的师傅")
+            .expect("两个具名候选应做比较");
+        assert!(answer.contains("比较结论"), "{}", answer);
+        assert!(answer.contains("更可能是「张三 的 师傅 是 李四"), "{}", answer);
+        assert!(answer.contains("王五"), "{}", answer);
     }
 
     #[test]

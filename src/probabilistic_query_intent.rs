@@ -599,9 +599,12 @@ fn parse_claim(raw: &str) -> Option<Claim> {
     }
     let left_possessive = left.rsplit_once('的');
     let right_possessive = right.rsplit_once('的');
+    // 「A 的 P 是 B」→ P(A, B)；「A 是 B 的 P」→ P(B, A)。
+    // 后者不能读成 P(A, B)：那会把「李四是王五的师傅」翻成
+    // 「李四的师傅是王五」，与 QueryPlanner/图谱的主客方向相反。
     let (subject, predicate, object) = match (left_possessive, right_possessive) {
         (Some((subject, predicate)), None) => (subject, predicate, right),
-        (None, Some((object, predicate))) => (left, predicate, object),
+        (None, Some((subject, predicate))) => (subject, predicate, left),
         // 两侧都带「的」是歧义结构（A 的 P 是 B 的 Q），不强行拍板。
         _ => return None,
     };
@@ -718,21 +721,46 @@ fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<Epistemi
         .iter()
         .find(|cue| cue.kind == CueKind::MostLikely)?;
     let prefix = clean_question(&raw[..cue.start]);
+    let prefix = strip_comparison_question_suffix(&prefix).to_string();
     let suffix = clean_question(&raw[cue.end..]);
     let suffix = trim_leading_phrases(&suffix, &["的是", "是", "为", "成为", "当", "做"]);
+    let suffix = strip_most_likely_tail(&suffix).to_string();
     if suffix.is_empty() {
         return None;
     }
+    // 「A 和 B 谁最可能是 X 的 P」不是开放式 argmax，而是两个具名候选的
+    // 概率比较；把它读成全图排序会丢掉用户点名的 B。
+    if let Some((left_subject, right_subject)) = split_comparison_subjects(&prefix) {
+        let (anchor, predicate) = parse_possessive(&suffix)?;
+        if anchor == "谁" || predicate.is_empty() {
+            return None;
+        }
+        return Some(EpistemicTarget::Comparison {
+            left: Claim {
+                subject: anchor.clone(),
+                predicate: predicate.clone(),
+                object: left_subject,
+                negated: false,
+            },
+            right: Claim {
+                subject: anchor,
+                predicate,
+                object: right_subject,
+                negated: false,
+            },
+        });
+    }
     // 谁最可能是 X 的 P / 最可能是 X 的 P / 最可能的是 X 的 P
     if prefix.is_empty() || prefix == "谁" {
-        if let Some((subject, predicate)) = parse_possessive(suffix) {
+        if let Some((subject, predicate)) = parse_possessive(&suffix) {
             if subject != "谁" && !contains_interrogative(&subject) && !contains_interrogative(&predicate)
             {
                 return Some(EpistemicTarget::ObjectsOf { subject, predicate });
             }
         }
     }
-    // 李四最可能是谁的 P
+    // 李四最可能是谁的 P：「李四 是 谁的 P」= 谁的 P 是李四 = P(?X, 李四)，
+    // 不能读成 P(李四, ?X)；后者会答成「李四的师傅是谁」。
     if let Some(rest) = suffix.strip_prefix("谁") {
         let predicate = trim_leading_phrases(rest, &["的"]);
         if !prefix.is_empty()
@@ -740,8 +768,8 @@ fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<Epistemi
             && !predicate.is_empty()
             && !contains_interrogative(predicate)
         {
-            return Some(EpistemicTarget::ObjectsOf {
-                subject: prefix,
+            return Some(EpistemicTarget::SubjectsOf {
+                object: prefix,
                 predicate: predicate.to_string(),
             });
         }
@@ -776,40 +804,74 @@ fn parse_comparison(raw: &str, cues: &[EpistemicCue]) -> Option<EpistemicTarget>
     let cue = cues
         .iter()
         .find(|cue| cue.kind == CueKind::Comparison)?;
-    let mut prefix =
-        trim_leading_phrases(&clean_question(&raw[..cue.start]), &["比较", "对比"])
-            .to_string();
-    for suffix in ["谁", "哪个", "哪一个"] {
-        if let Some(rest) = prefix.strip_suffix(suffix) {
-            prefix = rest.trim().to_string();
-            break;
-        }
-    }
-    let (left_subject, right_subject) = prefix.split_once('和')?;
-    let left_subject = left_subject.trim();
-    let right_subject = right_subject.trim();
-    if left_subject.is_empty() || right_subject.is_empty() {
-        return None;
-    }
+    let cleaned = clean_question(&raw[..cue.start]);
+    let prefix = trim_leading_phrases(&cleaned, &["比较", "对比"]);
+    let prefix = strip_comparison_question_suffix(prefix);
+    let (left_subject, right_subject) = split_comparison_subjects(prefix)?;
     let suffix = clean_question(&raw[cue.end..]);
     let suffix = trim_leading_phrases(&suffix, &["的是", "是", "为", "成为", "当", "做"]);
-    let (anchor, predicate) = parse_possessive(suffix)?;
+    let (anchor, predicate) = parse_possessive(&suffix)?;
     if anchor == "谁" || predicate.is_empty() {
         return None;
     }
     let left = Claim {
-        subject: left_subject.to_string(),
+        subject: anchor.clone(),
         predicate: predicate.clone(),
-        object: anchor.clone(),
+        object: left_subject,
         negated: false,
     };
     let right = Claim {
-        subject: right_subject.to_string(),
+        subject: anchor,
         predicate,
-        object: anchor,
+        object: right_subject,
         negated: false,
     };
     Some(EpistemicTarget::Comparison { left, right })
+}
+
+/// 比较问的两个具名候选：`A和B`、`A跟B`、`A与B`、`A同B`。
+/// 只接受非空两侧；不猜测超过两个候选的集合。
+fn split_comparison_subjects(prefix: &str) -> Option<(String, String)> {
+    for separator in ['和', '跟', '与', '同'] {
+        if let Some((left, right)) = prefix.split_once(separator) {
+            let left = left.trim();
+            let right = right.trim();
+            if !left.is_empty()
+                && !right.is_empty()
+                && !left.contains(['谁', '哪'])
+                && !right.contains(['谁', '哪'])
+            {
+                return Some((left.to_string(), right.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn strip_comparison_question_suffix(prefix: &str) -> &str {
+    let mut prefix = prefix.trim();
+    for suffix in ["谁", "哪一个", "哪个"] {
+        if let Some(rest) = prefix.strip_suffix(suffix) {
+            prefix = rest.trim();
+            break;
+        }
+    }
+    prefix
+}
+
+/// 「最可能是李四的师傅**的人是谁**」里的尾部是问句外壳，不是谓词的一部分。
+fn strip_most_likely_tail(suffix: &str) -> &str {
+    let mut suffix = suffix.trim();
+    for tail in ["的那个人是谁", "的人是谁", "的那个人", "的人", "的是谁", "是谁"] {
+        if let Some(rest) = suffix.strip_suffix(tail) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                suffix = rest;
+                break;
+            }
+        }
+    }
+    suffix
 }
 
 fn claim_without_cues(text: &str, cues: &[EpistemicCue]) -> Option<Claim> {
@@ -890,9 +952,9 @@ mod tests {
         assert_eq!(
             intent.target,
             Some(EpistemicTarget::GroundClaim(Claim {
-                subject: "李四".to_string(),
+                subject: "王五".to_string(),
                 predicate: "师傅".to_string(),
-                object: "王五".to_string(),
+                object: "李四".to_string(),
                 negated: false,
             }))
         );
@@ -922,9 +984,9 @@ mod tests {
         assert_eq!(
             intent.target,
             Some(EpistemicTarget::GroundClaim(Claim {
-                subject: "李四".to_string(),
+                subject: "王五".to_string(),
                 predicate: "师傅".to_string(),
-                object: "王五".to_string(),
+                object: "李四".to_string(),
                 negated: false,
             }))
         );
@@ -961,8 +1023,8 @@ mod tests {
         let intent = ProbabilisticQueryIntent::analyze("李四最可能是谁的师傅").unwrap();
         assert_eq!(
             intent.target,
-            Some(EpistemicTarget::ObjectsOf {
-                subject: "李四".to_string(),
+            Some(EpistemicTarget::SubjectsOf {
+                object: "李四".to_string(),
                 predicate: "师傅".to_string(),
             })
         );
@@ -976,11 +1038,11 @@ mod tests {
         let Some(EpistemicTarget::Comparison { left, right }) = intent.target else {
             panic!("应抽出两个待比较的基原子：{:?}", intent.target);
         };
-        assert_eq!(left.subject, "李四");
-        assert_eq!(right.subject, "王五");
+        assert_eq!(left.subject, "张三");
+        assert_eq!(right.subject, "张三");
         assert_eq!(left.predicate, "师傅");
-        assert_eq!(left.object, "张三");
-        assert_eq!(right.object, "张三");
+        assert_eq!(left.object, "李四");
+        assert_eq!(right.object, "王五");
     }
 
     #[test]
@@ -992,9 +1054,9 @@ mod tests {
         assert_eq!(
             intent.target,
             Some(EpistemicTarget::GroundClaim(Claim {
-                subject: "李四".to_string(),
+                subject: "王五".to_string(),
                 predicate: "师傅".to_string(),
-                object: "王五".to_string(),
+                object: "李四".to_string(),
                 negated: false,
             }))
         );
@@ -1007,9 +1069,9 @@ mod tests {
         let Some(EpistemicTarget::GroundClaim(claim)) = intent.target else {
             panic!("应抽出带否定的基原子");
         };
-        assert_eq!(claim.subject, "李四");
+        assert_eq!(claim.subject, "王五");
         assert_eq!(claim.predicate, "师傅");
-        assert_eq!(claim.object, "王五");
+        assert_eq!(claim.object, "李四");
         assert!(claim.negated);
     }
 
@@ -1020,10 +1082,57 @@ mod tests {
         let Some(EpistemicTarget::GroundClaim(claim)) = intent.target else {
             panic!("应抽出带否定的基原子");
         };
-        assert_eq!(claim.subject, "李四");
+        assert_eq!(claim.subject, "王五");
         assert_eq!(claim.predicate, "师傅");
-        assert_eq!(claim.object, "王五");
+        assert_eq!(claim.object, "李四");
         assert!(claim.negated);
+    }
+
+    #[test]
+    fn comparison_accepts_common_coordinators() {
+        for question in [
+            "李四和王五谁更可能是张三的师傅",
+            "李四跟王五谁更可能是张三的师傅",
+            "李四与王五谁更可能是张三的师傅",
+            "李四同王五谁更可能是张三的师傅",
+        ] {
+            let intent = ProbabilisticQueryIntent::analyze(question).unwrap();
+            assert_eq!(intent.mode, EpistemicMode::Comparison, "{}", question);
+            let Some(EpistemicTarget::Comparison { left, right }) = intent.target else {
+                panic!("应抽出两个待比较的基原子：{} => {:?}", question, intent.target);
+            };
+            assert_eq!(left.subject, "张三");
+            assert_eq!(right.subject, "张三");
+            assert_eq!(left.object, "李四");
+            assert_eq!(right.object, "王五");
+        }
+    }
+
+    #[test]
+    fn most_likely_with_two_named_candidates_is_a_comparison() {
+        let intent =
+            ProbabilisticQueryIntent::analyze("李四和王五谁最可能是张三的师傅").unwrap();
+        assert_eq!(intent.mode, EpistemicMode::MostLikely);
+        let Some(EpistemicTarget::Comparison { left, right }) = intent.target else {
+            panic!("两个具名候选应做比较而不是全图 argmax：{:?}", intent.target);
+        };
+        assert_eq!(left.subject, "张三");
+        assert_eq!(right.subject, "张三");
+        assert_eq!(left.predicate, "师傅");
+        assert_eq!(left.object, "李四");
+    }
+
+    #[test]
+    fn most_likely_accepts_the_person_tail() {
+        let intent =
+            ProbabilisticQueryIntent::analyze("最可能是李四的师傅的人是谁").unwrap();
+        assert_eq!(
+            intent.target,
+            Some(EpistemicTarget::ObjectsOf {
+                subject: "李四".to_string(),
+                predicate: "师傅".to_string(),
+            })
+        );
     }
 
     #[test]
