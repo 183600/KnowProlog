@@ -304,12 +304,8 @@ impl BatchTeacher {
         }
         candidates.sort_by(|a, b| a.id.cmp(&b.id));
 
-        let id_seed = format!(
-            "{}\n{}\n{}",
-            facts_text,
-            corpus_text,
-            format!("{}\n{:?}", negatives_text, options)
-        );
+        let negatives_key = format!("{}\n{:?}", negatives_text, options);
+        let id_seed = format!("{}\n{}\n{}", facts_text, corpus_text, negatives_key);
         let id = format!("bt-{}", &fnv1a_hex(id_seed.as_bytes())[..12]);
         TeachingEpisode {
             id,
@@ -417,11 +413,10 @@ impl BatchTeacher {
             }
         }
         let support = matched_pairs.len();
-        let purity = if matches == 0 {
-            0
-        } else {
-            ((supported_matches * 1000) / matches) as u32
-        };
+        let purity = (supported_matches
+            .saturating_mul(1000)
+            .checked_div(matches)
+            .unwrap_or(0)) as u32;
         let mut reasons = Vec::new();
         let mut decision = RuleDecision::Ready;
         if !negative_hits.is_empty() {
@@ -688,11 +683,11 @@ fn find_surface_spans(
     let mut spans = Vec::new();
     for start in 0..tokens.len() {
         let mut text = String::new();
-        for end in start..tokens.len().min(start + max_tokens) {
-            if !span_token_ok(&tokens[end]) {
+        for (end, token) in tokens.iter().enumerate().skip(start).take(max_tokens) {
+            if !span_token_ok(token) {
                 break;
             }
-            text.push_str(&tokens[end].text);
+            text.push_str(&token.text);
             if text == surface {
                 spans.push((start, end + 1));
                 break;
