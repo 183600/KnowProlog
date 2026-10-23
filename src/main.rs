@@ -5,6 +5,9 @@ use std::time::Instant;
 
 // 从库（know_prolog）中导入所需的功能
 use know_prolog::{
+    batch_teaching::{
+        self, BatchOptions, BatchTeacher, BatchTeachingLedger, LedgerLoad as BatchLedgerLoad,
+    },
     binding_frames::FrameProgram,
     chronicle::{Chronicle, FsyncPolicy},
     config_contract,
@@ -475,6 +478,43 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Learn attribute extraction rules from seed facts x corpus; only
+    /// explicitly adopted rules are persisted and reused by text imports
+    BatchTeach {
+        /// Seed facts file (TSV: subject<TAB>predicate<TAB>value[<TAB>entity_type], or JSONL)
+        #[arg(long)]
+        facts: Option<String>,
+        /// Corpus file with natural-language sentences
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Explicit negative sentences (one per line); any match rejects a rule
+        #[arg(long)]
+        negatives: Option<String>,
+        /// Minimum distinct supported facts before a rule may be adopted
+        #[arg(long, default_value_t = batch_teaching::DEFAULT_MIN_SUPPORT)]
+        min_support: usize,
+        /// Minimum match purity in per mille
+        #[arg(long, default_value_t = batch_teaching::DEFAULT_MIN_PURITY)]
+        min_purity: u32,
+        /// Maximum number of candidates to keep
+        #[arg(long, default_value_t = batch_teaching::DEFAULT_MAX_CANDIDATES)]
+        max_candidates: usize,
+        /// Explicitly adopt a ready rule id (repeatable; prefix allowed, "all" = every ready rule)
+        #[arg(long = "adopt", value_name = "RULE_ID")]
+        adopt: Vec<String>,
+        /// Retire an active rule id (repeatable; prefix allowed)
+        #[arg(long = "retire", value_name = "RULE_ID")]
+        retire: Vec<String>,
+        /// Ledger path (defaults to <store>/batch_teaching.json)
+        #[arg(long)]
+        ledger: Option<String>,
+        /// List active learned rules and exit (does not open the knowledge store)
+        #[arg(long)]
+        list: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Enumerate provenance-preserving paths between two entities, along a
     /// predicate chain, or across a shared neighbour (read-only)
     Paths {
@@ -891,6 +931,37 @@ async fn main() {
         isolate_dialogue_state_path(&mut config.reasoning.dialogue_state_path, &store_path);
     }
     let config = Arc::new(config);
+    if let Some(Commands::BatchTeach {
+        facts,
+        corpus,
+        negatives,
+        min_support,
+        min_purity,
+        max_candidates,
+        adopt,
+        retire,
+        ledger,
+        list,
+        json,
+    }) = &cli.command
+    {
+        run_batch_teach(
+            &config,
+            &store_path,
+            facts.as_deref(),
+            corpus.as_deref(),
+            negatives.as_deref(),
+            *min_support,
+            *min_purity,
+            *max_candidates,
+            adopt,
+            retire,
+            ledger.as_deref(),
+            *list,
+            *json,
+        );
+        return;
+    }
     // 分层追踪模式：命令行 `--trace` 优先，缺省回落 config.toml 的 [trace_graph]。
     let trace_mode = match cli.trace.as_deref() {
         Some(value) => parse_trace_mode(value),
@@ -2120,6 +2191,7 @@ async fn main() {
         Some(Commands::Frontier { .. }) => {}
         Some(Commands::EvalRecall { .. }) => {}
         Some(Commands::Forge { .. }) => {}
+        Some(Commands::BatchTeach { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
         // 已在加载默认配置前处理（见 main 顶部早期分派）
@@ -3140,6 +3212,160 @@ async fn run_fuse(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_batch_teach(
+    config: &Arc<SystemConfig>,
+    store_path: &str,
+    facts: Option<&str>,
+    corpus: Option<&str>,
+    negatives: Option<&str>,
+    min_support: usize,
+    min_purity: u32,
+    max_candidates: usize,
+    adopt: &[String],
+    retire: &[String],
+    ledger_path: Option<&str>,
+    list: bool,
+    json: bool,
+) {
+    let path = ledger_path
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}/{}", store_path, batch_teaching::LEDGER_FILE));
+    let mut ledger = match BatchTeachingLedger::load(&path) {
+        BatchLedgerLoad::Loaded(ledger) => ledger,
+        BatchLedgerLoad::Missing => BatchTeachingLedger::default(),
+        BatchLedgerLoad::Damaged(error) => {
+            eprintln!("批量教学台账损坏（{}）：{}", path, error);
+            std::process::exit(1);
+        }
+    };
+    if list {
+        if json {
+            match serde_json::to_string_pretty(&ledger.active_rules()) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("批量教学台账序列化失败：{}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", ledger.render_active());
+        }
+        return;
+    }
+    let teaching = match (facts, corpus) {
+        (Some(facts), Some(corpus)) => Some((facts, corpus)),
+        (None, None) => None,
+        _ => {
+            eprintln!("批量教学需要同时提供 --facts 与 --corpus");
+            std::process::exit(2);
+        }
+    };
+    let mut episode = None;
+    if let Some((facts_path, corpus_path)) = teaching {
+        let facts_text = match std::fs::read_to_string(facts_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("读取种子事实失败（{}）：{}", facts_path, error);
+                std::process::exit(1);
+            }
+        };
+        let corpus_text = match std::fs::read_to_string(corpus_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("读取语料失败（{}）：{}", corpus_path, error);
+                std::process::exit(1);
+            }
+        };
+        let negatives_text = match negatives {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("读取反例失败（{}）：{}", path, error);
+                    std::process::exit(1);
+                }
+            },
+            None => String::new(),
+        };
+        let options = BatchOptions {
+            min_support,
+            min_purity: min_purity.min(1000),
+            max_candidates,
+            ..BatchOptions::default()
+        };
+        let teacher = BatchTeacher::new(config.clone());
+        let produced = teacher.teach(&facts_text, &corpus_text, &negatives_text, &options);
+        if !json {
+            println!("{}", produced.render_text());
+        }
+        ledger.record(produced.clone());
+        match ledger.save(&path) {
+            Ok(()) => {
+                if !json {
+                    println!("台账已写入 {}（候选待显式采纳）。", path);
+                }
+            }
+            Err(error) => {
+                eprintln!("写入批量教学台账失败（{}）：{}", path, error);
+                std::process::exit(1);
+            }
+        }
+        episode = Some(produced);
+    }
+    let mut adopted = Vec::new();
+    for selector in adopt {
+        match ledger.adopt(selector, config.as_ref()) {
+            Ok(ids) => adopted.extend(ids),
+            Err(error) => {
+                let _ = ledger.save(&path);
+                eprintln!("采纳失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+    let mut retired = Vec::new();
+    for selector in retire {
+        match ledger.retire(selector) {
+            Ok(ids) => retired.extend(ids),
+            Err(error) => {
+                eprintln!("退役失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+    if !adopted.is_empty() || !retired.is_empty() {
+        if let Err(error) = ledger.save(&path) {
+            eprintln!("写入批量教学台账失败（{}）：{}", path, error);
+            std::process::exit(1);
+        }
+    }
+    if json {
+        let payload = serde_json::json!({
+            "episode": episode,
+            "adopted": adopted,
+            "retired": retired,
+            "active": ledger.active_rules().len(),
+            "ledger": path,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => eprintln!("批量教学结果序列化失败：{}", error),
+        }
+    } else {
+        if !adopted.is_empty() {
+            println!("已采纳：{}", adopted.join(", "));
+        }
+        if !retired.is_empty() {
+            println!("已退役：{}", retired.join(", "));
+        }
+        println!(
+            "活动规则 {} 条，台账：{}（用 batch-teach --list 查看）。",
+            ledger.active_rules().len(),
+            path
+        );
+    }
 }
 
 /// `forge`：离线从正例/反例归纳 token 正则，打印展开与探针结果。
