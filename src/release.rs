@@ -2102,10 +2102,6 @@ pub fn check(
             "fuzz_dialogue",
             "已跳过（--skip-evals）",
         ));
-        gates.push(GateReport::skipped(
-            "eval_shape_dialogue",
-            "已跳过（--skip-evals）",
-        ));
     } else {
         let nlu_report = dialogue_eval::evaluate_seed_with(EvalKnowledge::Reasoner, PromptMode::On);
         let (passed, summary, detail) = match &nlu_baseline {
