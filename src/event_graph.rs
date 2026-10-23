@@ -35,6 +35,18 @@ pub const DEFAULT_FOCUS_DEPTH: usize = 16;
 /// 事件图默认落入的命名图前缀（默认图保持只读，不被事件层改写）。
 pub const EVENT_GRAPH_NS: &str = "http://example.org/kg/eventGraph/";
 
+const EVENT_PROLOG_RULES: &str = r#"event_participant(E, P) :- event_role(E, agent, P).
+event_participant(E, P) :- event_role(E, patient, P).
+event_participant(E, P) :- event_role(E, recipient, P).
+event_place(E, P) :- event_role(E, location, P).
+event_before(A, B) :- event_link(A, before, B).
+event_before(A, B) :- event_link(A, subevent, B).
+event_before(A, C) :- event_before(A, B), event_before(B, C).
+event_after(A, B) :- event_before(B, A).
+event_causes(A, B) :- event_link(A, causes, B).
+event_at(E, T) :- event_time(E, T).
+"#;
+
 const CAUSE_MARKERS: &[&str] = &["因为", "由于", "鉴于"];
 const RESULT_MARKERS: &[&str] = &["所以", "因此", "于是", "因而", "故而", "结果"];
 const ORDER_MARKERS: &[&str] = &[
@@ -255,6 +267,15 @@ pub struct EventBuildStats {
     pub links: usize,
     pub truncated_events: usize,
     pub truncated_links: usize,
+}
+
+/// 候选共指：只提出、不自动合并。调用方需自行确认。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventCoreference {
+    pub left: String,
+    pub right: String,
+    pub score: f64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,6 +811,66 @@ impl EventGraph {
         EventAnswer::answered(EventQuestionKind::Did, primary, focused, implicit, text)
     }
 
+    pub fn events_by_trigger(&self, trigger: &str) -> Vec<&EventNode> {
+        self.events
+            .iter()
+            .filter(|event| event.trigger == trigger || event.event_type == trigger)
+            .collect()
+    }
+
+    pub fn events_for_time(&self, time: &str) -> Vec<&EventNode> {
+        self.events
+            .iter()
+            .filter(|event| event.time_text().as_deref() == Some(time))
+            .collect()
+    }
+
+    /// 候选共指：触发词与全部角色相同、极性/模态相同、时间不冲突。
+    /// 只记录候选，绝不自动合并；时间未知或一方未知时降低分数并注明。
+    pub fn coreference_candidates(&self) -> Vec<EventCoreference> {
+        let mut candidates = Vec::new();
+        for left in 0..self.events.len() {
+            for right in (left + 1)..self.events.len() {
+                let a = &self.events[left];
+                let b = &self.events[right];
+                if a.event_type != b.event_type
+                    || a.polarity != b.polarity
+                    || a.modality != b.modality
+                {
+                    continue;
+                }
+                let left_roles: BTreeSet<(&str, &str)> = a
+                    .arguments
+                    .iter()
+                    .map(|argument| (argument.role.tag(), argument.value.as_str()))
+                    .collect();
+                let right_roles: BTreeSet<(&str, &str)> = b
+                    .arguments
+                    .iter()
+                    .map(|argument| (argument.role.tag(), argument.value.as_str()))
+                    .collect();
+                if left_roles.is_empty() || left_roles != right_roles {
+                    continue;
+                }
+                let (score, reason) = match (a.time_text(), b.time_text()) {
+                    (Some(left_time), Some(right_time)) if left_time == right_time => {
+                        (0.85, "触发词、角色、时间与情态一致，可候选共指")
+                    }
+                    (Some(_), Some(_)) => continue,
+                    (None, None) => (0.6, "触发词与角色一致，但两处时间都未知"),
+                    _ => (0.55, "触发词与角色一致，但一方时间未知"),
+                };
+                candidates.push(EventCoreference {
+                    left: a.id.clone(),
+                    right: b.id.clone(),
+                    score,
+                    reason: reason.to_string(),
+                });
+            }
+        }
+        candidates
+    }
+
     /// 默认命名图 IRI：按来源文本指纹生成，重复导入可幂等覆盖。
     pub fn default_graph_iri(&self) -> String {
         format!("{}{}", EVENT_GRAPH_NS, self.source_fingerprint)
@@ -891,6 +972,16 @@ impl EventGraph {
                 graph_term
             ));
         }
+        output
+    }
+
+    /// 事件图 → 可装载的 Prolog 程序：事实 + 只读派生规则。
+    pub fn to_prolog_program(&self) -> String {
+        let mut output = self.to_prolog_lines().join("\n");
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(EVENT_PROLOG_RULES);
         output
     }
 
@@ -2325,6 +2416,35 @@ mod tests {
         assert!(custom
             .lines()
             .all(|line| line.ends_with("<http://example.org/custom> .")));
+    }
+
+    #[test]
+    fn coreference_candidates_are_reported_not_merged() {
+        let graph =
+            EventGraph::build("1991年，张三认识李四。1991年，张三认识李四。1999年，张三认识李四。");
+        assert_eq!(graph.events.len(), 3, "{:?}", graph.stats);
+        let candidates = graph.coreference_candidates();
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.score >= 0.8 && candidate.reason.contains("时间")));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.left != candidate.right));
+    }
+
+    #[test]
+    fn prolog_program_ships_derived_rules_alongside_facts() {
+        let graph = EventGraph::build("1991年，张三认识李四。");
+        let program = graph.to_prolog_program();
+        assert!(program.contains("event_role("));
+        assert!(program.contains("event_before(A, B) :- event_link(A, before, B)."));
+        assert!(program.contains("event_participant(E, P)"));
+        let mut engine = crate::prolog_engine::PrologEngine::new();
+        engine
+            .consult_source(program)
+            .expect("事件程序应可被 Prolog 引擎装载");
+        let participants = engine.query("event_participant(E, P)");
+        assert!(!participants.is_empty(), "角色规则应可查询");
     }
 
     #[test]

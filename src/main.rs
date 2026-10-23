@@ -3810,9 +3810,7 @@ fn run_events(
         };
         print!("{}", rendered);
         if prolog {
-            for line in graph.to_prolog_lines() {
-                println!("{}", line);
-            }
+            print!("{}", graph.to_prolog_program());
         }
         return;
     }
@@ -3865,9 +3863,7 @@ fn run_events(
         print!("{}", graph.render_text());
     }
     if prolog {
-        for line in graph.to_prolog_lines() {
-            println!("{}", line);
-        }
+        print!("{}", graph.to_prolog_program());
     }
 }
 
