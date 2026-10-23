@@ -874,9 +874,6 @@ impl BatchTeachingLedger {
 
     pub fn adopt(&mut self, selector: &str, config: &SystemConfig) -> Result<Vec<String>, String> {
         let selectors = self.select_targets(selector)?;
-        if selectors.is_empty() {
-            return Err("没有可采纳的候选规则".to_string());
-        }
         let mut adopted = Vec::new();
         for id in selectors {
             let latest = self
@@ -1206,10 +1203,55 @@ process_error = ""
         let facts = "张三\tage\t18\n";
         let corpus = "张三的年龄是18岁。";
         let episode = teacher.teach(facts, corpus, "", &options(2));
+        let id = episode.candidates[0].id.clone();
         assert_eq!(episode.candidates[0].decision, RuleDecision::Review);
         let mut ledger = BatchTeachingLedger::default();
         ledger.record(episode);
-        assert!(ledger.adopt("all", &config).is_err());
+        assert!(ledger.adopt(&id, &config).is_err());
+        assert!(ledger.adopt("all", &config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn candidates_are_inert_before_explicit_adoption() {
+        let config = test_config();
+        let teacher = BatchTeacher::new(config.clone());
+        let facts = "张三\tage\t18\n李四\tage\t19\n";
+        let corpus = "张三的年龄是18岁。李四的年龄是19岁。";
+        let episode = teacher.teach(facts, corpus, "", &options(2));
+        let mut ledger = BatchTeachingLedger::default();
+        ledger.record(episode);
+        let tokens = tokenize("王五的年龄是23岁。", &config);
+        assert!(ledger
+            .extract_active(&config, "王五的年龄是23岁。", &tokens)
+            .is_empty());
+    }
+
+    #[test]
+    fn base_rules_covering_all_examples_force_review() {
+        let config = Arc::new(
+            toml::from_str::<SystemConfig>(
+                &CONFIG.replace(
+                    "extraction_rules = []\nprolog_rules = []",
+                    r#"prolog_rules = []
+[[extraction_rules]]
+name = "已有年龄规则"
+entity_type = "Person"
+priority = 10
+
+[[extraction_rules.patterns]]
+pos_pattern = ["nr", "u", "n", "v", "m", "q"]
+property_mappings = { name = "pos:nr", age = "pos:m" }"#,
+                ),
+            )
+            .expect("测试配置应可解析"),
+        );
+        let teacher = BatchTeacher::new(config);
+        let facts = "李四\tage\t18\n";
+        let corpus = "李四的年龄是18岁。";
+        let episode = teacher.teach(facts, corpus, "", &options(1));
+        let rule = &episode.candidates[0];
+        assert_eq!(rule.decision, RuleDecision::Review);
+        assert!(rule.reasons.iter().any(|reason| reason.contains("现有抽取规则")));
     }
 
     #[test]
