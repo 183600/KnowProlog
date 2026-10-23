@@ -12686,7 +12686,15 @@ impl SymbolicReasoner {
     /// 情态剥离后的指称问句 → 结构化目标。只接受单跳目标；多跳链让位给
     /// 原有推理管线，避免把中间实体的概率误当成整条链的概率。
     fn epistemic_target_from_core(&self, question: &str) -> Option<EpistemicTarget> {
-        let plan = self.planner.parse(question)?;
+        if let Some(plan) = self.planner.parse(question) {
+            if let Some(target) = self.epistemic_target_from_plan(plan) {
+                return Some(target);
+            }
+        }
+        self.epistemic_target_from_proposition(question)
+    }
+
+    fn epistemic_target_from_plan(&self, plan: QueryPlan) -> Option<EpistemicTarget> {
         match plan {
             QueryPlan::FindObject { segments } => {
                 let (entity, predicates) = self.split_chain(&segments)?;
@@ -12758,6 +12766,32 @@ impl SymbolicReasoner {
             )),
             _ => None,
         }
+    }
+
+    /// 无「的」链、但有已知关系词面的直陈句（「李四认识王五」）用与语义
+    /// 蕴含相同的命题解析器兜底，保证概率通道和判断通道读同一套词表。
+    fn epistemic_target_from_proposition(&self, question: &str) -> Option<EpistemicTarget> {
+        if question.contains('的') && !question.contains('是') {
+            return None;
+        }
+        let propositions = self.proposition_parser().parse(question);
+        if propositions.len() != 1 {
+            return None;
+        }
+        let proposition = &propositions[0];
+        if !matches!(
+            proposition.kind,
+            crate::semantic_entailment::PropositionKind::Relation
+                | crate::semantic_entailment::PropositionKind::Attribute
+        ) {
+            return None;
+        }
+        Some(EpistemicTarget::GroundClaim(Claim {
+            subject: proposition.subject.clone(),
+            predicate: proposition.predicate.clone(),
+            object: proposition.object.clone(),
+            negated: proposition.negative,
+        }))
     }
 
     fn render_probabilistic_intent(
@@ -21461,6 +21495,11 @@ types = [
             .expect("否定确定问应可回答");
         assert!(answer.contains("因此 P(李四 的 师傅 不是 赵六)=1.000"), "{}", answer);
         assert!(answer.contains("可以确认"), "{}", answer);
+        let denied = reasoner
+            .answer("李四有多大的可能不是王五的师傅")
+            .expect("否定概率问句应可回答");
+        assert!(denied.contains("因此 P(李四 的 师傅 不是 王五)=0.000"), "{}", denied);
+        assert!(denied.contains("已排除"), "{}", denied);
     }
 
     #[test]
@@ -21478,6 +21517,21 @@ types = [
     }
 
     #[test]
+    fn epistemic_probability_parses_a_direct_relation() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "李四".to_string(),
+            rel_type: "认识".to_string(),
+            to: "王五".to_string(),
+        }]);
+        let answer = reasoner
+            .answer("李四有多大的可能认识王五")
+            .expect("直陈关系应能进入概率通道");
+        assert!(answer.contains("认识"), "{}", answer);
+        assert!(answer.contains("P=1.000"), "{}", answer);
+    }
+
+    #[test]
     fn epistemic_probability_reads_taught_probabilistic_facts() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
@@ -21487,5 +21541,20 @@ types = [
             .expect("教过的概率事实应可回答");
         assert!(answer.contains("P=0.800"), "{}", answer);
         assert!(answer.contains("概率事实"), "{}", answer);
+    }
+
+    #[test]
+    fn epistemic_question_survives_dialogue_frame_normalization() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let mut dialogue = crate::dialogue_manager::DialogueManager::new();
+        let answer = dialogue
+            .plan_pure_dialogue("李四的师傅可能是谁", &reasoner)
+            .or_else(|| dialogue.plan_reply("李四的师傅可能是谁", &reasoner))
+            .map(|reply| reply.text)
+            .or_else(|| reasoner.answer("李四的师傅可能是谁"))
+            .expect("对话层应回答情态问句");
+        assert!(answer.contains("PQI"), "对话层丢失情态：{}", answer);
+        assert!(answer.contains("P=1.000"), "{}", answer);
     }
 }

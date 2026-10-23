@@ -696,7 +696,14 @@ fn parse_probability_target(raw: &str) -> Option<EpistemicTarget> {
             continue;
         }
         let right = trim_leading_phrases(right, &["是", "成为", "当", "做"]);
-        if let Some(claim) = parse_claim(&format!("{}是{}", left, right)) {
+        // 「李四有多大的可能不是王五的师傅」：否定词属于断言，不能拼成
+        // 「李四是不是…」这种双重系词。
+        let candidate = if right.starts_with('不') || right.starts_with('没') {
+            format!("{}{}", left, right)
+        } else {
+            format!("{}是{}", left, right)
+        };
+        if let Some(claim) = parse_claim(&candidate) {
             return Some(EpistemicTarget::GroundClaim(claim));
         }
         if let Some(claim) = parse_claim(left) {
@@ -985,6 +992,19 @@ mod tests {
     fn copula_negation_stays_inside_the_claim() {
         let intent = ProbabilisticQueryIntent::analyze("李四一定不是王五的师傅吗").unwrap();
         assert_eq!(intent.mode, EpistemicMode::Certainty);
+        let Some(EpistemicTarget::GroundClaim(claim)) = intent.target else {
+            panic!("应抽出带否定的基原子");
+        };
+        assert_eq!(claim.subject, "李四");
+        assert_eq!(claim.predicate, "师傅");
+        assert_eq!(claim.object, "王五");
+        assert!(claim.negated);
+    }
+
+    #[test]
+    fn probability_frame_keeps_a_negated_copula() {
+        let intent =
+            ProbabilisticQueryIntent::analyze("李四有多大的可能不是王五的师傅").unwrap();
         let Some(EpistemicTarget::GroundClaim(claim)) = intent.target else {
             panic!("应抽出带否定的基原子");
         };
