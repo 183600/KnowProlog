@@ -1884,6 +1884,24 @@ impl OxigraphManager {
         self.import_jsonld(&content).await
     }
 
+    /// 按名称识别 RDF 序列化格式，供标准输入等没有扩展名的场景使用。
+    pub fn parse_rdf_format(
+        name: &str,
+    ) -> Result<oxigraph::io::RdfFormat, Box<dyn std::error::Error + Send + Sync>> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "ttl" | "turtle" => Ok(oxigraph::io::RdfFormat::Turtle),
+            "nt" | "ntriples" | "n-triples" => Ok(oxigraph::io::RdfFormat::NTriples),
+            "nq" | "nquads" | "n-quads" => Ok(oxigraph::io::RdfFormat::NQuads),
+            "trig" => Ok(oxigraph::io::RdfFormat::TriG),
+            "rdf" | "xml" | "rdfxml" | "rdf/xml" => Ok(oxigraph::io::RdfFormat::RdfXml),
+            _ => Err(format!(
+                "无法识别 RDF 格式「{}」（支持 ttl / nt / nq / trig / rdf / xml）",
+                name
+            )
+            .into()),
+        }
+    }
+
     /// 从文件扩展名识别 RDF 序列化格式（ttl / nt / nq / trig / rdf / xml）。
     ///
     /// JSON-LD 不在此列：请使用 `import_jsonld` / `import_jsonld_from_file`，
@@ -5676,6 +5694,34 @@ mod cache_tests {
             OxigraphManager::detect_rdf_format("kb").is_err(),
             "无扩展名应报错"
         );
+    }
+
+    /// 标准输入没有扩展名，必须能按显式格式名解析；未知名称要明确报错。
+    #[test]
+    fn parse_rdf_format_accepts_names_and_rejects_unknown() {
+        use oxigraph::io::RdfFormat;
+        assert!(matches!(
+            OxigraphManager::parse_rdf_format("ttl"),
+            Ok(RdfFormat::Turtle)
+        ));
+        assert!(matches!(
+            OxigraphManager::parse_rdf_format("N-Triples"),
+            Ok(RdfFormat::NTriples)
+        ));
+        assert!(matches!(
+            OxigraphManager::parse_rdf_format("nq"),
+            Ok(RdfFormat::NQuads)
+        ));
+        assert!(matches!(
+            OxigraphManager::parse_rdf_format("trig"),
+            Ok(RdfFormat::TriG)
+        ));
+        assert!(matches!(
+            OxigraphManager::parse_rdf_format("rdf/xml"),
+            Ok(RdfFormat::RdfXml)
+        ));
+        let error = OxigraphManager::parse_rdf_format("jsonld").unwrap_err();
+        assert!(error.to_string().contains("无法识别"), "{}", error);
     }
 
     /// RDF 文件导入：新增三元组计数正确、重复导入幂等、数据进入知识快照。

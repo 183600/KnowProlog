@@ -131,16 +131,21 @@ static ENTITY_ATTRIBUTE_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Import JSON-LD knowledge base from file
+    /// Import JSON-LD knowledge base from file or stdin
     ImportJsonld {
-        /// Path to the JSON-LD file
+        /// Path to the JSON-LD file; "-" reads from stdin
         file_path: String,
     },
-    /// Import an RDF file (Turtle / N-Triples / N-Quads / TriG / RDF/XML;
-    /// format inferred from the extension)
+    /// Import an RDF file or stdin (Turtle / N-Triples / N-Quads / TriG /
+    /// RDF/XML; format inferred from the extension, or set with --format)
     ImportRdf {
-        /// Path to the RDF file (.ttl / .nt / .nq / .trig / .rdf / .xml)
+        /// Path to the RDF file (.ttl / .nt / .nq / .trig / .rdf / .xml);
+        /// "-" reads from stdin
         file_path: String,
+        /// Explicit RDF format (ttl / nt / nq / trig / rdf / xml); required
+        /// when reading from stdin
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Batch-import natural-language sentences with the explicitly adopted
     /// batch-teaching rules (base extraction rules still run first)
@@ -1314,11 +1319,22 @@ async fn main() {
     match cli.command {
         Some(Commands::ImportJsonld { file_path }) => {
             load_persistent_registries(&config, &oxigraph_manager, &store_path);
-            println!("正在导入 JSON-LD 文件: {}", file_path);
+            let import_result = if file_path == "-" {
+                println!("正在从标准输入导入 JSON-LD...");
+                let mut content = String::new();
+                if let Err(error) = std::io::stdin().read_to_string(&mut content) {
+                    eprintln!("读取标准输入失败: {}", error);
+                    std::process::exit(1);
+                }
+                oxigraph_manager.import_jsonld(&content).await
+            } else {
+                println!("正在导入 JSON-LD 文件: {}", file_path);
+                oxigraph_manager.import_jsonld_from_file(&file_path).await
+            };
 
-            match oxigraph_manager.import_jsonld_from_file(&file_path).await {
+            match import_result {
                 Ok(stats) => {
-                    println!("JSON-LD 文件导入成功：{}", stats.summary());
+                    println!("JSON-LD 导入成功：{}", stats.summary());
                     if let Err(error) =
                         persist_registry_observations(&oxigraph_manager, &store_path).await
                     {
@@ -1326,7 +1342,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("JSON-LD 文件导入失败: {}", e);
+                    eprintln!("JSON-LD 导入失败: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -1350,13 +1366,55 @@ async fn main() {
                 }
             }
         }
-        Some(Commands::ImportRdf { file_path }) => {
+        Some(Commands::ImportRdf { file_path, format }) => {
             load_persistent_registries(&config, &oxigraph_manager, &store_path);
-            println!("正在导入 RDF 文件: {}", file_path);
+            let import_result = if file_path == "-" {
+                let Some(format_name) = format.as_deref() else {
+                    eprintln!(
+                        "从标准输入导入 RDF 时必须用 --format 指定格式（ttl / nt / nq / trig / rdf / xml）"
+                    );
+                    std::process::exit(2);
+                };
+                let format = match OxigraphManager::parse_rdf_format(format_name) {
+                    Ok(format) => format,
+                    Err(error) => {
+                        eprintln!("{}", error);
+                        std::process::exit(2);
+                    }
+                };
+                println!("正在从标准输入导入 RDF（{}）...", format_name);
+                let mut content = Vec::new();
+                if let Err(error) = std::io::stdin().read_to_end(&mut content) {
+                    eprintln!("读取标准输入失败: {}", error);
+                    std::process::exit(1);
+                }
+                oxigraph_manager
+                    .import_rdf_reader(format, content.as_slice())
+                    .await
+            } else {
+                println!("正在导入 RDF 文件: {}", file_path);
+                if let Some(format_name) = format.as_deref() {
+                    let format = match OxigraphManager::parse_rdf_format(format_name) {
+                        Ok(format) => format,
+                        Err(error) => {
+                            eprintln!("{}", error);
+                            std::process::exit(2);
+                        }
+                    };
+                    match std::fs::File::open(&file_path) {
+                        Ok(file) => {
+                            oxigraph_manager.import_rdf_reader(format, file).await
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                } else {
+                    oxigraph_manager.import_rdf_file(&file_path).await
+                }
+            };
 
-            match oxigraph_manager.import_rdf_file(&file_path).await {
+            match import_result {
                 Ok(added) => {
-                    println!("RDF 文件导入成功：新增 {} 条三元组！", added);
+                    println!("RDF 导入成功：新增 {} 条三元组！", added);
                     if let Err(error) =
                         persist_registry_observations(&oxigraph_manager, &store_path).await
                     {
@@ -1364,7 +1422,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("RDF 文件导入失败: {}", e);
+                    eprintln!("RDF 导入失败: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -13611,6 +13669,44 @@ mod session_tests {
         }
         assert_eq!(generation_followup("介绍一下北京"), None);
         assert_eq!(generation_followup("北京的人口是多少"), None);
+    }
+
+    #[test]
+    fn import_cli_accepts_stdin_and_explicit_rdf_format() {
+        let jsonld = Cli::try_parse_from(["knowprolog", "import-jsonld", "-"]).unwrap();
+        assert!(matches!(
+            jsonld.command,
+            Some(Commands::ImportJsonld { file_path }) if file_path == "-"
+        ));
+
+        let rdf = Cli::try_parse_from([
+            "knowprolog",
+            "import-rdf",
+            "-",
+            "--format",
+            "turtle",
+        ])
+        .unwrap();
+        match rdf.command {
+            Some(Commands::ImportRdf { file_path, format }) => {
+                assert_eq!(file_path, "-");
+                assert_eq!(format.as_deref(), Some("turtle"));
+            }
+            other => panic!("应解析为 import-rdf: {:?}", other),
+        }
+
+        let file = Cli::try_parse_from([
+            "knowprolog",
+            "import-rdf",
+            "dump.data",
+            "--format",
+            "ttl",
+        ])
+        .unwrap();
+        assert!(matches!(
+            file.command,
+            Some(Commands::ImportRdf { format: Some(name), .. }) if name == "ttl"
+        ));
     }
 
     #[test]
