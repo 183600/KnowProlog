@@ -29,6 +29,7 @@ pub mod chronicle;
 pub mod completion_episode;
 pub mod confidence;
 pub mod config_contract;
+pub mod constructive;
 pub mod context_image;
 pub mod contextual_rag;
 pub mod contextual_reference;
@@ -467,6 +468,10 @@ pub struct ReasoningConfig {
     /// 默认关闭；只有显式启用且证书通过校验时才接管情态回答。
     #[serde(default)]
     pub confidence: confidence::ConfidenceConfig,
+    /// 建设性多跳推理：在链式查询缺口处合成有证明的虚拟事实。
+    /// 默认关闭；关闭时回答路径与旧行为逐字节一致。
+    #[serde(default)]
+    pub constructive: constructive::ConstructionConfig,
 }
 
 fn default_enable_holographic_memory() -> bool {
@@ -696,6 +701,7 @@ impl Default for ReasoningConfig {
             enable_contextual_rag: false,
             require_predicate_admission: false,
             confidence: confidence::ConfidenceConfig::default(),
+            constructive: constructive::ConstructionConfig::default(),
         }
     }
 }

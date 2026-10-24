@@ -14479,6 +14479,7 @@ mod tests {
             enable_contextual_rag: false,
             require_predicate_admission: false,
             confidence: crate::confidence::ConfidenceConfig::default(),
+            constructive: crate::constructive::ConstructionConfig::default(),
         }
     }
 
