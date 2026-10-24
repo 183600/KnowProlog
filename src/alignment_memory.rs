@@ -954,34 +954,26 @@ impl AlignmentMemory {
             self.rules.remove(&id);
             self.push_event(turn, "expire", &id, String::new());
         }
-        if self.rules.len() > self.capacity {
-            let mut removable: Vec<(bool, u32, u64, String)> = self
+        while self.rules.len() > self.capacity {
+            // 淘汰顺序：已否证墓碑 → 低支持 → 更早使用 → 字典序；`min_by`
+            // 选中的就是最该丢的一条。旧实现排序后从尾部弹出，反而先丢高支持
+            // 的活规则、留下墓碑。
+            let victim = self
                 .rules
                 .values()
-                .map(|rule| {
-                    (
-                        rule.status == AlignmentStatus::Refuted,
-                        rule.support,
-                        rule.last_turn,
-                        rule.id.clone(),
-                    )
+                .min_by(|left, right| {
+                    (left.status == AlignmentStatus::Active)
+                        .cmp(&(right.status == AlignmentStatus::Active))
+                        .then_with(|| left.support.cmp(&right.support))
+                        .then_with(|| left.last_turn.cmp(&right.last_turn))
+                        .then_with(|| right.id.cmp(&left.id))
                 })
-                .collect();
-            removable.sort_by(|left, right| {
-                right
-                    .0
-                    .cmp(&left.0)
-                    .then_with(|| left.1.cmp(&right.1))
-                    .then_with(|| left.2.cmp(&right.2))
-                    .then_with(|| left.3.cmp(&right.3))
-            });
-            while self.rules.len() > self.capacity {
-                let Some((_, _, _, id)) = removable.pop() else {
-                    break;
-                };
-                if self.rules.remove(&id).is_some() {
-                    self.push_event(turn, "evict", &id, String::new());
-                }
+                .map(|rule| rule.id.clone());
+            let Some(id) = victim else {
+                break;
+            };
+            if self.rules.remove(&id).is_some() {
+                self.push_event(turn, "evict", &id, String::new());
             }
         }
         self.bound_echoes();
@@ -1463,6 +1455,94 @@ mod tests {
         assert_eq!(restored, memory);
         assert!(json.contains("suffix"));
         assert!(json.contains("未名科技公司"));
+    }
+
+    #[test]
+    fn eviction_drops_tombstones_then_low_support_rules() {
+        let mut memory = AlignmentMemory::new(2);
+        memory.learn_pair(
+            1,
+            "未名科技公司",
+            "未名科技",
+            AlignmentKind::Entity,
+            Some("组织"),
+            "用户纠正",
+            AlignmentScope::Session,
+        );
+        memory.learn_pair(
+            1,
+            "远山科技公司",
+            "远山科技",
+            AlignmentKind::Entity,
+            Some("组织"),
+            "用户纠正",
+            AlignmentScope::Session,
+        );
+        let tombstone = memory
+            .rules
+            .values()
+            .find(|rule| rule.target == "未名科技")
+            .map(|rule| rule.id.clone())
+            .expect("规则应已建立");
+        assert!(memory.refute_rule(2, &tombstone, "未名科技公司"));
+
+        memory.learn_pair(
+            3,
+            "张三先生",
+            "张三",
+            AlignmentKind::Entity,
+            Some("人物"),
+            "用户称呼",
+            AlignmentScope::Session,
+        );
+        assert_eq!(memory.len(), 2, "容量应被遵守");
+        assert!(
+            !memory.rules.contains_key(&tombstone),
+            "溢出时应先淘汰已否证的墓碑"
+        );
+        assert!(memory.rules.values().any(|rule| rule.target == "远山科技"));
+        assert!(memory.rules.values().any(|rule| rule.target == "张三"));
+    }
+
+    #[test]
+    fn eviction_keeps_high_support_active_rules() {
+        let mut memory = AlignmentMemory::new(2);
+        for (surface, canonical) in [("未名科技公司", "未名科技"), ("远山科技公司", "远山科技")] {
+            memory.learn_pair(
+                1,
+                surface,
+                canonical,
+                AlignmentKind::Entity,
+                Some("组织"),
+                "用户纠正",
+                AlignmentScope::Session,
+            );
+        }
+        for _ in 0..3 {
+            memory.learn_pair(
+                2,
+                "远山科技公司",
+                "远山科技",
+                AlignmentKind::Entity,
+                Some("组织"),
+                "重复观察",
+                AlignmentScope::Session,
+            );
+        }
+        memory.learn_pair(
+            3,
+            "张三先生",
+            "张三",
+            AlignmentKind::Entity,
+            Some("人物"),
+            "用户称呼",
+            AlignmentScope::Session,
+        );
+        assert_eq!(memory.len(), 2);
+        assert!(
+            memory.rules.values().any(|rule| rule.target == "远山科技"),
+            "高支持规则不应先于低支持规则被淘汰"
+        );
     }
 
     #[test]
