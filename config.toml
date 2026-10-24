@@ -127,6 +127,26 @@ calibration = [
   { score = 1.00, probability = 0.95 },
 ]
 
+# 软路由：精确模式路由失败后，用动态规划软对齐 + log-odds 证据竞争解释。
+# 只在精确/回退路由都未命中时接管；守卫与覆盖闸门先行，领先不足时澄清或回退。
+[reasoning.soft_route]
+enabled = true                         # 关闭后与旧路径逐字节一致
+accept_threshold = 0.74                # 接受解释的最低后验
+clarify_threshold = 0.48               # 进入澄清档的最低后验
+accept_margin = 0.08                   # 不同路由的领先优势下限
+min_alignment = 0.62                   # 对齐得分硬闸门
+min_token_coverage = 0.55              # token 覆盖硬闸门
+alignment_pivot = 0.72                 # 对齐证据的中性点
+alignment_scale = 0.12                 # 对齐证据尺度
+alignment_gain = 1.6                   # 对齐证据的 log-odds 增益
+priority_gain = 0.35                   # 模式优先级先验增益
+specificity_gain = 0.25                # 模式特化度先验增益
+context_bonus = 0.30                   # 守卫满足时的上下文证据
+fallback_penalty = 0.30                # NLU 回退候选折扣
+extra_token_penalty = 0.06             # 每个未对齐实词的惩罚
+fuzzy_floor = 0.55                     # 单要素可接受的最低对齐质量
+max_alternatives = 4                   # 报告展示的候选上限
+
 # 声明式插件（符号专家）：每个包是一份带类型贡献的 TOML 清单，
 # 不加载动态库、不执行插件代码；交互模式用「插件」查看，用「启用插件：<id>」切换。
 [plugins]

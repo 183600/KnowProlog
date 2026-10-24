@@ -6584,6 +6584,48 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 软路由解释：精确路由失败时，哪些近失解释在竞争、差多少、为何接受/澄清/回退
+        if let Some(text) = strip_any_prefix(
+            input,
+            &["软路由：", "软路由:", "软路由 ", "软匹配：", "软匹配:"],
+        ) {
+            let text = text.trim();
+            if text.is_empty() {
+                println!("用法：软路由：<句子>，例如「软路由：法国首都是哪里」。");
+            } else {
+                let tagged = preprocess(text, &config.nlp);
+                let normalized = normalize_words(tagged, &synonyms);
+                let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
+                let outcome = know_prolog::soft_route::route_tokens(
+                    text,
+                    &pattern_library,
+                    &normalized,
+                    &context,
+                    &config.reasoning.soft_route,
+                );
+                println!("{}", outcome.render_report(text));
+                let exact = pattern_library
+                    .match_route_with_context(&normalized, &context)
+                    .or_else(|| pattern_library.match_fallback_with_context(&normalized, &context));
+                match exact {
+                    Some(matched) => println!(
+                        "精确路由已命中「{}」：软路由仅作解释，不会改变回答路径。",
+                        matched.entry.name
+                    ),
+                    None => println!(
+                        "精确路由未命中；自动接管：{}。",
+                        if config.reasoning.soft_route.enabled {
+                            "开启"
+                        } else {
+                            "关闭（仅手动查看）"
+                        }
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
         // 模式匹配解释：对一句话给出胜者、命中榜与落选原因
         if let Some(text) = strip_any_prefix(
             input,
@@ -11090,6 +11132,7 @@ async fn run_interactive_mode(
                                             &normalized_words,
                                             &mut pattern_episodes,
                                             &route_context,
+                                            &config.reasoning.soft_route,
                                         )
                                     {
                                         // 执行查询流程
@@ -11150,6 +11193,7 @@ async fn run_interactive_mode(
                                             &normalized_words,
                                             &mut pattern_episodes,
                                             &route_context,
+                                            &config.reasoning.soft_route,
                                         )
                                     {
                                         if let Some(note) = &pattern_note {
@@ -11302,6 +11346,7 @@ async fn run_interactive_mode(
                     &normalized_words,
                     &mut pattern_episodes,
                     &route_context,
+                    &config.reasoning.soft_route,
                 ) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
@@ -12030,6 +12075,7 @@ fn interactive_help() -> String {
         "  模式关系 / 模式关系图                 泛化/冗余/冲突落成的图边与图体检查询",
         "  模式落图 / 同步模式图                 把模式库、关系边与模式经验同步到命名图",
         "  模式匹配：<句子>                     查看命中模式、绑定与落选原因",
+        "  软路由：<句子>                       查看近失解释的软对齐、置信度与接受/澄清/回退决策",
         "  模式经验 / 经验台账                  查看命中/未命中的可检索理解经验",
         "  模式联想：<句子>                     用相似成功经验泛化候选骨架（只确认，不直接回答）",
         "  确认联想：<句子>                     用户确认候选骨架，转正为可路由模式并落图",
@@ -12690,6 +12736,11 @@ fn is_command_like(input: &str) -> bool {
         "模式匹配 ",
         "匹配模式：",
         "匹配模式:",
+        "软路由：",
+        "软路由:",
+        "软路由 ",
+        "软匹配：",
+        "软匹配:",
         "教模式：",
         "教模式:",
         "教模式 ",
@@ -12855,47 +12906,77 @@ fn route_query_with_patterns(
     words: &[know_prolog::nlp::TaggedWord],
     episodes: &mut pattern_ir::PatternEpisodeLog,
     context: &pattern_ir::PatternContext,
+    soft_config: &know_prolog::soft_route::SoftRouteConfig,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    let Some(matched) = library
+    if let Some(matched) = library
         .match_route_with_context(words, context)
         .or_else(|| library.match_fallback_with_context(words, context))
-    else {
-        // 失败也要留下可行动的粒度：记录最近受阻模式停在哪一要素。
-        let frontier_report = frontier::analyze_tokens(input, words, library, context);
-        let snapshot = frontier_report.closest_blocked().and_then(|row| {
-            row.failure
-                .as_ref()
-                .map(|failure| pattern_ir::EpisodeFrontier {
-                    pattern_id: row.id.clone(),
-                    pattern_name: row.name.clone(),
-                    query_type: row.query_type.clone(),
-                    coverage: row.coverage(),
-                    failure: failure.clone(),
-                })
-        });
-        episodes.record_unmatched_with_frontier(input, words, context, snapshot);
-        return None;
-    };
-    episodes.record_match_with_context(input, words, &matched, context);
-    let guard = matched
-        .entry
-        .guard
-        .as_ref()
-        .map(|guard| format!("，守卫：{}", guard.render()))
-        .unwrap_or_default();
-    let note = format!(
-        "{}（{}，优先级 {}，来源 {}{}）",
-        matched.entry.name,
-        matched.entry.render(),
-        matched.entry.priority,
-        matched.entry.source,
-        guard
-    );
-    Some((
-        matched.entry.query_type.clone(),
-        matched.entities.clone(),
-        Some(note),
-    ))
+    {
+        episodes.record_match_with_context(input, words, &matched, context);
+        let guard = matched
+            .entry
+            .guard
+            .as_ref()
+            .map(|guard| format!("，守卫：{}", guard.render()))
+            .unwrap_or_default();
+        let note = format!(
+            "{}（{}，优先级 {}，来源 {}{}）",
+            matched.entry.name,
+            matched.entry.render(),
+            matched.entry.priority,
+            matched.entry.source,
+            guard
+        );
+        return Some((
+            matched.entry.query_type.clone(),
+            matched.entities.clone(),
+            Some(note),
+        ));
+    }
+
+    // 精确路由未命中：软路由只在通过守卫/覆盖闸门且领先时接管。
+    if soft_config.enabled {
+        let outcome = know_prolog::soft_route::route_tokens(
+            input, library, words, context, soft_config,
+        );
+        if outcome.decision == know_prolog::soft_route::SoftDecision::Accept {
+            if let Some(candidate) = outcome.selected {
+                let matched = candidate.to_pattern_match();
+                episodes.record_match_with_context(input, words, &matched, context);
+                let note = format!(
+                    "软路由：{}（{}，理解置信度 {:.2}，对齐 {:.0}%，要素 {}/{}，token 覆盖 {:.0}%）",
+                    candidate.name(),
+                    candidate.entry.render(),
+                    candidate.confidence,
+                    candidate.alignment.score * 100.0,
+                    candidate.alignment.matched_elems,
+                    candidate.alignment.total_elems,
+                    candidate.alignment.token_coverage() * 100.0
+                );
+                return Some((
+                    matched.entry.query_type.clone(),
+                    matched.entities.clone(),
+                    Some(note),
+                ));
+            }
+        }
+    }
+
+    // 失败也要留下可行动的粒度：记录最近受阻模式停在哪一要素。
+    let frontier_report = frontier::analyze_tokens(input, words, library, context);
+    let snapshot = frontier_report.closest_blocked().and_then(|row| {
+        row.failure
+            .as_ref()
+            .map(|failure| pattern_ir::EpisodeFrontier {
+                pattern_id: row.id.clone(),
+                pattern_name: row.name.clone(),
+                query_type: row.query_type.clone(),
+                coverage: row.coverage(),
+                failure: failure.clone(),
+            })
+    });
+    episodes.record_unmatched_with_frontier(input, words, context, snapshot);
+    None
 }
 
 /// 解析更正命令：`实体|属性|旧值|新值` 或 `实体 的 属性 从 旧值 改为 新值`。

@@ -14868,6 +14868,7 @@ mod tests {
             require_predicate_admission: false,
             confidence: crate::confidence::ConfidenceConfig::default(),
             constructive: crate::constructive::ConstructionConfig::default(),
+            soft_route: crate::soft_route::SoftRouteConfig::default(),
         }
     }
 

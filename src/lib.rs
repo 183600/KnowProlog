@@ -128,6 +128,7 @@ pub mod shape_eval;
 pub mod shape_gate;
 pub mod similarity_calculator;
 pub mod slot_ledger;
+pub mod soft_route;
 pub mod startup_ledger;
 pub mod symbolic_generator;
 pub mod symbolic_reasoner;
@@ -525,6 +526,10 @@ pub struct ReasoningConfig {
     /// 默认关闭；关闭时回答路径与旧行为逐字节一致。
     #[serde(default)]
     pub constructive: constructive::ConstructionConfig,
+    /// 软路由：精确模式路由失败后，用软对齐与 log-odds 证据竞争解释。
+    /// 默认开启；只有通过守卫/覆盖闸门且领先的候选才会被接受。
+    #[serde(default)]
+    pub soft_route: soft_route::SoftRouteConfig,
 }
 
 fn default_enable_holographic_memory() -> bool {
@@ -755,6 +760,7 @@ impl Default for ReasoningConfig {
             require_predicate_admission: false,
             confidence: confidence::ConfidenceConfig::default(),
             constructive: constructive::ConstructionConfig::default(),
+            soft_route: soft_route::SoftRouteConfig::default(),
         }
     }
 }
