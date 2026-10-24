@@ -56,6 +56,7 @@ use crate::pending_question::{
 };
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
+use crate::predictive_elaboration::{PredictiveElaboration, PredictionGuard};
 use crate::predicate_registry::PredicateRegistry;
 use crate::confidence::{ConfidenceDecision, DecisionRecord};
 use crate::probabilistic_query_intent::{
@@ -573,6 +574,8 @@ pub struct DialogueSnapshot {
     // 空台账不落盘，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<CompletionLedger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predictive: Option<PredictiveElaboration>,
     // 当前假设世界的临时假设（未确认、未写入会话事实层）；
     // 空世界不落盘，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -817,6 +820,7 @@ impl DialogueContext {
             pending_questions: None,
             ontology: None,
             completion: None,
+            predictive: None,
             assumptions: Vec::new(),
             session_receipts: Vec::new(),
             pending_hypotheses: Vec::new(),
@@ -1131,6 +1135,8 @@ pub struct SymbolicReasoner {
     predictor: LinkPredictor,
     // 补全回合：确认 → 归纳批次规则 → 有界闭包；默认不写图谱、不全局生效。
     completion: CompletionLedger,
+    // 生成侧推测账本：链接预测 → 闸门 → 呈现 → 裁决 → 会话记忆。
+    predictive: PredictiveElaboration,
     // 律典：声明律 + 挖掘律的统一台账；仅 Active 的传递/对称/互逆律参与查询扩展。
     laws: LawBook,
     // 律典的声明来源快照；知识变化时据此重建，避免把配置知识散落在查询路径。
@@ -1242,6 +1248,7 @@ impl Clone for SymbolicReasoner {
             aligner: self.aligner.clone(),
             predictor: self.predictor.clone(),
             completion: self.completion.clone(),
+            predictive: self.predictive.clone(),
             laws: self.laws.clone(),
             law_registry: self.law_registry.clone(),
             persisted_laws: self.persisted_laws.clone(),
@@ -1448,6 +1455,7 @@ impl SymbolicReasoner {
             aligner,
             predictor: LinkPredictor::new(),
             completion: CompletionLedger::new(),
+            predictive: PredictiveElaboration::new(),
             laws: LawBook::new(),
             law_registry: None,
             persisted_laws: None,
@@ -1574,6 +1582,7 @@ impl SymbolicReasoner {
         self.session_clauses.clear();
         // 补全回合属于会话态：分叉/重置不得把已确认候选与规则带进新会话。
         self.completion = CompletionLedger::new();
+        self.predictive = PredictiveElaboration::new();
         self.clarification = None;
         self.last_abduction_goal = None;
         self.last_abduction_vars.clear();
@@ -6770,6 +6779,212 @@ impl SymbolicReasoner {
         self.completion
             .next_question()
             .map(|question| format!("  下一问（{}）：{}\n", question.kind.label(), question.text))
+    }
+
+    pub fn predictive_ledger(&self) -> &PredictiveElaboration {
+        &self.predictive
+    }
+
+    fn predictive_guard(&mut self) -> PredictionGuard {
+        let mut guard = PredictionGuard::new();
+        for triple in self.predictor.triples() {
+            guard.insert_known(&triple.subject, &triple.predicate, &triple.object);
+        }
+        for triple in self.completion.refuted_triples() {
+            guard.insert_refuted(&triple.subject, &triple.predicate, &triple.object);
+        }
+        for atom in &self.session_facts {
+            if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+                guard.insert_session(subject, predicate, object);
+            }
+        }
+        for atom in &self.session_negative_facts {
+            if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
+                guard.insert_refuted(subject, predicate, object);
+            }
+        }
+        for predicate in self.slots.policy().functional_predicates() {
+            guard.mark_functional(predicate);
+        }
+        for (entity, etype) in self.generator.typed_entities() {
+            guard.insert_type(&entity, &etype);
+        }
+        let closure = self.discourse.narrator_mut().closure().clone();
+        guard.set_closure(closure);
+        guard
+    }
+
+    pub fn predictive_elaboration(&mut self, entity_raw: &str) -> Option<String> {
+        if !self.config.enable_link_prediction {
+            return None;
+        }
+        let trimmed = entity_raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let canonical = self.aligner.canonical_form(trimmed);
+        let entity = if canonical.is_empty() {
+            trimmed.to_string()
+        } else {
+            canonical
+        };
+        if !self.predictor.participates(&entity) && !self.generator.is_known_entity(&entity) {
+            return Some(format!(
+                "「{}」不在知识图谱的关系中：推测需要至少一条已导入关系。",
+                entity
+            ));
+        }
+        let limit = self.config.max_predictions.saturating_mul(4).clamp(6, 24);
+        let predictions = self.predictor.predict_for_entity(&entity, None, limit);
+        let guard = self.predictive_guard();
+        let plan = self
+            .predictive
+            .propose(&entity, &predictions, &self.predictor, &guard);
+        Some(plan.render())
+    }
+
+    pub fn generate_about_with_prediction(&mut self, entity_raw: &str) -> Option<String> {
+        let facts = self.generate_about(entity_raw);
+        let speculation = self.predictive_elaboration(entity_raw);
+        match (facts, speculation) {
+            (Some(facts), Some(speculation)) => {
+                Some(format!("{}\n\n{}", facts.trim_end(), speculation.trim_end()))
+            }
+            (Some(facts), None) => Some(facts),
+            (None, Some(speculation)) => Some(speculation),
+            (None, None) => None,
+        }
+    }
+
+    pub fn predictive_confirm(&mut self, selector: &str) -> String {
+        let hypothesis = match self.predictive.resolve(selector, true) {
+            Ok(hypothesis) => hypothesis,
+            Err(error) => return format!("无法确认预测：{}。", error),
+        };
+        let atom = Atom::rel(
+            &hypothesis.key.predicate,
+            &hypothesis.key.subject,
+            &hypothesis.key.object,
+        );
+        let label = format!("确认预测：{}", hypothesis.key.display());
+        match self.commit_session_assertion(label, &atom) {
+            Ok(_) => {
+                self.note_dialogue_verdict(
+                    &hypothesis.key.subject,
+                    &hypothesis.key.predicate,
+                    &hypothesis.key.object,
+                    true,
+                    &hypothesis.id,
+                );
+                format!(
+                    "已确认预测：{}。该事实只进入本次会话事实层（未写入知识图谱），后续介绍会把它当作会话事实。",
+                    hypothesis.sentence()
+                )
+            }
+            Err(error) => {
+                self.predictive.reopen(&hypothesis.id);
+                format!("确认未写入：{}", error)
+            }
+        }
+    }
+
+    pub fn predictive_refute(&mut self, selector: &str) -> String {
+        let hypothesis = match self.predictive.resolve(selector, false) {
+            Ok(hypothesis) => hypothesis,
+            Err(error) => return format!("无法否定预测：{}。", error),
+        };
+        let atom = Atom::rel(
+            &hypothesis.key.predicate,
+            &hypothesis.key.subject,
+            &hypothesis.key.object,
+        );
+        let message = self.assert_negative_atom(atom);
+        self.note_dialogue_verdict(
+            &hypothesis.key.subject,
+            &hypothesis.key.predicate,
+            &hypothesis.key.object,
+            false,
+            &hypothesis.id,
+        );
+        format!(
+            "已否定预测：{}。\n  {}\n本会话内不再提名该候选。",
+            hypothesis.sentence(),
+            message.trim()
+        )
+    }
+
+    pub fn predictive_report(&self) -> String {
+        self.predictive.render_report()
+    }
+
+    pub fn handle_predictive_command(&mut self, input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        for prefix in ["预测展开：", "预测展开:"] {
+            if let Some(entity) = trimmed.strip_prefix(prefix) {
+                let entity = entity.trim();
+                return Some(if entity.is_empty() {
+                    "请提供要展开的实体，例如：预测展开：李四".to_string()
+                } else {
+                    self.generate_about_with_prediction(entity)
+                        .unwrap_or_else(|| format!("无法为「{}」生成推测。", entity))
+                });
+            }
+        }
+        for prefix in ["推测：", "推测:", "预测推测：", "预测推测:"] {
+            if let Some(entity) = trimmed.strip_prefix(prefix) {
+                let entity = entity.trim();
+                return Some(if entity.is_empty() {
+                    "请提供要推测的实体，例如：推测：李四".to_string()
+                } else {
+                    self.predictive_elaboration(entity)
+                        .unwrap_or_else(|| format!("无法为「{}」生成推测。", entity))
+                });
+            }
+        }
+        for prefix in [
+            "确认预测：",
+            "确认预测:",
+            "确认推测：",
+            "确认推测:",
+            "采纳预测：",
+            "采纳预测:",
+        ] {
+            if let Some(selector) = trimmed.strip_prefix(prefix) {
+                let selector = selector.trim();
+                return Some(if selector.is_empty() {
+                    "请给出推测序号或编号，例如：确认预测：1".to_string()
+                } else {
+                    self.predictive_confirm(selector)
+                });
+            }
+        }
+        for prefix in [
+            "否定预测：",
+            "否定预测:",
+            "否定推测：",
+            "否定推测:",
+            "驳回预测：",
+            "驳回预测:",
+        ] {
+            if let Some(selector) = trimmed.strip_prefix(prefix) {
+                let selector = selector.trim();
+                return Some(if selector.is_empty() {
+                    "请给出推测序号或编号，例如：否定预测：1".to_string()
+                } else {
+                    self.predictive_refute(selector)
+                });
+            }
+        }
+        if matches!(
+            trimmed,
+            "预测台账" | "预测报告" | "推测台账" | "推测报告"
+        ) {
+            return Some(self.predictive_report());
+        }
+        None
     }
 
     /// 把恢复阶梯（或宿主脚本）的一次用户裁决写入补全台账。
@@ -14259,6 +14474,7 @@ impl SymbolicReasoner {
             (!self.pending_questions.is_empty()).then(|| self.pending_questions.clone());
         snapshot.ontology = self.discourse.ontology_capsule();
         snapshot.completion = (!self.completion.is_empty()).then(|| self.completion.clone());
+        snapshot.predictive = (!self.predictive.is_empty()).then(|| self.predictive.clone());
         snapshot.assumptions = self
             .assumption_world
             .iter()
@@ -14379,6 +14595,7 @@ impl SymbolicReasoner {
         // 旧快照没有该字段时清空，避免把上一个会话的回合串进新会话。
         self.completion = snapshot.completion.clone().unwrap_or_default();
         self.completion.clamp_limits();
+        self.predictive = snapshot.predictive.clone().unwrap_or_default();
         let regression = self.completion.enforce_regression();
         if !regression.passed() {
             self.completion.note(format!(
@@ -18155,6 +18372,89 @@ types = [
             profile
         );
         assert!(profile.contains("零幻觉"), "{}", profile);
+    }
+
+    fn pending_prediction_id(reasoner: &SymbolicReasoner, object: &str) -> String {
+        reasoner
+            .predictive_ledger()
+            .pending()
+            .iter()
+            .find(|hypothesis| hypothesis.key.object == object)
+            .map(|hypothesis| hypothesis.id.clone())
+            .unwrap_or_else(|| panic!("应存在指向「{}」的待定推测", object))
+    }
+
+    #[test]
+    fn test_predictive_elaboration_is_marked_as_speculation() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let text = reasoner
+            .predictive_elaboration("李四")
+            .expect("链接预测应生成推测段落");
+        assert!(text.contains("推测，不是已确认事实"), "{}", text);
+        assert!(text.contains("赵六"), "{}", text);
+        assert!(reasoner
+            .predictive_ledger()
+            .pending()
+            .iter()
+            .any(|hypothesis| hypothesis.key.object == "赵六"));
+    }
+
+    #[test]
+    fn test_predictive_confirmation_feeds_session_generation() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner
+            .predictive_elaboration("李四")
+            .expect("链接预测应生成推测段落");
+        let id = pending_prediction_id(&reasoner, "赵六");
+        let confirmed = reasoner.predictive_confirm(&id);
+        assert!(confirmed.contains("已确认预测"), "{}", confirmed);
+        let profile = reasoner
+            .generate_about("李四")
+            .expect("确认后的会话事实应参与介绍");
+        assert!(profile.contains("赵六"), "{}", profile);
+        assert!(profile.contains("零幻觉"), "{}", profile);
+    }
+
+    #[test]
+    fn test_predictive_refutation_suppresses_candidate() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner
+            .predictive_elaboration("李四")
+            .expect("链接预测应生成推测段落");
+        let id = pending_prediction_id(&reasoner, "赵六");
+        let refused = reasoner.predictive_refute(&id);
+        assert!(refused.contains("已否定预测"), "{}", refused);
+        assert!(refused.contains("不再提名"), "{}", refused);
+        reasoner
+            .predictive_elaboration("李四")
+            .expect("否认后仍应能生成剩余推测");
+        assert!(reasoner
+            .predictive_ledger()
+            .pending()
+            .iter()
+            .all(|hypothesis| hypothesis.key.object != "赵六"));
+    }
+
+    #[test]
+    fn test_predictive_ledger_survives_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner
+            .predictive_elaboration("李四")
+            .expect("链接预测应生成推测段落");
+        let id = pending_prediction_id(&reasoner, "赵六");
+        let snapshot = reasoner.dialogue_snapshot();
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("对话快照应可恢复");
+        let confirmed = restored.predictive_confirm(&id);
+        assert!(confirmed.contains("已确认预测"), "{}", confirmed);
     }
 
     #[test]
