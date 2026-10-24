@@ -130,6 +130,234 @@ impl Scenario {
     }
 }
 
+/// 解释空间：当前目标在有界枚举内所有通过 SLD 验证的解释（场景）集合。
+///
+/// 这是**派生状态**：确认/否定只改变兼容性过滤，不写知识图谱；会话快照只
+/// 保存用户承诺（确认/否定/暂缓），恢复后按当前知识重新计算，避免陈旧解释。
+#[derive(Debug, Clone, Default)]
+pub struct ExplanationSpace {
+    explanations: Vec<Scenario>,
+    /// 生成这些解释时看到的失败前沿（用于解释空间崩塌时说明缺少什么）
+    frontier: Vec<Atom>,
+    /// 枚举是否受假设池/组合预算/展示上限截断，可能漏解
+    bounded: bool,
+}
+
+/// 一个答案分组：同一答案可能由多组解释分别支撑
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplanationAnswer {
+    pub answer: String,
+    pub scenario_indices: Vec<usize>,
+}
+
+impl ExplanationSpace {
+    pub fn new(explanations: Vec<Scenario>, frontier: Vec<Atom>, bounded: bool) -> Self {
+        Self {
+            explanations: explanations
+                .into_iter()
+                .filter(|scenario| scenario.verified)
+                .collect(),
+            frontier,
+            bounded,
+        }
+    }
+
+    pub fn explanations(&self) -> &[Scenario] {
+        &self.explanations
+    }
+
+    pub fn frontier(&self) -> &[Atom] {
+        &self.frontier
+    }
+
+    pub fn len(&self) -> usize {
+        self.explanations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.explanations.is_empty()
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        self.bounded
+    }
+
+    /// 某假设对解释空间的划分：(含它的解释数, 不含它的解释数)。
+    pub fn split(&self, hypothesis: &Hypothesis) -> (usize, usize) {
+        let with = self
+            .explanations
+            .iter()
+            .filter(|scenario| {
+                scenario
+                    .hypotheses
+                    .iter()
+                    .any(|member| member.atom == hypothesis.atom)
+            })
+            .count();
+        (with, self.explanations.len().saturating_sub(with))
+    }
+
+    /// 删除包含被否定假设的解释：用户否定的不只是某条前提，而是所有依赖它的解释。
+    pub fn retain_compatible(&mut self, rejected: &[Hypothesis]) {
+        if rejected.is_empty() {
+            return;
+        }
+        self.explanations.retain(|scenario| {
+            !scenario.hypotheses.iter().any(|member| {
+                rejected
+                    .iter()
+                    .any(|rejected| rejected.atom == member.atom)
+            })
+        });
+    }
+
+    /// 按答案分组（保序）：用于判断答案在所有剩余解释下是否一致。
+    pub fn answer_groups(&self, query_vars: &[String]) -> Vec<ExplanationAnswer> {
+        let mut groups: Vec<ExplanationAnswer> = Vec::new();
+        for (index, scenario) in self.explanations.iter().enumerate() {
+            let answer = Self::scenario_answer(scenario, query_vars);
+            match groups.iter_mut().find(|group| group.answer == answer) {
+                Some(group) => group.scenario_indices.push(index),
+                None => groups.push(ExplanationAnswer {
+                    answer,
+                    scenario_indices: vec![index],
+                }),
+            }
+        }
+        groups
+    }
+
+    /// 单个解释给出的答案；无查询变量时表示"目标成立"。
+    ///
+    /// 一个解释可能包含多条证明（同一组前提下有多个答案），此时用「或」连接，
+    /// 避免只展示第一条解而谎称整个解释空间已经收敛到单一答案。
+    pub fn scenario_answer(scenario: &Scenario, query_vars: &[String]) -> String {
+        if query_vars.is_empty() {
+            return "目标成立".to_string();
+        }
+        let mut answers: Vec<String> = Vec::new();
+        for solution in &scenario.solutions {
+            let mut parts: Vec<String> = Vec::new();
+            for var in query_vars {
+                if let Some(value) = solution.bindings.get(var) {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if var == "答案" {
+                        parts.push(value.clone());
+                    } else {
+                        parts.push(format!("{}={}", var, value));
+                    }
+                }
+            }
+            let answer = if parts.is_empty() {
+                "目标成立".to_string()
+            } else {
+                parts.join("、")
+            };
+            if !answers.contains(&answer) {
+                answers.push(answer);
+            }
+        }
+        if answers.is_empty() {
+            "目标成立".to_string()
+        } else {
+            answers.join(" 或 ")
+        }
+    }
+
+    /// 解释的前提描述：多条假设用"且"连接；同一答案的多个解释由调用方用"或"连接。
+    pub fn scenario_premise(
+        scenario: &Scenario,
+        render: &dyn Fn(&Atom) -> String,
+    ) -> String {
+        scenario
+            .hypotheses
+            .iter()
+            .map(|hypothesis| render(&hypothesis.atom))
+            .collect::<Vec<_>>()
+            .join(" 且 ")
+    }
+}
+
+/// 渲染解释空间结论：收敛时给稳健答案，多答案时给条件化回答，空空间时给崩塌诊断。
+pub fn render_explanation_conclusion(
+    space: &ExplanationSpace,
+    query_vars: &[String],
+    render: &dyn Fn(&Atom) -> String,
+) -> String {
+    if space.is_empty() {
+        let mut output = String::from(
+            "【解释空间崩塌】有界枚举内曾存在的全部解释都已被当前回答排除。\n  这不是“知识库查无”，而是你的回答与所有可验证解释冲突。\n",
+        );
+        if !space.frontier().is_empty() {
+            let frontier = space
+                .frontier()
+                .iter()
+                .map(|atom| render(atom))
+                .collect::<Vec<_>>()
+                .join("；");
+            output.push_str(&format!("  仍然缺少的前提：{}\n", frontier));
+        }
+        output.push_str("  可补充新事实后重新提问，或输入「结束澄清」查看已排除清单。");
+        return output;
+    }
+
+    let groups = space.answer_groups(query_vars);
+    let mut output = String::new();
+    if groups.len() == 1 {
+        if query_vars.is_empty() {
+            output.push_str(&format!(
+                "【解释空间收敛】目标很可能成立，并且在剩余 {} 组解释下都成立。\n",
+                space.len()
+            ));
+        } else {
+            output.push_str(&format!(
+                "【解释空间收敛】答案很可能是「{}」，并且在剩余 {} 组解释下都成立。\n",
+                groups[0].answer,
+                space.len()
+            ));
+        }
+        for (order, index) in groups[0].scenario_indices.iter().enumerate() {
+            let scenario = &space.explanations()[*index];
+            output.push_str(&format!(
+                "  解释 {}（可信度 {:.2}）：{}\n",
+                order + 1,
+                scenario.joint_confidence,
+                ExplanationSpace::scenario_premise(scenario, render)
+            ));
+        }
+    } else {
+        output.push_str(
+            "【条件化回答】不同解释会给出不同答案；不必确认完所有前提也能先看条件结论：\n",
+        );
+        for group in groups {
+            let premises = group
+                .scenario_indices
+                .iter()
+                .map(|index| {
+                    ExplanationSpace::scenario_premise(&space.explanations()[*index], render)
+                })
+                .collect::<Vec<_>>()
+                .join(" 或 ");
+            if query_vars.is_empty() {
+                output.push_str(&format!("  若 {}，则目标成立；\n", premises));
+            } else {
+                output.push_str(&format!(
+                    "  若 {}，则答案是「{}」；\n",
+                    premises, group.answer
+                ));
+            }
+        }
+    }
+    if space.is_bounded() {
+        output.push_str(
+            "  说明：解释枚举有界（假设池 10 条、组合预算 60 次、展示上限 5 组），以上不是完备枚举。\n",
+        );
+    }
+    output.trim_end().to_string()
+}
+
 /// 澄清回答的语义类别（纯模式匹配，无神经网络）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerKind {
@@ -249,7 +477,18 @@ pub struct ClarificationSession {
     pub rejected: Vec<Hypothesis>,
     /// 记为不确定、暂缓的假设
     pub deferred: Vec<Hypothesis>,
+    /// 当前问题的竞争解释集合（派生状态，不写入快照）
+    space: Option<ExplanationSpace>,
+    /// 本次会话是否曾经拥有过非空解释空间（区分"从未有解释"与"全被排除"）
+    had_explanations: bool,
+    /// 已处理的回答轮数（含批量回答）
+    asked: usize,
+    /// 本轮澄清最多追问多少轮，超过后直接给条件化回答
+    max_questions: usize,
 }
+
+/// 默认最大追问轮数：超过后不再骚扰用户，改为给条件化/崩塌结论。
+const DEFAULT_MAX_CLARIFICATION_QUESTIONS: usize = 8;
 
 impl ClarificationSession {
     fn pool(hypotheses: &[Hypothesis]) -> Vec<Hypothesis> {
@@ -322,24 +561,32 @@ impl ClarificationSession {
         engine: &ResolutionEngine,
         goals: &[Atom],
         query_vars: &[String],
+        space: Option<&ExplanationSpace>,
     ) {
         // 判别力只算一次：排序比较器里反复克隆引擎会把澄清变成 O(n log n) 次证明。
-        let gains: HashMap<String, u8> = queue
+        let gains: HashMap<String, (u8, usize, bool)> = queue
             .iter()
             .map(|hypothesis| {
-                (
-                    hypothesis.atom.display(),
-                    Self::discrimination(engine, goals, query_vars, hypothesis),
-                )
+                let gain = Self::discrimination(engine, goals, query_vars, hypothesis);
+                let (with, without) = space
+                    .map(|space| space.split(hypothesis))
+                    .unwrap_or((0, 0));
+                // 平衡度 = min(含它, 不含它)：越均衡，一次回答越能砍掉一半解释空间。
+                // in_space 区分"在解释中出现但全含它"与"根本不在解释空间里"。
+                (hypothesis.atom.display(), (gain, with.min(without), with > 0))
             })
             .collect();
         queue.sort_by(|left, right| {
             let left_key = left.atom.display();
             let right_key = right.atom.display();
-            let left_gain = gains.get(&left_key).copied().unwrap_or(0);
-            let right_gain = gains.get(&right_key).copied().unwrap_or(0);
+            let (left_gain, left_balance, left_in_space) =
+                gains.get(&left_key).copied().unwrap_or((0, 0, false));
+            let (right_gain, right_balance, right_in_space) =
+                gains.get(&right_key).copied().unwrap_or((0, 0, false));
             right_gain
                 .cmp(&left_gain)
+                .then_with(|| right_balance.cmp(&left_balance))
+                .then_with(|| right_in_space.cmp(&left_in_space))
                 .then_with(|| {
                     right
                         .confidence
@@ -360,6 +607,10 @@ impl ClarificationSession {
             confirmed: Vec::new(),
             rejected: Vec::new(),
             deferred: Vec::new(),
+            space: None,
+            had_explanations: false,
+            asked: 0,
+            max_questions: DEFAULT_MAX_CLARIFICATION_QUESTIONS,
         };
         session.advance();
         session
@@ -377,7 +628,7 @@ impl ClarificationSession {
         if goals.is_empty() {
             Self::sort_by_confidence(&mut queue);
         } else {
-            Self::sort_by_goal(&mut queue, engine, goals, query_vars);
+            Self::sort_by_goal(&mut queue, engine, goals, query_vars, None);
         }
         let mut session = Self {
             queue,
@@ -385,9 +636,93 @@ impl ClarificationSession {
             confirmed: Vec::new(),
             rejected: Vec::new(),
             deferred: Vec::new(),
+            space: None,
+            had_explanations: false,
+            asked: 0,
+            max_questions: DEFAULT_MAX_CLARIFICATION_QUESTIONS,
         };
         session.advance();
         session
+    }
+
+    /// 挂载当前目标的解释空间；有解释时立即按"能砍掉多少解释"重排问题。
+    pub fn attach_explanation_space(&mut self, space: ExplanationSpace) {
+        self.had_explanations = !space.is_empty();
+        self.space = Some(space);
+    }
+
+    /// 用最新会话世界刷新解释空间：保留用户已确认/否定的承诺，删除不兼容解释。
+    pub fn refresh_explanation_space(&mut self, mut space: ExplanationSpace) {
+        space.retain_compatible(&self.rejected);
+        self.had_explanations |= !space.is_empty();
+        self.space = Some(space);
+    }
+
+    pub fn explanation_space(&self) -> Option<&ExplanationSpace> {
+        self.space.as_ref()
+    }
+
+    /// 把解释空间中新出现、尚未问过的前提并入候选队列。
+    ///
+    /// 解释空间每轮都会按当前知识重算，新场景可能引入原先不在待定池里的前提；
+    /// 不把它们纳入队列，系统就只能在一组过时的候选上做判别，无法真正收敛。
+    pub fn include_explanation_hypotheses(&mut self) -> usize {
+        let Some(space) = &self.space else {
+            return 0;
+        };
+        let mut seen: HashSet<String> = self
+            .queue
+            .iter()
+            .chain(self.current.iter())
+            .chain(self.confirmed.iter())
+            .chain(self.rejected.iter())
+            .chain(self.deferred.iter())
+            .map(|hypothesis| hypothesis.atom.display())
+            .collect();
+        let mut additions: Vec<Hypothesis> = Vec::new();
+        for scenario in space.explanations() {
+            for hypothesis in &scenario.hypotheses {
+                if !hypothesis.is_adoptable() {
+                    continue;
+                }
+                if seen.insert(hypothesis.atom.display()) {
+                    additions.push(hypothesis.clone());
+                }
+            }
+        }
+        let count = additions.len();
+        self.queue.extend(additions);
+        count
+    }
+
+    /// 解释空间是否曾经存在、现在却被全部排除。
+    pub fn explanation_collapsed(&self) -> bool {
+        self.had_explanations && self.space.as_ref().map(ExplanationSpace::is_empty).unwrap_or(false)
+    }
+
+    pub fn questions_asked(&self) -> usize {
+        self.asked
+    }
+
+    pub fn max_questions(&self) -> usize {
+        self.max_questions
+    }
+
+    pub fn max_questions_reached(&self) -> bool {
+        self.asked >= self.max_questions
+    }
+
+    /// 结束后给出解释空间结论（收敛答案 / 条件化答案 / 崩塌诊断）。
+    pub fn explanation_conclusion(
+        &self,
+        query_vars: &[String],
+        render: &dyn Fn(&Atom) -> String,
+    ) -> Option<String> {
+        let space = self.space.as_ref()?;
+        if space.is_empty() && !self.had_explanations {
+            return None;
+        }
+        Some(render_explanation_conclusion(space, query_vars, render))
     }
 
     /// 一次回答之后按最新世界重排剩余问题：已采纳的事实时常改变最优提问。
@@ -404,7 +739,8 @@ impl ClarificationSession {
         if let Some(current) = self.current.take() {
             self.queue.push(current);
         }
-        Self::sort_by_goal(&mut self.queue, engine, goals, query_vars);
+        let space = self.space.clone();
+        Self::sort_by_goal(&mut self.queue, engine, goals, query_vars, space.as_ref());
         self.advance();
     }
 
@@ -526,6 +862,9 @@ impl ClarificationSession {
         let Some(current) = self.current.take() else {
             return ClarificationReply::Finished;
         };
+        if kind != AnswerKind::Unrecognized {
+            self.asked += 1;
+        }
         // 更正优先于批量：「都不是，是王五」仍按更正处理，不能误否定全部。
         if kind != AnswerKind::Unknown {
             if let Some(index) = self.correction_target(text, &current) {
@@ -583,12 +922,22 @@ impl ClarificationSession {
 
     /// 计数摘要（用于对话记忆）
     pub fn progress_text(&self) -> String {
+        let space = match &self.space {
+            Some(space) if !space.is_empty() => format!(
+                "、解释空间 {} 组{}",
+                space.len(),
+                if space.is_bounded() { "（有界）" } else { "" }
+            ),
+            Some(_) if self.had_explanations => "、解释空间已崩塌".to_string(),
+            _ => String::new(),
+        };
         format!(
-            "已确认 {} 条、否定 {} 条、不确定 {} 条、待问 {} 条",
+            "已确认 {} 条、否定 {} 条、不确定 {} 条、待问 {} 条{}",
             self.confirmed.len(),
             self.rejected.len(),
             self.deferred.len(),
-            self.remaining()
+            self.remaining(),
+            space
         )
     }
 
@@ -605,12 +954,17 @@ impl ClarificationSession {
         rejected: Vec<Hypothesis>,
         deferred: Vec<Hypothesis>,
     ) -> Self {
+        let asked = confirmed.len() + rejected.len() + deferred.len();
         Self {
             queue,
             current,
             confirmed,
             rejected,
             deferred,
+            space: None,
+            had_explanations: false,
+            asked,
+            max_questions: DEFAULT_MAX_CLARIFICATION_QUESTIONS,
         }
     }
 }
@@ -1505,12 +1859,58 @@ impl AbductionEngine {
         self.scenarios_impl(engine, goals, query_vars)
     }
 
+    /// 当前目标的解释空间：先做有界溯因分析拿到失败前沿，再枚举并验证
+    /// 所有可解释目标的假设组合。目标已可证时返回空空间（无需解释）。
+    pub fn explanation_space(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> ExplanationSpace {
+        if goals.is_empty() {
+            return ExplanationSpace::default();
+        }
+        let report = self.analyze(engine, goals, query_vars);
+        if report.provable {
+            return ExplanationSpace::default();
+        }
+        self.explanation_space_with_frontier(engine, goals, query_vars, &report.frontier)
+    }
+
+    /// 复用已知失败前沿计算解释空间：回答一轮后只需重枚举场景，不必重跑前沿搜索。
+    pub fn explanation_space_with_frontier(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+        frontier: &[Atom],
+    ) -> ExplanationSpace {
+        if goals.is_empty() {
+            return ExplanationSpace::default();
+        }
+        if !engine.solve(goals, query_vars).is_empty() {
+            return ExplanationSpace::default();
+        }
+        let (scenarios, bounded) = self.scenarios_with_bounds(engine, goals, query_vars);
+        ExplanationSpace::new(scenarios, frontier.to_vec(), bounded)
+    }
+
     fn scenarios_impl(
         &self,
         engine: &ResolutionEngine,
         goals: &[Atom],
         query_vars: &[String],
     ) -> Vec<Scenario> {
+        self.scenarios_with_bounds(engine, goals, query_vars).0
+    }
+
+    /// 返回（场景, 是否因池/预算/展示上限而可能有漏解）。
+    fn scenarios_with_bounds(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> (Vec<Scenario>, bool) {
         let mut search = FrontierSearch {
             engine,
             max_depth: self.max_depth,
@@ -1547,17 +1947,20 @@ impl AbductionEngine {
             display: hypothesis.atom.display(),
         });
         // 组合枚举上限：池 10 × 规模 2 ⇒ 45 组，足够覆盖典型解释空间
+        let pool_truncated = pool.len() > 10;
         pool.truncate(10);
 
         let max_size = self.max_scenario_size.min(pool.len()).clamp(1, 4);
         let mut scenarios: Vec<Scenario> = Vec::new();
         let mut budget = 60usize;
+        let mut budget_exhausted = false;
         let mut indices: Vec<usize> = Vec::new();
         // 组合验证复用一个引擎克隆：逐组合“加入假设 → 求解 → 按原顺序移除”。
         let mut simulation = engine.clone();
         for size in 1..=max_size {
             let _ = collect_combinations(&pool, size, 0, &mut indices, &mut |combo| {
                 if budget == 0 {
+                    budget_exhausted = true;
                     return false;
                 }
                 budget -= 1;
@@ -1617,8 +2020,10 @@ impl AbductionEngine {
             joint_confidence: scenario.joint_confidence,
             first_display: scenario.hypotheses[0].atom.display(),
         });
+        let display_truncated = scenarios.len() > 5;
         scenarios.truncate(5);
-        scenarios
+        let bounded = pool_truncated || budget_exhausted || display_truncated;
+        (scenarios, bounded)
     }
 }
 
@@ -1912,7 +2317,7 @@ pub fn render_report(report: &AbductionReport, render: &dyn Fn(&Atom) -> String)
         }
     }
     output.push_str(
-        "  这些假设不会自动写入知识库；输入「采纳假设 N」可把它们加入本轮会话事实集，输入「澄清」可让系统就这些假设逐条向你确认（是 / 不是 / 不知道）。",
+        "  这些假设不会自动写入知识库；输入「采纳假设 N」可把它们加入本轮会话事实集，输入「澄清」可按解释空间选择最有判别力的问题（是 / 不是 / 不知道，结束时给条件化答案）。",
     );
     output
 }
@@ -1991,7 +2396,7 @@ pub fn render_scenarios(
         }
     }
     output.push_str(
-        "  场景中的假设都不会自动写入知识库；输入「澄清」可让系统就这些假设逐条向你确认，输入「采纳假设 N」可直接采纳单条。",
+        "  场景中的假设都不会自动写入知识库；输入「澄清」可按解释空间选择最有判别力的问题（结束时给条件化答案），输入「采纳假设 N」可直接采纳单条。",
     );
     output
 }
@@ -2002,12 +2407,41 @@ pub fn render_clarification_question(
     render: &dyn Fn(&Atom) -> String,
 ) -> String {
     match session.current() {
-        Some(hypothesis) => format!(
-            "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？\n  请回答：是 / 不是 / 不知道；若是别的取值可答「不是，是<取值>」；也可答「全部确认」/「全部否定」处理剩余全部（剩余 {} 条）。",
-            hypothesis.confidence,
-            render(&hypothesis.atom),
-            session.remaining()
-        ),
+        Some(hypothesis) => {
+            let mut output = format!(
+                "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？",
+                hypothesis.confidence,
+                render(&hypothesis.atom)
+            );
+            if let Some(space) = session.explanation_space() {
+                if !space.is_empty() {
+                    let (with, without) = space.split(hypothesis);
+                    if with == 0 {
+                        output.push_str(&format!(
+                            "\n  判别理由：当前解释空间 {} 组均不依赖它，提问只用于校准候选。",
+                            space.len()
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "\n  判别理由：当前解释空间 {} 组，其中 {} 组依赖它、{} 组不依赖；否定会排除依赖它的 {} 组。",
+                            space.len(), with, without, with
+                        ));
+                    }
+                    if space.is_bounded() {
+                        output.push_str("（解释枚举有界，未列尽所有可能）");
+                    }
+                } else if session.explanation_collapsed() {
+                    output.push_str(
+                        "\n  当前解释空间已崩塌：所有有界解释都被你排除，继续回答只会记录承诺，不会自动写入知识库。",
+                    );
+                }
+            }
+            output.push_str(&format!(
+                "\n  请回答：是 / 不是 / 不知道；若是别的取值可答「不是，是<取值>」；也可答「全部确认」/「全部否定」处理剩余全部（剩余 {} 条）。",
+                session.remaining()
+            ));
+            output
+        }
         None => "【对话式澄清】没有需要确认的假设。".to_string(),
     }
 }
@@ -2026,6 +2460,18 @@ pub fn render_clarification_summary(
     }
     for hypothesis in &session.deferred {
         output.push_str(&format!("  ？ 不确定：{}\n", render(&hypothesis.atom)));
+    }
+    if let Some(space) = session.explanation_space() {
+        if space.is_empty() && session.explanation_collapsed() {
+            output.push_str("  解释空间：已崩塌（全部有界解释均被排除）\n");
+        } else if !space.is_empty() {
+            output.push_str(&format!(
+                "  解释空间：{} 组{}；尚待确认 {} 条。\n",
+                space.len(),
+                if space.is_bounded() { "（有界）" } else { "" },
+                session.remaining()
+            ));
+        }
     }
     output.trim_end().to_string()
 }
@@ -2423,6 +2869,196 @@ mod tests {
             .hypotheses
             .iter()
             .all(|hypothesis| hypothesis.atom != goal)));
+    }
+
+    fn answered_scenario(
+        hypotheses: Vec<Hypothesis>,
+        answer: &str,
+        confidence: f64,
+    ) -> Scenario {
+        Scenario {
+            hypotheses,
+            verified: true,
+            joint_confidence: confidence,
+            solutions: vec![Solution {
+                bindings: [("答案".to_string(), answer.to_string())]
+                    .into_iter()
+                    .collect(),
+                proofs: Vec::new(),
+                confidence,
+            }],
+        }
+    }
+
+    #[test]
+    fn explanation_space_groups_answers_and_filters_rejections() {
+        let h1 = hyp("师傅", "张三", "李四", 0.8);
+        let h2 = hyp("师傅", "李四", "王五", 0.6);
+        let h3 = hyp("师傅", "张三", "王五", 0.5);
+        let mut space = ExplanationSpace::new(
+            vec![
+                answered_scenario(vec![h1.clone()], "王五", 0.8),
+                answered_scenario(vec![h2.clone(), h3.clone()], "王五", 0.7),
+                answered_scenario(vec![h2.clone()], "赵六", 0.6),
+            ],
+            vec![Atom::rel("师傅", "张三", "李四")],
+            false,
+        );
+        assert_eq!(space.len(), 3);
+        assert_eq!(space.split(&h1), (1, 2), "h1 只出现在 1 组解释中");
+        assert_eq!(space.split(&h2), (2, 1), "h2 出现在 2 组解释中");
+        let groups = space.answer_groups(&["答案".to_string()]);
+        assert_eq!(groups.len(), 2, "应分成王五/赵六两组答案");
+        assert_eq!(groups[0].answer, "王五");
+        assert_eq!(groups[0].scenario_indices, vec![0, 1]);
+
+        space.retain_compatible(&[h1.clone()]);
+        assert_eq!(space.len(), 2, "含被否定假设的解释应整体删除");
+        let groups = space.answer_groups(&["答案".to_string()]);
+        assert_eq!(groups.len(), 2, "删除 h1 后仍有王五/赵六两组解释");
+
+        space.retain_compatible(&[h3.clone()]);
+        assert_eq!(space.len(), 1, "含 h3 的解释应删除");
+        let groups = space.answer_groups(&["答案".to_string()]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].answer, "赵六");
+        assert_eq!(groups[0].scenario_indices, vec![0]);
+    }
+
+    #[test]
+    fn explanation_conclusion_distinguishes_robust_conditional_and_collapse() {
+        let h1 = hyp("师傅", "张三", "李四", 0.8);
+        let h2 = hyp("师傅", "李四", "王五", 0.6);
+        let render = |atom: &Atom| atom.display();
+
+        let robust = ExplanationSpace::new(
+            vec![
+                answered_scenario(vec![h1.clone()], "赵六", 0.8),
+                answered_scenario(vec![h2.clone()], "赵六", 0.6),
+            ],
+            Vec::new(),
+            false,
+        );
+        let text = render_explanation_conclusion(&robust, &["答案".to_string()], &render);
+        assert!(text.contains("解释空间收敛"), "{}", text);
+        assert!(text.contains("赵六"), "{}", text);
+        assert!(text.contains("都成立"), "{}", text);
+
+        let conditional = ExplanationSpace::new(
+            vec![
+                answered_scenario(vec![h1.clone()], "赵六", 0.8),
+                answered_scenario(vec![h2.clone()], "王五", 0.6),
+            ],
+            Vec::new(),
+            true,
+        );
+        let text = render_explanation_conclusion(&conditional, &["答案".to_string()], &render);
+        assert!(text.contains("条件化回答"), "{}", text);
+        assert!(text.contains("若") && text.contains("则答案是"), "{}", text);
+        assert!(text.contains("不是完备枚举"), "有界枚举必须标注：{}", text);
+
+        let empty = ExplanationSpace::new(Vec::new(), vec![h1.atom.clone()], false);
+        let text = render_explanation_conclusion(&empty, &["答案".to_string()], &render);
+        assert!(text.contains("解释空间崩塌"), "{}", text);
+        assert!(text.contains("不是“知识库查无”"), "{}", text);
+        assert!(text.contains("师傅(张三, 李四)"), "{}", text);
+    }
+
+    #[test]
+    fn clarification_prefers_balanced_split_over_confidence() {
+        let mut engine = ResolutionEngine::new(4, 4);
+        engine.add_fact("师傅", "张三", "李四");
+        let goals = [Atom::rel("师祖", "张三", "赵六")];
+        let always = hyp("师傅", "张三", "李四", 0.95);
+        let splitter = hyp("师傅", "李四", "王五", 0.1);
+        let irrelevant = hyp("师傅", "张三", "钱七", 0.99);
+        let space = ExplanationSpace::new(
+            vec![
+                answered_scenario(vec![always.clone()], "赵六", 0.9),
+                answered_scenario(vec![always.clone(), splitter.clone()], "王五", 0.5),
+            ],
+            Vec::new(),
+            false,
+        );
+        let mut session = ClarificationSession::start_with_goal(
+            &[irrelevant.clone(), always.clone(), splitter.clone()],
+            &engine,
+            &goals,
+            &["答案".to_string()],
+        );
+        session.attach_explanation_space(space);
+        session.reprioritize(&engine, &goals, &["答案".to_string()]);
+        assert_eq!(
+            session.current().map(|hypothesis| hypothesis.atom.clone()),
+            Some(splitter.atom.clone()),
+            "应优先问能均衡划分解释空间的假设，而不是可信度最高但无判别力的那条"
+        );
+    }
+
+    #[test]
+    fn explanation_space_members_join_the_question_queue() {
+        let stale = hyp("师傅", "张三", "钱七", 0.9);
+        let decisive = hyp("师傅", "张三", "李四", 0.3);
+        let space = ExplanationSpace::new(
+            vec![
+                answered_scenario(vec![decisive.clone()], "赵六", 0.7),
+                answered_scenario(vec![decisive.clone()], "王五", 0.6),
+            ],
+            Vec::new(),
+            false,
+        );
+        let mut engine = ResolutionEngine::new(4, 4);
+        engine.add_fact("师傅", "李四", "赵六");
+        engine.add_clause(teacher_clause());
+        let goals = [Atom::rel("师祖", "张三", "赵六")];
+        let mut session =
+            ClarificationSession::start_with_goal(&[stale.clone()], &engine, &goals, &[]);
+        session.attach_explanation_space(space);
+        assert_eq!(
+            session.include_explanation_hypotheses(),
+            1,
+            "解释空间中的新前提应并入队列"
+        );
+        assert_eq!(
+            session.include_explanation_hypotheses(),
+            0,
+            "重复并入必须幂等"
+        );
+        session.reprioritize(&engine, &goals, &[]);
+        assert_eq!(
+            session.current().map(|hypothesis| hypothesis.atom.clone()),
+            Some(decisive.atom.clone()),
+            "新并入且能单独证明目标的前提应优先提问"
+        );
+    }
+
+    #[test]
+    fn collapsed_explanation_space_is_diagnosed_not_reported_as_unknown() {
+        let h = hyp("师傅", "张三", "李四", 0.8);
+        let space = ExplanationSpace::new(
+            vec![answered_scenario(vec![h.clone()], "赵六", 0.8)],
+            vec![h.atom.clone()],
+            false,
+        );
+        let mut session = ClarificationSession::start(std::slice::from_ref(&h));
+        session.attach_explanation_space(space);
+        assert!(matches!(
+            session.respond("不是"),
+            ClarificationReply::Rejected(_)
+        ));
+        session.refresh_explanation_space(ExplanationSpace::new(
+            Vec::new(),
+            vec![h.atom.clone()],
+            false,
+        ));
+        assert!(session.explanation_collapsed());
+        assert!(session.progress_text().contains("解释空间已崩塌"));
+        let render = |atom: &Atom| atom.display();
+        let conclusion = session
+            .explanation_conclusion(&["答案".to_string()], &render)
+            .expect("崩塌应给出结论");
+        assert!(conclusion.contains("解释空间崩塌"), "{}", conclusion);
+        assert!(conclusion.contains("补充新事实"), "{}", conclusion);
     }
 
     #[test]

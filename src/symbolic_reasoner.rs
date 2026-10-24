@@ -5453,7 +5453,7 @@ impl SymbolicReasoner {
         if !self.config.enable_abduction || !self.config.enable_clarification {
             return None;
         }
-        let session = match &self.last_abduction_goal {
+        let mut session = match &self.last_abduction_goal {
             Some(goals) if !goals.is_empty() => ClarificationSession::start_with_goal(
                 self.abduction.pending(),
                 &self.resolver,
@@ -5464,6 +5464,18 @@ impl SymbolicReasoner {
         };
         if session.is_finished() {
             return None;
+        }
+        if let Some(goals) = self.last_abduction_goal.clone() {
+            let space = self.abduction.explanation_space(
+                &self.resolver,
+                &goals,
+                &self.last_abduction_vars,
+            );
+            session.attach_explanation_space(space);
+            // 场景成员可能比待定池更新：先并入，再按解释空间判别力排序。
+            session.include_explanation_hypotheses();
+            // 解释空间优先：能砍掉更多解释的假设先问，能单独证明目标的最先问。
+            session.reprioritize(&self.resolver, &goals, &self.last_abduction_vars);
         }
         self.clarification = Some(session);
         Some(self.render_clarification_prompt())
@@ -5661,18 +5673,64 @@ impl SymbolicReasoner {
         }
     }
 
-    /// 按最新会话世界重排剩余澄清问题（信息增益优先，可信度为平手）。
+    /// 按最新会话世界重排剩余澄清问题（解释空间判别力优先，可信度为平手）。
+    ///
+    /// 解释空间是派生状态：每轮从当前知识重新枚举，再用用户的否定承诺过滤，
+    /// 因此确认/否定后不会残留已经被事实或回答淘汰的旧解释。
     fn reprioritize_clarification(&mut self) {
         let Some(goals) = self.last_abduction_goal.clone() else {
             return;
         };
         let vars = self.last_abduction_vars.clone();
+        let frontier = self
+            .clarification
+            .as_ref()
+            .and_then(ClarificationSession::explanation_space)
+            .map(|space| space.frontier().to_vec())
+            .unwrap_or_default();
+        let space = self.abduction.explanation_space_with_frontier(
+            &self.resolver,
+            &goals,
+            &vars,
+            &frontier,
+        );
         if let Some(session) = self.clarification.as_mut() {
+            session.refresh_explanation_space(space);
+            session.include_explanation_hypotheses();
             session.reprioritize(&self.resolver, &goals, &vars);
         }
     }
 
-    /// 澄清推进：若原始目标已得证则汇报答案并结束会话；否则继续下一问
+    /// 只刷新解释空间、不改变当前问题顺序（快照恢复用：派生状态重算，承诺不变）。
+    fn refresh_clarification_space(&mut self) {
+        let Some(goals) = self.last_abduction_goal.clone() else {
+            return;
+        };
+        if self.clarification.is_none() {
+            return;
+        }
+        let vars = self.last_abduction_vars.clone();
+        let frontier = self
+            .clarification
+            .as_ref()
+            .and_then(ClarificationSession::explanation_space)
+            .map(|space| space.frontier().to_vec())
+            .unwrap_or_default();
+        let space = self.abduction.explanation_space_with_frontier(
+            &self.resolver,
+            &goals,
+            &vars,
+            &frontier,
+        );
+        if let Some(session) = self.clarification.as_mut() {
+            session.refresh_explanation_space(space);
+        }
+    }
+
+    /// 澄清推进：若原始目标已得证则汇报答案并结束会话；否则继续下一问。
+    ///
+    /// 三种提前收束：目标得证、解释空间崩塌、达到最大追问轮数。后两种直接给
+    /// 条件化/崩塌结论，避免在已经没有判别力的问题上继续纠缠用户。
     fn clarification_follow_up(&mut self) -> String {
         if let Some((goal, solution)) = self.clarified_goal_solution() {
             let mut text = format!(
@@ -5687,6 +5745,32 @@ impl SymbolicReasoner {
             text.push_str("。\n");
             text.push_str(&self.finish_clarification_session());
             return text;
+        }
+        let collapsed = self
+            .clarification
+            .as_ref()
+            .map(ClarificationSession::explanation_collapsed)
+            .unwrap_or(false);
+        if collapsed {
+            return format!(
+                "\n  已停止追问：继续确认已无法挽救当前解释空间。\n{}",
+                self.finish_clarification_session()
+            );
+        }
+        let max_reached = self
+            .clarification
+            .as_ref()
+            .map(ClarificationSession::max_questions_reached)
+            .unwrap_or(false);
+        if max_reached {
+            return format!(
+                "\n  已达到本轮最大追问数 {} 轮，先给条件化结论。\n{}",
+                self.clarification
+                    .as_ref()
+                    .map(ClarificationSession::max_questions)
+                    .unwrap_or(0),
+                self.finish_clarification_session()
+            );
         }
         if self.clarification_active() {
             format!("\n{}", self.render_clarification_prompt())
@@ -5717,7 +5801,17 @@ impl SymbolicReasoner {
         };
         let render = |atom: &Atom| self.render_atom_nl(atom);
         let mut output = abduction::render_clarification_summary(&session, &render);
-        if let Some((goal, solution)) = self.clarified_goal_solution() {
+        let proved = self.clarified_goal_solution();
+        // 目标已得证时解释空间会因"无需解释"而变空；此时不能再报崩塌。
+        if proved.is_none() {
+            if let Some(conclusion) =
+                session.explanation_conclusion(&self.last_abduction_vars, &render)
+            {
+                output.push('\n');
+                output.push_str(&conclusion);
+            }
+        }
+        if let Some((goal, solution)) = proved {
             output.push_str(&format!(
                 "\n  → 当前目标「{}」已可证明（置信度 {:.2}）",
                 goal, solution.confidence
@@ -15269,6 +15363,8 @@ impl SymbolicReasoner {
             (!goals.is_empty()).then_some(goals)
         };
         self.last_abduction_vars = snapshot.last_abduction_vars.clone();
+        // 解释空间不进入快照：恢复时按当前知识重算，只保留快照中的承诺与问题顺序。
+        self.refresh_clarification_space();
         Ok(())
     }
 
@@ -19750,6 +19846,146 @@ types = [
         assert!(
             !reasoner.pending_hypotheses().is_empty(),
             "场景成员应进入待定池，供采纳/澄清"
+        );
+    }
+
+    #[test]
+    fn clarification_explains_question_choice_and_collapse() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&sparse_master_facts());
+        reasoner.resolver.add_clause(teacher_rule());
+        let _ = reasoner.scenario_report("张三的师祖是赵六");
+        let prompt = reasoner.start_clarification().expect("应开始澄清");
+        assert!(
+            prompt.contains("解释空间") && prompt.contains("判别理由"),
+            "澄清提问应说明解释空间与判别理由：{}",
+            prompt
+        );
+
+        let mut last = String::new();
+        for _ in 0..10 {
+            if !reasoner.clarification_active() {
+                break;
+            }
+            last = reasoner
+                .answer_clarification("不是")
+                .expect("应处理否定回答");
+        }
+        assert!(
+            last.contains("解释空间崩塌"),
+            "连续否定应诊断解释空间崩塌：{}",
+            last
+        );
+        assert!(
+            last.contains("不是“知识库查无”"),
+            "崩塌不能误报为查无：{}",
+            last
+        );
+        assert!(
+            last.contains("缺少的前提"),
+            "崩塌应给出缺失前提：{}",
+            last
+        );
+    }
+
+    #[test]
+    fn clarification_that_proves_goal_does_not_report_collapse() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&sparse_master_facts());
+        reasoner.resolver.add_clause(teacher_rule());
+        let _ = reasoner.scenario_report("张三的师祖是赵六");
+        reasoner.start_clarification().expect("应开始澄清");
+        let output = reasoner
+            .answer_clarification("全部确认")
+            .expect("应处理批量确认");
+        assert!(output.contains("已可证明"), "{}", output);
+        assert!(
+            !output.contains("解释空间崩塌"),
+            "目标得证时空解释空间只是“无需解释”，不能误报崩塌：{}",
+            output
+        );
+        assert!(!reasoner.clarification_active());
+    }
+
+    #[test]
+    fn clarification_stops_after_question_budget() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let pending: Vec<Hypothesis> = (0..10)
+            .map(|index| Hypothesis {
+                atom: Atom::rel("颜色", "对象", &format!("取值{}", index)),
+                goal: Atom::rel("颜色", "对象", &format!("取值{}", index)),
+                kind: HypothesisKind::MissingFact,
+                confidence: 0.9 - index as f64 * 0.01,
+                reasons: vec!["测试".to_string()],
+                conflicts: Vec::new(),
+                contradicts_known: false,
+            })
+            .collect();
+        reasoner.abduction.set_pending(pending);
+        reasoner.start_clarification().expect("应开始澄清");
+        let mut last = String::new();
+        for _ in 0..12 {
+            if !reasoner.clarification_active() {
+                break;
+            }
+            last = reasoner
+                .answer_clarification("不知道")
+                .expect("应处理暂缓回答");
+        }
+        assert!(
+            last.contains("最大追问数"),
+            "达到预算后应停止追问并给结论：{}",
+            last
+        );
+        assert!(!reasoner.clarification_active());
+    }
+
+    #[test]
+    fn clarification_finishes_with_conditional_answers() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&sparse_master_facts());
+        reasoner.resolver.add_clause(teacher_rule());
+        let report = reasoner.scenario_report("张三的师祖是谁");
+        assert!(report.contains("生成式联合解释"), "{}", report);
+        reasoner.start_clarification().expect("应开始澄清");
+        let conclusion = reasoner.stop_clarification().expect("应结束澄清");
+        assert!(
+            conclusion.contains("条件化回答") || conclusion.contains("解释空间收敛"),
+            "提前结束应给出条件化或稳健答案：{}",
+            conclusion
+        );
+        assert!(conclusion.contains("若") && conclusion.contains("则答案是"), "{}", conclusion);
+    }
+
+    #[test]
+    fn clarification_snapshot_recomputes_explanation_space() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&sparse_master_facts());
+        reasoner.resolver.add_clause(teacher_rule());
+        let _ = reasoner.scenario_report("张三的师祖是赵六");
+        let prompt = reasoner.start_clarification().expect("应开始澄清");
+        assert!(prompt.contains("解释空间"), "{}", prompt);
+        let snapshot = reasoner.dialogue_snapshot();
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&sparse_master_facts());
+        restored.resolver.add_clause(teacher_rule());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("快照应可恢复");
+        assert!(restored.clarification_active(), "澄清会话应继续");
+        assert_eq!(
+            restored.clarification_progress(),
+            reasoner.clarification_progress(),
+            "恢复后解释空间应派生重算并与原会话一致"
+        );
+        let restored_prompt = restored
+            .start_clarification()
+            .expect("可显式重开以复核解释空间");
+        assert!(
+            restored_prompt.contains("解释空间"),
+            "重开后的提问仍应带解释空间：{}",
+            restored_prompt
         );
     }
 
