@@ -1299,11 +1299,17 @@ async fn main() {
     // 处理命令行参数
     match cli.command {
         Some(Commands::ImportJsonld { file_path }) => {
+            load_persistent_registries(&config, &oxigraph_manager, &store_path);
             println!("正在导入 JSON-LD 文件: {}", file_path);
 
             match oxigraph_manager.import_jsonld_from_file(&file_path).await {
                 Ok(stats) => {
                     println!("JSON-LD 文件导入成功：{}", stats.summary());
+                    if let Err(error) =
+                        persist_registry_observations(&oxigraph_manager, &store_path).await
+                    {
+                        eprintln!("导入已写入，但画像同步失败：{}", error);
+                    }
                 }
                 Err(e) => {
                     eprintln!("JSON-LD 文件导入失败: {}", e);
@@ -1312,11 +1318,17 @@ async fn main() {
             }
         }
         Some(Commands::ImportJsonldContent { content }) => {
+            load_persistent_registries(&config, &oxigraph_manager, &store_path);
             println!("正在导入 JSON-LD 内容...");
 
             match oxigraph_manager.import_jsonld(&content).await {
                 Ok(stats) => {
                     println!("JSON-LD 内容导入成功：{}", stats.summary());
+                    if let Err(error) =
+                        persist_registry_observations(&oxigraph_manager, &store_path).await
+                    {
+                        eprintln!("导入已写入，但画像同步失败：{}", error);
+                    }
                 }
                 Err(e) => {
                     eprintln!("JSON-LD 内容导入失败: {}", e);
@@ -1325,11 +1337,17 @@ async fn main() {
             }
         }
         Some(Commands::ImportRdf { file_path }) => {
+            load_persistent_registries(&config, &oxigraph_manager, &store_path);
             println!("正在导入 RDF 文件: {}", file_path);
 
             match oxigraph_manager.import_rdf_file(&file_path).await {
                 Ok(added) => {
                     println!("RDF 文件导入成功：新增 {} 条三元组！", added);
+                    if let Err(error) =
+                        persist_registry_observations(&oxigraph_manager, &store_path).await
+                    {
+                        eprintln!("导入已写入，但画像同步失败：{}", error);
+                    }
                 }
                 Err(e) => {
                     eprintln!("RDF 文件导入失败: {}", e);
@@ -3521,6 +3539,50 @@ async fn run_fuse(
     Ok(())
 }
 
+/// 导入前恢复持久画像：先载入已确认的谓词/实体/类型声明，再叠加 config，
+/// 避免一次 CLI 导入用空注册表覆盖用户此前签过的别名与准入。
+fn load_persistent_registries(
+    config: &SystemConfig,
+    manager: &OxigraphManager,
+    store_path: &str,
+) {
+    let _ = manager.load_predicate_registry(&format!(
+        "{}/predicate_registry.json",
+        store_path
+    ));
+    manager.configure_predicates(
+        &config.predicate_profiles,
+        config.reasoning.require_predicate_admission,
+    );
+    let _ = manager.load_entity_registry(&format!("{}/entity_registry.json", store_path));
+    manager.configure_entities(&config.entity_profiles);
+    manager.configure_type_system(&config.type_system);
+}
+
+/// 导入成功后把默认图观测进谓词/实体注册表并原子落盘。
+///
+/// RDF/JSON-LD 批量导入是「先有数据、后补画像」的路径：刷新而非准入，
+/// 让 `ask`、`laws`、`predicates` 等后续命令看到同一份持久观测。
+async fn persist_registry_observations(
+    manager: &OxigraphManager,
+    store_path: &str,
+) -> Result<(), String> {
+    manager
+        .refresh_predicate_registry()
+        .await
+        .map_err(|error| format!("刷新谓词画像失败：{}", error))?;
+    manager
+        .refresh_entity_registry()
+        .await
+        .map_err(|error| format!("刷新实体身份失败：{}", error))?;
+    manager
+        .save_predicate_registry(&format!("{}/predicate_registry.json", store_path))
+        .map_err(|error| format!("保存谓词画像失败：{}", error))?;
+    manager
+        .save_entity_registry(&format!("{}/entity_registry.json", store_path))
+        .map_err(|error| format!("保存实体身份失败：{}", error))
+}
+
 /// 谓词注册表的命令行编辑集（每项都可重复，空集合表示只读查看）。
 struct PredicateEdits {
     confirm: Vec<String>,
@@ -3727,6 +3789,7 @@ async fn run_batch_import(
     dry_run: bool,
     json: bool,
 ) {
+    load_persistent_registries(config, manager, store_path);
     let ledger_path = format!("{}/{}", store_path, batch_teaching::LEDGER_FILE);
     let ledger = match BatchTeachingLedger::load(&ledger_path) {
         BatchLedgerLoad::Loaded(ledger) => ledger,
@@ -3803,6 +3866,11 @@ async fn run_batch_import(
             }
         }
     };
+    if !dry_run {
+        if let Err(error) = persist_registry_observations(manager, store_path).await {
+            eprintln!("批量导入已写入，但画像同步失败：{}", error);
+        }
+    }
     if json {
         let payload = serde_json::json!({
             "sentences": sentences.len(),
@@ -14466,5 +14534,46 @@ mod session_tests {
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
+    }
+
+    /// RDF 导入后的画像同步必须落盘，且重新打开存储仍能解析导入的谓词与实体。
+    #[tokio::test]
+    async fn imported_graph_persists_predicate_and_entity_registries() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let store_path = dir.path().to_str().expect("临时目录路径");
+        let rdf_path = dir.path().join("sample.ttl");
+        std::fs::write(
+            &rdf_path,
+            r#"@prefix kg: <http://example.org/kg/> .
+<http://example.org/kg/entity/张三> kg:name "张三" .
+<http://example.org/kg/entity/张三> <http://example.org/kg/认识> <http://example.org/kg/entity/李四> .
+"#,
+        )
+        .expect("写入测试 RDF");
+
+        let manager = OxigraphManager::new(store_path).expect("打开测试存储");
+        let added = manager
+            .import_rdf_file(rdf_path.to_str().expect("RDF 路径"))
+            .await
+            .expect("导入测试 RDF");
+        assert_eq!(added, 2);
+        persist_registry_observations(&manager, store_path)
+            .await
+            .expect("同步画像注册表");
+        drop(manager);
+
+        let predicate_path = format!("{}/predicate_registry.json", store_path);
+        let entity_path = format!("{}/entity_registry.json", store_path);
+        assert!(std::path::Path::new(&predicate_path).exists());
+        assert!(std::path::Path::new(&entity_path).exists());
+
+        let reopened = OxigraphManager::new(store_path).expect("重新打开测试存储");
+        assert!(reopened.load_predicate_registry(&predicate_path));
+        assert!(reopened.predicate_registry_snapshot().resolve("认识").known);
+        assert!(reopened.load_entity_registry(&entity_path));
+        assert_eq!(
+            reopened.resolve_entity_identity("张三").canonical(),
+            Some("张三")
+        );
     }
 }
