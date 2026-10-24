@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub mod abduction;
 pub mod advanced_nlu;
 pub mod artifact_audit;
+pub mod alignment_memory;
 pub mod association_miner;
 pub mod batch_teaching;
 pub mod belief_revision;
