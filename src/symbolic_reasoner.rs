@@ -5448,6 +5448,26 @@ impl SymbolicReasoner {
 
     // ------------------------- 对话式澄清（以问代猜） -------------------------
 
+    /// 失败问题自动进入澄清：先做溯因拿到当前问题的失败前沿与候选解释，
+    /// 再直接返回最有判别力的提问，而不是把候选假设清单丢给用户。
+    ///
+    /// 与 [`Self::hypothesis_answer`] 的分工：
+    /// - `hypothesis_answer` 面向「我想看有哪些猜测」的显式溯因命令；
+    /// - 本方法面向「问题没答出来，下一步该问什么」的自动化通道。
+    ///
+    /// 目标已可证、溯因被禁用或无法形式化时返回 `None`，调用方应保留原回答。
+    pub fn begin_clarification_for_question(&mut self, question: &str) -> Option<String> {
+        if !self.config.enable_abduction || !self.config.enable_clarification {
+            return None;
+        }
+        if self.clarification_active() {
+            return Some(self.render_clarification_prompt());
+        }
+        // 始终按当前问题重算待定池：上一题残留的假设不能劫持这一题的提问。
+        let _ = self.hypothesis_answer(question)?;
+        self.start_clarification()
+    }
+
     /// 开始澄清对话：把待定假设逐条逆转为「是否成立」的提问
     pub fn start_clarification(&mut self) -> Option<String> {
         if !self.config.enable_abduction || !self.config.enable_clarification {
@@ -19745,6 +19765,45 @@ types = [
             "候选假设应补全师傅关系，实际：{:?}",
             displays
         );
+    }
+
+    #[test]
+    fn failed_question_enters_clarification_without_dumping_candidates() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&sparse_master_facts());
+        reasoner.resolver.add_clause(teacher_rule());
+        let prompt = reasoner
+            .begin_clarification_for_question("张三的师祖是谁")
+            .expect("不可证问句应能直接进入澄清");
+        assert!(reasoner.clarification_active());
+        assert!(
+            prompt.contains("判别理由") && prompt.contains("解释空间"),
+            "首问应说明解释空间与判别理由：{}",
+            prompt
+        );
+        assert!(
+            !prompt.contains("假设生成"),
+            "自动通道不应先把候选清单丢给用户：{}",
+            prompt
+        );
+        // 已在进行中的会话不能被新问题重置：仍返回同一个当前提问。
+        let again = reasoner
+            .begin_clarification_for_question("钱七的师祖是谁")
+            .expect("会话进行中应返回当前提问");
+        assert_eq!(again, prompt, "澄清进行中不得被新问题劫持");
+    }
+
+    #[test]
+    fn provable_question_does_not_enter_clarification() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(
+            reasoner
+                .begin_clarification_for_question("张三的师祖是谁")
+                .is_none(),
+            "已可证问题不应开启澄清"
+        );
+        assert!(!reasoner.clarification_active());
     }
 
     #[test]
