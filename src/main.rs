@@ -3541,15 +3541,8 @@ async fn run_fuse(
 
 /// 导入前恢复持久画像：先载入已确认的谓词/实体/类型声明，再叠加 config，
 /// 避免一次 CLI 导入用空注册表覆盖用户此前签过的别名与准入。
-fn load_persistent_registries(
-    config: &SystemConfig,
-    manager: &OxigraphManager,
-    store_path: &str,
-) {
-    let _ = manager.load_predicate_registry(&format!(
-        "{}/predicate_registry.json",
-        store_path
-    ));
+fn load_persistent_registries(config: &SystemConfig, manager: &OxigraphManager, store_path: &str) {
+    let _ = manager.load_predicate_registry(&format!("{}/predicate_registry.json", store_path));
     manager.configure_predicates(
         &config.predicate_profiles,
         config.reasoning.require_predicate_admission,
@@ -3754,9 +3747,17 @@ async fn run_predicates(
         for (name, changed) in &confirmed {
             println!(
                 "{}谓词「{}」{}",
-                if *changed { "已确认" } else { "无需确认" },
+                if *changed {
+                    "已确认"
+                } else {
+                    "无需确认"
+                },
                 name,
-                if *changed { "。" } else { "（不是待确认谓词）。" }
+                if *changed {
+                    "。"
+                } else {
+                    "（不是待确认谓词）。"
+                }
             );
         }
         for (name, removed, status) in &rejected {
