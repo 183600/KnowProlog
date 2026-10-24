@@ -208,6 +208,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_synonyms(&mut c, config);
     check_reasoning(&mut c, config);
     check_confidence(&mut c, config);
+    check_soft_route(&mut c, config);
     check_trace_graph(&mut c, config);
     check_dialogue_frames(&mut c, config);
     c.issues
@@ -1652,6 +1653,12 @@ fn check_reasoning(c: &mut Collector, config: &SystemConfig) {
                 "对话记忆路径为空：跨会话记忆无法落盘",
             );
         }
+    }
+}
+
+fn check_soft_route(c: &mut Collector, config: &SystemConfig) {
+    if let Err(issue) = config.reasoning.soft_route.validate() {
+        c.error("invalid_soft_route", "reasoning.soft_route", issue);
     }
 }
 
