@@ -50,6 +50,8 @@ pub struct LexiconEntry {
     pub status: LexiconStatus,
     pub origin: String,
     pub observations: u32,
+    /// 同一词面被确认到其他规范名时保留的候选；主规范名不静默切换。
+    pub alternates: Vec<String>,
 }
 
 /// 覆盖层选中的一个指称跨度（字符区间 `[start, end)`）。
@@ -190,19 +192,31 @@ impl MentionLexicon {
             if existing.status == LexiconStatus::Tombstoned {
                 return false;
             }
-            let changed = existing.status != LexiconStatus::Confirmed
-                || existing.canonical != canonical
-                || existing.pos != pos
-                || existing.etype.as_deref() != etype;
-            existing.status = LexiconStatus::Confirmed;
-            existing.canonical = canonical.to_string();
-            existing.pos = pos;
-            existing.etype = etype.map(str::to_string);
+            let was_confirmed = existing.status == LexiconStatus::Confirmed;
+            let mut changed = !was_confirmed;
+            if !was_confirmed {
+                existing.status = LexiconStatus::Confirmed;
+                existing.canonical = canonical.to_string();
+                existing.pos = pos;
+                existing.etype = etype.map(str::to_string);
+                existing.alternates.clear();
+            } else if existing.canonical == canonical {
+                // 同义项只允许补全类型，不允许用缺失类型把已知类型降级。
+                if let Some(etype) = etype {
+                    if existing.etype.as_deref() != Some(etype) {
+                        existing.etype = Some(etype.to_string());
+                        existing.pos = pos;
+                        changed = true;
+                    }
+                }
+            } else if !existing.alternates.iter().any(|alt| alt == canonical) {
+                // 同一词面指向多个规范名：保留主规范名，另存候选，避免静默择一。
+                existing.alternates.push(canonical.to_string());
+                existing.alternates.sort();
+                changed = true;
+            }
             existing.origin = origin.to_string();
             existing.observations = existing.observations.saturating_add(1);
-            if changed {
-                self.reindex_surface(surface);
-            }
             return changed;
         }
 
@@ -216,6 +230,7 @@ impl MentionLexicon {
                 status: LexiconStatus::Confirmed,
                 origin: origin.to_string(),
                 observations: 1,
+                alternates: Vec::new(),
             },
         );
         self.insert_index(surface);
@@ -248,6 +263,7 @@ impl MentionLexicon {
                 status: LexiconStatus::Pending,
                 origin: origin.to_string(),
                 observations: 1,
+                alternates: Vec::new(),
             },
         );
         true
@@ -279,6 +295,7 @@ impl MentionLexicon {
                 status: LexiconStatus::Tombstoned,
                 origin: origin.to_string(),
                 observations: 1,
+                alternates: Vec::new(),
             },
         );
         true
@@ -417,15 +434,21 @@ impl MentionLexicon {
             self.tombstoned_count()
         );
         for span in spans {
+            let alt_note = self
+                .entry(&span.surface)
+                .filter(|entry| !entry.alternates.is_empty())
+                .map(|entry| format!("｜多候选 {}", entry.alternates.join(" / ")))
+                .unwrap_or_default();
             let _ = writeln!(
                 output,
-                "  • 「{}」（第 {} 字起，{} 字）→ {}｜词性 {}｜来源 {}",
+                "  • 「{}」（第 {} 字起，{} 字）→ {}｜词性 {}｜来源 {}{}",
                 span.surface,
                 span.start + 1,
                 span.char_len(),
                 span.canonical,
                 span.pos,
-                span.origin
+                span.origin,
+                alt_note
             );
         }
         output.trim_end().to_string()
@@ -449,14 +472,20 @@ impl MentionLexicon {
                 .as_deref()
                 .map(|etype| format!("，类型 {}", etype))
                 .unwrap_or_default();
+            let alt_note = if entry.alternates.is_empty() {
+                String::new()
+            } else {
+                format!("，多候选 {}", entry.alternates.join(" / "))
+            };
             let _ = writeln!(
                 output,
-                "  • 「{}」→「{}」（{}，词性 {}{}；来源 {}；观察 {}）",
+                "  • 「{}」→「{}」（{}，词性 {}{}{}；来源 {}；观察 {}）",
                 entry.surface,
                 entry.canonical,
                 entry.status.label(),
                 entry.pos,
                 type_note,
+                alt_note,
                 entry.origin,
                 entry.observations
             );
@@ -497,11 +526,6 @@ impl MentionLexicon {
         if bucket.is_empty() {
             self.by_first.remove(&first);
         }
-    }
-
-    fn reindex_surface(&mut self, surface: &str) {
-        self.remove_index(surface);
-        self.insert_index(surface);
     }
 }
 
@@ -579,6 +603,29 @@ mod tests {
         assert!(!lexicon.confirm("姚明", "姚明", Some("Person"), "kb"));
         assert_eq!(lexicon.entry("姚明").unwrap().observations, 2);
         assert!(lexicon.render_report().contains("观察 2"));
+    }
+
+    #[test]
+    fn missing_type_never_downgrades_a_confirmed_entry() {
+        let mut lexicon = lexicon_with(&[("未名科技", "未名科技", Some("Organization"))]);
+        assert!(!lexicon.confirm("未名科技", "未名科技", None, "kb_relation"));
+        let entry = lexicon.entry("未名科技").unwrap();
+        assert_eq!(entry.pos, "nt");
+        assert_eq!(entry.etype.as_deref(), Some("Organization"));
+        assert_eq!(entry.origin, "kb_relation");
+    }
+
+    #[test]
+    fn conflicting_canonicals_are_kept_as_alternates() {
+        let mut lexicon = lexicon_with(&[("未名", "未名科技", Some("Organization"))]);
+        assert!(lexicon.confirm("未名", "未名大学", Some("University"), "confirmed_alias"));
+        let entry = lexicon.entry("未名").unwrap();
+        assert_eq!(entry.canonical, "未名科技");
+        assert_eq!(entry.alternates, vec!["未名大学".to_string()]);
+        assert!(lexicon.render_report().contains("多候选 未名大学"));
+        assert!(lexicon
+            .render_match_report("未名科技")
+            .contains("多候选 未名大学"));
     }
 
     #[test]
