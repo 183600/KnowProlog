@@ -508,6 +508,9 @@ impl QueryPlanner {
             ("多大", "年龄"),
             ("几岁", "年龄"),
         ];
+        // 「张三多大了」「王五几岁了」带完成体「了」：程度问句的时态尾缀
+        // 不改变属性，只剥一次，避免把「了」当成实体或属性的一部分。
+        let q = q.strip_suffix('了').unwrap_or(q).trim();
         for (marker, default_attribute) in DEGREE_ATTRIBUTES {
             let prefix = match q.strip_suffix(marker) {
                 Some(prefix) => prefix.trim(),
@@ -582,6 +585,7 @@ impl QueryPlanner {
 
     /// 多问句尾巴「多少岁」：与「多大」等价，放在候选末尾。
     fn parse_age_suffix(&self, q: &str) -> Option<QueryPlan> {
+        let q = q.strip_suffix('了').unwrap_or(q).trim();
         let prefix = q.strip_suffix("多少岁")?.trim();
         let prefix = prefix.strip_suffix('有').unwrap_or(prefix).trim();
         if prefix.is_empty() || Self::is_question_word(prefix) {
@@ -1638,8 +1642,10 @@ mod tests {
             ("姚明的身高有多高", "姚明", "身高"),
             ("姚明多重？", "姚明", "体重"),
             ("张三多大", "张三", "年龄"),
+            ("张三多大了？", "张三", "年龄"),
             ("李四几岁", "李四", "年龄"),
             ("王五多少岁", "王五", "年龄"),
+            ("王五多少岁了", "王五", "年龄"),
         ] {
             let plan = planner()
                 .parse(question)
