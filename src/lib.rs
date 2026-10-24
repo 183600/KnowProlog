@@ -315,6 +315,58 @@ fn term_to_json(term: &Term) -> Value {
     }
 }
 
+/// 属性值到节点引用的上下文强制（`"@type": "@id"` / `"@type": "@vocab"`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeReferenceCoercion {
+    /// 字符串按 `@base`（或上下文词项映射）解析为节点 IRI。
+    Id,
+    /// 字符串按 `@vocab`（或上下文词项映射）解析为节点 IRI。
+    Vocab,
+}
+
+/// JSON-LD 上下文：词项 → IRI 映射，以及节点引用的类型强制声明。
+///
+/// 词项定义里的 `@type` 不只是元数据：`"@type": "@id"` 表示该属性的字符串值
+/// 是节点引用而不是字面量；不记录它就会把「friend: "李四"」导入成字符串，
+/// 后续 SPARQL/推理再也找不到这条边。
+#[derive(Debug, Clone, Default)]
+struct JsonLdContext {
+    terms: HashMap<String, String>,
+    id_coerced: HashSet<String>,
+    vocab_coerced: HashSet<String>,
+    /// 本上下文重新定义的词项；合并到父级时必须先清掉继承的旧定义
+    ///（含 `null` 清除与非 `null` 覆盖）。
+    redefined: HashSet<String>,
+}
+
+impl JsonLdContext {
+    fn clear_term(&mut self, term: &str) {
+        self.terms.remove(term);
+        self.id_coerced.remove(term);
+        self.vocab_coerced.remove(term);
+        self.redefined.remove(term);
+    }
+
+    fn merge(&mut self, other: Self) {
+        for term in other.redefined {
+            self.clear_term(&term);
+        }
+        self.terms.extend(other.terms);
+        self.id_coerced.extend(other.id_coerced);
+        self.vocab_coerced.extend(other.vocab_coerced);
+    }
+
+    fn coercion(&self, term: &str) -> Option<NodeReferenceCoercion> {
+        if self.id_coerced.contains(term) {
+            Some(NodeReferenceCoercion::Id)
+        } else if self.vocab_coerced.contains(term) {
+            Some(NodeReferenceCoercion::Vocab)
+        } else {
+            None
+        }
+    }
+}
+
 /// JSON-LD 导入统计：节点（实体）数、指向命名节点的关系边数、
 /// 本次实际新增的三元组数（与库中已有三元组重复者不计入）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1186,28 +1238,47 @@ impl OxigraphManager {
         Ok(())
     }
 
-    /// 提取 @context 中的映射（term -> IRI / @base / @vocab），供类型与属性名展开使用。
+    /// 提取 @context 中的映射（term -> IRI / @base / @vocab）与节点引用强制，
+    /// 供类型与属性名展开使用。
     ///
     /// 支持三种常见写法：
     /// - 字符串映射：`"name": "http://example.org/kg/name"`
     /// - 上下文数组：`"@context": [{...}, {...}]`（后者覆盖前者）
-    /// - 对象映射：`"ex": { "@id": "http://example.org/kg/" }`
-    fn extract_jsonld_context(obj: &serde_json::Map<String, Value>) -> HashMap<String, String> {
-        let mut context = HashMap::new();
+    /// - 对象映射：`"ex": { "@id": "http://example.org/kg/" }`，并可带
+    ///   `"@type": "@id"` / `"@type": "@vocab"` 声明节点引用
+    ///
+    /// `null` 词项定义按 JSON-LD 语义清除先前映射，避免作用域上下文里
+    /// 「显式清空」被误读成继承。
+    fn extract_jsonld_context(obj: &serde_json::Map<String, Value>) -> JsonLdContext {
+        let mut context = JsonLdContext::default();
         let Some(ctx) = obj.get("@context") else {
             return context;
         };
-        let apply = |ctx: &serde_json::Map<String, Value>,
-                     context: &mut HashMap<String, String>| {
+        let apply = |ctx: &serde_json::Map<String, Value>, context: &mut JsonLdContext| {
             for (term, value) in ctx {
+                context.clear_term(term);
+                context.redefined.insert(term.clone());
+                if value.is_null() {
+                    continue;
+                }
                 if let Some(iri) = value.as_str() {
-                    context.insert(term.clone(), iri.to_string());
-                } else if let Some(iri) = value
-                    .as_object()
-                    .and_then(|definition| definition.get("@id"))
-                    .and_then(Value::as_str)
-                {
-                    context.insert(term.clone(), iri.to_string());
+                    context.terms.insert(term.clone(), iri.to_string());
+                    continue;
+                }
+                let Some(definition) = value.as_object() else {
+                    continue;
+                };
+                if let Some(iri) = definition.get("@id").and_then(Value::as_str) {
+                    context.terms.insert(term.clone(), iri.to_string());
+                }
+                match definition.get("@type").and_then(Value::as_str) {
+                    Some("@id") => {
+                        context.id_coerced.insert(term.clone());
+                    }
+                    Some("@vocab") => {
+                        context.vocab_coerced.insert(term.clone());
+                    }
+                    _ => {}
                 }
             }
         };
@@ -1227,16 +1298,16 @@ impl OxigraphManager {
     ///
     /// 支持前缀映射（`ex:name`）与「词项 → 紧凑 IRI → 绝对 IRI」的链式展开；
     /// 设深度上限避免自引用上下文导致死循环。
-    fn expand_jsonld_term(term: &str, context: &HashMap<String, String>) -> String {
+    fn expand_jsonld_term(term: &str, context: &JsonLdContext) -> String {
         let mut current = term.to_string();
         for _ in 0..8 {
             if let Some((prefix, suffix)) = current.split_once(':') {
-                if let Some(base) = context.get(prefix) {
+                if let Some(base) = context.terms.get(prefix) {
                     return format!("{}{}", base, suffix);
                 }
                 return current;
             }
-            let Some(iri) = context.get(&current) else {
+            let Some(iri) = context.terms.get(&current) else {
                 break;
             };
             if iri == &current {
@@ -1245,7 +1316,7 @@ impl OxigraphManager {
             current = iri.clone();
         }
         if !current.contains(':') {
-            if let Some(vocab) = context.get("@vocab") {
+            if let Some(vocab) = context.terms.get("@vocab") {
                 return format!("{}{}", vocab, current);
             }
         }
@@ -1253,14 +1324,59 @@ impl OxigraphManager {
     }
 
     /// 展开节点 `@id`：裸标识符按 `@base` 解析为绝对 IRI（JSON-LD 文档相对 IRI 语义）。
-    fn expand_jsonld_id(id: &str, context: &HashMap<String, String>) -> String {
-        if id.contains(':') || context.contains_key(id) {
+    fn expand_jsonld_id(id: &str, context: &JsonLdContext) -> String {
+        if id.contains(':') || context.terms.contains_key(id) {
             return Self::expand_jsonld_term(id, context);
         }
-        if let Some(base) = context.get("@base") {
+        if let Some(base) = context.terms.get("@base") {
             return format!("{}{}", base, id);
         }
         id.to_string()
+    }
+
+    /// 把被声明为节点引用的字符串解析为节点：`@id` 按 `@base`，`@vocab` 按词表；
+    /// 两者都没有可用基准时回落到本知识库的实体 URI 规则，而不是产出相对 IRI。
+    fn jsonld_coerced_node(
+        value: &str,
+        coercion: NodeReferenceCoercion,
+        context: &JsonLdContext,
+    ) -> Result<NamedOrBlankNode, Box<dyn std::error::Error + Send + Sync>> {
+        let expanded = match coercion {
+            NodeReferenceCoercion::Id => Self::expand_jsonld_id(value, context),
+            NodeReferenceCoercion::Vocab => Self::expand_jsonld_term(value, context),
+        };
+        if expanded.contains(':') {
+            Self::jsonld_node(&expanded, context)
+        } else {
+            Self::jsonld_node(&crate::identity::entity_uri(BASE_NS, &expanded), context)
+        }
+    }
+
+    /// JSON 原生标量 → RDF 字面量：数字/布尔保留 XSD 类型（与 JSON-LD 展开一致）。
+    ///
+    /// `null` 不是 RDF 值：JSON-LD 语义要求忽略，返回 `None`。对象/数组不应
+    /// 走到这里（它们由上层按 `@value` / `@list` / 节点展开），保留字符串兜底。
+    fn jsonld_scalar_literal(value: &Value) -> Option<Literal> {
+        const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
+        let datatype = |local: &str| {
+            NamedNode::new(format!("{}{}", XSD_NS, local)).expect("XSD 常量 IRI 必须合法")
+        };
+        match value {
+            Value::Null => None,
+            Value::String(text) => Some(Literal::new_simple_literal(text)),
+            Value::Bool(boolean) => {
+                Some(Literal::new_typed_literal(boolean.to_string(), datatype("boolean")))
+            }
+            Value::Number(number) => {
+                let local = if number.is_i64() || number.is_u64() {
+                    "integer"
+                } else {
+                    "double"
+                };
+                Some(Literal::new_typed_literal(number.to_string(), datatype(local)))
+            }
+            other => Some(Literal::new_simple_literal(&other.to_string())),
+        }
     }
 
     /// 把 JSON-LD 节点引用解析为命名节点或空白节点。
@@ -1269,7 +1385,7 @@ impl OxigraphManager {
     /// 必须映射到同一空白节点，才能保持导入幂等；标签含非法字符时用稳定哈希兜底。
     fn jsonld_node(
         id: &str,
-        context: &HashMap<String, String>,
+        context: &JsonLdContext,
     ) -> Result<NamedOrBlankNode, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(label) = id.strip_prefix("_:") {
             if let Ok(node) = BlankNode::new(label.to_string()) {
@@ -1289,13 +1405,13 @@ impl OxigraphManager {
         &self,
         store: &Store,
         obj: &serde_json::Map<String, Value>,
-        context: &HashMap<String, String>,
+        context: &JsonLdContext,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 节点级 @context 是作用域上下文：只影响本节点及其嵌套值。
         let mut context = context.clone();
         if obj.contains_key("@context") {
-            context.extend(Self::extract_jsonld_context(obj));
+            context.merge(Self::extract_jsonld_context(obj));
         }
         let context = &context;
 
@@ -1371,13 +1487,18 @@ impl OxigraphManager {
             }
 
             let predicate = NamedNode::new(Self::expand_jsonld_term(key, context))?;
+            let coercion = context.coercion(key);
 
             if let Some(value_array) = value.as_array() {
                 for val in value_array {
-                    self.process_property_value(store, &subject, &predicate, val, context, stats)?;
+                    self.process_property_value(
+                        store, &subject, &predicate, val, coercion, context, stats,
+                    )?;
                 }
             } else {
-                self.process_property_value(store, &subject, &predicate, value, context, stats)?;
+                self.process_property_value(
+                    store, &subject, &predicate, value, coercion, context, stats,
+                )?;
             }
         }
 
@@ -1388,15 +1509,16 @@ impl OxigraphManager {
                     continue;
                 }
                 let predicate = NamedNode::new(Self::expand_jsonld_term(key, context))?;
+                let coercion = context.coercion(key);
                 if let Some(value_array) = value.as_array() {
                     for val in value_array {
                         self.process_reverse_value(
-                            store, &subject, &predicate, val, context, stats,
+                            store, &subject, &predicate, val, coercion, context, stats,
                         )?;
                     }
                 } else {
                     self.process_reverse_value(
-                        store, &subject, &predicate, value, context, stats,
+                        store, &subject, &predicate, value, coercion, context, stats,
                     )?;
                 }
             }
@@ -1419,7 +1541,7 @@ impl OxigraphManager {
         &self,
         store: &Store,
         value: &Value,
-        context: &HashMap<String, String>,
+        context: &JsonLdContext,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match value {
@@ -1443,10 +1565,21 @@ impl OxigraphManager {
         subject: &NamedOrBlankNode,
         predicate: &NamedNode,
         value: &Value,
-        context: &HashMap<String, String>,
+        coercion: Option<NodeReferenceCoercion>,
+        context: &JsonLdContext,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(obj) = value.as_object() else {
+            if let (Some(text), Some(coercion)) = (value.as_str(), coercion) {
+                let object = Self::jsonld_coerced_node(text, coercion, context)?;
+                store.insert(&Quad::new(
+                    object,
+                    predicate.clone(),
+                    subject.clone(),
+                    GraphName::DefaultGraph,
+                ))?;
+                stats.relations += 1;
+            }
             return Ok(());
         };
         let Some(id) = obj.get("@id").and_then(Value::as_str) else {
@@ -1476,36 +1609,41 @@ impl OxigraphManager {
         subject: &NamedOrBlankNode,
         predicate: &NamedNode,
         value: &Value,
-        context: &HashMap<String, String>,
+        coercion: Option<NodeReferenceCoercion>,
+        context: &JsonLdContext,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match value {
+            Value::Null => {}
             Value::String(s) => {
-                let object = Literal::new_simple_literal(s);
-                store.insert(&Quad::new(
-                    subject.clone(),
-                    predicate.clone(),
-                    object,
-                    GraphName::DefaultGraph,
-                ))?;
+                if let Some(coercion) = coercion {
+                    let object = Self::jsonld_coerced_node(s, coercion, context)?;
+                    store.insert(&Quad::new(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                        GraphName::DefaultGraph,
+                    ))?;
+                    stats.relations += 1;
+                } else {
+                    let object = Literal::new_simple_literal(s);
+                    store.insert(&Quad::new(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                        GraphName::DefaultGraph,
+                    ))?;
+                }
             }
-            Value::Number(n) => {
-                let object = Literal::new_simple_literal(&n.to_string());
-                store.insert(&Quad::new(
-                    subject.clone(),
-                    predicate.clone(),
-                    object,
-                    GraphName::DefaultGraph,
-                ))?;
-            }
-            Value::Bool(b) => {
-                let object = Literal::new_simple_literal(&b.to_string());
-                store.insert(&Quad::new(
-                    subject.clone(),
-                    predicate.clone(),
-                    object,
-                    GraphName::DefaultGraph,
-                ))?;
+            Value::Number(_) | Value::Bool(_) => {
+                if let Some(object) = Self::jsonld_scalar_literal(value) {
+                    store.insert(&Quad::new(
+                        subject.clone(),
+                        predicate.clone(),
+                        object,
+                        GraphName::DefaultGraph,
+                    ))?;
+                }
             }
             Value::Object(obj) => {
                 // @set 只是数组容器：逐个展开，不产生额外节点。
@@ -1513,12 +1651,12 @@ impl OxigraphManager {
                     if let Some(items) = set.as_array() {
                         for item in items {
                             self.process_property_value(
-                                store, subject, predicate, item, context, stats,
+                                store, subject, predicate, item, coercion, context, stats,
                             )?;
                         }
                     } else {
                         self.process_property_value(
-                            store, subject, predicate, set, context, stats,
+                            store, subject, predicate, set, coercion, context, stats,
                         )?;
                     }
                     return Ok(());
@@ -1530,7 +1668,7 @@ impl OxigraphManager {
                         other => vec![other.clone()],
                     };
                     self.process_jsonld_list(
-                        store, subject, predicate, &items, context, stats,
+                        store, subject, predicate, &items, coercion, context, stats,
                     )?;
                     return Ok(());
                 }
@@ -1553,37 +1691,42 @@ impl OxigraphManager {
                         }
                     }
                 } else if let Some(val) = obj.get("@value") {
-                    // 字符串值取其内容本身，其他类型使用 JSON 表示
-                    let value_text = match val {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-
-                    // 处理带数据类型的值
+                    // 显式 @type / @language 优先；没有时按 JSON 原生标量定型
+                    // （数字 → xsd:integer/xsd:double，布尔 → xsd:boolean）。
                     let literal = if let Some(datatype) = obj.get("@type") {
                         if let Some(datatype_uri) = datatype.as_str() {
+                            let value_text = match val {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
                             let dt =
                                 NamedNode::new(Self::expand_jsonld_term(datatype_uri, context))?;
-                            Literal::new_typed_literal(&value_text, dt)
+                            Some(Literal::new_typed_literal(&value_text, dt))
                         } else {
-                            Literal::new_simple_literal(&value_text)
+                            Self::jsonld_scalar_literal(val)
                         }
                     } else if let Some(lang) = obj.get("@language") {
                         if let Some(lang_tag) = lang.as_str() {
-                            Literal::new_language_tagged_literal(&value_text, lang_tag)?
+                            let value_text = match val {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            Some(Literal::new_language_tagged_literal(&value_text, lang_tag)?)
                         } else {
-                            Literal::new_simple_literal(&value_text)
+                            Self::jsonld_scalar_literal(val)
                         }
                     } else {
-                        Literal::new_simple_literal(&value_text)
+                        Self::jsonld_scalar_literal(val)
                     };
 
-                    store.insert(&Quad::new(
-                        subject.clone(),
-                        predicate.clone(),
-                        literal,
-                        GraphName::DefaultGraph,
-                    ))?;
+                    if let Some(literal) = literal {
+                        store.insert(&Quad::new(
+                            subject.clone(),
+                            predicate.clone(),
+                            literal,
+                            GraphName::DefaultGraph,
+                        ))?;
+                    }
                 }
             }
             _ => {
@@ -1610,9 +1753,17 @@ impl OxigraphManager {
         subject: &NamedOrBlankNode,
         predicate: &NamedNode,
         items: &[Value],
-        context: &HashMap<String, String>,
+        coercion: Option<NodeReferenceCoercion>,
+        context: &JsonLdContext,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // JSON-LD 规定 null 不产生 RDF 项：先剔除，避免把「空位」编码进链表。
+        let items: Vec<Value> = items
+            .iter()
+            .filter(|item| !item.is_null())
+            .cloned()
+            .collect();
+        let items = items.as_slice();
         let rdf_nil = NamedNode::new(format!("{}nil", RDF_NS))?;
         if items.is_empty() {
             store.insert(&Quad::new(
@@ -1647,7 +1798,9 @@ impl OxigraphManager {
             GraphName::DefaultGraph,
         ))?;
         for (index, cell) in cells.iter().enumerate() {
-            let item = self.process_jsonld_list_item(store, &items[index], context, stats)?;
+            let item = self.process_jsonld_list_item(
+                store, &items[index], coercion, context, stats,
+            )?;
             store.insert(&Quad::new(
                 cell.clone(),
                 rdf_first.clone(),
@@ -1673,13 +1826,21 @@ impl OxigraphManager {
         &self,
         store: &Store,
         item: &Value,
-        context: &HashMap<String, String>,
+        coercion: Option<NodeReferenceCoercion>,
+        context: &JsonLdContext,
         stats: &mut JsonldImportStats,
     ) -> Result<Term, Box<dyn std::error::Error + Send + Sync>> {
         match item {
-            Value::String(text) => Ok(Literal::new_simple_literal(text).into()),
-            Value::Number(number) => Ok(Literal::new_simple_literal(&number.to_string()).into()),
-            Value::Bool(value) => Ok(Literal::new_simple_literal(&value.to_string()).into()),
+            Value::String(text) => {
+                if let Some(coercion) = coercion {
+                    Ok(Self::jsonld_coerced_node(text, coercion, context)?.into())
+                } else {
+                    Ok(Literal::new_simple_literal(text).into())
+                }
+            }
+            Value::Number(_) | Value::Bool(_) => Ok(Self::jsonld_scalar_literal(item)
+                .map(Term::from)
+                .unwrap_or_else(|| Literal::new_simple_literal(&item.to_string()).into())),
             Value::Object(obj) => {
                 if let Some(id) = obj.get("@id").and_then(Value::as_str) {
                     if id.is_empty() {
@@ -1705,7 +1866,9 @@ impl OxigraphManager {
                     if let Some(language) = obj.get("@language").and_then(Value::as_str) {
                         return Ok(Literal::new_language_tagged_literal(&text, language)?.into());
                     }
-                    return Ok(Literal::new_simple_literal(&text).into());
+                    return Ok(Self::jsonld_scalar_literal(value)
+                        .map(Term::from)
+                        .unwrap_or_else(|| Literal::new_simple_literal(&text).into()));
                 }
                 Ok(Literal::new_simple_literal(&item.to_string()).into())
             }
@@ -6238,6 +6401,165 @@ mod cache_tests {
         let error = manager.export_rdf_file(path.to_str().unwrap()).await;
         assert!(error.is_err());
         assert!(error.unwrap_err().to_string().contains("识别"));
+    }
+
+    /// JSON-LD 原生标量必须保留 XSD 类型：数字/布尔不是字符串，`null` 不落库。
+    /// 否则 `SELECT ?age` 只会得到 `"25"`，下游数值比较与类型化查询全部失效。
+    #[tokio::test]
+    async fn import_jsonld_types_native_scalars_and_skips_null() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "ex": "http://example.org/kg/",
+                "@vocab": "http://example.org/kg/",
+                "name": "ex:name",
+                "age": "ex:age",
+                "score": "ex:score",
+                "active": "ex:active"
+            },
+            "@id": "http://example.org/kg/entity/小明",
+            "@type": "Person",
+            "name": "小明",
+            "age": 25,
+            "score": 1.5,
+            "active": true,
+            "nickname": null,
+            "height": { "@value": 180 },
+            "retired": { "@value": false }
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 1);
+        assert_eq!(stats.relations, 0);
+        assert_eq!(stats.triples, 7, "类型 1 + 六个非空属性");
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?age ?score ?active ?height ?retired WHERE {
+                    <http://example.org/kg/entity/小明>
+                        kg:age ?age ;
+                        kg:score ?score ;
+                        kg:active ?active ;
+                        kg:height ?height ;
+                        kg:retired ?retired
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1, "{:?}", result.data);
+        assert_eq!(result.data[0].get("age"), Some(&serde_json::json!(25)));
+        assert_eq!(result.data[0].get("score"), Some(&serde_json::json!(1.5)));
+        assert_eq!(
+            result.data[0].get("active"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(result.data[0].get("height"), Some(&serde_json::json!(180)));
+        assert_eq!(
+            result.data[0].get("retired"),
+            Some(&serde_json::json!(false))
+        );
+
+        assert_eq!(
+            manager.import_jsonld(jsonld).await.unwrap().triples,
+            0,
+            "重复导入保持幂等"
+        );
+    }
+
+    /// 作用域上下文重新定义词项时，必须撤销父级继承的节点强制；
+    /// 否则子节点里的普通字符串会被误判成实体引用。
+    #[tokio::test]
+    async fn import_jsonld_scoped_context_resets_inherited_coercion() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "ex": "http://example.org/kg/",
+                "friend": { "@id": "ex:friend", "@type": "@id" }
+            },
+            "@id": "http://example.org/kg/entity/甲",
+            "friend": {
+                "@context": { "friend": { "@id": "ex:friend" } },
+                "@id": "http://example.org/kg/entity/乙",
+                "friend": "李四"
+            }
+        }"#;
+
+        manager.import_jsonld(jsonld).await.unwrap();
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?friend WHERE {
+                    <http://example.org/kg/entity/乙> kg:friend ?friend
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.data[0].get("friend"),
+            Some(&Value::String("李四".to_string())),
+            "作用域上下文应清除父级 @type:@id 强制"
+        );
+    }
+
+    /// 上下文里的 `@type: "@id"` / `"@vocab"` 是节点引用声明：字符串必须
+    /// 落成实体边而不是字面量；数组中的 `null` 直接跳过。
+    #[tokio::test]
+    async fn import_jsonld_coerces_string_values_to_node_references() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "ex": "http://example.org/kg/",
+                "@base": "http://example.org/kg/entity/",
+                "@vocab": "http://example.org/kg/entity/",
+                "name": "ex:name",
+                "friend": { "@id": "ex:friend", "@type": "@id" },
+                "mentor": { "@id": "ex:mentor", "@type": "@vocab" },
+                "parent": { "@id": "ex:parent", "@type": "@id" }
+            },
+            "@id": "http://example.org/kg/entity/张三",
+            "name": "张三",
+            "friend": "李四",
+            "mentor": "王五",
+            "parent": ["赵六", null]
+        }"#;
+
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.entities, 1);
+        assert_eq!(stats.relations, 3, "friend + mentor + parent 都是实体边");
+        assert_eq!(stats.triples, 4, "名字 1 + 关系 3");
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?friend ?mentor ?parent WHERE {
+                    <http://example.org/kg/entity/张三>
+                        kg:friend ?friend ;
+                        kg:mentor ?mentor ;
+                        kg:parent ?parent
+                }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1, "{:?}", result.data);
+        assert_eq!(
+            result.data[0].get("friend"),
+            Some(&serde_json::json!("http://example.org/kg/entity/李四"))
+        );
+        assert_eq!(
+            result.data[0].get("mentor"),
+            Some(&serde_json::json!("http://example.org/kg/entity/王五"))
+        );
+        assert_eq!(
+            result.data[0].get("parent"),
+            Some(&serde_json::json!("http://example.org/kg/entity/赵六"))
+        );
+
+        assert_eq!(
+            manager.import_jsonld(jsonld).await.unwrap().triples,
+            0,
+            "重复导入保持幂等"
+        );
     }
 }
 
