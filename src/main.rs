@@ -53,7 +53,7 @@ use know_prolog::{
     load_config_from,
     local_semantic_adapter::LocalSemanticAdapter,
     neuro_symbolic_contrast::ContrastArbiter,
-    nlp::{normalize_words, preprocess},
+    nlp::{normalize_words, preprocess, preprocess_annotated},
     nlu::NLUEngine,
     ontology_reasoning::OntologyProgram,
     ownthink_api::select_candidate_by_context,
@@ -8568,6 +8568,79 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 提及词表覆盖层：已确认词面回灌切分，展示旧/新边界与差异
+        if let Some(text) = strip_any_prefix(
+            input,
+            &[
+                "提及词表：",
+                "提及词表:",
+                "词表感知：",
+                "词表感知:",
+                "词表切分：",
+                "词表切分:",
+            ],
+        ) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            let text = text.trim();
+            if text.is_empty() {
+                println!("请提供要切分的文本，例如：提及词表：未名科技公司发布了新芯片");
+            } else {
+                let legacy = preprocess_annotated(text, &plugin_nlp);
+                let overlay =
+                    symbolic_reasoner.segment_annotated_with_lexicon(text, &plugin_nlp);
+                println!("{}", symbolic_reasoner.mention_lexicon_match_report(text));
+                let render = |words: &[know_prolog::nlp::AnnotatedWord]| {
+                    words
+                        .iter()
+                        .map(|word| format!("{}[{}]", word.text, word.source.code()))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                println!("旧切分：{}", render(&legacy));
+                println!("词表切分：{}", render(&overlay));
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "词表" | "提及词表" | "词表报告" | "词表台账") {
+            println!("{}", symbolic_reasoner.mention_lexicon_report());
+            println!();
+            continue;
+        }
+
+        if let Some(surface) = strip_any_prefix(
+            input,
+            &["词表提名：", "词表提名:", "提名词表：", "提名词表:"],
+        ) {
+            let surface = surface.trim();
+            if surface.is_empty() {
+                println!("请提供要提名的词面，例如：词表提名：未名科技公司");
+            } else if symbolic_reasoner.nominate_mention(surface, None) {
+                println!("已提名「{}」（待确认，不参与切分、不写图谱；准入：{} 可确认）。", surface, surface);
+            } else {
+                println!("「{}」未提名：它已确认或已被拒绝。", surface);
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(surface) = strip_any_prefix(
+            input,
+            &["词表拒绝：", "词表拒绝:", "拒绝词表：", "拒绝词表:"],
+        ) {
+            let surface = surface.trim();
+            if surface.is_empty() {
+                println!("请提供要拒绝的词面，例如：词表拒绝：未名科技公司");
+            } else if symbolic_reasoner.reject_mention(surface) {
+                println!("已拒绝「{}」：墓碑挡板已生效，后续观察不会再确认它。", surface);
+            } else {
+                println!("「{}」已是墓碑，无需重复拒绝。", surface);
+            }
+            println!();
+            continue;
+        }
+
         // OOV 准入：提名 → 用户确认 → 写入知识库（显式词汇增长，可回溯）
         if let Some(target) = strip_any_prefix(
             input,
@@ -10957,7 +11030,15 @@ async fn run_interactive_mode(
                 } else {
                     None
                 };
-                let normalized_words = normalize_words(tagged_words, &synonyms);
+                let normalized_words = normalize_words(tagged_words.clone(), &synonyms);
+                // 感知层覆盖：已确认词面（图谱实体/确认别名/显式准入）保留为
+                // 单一 token；旧切分仍是回退路径，覆盖层只增加边界证据。
+                let lexicon_tagged_words = symbolic_reasoner.segment_with_lexicon(input, &plugin_nlp);
+                let lexicon_normalized_words = if lexicon_tagged_words == tagged_words {
+                    normalized_words.clone()
+                } else {
+                    normalize_words(lexicon_tagged_words, &synonyms)
+                };
                 // 路由上下文：让带守卫的模式只在相应对话状态下参与匹配。
                 let route_context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
 
@@ -11163,9 +11244,10 @@ async fn run_interactive_mode(
                                 "知识查询" => {
                                     // 继续使用查询逻辑
                                     if let Some((query_type, entities, pattern_note)) =
-                                        route_query_with_patterns(
+                                        route_query_with_lexicon(
                                             &pattern_library,
                                             input,
+                                            &lexicon_normalized_words,
                                             &normalized_words,
                                             &mut pattern_episodes,
                                             &route_context,
@@ -11224,9 +11306,10 @@ async fn run_interactive_mode(
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
                                     if let Some((query_type, entities, pattern_note)) =
-                                        route_query_with_patterns(
+                                        route_query_with_lexicon(
                                             &pattern_library,
                                             input,
+                                            &lexicon_normalized_words,
                                             &normalized_words,
                                             &mut pattern_episodes,
                                             &route_context,
@@ -11377,9 +11460,10 @@ async fn run_interactive_mode(
                     }
                 }
 
-                if let Some((query_type, entities, pattern_note)) = route_query_with_patterns(
+                if let Some((query_type, entities, pattern_note)) = route_query_with_lexicon(
                     &pattern_library,
                     input,
+                    &lexicon_normalized_words,
                     &normalized_words,
                     &mut pattern_episodes,
                     &route_context,
@@ -12145,6 +12229,8 @@ fn interactive_help() -> String {
         "  追踪报告 / 指代轨迹 / 问据栈          分层追踪：问据栈、指代绑定与逐轮决策",
         "  追踪为什么 <编号>                     沿追踪图回溯某决策的依据链",
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
+        "  提及词表：<句子> / 词表                已确认词面对切分的覆盖、旧/新边界差异与来源",
+        "  词表提名：<词面> / 词表拒绝：<词面>     只提名不落库 / 墓碑挡板阻止后续确认",
         "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
         "  接地证书                              答案探测式消歧的候选、答案指纹与敏感度证书",
         "  接地重放                              用当前知识版本复算最近一张证书的候选答案与动作",
@@ -12493,6 +12579,14 @@ fn is_command_like(input: &str) -> bool {
         "提及账本",
         "提及格",
         "格解码",
+        "提及词表",
+        "词表感知",
+        "词表切分",
+        "词表报告",
+        "词表台账",
+        "词表提名",
+        "词表拒绝",
+        "词表",
         "准入",
         "收录",
         "身份台账",
@@ -13088,6 +13182,28 @@ fn route_query_with_patterns(
             })
     });
     episodes.record_unmatched_with_frontier(input, words, context, snapshot);
+    None
+}
+
+/// 感知层优先、旧切分兜底的路由：词表覆盖只增加边界证据，不牺牲旧召回。
+fn route_query_with_lexicon(
+    library: &PatternLibrary,
+    input: &str,
+    primary: &[know_prolog::nlp::TaggedWord],
+    fallback: &[know_prolog::nlp::TaggedWord],
+    episodes: &mut pattern_ir::PatternEpisodeLog,
+    context: &pattern_ir::PatternContext,
+    soft_config: &know_prolog::soft_route::SoftRouteConfig,
+) -> Option<(String, Vec<String>, Option<String>)> {
+    if let Some(hit) = route_query_with_patterns(library, input, primary, episodes, context, soft_config)
+    {
+        return Some(hit);
+    }
+    if primary != fallback {
+        return route_query_with_patterns(
+            library, input, fallback, episodes, context, soft_config,
+        );
+    }
     None
 }
 
@@ -14142,6 +14258,21 @@ mod session_tests {
         assert!(is_no_record_text("根据现有知识库，没有记录「张三 的 师傅」。"));
         assert!(is_no_record_text("未能回答：当前知识库中没有可用依据。"));
         assert!(!is_no_record_text("张三 的 师傅 是 李四。"));
+    }
+
+    #[test]
+    fn command_like_covers_mention_lexicon_commands() {
+        for command in [
+            "词表",
+            "提及词表",
+            "提及词表：未名科技公司发布了新芯片",
+            "词表感知：未名科技公司",
+            "词表提名：未名科技公司",
+            "词表拒绝：未名科技公司",
+            "词表报告",
+        ] {
+            assert!(is_command_like(command), "{} 应被识别为系统命令", command);
+        }
     }
 
     #[test]
