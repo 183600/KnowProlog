@@ -386,11 +386,14 @@ impl PredicateRegistry {
         true
     }
 
-    /// 人工确认待定谓词：转为已声明画像。
+    /// 人工确认谓词：转为已声明画像。
+    ///
+    /// 待定准入会清掉 provisional；已被自动观测但尚未声明的谓词同样可
+    /// 升格为 declared（人工确认优先，后续互逆槽位裁决与模式闸门都以它为准）。
     pub fn confirm(&mut self, predicate: &str) -> bool {
         let resolution = self.resolve(predicate);
         let changed = match self.profiles.get_mut(&resolution.canonical) {
-            Some(profile) if profile.provisional => {
+            Some(profile) if !profile.declared => {
                 profile.provisional = false;
                 profile.declared = true;
                 profile.sources.insert("人工确认".to_string());
@@ -1461,6 +1464,20 @@ mod tests {
         assert!(registry.reject("搭伙"));
         assert!(registry.profile("搭伙").is_none());
         assert!(!registry.is_known("搭伙"));
+    }
+
+    #[test]
+    fn observed_predicate_can_be_promoted_to_declared() {
+        let mut registry = PredicateRegistry::new();
+        registry.observe("甲", "认识", "乙", Some("知识图谱"));
+        assert!(!registry.profile("认识").unwrap().declared);
+        assert!(registry.confirm("认识"), "已观测谓词应可升格为声明");
+        let profile = registry.profile("认识").unwrap();
+        assert!(profile.declared);
+        assert!(!profile.provisional);
+        assert!(profile.sources.contains("人工确认"));
+        assert!(!registry.confirm("认识"), "重复确认必须幂等");
+        assert!(!registry.confirm("从未出现"), "不存在的谓词不能凭空声明");
     }
 
     #[test]
