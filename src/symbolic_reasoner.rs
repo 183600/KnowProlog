@@ -15,7 +15,7 @@ use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::completion_episode::{CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope};
-use crate::constructive::{ConstructiveReasoner, ObservedGraph, VirtualFact};
+use crate::constructive::{ConstructiveReasoner, FactKey, ObservedGraph, VirtualFact};
 use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
 };
@@ -7731,19 +7731,32 @@ impl SymbolicReasoner {
                 observed.insert(subject, &atom.predicate, object);
             }
         }
-        Some(ConstructiveReasoner::new(
-            self.config.constructive.clone(),
-            self.revision,
-            observed,
-            self.predictor
-                .rules()
-                .iter()
-                .enumerate()
-                .filter_map(|(index, rule)| {
-                    crate::constructive::ConstructionRule::from_horn(rule, index)
-                })
-                .collect(),
-        ))
+        let forbidden: Vec<FactKey> = self
+            .session_negative_facts
+            .iter()
+            .filter_map(|atom| {
+                let [Term::Const(subject), Term::Const(object)] = atom.terms.as_slice() else {
+                    return None;
+                };
+                Some(FactKey::new(subject.to_string(), format!("{}", atom.predicate), object.to_string()))
+            })
+            .collect();
+        Some(
+            ConstructiveReasoner::new(
+                self.config.constructive.clone(),
+                self.revision,
+                observed,
+                self.predictor
+                    .rules()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, rule)| {
+                        crate::constructive::ConstructionRule::from_horn(rule, index)
+                    })
+                    .collect(),
+            )
+            .with_forbidden(forbidden),
+        )
     }
 
     fn constructed_hit(node: &str, inverted: bool, fact: VirtualFact) -> ValueHit {
@@ -19729,6 +19742,27 @@ types = [
             .expect("否定后仍应给出无答案说明");
         assert!(!blocked.contains("吴九"), "被否认的前提不得复用：{}", blocked);
         assert!(!blocked.contains("建设性推断"), "被否认后不应再合成：{}", blocked);
+
+        let mut target_denied = SymbolicReasoner::new(test_config(), HashMap::new());
+        target_denied.observe_facts(&facts);
+        target_denied.config.enable_link_prediction = false;
+        target_denied.config.constructive.enabled = true;
+        target_denied
+            .handle_constructive_command("否定推断：孙七|朋友|吴九")
+            .expect("否定命令应被识别");
+        let target_blocked = target_denied
+            .answer("孙七的朋友的师傅是谁")
+            .expect("否认目标后仍应给出无答案说明");
+        assert!(
+            !target_blocked.contains("建设性推断"),
+            "被否认的目标不得从另一条规则重新合成：{}",
+            target_blocked
+        );
+        assert!(
+            !target_blocked.contains("综合得出"),
+            "被否认的目标不得成为下一跳前提：{}",
+            target_blocked
+        );
     }
 
     #[test]

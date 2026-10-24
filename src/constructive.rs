@@ -475,6 +475,7 @@ pub struct ConstructiveReasoner {
     rules: Vec<ConstructionRule>,
     virtuals: BTreeMap<FactKey, VirtualFact>,
     refuted: BTreeSet<FactKey>,
+    forbidden: BTreeSet<FactKey>,
     dependents: BTreeMap<FactKey, BTreeSet<FactKey>>,
     active: Vec<FactKey>,
     loaded_entities: BTreeSet<String>,
@@ -499,6 +500,7 @@ impl ConstructiveReasoner {
             rules,
             virtuals: BTreeMap::new(),
             refuted: BTreeSet::new(),
+            forbidden: BTreeSet::new(),
             dependents: BTreeMap::new(),
             active: Vec::new(),
             loaded_entities: BTreeSet::new(),
@@ -508,6 +510,24 @@ impl ConstructiveReasoner {
             truncated: false,
             truncation_reasons: Vec::new(),
         }
+    }
+
+    /// 显式否定约束：被否认的三元组不得被合成为虚拟事实，也不得作为前提。
+    pub fn forbid(&mut self, key: FactKey) {
+        self.forbidden.insert(key);
+    }
+
+    /// 批量注入否定约束（会话否定事实），链式构造时统一过滤。
+    pub fn with_forbidden<I>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = FactKey>,
+    {
+        self.forbidden.extend(keys);
+        self
+    }
+
+    pub fn forbidden_len(&self) -> usize {
+        self.forbidden.len()
     }
 
     pub fn from_predictor(
@@ -558,9 +578,23 @@ impl ConstructiveReasoner {
             return self.report(seed, predicate, inverted, ConstructionStatus::Disabled, 0);
         }
         let direct = if inverted {
-            !self.observed.subjects(predicate, seed).is_empty()
+            self.observed
+                .subjects(predicate, seed)
+                .into_iter()
+                .any(|subject| {
+                    !self
+                        .forbidden
+                        .contains(&FactKey::new(subject, predicate, seed))
+                })
         } else {
-            !self.observed.objects(seed, predicate).is_empty()
+            self.observed
+                .objects(seed, predicate)
+                .into_iter()
+                .any(|object| {
+                    !self
+                        .forbidden
+                        .contains(&FactKey::new(seed, predicate, object))
+                })
         };
         if direct {
             return self.report(
@@ -699,7 +733,7 @@ impl ConstructiveReasoner {
     }
 
     fn fact_ref(&self, key: &FactKey) -> Option<FactRef> {
-        if self.refuted.contains(key) {
+        if self.refuted.contains(key) || self.forbidden.contains(key) {
             return None;
         }
         if let Some(fact) = self.virtuals.get(key) {
@@ -728,7 +762,7 @@ impl ConstructiveReasoner {
             .objects(subject, predicate)
             .into_iter()
             .map(|object| FactKey::new(subject, predicate, object))
-            .filter(|key| !self.refuted.contains(key))
+            .filter(|key| !self.refuted.contains(key) && !self.forbidden.contains(key))
             .map(|key| FactRef {
                 key,
                 confidence_bps: OBSERVED_CONFIDENCE_BPS,
@@ -738,6 +772,7 @@ impl ConstructiveReasoner {
         for fact in self.virtuals.values() {
             if fact.key.subject == subject
                 && fact.key.predicate == predicate
+                && !self.forbidden.contains(&fact.key)
                 && matches!(fact.state, VirtualState::Hypothesis | VirtualState::Confirmed)
             {
                 refs.push(FactRef {
@@ -763,7 +798,7 @@ impl ConstructiveReasoner {
             .subjects(predicate, object)
             .into_iter()
             .map(|subject| FactKey::new(subject, predicate, object))
-            .filter(|key| !self.refuted.contains(key))
+            .filter(|key| !self.refuted.contains(key) && !self.forbidden.contains(key))
             .map(|key| FactRef {
                 key,
                 confidence_bps: OBSERVED_CONFIDENCE_BPS,
@@ -773,6 +808,7 @@ impl ConstructiveReasoner {
         for fact in self.virtuals.values() {
             if fact.key.object == object
                 && fact.key.predicate == predicate
+                && !self.forbidden.contains(&fact.key)
                 && matches!(fact.state, VirtualState::Hypothesis | VirtualState::Confirmed)
             {
                 refs.push(FactRef {
@@ -842,6 +878,7 @@ impl ConstructiveReasoner {
                 if self.observed.contains(&candidate.key)
                     || self.virtuals.contains_key(&candidate.key)
                     || self.refuted.contains(&candidate.key)
+                    || self.forbidden.contains(&candidate.key)
                 {
                     continue;
                 }
@@ -1068,6 +1105,9 @@ impl ConstructiveReasoner {
     }
 
     pub fn confirm(&mut self, key: &FactKey) -> bool {
+        if self.forbidden.contains(key) {
+            return false;
+        }
         let Some(fact) = self.virtuals.get_mut(key) else {
             return false;
         };
@@ -1543,6 +1583,42 @@ mod tests {
         assert_eq!(report.status, ConstructionStatus::AlreadyObserved);
         assert!(report.target_facts.is_empty());
         assert!(reasoner.virtual_facts().next().is_none());
+    }
+
+    #[test]
+    fn forbidden_target_is_never_constructed_or_confirmed() {
+        let mut graph = ObservedGraph::default();
+        graph.insert("甲", "同事", "乙");
+        graph.insert("乙", "师傅", "丙");
+        graph.insert("丁", "同事", "戊");
+        graph.insert("戊", "师傅", "己");
+        graph.insert("甲", "朋友", "丙");
+        graph.insert("丁", "朋友", "己");
+        let rule = rule(
+            ConstructionOperator::Compose,
+            &["同事", "师傅"],
+            "朋友",
+            10_000,
+        );
+        let target = FactKey::new("甲", "朋友", "丙");
+        let mut engine = ConstructiveReasoner::new(
+            ConstructionConfig {
+                enabled: true,
+                ..ConstructionConfig::default()
+            },
+            1,
+            graph,
+            vec![rule],
+        )
+        .with_forbidden([target.clone()]);
+        assert_eq!(engine.forbidden_len(), 1);
+        let report = engine.derive("甲", "朋友", false);
+        assert!(
+            !report.target_facts.iter().any(|fact| fact.key == target),
+            "被否认的目标不得出现：{:?}",
+            report.target_facts
+        );
+        assert!(!engine.confirm(&target));
     }
 
     #[test]
