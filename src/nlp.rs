@@ -1,3 +1,4 @@
+use crate::mention_lexicon::{LexiconSpan, MentionLexicon};
 use jieba_rs::Jieba; // 导入结巴分词库，用于中文分词
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap; // 导入哈希映射，用于存储键值对
@@ -15,7 +16,7 @@ fn jieba() -> &'static Jieba {
 }
 
 // 标注了词性的单词结构体
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedWord {
     pub text: String, // 词语文本
     pub pos: String,  // 词性标记（如n表示名词，v表示动词）
@@ -36,6 +37,8 @@ pub enum TagSource {
     Numeric,
     /// 数词 + 量词被结巴粘成一个 token，按语义拆分
     NumeralMeasure,
+    /// 已确认提及词表覆盖（图谱实体/确认别名/显式准入）
+    MentionLexicon,
     /// 没有证据，保留为未知词
     Unknown,
 }
@@ -48,6 +51,7 @@ impl TagSource {
             TagSource::JiebaTag => "jieba_tag",
             TagSource::Numeric => "numeric",
             TagSource::NumeralMeasure => "numeral_measure",
+            TagSource::MentionLexicon => "mention_lexicon",
             TagSource::Unknown => "unknown",
         }
     }
@@ -59,6 +63,7 @@ impl TagSource {
             TagSource::JiebaTag => "结巴兜底",
             TagSource::Numeric => "数字规则",
             TagSource::NumeralMeasure => "数词量词拆分",
+            TagSource::MentionLexicon => "提及词表",
             TagSource::Unknown => "未知",
         }
     }
@@ -180,6 +185,112 @@ pub fn preprocess_annotated(text: &str, config: &crate::NlpConfig) -> Vec<Annota
     }
 
     annotated
+}
+
+/// 用已确认的提及词表做一次覆盖层切分（返回纯词性序列）。
+///
+/// 与 [`preprocess`] 的差别只在「边界」：词表命中的长词面会被保留为单一
+/// token；未命中部分完全沿用旧路径。词表为空时与旧路径逐 token 相同。
+pub fn preprocess_with_lexicon(
+    text: &str,
+    config: &crate::NlpConfig,
+    lexicon: &MentionLexicon,
+) -> Vec<TaggedWord> {
+    preprocess_annotated_with_lexicon(text, config, lexicon)
+        .into_iter()
+        .map(|word| TaggedWord {
+            text: word.text,
+            pos: word.pos,
+        })
+        .collect()
+}
+
+/// 与 [`preprocess_with_lexicon`] 同序，但保留边界、来源与结巴原始标签。
+pub fn preprocess_annotated_with_lexicon(
+    text: &str,
+    config: &crate::NlpConfig,
+    lexicon: &MentionLexicon,
+) -> Vec<AnnotatedWord> {
+    let base = preprocess_annotated(text, config);
+    let spans = lexicon.confirmed_spans(text);
+    overlay_lexicon_spans(text, base, &spans)
+}
+
+/// 把词表跨度叠加到旧切分上：
+/// 1. 旧 token 在词表边界处切开，保证词表跨度不会跨 token；
+/// 2. 连续且恰好覆盖某个词表跨度的碎片合并为一个 [`TagSource::MentionLexicon`] token；
+/// 3. 无法对齐（如跨度含空白/未覆盖字符）时保留旧 token，绝不吞掉文本。
+fn overlay_lexicon_spans(
+    text: &str,
+    base: Vec<AnnotatedWord>,
+    spans: &[LexiconSpan],
+) -> Vec<AnnotatedWord> {
+    if spans.is_empty() || base.is_empty() {
+        return base;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut pieces: Vec<AnnotatedWord> = Vec::with_capacity(base.len() + spans.len());
+    for word in base {
+        let mut cuts = vec![word.start, word.end];
+        for span in spans {
+            if span.start > word.start && span.start < word.end {
+                cuts.push(span.start);
+            }
+            if span.end > word.start && span.end < word.end {
+                cuts.push(span.end);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if start >= end || end > chars.len() {
+                continue;
+            }
+            pieces.push(AnnotatedWord {
+                text: chars[start..end].iter().collect(),
+                pos: word.pos.clone(),
+                source: word.source,
+                jieba_pos: word.jieba_pos.clone(),
+                start,
+                end,
+            });
+        }
+    }
+
+    let mut merged: Vec<AnnotatedWord> = Vec::with_capacity(pieces.len());
+    let mut index = 0usize;
+    let mut span_index = 0usize;
+    while index < pieces.len() {
+        while span_index < spans.len() && spans[span_index].end <= pieces[index].start {
+            span_index += 1;
+        }
+        if span_index < spans.len() && spans[span_index].start == pieces[index].start {
+            let span = &spans[span_index];
+            let mut cursor = index;
+            let mut end = pieces[index].start;
+            while cursor < pieces.len() && pieces[cursor].start == end && end < span.end {
+                end = pieces[cursor].end;
+                cursor += 1;
+            }
+            if end == span.end {
+                merged.push(AnnotatedWord {
+                    text: chars[span.start..span.end].iter().collect(),
+                    pos: span.pos.clone(),
+                    source: TagSource::MentionLexicon,
+                    jieba_pos: None,
+                    start: span.start,
+                    end: span.end,
+                });
+                index = cursor;
+                span_index += 1;
+                continue;
+            }
+        }
+        merged.push(pieces[index].clone());
+        index += 1;
+    }
+    merged
 }
 
 /// 结巴词序列在原文本中的字符区间。分词结果可能并不逐字覆盖空白，
@@ -851,5 +962,69 @@ mod tests {
         ]);
         let matched = match_pattern_for_prolog(&words, &pattern).expect("关系模式应能匹配");
         assert_eq!(matched, vec!["张三".to_string(), "李四".to_string()]);
+    }
+
+    #[test]
+    fn empty_lexicon_keeps_legacy_segmentation_byte_for_byte() {
+        let config = test_config();
+        let lexicon = crate::mention_lexicon::MentionLexicon::new();
+        let legacy = preprocess_annotated("张三的所有权归谁", &config);
+        let overlay = preprocess_annotated_with_lexicon("张三的所有权归谁", &config, &lexicon);
+        assert_eq!(legacy.len(), overlay.len());
+        for (old, new) in legacy.iter().zip(overlay.iter()) {
+            assert_eq!(old.text, new.text);
+            assert_eq!(old.pos, new.pos);
+            assert_eq!(old.start, new.start);
+            assert_eq!(old.end, new.end);
+        }
+    }
+
+    #[test]
+    fn confirmed_long_entity_becomes_one_lexicon_token() {
+        let config = test_config();
+        let mut lexicon = crate::mention_lexicon::MentionLexicon::new();
+        lexicon.confirm(
+            "未名科技公司",
+            "未名科技公司",
+            Some("Organization"),
+            "test",
+        );
+        let words = preprocess_annotated_with_lexicon(
+            "未名科技公司发布了新芯片",
+            &config,
+            &lexicon,
+        );
+        let entity = words
+            .iter()
+            .find(|word| word.text == "未名科技公司")
+            .expect("确认词面应被保留为单一 token");
+        assert_eq!(entity.source, TagSource::MentionLexicon);
+        assert_eq!(entity.pos, "nt");
+        let text = "未名科技公司发布了新芯片";
+        let slice: String = text
+            .chars()
+            .skip(entity.start)
+            .take(entity.end - entity.start)
+            .collect();
+        assert_eq!(slice, entity.text);
+        assert!(words.iter().any(|word| word.text == "发布"));
+    }
+
+    #[test]
+    fn lexicon_overlay_splits_base_tokens_at_span_boundaries() {
+        let config = test_config();
+        let mut lexicon = crate::mention_lexicon::MentionLexicon::new();
+        lexicon.confirm("张三", "张三", Some("Person"), "test");
+        lexicon.confirm("所有权", "所有权", None, "test");
+        let words = preprocess_annotated_with_lexicon("张三的所有权", &config, &lexicon);
+        let name = words.iter().find(|word| word.text == "张三").unwrap();
+        let ownership = words.iter().find(|word| word.text == "所有权").unwrap();
+        assert_eq!(name.source, TagSource::MentionLexicon);
+        assert_eq!(ownership.source, TagSource::MentionLexicon);
+        assert_eq!(name.start, 0);
+        assert_eq!(name.end, 2);
+        assert_eq!(ownership.start, 3);
+        assert_eq!(ownership.end, 6);
+        assert!(words.iter().any(|word| word.text == "的"));
     }
 }
