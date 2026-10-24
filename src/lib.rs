@@ -95,6 +95,7 @@ pub mod pattern_ir;
 pub mod perf_ledger;
 pub mod planning;
 pub mod plugin;
+pub mod predictive_elaboration;
 pub mod predicate_registry;
 pub mod probabilistic_query_intent;
 pub mod problog;
