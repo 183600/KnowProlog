@@ -195,6 +195,11 @@ enum Commands {
         /// to every answered question; answers without a resolution proof say so
         #[arg(long)]
         explain: bool,
+        /// When a question cannot be answered, ask the single most discriminative
+        /// explanation-space clarification question. Following stdin lines are
+        /// treated as answers to that clarification until the session ends.
+        #[arg(long)]
+        clarify: bool,
     },
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
@@ -1600,6 +1605,7 @@ async fn main() {
             json,
             strict,
             explain,
+            clarify,
         }) => {
             run_ask(
                 &config,
@@ -1610,6 +1616,7 @@ async fn main() {
                 json,
                 strict,
                 explain,
+                clarify,
             )
             .await;
         }
@@ -5211,6 +5218,7 @@ async fn run_ask(
     json: bool,
     strict: bool,
     explain: bool,
+    clarify: bool,
 ) {
     let facts = match serve_facts(oxigraph_manager).await {
         Ok(facts) => facts,
@@ -5290,6 +5298,37 @@ async fn run_ask(
         if is_ask_terminator(&question) {
             break;
         }
+        // 澄清对话中的下一行按回答处理：脚本可以用多行 stdin 完成
+        // 「问题 → 是/不是 → 条件化结论」的整段解释空间收敛。
+        if clarify && reasoner.clarification_active() {
+            if matches!(
+                question.as_str(),
+                "结束澄清" | "停止澄清" | "退出澄清"
+            ) {
+                if let Some(text) = reasoner.stop_clarification() {
+                    answers.push(AskAnswer {
+                        question,
+                        status: "answered",
+                        answer: Some(text),
+                        derivation: None,
+                    });
+                    continue;
+                }
+            }
+            if let Some(text) = reasoner.answer_clarification(&question) {
+                answers.push(AskAnswer {
+                    question,
+                    status: if reasoner.clarification_active() {
+                        "needs_clarification"
+                    } else {
+                        "answered"
+                    },
+                    answer: Some(text),
+                    derivation: None,
+                });
+                continue;
+            }
+        }
         // 悬问回填：脚本输入里的下一行短答直接绑定到上一轮缺失前提。
         if reasoner.has_pending_question() {
             if let Some(deferred) = reasoner.try_answer_pending_question(&question) {
@@ -5337,17 +5376,43 @@ async fn run_ask(
                 .map(|reply| reply.text)
                 .or_else(|| reasoner.answer(&question))
         };
-        if let Some(text) = &answer {
-            if is_no_record_text(text) {
-                if let Some(prompt) = reasoner.open_pending_question(&question) {
-                    answer = Some(format!("{}\n{}", text, prompt));
+        let mut status = if answer.is_some() {
+            "answered"
+        } else {
+            "unanswered"
+        };
+        let mut clarification_started = false;
+        if clarify {
+            let unanswered = match answer.as_deref() {
+                Some(text) => is_no_record_text(text),
+                None => true,
+            };
+            if unanswered {
+                if let Some(prompt) = reasoner.begin_clarification_for_question(&question) {
+                    answer = Some(match answer {
+                        Some(text) if !text.trim().is_empty() => {
+                            format!("{}\n{}", text.trim_end(), prompt)
+                        }
+                        _ => prompt,
+                    });
+                    status = "needs_clarification";
+                    clarification_started = true;
                 }
-            } else {
-                reasoner.dismiss_pending_question(&question);
+            }
+        }
+        if !clarification_started {
+            if let Some(text) = &answer {
+                if is_no_record_text(text) {
+                    if let Some(prompt) = reasoner.open_pending_question(&question) {
+                        answer = Some(format!("{}\n{}", text, prompt));
+                    }
+                } else {
+                    reasoner.dismiss_pending_question(&question);
+                }
             }
         }
         // 追问依据是惰性通道：--explain 才重建推导，回答热路径保持零开销。
-        let derivation = if explain {
+        let derivation = if explain && status == "answered" {
             answer
                 .as_deref()
                 .and_then(|text| reasoner.answer_derivation(&question, Some(text)))
@@ -5356,11 +5421,7 @@ async fn run_ask(
         };
         answers.push(AskAnswer {
             question,
-            status: if answer.is_some() {
-                "answered"
-            } else {
-                "unanswered"
-            },
+            status,
             answer,
             derivation,
         });
@@ -14021,6 +14082,7 @@ mod session_tests {
             "--json",
             "--strict",
             "--explain",
+            "--clarify",
         ])
         .expect("ask 参数应可解析");
         match cli.command {
@@ -14029,11 +14091,13 @@ mod session_tests {
                 json,
                 strict,
                 explain,
+                clarify,
             }) => {
                 assert_eq!(question.as_deref(), Some("张三的师傅是谁"));
                 assert!(json);
                 assert!(strict);
                 assert!(explain);
+                assert!(clarify);
             }
             _ => panic!("应解析为 Ask 子命令"),
         }
@@ -14044,7 +14108,8 @@ mod session_tests {
                 question: None,
                 json: false,
                 strict: false,
-                explain: false
+                explain: false,
+                clarify: false
             })
         ));
         for terminator in ["quit", "exit", "退出", "q", " 退出 "] {
