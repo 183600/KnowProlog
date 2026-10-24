@@ -699,6 +699,9 @@ impl ConstructiveReasoner {
     }
 
     fn fact_ref(&self, key: &FactKey) -> Option<FactRef> {
+        if self.refuted.contains(key) {
+            return None;
+        }
         if let Some(fact) = self.virtuals.get(key) {
             if fact.state == VirtualState::Hypothesis || fact.state == VirtualState::Confirmed {
                 return Some(FactRef {
@@ -724,8 +727,10 @@ impl ConstructiveReasoner {
             .observed
             .objects(subject, predicate)
             .into_iter()
-            .map(|object| FactRef {
-                key: FactKey::new(subject, predicate, object),
+            .map(|object| FactKey::new(subject, predicate, object))
+            .filter(|key| !self.refuted.contains(key))
+            .map(|key| FactRef {
+                key,
                 confidence_bps: OBSERVED_CONFIDENCE_BPS,
                 depth: 0,
             })
@@ -757,8 +762,10 @@ impl ConstructiveReasoner {
             .observed
             .subjects(predicate, object)
             .into_iter()
-            .map(|subject| FactRef {
-                key: FactKey::new(subject, predicate, object),
+            .map(|subject| FactKey::new(subject, predicate, object))
+            .filter(|key| !self.refuted.contains(key))
+            .map(|key| FactRef {
+                key,
                 confidence_bps: OBSERVED_CONFIDENCE_BPS,
                 depth: 0,
             })
@@ -1536,6 +1543,76 @@ mod tests {
         assert_eq!(report.status, ConstructionStatus::AlreadyObserved);
         assert!(report.target_facts.is_empty());
         assert!(reasoner.virtual_facts().next().is_none());
+    }
+
+    #[test]
+    fn refuted_observed_premise_is_not_reused() {
+        let premise = FactKey::new("甲", "同事", "丙");
+        let mut reasoner = engine(
+            &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
+            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+        );
+        reasoner.refute(&premise);
+        let report = reasoner.derive("甲", "师傅", false);
+        assert!(report.target_facts.is_empty());
+    }
+
+    #[test]
+    fn session_capacity_evicts_old_hypotheses_first() {
+        let mut config = ConstructionConfig {
+            enabled: true,
+            session_capacity: 2,
+            ..ConstructionConfig::default()
+        };
+        config.max_virtual_facts = 16;
+        let triples = vec![
+            Triple::new("甲", "同事", "丙"),
+            Triple::new("丙", "师傅", "乙"),
+            Triple::new("丁", "同事", "己"),
+            Triple::new("己", "师傅", "戊"),
+            Triple::new("庚", "同事", "辛"),
+            Triple::new("辛", "师傅", "壬"),
+        ];
+        let rules = vec![rule(
+            ConstructionOperator::Compose,
+            &["同事", "师傅"],
+            "师傅",
+            9_000,
+        )];
+        let mut reasoner =
+            ConstructiveReasoner::new(config, 1, ObservedGraph::from_triples(&triples), rules);
+        for seed in ["甲", "丁", "庚"] {
+            let key = reasoner
+                .derive(seed, "师傅", false)
+                .target_facts
+                .first()
+                .map(|fact| fact.key.clone())
+                .expect("每个种子都应合成事实");
+            assert!(reasoner.confirm(&key));
+        }
+        assert_eq!(reasoner.session_facts().len(), 2);
+    }
+
+    #[test]
+    fn budget_exhaustion_is_reported_as_truncated() {
+        let triples = vec![
+            Triple::new("甲", "同事", "丙"),
+            Triple::new("丙", "师傅", "乙"),
+        ];
+        let config = ConstructionConfig {
+            enabled: true,
+            max_virtual_facts: 1,
+            ..ConstructionConfig::default()
+        };
+        let rules = vec![
+            rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000),
+            rule(ConstructionOperator::Inverse, &["师傅"], "徒弟", 9_000),
+        ];
+        let mut reasoner =
+            ConstructiveReasoner::new(config, 1, ObservedGraph::from_triples(&triples), rules);
+        let report = reasoner.derive("甲", "师傅", false);
+        assert!(report.truncated);
+        assert!(!report.truncation_reasons.is_empty());
     }
 
     #[test]
