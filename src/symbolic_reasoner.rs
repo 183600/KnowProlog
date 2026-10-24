@@ -1555,8 +1555,12 @@ impl SymbolicReasoner {
         let last_vars = self.last_abduction_vars.clone();
         let engine_fault = self.engine_fault.clone();
         let lexical_memory = self.lexical_memory.clone();
+        let mention_lexicon = self.mention_lexicon.clone();
         let mut fresh =
             Self::with_perf_ledger(self.config.clone(), synonyms, Arc::clone(&self.perf));
+        // 词表是词法记忆：待定提名与墓碑不能因图谱重建而消失；
+        // 当前图谱实体仍由随后的 observe_facts 重新确认。
+        fresh.mention_lexicon = mention_lexicon;
         fresh.observe_facts(facts);
         fresh.lexical_memory = lexical_memory;
         // 快照来自自身：胶囊公理摘要必然通过（除非内存中的快照被外部改写）。
@@ -23706,6 +23710,28 @@ types = [
             .mention_lexicon()
             .confirmed_spans("未名科技发布了新芯片")
             .is_empty());
+    }
+
+    #[test]
+    fn rebuild_preserves_mention_lexicon_decisions() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        assert!(reasoner.nominate_mention("未名科技", None));
+        assert!(reasoner.reject_mention("坏词"));
+        reasoner.rebuild_from_graph(&[]);
+        assert!(
+            reasoner
+                .mention_lexicon()
+                .entry("未名科技")
+                .is_some_and(|entry| entry.status == crate::mention_lexicon::LexiconStatus::Pending),
+            "重建后待定提名应保留"
+        );
+        assert!(
+            reasoner
+                .mention_lexicon()
+                .entry("坏词")
+                .is_some_and(|entry| entry.status == crate::mention_lexicon::LexiconStatus::Tombstoned),
+            "重建后墓碑应保留"
+        );
     }
 
     #[test]
