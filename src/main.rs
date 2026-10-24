@@ -3655,8 +3655,19 @@ async fn run_predicates(
         if name.is_empty() {
             continue;
         }
+        let provisional = {
+            let registry = manager.predicate_registry_snapshot();
+            let canonical = registry.resolve(name).canonical;
+            registry
+                .profile(&canonical)
+                .map_or(false, |profile| profile.provisional)
+        };
+        if !provisional {
+            rejected.push((name.to_string(), 0usize, "not_provisional"));
+            continue;
+        }
         match manager.reject_predicate(name).await {
-            Ok(removed) => rejected.push((name.to_string(), removed)),
+            Ok(removed) => rejected.push((name.to_string(), removed, "rejected")),
             Err(error) => {
                 eprintln!("拒绝谓词「{}」失败: {}", name, error);
                 std::process::exit(1);
@@ -3748,8 +3759,15 @@ async fn run_predicates(
                 if *changed { "。" } else { "（不是待确认谓词）。" }
             );
         }
-        for (name, removed) in &rejected {
-            println!("已拒绝谓词「{}」，移除 {} 条三元组。", name, removed);
+        for (name, removed, status) in &rejected {
+            if *status == "rejected" {
+                println!("已拒绝谓词「{}」，移除 {} 条三元组。", name, removed);
+            } else {
+                println!(
+                    "未拒绝「{}」：不是待确认谓词（已声明或已观测谓词不能直接拒绝）。",
+                    name
+                );
+            }
         }
         for (alias, canonical, changed) in &aliases {
             println!(
