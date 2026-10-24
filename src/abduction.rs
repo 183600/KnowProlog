@@ -2965,6 +2965,28 @@ mod tests {
     }
 
     #[test]
+    fn explanation_conclusion_keeps_multiple_answers_within_one_explanation() {
+        let mut scenario = answered_scenario(vec![hyp("师傅", "张三", "李四", 0.8)], "赵六", 0.7);
+        scenario.solutions.push(Solution {
+            bindings: [("答案".to_string(), "王五".to_string())]
+                .into_iter()
+                .collect(),
+            proofs: Vec::new(),
+            confidence: 0.6,
+        });
+        let space = ExplanationSpace::new(vec![scenario], Vec::new(), false);
+        let text = render_explanation_conclusion(&space, &["答案".to_string()], &|atom: &Atom| {
+            atom.display()
+        });
+        assert!(
+            text.contains("赵六 或 王五"),
+            "同一解释的多个答案不能被压成单值：{}",
+            text
+        );
+        assert!(text.contains("解释空间收敛"), "{}", text);
+    }
+
+    #[test]
     fn clarification_prefers_balanced_split_over_confidence() {
         let mut engine = ResolutionEngine::new(4, 4);
         engine.add_fact("师傅", "张三", "李四");
