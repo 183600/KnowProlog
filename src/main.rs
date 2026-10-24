@@ -8023,6 +8023,30 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 接地证书重放：用当前知识版本复算最近一张证书的候选答案指纹与动作
+        if matches!(input, "接地重放" | "指称重放" | "重放证书" | "证书重放") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            match grounding_ledger.latest() {
+                Some(certificate) => {
+                    if !certificate.verify() {
+                        println!("（警告：证书摘要校验失败，台账可能被外部修改。）");
+                    }
+                    let report = certificate.replay(
+                        symbolic_reasoner.revision(),
+                        |entity, rewritten| {
+                            probe_reference_answer(&symbolic_reasoner, entity, rewritten)
+                        },
+                    );
+                    println!("{}", report.render_text());
+                }
+                None => {
+                    println!("（空：暂无可重放的接地证书；先发生一次答案探测式消歧。）");
+                }
+            }
+            println!();
+            continue;
+        }
+
         // 提及格全局解码：不重叠最大证据路径（精确/别名/模糊/嵌套统一选路）
         if let Some(text) = strip_any_prefix(input, &["提及格：", "提及格:", "格解码：", "格解码:"])
         {
@@ -11571,6 +11595,7 @@ fn interactive_help() -> String {
         "  身份台账 / 谓词报告 / 律典 / 类型体系  实体身份、谓词画像、语义定律与类型格",
         "  绑定账本                              语境指称绑定：谁的说法指哪个实体（CRD）",
         "  接地证书                              答案探测式消歧的候选、答案指纹与敏感度证书",
+        "  接地重放                              用当前知识版本复算最近一张证书的候选答案与动作",
         "  关联规则 / 推理发现 / 全息状态        联想规则、挖掘发现与全息记忆",
         "  补全回合：<实体>                     打开一次学习回合：收集候选、确认归纳、本批闭包",
         "  确认补全：<序号> / 否定补全：<序号>   裁定候选；确认事实只进会话，不写图谱",
@@ -11905,6 +11930,10 @@ fn is_command_like(input: &str) -> bool {
         "指称证书",
         "接地台账",
         "指称接地",
+        "接地重放",
+        "指称重放",
+        "重放证书",
+        "证书重放",
         "身份报告",
         "确认身份",
         "记住身份",
@@ -13480,6 +13509,7 @@ mod session_tests {
             "改口：",
             "槽账本",
             "接地证书",
+            "接地重放",
             "帮助",
             "quit",
         ] {

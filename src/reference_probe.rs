@@ -10,7 +10,7 @@ use crate::contextual_reference::{
     MentionResolution,
 };
 
-pub const GROUNDING_CERTIFICATE_VERSION: u32 = 1;
+pub const GROUNDING_CERTIFICATE_VERSION: u32 = 2;
 pub const MAX_PROBE_CANDIDATES: usize = 3;
 pub const MAX_GROUNDING_CERTIFICATES: usize = 32;
 pub const MAX_ANSWER_PREVIEW_CHARS: usize = 48;
@@ -136,6 +136,8 @@ pub struct CertificateCandidate {
     pub status: String,
     pub answer_count: usize,
     pub answer_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rewritten: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,6 +210,199 @@ impl GroundingCertificate {
                 candidate.answer_count,
                 fingerprint
             );
+        }
+        out.trim_end().to_string()
+    }
+
+    /// 在当前知识版本上重放证书中的候选探测，核对答案指纹、敏感度与动作。
+    /// 旧版证书若没有保存改写问题，则标记为不可完整重放，而不是误报一致。
+    pub fn replay<F>(&self, current_revision: u64, mut probe: F) -> GroundingReplayReport
+    where
+        F: FnMut(&str, &str) -> ProbeStatus,
+    {
+        let mut candidates = Vec::with_capacity(self.candidates.len());
+        let mut observations = Vec::new();
+        let mut replayable = true;
+        for candidate in &self.candidates {
+            if candidate.rewritten.trim().is_empty() {
+                replayable = false;
+                candidates.push(ReplayCandidate {
+                    rank: candidate.rank,
+                    entity: candidate.entity.clone(),
+                    expected_status: candidate.status.clone(),
+                    actual_status: "unavailable".to_string(),
+                    expected_fingerprint: candidate.answer_fingerprint.clone(),
+                    actual_fingerprint: None,
+                    matches: false,
+                });
+                continue;
+            }
+            let status = normalize_status(probe(&candidate.entity, &candidate.rewritten));
+            let answers = answer_values(&status);
+            let answer_fingerprint = fingerprint_answers(&answers);
+            let matches = status.label() == candidate.status
+                && answer_fingerprint == candidate.answer_fingerprint;
+            candidates.push(ReplayCandidate {
+                rank: candidate.rank,
+                entity: candidate.entity.clone(),
+                expected_status: candidate.status.clone(),
+                actual_status: status.label().to_string(),
+                expected_fingerprint: candidate.answer_fingerprint.clone(),
+                actual_fingerprint: answer_fingerprint.clone(),
+                matches,
+            });
+            observations.push(ProbedCandidate {
+                rank: candidate.rank,
+                entity: candidate.entity.clone(),
+                votes: candidate.votes,
+                rewritten: candidate.rewritten.clone(),
+                status,
+                answers,
+                answer_fingerprint,
+            });
+        }
+
+        let (actual_sensitivity, actual_decision) = if observations.is_empty() {
+            (
+                ProbeSensitivity::Uninformative,
+                ProbeDecision::Clarify {
+                    reason: "没有可重放的候选".to_string(),
+                },
+            )
+        } else {
+            let (sensitivity, decision, _) = classify(&observations);
+            (sensitivity, decision)
+        };
+        let actual_action = actual_decision.action().to_string();
+        let action_matches =
+            actual_action == self.action && actual_decision.entity() == self.entity.as_deref();
+        let sensitivity_matches = actual_sensitivity.label() == self.sensitivity;
+        let candidate_matches = candidates.iter().all(|candidate| candidate.matches);
+        let matches = replayable && candidate_matches && action_matches && sensitivity_matches;
+        let revision_changed = current_revision != self.revision;
+
+        let mut notes = Vec::new();
+        if revision_changed {
+            notes.push(format!(
+                "知识版本已从 {} 变为 {}",
+                self.revision, current_revision
+            ));
+        }
+        if !replayable {
+            notes.push("证书缺少改写问题（旧版证书），无法完整重放".to_string());
+        } else if matches {
+            notes.push("候选答案指纹、敏感度与动作均与证书一致".to_string());
+        } else {
+            notes.push("重放结果与证书不一致：知识库或探测行为已变化".to_string());
+        }
+        if !action_matches {
+            notes.push(format!(
+                "动作不一致：证书 {} → 重放 {}",
+                self.action, actual_action
+            ));
+        }
+        if !sensitivity_matches {
+            notes.push(format!(
+                "敏感度不一致：证书 {} → 重放 {}",
+                self.sensitivity,
+                actual_sensitivity.label()
+            ));
+        }
+
+        GroundingReplayReport {
+            certificate_digest: self.certificate_digest.clone(),
+            certificate_revision: self.revision,
+            current_revision,
+            revision_changed,
+            replayable,
+            matches,
+            expected_sensitivity: self.sensitivity.clone(),
+            actual_sensitivity: actual_sensitivity.label().to_string(),
+            expected_action: self.action.clone(),
+            actual_action,
+            candidates,
+            notes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCandidate {
+    pub rank: usize,
+    pub entity: String,
+    pub expected_status: String,
+    pub actual_status: String,
+    pub expected_fingerprint: Option<String>,
+    pub actual_fingerprint: Option<String>,
+    pub matches: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroundingReplayReport {
+    pub certificate_digest: String,
+    pub certificate_revision: u64,
+    pub current_revision: u64,
+    pub revision_changed: bool,
+    pub replayable: bool,
+    pub matches: bool,
+    pub expected_sensitivity: String,
+    pub actual_sensitivity: String,
+    pub expected_action: String,
+    pub actual_action: String,
+    pub candidates: Vec<ReplayCandidate>,
+    pub notes: Vec<String>,
+}
+
+impl GroundingReplayReport {
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "指称接地证书重放：摘要 {}（知识版本 {} → {}）",
+            self.certificate_digest, self.certificate_revision, self.current_revision
+        );
+        let _ = writeln!(
+            out,
+            "  结果：{}",
+            if !self.replayable {
+                "不可完整重放"
+            } else if self.matches {
+                "与证书一致"
+            } else {
+                "与证书不一致"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "  敏感度：{} → {}",
+            self.expected_sensitivity, self.actual_sensitivity
+        );
+        let _ = writeln!(
+            out,
+            "  动作：{} → {}",
+            self.expected_action, self.actual_action
+        );
+        for candidate in &self.candidates {
+            let _ = writeln!(
+                out,
+                "    {}. {} {} → {}，指纹 {} → {}（{}）",
+                candidate.rank,
+                candidate.entity,
+                candidate.expected_status,
+                candidate.actual_status,
+                candidate.expected_fingerprint.as_deref().unwrap_or("-"),
+                candidate.actual_fingerprint.as_deref().unwrap_or("-"),
+                if candidate.matches {
+                    "一致"
+                } else if candidate.actual_status == "unavailable" {
+                    "不可重放"
+                } else {
+                    "变化"
+                }
+            );
+        }
+        for note in &self.notes {
+            let _ = writeln!(out, "  - {}", note);
         }
         out.trim_end().to_string()
     }
@@ -590,6 +785,7 @@ fn certificate_for(
             status: observation.status.label().to_string(),
             answer_count: observation.answers.len(),
             answer_fingerprint: observation.answer_fingerprint.clone(),
+            rewritten: observation.rewritten.clone(),
         })
         .collect();
     let key = resolution
@@ -955,9 +1151,9 @@ pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
         let report = probe_clarification(&request, None, 1, MAX_PROBE_CANDIDATES, |entity, _| {
             scripted_status(case, entity)
         });
-        let replay = probe_clarification(&request, None, 1, MAX_PROBE_CANDIDATES, |entity, _| {
-            scripted_status(case, entity)
-        });
+        let replay = report
+            .certificate
+            .replay(1, |entity, _| scripted_status(case, entity));
         if action_matches(case.expected_action, &report.decision) {
             action_hits += 1;
         }
@@ -1009,10 +1205,7 @@ pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
                 preview_hits += 1;
             }
         }
-        if report.certificate.verify()
-            && replay.certificate.verify()
-            && report.certificate.canonical_text() == replay.certificate.canonical_text()
-        {
+        if report.certificate.verify() && replay.replayable && replay.matches {
             replay_hits += 1;
         }
     }
@@ -1328,6 +1521,57 @@ mod tests {
     }
 
     #[test]
+    fn replay_checks_fingerprints_actions_and_legacy_certificates() {
+        let request = request(&["苹果", "苹果公司"]);
+        let report = probe_clarification(&request, None, 7, 3, |entity, _| {
+            if entity == "苹果" {
+                answered("红色")
+            } else {
+                ProbeStatus::NoAnswer
+            }
+        });
+        let same = report
+            .certificate
+            .replay(7, |entity, _| {
+                if entity == "苹果" {
+                    answered("红色")
+                } else {
+                    ProbeStatus::NoAnswer
+                }
+            });
+        assert!(same.replayable);
+        assert!(same.matches, "{}", same.render_text());
+        assert!(!same.revision_changed);
+
+        let changed = report.certificate.replay(8, |entity, _| {
+            if entity == "苹果" {
+                answered("绿色")
+            } else {
+                answered("库克")
+            }
+        });
+        assert!(!changed.matches);
+        assert!(changed.revision_changed);
+        assert_eq!(changed.actual_action, "clarify");
+
+        let mut legacy = report.certificate.clone();
+        for candidate in &mut legacy.candidates {
+            candidate.rewritten.clear();
+        }
+        legacy.certificate_digest = legacy.compute_digest();
+        assert!(legacy.verify());
+        let snapshot = serde_json::to_string(&legacy).expect("serialize legacy");
+        assert!(!snapshot.contains("\"rewritten\""));
+        let restored: GroundingCertificate =
+            serde_json::from_str(&snapshot).expect("deserialize legacy");
+        assert!(restored.verify());
+        let old = restored.replay(7, |_, _| answered("红色"));
+        assert!(!old.replayable);
+        assert!(!old.matches);
+        assert!(old.notes.iter().any(|note| note.contains("旧版证书")));
+    }
+
+    #[test]
     fn certificate_keeps_fingerprints_not_full_answers() {
         let request = request(&["苹果", "苹果公司"]);
         let report = probe_clarification(&request, None, 7, 3, |entity, _| {
@@ -1369,7 +1613,11 @@ mod tests {
         let snapshot = ledger.snapshot_json().expect("snapshot");
         let restored = GroundingLedger::from_snapshot_json(&snapshot).expect("restore");
         assert_eq!(restored.len(), ledger.len());
-        assert!(restored.latest().map(GroundingCertificate::verify).unwrap_or(false));
+        let latest = restored.latest().expect("restored certificate");
+        assert!(latest.verify());
+        let replay = latest.replay(latest.revision, |_, _| answered("红色"));
+        assert!(replay.replayable);
+        assert!(replay.matches, "{}", replay.render_text());
         assert!(restored.report().contains("指称接地证书"));
     }
 
