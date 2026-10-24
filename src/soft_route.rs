@@ -81,7 +81,7 @@ fn default_min_alignment() -> f64 {
 }
 
 fn default_min_token_coverage() -> f64 {
-    0.55
+    0.65
 }
 
 fn default_alignment_pivot() -> f64 {
@@ -459,12 +459,13 @@ impl SoftRouteOutcome {
                 };
                 let _ = writeln!(
                     out,
-                    "  {}. {}（{}）{:.2}  [{}]",
+                    "  {}. {}（{}）{:.2}  [{}；{}]",
                     index + 1,
                     candidate.name(),
                     candidate.query_type(),
                     candidate.confidence,
-                    status
+                    status,
+                    if candidate.entry.fallback { "回退层" } else { "配置层" }
                 );
                 let _ = writeln!(
                     out,
@@ -589,8 +590,26 @@ pub fn route_tokens(
     }
 
     candidates.sort_by(compare_candidates);
-    let eligible: Vec<&SoftCandidate> = candidates.iter().filter(|c| c.eligible()).collect();
-    let decision = decide(&eligible, config);
+    // 分层：配置路由先获得一次完整决策；只有它完全没有可用解释时，
+    // 才允许 NLU 回退候选接管。否则一个泛化的回退槽位会压过更具体的
+    // 配置模式（例如「属性查询」抢走「哲学思想查询」）。
+    let route_eligible: Vec<&SoftCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible() && candidate.entry.route)
+        .collect();
+    let fallback_eligible: Vec<&SoftCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.eligible() && candidate.entry.fallback)
+        .collect();
+    let route_decision = decide(&route_eligible, config);
+    let (eligible, decision) = if route_decision == SoftDecision::Reject
+        && !fallback_eligible.is_empty()
+    {
+        let fallback_decision = decide(&fallback_eligible, config);
+        (fallback_eligible, fallback_decision)
+    } else {
+        (route_eligible, route_decision)
+    };
     let selected = match decision {
         SoftDecision::Accept | SoftDecision::Clarify => eligible.first().map(|c| (*c).clone()),
         SoftDecision::Reject => None,
@@ -687,7 +706,7 @@ fn decision_reason(
                 .map(|second| top.confidence - second.confidence)
                 .unwrap_or(1.0);
             format!(
-                "「{}」后验 {:.2} ≥ 接受阈值 {:.2}，领先 {:.2}（阈值 {:.2}）",
+                "「{}」后验 {:.2} ≥ 接受阈值 {:.2}，同层领先 {:.2}（阈值 {:.2}）",
                 top.name(),
                 top.confidence,
                 config.accept_threshold,
@@ -1241,6 +1260,279 @@ fn edit_distance(left: &str, right: &str) -> usize {
     previous[right.len()]
 }
 
+/// 一条构念变体上的软路由结果（只保留需要复核的样例）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoftEvalCase {
+    pub question: String,
+    pub expected_query_type: String,
+    pub actual_query_type: Option<String>,
+    pub variant: String,
+    pub confidence: f64,
+    pub alignment: f64,
+}
+
+/// 构念变体上的软路由体检：精确基线、近失恢复、错误接受与澄清。
+///
+/// 分母来自配置规则的表面变体（同义词/实体替换/尾缀/礼貌前缀），
+/// **不是人工转述**；它只回答「软层有没有在原有精确路由之外制造新错误」，
+/// 不能替代真实用户语料的评估。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SoftEvalReport {
+    pub dialect: String,
+    pub cases: usize,
+    pub exact_correct: usize,
+    pub exact_wrong: usize,
+    pub exact_unanswered: usize,
+    pub soft_recovered: usize,
+    pub soft_wrong_accept: usize,
+    pub soft_clarify: usize,
+    pub soft_reject: usize,
+    pub correct: usize,
+    pub recoveries: Vec<SoftEvalCase>,
+    pub false_accepts: Vec<SoftEvalCase>,
+    pub clarifications: Vec<SoftEvalCase>,
+}
+
+impl SoftEvalReport {
+    /// 精确路由之后的增量召回。
+    pub fn soft_recall_gain(&self) -> f64 {
+        if self.cases == 0 {
+            0.0
+        } else {
+            self.soft_recovered as f64 / self.cases as f64
+        }
+    }
+
+    /// 软层在「精确未命中」上接受时的错误率。
+    pub fn soft_false_accept_rate(&self) -> f64 {
+        let accepted = self.soft_recovered + self.soft_wrong_accept;
+        if accepted == 0 {
+            0.0
+        } else {
+            self.soft_wrong_accept as f64 / accepted as f64
+        }
+    }
+
+    pub fn render_text(&self) -> String {
+        let mut output = String::new();
+        let _ = writeln!(output, "软路由体检 {}", self.dialect);
+        let _ = writeln!(
+            output,
+            "分母：{} 条构念变体（配置规则表面变体，非人工转述）",
+            self.cases
+        );
+        let _ = writeln!(
+            output,
+            "精确路由：正确 {}，错误 {}，未命中 {}",
+            self.exact_correct, self.exact_wrong, self.exact_unanswered
+        );
+        let _ = writeln!(
+            output,
+            "软层增量：恢复 {}（+{:.1} 个百分点），错误接受 {}（未命中上的错误率 {:.1}%），澄清 {}，回退 {}",
+            self.soft_recovered,
+            self.soft_recall_gain() * 100.0,
+            self.soft_wrong_accept,
+            self.soft_false_accept_rate() * 100.0,
+            self.soft_clarify,
+            self.soft_reject
+        );
+        let _ = writeln!(
+            output,
+            "总命中：{} / {}（{:.1}%）",
+            self.correct,
+            self.cases,
+            if self.cases == 0 {
+                0.0
+            } else {
+                self.correct as f64 / self.cases as f64 * 100.0
+            }
+        );
+        if !self.recoveries.is_empty() {
+            let _ = writeln!(output, "近失恢复样例：");
+            for case in self.recoveries.iter().take(8) {
+                let _ = writeln!(
+                    output,
+                    "  · {} → {}（{}，{:.2}，对齐 {:.0}%）",
+                    case.question,
+                    case.expected_query_type,
+                    case.variant,
+                    case.confidence,
+                    case.alignment * 100.0
+                );
+            }
+        }
+        if !self.false_accepts.is_empty() {
+            let _ = writeln!(output, "错误接受样例：");
+            for case in self.false_accepts.iter().take(8) {
+                let _ = writeln!(
+                    output,
+                    "  · {} → 期望 {}，实得 {}（{}，{:.2}）",
+                    case.question,
+                    case.expected_query_type,
+                    case.actual_query_type.as_deref().unwrap_or("<无>"),
+                    case.variant,
+                    case.confidence
+                );
+            }
+        }
+        if !self.clarifications.is_empty() {
+            let _ = writeln!(output, "澄清样例：");
+            for case in self.clarifications.iter().take(8) {
+                let _ = writeln!(
+                    output,
+                    "  · {} → 期望 {}（首选 {}，{:.2}）",
+                    case.question,
+                    case.expected_query_type,
+                    case.actual_query_type.as_deref().unwrap_or("<无>"),
+                    case.confidence
+                );
+            }
+        }
+        output
+    }
+}
+
+/// 在配置构念变体上评估软路由（离线、不打开存储）。
+pub fn evaluate_constructed(config: &crate::SystemConfig) -> SoftEvalReport {
+    use crate::nlp::{normalize_words, preprocess};
+
+    let library = PatternLibrary::from_config(config);
+    let synonyms = config
+        .synonyms
+        .as_ref()
+        .map(|synonyms| synonyms.mappings.clone())
+        .unwrap_or_default();
+    let (canonical_cases, _) = crate::recall_audit::construct_cases(&library, &synonyms);
+    let mut cases = canonical_cases.clone();
+    // 在字面句上删除一个虚词，构造可控的近失；这些样例只用于回归，
+    // 不冒充真实用户转述。
+    for case in &canonical_cases {
+        if case.variant != crate::recall_audit::CaseVariant::Canonical {
+            continue;
+        }
+        for particle in ["的", "是", "了"] {
+            let Some(position) = case.question.find(particle) else {
+                continue;
+            };
+            let question = format!(
+                "{}{}",
+                &case.question[..position],
+                &case.question[position + particle.len()..]
+            );
+            if question == case.question || cases.iter().any(|item| item.question == question) {
+                continue;
+            }
+            let mut near_miss = case.clone();
+            near_miss.question = question;
+            near_miss.seen = false;
+            cases.push(near_miss);
+        }
+    }
+    let context = PatternContext::default();
+    let mut exact_correct = 0usize;
+    let mut exact_wrong = 0usize;
+    let mut exact_unanswered = 0usize;
+    let mut soft_recovered = 0usize;
+    let mut soft_wrong_accept = 0usize;
+    let mut soft_clarify = 0usize;
+    let mut soft_reject = 0usize;
+    let mut recoveries = Vec::new();
+    let mut false_accepts = Vec::new();
+    let mut clarifications = Vec::new();
+
+    for case in &cases {
+        let tagged = preprocess(&case.question, &config.nlp);
+        let tokens = normalize_words(tagged, &synonyms);
+        let exact = library
+            .match_route_with_context(&tokens, &context)
+            .or_else(|| library.match_fallback_with_context(&tokens, &context));
+        if let Some(matched) = exact {
+            if matched.entry.query_type == case.expected_query_type {
+                exact_correct += 1;
+            } else {
+                exact_wrong += 1;
+            }
+            continue;
+        }
+        exact_unanswered += 1;
+        let outcome = route_tokens(
+            &case.question,
+            &library,
+            &tokens,
+            &context,
+            &config.reasoning.soft_route,
+        );
+        match outcome.decision {
+            SoftDecision::Accept => {
+                let Some(selected) = outcome.selected else {
+                    soft_reject += 1;
+                    continue;
+                };
+                let entry = SoftEvalCase {
+                    question: case.question.clone(),
+                    expected_query_type: case.expected_query_type.clone(),
+                    actual_query_type: Some(selected.query_type().to_string()),
+                    variant: case.variant.label().to_string(),
+                    confidence: selected.confidence,
+                    alignment: selected.alignment.score,
+                };
+                if selected.query_type() == case.expected_query_type {
+                    soft_recovered += 1;
+                    if recoveries.len() < 40 {
+                        recoveries.push(entry);
+                    }
+                } else {
+                    soft_wrong_accept += 1;
+                    if false_accepts.len() < 40 {
+                        false_accepts.push(entry);
+                    }
+                }
+            }
+            SoftDecision::Clarify => {
+                soft_clarify += 1;
+                if clarifications.len() < 40 {
+                    clarifications.push(SoftEvalCase {
+                        question: case.question.clone(),
+                        expected_query_type: case.expected_query_type.clone(),
+                        actual_query_type: outcome
+                            .selected
+                            .as_ref()
+                            .map(|candidate| candidate.query_type().to_string()),
+                        variant: case.variant.label().to_string(),
+                        confidence: outcome
+                            .selected
+                            .as_ref()
+                            .map(|candidate| candidate.confidence)
+                            .unwrap_or(0.0),
+                        alignment: outcome
+                            .selected
+                            .as_ref()
+                            .map(|candidate| candidate.alignment.score)
+                            .unwrap_or(0.0),
+                    });
+                }
+            }
+            SoftDecision::Reject => soft_reject += 1,
+        }
+    }
+
+    SoftEvalReport {
+        dialect: DIALECT.to_string(),
+        cases: cases.len(),
+        exact_correct,
+        exact_wrong,
+        exact_unanswered,
+        soft_recovered,
+        soft_wrong_accept,
+        soft_clarify,
+        soft_reject,
+        correct: exact_correct + soft_recovered,
+        recoveries,
+        false_accepts,
+        clarifications,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1457,6 +1749,32 @@ mod tests {
         assert!(report.contains("判定：接受"), "{}", report);
         assert!(report.contains("对齐：要素"), "{}", report);
         assert!(report.contains("log-odds"), "{}", report);
+    }
+
+    #[test]
+    fn constructed_eval_reports_incremental_recall_without_counting_errors_as_hits() {
+        let config: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let report = evaluate_constructed(&config);
+        assert!(report.cases > 0);
+        assert!(report.soft_recovered > 0, "{}", report.render_text());
+        assert_eq!(report.soft_wrong_accept, 0, "{}", report.render_text());
+        assert_eq!(report.correct, report.exact_correct + report.soft_recovered);
+        assert_eq!(
+            report.cases,
+            report.exact_correct
+                + report.exact_wrong
+                + report.exact_unanswered
+        );
+        assert_eq!(
+            report.exact_unanswered,
+            report.soft_recovered
+                + report.soft_wrong_accept
+                + report.soft_clarify
+                + report.soft_reject
+        );
+        assert!(report.soft_false_accept_rate() >= 0.0);
+        assert!(report.render_text().contains("软路由体检"));
     }
 
     #[test]
