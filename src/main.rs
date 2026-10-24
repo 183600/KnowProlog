@@ -3689,10 +3689,17 @@ impl PredicateEdits {
 
 /// 解析 `左=右` 形式的谓词对；任一侧为空或缺少分隔符时返回 None。
 fn parse_predicate_spec(spec: &str) -> Option<(&str, &str)> {
-    let (left, right) = spec.split_once('=')?;
-    let left = left.trim();
-    let right = right.trim();
-    (!left.is_empty() && !right.is_empty() && left != right).then_some((left, right))
+    let spec = spec.trim();
+    for separator in ["=>", "=", "＝"] {
+        if let Some((left, right)) = spec.split_once(separator) {
+            let left = left.trim();
+            let right = right.trim();
+            if !left.is_empty() && !right.is_empty() && left != right {
+                return Some((left, right));
+            }
+        }
+    }
+    None
 }
 
 /// `predicates`：把交互模式的谓词准入/别名/互逆/功能标记开放给脚本。
@@ -12891,21 +12898,6 @@ fn route_query_with_patterns(
     ))
 }
 
-/// 解析「左 = 右」形式的谓词登记参数（支持 = / ＝ / =>）
-fn parse_predicate_pair(spec: &str) -> Option<(String, String)> {
-    let spec = spec.trim();
-    for separator in ["=>", "=", "＝"] {
-        if let Some((left, right)) = spec.split_once(separator) {
-            let left = left.trim();
-            let right = right.trim();
-            if !left.is_empty() && !right.is_empty() {
-                return Some((left.to_string(), right.to_string()));
-            }
-        }
-    }
-    None
-}
-
 /// 解析更正命令：`实体|属性|旧值|新值` 或 `实体 的 属性 从 旧值 改为 新值`。
 ///
 /// 只认「有旧值」的更正：修正一条不知道旧值的陈述不是更正，而是无条件覆盖。
@@ -13792,6 +13784,14 @@ mod session_tests {
         }
         assert_eq!(
             parse_predicate_spec("老师=师傅"),
+            Some(("老师", "师傅"))
+        );
+        assert_eq!(
+            parse_predicate_spec("老师＝师傅"),
+            Some(("老师", "师傅"))
+        );
+        assert_eq!(
+            parse_predicate_spec("老师=>师傅"),
             Some(("老师", "师傅"))
         );
         assert_eq!(parse_predicate_spec("老师"), None);
