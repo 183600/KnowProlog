@@ -5453,6 +5453,23 @@ impl SymbolicReasoner {
         if !self.config.enable_abduction || !self.config.enable_clarification {
             return None;
         }
+        // 目标在生成待定假设之后可能已被新事实证明：这时再追问只会浪费用户
+        // 的确认，直接给证明并清空过期的假设池。
+        if let Some((goal, solution)) = self.clarified_goal_solution() {
+            self.abduction.clear_pending();
+            self.last_abduction_goal = None;
+            self.last_abduction_vars.clear();
+            let mut output = format!(
+                "【对话式澄清】原目标「{}」已可证明（置信度 {:.2}），无需继续追问。",
+                goal, solution.confidence
+            );
+            if let Some(answer) = solution.bindings.get("答案") {
+                if !answer.is_empty() {
+                    output.push_str(&format!("\n  答案是「{}」。", answer));
+                }
+            }
+            return Some(output);
+        }
         let mut session = match &self.last_abduction_goal {
             Some(goals) if !goals.is_empty() => ClarificationSession::start_with_goal(
                 self.abduction.pending(),
@@ -19886,6 +19903,21 @@ types = [
             "崩塌应给出缺失前提：{}",
             last
         );
+    }
+
+    #[test]
+    fn clarification_skips_questions_when_goal_is_already_proved() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let _ = reasoner.abduce_statement("张三的师祖是赵六");
+        assert!(!reasoner.pending_hypotheses().is_empty());
+        // 模拟用户在开始澄清前补上了缺失事实。
+        reasoner.adopt_session_triple("李四", "师傅", "赵六");
+        let output = reasoner.start_clarification().expect("应给出无需澄清的说明");
+        assert!(output.contains("已可证明"), "{}", output);
+        assert!(output.contains("无需继续追问"), "{}", output);
+        assert!(reasoner.pending_hypotheses().is_empty(), "过期假设应清空");
+        assert!(!reasoner.clarification_active());
     }
 
     #[test]
