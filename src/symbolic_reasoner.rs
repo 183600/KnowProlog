@@ -47,6 +47,7 @@ use crate::lexical_trace::{
 };
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
+use crate::mention_lexicon::MentionLexicon;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
 use crate::ontology_alignment::{AlignmentDecision, AlignmentState, OntologyAligner, TermKind};
 use crate::ontology_reasoning::{OntologyCapsule, OntologyLesson, OntologyProgram};
@@ -1239,6 +1240,9 @@ pub struct SymbolicReasoner {
     read_traces: ReadTraceLedger,
     // 跨会话词法记忆：词性来源证据 + 量词→类型期待（软约束；由宿主落图）
     lexical_memory: LexicalMemory,
+    // 可生长的提及词表：图谱实体/确认别名/显式准入回灌切分覆盖层；
+    // 待定只提名，墓碑永久挡板。派生自知识，不单独持久化。
+    mention_lexicon: MentionLexicon,
     // 引擎层故障通道（Prolog / 存储等下游失败由宿主注入）：
     // 非空时对话管理器走 EngineFault 路径，绝不与「知识里没有」合并。
     engine_fault: Option<String>,
@@ -1305,6 +1309,7 @@ impl Clone for SymbolicReasoner {
             // 轨迹不是记忆：分叉会话从空台账开始，避免把上一会话的失败带入
             read_traces: ReadTraceLedger::new(),
             lexical_memory: self.lexical_memory.clone(),
+            mention_lexicon: self.mention_lexicon.clone(),
             engine_fault: self.engine_fault.clone(),
         }
     }
@@ -1516,6 +1521,7 @@ impl SymbolicReasoner {
             nlp_config: None,
             read_traces: ReadTraceLedger::new(),
             lexical_memory: LexicalMemory::default(),
+            mention_lexicon: MentionLexicon::default(),
             engine_fault: None,
         };
         reasoner.rebuild_knowledge_caches();
@@ -1661,6 +1667,53 @@ impl SymbolicReasoner {
     /// 当前词法记忆（宿主据此落图）。
     pub fn lexical_memory(&self) -> &LexicalMemory {
         &self.lexical_memory
+    }
+
+    /// 当前提及词表（只读；图谱实体、确认别名与显式准入的切分记忆）。
+    pub fn mention_lexicon(&self) -> &MentionLexicon {
+        &self.mention_lexicon
+    }
+
+    /// 用当前提及词表做覆盖层切分；词表为空时与旧路径逐 token 相同。
+    pub fn segment_with_lexicon(
+        &self,
+        text: &str,
+        config: &NlpConfig,
+    ) -> Vec<crate::nlp::TaggedWord> {
+        crate::nlp::preprocess_with_lexicon(text, config, &self.mention_lexicon)
+    }
+
+    /// 与 [`Self::segment_with_lexicon`] 同序，保留边界与来源证据。
+    pub fn segment_annotated_with_lexicon(
+        &self,
+        text: &str,
+        config: &NlpConfig,
+    ) -> Vec<crate::nlp::AnnotatedWord> {
+        crate::nlp::preprocess_annotated_with_lexicon(text, config, &self.mention_lexicon)
+    }
+
+    /// 词表完整报告（确认/待定/墓碑与来源，按词面排序）。
+    pub fn mention_lexicon_report(&self) -> String {
+        self.mention_lexicon.render_report()
+    }
+
+    /// 词表在指定文本上的覆盖选路报告（只读审计）。
+    pub fn mention_lexicon_match_report(&self, text: &str) -> String {
+        self.mention_lexicon.render_match_report(text)
+    }
+
+    /// 提名一个 OOV 词面（只进待定，不参与切分，也不写图谱）。
+    pub fn nominate_mention(&mut self, surface: &str, etype: Option<&str>) -> bool {
+        self.mention_lexicon.nominate(surface, etype, "oov")
+    }
+
+    /// 拒绝一个词面：墓碑挡板，后续观察不得重新确认，也不再覆盖切分。
+    pub fn reject_mention(&mut self, surface: &str) -> bool {
+        let changed = self.mention_lexicon.reject(surface, "user");
+        if changed {
+            self.link_memo.lock().clear();
+        }
+        changed
     }
 
     /// 观察一轮原文，更新词形证据与量词期待；未注入 NLP 配置时不增加成本。
@@ -2547,10 +2600,13 @@ impl SymbolicReasoner {
         if alias.is_empty() || canonical.is_empty() || alias == canonical {
             return false;
         }
+        let etype = self.linker.entity_type(canonical).map(str::to_string);
         self.linker.register_alias(alias, canonical);
         self.aligner.register_term(canonical, TermKind::Entity);
         self.aligner.register_term(alias, TermKind::Entity);
         self.aligner.register_synonym(alias, canonical);
+        self.mention_lexicon
+            .confirm(alias, canonical, etype.as_deref(), "confirmed_alias");
         self.link_memo.lock().clear();
         true
     }
@@ -3020,6 +3076,15 @@ impl SymbolicReasoner {
                     self.aligner.observe_triple(from, rel_type, to);
                     self.predictor.add_triple(from, rel_type, to);
                     self.linker.observe_triple(from, rel_type, to);
+                    for endpoint in [from, to] {
+                        let etype = self.linker.entity_type(endpoint).map(str::to_string);
+                        self.mention_lexicon.confirm(
+                            endpoint,
+                            endpoint,
+                            etype.as_deref(),
+                            "kb_relation",
+                        );
+                    }
                     self.generator.observe_triple(from, rel_type, to);
                     if self.config.enable_semantic_embedding {
                         self.embedding.observe_triple(from, rel_type, to);
@@ -3049,6 +3114,8 @@ impl SymbolicReasoner {
                     }
                     self.linker
                         .register_entity(name, Some(entity_type.as_str()));
+                    self.mention_lexicon
+                        .confirm(name, name, Some(entity_type.as_str()), "kb");
                     // 生成器的实体类型会被后续观察覆盖，归结引擎的 __类型__ 事实依赖它：
                     // 类型变化时必须触发重建（关联篮子的变化无法覆盖此情形）
                     if !entity_type.trim().is_empty()
@@ -3690,6 +3757,8 @@ impl SymbolicReasoner {
     /// 持久化由调用方写入知识库后重新观察事实完成。
     pub fn admit_vocabulary(&mut self, surface: &str) -> Option<(String, String)> {
         let admitted = self.linker.admit_entity(surface)?;
+        self.mention_lexicon
+            .confirm(&admitted.0, &admitted.0, Some(&admitted.1), "admitted");
         self.link_memo.lock().clear();
         Some(admitted)
     }
@@ -23585,6 +23654,53 @@ types = [
         assert!(reasoner
             .alignment_canonicalize("张三公司")
             .is_none(), "组织后缀不得套到人物身上，除非同形规则另有类型锚点");
+    }
+
+    #[test]
+    fn mention_lexicon_grows_from_facts_and_segments_long_entities() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        let entry = reasoner
+            .mention_lexicon()
+            .entry("未名科技")
+            .expect("图谱实体应回灌提及词表");
+        assert_eq!(entry.pos, "nt");
+        assert!(reasoner.mention_lexicon_report().contains("未名科技"));
+
+        let words = reasoner.segment_with_lexicon("未名科技发布了新芯片", &trace_nlp_config());
+        let entity = words
+            .iter()
+            .find(|word| word.text == "未名科技")
+            .expect("长实体应保留为单一 token");
+        assert_eq!(entity.pos, "nt");
+    }
+
+    #[test]
+    fn confirmed_alias_enters_lexicon_and_tombstone_survives_reobservation() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        assert!(reasoner.register_entity_alias("小巨人", "张三"));
+        let alias = reasoner
+            .mention_lexicon()
+            .entry("小巨人")
+            .expect("确认别名应进入提及词表");
+        assert_eq!(alias.canonical, "张三");
+        assert_eq!(alias.pos, "nr");
+
+        assert!(reasoner.reject_mention("未名科技"));
+        reasoner.observe_facts(&alignment_facts());
+        let entry = reasoner
+            .mention_lexicon()
+            .entry("未名科技")
+            .expect("墓碑条目应保留");
+        assert_eq!(
+            entry.status,
+            crate::mention_lexicon::LexiconStatus::Tombstoned
+        );
+        assert!(reasoner
+            .mention_lexicon()
+            .confirmed_spans("未名科技发布了新芯片")
+            .is_empty());
     }
 
     #[test]
