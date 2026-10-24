@@ -1072,6 +1072,13 @@ impl ContextualResolver {
                     candidate.score, bucket
                 ));
             }
+            LinkMethod::Alignment => {
+                votes += VOTE_ALIAS;
+                evidence.push(format!(
+                    "镜像对齐「{}」→「{}」+{}（落地与类型守卫已通过）",
+                    sketch.key_surface, candidate.entity, VOTE_ALIAS
+                ));
+            }
         }
 
         // 硬约束 1：类型不相容一票否决（只由指称侧特征决定：量词/同位/关系名词/

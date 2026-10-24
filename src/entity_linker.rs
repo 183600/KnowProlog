@@ -11,11 +11,16 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::alignment_memory::{
+    AlignmentKind, AlignmentMatch, AlignmentMemory, LearnOutcome, AlignmentScope,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkMethod {
     ExactName,
     Alias,
     Fuzzy,
+    Alignment,
 }
 
 impl LinkMethod {
@@ -24,6 +29,7 @@ impl LinkMethod {
             LinkMethod::ExactName => "规范名精确匹配",
             LinkMethod::Alias => "别名匹配",
             LinkMethod::Fuzzy => "模糊匹配",
+            LinkMethod::Alignment => "镜像对齐匹配",
         }
     }
 }
@@ -393,6 +399,8 @@ pub struct EntityLinker {
     // 已观测三元组（去重）：整图快照会被反复观察，度数/谓词计数不得因重放膨胀
     seen_triples: HashSet<(String, String, String)>,
     fuzzy_threshold: f64,
+    // 会话级镜像对齐：记住「这类说法怎么读」，前向参与链接、反向供生成选面。
+    alignment: AlignmentMemory,
 }
 
 const FUZZY_MIN_SCORE: f64 = 0.45;
@@ -444,12 +452,97 @@ impl EntityLinker {
             in_predicates: HashMap::new(),
             seen_triples: HashSet::new(),
             fuzzy_threshold: FUZZY_MIN_SCORE,
+            alignment: AlignmentMemory::default(),
         }
     }
 
     pub fn with_fuzzy_threshold(mut self, threshold: f64) -> Self {
         self.fuzzy_threshold = threshold;
         self
+    }
+
+    /// 会话级镜像对齐记忆（只读）。
+    pub fn alignment(&self) -> &AlignmentMemory {
+        &self.alignment
+    }
+
+    /// 会话级镜像对齐记忆（可变；调用方负责失效链接缓存）。
+    pub fn alignment_mut(&mut self) -> &mut AlignmentMemory {
+        &mut self.alignment
+    }
+
+    /// 学习一次词面 ↔ 规范身份的对齐。
+    pub fn learn_alignment(
+        &mut self,
+        turn: u64,
+        surface: &str,
+        canonical: &str,
+        kind: AlignmentKind,
+        expected_type: Option<&str>,
+        origin: &str,
+        scope: AlignmentScope,
+    ) -> LearnOutcome {
+        let outcome = self.alignment.learn_pair(
+            turn,
+            surface,
+            canonical,
+            kind,
+            expected_type,
+            origin,
+            scope,
+        );
+        if outcome.changed() {
+            self.alignment.remember_echo(turn, surface, canonical);
+        }
+        outcome
+    }
+
+    /// 整段文本中的镜像对齐指称（只读；不改写输入文本）。
+    pub fn alignment_mentions(&self, text: &str) -> Vec<LinkedMention> {
+        if self.profiles.is_empty() || text.trim().is_empty() {
+            return Vec::new();
+        }
+        let resolve = |surface: &str| -> Vec<String> {
+            self.candidates_for_surface(surface)
+                .into_iter()
+                .map(|candidate| candidate.entity)
+                .collect()
+        };
+        let type_of = |entity: &str| -> Option<String> {
+            self.profiles
+                .get(entity)
+                .and_then(|profile| profile.etype.clone())
+        };
+        self.alignment
+            .mention_spans_with(
+                text,
+                AlignmentKind::Entity,
+                self.alignment.turn,
+                resolve,
+                type_of,
+            )
+            .into_iter()
+            .filter_map(|matched| self.alignment_link(matched))
+            .collect()
+    }
+
+    fn alignment_link(&self, matched: AlignmentMatch) -> Option<LinkedMention> {
+        let profile = self.profiles.get(&matched.canonical)?;
+        let degree_bonus = ((1.0 + profile.degree as f64).ln() / 20.0).min(0.05);
+        let mut reasons = vec![matched.reason.clone()];
+        if let Some(etype) = matched.expected_type.as_deref() {
+            reasons.push(format!("类型守卫：{}", etype));
+        }
+        Some(LinkedMention {
+            mention: matched.surface,
+            start: matched.start,
+            candidates: vec![LinkCandidate {
+                entity: matched.canonical,
+                score: (0.88 + degree_bonus).min(0.99),
+                method: LinkMethod::Alignment,
+                reasons,
+            }],
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -621,8 +714,29 @@ impl EntityLinker {
             return Vec::new();
         }
         let mut mentions = self.exact_mentions(text);
-        // 模糊匹配补充精确匹配未覆盖的片段：同一句中同时存在已知实体与错别字时，
-        // 不能因为有精确命中就整体跳过模糊匹配
+        // 镜像对齐补充「规范名 + 稳定词缀/包裹」的词面；完整词面本身已登记
+        // 为其他身份时由对齐记忆拒绝，不让泛化规则覆盖精确匹配。
+        let aligned = self.alignment_mentions(text);
+        if !aligned.is_empty() {
+            let aligned_spans: Vec<(usize, usize)> = aligned
+                .iter()
+                .map(|mention| {
+                    (
+                        mention.start,
+                        mention.start + mention.mention.chars().count(),
+                    )
+                })
+                .collect();
+            mentions.retain(|mention| {
+                let end = mention.start + mention.mention.chars().count();
+                !aligned_spans
+                    .iter()
+                    .any(|&(start, aligned_end)| mention.start >= start && end <= aligned_end)
+            });
+            mentions.extend(aligned);
+        }
+        // 模糊匹配补充精确/对齐匹配未覆盖的片段：同一句中同时存在已知实体与
+        // 错别字时，不能因为有精确命中就整体跳过模糊匹配
         let exact_spans: Vec<(usize, usize)> = mentions
             .iter()
             .map(|mention| {
@@ -933,6 +1047,16 @@ impl EntityLinker {
                 end,
                 surface: fuzzy.mention.clone(),
                 candidates: fuzzy.candidates,
+            });
+        }
+        // 3) 镜像对齐：形状泛化出的词面也进入格，由同一 Viterbi 路径裁决
+        for aligned in self.alignment_mentions(text) {
+            let end = aligned.start + aligned.mention.chars().count();
+            nodes.push(LatticeNode {
+                start: aligned.start,
+                end,
+                surface: aligned.mention,
+                candidates: aligned.candidates,
             });
         }
         if nodes.is_empty() {
@@ -1788,6 +1912,104 @@ mod tests {
         assert!(report.contains("身份注册表"));
         assert!(report.contains("苹果公司"));
         assert!(report.contains("苹果果实"));
+    }
+
+    #[test]
+    fn alignment_shape_links_unseen_surface_and_yields_to_exact_match() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("未名科技", Some("组织"));
+        linker.register_entity("远山科技", Some("组织"));
+        linker.register_entity("张三", Some("人物"));
+        let outcome = linker.learn_alignment(
+            1,
+            "未名科技公司",
+            "未名科技",
+            AlignmentKind::Entity,
+            Some("组织"),
+            "用户纠正",
+            AlignmentScope::Session,
+        );
+        assert!(outcome.changed());
+
+        let mentions = linker.link("远山科技公司发布了新芯片");
+        let aligned = mentions
+            .iter()
+            .find(|mention| mention.mention == "远山科技公司")
+            .expect("形状规则应命中未登录词面");
+        let best = aligned.best().unwrap();
+        assert_eq!(best.entity, "远山科技");
+        assert_eq!(best.method, LinkMethod::Alignment);
+
+        let type_blocked = linker.link("张三公司");
+        assert!(
+            type_blocked
+                .iter()
+                .all(|mention| mention.candidates.iter().all(|candidate| {
+                    candidate.method != LinkMethod::Alignment
+                })),
+            "类型守卫应阻止组织后缀套到人物身上"
+        );
+
+        linker.register_entity("远山科技公司", Some("组织"));
+        let exact = linker.link("远山科技公司");
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].mention, "远山科技公司");
+        assert_eq!(exact[0].best().unwrap().method, LinkMethod::ExactName);
+    }
+
+    #[test]
+    fn alignment_nodes_enter_the_global_lattice() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("未名科技", Some("组织"));
+        linker.register_entity("远山科技", Some("组织"));
+        linker.learn_alignment(
+            1,
+            "未名科技公司",
+            "未名科技",
+            AlignmentKind::Entity,
+            Some("组织"),
+            "用户说法",
+            AlignmentScope::Session,
+        );
+        let mentions = linker.link_lattice("远山科技公司发布了新芯片", &[]);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].mention, "远山科技公司");
+        assert_eq!(mentions[0].best().unwrap().method, LinkMethod::Alignment);
+    }
+
+    #[test]
+    fn alignment_reverse_surface_must_re_link() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("未名科技", Some("组织"));
+        linker.learn_alignment(
+            1,
+            "未名科技公司",
+            "未名科技",
+            AlignmentKind::Entity,
+            Some("组织"),
+            "用户说法",
+            AlignmentScope::Session,
+        );
+        linker.alignment_mut().remember_echo(2, "未名科技公司", "未名科技");
+        let resolve = |surface: &str| -> Vec<String> {
+            linker
+                .surface_candidates(surface)
+                .into_iter()
+                .map(|candidate| candidate.entity)
+                .collect()
+        };
+        let type_of =
+            |entity: &str| -> Option<String> { linker.entity_type(entity).map(str::to_string) };
+        let (surface, reason) = linker
+            .alignment()
+            .surface_for_with("未名科技", 2, resolve, type_of)
+            .unwrap();
+        assert_eq!(surface, "未名科技公司");
+        assert!(reason.contains("回声"));
+        assert_eq!(
+            linker.link(&surface)[0].best().unwrap().entity,
+            "未名科技"
+        );
     }
 
     /// OOV 提名带暂定类型；准入是显式动作且幂等，未准入前 KB 不变。
