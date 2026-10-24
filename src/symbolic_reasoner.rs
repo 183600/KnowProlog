@@ -6898,6 +6898,144 @@ impl SymbolicReasoner {
         self.knowledge_layer_manifest().render_text()
     }
 
+    /// 解析建设性推断命令（查询推断 / 确认 / 否定）。
+    ///
+    /// 构建性推断默认只是查询内假设；这里给出显式裁决入口，确认后的事实
+    /// 进入会话事实层并参与后续推理，但始终不写知识图谱。
+    pub fn handle_constructive_command(&mut self, input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        for prefix in ["建设性推断：", "建设性推断:", "推断依据：", "推断依据:"] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let spec = spec.trim();
+                return Some(if spec.is_empty() {
+                    "请给出起点与目标谓词，例如：建设性推断：孙七|朋友".to_string()
+                } else {
+                    self.constructive_probe_report(spec)
+                });
+            }
+        }
+        for prefix in ["确认推断：", "确认推断:", "采纳推断：", "采纳推断:"] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let spec = spec.trim();
+                return Some(if spec.is_empty() {
+                    "请给出三元组，例如：确认推断：孙七|朋友|吴九".to_string()
+                } else {
+                    self.confirm_constructive_triple(spec)
+                });
+            }
+        }
+        for prefix in ["否定推断：", "否定推断:", "驳回推断：", "驳回推断:"] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let spec = spec.trim();
+                return Some(if spec.is_empty() {
+                    "请给出三元组，例如：否定推断：孙七|同事|周八".to_string()
+                } else {
+                    self.refute_constructive_triple(spec)
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_constructive_triple(
+        &self,
+        spec: &str,
+    ) -> Result<(String, String, String), String> {
+        let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
+        if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+            return Err("需要「主体|谓词|客体」三段，且都不能为空".to_string());
+        }
+        let subject = self.aligner.canonical_form(parts[0]);
+        let object = self.aligner.canonical_form(parts[2]);
+        let (predicate, inverted) = self.resolve_question_predicate(parts[1]);
+        if !self.is_known_predicate(&predicate) {
+            return Err(format!("谓词「{}」不在当前词表或规则中", parts[1]));
+        }
+        Ok(if inverted {
+            (object, predicate, subject)
+        } else {
+            (subject, predicate, object)
+        })
+    }
+
+    fn confirm_constructive_triple(&mut self, spec: &str) -> String {
+        let (subject, predicate, object) = match self.parse_constructive_triple(spec) {
+            Ok(parts) => parts,
+            Err(error) => return format!("无法确认建设性推断：{}。", error),
+        };
+        let atom = Atom::rel(&predicate, &subject, &object);
+        let label = format!("确认建设性推断：{}|{}|{}", subject, predicate, object);
+        match self.commit_session_assertion(label, &atom) {
+            Ok(true) => format!(
+                "✓ 已确认建设性推断：{} 的 {} 是 {}。该事实进入本轮会话事实，未写入知识图谱。",
+                subject, predicate, object
+            ),
+            Ok(false) => format!(
+                "该建设性推断已在会话事实中：{} 的 {} 是 {}（幂等确认）。",
+                subject, predicate, object
+            ),
+            Err(error) => format!("确认未写入：{}", error),
+        }
+    }
+
+    fn refute_constructive_triple(&mut self, spec: &str) -> String {
+        let (subject, predicate, object) = match self.parse_constructive_triple(spec) {
+            Ok(parts) => parts,
+            Err(error) => return format!("无法否定建设性推断：{}。", error),
+        };
+        let atom = Atom::rel(&predicate, &subject, &object);
+        let rendered = self.render_atom_nl(&atom);
+        let message = self.assert_negative_atom(atom);
+        format!("已否定建设性推断：{}。
+{}", rendered, message)
+    }
+
+    fn constructive_probe_report(&self, spec: &str) -> String {
+        let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return "需要「起点|目标谓词」，例如：建设性推断：孙七|朋友".to_string();
+        }
+        if parts.len() > 3 {
+            return "最多三段：起点|目标谓词|正向或逆向".to_string();
+        }
+        let seed = self.aligner.canonical_form(parts[0]);
+        let (predicate, mut inverted) = self.resolve_question_predicate(parts[1]);
+        if parts.len() == 3 {
+            match parts[2] {
+                "逆向" | "反向" | "inverse" => inverted = !inverted,
+                "正向" | "forward" | "" => {}
+                other => return format!("方向「{}」无法识别；可用「正向」或「逆向」。", other),
+            }
+        }
+        if !self.is_known_predicate(&predicate) {
+            return format!("谓词「{}」不在当前词表或规则中。", parts[1]);
+        }
+        let Some(mut engine) = self.new_construction_reasoner() else {
+            return "建设性推断未启用。请在 config.toml 的 [reasoning.constructive] 中设置 enabled = true。".to_string();
+        };
+        let report = engine.derive(&seed, &predicate, inverted);
+        let audit = engine.support_audit();
+        let mut output = report.render_text();
+        output.push_str(&format!(
+            "\n证明审计：检查 {} 条虚拟事实，无效 {}，循环 {}。",
+            audit.inspected,
+            audit.invalid.len(),
+            audit.cyclic.len()
+        ));
+        if audit.is_clean() && audit.inspected > 0 {
+            output.push_str(" 所有推断都能回溯到观察事实。");
+        }
+        if !report.is_empty() {
+            let key = &report.target_facts[0].key;
+            output.push_str(&format!(
+                "\n如需采纳，回复「确认推断：{}|{}|{}」；否认回复「否定推断：{}|{}|{}」。",
+                key.subject, key.predicate, key.object, key.subject, key.predicate, key.object
+            ));
+        }
+        engine.end_query();
+        output
+    }
+
     /// 解析并执行补全回合命令（打开 / 确认 / 驳回 / 报告 / 规则生命周期）。
     ///
     /// 交互命令行与 HTTP 服务共用这一入口，避免两套解析漂移；返回 `None`
@@ -7576,9 +7714,20 @@ impl SymbolicReasoner {
         if !self.config.constructive.enabled {
             return None;
         }
-        let mut observed = ObservedGraph::from_triples(self.predictor.triples());
+        let mut observed = ObservedGraph::default();
+        for triple in self.predictor.triples() {
+            // 会话否定事实是显式阻断边：被否认的前提不得再作为建设性推断的
+            // 观察依据，否则否定只挡住了直接链，却从虚拟事实侧绕了回来。
+            if self.session_negative_blocks(&triple.subject, &triple.predicate, &triple.object) {
+                continue;
+            }
+            observed.insert(&triple.subject, &triple.predicate, &triple.object);
+        }
         for atom in self.positive_session_atoms() {
             if let [Term::Const(subject), Term::Const(object)] = atom.terms.as_slice() {
+                if self.session_negative_blocks(subject, &atom.predicate, object) {
+                    continue;
+                }
                 observed.insert(subject, &atom.predicate, object);
             }
         }
@@ -7934,6 +8083,31 @@ impl SymbolicReasoner {
             output.push_str(
                 "\n  说明：建设性推断只在本次查询内有效，未写入知识图谱；确认后才进入会话事实。",
             );
+            let confirmable = steps
+                .iter()
+                .flat_map(|step| step.hits.iter())
+                .chain(last_hits.iter())
+                .filter_map(|hit| hit.construction.as_ref())
+                .find_map(|fact| {
+                    let key = &fact.key;
+                    if key.subject.is_empty()
+                        || key.predicate.is_empty()
+                        || key.object.is_empty()
+                    {
+                        None
+                    } else {
+                        Some(format!(
+                            "{}|{}|{}",
+                            key.subject, key.predicate, key.object
+                        ))
+                    }
+                });
+            if let Some(spec) = confirmable {
+                output.push_str(&format!(
+                    "\n  如需采纳，回复「确认推断：{}」；否认请回复「否定推断：{}」。",
+                    spec, spec
+                ));
+            }
         }
         if construction_truncated {
             output.push_str(
@@ -19480,6 +19654,81 @@ types = [
             "规则来源应可追溯：{}",
             answer
         );
+        assert!(
+            answer.contains("确认推断：孙七|朋友|吴九"),
+            "应给出可直接复制的确认命令：{}",
+            answer
+        );
+    }
+
+    #[test]
+    fn constructive_command_confirms_into_session_and_refutes_as_blocker() {
+        let facts = vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "同事".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "朋友".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "孙七".to_string(),
+                rel_type: "同事".to_string(),
+                to: "周八".to_string(),
+            },
+            PrologFact::Relation {
+                from: "周八".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "吴九".to_string(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        reasoner.config.enable_link_prediction = false;
+        reasoner.config.constructive.enabled = true;
+
+        let probe = reasoner
+            .handle_constructive_command("建设性推断：孙七|朋友")
+            .expect("推断命令应被识别");
+        assert!(probe.contains("孙七 --朋友--> 吴九"), "实际：{}", probe);
+        assert!(probe.contains("回溯到观察事实"), "实际：{}", probe);
+
+        let confirmed = reasoner
+            .handle_constructive_command("确认推断：孙七|朋友|吴九")
+            .expect("确认命令应被识别");
+        assert!(confirmed.contains("会话事实"), "实际：{}", confirmed);
+        assert!(reasoner.positive_session_atoms().any(|atom| {
+            atom.predicate.as_ref() == "朋友"
+                && atom.terms.first().map(|term| term.name()) == Some("孙七")
+                && atom.terms.get(1).map(|term| term.name()) == Some("吴九")
+        }));
+        let after = reasoner
+            .answer("孙七的朋友是谁")
+            .expect("确认后的会话事实应可直接回答");
+        assert!(after.contains("吴九"), "实际：{}", after);
+        assert!(!after.contains("建设性推断"), "确认后不应再待确认：{}", after);
+
+        let mut refuting = SymbolicReasoner::new(test_config(), HashMap::new());
+        refuting.observe_facts(&facts);
+        refuting.config.enable_link_prediction = false;
+        refuting.config.constructive.enabled = true;
+        let denied = refuting
+            .handle_constructive_command("否定推断：孙七|同事|周八")
+            .expect("否定命令应被识别");
+        assert!(denied.contains("否定事实"), "实际：{}", denied);
+        let blocked = refuting
+            .answer("孙七的朋友的师傅是谁")
+            .expect("否定后仍应给出无答案说明");
+        assert!(!blocked.contains("吴九"), "被否认的前提不得复用：{}", blocked);
+        assert!(!blocked.contains("建设性推断"), "被否认后不应再合成：{}", blocked);
     }
 
     #[test]

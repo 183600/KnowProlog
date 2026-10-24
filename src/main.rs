@@ -8764,6 +8764,16 @@ async fn run_interactive_mode(
             }
         }
 
+        // 建设性推断：查询、确认或否认只在本次会话生效的虚拟事实。
+        if input.contains("推断") {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            if let Some(text) = symbolic_reasoner.handle_constructive_command(input) {
+                println!("{}", text);
+                println!();
+                continue;
+            }
+        }
+
         // 知识容器层次清单：把回答所依赖的四层前提摊开，供逐层审计。
         if matches!(
             input,

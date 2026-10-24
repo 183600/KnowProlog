@@ -805,11 +805,15 @@ impl Session {
         // 补全回合与假设世界命令使用原始措辞，避免被插件改写；
         // 带「那么」的一次性反事实句仍让位给 what-if 管线。
         let completion_command = self.reasoner.handle_completion_command(&raw_input);
+        let constructive_command = self.reasoner.handle_constructive_command(&raw_input);
         let assumption_command = self.reasoner.handle_assumption_command(&raw_input);
 
         // 悬问回填：上一轮刚追问过的洞，本轮短答直接绑定并重解原目标。
         // 系统命令/补全命令不参与裸回答，避免劫持正常控制流。
-        let pending_answer = if completion_command.is_none() && assumption_command.is_none() {
+        let pending_answer = if completion_command.is_none()
+            && constructive_command.is_none()
+            && assumption_command.is_none()
+        {
             self.reasoner.try_answer_pending_question(&raw_input)
         } else {
             None
@@ -838,7 +842,10 @@ impl Session {
         let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
         control.enter(TurnPhase::Recall)?;
-        let dialogue = if completion_command.is_some() || assumption_command.is_some() {
+        let dialogue = if completion_command.is_some()
+            || constructive_command.is_some()
+            || assumption_command.is_some()
+        {
             None
         } else {
             self.manager
@@ -854,6 +861,15 @@ impl Session {
                     "completion".to_string(),
                     Some("completion_command".to_string()),
                     vec!["completion_command".to_string()],
+                    text,
+                    None,
+                )
+            } else if let Some(text) = constructive_command {
+                (
+                    "answered".to_string(),
+                    "constructive".to_string(),
+                    Some("constructive_command".to_string()),
+                    vec!["constructive_command".to_string()],
                     text,
                     None,
                 )
