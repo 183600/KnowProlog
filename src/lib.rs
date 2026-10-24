@@ -860,6 +860,11 @@ pub struct PrologRuleConfig {
     pub pattern: Vec<String>,
     pub query_type: String,
     pub priority: i32,
+    /// 泛化规则命中后仍交给软路由复核；软层拒绝或澄清时保留本规则。
+    /// 用于「属性查询」这类只消费前缀的兜底模式，避免它们挡住更具体的
+    /// 配置规则在近失句上的软对齐。
+    #[serde(default)]
+    pub defer_to_soft: bool,
 }
 
 #[derive(Debug, Deserialize)]

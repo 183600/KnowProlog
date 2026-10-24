@@ -735,6 +735,9 @@ name = "属性查询"
 pattern = ["nr", "的", "n"]
 query_type = "property_query"
 priority = 5
+# 泛化前缀模式：精确命中后仍让软路由复核，避免挡住更具体的规则；
+# 软层拒绝/澄清时仍保留本命中。
+defer_to_soft = true
 # 基础实体类型配置
 [[entity_types]]
 label = "Person"

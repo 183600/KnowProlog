@@ -414,6 +414,10 @@ pub struct PatternEntry {
     /// 误接进知识查询。
     #[serde(default)]
     pub fallback: bool,
+    /// 精确命中后是否仍允许软路由复核并替换。泛化前缀模式用它让位给更具体
+    /// 的近失解释；软层不接管时仍保留本条目，避免降低召回。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub defer_to_soft: bool,
 }
 
 impl PatternEntry {
@@ -434,6 +438,7 @@ impl PatternEntry {
             elems,
             guard: None,
             fallback: false,
+            defer_to_soft: false,
         }
     }
 
@@ -453,14 +458,16 @@ impl PatternEntry {
 
     /// 由配置的一条 `[[prolog_rules]]` 编译。
     pub fn from_prolog_rule(rule: &PrologRuleConfig) -> Self {
-        Self::new(
+        let mut entry = Self::new(
             rule.name.clone(),
             format!("config.toml#{}", rule.name),
             rule.query_type.clone(),
             rule.priority,
             true,
             rule.pattern.iter().map(|t| parse_config_token(t)).collect(),
-        )
+        );
+        entry.defer_to_soft = rule.defer_to_soft;
+        entry
     }
 
     /// 由 NLU 的一个意图模式串编译（槽位来自意图的槽配置）。

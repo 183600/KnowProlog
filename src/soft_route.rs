@@ -1271,11 +1271,11 @@ pub struct SoftEvalCase {
     pub alignment: f64,
 }
 
-/// 构念变体上的软路由体检：精确基线、近失恢复、错误接受与澄清。
+/// 构念变体上的软路由体检：精确主路由基线、近失恢复、错误接受与澄清。
 ///
 /// 分母来自配置规则的表面变体（同义词/实体替换/尾缀/礼貌前缀），
-/// **不是人工转述**；它只回答「软层有没有在原有精确路由之外制造新错误」，
-/// 不能替代真实用户语料的评估。
+/// **不是人工转述**；它只回答「软层有没有在原有精确主路由之外制造新错误」，
+/// 不能替代真实用户语料的评估。NLU 回退排在软层之后，不计入这里的精确基线。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SoftEvalReport {
     pub dialect: String,
@@ -1323,7 +1323,7 @@ impl SoftEvalReport {
         );
         let _ = writeln!(
             output,
-            "精确路由：正确 {}，错误 {}，未命中 {}",
+            "精确主路由：正确 {}，错误 {}，未命中 {}",
             self.exact_correct, self.exact_wrong, self.exact_unanswered
         );
         let _ = writeln!(
@@ -1392,6 +1392,74 @@ impl SoftEvalReport {
     }
 }
 
+#[derive(Default)]
+struct SoftEvalTally {
+    recovered: usize,
+    wrong_accept: usize,
+    clarify: usize,
+    reject: usize,
+    recoveries: Vec<SoftEvalCase>,
+    false_accepts: Vec<SoftEvalCase>,
+    clarifications: Vec<SoftEvalCase>,
+}
+
+impl SoftEvalTally {
+    fn record(&mut self, case: &crate::recall_audit::RecallCase, outcome: &SoftRouteOutcome) {
+        match outcome.decision {
+            SoftDecision::Accept => {
+                let Some(selected) = &outcome.selected else {
+                    self.reject += 1;
+                    return;
+                };
+                let entry = SoftEvalCase {
+                    question: case.question.clone(),
+                    expected_query_type: case.expected_query_type.clone(),
+                    actual_query_type: Some(selected.query_type().to_string()),
+                    variant: case.variant.label().to_string(),
+                    confidence: selected.confidence,
+                    alignment: selected.alignment.score,
+                };
+                if selected.query_type() == case.expected_query_type {
+                    self.recovered += 1;
+                    if self.recoveries.len() < 40 {
+                        self.recoveries.push(entry);
+                    }
+                } else {
+                    self.wrong_accept += 1;
+                    if self.false_accepts.len() < 40 {
+                        self.false_accepts.push(entry);
+                    }
+                }
+            }
+            SoftDecision::Clarify => {
+                self.clarify += 1;
+                if self.clarifications.len() < 40 {
+                    self.clarifications.push(SoftEvalCase {
+                        question: case.question.clone(),
+                        expected_query_type: case.expected_query_type.clone(),
+                        actual_query_type: outcome
+                            .selected
+                            .as_ref()
+                            .map(|candidate| candidate.query_type().to_string()),
+                        variant: case.variant.label().to_string(),
+                        confidence: outcome
+                            .selected
+                            .as_ref()
+                            .map(|candidate| candidate.confidence)
+                            .unwrap_or(0.0),
+                        alignment: outcome
+                            .selected
+                            .as_ref()
+                            .map(|candidate| candidate.alignment.score)
+                            .unwrap_or(0.0),
+                    });
+                }
+            }
+            SoftDecision::Reject => self.reject += 1,
+        }
+    }
+}
+
 /// 在配置构念变体上评估软路由（离线、不打开存储）。
 pub fn evaluate_constructed(config: &crate::SystemConfig) -> SoftEvalReport {
     use crate::nlp::{normalize_words, preprocess};
@@ -1432,20 +1500,40 @@ pub fn evaluate_constructed(config: &crate::SystemConfig) -> SoftEvalReport {
     let mut exact_correct = 0usize;
     let mut exact_wrong = 0usize;
     let mut exact_unanswered = 0usize;
-    let mut soft_recovered = 0usize;
-    let mut soft_wrong_accept = 0usize;
-    let mut soft_clarify = 0usize;
-    let mut soft_reject = 0usize;
-    let mut recoveries = Vec::new();
-    let mut false_accepts = Vec::new();
-    let mut clarifications = Vec::new();
+    let mut tally = SoftEvalTally::default();
 
     for case in &cases {
         let tagged = preprocess(&case.question, &config.nlp);
         let tokens = normalize_words(tagged, &synonyms);
-        let exact = library
-            .match_route_with_context(&tokens, &context)
-            .or_else(|| library.match_fallback_with_context(&tokens, &context));
+        let exact = library.match_route_with_context(&tokens, &context);
+
+        let mut soft_outcome = None;
+        if let Some(matched) = &exact {
+            if matched.entry.defer_to_soft && config.reasoning.soft_route.enabled {
+                let outcome = route_tokens(
+                    &case.question,
+                    &library,
+                    &tokens,
+                    &context,
+                    &config.reasoning.soft_route,
+                );
+                let replaces = outcome.decision == SoftDecision::Accept
+                    && outcome
+                        .selected
+                        .as_ref()
+                        .is_some_and(|selected| selected.entry.id() != matched.entry.id());
+                if replaces {
+                    soft_outcome = Some(outcome);
+                }
+            }
+        }
+
+        if let Some(outcome) = soft_outcome {
+            exact_unanswered += 1;
+            tally.record(case, &outcome);
+            continue;
+        }
+
         if let Some(matched) = exact {
             if matched.entry.query_type == case.expected_query_type {
                 exact_correct += 1;
@@ -1454,6 +1542,7 @@ pub fn evaluate_constructed(config: &crate::SystemConfig) -> SoftEvalReport {
             }
             continue;
         }
+
         exact_unanswered += 1;
         let outcome = route_tokens(
             &case.question,
@@ -1462,58 +1551,7 @@ pub fn evaluate_constructed(config: &crate::SystemConfig) -> SoftEvalReport {
             &context,
             &config.reasoning.soft_route,
         );
-        match outcome.decision {
-            SoftDecision::Accept => {
-                let Some(selected) = outcome.selected else {
-                    soft_reject += 1;
-                    continue;
-                };
-                let entry = SoftEvalCase {
-                    question: case.question.clone(),
-                    expected_query_type: case.expected_query_type.clone(),
-                    actual_query_type: Some(selected.query_type().to_string()),
-                    variant: case.variant.label().to_string(),
-                    confidence: selected.confidence,
-                    alignment: selected.alignment.score,
-                };
-                if selected.query_type() == case.expected_query_type {
-                    soft_recovered += 1;
-                    if recoveries.len() < 40 {
-                        recoveries.push(entry);
-                    }
-                } else {
-                    soft_wrong_accept += 1;
-                    if false_accepts.len() < 40 {
-                        false_accepts.push(entry);
-                    }
-                }
-            }
-            SoftDecision::Clarify => {
-                soft_clarify += 1;
-                if clarifications.len() < 40 {
-                    clarifications.push(SoftEvalCase {
-                        question: case.question.clone(),
-                        expected_query_type: case.expected_query_type.clone(),
-                        actual_query_type: outcome
-                            .selected
-                            .as_ref()
-                            .map(|candidate| candidate.query_type().to_string()),
-                        variant: case.variant.label().to_string(),
-                        confidence: outcome
-                            .selected
-                            .as_ref()
-                            .map(|candidate| candidate.confidence)
-                            .unwrap_or(0.0),
-                        alignment: outcome
-                            .selected
-                            .as_ref()
-                            .map(|candidate| candidate.alignment.score)
-                            .unwrap_or(0.0),
-                    });
-                }
-            }
-            SoftDecision::Reject => soft_reject += 1,
-        }
+        tally.record(case, &outcome);
     }
 
     SoftEvalReport {
@@ -1522,14 +1560,14 @@ pub fn evaluate_constructed(config: &crate::SystemConfig) -> SoftEvalReport {
         exact_correct,
         exact_wrong,
         exact_unanswered,
-        soft_recovered,
-        soft_wrong_accept,
-        soft_clarify,
-        soft_reject,
-        correct: exact_correct + soft_recovered,
-        recoveries,
-        false_accepts,
-        clarifications,
+        soft_recovered: tally.recovered,
+        soft_wrong_accept: tally.wrong_accept,
+        soft_clarify: tally.clarify,
+        soft_reject: tally.reject,
+        correct: exact_correct + tally.recovered,
+        recoveries: tally.recoveries,
+        false_accepts: tally.false_accepts,
+        clarifications: tally.clarifications,
     }
 }
 
@@ -1731,6 +1769,72 @@ mod tests {
         let outcome = route_tokens("法国首都", &library, &words, &PatternContext::default(), &config);
         assert_eq!(outcome.decision, SoftDecision::Accept);
         assert_eq!(outcome.selected.unwrap().entry.source, "config#capital");
+    }
+
+    #[test]
+    fn soft_layer_precedes_generic_fallback() {
+        let mut library = PatternLibrary::new();
+        library.add(PatternEntry::new(
+            "完整海拔查询",
+            "config#altitude",
+            "altitude_query",
+            10,
+            true,
+            vec![
+                Elem::pos("ns"),
+                Elem::word("海拔"),
+                Elem::word("多少"),
+            ],
+        ));
+        let mut fallback = PatternEntry::new(
+            "泛化属性回退",
+            "nlu#kg#property",
+            "property_query",
+            10,
+            false,
+            vec![Elem::pos("ns"), Elem::word("海拔")],
+        );
+        fallback.fallback = true;
+        library.add(fallback);
+        let words = tokens(&[
+            ("北京", "ns"),
+            ("海拔", "n"),
+            ("高度", "n"),
+            ("多少", "r"),
+        ]);
+        let context = PatternContext::default();
+        assert!(library.match_route_with_context(&words, &context).is_none());
+        assert_eq!(
+            library
+                .match_fallback_with_context(&words, &context)
+                .expect("回退应命中泛化属性")
+                .entry
+                .query_type,
+            "property_query"
+        );
+        let outcome = route_tokens(
+            "北京海拔高度多少",
+            &library,
+            &words,
+            &context,
+            &SoftRouteConfig::default(),
+        );
+        assert_eq!(outcome.decision, SoftDecision::Accept);
+        assert_eq!(outcome.selected.unwrap().query_type(), "altitude_query");
+    }
+
+    #[test]
+    fn generic_property_rule_opts_into_soft_recheck() {
+        let config: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let library = PatternLibrary::from_config(&config);
+        let entry = library
+            .entries()
+            .iter()
+            .find(|entry| entry.source == "config.toml#属性查询")
+            .expect("配置中应有属性查询规则");
+        assert!(entry.route);
+        assert!(entry.defer_to_soft);
     }
 
     #[test]

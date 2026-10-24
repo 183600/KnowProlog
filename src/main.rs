@@ -12911,6 +12911,35 @@ fn suggest_case_for_text(
 /// 同实体提取），额外给出「命中模式」的人类可读说明；无命中返回 `None`。
 /// 每次尝试都会写入 [`pattern_ir::PatternEpisodeLog`]：成功记下命中模式与绑定，
 /// 失败也留下可检索的情境经验（不改变路由结果）。
+fn exact_pattern_result(
+    input: &str,
+    words: &[know_prolog::nlp::TaggedWord],
+    matched: pattern_ir::PatternMatch,
+    episodes: &mut pattern_ir::PatternEpisodeLog,
+    context: &pattern_ir::PatternContext,
+) -> (String, Vec<String>, Option<String>) {
+    episodes.record_match_with_context(input, words, &matched, context);
+    let guard = matched
+        .entry
+        .guard
+        .as_ref()
+        .map(|guard| format!("，守卫：{}", guard.render()))
+        .unwrap_or_default();
+    let note = format!(
+        "{}（{}，优先级 {}，来源 {}{}）",
+        matched.entry.name,
+        matched.entry.render(),
+        matched.entry.priority,
+        matched.entry.source,
+        guard
+    );
+    (
+        matched.entry.query_type.clone(),
+        matched.entities.clone(),
+        Some(note),
+    )
+}
+
 fn route_query_with_patterns(
     library: &PatternLibrary,
     input: &str,
@@ -12919,33 +12948,46 @@ fn route_query_with_patterns(
     context: &pattern_ir::PatternContext,
     soft_config: &know_prolog::soft_route::SoftRouteConfig,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    if let Some(matched) = library
-        .match_route_with_context(words, context)
-        .or_else(|| library.match_fallback_with_context(words, context))
-    {
-        episodes.record_match_with_context(input, words, &matched, context);
-        let guard = matched
-            .entry
-            .guard
-            .as_ref()
-            .map(|guard| format!("，守卫：{}", guard.render()))
-            .unwrap_or_default();
-        let note = format!(
-            "{}（{}，优先级 {}，来源 {}{}）",
-            matched.entry.name,
-            matched.entry.render(),
-            matched.entry.priority,
-            matched.entry.source,
-            guard
-        );
-        return Some((
-            matched.entry.query_type.clone(),
-            matched.entities.clone(),
-            Some(note),
+    // 第一层：配置主路由。泛化前缀模式命中后仍让软层复核一次：
+    // 近失句里它可能只吃掉了前缀，挡住更具体的配置规则。
+    // 软层不接管时保留这条精确命中，召回不倒退。
+    if let Some(matched) = library.match_route_with_context(words, context) {
+        if matched.entry.defer_to_soft && soft_config.enabled {
+            let outcome = know_prolog::soft_route::route_tokens(
+                input, library, words, context, soft_config,
+            );
+            if outcome.decision == know_prolog::soft_route::SoftDecision::Accept {
+                if let Some(candidate) = outcome.selected {
+                    if candidate.entry.id() != matched.entry.id() {
+                        let refined = candidate.to_pattern_match();
+                        episodes.record_match_with_context(input, words, &refined, context);
+                        let note = format!(
+                            "软路由复核：{}（{}，理解置信度 {:.2}，对齐 {:.0}%，要素 {}/{}，token 覆盖 {:.0}%；原命中 {}）",
+                            candidate.name(),
+                            candidate.entry.render(),
+                            candidate.confidence,
+                            candidate.alignment.score * 100.0,
+                            candidate.alignment.matched_elems,
+                            candidate.alignment.total_elems,
+                            candidate.alignment.token_coverage() * 100.0,
+                            matched.entry.name
+                        );
+                        return Some((
+                            refined.entry.query_type.clone(),
+                            refined.entities.clone(),
+                            Some(note),
+                        ));
+                    }
+                }
+            }
+        }
+        return Some(exact_pattern_result(
+            input, words, matched, episodes, context,
         ));
     }
 
-    // 精确路由未命中：软路由只在通过守卫/覆盖闸门且领先时接管。
+    // 第二层：软路由。主路由未命中时先于 NLU 回退评估，避免泛化的
+    // 回退槽位（如「属性查询」）再次挡住更具体的配置近失解释。
     if soft_config.enabled {
         let outcome = know_prolog::soft_route::route_tokens(
             input, library, words, context, soft_config,
@@ -12971,6 +13013,13 @@ fn route_query_with_patterns(
                 ));
             }
         }
+    }
+
+    // 第三层：NLU 回退。软层拒绝/澄清后仍保留原有回退召回。
+    if let Some(matched) = library.match_fallback_with_context(words, context) {
+        return Some(exact_pattern_result(
+            input, words, matched, episodes, context,
+        ));
     }
 
     // 失败也要留下可行动的粒度：记录最近受阻模式停在哪一要素。
