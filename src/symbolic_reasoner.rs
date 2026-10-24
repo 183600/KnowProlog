@@ -6118,7 +6118,16 @@ impl SymbolicReasoner {
         if !atom.is_ground() {
             return atom.display();
         }
-        let names: Vec<String> = atom.terms.iter().map(render_term).collect();
+        let names: Vec<String> = atom
+            .terms
+            .iter()
+            .map(|term| {
+                let canonical = render_term(term);
+                self.alignment_surface_choice(&canonical)
+                    .map(|(surface, _reason)| surface)
+                    .unwrap_or(canonical)
+            })
+            .collect();
         if &*atom.predicate == PROOF_HAS && names.len() == 2 {
             return format!("{} 具有 {}", names[0], names[1]);
         }
@@ -23481,6 +23490,12 @@ types = [
             .expect("学过的规范身份应能反向选面");
         assert_eq!(surface, "未名科技公司");
         assert!(reason.contains("回声"));
+        let rendered = reasoner.render_atom_nl(&Atom::rel("师傅", "未名科技", "张三"));
+        assert!(
+            rendered.contains("未名科技公司"),
+            "生成端应沿用用户词面：{}",
+            rendered
+        );
 
         assert!(reasoner
             .alignment_canonicalize("张三公司")
