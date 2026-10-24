@@ -15,6 +15,7 @@ use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::completion_episode::{CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope};
+use crate::constructive::{ConstructiveReasoner, ObservedGraph, VirtualFact};
 use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
 };
@@ -906,6 +907,8 @@ struct ValueHit {
     prediction: Option<Prediction>,
     /// 该取值由哪条 Active 语义律推出（直接事实为 None）。
     law: Option<String>,
+    /// 该取值来自建设性多跳推断（查询局部，未写图谱）。
+    construction: Option<VirtualFact>,
 }
 
 #[derive(Debug, Clone)]
@@ -920,6 +923,8 @@ struct ChainRun {
     steps: Vec<ChainStep>,
     last_hits: Vec<ValueHit>,
     closure_truncated: bool,
+    construction_truncated: bool,
+    construction_facts: usize,
 }
 
 /// 问句链上的一个谓词环节：词面（用户问法）+ 规范槽位（存储坐标）+ 是否逆向。
@@ -7256,6 +7261,7 @@ impl SymbolicReasoner {
                     value: object,
                     prediction: None,
                     law: None,
+                    construction: None,
                 });
             }
         }
@@ -7282,6 +7288,7 @@ impl SymbolicReasoner {
                     value: value.to_string(),
                     prediction: None,
                     law: None,
+                    construction: None,
                 });
             }
         }
@@ -7309,6 +7316,7 @@ impl SymbolicReasoner {
                             value: value.clone(),
                             prediction: None,
                             law: None,
+                            construction: None,
                         });
                     }
                 }
@@ -7330,6 +7338,7 @@ impl SymbolicReasoner {
                         value,
                         prediction: Some(prediction),
                         law: None,
+                        construction: None,
                     });
                 }
             }
@@ -7428,6 +7437,7 @@ impl SymbolicReasoner {
                             value: value.clone(),
                             prediction: None,
                             law: Some(law.id.clone()),
+                            construction: None,
                         });
                     }
                 }
@@ -7448,6 +7458,7 @@ impl SymbolicReasoner {
                             value,
                             prediction: None,
                             law: Some(law.id.clone()),
+                            construction: None,
                         });
                     }
                 }
@@ -7468,6 +7479,7 @@ impl SymbolicReasoner {
                                 value,
                                 prediction: None,
                                 law: Some(law.id.clone()),
+                                construction: None,
                             });
                         }
                     }
@@ -7555,7 +7567,49 @@ impl SymbolicReasoner {
             steps,
             last_hits,
             closure_truncated: false,
+            construction_truncated: false,
+            construction_facts: 0,
         })
+    }
+
+    fn new_construction_reasoner(&self) -> Option<ConstructiveReasoner> {
+        if !self.config.constructive.enabled {
+            return None;
+        }
+        let mut observed = ObservedGraph::from_triples(self.predictor.triples());
+        for atom in self.positive_session_atoms() {
+            if let [Term::Const(subject), Term::Const(object)] = atom.terms.as_slice() {
+                observed.insert(subject, &atom.predicate, object);
+            }
+        }
+        Some(ConstructiveReasoner::new(
+            self.config.constructive.clone(),
+            self.revision,
+            observed,
+            self.predictor
+                .rules()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, rule)| {
+                    crate::constructive::ConstructionRule::from_horn(rule, index)
+                })
+                .collect(),
+        ))
+    }
+
+    fn constructed_hit(node: &str, inverted: bool, fact: VirtualFact) -> ValueHit {
+        let value = if inverted {
+            fact.key.subject.clone()
+        } else {
+            fact.key.object.clone()
+        };
+        let _ = node;
+        ValueHit {
+            value,
+            prediction: None,
+            law: None,
+            construction: Some(fact),
+        }
     }
 
     fn run_chain_mode(
@@ -7571,6 +7625,9 @@ impl SymbolicReasoner {
         let mut steps: Vec<ChainStep> = Vec::new();
         let mut last_hits: Vec<ValueHit> = Vec::new();
         let mut closure_truncated = false;
+        let mut construction = self.new_construction_reasoner();
+        let mut construction_truncated = false;
+        let mut construction_facts = 0usize;
         for predicate in predicates {
             let mut next_frontier: Vec<String> = Vec::new();
             let mut round_hits: Vec<ValueHit> = Vec::new();
@@ -7579,7 +7636,7 @@ impl SymbolicReasoner {
             let mut seen_values: HashSet<String> = HashSet::new();
             for node in &frontier {
                 let direct = self.node_hits(node, predicate);
-                let hits = if force_closure || direct.is_empty() {
+                let mut hits = if force_closure || direct.is_empty() {
                     let (expanded, expanded_truncated) =
                         self.law_hits(node, predicate, direct.is_empty());
                     closure_truncated |= expanded_truncated;
@@ -7603,6 +7660,20 @@ impl SymbolicReasoner {
                 } else {
                     direct
                 };
+                if hits.is_empty() {
+                    if let Some(engine) = construction.as_mut() {
+                        let report = engine.derive(node, &predicate.slot, predicate.inverted);
+                        construction_truncated |= report.truncated;
+                        if !report.target_facts.is_empty() {
+                            construction_facts += report.target_facts.len();
+                            hits = report
+                                .target_facts
+                                .into_iter()
+                                .map(|fact| Self::constructed_hit(node, predicate.inverted, fact))
+                                .collect();
+                        }
+                    }
+                }
                 if hits.is_empty() {
                     continue;
                 }
@@ -7631,6 +7702,8 @@ impl SymbolicReasoner {
             steps,
             last_hits,
             closure_truncated,
+            construction_truncated,
+            construction_facts,
         })
     }
 
@@ -7672,6 +7745,8 @@ impl SymbolicReasoner {
         last_hits: &[ValueHit],
         question: &str,
         closure_truncated: bool,
+        construction_truncated: bool,
+        construction_facts: usize,
     ) -> String {
         let expectations = Self::expected_type_keywords(question);
         let mut ordered: Vec<&ValueHit> = last_hits.iter().collect();
@@ -7717,12 +7792,46 @@ impl SymbolicReasoner {
                 let values = step
                     .hits
                     .iter()
-                    .map(|hit| hit.value.clone())
+                    .map(|hit| {
+                        if let Some(fact) = &hit.construction {
+                            format!(
+                                "{}（建设性推断，待确认，置信度 {:.2}）",
+                                hit.value,
+                                fact.confidence()
+                            )
+                        } else {
+                            hit.value.clone()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("、");
                 output.push_str(&format!(
                     "  {} 的 {} 是 {}。\n",
                     step.subject, step.predicate, values
+                ));
+            }
+            let construction_notes: Vec<String> = steps
+                .iter()
+                .flat_map(|step| step.hits.iter())
+                .filter_map(|hit| hit.construction.as_ref())
+                .map(|fact| {
+                    format!(
+                        "{}（置信度 {:.2}，前提：{}）",
+                        fact.rule,
+                        fact.confidence(),
+                        fact.support
+                            .iter()
+                            .map(|key| key.render())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    )
+                })
+                .take(2)
+                .collect();
+            if !construction_notes.is_empty() {
+                output.push_str(&format!(
+                    "  推断依据：{}\n",
+                    construction_notes.join("；")
                 ));
             }
             output.push_str("  综合得出：\n");
@@ -7735,6 +7844,19 @@ impl SymbolicReasoner {
                     "\n  推理依据（推断，待确认，置信度 {:.2}）：{}",
                     prediction.confidence,
                     self.predictor.explain(prediction)
+                ));
+            } else if let Some(fact) = &hit.construction {
+                output.push_str(&format!(
+                    "\n  推理依据（{}，置信度 {:.2}，{}）：{}；前提：{}",
+                    fact.state.label(),
+                    fact.confidence(),
+                    fact.operator.label(),
+                    fact.rule,
+                    fact.support
+                        .iter()
+                        .map(|key| key.render())
+                        .collect::<Vec<_>>()
+                        .join("、")
                 ));
             } else if let Some(law_id) = &hit.law {
                 if let Some(explain) = self.laws.explain(law_id) {
@@ -7756,15 +7878,38 @@ impl SymbolicReasoner {
                 if let Some(prediction) = &hit.prediction {
                     output.push_str(&format!("（推断，置信度 {:.2}）", prediction.confidence));
                 }
+                if let Some(fact) = &hit.construction {
+                    output.push_str(&format!(
+                        "（建设性推断，待确认，置信度 {:.2}）",
+                        fact.confidence()
+                    ));
+                }
                 output.push('\n');
             }
-            if last_hits.iter().any(|hit| hit.prediction.is_some()) {
+            if last_hits
+                .iter()
+                .any(|hit| hit.prediction.is_some() || hit.construction.is_some())
+            {
                 let evidence: Vec<String> = last_hits
                     .iter()
                     .filter_map(|hit| {
                         hit.prediction
                             .as_ref()
                             .map(|prediction| self.predictor.explain(prediction))
+                            .or_else(|| {
+                                hit.construction.as_ref().map(|fact| {
+                                    format!(
+                                        "{}（建设性推断，置信度 {:.2}，前提：{}）",
+                                        fact.rule,
+                                        fact.confidence(),
+                                        fact.support
+                                            .iter()
+                                            .map(|key| key.render())
+                                            .collect::<Vec<_>>()
+                                            .join("、")
+                                    )
+                                })
+                            })
                     })
                     .take(2)
                     .collect();
@@ -7784,6 +7929,16 @@ impl SymbolicReasoner {
         }
         if closure_truncated {
             output.push_str("\n  说明：传递闭包扩展达到深度或节点上限，未列出的取值仍可能存在。");
+        }
+        if construction_facts > 0 {
+            output.push_str(
+                "\n  说明：建设性推断只在本次查询内有效，未写入知识图谱；确认后才进入会话事实。",
+            );
+        }
+        if construction_truncated {
+            output.push_str(
+                "\n  说明：建设性搜索达到跳深、候选或展开预算，未列出的推断仍可能存在。",
+            );
         }
         output
     }
@@ -8954,6 +9109,8 @@ impl SymbolicReasoner {
                         &run.last_hits,
                         question,
                         run.closure_truncated,
+                        run.construction_truncated,
+                        run.construction_facts,
                     ));
                 }
                 // 直接边/链接预测都没有命中时，再问一次归结引擎：规则推出来的
@@ -19270,6 +19427,57 @@ types = [
         assert!(
             answer.matches("推理依据").count() <= 1,
             "推理依据不应重复：{}",
+            answer
+        );
+    }
+
+    #[test]
+    fn test_constructive_chain_fills_missing_hop() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let facts = vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "同事".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "朋友".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "孙七".to_string(),
+                rel_type: "同事".to_string(),
+                to: "周八".to_string(),
+            },
+            PrologFact::Relation {
+                from: "周八".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "吴九".to_string(),
+            },
+            PrologFact::Relation {
+                from: "吴九".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "郑十".to_string(),
+            },
+        ];
+        reasoner.observe_facts(&facts);
+        reasoner.config.enable_link_prediction = false;
+        reasoner.config.constructive.enabled = true;
+        let answer = reasoner
+            .answer("孙七的朋友的师傅是谁")
+            .expect("缺中间边的多跳问句应能给出建设性推断");
+        assert!(answer.contains("郑十"), "实际：{}", answer);
+        assert!(answer.contains("建设性推断"), "实际：{}", answer);
+        assert!(answer.contains("未写入知识图谱"), "实际：{}", answer);
+        assert!(
+            answer.contains("同事(A,B) ∧ 师傅(B,C) ⇒ 朋友(A,C)"),
+            "规则来源应可追溯：{}",
             answer
         );
     }

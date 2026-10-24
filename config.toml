@@ -66,6 +66,19 @@ holographic_similarity_floor = 0.01    # 召回候选的余弦下限（低于视
 holographic_max_hits = 6               # 单次全息召回的最大候选数
 require_predicate_admission = false    # 严格准入：只允许画像中已登记的谓词入库（false=未知谓词自动待确认准入）
 
+# 建设性多跳：链式查询缺一条中间边时，用已挖掘规则合成查询局部虚拟事实，
+# 让推断继续参与下一跳；默认关闭，关闭时回答路径逐字节不变。
+[reasoning.constructive]
+enabled = false                       # 是否在链式查询缺口处启用建设性合成
+max_depth = 4                         # 虚拟事实最大推导深度
+max_virtual_facts = 96                # 查询/会话作用域虚拟事实总上限
+max_candidates_per_round = 32         # 单轮最多保留的候选事实数
+max_expansions = 8000                 # 单次饱和的最大规则展开次数
+beam_width = 32                       # 单轮最多插入的虚拟事实数
+min_confidence_bps = 3500             # 候选进入下一跳的最低置信度（万分之一）
+session_capacity = 64                 # 会话作用域确认事实容量（LRU）
+promotion_threshold_bps = 8000        # 允许晋升为会话事实的最低置信度
+
 # 可携带证明的置信度层（PCC）：原始证据 → PAV 校准断点 → log-odds 融合
 # → 四档决策（回答/含糊/澄清/拒答）→ 双词表回执。
 # 关闭 enabled 即逐字节回到旧回答路径；启用时 config-lint 会重算风险证书。
