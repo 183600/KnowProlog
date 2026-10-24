@@ -67,6 +67,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use crate::abduction::{clarification_batch_scope, classify_answer, AnswerKind};
 use crate::binding_frames::FrameProgram;
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
@@ -824,6 +825,18 @@ impl Session {
             // 裸回答窗口只开一轮：本轮没绑定成功，后续输入不得被旧追问劫持。
             self.reasoner.clear_pending_awaiting();
         }
+        // 解释空间澄清进行中：严格澄清策略下的短答直接结算为确认/否定/暂缓，
+        // 不再走普通问答或对话策略，避免「不是」被当成新问题。
+        let clarification_answer = if self.policy.strict_clarify
+            && self.reasoner.clarification_active()
+            && is_clarification_answer(&raw_input)
+        {
+            self.reasoner
+                .answer_clarification(&raw_input)
+                .map(|text| (text, self.reasoner.clarification_active()))
+        } else {
+            None
+        };
         // 上一轮的确认/更正若补上了悬问的洞，立即给出延期回答。
         let deferred_after_adopt = if adopted > 0 {
             self.reasoner.resolve_pending_after_assertion()
@@ -3268,6 +3281,19 @@ fn status_reason(status: u16) -> &'static str {
         504 => "Gateway Timeout",
         _ => "Internal Server Error",
     }
+}
+
+/// 服务端短答是否在回答澄清提问（是/不是/不知道、更正、批量）。
+///
+/// 只接受短句：长句里以「好」「是」开头的普通新问题不应被当成确认，
+/// 否则严格澄清会劫持正常问答。批量短语单独识别（`classify_answer` 不覆盖）。
+fn is_clarification_answer(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 24 {
+        return false;
+    }
+    clarification_batch_scope(trimmed).is_some()
+        || !matches!(classify_answer(trimmed), AnswerKind::Unrecognized)
 }
 
 /// 回答是否表示「知识库没有依据」：只有这种失败才立悬问。
