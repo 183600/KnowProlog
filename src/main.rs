@@ -374,6 +374,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Evaluate constructive multi-hop recovery on the built-in missing-edge
+    /// benchmark, comparing one-hop link prediction with bounded virtual facts
+    EvalConstruction {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Exit non-zero unless every target is recovered without a wrong fact
+        #[arg(long)]
+        strict: bool,
+    },
     /// Evaluate answer-probed reference resolution (grounding certificates /
     /// repair recall / over-ask / truncation safety) on the built-in gold corpus
     /// with a regression ratchet
@@ -1222,6 +1232,10 @@ async fn main() {
             json,
         }) => {
             run_eval_grounding(baseline.clone(), *update_baseline, *allow_regression, *json);
+            return;
+        }
+        Some(Commands::EvalConstruction { json, strict }) => {
+            run_eval_construction(*json, *strict);
             return;
         }
         Some(Commands::EvalIdentity {
@@ -2454,6 +2468,7 @@ async fn main() {
         Some(Commands::EvalNlu { .. }) => {}
         Some(Commands::EvalLink { .. }) => {}
         Some(Commands::EvalGrounding { .. }) => {}
+        Some(Commands::EvalConstruction { .. }) => {}
         Some(Commands::EvalIdentity { .. }) => {}
         Some(Commands::EvalRecovery { .. }) => {}
         Some(Commands::ProofBench { .. }) => {}
@@ -2938,6 +2953,23 @@ fn run_eval_nlu(
 }
 
 /// `eval-link`：会话级实体链接金标评测 + 回归棘轮（不依赖知识存储）。
+fn run_eval_construction(json: bool, strict: bool) {
+    let report = know_prolog::constructive_eval::evaluate();
+    if json {
+        println!("{}", report.json());
+    } else {
+        println!("{}", report.render_text());
+    }
+    if strict
+        && (report.metrics.recall_bps() < 10_000
+            || report.metrics.precision_bps() < 10_000
+            || report.metrics.wrong_target_facts > 0
+            || !report.metrics.support_audit_clean)
+    {
+        std::process::exit(1);
+    }
+}
+
 fn run_eval_link(
     baseline: Option<String>,
     update_baseline: bool,
