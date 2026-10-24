@@ -284,10 +284,19 @@ impl fmt::Display for PredictionError {
                 write!(formatter, "没有找到待定推测「{}」", selector)
             }
             PredictionError::NotPending(id, status) => {
-                write!(formatter, "推测「{}」当前状态为「{}」，不能再次裁决", id, status.label())
+                write!(
+                    formatter,
+                    "推测「{}」当前状态为「{}」，不能再次裁决",
+                    id,
+                    status.label()
+                )
             }
             PredictionError::AmbiguousSelector(selector) => {
-                write!(formatter, "推测选择「{}」命中了多个候选，请给出更完整的编号", selector)
+                write!(
+                    formatter,
+                    "推测选择「{}」命中了多个候选，请给出更完整的编号",
+                    selector
+                )
             }
         }
     }
@@ -354,7 +363,10 @@ impl PredictionGuard {
 
     pub fn check(&self, key: &HypothesisKey) -> Result<(), (RejectReason, String)> {
         if self.known.contains(key) {
-            return Err((RejectReason::AlreadyKnown, "该三元组已存在于基础图谱".to_string()));
+            return Err((
+                RejectReason::AlreadyKnown,
+                "该三元组已存在于基础图谱".to_string(),
+            ));
         }
         if self.session.contains(key) {
             return Err((
@@ -369,7 +381,10 @@ impl PredictionGuard {
             ));
         }
         if self.functional.contains(&key.predicate) {
-            if let Some(values) = self.values.get(&(key.subject.clone(), key.predicate.clone())) {
+            if let Some(values) = self
+                .values
+                .get(&(key.subject.clone(), key.predicate.clone()))
+            {
                 if let Some(existing) = values.iter().find(|value| *value != &key.object) {
                     return Err((
                         RejectReason::FunctionalConflict,
@@ -391,9 +406,7 @@ impl PredictionGuard {
         let closure = self.closure.as_ref()?;
         let subject_types = self.known_types(&key.subject, closure);
         let domain = closure.domain_classes(&key.predicate);
-        if let Some((actual, expected)) =
-            Self::first_disjoint(&subject_types, &domain, closure)
-        {
+        if let Some((actual, expected)) = Self::first_disjoint(&subject_types, &domain, closure) {
             return Some(format!(
                 "主体「{}」的类型「{}」与「{}」的定义域「{}」互斥",
                 key.subject, actual, key.predicate, expected
@@ -425,9 +438,9 @@ impl PredictionGuard {
             return None;
         }
         let compatible = actual_types.iter().any(|actual| {
-            expected_types.iter().any(|expected| {
-                actual == expected || closure.is_subclass(actual, expected)
-            })
+            expected_types
+                .iter()
+                .any(|expected| actual == expected || closure.is_subclass(actual, expected))
         });
         if compatible {
             return None;
@@ -788,8 +801,7 @@ impl PredictiveElaboration {
             let ambiguous = keys.windows(2).any(|pair| {
                 let left = candidates.get(&pair[0]).expect("候选应存在");
                 let right = candidates.get(&pair[1]).expect("候选应存在");
-                left.confidence_milli.saturating_sub(right.confidence_milli)
-                    < self.min_margin_milli
+                left.confidence_milli.saturating_sub(right.confidence_milli) < self.min_margin_milli
             });
             if !ambiguous {
                 continue;
@@ -915,10 +927,7 @@ impl PredictiveElaboration {
         if matches.len() > 1 {
             return Err(PredictionError::AmbiguousSelector(selector.to_string()));
         }
-        let parts: Vec<&str> = selector
-            .split(['|', '｜'])
-            .map(str::trim)
-            .collect();
+        let parts: Vec<&str> = selector.split(['|', '｜']).map(str::trim).collect();
         if parts.len() == 3 && parts.iter().all(|part| !part.is_empty()) {
             let key = HypothesisKey::new(parts[0], parts[1], parts[2]);
             let id = hypothesis_id(&key);
@@ -1041,8 +1050,7 @@ mod tests {
             .iter()
             .any(|hypothesis| hypothesis.key.object == "赵六"));
         assert!(plan.rejections.iter().any(|rejection| {
-            rejection.reason == RejectReason::SessionRefuted
-                && rejection.key.object == "赵六"
+            rejection.reason == RejectReason::SessionRefuted && rejection.key.object == "赵六"
         }));
 
         let mut guard = guard_from(&predictor);
@@ -1054,8 +1062,7 @@ mod tests {
             .iter()
             .any(|hypothesis| hypothesis.key.object == "赵六"));
         assert!(plan.rejections.iter().any(|rejection| {
-            rejection.reason == RejectReason::SessionConfirmed
-                && rejection.key.object == "赵六"
+            rejection.reason == RejectReason::SessionConfirmed && rejection.key.object == "赵六"
         }));
     }
 
