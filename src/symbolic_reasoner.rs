@@ -9893,7 +9893,9 @@ impl SymbolicReasoner {
         let mut chain_result = self.run_chain(&entity, &intermediate);
         let need_laws = self.laws.has_inference_laws()
             && chain_result.as_ref().map_or(true, |run| {
-                !run.last_hits.iter().any(|hit| hit.value == object)
+                !run.last_hits
+                    .iter()
+                    .any(|hit| hit.value == object && hit.construction.is_none())
             });
         if need_laws {
             if let Some(expanded) = self.run_chain_via_laws(&entity, &intermediate) {
@@ -9903,6 +9905,33 @@ impl SymbolicReasoner {
         if let Some(run) = chain_result {
             if let Some(hit) = run.last_hits.iter().find(|hit| hit.value == object) {
                 let step = run.steps.last()?;
+                if let Some(fact) = &hit.construction {
+                    let confirmable = run
+                        .steps
+                        .iter()
+                        .flat_map(|step| step.hits.iter())
+                        .chain(run.last_hits.iter())
+                        .filter_map(|candidate| candidate.construction.as_ref())
+                        .map(|candidate| &candidate.key)
+                        .next()
+                        .unwrap_or(&fact.key);
+                    return Some(format!(
+                        "很可能，但目前只是建设性推断（待确认，置信度 {:.2}）：{} 的 {} 是 {}。\n  推断依据：{}；前提：{}。\n  说明：推断只在本次查询内有效，未写入知识图谱；确认请回复「确认推断：{}|{}|{}」。",
+                        fact.confidence(),
+                        step.subject,
+                        step.predicate,
+                        object,
+                        fact.rule,
+                        fact.support
+                            .iter()
+                            .map(|premise| premise.render())
+                            .collect::<Vec<_>>()
+                            .join("、"),
+                        confirmable.subject,
+                        confirmable.predicate,
+                        confirmable.object
+                    ));
+                }
                 return Some(match &hit.prediction {
                     None => match &hit.law {
                         Some(law_id) => format!(
@@ -9928,7 +9957,13 @@ impl SymbolicReasoner {
             let known_values: Vec<String> = run
                 .last_hits
                 .iter()
-                .filter(|hit| hit.prediction.is_none())
+                .filter(|hit| hit.prediction.is_none() && hit.construction.is_none())
+                .map(|hit| hit.value.clone())
+                .collect();
+            let constructed_values: Vec<String> = run
+                .last_hits
+                .iter()
+                .filter(|hit| hit.construction.is_some())
                 .map(|hit| hit.value.clone())
                 .collect();
             if !known_values.is_empty() {
@@ -9947,6 +9982,15 @@ impl SymbolicReasoner {
                     step.subject,
                     step.predicate,
                     known_values.join("、")
+                ));
+            }
+            if !constructed_values.is_empty() {
+                let step = run.steps.last()?;
+                return Some(format!(
+                    "无法确定。知识图谱没有直接记录，建设性推断给出的是：{} 的 {} 是 {}（待确认，未写入知识图谱）。",
+                    step.subject,
+                    step.predicate,
+                    constructed_values.join("、")
                 ));
             }
         } else if intermediate.len() == 1 {
@@ -19762,6 +19806,66 @@ types = [
             !target_blocked.contains("综合得出"),
             "被否认的目标不得成为下一跳前提：{}",
             target_blocked
+        );
+    }
+
+    #[test]
+    fn constructive_check_is_reported_as_pending_not_graph_fact() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let facts = vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "同事".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "朋友".to_string(),
+                to: "赵六".to_string(),
+            },
+            PrologFact::Relation {
+                from: "孙七".to_string(),
+                rel_type: "同事".to_string(),
+                to: "周八".to_string(),
+            },
+            PrologFact::Relation {
+                from: "周八".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "吴九".to_string(),
+            },
+        ];
+        reasoner.observe_facts(&facts);
+        reasoner.config.enable_link_prediction = false;
+        reasoner.config.constructive.enabled = true;
+        let answer = reasoner
+            .answer("孙七的朋友的师傅是周八吗")
+            .expect("缺中间边的是非问应能给出待确认推断");
+        assert!(answer.contains("建设性推断"), "实际：{}", answer);
+        assert!(answer.contains("待确认"), "实际：{}", answer);
+        assert!(
+            !answer.contains("是的。根据知识图谱"),
+            "未确认的推断不得冒充图谱事实：{}",
+            answer
+        );
+        assert!(
+            answer.contains("确认推断：孙七|朋友|吴九"),
+            "应给出可执行的确认入口：{}",
+            answer
+        );
+
+        let other = reasoner
+            .answer("孙七的朋友的师傅是郑十吗")
+            .expect("不同取值应给出无法确定而不是伪造否定");
+        assert!(other.contains("无法确定"), "实际：{}", other);
+        assert!(
+            !other.contains("不是。知识图谱记录的是"),
+            "只有待确认推断时不得断言图谱否定：{}",
+            other
         );
     }
 
