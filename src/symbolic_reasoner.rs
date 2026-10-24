@@ -7084,6 +7084,14 @@ impl SymbolicReasoner {
                 ));
             }
         }
+        for hypothesis in self.predictive.pending() {
+            speculative.push(format!(
+                "预测 {} [{}，置信度 {:.2}]",
+                hypothesis.key.display(),
+                hypothesis.status.label(),
+                hypothesis.confidence()
+            ));
+        }
 
         let hypotheses: Vec<String> = self
             .assumption_world
@@ -22266,6 +22274,26 @@ types = [
         let text = reasoner.knowledge_layers_report();
         assert!(text.contains("知识容器层次清单"), "{}", text);
         assert!(text.contains("L3 假设层"), "{}", text);
+    }
+
+    #[test]
+    fn knowledge_layer_manifest_lists_predictive_hypotheses() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner
+            .predictive_elaboration("李四")
+            .expect("链接预测应生成推测段落");
+        let manifest = reasoner.knowledge_layer_manifest();
+        let speculative = manifest.layer("L2").expect("推测层");
+        assert!(speculative.count > 0, "推测层应包含待定预测");
+        assert!(
+            speculative
+                .sample
+                .iter()
+                .any(|entry| entry.contains("预测") && entry.contains("赵六")),
+            "{:?}",
+            speculative.sample
+        );
     }
 
     #[test]
