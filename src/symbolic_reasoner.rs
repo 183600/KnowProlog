@@ -1736,7 +1736,12 @@ impl SymbolicReasoner {
         let plan = self.planner.parse(question).or_else(|| {
             query_rewrite::rewrite(question, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
         });
-        let mut trace = lexical_trace::trace_question(question, config, plan.as_ref());
+        let mut trace = lexical_trace::trace_question_with_mention_lexicon(
+            question,
+            config,
+            plan.as_ref(),
+            Some(&self.mention_lexicon),
+        );
         trace.fidelity = TraceFidelity::Reconstructed;
         if let Some(plan) = &plan {
             self.enrich_trace_plan_terms(&mut trace, plan, question);
@@ -23701,6 +23706,24 @@ types = [
             .mention_lexicon()
             .confirmed_spans("未名科技发布了新芯片")
             .is_empty());
+    }
+
+    #[test]
+    fn lexical_trace_uses_the_same_mention_lexicon_overlay() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        reasoner.set_nlp_config(trace_nlp_config());
+        let trace = reasoner
+            .lexical_trace("未名科技发布了新芯片")
+            .expect("应能生成读法轨迹");
+        assert!(
+            trace.tokens.iter().any(|token| {
+                token.text == "未名科技"
+                    && token.source == crate::nlp::TagSource::MentionLexicon
+            }),
+            "读法轨迹应复用词表覆盖层：{:?}",
+            trace.tokens
+        );
     }
 
     #[test]

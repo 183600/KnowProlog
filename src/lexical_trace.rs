@@ -877,9 +877,23 @@ pub fn trace_question(
     config: &NlpConfig,
     plan: Option<&QueryPlan>,
 ) -> LexicalTrace {
+    trace_question_with_mention_lexicon(question, config, plan, None)
+}
+
+/// 与 [`trace_question`] 相同，但可注入已确认提及词表：
+/// 审计切分与真实路由使用同一覆盖层，避免「报告里一种读法、执行时另一种读法」。
+pub fn trace_question_with_mention_lexicon(
+    question: &str,
+    config: &NlpConfig,
+    plan: Option<&QueryPlan>,
+    lexicon: Option<&crate::mention_lexicon::MentionLexicon>,
+) -> LexicalTrace {
     let trimmed = question.trim();
     let question_chars = trimmed.chars().count();
-    let annotated = preprocess_annotated(trimmed, config);
+    let annotated = match lexicon {
+        Some(lexicon) => crate::nlp::preprocess_annotated_with_lexicon(trimmed, config, lexicon),
+        None => preprocess_annotated(trimmed, config),
+    };
     let tokens: Vec<TraceToken> = annotated
         .iter()
         .map(|word| TraceToken {
