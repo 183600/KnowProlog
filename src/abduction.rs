@@ -294,7 +294,7 @@ pub fn render_explanation_conclusion(
             let frontier = space
                 .frontier()
                 .iter()
-                .map(|atom| render(atom))
+                .map(render)
                 .collect::<Vec<_>>()
                 .join("；");
             output.push_str(&format!("  仍然缺少的前提：{}\n", frontier));
