@@ -807,12 +807,14 @@ impl Session {
         let completion_command = self.reasoner.handle_completion_command(&raw_input);
         let constructive_command = self.reasoner.handle_constructive_command(&raw_input);
         let assumption_command = self.reasoner.handle_assumption_command(&raw_input);
+        let predictive_command = self.reasoner.handle_predictive_command(&raw_input);
 
         // 悬问回填：上一轮刚追问过的洞，本轮短答直接绑定并重解原目标。
         // 系统命令/补全命令不参与裸回答，避免劫持正常控制流。
         let pending_answer = if completion_command.is_none()
             && constructive_command.is_none()
             && assumption_command.is_none()
+            && predictive_command.is_none()
         {
             self.reasoner.try_answer_pending_question(&raw_input)
         } else {
@@ -845,6 +847,7 @@ impl Session {
         let dialogue = if completion_command.is_some()
             || constructive_command.is_some()
             || assumption_command.is_some()
+            || predictive_command.is_some()
         {
             None
         } else {
@@ -879,6 +882,15 @@ impl Session {
                     "assumption".to_string(),
                     Some("assumption_world".to_string()),
                     vec!["assumption_world".to_string()],
+                    text,
+                    None,
+                )
+            } else if let Some(text) = predictive_command {
+                (
+                    "answered".to_string(),
+                    "predictive".to_string(),
+                    Some("predictive_command".to_string()),
+                    vec!["predictive_command".to_string()],
                     text,
                     None,
                 )
@@ -5432,6 +5444,88 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
 
         let report = session.run_turn("补全报告");
         assert_eq!(report.source, "completion", "{}", report.reply);
+        assert!(report.reply.contains("已确认 1"), "{}", report.reply);
+    }
+
+    #[test]
+    fn predictive_commands_are_available_over_session_turns() {
+        let facts = vec![
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师傅".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "李四".into(),
+                rel_type: "师傅".into(),
+                to: "王五".into(),
+            },
+            PrologFact::Relation {
+                from: "王五".into(),
+                rel_type: "师傅".into(),
+                to: "赵六".into(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师祖".into(),
+                to: "王五".into(),
+            },
+        ];
+        let reasoning = ReasoningConfig {
+            enable_link_prediction: true,
+            link_prediction_min_confidence: 0.5,
+            link_prediction_min_support: 1,
+            ..ReasoningConfig::default()
+        };
+        let state = Arc::new(ApiState::new(
+            facts,
+            reasoning,
+            HashMap::new(),
+            PerfLedger::shared(),
+            4,
+            StartupLedger::shared(),
+        ));
+        let mut session = build_session(
+            "s-predictive".to_string(),
+            &state.warm,
+            &state.perf,
+            state.prompt_mode,
+            state.recovery_mode,
+            None,
+            None,
+            None,
+            TurnBudget::unlimited(),
+            None,
+        );
+
+        let opened = session.run_turn("预测展开：李四");
+        assert_eq!(opened.source, "predictive", "{}", opened.reply);
+        assert!(
+            opened.reply.contains("推测，不是已确认事实"),
+            "{}",
+            opened.reply
+        );
+        assert!(opened.reply.contains("赵六"), "{}", opened.reply);
+
+        let id = session
+            .reasoner
+            .predictive_ledger()
+            .pending()
+            .iter()
+            .find(|hypothesis| hypothesis.key.object == "赵六")
+            .map(|hypothesis| hypothesis.id.clone())
+            .expect("应存在指向赵六的待定推测");
+        let confirmed = session.run_turn(&format!("确认预测：{}", id));
+        assert_eq!(confirmed.source, "predictive", "{}", confirmed.reply);
+        assert!(confirmed.reply.contains("已确认预测"), "{}", confirmed.reply);
+        let profile = session
+            .reasoner
+            .generate_about("李四")
+            .expect("确认后的会话事实应参与介绍");
+        assert!(profile.contains("赵六"), "{}", profile);
+
+        let report = session.run_turn("预测台账");
+        assert_eq!(report.source, "predictive", "{}", report.reply);
         assert!(report.reply.contains("已确认 1"), "{}", report.reply);
     }
 

@@ -8867,6 +8867,20 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 可修订推测：链接预测只作为生成假设呈现，确认/否定后才影响会话。
+        if input.contains("预测")
+            || input.starts_with("推测：")
+            || input.starts_with("推测:")
+            || matches!(input, "推测台账" | "推测报告")
+        {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            if let Some(text) = symbolic_reasoner.handle_predictive_command(input) {
+                println!("{}", text);
+                println!();
+                continue;
+            }
+        }
+
         // 补全回合：打开一次可确认、可归纳、可批量闭包的学习回合。
         // 解析与 HTTP 服务共用同一入口，避免两套命令文法漂移。
         if input.contains("补全") || input.starts_with("学习回合") {
@@ -12122,6 +12136,10 @@ fn interactive_help() -> String {
         "  补全回合：<实体>                     打开一次学习回合：收集候选、确认归纳、本批闭包",
         "  确认补全：<序号> / 否定补全：<序号>   裁定候选；确认事实只进会话，不写图谱",
         "  补全规则 / 补全报告                   已归纳规则与本回合候选（默认本批作用域）",
+        "  预测展开：<实体>                     事实介绍 + 明确标注「未确认」的推测段落",
+        "  推测：<实体> / 预测推测：<实体>       只输出推测、证据与拒绝审计，不混入事实段落",
+        "  确认预测：<序号或编号> / 否定预测：…  裁决推测；确认只进会话事实层，否定阻断候选",
+        "  预测台账 / 推测报告                   推测生命周期、拒绝原因与待定清单",
         "  补全提问 / 下一个问题                 按效用选一个候选追问（重复提问会降权）",
         "  补全测试 / 补全重放                   运行期裁决回归；重放会把违规规则隔离",
         "  别问了 / 允许提问                     长期静音或恢复主动追问（随会话持久化）",
