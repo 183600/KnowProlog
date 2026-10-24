@@ -1376,9 +1376,12 @@ impl SymbolicReasoner {
             }
 
             fn canonical_predicate(&self, raw: &str) -> Option<String> {
-                // 谓词同样先做精确判定：已登记关系、精确事实谓词、逆谓词
-                // 或同义词别名，任一成立才归一；模糊对齐不参与边界切分。
-                let canonical = self.0.aligner.canonical_form(raw);
+                // 谓词同样先做精确判定：已登记关系、精确事实谓词、逆谓词、
+                // 同义词别名或会话镜像对齐，任一成立才归一；模糊对齐不参与边界切分。
+                let aligned = self.0.alignment_predicate_canonicalize(raw);
+                let canonical = aligned
+                    .clone()
+                    .unwrap_or_else(|| self.0.aligner.canonical_form(raw));
                 let alias = canonical != raw
                     && self
                         .0
@@ -1386,11 +1389,15 @@ impl SymbolicReasoner {
                         .synonyms()
                         .get(raw)
                         .is_some_and(|target| target == &canonical);
-                let exact = self.0.predictor.has_predicate(raw)
+                let exact = aligned.is_some()
+                    || self.0.predictor.has_predicate(raw)
                     || self.0.aligner.kind_of(raw) == Some(TermKind::Relation)
                     || self.0.inverse_query_map.contains_key(raw)
                     || alias;
-                exact.then(|| self.0.resolve_question_predicate(raw).0)
+                exact.then(|| {
+                    let base = if aligned.is_some() { canonical.as_str() } else { raw };
+                    self.0.resolve_question_predicate(base).0
+                })
             }
         }
 
@@ -3390,6 +3397,16 @@ impl SymbolicReasoner {
         if self.inverse_query_map.contains_key(raw) {
             return Some(raw.to_string());
         }
+        if let Some(aligned) = self.alignment_predicate_canonicalize(raw) {
+            let known = matches!(
+                self.aligner.kind_of(&aligned),
+                Some(TermKind::Relation) | Some(TermKind::Attribute)
+            ) || self.predictor.has_predicate(&aligned)
+                || self.inverse_query_map.contains_key(aligned.as_str());
+            if known {
+                return Some(aligned);
+            }
+        }
         let canonical = self.aligner.canonical_form(raw);
         if self.inverse_query_map.contains_key(canonical.as_str()) {
             return Some(canonical);
@@ -3833,6 +3850,70 @@ impl SymbolicReasoner {
             resolve,
             type_of,
         )
+    }
+
+    /// 单次谓词侧对齐：把用户说法收束到已登记的关系/属性名。
+    pub fn alignment_predicate_canonicalize(&self, surface: &str) -> Option<String> {
+        let surface = surface.trim();
+        if surface.is_empty() {
+            return None;
+        }
+        let turn = self.linker.alignment().turn;
+        let resolve = |candidate: &str| -> Vec<String> {
+            let known = self.aligner.kind_of(candidate) == Some(TermKind::Relation)
+                || self.aligner.kind_of(candidate) == Some(TermKind::Attribute)
+                || self.predictor.has_predicate(candidate)
+                || self.inverse_query_map.contains_key(candidate);
+            (known && !candidate.trim().is_empty())
+                .then(|| vec![candidate.to_string()])
+                .unwrap_or_default()
+        };
+        let type_of = |_candidate: &str| -> Option<String> { None };
+        self.linker
+            .alignment()
+            .canonicalize_with(surface, AlignmentKind::Predicate, turn, resolve, type_of)
+            .map(|matched| matched.canonical)
+    }
+
+    /// 把问句中的会话谓词说法替换为已登记谓词；未知实体词面不参与改写。
+    fn rewrite_predicate_alignment(&self, text: &str) -> Option<String> {
+        let turn = self.linker.alignment().turn;
+        let resolve = |candidate: &str| -> Vec<String> {
+            let known = self.aligner.kind_of(candidate) == Some(TermKind::Relation)
+                || self.aligner.kind_of(candidate) == Some(TermKind::Attribute)
+                || self.predictor.has_predicate(candidate)
+                || self.inverse_query_map.contains_key(candidate);
+            (known && !candidate.trim().is_empty())
+                .then(|| vec![candidate.to_string()])
+                .unwrap_or_default()
+        };
+        let type_of = |_candidate: &str| -> Option<String> { None };
+        let spans: Vec<_> = self
+            .linker
+            .alignment()
+            .mention_spans_with(text, AlignmentKind::Predicate, turn, resolve, type_of)
+            .into_iter()
+            .filter(|matched| !self.is_known_entity(&matched.surface))
+            .collect();
+        if spans.is_empty() {
+            return None;
+        }
+        let mut chars: Vec<char> = text.chars().collect();
+        let mut spans = spans;
+        spans.sort_by(|left, right| right.start.cmp(&left.start));
+        for matched in spans {
+            if matched.end > chars.len()
+                || matched.start > matched.end
+                || matched.surface.chars().count() != matched.end - matched.start
+            {
+                continue;
+            }
+            chars.splice(
+                matched.start..matched.end,
+                matched.canonical.chars(),
+            );
+        }
+        Some(chars.into_iter().collect())
     }
 
     /// 交互入口：镜像对齐的查看、教学、否证、查询与反向选面。
@@ -10895,8 +10976,10 @@ impl SymbolicReasoner {
     }
 
     pub fn answer(&self, question: &str) -> Option<String> {
+        let rewritten = self.rewrite_predicate_alignment(question);
+        let normalized = rewritten.as_deref().unwrap_or(question);
         let answer = self
-            .answer_impl(question)
+            .answer_impl(normalized)
             .map(|answer| self.annotate_assumption_world(answer));
         if answer.is_none() {
             // 只观测失败：成功轮不做额外分词，回答内容与原有路径逐字节一致。
@@ -10910,6 +10993,8 @@ impl SymbolicReasoner {
     /// 对话层用它与恢复阶梯衔接：确证失败后由 L2 提名、验证、追问，
     /// 而不是把候选列表直接当结论输出。
     pub fn answer_certain(&self, question: &str) -> Option<String> {
+        let rewritten = self.rewrite_predicate_alignment(question);
+        let question = rewritten.as_deref().unwrap_or(question);
         // 情态问句的答案不是「确证事实」，但它把不确定性与阈值显式写在脸上；
         // 对话恢复层（answer_certain）同样必须看得见它，否则「可能」会被
         // 悄悄降级成普通确证回答。
@@ -23500,6 +23585,24 @@ types = [
         assert!(reasoner
             .alignment_canonicalize("张三公司")
             .is_none(), "组织后缀不得套到人物身上，除非同形规则另有类型锚点");
+    }
+
+    #[test]
+    fn predicate_alignment_feeds_query_normalization() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let receipt = reasoner.learn_predicate_alignment("恩师", "师傅");
+        assert!(receipt.contains("已记住"), "{}", receipt);
+        assert_eq!(
+            reasoner.alignment_predicate_canonicalize("恩师").as_deref(),
+            Some("师傅")
+        );
+        assert_eq!(
+            reasoner.canonical_attribute("恩师").as_deref(),
+            Some("师傅")
+        );
+        let answer = reasoner.answer("张三的恩师是谁").expect("谓词对齐应参与问句");
+        assert!(answer.contains("李四"), "{}", answer);
     }
 
     #[test]
