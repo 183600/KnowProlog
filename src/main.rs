@@ -212,6 +212,31 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or extend the persistent predicate registry: observed
+    /// predicates, pending admissions, aliases, inverses and functional marks
+    Predicates {
+        /// Print the registry and the applied edits as JSON
+        #[arg(long)]
+        json: bool,
+        /// Confirm a pending predicate (repeatable)
+        #[arg(long = "confirm", value_name = "PREDICATE")]
+        confirm: Vec<String>,
+        /// Reject a pending predicate and remove its triples (repeatable)
+        #[arg(long = "reject", value_name = "PREDICATE")]
+        reject: Vec<String>,
+        /// Register an alias: ALIAS=CANONICAL (repeatable)
+        #[arg(long = "alias", value_name = "ALIAS=CANONICAL")]
+        alias: Vec<String>,
+        /// Register inverse predicates: LEFT=RIGHT (repeatable)
+        #[arg(long = "inverse", value_name = "LEFT=RIGHT")]
+        inverse: Vec<String>,
+        /// Mark predicates as functional, i.e. one value per subject (repeatable)
+        #[arg(long = "functional", value_name = "PREDICATE")]
+        functional: Vec<String>,
+        /// Clear the functional mark (repeatable)
+        #[arg(long = "non-functional", value_name = "PREDICATE")]
+        non_functional: Vec<String>,
+    },
     /// Inspect or extend the persistent lexical memory: POS evidence and
     /// classifier→type expectations stored in their own named graph
     LexicalMemory {
@@ -1351,6 +1376,31 @@ async fn main() {
                     }
                 }
             }
+        }
+        Some(Commands::Predicates {
+            json,
+            confirm,
+            reject,
+            alias,
+            inverse,
+            functional,
+            non_functional,
+        }) => {
+            run_predicates(
+                &config,
+                &oxigraph_manager,
+                &store_path,
+                PredicateEdits {
+                    confirm,
+                    reject,
+                    alias,
+                    inverse,
+                    functional,
+                    non_functional,
+                },
+                json,
+            )
+            .await;
         }
         Some(Commands::LexicalMemory {
             learn,
@@ -3469,6 +3519,204 @@ async fn run_fuse(
         }
     }
     Ok(())
+}
+
+/// 谓词注册表的命令行编辑集（每项都可重复，空集合表示只读查看）。
+struct PredicateEdits {
+    confirm: Vec<String>,
+    reject: Vec<String>,
+    alias: Vec<String>,
+    inverse: Vec<String>,
+    functional: Vec<String>,
+    non_functional: Vec<String>,
+}
+
+impl PredicateEdits {
+    fn is_empty(&self) -> bool {
+        self.confirm.is_empty()
+            && self.reject.is_empty()
+            && self.alias.is_empty()
+            && self.inverse.is_empty()
+            && self.functional.is_empty()
+            && self.non_functional.is_empty()
+    }
+}
+
+/// 解析 `左=右` 形式的谓词对；任一侧为空或缺少分隔符时返回 None。
+fn parse_predicate_spec(spec: &str) -> Option<(&str, &str)> {
+    let (left, right) = spec.split_once('=')?;
+    let left = left.trim();
+    let right = right.trim();
+    (!left.is_empty() && !right.is_empty() && left != right).then_some((left, right))
+}
+
+/// `predicates`：把交互模式的谓词准入/别名/互逆/功能标记开放给脚本。
+///
+/// 与交互模式同一装配顺序（先加载持久注册表，再叠加 config 声明），
+/// 修改后立即原子落盘；只读查看不写任何文件。拒绝会删除该谓词的三元组，
+/// 因此报告里逐条给出实际移除数量。
+async fn run_predicates(
+    config: &SystemConfig,
+    manager: &OxigraphManager,
+    store_path: &str,
+    edits: PredicateEdits,
+    json: bool,
+) {
+    let registry_path = format!("{}/predicate_registry.json", store_path);
+    let _ = manager.load_predicate_registry(&registry_path);
+    manager.configure_predicates(
+        &config.predicate_profiles,
+        config.reasoning.require_predicate_admission,
+    );
+    if let Err(error) = manager.refresh_predicate_registry().await {
+        eprintln!("刷新谓词画像失败: {}", error);
+        std::process::exit(1);
+    }
+
+    let mut confirmed = Vec::new();
+    let mut rejected = Vec::new();
+    let mut aliases = Vec::new();
+    let mut inverses = Vec::new();
+    let mut functional = Vec::new();
+    let mut invalid = Vec::new();
+
+    for predicate in &edits.confirm {
+        let name = predicate.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let changed = manager.confirm_predicate(name);
+        confirmed.push((name.to_string(), changed));
+    }
+    for predicate in &edits.reject {
+        let name = predicate.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match manager.reject_predicate(name).await {
+            Ok(removed) => rejected.push((name.to_string(), removed)),
+            Err(error) => {
+                eprintln!("拒绝谓词「{}」失败: {}", name, error);
+                std::process::exit(1);
+            }
+        }
+    }
+    for spec in &edits.alias {
+        match parse_predicate_spec(spec) {
+            Some((alias, canonical)) => {
+                let changed = manager.register_predicate_alias(alias, canonical);
+                aliases.push((alias.to_string(), canonical.to_string(), changed));
+            }
+            None => invalid.push(format!("alias:{}", spec)),
+        }
+    }
+    for spec in &edits.inverse {
+        match parse_predicate_spec(spec) {
+            Some((left, right)) => {
+                let changed = manager.register_predicate_inverse(left, right);
+                inverses.push((left.to_string(), right.to_string(), changed));
+            }
+            None => invalid.push(format!("inverse:{}", spec)),
+        }
+    }
+    for predicate in &edits.functional {
+        let name = predicate.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let changed = manager.mark_predicate_functional(name, true);
+        functional.push((name.to_string(), true, changed));
+    }
+    for predicate in &edits.non_functional {
+        let name = predicate.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let changed = manager.mark_predicate_functional(name, false);
+        functional.push((name.to_string(), false, changed));
+    }
+
+    if !invalid.is_empty() {
+        for spec in &invalid {
+            eprintln!("无法解析谓词对「{}」（应为 左=右）", spec);
+        }
+        std::process::exit(1);
+    }
+
+    let mutated = !edits.is_empty();
+    if mutated {
+        if let Err(error) = manager.save_predicate_registry(&registry_path) {
+            eprintln!("保存谓词画像失败（{}）：{}", registry_path, error);
+            std::process::exit(1);
+        }
+    }
+
+    let registry = manager.predicate_registry_snapshot();
+    if json {
+        let registry_json: serde_json::Value =
+            serde_json::from_str(&registry.to_json()).unwrap_or(serde_json::Value::Null);
+        let payload = serde_json::json!({
+            "registry": registry_json,
+            "findings": registry.findings_report(),
+            "edits": {
+                "confirmed": confirmed,
+                "rejected": rejected,
+                "aliases": aliases,
+                "inverses": inverses,
+                "functional": functional,
+                "saved": mutated,
+            },
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("JSON 序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if mutated {
+        for (name, changed) in &confirmed {
+            println!(
+                "{}谓词「{}」{}",
+                if *changed { "已确认" } else { "无需确认" },
+                name,
+                if *changed { "。" } else { "（不是待确认谓词）。" }
+            );
+        }
+        for (name, removed) in &rejected {
+            println!("已拒绝谓词「{}」，移除 {} 条三元组。", name, removed);
+        }
+        for (alias, canonical, changed) in &aliases {
+            println!(
+                "{}别名「{}」→「{}」。",
+                if *changed { "已登记" } else { "未变更" },
+                alias,
+                canonical
+            );
+        }
+        for (left, right, changed) in &inverses {
+            println!(
+                "{}互逆谓词「{}」↔「{}」。",
+                if *changed { "已登记" } else { "未变更" },
+                left,
+                right
+            );
+        }
+        for (name, functional, changed) in &functional {
+            println!(
+                "{}「{}」的功能谓词标记{}。",
+                if *changed { "已设置" } else { "未变更" },
+                name,
+                if *functional { "" } else { "（已取消）" }
+            );
+        }
+        println!();
+    }
+    println!("{}", registry.report());
+    println!("{}", registry.findings_report());
 }
 
 async fn run_batch_import(
@@ -9082,7 +9330,7 @@ async fn run_interactive_mode(
                 "同义谓词:",
             ],
         ) {
-            match parse_predicate_pair(spec) {
+            match parse_predicate_spec(spec) {
                 Some((alias, canonical)) => {
                     if oxigraph_manager.register_predicate_alias(&alias, &canonical) {
                         sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
@@ -9115,7 +9363,7 @@ async fn run_interactive_mode(
                 "互逆谓词:",
             ],
         ) {
-            match parse_predicate_pair(spec) {
+            match parse_predicate_spec(spec) {
                 Some((left, right)) => {
                     if oxigraph_manager.register_predicate_inverse(&left, &right) {
                         sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
@@ -9170,7 +9418,7 @@ async fn run_interactive_mode(
 
         // 实体身份：确认/拒绝/记住/忘记/合并/铸造检查（谓词注册表的实体侧对偶）
         if let Some(spec) = strip_any_prefix(input, &["确认身份：", "确认身份:"]) {
-            match parse_predicate_pair(spec) {
+            match parse_predicate_spec(spec) {
                 Some((surface, canonical)) => {
                     if oxigraph_manager.confirm_entity_alias(&surface, &canonical) {
                         symbolic_reasoner.register_entity_alias(&surface, &canonical);
@@ -9190,7 +9438,7 @@ async fn run_interactive_mode(
         }
 
         if let Some(spec) = strip_any_prefix(input, &["记住身份：", "记住身份:"]) {
-            match parse_predicate_pair(spec) {
+            match parse_predicate_spec(spec) {
                 Some((surface, canonical)) => {
                     if oxigraph_manager.confirm_entity_alias(&surface, &canonical) {
                         symbolic_reasoner.register_entity_alias(&surface, &canonical);
@@ -9210,7 +9458,7 @@ async fn run_interactive_mode(
         }
 
         if let Some(spec) = strip_any_prefix(input, &["拒绝身份：", "拒绝身份:"]) {
-            match parse_predicate_pair(spec) {
+            match parse_predicate_spec(spec) {
                 Some((surface, canonical)) => {
                     if oxigraph_manager.reject_entity_alias(&surface, &canonical) {
                         let _ = oxigraph_manager.save_entity_registry(&entity_registry_path);
@@ -9250,7 +9498,7 @@ async fn run_interactive_mode(
         }
 
         if let Some(spec) = strip_any_prefix(input, &["合并身份：", "合并身份:"]) {
-            match parse_predicate_pair(spec) {
+            match parse_predicate_spec(spec) {
                 Some((from, into)) => {
                     match oxigraph_manager.merge_entity_identities(&from, &into) {
                         Ok(record) => {
@@ -13275,6 +13523,56 @@ mod session_tests {
             assert!(is_ask_terminator(terminator), "{}", terminator);
         }
         assert!(!is_ask_terminator("为什么退出假设"));
+    }
+
+    #[test]
+    fn predicates_cli_parses_repeatable_edits() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "predicates",
+            "--confirm",
+            "认识",
+            "--reject",
+            "噪音",
+            "--alias",
+            "老师=师傅",
+            "--inverse",
+            "师从=徒弟",
+            "--functional",
+            "年龄",
+            "--non-functional",
+            "别名",
+            "--json",
+        ])
+        .expect("predicates 参数应可解析");
+        match cli.command {
+            Some(Commands::Predicates {
+                json,
+                confirm,
+                reject,
+                alias,
+                inverse,
+                functional,
+                non_functional,
+            }) => {
+                assert!(json);
+                assert_eq!(confirm, vec!["认识"]);
+                assert_eq!(reject, vec!["噪音"]);
+                assert_eq!(alias, vec!["老师=师傅"]);
+                assert_eq!(inverse, vec!["师从=徒弟"]);
+                assert_eq!(functional, vec!["年龄"]);
+                assert_eq!(non_functional, vec!["别名"]);
+            }
+            _ => panic!("应解析为 Predicates 子命令"),
+        }
+        assert_eq!(
+            parse_predicate_spec("老师=师傅"),
+            Some(("老师", "师傅"))
+        );
+        assert_eq!(parse_predicate_spec("老师"), None);
+        assert_eq!(parse_predicate_spec("=师傅"), None);
+        assert_eq!(parse_predicate_spec("老师="), None);
+        assert_eq!(parse_predicate_spec("老师=老师"), None);
     }
 
     #[test]
