@@ -19,6 +19,7 @@ use know_prolog::{
     conversation_theory::{self, ConversationTheory},
     create_default_synonyms,
     dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
+    derivation::Derivation,
     detect_input_mode,
     dialogue_eval::{
         compare_baseline as compare_dialogue_baseline, evaluate_seed_with, DialogueEvalBaseline,
@@ -185,6 +186,10 @@ enum Commands {
         /// Exit non-zero when any question is left unanswered
         #[arg(long)]
         strict: bool,
+        /// Attach a bounded formal derivation (proof steps / failure frontier)
+        /// to every answered question; answers without a resolution proof say so
+        #[arg(long)]
+        explain: bool,
     },
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
@@ -1454,6 +1459,7 @@ async fn main() {
             question,
             json,
             strict,
+            explain,
         }) => {
             run_ask(
                 &config,
@@ -1463,6 +1469,7 @@ async fn main() {
                 question,
                 json,
                 strict,
+                explain,
             )
             .await;
         }
@@ -4651,6 +4658,9 @@ struct AskAnswer {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     answer: Option<String>,
+    /// 以当前知识版本重建的有界推导；None 表示这条回答没有可展开的归结证明。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derivation: Option<Derivation>,
 }
 
 fn is_ask_terminator(question: &str) -> bool {
@@ -4768,6 +4778,7 @@ async fn run_ask(
     question: Option<String>,
     json: bool,
     strict: bool,
+    explain: bool,
 ) {
     let facts = match serve_facts(oxigraph_manager).await {
         Ok(facts) => facts,
@@ -4854,6 +4865,7 @@ async fn run_ask(
                     question,
                     status: "answered",
                     answer: Some(deferred),
+                    derivation: None,
                 });
                 continue;
             }
@@ -4902,6 +4914,14 @@ async fn run_ask(
                 reasoner.dismiss_pending_question(&question);
             }
         }
+        // 追问依据是惰性通道：--explain 才重建推导，回答热路径保持零开销。
+        let derivation = if explain {
+            answer
+                .as_deref()
+                .and_then(|text| reasoner.answer_derivation(&question, Some(text)))
+        } else {
+            None
+        };
         answers.push(AskAnswer {
             question,
             status: if answer.is_some() {
@@ -4910,6 +4930,7 @@ async fn run_ask(
                 "unanswered"
             },
             answer,
+            derivation,
         });
     }
 
@@ -4930,6 +4951,11 @@ async fn run_ask(
             match &answer.answer {
                 Some(text) => println!("{}", text),
                 None => println!("未能回答：当前知识库中没有可用依据。"),
+            }
+            if let Some(derivation) = &answer.derivation {
+                println!("{}", derivation.render_explanation());
+            } else if explain && answer.answer.is_some() {
+                println!("（没有可展开的归结证明：这条回答来自检索、生成或对话通道。）");
             }
         }
     }
@@ -13218,6 +13244,7 @@ mod session_tests {
             "张三的师傅是谁",
             "--json",
             "--strict",
+            "--explain",
         ])
         .expect("ask 参数应可解析");
         match cli.command {
@@ -13225,10 +13252,12 @@ mod session_tests {
                 question,
                 json,
                 strict,
+                explain,
             }) => {
                 assert_eq!(question.as_deref(), Some("张三的师傅是谁"));
                 assert!(json);
                 assert!(strict);
+                assert!(explain);
             }
             _ => panic!("应解析为 Ask 子命令"),
         }
@@ -13238,7 +13267,8 @@ mod session_tests {
             Some(Commands::Ask {
                 question: None,
                 json: false,
-                strict: false
+                strict: false,
+                explain: false
             })
         ));
         for terminator in ["quit", "exit", "退出", "q", " 退出 "] {

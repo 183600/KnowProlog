@@ -6004,7 +6004,8 @@ impl SymbolicReasoner {
         let (phrase, goals) = match plan {
             QueryPlan::FindObjectByPredicate { subject, predicate } => {
                 let entity = self.resolve_known_entity(subject)?;
-                let (slot, inverted) = self.resolve_question_predicate(predicate);
+                let (raw_slot, inverted) = self.resolve_question_predicate(predicate);
+                let slot = self.proof_predicate_slot(predicate, &raw_slot, inverted);
                 if slot.is_empty() {
                     return None;
                 }
@@ -6017,7 +6018,8 @@ impl SymbolicReasoner {
             }
             QueryPlan::FindSubject { object, predicate } => {
                 let target = self.resolve_known_entity(object)?;
-                let (slot, inverted) = self.resolve_question_predicate(predicate);
+                let (raw_slot, inverted) = self.resolve_question_predicate(predicate);
+                let slot = self.proof_predicate_slot(predicate, &raw_slot, inverted);
                 if slot.is_empty() {
                     return None;
                 }
@@ -6041,7 +6043,8 @@ impl SymbolicReasoner {
                 }
                 let subject = self.resolve_known_entity(subject)?;
                 let object = self.resolve_known_entity(object)?;
-                let (slot, inverted) = self.resolve_question_predicate(predicate);
+                let (raw_slot, inverted) = self.resolve_question_predicate(predicate);
+                let slot = self.proof_predicate_slot(predicate, &raw_slot, inverted);
                 if slot.is_empty() {
                     return None;
                 }
@@ -6072,15 +6075,37 @@ impl SymbolicReasoner {
             } else {
                 Term::var(&format!("V{}", index + 1))
             };
+            let slot = self.proof_predicate_slot(&predicate.surface, &predicate.slot, predicate.inverted);
             let atom = if predicate.inverted {
-                Atom::pattern(&predicate.slot, next.clone(), previous.clone())
+                Atom::pattern(&slot, next.clone(), previous.clone())
             } else {
-                Atom::pattern(&predicate.slot, previous.clone(), next.clone())
+                Atom::pattern(&slot, previous.clone(), next.clone())
             };
             goals.push(atom);
             previous = next;
         }
         goals
+    }
+
+    /// 证明视图里的谓词落键：图谱常把属性存成英文键（JSON-LD 的 age/height），
+    /// 用户却按中文词面（年龄/身高）提问。只有当原槽位在归结知识库里完全没有
+    /// 事实与规则时，才回退到对照表的规范键，避免覆盖真实的中文谓词。
+    fn proof_predicate_slot(&self, surface: &str, slot: &str, inverted: bool) -> String {
+        if inverted || slot.is_empty() {
+            return slot.to_string();
+        }
+        if !self.resolver.facts_for(slot).is_empty() || !self.resolver.clauses_for(slot).is_empty()
+        {
+            return slot.to_string();
+        }
+        if let Some(canonical) = crate::symbolic_generator::canonical_predicate_key(surface) {
+            if !self.resolver.facts_for(canonical).is_empty()
+                || !self.resolver.clauses_for(canonical).is_empty()
+            {
+                return canonical.to_string();
+            }
+        }
+        slot.to_string()
     }
 
     /// 把三态搜索结论与同树失败前沿附在推理报告后面：不把截断伪装成「不存在」。
@@ -17464,6 +17489,34 @@ types = [
             profile.contains("零幻觉"),
             "裸谓词生成应通过自检：{}",
             profile
+        );
+    }
+
+    /// 英文属性键存图时，「证明/为什么」通道也必须按中文词面找到同一事实，
+    /// 不能出现「回答有值、推导却说无解」的自相矛盾。
+    #[test]
+    fn test_derivation_proves_chinese_label_of_english_attribute() {
+        let facts = vec![PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "person".to_string(),
+            properties: HashMap::from([
+                ("name".to_string(), "张三".to_string()),
+                ("age".to_string(), "25".to_string()),
+            ]),
+        }];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let derivation = reasoner
+            .answer_derivation("张三的年龄是多少", Some("25"))
+            .expect("年龄问句应能形式化");
+        assert!(derivation.is_proved(), "{:?}", derivation);
+        assert!(
+            derivation
+                .steps
+                .iter()
+                .any(|step| step.canonical.contains("age")),
+            "证明应引用图谱里的 age 事实：{:?}",
+            derivation
         );
     }
 
