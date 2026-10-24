@@ -8881,6 +8881,20 @@ async fn run_interactive_mode(
             }
         }
 
+        // 镜像对齐：会话级词形规则（用户说法 ↔ 规范身份），可正读、可反写。
+        if input.contains("对齐")
+            || input.contains("镜像记忆")
+            || input.starts_with("镜像查询")
+            || input.starts_with("镜像答法")
+        {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            if let Some(text) = symbolic_reasoner.handle_alignment_command(input) {
+                println!("{}", text);
+                println!();
+                continue;
+            }
+        }
+
         // 补全回合：打开一次可确认、可归纳、可批量闭包的学习回合。
         // 解析与 HTTP 服务共用同一入口，避免两套命令文法漂移。
         if input.contains("补全") || input.starts_with("学习回合") {
@@ -10681,6 +10695,8 @@ async fn run_interactive_mode(
                         }
                         Some(ClarifyAct::Correct { to, .. }) => {
                             crd_ledger.correct(&pending.key, &to, &format!("澄清纠正：{}", input));
+                            let _ = symbolic_reasoner
+                                .learn_entity_alignment(&pending.mention, &to);
                             println!("（语境纠错：{} ⇒ {}）", pending.mention, to);
                             crd_input = Some(rewrite_at(
                                 &pending.original_input,
@@ -12147,6 +12163,10 @@ fn interactive_help() -> String {
         "  晋升补全规则：<id>|<作用域>           命名空间留在回合内；只有「全局」进入全局归结",
         "  退役补全规则：<id> / 恢复补全规则：<id>  停用或恢复规则；已确认的会话事实保留",
         "  对齐报告 / 对齐候选：<术语>          本体对齐、候选格与答案等价性",
+        "  对齐记忆 / 镜像对齐                  会话级可逆词形规则、类型守卫与回声词面",
+        "  对齐纠正：<用户词面> = <规范身份>     从一次纠正归纳词形（落地 + 类型守卫后才生效）",
+        "  对齐谓词：<说法> = <规范谓词>         记住谓词侧的镜像说法（会话级）",
+        "  对齐否决：<词面> = <身份> / 对齐查询：<词面> / 对齐答法：<身份>  否证、前向复核、反向选面",
         "  覆盖报告 / 质量护照                   覆盖缺口与数据质量",
         "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
         "  获取缺口 / 获取模式 / 模式扫描：…    形状缺口转追问、诱导模式库与文本扫描",
@@ -12453,6 +12473,20 @@ fn is_command_like(input: &str) -> bool {
         "对齐报告",
         "本体对齐",
         "对齐候选",
+        "对齐记忆",
+        "镜像对齐",
+        "对齐台账",
+        "镜像记忆",
+        "词形对齐",
+        "对齐纠正",
+        "对齐谓词",
+        "谓词对齐",
+        "对齐否决",
+        "否证对齐",
+        "对齐查询",
+        "镜像查询",
+        "对齐答法",
+        "镜像答法",
         "推理规则",
         "链接预测规则",
         "实体链接",

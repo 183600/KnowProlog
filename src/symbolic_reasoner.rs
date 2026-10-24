@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::alignment_memory::{AlignmentKind, AlignmentMemory, AlignmentScope, LearnOutcome};
 use crate::abduction::{
     self, AbductionEngine, AbductionReport, ClarificationReply, ClarificationSession, Hypothesis,
     HypothesisKind, Scenario,
@@ -594,6 +595,9 @@ pub struct DialogueSnapshot {
     pub last_abduction_goal: Vec<SnapshotClauseAtom>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_abduction_vars: Vec<String>,
+    // 会话级镜像对齐（词形规则 + 回声词面）；空记忆不落盘，旧快照字节不变
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<AlignmentMemory>,
 }
 
 /// 概率降序、同概率按显示串升序的排序键
@@ -827,6 +831,7 @@ impl DialogueContext {
             clarification: None,
             last_abduction_goal: Vec::new(),
             last_abduction_vars: Vec::new(),
+            alignment: None,
         }
     }
 
@@ -3525,6 +3530,13 @@ impl SymbolicReasoner {
                 found.push((alias.chars().count(), canonical.clone()));
             }
         }
+        // 镜像对齐指称：整段词面（如「远山科技公司」）已在链接器里落地到
+        // 已知身份；这里同步进实体提及，让上下文焦点与问答计划看到同一结果。
+        for mention in self.linker.alignment_mentions(text) {
+            if let Some(best) = mention.best() {
+                found.push((mention.mention.chars().count(), best.entity.clone()));
+            }
+        }
         found.sort_by(|a, b| b.0.cmp(&a.0));
         let mut seen = HashSet::new();
         found
@@ -3663,6 +3675,261 @@ impl SymbolicReasoner {
         let admitted = self.linker.admit_entity(surface)?;
         self.link_memo.lock().clear();
         Some(admitted)
+    }
+
+    /// 会话级镜像对齐报告：规则、类型守卫、否证墓碑与回声词面。
+    pub fn alignment_memory_report(&self) -> String {
+        self.linker.alignment().render_report()
+    }
+
+    /// 解析一个可落地锚点：规范名本身或唯一别名；歧义/未登记返回 None。
+    fn alignment_anchor(&self, surface: &str) -> Option<String> {
+        let surface = surface.trim();
+        if surface.is_empty() {
+            return None;
+        }
+        if self.linker.is_known_entity(surface) {
+            return Some(surface.to_string());
+        }
+        let mut candidates: Vec<String> = self
+            .linker
+            .surface_candidates(surface)
+            .into_iter()
+            .map(|candidate| candidate.entity)
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        (candidates.len() == 1).then(|| candidates.remove(0))
+    }
+
+    /// 学习一次实体词形对齐（会话级）。返回人类可读回执。
+    pub fn learn_entity_alignment(&mut self, surface: &str, canonical: &str) -> String {
+        self.learn_alignment_with_kind(surface, canonical, AlignmentKind::Entity)
+    }
+
+    /// 学习一次谓词词形对齐（会话级；只影响对齐记忆本身与审计）。
+    pub fn learn_predicate_alignment(&mut self, surface: &str, canonical: &str) -> String {
+        self.learn_alignment_with_kind(surface, canonical, AlignmentKind::Predicate)
+    }
+
+    fn learn_alignment_with_kind(
+        &mut self,
+        surface: &str,
+        canonical: &str,
+        kind: AlignmentKind,
+    ) -> String {
+        let surface = surface.trim();
+        if surface.is_empty() {
+            return "请给出用户词面，例如：对齐纠正：未名科技公司 = 未名科技".to_string();
+        }
+        let anchor = match kind {
+            AlignmentKind::Entity => self.alignment_anchor(canonical),
+            AlignmentKind::Predicate => {
+                let canonical = self.aligner.canonical_form(canonical);
+                (self.aligner.kind_of(&canonical) == Some(TermKind::Relation))
+                    .then_some(canonical)
+            }
+            AlignmentKind::Type => {
+                let canonical = self.aligner.canonical_form(canonical);
+                (self.aligner.kind_of(&canonical) == Some(TermKind::Type)).then_some(canonical)
+            }
+        };
+        let Some(canonical) = anchor else {
+            return format!(
+                "对齐未生效：「{}」不是已确认的{}身份（落地律要求结果必须能被现有词表接住）。",
+                canonical.trim(),
+                kind.label()
+            );
+        };
+        let expected_type = match kind {
+            AlignmentKind::Entity => self
+                .linker
+                .entity_type(&canonical)
+                .map(str::to_string)
+                .or_else(|| self.generator.entity_type_of(&canonical).map(str::to_string)),
+            _ => None,
+        };
+        let turn = self.linker.alignment().turn.saturating_add(1);
+        let scope = AlignmentScope::Session;
+        let outcome = self.linker.learn_alignment(
+            turn,
+            surface,
+            &canonical,
+            kind,
+            expected_type.as_deref(),
+            "会话纠正",
+            scope,
+        );
+        if outcome.changed() {
+            self.link_memo.lock().clear();
+            self.entity_mentions_memo.lock().clear();
+        }
+        match outcome {
+            LearnOutcome::Learned { rule_id, created } => format!(
+                "{}镜像对齐：{}「{}」⇒「{}」（规则 {}，类型守卫 {}）。",
+                if created { "已记住" } else { "已加强" },
+                kind.label(),
+                surface,
+                canonical,
+                rule_id,
+                expected_type.as_deref().unwrap_or("未声明")
+            ),
+            LearnOutcome::Refuted { rule_id } => format!(
+                "「{}」⇒「{}」的规则 {} 已被否证；本次只记支持，不复活墓碑（可用「对齐查询」复核）。",
+                surface, canonical, rule_id
+            ),
+            LearnOutcome::Conflict { existing } => format!(
+                "对齐冲突：「{}」已被规则 {} 指向另一个身份；未静默替换，请先用「对齐否决」清理旧规则。",
+                surface, existing
+            ),
+            LearnOutcome::Unchanged => format!("「{}」与「{}」相同或无法形成词形规则。", surface, canonical),
+        }
+    }
+
+    /// 反向选面：生成端用用户自己的说法，且选择的词面必须能再对齐回原身份。
+    pub fn alignment_surface_choice(&self, canonical: &str) -> Option<(String, String)> {
+        let canonical = self.alignment_anchor(canonical)?;
+        let turn = self.linker.alignment().turn;
+        let resolve = |surface: &str| -> Vec<String> {
+            let mut entities: Vec<String> = self
+                .linker
+                .surface_candidates(surface)
+                .into_iter()
+                .map(|candidate| candidate.entity)
+                .collect();
+            entities.sort();
+            entities.dedup();
+            entities
+        };
+        let type_of = |entity: &str| -> Option<String> {
+            self.linker.entity_type(entity).map(str::to_string)
+        };
+        self.linker
+            .alignment()
+            .surface_for_with(&canonical, turn, resolve, type_of)
+    }
+
+    /// 单次前向对齐查询（供交互命令/生成复核使用）。
+    pub fn alignment_canonicalize(&self, surface: &str) -> Option<crate::alignment_memory::AlignmentMatch> {
+        let turn = self.linker.alignment().turn;
+        let resolve = |candidate: &str| -> Vec<String> {
+            let mut entities: Vec<String> = self
+                .linker
+                .surface_candidates(candidate)
+                .into_iter()
+                .map(|linked| linked.entity)
+                .collect();
+            entities.sort();
+            entities.dedup();
+            entities
+        };
+        let type_of = |entity: &str| -> Option<String> {
+            self.linker.entity_type(entity).map(str::to_string)
+        };
+        self.linker.alignment().canonicalize_with(
+            surface,
+            AlignmentKind::Entity,
+            turn,
+            resolve,
+            type_of,
+        )
+    }
+
+    /// 交互入口：镜像对齐的查看、教学、否证、查询与反向选面。
+    pub fn handle_alignment_command(&mut self, input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if matches!(
+            trimmed,
+            "对齐记忆" | "镜像对齐" | "对齐台账" | "镜像记忆" | "词形对齐"
+        ) {
+            return Some(self.alignment_memory_report());
+        }
+        for prefix in ["对齐纠正：", "对齐纠正:", "镜像对齐：", "镜像对齐:", "对齐：", "对齐:"] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let Some((surface, canonical)) = parse_alignment_pair(spec) else {
+                    return Some(
+                        "请用「对齐纠正：用户词面 = 规范身份」的格式，例如：对齐纠正：未名科技公司 = 未名科技"
+                            .to_string(),
+                    );
+                };
+                return Some(self.learn_entity_alignment(surface, canonical));
+            }
+        }
+        for prefix in ["对齐谓词：", "对齐谓词:", "谓词对齐：", "谓词对齐:"] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let Some((surface, canonical)) = parse_alignment_pair(spec) else {
+                    return Some(
+                        "请用「对齐谓词：用户说法 = 规范谓词」的格式，例如：对齐谓词：老婆 = 妻子"
+                            .to_string(),
+                    );
+                };
+                return Some(self.learn_predicate_alignment(surface, canonical));
+            }
+        }
+        for prefix in ["对齐否决：", "对齐否决:", "否证对齐：", "否证对齐:"] {
+            if let Some(spec) = trimmed.strip_prefix(prefix) {
+                let Some((surface, canonical)) = parse_alignment_pair(spec) else {
+                    return Some("请用「对齐否决：用户词面 = 规范身份」的格式。".to_string());
+                };
+                let turn = self.linker.alignment().turn.saturating_add(1);
+                let count = self.linker.alignment_mut().refute_pair(turn, surface, canonical);
+                if count == 0 {
+                    self.link_memo.lock().clear();
+                    self.entity_mentions_memo.lock().clear();
+                    return Some(format!(
+                        "没有找到生效中的「{}」⇒「{}」对齐规则；无需否证。",
+                        surface.trim(),
+                        canonical.trim()
+                    ));
+                }
+                self.link_memo.lock().clear();
+                self.entity_mentions_memo.lock().clear();
+                return Some(format!(
+                    "已否证「{}」⇒「{}」的 {} 条对齐规则；墓碑保留，后续同类观察不会自动复活。",
+                    surface.trim(),
+                    canonical.trim(),
+                    count
+                ));
+            }
+        }
+        for prefix in ["对齐查询：", "对齐查询:", "镜像查询：", "镜像查询:"] {
+            if let Some(surface) = trimmed.strip_prefix(prefix) {
+                let surface = surface.trim();
+                return Some(match self.alignment_canonicalize(surface) {
+                    Some(matched) => format!(
+                        "「{}」⇒「{}」（规则 {}，支持 {}，{}）",
+                        matched.surface,
+                        matched.canonical,
+                        matched.rule_id,
+                        matched.support,
+                        matched.reason
+                    ),
+                    None => format!(
+                        "「{}」没有可落地的镜像对齐（未登记、歧义、类型不符或词面本身已是另一身份）。",
+                        surface
+                    ),
+                });
+            }
+        }
+        for prefix in ["对齐答法：", "对齐答法:", "镜像答法：", "镜像答法:"] {
+            if let Some(canonical) = trimmed.strip_prefix(prefix) {
+                let canonical = canonical.trim();
+                return Some(match self.alignment_surface_choice(canonical) {
+                    Some((surface, reason)) => format!(
+                        "生成端将用「{}」称呼「{}」（{}；可再对齐回同一身份）。",
+                        surface, canonical, reason
+                    ),
+                    None => format!(
+                        "「{}」没有可逆的镜像答法；生成端继续使用规范名。",
+                        canonical
+                    ),
+                });
+            }
+        }
+        None
     }
 
     /// 提及格全局解码报告（只读审计面：不改变实际链接路径）。
@@ -14516,6 +14783,8 @@ impl SymbolicReasoner {
             .map(snapshot_clause_atom)
             .collect();
         snapshot.last_abduction_vars = self.last_abduction_vars.clone();
+        snapshot.alignment = (!self.linker.alignment().is_empty())
+            .then(|| self.linker.alignment().clone());
         snapshot
     }
 
@@ -14599,6 +14868,11 @@ impl SymbolicReasoner {
             self.sync_retrieval_type_hierarchy();
         }
         self.context.restore(snapshot);
+        // 镜像对齐：旧快照没有该字段时清空，避免把上一会话的词形规则串进来。
+        let alignment = snapshot.alignment.clone().unwrap_or_default();
+        *self.linker.alignment_mut() = alignment;
+        self.link_memo.lock().clear();
+        self.entity_mentions_memo.lock().clear();
         // 补全回合：先恢复台账，后续会话事实/规则重建时即可带上已晋升的全局规则。
         // 旧快照没有该字段时清空，避免把上一个会话的回合串进新会话。
         self.completion = snapshot.completion.clone().unwrap_or_default();
@@ -15036,6 +15310,19 @@ impl SymbolicReasoner {
         }
         output
     }
+}
+
+fn parse_alignment_pair(spec: &str) -> Option<(&str, &str)> {
+    let spec = spec.trim();
+    let (surface, canonical) = spec
+        .split_once('=')
+        .or_else(|| spec.split_once('＝'))
+        .or_else(|| spec.split_once("=>"))
+        .or_else(|| spec.split_once('⇒'))?;
+    let surface = surface.trim();
+    let canonical = canonical.trim();
+    (!surface.is_empty() && !canonical.is_empty() && surface != canonical)
+        .then_some((surface, canonical))
 }
 
 #[cfg(test)]
@@ -23150,6 +23437,112 @@ types = [
         assert!(follow.contains("PQI"), "{}", follow);
         assert!(follow.contains("知识概率"), "{}", follow);
         assert!(follow.contains("赵六"), "王五的师傅应为赵六：{}", follow);
+    }
+
+    fn alignment_facts() -> Vec<PrologFact> {
+        vec![
+            PrologFact::Entity {
+                name: "未名科技".to_string(),
+                entity_type: "组织".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "远山科技".to_string(),
+                entity_type: "组织".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn alignment_memory_teaches_and_links_unseen_surface() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        let receipt = reasoner.learn_entity_alignment("未名科技公司", "未名科技");
+        assert!(receipt.contains("已记住"), "{}", receipt);
+        assert!(reasoner.alignment_memory_report().contains("未名科技公司"));
+
+        let mentions = reasoner.linker().alignment_mentions("远山科技公司发布了新芯片");
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].mention, "远山科技公司");
+        assert_eq!(mentions[0].best().unwrap().entity, "远山科技");
+        assert_eq!(
+            mentions[0].best().unwrap().method,
+            LinkMethod::Alignment
+        );
+
+        let (surface, reason) = reasoner
+            .alignment_surface_choice("未名科技")
+            .expect("学过的规范身份应能反向选面");
+        assert_eq!(surface, "未名科技公司");
+        assert!(reason.contains("回声"));
+
+        assert!(reasoner
+            .alignment_canonicalize("张三公司")
+            .is_none(), "组织后缀不得套到人物身上，除非同形规则另有类型锚点");
+    }
+
+    #[test]
+    fn alignment_memory_survives_dialogue_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        reasoner.learn_entity_alignment("未名科技公司", "未名科技");
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(snapshot.alignment.is_some());
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&alignment_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("对齐记忆应可恢复");
+        let mentions = restored.linker().alignment_mentions("远山科技公司");
+        assert_eq!(mentions[0].best().unwrap().entity, "远山科技");
+        assert!(restored
+            .alignment_memory_report()
+            .contains("未名科技公司"));
+    }
+
+    #[test]
+    fn alignment_commands_query_refute_and_explain() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        let learned = reasoner
+            .handle_alignment_command("对齐纠正：未名科技公司 = 未名科技")
+            .unwrap();
+        assert!(learned.contains("已记住"), "{}", learned);
+
+        let query = reasoner
+            .handle_alignment_command("对齐查询：远山科技公司")
+            .unwrap();
+        assert!(query.contains("远山科技"), "{}", query);
+
+        let reverse = reasoner
+            .handle_alignment_command("对齐答法：未名科技")
+            .unwrap();
+        assert!(reverse.contains("未名科技公司"), "{}", reverse);
+
+        let refuted = reasoner
+            .handle_alignment_command("对齐否决：未名科技公司 = 未名科技")
+            .unwrap();
+        assert!(refuted.contains("已否证"), "{}", refuted);
+        let after = reasoner
+            .handle_alignment_command("对齐查询：远山科技公司")
+            .unwrap();
+        assert!(after.contains("没有可落地"), "{}", after);
+    }
+
+    #[test]
+    fn alignment_unknown_anchor_is_rejected() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&alignment_facts());
+        let receipt = reasoner.learn_entity_alignment("未名科技公司", "不存在公司");
+        assert!(receipt.contains("对齐未生效"), "{}", receipt);
+        assert!(reasoner.linker().alignment().is_empty());
     }
 
     #[test]
