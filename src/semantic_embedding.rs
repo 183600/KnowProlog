@@ -14,6 +14,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::schema_view::SchemaView;
+
 #[derive(Debug, Clone, Default)]
 struct EntityVector {
     weights: HashMap<Arc<str>, f64>,
@@ -36,6 +38,13 @@ pub struct SymbolicEmbedding {
     seen_triples: HashSet<(String, String, String)>,
     /// 已观测实体特征（实体, 特征名）：同上，实体事实重复观察亦不得抬高计数
     seen_entity_features: HashSet<(String, String)>,
+    /// 可选的 RDFS 模式视图：类型闭包、子属性上浮与定义域/值域投影的来源。
+    schema: Option<SchemaView>,
+    /// 原始观测（仅新事实），schema 变更后用于确定性重放。
+    observed_triples: Vec<(String, String, String)>,
+    observed_entities: Vec<(String, String, Vec<String>)>,
+    /// 已观测实体记录（名字, 类型, 排序去重后的属性）：重复观测不再入重放队列。
+    seen_entity_records: HashSet<(String, String, Vec<String>)>,
 }
 
 impl SymbolicEmbedding {
@@ -52,7 +61,69 @@ impl SymbolicEmbedding {
             max_features: 128,
             seen_triples: HashSet::new(),
             seen_entity_features: HashSet::new(),
+            schema: None,
+            observed_triples: Vec::new(),
+            observed_entities: Vec::new(),
+            seen_entity_records: HashSet::new(),
         }
+    }
+
+    /// 当前 RDFS 模式视图（未启用时返回 None）。
+    pub fn schema(&self) -> Option<&SchemaView> {
+        self.schema.as_ref()
+    }
+
+    /// 模式摘要：随模式内容变化，供调用方判断是否需要重放。
+    pub fn schema_digest(&self) -> Option<String> {
+        self.schema.as_ref().map(SchemaView::digest)
+    }
+
+    /// 安装/替换 RDFS 模式视图。
+    ///
+    /// 返回是否发生了实际变化。模式内容未变时是零成本 no-op；变化时清空派生
+    /// 计数并按原始观测顺序重放，因此「先观察后装 schema」与「先装 schema 后
+    /// 观察」得到同一批向量（确定性）。
+    pub fn set_schema(&mut self, schema: Option<SchemaView>) -> bool {
+        let next = schema.as_ref().map(SchemaView::digest);
+        if next == self.schema_digest() {
+            self.schema = schema;
+            return false;
+        }
+        self.schema = schema;
+        let triples = self.observed_triples.clone();
+        let entities = self.observed_entities.clone();
+        self.reset_derived();
+        for (subject, predicate, object) in triples {
+            self.seen_triples
+                .insert((subject.clone(), predicate.clone(), object.clone()));
+            self.observed_triples
+                .push((subject.clone(), predicate.clone(), object.clone()));
+            self.add_triple_features(&subject, &predicate, &object);
+        }
+        for (name, entity_type, properties) in entities {
+            let record = (name.clone(), entity_type.clone(), properties.clone());
+            if !self.seen_entity_records.insert(record.clone()) {
+                continue;
+            }
+            self.observed_entities.push(record);
+            self.add_entity_features(&name, &entity_type, &properties);
+        }
+        true
+    }
+
+    fn reset_derived(&mut self) {
+        self.counts.clear();
+        self.feature_totals.clear();
+        self.entity_masses.clear();
+        self.feature_interner.clear();
+        self.total_mass = 0.0;
+        self.vectors.clear();
+        self.dirty = true;
+        self.seen_triples.clear();
+        self.seen_entity_features.clear();
+        self.seen_entity_records.clear();
+        self.observed_triples.clear();
+        self.observed_entities.clear();
     }
 
     pub fn similarity_floor(&self) -> f64 {
@@ -89,15 +160,58 @@ impl SymbolicEmbedding {
         )) {
             return;
         }
-        // 复用同一个缓冲区构造特征名
-        let mut feature = String::with_capacity(predicate.len() + 3);
-        feature.push_str(predicate);
-        feature.push('→');
-        self.add_feature(subject, &feature);
-        feature.clear();
-        feature.push('←');
-        feature.push_str(predicate);
-        self.add_feature(object, &feature);
+        self.observed_triples.push((
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        ));
+        self.add_triple_features(subject, predicate, object);
+    }
+
+    /// 把一条三元组写入角色特征；有 schema 时额外加入子属性上浮与
+    /// 定义域/值域投影出的类型特征（RDFS 蕴含，不是硬过滤）。
+    fn add_triple_features(&mut self, subject: &str, predicate: &str, object: &str) {
+        let mut feature = String::with_capacity(predicate.len() + 4);
+        let schema = self.schema.clone();
+        match schema.as_ref() {
+            Some(schema) => {
+                for predicate in schema.superproperties(predicate) {
+                    feature.clear();
+                    feature.push_str(&predicate);
+                    feature.push('→');
+                    self.add_feature(subject, &feature);
+                    feature.clear();
+                    feature.push('←');
+                    feature.push_str(&predicate);
+                    self.add_feature(object, &feature);
+                }
+                for class in schema.domain_classes(predicate) {
+                    for ancestor in schema.class_ancestors(&class) {
+                        feature.clear();
+                        feature.push_str("类型·");
+                        feature.push_str(&ancestor);
+                        self.add_feature(subject, &feature);
+                    }
+                }
+                for class in schema.range_classes(predicate) {
+                    for ancestor in schema.class_ancestors(&class) {
+                        feature.clear();
+                        feature.push_str("类型·");
+                        feature.push_str(&ancestor);
+                        self.add_feature(object, &feature);
+                    }
+                }
+            }
+            None => {
+                feature.push_str(predicate);
+                feature.push('→');
+                self.add_feature(subject, &feature);
+                feature.clear();
+                feature.push('←');
+                feature.push_str(predicate);
+                self.add_feature(object, &feature);
+            }
+        }
     }
 
     pub fn observe_entity(&mut self, name: &str, entity_type: &str, properties: &[String]) {
@@ -121,20 +235,51 @@ impl SymbolicEmbedding {
         if name.is_empty() {
             return;
         }
+        let mut property_list: Vec<String> = properties
+            .into_iter()
+            .filter(|property| !property.is_empty())
+            .map(str::to_string)
+            .collect();
+        property_list.sort();
+        property_list.dedup();
+        let record = (
+            name.to_string(),
+            entity_type.to_string(),
+            property_list.clone(),
+        );
+        if !self.seen_entity_records.insert(record.clone()) {
+            return;
+        }
+        self.observed_entities.push(record);
+        self.add_entity_features(name, entity_type, &property_list);
+    }
+
+    /// 写入实体类型/属性特征；有 schema 时类型沿子类闭包展开。
+    fn add_entity_features(&mut self, name: &str, entity_type: &str, properties: &[String]) {
         let mut feature = String::new();
         if !entity_type.is_empty() {
-            feature.clear();
-            feature.push_str("类型·");
-            feature.push_str(entity_type);
-            self.observe_entity_feature(name, &feature);
-        }
-        for property in properties {
-            if !property.is_empty() {
+            let types: Vec<String> = match &self.schema {
+                Some(schema) => schema.class_ancestors(entity_type).into_iter().collect(),
+                None => vec![entity_type.to_string()],
+            };
+            for type_name in types {
+                if type_name.is_empty() {
+                    continue;
+                }
                 feature.clear();
-                feature.push_str("属性·");
-                feature.push_str(property);
+                feature.push_str("类型·");
+                feature.push_str(&type_name);
                 self.observe_entity_feature(name, &feature);
             }
+        }
+        for property in properties {
+            if property.is_empty() {
+                continue;
+            }
+            feature.clear();
+            feature.push_str("属性·");
+            feature.push_str(property);
+            self.observe_entity_feature(name, &feature);
         }
     }
 
@@ -564,6 +709,120 @@ mod tests {
         let explanation = embedding.explain_similarity("李四", "王五");
         assert!(explanation.contains("师傅"));
         assert!(explanation.contains("相似度"));
+    }
+
+    fn schema_with_subproperty() -> SchemaView {
+        use crate::predicate_registry::PredicateProfileConfig;
+        use crate::type_system::{TypeAliasConfig, TypeSubclassConfig, TypeSystemConfig};
+        SchemaView::from_config(
+            &TypeSystemConfig {
+                aliases: vec![TypeAliasConfig {
+                    alias: "Person".into(),
+                    canonical: "人物".into(),
+                }],
+                subclasses: vec![
+                    TypeSubclassConfig {
+                        sub: "学生".into(),
+                        sup: "人物".into(),
+                    },
+                    TypeSubclassConfig {
+                        sub: "人物".into(),
+                        sup: "实体".into(),
+                    },
+                ],
+                ..TypeSystemConfig::default()
+            },
+            &[
+                PredicateProfileConfig {
+                    name: "师傅".into(),
+                    domain: vec!["人物".into()],
+                    range: vec!["人物".into()],
+                    ..PredicateProfileConfig::default()
+                },
+                PredicateProfileConfig {
+                    name: "学生导师".into(),
+                    subproperty_of: Some("师傅".into()),
+                    domain: vec!["学生".into()],
+                    ..PredicateProfileConfig::default()
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn schema_lifts_subproperties_into_role_features() {
+        let mut embedding = SymbolicEmbedding::new(0.0);
+        assert!(embedding.set_schema(Some(schema_with_subproperty())));
+        embedding.observe_triple("甲", "学生导师", "乙");
+        embedding.observe_triple("丙", "师傅", "丁");
+        embedding.observe_entity("甲", "学生", &[]);
+        embedding.observe_entity("丙", "人物", &[]);
+        embedding.rebuild();
+        let shared = embedding.shared_feature_labels("甲", "丙", 8);
+        assert!(
+            shared.iter().any(|feature| feature == "师傅→"),
+            "子属性事实应上浮为父谓词特征：{:?}",
+            shared
+        );
+        assert!(
+            shared.iter().any(|feature| feature == "类型·人物"),
+            "定义域投影应产生共同类型特征：{:?}",
+            shared
+        );
+        assert!(embedding.schema_digest().is_some());
+    }
+
+    #[test]
+    fn schema_expands_entity_type_closure() {
+        let mut embedding = SymbolicEmbedding::new(0.0);
+        embedding.set_schema(Some(schema_with_subproperty()));
+        embedding.observe_entity("张三", "学生", &[]);
+        embedding.observe_entity("李四", "Person", &[]);
+        embedding.rebuild();
+        let shared = embedding.shared_feature_labels("张三", "李四", 8);
+        assert!(shared.iter().any(|feature| feature == "类型·人物"));
+        assert!(shared.iter().any(|feature| feature == "类型·实体"));
+    }
+
+    #[test]
+    fn schema_projects_domain_and_range_types_from_triples() {
+        let mut embedding = SymbolicEmbedding::new(0.0);
+        embedding.set_schema(Some(schema_with_subproperty()));
+        embedding.observe_triple("张三", "师傅", "李四");
+        embedding.observe_entity("王五", "人物", &[]);
+        embedding.rebuild();
+        let subject_shared = embedding.shared_feature_labels("张三", "王五", 8);
+        let object_shared = embedding.shared_feature_labels("李四", "王五", 8);
+        assert!(subject_shared.iter().any(|feature| feature == "类型·人物"));
+        assert!(object_shared.iter().any(|feature| feature == "类型·人物"));
+    }
+
+    #[test]
+    fn setting_schema_after_observation_replays_deterministically() {
+        let mut early = SymbolicEmbedding::new(0.0);
+        let view = schema_with_subproperty();
+        early.set_schema(Some(view.clone()));
+        early.observe_triple("甲", "学生导师", "乙");
+        early.observe_entity("甲", "学生", &[]);
+        early.observe_entity("丙", "Person", &[]);
+        early.rebuild();
+
+        let mut late = SymbolicEmbedding::new(0.0);
+        late.observe_triple("甲", "学生导师", "乙");
+        late.observe_entity("甲", "学生", &[]);
+        late.observe_entity("丙", "Person", &[]);
+        late.rebuild();
+        assert!(late.set_schema(Some(view.clone())));
+        late.rebuild();
+
+        assert_eq!(early.entity_count(), late.entity_count());
+        assert_eq!(early.feature_count(), late.feature_count());
+        assert_eq!(
+            early.shared_feature_labels("甲", "丙", 16),
+            late.shared_feature_labels("甲", "丙", 16)
+        );
+        assert!((early.similarity("甲", "丙") - late.similarity("甲", "丙")).abs() < 1e-12);
+        assert!(!late.set_schema(Some(view)), "同摘要重复安装必须是 no-op");
     }
 
     #[test]

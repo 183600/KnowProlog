@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
 use crate::predicate_registry::PredicateProfileConfig;
 use crate::type_system::{TypeSystemConfig, TypeVerdict};
@@ -658,6 +659,23 @@ impl SchemaView {
         SchemaCoverage::from_relations(self, relations, explicit)
     }
 
+    /// 规范摘要：只由声明内容决定，供嵌入缓存判断 schema 是否真的变化。
+    pub fn digest(&self) -> String {
+        let value = serde_json::json!({
+            "type_aliases": self.type_aliases,
+            "property_aliases": self.property_aliases,
+            "subclasses": self.subclasses,
+            "subproperties": self.subproperties,
+            "domains": self.domains,
+            "ranges": self.ranges,
+            "disjoint": self.disjoint,
+            "transitive": self.transitive,
+            "symmetric": self.symmetric,
+            "inverses": self.inverses,
+        });
+        fnv1a_hex(canonical_json(&value).as_bytes())
+    }
+
     /// 确定性人读报告。
     pub fn report(&self) -> String {
         let mut lines = Vec::new();
@@ -1083,6 +1101,16 @@ mod tests {
         assert!(coverage
             .untyped_predicates
             .contains(&"未知谓词".to_string()));
+    }
+
+    #[test]
+    fn digest_is_stable_and_content_sensitive() {
+        let first = mixed_schema();
+        let second = mixed_schema();
+        assert_eq!(first.digest(), second.digest());
+        let mut changed = mixed_schema();
+        changed.declare_subclass("公司", "实体");
+        assert_ne!(first.digest(), changed.digest());
     }
 
     #[test]
