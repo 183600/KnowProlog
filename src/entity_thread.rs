@@ -726,7 +726,7 @@ impl EntityThreadDigest {
         } else {
             lines.push("  最近记录（由新到旧）：".to_string());
             for event in thread.events.iter().rev().take(recent_cap) {
-                lines.push(format!("    {}", render_event(thread, event)));
+                lines.push(format!("    {}", render_event_line(thread, event)));
             }
             let omitted = thread.omitted_events + thread.events.len().saturating_sub(recent_cap);
             if omitted > 0 {
@@ -830,7 +830,8 @@ fn entity_refs(entry: &ChronicleEntry) -> Vec<EntityRef> {
         .collect()
 }
 
-fn render_event(thread: &EntityThread, event: &ThreadEvent) -> String {
+/// 单条线程事件的人类可读行（供实体足迹与别名感知检索共用）。
+pub fn render_event_line(thread: &EntityThread, event: &ThreadEvent) -> String {
     let mut text = format!("第 {} 条 [{}]", event.seq, event.role.label());
     if event.role == ThreadRole::Reply {
         if let Some(question) = &event.question {

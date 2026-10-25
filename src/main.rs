@@ -11,7 +11,7 @@ use know_prolog::{
         LedgerLoad as BatchLedgerLoad,
     },
     binding_frames::FrameProgram,
-    chronicle::{Chronicle, FsyncPolicy},
+    chronicle::{Chronicle, EntityRef, FsyncPolicy},
     config_contract,
     contextual_reference::{
         parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
@@ -36,6 +36,7 @@ use know_prolog::{
         EvalBaseline, EvalConfig,
     },
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
+    entity_thread::{render_event_line, EntityThreadDigest, ThreadLookup},
     event_graph::{EventDialogue, EventGraph},
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
@@ -7538,8 +7539,19 @@ async fn run_interactive_mode(
                     mode
                 };
                 let focus = dialogue_manager.focus_entity();
-                let _ =
-                    chronicle.append_turn(raw_input, kind, focus, dialogue_manager.turn_count());
+                // 写端只追加词面与写时身份；合并/改名由读端按当前注册表折叠。
+                let refs = if kind == "command" {
+                    Vec::new()
+                } else {
+                    chronicle_entity_refs(&symbolic_reasoner, raw_input, focus)
+                };
+                let _ = chronicle.append_turn_with_refs(
+                    raw_input,
+                    kind,
+                    focus,
+                    dialogue_manager.turn_count(),
+                    &refs,
+                );
             }
         }
 
@@ -8965,32 +8977,115 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 编年史检索：跨会话长程记忆（命中哪一轮、命中几次，可审计）
+        // 编年史检索：先按实体身份（别名感知、跨合并）查线程，再退回全文命中。
         if let Some(query) =
             strip_any_prefix(input, &["聊过：", "聊过:", "聊过 ", "查档案：", "查档案:"])
         {
             let query = query.trim();
             match (chronicle.as_ref(), query.is_empty()) {
                 (Some(chronicle), false) => {
-                    let matches = chronicle.search(query);
-                    if matches.is_empty() {
-                        println!("编年史里没有聊过「{}」。", query);
-                    } else {
-                        println!(
-                            "编年史检索「{}」：命中 {} 条（按序号，可审计）：",
-                            query,
-                            matches.len()
-                        );
-                        for item in matches.iter().rev().take(8).rev() {
+                    let registry = oxigraph_manager.entity_registry_snapshot();
+                    let digest = EntityThreadDigest::build(chronicle, &registry);
+                    match digest.lookup(query) {
+                        ThreadLookup::Found(thread) => {
                             println!(
-                                "  第 {} 条（{}，命中 {} 次）{}",
-                                item.seq, item.kind, item.hits, item.excerpt
+                                "编年史检索「{}」→ 实体「{}」：{} 条记录（seq {}–{}；别名感知，含读端折叠）：",
+                                query,
+                                thread.canonical,
+                                thread.total_events,
+                                thread.first_seq.unwrap_or(0),
+                                thread.last_seq.unwrap_or(0)
                             );
+                            for event in thread.events.iter().rev().take(8).rev() {
+                                println!("  {}", render_event_line(thread, event));
+                            }
+                            let omitted = thread.omitted_events
+                                + thread.events.len().saturating_sub(8);
+                            if omitted > 0 {
+                                println!(
+                                    "  …另有 {} 条较早记录已折叠；用「实体足迹：{}」查看概览。",
+                                    omitted, thread.canonical
+                                );
+                            }
+                        }
+                        ThreadLookup::Ambiguous(candidates) => {
+                            println!(
+                                "「{}」可解析到多个身份：{}。请用规范名再查（不会静默归并）。",
+                                query,
+                                candidates.join(" / ")
+                            );
+                        }
+                        ThreadLookup::Unknown => {
+                            let matches = chronicle.search(query);
+                            if matches.is_empty() {
+                                println!("编年史里没有聊过「{}」。", query);
+                            } else {
+                                println!(
+                                    "编年史检索「{}」：命中 {} 条（按序号，可审计）：",
+                                    query,
+                                    matches.len()
+                                );
+                                for item in matches.iter().rev().take(8).rev() {
+                                    println!(
+                                        "  第 {} 条（{}，命中 {} 次）{}",
+                                        item.seq, item.kind, item.hits, item.excerpt
+                                    );
+                                }
+                            }
                         }
                     }
                 }
                 (Some(_), true) => println!("用法：聊过：<关键词>，例如：聊过：姚明"),
                 (None, _) => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 实体足迹：跨会话提及、回答、身份折叠与当前图谱现状。
+        if input == "实体足迹"
+            || input.starts_with("实体足迹：")
+            || input.starts_with("实体足迹:")
+            || input.starts_with("实体足迹 ")
+        {
+            let spec = input
+                .trim_start_matches("实体足迹")
+                .trim_start_matches([' ', '：', ':'])
+                .trim();
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let (digest, facts) =
+                        entity_thread_context(chronicle, &oxigraph_manager).await;
+                    println!("{}", digest.render_footprint(spec, facts.as_slice()));
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 实体线索索引：活跃线程、静默身份、旧 URI 足迹与未解析提及。
+        if matches!(input, "实体索引" | "实体线程" | "实体线索" | "实体审计") {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let registry = oxigraph_manager.entity_registry_snapshot();
+                    let digest = EntityThreadDigest::build(chronicle, &registry);
+                    println!("{}", digest.render_audit());
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "未解析提及" | "未解析实体" | "实体歧义审计") {
+            match chronicle.as_ref() {
+                Some(chronicle) => {
+                    let registry = oxigraph_manager.entity_registry_snapshot();
+                    let digest = EntityThreadDigest::build(chronicle, &registry);
+                    println!("{}", digest.render_unresolved());
+                }
+                None => println!("编年史不可用（打开失败，见启动警告）。"),
             }
             println!();
             continue;
@@ -13246,6 +13341,55 @@ fn prolog_fact_edges(facts: &[PrologFact]) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// 构建实体脉络投影，并尽量附上当前图谱快照（失败只告警，不影响足迹）。
+async fn entity_thread_context(
+    chronicle: &Chronicle,
+    oxigraph_manager: &OxigraphManager,
+) -> (EntityThreadDigest, Arc<Vec<PrologFact>>) {
+    let registry = oxigraph_manager.entity_registry_snapshot();
+    let digest = EntityThreadDigest::build(chronicle, &registry);
+    let facts = match load_graph_snapshot(oxigraph_manager).await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("图谱快照读取失败（足迹不显示图谱现状）：{}", error);
+            Arc::new(Vec::new())
+        }
+    };
+    (digest, facts)
+}
+
+/// 编年史写端的实体引用：链接器词面 + 当轮继承焦点（焦点只记词面）。
+///
+/// 只写「当时看到的身份」，不写当前显示名；日志永不回写，合并后的投影由
+/// EntityThreadDigest 在读端完成。
+fn chronicle_entity_refs(
+    reasoner: &SymbolicReasoner,
+    text: &str,
+    focus: Option<&str>,
+) -> Vec<EntityRef> {
+    let mut refs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for mention in reasoner.grounding_mentions(text) {
+        if mention.score < SymbolicReasoner::LINK_ACCEPT_THRESHOLD {
+            continue;
+        }
+        let surface = mention.mention.trim();
+        let entity = mention.entity.trim();
+        if surface.is_empty() || entity.is_empty() {
+            continue;
+        }
+        if seen.insert((surface.to_string(), entity.to_string())) {
+            refs.push(EntityRef::linked(surface, entity));
+        }
+    }
+    if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
+        if !refs.iter().any(|reference| reference.surface == focus) {
+            refs.push(EntityRef::focus(focus));
+        }
+    }
+    refs
+}
+
 /// 编年史回复登记：与写前日志配对，失败不打断主流程。
 fn log_chronicle_reply(
     chronicle: &mut Option<Chronicle>,
@@ -13519,6 +13663,8 @@ fn interactive_help() -> String {
         "  证明日志 / 证明编号：<id>             回放带稳定 id 的证明凭证",
         "  一致性 / 改口检查                     同题异答、过期回答与未答问题",
         "  时间线 / 编年史 / 回放 <N>            对话编年史审计与重建",
+        "  实体足迹：<实体> / 实体索引           跨会话实体脉络、别名折叠与图谱现状",
+        "  聊过：<词面> / 未解析提及              别名感知检索、未落地提及审计",
         "  相似实体：<实体> / 介绍：<实体>       相似度排序与生成式介绍",
         "  证据检索：<问题>                    带约束与上界剪枝的证据排序及检索回执",
         "",
@@ -13957,6 +14103,14 @@ fn is_command_like(input: &str) -> bool {
         "回放",
         "聊过",
         "查档案",
+        "实体足迹",
+        "实体索引",
+        "实体线程",
+        "实体线索",
+        "实体审计",
+        "未解析提及",
+        "未解析实体",
+        "实体歧义审计",
         "时间线",
         "对话时间线",
         "证明图",
@@ -16434,6 +16588,33 @@ mod session_tests {
     }
 
     /// RDF 导入后的画像同步必须落盘，且重新打开存储仍能解析导入的谓词与实体。
+    #[test]
+    fn entity_thread_commands_are_command_like() {
+        for command in [
+            "实体足迹：张三",
+            "实体足迹:张三",
+            "实体足迹 张三",
+            "实体索引",
+            "实体线程",
+            "实体审计",
+            "未解析提及",
+            "未解析实体",
+        ] {
+            assert!(is_command_like(command), "{} 应视为命令", command);
+        }
+    }
+
+    #[test]
+    fn chronicle_refs_keep_focus_when_linker_has_no_mention() {
+        let reasoner = SymbolicReasoner::new(
+            know_prolog::ReasoningConfig::default(),
+            std::collections::HashMap::new(),
+        );
+        let refs = chronicle_entity_refs(&reasoner, "今天天气不错", Some("张三"));
+        assert_eq!(refs, vec![EntityRef::focus("张三")]);
+        assert!(chronicle_entity_refs(&reasoner, "今天天气不错", None).is_empty());
+    }
+
     #[tokio::test]
     async fn imported_graph_persists_predicate_and_entity_registries() {
         let dir = tempfile::TempDir::new().expect("临时目录");
