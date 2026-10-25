@@ -148,6 +148,7 @@ pub mod turn_runtime;
 pub mod type_memory;
 pub mod type_system;
 pub mod view_render;
+pub mod viewpoint;
 pub mod weak_construction;
 
 #[cfg(test)]
