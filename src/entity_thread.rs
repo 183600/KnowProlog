@@ -743,18 +743,35 @@ impl EntityThreadDigest {
             .chain(std::iter::once(&thread.canonical))
             .cloned()
             .collect();
-        let mut related: Vec<String> = facts
+        let spoken = thread
+            .events
+            .iter()
+            .flat_map(|event| [event.question.as_deref(), event.answer.as_deref()])
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut related: Vec<(String, bool)> = facts
             .iter()
             .filter(|fact| fact_touches(fact, &names))
-            .map(render_fact)
+            .map(|fact| (render_fact(fact), fact_surfaced(fact, &spoken)))
             .collect();
         related.sort();
         if related.is_empty() {
             lines.push("  图谱现状：当前快照中没有与该实体相关的事实。".to_string());
         } else {
-            lines.push(format!("  图谱现状：{} 条相关事实。", related.len()));
-            for fact in related.iter().take(6) {
-                lines.push(format!("    {}", fact));
+            let unmentioned = related.iter().filter(|(_, surfaced)| !surfaced).count();
+            let note = if unmentioned > 0 {
+                format!("（其中 {} 条未在对话文本中出现）", unmentioned)
+            } else {
+                "（均已在对话文本中出现）".to_string()
+            };
+            lines.push(format!("  图谱现状：{} 条相关事实{}。", related.len(), note));
+            for (fact, surfaced) in related.iter().take(6) {
+                lines.push(format!(
+                    "    {}{}",
+                    fact,
+                    if *surfaced { "" } else { "（对话未提及）" }
+                ));
             }
             if related.len() > 6 {
                 lines.push(format!("    …另有 {} 条。", related.len() - 6));
@@ -872,6 +889,18 @@ fn excerpt(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// 事实是否在对话文本中被明确提到（宽松但只作「未出现」标注，不宣称真假）。
+fn fact_surfaced(fact: &PrologFact, text: &str) -> bool {
+    match fact {
+        PrologFact::Entity { properties, .. } => properties
+            .iter()
+            .any(|(key, value)| text.contains(key) || text.contains(value)),
+        PrologFact::Relation {
+            from, rel_type, to, ..
+        } => text.contains(rel_type) || (text.contains(from) && text.contains(to)),
+    }
 }
 
 fn fact_touches(fact: &PrologFact, names: &BTreeSet<String>) -> bool {
@@ -1239,6 +1268,47 @@ mod tests {
         assert!(report.contains("静默身份"), "{}", report);
         assert!(report.contains("王五"), "{}", report);
         assert!(!report.contains("旧 URI 足迹"), "没有合并时不应伪造旧 URI");
+    }
+
+    #[test]
+    fn footprint_marks_graph_facts_absent_from_dialogue_text() {
+        let dir = TempDir::new().unwrap();
+        let (mut chronicle, _) = chronicle(&dir);
+        let refs = vec![EntityRef {
+            surface: "张三".to_string(),
+            entity: Some("张三".to_string()),
+            source: "link".to_string(),
+        }];
+        chronicle
+            .append_turn_with_refs("张三的身高是多少", "query", None, 0, &refs)
+            .unwrap();
+        chronicle
+            .append_reply("张三的身高是 226 厘米。", &[], &[])
+            .unwrap();
+        let registry = registry_with(&[("张三", &[], &[])]);
+        let digest = EntityThreadDigest::build(&chronicle, &registry);
+        let mut properties = std::collections::HashMap::new();
+        properties.insert("身高".to_string(), "226 厘米".to_string());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "Person".to_string(),
+                properties,
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+        ];
+        let report = digest.render_footprint("张三", &facts);
+        assert!(report.contains("226 厘米"), "{}", report);
+        assert!(
+            report.contains("师傅") && report.contains("对话未提及"),
+            "{}",
+            report
+        );
+        assert!(report.contains("1 条未在对话文本中出现"), "{}", report);
     }
 
     #[test]
