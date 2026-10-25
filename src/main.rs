@@ -4107,11 +4107,14 @@ async fn run_namespace_status(
     }
     let ledger = manager.load_fusion_ledger().await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "namespace": know_prolog::knowledge_fusion::sanitize_namespace_id(source),
-            "status": status,
-            "ledger": ledger,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace": know_prolog::knowledge_fusion::sanitize_namespace_id(source),
+                "status": status,
+                "ledger": ledger,
+            }))?
+        );
     } else {
         println!(
             "命名空间 {} 状态已设为 {}",
@@ -4224,9 +4227,12 @@ async fn run_lens(
     if contexts {
         let summaries = corpus.summaries();
         if json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "contexts": summaries,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "contexts": summaries,
+                }))?
+            );
         } else {
             println!("语境目录：");
             for summary in &summaries {
@@ -4291,7 +4297,10 @@ async fn run_lens(
     } else if let Some(cue) = &cue {
         cue.scope.clone()
     } else {
-        return Err("没有识别到语境限定：请用 --view 指定，或把「据 alice 说 / 知识库里 / 假设里」写进问句".into());
+        return Err(
+            "没有识别到语境限定：请用 --view 指定，或把「据 alice 说 / 知识库里 / 假设里」写进问句"
+                .into(),
+        );
     };
 
     let query = if let (Some(subject), Some(predicate)) = (&subject, &predicate) {
@@ -4336,11 +4345,14 @@ async fn run_lens(
 
     let slot_view = corpus.query_slot(&scope, &query, is_functional);
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "state": slot_view.state(),
-            "answer": slot_view.render(),
-            "view": slot_view,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "state": slot_view.state(),
+                "answer": slot_view.render(),
+                "view": slot_view,
+            }))?
+        );
     } else {
         println!("{}", slot_view.render());
     }
@@ -6843,7 +6855,11 @@ async fn ask_with_lens(
         .predicates
         .iter()
         .any(|predicate| functional.contains(predicate));
-    Some(corpus.query_slot(&cue.scope, &query, is_functional).render())
+    Some(
+        corpus
+            .query_slot(&cue.scope, &query, is_functional)
+            .render(),
+    )
 }
 
 async fn run_types(
@@ -15929,11 +15945,9 @@ mod session_tests {
     #[tokio::test]
     async fn ask_lens_keeps_source_scope_and_discloses_other_contexts() {
         let dir = tempfile::TempDir::new().unwrap();
-        let manager = OxigraphManager::with_perf_ledger(
-            dir.path().to_str().unwrap(),
-            PerfLedger::shared(),
-        )
-        .unwrap();
+        let manager =
+            OxigraphManager::with_perf_ledger(dir.path().to_str().unwrap(), PerfLedger::shared())
+                .unwrap();
         let namespace = NamespaceRecord::new(
             "alice",
             "alice",
@@ -15955,26 +15969,16 @@ mod session_tests {
         let config = load_config_from("config.toml").await.unwrap();
         let mut cache = None;
 
-        let reply = ask_with_lens(
-            "据alice说，张三的师傅是谁",
-            &manager,
-            &config,
-            &mut cache,
-        )
-        .await
-        .expect("来源镜头应接管");
+        let reply = ask_with_lens("据alice说，张三的师傅是谁", &manager, &config, &mut cache)
+            .await
+            .expect("来源镜头应接管");
         assert!(reply.contains("李四"), "{}", reply);
         assert!(reply.contains("alice"), "{}", reply);
         assert!(!reply.contains("是 王五"), "{}", reply);
 
-        let reply = ask_with_lens(
-            "知识库里张三的师傅是谁",
-            &manager,
-            &config,
-            &mut cache,
-        )
-        .await
-        .expect("知识库镜头应接管");
+        let reply = ask_with_lens("知识库里张三的师傅是谁", &manager, &config, &mut cache)
+            .await
+            .expect("知识库镜头应接管");
         assert!(reply.contains("没有关于"), "{}", reply);
         assert!(reply.contains("alice"), "{}", reply);
 
@@ -16034,13 +16038,9 @@ mod session_tests {
 
     #[test]
     fn lens_cli_parses_question_and_explicit_slot() {
-        let cli = Cli::try_parse_from([
-            "knowprolog",
-            "lens",
-            "据alice说，张三的师傅是谁",
-            "--json",
-        ])
-        .expect("lens 问句应可解析");
+        let cli =
+            Cli::try_parse_from(["knowprolog", "lens", "据alice说，张三的师傅是谁", "--json"])
+                .expect("lens 问句应可解析");
         match cli.command {
             Some(Commands::Lens {
                 question,
@@ -16114,13 +16114,7 @@ mod session_tests {
             }
             other => panic!("应解析为 Lens 子命令: {:?}", other),
         }
-        assert!(Cli::try_parse_from([
-            "knowprolog",
-            "lens",
-            "--facts",
-            "--contexts"
-        ])
-        .is_err());
+        assert!(Cli::try_parse_from(["knowprolog", "lens", "--facts", "--contexts"]).is_err());
     }
 
     #[test]

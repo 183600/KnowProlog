@@ -50,7 +50,15 @@ const ALL_NAMES: [&str; 11] = [
     "各个命名空间",
 ];
 const SOURCE_SUFFIXES: [&str; 9] = [
-    "的说法", "的记录", "的资料", "所言", "来源", "说", "称", "表示", "认为",
+    "的说法",
+    "的记录",
+    "的资料",
+    "所言",
+    "来源",
+    "说",
+    "称",
+    "表示",
+    "认为",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,12 +350,12 @@ impl SlotView {
             );
         }
         let mut text = format!("{}没有关于{}的记录。", self.scope_prefix, slot);
-        if let Some(found) = self.elsewhere.iter().find(|fact| self.display_value(fact) == expected)
+        if let Some(found) = self
+            .elsewhere
+            .iter()
+            .find(|fact| self.display_value(fact) == expected)
         {
-            text.push_str(&format!(
-                "不过{}里有该说法。",
-                found.context.render_short()
-            ));
+            text.push_str(&format!("不过{}里有该说法。", found.context.render_short()));
         } else if !self.elsewhere.is_empty() {
             text.push_str(&self.render_elsewhere());
         }
@@ -431,7 +439,10 @@ impl SlotView {
                 fact.context.render_short()
             ));
         }
-        format!("其他语境里有：{}。", parts.into_iter().collect::<Vec<_>>().join("；"))
+        format!(
+            "其他语境里有：{}。",
+            parts.into_iter().collect::<Vec<_>>().join("；")
+        )
     }
 
     fn display_value(&self, fact: &LensFact) -> String {
@@ -479,11 +490,7 @@ impl LensCorpus {
                 continue;
             };
             facts.push(LensFact {
-                fact: FactRef::new(
-                    &assertion.subject,
-                    &assertion.predicate,
-                    &assertion.object,
-                ),
+                fact: FactRef::new(&assertion.subject, &assertion.predicate, &assertion.object),
                 context: context.clone(),
                 source: assertion.source.clone(),
                 object_kind: assertion.object_kind,
@@ -580,7 +587,11 @@ impl LensCorpus {
                 status,
                 priority,
             });
-        if !self.contexts.iter().any(|existing| existing.id == context.id) {
+        if !self
+            .contexts
+            .iter()
+            .any(|existing| existing.id == context.id)
+        {
             self.contexts.push(context.clone());
         }
         self.facts.extend(facts.into_iter().map(|fact| LensFact {
@@ -637,12 +648,7 @@ impl LensCorpus {
             .collect()
     }
 
-    pub fn query_slot(
-        &self,
-        scope: &LensScope,
-        query: &SlotQuery,
-        functional: bool,
-    ) -> SlotView {
+    pub fn query_slot(&self, scope: &LensScope, query: &SlotQuery, functional: bool) -> SlotView {
         let selected_ids = match self.selected_context_ids(scope) {
             Ok(ids) => ids,
             Err(error) => {
@@ -664,7 +670,11 @@ impl LensCorpus {
         let mut in_scope: Vec<LensFact> = Vec::new();
         let mut elsewhere: Vec<LensFact> = Vec::new();
         for fact in &self.facts {
-            if !query.predicates.iter().any(|predicate| predicate == &fact.fact.predicate) {
+            if !query
+                .predicates
+                .iter()
+                .any(|predicate| predicate == &fact.fact.predicate)
+            {
                 continue;
             }
             let key_matches = match query.direction {
@@ -716,9 +726,7 @@ impl LensCorpus {
     ) -> Result<Vec<LensFact>, String> {
         let selected_ids = self.selected_context_ids(scope)?;
         let subject = subject.map(str::trim).filter(|value| !value.is_empty());
-        let predicate = predicate
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+        let predicate = predicate.map(str::trim).filter(|value| !value.is_empty());
         Ok(self
             .facts
             .iter()
@@ -743,7 +751,9 @@ impl LensCorpus {
             LensScope::Kind(kind) => Ok(self
                 .contexts
                 .iter()
-                .filter(|context| context.kind == *kind && context.status != NamespaceStatus::Retired)
+                .filter(|context| {
+                    context.kind == *kind && context.status != NamespaceStatus::Retired
+                })
                 .map(|context| context.id.clone())
                 .collect()),
             LensScope::Namespace(raw) => {
@@ -811,7 +821,10 @@ fn group_values(facts: &[LensFact], direction: SlotDirection) -> Vec<ValueWarran
             let mut contexts: Vec<LensContext> = Vec::new();
             let mut sources: BTreeSet<String> = BTreeSet::new();
             for member in &members {
-                if !contexts.iter().any(|context| context.id == member.context.id) {
+                if !contexts
+                    .iter()
+                    .any(|context| context.id == member.context.id)
+                {
                     contexts.push(member.context.clone());
                 }
                 if !member.source.trim().is_empty() {
@@ -855,7 +868,10 @@ fn scope_render(scope: &LensScope, contexts: &[LensContext]) -> (String, String)
                 })
                 .map(|context| context.label.clone())
                 .unwrap_or_else(|| raw.trim().to_string());
-            (format!("「{}」的记录", label), format!("据「{}」的记录", label))
+            (
+                format!("「{}」的记录", label),
+                format!("据「{}」的记录", label),
+            )
         }
     }
 }
@@ -885,11 +901,9 @@ pub fn detect_lens_cue(question: &str, aliases: &[ContextAlias]) -> Option<LensC
     ) {
         return Some(cue);
     }
-    if let Some(cue) = match_named_scope(
-        text,
-        &IMPORT_NAMES,
-        LensScope::Kind(NamespaceKind::Import),
-    ) {
+    if let Some(cue) =
+        match_named_scope(text, &IMPORT_NAMES, LensScope::Kind(NamespaceKind::Import))
+    {
         return Some(cue);
     }
     if let Some(cue) = match_alias_prefix(text, aliases) {
@@ -938,10 +952,7 @@ fn match_alias_prefix(text: &str, aliases: &[ContextAlias]) -> Option<LensCue> {
             }
             for lead in ["据", "根据", "按照", "按"] {
                 for suffix in SOURCE_SUFFIXES {
-                    candidates.push((
-                        format!("{}{}{}", lead, name, suffix),
-                        alias.id.clone(),
-                    ));
+                    candidates.push((format!("{}{}{}", lead, name, suffix), alias.id.clone()));
                 }
                 candidates.push((format!("{}{}", lead, name), alias.id.clone()));
             }
@@ -950,10 +961,7 @@ fn match_alias_prefix(text: &str, aliases: &[ContextAlias]) -> Option<LensCue> {
             }
             for prefix in ["在", "从", ""] {
                 for suffix in ["里", "中", "内", "下"] {
-                    candidates.push((
-                        format!("{}{}{}", prefix, name, suffix),
-                        alias.id.clone(),
-                    ));
+                    candidates.push((format!("{}{}{}", prefix, name, suffix), alias.id.clone()));
                 }
             }
         }
@@ -1104,8 +1112,7 @@ pub fn parse_lens_scope(raw: &str, aliases: &[ContextAlias]) -> LensScope {
                 return LensScope::Namespace(rest.trim().to_string());
             }
             if let Some(alias) = aliases.iter().find(|alias| {
-                alias.id.eq_ignore_ascii_case(trimmed)
-                    || alias.label.eq_ignore_ascii_case(trimmed)
+                alias.id.eq_ignore_ascii_case(trimmed) || alias.label.eq_ignore_ascii_case(trimmed)
             }) {
                 return LensScope::Namespace(alias.id.clone());
             }
@@ -1250,10 +1257,7 @@ mod tests {
     }
 
     fn corpus() -> LensCorpus {
-        LensCorpus::new(
-            &[FactRef::new("张三", "师傅", "王五")],
-            &ledger(),
-        )
+        LensCorpus::new(&[FactRef::new("张三", "师傅", "王五")], &ledger())
     }
 
     #[test]
@@ -1284,15 +1288,21 @@ mod tests {
             LensScope::Kind(NamespaceKind::Hypothesis)
         );
         assert_eq!(
-            detect_lens_cue("本次会话中张三的师傅是谁", &[]).unwrap().scope,
+            detect_lens_cue("本次会话中张三的师傅是谁", &[])
+                .unwrap()
+                .scope,
             LensScope::Kind(NamespaceKind::Session)
         );
         assert_eq!(
-            detect_lens_cue("所有来源里张三的师傅是谁", &[]).unwrap().scope,
+            detect_lens_cue("所有来源里张三的师傅是谁", &[])
+                .unwrap()
+                .scope,
             LensScope::All
         );
         assert_eq!(
-            detect_lens_cue("导入来源里张三的师傅是谁", &[]).unwrap().scope,
+            detect_lens_cue("导入来源里张三的师傅是谁", &[])
+                .unwrap()
+                .scope,
             LensScope::Kind(NamespaceKind::Import)
         );
     }
@@ -1413,15 +1423,8 @@ mod tests {
         );
         assert_eq!(hypothesis.state(), SlotState::Supported);
         assert_eq!(hypothesis.values[0].value, "赵六");
-        assert_eq!(
-            hypothesis.values[0].contexts[0].id,
-            HYPOTHESIS_CONTEXT_ID
-        );
-        let all = corpus.query_slot(
-            &LensScope::All,
-            &SlotQuery::forward("张三", "师傅"),
-            false,
-        );
+        assert_eq!(hypothesis.values[0].contexts[0].id, HYPOTHESIS_CONTEXT_ID);
+        let all = corpus.query_slot(&LensScope::All, &SlotQuery::forward("张三", "师傅"), false);
         assert_eq!(all.values[0].value, "李四");
         assert!(corpus
             .summaries()
@@ -1450,11 +1453,7 @@ mod tests {
     #[test]
     fn all_lens_reports_conflict_without_truth_claim() {
         let corpus = corpus();
-        let view = corpus.query_slot(
-            &LensScope::All,
-            &SlotQuery::forward("张三", "师傅"),
-            true,
-        );
+        let view = corpus.query_slot(&LensScope::All, &SlotQuery::forward("张三", "师傅"), true);
         assert_eq!(view.state(), SlotState::Conflict);
         assert_eq!(view.values.len(), 2);
         let rendered = view.render();
@@ -1488,7 +1487,11 @@ mod tests {
         );
         assert_eq!(view.state(), SlotState::Unknown);
         let rendered = view.render();
-        assert!(rendered.contains("知识库中没有关于张三 的 师傅的记录"), "{}", rendered);
+        assert!(
+            rendered.contains("知识库中没有关于张三 的 师傅的记录"),
+            "{}",
+            rendered
+        );
         assert!(rendered.contains("alice（导入）"), "{}", rendered);
     }
 
