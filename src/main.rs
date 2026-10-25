@@ -52,6 +52,7 @@ use know_prolog::{
     knowledge_fusion::{
         Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, NamespaceStatus, TrustLevel,
     },
+    lang_runtime::{self, LangReloadOutcome, LangRuntime},
     law_book::LawBook,
     lex_gate, lexical_memory, lexical_trace,
     link_prediction::{LinkPredictor, Triple as LawTriple},
@@ -103,7 +104,7 @@ use know_prolog::{
     shape_gate::{RepairAction, ShapeReport, ShapeSet},
     startup_ledger::StartupLedger,
     symbolic_generator::SymbolicGenerator,
-    symbolic_reasoner::SymbolicReasoner,
+    symbolic_reasoner::{LanguagePolicySync, SymbolicReasoner},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
     view_render::{
@@ -3431,6 +3432,7 @@ async fn main() {
                 recovery_mode,
                 trace_mode,
                 &store_path,
+                &cli.config,
             )
             .await;
         }
@@ -7137,6 +7139,52 @@ async fn refresh_dialogue_quality(
     dialogue_manager.set_quality_index(Some(index));
 }
 
+/// 把一份语言配置视图装回所有语言消费者。
+///
+/// 只重建配置派生层（抽取器、措辞器、NLU、模式库配置层、插件词性线索、
+/// 同义词表、本地语义开关与推理器语言策略）；对话焦点、编年史、会话事实、
+/// 教学模式与承诺全部保持原对象不变。
+#[allow(clippy::type_complexity)]
+fn apply_language_snapshot(
+    config: &Arc<SystemConfig>,
+    knowledge_extractor: &mut KnowledgeExtractor,
+    response_formatter: &mut ResponseFormatter,
+    nlu_engine: &mut NLUEngine,
+    pattern_library: &mut PatternLibrary,
+    plugin_runtime: &PluginRuntime,
+    plugin_nlp: &mut know_prolog::NlpConfig,
+    synonyms: &mut std::collections::HashMap<String, String>,
+    local_semantic_adapter: &mut LocalSemanticAdapter,
+    symbolic_reasoner: &mut SymbolicReasoner,
+) -> (
+    pattern_ir::PatternLayerRefresh,
+    LanguagePolicySync,
+    usize,
+) {
+    *knowledge_extractor = KnowledgeExtractor::new(Arc::clone(config));
+    *response_formatter = ResponseFormatter::new(Arc::clone(config));
+    *nlu_engine = NLUEngine::new(config);
+    let patterns = pattern_library.replace_config_layer(config);
+    *plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
+    let plugin_entries = plugin_nlp
+        .pos_dict
+        .len()
+        .saturating_sub(config.nlp.pos_dict.len());
+    // 同义词是会话内单调追加：新配置可登记/改写映射，但删除旧映射需重启
+    // 才能同时清掉已学指称与推理器里的别名缓存。
+    if let Some(configured) = &config.synonyms {
+        for (alias, canonical) in &configured.mappings {
+            synonyms.insert(alias.clone(), canonical.clone());
+        }
+    }
+    *local_semantic_adapter = LocalSemanticAdapter::new(
+        config.nlp.enable_local_semantic.unwrap_or(true)
+            && config.nlp.disable_ownthink_api.unwrap_or(false),
+    );
+    let language = symbolic_reasoner.apply_language_policy(config);
+    (patterns, language, plugin_entries)
+}
+
 async fn run_interactive_mode(
     config: Arc<know_prolog::SystemConfig>,
     oxigraph_manager: OxigraphManager,
@@ -7144,7 +7192,12 @@ async fn run_interactive_mode(
     recovery_mode: RecoveryMode,
     trace_mode: TraceMode,
     store_path: &str,
+    config_path: &str,
 ) {
+    let mut lang_runtime = LangRuntime::new(config_path, (*config).clone());
+    // 本会话生效的语言视图：热节来自最近的已提交快照，需重启的节沿用启动值。
+    // `config` 始终是启动结构；后续语言读取一律走 `language_config`。
+    let mut language_config = Arc::clone(&config);
     println!("{}", config.messages.startup);
     warn_config_contract(&config);
     let frame_program = compile_frame_program(&config);
@@ -7182,7 +7235,7 @@ async fn run_interactive_mode(
     // 类型体系：别名/子类/互斥声明 + 模式闸门闭包档（config.toml [type_system]）
     oxigraph_manager.configure_type_system(&config.type_system);
 
-    let knowledge_extractor = KnowledgeExtractor::new(config.clone());
+    let mut knowledge_extractor = KnowledgeExtractor::new(config.clone());
     let batch_teaching_path = format!("{}/{}", store_path, batch_teaching::LEDGER_FILE);
     let mut batch_teaching = match BatchTeachingLedger::load(&batch_teaching_path) {
         BatchLedgerLoad::Loaded(ledger) => ledger,
@@ -7200,8 +7253,8 @@ async fn run_interactive_mode(
     }
     // 文法式关系抽取器：DCG 语言器官，词库由谓词画像注册表注入
     let grammar_extractor = GrammarExtractor::new();
-    let response_formatter = ResponseFormatter::new(config.clone());
-    let nlu_engine = NLUEngine::new(&config);
+    let mut response_formatter = ResponseFormatter::new(config.clone());
+    let mut nlu_engine = NLUEngine::new(&config);
     // 统一模式库：配置查询规则 + NLU 意图（同库展示、不路由）+ 跨会话教学模式。
     let mut pattern_library = PatternLibrary::from_config(&config);
     match oxigraph_manager.load_pattern_ledger().await {
@@ -7261,7 +7314,7 @@ async fn run_interactive_mode(
     let mut turns_since_episode_sync = 0usize;
 
     let mut prolog_engine = PrologEngine::new();
-    let local_semantic_adapter = {
+    let mut local_semantic_adapter = {
         let nlp_config = &config.nlp;
         LocalSemanticAdapter::new(
             nlp_config.enable_local_semantic.unwrap_or(true)
@@ -7319,7 +7372,7 @@ async fn run_interactive_mode(
         service
     };
 
-    let synonyms = if let Some(synonyms_config) = &config.synonyms {
+    let mut synonyms = if let Some(synonyms_config) = &config.synonyms {
         synonyms_config.mappings.clone()
     } else {
         create_default_synonyms()
@@ -7591,7 +7644,7 @@ async fn run_interactive_mode(
         );
     }
     // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
-    let plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
+    let mut plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
     let plugin_reference_entries = plugin_nlp
         .pos_dict
         .len()
@@ -7864,10 +7917,127 @@ async fn run_interactive_mode(
             continue;
         }
 
-        // 配置契约体检：随时把当前 config.toml 当源码再编译一遍
+        // 配置契约体检：对本会话实际生效的语言视图做静态检查。
         if matches!(input, "配置契约" | "配置检查" | "配置体检" | "config-lint") {
-            let issues = config_contract::lint(&config);
+            let issues = config_contract::lint(&language_config);
             println!("{}", config_contract::render_text(&issues));
+            continue;
+        }
+
+        // 配置热加载：一次事务式修订。lint 有 Error 整次拒绝；只有语言节
+        // 立即接管，结构节留待重启；会话记忆不随配置重建。
+        if matches!(
+            input,
+            "重载配置" | "配置重载" | "重新加载配置" | "reload-config" | "config-reload"
+        ) {
+            match lang_runtime.reload() {
+                Ok(LangReloadOutcome::Applied(apply)) => {
+                    language_config =
+                        Arc::clone(lang_runtime.current().language_config());
+                    let (patterns, language, plugin_entries) = apply_language_snapshot(
+                        &language_config,
+                        &mut knowledge_extractor,
+                        &mut response_formatter,
+                        &mut nlu_engine,
+                        &mut pattern_library,
+                        &plugin_runtime,
+                        &mut plugin_nlp,
+                        &mut synonyms,
+                        &mut local_semantic_adapter,
+                        &mut symbolic_reasoner,
+                    );
+                    println!(
+                        "配置已重载：epoch {} → {}。",
+                        apply.previous_epoch, apply.epoch
+                    );
+                    println!(
+                        "  已热替换：{}。",
+                        lang_runtime::render_sections(&apply.diff.hot)
+                    );
+                    if !apply.diff.restart_required.is_empty() {
+                        println!(
+                            "  需重启生效：{}。",
+                            lang_runtime::render_sections(&apply.diff.restart_required)
+                        );
+                    }
+                    println!(
+                        "  模式层：新增 {} 条、移除 {} 条，保留会话模式 {} 条；同义词新增 {} 条；插件指称 {} 条。",
+                        patterns.added,
+                        patterns.removed,
+                        patterns.kept,
+                        language.synonyms_added,
+                        plugin_entries
+                    );
+                    if apply.warnings > 0 {
+                        println!(
+                            "  配置契约警告 {} 条（输入「配置契约」查看）。",
+                            apply.warnings
+                        );
+                    }
+                    println!("  对话焦点、编年史、会话事实与已学模式保持不变。");
+                }
+                Ok(LangReloadOutcome::Unchanged { epoch }) => {
+                    println!("配置未发生语义变化（epoch {}）。", epoch);
+                }
+                Ok(LangReloadOutcome::Rejected { reason, issues }) => {
+                    println!("{}；当前仍为 epoch {}。", reason, lang_runtime.epoch());
+                    println!("{}", config_contract::render_text(&issues));
+                    println!("（会话记忆未受影响。）");
+                }
+                Err(error) => eprintln!("{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 配置回滚：把上一份快照的内容重新提交为新 epoch，而不是倒转时间。
+        if matches!(input, "回滚配置" | "配置回滚" | "config-rollback" | "rollback-config") {
+            match lang_runtime.rollback() {
+                Ok(rollback) => {
+                    language_config =
+                        Arc::clone(lang_runtime.current().language_config());
+                    let (patterns, language, plugin_entries) = apply_language_snapshot(
+                        &language_config,
+                        &mut knowledge_extractor,
+                        &mut response_formatter,
+                        &mut nlu_engine,
+                        &mut pattern_library,
+                        &plugin_runtime,
+                        &mut plugin_nlp,
+                        &mut synonyms,
+                        &mut local_semantic_adapter,
+                        &mut symbolic_reasoner,
+                    );
+                    println!(
+                        "配置已回滚：恢复 epoch {} 的内容，提交为 epoch {}。",
+                        rollback.restored_epoch, rollback.epoch
+                    );
+                    println!(
+                        "  已热替换：{}。",
+                        lang_runtime::render_sections(&rollback.diff.hot)
+                    );
+                    if !rollback.diff.restart_required.is_empty() {
+                        println!(
+                            "  需重启生效：{}。",
+                            lang_runtime::render_sections(&rollback.diff.restart_required)
+                        );
+                    }
+                    println!(
+                        "  模式层：新增 {} 条、移除 {} 条，保留会话模式 {} 条；同义词新增 {} 条；插件指称 {} 条。",
+                        patterns.added,
+                        patterns.removed,
+                        patterns.kept,
+                        language.synonyms_added,
+                        plugin_entries
+                    );
+                    println!("  同义词按会话单调追加，已登记映射需重启才完全撤销。");
+                    println!("  对话焦点、编年史、会话事实与已学模式保持不变。");
+                }
+                Err(error) => {
+                    println!("{}（epoch {} 保持）。", error, lang_runtime.epoch());
+                }
+            }
+            println!();
             continue;
         }
 
@@ -7899,7 +8069,7 @@ async fn run_interactive_mode(
         let raw_input = input;
         let plugin_outcome = if !raw_input.is_empty()
             && matches!(
-                detect_input_mode(raw_input, &config.nlp.import_keywords),
+                detect_input_mode(raw_input, &language_config.nlp.import_keywords),
                 InputMode::Query
             )
             && !is_command_like(raw_input)
@@ -7930,7 +8100,7 @@ async fn run_interactive_mode(
         // 导入行不立即刷新：进入查询/命令前统一观察整图
         if reasoner_stale
             && !matches!(
-                detect_input_mode(input, &config.nlp.import_keywords),
+                detect_input_mode(input, &language_config.nlp.import_keywords),
                 InputMode::KnowledgeImport
             )
         {
@@ -7951,7 +8121,7 @@ async fn run_interactive_mode(
         // 重启后据此回放/重建上下文（崩溃语义：最多丢进行中的一轮）。
         if !raw_input.is_empty() {
             if let Some(chronicle) = chronicle.as_mut() {
-                let mode = match detect_input_mode(raw_input, &config.nlp.import_keywords) {
+                let mode = match detect_input_mode(raw_input, &language_config.nlp.import_keywords) {
                     InputMode::KnowledgeImport => "import",
                     InputMode::Query => "query",
                 };
@@ -7993,7 +8163,7 @@ async fn run_interactive_mode(
             if raw.is_empty() {
                 println!("用法：关系获取：<实体> 的 <谓词>，例如「关系获取：姚明的女儿是谁」。");
             } else {
-                match acquisition_context(&oxigraph_manager, &config).await {
+                match acquisition_context(&oxigraph_manager, &language_config).await {
                     Ok((facts, registry, types, shapes)) => {
                         let opening =
                             acquisition.start_command(raw, &facts, &registry, &types, &shapes);
@@ -8009,7 +8179,7 @@ async fn run_interactive_mode(
 
         // 形状缺口 → 下一个问题：把节点的必备属性缺口编译成槽位追问。
         if matches!(input, "获取缺口" | "关系缺口" | "追问缺口" | "缺口追问") {
-            match acquisition_context(&oxigraph_manager, &config).await {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
                     let report = shapes.validate(&facts, &registry, &types);
                     let mut opened = None;
@@ -8102,7 +8272,7 @@ async fn run_interactive_mode(
                 let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 match suggest_case_for_text(
                     text,
-                    &config,
+                    &language_config,
                     &synonyms,
                     &pattern_episodes,
                     &context,
@@ -8143,7 +8313,7 @@ async fn run_interactive_mode(
                 let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 match suggest_case_for_text(
                     text,
-                    &config,
+                    &language_config,
                     &synonyms,
                     &pattern_episodes,
                     &context,
@@ -8275,7 +8445,7 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：软路由：<句子>，例如「软路由：法国首都是哪里」。");
             } else {
-                let tagged = preprocess(text, &config.nlp);
+                let tagged = preprocess(text, &language_config.nlp);
                 let normalized = normalize_words(tagged, &synonyms);
                 let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 let outcome = know_prolog::soft_route::route_tokens(
@@ -8283,7 +8453,7 @@ async fn run_interactive_mode(
                     &pattern_library,
                     &normalized,
                     &context,
-                    &config.reasoning.soft_route,
+                    &language_config.reasoning.soft_route,
                 );
                 println!("{}", outcome.render_report(text));
                 let exact = pattern_library
@@ -8296,7 +8466,7 @@ async fn run_interactive_mode(
                     ),
                     None => println!(
                         "精确路由未命中；自动接管：{}。",
-                        if config.reasoning.soft_route.enabled {
+                        if language_config.reasoning.soft_route.enabled {
                             "开启"
                         } else {
                             "关闭（仅手动查看）"
@@ -8312,7 +8482,7 @@ async fn run_interactive_mode(
         if matches!(input, "软路由体检" | "软路由评估" | "软匹配体检") {
             println!(
                 "{}",
-                know_prolog::soft_route::evaluate_constructed(&config).render_text()
+                know_prolog::soft_route::evaluate_constructed(&language_config).render_text()
             );
             println!();
             continue;
@@ -8333,7 +8503,7 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：模式匹配：<句子>，例如「模式匹配：法国的首都是哪里」。");
             } else {
-                let tagged = preprocess(text, &config.nlp);
+                let tagged = preprocess(text, &language_config.nlp);
                 let normalized = normalize_words(tagged, &synonyms);
                 let context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
                 let report = pattern_library.rank_with_context(&normalized, &context);
@@ -8372,7 +8542,7 @@ async fn run_interactive_mode(
             if selector.is_empty() {
                 println!("用法：采纳教学 <规则id>（用「批量教学」查看；all 采纳全部可采纳候选）。");
             } else {
-                match batch_teaching.adopt(selector, &config) {
+                match batch_teaching.adopt(selector, &language_config) {
                     Ok(ids) if ids.is_empty() => println!("没有可采纳的候选规则。"),
                     Ok(ids) => match batch_teaching.save(&batch_teaching_path) {
                         Ok(()) => println!(
@@ -8440,7 +8610,7 @@ async fn run_interactive_mode(
             ],
         ) {
             match pattern_forge::parse_forge_spec(spec.trim())
-                .and_then(|request| pattern_forge.forge(&request, &config.nlp))
+                .and_then(|request| pattern_forge.forge(&request, &language_config.nlp))
             {
                 Ok(outcome) => {
                     println!("{}", outcome.render());
@@ -8631,7 +8801,7 @@ async fn run_interactive_mode(
 
         // 锻造探针：重新跑正例/反例/逆生成句，防止正则在分词变化后悄悄失效。
         if matches!(input, "锻造探针" | "复核锻造" | "锻造探针报告") {
-            match pattern_forge.verify_probes(None, &config.nlp) {
+            match pattern_forge.verify_probes(None, &language_config.nlp) {
                 Ok(report) => {
                     println!("{}", report.render(None));
                     persist_pattern_forge(&pattern_forge, &forge_path);
@@ -8655,7 +8825,7 @@ async fn run_interactive_mode(
                 .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
                 .trim();
             let key = (!key.is_empty()).then_some(key);
-            match pattern_forge.verify_probes(key, &config.nlp) {
+            match pattern_forge.verify_probes(key, &language_config.nlp) {
                 Ok(report) => {
                     println!("{}", report.render(key));
                     persist_pattern_forge(&pattern_forge, &forge_path);
@@ -8848,7 +9018,7 @@ async fn run_interactive_mode(
             if text.is_empty() {
                 println!("用法：模式扫描：<文本>，例如「模式扫描：王强的女儿是赵敏」。");
             } else {
-                match acquisition_context(&oxigraph_manager, &config).await {
+                match acquisition_context(&oxigraph_manager, &language_config).await {
                     Ok((facts, registry, types, shapes)) => {
                         let outcome = acquisition
                             .absorb_pattern_scan(text, &facts, &registry, &types, &shapes);
@@ -8928,7 +9098,7 @@ async fn run_interactive_mode(
             if entity.is_empty() {
                 println!("用法：形状画像：<实体>，例如「形状画像：刘德华」。");
             } else {
-                match acquisition_context(&oxigraph_manager, &config).await {
+                match acquisition_context(&oxigraph_manager, &language_config).await {
                     Ok((facts, registry, types, shapes)) => {
                         let question = format!("{}是谁？", entity);
                         let turn = shape_dialogue.start_profile(
@@ -8965,7 +9135,7 @@ async fn run_interactive_mode(
         ) {
             match know_prolog::shape_dialogue::parse_ruling(body) {
                 Some((entity, predicate, value)) => {
-                    match acquisition_context(&oxigraph_manager, &config).await {
+                    match acquisition_context(&oxigraph_manager, &language_config).await {
                         Ok((facts, registry, types, shapes)) => {
                             match shape_dialogue.resolve_conflict(
                                 &entity,
@@ -8999,7 +9169,7 @@ async fn run_interactive_mode(
             && ShapeDialogue::looks_like_conflict_ruling(input)
             && !is_command_like(input)
         {
-            match acquisition_context(&oxigraph_manager, &config).await {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
                     if let Some(result) = shape_dialogue.resolve_conflict_text(
                         input,
@@ -9030,7 +9200,7 @@ async fn run_interactive_mode(
         }
 
         if matches!(input, "形状议程" | "形状缺口议程") {
-            match acquisition_context(&oxigraph_manager, &config).await {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
                     let (ruled_facts, ruled_overlay) = know_prolog::shape_dialogue::apply_rulings(
                         &facts,
@@ -9052,7 +9222,7 @@ async fn run_interactive_mode(
         }
 
         if matches!(input, "下一个形状问题" | "下一个缺口问题") {
-            match acquisition_context(&oxigraph_manager, &config).await {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
                     match shape_dialogue.ask_next(
                         &facts,
@@ -9090,11 +9260,11 @@ async fn run_interactive_mode(
             && !is_command_like(input)
             && RelationAcquisition::looks_like_answer(input)
             && !matches!(
-                detect_input_mode(input, &config.nlp.import_keywords),
+                detect_input_mode(input, &language_config.nlp.import_keywords),
                 InputMode::KnowledgeImport
             )
         {
-            match acquisition_context(&oxigraph_manager, &config).await {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
                     if let Some(turn) = shape_dialogue.respond(
                         input,
@@ -9121,11 +9291,11 @@ async fn run_interactive_mode(
             && !is_command_like(input)
             && RelationAcquisition::looks_like_answer(input)
             && !matches!(
-                detect_input_mode(input, &config.nlp.import_keywords),
+                detect_input_mode(input, &language_config.nlp.import_keywords),
                 InputMode::KnowledgeImport
             )
         {
-            match acquisition_context(&oxigraph_manager, &config).await {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
                     let outcome =
                         acquisition.interpret_answer(input, &facts, &registry, &types, &shapes);
@@ -9921,7 +10091,7 @@ async fn run_interactive_mode(
                             }
                         }
                     }
-                    for profile in &config.predicate_profiles {
+                    for profile in &language_config.predicate_profiles {
                         coverage.registered_predicates.push(profile.name.clone());
                         coverage
                             .registered_predicates
@@ -11377,7 +11547,7 @@ async fn run_interactive_mode(
 
         // 质量护照：确定性可信向量（低分只用于排序/措辞/追问，不写回、不删事实）
         if matches!(input, "质量护照" | "质量总览" | "护照总览") {
-            match quality_report_for(&oxigraph_manager, &config, &store_path).await {
+                match quality_report_for(&oxigraph_manager, &language_config, &store_path).await {
                 Ok(report) => println!("{}", report.render_text()),
                 Err(e) => eprintln!("构建质量护照失败: {}", e),
             }
@@ -11390,7 +11560,7 @@ async fn run_interactive_mode(
             input,
             "形状报告" | "形状校验" | "SHACL报告" | "shacl报告" | "shapes"
         ) {
-            match shape_report_for(&oxigraph_manager, &config).await {
+            match shape_report_for(&oxigraph_manager, &language_config).await {
                 Ok((_, report)) => println!("{}", report.render_text()),
                 Err(e) => eprintln!("构建形状报告失败: {}", e),
             }
@@ -11404,7 +11574,7 @@ async fn run_interactive_mode(
             if entity.is_empty() {
                 println!("请给出实体名，例如：质量护照：张三");
             } else {
-                match quality_report_for(&oxigraph_manager, &config, &store_path).await {
+            match quality_report_for(&oxigraph_manager, &language_config, &store_path).await {
                     Ok(report) => match report.passport_for(entity) {
                         Some(passport) => println!("{}", render_entity_passport(passport)),
                         None => println!(
@@ -11920,7 +12090,7 @@ async fn run_interactive_mode(
                 Err(e) => println!("读取融合账本失败：{}", e),
             }
             match oxigraph_manager
-                .fusion_plan(&FusionPolicy::new().with_functional(functional_predicates(&config)))
+                .fusion_plan(&FusionPolicy::new().with_functional(functional_predicates(&language_config)))
                 .await
             {
                 Ok(plan) => println!("{}", plan.render_zh()),
@@ -11933,7 +12103,7 @@ async fn run_interactive_mode(
         // 知识融合物化：把当前视图的赢家写入默认图（可重复执行，幂等）
         if matches!(input, "融合应用" | "物化融合" | "应用融合") {
             match oxigraph_manager
-                .apply_fusion(&FusionPolicy::new().with_functional(functional_predicates(&config)))
+                .apply_fusion(&FusionPolicy::new().with_functional(functional_predicates(&language_config)))
                 .await
             {
                 Ok(outcome) => {
@@ -12037,7 +12207,7 @@ async fn run_interactive_mode(
             refresh_dialogue_quality(
                 &mut dialogue_manager,
                 &oxigraph_manager,
-                &config,
+                &language_config,
                 symbolic_reasoner.revision(),
                 &store_path,
             )
@@ -12309,15 +12479,15 @@ async fn run_interactive_mode(
             continue;
         }
 
-        let mode = detect_input_mode(input, &config.nlp.import_keywords);
+        let mode = detect_input_mode(input, &language_config.nlp.import_keywords);
 
         match mode {
             InputMode::KnowledgeImport => {
                 {
                     // 知识导入逻辑
-                    println!("{}", config.messages.importing);
+                    println!("{}", language_config.messages.importing);
 
-                    let clean_text = config
+                    let clean_text = language_config
                         .nlp
                         .import_keywords
                         .iter()
@@ -12336,7 +12506,7 @@ async fn run_interactive_mode(
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
                     let learned =
-                        batch_teaching.extract_active(&config, &clean_text, &normalized_words);
+                        batch_teaching.extract_active(&language_config, &clean_text, &normalized_words);
                     let learned_added = append_learned_items(&mut items, learned);
                     if learned_added > 0 {
                         println!("批量教学规则命中 {} 条。", learned_added);
@@ -12363,7 +12533,7 @@ async fn run_interactive_mode(
                     }
 
                     if items.is_empty() {
-                        println!("{}", config.messages.no_knowledge_extracted);
+                        println!("{}", language_config.messages.no_knowledge_extracted);
                     } else {
                         for item in &items {
                             match item {
@@ -12759,7 +12929,7 @@ async fn run_interactive_mode(
                     refresh_dialogue_quality(
                         &mut dialogue_manager,
                         &oxigraph_manager,
-                        &config,
+                        &language_config,
                         symbolic_reasoner.revision(),
                         &store_path,
                     )
@@ -12789,8 +12959,8 @@ async fn run_interactive_mode(
 
                 let tagged_words = preprocess(input, &plugin_nlp);
                 let precomputed_query_entities =
-                    extract_query_entities_from_tagged(&tagged_words, &config);
-                let nlu_tagged_words = if config.nlp.enable_nlu.unwrap_or(false) {
+                    extract_query_entities_from_tagged(&tagged_words, &language_config);
+                let nlu_tagged_words = if language_config.nlp.enable_nlu.unwrap_or(false) {
                     Some(tagged_words.clone())
                 } else {
                     None
@@ -12809,7 +12979,7 @@ async fn run_interactive_mode(
                 let route_context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);
 
                 // 使用NLU进行语义理解
-                if config.nlp.enable_nlu.unwrap_or(false) {
+                if language_config.nlp.enable_nlu.unwrap_or(false) {
                     let semantic_analysis = match nlu_tagged_words {
                         Some(tagged) => nlu_engine.analyze_tagged(input, tagged),
                         None => nlu_engine.analyze(input),
@@ -12818,7 +12988,7 @@ async fn run_interactive_mode(
                     if !semantic_analysis.semantics.is_empty() {
                         let best_semantic = &semantic_analysis.semantics[0];
                         let confidence_threshold =
-                            config.nlp.nlu_confidence_threshold.unwrap_or(0.6);
+                            language_config.nlp.nlu_confidence_threshold.unwrap_or(0.6);
 
                         if best_semantic.score >= confidence_threshold {
                             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -13017,7 +13187,7 @@ async fn run_interactive_mode(
                                             &normalized_words,
                                             &mut pattern_episodes,
                                             &route_context,
-                                            &config.reasoning.soft_route,
+                                            &language_config.reasoning.soft_route,
                                         )
                                     {
                                         // 执行查询流程
@@ -13026,7 +13196,7 @@ async fn run_interactive_mode(
                                             record_forge_hit(&mut pattern_forge, note, &forge_path);
                                         }
                                         continue_original_query(
-                                            &config,
+                                            &language_config,
                                             &oxigraph_manager,
                                             &mut prolog_engine,
                                             &response_formatter,
@@ -13079,7 +13249,7 @@ async fn run_interactive_mode(
                                             &normalized_words,
                                             &mut pattern_episodes,
                                             &route_context,
-                                            &config.reasoning.soft_route,
+                                            &language_config.reasoning.soft_route,
                                         )
                                     {
                                         if let Some(note) = &pattern_note {
@@ -13087,7 +13257,7 @@ async fn run_interactive_mode(
                                             record_forge_hit(&mut pattern_forge, note, &forge_path);
                                         }
                                         continue_original_query(
-                                            &config,
+                                            &language_config,
                                             &oxigraph_manager,
                                             &mut prolog_engine,
                                             &response_formatter,
@@ -13124,10 +13294,10 @@ async fn run_interactive_mode(
                                             &[format!("插件策略 {}", plan)],
                                         );
                                     } else {
-                                        println!("{}", config.messages.cannot_understand);
+                                        println!("{}", language_config.messages.cannot_understand);
                                         log_chronicle_reply(
                                             &mut chronicle,
-                                            &config.messages.cannot_understand,
+                                            &language_config.messages.cannot_understand,
                                             &[],
                                             &[],
                                         );
@@ -13233,7 +13403,7 @@ async fn run_interactive_mode(
                     &normalized_words,
                     &mut pattern_episodes,
                     &route_context,
-                    &config.reasoning.soft_route,
+                    &language_config.reasoning.soft_route,
                 ) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
@@ -13252,7 +13422,7 @@ async fn run_interactive_mode(
                     }
 
                     // === 歧义解析 ===
-                    if let Some(api_config) = &config.api {
+                    if let Some(api_config) = &language_config.api {
                         if api_config.enable_entity_disambiguation {
                             let resolved_entities = resolve_query_entities_with_disambiguation(
                                 input,
@@ -13308,7 +13478,7 @@ async fn run_interactive_mode(
                                     }
                                 }
                                 Err(e) => {
-                                    println!("{}: {}", config.messages.process_error, e);
+                                    println!("{}: {}", language_config.messages.process_error, e);
                                 }
                             }
                         } else {
@@ -13347,7 +13517,7 @@ async fn run_interactive_mode(
                                     }
                                 }
                                 Err(e) => {
-                                    println!("{}: {}", config.messages.process_error, e);
+                                    println!("{}: {}", language_config.messages.process_error, e);
                                 }
                             }
                         }
@@ -13387,7 +13557,7 @@ async fn run_interactive_mode(
                                 }
                             }
                             Err(e) => {
-                                println!("{}: {}", config.messages.process_error, e);
+                                println!("{}: {}", language_config.messages.process_error, e);
                             }
                         }
                     }
@@ -13419,7 +13589,7 @@ async fn run_interactive_mode(
                         }
                     }
                     if missing_entities.is_empty() {
-                        println!("{}", config.messages.cannot_understand);
+                        println!("{}", language_config.messages.cannot_understand);
                     } else {
                         let names = missing_entities
                             .iter()
@@ -14138,6 +14308,7 @@ fn interactive_help() -> String {
         "  外链台账 / 图账本                     外部知识留册与命名图物化视图",
         "  融合 / 融合应用 / 裁决：谓词=来源     多来源融合视图、物化与显式裁决",
         "  配置契约 / 配置体检                   config.toml 引用/能力/阈值静态检查",
+        "  重载配置 / 回滚配置                   事务式热更新语言节；结构节留待重启",
         "",
         "证明与视图",
         "  证明图：<目标> / 知识子图：<实体>     证明树 / 邻域子图",
@@ -14556,6 +14727,15 @@ fn is_command_like(input: &str) -> bool {
         "配置检查",
         "配置体检",
         "config-lint",
+        "重载配置",
+        "配置重载",
+        "重新加载配置",
+        "reload-config",
+        "config-reload",
+        "回滚配置",
+        "配置回滚",
+        "config-rollback",
+        "rollback-config",
         "性能报告",
         "性能台账",
         "运行统计",

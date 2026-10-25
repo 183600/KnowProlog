@@ -75,6 +75,7 @@ pub mod identity_eval;
 pub mod import_journal;
 pub mod knowledge_fusion;
 pub mod knowledge_layers;
+pub mod lang_runtime;
 pub mod law_book;
 pub mod lex_gate;
 pub mod lexical_memory;
@@ -399,8 +400,9 @@ impl JsonldImportStats {
     }
 }
 
-// 所有配置结构体都需要是 pub，以便在测试中使用
-#[derive(Debug, Deserialize)]
+// 所有配置结构体都需要是 pub，以便在测试中使用；
+// 派生 Clone 让语言运行时能在不重启进程的前提下重建语言配置视图。
+#[derive(Debug, Deserialize, Clone)]
 pub struct SystemConfig {
     pub system: SystemSettings,
     pub api: Option<ApiConfig>,
@@ -780,7 +782,7 @@ impl Default for ReasoningConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ApiConfig {
     pub ownthink_base_url: String,
     pub ownthink_timeout_seconds: u64,
@@ -802,12 +804,12 @@ fn default_external_ledger_capacity() -> usize {
     external_ledger::DEFAULT_CAPACITY
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SynonymsConfig {
     pub mappings: HashMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SystemSettings {
     pub oxigraph_endpoint: String,
     pub oxigraph_store_path: String,
@@ -838,14 +840,14 @@ pub struct NamePatterns {
     pub profession_suffix: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct EntityTypeConfig {
     pub label: String,
     pub properties: Vec<PropertyConfig>,
     pub examples: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PropertyConfig {
     pub name: String,
     pub data_type: String,
@@ -854,7 +856,7 @@ pub struct PropertyConfig {
     pub extraction_patterns: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExtractionRule {
     pub name: String,
     pub entity_type: String,
@@ -862,14 +864,14 @@ pub struct ExtractionRule {
     pub priority: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PatternConfig {
     pub pos_pattern: Vec<String>,
     pub keyword_patterns: Option<Vec<String>>,
     pub property_mappings: HashMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PrologRuleConfig {
     pub name: String,
     pub pattern: Vec<String>,
@@ -882,7 +884,7 @@ pub struct PrologRuleConfig {
     pub defer_to_soft: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Messages {
     pub startup: String,
     pub ready: String,

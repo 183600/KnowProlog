@@ -90,7 +90,7 @@ use crate::temporal::{
     self, validity_from_bounds, TemporalConstraint, UnknownTimePolicy, Validity,
 };
 use crate::view_render::ProofViewNode;
-use crate::{NlpConfig, ReasoningConfig};
+use crate::{NlpConfig, ReasoningConfig, SystemConfig};
 
 // 归结引擎内部谓词：has(E, 谓词名) / type(E, 类型名)，用于承载关联规则的物品
 const PROOF_HAS: &str = "__具有__";
@@ -1003,6 +1003,20 @@ pub struct PluginOntologySync {
     pub lessons: usize,
 }
 
+/// 语言策略热更新的回执。配置里的推理结构阈值不在本方法范围内：
+/// 那些属于需要重启的层，绝不在一轮对话中半途换掉。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LanguagePolicySync {
+    /// 新登记的同义词条数（已存在的映射不计）。
+    pub synonyms_added: usize,
+    /// 是否替换了分词/NLU 配置。
+    pub nlp_updated: bool,
+    /// 生成预算是否变化。
+    pub generation_updated: bool,
+    /// 当前是否挂接着双向语义规则包。
+    pub semantic_grammar: bool,
+}
+
 /// 结构化证明视图：可视化（Mermaid/ASCII）消费的纯数据，不重复解析逻辑。
 #[derive(Debug, Clone)]
 pub struct ResolutionProofView {
@@ -1803,6 +1817,63 @@ impl SymbolicReasoner {
     pub fn set_nlp_config(&mut self, config: NlpConfig) {
         self.nlp_config = Some(config);
         self.read_traces.clear();
+    }
+
+    /// 应用热替换的语言策略：同义词、分词/NLU 配置、生成预算与双向语义规则。
+    ///
+    /// 只触碰「怎么说」这一层，不重建事实、焦点、会话假设或已学规则。
+    /// 同义词是单调追加：删除旧映射不会在会话中撤销已经学到的指称；
+    /// 这类撤销应由重启按新配置重建。
+    pub fn apply_language_policy(&mut self, config: &SystemConfig) -> LanguagePolicySync {
+        let mut sync = LanguagePolicySync::default();
+        if let Some(synonyms) = &config.synonyms {
+            for (alias, canonical) in &synonyms.mappings {
+                let (alias, canonical) = (alias.trim(), canonical.trim());
+                if alias.is_empty() || canonical.is_empty() || alias == canonical {
+                    continue;
+                }
+                self.linker.register_alias(alias, canonical);
+                if self.aligner.register_synonym(alias, canonical) {
+                    sync.synonyms_added += 1;
+                }
+            }
+        }
+        if sync.synonyms_added > 0 {
+            self.rebuild_knowledge_caches();
+        }
+
+        let enable_generation = self.config.enable_generation;
+        let budget = (
+            self.config.max_profile_sentences,
+            self.config.completion_min_score,
+        );
+        self.config.enable_generation = config.reasoning.enable_generation;
+        self.config.max_profile_sentences = config.reasoning.max_profile_sentences;
+        self.config.completion_min_score = config.reasoning.completion_min_score;
+        sync.generation_updated = enable_generation != self.config.enable_generation
+            || budget
+                != (
+                    self.config.max_profile_sentences,
+                    self.config.completion_min_score,
+                );
+        self.generator.set_generation_budget(
+            config.reasoning.max_profile_sentences,
+            config.reasoning.completion_min_score,
+        );
+
+        if config.semantic_grammar.enabled {
+            self.generator.attach_semantic_grammar(
+                crate::semantic_grammar::RulePack::from_config(config),
+            );
+            sync.semantic_grammar = true;
+        } else {
+            self.generator.detach_semantic_grammar();
+            sync.semantic_grammar = false;
+        }
+
+        self.set_nlp_config(config.nlp.clone());
+        sync.nlp_updated = true;
+        sync
     }
 
     /// 恢复跨会话词法记忆（宿主从命名图读取后注入）。
@@ -15992,6 +16063,40 @@ mod tests {
             .expect("代词应被解析为上下文焦点实体");
         assert!(rewritten.contains("张三"));
         assert!(!rewritten.contains("他的"));
+    }
+
+    #[test]
+    fn apply_language_policy_swaps_language_layer_but_keeps_session_memory() {
+        let mut config = test_config();
+        config.max_profile_sentences = 4;
+        config.enable_generation = true;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let revision = reasoner.revision();
+        assert!(reasoner.linker.is_known_entity("张三"));
+
+        let mut language: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        language.reasoning.max_profile_sentences = 2;
+        language.reasoning.enable_generation = false;
+        language.synonyms = Some(crate::SynonymsConfig {
+            mappings: HashMap::from([("师父".to_string(), "师傅".to_string())]),
+        });
+        language.semantic_grammar.enabled = false;
+
+        let sync = reasoner.apply_language_policy(&language);
+        assert!(sync.nlp_updated);
+        assert_eq!(sync.synonyms_added, 1);
+        assert!(sync.generation_updated);
+        assert!(!sync.semantic_grammar);
+        assert!(reasoner.aligner.synonyms().contains_key("师父"));
+        assert_eq!(reasoner.config.max_profile_sentences, 2);
+        assert!(!reasoner.config.enable_generation);
+        assert_eq!(reasoner.revision(), revision, "语言热替换不改知识修订号");
+        assert!(
+            reasoner.linker.is_known_entity("张三"),
+            "语言热替换不丢会话实体"
+        );
     }
 
     /// 类型闸门：「他/她」可解析人物（类型未知按开放世界放行），

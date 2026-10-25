@@ -778,6 +778,21 @@ impl SymbolicGenerator {
         self.semantic_grammar = Some(grammar);
     }
 
+    /// 摘除双向语义规则包（配置热加载关闭该能力时使用）。
+    pub fn detach_semantic_grammar(&mut self) {
+        self.semantic_grammar = None;
+    }
+
+    /// 热更新生成预算：只改「说多少」，不重建已观察的事实与类型索引。
+    pub fn set_generation_budget(
+        &mut self,
+        max_profile_sentences: usize,
+        completion_min_score: f64,
+    ) {
+        self.max_profile_sentences = max_profile_sentences.max(1);
+        self.completion_min_score = completion_min_score.clamp(0.0, 1.0);
+    }
+
     /// 当前挂接的语义规则包（未挂接时为 `None`）。
     pub fn semantic_grammar(&self) -> Option<&crate::semantic_grammar::RulePack> {
         self.semantic_grammar.as_ref()

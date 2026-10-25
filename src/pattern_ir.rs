@@ -2116,6 +2116,14 @@ fn first_elem_may_miss(entry: &PatternEntry, tokens: &[crate::nlp::TaggedWord]) 
 // 模式库
 // ---------------------------------------------------------------------------
 
+/// 配置层热替换的回执：旧基础条数、新基础条数、保留下来的会话条数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatternLayerRefresh {
+    pub removed: usize,
+    pub added: usize,
+    pub kept: usize,
+}
+
 /// 模式库：配置查询 + NLU 意图 + 教学模式的统一登记处。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PatternLibrary {
@@ -2315,6 +2323,41 @@ impl PatternLibrary {
         self.entries
             .retain(|entry| !entry.source.starts_with(prefix));
         before - self.entries.len()
+    }
+
+    /// 配置层条目的来源前缀：`config.toml` 查询规则与内置 NLU 意图。
+    pub fn is_config_layer_source(source: &str) -> bool {
+        source.starts_with("config.toml#") || source.starts_with("nlu#")
+    }
+
+    /// 原子替换配置层：重编译查询规则与 NLU 回退，保留教学/归纳/锻造来源。
+    ///
+    /// 热加载只换「语言策略」这一层；会话中学到的模式、已确认案例与锻造
+    /// 展开不随配置重建。返回移除了多少旧基础条目、加入了多少新基础条目。
+    pub fn replace_config_layer(&mut self, config: &SystemConfig) -> PatternLayerRefresh {
+        let removed = self
+            .entries
+            .iter()
+            .filter(|entry| Self::is_config_layer_source(&entry.source))
+            .count();
+        let runtime: Vec<PatternEntry> = self
+            .entries
+            .iter()
+            .filter(|entry| !Self::is_config_layer_source(&entry.source))
+            .cloned()
+            .collect();
+        let kept = runtime.len();
+        let mut next = Self::from_config(config);
+        let added = next.entries.len();
+        for entry in runtime {
+            next.add(entry);
+        }
+        *self = next;
+        PatternLayerRefresh {
+            removed,
+            added,
+            kept,
+        }
     }
 
     /// 并入外部载入的条目（教学与归纳来源；配置/NLU 每次启动重建）。
@@ -4899,5 +4942,50 @@ mod tests {
         assert_eq!(log.revision(), after_record, "只读检索不应推进版本");
         assert_eq!(log.forget(&episode.short_id()), 1);
         assert!(log.revision() > after_record, "删除经验应推进版本");
+    }
+
+    #[test]
+    fn config_layer_replacement_keeps_session_patterns_and_recompiles_nlu() {
+        let mut config: SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let mut library = PatternLibrary::from_config(&config);
+        library
+            .teach("会话规则", "nr 今年 多大", "age_query", 30)
+            .expect("教学规则应可编译");
+        library.add(PatternEntry::new(
+            "锻造规则",
+            "induced#forge#test",
+            "age_query",
+            25,
+            true,
+            vec![Elem::pos("nr"), Elem::word("几岁")],
+        ));
+        let taught_before = library.entries().len();
+        let removed_rule = config.prolog_rules.remove(0).name;
+        let refresh = library.replace_config_layer(&config);
+
+        assert!(refresh.removed > 0);
+        assert!(refresh.added > 0);
+        assert_eq!(refresh.kept, taught_before - refresh.removed);
+        assert!(
+            library.entries().iter().all(|entry| entry.name != removed_rule),
+            "被删掉的配置规则不应在重建后复活"
+        );
+        assert!(library
+            .entries()
+            .iter()
+            .any(|entry| entry.source == "taught#会话"));
+        assert!(library
+            .entries()
+            .iter()
+            .any(|entry| entry.source == "induced#forge#test"));
+        assert_eq!(
+            library.count_with_source_prefix("config.toml#"),
+            config.prolog_rules.len()
+        );
+        assert!(
+            library.count_with_source_prefix("nlu#") > 0,
+            "NLU 回退层应随配置重建"
+        );
     }
 }
