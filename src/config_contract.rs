@@ -1930,6 +1930,34 @@ process_error = "处理出错"
     }
 
     #[test]
+    fn semantic_grammar_rules_are_compiled_and_reported() {
+        let valid = format!(
+            "{}\n[semantic_grammar]\nenabled = true\n\n[[semantic_grammar.rules]]\nname = \"身高\"\npredicate = \"height\"\nentity_type = \"Person\"\npattern = [\"$s:pos:nr\", \"身高\", \"$o:pos:m\"]\nrealize = \"{{s}}身高{{o}}\"\n",
+            base()
+        );
+        let issues = lint_source(&valid);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code.starts_with("semantic_")),
+            "合法双向规则不应报语义问题：{}",
+            render_text(&issues)
+        );
+
+        let invalid = format!(
+            "{}\n[semantic_grammar]\nenabled = true\n\n[[semantic_grammar.rules]]\nname = \"坏规则\"\npredicate = \"height\"\npattern = [\"$s:pos:nr\"]\nrealize = \"{{s}}\"\n",
+            base()
+        );
+        assert_code(&lint_source(&invalid), "semantic_rule_compile_error");
+
+        let disabled = format!(
+            "{}\n[semantic_grammar]\nenabled = false\n\n[[semantic_grammar.rules]]\nname = \"预览\"\npredicate = \"height\"\npattern = [\"$s:pos:nr\", \"身高\", \"$o:pos:m\"]\nrealize = \"{{s}}身高{{o}}\"\n",
+            base()
+        );
+        assert_code(&lint_source(&disabled), "semantic_grammar_disabled");
+    }
+
+    #[test]
     fn trace_graph_mode_is_validated() {
         // 合法模式：不报错误。
         for mode in ["off", "observe", "on"] {
