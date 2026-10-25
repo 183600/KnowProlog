@@ -305,7 +305,9 @@ impl RulePack {
             if rule.predicate != predicate {
                 continue;
             }
-            let template = rule.realize.as_ref()?;
+            let Some(template) = rule.realize.as_ref() else {
+                continue;
+            };
             let text = template
                 .replace("{s}", subject)
                 .replace("{o}", &joined)
@@ -852,6 +854,32 @@ mod tests {
         assert!(pack.is_empty());
         assert_eq!(pack.errors().len(), 1);
         assert!(pack.errors()[0].message.contains("取值捕获"));
+    }
+
+    #[test]
+    fn realization_skips_rules_without_template_instead_of_giving_up() {
+        let mut no_template = rule(
+            "无模板",
+            "height",
+            &["$s:pos:nr", "身高", "$o:pos:m"],
+            "{s}身高{o}",
+            false,
+        );
+        no_template.realize = None;
+        no_template.priority = 20;
+        let with_template = rule(
+            "有模板",
+            "height",
+            &["$s:pos:nr", "身高", "$o:pos:m"],
+            "{s}的身高是{o}",
+            false,
+        );
+        let pack = RulePack::compile(vec![no_template, with_template]);
+        let text = pack
+            .realize_values("小明", "height", &["226".to_string()])
+            .unwrap();
+        assert_eq!(text.rule, "有模板");
+        assert_eq!(text.text, "小明的身高是226");
     }
 
     #[test]
