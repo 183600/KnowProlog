@@ -6384,12 +6384,21 @@ async fn run_ask(
                 dialogue.note_plugin_focus(&entity);
             }
             generated
+        } else if let Some(reply) = dialogue.plan_pure_dialogue(&question, &reasoner) {
+            // 元话语/情态承接优先，避免把「还有呢」误当实体省略补全。
+            Some(reply.text)
         } else {
+            // 与交互模式共用同一条上下文前通道：管道输入里的
+            // 「那李四呢」「他的师傅是谁」也按上一轮计划/谓词补全。
+            let contextual = reasoner.contextualize_with_receipt(&question);
+            let effective = contextual
+                .as_ref()
+                .map(|rewrite| rewrite.text.as_str())
+                .unwrap_or(question.as_str());
             dialogue
-                .plan_pure_dialogue(&question, &reasoner)
-                .or_else(|| dialogue.plan_reply(&question, &reasoner))
+                .plan_reply(effective, &reasoner)
                 .map(|reply| reply.text)
-                .or_else(|| reasoner.answer(&question))
+                .or_else(|| reasoner.answer(effective))
         };
         let mut status = if answer.is_some() {
             "answered"
