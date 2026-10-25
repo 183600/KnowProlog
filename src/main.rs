@@ -2150,11 +2150,7 @@ async fn main() {
                                     ""
                                 }
                             );
-                            let rows = if all {
-                                &view.all
-                            } else {
-                                &view.effective
-                            };
+                            let rows = if all { &view.all } else { &view.effective };
                             for record in rows {
                                 println!("  {}", record.display());
                             }
@@ -4681,7 +4677,6 @@ fn run_events(
     }
 }
 
-
 /// 解析 `--fact`：支持竖线、制表、逗号与空白分隔。
 fn parse_semantic_fact(raw: &str) -> Option<know_prolog::provenance::FactRef> {
     let raw = raw.trim();
@@ -4813,7 +4808,11 @@ fn run_semantic_grammar(
         for trip in &trips {
             println!(
                 "  往返 {}：{} ⇒ {}",
-                if trip.consistent { "一致" } else { "不一致" },
+                if trip.consistent {
+                    "一致"
+                } else {
+                    "不一致"
+                },
                 trip.text,
                 trip.recovered
                     .as_ref()
@@ -14397,7 +14396,12 @@ mod session_tests {
 
     #[test]
     fn semantic_fact_argument_accepts_common_separators() {
-        for raw in ["张三|height|226", "张三 height 226", "张三,height,226", "张三，height，226"] {
+        for raw in [
+            "张三|height|226",
+            "张三 height 226",
+            "张三,height,226",
+            "张三，height，226",
+        ] {
             let fact = parse_semantic_fact(raw).unwrap();
             assert_eq!(fact.subject, "张三");
             assert_eq!(fact.predicate, "height");

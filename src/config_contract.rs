@@ -684,11 +684,7 @@ fn check_extraction_rules(c: &mut Collector, config: &SystemConfig, type_names: 
 }
 
 /// 双向语义规则包的静态检查：坏规则必须在 lint 中可见，而不是等运行时空转。
-fn check_semantic_grammar(
-    c: &mut Collector,
-    config: &SystemConfig,
-    type_names: &BTreeSet<String>,
-) {
+fn check_semantic_grammar(c: &mut Collector, config: &SystemConfig, type_names: &BTreeSet<String>) {
     let grammar = &config.semantic_grammar;
     if !grammar.enabled {
         if !grammar.rules.is_empty() {
@@ -721,12 +717,19 @@ fn check_semantic_grammar(
         let path = format!("semantic_grammar.rules[{}]", index);
         let name = rule.name.trim();
         if name.is_empty() {
-            c.error("empty_semantic_rule_name", format!("{}.name", path), "规则名为空");
+            c.error(
+                "empty_semantic_rule_name",
+                format!("{}.name", path),
+                "规则名为空",
+            );
         } else if let Some(first) = names.insert(name.to_string(), index) {
             c.warn(
                 "duplicate_semantic_rule_name",
                 format!("{}.name", path),
-                format!("规则名「{}」与 semantic_grammar.rules[{}] 重复", name, first),
+                format!(
+                    "规则名「{}」与 semantic_grammar.rules[{}] 重复",
+                    name, first
+                ),
             );
         }
         if rule.predicate.trim().is_empty() {
@@ -741,7 +744,10 @@ fn check_semantic_grammar(
                 c.warn(
                     "dangling_semantic_entity_type",
                     format!("{}.entity_type", path),
-                    format!("实体类型「{}」未声明：抽取结果仍会入库，但类型契约看不到它", entity_type),
+                    format!(
+                        "实体类型「{}」未声明：抽取结果仍会入库，但类型契约看不到它",
+                        entity_type
+                    ),
                 );
             }
         }

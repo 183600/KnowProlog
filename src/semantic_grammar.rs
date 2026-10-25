@@ -146,7 +146,10 @@ impl RuleMatch {
             properties.insert("name".to_string(), self.fact.subject.clone());
             properties.insert(self.fact.predicate.clone(), self.fact.value.clone());
             KnowledgeItem::Entity {
-                label: self.entity_type.clone().unwrap_or_else(|| "Entity".to_string()),
+                label: self
+                    .entity_type
+                    .clone()
+                    .unwrap_or_else(|| "Entity".to_string()),
                 properties,
             }
         }
@@ -240,7 +243,8 @@ impl RulePack {
             }
             for start in 0..words.len() {
                 let mut bindings = BTreeMap::new();
-                if let Some((end, captures)) = match_atoms(&rule.atoms, words, 0, start, &mut bindings)
+                if let Some((end, captures)) =
+                    match_atoms(&rule.atoms, words, 0, start, &mut bindings)
                 {
                     let fact = match build_fact(rule, &captures) {
                         Some(fact) => fact,
@@ -299,7 +303,12 @@ impl RulePack {
     ///
     /// 只使用显式配置了模板的规则；没有模板时返回 `None`，调用方保留原有
     /// 生成路径，避免新模块悄悄改变旧输出。
-    pub fn realize_values(&self, subject: &str, predicate: &str, values: &[String]) -> Option<Realization> {
+    pub fn realize_values(
+        &self,
+        subject: &str,
+        predicate: &str,
+        values: &[String],
+    ) -> Option<Realization> {
         let joined = values.join("、");
         for rule in &self.rules {
             if rule.predicate != predicate {
@@ -333,11 +342,7 @@ impl RulePack {
     }
 
     /// 往返检查：事实 → 句子 → 分词 → 事实。
-    pub fn roundtrip(
-        &self,
-        fact: &FactRef,
-        nlp: &crate::NlpConfig,
-    ) -> Option<RoundTrip> {
+    pub fn roundtrip(&self, fact: &FactRef, nlp: &crate::NlpConfig) -> Option<RoundTrip> {
         let realization = self.realize_fact(fact)?;
         let recovered = self
             .extract_text(&realization.text, nlp)
@@ -395,7 +400,11 @@ impl RulePack {
 
 fn render_atom(atom: &PatternAtom) -> String {
     match atom {
-        PatternAtom::Capture { slot, pos, optional } => {
+        PatternAtom::Capture {
+            slot,
+            pos,
+            optional,
+        } => {
             let suffix = if *optional { "?" } else { "" };
             if pos.is_empty() {
                 format!("${}{}", slot, suffix)
@@ -447,7 +456,10 @@ fn compile_rule(config: &SemanticRuleConfig) -> Result<SemanticRule, String> {
     if !has_value {
         return Err("缺少取值捕获：请使用 $o / $object / $value".to_string());
     }
-    let realize = config.realize.as_ref().map(|template| template.trim().to_string());
+    let realize = config
+        .realize
+        .as_ref()
+        .map(|template| template.trim().to_string());
     if let Some(template) = &realize {
         if !template.contains("{s}") || !template.contains("{o}") {
             return Err("realize 必须同时包含 {s} 与 {o}".to_string());
@@ -601,8 +613,13 @@ fn match_atoms_required(
                 next.insert(slot, value);
             }
         }
-        if let Some(result) = match_atoms(atoms, words, atom_index + 1, word_index + advance, &mut next)
-        {
+        if let Some(result) = match_atoms(
+            atoms,
+            words,
+            atom_index + 1,
+            word_index + advance,
+            &mut next,
+        ) {
             return Some(result);
         }
     }
@@ -661,10 +678,7 @@ fn atom_candidates(
 }
 
 fn pos_match(expected: &[String], actual: &str) -> bool {
-    expected.is_empty()
-        || expected
-            .iter()
-            .any(|pos| pos == "*" || pos == actual)
+    expected.is_empty() || expected.iter().any(|pos| pos == "*" || pos == actual)
 }
 
 #[cfg(test)]
@@ -672,7 +686,13 @@ mod tests {
     use super::*;
     use crate::NamePatterns;
 
-    fn rule(name: &str, predicate: &str, pattern: &[&str], realize: &str, relation: bool) -> SemanticRuleConfig {
+    fn rule(
+        name: &str,
+        predicate: &str,
+        pattern: &[&str],
+        realize: &str,
+        relation: bool,
+    ) -> SemanticRuleConfig {
         SemanticRuleConfig {
             name: name.to_string(),
             predicate: predicate.to_string(),
@@ -722,9 +742,18 @@ mod tests {
             false,
         )]);
         let words = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "身高".into(), pos: "n".into() },
-            TaggedWord { text: "226".into(), pos: "m".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "身高".into(),
+                pos: "n".into(),
+            },
+            TaggedWord {
+                text: "226".into(),
+                pos: "m".into(),
+            },
         ];
         let hits = pack.extract_tagged(&words);
         assert_eq!(hits.len(), 1);
@@ -745,17 +774,28 @@ mod tests {
             true,
         )]);
         let words = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "认识".into(), pos: "v".into() },
-            TaggedWord { text: "小刚".into(), pos: "nr".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "认识".into(),
+                pos: "v".into(),
+            },
+            TaggedWord {
+                text: "小刚".into(),
+                pos: "nr".into(),
+            },
         ];
         let hits = pack.extract_tagged(&words);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].relation);
         assert_eq!(hits[0].fact, FactRef::relation("小明", "认识", "小刚"));
         let item = hits[0].to_knowledge_item();
-        assert!(matches!(item, KnowledgeItem::Relationship { ref from_id, ref to_id, .. }
-            if from_id == "小明" && to_id == "小刚"));
+        assert!(
+            matches!(item, KnowledgeItem::Relationship { ref from_id, ref to_id, .. }
+            if from_id == "小明" && to_id == "小刚")
+        );
         let trip = pack.roundtrip(&hits[0].fact, &nlp_config()).unwrap();
         assert!(trip.consistent, "{trip:?}");
     }
@@ -770,15 +810,36 @@ mod tests {
             false,
         )]);
         let no_measure = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "身高".into(), pos: "n".into() },
-            TaggedWord { text: "226".into(), pos: "m".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "身高".into(),
+                pos: "n".into(),
+            },
+            TaggedWord {
+                text: "226".into(),
+                pos: "m".into(),
+            },
         ];
         let with_measure = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "身高".into(), pos: "n".into() },
-            TaggedWord { text: "226".into(), pos: "m".into() },
-            TaggedWord { text: "厘米".into(), pos: "q".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "身高".into(),
+                pos: "n".into(),
+            },
+            TaggedWord {
+                text: "226".into(),
+                pos: "m".into(),
+            },
+            TaggedWord {
+                text: "厘米".into(),
+                pos: "q".into(),
+            },
         ];
         assert_eq!(
             pack.extract_tagged(&no_measure)[0].fact,
@@ -800,10 +861,22 @@ mod tests {
             false,
         )]);
         let words = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "身高".into(), pos: "n".into() },
-            TaggedWord { text: "为".into(), pos: "v".into() },
-            TaggedWord { text: "226".into(), pos: "m".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "身高".into(),
+                pos: "n".into(),
+            },
+            TaggedWord {
+                text: "为".into(),
+                pos: "v".into(),
+            },
+            TaggedWord {
+                text: "226".into(),
+                pos: "m".into(),
+            },
         ];
         let hits = pack.extract_tagged(&words);
         assert_eq!(hits.len(), 1);
@@ -829,9 +902,18 @@ mod tests {
         );
         let pack = RulePack::compile(vec![low, high]);
         let words = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "身高".into(), pos: "n".into() },
-            TaggedWord { text: "226".into(), pos: "m".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "身高".into(),
+                pos: "n".into(),
+            },
+            TaggedWord {
+                text: "226".into(),
+                pos: "m".into(),
+            },
         ];
         let hits = pack.extract_tagged(&words);
         assert_eq!(hits.len(), 1);
@@ -916,9 +998,18 @@ mod tests {
         guarded.keywords = vec!["体重".to_string()];
         let pack = RulePack::compile(vec![guarded]);
         let words = vec![
-            TaggedWord { text: "小明".into(), pos: "nr".into() },
-            TaggedWord { text: "身高".into(), pos: "n".into() },
-            TaggedWord { text: "226".into(), pos: "m".into() },
+            TaggedWord {
+                text: "小明".into(),
+                pos: "nr".into(),
+            },
+            TaggedWord {
+                text: "身高".into(),
+                pos: "n".into(),
+            },
+            TaggedWord {
+                text: "226".into(),
+                pos: "m".into(),
+            },
         ];
         assert!(pack.extract_tagged(&words).is_empty());
     }

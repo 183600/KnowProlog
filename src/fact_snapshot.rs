@@ -27,9 +27,7 @@ use crate::symbolic_generator::SymbolicGenerator;
 pub const FACT_SNAPSHOT_VERSION: u32 = 1;
 
 /// 事实所在层；`Ord` 顺序就是裁决优先级。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FactLayer {
     /// 临时假设世界（「如果……」），优先级最低。
@@ -127,13 +125,7 @@ impl FactRecord {
         premises: Vec<FactRef>,
         confidence_milli: u32,
     ) -> Self {
-        let mut record = Self::new(
-            fact,
-            kind,
-            FactLayer::Derived,
-            source,
-            confidence_milli,
-        );
+        let mut record = Self::new(fact, kind, FactLayer::Derived, source, confidence_milli);
         record.rule = Some(rule.to_string());
         record.premises = premises;
         record
@@ -222,7 +214,11 @@ impl FactConflict {
             self.values.len(),
             self.values.join("、"),
             self.winner.value,
-            if self.resolved { "已裁决" } else { "未裁决" }
+            if self.resolved {
+                "已裁决"
+            } else {
+                "未裁决"
+            }
         )
     }
 }
@@ -325,7 +321,10 @@ impl FactSnapshot {
     pub fn effective_records(&self) -> Vec<&FactRecord> {
         let mut out = Vec::new();
         for records in self.slots.values() {
-            out.extend(effective_records(records, self.is_functional(&records[0].fact.predicate)));
+            out.extend(effective_records(
+                records,
+                self.is_functional(&records[0].fact.predicate),
+            ));
         }
         out.sort_by(|left, right| left.fact.cmp(&right.fact));
         out
@@ -544,10 +543,7 @@ impl FactSnapshotBuilder {
     /// 添加一条记录；同一槽位同一取值按层/置信度/来源身份保留最佳者。
     pub fn add_record(&mut self, record: FactRecord) -> &mut Self {
         self.slots
-            .entry((
-                record.fact.subject.clone(),
-                record.fact.predicate.clone(),
-            ))
+            .entry((record.fact.subject.clone(), record.fact.predicate.clone()))
             .or_default()
             .entry(record.fact.value.clone())
             .and_modify(|existing| {
@@ -567,13 +563,7 @@ impl FactSnapshotBuilder {
         source: SourceId,
         confidence_milli: u32,
     ) -> &mut Self {
-        self.add_record(FactRecord::new(
-            fact,
-            kind,
-            layer,
-            source,
-            confidence_milli,
-        ))
+        self.add_record(FactRecord::new(fact, kind, layer, source, confidence_milli))
     }
 
     pub fn add_base(&mut self, fact: FactRef, kind: FactKind, source: SourceId) -> &mut Self {
@@ -756,7 +746,11 @@ mod tests {
     fn session_overrides_base_for_functional_slots_without_conflict() {
         let mut builder = FactSnapshotBuilder::new(7);
         builder.mark_functional("age");
-        builder.add_base(age("18"), FactKind::Attribute, source(SourceKind::Import, "kb"));
+        builder.add_base(
+            age("18"),
+            FactKind::Attribute,
+            source(SourceKind::Import, "kb"),
+        );
         builder.add_session(
             age("20"),
             FactKind::Attribute,
@@ -775,8 +769,16 @@ mod tests {
     fn same_layer_functional_multi_value_is_an_explicit_conflict() {
         let mut builder = FactSnapshotBuilder::new(1);
         builder.mark_functional("age");
-        builder.add_base(age("18"), FactKind::Attribute, source(SourceKind::Import, "a"));
-        builder.add_base(age("19"), FactKind::Attribute, source(SourceKind::Import, "b"));
+        builder.add_base(
+            age("18"),
+            FactKind::Attribute,
+            source(SourceKind::Import, "a"),
+        );
+        builder.add_base(
+            age("19"),
+            FactKind::Attribute,
+            source(SourceKind::Import, "b"),
+        );
         let snapshot = builder.build();
         assert_eq!(snapshot.conflicts().len(), 1);
         assert!(!snapshot.conflicts()[0].resolved);
@@ -793,7 +795,11 @@ mod tests {
     fn hypothesis_and_derived_never_override_base() {
         let mut builder = FactSnapshotBuilder::new(1);
         builder.mark_functional("age");
-        builder.add_base(age("18"), FactKind::Attribute, source(SourceKind::Import, "kb"));
+        builder.add_base(
+            age("18"),
+            FactKind::Attribute,
+            source(SourceKind::Import, "kb"),
+        );
         builder.add(
             age("30"),
             FactKind::Attribute,
@@ -816,7 +822,11 @@ mod tests {
     #[test]
     fn session_suppression_removes_base_fact_but_not_higher_layer() {
         let mut builder = FactSnapshotBuilder::new(1);
-        builder.add_base(age("18"), FactKind::Attribute, source(SourceKind::Import, "kb"));
+        builder.add_base(
+            age("18"),
+            FactKind::Attribute,
+            source(SourceKind::Import, "kb"),
+        );
         builder.add_session(
             age("18"),
             FactKind::Attribute,
@@ -876,9 +886,7 @@ mod tests {
         assert!(generator.is_known_entity("张三"));
         assert_eq!(generator.entity_type_of("张三"), Some("Person"));
         assert_eq!(generator.relation_values("张三", "认识"), vec!["李四"]);
-        let text = generator
-            .profile("张三")
-            .expect("快照灌入后应可生成介绍");
+        let text = generator.profile("张三").expect("快照灌入后应可生成介绍");
         assert!(text.contains("18") || text.contains("李四"), "{}", text);
     }
 
