@@ -707,6 +707,30 @@ impl LensCorpus {
         }
     }
 
+    /// 列出某个镜头内的原始事实，可按主语/谓词过滤（探索式查看，不做槽位裁决）。
+    pub fn list_facts(
+        &self,
+        scope: &LensScope,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+    ) -> Result<Vec<LensFact>, String> {
+        let selected_ids = self.selected_context_ids(scope)?;
+        let subject = subject.map(str::trim).filter(|value| !value.is_empty());
+        let predicate = predicate
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        Ok(self
+            .facts
+            .iter()
+            .filter(|fact| {
+                selected_ids.contains(&fact.context.id)
+                    && subject.is_none_or(|value| fact.fact.subject == value)
+                    && predicate.is_none_or(|value| fact.fact.predicate == value)
+            })
+            .cloned()
+            .collect())
+    }
+
     fn selected_context_ids(&self, scope: &LensScope) -> Result<BTreeSet<String>, String> {
         match scope {
             LensScope::Default => Ok([DEFAULT_CONTEXT_ID.to_string()].into_iter().collect()),
@@ -1332,6 +1356,30 @@ mod tests {
         assert!(rendered.contains("李四"), "{}", rendered);
         assert!(!rendered.contains("是 王五"), "{}", rendered);
         assert!(rendered.contains("其他语境"), "{}", rendered);
+    }
+
+    #[test]
+    fn list_facts_filters_scope_and_slot() {
+        let corpus = corpus();
+        let all = corpus.list_facts(&LensScope::All, None, None).unwrap();
+        assert_eq!(all.len(), 2);
+        let alice = corpus
+            .list_facts(&LensScope::Namespace("alice".to_string()), None, None)
+            .unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].fact.value, "李四");
+        let by_slot = corpus
+            .list_facts(&LensScope::All, Some("张三"), Some("师傅"))
+            .unwrap();
+        assert_eq!(by_slot.len(), 2);
+        assert!(corpus
+            .list_facts(&LensScope::All, Some("李四"), None)
+            .unwrap()
+            .is_empty());
+        assert!(corpus
+            .list_facts(&LensScope::Namespace("bob".to_string()), None, None)
+            .unwrap_err()
+            .contains("没有名为「bob」的语境"));
     }
 
     #[test]

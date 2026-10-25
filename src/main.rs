@@ -950,10 +950,10 @@ enum Commands {
     /// of silently flattening all contexts into one answer
     Lens {
         /// Question carrying a context cue, e.g. "据alice说，张三的师傅是谁"
-        #[arg(required_unless_present_any = ["subject", "contexts"])]
+        #[arg(required_unless_present_any = ["subject", "contexts", "facts"])]
         question: Option<String>,
-        /// Explicit subject (requires --predicate)
-        #[arg(long, requires = "predicate")]
+        /// Explicit subject (with --facts, optional predicate filter)
+        #[arg(long)]
         subject: Option<String>,
         /// Explicit predicate (requires --subject)
         #[arg(long, requires = "subject")]
@@ -966,8 +966,12 @@ enum Commands {
         #[arg(long = "functional", value_name = "PREDICATE")]
         functional: Vec<String>,
         /// List known contexts and exit
-        #[arg(long)]
+        #[arg(long, conflicts_with = "facts")]
         contexts: bool,
+        /// List facts in the selected lens instead of answering a slot query;
+        /// --subject / --predicate become optional filters
+        #[arg(long, conflicts_with_all = ["question", "contexts"])]
+        facts: bool,
         /// Include session facts and current assumptions from a saved dialogue
         /// state file (see reasoning.dialogue_state_path)
         #[arg(long, value_name = "PATH")]
@@ -3211,6 +3215,7 @@ async fn main() {
             view,
             functional,
             contexts,
+            facts,
             dialogue_state,
             json,
         }) => {
@@ -3224,6 +3229,7 @@ async fn main() {
                 view,
                 functional,
                 contexts,
+                facts,
                 dialogue_state,
                 json,
             )
@@ -4200,6 +4206,7 @@ async fn run_lens(
     view: Option<String>,
     functional: Vec<String>,
     contexts: bool,
+    facts: bool,
     dialogue_state: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -4234,6 +4241,48 @@ async fn run_lens(
     }
 
     let aliases = corpus.aliases();
+    if facts {
+        let scope = view
+            .as_deref()
+            .map(|view| viewpoint::parse_lens_scope(view, &aliases))
+            .unwrap_or(viewpoint::LensScope::All);
+        let listed = corpus.list_facts(&scope, subject.as_deref(), predicate.as_deref())?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "scope": scope,
+                    "count": listed.len(),
+                    "facts": listed,
+                }))?
+            );
+        } else {
+            let label = scope.label_zh();
+            if listed.is_empty() {
+                println!("{}中没有匹配的事实。", label);
+            } else if matches!(scope, viewpoint::LensScope::Namespace(_)) {
+                println!("据{}，共 {} 条事实：", label, listed.len());
+            } else {
+                println!("{}中的事实（共 {} 条）：", label, listed.len());
+            }
+            if !listed.is_empty() {
+                for fact in &listed {
+                    println!(
+                        "  • {} 的 {}：{}（出处：{}）",
+                        fact.fact.subject,
+                        fact.fact.predicate,
+                        fact.fact.value,
+                        fact.context.render_short()
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if subject.is_some() && predicate.is_none() {
+        return Err("--subject 需要与 --predicate 一起使用（列事实请加 --facts）".into());
+    }
     let cue = question
         .as_deref()
         .and_then(|question| viewpoint::detect_lens_cue(question, &aliases));
@@ -16027,6 +16076,7 @@ mod session_tests {
                 predicate,
                 view,
                 dialogue_state,
+                facts,
                 ..
             }) => {
                 assert!(question.is_none());
@@ -16034,11 +16084,43 @@ mod session_tests {
                 assert_eq!(predicate.as_deref(), Some("师傅"));
                 assert_eq!(view.as_deref(), Some("alice"));
                 assert_eq!(dialogue_state.as_deref(), Some("state.json"));
+                assert!(!facts);
             }
             other => panic!("应解析为 Lens 子命令: {:?}", other),
         }
         assert!(Cli::try_parse_from(["knowprolog", "lens"]).is_err());
-        assert!(Cli::try_parse_from(["knowprolog", "lens", "--subject", "张三"]).is_err());
+        // 只给主语时 Clap 仍可解析，run_lens 会要求补 --predicate 或 --facts。
+        assert!(Cli::try_parse_from(["knowprolog", "lens", "--subject", "张三"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "lens",
+            "--facts",
+            "--view",
+            "all",
+            "--subject",
+            "张三",
+        ])
+        .expect("事实列表应允许只给主语过滤");
+        match cli.command {
+            Some(Commands::Lens {
+                facts,
+                subject,
+                predicate,
+                ..
+            }) => {
+                assert!(facts);
+                assert_eq!(subject.as_deref(), Some("张三"));
+                assert!(predicate.is_none());
+            }
+            other => panic!("应解析为 Lens 子命令: {:?}", other),
+        }
+        assert!(Cli::try_parse_from([
+            "knowprolog",
+            "lens",
+            "--facts",
+            "--contexts"
+        ])
+        .is_err());
     }
 
     #[test]
