@@ -201,6 +201,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_entity_types(&mut c, config);
     let type_names = collect_type_names(config);
     check_extraction_rules(&mut c, config, &type_names);
+    check_semantic_grammar(&mut c, config, &type_names);
     check_prolog_rules(&mut c, config);
     check_predicate_profiles(&mut c, config, &type_names);
     check_entity_profiles(&mut c, config, &type_names);
@@ -678,6 +679,78 @@ fn check_extraction_rules(c: &mut Collector, config: &SystemConfig, type_names: 
                     }
                 }
             }
+        }
+    }
+}
+
+/// 双向语义规则包的静态检查：坏规则必须在 lint 中可见，而不是等运行时空转。
+fn check_semantic_grammar(
+    c: &mut Collector,
+    config: &SystemConfig,
+    type_names: &BTreeSet<String>,
+) {
+    let grammar = &config.semantic_grammar;
+    if !grammar.enabled {
+        if !grammar.rules.is_empty() {
+            c.warn(
+                "semantic_grammar_disabled",
+                "semantic_grammar.enabled",
+                "已配置双向规则但开关为 false：规则只可预览，运行时不参与抽取与生成",
+            );
+        }
+        return;
+    }
+    if grammar.rules.is_empty() {
+        c.warn(
+            "semantic_grammar_without_rules",
+            "semantic_grammar.rules",
+            "双向语义语法已启用但没有任何规则",
+        );
+        return;
+    }
+    let pack = crate::semantic_grammar::RulePack::compile(grammar.rules.clone());
+    for error in pack.errors() {
+        c.error(
+            "semantic_rule_compile_error",
+            "semantic_grammar.rules",
+            error.render(),
+        );
+    }
+    let mut names: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, rule) in grammar.rules.iter().enumerate() {
+        let path = format!("semantic_grammar.rules[{}]", index);
+        let name = rule.name.trim();
+        if name.is_empty() {
+            c.error("empty_semantic_rule_name", format!("{}.name", path), "规则名为空");
+        } else if let Some(first) = names.insert(name.to_string(), index) {
+            c.warn(
+                "duplicate_semantic_rule_name",
+                format!("{}.name", path),
+                format!("规则名「{}」与 semantic_grammar.rules[{}] 重复", name, first),
+            );
+        }
+        if rule.predicate.trim().is_empty() {
+            c.error(
+                "empty_semantic_predicate",
+                format!("{}.predicate", path),
+                "predicate 为空：抽取结果没有谓词",
+            );
+        }
+        if let Some(entity_type) = rule.entity_type.as_deref().map(str::trim) {
+            if !entity_type.is_empty() && !type_names.contains(&fold(entity_type)) {
+                c.warn(
+                    "dangling_semantic_entity_type",
+                    format!("{}.entity_type", path),
+                    format!("实体类型「{}」未声明：抽取结果仍会入库，但类型契约看不到它", entity_type),
+                );
+            }
+        }
+        if rule.realize.is_none() && rule.relation {
+            c.warn(
+                "semantic_relation_without_realize",
+                format!("{}.realize", path),
+                "关系规则没有反向模板：抽取可用，但生成不会复用这条规则",
+            );
         }
     }
 }
