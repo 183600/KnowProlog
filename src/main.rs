@@ -108,6 +108,7 @@ use know_prolog::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
         render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
     },
+    viewpoint,
     weak_construction::{parse_feedback, ConstructionOptions, WeakConstructor},
     InputMode, KnowledgeExtractor, KnowledgeItem, OxigraphManager, ResponseFormatter, SystemConfig,
 };
@@ -925,6 +926,34 @@ enum Commands {
         /// RDF file path (.ttl / .nt / .nq / .trig / .rdf / .xml)
         file_path: String,
         /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer a question under an explicit context lens: the default graph, a
+    /// fusion source namespace, a session/hypothesis/import kind, or every
+    /// context. Reports support / conflict / unknown with provenance instead
+    /// of silently flattening all contexts into one answer
+    Lens {
+        /// Question carrying a context cue, e.g. "据alice说，张三的师傅是谁"
+        #[arg(required_unless_present_any = ["subject", "contexts"])]
+        question: Option<String>,
+        /// Explicit subject (requires --predicate)
+        #[arg(long, requires = "predicate")]
+        subject: Option<String>,
+        /// Explicit predicate (requires --subject)
+        #[arg(long, requires = "subject")]
+        predicate: Option<String>,
+        /// Force the lens: default / all / session / hypothesis / import /
+        /// namespace:<id> / <namespace id>
+        #[arg(long)]
+        view: Option<String>,
+        /// Treat this predicate as functional (repeatable)
+        #[arg(long = "functional", value_name = "PREDICATE")]
+        functional: Vec<String>,
+        /// List known contexts and exit
+        #[arg(long)]
+        contexts: bool,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
@@ -3142,6 +3171,33 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Lens {
+            question,
+            subject,
+            predicate,
+            view,
+            functional,
+            contexts,
+            json,
+        }) => {
+            if let Err(e) = run_lens(
+                &oxigraph_manager,
+                &config,
+                &store_path,
+                question,
+                subject,
+                predicate,
+                view,
+                functional,
+                contexts,
+                json,
+            )
+            .await
+            {
+                eprintln!("语境镜头查询失败: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Artifacts { fix, json, paths }) => {
             run_artifact_audit(&config, &store_path, fix, json, &paths);
         }
@@ -4043,6 +4099,110 @@ async fn run_fuse(
         } else {
             println!("（预览模式：加 --apply 才会写入默认图）");
         }
+    }
+    Ok(())
+}
+
+/// `lens`：在显式语境镜头下回答一个槽位问题。
+///
+/// 默认图、融合来源命名图与会话语境共享同一个只读事实视图；镜头内没有
+/// 记录时显式披露其他语境，而不是静默回落到默认图。
+async fn run_lens(
+    manager: &OxigraphManager,
+    config: &SystemConfig,
+    store_path: &str,
+    question: Option<String>,
+    subject: Option<String>,
+    predicate: Option<String>,
+    view: Option<String>,
+    functional: Vec<String>,
+    contexts: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ledger = manager.load_fusion_ledger().await?;
+    let default_facts = manager.load_fact_refs().await?;
+    let corpus = viewpoint::LensCorpus::new(&default_facts, &ledger);
+
+    if contexts {
+        let summaries = corpus.summaries();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "contexts": summaries,
+            }))?);
+        } else {
+            println!("语境目录：");
+            for summary in &summaries {
+                println!(
+                    "  • {}：{} 条事实",
+                    summary.context.render_short(),
+                    summary.facts
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let aliases = corpus.aliases();
+    let cue = question
+        .as_deref()
+        .and_then(|question| viewpoint::detect_lens_cue(question, &aliases));
+    let scope = if let Some(view) = view.as_deref() {
+        viewpoint::parse_lens_scope(view, &aliases)
+    } else if let Some(cue) = &cue {
+        cue.scope.clone()
+    } else {
+        return Err("没有识别到语境限定：请用 --view 指定，或把「据 alice 说 / 知识库里 / 假设里」写进问句".into());
+    };
+
+    let query = if let (Some(subject), Some(predicate)) = (&subject, &predicate) {
+        viewpoint::SlotQuery::forward(subject, predicate)
+    } else if let Some(cue) = &cue {
+        viewpoint::extract_slot_query(&cue.question).ok_or_else(|| {
+            format!(
+                "问句「{}」已限定语境，但没能编译成可查询的槽位；请用 --subject/--predicate 明确指定",
+                cue.question
+            )
+        })?
+    } else {
+        return Err("请提供问句，或用 --subject/--predicate 指定要查询的槽位".into());
+    };
+
+    let registry_path = format!("{}/predicate_registry.json", store_path);
+    let _ = manager.load_predicate_registry(&registry_path);
+    manager.configure_predicates(
+        &config.predicate_profiles,
+        config.reasoning.require_predicate_admission,
+    );
+    let registry = manager.predicate_registry_snapshot();
+    let mut functional_set: BTreeSet<String> =
+        registry.functional_predicates().into_iter().collect();
+    functional_set.extend(
+        functional
+            .iter()
+            .map(|predicate| predicate.trim().to_string())
+            .filter(|predicate| !predicate.is_empty()),
+    );
+    let mut variants = vec![query.predicate.clone()];
+    let resolution = registry.resolve(&query.predicate);
+    if resolution.known {
+        variants.push(resolution.canonical.clone());
+        variants.extend(registry.aliases_of(&resolution.canonical));
+    }
+    let query = query.with_predicate_aliases(variants);
+    let is_functional = query
+        .predicates
+        .iter()
+        .any(|predicate| functional_set.contains(predicate));
+
+    let slot_view = corpus.query_slot(&scope, &query, is_functional);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "state": slot_view.state(),
+            "answer": slot_view.render(),
+            "view": slot_view,
+        }))?);
+    } else {
+        println!("{}", slot_view.render());
     }
     Ok(())
 }
@@ -15560,6 +15720,60 @@ mod session_tests {
             assert!(is_ask_terminator(terminator), "{}", terminator);
         }
         assert!(!is_ask_terminator("为什么退出假设"));
+    }
+
+    #[test]
+    fn lens_cli_parses_question_and_explicit_slot() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "lens",
+            "据alice说，张三的师傅是谁",
+            "--json",
+        ])
+        .expect("lens 问句应可解析");
+        match cli.command {
+            Some(Commands::Lens {
+                question,
+                subject,
+                predicate,
+                json,
+                ..
+            }) => {
+                assert_eq!(question.as_deref(), Some("据alice说，张三的师傅是谁"));
+                assert!(subject.is_none());
+                assert!(predicate.is_none());
+                assert!(json);
+            }
+            other => panic!("应解析为 Lens 子命令: {:?}", other),
+        }
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "lens",
+            "--subject",
+            "张三",
+            "--predicate",
+            "师傅",
+            "--view",
+            "alice",
+        ])
+        .expect("显式槽位应可解析");
+        match cli.command {
+            Some(Commands::Lens {
+                question,
+                subject,
+                predicate,
+                view,
+                ..
+            }) => {
+                assert!(question.is_none());
+                assert_eq!(subject.as_deref(), Some("张三"));
+                assert_eq!(predicate.as_deref(), Some("师傅"));
+                assert_eq!(view.as_deref(), Some("alice"));
+            }
+            other => panic!("应解析为 Lens 子命令: {:?}", other),
+        }
+        assert!(Cli::try_parse_from(["knowprolog", "lens"]).is_err());
+        assert!(Cli::try_parse_from(["knowprolog", "lens", "--subject", "张三"]).is_err());
     }
 
     #[test]
