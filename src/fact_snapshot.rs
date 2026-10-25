@@ -247,6 +247,15 @@ impl SlotView {
     }
 
     pub fn winner(&self) -> Option<&FactRecord> {
+        if let Some(conflict) = &self.conflict {
+            if let Some(record) = self
+                .effective
+                .iter()
+                .find(|record| record.fact == conflict.winner)
+            {
+                return Some(record);
+            }
+        }
         self.effective.first()
     }
 }
@@ -772,7 +781,12 @@ mod tests {
         assert_eq!(snapshot.conflicts().len(), 1);
         assert!(!snapshot.conflicts()[0].resolved);
         assert_eq!(snapshot.values("张三", "age").len(), 2);
-        assert!(snapshot.winner("张三", "age").is_some());
+        let view = snapshot.lookup("张三", "age").unwrap();
+        assert_eq!(
+            view.winner().map(|record| record.fact.clone()),
+            Some(snapshot.conflicts()[0].winner.clone()),
+            "槽位展示赢家必须与冲突报告一致"
+        );
     }
 
     #[test]
