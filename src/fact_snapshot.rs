@@ -264,6 +264,10 @@ pub struct FactSnapshot {
     /// 规则包指纹：规则变更不应让旧派生事实「串味」。
     pub grammar_digest: String,
     pub functional: BTreeSet<String>,
+    #[serde(
+        serialize_with = "serialize_slots",
+        deserialize_with = "deserialize_slots"
+    )]
     slots: BTreeMap<(String, String), Vec<FactRecord>>,
     suppressions: Vec<FactSuppression>,
     conflicts: Vec<FactConflict>,
@@ -469,6 +473,52 @@ impl FactSnapshot {
         }
         lines.join("\n")
     }
+}
+
+#[derive(Serialize)]
+struct SlotWire<'a> {
+    subject: &'a str,
+    predicate: &'a str,
+    records: &'a [FactRecord],
+}
+
+#[derive(Deserialize)]
+struct OwnedSlotWire {
+    subject: String,
+    predicate: String,
+    records: Vec<FactRecord>,
+}
+
+fn serialize_slots<S>(
+    slots: &BTreeMap<(String, String), Vec<FactRecord>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let wire: Vec<SlotWire<'_>> = slots
+        .iter()
+        .map(|((subject, predicate), records)| SlotWire {
+            subject,
+            predicate,
+            records,
+        })
+        .collect();
+    wire.serialize(serializer)
+}
+
+fn deserialize_slots<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<(String, String), Vec<FactRecord>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wire = Vec::<OwnedSlotWire>::deserialize(deserializer)?;
+    let mut slots = BTreeMap::new();
+    for slot in wire {
+        slots.insert((slot.subject, slot.predicate), slot.records);
+    }
+    Ok(slots)
 }
 
 fn effective_records(records: &[FactRecord], functional: bool) -> Vec<&FactRecord> {
@@ -927,6 +977,38 @@ mod tests {
         assert_eq!(kinds.get("age(张三, 18)"), Some(&FactKind::Attribute));
         assert_eq!(kinds.get("认识(张三, 李四)"), Some(&FactKind::Relation));
         assert_eq!(snapshot.values("张三", "age"), vec!["18"]);
+    }
+
+    #[test]
+    fn snapshot_roundtrips_through_json_without_losing_slots_or_conflicts() {
+        let mut builder = FactSnapshotBuilder::new(9);
+        builder.mark_functional("age");
+        builder
+            .grammar_digest("rules-v1")
+            .add_base(
+                age("18"),
+                FactKind::Attribute,
+                source(SourceKind::Import, "a"),
+            )
+            .add_base(
+                age("19"),
+                FactKind::Attribute,
+                source(SourceKind::Import, "b"),
+            )
+            .suppress(
+                FactSuppression::new(
+                    age("19"),
+                    FactLayer::Session,
+                    source(SourceKind::Manual, "correction"),
+                )
+                .with_reason("用户更正"),
+            );
+        let snapshot = builder.build();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: FactSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snapshot, restored);
+        assert_eq!(restored.values("张三", "age"), vec!["18"]);
+        assert_eq!(restored.suppressions().len(), 1);
     }
 
     #[test]
