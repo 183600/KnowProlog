@@ -4082,7 +4082,17 @@ async fn run_namespace_list(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ledger = manager.load_fusion_ledger().await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&ledger)?);
+        let summaries: Vec<_> = viewpoint::LensCorpus::new(&[], &ledger)
+            .summaries()
+            .into_iter()
+            .filter(|summary| !summary.context.is_default())
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespaces": summaries,
+            }))?
+        );
     } else {
         println!("{}", ledger.render_zh());
     }
@@ -4107,12 +4117,17 @@ async fn run_namespace_status(
     }
     let ledger = manager.load_fusion_ledger().await?;
     if json {
+        let summaries: Vec<_> = viewpoint::LensCorpus::new(&[], &ledger)
+            .summaries()
+            .into_iter()
+            .filter(|summary| !summary.context.is_default())
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "namespace": know_prolog::knowledge_fusion::sanitize_namespace_id(source),
                 "status": status,
-                "ledger": ledger,
+                "namespaces": summaries,
             }))?
         );
     } else {
