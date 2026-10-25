@@ -15933,6 +15933,34 @@ mod session_tests {
     }
 
     #[test]
+    fn owl_cli_forwards_arguments_and_parses_decisions() {
+        let cli = Cli::try_parse_from(["knowprolog", "owl", "propose", "--min-support", "3"])
+            .expect("owl 参数应转发");
+        match cli.command {
+            Some(Commands::Owl { args }) => {
+                assert_eq!(args, vec!["propose", "--min-support", "3"]);
+            }
+            _ => panic!("应解析为 Owl 子命令"),
+        }
+        let cli =
+            OwlCli::try_parse_from(["owl", "review", "owl-0001", "accept", "--reviewer", "alice"])
+                .expect("owl review 参数应可解析");
+        match cli.command {
+            OwlCommands::Review {
+                id,
+                action,
+                reviewer,
+                ..
+            } => {
+                assert_eq!(id, "owl-0001");
+                assert!(matches!(action, OwlReviewAction::Accept));
+                assert_eq!(reviewer, "alice");
+            }
+            _ => panic!("应解析为 Review 子命令"),
+        }
+    }
+
+    #[test]
     fn batch_teach_cli_parses_seed_corpus_and_decisions() {
         let cli = Cli::try_parse_from([
             "knowprolog",
