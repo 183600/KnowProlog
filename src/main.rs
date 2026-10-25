@@ -49,7 +49,9 @@ use know_prolog::{
         IdentityEvalBaseline,
     },
     import_journal::{ImportJournal, JournalLoad},
-    knowledge_fusion::{Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, TrustLevel},
+    knowledge_fusion::{
+        Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, NamespaceStatus, TrustLevel,
+    },
     law_book::LawBook,
     lex_gate, lexical_memory, lexical_trace,
     link_prediction::{LinkPredictor, Triple as LawTriple},
@@ -908,12 +910,13 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Import an RDF file into a named source namespace: raw assertions stay in
-    /// their own named graph, the default graph is untouched until `fuse --apply`
+    /// Import an RDF file into a named source namespace, list namespaces, or
+    /// change a namespace status. Raw assertions stay in their own named
+    /// graph; the default graph is untouched until `fuse --apply`
     Namespace {
         /// Namespace id (IRI-safe slug), e.g. "alice" or "batch-2026-10"
-        #[arg(long)]
-        source: String,
+        #[arg(long, required_unless_present = "list")]
+        source: Option<String>,
         /// Human-readable source label (defaults to the namespace id)
         #[arg(long)]
         label: Option<String>,
@@ -924,7 +927,19 @@ enum Commands {
         #[arg(long, default_value = "import")]
         kind: String,
         /// RDF file path (.ttl / .nt / .nq / .trig / .rdf / .xml)
-        file_path: String,
+        #[arg(required_unless_present_any = ["list", "status"])]
+        file_path: Option<String>,
+        /// List namespaces, assertion counts and adjudications, then exit
+        #[arg(long, conflicts_with = "file_path")]
+        list: bool,
+        /// Set namespace status: active / quarantined / retired
+        #[arg(
+            long,
+            value_name = "STATUS",
+            requires = "source",
+            conflicts_with_all = ["list", "file_path"]
+        )]
+        status: Option<String>,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -3154,20 +3169,34 @@ async fn main() {
             trust,
             kind,
             file_path,
+            list,
+            status,
             json,
         }) => {
-            if let Err(e) = run_namespace_import(
-                &oxigraph_manager,
-                &source,
-                label.as_deref(),
-                &trust,
-                &kind,
-                &file_path,
-                json,
-            )
-            .await
-            {
-                eprintln!("命名空间导入失败: {}", e);
+            let result = if list {
+                run_namespace_list(&oxigraph_manager, json).await
+            } else if let Some(status) = status.as_deref() {
+                run_namespace_status(
+                    &oxigraph_manager,
+                    source.as_deref().unwrap_or_default(),
+                    status,
+                    json,
+                )
+                .await
+            } else {
+                run_namespace_import(
+                    &oxigraph_manager,
+                    source.as_deref().unwrap_or_default(),
+                    label.as_deref(),
+                    &trust,
+                    &kind,
+                    file_path.as_deref().unwrap_or_default(),
+                    json,
+                )
+                .await
+            };
+            if let Err(e) = result {
+                eprintln!("命名空间操作失败: {}", e);
                 std::process::exit(1);
             }
         }
@@ -4030,6 +4059,54 @@ async fn run_namespace_import(
             added
         );
         println!("  默认图未改动；用 `fuse --apply` 物化融合视图");
+    }
+    Ok(())
+}
+
+/// `namespace --list`：列出全部命名空间与断言计数。
+async fn run_namespace_list(
+    manager: &OxigraphManager,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ledger = manager.load_fusion_ledger().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&ledger)?);
+    } else {
+        println!("{}", ledger.render_zh());
+    }
+    Ok(())
+}
+
+/// `namespace --status`：启用 / 隔离 / 退役一个命名空间。
+async fn run_namespace_status(
+    manager: &OxigraphManager,
+    source: &str,
+    status: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let status = NamespaceStatus::parse(status).ok_or_else(|| {
+        format!(
+            "未知命名空间状态：{}（可用 active / quarantined / retired）",
+            status
+        )
+    })?;
+    if !manager.set_namespace_status(source, status).await? {
+        return Err(format!("命名空间不存在：{}", source).into());
+    }
+    let ledger = manager.load_fusion_ledger().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "namespace": know_prolog::knowledge_fusion::sanitize_namespace_id(source),
+            "status": status,
+            "ledger": ledger,
+        }))?);
+    } else {
+        println!(
+            "命名空间 {} 状态已设为 {}",
+            know_prolog::knowledge_fusion::sanitize_namespace_id(source),
+            status.label_zh()
+        );
+        println!("{}", ledger.render_zh());
     }
     Ok(())
 }
@@ -15840,6 +15917,56 @@ mod session_tests {
 
         let reply = ask_with_lens("张三的师傅是谁", &manager, &config, &mut cache).await;
         assert!(reply.is_none(), "无语境线索不应接管旧回答路径");
+    }
+
+    #[test]
+    fn namespace_cli_parses_import_list_and_status() {
+        let cli = Cli::try_parse_from(["knowprolog", "namespace", "--source", "alice", "a.ttl"])
+            .expect("命名空间导入应可解析");
+        match cli.command {
+            Some(Commands::Namespace {
+                source,
+                file_path,
+                list,
+                status,
+                ..
+            }) => {
+                assert_eq!(source.as_deref(), Some("alice"));
+                assert_eq!(file_path.as_deref(), Some("a.ttl"));
+                assert!(!list);
+                assert!(status.is_none());
+            }
+            other => panic!("应解析为 Namespace 子命令: {:?}", other),
+        }
+        let cli = Cli::try_parse_from(["knowprolog", "namespace", "--list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Namespace { list: true, .. })
+        ));
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "namespace",
+            "--source",
+            "alice",
+            "--status",
+            "retired",
+        ])
+        .expect("命名空间状态应可解析");
+        match cli.command {
+            Some(Commands::Namespace {
+                source,
+                status,
+                file_path,
+                ..
+            }) => {
+                assert_eq!(source.as_deref(), Some("alice"));
+                assert_eq!(status.as_deref(), Some("retired"));
+                assert!(file_path.is_none());
+            }
+            other => panic!("应解析为 Namespace 子命令: {:?}", other),
+        }
+        assert!(Cli::try_parse_from(["knowprolog", "namespace", "--list", "a.ttl"]).is_err());
+        assert!(Cli::try_parse_from(["knowprolog", "namespace", "--source", "alice"]).is_err());
     }
 
     #[test]
