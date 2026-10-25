@@ -835,6 +835,26 @@ property_mappings = { name = "pos:nr", property = "pos:*" }
 pos_pattern = ["n", "v", "*"]
 property_mappings = { name = "pos:n", property = "pos:*" }
 
+# 双向语义规则包（默认关闭）：同一规则既做正向抽取，也做反向实现。
+# 开启后可用 `cargo run -- grammar --text "张三身高226" --roundtrip` 预览。
+# [semantic_grammar]
+# enabled = true
+#
+# [[semantic_grammar.rules]]
+# name = "身高"
+# predicate = "height"
+# entity_type = "Person"
+# pattern = ["$s:pos:nr", "身高", "$o:pos:m"]
+# realize = "{s}身高{o}"
+#
+# [[semantic_grammar.rules]]
+# name = "老师关系"
+# predicate = "teacher_of"
+# entity_type = "Person"
+# relation = true
+# pattern = ["$s:pos:nr", "是", "$o:pos:nr", "的", "老师"]
+# realize = "{s}是{o}的老师"
+
 [messages]
 startup = "知识图谱系统启动中..."
 ready = "系统已就绪！"
