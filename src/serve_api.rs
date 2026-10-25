@@ -83,6 +83,7 @@ use crate::prompt_spec::{self, PromptMode};
 use crate::quality::QualityIndex;
 use crate::reading::{Reading, Residual};
 use crate::recovery::RecoveryMode;
+use crate::schema_view::SchemaView;
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::turn_runtime::{
@@ -1556,6 +1557,12 @@ impl ApiState {
             .reasoner
             .lock()
             .configure_ontology_program(program)
+    }
+
+    /// 注入配置态 RDFS 模式视图（含类型别名与谓词画像），
+    /// 与 `configure_ontology` 一样在暖基座上单调合并，分叉会话同源携带。
+    pub fn configure_schema(&self, schema: &SchemaView) -> bool {
+        self.warm.reasoner.lock().configure_schema_view(schema)
     }
 
     /// 宿主注入已启用插件的本体贡献：谓词别名、逆向词面与结构性公理
@@ -5553,7 +5560,11 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .expect("应存在指向赵六的待定推测");
         let confirmed = session.run_turn(&format!("确认预测：{}", id));
         assert_eq!(confirmed.source, "predictive", "{}", confirmed.reply);
-        assert!(confirmed.reply.contains("已确认预测"), "{}", confirmed.reply);
+        assert!(
+            confirmed.reply.contains("已确认预测"),
+            "{}",
+            confirmed.reply
+        );
         let profile = session
             .reasoner
             .generate_about("李四")

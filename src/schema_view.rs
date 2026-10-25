@@ -335,6 +335,47 @@ impl SchemaView {
         canonical_with(&self.property_aliases, name)
     }
 
+    /// 单调并入另一份视图（别名、子类、子属性、域/值域、互斥取并集）。
+    /// 返回内容是否发生变化；重复合并是幂等的。
+    pub fn merge(&mut self, other: &SchemaView) -> bool {
+        let before = self.digest();
+        self.type_aliases.extend(other.type_aliases.clone());
+        self.property_aliases.extend(other.property_aliases.clone());
+        for (sub, parents) in &other.subclasses {
+            self.subclasses
+                .entry(sub.clone())
+                .or_default()
+                .extend(parents.iter().cloned());
+        }
+        for (sub, parents) in &other.subproperties {
+            self.subproperties
+                .entry(sub.clone())
+                .or_default()
+                .extend(parents.iter().cloned());
+        }
+        for (property, classes) in &other.domains {
+            self.domains
+                .entry(property.clone())
+                .or_default()
+                .extend(classes.iter().cloned());
+        }
+        for (property, classes) in &other.ranges {
+            self.ranges
+                .entry(property.clone())
+                .or_default()
+                .extend(classes.iter().cloned());
+        }
+        self.disjoint.extend(other.disjoint.iter().cloned());
+        self.transitive.extend(other.transitive.iter().cloned());
+        self.symmetric.extend(other.symmetric.iter().cloned());
+        self.inverses.extend(other.inverses.iter().cloned());
+        self.declared_classes
+            .extend(other.declared_classes.iter().cloned());
+        self.declared_properties
+            .extend(other.declared_properties.iter().cloned());
+        self.digest() != before
+    }
+
     pub fn is_empty(&self) -> bool {
         self.subclasses.is_empty()
             && self.subproperties.is_empty()
@@ -1101,6 +1142,19 @@ mod tests {
         assert!(coverage
             .untyped_predicates
             .contains(&"未知谓词".to_string()));
+    }
+
+    #[test]
+    fn merge_is_monotonic_and_idempotent() {
+        let mut view = mixed_schema();
+        let before = view.digest();
+        assert!(!view.merge(&mixed_schema()));
+        assert_eq!(view.digest(), before);
+        let mut extra = SchemaView::new();
+        extra.declare_subclass("公司", "实体");
+        assert!(view.merge(&extra));
+        assert!(view.is_subclass("公司", "实体"));
+        assert!(!view.merge(&extra));
     }
 
     #[test]

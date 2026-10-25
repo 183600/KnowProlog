@@ -77,6 +77,7 @@ use crate::resolution_engine::{
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
 };
 use crate::revision_guard::{GuardPlan, RevisionGuard};
+use crate::schema_view::SchemaView;
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{self, EntailmentResult, Knowledge, PropositionParser, Verdict};
 use crate::slot_ledger::{
@@ -1152,6 +1153,8 @@ pub struct SymbolicReasoner {
     persisted_laws: Option<LawBook>,
     context: DialogueContext,
     embedding: SymbolicEmbedding,
+    // 单一 RDFS 模式视图：类型闭包/子属性/域值域，嵌入与审计共用同一坐标系。
+    schema_view: SchemaView,
     // 符号化图嵌入：随机游走重启（RWR）向量，做结构联想与话题延伸
     walks: GraphWalkEmbedding,
     // 轻量马尔可夫逻辑网络：加权规则软真值传播 + 加权 MAP 局部搜索
@@ -1361,6 +1364,7 @@ impl Clone for SymbolicReasoner {
             persisted_laws: self.persisted_laws.clone(),
             context: self.context.clone(),
             embedding: self.embedding.clone(),
+            schema_view: self.schema_view.clone(),
             walks: self.walks.clone(),
             soft: self.soft.clone(),
             problog: self.problog.clone(),
@@ -1592,6 +1596,7 @@ impl SymbolicReasoner {
             persisted_laws: None,
             context: DialogueContext::new(5),
             embedding,
+            schema_view: SchemaView::new(),
             walks,
             soft,
             problog,
@@ -1670,8 +1675,11 @@ impl SymbolicReasoner {
         let engine_fault = self.engine_fault.clone();
         let lexical_memory = self.lexical_memory.clone();
         let mention_lexicon = self.mention_lexicon.clone();
+        let schema_view = self.schema_view.clone();
         let mut fresh =
             Self::with_perf_ledger(self.config.clone(), synonyms, Arc::clone(&self.perf));
+        fresh.schema_view = schema_view.clone();
+        fresh.embedding.set_schema(Some(schema_view));
         // 词表是词法记忆：待定提名与墓碑不能因图谱重建而消失；
         // 当前图谱实体仍由随后的 observe_facts 重新确认。
         fresh.mention_lexicon = mention_lexicon;
@@ -4521,6 +4529,7 @@ impl SymbolicReasoner {
         }
         let summary = self.discourse.teach_axiom(trimmed)?;
         self.sync_retrieval_type_hierarchy();
+        self.refresh_schema_view();
         Ok(summary)
     }
 
@@ -4541,6 +4550,33 @@ impl SymbolicReasoner {
         }
     }
 
+    /// 合并一份外部 RDFS 模式视图（配置别名/子类/互斥/谓词画像），
+    /// 并让符号嵌入按新闭包重放。返回内容是否实际变化。
+    pub fn configure_schema_view(&mut self, view: &SchemaView) -> bool {
+        let merged = self.schema_view.merge(view);
+        let digest = self.schema_view.digest();
+        let needs_install =
+            merged || self.embedding.schema_digest().as_deref() != Some(digest.as_str());
+        if needs_install {
+            self.embedding.set_schema(Some(self.schema_view.clone()));
+        }
+        merged
+    }
+
+    /// 当前 RDFS 模式视图（只读；嵌入与类型审计同源）。
+    pub fn schema_view(&self) -> &SchemaView {
+        &self.schema_view
+    }
+
+    /// 把已登记的全部本体公理重建成模式视图并装进嵌入。
+    /// 公理集单调，因此迁移只增不减；重复调用由摘要去重。
+    fn refresh_schema_view(&mut self) {
+        let program = OntologyProgram::from_lessons(self.discourse.taught_lessons().to_vec());
+        let lessons_view = SchemaView::from_ontology_program(&program);
+        self.schema_view.merge(&lessons_view);
+        self.embedding.set_schema(Some(self.schema_view.clone()));
+    }
+
     /// 配置态本体并入**单一本体**：`[type_system]` 与 `[[predicate_profiles]]`
     /// 归约出的公理与教学公理共用同一个本体推理器与同一个胶囊，
     /// 落盘/重建/分叉都不丢（配置不再是第二套本体）。
@@ -4556,6 +4592,7 @@ impl SymbolicReasoner {
             self.perf.bump_by("ontology_config_lessons", added as u64);
             self.sync_retrieval_type_hierarchy();
         }
+        self.refresh_schema_view();
         added
     }
 
@@ -17880,6 +17917,116 @@ mod tests {
         assert!(reasoner.embedding().is_embedded("张三"));
         assert!(reasoner.embedding().is_embedded("赵六"));
         assert!(reasoner.embedding().similarity("张三", "王五") > 0.9);
+    }
+
+    #[test]
+    fn test_configure_ontology_feeds_schema_aware_embedding() {
+        use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
+
+        let program = OntologyProgram::from_lessons(vec![
+            OntologyLesson::Subclass {
+                sub: "学生".into(),
+                sup: "人物".into(),
+                original: "学生是一种人物".into(),
+            },
+            OntologyLesson::Subproperty {
+                sub: "导师".into(),
+                sup: "师傅".into(),
+                original: "导师是师傅的子属性".into(),
+            },
+            OntologyLesson::Domain {
+                property: "导师".into(),
+                class: "学生".into(),
+                original: "导师关系的定义域是学生".into(),
+            },
+            OntologyLesson::Range {
+                property: "导师".into(),
+                class: "人物".into(),
+                original: "导师关系的值域是人物".into(),
+            },
+        ]);
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.configure_ontology_program(&program);
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "王五".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "导师".into(),
+                to: "李四".into(),
+            },
+        ]);
+        assert!(reasoner.schema_view().is_subclass("学生", "人物"));
+        let shared = reasoner
+            .embedding()
+            .shared_feature_labels("张三", "王五", 8);
+        assert!(
+            shared.iter().any(|feature| feature == "类型·人物"),
+            "定义域投影应让关系主语与显式类型实体共享类型特征：{:?}",
+            shared
+        );
+    }
+
+    #[test]
+    fn test_configure_schema_view_merges_aliases_and_survives_rebuild() {
+        use crate::predicate_registry::PredicateProfileConfig;
+        use crate::schema_view::SchemaView;
+        use crate::type_system::{TypeAliasConfig, TypeSubclassConfig, TypeSystemConfig};
+
+        let view = SchemaView::from_config(
+            &TypeSystemConfig {
+                aliases: vec![TypeAliasConfig {
+                    alias: "Person".into(),
+                    canonical: "人物".into(),
+                }],
+                subclasses: vec![TypeSubclassConfig {
+                    sub: "学生".into(),
+                    sup: "人物".into(),
+                }],
+                ..TypeSystemConfig::default()
+            },
+            &[PredicateProfileConfig {
+                name: "师傅".into(),
+                domain: vec!["人物".into()],
+                range: vec!["人物".into()],
+                ..PredicateProfileConfig::default()
+            }],
+        );
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".into(),
+                entity_type: "Person".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".into(),
+                entity_type: "学生".into(),
+                properties: HashMap::new(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.configure_schema_view(&view);
+        reasoner.observe_facts(&facts);
+        let shared = reasoner
+            .embedding()
+            .shared_feature_labels("张三", "李四", 8);
+        assert!(
+            shared.iter().any(|feature| feature == "类型·人物"),
+            "Person 别名与学生的子类闭包应汇合到人物：{:?}",
+            shared
+        );
+        let digest = reasoner.schema_view().digest();
+
+        reasoner.rebuild_from_graph(&facts);
+        assert_eq!(reasoner.schema_view().digest(), digest);
+        let shared = reasoner
+            .embedding()
+            .shared_feature_labels("张三", "李四", 8);
+        assert!(shared.iter().any(|feature| feature == "类型·人物"));
+        assert_eq!(reasoner.fork_session().schema_view().digest(), digest);
     }
 
     #[test]

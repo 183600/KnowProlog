@@ -84,6 +84,7 @@ use know_prolog::{
     },
     release::{self, CheckOptions},
     resolution_engine::SearchStatus,
+    schema_view::SchemaView,
     shape_dialogue::ShapeDialogue,
     shape_eval::{
         compare_baseline as compare_shape_eval_baseline, evaluate_seed as evaluate_shape_dialogue,
@@ -3067,6 +3068,10 @@ async fn main() {
                 &config.type_system,
                 &config.predicate_profiles,
             ));
+            api_state.configure_schema(&SchemaView::from_config(
+                &config.type_system,
+                &config.predicate_profiles,
+            ));
             if api_config_lessons > 0 {
                 println!("服务已注入配置本体公理：{} 条。", api_config_lessons);
             }
@@ -5665,6 +5670,10 @@ async fn run_ask(
         &config.type_system,
         &config.predicate_profiles,
     ));
+    reasoner.configure_schema_view(&SchemaView::from_config(
+        &config.type_system,
+        &config.predicate_profiles,
+    ));
     reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
     reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
     if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
@@ -6326,6 +6335,10 @@ async fn run_interactive_mode(
     let config_lessons = symbolic_reasoner.configure_ontology_program(
         &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
     );
+    symbolic_reasoner.configure_schema_view(&SchemaView::from_config(
+        &config.type_system,
+        &config.predicate_profiles,
+    ));
     if config_lessons > 0 {
         println!(
             "已并入配置本体公理：{} 条（类型层级与谓词画像，随对话记忆持久保留）。",
