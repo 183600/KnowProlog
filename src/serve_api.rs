@@ -1381,6 +1381,11 @@ impl WarmBase {
         self.reasoner.lock().set_nlp_config(config);
     }
 
+    /// 为后续分叉注入双向语义规则包（生成侧与抽取侧共享模板）。
+    fn set_semantic_grammar(&self, grammar: crate::semantic_grammar::RulePack) {
+        self.reasoner.lock().attach_semantic_grammar(grammar);
+    }
+
     /// 知识版本（分叉基座当前携带的 revision，供审计与测试）。
     pub fn revision(&self) -> u64 {
         self.reasoner.lock().revision()
@@ -1536,6 +1541,11 @@ impl ApiState {
     /// 必须在启动会话 actor 之前调用；不改变任何回答文本。
     pub fn set_nlp_config(&mut self, config: NlpConfig) {
         self.warm.set_nlp_config(config);
+    }
+
+    /// 注入双向语义规则包：之后由本基座分叉的会话在生成时复用同一份模板。
+    pub fn set_semantic_grammar(&mut self, grammar: crate::semantic_grammar::RulePack) {
+        self.warm.set_semantic_grammar(grammar);
     }
 
     /// 宿主注入配置态本体（`[type_system]` + `[[predicate_profiles]]` 归约的公理）：

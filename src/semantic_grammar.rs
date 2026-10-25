@@ -857,6 +857,28 @@ mod tests {
     }
 
     #[test]
+    fn generator_reuses_the_same_realize_template() {
+        let pack = RulePack::compile(vec![rule(
+            "身高",
+            "height",
+            &["$s:pos:nr", "身高", "$o:pos:m"],
+            "{s}身高{o}",
+            false,
+        )]);
+        let mut generator = crate::symbolic_generator::SymbolicGenerator::new(8, 0.5);
+        generator.observe_entity(
+            "小明",
+            "Person",
+            &[("height".to_string(), "226".to_string())],
+        );
+        pack.apply_to_generator(&mut generator);
+        assert_eq!(
+            generator.render_fact("小明", "height", &["226".to_string()]),
+            "小明身高226"
+        );
+    }
+
+    #[test]
     fn realization_skips_rules_without_template_instead_of_giving_up() {
         let mut no_template = rule(
             "无模板",

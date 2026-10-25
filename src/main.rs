@@ -3033,6 +3033,11 @@ async fn main() {
             );
             // 读法观测：服务会话的失败轮同样留下有界回执，指标进共享性能台账。
             api_state.set_nlp_config(config.nlp.clone());
+            if config.semantic_grammar.enabled {
+                api_state.set_semantic_grammar(
+                    know_prolog::semantic_grammar::RulePack::from_config(&config),
+                );
+            }
             api_state.set_frame_program(frame_program.clone());
             // 单一本体：配置态本体注入暖基座，之后分叉的每个会话同源携带。
             let api_config_lessons = api_state.configure_ontology(&OntologyProgram::from_config(
@@ -5620,6 +5625,11 @@ async fn run_ask(
         PerfLedger::shared(),
     );
     reasoner.set_nlp_config(config.nlp.clone());
+    if config.semantic_grammar.enabled {
+        reasoner.attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(
+            &config,
+        ));
+    }
     if let Ok(memory) = oxigraph_manager.load_lexical_memory().await {
         if !memory.is_empty() {
             reasoner.set_lexical_memory(memory);
@@ -6262,6 +6272,11 @@ async fn run_interactive_mode(
     );
     // 读法观测：注入与交互/导入路径相同的 NLP 配置；失败轮才留轨迹。
     symbolic_reasoner.set_nlp_config(config.nlp.clone());
+    if config.semantic_grammar.enabled {
+        symbolic_reasoner.attach_semantic_grammar(
+            know_prolog::semantic_grammar::RulePack::from_config(&config),
+        );
+    }
     // 跨会话词法记忆：从独立命名图恢复词性证据与量词期待（只作软约束）。
     match oxigraph_manager.load_lexical_memory().await {
         Ok(memory) if !memory.is_empty() => {

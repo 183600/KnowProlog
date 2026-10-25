@@ -2381,6 +2381,11 @@ impl SymbolicReasoner {
         &self.generator
     }
 
+    /// 让生成器复用配置编译出的双向语义规则（抽取与生成同源）。
+    pub fn attach_semantic_grammar(&mut self, grammar: crate::semantic_grammar::RulePack) {
+        self.generator.attach_semantic_grammar(grammar);
+    }
+
     /// 类型化配方查询：按方向（实体→答案 / 答案→实体）取关系值，
     /// 用当前单一本体的物化闭包补齐逆关系与子类推断，并按答案类型做
     /// **开放世界**过滤——未知类型放行，只有显式互斥的已知冲突才拒答。
