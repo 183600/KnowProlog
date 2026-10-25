@@ -482,15 +482,6 @@ impl EntityThreadDigest {
                 seq: entry.seq,
             });
         }
-        if let Some(focus) = focus.as_deref() {
-            raw.push(RawMention {
-                surface: focus.to_string(),
-                entity: None,
-                source: "focus".to_string(),
-                late_bound: true,
-                seq: entry.seq,
-            });
-        }
         // 旧日志没有 refs：按今天的已确认词面做确定性扫描，实现延迟绑定。
         if entry.kind != "command" {
             for text in [question.as_deref(), answer.as_deref()]
@@ -506,6 +497,19 @@ impl EntityThreadDigest {
                         seq: entry.seq,
                     });
                 }
+            }
+        }
+        // 焦点只在本轮确实像「接着聊」时才作为词面证据：代词/继续/呢等。
+        // 换了新话题的轮次不应污染上一焦点实体的足迹。
+        if question.as_deref().map(looks_like_follow_up).unwrap_or(false) {
+            if let Some(focus) = focus.as_deref() {
+                raw.push(RawMention {
+                    surface: focus.to_string(),
+                    entity: None,
+                    source: "focus".to_string(),
+                    late_bound: true,
+                    seq: entry.seq,
+                });
             }
         }
 
@@ -845,6 +849,29 @@ fn entity_refs(entry: &ChronicleEntry) -> Vec<EntityRef> {
             _ => None,
         })
         .collect()
+}
+
+/// 本轮是否是在「接着上一轮说」：只有这类轮次才让焦点词面进入实体足迹。
+fn looks_like_follow_up(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let cleaned = text.replace("其他", "").replace("其它", "").replace("吉他", "");
+    if cleaned
+        .chars()
+        .any(|character| matches!(character, '他' | '她' | '它'))
+    {
+        return true;
+    }
+    const MARKERS: &[&str] = &[
+        "继续", "接着", "然后", "还有", "上述", "刚才", "之前", "上面", "该实体", "此人", "这位",
+        "那位",
+    ];
+    if MARKERS.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    text.ends_with('呢')
 }
 
 /// 单条线程事件的人类可读行（供实体足迹与别名感知检索共用）。
@@ -1218,15 +1245,18 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_refs_are_reported_not_collapsed() {
+    fn unresolved_mentions_keep_their_sources() {
         let dir = TempDir::new().unwrap();
         let (mut chronicle, _) = chronicle(&dir);
+        chronicle
+            .append_turn("他是谁", "query", Some("小赵"), 0)
+            .unwrap();
         chronicle
             .append_turn_with_refs(
                 "小赵是谁",
                 "query",
-                Some("小赵"),
-                0,
+                None,
+                1,
                 &[EntityRef {
                     surface: "小赵".to_string(),
                     entity: Some("赵六".to_string()),
@@ -1238,10 +1268,46 @@ mod tests {
         let digest = EntityThreadDigest::build(&chronicle, &registry);
         assert!(digest.threads.is_empty());
         let mention = digest.unresolved.get("小赵").expect("未解析词面必须保留");
-        assert!(mention.seqs.contains(&1));
+        assert_eq!(mention.seqs.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
         assert!(mention.sources.contains("focus"));
+        assert!(mention.sources.contains("link"));
         let report = digest.render_unresolved();
         assert!(report.contains("小赵"), "{}", report);
+    }
+
+    #[test]
+    fn focus_is_only_used_for_follow_up_turns() {
+        let dir = TempDir::new().unwrap();
+        let (mut chronicle, _) = chronicle(&dir);
+        let refs = vec![EntityRef {
+            surface: "姚明".to_string(),
+            entity: Some("姚明".to_string()),
+            source: "link".to_string(),
+        }];
+        chronicle
+            .append_turn_with_refs("姚明是谁", "query", None, 0, &refs)
+            .unwrap();
+        // 换新话题：焦点仍是姚明，但本轮没有代词/继续标记，不应污染姚明线程。
+        chronicle
+            .append_turn("今天天气怎么样", "query", Some("姚明"), 1)
+            .unwrap();
+        // 接着聊：代词让焦点参与指代。
+        chronicle
+            .append_turn("他的身高呢", "query", Some("姚明"), 2)
+            .unwrap();
+        let registry = registry_with(&[("姚明", &[], &[])]);
+        let digest = EntityThreadDigest::build(&chronicle, &registry);
+        let thread = digest.thread("姚明").unwrap();
+        assert_eq!(
+            thread.events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 3],
+            "{:?}",
+            thread.events
+        );
+        assert!(thread
+            .events
+            .iter()
+            .any(|event| event.mentions.iter().any(|mention| mention.sources.contains("focus"))));
     }
 
     #[test]

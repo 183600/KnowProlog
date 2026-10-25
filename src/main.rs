@@ -7570,7 +7570,7 @@ async fn run_interactive_mode(
                 let refs = if kind == "command" {
                     Vec::new()
                 } else {
-                    chronicle_entity_refs(&symbolic_reasoner, raw_input, focus)
+                    chronicle_entity_refs(&symbolic_reasoner, raw_input)
                 };
                 let _ = chronicle.append_turn_with_refs(
                     raw_input,
@@ -13389,11 +13389,7 @@ async fn entity_thread_context(
 ///
 /// 只写「当时看到的身份」，不写当前显示名；日志永不回写，合并后的投影由
 /// EntityThreadDigest 在读端完成。
-fn chronicle_entity_refs(
-    reasoner: &SymbolicReasoner,
-    text: &str,
-    focus: Option<&str>,
-) -> Vec<EntityRef> {
+fn chronicle_entity_refs(reasoner: &SymbolicReasoner, text: &str) -> Vec<EntityRef> {
     let mut refs = Vec::new();
     let mut seen = BTreeSet::new();
     for mention in reasoner.grounding_mentions(text) {
@@ -13407,11 +13403,6 @@ fn chronicle_entity_refs(
         }
         if seen.insert((surface.to_string(), entity.to_string())) {
             refs.push(EntityRef::linked(surface, entity));
-        }
-    }
-    if let Some(focus) = focus.map(str::trim).filter(|focus| !focus.is_empty()) {
-        if !refs.iter().any(|reference| reference.surface == focus) {
-            refs.push(EntityRef::focus(focus));
         }
     }
     refs
@@ -16632,14 +16623,12 @@ mod session_tests {
     }
 
     #[test]
-    fn chronicle_refs_keep_focus_when_linker_has_no_mention() {
+    fn chronicle_refs_only_write_linked_mentions() {
         let reasoner = SymbolicReasoner::new(
             know_prolog::ReasoningConfig::default(),
             std::collections::HashMap::new(),
         );
-        let refs = chronicle_entity_refs(&reasoner, "今天天气不错", Some("张三"));
-        assert_eq!(refs, vec![EntityRef::focus("张三")]);
-        assert!(chronicle_entity_refs(&reasoner, "今天天气不错", None).is_empty());
+        assert!(chronicle_entity_refs(&reasoner, "今天天气不错").is_empty());
     }
 
     #[tokio::test]
