@@ -13385,8 +13385,10 @@ async fn entity_thread_context(
     (digest, facts)
 }
 
-/// 编年史写端的实体引用：链接器词面 + 当轮继承焦点（焦点只记词面）。
+/// 编年史写端的实体引用：只记链接器本轮真正看到的词面/身份。
 ///
+/// 焦点不在这里重复落账：`Chronicle` 的 turn 已带 `focus`，读端只在
+/// 代词/继续等「接着聊」轮次把焦点当指代证据，避免新话题污染旧实体足迹。
 /// 只写「当时看到的身份」，不写当前显示名；日志永不回写，合并后的投影由
 /// EntityThreadDigest 在读端完成。
 fn chronicle_entity_refs(reasoner: &SymbolicReasoner, text: &str) -> Vec<EntityRef> {
