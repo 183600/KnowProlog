@@ -846,6 +846,28 @@ fn ratio(count: usize, total: usize) -> f64 {
     }
 }
 
+fn most_specific_top(
+    counts: &BTreeMap<String, usize>,
+    closure: &OntologyClosure,
+) -> Vec<(String, usize)> {
+    let Some(maximum) = counts.values().copied().max() else {
+        return Vec::new();
+    };
+    let top: Vec<(String, usize)> = counts
+        .iter()
+        .filter(|(_, count)| **count == maximum)
+        .map(|(class, count)| (class.clone(), *count))
+        .collect();
+    top.iter()
+        .filter(|(class, _)| {
+            !top.iter().any(|(other, _)| {
+                other != class && closure.is_subclass(other.as_str(), class.as_str())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 fn preview_against(
     base_reasoner: &OntologyReasoner,
     before: &OntologyClosure,
@@ -1023,7 +1045,7 @@ pub fn propose_from_observation(
                     }
                 }
                 if reaches(typed, subjects.len(), min_purity) {
-                    for (class, count) in counts {
+                    for (class, count) in most_specific_top(&counts, &before) {
                         if count < min_support || !reaches(count, subjects.len(), min_purity) {
                             continue;
                         }
@@ -1075,7 +1097,7 @@ pub fn propose_from_observation(
                     }
                 }
                 if reaches(typed, objects.len(), min_purity) {
-                    for (class, count) in counts {
+                    for (class, count) in most_specific_top(&counts, &before) {
                         if count < min_support || !reaches(count, objects.len(), min_purity) {
                             continue;
                         }

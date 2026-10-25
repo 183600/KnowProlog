@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -56,7 +56,11 @@ use know_prolog::{
     neuro_symbolic_contrast::ContrastArbiter,
     nlp::{normalize_words, preprocess, preprocess_annotated},
     nlu::NLUEngine,
-    ontology_reasoning::OntologyProgram,
+    ontology_reasoning::{parse_ontology_lesson, OntologyProgram},
+    owl_annotation::{
+        self, AnnotationLedger, GraphObservation, LedgerLoad as OwlLedgerLoad, ProposalOptions,
+        ReviewAction,
+    },
     ownthink_api::select_candidate_by_context,
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
     pattern_forge::{self, ForgeRequest, PatternForge},
@@ -1007,8 +1011,86 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Mine, review, export or import OWL axioms proposed from the graph
+    Owl {
+        #[command(subcommand)]
+        command: OwlCommands,
+    },
     /// Run interactive mode (default)
     Interactive,
+}
+
+#[derive(Subcommand, Debug)]
+enum OwlCommands {
+    /// Mine candidate axioms from the default graph and record them in the
+    /// review ledger; proposals never affect reasoning until reviewed
+    Propose {
+        /// Minimum evidence count for a candidate
+        #[arg(long, default_value_t = 2)]
+        min_support: usize,
+        /// Minimum purity in per mille (0-1000)
+        #[arg(long, default_value_t = 800)]
+        min_purity: u32,
+        /// Maximum number of candidates to keep per run
+        #[arg(long, default_value_t = 32)]
+        max_candidates: usize,
+        /// Print the ledger and outcome as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept, reject, defer or revise one candidate axiom by id
+    Review {
+        /// Candidate id (owl-0001) or stable axiom key
+        id: String,
+        #[arg(value_enum)]
+        action: OwlReviewAction,
+        /// Reviewer name stored with the decision
+        #[arg(long, default_value = "human")]
+        reviewer: String,
+        /// Human-readable reason stored with the decision
+        #[arg(long)]
+        note: Option<String>,
+        /// Replacement lesson text for `revise`, e.g. "学生是一种人物"
+        #[arg(long)]
+        lesson: Option<String>,
+    },
+    /// Render the review ledger and the accepted axiom program
+    Report {
+        /// Print the ledger as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export annotated axioms for other OWL tools or later import
+    Export {
+        /// Output format: turtle (annotated OWL) or json (full review ledger)
+        #[arg(long, default_value = "turtle")]
+        format: String,
+        /// Output path; omit or "-" for stdout
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        /// Include proposed/deferred/rejected entries in the Turtle export
+        #[arg(long)]
+        include_proposed: bool,
+    },
+    /// Import an annotated Turtle file or review ledger JSON
+    Import {
+        /// Input file path
+        path: String,
+        /// Input format: auto, turtle or json
+        #[arg(long, default_value = "auto")]
+        format: String,
+        /// Replace the existing ledger instead of merging decisions by axiom key
+        #[arg(long)]
+        replace: bool,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum OwlReviewAction {
+    Accept,
+    Reject,
+    Defer,
+    Revise,
 }
 
 #[tokio::main]
@@ -1520,6 +1602,9 @@ async fn main() {
                 json,
             )
             .await;
+        }
+        Some(Commands::Owl { command }) => {
+            run_owl_command(&config, &oxigraph_manager, &store_path, command).await;
         }
         Some(Commands::ExportRdf { file_path }) => {
             if file_path == "-" {
@@ -4411,6 +4496,284 @@ fn run_batch_teach(
             ledger.active_rules().len(),
             path
         );
+    }
+}
+
+fn load_owl_ledger(path: &str) -> AnnotationLedger {
+    match AnnotationLedger::load(path) {
+        OwlLedgerLoad::Missing => AnnotationLedger::default(),
+        OwlLedgerLoad::Loaded(ledger) => ledger,
+        OwlLedgerLoad::Damaged(error) => {
+            eprintln!("OWL 人工反馈台账损坏：{}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_owl_command(
+    config: &Arc<SystemConfig>,
+    manager: &OxigraphManager,
+    store_path: &str,
+    command: OwlCommands,
+) {
+    let ledger_path = format!("{}/{}", store_path, owl_annotation::LEDGER_FILE);
+    match command {
+        OwlCommands::Propose {
+            min_support,
+            min_purity,
+            max_candidates,
+            json,
+        } => {
+            load_persistent_registries(config, manager, store_path);
+            let mut ledger = load_owl_ledger(&ledger_path);
+            let facts = match manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(error) => {
+                    eprintln!("读取知识库失败：{}", error);
+                    std::process::exit(1);
+                }
+            };
+            let mut observation = GraphObservation::from_facts(&facts);
+            if let Ok(refs) = manager.load_fact_refs().await {
+                for fact in refs {
+                    if fact.predicate == "type" {
+                        observation
+                            .instances
+                            .push((fact.subject.clone(), fact.value.clone()));
+                    }
+                }
+                observation = GraphObservation::new(observation.instances, observation.relations);
+            }
+            let mut base =
+                OntologyProgram::from_config(&config.type_system, &config.predicate_profiles);
+            base.merge(&ledger.accepted_program());
+            let options = ProposalOptions {
+                min_support,
+                min_purity,
+                max_candidates,
+                ..ProposalOptions::default()
+            };
+            let proposals = owl_annotation::propose_from_observation(&observation, &base, &options);
+            let outcome = ledger.propose(proposals);
+            if let Err(error) = ledger.save(&ledger_path) {
+                eprintln!("保存 OWL 反馈台账失败：{}", error);
+                std::process::exit(1);
+            }
+            if json {
+                let touched: Vec<&str> = outcome
+                    .added
+                    .iter()
+                    .chain(outcome.updated.iter())
+                    .map(String::as_str)
+                    .collect();
+                let candidates: Vec<_> = touched.iter().filter_map(|id| ledger.find(id)).collect();
+                let payload = serde_json::json!({
+                    "ledger": ledger_path,
+                    "observation": {
+                        "type_assertions": observation.instances.len(),
+                        "relations": observation.relations.len(),
+                    },
+                    "outcome": outcome,
+                    "candidates": candidates,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => eprintln!("候选序列化失败：{}", error),
+                }
+                return;
+            }
+            println!(
+                "图谱观测：{} 条类型断言，{} 条关系。",
+                observation.instances.len(),
+                observation.relations.len()
+            );
+            if outcome.total_changes() == 0 {
+                println!("没有新的可提议公理（驳回记忆会抑制同形候选）。");
+            } else {
+                for id in outcome.added.iter().chain(outcome.updated.iter()) {
+                    if let Some(entry) = ledger.find(id) {
+                        println!("{}", entry.render());
+                        println!();
+                    }
+                }
+            }
+            println!(
+                "台账：{}（接受 {}，待裁决 {}，驳回 {}）。用 owl review <id> accept|reject|defer|revise 裁决。",
+                ledger_path,
+                ledger.accepted_count(),
+                ledger.pending_count(),
+                ledger.rejected_count()
+            );
+        }
+        OwlCommands::Review {
+            id,
+            action,
+            reviewer,
+            note,
+            lesson,
+        } => {
+            let mut ledger = load_owl_ledger(&ledger_path);
+            let action = match action {
+                OwlReviewAction::Accept => ReviewAction::Accept,
+                OwlReviewAction::Reject => ReviewAction::Reject,
+                OwlReviewAction::Defer => ReviewAction::Defer,
+                OwlReviewAction::Revise => {
+                    let Some(text) = lesson.as_deref() else {
+                        eprintln!("revise 需要 --lesson，例如 --lesson \"学生是一种人物\"");
+                        std::process::exit(2);
+                    };
+                    let lesson = match parse_ontology_lesson(text) {
+                        Ok(lesson) => lesson,
+                        Err(error) => {
+                            eprintln!("无法解析修正公理：{}", error);
+                            std::process::exit(2);
+                        }
+                    };
+                    ReviewAction::Revise { lesson }
+                }
+            };
+            let outcome = match ledger.review(&id, action, &reviewer, note.as_deref().unwrap_or(""))
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    eprintln!("裁决失败：{}", error);
+                    std::process::exit(1);
+                }
+            };
+            if let Err(error) = ledger.save(&ledger_path) {
+                eprintln!("保存 OWL 反馈台账失败：{}", error);
+                std::process::exit(1);
+            }
+            if let Some(entry) = ledger.find(&outcome.id) {
+                println!("{}", entry.render());
+            }
+            println!(
+                "当前已接受公理 {} 条；下次交互/ask/serve 启动时并入本体。台账：{}",
+                ledger.accepted_count(),
+                ledger_path
+            );
+        }
+        OwlCommands::Report { json } => {
+            let ledger = load_owl_ledger(&ledger_path);
+            if json {
+                match ledger.to_json() {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("{}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", ledger.render_report());
+                println!("台账：{}", ledger_path);
+            }
+        }
+        OwlCommands::Export {
+            format,
+            output,
+            include_proposed,
+        } => {
+            let ledger = load_owl_ledger(&ledger_path);
+            let format = format.trim().to_ascii_lowercase();
+            let text = match format.as_str() {
+                "turtle" | "ttl" => match ledger.export_turtle(include_proposed) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("导出 OWL 注解失败：{}", error);
+                        std::process::exit(1);
+                    }
+                },
+                "json" => match ledger.to_json() {
+                    Ok(text) => text,
+                    Err(error) => {
+                        eprintln!("导出 OWL 台账失败：{}", error);
+                        std::process::exit(1);
+                    }
+                },
+                other => {
+                    eprintln!("不支持的导出格式「{}」（应为 turtle 或 json）", other);
+                    std::process::exit(2);
+                }
+            };
+            match output.as_deref() {
+                None | Some("-") => print!("{}", text),
+                Some(path) => {
+                    if let Err(error) = std::fs::write(path, text.as_bytes()) {
+                        eprintln!("写入导出文件失败（{}）：{}", path, error);
+                        std::process::exit(1);
+                    }
+                    println!("已导出 OWL 人工反馈：{}", path);
+                }
+            }
+        }
+        OwlCommands::Import {
+            path,
+            format,
+            replace,
+        } => {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("读取导入文件失败（{}）：{}", path, error);
+                    std::process::exit(1);
+                }
+            };
+            let format = format.trim().to_ascii_lowercase();
+            let format = if format == "auto" {
+                match std::path::Path::new(&path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| extension.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some("json") | Some("jsonld") => "json".to_string(),
+                    Some("ttl") | Some("turtle") => "turtle".to_string(),
+                    _ if text.trim_start().starts_with('{') => "json".to_string(),
+                    _ => "turtle".to_string(),
+                }
+            } else {
+                format
+            };
+            let imported = match format.as_str() {
+                "json" => match serde_json::from_str::<AnnotationLedger>(&text) {
+                    Ok(ledger) => ledger,
+                    Err(error) => {
+                        eprintln!("解析 OWL 台账 JSON 失败：{}", error);
+                        std::process::exit(1);
+                    }
+                },
+                "turtle" | "ttl" => match AnnotationLedger::import_turtle(&text) {
+                    Ok(ledger) => ledger,
+                    Err(error) => {
+                        eprintln!("导入 OWL 注解失败：{}", error);
+                        std::process::exit(1);
+                    }
+                },
+                other => {
+                    eprintln!("不支持的导入格式「{}」（应为 auto、turtle 或 json）", other);
+                    std::process::exit(2);
+                }
+            };
+            let mut ledger = if replace {
+                AnnotationLedger::default()
+            } else {
+                load_owl_ledger(&ledger_path)
+            };
+            let changed = ledger.merge_entries(&imported, true);
+            if let Err(error) = ledger.save(&ledger_path) {
+                eprintln!("保存 OWL 反馈台账失败：{}", error);
+                std::process::exit(1);
+            }
+            println!(
+                "已导入 {} 条候选（更新 {} 条）；当前接受 {}，待裁决 {}，驳回 {}。台账：{}",
+                imported.len(),
+                changed,
+                ledger.accepted_count(),
+                ledger.pending_count(),
+                ledger.rejected_count(),
+                ledger_path
+            );
+        }
     }
 }
 
