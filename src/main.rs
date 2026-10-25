@@ -795,6 +795,25 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the layered fact snapshot: effective facts, audit records and
+    /// functional-slot conflicts under one consistent read-only world
+    Snapshot {
+        /// Subject to inspect (requires --predicate)
+        #[arg(long, requires = "predicate")]
+        subject: Option<String>,
+        /// Predicate to inspect (requires --subject)
+        #[arg(long, requires = "subject")]
+        predicate: Option<String>,
+        /// Show every layered record in the slot, not only effective values
+        #[arg(long)]
+        all: bool,
+        /// Maximum rows printed in the whole-snapshot view
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+        /// Print the snapshot/slot as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the read-only temporal index: timeline, facts valid at a time,
     /// and time-aware functional conflicts (no writes to the knowledge store)
     Temporal {
@@ -2079,6 +2098,99 @@ async fn main() {
                 println!("{}", retriever.format_hits(&query, &search.hits));
                 println!();
                 println!("{}", search.receipt.render_text());
+            }
+        }
+        Some(Commands::Snapshot {
+            subject,
+            predicate,
+            all,
+            limit,
+            json,
+        }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            let snapshot = match oxigraph_manager.load_fact_snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!("读取事实快照失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            if let (Some(subject), Some(predicate)) = (subject, predicate) {
+                let view = snapshot.lookup(subject.as_str(), predicate.as_str());
+                if json {
+                    let payload = serde_json::json!({
+                        "revision": snapshot.revision(),
+                        "functional": snapshot.is_functional(predicate.as_str()),
+                        "slot": view,
+                    });
+                    match serde_json::to_string_pretty(&payload) {
+                        Ok(text) => println!("{}", text),
+                        Err(error) => {
+                            eprintln!("快照序列化失败: {}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    match view {
+                        Some(view) => {
+                            println!(
+                                "槽位 {}({}, ?)：{} 条记录，{} 个有效取值{}",
+                                predicate,
+                                subject,
+                                view.all.len(),
+                                view.effective.len(),
+                                if view.conflict.is_some() {
+                                    "（存在冲突）"
+                                } else {
+                                    ""
+                                }
+                            );
+                            let rows = if all {
+                                &view.all
+                            } else {
+                                &view.effective
+                            };
+                            for record in rows {
+                                println!("  {}", record.display());
+                            }
+                            if let Some(conflict) = &view.conflict {
+                                println!("  {}", conflict.render());
+                            }
+                        }
+                        None => println!("槽位 {}({}, ?) 没有事实。", predicate, subject),
+                    }
+                }
+            } else if json {
+                let payload = serde_json::json!({
+                    "version": snapshot.version,
+                    "revision": snapshot.revision(),
+                    "grammar_digest": snapshot.grammar_digest(),
+                    "functional": snapshot.functional,
+                    "conflicts": snapshot.conflicts(),
+                    "records": snapshot.effective_records().into_iter().take(limit).collect::<Vec<_>>(),
+                    "record_count": snapshot.record_count(),
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("快照序列化失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", snapshot.render());
+                println!();
+                for record in snapshot.effective_records().into_iter().take(limit) {
+                    println!("- {}", record.display());
+                }
+                if snapshot.effective_records().len() > limit {
+                    println!("（仅显示前 {} 条；用 --limit 调整）", limit);
+                }
             }
         }
         Some(Commands::Conflicts {
