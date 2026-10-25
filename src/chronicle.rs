@@ -150,6 +150,39 @@ impl ChainAudit {
     }
 }
 
+/// 一轮输入中写端记录的实体引用（词面 + 写时身份）。
+///
+/// 日志只追加、不回写：合并/改名后由读端按当前身份注册表折叠到最终身份。
+/// `entity` 允许为空（当时的链接器没有给出身份），读端可延迟绑定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityRef {
+    pub surface: String,
+    #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub source: String,
+}
+
+impl EntityRef {
+    /// 链接器给出的词面与写时规范身份。
+    pub fn linked(surface: &str, entity: &str) -> Self {
+        EntityRef {
+            surface: surface.trim().to_string(),
+            entity: Some(entity.trim().to_string()),
+            source: "link".to_string(),
+        }
+    }
+
+    /// 当轮继承的焦点（只记词面，读端再解析）。
+    pub fn focus(surface: &str) -> Self {
+        EntityRef {
+            surface: surface.trim().to_string(),
+            entity: None,
+            source: "focus".to_string(),
+        }
+    }
+}
+
 /// 检索命中：状态编号 + 命中次数 + 摘要。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChronicleMatch {
@@ -496,15 +529,31 @@ impl Chronicle {
         focus: Option<&str>,
         dialogue_turns: usize,
     ) -> std::io::Result<u64> {
-        self.append(
-            "turn",
-            serde_json::json!({
-                "user": user,
-                "mode": mode,
-                "focus": focus,
-                "dialogue_turns": dialogue_turns as u64,
-            }),
-        )
+        self.append_turn_with_refs(user, mode, focus, dialogue_turns, &[])
+    }
+
+    /// 便捷追加：一轮用户输入 + 实体引用（词面/写时身份）。
+    ///
+    /// refs 只影响新追加的记录；旧记录保持原字节，读端投影负责跟随身份变化。
+    pub fn append_turn_with_refs(
+        &mut self,
+        user: &str,
+        mode: &str,
+        focus: Option<&str>,
+        dialogue_turns: usize,
+        refs: &[EntityRef],
+    ) -> std::io::Result<u64> {
+        let mut payload = serde_json::json!({
+            "user": user,
+            "mode": mode,
+            "focus": focus,
+            "dialogue_turns": dialogue_turns as u64,
+        });
+        if !refs.is_empty() {
+            payload["refs"] = serde_json::to_value(refs)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        self.append("turn", payload)
     }
 
     /// 便捷追加：一次系统回答（尽力而为；未接管的管线不记录）。

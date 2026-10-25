@@ -14,8 +14,8 @@ use uuid::Uuid;
 // 使模块公开，以便 main.rs 和 tests 可以访问
 pub mod abduction;
 pub mod advanced_nlu;
-pub mod artifact_audit;
 pub mod alignment_memory;
+pub mod artifact_audit;
 pub mod association_miner;
 pub mod batch_teaching;
 pub mod belief_revision;
@@ -46,13 +46,14 @@ pub mod dialogue_fuzz;
 pub mod dialogue_manager;
 pub mod discourse;
 pub mod embedding_eval;
+pub mod entailment_eval;
 pub mod entity_linker;
 pub mod entity_registry;
 pub mod entity_relation_extractor;
-pub mod entailment_eval;
-pub mod event_graph;
+pub mod entity_thread;
 pub mod epistemic;
 pub mod eval_recovery;
+pub mod event_graph;
 pub mod external_knowledge;
 pub mod external_ledger;
 pub mod fact_snapshot;
@@ -93,14 +94,14 @@ pub mod owl_annotation;
 pub mod ownthink_api;
 pub mod path_memory;
 pub mod pattern_closure;
-pub mod pending_question;
 pub mod pattern_forge;
 pub mod pattern_ir;
+pub mod pending_question;
 pub mod perf_ledger;
 pub mod planning;
 pub mod plugin;
-pub mod predictive_elaboration;
 pub mod predicate_registry;
+pub mod predictive_elaboration;
 pub mod probabilistic_query_intent;
 pub mod problog;
 pub mod prolog_engine;
@@ -109,12 +110,12 @@ pub mod proof_bench;
 pub mod proof_journal;
 pub mod provenance;
 pub mod quality;
+pub mod quantity;
 pub mod query_anchor;
 pub mod query_board;
 pub mod query_planner;
 pub mod query_rewrite;
 pub mod query_scenario;
-pub mod quantity;
 pub mod question_analyzer;
 pub mod reading;
 pub mod recall_audit;
@@ -1400,16 +1401,20 @@ impl OxigraphManager {
         match value {
             Value::Null => None,
             Value::String(text) => Some(Literal::new_simple_literal(text)),
-            Value::Bool(boolean) => {
-                Some(Literal::new_typed_literal(boolean.to_string(), datatype("boolean")))
-            }
+            Value::Bool(boolean) => Some(Literal::new_typed_literal(
+                boolean.to_string(),
+                datatype("boolean"),
+            )),
             Value::Number(number) => {
                 let local = if number.is_i64() || number.is_u64() {
                     "integer"
                 } else {
                     "double"
                 };
-                Some(Literal::new_typed_literal(number.to_string(), datatype(local)))
+                Some(Literal::new_typed_literal(
+                    number.to_string(),
+                    datatype(local),
+                ))
             }
             other => Some(Literal::new_simple_literal(&other.to_string())),
         }
@@ -1834,9 +1839,8 @@ impl OxigraphManager {
             GraphName::DefaultGraph,
         ))?;
         for (index, cell) in cells.iter().enumerate() {
-            let item = self.process_jsonld_list_item(
-                store, &items[index], coercion, context, stats,
-            )?;
+            let item =
+                self.process_jsonld_list_item(store, &items[index], coercion, context, stats)?;
             store.insert(&Quad::new(
                 cell.clone(),
                 rdf_first.clone(),
@@ -1895,8 +1899,7 @@ impl OxigraphManager {
                         other => other.to_string(),
                     };
                     if let Some(datatype) = obj.get("@type").and_then(Value::as_str) {
-                        let datatype =
-                            NamedNode::new(Self::expand_jsonld_term(datatype, context))?;
+                        let datatype = NamedNode::new(Self::expand_jsonld_term(datatype, context))?;
                         return Ok(Literal::new_typed_literal(&text, datatype).into());
                     }
                     if let Some(language) = obj.get("@language").and_then(Value::as_str) {
@@ -3263,8 +3266,7 @@ impl OxigraphManager {
     /// 与知识版本一致，同一 revision 下重复读取得到相同内容。
     pub async fn load_fact_snapshot(
         &self,
-    ) -> Result<crate::fact_snapshot::FactSnapshot, Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<crate::fact_snapshot::FactSnapshot, Box<dyn std::error::Error + Send + Sync>> {
         let revision = self.revision.load(Ordering::Acquire);
         let rows = {
             let store = self.store.lock().await;
@@ -3288,7 +3290,9 @@ impl OxigraphManager {
     }
 
     /// 单次遍历默认图，保留每一行并区分类型/属性/关系。
-    fn scan_fact_refs(store: &Store) -> Vec<(crate::provenance::FactRef, crate::fact_snapshot::FactKind)> {
+    fn scan_fact_refs(
+        store: &Store,
+    ) -> Vec<(crate::provenance::FactRef, crate::fact_snapshot::FactKind)> {
         use crate::fact_snapshot::FactKind;
         let mut out: Vec<(crate::provenance::FactRef, FactKind)> = Vec::new();
         for quad in store.iter() {
@@ -3331,7 +3335,10 @@ impl OxigraphManager {
                     FactKind::Attribute,
                 ),
             };
-            out.push((crate::provenance::FactRef::new(&subject, &predicate, &value), kind));
+            out.push((
+                crate::provenance::FactRef::new(&subject, &predicate, &value),
+                kind,
+            ));
         }
         out.sort();
         out.dedup();
@@ -4441,8 +4448,7 @@ impl OxigraphManager {
         memory: &lexical_memory::LexicalMemory,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = memory.to_quads()?;
-        let graph =
-            GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
+        let graph = GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
         let store = self.store.lock().await;
         let existing: Vec<Quad> = store
             .quads_for_pattern(None, None, None, Some(graph.as_ref()))
@@ -4461,16 +4467,13 @@ impl OxigraphManager {
     pub async fn load_lexical_memory(
         &self,
     ) -> Result<lexical_memory::LexicalMemory, Box<dyn std::error::Error + Send + Sync>> {
-        let graph =
-            GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
+        let graph = GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
         let store = self.store.lock().await;
         let quads: Vec<Quad> = store
             .quads_for_pattern(None, None, None, Some(graph.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         self.perf.bump("lexical_memory_load");
-        Ok(lexical_memory::LexicalMemory::from_quads(
-            quads.into_iter(),
-        ))
+        Ok(lexical_memory::LexicalMemory::from_quads(quads.into_iter()))
     }
 
     /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
@@ -5067,9 +5070,11 @@ mod config_path_tests {
         fs::write(&path, include_str!("../config.toml")).unwrap();
         let config = load_config_from(path.to_str().unwrap()).await.unwrap();
         assert_eq!(config.system.default_language, "zh");
-        assert!(load_config_from(dir.path().join("missing.toml").to_str().unwrap())
-            .await
-            .is_err());
+        assert!(
+            load_config_from(dir.path().join("missing.toml").to_str().unwrap())
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -6197,11 +6202,7 @@ mod cache_tests {
             .unwrap();
         assert_eq!(nicks.data.len(), 2, "{:?}", nicks.data);
         assert_eq!(
-            manager
-                .import_jsonld(jsonld)
-                .await
-                .unwrap()
-                .triples,
+            manager.import_jsonld(jsonld).await.unwrap().triples,
             0,
             "重复导入保持幂等"
         );
@@ -6584,10 +6585,7 @@ mod cache_tests {
         assert_eq!(result.data.len(), 1, "{:?}", result.data);
         assert_eq!(result.data[0].get("age"), Some(&serde_json::json!(25)));
         assert_eq!(result.data[0].get("score"), Some(&serde_json::json!(1.5)));
-        assert_eq!(
-            result.data[0].get("active"),
-            Some(&serde_json::json!(true))
-        );
+        assert_eq!(result.data[0].get("active"), Some(&serde_json::json!(true)));
         assert_eq!(result.data[0].get("height"), Some(&serde_json::json!(180)));
         assert_eq!(
             result.data[0].get("retired"),
