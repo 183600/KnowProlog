@@ -798,8 +798,8 @@ enum Commands {
     /// Inspect the layered fact snapshot: effective facts, audit records and
     /// functional-slot conflicts under one consistent read-only world
     Snapshot {
-        /// Subject to inspect (requires --predicate)
-        #[arg(long, requires = "predicate")]
+        /// Subject to inspect; omit --predicate to list all its facts
+        #[arg(long)]
         subject: Option<String>,
         /// Predicate to inspect (requires --subject)
         #[arg(long, requires = "subject")]
@@ -2120,7 +2120,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            if let (Some(subject), Some(predicate)) = (subject, predicate) {
+            if let (Some(subject), Some(predicate)) = (&subject, &predicate) {
                 let view = snapshot.lookup(subject.as_str(), predicate.as_str());
                 if json {
                     let payload = serde_json::json!({
@@ -2159,6 +2159,33 @@ async fn main() {
                             }
                         }
                         None => println!("槽位 {}({}, ?) 没有事实。", predicate, subject),
+                    }
+                }
+            } else if let Some(subject) = &subject {
+                let records = snapshot.subject_records(subject);
+                if json {
+                    let payload = serde_json::json!({
+                        "revision": snapshot.revision(),
+                        "subject": subject,
+                        "record_count": records.len(),
+                        "records": records,
+                    });
+                    match serde_json::to_string_pretty(&payload) {
+                        Ok(text) => println!("{}", text),
+                        Err(error) => {
+                            eprintln!("快照序列化失败: {}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                } else if records.is_empty() {
+                    println!("实体「{}」没有事实。", subject);
+                } else {
+                    println!("实体「{}」：{} 条记录", subject, records.len());
+                    for record in records.iter().take(limit) {
+                        println!("  {}", record.display());
+                    }
+                    if records.len() > limit {
+                        println!("  …另有 {} 条（--limit 调整）", records.len() - limit);
                     }
                 }
             } else if json {
