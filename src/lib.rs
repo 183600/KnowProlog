@@ -126,6 +126,7 @@ pub mod revision_guard;
 pub mod semantic_embedding;
 pub mod semantic_engine;
 pub mod semantic_entailment;
+pub mod semantic_grammar;
 pub mod serve_api;
 pub mod shape_dialogue;
 pub mod shape_eval;
@@ -423,6 +424,9 @@ pub struct SystemConfig {
     /// 配置编译的绑定帧：模式 -> 槽位 -> 目标 -> 措辞（默认关闭）。
     #[serde(default)]
     pub dialogue_frames: binding_frames::DialogueFramesConfig,
+    /// 双向语义规则包：同一份规则负责正向抽取与反向实现（默认关闭）。
+    #[serde(default)]
+    pub semantic_grammar: semantic_grammar::SemanticGrammarConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -909,11 +913,19 @@ pub enum KnowledgeItem {
 
 pub struct KnowledgeExtractor {
     config: Arc<SystemConfig>,
+    semantic_grammar: semantic_grammar::RulePack,
+    semantic_grammar_enabled: bool,
 }
 
 impl KnowledgeExtractor {
     pub fn new(config: Arc<SystemConfig>) -> Self {
-        Self { config }
+        let semantic_grammar = semantic_grammar::RulePack::from_config(&config);
+        let semantic_grammar_enabled = config.semantic_grammar.enabled;
+        Self {
+            config,
+            semantic_grammar,
+            semantic_grammar_enabled,
+        }
     }
 
     pub fn extract(&self, text: &str, tagged_words: &[TaggedWord]) -> Vec<KnowledgeItem> {
@@ -923,6 +935,10 @@ impl KnowledgeExtractor {
 
         for rule in &self.config.extraction_rules {
             items.extend(self.apply_extraction_rule(text, tagged_words, rule));
+        }
+
+        if self.semantic_grammar_enabled {
+            items.extend(self.semantic_grammar.extract_items(tagged_words));
         }
 
         if text.contains("，") || text.contains("；") || text.contains("。") {

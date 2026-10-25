@@ -681,6 +681,8 @@ pub struct SymbolicGenerator {
     // 谓词的中文表述（含词汇化动词）→ 规范谓词，供形式化语义解析复用
     predicate_surfaces: HashMap<String, String>,
     lexicalized_predicates: HashSet<String>,
+    // 可选的同一份双向语义规则包：生成侧复用抽取侧配置的 realize 模板
+    semantic_grammar: Option<crate::semantic_grammar::RulePack>,
     // 类型 → 谓词计数聚合缓存；知识变更（revision 自增）后失效
     revision: u64,
     type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
@@ -729,6 +731,7 @@ impl Clone for SymbolicGenerator {
             completion_min_score: self.completion_min_score,
             predicate_surfaces: self.predicate_surfaces.clone(),
             lexicalized_predicates: self.lexicalized_predicates.clone(),
+            semantic_grammar: self.semantic_grammar.clone(),
             revision: self.revision,
             type_count_cache: parking_lot::RwLock::new(self.type_count_cache.read().clone()),
             type_versions: self.type_versions.clone(),
@@ -757,6 +760,7 @@ impl SymbolicGenerator {
             completion_min_score: completion_min_score.clamp(0.0, 1.0),
             predicate_surfaces: HashMap::new(),
             lexicalized_predicates: HashSet::new(),
+            semantic_grammar: None,
             revision: 0,
             type_count_cache: parking_lot::RwLock::new(HashMap::new()),
             type_versions: HashMap::new(),
@@ -767,6 +771,16 @@ impl SymbolicGenerator {
 
     pub fn is_known_entity(&self, name: &str) -> bool {
         self.known_entities.contains(name)
+    }
+
+    /// 挂接双向语义规则包：之后生成优先使用同一份规则里的 `realize` 模板。
+    pub fn attach_semantic_grammar(&mut self, grammar: crate::semantic_grammar::RulePack) {
+        self.semantic_grammar = Some(grammar);
+    }
+
+    /// 当前挂接的语义规则包（未挂接时为 `None`）。
+    pub fn semantic_grammar(&self) -> Option<&crate::semantic_grammar::RulePack> {
+        self.semantic_grammar.as_ref()
     }
 
     pub fn relation_count(&self) -> usize {
@@ -1561,6 +1575,13 @@ impl SymbolicGenerator {
     // 谓词动词化：把裸谓词（含 JSON-LD 英文谓词）渲染成自然中文句子
     fn lexicalize(&self, subject: &str, predicate: &str, objects: &[String]) -> String {
         let joined = objects.join("、");
+        if let Some(realization) = self
+            .semantic_grammar
+            .as_ref()
+            .and_then(|grammar| grammar.realize_values(subject, predicate, objects))
+        {
+            return realization.text;
+        }
         if let Some(template) = lexical_template(predicate) {
             return template.replace("{s}", subject).replace("{o}", &joined);
         }
