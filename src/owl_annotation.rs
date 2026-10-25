@@ -1813,6 +1813,37 @@ mod tests {
     }
 
     #[test]
+    fn test_program_with_annotations_reads_accepted_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(LEDGER_FILE);
+        let path_text = path.to_str().unwrap();
+        let lesson = OntologyLesson::Subclass {
+            sub: "学生".to_string(),
+            sup: "人物".to_string(),
+            original: "学生是一种人物".to_string(),
+        };
+        let proposal = Proposal {
+            key: lesson_key(&lesson),
+            lesson: lesson.clone(),
+            rationale: String::new(),
+            evidence: Vec::new(),
+            support: 3,
+            purity: 1.0,
+            impact: ImpactPreview::default(),
+        };
+        let mut ledger = AnnotationLedger::default();
+        let outcome = ledger.propose(vec![proposal]);
+        ledger
+            .review(&outcome.added[0], ReviewAction::Accept, "tester", "")
+            .unwrap();
+        ledger.save(path_text).unwrap();
+        let (program, count) =
+            ontology_program_with_annotations(&OntologyProgram::default(), path_text);
+        assert_eq!(count, 1);
+        assert!(program.lessons.contains(&lesson));
+    }
+
+    #[test]
     fn test_merge_entries_prefers_imported_decision() {
         let mut ledger = AnnotationLedger::default();
         let proposal = Proposal {

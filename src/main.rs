@@ -3156,16 +3156,20 @@ async fn main() {
             }
             api_state.set_frame_program(frame_program.clone());
             // 单一本体：配置态本体注入暖基座，之后分叉的每个会话同源携带。
-            let api_config_lessons = api_state.configure_ontology(&OntologyProgram::from_config(
-                &config.type_system,
-                &config.predicate_profiles,
-            ));
+            let (ontology_program, owl_lessons) = owl_annotation::ontology_program_with_annotations(
+                &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
+                &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
+            );
+            let api_config_lessons = api_state.configure_ontology(&ontology_program);
             api_state.configure_schema(&SchemaView::from_config(
                 &config.type_system,
                 &config.predicate_profiles,
             ));
             if api_config_lessons > 0 {
-                println!("服务已注入配置本体公理：{} 条。", api_config_lessons);
+                println!(
+                    "服务已注入本体公理：{} 条（含 OWL 人工反馈 {} 条）。",
+                    api_config_lessons, owl_lessons
+                );
             }
             // 知识对齐：谓词别名/换向词面 + 画像律典 + 实体持久别名 + 律典的
             // 跨重启采纳/退役决定，与交互启动同一套注册入口，建会话前完成。
@@ -6036,10 +6040,11 @@ async fn run_ask(
             reasoner.set_lexical_memory(memory);
         }
     }
-    reasoner.configure_ontology_program(&OntologyProgram::from_config(
-        &config.type_system,
-        &config.predicate_profiles,
-    ));
+    let (ontology_program, _) = owl_annotation::ontology_program_with_annotations(
+        &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
+        &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
+    );
+    reasoner.configure_ontology_program(&ontology_program);
     reasoner.configure_schema_view(&SchemaView::from_config(
         &config.type_system,
         &config.predicate_profiles,
@@ -6702,17 +6707,19 @@ async fn run_interactive_mode(
     // 查询换向（如「徒弟」「学生」命中 师傅 槽位时主宾对调），不改词面表。
     sync_predicate_pairs(&mut symbolic_reasoner, &oxigraph_manager);
     // 单一本体：配置里的类型层级与谓词画像并入教学本体（同一推理器、同一胶囊）
-    let config_lessons = symbolic_reasoner.configure_ontology_program(
+    let (ontology_program, owl_lessons) = owl_annotation::ontology_program_with_annotations(
         &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
+        &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
     );
+    let config_lessons = symbolic_reasoner.configure_ontology_program(&ontology_program);
     symbolic_reasoner.configure_schema_view(&SchemaView::from_config(
         &config.type_system,
         &config.predicate_profiles,
     ));
     if config_lessons > 0 {
         println!(
-            "已并入配置本体公理：{} 条（类型层级与谓词画像，随对话记忆持久保留）。",
-            config_lessons
+            "已并入本体公理：{} 条（类型层级、谓词画像与已接受的 OWL 人工反馈 {} 条）。",
+            config_lessons, owl_lessons
         );
     }
     // 律典：显式采纳/退役决定跨重启生效；缺失文件不影响声明律。
