@@ -1013,8 +1013,13 @@ enum Commands {
     },
     /// Mine, review, export or import OWL axioms proposed from the graph
     Owl {
-        #[command(subcommand)]
-        command: OwlCommands,
+        /// Arguments forwarded to the OWL review command
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
     },
     /// Run interactive mode (default)
     Interactive,
@@ -1083,6 +1088,13 @@ enum OwlCommands {
         #[arg(long)]
         replace: bool,
     },
+}
+
+#[derive(Parser)]
+#[command(name = "owl", about = "OWL 人工反馈台账：挖掘、裁决、报告与导入导出")]
+struct OwlCli {
+    #[command(subcommand)]
+    command: OwlCommands,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -1603,8 +1615,8 @@ async fn main() {
             )
             .await;
         }
-        Some(Commands::Owl { command }) => {
-            run_owl_command(&config, &oxigraph_manager, &store_path, command).await;
+        Some(Commands::Owl { args }) => {
+            run_owl_command(&config, &oxigraph_manager, &store_path, args).await;
         }
         Some(Commands::ExportRdf { file_path }) => {
             if file_path == "-" {
@@ -4518,10 +4530,17 @@ async fn run_owl_command(
     config: &Arc<SystemConfig>,
     manager: &OxigraphManager,
     store_path: &str,
-    command: OwlCommands,
+    args: Vec<String>,
 ) {
+    let owl_cli = match OwlCli::try_parse_from(std::iter::once("owl".to_string()).chain(args)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            std::process::exit(2);
+        }
+    };
     let ledger_path = format!("{}/{}", store_path, owl_annotation::LEDGER_FILE);
-    match command {
+    match owl_cli.command {
         OwlCommands::Propose {
             min_support,
             min_purity,
