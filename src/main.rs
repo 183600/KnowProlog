@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -89,6 +90,7 @@ use know_prolog::{
     },
     release::{self, CheckOptions},
     resolution_engine::SearchStatus,
+    rewrite_book::{self, RewriteBook},
     schema_view::SchemaView,
     shape_dialogue::ShapeDialogue,
     shape_eval::{
@@ -346,6 +348,43 @@ enum Commands {
         #[arg(long, default_value_t = 0.75)]
         near_miss: f64,
         /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mine surface→canonical rewrite rules from paired question episodes and
+    /// evaluate them on held-out predicates (offline; does not open the store)
+    RewriteMine {
+        /// JSONL or JSON episode corpus; omit for the built-in seed corpus
+        #[arg(long)]
+        episodes: Option<String>,
+        /// Predicate to hold out (repeatable); defaults to every third sorted predicate
+        #[arg(long = "holdout-predicate", value_name = "PREDICATE")]
+        holdout_predicates: Vec<String>,
+        /// Minimum support before a rule is proposed
+        #[arg(long, default_value_t = 2)]
+        min_support: usize,
+        /// Persist the mined rule book to this path
+        #[arg(long)]
+        save: Option<String>,
+        /// Exit non-zero when a held-out rewrite is wrong or coverage does not improve
+        #[arg(long)]
+        strict: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect, adopt or retire a persisted surface→canonical rewrite book
+    RewriteRules {
+        /// Rule book path (created by `rewrite-mine --save`)
+        #[arg(long, default_value = "rewrite_book.json")]
+        book: String,
+        /// Adopt a proposed rule id (repeatable; prefix allowed)
+        #[arg(long = "adopt", value_name = "RULE_ID")]
+        adopt: Vec<String>,
+        /// Retire an active rule id (repeatable; prefix allowed)
+        #[arg(long = "retire", value_name = "RULE_ID")]
+        retire: Vec<String>,
+        /// Print the book as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1114,6 +1153,37 @@ async fn main() {
     // 因此不依赖默认配置加载，也不打开知识存储。
     if let Some(Commands::ConfigLint { file, json, strict }) = &cli.command {
         run_config_lint(Some(file.as_deref().unwrap_or(&cli.config)), *json, *strict);
+        return;
+    }
+
+    // 重写手册完全离线：语料是显式问答对，挖掘与留出评估都不需要存储。
+    if let Some(Commands::RewriteMine {
+        episodes,
+        holdout_predicates,
+        min_support,
+        save,
+        strict,
+        json,
+    }) = &cli.command
+    {
+        run_rewrite_mine(
+            episodes.as_deref(),
+            holdout_predicates,
+            *min_support,
+            save.as_deref(),
+            *strict,
+            *json,
+        );
+        return;
+    }
+    if let Some(Commands::RewriteRules {
+        book,
+        adopt,
+        retire,
+        json,
+    }) = &cli.command
+    {
+        run_rewrite_rules(book, adopt, retire, *json);
         return;
     }
 
@@ -2872,6 +2942,8 @@ async fn main() {
         Some(Commands::Frontier { .. }) => {}
         Some(Commands::EvalRecall { .. }) => {}
         Some(Commands::Forge { .. }) => {}
+        // 已在加载配置前处理（见 main 顶部早期分派）
+        Some(Commands::RewriteMine { .. }) | Some(Commands::RewriteRules { .. }) => {}
         Some(Commands::BatchTeach { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigLint { .. }) => {}
@@ -4798,6 +4870,169 @@ async fn run_owl_command(
                 ledger_path
             );
         }
+    }
+}
+
+/// `rewrite-mine`：从成对问句挖掘表面→规范重写规则，并按留出谓词评估。
+/// 语料是显式问答对；规则只在基础解析失败时作为 fallback 参与评估。
+fn run_rewrite_mine(
+    episodes_path: Option<&str>,
+    holdout_predicates: &[String],
+    min_support: usize,
+    save: Option<&str>,
+    strict: bool,
+    json: bool,
+) {
+    let episodes = match episodes_path {
+        Some(path) => match rewrite_book::load_episodes(path) {
+            Ok(episodes) => episodes,
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(1);
+            }
+        },
+        None => rewrite_book::seed_episodes(),
+    };
+    if episodes.is_empty() {
+        eprintln!("重写语料为空：请提供至少一条 surface/canonical 问句对。");
+        std::process::exit(1);
+    }
+    let lexicon = rewrite_book::EpisodeLexicon::from_episodes(&episodes);
+    let predicates = rewrite_book::corpus_predicates(&episodes, &lexicon);
+    let holdout: BTreeSet<String> = if holdout_predicates.is_empty() {
+        rewrite_book::default_holdout(&predicates)
+    } else {
+        holdout_predicates.iter().cloned().collect()
+    };
+    for predicate in holdout.iter() {
+        if !predicates.contains(predicate) {
+            eprintln!("提示：留出谓词「{}」不在语料中。", predicate);
+        }
+    }
+    let train: Vec<rewrite_book::RewriteEpisode> = episodes
+        .iter()
+        .filter(|episode| {
+            let involved = rewrite_book::episode_predicates(episode, &lexicon);
+            involved.is_empty() || involved.is_disjoint(&holdout)
+        })
+        .cloned()
+        .collect();
+    let book = rewrite_book::mine(&train, &episodes, &lexicon, min_support);
+    let evaluation = rewrite_book::evaluate(&book, &episodes, &lexicon, &holdout);
+    if let Some(path) = save {
+        if let Err(error) = book.save_to_path(path) {
+            eprintln!("{}", error);
+            std::process::exit(1);
+        }
+    }
+
+    if json {
+        let payload = serde_json::json!({
+            "episodes": episodes.len(),
+            "train_episodes": train.len(),
+            "holdout_predicates": holdout.iter().collect::<Vec<_>>(),
+            "rules": book.rules,
+            "evaluation": evaluation,
+            "saved": save,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("重写报告序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!(
+            "语料：{} 回合，训练 {} 回合；留出谓词：{}。",
+            episodes.len(),
+            train.len(),
+            if holdout.is_empty() {
+                "—".to_string()
+            } else {
+                holdout.iter().cloned().collect::<Vec<_>>().join("、")
+            }
+        );
+        print!("{}", book.render_text());
+        print!("{}", evaluation.render_text());
+        if let Some(path) = save {
+            println!("已保存重写手册：{}", path);
+        }
+    }
+
+    let regressed = evaluation.held_out.wrong_rewrites > 0
+        || (evaluation.held_out.episodes > 0 && evaluation.held_out.coverage_gain() <= 0.0);
+    if strict && regressed {
+        std::process::exit(1);
+    }
+}
+
+/// `rewrite-rules`：查看重写手册，显式采纳/退役候选规则并原子保存。
+fn run_rewrite_rules(book_path: &str, adopt: &[String], retire: &[String], json: bool) {
+    let mut book = match RewriteBook::load_from_path(book_path) {
+        Ok(book) => book,
+        Err(error) => {
+            eprintln!("{}（可先用 `rewrite-mine --save {}` 生成）", error, book_path);
+            std::process::exit(1);
+        }
+    };
+    let mut changed = false;
+    let mut errors = Vec::new();
+    let mut adopted = Vec::new();
+    let mut retired = Vec::new();
+    for selector in adopt {
+        match book.adopt(selector) {
+            Ok(rule) => {
+                adopted.push(rule.id.clone());
+                changed = true;
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    for selector in retire {
+        match book.retire(selector) {
+            Ok(rule) => {
+                retired.push(rule.id.clone());
+                changed = true;
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    if changed {
+        if let Err(error) = book.save_to_path(book_path) {
+            eprintln!("{}", error);
+            std::process::exit(1);
+        }
+    }
+
+    if json {
+        let payload = serde_json::json!({
+            "book": book,
+            "adopted": adopted,
+            "retired": retired,
+            "errors": errors,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("重写手册序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print!("{}", book.render_text());
+        for id in &adopted {
+            println!("已采纳：{}", id);
+        }
+        for id in &retired {
+            println!("已退役：{}", id);
+        }
+        for error in &errors {
+            eprintln!("{}", error);
+        }
+    }
+    if !errors.is_empty() {
+        std::process::exit(1);
     }
 }
 
@@ -15880,6 +16115,72 @@ mod session_tests {
             _ => panic!("应解析为 Forge 子命令"),
         }
         assert!(Cli::try_parse_from(["knowprolog", "forge", "--name", "空"]).is_err());
+    }
+
+    #[test]
+    fn rewrite_cli_parses_mine_and_rules() {
+        let mine = Cli::try_parse_from([
+            "knowprolog",
+            "rewrite-mine",
+            "--episodes",
+            "episodes.jsonl",
+            "--holdout-predicate",
+            "邀请",
+            "--holdout-predicate",
+            "拜访",
+            "--min-support",
+            "3",
+            "--save",
+            "rewrite_book.json",
+            "--strict",
+            "--json",
+        ])
+        .expect("rewrite-mine 参数应可解析");
+        match mine.command {
+            Some(Commands::RewriteMine {
+                episodes,
+                holdout_predicates,
+                min_support,
+                save,
+                strict,
+                json,
+            }) => {
+                assert_eq!(episodes.as_deref(), Some("episodes.jsonl"));
+                assert_eq!(holdout_predicates, vec!["邀请", "拜访"]);
+                assert_eq!(min_support, 3);
+                assert_eq!(save.as_deref(), Some("rewrite_book.json"));
+                assert!(strict);
+                assert!(json);
+            }
+            _ => panic!("应解析为 RewriteMine 子命令"),
+        }
+
+        let rules = Cli::try_parse_from([
+            "knowprolog",
+            "rewrite-rules",
+            "--book",
+            "book.json",
+            "--adopt",
+            "rw-1234",
+            "--retire",
+            "rw-5678",
+            "--json",
+        ])
+        .expect("rewrite-rules 参数应可解析");
+        match rules.command {
+            Some(Commands::RewriteRules {
+                book,
+                adopt,
+                retire,
+                json,
+            }) => {
+                assert_eq!(book, "book.json");
+                assert_eq!(adopt, vec!["rw-1234"]);
+                assert_eq!(retire, vec!["rw-5678"]);
+                assert!(json);
+            }
+            _ => panic!("应解析为 RewriteRules 子命令"),
+        }
     }
 
     #[test]
