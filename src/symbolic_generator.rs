@@ -189,6 +189,35 @@ impl TypeProfile {
     }
 }
 
+impl TypeMemberPage {
+    pub fn render(&self) -> String {
+        let shown = self.members.len();
+        let first = self.offset + usize::from(shown > 0);
+        let last = self.offset + shown;
+        let mut output = format!(
+            "类型「{}」的成员（第 {}–{} 个，共 {} 个）：\n",
+            self.type_name, first, last, self.total
+        );
+        if self.members.is_empty() {
+            output.push_str("  （这一页没有成员。）");
+            return output;
+        }
+        for (index, member) in self.members.iter().enumerate() {
+            output.push_str(&format!("  {}. {}\n", self.offset + index + 1, member));
+        }
+        if self.done {
+            output.push_str("  已到成员表末尾。");
+        } else {
+            output.push_str(&format!(
+                "  还有 {} 个未显示；可用 --offset {} 继续查看。",
+                self.total.saturating_sub(self.next_offset),
+                self.next_offset
+            ));
+        }
+        output.trim_end().to_string()
+    }
+}
+
 impl TypeComparison {
     pub fn render(&self) -> String {
         let mut output = format!(

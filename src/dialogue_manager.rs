@@ -31,9 +31,7 @@ use crate::identity_dialogue::{
     self, IdentityAct, IdentityCard, IdentityStatus, UserIdentityLedger,
 };
 use crate::logic_program::{LAtom, LTerm, LogicProgram};
-use crate::probabilistic_query_intent::{
-    EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
-};
+use crate::probabilistic_query_intent::{EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent};
 use crate::prompt_spec::{self, PromptMode, PromptStats, RenderOutcome, PROMPT_SPEC_VERSION};
 use crate::quality::{ClaimWarrant, QualityIndex};
 use crate::query_board::QueryBoard;
@@ -223,6 +221,11 @@ pub trait DialogueKnowledge {
     fn answer_certain(&self, question: &str) -> Option<String> {
         self.answer(question)
     }
+    /// 类型画像/成员/对比问句（缺省不接管，保持旧知识源行为）。
+    fn type_memory_answer(&self, question: &str) -> Option<String> {
+        let _ = question;
+        None
+    }
     /// 为问句重建一条有界推导；`expected_answer` 用于把证明锚定到上一轮
     /// 的实际回答，匹配不上时返回 None（宁可不解释，也不挂错证明）。
     fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
@@ -396,6 +399,10 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn answer_certain(&self, question: &str) -> Option<String> {
         SymbolicReasoner::answer_certain(self, question)
+    }
+
+    fn type_memory_answer(&self, question: &str) -> Option<String> {
+        crate::type_memory::answer(self.generator(), question).map(|answer| answer.text)
     }
 
     fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
@@ -1502,17 +1509,22 @@ impl DialogueManager {
         })
     }
 
-    fn epistemic_followup_entity(
-        input: &str,
-        knowledge: &dyn DialogueKnowledge,
-    ) -> Option<String> {
+    fn epistemic_followup_entity(input: &str, knowledge: &dyn DialogueKnowledge) -> Option<String> {
         let stripped = input
             .trim()
             .trim_end_matches(['？', '?', '！', '!', '。', '.', '，', ',', ' '])
             .trim();
         let mut body = stripped.strip_suffix('呢')?.trim();
         let mut marked = false;
-        for prefix in ["如果换成", "要是换成", "那换成", "换成", "换为", "那么", "那"] {
+        for prefix in [
+            "如果换成",
+            "要是换成",
+            "那换成",
+            "换成",
+            "换为",
+            "那么",
+            "那",
+        ] {
             if let Some(rest) = body.strip_prefix(prefix) {
                 body = rest.trim();
                 marked = true;
@@ -1520,11 +1532,22 @@ impl DialogueManager {
         }
         // 裸「王五呢」仍交给普通省略/身份管线；只有明确的承接标记
         //（那/那么/换成…）才把它读成上一轮情态问句的换槽。
-        if !marked || body.is_empty()
+        if !marked
+            || body.is_empty()
             || body.chars().any(|ch| {
                 matches!(
                     ch,
-                    '谁' | '什' | '么' | '哪' | '吗' | '的' | '是' | '怎' | '几' | '多' | '？' | '?'
+                    '谁' | '什'
+                        | '么'
+                        | '哪'
+                        | '吗'
+                        | '的'
+                        | '是'
+                        | '怎'
+                        | '几'
+                        | '多'
+                        | '？'
+                        | '?'
                 )
             })
         {
@@ -1544,6 +1567,14 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
+        if let Some(text) = knowledge.type_memory_answer(input) {
+            return Some(DialogueReply {
+                text,
+                plan: vec!["type_memory".to_string()],
+                kind: MoveKind::Other,
+                derivation: None,
+            });
+        }
         if let Some(reply) = self.plan_epistemic_followup(input, knowledge) {
             return Some(reply);
         }
@@ -1966,10 +1997,7 @@ impl DialogueManager {
             return None;
         }
         let revision = knowledge.revision();
-        let attribute_hint = self
-            .turns
-            .last()
-            .and_then(|turn| turn.attribute.clone());
+        let attribute_hint = self.turns.last().and_then(|turn| turn.attribute.clone());
         let outcome =
             self.board
                 .apply_with_hint(input, knowledge, revision, attribute_hint.as_deref())?;
@@ -3894,9 +3922,7 @@ impl DialogueManager {
 fn negative_correction_body(input: &str) -> Option<&str> {
     for prefix in ["不是", "不对", "错了"] {
         if let Some(rest) = input.strip_prefix(prefix) {
-            let rest = rest
-                .trim_start_matches(['，', ',', '：', ':', ' '])
-                .trim();
+            let rest = rest.trim_start_matches(['，', ',', '：', ':', ' ']).trim();
             if !rest.is_empty() {
                 return Some(rest);
             }
@@ -4307,11 +4333,7 @@ mod tests {
             self.profiles.get(entity).cloned()
         }
 
-        fn recovery_nominations(
-            &self,
-            entity: &str,
-            attribute: &str,
-        ) -> Vec<RecoveryNomination> {
+        fn recovery_nominations(&self, entity: &str, attribute: &str) -> Vec<RecoveryNomination> {
             self.nominations
                 .get(&(entity.to_string(), attribute.to_string()))
                 .cloned()
@@ -4480,9 +4502,7 @@ mod tests {
         let statement = manager.analyze("姚明是叶莉的师傅", &knowledge);
         assert_eq!(statement.kind, MoveKind::Assert, "{:?}", statement);
         assert!(
-            manager
-                .plan_reply("姚明是叶莉的师傅", &knowledge)
-                .is_none(),
+            manager.plan_reply("姚明是叶莉的师傅", &knowledge).is_none(),
             "查询板不得把系表判断重扫成「叶莉的师傅」"
         );
     }
@@ -5609,11 +5629,7 @@ output = "value"
             self.base.attribute_values(entity, attribute)
         }
 
-        fn recovery_nominations(
-            &self,
-            entity: &str,
-            attribute: &str,
-        ) -> Vec<RecoveryNomination> {
+        fn recovery_nominations(&self, entity: &str, attribute: &str) -> Vec<RecoveryNomination> {
             self.base.recovery_nominations(entity, attribute)
         }
     }
@@ -5621,9 +5637,13 @@ output = "value"
     #[test]
     fn prediction_is_not_treated_as_certain_in_recovery_mode() {
         let knowledge = TentativeKnowledge {
-            base: mock()
-                .with_entity("姚明", &["体重"])
-                .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据"),
+            base: mock().with_entity("姚明", &["体重"]).with_nomination(
+                "姚明",
+                "体重",
+                "140公斤",
+                0.72,
+                "链接预测：分布证据",
+            ),
         };
 
         let mut off = DialogueManager::new();
@@ -5631,10 +5651,7 @@ output = "value"
             .plan_reply("姚明的体重是多少", &knowledge)
             .expect("Off 模式保持既有输出");
         assert!(direct.text.contains("链接预测"), "{}", direct.text);
-        assert!(
-            off.last_recovery().is_none(),
-            "Off 模式不应产生恢复视图"
-        );
+        assert!(off.last_recovery().is_none(), "Off 模式不应产生恢复视图");
 
         let mut on = DialogueManager::new();
         on.set_recovery_mode(RecoveryMode::On);
@@ -5664,9 +5681,13 @@ output = "value"
 
     #[test]
     fn denying_the_same_candidate_is_refutation_not_correction() {
-        let knowledge = mock()
-            .with_entity("姚明", &["体重"])
-            .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据");
+        let knowledge = mock().with_entity("姚明", &["体重"]).with_nomination(
+            "姚明",
+            "体重",
+            "140公斤",
+            0.72,
+            "链接预测：分布证据",
+        );
         let mut manager = DialogueManager::new();
         manager.set_recovery_mode(RecoveryMode::On);
         manager
@@ -5690,9 +5711,13 @@ output = "value"
 
     #[test]
     fn session_confirmed_facts_survive_snapshot_roundtrip() {
-        let knowledge = mock()
-            .with_entity("姚明", &["体重"])
-            .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据");
+        let knowledge = mock().with_entity("姚明", &["体重"]).with_nomination(
+            "姚明",
+            "体重",
+            "140公斤",
+            0.72,
+            "链接预测：分布证据",
+        );
         let mut manager = DialogueManager::new();
         manager.set_recovery_mode(RecoveryMode::On);
         manager
@@ -5722,9 +5747,13 @@ output = "value"
 
     #[test]
     fn confirmed_provisional_becomes_next_turn_premise_and_correction_revises() {
-        let knowledge = mock()
-            .with_entity("姚明", &["体重"])
-            .with_nomination("姚明", "体重", "140公斤", 0.72, "链接预测：分布证据");
+        let knowledge = mock().with_entity("姚明", &["体重"]).with_nomination(
+            "姚明",
+            "体重",
+            "140公斤",
+            0.72,
+            "链接预测：分布证据",
+        );
         let mut manager = DialogueManager::new();
         manager.set_recovery_mode(RecoveryMode::On);
 

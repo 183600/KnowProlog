@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::alignment_memory::{AlignmentKind, AlignmentMemory, AlignmentScope, LearnOutcome};
 use crate::abduction::{
     self, AbductionEngine, AbductionReport, ClarificationReply, ClarificationSession, Hypothesis,
     HypothesisKind, Scenario,
 };
+use crate::alignment_memory::{AlignmentKind, AlignmentMemory, AlignmentScope, LearnOutcome};
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::belief_revision::{BeliefState, ChangeOp, ChangeSet, RevisionConstraints};
 use crate::cache::RevisionLru;
@@ -16,6 +16,7 @@ use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::completion_episode::{CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope};
+use crate::confidence::{ConfidenceDecision, DecisionRecord};
 use crate::constructive::{ConstructiveReasoner, FactKey, ObservedGraph, VirtualFact};
 use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
@@ -58,9 +59,8 @@ use crate::pending_question::{
 };
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
-use crate::predictive_elaboration::{PredictiveElaboration, PredictionGuard};
 use crate::predicate_registry::PredicateRegistry;
-use crate::confidence::{ConfidenceDecision, DecisionRecord};
+use crate::predictive_elaboration::{PredictionGuard, PredictiveElaboration};
 use crate::probabilistic_query_intent::{
     Claim, EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
 };
@@ -1328,8 +1328,7 @@ impl AnchorEvidence for AnchorEvidenceView<'_> {
         };
         let actual_ancestors = ancestors(actual.trim());
         let expected_ancestors = ancestors(expected.trim());
-        if actual_ancestors.contains(expected.trim())
-            || expected_ancestors.contains(actual.trim())
+        if actual_ancestors.contains(expected.trim()) || expected_ancestors.contains(actual.trim())
         {
             return TypeFit::Compatible;
         }
@@ -1499,7 +1498,11 @@ impl SymbolicReasoner {
                     || self.0.inverse_query_map.contains_key(raw)
                     || alias;
                 exact.then(|| {
-                    let base = if aligned.is_some() { canonical.as_str() } else { raw };
+                    let base = if aligned.is_some() {
+                        canonical.as_str()
+                    } else {
+                        raw
+                    };
                     self.0.resolve_question_predicate(base).0
                 })
             }
@@ -3932,8 +3935,7 @@ impl SymbolicReasoner {
             AlignmentKind::Entity => self.alignment_anchor(canonical),
             AlignmentKind::Predicate => {
                 let canonical = self.aligner.canonical_form(canonical);
-                (self.aligner.kind_of(&canonical) == Some(TermKind::Relation))
-                    .then_some(canonical)
+                (self.aligner.kind_of(&canonical) == Some(TermKind::Relation)).then_some(canonical)
             }
             AlignmentKind::Type => {
                 let canonical = self.aligner.canonical_form(canonical);
@@ -3952,7 +3954,11 @@ impl SymbolicReasoner {
                 .linker
                 .entity_type(&canonical)
                 .map(str::to_string)
-                .or_else(|| self.generator.entity_type_of(&canonical).map(str::to_string)),
+                .or_else(|| {
+                    self.generator
+                        .entity_type_of(&canonical)
+                        .map(str::to_string)
+                }),
             _ => None,
         };
         let turn = self.linker.alignment().turn.saturating_add(1);
@@ -4016,7 +4022,10 @@ impl SymbolicReasoner {
     }
 
     /// 单次前向对齐查询（供交互命令/生成复核使用）。
-    pub fn alignment_canonicalize(&self, surface: &str) -> Option<crate::alignment_memory::AlignmentMatch> {
+    pub fn alignment_canonicalize(
+        &self,
+        surface: &str,
+    ) -> Option<crate::alignment_memory::AlignmentMatch> {
         let turn = self.linker.alignment().turn;
         let resolve = |candidate: &str| -> Vec<String> {
             let mut entities: Vec<String> = self
@@ -4097,10 +4106,7 @@ impl SymbolicReasoner {
             {
                 continue;
             }
-            chars.splice(
-                matched.start..matched.end,
-                matched.canonical.chars(),
-            );
+            chars.splice(matched.start..matched.end, matched.canonical.chars());
         }
         Some(chars.into_iter().collect())
     }
@@ -4117,7 +4123,14 @@ impl SymbolicReasoner {
         ) {
             return Some(self.alignment_memory_report());
         }
-        for prefix in ["对齐纠正：", "对齐纠正:", "镜像对齐：", "镜像对齐:", "对齐：", "对齐:"] {
+        for prefix in [
+            "对齐纠正：",
+            "对齐纠正:",
+            "镜像对齐：",
+            "镜像对齐:",
+            "对齐：",
+            "对齐:",
+        ] {
             if let Some(spec) = trimmed.strip_prefix(prefix) {
                 let Some((surface, canonical)) = parse_alignment_pair(spec) else {
                     return Some(
@@ -4145,7 +4158,10 @@ impl SymbolicReasoner {
                     return Some("请用「对齐否决：用户词面 = 规范身份」的格式。".to_string());
                 };
                 let turn = self.linker.alignment().turn.saturating_add(1);
-                let count = self.linker.alignment_mut().refute_pair(turn, surface, canonical);
+                let count = self
+                    .linker
+                    .alignment_mut()
+                    .refute_pair(turn, surface, canonical);
                 if count == 0 {
                     self.link_memo.lock().clear();
                     self.entity_mentions_memo.lock().clear();
@@ -4565,9 +4581,9 @@ impl SymbolicReasoner {
                 cursor
             }
         };
-        let page =
-            self.generator
-                .cursor_page(&state.entity, state.order, &overlay, &mut cursor)?;
+        let page = self
+            .generator
+            .cursor_page(&state.entity, state.order, &overlay, &mut cursor)?;
         if page.shown == 0 {
             return Some(format!(
                 "关于「{}」的知识已经介绍完毕。可以输入「换个角度说」按不同顺序重述，或介绍其它实体。",
@@ -4603,9 +4619,9 @@ impl SymbolicReasoner {
             .unwrap_or_else(|| GenerationCursor::new(&state.entity, order));
         // 「换个角度说」是显式重述：账本从零开始，但排序角度更新。
         cursor.reset_for_order(order);
-        let page =
-            self.generator
-                .cursor_page(&state.entity, order, &overlay, &mut cursor)?;
+        let page = self
+            .generator
+            .cursor_page(&state.entity, order, &overlay, &mut cursor)?;
         if page.shown == 0 {
             return Some(format!("关于「{}」暂无可重述的事实。", state.entity));
         }
@@ -5614,11 +5630,9 @@ impl SymbolicReasoner {
             return None;
         }
         if let Some(goals) = self.last_abduction_goal.clone() {
-            let space = self.abduction.explanation_space(
-                &self.resolver,
-                &goals,
-                &self.last_abduction_vars,
-            );
+            let space =
+                self.abduction
+                    .explanation_space(&self.resolver, &goals, &self.last_abduction_vars);
             session.attach_explanation_space(space);
             // 场景成员可能比待定池更新：先并入，再按解释空间判别力排序。
             session.include_explanation_hypotheses();
@@ -6329,11 +6343,7 @@ impl SymbolicReasoner {
                 .entity_type_of(&subject)
                 .unwrap_or("")
                 .to_string();
-            generator.observe_entity(
-                &subject,
-                &etype,
-                &[(predicate.clone(), object.clone())],
-            );
+            generator.observe_entity(&subject, &etype, &[(predicate.clone(), object.clone())]);
         }
         (predictor, generator)
     }
@@ -6766,7 +6776,8 @@ impl SymbolicReasoner {
             } else {
                 Term::var(&format!("V{}", index + 1))
             };
-            let slot = self.proof_predicate_slot(&predicate.surface, &predicate.slot, predicate.inverted);
+            let slot =
+                self.proof_predicate_slot(&predicate.surface, &predicate.slot, predicate.inverted);
             let atom = if predicate.inverted {
                 Atom::pattern(&slot, next.clone(), previous.clone())
             } else {
@@ -7524,9 +7535,11 @@ impl SymbolicReasoner {
         let facts = self.generate_about(entity_raw);
         let speculation = self.predictive_elaboration(entity_raw);
         match (facts, speculation) {
-            (Some(facts), Some(speculation)) => {
-                Some(format!("{}\n\n{}", facts.trim_end(), speculation.trim_end()))
-            }
+            (Some(facts), Some(speculation)) => Some(format!(
+                "{}\n\n{}",
+                facts.trim_end(),
+                speculation.trim_end()
+            )),
             (Some(facts), None) => Some(facts),
             (None, Some(speculation)) => Some(speculation),
             (None, None) => None,
@@ -7655,10 +7668,7 @@ impl SymbolicReasoner {
                 });
             }
         }
-        if matches!(
-            trimmed,
-            "预测台账" | "预测报告" | "推测台账" | "推测报告"
-        ) {
+        if matches!(trimmed, "预测台账" | "预测报告" | "推测台账" | "推测报告") {
             return Some(self.predictive_report());
         }
         None
@@ -7804,7 +7814,8 @@ impl SymbolicReasoner {
     /// 进入会话事实层并参与后续推理，但始终不写知识图谱。
     pub fn handle_constructive_command(&mut self, input: &str) -> Option<String> {
         let trimmed = input.trim();
-        for prefix in ["建设性推断：", "建设性推断:", "推断依据：", "推断依据:"] {
+        for prefix in ["建设性推断：", "建设性推断:", "推断依据：", "推断依据:"]
+        {
             if let Some(spec) = trimmed.strip_prefix(prefix) {
                 let spec = spec.trim();
                 return Some(if spec.is_empty() {
@@ -7837,10 +7848,7 @@ impl SymbolicReasoner {
         None
     }
 
-    fn parse_constructive_triple(
-        &self,
-        spec: &str,
-    ) -> Result<(String, String, String), String> {
+    fn parse_constructive_triple(&self, spec: &str) -> Result<(String, String, String), String> {
         let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
         if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
             return Err("需要「主体|谓词|客体」三段，且都不能为空".to_string());
@@ -7886,8 +7894,11 @@ impl SymbolicReasoner {
         let atom = Atom::rel(&predicate, &subject, &object);
         let rendered = self.render_atom_nl(&atom);
         let message = self.assert_negative_atom(atom);
-        format!("已否定建设性推断：{}。
-{}", rendered, message)
+        format!(
+            "已否定建设性推断：{}。
+{}",
+            rendered, message
+        )
     }
 
     fn constructive_probe_report(&self, spec: &str) -> String {
@@ -8385,10 +8396,9 @@ impl SymbolicReasoner {
         // 保存的是导入时的宾语 IRI（如 `kg:entity/李四`）。显示与计数前把
         // kg 实体 IRI 还原成本地名并按值去重；外部 IRI 原样保留，绝不猜测。
         for hit in &mut hits {
-            if let Some(local) = crate::identity::entity_local_name(
-                crate::identity::DEFAULT_BASE_NS,
-                &hit.value,
-            ) {
+            if let Some(local) =
+                crate::identity::entity_local_name(crate::identity::DEFAULT_BASE_NS, &hit.value)
+            {
                 hit.value = local;
             }
         }
@@ -8638,7 +8648,11 @@ impl SymbolicReasoner {
                 let [Term::Const(subject), Term::Const(object)] = atom.terms.as_slice() else {
                     return None;
                 };
-                Some(FactKey::new(subject.to_string(), format!("{}", atom.predicate), object.to_string()))
+                Some(FactKey::new(
+                    subject.to_string(),
+                    format!("{}", atom.predicate),
+                    object.to_string(),
+                ))
             })
             .collect();
         Some(
@@ -8891,10 +8905,7 @@ impl SymbolicReasoner {
                 .take(2)
                 .collect();
             if !construction_notes.is_empty() {
-                output.push_str(&format!(
-                    "  推断依据：{}\n",
-                    construction_notes.join("；")
-                ));
+                output.push_str(&format!("  推断依据：{}\n", construction_notes.join("；")));
             }
             output.push_str("  综合得出：\n");
         }
@@ -9003,16 +9014,10 @@ impl SymbolicReasoner {
                 .filter_map(|hit| hit.construction.as_ref())
                 .find_map(|fact| {
                     let key = &fact.key;
-                    if key.subject.is_empty()
-                        || key.predicate.is_empty()
-                        || key.object.is_empty()
-                    {
+                    if key.subject.is_empty() || key.predicate.is_empty() || key.object.is_empty() {
                         None
                     } else {
-                        Some(format!(
-                            "{}|{}|{}",
-                            key.subject, key.predicate, key.object
-                        ))
+                        Some(format!("{}|{}|{}", key.subject, key.predicate, key.object))
                     }
                 });
             if let Some(spec) = confirmable {
@@ -9023,9 +9028,8 @@ impl SymbolicReasoner {
             }
         }
         if construction_truncated {
-            output.push_str(
-                "\n  说明：建设性搜索达到跳深、候选或展开预算，未列出的推断仍可能存在。",
-            );
+            output
+                .push_str("\n  说明：建设性搜索达到跳深、候选或展开预算，未列出的推断仍可能存在。");
         }
         output
     }
@@ -9064,11 +9068,7 @@ impl SymbolicReasoner {
             }
         }
         for triple in self.predictor.triples() {
-            if self.is_suppressed_slot_value(
-                &triple.subject,
-                &triple.predicate,
-                &triple.object,
-            ) {
+            if self.is_suppressed_slot_value(&triple.subject, &triple.predicate, &triple.object) {
                 continue;
             }
             let validity = validity_by_entity
@@ -10103,11 +10103,14 @@ impl SymbolicReasoner {
             return None;
         }
         let expected_key = self.aligner.canonical_form(expected);
-        self.resolver.forward_chain(3, 100).into_iter().find(|fact| {
-            self.derived_value_for(fact, entity, predicate)
-                .map(|value| self.aligner.canonical_form(&value) == expected_key)
-                .unwrap_or(false)
-        })
+        self.resolver
+            .forward_chain(3, 100)
+            .into_iter()
+            .find(|fact| {
+                self.derived_value_for(fact, entity, predicate)
+                    .map(|value| self.aligner.canonical_form(&value) == expected_key)
+                    .unwrap_or(false)
+            })
     }
 
     /// 判断/是非问句里的一行推导回执：证明依据与规则来源，不写回知识。
@@ -10166,13 +10169,8 @@ impl SymbolicReasoner {
         let capsule = self.discourse.ontology_capsule();
         let evidence = self.anchor_evidence(capsule.as_ref());
         let lexicon = self.relation_lexicon();
-        let variants = query_anchor::anchor_questions(
-            question,
-            &self.linker,
-            &hints,
-            &lexicon,
-            &evidence,
-        );
+        let variants =
+            query_anchor::anchor_questions(question, &self.linker, &hints, &lexicon, &evidence);
         for variant in variants {
             let mut answer = variant
                 .planner_plan
@@ -11387,6 +11385,9 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_probabilistic_intent(question) {
             return Some(answer);
         }
+        if let Some(answer) = crate::type_memory::answer(&self.generator, question) {
+            return Some(self.annotate_assumption_world(answer.text));
+        }
         if let Some(answer) = self.answer_planned(question) {
             if !answer.contains("置信度") && !answer.contains("链接预测") {
                 return Some(self.annotate_assumption_world(answer));
@@ -11517,9 +11518,12 @@ impl SymbolicReasoner {
                     support.push(fill_sentence);
                     output.push_str(&format!("\n依据：{}。", support.join("；")));
                 }
-                if !adopted && !self.session_facts.iter().any(|atom| {
-                    atom.terms.iter().any(|term| term.name() == object)
-                }) {
+                if !adopted
+                    && !self
+                        .session_facts
+                        .iter()
+                        .any(|atom| atom.terms.iter().any(|term| term.name() == object))
+                {
                     output.push_str("\n（该取值已在图谱或已有会话事实中，未重复写入。）");
                 }
                 Some(output)
@@ -11607,10 +11611,7 @@ impl SymbolicReasoner {
     }
 
     /// 模拟一次多跳链，返回（目标串，缺口，已走通的边）。
-    fn diagnose_chain_hole(
-        &self,
-        question: &str,
-    ) -> Option<(String, PendingHole, Vec<String>)> {
+    fn diagnose_chain_hole(&self, question: &str) -> Option<(String, PendingHole, Vec<String>)> {
         let plan = self.planner.parse(question)?;
         let QueryPlan::FindObject { segments } = plan else {
             return None;
@@ -11618,9 +11619,7 @@ impl SymbolicReasoner {
         let (entity, predicates) = self.split_chain(&segments)?;
         if predicates.is_empty()
             || entity.is_empty()
-            || predicates
-                .iter()
-                .any(|predicate| predicate.slot.is_empty())
+            || predicates.iter().any(|predicate| predicate.slot.is_empty())
             || !self.is_known_entity(&entity)
             || !predicates
                 .iter()
@@ -11682,11 +11681,7 @@ impl SymbolicReasoner {
     }
 
     /// 悬问诊断用的边：只认已知事实/会话事实/声明的律，不认链接预测候选。
-    fn pending_simulation_hits(
-        &self,
-        node: &str,
-        predicate: &ChainPredicate,
-    ) -> Vec<ValueHit> {
+    fn pending_simulation_hits(&self, node: &str, predicate: &ChainPredicate) -> Vec<ValueHit> {
         let mut hits: Vec<ValueHit> = self
             .node_hits(node, predicate)
             .into_iter()
@@ -11723,6 +11718,9 @@ impl SymbolicReasoner {
     fn answer_impl(&self, question: &str) -> Option<String> {
         if let Some(answer) = self.answer_probabilistic_intent(question) {
             return Some(answer);
+        }
+        if let Some(answer) = crate::type_memory::answer(&self.generator, question) {
+            return Some(answer.text);
         }
         if let Some(answer) = self.answer_planned(question) {
             return Some(answer);
@@ -14283,15 +14281,13 @@ impl SymbolicReasoner {
         target: &EpistemicTarget,
     ) -> Option<String> {
         match target {
-            EpistemicTarget::GroundClaim(claim) => {
-                self.render_epistemic_claim(intent, claim)
+            EpistemicTarget::GroundClaim(claim) => self.render_epistemic_claim(intent, claim),
+            EpistemicTarget::ObjectsOf { subject, predicate } => {
+                Some(self.render_epistemic_ranking(intent, Some(subject), None, predicate))
             }
-            EpistemicTarget::ObjectsOf { subject, predicate } => Some(
-                self.render_epistemic_ranking(intent, Some(subject), None, predicate),
-            ),
-            EpistemicTarget::SubjectsOf { object, predicate } => Some(
-                self.render_epistemic_ranking(intent, None, Some(object), predicate),
-            ),
+            EpistemicTarget::SubjectsOf { object, predicate } => {
+                Some(self.render_epistemic_ranking(intent, None, Some(object), predicate))
+            }
             EpistemicTarget::Comparison { left, right } => {
                 self.render_epistemic_comparison(intent, left, right)
             }
@@ -14308,10 +14304,7 @@ impl SymbolicReasoner {
         }
     }
 
-    fn render_problog_stats(
-        &self,
-        stats: (usize, usize, usize, usize, bool),
-    ) -> String {
+    fn render_problog_stats(&self, stats: (usize, usize, usize, usize, bool)) -> String {
         let (choice_variables, bdd_nodes, ground_instances, ground_rounds, exact) = stats;
         format!(
             "ProbLog 编译：{} 轮基化 / {} 条规则实例 / {} 个选择变量 / {} 个 BDD 节点；{}",
@@ -14371,7 +14364,11 @@ impl SymbolicReasoner {
     fn epistemic_claim_probability(
         &self,
         claim: &Claim,
-    ) -> Option<(f64, Option<ProblogAnswer>, (usize, usize, usize, usize, bool))> {
+    ) -> Option<(
+        f64,
+        Option<ProblogAnswer>,
+        (usize, usize, usize, usize, bool),
+    )> {
         let atom = Atom::rel(&claim.predicate, &claim.subject, &claim.object);
         let query = self.problog.query(&atom, 4, 0.0);
         let stats = (
@@ -14406,16 +14403,11 @@ impl SymbolicReasoner {
                 EpistemicMode::Certainty | EpistemicMode::Possibility
             );
         threshold_relevant
-            && (probability - intent.threshold).abs()
-                <= self.config.confidence.near_margin
+            && (probability - intent.threshold).abs() <= self.config.confidence.near_margin
     }
 
     /// 边界证据分：贴阈值时为 0，离开边界带为 1，中间线性过渡。
-    fn confidence_margin_score(
-        &self,
-        intent: &ProbabilisticQueryIntent,
-        probability: f64,
-    ) -> f64 {
+    fn confidence_margin_score(&self, intent: &ProbabilisticQueryIntent, probability: f64) -> f64 {
         let threshold_relevant = intent.threshold_explicit
             || matches!(
                 intent.mode,
@@ -14465,12 +14457,7 @@ impl SymbolicReasoner {
         }
         let near_boundary = self.confidence_near_boundary(intent, probability);
         let margin = self.confidence_margin_score(intent, probability);
-        self.confidence_record_with_margin(
-            intent,
-            exact,
-            margin,
-            near_boundary,
-        )
+        self.confidence_record_with_margin(intent, exact, margin, near_boundary)
     }
 
     /// 排序/比较路径可以自己给「边界强度」，不套用单原子的阈值距离。
@@ -14484,8 +14471,7 @@ impl SymbolicReasoner {
         if !self.config.confidence.enabled {
             return None;
         }
-        let observations =
-            self.confidence_observations(intent, exact, margin.clamp(0.0, 1.0));
+        let observations = self.confidence_observations(intent, exact, margin.clamp(0.0, 1.0));
         Some(
             self.config
                 .confidence
@@ -14494,18 +14480,15 @@ impl SymbolicReasoner {
     }
 
     /// 决策为澄清/拒答时，不再把后面的结论当作确定事实铺开。
-    fn confidence_blocked_note(
-        record: &DecisionRecord,
-        core_question: &str,
-    ) -> Option<String> {
+    fn confidence_blocked_note(record: &DecisionRecord, core_question: &str) -> Option<String> {
         match record.decision {
             ConfidenceDecision::Clarify => Some(format!(
                 "  为避免误导，先确认你问的是不是「{}」，或换一种更明确的问法。",
                 core_question
             )),
-            ConfidenceDecision::Abstain => Some(
-                "  证据不足以给出可靠结论：本次拒答，不把猜测伪装成答案。".to_string(),
-            ),
+            ConfidenceDecision::Abstain => {
+                Some("  证据不足以给出可靠结论：本次拒答，不把猜测伪装成答案。".to_string())
+            }
             _ => None,
         }
     }
@@ -14523,9 +14506,7 @@ impl SymbolicReasoner {
         };
         let record = self.confidence_record(intent, probability, stats.4);
         if let Some(record) = &record {
-            if let Some(note) =
-                Self::confidence_blocked_note(record, &intent.core_question)
-            {
+            if let Some(note) = Self::confidence_blocked_note(record, &intent.core_question) {
                 let mut output = intent.render_ledger();
                 output.push('\n');
                 output.push_str(&format!("情态算子：{}\n", intent.operator_note()));
@@ -14583,9 +14564,17 @@ impl SymbolicReasoner {
             output.push_str(&format!(
                 "  显式阈值检查：P={:.3} {} {:.2} → {}\n",
                 probability,
-                if intent.threshold_at_least { "≥" } else { "≤" },
+                if intent.threshold_at_least {
+                    "≥"
+                } else {
+                    "≤"
+                },
                 intent.threshold,
-                if met { "条件成立" } else { "条件不成立" }
+                if met {
+                    "条件成立"
+                } else {
+                    "条件不成立"
+                }
             ));
             if intent.mode == EpistemicMode::Probability {
                 output.push_str(
@@ -14637,7 +14626,9 @@ impl SymbolicReasoner {
                     ));
                 }
                 EpistemicMode::Probability => {
-                    output.push_str("  概率值问：以上为基原子的精确概率；理解置信度与知识概率分账展示。\n");
+                    output.push_str(
+                        "  概率值问：以上为基原子的精确概率；理解置信度与知识概率分账展示。\n",
+                    );
                 }
                 EpistemicMode::MostLikely => {}
                 EpistemicMode::Plain | EpistemicMode::Comparison => {}
@@ -14646,9 +14637,7 @@ impl SymbolicReasoner {
         if let Some(record) = &record {
             output.push_str(&format!("  {}\n", record.render_receipt()));
             if record.decision == ConfidenceDecision::Hedge {
-                output.push_str(
-                    "  说明：置信度一般，以上结论请结合来源核对，不宜当作确定事实。\n",
-                );
+                output.push_str("  说明：置信度一般，以上结论请结合来源核对，不宜当作确定事实。\n");
             }
         }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
@@ -14664,16 +14653,12 @@ impl SymbolicReasoner {
     ) -> String {
         let fixed = subject.or(object);
         let pattern = match (subject, object) {
-            (Some(subject), None) => Atom::pattern(
-                predicate,
-                Term::constant(subject),
-                Term::var("X"),
-            ),
-            (None, Some(object)) => Atom::pattern(
-                predicate,
-                Term::var("X"),
-                Term::constant(object),
-            ),
+            (Some(subject), None) => {
+                Atom::pattern(predicate, Term::constant(subject), Term::var("X"))
+            }
+            (None, Some(object)) => {
+                Atom::pattern(predicate, Term::var("X"), Term::constant(object))
+            }
             _ => {
                 return format!(
                     "{}\n知识概率：候选目标不完整，无法排序。",
@@ -14745,16 +14730,9 @@ impl SymbolicReasoner {
                 self.confidence_near_boundary(intent, top_probability),
             )
         };
-        let record = self.confidence_record_with_margin(
-            intent,
-            stats.4,
-            margin,
-            near_boundary,
-        );
+        let record = self.confidence_record_with_margin(intent, stats.4, margin, near_boundary);
         if let Some(record) = &record {
-            if let Some(note) =
-                Self::confidence_blocked_note(record, &intent.core_question)
-            {
+            if let Some(note) = Self::confidence_blocked_note(record, &intent.core_question) {
                 output.push_str(&format!("  {}\n", record.render_receipt()));
                 output.push_str(&note);
                 return output.trim_end().to_string();
@@ -14801,9 +14779,7 @@ impl SymbolicReasoner {
         if let Some(record) = &record {
             output.push_str(&format!("  {}\n", record.render_receipt()));
             if record.decision == ConfidenceDecision::Hedge {
-                output.push_str(
-                    "  说明：候选之间或与阈值过于接近，以上排序请结合来源核对。\n",
-                );
+                output.push_str("  说明：候选之间或与阈值过于接近，以上排序请结合来源核对。\n");
             }
         }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
@@ -14815,13 +14791,7 @@ impl SymbolicReasoner {
     /// 只能答出锚点本身。
     fn epistemic_candidate(&self, answer: &ProblogAnswer, fixed: Option<&str>) -> String {
         let term = fixed
-            .and_then(|anchor| {
-                answer
-                    .atom
-                    .terms
-                    .iter()
-                    .find(|term| term.name() != anchor)
-            })
+            .and_then(|anchor| answer.atom.terms.iter().find(|term| term.name() != anchor))
             .or_else(|| answer.atom.terms.last())
             .map(|term| self.canonical_epistemic_entity(term.name()))
             .unwrap_or_else(|| self.render_atom_nl(&answer.atom));
@@ -14900,15 +14870,11 @@ impl SymbolicReasoner {
         );
         if let Some(record) = &record {
             output.push_str(&format!("  {}\n", record.render_receipt()));
-            if let Some(note) =
-                Self::confidence_blocked_note(record, &intent.core_question)
-            {
+            if let Some(note) = Self::confidence_blocked_note(record, &intent.core_question) {
                 output.push_str(&note);
                 output.push('\n');
             } else if record.decision == ConfidenceDecision::Hedge {
-                output.push_str(
-                    "  说明：两者概率过于接近，比较结论请结合来源核对。\n",
-                );
+                output.push_str("  说明：两者概率过于接近，比较结论请结合来源核对。\n");
             }
         }
         output.push_str(&format!("  {}\n", self.render_problog_stats(stats)));
@@ -15273,8 +15239,8 @@ impl SymbolicReasoner {
             .map(snapshot_clause_atom)
             .collect();
         snapshot.last_abduction_vars = self.last_abduction_vars.clone();
-        snapshot.alignment = (!self.linker.alignment().is_empty())
-            .then(|| self.linker.alignment().clone());
+        snapshot.alignment =
+            (!self.linker.alignment().is_empty()).then(|| self.linker.alignment().clone());
         snapshot
     }
 
@@ -16019,6 +15985,65 @@ mod tests {
     }
 
     #[test]
+    fn type_memory_answers_profiles_comparisons_and_members() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut person_properties = HashMap::new();
+        person_properties.insert("年龄".to_string(), "30".to_string());
+        let mut organization_properties = HashMap::new();
+        organization_properties.insert("城市".to_string(), "北京".to_string());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "人物".to_string(),
+                properties: person_properties,
+            },
+            PrologFact::Entity {
+                name: "李四".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "甲公司".to_string(),
+                entity_type: "组织".to_string(),
+                properties: organization_properties,
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+        ]);
+
+        let profile = reasoner
+            .answer("人物一般有哪些属性")
+            .expect("类型画像应可回答");
+        assert!(profile.contains("类型画像「人物」"), "{}", profile);
+        assert!(profile.contains("年龄"), "{}", profile);
+        assert!(profile.contains("师傅"), "{}", profile);
+
+        let comparison = reasoner
+            .answer("人物和组织有什么区别")
+            .expect("类型对比应可回答");
+        assert!(
+            comparison.contains("类型对比「人物」与「组织」"),
+            "{}",
+            comparison
+        );
+        assert!(comparison.contains("年龄"), "{}", comparison);
+        assert!(comparison.contains("城市"), "{}", comparison);
+
+        let members = reasoner
+            .answer_certain("人物有哪些成员")
+            .expect("成员列表应可确证回答");
+        assert!(members.contains("张三"), "{}", members);
+        assert!(members.contains("李四"), "{}", members);
+        assert!(!reasoner
+            .answer("张三的年龄是多少")
+            .unwrap_or_default()
+            .contains("类型画像"));
+    }
+
+    #[test]
     fn test_frame_full_question_records_last_frame() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
@@ -16150,10 +16175,7 @@ mod tests {
             SearchBudget::unlimited(),
         );
         assert!(
-            !evidence
-                .hits
-                .iter()
-                .any(|hit| hit.object == "226cm"),
+            !evidence.hits.iter().any(|hit| hit.object == "226cm"),
             "证据索引不得再返回被压制的旧值：{:?}",
             evidence
                 .hits
@@ -17006,9 +17028,7 @@ mod tests {
         }]);
         reasoner.slots.policy_mut().declare_functional("师傅", true);
         reasoner.assert_nl_fact("张三的师傅是李四");
-        reasoner
-            .aligner
-            .register_term("师祖", TermKind::Relation);
+        reasoner.aligner.register_term("师祖", TermKind::Relation);
         reasoner.session_clauses.push(Clause::new(
             Atom::pattern("师祖", Term::var("X"), Term::var("Z")),
             vec![
@@ -17058,9 +17078,7 @@ mod tests {
         reasoner.slots.policy_mut().declare_functional("师傅", true);
         reasoner.assert_nl_fact("张三的师傅是李四");
         reasoner.assert_nl_fact("李四的师傅是王五");
-        reasoner
-            .aligner
-            .register_term("师祖", TermKind::Relation);
+        reasoner.aligner.register_term("师祖", TermKind::Relation);
         reasoner.session_clauses.push(Clause::new(
             Atom::pattern("师祖", Term::var("X"), Term::var("Z")),
             vec![
@@ -17073,9 +17091,7 @@ mod tests {
         reasoner.rebuild_knowledge_caches();
         reasoner.rebuild_resolver();
 
-        let before = reasoner
-            .answer("张三的师祖是谁")
-            .expect("两跳规则应能回答");
+        let before = reasoner.answer("张三的师祖是谁").expect("两跳规则应能回答");
         assert!(before.contains("王五"), "{}", before);
         assert!(!before.contains("赵六"), "{}", before);
 
@@ -17124,7 +17140,9 @@ mod tests {
         assert!(ask.contains("张三 的 师傅 是 李四"), "{}", ask);
         assert!(!ask.contains("王五"), "不得把未知取值说成已知：{}", ask);
         assert!(reasoner.has_pending_question());
-        assert!(reasoner.pending_question_report().contains("张三的师傅的师傅是谁"));
+        assert!(reasoner
+            .pending_question_report()
+            .contains("张三的师傅的师傅是谁"));
     }
 
     #[test]
@@ -17160,7 +17178,9 @@ mod tests {
             .open_pending_question("张三的师傅的师傅是谁")
             .expect("应先立悬问");
         assert!(reasoner.try_answer_pending_question("王五是谁").is_none());
-        assert!(reasoner.try_answer_pending_question("记住：李四的师傅是王五").is_none());
+        assert!(reasoner
+            .try_answer_pending_question("记住：李四的师傅是王五")
+            .is_none());
         assert!(reasoner.has_pending_question());
     }
 
@@ -17318,7 +17338,9 @@ mod tests {
             "回填应落在第二条悬问的洞上"
         );
         assert!(reasoner.has_pending_question(), "第一条悬问仍应挂着");
-        assert!(reasoner.pending_question_report().contains("张三的师傅的师傅是谁"));
+        assert!(reasoner
+            .pending_question_report()
+            .contains("张三的师傅的师傅是谁"));
 
         // 追问窗口已过：裸回答不再绑定，但显式前缀仍可回填旧悬问。
         assert!(reasoner.try_answer_pending_question("王五").is_none());
@@ -17414,7 +17436,10 @@ mod tests {
             .expect("补上第一条洞后应继续追问");
         assert!(next.contains("还差前提"), "{}", next);
         assert!(next.contains("赵六 的 师傅"), "{}", next);
-        assert!(reasoner.has_pending_question(), "四跳仍未走通，悬问不能关闭");
+        assert!(
+            reasoner.has_pending_question(),
+            "四跳仍未走通，悬问不能关闭"
+        );
 
         let done = reasoner
             .try_answer_pending_question("孙七")
@@ -17904,7 +17929,9 @@ mod tests {
         reasoner.observe_facts(&facts);
         let exact = reasoner.answer("张山认识谁");
         assert!(
-            exact.as_deref().is_some_and(|answer| answer.contains("李四")),
+            exact
+                .as_deref()
+                .is_some_and(|answer| answer.contains("李四")),
             "精确路径先报无记录时仍应尝试锚定：{:?}",
             exact
         );
@@ -19185,7 +19212,11 @@ types = [
             "更正应给出新说法：{}",
             corrected
         );
-        assert!(!corrected.contains("未通过"), "更正不应被自检误报：{}", corrected);
+        assert!(
+            !corrected.contains("未通过"),
+            "更正不应被自检误报：{}",
+            corrected
+        );
     }
 
     #[test]
@@ -19193,7 +19224,9 @@ types = [
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
         let taught = reasoner.assert_nl_fact("钱七是孙八的师傅");
-        let profile = reasoner.generate_about("钱七").expect("会话层新实体也应可介绍");
+        let profile = reasoner
+            .generate_about("钱七")
+            .expect("会话层新实体也应可介绍");
         assert!(
             profile.contains("钱七") && profile.contains("孙八") && profile.contains("师傅"),
             "教学回执={}；介绍={}",
@@ -19357,8 +19390,7 @@ types = [
             "history": [],
             "generation": {"entity": "张三", "shown": 1, "order": "Relevance"}
         }"#;
-        let snapshot: DialogueSnapshot =
-            serde_json::from_str(legacy).expect("旧快照应可解码");
+        let snapshot: DialogueSnapshot = serde_json::from_str(legacy).expect("旧快照应可解码");
         assert!(snapshot.generation.unwrap().cursor.is_none());
     }
 
@@ -20186,11 +20218,7 @@ types = [
             "崩塌不能误报为查无：{}",
             last
         );
-        assert!(
-            last.contains("缺少的前提"),
-            "崩塌应给出缺失前提：{}",
-            last
-        );
+        assert!(last.contains("缺少的前提"), "崩塌应给出缺失前提：{}", last);
     }
 
     #[test]
@@ -20201,7 +20229,9 @@ types = [
         assert!(!reasoner.pending_hypotheses().is_empty());
         // 模拟用户在开始澄清前补上了缺失事实。
         reasoner.adopt_session_triple("李四", "师傅", "赵六");
-        let output = reasoner.start_clarification().expect("应给出无需澄清的说明");
+        let output = reasoner
+            .start_clarification()
+            .expect("应给出无需澄清的说明");
         assert!(output.contains("已可证明"), "{}", output);
         assert!(output.contains("无需继续追问"), "{}", output);
         assert!(reasoner.pending_hypotheses().is_empty(), "过期假设应清空");
@@ -20274,7 +20304,11 @@ types = [
             "提前结束应给出条件化或稳健答案：{}",
             conclusion
         );
-        assert!(conclusion.contains("若") && conclusion.contains("则答案是"), "{}", conclusion);
+        assert!(
+            conclusion.contains("若") && conclusion.contains("则答案是"),
+            "{}",
+            conclusion
+        );
     }
 
     #[test]
@@ -21095,7 +21129,11 @@ types = [
             .answer("孙七的朋友是谁")
             .expect("确认后的会话事实应可直接回答");
         assert!(after.contains("吴九"), "实际：{}", after);
-        assert!(!after.contains("建设性推断"), "确认后不应再待确认：{}", after);
+        assert!(
+            !after.contains("建设性推断"),
+            "确认后不应再待确认：{}",
+            after
+        );
 
         let mut refuting = SymbolicReasoner::new(test_config(), HashMap::new());
         refuting.observe_facts(&facts);
@@ -21108,8 +21146,16 @@ types = [
         let blocked = refuting
             .answer("孙七的朋友的师傅是谁")
             .expect("否定后仍应给出无答案说明");
-        assert!(!blocked.contains("吴九"), "被否认的前提不得复用：{}", blocked);
-        assert!(!blocked.contains("建设性推断"), "被否认后不应再合成：{}", blocked);
+        assert!(
+            !blocked.contains("吴九"),
+            "被否认的前提不得复用：{}",
+            blocked
+        );
+        assert!(
+            !blocked.contains("建设性推断"),
+            "被否认后不应再合成：{}",
+            blocked
+        );
 
         let mut target_denied = SymbolicReasoner::new(test_config(), HashMap::new());
         target_denied.observe_facts(&facts);
@@ -23902,7 +23948,11 @@ types = [
             .answer("李四和王五谁更可能是张三的师傅")
             .expect("比较问应可回答");
         assert!(answer.contains("比较结论"), "{}", answer);
-        assert!(answer.contains("更可能是「张三 的 师傅 是 李四"), "{}", answer);
+        assert!(
+            answer.contains("更可能是「张三 的 师傅 是 李四"),
+            "{}",
+            answer
+        );
     }
 
     #[test]
@@ -23912,12 +23962,20 @@ types = [
         let answer = reasoner
             .answer("张三一定不是李四的师傅吗")
             .expect("否定确定问应可回答");
-        assert!(answer.contains("因此 P(李四 的 师傅 不是 张三)=1.000"), "{}", answer);
+        assert!(
+            answer.contains("因此 P(李四 的 师傅 不是 张三)=1.000"),
+            "{}",
+            answer
+        );
         assert!(answer.contains("可以确认"), "{}", answer);
         let denied = reasoner
             .answer("王五有多大的可能不是李四的师傅")
             .expect("否定概率问句应可回答");
-        assert!(denied.contains("因此 P(李四 的 师傅 不是 王五)=0.000"), "{}", denied);
+        assert!(
+            denied.contains("因此 P(李四 的 师傅 不是 王五)=0.000"),
+            "{}",
+            denied
+        );
         assert!(denied.contains("已排除"), "{}", denied);
     }
 
@@ -24037,12 +24095,7 @@ types = [
             let answer = reasoner
                 .answer(question)
                 .unwrap_or_else(|| panic!("姓名问句应可回答：{}", question));
-            assert!(
-                answer.contains("张三 的 师傅"),
-                "{} → {}",
-                question,
-                answer
-            );
+            assert!(answer.contains("张三 的 师傅"), "{} → {}", question, answer);
             assert!(answer.contains("李四"), "{} → {}", question, answer);
             assert!(
                 !answer.contains("师傅叫什么名字 是"),
@@ -24129,7 +24182,11 @@ types = [
             .answer("李四跟王五谁更可能是张三的师傅")
             .expect("「跟」也应读作比较");
         assert!(answer.contains("比较结论"), "{}", answer);
-        assert!(answer.contains("更可能是「张三 的 师傅 是 李四"), "{}", answer);
+        assert!(
+            answer.contains("更可能是「张三 的 师傅 是 李四"),
+            "{}",
+            answer
+        );
     }
 
     #[test]
@@ -24140,7 +24197,11 @@ types = [
             .answer("李四和王五谁最可能是张三的师傅")
             .expect("两个具名候选应做比较");
         assert!(answer.contains("比较结论"), "{}", answer);
-        assert!(answer.contains("更可能是「张三 的 师傅 是 李四"), "{}", answer);
+        assert!(
+            answer.contains("更可能是「张三 的 师傅 是 李四"),
+            "{}",
+            answer
+        );
         assert!(answer.contains("王五"), "{}", answer);
     }
 
@@ -24195,14 +24256,13 @@ types = [
         assert!(receipt.contains("已记住"), "{}", receipt);
         assert!(reasoner.alignment_memory_report().contains("未名科技公司"));
 
-        let mentions = reasoner.linker().alignment_mentions("远山科技公司发布了新芯片");
+        let mentions = reasoner
+            .linker()
+            .alignment_mentions("远山科技公司发布了新芯片");
         assert_eq!(mentions.len(), 1);
         assert_eq!(mentions[0].mention, "远山科技公司");
         assert_eq!(mentions[0].best().unwrap().entity, "远山科技");
-        assert_eq!(
-            mentions[0].best().unwrap().method,
-            LinkMethod::Alignment
-        );
+        assert_eq!(mentions[0].best().unwrap().method, LinkMethod::Alignment);
 
         let (surface, reason) = reasoner
             .alignment_surface_choice("未名科技")
@@ -24216,9 +24276,10 @@ types = [
             rendered
         );
 
-        assert!(reasoner
-            .alignment_canonicalize("张三公司")
-            .is_none(), "组织后缀不得套到人物身上，除非同形规则另有类型锚点");
+        assert!(
+            reasoner.alignment_canonicalize("张三公司").is_none(),
+            "组织后缀不得套到人物身上，除非同形规则另有类型锚点"
+        );
     }
 
     #[test]
@@ -24282,10 +24343,9 @@ types = [
             "重建后待定提名应保留"
         );
         assert!(
-            reasoner
-                .mention_lexicon()
-                .entry("坏词")
-                .is_some_and(|entry| entry.status == crate::mention_lexicon::LexiconStatus::Tombstoned),
+            reasoner.mention_lexicon().entry("坏词").is_some_and(
+                |entry| entry.status == crate::mention_lexicon::LexiconStatus::Tombstoned
+            ),
             "重建后墓碑应保留"
         );
     }
@@ -24300,8 +24360,7 @@ types = [
             .expect("应能生成读法轨迹");
         assert!(
             trace.tokens.iter().any(|token| {
-                token.text == "未名科技"
-                    && token.source == crate::nlp::TagSource::MentionLexicon
+                token.text == "未名科技" && token.source == crate::nlp::TagSource::MentionLexicon
             }),
             "读法轨迹应复用词表覆盖层：{:?}",
             trace.tokens
@@ -24322,7 +24381,9 @@ types = [
             reasoner.canonical_attribute("恩师").as_deref(),
             Some("师傅")
         );
-        let answer = reasoner.answer("张三的恩师是谁").expect("谓词对齐应参与问句");
+        let answer = reasoner
+            .answer("张三的恩师是谁")
+            .expect("谓词对齐应参与问句");
         assert!(answer.contains("李四"), "{}", answer);
     }
 
@@ -24341,9 +24402,7 @@ types = [
             .expect("对齐记忆应可恢复");
         let mentions = restored.linker().alignment_mentions("远山科技公司");
         assert_eq!(mentions[0].best().unwrap().entity, "远山科技");
-        assert!(restored
-            .alignment_memory_report()
-            .contains("未名科技公司"));
+        assert!(restored.alignment_memory_report().contains("未名科技公司"));
     }
 
     #[test]

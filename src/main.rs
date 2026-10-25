@@ -91,6 +91,7 @@ use know_prolog::{
     },
     shape_gate::{RepairAction, ShapeReport, ShapeSet},
     startup_ledger::StartupLedger,
+    symbolic_generator::SymbolicGenerator,
     symbolic_reasoner::SymbolicReasoner,
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
@@ -200,6 +201,32 @@ enum Commands {
         /// treated as answers to that clarification until the session ends.
         #[arg(long)]
         clarify: bool,
+    },
+    /// Inspect type memory: type profiles, members or a pairwise comparison
+    Types {
+        /// Type to inspect (canonical name or localized label)
+        #[arg(long = "type", value_name = "TYPE")]
+        type_name: Option<String>,
+        /// Compare two types, e.g. --compare 人物 组织
+        #[arg(
+            long,
+            num_args = 2,
+            value_names = ["LEFT", "RIGHT"],
+            conflicts_with = "type_name"
+        )]
+        compare: Option<Vec<String>>,
+        /// List members instead of the profile (requires --type; use --offset/--limit to page)
+        #[arg(long, requires = "type_name")]
+        members: bool,
+        /// Zero-based member offset (only with --members)
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Maximum members per page (only with --members)
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print the profile/page/comparison as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
@@ -1407,9 +1434,7 @@ async fn main() {
                         }
                     };
                     match std::fs::File::open(&file_path) {
-                        Ok(file) => {
-                            oxigraph_manager.import_rdf_reader(format, file).await
-                        }
+                        Ok(file) => oxigraph_manager.import_rdf_reader(format, file).await,
                         Err(error) => Err(error.into()),
                     }
                 } else {
@@ -1550,7 +1575,11 @@ async fn main() {
                             expectation.votes,
                             expectation.total,
                             expectation.confidence(),
-                            if expectation.conflict { "，冲突" } else { "" }
+                            if expectation.conflict {
+                                "，冲突"
+                            } else {
+                                ""
+                            }
                         ),
                         None => println!("「{}」没有词法类型证据。", word),
                     }
@@ -1617,6 +1646,33 @@ async fn main() {
                 strict,
                 explain,
                 clarify,
+            )
+            .await;
+        }
+        Some(Commands::Types {
+            type_name,
+            compare,
+            members,
+            offset,
+            limit,
+            json,
+        }) => {
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            oxigraph_manager.configure_type_system(&config.type_system);
+            run_types(
+                &config,
+                &oxigraph_manager,
+                type_name,
+                compare,
+                members,
+                offset,
+                limit,
+                json,
             )
             .await;
         }
@@ -3119,8 +3175,7 @@ fn run_eval_grounding(
     } else if baseline.is_some() {
         match reference_probe::GroundingEvalBaseline::load(&baseline_path) {
             Ok(old_baseline) => {
-                let verdict =
-                    reference_probe::compare_baseline(&old_baseline, &report, 1e-6);
+                let verdict = reference_probe::compare_baseline(&old_baseline, &report, 1e-6);
                 print!("{}", verdict.render_text());
                 if !verdict.passed && !allow_regression {
                     std::process::exit(1);
@@ -3929,9 +3984,7 @@ async fn run_batch_import(
         }
     };
     if ledger.active_rules().is_empty() {
-        eprintln!(
-            "批量教学台账里没有已采纳的活动规则（用 batch-teach --adopt 采纳后再导入）"
-        );
+        eprintln!("批量教学台账里没有已采纳的活动规则（用 batch-teach --adopt 采纳后再导入）");
         std::process::exit(1);
     }
     let text = match std::fs::read_to_string(file_path) {
@@ -3952,9 +4005,9 @@ async fn run_batch_import(
     for sentence in &sentences {
         let tokens = batch_teaching::tokenize_sentence(sentence, config);
         let mut sentence_items = extractor.extract(sentence, &tokens);
-        sentence_items.retain(|item| {
-            !matches!(item, KnowledgeItem::Entity { label, .. } if label == "Entity")
-        });
+        sentence_items.retain(
+            |item| !matches!(item, KnowledgeItem::Entity { label, .. } if label == "Entity"),
+        );
         extracted += sentence_items.len();
         let learned = ledger.extract_active(config, sentence, &tokens);
         extracted += learned.len();
@@ -3972,7 +4025,10 @@ async fn run_batch_import(
                         JournalLoad::Loaded(journal) => journal,
                         JournalLoad::Missing => ImportJournal::new(),
                         JournalLoad::Damaged(error) => {
-                            eprintln!("导入日志损坏（{}），本轮按空日志重建：{}", journal_path, error);
+                            eprintln!(
+                                "导入日志损坏（{}），本轮按空日志重建：{}",
+                                journal_path, error
+                            );
                             ImportJournal::new()
                         }
                     };
@@ -5254,10 +5310,7 @@ async fn run_ask(
         &config.predicate_profiles,
         config.reasoning.require_predicate_admission,
     );
-    let _ = oxigraph_manager.load_entity_registry(&format!(
-        "{}/entity_registry.json",
-        store_path
-    ));
+    let _ = oxigraph_manager.load_entity_registry(&format!("{}/entity_registry.json", store_path));
     oxigraph_manager.configure_entities(&config.entity_profiles);
     oxigraph_manager.configure_type_system(&config.type_system);
 
@@ -5301,10 +5354,7 @@ async fn run_ask(
         // 澄清对话中的下一行按回答处理：脚本可以用多行 stdin 完成
         // 「问题 → 是/不是 → 条件化结论」的整段解释空间收敛。
         if clarify && reasoner.clarification_active() {
-            if matches!(
-                question.as_str(),
-                "结束澄清" | "停止澄清" | "退出澄清"
-            ) {
+            if matches!(question.as_str(), "结束澄清" | "停止澄清" | "退出澄清") {
                 if let Some(text) = reasoner.stop_clarification() {
                     answers.push(AskAnswer {
                         question,
@@ -5358,12 +5408,7 @@ async fn run_ask(
             let generated = reasoner
                 .generate_about(&entity)
                 .or_else(|| reasoner.narrate(&entity))
-                .or_else(|| {
-                    Some(format!(
-                        "知识图谱中没有关于「{}」的可生成事实。",
-                        entity
-                    ))
-                });
+                .or_else(|| Some(format!("知识图谱中没有关于「{}」的可生成事实。", entity)));
             if generated.is_some() {
                 // 介绍轮也推进焦点栈：下一轮「它的人口呢」必须能接上实体。
                 dialogue.note_plugin_focus(&entity);
@@ -5455,6 +5500,158 @@ async fn run_ask(
     if strict && answers.iter().any(|answer| answer.answer.is_none()) {
         std::process::exit(1);
     }
+}
+
+async fn run_types(
+    config: &SystemConfig,
+    oxigraph_manager: &OxigraphManager,
+    type_name: Option<String>,
+    compare: Option<Vec<String>>,
+    members: bool,
+    offset: usize,
+    limit: usize,
+    json: bool,
+) {
+    let facts = match load_graph_snapshot(oxigraph_manager).await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识库失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let mut generator = SymbolicGenerator::new(
+        config.reasoning.max_profile_sentences,
+        config.reasoning.completion_min_score,
+    );
+    for fact in facts.iter() {
+        match fact {
+            PrologFact::Entity {
+                name,
+                entity_type,
+                properties,
+            } => generator.observe_entity_map(name, entity_type, properties),
+            PrologFact::Relation { from, rel_type, to } => {
+                generator.observe_triple(from, rel_type, to)
+            }
+        }
+    }
+
+    let available = || generator.all_types().join("、");
+    let resolve = |mention: &str| {
+        generator.resolve_type_name(mention).unwrap_or_else(|| {
+            let names = available();
+            if names.is_empty() {
+                eprintln!("知识图谱中没有带类型的实体。");
+            } else {
+                eprintln!("未知类型「{}」。当前类型：{}", mention, names);
+            }
+            std::process::exit(1);
+        })
+    };
+
+    if let Some(pair) = compare {
+        if pair.len() != 2 {
+            eprintln!("--compare 需要正好两个类型。");
+            std::process::exit(2);
+        }
+        let left = resolve(&pair[0]);
+        let right = resolve(&pair[1]);
+        if left == right {
+            eprintln!("--compare 的两个类型不能相同：{}", left);
+            std::process::exit(2);
+        }
+        let Some(comparison) = generator.compare_types(&left, &right) else {
+            eprintln!("类型「{}」或「{}」没有可用画像。", left, right);
+            std::process::exit(1);
+        };
+        if json {
+            match serde_json::to_string_pretty(&comparison) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("类型对比序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", comparison.render());
+        }
+        return;
+    }
+
+    if let Some(mention) = type_name {
+        let etype = resolve(&mention);
+        if members {
+            let Some(page) = generator.type_member_page(&etype, offset, limit) else {
+                eprintln!("类型「{}」没有成员。", etype);
+                std::process::exit(1);
+            };
+            if json {
+                match serde_json::to_string_pretty(&page) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("成员分页序列化失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", page.render());
+            }
+            return;
+        }
+        if offset != 0 || limit != 20 {
+            eprintln!("提示：--offset/--limit 仅在 --members 时生效。");
+        }
+        let Some(profile) = generator.type_profile(&etype) else {
+            eprintln!("类型「{}」没有可用画像。", etype);
+            std::process::exit(1);
+        };
+        if json {
+            match serde_json::to_string_pretty(&profile) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("类型画像序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", profile.render());
+        }
+        return;
+    }
+
+    let types = generator.all_types();
+    let profiles: Vec<_> = types
+        .iter()
+        .filter_map(|etype| generator.type_profile(etype))
+        .collect();
+    if json {
+        match serde_json::to_string_pretty(&profiles) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("类型总览序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if profiles.is_empty() {
+        println!("知识图谱中没有带类型的实体。");
+        return;
+    }
+    println!("类型总览（{} 类；按显式 rdf:type 统计）：", profiles.len());
+    for profile in &profiles {
+        println!(
+            "  - {}：{} 个成员；{} 种谓词，覆盖 {}/{} 个成员",
+            profile.type_name,
+            profile.total_members,
+            profile.total_predicates,
+            profile.covered_members,
+            profile.total_members
+        );
+    }
+    println!(
+        "使用 --type TYPE 查看画像，--type TYPE --members 查看成员，--compare LEFT RIGHT 对比。"
+    );
 }
 
 /// 编译并执行形状校验（`eval-shapes` 与交互命令共用同一确定性路径）。
@@ -6689,7 +6886,10 @@ async fn run_interactive_mode(
 
         // 软路由体检：配置构念变体上的恢复率、误接受与澄清账目（离线，不打开存储）
         if matches!(input, "软路由体检" | "软路由评估" | "软匹配体检") {
-            println!("{}", know_prolog::soft_route::evaluate_constructed(&config).render_text());
+            println!(
+                "{}",
+                know_prolog::soft_route::evaluate_constructed(&config).render_text()
+            );
             println!();
             continue;
         }
@@ -6727,10 +6927,8 @@ async fn run_interactive_mode(
             continue;
         }
 
-        if matches!(
-            input,
-            "批量教学" | "批量教学台账" | "教学规则" | "属性教学"
-        ) {
+        if matches!(input, "批量教学" | "批量教学台账" | "教学规则" | "属性教学")
+        {
             println!("{}", batch_teaching.render_ledger());
             println!();
             continue;
@@ -6752,19 +6950,17 @@ async fn run_interactive_mode(
             } else {
                 match batch_teaching.adopt(selector, &config) {
                     Ok(ids) if ids.is_empty() => println!("没有可采纳的候选规则。"),
-                    Ok(ids) => {
-                        match batch_teaching.save(&batch_teaching_path) {
-                            Ok(()) => println!(
-                                "已采纳 {} 条批量教学规则：{}（立即用于文本录入）。",
-                                ids.len(),
-                                ids.join(", ")
-                            ),
-                            Err(error) => eprintln!(
-                                "采纳已生效，但写入台账失败（{}）：{}",
-                                batch_teaching_path, error
-                            ),
-                        }
-                    }
+                    Ok(ids) => match batch_teaching.save(&batch_teaching_path) {
+                        Ok(()) => println!(
+                            "已采纳 {} 条批量教学规则：{}（立即用于文本录入）。",
+                            ids.len(),
+                            ids.join(", ")
+                        ),
+                        Err(error) => eprintln!(
+                            "采纳已生效，但写入台账失败（{}）：{}",
+                            batch_teaching_path, error
+                        ),
+                    },
                     Err(error) => println!("采纳教学失败：{}", error),
                 }
             }
@@ -6788,15 +6984,13 @@ async fn run_interactive_mode(
             } else {
                 match batch_teaching.retire(selector) {
                     Ok(ids) if ids.is_empty() => println!("没有匹配的规则。"),
-                    Ok(ids) => {
-                        match batch_teaching.save(&batch_teaching_path) {
-                            Ok(()) => println!("已退役 {} 条规则：{}。", ids.len(), ids.join(", ")),
-                            Err(error) => eprintln!(
-                                "退役已生效，但写入台账失败（{}）：{}",
-                                batch_teaching_path, error
-                            ),
-                        }
-                    }
+                    Ok(ids) => match batch_teaching.save(&batch_teaching_path) {
+                        Ok(()) => println!("已退役 {} 条规则：{}。", ids.len(), ids.join(", ")),
+                        Err(error) => eprintln!(
+                            "退役已生效，但写入台账失败（{}）：{}",
+                            batch_teaching_path, error
+                        ),
+                    },
                     Err(error) => println!("退役教学失败：{}", error),
                 }
             }
@@ -8599,12 +8793,10 @@ async fn run_interactive_mode(
                     if !certificate.verify() {
                         println!("（警告：证书摘要校验失败，台账可能被外部修改。）");
                     }
-                    let report = certificate.replay(
-                        symbolic_reasoner.revision(),
-                        |entity, rewritten| {
+                    let report =
+                        certificate.replay(symbolic_reasoner.revision(), |entity, rewritten| {
                             probe_reference_answer(&symbolic_reasoner, entity, rewritten)
-                        },
-                    );
+                        });
                     println!("{}", report.render_text());
                 }
                 None => {
@@ -8647,8 +8839,7 @@ async fn run_interactive_mode(
                 println!("请提供要切分的文本，例如：提及词表：未名科技公司发布了新芯片");
             } else {
                 let legacy = preprocess_annotated(text, &plugin_nlp);
-                let overlay =
-                    symbolic_reasoner.segment_annotated_with_lexicon(text, &plugin_nlp);
+                let overlay = symbolic_reasoner.segment_annotated_with_lexicon(text, &plugin_nlp);
                 println!("{}", symbolic_reasoner.mention_lexicon_match_report(text));
                 let render = |words: &[know_prolog::nlp::AnnotatedWord]| {
                     words
@@ -8678,7 +8869,10 @@ async fn run_interactive_mode(
             if surface.is_empty() {
                 println!("请提供要提名的词面，例如：词表提名：未名科技公司");
             } else if symbolic_reasoner.nominate_mention(surface, None) {
-                println!("已提名「{}」（待确认，不参与切分、不写图谱；准入：{} 可确认）。", surface, surface);
+                println!(
+                    "已提名「{}」（待确认，不参与切分、不写图谱；准入：{} 可确认）。",
+                    surface, surface
+                );
             } else {
                 println!("「{}」未提名：它已确认或已被拒绝。", surface);
             }
@@ -8694,7 +8888,10 @@ async fn run_interactive_mode(
             if surface.is_empty() {
                 println!("请提供要拒绝的词面，例如：词表拒绝：未名科技公司");
             } else if symbolic_reasoner.reject_mention(surface) {
-                println!("已拒绝「{}」：墓碑挡板已生效，后续观察不会再确认它。", surface);
+                println!(
+                    "已拒绝「{}」：墓碑挡板已生效，后续观察不会再确认它。",
+                    surface
+                );
             } else {
                 println!("「{}」已是墓碑，无需重复拒绝。", surface);
             }
@@ -10627,11 +10824,8 @@ async fn run_interactive_mode(
                     let tagged_words = preprocess(&clean_text, &plugin_nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
-                    let learned = batch_teaching.extract_active(
-                        &config,
-                        &clean_text,
-                        &normalized_words,
-                    );
+                    let learned =
+                        batch_teaching.extract_active(&config, &clean_text, &normalized_words);
                     let learned_added = append_learned_items(&mut items, learned);
                     if learned_added > 0 {
                         println!("批量教学规则命中 {} 条。", learned_added);
@@ -10829,8 +11023,7 @@ async fn run_interactive_mode(
                         }
                         Some(ClarifyAct::Correct { to, .. }) => {
                             crd_ledger.correct(&pending.key, &to, &format!("澄清纠正：{}", input));
-                            let _ = symbolic_reasoner
-                                .learn_entity_alignment(&pending.mention, &to);
+                            let _ = symbolic_reasoner.learn_entity_alignment(&pending.mention, &to);
                             println!("（语境纠错：{} ⇒ {}）", pending.mention, to);
                             crd_input = Some(rewrite_at(
                                 &pending.original_input,
@@ -11094,7 +11287,8 @@ async fn run_interactive_mode(
                 let normalized_words = normalize_words(tagged_words.clone(), &synonyms);
                 // 感知层覆盖：已确认词面（图谱实体/确认别名/显式准入）保留为
                 // 单一 token；旧切分仍是回退路径，覆盖层只增加边界证据。
-                let lexicon_tagged_words = symbolic_reasoner.segment_with_lexicon(input, &plugin_nlp);
+                let lexicon_tagged_words =
+                    symbolic_reasoner.segment_with_lexicon(input, &plugin_nlp);
                 let lexicon_normalized_words = if lexicon_tagged_words == tagged_words {
                     normalized_words.clone()
                 } else {
@@ -13162,9 +13356,8 @@ fn route_query_with_patterns(
     // 软层不接管时保留这条精确命中，召回不倒退。
     if let Some(matched) = library.match_route_with_context(words, context) {
         if matched.entry.defer_to_soft && soft_config.enabled {
-            let outcome = know_prolog::soft_route::route_tokens(
-                input, library, words, context, soft_config,
-            );
+            let outcome =
+                know_prolog::soft_route::route_tokens(input, library, words, context, soft_config);
             if outcome.decision == know_prolog::soft_route::SoftDecision::Accept {
                 if let Some(candidate) = outcome.selected {
                     if candidate.entry.id() != matched.entry.id() {
@@ -13198,9 +13391,8 @@ fn route_query_with_patterns(
     // 第二层：软路由。主路由未命中时先于 NLU 回退评估，避免泛化的
     // 回退槽位（如「属性查询」）再次挡住更具体的配置近失解释。
     if soft_config.enabled {
-        let outcome = know_prolog::soft_route::route_tokens(
-            input, library, words, context, soft_config,
-        );
+        let outcome =
+            know_prolog::soft_route::route_tokens(input, library, words, context, soft_config);
         if outcome.decision == know_prolog::soft_route::SoftDecision::Accept {
             if let Some(candidate) = outcome.selected {
                 let matched = candidate.to_pattern_match();
@@ -13258,14 +13450,13 @@ fn route_query_with_lexicon(
     context: &pattern_ir::PatternContext,
     soft_config: &know_prolog::soft_route::SoftRouteConfig,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    if let Some(hit) = route_query_with_patterns(library, input, primary, episodes, context, soft_config)
+    if let Some(hit) =
+        route_query_with_patterns(library, input, primary, episodes, context, soft_config)
     {
         return Some(hit);
     }
     if primary != fallback {
-        return route_query_with_patterns(
-            library, input, fallback, episodes, context, soft_config,
-        );
+        return route_query_with_patterns(library, input, fallback, episodes, context, soft_config);
     }
     None
 }
@@ -14005,7 +14196,8 @@ mod session_tests {
                 ("population".to_string(), "2189万".to_string()),
             ]),
         }]);
-        for input in ["北京有多少人？", "北京的人口有多少人？", "北京有多少人口？"] {
+        for input in ["北京有多少人？", "北京的人口有多少人？", "北京有多少人口？"]
+        {
             let frame = dialogue.analyze(input, &reasoner);
             assert_eq!(frame.kind, MoveKind::AskAttribute, "{} {:?}", input, frame);
             assert_eq!(frame.entity.as_deref(), Some("北京"), "{}", input);
@@ -14043,14 +14235,8 @@ mod session_tests {
             Some(Commands::ImportJsonld { file_path }) if file_path == "-"
         ));
 
-        let rdf = Cli::try_parse_from([
-            "knowprolog",
-            "import-rdf",
-            "-",
-            "--format",
-            "turtle",
-        ])
-        .unwrap();
+        let rdf =
+            Cli::try_parse_from(["knowprolog", "import-rdf", "-", "--format", "turtle"]).unwrap();
         match rdf.command {
             Some(Commands::ImportRdf { file_path, format }) => {
                 assert_eq!(file_path, "-");
@@ -14059,14 +14245,9 @@ mod session_tests {
             other => panic!("应解析为 import-rdf: {:?}", other),
         }
 
-        let file = Cli::try_parse_from([
-            "knowprolog",
-            "import-rdf",
-            "dump.data",
-            "--format",
-            "ttl",
-        ])
-        .unwrap();
+        let file =
+            Cli::try_parse_from(["knowprolog", "import-rdf", "dump.data", "--format", "ttl"])
+                .unwrap();
         assert!(matches!(
             file.command,
             Some(Commands::ImportRdf { format: Some(name), .. }) if name == "ttl"
@@ -14119,6 +14300,64 @@ mod session_tests {
     }
 
     #[test]
+    fn types_cli_parses_profile_members_and_compare() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "types",
+            "--type",
+            "人物",
+            "--members",
+            "--offset",
+            "10",
+            "--limit",
+            "5",
+            "--json",
+        ])
+        .expect("types 成员分页参数应可解析");
+        match cli.command {
+            Some(Commands::Types {
+                type_name,
+                compare,
+                members,
+                offset,
+                limit,
+                json,
+            }) => {
+                assert_eq!(type_name.as_deref(), Some("人物"));
+                assert!(compare.is_none());
+                assert!(members);
+                assert_eq!(offset, 10);
+                assert_eq!(limit, 5);
+                assert!(json);
+            }
+            other => panic!("应解析为 Types：{:?}", other),
+        }
+
+        let cli = Cli::try_parse_from(["knowprolog", "types", "--compare", "人物", "组织"])
+            .expect("types 对比参数应可解析");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Types {
+                compare: Some(pair),
+                members: false,
+                ..
+            }) if pair == vec!["人物".to_string(), "组织".to_string()]
+        ));
+
+        assert!(Cli::try_parse_from(["knowprolog", "types", "--members"]).is_err());
+        assert!(Cli::try_parse_from([
+            "knowprolog",
+            "types",
+            "--type",
+            "人物",
+            "--compare",
+            "人物",
+            "组织"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn predicates_cli_parses_repeatable_edits() {
         let cli = Cli::try_parse_from([
             "knowprolog",
@@ -14158,18 +14397,9 @@ mod session_tests {
             }
             _ => panic!("应解析为 Predicates 子命令"),
         }
-        assert_eq!(
-            parse_predicate_spec("老师=师傅"),
-            Some(("老师", "师傅"))
-        );
-        assert_eq!(
-            parse_predicate_spec("老师＝师傅"),
-            Some(("老师", "师傅"))
-        );
-        assert_eq!(
-            parse_predicate_spec("老师=>师傅"),
-            Some(("老师", "师傅"))
-        );
+        assert_eq!(parse_predicate_spec("老师=师傅"), Some(("老师", "师傅")));
+        assert_eq!(parse_predicate_spec("老师＝师傅"), Some(("老师", "师傅")));
+        assert_eq!(parse_predicate_spec("老师=>师傅"), Some(("老师", "师傅")));
         assert_eq!(parse_predicate_spec("老师"), None);
         assert_eq!(parse_predicate_spec("=师傅"), None);
         assert_eq!(parse_predicate_spec("老师="), None);
@@ -14322,7 +14552,9 @@ mod session_tests {
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
-        assert!(is_no_record_text("根据现有知识库，没有记录「张三 的 师傅」。"));
+        assert!(is_no_record_text(
+            "根据现有知识库，没有记录「张三 的 师傅」。"
+        ));
         assert!(is_no_record_text("未能回答：当前知识库中没有可用依据。"));
         assert!(!is_no_record_text("张三 的 师傅 是 李四。"));
     }

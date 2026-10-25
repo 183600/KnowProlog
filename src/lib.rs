@@ -139,6 +139,7 @@ pub mod symbolic_reasoner;
 pub mod temporal;
 pub mod trace_graph;
 pub mod turn_runtime;
+pub mod type_memory;
 pub mod type_system;
 pub mod view_render;
 pub mod weak_construction;
