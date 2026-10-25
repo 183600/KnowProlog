@@ -9084,6 +9084,10 @@ async fn run_interactive_mode(
                     let (digest, facts) =
                         entity_thread_context(chronicle, &oxigraph_manager).await;
                     println!("{}", digest.render_footprint(spec, facts.as_slice()));
+                    if let Some(changes) = entity_related_changes(&digest, chronicle, spec) {
+                        println!();
+                        println!("{}", changes);
+                    }
                 }
                 None => println!("编年史不可用（打开失败，见启动警告）。"),
             }
@@ -13368,6 +13372,68 @@ fn prolog_fact_edges(facts: &[PrologFact]) -> Vec<(String, String, String)> {
         .collect()
 }
 
+/// 把同一实体线索下问过的问题接到情景理论上，列出跨会话「同题异答」。
+///
+/// 只复用已有的 AnswerChange 判定，不在足迹里另造冲突规则；没有改口就静默。
+fn entity_related_changes(
+    digest: &EntityThreadDigest,
+    chronicle: &Chronicle,
+    query: &str,
+) -> Option<String> {
+    let ThreadLookup::Found(thread) = digest.lookup(query) else {
+        return None;
+    };
+    let questions: BTreeSet<String> = thread
+        .events
+        .iter()
+        .filter_map(|event| event.question.as_deref())
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .map(str::to_string)
+        .collect();
+    if questions.is_empty() {
+        return None;
+    }
+    let theory = ConversationTheory::build(chronicle);
+    let mut seen_keys = BTreeSet::new();
+    let mut lines = Vec::new();
+    for question in questions {
+        let Some(change) = theory.latest_change(&question) else {
+            continue;
+        };
+        if !seen_keys.insert(change.question_key.clone()) {
+            continue;
+        }
+        lines.push(format!(
+            "  「{}」：{}（rev {}，seq {}）→ {}（rev {}，seq {}）；{}",
+            clip_text(&change.question, 40),
+            clip_text(&change.previous.answer, 48),
+            change.previous.revision,
+            change.previous.reply_seq,
+            clip_text(&change.current.answer, 48),
+            change.current.revision,
+            change.current.reply_seq,
+            change.kind.label()
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut output = vec!["相关改口（跨会话同题异答）：".to_string()];
+    output.extend(lines);
+    output.push("  用「情景归因：<问题>」查看候选原因。".to_string());
+    Some(output.join("\n"))
+}
+
+fn clip_text(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(limit).collect();
+    clipped.push('…');
+    clipped
+}
+
 /// 构建实体脉络投影，并尽量附上当前图谱快照（失败只告警，不影响足迹）。
 async fn entity_thread_context(
     chronicle: &Chronicle,
@@ -16631,6 +16697,35 @@ mod session_tests {
             std::collections::HashMap::new(),
         );
         assert!(chronicle_entity_refs(&reasoner, "今天天气不错").is_empty());
+    }
+
+    #[test]
+    fn entity_footprint_reuses_situational_change_detection() {
+        use know_prolog::entity_registry::EntityRegistry;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("chronicle.jsonl");
+        let (mut chronicle, _) =
+            Chronicle::open(path.to_str().unwrap(), FsyncPolicy::EachAppend).unwrap();
+        chronicle
+            .append_turn("张三的身高是多少", "query", None, 0)
+            .unwrap();
+        chronicle.append_reply("226 厘米", &[], &[]).unwrap();
+        chronicle.set_kb_revision(1);
+        chronicle
+            .append_turn("张三的身高是多少呢", "query", None, 0)
+            .unwrap();
+        chronicle.append_reply("228 厘米", &[], &[]).unwrap();
+
+        let mut registry = EntityRegistry::new();
+        registry.observe_kb_entity("张三", &BTreeSet::new(), &[], "test");
+        let digest = EntityThreadDigest::build(&chronicle, &registry);
+        let report = entity_related_changes(&digest, &chronicle, "张三")
+            .expect("同一问题两次不同回答应报告改口");
+        assert!(report.contains("226 厘米"), "{}", report);
+        assert!(report.contains("228 厘米"), "{}", report);
+        assert!(report.contains("知识版本变化"), "{}", report);
+        assert!(entity_related_changes(&digest, &chronicle, "不存在").is_none());
     }
 
     #[tokio::test]
