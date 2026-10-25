@@ -29,6 +29,235 @@ pub struct ProfilePage {
     pub next_offset: usize,
 }
 
+/// 类型画像中一个谓词的来源：关系句、属性句，或两种用法在成员间并存。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeFactKind {
+    Relation,
+    Attribute,
+    Mixed,
+}
+
+impl TypeFactKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            TypeFactKind::Relation => "关系",
+            TypeFactKind::Attribute => "属性",
+            TypeFactKind::Mixed => "关系/属性",
+        }
+    }
+}
+
+/// 类型画像中的一条样例：某个成员在该谓词上的取值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeFactSample {
+    pub entity: String,
+    pub values: Vec<String>,
+}
+
+/// 类型画像的谓词切片（成员覆盖度 + 取值数 + 有界样例）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypePredicateSummary {
+    pub predicate: String,
+    pub label: String,
+    pub kind: TypeFactKind,
+    pub member_count: usize,
+    pub value_count: usize,
+    /// 拥有该谓词的成员占比（千分比，四舍五入）。
+    pub coverage_milli: u32,
+    pub samples: Vec<TypeFactSample>,
+}
+
+/// 一个类型的物化画像：成员、谓词分布、覆盖度与确定性样例。
+///
+/// 画像是纯派生数据：`revision` 是该类型自己的版本戳，只有影响该类型
+/// 成员事实的写入才推进它，因此不同类型的缓存可以独立失效。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeProfile {
+    pub type_name: String,
+    pub revision: u64,
+    pub total_members: usize,
+    pub members: Vec<String>,
+    pub members_truncated: bool,
+    pub covered_members: usize,
+    pub total_predicates: usize,
+    pub predicates: Vec<TypePredicateSummary>,
+    pub predicates_truncated: bool,
+    pub samples: Vec<String>,
+}
+
+/// 类型成员的一页（稳定字典序）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeMemberPage {
+    pub type_name: String,
+    pub offset: usize,
+    pub next_offset: usize,
+    pub total: usize,
+    pub done: bool,
+    pub members: Vec<String>,
+}
+
+/// 两个类型的画像对比：共享谓词与各自独有的谓词。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeComparison {
+    pub left: TypeProfile,
+    pub right: TypeProfile,
+    pub shared_predicates: Vec<String>,
+    pub left_only_predicates: Vec<String>,
+    pub right_only_predicates: Vec<String>,
+}
+
+const TYPE_PROFILE_MAX_MEMBERS: usize = 256;
+const TYPE_PROFILE_SAMPLES_PER_PREDICATE: usize = 2;
+const TYPE_PROFILE_DEFAULT_PREDICATES: usize = 12;
+const TYPE_PROFILE_DEFAULT_SAMPLES: usize = 6;
+
+impl TypeProfile {
+    /// 人读报告（确定性排序；超长成员表只展示前 20 个并显式披露）。
+    pub fn render(&self) -> String {
+        let mut output = format!(
+            "类型画像「{}」（类型版本 v{}；成员 {} 个）：\n",
+            self.type_name, self.revision, self.total_members
+        );
+        if self.members.is_empty() {
+            output.push_str("  （没有显式成员。）");
+            return output;
+        }
+        let shown = self.members.iter().take(20).cloned().collect::<Vec<_>>();
+        output.push_str(&format!("  成员：{}", shown.join("、")));
+        if self.total_members > shown.len() {
+            output.push_str(&format!(" 等 {} 个", self.total_members));
+        }
+        if self.members_truncated {
+            output.push_str(&format!(
+                "（画像成员表仅保留前 {} 个，覆盖度仍按全部成员统计）",
+                TYPE_PROFILE_MAX_MEMBERS
+            ));
+        }
+        output.push('\n');
+
+        let coverage = if self.total_members == 0 {
+            0
+        } else {
+            (self.covered_members * 1000 / self.total_members).min(1000)
+        };
+        output.push_str(&format!(
+            "  覆盖：{}/{} 个成员至少有 1 条事实（{}%）；谓词 {} 种。\n",
+            self.covered_members,
+            self.total_members,
+            coverage / 10,
+            self.total_predicates
+        ));
+        if self.predicates.is_empty() {
+            output.push_str("  （这些成员尚无可生成的事实。）");
+            return output;
+        }
+        output.push_str("  常见谓词：\n");
+        for (index, summary) in self.predicates.iter().enumerate() {
+            output.push_str(&format!(
+                "    {}. {}（{}）：{}/{} 个成员（{}%），共 {} 个取值",
+                index + 1,
+                summary.label,
+                summary.kind.label(),
+                summary.member_count,
+                self.total_members,
+                summary.coverage_milli / 10,
+                summary.value_count
+            ));
+            if let Some(sample) = summary.samples.first() {
+                output.push_str(&format!(
+                    "；样例：{} → {}",
+                    sample.entity,
+                    sample.values.join("、")
+                ));
+            }
+            output.push('\n');
+        }
+        if self.predicates_truncated {
+            output.push_str(&format!(
+                "    （其余 {} 种谓词未展开。）\n",
+                self.total_predicates.saturating_sub(self.predicates.len())
+            ));
+        }
+        if !self.samples.is_empty() {
+            output.push_str("  样例事实：\n");
+            for sentence in &self.samples {
+                output.push_str(&format!("    - {}\n", sentence));
+            }
+        }
+        output.trim_end().to_string()
+    }
+}
+
+impl TypeComparison {
+    pub fn render(&self) -> String {
+        let mut output = format!(
+            "类型对比「{}」与「{}」：\n",
+            self.left.type_name, self.right.type_name
+        );
+        output.push_str(&format!(
+            "  成员：{} {} 个；{} {} 个。\n",
+            self.left.type_name,
+            self.left.total_members,
+            self.right.type_name,
+            self.right.total_members
+        ));
+        let label = |predicate: &str| {
+            localized_predicate_key(predicate)
+                .unwrap_or(predicate)
+                .to_string()
+        };
+        let shared = self
+            .shared_predicates
+            .iter()
+            .map(|predicate| label(predicate))
+            .collect::<Vec<_>>();
+        let left_only = self
+            .left_only_predicates
+            .iter()
+            .map(|predicate| label(predicate))
+            .collect::<Vec<_>>();
+        let right_only = self
+            .right_only_predicates
+            .iter()
+            .map(|predicate| label(predicate))
+            .collect::<Vec<_>>();
+        output.push_str(&format!(
+            "  共同谓词（{}）：{}\n",
+            shared.len(),
+            if shared.is_empty() {
+                "无".to_string()
+            } else {
+                shared.join("、")
+            }
+        ));
+        output.push_str(&format!(
+            "  仅「{}」（{}）：{}\n",
+            self.left.type_name,
+            left_only.len(),
+            if left_only.is_empty() {
+                "无".to_string()
+            } else {
+                left_only.join("、")
+            }
+        ));
+        output.push_str(&format!(
+            "  仅「{}」（{}）：{}\n",
+            self.right.type_name,
+            right_only.len(),
+            if right_only.is_empty() {
+                "无".to_string()
+            } else {
+                right_only.join("、")
+            }
+        ));
+        output.push_str(
+            "  说明：共同谓词是共享范畴线索，独有谓词是区分线索；均只基于显式 rdf:type 成员。",
+        );
+        output
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionLevel {
     Entity,
@@ -254,8 +483,7 @@ impl GenerationCursor {
             .iter()
             .filter_map(|(encoded, record)| {
                 let clause = current.get(encoded)?;
-                (record.fingerprint != clause.fingerprint())
-                    .then(|| (encoded.clone(), *clause))
+                (record.fingerprint != clause.fingerprint()).then(|| (encoded.clone(), *clause))
             })
             .collect();
         updates.sort_by_key(|(encoded, _)| order_index.get(encoded).copied().unwrap_or(usize::MAX));
@@ -427,6 +655,11 @@ pub struct SymbolicGenerator {
     // 类型 → 谓词计数聚合缓存；知识变更（revision 自增）后失效
     revision: u64,
     type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
+    // 类型 → 该类型自己的版本戳：只有影响该类型成员事实的写入才推进
+    type_versions: HashMap<String, u64>,
+    type_version_counter: u64,
+    // 类型画像缓存：键含「类型 + 有界参数」，只按该类型的版本戳失效
+    type_profile_cache: parking_lot::RwLock<HashMap<(String, usize, usize), (u64, TypeProfile)>>,
 }
 
 // 三元组的去重键：长度前缀保证无歧义
@@ -469,6 +702,9 @@ impl Clone for SymbolicGenerator {
             lexicalized_predicates: self.lexicalized_predicates.clone(),
             revision: self.revision,
             type_count_cache: parking_lot::RwLock::new(self.type_count_cache.read().clone()),
+            type_versions: self.type_versions.clone(),
+            type_version_counter: self.type_version_counter,
+            type_profile_cache: parking_lot::RwLock::new(self.type_profile_cache.read().clone()),
         }
     }
 }
@@ -494,6 +730,9 @@ impl SymbolicGenerator {
             lexicalized_predicates: HashSet::new(),
             revision: 0,
             type_count_cache: parking_lot::RwLock::new(HashMap::new()),
+            type_versions: HashMap::new(),
+            type_version_counter: 0,
+            type_profile_cache: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -534,6 +773,291 @@ impl SymbolicGenerator {
             .get(etype)
             .map(|members| members.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// 某类型自己的版本戳（未见过的类型为 0）。
+    pub fn type_revision(&self, etype: &str) -> u64 {
+        self.type_versions.get(etype).copied().unwrap_or(0)
+    }
+
+    /// 把用户词面解析成图中的类型名：精确名 → 大小写不敏感 → 本地化标签。
+    /// 只在显式成员类型中查找，避免把普通实体名误当类型。
+    pub fn resolve_type_name(&self, mention: &str) -> Option<String> {
+        let mention = mention.trim().trim_matches(|c: char| {
+            matches!(
+                c,
+                '「' | '」' | '"' | '\'' | '“' | '”' | '？' | '?' | '。' | '，' | ',' | '：' | ':'
+            )
+        });
+        if mention.is_empty() {
+            return None;
+        }
+        let types = self.all_types();
+        if let Some(exact) = types.iter().find(|etype| etype.as_str() == mention) {
+            return Some(exact.clone());
+        }
+        if let Some(insensitive) = types
+            .iter()
+            .find(|etype| etype.eq_ignore_ascii_case(mention))
+        {
+            return Some(insensitive.clone());
+        }
+        let label = localized_type_label(mention);
+        types
+            .iter()
+            .find(|etype| localized_type_label(etype) == label)
+            .cloned()
+    }
+
+    /// 默认粒度的类型画像（12 种谓词、6 条样例）。
+    pub fn type_profile(&self, etype: &str) -> Option<TypeProfile> {
+        self.type_profile_bounded(
+            etype,
+            TYPE_PROFILE_DEFAULT_PREDICATES,
+            TYPE_PROFILE_DEFAULT_SAMPLES,
+        )
+    }
+
+    /// 有界类型画像；缓存键包含界参数，只随该类型的版本戳失效。
+    pub fn type_profile_bounded(
+        &self,
+        etype: &str,
+        max_predicates: usize,
+        max_samples: usize,
+    ) -> Option<TypeProfile> {
+        let revision = self.type_revision(etype);
+        let cache_key = (etype.to_string(), max_predicates, max_samples);
+        {
+            let cache = self.type_profile_cache.read();
+            if let Some((cached_revision, profile)) = cache.get(&cache_key) {
+                if *cached_revision == revision {
+                    return Some(profile.clone());
+                }
+            }
+        }
+        let profile = self.build_type_profile(etype, revision, max_predicates, max_samples)?;
+        self.type_profile_cache
+            .write()
+            .insert(cache_key, (revision, profile.clone()));
+        Some(profile)
+    }
+
+    fn build_type_profile(
+        &self,
+        etype: &str,
+        revision: u64,
+        max_predicates: usize,
+        max_samples: usize,
+    ) -> Option<TypeProfile> {
+        let members_ref = self.type_members.get(etype)?;
+        if members_ref.is_empty() {
+            return None;
+        }
+        struct Accumulator {
+            members: usize,
+            values: usize,
+            relation: bool,
+            attribute: bool,
+            samples: Vec<TypeFactSample>,
+        }
+        let mut accumulators: BTreeMap<String, Accumulator> = BTreeMap::new();
+        let mut covered: BTreeSet<String> = BTreeSet::new();
+        for entity in members_ref {
+            // 同一实体同一谓词先合并：关系优先，姓名自指句不计入画像。
+            let mut facts: BTreeMap<String, (BTreeSet<String>, bool)> = BTreeMap::new();
+            if let Some(relations) = self.by_subject.get(entity) {
+                for (predicate, objects) in relations {
+                    let values = facts
+                        .entry(predicate.clone())
+                        .or_insert_with(|| (BTreeSet::new(), true));
+                    values.1 = true;
+                    values.0.extend(objects.iter().cloned());
+                }
+            }
+            if let Some(attributes) = self.attributes.get(entity) {
+                for (key, value) in attributes {
+                    if facts.contains_key(key) {
+                        continue;
+                    }
+                    if is_name_key(key) && value == entity {
+                        continue;
+                    }
+                    facts
+                        .entry(key.clone())
+                        .or_insert_with(|| (BTreeSet::new(), false))
+                        .0
+                        .insert(value.clone());
+                }
+            }
+            for (predicate, (values, relation)) in facts {
+                if values.is_empty() {
+                    continue;
+                }
+                covered.insert(entity.clone());
+                let entry = accumulators
+                    .entry(predicate)
+                    .or_insert_with(|| Accumulator {
+                        members: 0,
+                        values: 0,
+                        relation: false,
+                        attribute: false,
+                        samples: Vec::new(),
+                    });
+                entry.members += 1;
+                entry.values += values.len();
+                if relation {
+                    entry.relation = true;
+                } else {
+                    entry.attribute = true;
+                }
+                if entry.samples.len() < TYPE_PROFILE_SAMPLES_PER_PREDICATE {
+                    entry.samples.push(TypeFactSample {
+                        entity: entity.clone(),
+                        values: values.into_iter().collect(),
+                    });
+                }
+            }
+        }
+
+        let total_members = members_ref.len();
+        let mut summaries: Vec<TypePredicateSummary> = accumulators
+            .into_iter()
+            .map(|(predicate, accumulator)| {
+                let kind = match (accumulator.relation, accumulator.attribute) {
+                    (true, true) => TypeFactKind::Mixed,
+                    (true, false) => TypeFactKind::Relation,
+                    (false, true) => TypeFactKind::Attribute,
+                    (false, false) => TypeFactKind::Attribute,
+                };
+                let coverage_milli = if total_members == 0 {
+                    0
+                } else {
+                    ((accumulator.members * 1000 + total_members / 2) / total_members).min(1000)
+                        as u32
+                };
+                TypePredicateSummary {
+                    label: localized_predicate_key(&predicate)
+                        .unwrap_or(predicate.as_str())
+                        .to_string(),
+                    predicate,
+                    kind,
+                    member_count: accumulator.members,
+                    value_count: accumulator.values,
+                    coverage_milli,
+                    samples: accumulator.samples,
+                }
+            })
+            .collect();
+        summaries.sort_by(|left, right| {
+            right
+                .member_count
+                .cmp(&left.member_count)
+                .then_with(|| right.value_count.cmp(&left.value_count))
+                .then_with(|| left.predicate.cmp(&right.predicate))
+        });
+        let total_predicates = summaries.len();
+        let predicates_truncated = total_predicates > max_predicates;
+        summaries.truncate(max_predicates);
+
+        let mut samples = Vec::new();
+        'outer: for summary in &summaries {
+            for sample in &summary.samples {
+                let sentence = self.lexicalize(&sample.entity, &summary.predicate, &sample.values);
+                if !samples.contains(&sentence) {
+                    samples.push(sentence);
+                }
+                if samples.len() >= max_samples {
+                    break 'outer;
+                }
+            }
+        }
+
+        let members: Vec<String> = members_ref
+            .iter()
+            .take(TYPE_PROFILE_MAX_MEMBERS)
+            .cloned()
+            .collect();
+        Some(TypeProfile {
+            type_name: etype.to_string(),
+            revision,
+            total_members,
+            members_truncated: total_members > members.len(),
+            members,
+            covered_members: covered.len(),
+            total_predicates,
+            predicates: summaries,
+            predicates_truncated,
+            samples,
+        })
+    }
+
+    /// 类型成员分页（字典序，越界返回空页而不是报错）。
+    pub fn type_member_page(
+        &self,
+        etype: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Option<TypeMemberPage> {
+        let members = self.type_members.get(etype)?;
+        let total = members.len();
+        let limit = limit.max(1);
+        let offset = offset.min(total);
+        let page: Vec<String> = members.iter().skip(offset).take(limit).cloned().collect();
+        let next_offset = offset + page.len();
+        Some(TypeMemberPage {
+            type_name: etype.to_string(),
+            offset,
+            next_offset,
+            total,
+            done: next_offset >= total,
+            members: page,
+        })
+    }
+
+    /// 两个类型的画像对比（全量谓词，不做默认截断）。
+    pub fn compare_types(&self, left: &str, right: &str) -> Option<TypeComparison> {
+        let left_profile = self.type_profile_bounded(left, usize::MAX, 0)?;
+        let right_profile = self.type_profile_bounded(right, usize::MAX, 0)?;
+        let left_predicates: BTreeSet<String> = left_profile
+            .predicates
+            .iter()
+            .map(|summary| summary.predicate.clone())
+            .collect();
+        let right_predicates: BTreeSet<String> = right_profile
+            .predicates
+            .iter()
+            .map(|summary| summary.predicate.clone())
+            .collect();
+        let shared = left_predicates
+            .intersection(&right_predicates)
+            .cloned()
+            .collect();
+        let left_only = left_predicates
+            .difference(&right_predicates)
+            .cloned()
+            .collect();
+        let right_only = right_predicates
+            .difference(&left_predicates)
+            .cloned()
+            .collect();
+        Some(TypeComparison {
+            left: left_profile,
+            right: right_profile,
+            shared_predicates: shared,
+            left_only_predicates: left_only,
+            right_only_predicates: right_only,
+        })
+    }
+
+    /// 默认类型画像的人读报告。
+    pub fn type_profile_report(&self, etype: &str) -> Option<String> {
+        self.type_profile(etype).map(|profile| profile.render())
+    }
+
+    /// 类型对比的人读报告。
+    pub fn type_comparison_report(&self, left: &str, right: &str) -> Option<String> {
+        self.compare_types(left, right)
+            .map(|comparison| comparison.render())
     }
 
     pub fn attribute_pairs(&self, entity: &str) -> Vec<(String, String)> {
@@ -630,6 +1154,7 @@ impl SymbolicGenerator {
             .insert(alias.to_string(), canonical.to_string());
         self.lexicalized_predicates.insert(alias.to_string());
         self.revision += 1;
+        self.type_profile_cache.write().clear();
         true
     }
 
@@ -724,6 +1249,7 @@ impl SymbolicGenerator {
         }
         // 只在知识确有变化时自增 revision
         let mut changed = false;
+        let mut touched_types: BTreeSet<String> = BTreeSet::new();
         if self.known_entities.insert(name.to_string()) {
             changed = true;
         }
@@ -735,6 +1261,8 @@ impl SymbolicGenerator {
                 Some(previous) => {
                     if previous != etype {
                         changed = true;
+                        touched_types.insert(previous.clone());
+                        touched_types.insert(etype.to_string());
                         if let Some(members) = self.type_members.get_mut(&previous) {
                             members.remove(name);
                             if members.is_empty() {
@@ -749,6 +1277,7 @@ impl SymbolicGenerator {
                 }
                 None => {
                     changed = true;
+                    touched_types.insert(etype.to_string());
                     self.type_members
                         .entry(etype.to_string())
                         .or_default()
@@ -756,6 +1285,7 @@ impl SymbolicGenerator {
                 }
             }
         }
+        let mut facts_changed = false;
         if !properties.is_empty() {
             let bucket = self.attributes.entry(name.to_string()).or_default();
             for &(key, value) in properties {
@@ -765,6 +1295,7 @@ impl SymbolicGenerator {
                 if !bucket.iter().any(|(k, v)| k == key && v == value) {
                     bucket.push((key.to_string(), value.to_string()));
                     changed = true;
+                    facts_changed = true;
                 }
             }
         }
@@ -772,6 +1303,14 @@ impl SymbolicGenerator {
             if !key.trim().is_empty() && self.register_predicate_surface(key) {
                 changed = true;
             }
+        }
+        if facts_changed {
+            if let Some(current) = self.entity_types.get(name) {
+                touched_types.insert(current.clone());
+            }
+        }
+        for etype in touched_types {
+            self.bump_type_version(&etype);
         }
         if changed {
             self.revision += 1;
@@ -795,7 +1334,19 @@ impl SymbolicGenerator {
             self.predicate_surfaces
                 .insert(surface.to_string(), predicate.to_string());
         }
+        self.type_profile_cache.write().clear();
         true
+    }
+
+    /// 推进一个类型自己的版本戳。只有成员集合或成员事实变化时才调用，
+    /// 因而同一轮写入不会把无关类型的画像缓存一并打掉。
+    fn bump_type_version(&mut self, etype: &str) {
+        if etype.trim().is_empty() {
+            return;
+        }
+        self.type_version_counter = self.type_version_counter.saturating_add(1);
+        let stamp = self.type_version_counter;
+        self.type_versions.insert(etype.to_string(), stamp);
     }
 
     pub fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
@@ -807,6 +1358,7 @@ impl SymbolicGenerator {
             return;
         }
         self.revision += 1;
+        let subject_type = self.entity_types.get(subject).cloned();
         self.known_entities.insert(subject.to_string());
         self.known_entities.insert(object.to_string());
 
@@ -871,6 +1423,9 @@ impl SymbolicGenerator {
         self.total_relations += 1;
 
         self.register_predicate_surface(predicate);
+        if let Some(etype) = subject_type {
+            self.bump_type_version(&etype);
+        }
     }
 
     /// 从生成器索引中撤回一条三元组（知识图谱侧删除后调用）。
@@ -883,6 +1438,7 @@ impl SymbolicGenerator {
             return false;
         }
         self.revision += 1;
+        let subject_type = self.entity_types.get(subject).cloned();
 
         if let Some(subjects) = self.by_subject.get_mut(subject) {
             if let Some(objects) = subjects.get_mut(predicate) {
@@ -943,6 +1499,9 @@ impl SymbolicGenerator {
             self.refresh_predicate_min_entity(predicate);
         } else if self.predicate_min_entity.get(predicate).map(String::as_str) == Some(subject) {
             self.refresh_predicate_min_entity(predicate);
+        }
+        if let Some(etype) = subject_type {
+            self.bump_type_version(&etype);
         }
         true
     }
@@ -1031,15 +1590,11 @@ impl SymbolicGenerator {
     ) -> Option<Vec<ProfileClause>> {
         // 会话层可能引入图谱尚未收录的实体：它既可能是新事实的主语，
         // 也可能只作为宾语出现（此时生成反向句）。
-        let overlay_has_entity = overlay
-            .add
-            .iter()
-            .any(|((subject, _), values)| {
-                subject == entity || values.iter().any(|value| value == entity)
-            })
-            || overlay.replace.iter().any(|((subject, _), values)| {
-                subject == entity || values.iter().any(|value| value == entity)
-            });
+        let overlay_has_entity = overlay.add.iter().any(|((subject, _), values)| {
+            subject == entity || values.iter().any(|value| value == entity)
+        }) || overlay.replace.iter().any(|((subject, _), values)| {
+            subject == entity || values.iter().any(|value| value == entity)
+        });
         if !self.is_known_entity(entity) && !overlay_has_entity {
             return None;
         }
@@ -1221,11 +1776,9 @@ impl SymbolicGenerator {
                     .then_with(|| a.sentence.cmp(&b.sentence))
                     .then_with(|| a.key.cmp(&b.key))
             }),
-            GenerationOrder::Alphabetical => clauses.sort_by(|a, b| {
-                a.sentence
-                    .cmp(&b.sentence)
-                    .then_with(|| a.key.cmp(&b.key))
-            }),
+            GenerationOrder::Alphabetical => {
+                clauses.sort_by(|a, b| a.sentence.cmp(&b.sentence).then_with(|| a.key.cmp(&b.key)))
+            }
         }
         Some(clauses)
     }
@@ -1957,11 +2510,20 @@ mod tests {
         let mut generator = SymbolicGenerator::new(6, 0.3);
         // 配置谓词画像先登记「岁数 → 年龄」。
         assert!(generator.register_predicate_alias("岁数", "年龄"));
-        assert_eq!(generator.canonical_predicate("年龄").as_deref(), Some("年龄"));
+        assert_eq!(
+            generator.canonical_predicate("年龄").as_deref(),
+            Some("年龄")
+        );
         // 随后图谱出现英文属性 age：内置中文词面「年龄」应重新指回 age。
         generator.observe_entity("张三", "人物", &[("age".to_string(), "30".to_string())]);
-        assert_eq!(generator.canonical_predicate("年龄").as_deref(), Some("age"));
-        assert_eq!(generator.canonical_predicate("岁数").as_deref(), Some("年龄"));
+        assert_eq!(
+            generator.canonical_predicate("年龄").as_deref(),
+            Some("age")
+        );
+        assert_eq!(
+            generator.canonical_predicate("岁数").as_deref(),
+            Some("年龄")
+        );
     }
 
     #[test]
@@ -1974,7 +2536,11 @@ mod tests {
     #[test]
     fn test_chinese_attribute_alias_reaches_english_key() {
         let mut generator = SymbolicGenerator::new(6, 0.3);
-        generator.observe_entity("北京", "City", &[("population".to_string(), "2189万".to_string())]);
+        generator.observe_entity(
+            "北京",
+            "City",
+            &[("population".to_string(), "2189万".to_string())],
+        );
         assert_eq!(canonical_predicate_key("人口"), Some("population"));
         assert_eq!(localized_predicate_key("population"), Some("人口"));
         assert_eq!(generator.attribute_values("北京", "人口"), vec!["2189万"]);
@@ -2023,13 +2589,19 @@ mod tests {
         assert_eq!(generator.relation_count(), 1);
         assert!(generator.relation_values("甲", "朋友").is_empty());
         // 反向索引同步撤回，不再把甲当作「丁的朋友」
-        assert!(generator.relation_values_in("丁", "朋友").contains(&"丙".to_string()));
+        assert!(generator
+            .relation_values_in("丁", "朋友")
+            .contains(&"丙".to_string()));
         assert!(!generator.retract_triple("甲", "朋友", "乙"));
 
         // 全局回退原型必须从现存主体重算，不能指向已撤回的甲。
         let completion = generator.complete("甲的").expect("仍应给出全局回退");
         assert!(completion.contains("全局回退"), "实际：{}", completion);
-        assert!(completion.contains("丙"), "原型不应指向幽灵实体：{}", completion);
+        assert!(
+            completion.contains("丙"),
+            "原型不应指向幽灵实体：{}",
+            completion
+        );
         assert!(!completion.contains("甲的朋友"), "{}", completion);
     }
 
@@ -2074,7 +2646,9 @@ mod tests {
             .unwrap();
         assert_eq!(second.shown, 1);
         assert!(
-            !second.text.contains(first_sentence.trim_start_matches("接着，")),
+            !second
+                .text
+                .contains(first_sentence.trim_start_matches("接着，")),
             "已说过的句子不应重复：第一页={}；第二页={}",
             first.text,
             second.text
@@ -2134,9 +2708,10 @@ mod tests {
         generator.observe_entity("张三", "人物", &[]);
         generator.observe_triple("张三", "师傅", "李四");
         let mut overlay = GenerationOverlay::default();
-        overlay
-            .replace
-            .insert(("张三".to_string(), "师傅".to_string()), vec!["王五".to_string()]);
+        overlay.replace.insert(
+            ("张三".to_string(), "师傅".to_string()),
+            vec!["王五".to_string()],
+        );
         overlay
             .suppress
             .entry(("张三".to_string(), "师傅".to_string()))
@@ -2200,5 +2775,137 @@ mod tests {
         generator.observe_entity("乙", "组织", &[]);
         assert_eq!(generator.entities_of_type("人物"), vec!["甲"]);
         assert_eq!(generator.entities_of_type("组织"), vec!["乙"]);
+    }
+
+    #[test]
+    fn test_type_profile_materializes_members_predicates_and_coverage() {
+        let generator = sample_generator();
+        let profile = generator.type_profile("人物").expect("人物应有类型画像");
+        assert_eq!(profile.total_members, 3);
+        assert_eq!(profile.members, vec!["张三", "李四", "王五"]);
+        assert_eq!(profile.covered_members, 2);
+
+        let master = profile
+            .predicates
+            .iter()
+            .find(|summary| summary.predicate == "师傅")
+            .expect("师傅应进入谓词切片");
+        assert_eq!(master.member_count, 2);
+        assert_eq!(master.value_count, 2);
+        assert_eq!(master.coverage_milli, 667);
+        assert_eq!(master.kind, TypeFactKind::Relation);
+        assert!(!master.samples.is_empty());
+
+        let report = generator.type_profile_report("人物").unwrap();
+        assert!(report.contains("类型画像「人物」"), "{}", report);
+        assert!(report.contains("成员：张三、李四、王五"), "{}", report);
+        assert!(report.contains("覆盖：2/3"), "{}", report);
+        assert!(report.contains("师傅"), "{}", report);
+        assert!(report.contains("样例事实"), "{}", report);
+        assert_eq!(report, generator.type_profile_report("人物").unwrap());
+    }
+
+    #[test]
+    fn test_type_profile_cache_invalidates_only_the_touched_type() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("甲", "甲类", &[("年龄".to_string(), "20".to_string())]);
+        generator.observe_entity("乙", "乙类", &[("人口".to_string(), "100".to_string())]);
+        let alpha = generator.type_profile("甲类").unwrap();
+        let beta = generator.type_profile("乙类").unwrap();
+        let beta_revision = beta.revision;
+
+        generator.observe_entity("甲", "甲类", &[("身高".to_string(), "180".to_string())]);
+        let alpha_after = generator.type_profile("甲类").unwrap();
+        let beta_after = generator.type_profile("乙类").unwrap();
+        assert!(
+            alpha_after.revision > alpha.revision,
+            "受影响类型必须换版本"
+        );
+        assert_eq!(beta_after.revision, beta_revision, "无关类型不得被整体失效");
+        assert_eq!(beta_after, beta, "无关类型画像应逐字节保持");
+        assert!(alpha_after
+            .predicates
+            .iter()
+            .any(|summary| summary.predicate == "身高"));
+
+        generator.observe_triple("Avat", "朋友", "Bod");
+        let other = generator.type_profile("乙类").unwrap();
+        assert_eq!(other, beta_after, "其它关系写入同样不得打掉无关类型");
+    }
+
+    #[test]
+    fn test_type_profile_follows_member_moves_and_retractions() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("甲", "甲类", &[]);
+        generator.observe_entity("乙", "乙类", &[]);
+        generator.observe_triple("甲", "朋友", "丙");
+        let before = generator.type_profile("甲类").unwrap();
+        assert_eq!(before.total_members, 1);
+
+        generator.observe_entity("甲", "乙类", &[]);
+        assert!(
+            generator.type_profile("甲类").is_none(),
+            "成员迁出后空类型不再有画像"
+        );
+        let moved = generator.type_profile("乙类").unwrap();
+        assert_eq!(moved.members, vec!["乙", "甲"]);
+        assert!(moved.revision > before.revision);
+
+        assert!(generator.retract_triple("甲", "朋友", "丙"));
+        let after = generator.type_profile("乙类").unwrap();
+        assert!(after.revision > moved.revision, "撤回成员事实必须推进版本");
+        assert_eq!(after.covered_members, 0);
+        assert!(after.predicates.is_empty());
+    }
+
+    #[test]
+    fn test_type_member_page_and_comparison_are_deterministic() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("甲", "甲类", &[("说明".to_string(), "x".to_string())]);
+        generator.observe_entity("乙", "甲类", &[("年龄".to_string(), "20".to_string())]);
+        generator.observe_entity("丙", "乙类", &[("说明".to_string(), "y".to_string())]);
+        generator.observe_entity("丁", "乙类", &[("人口".to_string(), "9".to_string())]);
+
+        let first = generator.type_member_page("甲类", 0, 1).unwrap();
+        assert_eq!(first.members, vec!["乙"]);
+        assert_eq!(first.next_offset, 1);
+        assert!(!first.done);
+        let second = generator
+            .type_member_page("甲类", first.next_offset, 1)
+            .unwrap();
+        assert_eq!(second.members, vec!["甲"]);
+        assert!(second.done);
+
+        let comparison = generator.compare_types("甲类", "乙类").unwrap();
+        assert_eq!(comparison.shared_predicates, vec!["说明".to_string()]);
+        assert_eq!(comparison.left_only_predicates, vec!["年龄".to_string()]);
+        assert_eq!(comparison.right_only_predicates, vec!["人口".to_string()]);
+        let report = comparison.render();
+        assert!(report.contains("共同谓词（1）：说明"), "{}", report);
+        assert!(report.contains("仅「甲类」（1）：年龄"), "{}", report);
+        assert!(report.contains("仅「乙类」（1）：人口"), "{}", report);
+    }
+
+    #[test]
+    fn test_type_profile_is_stable_across_insertion_orders() {
+        fn build(reverse: bool) -> String {
+            let mut generator = SymbolicGenerator::new(6, 0.3);
+            let mut facts: Vec<(&str, &str, &str)> = vec![
+                ("甲", "朋友", "丙"),
+                ("乙", "朋友", "丁"),
+                ("甲", "年龄", "30"),
+                ("乙", "年龄", "40"),
+            ];
+            if reverse {
+                facts.reverse();
+            }
+            for (subject, predicate, object) in facts {
+                generator.observe_triple(subject, predicate, object);
+            }
+            generator.observe_entity("甲", "人物", &[]);
+            generator.observe_entity("乙", "人物", &[]);
+            generator.type_profile_report("人物").unwrap()
+        }
+        assert_eq!(build(false), build(true));
     }
 }
