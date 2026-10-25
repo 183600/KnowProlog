@@ -1145,6 +1145,17 @@ impl DialogueManager {
         self.push_focus(entity.trim());
     }
 
+    /// 跨会话焦点兜底：快照没有恢复出焦点时，用编年史最近的实体线程移动焦点。
+    /// 只影响下一轮的指代先验，不新增对话轮，也不写任何事实。
+    pub fn note_restored_focus(&mut self, entity: &str) -> bool {
+        let entity = entity.trim();
+        if entity.is_empty() {
+            return false;
+        }
+        self.push_focus(entity);
+        true
+    }
+
     pub fn focus_stack(&self) -> &[String] {
         &self.focus
     }
@@ -5795,5 +5806,16 @@ output = "value"
             "{:?}",
             last.provenance
         );
+    }
+
+    #[test]
+    fn restored_focus_moves_reference_prior_without_new_turn() {
+        let mut manager = DialogueManager::new();
+        let turns = manager.turn_count();
+        assert!(manager.note_restored_focus(" 张三 "));
+        assert_eq!(manager.focus_entity(), Some("张三"));
+        assert_eq!(manager.turn_count(), turns, "恢复焦点不得伪造对话轮");
+        assert!(!manager.note_restored_focus("   "));
+        assert_eq!(manager.focus_entity(), Some("张三"));
     }
 }

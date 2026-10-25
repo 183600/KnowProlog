@@ -7277,6 +7277,33 @@ async fn run_interactive_mode(
             None
         }
     };
+    // 跨会话焦点兜底：只有快照没有恢复出焦点时，才用编年史最近的实体线程。
+    // 显式会话状态永远优先；这里只移动下一轮的指代先验，不新增对话轮。
+    if dialogue_enabled && dialogue_manager.focus_entity().is_none() {
+        if let Some(chronicle) = chronicle.as_ref() {
+            let registry = oxigraph_manager.entity_registry_snapshot();
+            let digest = EntityThreadDigest::build(chronicle, &registry);
+            let candidate = digest
+                .threads
+                .values()
+                .filter(|thread| thread.last_seq.is_some())
+                .max_by(|left, right| {
+                    left.last_seq
+                        .cmp(&right.last_seq)
+                        .then_with(|| right.canonical.cmp(&left.canonical))
+                });
+            if let Some(thread) = candidate {
+                if dialogue_manager.note_restored_focus(&thread.canonical) {
+                    println!(
+                        "已从编年史恢复最近实体焦点：{}（seq {}；无会话快照时兜底）。",
+                        thread.canonical,
+                        thread.last_seq.unwrap_or(0)
+                    );
+                }
+            }
+        }
+    }
+
     // KB 修订号：知识库每发生一次批量变更（导入/撤销）自增，随编年史记录，
     // 用于区分「重演」时的知识漂移（挂钟时间不可断言，序号才是语义时戳）。
     let mut kb_revision: u64 = chronicle
