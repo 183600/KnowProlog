@@ -89,6 +89,7 @@ pub mod nlp;
 pub mod nlu;
 pub mod ontology_alignment;
 pub mod ontology_reasoning;
+pub mod owl_annotation;
 pub mod ownthink_api;
 pub mod path_memory;
 pub mod pattern_closure;

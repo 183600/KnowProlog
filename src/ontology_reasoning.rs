@@ -53,6 +53,14 @@ impl OntologyClosure {
         self.instances.contains(&(x.to_string(), c.to_string())) || self.is_subclass(x, c)
     }
 
+    /// p ⊑ q（闭包含自反：p ⊑ p 恒真）
+    pub fn is_subproperty(&self, p: &str, q: &str) -> bool {
+        self.subproperties
+            .get(p)
+            .map(|supers| supers.contains(q))
+            .unwrap_or(p == q)
+    }
+
     /// 个体 x 的全部所属概念（排序去重）
     pub fn types_of(&self, x: &str) -> Vec<String> {
         let mut types: Vec<String> = self
