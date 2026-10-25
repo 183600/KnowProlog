@@ -14422,6 +14422,23 @@ mod session_tests {
     use std::collections::HashMap;
 
     #[test]
+    fn snapshot_accepts_subject_without_predicate() {
+        let cli = Cli::try_parse_from(["knowprolog", "snapshot", "--subject", "张三"]).unwrap();
+        match cli.command {
+            Some(Commands::Snapshot {
+                subject: Some(subject),
+                predicate: None,
+                ..
+            }) => assert_eq!(subject, "张三"),
+            _ => panic!("应解析为按实体查看快照"),
+        }
+        assert!(
+            Cli::try_parse_from(["knowprolog", "snapshot", "--predicate", "age"]).is_err(),
+            "--predicate 离开 --subject 应报错"
+        );
+    }
+
+    #[test]
     fn semantic_fact_argument_accepts_common_separators() {
         for raw in [
             "张三|height|226",
