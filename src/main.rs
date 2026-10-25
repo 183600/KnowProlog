@@ -6476,6 +6476,7 @@ async fn run_ask(
     // reasoner.answer 之前；一次 ask 的多行输入共享同一会话记忆。
     let mut dialogue = DialogueManager::new();
     dialogue.set_recovery_mode(recovery_mode);
+    let mut lens_cache: Option<(viewpoint::LensCorpus, BTreeSet<String>)> = None;
     let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
     for question in questions {
         // 管道输入常沿用交互脚本的收尾行：不要把它当成待回答的问题。
@@ -6524,6 +6525,17 @@ async fn run_ask(
         }
         // 一次性问答同样只给紧接的一轮开裸回答窗口。
         reasoner.clear_pending_awaiting();
+        if let Some(reply) =
+            ask_with_lens(&question, oxigraph_manager, config, &mut lens_cache).await
+        {
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(reply),
+                derivation: None,
+            });
+            continue;
+        }
         let followup = generation_followup(&question);
         let intro_entity = if followup.is_none() {
             intro_request_entity(&question, &reasoner)
@@ -6640,6 +6652,58 @@ async fn run_ask(
     if strict && answers.iter().any(|answer| answer.answer.is_none()) {
         std::process::exit(1);
     }
+}
+
+async fn ask_with_lens(
+    question: &str,
+    manager: &OxigraphManager,
+    config: &SystemConfig,
+    cache: &mut Option<(viewpoint::LensCorpus, BTreeSet<String>)>,
+) -> Option<String> {
+    if !viewpoint::looks_contextual(question) {
+        return None;
+    }
+    if cache.is_none() {
+        let ledger = manager.load_fusion_ledger().await.unwrap_or_default();
+        let default_facts = manager.load_fact_refs().await.unwrap_or_default();
+        let corpus = viewpoint::LensCorpus::new(&default_facts, &ledger);
+        let mut functional: BTreeSet<String> = manager
+            .predicate_registry_snapshot()
+            .functional_predicates()
+            .into_iter()
+            .collect();
+        for profile in &config.predicate_profiles {
+            if profile.functional {
+                functional.insert(profile.name.clone());
+            }
+        }
+        *cache = Some((corpus, functional));
+    }
+    let (corpus, functional) = cache.as_ref()?;
+    let aliases = corpus.aliases();
+    let cue = viewpoint::detect_lens_cue(question, &aliases)?;
+    let Some(mut query) = viewpoint::extract_slot_query(&cue.question) else {
+        return match cue.scope {
+            viewpoint::LensScope::Default | viewpoint::LensScope::All => None,
+            _ => Some(format!(
+                "已识别到语境限定「{}」，但没能把问句编译成槽位查询；请用 `lens --subject … --predicate … --view …` 明确指定。",
+                cue.surface
+            )),
+        };
+    };
+    let registry = manager.predicate_registry_snapshot();
+    let resolution = registry.resolve(&query.predicate);
+    let mut variants = vec![query.predicate.clone()];
+    if resolution.known {
+        variants.push(resolution.canonical.clone());
+        variants.extend(registry.aliases_of(&resolution.canonical));
+    }
+    query = query.with_predicate_aliases(variants);
+    let is_functional = query
+        .predicates
+        .iter()
+        .any(|predicate| functional.contains(predicate));
+    Some(corpus.query_slot(&cue.scope, &query, is_functional).render())
 }
 
 async fn run_types(
@@ -15720,6 +15784,62 @@ mod session_tests {
             assert!(is_ask_terminator(terminator), "{}", terminator);
         }
         assert!(!is_ask_terminator("为什么退出假设"));
+    }
+
+    #[tokio::test]
+    async fn ask_lens_keeps_source_scope_and_discloses_other_contexts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = OxigraphManager::with_perf_ledger(
+            dir.path().to_str().unwrap(),
+            PerfLedger::shared(),
+        )
+        .unwrap();
+        let namespace = NamespaceRecord::new(
+            "alice",
+            "alice",
+            NamespaceKind::Import,
+            TrustLevel::Imported,
+        );
+        let assertions = vec![know_prolog::knowledge_fusion::ScopedAssertion::new(
+            "alice",
+            "张三",
+            "师傅",
+            "李四",
+            know_prolog::knowledge_fusion::ObjectKind::Literal,
+            "alice.ttl",
+        )];
+        manager
+            .record_namespace_assertions(&namespace, &assertions)
+            .await
+            .unwrap();
+        let config = load_config_from("config.toml").await.unwrap();
+        let mut cache = None;
+
+        let reply = ask_with_lens(
+            "据alice说，张三的师傅是谁",
+            &manager,
+            &config,
+            &mut cache,
+        )
+        .await
+        .expect("来源镜头应接管");
+        assert!(reply.contains("李四"), "{}", reply);
+        assert!(reply.contains("alice"), "{}", reply);
+        assert!(!reply.contains("是 王五"), "{}", reply);
+
+        let reply = ask_with_lens(
+            "知识库里张三的师傅是谁",
+            &manager,
+            &config,
+            &mut cache,
+        )
+        .await
+        .expect("知识库镜头应接管");
+        assert!(reply.contains("没有关于"), "{}", reply);
+        assert!(reply.contains("alice"), "{}", reply);
+
+        let reply = ask_with_lens("张三的师傅是谁", &manager, &config, &mut cache).await;
+        assert!(reply.is_none(), "无语境线索不应接管旧回答路径");
     }
 
     #[test]
