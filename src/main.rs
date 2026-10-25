@@ -1012,6 +1012,7 @@ enum Commands {
         json: bool,
     },
     /// Mine, review, export or import OWL axioms proposed from the graph
+    #[command(disable_help_flag = true)]
     Owl {
         /// Arguments forwarded to the OWL review command
         #[arg(
