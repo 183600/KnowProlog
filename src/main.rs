@@ -31,7 +31,8 @@ use know_prolog::{
     },
     dialogue_manager::{DialogueManager, MoveKind},
     embedding_eval::{
-        compare_baseline, evaluate, triples_from_prolog_facts, EvalBaseline, EvalConfig,
+        compare_baseline, entity_types_from_prolog_facts, evaluate, triples_from_prolog_facts,
+        EvalBaseline, EvalConfig,
     },
     entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
     event_graph::{EventDialogue, EventGraph},
@@ -2698,9 +2699,10 @@ async fn main() {
             update_baseline,
             allow_regression,
             rrf_k,
-        }) => match oxigraph_manager.load_all_relations().await {
-            Ok(relations) => {
-                let triples = triples_from_prolog_facts(&relations);
+        }) => match oxigraph_manager.load_all_facts().await {
+            Ok(facts) => {
+                let triples = triples_from_prolog_facts(&facts);
+                let entity_types = entity_types_from_prolog_facts(&facts);
                 if triples.len() < 2 {
                     eprintln!(
                         "知识库中的关系三元组不足（{} 条），无法评估。可先导入 JSON-LD 知识库。",
@@ -2711,6 +2713,11 @@ async fn main() {
                 let eval_config = EvalConfig {
                     test_ratio_per_mille: test_ratio,
                     rrf_k: rrf_k.max(1.0),
+                    schema: Some(SchemaView::from_config(
+                        &config.type_system,
+                        &config.predicate_profiles,
+                    )),
+                    entity_types,
                     ..Default::default()
                 };
                 let report = evaluate(&triples, &eval_config);

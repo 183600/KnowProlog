@@ -9,12 +9,14 @@
 //!
 //! 评估方式为标准过滤式链接预测（object prediction）：
 //!   对每条留出三元组 (s, p, o)，在被全图过滤掉其他真值的候选集上排序，
-//!   统计 MRR / Hits@1 / Hits@3 / Hits@10。五个通道：
+//!   统计 MRR / Hits@1 / Hits@3 / Hits@10。可用通道（无 schema 时省略 RDFS 两项）：
 //!   - `ppr`：图游走重启的结构分量（`GraphWalkEmbedding`）
 //!   - `ppmi`：可命名特征的稀疏嵌入余弦（`SymbolicEmbedding`）
+//!   - `ppmi_rdfs`：同一嵌入接入 RDFS 类型闭包/子属性上浮后的余弦
 //!   - `holo`：全息记忆的键控软召回（`HolographicMemory`，谓词敏感的硬核查通道）
 //!   - `rule`：Horn 规则挖掘（`LinkPredictor`，组合/逆向/共邻）
-//!   - `fused`：四通道倒数排名融合（RRF，k=60，无权重学习）
+//!   - `rdfs`：定义域/值域与实体类型的三值相容性排序
+//!   - `fused`：可用通道的倒数排名融合（RRF，k=60，无权重学习）
 //!
 //! 另给 Holo top-1 置信分做固定分桶校准（命中率按分桶单调即为有信号）；
 //! 并用「训练对已知 + 留出对补全」的同谓词结构题（A:B::C:?）评估
@@ -30,6 +32,7 @@ use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
 use crate::link_prediction::LinkPredictor;
 use crate::prolog_engine::PrologFact;
+use crate::schema_view::{SchemaCoverage, SchemaView};
 use crate::semantic_embedding::SymbolicEmbedding;
 
 /// 基线 JSON 的格式版本。
@@ -87,6 +90,27 @@ pub fn triples_from_prolog_facts(facts: &[PrologFact]) -> Vec<EvalTriple> {
             _ => None,
         })
         .collect()
+}
+
+/// 从整图实体事实提取显式类型（可与训练关系一起用于类型闭包推断）。
+pub fn entity_types_from_prolog_facts(facts: &[PrologFact]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for fact in facts {
+        if let PrologFact::Entity {
+            name, entity_type, ..
+        } = fact
+        {
+            let name = name.trim();
+            let entity_type = entity_type.trim();
+            if !name.is_empty() && !entity_type.is_empty() {
+                types
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(entity_type.to_string());
+            }
+        }
+    }
+    types
 }
 
 /// 每个谓词在划分中的样本数。
@@ -348,17 +372,21 @@ impl MetricAcc {
 pub enum EvalChannel {
     Ppr,
     Ppmi,
+    PpmiRdfs,
     Holo,
     Rule,
+    Rdfs,
     Fused,
 }
 
 impl EvalChannel {
-    pub const ALL: [EvalChannel; 5] = [
+    pub const ALL: [EvalChannel; 7] = [
         EvalChannel::Ppr,
         EvalChannel::Ppmi,
+        EvalChannel::PpmiRdfs,
         EvalChannel::Holo,
         EvalChannel::Rule,
+        EvalChannel::Rdfs,
         EvalChannel::Fused,
     ];
 
@@ -367,8 +395,10 @@ impl EvalChannel {
         match self {
             EvalChannel::Ppr => "ppr",
             EvalChannel::Ppmi => "ppmi",
+            EvalChannel::PpmiRdfs => "ppmi_rdfs",
             EvalChannel::Holo => "holo",
             EvalChannel::Rule => "rule",
+            EvalChannel::Rdfs => "rdfs",
             EvalChannel::Fused => "fused",
         }
     }
@@ -377,10 +407,17 @@ impl EvalChannel {
         match self {
             EvalChannel::Ppr => "PPR（图游走结构）",
             EvalChannel::Ppmi => "PPMI（可命名特征）",
+            EvalChannel::PpmiRdfs => "PPMI+RDFS（类型闭包）",
             EvalChannel::Holo => "HOLO（全息软召回）",
             EvalChannel::Rule => "RULE（Horn规则挖掘）",
-            EvalChannel::Fused => "FUSED（四通道RRF）",
+            EvalChannel::Rdfs => "RDFS（域值域三值相容）",
+            EvalChannel::Fused => "FUSED（可用通道RRF）",
         }
+    }
+
+    /// 该通道是否依赖 RDFS 模式视图；无 schema 时报告中省略。
+    pub fn requires_schema(self) -> bool {
+        matches!(self, EvalChannel::PpmiRdfs | EvalChannel::Rdfs)
     }
 }
 
@@ -397,6 +434,10 @@ pub struct EvalConfig {
     pub rule_min_support: usize,
     pub rule_min_confidence: f64,
     pub analogy_max_per_predicate: usize,
+    /// 可选的 RDFS 模式视图；缺省时保持旧版盲 PPMI 评估。
+    pub schema: Option<SchemaView>,
+    /// 显式实体类型（关系端点之外的 `rdf:type` 侧信息）。
+    pub entity_types: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for EvalConfig {
@@ -412,6 +453,8 @@ impl Default for EvalConfig {
             rule_min_support: 2,
             rule_min_confidence: 0.6,
             analogy_max_per_predicate: 50,
+            schema: None,
+            entity_types: BTreeMap::new(),
         }
     }
 }
@@ -478,6 +521,10 @@ pub struct EvalReport {
     pub calibration: Vec<CalibrationBin>,
     /// 主体=客体的自环测试三元组（不参与排序）。
     pub skipped_self_loops: usize,
+    /// RDFS 模式覆盖率（仅当评估配置携带 schema）。
+    pub schema_coverage: Option<SchemaCoverage>,
+    /// 评估所用 schema 的摘要（用于复现与漂移审计）。
+    pub schema_digest: Option<String>,
 }
 
 impl EvalReport {
@@ -509,22 +556,43 @@ impl EvalReport {
                 self.skipped_self_loops
             ));
         }
+        if let (Some(coverage), Some(digest)) = (&self.schema_coverage, &self.schema_digest) {
+            output.push_str(&format!("schema 摘要: {}\n", digest));
+            output.push_str(&coverage.render_text());
+        }
 
         output.push_str("\n通道指标（过滤式链接预测，按客体排序）:\n");
+        let channel_width = EvalChannel::ALL
+            .into_iter()
+            .filter(|channel| !channel.requires_schema() || self.schema_coverage.is_some())
+            .map(|channel| channel.id().len())
+            .max()
+            .unwrap_or(6)
+            .max(6);
         output.push_str(&format!(
-            "  {:<6} {:>6} {:>8} {:>8} {:>8} {:>8}\n",
-            "通道", "查询", "MRR", "Hits@1", "Hits@3", "Hits@10"
+            "  {:<width$} {:>6} {:>8} {:>8} {:>8} {:>8}\n",
+            "通道",
+            "查询",
+            "MRR",
+            "Hits@1",
+            "Hits@3",
+            "Hits@10",
+            width = channel_width
         ));
         for channel in EvalChannel::ALL {
+            if channel.requires_schema() && self.schema_coverage.is_none() {
+                continue;
+            }
             if let Some(metrics) = self.channel_metrics(channel) {
                 output.push_str(&format!(
-                    "  {:<6} {:>6} {:>8.4} {:>7.1}% {:>7.1}% {:>7.1}%\n",
+                    "  {:<width$} {:>6} {:>8.4} {:>7.1}% {:>7.1}% {:>7.1}%\n",
                     channel.id(),
                     metrics.queries,
                     metrics.mrr,
                     metrics.hits1_rate * 100.0,
                     metrics.hits3_rate * 100.0,
-                    metrics.hits10_rate * 100.0
+                    metrics.hits10_rate * 100.0,
+                    width = channel_width
                 ));
             }
         }
@@ -533,10 +601,22 @@ impl EvalReport {
             "\n按谓词（Hits@10；n<{} 标注为样本不足）:\n",
             config.low_sample_threshold
         ));
-        output.push_str(&format!(
-            "  {:<16} {:>5} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
-            "谓词", "训练", "测试", "ppr", "ppmi", "holo", "rule", "fused"
-        ));
+        let visible_channels: Vec<EvalChannel> = EvalChannel::ALL
+            .into_iter()
+            .filter(|channel| !channel.requires_schema() || self.schema_coverage.is_some())
+            .collect();
+        let metric_width = visible_channels
+            .iter()
+            .map(|channel| channel.id().len())
+            .max()
+            .unwrap_or(8)
+            .max(8);
+        let mut header = format!("  {:<16} {:>5} {:>5}", "谓词", "训练", "测试");
+        for channel in &visible_channels {
+            header.push_str(&format!(" {:>width$}", channel.id(), width = metric_width));
+        }
+        output.push_str(&header);
+        output.push('\n');
         for (predicate, samples) in &self.predicate_samples {
             let metrics = self.per_predicate.get(predicate);
             let mut row = format!(
@@ -545,11 +625,17 @@ impl EvalReport {
                 samples.train,
                 samples.test
             );
-            for channel in EvalChannel::ALL {
+            for channel in &visible_channels {
                 let value = metrics
                     .and_then(|map| map.get(channel.id()))
-                    .map(|m| format!("{:>7.1}%", m.hits10_rate * 100.0))
-                    .unwrap_or_else(|| "      -".to_string());
+                    .map(|m| {
+                        format!(
+                            "{:>width$.1}%",
+                            m.hits10_rate * 100.0,
+                            width = metric_width - 1
+                        )
+                    })
+                    .unwrap_or_else(|| format!("{:>width$}", "-", width = metric_width));
                 row.push(' ');
                 row.push_str(&value);
             }
@@ -564,18 +650,26 @@ impl EvalReport {
         }
 
         output.push_str("\n按主体度数（Hits@10）:\n");
-        output.push_str(&format!(
-            "  {:<8} {:>5} {:>5} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
-            "度数", "查询", "—", "ppr", "ppmi", "holo", "rule", "fused"
-        ));
+        let mut header = format!("  {:<8} {:>5} {:>5}", "度数", "查询", "—");
+        for channel in &visible_channels {
+            header.push_str(&format!(" {:>width$}", channel.id(), width = metric_width));
+        }
+        output.push_str(&header);
+        output.push('\n');
         for (bucket, metrics) in &self.per_degree {
             let queries = metrics.values().next().map(|m| m.queries).unwrap_or(0);
             let mut row = format!("  {:<8} {:>5} {:>5}", bucket, queries, "");
-            for channel in EvalChannel::ALL {
+            for channel in &visible_channels {
                 let value = metrics
                     .get(channel.id())
-                    .map(|m| format!("{:>7.1}%", m.hits10_rate * 100.0))
-                    .unwrap_or_else(|| "      -".to_string());
+                    .map(|m| {
+                        format!(
+                            "{:>width$.1}%",
+                            m.hits10_rate * 100.0,
+                            width = metric_width - 1
+                        )
+                    })
+                    .unwrap_or_else(|| format!("{:>width$}", "-", width = metric_width));
                 row.push(' ');
                 row.push_str(&value);
             }
@@ -689,15 +783,58 @@ pub fn evaluate_split(
         candidate_count,
     );
     let mut predictor = LinkPredictor::new();
+    let mut schema_embedding = config.schema.as_ref().map(|schema| {
+        let mut embedding = SymbolicEmbedding::new(0.0);
+        embedding.set_schema(Some(schema.clone()));
+        embedding
+    });
     for triple in &split.train {
         walks.observe_triple(&triple.subject, &triple.predicate, &triple.object);
         embedding.observe_triple(&triple.subject, &triple.predicate, &triple.object);
+        if let Some(schema_embedding) = schema_embedding.as_mut() {
+            schema_embedding.observe_triple(&triple.subject, &triple.predicate, &triple.object);
+        }
         holo.observe_triple(&triple.subject, &triple.predicate, &triple.object);
         predictor.add_triple(&triple.subject, &triple.predicate, &triple.object);
     }
     walks.rebuild();
     embedding.rebuild();
+    if let Some(schema_embedding) = schema_embedding.as_mut() {
+        schema_embedding.rebuild();
+    }
     predictor.mine_rules(config.rule_min_support, config.rule_min_confidence);
+
+    // 类型只从训练关系与调用方给出的显式 `rdf:type` 推断；留出边不参与。
+    let training_relations: Vec<(String, String, String)> = split
+        .train
+        .iter()
+        .map(|triple| {
+            (
+                triple.subject.clone(),
+                triple.predicate.clone(),
+                triple.object.clone(),
+            )
+        })
+        .collect();
+    let inferred_types = config
+        .schema
+        .as_ref()
+        .map(|schema| schema.infer_entity_types(&training_relations, &config.entity_types));
+    let all_relations: Vec<(String, String, String)> = all_triples
+        .iter()
+        .map(|triple| {
+            (
+                triple.subject.clone(),
+                triple.predicate.clone(),
+                triple.object.clone(),
+            )
+        })
+        .collect();
+    let schema_coverage = config
+        .schema
+        .as_ref()
+        .map(|schema| schema.coverage(&all_relations, &config.entity_types));
+    let schema_digest = config.schema.as_ref().map(SchemaView::digest);
 
     // 训练集度数（结构分层用；不引入留出边）。
     let mut adjacency: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -782,6 +919,18 @@ pub fn evaluate_split(
             }
         }
 
+        // 通道 3b：schema-aware PPMI（类型闭包 + 子属性上浮后的余弦）。
+        let mut ppmi_rdfs_scores = vec![i64::MIN; n];
+        if let Some(schema_embedding) = schema_embedding.as_ref() {
+            for (index, candidate) in candidates.iter().enumerate() {
+                if index == subject_index || !schema_embedding.is_embedded(candidate) {
+                    continue;
+                }
+                let score = schema_embedding.similarity(&triple.subject, candidate);
+                ppmi_rdfs_scores[index] = score_key(score);
+            }
+        }
+
         // 通道 4：Horn 规则挖掘（谓词敏感；同一客体取最高置信度）。
         let mut rule_scores = vec![i64::MIN; n];
         for prediction in predictor.predict_for_entity(&triple.subject, Some(&triple.predicate), n)
@@ -797,13 +946,28 @@ pub fn evaluate_split(
             }
         }
 
+        // 通道 5：RDFS 定义域/值域三值相容性（只对已类型化候选给证据）。
+        let mut rdfs_scores = vec![i64::MIN; n];
+        if let (Some(schema), Some(inferred)) = (config.schema.as_ref(), inferred_types.as_ref()) {
+            rdfs_scores = rdfs_channel_scores(schema, inferred, &triple.predicate, &candidates);
+        }
+
         let ppr_ranking = rank_channel(&candidates, &ppr_scores, &excluded);
         let ppmi_ranking = rank_channel(&candidates, &ppmi_scores, &excluded);
+        let ppmi_rdfs_ranking = rank_channel(&candidates, &ppmi_rdfs_scores, &excluded);
         let holo_ranking = rank_channel(&candidates, &holo_scores, &excluded);
         let rule_ranking = rank_channel(&candidates, &rule_scores, &excluded);
+        let rdfs_ranking = rank_channel(&candidates, &rdfs_scores, &excluded);
         let non_excluded = excluded.iter().filter(|flag| !**flag).count().max(1);
 
-        // 通道 5：RRF 融合（只用「有证据」通道的名次；无任何证据的候选排最后）。
+        // 通道 6：RRF 融合（只用「有证据」通道的名次；无任何证据的候选排最后）。
+        // schema 缺席时不把两个 schema 通道塞进融合，保持旧版盲通道对照。
+        let mut fusion_rankings: Vec<&ChannelRanking> =
+            vec![&ppr_ranking, &ppmi_ranking, &holo_ranking, &rule_ranking];
+        if config.schema.is_some() {
+            fusion_rankings.push(&ppmi_rdfs_ranking);
+            fusion_rankings.push(&rdfs_ranking);
+        }
         let mut fused_scores = vec![i64::MIN; n];
         for index in 0..n {
             if excluded[index] {
@@ -811,7 +975,7 @@ pub fn evaluate_split(
             }
             let mut sum = 0.0;
             let mut has_evidence = false;
-            for ranking in [&ppr_ranking, &ppmi_ranking, &holo_ranking, &rule_ranking] {
+            for ranking in &fusion_rankings {
                 if ranking.ranks[index] > 0 {
                     sum += 1.0 / (config.rrf_k + ranking.ranks[index] as f64);
                     has_evidence = true;
@@ -832,7 +996,7 @@ pub fn evaluate_split(
             }
         }
 
-        let ranks = [
+        let mut ranks = vec![
             (
                 EvalChannel::Ppr,
                 effective_rank(&ppr_ranking, object_index, non_excluded),
@@ -849,11 +1013,21 @@ pub fn evaluate_split(
                 EvalChannel::Rule,
                 effective_rank(&rule_ranking, object_index, non_excluded),
             ),
-            (
-                EvalChannel::Fused,
-                effective_rank(&fused_ranking, object_index, non_excluded),
-            ),
         ];
+        if config.schema.is_some() {
+            ranks.push((
+                EvalChannel::PpmiRdfs,
+                effective_rank(&ppmi_rdfs_ranking, object_index, non_excluded),
+            ));
+            ranks.push((
+                EvalChannel::Rdfs,
+                effective_rank(&rdfs_ranking, object_index, non_excluded),
+            ));
+        }
+        ranks.push((
+            EvalChannel::Fused,
+            effective_rank(&fused_ranking, object_index, non_excluded),
+        ));
         let predicate_entry = per_predicate.entry(triple.predicate.clone()).or_default();
         let degree = adjacency
             .get(triple.subject.as_str())
@@ -998,7 +1172,44 @@ pub fn evaluate_split(
         analogy,
         calibration,
         skipped_self_loops,
+        schema_coverage,
+        schema_digest,
     }
+}
+
+/// RDFS 通道：候选类型的闭包若命中谓词值域则加分；可证明互斥则减分；
+/// 已类型化但无法判定时只给弱证据。无类型候选不参与该通道。
+fn rdfs_channel_scores(
+    schema: &SchemaView,
+    inferred: &BTreeMap<String, BTreeSet<String>>,
+    predicate: &str,
+    candidates: &[String],
+) -> Vec<i64> {
+    let ranges = schema.range_classes(predicate);
+    let mut scores = vec![i64::MIN; candidates.len()];
+    if ranges.is_empty() {
+        return scores;
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(types) = inferred.get(candidate) else {
+            continue;
+        };
+        if types.is_empty() {
+            continue;
+        }
+        let matched = types.iter().any(|actual| ranges.contains(actual));
+        if matched {
+            scores[index] = score_key(2.0);
+            continue;
+        }
+        let disjoint = types.iter().any(|actual| {
+            ranges
+                .iter()
+                .any(|expected| schema.types_disjoint(actual, expected))
+        });
+        scores[index] = score_key(if disjoint { -2.0 } else { 0.25 });
+    }
+    scores
 }
 
 /// 单通道名次：`ranks[i] = 0` 表示该候选没有任何证据（量化分为 i64::MIN），
@@ -1059,6 +1270,9 @@ pub struct EvalBaseline {
     /// 类比通道 ID → 指标；该字段缺失时视为空。
     #[serde(default)]
     pub analogy: BTreeMap<String, EvalMetrics>,
+    /// 评估所用 schema 摘要；旧基线缺省时不做 schema 漂移判定。
+    #[serde(default)]
+    pub schema_digest: Option<String>,
 }
 
 impl EvalBaseline {
@@ -1069,6 +1283,7 @@ impl EvalBaseline {
             test_ratio_per_mille: report.test_ratio_per_mille,
             channels: report.channels.clone(),
             analogy: report.analogy.clone(),
+            schema_digest: report.schema_digest.clone(),
         }
     }
 
@@ -1112,7 +1327,7 @@ impl RatchetVerdict {
         } else {
             output.push_str("棘轮检查未通过：\n");
             if !self.digest_matches {
-                output.push_str("  - 划分摘要不匹配：留出集已漂移，基线不可直接比较\n");
+                output.push_str("  - 划分或 schema 摘要不匹配：评估条件已漂移，基线不可直接比较\n");
             }
             for drop in &self.drops {
                 output.push_str(&format!(
@@ -1132,14 +1347,18 @@ impl RatchetVerdict {
     }
 }
 
-/// 与基线比较：任何指标跌幅超过 ε、或划分摘要不同，即不通过。
+/// 与基线比较：任何指标跌幅超过 ε、划分摘要不同、或基线记录的 schema 已漂移，
+/// 即不通过。旧基线没有 `schema_digest` 时保持向后兼容，不判漂移。
 pub fn compare_baseline(
     baseline: &EvalBaseline,
     current: &EvalReport,
     epsilon: f64,
 ) -> RatchetVerdict {
+    let schema_matches =
+        baseline.schema_digest.is_none() || baseline.schema_digest == current.schema_digest;
     let digest_matches = baseline.split_digest == current.split_digest
-        && baseline.test_ratio_per_mille == current.test_ratio_per_mille;
+        && baseline.test_ratio_per_mille == current.test_ratio_per_mille
+        && schema_matches;
     let mut drops = Vec::new();
     let mut gains = Vec::new();
 
@@ -1617,6 +1836,78 @@ mod tests {
         ];
         let triples = triples_from_prolog_facts(&facts);
         assert_eq!(triples, vec![EvalTriple::new("甲", "认识", "乙")]);
+        let types = entity_types_from_prolog_facts(&facts);
+        assert_eq!(
+            types.get("甲").cloned().unwrap_or_default(),
+            BTreeSet::from(["Person".to_string()])
+        );
+    }
+
+    #[test]
+    fn schema_channels_rank_type_compatible_object_and_report_coverage() {
+        let mut schema = SchemaView::new();
+        schema.declare_subclass("学生", "人物");
+        schema.declare_disjoint("人物", "地点");
+        schema.declare_domain("师傅", "人物");
+        schema.declare_range("师傅", "人物");
+        let mut entity_types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        entity_types.insert("p4".into(), BTreeSet::from(["人物".to_string()]));
+        entity_types.insert("c1".into(), BTreeSet::from(["地点".to_string()]));
+        let config = EvalConfig {
+            schema: Some(schema),
+            entity_types,
+            ..fast_config()
+        };
+        let train = vec![
+            EvalTriple::new("p1", "同事", "p2"),
+            EvalTriple::new("p2", "同事", "p3"),
+        ];
+        let test = vec![EvalTriple::new("p3", "师傅", "p4")];
+        let mut all = train.clone();
+        all.extend(test.clone());
+        all.push(EvalTriple::new("c1", "同事", "p1"));
+        let split = HoldoutSplit {
+            train,
+            test,
+            digest: "schema".into(),
+            test_ratio_per_mille: 0,
+            predicate_samples: BTreeMap::new(),
+        };
+        let report = evaluate_split(&split, &all, &config);
+        let rdfs = report.channel_metrics(EvalChannel::Rdfs).unwrap();
+        assert_eq!(rdfs.queries, 1);
+        assert_eq!(rdfs.hits1_rate, 1.0, "值域相容的人物应排在地点之前");
+        assert!(report.schema_coverage.is_some());
+        assert!(report.schema_digest.is_some());
+        let text = report.render_text(&config);
+        assert!(text.contains("RDFS 模式覆盖率"), "报告应给出 schema 覆盖率");
+        assert!(text.contains("ppmi_rdfs"), "有 schema 时应列出 schema 通道");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("训练") && line.contains(" rdfs")),
+            "表头应包含 RDFS 通道"
+        );
+        let baseline = EvalBaseline::from_report(&report);
+        assert_eq!(baseline.schema_digest, report.schema_digest);
+        assert!(compare_baseline(&baseline, &report, 1e-6).passed);
+        let mut drifted = report.clone();
+        drifted.schema_digest = Some("schema-drift".into());
+        let verdict = compare_baseline(&baseline, &drifted, 1e-6);
+        assert!(!verdict.passed);
+        assert!(!verdict.digest_matches, "schema 漂移应使基线不可比");
+    }
+
+    #[test]
+    fn schema_channels_are_hidden_without_a_schema_view() {
+        let report = evaluate(&sample_triples(), &fast_config());
+        assert!(report.schema_coverage.is_none());
+        assert_eq!(
+            report.channel_metrics(EvalChannel::Rdfs).unwrap().queries,
+            0
+        );
+        let text = report.render_text(&fast_config());
+        assert!(!text.contains("ppmi_rdfs"));
+        assert!(!text.contains("RDFS 模式覆盖率"));
     }
 
     #[test]
