@@ -249,6 +249,22 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Compile the bidirectional semantic rule pack, preview extraction or
+    /// realization, and verify round-trip consistency (offline; no store)
+    Grammar {
+        /// Natural-language text to read with the configured rule pack
+        #[arg(conflicts_with = "fact")]
+        text: Option<String>,
+        /// Fact to realize as "subject|predicate|value" (or whitespace separated)
+        #[arg(long, conflicts_with = "text")]
+        fact: Option<String>,
+        /// Re-read every realized sentence and require the same fact back
+        #[arg(long)]
+        roundtrip: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect or extend the persistent predicate registry: observed
     /// predicates, pending admissions, aliases, inverses and functional marks
     Predicates {
@@ -1159,6 +1175,18 @@ async fn main() {
             *json,
             &config,
         );
+        return;
+    }
+
+    // 双向语义语法只读配置与文本：不打开知识存储，可检查抽取/生成往返。
+    if let Some(Commands::Grammar {
+        text,
+        fact,
+        roundtrip,
+        json,
+    }) = &cli.command
+    {
+        run_semantic_grammar(text.as_deref(), fact.as_deref(), *roundtrip, *json, &config);
         return;
     }
 
@@ -2599,6 +2627,7 @@ async fn main() {
         // 已在打开存储前处理（见 main 顶部早期分派，无需知识存储）
         Some(Commands::Events { .. }) => {}
         Some(Commands::ReadTrace { .. }) => {}
+        Some(Commands::Grammar { .. }) => {}
         Some(Commands::Frontier { .. }) => {}
         Some(Commands::EvalRecall { .. }) => {}
         Some(Commands::Forge { .. }) => {}
@@ -4532,6 +4561,160 @@ fn run_events(
     }
     if prolog {
         print!("{}", graph.to_prolog_program());
+    }
+}
+
+
+/// 解析 `--fact`：支持竖线、制表、逗号与空白分隔。
+fn parse_semantic_fact(raw: &str) -> Option<know_prolog::provenance::FactRef> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = if raw.contains('|') {
+        raw.splitn(3, '|').collect()
+    } else if raw.contains('\t') {
+        raw.splitn(3, '\t').collect()
+    } else if raw.split_whitespace().count() == 3 {
+        raw.split_whitespace().collect()
+    } else if raw.matches(',').count() >= 2 {
+        raw.splitn(3, ',').collect()
+    } else {
+        raw.splitn(3, '，').collect()
+    };
+    let parts: Vec<&str> = parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some(know_prolog::provenance::FactRef::new(
+        parts[0], parts[1], parts[2],
+    ))
+}
+
+fn run_semantic_grammar(
+    text: Option<&str>,
+    fact: Option<&str>,
+    roundtrip: bool,
+    json: bool,
+    config: &know_prolog::SystemConfig,
+) {
+    let pack = know_prolog::semantic_grammar::RulePack::from_config(config);
+    let mut hits = Vec::new();
+    let mut trips = Vec::new();
+    let mut target_fact = None;
+
+    if let Some(text) = text {
+        hits = pack.extract_text(text, &config.nlp);
+    } else if let Some(raw) = fact {
+        match parse_semantic_fact(raw) {
+            Some(parsed) => target_fact = Some(parsed),
+            None => {
+                eprintln!("无法解析事实「{}」：请写成 subject|predicate|value", raw);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let mut realized = Vec::new();
+    if let Some(target) = &target_fact {
+        if let Some(realization) = pack.realize_fact(target) {
+            realized.push((target.clone(), realization));
+        }
+    } else {
+        for hit in &hits {
+            if let Some(realization) = pack.realize_fact(&hit.fact) {
+                realized.push((hit.fact.clone(), realization));
+            }
+        }
+    }
+    if roundtrip {
+        for (target, _) in &realized {
+            if let Some(trip) = pack.roundtrip(target, &config.nlp) {
+                trips.push(trip);
+            }
+        }
+    }
+
+    let failed_roundtrips = trips.iter().filter(|trip| !trip.consistent).count();
+    if json {
+        let value = serde_json::json!({
+            "enabled": config.semantic_grammar.enabled,
+            "rules": pack.len(),
+            "errors": pack.errors(),
+            "text": text,
+            "hits": hits,
+            "realizations": realized
+                .iter()
+                .map(|(_, realization)| realization)
+                .collect::<Vec<_>>(),
+            "roundtrips": trips,
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(output) => println!("{}", output),
+            Err(error) => {
+                eprintln!("语义语法报告序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!(
+            "双向语义规则包：{} 条规则，运行开关：{}",
+            pack.len(),
+            if config.semantic_grammar.enabled {
+                "开"
+            } else {
+                "关（预览模式）"
+            }
+        );
+        if text.is_none() && fact.is_none() {
+            println!("{}", pack.render());
+        }
+        for error in pack.errors() {
+            eprintln!("编译错误 {}", error.render());
+        }
+        for hit in &hits {
+            println!(
+                "- [{}] {}（token {}..{}）",
+                hit.rule,
+                hit.fact.display(),
+                hit.start,
+                hit.end
+            );
+        }
+        for (target, realization) in &realized {
+            println!(
+                "  {} ⇒ {}（规则 {}）",
+                target.display(),
+                realization.text,
+                realization.rule
+            );
+        }
+        for trip in &trips {
+            println!(
+                "  往返 {}：{} ⇒ {}",
+                if trip.consistent { "一致" } else { "不一致" },
+                trip.text,
+                trip.recovered
+                    .as_ref()
+                    .map(|recovered| recovered.display())
+                    .unwrap_or_else(|| "（未抽回）".to_string())
+            );
+        }
+        if hits.is_empty() && text.is_some() {
+            println!("（没有规则命中该文本）");
+        }
+        if let Some(target) = &target_fact {
+            if !realized.iter().any(|(value, _)| value == target) {
+                println!("（没有带 realize 模板的规则可生成该事实）");
+            }
+        }
+    }
+    if !pack.errors().is_empty() || failed_roundtrips > 0 {
+        std::process::exit(1);
     }
 }
 
@@ -14084,6 +14267,17 @@ async fn continue_original_query(
 mod session_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn semantic_fact_argument_accepts_common_separators() {
+        for raw in ["张三|height|226", "张三 height 226", "张三,height,226", "张三，height，226"] {
+            let fact = parse_semantic_fact(raw).unwrap();
+            assert_eq!(fact.subject, "张三");
+            assert_eq!(fact.predicate, "height");
+            assert_eq!(fact.value, "226");
+        }
+        assert!(parse_semantic_fact("只有两个|字段").is_none());
+    }
 
     #[test]
     fn store_override_isolates_relative_dialogue_state() {
