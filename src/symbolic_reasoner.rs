@@ -10126,10 +10126,16 @@ impl SymbolicReasoner {
     }
 
     fn answer_planned(&self, question: &str) -> Option<String> {
-        if let Some(answer) = self.answer_compiled(question) {
-            return Some(answer);
+        let compiled = self.answer_compiled(question);
+        if compiled
+            .as_deref()
+            .is_some_and(|answer| !Self::is_pending_failure(answer))
+        {
+            return compiled;
         }
-        self.answer_anchored(question)
+        // 精确路径只给出「没有记录」时，错别字/别名问句仍应有机会走锚定；
+        // 若锚定也拿不到确证答案，再保留原失败答复，避免改变既有语义。
+        self.answer_anchored(question).or(compiled)
     }
 
     /// 精确词表路径：句法规划器优先，其次句法重写器。
@@ -17872,6 +17878,24 @@ mod tests {
             .answer("张山的师傅是谁")
             .expect("单跳错别字问句应被锚定重写救回");
         assert!(answer.contains("李四"), "实际回答：{}", answer);
+    }
+
+    #[test]
+    fn test_query_anchor_recovers_after_pending_failure() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let mut facts = master_facts();
+        facts.push(PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "认识".to_string(),
+            to: "李四".to_string(),
+        });
+        reasoner.observe_facts(&facts);
+        let exact = reasoner.answer("张山认识谁");
+        assert!(
+            exact.as_deref().is_some_and(|answer| answer.contains("李四")),
+            "精确路径先报无记录时仍应尝试锚定：{:?}",
+            exact
+        );
     }
 
     #[test]
