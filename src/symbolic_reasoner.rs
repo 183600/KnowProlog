@@ -10127,14 +10127,16 @@ impl SymbolicReasoner {
 
     fn answer_planned(&self, question: &str) -> Option<String> {
         let compiled = self.answer_compiled(question);
-        if compiled
-            .as_deref()
-            .is_some_and(|answer| !Self::is_pending_failure(answer))
-        {
+        let should_anchor = match compiled.as_deref() {
+            None => true,
+            Some(answer) => Self::is_missing_record(answer),
+        };
+        if !should_anchor {
             return compiled;
         }
         // 精确路径只给出「没有记录」时，错别字/别名问句仍应有机会走锚定；
-        // 若锚定也拿不到确证答案，再保留原失败答复，避免改变既有语义。
+        // 歧义、无法证明等失败不进入，避免绕过澄清或证明边界。若锚定也
+        // 拿不到确证答案，再保留原失败答复。
         self.answer_anchored(question).or(compiled)
     }
 
@@ -11564,6 +11566,16 @@ impl SymbolicReasoner {
         self.pending_questions.clear_awaiting();
         self.pending_questions.replace(unresolved);
         (!resolved.is_empty()).then(|| resolved.join("\n"))
+    }
+
+    /// 只把「查无记录」视为可继续尝试锚定的失败；歧义/未证明等失败
+    /// 必须原样返回，不能靠改写绕过。
+    fn is_missing_record(text: &str) -> bool {
+        text.contains("没有记录")
+            || text.contains("没有相关记录")
+            || text.contains("没有可用依据")
+            || text.contains("数量为 0")
+            || text.contains("未能回答")
     }
 
     fn is_pending_failure(text: &str) -> bool {
