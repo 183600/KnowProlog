@@ -8,8 +8,11 @@ use crate::knowledge_fusion::{
 };
 use crate::provenance::FactRef;
 use crate::query_planner::{QueryPlan, QueryPlanner};
+use crate::symbolic_reasoner::{DialogueSnapshot, SnapshotAtom};
 
 pub const DEFAULT_CONTEXT_ID: &str = "default";
+pub const SESSION_CONTEXT_ID: &str = "dialogue-session";
+pub const HYPOTHESIS_CONTEXT_ID: &str = "dialogue-hypothesis";
 
 const DEFAULT_NAMES: [&str; 8] = [
     "知识库",
@@ -486,15 +489,117 @@ impl LensCorpus {
                 object_kind: assertion.object_kind,
             });
         }
-        facts.sort_by(|left, right| fact_sort_key(left).cmp(&fact_sort_key(right)));
-        facts.dedup_by(|left, right| fact_sort_key(left) == fact_sort_key(right));
-        contexts.sort_by(|left, right| {
+        let mut corpus = Self { facts, contexts };
+        corpus.finish();
+        corpus
+    }
+
+    /// 在融合来源之外，把持久化对话状态里的会话事实与当前假设也纳入镜头。
+    ///
+    /// 这两层是运行时信念（不写知识图谱），但用户会自然地问「会话里呢 /
+    /// 假设里呢」。`--dialogue-state` 让离线镜头查询看到与交互会话相同的
+    /// 会话层和假设世界，而不是把它们误报成未知。
+    pub fn with_dialogue(
+        default_facts: &[FactRef],
+        ledger: &FusionLedger,
+        snapshot: &DialogueSnapshot,
+    ) -> Self {
+        let mut corpus = Self::new(default_facts, ledger);
+        corpus.add_virtual_context(
+            SESSION_CONTEXT_ID,
+            "本次会话",
+            NamespaceKind::Session,
+            TrustLevel::Verified,
+            NamespaceStatus::Active,
+            20,
+            &snapshot.session_facts,
+            "会话事实",
+        );
+        corpus.add_virtual_context(
+            HYPOTHESIS_CONTEXT_ID,
+            "当前假设",
+            NamespaceKind::Hypothesis,
+            TrustLevel::Speculative,
+            NamespaceStatus::Active,
+            30,
+            &snapshot.assumptions,
+            "假设世界",
+        );
+        corpus.finish();
+        corpus
+    }
+
+    fn add_virtual_context(
+        &mut self,
+        id: &str,
+        label: &str,
+        kind: NamespaceKind,
+        trust: TrustLevel,
+        status: NamespaceStatus,
+        priority: i64,
+        atoms: &[SnapshotAtom],
+        source: &str,
+    ) {
+        let facts: Vec<LensFact> = atoms
+            .iter()
+            .filter_map(|atom| {
+                if atom.predicate.trim().is_empty() || atom.terms.len() != 2 {
+                    return None;
+                }
+                if atom.terms.iter().any(|term| term.trim().is_empty()) {
+                    return None;
+                }
+                Some(LensFact {
+                    fact: FactRef::new(&atom.terms[0], &atom.predicate, &atom.terms[1]),
+                    context: LensContext {
+                        id: id.to_string(),
+                        label: label.to_string(),
+                        kind,
+                        trust,
+                        status,
+                        priority,
+                    },
+                    source: source.to_string(),
+                    object_kind: ObjectKind::Literal,
+                })
+            })
+            .collect();
+        if facts.is_empty() {
+            return;
+        }
+        let context = self
+            .contexts
+            .iter()
+            .find(|context| context.id == id)
+            .cloned()
+            .unwrap_or_else(|| LensContext {
+                id: id.to_string(),
+                label: label.to_string(),
+                kind,
+                trust,
+                status,
+                priority,
+            });
+        if !self.contexts.iter().any(|existing| existing.id == context.id) {
+            self.contexts.push(context.clone());
+        }
+        self.facts.extend(facts.into_iter().map(|fact| LensFact {
+            context: context.clone(),
+            ..fact
+        }));
+    }
+
+    fn finish(&mut self) {
+        self.facts
+            .sort_by(|left, right| fact_sort_key(left).cmp(&fact_sort_key(right)));
+        self.facts
+            .dedup_by(|left, right| fact_sort_key(left) == fact_sort_key(right));
+        self.contexts.sort_by(|left, right| {
             right
                 .is_default()
                 .cmp(&left.is_default())
                 .then_with(|| left.id.cmp(&right.id))
         });
-        Self { facts, contexts }
     }
 
     pub fn contexts(&self) -> &[LensContext] {
@@ -1227,6 +1332,71 @@ mod tests {
         assert!(rendered.contains("李四"), "{}", rendered);
         assert!(!rendered.contains("是 王五"), "{}", rendered);
         assert!(rendered.contains("其他语境"), "{}", rendered);
+    }
+
+    #[test]
+    fn dialogue_snapshot_facts_are_visible_in_session_and_hypothesis_lenses() {
+        let ledger = FusionLedger::new();
+        let snapshot: DialogueSnapshot = serde_json::from_value(serde_json::json!({
+            "focus_entities": [],
+            "last_predicate": null,
+            "history": [],
+            "session_facts": [
+                {"predicate": "师傅", "terms": ["张三", "李四"]}
+            ],
+            "assumptions": [
+                {"predicate": "师傅", "terms": ["王五", "赵六"]}
+            ]
+        }))
+        .expect("对话快照应可解码");
+        let corpus = LensCorpus::with_dialogue(&[], &ledger, &snapshot);
+        let session = corpus.query_slot(
+            &LensScope::Kind(NamespaceKind::Session),
+            &SlotQuery::forward("张三", "师傅"),
+            false,
+        );
+        assert_eq!(session.state(), SlotState::Supported);
+        assert_eq!(session.values[0].value, "李四");
+        assert_eq!(session.values[0].contexts[0].id, SESSION_CONTEXT_ID);
+        let hypothesis = corpus.query_slot(
+            &LensScope::Kind(NamespaceKind::Hypothesis),
+            &SlotQuery::forward("王五", "师傅"),
+            false,
+        );
+        assert_eq!(hypothesis.state(), SlotState::Supported);
+        assert_eq!(hypothesis.values[0].value, "赵六");
+        assert_eq!(
+            hypothesis.values[0].contexts[0].id,
+            HYPOTHESIS_CONTEXT_ID
+        );
+        let all = corpus.query_slot(
+            &LensScope::All,
+            &SlotQuery::forward("张三", "师傅"),
+            false,
+        );
+        assert_eq!(all.values[0].value, "李四");
+        assert!(corpus
+            .summaries()
+            .iter()
+            .any(|summary| summary.context.kind == NamespaceKind::Session));
+        assert!(corpus
+            .summaries()
+            .iter()
+            .any(|summary| summary.context.kind == NamespaceKind::Hypothesis));
+    }
+
+    #[test]
+    fn empty_dialogue_snapshot_adds_no_virtual_contexts() {
+        let ledger = FusionLedger::new();
+        let snapshot: DialogueSnapshot = serde_json::from_value(serde_json::json!({
+            "focus_entities": [],
+            "last_predicate": null,
+            "history": []
+        }))
+        .unwrap();
+        let corpus = LensCorpus::with_dialogue(&[], &ledger, &snapshot);
+        assert_eq!(corpus.contexts().len(), 1);
+        assert_eq!(corpus.contexts()[0].id, DEFAULT_CONTEXT_ID);
     }
 
     #[test]

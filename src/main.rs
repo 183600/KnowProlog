@@ -968,6 +968,10 @@ enum Commands {
         /// List known contexts and exit
         #[arg(long)]
         contexts: bool,
+        /// Include session facts and current assumptions from a saved dialogue
+        /// state file (see reasoning.dialogue_state_path)
+        #[arg(long, value_name = "PATH")]
+        dialogue_state: Option<String>,
         /// Print the result as JSON
         #[arg(long)]
         json: bool,
@@ -3207,6 +3211,7 @@ async fn main() {
             view,
             functional,
             contexts,
+            dialogue_state,
             json,
         }) => {
             if let Err(e) = run_lens(
@@ -3219,6 +3224,7 @@ async fn main() {
                 view,
                 functional,
                 contexts,
+                dialogue_state,
                 json,
             )
             .await
@@ -4194,11 +4200,19 @@ async fn run_lens(
     view: Option<String>,
     functional: Vec<String>,
     contexts: bool,
+    dialogue_state: Option<String>,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ledger = manager.load_fusion_ledger().await?;
     let default_facts = manager.load_fact_refs().await?;
-    let corpus = viewpoint::LensCorpus::new(&default_facts, &ledger);
+    let corpus = match dialogue_state.as_deref() {
+        Some(path) => {
+            let (snapshot, _) = SymbolicReasoner::read_dialogue_state(path)
+                .map_err(|error| format!("读取对话状态「{}」失败：{}", path, error))?;
+            viewpoint::LensCorpus::with_dialogue(&default_facts, &ledger, &snapshot)
+        }
+        None => viewpoint::LensCorpus::new(&default_facts, &ledger),
+    };
 
     if contexts {
         let summaries = corpus.summaries();
@@ -16002,6 +16016,8 @@ mod session_tests {
             "师傅",
             "--view",
             "alice",
+            "--dialogue-state",
+            "state.json",
         ])
         .expect("显式槽位应可解析");
         match cli.command {
@@ -16010,12 +16026,14 @@ mod session_tests {
                 subject,
                 predicate,
                 view,
+                dialogue_state,
                 ..
             }) => {
                 assert!(question.is_none());
                 assert_eq!(subject.as_deref(), Some("张三"));
                 assert_eq!(predicate.as_deref(), Some("师傅"));
                 assert_eq!(view.as_deref(), Some("alice"));
+                assert_eq!(dialogue_state.as_deref(), Some("state.json"));
             }
             other => panic!("应解析为 Lens 子命令: {:?}", other),
         }
