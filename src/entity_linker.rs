@@ -842,77 +842,87 @@ impl EntityLinker {
         out
     }
 
-    fn fuzzy_mentions(&self, text: &str) -> Vec<LinkedMention> {
-        let mut out: Vec<LinkedMention> = Vec::new();
-        for (start, segment) in segment_spans(text) {
-            let trimmed = segment.trim();
-            let char_count = trimmed.chars().count();
-            if char_count < 2 || char_count > FUZZY_MAX_CHARS || is_stop_segment(trimmed) {
-                continue;
-            }
-            let trimmed_chars: Vec<char> = trimmed.chars().collect();
-            let trimmed_char_set: HashSet<char> = trimmed_chars.iter().copied().collect();
-            let trimmed_bigrams: HashSet<(char, char)> =
-                trimmed_chars.windows(2).map(|w| (w[0], w[1])).collect();
-            let mut scored: Vec<(f64, f64, &String)> = self
-                .profiles
-                .iter()
-                .filter_map(|(canonical, profile)| {
-                    // 上界低于阈值时直接跳过集合运算（须用真实集合大小，
-                    // 重复字符会令集合远小于字符数，按字符数估界会误剪）
-                    let upper = similarity_upper_bound(
-                        trimmed_chars.len(),
-                        profile.char_count,
-                        trimmed_char_set.len(),
-                        profile.char_set.len(),
-                        trimmed_bigrams.len(),
-                        profile.bigrams.len(),
-                        trimmed == canonical.as_str(),
-                    );
-                    if upper + 0.1 < self.fuzzy_threshold {
-                        return None;
-                    }
-                    let similarity = dice_similarity_precomputed(
-                        trimmed,
-                        &trimmed_chars,
-                        &trimmed_char_set,
-                        &trimmed_bigrams,
-                        canonical,
-                        profile,
-                    );
-                    let degree_bonus = ((1.0 + profile.degree as f64).ln() / 10.0).min(0.1);
-                    Some((similarity + degree_bonus, similarity, canonical))
-                })
-                .filter(|(combined, _, _)| *combined >= self.fuzzy_threshold)
-                .collect();
-            if scored.is_empty() {
-                continue;
-            }
-            scored.sort_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.2.cmp(b.2))
-            });
-            let candidates: Vec<LinkCandidate> = scored
-                .iter()
-                .take(MAX_CANDIDATES_PER_MENTION)
-                .map(|(combined, similarity, canonical)| LinkCandidate {
-                    entity: (*canonical).clone(),
-                    score: combined.min(0.9),
-                    method: LinkMethod::Fuzzy,
-                    reasons: vec![format!(
-                        "字符相似度 {:.2}（「{}」≈「{}」，容错匹配）",
-                        similarity, trimmed, canonical
-                    )],
-                })
-                .collect();
-            out.push(LinkedMention {
-                mention: trimmed.to_string(),
-                start,
-                candidates,
-            });
+    /// 单个词面的模糊候选（容错匹配；不做边界切分）。
+    ///
+    /// 公开给锚定重写器等上层：当整段被动词/语气词粘在一起、按分隔符
+    /// 切出的片段过长时，调用方可以在词面窗口上复用同一套候选生成器，
+    /// 不另写一份相似度规则。
+    pub fn fuzzy_candidates(&self, surface: &str) -> Vec<LinkCandidate> {
+        let trimmed = surface.trim();
+        let char_count = trimmed.chars().count();
+        if char_count < 2 || char_count > FUZZY_MAX_CHARS || is_stop_segment(trimmed) {
+            return Vec::new();
         }
-        out
+        let trimmed_chars: Vec<char> = trimmed.chars().collect();
+        let trimmed_char_set: HashSet<char> = trimmed_chars.iter().copied().collect();
+        let trimmed_bigrams: HashSet<(char, char)> =
+            trimmed_chars.windows(2).map(|w| (w[0], w[1])).collect();
+        let mut scored: Vec<(f64, f64, &String)> = self
+            .profiles
+            .iter()
+            .filter_map(|(canonical, profile)| {
+                // 上界低于阈值时直接跳过集合运算（须用真实集合大小，
+                // 重复字符会令集合远小于字符数，按字符数估界会误剪）
+                let upper = similarity_upper_bound(
+                    trimmed_chars.len(),
+                    profile.char_count,
+                    trimmed_char_set.len(),
+                    profile.char_set.len(),
+                    trimmed_bigrams.len(),
+                    profile.bigrams.len(),
+                    trimmed == canonical.as_str(),
+                );
+                if upper + 0.1 < self.fuzzy_threshold {
+                    return None;
+                }
+                let similarity = dice_similarity_precomputed(
+                    trimmed,
+                    &trimmed_chars,
+                    &trimmed_char_set,
+                    &trimmed_bigrams,
+                    canonical,
+                    profile,
+                );
+                let degree_bonus = ((1.0 + profile.degree as f64).ln() / 10.0).min(0.1);
+                Some((similarity + degree_bonus, similarity, canonical))
+            })
+            .filter(|(combined, _, _)| *combined >= self.fuzzy_threshold)
+            .collect();
+        if scored.is_empty() {
+            return Vec::new();
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.2.cmp(b.2))
+        });
+        scored
+            .iter()
+            .take(MAX_CANDIDATES_PER_MENTION)
+            .map(|(combined, similarity, canonical)| LinkCandidate {
+                entity: (*canonical).clone(),
+                score: combined.min(0.9),
+                method: LinkMethod::Fuzzy,
+                reasons: vec![format!(
+                    "字符相似度 {:.2}（「{}」≈「{}」，容错匹配）",
+                    similarity, trimmed, canonical
+                )],
+            })
+            .collect()
+    }
+
+    fn fuzzy_mentions(&self, text: &str) -> Vec<LinkedMention> {
+        segment_spans(text)
+            .into_iter()
+            .filter_map(|(start, segment)| {
+                let candidates = self.fuzzy_candidates(&segment);
+                (!candidates.is_empty()).then(|| LinkedMention {
+                    mention: segment.trim().to_string(),
+                    start,
+                    candidates,
+                })
+            })
+            .collect()
     }
 
     /// 问题线索加成：候选实体的出/入谓词或登记类型命中线索时 +0.1（可解释理由）。

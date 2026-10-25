@@ -107,6 +107,7 @@ pub mod proof_bench;
 pub mod proof_journal;
 pub mod provenance;
 pub mod quality;
+pub mod query_anchor;
 pub mod query_board;
 pub mod query_planner;
 pub mod query_rewrite;

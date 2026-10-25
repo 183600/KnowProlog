@@ -66,6 +66,7 @@ use crate::probabilistic_query_intent::{
 };
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
+use crate::query_anchor::{self, AnchorEvidence, TypeFit};
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::query_rewrite::{self, RelationLexicon};
 use crate::reading::{
@@ -1248,6 +1249,104 @@ pub struct SymbolicReasoner {
     engine_fault: Option<String>,
 }
 
+/// 锚定重写证据：把实体链接器的类型证据、谓词画像的定义域/值域，
+/// 以及本体闭包中的子类/互斥声明合成一个只读视图。只在精确路径失败后使用。
+struct AnchorEvidenceView<'a> {
+    linker: &'a EntityLinker,
+    registry: Option<&'a PredicateRegistry>,
+    capsule: Option<&'a OntologyCapsule>,
+}
+
+impl AnchorEvidence for AnchorEvidenceView<'_> {
+    fn entity_types(&self, entity: &str) -> Vec<String> {
+        let mut types: Vec<String> = self
+            .linker
+            .entity_type(entity)
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        if let Some(capsule) = self.capsule {
+            for (individual, class) in &capsule.closure.instances {
+                if individual == entity {
+                    types.push(class.clone());
+                }
+            }
+        }
+        types.sort();
+        types.dedup();
+        types
+    }
+
+    fn domain_of(&self, predicate: &str) -> Vec<String> {
+        self.registry
+            .and_then(|registry| registry.lookup(predicate))
+            .map(|(profile, inverted)| {
+                let classes = if inverted {
+                    &profile.range
+                } else {
+                    &profile.domain
+                };
+                classes.iter().cloned().collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn range_of(&self, predicate: &str) -> Vec<String> {
+        self.registry
+            .and_then(|registry| registry.lookup(predicate))
+            .map(|(profile, inverted)| {
+                let classes = if inverted {
+                    &profile.domain
+                } else {
+                    &profile.range
+                };
+                classes.iter().cloned().collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn type_fit(&self, actual: &str, expected: &str) -> TypeFit {
+        let base = query_anchor::default_type_fit(actual, expected);
+        if base == TypeFit::Compatible {
+            return base;
+        }
+        let Some(capsule) = self.capsule else {
+            return base;
+        };
+        let ancestors = |name: &str| {
+            let mut set: BTreeSet<String> = BTreeSet::new();
+            set.insert(name.to_string());
+            if let Some((_, supers)) = capsule
+                .closure
+                .subclasses
+                .iter()
+                .find(|(sub, _)| sub == name)
+            {
+                set.extend(supers.iter().cloned());
+            }
+            set
+        };
+        let actual_ancestors = ancestors(actual.trim());
+        let expected_ancestors = ancestors(expected.trim());
+        if actual_ancestors.contains(expected.trim())
+            || expected_ancestors.contains(actual.trim())
+        {
+            return TypeFit::Compatible;
+        }
+        for lesson in &capsule.lessons {
+            if let OntologyLesson::Disjoint { left, right, .. } = lesson {
+                let (left, right) = (left.trim(), right.trim());
+                if (actual_ancestors.contains(left) && expected_ancestors.contains(right))
+                    || (actual_ancestors.contains(right) && expected_ancestors.contains(left))
+                {
+                    return TypeFit::Disjoint;
+                }
+            }
+        }
+        base
+    }
+}
+
 /// 深拷贝：所有子引擎必须实现 `Clone`（锁/原子量以值重建，不共享可变状态）。
 /// 内存记忆缓存（提及/链接/谓词）按内容复制，语义不变。
 impl Clone for SymbolicReasoner {
@@ -1407,6 +1506,18 @@ impl SymbolicReasoner {
         }
 
         View(self)
+    }
+
+    /// 锚定重写的只读证据视图：链接器类型 + 谓词画像 + 本体闭包层级。
+    fn anchor_evidence<'a>(
+        &'a self,
+        capsule: Option<&'a OntologyCapsule>,
+    ) -> AnchorEvidenceView<'a> {
+        AnchorEvidenceView {
+            linker: &self.linker,
+            registry: self.law_registry.as_ref(),
+            capsule,
+        }
     }
     /// 审计辅助：词条是否是任一实体的属性键、取值或实体名本身。
     /// 供对话忠信度检查（回答引用必须可回溯）使用。
@@ -10015,6 +10126,14 @@ impl SymbolicReasoner {
     }
 
     fn answer_planned(&self, question: &str) -> Option<String> {
+        if let Some(answer) = self.answer_compiled(question) {
+            return Some(answer);
+        }
+        self.answer_anchored(question)
+    }
+
+    /// 精确词表路径：句法规划器优先，其次句法重写器。
+    fn answer_compiled(&self, question: &str) -> Option<String> {
         let parsed = self.planner.parse(question);
         if let Some(answer) = parsed
             .as_ref()
@@ -10029,6 +10148,56 @@ impl SymbolicReasoner {
             return None;
         }
         self.answer_plan(&rewritten.plan, question)
+    }
+
+    /// 精确路径失败后的指称锚定回退：用实体链接器的候选把错别字/别名
+    /// 替换成规范名，再走同一套规划与执行。歧义、类型互斥或只得到
+    /// 「没有记录」时一律放弃，让后续预测/证据路径继续工作。
+    fn answer_anchored(&self, question: &str) -> Option<String> {
+        let hints = self.link_hints(question);
+        let capsule = self.discourse.ontology_capsule();
+        let evidence = self.anchor_evidence(capsule.as_ref());
+        let lexicon = self.relation_lexicon();
+        let variants = query_anchor::anchor_questions(
+            question,
+            &self.linker,
+            &hints,
+            &lexicon,
+            &evidence,
+        );
+        for variant in variants {
+            let mut answer = variant
+                .planner_plan
+                .as_ref()
+                .and_then(|plan| self.answer_plan(plan, &variant.question));
+            if answer.is_none() {
+                if let Some(rewrite) = &variant.rewrite {
+                    if variant.planner_plan.as_ref() != Some(&rewrite.plan) {
+                        answer = self.answer_plan(&rewrite.plan, &variant.question);
+                    }
+                }
+            }
+            let Some(answer) = answer else {
+                continue;
+            };
+            if Self::is_pending_failure(&answer) {
+                continue;
+            }
+            self.perf.bump("query_anchor_accept");
+            return Some(answer);
+        }
+        None
+    }
+
+    /// 锚定重写回执（只读审计；无可用变体时返回 None）。
+    pub fn query_anchor_receipt(&self, question: &str) -> Option<String> {
+        let hints = self.link_hints(question);
+        let capsule = self.discourse.ontology_capsule();
+        let evidence = self.anchor_evidence(capsule.as_ref());
+        let lexicon = self.relation_lexicon();
+        query_anchor::anchor_questions(question, &self.linker, &hints, &lexicon, &evidence)
+            .first()
+            .map(|variant| variant.receipt())
     }
 
     fn answer_plan(&self, plan: &QueryPlan, question: &str) -> Option<String> {
@@ -17688,6 +17857,30 @@ mod tests {
             .answer("李寺的师祖是谁")
             .expect("错别字实体应能通过链接回退命中推理");
         assert!(answer.contains("赵六"), "实际回答：{}", answer);
+    }
+
+    #[test]
+    fn test_query_anchor_recovers_single_hop_typo() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let receipt = reasoner
+            .query_anchor_receipt("张山的师傅是谁")
+            .expect("单跳错别字问句应产生锚定回执");
+        assert!(receipt.contains("张山"), "{}", receipt);
+        assert!(receipt.contains("张三"), "{}", receipt);
+        let answer = reasoner
+            .answer("张山的师傅是谁")
+            .expect("单跳错别字问句应被锚定重写救回");
+        assert!(answer.contains("李四"), "实际回答：{}", answer);
+    }
+
+    #[test]
+    fn test_query_anchor_keeps_exact_answer_unchanged() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let exact = reasoner.answer("张三的师傅是谁").expect("精确问句应可回答");
+        assert!(exact.contains("李四"), "实际回答：{}", exact);
+        assert!(reasoner.query_anchor_receipt("张三的师傅是谁").is_none());
     }
 
     #[test]
