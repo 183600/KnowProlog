@@ -542,6 +542,10 @@ pub struct DialogueSnapshot {
     #[serde(default)]
     pub focus_types: HashMap<String, String>,
     pub last_predicate: Option<String>,
+    /// 上一轮成功编译出的查询计划类型（`QueryPlanner::kind`）。
+    /// 省略追问据此决定补「换主语的关系问」还是「换宾语的属性问」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_plan_kind: Option<String>,
     pub history: Vec<String>,
     #[serde(default)]
     pub generation: Option<GenerationState>,
@@ -689,6 +693,7 @@ pub struct DialogueContext {
     /// 焦点实体的类型证据（代词消解的类型闸门；未知=键不存在）
     focus_types: HashMap<String, String>,
     last_predicate: Option<String>,
+    last_plan_kind: Option<String>,
     history: Vec<String>,
     generation: Option<GenerationState>,
     max_focus: usize,
@@ -701,6 +706,7 @@ impl DialogueContext {
             focus_entities: Vec::new(),
             focus_types: HashMap::new(),
             last_predicate: None,
+            last_plan_kind: None,
             history: Vec::new(),
             generation: None,
             max_focus,
@@ -714,6 +720,11 @@ impl DialogueContext {
 
     pub fn last_predicate(&self) -> Option<&str> {
         self.last_predicate.as_deref()
+    }
+
+    /// 上一轮查询计划类型；只记录成功编译的计划，省略句本身不会覆盖它。
+    pub fn last_plan_kind(&self) -> Option<&str> {
+        self.last_plan_kind.as_deref()
     }
 
     pub fn history(&self) -> &[String] {
@@ -763,6 +774,12 @@ impl DialogueContext {
         }
     }
 
+    pub fn record_plan_kind(&mut self, kind: &str) {
+        if !kind.is_empty() {
+            self.last_plan_kind = Some(kind.to_string());
+        }
+    }
+
     pub fn record_question(&mut self, question: &str) {
         if question.trim().is_empty() {
             return;
@@ -777,6 +794,7 @@ impl DialogueContext {
         self.focus_entities.clear();
         self.focus_types.clear();
         self.last_predicate = None;
+        self.last_plan_kind = None;
         self.history.clear();
         self.generation = None;
     }
@@ -815,6 +833,7 @@ impl DialogueContext {
             focus_entities: self.focus_entities.clone(),
             focus_types: self.focus_types.clone(),
             last_predicate: self.last_predicate.clone(),
+            last_plan_kind: self.last_plan_kind.clone(),
             history: self.history.clone(),
             generation: self.generation.clone(),
             session_facts: Vec::new(),
@@ -845,6 +864,7 @@ impl DialogueContext {
         self.focus_types
             .retain(|entity, _| self.focus_entities.contains(entity));
         self.last_predicate = snapshot.last_predicate.clone();
+        self.last_plan_kind = snapshot.last_plan_kind.clone();
         self.history = snapshot.history.clone();
         self.history.truncate(self.max_history);
         self.generation = snapshot.generation.clone();
@@ -3503,7 +3523,23 @@ impl SymbolicReasoner {
         if let Some(rewrite) = &rewrite {
             self.record_vocabulary(&rewrite.text);
         }
+        if let Some(rewrite) = &rewrite {
+            self.record_plan_kind(&rewrite.text);
+        } else {
+            self.record_plan_kind(input);
+        }
         rewrite
+    }
+
+    /// 记录本轮成功编译的查询计划类型；省略句/纯寒暄没有计划时不覆盖
+    /// 上一轮类型，保证「那李四呢」仍能接着上一轮的结构补全。
+    fn record_plan_kind(&mut self, text: &str) {
+        let plan = self.planner.parse(text).or_else(|| {
+            query_rewrite::rewrite(text, &self.relation_lexicon()).map(|rewrite| rewrite.plan)
+        });
+        if let Some(plan) = plan {
+            self.context.record_plan_kind(QueryPlanner::kind(&plan));
+        }
     }
 
     /// 话语帧通道：复合问句拆帧（第一问照答、其余挂账）、省略追问合一补全、
@@ -3643,6 +3679,20 @@ impl SymbolicReasoner {
             return Some(format!("{}是什么", core));
         }
         let predicate = self.context.last_predicate()?;
+        // 换实体的省略追问必须跟着上一轮的计划类型走：
+        // 「张三认识谁」后的「李四呢」是「李四认识谁」，不是
+        // 「李四的认识是什么」；反查句则替换宾语。
+        if self.is_known_entity(core) {
+            match self.context.last_plan_kind() {
+                Some("FindObjectByPredicate") | Some("FindObjectExcept") => {
+                    return Some(format!("{}{}谁", core, predicate));
+                }
+                Some("FindSubject") | Some("FindSubjectExcept") => {
+                    return Some(format!("谁{}{}", predicate, core));
+                }
+                _ => {}
+            }
+        }
         Some(format!("{}的{}是什么", core, predicate))
     }
 
@@ -16013,6 +16063,65 @@ mod tests {
         reasoner.contextualize("张三的师傅是谁");
         let rewritten = reasoner.contextualize("其他人的师傅是谁");
         assert!(rewritten.is_none() || rewritten.as_deref() == Some("其他张三的师傅是谁"));
+    }
+
+    fn acquaintance_facts() -> Vec<PrologFact> {
+        vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "认识".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "认识".to_string(),
+                to: "李四".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_relation_ellipsis_uses_last_plan_kind() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&acquaintance_facts());
+        assert!(reasoner.contextualize("张三认识谁").is_none());
+        assert_eq!(
+            reasoner.context().last_plan_kind(),
+            Some("FindObjectByPredicate")
+        );
+        let rewritten = reasoner
+            .contextualize("李四呢")
+            .expect("关系问句后的省略应沿用计划类型");
+        assert_eq!(rewritten, "李四认识谁");
+
+        assert!(reasoner.contextualize("谁认识李四").is_none());
+        assert_eq!(reasoner.context().last_plan_kind(), Some("FindSubject"));
+        let rewritten = reasoner
+            .contextualize("张三呢")
+            .expect("反查句后的省略应替换宾语");
+        assert_eq!(rewritten, "谁认识张三");
+    }
+
+    #[test]
+    fn test_last_plan_kind_survives_snapshot_roundtrip() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&acquaintance_facts());
+        reasoner.contextualize("张三认识谁");
+        let snapshot = reasoner.dialogue_snapshot();
+        assert_eq!(
+            snapshot.last_plan_kind.as_deref(),
+            Some("FindObjectByPredicate")
+        );
+
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&acquaintance_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("快照应可恢复");
+        let rewritten = restored
+            .contextualize("李四呢")
+            .expect("恢复后省略补全仍应沿用计划类型");
+        assert_eq!(rewritten, "李四认识谁");
     }
 
     fn attribute_facts() -> Vec<PrologFact> {
