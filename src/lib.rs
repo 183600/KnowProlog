@@ -55,6 +55,7 @@ pub mod epistemic;
 pub mod eval_recovery;
 pub mod external_knowledge;
 pub mod external_ledger;
+pub mod fact_snapshot;
 pub mod formal_semantics;
 pub mod frontier;
 pub mod fulfillment;
@@ -3243,7 +3244,50 @@ impl OxigraphManager {
         &self,
     ) -> Result<Vec<crate::provenance::FactRef>, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
-        let mut out: Vec<crate::provenance::FactRef> = Vec::new();
+        let mut out: Vec<crate::provenance::FactRef> = Self::scan_fact_refs(&store)
+            .into_iter()
+            .map(|(fact, _)| fact)
+            .collect();
+        out.sort();
+        out.dedup();
+        self.perf.bump("fact_ref_scan");
+        Ok(out)
+    }
+
+    /// 读取按层组织的事实快照：默认图的全部行 + 谓词注册表里的功能声明。
+    ///
+    /// 这是只读 adapter；写入路径、缓存与导入行为不受影响。快照的 revision
+    /// 与知识版本一致，同一 revision 下重复读取得到相同内容。
+    pub async fn load_fact_snapshot(
+        &self,
+    ) -> Result<crate::fact_snapshot::FactSnapshot, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let revision = self.revision.load(Ordering::Acquire);
+        let rows = {
+            let store = self.store.lock().await;
+            Self::scan_fact_refs(&store)
+        };
+        let source = crate::provenance::SourceId::new(
+            crate::provenance::SourceKind::Import,
+            "oxigraph:default",
+            &format!("revision={revision};rows={}", rows.len()),
+        );
+        let mut builder = crate::fact_snapshot::FactSnapshotBuilder::new(revision);
+        builder.grammar_digest("oxigraph");
+        for predicate in self.predicate_registry.read().functional_predicates() {
+            builder.mark_functional(&predicate);
+        }
+        for (fact, kind) in rows {
+            builder.add_base(fact, kind, source.clone());
+        }
+        self.perf.bump("fact_snapshot_load");
+        Ok(builder.build())
+    }
+
+    /// 单次遍历默认图，保留每一行并区分类型/属性/关系。
+    fn scan_fact_refs(store: &Store) -> Vec<(crate::provenance::FactRef, crate::fact_snapshot::FactKind)> {
+        use crate::fact_snapshot::FactKind;
+        let mut out: Vec<(crate::provenance::FactRef, FactKind)> = Vec::new();
         for quad in store.iter() {
             let quad = match quad {
                 Ok(quad) => quad,
@@ -3266,20 +3310,29 @@ impl OxigraphManager {
             } else {
                 quad.predicate.as_str().to_string()
             };
-            let value = match &quad.object {
-                Term::Literal(literal) => literal.value().to_string(),
-                Term::NamedNode(node) => Self::entity_key_from_iri(node.as_str()),
-                object => object
-                    .to_string()
-                    .trim_matches(|c| c == '<' || c == '>')
-                    .to_string(),
+            let (value, kind) = match &quad.object {
+                Term::Literal(literal) => (literal.value().to_string(), FactKind::Attribute),
+                Term::NamedNode(node) => (
+                    Self::entity_key_from_iri(node.as_str()),
+                    if predicate == "type" {
+                        FactKind::Type
+                    } else {
+                        FactKind::Relation
+                    },
+                ),
+                object => (
+                    object
+                        .to_string()
+                        .trim_matches(|c| c == '<' || c == '>')
+                        .to_string(),
+                    FactKind::Attribute,
+                ),
             };
-            out.push(crate::provenance::FactRef::new(&subject, &predicate, &value));
+            out.push((crate::provenance::FactRef::new(&subject, &predicate, &value), kind));
         }
         out.sort();
         out.dedup();
-        self.perf.bump("fact_ref_scan");
-        Ok(out)
+        out
     }
 
     /// 单次遍历存储，同时构建整图的实体事实与关系事实。

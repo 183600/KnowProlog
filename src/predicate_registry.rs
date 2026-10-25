@@ -236,6 +236,18 @@ impl PredicateRegistry {
         self.profile(predicate).map_or(false, |p| p.functional)
     }
 
+    /// 全部显式声明为功能谓词的规范名（快照层据此裁决同槽多值）。
+    pub fn functional_predicates(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|(_, profile)| profile.functional)
+            .map(|(name, _)| name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
     pub fn is_transitive(&self, predicate: &str) -> bool {
         self.profile(predicate).map_or(false, |p| p.transitive)
     }
