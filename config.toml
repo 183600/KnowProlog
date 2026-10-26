@@ -147,6 +147,29 @@ extra_token_penalty = 0.06             # 每个未对齐实词的惩罚
 fuzzy_floor = 0.55                     # 单要素可接受的最低对齐质量
 max_alternatives = 4                   # 报告展示的候选上限
 
+# 溯因式重写-检索互证（ARR）：保留多个读法，让稠密检索证据裁决。
+# 默认关闭；关闭时回答路径与旧行为逐字节一致。可用 rewrite-retrieval 命令离线查看。
+[reasoning.rewrite_retrieval]
+enabled = false                        # 是否让回答路径使用证据裁决后的读法
+max_hypotheses = 4                     # 一次最多评估的候选读法数
+max_probes = 2                         # 每个读法最多执行的检索探针数
+per_probe_k = 4                        # 每个探针取回的候选证据数
+accept_threshold = 0.72                # 接受读法的最低置信度
+clarify_threshold = 0.48               # 进入澄清档的最低置信度
+accept_margin = 0.08                   # 与不同答案的竞争读法所需的最小领先
+min_support = 0.18                     # 最强证据分硬闸门
+min_coverage = 0.55                    # 主答案簇占比硬闸门
+min_margin = 0.08                      # 答案簇边际硬闸门
+support_pivot = 0.25                   # 支持度的 log-odds 中性点
+coverage_pivot = 0.60                  # 覆盖度的 log-odds 中性点
+margin_pivot = 0.30                    # 边际的 log-odds 中性点
+consistency_pivot = 0.60               # 一致性的 log-odds 中性点
+support_gain = 3.0                     # 支持度证据增益
+coverage_gain = 1.8                    # 覆盖度证据增益
+margin_gain = 1.2                      # 边际证据增益
+consistency_gain = 1.0                 # 一致性证据增益
+partial_discount = 0.65                # 仅验证首跳时的证据折扣
+
 # 声明式插件（符号专家）：每个包是一份带类型贡献的 TOML 清单，
 # 不加载动态库、不执行插件代码；交互模式用「插件」查看，用「启用插件：<id>」切换。
 [plugins]

@@ -556,6 +556,10 @@ pub struct ReasoningConfig {
     /// 默认开启；只有通过守卫/覆盖闸门且领先的候选才会被接受。
     #[serde(default)]
     pub soft_route: soft_route::SoftRouteConfig,
+    /// 溯因式重写-检索互证：保留多个读法，让稠密检索证据裁决。
+    /// 默认关闭；关闭时回答路径与旧行为逐字节一致。
+    #[serde(default)]
+    pub rewrite_retrieval: rewrite_retrieval::RewriteRetrievalConfig,
 }
 
 fn default_enable_holographic_memory() -> bool {
@@ -787,6 +791,7 @@ impl Default for ReasoningConfig {
             confidence: confidence::ConfidenceConfig::default(),
             constructive: constructive::ConstructionConfig::default(),
             soft_route: soft_route::SoftRouteConfig::default(),
+            rewrite_retrieval: rewrite_retrieval::RewriteRetrievalConfig::default(),
         }
     }
 }

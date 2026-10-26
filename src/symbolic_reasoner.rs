@@ -83,6 +83,9 @@ use crate::resolution_engine::{
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
 };
 use crate::revision_guard::{GuardPlan, RevisionGuard};
+use crate::rewrite_retrieval::{
+    self, Decision as RewriteRetrievalDecision, HypothesisCandidate, HypothesisSource,
+};
 use crate::schema_view::SchemaView;
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{self, EntailmentResult, Knowledge, PropositionParser, Verdict};
@@ -11182,7 +11185,135 @@ impl SymbolicReasoner {
         // 精确路径只给出「没有记录」时，错别字/别名问句仍应有机会走锚定；
         // 歧义、无法证明等失败不进入，避免绕过澄清或证明边界。若锚定也
         // 拿不到确证答案，再保留原失败答复。
-        self.answer_anchored(question).or(compiled)
+        if let Some(answer) = self.answer_anchored(question) {
+            return Some(answer);
+        }
+        // 最后让多个候选读法用稠密检索证据竞争；默认关闭，且只在精确/
+        // 锚定路径失败后接管，因此不会改变已能确证的旧行为。
+        if self.config.rewrite_retrieval.enabled {
+            if let Some(answer) = self.answer_rewrite_retrieval(question) {
+                return Some(answer);
+            }
+        }
+        compiled
+    }
+
+    /// 收集问句的候选读法：精确计划、句法重写、指称锚定。
+    ///
+    /// 顺序只影响报告的可读性；去重与排序交给
+    /// [`rewrite_retrieval::assess`]，同一计划保留最可靠的来源。
+    pub fn rewrite_retrieval_candidates(&self, question: &str) -> Vec<HypothesisCandidate> {
+        let mut candidates = Vec::new();
+        if let Some(plan) = self.planner.parse(question) {
+            candidates.push(HypothesisCandidate::new(
+                HypothesisSource::ExactPlan,
+                "planner",
+                question,
+                plan,
+            ));
+        }
+        let lexicon = self.relation_lexicon();
+        if let Some(rewrite) = query_rewrite::rewrite(question, &lexicon) {
+            candidates.push(HypothesisCandidate::new(
+                HypothesisSource::SyntaxRewrite,
+                rewrite.rule,
+                question,
+                rewrite.plan,
+            ));
+        }
+        let hints = self.link_hints(question);
+        let capsule = self.discourse.ontology_capsule();
+        let evidence = self.anchor_evidence(capsule.as_ref());
+        for variant in
+            query_anchor::anchor_questions(question, &self.linker, &hints, &lexicon, &evidence)
+        {
+            let Some(plan) = variant.preferred_plan() else {
+                continue;
+            };
+            let rule = variant
+                .replacements
+                .first()
+                .map(|replacement| format!("anchor:{}", replacement.surface))
+                .unwrap_or_else(|| "anchor".to_string());
+            candidates.push(HypothesisCandidate::new(
+                HypothesisSource::AnchoredPlan,
+                rule,
+                variant.question.clone(),
+                plan.clone(),
+            ));
+        }
+        candidates
+    }
+
+    /// 对候选读法做证据裁决（只读；不执行计划、不写知识库）。
+    pub fn rewrite_retrieval_assessment(
+        &self,
+        question: &str,
+    ) -> Option<rewrite_retrieval::Assessment> {
+        let candidates = self.rewrite_retrieval_candidates(question);
+        if candidates.is_empty() {
+            return None;
+        }
+        Some(rewrite_retrieval::assess(
+            question,
+            candidates,
+            &self.config.rewrite_retrieval,
+            |query, k, constraints| {
+                self.evidence_search(query, k, constraints, SearchBudget::default())
+            },
+        ))
+    }
+
+    /// 读法裁决的可打印回执（只读审计）。
+    pub fn rewrite_retrieval_report(&self, question: &str) -> Option<String> {
+        self.rewrite_retrieval_assessment(question)
+            .map(|assessment| assessment.render_report())
+    }
+
+    fn render_rewrite_retrieval_clarification(
+        &self,
+        assessment: &rewrite_retrieval::Assessment,
+    ) -> String {
+        let mut output = String::from("这个问句有不止一种有证据的读法，需要先确认：\n");
+        for (index, hypothesis) in assessment
+            .hypotheses
+            .iter()
+            .filter(|hypothesis| hypothesis.answer.is_some())
+            .take(3)
+            .enumerate()
+        {
+            output.push_str(&format!(
+                "  {}. {}（答案：{}；置信度 {:.2}）\n",
+                index + 1,
+                hypothesis.candidate.receipt(),
+                hypothesis.answer.as_deref().unwrap_or("未定"),
+                hypothesis.confidence
+            ));
+        }
+        output.push_str("请补充主语/谓词，或直接说明你指的是哪一种。");
+        output
+    }
+
+    /// 证据裁决后的读法执行：只有 `Accept` 才执行计划，`Clarify` 先问一句。
+    fn answer_rewrite_retrieval(&self, question: &str) -> Option<String> {
+        let assessment = self.rewrite_retrieval_assessment(question)?;
+        match assessment.decision {
+            RewriteRetrievalDecision::Accept => {
+                let selected = assessment.selected_hypothesis()?;
+                let answer =
+                    self.answer_plan(&selected.candidate.plan, &selected.candidate.question)?;
+                if Self::is_pending_failure(&answer) {
+                    return None;
+                }
+                self.perf.bump("rewrite_retrieval_accept");
+                Some(answer)
+            }
+            RewriteRetrievalDecision::Clarify => {
+                self.perf.bump("rewrite_retrieval_clarify");
+                Some(self.render_rewrite_retrieval_clarification(&assessment))
+            }
+            RewriteRetrievalDecision::Abstain => None,
+        }
     }
 
     /// 精确词表路径：句法规划器优先，其次句法重写器。
@@ -17084,6 +17215,7 @@ mod tests {
             confidence: crate::confidence::ConfidenceConfig::default(),
             constructive: crate::constructive::ConstructionConfig::default(),
             soft_route: crate::soft_route::SoftRouteConfig::default(),
+            rewrite_retrieval: crate::rewrite_retrieval::RewriteRetrievalConfig::default(),
         }
     }
 
@@ -17092,6 +17224,12 @@ mod tests {
             toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
         let mut config = test_config();
         config.confidence = full.reasoning.confidence;
+        config
+    }
+
+    fn rewrite_retrieval_config() -> ReasoningConfig {
+        let mut config = test_config();
+        config.rewrite_retrieval.enabled = true;
         config
     }
 
@@ -17133,6 +17271,40 @@ mod tests {
                 to: "赵六".to_string(),
             },
         ]
+    }
+
+    #[test]
+    fn rewrite_retrieval_arbitrates_readings_with_dense_evidence() {
+        let mut reasoner = SymbolicReasoner::new(rewrite_retrieval_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        let assessment = reasoner
+            .rewrite_retrieval_assessment("谁的师傅是李四")
+            .expect("应收集到候选读法");
+        assert_eq!(
+            assessment.decision,
+            crate::rewrite_retrieval::Decision::Accept,
+            "{}",
+            assessment.render_report()
+        );
+        assert_eq!(assessment.answer(), Some("张三"));
+
+        let report = reasoner
+            .rewrite_retrieval_report("谁的师傅是李四")
+            .expect("应能打印裁决回执");
+        assert!(report.contains("读法裁决"), "{}", report);
+        assert!(report.contains("张三"), "{}", report);
+    }
+
+    #[test]
+    fn rewrite_retrieval_is_disabled_by_default() {
+        let config = test_config();
+        assert!(!config.rewrite_retrieval.enabled);
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        assert!(reasoner
+            .rewrite_retrieval_assessment("谁的师傅是李四")
+            .is_some());
     }
 
     #[test]

@@ -43,6 +43,7 @@ use know_prolog::{
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
     extract_query_entities_from_tagged, frontier, fulfillment,
+    fusion_arbitration::{arbitrate, ArbitrationInput},
     grammar_extractor::GrammarExtractor,
     history_trust::TrustAssessment,
     holographic_memory::{HoloAnalogyHit, HoloHit},
@@ -52,7 +53,6 @@ use know_prolog::{
     },
     import_frames::{FrameLoad as ImportFrameLoad, ImportFrameLedger},
     import_journal::{ImportJournal, JournalLoad},
-    fusion_arbitration::{arbitrate, ArbitrationInput},
     knowledge_fusion::{
         Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, NamespaceStatus, TrustLevel,
     },
@@ -828,6 +828,15 @@ enum Commands {
         #[arg(long)]
         max_scanned: Option<usize>,
         /// Print hits and the receipt as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Arbitrate query readings (exact plan / syntax rewrite / anchoring)
+    /// with dense-retrieval evidence and print the three-way decision receipt
+    RewriteRetrieval {
+        /// Question to analyse
+        question: String,
+        /// Print the assessment as JSON
         #[arg(long)]
         json: bool,
     },
@@ -2387,6 +2396,74 @@ async fn main() {
                 println!("{}", retriever.format_hits(&query, &search.hits));
                 println!();
                 println!("{}", search.receipt.render_text());
+            }
+        }
+        Some(Commands::RewriteRetrieval { question, json }) => {
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(error) => {
+                    eprintln!("读取知识库失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            let registry_path = format!("{}/predicate_registry.json", store_path);
+            let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+            oxigraph_manager.configure_predicates(
+                &config.predicate_profiles,
+                config.reasoning.require_predicate_admission,
+            );
+            let _ = oxigraph_manager
+                .load_entity_registry(&format!("{}/entity_registry.json", store_path));
+            oxigraph_manager.configure_entities(&config.entity_profiles);
+            oxigraph_manager.configure_type_system(&config.type_system);
+            let synonyms = config
+                .synonyms
+                .as_ref()
+                .map(|synonyms| synonyms.mappings.clone())
+                .unwrap_or_else(create_default_synonyms);
+            let mut reasoner = SymbolicReasoner::with_perf_ledger(
+                config.reasoning.clone(),
+                synonyms,
+                PerfLedger::shared(),
+            );
+            reasoner.set_nlp_config(config.nlp.clone());
+            if config.semantic_grammar.enabled {
+                reasoner.attach_semantic_grammar(
+                    know_prolog::semantic_grammar::RulePack::from_config(&config),
+                );
+            }
+            let (ontology_program, _) = owl_annotation::ontology_program_with_annotations(
+                &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
+                &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
+            );
+            reasoner.configure_ontology_program(&ontology_program);
+            reasoner.configure_schema_view(&SchemaView::from_config(
+                &config.type_system,
+                &config.predicate_profiles,
+            ));
+            reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
+            reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
+            if let Some(persisted) =
+                LawBook::load_from_path(&format!("{}/law_book.json", store_path))
+            {
+                reasoner.load_persisted_laws(persisted);
+            }
+            reasoner.observe_facts(&facts);
+            match reasoner.rewrite_retrieval_assessment(&question) {
+                Some(assessment) => {
+                    if json {
+                        match serde_json::to_string_pretty(&assessment) {
+                            Ok(text) => println!("{}", text),
+                            Err(error) => {
+                                eprintln!("读法裁决序列化失败: {}", error);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        println!("{}", assessment.render_report());
+                    }
+                }
+                None => println!("没有可编译的候选读法：{}", question.trim()),
             }
         }
         Some(Commands::Snapshot {
@@ -5389,7 +5466,10 @@ fn run_rewrite_rules(book_path: &str, adopt: &[String], retire: &[String], json:
     let mut book = match RewriteBook::load_from_path(book_path) {
         Ok(book) => book,
         Err(error) => {
-            eprintln!("{}（可先用 `rewrite-mine --save {}` 生成）", error, book_path);
+            eprintln!(
+                "{}（可先用 `rewrite-mine --save {}` 生成）",
+                error, book_path
+            );
             std::process::exit(1);
         }
     };
@@ -5614,11 +5694,9 @@ async fn run_contextual_segment(
                     segmenter.observe_predicate(property);
                 }
             }
-            PrologFact::Relation {
-                from,
-                rel_type,
-                to,
-            } => segmenter.observe_triple(from, rel_type, to),
+            PrologFact::Relation { from, rel_type, to } => {
+                segmenter.observe_triple(from, rel_type, to)
+            }
         }
     }
 
@@ -5665,12 +5743,10 @@ async fn run_contextual_segment(
         let kind = segmenter
             .reading_kind(surface, canonical)
             .unwrap_or(ReadingKind::Entity);
-        memory_changed |= segmenter.memory_mut().confirm(
-            surface,
-            canonical,
-            kind,
-            &result.context.fingerprint,
-        );
+        memory_changed |=
+            segmenter
+                .memory_mut()
+                .confirm(surface, canonical, kind, &result.context.fingerprint);
     }
     for spec in correct {
         let Some((surface, replacement)) = spec.split_once('=') else {
@@ -6943,9 +7019,9 @@ async fn run_ask(
         // 不会被误当成对上一轮缺失前提的短答。
         if let Some(directive) = StyleDirective::parse(&question) {
             reasoner.clear_pending_awaiting();
-            let text = reasoner.restyle_generation(directive).unwrap_or_else(|| {
-                "生成功能未启用，无法按回答计划重述。".to_string()
-            });
+            let text = reasoner
+                .restyle_generation(directive)
+                .unwrap_or_else(|| "生成功能未启用，无法按回答计划重述。".to_string());
             answers.push(AskAnswer {
                 question,
                 status: "answered",
@@ -7516,11 +7592,7 @@ fn apply_language_snapshot(
     synonyms: &mut std::collections::HashMap<String, String>,
     local_semantic_adapter: &mut LocalSemanticAdapter,
     symbolic_reasoner: &mut SymbolicReasoner,
-) -> (
-    pattern_ir::PatternLayerRefresh,
-    LanguagePolicySync,
-    usize,
-) {
+) -> (pattern_ir::PatternLayerRefresh, LanguagePolicySync, usize) {
     *knowledge_extractor = KnowledgeExtractor::new(Arc::clone(config));
     *response_formatter = ResponseFormatter::new(Arc::clone(config));
     *nlu_engine = NLUEngine::new(config);
@@ -7845,10 +7917,7 @@ async fn run_interactive_mode(
     let mut import_frames = match ImportFrameLedger::load(&import_frames_path) {
         ImportFrameLoad::Loaded(ledger) => {
             if !ledger.is_empty() {
-                println!(
-                    "已恢复导入帧：{} 条（「导入帧」查看）。",
-                    ledger.len()
-                );
+                println!("已恢复导入帧：{} 条（「导入帧」查看）。", ledger.len());
                 symbolic_reasoner.attach_import_frames(ledger.clone());
             }
             ledger
@@ -8313,8 +8382,7 @@ async fn run_interactive_mode(
         ) {
             match lang_runtime.reload() {
                 Ok(LangReloadOutcome::Applied(apply)) => {
-                    language_config =
-                        Arc::clone(lang_runtime.current().language_config());
+                    language_config = Arc::clone(lang_runtime.current().language_config());
                     let (patterns, language, plugin_entries) = apply_language_snapshot(
                         &language_config,
                         &mut knowledge_extractor,
@@ -8372,11 +8440,13 @@ async fn run_interactive_mode(
         }
 
         // 配置回滚：把上一份快照的内容重新提交为新 epoch，而不是倒转时间。
-        if matches!(input, "回滚配置" | "配置回滚" | "config-rollback" | "rollback-config") {
+        if matches!(
+            input,
+            "回滚配置" | "配置回滚" | "config-rollback" | "rollback-config"
+        ) {
             match lang_runtime.rollback() {
                 Ok(rollback) => {
-                    language_config =
-                        Arc::clone(lang_runtime.current().language_config());
+                    language_config = Arc::clone(lang_runtime.current().language_config());
                     let (patterns, language, plugin_entries) = apply_language_snapshot(
                         &language_config,
                         &mut knowledge_extractor,
@@ -8502,7 +8572,8 @@ async fn run_interactive_mode(
         // 重启后据此回放/重建上下文（崩溃语义：最多丢进行中的一轮）。
         if !raw_input.is_empty() {
             if let Some(chronicle) = chronicle.as_mut() {
-                let mode = match detect_input_mode(raw_input, &language_config.nlp.import_keywords) {
+                let mode = match detect_input_mode(raw_input, &language_config.nlp.import_keywords)
+                {
                     InputMode::KnowledgeImport => "import",
                     InputMode::Query => "query",
                 };
@@ -9972,8 +10043,8 @@ async fn run_interactive_mode(
                             for event in thread.events.iter().rev().take(8).rev() {
                                 println!("  {}", render_event_line(thread, event));
                             }
-                            let omitted = thread.omitted_events
-                                + thread.events.len().saturating_sub(8);
+                            let omitted =
+                                thread.omitted_events + thread.events.len().saturating_sub(8);
                             if omitted > 0 {
                                 println!(
                                     "  …另有 {} 条较早记录已折叠；用「实体足迹：{}」查看概览。",
@@ -10027,8 +10098,7 @@ async fn run_interactive_mode(
                 .trim();
             match chronicle.as_ref() {
                 Some(chronicle) => {
-                    let (digest, facts) =
-                        entity_thread_context(chronicle, &oxigraph_manager).await;
+                    let (digest, facts) = entity_thread_context(chronicle, &oxigraph_manager).await;
                     println!("{}", digest.render_footprint(spec, facts.as_slice()));
                     if let Some(changes) = entity_related_changes(&digest, chronicle, spec) {
                         println!();
@@ -11564,12 +11634,7 @@ async fn run_interactive_mode(
         // 语境分词：符号子词嵌入 + 字符格 k-best + 焦点语境；只读审计，不影响回答主路径
         if let Some(target) = strip_any_prefix(
             input,
-            &[
-                "语境分词：",
-                "语境分词:",
-                "读法分词：",
-                "读法分词:",
-            ],
+            &["语境分词：", "语境分词:", "读法分词：", "读法分词:"],
         ) {
             let target = target.trim();
             if target.is_empty() {
@@ -11585,12 +11650,7 @@ async fn run_interactive_mode(
         // 语境分词确认/纠正：把用户裁决写进会话级读法记忆（键 = 当前焦点语境指纹）
         if let Some(spec) = strip_any_prefix(
             input,
-            &[
-                "语境分词确认：",
-                "语境分词确认:",
-                "读法确认：",
-                "读法确认:",
-            ],
+            &["语境分词确认：", "语境分词确认:", "读法确认：", "读法确认:"],
         ) {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             match spec.trim().split_once('=') {
@@ -11611,12 +11671,7 @@ async fn run_interactive_mode(
 
         if let Some(spec) = strip_any_prefix(
             input,
-            &[
-                "语境分词纠正：",
-                "语境分词纠正:",
-                "读法纠正：",
-                "读法纠正:",
-            ],
+            &["语境分词纠正：", "语境分词纠正:", "读法纠正：", "读法纠正:"],
         ) {
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             let parsed = spec.trim().split_once('=').and_then(|(surface, rest)| {
@@ -11638,9 +11693,9 @@ async fn run_interactive_mode(
                         )
                     );
                 }
-                _ => println!(
-                    "请提供「词面=旧读法>新读法」，例如：语境分词纠正：苹果=苹果>苹果公司"
-                ),
+                _ => {
+                    println!("请提供「词面=旧读法>新读法」，例如：语境分词纠正：苹果=苹果>苹果公司")
+                }
             }
             println!();
             continue;
@@ -12076,7 +12131,7 @@ async fn run_interactive_mode(
 
         // 质量护照：确定性可信向量（低分只用于排序/措辞/追问，不写回、不删事实）
         if matches!(input, "质量护照" | "质量总览" | "护照总览") {
-                match quality_report_for(&oxigraph_manager, &language_config, &store_path).await {
+            match quality_report_for(&oxigraph_manager, &language_config, &store_path).await {
                 Ok(report) => println!("{}", report.render_text()),
                 Err(e) => eprintln!("构建质量护照失败: {}", e),
             }
@@ -12103,7 +12158,7 @@ async fn run_interactive_mode(
             if entity.is_empty() {
                 println!("请给出实体名，例如：质量护照：张三");
             } else {
-            match quality_report_for(&oxigraph_manager, &language_config, &store_path).await {
+                match quality_report_for(&oxigraph_manager, &language_config, &store_path).await {
                     Ok(report) => match report.passport_for(entity) {
                         Some(passport) => println!("{}", render_entity_passport(passport)),
                         None => println!(
@@ -12634,7 +12689,9 @@ async fn run_interactive_mode(
                 Err(e) => println!("读取融合账本失败：{}", e),
             }
             match oxigraph_manager
-                .fusion_plan(&FusionPolicy::new().with_functional(functional_predicates(&language_config)))
+                .fusion_plan(
+                    &FusionPolicy::new().with_functional(functional_predicates(&language_config)),
+                )
                 .await
             {
                 Ok(plan) => println!("{}", plan.render_zh()),
@@ -12647,7 +12704,9 @@ async fn run_interactive_mode(
         // 知识融合物化：把当前视图的赢家写入默认图（可重复执行，幂等）
         if matches!(input, "融合应用" | "物化融合" | "应用融合") {
             match oxigraph_manager
-                .apply_fusion(&FusionPolicy::new().with_functional(functional_predicates(&language_config)))
+                .apply_fusion(
+                    &FusionPolicy::new().with_functional(functional_predicates(&language_config)),
+                )
                 .await
             {
                 Ok(outcome) => {
@@ -13049,8 +13108,11 @@ async fn run_interactive_mode(
                     let tagged_words = preprocess(&clean_text, &plugin_nlp);
                     let normalized_words = normalize_words(tagged_words, &synonyms);
                     let mut items = knowledge_extractor.extract(&clean_text, &normalized_words);
-                    let learned =
-                        batch_teaching.extract_active(&language_config, &clean_text, &normalized_words);
+                    let learned = batch_teaching.extract_active(
+                        &language_config,
+                        &clean_text,
+                        &normalized_words,
+                    );
                     let learned_added = append_learned_items(&mut items, learned);
                     if learned_added > 0 {
                         println!("批量教学规则命中 {} 条。", learned_added);
@@ -16777,6 +16839,22 @@ mod session_tests {
             assert!(is_ask_terminator(terminator), "{}", terminator);
         }
         assert!(!is_ask_terminator("为什么退出假设"));
+    }
+
+    #[test]
+    fn rewrite_retrieval_cli_parses_question_and_json() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "rewrite-retrieval",
+            "谁的师傅是李四",
+            "--json",
+        ])
+        .expect("rewrite-retrieval 参数应可解析");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::RewriteRetrieval { question, json })
+                if question == "谁的师傅是李四" && json
+        ));
     }
 
     #[tokio::test]
