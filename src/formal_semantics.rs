@@ -498,6 +498,7 @@ pub struct TinyModel {
     unary: HashMap<String, BTreeSet<String>>,
     values: HashMap<(String, String), Vec<String>>,
     binary: HashSet<(String, String, String)>,
+    binary_predicates: HashSet<String>,
     types: HashMap<String, BTreeSet<String>>,
     supers: HashMap<String, BTreeSet<String>>,
     class_set: HashSet<String>,
@@ -514,6 +515,7 @@ impl TinyModel {
             unary: HashMap::new(),
             values: HashMap::new(),
             binary: HashSet::new(),
+            binary_predicates: HashSet::new(),
             types: HashMap::new(),
             supers: HashMap::new(),
             class_set: HashSet::new(),
@@ -530,6 +532,68 @@ impl TinyModel {
 
     pub fn entity_count(&self) -> usize {
         self.entities.len()
+    }
+
+    /// 从一批已加载事实构造微型模型（与逐条 `observe_fact` 等价）。
+    pub fn from_facts(facts: &[PrologFact], synonyms: HashMap<String, String>) -> Self {
+        let mut model = Self::new(synonyms);
+        for fact in facts {
+            model.observe_fact(fact);
+        }
+        model
+    }
+
+    /// 名称是否已有个体域/类/取值层面的记录（数字字面量视为已知）。
+    pub fn knows_name(&self, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        if parse_number_token(name).is_some() {
+            return true;
+        }
+        if self
+            .name_variants(name)
+            .iter()
+            .any(|n| self.entities.contains(n) || self.class_set.contains(n))
+        {
+            return true;
+        }
+        self.class_like(name) || self.types.contains_key(name)
+    }
+
+    /// 谓词是否有任何外延记录（一元谓词、类型、属性键或二元关系）。
+    pub fn knows_predicate(&self, predicate: &str) -> bool {
+        let predicate = predicate.trim();
+        if predicate.is_empty() {
+            return false;
+        }
+        self.name_variants(predicate).iter().any(|p| {
+            self.unary.contains_key(p)
+                || self.class_set.contains(p)
+                || self.binary_predicates.contains(p)
+                || self.values.keys().any(|(_, key)| key == p)
+        })
+    }
+
+    /// 逻辑项中既不在个体域、也没有谓词/类型记录的词面（证据缺口）。
+    pub fn unknown_mentions(&self, term: &Term) -> Vec<String> {
+        let mut constants = Vec::new();
+        term.collect_consts(&mut constants);
+        let mut predicates = Vec::new();
+        collect_predicate_names(term, &mut predicates);
+        let mut unknown = Vec::new();
+        for name in constants {
+            if !self.knows_name(&name) && !unknown.contains(&name) {
+                unknown.push(name);
+            }
+        }
+        for predicate in predicates {
+            if !self.knows_predicate(&predicate) && !unknown.contains(&predicate) {
+                unknown.push(predicate);
+            }
+        }
+        unknown
     }
 
     fn canon(&self, name: &str) -> String {
@@ -581,6 +645,7 @@ impl TinyModel {
             return;
         }
         self.fact_count += 1;
+        self.binary_predicates.insert(rel_type.to_string());
         self.note_entity(from);
         self.note_entity(to);
         self.out_index
@@ -1171,6 +1236,20 @@ impl LogicalForm {
         !matches!(self.kind, LfKind::Unknown)
     }
 
+    /// 逻辑形式的规范签名：只含可求值的语义内容，不含来源与轨迹。
+    /// 同一签名的不同解析视为同一读法（用于候选森林去重与歧义判定）。
+    pub fn signature(&self) -> String {
+        match &self.kind {
+            LfKind::Statement(term) => format!("statement:{}", term.render()),
+            LfKind::Query(Query::Value { entity, predicate }) => {
+                format!("value:{}=>{}", entity, predicate)
+            }
+            LfKind::Query(Query::Entity { predicate }) => format!("entity:{}", predicate),
+            LfKind::Query(Query::Truth { body }) => format!("truth:{}", body.render()),
+            LfKind::Unknown => "unknown".to_string(),
+        }
+    }
+
     /// 逻辑形式的一行渲染
     pub fn render(&self) -> String {
         match &self.kind {
@@ -1199,6 +1278,39 @@ impl LogicalForm {
                 .unwrap_or((None, None)),
             LfKind::Unknown => (None, None),
         }
+    }
+}
+
+/// 收集逻辑项里出现的谓词名（不包括常量与量词变量）。
+fn collect_predicate_names(term: &Term, out: &mut Vec<String>) {
+    match term {
+        Term::Pred(name) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Term::App(f, a) => {
+            collect_predicate_names(f, out);
+            collect_predicate_names(a, out);
+        }
+        Term::Lam(_, body)
+        | Term::Not(body)
+        | Term::Exists { body, .. }
+        | Term::Forall { body, .. } => collect_predicate_names(body, out),
+        Term::Attr(p, x) => {
+            collect_predicate_names(p, out);
+            collect_predicate_names(x, out);
+        }
+        Term::And(terms) | Term::Or(terms) => {
+            for item in terms {
+                collect_predicate_names(item, out);
+            }
+        }
+        Term::Implies(a, b) | Term::Isa(a, b) | Term::Eq(a, b) => {
+            collect_predicate_names(a, out);
+            collect_predicate_names(b, out);
+        }
+        Term::Const(_) | Term::Num(_) | Term::Var(_) => {}
     }
 }
 
@@ -1246,6 +1358,132 @@ pub enum QueryOutcome {
         evidence: Vec<String>,
     },
     Unsupported(String),
+}
+
+impl QueryOutcome {
+    /// 可答内容的规范签名：两个候选签名相同即视为同一答案。
+    pub fn signature(&self) -> String {
+        match self {
+            QueryOutcome::Values {
+                entity,
+                predicate,
+                values,
+                ..
+            } => format!("values:{}:{}:{}", entity, predicate, values.join("\u{1f}")),
+            QueryOutcome::Entities {
+                predicate,
+                entities,
+                ..
+            } => format!("entities:{}:{}", predicate, entities.join("\u{1f}")),
+            QueryOutcome::Truth {
+                holds, statement, ..
+            } => {
+                format!("truth:{}:{}", holds, statement)
+            }
+            QueryOutcome::Unsupported(reason) => format!("unsupported:{}", reason),
+        }
+    }
+}
+
+/// 候选逻辑形式的来源策略（成本越低越优先保留旧路径的读法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseStrategy {
+    Conditional,
+    QuestionPattern,
+    Chart,
+}
+
+impl ParseStrategy {
+    pub fn label(self) -> &'static str {
+        match self {
+            ParseStrategy::Conditional => "条件句",
+            ParseStrategy::QuestionPattern => "问句模式",
+            ParseStrategy::Chart => "图表组合",
+        }
+    }
+}
+
+/// 解析候选：逻辑形式 + 来源 + 成本。森林保留全部读法，不在此处压平成一条。
+#[derive(Debug, Clone)]
+pub struct ParseCandidate {
+    pub form: LogicalForm,
+    pub strategy: ParseStrategy,
+    pub cost: usize,
+}
+
+/// 解析森林：同一输入的全部候选读法（按签名去重，保持发现顺序）。
+#[derive(Debug, Clone)]
+pub struct ParseForest {
+    pub source: String,
+    pub tokens: Vec<String>,
+    pub candidates: Vec<ParseCandidate>,
+    pub trace: Vec<String>,
+}
+
+impl ParseForest {
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    pub fn signatures(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.form.signature())
+            .collect()
+    }
+}
+
+/// 候选在给定微型模型上的接地状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateStatus {
+    /// 图谱中有正面证据（值/实体/成立的真值）。
+    Supported,
+    /// 名称与谓词均已知，但按封闭世界判为不成立。
+    Refuted,
+    /// 证据缺口：实体/谓词未知，或图谱没有相关记录。
+    Open,
+}
+
+impl CandidateStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            CandidateStatus::Supported => "有证据",
+            CandidateStatus::Refuted => "被反驳",
+            CandidateStatus::Open => "证据缺口",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GroundedCandidate {
+    pub candidate: ParseCandidate,
+    pub outcome: QueryOutcome,
+    pub status: CandidateStatus,
+    pub gaps: Vec<String>,
+}
+
+/// 联合解析-推理的判定：唯一答案、歧义（多个不同答案）、或证据不足。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForestDecision {
+    Answer { index: usize },
+    Ambiguous { indexes: Vec<usize> },
+    Unknown { reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ForestEvaluation {
+    pub forest: ParseForest,
+    pub grounded: Vec<GroundedCandidate>,
+    pub decision: ForestDecision,
+}
+
+impl ForestEvaluation {
+    pub fn answer(&self) -> Option<&QueryOutcome> {
+        match self.decision {
+            ForestDecision::Answer { index } => self.grounded.get(index).map(|g| &g.outcome),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,11 +1592,9 @@ impl FormalSemantics {
         tokens
     }
 
-    /// 解析中文句子为逻辑形式（问句优先走模式切分，陈述句走类型驱动图表分析）
-    pub fn parse(&self, text: &str) -> LogicalForm {
-        let source = text.trim().to_string();
-        let raw_tokens = self.tokenize(&source);
-        // 合并被切开的「不 + 是」→「不是」，保证系词否定进入同一条系词规则
+    /// 归一化分词：合并被切开的「不 + 是」→「不是」，保证系词否定进入同一条系词规则。
+    fn normalize_tokens(&self, text: &str) -> Vec<String> {
+        let raw_tokens = self.tokenize(text);
         let mut tokens: Vec<String> = Vec::with_capacity(raw_tokens.len());
         let mut index = 0;
         while index < raw_tokens.len() {
@@ -1373,6 +1609,13 @@ impl FormalSemantics {
                 index += 1;
             }
         }
+        tokens
+    }
+
+    /// 解析中文句子为逻辑形式（问句优先走模式切分，陈述句走类型驱动图表分析）
+    pub fn parse(&self, text: &str) -> LogicalForm {
+        let source = text.trim().to_string();
+        let tokens = self.normalize_tokens(&source);
         let mut trace = vec![format!("分词：{}", tokens.join(" / "))];
         if tokens.is_empty() {
             trace.push("空输入".to_string());
@@ -1425,6 +1668,109 @@ impl FormalSemantics {
         }
         trace.push("未能在当前片段内组合出类型为 t 的逻辑形式".to_string());
         LogicalForm::unknown(source, tokens, trace)
+    }
+
+    /// 解析出候选森林：条件句、问句模式与图表组合都作为独立读法保留。
+    ///
+    /// 与 `parse` 的差别只在「不压平」：`parse` 仍按旧优先级返回单条逻辑形式，
+    /// 本方法把同一输入的其它类型合法读法也留下来，供模型接地与歧义判定。
+    pub fn parse_forest(&self, text: &str) -> ParseForest {
+        let source = text.trim().to_string();
+        let tokens = self.normalize_tokens(&source);
+        let mut forest = ParseForest {
+            source: source.clone(),
+            tokens: tokens.clone(),
+            candidates: Vec::new(),
+            trace: vec![format!("分词：{}", tokens.join(" / "))],
+        };
+        if tokens.is_empty() {
+            forest.trace.push("空输入".to_string());
+            return forest;
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut conditional_trace = forest.trace.clone();
+        if let Some(lf) = self.parse_conditional(&tokens, &source, &mut conditional_trace) {
+            push_forest_candidate(&mut forest, &mut seen, lf, ParseStrategy::Conditional, 0);
+        }
+        let is_question = tokens
+            .iter()
+            .any(|token| QUESTION_WORDS.contains(&token.as_str()))
+            || tokens
+                .last()
+                .map(|token| QUESTION_SUFFIX.contains(&token.as_str()))
+                .unwrap_or(false)
+            || source.ends_with('?')
+            || source.ends_with('？');
+        if is_question {
+            for (index, lf) in self
+                .question_candidates(&tokens, &source)
+                .into_iter()
+                .enumerate()
+            {
+                push_forest_candidate(
+                    &mut forest,
+                    &mut seen,
+                    lf,
+                    ParseStrategy::QuestionPattern,
+                    10 + index,
+                );
+            }
+        }
+        if tokens.len() <= self.max_tokens {
+            let chart_items = self.chart_complete(&tokens);
+            for (index, item) in chart_items.into_iter().enumerate() {
+                if item.ty != Type::Truth {
+                    continue;
+                }
+                let chart_label = format!("图表组合：{} : {}", item.label, item.ty.render());
+                if !self.has_assertion_marker(&tokens) {
+                    if let Some((entity, predicate)) = possessive_np(&item.term) {
+                        let form = LogicalForm {
+                            source: source.clone(),
+                            tokens: tokens.clone(),
+                            kind: LfKind::Query(Query::Value {
+                                entity: entity.clone(),
+                                predicate: predicate.clone(),
+                            }),
+                            trace: vec![
+                                format!("分词：{}", tokens.join(" / ")),
+                                chart_label.clone(),
+                                format!(
+                                    "无断言标记，也可解释为属性查询：{} 的 {}",
+                                    entity, predicate
+                                ),
+                            ],
+                        };
+                        push_forest_candidate(
+                            &mut forest,
+                            &mut seen,
+                            form,
+                            ParseStrategy::Chart,
+                            20 + index,
+                        );
+                    }
+                }
+                let form = LogicalForm {
+                    source: source.clone(),
+                    tokens: tokens.clone(),
+                    kind: LfKind::Statement(item.term),
+                    trace: vec![format!("分词：{}", tokens.join(" / ")), chart_label],
+                };
+                push_forest_candidate(
+                    &mut forest,
+                    &mut seen,
+                    form,
+                    ParseStrategy::Chart,
+                    40 + index,
+                );
+            }
+        }
+        if forest.candidates.is_empty() {
+            forest
+                .trace
+                .push("未能在当前片段内组合出可求值的逻辑形式".to_string());
+        }
+        forest
     }
 
     fn has_assertion_marker(&self, tokens: &[String]) -> bool {
@@ -1481,22 +1827,43 @@ impl FormalSemantics {
         source: &str,
         trace: &mut Vec<String>,
     ) -> Option<LogicalForm> {
+        let first = self
+            .question_candidates(tokens, source)
+            .into_iter()
+            .next()?;
+        *trace = first.trace.clone();
+        Some(first)
+    }
+
+    /// 问句模式的全部候选：按旧路径的优先级顺序生成，但不提前返回。
+    fn question_candidates(&self, tokens: &[String], source: &str) -> Vec<LogicalForm> {
+        let base_trace = vec![format!("分词：{}", tokens.join(" / "))];
+        let mut out = Vec::new();
+        let make = |kind: LfKind, extra: Vec<String>| {
+            let mut trace = base_trace.clone();
+            trace.extend(extra);
+            LogicalForm {
+                source: source.to_string(),
+                tokens: tokens.to_vec(),
+                kind,
+                trace,
+            }
+        };
         // 1) 「…吗/呢」：去掉句尾疑问词后按陈述句解析，再作为真值查询
         if let Some(last) = tokens.last() {
             if QUESTION_SUFFIX.contains(&last.as_str()) && tokens.len() > 1 {
                 let body_tokens = &tokens[..tokens.len() - 1];
-                let mut chart_trace = Vec::new();
-                if let Some(item) = self.chart_parse(body_tokens, &mut chart_trace) {
-                    if item.ty == Type::Truth {
-                        trace.extend(chart_trace);
-                        trace.push("句尾疑问词：转化为真值查询".to_string());
-                        return Some(LogicalForm {
-                            source: source.to_string(),
-                            tokens: tokens.to_vec(),
-                            kind: LfKind::Query(Query::Truth { body: item.term }),
-                            trace: trace.clone(),
-                        });
+                for item in self.chart_complete(body_tokens) {
+                    if item.ty != Type::Truth {
+                        continue;
                     }
+                    out.push(make(
+                        LfKind::Query(Query::Truth { body: item.term }),
+                        vec![
+                            format!("图表组合：{} : {}", item.label, item.ty.render()),
+                            "句尾疑问词：转化为真值查询".to_string(),
+                        ],
+                    ));
                 }
             }
         }
@@ -1508,18 +1875,15 @@ impl FormalSemantics {
             let entity = self.entity_from_tokens(&tokens[..index]);
             let predicate = self.predicate_from_tokens(&tokens[index + 1..]);
             if let (Some(entity), Some(predicate)) = (entity, predicate) {
-                trace.push(format!("是不是句式：Isa({}, {})", entity, predicate));
-                return Some(LogicalForm {
-                    source: source.to_string(),
-                    tokens: tokens.to_vec(),
-                    kind: LfKind::Query(Query::Truth {
+                out.push(make(
+                    LfKind::Query(Query::Truth {
                         body: Term::Isa(
-                            Box::new(Term::Const(entity)),
-                            Box::new(Term::Const(predicate)),
+                            Box::new(Term::Const(entity.clone())),
+                            Box::new(Term::Const(predicate.clone())),
                         ),
                     }),
-                    trace: trace.clone(),
-                });
+                    vec![format!("是不是句式：Isa({}, {})", entity, predicate)],
+                ));
             }
         }
         // 3) 「谁 / 哪些人 / 何人 …」：实体查询
@@ -1535,13 +1899,12 @@ impl FormalSemantics {
                     rest = &rest[1..];
                 }
                 if let Some(predicate) = self.predicate_from_tokens(rest) {
-                    trace.push(format!("谁是句式：查询满足「{}」的实体", predicate));
-                    return Some(LogicalForm {
-                        source: source.to_string(),
-                        tokens: tokens.to_vec(),
-                        kind: LfKind::Query(Query::Entity { predicate }),
-                        trace: trace.clone(),
-                    });
+                    out.push(make(
+                        LfKind::Query(Query::Entity {
+                            predicate: predicate.clone(),
+                        }),
+                        vec![format!("谁是句式：查询满足「{}」的实体", predicate)],
+                    ));
                 }
             }
         }
@@ -1551,16 +1914,16 @@ impl FormalSemantics {
                 if let Some(entity) = self.entity_from_tokens(&tokens[..index]) {
                     if let Some(predicate) = self.predicate_from_tokens(&tokens[index + 1..]) {
                         if !predicate.is_empty() {
-                            trace.push(format!(
-                                "的-属格句式：查询「{}」的「{}」值",
-                                entity, predicate
+                            out.push(make(
+                                LfKind::Query(Query::Value {
+                                    entity: entity.clone(),
+                                    predicate: predicate.clone(),
+                                }),
+                                vec![format!(
+                                    "的-属格句式：查询「{}」的「{}」值",
+                                    entity, predicate
+                                )],
                             ));
-                            return Some(LogicalForm {
-                                source: source.to_string(),
-                                tokens: tokens.to_vec(),
-                                kind: LfKind::Query(Query::Value { entity, predicate }),
-                                trace: trace.clone(),
-                            });
                         }
                     }
                 }
@@ -1568,18 +1931,18 @@ impl FormalSemantics {
         }
         // 5) 「E P …」（无「的」）：按最长实体前缀切分
         if let Some((entity, predicate)) = self.split_entity_predicate(tokens) {
-            trace.push(format!(
-                "实体-谓词切分：查询「{}」的「{}」值",
-                entity, predicate
+            out.push(make(
+                LfKind::Query(Query::Value {
+                    entity: entity.clone(),
+                    predicate: predicate.clone(),
+                }),
+                vec![format!(
+                    "实体-谓词切分：查询「{}」的「{}」值",
+                    entity, predicate
+                )],
             ));
-            return Some(LogicalForm {
-                source: source.to_string(),
-                tokens: tokens.to_vec(),
-                kind: LfKind::Query(Query::Value { entity, predicate }),
-                trace: trace.clone(),
-            });
         }
-        None
+        out
     }
 
     fn entity_from_tokens(&self, tokens: &[String]) -> Option<String> {
@@ -1647,11 +2010,27 @@ impl FormalSemantics {
         best
     }
 
-    /// 类型驱动的图表组合分析（CKY 风格：函数应用 + 量词 + 合取 + 系词规则）
+    /// 旧的单读法入口：从图表完整分析中按「真值 > 一元谓词 > 任意」取一条。
+    /// 新代码应使用 `chart_complete` 或 `parse_forest`，避免静默丢掉其它读法。
     fn chart_parse(&self, tokens: &[String], trace: &mut Vec<String>) -> Option<Item> {
+        let top = self.chart_complete(tokens);
+        let truth = top.iter().find(|item| item.ty == Type::Truth).cloned();
+        let unary = top
+            .iter()
+            .find(|item| item.ty == Type::fun(Type::Entity, Type::Truth))
+            .cloned();
+        let chosen = truth.or(unary).or_else(|| top.first().cloned());
+        if let Some(item) = &chosen {
+            trace.push(format!("图表组合：{} : {}", item.label, item.ty.render()));
+        }
+        chosen
+    }
+
+    /// 图表完整分析：返回顶层全部读法（按首次发现顺序，按项渲染去重）。
+    fn chart_complete(&self, tokens: &[String]) -> Vec<Item> {
         let n = tokens.len();
         if n == 0 || n > self.max_tokens {
-            return None;
+            return Vec::new();
         }
         let entity_ty = Type::Entity;
         let truth_ty = Type::Truth;
@@ -1915,15 +2294,14 @@ impl FormalSemantics {
             }
         }
 
-        // 优先取类型为 t 的完整解析，其次取一元谓词（无主语句），最后取任何解析
-        let top = cells[0][n].clone();
-        let truth = top.iter().find(|item| item.ty == truth_ty).cloned();
-        let unary = top.iter().find(|item| item.ty == unary_ty).cloned();
-        let chosen = truth.or(unary).or_else(|| top.first().cloned());
-        if let Some(item) = &chosen {
-            trace.push(format!("图表组合：{} : {}", item.label, item.ty.render()));
+        let mut out: Vec<Item> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in cells[0][n].iter() {
+            if seen.insert(format!("{}:{}", item.ty.render(), item.term.render())) {
+                out.push(item.clone());
+            }
         }
-        chosen
+        out
     }
 
     /// 在模型上求解逻辑形式
@@ -1987,6 +2365,239 @@ impl FormalSemantics {
             }
             LfKind::Unknown => QueryOutcome::Unsupported("未能组合出逻辑形式".to_string()),
         }
+    }
+
+    /// 候选读法的证据缺口：实体/谓词不在模型里，或查询没有命中记录。
+    fn candidate_gaps(&self, lf: &LogicalForm, model: &TinyModel) -> Vec<String> {
+        let mut gaps = Vec::new();
+        match &lf.kind {
+            LfKind::Query(Query::Value { entity, predicate }) => {
+                if !model.knows_name(entity) {
+                    gaps.push(format!("实体「{}」不在已知个体域", entity));
+                }
+                if !model.knows_predicate(predicate) {
+                    gaps.push(format!("谓词「{}」没有任何已知记录", predicate));
+                }
+            }
+            LfKind::Query(Query::Entity { predicate }) => {
+                if !model.knows_predicate(predicate) {
+                    gaps.push(format!("谓词「{}」没有任何已知记录", predicate));
+                }
+            }
+            LfKind::Query(Query::Truth { body }) | LfKind::Statement(body) => {
+                for name in model.unknown_mentions(body) {
+                    gaps.push(format!("「{}」不在个体域或谓词表中", name));
+                }
+            }
+            LfKind::Unknown => gaps.push("未能组合出可求值的逻辑形式".to_string()),
+        }
+        gaps
+    }
+
+    /// 把单个候选放到模型上接地：有证据 / 被反驳 / 证据缺口。
+    pub fn ground_candidate(
+        &self,
+        candidate: ParseCandidate,
+        model: &TinyModel,
+    ) -> GroundedCandidate {
+        let gaps = self.candidate_gaps(&candidate.form, model);
+        let outcome = self.solve(&candidate.form, model);
+        let status = match &outcome {
+            QueryOutcome::Values { values, .. } => {
+                if values.is_empty() {
+                    CandidateStatus::Open
+                } else {
+                    CandidateStatus::Supported
+                }
+            }
+            QueryOutcome::Entities { entities, .. } => {
+                if entities.is_empty() {
+                    CandidateStatus::Open
+                } else {
+                    CandidateStatus::Supported
+                }
+            }
+            QueryOutcome::Truth { holds: true, .. } => {
+                if gaps.is_empty() {
+                    CandidateStatus::Supported
+                } else {
+                    CandidateStatus::Open
+                }
+            }
+            QueryOutcome::Truth { holds: false, .. } => {
+                if gaps.is_empty() {
+                    CandidateStatus::Refuted
+                } else {
+                    CandidateStatus::Open
+                }
+            }
+            QueryOutcome::Unsupported(_) => CandidateStatus::Open,
+        };
+        GroundedCandidate {
+            candidate,
+            outcome,
+            status,
+            gaps,
+        }
+    }
+
+    /// 联合解析-推理：保留森林、逐候选接地，再决定唯一答案/歧义/缺口。
+    pub fn evaluate(&self, text: &str, model: &TinyModel) -> ForestEvaluation {
+        let forest = self.parse_forest(text);
+        self.evaluate_forest(forest, model)
+    }
+
+    /// 对已有森林做接地与判定（供外部候选来源合并后复用）。
+    pub fn evaluate_forest(&self, forest: ParseForest, model: &TinyModel) -> ForestEvaluation {
+        let grounded: Vec<GroundedCandidate> = forest
+            .candidates
+            .iter()
+            .cloned()
+            .map(|candidate| self.ground_candidate(candidate, model))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut supported_indexes = Vec::new();
+        for (index, candidate) in grounded.iter().enumerate() {
+            if candidate.status != CandidateStatus::Supported {
+                continue;
+            }
+            if seen.insert(candidate.outcome.signature()) {
+                supported_indexes.push(index);
+            }
+        }
+        let decision = if supported_indexes.len() == 1 {
+            ForestDecision::Answer {
+                index: supported_indexes[0],
+            }
+        } else if supported_indexes.len() > 1 {
+            ForestDecision::Ambiguous {
+                indexes: supported_indexes,
+            }
+        } else if grounded.is_empty() {
+            ForestDecision::Unknown {
+                reason: "没有可求值的候选逻辑形式".to_string(),
+            }
+        } else if grounded
+            .iter()
+            .any(|candidate| candidate.status == CandidateStatus::Refuted)
+        {
+            ForestDecision::Unknown {
+                reason: "候选均被知识图谱反驳；不把否定当作答案".to_string(),
+            }
+        } else {
+            let mut gaps: Vec<String> = Vec::new();
+            for candidate in &grounded {
+                for gap in &candidate.gaps {
+                    if !gaps.contains(gap) {
+                        gaps.push(gap.clone());
+                    }
+                }
+            }
+            let detail = if gaps.is_empty() {
+                "图谱没有命中记录".to_string()
+            } else {
+                gaps.join("；")
+            };
+            ForestDecision::Unknown {
+                reason: format!("证据不足：{}", detail),
+            }
+        };
+        ForestEvaluation {
+            forest,
+            grounded,
+            decision,
+        }
+    }
+
+    /// 从联合判定生成中文回答；只有唯一且正证据支持的候选才作答。
+    pub fn answer_evaluation(
+        &self,
+        evaluation: &ForestEvaluation,
+        include_evidence: bool,
+    ) -> Option<String> {
+        let index = match evaluation.decision {
+            ForestDecision::Answer { index } => index,
+            _ => return None,
+        };
+        let grounded = evaluation.grounded.get(index)?;
+        let mut answer = self.render_outcome(&grounded.outcome);
+        if include_evidence {
+            let evidence = match &grounded.outcome {
+                QueryOutcome::Values { evidence, .. }
+                | QueryOutcome::Entities { evidence, .. }
+                | QueryOutcome::Truth { evidence, .. } => evidence.clone(),
+                QueryOutcome::Unsupported(_) => Vec::new(),
+            };
+            if !evidence.is_empty() && !answer.contains("证据：") {
+                answer.push_str(&format!("\n证据：{}", evidence.join("；")));
+            }
+        }
+        Some(answer)
+    }
+
+    /// 一步完成解析森林 + 模型接地 + 唯一答案生成。
+    pub fn answer_forest(
+        &self,
+        text: &str,
+        model: &TinyModel,
+        include_evidence: bool,
+    ) -> Option<String> {
+        let evaluation = self.evaluate(text, model);
+        self.answer_evaluation(&evaluation, include_evidence)
+    }
+
+    /// 候选森林与接地状态的可读报告（用于「语义分析」命令与失败诊断）。
+    pub fn render_forest_report(&self, evaluation: &ForestEvaluation) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("语义森林：「{}」\n", evaluation.forest.source));
+        if evaluation.forest.candidates.is_empty() {
+            for step in &evaluation.forest.trace {
+                out.push_str(&format!("  • {}\n", step));
+            }
+            out.push_str("判定：没有可求值的逻辑形式。");
+            return out.trim_end().to_string();
+        }
+        for (index, grounded) in evaluation.grounded.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. [{}，成本 {}] {}\n",
+                index + 1,
+                grounded.candidate.strategy.label(),
+                grounded.candidate.cost,
+                grounded.candidate.form.render()
+            ));
+            out.push_str(&format!("   状态：{}", grounded.status.label()));
+            if !grounded.gaps.is_empty() {
+                out.push_str(&format!("（缺口：{}）", grounded.gaps.join("；")));
+            }
+            out.push('\n');
+            let evidence = match &grounded.outcome {
+                QueryOutcome::Values { evidence, .. }
+                | QueryOutcome::Entities { evidence, .. }
+                | QueryOutcome::Truth { evidence, .. } => evidence.clone(),
+                QueryOutcome::Unsupported(_) => Vec::new(),
+            };
+            if !evidence.is_empty() {
+                out.push_str(&format!("   证据：{}\n", evidence.join("；")));
+            }
+        }
+        match &evaluation.decision {
+            ForestDecision::Answer { index } => {
+                out.push_str(&format!("判定：唯一可答读法（候选 {}）。", index + 1));
+            }
+            ForestDecision::Ambiguous { indexes } => {
+                out.push_str("判定：存在歧义；不同读法给出不同答案：");
+                let answers: Vec<String> = indexes
+                    .iter()
+                    .filter_map(|index| evaluation.grounded.get(*index))
+                    .map(|grounded| self.render_outcome(&grounded.outcome))
+                    .collect();
+                out.push_str(&answers.join(" / "));
+            }
+            ForestDecision::Unknown { reason } => {
+                out.push_str(&format!("判定：证据不足（{}）。", reason));
+            }
+        }
+        out.trim_end().to_string()
     }
 
     /// 渲染求解结果（中文生成）
@@ -2069,6 +2680,35 @@ impl FormalSemantics {
         }
         out
     }
+}
+
+/// 森林追加：按逻辑形式签名去重，保留成本更低的读法。
+fn push_forest_candidate(
+    forest: &mut ParseForest,
+    seen: &mut HashSet<String>,
+    form: LogicalForm,
+    strategy: ParseStrategy,
+    cost: usize,
+) {
+    let signature = form.signature();
+    if !seen.insert(signature.clone()) {
+        if let Some(existing) = forest
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.form.signature() == signature)
+        {
+            if cost < existing.cost {
+                existing.cost = cost;
+                existing.strategy = strategy;
+            }
+        }
+        return;
+    }
+    forest.candidates.push(ParseCandidate {
+        form,
+        strategy,
+        cost,
+    });
 }
 
 /// 把完整解析饱和为真值：一元谓词做存在闭包（无主语句），其余仅接受 t
@@ -2562,5 +3202,99 @@ mod tests {
             Some("张三的年龄是多少")
         );
         assert_eq!(memory.contextualize("张三的年龄是多少"), None);
+    }
+
+    #[test]
+    fn parse_forest_keeps_multiple_readings() {
+        let (semantics, _model) = people_setup();
+        let forest = semantics.parse_forest("张三的年龄");
+        assert!(
+            forest.candidates.len() >= 2,
+            "森林不应压平成单条：{:?}",
+            forest
+        );
+        let legacy = semantics.parse("张三的年龄");
+        assert!(
+            forest
+                .candidates
+                .iter()
+                .any(|candidate| candidate.form.signature() == legacy.signature()),
+            "旧路径读法必须保留在森林中"
+        );
+    }
+
+    #[test]
+    fn forest_answers_only_evidence_backed_reading() {
+        let (semantics, model) = people_setup();
+        let evaluation = semantics.evaluate("张三的年龄是多少", &model);
+        assert!(
+            matches!(evaluation.decision, ForestDecision::Answer { .. }),
+            "evaluation = {:?}",
+            evaluation
+        );
+        let answer = semantics
+            .answer_evaluation(&evaluation, true)
+            .expect("应给出唯一答案");
+        assert!(answer.contains("30"), "answer = {}", answer);
+        assert!(answer.contains("证据"), "answer = {}", answer);
+    }
+
+    #[test]
+    fn unknown_entity_stays_an_open_gap() {
+        let (semantics, model) = people_setup();
+        let evaluation = semantics.evaluate("王五的年龄是多少", &model);
+        assert!(
+            matches!(evaluation.decision, ForestDecision::Unknown { .. }),
+            "evaluation = {:?}",
+            evaluation
+        );
+        assert!(evaluation
+            .grounded
+            .iter()
+            .all(|candidate| candidate.status != CandidateStatus::Supported));
+        assert!(evaluation
+            .grounded
+            .iter()
+            .any(|candidate| candidate.gaps.iter().any(|gap| gap.contains("王五"))));
+        assert!(semantics.answer_evaluation(&evaluation, true).is_none());
+    }
+
+    #[test]
+    fn distinct_supported_readings_are_reported_as_ambiguous() {
+        let (semantics, model) = people_setup();
+        let make = |predicate: &str| LogicalForm {
+            source: "张三的年龄和国籍".to_string(),
+            tokens: vec!["张三".into(), "的".into(), predicate.into()],
+            kind: LfKind::Query(Query::Value {
+                entity: "张三".to_string(),
+                predicate: predicate.to_string(),
+            }),
+            trace: Vec::new(),
+        };
+        let forest = ParseForest {
+            source: "张三的年龄和国籍".to_string(),
+            tokens: vec!["张三".into(), "的".into(), "年龄和国籍".into()],
+            candidates: vec![
+                ParseCandidate {
+                    form: make("年龄"),
+                    strategy: ParseStrategy::QuestionPattern,
+                    cost: 10,
+                },
+                ParseCandidate {
+                    form: make("国籍"),
+                    strategy: ParseStrategy::Chart,
+                    cost: 20,
+                },
+            ],
+            trace: Vec::new(),
+        };
+        let evaluation = semantics.evaluate_forest(forest, &model);
+        match evaluation.decision {
+            ForestDecision::Ambiguous { ref indexes } => assert_eq!(indexes.len(), 2),
+            other => panic!("unexpected decision: {:?}", other),
+        }
+        assert!(evaluation.answer().is_none());
+        let report = semantics.render_forest_report(&evaluation);
+        assert!(report.contains("歧义"), "report = {}", report);
     }
 }
