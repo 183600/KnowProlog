@@ -11202,24 +11202,49 @@ impl SymbolicReasoner {
     ///
     /// 顺序只影响报告的可读性；去重与排序交给
     /// [`rewrite_retrieval::assess`]，同一计划保留最可靠的来源。
+    fn rewrite_retrieval_context_bonus(&self, plan: &QueryPlan) -> f64 {
+        let last_predicate = self.context.last_predicate();
+        let focus = self.context.focus_entities();
+        let mut bonus: f64 = 0.0;
+        for predicate in rewrite_retrieval::plan_predicates(plan) {
+            if last_predicate.is_some_and(|last| last == predicate) {
+                bonus += 0.5;
+            }
+        }
+        for entity in rewrite_retrieval::plan_entities(plan) {
+            if focus.iter().any(|focused| focused == entity) {
+                bonus += 0.25;
+            }
+        }
+        bonus.clamp(-2.0, 2.0)
+    }
+
     pub fn rewrite_retrieval_candidates(&self, question: &str) -> Vec<HypothesisCandidate> {
         let mut candidates = Vec::new();
         if let Some(plan) = self.planner.parse(question) {
-            candidates.push(HypothesisCandidate::new(
-                HypothesisSource::ExactPlan,
-                "planner",
-                question,
-                plan,
-            ));
+            let bonus = self.rewrite_retrieval_context_bonus(&plan);
+            candidates.push(
+                HypothesisCandidate::new(
+                    HypothesisSource::ExactPlan,
+                    "planner",
+                    question,
+                    plan,
+                )
+                .with_context_bonus(bonus),
+            );
         }
         let lexicon = self.relation_lexicon();
         if let Some(rewrite) = query_rewrite::rewrite(question, &lexicon) {
-            candidates.push(HypothesisCandidate::new(
-                HypothesisSource::SyntaxRewrite,
-                rewrite.rule,
-                question,
-                rewrite.plan,
-            ));
+            let bonus = self.rewrite_retrieval_context_bonus(&rewrite.plan);
+            candidates.push(
+                HypothesisCandidate::new(
+                    HypothesisSource::SyntaxRewrite,
+                    rewrite.rule,
+                    question,
+                    rewrite.plan,
+                )
+                .with_context_bonus(bonus),
+            );
         }
         let hints = self.link_hints(question);
         let capsule = self.discourse.ontology_capsule();
@@ -11230,17 +11255,21 @@ impl SymbolicReasoner {
             let Some(plan) = variant.preferred_plan() else {
                 continue;
             };
+            let bonus = self.rewrite_retrieval_context_bonus(plan);
             let rule = variant
                 .replacements
                 .first()
                 .map(|replacement| format!("anchor:{}", replacement.surface))
                 .unwrap_or_else(|| "anchor".to_string());
-            candidates.push(HypothesisCandidate::new(
-                HypothesisSource::AnchoredPlan,
-                rule,
-                variant.question.clone(),
-                plan.clone(),
-            ));
+            candidates.push(
+                HypothesisCandidate::new(
+                    HypothesisSource::AnchoredPlan,
+                    rule,
+                    variant.question.clone(),
+                    plan.clone(),
+                )
+                .with_context_bonus(bonus),
+            );
         }
         candidates
     }

@@ -99,6 +99,7 @@ use know_prolog::{
     release::{self, CheckOptions},
     resolution_engine::SearchStatus,
     rewrite_book::{self, RewriteBook},
+    rewrite_retrieval,
     schema_view::SchemaView,
     shape_dialogue::ShapeDialogue,
     shape_eval::{
@@ -837,6 +838,18 @@ enum Commands {
         /// Question to analyse
         question: String,
         /// Print the assessment as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Evaluate the rewrite-retrieval arbitration on a TSV corpus
+    /// (`question<TAB>expected`, expected may use `|` alternatives)
+    RewriteRetrievalEval {
+        /// Corpus file path
+        corpus: String,
+        /// Exit non-zero when any accepted reading is wrong
+        #[arg(long)]
+        strict: bool,
+        /// Print the report as JSON
         #[arg(long)]
         json: bool,
     },
@@ -2406,49 +2419,8 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let registry_path = format!("{}/predicate_registry.json", store_path);
-            let _ = oxigraph_manager.load_predicate_registry(&registry_path);
-            oxigraph_manager.configure_predicates(
-                &config.predicate_profiles,
-                config.reasoning.require_predicate_admission,
-            );
-            let _ = oxigraph_manager
-                .load_entity_registry(&format!("{}/entity_registry.json", store_path));
-            oxigraph_manager.configure_entities(&config.entity_profiles);
-            oxigraph_manager.configure_type_system(&config.type_system);
-            let synonyms = config
-                .synonyms
-                .as_ref()
-                .map(|synonyms| synonyms.mappings.clone())
-                .unwrap_or_else(create_default_synonyms);
-            let mut reasoner = SymbolicReasoner::with_perf_ledger(
-                config.reasoning.clone(),
-                synonyms,
-                PerfLedger::shared(),
-            );
-            reasoner.set_nlp_config(config.nlp.clone());
-            if config.semantic_grammar.enabled {
-                reasoner.attach_semantic_grammar(
-                    know_prolog::semantic_grammar::RulePack::from_config(&config),
-                );
-            }
-            let (ontology_program, _) = owl_annotation::ontology_program_with_annotations(
-                &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
-                &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
-            );
-            reasoner.configure_ontology_program(&ontology_program);
-            reasoner.configure_schema_view(&SchemaView::from_config(
-                &config.type_system,
-                &config.predicate_profiles,
-            ));
-            reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
-            reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
-            if let Some(persisted) =
-                LawBook::load_from_path(&format!("{}/law_book.json", store_path))
-            {
-                reasoner.load_persisted_laws(persisted);
-            }
-            reasoner.observe_facts(&facts);
+            let reasoner =
+                build_store_reasoner(config.as_ref(), &oxigraph_manager, &store_path, &facts).await;
             match reasoner.rewrite_retrieval_assessment(&question) {
                 Some(assessment) => {
                     if json {
@@ -2464,6 +2436,57 @@ async fn main() {
                     }
                 }
                 None => println!("没有可编译的候选读法：{}", question.trim()),
+            }
+        }
+        Some(Commands::RewriteRetrievalEval {
+            corpus,
+            strict,
+            json,
+        }) => {
+            let text = match std::fs::read_to_string(&corpus) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("读取评测语料失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            let cases = rewrite_retrieval::parse_corpus(&text);
+            if cases.is_empty() {
+                eprintln!(
+                    "评测语料为空：每行应为 `问句<TAB>期望答案`（期望答案可用 | 分隔多个候选）。"
+                );
+                std::process::exit(1);
+            }
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(error) => {
+                    eprintln!("读取知识库失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            let reasoner =
+                build_store_reasoner(config.as_ref(), &oxigraph_manager, &store_path, &facts).await;
+            let report = rewrite_retrieval::evaluate(
+                &cases,
+                &config.reasoning.rewrite_retrieval,
+                |question| reasoner.rewrite_retrieval_candidates(question),
+                |query, k, constraints| {
+                    reasoner.evidence_search(query, k, constraints, SearchBudget::default())
+                },
+            );
+            if json {
+                match serde_json::to_string_pretty(&report) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("评测报告序列化失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", report.render_text());
+            }
+            if strict && report.accepted_wrong > 0 {
+                std::process::exit(1);
             }
         }
         Some(Commands::Snapshot {
@@ -6918,6 +6941,62 @@ fn intro_request_entity(input: &str, reasoner: &SymbolicReasoner) -> Option<Stri
     None
 }
 
+/// 按 ask/交互/服务一致的装配顺序，从存储事实构建只读推理器。
+async fn build_store_reasoner(
+    config: &SystemConfig,
+    oxigraph_manager: &OxigraphManager,
+    store_path: &str,
+    facts: &[PrologFact],
+) -> SymbolicReasoner {
+    let registry_path = format!("{}/predicate_registry.json", store_path);
+    let _ = oxigraph_manager.load_predicate_registry(&registry_path);
+    oxigraph_manager.configure_predicates(
+        &config.predicate_profiles,
+        config.reasoning.require_predicate_admission,
+    );
+    let _ = oxigraph_manager.load_entity_registry(&format!("{}/entity_registry.json", store_path));
+    oxigraph_manager.configure_entities(&config.entity_profiles);
+    oxigraph_manager.configure_type_system(&config.type_system);
+
+    let synonyms = config
+        .synonyms
+        .as_ref()
+        .map(|synonyms| synonyms.mappings.clone())
+        .unwrap_or_else(create_default_synonyms);
+    let mut reasoner = SymbolicReasoner::with_perf_ledger(
+        config.reasoning.clone(),
+        synonyms,
+        PerfLedger::shared(),
+    );
+    reasoner.set_nlp_config(config.nlp.clone());
+    if config.semantic_grammar.enabled {
+        reasoner.attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(
+            config,
+        ));
+    }
+    if let Ok(memory) = oxigraph_manager.load_lexical_memory().await {
+        if !memory.is_empty() {
+            reasoner.set_lexical_memory(memory);
+        }
+    }
+    let (ontology_program, _) = owl_annotation::ontology_program_with_annotations(
+        &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
+        &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
+    );
+    reasoner.configure_ontology_program(&ontology_program);
+    reasoner.configure_schema_view(&SchemaView::from_config(
+        &config.type_system,
+        &config.predicate_profiles,
+    ));
+    reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
+    reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
+    if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
+        reasoner.load_persisted_laws(persisted);
+    }
+    reasoner.observe_facts(facts);
+    reasoner
+}
+
 async fn run_ask(
     config: &SystemConfig,
     oxigraph_manager: &OxigraphManager,
@@ -6957,52 +7036,7 @@ async fn run_ask(
         std::process::exit(1);
     }
 
-    let registry_path = format!("{}/predicate_registry.json", store_path);
-    let _ = oxigraph_manager.load_predicate_registry(&registry_path);
-    oxigraph_manager.configure_predicates(
-        &config.predicate_profiles,
-        config.reasoning.require_predicate_admission,
-    );
-    let _ = oxigraph_manager.load_entity_registry(&format!("{}/entity_registry.json", store_path));
-    oxigraph_manager.configure_entities(&config.entity_profiles);
-    oxigraph_manager.configure_type_system(&config.type_system);
-
-    let synonyms = config
-        .synonyms
-        .as_ref()
-        .map(|synonyms| synonyms.mappings.clone())
-        .unwrap_or_else(create_default_synonyms);
-    let mut reasoner = SymbolicReasoner::with_perf_ledger(
-        config.reasoning.clone(),
-        synonyms,
-        PerfLedger::shared(),
-    );
-    reasoner.set_nlp_config(config.nlp.clone());
-    if config.semantic_grammar.enabled {
-        reasoner.attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(
-            &config,
-        ));
-    }
-    if let Ok(memory) = oxigraph_manager.load_lexical_memory().await {
-        if !memory.is_empty() {
-            reasoner.set_lexical_memory(memory);
-        }
-    }
-    let (ontology_program, _) = owl_annotation::ontology_program_with_annotations(
-        &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
-        &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),
-    );
-    reasoner.configure_ontology_program(&ontology_program);
-    reasoner.configure_schema_view(&SchemaView::from_config(
-        &config.type_system,
-        &config.predicate_profiles,
-    ));
-    reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
-    reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
-    if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
-        reasoner.load_persisted_laws(persisted);
-    }
-    reasoner.observe_facts(&facts);
+    let mut reasoner = build_store_reasoner(config, oxigraph_manager, store_path, &facts).await;
 
     // 与交互/服务同一条对话前通道：查询板、指代、澄清与身份回合都在
     // reasoner.answer 之前；一次 ask 的多行输入共享同一会话记忆。
@@ -16854,6 +16888,23 @@ mod session_tests {
             cli.command,
             Some(Commands::RewriteRetrieval { question, json })
                 if question == "谁的师傅是李四" && json
+        ));
+    }
+
+    #[test]
+    fn rewrite_retrieval_eval_cli_parses_corpus_and_flags() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "rewrite-retrieval-eval",
+            "corpus.tsv",
+            "--strict",
+            "--json",
+        ])
+        .expect("rewrite-retrieval-eval 参数应可解析");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::RewriteRetrievalEval { corpus, strict, json })
+                if corpus == "corpus.tsv" && strict && json
         ));
     }
 

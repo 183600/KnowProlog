@@ -92,6 +92,8 @@ pub struct HypothesisCandidate {
     /// 该读法对应的问句（锚定后可能是替换过实体的变体）。
     pub question: String,
     pub plan: QueryPlan,
+    /// 调用方注入的上下文先验（log-odds 加项；例如焦点实体/上一轮谓词连续）。
+    pub context_bonus: f64,
 }
 
 impl Serialize for HypothesisCandidate {
@@ -100,12 +102,13 @@ impl Serialize for HypothesisCandidate {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("HypothesisCandidate", 5)?;
+        let mut state = serializer.serialize_struct("HypothesisCandidate", 6)?;
         state.serialize_field("source", &self.source)?;
         state.serialize_field("rule", &self.rule)?;
         state.serialize_field("question", &self.question)?;
         state.serialize_field("plan_kind", QueryPlanner::kind(&self.plan))?;
         state.serialize_field("plan", &QueryPlanner::format_plan(&self.plan))?;
+        state.serialize_field("context_bonus", &self.context_bonus)?;
         state.end()
     }
 }
@@ -122,7 +125,14 @@ impl HypothesisCandidate {
             rule: rule.into(),
             question: question.into(),
             plan,
+            context_bonus: 0.0,
         }
+    }
+
+    /// 注入上下文先验（log-odds 加项，内部会夹在 ±2 之间）。
+    pub fn with_context_bonus(mut self, bonus: f64) -> Self {
+        self.context_bonus = bonus;
+        self
     }
 
     /// 去重键：同一逻辑计划只让最可靠的来源参赛。
@@ -334,6 +344,72 @@ pub fn probes_for(plan: &QueryPlan) -> Vec<Probe> {
             ProbeRole::Subject,
             false,
         )],
+        QueryPlan::PathBetween { .. }
+        | QueryPlan::CommonNeighbor { .. }
+        | QueryPlan::Intermediary { .. }
+        | QueryPlan::Similar { .. }
+        | QueryPlan::Analogy { .. } => Vec::new(),
+    }
+}
+
+/// 计划中出现的实体词面（用于上下文连续性先验）。
+pub fn plan_entities(plan: &QueryPlan) -> Vec<&str> {
+    match plan {
+        QueryPlan::FindObject { segments } => segments.iter().map(String::as_str).collect(),
+        QueryPlan::FindSubject { object, .. } => vec![object.as_str()],
+        QueryPlan::FindObjectByPredicate { subject, .. } => vec![subject.as_str()],
+        QueryPlan::FindObjectExcept {
+            subject, excluded, ..
+        } => std::iter::once(subject.as_str())
+            .chain(excluded.iter().map(String::as_str))
+            .collect(),
+        QueryPlan::FindSubjectExcept {
+            object, excluded, ..
+        } => std::iter::once(object.as_str())
+            .chain(excluded.iter().map(String::as_str))
+            .collect(),
+        QueryPlan::PathBetween { start, goal, .. }
+        | QueryPlan::Intermediary { start, goal, .. } => vec![start.as_str(), goal.as_str()],
+        QueryPlan::CommonNeighbor { left, right } => vec![left.as_str(), right.as_str()],
+        QueryPlan::CheckTriple {
+            subject_segments,
+            object,
+        } => subject_segments
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(object.as_str()))
+            .collect(),
+        QueryPlan::CheckRelation {
+            subject, object, ..
+        } => vec![subject.as_str(), object.as_str()],
+        QueryPlan::Count { subject, .. }
+        | QueryPlan::Exist { subject, .. }
+        | QueryPlan::Closure { subject, .. } => vec![subject.as_str()],
+        QueryPlan::Similar { entity } => vec![entity.as_str()],
+        QueryPlan::Analogy { a, b, c } => vec![a.as_str(), b.as_str(), c.as_str()],
+    }
+}
+
+/// 计划中出现的谓词词面（用于上下文连续性先验）。
+pub fn plan_predicates(plan: &QueryPlan) -> Vec<&str> {
+    match plan {
+        QueryPlan::FindObject { segments } => {
+            segments.iter().skip(1).map(String::as_str).collect()
+        }
+        QueryPlan::FindSubject { predicate, .. }
+        | QueryPlan::FindObjectByPredicate { predicate, .. }
+        | QueryPlan::FindObjectExcept { predicate, .. }
+        | QueryPlan::FindSubjectExcept { predicate, .. }
+        | QueryPlan::CheckRelation { predicate, .. }
+        | QueryPlan::Count { predicate, .. }
+        | QueryPlan::Exist { predicate, .. }
+        | QueryPlan::Closure { predicate, .. } => vec![predicate.as_str()],
+        QueryPlan::CheckTriple {
+            subject_segments, ..
+        } => subject_segments
+            .last()
+            .map(|predicate| vec![predicate.as_str()])
+            .unwrap_or_default(),
         QueryPlan::PathBetween { .. }
         | QueryPlan::CommonNeighbor { .. }
         | QueryPlan::Intermediary { .. }
@@ -822,12 +898,17 @@ where
         agreeing as f64 / with_hits as f64
     };
     let support = clamp01(best_support);
+    let context_bonus = candidate.context_bonus.clamp(-2.0, 2.0);
     let log_odds = logit(candidate.source.prior())
+        + context_bonus
         + config.support_gain * (support - config.support_pivot)
         + config.coverage_gain * (coverage - config.coverage_pivot)
         + config.margin_gain * (margin - config.margin_pivot)
         + config.consistency_gain * (consistency - config.consistency_pivot);
     let confidence = sigmoid(log_odds);
+    if context_bonus.abs() > f64::EPSILON {
+        notes.push(format!("上下文先验 {:+.2} 已计入 log-odds。", context_bonus));
+    }
     if answers.len() > 1 {
         notes.push(format!(
             "证据分成 {} 个答案簇，主簇占比 {:.2}。",
@@ -988,6 +1069,171 @@ pub fn candidate_from_plan(
     HypothesisCandidate::new(source, rule, question, plan)
 }
 
+/// 离线评测样例：问句与期望答案（期望答案可写多个候选用 `|` 分隔）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvalCase {
+    pub question: String,
+    pub expected: String,
+}
+
+impl EvalCase {
+    pub fn new(question: impl Into<String>, expected: impl Into<String>) -> Self {
+        Self {
+            question: question.into(),
+            expected: expected.into(),
+        }
+    }
+
+    /// 一行样例：`问句<TAB>期望答案`，也接受 `问句 => 期望答案`。
+    pub fn parse_line(line: &str) -> Option<Self> {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+        let (question, expected) = line
+            .split_once('\t')
+            .or_else(|| line.split_once("=>"))?;
+        let question = question.trim();
+        let expected = expected.trim();
+        if question.is_empty() || expected.is_empty() {
+            return None;
+        }
+        Some(Self::new(question, expected))
+    }
+
+    fn answer_matches(&self, answer: &str) -> bool {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return false;
+        }
+        self.expected.split('|').any(|expected| {
+            let expected = expected.trim();
+            !expected.is_empty()
+                && (answer == expected
+                    || answer.contains(expected)
+                    || expected.contains(answer))
+        })
+    }
+}
+
+/// 解析离线评测语料；非法行被跳过，空行与 `#` 注释被忽略。
+pub fn parse_corpus(text: &str) -> Vec<EvalCase> {
+    text.lines().filter_map(EvalCase::parse_line).collect()
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceEval {
+    pub selected: usize,
+    pub correct: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EvalReport {
+    pub total: usize,
+    pub accepted: usize,
+    pub accepted_correct: usize,
+    pub accepted_wrong: usize,
+    pub clarified: usize,
+    pub abstained: usize,
+    pub no_candidates: usize,
+    pub by_source: BTreeMap<String, SourceEval>,
+}
+
+impl EvalReport {
+    /// 接受率：接受读法的题数 / 总题数。
+    pub fn coverage(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.accepted as f64 / self.total as f64
+        }
+    }
+
+    /// 接受读法的答案精确率。
+    pub fn precision(&self) -> f64 {
+        if self.accepted == 0 {
+            0.0
+        } else {
+            self.accepted_correct as f64 / self.accepted as f64
+        }
+    }
+
+    pub fn render_text(&self) -> String {
+        let mut output = format!(
+            "读法裁决离线评测：{} 题；接受 {}（正确 {} / 错误 {}，覆盖 {:.2}，精确率 {:.2}），澄清 {}，弃权 {}，无候选 {}。",
+            self.total,
+            self.accepted,
+            self.accepted_correct,
+            self.accepted_wrong,
+            self.coverage(),
+            self.precision(),
+            self.clarified,
+            self.abstained,
+            self.no_candidates
+        );
+        for (source, stats) in &self.by_source {
+            output.push_str(&format!(
+                "\n  {}：选中 {}，正确 {}",
+                source, stats.selected, stats.correct
+            ));
+        }
+        output
+    }
+}
+
+/// 用候选生成器与证据检索器跑一遍离线评测。
+///
+/// 评测只比较「裁决层选中的证据答案」与期望答案；不执行完整计划，
+/// 因此适合快速比较不同阈值/来源先验，而不会把生成措辞算进误差。
+pub fn evaluate<C, S>(
+    cases: &[EvalCase],
+    config: &RewriteRetrievalConfig,
+    mut candidates_for: C,
+    mut search: S,
+) -> EvalReport
+where
+    C: FnMut(&str) -> Vec<HypothesisCandidate>,
+    S: FnMut(&str, usize, &SearchConstraints) -> EvidenceSearch,
+{
+    let mut report = EvalReport {
+        total: cases.len(),
+        ..EvalReport::default()
+    };
+    for case in cases {
+        let candidates = candidates_for(&case.question);
+        if candidates.is_empty() {
+            report.no_candidates += 1;
+            continue;
+        }
+        let assessment = assess(&case.question, candidates, config, &mut search);
+        match assessment.decision {
+            Decision::Accept => {
+                report.accepted += 1;
+                let correct = assessment
+                    .answer()
+                    .map(|answer| case.answer_matches(answer))
+                    .unwrap_or(false);
+                if correct {
+                    report.accepted_correct += 1;
+                } else {
+                    report.accepted_wrong += 1;
+                }
+                if let Some(hypothesis) = assessment.selected_hypothesis() {
+                    let source = hypothesis.candidate.source.label().to_string();
+                    let entry = report.by_source.entry(source).or_default();
+                    entry.selected += 1;
+                    if correct {
+                        entry.correct += 1;
+                    }
+                }
+            }
+            Decision::Clarify => report.clarified += 1,
+            Decision::Abstain => report.abstained += 1,
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,5 +1381,66 @@ mod tests {
             c: "王五".to_string()
         })
         .is_empty());
+    }
+
+    #[test]
+    fn corpus_parsing_skips_comments_and_malformed_lines() {
+        let cases = parse_corpus(
+            "# 注释\n张三的师傅是谁\t李四\n\n谁的师傅是李四 => 张三\n没有分隔符\n",
+        );
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].question, "张三的师傅是谁");
+        assert_eq!(cases[1].expected, "张三");
+    }
+
+    #[test]
+    fn offline_evaluation_counts_acceptance_and_accuracy() {
+        let cases = vec![
+            EvalCase::new("张三的师傅是谁", "李四"),
+            EvalCase::new("未名的师傅是谁", "某人"),
+        ];
+        let mut retriever = retriever();
+        let report = evaluate(
+            &cases,
+            &RewriteRetrievalConfig::default(),
+            |question| {
+                vec![candidate(
+                    HypothesisSource::ExactPlan,
+                    question.split('的').next().unwrap_or(question),
+                    "师傅",
+                )]
+            },
+            |query, k, constraints| retriever.search(query, k, constraints, Default::default()),
+        );
+        assert_eq!(report.total, 2);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.accepted_correct, 1);
+        assert_eq!(report.accepted_wrong, 0);
+        assert_eq!(report.abstained, 1);
+        assert!((report.coverage() - 0.5).abs() < 1e-9);
+        assert!((report.precision() - 1.0).abs() < 1e-9);
+        assert!(report.render_text().contains("精确率 1.00"));
+    }
+
+    #[test]
+    fn context_bonus_raises_confidence_without_changing_evidence() {
+        let mut plain_retriever = retriever();
+        let plain = assess(
+            "张三的师傅是谁",
+            vec![candidate(HypothesisSource::ExactPlan, "张三", "师傅")],
+            &RewriteRetrievalConfig::default(),
+            |query, k, constraints| {
+                plain_retriever.search(query, k, constraints, Default::default())
+            },
+        );
+        let mut retriever2 = retriever();
+        let contextual = assess(
+            "张三的师傅是谁",
+            vec![candidate(HypothesisSource::ExactPlan, "张三", "师傅").with_context_bonus(1.0)],
+            &RewriteRetrievalConfig::default(),
+            |query, k, constraints| retriever2.search(query, k, constraints, Default::default()),
+        );
+        assert!(contextual.hypotheses[0].confidence > plain.hypotheses[0].confidence);
+        assert_eq!(contextual.answer(), plain.answer());
     }
 }
