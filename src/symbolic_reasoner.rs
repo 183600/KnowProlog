@@ -1921,6 +1921,7 @@ impl SymbolicReasoner {
         self.context.clear();
         self.epistemic_turns.clear();
         *self.contextual_last.lock() = None;
+        *self.formal_clarification.lock() = None;
         self.contextual_memory.clear();
         // 假设世界是会话态：分叉/重置时整体丢弃，不带走任何临时前提。
         self.discard_assumption_world();
@@ -26339,5 +26340,12 @@ types = [
             FormalClarificationOutcome::NotAnAnswer
         );
         assert!(!reasoner.formal_clarification_active(), "非回答输入应清空旧澄清帧");
+
+        *reasoner.formal_clarification.lock() = Some(frame());
+        let forked = reasoner.fork_session();
+        assert!(
+            !forked.formal_clarification_active(),
+            "分叉会话不得带走上一会话的歧义澄清帧"
+        );
     }
 }
