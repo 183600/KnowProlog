@@ -1473,8 +1473,7 @@ mod tests {
         let envelope = ClaimEnvelope::new(6_300, 9_000);
         assert_eq!(profile.envelope_verdict(envelope), EnvelopeVerdict::Qualify);
         let text = profile.render_envelope(envelope);
-        assert!(text.contains("63%"), "{}", text);
-        assert!(text.contains("90%"), "{}", text);
+        assert!(text.contains("63–90%"), "{}", text);
         assert!(text.contains("需限定"), "{}", text);
         let below = ClaimEnvelope::new(6_000, 9_000);
         assert_eq!(profile.envelope_verdict(below), EnvelopeVerdict::Verify);

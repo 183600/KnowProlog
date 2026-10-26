@@ -36,6 +36,7 @@ use crate::derivation::Derivation;
 use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
+use crate::epistemic_turn::{EpistemicTurnBook, TurnEnvelope, TurnPolicy};
 use crate::graph_diagnosis::diagnose_failure;
 use crate::graph_ledger;
 use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
@@ -556,6 +557,9 @@ pub struct DialogueSnapshot {
     pub history: Vec<String>,
     #[serde(default)]
     pub generation: Option<GenerationState>,
+    /// 逐命题复核台账；旧快照缺省为空，空台账不写字段以保持字节兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_turns: Option<EpistemicTurnBook>,
     // 跨会话临时信念：被采纳的假设事实（会话级，不写知识图谱）
     #[serde(default)]
     pub session_facts: Vec<SnapshotAtom>,
@@ -873,6 +877,7 @@ impl DialogueContext {
             last_plan_kind: self.last_plan_kind.clone(),
             history: self.history.clone(),
             generation: self.generation.clone(),
+            epistemic_turns: None,
             session_facts: Vec::new(),
             session_negative_facts: Vec::new(),
             slots: None,
@@ -1223,6 +1228,7 @@ pub struct SymbolicReasoner {
     // 显式持久化的采纳/退役决定；每次重建律典后重新盖到声明/挖掘结果上。
     persisted_laws: Option<LawBook>,
     context: DialogueContext,
+    epistemic_turns: EpistemicTurnBook,
     embedding: SymbolicEmbedding,
     // 单一 RDFS 模式视图：类型闭包/子属性/域值域，嵌入与审计共用同一坐标系。
     schema_view: SchemaView,
@@ -1436,6 +1442,7 @@ impl Clone for SymbolicReasoner {
             law_registry: self.law_registry.clone(),
             persisted_laws: self.persisted_laws.clone(),
             context: self.context.clone(),
+            epistemic_turns: self.epistemic_turns.clone(),
             embedding: self.embedding.clone(),
             schema_view: self.schema_view.clone(),
             walks: self.walks.clone(),
@@ -1669,6 +1676,7 @@ impl SymbolicReasoner {
             law_registry: None,
             persisted_laws: None,
             context: DialogueContext::new(5),
+            epistemic_turns: EpistemicTurnBook::new(),
             embedding,
             schema_view: SchemaView::new(),
             walks,
@@ -1782,6 +1790,7 @@ impl SymbolicReasoner {
     /// 注入故障。知识派生状态（剖面/规则/向量/台账）原样保留。
     fn reset_session_state(&mut self) {
         self.context.clear();
+        self.epistemic_turns.clear();
         *self.contextual_last.lock() = None;
         self.contextual_memory.clear();
         // 假设世界是会话态：分叉/重置时整体丢弃，不带走任何临时前提。
@@ -4579,6 +4588,7 @@ impl SymbolicReasoner {
             &entity,
             &clauses,
         );
+        self.observe_epistemic_plan(&plan);
         let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
         let page = self.generator.cursor_page(
             &entity,
@@ -4598,10 +4608,17 @@ impl SymbolicReasoner {
         Some(text)
     }
 
-    /// 把生成器命题转成回答计划：先做一次整批生成自检，再按原顺序保留。
-    ///
-    /// 自检失败的句子不进入计划，避免「详细版」重新说出初次生成时已被
-    /// 丢弃的句子；容量上限由 [`AnswerPlan::new`] 统一执行。
+    /// 观察一份新计划：只有启用 PCC 时才写入逐命题复核台账。
+    fn observe_epistemic_plan(&mut self, plan: &AnswerPlan) {
+        if !self.config.confidence.enabled {
+            return;
+        }
+        let policy = TurnPolicy::from_confidence(&self.config.confidence);
+        let turn = self.epistemic_turns.turn.saturating_add(1);
+        self.epistemic_turns
+            .observe_turn(&TurnEnvelope::from_plan(turn, plan), &policy);
+    }
+
     /// 从生成命题的来源等级与槽账本事件构造逐命题置信区间。
     ///
     /// 关闭 PCC 时不附加区间，旧计划与快照字节保持不变。启用后：
@@ -4646,6 +4663,10 @@ impl SymbolicReasoner {
         ClaimEnvelope::from_grade(grade, corroborations, conflicts)
     }
 
+    /// 把生成器命题转成回答计划：先做一次整批生成自检，再按原顺序保留。
+    ///
+    /// 自检失败的句子不进入计划，避免「详细版」重新说出初次生成时已被
+    /// 丢弃的句子；容量上限由 [`AnswerPlan::new`] 统一执行。
     fn build_answer_plan(
         &self,
         question: &str,
@@ -4746,9 +4767,10 @@ impl SymbolicReasoner {
 
     /// 用当前知识重建同一实体的计划，并与上一份计划逐点对照。
     ///
-    /// 复核是只读操作：不重新解释原问题、不改写已经说出口的回答，也不替换
-    /// 已保存的旧计划。缺失/过期/结构不兼容都给出明确回执；实体在图谱与
-    /// 会话层都不存在时，当前计划为空，差异会逐点标为「移除」。
+    /// 计划本身只读：不重新解释原问题、不改写已经说出口的回答，也不替换
+    /// 已保存的旧计划。复核会推进逐命题置信台账（应用待复核项、生成掉档
+    /// 更正），但不写知识图谱。缺失/过期/结构不兼容都给出明确回执；实体在
+    /// 图谱与会话层都不存在时，当前计划为空，差异会逐点标为「移除」。
     pub fn review_generation_plan(&mut self) -> String {
         if !self.config.enable_generation {
             return "生成功能未启用，无法复核回答计划。".to_string();
@@ -4785,6 +4807,19 @@ impl SymbolicReasoner {
             state.entity
         );
         output.push_str(&plan.diff(&current).render_zh(true));
+        if self.config.confidence.enabled && !self.epistemic_turns.is_empty() {
+            let policy = TurnPolicy::from_confidence(&self.config.confidence);
+            let turn = self.epistemic_turns.turn.saturating_add(1);
+            let report = self
+                .epistemic_turns
+                .reconcile(&TurnEnvelope::from_plan(turn, &current), &policy);
+            let text = report.render_zh();
+            if !text.is_empty() {
+                output.push_str("\n置信复核：\n");
+                output.push_str(&text);
+                output.push('\n');
+            }
+        }
         if !plan.is_fresh_for(self.revision) {
             output.push_str(&format!(
                 "\n旧计划仍保留为历史对照；如需基于当前知识重新生成，请输入「介绍：{}」。",
@@ -4868,6 +4903,13 @@ impl SymbolicReasoner {
             ));
         }
         output.push_str("  可输入「简短点」「完整讲讲」「换种表达」或「第N点是什么」重述同一份计划。");
+        if self.config.confidence.enabled {
+            let pending = self.epistemic_turns.render_pending_zh(3);
+            if !pending.is_empty() {
+                output.push('\n');
+                output.push_str(&pending);
+            }
+        }
         output
     }
 
@@ -15964,6 +16006,8 @@ impl SymbolicReasoner {
         snapshot.last_abduction_vars = self.last_abduction_vars.clone();
         snapshot.alignment =
             (!self.linker.alignment().is_empty()).then(|| self.linker.alignment().clone());
+        snapshot.epistemic_turns =
+            (!self.epistemic_turns.is_empty()).then(|| self.epistemic_turns.clone());
         snapshot
     }
 
@@ -16047,6 +16091,8 @@ impl SymbolicReasoner {
             self.sync_retrieval_type_hierarchy();
         }
         self.context.restore(snapshot);
+        // 复核台账是会话态：旧快照缺省为空，避免把上一会话的待办带进来。
+        self.epistemic_turns = snapshot.epistemic_turns.clone().unwrap_or_default();
         // 镜像对齐：旧快照没有该字段时清空，避免把上一会话的词形规则串进来。
         let alignment = snapshot.alignment.clone().unwrap_or_default();
         *self.linker.alignment_mut() = alignment;
@@ -20465,6 +20511,81 @@ types = [
                 report
             );
         }
+    }
+
+    #[test]
+    fn epistemic_review_queue_survives_snapshot_and_is_visible_in_plan_report() {
+        let mut config = test_config();
+        config.max_profile_sentences = 4;
+        config.confidence.enabled = true;
+        let mut reasoner = SymbolicReasoner::new(config.clone(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.assert_nl_fact("记住：张三的师傅是赵六");
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        assert!(
+            reasoner.epistemic_turns.pending_count() > 0,
+            "会话命题的跨阈值区间应进入复核队列"
+        );
+        let report = reasoner.answer_plan_report();
+        assert!(report.contains("待复核"), "{}", report);
+        assert!(report.contains("优先级"), "{}", report);
+
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(snapshot.epistemic_turns.is_some());
+        let plain = SymbolicReasoner::new(config, HashMap::new());
+        assert!(
+            !serde_json::to_string(&plain.dialogue_snapshot())
+                .unwrap()
+                .contains("epistemic_turns"),
+            "空台账不得写字段"
+        );
+        let mut restored = SymbolicReasoner::new(reasoner.config.clone(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("复核台账应可随快照恢复");
+        assert_eq!(restored.epistemic_turns, reasoner.epistemic_turns);
+        assert!(restored.answer_plan_report().contains("待复核"));
+    }
+
+    #[test]
+    fn review_reports_a_confidence_correction_for_a_previously_asserted_claim() {
+        let mut config = test_config();
+        config.max_profile_sentences = 4;
+        config.confidence.enabled = true;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.as_ref())
+            .expect("应有计划");
+        assert!(
+            plan.claims
+                .iter()
+                .filter(|claim| claim.predicate == "师傅")
+                .all(|claim| reasoner.config.confidence.envelope_verdict(
+                    claim.envelope.expect("图谱命题应带区间")
+                ) == crate::confidence::EnvelopeVerdict::Assert)
+        );
+
+        reasoner.assert_nl_fact("记住：张三的师傅是赵六");
+        reasoner.generate_about("张三").expect("会话事实应可重新生成");
+        let report = reasoner.review_generation_plan();
+        assert!(report.contains("置信复核"), "{}", report);
+        assert!(report.contains("更正"), "{}", report);
+        assert!(report.contains("当前知识"), "{}", report);
+        let claim = reasoner
+            .epistemic_turns
+            .last_claims
+            .values()
+            .find(|claim| claim.predicate == "师傅")
+            .expect("复核后应记录当前命题");
+        assert_ne!(
+            reasoner.config.confidence.envelope_verdict(claim.envelope),
+            crate::confidence::EnvelopeVerdict::Assert
+        );
     }
 
     #[test]

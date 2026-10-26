@@ -54,6 +54,7 @@ pub mod entity_registry;
 pub mod entity_relation_extractor;
 pub mod entity_thread;
 pub mod epistemic;
+pub mod epistemic_turn;
 pub mod eval_recovery;
 pub mod event_graph;
 pub mod external_knowledge;
