@@ -5214,6 +5214,93 @@ impl SymbolicReasoner {
         PropositionParser::with_surfaces(&self.aligner, &self.linker, &self.proposition_surfaces)
     }
 
+    /// 把「图谱 ∪ 会话层」投影为形式语义的词库与微型模型。
+    ///
+    /// 只读取生成器/预测器/槽账本的既有投影，不新建事实源：
+    /// 关系三元组、实体类型、属性键值与子类层级都按同一份知识版本构建。
+    fn formal_semantics_view(&self) -> (
+        crate::formal_semantics::FormalSemantics,
+        crate::formal_semantics::TinyModel,
+    ) {
+        use crate::formal_semantics::{FormalSemantics, TinyModel};
+        let synthesized = if self.session_facts.is_empty() && self.slots.is_empty() {
+            None
+        } else {
+            Some(self.session_aware_knowledge())
+        };
+        let (predictor, generator) = match &synthesized {
+            Some((predictor, generator)) => (predictor, generator),
+            None => (&self.predictor, &self.generator),
+        };
+        let mut semantics = FormalSemantics::new();
+        let mut model = TinyModel::new(self.aligner.synonyms().clone());
+        let mut canonical_to_surface: HashMap<String, String> = HashMap::new();
+        for (surface, canonical) in generator.predicate_surfaces() {
+            canonical_to_surface
+                .entry(canonical.clone())
+                .or_insert_with(|| surface.clone());
+        }
+        semantics.set_predicate_surfaces(&canonical_to_surface);
+        for entity in generator.all_entities() {
+            semantics.register_entity(&entity);
+            let etype = generator.entity_type_of(&entity).unwrap_or("");
+            let pairs = generator.attribute_pairs(&entity);
+            if pairs.is_empty() && etype.trim().is_empty() {
+                model.observe_entity(&entity, "", &[]);
+            } else {
+                model.observe_entity(&entity, etype, &pairs);
+            }
+            if !etype.trim().is_empty() {
+                semantics.register_class(etype);
+            }
+            for (key, _) in &pairs {
+                semantics.register_unary_predicate(key);
+            }
+        }
+        for triple in predictor.triples() {
+            model.observe_relation(&triple.subject, &triple.predicate, &triple.object);
+            semantics.register_binary_predicate(&triple.predicate);
+            semantics.register_entity(&triple.subject);
+            semantics.register_entity(&triple.object);
+            if crate::formal_semantics::is_subclass_relation(&triple.predicate) {
+                semantics.register_class(&triple.subject);
+                semantics.register_class(&triple.object);
+            }
+        }
+        for key in self.attribute_index.keys() {
+            semantics.register_entity(&key.0);
+            semantics.register_unary_predicate(&key.1);
+        }
+        (semantics, model)
+    }
+
+    /// 候选森林 + 模型接地的可读报告（「语义分析」命令）。
+    pub fn formal_semantics_report(&self, text: &str) -> String {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return "请输入要分析的句子，例如：语义分析：张三的年龄是多少".to_string();
+        }
+        let (semantics, model) = self.formal_semantics_view();
+        let evaluation = semantics.evaluate(trimmed, &model);
+        semantics.render_forest_report(&evaluation)
+    }
+
+    /// 旧回答路径全部失败后的语义回退：只回答唯一且由正面证据支持的读法。
+    fn formal_semantics_answer(&self, text: &str) -> Option<String> {
+        if !self.config.enable_entailment {
+            return None;
+        }
+        let trimmed = text.trim();
+        if !crate::function_words::contains_question_marker(trimmed)
+            && !trimmed.ends_with('?')
+            && !trimmed.ends_with('？')
+        {
+            return None;
+        }
+        let (semantics, model) = self.formal_semantics_view();
+        semantics.answer_forest(trimmed, &model, true)
+    }
+
     // 形式化语义 + 语义蕴含：把陈述句解析为命题并逐条判定蕴含/矛盾/未知。
     // 判定视图与生成自检共用同一份「图谱 ∪ 会话层」，刚记住的事实应能立即
     // 通过校验，而不是生成时可见、判断时却报未知。
@@ -11958,6 +12045,7 @@ impl SymbolicReasoner {
             return Some(self.annotate_assumption_world(answer));
         }
         self.answer_contextual(question)
+            .or_else(|| self.formal_semantics_answer(question))
             .map(|answer| self.annotate_assumption_world(answer))
     }
 
@@ -12293,6 +12381,7 @@ impl SymbolicReasoner {
             return Some(answer);
         }
         self.answer_contextual(question)
+            .or_else(|| self.formal_semantics_answer(question))
     }
 
     /// 对话级证据装配（默认关闭）：把问句、焦点栈、上一谓词与已引用证据
@@ -25843,5 +25932,54 @@ types = [
             .expect("对话层应回答情态问句");
         assert!(answer.contains("PQI"), "对话层丢失情态：{}", answer);
         assert!(answer.contains("P=1.000"), "{}", answer);
+    }
+
+    #[test]
+    fn formal_semantics_report_exposes_gaps_and_supported_readings() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "中国人".to_string(),
+                properties: HashMap::from([("年龄".to_string(), "30".to_string())]),
+            },
+            PrologFact::Entity {
+                name: "李四".to_string(),
+                entity_type: "美国人".to_string(),
+                properties: HashMap::from([("年龄".to_string(), "28".to_string())]),
+            },
+        ]);
+        let report = reasoner.formal_semantics_report("张三的年龄是多少");
+        assert!(report.contains("语义森林"), "report = {}", report);
+        assert!(report.contains("唯一可答"), "report = {}", report);
+        let gap = reasoner.formal_semantics_report("王五的年龄是多少");
+        assert!(gap.contains("证据不足"), "report = {}", gap);
+        assert!(gap.contains("王五"), "report = {}", gap);
+    }
+
+    #[test]
+    fn formal_semantics_fallback_only_answers_supported_readings() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "中国人".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".to_string(),
+                entity_type: "美国人".to_string(),
+                properties: HashMap::new(),
+            },
+        ]);
+        let answer = reasoner
+            .formal_semantics_answer("谁是中国人？")
+            .expect("应能回答有证据的实体查询");
+        assert!(answer.contains("张三"), "answer = {}", answer);
+        assert!(!answer.contains("李四"), "answer = {}", answer);
+        assert!(
+            reasoner.formal_semantics_answer("谁是火星人？").is_none(),
+            "没有证据时不得把候选当事实"
+        );
     }
 }

@@ -10680,6 +10680,25 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 语义森林：同一句子的全部候选读法 + 图谱接地状态（歧义不静默压平）
+        if let Some(target) = strip_any_prefix(
+            input,
+            &["语义分析：", "语义分析:", "语义森林：", "语义森林:"],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要分析的句子，例如：语义分析：张三的年龄是多少");
+            } else {
+                match load_graph_snapshot(&oxigraph_manager).await {
+                    Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                    Err(e) => println!("加载知识图谱失败: {}", e),
+                }
+                println!("{}", symbolic_reasoner.formal_semantics_report(target));
+            }
+            println!();
+            continue;
+        }
+
         // 形式化语义与语义蕴含：把陈述句解析为逻辑形式并判定蕴含/矛盾/未知
         if let Some(target) = strip_any_prefix(
             input,
@@ -14677,6 +14696,7 @@ fn interactive_help() -> String {
         "  查询剧本：<file.toml>              回放查询板剧本（每轮断言算子/行数/页码/选中/证据），自检交互行为",
         "  SPARQL：<查询>                      执行任意 SPARQL 1.1 查询（SELECT/ASK/CONSTRUCT）",
         "  判断：<陈述> / 蕴含：<陈述>         形式化语义 + 语义蕴含校验",
+        "  语义分析：<句子>                    候选逻辑形式森林 + 图谱接地（歧义/证据缺口）",
         "  证明：<目标> / 推理链：<目标>        归结证明与后向链推理",
         "  为什么<陈述> / 溯因：<陈述>         证明失败前沿生成候选假设",
         "  场景：<问句> / 联合解释：<问句>     枚举多假设协同并注入克隆引擎验证",
@@ -15126,6 +15146,8 @@ fn is_command_like(input: &str) -> bool {
         "蕴含",
         "校验",
         "形式化",
+        "语义分析",
+        "语义森林",
         "相似实体",
         "语义相似",
         "证据检索",
