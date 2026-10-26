@@ -487,6 +487,11 @@ pub enum Eval {
 
 /// 子类关系谓词（沿此关系传播类型断言）
 const SUPER_RELS: [&str; 6] = ["子类", "子类别", "subclass", "subClassOf", "is_a", "isa"];
+
+/// 判断关系名是否表示子类层级（供外部构建微型模型时登记类）。
+pub fn is_subclass_relation(rel_type: &str) -> bool {
+    SUPER_RELS.contains(&rel_type.trim())
+}
 /// 对称关系（双向匹配）
 const SYMMETRIC_RELS: [&str; 5] = ["配偶", "夫妻", "兄弟", "姐妹", "同学"];
 /// 个体域枚举上限（量词求值）

@@ -107,7 +107,7 @@ use know_prolog::{
     shape_gate::{RepairAction, ShapeReport, ShapeSet},
     startup_ledger::StartupLedger,
     symbolic_generator::SymbolicGenerator,
-    symbolic_reasoner::{LanguagePolicySync, SymbolicReasoner},
+    symbolic_reasoner::{FormalClarificationOutcome, LanguagePolicySync, SymbolicReasoner},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
     view_render::{
@@ -6979,6 +6979,31 @@ async fn run_ask(
             });
             continue;
         }
+        // 语义歧义澄清中的下一行：序号/前者/后者选定读法，都不是则放弃。
+        if reasoner.formal_clarification_active() {
+            match reasoner.answer_formal_clarification(&question) {
+                FormalClarificationOutcome::Answered(text)
+                | FormalClarificationOutcome::Cancelled(text) => {
+                    answers.push(AskAnswer {
+                        question,
+                        status: "answered",
+                        answer: Some(text),
+                        derivation: None,
+                    });
+                    continue;
+                }
+                FormalClarificationOutcome::Reprompt(prompt) => {
+                    answers.push(AskAnswer {
+                        question,
+                        status: "needs_clarification",
+                        answer: Some(prompt),
+                        derivation: None,
+                    });
+                    continue;
+                }
+                FormalClarificationOutcome::NotAnAnswer => {}
+            }
+        }
         // 澄清对话中的下一行按回答处理：脚本可以用多行 stdin 完成
         // 「问题 → 是/不是 → 条件化结论」的整段解释空间收敛。
         if clarify && reasoner.clarification_active() {
@@ -10607,6 +10632,11 @@ async fn run_interactive_mode(
             }
             // 非作答输入：结束本轮追问，按普通输入继续处理
             contrast_followup = None;
+        }
+
+        // 语义歧义澄清进行中：序号/前者/后者选定读法；都不是放弃；其它输入放行。
+        if handle_formal_clarification(&mut symbolic_reasoner, input) {
+            continue;
         }
 
         // 帧澄清进行中：短答（序号 / 实体名 / 都不是）→ 确定性绑定 → 重放原问句。
@@ -15515,6 +15545,21 @@ fn is_command_like(input: &str) -> bool {
         "exit",
     ];
     COMMANDS.iter().any(|command| input.starts_with(command))
+}
+
+/// 语义歧义澄清的一步处理：已消化则返回 true；非回答输入放行常规管线。
+fn handle_formal_clarification(reasoner: &mut SymbolicReasoner, input: &str) -> bool {
+    if !reasoner.formal_clarification_active() || is_command_like(input) {
+        return false;
+    }
+    match reasoner.answer_formal_clarification(input) {
+        FormalClarificationOutcome::Answered(text)
+        | FormalClarificationOutcome::Cancelled(text) => println!("{}", text),
+        FormalClarificationOutcome::Reprompt(prompt) => println!("{}", prompt),
+        FormalClarificationOutcome::NotAnAnswer => return false,
+    }
+    println!();
+    true
 }
 
 /// 帧澄清(input) 的一步处理结果：绑定后重放 / 本轮已消化 / 放行常规管线

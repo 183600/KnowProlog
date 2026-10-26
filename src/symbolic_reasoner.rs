@@ -1213,6 +1213,121 @@ struct GenerationAudit {
     note: Option<String>,
 }
 
+/// 语义歧义澄清的一个可答读法：自然答案 + 可追溯的逻辑形式。
+#[derive(Debug, Clone)]
+struct FormalClarificationOption {
+    logical_form: String,
+    answer: String,
+    evidence: Vec<String>,
+}
+
+impl FormalClarificationOption {
+    fn full_answer(&self) -> String {
+        if self.evidence.is_empty() {
+            self.answer.clone()
+        } else {
+            format!("{}\n证据：{}", self.answer, self.evidence.join("；"))
+        }
+    }
+}
+
+/// 解析森林给出多个有证据读法时的会话态澄清帧。
+///
+/// 只在旧回答路径失败后建立；用户用序号/前者/后者选择，或明确放弃。
+/// 不做默认选择，也不把多个候选合并成一条「都成立」的假答案。
+#[derive(Debug, Clone)]
+struct FormalClarification {
+    question: String,
+    options: Vec<FormalClarificationOption>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormalReply {
+    Choice(usize),
+    OutOfRange,
+    Cancel,
+}
+
+impl FormalClarification {
+    fn prompt(&self) -> String {
+        let mut out = format!(
+            "「{}」有 {} 种有证据的读法，请选择：",
+            self.question,
+            self.options.len()
+        );
+        for (index, option) in self.options.iter().enumerate() {
+            out.push_str(&format!(
+                "\n  {}. {}（读法：{}）",
+                index + 1,
+                option.answer.replace('\n', "；"),
+                option.logical_form
+            ));
+        }
+        out.push_str("\n输入序号选择；输入「都不是」放弃。");
+        out
+    }
+
+    fn parse_reply(&self, text: &str) -> Option<FormalReply> {
+        let trimmed = text
+            .trim()
+            .trim_end_matches(['。', '.', '，', ',', '!', '！', '?', '？'])
+            .trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if ["都不是", "都不要", "取消", "算了", "放弃", "quit", "exit"].contains(&trimmed) {
+            return Some(FormalReply::Cancel);
+        }
+        let ordinal = |token: &str| -> Option<usize> {
+            let digits = token
+                .trim()
+                .trim_start_matches('第')
+                .trim_end_matches(|c| matches!(c, '个' | '条' | '项' | '种' | '号'))
+                .trim();
+            let value = if let Ok(number) = digits.parse::<usize>() {
+                Some(number)
+            } else {
+                match digits {
+                    "一" => Some(1),
+                    "二" | "两" => Some(2),
+                    "三" => Some(3),
+                    "四" => Some(4),
+                    "五" => Some(5),
+                    "六" => Some(6),
+                    "七" => Some(7),
+                    "八" => Some(8),
+                    "九" => Some(9),
+                    "十" => Some(10),
+                    _ => None,
+                }
+            }?;
+            Some(value)
+        };
+        if trimmed == "前者" {
+            return Some(FormalReply::Choice(0));
+        }
+        if trimmed == "后者" {
+            return Some(FormalReply::Choice(1));
+        }
+        if let Some(value) = ordinal(trimmed) {
+            if value == 0 || value > self.options.len() {
+                return Some(FormalReply::OutOfRange);
+            }
+            return Some(FormalReply::Choice(value - 1));
+        }
+        None
+    }
+}
+
+/// 语义歧义澄清的一步结果：给出选中答案 / 越界重问 / 放弃 / 不是回答。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormalClarificationOutcome {
+    Answered(String),
+    Reprompt(String),
+    Cancelled(String),
+    NotAnAnswer,
+}
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -1250,6 +1365,8 @@ pub struct SymbolicReasoner {
     retrieval: parking_lot::Mutex<DenseRetriever>,
     // 对话级证据装配器的会话记忆：上次回答引用过的证据（追问去重、防复述）
     contextual_last: parking_lot::Mutex<Option<(String, Vec<EvidenceKey>)>>,
+    // 语义歧义澄清帧：解析森林出现多个有证据读法时，等待用户选定其一
+    formal_clarification: parking_lot::Mutex<Option<FormalClarification>>,
     // 语境分词读法记忆：同一词面在不同焦点/类型语境下的确认与纠正（会话态）
     contextual_memory: ReadingMemory,
     // 实体属性三元组（观察到的），供归结引擎编码事实
@@ -1455,6 +1572,7 @@ impl Clone for SymbolicReasoner {
             generator: self.generator.clone(),
             retrieval: parking_lot::Mutex::new(self.retrieval.lock().clone()),
             contextual_last: parking_lot::Mutex::new(self.contextual_last.lock().clone()),
+            formal_clarification: parking_lot::Mutex::new(self.formal_clarification.lock().clone()),
             contextual_memory: self.contextual_memory.clone(),
             attributes: self.attributes.clone(),
             attribute_index: self.attribute_index.clone(),
@@ -1689,6 +1807,7 @@ impl SymbolicReasoner {
             generator,
             retrieval: parking_lot::Mutex::new(DenseRetriever::new(8, 0.85, 12)),
             contextual_last: parking_lot::Mutex::new(None),
+            formal_clarification: parking_lot::Mutex::new(None),
             contextual_memory: ReadingMemory::new(512),
             attributes: HashSet::new(),
             attribute_index: HashMap::new(),
@@ -5287,18 +5406,126 @@ impl SymbolicReasoner {
 
     /// 旧回答路径全部失败后的语义回退：只回答唯一且由正面证据支持的读法。
     fn formal_semantics_answer(&self, text: &str) -> Option<String> {
+        let (semantics, _model, evaluation) = self.formal_semantics_evaluation(text)?;
+        semantics.answer_evaluation(&evaluation, true)
+    }
+
+    fn formal_semantics_evaluation(
+        &self,
+        text: &str,
+    ) -> Option<(
+        crate::formal_semantics::FormalSemantics,
+        crate::formal_semantics::TinyModel,
+        crate::formal_semantics::ForestEvaluation,
+    )> {
         if !self.config.enable_entailment {
             return None;
         }
         let trimmed = text.trim();
-        if !crate::function_words::contains_question_marker(trimmed)
-            && !trimmed.ends_with('?')
-            && !trimmed.ends_with('？')
+        if trimmed.is_empty()
+            || (!crate::function_words::contains_question_marker(trimmed)
+                && !trimmed.ends_with('?')
+                && !trimmed.ends_with('？'))
         {
             return None;
         }
         let (semantics, model) = self.formal_semantics_view();
-        semantics.answer_forest(trimmed, &model, true)
+        let evaluation = semantics.evaluate(trimmed, &model);
+        Some((semantics, model, evaluation))
+    }
+
+    /// 正常回答路径的回退：唯一读法直接作答；多个有证据读法则建立澄清帧。
+    fn formal_semantics_attempt(&self, text: &str) -> Option<String> {
+        let (semantics, _model, evaluation) = self.formal_semantics_evaluation(text)?;
+        match &evaluation.decision {
+            crate::formal_semantics::ForestDecision::Answer { .. } => {
+                semantics.answer_evaluation(&evaluation, true)
+            }
+            crate::formal_semantics::ForestDecision::Ambiguous { indexes } => {
+                let options: Vec<FormalClarificationOption> = indexes
+                    .iter()
+                    .filter_map(|index| evaluation.grounded.get(*index))
+                    .map(|grounded| {
+                        let evidence = match &grounded.outcome {
+                            crate::formal_semantics::QueryOutcome::Values {
+                                evidence, ..
+                            }
+                            | crate::formal_semantics::QueryOutcome::Entities {
+                                evidence, ..
+                            }
+                            | crate::formal_semantics::QueryOutcome::Truth {
+                                evidence, ..
+                            } => evidence.clone(),
+                            crate::formal_semantics::QueryOutcome::Unsupported(_) => Vec::new(),
+                        };
+                        FormalClarificationOption {
+                            logical_form: grounded.candidate.form.render(),
+                            answer: semantics.render_outcome(&grounded.outcome),
+                            evidence,
+                        }
+                    })
+                    .collect();
+                if options.len() < 2 {
+                    return semantics.answer_evaluation(&evaluation, true);
+                }
+                let clarification = FormalClarification {
+                    question: text.trim().to_string(),
+                    options,
+                };
+                let prompt = clarification.prompt();
+                *self.formal_clarification.lock() = Some(clarification);
+                Some(prompt)
+            }
+            crate::formal_semantics::ForestDecision::Unknown { .. } => None,
+        }
+    }
+
+    pub fn formal_clarification_active(&self) -> bool {
+        self.formal_clarification.lock().is_some()
+    }
+
+    pub fn formal_clarification_prompt(&self) -> Option<String> {
+        self.formal_clarification
+            .lock()
+            .as_ref()
+            .map(FormalClarification::prompt)
+    }
+
+    /// 处理对语义歧义澄清的短答：序号/前者/后者 → 选定读法；都不是 → 放弃。
+    /// 非回答输入清空澄清帧并返回 `NotAnAnswer`，放行常规管线。
+    pub fn answer_formal_clarification(
+        &mut self,
+        text: &str,
+    ) -> FormalClarificationOutcome {
+        let Some(clarification) = self.formal_clarification.lock().clone() else {
+            return FormalClarificationOutcome::NotAnAnswer;
+        };
+        match clarification.parse_reply(text) {
+            Some(FormalReply::Choice(index)) => {
+                let option = &clarification.options[index];
+                let answer = format!(
+                    "按你选择的读法（{}）：\n{}",
+                    option.logical_form,
+                    option.full_answer()
+                );
+                *self.formal_clarification.lock() = None;
+                FormalClarificationOutcome::Answered(answer)
+            }
+            Some(FormalReply::Cancel) => {
+                *self.formal_clarification.lock() = None;
+                FormalClarificationOutcome::Cancelled(format!(
+                    "已放弃「{}」的歧义消解；没有把任何候选当作事实。",
+                    clarification.question
+                ))
+            }
+            Some(FormalReply::OutOfRange) => {
+                FormalClarificationOutcome::Reprompt(clarification.prompt())
+            }
+            None => {
+                *self.formal_clarification.lock() = None;
+                FormalClarificationOutcome::NotAnAnswer
+            }
+        }
     }
 
     // 形式化语义 + 语义蕴含：把陈述句解析为命题并逐条判定蕴含/矛盾/未知。
@@ -12381,7 +12608,7 @@ impl SymbolicReasoner {
             return Some(answer);
         }
         self.answer_contextual(question)
-            .or_else(|| self.formal_semantics_answer(question))
+            .or_else(|| self.formal_semantics_attempt(question))
     }
 
     /// 对话级证据装配（默认关闭）：把问句、焦点栈、上一谓词与已引用证据
@@ -25981,5 +26208,67 @@ types = [
             reasoner.formal_semantics_answer("谁是火星人？").is_none(),
             "没有证据时不得把候选当事实"
         );
+        let attempt = reasoner
+            .formal_semantics_attempt("谁是中国人？")
+            .expect("正常回答路径也应能使用唯一读法");
+        assert!(attempt.contains("张三"), "attempt = {}", attempt);
+        assert!(!reasoner.formal_clarification_active());
+    }
+
+    #[test]
+    fn formal_clarification_selects_cancels_and_reprompts() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let frame = || FormalClarification {
+            question: "张三的师傅是谁".to_string(),
+            options: vec![
+                FormalClarificationOption {
+                    logical_form: "师傅(张三, 李四)".to_string(),
+                    answer: "张三的师傅是李四。".to_string(),
+                    evidence: vec!["relation(张三, 师傅, 李四)".to_string()],
+                },
+                FormalClarificationOption {
+                    logical_form: "师傅(李四, 张三)".to_string(),
+                    answer: "李四的师傅是张三。".to_string(),
+                    evidence: vec!["relation(李四, 师傅, 张三)".to_string()],
+                },
+            ],
+        };
+
+        *reasoner.formal_clarification.lock() = Some(frame());
+        let prompt = reasoner
+            .formal_clarification_prompt()
+            .expect("澄清帧应给出提示");
+        assert!(prompt.contains("2 种有证据的读法"), "{}", prompt);
+        assert!(
+            matches!(reasoner.answer_formal_clarification("9"), FormalClarificationOutcome::Reprompt(_)),
+            "越界应重问且不清空"
+        );
+        assert!(reasoner.formal_clarification_active());
+
+        match reasoner.answer_formal_clarification("第二个") {
+            FormalClarificationOutcome::Answered(text) => {
+                assert!(text.contains("李四的师傅是张三"), "{}", text);
+                assert!(text.contains("证据：relation(李四, 师傅, 张三)"), "{}", text);
+            }
+            other => panic!("应选定第二条读法，got {:?}", other),
+        }
+        assert!(!reasoner.formal_clarification_active());
+        assert!(reasoner.formal_clarification_prompt().is_none());
+
+        *reasoner.formal_clarification.lock() = Some(frame());
+        match reasoner.answer_formal_clarification("都不是") {
+            FormalClarificationOutcome::Cancelled(text) => {
+                assert!(text.contains("没有把任何候选当作事实"), "{}", text);
+            }
+            other => panic!("应放弃澄清，got {:?}", other),
+        }
+        assert!(!reasoner.formal_clarification_active());
+
+        *reasoner.formal_clarification.lock() = Some(frame());
+        assert_eq!(
+            reasoner.answer_formal_clarification("张三是谁"),
+            FormalClarificationOutcome::NotAnAnswer
+        );
+        assert!(!reasoner.formal_clarification_active(), "非回答输入应清空旧澄清帧");
     }
 }
