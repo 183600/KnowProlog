@@ -694,6 +694,8 @@ pub struct SymbolicGenerator {
     lexicalized_predicates: HashSet<String>,
     // 可选的同一份双向语义规则包：生成侧复用抽取侧配置的 realize 模板
     semantic_grammar: Option<crate::semantic_grammar::RulePack>,
+    // 导入可逆帧：把导入句学到的措辞用于生成与保守问法回答。
+    import_frames: Option<crate::import_frames::ImportFrameLedger>,
     // 类型 → 谓词计数聚合缓存；知识变更（revision 自增）后失效
     revision: u64,
     type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
@@ -743,6 +745,7 @@ impl Clone for SymbolicGenerator {
             predicate_surfaces: self.predicate_surfaces.clone(),
             lexicalized_predicates: self.lexicalized_predicates.clone(),
             semantic_grammar: self.semantic_grammar.clone(),
+            import_frames: self.import_frames.clone(),
             revision: self.revision,
             type_count_cache: parking_lot::RwLock::new(self.type_count_cache.read().clone()),
             type_versions: self.type_versions.clone(),
@@ -772,6 +775,7 @@ impl SymbolicGenerator {
             predicate_surfaces: HashMap::new(),
             lexicalized_predicates: HashSet::new(),
             semantic_grammar: None,
+            import_frames: None,
             revision: 0,
             type_count_cache: parking_lot::RwLock::new(HashMap::new()),
             type_versions: HashMap::new(),
@@ -792,6 +796,39 @@ impl SymbolicGenerator {
     /// 摘除双向语义规则包（配置热加载关闭该能力时使用）。
     pub fn detach_semantic_grammar(&mut self) {
         self.semantic_grammar = None;
+    }
+
+    /// 挂接导入可逆帧：生成优先复用导入句学到的措辞。
+    pub fn attach_import_frames(&mut self, frames: crate::import_frames::ImportFrameLedger) {
+        self.import_frames = Some(frames);
+    }
+
+    /// 摘除导入可逆帧（撤销全部导入或热加载关闭时使用）。
+    pub fn detach_import_frames(&mut self) {
+        self.import_frames = None;
+    }
+
+    /// 当前导入帧台账（未挂接时为 `None`）。
+    pub fn import_frames(&self) -> Option<&crate::import_frames::ImportFrameLedger> {
+        self.import_frames.as_ref()
+    }
+
+    /// 用导入帧回答宾语问句：只有图谱取值存在时才作答，并附原句见证。
+    pub fn answer_import_frame(&self, question: &str) -> Option<String> {
+        let frames = self.import_frames.as_ref()?;
+        let answer = frames.answer(
+            question,
+            frames.min_ask_support(),
+            |kind, subject, predicate| match kind {
+                crate::import_frames::FactKind::Attribute => {
+                    self.attribute_values(subject, predicate)
+                }
+                crate::import_frames::FactKind::Relation => {
+                    self.relation_values(subject, predicate)
+                }
+            },
+        )?;
+        Some(answer.render_with_witness())
     }
 
     /// 热更新生成预算：只改「说多少」，不重建已观察的事实与类型索引。
@@ -1620,6 +1657,15 @@ impl SymbolicGenerator {
         {
             return realization.text;
         }
+        if objects.len() == 1 {
+            if let Some(realization) = self
+                .import_frames
+                .as_ref()
+                .and_then(|frames| frames.realize(subject, predicate, &objects[0]))
+            {
+                return realization;
+            }
+        }
         if let Some(template) = lexical_template(predicate) {
             return template.replace("{s}", subject).replace("{o}", &joined);
         }
@@ -1766,11 +1812,7 @@ impl SymbolicGenerator {
                     };
                     let sentence =
                         self.lexicalize(entity, &predicate, std::slice::from_ref(&value));
-                    let evidence = vec![(
-                        entity.to_string(),
-                        predicate.clone(),
-                        value.clone(),
-                    )];
+                    let evidence = vec![(entity.to_string(), predicate.clone(), value.clone())];
                     clauses.push(ProfileClause {
                         key,
                         sentence,
@@ -2528,6 +2570,60 @@ mod tests {
         assert!(profile.contains("年龄"));
         assert!(profile.contains("30"));
         assert!(profile.contains("首先"));
+    }
+
+    fn import_frame_ledger() -> crate::import_frames::ImportFrameLedger {
+        use crate::import_frames::{
+            FactKind, FrameAtom, FrameObservation, ImportFrame, ImportFrameLedger,
+        };
+        let mut ledger = ImportFrameLedger::new();
+        let frame = ImportFrame {
+            id: "ifr#test".to_string(),
+            kind: FactKind::Attribute,
+            predicate: "年龄".to_string(),
+            atoms: vec![
+                FrameAtom::Subject,
+                FrameAtom::Literal {
+                    surface: "今年".to_string(),
+                },
+                FrameAtom::Object,
+                FrameAtom::Literal {
+                    surface: "岁".to_string(),
+                },
+            ],
+            example_subject: "张三".to_string(),
+            example_object: "30".to_string(),
+            observations: vec![FrameObservation {
+                witness: "张三今年30岁".to_string(),
+                import_digest: "digest".to_string(),
+                turn: 1,
+            }],
+            ask_activated: true,
+        };
+        ledger.frames.insert(frame.id.clone(), frame);
+        ledger
+    }
+
+    #[test]
+    fn import_frame_realizes_and_answers_with_witness() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("张三", "人物", &[("年龄".to_string(), "30".to_string())]);
+        generator.attach_import_frames(import_frame_ledger());
+        assert_eq!(
+            generator.lexicalize("张三", "年龄", &["30".to_string()]),
+            "张三今年30岁"
+        );
+        let answer = generator
+            .answer_import_frame("张三今年多少岁")
+            .expect("导入帧应能回答宾语问句");
+        assert!(answer.contains("张三今年30岁"));
+        assert!(answer.contains("依据：张三今年30岁"));
+        generator.detach_import_frames();
+        assert!(generator.import_frames().is_none());
+        assert_ne!(
+            generator.lexicalize("张三", "年龄", &["30".to_string()]),
+            "张三今年30岁"
+        );
     }
 
     #[test]

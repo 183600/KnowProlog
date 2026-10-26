@@ -848,11 +848,7 @@ impl DialogueContext {
     }
 
     /// 记录一段生成、话语账本与可重述计划。
-    pub fn record_generation_with_plan(
-        &mut self,
-        cursor: GenerationCursor,
-        plan: AnswerPlan,
-    ) {
+    pub fn record_generation_with_plan(&mut self, cursor: GenerationCursor, plan: AnswerPlan) {
         if cursor.entity.trim().is_empty() {
             return;
         }
@@ -1279,7 +1275,8 @@ impl FormalClarification {
         if trimmed.is_empty() {
             return None;
         }
-        if ["都不是", "都不要", "取消", "算了", "放弃", "quit", "exit"].contains(&trimmed) {
+        if ["都不是", "都不要", "取消", "算了", "放弃", "quit", "exit"].contains(&trimmed)
+        {
             return Some(FormalReply::Cancel);
         }
         let ordinal = |token: &str| -> Option<usize> {
@@ -1289,9 +1286,8 @@ impl FormalClarification {
             }
             let mut digits = digits.trim();
             loop {
-                let stripped = digits.trim_end_matches(|c| {
-                    matches!(c, '个' | '条' | '项' | '种' | '号' | '吧')
-                });
+                let stripped = digits
+                    .trim_end_matches(|c| matches!(c, '个' | '条' | '项' | '种' | '号' | '吧'));
                 if stripped == digits {
                     break;
                 }
@@ -2063,9 +2059,8 @@ impl SymbolicReasoner {
         );
 
         if config.semantic_grammar.enabled {
-            self.generator.attach_semantic_grammar(
-                crate::semantic_grammar::RulePack::from_config(config),
-            );
+            self.generator
+                .attach_semantic_grammar(crate::semantic_grammar::RulePack::from_config(config));
             sync.semantic_grammar = true;
         } else {
             self.generator.detach_semantic_grammar();
@@ -2684,6 +2679,21 @@ impl SymbolicReasoner {
     /// 让生成器复用配置编译出的双向语义规则（抽取与生成同源）。
     pub fn attach_semantic_grammar(&mut self, grammar: crate::semantic_grammar::RulePack) {
         self.generator.attach_semantic_grammar(grammar);
+    }
+
+    /// 挂接导入可逆帧：生成侧复用导入句措辞，回答侧作为最后一道保守回退。
+    pub fn attach_import_frames(&mut self, frames: crate::import_frames::ImportFrameLedger) {
+        self.generator.attach_import_frames(frames);
+    }
+
+    /// 摘除导入可逆帧（撤销全部导入或热加载关闭时使用）。
+    pub fn detach_import_frames(&mut self) {
+        self.generator.detach_import_frames();
+    }
+
+    /// 当前导入帧台账（未挂接时为 `None`）。
+    pub fn import_frames(&self) -> Option<&crate::import_frames::ImportFrameLedger> {
+        self.generator.import_frames()
     }
 
     /// 类型化配方查询：按方向（实体→答案 / 答案→实体）取关系值，
@@ -4750,14 +4760,12 @@ impl SymbolicReasoner {
             canonical
         };
         let overlay = self.generation_overlay();
-        let clauses =
-            self.generator
-                .profile_clauses_with_overlay(&entity, GenerationOrder::Relevance, &overlay)?;
-        let plan = self.build_answer_plan(
-            &format!("介绍：{}", entity),
+        let clauses = self.generator.profile_clauses_with_overlay(
             &entity,
-            &clauses,
-        );
+            GenerationOrder::Relevance,
+            &overlay,
+        )?;
+        let plan = self.build_answer_plan(&format!("介绍：{}", entity), &entity, &clauses);
         let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
         let page = self.generator.cursor_page(
             &entity,
@@ -4798,9 +4806,7 @@ impl SymbolicReasoner {
         if !self.config.confidence.enabled {
             return ClaimEnvelope::point(0.5);
         }
-        let history = self
-            .slots
-            .history(&clause.key.entity, clause.predicate());
+        let history = self.slots.history(&clause.key.entity, clause.predicate());
         let grade = if clause.from_overlay {
             match history.last().map(|event| event.strength) {
                 Some(AssertionStrength::Correction) => EnvelopeGrade::SessionCorrection,
@@ -4843,7 +4849,8 @@ impl SymbolicReasoner {
         entity: &str,
         clauses: &[ProfileClause],
     ) -> AnswerPlan {
-        let accepted: Vec<&ProfileClause> = if self.config.enable_entailment && !clauses.is_empty() {
+        let accepted: Vec<&ProfileClause> = if self.config.enable_entailment && !clauses.is_empty()
+        {
             let raw = clauses
                 .iter()
                 .map(|clause| clause.sentence.as_str())
@@ -4893,12 +4900,7 @@ impl SymbolicReasoner {
                             .evidence
                             .iter()
                             .map(|(subject, predicate, object)| {
-                                ClaimEvidence::new(
-                                    subject,
-                                    predicate,
-                                    object,
-                                    clause.from_overlay,
-                                )
+                                ClaimEvidence::new(subject, predicate, object, clause.from_overlay)
                             })
                             .collect(),
                     );
@@ -4988,10 +4990,7 @@ impl SymbolicReasoner {
             plan.question.clone()
         };
         let current = self.build_answer_plan(&question, &state.entity, &clauses);
-        let mut output = format!(
-            "复核对象：最近一次生成（关于「{}」）。\n",
-            state.entity
-        );
+        let mut output = format!("复核对象：最近一次生成（关于「{}」）。\n", state.entity);
         output.push_str(&plan.diff(&current).render_zh(true));
         if self.config.confidence.enabled && !self.epistemic_turns.is_empty() {
             let policy = TurnPolicy::from_confidence(&self.config.confidence);
@@ -5088,7 +5087,9 @@ impl SymbolicReasoner {
                 MAX_PLAN_CLAIMS, plan.omitted
             ));
         }
-        output.push_str("  可输入「简短点」「完整讲讲」「换种表达」或「第N点是什么」重述同一份计划。");
+        output.push_str(
+            "  可输入「简短点」「完整讲讲」「换种表达」或「第N点是什么」重述同一份计划。",
+        );
         if self.config.confidence.enabled {
             let pending = self.epistemic_turns.render_pending_zh(3);
             if !pending.is_empty() {
@@ -5404,7 +5405,9 @@ impl SymbolicReasoner {
     ///
     /// 只读取生成器/预测器/槽账本的既有投影，不新建事实源：
     /// 关系三元组、实体类型、属性键值与子类层级都按同一份知识版本构建。
-    fn formal_semantics_view(&self) -> (
+    fn formal_semantics_view(
+        &self,
+    ) -> (
         crate::formal_semantics::FormalSemantics,
         crate::formal_semantics::TinyModel,
     ) {
@@ -5514,18 +5517,17 @@ impl SymbolicReasoner {
                     .filter_map(|index| evaluation.grounded.get(*index))
                     .map(|grounded| {
                         let evidence = match &grounded.outcome {
-                            crate::formal_semantics::QueryOutcome::Values {
-                                evidence, ..
-                            }
+                            crate::formal_semantics::QueryOutcome::Values { evidence, .. }
                             | crate::formal_semantics::QueryOutcome::Entities {
                                 evidence, ..
                             }
                             | crate::formal_semantics::QueryOutcome::EntitiesByObject {
-                                evidence, ..
+                                evidence,
+                                ..
                             }
-                            | crate::formal_semantics::QueryOutcome::Truth {
-                                evidence, ..
-                            } => evidence.clone(),
+                            | crate::formal_semantics::QueryOutcome::Truth { evidence, .. } => {
+                                evidence.clone()
+                            }
                             crate::formal_semantics::QueryOutcome::Unsupported(_) => Vec::new(),
                         };
                         FormalClarificationOption {
@@ -5563,10 +5565,7 @@ impl SymbolicReasoner {
 
     /// 处理对语义歧义澄清的短答：序号/前者/后者 → 选定读法；都不是 → 放弃。
     /// 非回答输入清空澄清帧并返回 `NotAnAnswer`，放行常规管线。
-    pub fn answer_formal_clarification(
-        &mut self,
-        text: &str,
-    ) -> FormalClarificationOutcome {
+    pub fn answer_formal_clarification(&mut self, text: &str) -> FormalClarificationOutcome {
         let Some(clarification) = self.formal_clarification.lock().clone() else {
             return FormalClarificationOutcome::NotAnAnswer;
         };
@@ -8459,7 +8458,8 @@ impl SymbolicReasoner {
             limit,
             predictions.clone(),
         );
-        self.perf.bump_by("prediction_draft_evictions", evicted as u64);
+        self.perf
+            .bump_by("prediction_draft_evictions", evicted as u64);
         predictions
     }
 
@@ -8482,7 +8482,8 @@ impl SymbolicReasoner {
                 .len();
         }
         self.perf.bump("prediction_draft_prefetches");
-        self.perf.bump_by("prediction_draft_prefetched", warmed as u64);
+        self.perf
+            .bump_by("prediction_draft_prefetched", warmed as u64);
         warmed
     }
 
@@ -9140,9 +9141,7 @@ impl SymbolicReasoner {
         }
         let limit = self.config.max_predictions.saturating_mul(2).max(4);
         let mut nominations = Vec::new();
-        for prediction in self
-            .predictions_for_entity(entity, Some(attribute), limit)
-        {
+        for prediction in self.predictions_for_entity(entity, Some(attribute), limit) {
             if prediction.triple.subject != entity || prediction.triple.predicate != attribute {
                 continue;
             }
@@ -9419,9 +9418,7 @@ impl SymbolicReasoner {
         }
         if !predicate.inverted && self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
-            for prediction in self
-                .predictions_for_entity(node, Some(&predicate.slot), limit)
-            {
+            for prediction in self.predictions_for_entity(node, Some(&predicate.slot), limit) {
                 // 只取 node 作为主体的出边预测
                 if prediction.triple.subject != node {
                     continue;
@@ -12287,9 +12284,7 @@ impl SymbolicReasoner {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
             // 用哈希集合做成员检查
             let mut seen_subjects: HashSet<String> = subjects.iter().cloned().collect();
-            for prediction in self
-                .predictions_for_entity(&object, Some(&slot), limit)
-            {
+            for prediction in self.predictions_for_entity(&object, Some(&slot), limit) {
                 if prediction.triple.object == object
                     && prediction.triple.subject != object
                     && !excluded_set.contains(&prediction.triple.subject)
@@ -12445,6 +12440,7 @@ impl SymbolicReasoner {
         }
         self.answer_contextual(question)
             .or_else(|| self.formal_semantics_answer(question))
+            .or_else(|| self.generator.answer_import_frame(question))
             .map(|answer| self.annotate_assumption_world(answer))
     }
 
@@ -12781,6 +12777,7 @@ impl SymbolicReasoner {
         }
         self.answer_contextual(question)
             .or_else(|| self.formal_semantics_attempt(question))
+            .or_else(|| self.generator.answer_import_frame(question))
     }
 
     /// 对话级证据装配（默认关闭）：把问句、焦点栈、上一谓词与已引用证据
@@ -13836,12 +13833,8 @@ impl SymbolicReasoner {
         let kind = segmenter
             .reading_kind(surface, canonical)
             .unwrap_or(ReadingKind::Entity);
-        self.contextual_memory.confirm(
-            surface,
-            canonical,
-            kind,
-            &result.context.fingerprint,
-        );
+        self.contextual_memory
+            .confirm(surface, canonical, kind, &result.context.fingerprint);
         format!(
             "读法记忆已确认：「{}」→「{}」（{}）；语境 {}。",
             surface,
@@ -13929,11 +13922,7 @@ impl SymbolicReasoner {
         (focus_entities, expected_types)
     }
 
-    fn contextual_segment_options(
-        &self,
-        focus: &[String],
-        expected: &[String],
-    ) -> SegmentOptions {
+    fn contextual_segment_options(&self, focus: &[String], expected: &[String]) -> SegmentOptions {
         SegmentOptions {
             context_terms: focus.to_vec(),
             expected_types: expected.to_vec(),
@@ -20994,9 +20983,11 @@ types = [
             plan.claims
         );
         assert!(
-            plan.claims.iter().any(|claim| claim.evidence.iter().any(|item| {
-                item.subject == "张三" && item.predicate == "师傅" && item.object == "李四"
-            })),
+            plan.claims
+                .iter()
+                .any(|claim| claim.evidence.iter().any(|item| {
+                    item.subject == "张三" && item.predicate == "师傅" && item.object == "李四"
+                })),
             "师傅事实应出现在证据中：{:?}",
             plan.claims
         );
@@ -21144,17 +21135,20 @@ types = [
             .generation_state()
             .and_then(|state| state.plan.as_ref())
             .expect("应有计划");
-        assert!(
-            plan.claims
-                .iter()
-                .filter(|claim| claim.predicate == "师傅")
-                .all(|claim| reasoner.config.confidence.envelope_verdict(
-                    claim.envelope.expect("图谱命题应带区间")
-                ) == crate::confidence::EnvelopeVerdict::Assert)
-        );
+        assert!(plan
+            .claims
+            .iter()
+            .filter(|claim| claim.predicate == "师傅")
+            .all(|claim| reasoner
+                .config
+                .confidence
+                .envelope_verdict(claim.envelope.expect("图谱命题应带区间"))
+                == crate::confidence::EnvelopeVerdict::Assert));
 
         reasoner.assert_nl_fact("记住：张三的师傅是赵六");
-        reasoner.generate_about("张三").expect("会话事实应可重新生成");
+        reasoner
+            .generate_about("张三")
+            .expect("会话事实应可重新生成");
         let report = reasoner.review_generation_plan();
         assert!(report.contains("置信复核"), "{}", report);
         assert!(report.contains("更正"), "{}", report);
@@ -21194,7 +21188,9 @@ types = [
 
         let reply = reasoner.assert_nl_fact("记住：张三的师傅是赵六");
         assert!(reply.contains("已记住"), "{}", reply);
-        reasoner.generate_about("张三").expect("会话事实应可重新生成");
+        reasoner
+            .generate_about("张三")
+            .expect("会话事实应可重新生成");
         let plan = reasoner
             .context()
             .generation_state()
@@ -26526,7 +26522,6 @@ types = [
         assert!(!reasoner.formal_clarification_active());
     }
 
-
     #[test]
     fn formal_semantics_fallback_answers_reverse_relation() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
@@ -26607,7 +26602,10 @@ types = [
             .expect("澄清帧应给出提示");
         assert!(prompt.contains("2 种有证据的读法"), "{}", prompt);
         assert!(
-            matches!(reasoner.answer_formal_clarification("9"), FormalClarificationOutcome::Reprompt(_)),
+            matches!(
+                reasoner.answer_formal_clarification("9"),
+                FormalClarificationOutcome::Reprompt(_)
+            ),
             "越界应重问且不清空"
         );
         assert!(reasoner.formal_clarification_active());
@@ -26615,7 +26613,11 @@ types = [
         match reasoner.answer_formal_clarification("选择第二个") {
             FormalClarificationOutcome::Answered(text) => {
                 assert!(text.contains("李四的师傅是张三"), "{}", text);
-                assert!(text.contains("证据：relation(李四, 师傅, 张三)"), "{}", text);
+                assert!(
+                    text.contains("证据：relation(李四, 师傅, 张三)"),
+                    "{}",
+                    text
+                );
             }
             other => panic!("应选定第二条读法，got {:?}", other),
         }
@@ -26636,7 +26638,10 @@ types = [
             reasoner.answer_formal_clarification("张三是谁"),
             FormalClarificationOutcome::NotAnAnswer
         );
-        assert!(!reasoner.formal_clarification_active(), "非回答输入应清空旧澄清帧");
+        assert!(
+            !reasoner.formal_clarification_active(),
+            "非回答输入应清空旧澄清帧"
+        );
 
         *reasoner.formal_clarification.lock() = Some(frame());
         let forked = reasoner.fork_session();
