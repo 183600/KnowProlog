@@ -779,8 +779,9 @@ impl SlotDecision {
             DecisionMode::Consensus => {
                 let sources = self
                     .winners
-                    .first()
+                    .iter()
                     .map(|value| value.independent_sources)
+                    .max()
                     .unwrap_or(0);
                 format!(
                     "据 {} 个独立来源一致记录，{} 是「{}」。",
@@ -832,6 +833,9 @@ impl SlotDecision {
                 DecisionMode::Adjudicated => RankBand::Adjudicated,
                 DecisionMode::KnowledgeBaseOnly => RankBand::KnowledgeBaseOnly,
                 DecisionMode::NoEvidence => RankBand::NoEvidence,
+                _ if argument.independent_sources == 0 && argument.materialized => {
+                    RankBand::KnowledgeBaseOnly
+                }
                 _ => RankBand::Winner,
             }
         } else if self.dissent.iter().any(|value| value.object == object) {
@@ -1929,6 +1933,40 @@ mod tests {
         assert_eq!(
             report.rank_for("小明", "年龄", "18").band,
             RankBand::Contested
+        );
+    }
+
+    #[test]
+    fn materialized_only_value_is_ranked_as_knowledge_base_in_mixed_slot() {
+        let catalog = SourceCatalog::from_records(&[
+            record("a", TrustLevel::Imported),
+            record("kb", TrustLevel::Curated),
+        ]);
+        let report = arbitrate(
+            &ArbitrationInput {
+                catalog,
+                assertions: vec![assertion("a", "苹果", "颜色", "红色")],
+                applied: vec![AppliedWinner {
+                    id: "w1".to_string(),
+                    namespace: "kb".to_string(),
+                    subject: "苹果".to_string(),
+                    predicate: "颜色".to_string(),
+                    object: "绿色".to_string(),
+                    object_kind: ObjectKind::Literal,
+                }],
+                ..ArbitrationInput::default()
+            },
+            &policy(),
+        );
+        let slot = report.slot("苹果", "颜色").expect("应有槽");
+        assert_eq!(slot.winners.len(), 2);
+        assert_eq!(
+            report.rank_for("苹果", "颜色", "红色").band,
+            RankBand::Winner
+        );
+        assert_eq!(
+            report.rank_for("苹果", "颜色", "绿色").band,
+            RankBand::KnowledgeBaseOnly
         );
     }
 
