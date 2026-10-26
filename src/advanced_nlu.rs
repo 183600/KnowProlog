@@ -4,6 +4,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::text_anchor::{ByteSpan, ProjectionOptions, TextProjection};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentResult {
     pub intent: String,
@@ -17,10 +19,19 @@ pub struct IntentResult {
 pub struct ExtractedEntity {
     pub text: String,
     pub entity_type: String,
+    /// 原始查询中的 UTF-8 字节起点（不是归一化文本、也不是字符序号）。
     pub start_pos: usize,
+    /// 原始查询中的 UTF-8 字节终点（左闭右开）。
     pub end_pos: usize,
     pub confidence: f64,
     pub normalized_value: Option<String>,
+}
+
+impl ExtractedEntity {
+    /// 用原始查询安全切出实体词面；位置不合法时返回 `None`。
+    pub fn raw_text<'a>(&self, raw: &'a str) -> Option<&'a str> {
+        raw.get(self.start_pos..self.end_pos)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,22 +518,32 @@ impl AdvancedNLU {
         &self,
         query: &str,
     ) -> Result<IntentResult, Box<dyn std::error::Error>> {
-        // 预处理查询
-        let normalized_query = self.normalize_query(query);
+        // 保守归一化只在投影层发生：分析用归一化串，位置一律投回原文。
+        let projection = TextProjection::new(query, ProjectionOptions::default());
+        let normalized_query = projection.normalized();
 
         // 意图识别
-        let intent_info = self.recognize_intent(&normalized_query).await?;
+        let intent_info = self.recognize_intent(normalized_query).await?;
 
-        // 实体抽取
-        let entities = self.extract_entities(&normalized_query).await?;
+        // 实体抽取（正则给出的是归一化串的字节区间）
+        let mut entities = self.extract_entities(normalized_query).await?;
+        for entity in &mut entities {
+            if let Ok(anchor) = projection.surface_bytes_to_raw(ByteSpan::new(
+                entity.start_pos,
+                entity.end_pos,
+            )) {
+                entity.start_pos = anchor.raw.start;
+                entity.end_pos = anchor.raw.end;
+            }
+        }
 
         // 槽位填充
         let slots = self
-            .extract_slots(&normalized_query, &intent_info, &entities)
+            .extract_slots(normalized_query, &intent_info, &entities)
             .await?;
 
         // 上下文分析
-        let context = self.analyze_context(&normalized_query, &entities).await?;
+        let context = self.analyze_context(normalized_query, &entities).await?;
 
         // 保存上下文到记忆
         self.update_context_memory(&context);
@@ -534,19 +555,6 @@ impl AdvancedNLU {
             slots,
             context,
         })
-    }
-
-    fn normalize_query(&self, query: &str) -> String {
-        // 去除多余空白字符并统一标点符号
-        query
-            .trim()
-            .chars()
-            .map(|ch| match ch {
-                '？' => '?',
-                '！' => '!',
-                other => other,
-            })
-            .collect()
     }
 
     async fn recognize_intent(
@@ -819,15 +827,20 @@ impl AdvancedNLU {
         for pattern in &pattern_info.patterns {
             if let Some(regex) = self.get_compiled_entity_regex(pattern) {
                 for mat in regex.find_iter(query) {
-                    let text = mat.as_str();
+                    // 句读不是实体的一部分：像「刘德华？」这种贪婪匹配必须在
+                    // 投影前先裁掉边界标点，否则实体词面会带着问号进入槽位。
+                    let (text, leading, trailing) = trim_entity_surface(mat.as_str());
+                    if text.is_empty() {
+                        continue;
+                    }
                     let confidence =
                         self.calculate_entity_confidence(text, context_hits, pattern_info);
 
                     entities.push(ExtractedEntity {
                         text: text.to_string(),
                         entity_type: entity_type.to_string(),
-                        start_pos: mat.start(),
-                        end_pos: mat.end(),
+                        start_pos: mat.start() + leading,
+                        end_pos: mat.end() - trailing,
                         confidence,
                         normalized_value: self.normalize_entity_value(text, entity_type),
                     });
@@ -1296,6 +1309,38 @@ impl Default for AdvancedNLU {
     }
 }
 
+/// 裁掉实体匹配两端的空白与句读，返回（词面, 前导字节数, 尾部字节数）。
+fn trim_entity_surface(text: &str) -> (&str, usize, usize) {
+    fn is_boundary(ch: char) -> bool {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '，' | '。' | '！' | '？' | '；' | '：' | '、'
+                    | ',' | '.' | '!' | '?' | ';' | ':' | '的'
+                    | '“' | '”' | '‘' | '’' | '「' | '」' | '『' | '』'
+                    | '(' | ')' | '（' | '）' | '[' | ']' | '【' | '】'
+                    | '"' | '\''
+            )
+    }
+
+    let start = text
+        .char_indices()
+        .find(|(_, ch)| !is_boundary(*ch))
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    let end = text
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_boundary(*ch))
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    if start >= end {
+        ("", 0, text.len())
+    } else {
+        (&text[start..end], start, text.len() - end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,5 +1418,37 @@ mod tests {
         for _ in 0..32 {
             assert_eq!(nlu.recognize_intent("刘德华是谁").await.unwrap(), first);
         }
+    }
+
+    #[tokio::test]
+    async fn test_entity_positions_are_relative_to_original_query() {
+        let nlu = AdvancedNLU::new();
+        let raw = "  刘德华？年龄是多少  ";
+        let result = nlu.analyze_query(raw).await.unwrap();
+        let person = result
+            .entities
+            .iter()
+            .find(|entity| entity.entity_type == "PERSON")
+            .expect("应识别出人物实体");
+        assert_eq!(person.raw_text(raw), Some(person.text.as_str()));
+        assert_eq!(person.text, "刘德华");
+
+        // 归一化串比原文短：若位置仍相对归一化串，这里会切到别的字。
+        assert_eq!(person.start_pos, 2);
+        assert_eq!(person.end_pos, 2 + "刘德华".len());
+    }
+
+    #[tokio::test]
+    async fn test_zero_width_input_projects_entity_to_raw_evidence() {
+        let nlu = AdvancedNLU::new();
+        let raw = "刘\u{200B}德华的年龄是多少";
+        let result = nlu.analyze_query(raw).await.unwrap();
+        let person = result
+            .entities
+            .iter()
+            .find(|entity| entity.entity_type == "PERSON")
+            .expect("应识别出人物实体");
+        assert_eq!(person.text, "刘德华");
+        assert_eq!(person.raw_text(raw), Some("刘\u{200B}德华"));
     }
 }

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::text_anchor::{ByteSpan, ProjectionOptions, TextProjection};
+
 static QUESTION_PATTERNS: OnceLock<HashMap<QuestionType, Vec<Regex>>> = OnceLock::new();
 static DOMAIN_KEYWORDS: OnceLock<HashMap<Domain, Vec<String>>> = OnceLock::new();
 static INTENT_INDICATORS: OnceLock<HashMap<Intent, Vec<String>>> = OnceLock::new();
@@ -72,9 +74,18 @@ pub enum Intent {
 pub struct Entity {
     pub text: String,
     pub entity_type: String,
+    /// 原始问句中的 UTF-8 字节起点（不是归一化文本、也不是字符序号）。
     pub start_pos: usize,
+    /// 原始问句中的 UTF-8 字节终点（左闭右开）。
     pub end_pos: usize,
     pub confidence: f64,
+}
+
+impl Entity {
+    /// 用原始问句安全切出实体词面；位置不合法时返回 `None`。
+    pub fn raw_text<'a>(&self, raw: &'a str) -> Option<&'a str> {
+        raw.get(self.start_pos..self.end_pos)
+    }
 }
 
 pub struct QuestionAnalyzer {
@@ -475,28 +486,38 @@ impl QuestionAnalyzer {
         &self,
         question: &str,
     ) -> Result<QuestionAnalysis, Box<dyn std::error::Error + Send + Sync>> {
-        // 预处理
-        let normalized_question = self.normalize_question(question);
+        // 保守归一化只在投影层发生：分类与正则读归一化串，实体位置投回原文。
+        let projection = TextProjection::new(question, ProjectionOptions::default());
+        let normalized_question = projection.normalized();
 
         // 识别问题类型
-        let question_type = self.identify_question_type(&normalized_question).await?;
+        let question_type = self.identify_question_type(normalized_question).await?;
 
         // 识别领域
-        let domain = self.identify_domain(&normalized_question).await?;
+        let domain = self.identify_domain(normalized_question).await?;
 
         // 评估复杂度
         let complexity = self
-            .assess_complexity(&normalized_question, &question_type)
+            .assess_complexity(normalized_question, &question_type)
             .await?;
 
         // 识别意图
-        let intent = self.identify_intent(&normalized_question).await?;
+        let intent = self.identify_intent(normalized_question).await?;
 
-        // 提取实体
-        let entities = self.extract_entities(&normalized_question).await?;
+        // 提取实体（正则给出的是归一化串的字节区间）
+        let mut entities = self.extract_entities(normalized_question).await?;
+        for entity in &mut entities {
+            if let Ok(anchor) = projection.surface_bytes_to_raw(ByteSpan::new(
+                entity.start_pos,
+                entity.end_pos,
+            )) {
+                entity.start_pos = anchor.raw.start;
+                entity.end_pos = anchor.raw.end;
+            }
+        }
 
         // 提取关键词
-        let keywords = self.extract_keywords(&normalized_question).await?;
+        let keywords = self.extract_keywords(normalized_question).await?;
 
         // 计算置信度
         let confidence = self
@@ -519,21 +540,6 @@ impl QuestionAnalyzer {
             confidence,
             suggested_query_patterns,
         })
-    }
-
-    fn normalize_question(&self, question: &str) -> String {
-        // 四个源字符与替换字符互不相同，可单遍映射
-        question
-            .trim()
-            .chars()
-            .map(|ch| match ch {
-                '？' => '?',
-                '！' => '!',
-                '，' => ',',
-                '。' => '.',
-                other => other,
-            })
-            .collect()
     }
 
     async fn identify_question_type(
@@ -841,5 +847,35 @@ mod tests {
             .unwrap();
         assert!(!result.entities.is_empty());
         assert!(!result.keywords.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_entity_positions_are_relative_to_original_question() {
+        let analyzer = QuestionAnalyzer::new();
+        let raw = "  法国？的首都是哪里  ";
+        let result = analyzer.analyze_question(raw).await.unwrap();
+        let country = result
+            .entities
+            .iter()
+            .find(|entity| entity.entity_type == "COUNTRY")
+            .expect("应识别出国家实体");
+        assert_eq!(country.text, "法国");
+        assert_eq!(country.raw_text(raw), Some("法国"));
+        assert_eq!(country.start_pos, 2);
+        assert_eq!(country.end_pos, 2 + "法国".len());
+    }
+
+    #[tokio::test]
+    async fn test_zero_width_question_projections_keep_raw_evidence() {
+        let analyzer = QuestionAnalyzer::new();
+        let raw = "法\u{200B}国的首都是哪里？";
+        let result = analyzer.analyze_question(raw).await.unwrap();
+        let country = result
+            .entities
+            .iter()
+            .find(|entity| entity.entity_type == "COUNTRY")
+            .expect("应识别出国家实体");
+        assert_eq!(country.text, "法国");
+        assert_eq!(country.raw_text(raw), Some("法\u{200B}国"));
     }
 }

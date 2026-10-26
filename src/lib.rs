@@ -148,6 +148,7 @@ pub mod startup_ledger;
 pub mod symbolic_generator;
 pub mod symbolic_reasoner;
 pub mod temporal;
+pub mod text_anchor;
 pub mod trace_graph;
 pub mod turn_runtime;
 pub mod type_memory;
