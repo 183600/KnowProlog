@@ -4588,7 +4588,6 @@ impl SymbolicReasoner {
             &entity,
             &clauses,
         );
-        self.observe_epistemic_plan(&plan);
         let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
         let page = self.generator.cursor_page(
             &entity,
@@ -4596,6 +4595,7 @@ impl SymbolicReasoner {
             &overlay,
             &mut cursor,
         )?;
+        self.observe_epistemic_plan(&plan);
         self.context.record_generation_with_plan(cursor, plan);
         let audit = self.audit_generation(&page.text, &page.trusted);
         let mut text = audit.text;
