@@ -18,7 +18,7 @@ use know_prolog::{
         parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
         ContextualResolver,
     },
-    contextual_segmentation::{ContextualSegmenter, SegmentOptions},
+    contextual_segmentation::{ContextualSegmenter, ReadingKind, ReadingMemory, SegmentOptions},
     conversation_theory::{self, ConversationTheory},
     create_default_synonyms,
     dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
@@ -262,6 +262,15 @@ enum Commands {
         /// Ambiguity margin threshold for clarification
         #[arg(long, default_value_t = 0.05)]
         margin: f64,
+        /// Read/write the contextual reading memory JSON at this path
+        #[arg(long)]
+        memory: Option<String>,
+        /// Confirm SURFACE=CANONICAL in the current context (repeatable)
+        #[arg(long = "confirm", value_name = "SURFACE=CANONICAL")]
+        confirm: Vec<String>,
+        /// Correct SURFACE=REJECTED>ACCEPTED in the current context (repeatable)
+        #[arg(long = "correct", value_name = "SURFACE=REJECTED>ACCEPTED")]
+        correct: Vec<String>,
         /// Print the result as JSON
         #[arg(long)]
         json: bool,
@@ -1982,6 +1991,9 @@ async fn main() {
             expected_types,
             predicate,
             margin,
+            memory,
+            confirm,
+            correct,
             json,
         }) => {
             run_contextual_segment(
@@ -1992,6 +2004,9 @@ async fn main() {
                 &expected_types,
                 predicate.as_deref(),
                 margin,
+                memory.as_deref(),
+                &confirm,
+                &correct,
                 json,
             )
             .await;
@@ -5525,12 +5540,32 @@ async fn run_contextual_segment(
     expected_types: &[String],
     predicate: Option<&str>,
     margin: f64,
+    memory_path: Option<&str>,
+    confirm: &[String],
+    correct: &[String],
     json: bool,
 ) {
     if !(0.0..=1.0).contains(&margin) || !margin.is_finite() {
         eprintln!("--margin 必须在 0 到 1 之间（含端点），实得 {}", margin);
         std::process::exit(2);
     }
+    let memory = match memory_path {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => match ReadingMemory::from_json(&text) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    eprintln!("读法记忆解析失败（{}）: {}", path, error);
+                    std::process::exit(1);
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadingMemory::new(512),
+            Err(error) => {
+                eprintln!("读法记忆读取失败（{}）: {}", path, error);
+                std::process::exit(1);
+            }
+        },
+        None => ReadingMemory::new(512),
+    };
 
     let mut segmenter = ContextualSegmenter::new();
     segmenter.set_schema(SchemaView::from_config(
@@ -5602,6 +5637,7 @@ async fn run_contextual_segment(
         std::process::exit(2);
     }
 
+    *segmenter.memory_mut() = memory;
     let result = segmenter.segment(
         &source,
         &SegmentOptions {
@@ -5612,6 +5648,77 @@ async fn run_contextual_segment(
             ..Default::default()
         },
     );
+
+    let mut memory_changed = false;
+    for spec in confirm {
+        let Some((surface, canonical)) = spec.split_once('=') else {
+            eprintln!("--confirm 需要 SURFACE=CANONICAL，实得 {}", spec);
+            std::process::exit(2);
+        };
+        let surface = surface.trim();
+        let canonical = canonical.trim();
+        if surface.is_empty() || canonical.is_empty() {
+            eprintln!("--confirm 的词面与规范名都不能为空：{}", spec);
+            std::process::exit(2);
+        }
+        let kind = segmenter
+            .reading_kind(surface, canonical)
+            .unwrap_or(ReadingKind::Entity);
+        memory_changed |= segmenter.memory_mut().confirm(
+            surface,
+            canonical,
+            kind,
+            &result.context.fingerprint,
+        );
+    }
+    for spec in correct {
+        let Some((surface, replacement)) = spec.split_once('=') else {
+            eprintln!("--correct 需要 SURFACE=REJECTED>ACCEPTED，实得 {}", spec);
+            std::process::exit(2);
+        };
+        let Some((rejected, accepted)) = replacement.split_once('>') else {
+            eprintln!("--correct 需要 SURFACE=REJECTED>ACCEPTED，实得 {}", spec);
+            std::process::exit(2);
+        };
+        let surface = surface.trim();
+        let rejected = rejected.trim();
+        let accepted = accepted.trim();
+        if surface.is_empty() || accepted.is_empty() {
+            eprintln!("--correct 的词面与接受读法都不能为空：{}", spec);
+            std::process::exit(2);
+        }
+        let rejected_kind = segmenter
+            .reading_kind(surface, rejected)
+            .unwrap_or(ReadingKind::Entity);
+        let accepted_kind = segmenter
+            .reading_kind(surface, accepted)
+            .unwrap_or(rejected_kind);
+        memory_changed |= segmenter.memory_mut().correct(
+            surface,
+            rejected,
+            rejected_kind,
+            accepted,
+            accepted_kind,
+            &result.context.fingerprint,
+        );
+    }
+    if memory_changed {
+        if let Some(path) = memory_path {
+            match segmenter.memory().to_json() {
+                Ok(rendered) => {
+                    if let Err(error) = std::fs::write(path, rendered) {
+                        eprintln!("读法记忆写入失败（{}）: {}", path, error);
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("读法记忆序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        }
+        eprintln!("读法记忆已更新。");
+    }
     if json {
         match serde_json::to_string_pretty(&result) {
             Ok(rendered) => println!("{}", rendered),

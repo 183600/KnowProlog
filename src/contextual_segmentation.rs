@@ -455,6 +455,14 @@ impl ReadingMemory {
         })
     }
 
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(text)
+    }
+
     pub fn render_report(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(
@@ -733,6 +741,14 @@ impl ContextualSegmenter {
 
     pub fn memory_mut(&mut self) -> &mut ReadingMemory {
         &mut self.memory
+    }
+
+    pub fn reading_kind(&self, surface: &str, canonical: &str) -> Option<ReadingKind> {
+        self.surfaces
+            .get(surface.trim())?
+            .iter()
+            .find(|reading| reading.canonical == canonical.trim())
+            .map(|reading| reading.kind)
     }
 
     pub fn entity_count(&self) -> usize {
@@ -1893,6 +1909,47 @@ mod tests {
             "模式互斥应让语境与类型证据参与比较：{:?}",
             result.tokens
         );
+    }
+
+    #[test]
+    fn reading_memory_json_roundtrip_is_lossless() {
+        let mut memory = ReadingMemory::new(8);
+        memory.confirm("苹果", "苹果公司", ReadingKind::Entity, "ctx-1");
+        memory.correct(
+            "苹果",
+            "苹果",
+            ReadingKind::Entity,
+            "苹果公司",
+            ReadingKind::Entity,
+            "ctx-1",
+        );
+        let json = memory.to_json().expect("记忆应可序列化");
+        let restored = ReadingMemory::from_json(&json).expect("记忆应可反序列化");
+        assert_eq!(restored, memory);
+        assert_eq!(
+            restored
+                .preferred("苹果", "ctx-1")
+                .map(|preference| preference.canonical.as_str()),
+            Some("苹果公司")
+        );
+    }
+
+    #[test]
+    fn reading_kind_exposes_surface_senses() {
+        let segmenter = sample_segmenter();
+        assert_eq!(
+            segmenter.reading_kind("苹果", "苹果"),
+            Some(ReadingKind::Entity)
+        );
+        assert_eq!(
+            segmenter.reading_kind("苹果", "苹果公司"),
+            Some(ReadingKind::Entity)
+        );
+        assert_eq!(
+            segmenter.reading_kind("水果", "水果"),
+            Some(ReadingKind::Type)
+        );
+        assert_eq!(segmenter.reading_kind("苹果", "不存在"), None);
     }
 
     #[test]
