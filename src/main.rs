@@ -6966,6 +6966,19 @@ async fn run_ask(
             });
             continue;
         }
+        if matches!(
+            question.as_str(),
+            "复核计划" | "计划复核" | "核对计划" | "检查计划"
+        ) {
+            reasoner.clear_pending_awaiting();
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(reasoner.review_generation_plan()),
+                derivation: None,
+            });
+            continue;
+        }
         // 澄清对话中的下一行按回答处理：脚本可以用多行 stdin 完成
         // 「问题 → 是/不是 → 条件化结论」的整段解释空间收敛。
         if clarify && reasoner.clarification_active() {
@@ -10698,6 +10711,13 @@ async fn run_interactive_mode(
         // 回答计划审计：查看 id、知识版本、逐点命题与来源。
         if matches!(input, "回答计划" | "计划台账" | "生成计划" | "回答方案") {
             println!("{}", symbolic_reasoner.answer_plan_report());
+            println!();
+            continue;
+        }
+
+        // 回答计划复核：用当前知识重建同一实体计划并逐点对照，不改写旧回答。
+        if matches!(input, "复核计划" | "计划复核" | "核对计划" | "检查计划") {
+            println!("{}", symbolic_reasoner.review_generation_plan());
             println!();
             continue;
         }
@@ -14752,6 +14772,7 @@ fn interactive_help() -> String {
         "  简短点 / 完整讲讲 / 换种表达        按同一份回答计划重述，不重新检索、不新增事实",
         "  第N点是什么 / 风格：第N点            只展开回答计划中的第 N 点",
         "  回答计划 / 计划台账                  查看计划 id、知识版本、逐点来源与过期状态",
+        "  复核计划 / 计划复核                  用当前知识对照旧计划，只报告差异不改写回答",
         "  证据检索：<问题>                    带约束与上界剪枝的证据排序及检索回执",
         "",
         "其他",
@@ -14996,6 +15017,10 @@ fn is_command_like(input: &str) -> bool {
         "计划台账",
         "生成计划",
         "回答方案",
+        "复核计划",
+        "计划复核",
+        "核对计划",
+        "检查计划",
         "叙述",
         "讲述",
         "详细叙述",
@@ -16532,8 +16557,17 @@ mod session_tests {
             );
             assert!(is_command_like(input), "风格指令不应被当成短答：{}", input);
         }
-        for input in ["回答计划", "计划台账", "生成计划", "回答方案"] {
-            assert!(is_command_like(input), "计划报告不应被当成短答：{}", input);
+        for input in [
+            "回答计划",
+            "计划台账",
+            "生成计划",
+            "回答方案",
+            "复核计划",
+            "计划复核",
+            "核对计划",
+            "检查计划",
+        ] {
+            assert!(is_command_like(input), "计划命令不应被当成短答：{}", input);
         }
         for input in ["详细一点", "展开说说", "展开讲", "换个说法", "接着说"] {
             assert!(
@@ -17180,6 +17214,7 @@ mod session_tests {
             "接地重放",
             "简短点",
             "回答计划",
+            "复核计划",
             "帮助",
             "quit",
         ] {

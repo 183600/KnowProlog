@@ -4695,6 +4695,56 @@ impl SymbolicReasoner {
         }
     }
 
+    /// 用当前知识重建同一实体的计划，并与上一份计划逐点对照。
+    ///
+    /// 复核是只读操作：不重新解释原问题、不改写已经说出口的回答，也不替换
+    /// 已保存的旧计划。缺失/过期/结构不兼容都给出明确回执；实体在图谱与
+    /// 会话层都不存在时，当前计划为空，差异会逐点标为「移除」。
+    pub fn review_generation_plan(&mut self) -> String {
+        if !self.config.enable_generation {
+            return "生成功能未启用，无法复核回答计划。".to_string();
+        }
+        let Some(state) = self.context.generation_state().cloned() else {
+            return "还没有回答计划。先用「介绍：实体名」生成一段介绍，再说「复核计划」。"
+                .to_string();
+        };
+        let Some(plan) = state.plan.as_ref() else {
+            return format!(
+                "最近一次生成回答（关于「{}」）没有可复述的计划；请重新输入「介绍：{}」。",
+                state.entity, state.entity
+            );
+        };
+        if !plan.is_current_schema() {
+            return format!(
+                "最近一份生成计划的结构版本 {} 超出当前支持范围；请重新输入「介绍：{}」。",
+                plan.version, state.entity
+            );
+        }
+        let overlay = self.generation_overlay();
+        let clauses = self
+            .generator
+            .profile_clauses_with_overlay(&state.entity, GenerationOrder::Relevance, &overlay)
+            .unwrap_or_default();
+        let question = if plan.question.is_empty() {
+            format!("介绍：{}", state.entity)
+        } else {
+            plan.question.clone()
+        };
+        let current = self.build_answer_plan(&question, &state.entity, &clauses);
+        let mut output = format!(
+            "复核对象：最近一次生成（关于「{}」）。\n",
+            state.entity
+        );
+        output.push_str(&plan.diff(&current).render_zh(true));
+        if !plan.is_fresh_for(self.revision) {
+            output.push_str(&format!(
+                "\n旧计划仍保留为历史对照；如需基于当前知识重新生成，请输入「介绍：{}」。",
+                state.entity
+            ));
+        }
+        output
+    }
+
     /// 当前回答计划的审计视图：id、知识版本、逐点命题与可用风格指令。
     pub fn answer_plan_report(&self) -> String {
         let Some(state) = self.context.generation_state() else {
@@ -4717,7 +4767,7 @@ impl SymbolicReasoner {
             "与当前知识版本一致".to_string()
         } else {
             format!(
-                "已过期：计划基于 v{}，当前为 v{}",
+                "已过期：计划基于 v{}，当前为 v{}（输入「复核计划」查看逐点差异）",
                 plan.revision, self.revision
             )
         };
@@ -20315,6 +20365,57 @@ types = [
         let stale = reasoner.answer_plan_report();
         assert!(stale.contains("已过期"), "{}", stale);
         assert!(stale.contains(&format!("v{}", plan.revision)), "{}", stale);
+    }
+
+    #[test]
+    fn plan_review_is_read_only_and_reports_current_differences() {
+        let mut config = test_config();
+        config.max_profile_sentences = 2;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let saved_plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+
+        let fresh = reasoner.review_generation_plan();
+        assert!(fresh.contains("复核对象"), "{}", fresh);
+        assert!(fresh.contains("计划内容未变"), "{}", fresh);
+        assert!(fresh.contains(&saved_plan.id), "{}", fresh);
+        let still_saved = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("复核不得替换旧计划");
+        assert_eq!(still_saved, saved_plan, "复核必须是只读操作");
+
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "师傅".to_string(),
+            to: "赵六".to_string(),
+        }]);
+        let stale = reasoner.review_generation_plan();
+        assert!(stale.contains("知识版本"), "{}", stale);
+        assert!(stale.contains("更新"), "{}", stale);
+        assert!(stale.contains("李四"), "{}", stale);
+        assert!(stale.contains("赵六"), "{}", stale);
+        assert!(stale.contains("旧计划仍保留"), "{}", stale);
+        let after_review = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("旧计划仍应在");
+        assert_eq!(after_review.revision, saved_plan.revision);
+    }
+
+    #[test]
+    fn plan_review_without_a_plan_explains_how_to_create_one() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        let report = reasoner.review_generation_plan();
+        assert!(report.contains("还没有回答计划"), "{}", report);
+        assert!(report.contains("介绍"), "{}", report);
     }
 
     #[test]

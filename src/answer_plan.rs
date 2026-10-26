@@ -262,6 +262,109 @@ impl AnswerPlan {
         output.trim_end().to_string()
     }
 
+    /// 比较两份计划，按稳定槽位给出可审计的差异。
+    ///
+    /// 差异只比较「计划里说了什么」，不重新解释问题，也不改写旧回答；
+    /// 因此旧计划即使已过期，仍能作为对照物保留。槽位相同但文本或来源
+    /// 变化记为更新，知识变化导致的消失/新增分别记为移除/新增。
+    pub fn diff(&self, current: &AnswerPlan) -> PlanDiff {
+        let mut matched: Vec<bool> = vec![false; current.claims.len()];
+        let mut changes: Vec<PlanClaimChange> = Vec::new();
+        for before in &self.claims {
+            let exact = current
+                .claims
+                .iter()
+                .enumerate()
+                .find(|(index, after)| {
+                    !matched[*index]
+                        && after.slot == before.slot
+                        && after.predicate == before.predicate
+                        && after.text == before.text
+                        && after.session == before.session
+                })
+                .map(|(index, _)| index);
+            let same_slot = exact.or_else(|| {
+                current
+                    .claims
+                    .iter()
+                    .enumerate()
+                    .find(|(index, after)| !matched[*index] && after.slot == before.slot)
+                    .map(|(index, _)| index)
+            });
+            match same_slot {
+                Some(index) => {
+                    matched[index] = true;
+                    let after = &current.claims[index];
+                    let kind = if after == before {
+                        PlanChangeKind::Unchanged
+                    } else {
+                        PlanChangeKind::Updated
+                    };
+                    changes.push(PlanClaimChange {
+                        slot: before.slot.clone(),
+                        kind,
+                        before: Some(before.clone()),
+                        after: Some(after.clone()),
+                    });
+                }
+                None => changes.push(PlanClaimChange {
+                    slot: before.slot.clone(),
+                    kind: PlanChangeKind::Removed,
+                    before: Some(before.clone()),
+                    after: None,
+                }),
+            }
+        }
+        for (index, after) in current.claims.iter().enumerate() {
+            if !matched[index] {
+                changes.push(PlanClaimChange {
+                    slot: after.slot.clone(),
+                    kind: PlanChangeKind::Added,
+                    before: None,
+                    after: Some(after.clone()),
+                });
+            }
+        }
+        changes.sort_by(|left, right| {
+            left.slot
+                .cmp(&right.slot)
+                .then_with(|| left.kind.rank().cmp(&right.kind.rank()))
+                .then_with(|| {
+                    left.before
+                        .as_ref()
+                        .map(|claim| claim.text.as_str())
+                        .unwrap_or("")
+                        .cmp(
+                            right
+                                .before
+                                .as_ref()
+                                .map(|claim| claim.text.as_str())
+                                .unwrap_or(""),
+                        )
+                })
+                .then_with(|| {
+                    left.after
+                        .as_ref()
+                        .map(|claim| claim.text.as_str())
+                        .unwrap_or("")
+                        .cmp(
+                            right
+                                .after
+                                .as_ref()
+                                .map(|claim| claim.text.as_str())
+                                .unwrap_or(""),
+                        )
+                })
+        });
+        PlanDiff {
+            base_id: self.id.clone(),
+            current_id: current.id.clone(),
+            base_revision: self.revision,
+            current_revision: current.revision,
+            changes,
+        }
+    }
+
     fn append_plan_notes(&self, output: &mut String, detailed: bool) {
         if self.suppressed > 0 {
             let _ = writeln!(
@@ -284,6 +387,164 @@ impl AnswerPlan {
                 BRIEF_CLAIM_LIMIT
             );
         }
+    }
+}
+
+/// 一条计划差异的类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanChangeKind {
+    /// 同一槽位、同一内容（知识版本仍可能变化）。
+    Unchanged,
+    /// 槽位相同，但文本、谓词或来源发生变化。
+    Updated,
+    /// 旧计划有、当前计划不再支持。
+    Removed,
+    /// 当前计划新增、旧计划没有。
+    Added,
+}
+
+impl PlanChangeKind {
+    fn rank(self) -> u8 {
+        match self {
+            PlanChangeKind::Updated => 0,
+            PlanChangeKind::Removed => 1,
+            PlanChangeKind::Added => 2,
+            PlanChangeKind::Unchanged => 3,
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            PlanChangeKind::Unchanged => "未变",
+            PlanChangeKind::Updated => "更新",
+            PlanChangeKind::Removed => "移除",
+            PlanChangeKind::Added => "新增",
+        }
+    }
+}
+
+/// 一条可逐项核对的计划差异。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanClaimChange {
+    pub slot: String,
+    pub kind: PlanChangeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<PlanClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<PlanClaim>,
+}
+
+/// 两份计划之间的差异回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDiff {
+    pub base_id: String,
+    pub current_id: String,
+    pub base_revision: u64,
+    pub current_revision: u64,
+    pub changes: Vec<PlanClaimChange>,
+}
+
+impl PlanDiff {
+    /// 是否只有「未变」项。
+    pub fn is_unchanged(&self) -> bool {
+        self.changes
+            .iter()
+            .all(|change| change.kind == PlanChangeKind::Unchanged)
+    }
+
+    /// 更新 / 移除 / 新增 / 未变的计数。
+    pub fn counts(&self) -> (usize, usize, usize, usize) {
+        let count = |kind| {
+            self.changes
+                .iter()
+                .filter(|change| change.kind == kind)
+                .count()
+        };
+        (
+            count(PlanChangeKind::Updated),
+            count(PlanChangeKind::Removed),
+            count(PlanChangeKind::Added),
+            count(PlanChangeKind::Unchanged),
+        )
+    }
+
+    /// 渲染复核回执；`include_unchanged` 为 false 时只列变化项。
+    pub fn render_zh(&self, include_unchanged: bool) -> String {
+        let (updated, removed, added, unchanged) = self.counts();
+        let mut output = format!(
+            "回答计划复核：知识版本 v{} → v{}（旧计划 {}，当前计划 {}）\n",
+            self.base_revision, self.current_revision, self.base_id, self.current_id
+        );
+        if updated + removed + added == 0 {
+            output.push_str("  结论：计划内容未变");
+            if self.base_revision != self.current_revision {
+                output.push_str("（知识版本已更新，但逐点命题仍一致）");
+            }
+            output.push_str(&format!("；未变 {} 点。\n", unchanged));
+        } else {
+            output.push_str(&format!(
+                "  变化：更新 {}，移除 {}，新增 {}，未变 {}。\n",
+                updated, removed, added, unchanged
+            ));
+        }
+        for change in &self.changes {
+            if change.kind == PlanChangeKind::Unchanged && !include_unchanged {
+                continue;
+            }
+            match change.kind {
+                PlanChangeKind::Unchanged => {
+                    let text = change
+                        .after
+                        .as_ref()
+                        .map(|claim| claim.text.trim())
+                        .unwrap_or("");
+                    output.push_str(&format!("  [未变] {}：{}\n", change.slot, text));
+                }
+                PlanChangeKind::Updated => {
+                    let before = change
+                        .before
+                        .as_ref()
+                        .map(|claim| claim.text.trim())
+                        .unwrap_or("");
+                    let after = change
+                        .after
+                        .as_ref()
+                        .map(|claim| claim.text.trim())
+                        .unwrap_or("");
+                    output.push_str(&format!(
+                        "  [更新] {}：{} → {}\n",
+                        change.slot, before, after
+                    ));
+                }
+                PlanChangeKind::Removed => {
+                    let before = change
+                        .before
+                        .as_ref()
+                        .map(|claim| claim.text.trim())
+                        .unwrap_or("");
+                    output.push_str(&format!(
+                        "  [移除] {}：{}（当前知识不再支持）\n",
+                        change.slot, before
+                    ));
+                }
+                PlanChangeKind::Added => {
+                    let after = change
+                        .after
+                        .as_ref()
+                        .map(|claim| claim.text.trim())
+                        .unwrap_or("");
+                    output.push_str(&format!(
+                        "  [新增] {}：{}（旧计划之后新增）\n",
+                        change.slot, after
+                    ));
+                }
+            }
+        }
+        output.push_str(
+            "  说明：复核只比较新旧计划，不重新解释问题，也不改写已经说出口的回答。\n",
+        );
+        output.trim_end().to_string()
     }
 }
 
@@ -714,6 +975,101 @@ mod tests {
         ] {
             assert_eq!(StyleDirective::parse(input), None, "不应接管「{}」", input);
         }
+    }
+
+    #[test]
+    fn diff_reports_updated_removed_and_added_claims_by_slot() {
+        let before = AnswerPlan::new(
+            "介绍：张三",
+            "张三",
+            3,
+            vec![
+                PlanClaim::new("a#age", "age", "张三的年龄是18岁。", false),
+                PlanClaim::new("r#师傅", "师傅", "张三的师傅是李四。", false),
+                PlanClaim::new("r#徒弟", "徒弟", "张三的徒弟是王五。", false),
+            ],
+            0,
+            0,
+        );
+        let after = AnswerPlan::new(
+            "介绍：张三",
+            "张三",
+            4,
+            vec![
+                PlanClaim::new("a#age", "age", "张三的年龄是19岁。", false),
+                PlanClaim::new("r#徒弟", "徒弟", "张三的徒弟是王五。", false),
+                PlanClaim::new("a#出生地", "出生地", "张三的出生地是北京。", true),
+            ],
+            0,
+            0,
+        );
+        let diff = before.diff(&after);
+        assert_eq!(diff.counts(), (1, 1, 1, 1), "{:?}", diff);
+        assert!(!diff.is_unchanged());
+        assert_eq!(diff.base_revision, 3);
+        assert_eq!(diff.current_revision, 4);
+        let text = diff.render_zh(false);
+        assert!(text.contains("[更新] a#age"), "{}", text);
+        assert!(text.contains("[移除] r#师傅"), "{}", text);
+        assert!(text.contains("[新增] a#出生地"), "{}", text);
+        assert!(!text.contains("[未变]"), "默认只列变化项：{}", text);
+        assert!(text.contains("不改写已经说出口的回答"), "{}", text);
+    }
+
+    #[test]
+    fn diff_prefers_exact_matches_before_same_slot_updates() {
+        let before = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "p", "旧说法。", false)],
+            0,
+            0,
+        );
+        let after = AnswerPlan::new(
+            "q",
+            "张三",
+            2,
+            vec![
+                PlanClaim::new("s", "p", "新说法。", false),
+                PlanClaim::new("s", "p", "旧说法。", false),
+            ],
+            0,
+            0,
+        );
+        let diff = before.diff(&after);
+        assert_eq!(diff.counts(), (0, 0, 1, 1), "{:?}", diff);
+    }
+
+    #[test]
+    fn diff_of_identical_content_across_revisions_is_still_explicit() {
+        let first = sample_plan();
+        let second = AnswerPlan::new(
+            "介绍：张三",
+            "张三",
+            first.revision + 1,
+            first.claims.clone(),
+            0,
+            0,
+        );
+        let diff = first.diff(&second);
+        assert!(diff.is_unchanged());
+        assert_eq!(diff.counts(), (0, 0, 0, first.claim_count()));
+        let text = diff.render_zh(true);
+        assert!(text.contains("计划内容未变"), "{}", text);
+        assert!(text.contains("知识版本已更新"), "{}", text);
+        assert!(text.contains("[未变]"), "{}", text);
+    }
+
+    #[test]
+    fn diff_serializes_without_optional_claim_placeholders() {
+        let before = sample_plan();
+        let mut claims = before.claims.clone();
+        claims.pop();
+        let after = AnswerPlan::new("介绍：张三", "张三", 8, claims, 0, 0);
+        let json = serde_json::to_string(&before.diff(&after)).unwrap();
+        let restored: PlanDiff = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.counts().1, 1);
     }
 
     #[test]
