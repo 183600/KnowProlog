@@ -4669,13 +4669,13 @@ impl SymbolicReasoner {
         };
         if !plan.is_current_schema() {
             return Some(format!(
-                "最近一份生成回答计划的格式版本 {} 超出当前支持范围；请重新生成「介绍：{}」。",
+                "最近一份生成计划的结构版本 {} 超出当前支持范围；请重新生成「介绍：{}」。",
                 plan.version, state.entity
             ));
         }
         if !plan.is_fresh_for(self.revision) {
             return Some(format!(
-                "最近一份生成回答计划基于知识版本 v{}，当前已是 v{}；为避免混用两代事实，请重新输入「介绍：{}」。",
+                "最近一份生成计划基于知识版本 v{}，当前已是 v{}；为避免混用两代事实，请重新输入「介绍：{}」。",
                 plan.revision, self.revision, state.entity
             ));
         }
@@ -4714,7 +4714,7 @@ impl SymbolicReasoner {
             if plan.question.is_empty() {
                 "来源未记录".to_string()
             } else {
-                format!("问句：{}", plan.question)
+                format!("问句「{}」", plan.question)
             }
         );
         for (index, claim) in plan.claims.iter().enumerate() {

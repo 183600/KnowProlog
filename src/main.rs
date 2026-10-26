@@ -6653,6 +6653,34 @@ async fn run_ask(
         if is_ask_terminator(&question) {
             break;
         }
+        // 风格指令与计划审计优先于澄清/悬问回填：脚本里的「简短点」
+        // 不会被误当成对上一轮缺失前提的短答。
+        if let Some(directive) = StyleDirective::parse(&question) {
+            reasoner.clear_pending_awaiting();
+            let text = reasoner.restyle_generation(directive).unwrap_or_else(|| {
+                "生成功能未启用，无法按回答计划重述。".to_string()
+            });
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(text),
+                derivation: None,
+            });
+            continue;
+        }
+        if matches!(
+            question.as_str(),
+            "回答计划" | "计划台账" | "生成计划" | "回答方案"
+        ) {
+            reasoner.clear_pending_awaiting();
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(reasoner.answer_plan_report()),
+                derivation: None,
+            });
+            continue;
+        }
         // 澄清对话中的下一行按回答处理：脚本可以用多行 stdin 完成
         // 「问题 → 是/不是 → 条件化结论」的整段解释空间收敛。
         if clarify && reasoner.clarification_active() {
@@ -6695,31 +6723,6 @@ async fn run_ask(
         }
         // 一次性问答同样只给紧接的一轮开裸回答窗口。
         reasoner.clear_pending_awaiting();
-        // 风格重述：对上一段生成的同一份回答计划换表达，不重新检索。
-        if let Some(directive) = StyleDirective::parse(&question) {
-            let text = reasoner.restyle_generation(directive).unwrap_or_else(|| {
-                "生成功能未启用，无法按回答计划重述。".to_string()
-            });
-            answers.push(AskAnswer {
-                question,
-                status: "answered",
-                answer: Some(text),
-                derivation: None,
-            });
-            continue;
-        }
-        if matches!(
-            question.as_str(),
-            "回答计划" | "计划台账" | "生成计划" | "回答方案"
-        ) {
-            answers.push(AskAnswer {
-                question,
-                status: "answered",
-                answer: Some(reasoner.answer_plan_report()),
-                derivation: None,
-            });
-            continue;
-        }
         if let Some(reply) =
             ask_with_lens(&question, oxigraph_manager, config, &mut lens_cache).await
         {
