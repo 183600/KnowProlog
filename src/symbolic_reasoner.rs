@@ -1705,7 +1705,11 @@ impl SymbolicReasoner {
                         .synonyms()
                         .get(raw)
                         .is_some_and(|target| target == &canonical);
+                // 生成器词面（knows → 认识）是观察事实时登记的可用谓词，
+                // 与对齐记忆、预测器索引同权参与句法边界校验。
+                let generated = self.0.generator.canonical_predicate(raw);
                 let exact = aligned.is_some()
+                    || generated.is_some()
                     || self.0.predictor.has_predicate(raw)
                     || self.0.aligner.kind_of(raw) == Some(TermKind::Relation)
                     || self.0.inverse_query_map.contains_key(raw)
@@ -3451,6 +3455,10 @@ impl SymbolicReasoner {
 
     /// 问句谓词解析：对齐器归一后，若为反向词面则返回 (槽位, true)。
     /// 与「谓词画像」约定一致：逆向词面的答案是槽位三元组的反方向。
+    ///
+    /// 生成器在观察事实时登记了「图谱键 ↔ 中文词面」对照（如 knows ↔ 认识）。
+    /// 这类词面没有经过对齐记忆，但同样是已登记谓词；在此统一解析后，正向
+    /// 查询与「谁认识李四」这类反查主体问句才能落到同一个槽位。
     fn resolve_question_predicate(&self, raw: &str) -> (String, bool) {
         let raw = raw.trim();
         if let Some((slot, inverted)) = self.inverse_query_map.get(raw) {
@@ -3460,7 +3468,24 @@ impl SymbolicReasoner {
         if let Some((slot, inverted)) = self.inverse_query_map.get(canonical.as_str()) {
             return (slot.clone(), *inverted);
         }
+        if let Some(generated) = self.generator.canonical_predicate(raw) {
+            return (generated, false);
+        }
         (canonical, false)
+    }
+
+    /// 回答措辞里的谓词面：用户原话优先；只有原话就是图谱规范键
+    /// （如 knows/age）时，才回退到生成器登记的中文词面，避免回答里
+    /// 突然出现英文键。
+    fn display_predicate_surface(&self, raw: &str) -> String {
+        let raw = raw.trim();
+        let slot = self.resolve_question_predicate(raw).0;
+        if raw == slot {
+            if let Some(surface) = self.generator.preferred_predicate_surface(&slot) {
+                return surface.to_string();
+            }
+        }
+        raw.to_string()
     }
 
     pub fn observe_facts(&mut self, facts: &[PrologFact]) {
@@ -9145,12 +9170,16 @@ impl SymbolicReasoner {
 
     fn is_known_predicate(&self, name: &str) -> bool {
         let canonical = self.aligner.canonical_form(name);
+        let generated = self.generator.canonical_predicate(name);
         self.aligner.kind_of(name) == Some(TermKind::Relation)
             || self.inverse_query_map.contains_key(name)
             || self.inverse_query_map.contains_key(canonical.as_str())
             || self.predictor.has_predicate(name)
             // 正向别名（同义词）按规范化槽位回查预测器
             || (canonical != name && self.predictor.has_predicate(&canonical))
+            || generated
+                .as_deref()
+                .is_some_and(|slot| self.predictor.has_predicate(slot))
             || self
                 .positive_session_atoms()
                 .chain(self.session_negative_facts.iter())
@@ -11661,7 +11690,7 @@ impl SymbolicReasoner {
         if entity.is_empty() || slot.is_empty() || object.is_empty() {
             return None;
         }
-        let surface = predicate_raw.trim().to_string();
+        let surface = self.display_predicate_surface(&predicate_raw);
         intermediate.push(ChainPredicate {
             surface: surface.clone(),
             slot: slot.clone(),
@@ -11940,7 +11969,7 @@ impl SymbolicReasoner {
     ) -> Option<String> {
         let entity = self.aligner.canonical_form(subject_raw.trim());
         let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
-        let surface = predicate_raw.trim().to_string();
+        let surface = self.display_predicate_surface(predicate_raw);
         if entity.is_empty() || slot.is_empty() {
             return None;
         }
@@ -12028,7 +12057,7 @@ impl SymbolicReasoner {
         let subject = self.aligner.canonical_form(subject_raw.trim());
         let object = self.aligner.canonical_form(object_raw.trim());
         let (slot, inverted) = self.resolve_question_predicate(predicate_raw);
-        let surface = predicate_raw.trim().to_string();
+        let surface = self.display_predicate_surface(predicate_raw);
         if subject.is_empty() || object.is_empty() || slot.is_empty() {
             return None;
         }
@@ -12119,7 +12148,7 @@ impl SymbolicReasoner {
         if object.is_empty() || slot.is_empty() {
             return None;
         }
-        let surface = predicate_raw.trim().to_string();
+        let surface = self.display_predicate_surface(predicate_raw);
         let excluded_display: Vec<String> = excluded.to_vec();
         let excluded_set: HashSet<String> = excluded
             .iter()
@@ -24244,6 +24273,50 @@ types = [
             .expect("关系问句应可重建证明");
         assert!(derivation.is_proved(), "{:?}", derivation);
         assert_eq!(derivation.answer_value(), Some("王五"));
+    }
+
+    /// 图谱用英文键（knows）而用户说中文词面（认识）时，反查主体问句也应
+    /// 走同一条关系计划，而不是退化成「无可用依据」。
+    #[test]
+    fn generated_predicate_surface_supports_reverse_relation_questions() {
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "王五".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "knows".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "王五".into(),
+                rel_type: "knows".into(),
+                to: "李四".into(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+
+        let answer = reasoner.answer("谁认识李四").expect("中文词面反查主体");
+        assert!(answer.contains("张三"), "{}", answer);
+        assert!(answer.contains("王五"), "{}", answer);
+
+        let receipt = reasoner
+            .query_rewrite_receipt("谁认识李四")
+            .expect("中文词面应可重写");
+        assert!(receipt.contains("FindSubject"), "{}", receipt);
     }
 
     #[test]

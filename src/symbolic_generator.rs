@@ -1209,6 +1209,18 @@ impl SymbolicGenerator {
         &self.predicate_surfaces
     }
 
+    /// 规范谓词键的稳定中文展示面：观察事实时登记的非同名词面里，
+    /// 先取最短、再按字典序，避免 HashMap 迭代顺序影响回答措辞。
+    pub fn preferred_predicate_surface(&self, canonical: &str) -> Option<&str> {
+        self.predicate_surfaces
+            .iter()
+            .filter(|(surface, target)| {
+                target.as_str() == canonical && surface.as_str() != canonical
+            })
+            .map(|(surface, _)| surface.as_str())
+            .min_by_key(|surface| (surface.chars().count(), *surface))
+    }
+
     /// 运行时登记谓词别名（谓词画像准入后同步，查询/生成共用同一词面表）。
     pub fn register_predicate_alias(&mut self, alias: &str, canonical: &str) -> bool {
         if alias.trim().is_empty() || canonical.trim().is_empty() || alias == canonical {
