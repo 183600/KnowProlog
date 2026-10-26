@@ -6708,6 +6708,18 @@ async fn run_ask(
             });
             continue;
         }
+        if matches!(
+            question.as_str(),
+            "回答计划" | "计划台账" | "生成计划" | "回答方案"
+        ) {
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(reasoner.answer_plan_report()),
+                derivation: None,
+            });
+            continue;
+        }
         if let Some(reply) =
             ask_with_lens(&question, oxigraph_manager, config, &mut lens_cache).await
         {
@@ -10391,6 +10403,13 @@ async fn run_interactive_mode(
                 }
                 println!("{}", symbolic_reasoner.entailment_report(target));
             }
+            println!();
+            continue;
+        }
+
+        // 回答计划审计：查看 id、知识版本、逐点命题与来源。
+        if matches!(input, "回答计划" | "计划台账" | "生成计划" | "回答方案") {
+            println!("{}", symbolic_reasoner.answer_plan_report());
             println!();
             continue;
         }
@@ -14584,6 +14603,10 @@ fn is_command_like(input: &str) -> bool {
         "候选假设",
         "介绍",
         "生成介绍",
+        "回答计划",
+        "计划台账",
+        "生成计划",
+        "回答方案",
         "叙述",
         "讲述",
         "详细叙述",
@@ -16110,6 +16133,9 @@ mod session_tests {
                 input
             );
             assert!(is_command_like(input), "风格指令不应被当成短答：{}", input);
+        }
+        for input in ["回答计划", "计划台账", "生成计划", "回答方案"] {
+            assert!(is_command_like(input), "计划报告不应被当成短答：{}", input);
         }
         for input in ["详细一点", "展开说说", "展开讲", "换个说法", "接着说"] {
             assert!(

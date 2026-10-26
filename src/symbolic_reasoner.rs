@@ -4685,6 +4685,67 @@ impl SymbolicReasoner {
         }
     }
 
+    /// 当前回答计划的审计视图：id、知识版本、逐点命题与可用风格指令。
+    pub fn answer_plan_report(&self) -> String {
+        let Some(state) = self.context.generation_state() else {
+            return "还没有回答计划。先用「介绍：实体名」生成一段介绍，再说「简短点」或「完整讲讲」。"
+                .to_string();
+        };
+        let Some(plan) = state.plan.as_ref() else {
+            return format!(
+                "上一段关于「{}」的回答没有可复述的计划；请重新输入「介绍：{}」。",
+                state.entity, state.entity
+            );
+        };
+        let freshness = if plan.is_fresh_for(self.revision) {
+            "与当前知识版本一致".to_string()
+        } else {
+            format!(
+                "已过期：计划基于 v{}，当前为 v{}",
+                plan.revision, self.revision
+            )
+        };
+        let mut output = format!(
+            "回答计划 {}（主体：{}；{} 点；{}；{}）：\n",
+            plan.id,
+            plan.subject,
+            plan.claim_count(),
+            freshness,
+            if plan.question.is_empty() {
+                "来源未记录".to_string()
+            } else {
+                format!("问句：{}", plan.question)
+            }
+        );
+        for (index, claim) in plan.claims.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}（谓词：{}；来源：{}）\n",
+                index + 1,
+                claim.text.trim(),
+                claim.predicate,
+                if claim.session {
+                    "会话事实"
+                } else {
+                    "图谱事实"
+                }
+            ));
+        }
+        if plan.suppressed > 0 {
+            output.push_str(&format!(
+                "  另有 {} 句未通过生成自检，未纳入计划。\n",
+                plan.suppressed
+            ));
+        }
+        if plan.omitted > 0 {
+            output.push_str(&format!(
+                "  计划容量上限 {} 点，另有 {} 点未纳入。\n",
+                MAX_PLAN_CLAIMS, plan.omitted
+            ));
+        }
+        output.push_str("  可输入「简短点」「完整讲讲」「换种表达」或「第N点是什么」重述同一份计划。");
+        output
+    }
+
     pub fn discourse(&self) -> &DiscoursePlanner {
         &self.discourse
     }
@@ -20001,6 +20062,34 @@ types = [
         for claim in &plan.claims {
             assert!(restated.contains(claim.text.trim()), "{}", restated);
         }
+    }
+
+    #[test]
+    fn answer_plan_report_exposes_identity_version_and_actions() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        let report = reasoner.answer_plan_report();
+        assert!(report.contains(&plan.id), "{}", report);
+        assert!(report.contains("与当前知识版本一致"), "{}", report);
+        assert!(report.contains(plan.claims[0].text.trim()), "{}", report);
+        assert!(report.contains("简短点"), "{}", report);
+
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "李四".to_string(),
+            rel_type: "徒弟".to_string(),
+            to: "张三".to_string(),
+        }]);
+        let stale = reasoner.answer_plan_report();
+        assert!(stale.contains("已过期"), "{}", stale);
+        assert!(stale.contains(&format!("v{}", plan.revision)), "{}", stale);
     }
 
     #[test]
