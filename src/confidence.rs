@@ -202,6 +202,261 @@ impl ConfidenceDecision {
     }
 }
 
+/// 逐命题置信信封：`[lower, upper]` 用万分比表示，避免浮点在计划指纹中漂移。
+///
+/// 区间不是频率概率，而是「已核实支持」与「仍可能被支持」之间的可审计范围：
+/// 下界来自已登记的证据强度，上界扣除已知冲突；两端都保留来源等级，因此
+/// 生成层可以据此断言、限定、先澄清或拒答，异步复核也可以据此计算 VOI。
+pub const ENVELOPE_SCALE: u16 = 10_000;
+
+/// 一条证据来源的保守强度等级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeGrade {
+    /// 图谱中已登记的断言（仍不是绝对真理）。
+    Graph,
+    /// 用户显式改口/更正后采纳的会话事实。
+    SessionCorrection,
+    /// 用户直陈的会话事实。
+    SessionDirect,
+    /// 转述、听说或低可信来源；正常回答路径不应把它当确定事实。
+    SessionHearsay,
+    /// 由规则/模型推出的结论。
+    Inference,
+}
+
+impl EnvelopeGrade {
+    pub fn base_lower_bps(self) -> u16 {
+        match self {
+            EnvelopeGrade::Graph => 9_000,
+            EnvelopeGrade::SessionCorrection => 7_200,
+            EnvelopeGrade::SessionDirect => 6_000,
+            EnvelopeGrade::SessionHearsay => 3_500,
+            EnvelopeGrade::Inference => 5_000,
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            EnvelopeGrade::Graph => "图谱断言",
+            EnvelopeGrade::SessionCorrection => "会话更正",
+            EnvelopeGrade::SessionDirect => "会话直陈",
+            EnvelopeGrade::SessionHearsay => "传闻",
+            EnvelopeGrade::Inference => "推断",
+        }
+    }
+}
+
+/// 区间决策：与四档 PCC 决策同构，但只看上下界是否跨过阈值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvelopeVerdict {
+    /// 下界已经达到回答阈值。
+    Assert,
+    /// 下界只到含糊阈值：可以回答，但必须限定。
+    Qualify,
+    /// 下界不足、上界仍可能达阈值：先复核/澄清。
+    Verify,
+    /// 上界都不到含糊阈值：证据不足。
+    Abstain,
+}
+
+impl EnvelopeVerdict {
+    pub fn code(self) -> &'static str {
+        match self {
+            EnvelopeVerdict::Assert => "assert",
+            EnvelopeVerdict::Qualify => "qualify",
+            EnvelopeVerdict::Verify => "verify",
+            EnvelopeVerdict::Abstain => "abstain",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            EnvelopeVerdict::Assert => "可断言",
+            EnvelopeVerdict::Qualify => "需限定",
+            EnvelopeVerdict::Verify => "需复核",
+            EnvelopeVerdict::Abstain => "证据不足",
+        }
+    }
+
+    pub fn asserts(self) -> bool {
+        matches!(self, EnvelopeVerdict::Assert | EnvelopeVerdict::Qualify)
+    }
+}
+
+/// 逐命题的置信区间（万分比，闭区间）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "ClaimEnvelopeWire")]
+pub struct ClaimEnvelope {
+    lower_bps: u16,
+    upper_bps: u16,
+}
+
+#[derive(Deserialize)]
+struct ClaimEnvelopeWire {
+    lower_bps: u16,
+    upper_bps: u16,
+}
+
+impl TryFrom<ClaimEnvelopeWire> for ClaimEnvelope {
+    type Error = String;
+
+    fn try_from(wire: ClaimEnvelopeWire) -> Result<Self, Self::Error> {
+        if wire.lower_bps > ENVELOPE_SCALE || wire.upper_bps > ENVELOPE_SCALE {
+            return Err(format!(
+                "置信区间端点必须 <= {}，收到 {}..{}",
+                ENVELOPE_SCALE, wire.lower_bps, wire.upper_bps
+            ));
+        }
+        if wire.lower_bps > wire.upper_bps {
+            return Err(format!(
+                "置信区间下界 {} 不能高于上界 {}",
+                wire.lower_bps, wire.upper_bps
+            ));
+        }
+        Ok(Self {
+            lower_bps: wire.lower_bps,
+            upper_bps: wire.upper_bps,
+        })
+    }
+}
+
+impl ClaimEnvelope {
+    /// 构造并规范化区间：端点钳制到 `[0, ENVELOPE_SCALE]`，上下界互换以保持
+    /// 闭区间语义。需要严格校验外部输入时请用反序列化（越界/倒挂会报错）。
+    pub fn new(lower_bps: u16, upper_bps: u16) -> Self {
+        let lower = lower_bps.min(ENVELOPE_SCALE);
+        let upper = upper_bps.min(ENVELOPE_SCALE);
+        Self {
+            lower_bps: lower.min(upper),
+            upper_bps: lower.max(upper),
+        }
+    }
+
+    pub fn point(probability: f64) -> Self {
+        let value = to_bps(probability);
+        Self {
+            lower_bps: value,
+            upper_bps: value,
+        }
+    }
+
+    /// 由证据等级、佐证次数与冲突次数构造保守区间。
+    ///
+    /// 佐证按递减收益抬升下界；冲突同时压低上下界。所有运算都是整数，
+    /// 同一输入永远得到同一区间。
+    pub fn from_grade(grade: EnvelopeGrade, corroborations: usize, conflicts: usize) -> Self {
+        let mut support = u32::from(grade.base_lower_bps());
+        for _ in 0..corroborations.min(8) {
+            support = ENVELOPE_SCALE as u32
+                - (ENVELOPE_SCALE as u32 - support) * 9_000 / ENVELOPE_SCALE as u32;
+        }
+        let mut attack = 0u32;
+        for _ in 0..conflicts.min(8) {
+            attack = ENVELOPE_SCALE as u32
+                - (ENVELOPE_SCALE as u32 - attack) * 7_000 / ENVELOPE_SCALE as u32;
+        }
+        let upper = ENVELOPE_SCALE as u32 - attack;
+        let lower = support * upper / ENVELOPE_SCALE as u32;
+        Self {
+            lower_bps: lower.min(upper) as u16,
+            upper_bps: upper as u16,
+        }
+    }
+
+    pub fn lower_bps(self) -> u16 {
+        self.lower_bps
+    }
+
+    pub fn upper_bps(self) -> u16 {
+        self.upper_bps
+    }
+
+    pub fn lower(self) -> f64 {
+        f64::from(self.lower_bps) / f64::from(ENVELOPE_SCALE)
+    }
+
+    pub fn upper(self) -> f64 {
+        f64::from(self.upper_bps) / f64::from(ENVELOPE_SCALE)
+    }
+
+    pub fn width_bps(self) -> u16 {
+        self.upper_bps - self.lower_bps
+    }
+
+    pub fn is_point(self) -> bool {
+        self.lower_bps == self.upper_bps
+    }
+
+    /// 区间是否跨过给定阈值（下界不足而上界可达）。
+    pub fn crosses(self, threshold_bps: u16) -> bool {
+        self.lower_bps < threshold_bps && self.upper_bps >= threshold_bps
+    }
+
+    /// 只看区间上下界的四档决策；`answer_bps` 与 `hedge_bps` 会先排好序。
+    pub fn verdict(self, answer_bps: u16, hedge_bps: u16) -> EnvelopeVerdict {
+        let answer = answer_bps.min(ENVELOPE_SCALE);
+        let hedge = hedge_bps.min(answer);
+        if self.lower_bps >= answer {
+            EnvelopeVerdict::Assert
+        } else if self.lower_bps >= hedge {
+            EnvelopeVerdict::Qualify
+        } else if self.upper_bps >= hedge {
+            EnvelopeVerdict::Verify
+        } else {
+            EnvelopeVerdict::Abstain
+        }
+    }
+
+    /// VOI 优先级：跨回答阈值的区间最值得复核；与含糊/回答判定带的
+    /// 重叠宽度提供次级排序。结果在 `[0, ENVELOPE_SCALE]`。
+    pub fn deliberation_priority(self, answer_bps: u16, hedge_bps: u16) -> u16 {
+        let answer = answer_bps.min(ENVELOPE_SCALE);
+        let hedge = hedge_bps.min(answer);
+        let overlap = self
+            .upper_bps
+            .min(answer)
+            .saturating_sub(self.lower_bps.max(hedge));
+        let answer_cross = u16::from(self.crosses(answer)) * 5_000;
+        let hedge_cross = u16::from(self.crosses(hedge)) * 2_000;
+        overlap
+            .saturating_add(answer_cross)
+            .saturating_add(hedge_cross)
+            .min(ENVELOPE_SCALE)
+    }
+
+    /// 只渲染区间本身（不绑定决策阈值）。
+    pub fn render_interval(self) -> String {
+        format!("{}–{}%", percent(self.lower_bps), percent(self.upper_bps))
+    }
+
+    /// 对外审计措辞：百分比 + 四档结论。
+    pub fn render_zh(self, answer_bps: u16, hedge_bps: u16) -> String {
+        let verdict = self.verdict(answer_bps, hedge_bps);
+        format!("{}（{}）", self.render_interval(), verdict.label_zh())
+    }
+}
+
+fn to_bps(probability: f64) -> u16 {
+    let clamped = if probability.is_finite() {
+        probability.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (clamped * f64::from(ENVELOPE_SCALE)).round() as u16
+}
+
+fn percent(bps: u16) -> String {
+    let whole = bps / 100;
+    let fraction = bps % 100;
+    if fraction == 0 {
+        format!("{}", whole)
+    } else {
+        format!("{}.{:02}", whole, fraction)
+    }
+}
+
 /// 一次决策的完整回执。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionRecord {
@@ -392,6 +647,23 @@ impl ConfidenceConfig {
                     .ok()
             }),
         }
+    }
+
+    /// 把回答/含糊阈值转成信封使用的万分比。
+    pub fn envelope_thresholds_bps(&self) -> (u16, u16) {
+        (to_bps(self.answer_threshold), to_bps(self.hedge_threshold))
+    }
+
+    /// 按当前阈值判断一个置信信封的决策档位。
+    pub fn envelope_verdict(&self, envelope: ClaimEnvelope) -> EnvelopeVerdict {
+        let (answer, hedge) = self.envelope_thresholds_bps();
+        envelope.verdict(answer, hedge)
+    }
+
+    /// 按当前阈值渲染置信区间。
+    pub fn render_envelope(&self, envelope: ClaimEnvelope) -> String {
+        let (answer, hedge) = self.envelope_thresholds_bps();
+        envelope.render_zh(answer, hedge)
     }
 
     /// 静态校验：阈值次序、校准单调性、证书可复算性。
@@ -1126,5 +1398,85 @@ mod tests {
         let profile = ConfidenceConfig::default();
         assert!(!profile.enabled);
         assert!(profile.validate().is_empty());
+    }
+
+    #[test]
+    fn graph_envelope_asserts_but_conflicts_lower_the_ceiling() {
+        let graph = ClaimEnvelope::from_grade(EnvelopeGrade::Graph, 0, 0);
+        assert_eq!((graph.lower_bps(), graph.upper_bps()), (9_000, 10_000));
+        assert_eq!(graph.verdict(8_600, 6_200), EnvelopeVerdict::Assert);
+        assert_eq!(graph.deliberation_priority(8_600, 6_200), 0);
+
+        let conflicted = ClaimEnvelope::from_grade(EnvelopeGrade::Graph, 0, 1);
+        assert_eq!((conflicted.lower_bps(), conflicted.upper_bps()), (6_300, 7_000));
+        assert_eq!(conflicted.verdict(8_600, 6_200), EnvelopeVerdict::Qualify);
+        assert!(conflicted.deliberation_priority(8_600, 6_200) > 0);
+
+        let contested = ClaimEnvelope::from_grade(EnvelopeGrade::Graph, 0, 2);
+        assert!(contested.upper_bps() < 6_200);
+        assert_eq!(contested.verdict(8_600, 6_200), EnvelopeVerdict::Abstain);
+    }
+
+    #[test]
+    fn corroboration_only_lowers_uncertainty_and_grade_order_is_visible() {
+        let base = ClaimEnvelope::from_grade(EnvelopeGrade::Graph, 0, 0);
+        let supported = ClaimEnvelope::from_grade(EnvelopeGrade::Graph, 1, 0);
+        assert!(supported.lower_bps() > base.lower_bps());
+        assert_eq!(supported.upper_bps(), base.upper_bps());
+
+        let direct = ClaimEnvelope::from_grade(EnvelopeGrade::SessionDirect, 0, 0);
+        let correction = ClaimEnvelope::from_grade(EnvelopeGrade::SessionCorrection, 0, 0);
+        let hearsay = ClaimEnvelope::from_grade(EnvelopeGrade::SessionHearsay, 0, 0);
+        assert!(direct.lower_bps() > hearsay.lower_bps());
+        assert!(correction.lower_bps() > direct.lower_bps());
+        assert_eq!(direct.verdict(8_600, 6_200), EnvelopeVerdict::Verify);
+        assert_eq!(hearsay.verdict(8_600, 6_200), EnvelopeVerdict::Verify);
+    }
+
+    #[test]
+    fn point_envelopes_are_exact_and_priority_prefers_answer_crossing() {
+        let point = ClaimEnvelope::point(0.9);
+        assert!(point.is_point());
+        assert_eq!(point.verdict(8_600, 6_200), EnvelopeVerdict::Assert);
+        assert_eq!(point.deliberation_priority(8_600, 6_200), 0);
+
+        let crossing = ClaimEnvelope::new(6_000, 9_000);
+        let below = ClaimEnvelope::new(5_000, 8_000);
+        assert!(crossing.crosses(8_600));
+        assert!(!crossing.crosses(9_500));
+        assert!(
+            crossing.deliberation_priority(8_600, 6_200)
+                > below.deliberation_priority(8_600, 6_200)
+        );
+    }
+
+    #[test]
+    fn envelope_wire_rejects_inverted_or_out_of_range_bounds() {
+        let ok: ClaimEnvelope =
+            serde_json::from_str(r#"{"lower_bps":6000,"upper_bps":9000}"#).unwrap();
+        assert_eq!((ok.lower_bps(), ok.upper_bps()), (6_000, 9_000));
+        assert!(serde_json::from_str::<ClaimEnvelope>(
+            r#"{"lower_bps":9000,"upper_bps":6000}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ClaimEnvelope>(
+            r#"{"lower_bps":1000,"upper_bps":10001}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn configured_thresholds_drive_envelope_wording() {
+        let profile = profile();
+        let (answer, hedge) = profile.envelope_thresholds_bps();
+        assert_eq!((answer, hedge), (8_600, 6_200));
+        let envelope = ClaimEnvelope::new(6_300, 9_000);
+        assert_eq!(profile.envelope_verdict(envelope), EnvelopeVerdict::Qualify);
+        let text = profile.render_envelope(envelope);
+        assert!(text.contains("63%"), "{}", text);
+        assert!(text.contains("90%"), "{}", text);
+        assert!(text.contains("需限定"), "{}", text);
+        let below = ClaimEnvelope::new(6_000, 9_000);
+        assert_eq!(profile.envelope_verdict(below), EnvelopeVerdict::Verify);
     }
 }

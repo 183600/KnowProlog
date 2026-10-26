@@ -17,7 +17,7 @@ use crate::causal_reasoning::{CausalAnalyzer, CausalGraph, CounterfactualDelta};
 use crate::causal_tokenization::{attribute_tokens, AnchorKind, CausalTokenizer, MAX_TOKEN_CHARS};
 use crate::chinese_reasoning_nlu::{self, LessonKind};
 use crate::completion_episode::{CandidateStatus, CompletionLedger, CompletionQuestion, RuleScope};
-use crate::confidence::{ConfidenceDecision, DecisionRecord};
+use crate::confidence::{ClaimEnvelope, ConfidenceDecision, DecisionRecord, EnvelopeGrade};
 use crate::constructive::{ConstructiveReasoner, FactKey, ObservedGraph, VirtualFact};
 use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
@@ -4602,6 +4602,50 @@ impl SymbolicReasoner {
     ///
     /// 自检失败的句子不进入计划，避免「详细版」重新说出初次生成时已被
     /// 丢弃的句子；容量上限由 [`AnswerPlan::new`] 统一执行。
+    /// 从生成命题的来源等级与槽账本事件构造逐命题置信区间。
+    ///
+    /// 关闭 PCC 时不附加区间，旧计划与快照字节保持不变。启用后：
+    /// 图谱断言以下界较高起步；会话直陈/更正降低下界；槽账本中的冲突
+    /// 同时压低上界，佐证按递减收益抬升下界。所有推导都是整数运算。
+    fn claim_envelope(&self, clause: &ProfileClause) -> ClaimEnvelope {
+        if !self.config.confidence.enabled {
+            return ClaimEnvelope::point(0.5);
+        }
+        let history = self
+            .slots
+            .history(&clause.key.entity, clause.predicate());
+        let grade = if clause.from_overlay {
+            match history.last().map(|event| event.strength) {
+                Some(AssertionStrength::Correction) => EnvelopeGrade::SessionCorrection,
+                Some(AssertionStrength::Hearsay) => EnvelopeGrade::SessionHearsay,
+                _ => EnvelopeGrade::SessionDirect,
+            }
+        } else {
+            EnvelopeGrade::Graph
+        };
+        let corroborations = history
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    crate::slot_ledger::SlotEventKind::Corroborate
+                        | crate::slot_ledger::SlotEventKind::Evidence
+                )
+            })
+            .count();
+        let conflicts = history
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    crate::slot_ledger::SlotEventKind::Conflict
+                        | crate::slot_ledger::SlotEventKind::Suppress
+                )
+            })
+            .count();
+        ClaimEnvelope::from_grade(grade, corroborations, conflicts)
+    }
+
     fn build_answer_plan(
         &self,
         question: &str,
@@ -4646,12 +4690,17 @@ impl SymbolicReasoner {
             .iter()
             .take(MAX_PLAN_CLAIMS)
             .map(|clause| {
-                PlanClaim::new(
+                let claim = PlanClaim::new(
                     clause.slot_id(),
                     clause.predicate(),
                     clause.sentence.clone(),
                     clause.from_overlay,
-                )
+                );
+                if self.config.confidence.enabled {
+                    claim.with_envelope(self.claim_envelope(clause))
+                } else {
+                    claim
+                }
             })
             .collect();
         AnswerPlan::new(question, entity, self.revision, claims, omitted, suppressed)
@@ -4784,8 +4833,17 @@ impl SymbolicReasoner {
             }
         );
         for (index, claim) in plan.claims.iter().enumerate() {
+            let envelope = claim
+                .envelope
+                .map(|envelope| {
+                    format!(
+                        "；置信区间：{}",
+                        self.config.confidence.render_envelope(envelope)
+                    )
+                })
+                .unwrap_or_default();
             output.push_str(&format!(
-                "  {}. {}（谓词：{}；来源：{}）\n",
+                "  {}. {}（谓词：{}；来源：{}{}）\n",
                 index + 1,
                 claim.text.trim(),
                 claim.predicate,
@@ -4793,7 +4851,8 @@ impl SymbolicReasoner {
                     "会话事实"
                 } else {
                     "图谱事实"
-                }
+                },
+                envelope
             ));
         }
         if plan.suppressed > 0 {
@@ -20365,6 +20424,91 @@ types = [
         let stale = reasoner.answer_plan_report();
         assert!(stale.contains("已过期"), "{}", stale);
         assert!(stale.contains(&format!("v{}", plan.revision)), "{}", stale);
+    }
+
+    #[test]
+    fn generation_plan_attaches_claim_envelopes_only_when_pcc_is_enabled() {
+        let mut config = test_config();
+        config.max_profile_sentences = 2;
+        let mut reasoner = SymbolicReasoner::new(config.clone(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plain = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("应有计划");
+        assert!(
+            plain.claims.iter().all(|claim| claim.envelope.is_none()),
+            "关闭 PCC 时不得写入新区间字段"
+        );
+
+        config.confidence.enabled = true;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("应有计划");
+        assert!(plan.claims.iter().all(|claim| claim.envelope.is_some()));
+        let report = reasoner.answer_plan_report();
+        assert!(report.contains("置信区间"), "{}", report);
+        assert!(report.contains("可断言"), "{}", report);
+        for claim in &plan.claims {
+            let envelope = claim.envelope.expect("已附加区间");
+            assert_eq!(
+                reasoner.config.confidence.envelope_verdict(envelope),
+                crate::confidence::EnvelopeVerdict::Assert,
+                "纯图谱断言的默认区间应达到回答阈值：{}",
+                report
+            );
+        }
+    }
+
+    #[test]
+    fn session_fact_lowers_its_claim_envelope_below_graph_assertions() {
+        let mut config = test_config();
+        config.max_profile_sentences = 4;
+        config.confidence.enabled = true;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let graph_lower = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.as_ref())
+            .and_then(|plan| {
+                plan.claims
+                    .iter()
+                    .find(|claim| claim.predicate == "师傅")
+                    .and_then(|claim| claim.envelope)
+            })
+            .expect("图谱师傅命题应带区间")
+            .lower_bps();
+
+        let reply = reasoner.assert_nl_fact("记住：张三的师傅是赵六");
+        assert!(reply.contains("已记住"), "{}", reply);
+        reasoner.generate_about("张三").expect("会话事实应可重新生成");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("应有计划");
+        let session_claim = plan
+            .claims
+            .iter()
+            .find(|claim| claim.predicate == "师傅")
+            .expect("师傅命题仍在");
+        assert!(session_claim.session, "命题应标记为会话事实");
+        let envelope = session_claim.envelope.expect("会话命题应带区间");
+        assert!(envelope.lower_bps() < graph_lower);
+        assert_ne!(
+            reasoner.config.confidence.envelope_verdict(envelope),
+            crate::confidence::EnvelopeVerdict::Assert,
+            "会话直陈不应直接被视为可断言"
+        );
     }
 
     #[test]

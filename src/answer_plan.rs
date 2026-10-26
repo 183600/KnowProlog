@@ -15,6 +15,7 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::confidence::ClaimEnvelope;
 use crate::context_image::fnv1a_hex;
 
 /// 回答计划的结构版本；不兼容变更时递增。
@@ -39,6 +40,9 @@ pub struct PlanClaim {
     /// 是否来自本会话叠加层（未写入图谱）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub session: bool,
+    /// 逐命题置信区间；旧计划缺省为 None，序列化字节保持不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<ClaimEnvelope>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -57,6 +61,20 @@ impl PlanClaim {
             predicate: predicate.into(),
             text: text.into(),
             session,
+            envelope: None,
+        }
+    }
+
+    /// 附加/覆盖逐命题置信区间；不改变命题内容。
+    pub fn with_envelope(mut self, envelope: ClaimEnvelope) -> Self {
+        self.envelope = Some(envelope);
+        self
+    }
+
+    fn envelope_note(&self) -> String {
+        match self.envelope {
+            Some(envelope) => format!("；置信区间：{}", envelope.render_interval()),
+            None => String::new(),
         }
     }
 
@@ -156,6 +174,14 @@ impl AnswerPlan {
                 "\n{}|{}|{}|{}",
                 claim.slot, claim.predicate, claim.text, claim.session
             );
+            if let Some(envelope) = claim.envelope {
+                let _ = write!(
+                    material,
+                    "|{}:{}",
+                    envelope.lower_bps(),
+                    envelope.upper_bps()
+                );
+            }
         }
         fnv1a_hex(material.as_bytes())
     }
@@ -194,9 +220,10 @@ impl AnswerPlan {
                 claim.text.trim(),
                 if detailed {
                     format!(
-                        "（谓词：{}；来源：{}）",
+                        "（谓词：{}；来源：{}）{}",
                         claim.predicate,
-                        claim.source_label()
+                        claim.source_label(),
+                        claim.envelope_note()
                     )
                 } else {
                     String::new()
@@ -229,10 +256,11 @@ impl AnswerPlan {
         );
         let _ = writeln!(
             output,
-            "  {}（谓词：{}；来源：{}）",
+            "  {}（谓词：{}；来源：{}）{}",
             claim.text.trim(),
             claim.predicate,
-            claim.source_label()
+            claim.source_label(),
+            claim.envelope_note()
         );
         if total > 1 {
             let _ = writeln!(output, "  输入「完整讲讲」查看全部 {} 点。", total);
@@ -1070,6 +1098,41 @@ mod tests {
         let json = serde_json::to_string(&before.diff(&after)).unwrap();
         let restored: PlanDiff = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.counts().1, 1);
+    }
+
+    #[test]
+    fn envelopes_are_optional_but_change_identity_and_detailed_rendering() {
+        let plain = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "p", "命题。", false)],
+            0,
+            0,
+        );
+        let annotated = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "p", "命题。", false)
+                .with_envelope(ClaimEnvelope::new(6_300, 9_000))],
+            0,
+            0,
+        );
+        assert_ne!(plain.id, annotated.id, "区间属于计划内容，必须进入指纹");
+        let text = annotated.realize(StyleDirective::Detailed).unwrap();
+        assert!(text.contains("置信区间：63–90%"), "{}", text);
+        let brief = annotated.realize(StyleDirective::Brief).unwrap();
+        assert!(!brief.contains("置信区间"), "简短版不展开置信元数据：{}", brief);
+
+        let json = serde_json::to_string(&annotated).unwrap();
+        let restored: AnswerPlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, annotated);
+        let old: AnswerPlan = serde_json::from_str(
+            r#"{"version":1,"id":"x","question":"q","subject":"张三","revision":1,"claims":[{"slot":"s","predicate":"p","text":"命题。","session":false}],"omitted":0,"suppressed":0}"#,
+        )
+        .unwrap();
+        assert!(old.claims[0].envelope.is_none());
     }
 
     #[test]
