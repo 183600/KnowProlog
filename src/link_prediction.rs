@@ -102,6 +102,14 @@ struct Candidate {
     order: usize,
 }
 
+/// 规则挖掘的只读倒排视图：谓词列表、事实对→头谓词下标、过滤阈值。
+struct HeadIndex<'a> {
+    predicates: &'a [String],
+    by_pair: &'a HashMap<(&'a str, &'a str), Vec<usize>>,
+    min_support: usize,
+    min_confidence: f64,
+}
+
 #[derive(Clone)]
 pub struct LinkPredictor {
     triples: Vec<Triple>,
@@ -318,10 +326,7 @@ impl LinkPredictor {
         template: RuleTemplate,
         body: &[&str],
         body_pairs: &HashSet<(String, String)>,
-        heads_by_pair: &HashMap<(&str, &str), Vec<usize>>,
-        predicates: &[String],
-        min_support: usize,
-        min_confidence: f64,
+        index: &HeadIndex<'_>,
         rules: &mut Vec<HornRule>,
     ) {
         if body_pairs.is_empty() {
@@ -329,7 +334,7 @@ impl LinkPredictor {
         }
         let mut support_by_head: HashMap<usize, usize> = HashMap::new();
         for (subject, object) in body_pairs {
-            if let Some(head_indices) = heads_by_pair.get(&(subject.as_str(), object.as_str())) {
+            if let Some(head_indices) = index.by_pair.get(&(subject.as_str(), object.as_str())) {
                 for &head_index in head_indices {
                     *support_by_head.entry(head_index).or_insert(0) += 1;
                 }
@@ -342,10 +347,10 @@ impl LinkPredictor {
         head_indices.sort_unstable();
         for head_index in head_indices {
             let support = support_by_head[&head_index];
-            if support < min_support {
+            if support < index.min_support {
                 continue;
             }
-            let Some(head) = predicates.get(head_index) else {
+            let Some(head) = index.predicates.get(head_index) else {
                 continue;
             };
             let Some(head_pairs) = self.pairs_of(head) else {
@@ -355,7 +360,7 @@ impl LinkPredictor {
                 continue;
             }
             let confidence = support as f64 / body_pairs.len() as f64;
-            if confidence < min_confidence {
+            if confidence < index.min_confidence {
                 continue;
             }
             rules.push(HornRule {
@@ -384,6 +389,12 @@ impl LinkPredictor {
                 }
             }
         }
+        let index = HeadIndex {
+            predicates: &predicates,
+            by_pair: &heads_by_pair,
+            min_support,
+            min_confidence,
+        };
         let mut rules = Vec::new();
 
         for p1 in &predicates {
@@ -397,10 +408,7 @@ impl LinkPredictor {
                         RuleTemplate::Inverse,
                         &[p1.as_str()],
                         reversed,
-                        &heads_by_pair,
-                        &predicates,
-                        min_support,
-                        min_confidence,
+                        &index,
                         &mut rules,
                     );
                 }
@@ -412,10 +420,7 @@ impl LinkPredictor {
                             RuleTemplate::Compose,
                             &[p1.as_str(), p2.as_str()],
                             &body,
-                            &heads_by_pair,
-                            &predicates,
-                            min_support,
-                            min_confidence,
+                            &index,
                             &mut rules,
                         );
                     }
@@ -427,10 +432,7 @@ impl LinkPredictor {
                             RuleTemplate::CommonNeighbor,
                             &[p1.as_str(), p2.as_str()],
                             &body,
-                            &heads_by_pair,
-                            &predicates,
-                            min_support,
-                            min_confidence,
+                            &index,
                             &mut rules,
                         );
                     }
@@ -442,10 +444,7 @@ impl LinkPredictor {
                             RuleTemplate::CommonObject,
                             &[p1.as_str(), p2.as_str()],
                             &body,
-                            &heads_by_pair,
-                            &predicates,
-                            min_support,
-                            min_confidence,
+                            &index,
                             &mut rules,
                         );
                     }
@@ -718,7 +717,7 @@ impl LinkPredictor {
             let Some(rule) = self.rules.get(idx) else {
                 continue;
             };
-            if predicate.map_or(false, |query| rule.head != query) {
+            if predicate.is_some_and(|query| rule.head != query) {
                 continue;
             }
             match rule.template {
