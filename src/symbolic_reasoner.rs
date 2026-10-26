@@ -4697,6 +4697,12 @@ impl SymbolicReasoner {
                 state.entity, state.entity
             );
         };
+        if !plan.is_current_schema() {
+            return format!(
+                "最近一份生成计划的结构版本 {} 超出当前支持范围；请重新输入「介绍：{}」。",
+                plan.version, state.entity
+            );
+        }
         let freshness = if plan.is_fresh_for(self.revision) {
             "与当前知识版本一致".to_string()
         } else {
