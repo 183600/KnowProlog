@@ -110,6 +110,8 @@ pub struct LinkPredictor {
     in_edges: HashMap<String, HashMap<String, HashSet<String>>>,
     participants: HashSet<String>,
     rules: Vec<HornRule>,
+    /// 头部谓词 → 规则下标（按 `rules` 顺序）。谓词已知时只枚举相关规则。
+    rules_by_head: HashMap<String, Vec<usize>>,
     max_body_pairs: usize,
     max_enumeration: usize,
 }
@@ -129,6 +131,7 @@ impl LinkPredictor {
             in_edges: HashMap::new(),
             participants: HashSet::new(),
             rules: Vec::new(),
+            rules_by_head: HashMap::new(),
             max_body_pairs: 20_000,
             max_enumeration: 5_000,
         }
@@ -439,6 +442,13 @@ impl LinkPredictor {
         });
         rules.dedup_by(|a, b| a.template == b.template && a.body == b.body && a.head == b.head);
         self.rules = rules;
+        self.rules_by_head.clear();
+        for (index, rule) in self.rules.iter().enumerate() {
+            self.rules_by_head
+                .entry(rule.head.clone())
+                .or_default()
+                .push(index);
+        }
     }
 
     fn try_prediction<F>(
@@ -658,6 +668,285 @@ impl LinkPredictor {
         self.enumerate_predictions_matching(cap, |_| true)
     }
 
+    /// 以实体为锚点直接展开规则体，不再先枚举全图候选再过滤。
+    ///
+    /// 旧路径把 `max_enumeration` 消耗在与实体无关的候选上，实体出现在枚举
+    /// 尾部时会漏掉本可命中的预测。这里从实体的出/入边出发，只生成
+    /// `subject == entity || object == entity` 的候选；谓词已知时还先按
+    /// `rules_by_head` 跳过无关规则。结果与旧路径的匹配集一致，但不依赖
+    /// 全图枚举顺序。
+    fn enumerate_predictions_for_entity(
+        &self,
+        entity: &str,
+        predicate: Option<&str>,
+        cap: usize,
+    ) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<Triple> = HashSet::new();
+        let mut generated = 0usize;
+
+        let rule_indices: Vec<usize> = match predicate {
+            Some(predicate) => self
+                .rules_by_head
+                .get(predicate)
+                .cloned()
+                .unwrap_or_default(),
+            None => (0..self.rules.len()).collect(),
+        };
+
+        for idx in rule_indices {
+            let Some(rule) = self.rules.get(idx) else {
+                continue;
+            };
+            if predicate.map_or(false, |query| rule.head != query) {
+                continue;
+            }
+            match rule.template {
+                RuleTemplate::Compose => {
+                    let p1 = rule.body1();
+                    let p2 = rule.body2().unwrap_or("");
+                    let p3 = rule.head.as_str();
+                    // 主体锚：entity --p1--> y --p2--> z
+                    if let Some(ys) = self.out_edges.get(p1).and_then(|map| map.get(entity)) {
+                        for y in ys {
+                            let Some(zs) =
+                                self.out_edges.get(p2).and_then(|map| map.get(y))
+                            else {
+                                continue;
+                            };
+                            for z in zs {
+                                if z == entity {
+                                    continue;
+                                }
+                                let triple = Triple::new(entity, p3, z);
+                                if let Some(pred) = self.try_prediction(
+                                    &mut seen,
+                                    &mut generated,
+                                    idx,
+                                    rule.confidence,
+                                    triple,
+                                    y,
+                                    |_| true,
+                                ) {
+                                    out.push(pred);
+                                }
+                                if generated >= cap {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+                    // 客体锚：x --p1--> y --p2--> entity
+                    if let Some(ys) = self.in_edges.get(p2).and_then(|map| map.get(entity)) {
+                        for y in ys {
+                            let Some(xs) =
+                                self.in_edges.get(p1).and_then(|map| map.get(y))
+                            else {
+                                continue;
+                            };
+                            for x in xs {
+                                if x == entity {
+                                    continue;
+                                }
+                                let triple = Triple::new(x, p3, entity);
+                                if let Some(pred) = self.try_prediction(
+                                    &mut seen,
+                                    &mut generated,
+                                    idx,
+                                    rule.confidence,
+                                    triple,
+                                    y,
+                                    |_| true,
+                                ) {
+                                    out.push(pred);
+                                }
+                                if generated >= cap {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+                }
+                RuleTemplate::Inverse => {
+                    let p1 = rule.body1();
+                    let p2 = rule.head.as_str();
+                    // entity 作为预测主体：s --p1--> entity ⇒ entity --p2--> s
+                    if let Some(subjects) = self.in_edges.get(p1).and_then(|map| map.get(entity)) {
+                        for subject in subjects {
+                            let triple = Triple::new(entity, p2, subject);
+                            if let Some(pred) = self.try_prediction(
+                                &mut seen,
+                                &mut generated,
+                                idx,
+                                rule.confidence,
+                                triple,
+                                "",
+                                |_| true,
+                            ) {
+                                out.push(pred);
+                            }
+                            if generated >= cap {
+                                return out;
+                            }
+                        }
+                    }
+                    // entity 作为预测客体：entity --p1--> o ⇒ o --p2--> entity
+                    if let Some(objects) = self.out_edges.get(p1).and_then(|map| map.get(entity)) {
+                        for object in objects {
+                            let triple = Triple::new(object, p2, entity);
+                            if let Some(pred) = self.try_prediction(
+                                &mut seen,
+                                &mut generated,
+                                idx,
+                                rule.confidence,
+                                triple,
+                                "",
+                                |_| true,
+                            ) {
+                                out.push(pred);
+                            }
+                            if generated >= cap {
+                                return out;
+                            }
+                        }
+                    }
+                }
+                RuleTemplate::CommonNeighbor => {
+                    let p1 = rule.body1();
+                    let p2 = rule.body2().unwrap_or("");
+                    let p3 = rule.head.as_str();
+                    // entity --p1--> z <--p2-- y ⇒ entity --p3--> y
+                    if let Some(anchors) = self.out_edges.get(p1).and_then(|map| map.get(entity)) {
+                        for anchor in anchors {
+                            let Some(ys) =
+                                self.in_edges.get(p2).and_then(|map| map.get(anchor))
+                            else {
+                                continue;
+                            };
+                            for y in ys {
+                                if y == entity {
+                                    continue;
+                                }
+                                let triple = Triple::new(entity, p3, y);
+                                if let Some(pred) = self.try_prediction(
+                                    &mut seen,
+                                    &mut generated,
+                                    idx,
+                                    rule.confidence,
+                                    triple,
+                                    anchor,
+                                    |_| true,
+                                ) {
+                                    out.push(pred);
+                                }
+                                if generated >= cap {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+                    // y --p1--> z <--p2-- entity ⇒ x --p3--> entity
+                    if let Some(anchors) = self.out_edges.get(p2).and_then(|map| map.get(entity)) {
+                        for anchor in anchors {
+                            let Some(xs) =
+                                self.in_edges.get(p1).and_then(|map| map.get(anchor))
+                            else {
+                                continue;
+                            };
+                            for x in xs {
+                                if x == entity {
+                                    continue;
+                                }
+                                let triple = Triple::new(x, p3, entity);
+                                if let Some(pred) = self.try_prediction(
+                                    &mut seen,
+                                    &mut generated,
+                                    idx,
+                                    rule.confidence,
+                                    triple,
+                                    anchor,
+                                    |_| true,
+                                ) {
+                                    out.push(pred);
+                                }
+                                if generated >= cap {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+                }
+                RuleTemplate::CommonObject => {
+                    let p1 = rule.body1();
+                    let p2 = rule.body2().unwrap_or("");
+                    let p3 = rule.head.as_str();
+                    // z --p1--> entity 且 z --p2--> y ⇒ entity --p3--> y
+                    if let Some(anchors) = self.in_edges.get(p1).and_then(|map| map.get(entity)) {
+                        for anchor in anchors {
+                            let Some(ys) =
+                                self.out_edges.get(p2).and_then(|map| map.get(anchor))
+                            else {
+                                continue;
+                            };
+                            for y in ys {
+                                if y == entity {
+                                    continue;
+                                }
+                                let triple = Triple::new(entity, p3, y);
+                                if let Some(pred) = self.try_prediction(
+                                    &mut seen,
+                                    &mut generated,
+                                    idx,
+                                    rule.confidence,
+                                    triple,
+                                    anchor,
+                                    |_| true,
+                                ) {
+                                    out.push(pred);
+                                }
+                                if generated >= cap {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+                    // z --p1--> x 且 z --p2--> entity ⇒ x --p3--> entity
+                    if let Some(anchors) = self.in_edges.get(p2).and_then(|map| map.get(entity)) {
+                        for anchor in anchors {
+                            let Some(xs) =
+                                self.out_edges.get(p1).and_then(|map| map.get(anchor))
+                            else {
+                                continue;
+                            };
+                            for x in xs {
+                                if x == entity {
+                                    continue;
+                                }
+                                let triple = Triple::new(x, p3, entity);
+                                if let Some(pred) = self.try_prediction(
+                                    &mut seen,
+                                    &mut generated,
+                                    idx,
+                                    rule.confidence,
+                                    triple,
+                                    anchor,
+                                    |_| true,
+                                ) {
+                                    out.push(pred);
+                                }
+                                if generated >= cap {
+                                    return out;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
     fn compare_candidates(a: &Candidate, b: &Candidate) -> Ordering {
         b.confidence
             .partial_cmp(&a.confidence)
@@ -697,10 +986,8 @@ impl LinkPredictor {
         predicate: Option<&str>,
         limit: usize,
     ) -> Vec<Prediction> {
-        let mut candidates = self.enumerate_predictions_matching(self.max_enumeration, |triple| {
-            (triple.subject == entity || triple.object == entity)
-                && predicate.map_or(true, |q| triple.predicate == q)
-        });
+        let mut candidates =
+            self.enumerate_predictions_for_entity(entity, predicate, self.max_enumeration);
         Self::top_candidates(&mut candidates, limit);
         candidates
             .into_iter()
@@ -911,5 +1198,109 @@ mod tests {
         assert!(predictor.participates("张三"));
         assert!(predictor.participates("李四"));
         assert!(!predictor.participates("赵六"));
+    }
+
+    fn mixed_predictor() -> LinkPredictor {
+        let mut predictor = LinkPredictor::new();
+        // 组合规则：师傅 ∘ 师傅 ⇒ 师祖
+        predictor.add_triple("张三", "师傅", "李四");
+        predictor.add_triple("李四", "师傅", "王五");
+        predictor.add_triple("王五", "师傅", "赵六");
+        predictor.add_triple("张三", "师祖", "王五");
+        // 共同邻居：共享父亲 ⇒ 兄妹
+        predictor.add_triple("张三", "父亲", "张父");
+        predictor.add_triple("张三妹", "父亲", "张父");
+        predictor.add_triple("张三", "兄妹", "张三妹");
+        predictor.add_triple("李四", "父亲", "李父");
+        predictor.add_triple("李四妹", "父亲", "李父");
+        // 共同主体：共享老师 ⇒ 同学
+        predictor.add_triple("张三", "老师", "王老师");
+        predictor.add_triple("李四", "老师", "王老师");
+        predictor.add_triple("张三", "同学", "李四");
+        // 逆向规则：配偶（已有对称对提供支持，王五→赵六留待预测）
+        predictor.add_triple("张三", "配偶", "李四");
+        predictor.add_triple("李四", "配偶", "张三");
+        predictor.add_triple("王五", "配偶", "赵六");
+        predictor.mine_rules(1, 0.2);
+        predictor
+    }
+
+    #[test]
+    fn test_anchored_enumeration_matches_filtered_full_scan() {
+        let predictor = mixed_predictor();
+        let full = predictor.predict_missing(500);
+        for entity in [
+            "张三", "李四", "王五", "赵六", "张三妹", "李四妹", "张父", "李父", "王老师",
+        ] {
+            for predicate in [None, Some("师傅"), Some("师祖"), Some("兄妹"), Some("同学"), Some("配偶")] {
+                let anchored: HashSet<Triple> = predictor
+                    .predict_for_entity(entity, predicate, 100)
+                    .into_iter()
+                    .map(|prediction| prediction.triple)
+                    .collect();
+                let expected: HashSet<Triple> = full
+                    .iter()
+                    .filter(|prediction| {
+                        (prediction.triple.subject == entity
+                            || prediction.triple.object == entity)
+                            && predicate
+                                .map_or(true, |query| prediction.triple.predicate == query)
+                    })
+                    .map(|prediction| prediction.triple.clone())
+                    .collect();
+                assert_eq!(
+                    anchored, expected,
+                    "实体「{}」谓词 {:?} 的锚定枚举应与全图过滤一致",
+                    entity, predicate
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_anchored_enumeration_covers_subject_and_object_positions() {
+        let predictor = mixed_predictor();
+        let expect = |entity: &str, predicate: &str, triple: Triple| {
+            let predictions = predictor.predict_for_entity(entity, Some(predicate), 100);
+            assert!(
+                predictions.iter().any(|p| p.triple == triple),
+                "实体「{}」的「{}」预测应包含 {:?}，实际 {:?}",
+                entity,
+                predicate,
+                triple,
+                predictions
+                    .iter()
+                    .map(|p| p.triple.clone())
+                    .collect::<Vec<_>>()
+            );
+        };
+        // 组合：主体锚与客体锚
+        expect("李四", "师祖", Triple::new("李四", "师祖", "赵六"));
+        expect("赵六", "师祖", Triple::new("李四", "师祖", "赵六"));
+        // 共同邻居：主体锚与客体锚
+        expect("李四", "兄妹", Triple::new("李四", "兄妹", "李四妹"));
+        expect("李四妹", "兄妹", Triple::new("李四", "兄妹", "李四妹"));
+        expect("张三", "兄妹", Triple::new("张三妹", "兄妹", "张三"));
+        // 共同主体：主体锚与客体锚
+        expect("李四", "同学", Triple::new("李四", "同学", "张三"));
+        expect("张三", "同学", Triple::new("李四", "同学", "张三"));
+        // 逆向：主体锚与客体锚
+        expect("赵六", "配偶", Triple::new("赵六", "配偶", "王五"));
+        expect("王五", "配偶", Triple::new("赵六", "配偶", "王五"));
+    }
+
+    #[test]
+    fn test_anchored_enumeration_ignores_global_generation_cap() {
+        let mut predictor = mixed_predictor();
+        predictor.max_enumeration = 1;
+        let predictions = predictor.predict_for_entity("李四", Some("师祖"), 5);
+        assert_eq!(
+            predictions
+                .iter()
+                .map(|prediction| prediction.triple.clone())
+                .collect::<Vec<_>>(),
+            vec![Triple::new("李四", "师祖", "赵六")],
+            "锚定枚举只生成目标实体的候选，不应被全图枚举预算饿死"
+        );
     }
 }
