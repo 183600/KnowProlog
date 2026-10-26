@@ -766,6 +766,10 @@ impl TinyModel {
                 }
             }
         }
+        let symmetric = self
+            .name_variants(predicate)
+            .iter()
+            .any(|p| SYMMETRIC_RELS.contains(&self.canon(p).as_str()));
         for e in self.name_variants(entity) {
             if let Some(outgoing) = self.out_index.get(&e) {
                 for (rel, object) in outgoing {
@@ -774,10 +778,13 @@ impl TinyModel {
                     }
                 }
             }
-            if let Some(incoming) = self.in_index.get(&e) {
-                for (rel, subject) in incoming {
-                    if self.name_variants(predicate).contains(rel) && !out.contains(subject) {
-                        out.push(subject.clone());
+            // 非对称关系只沿出边取值；入边必须由「谁的 P 是 O」这类反向查询显式表达。
+            if symmetric {
+                if let Some(incoming) = self.in_index.get(&e) {
+                    for (rel, subject) in incoming {
+                        if self.name_variants(predicate).contains(rel) && !out.contains(subject) {
+                            out.push(subject.clone());
+                        }
                     }
                 }
             }
@@ -1932,6 +1939,34 @@ impl FormalSemantics {
                     }),
                     vec![format!("是不是句式：Isa({}, {})", entity, predicate)],
                 ));
+            }
+        }
+        // 3a) 「谁是 X 的 P」：属格值查询（问 X 的 P 是谁）
+        if tokens.len() >= 5
+            && ["谁", "哪些人", "哪些", "何人", "什么人", "哪个", "哪个人"]
+                .contains(&tokens[0].as_str())
+            && tokens.get(1).map(|token| token == "是").unwrap_or(false)
+        {
+            if let Some(de) = tokens.iter().position(|token| token == "的") {
+                if de > 2 {
+                    if let (Some(entity), Some(predicate)) = (
+                        self.entity_from_tokens(&tokens[2..de]),
+                        self.predicate_from_tokens(&tokens[de + 1..]),
+                    ) {
+                        if !predicate.is_empty() {
+                            out.push(make(
+                                LfKind::Query(Query::Value {
+                                    entity: entity.clone(),
+                                    predicate: predicate.clone(),
+                                }),
+                                vec![format!(
+                                    "谁是 X 的 P 句式：查询「{}」的「{}」值",
+                                    entity, predicate
+                                )],
+                            ));
+                        }
+                    }
+                }
             }
         }
         // 3) 「谁的 P 是 O」：反向实体查询（保留关系方向，不把入边当出边）
@@ -3291,6 +3326,14 @@ mod tests {
             candidate.form.kind,
             LfKind::Query(Query::EntityByObject { .. })
         )));
+
+        let lf = semantics.parse("谁是李四的师傅");
+        match semantics.solve(&lf, &model) {
+            QueryOutcome::Values { values, .. } => {
+                assert_eq!(values, vec!["赵六".to_string()], "lf = {:?}", lf);
+            }
+            other => panic!("unexpected outcome: {:?}", other),
+        }
     }
 
     #[test]
