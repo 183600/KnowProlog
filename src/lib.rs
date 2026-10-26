@@ -135,6 +135,7 @@ pub mod release;
 pub mod resolution_engine;
 pub mod revision_guard;
 pub mod rewrite_book;
+pub mod rewrite_retrieval;
 pub mod schema_view;
 pub mod semantic_embedding;
 pub mod semantic_engine;
