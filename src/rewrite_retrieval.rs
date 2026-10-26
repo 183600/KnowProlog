@@ -954,8 +954,8 @@ where
     let candidates = normalise_candidates(candidates);
     let mut hypotheses: Vec<HypothesisAssessment> = candidates
         .into_iter()
-        .take(config.max_hypotheses)
         .filter_map(|candidate| evaluate_hypothesis(candidate, &config, &mut search))
+        .take(config.max_hypotheses)
         .collect();
     hypotheses.sort_by(|left, right| {
         right
@@ -1420,6 +1420,31 @@ mod tests {
         assert!((report.coverage() - 0.5).abs() < 1e-9);
         assert!((report.precision() - 1.0).abs() < 1e-9);
         assert!(report.render_text().contains("精确率 1.00"));
+    }
+
+    #[test]
+    fn unverifiable_candidates_do_not_consume_hypothesis_budget() {
+        let mut retriever = retriever();
+        let mut config = RewriteRetrievalConfig::default();
+        config.max_hypotheses = 1;
+        let assessment = assess(
+            "张三的师傅是谁",
+            vec![
+                HypothesisCandidate::new(
+                    HypothesisSource::ExactPlan,
+                    "similar",
+                    "张三的师傅是谁",
+                    QueryPlan::Similar {
+                        entity: "张三".to_string(),
+                    },
+                ),
+                candidate(HypothesisSource::ExactPlan, "张三", "师傅"),
+            ],
+            &config,
+            |query, k, constraints| retriever.search(query, k, constraints, Default::default()),
+        );
+        assert_eq!(assessment.hypotheses.len(), 1);
+        assert_eq!(assessment.answer(), Some("李四"));
     }
 
     #[test]

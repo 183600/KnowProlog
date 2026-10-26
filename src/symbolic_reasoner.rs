@@ -11303,7 +11303,8 @@ impl SymbolicReasoner {
         &self,
         assessment: &rewrite_retrieval::Assessment,
     ) -> String {
-        let mut output = String::from("这个问句有不止一种有证据的读法，需要先确认：\n");
+        let mut output =
+            String::from("这个问句有不止一种理解，也有不止一种有证据的读法，需要先确认：\n");
         for (index, hypothesis) in assessment
             .hypotheses
             .iter()
