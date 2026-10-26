@@ -1994,6 +1994,11 @@ impl OxigraphManager {
 
     /// 从任意 reader 导入 RDF 到默认图，返回新增三元组数。
     ///
+    /// N-Quads / TriG 等数据集格式里的命名图不会被保留：所有三元组统一并入
+    /// 默认图。这样 `import-rdf` 与只导出默认图的 `export-rdf` 语义对称，
+    /// 导入的知识也能立即被推理器与 SPARQL 默认图查询看到；需要保留来源
+    /// 隔离时请使用 `namespace` 命令。
+    ///
     /// 与 JSON-LD 导入一致：持锁后、写前推进知识版本，保证并发读者不会把
     /// 半成品缓存成完整快照；解析或写入失败时版本号也已推进（保守失效）。
     pub async fn import_rdf_reader<R: std::io::Read>(
@@ -2001,12 +2006,38 @@ impl OxigraphManager {
         format: oxigraph::io::RdfFormat,
         reader: R,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        // 先完整解析再写入：语法错误不会留下半批三元组。空白节点重命名
+        // 与 Store::load_from_reader 一致，避免不同文档的 `_:b0` 相互碰撞。
+        let quads: Vec<Quad> = oxigraph::io::RdfParser::from_format(format)
+            .rename_blank_nodes()
+            .for_reader(reader)
+            .map(|quad| {
+                quad.map(|quad| {
+                    Quad::new(
+                        quad.subject,
+                        quad.predicate,
+                        quad.object,
+                        GraphName::DefaultGraph,
+                    )
+                })
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("RDF 解析失败：{}", error).into()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let store = self.store.lock().await;
-        let before = store.len()?;
         self.bump_revision();
-        store.load_from_reader(format, reader)?;
-        let after = store.len()?;
-        Ok(after.saturating_sub(before))
+        let added = store.transaction(move |mut transaction| {
+            let mut added = 0usize;
+            for quad in &quads {
+                if transaction.insert(quad.as_ref())? {
+                    added += 1;
+                }
+            }
+            Ok::<usize, oxigraph::store::StorageError>(added)
+        })?;
+        Ok(added)
     }
 
     /// 执行任意 SPARQL 1.1 查询（SELECT / ASK / CONSTRUCT / DESCRIBE）。
@@ -5882,6 +5913,56 @@ mod cache_tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    /// N-Quads / TriG 的命名图在通用导入中并入默认图，命名图本身不落库。
+    #[tokio::test]
+    async fn import_rdf_reader_flattens_named_graphs_into_default_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let nquads = concat!(
+            "<http://example.org/kg/entity/甲> <http://example.org/kg/name> \"甲\" <http://example.org/kg/g1> .\n",
+            "<http://example.org/kg/entity/乙> <http://example.org/kg/name> \"乙\" <http://example.org/kg/g2> .\n",
+        );
+        let added = manager
+            .import_rdf_reader(oxigraph::io::RdfFormat::NQuads, nquads.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(added, 2);
+
+        let trig = concat!(
+            "@prefix kg: <http://example.org/kg/> .\n",
+            "<http://example.org/kg/g> {\n",
+            "  <http://example.org/kg/entity/丙> <http://example.org/kg/name> \"丙\" .\n",
+            "}\n",
+        );
+        assert_eq!(
+            manager
+                .import_rdf_reader(oxigraph::io::RdfFormat::TriG, trig.as_bytes())
+                .await
+                .unwrap(),
+            1
+        );
+
+        let default_graph = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert_eq!(
+            default_graph.data.len(),
+            3,
+            "命名图中的三元组应全部并入默认图：{:?}",
+            default_graph.data
+        );
+
+        let named = manager
+            .query_sparql("SELECT ?g WHERE { GRAPH ?g { ?s ?p ?o } }")
+            .await
+            .unwrap();
+        assert!(
+            named.data.is_empty(),
+            "通用导入不应保留命名图：{:?}",
+            named.data
         );
     }
 
