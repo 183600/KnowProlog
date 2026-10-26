@@ -193,7 +193,11 @@ impl AnswerPlan {
                 index + 1,
                 claim.text.trim(),
                 if detailed {
-                    format!("（谓词：{}；来源：{}）", claim.predicate, claim.source_label())
+                    format!(
+                        "（谓词：{}；来源：{}）",
+                        claim.predicate,
+                        claim.source_label()
+                    )
                 } else {
                     String::new()
                 }
@@ -319,7 +323,9 @@ impl StyleDirective {
                     return Some(StyleDirective::Focus(index));
                 }
                 return match rest {
-                    "简短" | "短" | "精简" | "要点" | "重点" => Some(StyleDirective::Brief),
+                    "简短" | "短" | "精简" | "要点" | "重点" => {
+                        Some(StyleDirective::Brief)
+                    }
                     "详细" | "完整" | "全部" | "展开" => Some(StyleDirective::Detailed),
                     "换种表达" | "换一种表达" | "换种说法" | "重排" | "重新组织" => {
                         Some(StyleDirective::Restate)
@@ -422,6 +428,11 @@ fn parse_focus(text: &str, explicit: bool) -> Option<usize> {
             | "点说说"
             | "条"
             | "条呢"
+            | "条是什么"
+            | "条的内容"
+            | "条内容"
+            | "条讲讲"
+            | "条说说"
     );
     // 裸数字「1」是澄清短答或普通数字，不是风格指令；只有显式前缀
     // 或「展开/第N点」这类带点标记的说法才进入计划定位。
@@ -429,7 +440,7 @@ fn parse_focus(text: &str, explicit: bool) -> Option<usize> {
     if !suffix_ok {
         return None;
     }
-    let bare = had_di && rest == "点";
+    let bare = had_di && matches!(rest, "点" | "条");
     if bare && !explicit && !prefixed {
         return None;
     }
@@ -505,7 +516,11 @@ impl std::fmt::Display for PlanRenderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PlanRenderError::Empty { subject } => {
-                write!(formatter, "关于「{}」的回答计划为空，没有可复述的命题。", subject)
+                write!(
+                    formatter,
+                    "关于「{}」的回答计划为空，没有可复述的命题。",
+                    subject
+                )
             }
             PlanRenderError::FocusOutOfRange {
                 subject,
@@ -659,6 +674,7 @@ mod tests {
             ("回到详细版", StyleDirective::Detailed),
             ("换种表达", StyleDirective::Restate),
             ("第二点是什么", StyleDirective::Focus(2)),
+            ("第二条是什么", StyleDirective::Focus(2)),
             ("展开第三点", StyleDirective::Focus(3)),
             ("风格：第2点", StyleDirective::Focus(2)),
             ("回答计划：简短", StyleDirective::Brief),
@@ -680,6 +696,8 @@ mod tests {
             "换个角度说",
             "接着说",
             "第二点",
+            "第二条",
+            "第2条",
             "1",
             "2",
             "二十",
