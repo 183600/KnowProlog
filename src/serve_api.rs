@@ -811,21 +811,6 @@ impl Session {
         let assumption_command = self.reasoner.handle_assumption_command(&raw_input);
         let predictive_command = self.reasoner.handle_predictive_command(&raw_input);
 
-        // 悬问回填：上一轮刚追问过的洞，本轮短答直接绑定并重解原目标。
-        // 系统命令/补全命令不参与裸回答，避免劫持正常控制流。
-        let pending_answer = if completion_command.is_none()
-            && constructive_command.is_none()
-            && assumption_command.is_none()
-            && predictive_command.is_none()
-        {
-            self.reasoner.try_answer_pending_question(&raw_input)
-        } else {
-            None
-        };
-        if pending_answer.is_none() {
-            // 裸回答窗口只开一轮：本轮没绑定成功，后续输入不得被旧追问劫持。
-            self.reasoner.clear_pending_awaiting();
-        }
         // 解释空间澄清进行中：严格澄清策略下的短答直接结算为确认/否定/暂缓，
         // 不再走普通问答或对话策略，避免「不是」被当成新问题。
         let clarification_answer = if self.policy.strict_clarify
@@ -838,6 +823,23 @@ impl Session {
         } else {
             None
         };
+        // 悬问回填：上一轮刚追问过的洞，本轮短答直接绑定并重解原目标。
+        // 系统命令/补全命令不参与裸回答，避免劫持正常控制流；澄清短答
+        // 已由上面的通道结算，不能再被悬问窗口二次消费。
+        let pending_answer = if clarification_answer.is_none()
+            && completion_command.is_none()
+            && constructive_command.is_none()
+            && assumption_command.is_none()
+            && predictive_command.is_none()
+        {
+            self.reasoner.try_answer_pending_question(&raw_input)
+        } else {
+            None
+        };
+        if pending_answer.is_none() && clarification_answer.is_none() {
+            // 裸回答窗口只开一轮：本轮没绑定成功，后续输入不得被旧追问劫持。
+            self.reasoner.clear_pending_awaiting();
+        }
         // 上一轮的确认/更正若补上了悬问的洞，立即给出延期回答。
         let deferred_after_adopt = if adopted > 0 {
             self.reasoner.resolve_pending_after_assertion()
@@ -905,6 +907,19 @@ impl Session {
                     "predictive".to_string(),
                     Some("predictive_command".to_string()),
                     vec!["predictive_command".to_string()],
+                    text,
+                    None,
+                )
+            } else if let Some((text, still_active)) = clarification_answer {
+                (
+                    if still_active {
+                        "needs_clarification".to_string()
+                    } else {
+                        "answered".to_string()
+                    },
+                    "clarification".to_string(),
+                    Some("clarification".to_string()),
+                    vec!["clarification".to_string()],
                     text,
                     None,
                 )
@@ -5315,6 +5330,54 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             budget,
             None,
         )
+    }
+
+    /// 严格澄清会话中的短答必须由澄清通道结算：确认/否定/暂缓不能再被
+    /// 普通问答或悬问回填消费，也不能给用户抛回一个新的未回答问题。
+    #[test]
+    fn strict_clarification_short_answer_settles_through_clarification_channel() {
+        let mut session = test_session(TurnBudget::unlimited());
+        session.reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+        ]);
+        session.policy.strict_clarify = true;
+        session
+            .reasoner
+            .hypothesis_answer("赵六的师傅是谁")
+            .expect("缺失关系应能生成候选假设");
+        session
+            .reasoner
+            .start_clarification()
+            .expect("有待定假设应能开始澄清");
+
+        let response = session.run_turn("是");
+        let expected_status = if session.reasoner.clarification_active() {
+            "needs_clarification"
+        } else {
+            "answered"
+        };
+        assert_eq!(response.status, expected_status, "{}", response.reply);
+        assert_eq!(response.source, "clarification", "{}", response.reply);
+        assert_eq!(response.plan, vec!["clarification".to_string()]);
+        assert!(
+            response.reply.contains("澄清确认") || response.reply.contains("已确认假设"),
+            "短答应结算为确认而不是新问题：{}",
+            response.reply
+        );
+        assert!(
+            !response.reply.contains("请补充实体名称"),
+            "澄清短答不应落入严格澄清的让位话术：{}",
+            response.reply
+        );
     }
 
     #[test]
