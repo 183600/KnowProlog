@@ -34,6 +34,7 @@ pub mod config_contract;
 pub mod constructive;
 pub mod constructive_eval;
 pub mod context_image;
+pub mod context_window;
 pub mod contextual_rag;
 pub mod contextual_reference;
 pub mod contextual_segmentation;

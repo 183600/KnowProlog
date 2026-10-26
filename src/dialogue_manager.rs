@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binding_frames::{FrameMemory, FrameProgram};
 use crate::bindings::BindingSet;
+use crate::context_window::{select_window, ContextCue, WindowBudget, WindowSelection};
 use crate::contextual_reference::{
     parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
     ContextualResolver, SenseSource,
@@ -3195,6 +3196,33 @@ impl DialogueManager {
         )
     }
 
+    /// 回顾所用的有界窗口：当前焦点相关轮优先，最近轮兜底，并按字符预算封顶。
+    pub fn recap_window(&self, budget: WindowBudget) -> WindowSelection {
+        let cues: Vec<ContextCue> = self
+            .turns
+            .iter()
+            .map(|turn| {
+                let mut cue = ContextCue::new(turn.index, turn.user.clone())
+                    .open(turn.answer_excerpt.is_none());
+                if let Some(entity) = &turn.entity {
+                    cue.focus.push(entity.clone());
+                }
+                if let Some(attribute) = &turn.attribute {
+                    cue.predicates.push(attribute.clone());
+                }
+                cue
+            })
+            .collect();
+        let focus: Vec<String> = self.focus.last().cloned().into_iter().collect();
+        let predicates: Vec<String> = self
+            .turns
+            .last()
+            .and_then(|turn| turn.attribute.clone())
+            .into_iter()
+            .collect();
+        select_window(&cues, &focus, &predicates, budget)
+    }
+
     /// 多轮回顾：把对话本体实例组织成一段连贯自述。
     pub fn recap_text(&self) -> String {
         if self.turns.is_empty() {
@@ -3209,14 +3237,11 @@ impl DialogueManager {
             return text;
         }
         let mut text = format!("我们一共聊了 {} 轮。", self.turns.len());
+        let window = self.recap_window(WindowBudget::new(3, 240, 1));
         let recent: Vec<String> = self
             .turns
             .iter()
-            .rev()
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
+            .filter(|turn| window.keep(turn.index))
             .map(|turn| {
                 let topic = match (&turn.entity, &turn.attribute) {
                     (Some(entity), Some(attribute)) => {
@@ -4746,6 +4771,46 @@ mod tests {
             .expect("依据元话语应被接管");
         assert!(why.text.contains("依据"));
         assert!(why.text.contains("知识图谱"));
+    }
+
+    #[test]
+    fn test_recap_window_keeps_focus_relevant_old_turn() {
+        let mut manager = DialogueManager::new();
+        manager.note_plugin_turn(
+            "姚明的身高是多少",
+            MoveKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            "226 厘米",
+            Vec::new(),
+            Vec::new(),
+        );
+        for (input, answer) in [
+            ("今天天气怎么样", "不知道"),
+            ("随便聊聊", "好"),
+            ("讲个笑话", "好"),
+            ("谢谢", "不客气"),
+        ] {
+            manager.note_plugin_turn(
+                input,
+                MoveKind::Other,
+                None,
+                None,
+                answer,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        manager.note_plugin_focus("姚明");
+        let window = manager.recap_window(WindowBudget::new(3, 240, 1));
+        assert!(window.keep(1), "焦点相关的旧轮应进入窗口");
+        assert!(!window.keep(2), "{:?}", window);
+        assert!(!window.keep(3), "{:?}", window);
+        assert!(window.keep(4));
+        assert!(window.keep(5));
+        let recap = manager.recap_text();
+        assert!(recap.contains("第 1 轮"), "{}", recap);
+        assert!(recap.contains("姚明"), "{}", recap);
     }
 
     #[test]

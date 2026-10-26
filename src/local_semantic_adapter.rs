@@ -21,6 +21,7 @@ pub struct LocalSemanticAdapter {
     advanced_nlu_cell: OnceLock<AdvancedNLU>,
     entity_extractor_cell: OnceLock<EntityRelationExtractor>,
     question_analyzer_cell: OnceLock<QuestionAnalyzer>,
+    context_window_size: Option<usize>,
     enabled: bool,
 }
 
@@ -32,8 +33,15 @@ impl LocalSemanticAdapter {
             advanced_nlu_cell: OnceLock::new(),
             entity_extractor_cell: OnceLock::new(),
             question_analyzer_cell: OnceLock::new(),
+            context_window_size: None,
             enabled,
         }
+    }
+
+    /// 让 `nlp.context_window_size` 真正约束本地语义分析的上下文记忆。
+    pub fn with_context_window_size(mut self, size: Option<usize>) -> Self {
+        self.context_window_size = size;
+        self
     }
 
     fn semantic_engine(&self) -> &SemanticEngine {
@@ -46,7 +54,9 @@ impl LocalSemanticAdapter {
     }
 
     fn advanced_nlu(&self) -> &AdvancedNLU {
-        self.advanced_nlu_cell.get_or_init(AdvancedNLU::new)
+        self.advanced_nlu_cell.get_or_init(|| {
+            AdvancedNLU::new().with_context_window_size(self.context_window_size)
+        })
     }
 
     fn entity_extractor(&self) -> &EntityRelationExtractor {

@@ -84,6 +84,7 @@ pub struct AdvancedNLU {
     spatial_patterns: Vec<(Regex, String)>,
     number_patterns: Vec<(Regex, String)>,
     context_memory: RwLock<Vec<QueryContext>>,
+    context_window_size: usize,
     entity_regex_cache: RwLock<HashMap<String, Regex>>,
 }
 
@@ -100,8 +101,19 @@ impl AdvancedNLU {
             spatial_patterns: Self::initialize_spatial_patterns(),
             number_patterns: Self::initialize_number_patterns(),
             context_memory: RwLock::new(Vec::new()),
+            context_window_size: 10,
             entity_regex_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// 设置保留的上下文轮数；`None` 保持默认 10，`Some(0)` 显式关闭记忆。
+    pub fn with_context_window_size(mut self, size: Option<usize>) -> Self {
+        self.context_window_size = size.unwrap_or(10);
+        self
+    }
+
+    pub fn context_window_size(&self) -> usize {
+        self.context_window_size
     }
 
     fn initialize_intent_patterns() -> HashMap<String, IntentPattern> {
@@ -1257,12 +1269,15 @@ impl AdvancedNLU {
     }
 
     fn update_context_memory(&self, context: &QueryContext) {
+        let limit = self.context_window_size;
+        if limit == 0 {
+            return;
+        }
         let mut memory = self.context_memory.write();
         memory.push(context.clone());
-
-        // 保持最近的10个上下文
-        if memory.len() > 10 {
-            memory.remove(0);
+        if memory.len() > limit {
+            let excess = memory.len() - limit;
+            memory.drain(..excess);
         }
     }
 
@@ -1386,6 +1401,23 @@ mod tests {
         let result = nlu.analyze_query("明天北京的天气怎么样").await.unwrap();
         assert!(result.context.temporal_info.is_some());
         assert_eq!(result.context.query_type, "how_to");
+    }
+
+    #[tokio::test]
+    async fn test_context_memory_respects_configured_window() {
+        let nlu = AdvancedNLU::new().with_context_window_size(Some(2));
+        assert_eq!(nlu.context_window_size(), 2);
+        for query in ["刘德华是谁", "刘德华的年龄是多少", "刘德华的身高是多少"] {
+            nlu.analyze_query(query).await.unwrap();
+        }
+        assert_eq!(nlu.get_context_history().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_zero_context_window_disables_memory() {
+        let nlu = AdvancedNLU::new().with_context_window_size(Some(0));
+        nlu.analyze_query("刘德华的年龄是多少").await.unwrap();
+        assert!(nlu.get_context_history().is_empty());
     }
 
     #[test]

@@ -7532,7 +7532,8 @@ fn apply_language_snapshot(
     *local_semantic_adapter = LocalSemanticAdapter::new(
         config.nlp.enable_local_semantic.unwrap_or(true)
             && config.nlp.disable_ownthink_api.unwrap_or(false),
-    );
+    )
+    .with_context_window_size(config.nlp.context_window_size);
     let language = symbolic_reasoner.apply_language_policy(config);
     (patterns, language, plugin_entries)
 }
@@ -7672,6 +7673,7 @@ async fn run_interactive_mode(
             nlp_config.enable_local_semantic.unwrap_or(true)
                 && nlp_config.disable_ownthink_api.unwrap_or(false),
         )
+        .with_context_window_size(nlp_config.context_window_size)
     };
 
     // 创建外部知识服务：外链名册为外部知识留册（出处 + 逻辑时刻 + 时限），
