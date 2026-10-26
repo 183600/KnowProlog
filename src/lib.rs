@@ -36,6 +36,7 @@ pub mod constructive_eval;
 pub mod context_image;
 pub mod contextual_rag;
 pub mod contextual_reference;
+pub mod contextual_segmentation;
 pub mod conversation_theory;
 pub mod conversational_graph;
 pub mod default_logic;

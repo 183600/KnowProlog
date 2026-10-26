@@ -18,6 +18,7 @@ use know_prolog::{
         parse_clarify_act, rewrite_at, BindingLedger, BindingScope, ClarifyAct, ClarifyRequest,
         ContextualResolver,
     },
+    contextual_segmentation::{ContextualSegmenter, SegmentOptions},
     conversation_theory::{self, ConversationTheory},
     create_default_synonyms,
     dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
@@ -240,6 +241,28 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Print the profile/page/comparison as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain contextual segmentation: symbolic subword evidence, lattice
+    /// paths, readings, ambiguity margin and clarification (read-only; opens
+    /// the knowledge store for lexicon and graph context)
+    Segment {
+        /// Text to segment; omit to read stdin
+        text: Option<String>,
+        /// Focus term used to build the context vector (repeatable)
+        #[arg(long = "context")]
+        context: Vec<String>,
+        /// Expected entity type used as a soft schema constraint (repeatable)
+        #[arg(long = "expect")]
+        expected_types: Vec<String>,
+        /// Expected predicate used as a soft context feature
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Ambiguity margin threshold for clarification
+        #[arg(long, default_value_t = 0.05)]
+        margin: f64,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },
@@ -1949,6 +1972,26 @@ async fn main() {
                 members,
                 offset,
                 limit,
+                json,
+            )
+            .await;
+        }
+        Some(Commands::Segment {
+            text,
+            context,
+            expected_types,
+            predicate,
+            margin,
+            json,
+        }) => {
+            run_contextual_segment(
+                &config,
+                &oxigraph_manager,
+                text.as_deref(),
+                &context,
+                &expected_types,
+                predicate.as_deref(),
+                margin,
                 json,
             )
             .await;
@@ -5471,6 +5514,114 @@ fn run_pattern_forge(
         }
     } else {
         println!("（预览：加 --activate 可查看展开后的路由条目）");
+    }
+}
+
+async fn run_contextual_segment(
+    config: &know_prolog::SystemConfig,
+    manager: &OxigraphManager,
+    text: Option<&str>,
+    context_terms: &[String],
+    expected_types: &[String],
+    predicate: Option<&str>,
+    margin: f64,
+    json: bool,
+) {
+    if !(0.0..=1.0).contains(&margin) || !margin.is_finite() {
+        eprintln!("--margin 必须在 0 到 1 之间（含端点），实得 {}", margin);
+        std::process::exit(2);
+    }
+
+    let mut segmenter = ContextualSegmenter::new();
+    segmenter.set_schema(SchemaView::from_config(
+        &config.type_system,
+        &config.predicate_profiles,
+    ));
+    for entity_type in &config.entity_types {
+        segmenter.observe_type(&entity_type.label);
+    }
+    for profile in &config.entity_profiles {
+        for etype in &profile.etype {
+            segmenter.observe_type(etype);
+        }
+        segmenter.observe_entity(&profile.name, profile.etype.first().map(String::as_str));
+        for alias in &profile.aliases {
+            segmenter.observe_alias(alias, &profile.name);
+        }
+    }
+    for profile in &config.predicate_profiles {
+        segmenter.observe_predicate(&profile.name);
+        for alias in &profile.aliases {
+            segmenter.observe_predicate_alias(alias, &profile.name);
+        }
+        for class in profile.domain.iter().chain(profile.range.iter()) {
+            segmenter.observe_type(class);
+        }
+    }
+
+    let facts = match manager.load_graph_snapshot().await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识库失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    for fact in facts.iter() {
+        match fact {
+            PrologFact::Entity {
+                name,
+                entity_type,
+                properties,
+            } => {
+                segmenter.observe_entity(name, Some(entity_type));
+                for property in properties.keys() {
+                    segmenter.observe_predicate(property);
+                }
+            }
+            PrologFact::Relation {
+                from,
+                rel_type,
+                to,
+            } => segmenter.observe_triple(from, rel_type, to),
+        }
+    }
+
+    let source = match text {
+        Some(text) => text.to_string(),
+        None => {
+            let mut input = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+                eprintln!("读取标准输入失败: {}", error);
+                std::process::exit(1);
+            }
+            input.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    if source.trim().is_empty() {
+        eprintln!("语境分词需要非空文本（参数或标准输入）。");
+        std::process::exit(2);
+    }
+
+    let result = segmenter.segment(
+        &source,
+        &SegmentOptions {
+            context_terms: context_terms.to_vec(),
+            expected_types: expected_types.to_vec(),
+            predicate: predicate.map(str::to_string),
+            ambiguity_margin: margin,
+            ..Default::default()
+        },
+    );
+    if json {
+        match serde_json::to_string_pretty(&result) {
+            Ok(rendered) => println!("{}", rendered),
+            Err(error) => {
+                eprintln!("语境分词序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        print!("{}", result.render_report());
     }
 }
 
