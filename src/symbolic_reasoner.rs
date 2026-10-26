@@ -1279,11 +1279,21 @@ impl FormalClarification {
             return Some(FormalReply::Cancel);
         }
         let ordinal = |token: &str| -> Option<usize> {
-            let digits = token
-                .trim()
-                .trim_start_matches('第')
-                .trim_end_matches(|c| matches!(c, '个' | '条' | '项' | '种' | '号'))
-                .trim();
+            let mut digits = token.trim();
+            for prefix in ["选择", "选", "第"] {
+                digits = digits.strip_prefix(prefix).unwrap_or(digits).trim();
+            }
+            let mut digits = digits.trim();
+            loop {
+                let stripped = digits.trim_end_matches(|c| {
+                    matches!(c, '个' | '条' | '项' | '种' | '号' | '吧')
+                });
+                if stripped == digits {
+                    break;
+                }
+                digits = stripped.trim_end();
+            }
+            let digits = digits.trim();
             let value = if let Ok(number) = digits.parse::<usize>() {
                 Some(number)
             } else {
@@ -26267,6 +26277,11 @@ types = [
         assert!(!answer.contains("赵六"), "answer = {}", answer);
         assert!(answer.contains("证据"), "answer = {}", answer);
         assert!(!reasoner.formal_clarification_active());
+        let integrated = reasoner
+            .answer("谁的师傅是李四？")
+            .expect("正常回答路径也应接通反向查询");
+        assert!(integrated.contains("张三"), "integrated = {}", integrated);
+        assert!(!integrated.contains("赵六"), "integrated = {}", integrated);
     }
 
     #[test]
@@ -26299,7 +26314,7 @@ types = [
         );
         assert!(reasoner.formal_clarification_active());
 
-        match reasoner.answer_formal_clarification("第二个") {
+        match reasoner.answer_formal_clarification("选择第二个") {
             FormalClarificationOutcome::Answered(text) => {
                 assert!(text.contains("李四的师傅是张三"), "{}", text);
                 assert!(text.contains("证据：relation(李四, 师傅, 张三)"), "{}", text);
