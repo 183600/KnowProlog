@@ -107,6 +107,7 @@ pub mod perf_ledger;
 pub mod planning;
 pub mod plugin;
 pub mod predicate_registry;
+pub mod prediction_draft;
 pub mod predictive_elaboration;
 pub mod probabilistic_query_intent;
 pub mod problog;

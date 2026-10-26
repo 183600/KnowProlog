@@ -65,6 +65,7 @@ use crate::pending_question::{
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
+use crate::prediction_draft::PredictionDrafts;
 use crate::predictive_elaboration::{PredictionGuard, PredictiveElaboration};
 use crate::probabilistic_query_intent::{
     Claim, EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
@@ -126,6 +127,9 @@ const TEMPORAL_TO_FIELDS: &[&str] = &["valid_to", "end_year", "until", "结束�
 // 会话内纯函数记忆槽容量（提及/链接/谓词）：多轮交替询问时各自留槽，
 // 知识版本推进（revision 自增）时整体失效；容量按条目数确定，LRU 序可审计。
 const MEMO_CAPACITY: usize = 16;
+
+// 轮末预测草稿容量：只缓存焦点实体/谓词的少量结果，纪元推进时整体失效。
+const PREDICTION_DRAFT_CAPACITY: usize = 64;
 
 // 会话修订回执容量：只保留最近若干次可撤销写入，历史仍可在对话编年史里查。
 const MAX_SESSION_RECEIPTS: usize = 32;
@@ -1342,6 +1346,8 @@ pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
     predictor: LinkPredictor,
+    // 轮末预测答案草稿：按知识纪元失效，只复用纯函数结果，不写图谱。
+    prediction_drafts: parking_lot::Mutex<PredictionDrafts>,
     // 补全回合：确认 → 归纳批次规则 → 有界闭包；默认不写图谱、不全局生效。
     completion: CompletionLedger,
     // 生成侧推测账本：链接预测 → 闸门 → 呈现 → 裁决 → 会话记忆。
@@ -1563,6 +1569,10 @@ impl Clone for SymbolicReasoner {
             config: self.config.clone(),
             aligner: self.aligner.clone(),
             predictor: self.predictor.clone(),
+            // 草稿是纯派生缓存：分叉时留空，由新会话按需重建。
+            prediction_drafts: parking_lot::Mutex::new(PredictionDrafts::new(
+                PREDICTION_DRAFT_CAPACITY,
+            )),
             completion: self.completion.clone(),
             predictive: self.predictive.clone(),
             laws: self.laws.clone(),
@@ -1802,6 +1812,9 @@ impl SymbolicReasoner {
             config,
             aligner,
             predictor: LinkPredictor::new(),
+            prediction_drafts: parking_lot::Mutex::new(PredictionDrafts::new(
+                PREDICTION_DRAFT_CAPACITY,
+            )),
             completion: CompletionLedger::new(),
             predictive: PredictiveElaboration::new(),
             laws: LawBook::new(),
@@ -1955,6 +1968,7 @@ impl SymbolicReasoner {
         self.link_memo.lock().clear();
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
+        self.prediction_drafts.lock().clear();
         self.read_traces.clear();
         self.engine_fault = None;
         // 会话事实/规则可能已注入归结、软逻辑与概率程序；分叉后必须用
@@ -3615,6 +3629,7 @@ impl SymbolicReasoner {
         self.link_memo.lock().clear();
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
+        self.prediction_drafts.lock().clear();
         // 规则只依赖已积累的三元组与固定阈值：有新增三元组时才重新挖掘
         if triples_added && self.config.enable_link_prediction {
             self.predictor.mine_rules(
@@ -8160,7 +8175,7 @@ impl SymbolicReasoner {
             );
         }
         let limit = self.config.max_predictions.saturating_mul(3).clamp(6, 24);
-        let predictions = self.predictor.predict_for_entity(&entity, None, limit);
+        let predictions = self.predictions_for_entity(&entity, None, limit);
         let scope = self.completion_batch_scope(&entity);
         self.completion.open_episode(&entity, None);
         self.completion.set_batch_scope(scope);
@@ -8394,6 +8409,105 @@ impl SymbolicReasoner {
             .map(|question| format!("  下一问（{}）：{}\n", question.kind.label(), question.text))
     }
 
+    /// 草稿命中前的双重复核：纪元已由 `RevisionLru` 把关，这里再确认
+    /// 规则下标仍然有效、头部谓词一致、置信度未变、证据三元组仍在图中。
+    /// 任何一项不符都按未命中处理，绝不让旧规则文本借缓存回流。
+    fn draft_is_valid(&self, predictions: &[Prediction]) -> bool {
+        predictions.iter().all(|prediction| {
+            let Some(rule) = self.predictor.rules().get(prediction.rule_index) else {
+                return false;
+            };
+            rule.head == prediction.triple.predicate
+                && (prediction.confidence - rule.confidence).abs() < f64::EPSILON
+                && !self.predictor.has_triple(
+                    &prediction.triple.subject,
+                    &prediction.triple.predicate,
+                    &prediction.triple.object,
+                )
+                && prediction.evidence.iter().all(|triple| {
+                    self.predictor
+                        .has_triple(&triple.subject, &triple.predicate, &triple.object)
+                })
+        })
+    }
+
+    /// 预测候选的会话缓存入口：纪元相同且证据复核通过才复用，否则重算。
+    fn predictions_for_entity(
+        &self,
+        entity: &str,
+        predicate: Option<&str>,
+        limit: usize,
+    ) -> Vec<Prediction> {
+        let cached = {
+            let mut drafts = self.prediction_drafts.lock();
+            drafts.get(self.revision, entity, predicate, limit)
+        };
+        if let Some(predictions) = cached {
+            if self.draft_is_valid(&predictions) {
+                self.perf.bump("prediction_draft_hits");
+                return predictions;
+            }
+            self.perf.bump("prediction_draft_stale");
+            self.prediction_drafts.lock().clear();
+        }
+        self.perf.bump("prediction_draft_misses");
+        let predictions = self.predictor.predict_for_entity(entity, predicate, limit);
+        let evicted = self.prediction_drafts.lock().put(
+            self.revision,
+            entity,
+            predicate,
+            limit,
+            predictions.clone(),
+        );
+        self.perf.bump_by("prediction_draft_evictions", evicted as u64);
+        predictions
+    }
+
+    /// 轮末预取：把当前焦点实体（以及上一轮谓词）的候选提前算好。
+    ///
+    /// 预取只是把下一轮本来就要做的纯计算提前；不写入图谱、不确认候选、
+    /// 不改变任何回答文本。返回预先物化的候选条数。
+    pub fn prefetch_answer_drafts(&mut self) -> usize {
+        if !self.config.enable_link_prediction || self.predictor.rules().is_empty() {
+            return 0;
+        }
+        let Some(entity) = self.context.focus().map(str::to_string) else {
+            return 0;
+        };
+        let limit = self.config.max_predictions.saturating_mul(4).max(4);
+        let mut warmed = self.predictions_for_entity(&entity, None, limit).len();
+        if let Some(predicate) = self.context.last_predicate().map(str::to_string) {
+            warmed += self
+                .predictions_for_entity(&entity, Some(&predicate), limit)
+                .len();
+        }
+        self.perf.bump("prediction_draft_prefetches");
+        self.perf.bump_by("prediction_draft_prefetched", warmed as u64);
+        warmed
+    }
+
+    /// 草稿台账：只读观测，展示纪元、驻留条目与命中/预取计数。
+    pub fn prediction_draft_report(&self) -> String {
+        let drafts = self.prediction_drafts.lock();
+        let hits = self.perf.count("prediction_draft_hits");
+        let misses = self.perf.count("prediction_draft_misses");
+        let stale = self.perf.count("prediction_draft_stale");
+        let prefetches = self.perf.count("prediction_draft_prefetches");
+        let prefetched = self.perf.count("prediction_draft_prefetched");
+        let evictions = self.perf.count("prediction_draft_evictions");
+        format!(
+            "预测答案草稿（链接预测的轮末预取）：知识版本 {}，驻留 {} 条。\n  命中 {} 次，未命中 {} 次，证据复核拒绝 {} 次；预取 {} 轮（{} 条候选），淘汰 {} 条。\n  草稿不是知识：不写图谱、不确认候选；知识版本推进时整体失效。",
+            self.revision,
+            drafts.len(),
+            hits,
+            misses,
+            stale,
+            prefetches,
+            prefetched,
+            evictions
+        )
+    }
+
     pub fn predictive_ledger(&self) -> &PredictiveElaboration {
         &self.predictive
     }
@@ -8448,7 +8562,7 @@ impl SymbolicReasoner {
             ));
         }
         let limit = self.config.max_predictions.saturating_mul(4).clamp(6, 24);
-        let predictions = self.predictor.predict_for_entity(&entity, None, limit);
+        let predictions = self.predictions_for_entity(&entity, None, limit);
         let guard = self.predictive_guard();
         let plan = self
             .predictive
@@ -8598,6 +8712,9 @@ impl SymbolicReasoner {
         if matches!(trimmed, "预测台账" | "预测报告" | "推测台账" | "推测报告") {
             return Some(self.predictive_report());
         }
+        if matches!(trimmed, "预测草稿" | "预测缓存" | "草稿台账") {
+            return Some(self.prediction_draft_report());
+        }
         None
     }
 
@@ -8622,8 +8739,7 @@ impl SymbolicReasoner {
         }
         let limit = self.config.max_predictions.saturating_mul(2).max(4);
         let prediction = self
-            .predictor
-            .predict_for_entity(&triple.subject, Some(&triple.predicate), limit)
+            .predictions_for_entity(&triple.subject, Some(&triple.predicate), limit)
             .into_iter()
             .find(|prediction| prediction.triple == triple);
         let (rule, evidence) = prediction
@@ -9025,8 +9141,7 @@ impl SymbolicReasoner {
         let limit = self.config.max_predictions.saturating_mul(2).max(4);
         let mut nominations = Vec::new();
         for prediction in self
-            .predictor
-            .predict_for_entity(entity, Some(attribute), limit)
+            .predictions_for_entity(entity, Some(attribute), limit)
         {
             if prediction.triple.subject != entity || prediction.triple.predicate != attribute {
                 continue;
@@ -9305,8 +9420,7 @@ impl SymbolicReasoner {
         if !predicate.inverted && self.config.enable_link_prediction {
             let limit = self.config.max_predictions.saturating_mul(4).max(4);
             for prediction in self
-                .predictor
-                .predict_for_entity(node, Some(&predicate.slot), limit)
+                .predictions_for_entity(node, Some(&predicate.slot), limit)
             {
                 // 只取 node 作为主体的出边预测
                 if prediction.triple.subject != node {
@@ -12174,8 +12288,7 @@ impl SymbolicReasoner {
             // 用哈希集合做成员检查
             let mut seen_subjects: HashSet<String> = subjects.iter().cloned().collect();
             for prediction in self
-                .predictor
-                .predict_for_entity(&object, Some(&slot), limit)
+                .predictions_for_entity(&object, Some(&slot), limit)
             {
                 if prediction.triple.object == object
                     && prediction.triple.subject != object
@@ -12921,8 +13034,7 @@ impl SymbolicReasoner {
         let mut candidates: Vec<Prediction> = Vec::new();
         for entity in &entities {
             for prediction in
-                self.predictor
-                    .predict_for_entity(entity, None, self.config.max_predictions * 4)
+                self.predictions_for_entity(entity, None, self.config.max_predictions * 4)
             {
                 if self.is_suppressed_slot_value(
                     &prediction.triple.subject,
@@ -20607,6 +20719,51 @@ types = [
             .pending()
             .iter()
             .any(|hypothesis| hypothesis.key.object == "赵六"));
+    }
+
+    #[test]
+    fn test_prediction_drafts_prefetch_hit_and_invalidate() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.context.record_entities(&["李四".to_string()]);
+        reasoner.context.record_predicate("师祖");
+
+        let warmed = reasoner.prefetch_answer_drafts();
+        assert!(warmed > 0, "轮末预取应物化焦点实体的候选");
+        let perf = reasoner.perf_ledger();
+        let hits_before = perf.count("prediction_draft_hits");
+        let predictions = reasoner.predictions_for_entity("李四", None, 20);
+        assert!(!predictions.is_empty());
+        assert!(
+            perf.count("prediction_draft_hits") > hits_before,
+            "相同的实体/谓词/上限应命中预取草稿"
+        );
+
+        let first = reasoner
+            .answer_by_prediction("李四的师祖是谁")
+            .expect("应能给出链接预测候选");
+        let second = reasoner
+            .answer_by_prediction("李四的师祖是谁")
+            .expect("命中草稿后仍应给出候选");
+        assert_eq!(first, second, "草稿命中与重算的输出必须逐字节一致");
+
+        let report = reasoner
+            .handle_predictive_command("预测草稿")
+            .expect("预测草稿命令应可读");
+        assert!(report.contains("预测答案草稿"), "{}", report);
+
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "李四".to_string(),
+            rel_type: "同事".to_string(),
+            to: "钱七".to_string(),
+        }]);
+        let misses_before = perf.count("prediction_draft_misses");
+        let refreshed = reasoner.predictions_for_entity("李四", None, 20);
+        assert!(!refreshed.is_empty());
+        assert!(
+            perf.count("prediction_draft_misses") > misses_before,
+            "知识版本推进后旧草稿必须整体失效"
+        );
     }
 
     #[test]

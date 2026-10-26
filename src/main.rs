@@ -7094,6 +7094,13 @@ async fn run_ask(
                 .map(|reply| reply.text)
                 .or_else(|| reasoner.answer(effective))
         };
+        if answer
+            .as_deref()
+            .map_or(false, |text| !is_no_record_text(text))
+        {
+            // 一次性问答也做轮末预取：下一行继续追问时可命中同纪元草稿。
+            reasoner.prefetch_answer_drafts();
+        }
         let mut status = if answer.is_some() {
             "answered"
         } else {
@@ -14940,6 +14947,8 @@ async fn try_symbolic_reasoning(
             return Some(combined);
         }
         symbolic_reasoner.dismiss_pending_question(input);
+        // 轮末预取：焦点实体已确定，下一轮若继续追问可直接复用链接预测候选。
+        symbolic_reasoner.prefetch_answer_drafts();
         return Some(answer);
     }
     // 开放问句无直接答案：尝试溯因生成候选假设

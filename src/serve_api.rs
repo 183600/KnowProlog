@@ -1092,6 +1092,11 @@ impl Session {
             derivation,
         };
         self.policy.apply(&input, &mut response, &self.reasoner);
+        // 轮末预取：只把焦点实体下一轮可能用到的链接预测提前算好（有界），
+        // 回答文本与轮次语义不变；失败/澄清轮不预取，避免为不确定目标付费。
+        if response.status == "answered" {
+            self.reasoner.prefetch_answer_drafts();
+        }
         control.enter(TurnPhase::Commit)?;
         Ok(response)
     }
