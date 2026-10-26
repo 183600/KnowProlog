@@ -307,54 +307,85 @@ impl LinkPredictor {
         }
     }
 
-    fn build_rule(
+    /// 用「事实对 → 包含它的头谓词」倒排表，一次性为体部计出所有头的支持度。
+    ///
+    /// 旧实现对每个体部都遍历全部谓词做集合求交（三层枚举）。这里把第三层
+    /// 换成 `heads_by_pair`：体部只有真正共享事实对的谓词才会产生候选头，
+    /// 支撑度为 0 的头根本不会进入后续过滤。规则生成顺序与旧实现一致：
+    /// 体部按 p1/p2 顺序、头按谓词下标升序，最后的稳定排序结果不变。
+    fn push_body_rules(
         &self,
         template: RuleTemplate,
         body: &[&str],
-        head: &str,
         body_pairs: &HashSet<(String, String)>,
+        heads_by_pair: &HashMap<(&str, &str), Vec<usize>>,
+        predicates: &[String],
         min_support: usize,
         min_confidence: f64,
-    ) -> Option<HornRule> {
-        let head_pairs = self.pairs_of(head)?;
-        // 从较小集合侧做包含计数，交集大小不变
-        let support = if body_pairs.len() <= head_pairs.len() {
-            body_pairs
-                .iter()
-                .filter(|pair| head_pairs.contains(*pair))
-                .count()
-        } else {
-            head_pairs
-                .iter()
-                .filter(|pair| body_pairs.contains(*pair))
-                .count()
-        };
-        if support < min_support || body_pairs.is_empty() {
-            return None;
+        rules: &mut Vec<HornRule>,
+    ) {
+        if body_pairs.is_empty() {
+            return;
         }
-        let confidence = support as f64 / body_pairs.len() as f64;
-        if confidence < min_confidence {
-            return None;
+        let mut support_by_head: HashMap<usize, usize> = HashMap::new();
+        for (subject, object) in body_pairs {
+            if let Some(head_indices) =
+                heads_by_pair.get(&(subject.as_str(), object.as_str()))
+            {
+                for &head_index in head_indices {
+                    *support_by_head.entry(head_index).or_insert(0) += 1;
+                }
+            }
         }
-        let head_coverage = if head_pairs.is_empty() {
-            0.0
-        } else {
-            support as f64 / head_pairs.len() as f64
-        };
-        // 通过全部过滤后克隆体部/头部名称
-        Some(HornRule {
-            template,
-            body: body.iter().map(|name| name.to_string()).collect(),
-            head: head.to_string(),
-            support,
-            body_count: body_pairs.len(),
-            confidence,
-            head_coverage,
-        })
+        if support_by_head.is_empty() {
+            return;
+        }
+        let mut head_indices: Vec<usize> = support_by_head.keys().copied().collect();
+        head_indices.sort_unstable();
+        for head_index in head_indices {
+            let support = support_by_head[&head_index];
+            if support < min_support {
+                continue;
+            }
+            let Some(head) = predicates.get(head_index) else {
+                continue;
+            };
+            let Some(head_pairs) = self.pairs_of(head) else {
+                continue;
+            };
+            if head_pairs.is_empty() {
+                continue;
+            }
+            let confidence = support as f64 / body_pairs.len() as f64;
+            if confidence < min_confidence {
+                continue;
+            }
+            rules.push(HornRule {
+                template,
+                body: body.iter().map(|name| name.to_string()).collect(),
+                head: head.clone(),
+                support,
+                body_count: body_pairs.len(),
+                confidence,
+                head_coverage: support as f64 / head_pairs.len() as f64,
+            });
+        }
     }
 
     pub fn mine_rules(&mut self, min_support: usize, min_confidence: f64) {
         let predicates: Vec<String> = self.pairs_by_pred.keys().cloned().collect();
+        // 头谓词倒排：事实对 → 包含该事实对的头谓词下标。
+        let mut heads_by_pair: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (index, predicate) in predicates.iter().enumerate() {
+            if let Some(pairs) = self.pairs_by_pred.get(predicate) {
+                for (subject, object) in pairs {
+                    heads_by_pair
+                        .entry((subject.as_str(), object.as_str()))
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
         let mut rules = Vec::new();
 
         for p1 in &predicates {
@@ -364,70 +395,61 @@ impl LinkPredictor {
                 .map(|pairs1| pairs1.iter().map(|(o, s)| (s.clone(), o.clone())).collect());
             for p2 in &predicates {
                 if let Some(reversed) = &reversed {
-                    if let Some(rule) = self.build_rule(
+                    self.push_body_rules(
                         RuleTemplate::Inverse,
                         &[p1.as_str()],
-                        p2,
                         reversed,
+                        &heads_by_pair,
+                        &predicates,
                         min_support,
                         min_confidence,
-                    ) {
-                        rules.push(rule);
-                    }
+                        &mut rules,
+                    );
                 }
 
                 if let Some(body) = self.compose_body_pairs(p1, p2) {
                     // 支撑量不可能超过体部对数：先剪掉不足阈值的体部
                     if body.len() >= min_support {
-                        let body_names = [p1.as_str(), p2.as_str()];
-                        for p3 in &predicates {
-                            if let Some(rule) = self.build_rule(
-                                RuleTemplate::Compose,
-                                &body_names,
-                                p3,
-                                &body,
-                                min_support,
-                                min_confidence,
-                            ) {
-                                rules.push(rule);
-                            }
-                        }
+                        self.push_body_rules(
+                            RuleTemplate::Compose,
+                            &[p1.as_str(), p2.as_str()],
+                            &body,
+                            &heads_by_pair,
+                            &predicates,
+                            min_support,
+                            min_confidence,
+                            &mut rules,
+                        );
                     }
                 }
 
                 if let Some(body) = self.common_body_pairs(p1, p2, false) {
                     if body.len() >= min_support {
-                        let body_names = [p1.as_str(), p2.as_str()];
-                        for p3 in &predicates {
-                            if let Some(rule) = self.build_rule(
-                                RuleTemplate::CommonNeighbor,
-                                &body_names,
-                                p3,
-                                &body,
-                                min_support,
-                                min_confidence,
-                            ) {
-                                rules.push(rule);
-                            }
-                        }
+                        self.push_body_rules(
+                            RuleTemplate::CommonNeighbor,
+                            &[p1.as_str(), p2.as_str()],
+                            &body,
+                            &heads_by_pair,
+                            &predicates,
+                            min_support,
+                            min_confidence,
+                            &mut rules,
+                        );
                     }
                 }
 
                 if let Some(body) = self.common_body_pairs(p1, p2, true) {
                     if body.len() >= min_support {
-                        let body_names = [p1.as_str(), p2.as_str()];
-                        for p3 in &predicates {
-                            if let Some(rule) = self.build_rule(
-                                RuleTemplate::CommonObject,
-                                &body_names,
-                                p3,
-                                &body,
-                                min_support,
-                                min_confidence,
-                            ) {
-                                rules.push(rule);
-                            }
-                        }
+                        self.push_body_rules(
+                            RuleTemplate::CommonObject,
+                            &[p1.as_str(), p2.as_str()],
+                            &body,
+                            &heads_by_pair,
+                            &predicates,
+                            min_support,
+                            min_confidence,
+                            &mut rules,
+                        );
                     }
                 }
             }
@@ -1148,6 +1170,42 @@ mod tests {
         assert!((rule.confidence - 0.5).abs() < 1e-9);
         predictor.mine_rules(1, 1.0);
         assert!(predictor.rules().iter().all(|r| r.confidence >= 1.0));
+    }
+
+    #[test]
+    fn test_head_index_counts_each_head_support() {
+        let mut predictor = LinkPredictor::new();
+        predictor.add_triple("a", "r1", "b");
+        predictor.add_triple("b", "r2", "c");
+        predictor.add_triple("x", "r1", "y");
+        predictor.add_triple("y", "r2", "z");
+        predictor.add_triple("a", "r3", "c");
+        predictor.add_triple("x", "r3", "z");
+        predictor.add_triple("a", "r4", "c");
+        predictor.mine_rules(1, 0.4);
+
+        let compose: Vec<&HornRule> = predictor
+            .rules()
+            .iter()
+            .filter(|rule| {
+                rule.template == RuleTemplate::Compose
+                    && rule.body == vec!["r1".to_string(), "r2".to_string()]
+            })
+            .collect();
+        let r3 = compose
+            .iter()
+            .find(|rule| rule.head == "r3")
+            .expect("r3 应获得 2 个事实对的支持");
+        assert_eq!(r3.support, 2);
+        assert_eq!(r3.body_count, 2);
+        assert!((r3.confidence - 1.0).abs() < 1e-9);
+        let r4 = compose
+            .iter()
+            .find(|rule| rule.head == "r4")
+            .expect("r4 应获得 1 个事实对的支持");
+        assert_eq!(r4.support, 1);
+        assert!((r4.confidence - 0.5).abs() < 1e-9);
+        assert!(compose.iter().all(|rule| rule.head != "r5"));
     }
 
     #[test]
