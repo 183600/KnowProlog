@@ -8,7 +8,7 @@ use crate::abduction::{
     HypothesisKind, Scenario,
 };
 use crate::alignment_memory::{AlignmentKind, AlignmentMemory, AlignmentScope, LearnOutcome};
-use crate::answer_plan::{AnswerPlan, PlanClaim, StyleDirective, MAX_PLAN_CLAIMS};
+use crate::answer_plan::{AnswerPlan, ClaimEvidence, PlanClaim, StyleDirective, MAX_PLAN_CLAIMS};
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::belief_revision::{BeliefState, ChangeOp, ChangeSet, RevisionConstraints};
 use crate::cache::RevisionLru;
@@ -4841,12 +4841,28 @@ impl SymbolicReasoner {
             .iter()
             .take(MAX_PLAN_CLAIMS)
             .map(|clause| {
-                let claim = PlanClaim::new(
+                let mut claim = PlanClaim::new(
                     clause.slot_id(),
                     clause.predicate(),
                     clause.sentence.clone(),
                     clause.from_overlay,
                 );
+                if !clause.evidence.is_empty() {
+                    claim = claim.with_evidence(
+                        clause
+                            .evidence
+                            .iter()
+                            .map(|(subject, predicate, object)| {
+                                ClaimEvidence::new(
+                                    subject,
+                                    predicate,
+                                    object,
+                                    clause.from_overlay,
+                                )
+                            })
+                            .collect(),
+                    );
+                }
                 if self.config.confidence.enabled {
                     claim.with_envelope(self.claim_envelope(clause))
                 } else {
@@ -20771,6 +20787,57 @@ types = [
             .expect("换种表达应可用");
         for claim in &plan.claims {
             assert!(restated.contains(claim.text.trim()), "{}", restated);
+        }
+    }
+
+    #[test]
+    fn generation_plan_cites_registered_triples() {
+        let mut config = test_config();
+        config.max_profile_sentences = 6;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        assert!(
+            plan.claims.iter().all(|claim| !claim.evidence.is_empty()),
+            "每条命题都应带证据引用：{:?}",
+            plan.claims
+        );
+        assert!(
+            plan.claims.iter().any(|claim| claim.evidence.iter().any(|item| {
+                item.subject == "张三" && item.predicate == "师傅" && item.object == "李四"
+            })),
+            "师傅事实应出现在证据中：{:?}",
+            plan.claims
+        );
+        let known: HashSet<(String, String, String)> = master_facts()
+            .into_iter()
+            .flat_map(|fact| match fact {
+                PrologFact::Relation { from, rel_type, to } => vec![(from, rel_type, to)],
+                PrologFact::Entity {
+                    name, properties, ..
+                } => properties
+                    .into_iter()
+                    .map(|(key, value)| (name.clone(), key, value))
+                    .collect(),
+            })
+            .collect();
+        for claim in &plan.claims {
+            for item in &claim.evidence {
+                assert!(
+                    known.contains(&(
+                        item.subject.clone(),
+                        item.predicate.clone(),
+                        item.object.clone()
+                    )),
+                    "证据必须是登记事实：{:?}",
+                    item
+                );
+            }
         }
     }
 

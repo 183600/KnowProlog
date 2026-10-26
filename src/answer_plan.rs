@@ -27,6 +27,43 @@ pub const MAX_PLAN_CLAIMS: usize = 24;
 /// 简短模式默认展示的命题数。
 pub const BRIEF_CLAIM_LIMIT: usize = 3;
 
+/// 一条命题所依据的登记事实（不含推断过程，只含可核查的三元组）。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ClaimEvidence {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    /// 是否来自会话叠加层（未写入图谱）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session: bool,
+}
+
+impl ClaimEvidence {
+    pub fn new(
+        subject: impl Into<String>,
+        predicate: impl Into<String>,
+        object: impl Into<String>,
+        session: bool,
+    ) -> Self {
+        Self {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            session,
+        }
+    }
+
+    pub fn render(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            if self.session { "会话" } else { "图谱" },
+            self.subject,
+            self.predicate,
+            self.object
+        )
+    }
+}
+
 /// 一条可被表达层选择的命题。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanClaim {
@@ -43,6 +80,9 @@ pub struct PlanClaim {
     /// 逐命题置信区间；旧计划缺省为 None，序列化字节保持不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<ClaimEnvelope>,
+    /// 该命题依据的事实三元组；空证据跳过序列化，旧计划字节不变。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ClaimEvidence>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -62,6 +102,7 @@ impl PlanClaim {
             text: text.into(),
             session,
             envelope: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -69,6 +110,32 @@ impl PlanClaim {
     pub fn with_envelope(mut self, envelope: ClaimEnvelope) -> Self {
         self.envelope = Some(envelope);
         self
+    }
+
+    /// 附加/覆盖命题所依据的登记事实；空证据不会写入序列化。
+    pub fn with_evidence(mut self, evidence: Vec<ClaimEvidence>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+
+    fn evidence_note(&self) -> String {
+        if self.evidence.is_empty() {
+            return String::new();
+        }
+        const SHOWN: usize = 3;
+        let mut note = format!(
+            "；依据：{}",
+            self.evidence
+                .iter()
+                .take(SHOWN)
+                .map(ClaimEvidence::render)
+                .collect::<Vec<_>>()
+                .join("；")
+        );
+        if self.evidence.len() > SHOWN {
+            let _ = write!(note, "；等 {} 条", self.evidence.len());
+        }
+        note
     }
 
     fn envelope_note(&self) -> String {
@@ -182,6 +249,15 @@ impl AnswerPlan {
                     envelope.upper_bps()
                 );
             }
+            let mut evidence: Vec<&ClaimEvidence> = claim.evidence.iter().collect();
+            evidence.sort();
+            for item in evidence {
+                let _ = write!(
+                    material,
+                    "|e:{}|{}|{}|{}",
+                    item.subject, item.predicate, item.object, item.session
+                );
+            }
         }
         fnv1a_hex(material.as_bytes())
     }
@@ -223,7 +299,7 @@ impl AnswerPlan {
                         "（谓词：{}；来源：{}）{}",
                         claim.predicate,
                         claim.source_label(),
-                        claim.envelope_note()
+                        format!("{}{}", claim.envelope_note(), claim.evidence_note())
                     )
                 } else {
                     String::new()
@@ -260,7 +336,7 @@ impl AnswerPlan {
             claim.text.trim(),
             claim.predicate,
             claim.source_label(),
-            claim.envelope_note()
+            format!("{}{}", claim.envelope_note(), claim.evidence_note())
         );
         if total > 1 {
             let _ = writeln!(output, "  输入「完整讲讲」查看全部 {} 点。", total);
@@ -1098,6 +1174,46 @@ mod tests {
         let json = serde_json::to_string(&before.diff(&after)).unwrap();
         let restored: PlanDiff = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.counts().1, 1);
+    }
+
+    #[test]
+    fn evidence_is_optional_skipped_in_json_and_changes_identity() {
+        let plain = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "p", "命题。", false)],
+            0,
+            0,
+        );
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("evidence"), "空证据不得增加序列化字节：{}", json);
+
+        let annotated = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "p", "命题。", false).with_evidence(vec![
+                ClaimEvidence::new("张三", "师傅", "李四", false),
+            ])],
+            0,
+            0,
+        );
+        assert_ne!(plain.id, annotated.id, "证据属于计划内容，必须进入指纹");
+        let detailed = annotated.realize(StyleDirective::Detailed).unwrap();
+        assert!(detailed.contains("依据：图谱 张三 师傅 李四"), "{}", detailed);
+        let brief = annotated.realize(StyleDirective::Brief).unwrap();
+        assert!(!brief.contains("依据："), "简短版不展开证据：{}", brief);
+
+        let roundtrip: AnswerPlan =
+            serde_json::from_str(&serde_json::to_string(&annotated).unwrap()).unwrap();
+        assert_eq!(roundtrip, annotated);
+
+        let old: AnswerPlan = serde_json::from_str(
+            r#"{"version":1,"id":"x","question":"q","subject":"张三","revision":1,"claims":[{"slot":"s","predicate":"p","text":"命题。","session":false}],"omitted":0,"suppressed":0}"#,
+        )
+        .unwrap();
+        assert!(old.claims[0].evidence.is_empty());
     }
 
     #[test]

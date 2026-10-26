@@ -366,6 +366,8 @@ pub struct ProfileClause {
     pub sentence: String,
     /// 是否含会话层事实（自检时可把这些句子视为已证事实）
     pub from_overlay: bool,
+    /// 本句依据的登记三元组（主体, 谓词, 客体）；用于回答计划的证据引用。
+    pub evidence: Vec<(String, String, String)>,
     rank_milli: i64,
 }
 
@@ -1752,10 +1754,16 @@ impl SymbolicGenerator {
                     };
                     let sentence =
                         self.lexicalize(entity, &predicate, std::slice::from_ref(&value));
+                    let evidence = vec![(
+                        entity.to_string(),
+                        predicate.clone(),
+                        value.clone(),
+                    )];
                     clauses.push(ProfileClause {
                         key,
                         sentence,
                         from_overlay,
+                        evidence,
                         rank_milli: 500,
                     });
                 }
@@ -1767,10 +1775,15 @@ impl SymbolicGenerator {
                     qualifier: String::new(),
                 };
                 let sentence = self.lexicalize(entity, &predicate, &values);
+                let evidence = values
+                    .iter()
+                    .map(|value| (entity.to_string(), predicate.clone(), value.clone()))
+                    .collect();
                 clauses.push(ProfileClause {
                     key,
                     sentence,
                     from_overlay,
+                    evidence,
                     rank_milli: (self.predicate_idf(&predicate) * 1000.0).round() as i64,
                 });
             }
@@ -1834,10 +1847,15 @@ impl SymbolicGenerator {
                 &predicate,
                 std::slice::from_ref(&entity.to_string()),
             );
+            let evidence = subject_list
+                .iter()
+                .map(|subject| (subject.clone(), predicate.clone(), entity.to_string()))
+                .collect();
             clauses.push(ProfileClause {
                 key,
                 sentence,
                 from_overlay: reverse_overlay.contains(&predicate),
+                evidence,
                 rank_milli: -1000,
             });
             reverse_added += 1;
