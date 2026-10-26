@@ -69,11 +69,8 @@ impl PredictionDrafts {
         limit: usize,
         predictions: Vec<Prediction>,
     ) -> usize {
-        self.entries.put(
-            epoch,
-            draft_key(entity, predicate, limit),
-            predictions,
-        )
+        self.entries
+            .put(epoch, draft_key(entity, predicate, limit), predictions)
     }
 
     pub fn clear(&mut self) {

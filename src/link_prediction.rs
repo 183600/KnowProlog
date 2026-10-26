@@ -329,9 +329,7 @@ impl LinkPredictor {
         }
         let mut support_by_head: HashMap<usize, usize> = HashMap::new();
         for (subject, object) in body_pairs {
-            if let Some(head_indices) =
-                heads_by_pair.get(&(subject.as_str(), object.as_str()))
-            {
+            if let Some(head_indices) = heads_by_pair.get(&(subject.as_str(), object.as_str())) {
                 for &head_index in head_indices {
                     *support_by_head.entry(head_index).or_insert(0) += 1;
                 }
@@ -731,9 +729,7 @@ impl LinkPredictor {
                     // 主体锚：entity --p1--> y --p2--> z
                     if let Some(ys) = self.out_edges.get(p1).and_then(|map| map.get(entity)) {
                         for y in ys {
-                            let Some(zs) =
-                                self.out_edges.get(p2).and_then(|map| map.get(y))
-                            else {
+                            let Some(zs) = self.out_edges.get(p2).and_then(|map| map.get(y)) else {
                                 continue;
                             };
                             for z in zs {
@@ -761,9 +757,7 @@ impl LinkPredictor {
                     // 客体锚：x --p1--> y --p2--> entity
                     if let Some(ys) = self.in_edges.get(p2).and_then(|map| map.get(entity)) {
                         for y in ys {
-                            let Some(xs) =
-                                self.in_edges.get(p1).and_then(|map| map.get(y))
-                            else {
+                            let Some(xs) = self.in_edges.get(p1).and_then(|map| map.get(y)) else {
                                 continue;
                             };
                             for x in xs {
@@ -840,8 +834,7 @@ impl LinkPredictor {
                     // entity --p1--> z <--p2-- y ⇒ entity --p3--> y
                     if let Some(anchors) = self.out_edges.get(p1).and_then(|map| map.get(entity)) {
                         for anchor in anchors {
-                            let Some(ys) =
-                                self.in_edges.get(p2).and_then(|map| map.get(anchor))
+                            let Some(ys) = self.in_edges.get(p2).and_then(|map| map.get(anchor))
                             else {
                                 continue;
                             };
@@ -870,8 +863,7 @@ impl LinkPredictor {
                     // y --p1--> z <--p2-- entity ⇒ x --p3--> entity
                     if let Some(anchors) = self.out_edges.get(p2).and_then(|map| map.get(entity)) {
                         for anchor in anchors {
-                            let Some(xs) =
-                                self.in_edges.get(p1).and_then(|map| map.get(anchor))
+                            let Some(xs) = self.in_edges.get(p1).and_then(|map| map.get(anchor))
                             else {
                                 continue;
                             };
@@ -905,8 +897,7 @@ impl LinkPredictor {
                     // z --p1--> entity 且 z --p2--> y ⇒ entity --p3--> y
                     if let Some(anchors) = self.in_edges.get(p1).and_then(|map| map.get(entity)) {
                         for anchor in anchors {
-                            let Some(ys) =
-                                self.out_edges.get(p2).and_then(|map| map.get(anchor))
+                            let Some(ys) = self.out_edges.get(p2).and_then(|map| map.get(anchor))
                             else {
                                 continue;
                             };
@@ -935,8 +926,7 @@ impl LinkPredictor {
                     // z --p1--> x 且 z --p2--> entity ⇒ x --p3--> entity
                     if let Some(anchors) = self.in_edges.get(p2).and_then(|map| map.get(entity)) {
                         for anchor in anchors {
-                            let Some(xs) =
-                                self.out_edges.get(p1).and_then(|map| map.get(anchor))
+                            let Some(xs) = self.out_edges.get(p1).and_then(|map| map.get(anchor))
                             else {
                                 continue;
                             };
@@ -1288,9 +1278,24 @@ mod tests {
         let predictor = mixed_predictor();
         let full = predictor.predict_missing(500);
         for entity in [
-            "张三", "李四", "王五", "赵六", "张三妹", "李四妹", "张父", "李父", "王老师",
+            "张三",
+            "李四",
+            "王五",
+            "赵六",
+            "张三妹",
+            "李四妹",
+            "张父",
+            "李父",
+            "王老师",
         ] {
-            for predicate in [None, Some("师傅"), Some("师祖"), Some("兄妹"), Some("同学"), Some("配偶")] {
+            for predicate in [
+                None,
+                Some("师傅"),
+                Some("师祖"),
+                Some("兄妹"),
+                Some("同学"),
+                Some("配偶"),
+            ] {
                 let anchored: HashSet<Triple> = predictor
                     .predict_for_entity(entity, predicate, 100)
                     .into_iter()
@@ -1299,10 +1304,8 @@ mod tests {
                 let expected: HashSet<Triple> = full
                     .iter()
                     .filter(|prediction| {
-                        (prediction.triple.subject == entity
-                            || prediction.triple.object == entity)
-                            && predicate
-                                .map_or(true, |query| prediction.triple.predicate == query)
+                        (prediction.triple.subject == entity || prediction.triple.object == entity)
+                            && predicate.map_or(true, |query| prediction.triple.predicate == query)
                     })
                     .map(|prediction| prediction.triple.clone())
                     .collect();
