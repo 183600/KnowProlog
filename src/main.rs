@@ -50,6 +50,7 @@ use know_prolog::{
         IdentityEvalBaseline,
     },
     import_journal::{ImportJournal, JournalLoad},
+    fusion_arbitration::{arbitrate, ArbitrationInput},
     knowledge_fusion::{
         Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, NamespaceStatus, TrustLevel,
     },
@@ -908,6 +909,10 @@ enum Commands {
         /// Record an adjudication `PREDICATE=NAMESPACE` (repeatable)
         #[arg(long = "prefer", value_name = "PREDICATE=NAMESPACE")]
         prefer: Vec<String>,
+        /// Also print the answer-time arbitration (independent source
+        /// components, trusted winners, contested slots)
+        #[arg(long)]
+        arbitrate: bool,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,
@@ -3166,9 +3171,12 @@ async fn main() {
         Some(Commands::Fuse {
             apply,
             prefer,
+            arbitrate,
             json,
         }) => {
-            if let Err(e) = run_fuse(&oxigraph_manager, &config, apply, &prefer, json).await {
+            if let Err(e) =
+                run_fuse(&oxigraph_manager, &config, apply, &prefer, arbitrate, json).await
+            {
                 eprintln!("知识融合失败: {}", e);
                 std::process::exit(1);
             }
@@ -4150,6 +4158,7 @@ async fn run_fuse(
     config: &know_prolog::SystemConfig,
     apply: bool,
     prefer: &[String],
+    arbitrate_view: bool,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ledger = manager.load_fusion_ledger().await?;
@@ -4190,8 +4199,19 @@ async fn run_fuse(
         ledger = manager.load_fusion_ledger().await?;
     }
 
+    let arbitration = if arbitrate_view {
+        let policy = know_prolog::slot_ledger::SlotPolicy::with_defaults()
+            .with_functional(functional_predicates(config));
+        Some(arbitrate(
+            &ArbitrationInput::from_ledger(&ledger),
+            &policy,
+        ))
+    } else {
+        None
+    };
+
     if json {
-        let report = serde_json::json!({
+        let mut report = serde_json::json!({
             "namespaces": ledger.namespaces,
             "assertions": ledger.assertions.len(),
             "adjudications": ledger.adjudications,
@@ -4200,10 +4220,16 @@ async fn run_fuse(
             "removed": removed,
             "plan": plan,
         });
+        if let Some(arbitration) = &arbitration {
+            report["arbitration"] = serde_json::to_value(arbitration)?;
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", ledger.render_zh());
         println!("{}", plan.render_zh());
+        if let Some(arbitration) = &arbitration {
+            println!("{}", arbitration.render_zh());
+        }
         if apply {
             println!("已物化：写入 {} 条，回收 {} 条", inserted, removed);
         } else {
