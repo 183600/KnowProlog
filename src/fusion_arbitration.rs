@@ -901,6 +901,13 @@ impl ArbitrationRank {
     fn trust_rank(&self) -> u8 {
         self.trust.map(|trust| trust.rank() + 1).unwrap_or(0)
     }
+
+    /// 序数优先级（越大越靠前），供重排器做确定性比较。
+    pub fn priority_score(&self) -> i64 {
+        let band = RankBand::Unsupported as i64 - self.band as i64;
+        band * 1_000_000 + i64::from(self.trust_rank()) * 10_000
+            + self.independent_sources.min(999) as i64 * 10
+    }
 }
 
 impl PartialOrd for ArbitrationRank {

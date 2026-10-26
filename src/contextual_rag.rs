@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::dense_retrieval::RetrievalHit;
+use crate::fusion_arbitration::{ArbitrationRank, ArbitrationReport, RankBand};
 
 /// 默认证据束上限。
 pub const DEFAULT_MAX_ITEMS: usize = 6;
@@ -384,6 +385,8 @@ pub struct EvidenceItem {
     pub novelty: bool,
     pub channels: Vec<String>,
     pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbitration: Option<ArbitrationRank>,
 }
 
 impl EvidenceItem {
@@ -405,6 +408,7 @@ pub enum BundleKind {
     SlotList,
     Path,
     Comparison,
+    Contested,
     NoMore,
 }
 
@@ -416,6 +420,7 @@ impl BundleKind {
             Self::SlotList => "槽位列表",
             Self::Path => "显式路径",
             Self::Comparison => "对比",
+            Self::Contested => "争议未决",
             Self::NoMore => "无新证据",
         }
     }
@@ -434,6 +439,8 @@ pub struct EvidenceBundle {
     pub multiple_values: Vec<String>,
     pub coverage: f64,
     pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbitration: Option<ArbitrationReport>,
 }
 
 impl EvidenceBundle {
@@ -521,6 +528,37 @@ pub fn assemble(
     type_hints: &HashMap<String, String>,
     max_items: usize,
 ) -> EvidenceAssembly {
+    assemble_internal(frame, dense_hits, holo_hits, type_hints, max_items, None)
+}
+
+/// 在装配阶段启用融合裁决重排。默认路径仍走 [`assemble`]，本函数不改变
+/// 旧回答；只有显式传入 [`ArbitrationReport`] 时才按裁决档位重排。
+pub fn assemble_with_arbitration(
+    frame: &QueryFrame,
+    dense_hits: &[RetrievalHit],
+    holo_hits: &[HoloEvidence],
+    type_hints: &HashMap<String, String>,
+    max_items: usize,
+    arbitration: &ArbitrationReport,
+) -> EvidenceAssembly {
+    assemble_internal(
+        frame,
+        dense_hits,
+        holo_hits,
+        type_hints,
+        max_items,
+        Some(arbitration),
+    )
+}
+
+fn assemble_internal(
+    frame: &QueryFrame,
+    dense_hits: &[RetrievalHit],
+    holo_hits: &[HoloEvidence],
+    type_hints: &HashMap<String, String>,
+    max_items: usize,
+    arbitration: Option<&ArbitrationReport>,
+) -> EvidenceAssembly {
     let mut receipt = AssemblyReceipt {
         dense_candidates: dense_hits.len(),
         holo_candidates: holo_hits.len(),
@@ -599,6 +637,8 @@ pub fn assemble(
         if contextual > 0.001 && !channels.iter().any(|channel| channel == "上下文") {
             channels.push("上下文".to_string());
         }
+        let arbitration_rank = arbitration
+            .map(|report| report.rank_for(&key.subject, &key.predicate, &key.object));
         candidates.push(EvidenceItem {
             id: String::new(),
             subject: key.subject,
@@ -614,6 +654,7 @@ pub fn assemble(
             novelty,
             channels,
             reasons,
+            arbitration: arbitration_rank,
         });
     }
     candidates.sort_by(|left, right| {
@@ -646,6 +687,7 @@ pub fn assemble(
                     multiple_values: Vec::new(),
                     coverage: 0.0,
                     answer,
+                    arbitration: arbitration.cloned(),
                 }),
                 receipt,
             };
@@ -660,6 +702,19 @@ pub fn assemble(
 
     let available = novel.len();
     let mut selected = mmr_select(&novel, max_items.clamp(1, 12), MMR_LAMBDA);
+    if arbitration.is_some() {
+        selected.sort_by(|left, right| {
+            left.arbitration
+                .cmp(&right.arbitration)
+                .then_with(|| {
+                    right
+                        .score
+                        .partial_cmp(&left.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.key().cmp(&right.key()))
+        });
+    }
     let coverage = if available == 0 {
         0.0
     } else {
@@ -669,8 +724,26 @@ pub fn assemble(
         item.id = format!("E{}", index + 1);
     }
     let multiple_values = multiple_values(&selected);
-    let (kind, ordered) = classify(frame, selected);
-    let answer = render_bundle_answer(frame, kind, &ordered, &multiple_values, referenced_dropped, coverage);
+    let (mut kind, ordered) = classify(frame, selected);
+    if let Some(report) = arbitration {
+        if ordered.iter().any(|item| {
+            report
+                .rank_for(&item.subject, &item.predicate, &item.object)
+                .band
+                == RankBand::Contested
+        }) {
+            kind = BundleKind::Contested;
+        }
+    }
+    let answer = render_bundle_answer(
+        frame,
+        kind,
+        &ordered,
+        &multiple_values,
+        referenced_dropped,
+        coverage,
+        arbitration,
+    );
     receipt.selected = ordered.len();
     if frame.notes.is_empty() {
         receipt.notes.push("已按对话焦点与槽位约束装配证据。".to_string());
@@ -692,6 +765,7 @@ pub fn assemble(
             multiple_values,
             coverage,
             answer,
+            arbitration: arbitration.cloned(),
         }),
         receipt,
     }
@@ -821,7 +895,13 @@ fn mmr_value(
     max_score: f64,
     lambda: f64,
 ) -> f64 {
-    let relevance = candidate.score / max_score;
+    let relevance = match candidate.arbitration {
+        Some(rank) => {
+            rank.priority_score() as f64 * 1000.0
+                + (candidate.score / max_score).clamp(0.0, 1.0)
+        }
+        None => candidate.score / max_score,
+    };
     let redundancy = selected
         .iter()
         .map(|chosen| evidence_similarity(candidate, chosen))
@@ -922,6 +1002,7 @@ fn render_bundle_answer(
     multiple_values: &[String],
     referenced_dropped: usize,
     coverage: f64,
+    arbitration: Option<&ArbitrationReport>,
 ) -> String {
     let anchor = frame.anchors.first().map(String::as_str);
     let secondary = frame.anchors.get(1).map(String::as_str);
@@ -971,6 +1052,12 @@ fn render_bundle_answer(
                 secondary.unwrap_or("")
             ));
         }
+        BundleKind::Contested => {
+            output.push_str(&format!(
+                "关于「{}」的说法可信度相当，暂不合并：\n",
+                anchor.unwrap_or("")
+            ));
+        }
         BundleKind::NoMore => {
             return format!(
                 "除上文已引用的 {} 条证据外，没有新的已核实证据。",
@@ -994,6 +1081,19 @@ fn render_bundle_answer(
     for warning in multiple_values {
         output.push_str(&format!("注意：{}。\n", warning));
     }
+    if let Some(report) = arbitration {
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for item in items {
+            if !seen.insert((item.subject.clone(), item.predicate.clone())) {
+                continue;
+            }
+            if let Some(decision) = report.slot(&item.subject, &item.predicate) {
+                if decision.mode != crate::fusion_arbitration::DecisionMode::NoEvidence {
+                    output.push_str(&format!("融合裁决：{}\n", decision.wording_zh()));
+                }
+            }
+        }
+    }
     if referenced_dropped > 0 {
         output.push_str(&format!(
             "（已跳过上文引用过的 {} 条证据。）\n",
@@ -1012,6 +1112,12 @@ fn render_bundle_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fusion_arbitration::{
+        arbitrate, ArbitrationAssertion, ArbitrationInput, ArbitrationReport, RankBand,
+        SourceCatalog,
+    };
+    use crate::knowledge_fusion::{NamespaceKind, NamespaceRecord, ObjectKind, TrustLevel};
+    use crate::slot_ledger::SlotPolicy;
 
     fn hit(
         subject: &str,
@@ -1331,5 +1437,112 @@ mod tests {
             first.bundle.as_ref().map(|bundle| bundle.answer.clone()),
             second.bundle.as_ref().map(|bundle| bundle.answer.clone())
         );
+    }
+
+    fn arbitration_report(namespaces: &[(&str, TrustLevel)], facts: &[(&str, &str, &str)]) -> ArbitrationReport {
+        let catalog = SourceCatalog::from_records(
+            &namespaces
+                .iter()
+                .map(|(id, trust)| {
+                    NamespaceRecord::new(id, id, NamespaceKind::Import, *trust)
+                })
+                .collect::<Vec<_>>(),
+        );
+        let assertions = facts
+            .iter()
+            .map(|(namespace, object, predicate)| {
+                ArbitrationAssertion::new(namespace, "李白", predicate, object, ObjectKind::Literal)
+            })
+            .collect();
+        arbitrate(
+            &ArbitrationInput {
+                catalog,
+                assertions,
+                ..ArbitrationInput::default()
+            },
+            &SlotPolicy::with_defaults(),
+        )
+    }
+
+    #[test]
+    fn arbitration_reranks_trusted_winner_above_lexical_dissent() {
+        let frame = frame("李白的年龄是多少", &["李白"], Some("年龄"));
+        let report = arbitration_report(
+            &[
+                ("kb", TrustLevel::Curated),
+                ("friend", TrustLevel::Imported),
+            ],
+            &[("kb", "61岁", "年龄"), ("friend", "62岁", "年龄")],
+        );
+        let assembly = assemble_with_arbitration(
+            &frame,
+            &[
+                hit("李白", "年龄", "62岁", 0.9, 0.8, 0.5, 1.0),
+                hit("李白", "年龄", "61岁", 0.5, 0.4, 0.3, 1.0),
+            ],
+            &[],
+            &HashMap::new(),
+            DEFAULT_MAX_ITEMS,
+            &report,
+        );
+        let bundle = assembly.bundle.expect("应有证据束");
+        assert_eq!(bundle.items[0].object, "61岁");
+        assert_eq!(
+            bundle.items[0].arbitration.map(|rank| rank.band),
+            Some(RankBand::Winner)
+        );
+        assert!(bundle.answer.contains("融合裁决"));
+        assert!(bundle.answer.contains("综合信任层级"));
+    }
+
+    #[test]
+    fn arbitration_exposes_contested_slots_instead_of_picking_one() {
+        let frame = frame("李白的年龄是多少", &["李白"], Some("年龄"));
+        let report = arbitration_report(
+            &[
+                ("a", TrustLevel::Imported),
+                ("b", TrustLevel::Imported),
+            ],
+            &[("a", "61岁", "年龄"), ("b", "62岁", "年龄")],
+        );
+        let assembly = assemble_with_arbitration(
+            &frame,
+            &[
+                hit("李白", "年龄", "61岁", 0.8, 0.6, 0.4, 1.0),
+                hit("李白", "年龄", "62岁", 0.7, 0.5, 0.3, 1.0),
+            ],
+            &[],
+            &HashMap::new(),
+            DEFAULT_MAX_ITEMS,
+            &report,
+        );
+        let bundle = assembly.bundle.expect("争议也应展示");
+        assert_eq!(bundle.kind, BundleKind::Contested);
+        assert_eq!(bundle.items.len(), 2);
+        assert!(bundle.answer.contains("暂不合并"));
+        assert_eq!(
+            bundle.items[0].arbitration.map(|rank| rank.band),
+            Some(RankBand::Contested)
+        );
+        assert_eq!(
+            bundle.items[1].arbitration.map(|rank| rank.band),
+            Some(RankBand::Contested)
+        );
+    }
+
+    #[test]
+    fn empty_arbitration_keeps_the_legacy_answer() {
+        let frame = frame("李白的朝代是什么", &["李白"], Some("朝代"));
+        let hits = vec![hit("李白", "朝代", "唐", 0.8, 0.6, 0.4, 1.0)];
+        let plain = assemble(&frame, &hits, &[], &HashMap::new(), DEFAULT_MAX_ITEMS);
+        let arbitrated = assemble_with_arbitration(
+            &frame,
+            &hits,
+            &[],
+            &HashMap::new(),
+            DEFAULT_MAX_ITEMS,
+            &ArbitrationReport::default(),
+        );
+        assert_eq!(plain.answer(), arbitrated.answer());
     }
 }
