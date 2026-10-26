@@ -23,7 +23,9 @@ use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
 };
 use crate::contextual_reference::{SenseCard, SenseSource};
-use crate::contextual_segmentation::{ContextualSegmenter, SegmentOptions};
+use crate::contextual_segmentation::{
+    ContextualSegmenter, ReadingKind, ReadingMemory, SegmentOptions,
+};
 use crate::conversational_graph::{
     ConversationalGraph, GraphCommand, GraphFact, GraphReply, MatchOptions, PatternError,
     PatternOutcome,
@@ -1242,6 +1244,8 @@ pub struct SymbolicReasoner {
     retrieval: parking_lot::Mutex<DenseRetriever>,
     // 对话级证据装配器的会话记忆：上次回答引用过的证据（追问去重、防复述）
     contextual_last: parking_lot::Mutex<Option<(String, Vec<EvidenceKey>)>>,
+    // 语境分词读法记忆：同一词面在不同焦点/类型语境下的确认与纠正（会话态）
+    contextual_memory: ReadingMemory,
     // 实体属性三元组（观察到的），供归结引擎编码事实
     attributes: HashSet<(String, String, String)>,
     // 属性查询索引：规范槽位 `(实体, 属性)` → 取值列表（随知识重建）
@@ -1444,6 +1448,7 @@ impl Clone for SymbolicReasoner {
             generator: self.generator.clone(),
             retrieval: parking_lot::Mutex::new(self.retrieval.lock().clone()),
             contextual_last: parking_lot::Mutex::new(self.contextual_last.lock().clone()),
+            contextual_memory: self.contextual_memory.clone(),
             attributes: self.attributes.clone(),
             attribute_index: self.attribute_index.clone(),
             associations: self.associations.clone(),
@@ -1676,6 +1681,7 @@ impl SymbolicReasoner {
             generator,
             retrieval: parking_lot::Mutex::new(DenseRetriever::new(8, 0.85, 12)),
             contextual_last: parking_lot::Mutex::new(None),
+            contextual_memory: ReadingMemory::new(512),
             attributes: HashSet::new(),
             attribute_index: HashMap::new(),
             associations,
@@ -1744,6 +1750,7 @@ impl SymbolicReasoner {
         let engine_fault = self.engine_fault.clone();
         let lexical_memory = self.lexical_memory.clone();
         let mention_lexicon = self.mention_lexicon.clone();
+        let contextual_memory = self.contextual_memory.clone();
         let schema_view = self.schema_view.clone();
         let mut fresh =
             Self::with_perf_ledger(self.config.clone(), synonyms, Arc::clone(&self.perf));
@@ -1754,6 +1761,7 @@ impl SymbolicReasoner {
         fresh.mention_lexicon = mention_lexicon;
         fresh.observe_facts(facts);
         fresh.lexical_memory = lexical_memory;
+        fresh.contextual_memory = contextual_memory;
         // 快照来自自身：胶囊公理摘要必然通过（除非内存中的快照被外部改写）。
         // 万一被拒，也保留新图谱与其余会话态，不让重建失败丢掉知识。
         let _ = fresh.restore_dialogue_snapshot(&snapshot);
@@ -1775,6 +1783,7 @@ impl SymbolicReasoner {
     fn reset_session_state(&mut self) {
         self.context.clear();
         *self.contextual_last.lock() = None;
+        self.contextual_memory.clear();
         // 假设世界是会话态：分叉/重置时整体丢弃，不带走任何临时前提。
         self.discard_assumption_world();
         let lessons_were_taught = !self.lessons_parsed.is_empty();
@@ -13147,34 +13156,9 @@ impl SymbolicReasoner {
         if text.is_empty() {
             return "请输入要分词的文本，例如：语境分词：张三的师傅是谁".to_string();
         }
+        let (focus_entities, expected_types) = self.contextual_focus();
+        let options = self.contextual_segment_options(&focus_entities, &expected_types);
         let mut segmenter = self.build_contextual_segmenter();
-        let focus_entities: Vec<String> = {
-            let focused = self.context.focus_entities();
-            if focused.is_empty() {
-                self.entities_mentioned(text).into_iter().take(3).collect()
-            } else {
-                focused.to_vec()
-            }
-        };
-        let mut expected_types: Vec<String> = Vec::new();
-        for entity in &focus_entities {
-            if let Some(etype) = self
-                .context
-                .focus_type(entity)
-                .or_else(|| self.generator.entity_type_of(entity))
-                .or_else(|| self.linker.entity_type(entity))
-            {
-                if !expected_types.iter().any(|known| known == etype) {
-                    expected_types.push(etype.to_string());
-                }
-            }
-        }
-        let options = SegmentOptions {
-            context_terms: focus_entities.clone(),
-            expected_types: expected_types.clone(),
-            predicate: self.context.last_predicate().map(str::to_string),
-            ..SegmentOptions::default()
-        };
         let result = segmenter.segment(text, &options);
         let mut output = format!(
             "语境分词（符号子词嵌入 + 字符格 k-best + 焦点语境；词表 {} 个词面 / 类型 {} / 谓词 {} / 三元组 {}；纯符号、零训练）\n",
@@ -13200,9 +13184,130 @@ impl SymbolicReasoner {
         output
     }
 
+    /// 确认当前语境下某个词面的读法；写入会话级读法记忆。
+    pub fn confirm_contextual_reading(&mut self, surface: &str, canonical: &str) -> String {
+        let surface = surface.trim();
+        let canonical = canonical.trim();
+        if surface.is_empty() || canonical.is_empty() {
+            return "请提供「词面=规范读法」，例如：语境分词确认：苹果=苹果公司".to_string();
+        }
+        let (focus, expected) = self.contextual_focus();
+        let options = self.contextual_segment_options(&focus, &expected);
+        let mut segmenter = self.build_contextual_segmenter();
+        let result = segmenter.segment(surface, &options);
+        let kind = segmenter
+            .reading_kind(surface, canonical)
+            .unwrap_or(ReadingKind::Entity);
+        self.contextual_memory.confirm(
+            surface,
+            canonical,
+            kind,
+            &result.context.fingerprint,
+        );
+        format!(
+            "读法记忆已确认：「{}」→「{}」（{}）；语境 {}。",
+            surface,
+            canonical,
+            kind.label(),
+            if result.context.fingerprint.is_empty() {
+                "∅".to_string()
+            } else {
+                result.context.fingerprint
+            }
+        )
+    }
+
+    /// 纠正当前语境下某个词面的读法：否定旧读法，采纳新读法。
+    pub fn correct_contextual_reading(
+        &mut self,
+        surface: &str,
+        rejected: &str,
+        accepted: &str,
+    ) -> String {
+        let surface = surface.trim();
+        let rejected = rejected.trim();
+        let accepted = accepted.trim();
+        if surface.is_empty() || rejected.is_empty() || accepted.is_empty() {
+            return "请提供「词面=旧读法>新读法」，例如：语境分词纠正：苹果=苹果>苹果公司"
+                .to_string();
+        }
+        let (focus, expected) = self.contextual_focus();
+        let options = self.contextual_segment_options(&focus, &expected);
+        let mut segmenter = self.build_contextual_segmenter();
+        let result = segmenter.segment(surface, &options);
+        let rejected_kind = segmenter
+            .reading_kind(surface, rejected)
+            .unwrap_or(ReadingKind::Entity);
+        let accepted_kind = segmenter
+            .reading_kind(surface, accepted)
+            .unwrap_or(rejected_kind);
+        self.contextual_memory.correct(
+            surface,
+            rejected,
+            rejected_kind,
+            accepted,
+            accepted_kind,
+            &result.context.fingerprint,
+        );
+        format!(
+            "读法记忆已纠正：「{}」：{} → {}；语境 {}。",
+            surface,
+            rejected,
+            accepted,
+            if result.context.fingerprint.is_empty() {
+                "∅".to_string()
+            } else {
+                result.context.fingerprint
+            }
+        )
+    }
+
+    pub fn contextual_reading_memory_report(&self) -> String {
+        self.contextual_memory.render_report()
+    }
+
+    pub fn clear_contextual_reading_memory(&mut self) -> String {
+        self.contextual_memory.clear();
+        "读法记忆已清空。".to_string()
+    }
+
+    fn contextual_focus(&self) -> (Vec<String>, Vec<String>) {
+        // 焦点只取显式对话焦点栈：若拿输入文本中的实体回填，歧义词面会被
+        // 自身同义词反向锚定，读法记忆也就失去「由语境裁决」的意义。
+        let focus_entities = self.context.focus_entities().to_vec();
+        let mut expected_types: Vec<String> = Vec::new();
+        for entity in &focus_entities {
+            if let Some(etype) = self
+                .context
+                .focus_type(entity)
+                .or_else(|| self.generator.entity_type_of(entity))
+                .or_else(|| self.linker.entity_type(entity))
+            {
+                if !expected_types.iter().any(|known| known == etype) {
+                    expected_types.push(etype.to_string());
+                }
+            }
+        }
+        (focus_entities, expected_types)
+    }
+
+    fn contextual_segment_options(
+        &self,
+        focus: &[String],
+        expected: &[String],
+    ) -> SegmentOptions {
+        SegmentOptions {
+            context_terms: focus.to_vec(),
+            expected_types: expected.to_vec(),
+            predicate: self.context.last_predicate().map(str::to_string),
+            ..SegmentOptions::default()
+        }
+    }
+
     fn build_contextual_segmenter(&self) -> ContextualSegmenter {
         let mut segmenter = ContextualSegmenter::new();
         segmenter.set_schema(self.schema_view.clone());
+        *segmenter.memory_mut() = self.contextual_memory.clone();
         let mut profiles: Vec<_> = self.aligner.profiles().iter().collect();
         profiles.sort_by(|left, right| left.term.cmp(&right.term));
         for profile in profiles {
@@ -25323,6 +25428,40 @@ types = [
         assert!(report.contains("师傅"), "{}", report);
         assert!(report.contains("纯符号、零训练"), "{}", report);
         assert!(report.contains("读法："), "{}", report);
+    }
+
+    #[test]
+    fn contextual_reading_memory_flows_into_report_and_resets() {
+        let mut synonyms = HashMap::new();
+        synonyms.insert("苹果".to_string(), "苹果公司".to_string());
+        let mut reasoner = SymbolicReasoner::new(test_config(), synonyms);
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "苹果".into(),
+                entity_type: "水果".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "苹果公司".into(),
+                entity_type: "公司".into(),
+                properties: HashMap::new(),
+            },
+        ]);
+        let confirmed = reasoner.confirm_contextual_reading("苹果", "苹果公司");
+        assert!(confirmed.contains("已确认"), "{}", confirmed);
+        let report = reasoner.contextual_segment_report("苹果");
+        assert!(report.contains("苹果公司"), "{}", report);
+        let memory = reasoner.contextual_reading_memory_report();
+        assert!(memory.contains("「苹果」@∅"), "{}", memory);
+        assert!(!memory.contains('\u{1f}'), "{}", memory);
+        let corrected = reasoner.correct_contextual_reading("苹果", "苹果公司", "苹果");
+        assert!(corrected.contains("已纠正"), "{}", corrected);
+        assert!(reasoner
+            .clear_contextual_reading_memory()
+            .contains("已清空"));
+        assert!(reasoner
+            .contextual_reading_memory_report()
+            .starts_with("读法记忆：0 个语境桶"));
     }
 
     #[test]

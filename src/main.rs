@@ -11484,6 +11484,85 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 语境分词确认/纠正：把用户裁决写进会话级读法记忆（键 = 当前焦点语境指纹）
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &[
+                "语境分词确认：",
+                "语境分词确认:",
+                "读法确认：",
+                "读法确认:",
+            ],
+        ) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            match spec.trim().split_once('=') {
+                Some((surface, canonical))
+                    if !surface.trim().is_empty() && !canonical.trim().is_empty() =>
+                {
+                    println!(
+                        "{}",
+                        symbolic_reasoner
+                            .confirm_contextual_reading(surface.trim(), canonical.trim())
+                    );
+                }
+                _ => println!("请提供「词面=规范读法」，例如：语境分词确认：苹果=苹果公司"),
+            }
+            println!();
+            continue;
+        }
+
+        if let Some(spec) = strip_any_prefix(
+            input,
+            &[
+                "语境分词纠正：",
+                "语境分词纠正:",
+                "读法纠正：",
+                "读法纠正:",
+            ],
+        ) {
+            refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+            let parsed = spec.trim().split_once('=').and_then(|(surface, rest)| {
+                rest.split_once('>')
+                    .map(|(rejected, accepted)| (surface, rejected, accepted))
+            });
+            match parsed {
+                Some((surface, rejected, accepted))
+                    if !surface.trim().is_empty()
+                        && !rejected.trim().is_empty()
+                        && !accepted.trim().is_empty() =>
+                {
+                    println!(
+                        "{}",
+                        symbolic_reasoner.correct_contextual_reading(
+                            surface.trim(),
+                            rejected.trim(),
+                            accepted.trim()
+                        )
+                    );
+                }
+                _ => println!(
+                    "请提供「词面=旧读法>新读法」，例如：语境分词纠正：苹果=苹果>苹果公司"
+                ),
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(
+            input,
+            "语境记忆" | "读法记忆" | "语境分词记忆" | "读法记忆报告"
+        ) {
+            println!("{}", symbolic_reasoner.contextual_reading_memory_report());
+            println!();
+            continue;
+        }
+
+        if matches!(input, "清空语境记忆" | "清空读法记忆" | "忘记读法记忆") {
+            println!("{}", symbolic_reasoner.clear_contextual_reading_memory());
+            println!();
+            continue;
+        }
+
         // 因果分词：知识/因果图引导的 token 格 k-best DP + token 级因果归因（纯符号 attention）
         if let Some(target) = strip_any_prefix(
             input,
@@ -15049,6 +15128,13 @@ fn is_command_like(input: &str) -> bool {
         "因果分词",
         "语境分词",
         "读法分词",
+        "读法确认",
+        "读法纠正",
+        "读法记忆",
+        "语境记忆",
+        "清空读法记忆",
+        "清空语境记忆",
+        "忘记读法记忆",
         "分词：",
         "分词:",
         "概率推理",

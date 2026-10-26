@@ -467,16 +467,19 @@ impl ReadingMemory {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "读法记忆：{} 个词面 / {} 个语境桶",
+            "读法记忆：{} 个语境桶 / {} 条读法",
             self.entries.len(),
             self.entries.values().map(BTreeMap::len).sum::<usize>()
         );
         for (bucket, readings) in &self.entries {
+            let (surface, context) = bucket.split_once('\u{1f}').unwrap_or((bucket.as_str(), ""));
+            let context = if context.is_empty() { "∅" } else { context };
             for preference in readings.values() {
                 let _ = writeln!(
                     out,
-                    "  {} {}「{}」确认={} 纠正={} 可靠度={:.3}",
-                    bucket,
+                    "  「{}」@{} {}「{}」确认={} 纠正={} 可靠度={:.3}",
+                    surface,
+                    context,
                     preference.kind.label(),
                     preference.canonical,
                     preference.confirmations,
@@ -798,7 +801,7 @@ impl ContextualSegmenter {
     pub fn observe_type_alias(&mut self, alias: &str, canonical: &str) {
         let alias = alias.trim();
         let canonical = canonical.trim();
-        if alias.is_empty() || canonical.is_empty() {
+        if alias.is_empty() || canonical.is_empty() || alias == canonical {
             return;
         }
         self.observe_type(canonical);
@@ -1983,6 +1986,9 @@ mod tests {
         let json = memory.to_json().expect("记忆应可序列化");
         let restored = ReadingMemory::from_json(&json).expect("记忆应可反序列化");
         assert_eq!(restored, memory);
+        let report = restored.render_report();
+        assert!(!report.contains('\u{1f}'), "{}", report);
+        assert!(report.contains("「苹果」@ctx-1"), "{}", report);
         assert_eq!(
             restored
                 .preferred("苹果", "ctx-1")
