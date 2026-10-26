@@ -11463,6 +11463,27 @@ async fn run_interactive_mode(
             continue;
         }
 
+        // 语境分词：符号子词嵌入 + 字符格 k-best + 焦点语境；只读审计，不影响回答主路径
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "语境分词：",
+                "语境分词:",
+                "读法分词：",
+                "读法分词:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要分词的文本，例如：语境分词：张三的师傅是谁");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.contextual_segment_report(target));
+            }
+            println!();
+            continue;
+        }
+
         // 因果分词：知识/因果图引导的 token 格 k-best DP + token 级因果归因（纯符号 attention）
         if let Some(target) = strip_any_prefix(
             input,
@@ -15026,6 +15047,8 @@ fn is_command_like(input: &str) -> bool {
         "梯度归因",
         "可微推理",
         "因果分词",
+        "语境分词",
+        "读法分词",
         "分词：",
         "分词:",
         "概率推理",

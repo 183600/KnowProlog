@@ -702,6 +702,7 @@ pub struct ContextualSegmenter {
     entities: BTreeMap<String, EntityProfile>,
     surfaces: BTreeMap<String, Vec<SurfaceReading>>,
     ngram_documents: BTreeMap<String, NgramDocument>,
+    triples: HashSet<(String, String, String)>,
     indexed_surfaces: usize,
     dirty: bool,
     schema: Option<SchemaView>,
@@ -720,6 +721,7 @@ impl ContextualSegmenter {
             entities: BTreeMap::new(),
             surfaces: BTreeMap::new(),
             ngram_documents: BTreeMap::new(),
+            triples: HashSet::new(),
             indexed_surfaces: 0,
             dirty: true,
             schema: None,
@@ -759,6 +761,28 @@ impl ContextualSegmenter {
         self.surfaces.len()
     }
 
+    pub fn type_count(&self) -> usize {
+        self.unique_canonical_count(ReadingKind::Type)
+    }
+
+    pub fn predicate_count(&self) -> usize {
+        self.unique_canonical_count(ReadingKind::Predicate)
+    }
+
+    pub fn triple_count(&self) -> usize {
+        self.triples.len()
+    }
+
+    fn unique_canonical_count(&self, kind: ReadingKind) -> usize {
+        self.surfaces
+            .values()
+            .flat_map(|readings| readings.iter())
+            .filter(|reading| reading.kind == kind)
+            .map(|reading| reading.canonical.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
     pub fn ngram_count(&self) -> usize {
         self.ngram_documents.len()
     }
@@ -769,6 +793,16 @@ impl ContextualSegmenter {
             return;
         }
         self.add_surface_reading(etype, etype, ReadingKind::Type);
+    }
+
+    pub fn observe_type_alias(&mut self, alias: &str, canonical: &str) {
+        let alias = alias.trim();
+        let canonical = canonical.trim();
+        if alias.is_empty() || canonical.is_empty() {
+            return;
+        }
+        self.observe_type(canonical);
+        self.add_surface_reading(alias, canonical, ReadingKind::Type);
     }
 
     pub fn observe_predicate(&mut self, predicate: &str) {
@@ -821,6 +855,13 @@ impl ContextualSegmenter {
         let predicate = predicate.trim();
         let object = object.trim();
         if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            return;
+        }
+        if !self.triples.insert((
+            subject.to_string(),
+            predicate.to_string(),
+            object.to_string(),
+        )) {
             return;
         }
         self.observe_entity(subject, None);
@@ -1909,6 +1950,22 @@ mod tests {
             "模式互斥应让语境与类型证据参与比较：{:?}",
             result.tokens
         );
+    }
+
+    #[test]
+    fn type_aliases_and_triples_are_deduplicated() {
+        let mut segmenter = sample_segmenter();
+        let types = segmenter.type_count();
+        let triples = segmenter.triple_count();
+        segmenter.observe_type_alias("企业", "公司");
+        assert_eq!(segmenter.type_count(), types);
+        assert_eq!(
+            segmenter.reading_kind("企业", "公司"),
+            Some(ReadingKind::Type)
+        );
+        segmenter.observe_triple("张三", "师傅", "李四");
+        segmenter.observe_triple("张三", "师傅", "李四");
+        assert_eq!(segmenter.triple_count(), triples + 1);
     }
 
     #[test]

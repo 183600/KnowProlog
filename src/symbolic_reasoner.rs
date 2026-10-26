@@ -23,6 +23,7 @@ use crate::contextual_rag::{
     self, EvidenceAssembly, EvidenceKey, FrameInput, HoloEvidence, QueryFrame,
 };
 use crate::contextual_reference::{SenseCard, SenseSource};
+use crate::contextual_segmentation::{ContextualSegmenter, SegmentOptions};
 use crate::conversational_graph::{
     ConversationalGraph, GraphCommand, GraphFact, GraphReply, MatchOptions, PatternError,
     PatternOutcome,
@@ -13139,6 +13140,117 @@ impl SymbolicReasoner {
         tokenizer
     }
 
+    /// 语境分词：把词表、类型、谓词、三元组与当前焦点投影到同一符号坐标系，
+    /// 再用字符格 k-best 解码；只读，不写图谱，不改写回答主路径。
+    pub fn contextual_segment_report(&self, input_raw: &str) -> String {
+        let text = input_raw.trim();
+        if text.is_empty() {
+            return "请输入要分词的文本，例如：语境分词：张三的师傅是谁".to_string();
+        }
+        let mut segmenter = self.build_contextual_segmenter();
+        let focus_entities: Vec<String> = {
+            let focused = self.context.focus_entities();
+            if focused.is_empty() {
+                self.entities_mentioned(text).into_iter().take(3).collect()
+            } else {
+                focused.to_vec()
+            }
+        };
+        let mut expected_types: Vec<String> = Vec::new();
+        for entity in &focus_entities {
+            if let Some(etype) = self
+                .context
+                .focus_type(entity)
+                .or_else(|| self.generator.entity_type_of(entity))
+                .or_else(|| self.linker.entity_type(entity))
+            {
+                if !expected_types.iter().any(|known| known == etype) {
+                    expected_types.push(etype.to_string());
+                }
+            }
+        }
+        let options = SegmentOptions {
+            context_terms: focus_entities.clone(),
+            expected_types: expected_types.clone(),
+            predicate: self.context.last_predicate().map(str::to_string),
+            ..SegmentOptions::default()
+        };
+        let result = segmenter.segment(text, &options);
+        let mut output = format!(
+            "语境分词（符号子词嵌入 + 字符格 k-best + 焦点语境；词表 {} 个词面 / 类型 {} / 谓词 {} / 三元组 {}；纯符号、零训练）\n",
+            segmenter.surface_count(),
+            segmenter.type_count(),
+            segmenter.predicate_count(),
+            segmenter.triple_count()
+        );
+        if focus_entities.is_empty() {
+            output.push_str("焦点：∅\n");
+        } else {
+            output.push_str(&format!(
+                "焦点：{}；期望类型：{}\n",
+                focus_entities.join("、"),
+                if expected_types.is_empty() {
+                    "∅".to_string()
+                } else {
+                    expected_types.join("、")
+                }
+            ));
+        }
+        output.push_str(&result.render_report());
+        output
+    }
+
+    fn build_contextual_segmenter(&self) -> ContextualSegmenter {
+        let mut segmenter = ContextualSegmenter::new();
+        segmenter.set_schema(self.schema_view.clone());
+        let mut profiles: Vec<_> = self.aligner.profiles().iter().collect();
+        profiles.sort_by(|left, right| left.term.cmp(&right.term));
+        for profile in profiles {
+            let canonical = self.aligner.canonical_form(&profile.term);
+            let canonical = if canonical.is_empty() {
+                profile.term.as_str()
+            } else {
+                canonical.as_str()
+            };
+            match profile.kind {
+                TermKind::Entity => {
+                    let fallback_type = profile.types.iter().min().cloned();
+                    let etype = self
+                        .generator
+                        .entity_type_of(canonical)
+                        .or_else(|| self.linker.entity_type(canonical))
+                        .or(fallback_type.as_deref());
+                    segmenter.observe_entity(canonical, etype);
+                }
+                TermKind::Type => segmenter.observe_type(canonical),
+                TermKind::Relation | TermKind::Attribute => {
+                    segmenter.observe_predicate(canonical);
+                }
+            }
+        }
+        let mut synonyms: Vec<_> = self.aligner.synonyms().iter().collect();
+        synonyms.sort_by(|left, right| left.0.cmp(right.0));
+        for (alias, canonical) in synonyms {
+            match self.aligner.kind_of(canonical) {
+                Some(TermKind::Entity) => segmenter.observe_alias(alias, canonical),
+                Some(TermKind::Type) => segmenter.observe_type_alias(alias, canonical),
+                Some(TermKind::Relation | TermKind::Attribute) => {
+                    segmenter.observe_predicate_alias(alias, canonical);
+                }
+                None => {}
+            }
+        }
+        let mut surfaces: Vec<_> = self.generator.predicate_surfaces().iter().collect();
+        surfaces.sort_by(|left, right| left.0.cmp(right.0));
+        for (surface, canonical) in surfaces {
+            segmenter.observe_predicate_alias(surface, canonical);
+        }
+        for triple in self.predictor.triples() {
+            segmenter.observe_triple(&triple.subject, &triple.predicate, &triple.object);
+        }
+        segmenter
+    }
+
     /// 因果分词报告：知识/因果图引导的 token 格 k-best DP 分词 + token 级因果归因
     /// （纯符号 attention：结论的概率质量沿因果链回溯摊到输入 token 上）
     pub fn causal_tokenize_report(&self, input_raw: &str) -> String {
@@ -25179,6 +25291,38 @@ types = [
         let receipt = reasoner.learn_entity_alignment("未名科技公司", "不存在公司");
         assert!(receipt.contains("对齐未生效"), "{}", receipt);
         assert!(reasoner.linker().alignment().is_empty());
+    }
+
+    #[test]
+    fn contextual_segment_report_projects_focus_types_and_graph() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "张三".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师傅".into(),
+                to: "李四".into(),
+            },
+        ]);
+        reasoner
+            .context
+            .record_entities_typed(&[("张三".into(), Some("人物".into()))]);
+        reasoner.context.record_predicate("师傅");
+        let report = reasoner.contextual_segment_report("张三的师傅是谁");
+        assert!(report.contains("焦点：张三"), "{}", report);
+        assert!(report.contains("期望类型：人物"), "{}", report);
+        assert!(report.contains("师傅"), "{}", report);
+        assert!(report.contains("纯符号、零训练"), "{}", report);
+        assert!(report.contains("读法："), "{}", report);
     }
 
     #[test]
