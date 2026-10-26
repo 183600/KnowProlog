@@ -7926,6 +7926,8 @@ impl SymbolicReasoner {
         Some(plan.render())
     }
 
+    /// 事实介绍 + 推测段。推测是未确认假设，不进入 [`AnswerPlan`]；
+    /// 后续风格重述只覆盖已审计事实，避免把假设当成计划内命题。
     pub fn generate_about_with_prediction(&mut self, entity_raw: &str) -> Option<String> {
         let facts = self.generate_about(entity_raw);
         let speculation = self.predictive_elaboration(entity_raw);
