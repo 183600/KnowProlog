@@ -1857,6 +1857,52 @@ mod tests {
     }
 
     #[test]
+    fn provenance_ledger_bridge_replaces_namespace_origins() {
+        let mut ledger = FusionLedger::new();
+        ledger.upsert_namespace(record("batch-a", TrustLevel::Imported));
+        ledger.upsert_namespace(record("batch-b", TrustLevel::Imported));
+        ledger.record_assertion(ScopedAssertion::new(
+            "batch-a",
+            "小明",
+            "年龄",
+            "18",
+            ObjectKind::Literal,
+            "a.csv",
+        ));
+        ledger.record_assertion(ScopedAssertion::new(
+            "batch-b",
+            "小明",
+            "年龄",
+            "18",
+            ObjectKind::Literal,
+            "b.csv",
+        ));
+
+        let without = arbitrate(&ArbitrationInput::from_ledger(&ledger), &policy());
+        assert_eq!(
+            without.slot("小明", "年龄").expect("应有槽").mode,
+            DecisionMode::Consensus
+        );
+
+        let origin = SourceId::new(SourceKind::Import, "people.csv", "小明,18");
+        let fact = FactRef::new("小明", "年龄", "18");
+        let mut provenance = ProvenanceLedger::new();
+        provenance.record(fact.clone(), origin.clone());
+        provenance.record(fact, origin.clone());
+        let report = arbitrate(
+            &ArbitrationInput::from_ledger(&ledger).with_provenance(&provenance),
+            &policy(),
+        );
+        let slot = report.slot("小明", "年龄").expect("应有槽");
+        assert_eq!(slot.mode, DecisionMode::SingleSource);
+        assert_eq!(slot.winners[0].independent_sources, 1);
+        assert!(slot.winners[0]
+            .sources
+            .iter()
+            .any(|source| source == &origin.render()));
+    }
+
+    #[test]
     fn provenance_origins_collapse_duplicate_imports() {
         let origin = SourceId::new(SourceKind::Import, "people.csv", "小明,18");
         let input = input(

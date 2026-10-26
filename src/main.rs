@@ -4202,8 +4202,9 @@ async fn run_fuse(
     let arbitration = if arbitrate_view {
         let policy = know_prolog::slot_ledger::SlotPolicy::with_defaults()
             .with_functional(functional_predicates(config));
+        let provenance = provenance_seed_for_store(Some(&config.system.oxigraph_store_path), None);
         Some(arbitrate(
-            &ArbitrationInput::from_ledger(&ledger),
+            &ArbitrationInput::from_ledger(&ledger).with_provenance(&provenance),
             &policy,
         ))
     } else {
