@@ -50,6 +50,7 @@ use know_prolog::{
         compare_baseline as compare_identity_baseline, evaluate_seed as evaluate_identity,
         IdentityEvalBaseline,
     },
+    import_frames::{FrameLoad as ImportFrameLoad, ImportFrameLedger},
     import_journal::{ImportJournal, JournalLoad},
     fusion_arbitration::{arbitrate, ArbitrationInput},
     knowledge_fusion::{
@@ -7839,6 +7840,25 @@ async fn run_interactive_mode(
         }
         JournalLoad::Missing => ImportJournal::new(),
     };
+    // 导入可逆帧：从成功落库的陈述句学习「怎么说/怎么问」，随导入日志一起撤销。
+    let import_frames_path = format!("{}/import_frames.json", store_path);
+    let mut import_frames = match ImportFrameLedger::load(&import_frames_path) {
+        ImportFrameLoad::Loaded(ledger) => {
+            if !ledger.is_empty() {
+                println!(
+                    "已恢复导入帧：{} 条（「导入帧」查看）。",
+                    ledger.len()
+                );
+                symbolic_reasoner.attach_import_frames(ledger.clone());
+            }
+            ledger
+        }
+        ImportFrameLoad::Damaged(message) => {
+            eprintln!("导入帧台账损坏，已忽略（不影响知识库）：{}", message);
+            ImportFrameLedger::new()
+        }
+        ImportFrameLoad::Missing => ImportFrameLedger::new(),
+    };
     // 批量导入期间把整图刷新推迟到真正需要时（见循环顶部）
     let mut reasoner_stale = false;
     let mut graph_refreshed = false;
@@ -12380,12 +12400,20 @@ async fn run_interactive_mode(
                             );
                         }
                         reasoner_stale = true;
+                        let retracted_frames = import_frames.retract_import(&receipt);
+                        if retracted_frames > 0 {
+                            if let Err(error) = import_frames.save(&import_frames_path) {
+                                eprintln!("保存导入帧失败：{}", error);
+                            }
+                            symbolic_reasoner.attach_import_frames(import_frames.clone());
+                        }
                         let _ = oxigraph_manager.save_predicate_registry(&registry_path);
                         let _ = import_journal.save(&journal_path);
                         println!(
-                            "已撤销上次导入：移除 {} 条三元组（日志余 {} 笔）。",
+                            "已撤销上次导入：移除 {} 条三元组（日志余 {} 笔，导入帧退场 {} 条）。",
                             removed,
-                            import_journal.len()
+                            import_journal.len(),
+                            retracted_frames
                         );
                     }
                     Err(e) => {
@@ -12412,6 +12440,13 @@ async fn run_interactive_mode(
         // 导入历史：跨会话撤销栈（新 → 旧）
         if matches!(input, "导入历史" | "导入日志" | "撤销历史") {
             println!("{}", import_journal.summary());
+            println!();
+            continue;
+        }
+
+        // 导入帧：从导入陈述句学到的措辞、问法与原句见证
+        if matches!(input, "导入帧" | "语言帧" | "帧台账") {
+            println!("{}", import_frames.report());
             println!();
             continue;
         }
@@ -13065,6 +13100,7 @@ async fn run_interactive_mode(
                             }
                         }
 
+                        let frame_items = items.clone();
                         match oxigraph_manager.save_knowledge_with_receipt(items).await {
                             Ok(receipt) => {
                                 let summary = receipt.summary();
@@ -13086,6 +13122,20 @@ async fn run_interactive_mode(
                                     }
                                 }
                                 log_chronicle_reply(&mut chronicle, &summary, &[], &[]);
+                                // 抽取即标注：把已落库事实回对齐到原句，学习可逆措辞/问法。
+                                let learned = import_frames.learn_from_import(
+                                    kb_revision + 1,
+                                    &clean_text,
+                                    &frame_items,
+                                    &receipt,
+                                );
+                                if learned.changed() {
+                                    if let Err(error) = import_frames.save(&import_frames_path) {
+                                        eprintln!("保存导入帧失败：{}", error);
+                                    }
+                                    symbolic_reasoner.attach_import_frames(import_frames.clone());
+                                    println!("{}", learned.summary());
+                                }
                                 if receipt.can_undo() {
                                     import_journal.push(receipt);
                                     let _ = import_journal.save(&journal_path);
@@ -14719,6 +14769,7 @@ fn interactive_help() -> String {
         "  导入rdf文件：<路径>                 导入 Turtle/N-Triples/N-Quads/TriG/RDF/XML",
         "  导出rdf文件：<路径>                 导出默认图（按扩展名，支持 jsonld；简写：导出文件：）",
         "  撤销导入 / 导入回执 / 导入历史       导入回执与可撤销导入栈",
+        "  导入帧 / 语言帧 / 帧台账             导入句学到的措辞、问法与原句见证",
         "  情景 / 对话情景                      把编年史编译成可查询的情景理论（CST）",
         "  情景历史：<问题>                     同一问题在各情景下的回答与修订",
         "  情景归因：<问题>                     改口的候选事件原因（无候选就明说）",
