@@ -738,6 +738,21 @@ impl TinyModel {
         out
     }
 
+    /// 反向关系检索：返回满足 PREDICATE(subject, object) 的全部主语。
+    pub fn subjects_with_object(&self, predicate: &str, object: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for o in self.name_variants(object) {
+            if let Some(incoming) = self.in_index.get(&o) {
+                for (rel, subject) in incoming {
+                    if self.name_variants(predicate).contains(rel) && !out.contains(subject) {
+                        out.push(subject.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn values_of(&self, entity: &str, predicate: &str) -> Vec<String> {
         let mut out = Vec::new();
         for e in self.name_variants(entity) {
@@ -1208,6 +1223,8 @@ pub enum Query {
     Value { entity: String, predicate: String },
     /// 实体查询：谁是 PREDICATE
     Entity { predicate: String },
+    /// 反向实体查询：谁的 PREDICATE 是 OBJECT
+    EntityByObject { predicate: String, object: String },
     /// 真值查询：判断 BODY 是否成立
     Truth { body: Term },
 }
@@ -1250,6 +1267,9 @@ impl LogicalForm {
                 format!("value:{}=>{}", entity, predicate)
             }
             LfKind::Query(Query::Entity { predicate }) => format!("entity:{}", predicate),
+            LfKind::Query(Query::EntityByObject { predicate, object }) => {
+                format!("entity-rev:{}<-{}", predicate, object)
+            }
             LfKind::Query(Query::Truth { body }) => format!("truth:{}", body.render()),
             LfKind::Unknown => "unknown".to_string(),
         }
@@ -1263,6 +1283,9 @@ impl LogicalForm {
                 format!("查询 x：{} 的 {} = x", entity, predicate)
             }
             LfKind::Query(Query::Entity { predicate }) => format!("查询 x：{}(x)", predicate),
+            LfKind::Query(Query::EntityByObject { predicate, object }) => {
+                format!("查询 x：{}(x, {})", predicate, object)
+            }
             LfKind::Query(Query::Truth { body }) => format!("验证：{}", body.render()),
             LfKind::Unknown => "（未能组合出逻辑形式）".to_string(),
         }
@@ -1275,6 +1298,9 @@ impl LogicalForm {
                 (Some(entity.clone()), Some(predicate.clone()))
             }
             LfKind::Query(Query::Entity { predicate }) => (None, Some(predicate.clone())),
+            LfKind::Query(Query::EntityByObject { predicate, object }) => {
+                (Some(object.clone()), Some(predicate.clone()))
+            }
             LfKind::Query(Query::Truth { body }) => first_atom(body)
                 .map(|(e, p)| (Some(e), Some(p)))
                 .unwrap_or((None, None)),
@@ -1357,6 +1383,12 @@ pub enum QueryOutcome {
         entities: Vec<String>,
         evidence: Vec<String>,
     },
+    EntitiesByObject {
+        predicate: String,
+        object: String,
+        entities: Vec<String>,
+        evidence: Vec<String>,
+    },
     Truth {
         holds: bool,
         statement: String,
@@ -1380,6 +1412,17 @@ impl QueryOutcome {
                 entities,
                 ..
             } => format!("entities:{}:{}", predicate, entities.join("\u{1f}")),
+            QueryOutcome::EntitiesByObject {
+                predicate,
+                object,
+                entities,
+                ..
+            } => format!(
+                "entities-rev:{}<-{}:{}",
+                predicate,
+                object,
+                entities.join("\u{1f}")
+            ),
             QueryOutcome::Truth {
                 holds, statement, ..
             } => {
@@ -1891,7 +1934,48 @@ impl FormalSemantics {
                 ));
             }
         }
-        // 3) 「谁 / 哪些人 / 何人 …」：实体查询
+        // 3) 「谁的 P 是 O」：反向实体查询（保留关系方向，不把入边当出边）
+        if tokens.len() >= 5
+            && ["谁", "哪些人", "哪些", "何人", "什么人", "哪个", "哪个人"]
+                .contains(&tokens[0].as_str())
+            && tokens.get(1).map(|token| token == "的").unwrap_or(false)
+        {
+            if let Some(copula) = tokens
+                .iter()
+                .position(|token| token == "是" || token == "为")
+            {
+                if copula > 2 {
+                    let mut object_tokens = &tokens[copula + 1..];
+                    while object_tokens
+                        .last()
+                        .map(|token| {
+                            QUESTION_SUFFIX.contains(&token.as_str())
+                                || token == "?"
+                                || token == "？"
+                        })
+                        .unwrap_or(false)
+                    {
+                        object_tokens = &object_tokens[..object_tokens.len() - 1];
+                    }
+                    if let (Some(predicate), Some(object)) = (
+                        self.predicate_from_tokens(&tokens[2..copula]),
+                        self.entity_from_tokens(object_tokens),
+                    ) {
+                        out.push(make(
+                            LfKind::Query(Query::EntityByObject {
+                                predicate: predicate.clone(),
+                                object: object.clone(),
+                            }),
+                            vec![format!(
+                                "谁的 P 是 O 句式：查询 {}(x, {}) 中的 x",
+                                predicate, object
+                            )],
+                        ));
+                    }
+                }
+            }
+        }
+        // 4) 「谁 / 哪些人 / 何人 …」：实体查询
         if let Some(first) = tokens.first() {
             if ["谁", "哪些人", "哪些", "何人", "什么人", "哪个"].contains(&first.as_str())
             {
@@ -1913,7 +1997,7 @@ impl FormalSemantics {
                 }
             }
         }
-        // 4) 「X 的 P …」：值查询
+        // 5) 「X 的 P …」：值查询
         if let Some(index) = tokens.iter().position(|token| token == "的") {
             if index > 0 && index + 1 < tokens.len() {
                 if let Some(entity) = self.entity_from_tokens(&tokens[..index]) {
@@ -1934,7 +2018,7 @@ impl FormalSemantics {
                 }
             }
         }
-        // 5) 「E P …」（无「的」）：按最长实体前缀切分
+        // 6) 「E P …」（无「的」）：按最长实体前缀切分
         if let Some((entity, predicate)) = self.split_entity_predicate(tokens) {
             out.push(make(
                 LfKind::Query(Query::Value {
@@ -2344,6 +2428,19 @@ impl FormalSemantics {
                     evidence,
                 }
             }
+            LfKind::Query(Query::EntityByObject { predicate, object }) => {
+                let entities = model.subjects_with_object(predicate, object);
+                let evidence = entities
+                    .iter()
+                    .map(|entity| format!("{} —{}→ {}", entity, predicate, object))
+                    .collect();
+                QueryOutcome::EntitiesByObject {
+                    predicate: predicate.clone(),
+                    object: object.clone(),
+                    entities,
+                    evidence,
+                }
+            }
             LfKind::Query(Query::Truth { body }) => {
                 let value = model.eval(body);
                 match value {
@@ -2389,6 +2486,14 @@ impl FormalSemantics {
                     gaps.push(format!("谓词「{}」没有任何已知记录", predicate));
                 }
             }
+            LfKind::Query(Query::EntityByObject { predicate, object }) => {
+                if !model.knows_predicate(predicate) {
+                    gaps.push(format!("谓词「{}」没有任何已知记录", predicate));
+                }
+                if !model.knows_name(object) {
+                    gaps.push(format!("实体「{}」不在已知个体域", object));
+                }
+            }
             LfKind::Query(Query::Truth { body }) | LfKind::Statement(body) => {
                 for name in model.unknown_mentions(body) {
                     gaps.push(format!("「{}」不在个体域或谓词表中", name));
@@ -2415,7 +2520,8 @@ impl FormalSemantics {
                     CandidateStatus::Supported
                 }
             }
-            QueryOutcome::Entities { entities, .. } => {
+            QueryOutcome::Entities { entities, .. }
+            | QueryOutcome::EntitiesByObject { entities, .. } => {
                 if entities.is_empty() {
                     CandidateStatus::Open
                 } else {
@@ -2530,6 +2636,7 @@ impl FormalSemantics {
             let evidence = match &grounded.outcome {
                 QueryOutcome::Values { evidence, .. }
                 | QueryOutcome::Entities { evidence, .. }
+                | QueryOutcome::EntitiesByObject { evidence, .. }
                 | QueryOutcome::Truth { evidence, .. } => evidence.clone(),
                 QueryOutcome::Unsupported(_) => Vec::new(),
             };
@@ -2578,6 +2685,7 @@ impl FormalSemantics {
             let evidence = match &grounded.outcome {
                 QueryOutcome::Values { evidence, .. }
                 | QueryOutcome::Entities { evidence, .. }
+                | QueryOutcome::EntitiesByObject { evidence, .. }
                 | QueryOutcome::Truth { evidence, .. } => evidence.clone(),
                 QueryOutcome::Unsupported(_) => Vec::new(),
             };
@@ -2643,6 +2751,28 @@ impl FormalSemantics {
                     )
                 }
             }
+            QueryOutcome::EntitiesByObject {
+                predicate,
+                object,
+                entities,
+                ..
+            } => {
+                let surface = self.lexicon.surface_of(predicate);
+                if entities.is_empty() {
+                    format!(
+                        "知识图谱中没有以「{}」为「{}」对象的实体。",
+                        object, surface
+                    )
+                } else {
+                    format!(
+                        "以「{}」为「{}」对象的实体有 {} 个：{}。",
+                        object,
+                        surface,
+                        entities.len(),
+                        entities.join("、")
+                    )
+                }
+            }
             QueryOutcome::Truth {
                 holds, statement, ..
             } => {
@@ -2677,6 +2807,7 @@ impl FormalSemantics {
         let evidence = match &outcome {
             QueryOutcome::Values { evidence, .. }
             | QueryOutcome::Entities { evidence, .. }
+            | QueryOutcome::EntitiesByObject { evidence, .. }
             | QueryOutcome::Truth { evidence, .. } => evidence.clone(),
             QueryOutcome::Unsupported(_) => Vec::new(),
         };
@@ -3090,6 +3221,76 @@ mod tests {
             }
             other => panic!("unexpected outcome: {:?}", other),
         }
+    }
+
+    #[test]
+    fn reverse_entity_query_keeps_relation_direction() {
+        let mut semantics = FormalSemantics::new();
+        let mut model = TinyModel::new(HashMap::new());
+        let facts = vec![
+            PrologFact::Entity {
+                name: "张三".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "王五".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "赵六".to_string(),
+                entity_type: "人物".to_string(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "王五".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "李四".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+        ];
+        feed(&mut semantics, &mut model, &facts);
+        let lf = semantics.parse("谁的师傅是李四");
+        assert!(
+            matches!(
+                lf.kind,
+                LfKind::Query(Query::EntityByObject { .. })
+            ),
+            "lf = {:?}",
+            lf
+        );
+        match semantics.solve(&lf, &model) {
+            QueryOutcome::EntitiesByObject {
+                entities, evidence, ..
+            } => {
+                assert_eq!(entities.len(), 2, "entities = {:?}", entities);
+                assert!(entities.contains(&"张三".to_string()));
+                assert!(entities.contains(&"王五".to_string()));
+                assert!(!entities.contains(&"赵六".to_string()));
+                assert!(evidence.iter().all(|line| line.contains("李四")));
+            }
+            other => panic!("unexpected outcome: {:?}", other),
+        }
+        let forest = semantics.parse_forest("谁的师傅是李四");
+        assert!(forest.candidates.iter().any(|candidate| matches!(
+            candidate.form.kind,
+            LfKind::Query(Query::EntityByObject { .. })
+        )));
     }
 
     #[test]

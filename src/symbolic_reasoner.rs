@@ -5453,6 +5453,9 @@ impl SymbolicReasoner {
                             | crate::formal_semantics::QueryOutcome::Entities {
                                 evidence, ..
                             }
+                            | crate::formal_semantics::QueryOutcome::EntitiesByObject {
+                                evidence, ..
+                            }
                             | crate::formal_semantics::QueryOutcome::Truth {
                                 evidence, ..
                             } => evidence.clone(),
@@ -26212,6 +26215,57 @@ types = [
             .formal_semantics_attempt("谁是中国人？")
             .expect("正常回答路径也应能使用唯一读法");
         assert!(attempt.contains("张三"), "attempt = {}", attempt);
+        assert!(!reasoner.formal_clarification_active());
+    }
+
+
+    #[test]
+    fn formal_semantics_fallback_answers_reverse_relation() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "张三".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "王五".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "李四".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "赵六".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "师傅".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "王五".into(),
+                rel_type: "师傅".into(),
+                to: "李四".into(),
+            },
+            PrologFact::Relation {
+                from: "李四".into(),
+                rel_type: "师傅".into(),
+                to: "赵六".into(),
+            },
+        ]);
+        let answer = reasoner
+            .formal_semantics_answer("谁的师傅是李四？")
+            .expect("反向关系查询应有答案");
+        assert!(answer.contains("张三"), "answer = {}", answer);
+        assert!(answer.contains("王五"), "answer = {}", answer);
+        assert!(!answer.contains("赵六"), "answer = {}", answer);
+        assert!(answer.contains("证据"), "answer = {}", answer);
         assert!(!reasoner.formal_clarification_active());
     }
 

@@ -17063,6 +17063,8 @@ mod session_tests {
     #[test]
     fn command_like_covers_journal_and_perf_commands() {
         for command in [
+            "语义分析：张三的年龄是多少",
+            "语义森林：张三的年龄是多少",
             "撤销导入",
             "导入回执",
             "导入历史",
