@@ -6,6 +6,7 @@ use std::time::Instant;
 
 // 从库（know_prolog）中导入所需的功能
 use know_prolog::{
+    answer_plan::StyleDirective,
     batch_teaching::{
         self, append_learned_items, BatchOptions, BatchTeacher, BatchTeachingLedger,
         LedgerLoad as BatchLedgerLoad,
@@ -6694,6 +6695,19 @@ async fn run_ask(
         }
         // 一次性问答同样只给紧接的一轮开裸回答窗口。
         reasoner.clear_pending_awaiting();
+        // 风格重述：对上一段生成的同一份回答计划换表达，不重新检索。
+        if let Some(directive) = StyleDirective::parse(&question) {
+            let text = reasoner.restyle_generation(directive).unwrap_or_else(|| {
+                "生成功能未启用，无法按回答计划重述。".to_string()
+            });
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(text),
+                derivation: None,
+            });
+            continue;
+        }
         if let Some(reply) =
             ask_with_lens(&question, oxigraph_manager, config, &mut lens_cache).await
         {
@@ -10376,6 +10390,16 @@ async fn run_interactive_mode(
                     Err(e) => println!("加载知识图谱失败: {}", e),
                 }
                 println!("{}", symbolic_reasoner.entailment_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 多轮生成：按同一份回答计划换风格重述（不重新检索、不新增事实）
+        if let Some(directive) = StyleDirective::parse(input) {
+            match symbolic_reasoner.restyle_generation(directive) {
+                Some(text) => println!("{}", text),
+                None => println!("生成功能未启用，无法按回答计划重述。"),
             }
             println!();
             continue;
@@ -14318,6 +14342,8 @@ fn interactive_help() -> String {
         "  实体足迹：<实体> / 实体索引           跨会话实体脉络、别名折叠、同题异答与图谱现状",
         "  聊过：<词面> / 未解析提及              别名感知检索、未落地提及审计",
         "  相似实体：<实体> / 介绍：<实体>       相似度排序与生成式介绍",
+        "  简短点 / 完整讲讲 / 换种表达        按同一份回答计划重述，不重新检索、不新增事实",
+        "  第N点是什么 / 风格：第N点            只展开回答计划中的第 N 点",
         "  证据检索：<问题>                    带约束与上界剪枝的证据排序及检索回执",
         "",
         "其他",
@@ -14509,6 +14535,10 @@ fn plugin_policy_text(
 }
 
 fn is_command_like(input: &str) -> bool {
+    // 回答计划风格指令：不参与悬问/澄清的短答回填。
+    if StyleDirective::parse(input).is_some() {
+        return true;
+    }
     const COMMANDS: &[&str] = &[
         "SPARQL",
         "sparql",
@@ -16063,6 +16093,31 @@ mod session_tests {
         }
         assert_eq!(generation_followup("介绍一下北京"), None);
         assert_eq!(generation_followup("北京的人口是多少"), None);
+    }
+
+    #[test]
+    fn generation_style_commands_do_not_steal_existing_followups() {
+        for input in [
+            "简短点",
+            "完整讲讲",
+            "换种表达",
+            "第二点是什么",
+            "风格：第2点",
+        ] {
+            assert!(
+                StyleDirective::parse(input).is_some(),
+                "应识别风格指令：{}",
+                input
+            );
+            assert!(is_command_like(input), "风格指令不应被当成短答：{}", input);
+        }
+        for input in ["详细一点", "展开说说", "展开讲", "换个说法", "接着说"] {
+            assert!(
+                StyleDirective::parse(input).is_none(),
+                "不得改写既有续说/换角度语义：{}",
+                input
+            );
+        }
     }
 
     #[test]
