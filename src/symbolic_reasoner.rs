@@ -8,6 +8,7 @@ use crate::abduction::{
     HypothesisKind, Scenario,
 };
 use crate::alignment_memory::{AlignmentKind, AlignmentMemory, AlignmentScope, LearnOutcome};
+use crate::answer_plan::{AnswerPlan, PlanClaim, StyleDirective, MAX_PLAN_CLAIMS};
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
 use crate::belief_revision::{BeliefState, ChangeOp, ChangeSet, RevisionConstraints};
 use crate::cache::RevisionLru;
@@ -84,7 +85,7 @@ use crate::slot_ledger::{
     AssertionStrength, SlotAssertion, SlotLedger, SlotPolicy, SlotTransition,
 };
 use crate::symbolic_generator::{
-    GenerationCursor, GenerationOrder, GenerationOverlay, SymbolicGenerator,
+    GenerationCursor, GenerationOrder, GenerationOverlay, ProfileClause, SymbolicGenerator,
 };
 use crate::temporal::{
     self, validity_from_bounds, TemporalConstraint, UnknownTimePolicy, Validity,
@@ -373,6 +374,9 @@ pub struct GenerationState {
     /// 增量话语账本：记住已经说出口的命题。旧快照缺省时从 `shown` 迁移。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<GenerationCursor>,
+    /// 上一段生成的可重述计划：只说「说什么」，表达由风格指令选择。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<AnswerPlan>,
 }
 
 // 会话事实的持久化快照（定义域：全部为基事实，故只存谓词+常量名）
@@ -807,11 +811,13 @@ impl DialogueContext {
         if entity.trim().is_empty() {
             return;
         }
+        let plan = self.retained_plan(entity);
         self.generation = Some(GenerationState {
             entity: entity.to_string(),
             shown,
             order,
             cursor: None,
+            plan,
         });
     }
 
@@ -820,12 +826,40 @@ impl DialogueContext {
         if cursor.entity.trim().is_empty() {
             return;
         }
+        let plan = self.retained_plan(&cursor.entity);
         self.generation = Some(GenerationState {
             entity: cursor.entity.clone(),
             shown: cursor.spoken_count(),
             order: cursor.order,
             cursor: Some(cursor),
+            plan,
         });
+    }
+
+    /// 记录一段生成、话语账本与可重述计划。
+    pub fn record_generation_with_plan(
+        &mut self,
+        cursor: GenerationCursor,
+        plan: AnswerPlan,
+    ) {
+        if cursor.entity.trim().is_empty() {
+            return;
+        }
+        self.generation = Some(GenerationState {
+            entity: cursor.entity.clone(),
+            shown: cursor.spoken_count(),
+            order: cursor.order,
+            cursor: Some(cursor),
+            plan: Some(plan),
+        });
+    }
+
+    /// 同一实体的计划在「接着说」等操作后继续保留；换实体则丢弃。
+    fn retained_plan(&self, entity: &str) -> Option<AnswerPlan> {
+        self.generation
+            .as_ref()
+            .filter(|state| state.entity == entity)
+            .and_then(|state| state.plan.clone())
     }
 
     pub fn snapshot(&self) -> DialogueSnapshot {
@@ -4527,6 +4561,14 @@ impl SymbolicReasoner {
             canonical
         };
         let overlay = self.generation_overlay();
+        let clauses =
+            self.generator
+                .profile_clauses_with_overlay(&entity, GenerationOrder::Relevance, &overlay)?;
+        let plan = self.build_answer_plan(
+            &format!("介绍：{}", entity),
+            &entity,
+            &clauses,
+        );
         let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
         let page = self.generator.cursor_page(
             &entity,
@@ -4534,7 +4576,7 @@ impl SymbolicReasoner {
             &overlay,
             &mut cursor,
         )?;
-        self.context.record_generation_with_cursor(cursor);
+        self.context.record_generation_with_plan(cursor, plan);
         let audit = self.audit_generation(&page.text, &page.trusted);
         let mut text = audit.text;
         if let Some(note) = audit.note {
@@ -4544,6 +4586,103 @@ impl SymbolicReasoner {
             text.push_str(&note);
         }
         Some(text)
+    }
+
+    /// 把生成器命题转成回答计划：先做一次整批生成自检，再按原顺序保留。
+    ///
+    /// 自检失败的句子不进入计划，避免「详细版」重新说出初次生成时已被
+    /// 丢弃的句子；容量上限由 [`AnswerPlan::new`] 统一执行。
+    fn build_answer_plan(
+        &self,
+        question: &str,
+        entity: &str,
+        clauses: &[ProfileClause],
+    ) -> AnswerPlan {
+        let accepted: Vec<&ProfileClause> = if self.config.enable_entailment && !clauses.is_empty() {
+            let raw = clauses
+                .iter()
+                .map(|clause| clause.sentence.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let trusted: Vec<String> = clauses
+                .iter()
+                .filter(|clause| clause.from_overlay)
+                .map(|clause| clause.sentence.clone())
+                .collect();
+            let audited = self.audit_generation(&raw, &trusted);
+            let mut kept: HashMap<String, usize> = HashMap::new();
+            for line in audited.text.lines() {
+                *kept.entry(line.trim().to_string()).or_default() += 1;
+            }
+            clauses
+                .iter()
+                .filter(|clause| {
+                    let key = clause.sentence.trim();
+                    match kept.get_mut(key) {
+                        Some(count) if *count > 0 => {
+                            *count -= 1;
+                            true
+                        }
+                        _ => false,
+                    }
+                })
+                .collect()
+        } else {
+            clauses.iter().collect()
+        };
+        let suppressed = clauses.len().saturating_sub(accepted.len());
+        let omitted = accepted.len().saturating_sub(MAX_PLAN_CLAIMS);
+        let claims = accepted
+            .iter()
+            .take(MAX_PLAN_CLAIMS)
+            .map(|clause| {
+                PlanClaim::new(
+                    clause.slot_id(),
+                    clause.predicate(),
+                    clause.sentence.clone(),
+                    clause.from_overlay,
+                )
+            })
+            .collect();
+        AnswerPlan::new(question, entity, self.revision, claims, omitted, suppressed)
+    }
+
+    /// 对上一段生成的计划做风格化重述：只选择与呈现，不重新检索。
+    ///
+    /// 计划缺失、结构版本不支持或知识版本已变化时返回明确提示；绝不把
+    /// 两代知识拼进同一段回答。
+    pub fn restyle_generation(&mut self, directive: StyleDirective) -> Option<String> {
+        if !self.config.enable_generation {
+            return None;
+        }
+        let Some(state) = self.context.generation_state().cloned() else {
+            return Some(
+                "还没有可复述的回答计划。先用「介绍：实体名」生成一段介绍，再说「简短点」或「完整讲讲」。"
+                    .to_string(),
+            );
+        };
+        let Some(plan) = state.plan.as_ref() else {
+            return Some(format!(
+                "上一段关于「{}」的回答没有可复述的计划；请重新输入「介绍：{}」。",
+                state.entity, state.entity
+            ));
+        };
+        if !plan.is_current_schema() {
+            return Some(format!(
+                "上一份回答计划的格式版本 {} 超出当前支持范围；请重新生成「介绍：{}」。",
+                plan.version, state.entity
+            ));
+        }
+        if !plan.is_fresh_for(self.revision) {
+            return Some(format!(
+                "上一份回答计划基于知识版本 v{}，当前已是 v{}；为避免混用两代事实，请重新输入「介绍：{}」。",
+                plan.revision, self.revision, state.entity
+            ));
+        }
+        match plan.realize(directive) {
+            Ok(text) => Some(text),
+            Err(error) => Some(error.to_string()),
+        }
     }
 
     pub fn discourse(&self) -> &DiscoursePlanner {
@@ -4753,7 +4892,20 @@ impl SymbolicReasoner {
                 state.entity
             ));
         }
-        self.context.record_generation_with_cursor(cursor);
+        let plan = self
+            .generator
+            .profile_clauses_with_overlay(&state.entity, state.order, &overlay)
+            .map(|clauses| {
+                self.build_answer_plan(
+                    &format!("继续介绍：{}", state.entity),
+                    &state.entity,
+                    &clauses,
+                )
+            });
+        match plan {
+            Some(plan) => self.context.record_generation_with_plan(cursor, plan),
+            None => self.context.record_generation_with_cursor(cursor),
+        }
         let audit = self.audit_generation(&page.text, &page.trusted);
         let mut text = audit.text;
         if let Some(note) = audit.note {
@@ -4788,7 +4940,20 @@ impl SymbolicReasoner {
         if page.shown == 0 {
             return Some(format!("关于「{}」暂无可重述的事实。", state.entity));
         }
-        self.context.record_generation_with_cursor(cursor);
+        let plan = self
+            .generator
+            .profile_clauses_with_overlay(&state.entity, order, &overlay)
+            .map(|clauses| {
+                self.build_answer_plan(
+                    &format!("换个角度介绍：{}", state.entity),
+                    &state.entity,
+                    &clauses,
+                )
+            });
+        match plan {
+            Some(plan) => self.context.record_generation_with_plan(cursor, plan),
+            None => self.context.record_generation_with_cursor(cursor),
+        }
         let label = match order {
             GenerationOrder::Relevance => "信息量排序（由稀有谓词到常见谓词）",
             GenerationOrder::Alphabetical => "主题排序（按谓词字典序）",
@@ -19757,7 +19922,9 @@ types = [
             "generation": {"entity": "张三", "shown": 1, "order": "Relevance"}
         }"#;
         let snapshot: DialogueSnapshot = serde_json::from_str(legacy).expect("旧快照应可解码");
-        assert!(snapshot.generation.unwrap().cursor.is_none());
+        let generation = snapshot.generation.unwrap();
+        assert!(generation.cursor.is_none());
+        assert!(generation.plan.is_none(), "旧快照缺省字段应为 None");
     }
 
     #[test]
@@ -19782,6 +19949,114 @@ types = [
             .expect("换个角度说应重新生成");
         assert!(angled.contains("换个角度"), "实际：{}", angled);
         assert!(reasoner.dialogue_summary().contains("上一段生成"));
+    }
+
+    #[test]
+    fn generation_plan_supports_style_restyle_without_new_claims() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        assert!(plan.claim_count() >= 2, "计划应覆盖全部可用命题");
+        assert_eq!(plan.revision, reasoner.revision());
+
+        let brief = reasoner
+            .restyle_generation(StyleDirective::Brief)
+            .expect("简短重述应可用");
+        assert!(brief.contains("简短版"), "{}", brief);
+        for claim in plan.claims.iter().take(3) {
+            assert!(brief.contains(claim.text.trim()), "{}", brief);
+        }
+        for claim in plan.claims.iter().skip(3) {
+            assert!(!brief.contains(claim.text.trim()), "越界：{}", brief);
+        }
+
+        let detailed = reasoner
+            .restyle_generation(StyleDirective::Detailed)
+            .expect("完整重述应可用");
+        for claim in &plan.claims {
+            assert!(detailed.contains(claim.text.trim()), "{}", detailed);
+        }
+        assert!(detailed.contains("来源："), "{}", detailed);
+
+        let focused = reasoner
+            .restyle_generation(StyleDirective::Focus(2))
+            .expect("定位第二点应可用");
+        assert!(focused.contains(plan.claims[1].text.trim()), "{}", focused);
+        assert!(
+            !focused.contains(plan.claims[0].text.trim()),
+            "定位单点不得夹带其它命题：{}",
+            focused
+        );
+
+        let restated = reasoner
+            .restyle_generation(StyleDirective::Restate)
+            .expect("换种表达应可用");
+        for claim in &plan.claims {
+            assert!(restated.contains(claim.text.trim()), "{}", restated);
+        }
+    }
+
+    #[test]
+    fn restyle_refuses_a_plan_from_an_older_knowledge_revision() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let recorded = reasoner.revision();
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "李四".to_string(),
+            rel_type: "徒弟".to_string(),
+            to: "张三".to_string(),
+        }]);
+        assert!(reasoner.revision() > recorded);
+        let text = reasoner
+            .restyle_generation(StyleDirective::Brief)
+            .expect("过期计划应给出明确提示");
+        assert!(text.contains("知识版本"), "{}", text);
+        assert!(text.contains(&format!("v{}", recorded)), "{}", text);
+        assert!(text.contains("重新输入"), "{}", text);
+    }
+
+    #[test]
+    fn generation_plan_survives_dialogue_snapshot_roundtrip() {
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let mut reasoner = SymbolicReasoner::new(config.clone(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        let snapshot = reasoner.dialogue_snapshot();
+        let json = serde_json::to_string(&snapshot).expect("计划应可序列化");
+        let restored_snapshot: DialogueSnapshot =
+            serde_json::from_str(&json).expect("计划应可反序列化");
+
+        let mut restored = SymbolicReasoner::new(config, HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&restored_snapshot)
+            .expect("快照应能恢复");
+        let restored_plan = restored
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("恢复后计划仍应在");
+        assert_eq!(restored_plan, plan);
+        let text = restored
+            .restyle_generation(StyleDirective::Detailed)
+            .expect("重启后仍应可完整重述");
+        assert!(text.contains(plan.claims[0].text.trim()), "{}", text);
     }
 
     #[test]

@@ -373,6 +373,15 @@ impl ProfileClause {
     pub fn fingerprint(&self) -> &str {
         &self.sentence
     }
+
+    /// 稳定槽位编码：回答计划与话语账本共用同一身份。
+    pub fn slot_id(&self) -> String {
+        self.key.encode()
+    }
+
+    pub fn predicate(&self) -> &str {
+        &self.key.predicate
+    }
 }
 
 /// 生成时的分层事实视图：图谱值 ∪ 会话值，先压制、再替换。
