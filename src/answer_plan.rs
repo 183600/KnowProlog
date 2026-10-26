@@ -411,19 +411,21 @@ fn parse_focus(text: &str, explicit: bool) -> Option<usize> {
     };
     let (index, rest) = split_ordinal(body)?;
     let rest = rest.trim();
-    let suffix_ok = rest.is_empty()
-        || matches!(
-            rest,
-            "点" | "点呢"
-                | "点是什么"
-                | "点什么"
-                | "点的内容"
-                | "点内容"
-                | "点讲讲"
-                | "点说说"
-                | "条"
-                | "条呢"
-        );
+    let named_point = matches!(
+        rest,
+        "点" | "点呢"
+            | "点是什么"
+            | "点什么"
+            | "点的内容"
+            | "点内容"
+            | "点讲讲"
+            | "点说说"
+            | "条"
+            | "条呢"
+    );
+    // 裸数字「1」是澄清短答或普通数字，不是风格指令；只有显式前缀
+    // 或「展开/第N点」这类带点标记的说法才进入计划定位。
+    let suffix_ok = named_point || (rest.is_empty() && (explicit || prefixed));
     if !suffix_ok {
         return None;
     }
@@ -678,6 +680,9 @@ mod tests {
             "换个角度说",
             "接着说",
             "第二点",
+            "1",
+            "2",
+            "二十",
             "介绍一下北京",
         ] {
             assert_eq!(StyleDirective::parse(input), None, "不应接管「{}」", input);
