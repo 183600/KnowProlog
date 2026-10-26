@@ -122,20 +122,25 @@ impl PlanClaim {
         if self.evidence.is_empty() {
             return String::new();
         }
-        const SHOWN: usize = 3;
-        let mut note = format!(
-            "；依据：{}",
-            self.evidence
-                .iter()
-                .take(SHOWN)
-                .map(ClaimEvidence::render)
-                .collect::<Vec<_>>()
-                .join("；")
-        );
-        if self.evidence.len() > SHOWN {
-            let _ = write!(note, "；等 {} 条", self.evidence.len());
+        format!("；依据：{}", self.evidence_digest())
+    }
+
+    fn evidence_digest(&self) -> String {
+        if self.evidence.is_empty() {
+            return "无".to_string();
         }
-        note
+        const SHOWN: usize = 3;
+        let mut digest = self
+            .evidence
+            .iter()
+            .take(SHOWN)
+            .map(ClaimEvidence::render)
+            .collect::<Vec<_>>()
+            .join("；");
+        if self.evidence.len() > SHOWN {
+            let _ = write!(digest, "；等 {} 条", self.evidence.len());
+        }
+        digest
     }
 
     fn envelope_note(&self) -> String {
@@ -616,10 +621,36 @@ impl PlanDiff {
                         .as_ref()
                         .map(|claim| claim.text.trim())
                         .unwrap_or("");
-                    output.push_str(&format!(
-                        "  [更新] {}：{} → {}\n",
-                        change.slot, before, after
-                    ));
+                    let evidence_only = match (&change.before, &change.after) {
+                        (Some(before), Some(after)) => {
+                            before.text == after.text
+                                && before.predicate == after.predicate
+                                && before.session == after.session
+                                && before.evidence != after.evidence
+                        }
+                        _ => false,
+                    };
+                    if evidence_only {
+                        let before_evidence = change
+                            .before
+                            .as_ref()
+                            .map(PlanClaim::evidence_digest)
+                            .unwrap_or_else(|| "无".to_string());
+                        let after_evidence = change
+                            .after
+                            .as_ref()
+                            .map(PlanClaim::evidence_digest)
+                            .unwrap_or_else(|| "无".to_string());
+                        output.push_str(&format!(
+                            "  [更新] {}：{}（依据：{} → {}）\n",
+                            change.slot, after, before_evidence, after_evidence
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "  [更新] {}：{} → {}\n",
+                            change.slot, before, after
+                        ));
+                    }
                 }
                 PlanChangeKind::Removed => {
                     let before = change
@@ -1214,6 +1245,35 @@ mod tests {
         )
         .unwrap();
         assert!(old.claims[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn diff_surfaces_evidence_only_updates() {
+        let before = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "p", "命题。", false).with_evidence(vec![
+                ClaimEvidence::new("张三", "师傅", "李四", false),
+            ])],
+            0,
+            0,
+        );
+        let after = AnswerPlan::new(
+            "q",
+            "张三",
+            2,
+            vec![PlanClaim::new("s", "p", "命题。", false).with_evidence(vec![
+                ClaimEvidence::new("张三", "师傅", "王五", false),
+            ])],
+            0,
+            0,
+        );
+        let diff = before.diff(&after);
+        assert_eq!(diff.counts().0, 1, "证据变化应算更新");
+        let text = diff.render_zh(false);
+        assert!(text.contains("依据："), "{}", text);
+        assert!(text.contains("李四") && text.contains("王五"), "{}", text);
     }
 
     #[test]
