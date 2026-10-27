@@ -470,6 +470,26 @@ impl SharedMemoryBoard {
         self.state.read().evictions
     }
 
+    /// 按 id 撤回一条声明，但只在作用域完全匹配时生效（防止跨作用域越权删除）。
+    /// 返回被撤回的声明；有变化时推进一次修订号。
+    pub fn retract_scoped(&self, claim_id: &str, scope: &MemoryScope) -> Option<SharedClaim> {
+        let mut state = self.state.write();
+        let (entry_key, index) = state.entries.iter().find_map(|(key, claims)| {
+            claims
+                .iter()
+                .position(|claim| claim.id == claim_id && &claim.scope == scope)
+                .map(|index| (key.clone(), index))
+        })?;
+        let claims = state.entries.get_mut(&entry_key)?;
+        let claim = claims.remove(index);
+        if claims.is_empty() {
+            state.entries.remove(&entry_key);
+        }
+        state.total = state.total.saturating_sub(1);
+        state.revision = state.revision.saturating_add(1);
+        Some(claim)
+    }
+
     /// 删除某会话的全部私有声明（会话关闭/删除时调用，防止 id 复用时泄漏）。
     /// 返回删除的声明条数；有删除时推进一次修订号。
     pub fn purge_session(&self, session_id: &str) -> usize {
@@ -1027,6 +1047,56 @@ mod tests {
         let json = serde_json::to_string(view.as_ref()).unwrap();
         let restored: SharedMemoryView = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, *view);
+    }
+
+    #[test]
+    fn retraction_is_scoped_and_revisioned() {
+        let board = SharedMemoryBoard::new(8);
+        board
+            .publish(NewClaim::global("姚明", "身高", "226cm"))
+            .unwrap();
+        board
+            .publish(NewClaim::session("s-1", "姚明", "国籍", "中国"))
+            .unwrap();
+        let global = board.snapshot().claims[0].id.clone();
+        let private = board
+            .snapshot_for("s-1")
+            .claims
+            .iter()
+            .find(|claim| claim.value == "中国")
+            .unwrap()
+            .id
+            .clone();
+        let revision = board.revision();
+        assert!(board
+            .retract_scoped(&private, &MemoryScope::Global)
+            .is_none());
+        assert!(board
+            .retract_scoped(&global, &MemoryScope::session("s-1"))
+            .is_none());
+        assert_eq!(board.len(), 2);
+        assert_eq!(board.revision(), revision);
+        assert_eq!(
+            board
+                .retract_scoped(&global, &MemoryScope::Global)
+                .unwrap()
+                .id,
+            global
+        );
+        assert_eq!(board.len(), 1);
+        assert_eq!(board.revision(), revision + 1);
+        assert!(board
+            .retract_scoped(&global, &MemoryScope::Global)
+            .is_none());
+        assert_eq!(board.revision(), revision + 1);
+        assert_eq!(
+            board
+                .retract_scoped(&private, &MemoryScope::session("s-1"))
+                .unwrap()
+                .id,
+            private
+        );
+        assert_eq!(board.len(), 0);
     }
 
     #[test]

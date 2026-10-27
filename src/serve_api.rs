@@ -41,7 +41,9 @@
 //! - `POST /sessions/import`       导入会话信封重建会话
 //! - `DELETE /sessions/{id}`       关闭会话
 //! - `GET/POST /sessions/{id}/memory` 会话可见的共享语义白板（全局 + 会话私有）
+//! - `DELETE /sessions/{id}/memory/{claim}` 撤回该会话私有声明
 //! - `GET/POST /v1/memory`          全局共享语义白板（`?session=` 只读叠加会话视图）
+//! - `DELETE /v1/memory/{claim}`    撤回全局共享声明
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
 //!   或 `?stream=1` 时按句 SSE 流式返回。轮次有墙钟预算（默认 30 秒 Enforce），
 //!   失败/取消/超时会回滚可观察状态并留下可继续的未完成轮次
@@ -2462,8 +2464,10 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "DELETE /sessions/{id}/open-turn",
                     "GET /sessions/{id}/memory",
                     "POST /sessions/{id}/memory",
+                    "DELETE /sessions/{id}/memory/{claim}",
                     "GET /v1/memory",
                     "POST /v1/memory",
+                    "DELETE /v1/memory/{claim}",
                     "GET /v1/models",
                     "GET /v1/prompts",
                     "POST /v1/events",
@@ -2546,6 +2550,12 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             handle_shared_memory_view(state, session).await
         }
         ("POST", ["v1", "memory"]) => handle_shared_memory_publish(state, request, None).await,
+        ("DELETE", ["sessions", id, "memory", claim_id]) => {
+            handle_shared_memory_retract(state, claim_id, Some(id)).await
+        }
+        ("DELETE", ["v1", "memory", claim_id]) => {
+            handle_shared_memory_retract(state, claim_id, None).await
+        }
         ("DELETE", ["sessions", id]) => {
             if state.close_session(id).await {
                 Response::json(200, &serde_json::json!({"closed": id}))
@@ -2870,6 +2880,39 @@ async fn handle_shared_memory_publish(
             Response::json(status_code, &serde_json::Value::Object(body))
         }
         Err(error) => shared_memory_error_response(&error),
+    }
+}
+
+/// 撤回声明：作用域由路由决定，跨作用域一律 404（不泄漏其它会话是否存在该声明）。
+async fn handle_shared_memory_retract(
+    state: &Arc<ApiState>,
+    claim_id: &str,
+    session_id: Option<&str>,
+) -> Response {
+    if let Some(id) = session_id {
+        if let Err(error) = state.session_tx(id).await {
+            return session_error_response(error);
+        }
+    }
+    let scope = session_id
+        .map(MemoryScope::session)
+        .unwrap_or(MemoryScope::Global);
+    match state.shared_memory.retract_scoped(claim_id, &scope) {
+        Some(claim) => Response::json(
+            200,
+            &serde_json::json!({
+                "status": "retracted",
+                "claim": claim,
+                "memory_revision": state.shared_memory.revision(),
+            }),
+        ),
+        None => Response::json(
+            404,
+            &serde_json::json!({
+                "error": "claim not found in this scope",
+                "code": "not_found",
+            }),
+        ),
     }
 }
 
@@ -4529,6 +4572,83 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["shared_memory"]["claims"], 3);
         assert_eq!(value["shared_memory"]["conflicts"], 1);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/memory",
+            &[("Content-Type", "application/json")],
+            r#"{"subject":"叶莉","predicate":"国籍","value":"中国"}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let global_id = value["claim"]["id"].as_str().unwrap().to_string();
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/memory", first),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let private_id = value["claims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|claim| claim["value"] == "190cm")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}/memory/{}", first, global_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 404, "会话路由不得删除全局声明");
+        let (status, _, body) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/v1/memory/{}", global_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "retracted");
+
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/v1/memory/{}", private_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 404, "全局路由不得删除会话私有声明");
+        let (status, _, body) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}/memory/{}", first, private_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+
+        let (status, _, body) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["shared_memory"]["claims"], 2);
 
         let (status, _, _) = raw_request(
             addr,
