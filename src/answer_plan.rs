@@ -269,60 +269,87 @@ impl AnswerPlan {
 
     /// 按风格指令表达同一份计划。
     pub fn realize(&self, directive: StyleDirective) -> Result<String, PlanRenderError> {
+        self.surface_units(directive).map(|stream| stream.concat())
+    }
+
+    /// 把同一份表达拆成可逐单位提交的表层事件。
+    ///
+    /// 不变量：`surface_units(d).concat()` 与 `realize(d)` 逐字节相等。流式
+    /// 输出因此不是第二套生成器，而只是同一份计划的增量呈现；单位索引、
+    /// 计划 id 与表达标签共同构成可恢复的事件 id。
+    pub fn surface_units(&self, directive: StyleDirective) -> Result<SurfaceUnits, PlanRenderError> {
         if self.claims.is_empty() {
             return Err(PlanRenderError::Empty {
                 subject: self.subject.clone(),
             });
         }
+        let mut builder = SurfaceBuilder::new(self, directive);
         match directive {
-            StyleDirective::Brief => Ok(self.render_window(BRIEF_CLAIM_LIMIT, false)),
-            StyleDirective::Detailed => Ok(self.render_window(usize::MAX, true)),
-            StyleDirective::Restate => Ok(self.render_restate()),
-            StyleDirective::Focus(index) => self.render_focus(index),
+            StyleDirective::Brief => self.build_window(&mut builder, BRIEF_CLAIM_LIMIT, false),
+            StyleDirective::Detailed => self.build_window(&mut builder, usize::MAX, true),
+            StyleDirective::Restate => self.build_restate(&mut builder),
+            StyleDirective::Focus(index) => self.build_focus(&mut builder, index)?,
         }
+        Ok(builder.finish())
     }
 
-    fn render_window(&self, limit: usize, detailed: bool) -> String {
+    fn build_window(&self, builder: &mut SurfaceBuilder, limit: usize, detailed: bool) {
         let total = self.claims.len();
         let shown = limit.min(total);
-        let mut output = if detailed {
-            format!(
-                "完整版（{}/{} 点，计划 {}，知识版本 v{}）：\n",
-                shown, total, self.id, self.revision
-            )
-        } else {
-            format!("简短版（取前 {}/{} 点，未新增事实）：\n", shown, total)
-        };
+        builder.push(
+            SurfaceUnitKind::Header,
+            if detailed {
+                format!(
+                    "完整版（{}/{} 点，计划 {}，知识版本 v{}）：\n",
+                    shown, total, self.id, self.revision
+                )
+            } else {
+                format!("简短版（取前 {}/{} 点，未新增事实）：\n", shown, total)
+            },
+            None,
+            None,
+        );
         for (index, claim) in self.claims.iter().take(shown).enumerate() {
-            let _ = writeln!(
-                output,
-                "  {}. {}{}",
-                index + 1,
-                claim.text.trim(),
-                if detailed {
-                    format!(
-                        "（谓词：{}；来源：{}）{}",
-                        claim.predicate,
-                        claim.source_label(),
-                        format!("{}{}", claim.envelope_note(), claim.evidence_note())
-                    )
-                } else {
-                    String::new()
-                }
+            builder.push(
+                SurfaceUnitKind::Claim,
+                format!(
+                    "  {}. {}{}\n",
+                    index + 1,
+                    claim.text.trim(),
+                    if detailed {
+                        format!(
+                            "（谓词：{}；来源：{}）{}",
+                            claim.predicate,
+                            claim.source_label(),
+                            format!("{}{}", claim.envelope_note(), claim.evidence_note())
+                        )
+                    } else {
+                        String::new()
+                    }
+                ),
+                Some(&claim.slot),
+                Some(index + 1),
             );
         }
         if shown < total {
-            let _ = writeln!(
-                output,
-                "  ……其余 {} 点未展开；输入「完整讲讲」查看全部。",
-                total - shown
+            builder.push(
+                SurfaceUnitKind::Omission,
+                format!(
+                    "  ……其余 {} 点未展开；输入「完整讲讲」查看全部。\n",
+                    total - shown
+                ),
+                None,
+                None,
             );
         }
-        self.append_plan_notes(&mut output, detailed);
-        output.trim_end().to_string()
+        self.build_plan_notes(builder, detailed);
     }
 
-    fn render_focus(&self, index: usize) -> Result<String, PlanRenderError> {
+    fn build_focus(
+        &self,
+        builder: &mut SurfaceBuilder,
+        index: usize,
+    ) -> Result<(), PlanRenderError> {
         let total = self.claims.len();
         let Some(claim) = self.claims.get(index.saturating_sub(1)) else {
             return Err(PlanRenderError::FocusOutOfRange {
@@ -331,26 +358,40 @@ impl AnswerPlan {
                 total,
             });
         };
-        let mut output = format!(
-            "第 {} 点（共 {} 点，计划 {}，知识版本 v{}）：\n",
-            index, total, self.id, self.revision
+        builder.push(
+            SurfaceUnitKind::Header,
+            format!(
+                "第 {} 点（共 {} 点，计划 {}，知识版本 v{}）：\n",
+                index, total, self.id, self.revision
+            ),
+            None,
+            None,
         );
-        let _ = writeln!(
-            output,
-            "  {}（谓词：{}；来源：{}）{}",
-            claim.text.trim(),
-            claim.predicate,
-            claim.source_label(),
-            format!("{}{}", claim.envelope_note(), claim.evidence_note())
+        builder.push(
+            SurfaceUnitKind::Claim,
+            format!(
+                "  {}（谓词：{}；来源：{}）{}\n",
+                claim.text.trim(),
+                claim.predicate,
+                claim.source_label(),
+                format!("{}{}", claim.envelope_note(), claim.evidence_note())
+            ),
+            Some(&claim.slot),
+            Some(index),
         );
         if total > 1 {
-            let _ = writeln!(output, "  输入「完整讲讲」查看全部 {} 点。", total);
+            builder.push(
+                SurfaceUnitKind::Followup,
+                format!("  输入「完整讲讲」查看全部 {} 点。\n", total),
+                None,
+                None,
+            );
         }
-        self.append_plan_notes(&mut output, true);
-        Ok(output.trim_end().to_string())
+        self.build_plan_notes(builder, true);
+        Ok(())
     }
 
-    fn render_restate(&self) -> String {
+    fn build_restate(&self, builder: &mut SurfaceBuilder) {
         let mut indices: Vec<usize> = (0..self.claims.len()).collect();
         indices.sort_by(|left, right| {
             let left = &self.claims[*left];
@@ -360,15 +401,25 @@ impl AnswerPlan {
                 .then_with(|| left.text.cmp(&right.text))
                 .then_with(|| left.slot.cmp(&right.slot))
         });
-        let mut output = format!(
-            "换种表达（同一份计划按主题重排，共 {} 点，未新增事实）：\n",
-            self.claims.len()
+        builder.push(
+            SurfaceUnitKind::Header,
+            format!(
+                "换种表达（同一份计划按主题重排，共 {} 点，未新增事实）：\n",
+                self.claims.len()
+            ),
+            None,
+            None,
         );
         for index in indices {
-            let _ = writeln!(output, "  • {}", self.claims[index].text.trim());
+            let claim = &self.claims[index];
+            builder.push(
+                SurfaceUnitKind::Claim,
+                format!("  • {}\n", claim.text.trim()),
+                Some(&claim.slot),
+                Some(index + 1),
+            );
         }
-        self.append_plan_notes(&mut output, false);
-        output.trim_end().to_string()
+        self.build_plan_notes(builder, false);
     }
 
     /// 比较两份计划，按稳定槽位给出可审计的差异。
@@ -474,27 +525,180 @@ impl AnswerPlan {
         }
     }
 
-    fn append_plan_notes(&self, output: &mut String, detailed: bool) {
+    fn build_plan_notes(&self, builder: &mut SurfaceBuilder, detailed: bool) {
         if self.suppressed > 0 {
-            let _ = writeln!(
-                output,
-                "  （另有 {} 句未通过生成自检，未纳入计划。）",
-                self.suppressed
+            builder.push(
+                SurfaceUnitKind::Suppression,
+                format!(
+                    "  （另有 {} 句未通过生成自检，未纳入计划。）\n",
+                    self.suppressed
+                ),
+                None,
+                None,
             );
         }
         if self.omitted > 0 {
-            let _ = writeln!(
-                output,
-                "  （计划容量上限 {} 点，另有 {} 点未纳入。）",
-                MAX_PLAN_CLAIMS, self.omitted
+            builder.push(
+                SurfaceUnitKind::Capacity,
+                format!(
+                    "  （计划容量上限 {} 点，另有 {} 点未纳入。）\n",
+                    MAX_PLAN_CLAIMS, self.omitted
+                ),
+                None,
+                None,
             );
         }
         if detailed && self.claims.len() > BRIEF_CLAIM_LIMIT {
-            let _ = writeln!(
-                output,
-                "  （说「简短点」可回到前 {} 点摘要。）",
-                BRIEF_CLAIM_LIMIT
+            builder.push(
+                SurfaceUnitKind::Followup,
+                format!(
+                    "  （说「简短点」可回到前 {} 点摘要。）\n",
+                    BRIEF_CLAIM_LIMIT
+                ),
+                None,
+                None,
             );
+        }
+    }
+}
+
+/// 表层单位类别：只决定客户端如何呈现或续传，不改变回答内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceUnitKind {
+    /// 版本/风格抬头。
+    Header,
+    /// 一条计划命题（可对应到稳定槽位）。
+    Claim,
+    /// 简短版截断提示。
+    Omission,
+    /// 生成自检剔除计数。
+    Suppression,
+    /// 计划容量上限计数。
+    Capacity,
+    /// 后续可执行动作提示。
+    Followup,
+}
+
+impl SurfaceUnitKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            SurfaceUnitKind::Header => "header",
+            SurfaceUnitKind::Claim => "claim",
+            SurfaceUnitKind::Omission => "omission",
+            SurfaceUnitKind::Suppression => "suppression",
+            SurfaceUnitKind::Capacity => "capacity",
+            SurfaceUnitKind::Followup => "followup",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            SurfaceUnitKind::Header => "抬头",
+            SurfaceUnitKind::Claim => "命题",
+            SurfaceUnitKind::Omission => "截断",
+            SurfaceUnitKind::Suppression => "自检",
+            SurfaceUnitKind::Capacity => "容量",
+            SurfaceUnitKind::Followup => "后续",
+        }
+    }
+}
+
+/// 一个可按序提交的表层单位；`text` 是该单位要写出的精确字节。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceUnit {
+    /// 在表层流中的位置（从 0 开始）。
+    pub index: usize,
+    pub kind: SurfaceUnitKind,
+    /// 命题单位对应的计划槽位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    /// 命题在计划中的展示序号（从 1 开始；换序表达仍指向原计划位次）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_index: Option<usize>,
+    pub text: String,
+}
+
+/// 一份表达的全部表层单位，保证拼接后与 `AnswerPlan::realize` 完全一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurfaceUnits {
+    pub plan_id: String,
+    pub revision: u64,
+    /// 表达指令的稳定标签（`brief` / `detailed` / `restate` / `focus:N`）。
+    pub directive: String,
+    pub units: Vec<SurfaceUnit>,
+}
+
+impl SurfaceUnits {
+    pub fn concat(&self) -> String {
+        self.units.iter().map(|unit| unit.text.as_str()).collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SurfaceUnit> {
+        self.units.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.units.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
+
+    /// 第 `position` 个单位的事件 id；同一计划、同一表达下稳定可复现。
+    pub fn event_id(&self, position: usize) -> Option<String> {
+        self.units
+            .get(position)
+            .map(|unit| format!("{}:{}:{}", self.plan_id, self.directive, unit.index))
+    }
+}
+
+struct SurfaceBuilder {
+    plan_id: String,
+    revision: u64,
+    directive: String,
+    units: Vec<SurfaceUnit>,
+}
+
+impl SurfaceBuilder {
+    fn new(plan: &AnswerPlan, directive: StyleDirective) -> Self {
+        Self {
+            plan_id: plan.id.clone(),
+            revision: plan.revision,
+            directive: directive.tag(),
+            units: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        kind: SurfaceUnitKind,
+        text: impl Into<String>,
+        slot: Option<&str>,
+        claim_index: Option<usize>,
+    ) {
+        self.units.push(SurfaceUnit {
+            index: self.units.len(),
+            kind,
+            slot: slot.map(str::to_string),
+            claim_index,
+            text: text.into(),
+        });
+    }
+
+    fn finish(mut self) -> SurfaceUnits {
+        if let Some(last) = self.units.last_mut() {
+            let trimmed = last.text.trim_end();
+            if trimmed.len() != last.text.len() {
+                last.text.truncate(trimmed.len());
+            }
+        }
+        SurfaceUnits {
+            plan_id: self.plan_id,
+            revision: self.revision,
+            directive: self.directive,
+            units: self.units,
         }
     }
 }
@@ -748,6 +952,16 @@ impl StyleDirective {
             StyleDirective::Detailed => "完整版",
             StyleDirective::Restate => "换种表达",
             StyleDirective::Focus(_) => "定位单点",
+        }
+    }
+
+    /// 稳定标签：进入表层事件 id，区分同一计划的不同表达。
+    pub fn tag(self) -> String {
+        match self {
+            StyleDirective::Brief => "brief".to_string(),
+            StyleDirective::Detailed => "detailed".to_string(),
+            StyleDirective::Restate => "restate".to_string(),
+            StyleDirective::Focus(index) => format!("focus:{}", index),
         }
     }
 }
@@ -1326,5 +1540,97 @@ mod tests {
         }
         let old: Holder = serde_json::from_str("{}").unwrap();
         assert!(old.plan.is_none());
+    }
+
+    #[test]
+    fn surface_units_concatenate_to_exactly_the_rendered_text() {
+        let plan = sample_plan();
+        for directive in [
+            StyleDirective::Brief,
+            StyleDirective::Detailed,
+            StyleDirective::Restate,
+            StyleDirective::Focus(2),
+        ] {
+            let stream = plan.surface_units(directive).unwrap();
+            assert_eq!(
+                stream.concat(),
+                plan.realize(directive).unwrap(),
+                "{} 必须由同一份表层单位拼接",
+                directive.label()
+            );
+            assert_eq!(stream.len(), stream.units.len());
+            for (position, unit) in stream.iter().enumerate() {
+                assert_eq!(unit.index, position);
+                assert_eq!(
+                    stream.event_id(position),
+                    Some(format!("{}:{}:{}", plan.id, directive.tag(), position))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claim_units_map_to_slots_without_leaking_brief_metadata() {
+        let plan = sample_plan();
+        let brief = plan.surface_units(StyleDirective::Brief).unwrap();
+        let claims: Vec<&SurfaceUnit> = brief
+            .iter()
+            .filter(|unit| unit.kind == SurfaceUnitKind::Claim)
+            .collect();
+        assert_eq!(claims.len(), BRIEF_CLAIM_LIMIT);
+        for (position, unit) in claims.iter().enumerate() {
+            assert_eq!(unit.slot.as_deref(), Some(plan.claims[position].slot.as_str()));
+            assert_eq!(unit.claim_index, Some(position + 1));
+            assert!(!unit.text.contains("谓词："), "简短版不展开元数据：{}", unit.text);
+        }
+        assert_eq!(
+            brief.iter().next().map(|unit| unit.kind),
+            Some(SurfaceUnitKind::Header)
+        );
+        assert_eq!(
+            brief.iter().last().map(|unit| unit.kind),
+            Some(SurfaceUnitKind::Omission)
+        );
+        assert!(brief.concat().contains("完整讲讲"), "{}", brief.concat());
+
+        let detailed = plan.surface_units(StyleDirective::Detailed).unwrap();
+        assert_eq!(
+            detailed
+                .iter()
+                .filter(|unit| unit.kind == SurfaceUnitKind::Claim)
+                .count(),
+            plan.claim_count()
+        );
+        assert!(detailed.concat().contains("来源：图谱事实"));
+        assert_eq!(
+            detailed.iter().last().map(|unit| unit.kind),
+            Some(SurfaceUnitKind::Followup)
+        );
+    }
+
+    #[test]
+    fn surface_units_preserve_focus_errors_and_serialize_with_event_ids() {
+        let plan = sample_plan();
+        assert_eq!(
+            plan.surface_units(StyleDirective::Focus(9)).unwrap_err(),
+            PlanRenderError::FocusOutOfRange {
+                subject: plan.subject.clone(),
+                requested: 9,
+                total: plan.claim_count(),
+            }
+        );
+        let empty = AnswerPlan::new("介绍：无人", "无人", 1, Vec::new(), 0, 0);
+        assert!(matches!(
+            empty.surface_units(StyleDirective::Brief),
+            Err(PlanRenderError::Empty { .. })
+        ));
+
+        let brief = plan.surface_units(StyleDirective::Brief).unwrap();
+        let detailed = plan.surface_units(StyleDirective::Detailed).unwrap();
+        let json = serde_json::to_string(&brief).unwrap();
+        let restored: SurfaceUnits = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, brief);
+        assert_ne!(brief.event_id(0), detailed.event_id(0));
+        assert_eq!(brief.event_id(brief.len()), None);
     }
 }
