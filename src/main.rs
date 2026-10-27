@@ -100,7 +100,7 @@ use know_prolog::{
     query_planner::QueryPlanner,
     recovery::RecoveryMode,
     reference_probe::{self, GroundingLedger, ProbeDecision, ProbeStatus},
-    relation_acquisition::{GoalOpen, RelationAcquisition},
+    relation_acquisition::{AcquisitionSource, GoalOpen, RelationAcquisition},
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, RelationFrame,
         FRAME_DIALECT,
@@ -119,6 +119,7 @@ use know_prolog::{
     startup_ledger::StartupLedger,
     symbolic_generator::SymbolicGenerator,
     symbolic_reasoner::{FormalClarificationOutcome, LanguagePolicySync, SymbolicReasoner},
+    teachable_assertion::{TarDecision, TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
     view_render::{
@@ -8838,6 +8839,12 @@ fn persist_acquisition(acquisition: &RelationAcquisition, path: &str) {
     }
 }
 
+fn persist_assertion_reader(reader: &TeachableAssertionReader, path: &str) {
+    if let Err(error) = reader.save_to_path(path) {
+        eprintln!("断言阅读器保存失败：{}", error);
+    }
+}
+
 fn persist_pattern_forge(forge: &PatternForge, path: &str) {
     if let Err(error) = forge.save_to_path(path) {
         eprintln!("锻造台账保存失败：{}", error);
@@ -9451,6 +9458,20 @@ async fn run_interactive_mode(
             "已恢复关系获取账本：{} 条，诱导模式 {} 个。",
             acquisition.claims().count(),
             acquisition.patterns().count()
+        );
+    }
+    let assertion_reader_path = format!("{}/teachable_assertions.json", store_path);
+    let mut assertion_reader =
+        TeachableAssertionReader::load_from_path(&assertion_reader_path).unwrap_or_default();
+    if assertion_reader.turn_count() > 0 {
+        println!(
+            "已恢复断言阅读器：提及卡 {} 张，{}。",
+            assertion_reader.mentions().count(),
+            if assertion_reader.has_pending() {
+                "有一条待确认断言"
+            } else {
+                "没有待确认断言"
+            }
         );
     }
     let shape_dialogue_path = format!("{}/shape_dialogue.json", store_path);
@@ -10729,6 +10750,63 @@ async fn run_interactive_mode(
             continue;
         }
 
+        if matches!(
+            input,
+            "断言阅读" | "断言阅读报告" | "待确认断言" | "提及卡" | "断言台账"
+        ) {
+            println!("{}", assertion_reader.report());
+            println!();
+            continue;
+        }
+
+        if matches!(input, "清空断言" | "取消断言" | "放弃断言") {
+            assertion_reader.clear_pending();
+            persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+            println!("已清除待确认断言（会话覆盖层与知识图谱不变）。");
+            println!();
+            continue;
+        }
+
+        if matches!(input, "确认断言" | "确认当前断言") {
+            match assertion_reader.pending_claim_id().map(str::to_string) {
+                Some(claim_id) => {
+                    let outcome = acquisition.confirm(Some(&claim_id));
+                    println!("{}", outcome.message);
+                    if let Some(proposal) = outcome.commit.as_ref() {
+                        let answer = symbolic_reasoner.assert_nl_fact(&proposal.sentence);
+                        if acquisition.mark_admitted(&proposal.claim_id) {
+                            println!(
+                                "已记入会话事实：{}（未写入知识图谱）。",
+                                proposal.sentence
+                            );
+                        }
+                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                    }
+                    assertion_reader.clear_pending();
+                    persist_acquisition(&acquisition, &acquisition_path);
+                    persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                }
+                None => println!("当前没有待确认的断言（可先输入自由陈述句）。"),
+            }
+            println!();
+            continue;
+        }
+
+        if matches!(input, "否认断言" | "否认当前断言") {
+            match assertion_reader.pending_claim_id().map(str::to_string) {
+                Some(claim_id) => {
+                    let outcome = acquisition.deny(Some(&claim_id));
+                    println!("{}", outcome.message);
+                    assertion_reader.clear_pending();
+                    persist_acquisition(&acquisition, &acquisition_path);
+                    persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                }
+                None => println!("当前没有待否认的断言。"),
+            }
+            println!();
+            continue;
+        }
+
         if let Some(rest) = strip_any_prefix(input, &["确认获取", "确认关系获取", "确认问答获取"])
         {
             let id = rest
@@ -11041,6 +11119,95 @@ async fn run_interactive_mode(
             println!("形状填充对话状态已重置（关系获取账本与知识图谱保持不变）。");
             println!();
             continue;
+        }
+
+        // 可教断言：上一轮刚问过「对/不对」或「是哪类实体」，本轮短答优先落在这里。
+        if assertion_reader.has_pending()
+            && !is_command_like(input)
+            && !matches!(
+                detect_input_mode(input, &language_config.nlp.import_keywords),
+                InputMode::KnowledgeImport
+            )
+        {
+            let types_snapshot = oxigraph_manager.type_system_snapshot();
+            match assertion_reader.respond(input, &types_snapshot) {
+                TarResponse::Confirm { claim_id } => {
+                    let outcome = acquisition.confirm(Some(&claim_id));
+                    println!("{}", outcome.message);
+                    if let Some(proposal) = outcome.commit.as_ref() {
+                        let answer = symbolic_reasoner.assert_nl_fact(&proposal.sentence);
+                        if acquisition.mark_admitted(&proposal.claim_id) {
+                            println!(
+                                "已记入会话事实：{}（未写入知识图谱）。",
+                                proposal.sentence
+                            );
+                        }
+                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                    }
+                    persist_acquisition(&acquisition, &acquisition_path);
+                    persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                    println!();
+                    continue;
+                }
+                TarResponse::Deny { claim_id } => {
+                    let outcome = acquisition.deny(Some(&claim_id));
+                    println!("{}", outcome.message);
+                    persist_acquisition(&acquisition, &acquisition_path);
+                    persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                    println!();
+                    continue;
+                }
+                TarResponse::TypeResolved {
+                    frame,
+                    mention,
+                    type_name,
+                } => {
+                    match acquisition_context(&oxigraph_manager, &language_config).await {
+                        Ok((facts, registry, types, shapes)) => {
+                            let source_text = frame.source_text.clone();
+                            let outcome = acquisition.record_assertion(
+                                frame.to_claim(),
+                                AcquisitionSource::UserAssertion,
+                                &source_text,
+                                "断言阅读",
+                                &facts,
+                                &registry,
+                                &types,
+                                &shapes,
+                            );
+                            assertion_reader
+                                .mark_proposed(frame.clone(), outcome.claim_id.clone());
+                            println!(
+                                "好，我按「{}」是{}理解。我理解为：{}。要记入本轮会话吗？（对/不对）",
+                                mention,
+                                type_name,
+                                frame.render_text()
+                            );
+                            if let Some(claim_id) = outcome.claim_id.as_deref() {
+                                if let Some(claim) = acquisition.claim(claim_id) {
+                                    if !claim.notes.is_empty() {
+                                        println!("（{}）", claim.notes.join("；"));
+                                    }
+                                }
+                            }
+                            persist_acquisition(&acquisition, &acquisition_path);
+                            persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                        }
+                        Err(error) => eprintln!("加载断言阅读上下文失败：{}", error),
+                    }
+                    println!();
+                    continue;
+                }
+                TarResponse::Cancelled => {
+                    println!("好，这条关系先不记。");
+                    persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                    println!();
+                    continue;
+                }
+                TarResponse::None => {
+                    persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                }
+            }
         }
 
         if shape_dialogue.has_pending()
@@ -14435,6 +14602,74 @@ async fn run_interactive_mode(
 
         let mode = detect_input_mode(input, &language_config.nlp.import_keywords);
 
+        // 自由陈述先过可教断言阅读器：高精度候选进入 QRA 账本等待确认；
+        // 不识别时返回 Ignore，原蕴含/溯因管线保持不变。
+        if matches!(&mode, InputMode::Query)
+            && !is_command_like(input)
+            && !RelationAcquisition::looks_like_question(input)
+        {
+            match acquisition_context(&oxigraph_manager, &language_config).await {
+                Ok((facts, registry, types, shapes)) => {
+                    grammar_extractor
+                        .set_lexicon_if_changed(&oxigraph_manager.predicate_query_pairs());
+                    let grammar_triples = grammar_extractor.extract(input);
+                    let reading = assertion_reader.read_statement(
+                        input,
+                        &grammar_triples,
+                        &facts,
+                        &registry,
+                        &types,
+                    );
+                    match reading.decision {
+                        TarDecision::Propose { frame } => {
+                            let outcome = acquisition.record_assertion(
+                                frame.to_claim(),
+                                AcquisitionSource::UserAssertion,
+                                input,
+                                "断言阅读",
+                                &facts,
+                                &registry,
+                                &types,
+                                &shapes,
+                            );
+                            assertion_reader.mark_proposed(frame, outcome.claim_id.clone());
+                            println!("{}", reading.message);
+                            if let Some(claim_id) = outcome.claim_id.as_deref() {
+                                if let Some(claim) = acquisition.claim(claim_id) {
+                                    if !claim.notes.is_empty() {
+                                        println!("（{}）", claim.notes.join("；"));
+                                    }
+                                }
+                            }
+                            persist_acquisition(&acquisition, &acquisition_path);
+                            persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                            println!();
+                            continue;
+                        }
+                        TarDecision::ClarifyType { .. } => {
+                            println!("{}", reading.message);
+                            persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                            println!();
+                            continue;
+                        }
+                        TarDecision::TypeLearned { .. } => {
+                            println!("{}", reading.message);
+                            persist_assertion_reader(&assertion_reader, &assertion_reader_path);
+                            println!();
+                            continue;
+                        }
+                        TarDecision::AlreadyKnown { .. } => {
+                            println!("{}", reading.message);
+                            println!();
+                            continue;
+                        }
+                        TarDecision::Ignore => {}
+                    }
+                }
+                Err(error) => eprintln!("加载断言阅读上下文失败：{}", error),
+            }
+        }
+
         match mode {
             InputMode::KnowledgeImport => {
                 {
@@ -16273,6 +16508,8 @@ fn interactive_help() -> String {
         "  关系获取：S 的 P / 获取台账         以问代抽：槽位追问、会话账本、覆盖层与诱导模式",
         "  获取缺口 / 获取模式 / 模式扫描：…    形状缺口转追问、诱导模式库与文本扫描",
         "  确认获取 / 采纳获取 / 模式扫描：…    确认、写入会话事实集、用诱导模式扫描新文本",
+        "  断言阅读 / 待确认断言 / 提及卡       自由陈述的类型证据、确认状态与会话提及",
+        "  确认断言 / 否认断言 / 清空断言       对待确认断言表态（只进会话，不写图谱）",
         "  形状报告 / 形状校验                  必备属性、基数、类型与定义域/值域校验",
         "  形状画像：<实体>                     形状完整画像：已知/缺失/冲突/未知 + 一次缺口追问",
         "  裁定：<实体> 的 <谓词> = <值>         会话内收敛冲突（不写图谱）",
@@ -16830,6 +17067,18 @@ fn is_command_like(input: &str) -> bool {
         "获取覆盖",
         "会话覆盖层",
         "覆盖层",
+        "断言阅读",
+        "断言阅读报告",
+        "待确认断言",
+        "提及卡",
+        "断言台账",
+        "清空断言",
+        "取消断言",
+        "放弃断言",
+        "确认断言",
+        "确认当前断言",
+        "否认断言",
+        "否认当前断言",
         "确认获取",
         "确认关系获取",
         "否认获取",

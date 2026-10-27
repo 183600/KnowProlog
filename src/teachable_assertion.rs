@@ -223,6 +223,13 @@ impl TeachableAssertionReader {
         self.pending.as_ref()
     }
 
+    pub fn pending_claim_id(&self) -> Option<&str> {
+        match self.pending.as_ref().map(|pending| &pending.stage) {
+            Some(PendingStage::ConfirmClaim { claim_id }) => Some(claim_id.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn clear_pending(&mut self) {
         self.pending = None;
     }
