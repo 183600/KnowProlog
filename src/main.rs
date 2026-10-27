@@ -239,6 +239,10 @@ enum Commands {
         /// Fact to adjudicate as SUBJECT|PREDICATE|OBJECT (repeatable)
         #[arg(long = "fact", value_name = "S|P|O")]
         fact: Vec<String>,
+        /// File of facts to adjudicate, one SUBJECT|PREDICATE|OBJECT per line
+        /// (blank lines and # comments are ignored)
+        #[arg(long, value_name = "PATH")]
+        facts_file: Option<String>,
         /// Question text; its interrogative type constrains the replacement
         #[arg(long)]
         question: Option<String>,
@@ -1585,6 +1589,7 @@ async fn main() {
     if let Some(Commands::Privacy {
         text,
         fact,
+        facts_file,
         question,
         purpose,
         precision,
@@ -1602,6 +1607,7 @@ async fn main() {
         run_privacy(
             text.as_deref(),
             fact,
+            facts_file.as_deref(),
             question.as_deref(),
             purpose,
             precision,
@@ -6097,6 +6103,7 @@ fn run_open_closure(
 fn run_privacy(
     text: Option<&str>,
     facts: &[String],
+    facts_file: Option<&str>,
     question: Option<&str>,
     purpose: &str,
     precision: &str,
@@ -6139,6 +6146,15 @@ fn run_privacy(
             Err(error) => {
                 eprintln!("{}", error);
                 std::process::exit(2);
+            }
+        }
+    }
+    if let Some(path) = facts_file {
+        match read_privacy_facts(path) {
+            Ok(file_facts) => parsed_facts.extend(file_facts),
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(1);
             }
         }
     }
@@ -6276,6 +6292,14 @@ fn run_privacy(
         }
     }
 
+    let audit_summary = if decisions.is_empty() {
+        None
+    } else {
+        Some(privacy_flow::AuditSummary::from_decisions(
+            decisions.iter().map(|(_, _, _, decision)| decision),
+        ))
+    };
+
     if let Some(path) = session_path {
         let canonical = match ledger.canonical_json() {
             Ok(canonical) => canonical,
@@ -6312,6 +6336,7 @@ fn run_privacy(
             "requested_precision": requested.code(),
             "spans": spans,
             "redaction": redaction,
+            "audit_summary": audit_summary,
             "facts": fact_reports,
             "ledger": ledger,
             "ledger_digest": ledger.digest(),
@@ -6377,6 +6402,9 @@ fn run_privacy(
                 render_privacy_decision(subject, predicate, object, decision)
             );
         }
+    }
+    if let Some(summary) = &audit_summary {
+        println!("{}", summary.render());
     }
     println!(
         "台账：第 {} 轮，授权 {} 条，披露 {} 条，墓碑 {} 条（摘要 {}）",
@@ -6456,6 +6484,22 @@ fn load_privacy_policy(path: &str) -> Result<PrivacyPolicy, String> {
     };
     policy.merge_default_rules();
     Ok(policy)
+}
+
+fn read_privacy_facts(path: &str) -> Result<Vec<(String, String, String)>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("读取事实文件失败（{}）：{}", path, error))?;
+    let mut facts = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let fact = parse_privacy_fact(trimmed)
+            .map_err(|error| format!("{}:{} {}", path, index + 1, error))?;
+        facts.push(fact);
+    }
+    Ok(facts)
 }
 
 fn parse_privacy_fact(raw: &str) -> Result<(String, String, String), String> {

@@ -1682,6 +1682,130 @@ pub struct PrivacyReceipt {
     pub turn: u64,
 }
 
+/// 批量审计摘要。`Audit` 模式使用影子结论统计，`Enforce` 模式使用实际结论，
+/// 因而同一份策略可以先在影子模式度量公开事实保留率与误拦率。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditSummary {
+    pub total: usize,
+    pub allowed: usize,
+    pub downgraded: usize,
+    pub needs_consent: usize,
+    pub blocked: usize,
+    /// 非敏感（`Other`）事实数：它们本应原样回答。
+    pub public_total: usize,
+    pub public_retained: usize,
+    /// 非敏感事实中被降级或阻断的数量。
+    pub public_changed: usize,
+    pub sensitive_total: usize,
+    pub sensitive_retained: usize,
+    pub closure_truncated: usize,
+    pub code_counts: BTreeMap<String, usize>,
+}
+
+impl AuditSummary {
+    pub fn from_decisions<'a>(
+        decisions: impl IntoIterator<Item = &'a DisclosureDecision>,
+    ) -> Self {
+        let mut summary = Self::default();
+        for decision in decisions {
+            summary.total += 1;
+            let (status, precision) = match &decision.audit {
+                Some(audit) => (audit.would_be_status, audit.would_be_precision),
+                None => (decision.status, decision.effective_precision),
+            };
+            match status {
+                DisclosureStatus::Allowed => summary.allowed += 1,
+                DisclosureStatus::Downgraded => summary.downgraded += 1,
+                DisclosureStatus::NeedsConsent => summary.needs_consent += 1,
+                DisclosureStatus::Blocked => summary.blocked += 1,
+            }
+            let retained = precision == decision.requested_precision;
+            if decision.category == PrivacyCategory::Other {
+                summary.public_total += 1;
+                if retained {
+                    summary.public_retained += 1;
+                } else {
+                    summary.public_changed += 1;
+                }
+            } else {
+                summary.sensitive_total += 1;
+                if retained {
+                    summary.sensitive_retained += 1;
+                }
+            }
+            let codes = match &decision.audit {
+                Some(audit) => audit.codes.as_slice(),
+                None => decision.codes.as_slice(),
+            };
+            for code in codes {
+                *summary
+                    .code_counts
+                    .entry(code.code().to_string())
+                    .or_insert(0) += 1;
+                if *code == DecisionCode::ClosureTruncated {
+                    summary.closure_truncated += 1;
+                }
+            }
+        }
+        summary
+    }
+
+    /// 公开事实按请求精度保留的比例；没有公开事实时视为 1。
+    pub fn public_retention(&self) -> f64 {
+        ratio(self.public_retained, self.public_total)
+    }
+
+    /// 公开事实被误拦的比例；没有公开事实时视为 0。
+    pub fn false_block_rate(&self) -> f64 {
+        if self.public_total == 0 {
+            0.0
+        } else {
+            (self.public_changed as f64) / (self.public_total as f64)
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mut text = format!(
+            "审计摘要：{} 条；允许 {}，降级 {}，待授权 {}，阻断 {}；公开事实保留 {}/{}（{:.1}%），误降级/误拦 {:.1}%；敏感事实保持请求精度 {}/{}",
+            self.total,
+            self.allowed,
+            self.downgraded,
+            self.needs_consent,
+            self.blocked,
+            self.public_retained,
+            self.public_total,
+            self.public_retention() * 100.0,
+            self.false_block_rate() * 100.0,
+            self.sensitive_retained,
+            self.sensitive_total
+        );
+        if self.closure_truncated > 0 {
+            text.push_str(&format!(
+                "；闭包截断 {} 条（按保守结论计）",
+                self.closure_truncated
+            ));
+        }
+        if !self.code_counts.is_empty() {
+            let codes = self
+                .code_counts
+                .iter()
+                .map(|(code, count)| format!("{}={}", code, count))
+                .collect::<Vec<_>>()
+                .join(" ");
+            text.push_str(&format!("；决策码：{}", codes));
+        }
+        text
+    }
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        1.0
+    } else {
+        (numerator as f64) / (denominator as f64)
+    }
+}
+
 /// 一次披露的完整裁决。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisclosureDecision {
@@ -2642,6 +2766,65 @@ mod tests {
         assert!(overlay
             .hide
             .contains(&("张三".to_string(), "地址".to_string())));
+    }
+
+    #[test]
+    fn audit_summary_counts_retention_and_consent() {
+        let mut policy = PrivacyPolicy::default();
+        policy.mode = PolicyMode::Audit;
+        policy.k_anonymity = 1;
+        let mut graph = PrivacyGraph::new();
+        graph.add_fact(&policy, "张三", "职业", "工程师");
+        graph.add_fact(&policy, "张三", "电话", "13800138000");
+        graph.add_fact(&policy, "张三", "地址", "北京市海淀区中关村大街1号");
+        let mut ledger = ledger();
+        let mut adjudicator = PrivacyAdjudicator::new(&policy, &graph, &mut ledger);
+        let decisions = vec![
+            adjudicator.adjudicate(&DisclosureRequest::new("张三", "职业", "工程师")),
+            adjudicator.adjudicate(&DisclosureRequest::new("张三", "电话", "13800138000")),
+            adjudicator.adjudicate(&DisclosureRequest::new(
+                "张三",
+                "地址",
+                "北京市海淀区中关村大街1号",
+            )),
+        ];
+
+        let summary = AuditSummary::from_decisions(&decisions);
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.allowed, 1);
+        assert_eq!(summary.needs_consent, 1);
+        assert_eq!(summary.downgraded, 1);
+        assert_eq!(summary.blocked, 0);
+        assert_eq!(summary.public_total, 1);
+        assert_eq!(summary.public_retained, 1);
+        assert_eq!(summary.public_changed, 0);
+        assert_eq!(summary.false_block_rate(), 0.0);
+        assert_eq!(summary.public_retention(), 1.0);
+        assert_eq!(summary.sensitive_total, 2);
+        assert_eq!(summary.sensitive_retained, 0);
+        assert_eq!(summary.code_counts.get("consent_required"), Some(&1));
+        assert_eq!(summary.code_counts.get("policy_ceiling"), Some(&2));
+        assert!(summary.render().contains("公开事实保留 1/1"));
+    }
+
+    #[test]
+    fn audit_summary_flags_public_fact_false_block() {
+        let mut policy = PrivacyPolicy::default();
+        policy.mode = PolicyMode::Audit;
+        policy.k_anonymity = 1;
+        let mut graph = PrivacyGraph::new();
+        graph.add_fact(&policy, "张三", "职业", "工程师");
+        let mut ledger = ledger();
+        ledger.forget_subject("张三", "用户要求遗忘");
+        let mut adjudicator = PrivacyAdjudicator::new(&policy, &graph, &mut ledger);
+        let decision = adjudicator.adjudicate(&DisclosureRequest::new("张三", "职业", "工程师"));
+
+        let summary = AuditSummary::from_decisions([&decision]);
+        assert_eq!(summary.public_total, 1);
+        assert_eq!(summary.public_changed, 1);
+        assert_eq!(summary.false_block_rate(), 1.0);
+        assert_eq!(summary.blocked, 1);
+        assert_eq!(summary.code_counts.get("tombstoned"), Some(&1));
     }
 
     #[test]
