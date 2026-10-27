@@ -52,6 +52,8 @@ pub const DEFAULT_TOP_N: usize = 5;
 pub const DEFAULT_SAMPLE_LIMIT: usize = 8;
 /// 台账一次最多展示的批次数。
 pub const MAX_LEDGER_ROWS: usize = 50;
+/// 批次内实体列表 / 单主体事实列表的展示上限。
+pub const DEFAULT_ENTITY_LIMIT: usize = 20;
 
 type EpisodeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -558,7 +560,9 @@ impl TypeFocus {
 
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
-            Self::Person => &["person", "people", "human", "人物", "人员"],
+            Self::Person => &[
+                "person", "people", "human", "人物", "人员", "哪些人", "几个人", "多少人",
+            ],
             Self::Organization => &[
                 "organization",
                 "organisation",
@@ -608,11 +612,22 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// 类型标签是否命中某个类型焦点（大小写不敏感的子串匹配）。
+pub fn type_label_matches(label: &str, focus: TypeFocus) -> bool {
+    let lower = label.to_ascii_lowercase();
+    focus
+        .aliases()
+        .iter()
+        .any(|alias| lower.contains(&alias.to_ascii_lowercase()))
+}
+
 /// 识别问题里的类型焦点（人物 / 组织 / 地点 / 事件 / 作品）。
 pub fn classify_type_focus(text: &str) -> Option<TypeFocus> {
     let lower = text.to_ascii_lowercase();
     let has = |needles: &[&str]| contains_any(&lower, needles);
-    if has(&["人物", "人员", "都有谁", "有谁", "person", "people"]) {
+    if has(&[
+        "人物", "人员", "哪些人", "几个人", "多少人", "都有谁", "有谁", "person", "people",
+    ]) {
         Some(TypeFocus::Person)
     } else if has(&[
         "公司",

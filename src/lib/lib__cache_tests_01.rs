@@ -1619,6 +1619,86 @@
         );
     }
 
+    /// 批次问题只在出现批次线索时回答；类型名单与单主体事实来自批次命名图。
+    #[tokio::test]
+    async fn import_episode_answers_are_scoped_to_the_batch_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let turtle = concat!(
+            "@prefix kg: <http://example.org/kg/> .\n",
+            "<http://example.org/kg/entity/张三> a kg:Person ; kg:name \"张三\" ; kg:age \"30\" .\n",
+            "<http://example.org/kg/entity/李四> a kg:Person ; kg:name \"李四\" ; kg:knows <http://example.org/kg/entity/张三> .\n",
+            "<http://example.org/kg/entity/北京> a kg:Place ; kg:name \"北京\" .\n",
+        );
+        manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                turtle.as_bytes(),
+                "data/people.ttl",
+            )
+            .await
+            .unwrap();
+        let episodes = manager.load_import_episodes().await.unwrap();
+        assert_eq!(episodes.len(), 1);
+
+        let people = manager
+            .answer_import_episode_question("这批里有哪些人物", &episodes)
+            .await
+            .unwrap()
+            .expect("批次问题应有回答");
+        assert!(people.contains("张三"), "{}", people);
+        assert!(people.contains("李四"), "{}", people);
+        assert!(!people.contains("北京"), "{}", people);
+
+        let facts = manager
+            .answer_import_episode_question("这批里关于张三有哪些事实", &episodes)
+            .await
+            .unwrap()
+            .expect("批次问题应有回答");
+        assert!(facts.contains("张三"), "{}", facts);
+        assert!(facts.contains("李四 knows 张三"), "{}", facts);
+        assert!(facts.contains("[B1-"), "{}", facts);
+
+        let count = manager
+            .answer_import_episode_question("这批有多少条断言", &episodes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(count.contains("批次 B1 共 8 条断言"), "{}", count);
+
+        let types = manager
+            .answer_import_episode_question("这批有哪些类型", &episodes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(types.contains("Person×2"), "{}", types);
+        assert!(types.contains("Place×1"), "{}", types);
+
+        let source = manager
+            .answer_import_episode_question("这批的来源是什么", &episodes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source.contains("data/people.ttl"), "{}", source);
+
+        let changes = manager
+            .answer_import_episode_question("这批新增多少、重复多少", &episodes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(changes.contains("新增 8 条"), "{}", changes);
+
+        assert!(manager
+            .answer_import_episode_question("张三多大", &episodes)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(manager
+            .answer_import_episode_question("这批讲了什么", &[])
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     /// 空白节点是内容寻址的例外：回执必须披露，且解析失败不留下批次。
     #[tokio::test]
     async fn import_rdf_batch_discloses_blank_nodes_and_parse_failures() {

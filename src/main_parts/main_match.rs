@@ -132,32 +132,43 @@
                 }
             };
             if let Some(reference) = reference {
-                match know_prolog::import_episode::resolve_episode_reference(
-                    &reference,
-                    &episodes,
-                ) {
-                    Some(episode) => {
-                        if json {
-                            match serde_json::to_string_pretty(episode) {
-                                Ok(text) => println!("{}", text),
-                                Err(error) => {
-                                    eprintln!("JSON 序列化失败：{}", error);
-                                    std::process::exit(1);
-                                }
+                if json {
+                    match know_prolog::import_episode::resolve_episode_reference(
+                        &reference,
+                        &episodes,
+                    ) {
+                        Some(episode) => match serde_json::to_string_pretty(episode) {
+                            Ok(text) => println!("{}", text),
+                            Err(error) => {
+                                eprintln!("JSON 序列化失败：{}", error);
+                                std::process::exit(1);
                             }
-                        } else {
-                            println!(
-                                "{}",
-                                know_prolog::import_episode::render_episode_brief(episode)
+                        },
+                        None => {
+                            eprintln!(
+                                "没有匹配的导入批次：{}（可用 episodes 查看当前批次）",
+                                reference
                             );
+                            std::process::exit(1);
                         }
                     }
-                    None => {
-                        eprintln!(
-                            "没有匹配的导入批次：{}（可用 episodes 查看当前批次）",
-                            reference
-                        );
-                        std::process::exit(1);
+                } else {
+                    match oxigraph_manager
+                        .answer_import_episode_question(&reference, &episodes)
+                        .await
+                    {
+                        Ok(Some(answer)) => println!("{}", answer),
+                        Ok(None) => {
+                            eprintln!(
+                                "没有匹配的导入批次：{}（可用 episodes 查看当前批次）",
+                                reference
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(error) => {
+                            eprintln!("读取导入批次失败：{}", error);
+                            std::process::exit(1);
+                        }
                     }
                 }
             } else if json {

@@ -1131,19 +1131,20 @@
         if know_prolog::import_episode::looks_like_episode_reference(input) {
             match oxigraph_manager.load_import_episodes().await {
                 Ok(episodes) => {
-                    match know_prolog::import_episode::resolve_episode_reference(input, &episodes) {
-                        Some(episode) => println!(
-                            "{}",
-                            know_prolog::import_episode::render_episode_brief(episode)
-                        ),
-                        None if episodes.is_empty() => {
+                    match oxigraph_manager
+                        .answer_import_episode_question(input, &episodes)
+                        .await
+                    {
+                        Ok(Some(answer)) => println!("{}", answer),
+                        Ok(None) if episodes.is_empty() => {
                             println!("还没有 RDF 导入批次；没有可用于「这批」的阅读记录。")
                         }
-                        None => println!(
+                        Ok(None) => println!(
                             "没有匹配的批次「{}」。可用「批次台账」查看现有 {} 批。",
                             input,
                             episodes.len()
                         ),
+                        Err(error) => eprintln!("读取导入批次失败：{}", error),
                     }
                 }
                 Err(error) => eprintln!("读取导入批次失败：{}", error),

@@ -16,6 +16,21 @@ impl From<oxigraph::store::StorageError> for ImportBatchTransactionError {
     }
 }
 
+fn push_unique_episode_fact(
+    facts: &mut Vec<crate::import_episode::GistFact>,
+    seen: &mut BTreeSet<(String, String, String)>,
+    quad: &Quad,
+) {
+    let fact = crate::import_episode::gist_fact(quad);
+    if seen.insert((
+        fact.subject.clone(),
+        fact.predicate.clone(),
+        fact.object.clone(),
+    )) {
+        facts.push(fact);
+    }
+}
+
 impl OxigraphManager {
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::with_perf_ledger(store_path, Arc::new(perf_ledger::PerfLedger::new()))
@@ -1067,6 +1082,155 @@ impl OxigraphManager {
         Ok(crate::import_episode::parse_episode_graph(
             quads.into_iter(),
         ))
+    }
+
+    /// 回答带批次线索的问题：先解析批次，再按意图从 gist 或批次命名图取数。
+    ///
+    /// 只有出现批次线索（这批 / 上一批 / 第 N 批 / 来源文件 / 批次 id）时才返回
+    /// `Some`；普通问题返回 `None`，仍走全局图谱，避免最近导入偏置。
+    pub async fn answer_import_episode_question(
+        &self,
+        text: &str,
+        episodes: &[crate::import_episode::ImportEpisode],
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(episode) = crate::import_episode::resolve_episode_reference(text, episodes) else {
+            return Ok(None);
+        };
+        let question = crate::import_episode::classify_episode_question(text);
+        match question {
+            crate::import_episode::EpisodeQuestion::TypeEntities(focus) => {
+                if let Some(answer) = self.batch_type_entities_answer(episode, focus).await? {
+                    return Ok(Some(answer));
+                }
+            }
+            crate::import_episode::EpisodeQuestion::SubjectFacts => {
+                if let Some(answer) = self.batch_subject_facts_answer(episode, text).await? {
+                    return Ok(Some(answer));
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(crate::import_episode::render_episode_answer(
+            episode, question,
+        )))
+    }
+
+    /// 从批次命名图列出某类实体的有界名单（类型标签按焦点别名匹配）。
+    async fn batch_type_entities_answer(
+        &self,
+        episode: &crate::import_episode::ImportEpisode,
+        focus: crate::import_episode::TypeFocus,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(&episode.batch_graph)?);
+        let rdf_type = NamedNode::new(RDF_TYPE_IRI)?;
+        let store = self.store.lock().await;
+        let quads = store
+            .quads_for_pattern(None, Some(rdf_type.as_ref()), None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut by_type: std::collections::BTreeMap<String, BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for quad in &quads {
+            let Term::NamedNode(type_node) = &quad.object else {
+                continue;
+            };
+            by_type
+                .entry(crate::import_episode::display_named_node(type_node))
+                .or_default()
+                .insert(crate::import_episode::display_subject(&quad.subject));
+        }
+        let mut labels = Vec::new();
+        let mut entities = BTreeSet::new();
+        for (label, subjects) in &by_type {
+            if crate::import_episode::type_label_matches(label, focus) {
+                labels.push(label.clone());
+                entities.extend(subjects.iter().cloned());
+            }
+        }
+        if labels.is_empty() {
+            return Ok(None);
+        }
+        let total = entities.len();
+        let shown: Vec<String> = entities
+            .into_iter()
+            .take(crate::import_episode::DEFAULT_ENTITY_LIMIT)
+            .collect();
+        Ok(Some(crate::import_episode::render_episode_type_entities(
+            episode,
+            &labels.join(" / "),
+            total,
+            &shown,
+        )))
+    }
+
+    /// 从批次命名图回答单主体问题：匹配问题中最长的已知实体名，返回出入边。
+    async fn batch_subject_facts_answer(
+        &self,
+        episode: &crate::import_episode::ImportEpisode,
+        text: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(&episode.batch_graph)?);
+        let store = self.store.lock().await;
+        let quads = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut best: Option<(usize, NamedNode)> = None;
+        for quad in &quads {
+            let mut candidates: Vec<&NamedNode> = Vec::new();
+            if let Subject::NamedNode(node) = &quad.subject {
+                candidates.push(node);
+            }
+            if quad.predicate.as_str() != RDF_TYPE_IRI {
+                if let Term::NamedNode(node) = &quad.object {
+                    candidates.push(node);
+                }
+            }
+            for node in candidates {
+                let name = crate::import_episode::display_named_node(node);
+                let length = name.chars().count();
+                if length < 2 || !text.contains(&name) {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .map_or(true, |(best_length, _)| length > *best_length)
+                {
+                    best = Some((length, node.clone()));
+                }
+            }
+        }
+        let Some((_, node)) = best else {
+            return Ok(None);
+        };
+        let subject = Subject::NamedNode(node.clone());
+        let mut facts = Vec::new();
+        let mut seen = BTreeSet::new();
+        for quad in store
+            .quads_for_pattern(Some(subject.as_ref()), None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            push_unique_episode_fact(&mut facts, &mut seen, &quad);
+        }
+        let object = Term::NamedNode(node.clone());
+        for quad in store
+            .quads_for_pattern(None, None, Some(object.as_ref()), Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?
+        {
+            push_unique_episode_fact(&mut facts, &mut seen, &quad);
+        }
+        facts.sort_by(|left, right| {
+            left.subject
+                .cmp(&right.subject)
+                .then_with(|| left.predicate.cmp(&right.predicate))
+                .then_with(|| left.object.cmp(&right.object))
+        });
+        let total = facts.len();
+        facts.truncate(crate::import_episode::DEFAULT_ENTITY_LIMIT);
+        Ok(Some(crate::import_episode::render_episode_subject_facts(
+            episode,
+            &crate::import_episode::display_named_node(&node),
+            total,
+            &facts,
+        )))
     }
 
     /// 执行任意 SPARQL 1.1 查询（SELECT / ASK / CONSTRUCT / DESCRIBE）。
