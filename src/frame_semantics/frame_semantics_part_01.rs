@@ -354,6 +354,12 @@ impl FrameSchema {
         self
     }
 
+    pub fn without_role(mut self, role: Role) -> Self {
+        self.roles.retain(|existing| existing.role != role);
+        self.refresh_id();
+        self
+    }
+
     pub fn with_realize(mut self, template: impl Into<String>) -> Self {
         self.realize = Some(template.into());
         self.refresh_id();
@@ -740,6 +746,7 @@ impl FrameBook {
         book.register(
             FrameSchema::new("去", "move")
                 .with_surfaces(["去", "前往", "到"])
+                .without_role(Role::Patient)
                 .with_role(RoleSpec::new(Role::Agent).required())
                 .with_role(RoleSpec::new(Role::Goal).required().with_markers(["到", "去", "往", "向"]))
                 .with_role(RoleSpec::new(Role::Source).with_markers(["从", "自"]))
@@ -859,37 +866,50 @@ impl FrameBook {
     }
 
     pub fn find_predicate(&self, text: &str) -> Option<PredicateHit> {
-        let mut best: Option<PredicateHit> = None;
+        let mut best: Option<(i64, PredicateHit)> = None;
         for schema in self.active_schemas() {
             for surface in &schema.surfaces {
                 if surface.is_empty() {
                     continue;
                 }
-                let Some(start) = text.find(surface.as_str()) else {
-                    continue;
-                };
-                let end = start + surface.len();
-                let candidate = PredicateHit {
-                    schema_id: schema.id.clone(),
-                    predicate: schema.predicate.clone(),
-                    surface: surface.clone(),
-                    start,
-                    end,
-                    support: schema.support,
-                };
-                let better = match &best {
-                    None => true,
-                    Some(current) => {
-                        (candidate.end - candidate.start, candidate.support, &candidate.schema_id)
-                            > (current.end - current.start, current.support, &current.schema_id)
+                for (start, _) in text.match_indices(surface.as_str()) {
+                    let end = start + surface.len();
+                    let mut score = (surface.len() as i64) * 100 + schema.support as i64;
+                    if inside_time_word(text, start, end) {
+                        score -= 10_000;
                     }
-                };
-                if better {
-                    best = Some(candidate);
+                    let before = &text[..start];
+                    score += marker_hits(before).len() as i64 * 5;
+                    if !before.trim().is_empty() {
+                        score += 1;
+                    }
+                    if !text[end..].trim().is_empty() {
+                        score += 1;
+                    }
+                    let candidate = PredicateHit {
+                        schema_id: schema.id.clone(),
+                        predicate: schema.predicate.clone(),
+                        surface: surface.clone(),
+                        start,
+                        end,
+                        support: schema.support,
+                    };
+                    let better = match &best {
+                        None => true,
+                        Some((current_score, current)) => {
+                            score > *current_score
+                                || (score == *current_score
+                                    && (&candidate.schema_id, candidate.start)
+                                        > (&current.schema_id, current.start))
+                        }
+                    };
+                    if better {
+                        best = Some((score, candidate));
+                    }
                 }
             }
         }
-        best
+        best.map(|(_, hit)| hit)
     }
 
     pub fn realize(&self, frame: &FrameInstance) -> Option<String> {
@@ -974,8 +994,6 @@ const TIME_WORDS: &[&str] = &[
     "上个月", "这个月", "下个月", "早上", "上午", "中午", "下午", "晚上", "凌晨", "现在", "当时",
 ];
 
-const ASPECT_PARTICLES: &[&str] = &["了", "着", "过", "完", "好"];
-
 #[derive(Debug, Clone)]
 struct MarkerHit {
     start: usize,
@@ -1027,20 +1045,39 @@ fn marker_hits(segment: &str) -> Vec<MarkerHit> {
     filtered
 }
 
+fn inside_time_word(text: &str, start: usize, end: usize) -> bool {
+    TIME_WORDS.iter().any(|word| {
+        text.match_indices(word).any(|(word_start, _)| {
+            let word_end = word_start + word.len();
+            word_start <= start && end <= word_end && (word_end - word_start) > (end - start)
+        })
+    })
+}
+
 fn trim_value(text: &str) -> &str {
-    let mut trimmed = text.trim().trim_matches(|c: char| {
+    text.trim().trim_matches(|c: char| {
         matches!(c, '，' | ',' | '。' | '.' | '；' | ';' | '：' | ':' | '！' | '!' | '？' | '?')
-    });
-    loop {
-        let mut stripped_any = false;
-        for particle in ASPECT_PARTICLES {
-            if let Some(stripped) = trimmed.strip_prefix(particle) {
-                trimmed = stripped.trim();
-                stripped_any = true;
-                break;
-            }
+    })
+}
+
+fn trim_marker_value(text: &str) -> &str {
+    let trimmed = trim_value(text);
+    trimmed
+        .strip_prefix('了')
+        .map(str::trim)
+        .unwrap_or(trimmed)
+}
+
+fn trim_after_predicate(text: &str) -> &str {
+    let mut trimmed = trim_value(text);
+    for compound in ["好了", "完了", "过了", "着过"] {
+        if let Some(rest) = trimmed.strip_prefix(compound) {
+            return rest.trim();
         }
-        if !stripped_any {
+    }
+    for particle in ["了", "着", "过", "完"] {
+        if let Some(rest) = trimmed.strip_prefix(particle) {
+            trimmed = rest.trim();
             break;
         }
     }
@@ -1059,7 +1096,7 @@ fn scan_markers(segment: &str, base: usize) -> (Vec<(Role, RoleFiller)>, Option<
                 .get(index + 1)
                 .map(|next| next.start)
                 .unwrap_or(segment.len());
-            trim_value(&segment[hit.end..end]).to_string()
+            trim_marker_value(&segment[hit.end..end]).to_string()
         };
         if value.is_empty() {
             continue;
@@ -1225,7 +1262,7 @@ impl<'a> FrameAnnotator<'a> {
             frame.set_role(role, filler);
         }
         if let Some(first) = first {
-            let remainder = trim_value(&after[..first]);
+            let remainder = trim_after_predicate(&after[..first]);
             if !remainder.is_empty() {
                 let role = default_object_role(schema);
                 let leading = after[..first].len() - after[..first].trim_start().len();
@@ -1240,7 +1277,7 @@ impl<'a> FrameAnnotator<'a> {
                 has_object = true;
             }
         } else {
-            let remainder = trim_value(after);
+            let remainder = trim_after_predicate(after);
             if !remainder.is_empty() {
                 let role = default_object_role(schema);
                 let leading = after.len() - after.trim_start().len();

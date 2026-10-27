@@ -648,48 +648,75 @@ fn render_roles_map(roles: &BTreeMap<Role, String>) -> String {
 /// 把模板当作「字面锚点 + 角色槽」匹配文本；空槽不算命中。
 pub fn match_template(template: &str, text: &str) -> Option<BTreeMap<Role, String>> {
     let parts = template_parts(template);
-    let mut cursor = 0usize;
     let mut roles = BTreeMap::new();
-    for (index, part) in parts.iter().enumerate() {
-        match part {
-            TemplatePart::Literal(literal) => {
-                if literal.is_empty() {
-                    continue;
-                }
-                if !text[cursor..].starts_with(literal.as_str()) {
-                    return None;
-                }
-                cursor += literal.len();
-            }
-            TemplatePart::Slot(role) => {
-                let next_literal = parts[index + 1..]
-                    .iter()
-                    .find_map(|part| match part {
-                        TemplatePart::Literal(literal) if !literal.is_empty() => {
-                            Some(literal.as_str())
-                        }
-                        _ => None,
-                    });
-                let (value, next_cursor) = match next_literal {
-                    Some(literal) => {
-                        let offset = text[cursor..].find(literal)?;
-                        (&text[cursor..cursor + offset], cursor + offset)
-                    }
-                    None => (&text[cursor..], text.len()),
-                };
-                let value = trim_value(value).to_string();
-                if value.is_empty() {
-                    return None;
-                }
-                roles.insert(*role, value);
-                cursor = next_cursor;
-            }
-        }
-    }
-    if cursor == text.len() {
+    if match_parts(&parts, text, 0, &mut roles) {
         Some(roles)
     } else {
         None
+    }
+}
+
+fn match_parts(
+    parts: &[TemplatePart],
+    text: &str,
+    cursor: usize,
+    roles: &mut BTreeMap<Role, String>,
+) -> bool {
+    let Some(part) = parts.first() else {
+        return cursor == text.len();
+    };
+    match part {
+        TemplatePart::Literal(literal) => {
+            if literal.is_empty() {
+                return match_parts(&parts[1..], text, cursor, roles);
+            }
+            if text[cursor..].starts_with(literal.as_str()) {
+                return match_parts(&parts[1..], text, cursor + literal.len(), roles);
+            }
+            false
+        }
+        TemplatePart::Slot(role) => {
+            let Some(next) = parts.get(1) else {
+                let value = trim_value(&text[cursor..]).to_string();
+                if value.is_empty() {
+                    return false;
+                }
+                roles.insert(*role, value);
+                return true;
+            };
+            match next {
+                TemplatePart::Literal(literal) if literal.is_empty() => {
+                    match_parts(&parts[1..], text, cursor, roles)
+                }
+                TemplatePart::Literal(literal) => {
+                    let mut search = cursor;
+                    while search <= text.len() {
+                        let Some(offset) = text[search..].find(literal.as_str()) else {
+                            return false;
+                        };
+                        let end = search + offset;
+                        let value = trim_value(&text[cursor..end]).to_string();
+                        if !value.is_empty() {
+                            let old = roles.insert(*role, value);
+                            if match_parts(&parts[1..], text, end, roles) {
+                                return true;
+                            }
+                            match old {
+                                Some(previous) => {
+                                    roles.insert(*role, previous);
+                                }
+                                None => {
+                                    roles.remove(role);
+                                }
+                            }
+                        }
+                        search = end + literal.len();
+                    }
+                    false
+                }
+                TemplatePart::Slot(_) => false,
+            }
+        }
     }
 }
 
@@ -813,6 +840,33 @@ mod tests {
         for role in [Role::Agent, Role::Patient, Role::Instrument, Role::Location, Role::Time] {
             assert_eq!(recovered.usable(role), frame.usable(role), "{role:?}");
         }
+    }
+
+    #[test]
+    fn prefers_predicate_outside_time_word() {
+        let frame = repair_frame("张三去年去北京");
+        assert_eq!(frame.usable(Role::Agent), Some("张三"));
+        assert_eq!(frame.usable(Role::Time), Some("去年"));
+        assert_eq!(frame.usable(Role::Goal), Some("北京"));
+    }
+
+    #[test]
+    fn does_not_eat_adjectives_after_predicate() {
+        let frame = repair_frame("张三看了好书");
+        assert_eq!(frame.usable(Role::Agent), Some("张三"));
+        assert_eq!(frame.usable(Role::Patient), Some("好书"));
+    }
+
+    #[test]
+    fn matcher_backtracks_over_literal_inside_value() {
+        let roles = match_template(
+            "{agent}用{instrument}修好了{patient}",
+            "用户用扳手修好了电脑",
+        )
+        .expect("matched");
+        assert_eq!(roles[&Role::Agent], "用户");
+        assert_eq!(roles[&Role::Instrument], "扳手");
+        assert_eq!(roles[&Role::Patient], "电脑");
     }
 
     #[test]

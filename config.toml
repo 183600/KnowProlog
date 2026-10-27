@@ -905,6 +905,32 @@ property_mappings = { name = "pos:n", property = "pos:*" }
 # pattern = ["$s:pos:nr", "是", "$o:pos:nr", "的", "老师"]
 # realize = "{s}是{o}的老师"
 
+# 谓词中心语义角色帧（默认关闭）：同一份 schema 驱动角色标注、三元组投影
+# 与反向生成。开启后可用 `cargo run -- roles "张三用扳手修好了电脑"` 预览；
+# 未声明 schemas 时使用内置核心种子（修/去/给/看）。
+# [frame_semantics]
+# enabled = true
+#
+# [[frame_semantics.schemas]]
+# predicate = "修"
+# sense = "repair/tool"
+# surfaces = ["修", "修好"]
+# realize = "{agent}用{instrument}修好了{patient}"
+# status = "active"
+#
+# [[frame_semantics.schemas.roles]]
+# role = "agent"
+# required = true
+#
+# [[frame_semantics.schemas.roles]]
+# role = "instrument"
+# required = true
+# markers = ["用"]
+#
+# [[frame_semantics.schemas.roles]]
+# role = "patient"
+# required = true
+
 [messages]
 startup = "知识图谱系统启动中..."
 ready = "系统已就绪！"

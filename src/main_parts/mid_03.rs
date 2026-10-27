@@ -4,7 +4,9 @@ fn run_roles(text: Option<&str>, predicate: Option<&str>, json: bool, config_pat
     let book = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|raw| toml::from_str::<SystemConfig>(&raw).ok())
-        .filter(|config| config.frame_semantics.enabled)
+        .filter(|config| {
+            config.frame_semantics.enabled || !config.frame_semantics.schemas.is_empty()
+        })
         .map(|config| FrameBook::from_config(&config.frame_semantics))
         .unwrap_or_else(FrameBook::with_core_schemas);
 
