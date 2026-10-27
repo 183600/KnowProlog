@@ -122,15 +122,12 @@ impl JointContext {
         }
         self.observe_focus(&entities);
         self.observe_types(&types);
-        if let Some(frame) = frames
-            .iter()
-            .max_by(|left, right| {
-                left.original
-                    .confidence
-                    .total_cmp(&right.original.confidence)
-                    .then_with(|| right.original.id.cmp(&left.original.id))
-            })
-        {
+        if let Some(frame) = frames.iter().max_by(|left, right| {
+            left.original
+                .confidence
+                .total_cmp(&right.original.confidence)
+                .then_with(|| right.original.id.cmp(&left.original.id))
+        }) {
             self.last_predicate = Some(frame.normalized.predicate.clone());
         }
     }
@@ -425,7 +422,12 @@ fn render_argument(out: &mut String, label: &str, argument: &JointArgument, verd
     let types = if argument.types.is_empty() {
         "∅".to_string()
     } else {
-        argument.types.iter().cloned().collect::<Vec<_>>().join("、")
+        argument
+            .types
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、")
     };
     let _ = writeln!(
         out,
@@ -482,8 +484,12 @@ pub fn joint_parse_with_frames(
     }
 
     let max_rounds = options.max_rounds.clamp(1, 6);
-    let mut evaluated: Vec<(JointRound, SegmentResult, Vec<JointFrame>, Vec<NewWordCandidate>)> =
-        Vec::new();
+    let mut evaluated: Vec<(
+        JointRound,
+        SegmentResult,
+        Vec<JointFrame>,
+        Vec<NewWordCandidate>,
+    )> = Vec::new();
     let mut seen_digests = BTreeSet::new();
     let mut current_options = base_options.clone();
     let mut current_result = base.clone();
@@ -768,7 +774,9 @@ fn evaluate_frames(
     for request in &requests {
         for argument in [&request.subject, &request.object] {
             if let (Some(span), None) = (argument.span, &argument.error) {
-                unique.entry(span).or_insert_with(|| argument.surface.clone());
+                unique
+                    .entry(span)
+                    .or_insert_with(|| argument.surface.clone());
             }
         }
     }
@@ -799,14 +807,7 @@ fn evaluate_frames(
     let mut hard_failures = 0usize;
     for (frame, requests) in frames.iter().zip(requests) {
         let (joint, frame_candidates) = evaluate_frame(
-            segmenter,
-            schema,
-            text,
-            frame,
-            requests,
-            result,
-            options,
-            &weld_log,
+            segmenter, schema, text, frame, requests, result, options, &weld_log,
         );
         if joint.is_hard_failure() {
             hard_failures += 1;
@@ -985,14 +986,22 @@ fn resolve_argument(
     conflicts: &mut Vec<String>,
     weld_log: &BTreeMap<(usize, usize), WeldRecord>,
 ) -> JointArgument {
-    let mut argument =
-        JointArgument::unresolved(request.role, &request.surface, request.span);
+    let mut argument = JointArgument::unresolved(request.role, &request.surface, request.span);
     if let Some(error) = &request.error {
-        conflicts.push(format!("{}「{}」{}", request.role.label(), request.surface, error));
+        conflicts.push(format!(
+            "{}「{}」{}",
+            request.role.label(),
+            request.surface,
+            error
+        ));
         return argument;
     }
     let Some(span) = request.span else {
-        conflicts.push(format!("{}「{}」没有字符跨度", request.role.label(), request.surface));
+        conflicts.push(format!(
+            "{}「{}」没有字符跨度",
+            request.role.label(),
+            request.surface
+        ));
         return argument;
     };
     let Some(token_index) = exact_token(result, span) else {
@@ -1006,7 +1015,14 @@ fn resolve_argument(
         return argument;
     };
     let token = result.tokens[token_index].clone();
-    let choice = select_reading(segmenter, schema, &request.surface, slot_types, hints, &token);
+    let choice = select_reading(
+        segmenter,
+        schema,
+        &request.surface,
+        slot_types,
+        hints,
+        &token,
+    );
     if let Some(ambiguity) = &choice.ambiguity {
         ambiguities.push(ambiguity.clone());
     }
@@ -1054,20 +1070,12 @@ fn select_reading(
     token: &SegmentedToken,
 ) -> ReadingChoice {
     let mut candidates: Vec<(String, ReadingKind, Vec<String>)> = Vec::new();
-    candidates.push((
-        token.canonical.clone(),
-        token.kind,
-        token.evidence.clone(),
-    ));
+    candidates.push((token.canonical.clone(), token.kind, token.evidence.clone()));
     for (canonical, kind) in segmenter.surface_readings(surface) {
         candidates.push((canonical, kind, Vec::new()));
     }
     candidates.retain(|(_, kind, _)| *kind != ReadingKind::Predicate);
-    candidates.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
     candidates.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
 
     let mut scored: Vec<(f64, String, ReadingKind, BTreeSet<String>, Vec<String>)> = Vec::new();
@@ -1222,9 +1230,10 @@ fn new_word_candidate(
             .iter()
             .any(|(_, kind)| *kind == ReadingKind::Entity)
     {
-        let mut evidence = vec![
-            format!("{}「{}」未登录，帧置信度 {:.2}", role, argument.surface, confidence),
-        ];
+        let mut evidence = vec![format!(
+            "{}「{}」未登录，帧置信度 {:.2}",
+            role, argument.surface, confidence
+        )];
         if argument.welded {
             evidence.push("参数跨度跨分词边界，已按帧证据焊接".to_string());
         }
@@ -1428,7 +1437,9 @@ fn welded_token(
         start: span.0,
         end: span.1,
         canonical: surface.to_string(),
-        kind: preserved.map(|token| token.kind).unwrap_or(ReadingKind::Unknown),
+        kind: preserved
+            .map(|token| token.kind)
+            .unwrap_or(ReadingKind::Unknown),
         etype: preserved.and_then(|token| token.etype.clone()),
         evidence: vec![format!("帧锚定：参数「{}」焊为原子 token", surface)],
         score: ReadingScore::default(),
@@ -1691,12 +1702,7 @@ mod tests {
             .collect()
     }
 
-    fn frame_with_spans(
-        text: &str,
-        subject: &str,
-        predicate: &str,
-        object: &str,
-    ) -> RelationFrame {
+    fn frame_with_spans(text: &str, subject: &str, predicate: &str, object: &str) -> RelationFrame {
         let mut frame = RelationFrame::new(subject, predicate, object);
         frame.evidence = EvidenceSpan {
             sentence_index: 0,
@@ -1794,8 +1800,7 @@ mod tests {
         let frame = frame_with_spans(text, "纳西姆塔勒布", "认识", "李四");
         let schema = SchemaView::new();
         let options = JointParseOptions::default();
-        let parse =
-            joint_parse_with_frames(&mut segmenter, &schema, text, vec![frame], &options);
+        let parse = joint_parse_with_frames(&mut segmenter, &schema, text, vec![frame], &options);
         assert_eq!(parse.frames.len(), 1);
         let frame = &parse.frames[0];
         assert!(frame.aligned);
@@ -1846,8 +1851,8 @@ mod tests {
         let verification = verify_frames(&schema, &parse, &expected);
         assert!(verification.passed, "{:?}", verification);
 
-        let negative = vec![RelationFrame::new("张三", "师傅", "李四")
-            .with_polarity(Polarity::Negative)];
+        let negative =
+            vec![RelationFrame::new("张三", "师傅", "李四").with_polarity(Polarity::Negative)];
         let verification = verify_frames(&schema, &parse, &negative);
         assert!(!verification.passed);
         assert!(!verification.missing.is_empty());
@@ -1862,8 +1867,7 @@ mod tests {
         frame.polarity = Polarity::Negative;
         frame.modality = Modality::Asserted;
         let options = JointParseOptions::default();
-        let parse =
-            joint_parse_with_frames(&mut segmenter, &schema, text, vec![frame], &options);
+        let parse = joint_parse_with_frames(&mut segmenter, &schema, text, vec![frame], &options);
         assert_eq!(parse.frames[0].normalized.polarity, Polarity::Negative);
         assert_eq!(parse.frames[0].normalized.modality, Modality::Asserted);
     }
