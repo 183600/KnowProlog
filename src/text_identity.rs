@@ -337,6 +337,11 @@ fn is_recall_noise(ch: char) -> bool {
 }
 
 fn is_invisible(ch: char) -> bool {
+    // C0/C1 控制字符（含 NUL、分隔符、换行/制表）不参与身份键：
+    // 否则它们既能制造「显示不同、身份相同」的幽灵，也能伪造内部分隔符。
+    if ch.is_control() {
+        return true;
+    }
     matches!(
         ch,
         '\u{00AD}'
@@ -473,6 +478,15 @@ mod tests {
         assert_eq!(first.match_key(), second.match_key());
         assert_eq!(first, TextIdentity::new(" 张\u{200B}三？？ 身高 "));
         assert_eq!(first.version(), TEXT_IDENTITY_VERSION);
+    }
+
+    #[test]
+    fn control_characters_cannot_forge_internal_separators() {
+        let clean = TextIdentity::new("张三");
+        let forged = TextIdentity::new("张\u{1}三");
+        assert!(clean.same_identity(&forged));
+        assert_eq!(forged.identity(), "张三");
+        assert_eq!(forged.display(), "张\u{1}三");
     }
 
     #[test]

@@ -72,7 +72,10 @@ impl MemoryScope {
     fn key(&self) -> String {
         match self {
             MemoryScope::Global => "global".to_string(),
-            MemoryScope::Session(id) => format!("session\u{1}{}", id),
+            // 长度前缀让任意会话 id（含内部分隔符）都不能与另一个作用域前缀碰撞。
+            MemoryScope::Session(id) => {
+                format!("session\u{1}{}\u{2}{}", id.chars().count(), id)
+            }
         }
     }
 }
@@ -1047,6 +1050,21 @@ mod tests {
         let json = serde_json::to_string(view.as_ref()).unwrap();
         let restored: SharedMemoryView = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, *view);
+    }
+
+    #[test]
+    fn session_scope_keys_cannot_prefix_collide() {
+        let board = SharedMemoryBoard::new(8);
+        board
+            .publish(NewClaim::session("a", "姚明", "身高", "226cm"))
+            .unwrap();
+        board
+            .publish(NewClaim::session("a\u{1}b", "姚明", "身高", "229cm"))
+            .unwrap();
+        assert_eq!(board.purge_session("a"), 1);
+        let other = board.snapshot_for("a\u{1}b");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other.values("姚明", "身高"), vec!["229cm"]);
     }
 
     #[test]
