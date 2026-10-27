@@ -160,6 +160,49 @@ impl PrivacyCategory {
         };
         Some(parsed)
     }
+
+    /// 从自然语言短语里猜类别，供「别提我的电话」这类言语行为使用。
+    pub fn infer_from_text(text: &str) -> Option<Self> {
+        let lowered = text.to_lowercase();
+        let table: &[(&[&str], PrivacyCategory)] = &[
+            (
+                &["身份证", "护照", "证件", "驾照", "社保号"],
+                PrivacyCategory::Credential,
+            ),
+            (
+                &["电话", "手机", "联系方式", "邮箱", "email", "住址电话"],
+                PrivacyCategory::Contact,
+            ),
+            (
+                &["病历", "病史", "病情", "诊断", "用药", "过敏", "健康"],
+                PrivacyCategory::Health,
+            ),
+            (
+                &["工资", "收入", "银行卡", "余额", "资产", "财务"],
+                PrivacyCategory::Finance,
+            ),
+            (
+                &["住址", "地址", "位置", "行踪", "住哪", "住在"],
+                PrivacyCategory::Location,
+            ),
+            (
+                &["年龄", "生日", "出生", "岁数"],
+                PrivacyCategory::Demographic,
+            ),
+            (
+                &["父亲", "母亲", "父母", "配偶", "亲属", "家人", "朋友", "同事"],
+                PrivacyCategory::Relationship,
+            ),
+            (
+                &["姓名", "名字", "真名", "身份"],
+                PrivacyCategory::PersonalIdentity,
+            ),
+        ];
+        table
+            .iter()
+            .find(|(terms, _)| terms.iter().any(|term| lowered.contains(term)))
+            .map(|(_, category)| *category)
+    }
 }
 
 /// 披露精度，按「从最粗到最细」排序；`Ord` 越小越保守。
@@ -788,6 +831,56 @@ impl PrivacyPolicy {
         self.max_closure_depth = self.max_closure_depth.max(1);
         self.max_closure_atoms = self.max_closure_atoms.max(1);
     }
+
+    /// 面向用户的策略摘要。只列规则与上限，不暴露任何事实值。
+    pub fn render_summary(&self) -> String {
+        let categories = self
+            .category_precision
+            .iter()
+            .map(|(category, precision)| format!("{}={}", category.code(), precision.code()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let consent = self
+            .consent_required
+            .iter()
+            .map(|category| category.code())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut text = format!(
+            "隐私策略：模式 {}，k={}，闭包深度 {}，闭包原子上限 {}，弱证据{}硬拦；类别上限：{}；需授权：{}；敏感词 {} 条，推导规则 {} 条",
+            self.mode.label(),
+            self.k_anonymity,
+            self.max_closure_depth,
+            self.max_closure_atoms,
+            if self.weak_evidence_blocks {
+                ""
+            } else {
+                "不"
+            },
+            if categories.is_empty() {
+                "（默认）"
+            } else {
+                categories.as_str()
+            },
+            if consent.is_empty() {
+                "（无）"
+            } else {
+                consent.as_str()
+            },
+            self.sensitive_terms.len(),
+            self.inference_rules.len()
+        );
+        if !self.inference_rules.is_empty() {
+            let names = self
+                .inference_rules
+                .iter()
+                .map(|rule| rule.name.as_str())
+                .collect::<Vec<_>>()
+                .join("、");
+            text.push_str(&format!("；推导：{}", names));
+        }
+        text
+    }
 }
 
 fn default_category_precision() -> BTreeMap<PrivacyCategory, DisclosurePrecision> {
@@ -1209,6 +1302,142 @@ impl ConsentScope {
     }
 }
 
+/// 用户话语里的隐私言语行为。只做确定性关键词识别；主体由调用方的
+/// 会话上下文给出，避免把「我 / 他」直接当成图谱实体名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "act", rename_all = "snake_case")]
+pub enum PrivacyAct {
+    /// 询问策略本身：隐私政策 / 哪些信息不能说。
+    AskPolicy,
+    /// 允许披露某类信息。
+    Grant {
+        category: PrivacyCategory,
+        scope: ConsentScope,
+    },
+    /// 撤回某类披露授权。
+    Revoke { category: PrivacyCategory },
+    /// 遗忘某类或全部会话信息。
+    Forget {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<PrivacyCategory>,
+    },
+    /// 与隐私策略无关的话语。
+    Other,
+}
+
+impl PrivacyAct {
+    pub fn parse(text: &str) -> Self {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return PrivacyAct::Other;
+        }
+        let category = PrivacyCategory::infer_from_text(trimmed);
+        let interrogative = trimmed.ends_with('吗')
+            || trimmed.ends_with('？')
+            || trimmed.ends_with('?')
+            || trimmed.contains("是否");
+        let asks_policy = contains_any(
+            trimmed,
+            &[
+                "隐私政策",
+                "隐私规则",
+                "哪些信息",
+                "什么信息不能",
+                "记得我什么",
+                "你记得我",
+                "能说什么",
+                "不能说什么",
+            ],
+        );
+        let forgets = contains_any(
+            trimmed,
+            &[
+                "忘记",
+                "忘掉",
+                "删除",
+                "抹掉",
+                "清除",
+                "不要再记",
+                "不要记",
+                "别记",
+            ],
+        );
+        let negated = contains_any(
+            trimmed,
+            &[
+                "不要", "不能", "不准", "不许", "不得", "别告诉", "别把", "别说", "别透露",
+                "别公开", "别分享", "别记", "别再",
+            ],
+        );
+        let disclosure_verb = contains_any(trimmed, &["告诉", "透露", "说出去", "公开", "分享"]);
+        let revokes = negated && disclosure_verb
+            || contains_any(trimmed, &["撤回", "收回", "取消授权", "不同意"]);
+        let grants = contains_any(
+            trimmed,
+            &["可以告诉", "可以说", "同意", "允许", "授权"],
+        ) && !negated;
+
+        if forgets {
+            return PrivacyAct::Forget { category };
+        }
+        if revokes {
+            return category
+                .map(|category| PrivacyAct::Revoke { category })
+                .unwrap_or(PrivacyAct::Other);
+        }
+        let asks_permission = interrogative
+            && !negated
+            && contains_any(trimmed, &["可以", "能", "同意", "允许", "授权", "告诉"]);
+        if asks_policy || asks_permission {
+            return PrivacyAct::AskPolicy;
+        }
+        if grants {
+            let scope = if contains_any(trimmed, &["只此一次", "仅此一次", "这一次", "这次可以"]) {
+                ConsentScope::Once
+            } else {
+                ConsentScope::Session
+            };
+            return category
+                .map(|category| PrivacyAct::Grant { category, scope })
+                .unwrap_or(PrivacyAct::Other);
+        }
+        PrivacyAct::Other
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            PrivacyAct::AskPolicy => "ask_policy",
+            PrivacyAct::Grant { .. } => "grant",
+            PrivacyAct::Revoke { .. } => "revoke",
+            PrivacyAct::Forget { .. } => "forget",
+            PrivacyAct::Other => "other",
+        }
+    }
+
+    pub fn is_policy_act(&self) -> bool {
+        !matches!(self, PrivacyAct::Other)
+    }
+
+    pub fn render(&self) -> String {
+        match self {
+            PrivacyAct::AskPolicy => "询问隐私策略".to_string(),
+            PrivacyAct::Grant { category, scope } => {
+                format!("允许披露{}（{}）", category.label(), scope.code())
+            }
+            PrivacyAct::Revoke { category } => format!("撤回{}授权", category.label()),
+            PrivacyAct::Forget {
+                category: Some(category),
+            } => format!("遗忘{}", category.label()),
+            PrivacyAct::Forget { category: None } => "遗忘全部会话信息".to_string(),
+            PrivacyAct::Other => "非隐私言语行为".to_string(),
+        }
+    }
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
 /// 一次显式授权或撤回。最新记录优先；撤回不会删除历史。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsentRecord {
@@ -1356,6 +1585,25 @@ impl PrivacyLedger {
             consumed: false,
             turn: self.turn,
         });
+    }
+
+    /// 把一条隐私言语行为落到台账上。`AskPolicy` 与 `Other` 不改变状态。
+    pub fn apply_act(&mut self, subject: &str, purpose: &str, act: &PrivacyAct) {
+        match act {
+            PrivacyAct::Grant { category, scope } => {
+                self.grant(subject, *category, purpose, *scope);
+            }
+            PrivacyAct::Revoke { category } => {
+                self.revoke(subject, *category, purpose);
+            }
+            PrivacyAct::Forget {
+                category: Some(category),
+            } => self.forget_category(subject, *category, "对话中的遗忘请求"),
+            PrivacyAct::Forget { category: None } => {
+                self.forget_subject(subject, "对话中的遗忘请求")
+            }
+            PrivacyAct::AskPolicy | PrivacyAct::Other => {}
+        }
     }
 
     pub fn forget_subject(&mut self, subject: &str, reason: &str) {
@@ -2708,6 +2956,106 @@ mod tests {
         assert_eq!(request.wh, Some(WhKind::Place));
         let decision_policy = PolicyMode::Audit;
         assert_eq!(decision_policy.label(), "审计（影子）");
+    }
+
+    #[test]
+    fn privacy_acts_parse_grant_revoke_forget_and_policy() {
+        assert_eq!(
+            PrivacyAct::parse("我同意你告诉别人我的电话"),
+            PrivacyAct::Grant {
+                category: PrivacyCategory::Contact,
+                scope: ConsentScope::Session,
+            }
+        );
+        assert_eq!(
+            PrivacyAct::parse("只此一次，可以告诉别人我的邮箱"),
+            PrivacyAct::Grant {
+                category: PrivacyCategory::Contact,
+                scope: ConsentScope::Once,
+            }
+        );
+        assert_eq!(
+            PrivacyAct::parse("别把我的地址透露给别人"),
+            PrivacyAct::Revoke {
+                category: PrivacyCategory::Location,
+            }
+        );
+        assert_eq!(
+            PrivacyAct::parse("不要告诉别人我的病史"),
+            PrivacyAct::Revoke {
+                category: PrivacyCategory::Health,
+            }
+        );
+        assert_eq!(
+            PrivacyAct::parse("忘掉关于我的所有信息"),
+            PrivacyAct::Forget { category: None }
+        );
+        assert_eq!(
+            PrivacyAct::parse("忘记我的家庭住址"),
+            PrivacyAct::Forget {
+                category: Some(PrivacyCategory::Location),
+            }
+        );
+        assert_eq!(
+            PrivacyAct::parse("你的隐私政策是什么？"),
+            PrivacyAct::AskPolicy
+        );
+        assert_eq!(
+            PrivacyAct::parse("我可以告诉别人我的电话吗"),
+            PrivacyAct::AskPolicy
+        );
+        assert_eq!(PrivacyAct::parse("今天天气不错"), PrivacyAct::Other);
+    }
+
+    #[test]
+    fn apply_act_updates_consent_and_tombstones() {
+        let mut ledger = ledger();
+        ledger.apply_act(
+            "张三",
+            "问答",
+            &PrivacyAct::Grant {
+                category: PrivacyCategory::Contact,
+                scope: ConsentScope::Session,
+            },
+        );
+        assert!(ledger.consent_permits("张三", PrivacyCategory::Contact, "问答"));
+        ledger.apply_act(
+            "张三",
+            "问答",
+            &PrivacyAct::Revoke {
+                category: PrivacyCategory::Contact,
+            },
+        );
+        assert!(!ledger.consent_permits("张三", PrivacyCategory::Contact, "问答"));
+        ledger.apply_act(
+            "张三",
+            "问答",
+            &PrivacyAct::Forget {
+                category: Some(PrivacyCategory::Location),
+            },
+        );
+        assert!(ledger.is_tombstoned(
+            "张三",
+            "地址",
+            "北京市",
+            PrivacyCategory::Location
+        ));
+        assert!(!ledger.is_tombstoned(
+            "张三",
+            "电话",
+            "13800138000",
+            PrivacyCategory::Contact
+        ));
+    }
+
+    #[test]
+    fn policy_summary_is_deterministic_and_value_free() {
+        let policy = PrivacyPolicy::default();
+        let summary = policy.render_summary();
+        assert!(summary.contains("审计（影子）"));
+        assert!(summary.contains("k=2"));
+        assert!(summary.contains("contact=type"));
+        assert!(!summary.contains("13800138000"));
     }
 
     #[test]

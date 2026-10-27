@@ -80,7 +80,7 @@ use know_prolog::{
     perf_ledger::PerfLedger,
     plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
     privacy_flow::{
-        self, ConsentScope, DisclosurePrecision, DisclosureRequest, PolicyMode,
+        self, ConsentScope, DisclosurePrecision, DisclosureRequest, PolicyMode, PrivacyAct,
         PrivacyAdjudicator, PrivacyCategory, PrivacyGraph, PrivacyLedger, PrivacyPolicy,
         SpanDetector,
     },
@@ -258,6 +258,13 @@ enum Commands {
         /// Enforce the policy instead of audit/shadow mode
         #[arg(long)]
         enforce: bool,
+        /// Data subject used by natural-language policy acts (default: 我)
+        #[arg(long, default_value = "我")]
+        subject: String,
+        /// Privacy speech act in natural language, e.g. 「别告诉别人我的电话」
+        /// or 「我同意你告诉别人我的邮箱」(repeatable; processed in order)
+        #[arg(long = "utterance")]
+        utterance: Vec<String>,
         /// Grant session consent as SUBJECT|CATEGORY|PURPOSE (repeatable)
         #[arg(long = "grant", value_name = "S|CATEGORY|PURPOSE")]
         grant: Vec<String>,
@@ -1595,6 +1602,8 @@ async fn main() {
         precision,
         k,
         enforce,
+        subject,
+        utterance,
         grant,
         grant_once,
         revoke,
@@ -1613,6 +1622,8 @@ async fn main() {
             precision,
             *k,
             *enforce,
+            subject,
+            utterance,
             grant,
             grant_once,
             revoke,
@@ -6109,6 +6120,8 @@ fn run_privacy(
     precision: &str,
     k: Option<usize>,
     enforce: bool,
+    act_subject: &str,
+    utterances: &[String],
     grants: &[String],
     grants_once: &[String],
     revokes: &[String],
@@ -6171,8 +6184,8 @@ fn run_privacy(
         Some(value) => Some(value.to_string()),
         None => None,
     };
-    if text_owned.is_none() && parsed_facts.is_empty() {
-        eprintln!("请至少提供 --text 或 --fact \"主语|谓词|宾语\"");
+    if text_owned.is_none() && parsed_facts.is_empty() && utterances.is_empty() {
+        eprintln!("请至少提供 --text、--fact \"主语|谓词|宾语\" 或 --utterance");
         std::process::exit(2);
     }
 
@@ -6244,6 +6257,16 @@ fn run_privacy(
             }
         }
     }
+
+    let mut acts = Vec::new();
+    for raw in utterances {
+        let act = PrivacyAct::parse(raw);
+        ledger.apply_act(act_subject, purpose, &act);
+        acts.push(act);
+    }
+    let asks_policy = acts
+        .iter()
+        .any(|act| matches!(act, PrivacyAct::AskPolicy));
 
     let annotated = text_owned.as_deref().map(|text| {
         std::fs::read_to_string(config_path)
@@ -6336,6 +6359,8 @@ fn run_privacy(
             "requested_precision": requested.code(),
             "spans": spans,
             "redaction": redaction,
+            "policy_summary": policy.render_summary(),
+            "acts": acts,
             "audit_summary": audit_summary,
             "facts": fact_reports,
             "ledger": ledger,
@@ -6353,6 +6378,15 @@ fn run_privacy(
     }
 
     println!("策略模式：{}", policy.mode.label());
+    if !acts.is_empty() {
+        println!("隐私言语行为（{}）：", acts.len());
+        for act in &acts {
+            println!("  {}：{}", act.code(), act.render());
+        }
+    }
+    if asks_policy {
+        println!("{}", policy.render_summary());
+    }
     if text_owned.is_some() {
         if spans.is_empty() {
             println!("敏感跨度：未发现（强规则与词性弱证据均未命中）");
