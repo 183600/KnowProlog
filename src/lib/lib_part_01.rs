@@ -268,6 +268,30 @@ pub struct SystemConfig {
     pub semantic_grammar: semantic_grammar::SemanticGrammarConfig,
 }
 #[derive(Debug, Deserialize, Clone)]
+pub struct SemanticMonitorConfig {
+    #[serde(default = "default_semantic_monitor_window")]
+    pub window: usize,
+    #[serde(default)]
+    pub mode: semantic_monitor::ControlMode,
+    #[serde(default)]
+    pub budget: semantic_monitor::BudgetConfig,
+}
+
+fn default_semantic_monitor_window() -> usize {
+    semantic_monitor::DEFAULT_WINDOW
+}
+
+impl Default for SemanticMonitorConfig {
+    fn default() -> Self {
+        Self {
+            window: default_semantic_monitor_window(),
+            mode: semantic_monitor::ControlMode::Observe,
+            budget: semantic_monitor::BudgetConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ReasoningConfig {
     #[serde(default = "default_enable_link_prediction")]
     pub enable_link_prediction: bool,
@@ -381,6 +405,8 @@ pub struct ReasoningConfig {
     /// 默认关闭；关闭时回答路径与旧行为逐字节一致。
     #[serde(default)]
     pub rewrite_retrieval: rewrite_retrieval::RewriteRetrievalConfig,
+    #[serde(default)]
+    pub semantic_monitor: SemanticMonitorConfig,
 }
 fn default_enable_holographic_memory() -> bool {
     true
@@ -568,6 +594,7 @@ impl Default for ReasoningConfig {
             constructive: constructive::ConstructionConfig::default(),
             soft_route: soft_route::SoftRouteConfig::default(),
             rewrite_retrieval: rewrite_retrieval::RewriteRetrievalConfig::default(),
+            semantic_monitor: SemanticMonitorConfig::default(),
         }
     }
 }

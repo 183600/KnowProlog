@@ -53,6 +53,7 @@
             constructive: crate::constructive::ConstructionConfig::default(),
             soft_route: crate::soft_route::SoftRouteConfig::default(),
             rewrite_retrieval: crate::rewrite_retrieval::RewriteRetrievalConfig::default(),
+            semantic_monitor: crate::SemanticMonitorConfig::default(),
         }
     }
 
@@ -1527,4 +1528,19 @@
         let json = serde_json::to_string(&observations).unwrap();
         assert!(!json.contains(question), "观测不得保存原始问句：{}", json);
         assert!(reasoner.semantic_report().contains("语义检索监控"));
+    }
+
+    #[test]
+    fn semantic_control_mode_and_budget_are_configurable() {
+        let mut config = test_config();
+        config.semantic_monitor.mode = crate::semantic_monitor::ControlMode::Control;
+        config.semantic_monitor.budget.initial = 0;
+        let reasoner = SymbolicReasoner::new(config, HashMap::new());
+        let advice = reasoner.semantic_advice();
+        assert_eq!(advice.level, crate::semantic_monitor::PressureLevel::Strict);
+        assert_eq!(
+            advice.max_items,
+            Some(crate::semantic_monitor::STRICT_MAX_ITEMS)
+        );
+        assert!(advice.prefer_clarification);
     }

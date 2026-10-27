@@ -68,6 +68,10 @@ require_predicate_admission = false    # 严格准入：只允许画像中已登
 
 # 建设性多跳：链式查询缺一条中间边时，用已挖掘规则合成查询局部虚拟事实，
 # 让推断继续参与下一跳；默认关闭，关闭时回答路径逐字节不变。
+[reasoning.semantic_monitor]
+window = 64
+mode = "observe"
+
 [reasoning.constructive]
 enabled = false                       # 是否在链式查询缺口处启用建设性合成
 max_depth = 4                         # 虚拟事实最大推导深度

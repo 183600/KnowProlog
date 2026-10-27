@@ -102,6 +102,11 @@ impl SymbolicReasoner {
         synonyms: HashMap<String, String>,
         perf: Arc<PerfLedger>,
     ) -> Self {
+        let semantic = SemanticMonitor::with_options(
+            config.semantic_monitor.window,
+            config.semantic_monitor.budget.clone(),
+        );
+        semantic.set_mode(config.semantic_monitor.mode);
         let aligner = OntologyAligner::new(synonyms, config.ontology_alignment_threshold);
         let embedding = SymbolicEmbedding::new(config.embedding_similarity_floor);
         let mut linker = EntityLinker::new();
@@ -199,7 +204,7 @@ impl SymbolicReasoner {
             perf,
             nlp_config: None,
             read_traces: ReadTraceLedger::new(),
-            semantic: SemanticMonitor::new(),
+            semantic,
             lexical_memory: LexicalMemory::default(),
             mention_lexicon: MentionLexicon::default(),
             engine_fault: None,
@@ -590,7 +595,7 @@ impl SymbolicReasoner {
     }
 
     pub fn semantic_advice(&self) -> SearchAdvice {
-        self.semantic.snapshot().advice
+        self.semantic.advice()
     }
 
     pub fn semantic_report(&self) -> String {

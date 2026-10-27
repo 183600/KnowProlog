@@ -801,7 +801,15 @@ impl SymbolicReasoner {
         if frame.is_empty_request() {
             return None;
         }
-        let max_items = self.config.max_predictions.clamp(3, 8);
+        let base_max_items = self.config.max_predictions.clamp(3, 8);
+        let advice = self.semantic.advice();
+        let max_items = advice
+            .max_items
+            .unwrap_or(base_max_items)
+            .clamp(3, base_max_items);
+        if advice.max_items.is_some() && advice.max_items != Some(base_max_items) {
+            self.perf.bump("semantic_control_max_items");
+        }
         let query = if frame.explicit_anchors.is_empty() {
             match (frame.anchors.first(), frame.predicate.as_deref()) {
                 (Some(anchor), Some(predicate)) => format!("{} {}", anchor, predicate),

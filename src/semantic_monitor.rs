@@ -579,6 +579,16 @@ struct BudgetState {
     level: PressureLevel,
 }
 
+fn initial_level(config: &BudgetConfig) -> PressureLevel {
+    if config.initial < config.strict_below {
+        PressureLevel::Strict
+    } else if config.initial < config.cautious_below {
+        PressureLevel::Cautious
+    } else {
+        PressureLevel::Healthy
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MonitorState {
     next_sequence: u64,
@@ -596,7 +606,7 @@ impl MonitorState {
             observations: VecDeque::new(),
             active: None,
             score: config.initial,
-            level: PressureLevel::Healthy,
+            level: initial_level(config),
             mode: ControlMode::Observe,
         }
     }
@@ -606,7 +616,7 @@ impl MonitorState {
         self.observations.clear();
         self.active = None;
         self.score = config.initial;
-        self.level = PressureLevel::Healthy;
+        self.level = initial_level(config);
     }
 }
 
@@ -649,9 +659,13 @@ impl SemanticMonitor {
     }
 
     pub fn with_budget(config: BudgetConfig) -> Self {
-        let config = config.clamped();
+        Self::with_options(DEFAULT_WINDOW, config)
+    }
+
+    pub fn with_options(window: usize, budget: BudgetConfig) -> Self {
+        let config = budget.clamped();
         Self {
-            window: DEFAULT_WINDOW,
+            window: window.max(1),
             state: Mutex::new(MonitorState::new(&config)),
             config,
         }
@@ -667,6 +681,16 @@ impl SemanticMonitor {
 
     pub fn mode(&self) -> ControlMode {
         self.state.lock().mode
+    }
+
+    pub fn advice(&self) -> SearchAdvice {
+        let state = self.state.lock();
+        SearchAdvice::from_budget(
+            &BudgetState {
+                level: state.level,
+            },
+            state.mode,
+        )
     }
 
     pub fn clear(&self) {

@@ -687,6 +687,18 @@ impl SymbolicReasoner {
     fn answer_rewrite_retrieval(&self, question: &str) -> Option<String> {
         let assessment = self.rewrite_retrieval_assessment(question)?;
         self.semantic.record_assessment(&assessment);
+        if self.semantic.advice().prefer_clarification
+            && assessment.decision == RewriteRetrievalDecision::Accept
+        {
+            if let Some(clarification) =
+                self.rewrite_retrieval_clarification(question, &assessment)
+            {
+                self.perf.bump("semantic_control_clarify");
+                let prompt = clarification.prompt();
+                *self.formal_clarification.lock() = Some(clarification);
+                return Some(prompt);
+            }
+        }
         match assessment.decision {
             RewriteRetrievalDecision::Accept => {
                 let selected = assessment.selected_hypothesis()?;
