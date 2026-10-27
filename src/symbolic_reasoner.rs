@@ -45,6 +45,9 @@ use crate::graph_repair::{
 };
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
+use crate::joint_parse::{
+    joint_parse, verify_frames, FrameVerification, JointContext, JointParse, JointParseOptions,
+};
 use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
 use crate::law_book::{LawBook, LawStatus};
 use crate::lexical_memory::{LexicalMemory, ObservationSummary, TypeExpectation};
@@ -78,6 +81,7 @@ use crate::query_rewrite::{self, RelationLexicon};
 use crate::reading::{
     Reading, RepairKind, Residual, ResidualKind, ResidualSeverity, ResidualStage, TextSpan,
 };
+use crate::relation_frame::RelationFrame;
 use crate::resolution_engine::{
     render_term, Atom, Clause, DerivedFact, FailureFrontier, ProofNode, ProofSource,
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
@@ -114,6 +118,22 @@ fn term_span(question: &str, term: &str) -> Option<TextSpan> {
     let byte_index = question.find(term)?;
     let start = question[..byte_index].chars().count();
     Some(TextSpan::new(start, start + term.chars().count()))
+}
+
+fn insert_type_hint(
+    hints: &mut BTreeMap<String, BTreeSet<String>>,
+    entity: &str,
+    etype: &str,
+) {
+    let entity = entity.trim();
+    let etype = etype.trim();
+    if entity.is_empty() || etype.is_empty() {
+        return;
+    }
+    hints
+        .entry(entity.to_string())
+        .or_default()
+        .insert(etype.to_string());
 }
 
 // 默认逻辑（可反驳常识）的最大接地推导轮数
@@ -14093,6 +14113,123 @@ impl SymbolicReasoner {
         output
     }
 
+    /// 联合解析：先抽关系帧，再让帧的定义域/值域与参数跨度反向约束分词，
+    /// 最后用类型裁决、读法归一与失败回灌收敛。只读诊断，不改回答主路径。
+    pub fn joint_parse_report(&self, input_raw: &str) -> String {
+        let (focus, expected) = self.contextual_focus();
+        self.joint_parse_report_with_context(
+            input_raw,
+            &focus,
+            &expected,
+            self.context.last_predicate(),
+            crate::contextual_segmentation::DEFAULT_AMBIGUITY_MARGIN,
+        )
+    }
+
+    /// 与 [`Self::joint_parse_report`] 相同，但允许命令行显式给出焦点/类型/谓词。
+    pub fn joint_parse_report_with_context(
+        &self,
+        input_raw: &str,
+        focus: &[String],
+        expected_types: &[String],
+        predicate: Option<&str>,
+        margin: f64,
+    ) -> String {
+        self.joint_parse_result(input_raw, focus, expected_types, predicate, margin)
+            .render_report()
+    }
+
+    /// 返回结构化联合解析结果，供 CLI `--json` 与生成回译验证复用。
+    pub fn joint_parse_result(
+        &self,
+        input_raw: &str,
+        focus: &[String],
+        expected_types: &[String],
+        predicate: Option<&str>,
+        margin: f64,
+    ) -> JointParse {
+        let text = input_raw.trim();
+        let context = JointContext::new(
+            focus.to_vec(),
+            expected_types.to_vec(),
+            predicate.map(str::to_string),
+        );
+        let options = JointParseOptions {
+            context,
+            type_hints: self.joint_type_hints(),
+            ambiguity_margin: margin.clamp(0.0, 1.0),
+            ..JointParseOptions::default()
+        };
+        let mut segmenter = self.build_contextual_segmenter();
+        joint_parse(&mut segmenter, &self.schema_view, text, &options)
+    }
+
+    /// 生成侧回译验证：把候选句重新联合解析，要求恢复同一组关系帧。
+    pub fn verify_joint_generation(
+        &self,
+        candidate: &str,
+        expected: &[RelationFrame],
+    ) -> FrameVerification {
+        let (focus, expected_types) = self.contextual_focus();
+        let parsed = self.joint_parse_result(
+            candidate,
+            &focus,
+            &expected_types,
+            self.context.last_predicate(),
+            crate::contextual_segmentation::DEFAULT_AMBIGUITY_MARGIN,
+        );
+        verify_frames(&self.schema_view, &parsed, expected)
+    }
+
+    /// 把生成器/对齐器/链接器里的实体类型证据投影成只读类型提示。
+    fn joint_type_hints(&self) -> BTreeMap<String, BTreeSet<String>> {
+        let mut hints: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (entity, etype) in self.generator.typed_entities() {
+            insert_type_hint(&mut hints, &entity, &etype);
+        }
+        for entity in self.context.focus_entities() {
+            if let Some(etype) = self.context.focus_type(entity) {
+                insert_type_hint(&mut hints, entity, etype);
+            }
+        }
+        for profile in self.aligner.profiles() {
+            if profile.kind != TermKind::Entity {
+                continue;
+            }
+            let canonical = self.aligner.canonical_form(&profile.term);
+            let canonical = if canonical.is_empty() {
+                profile.term.as_str()
+            } else {
+                canonical.as_str()
+            };
+            for etype in &profile.types {
+                insert_type_hint(&mut hints, canonical, etype);
+                insert_type_hint(&mut hints, &profile.term, etype);
+            }
+            if let Some(etype) = self
+                .generator
+                .entity_type_of(canonical)
+                .or_else(|| self.linker.entity_type(canonical))
+            {
+                insert_type_hint(&mut hints, canonical, etype);
+                insert_type_hint(&mut hints, &profile.term, etype);
+            }
+        }
+        let mut aliases: Vec<(&String, &String)> = self.aligner.synonyms().iter().collect();
+        aliases.sort();
+        for (alias, canonical) in aliases {
+            if self.aligner.kind_of(canonical) != Some(TermKind::Entity) {
+                continue;
+            }
+            if let Some(types) = hints.get(canonical).cloned() {
+                for etype in types {
+                    insert_type_hint(&mut hints, alias, &etype);
+                }
+            }
+        }
+        hints
+    }
+
     /// 确认当前语境下某个词面的读法；写入会话级读法记忆。
     pub fn confirm_contextual_reading(&mut self, surface: &str, canonical: &str) -> String {
         let surface = surface.trim();
@@ -26832,6 +26969,46 @@ types = [
         assert!(report.contains("师傅"), "{}", report);
         assert!(report.contains("纯符号、零训练"), "{}", report);
         assert!(report.contains("读法："), "{}", report);
+    }
+
+    #[test]
+    fn joint_parse_report_uses_frame_types_and_verifies_generation() {
+        let mut synonyms = HashMap::new();
+        synonyms.insert("苹果".to_string(), "苹果公司".to_string());
+        let mut reasoner = SymbolicReasoner::new(test_config(), synonyms);
+        reasoner.observe_facts(&[
+            PrologFact::Entity {
+                name: "苹果".into(),
+                entity_type: "水果".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "苹果公司".into(),
+                entity_type: "公司".into(),
+                properties: HashMap::new(),
+            },
+            PrologFact::Entity {
+                name: "乔布斯".into(),
+                entity_type: "人物".into(),
+                properties: HashMap::new(),
+            },
+        ]);
+        let mut schema = SchemaView::new();
+        schema.declare_domain("创始人", "公司");
+        schema.declare_range("创始人", "人物");
+        schema.declare_disjoint("水果", "公司");
+        reasoner.configure_schema_view(&schema);
+
+        let report = reasoner.joint_parse_report("苹果的创始人是乔布斯");
+        assert!(report.contains("联合解析"), "{}", report);
+        assert!(report.contains("苹果公司"), "{}", report);
+        assert!(report.contains("回写上下文"), "{}", report);
+        assert!(!report.contains("冲突：类型互斥"), "{}", report);
+
+        let expected = vec![RelationFrame::new("苹果公司", "创始人", "乔布斯")];
+        let verification =
+            reasoner.verify_joint_generation("苹果的创始人是乔布斯", &expected);
+        assert!(verification.passed, "{:?}", verification);
     }
 
     #[test]
