@@ -1733,6 +1733,139 @@ fn check_reasoning(c: &mut Collector, config: &SystemConfig) {
             );
         }
     }
+    check_rewrite_retrieval(c, &r.rewrite_retrieval);
+}
+
+fn check_rewrite_retrieval(
+    c: &mut Collector,
+    r: &crate::rewrite_retrieval::RewriteRetrievalConfig,
+) {
+    for (value, path, label) in [
+        (
+            r.accept_threshold,
+            "reasoning.rewrite_retrieval.accept_threshold",
+            "读法接受阈值",
+        ),
+        (
+            r.clarify_threshold,
+            "reasoning.rewrite_retrieval.clarify_threshold",
+            "读法澄清阈值",
+        ),
+        (
+            r.accept_margin,
+            "reasoning.rewrite_retrieval.accept_margin",
+            "读法接受边际",
+        ),
+        (
+            r.min_support,
+            "reasoning.rewrite_retrieval.min_support",
+            "读法证据支持闸门",
+        ),
+        (
+            r.min_coverage,
+            "reasoning.rewrite_retrieval.min_coverage",
+            "读法答案覆盖闸门",
+        ),
+        (
+            r.min_margin,
+            "reasoning.rewrite_retrieval.min_margin",
+            "读法答案边际闸门",
+        ),
+        (
+            r.support_pivot,
+            "reasoning.rewrite_retrieval.support_pivot",
+            "读法支持度中性点",
+        ),
+        (
+            r.coverage_pivot,
+            "reasoning.rewrite_retrieval.coverage_pivot",
+            "读法覆盖度中性点",
+        ),
+        (
+            r.margin_pivot,
+            "reasoning.rewrite_retrieval.margin_pivot",
+            "读法边际中性点",
+        ),
+        (
+            r.consistency_pivot,
+            "reasoning.rewrite_retrieval.consistency_pivot",
+            "读法一致性中性点",
+        ),
+        (
+            r.partial_discount,
+            "reasoning.rewrite_retrieval.partial_discount",
+            "读法首跳折扣",
+        ),
+    ] {
+        check_probability(c, value, path, label);
+    }
+    if r.clarify_threshold > r.accept_threshold {
+        c.warn(
+            "clarify_above_accept",
+            "reasoning.rewrite_retrieval.clarify_threshold",
+            "澄清阈值高于接受阈值：运行时会把澄清阈值压到接受阈值",
+        );
+    }
+    check_clamped_range(
+        c,
+        r.max_hypotheses,
+        1,
+        8,
+        "reasoning.rewrite_retrieval.max_hypotheses",
+        "读法候选数",
+    );
+    check_clamped_range(
+        c,
+        r.max_probes,
+        1,
+        4,
+        "reasoning.rewrite_retrieval.max_probes",
+        "读法探针数",
+    );
+    check_clamped_range(
+        c,
+        r.per_probe_k,
+        1,
+        20,
+        "reasoning.rewrite_retrieval.per_probe_k",
+        "读法探针召回数",
+    );
+    for (value, path, label) in [
+        (
+            r.support_gain,
+            "reasoning.rewrite_retrieval.support_gain",
+            "读法支持度增益",
+        ),
+        (
+            r.coverage_gain,
+            "reasoning.rewrite_retrieval.coverage_gain",
+            "读法覆盖度增益",
+        ),
+        (
+            r.margin_gain,
+            "reasoning.rewrite_retrieval.margin_gain",
+            "读法边际增益",
+        ),
+        (
+            r.consistency_gain,
+            "reasoning.rewrite_retrieval.consistency_gain",
+            "读法一致性增益",
+        ),
+    ] {
+        if !value.is_finite() {
+            c.error(
+                "non_finite_gain",
+                path.to_string(),
+                format!("{}不是有限数（{}）", label, value),
+            );
+        } else if !(0.0..=10.0).contains(&value) {
+            c.warn(
+                "gain_will_be_clamped",
+                path.to_string(),
+                format!("{}={} 超出运行时区间 [0,10]：将被静默钳制", label, value),
+            );
+        }
+    }
 }
 
 fn check_soft_route(c: &mut Collector, config: &SystemConfig) {
@@ -2251,6 +2384,19 @@ process_error = "处理出错"
         let issues = lint_source(&source);
         assert_code(&issues, "threshold_out_of_range");
         assert_eq!(error_count(&issues), 2, "{}", render_text(&issues));
+    }
+
+    #[test]
+    fn rewrite_retrieval_thresholds_are_checked() {
+        let source = format!(
+            "{}\n[reasoning.rewrite_retrieval]\naccept_threshold = 1.5\nclarify_threshold = 2.0\nmax_hypotheses = 0\nsupport_gain = 50.0\npartial_discount = -0.5\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "threshold_out_of_range");
+        assert_code(&issues, "clarify_above_accept");
+        assert_code(&issues, "value_will_be_clamped");
+        assert_code(&issues, "gain_will_be_clamped");
     }
 
     #[test]
