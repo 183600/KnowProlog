@@ -1,0 +1,1490 @@
+impl AbductionEngine {
+    pub fn new(max_depth: usize, max_hypotheses: usize) -> Self {
+        Self {
+            max_depth: max_depth.clamp(1, 12),
+            max_hypotheses: max_hypotheses.clamp(1, 20),
+            max_frontiers: 6,
+            max_scenario_size: 2,
+            pred_objects: HashMap::new(),
+            pred_subject_types: HashMap::new(),
+            pred_object_types: HashMap::new(),
+            pred_subject_objects: HashMap::new(),
+            entity_types: HashMap::new(),
+            entity_features: HashMap::new(),
+            entity_predicates: HashMap::new(),
+            observed_triples: HashSet::new(),
+            pending: Vec::new(),
+            adopted: Vec::new(),
+        }
+    }
+
+    /// 设置联合解释场景的最大假设条数（1~4，默认 2）
+    pub fn set_max_scenario_size(&mut self, size: usize) {
+        self.max_scenario_size = size.clamp(1, 4);
+    }
+
+    pub fn max_scenario_size(&self) -> usize {
+        self.max_scenario_size
+    }
+
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    pub fn pending(&self) -> &[Hypothesis] {
+        &self.pending
+    }
+
+    pub fn adopted(&self) -> &[Atom] {
+        &self.adopted
+    }
+
+    /// 观察知识：只累积计数统计，不做任何学习/权重
+    pub fn observe_facts(&mut self, facts: &[PrologFact]) {
+        // 第一遍：先登记实体类型——关系谓词的类型统计依赖它，
+        // 避免"关系事实先于实体类型出现"时类型分布为空
+        for fact in facts {
+            if let PrologFact::Entity {
+                name, entity_type, ..
+            } = fact
+            {
+                if !entity_type.trim().is_empty()
+                    && self.entity_types.get(name).map(String::as_str) != Some(entity_type.as_str())
+                {
+                    self.entity_types.insert(name.clone(), entity_type.clone());
+                }
+            }
+        }
+        for fact in facts {
+            match fact {
+                PrologFact::Relation { from, rel_type, to } => {
+                    self.observe_triple(from, rel_type, to);
+                }
+                PrologFact::Entity {
+                    name, properties, ..
+                } => {
+                    // 实体类型已在第一遍登记，这里无需重复写入
+                    for (key, value) in properties {
+                        // 关系型属性在存储层可能以完整 IRI 形式留存，跳过以免污染
+                        // 谓词取值统计与候选生成（如「师傅」的候选值变成 IRI）
+                        if value.starts_with("http://") || value.starts_with("https://") {
+                            continue;
+                        }
+                        self.observe_triple(name, key, value);
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_triple(&mut self, subject: &str, predicate: &str, object: &str) {
+        if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+            return;
+        }
+        // 同一三元组只观察一次：`observe_facts` 会在导入/快照重放后反复调用，
+        // 重复累计会把「出现次数」变成「被观察次数」，让理由里的计数失真。
+        let mut key = String::with_capacity(subject.len() + predicate.len() + object.len() + 2);
+        key.push_str(subject);
+        key.push('\u{1f}');
+        key.push_str(predicate);
+        key.push('\u{1f}');
+        key.push_str(object);
+        if !self.observed_triples.insert(key) {
+            return;
+        }
+        // 已存在的计数直接自增
+        match self
+            .pred_objects
+            .get_mut(predicate)
+            .and_then(|values| values.get_mut(object))
+        {
+            Some(count) => *count += 1,
+            None => {
+                *self
+                    .pred_objects
+                    .entry(predicate.to_string())
+                    .or_default()
+                    .entry(object.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        if let Some(t) = self.entity_types.get(subject) {
+            match self.pred_subject_types.get_mut(predicate) {
+                Some(types) => match types.get_mut(t) {
+                    Some(count) => *count += 1,
+                    None => {
+                        types.insert(t.clone(), 1);
+                    }
+                },
+                None => {
+                    *self
+                        .pred_subject_types
+                        .entry(predicate.to_string())
+                        .or_default()
+                        .entry(t.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        if let Some(t) = self.entity_types.get(object) {
+            match self.pred_object_types.get_mut(predicate) {
+                Some(types) => match types.get_mut(t) {
+                    Some(count) => *count += 1,
+                    None => {
+                        types.insert(t.clone(), 1);
+                    }
+                },
+                None => {
+                    *self
+                        .pred_object_types
+                        .entry(predicate.to_string())
+                        .or_default()
+                        .entry(t.clone())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        match self
+            .pred_subject_objects
+            .get_mut(predicate)
+            .and_then(|subjects| subjects.get_mut(subject))
+        {
+            Some(objects) => {
+                // HashSet 的 insert 需要所有权：先做借用检查
+                if !objects.contains(object) {
+                    objects.insert(object.to_string());
+                }
+            }
+            None => {
+                self.pred_subject_objects
+                    .entry(predicate.to_string())
+                    .or_default()
+                    .entry(subject.to_string())
+                    .or_default()
+                    .insert(object.to_string());
+            }
+        }
+
+        // 特征串用可复用缓冲构造
+        let mut feature = String::with_capacity(predicate.len() + subject.len() + object.len() + 4);
+        feature.push_str("出:");
+        feature.push_str(predicate);
+        feature.push('=');
+        feature.push_str(object);
+        match self.entity_features.get_mut(subject) {
+            Some(features) => {
+                if !features.contains(feature.as_str()) {
+                    features.insert(feature.clone());
+                }
+            }
+            None => {
+                self.entity_features
+                    .entry(subject.to_string())
+                    .or_default()
+                    .insert(feature.clone());
+            }
+        }
+        feature.clear();
+        feature.push_str("入:");
+        feature.push_str(predicate);
+        feature.push('=');
+        feature.push_str(subject);
+        match self.entity_features.get_mut(object) {
+            Some(features) => {
+                if !features.contains(feature.as_str()) {
+                    features.insert(feature.clone());
+                }
+            }
+            None => {
+                self.entity_features
+                    .entry(object.to_string())
+                    .or_default()
+                    .insert(feature.clone());
+            }
+        }
+
+        match self
+            .entity_predicates
+            .get_mut(subject)
+            .and_then(|counts| counts.get_mut(predicate))
+        {
+            Some(count) => *count += 1,
+            None => {
+                *self
+                    .entity_predicates
+                    .entry(subject.to_string())
+                    .or_default()
+                    .entry(predicate.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+        match self
+            .entity_predicates
+            .get_mut(object)
+            .and_then(|counts| counts.get_mut(predicate))
+        {
+            Some(count) => *count += 1,
+            None => {
+                *self
+                    .entity_predicates
+                    .entry(object.to_string())
+                    .or_default()
+                    .entry(predicate.to_string())
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// 目标制导的溯因分析：
+    ///   1. 先做完整的 SLD 后向链（含规则）；可证则返回证明；
+    ///   2. 不可证则枚举失败前沿（有界、去重），并从前沿生成候选假设。
+    pub fn analyze(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> AbductionReport {
+        let goal = goals
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Atom::unary("空目标", Term::constant("")));
+        let outcome = engine.solve_outcome(goals, query_vars);
+        let search_status = outcome.render_status();
+        let search_truncated = outcome.is_truncated();
+        if !outcome.solutions.is_empty() {
+            return AbductionReport {
+                goal,
+                provable: true,
+                solutions: outcome.solutions,
+                frontier: Vec::new(),
+                hypotheses: Vec::new(),
+                notes: vec!["目标可由现有事实与规则证明（后向链成功）".to_string()],
+            };
+        }
+
+        let mut search = FrontierSearch {
+            engine,
+            max_depth: self.max_depth,
+            max_frontiers: self.max_frontiers,
+            budget: 20_000,
+            results: Vec::new(),
+            seen: HashSet::new(),
+            freshen_counter: 0,
+        };
+        let mut missing = Vec::new();
+        search.run(goals, &Substitution::new(), 0, &mut missing);
+        let frontier = self.select_best_frontier(search.results);
+
+        let mut hypotheses = Vec::new();
+        for atom in &frontier {
+            hypotheses.extend(self.hypotheses_for(engine, atom));
+        }
+        hypotheses.sort_by_cached_key(|hypothesis| ConfidenceDisplayKey {
+            confidence: hypothesis.confidence,
+            display: hypothesis.atom.display(),
+        });
+        dedupe_hypotheses(&mut hypotheses);
+        if hypotheses.len() > self.max_hypotheses {
+            hypotheses.truncate(self.max_hypotheses);
+        }
+
+        let mut notes = vec![format!(
+            "后向链在深度上限 {} 内未能证明目标，改走溯因：从失败前沿生成候选假设",
+            self.max_depth
+        )];
+        notes.push(format!("主后向链搜索结论：{}", search_status));
+        if !outcome.frontier.is_empty() {
+            notes.push(format!(
+                "本次搜索实际失败的叶子：{}",
+                outcome
+                    .frontier
+                    .iter()
+                    .take(4)
+                    .map(|entry| entry.describe())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+        if search_truncated {
+            notes.push(
+                "主后向链搜索被截断：不能据此断言目标不存在；下方失败前沿由另一条有界搜索重建，可能与该次实际路径不同"
+                    .to_string(),
+            );
+        }
+        if frontier.is_empty() {
+            notes.push("失败前沿为空（目标含深层循环或超出搜索预算）".to_string());
+        }
+
+        AbductionReport {
+            goal,
+            provable: false,
+            solutions: Vec::new(),
+            frontier,
+            hypotheses,
+            notes,
+        }
+    }
+
+    /// 对单个失败前沿原子生成候选假设
+    fn hypotheses_for(&self, engine: &ResolutionEngine, atom: &Atom) -> Vec<Hypothesis> {
+        if atom.is_ground() {
+            if engine.has_fact(atom) {
+                return Vec::new();
+            }
+            let (confidence, reasons, conflicts, contradicts_known) = self.score(atom);
+            return vec![Hypothesis {
+                atom: atom.clone(),
+                goal: atom.clone(),
+                kind: HypothesisKind::MissingFact,
+                confidence,
+                reasons,
+                conflicts,
+                contradicts_known,
+            }];
+        }
+
+        // 开放原子：找出第一个未绑定变量，用候选取值逐一补全
+        let Some(var_index) = atom.terms.iter().position(|term| term.is_var()) else {
+            return Vec::new();
+        };
+        let candidates = self.candidate_values(engine, atom, var_index);
+        let mut hypotheses = Vec::new();
+        for candidate in candidates {
+            let mut terms = atom.terms.clone();
+            terms[var_index] = Term::constant(&candidate);
+            let hypothesis = Atom::new(&atom.predicate, terms);
+            if hypothesis.is_ground() && engine.has_fact(&hypothesis) {
+                continue;
+            }
+            let (confidence, reasons, conflicts, contradicts_known) = self.score(&hypothesis);
+            hypotheses.push(Hypothesis {
+                atom: hypothesis,
+                goal: atom.clone(),
+                kind: HypothesisKind::CandidateValue,
+                confidence,
+                reasons,
+                conflicts,
+                contradicts_known,
+            });
+        }
+
+        if hypotheses.is_empty() {
+            // 无法生成任何具体取值：保留开放形式的"缺失事实"作为方向提示
+            hypotheses.push(Hypothesis {
+                atom: atom.clone(),
+                goal: atom.clone(),
+                kind: HypothesisKind::MissingFact,
+                confidence: 0.05,
+                reasons: vec!["知识库中缺少该谓词的可参考取值，无法给出具体候选".to_string()],
+                conflicts: vec!["需要外部补充事实".to_string()],
+                contradicts_known: false,
+            });
+        }
+        // 每个前沿原子最多保留 3 条候选，保证假设集多样性
+        hypotheses.sort_by(|a, b| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hypotheses.truncate(3);
+        hypotheses
+    }
+
+    /// 候选取值：同谓词已知取值 → 与另一侧同类型实体 → 特征最相似实体
+    fn candidate_values(
+        &self,
+        engine: &ResolutionEngine,
+        atom: &Atom,
+        var_index: usize,
+    ) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let predicate: &str = &atom.predicate;
+
+        // 1) 同谓词已知取值（按频次降序）
+        if let Some(counts) = self.pred_objects.get(predicate) {
+            let mut values: Vec<(&String, &u64)> = counts.iter().collect();
+            let cmp =
+                |a: &(&String, &u64), b: &(&String, &u64)| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0));
+            // 取前 6 名
+            if values.len() > 6 {
+                values.select_nth_unstable_by(6, cmp);
+                values.truncate(6);
+            }
+            values.sort_by(cmp);
+            for (value, _) in values.into_iter() {
+                if seen.insert(value.clone()) {
+                    candidates.push(value.clone());
+                }
+            }
+        }
+
+        // 另一侧的基（用于类型/特征对比）
+        let counterpart = atom.terms.iter().enumerate().find_map(|(index, term)| {
+            if index != var_index {
+                constant_name(term)
+            } else {
+                None
+            }
+        });
+
+        if let Some(base) = counterpart {
+            // 2) 同类型实体（共享主体类型时最自然）
+            if let Some(base_type) = self.entity_types.get(base) {
+                let mut same_type: Vec<&String> = self
+                    .entity_types
+                    .iter()
+                    .filter(|(entity, etype)| *etype == base_type && entity.as_str() != base)
+                    .map(|(entity, _)| entity)
+                    .collect();
+                // 取字典序前 5 个
+                if same_type.len() > 5 {
+                    same_type.select_nth_unstable(5);
+                    same_type.truncate(5);
+                }
+                same_type.sort();
+                for entity in same_type.into_iter() {
+                    if seen.insert(entity.clone()) {
+                        candidates.push(entity.clone());
+                    }
+                }
+            }
+
+            // 3) 特征最相似实体（Jaccard 排序）
+            if let Some(base_features) = self.entity_features.get(base) {
+                let mut similar: Vec<(f64, &String)> = self
+                    .entity_features
+                    .iter()
+                    .filter(|(entity, _)| entity.as_str() != base)
+                    .map(|(entity, features)| {
+                        let inter = features.intersection(base_features).count();
+                        let union = (features.len() + base_features.len())
+                            .saturating_sub(inter)
+                            .max(1) as f64;
+                        (inter as f64 / union, entity)
+                    })
+                    .filter(|(score, _)| *score > 0.0)
+                    .collect();
+                let cmp = |a: &(f64, &String), b: &(f64, &String)| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(b.1))
+                };
+                // 取前 5 名
+                if similar.len() > 5 {
+                    similar.select_nth_unstable_by(5, cmp);
+                    similar.truncate(5);
+                }
+                similar.sort_by(cmp);
+                for (_, entity) in similar.into_iter() {
+                    if seen.insert(entity.clone()) {
+                        candidates.push(entity.clone());
+                    }
+                }
+            }
+        }
+
+        // 过滤掉已能在知识库中被证明的取值
+        candidates.retain(|value| {
+            let mut terms = atom.terms.clone();
+            terms[var_index] = Term::constant(value);
+            !engine.has_fact(&Atom::new(&atom.predicate, terms))
+        });
+        candidates.truncate(6);
+        candidates
+    }
+
+    /// 纯计数可信度评分：先验 + 类型匹配 + 特征重叠 − 功能谓词/类型冲突
+    ///
+    /// 返回（可信度, 支持理由, 冲突说明, 是否与已知事实硬冲突）。
+    fn score(&self, atom: &Atom) -> (f64, Vec<String>, Vec<String>, bool) {
+        let mut reasons: Vec<String> = Vec::new();
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut contradicts_known = false;
+        let mut score = 0.25f64;
+
+        let predicate: &str = &atom.predicate;
+        let subject = atom.terms.first().and_then(constant_name);
+        let object = atom.terms.get(1).and_then(constant_name);
+
+        // 1) 同谓词取值先验
+        if let (Some(counts), Some(object)) = (self.pred_objects.get(predicate), object) {
+            let total: u64 = counts.values().sum();
+            if let Some(&count) = counts.get(object) {
+                let share = count as f64 / total.max(1) as f64;
+                score += 0.20 * share;
+                reasons.push(format!(
+                    "图谱中「{}」共 {} 条记录，取值「{}」出现 {} 次（占 {:.0}%）",
+                    predicate,
+                    total,
+                    object,
+                    count,
+                    share * 100.0
+                ));
+            } else if total > 0 {
+                reasons.push(format!(
+                    "「{}」在图中尚无「{}」记录（候选来自类型/特征相似性）",
+                    object, predicate
+                ));
+            }
+        }
+
+        // 2) 主语类型 × 谓词相容度
+        if let Some(subject) = subject {
+            if let Some(subject_type) = self.entity_types.get(subject) {
+                if let Some(type_counts) = self.pred_subject_types.get(predicate) {
+                    let total: u64 = type_counts.values().sum();
+                    let count = type_counts.get(subject_type).copied().unwrap_or(0);
+                    if count > 0 {
+                        let share = count as f64 / total.max(1) as f64;
+                        score += 0.12 * share;
+                        reasons.push(format!(
+                            "主体「{}」属于「{}」，该类型在「{}」主语中占 {:.0}%",
+                            subject,
+                            subject_type,
+                            predicate,
+                            share * 100.0
+                        ));
+                    } else {
+                        conflicts.push(format!(
+                            "主体类型「{}」未在「{}」的历史主语中出现",
+                            subject_type, predicate
+                        ));
+                        score -= 0.05;
+                    }
+                }
+            }
+        }
+
+        // 3) 宾语类型 × 谓词相容度
+        if let Some(object) = object {
+            if let Some(object_type) = self.entity_types.get(object) {
+                if let Some(type_counts) = self.pred_object_types.get(predicate) {
+                    let total: u64 = type_counts.values().sum();
+                    let count = type_counts.get(object_type).copied().unwrap_or(0);
+                    if count > 0 {
+                        let share = count as f64 / total.max(1) as f64;
+                        score += 0.12 * share;
+                        reasons.push(format!(
+                            "宾体「{}」属于「{}」，该类型在「{}」宾语中占 {:.0}%",
+                            object,
+                            object_type,
+                            predicate,
+                            share * 100.0
+                        ));
+                    } else if total > 0 {
+                        // 类型不相容：宾体类型从未在该谓词宾语中出现过（有足够历史证据时）
+                        conflicts.push(format!(
+                            "宾体类型「{}」未在「{}」的历史宾语中出现（{} 次观测）",
+                            object_type, predicate, total
+                        ));
+                        score -= 0.05;
+                    }
+                }
+            }
+        }
+
+        // 4) 特征重叠（Jaccard）
+        if let (Some(subject), Some(object)) = (subject, object) {
+            if let (Some(subject_features), Some(object_features)) = (
+                self.entity_features.get(subject),
+                self.entity_features.get(object),
+            ) {
+                let inter = subject_features.intersection(object_features).count();
+                let union = (subject_features.len() + object_features.len())
+                    .saturating_sub(inter)
+                    .max(1);
+                if inter > 0 {
+                    let jaccard = inter as f64 / union as f64;
+                    score += 0.25 * jaccard;
+                    reasons.push(format!(
+                        "候选与主体共享 {} 个关系特征（Jaccard {:.2}）",
+                        inter, jaccard
+                    ));
+                }
+            }
+
+            // 5) 参与谓词分布的相似度（互补证据，权重较小）
+            if let (Some(subject_predicates), Some(object_predicates)) = (
+                self.entity_predicates.get(subject),
+                self.entity_predicates.get(object),
+            ) {
+                let inter = subject_predicates
+                    .keys()
+                    .filter(|key| object_predicates.contains_key(*key))
+                    .count();
+                let union = (subject_predicates.len() + object_predicates.len())
+                    .saturating_sub(inter)
+                    .max(1);
+                if inter > 0 {
+                    score += 0.10 * inter as f64 / union as f64;
+                    reasons.push(format!("与主体共用 {} 个谓词上下文", inter));
+                }
+            }
+        }
+
+        // 6) 功能谓词冲突：同主语已有不同取值 ⇒ 封闭世界假设下重罚
+        if let (Some(subject), Some(object)) = (subject, object) {
+            if let Some(by_subject) = self.pred_subject_objects.get(predicate) {
+                if let Some(existing) = by_subject.get(subject) {
+                    if !existing.contains(object) && self.is_functional(predicate) {
+                        conflicts.push(format!(
+                            "「{}」是功能谓词，「{}」已有取值：{}（封闭世界假设）",
+                            predicate,
+                            subject,
+                            existing.iter().cloned().collect::<Vec<_>>().join("、")
+                        ));
+                        score = score.min(0.08);
+                        contradicts_known = true;
+                    }
+                }
+            }
+        }
+
+        if reasons.is_empty() {
+            reasons.push("无同谓词历史与类型证据（低置信度假设）".to_string());
+        }
+        (
+            score.clamp(0.02, 0.95),
+            reasons,
+            conflicts,
+            contradicts_known,
+        )
+    }
+
+    /// 功能谓词：≥3 个主语且 90% 以上主语只有唯一取值
+    fn is_functional(&self, predicate: &str) -> bool {
+        let Some(by_subject) = self.pred_subject_objects.get(predicate) else {
+            return false;
+        };
+        if by_subject.len() < 3 {
+            return false;
+        }
+        let single = by_subject
+            .values()
+            .filter(|objects| objects.len() == 1)
+            .count();
+        single as f64 / by_subject.len() as f64 >= 0.9
+    }
+
+    /// 反事实模拟：临时加入假设事实，正向饱和推导新结论（不修改原知识库）
+    pub fn what_if(
+        &self,
+        engine: &ResolutionEngine,
+        assumptions: &[Atom],
+        max_rounds: usize,
+        max_facts: usize,
+    ) -> WhatIfResult {
+        // 假设作为额外基事实注入推导
+        let ground_assumptions: Vec<Atom> = assumptions
+            .iter()
+            .filter(|assumption| assumption.is_ground())
+            .cloned()
+            .collect();
+        let derived =
+            engine.forward_chain_with_extra_facts(&ground_assumptions, max_rounds, max_facts);
+        // 单遍同时构造“排除已知事实后的推导结果”和“去重后的新事实”
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut new_facts: Vec<Atom> = Vec::new();
+        let mut kept: Vec<DerivedFact> = Vec::with_capacity(derived.len());
+        for item in derived {
+            if engine.has_fact(&item.atom) {
+                continue;
+            }
+            if seen.insert(item.atom.display()) {
+                new_facts.push(item.atom.clone());
+            }
+            kept.push(item);
+        }
+        WhatIfResult {
+            assumptions: assumptions.to_vec(),
+            derived: kept,
+            new_facts,
+        }
+    }
+
+    /// 选择"最佳失败前沿"：缺失原子少者优先；同规模时谓词在图谱中
+    /// 支撑越多（同谓词历史取值越多）越可信，最后按显示长度稳定排序。
+    fn select_best_frontier(&self, frontiers: Vec<Vec<Atom>>) -> Vec<Atom> {
+        let quality = |frontier: &Vec<Atom>| -> u64 {
+            frontier
+                .iter()
+                .map(|atom| {
+                    self.pred_objects
+                        .get(atom.predicate.as_ref())
+                        .map(|values| values.values().sum::<u64>())
+                        .unwrap_or(0)
+                })
+                .sum()
+        };
+        // 排序键：规模升序 → 谓词支撑降序 → 显示长度升序
+        let candidates: Vec<(Vec<Atom>, usize, u64, usize)> = frontiers
+            .into_iter()
+            .map(|frontier| {
+                let size = frontier.len();
+                let support = quality(&frontier);
+                let display_len: usize = frontier.iter().map(|atom| atom.display().len()).sum();
+                (frontier, size, support, display_len)
+            })
+            .collect();
+        // 取极值（稳定升序排序后的首个）
+        candidates
+            .into_iter()
+            .min_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.3.cmp(&b.3))
+            })
+            .map(|(frontier, _, _, _)| frontier)
+            .unwrap_or_default()
+    }
+
+    /// 暂存候选假设，供「采纳假设 N」使用
+    pub fn set_pending(&mut self, hypotheses: Vec<Hypothesis>) {
+        self.pending = hypotheses;
+    }
+
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
+    /// 清空全部会话态（待定假设 + 已采纳假设），保留观察统计。
+    /// 供 WarmBase 会话分叉：新会话不得继承其他会话的假设。
+    pub fn reset_session(&mut self) {
+        self.pending.clear();
+        self.adopted.clear();
+    }
+
+    /// 取第 index（1 起）条假设并从待定列表移除
+    pub fn take_pending(&mut self, index: usize) -> Option<Hypothesis> {
+        if index == 0 || index > self.pending.len() {
+            return None;
+        }
+        Some(self.pending.remove(index - 1))
+    }
+
+    /// 记录被采纳的假设（会话级事实，不写知识图谱）
+    pub fn adopt(&mut self, hypothesis: Hypothesis) {
+        self.adopted.push(hypothesis.atom);
+    }
+
+    /// 恢复历史会话采纳的假设（跨会话临时信念）
+    pub fn restore_adopted(&mut self, atoms: Vec<Atom>) {
+        if atoms.is_empty() {
+            return;
+        }
+        // 用哈希集合做成员检查
+        let mut new_atoms: Vec<Atom> = Vec::new();
+        {
+            let mut seen: HashSet<&Atom> = self.adopted.iter().collect();
+            for atom in &atoms {
+                if seen.insert(atom) {
+                    new_atoms.push(atom.clone());
+                }
+            }
+        }
+        self.adopted.extend(new_atoms);
+    }
+
+    /// 两条假设是否互斥：同一主体的功能谓词给出不同取值（不会同时为真）
+    pub fn hypotheses_conflict(&self, a: &Hypothesis, b: &Hypothesis) -> bool {
+        if a.atom.predicate != b.atom.predicate {
+            return false;
+        }
+        if a.atom.terms.len() != 2 || b.atom.terms.len() != 2 {
+            return a.atom == b.atom;
+        }
+        a.atom.terms[0] == b.atom.terms[0]
+            && a.atom.terms[1] != b.atom.terms[1]
+            && self.is_functional(&a.atom.predicate)
+    }
+
+    /// 联合解释场景生成（生成式推理：多假设协同 → 验证 → 排序）
+    ///
+    /// 1. 复刻 `analyze` 的失败前沿搜索，但汇集**所有前沿**（而非最佳前沿）的假设池；
+    /// 2. 枚举规模 1..=max_scenario_size 的假设组合，过滤互斥组合；
+    /// 3. 把每个组合注入克隆引擎，做完整的 SLD 反驳验证：只有真正证明
+    ///    目标的组合才会被保留（这一点与单假设 Top-K 的"启发式猜测"本质不同）；
+    /// 4. 联合可信度 = 成员可信度均值 × 规模折扣（假设越多越保守），
+    ///    按"规模最小 → 联合可信度最高"排序。
+    pub fn scenarios(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> Vec<Scenario> {
+        if goals.is_empty() {
+            return Vec::new();
+        }
+        // 目标本身可证：无需假设，不存在"解释场景"
+        if !engine.solve(goals, query_vars).is_empty() {
+            return Vec::new();
+        }
+        self.scenarios_impl(engine, goals, query_vars)
+    }
+
+    /// 与 [`AbductionEngine::scenarios`] 相同，但调用方已确认目标在 `engine`
+    /// 上不可证，因而跳过可证性检查。仅在 `engine` 状态与不可证结论一致时调用，
+    /// 语义与 `scenarios` 等价。
+    pub fn scenarios_assuming_unprovable(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> Vec<Scenario> {
+        if goals.is_empty() {
+            return Vec::new();
+        }
+        self.scenarios_impl(engine, goals, query_vars)
+    }
+
+    /// 当前目标的解释空间：先做有界溯因分析拿到失败前沿，再枚举并验证
+    /// 所有可解释目标的假设组合。目标已可证时返回空空间（无需解释）。
+    pub fn explanation_space(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> ExplanationSpace {
+        if goals.is_empty() {
+            return ExplanationSpace::default();
+        }
+        let report = self.analyze(engine, goals, query_vars);
+        if report.provable {
+            return ExplanationSpace::default();
+        }
+        self.explanation_space_with_frontier(engine, goals, query_vars, &report.frontier)
+    }
+
+    /// 复用已知失败前沿计算解释空间：回答一轮后只需重枚举场景，不必重跑前沿搜索。
+    pub fn explanation_space_with_frontier(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+        frontier: &[Atom],
+    ) -> ExplanationSpace {
+        if goals.is_empty() {
+            return ExplanationSpace::default();
+        }
+        if !engine.solve(goals, query_vars).is_empty() {
+            return ExplanationSpace::default();
+        }
+        let (scenarios, bounded) = self.scenarios_with_bounds(engine, goals, query_vars);
+        ExplanationSpace::new(scenarios, frontier.to_vec(), bounded)
+    }
+
+    fn scenarios_impl(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> Vec<Scenario> {
+        self.scenarios_with_bounds(engine, goals, query_vars).0
+    }
+
+    /// 返回（场景, 是否因池/预算/展示上限而可能有漏解）。
+    fn scenarios_with_bounds(
+        &self,
+        engine: &ResolutionEngine,
+        goals: &[Atom],
+        query_vars: &[String],
+    ) -> (Vec<Scenario>, bool) {
+        let mut search = FrontierSearch {
+            engine,
+            max_depth: self.max_depth,
+            max_frontiers: self.max_frontiers,
+            budget: 20_000,
+            results: Vec::new(),
+            seen: HashSet::new(),
+            freshen_counter: 0,
+        };
+        let mut missing = Vec::new();
+        search.run(goals, &Substitution::new(), 0, &mut missing);
+
+        // 假设池：所有前沿的基假设，排除与已知事实硬冲突者
+        // 循环解释过滤：假设集合里不能包含目标本身（"假设目标成立"不算解释）
+        let mut pool: Vec<Hypothesis> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for frontier in &search.results {
+            for atom in frontier {
+                for hypothesis in self.hypotheses_for(engine, atom) {
+                    if !hypothesis.is_adoptable() || hypothesis.contradicts_known {
+                        continue;
+                    }
+                    if goals.iter().any(|goal| goal == &hypothesis.atom) {
+                        continue;
+                    }
+                    if seen.insert(hypothesis.atom.display()) {
+                        pool.push(hypothesis);
+                    }
+                }
+            }
+        }
+        pool.sort_by_cached_key(|hypothesis| ConfidenceDisplayKey {
+            confidence: hypothesis.confidence,
+            display: hypothesis.atom.display(),
+        });
+        // 组合枚举上限：池 10 × 规模 2 ⇒ 45 组，足够覆盖典型解释空间
+        let pool_truncated = pool.len() > 10;
+        pool.truncate(10);
+
+        let max_size = self.max_scenario_size.min(pool.len()).clamp(1, 4);
+        let mut scenarios: Vec<Scenario> = Vec::new();
+        let mut budget = 60usize;
+        let mut budget_exhausted = false;
+        let mut indices: Vec<usize> = Vec::new();
+        // 组合验证复用一个引擎克隆：逐组合“加入假设 → 求解 → 按原顺序移除”。
+        let mut simulation = engine.clone();
+        for size in 1..=max_size {
+            let _ = collect_combinations(&pool, size, 0, &mut indices, &mut |combo| {
+                if budget == 0 {
+                    budget_exhausted = true;
+                    return false;
+                }
+                budget -= 1;
+                // 互斥组合直接跳过（功能谓词同主体不同取值）
+                for i in 0..combo.len() {
+                    for j in (i + 1)..combo.len() {
+                        if self.hypotheses_conflict(&pool[combo[i]], &pool[combo[j]]) {
+                            return true;
+                        }
+                    }
+                }
+                let members: Vec<Hypothesis> =
+                    combo.iter().map(|&index| pool[index].clone()).collect();
+                let mut added: Vec<Atom> = Vec::with_capacity(members.len());
+                for hypothesis in &members {
+                    let atom = hypothesis.atom.clone();
+                    if simulation.add_fact_atom(atom.clone()) {
+                        added.push(atom);
+                    }
+                }
+                let solutions = simulation.solve(goals, query_vars);
+                for atom in &added {
+                    simulation.remove_fact_atom(atom);
+                }
+                if solutions.is_empty() {
+                    return true;
+                }
+                let mean = members
+                    .iter()
+                    .map(|hypothesis| hypothesis.confidence)
+                    .sum::<f64>()
+                    / members.len() as f64;
+                let discount = 1.0 / (1.0 + 0.2 * (members.len().saturating_sub(1)) as f64);
+                scenarios.push(Scenario {
+                    hypotheses: members,
+                    verified: true,
+                    joint_confidence: (mean * discount).clamp(0.02, 0.95),
+                    solutions,
+                });
+                true
+            });
+        }
+        // 没有可验证的组合：退回展示可信度最高的单条假设（明确标注未验证）
+        if scenarios.is_empty() {
+            if let Some(best) = pool.first() {
+                scenarios.push(Scenario {
+                    hypotheses: vec![best.clone()],
+                    verified: false,
+                    joint_confidence: best.confidence,
+                    solutions: Vec::new(),
+                });
+            }
+        }
+        // 规模最小优先（最小基数解释），同规模按联合可信度降序
+        scenarios.sort_by_cached_key(|scenario| ScenarioOrderKey {
+            size: scenario.size(),
+            joint_confidence: scenario.joint_confidence,
+            first_display: scenario.hypotheses[0].atom.display(),
+        });
+        let display_truncated = scenarios.len() > 5;
+        scenarios.truncate(5);
+        let bounded = pool_truncated || budget_exhausted || display_truncated;
+        (scenarios, bounded)
+    }
+}
+/// 组合枚举：对 pool 取 size 个下标的组合，回调返回 false 时提前终止
+fn collect_combinations(
+    pool: &[Hypothesis],
+    size: usize,
+    start: usize,
+    indices: &mut Vec<usize>,
+    visit: &mut dyn FnMut(&[usize]) -> bool,
+) -> bool {
+    if indices.len() == size {
+        return visit(indices);
+    }
+    for index in start..pool.len() {
+        indices.push(index);
+        let keep_going = collect_combinations(pool, size, index + 1, indices, visit);
+        indices.pop();
+        if !keep_going {
+            return false;
+        }
+    }
+    true
+}
+fn constant_name(term: &Term) -> Option<&str> {
+    match term {
+        Term::Const(name) => Some(name),
+        Term::Var(_) => None,
+    }
+}
+/// 置信度降序、同置信度按显示串升序的排序键
+#[derive(PartialEq)]
+struct ConfidenceDisplayKey {
+    confidence: f64,
+    display: String,
+}
+impl Eq for ConfidenceDisplayKey {}
+impl PartialOrd for ConfidenceDisplayKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ConfidenceDisplayKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .confidence
+            .partial_cmp(&self.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.display.cmp(&other.display))
+    }
+}
+/// 场景排序键：规模升序 → 联合可信度降序 → 首假设显示串升序
+#[derive(PartialEq)]
+struct ScenarioOrderKey {
+    size: usize,
+    joint_confidence: f64,
+    first_display: String,
+}
+impl Eq for ScenarioOrderKey {}
+impl PartialOrd for ScenarioOrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScenarioOrderKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.size
+            .cmp(&other.size)
+            .then_with(|| {
+                other
+                    .joint_confidence
+                    .partial_cmp(&self.joint_confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| self.first_display.cmp(&other.first_display))
+    }
+}
+/// 去重：同一基事实只保留置信度最高的一条。
+/// 输入已按可信度降序排序，故保留每个原子的首次出现即可，
+/// 同时保持顺序（调用方随后依赖该顺序做截断与「假设 N」编号）。
+fn dedupe_hypotheses(hypotheses: &mut Vec<Hypothesis>) {
+    let mut seen: HashSet<String> = HashSet::new();
+    hypotheses.retain(|hypothesis| seen.insert(hypothesis.atom.display()));
+}
+/// 有界后向链失败前沿搜索：
+/// 目标逐个展开——能匹配事实/规则就继续深入；无任何匹配时把当前原子
+/// 记入"缺失前提"，继续处理剩余目标。多处分支会得到多个前沿，去重后供排序。
+struct FrontierSearch<'a> {
+    engine: &'a ResolutionEngine,
+    max_depth: usize,
+    max_frontiers: usize,
+    budget: usize,
+    results: Vec<Vec<Atom>>,
+    seen: HashSet<String>,
+    /// 全局单调递增的换名计数：每次规则换名取一个全新 tag，
+    /// 避免递归不同层复用同一 tag 造成变量捕获
+    freshen_counter: usize,
+}
+impl<'a> FrontierSearch<'a> {
+    fn run(&mut self, goals: &[Atom], subst: &Substitution, depth: usize, missing: &mut Vec<Atom>) {
+        if self.budget == 0 || self.results.len() >= self.max_frontiers {
+            return;
+        }
+        if goals.is_empty() {
+            self.record(missing);
+            return;
+        }
+        self.budget = self.budget.saturating_sub(1);
+
+        let goal = &goals[0];
+        let applied = apply_atom(subst, goal);
+
+        // 深度截断：把当前原子视为缺失前提（更深的证明超出预算）
+        if depth > self.max_depth {
+            missing.push(applied);
+            self.run(&goals[1..], subst, depth, missing);
+            missing.pop();
+            return;
+        }
+
+        // 1) 与基事实归结：命中即可继续推进剩余目标
+        //（把引擎引用拷出，避免与递归调用 `self.run` 的可变借用冲突）
+        let engine = self.engine;
+        let mut fact_matched = false;
+        for fact in engine
+            .facts_for(&applied.predicate)
+            .iter()
+            .filter(|fact| fact.arity() == applied.arity())
+            .take(6)
+        {
+            let mut unified = subst.clone();
+            if crate::resolution_engine::unify_atoms(&applied, fact, &mut unified) {
+                if fact_matched {
+                    break;
+                }
+                fact_matched = true;
+                self.run(&goals[1..], &unified, depth, missing);
+            }
+        }
+        if fact_matched {
+            return;
+        }
+
+        // 2) 直接切点：把当前原子记为缺失前提（最小解释，最先记录）
+        //（借出 `applied` 随递归入栈，返回后再取回；
+        //  递归按栈序归还，`pop` 必然取回同一原子）
+        missing.push(applied);
+        self.run(&goals[1..], subst, depth, missing);
+        let applied = missing.pop().unwrap_or_else(|| apply_atom(subst, goal));
+
+        // 3) 与规则头归结：换名后合一，再把规则体前置到目标队列
+        //    （规则解释作为备选前沿，与直接切点一起参与排序）
+        for clause in engine.clauses_iter_for(&applied.predicate).take(6) {
+            if self.budget == 0 {
+                break;
+            }
+            let tag = self.freshen_counter;
+            self.freshen_counter += 1;
+            let fresh = freshen_clause(clause, tag);
+            let mut unified = subst.clone();
+            if !crate::resolution_engine::unify_atoms(&applied, &fresh.head, &mut unified) {
+                continue;
+            }
+            // 规则体直接移动进组合目标队列（head 已合一，只需继续推进规则体）
+            let mut combined: Vec<Atom> = fresh.body;
+            combined.extend_from_slice(&goals[1..]);
+            self.run(&combined, &unified, depth + 1, missing);
+        }
+    }
+
+    fn record(&mut self, missing: &[Atom]) {
+        if self.results.len() >= self.max_frontiers {
+            return;
+        }
+        let mut key = String::new();
+        for (index, atom) in missing.iter().enumerate() {
+            if index > 0 {
+                key.push('|');
+            }
+            key.push_str(&atom.display());
+        }
+        if !self.seen.insert(key) {
+            return;
+        }
+        self.results.push(missing.to_vec());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 自然语言渲染：把结构化的证明/假设/反事实结果组织成可读回答
+// （render 闭包由调用方提供，以复用知识图谱的谓词/句式渲染）
+// ---------------------------------------------------------------------------
+fn render_proof_tree(
+    node: &ProofNode,
+    render: &dyn Fn(&Atom) -> String,
+    lines: &mut Vec<String>,
+    indent: usize,
+) {
+    let padding = "    ".repeat(indent);
+    let fact = render(&node.atom);
+    match &node.source {
+        ProofSource::Fact => lines.push(format!("{}{}（事实）", padding, fact)),
+        ProofSource::Rule { source } => lines.push(format!(
+            "{}{}（由 {}；本步置信度 {:.2}）",
+            padding, fact, source, node.confidence
+        )),
+    }
+    for child in &node.children {
+        render_proof_tree(child, render, lines, indent + 1);
+    }
+}
+/// 渲染溯因报告：可证则给证明，不可证则给"失败前沿 + 候选假设"
+pub fn render_report(report: &AbductionReport, render: &dyn Fn(&Atom) -> String) -> String {
+    let goal = render(&report.goal);
+    if report.provable {
+        let mut output = format!(
+            "【溯因推理·后向链得证】目标「{}」可由现有知识证明。\n",
+            goal
+        );
+        if let Some(solution) = report.solutions.first() {
+            output.push_str(&format!("  证明置信度 {:.2}\n", solution.confidence));
+            let mut lines = Vec::new();
+            for proof in &solution.proofs {
+                render_proof_tree(proof, render, &mut lines, 1);
+            }
+            output.push_str("  证明树：\n");
+            output.push_str(&lines.join("\n"));
+        }
+        return output;
+    }
+
+    let mut output = format!(
+        "【溯因推理·假设生成】目标「{}」在后向链深度上限内无法由现有知识证明。\n",
+        goal
+    );
+    if !report.frontier.is_empty() {
+        let frontier = report
+            .frontier
+            .iter()
+            .map(|atom| render(atom))
+            .collect::<Vec<_>>()
+            .join("；");
+        output.push_str(&format!("  失败前沿（缺少的前提）：{}\n", frontier));
+    }
+    for note in &report.notes {
+        output.push_str(&format!("  说明：{}\n", note));
+    }
+    if report.hypotheses.is_empty() {
+        output.push_str("  未能生成候选假设（知识库中缺少可参考的同类事实）。\n");
+        return output;
+    }
+    output.push_str("  候选假设（纯计数评分，按可信度降序）：\n");
+    for (index, hypothesis) in report.hypotheses.iter().enumerate() {
+        let assumption = render(&hypothesis.atom);
+        output.push_str(&format!(
+            "    假设 {}（可信度 {:.2}，{}）：{}",
+            index + 1,
+            hypothesis.confidence,
+            hypothesis.kind.label(),
+            assumption
+        ));
+        if !hypothesis.is_adoptable() {
+            output.push_str("〔含未绑定变量，仅作方向提示〕");
+        }
+        output.push('\n');
+        if !hypothesis.reasons.is_empty() {
+            output.push_str(&format!(
+                "        依据：{}\n",
+                hypothesis.reasons.join("；")
+            ));
+        }
+        if !hypothesis.conflicts.is_empty() {
+            output.push_str(&format!(
+                "        冲突：{}\n",
+                hypothesis.conflicts.join("；")
+            ));
+        }
+    }
+    output.push_str(
+        "  这些假设不会自动写入知识库；输入「采纳假设 N」可把它们加入本轮会话事实集，输入「澄清」可按解释空间选择最有判别力的问题（是 / 不是 / 不知道，结束时给条件化答案）。",
+    );
+    output
+}
+/// 渲染联合解释场景报告（生成式推理：多假设协同 + 注入验证）
+pub fn render_scenarios(
+    goal: &Atom,
+    frontier: &[Atom],
+    scenarios: &[Scenario],
+    render: &dyn Fn(&Atom) -> String,
+) -> String {
+    let mut output = format!(
+        "【生成式联合解释】目标「{}」无法由现有知识单独证明；枚举假设组合并注入克隆引擎验证（纯符号）。\n",
+        render(goal)
+    );
+    if !frontier.is_empty() {
+        let frontier_text = frontier
+            .iter()
+            .map(|atom| render(atom))
+            .collect::<Vec<_>>()
+            .join("；");
+        output.push_str(&format!("  失败前沿（缺少的前提）：{}\n", frontier_text));
+    }
+    if scenarios.is_empty() {
+        output.push_str(
+            "  未能生成任何解释场景（知识库中缺少可参考的同类事实）。\n  可先补充相关事实，或用「溯因：<陈述>」查看单条假设。",
+        );
+        return output;
+    }
+    for (index, scenario) in scenarios.iter().enumerate() {
+        let status = if scenario.verified {
+            "注入后目标可证"
+        } else {
+            "未通过验证（仅为最弱候选，请谨慎采纳）"
+        };
+        output.push_str(&format!(
+            "  场景 {}（{} 条假设，联合可信度 {:.2}，{}）：\n",
+            index + 1,
+            scenario.size(),
+            scenario.joint_confidence,
+            status
+        ));
+        for (member_index, hypothesis) in scenario.hypotheses.iter().enumerate() {
+            output.push_str(&format!(
+                "    假设 {}-{}（{:.2}，{}）：{}",
+                index + 1,
+                member_index + 1,
+                hypothesis.confidence,
+                hypothesis.kind.label(),
+                render(&hypothesis.atom)
+            ));
+            if !hypothesis.is_adoptable() {
+                output.push_str("〔含未绑定变量，仅作方向提示〕");
+            }
+            output.push('\n');
+            if !hypothesis.reasons.is_empty() {
+                output.push_str(&format!(
+                    "        依据：{}\n",
+                    hypothesis.reasons.join("；")
+                ));
+            }
+        }
+        if scenario.verified {
+            if let Some(solution) = scenario.solutions.first() {
+                output.push_str(&format!(
+                    "    验证证明（注入假设后后向链得证，置信度 {:.2}）：\n",
+                    solution.confidence
+                ));
+                let mut lines = Vec::new();
+                for proof in &solution.proofs {
+                    render_proof_tree(proof, render, &mut lines, 3);
+                }
+                output.push_str(&lines.join("\n"));
+                output.push('\n');
+            }
+        }
+    }
+    output.push_str(
+        "  场景中的假设都不会自动写入知识库；输入「澄清」可按解释空间选择最有判别力的问题（结束时给条件化答案），输入「采纳假设 N」可直接采纳单条。",
+    );
+    output
+}
+/// 渲染一条澄清提问（把待确认假设逆转为"是/不是"式问题）
+pub fn render_clarification_question(
+    session: &ClarificationSession,
+    render: &dyn Fn(&Atom) -> String,
+) -> String {
+    match session.current() {
+        Some(hypothesis) => {
+            let mut output = format!(
+                "【对话式澄清】系统想确认一条推测（可信度 {:.2}）：\n  「{}」是否成立？",
+                hypothesis.confidence,
+                render(&hypothesis.atom)
+            );
+            if let Some(space) = session.explanation_space() {
+                if !space.is_empty() {
+                    let (with, without) = space.split(hypothesis);
+                    if with == 0 {
+                        output.push_str(&format!(
+                            "\n  判别理由：当前解释空间 {} 组均不依赖它，提问只用于校准候选。",
+                            space.len()
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "\n  判别理由：当前解释空间 {} 组，其中 {} 组依赖它、{} 组不依赖；否定会排除依赖它的 {} 组。",
+                            space.len(), with, without, with
+                        ));
+                    }
+                    if space.is_bounded() {
+                        output.push_str("（解释枚举有界，未列尽所有可能）");
+                    }
+                } else if session.explanation_collapsed() {
+                    output.push_str(
+                        "\n  当前解释空间已崩塌：所有有界解释都被你排除，继续回答只会记录承诺，不会自动写入知识库。",
+                    );
+                }
+            }
+            output.push_str(&format!(
+                "\n  请回答：是 / 不是 / 不知道；若是别的取值可答「不是，是<取值>」；也可答「全部确认」/「全部否定」处理剩余全部（剩余 {} 条）。",
+                session.remaining()
+            ));
+            output
+        }
+        None => "【对话式澄清】没有需要确认的假设。".to_string(),
+    }
+}
+/// 渲染澄清会话结束摘要
+pub fn render_clarification_summary(
+    session: &ClarificationSession,
+    render: &dyn Fn(&Atom) -> String,
+) -> String {
+    let mut output = format!("【澄清结束】{}。\n", session.progress_text());
+    for hypothesis in &session.confirmed {
+        output.push_str(&format!("  ✓ 已确认：{}\n", render(&hypothesis.atom)));
+    }
+    for hypothesis in &session.rejected {
+        output.push_str(&format!("  ✗ 已否定：{}\n", render(&hypothesis.atom)));
+    }
+    for hypothesis in &session.deferred {
+        output.push_str(&format!("  ？ 不确定：{}\n", render(&hypothesis.atom)));
+    }
+    if let Some(space) = session.explanation_space() {
+        if space.is_empty() && session.explanation_collapsed() {
+            output.push_str("  解释空间：已崩塌（全部有界解释均被排除）\n");
+        } else if !space.is_empty() {
+            output.push_str(&format!(
+                "  解释空间：{} 组{}；尚待确认 {} 条。\n",
+                space.len(),
+                if space.is_bounded() { "（有界）" } else { "" },
+                session.remaining()
+            ));
+        }
+    }
+    output.trim_end().to_string()
+}
+/// 渲染反事实模拟结果
+pub fn render_what_if(result: &WhatIfResult, render: &dyn Fn(&Atom) -> String) -> String {
+    let assumptions = result
+        .assumptions
+        .iter()
+        .map(|atom| render(atom))
+        .collect::<Vec<_>>()
+        .join("；");
+    let mut output = format!(
+        "【反事实模拟·纯符号】临时假设：{}（模拟结束后自动回滚，不写入知识库）。\n",
+        assumptions
+    );
+    if result.new_facts.is_empty() {
+        output.push_str("  正向链未推出新结论（假设与现有规则没有可组合的推理路径）。\n");
+        return output;
+    }
+    output.push_str(&format!(
+        "  正向链推出 {} 条新结论：\n",
+        result.new_facts.len()
+    ));
+    for derived in &result.derived {
+        output.push_str(&format!(
+            "    • {}（依据：{}；置信度 {:.2}，{} 跳）\n",
+            render(&derived.atom),
+            derived.rule_source,
+            derived.confidence,
+            derived.depth
+        ));
+    }
+    output
+}
+/// 渲染待定假设清单（供「采纳假设 N」）
+pub fn render_pending(pending: &[Hypothesis], render: &dyn Fn(&Atom) -> String) -> String {
+    if pending.is_empty() {
+        return "当前没有待定假设。可先用「溯因：<陈述>」或「假设生成：<问句>」生成候选。"
+            .to_string();
+    }
+    let mut output =
+        String::from("当前待定假设（未写入知识库，可用「采纳假设 N」加入会话事实集）：\n");
+    for (index, hypothesis) in pending.iter().enumerate() {
+        output.push_str(&format!(
+            "  {}. （可信度 {:.2}，{}）{}\n",
+            index + 1,
+            hypothesis.confidence,
+            hypothesis.kind.label(),
+            render(&hypothesis.atom)
+        ));
+    }
+    output.trim_end().to_string()
+}

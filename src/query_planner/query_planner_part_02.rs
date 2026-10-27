@@ -1,0 +1,1460 @@
+impl QueryPlanner {
+    pub fn new() -> Self {
+        Self {
+            max_question_chars: 80,
+            max_chain: 6,
+            max_path_hops: 4,
+        }
+    }
+
+    pub fn parse(&self, question: &str) -> Option<QueryPlan> {
+        let raw = Self::clean(question)?;
+        if raw.chars().count() > self.max_question_chars {
+            return None;
+        }
+
+        let path_question = Self::strip_particles(&raw);
+        if let Some(mut plan) = self.parse_path_question(&path_question) {
+            if let Some(limit) = Self::parse_hop_limit(&path_question) {
+                Self::apply_hop_limit(&mut plan, limit);
+            }
+            return Some(plan);
+        }
+
+        if let Some(plan) = self.parse_exact_closure(&raw) {
+            return Some(plan);
+        }
+
+        // 「所有」必须先于存在句解析，否则会被「有」误判成存在性问句。
+        if let Some(plan) = self.parse_closure(&raw) {
+            return Some(plan);
+        }
+
+        let particle_free = Self::strip_particles(&raw);
+
+        // 程度问句里的「有」是脚手架（姚明有多高），必须先于存在句识别，
+        // 否则会被误读成「姚明 有 多高」。其余存在句仍依赖句尾语气词。
+        if let Some(plan) = self.parse_degree_attribute(&particle_free) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_nationality_question(&particle_free) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_age_suffix(&particle_free) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_attribute_quantity(&particle_free) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_name_question(&particle_free) {
+            return Some(plan);
+        }
+
+        // 存在句依赖句尾语气词（"有…吗"），必须在去语气词之前判断
+        if let Some(plan) = self.parse_exist(&raw) {
+            return Some(plan);
+        }
+        let q = particle_free;
+
+        if let Some(plan) = self.parse_analogy(&q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_similar(&q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_inverse_possessive(&q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_which_relations(&q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_count(&q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_find_subject_except(&q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_find_subject(&q) {
+            return Some(plan);
+        }
+        let (core, had_tail) = Self::strip_question_tail(&q);
+        if had_tail {
+            return self.build_find_object(core);
+        }
+
+        if let Some(plan) = self.parse_check_triple(&q) {
+            return Some(plan);
+        }
+
+        if q.contains('的') {
+            return self.build_find_object(&q);
+        }
+        None
+    }
+
+    pub fn kind(plan: &QueryPlan) -> &'static str {
+        match plan {
+            QueryPlan::FindObject { .. } => "FindObject",
+            QueryPlan::FindSubject { .. } => "FindSubject",
+            QueryPlan::FindObjectByPredicate { .. } => "FindObjectByPredicate",
+            QueryPlan::FindObjectExcept { .. } => "FindObjectExcept",
+            QueryPlan::FindSubjectExcept { .. } => "FindSubjectExcept",
+            QueryPlan::PathBetween { .. } => "PathBetween",
+            QueryPlan::CommonNeighbor { .. } => "CommonNeighbor",
+            QueryPlan::Intermediary { .. } => "Intermediary",
+            QueryPlan::CheckTriple { .. } => "CheckTriple",
+            QueryPlan::CheckRelation { .. } => "CheckRelation",
+            QueryPlan::Count { .. } => "Count",
+            QueryPlan::Exist { .. } => "Exist",
+            QueryPlan::Closure { .. } => "Closure",
+            QueryPlan::Similar { .. } => "Similar",
+            QueryPlan::Analogy { .. } => "Analogy",
+        }
+    }
+
+    pub fn format_plan(plan: &QueryPlan) -> String {
+        match plan {
+            QueryPlan::FindObject { segments } => {
+                format!("查找对象：{}", segments.join(" 的 "))
+            }
+            QueryPlan::FindSubject { object, predicate } => {
+                format!("反查主体：谁的 {} 是 {}", predicate, object)
+            }
+            QueryPlan::FindObjectByPredicate { subject, predicate } => {
+                format!("关系查找：{} {} 的对象", subject, predicate)
+            }
+            QueryPlan::FindObjectExcept {
+                subject,
+                predicate,
+                excluded,
+            } => format!(
+                "关系查找（排除 {}）：{} {} 的对象",
+                excluded.join("、"),
+                subject,
+                predicate
+            ),
+            QueryPlan::FindSubjectExcept {
+                object,
+                predicate,
+                excluded,
+            } => format!(
+                "反查主体（排除 {}）：谁的 {} 是 {}",
+                excluded.join("、"),
+                predicate,
+                object
+            ),
+            QueryPlan::PathBetween {
+                start,
+                goal,
+                max_hops,
+            } => format!("路径枚举：{} → {}（最多 {} 跳）", start, goal, max_hops),
+            QueryPlan::CommonNeighbor { left, right } => {
+                format!("共同邻居：{} 和 {} 共同指向的实体", left, right)
+            }
+            QueryPlan::Intermediary {
+                start,
+                goal,
+                max_hops,
+            } => format!("中间人：{} → ? → {}（最多 {} 跳）", start, goal, max_hops),
+            QueryPlan::CheckTriple {
+                subject_segments,
+                object,
+            } => format!(
+                "校验事实：{} 的 {} 是 {}",
+                subject_segments[..subject_segments.len().saturating_sub(1)].join(" 的 "),
+                subject_segments.last().cloned().unwrap_or_default(),
+                object
+            ),
+            QueryPlan::CheckRelation {
+                subject,
+                predicate,
+                object,
+                negated,
+            } => {
+                let polarity = if *negated { "否定" } else { "肯定" };
+                format!(
+                    "校验关系（{}）：{} {} {}",
+                    polarity, subject, predicate, object
+                )
+            }
+            QueryPlan::Count { subject, predicate } => {
+                format!("计数：{} 的 {} 个数", subject, predicate)
+            }
+            QueryPlan::Exist { subject, predicate } => {
+                format!("存在性：{} 是否有 {}", subject, predicate)
+            }
+            QueryPlan::Closure {
+                subject,
+                predicate,
+                operator,
+                count_only,
+                then,
+            } => {
+                let view = if *count_only { "计数" } else { "列出" };
+                let chain = if then.is_empty() {
+                    predicate.clone()
+                } else {
+                    format!("{} 的 {}", predicate, then.join(" 的 "))
+                };
+                format!(
+                    "{}闭包：{} 的所有 {}（{}）",
+                    view,
+                    subject,
+                    chain,
+                    operator.label()
+                )
+            }
+            QueryPlan::Similar { entity } => format!("语义近邻：与 {} 最像的实体", entity),
+            QueryPlan::Analogy { a, b, c } => {
+                format!("类比：{} : {} :: {} : ?", a, b, c)
+            }
+        }
+    }
+
+    fn clean(question: &str) -> Option<String> {
+        let mut text = question.trim().to_string();
+        for prefix in [
+            "请问",
+            "请告诉我一下",
+            "请告诉我",
+            "我想知道",
+            "我想问一下",
+            "帮我查一下",
+            "帮我查查",
+            "麻烦问一下",
+        ] {
+            if let Some(rest) = text.strip_prefix(prefix) {
+                text = rest.trim().to_string();
+            }
+        }
+        let mut trimmed = text
+            .trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    '？' | '?' | '。' | '！' | '!' | '，' | ',' | '；' | ';' | '~' | '、' | ' '
+                )
+            })
+            .trim()
+            .to_string();
+        // 情态与迟疑词不改变查询目标：「李四的老师应该是谁」与「李四的老师是谁」
+        // 编译成同一计划；只在系词/存在词前吸收，避免误伤实体名。
+        for (from, to) in [
+            ("应该是", "是"),
+            ("可能是", "是"),
+            ("也许是", "是"),
+            ("大概是", "是"),
+            ("或许是", "是"),
+            ("估计是", "是"),
+            ("应该有", "有"),
+            ("可能有", "有"),
+        ] {
+            trimmed = trimmed.replace(from, to);
+        }
+        trimmed = trimmed.replace("到底", "").replace("究竟", "");
+        let trimmed = trimmed.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    fn strip_particles(text: &str) -> String {
+        text.trim_end_matches(|c: char| {
+            matches!(
+                c,
+                '吗' | '呢' | '吧' | '啊' | '呀' | '？' | '?' | '。' | '！' | '!' | ' '
+            )
+        })
+        .trim()
+        .to_string()
+    }
+
+    fn strip_question_tail(q: &str) -> (&str, bool) {
+        const TAILS: [&str; 11] = [
+            "是什么人",
+            "是哪一位",
+            "是哪一个",
+            "是多少",
+            "有多少",
+            "是什么",
+            "是哪个",
+            "是哪位",
+            "是哪里",
+            "是谁",
+            "为谁",
+        ];
+        for tail in TAILS {
+            if let Some(core) = q.strip_suffix(tail) {
+                return (core.trim_end_matches('的'), true);
+            }
+        }
+        for tail in ["谁", "什么", "哪个", "啥", "何人"] {
+            if let Some(core) = q.strip_suffix(tail) {
+                return (core.trim_end_matches('的'), true);
+            }
+        }
+        (q, false)
+    }
+
+    fn segments_of(core: &str) -> Vec<String> {
+        core.split('的')
+            .map(|segment| segment.trim().to_string())
+            .filter(|segment| !segment.is_empty())
+            .collect()
+    }
+
+    fn build_find_object(&self, core: &str) -> Option<QueryPlan> {
+        let segments = Self::segments_of(core);
+        if segments.len() < 2 || segments.len() > self.max_chain {
+            return None;
+        }
+        Some(QueryPlan::FindObject { segments })
+    }
+
+    fn parse_check_triple(&self, q: &str) -> Option<QueryPlan> {
+        if let Some((left, right)) = q.split_once("是不是") {
+            // 形式一：A 是不是 B 的 C  → 校验 B 的 C 是否为 A
+            // 形式二：A 的 B 是不是 C  → 校验 A 的 B 是否为 C
+            let left = left.trim();
+            let right = right.trim();
+            let (subject_segments, object) = if right.contains('的') {
+                (Self::segments_of(right), left)
+            } else if left.contains('的') {
+                (Self::segments_of(left), right)
+            } else {
+                return None;
+            };
+            if subject_segments.len() >= 2 && !object.is_empty() && !Self::is_question_word(object)
+            {
+                return Some(QueryPlan::CheckTriple {
+                    subject_segments,
+                    object: object.to_string(),
+                });
+            }
+            return None;
+        }
+        if let Some((left, right)) = q.split_once('是') {
+            // 形式三：A 是 B 的 C → 校验 B 的 C 是否为 A
+            let left = left.trim();
+            let right = right.trim();
+            if !left.is_empty()
+                && !Self::is_question_word(left)
+                && right.contains('的')
+                && !Self::is_question_word(right)
+            {
+                let subject_segments = Self::segments_of(right);
+                if subject_segments.len() >= 2 && subject_segments.len() <= self.max_chain {
+                    return Some(QueryPlan::CheckTriple {
+                        subject_segments,
+                        object: left.to_string(),
+                    });
+                }
+            }
+        }
+        if let Some((left, right)) = q.rsplit_once('是') {
+            let left = left.trim();
+            let object = right.trim();
+            if !left.contains('的') || object.is_empty() || Self::is_question_word(object) {
+                return None;
+            }
+            let subject_segments = Self::segments_of(left);
+            if subject_segments.len() < 2 || subject_segments.len() > self.max_chain {
+                return None;
+            }
+            return Some(QueryPlan::CheckTriple {
+                subject_segments,
+                object: object.to_string(),
+            });
+        }
+        None
+    }
+
+    fn is_question_word(text: &str) -> bool {
+        [
+            "谁", "什么", "哪个", "哪些", "哪一些", "哪几个", "哪位", "哪里", "啥", "何人",
+            "几点", "多少", "几",
+        ]
+        .iter()
+        .any(|word| text.contains(word))
+    }
+
+    /// 程度形容词 → 属性名。只收录能稳定落到已登记属性上的几个：
+    /// 多高 / 多重 / 多大（几岁）。若问句里已经明写属性词（面积/人口/
+    /// 出生地等），以明写属性为准，避免把「北京面积多大」误读成年龄。
+    /// 其余没有属性词的程度问句交回规划器弃权，不硬映射。
+    fn parse_degree_attribute(&self, q: &str) -> Option<QueryPlan> {
+        const DEGREE_ATTRIBUTES: [(&str, &str); 4] = [
+            ("多高", "身高"),
+            ("多重", "体重"),
+            ("多大", "年龄"),
+            ("几岁", "年龄"),
+        ];
+        // 「张三多大了」「王五几岁了」带完成体「了」：程度问句的时态尾缀
+        // 不改变属性，只剥一次，避免把「了」当成实体或属性的一部分。
+        let q = q.strip_suffix('了').unwrap_or(q).trim();
+        for (marker, default_attribute) in DEGREE_ATTRIBUTES {
+            let prefix = match q.strip_suffix(marker) {
+                Some(prefix) => prefix.trim(),
+                None => continue,
+            };
+            // 「姚明有多高」里的「有」只是程度问句的脚手架，不是实体的一部分。
+            let prefix = prefix.strip_suffix('有').unwrap_or(prefix).trim();
+            let explicit = predicate_labels()
+                .iter()
+                .filter(|(_, label)| *label != default_attribute && prefix.ends_with(label))
+                .max_by_key(|(_, label)| label.chars().count());
+            let (prefix, attribute) = match explicit {
+                Some((_, label)) => (
+                    prefix
+                        .strip_suffix(label)
+                        .unwrap_or(prefix)
+                        .trim_end_matches('的')
+                        .trim(),
+                    *label,
+                ),
+                // 「姚明的身高有多高」允许重复属性词，去掉后仍指向同一属性。
+                None => (
+                    prefix
+                        .strip_suffix(default_attribute)
+                        .unwrap_or(prefix)
+                        .trim_end_matches('的')
+                        .trim(),
+                    default_attribute,
+                ),
+            };
+            if prefix.is_empty() || Self::is_question_word(prefix) {
+                continue;
+            }
+            let mut segments = Self::segments_of(prefix);
+            if segments.is_empty() {
+                continue;
+            }
+            if segments
+                .iter()
+                .any(|segment| Self::is_question_word(segment))
+            {
+                continue;
+            }
+            segments.push(attribute.to_string());
+            if segments.len() < 2 || segments.len() > self.max_chain {
+                continue;
+            }
+            return Some(QueryPlan::FindObject { segments });
+        }
+        None
+    }
+
+    /// 国籍问法：「姚明是哪国人」与「姚明的国籍是什么」指向同一属性。
+    fn parse_nationality_question(&self, q: &str) -> Option<QueryPlan> {
+        for suffix in ["是哪国人", "是哪个国家的人", "来自哪个国家", "来自哪里", "来自哪儿"] {
+            let Some(prefix) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let subject = prefix.trim();
+            if subject.is_empty() || Self::is_question_word(subject) {
+                continue;
+            }
+            let mut segments = Self::segments_of(subject);
+            if segments.is_empty() || segments.len() > self.max_chain {
+                continue;
+            }
+            segments.push("国籍".to_string());
+            return Some(QueryPlan::FindObject { segments });
+        }
+        None
+    }
+
+    /// 多问句尾巴「多少岁」：与「多大」等价，放在候选末尾。
+    fn parse_age_suffix(&self, q: &str) -> Option<QueryPlan> {
+        let q = q.strip_suffix('了').unwrap_or(q).trim();
+        let prefix = q.strip_suffix("多少岁")?.trim();
+        let prefix = prefix.strip_suffix('有').unwrap_or(prefix).trim();
+        if prefix.is_empty() || Self::is_question_word(prefix) {
+            return None;
+        }
+        let mut segments = Self::segments_of(prefix);
+        if segments.is_empty() {
+            return None;
+        }
+        segments.push("年龄".to_string());
+        if segments.len() < 2 || segments.len() > self.max_chain {
+            return None;
+        }
+        Some(QueryPlan::FindObject { segments })
+    }
+
+    /// 「实体 + 属性 + 多少」的省略问法：北京人口多少 / 北京人口是多少 /
+    /// 北京有多少人口。属性词面必须命中内置属性词表，主体部分留在「的」
+    /// 之前；这样不引入模糊对齐，也不会把「中国有多少人」硬映射成属性。
+    fn parse_attribute_quantity(&self, q: &str) -> Option<QueryPlan> {
+        const SUFFIXES: [&str; 5] = ["是多少", "有多少", "为多少", "多少", "是几"];
+        for suffix in SUFFIXES {
+            let Some(prefix) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let prefix = prefix.trim().trim_end_matches('有').trim();
+            if let Some(plan) = self.attribute_find_object(prefix) {
+                return Some(plan);
+            }
+        }
+        if let Some((left, right)) = q.split_once("有多少") {
+            let right = right.trim().trim_end_matches('的').trim();
+            if let Some((_, label)) = predicate_labels()
+                .iter()
+                .find(|(_, label)| *label == right)
+            {
+                if let Some(plan) = self.build_attribute_plan(left, label) {
+                    return Some(plan);
+                }
+            }
+        }
+        None
+    }
+
+    /// 「X 叫什么名字 / X 的名字是什么 / X 姓名是什么」统一编译为
+    /// 「X 的姓名」属性链。只认完整的姓名问句框架，避免把「什么是X」
+    /// 这类定义问句误当属性查询。
+    fn parse_name_question(&self, q: &str) -> Option<QueryPlan> {
+        const SUFFIXES: [&str; 8] = [
+            "叫什么名字",
+            "叫啥名字",
+            "叫什麼名字",
+            "的名字是什么",
+            "的姓名是什么",
+            "名字是什么",
+            "姓名是什么",
+            "叫啥",
+        ];
+        for suffix in SUFFIXES {
+            let Some(prefix) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let subject = prefix.trim().trim_end_matches('的').trim();
+            if subject.is_empty() || Self::is_question_word(subject) {
+                continue;
+            }
+            let mut segments = Self::segments_of(subject);
+            if segments.is_empty() || segments.len() + 1 > self.max_chain {
+                continue;
+            }
+            segments.push("姓名".to_string());
+            return Some(QueryPlan::FindObject { segments });
+        }
+        None
+    }
+
+    /// 从「主体+属性词面」构造查找计划：最长属性词面优先，主体不能为空
+    /// 或含疑问词。
+    fn attribute_find_object(&self, prefix: &str) -> Option<QueryPlan> {
+        let prefix = prefix.trim().trim_end_matches('的').trim();
+        let (_, label) = predicate_labels()
+            .iter()
+            .filter(|(_, label)| prefix.ends_with(label))
+            .max_by_key(|(_, label)| label.chars().count())?;
+        let subject = prefix.strip_suffix(label)?.trim().trim_end_matches('的').trim();
+        self.build_attribute_plan(subject, label)
+    }
+
+    fn build_attribute_plan(&self, raw_subject: &str, label: &str) -> Option<QueryPlan> {
+        let subject = Self::clean_name(raw_subject);
+        if subject.is_empty() || Self::is_question_word(&subject) {
+            return None;
+        }
+        // 主体本身可以是「叶莉的先生」这样的链：必须按「的」拆成段，
+        // 否则整条链会被当成一个实体名，多跳证据闸门也会失效。
+        let mut segments = Self::segments_of(&subject);
+        if segments.is_empty() {
+            return None;
+        }
+        segments.push(label.to_string());
+        if segments.len() < 2 || segments.len() > self.max_chain {
+            return None;
+        }
+        Some(QueryPlan::FindObject { segments })
+    }
+
+    fn parse_find_subject(&self, q: &str) -> Option<QueryPlan> {
+        if let Some(rest) = q
+            .strip_prefix("谁的")
+            .or_else(|| q.strip_prefix("哪位的"))
+        {
+            if let Some((predicate, object)) = rest.split_once('是') {
+                return Self::find_subject_plan(predicate, object);
+            }
+        }
+        self.parse_predicate_object_plan(q)
+    }
+
+    /// 「张三是谁的徒弟」与「谁的徒弟是张三」是同一个反查主体计划，
+    /// 只是把已知主体放到了系词左边。只接受「实体 + 是谁的 + 谓词」这种
+    /// 完整框架：实体或谓词含疑问词/多跳链时交回普通解析，避免把
+    /// 「李四的师傅是谁的徒弟」误读成单个实体反查。
+    fn parse_inverse_possessive(&self, q: &str) -> Option<QueryPlan> {
+        let (entity, predicate) = q
+            .split_once("是谁的")
+            .or_else(|| q.split_once("是哪位的"))?;
+        let entity = Self::clean_name(entity);
+        let predicate = Self::clean_name(predicate);
+        if entity.is_empty()
+            || predicate.is_empty()
+            || entity.contains('的')
+            || predicate.contains('的')
+            || Self::is_question_word(&entity)
+            || Self::is_question_word(&predicate)
+        {
+            return None;
+        }
+        Some(QueryPlan::FindSubject {
+            object: entity,
+            predicate,
+        })
+    }
+
+    /// 「身高是226的人是谁」把谓词放在句首：与「谁的身高是226」
+    /// 是同一逻辑计划，只是表层语序不同。必须带「的人是谁」类后缀，
+    /// 否则陈述句「张三是李四的师傅」会被误编译成反查。
+    fn parse_predicate_object_plan(&self, q: &str) -> Option<QueryPlan> {
+        let core = ["的人是谁", "的人有谁", "的人有哪些", "的人分别是谁"]
+            .iter()
+            .find_map(|suffix| q.strip_suffix(suffix))?;
+        Self::copula_subject_plan(core)
+    }
+
+    fn copula_subject_plan(core: &str) -> Option<QueryPlan> {
+        let (predicate, object) = core
+            .split_once('是')
+            .or_else(|| core.split_once('为'))?;
+        Self::find_subject_plan(predicate, object)
+    }
+
+    /// 「除了姚明还有谁身高是213」：排除项 + 主体反查。
+    fn parse_find_subject_except(&self, q: &str) -> Option<QueryPlan> {
+        let after = q
+            .strip_prefix("除了")
+            .or_else(|| q.strip_prefix("除"))?
+            .trim_start_matches(['，', ',', '、', ' ']);
+        if after.starts_with('非') {
+            return None;
+        }
+        let (excluded_text, inner) = ["还有哪些人", "还有哪个人", "还有哪些", "还有谁", "还有"]
+            .iter()
+            .find_map(|marker| {
+                after
+                    .find(marker)
+                    .map(|position| (&after[..position], &after[position + marker.len()..]))
+            })?;
+        let excluded: Vec<String> = excluded_text
+            .split(['、', '和', '与', '及', '跟'])
+            .map(|entity| entity.trim().trim_matches(['，', ',', '、', ' ']))
+            .filter(|entity| !entity.is_empty())
+            .map(str::to_string)
+            .collect();
+        if excluded.is_empty() {
+            return None;
+        }
+        let inner = inner.trim_start_matches(['，', ',', '、', ' ']);
+        let inner = inner.strip_prefix('谁').unwrap_or(inner);
+        let inner = inner.trim_start_matches('的').trim();
+        if inner.is_empty() {
+            return None;
+        }
+        let QueryPlan::FindSubject { object, predicate } = Self::copula_subject_plan(inner)?
+        else {
+            return None;
+        };
+        Some(QueryPlan::FindSubjectExcept {
+            object,
+            predicate,
+            excluded,
+        })
+    }
+
+    fn find_subject_plan(predicate: &str, object: &str) -> Option<QueryPlan> {
+        let predicate = predicate.trim();
+        let object = object.trim();
+        if predicate.is_empty() || object.is_empty() || Self::is_question_word(object) {
+            return None;
+        }
+        Some(QueryPlan::FindSubject {
+            object: object.to_string(),
+            predicate: predicate.to_string(),
+        })
+    }
+
+    fn clean_name(text: &str) -> String {
+        text.trim()
+            .trim_end_matches(|c: char| {
+                matches!(
+                    c,
+                    ' ' | '的' | '是' | '，' | ',' | '。' | '?' | '？' | '！' | '!' | '、'
+                )
+            })
+            .trim()
+            .to_string()
+    }
+
+    fn valid_path_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.chars().count() <= 40
+            && !name.contains('的')
+            && !Self::is_question_word(name)
+            && ![
+                "怎么",
+                "如何",
+                "怎样",
+                "关系",
+                "路径",
+                "路线",
+                "中间人",
+                "连接",
+            ]
+            .iter()
+            .any(|word| name.contains(word))
+    }
+
+    fn split_pair(text: &str) -> Option<(String, String)> {
+        for connector in ['和', '跟', '与'] {
+            if let Some((left, right)) = text.split_once(connector) {
+                let left = Self::clean_name(left);
+                let right = Self::clean_name(right);
+                if Self::valid_path_name(&left) && Self::valid_path_name(&right) {
+                    return Some((left, right));
+                }
+            }
+        }
+        None
+    }
+
+    fn cut_at_marker(text: &str, markers: &[&str]) -> String {
+        let mut earliest: Option<usize> = None;
+        for marker in markers {
+            if let Some(position) = text.find(marker) {
+                if earliest.is_none_or(|current| position < current) {
+                    earliest = Some(position);
+                }
+            }
+        }
+        let cut = earliest.unwrap_or(text.len());
+        Self::clean_name(&text[..cut])
+    }
+
+    fn strip_relation_prefix(text: &str) -> String {
+        let mut value = text.trim().to_string();
+        for _ in 0..3 {
+            let mut changed = false;
+            for prefix in [
+                "认识",
+                "结识",
+                "找到",
+                "联系到",
+                "联系",
+                "见到",
+                "是",
+                "和",
+                "与",
+                "跟",
+            ] {
+                if let Some(rest) = value.strip_prefix(prefix) {
+                    value = rest.trim().to_string();
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for suffix in ["联系", "认识", "相连", "连接", "吗", "呢"] {
+            if let Some(rest) = value.strip_suffix(suffix) {
+                value = rest.trim().to_string();
+            }
+        }
+        value
+    }
+
+    fn parse_path_question(&self, q: &str) -> Option<QueryPlan> {
+        if let Some(plan) = self.parse_common_neighbor(q) {
+            return Some(plan);
+        }
+        if let Some(plan) = self.parse_intermediary(q) {
+            return Some(plan);
+        }
+        self.parse_path_between(q)
+    }
+
+    fn parse_hop_limit(q: &str) -> Option<usize> {
+        for marker in ["最多", "不超过", "至多"] {
+            let Some(position) = q.find(marker) else {
+                continue;
+            };
+            let rest = q[position + marker.len()..].trim_start();
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || Self::chinese_digit(*c).is_some())
+                .collect();
+            if digits.is_empty() || !rest[digits.len()..].contains('跳') {
+                continue;
+            }
+            if let Some(limit) = Self::parse_hop_number(&digits) {
+                return Some(limit.clamp(1, 6));
+            }
+        }
+        for suffix in ["跳以内", "跳之内", "跳内"] {
+            let Some(position) = q.find(suffix) else {
+                continue;
+            };
+            let before = q[..position].trim_end();
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_ascii_digit() && Self::chinese_digit(*c).is_none())
+                .map_or(0, |(index, c)| index + c.len_utf8());
+            let digits = &before[start..];
+            if let Some(limit) = Self::parse_hop_number(digits) {
+                return Some(limit.clamp(1, 6));
+            }
+        }
+        None
+    }
+
+    fn chinese_digit(c: char) -> Option<usize> {
+        Some(match c {
+            '零' => 0,
+            '一' => 1,
+            '二' | '两' => 2,
+            '三' => 3,
+            '四' => 4,
+            '五' => 5,
+            '六' => 6,
+            '七' => 7,
+            '八' => 8,
+            '九' => 9,
+            _ => return None,
+        })
+    }
+
+    fn parse_hop_number(text: &str) -> Option<usize> {
+        if text.is_empty() {
+            return None;
+        }
+        if text.chars().all(|c| c.is_ascii_digit()) {
+            return text.parse().ok();
+        }
+        let mut total = 0usize;
+        let mut current: Option<usize> = None;
+        for c in text.chars() {
+            if c == '十' {
+                total += current.take().unwrap_or(1) * 10;
+            } else if let Some(digit) = Self::chinese_digit(c) {
+                if current.is_some() {
+                    return None;
+                }
+                current = Some(digit);
+            } else {
+                return None;
+            }
+        }
+        if let Some(current) = current {
+            total += current;
+        }
+        (total > 0).then_some(total)
+    }
+
+    fn apply_hop_limit(plan: &mut QueryPlan, limit: usize) {
+        match plan {
+            QueryPlan::PathBetween { max_hops, .. } | QueryPlan::Intermediary { max_hops, .. } => {
+                *max_hops = limit
+            }
+            _ => {}
+        }
+    }
+
+    fn parse_common_neighbor(&self, q: &str) -> Option<QueryPlan> {
+        const MARKERS: [&str; 7] = [
+            "共同认识",
+            "共同好友",
+            "共同的朋友",
+            "共同朋友",
+            "共同关注",
+            "都认识",
+            "同时认识",
+        ];
+        for marker in MARKERS {
+            let Some(position) = q.find(marker) else {
+                continue;
+            };
+            let before = Self::clean_name(&q[..position]);
+            let after = Self::clean_name(&q[position + marker.len()..]);
+            if let Some((left, right)) = Self::split_pair(&before) {
+                return Some(QueryPlan::CommonNeighbor { left, right });
+            }
+            if let Some((left, right)) = Self::split_pair(&after) {
+                return Some(QueryPlan::CommonNeighbor { left, right });
+            }
+        }
+        None
+    }
+
+    fn parse_intermediary(&self, q: &str) -> Option<QueryPlan> {
+        if let Some(position) = q.find("通过谁") {
+            let start = Self::clean_name(&q[..position]);
+            let goal = Self::strip_relation_prefix(&q[position + "通过谁".len()..]);
+            if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                return Some(QueryPlan::Intermediary {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        if let Some(rest) = q.strip_prefix("谁把") {
+            for marker in ["连接起来", "连起来", "联系起来", "连接", "联系"] {
+                if let Some((pair, _)) = rest.split_once(marker) {
+                    if let Some((start, goal)) = Self::split_pair(pair) {
+                        return Some(QueryPlan::Intermediary {
+                            start,
+                            goal,
+                            max_hops: self.max_path_hops,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(position) = q.find("中间人") {
+            let before = &q[..position];
+            let pair_text = before
+                .find("之间")
+                .map(|split| &before[..split])
+                .unwrap_or(before);
+            if let Some((start, goal)) = Self::split_pair(pair_text) {
+                return Some(QueryPlan::Intermediary {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_path_between(&self, q: &str) -> Option<QueryPlan> {
+        const MARKERS: [&str; 11] = [
+            "之间",
+            "什么关系",
+            "有什么关系",
+            "的关系",
+            "怎么",
+            "如何",
+            "怎样",
+            "路径",
+            "路线",
+            "连接起来",
+            "连起来",
+        ];
+        // 「张三是李四的什么人」：系表式关系问法，方向由「是」两侧给出。
+        for suffix in ["的什么人", "的什么关系", "的谁"] {
+            let Some(rest) = q.strip_suffix(suffix) else {
+                continue;
+            };
+            let Some((left, right)) = rest.split_once('是') else {
+                continue;
+            };
+            let start = Self::clean_name(left);
+            let goal = Self::clean_name(right);
+            if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                return Some(QueryPlan::PathBetween {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        if !MARKERS.iter().any(|marker| q.contains(marker)) {
+            return None;
+        }
+        for connector in ['和', '跟', '与'] {
+            let Some((left, right)) = q.split_once(connector) else {
+                continue;
+            };
+            let start = Self::clean_name(left);
+            let goal = Self::cut_at_marker(right, &MARKERS);
+            if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                return Some(QueryPlan::PathBetween {
+                    start,
+                    goal,
+                    max_hops: self.max_path_hops,
+                });
+            }
+        }
+        for marker in [
+            "怎么找到",
+            "如何找到",
+            "怎么认识",
+            "如何认识",
+            "怎么联系",
+            "如何联系",
+        ] {
+            if let Some((start, rest)) = q.split_once(marker) {
+                let start = Self::clean_name(start);
+                let goal = Self::strip_relation_prefix(rest);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        for marker in ["怎么到", "如何到", "怎样到"] {
+            if let Some((start, rest)) = q.split_once(marker) {
+                let start = Self::clean_name(start);
+                let goal = Self::strip_relation_prefix(rest);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        if let Some(rest) = q.strip_prefix("从") {
+            if let Some((start, right)) = rest.split_once('到') {
+                let start = Self::clean_name(start);
+                let goal = Self::cut_at_marker(right, &MARKERS);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        if !q.contains("找到") && !q.contains("认识到") {
+            if let Some((start, right)) = q.split_once('到') {
+                let start = Self::clean_name(start);
+                let goal = Self::cut_at_marker(right, &MARKERS);
+                if Self::valid_path_name(&start) && Self::valid_path_name(&goal) {
+                    return Some(QueryPlan::PathBetween {
+                        start,
+                        goal,
+                        max_hops: self.max_path_hops,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn parse_exact_closure(&self, raw: &str) -> Option<QueryPlan> {
+        for marker in ["恰好", "正好", "刚好"] {
+            let Some((subject, rest)) = raw.split_once(marker) else {
+                continue;
+            };
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let digits: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || Self::chinese_digit(*c).is_some())
+                .collect();
+            if digits.is_empty() {
+                continue;
+            }
+            let after = rest[digits.len()..].trim_start();
+            let Some(after) = after
+                .strip_prefix('跳')
+                .or_else(|| after.strip_prefix('步'))
+            else {
+                continue;
+            };
+            let after = after.trim_start();
+            let after = after.strip_prefix('的').unwrap_or(after);
+            let Some(hops) = Self::parse_hop_number(&digits) else {
+                continue;
+            };
+            if let Some(plan) = Self::build_closure_with_operator(
+                subject,
+                after,
+                ClosureOp::Exact(hops.clamp(1, 12)),
+            ) {
+                return Some(plan);
+            }
+        }
+        None
+    }
+
+    fn parse_closure(&self, raw: &str) -> Option<QueryPlan> {
+        for marker in ["的所有", "的全部", "的一切", "的任何", "的任意"] {
+            let Some((subject, rest)) = raw.split_once(marker) else {
+                continue;
+            };
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
+                continue;
+            }
+            if let Some(plan) = Self::build_closure(subject, rest) {
+                return Some(plan);
+            }
+        }
+        for marker in ["所有", "全部"] {
+            let Some((subject, rest)) = raw.split_once(marker) else {
+                continue;
+            };
+            let subject = subject.trim();
+            if subject.is_empty() || subject.contains('的') || Self::is_question_word(subject) {
+                continue;
+            }
+            if let Some(plan) = Self::build_closure(subject, rest) {
+                return Some(plan);
+            }
+        }
+        None
+    }
+
+    fn build_closure(subject: &str, rest: &str) -> Option<QueryPlan> {
+        Self::build_closure_with_operator(subject, rest, ClosureOp::Plus)
+    }
+
+    fn build_closure_with_operator(
+        subject: &str,
+        rest: &str,
+        operator: ClosureOp,
+    ) -> Option<QueryPlan> {
+        let (chain, count_only) = Self::strip_closure_tail(rest);
+        let parts: Vec<&str> = chain
+            .split('的')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() || parts.len() > 6 {
+            return None;
+        }
+        if parts
+            .iter()
+            .any(|part| part.chars().count() > 40 || Self::is_question_word(part))
+        {
+            return None;
+        }
+        let predicate = parts[0].trim_end_matches('的').trim();
+        if predicate.is_empty() {
+            return None;
+        }
+        Some(QueryPlan::Closure {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            operator,
+            count_only,
+            then: parts[1..].iter().map(|part| part.to_string()).collect(),
+        })
+    }
+
+    fn strip_closure_tail(raw: &str) -> (String, bool) {
+        let text = Self::strip_particles(raw);
+        const TAILS: [(&str, bool); 56] = [
+            ("分别都是谁", false),
+            ("分别都是什么", false),
+            ("都有哪些人", false),
+            ("都有哪几位", false),
+            ("都有哪几个", false),
+            ("包括哪些人", false),
+            ("都是哪些人", false),
+            ("有哪几个人", false),
+            ("是什么人", false),
+            ("分别是哪些人", false),
+            ("分别是哪些", false),
+            ("分别有哪些", false),
+            ("分别是什么", false),
+            ("分别是谁", false),
+            ("一共有多少人", true),
+            ("一共有多少个", true),
+            ("一共有几位", true),
+            ("一共有几个", true),
+            ("一共有多少位", true),
+            ("一共有多少名", true),
+            ("一共有多少", true),
+            ("共有多少人", true),
+            ("共有多少个", true),
+            ("共有几位", true),
+            ("共有几个", true),
+            ("共有多少", true),
+            ("总共有多少", true),
+            ("总共多少人", true),
+            ("总共多少个", true),
+            ("总共几位", true),
+            ("总共几个", true),
+            ("总共多少", true),
+            ("有哪几个", false),
+            ("有哪几位", false),
+            ("都有哪些", false),
+            ("包括哪些", false),
+            ("包括谁", false),
+            ("有哪些人", false),
+            ("有哪些", false),
+            ("都是什么", false),
+            ("都是谁", false),
+            ("都有谁", false),
+            ("是哪些人", false),
+            ("是哪些", false),
+            ("是什么", false),
+            ("是谁", false),
+            ("有多少位", true),
+            ("有多少名", true),
+            ("有多少人", true),
+            ("有多少个", true),
+            ("有几个人", true),
+            ("有几位", true),
+            ("有几个", true),
+            ("有多少", true),
+            ("的总数", true),
+            ("有谁", false),
+        ];
+        for (tail, count_only) in TAILS {
+            if let Some(core) = text.strip_suffix(tail) {
+                return (core.trim().to_string(), count_only);
+            }
+        }
+        (text, false)
+    }
+
+    /// 复数问法「S 有哪些 P / S 的 P 有哪些」：编译成同一条链查找，
+    /// 由执行层枚举全部对象；「哪些」不是谓词的一部分。
+    fn parse_which_relations(&self, q: &str) -> Option<QueryPlan> {
+        const MARKERS: [&str; 4] = ["有哪些", "有哪几个", "有哪几位", "有哪几种"];
+        for marker in MARKERS {
+            let Some((left, right)) = q.split_once(marker) else {
+                continue;
+            };
+            let left = left.trim().trim_end_matches('都').trim();
+            let right = Self::strip_measure(right.trim());
+            // 含「是」的左侧属于反查主体/系表判断，交给更专门的解析器，
+            // 不能被当成「S 的 P」链。
+            if left.is_empty() || left.contains('是') || Self::is_question_word(left) {
+                continue;
+            }
+            if let Some(predicate) = right {
+                if predicate.is_empty() || Self::is_question_word(&predicate) {
+                    continue;
+                }
+                let mut segments = Self::segments_of(left);
+                if segments.is_empty() || segments.len() >= self.max_chain {
+                    continue;
+                }
+                // 左侧若已是「S 的 P」，右侧只能是空的复数尾巴。
+                if segments.len() > 1 {
+                    continue;
+                }
+                segments.push(predicate);
+                if segments.len() >= 2 {
+                    return Some(QueryPlan::FindObject { segments });
+                }
+            } else if left.contains('的') {
+                return self.build_find_object(left);
+            }
+        }
+        None
+    }
+
+    fn parse_count(&self, q: &str) -> Option<QueryPlan> {
+        // 「有几个/几位/几名…」：量词可省略（有几个），也可跟上其它量词（有几位）
+        if let Some((head, rest)) = q.split_once("有几") {
+            let stripped = rest
+                .trim_start_matches(|c: char| matches!(c, '个' | '位' | '条' | '种' | '名' | '只'));
+            if stripped.len() != rest.len() {
+                if let Some(predicate) = Self::strip_measure(stripped) {
+                    if !head.is_empty() && !predicate.is_empty() {
+                        return Some(QueryPlan::Count {
+                            subject: head.to_string(),
+                            predicate,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some((head, rest)) = q.split_once("有多少") {
+            let rest = rest.strip_prefix('个').unwrap_or(rest);
+            if let Some(predicate) = Self::strip_measure(rest) {
+                if !head.is_empty() && !predicate.is_empty() {
+                    return Some(QueryPlan::Count {
+                        subject: head.to_string(),
+                        predicate,
+                    });
+                }
+            }
+        }
+        if let Some((subject, tail)) = q.split_once('的') {
+            if let Some((predicate, _)) = tail
+                .split_once("有几个")
+                .or_else(|| tail.split_once("有多少个"))
+            {
+                if !subject.is_empty() && !predicate.is_empty() {
+                    return Some(QueryPlan::Count {
+                        subject: subject.to_string(),
+                        predicate: predicate.to_string(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn strip_measure(text: &str) -> Option<String> {
+        let mut rest = Self::strip_particles(text);
+        for measure in ["个", "位", "条", "种", "名", "只"] {
+            if let Some(stripped) = rest.strip_suffix(measure) {
+                rest = stripped.trim().to_string();
+            }
+        }
+        if rest.is_empty() {
+            None
+        } else {
+            Some(rest)
+        }
+    }
+
+    fn parse_exist(&self, q: &str) -> Option<QueryPlan> {
+        if let Some((subject, predicate)) = q.split_once("有没有") {
+            if let Some(predicate) = Self::strip_measure(predicate) {
+                if !subject.trim().is_empty()
+                    && !predicate.is_empty()
+                    && !Self::is_question_word(&predicate)
+                {
+                    return Some(QueryPlan::Exist {
+                        subject: subject.to_string(),
+                        predicate,
+                    });
+                }
+            }
+        }
+        if let Some((subject, tail)) = Self::split_has(q) {
+            // 计数问句（有几个/有多少）交给 Count 分支
+            if tail.starts_with('几') || tail.starts_with("多少") {
+                return None;
+            }
+            let tail = tail.trim_end_matches(|c: char| {
+                matches!(c, '吗' | '么' | '嘛' | '吧' | '啊' | '？' | '?')
+            });
+            if tail.is_empty() || subject.trim().is_empty() {
+                return None;
+            }
+            if let Some(predicate) = Self::strip_measure(tail) {
+                if !predicate.is_empty() && !Self::is_question_word(&predicate) {
+                    return Some(QueryPlan::Exist {
+                        subject: subject.to_string(),
+                        predicate,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn split_has(q: &str) -> Option<(&str, &str)> {
+        for (index, _) in q.match_indices('有') {
+            let before = &q[..index];
+            if before.ends_with('所') || before.ends_with('没') {
+                continue;
+            }
+            return Some((before, &q[index + '有'.len_utf8()..]));
+        }
+        None
+    }
+
+    fn parse_similar(&self, q: &str) -> Option<QueryPlan> {
+        // 「谁和张三最像」中问题词在左侧，真正要检索的实体在右侧；
+        // 「张三和谁最像」则相反，选非问题词的一侧作为实体。
+        let resolve = |left: &str, entity: &str| -> Option<QueryPlan> {
+            let entity = entity.trim();
+            let candidate = if Self::is_question_word(entity) {
+                left.trim()
+            } else {
+                entity
+            };
+            if candidate.is_empty() || Self::is_question_word(candidate) {
+                None
+            } else {
+                Some(QueryPlan::Similar {
+                    entity: candidate.to_string(),
+                })
+            }
+        };
+        if let Some((left, rest)) = q.split_once("和") {
+            if let Some((entity, _)) = rest.split_once("最像") {
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
+                }
+            }
+            if let Some((entity, _)) = rest.split_once("相似") {
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
+                }
+            }
+        }
+        if let Some((left, rest)) = q.split_once("跟") {
+            if let Some((entity, _)) = rest.split_once("最像") {
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
+                }
+            }
+        }
+        if let Some((left, rest)) = q.split_once("与") {
+            if let Some((entity, _)) = rest.split_once("相似") {
+                if let Some(plan) = resolve(left, entity) {
+                    return Some(plan);
+                }
+            }
+        }
+        if q.ends_with("最像谁") {
+            let entity = q
+                .trim_end_matches("最像谁")
+                .trim_end_matches('和')
+                .trim_end_matches('跟')
+                .trim_end_matches('与')
+                .trim();
+            if !entity.is_empty() && !Self::is_question_word(entity) {
+                return Some(QueryPlan::Similar {
+                    entity: entity.to_string(),
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_analogy(&self, q: &str) -> Option<QueryPlan> {
+        for separator in ['，', ',', '；', ';'] {
+            if let Some((left, right)) = q.split_once(separator) {
+                if let Some((a, b)) = left.split_once("对应") {
+                    if let Some(c) = right.strip_suffix("对应谁") {
+                        let (a, b, c) = (a.trim(), b.trim(), c.trim());
+                        if !a.is_empty() && !b.is_empty() && !c.is_empty() {
+                            return Some(QueryPlan::Analogy {
+                                a: a.to_string(),
+                                b: b.to_string(),
+                                c: c.to_string(),
+                            });
+                        }
+                    }
+                }
+                if let Some((a, b)) = left.split_once("之于") {
+                    // 与「对应」句式一致：去掉右侧问句尾巴「对应谁/是谁」
+                    let c = right
+                        .strip_suffix("对应谁")
+                        .or_else(|| right.strip_suffix("是谁"))
+                        .unwrap_or(right)
+                        .trim();
+                    if !a.trim().is_empty() && !b.trim().is_empty() && !c.is_empty() {
+                        return Some(QueryPlan::Analogy {
+                            a: a.trim().to_string(),
+                            b: b.trim().to_string(),
+                            c: c.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        None
+    }
+}

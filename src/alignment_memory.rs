@@ -1098,7 +1098,7 @@ fn rule_spans(rule: &AlignmentRule, chars: &[char]) -> Vec<(usize, usize)> {
             {
                 let max_start = end.saturating_sub(MAX_CANONICAL_CHARS);
                 for start in (max_start..end).rev() {
-                    if end - start <= MAX_CANONICAL_CHARS && end - start <= MAX_SURFACE_CHARS {
+                    if end - start <= MAX_CANONICAL_CHARS {
                         spans.push((start, end));
                     }
                 }
