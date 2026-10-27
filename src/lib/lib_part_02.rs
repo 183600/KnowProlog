@@ -1102,11 +1102,17 @@ impl OxigraphManager {
                 if let Some(answer) = self.batch_type_entities_answer(episode, focus).await? {
                     return Ok(Some(answer));
                 }
+                return Ok(Some(
+                    crate::import_episode::render_episode_missing_type(episode, focus),
+                ));
             }
             crate::import_episode::EpisodeQuestion::SubjectFacts => {
                 if let Some(answer) = self.batch_subject_facts_answer(episode, text).await? {
                     return Ok(Some(answer));
                 }
+                return Ok(Some(
+                    crate::import_episode::render_episode_missing_subject(episode),
+                ));
             }
             _ => {}
         }

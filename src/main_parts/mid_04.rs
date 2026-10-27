@@ -44,6 +44,7 @@ async fn run_ask(
     let mut dialogue = DialogueManager::new();
     dialogue.set_recovery_mode(recovery_mode);
     let mut lens_cache: Option<(viewpoint::LensCorpus, BTreeSet<String>)> = None;
+    let mut import_episodes: Option<Vec<know_prolog::import_episode::ImportEpisode>> = None;
     let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
     for question in questions {
         // 管道输入常沿用交互脚本的收尾行：不要把它当成待回答的问题。
@@ -90,6 +91,47 @@ async fn run_ask(
                 derivation: None,
             });
             continue;
+        }
+        // 批次线索优先于澄清/悬问回填：问「这批」时不应被当成上一轮短答。
+        if know_prolog::import_episode::looks_like_episode_reference(&question) {
+            if import_episodes.is_none() {
+                import_episodes = Some(
+                    oxigraph_manager
+                        .load_import_episodes()
+                        .await
+                        .unwrap_or_else(|error| {
+                            eprintln!("读取导入批次失败: {}", error);
+                            Vec::new()
+                        }),
+                );
+            }
+            let episodes = import_episodes.as_deref().unwrap_or(&[]);
+            match oxigraph_manager
+                .answer_import_episode_question(&question, episodes)
+                .await
+            {
+                Ok(Some(answer)) => {
+                    reasoner.clear_pending_awaiting();
+                    answers.push(AskAnswer {
+                        question,
+                        status: "answered",
+                        answer: Some(answer),
+                        derivation: None,
+                    });
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("读取导入批次失败: {}", error);
+                    answers.push(AskAnswer {
+                        question,
+                        status: "unanswered",
+                        answer: None,
+                        derivation: None,
+                    });
+                    continue;
+                }
+            }
         }
         // 语义歧义澄清中的下一行：序号/前者/后者选定读法，都不是则放弃。
         if reasoner.formal_clarification_active() {

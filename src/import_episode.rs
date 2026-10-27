@@ -1093,6 +1093,46 @@ pub fn render_episode_type_entities(
     )
 }
 
+/// 问题提到了实体，但批次图里没有匹配项时的诚实回答。
+pub fn render_episode_missing_subject(episode: &ImportEpisode) -> String {
+    let top = if episode.gist.top_subjects.is_empty() {
+        "无".to_string()
+    } else {
+        episode
+            .gist
+            .top_subjects
+            .iter()
+            .map(|(label, count)| format!("{}（{} 条）", label, count))
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    format!(
+        "批次 B{} 中没有找到问题提到的实体。本批不同主体 {} 个；按断言数 Top：{}。\n可用「这批有哪些实体」或「批次台账」继续。",
+        episode.seq, episode.gist.distinct_subjects, top
+    )
+}
+
+/// 问题指定的类型在批次里没有匹配项时的诚实回答。
+pub fn render_episode_missing_type(episode: &ImportEpisode, focus: TypeFocus) -> String {
+    let distribution = if episode.gist.type_counts.is_empty() {
+        "无".to_string()
+    } else {
+        episode
+            .gist
+            .type_counts
+            .iter()
+            .map(|(label, count)| format!("{}×{}", label, count))
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    format!(
+        "批次 B{} 的类型分布中没有匹配「{}」的类型。现有类型：{}。",
+        episode.seq,
+        focus.label(),
+        distribution
+    )
+}
+
 /// 批次内某个主体的出入边（总数由调用方从批次图统计，样例有界）。
 pub fn render_episode_subject_facts(
     episode: &ImportEpisode,
@@ -1591,6 +1631,9 @@ mod tests {
         let entities =
             render_episode_type_entities(&sample, "Person", 3, &["张三".to_string()]);
         assert!(entities.contains("前 1 个 / 共 3 个"), "{}", entities);
+        assert!(render_episode_missing_subject(&sample).contains("没有找到"));
+        assert!(render_episode_missing_type(&sample, TypeFocus::Organization)
+            .contains("没有匹配"));
     }
 
     #[test]
