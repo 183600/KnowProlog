@@ -174,7 +174,11 @@ pub struct RoleFiller {
 }
 
 impl RoleFiller {
-    pub fn explicit(value: impl Into<String>, span: Option<(usize, usize)>, marker: Option<String>) -> Self {
+    pub fn explicit(
+        value: impl Into<String>,
+        span: Option<(usize, usize)>,
+        marker: Option<String>,
+    ) -> Self {
         Self {
             value: value.into().trim().to_string(),
             span,
@@ -224,7 +228,10 @@ impl RoleSpec {
         Self {
             role,
             required: false,
-            markers: role.default_marker().map(|m| vec![m.to_string()]).unwrap_or_default(),
+            markers: role
+                .default_marker()
+                .map(|m| vec![m.to_string()])
+                .unwrap_or_default(),
             allowed_types: BTreeSet::new(),
             weight: default_role_weight(),
         }
@@ -396,7 +403,12 @@ impl FrameSchema {
             self.sense,
             self.roles
                 .iter()
-                .map(|spec| format!("{}:{}:{:?}", spec.role.as_str(), spec.required, spec.markers))
+                .map(|spec| format!(
+                    "{}:{}:{:?}",
+                    spec.role.as_str(),
+                    spec.required,
+                    spec.markers
+                ))
                 .collect::<Vec<_>>()
                 .join(","),
             self.realize.as_deref().unwrap_or("")
@@ -452,10 +464,7 @@ impl FrameSchema {
                             findings.push(SchemaFinding {
                                 role: spec.role,
                                 kind: SchemaFindingKind::SelectionViolation,
-                                detail: format!(
-                                    "「{}」的类型与角色选择限制不相容",
-                                    filler.value
-                                ),
+                                detail: format!("「{}」的类型与角色选择限制不相容", filler.value),
                             });
                         }
                     }
@@ -762,7 +771,12 @@ impl FrameBook {
                 .with_surfaces(["去", "前往"])
                 .without_role(Role::Patient)
                 .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
-                .with_role(RoleSpec::new(Role::Goal).required().with_weight(10).with_markers(["到", "去", "往", "向"]))
+                .with_role(
+                    RoleSpec::new(Role::Goal)
+                        .required()
+                        .with_weight(10)
+                        .with_markers(["到", "去", "往", "向"]),
+                )
                 .with_role(RoleSpec::new(Role::Source).with_markers(["从", "自"]))
                 .with_role(RoleSpec::new(Role::Time))
                 .with_role(RoleSpec::new(Role::Purpose).with_markers(["为了"]))
@@ -775,7 +789,12 @@ impl FrameBook {
                 .with_surfaces(["给", "送给", "交给", "递给"])
                 .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
                 .with_role(RoleSpec::new(Role::Patient).required().with_weight(10))
-                .with_role(RoleSpec::new(Role::Recipient).required().with_weight(20).with_markers(["给", "对"]))
+                .with_role(
+                    RoleSpec::new(Role::Recipient)
+                        .required()
+                        .with_weight(20)
+                        .with_markers(["给", "对"]),
+                )
                 .with_role(RoleSpec::new(Role::Time))
                 .with_realize("{agent}[{time}]把{patient}给了{recipient}")
                 .with_source("内置种子")
@@ -1033,8 +1052,28 @@ const MARKERS: &[(&str, Role)] = &[
 const PASSIVE_MARKERS: &[&str] = &["被", "由", "让"];
 
 const TIME_WORDS: &[&str] = &[
-    "昨天", "今天", "明天", "前天", "后天", "去年", "今年", "明年", "上周", "本周", "下周",
-    "上个月", "这个月", "下个月", "早上", "上午", "中午", "下午", "晚上", "凌晨", "现在", "当时",
+    "昨天",
+    "今天",
+    "明天",
+    "前天",
+    "后天",
+    "去年",
+    "今年",
+    "明年",
+    "上周",
+    "本周",
+    "下周",
+    "上个月",
+    "这个月",
+    "下个月",
+    "早上",
+    "上午",
+    "中午",
+    "下午",
+    "晚上",
+    "凌晨",
+    "现在",
+    "当时",
 ];
 
 #[derive(Debug, Clone)]
@@ -1099,16 +1138,16 @@ fn inside_time_word(text: &str, start: usize, end: usize) -> bool {
 
 fn trim_value(text: &str) -> &str {
     text.trim().trim_matches(|c: char| {
-        matches!(c, '，' | ',' | '。' | '.' | '；' | ';' | '：' | ':' | '！' | '!' | '？' | '?')
+        matches!(
+            c,
+            '，' | ',' | '。' | '.' | '；' | ';' | '：' | ':' | '！' | '!' | '？' | '?'
+        )
     })
 }
 
 fn trim_marker_value(text: &str) -> &str {
     let trimmed = trim_value(text);
-    trimmed
-        .strip_prefix('了')
-        .map(str::trim)
-        .unwrap_or(trimmed)
+    trimmed.strip_prefix('了').map(str::trim).unwrap_or(trimmed)
 }
 
 fn trim_after_predicate(text: &str) -> &str {
@@ -1262,7 +1301,9 @@ impl<'a> FrameAnnotator<'a> {
         let before = &text[..start];
         let after = &text[end..];
         let mut frame = FrameInstance::new(
-            schema.map(|s| s.predicate.clone()).unwrap_or_else(|| surface.to_string()),
+            schema
+                .map(|s| s.predicate.clone())
+                .unwrap_or_else(|| surface.to_string()),
             text,
         );
         if let Some(schema) = schema {
@@ -1275,11 +1316,7 @@ impl<'a> FrameAnnotator<'a> {
             if !patient_text.is_empty() {
                 frame.set_role(
                     Role::Patient,
-                    RoleFiller::explicit(
-                        patient_text,
-                        Some((0, passive_at)),
-                        None,
-                    ),
+                    RoleFiller::explicit(patient_text, Some((0, passive_at)), None),
                 );
             }
             let suffix = &before[passive_at + marker.len()..];
@@ -1319,7 +1356,9 @@ impl<'a> FrameAnnotator<'a> {
             }
         }
 
-        let after = after.strip_prefix(|c: char| c.is_whitespace()).unwrap_or(after);
+        let after = after
+            .strip_prefix(|c: char| c.is_whitespace())
+            .unwrap_or(after);
         let (after_roles, first) = scan_markers(after, end);
         let mut has_object = false;
         for (role, filler) in after_roles {

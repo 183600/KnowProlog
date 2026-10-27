@@ -12,9 +12,19 @@ pub struct RoleCorrection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FollowupKind {
-    Answer { role: Role, value: String, frame_id: String },
-    Correction { role: Role, old: Option<String>, new: String },
-    Clarify { role: Role },
+    Answer {
+        role: Role,
+        value: String,
+        frame_id: String,
+    },
+    Correction {
+        role: Role,
+        old: Option<String>,
+        new: String,
+    },
+    Clarify {
+        role: Role,
+    },
     Unknown,
 }
 
@@ -129,9 +139,15 @@ impl FrameLedger {
             (&["为谁", "受益"], Role::Beneficiary),
             (&["为什么", "原因", "怎么会", "为何"], Role::Cause),
             (&["为了什么", "目的", "干嘛", "做什么"], Role::Purpose),
-            (&["在哪", "哪里", "哪儿", "地点", "什么地方"], Role::Location),
+            (
+                &["在哪", "哪里", "哪儿", "地点", "什么地方"],
+                Role::Location,
+            ),
             (&["什么时候", "何时", "时间", "哪天"], Role::Time),
-            (&["用什么", "拿什么", "工具", "怎么修", "怎么去"], Role::Instrument),
+            (
+                &["用什么", "拿什么", "工具", "怎么修", "怎么去"],
+                Role::Instrument,
+            ),
             (&["从哪", "来源", "从哪里"], Role::Source),
             (&["到哪", "去哪", "终点", "到哪里"], Role::Goal),
             (&["结果"], Role::Result),
@@ -255,7 +271,10 @@ impl FrameLedger {
                 continue;
             }
             if let Some(filler) = previous.filler(*role) {
-                current.set_role(*role, RoleFiller::inherited(filler.value.clone(), &previous.id));
+                current.set_role(
+                    *role,
+                    RoleFiller::inherited(filler.value.clone(), &previous.id),
+                );
                 inherited += 1;
             }
         }
@@ -339,11 +358,27 @@ impl FrameExample {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompileError {
     EmptyExamples,
-    MissingRole { role: Role, text: String },
-    AmbiguousOccurrence { role: Role, value: String, text: String },
-    InconsistentSkeleton { first: String, second: String },
-    PositiveMismatch { text: String, expected: String, actual: String },
-    NegativeHit { text: String },
+    MissingRole {
+        role: Role,
+        text: String,
+    },
+    AmbiguousOccurrence {
+        role: Role,
+        value: String,
+        text: String,
+    },
+    InconsistentSkeleton {
+        first: String,
+        second: String,
+    },
+    PositiveMismatch {
+        text: String,
+        expected: String,
+        actual: String,
+    },
+    NegativeHit {
+        text: String,
+    },
 }
 
 impl CompileError {
@@ -453,7 +488,10 @@ impl FrameRuleCompiler {
         schema.roles.sort_by_key(|spec| spec.role);
         schema.realize = Some(template.clone());
         schema.support = examples.len();
-        schema.positives = examples.iter().map(|example| example.text.clone()).collect();
+        schema.positives = examples
+            .iter()
+            .map(|example| example.text.clone())
+            .collect();
         schema.negatives = negatives.to_vec();
         schema.status = if examples.len() >= options.min_support {
             SchemaStatus::Active
@@ -513,7 +551,15 @@ impl FrameRuleCompiler {
 
         let diagnostics = vec![
             format!("模板：{}", template),
-            format!("角色：{}", schema.roles.iter().map(|spec| spec.role.label_zh()).collect::<Vec<_>>().join("、")),
+            format!(
+                "角色：{}",
+                schema
+                    .roles
+                    .iter()
+                    .map(|spec| spec.role.label_zh())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
             format!("正例命中 {}/{}", positive_hits, examples.len()),
             format!("反例命中 {}", negative_hits),
         ];
@@ -759,7 +805,9 @@ fn template_parts(template: &str) -> Vec<TemplatePart> {
         if let Some(role) = Role::parse(name) {
             parts.push(TemplatePart::Slot(role));
         } else {
-            parts.push(TemplatePart::Literal(rest[open..open + close + 2].to_string()));
+            parts.push(TemplatePart::Literal(
+                rest[open..open + close + 2].to_string(),
+            ));
         }
         rest = &rest[open + close + 2..];
     }
@@ -828,7 +876,10 @@ mod tests {
         let book = config.book();
         assert_eq!(book.len(), 1);
         let annotator = FrameAnnotator::new(&book);
-        let frame = annotator.annotate("张三用扳手修好了电脑").pop().expect("frame");
+        let frame = annotator
+            .annotate("张三用扳手修好了电脑")
+            .pop()
+            .expect("frame");
         assert_eq!(frame.usable(Role::Instrument), Some("扳手"));
         assert_eq!(
             book.realize(&frame).as_deref(),
@@ -870,7 +921,13 @@ mod tests {
         let text = book.realize(&frame).expect("realized");
         assert_eq!(text, "张三昨天在北京用扳手修好了李四的电脑");
         let recovered = repair_frame(&text);
-        for role in [Role::Agent, Role::Patient, Role::Instrument, Role::Location, Role::Time] {
+        for role in [
+            Role::Agent,
+            Role::Patient,
+            Role::Instrument,
+            Role::Location,
+            Role::Time,
+        ] {
             assert_eq!(recovered.usable(role), frame.usable(role), "{role:?}");
         }
     }
@@ -887,9 +944,15 @@ mod tests {
         assert_eq!(frames[1].usable(Role::Agent), Some("李四"));
         assert_eq!(frames[1].usable(Role::Goal), Some("北京"));
         let first_agent_span = frames[0].roles[&Role::Agent].span.expect("span");
-        assert_eq!(&"张三用扳手修好了电脑。李四去北京。"[first_agent_span.0..first_agent_span.1], "张三");
+        assert_eq!(
+            &"张三用扳手修好了电脑。李四去北京。"[first_agent_span.0..first_agent_span.1],
+            "张三"
+        );
         let second_agent_span = frames[1].roles[&Role::Agent].span.expect("span");
-        assert_eq!(&"张三用扳手修好了电脑。李四去北京。"[second_agent_span.0..second_agent_span.1], "李四");
+        assert_eq!(
+            &"张三用扳手修好了电脑。李四去北京。"[second_agent_span.0..second_agent_span.1],
+            "李四"
+        );
     }
 
     #[test]
@@ -934,10 +997,7 @@ mod tests {
         assert_eq!(frame.usable(Role::Patient), Some("书"));
         assert_eq!(frame.usable(Role::Recipient), Some("李四"));
         let book = book();
-        assert_eq!(
-            book.realize(&frame).as_deref(),
-            Some("张三把书给了李四")
-        );
+        assert_eq!(book.realize(&frame).as_deref(), Some("张三把书给了李四"));
         let projected = book.project(&frame).expect("projected");
         assert_eq!(projected.subject, "张三");
         assert_eq!(projected.object, "李四");
@@ -1003,10 +1063,7 @@ mod tests {
         let mut ledger = FrameLedger::new();
         ledger.observe(repair_frame("张三在北京用扳手修好了电脑"));
         let mut next = FrameInstance::new("看", "张三看了书");
-        next.set_role(
-            Role::Agent,
-            RoleFiller::explicit("张三", None, None),
-        );
+        next.set_role(Role::Agent, RoleFiller::explicit("张三", None, None));
         next.set_role(Role::Patient, RoleFiller::explicit("书", None, None));
         ledger.observe(next);
         let inherited = ledger.inherit_missing(&[Role::Location, Role::Instrument]);
@@ -1047,7 +1104,12 @@ mod tests {
             Some("{agent}用{instrument}修好了{patient}")
         );
         assert_eq!(rule.schema.status, SchemaStatus::Active);
-        assert!(rule.schema.role_spec(Role::Instrument).unwrap().markers.contains(&"用".to_string()));
+        assert!(rule
+            .schema
+            .role_spec(Role::Instrument)
+            .unwrap()
+            .markers
+            .contains(&"用".to_string()));
     }
 
     #[test]
@@ -1072,12 +1134,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, CompileError::InconsistentSkeleton { .. }));
 
-        let examples = vec![
-            FrameExample::new("张三用扳手修好了电脑")
-                .with_role(Role::Agent, "张三")
-                .with_role(Role::Instrument, "扳手")
-                .with_role(Role::Patient, "电脑"),
-        ];
+        let examples = vec![FrameExample::new("张三用扳手修好了电脑")
+            .with_role(Role::Agent, "张三")
+            .with_role(Role::Instrument, "扳手")
+            .with_role(Role::Patient, "电脑")];
         let error = FrameRuleCompiler::compile(
             "修",
             "repair/tool",
