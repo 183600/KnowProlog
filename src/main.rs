@@ -67,12 +67,14 @@ use know_prolog::{
     nlp::{normalize_words, preprocess, preprocess_annotated},
     nlu::NLUEngine,
     ontology_reasoning::{parse_ontology_lesson, OntologyProgram},
+    open_closure::{self, OpenClosureSession},
     owl_annotation::{
         self, AnnotationLedger, GraphObservation, LedgerLoad as OwlLedgerLoad, ProposalOptions,
         ReviewAction,
     },
     ownthink_api::select_candidate_by_context,
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
+    pattern_closure::ClosureBudget,
     pattern_forge::{self, ForgeRequest, PatternForge},
     pattern_ir::{self, PatternLibrary},
     perf_ledger::PerfLedger,
@@ -221,6 +223,46 @@ enum Commands {
         /// treated as answers to that clarification until the session ends.
         #[arg(long)]
         clarify: bool,
+    },
+    /// Explore transitive closure over open predicates in a session ledger:
+    /// observe text/triples, ask "all", confirm or reject a transitive
+    /// hypothesis, and get witness-carrying answers (never writes the KB)
+    OpenClosure {
+        /// Natural-language sentence to observe (repeatable)
+        #[arg(long = "text")]
+        text: Vec<String>,
+        /// Fact to observe as SUBJECT|PREDICATE|OBJECT (prefix ! for explicit
+        /// negation; repeatable)
+        #[arg(long = "fact", value_name = "S|P|O")]
+        fact: Vec<String>,
+        /// Query as SUBJECT|PREDICATE or Chinese 「X 的所有 Y 是谁？」 (repeatable)
+        #[arg(long = "ask", value_name = "QUERY")]
+        ask: Vec<String>,
+        /// Confirm a predicate as transitive in this session (repeatable)
+        #[arg(long = "confirm", value_name = "PREDICATE")]
+        confirm: Vec<String>,
+        /// Reject a predicate as transitive in this session (repeatable)
+        #[arg(long = "reject", value_name = "PREDICATE")]
+        reject: Vec<String>,
+        /// Retract an observed fact as SUBJECT|PREDICATE|OBJECT (repeatable)
+        #[arg(long = "retract", value_name = "S|P|O")]
+        retract: Vec<String>,
+        /// Session ledger JSON to load and save (state only; the knowledge
+        /// store is never opened or written)
+        #[arg(long)]
+        session: Option<String>,
+        /// Maximum closure depth
+        #[arg(long, default_value_t = 8)]
+        max_depth: usize,
+        /// Maximum distinct closure nodes
+        #[arg(long, default_value_t = 512)]
+        max_nodes: usize,
+        /// Maximum neighbor expansions
+        #[arg(long, default_value_t = 20_000)]
+        max_expansions: usize,
+        /// Print the ledger and answers as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect type memory: type profiles, members or a pairwise comparison
     Types {
@@ -1447,6 +1489,37 @@ async fn main() {
     // 查询剧本完全离线（自带事实）：先于配置加载与存储打开处理。
     if let Some(Commands::Scenario { file, json }) = &cli.command {
         run_query_scenario(file, *json);
+        return;
+    }
+
+    // 开放闭包只操作会话账本，不打开知识存储，也不写律典。
+    if let Some(Commands::OpenClosure {
+        text,
+        fact,
+        ask,
+        confirm,
+        reject,
+        retract,
+        session,
+        max_depth,
+        max_nodes,
+        max_expansions,
+        json,
+    }) = &cli.command
+    {
+        run_open_closure(
+            text,
+            fact,
+            ask,
+            confirm,
+            reject,
+            retract,
+            session.as_deref(),
+            *max_depth,
+            *max_nodes,
+            *max_expansions,
+            *json,
+        );
         return;
     }
 
@@ -3324,6 +3397,8 @@ async fn main() {
         Some(Commands::ConfigLint { .. }) => {}
         // 已在加载默认配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigFulfillment { .. }) => {}
+        // 已在加载配置前处理（见 main 顶部早期分派）
+        Some(Commands::OpenClosure { .. }) => {}
         Some(Commands::EvalQuality {
             baseline,
             update_baseline,
@@ -5709,6 +5784,211 @@ fn run_rewrite_rules(book_path: &str, adopt: &[String], retire: &[String], json:
     }
     if !errors.is_empty() {
         std::process::exit(1);
+    }
+}
+
+fn parse_open_fact(text: &str) -> Result<(String, String, String, bool), String> {
+    let trimmed = text.trim();
+    let (negated, body) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, trimmed),
+    };
+    if body.is_empty() {
+        return Err("事实为空".to_string());
+    }
+    let parts: Vec<&str> = body.split(['|', '｜']).collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "无法解析事实「{}」；格式应为 SUBJECT|PREDICATE|OBJECT",
+            text
+        ));
+    }
+    let subject = parts[0].trim();
+    let predicate = parts[1].trim();
+    let object = parts[2].trim();
+    if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+        return Err(format!("事实「{}」的主语、谓词或宾语为空", text));
+    }
+    Ok((
+        subject.to_string(),
+        predicate.to_string(),
+        object.to_string(),
+        negated,
+    ))
+}
+
+/// `open-closure`：只操作会话账本，不打开知识存储，也不写律典。
+#[allow(clippy::too_many_arguments)]
+fn run_open_closure(
+    texts: &[String],
+    facts: &[String],
+    asks: &[String],
+    confirm: &[String],
+    reject: &[String],
+    retract: &[String],
+    session_path: Option<&str>,
+    max_depth: usize,
+    max_nodes: usize,
+    max_expansions: usize,
+    json: bool,
+) {
+    let mut parsed_facts = Vec::new();
+    for raw in facts {
+        match parse_open_fact(raw) {
+            Ok(fact) => parsed_facts.push(fact),
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    let mut parsed_retractions = Vec::new();
+    for raw in retract {
+        match parse_open_fact(raw) {
+            Ok((subject, predicate, object, _)) => {
+                parsed_retractions.push((subject, predicate, object))
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    let mut parsed_queries = Vec::new();
+    for raw in asks {
+        match open_closure::parse_query(raw) {
+            Ok(query) => parsed_queries.push(query),
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let mut session = match session_path {
+        Some(path) if std::path::Path::new(path).exists() => {
+            match OpenClosureSession::load_from_path(path) {
+                Some(session) => session,
+                None => {
+                    eprintln!("读取开放闭包会话失败：{}", path);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => OpenClosureSession::new(),
+    };
+
+    let mut warnings = Vec::new();
+    let mut retracted = 0usize;
+    for (subject, predicate, object) in &parsed_retractions {
+        if session.retract_triple(subject, predicate, object) {
+            retracted += 1;
+        } else {
+            warnings.push(format!(
+                "未找到可撤回的事实：{}|{}|{}",
+                subject, predicate, object
+            ));
+        }
+    }
+
+    let mut observed = 0usize;
+    for text in texts {
+        observed += session.observe_text(text);
+    }
+    for (subject, predicate, object, negated) in &parsed_facts {
+        let source = "命令行事实";
+        let added = if *negated {
+            session.observe_negative(subject, predicate, object, source)
+        } else {
+            session.observe_triple(subject, predicate, object, source)
+        };
+        if added {
+            observed += 1;
+        }
+    }
+
+    let mut confirmed = 0usize;
+    let mut rejected = 0usize;
+    for predicate in confirm {
+        if session.confirm_transitive(predicate, "命令行 --confirm") {
+            confirmed += 1;
+        }
+    }
+    for predicate in reject {
+        if session.reject_transitive(predicate, "命令行 --reject") {
+            rejected += 1;
+        }
+    }
+
+    let budget = ClosureBudget {
+        max_depth: max_depth.max(1),
+        max_nodes: max_nodes.max(1),
+        max_expansions: max_expansions.max(1),
+        ..ClosureBudget::default()
+    };
+    let mut answers = Vec::new();
+    for (subject, predicate) in parsed_queries {
+        let answer = session.answer(&subject, &predicate, budget);
+        answers.push((subject, predicate, answer));
+    }
+
+    if let Some(path) = session_path {
+        if let Err(error) = session.save_to_path(path) {
+            eprintln!("写入开放闭包会话失败（{}）：{}", path, error);
+            std::process::exit(1);
+        }
+    }
+
+    if json {
+        let answer_values: Vec<serde_json::Value> = answers
+            .iter()
+            .map(|(subject, predicate, answer)| {
+                serde_json::json!({
+                    "subject": subject,
+                    "predicate": predicate,
+                    "answer": answer,
+                    "text": answer.render_text(),
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "session": &session,
+            "answers": answer_values,
+            "observed": observed,
+            "retracted": retracted,
+            "confirmed": confirmed,
+            "rejected": rejected,
+            "warnings": warnings,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("开放闭包序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    print!("{}", session.render_text());
+    if observed > 0 || retracted > 0 {
+        println!(
+            "本次吸收 {} 条记录，撤回 {} 条记录。",
+            observed, retracted
+        );
+    }
+    if confirmed > 0 || rejected > 0 {
+        println!("本次确认 {} 个传递谓词，拒绝 {} 个。", confirmed, rejected);
+    }
+    for (subject, predicate, answer) in &answers {
+        println!("\n查询：{}|{}", subject, predicate);
+        print!("{}", answer.render_text());
+    }
+    if let Some(path) = session_path {
+        println!("会话账本已写入 {}。", path);
+    }
+    for warning in &warnings {
+        eprintln!("{}", warning);
     }
 }
 
