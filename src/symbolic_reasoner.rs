@@ -14228,8 +14228,31 @@ impl SymbolicReasoner {
         &self,
         expected: &[RelationFrame],
     ) -> Option<(String, FrameVerification)> {
+        let (focus, expected_types) = self.contextual_focus();
+        self.joint_generate_and_verify_with_context(
+            expected,
+            &focus,
+            &expected_types,
+            self.context.last_predicate(),
+        )
+    }
+
+    /// 与 [`Self::joint_generate_and_verify`] 相同，但允许显式给出联合上下文。
+    pub fn joint_generate_and_verify_with_context(
+        &self,
+        expected: &[RelationFrame],
+        focus: &[String],
+        expected_types: &[String],
+        predicate: Option<&str>,
+    ) -> Option<(String, FrameVerification)> {
         let candidate = self.joint_generation_candidate(expected)?;
-        let verification = self.verify_joint_generation(&candidate, expected);
+        let verification = self.verify_joint_generation_with_context(
+            &candidate,
+            expected,
+            focus,
+            expected_types,
+            predicate,
+        );
         Some((candidate, verification))
     }
 
@@ -14240,11 +14263,29 @@ impl SymbolicReasoner {
         expected: &[RelationFrame],
     ) -> FrameVerification {
         let (focus, expected_types) = self.contextual_focus();
-        let parsed = self.joint_parse_result(
+        self.verify_joint_generation_with_context(
             candidate,
+            expected,
             &focus,
             &expected_types,
             self.context.last_predicate(),
+        )
+    }
+
+    /// 与 [`Self::verify_joint_generation`] 相同，但允许显式给出联合上下文。
+    pub fn verify_joint_generation_with_context(
+        &self,
+        candidate: &str,
+        expected: &[RelationFrame],
+        focus: &[String],
+        expected_types: &[String],
+        predicate: Option<&str>,
+    ) -> FrameVerification {
+        let parsed = self.joint_parse_result(
+            candidate,
+            focus,
+            expected_types,
+            predicate,
             crate::contextual_segmentation::DEFAULT_AMBIGUITY_MARGIN,
         );
         verify_frames(&self.schema_view, &parsed, expected)
@@ -27097,6 +27138,10 @@ types = [
             .expect("肯定直陈帧应能生成候选");
         assert!(candidate.contains("创始人"), "{}", candidate);
         assert!(verification.passed, "{:?}", verification);
+
+        let negative = vec![RelationFrame::new("苹果公司", "创始人", "乔布斯")
+            .with_polarity(crate::relation_frame::Polarity::Negative)];
+        assert!(reasoner.joint_generation_candidate(&negative).is_none());
     }
 
     #[test]

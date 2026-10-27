@@ -322,6 +322,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Generate a candidate from expected facts with the existing generator,
+    /// then re-read it through joint parsing and report whether the same
+    /// frames come back
+    JointGenerate {
+        /// Expected fact as SUBJECT|PREDICATE|OBJECT (prefix ! for negation; repeatable)
+        #[arg(long = "fact", value_name = "S|P|O", required = true)]
+        fact: Vec<String>,
+        /// Focus term used to seed the joint context (repeatable)
+        #[arg(long = "context")]
+        context: Vec<String>,
+        /// Expected entity type used as a soft schema constraint (repeatable)
+        #[arg(long = "expect")]
+        expected_types: Vec<String>,
+        /// Expected predicate used as a soft context feature
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Print the candidate and verification as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
     ReadTrace {
@@ -2119,6 +2139,25 @@ async fn main() {
                 &oxigraph_manager,
                 &store_path,
                 text.as_deref(),
+                &fact,
+                &context,
+                &expected_types,
+                predicate.as_deref(),
+                json,
+            )
+            .await;
+        }
+        Some(Commands::JointGenerate {
+            fact,
+            context,
+            expected_types,
+            predicate,
+            json,
+        }) => {
+            run_joint_generate(
+                &config,
+                &oxigraph_manager,
+                &store_path,
                 &fact,
                 &context,
                 &expected_types,
@@ -5805,6 +5844,31 @@ async fn run_joint_parse(
     }
 }
 
+fn expected_frames_from_specs(facts: &[String]) -> Vec<RelationFrame> {
+    facts
+        .iter()
+        .map(|spec| {
+            let (negative, body) = match spec.strip_prefix('!') {
+                Some(body) => (true, body),
+                None => (false, spec.as_str()),
+            };
+            let parts: Vec<&str> = body.split('|').map(str::trim).collect();
+            if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+                eprintln!(
+                    "--fact 需要 SUBJECT|PREDICATE|OBJECT（可选前缀 ! 表示否定），实得 {}",
+                    spec
+                );
+                std::process::exit(2);
+            }
+            let mut frame = RelationFrame::new(parts[0], parts[1], parts[2]);
+            if negative {
+                frame = frame.with_polarity(know_prolog::relation_frame::Polarity::Negative);
+            }
+            frame
+        })
+        .collect()
+}
+
 async fn run_joint_verify(
     config: &know_prolog::SystemConfig,
     manager: &OxigraphManager,
@@ -5831,28 +5895,7 @@ async fn run_joint_verify(
         eprintln!("联合验证需要非空候选句（参数或标准输入）。");
         std::process::exit(2);
     }
-    let expected: Vec<RelationFrame> = facts
-        .iter()
-        .map(|spec| {
-            let (negative, body) = match spec.strip_prefix('!') {
-                Some(body) => (true, body),
-                None => (false, spec.as_str()),
-            };
-            let parts: Vec<&str> = body.split('|').map(str::trim).collect();
-            if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
-                eprintln!(
-                    "--fact 需要 SUBJECT|PREDICATE|OBJECT（可选前缀 ! 表示否定），实得 {}",
-                    spec
-                );
-                std::process::exit(2);
-            }
-            let mut frame = RelationFrame::new(parts[0], parts[1], parts[2]);
-            if negative {
-                frame = frame.with_polarity(know_prolog::relation_frame::Polarity::Negative);
-            }
-            frame
-        })
-        .collect();
+    let expected = expected_frames_from_specs(facts);
     let facts = match manager.load_graph_snapshot().await {
         Ok(facts) => facts,
         Err(error) => {
@@ -5883,6 +5926,53 @@ async fn run_joint_verify(
         }
     } else {
         println!("{}", parsed.render_report());
+        println!("{}", verification.render_report());
+    }
+}
+
+async fn run_joint_generate(
+    config: &know_prolog::SystemConfig,
+    manager: &OxigraphManager,
+    store_path: &str,
+    facts: &[String],
+    context: &[String],
+    expected_types: &[String],
+    predicate: Option<&str>,
+    json: bool,
+) {
+    let expected = expected_frames_from_specs(facts);
+    let snapshot = match manager.load_graph_snapshot().await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识库失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let reasoner = build_store_reasoner(config, manager, store_path, &snapshot).await;
+    let generated = reasoner.joint_generate_and_verify_with_context(
+        &expected,
+        context,
+        expected_types,
+        predicate,
+    );
+    let Some((candidate, verification)) = generated else {
+        eprintln!("当前生成器无法为否定/模态帧或空帧生成候选。");
+        std::process::exit(1);
+    };
+    if json {
+        let payload = serde_json::json!({
+            "candidate": candidate,
+            "verification": verification,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(rendered) => println!("{}", rendered),
+            Err(error) => {
+                eprintln!("联合生成序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("候选：{}", candidate);
         println!("{}", verification.render_report());
     }
 }
