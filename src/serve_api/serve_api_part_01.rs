@@ -1275,6 +1275,9 @@ enum SessionCommand {
     ReadTraces {
         reply: oneshot::Sender<serde_json::Value>,
     },
+    Semantic {
+        reply: oneshot::Sender<serde_json::Value>,
+    },
     Layers {
         reply: oneshot::Sender<serde_json::Value>,
     },

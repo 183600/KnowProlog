@@ -686,6 +686,7 @@ impl SymbolicReasoner {
     /// 证据裁决后的读法执行：只有 `Accept` 才执行计划，`Clarify` 先问一句。
     fn answer_rewrite_retrieval(&self, question: &str) -> Option<String> {
         let assessment = self.rewrite_retrieval_assessment(question)?;
+        self.semantic.record_assessment(&assessment);
         match assessment.decision {
             RewriteRetrievalDecision::Accept => {
                 let selected = assessment.selected_hypothesis()?;

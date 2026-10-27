@@ -1323,6 +1323,46 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
     }
 
     #[tokio::test]
+    async fn semantic_route_exposes_bounded_metrics_without_raw_question() {
+        let (addr, _server) = start_server(4);
+        let session_id = create_session(addr).await;
+        let question = "姚明的身高是多少";
+        let body = take_turn_body(addr, &session_id, question).await;
+        assert_eq!(body["status"], "answered", "{}", body);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/semantic", session_id),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["session_id"], session_id);
+        assert!(
+            value["metrics"]["observations"].as_u64().unwrap_or(0) >= 1,
+            "{}",
+            body
+        );
+        assert!(value["report"]
+            .as_str()
+            .is_some_and(|report| report.contains("语义检索监控")));
+        assert!(!body.contains(question), "监控不得泄露原始问句：{}", body);
+
+        let (status, _, _) = raw_request(
+            addr,
+            "GET",
+            "/sessions/nope/semantic",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
     async fn read_traces_route_returns_bounded_receipts_without_raw_question() {
         let (addr, _server) = start_server(4);
         let session_id = create_session(addr).await;

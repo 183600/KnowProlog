@@ -360,6 +360,7 @@ impl SymbolicReasoner {
     }
 
     pub fn answer(&self, question: &str) -> Option<String> {
+        self.semantic.begin(question);
         let rewritten = self.rewrite_predicate_alignment(question);
         let normalized = rewritten.as_deref().unwrap_or(question);
         let answer = self
@@ -369,6 +370,11 @@ impl SymbolicReasoner {
             // 只观测失败：成功轮不做额外分词，回答内容与原有路径逐字节一致。
             self.record_read_failure(question);
         }
+        self.semantic.finish(if answer.is_some() {
+            TurnOutcome::Answered
+        } else {
+            TurnOutcome::Deferred
+        });
         answer
     }
 
@@ -377,6 +383,17 @@ impl SymbolicReasoner {
     /// 对话层用它与恢复阶梯衔接：确证失败后由 L2 提名、验证、追问，
     /// 而不是把候选列表直接当结论输出。
     pub fn answer_certain(&self, question: &str) -> Option<String> {
+        self.semantic.begin(question);
+        let answer = self.answer_certain_impl(question);
+        self.semantic.finish(if answer.is_some() {
+            TurnOutcome::Answered
+        } else {
+            TurnOutcome::Deferred
+        });
+        answer
+    }
+
+    fn answer_certain_impl(&self, question: &str) -> Option<String> {
         let rewritten = self.rewrite_predicate_alignment(question);
         let question = rewritten.as_deref().unwrap_or(question);
         if let Some(answer) = self.answer_learned_rewrite(question) {
@@ -878,6 +895,7 @@ impl SymbolicReasoner {
         }
         let assembly =
             contextual_rag::assemble(&frame, &dense_hits, &holo_hits, &type_hints, max_items);
+        self.semantic.record_assembly(&assembly);
         if assembly.bundle.is_none() {
             return None;
         }

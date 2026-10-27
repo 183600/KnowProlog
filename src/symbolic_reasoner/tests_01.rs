@@ -1511,3 +1511,20 @@
         );
         assert!(report.contains("赵六"), "{}", report);
     }
+
+    #[test]
+    fn semantic_monitor_records_answer_without_question_text() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let question = "张三的师傅是谁";
+        let answer = reasoner.answer(question);
+        assert!(answer.is_some(), "测试事实应可回答");
+        let metrics = reasoner.semantic_metrics();
+        assert_eq!(metrics.observations, 1);
+        assert!(metrics.answered.bps.is_some());
+        let observations = reasoner.semantic_observations();
+        assert_eq!(observations.len(), 1);
+        let json = serde_json::to_string(&observations).unwrap();
+        assert!(!json.contains(question), "观测不得保存原始问句：{}", json);
+        assert!(reasoner.semantic_report().contains("语义检索监控"));
+    }

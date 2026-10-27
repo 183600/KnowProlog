@@ -67,6 +67,7 @@ impl Clone for SymbolicReasoner {
             nlp_config: self.nlp_config.clone(),
             // 轨迹不是记忆：分叉会话从空台账开始，避免把上一会话的失败带入
             read_traces: ReadTraceLedger::new(),
+            semantic: self.semantic.clone(),
             lexical_memory: self.lexical_memory.clone(),
             mention_lexicon: self.mention_lexicon.clone(),
             engine_fault: self.engine_fault.clone(),

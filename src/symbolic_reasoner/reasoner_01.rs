@@ -199,6 +199,7 @@ impl SymbolicReasoner {
             perf,
             nlp_config: None,
             read_traces: ReadTraceLedger::new(),
+            semantic: SemanticMonitor::new(),
             lexical_memory: LexicalMemory::default(),
             mention_lexicon: MentionLexicon::default(),
             engine_fault: None,
@@ -303,6 +304,7 @@ impl SymbolicReasoner {
         self.predicate_canonicals_memo.lock().clear();
         self.prediction_drafts.lock().clear();
         self.read_traces.clear();
+        self.semantic.clear();
         self.engine_fault = None;
         // 会话事实/规则可能已注入归结、软逻辑与概率程序；分叉后必须用
         // 纯图谱基座重建，否则新会话仍能推出上一会话的临时前提。
@@ -577,6 +579,30 @@ impl SymbolicReasoner {
 
     pub fn read_trace_receipts(&self) -> Vec<TraceReceipt> {
         self.read_traces.snapshot()
+    }
+
+    pub fn semantic_metrics(&self) -> WindowMetrics {
+        self.semantic.snapshot()
+    }
+
+    pub fn semantic_observations(&self) -> Vec<SemanticObservation> {
+        self.semantic.observations()
+    }
+
+    pub fn semantic_advice(&self) -> SearchAdvice {
+        self.semantic.snapshot().advice
+    }
+
+    pub fn semantic_report(&self) -> String {
+        self.semantic.report()
+    }
+
+    pub fn set_semantic_control_mode(&self, mode: ControlMode) {
+        self.semantic.set_mode(mode);
+    }
+
+    pub fn clear_semantic_monitor(&self) {
+        self.semantic.clear();
     }
 
     fn enrich_trace_plan_terms(&self, trace: &mut LexicalTrace, plan: &QueryPlan, question: &str) {
@@ -1312,6 +1338,7 @@ impl SymbolicReasoner {
         search.hits.retain(|hit| {
             !self.is_suppressed_slot_value(&hit.subject, &hit.predicate, &hit.object)
         });
+        self.semantic.record_search(query, &search);
         search
     }
 

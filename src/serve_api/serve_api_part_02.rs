@@ -403,6 +403,14 @@ impl ApiState {
                                 "receipts": session.reasoner.read_trace_receipts(),
                             }));
                         }
+                        SessionCommand::Semantic { reply } => {
+                            let _ = reply.send(serde_json::json!({
+                                "session_id": session.id,
+                                "metrics": session.reasoner.semantic_metrics(),
+                                "observations": session.reasoner.semantic_observations(),
+                                "report": session.reasoner.semantic_report(),
+                            }));
+                        }
                         SessionCommand::Layers { reply } => {
                             session.sync_knowledge();
                             let manifest = session.reasoner.knowledge_layer_manifest();
@@ -711,6 +719,15 @@ impl ApiState {
         let tx = self.session_tx(session_id).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(SessionCommand::ReadTraces { reply: reply_tx })
+            .await
+            .map_err(|_| SessionError::Unavailable)?;
+        reply_rx.await.map_err(|_| SessionError::Unavailable)
+    }
+
+    async fn semantic_metrics(&self, session_id: &str) -> Result<serde_json::Value, SessionError> {
+        let tx = self.session_tx(session_id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(SessionCommand::Semantic { reply: reply_tx })
             .await
             .map_err(|_| SessionError::Unavailable)?;
         reply_rx.await.map_err(|_| SessionError::Unavailable)
@@ -1065,6 +1082,10 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             Err(error) => session_error_response(error),
         },
         ("GET", ["sessions", id, "read-traces"]) => match state.read_traces(id).await {
+            Ok(report) => Response::json(200, &report),
+            Err(error) => session_error_response(error),
+        },
+        ("GET", ["sessions", id, "semantic"]) => match state.semantic_metrics(id).await {
             Ok(report) => Response::json(200, &report),
             Err(error) => session_error_response(error),
         },

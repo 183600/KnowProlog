@@ -95,6 +95,9 @@ use crate::rewrite_retrieval::{
 use crate::schema_view::SchemaView;
 use crate::semantic_embedding::SymbolicEmbedding;
 use crate::semantic_entailment::{self, EntailmentResult, Knowledge, PropositionParser, Verdict};
+use crate::semantic_monitor::{
+    ControlMode, SearchAdvice, SemanticMonitor, SemanticObservation, TurnOutcome, WindowMetrics,
+};
 use crate::slot_ledger::{
     AssertionStrength, SlotAssertion, SlotLedger, SlotPolicy, SlotTransition,
 };
@@ -1393,6 +1396,7 @@ pub struct SymbolicReasoner {
     nlp_config: Option<NlpConfig>,
     // 有界失败回执（只含 digest/计数/有限枚举，不保存原文，不进会话快照）
     read_traces: ReadTraceLedger,
+    semantic: SemanticMonitor,
     // 跨会话词法记忆：词性来源证据 + 量词→类型期待（软约束；由宿主落图）
     lexical_memory: LexicalMemory,
     // 可生长的提及词表：图谱实体/确认别名/显式准入回灌切分覆盖层；
