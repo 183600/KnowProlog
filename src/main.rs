@@ -6941,6 +6941,12 @@ fn intro_request_entity(input: &str, reasoner: &SymbolicReasoner) -> Option<Stri
     None
 }
 
+fn load_rewrite_book(store_path: &str) -> Option<RewriteBook> {
+    RewriteBook::load_from_path(format!("{}/rewrite_book.json", store_path))
+        .ok()
+        .or_else(|| RewriteBook::load_from_path("rewrite_book.json").ok())
+}
+
 /// 按 ask/交互/服务一致的装配顺序，从存储事实构建只读推理器。
 async fn build_store_reasoner(
     config: &SystemConfig,
@@ -6992,6 +6998,9 @@ async fn build_store_reasoner(
     reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
     if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
         reasoner.load_persisted_laws(persisted);
+    }
+    if let Some(book) = load_rewrite_book(store_path) {
+        reasoner.set_rewrite_book(book);
     }
     reasoner.observe_facts(facts);
     reasoner
@@ -7906,6 +7915,9 @@ async fn run_interactive_mode(
     // 律典：显式采纳/退役决定跨重启生效；缺失文件不影响声明律。
     if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
         symbolic_reasoner.load_persisted_laws(persisted);
+    }
+    if let Some(book) = load_rewrite_book(store_path) {
+        symbolic_reasoner.set_rewrite_book(book);
     }
     // 实体身份：已确认的持久别名同步进链接器（别名与规范名同权）
     sync_entity_aliases(&mut symbolic_reasoner, &oxigraph_manager);

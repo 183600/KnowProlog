@@ -83,6 +83,7 @@ use crate::resolution_engine::{
     ResolutionEngine, SearchOutcome, SearchStats, SearchStatus, Solution, Term,
 };
 use crate::revision_guard::{GuardPlan, RevisionGuard};
+use crate::rewrite_book::RewriteBook;
 use crate::rewrite_retrieval::{
     self, Decision as RewriteRetrievalDecision, HypothesisCandidate, HypothesisSource,
 };
@@ -1375,6 +1376,8 @@ pub struct SymbolicReasoner {
     planner: QueryPlanner,
     linker: EntityLinker,
     generator: SymbolicGenerator,
+    // 已采纳的习得重写规则；只作为读法候选，不覆盖精确解析。
+    rewrite_book: Option<RewriteBook>,
     // 统一证据索引：词面倒排 × 结构 PPR × 谓词匹配，支持约束与可审计剪枝回执。
     // 用 Mutex 承载惰性重建，使只读回答路径也能在不改变 &self 契约下检索。
     retrieval: parking_lot::Mutex<DenseRetriever>,
@@ -1589,6 +1592,7 @@ impl Clone for SymbolicReasoner {
             planner: self.planner.clone(),
             linker: self.linker.clone(),
             generator: self.generator.clone(),
+            rewrite_book: self.rewrite_book.clone(),
             retrieval: parking_lot::Mutex::new(self.retrieval.lock().clone()),
             contextual_last: parking_lot::Mutex::new(self.contextual_last.lock().clone()),
             formal_clarification: parking_lot::Mutex::new(self.formal_clarification.lock().clone()),
@@ -1737,6 +1741,15 @@ impl SymbolicReasoner {
         View(self)
     }
 
+    /// 装载已采纳的习得重写规则；只在读法候选层生效。
+    pub fn set_rewrite_book(&mut self, book: RewriteBook) {
+        self.rewrite_book = Some(book);
+    }
+
+    pub fn rewrite_book(&self) -> Option<&RewriteBook> {
+        self.rewrite_book.as_ref()
+    }
+
     /// 锚定重写的只读证据视图：链接器类型 + 谓词画像 + 本体闭包层级。
     fn anchor_evidence<'a>(
         &'a self,
@@ -1831,6 +1844,7 @@ impl SymbolicReasoner {
             planner: QueryPlanner::new(),
             linker,
             generator,
+            rewrite_book: None,
             retrieval: parking_lot::Mutex::new(DenseRetriever::new(8, 0.85, 12)),
             contextual_last: parking_lot::Mutex::new(None),
             formal_clarification: parking_lot::Mutex::new(None),
@@ -1904,6 +1918,7 @@ impl SymbolicReasoner {
         let lexical_memory = self.lexical_memory.clone();
         let mention_lexicon = self.mention_lexicon.clone();
         let contextual_memory = self.contextual_memory.clone();
+        let rewrite_book = self.rewrite_book.clone();
         let schema_view = self.schema_view.clone();
         let mut fresh =
             Self::with_perf_ledger(self.config.clone(), synonyms, Arc::clone(&self.perf));
@@ -1912,6 +1927,7 @@ impl SymbolicReasoner {
         // 词表是词法记忆：待定提名与墓碑不能因图谱重建而消失；
         // 当前图谱实体仍由随后的 observe_facts 重新确认。
         fresh.mention_lexicon = mention_lexicon;
+        fresh.rewrite_book = rewrite_book;
         fresh.observe_facts(facts);
         fresh.lexical_memory = lexical_memory;
         fresh.contextual_memory = contextual_memory;
@@ -11246,6 +11262,25 @@ impl SymbolicReasoner {
                 .with_context_bonus(bonus),
             );
         }
+        if let Some(book) = &self.rewrite_book {
+            if let Some(application) = book.resolve(question, &lexicon) {
+                let plan = self.planner.parse(&application.text).or_else(|| {
+                    query_rewrite::rewrite(&application.text, &lexicon).map(|rewrite| rewrite.plan)
+                });
+                if let Some(plan) = plan {
+                    let bonus = self.rewrite_retrieval_context_bonus(&plan);
+                    candidates.push(
+                        HypothesisCandidate::new(
+                            HypothesisSource::LearnedRewrite,
+                            application.rules.join("+"),
+                            application.text,
+                            plan,
+                        )
+                        .with_context_bonus(bonus),
+                    );
+                }
+            }
+        }
         let hints = self.link_hints(question);
         let capsule = self.discourse.ontology_capsule();
         let evidence = self.anchor_evidence(capsule.as_ref());
@@ -17324,6 +17359,45 @@ mod tests {
             .expect("应能打印裁决回执");
         assert!(report.contains("读法裁决"), "{}", report);
         assert!(report.contains("张三"), "{}", report);
+    }
+
+    #[test]
+    fn learned_rewrite_book_contributes_candidate_readings() {
+        use crate::rewrite_book::{RewriteRule, RewriteStatus};
+
+        let mut reasoner = SymbolicReasoner::new(rewrite_retrieval_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let mut book = RewriteBook::new();
+        book.rules.push(RewriteRule {
+            id: "learned-shell".to_string(),
+            plan_kind: "FindObjectByPredicate".to_string(),
+            surface: "{S}到底{P}是谁".to_string(),
+            canonical: "{S}的{P}是谁".to_string(),
+            status: RewriteStatus::Active,
+            support: 3,
+            predicates: vec!["师傅".to_string()],
+            entities: Vec::new(),
+            examples: Vec::new(),
+            refutations: 0,
+            source: "test".to_string(),
+        });
+        reasoner.set_rewrite_book(book);
+
+        let candidates = reasoner.rewrite_retrieval_candidates("张三到底师傅是谁");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source == HypothesisSource::LearnedRewrite),
+            "{:?}",
+            candidates
+                .iter()
+                .map(|candidate| candidate.receipt())
+                .collect::<Vec<_>>()
+        );
+        let assessment = reasoner
+            .rewrite_retrieval_assessment("张三到底师傅是谁")
+            .expect("应收集到候选读法");
+        assert_eq!(assessment.answer(), Some("李四"));
     }
 
     #[test]
