@@ -161,8 +161,8 @@ impl StreamingDraft {
         self.update(previous, mentions)
     }
 
-    /// 输入结束：把剩余尾部全部密封；之后不再追加。
-    pub fn seal_all(&mut self) -> DraftUpdate {
+    /// 输入结束：消费草稿，把剩余尾部全部密封并返回最终回执。
+    pub fn seal_all(mut self) -> DraftUpdate {
         let previous = self.committed;
         let total = self.chars.len();
         let mut mentions = Vec::new();
@@ -311,10 +311,12 @@ mod tests {
         assert_eq!(final_update.pending, "");
         assert_eq!(final_update.mentions.len(), 1);
         assert_eq!(final_update.mentions[0].surface, "北京");
-        assert!(draft.sealed_mentions().iter().all(|item| item.surface != "苹果"));
 
-        let apple = draft.push("苹果");
-        assert!(apple.mentions.is_empty(), "待定词面不参与密封");
+        let mut apple_draft = StreamingDraft::new(&lexicon, 3);
+        let apple = apple_draft.push("苹果").mentions;
+        assert!(apple.is_empty(), "待定词面不参与密封");
+        let apple_final = apple_draft.seal_all();
+        assert!(apple_final.mentions.is_empty(), "待定词面不参与密封");
     }
 
     #[test]
