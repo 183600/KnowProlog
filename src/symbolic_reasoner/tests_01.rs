@@ -1528,6 +1528,8 @@
         let json = serde_json::to_string(&observations).unwrap();
         assert!(!json.contains(question), "观测不得保存原始问句：{}", json);
         assert!(reasoner.semantic_report().contains("语义检索监控"));
+        assert_eq!(reasoner.perf.count("semantic_observations"), 1);
+        assert_eq!(reasoner.perf.count("semantic_outcome_answered"), 1);
     }
 
     #[test]

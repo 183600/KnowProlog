@@ -370,7 +370,7 @@ impl SymbolicReasoner {
             // 只观测失败：成功轮不做额外分词，回答内容与原有路径逐字节一致。
             self.record_read_failure(question);
         }
-        self.semantic.finish(if answer.is_some() {
+        self.finish_semantic_turn(if answer.is_some() {
             TurnOutcome::Answered
         } else {
             TurnOutcome::Deferred
@@ -385,12 +385,41 @@ impl SymbolicReasoner {
     pub fn answer_certain(&self, question: &str) -> Option<String> {
         self.semantic.begin(question);
         let answer = self.answer_certain_impl(question);
-        self.semantic.finish(if answer.is_some() {
+        self.finish_semantic_turn(if answer.is_some() {
             TurnOutcome::Answered
         } else {
             TurnOutcome::Deferred
         });
         answer
+    }
+
+    fn finish_semantic_turn(
+        &self,
+        outcome: TurnOutcome,
+    ) -> Option<crate::semantic_monitor::SemanticObservation> {
+        let observation = self.semantic.finish(outcome)?;
+        self.perf.bump("semantic_observations");
+        self.perf.bump(match outcome {
+            TurnOutcome::Answered => "semantic_outcome_answered",
+            TurnOutcome::Deferred => "semantic_outcome_deferred",
+            TurnOutcome::Clarified => "semantic_outcome_clarified",
+            TurnOutcome::Fault => "semantic_outcome_fault",
+        });
+        self.perf
+            .bump_by("semantic_search_attempts", observation.search.searches);
+        self.perf
+            .bump_by("semantic_search_hits", observation.search.returned);
+        self.perf
+            .bump_by("semantic_assemblies", observation.assembly.assemblies);
+        self.perf
+            .bump_by(
+                "semantic_assembly_selected",
+                observation.assembly.selected_assemblies,
+            );
+        for code in &observation.codes {
+            self.perf.bump(&format!("semantic_code_{code}"));
+        }
+        Some(observation)
     }
 
     fn answer_certain_impl(&self, question: &str) -> Option<String> {
@@ -949,9 +978,18 @@ impl SymbolicReasoner {
         // 「配偶是谁」的证据当成「配偶的体重」的答案，制造无证明的确定回答。
         let target_predicate = self.target_predicate_surface(normalized_question.as_ref());
 
+        let base_k = self.config.max_predictions.clamp(1, 5);
+        let search_k = self
+            .semantic
+            .advice()
+            .max_items
+            .map_or(base_k, |max_items| base_k.min(max_items));
+        if search_k < base_k {
+            self.perf.bump("semantic_control_evidence_k");
+        }
         let search = self.evidence_search(
             question,
-            self.config.max_predictions.clamp(1, 5),
+            search_k,
             &SearchConstraints::default(),
             SearchBudget::default(),
         );

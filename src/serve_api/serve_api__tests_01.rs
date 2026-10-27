@@ -1351,6 +1351,19 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .is_some_and(|report| report.contains("语义检索监控")));
         assert!(!body.contains(question), "监控不得泄露原始问句：{}", body);
 
+        let (status, _, body) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let metrics: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            metrics["perf"]["semantic_observations"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1,
+            "{}",
+            body
+        );
+        assert!(!body.contains(question), "性能台账也不得泄露问题文本：{}", body);
+
         let (status, _, _) = raw_request(
             addr,
             "GET",
