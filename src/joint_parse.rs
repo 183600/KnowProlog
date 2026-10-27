@@ -1812,6 +1812,30 @@ mod tests {
     }
 
     #[test]
+    fn extractor_welds_oov_person_and_nominates_candidate() {
+        let mut segmenter = ContextualSegmenter::new();
+        segmenter.observe_entity("李四", Some("人物"));
+        let schema = SchemaView::new();
+        let text = "纳西姆塔勒布认识李四";
+        let parse = joint_parse(&mut segmenter, &schema, text, &JointParseOptions::default());
+        assert!(!parse.frames.is_empty(), "应抽到 OOV 人名帧：{:?}", parse);
+        let frame = &parse.frames[0];
+        assert_eq!(frame.subject.canonical, "纳西姆塔勒布");
+        let span = frame.subject.span.expect("subject span");
+        assert!(parse.segmentation.tokens.iter().any(|token| {
+            token.start == span.0 && token.end == span.1 && token.text == "纳西姆塔勒布"
+        }));
+        assert!(
+            parse
+                .candidates
+                .iter()
+                .any(|candidate| candidate.surface == "纳西姆塔勒布"),
+            "OOV 人名应进入候选新词：{:?}",
+            parse.candidates
+        );
+    }
+
+    #[test]
     fn verify_frames_round_trips_generation() {
         let mut segmenter = ContextualSegmenter::new();
         let schema = SchemaView::new();
