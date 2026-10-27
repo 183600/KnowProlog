@@ -1379,9 +1379,16 @@ fn disambiguate_argument_spans(text: &str, requests: &mut [FrameRequests]) {
         else {
             continue;
         };
-        if request.subject.surface == request.object.surface
-            || !spans_overlap(subject_span, object_span)
-        {
+        if !spans_overlap(subject_span, object_span) {
+            continue;
+        }
+        if request.subject.surface == request.object.surface {
+            if let Some(found) =
+                find_char_span_from_char(text, &request.object.surface, subject_span.1)
+            {
+                request.object.span = Some(found);
+                request.object.error = None;
+            }
             continue;
         }
         if let Some(found) = find_char_span_from_char(text, &request.object.surface, subject_span.1)
@@ -1416,7 +1423,10 @@ fn find_char_span_from_char(
 }
 
 fn find_char_span_from(text: &str, surface: &str, byte_start: usize) -> Option<(usize, usize)> {
-    let byte_start = byte_start.min(text.len());
+    let mut byte_start = byte_start.min(text.len());
+    while byte_start > 0 && !text.is_char_boundary(byte_start) {
+        byte_start -= 1;
+    }
     let haystack = &text[byte_start..];
     let relative = haystack.find(surface)?;
     let absolute = byte_start + relative;
@@ -1906,6 +1916,34 @@ mod tests {
         let frame = &parse.frames[0];
         assert_eq!(frame.subject.span, Some((0, 4)));
         assert_eq!(frame.object.span, Some((9, 11)));
+        assert!(frame.conflicts.is_empty(), "{:?}", frame.conflicts);
+    }
+
+    #[test]
+    fn repeated_surface_gets_two_spans_in_order() {
+        let text = "张三认识张三";
+        let mut frame = RelationFrame::new("张三", "认识", "张三");
+        frame.evidence = EvidenceSpan {
+            sentence_index: 0,
+            sentence: text.to_string(),
+            start: 0,
+            end: text.len(),
+            subject_span: None,
+            object_span: None,
+            polarity_span: None,
+        };
+        let mut segmenter = ContextualSegmenter::new();
+        segmenter.observe_entity("张三", Some("人物"));
+        let parse = joint_parse_with_frames(
+            &mut segmenter,
+            &SchemaView::new(),
+            text,
+            vec![frame],
+            &JointParseOptions::default(),
+        );
+        let frame = &parse.frames[0];
+        assert_eq!(frame.subject.span, Some((0, 2)));
+        assert_eq!(frame.object.span, Some((4, 6)));
         assert!(frame.conflicts.is_empty(), "{:?}", frame.conflicts);
     }
 
