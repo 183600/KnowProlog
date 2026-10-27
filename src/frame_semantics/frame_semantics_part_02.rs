@@ -903,6 +903,19 @@ mod tests {
     }
 
     #[test]
+    fn fills_recipient_after_ba_patient() {
+        let frame = repair_frame("张三把书给了李四");
+        assert_eq!(frame.usable(Role::Agent), Some("张三"));
+        assert_eq!(frame.usable(Role::Patient), Some("书"));
+        assert_eq!(frame.usable(Role::Recipient), Some("李四"));
+        let book = book();
+        assert_eq!(
+            book.realize(&frame).as_deref(),
+            Some("张三把书给了李四")
+        );
+    }
+
+    #[test]
     fn handles_passive_and_ba() {
         let passive = repair_frame("李四的电脑被张三修好了");
         assert_eq!(passive.usable(Role::Agent), Some("张三"));

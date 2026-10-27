@@ -1146,23 +1146,27 @@ fn passive_hit(segment: &str) -> Option<(usize, &'static str)> {
         .min_by_key(|(start, _)| *start)
 }
 
-fn default_object_role(schema: Option<&FrameSchema>) -> Role {
+fn default_object_role(schema: Option<&FrameSchema>, frame: &FrameInstance) -> Role {
     let Some(schema) = schema else {
         return Role::Patient;
     };
-    for role in [
+    let candidates = [
         Role::Patient,
         Role::Theme,
         Role::Stimulus,
         Role::Goal,
         Role::Recipient,
         Role::Result,
-    ] {
-        if schema.role_spec(role).is_some() {
+    ];
+    for role in candidates {
+        if schema.role_spec(role).is_some() && frame.filler(role).is_none() {
             return role;
         }
     }
-    Role::Patient
+    candidates
+        .into_iter()
+        .find(|role| schema.role_spec(*role).is_some())
+        .unwrap_or(Role::Patient)
 }
 
 fn detect_negation(before: &str, after: &str) -> bool {
@@ -1286,7 +1290,7 @@ impl<'a> FrameAnnotator<'a> {
         if let Some(first) = first {
             let remainder = trim_after_predicate(&after[..first]);
             if !remainder.is_empty() {
-                let role = default_object_role(schema);
+                let role = default_object_role(schema, &frame);
                 let leading = after[..first].len() - after[..first].trim_start().len();
                 frame.set_role(
                     role,
@@ -1301,7 +1305,7 @@ impl<'a> FrameAnnotator<'a> {
         } else {
             let remainder = trim_after_predicate(after);
             if !remainder.is_empty() {
-                let role = default_object_role(schema);
+                let role = default_object_role(schema, &frame);
                 let leading = after.len() - after.trim_start().len();
                 frame.set_role(
                     role,
