@@ -145,6 +145,7 @@ pub mod serve_api;
 pub mod shape_dialogue;
 pub mod shape_eval;
 pub mod shape_gate;
+pub mod shared_memory;
 pub mod similarity_calculator;
 pub mod slot_ledger;
 pub mod soft_route;

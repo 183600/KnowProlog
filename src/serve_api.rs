@@ -40,6 +40,8 @@
 //! - `GET  /sessions/{id}/export`  导出会话信封（可移植 JSON）
 //! - `POST /sessions/import`       导入会话信封重建会话
 //! - `DELETE /sessions/{id}`       关闭会话
+//! - `GET/POST /sessions/{id}/memory` 会话可见的共享语义白板（全局 + 会话私有）
+//! - `GET/POST /v1/memory`          全局共享语义白板（`?session=` 只读叠加会话视图）
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
 //!   或 `?stream=1` 时按句 SSE 流式返回。轮次有墙钟预算（默认 30 秒 Enforce），
 //!   失败/取消/超时会回滚可观察状态并留下可继续的未完成轮次
@@ -84,6 +86,9 @@ use crate::quality::QualityIndex;
 use crate::reading::{Reading, Residual};
 use crate::recovery::RecoveryMode;
 use crate::schema_view::SchemaView;
+use crate::shared_memory::{
+    MemoryScope, NewClaim, PublishError, SharedMemoryBoard, DEFAULT_MAX_CLAIMS,
+};
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::turn_runtime::{
@@ -1503,6 +1508,8 @@ pub struct ApiState {
     frame_program: Option<Arc<FrameProgram>>,
     /// 每轮预算（复制给每个会话 actor；默认 30 秒 Enforce）。
     turn_budget: TurnBudget,
+    /// 跨会话共享语义白板：默认私有，显式发布到全局或指定会话。
+    shared_memory: Arc<SharedMemoryBoard>,
 }
 
 impl ApiState {
@@ -1545,6 +1552,7 @@ impl ApiState {
             recovery_mode: RecoveryMode::Observe,
             frame_program: None,
             turn_budget: TurnBudget::enforced(crate::turn_runtime::DEFAULT_TURN_BUDGET),
+            shared_memory: Arc::new(SharedMemoryBoard::new(DEFAULT_MAX_CLAIMS)),
         }
     }
 
@@ -2228,6 +2236,8 @@ impl ApiState {
 
     async fn close_session(&self, session_id: &str) -> bool {
         let removed = self.sessions.lock().await.remove(session_id).is_some();
+        // 私有声明随会话生命周期结束；否则同 id 重新导入/创建会继承旧记忆。
+        self.shared_memory.purge_session(session_id);
         match self.session_file(session_id) {
             // 冷会话（已换出）也必须可删除，否则会被下次访问复活
             Some(path) => {
@@ -2436,6 +2446,10 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "POST /sessions/{id}/turns",
                     "POST /sessions/{id}/resume",
                     "DELETE /sessions/{id}/open-turn",
+                    "GET /sessions/{id}/memory",
+                    "POST /sessions/{id}/memory",
+                    "GET /v1/memory",
+                    "POST /v1/memory",
                     "GET /v1/models",
                     "GET /v1/prompts",
                     "POST /v1/events",
@@ -2453,25 +2467,35 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 "quality": state.quality_index().is_some(),
             }),
         ),
-        ("GET", ["metrics"]) => Response::json(
-            200,
-            &serde_json::json!({
-                "sessions": state.session_count().await,
-                "turns_total": state.turns_total.load(Ordering::Relaxed),
-                "quality": state.quality_index().map(|index| serde_json::json!({
-                    "entities": index.len(),
-                    "revision": index.revision,
-                    "digest": index.digest,
-                })),
-                "max_sessions": state.max_sessions,
-                "session_dir": state.session_dir.as_ref().map(|dir| dir.display().to_string()),
-                "cold_sessions": state.cold_session_count(),
-                "evictions_total": state.evictions_total.load(Ordering::Relaxed),
-                "warm_revision": state.warm_revision(),
-                "perf": state.perf.snapshot(),
-                "startup": state.startup.snapshot(),
-            }),
-        ),
+        ("GET", ["metrics"]) => {
+            let memory = state.shared_memory.snapshot_all();
+            Response::json(
+                200,
+                &serde_json::json!({
+                    "sessions": state.session_count().await,
+                    "turns_total": state.turns_total.load(Ordering::Relaxed),
+                    "quality": state.quality_index().map(|index| serde_json::json!({
+                        "entities": index.len(),
+                        "revision": index.revision,
+                        "digest": index.digest,
+                    })),
+                    "max_sessions": state.max_sessions,
+                    "session_dir": state.session_dir.as_ref().map(|dir| dir.display().to_string()),
+                    "cold_sessions": state.cold_session_count(),
+                    "evictions_total": state.evictions_total.load(Ordering::Relaxed),
+                    "warm_revision": state.warm_revision(),
+                    "shared_memory": {
+                        "revision": memory.revision,
+                        "claims": memory.claims.len(),
+                        "conflicts": memory.conflicts.len(),
+                        "evictions": memory.evictions,
+                        "digest": memory.digest,
+                    },
+                    "perf": state.perf.snapshot(),
+                    "startup": state.startup.snapshot(),
+                }),
+            )
+        }
         ("POST", ["sessions"]) => match state.create_session().await {
             Ok(session_id) => Response::json(201, &serde_json::json!({"session_id": session_id})),
             Err(message) => Response::error(429, message),
@@ -2497,6 +2521,17 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             Ok(report) => Response::json(200, &report),
             Err(error) => session_error_response(error),
         },
+        ("GET", ["sessions", id, "memory"]) => {
+            handle_shared_memory_view(state, Some(id)).await
+        }
+        ("POST", ["sessions", id, "memory"]) => {
+            handle_shared_memory_publish(state, request, Some(id)).await
+        }
+        ("GET", ["v1", "memory"]) => {
+            let session = request.query.get("session").map(String::as_str);
+            handle_shared_memory_view(state, session).await
+        }
+        ("POST", ["v1", "memory"]) => handle_shared_memory_publish(state, request, None).await,
         ("DELETE", ["sessions", id]) => {
             if state.close_session(id).await {
                 Response::json(200, &serde_json::json!({"closed": id}))
@@ -2700,6 +2735,98 @@ async fn handle_events(request: &Request) -> Response {
             "status": answer.status.tag(),
             "answer": answer,
             "graph": graph,
+        }),
+    )
+}
+
+/// 读取共享语义白板：无会话参数只读全局；指定会话时叠加该会话私有声明。
+async fn handle_shared_memory_view(state: &Arc<ApiState>, session_id: Option<&str>) -> Response {
+    let view = match session_id {
+        Some(id) => {
+            if let Err(error) = state.session_tx(id).await {
+                return session_error_response(error);
+            }
+            state.shared_memory.snapshot_for(id)
+        }
+        None => state.shared_memory.snapshot(),
+    };
+    Response::json(
+        200,
+        &serde_json::to_value(view.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
+    )
+}
+
+/// 发布一条共享声明。作用域由路由显式决定，绝不信任请求体里的 `session_id`：
+/// `/v1/memory` 恒为全局，`/sessions/{id}/memory` 恒为该会话私有。
+async fn handle_shared_memory_publish(
+    state: &Arc<ApiState>,
+    request: &Request,
+    session_id: Option<&str>,
+) -> Response {
+    if let Some(id) = session_id {
+        if let Err(error) = state.session_tx(id).await {
+            return session_error_response(error);
+        }
+    }
+    let body = match request.body_text() {
+        Ok(body) => body,
+        Err(error) => return utf8_body_error(error),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
+    };
+    let Some(subject) = payload.get("subject").and_then(serde_json::Value::as_str) else {
+        return Response::error(400, "missing string field: subject");
+    };
+    let Some(predicate) = payload
+        .get("predicate")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Response::error(400, "missing string field: predicate");
+    };
+    let Some(value) = payload.get("value").and_then(serde_json::Value::as_str) else {
+        return Response::error(400, "missing string field: value");
+    };
+    let source = payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("http");
+    let scope = session_id
+        .map(MemoryScope::session)
+        .unwrap_or(MemoryScope::Global);
+    let claim = NewClaim::new(subject, predicate, value, scope).with_source(source);
+    match state.shared_memory.publish(claim) {
+        Ok(outcome) => {
+            let status_code = match outcome.status() {
+                "published" | "conflict" => 201,
+                "saturated" => 409,
+                _ => 200,
+            };
+            let mut body = serde_json::to_value(&outcome)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .unwrap_or_default();
+            body.insert(
+                "status".to_string(),
+                serde_json::Value::String(outcome.status().to_string()),
+            );
+            body.insert(
+                "memory_revision".to_string(),
+                serde_json::json!(outcome.revision()),
+            );
+            Response::json(status_code, &serde_json::Value::Object(body))
+        }
+        Err(error) => shared_memory_error_response(&error),
+    }
+}
+
+fn shared_memory_error_response(error: &PublishError) -> Response {
+    Response::json(
+        400,
+        &serde_json::json!({
+            "error": error.to_string(),
+            "code": error.code(),
         }),
     )
 }
@@ -4196,6 +4323,144 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
                 .contains("\"sessions\":1"),
             "非法请求不得创建会话"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_memory_http_is_scoped_and_conflict_preserving() {
+        let (addr, _server) = start_server(2);
+        let first = create_session(addr).await;
+        let second = create_session(addr).await;
+
+        let (status, _, body) = raw_request(addr, "GET", "/v1/memory", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["claims"].as_array().unwrap().len(), 0);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/memory",
+            &[("Content-Type", "application/json")],
+            r#"{"subject":"姚明","predicate":"身高","value":"226cm","source":"seed"}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "published");
+        assert_eq!(value["outcome"], "published");
+
+        // 零宽字符 + 全角数字仍命中同一条身份键：幂等重复，不产生冲突。
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/memory",
+            &[("Content-Type", "application/json")],
+            r#"{"subject":"姚\u200b明","predicate":"身高","value":"２２６cm"}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "duplicate");
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/memory",
+            &[("Content-Type", "application/json")],
+            r#"{"subject":"姚明","predicate":"身高","value":"229cm"}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "conflict");
+        assert_eq!(
+            value["conflict"]["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["226cm", "229cm"]
+        );
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            &format!("/sessions/{}/memory", first),
+            &[("Content-Type", "application/json")],
+            r#"{"subject":"叶莉","predicate":"身高","value":"190cm"}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/memory", second),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["claims"].as_array().unwrap().len(), 2);
+        assert!(!body.contains("190cm"), "{}", body);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            &format!("/sessions/{}/memory", first),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["claims"].as_array().unwrap().len(), 3);
+        assert!(body.contains("190cm"), "{}", body);
+
+        let (status, _, _) = raw_request(
+            addr,
+            "GET",
+            "/sessions/s-missing/memory",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/memory",
+            &[("Content-Type", "application/json")],
+            r#"{"subject":"  ","predicate":"身高","value":"1cm"}"#,
+        )
+        .await;
+        assert_eq!(status, 400, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["code"], "empty_field");
+
+        let (status, _, body) = raw_request(addr, "GET", "/metrics", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["shared_memory"]["claims"], 3);
+        assert_eq!(value["shared_memory"]["conflicts"], 1);
+
+        let (status, _, _) = raw_request(
+            addr,
+            "DELETE",
+            &format!("/sessions/{}", first),
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (status, _, body) = raw_request(addr, "GET", "/v1/memory", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["claims"].as_array().unwrap().len(), 2, "{}", body);
+        assert!(!body.contains("190cm"), "{}", body);
     }
 
     #[tokio::test]
