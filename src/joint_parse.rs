@@ -534,11 +534,17 @@ pub fn joint_parse_with_frames(
             break;
         }
         let next = if hard_failures == 0 && !next_from_failure {
-            frame_constraints(&frames, &options.context, options.min_frame_confidence)
+            frame_constraints(
+                &frames,
+                &options.context,
+                options.min_frame_confidence,
+                schema,
+            )
         } else {
             failure_constraints(
                 &evaluated.last().expect("just pushed").2,
                 &options.context,
+                schema,
             )
         };
         let Some(mut next) = next else {
@@ -557,6 +563,10 @@ pub fn joint_parse_with_frames(
         next_from_failure = true;
     }
 
+    let rounds: Vec<JointRound> = evaluated
+        .iter()
+        .map(|(round, _, _, _)| round.clone())
+        .collect();
     let (best_round, best_result, best_frames, best_candidates) = evaluated
         .into_iter()
         .max_by(|left, right| {
@@ -598,7 +608,7 @@ pub fn joint_parse_with_frames(
         base,
         segmentation: best_result,
         frames: best_frames,
-        rounds: vec![best_round],
+        rounds,
         candidates,
         ambiguities,
         context,
@@ -669,6 +679,7 @@ fn frame_constraints(
     frames: &[RelationFrame],
     context: &JointContext,
     min_confidence: f64,
+    schema: &SchemaView,
 ) -> Option<SegmentOptions> {
     let anchor = frames
         .iter()
@@ -682,9 +693,7 @@ fn frame_constraints(
     terms.push(anchor.subject.clone());
     terms.push(anchor.object.clone());
     let mut expected = context.expected_types.clone();
-    if let Some(schema_types) = anchor_domain_range(anchor) {
-        expected.extend(schema_types);
-    }
+    expected.extend(frame_domain_range(schema, anchor));
     Some(SegmentOptions {
         context_terms: terms,
         expected_types: expected,
@@ -696,6 +705,7 @@ fn frame_constraints(
 fn failure_constraints(
     frames: &[JointFrame],
     context: &JointContext,
+    schema: &SchemaView,
 ) -> Option<SegmentOptions> {
     let failed = frames
         .iter()
@@ -710,9 +720,7 @@ fn failure_constraints(
     terms.push(failed.subject.canonical.clone());
     terms.push(failed.object.canonical.clone());
     let mut expected = context.expected_types.clone();
-    if let Some(schema_types) = anchor_domain_range(&failed.original) {
-        expected.extend(schema_types);
-    }
+    expected.extend(frame_domain_range(schema, &failed.original));
     Some(SegmentOptions {
         context_terms: terms,
         expected_types: expected,
@@ -721,16 +729,13 @@ fn failure_constraints(
     })
 }
 
-fn anchor_domain_range(frame: &RelationFrame) -> Option<Vec<String>> {
-    // 单独的函数无法访问 SchemaView；这里只保留帧自身的类型限定证据。
-    // 真正的定义域/值域在 evaluate_frame 中通过 schema 裁决。
-    let mut types = Vec::new();
-    for qualifier in &frame.qualifiers {
-        if let Some(rest) = qualifier.strip_prefix("类型:") {
-            types.extend(rest.split('/').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string));
-        }
-    }
-    (!types.is_empty()).then_some(types)
+fn frame_domain_range(schema: &SchemaView, frame: &RelationFrame) -> Vec<String> {
+    let predicate = schema.canonical_property(&frame.predicate);
+    let mut types: Vec<String> = schema.domain_classes(&predicate).into_iter().collect();
+    types.extend(schema.range_classes(&predicate));
+    types.sort();
+    types.dedup();
+    types
 }
 
 fn evaluate_frames(
@@ -793,7 +798,7 @@ fn evaluate_frames(
     let mut candidates = Vec::new();
     let mut hard_failures = 0usize;
     for (frame, requests) in frames.iter().zip(requests) {
-        let (joint, candidate) = evaluate_frame(
+        let (joint, frame_candidates) = evaluate_frame(
             segmenter,
             schema,
             text,
@@ -806,9 +811,7 @@ fn evaluate_frames(
         if joint.is_hard_failure() {
             hard_failures += 1;
         }
-        if let Some(candidate) = candidate {
-            candidates.push(candidate);
-        }
+        candidates.extend(frame_candidates);
         evaluated.push(joint);
     }
     (evaluated, candidates, hard_failures)
@@ -823,7 +826,7 @@ fn evaluate_frame(
     result: &mut SegmentResult,
     options: &JointParseOptions,
     weld_log: &BTreeMap<(usize, usize), WeldRecord>,
-) -> (JointFrame, Option<NewWordCandidate>) {
+) -> (JointFrame, Vec<NewWordCandidate>) {
     let predicate = schema.canonical_property(&frame.predicate);
     let subject_slot = schema.domain_classes(&predicate);
     let object_slot = schema.range_classes(&predicate);
@@ -901,24 +904,27 @@ fn evaluate_frame(
 
     let aligned = subject.token_span.is_some() && object.token_span.is_some();
     let welded = subject.welded || object.welded;
-    let candidate = new_word_candidate(
+    let mut candidates = Vec::new();
+    if let Some(candidate) = new_word_candidate(
         &subject,
         result,
         segmenter,
         &options.type_hints,
         frame.confidence,
         "主语",
-    )
-    .or_else(|| {
-        new_word_candidate(
-            &object,
-            result,
-            segmenter,
-            &options.type_hints,
-            frame.confidence,
-            "宾语",
-        )
-    });
+    ) {
+        candidates.push(candidate);
+    }
+    if let Some(candidate) = new_word_candidate(
+        &object,
+        result,
+        segmenter,
+        &options.type_hints,
+        frame.confidence,
+        "宾语",
+    ) {
+        candidates.push(candidate);
+    }
 
     if subject.normalized() {
         reasons.push(format!(
@@ -962,7 +968,7 @@ fn evaluate_frame(
             aligned,
             welded,
         },
-        candidate,
+        candidates,
     )
 }
 
@@ -1291,7 +1297,7 @@ fn argument_request(
         };
     };
     if char_slice(text, span.0, span.1) != surface {
-        if let Some(found) = find_char_span(text, &surface) {
+        if let Some(found) = find_char_span_from(text, &surface, frame.evidence.start) {
             span = found;
         } else {
             return ArgumentRequest {
@@ -1341,12 +1347,15 @@ fn absolute_char_span(
             return Some((start, end));
         }
     }
-    find_char_span(text, surface)
+    find_char_span_from(text, surface, frame.evidence.start)
 }
 
-fn find_char_span(text: &str, surface: &str) -> Option<(usize, usize)> {
-    let byte = text.find(surface)?;
-    let start = text[..byte].chars().count();
+fn find_char_span_from(text: &str, surface: &str, byte_start: usize) -> Option<(usize, usize)> {
+    let byte_start = byte_start.min(text.len());
+    let haystack = &text[byte_start..];
+    let relative = haystack.find(surface)?;
+    let absolute = byte_start + relative;
+    let start = text[..absolute].chars().count();
     Some((start, start + surface.chars().count()))
 }
 
