@@ -1,3 +1,21 @@
+/// 批次写入事务的错误：只用于把非存储错误（IRI / JSON）带进 Oxigraph 事务闭包。
+#[derive(Debug)]
+struct ImportBatchTransactionError(String);
+
+impl std::fmt::Display for ImportBatchTransactionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ImportBatchTransactionError {}
+
+impl From<oxigraph::store::StorageError> for ImportBatchTransactionError {
+    fn from(error: oxigraph::store::StorageError) -> Self {
+        Self(error.to_string())
+    }
+}
+
 impl OxigraphManager {
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::with_perf_ledger(store_path, Arc::new(perf_ledger::PerfLedger::new()))
@@ -871,6 +889,184 @@ impl OxigraphManager {
             Ok::<usize, oxigraph::store::StorageError>(added)
         })?;
         Ok(added)
+    }
+
+    /// 从 RDF 文件导入并记录导入情景（默认图 + 批次命名图 + 元数据图）。
+    pub async fn import_rdf_file_batch(
+        &self,
+        file_path: &str,
+    ) -> Result<crate::import_episode::RdfImportReceipt, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let format = Self::detect_rdf_format(file_path)?;
+        let file = fs::File::open(file_path)?;
+        self.import_rdf_batch(format, file, file_path).await
+    }
+
+    /// 从任意 reader 导入 RDF，并把本次导入提升为可回指、可审计的导入情景。
+    ///
+    /// 断言仍全部并入默认图（与 `import_rdf_reader` 一致，旧查询不受影响），
+    /// 同时写入：
+    /// - 批次命名图 `kg:graphs/import-batches/{id}`：本批压平后的断言；
+    /// - 元数据图 `kg:graphs/import-episodes`：序号、来源、格式、计数与 gist。
+    ///
+    /// 批次 id 由内容寻址；同一内容重复导入不会新建批次记录，也不会重复写
+    /// 元数据。空白节点因解析时会重命名，是幂等的已知例外，回执会显式披露。
+    pub async fn import_rdf_batch<R: std::io::Read>(
+        &self,
+        format: oxigraph::io::RdfFormat,
+        reader: R,
+        source: &str,
+    ) -> Result<crate::import_episode::RdfImportReceipt, Box<dyn std::error::Error + Send + Sync>>
+    {
+        // 先完整解析：语法错误不会留下半批三元组。
+        let parsed: Vec<Quad> = oxigraph::io::RdfParser::from_format(format)
+            .rename_blank_nodes()
+            .for_reader(reader)
+            .map(|quad| {
+                quad.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("RDF 解析失败：{}", error).into()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let input_named_graphs: BTreeSet<String> = parsed
+            .iter()
+            .filter_map(|quad| match &quad.graph_name {
+                GraphName::DefaultGraph => None,
+                GraphName::NamedNode(node) => Some(node.as_str().to_string()),
+                GraphName::BlankNode(node) => Some(format!("_:{}", node.as_str())),
+            })
+            .collect();
+        let blank_nodes = crate::import_episode::has_blank_nodes(&parsed);
+        let flattened: Vec<Quad> = parsed
+            .into_iter()
+            .map(|quad| {
+                Quad::new(
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+
+        let id = crate::import_episode::batch_id(&flattened);
+        let gist = crate::import_episode::build_gist(
+            &flattened,
+            crate::import_episode::DEFAULT_TOP_N,
+            crate::import_episode::DEFAULT_SAMPLE_LIMIT,
+        );
+        let store = self.store.lock().await;
+        let existing = Self::import_episodes_from_store(&store)?;
+        let known_episode = existing.iter().find(|episode| episode.id == id).cloned();
+        let seq = existing
+            .iter()
+            .map(|episode| episode.seq)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let batch_graph = crate::import_episode::batch_graph_iri(&id);
+        let fresh_episode = crate::import_episode::ImportEpisode {
+            seq,
+            id: id.clone(),
+            source: source.to_string(),
+            format: crate::import_episode::rdf_format_label(format).to_string(),
+            imported_at: crate::import_episode::now_unix_seconds(),
+            total: flattened.len(),
+            added: 0,
+            duplicates: 0,
+            blank_nodes,
+            input_named_graphs: input_named_graphs.len(),
+            batch_graph: batch_graph.clone(),
+            gist,
+        };
+        let known_for_closure = known_episode.clone();
+        let fallback_episode = fresh_episode.clone();
+
+        let (added, duplicates, recorded_episode) = store
+            .transaction(
+                move |mut transaction| -> Result<
+                    (usize, usize, Option<crate::import_episode::ImportEpisode>),
+                    ImportBatchTransactionError,
+                > {
+                    let mut added = 0usize;
+                    let mut duplicates = 0usize;
+                    for quad in &flattened {
+                        if transaction.insert(quad.as_ref())? {
+                            added += 1;
+                        } else {
+                            duplicates += 1;
+                        }
+                    }
+                    let batch_graph_node = GraphName::NamedNode(
+                        NamedNode::new(&batch_graph)
+                            .map_err(|error| ImportBatchTransactionError(error.to_string()))?,
+                    );
+                    for quad in &flattened {
+                        let batch_quad = Quad::new(
+                            quad.subject.clone(),
+                            quad.predicate.clone(),
+                            quad.object.clone(),
+                            batch_graph_node.clone(),
+                        );
+                        transaction.insert(batch_quad.as_ref())?;
+                    }
+                    let recorded_episode = if known_for_closure.is_none() {
+                        let mut episode = fresh_episode.clone();
+                        episode.added = added;
+                        episode.duplicates = duplicates;
+                        let metadata = crate::import_episode::episode_quads(&episode)
+                            .map_err(|error| ImportBatchTransactionError(error.to_string()))?;
+                        for quad in metadata {
+                            transaction.insert(quad.as_ref())?;
+                        }
+                        Some(episode)
+                    } else {
+                        None
+                    };
+                    Ok((added, duplicates, recorded_episode))
+                },
+            )
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+
+        // 只在实际改变默认图时推进知识版本；批次元数据与命名图不污染快照缓存。
+        if added > 0 {
+            self.bump_revision();
+        }
+        self.perf.bump("rdf_import_batch");
+        let recorded = recorded_episode.is_some();
+        let episode = recorded_episode
+            .or(known_episode)
+            .unwrap_or(fallback_episode);
+        Ok(crate::import_episode::RdfImportReceipt {
+            episode,
+            added,
+            duplicates,
+            recorded,
+        })
+    }
+
+    /// 读取全部 RDF 导入情景（按 seq 升序）。
+    pub async fn load_import_episodes(
+        &self,
+    ) -> Result<Vec<crate::import_episode::ImportEpisode>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let store = self.store.lock().await;
+        self.perf.bump("import_episode_load");
+        Self::import_episodes_from_store(&store)
+    }
+
+    fn import_episodes_from_store(
+        store: &Store,
+    ) -> Result<Vec<crate::import_episode::ImportEpisode>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let graph = NamedNode::new(crate::import_episode::EPISODE_LEDGER_GRAPH)?;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(GraphName::NamedNode(graph).as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::import_episode::parse_episode_graph(
+            quads.into_iter(),
+        ))
     }
 
     /// 执行任意 SPARQL 1.1 查询（SELECT / ASK / CONSTRUCT / DESCRIBE）。

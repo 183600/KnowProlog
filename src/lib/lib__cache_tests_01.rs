@@ -1536,3 +1536,127 @@
             "重复导入保持幂等"
         );
     }
+
+    /// RDF 批量导入把断言双写进默认图与批次图，并在元数据图留下可回指的情景。
+    #[tokio::test]
+    async fn import_rdf_batch_records_episode_and_batch_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let nquads = concat!(
+            "<http://example.org/kg/entity/甲> <http://example.org/kg/name> \"甲\" <http://example.org/kg/g1> .\n",
+            "<http://example.org/kg/entity/乙> <http://example.org/kg/name> \"乙\" <http://example.org/kg/g2> .\n",
+        );
+        let first = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::NQuads,
+                nquads.as_bytes(),
+                "data/sample.nq",
+            )
+            .await
+            .unwrap();
+        assert!(first.recorded, "首次导入应新建批次");
+        assert_eq!(first.added, 2);
+        assert_eq!(first.episode.seq, 1);
+        assert_eq!(first.episode.total, 2);
+        assert_eq!(first.episode.input_named_graphs, 2);
+        assert_eq!(first.episode.gist.distinct_subjects, 2);
+        assert!(!first.episode.blank_nodes);
+        let batch_graph = first.episode.batch_graph.clone();
+
+        let default = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert_eq!(default.data.len(), 2, "默认图仍是主视图");
+        let batch = manager
+            .query_sparql(&format!(
+                "SELECT ?s WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
+                batch_graph
+            ))
+            .await
+            .unwrap();
+        assert_eq!(batch.data.len(), 2, "批次命名图保存本批断言");
+
+        let replay = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::NQuads,
+                nquads.as_bytes(),
+                "data/sample.nq",
+            )
+            .await
+            .unwrap();
+        assert!(!replay.recorded, "同内容重复导入不新建批次");
+        assert_eq!(replay.added, 0);
+        assert_eq!(replay.duplicates, 2);
+        assert_eq!(replay.episode.id, first.episode.id);
+        assert_eq!(manager.load_import_episodes().await.unwrap().len(), 1);
+
+        let second = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/丙> <http://example.org/kg/name> \"丙\" ."
+                    .as_bytes(),
+                "data/second.ttl",
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.episode.seq, 2);
+        let episodes = manager.load_import_episodes().await.unwrap();
+        assert_eq!(episodes.len(), 2);
+        assert_eq!(
+            crate::import_episode::resolve_episode_reference("上一批", &episodes)
+                .map(|episode| episode.seq),
+            Some(1)
+        );
+        assert_eq!(
+            crate::import_episode::resolve_episode_reference("第2批", &episodes)
+                .map(|episode| episode.seq),
+            Some(2)
+        );
+        assert_eq!(
+            crate::import_episode::resolve_episode_reference("second.ttl 讲了什么", &episodes)
+                .map(|episode| episode.seq),
+            Some(2)
+        );
+    }
+
+    /// 空白节点是内容寻址的例外：回执必须披露，且解析失败不留下批次。
+    #[tokio::test]
+    async fn import_rdf_batch_discloses_blank_nodes_and_parse_failures() {
+        let (manager, _dir) = temp_manager().await;
+        let turtle = "@prefix kg: <http://example.org/kg/> .\n[] kg:name \"匿名\" .\n";
+        let first = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                turtle.as_bytes(),
+                "blank.ttl",
+            )
+            .await
+            .unwrap();
+        assert!(first.episode.blank_nodes);
+        assert_eq!(first.added, 1);
+
+        let second = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                turtle.as_bytes(),
+                "blank.ttl",
+            )
+            .await
+            .unwrap();
+        assert!(second.episode.blank_nodes);
+        assert_ne!(
+            second.episode.id, first.episode.id,
+            "空白节点重命名使同文档批次 id 不稳定（已知例外）"
+        );
+
+        let before = manager.load_import_episodes().await.unwrap().len();
+        let broken = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                b"<http://example.org/kg/s> <http://example.org/kg/p> .".as_slice(),
+                "broken.ttl",
+            )
+            .await;
+        assert!(broken.is_err());
+        assert_eq!(manager.load_import_episodes().await.unwrap().len(), before);
+    }
