@@ -1601,17 +1601,28 @@ pub fn verify_frames(
     let mut used = vec![false; parsed_keys.len()];
     let mut missing = Vec::new();
     let mut matched = 0usize;
+    let mut reasons = Vec::new();
     for frame in expected {
         let key = frame_key(schema, frame);
         if let Some(index) = parsed_keys
             .iter()
             .enumerate()
-            .find(|(index, parsed_key)| !used[*index] && **parsed_key == key)
+            .find(|(index, parsed_key)| {
+                !used[*index] && **parsed_key == key && !parsed.frames[*index].is_hard_failure()
+            })
             .map(|(index, _)| index)
         {
             used[index] = true;
             matched += 1;
         } else {
+            if parsed_keys.iter().enumerate().any(|(index, parsed_key)| {
+                **parsed_key == key && parsed.frames[index].is_hard_failure()
+            }) {
+                reasons.push(format!(
+                    "期望帧「{}」虽然命中，但联合解析存在硬冲突",
+                    frame.render_text()
+                ));
+            }
             missing.push(frame.render_text());
         }
     }
@@ -1622,7 +1633,6 @@ pub fn verify_frames(
         .filter(|(index, _)| !used[*index])
         .map(|(_, frame)| frame.normalized.render_text())
         .collect();
-    let mut reasons = Vec::new();
     if !missing.is_empty() {
         reasons.push("生成句没有恢复全部期望帧".to_string());
     }
@@ -1791,6 +1801,27 @@ mod tests {
         assert_eq!(frame.overall_verdict, TypeVerdict::Disjoint);
         assert!(!frame.conflicts.is_empty());
         assert!(!parse.converged);
+    }
+
+    #[test]
+    fn verification_rejects_frames_with_hard_conflicts() {
+        let mut segmenter = ContextualSegmenter::new();
+        segmenter.observe_entity("苹果", Some("水果"));
+        segmenter.observe_entity("乔布斯", Some("人物"));
+        let schema = schema_with(&["公司"], &["人物"], &[("水果", "公司")]);
+        let text = "苹果的创始人是乔布斯";
+        let options = JointParseOptions {
+            type_hints: hints(&[("苹果", &["水果"]), ("乔布斯", &["人物"])]),
+            ..JointParseOptions::default()
+        };
+        let parse = joint_parse(&mut segmenter, &schema, text, &options);
+        let expected = vec![RelationFrame::new("苹果", "创始人", "乔布斯")];
+        let verification = verify_frames(&schema, &parse, &expected);
+        assert!(!verification.passed);
+        assert!(verification
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("硬冲突")));
     }
 
     #[test]
