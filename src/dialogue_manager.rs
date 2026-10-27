@@ -222,6 +222,11 @@ pub trait DialogueKnowledge {
     fn answer_certain(&self, question: &str) -> Option<String> {
         self.answer(question)
     }
+    /// 已采纳的习得重写直接给出的回答；缺省不接管。
+    fn learned_rewrite_answer(&self, question: &str) -> Option<String> {
+        let _ = question;
+        None
+    }
     /// 类型画像/成员/对比问句（缺省不接管，保持旧知识源行为）。
     fn type_memory_answer(&self, question: &str) -> Option<String> {
         let _ = question;
@@ -400,6 +405,10 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn answer_certain(&self, question: &str) -> Option<String> {
         SymbolicReasoner::answer_certain(self, question)
+    }
+
+    fn learned_rewrite_answer(&self, question: &str) -> Option<String> {
+        SymbolicReasoner::answer_learned_rewrite(self, question)
     }
 
     fn type_memory_answer(&self, question: &str) -> Option<String> {
@@ -1769,6 +1778,16 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
+        if let Some(text) = knowledge.learned_rewrite_answer(input) {
+            let plan = vec!["learned_rewrite".to_string()];
+            self.last_reply = plan.clone();
+            return Some(DialogueReply {
+                text,
+                plan,
+                kind: MoveKind::AskAttribute,
+                derivation: None,
+            });
+        }
         if let Some(reply) = self.plan_epistemic_followup(input, knowledge) {
             return Some(reply);
         }
@@ -4244,6 +4263,7 @@ mod tests {
         profiles: BTreeMap<String, String>,
         derivations: BTreeMap<String, Derivation>,
         nominations: BTreeMap<(String, String), Vec<RecoveryNomination>>,
+        learned: BTreeMap<String, String>,
     }
 
     impl MockKnowledge {
@@ -4257,7 +4277,14 @@ mod tests {
                 profiles: BTreeMap::new(),
                 derivations: BTreeMap::new(),
                 nominations: BTreeMap::new(),
+                learned: BTreeMap::new(),
             }
+        }
+
+        fn with_learned_rewrite(mut self, question: &str, answer: &str) -> Self {
+            self.learned
+                .insert(question.to_string(), answer.to_string());
+            self
         }
 
         fn with_nomination(
@@ -4335,6 +4362,10 @@ mod tests {
             self.answers.get(question).cloned()
         }
 
+        fn learned_rewrite_answer(&self, question: &str) -> Option<String> {
+            self.learned.get(question).cloned()
+        }
+
         fn derivation(&self, question: &str, expected: Option<&str>) -> Option<Derivation> {
             let derivation = self.derivations.get(question)?;
             if let Some(expected) = expected {
@@ -4383,6 +4414,20 @@ mod tests {
             .with_answer("姚明是谁", "姚明是中国篮球运动员。")
             .with_answer("姚明的身高是什么", "姚明的身高是 226 厘米。")
             .with_answer("姚明的国籍是什么", "姚明的国籍是中国。")
+    }
+
+    #[test]
+    fn learned_rewrite_answer_precedes_profile_generation() {
+        let knowledge = MockKnowledge::new()
+            .with_entity("张三", &["师傅"])
+            .with_answer("张三到底师傅是谁", "关于「张三」的知识（类型：人物）")
+            .with_learned_rewrite("张三到底师傅是谁", "李四");
+        let mut manager = DialogueManager::new();
+        let reply = manager
+            .plan_reply("张三到底师傅是谁", &knowledge)
+            .expect("习得重写应接管本轮");
+        assert_eq!(reply.text, "李四");
+        assert_eq!(reply.plan, vec!["learned_rewrite"]);
     }
 
     struct CrdKnowledge {

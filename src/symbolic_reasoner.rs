@@ -11198,6 +11198,15 @@ impl SymbolicReasoner {
         if !should_anchor {
             return compiled;
         }
+        // 已采纳的习得重写是显式规则：在通用锚定/实体画像回退之前竞争，
+        // 避免一条本该走规则的问题被实体画像吞掉。
+        let mut rewrite_retrieval_attempted = false;
+        if self.config.rewrite_retrieval.enabled && self.learned_rewrite_available(question) {
+            rewrite_retrieval_attempted = true;
+            if let Some(answer) = self.answer_rewrite_retrieval(question) {
+                return Some(answer);
+            }
+        }
         // 精确路径只给出「没有记录」时，错别字/别名问句仍应有机会走锚定；
         // 歧义、无法证明等失败不进入，避免绕过澄清或证明边界。若锚定也
         // 拿不到确证答案，再保留原失败答复。
@@ -11206,12 +11215,25 @@ impl SymbolicReasoner {
         }
         // 最后让多个候选读法用稠密检索证据竞争；默认关闭，且只在精确/
         // 锚定路径失败后接管，因此不会改变已能确证的旧行为。
-        if self.config.rewrite_retrieval.enabled {
+        if self.config.rewrite_retrieval.enabled && !rewrite_retrieval_attempted {
             if let Some(answer) = self.answer_rewrite_retrieval(question) {
                 return Some(answer);
             }
         }
         compiled
+    }
+
+    fn learned_rewrite_available(&self, question: &str) -> bool {
+        self.rewrite_book
+            .as_ref()
+            .is_some_and(|book| book.resolve(question, &self.relation_lexicon()).is_some())
+    }
+
+    pub(crate) fn answer_learned_rewrite(&self, question: &str) -> Option<String> {
+        if !self.config.rewrite_retrieval.enabled || !self.learned_rewrite_available(question) {
+            return None;
+        }
+        self.answer_rewrite_retrieval(question)
     }
 
     /// 收集问句的候选读法：精确计划、句法重写、指称锚定。
@@ -12664,6 +12686,9 @@ impl SymbolicReasoner {
     pub fn answer_certain(&self, question: &str) -> Option<String> {
         let rewritten = self.rewrite_predicate_alignment(question);
         let question = rewritten.as_deref().unwrap_or(question);
+        if let Some(answer) = self.answer_learned_rewrite(question) {
+            return Some(self.annotate_assumption_world(answer));
+        }
         // 情态问句的答案不是「确证事实」，但它把不确定性与阈值显式写在脸上；
         // 对话恢复层（answer_certain）同样必须看得见它，否则「可能」会被
         // 悄悄降级成普通确证回答。
@@ -13003,6 +13028,9 @@ impl SymbolicReasoner {
 
     /// 无观测副作用的回答实现（报告路径复用，避免失败轨迹递归）。
     fn answer_impl(&self, question: &str) -> Option<String> {
+        if let Some(answer) = self.answer_learned_rewrite(question) {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_probabilistic_intent(question) {
             return Some(answer);
         }
@@ -17504,6 +17532,11 @@ mod tests {
             .rewrite_retrieval_assessment("张三到底师傅是谁")
             .expect("应收集到候选读法");
         assert_eq!(assessment.answer(), Some("李四"));
+        let answer = reasoner
+            .answer("张三到底师傅是谁")
+            .expect("习得重写应直接回答");
+        assert!(answer.contains("李四"), "{}", answer);
+        assert!(!answer.contains("知识（类型"), "{}", answer);
     }
 
     #[test]
