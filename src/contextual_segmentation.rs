@@ -756,6 +756,24 @@ impl ContextualSegmenter {
             .map(|reading| reading.kind)
     }
 
+    /// 某个词面在词表中的全部读法（规范名 + 读法类别），按规范名排序。
+    /// 只读；供帧约束联合解析在词面层做类型裁决，不暴露内部结构。
+    pub fn surface_readings(&self, surface: &str) -> Vec<(String, ReadingKind)> {
+        let mut readings: Vec<(String, ReadingKind)> = self
+            .surfaces
+            .get(surface.trim())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|reading| (reading.canonical.clone(), reading.kind))
+                    .collect()
+            })
+            .unwrap_or_default();
+        readings.sort();
+        readings.dedup();
+        readings
+    }
+
     pub fn entity_count(&self) -> usize {
         self.entities.len()
     }
