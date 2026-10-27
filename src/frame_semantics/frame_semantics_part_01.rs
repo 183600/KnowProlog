@@ -257,6 +257,11 @@ impl RoleSpec {
         self.allowed_types = types.into_iter().map(Into::into).collect();
         self
     }
+
+    pub fn with_weight(mut self, weight: i32) -> Self {
+        self.weight = weight;
+        self
+    }
 }
 
 /// 帧 schema 的生命周期：候选、激活、退役。
@@ -591,6 +596,11 @@ impl FrameInstance {
 
     /// 投影为带限定语的关系帧：核心角色落主语/宾语，旁格落 qualifiers。
     pub fn project(&self) -> Option<RelationFrame> {
+        self.project_with_schema(None)
+    }
+
+    /// 带 schema 的投影：`RoleSpec::weight` 决定哪个角色优先成为宾语。
+    pub fn project_with_schema(&self, schema: Option<&FrameSchema>) -> Option<RelationFrame> {
         let empty = BTreeSet::new();
         let (subject_role, subject) = self.pick_role(
             &[Role::Agent, Role::Experiencer, Role::Patient, Role::Theme],
@@ -598,18 +608,22 @@ impl FrameInstance {
         )?;
         let mut used = BTreeSet::new();
         used.insert(subject_role);
-        let (object_role, object) = self.pick_role(
-            &[
-                Role::Patient,
-                Role::Theme,
-                Role::Stimulus,
-                Role::Recipient,
-                Role::Goal,
-                Role::Result,
-                Role::Source,
-            ],
-            &used,
-        )?;
+        let mut candidates: Vec<(Role, &RoleFiller)> = self
+            .roles
+            .iter()
+            .filter(|(role, filler)| {
+                !used.contains(role) && role.is_projected_object() && filler.is_usable()
+            })
+            .map(|(role, filler)| (*role, filler))
+            .collect();
+        candidates.sort_by_key(|(role, _)| {
+            let weight = schema
+                .and_then(|schema| schema.role_spec(*role))
+                .map(|spec| spec.weight)
+                .unwrap_or(0);
+            (std::cmp::Reverse(weight), *role)
+        });
+        let (object_role, object) = candidates.into_iter().next()?;
         used.insert(object_role);
 
         let mut frame = RelationFrame::new(&subject.value, &self.predicate, &object.value);
@@ -732,8 +746,8 @@ impl FrameBook {
         book.register(
             FrameSchema::new("修", "repair")
                 .with_surfaces(["修", "修好", "修理", "修过"])
-                .with_role(RoleSpec::new(Role::Agent).required())
-                .with_role(RoleSpec::new(Role::Patient).required())
+                .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
+                .with_role(RoleSpec::new(Role::Patient).required().with_weight(10))
                 .with_role(RoleSpec::new(Role::Instrument).with_markers(["用", "拿", "使用"]))
                 .with_role(RoleSpec::new(Role::Location))
                 .with_role(RoleSpec::new(Role::Time))
@@ -747,8 +761,8 @@ impl FrameBook {
             FrameSchema::new("去", "move")
                 .with_surfaces(["去", "前往", "到"])
                 .without_role(Role::Patient)
-                .with_role(RoleSpec::new(Role::Agent).required())
-                .with_role(RoleSpec::new(Role::Goal).required().with_markers(["到", "去", "往", "向"]))
+                .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
+                .with_role(RoleSpec::new(Role::Goal).required().with_weight(10).with_markers(["到", "去", "往", "向"]))
                 .with_role(RoleSpec::new(Role::Source).with_markers(["从", "自"]))
                 .with_role(RoleSpec::new(Role::Time))
                 .with_role(RoleSpec::new(Role::Purpose).with_markers(["为了"]))
@@ -759,9 +773,9 @@ impl FrameBook {
         book.register(
             FrameSchema::new("给", "transfer")
                 .with_surfaces(["给", "送给", "交给", "递给"])
-                .with_role(RoleSpec::new(Role::Agent).required())
-                .with_role(RoleSpec::new(Role::Patient).required())
-                .with_role(RoleSpec::new(Role::Recipient).required().with_markers(["给", "对"]))
+                .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
+                .with_role(RoleSpec::new(Role::Patient).required().with_weight(10))
+                .with_role(RoleSpec::new(Role::Recipient).required().with_weight(20).with_markers(["给", "对"]))
                 .with_role(RoleSpec::new(Role::Time))
                 .with_realize("{agent}[{time}]把{patient}给了{recipient}")
                 .with_source("内置种子")
@@ -770,8 +784,8 @@ impl FrameBook {
         book.register(
             FrameSchema::new("看", "observe")
                 .with_surfaces(["看", "看见", "看了", "观看"])
-                .with_role(RoleSpec::new(Role::Agent).required())
-                .with_role(RoleSpec::new(Role::Patient).required())
+                .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
+                .with_role(RoleSpec::new(Role::Patient).required().with_weight(10))
                 .with_role(RoleSpec::new(Role::Location))
                 .with_role(RoleSpec::new(Role::Time))
                 .with_realize("{agent}[{time}][在{location}]看了{patient}")
@@ -912,8 +926,8 @@ impl FrameBook {
         best.map(|(_, hit)| hit)
     }
 
-    pub fn realize(&self, frame: &FrameInstance) -> Option<String> {
-        let schema = frame
+    pub fn schema_for_frame(&self, frame: &FrameInstance) -> Option<&FrameSchema> {
+        frame
             .schema
             .as_deref()
             .and_then(|id| self.schemas.get(id))
@@ -921,8 +935,15 @@ impl FrameBook {
                 self.schemas_for(&frame.predicate)
                     .into_iter()
                     .find(|schema| schema.status == SchemaStatus::Active)
-            })?;
-        schema.realize(frame)
+            })
+    }
+
+    pub fn project(&self, frame: &FrameInstance) -> Option<RelationFrame> {
+        frame.project_with_schema(self.schema_for_frame(frame))
+    }
+
+    pub fn realize(&self, frame: &FrameInstance) -> Option<String> {
+        self.schema_for_frame(frame)?.realize(frame)
     }
 
     pub fn to_json(&self) -> String {

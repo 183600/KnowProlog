@@ -913,6 +913,10 @@ mod tests {
             book.realize(&frame).as_deref(),
             Some("张三把书给了李四")
         );
+        let projected = book.project(&frame).expect("projected");
+        assert_eq!(projected.subject, "张三");
+        assert_eq!(projected.object, "李四");
+        assert!(projected.qualifiers.contains(&"受事=书".to_string()));
     }
 
     #[test]

@@ -50,7 +50,7 @@ fn run_roles(text: Option<&str>, predicate: Option<&str>, json: bool, config_pat
             continue;
         }
         for frame in frames {
-            let projection = frame.project();
+            let projection = book.project(&frame);
             let realized = book.realize(&frame);
             if json {
                 records.push(serde_json::json!({
