@@ -277,6 +277,28 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Frame-constrained joint parsing: frame spans and predicate domain/range
+    /// feed back into segmentation, then type adjudication and reading
+    /// normalization converge (read-only; opens the store for type evidence)
+    JointParse {
+        /// Text to parse; omit to read stdin
+        text: Option<String>,
+        /// Focus term used to seed the joint context (repeatable)
+        #[arg(long = "context")]
+        context: Vec<String>,
+        /// Expected entity type used as a soft schema constraint (repeatable)
+        #[arg(long = "expect")]
+        expected_types: Vec<String>,
+        /// Expected predicate used as a soft context feature
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Ambiguity margin threshold for clarification
+        #[arg(long, default_value_t = 0.05)]
+        margin: f64,
+        /// Print the joint parse as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Trace how a question is read: tokens, POS provenance, spans, query plan
     /// and closure-marker boundary risks (offline; does not open the store)
     ReadTrace {
@@ -2036,6 +2058,27 @@ async fn main() {
                 memory.as_deref(),
                 &confirm,
                 &correct,
+                json,
+            )
+            .await;
+        }
+        Some(Commands::JointParse {
+            text,
+            context,
+            expected_types,
+            predicate,
+            margin,
+            json,
+        }) => {
+            run_joint_parse(
+                &config,
+                &oxigraph_manager,
+                &store_path,
+                text.as_deref(),
+                &context,
+                &expected_types,
+                predicate.as_deref(),
+                margin,
                 json,
             )
             .await;
@@ -5663,6 +5706,64 @@ fn run_pattern_forge(
         }
     } else {
         println!("（预览：加 --activate 可查看展开后的路由条目）");
+    }
+}
+
+async fn run_joint_parse(
+    config: &know_prolog::SystemConfig,
+    manager: &OxigraphManager,
+    store_path: &str,
+    text: Option<&str>,
+    context: &[String],
+    expected_types: &[String],
+    predicate: Option<&str>,
+    margin: f64,
+    json: bool,
+) {
+    if !(0.0..=1.0).contains(&margin) || !margin.is_finite() {
+        eprintln!("--margin 必须在 0 到 1 之间（含端点），实得 {}", margin);
+        std::process::exit(2);
+    }
+    let source = match text {
+        Some(text) => text.to_string(),
+        None => {
+            let mut input = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+                eprintln!("读取标准输入失败: {}", error);
+                std::process::exit(1);
+            }
+            input.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    if source.trim().is_empty() {
+        eprintln!("联合解析需要非空文本（参数或标准输入）。");
+        std::process::exit(2);
+    }
+    let facts = match manager.load_graph_snapshot().await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识库失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let reasoner = build_store_reasoner(config, manager, store_path, &facts).await;
+    let result = reasoner.joint_parse_result(
+        &source,
+        context,
+        expected_types,
+        predicate,
+        margin,
+    );
+    if json {
+        match serde_json::to_string_pretty(&result) {
+            Ok(rendered) => println!("{}", rendered),
+            Err(error) => {
+                eprintln!("联合解析序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", result.render_report());
     }
 }
 
@@ -11724,6 +11825,19 @@ async fn run_interactive_mode(
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.contextual_segment_report(target));
+            }
+            println!();
+            continue;
+        }
+
+        // 联合解析：关系帧反向约束分词（帧锚定焊接 + 类型裁决 + 读法归一）
+        if let Some(target) = strip_any_prefix(input, &["联合解析：", "联合解析:"]) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请提供要联合解析的文本，例如：联合解析：苹果的创始人是乔布斯");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                println!("{}", symbolic_reasoner.joint_parse_report(target));
             }
             println!();
             continue;
