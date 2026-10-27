@@ -663,6 +663,8 @@ pub struct SymbolicGenerator {
     semantic_grammar: Option<crate::semantic_grammar::RulePack>,
     // 导入可逆帧：把导入句学到的措辞用于生成与保守问法回答。
     import_frames: Option<crate::import_frames::ImportFrameLedger>,
+    // 谓词中心语义角色帧：同一份 schema 驱动角色标注与反向生成。
+    frame_book: Option<crate::frame_semantics::FrameBook>,
     // 类型 → 谓词计数聚合缓存；知识变更（revision 自增）后失效
     revision: u64,
     type_count_cache: parking_lot::RwLock<HashMap<String, (u64, HashMap<String, usize>, usize)>>,
@@ -711,6 +713,7 @@ impl Clone for SymbolicGenerator {
             lexicalized_predicates: self.lexicalized_predicates.clone(),
             semantic_grammar: self.semantic_grammar.clone(),
             import_frames: self.import_frames.clone(),
+            frame_book: self.frame_book.clone(),
             revision: self.revision,
             type_count_cache: parking_lot::RwLock::new(self.type_count_cache.read().clone()),
             type_versions: self.type_versions.clone(),

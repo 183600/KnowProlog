@@ -324,6 +324,30 @@ mod tests {
     }
 
     #[test]
+    fn frame_book_drives_annotation_and_realization() {
+        use crate::frame_semantics::{FrameAnnotator, FrameBook, Role};
+
+        let book = FrameBook::with_core_schemas();
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.attach_frame_book(book.clone());
+        let frames = generator.annotate_frames("张三在北京用扳手修好了电脑");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].usable(Role::Location), Some("北京"));
+        assert_eq!(
+            generator.realize_frame(&frames[0]).as_deref(),
+            Some("张三在北京用扳手修好了电脑")
+        );
+        let direct = FrameAnnotator::new(&book)
+            .annotate("张三在北京用扳手修好了电脑")
+            .pop()
+            .expect("annotated");
+        assert_eq!(direct.project().expect("projected").qualifiers.len(), 2);
+        generator.detach_frame_book();
+        assert!(generator.frame_book().is_none());
+        assert!(generator.annotate_frames("张三修好了电脑").is_empty());
+    }
+
+    #[test]
     fn test_profile_unknown_entity_is_none() {
         let generator = sample_generator();
         assert!(generator.profile("不存在的人").is_none());

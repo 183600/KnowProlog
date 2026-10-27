@@ -19,6 +19,7 @@ impl SymbolicGenerator {
             lexicalized_predicates: HashSet::new(),
             semantic_grammar: None,
             import_frames: None,
+            frame_book: None,
             revision: 0,
             type_count_cache: parking_lot::RwLock::new(HashMap::new()),
             type_versions: HashMap::new(),
@@ -54,6 +55,32 @@ impl SymbolicGenerator {
     /// 当前导入帧台账（未挂接时为 `None`）。
     pub fn import_frames(&self) -> Option<&crate::import_frames::ImportFrameLedger> {
         self.import_frames.as_ref()
+    }
+
+    /// 挂接谓词中心语义角色帧；之后可用同一份 schema 标注与实现帧。
+    pub fn attach_frame_book(&mut self, book: crate::frame_semantics::FrameBook) {
+        self.frame_book = Some(book);
+    }
+
+    pub fn detach_frame_book(&mut self) {
+        self.frame_book = None;
+    }
+
+    pub fn frame_book(&self) -> Option<&crate::frame_semantics::FrameBook> {
+        self.frame_book.as_ref()
+    }
+
+    /// 用已挂接的 schema 实现一个语义角色帧；没有匹配 schema 时返回 `None`。
+    pub fn realize_frame(&self, frame: &crate::frame_semantics::FrameInstance) -> Option<String> {
+        self.frame_book.as_ref()?.realize(frame)
+    }
+
+    /// 用已挂接的 schema 从文本标注语义角色帧。
+    pub fn annotate_frames(&self, text: &str) -> Vec<crate::frame_semantics::FrameInstance> {
+        let Some(book) = self.frame_book.as_ref() else {
+            return Vec::new();
+        };
+        crate::frame_semantics::FrameAnnotator::new(book).annotate(text)
     }
 
     /// 用导入帧回答宾语问句：只有图谱取值存在时才作答，并附原句见证。
