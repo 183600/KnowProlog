@@ -309,6 +309,51 @@ impl SensitiveSpan {
     }
 }
 
+/// 一条类型保持改写的记录。只保存位置、类别、精度与可披露表达，不保存原文，
+/// 因而可以直接写进回执或评测日志。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionRecord {
+    pub start: usize,
+    pub end: usize,
+    pub category: PrivacyCategory,
+    pub strength: EvidenceStrength,
+    pub precision: DisclosurePrecision,
+    /// 类型化占位或粗化后的表达；`suppressed` 为真时为空。
+    pub replacement: String,
+    pub suppressed: bool,
+}
+
+/// 文本级改写结果：保持非敏感片段与语序，只替换阻断跨度。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpanRedaction {
+    pub text: String,
+    #[serde(default)]
+    pub records: Vec<RedactionRecord>,
+    /// 因弱证据默认只提示而原样保留的跨度数。
+    #[serde(default)]
+    pub kept_weak: usize,
+}
+
+impl SpanRedaction {
+    /// 是否发生了实际改写（替换或省略）。
+    pub fn changed(&self) -> bool {
+        self.records
+            .iter()
+            .any(|record| record.suppressed || !record.replacement.is_empty())
+    }
+
+    pub fn suppressed(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.suppressed)
+            .count()
+    }
+
+    pub fn replacements(&self) -> usize {
+        self.records.len().saturating_sub(self.suppressed())
+    }
+}
+
 /// 词性 + 上下文规则驱动的敏感跨度检测器。
 ///
 /// 强证据：配置词表、手机号/身份证/邮箱/银行卡号、住址引导词、健康词表。
@@ -320,6 +365,17 @@ pub struct SpanDetector<'a> {
 impl<'a> SpanDetector<'a> {
     pub fn new(policy: &'a PrivacyPolicy) -> Self {
         Self { policy }
+    }
+
+    /// 跨度的建议精度跟随策略。弱证据只有在被策略提升为硬证据时才收紧到
+    /// 类型化表达；默认仍保留人名等指称，避免过度脱敏。
+    fn suggested_precision(&self, category: PrivacyCategory, weak: bool) -> DisclosurePrecision {
+        let ceiling = self.policy.max_precision(category);
+        if weak && self.policy.weak_evidence_blocks && ceiling == DisclosurePrecision::Exact {
+            DisclosurePrecision::TypeOnly
+        } else {
+            ceiling
+        }
     }
 
     pub fn scan(&self, text: &str, annotated: &[AnnotatedWord]) -> Vec<SensitiveSpan> {
@@ -342,7 +398,7 @@ impl<'a> SpanDetector<'a> {
                     category: *category,
                     strength: EvidenceStrength::Strong,
                     reason: "上下文数字/邮箱规则".to_string(),
-                    suggested_precision: category.default_precision(),
+                    suggested_precision: self.suggested_precision(*category, false),
                 });
             }
         }
@@ -361,7 +417,7 @@ impl<'a> SpanDetector<'a> {
                 category: PrivacyCategory::Location,
                 strength: EvidenceStrength::Strong,
                 reason: "住址引导词".to_string(),
-                suggested_precision: DisclosurePrecision::Coarse,
+                suggested_precision: self.suggested_precision(PrivacyCategory::Location, false),
             });
         }
 
@@ -377,7 +433,7 @@ impl<'a> SpanDetector<'a> {
                     category: *category,
                     strength: EvidenceStrength::Strong,
                     reason: format!("敏感词表：{}", term),
-                    suggested_precision: category.default_precision(),
+                    suggested_precision: self.suggested_precision(*category, false),
                 });
             }
         }
@@ -405,11 +461,81 @@ impl<'a> SpanDetector<'a> {
                 category,
                 strength: EvidenceStrength::Weak,
                 reason: reason.to_string(),
-                suggested_precision: category.default_precision(),
+                suggested_precision: self.suggested_precision(category, true),
             });
         }
 
         resolve_overlaps(spans)
+    }
+
+    /// 扫描并做类型保持改写。非阻断跨度（默认的弱证据）原样保留。
+    pub fn redact(&self, text: &str, annotated: &[AnnotatedWord]) -> SpanRedaction {
+        let spans = self.scan(text, annotated);
+        redact_spans(text, &spans, self.policy)
+    }
+}
+
+/// 把已经检测出的跨度改写成同类型的粗粒度表达。
+///
+/// 与逐事实裁决共享 [`coarsen_value`]，因此“某位人士 / 某地 / 15-19 岁”
+/// 这类表达在多轮之间保持稳定；只替换阻断跨度，句子的其余部分与语序不变。
+pub fn redact_spans(
+    text: &str,
+    spans: &[SensitiveSpan],
+    policy: &PrivacyPolicy,
+) -> SpanRedaction {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut records = Vec::new();
+    let mut kept_weak = 0usize;
+    let mut cursor = 0usize;
+
+    for span in spans {
+        if !span.is_blocking(policy) {
+            kept_weak += 1;
+            continue;
+        }
+        let start = span.start.min(chars.len());
+        let end = span.end.min(chars.len());
+        if start < cursor || start >= end {
+            continue;
+        }
+        output.extend(chars[cursor..start].iter());
+        let replacement = coarsen_value(span.category, span.suggested_precision, &span.text, None);
+        match replacement {
+            Some(value) if value != span.text => {
+                output.push_str(&value);
+                records.push(RedactionRecord {
+                    start,
+                    end,
+                    category: span.category,
+                    strength: span.strength,
+                    precision: span.suggested_precision,
+                    replacement: value,
+                    suppressed: false,
+                });
+            }
+            Some(_) => output.extend(chars[start..end].iter()),
+            None => {
+                records.push(RedactionRecord {
+                    start,
+                    end,
+                    category: span.category,
+                    strength: span.strength,
+                    precision: DisclosurePrecision::Hidden,
+                    replacement: String::new(),
+                    suppressed: true,
+                });
+            }
+        }
+        cursor = end;
+    }
+    output.extend(chars[cursor..].iter());
+
+    SpanRedaction {
+        text: output,
+        records,
+        kept_weak,
     }
 }
 
@@ -2113,6 +2239,61 @@ mod tests {
             })
             .expect("住址");
         assert!(address.text.contains("海淀区"));
+    }
+
+    #[test]
+    fn redact_replaces_strong_spans_and_keeps_weak_names() {
+        let policy = policy();
+        let detector = SpanDetector::new(&policy);
+        let text = "张三住在北京市海淀区中关村大街1号，电话13800138000。";
+        let redaction = detector.redact(text, &annotate(text));
+
+        assert!(redaction.changed());
+        assert!(redaction.text.contains("张三"), "默认不对人名脱敏");
+        assert!(redaction.text.contains("北京市"));
+        assert!(!redaction.text.contains("海淀区"));
+        assert!(!redaction.text.contains("13800138000"));
+        assert!(redaction.text.contains("某联系方式"));
+        assert!(redaction.text.starts_with("张三住在北京市，电话"));
+        assert!(redaction.kept_weak >= 1);
+        assert!(redaction
+            .records
+            .iter()
+            .any(|record| record.category == PrivacyCategory::Contact
+                && record.precision == DisclosurePrecision::TypeOnly));
+    }
+
+    #[test]
+    fn redact_honors_policy_precision_and_weak_blocking() {
+        let mut policy = policy();
+        policy.category_precision.insert(
+            PrivacyCategory::Location,
+            DisclosurePrecision::Granular,
+        );
+        policy.weak_evidence_blocks = true;
+        let detector = SpanDetector::new(&policy);
+        let text = "张三住在北京市海淀区中关村大街1号。";
+        let redaction = detector.redact(text, &annotate(text));
+
+        assert!(redaction.text.contains("北京市海淀区"));
+        assert!(!redaction.text.contains("中关村"));
+        assert_eq!(
+            redaction.kept_weak, 0,
+            "弱证据被提升为硬证据后不再原样保留"
+        );
+        assert!(!redaction.text.contains("张三"));
+        assert!(redaction.text.contains("某位人士"));
+    }
+
+    #[test]
+    fn redact_with_no_spans_is_identity() {
+        let policy = policy();
+        let detector = SpanDetector::new(&policy);
+        let text = "今天天气不错。";
+        let redaction = detector.redact(text, &annotate(text));
+        assert_eq!(redaction.text, text);
+        assert!(!redaction.changed());
+        assert!(redaction.records.is_empty());
     }
 
     #[test]

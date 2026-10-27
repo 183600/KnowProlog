@@ -6245,6 +6245,9 @@ fn run_privacy(
             )
         })
         .unwrap_or_default();
+    let redaction = text_owned
+        .as_deref()
+        .map(|text| privacy_flow::redact_spans(text, &spans, &policy));
 
     let mut graph = PrivacyGraph::new();
     for (subject, predicate, object) in &parsed_facts {
@@ -6308,6 +6311,7 @@ fn run_privacy(
             "mode": policy.mode.code(),
             "requested_precision": requested.code(),
             "spans": spans,
+            "redaction": redaction,
             "facts": fact_reports,
             "ledger": ledger,
             "ledger_digest": ledger.digest(),
@@ -6331,6 +6335,37 @@ fn run_privacy(
             println!("敏感跨度（{}）：", spans.len());
             for span in &spans {
                 println!("  {}", span.render());
+            }
+        }
+    }
+    if let Some(redaction) = &redaction {
+        let mode = if policy.mode == PolicyMode::Enforce {
+            "已执行"
+        } else {
+            "影子，未生效"
+        };
+        println!("可披露文本（{}）：{}", mode, redaction.text);
+        if !redaction.records.is_empty() {
+            println!(
+                "改写 {} 处，省略 {} 处；弱证据保留 {} 处",
+                redaction.replacements(),
+                redaction.suppressed(),
+                redaction.kept_weak
+            );
+            for record in &redaction.records {
+                println!(
+                    "  {}..{} {}（{}，{}）→ {}",
+                    record.start,
+                    record.end,
+                    record.category.label(),
+                    record.strength.label(),
+                    record.precision.label(),
+                    if record.suppressed {
+                        "（已省略）"
+                    } else {
+                        record.replacement.as_str()
+                    }
+                );
             }
         }
     }
