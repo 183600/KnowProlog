@@ -14197,6 +14197,42 @@ impl SymbolicReasoner {
         joint_parse(&mut segmenter, &self.schema_view, text, &options)
     }
 
+    /// 用现有生成器把肯定直陈帧渲染成候选句；否定/模态帧暂不猜测措辞。
+    pub fn joint_generation_candidate(&self, frames: &[RelationFrame]) -> Option<String> {
+        if frames.is_empty() {
+            return None;
+        }
+        let mut sentences = Vec::with_capacity(frames.len());
+        for frame in frames {
+            if frame.polarity != crate::relation_frame::Polarity::Affirmative
+                || frame.modality != crate::relation_frame::Modality::Asserted
+            {
+                return None;
+            }
+            let rendered = self.generator.render_fact(
+                &frame.subject,
+                &frame.predicate,
+                &[frame.object.clone()],
+            );
+            let rendered = rendered.trim().trim_end_matches('。');
+            if rendered.is_empty() {
+                return None;
+            }
+            sentences.push(format!("{}。", rendered));
+        }
+        Some(sentences.join(""))
+    }
+
+    /// 生成候选并立即回译验证；返回候选句与验证结果。
+    pub fn joint_generate_and_verify(
+        &self,
+        expected: &[RelationFrame],
+    ) -> Option<(String, FrameVerification)> {
+        let candidate = self.joint_generation_candidate(expected)?;
+        let verification = self.verify_joint_generation(&candidate, expected);
+        Some((candidate, verification))
+    }
+
     /// 生成侧回译验证：把候选句重新联合解析，要求恢复同一组关系帧。
     pub fn verify_joint_generation(
         &self,
@@ -27054,6 +27090,12 @@ types = [
 
         let expected = vec![RelationFrame::new("苹果公司", "创始人", "乔布斯")];
         let verification = reasoner.verify_joint_generation("苹果的创始人是乔布斯", &expected);
+        assert!(verification.passed, "{:?}", verification);
+
+        let (candidate, verification) = reasoner
+            .joint_generate_and_verify(&expected)
+            .expect("肯定直陈帧应能生成候选");
+        assert!(candidate.contains("创始人"), "{}", candidate);
         assert!(verification.passed, "{:?}", verification);
     }
 
