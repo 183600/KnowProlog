@@ -93,8 +93,10 @@ use know_prolog::{
     recovery::RecoveryMode,
     reference_probe::{self, GroundingLedger, ProbeDecision, ProbeStatus},
     relation_acquisition::{GoalOpen, RelationAcquisition},
+    joint_parse::verify_frames,
     relation_frame::{
-        diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, FRAME_DIALECT,
+        diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, RelationFrame,
+        FRAME_DIALECT,
     },
     release::{self, CheckOptions},
     resolution_engine::SearchStatus,
@@ -296,6 +298,27 @@ enum Commands {
         #[arg(long, default_value_t = 0.05)]
         margin: f64,
         /// Print the joint parse as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify a generated candidate by re-reading it: every expected fact must
+    /// come back with the same subject, predicate, object, polarity and modality
+    JointVerify {
+        /// Candidate sentence to re-read; omit to read stdin
+        text: Option<String>,
+        /// Expected fact as SUBJECT|PREDICATE|OBJECT (prefix ! for negation; repeatable)
+        #[arg(long = "fact", value_name = "S|P|O", required = true)]
+        fact: Vec<String>,
+        /// Focus term used to seed the joint context (repeatable)
+        #[arg(long = "context")]
+        context: Vec<String>,
+        /// Expected entity type used as a soft schema constraint (repeatable)
+        #[arg(long = "expect")]
+        expected_types: Vec<String>,
+        /// Expected predicate used as a soft context feature
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Print the parse and verification as JSON
         #[arg(long)]
         json: bool,
     },
@@ -2079,6 +2102,27 @@ async fn main() {
                 &expected_types,
                 predicate.as_deref(),
                 margin,
+                json,
+            )
+            .await;
+        }
+        Some(Commands::JointVerify {
+            text,
+            fact,
+            context,
+            expected_types,
+            predicate,
+            json,
+        }) => {
+            run_joint_verify(
+                &config,
+                &oxigraph_manager,
+                &store_path,
+                text.as_deref(),
+                &fact,
+                &context,
+                &expected_types,
+                predicate.as_deref(),
                 json,
             )
             .await;
@@ -5764,6 +5808,88 @@ async fn run_joint_parse(
         }
     } else {
         println!("{}", result.render_report());
+    }
+}
+
+async fn run_joint_verify(
+    config: &know_prolog::SystemConfig,
+    manager: &OxigraphManager,
+    store_path: &str,
+    text: Option<&str>,
+    facts: &[String],
+    context: &[String],
+    expected_types: &[String],
+    predicate: Option<&str>,
+    json: bool,
+) {
+    let source = match text {
+        Some(text) => text.to_string(),
+        None => {
+            let mut input = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut input) {
+                eprintln!("读取标准输入失败: {}", error);
+                std::process::exit(1);
+            }
+            input.trim_end_matches(['\r', '\n']).to_string()
+        }
+    };
+    if source.trim().is_empty() {
+        eprintln!("联合验证需要非空候选句（参数或标准输入）。");
+        std::process::exit(2);
+    }
+    let expected: Vec<RelationFrame> = facts
+        .iter()
+        .map(|spec| {
+            let (negative, body) = match spec.strip_prefix('!') {
+                Some(body) => (true, body),
+                None => (false, spec.as_str()),
+            };
+            let parts: Vec<&str> = body.split('|').map(str::trim).collect();
+            if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+                eprintln!(
+                    "--fact 需要 SUBJECT|PREDICATE|OBJECT（可选前缀 ! 表示否定），实得 {}",
+                    spec
+                );
+                std::process::exit(2);
+            }
+            let mut frame = RelationFrame::new(parts[0], parts[1], parts[2]);
+            if negative {
+                frame = frame.with_polarity(know_prolog::relation_frame::Polarity::Negative);
+            }
+            frame
+        })
+        .collect();
+    let facts = match manager.load_graph_snapshot().await {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("读取知识库失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let reasoner = build_store_reasoner(config, manager, store_path, &facts).await;
+    let parsed = reasoner.joint_parse_result(
+        &source,
+        context,
+        expected_types,
+        predicate,
+        know_prolog::contextual_segmentation::DEFAULT_AMBIGUITY_MARGIN,
+    );
+    let verification = verify_frames(reasoner.schema_view(), &parsed, &expected);
+    if json {
+        let payload = serde_json::json!({
+            "parse": parsed,
+            "verification": verification,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(rendered) => println!("{}", rendered),
+            Err(error) => {
+                eprintln!("联合验证序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", parsed.render_report());
+        println!("{}", verification.render_report());
     }
 }
 
