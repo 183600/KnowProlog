@@ -759,7 +759,7 @@ impl FrameBook {
         );
         book.register(
             FrameSchema::new("去", "move")
-                .with_surfaces(["去", "前往", "到"])
+                .with_surfaces(["去", "前往"])
                 .without_role(Role::Patient)
                 .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
                 .with_role(RoleSpec::new(Role::Goal).required().with_weight(10).with_markers(["到", "去", "往", "向"]))
@@ -783,7 +783,7 @@ impl FrameBook {
         );
         book.register(
             FrameSchema::new("看", "observe")
-                .with_surfaces(["看", "看见", "看了", "观看"])
+                .with_surfaces(["看", "看见", "看了", "观看", "看到", "看到了"])
                 .with_role(RoleSpec::new(Role::Agent).required().with_weight(10))
                 .with_role(RoleSpec::new(Role::Patient).required().with_weight(10))
                 .with_role(RoleSpec::new(Role::Location))

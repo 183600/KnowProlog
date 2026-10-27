@@ -901,6 +901,14 @@ mod tests {
     }
 
     #[test]
+    fn does_not_confuse_kan_dao_with_go() {
+        let frame = repair_frame("张三看到了书");
+        assert_eq!(frame.predicate, "看");
+        assert_eq!(frame.usable(Role::Agent), Some("张三"));
+        assert_eq!(frame.usable(Role::Patient), Some("书"));
+    }
+
+    #[test]
     fn does_not_eat_adjectives_after_predicate() {
         let frame = repair_frame("张三看了好书");
         assert_eq!(frame.usable(Role::Agent), Some("张三"));
