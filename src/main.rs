@@ -14607,6 +14607,8 @@ async fn run_interactive_mode(
         if matches!(&mode, InputMode::Query)
             && !is_command_like(input)
             && !RelationAcquisition::looks_like_question(input)
+            && !acquisition.has_pending_goal()
+            && !shape_dialogue.has_pending()
         {
             match acquisition_context(&oxigraph_manager, &language_config).await {
                 Ok((facts, registry, types, shapes)) => {
