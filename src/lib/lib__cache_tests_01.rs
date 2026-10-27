@@ -1658,6 +1658,27 @@
         assert!(facts.contains("李四 knows 张三"), "{}", facts);
         assert!(facts.contains("[B1-"), "{}", facts);
 
+        let implicit_facts = manager
+            .answer_import_episode_question("这批里张三的关系", &episodes)
+            .await
+            .unwrap()
+            .expect("批次问题应有回答");
+        assert!(implicit_facts.contains("李四 knows 张三"), "{}", implicit_facts);
+
+        let missing_subject = manager
+            .answer_import_episode_question("这批里关于王五有哪些事实", &episodes)
+            .await
+            .unwrap()
+            .expect("批次问题应有回答");
+        assert!(missing_subject.contains("没有找到"), "{}", missing_subject);
+
+        let missing_type = manager
+            .answer_import_episode_question("这批里有哪些公司", &episodes)
+            .await
+            .unwrap()
+            .expect("批次问题应有回答");
+        assert!(missing_type.contains("没有匹配"), "{}", missing_type);
+
         let count = manager
             .answer_import_episode_question("这批有多少条断言", &episodes)
             .await

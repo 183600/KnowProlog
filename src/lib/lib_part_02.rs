@@ -1097,24 +1097,39 @@ impl OxigraphManager {
             return Ok(None);
         };
         let question = crate::import_episode::classify_episode_question(text);
-        match question {
-            crate::import_episode::EpisodeQuestion::TypeEntities(focus) => {
-                if let Some(answer) = self.batch_type_entities_answer(episode, focus).await? {
-                    return Ok(Some(answer));
-                }
-                return Ok(Some(
-                    crate::import_episode::render_episode_missing_type(episode, focus),
-                ));
+        let mentions_scope =
+            text.contains("关于") || text.contains("批里") || text.contains("批中");
+        let wants_subject = matches!(
+            question,
+            crate::import_episode::EpisodeQuestion::SubjectFacts
+        ) || (mentions_scope
+            && matches!(
+                question,
+                crate::import_episode::EpisodeQuestion::Brief
+                    | crate::import_episode::EpisodeQuestion::Types
+                    | crate::import_episode::EpisodeQuestion::Predicates
+                    | crate::import_episode::EpisodeQuestion::TypeEntities(_)
+            ));
+        if wants_subject {
+            if let Some(answer) = self.batch_subject_facts_answer(episode, text).await? {
+                return Ok(Some(answer));
             }
-            crate::import_episode::EpisodeQuestion::SubjectFacts => {
-                if let Some(answer) = self.batch_subject_facts_answer(episode, text).await? {
-                    return Ok(Some(answer));
-                }
-                return Ok(Some(
-                    crate::import_episode::render_episode_missing_subject(episode),
-                ));
+            if matches!(
+                question,
+                crate::import_episode::EpisodeQuestion::SubjectFacts
+            ) {
+                return Ok(Some(crate::import_episode::render_episode_missing_subject(
+                    episode,
+                )));
             }
-            _ => {}
+        }
+        if let crate::import_episode::EpisodeQuestion::TypeEntities(focus) = question {
+            if let Some(answer) = self.batch_type_entities_answer(episode, focus).await? {
+                return Ok(Some(answer));
+            }
+            return Ok(Some(crate::import_episode::render_episode_missing_type(
+                episode, focus,
+            )));
         }
         Ok(Some(crate::import_episode::render_episode_answer(
             episode, question,
@@ -1136,6 +1151,9 @@ impl OxigraphManager {
         let mut by_type: std::collections::BTreeMap<String, BTreeSet<String>> =
             std::collections::BTreeMap::new();
         for quad in &quads {
+            if !matches!(quad.subject, Subject::NamedNode(_)) {
+                continue;
+            }
             let Term::NamedNode(type_node) = &quad.object else {
                 continue;
             };

@@ -561,7 +561,14 @@ impl TypeFocus {
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
             Self::Person => &[
-                "person", "people", "human", "人物", "人员", "哪些人", "几个人", "多少人",
+                "person",
+                "people",
+                "human",
+                "人物",
+                "人员",
+                "哪些人",
+                "几个人",
+                "多少人",
             ],
             Self::Organization => &[
                 "organization",
@@ -574,15 +581,7 @@ impl TypeFocus {
                 "机构",
             ],
             Self::Place => &[
-                "place",
-                "location",
-                "city",
-                "country",
-                "地点",
-                "地方",
-                "城市",
-                "国家",
-                "位置",
+                "place", "location", "city", "country", "地点", "地方", "城市", "国家", "位置",
             ],
             Self::Event => &["event", "事件"],
             Self::Work => &[
@@ -626,7 +625,15 @@ pub fn classify_type_focus(text: &str) -> Option<TypeFocus> {
     let lower = text.to_ascii_lowercase();
     let has = |needles: &[&str]| contains_any(&lower, needles);
     if has(&[
-        "人物", "人员", "哪些人", "几个人", "多少人", "都有谁", "有谁", "person", "people",
+        "人物",
+        "人员",
+        "哪些人",
+        "几个人",
+        "多少人",
+        "都有谁",
+        "有谁",
+        "person",
+        "people",
     ]) {
         Some(TypeFocus::Person)
     } else if has(&[
@@ -640,15 +647,7 @@ pub fn classify_type_focus(text: &str) -> Option<TypeFocus> {
     ]) {
         Some(TypeFocus::Organization)
     } else if has(&[
-        "地点",
-        "地方",
-        "城市",
-        "国家",
-        "位置",
-        "place",
-        "location",
-        "city",
-        "country",
+        "地点", "地方", "城市", "国家", "位置", "place", "location", "city", "country",
     ]) {
         Some(TypeFocus::Place)
     } else if has(&["事件", "event"]) {
@@ -685,20 +684,21 @@ pub fn classify_episode_question(text: &str) -> EpisodeQuestion {
     ]) {
         return EpisodeQuestion::Source;
     }
-    if has(&[
-        "什么时候",
-        "何时",
-        "导入时间",
-        "时间",
-        "日期",
-        "when",
-    ]) {
+    if has(&["什么时候", "何时", "导入时间", "时间", "日期", "when"]) {
         return EpisodeQuestion::Timing;
     }
     if has(&["新增", "重复", "幂等", "added", "duplicate"]) {
         return EpisodeQuestion::Changes;
     }
-    if has(&["多少条", "几条", "总数", "规模", "数量", "count", "how many"]) {
+    if has(&[
+        "多少条",
+        "几条",
+        "总数",
+        "规模",
+        "数量",
+        "count",
+        "how many",
+    ]) {
         return EpisodeQuestion::Count;
     }
     if has(&["类型", "种类", "哪类", "什么类", "type", "kind"]) {
@@ -716,13 +716,18 @@ pub fn classify_episode_question(text: &str) -> EpisodeQuestion {
     if has(&["里的", "中的"]) {
         return EpisodeQuestion::SubjectFacts;
     }
-    if has(&[
-        "样例", "例子", "举例", "示例", "事实", "sample", "example",
-    ]) {
+    if has(&["样例", "例子", "举例", "示例", "事实", "sample", "example"]) {
         return EpisodeQuestion::Samples;
     }
     if has(&[
-        "主体", "实体", "有哪些", "谁", "名单", "列出", "entity", "list",
+        "主体",
+        "实体",
+        "有哪些",
+        "谁",
+        "名单",
+        "列出",
+        "entity",
+        "list",
     ]) {
         return EpisodeQuestion::Subjects;
     }
@@ -1079,10 +1084,7 @@ pub fn render_episode_type_entities(
     entities: &[String],
 ) -> String {
     if total == 0 {
-        return format!(
-            "批次 B{} 没有类型为「{}」的实体。",
-            episode.seq, type_label
-        );
+        return format!("批次 B{} 没有类型为「{}」的实体。", episode.seq, type_label);
     }
     format!(
         "批次 B{} 中类型为「{}」的实体：{}（{}）。",
@@ -1107,8 +1109,15 @@ pub fn render_episode_missing_subject(episode: &ImportEpisode) -> String {
             .join("、")
     };
     format!(
-        "批次 B{} 中没有找到问题提到的实体。本批不同主体 {} 个；按断言数 Top：{}。\n可用「这批有哪些实体」或「批次台账」继续。",
-        episode.seq, episode.gist.distinct_subjects, top
+        "批次 B{} 中没有找到问题提到的实体。本批不同主体 {} 个；按断言数 Top：{}（{}）。\n可用「这批有哪些实体」或「批次台账」继续。",
+        episode.seq,
+        episode.gist.distinct_subjects,
+        top,
+        truncated_note(
+            episode.gist.top_subjects.len(),
+            episode.gist.distinct_subjects,
+            "个"
+        )
     )
 }
 
@@ -1126,10 +1135,15 @@ pub fn render_episode_missing_type(episode: &ImportEpisode, focus: TypeFocus) ->
             .join("、")
     };
     format!(
-        "批次 B{} 的类型分布中没有匹配「{}」的类型。现有类型：{}。",
+        "批次 B{} 的类型分布中没有匹配「{}」的类型。现有类型：{}（{}）。",
         episode.seq,
         focus.label(),
-        distribution
+        distribution,
+        truncated_note(
+            episode.gist.type_counts.len(),
+            episode.gist.distinct_types,
+            "种"
+        )
     )
 }
 
@@ -1230,10 +1244,7 @@ pub fn render_episode_answer(episode: &ImportEpisode, question: EpisodeQuestion)
                     "批次 B{} 来源：{}；格式：{}。",
                     episode.seq, episode.source, episode.format
                 ),
-                format!(
-                    "批次 id：{}；批次图：{}。",
-                    episode.id, episode.batch_graph
-                ),
+                format!("批次 id：{}；批次图：{}。", episode.id, episode.batch_graph),
             ];
             if episode.input_named_graphs > 0 {
                 lines.push(format!(
@@ -1289,7 +1300,7 @@ pub fn render_episode_answer(episode: &ImportEpisode, question: EpisodeQuestion)
         }
         EpisodeQuestion::TypeEntities(focus) => {
             let mut lines = vec![format!(
-                "批次 B{} 的类型分布：{}。",
+                "批次 B{} 的类型分布：{}（{}）。",
                 episode.seq,
                 if episode.gist.distinct_types == 0 {
                     "无".to_string()
@@ -1301,7 +1312,12 @@ pub fn render_episode_answer(episode: &ImportEpisode, question: EpisodeQuestion)
                         .map(|(label, count)| format!("{}×{}", label, count))
                         .collect::<Vec<_>>()
                         .join("、")
-                }
+                },
+                truncated_note(
+                    episode.gist.type_counts.len(),
+                    episode.gist.distinct_types,
+                    "种"
+                )
             )];
             lines.push(format!(
                 "「{}」类实体的完整名单需要批次图查询；可用「批次里的<主体>有哪些事实」查看单实体断言。",
@@ -1581,7 +1597,10 @@ mod tests {
             classify_episode_question("这批有哪些实体"),
             EpisodeQuestion::Subjects
         );
-        assert_eq!(classify_type_focus("这批里的公司"), Some(TypeFocus::Organization));
+        assert_eq!(
+            classify_type_focus("这批里的公司"),
+            Some(TypeFocus::Organization)
+        );
         assert_eq!(classify_type_focus("这批里的地点"), Some(TypeFocus::Place));
         assert_eq!(classify_type_focus("这批讲了什么"), None);
     }
@@ -1626,14 +1645,16 @@ mod tests {
                 object: "张三".to_string(),
             }],
         );
-        assert!(subject_facts.contains("前 1 条 / 共 3 条"), "{}", subject_facts);
+        assert!(
+            subject_facts.contains("前 1 条 / 共 3 条"),
+            "{}",
+            subject_facts
+        );
         assert!(subject_facts.contains("不是全量"), "{}", subject_facts);
-        let entities =
-            render_episode_type_entities(&sample, "Person", 3, &["张三".to_string()]);
+        let entities = render_episode_type_entities(&sample, "Person", 3, &["张三".to_string()]);
         assert!(entities.contains("前 1 个 / 共 3 个"), "{}", entities);
         assert!(render_episode_missing_subject(&sample).contains("没有找到"));
-        assert!(render_episode_missing_type(&sample, TypeFocus::Organization)
-            .contains("没有匹配"));
+        assert!(render_episode_missing_type(&sample, TypeFocus::Organization).contains("没有匹配"));
     }
 
     #[test]
