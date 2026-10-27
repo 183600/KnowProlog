@@ -155,6 +155,7 @@ pub mod similarity_calculator;
 pub mod slot_ledger;
 pub mod soft_route;
 pub mod startup_ledger;
+pub mod streaming_draft;
 pub mod symbolic_generator;
 pub mod symbolic_reasoner;
 pub mod teachable_assertion;
