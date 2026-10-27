@@ -457,6 +457,8 @@ fn interactive_help() -> String {
         "  导入jsonld文件：<路径>              导入 JSON-LD 文件（简写：导入文件：）",
         "  导入jsonld内容：<JSON>              直接导入 JSON-LD 内容（简写：导入内容：）",
         "  导入rdf文件：<路径>                 导入 Turtle/N-Triples/N-Quads/TriG/RDF/XML",
+        "  批次台账 / 导入批次                  查看 RDF 导入情景（批次号、来源、新增/重复）",
+        "  这批简报 / 上一批 / 第2批           按批次线索回指并复述（样例带 [B序号-序号] 引用）",
         "  导出rdf文件：<路径>                 导出默认图（按扩展名，支持 jsonld；简写：导出文件：）",
         "  撤销导入 / 导入回执 / 导入历史       导入回执与可撤销导入栈",
         "  导入帧 / 语言帧 / 帧台账             导入句学到的措辞、问法与原句见证",
@@ -772,6 +774,10 @@ fn is_command_like(input: &str) -> bool {
     if StyleDirective::parse(input).is_some() {
         return true;
     }
+    // 批次线索（这批 / 上一批 / 第 N 批 / 来源文件）走导入情景，不参与短答回填。
+    if know_prolog::import_episode::looks_like_episode_reference(input) {
+        return true;
+    }
     const COMMANDS: &[&str] = &[
         "SPARQL",
         "sparql",
@@ -1001,6 +1007,10 @@ fn is_command_like(input: &str) -> bool {
         "撤销导入",
         "导入回执",
         "导入历史",
+        "批次台账",
+        "导入批次",
+        "批次列表",
+        "批次报告",
         "导入日志",
         "撤销历史",
         "外链",

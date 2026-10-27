@@ -685,7 +685,21 @@ pub fn looks_like_episode_reference(text: &str) -> bool {
     if parse_episode_reference(text).is_some() {
         return true;
     }
-    let lower = text.to_ascii_lowercase();
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "导出",
+        "export",
+        "导入",
+        "import",
+        "sparql",
+        "查询sparql",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+    {
+        return false;
+    }
     [".ttl", ".nt", ".nq", ".trig", ".rdf", ".xml"]
         .iter()
         .any(|extension| lower.contains(extension))

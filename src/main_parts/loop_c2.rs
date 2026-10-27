@@ -1080,15 +1080,27 @@
                         continue;
                     }
                     println!("正在导入 RDF 文件: {}", file_path);
-                    match oxigraph_manager.import_rdf_file(&file_path).await {
-                        Ok(added) => {
-                            println!("RDF 文件导入成功：新增 {} 条三元组！", added);
+                    match oxigraph_manager.import_rdf_file_batch(&file_path).await {
+                        Ok(receipt) => {
+                            println!("RDF 文件导入成功：新增 {} 条三元组！", receipt.added);
+                            println!("{}", receipt.summary());
+                            println!(
+                                "批次 B{}｜id {}｜批次图 {}",
+                                receipt.episode.seq,
+                                receipt.episode.id,
+                                receipt.episode.batch_graph
+                            );
+                            if receipt.episode.blank_nodes {
+                                println!(
+                                    "注意：本批含空白节点；解析器会重命名空白节点，同一文档重复导入可能得到不同批次 id。"
+                                );
+                            }
                             if let Some(chronicle) = chronicle.as_mut() {
                                 let _ = conversation_theory::append_bulk_import(
                                     chronicle,
                                     "RDF",
                                     &file_path,
-                                    added,
+                                    receipt.added,
                                     kb_revision + 1,
                                 );
                             }
@@ -1099,6 +1111,42 @@
                         }
                     }
                 }
+            }
+            println!();
+            continue;
+        }
+
+        // RDF 导入情景：批次台账与按批次线索回指（这批 / 上一批 / 第 N 批 / 来源文件）。
+        if matches!(input, "批次台账" | "导入批次" | "批次列表" | "批次报告") {
+            match oxigraph_manager.load_import_episodes().await {
+                Ok(episodes) => println!(
+                    "{}",
+                    know_prolog::import_episode::render_episode_ledger(&episodes)
+                ),
+                Err(error) => eprintln!("读取导入批次失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+        if know_prolog::import_episode::looks_like_episode_reference(input) {
+            match oxigraph_manager.load_import_episodes().await {
+                Ok(episodes) => {
+                    match know_prolog::import_episode::resolve_episode_reference(input, &episodes) {
+                        Some(episode) => println!(
+                            "{}",
+                            know_prolog::import_episode::render_episode_brief(episode)
+                        ),
+                        None if episodes.is_empty() => {
+                            println!("还没有 RDF 导入批次；没有可用于「这批」的阅读记录。")
+                        }
+                        None => println!(
+                            "没有匹配的批次「{}」。可用「批次台账」查看现有 {} 批。",
+                            input,
+                            episodes.len()
+                        ),
+                    }
+                }
+                Err(error) => eprintln!("读取导入批次失败：{}", error),
             }
             println!();
             continue;

@@ -176,6 +176,15 @@ enum Commands {
         #[arg(long)]
         format: Option<String>,
     },
+    /// Inspect RDF import episode memory: list batches, or show a brief for
+    /// one batch (这批 / 上一批 / 第 N 批 / source file / batch id)
+    Episodes {
+        /// Batch reference; omit to list all recorded batches
+        reference: Option<String>,
+        /// Print JSON instead of the Chinese brief
+        #[arg(long)]
+        json: bool,
+    },
     /// Batch-import natural-language sentences with the explicitly adopted
     /// batch-teaching rules (base extraction rules still run first)
     BatchImport {

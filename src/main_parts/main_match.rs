@@ -71,7 +71,7 @@
                     std::process::exit(1);
                 }
                 oxigraph_manager
-                    .import_rdf_reader(format, content.as_slice())
+                    .import_rdf_batch(format, content.as_slice(), "stdin")
                     .await
             } else {
                 println!("正在导入 RDF 文件: {}", file_path);
@@ -84,17 +84,33 @@
                         }
                     };
                     match std::fs::File::open(&file_path) {
-                        Ok(file) => oxigraph_manager.import_rdf_reader(format, file).await,
+                        Ok(file) => {
+                            oxigraph_manager
+                                .import_rdf_batch(format, file, &file_path)
+                                .await
+                        }
                         Err(error) => Err(error.into()),
                     }
                 } else {
-                    oxigraph_manager.import_rdf_file(&file_path).await
+                    oxigraph_manager.import_rdf_file_batch(&file_path).await
                 }
             };
 
             match import_result {
-                Ok(added) => {
-                    println!("RDF 导入成功：新增 {} 条三元组！", added);
+                Ok(receipt) => {
+                    println!("RDF 导入成功：新增 {} 条三元组！", receipt.added);
+                    println!("{}", receipt.summary());
+                    println!(
+                        "批次 B{}｜id {}｜批次图 {}",
+                        receipt.episode.seq,
+                        receipt.episode.id,
+                        receipt.episode.batch_graph
+                    );
+                    if receipt.episode.blank_nodes {
+                        println!(
+                            "注意：本批含空白节点；解析器会重命名空白节点，同一文档重复导入可能得到不同批次 id。"
+                        );
+                    }
                     if let Err(error) =
                         persist_registry_observations(&oxigraph_manager, &store_path).await
                     {
@@ -105,6 +121,58 @@
                     eprintln!("RDF 导入失败: {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+        Some(Commands::Episodes { reference, json }) => {
+            let episodes = match oxigraph_manager.load_import_episodes().await {
+                Ok(episodes) => episodes,
+                Err(error) => {
+                    eprintln!("读取导入批次失败：{}", error);
+                    std::process::exit(1);
+                }
+            };
+            if let Some(reference) = reference {
+                match know_prolog::import_episode::resolve_episode_reference(
+                    &reference,
+                    &episodes,
+                ) {
+                    Some(episode) => {
+                        if json {
+                            match serde_json::to_string_pretty(episode) {
+                                Ok(text) => println!("{}", text),
+                                Err(error) => {
+                                    eprintln!("JSON 序列化失败：{}", error);
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            println!(
+                                "{}",
+                                know_prolog::import_episode::render_episode_brief(episode)
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "没有匹配的导入批次：{}（可用 episodes 查看当前批次）",
+                            reference
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else if json {
+                match serde_json::to_string_pretty(&episodes) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("JSON 序列化失败：{}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!(
+                    "{}",
+                    know_prolog::import_episode::render_episode_ledger(&episodes)
+                );
             }
         }
         Some(Commands::BatchImport {
