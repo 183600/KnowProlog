@@ -42,6 +42,10 @@ use crate::recovery::{RecoveryNomination, ReframedReading, VerificationOutcome};
 use crate::symbolic_reasoner::SymbolicReasoner;
 use crate::trace_graph::{NodeId, QudKind, ReferentSource, TraceMode, TraceStore, TurnTrace};
 use crate::turn_runtime::{OpenTurn, OpenTurnBook, TurnFault};
+use crate::working_memory::{
+    AttentionBudget, AttentionItem, AttentionKind, AttentionQuery, ContextPacket, WorkingMemory,
+    WORKING_MEMORY_CAPACITY,
+};
 
 /// 一轮话语的语用类型（对话本体的「动作类」）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1168,6 +1172,146 @@ impl DialogueManager {
 
     pub fn focus_stack(&self) -> &[String] {
         &self.focus
+    }
+
+    /// 从既有状态派生工作记忆索引（不复制事实正文，不改变任何状态）。
+    pub fn working_memory(&self) -> WorkingMemory {
+        let mut memory = WorkingMemory::new(WORKING_MEMORY_CAPACITY);
+        let latest_open = self.open_turns.latest().map(|open| open.id);
+        let latest_pending = self
+            .recovery
+            .latest_pending()
+            .map(|pending| pending.receipt_id.clone());
+
+        for turn in &self.turns {
+            let answered = turn.answer_excerpt.is_some();
+            let mut item = AttentionItem::new(
+                format!("turn:{}", turn.index),
+                AttentionKind::Turn,
+                turn.user.clone(),
+            )
+            .recency(turn.index as u64)
+            .trust(if answered { 80 } else { 50 })
+            .open(!answered);
+            if let Some(entity) = &turn.entity {
+                item = item.with_entities([entity.clone()]);
+            }
+            if let Some(attribute) = &turn.attribute {
+                item = item.with_predicates([attribute.clone()]);
+            }
+            memory.push(item);
+        }
+
+        let focus_recency = self.turns.len() as u64;
+        for (index, entity) in self.focus.iter().enumerate() {
+            memory.push(
+                AttentionItem::new(
+                    format!("focus:{}", entity),
+                    AttentionKind::Focus,
+                    entity.clone(),
+                )
+                .with_entities([entity.clone()])
+                .recency(focus_recency.saturating_add(index as u64 + 1))
+                .trust(100)
+                .pinned(true),
+            );
+        }
+
+        for open in self.open_turns.entries() {
+            let pinned = latest_open == Some(open.id);
+            let mut item = AttentionItem::new(
+                format!("open:{}", open.id),
+                AttentionKind::OpenQuestion,
+                open.input.clone(),
+            )
+            .recency(open.turn)
+            .trust(100)
+            .open(true)
+            .pinned(pinned);
+            if let Some(focus) = &open.focus {
+                item = item.with_entities([focus.clone()]);
+            }
+            if let Some(attribute) = &open.attribute {
+                item = item.with_predicates([attribute.clone()]);
+            }
+            memory.push(item);
+        }
+
+        for pending in self.recovery.pending.values() {
+            let pinned = latest_pending.as_deref() == Some(pending.receipt_id.as_str());
+            let mut item = AttentionItem::new(
+                format!("pending:{}", pending.receipt_id),
+                AttentionKind::OpenQuestion,
+                pending.question.clone(),
+            )
+            .recency(pending.created_tick)
+            .trust(90)
+            .open(true)
+            .pinned(pinned);
+            if let Some(entity) = &pending.entity {
+                item = item.with_entities([entity.clone()]);
+            }
+            if let Some(attribute) = &pending.attribute {
+                item = item.with_predicates([attribute.clone()]);
+            }
+            memory.push(item);
+        }
+
+        for fact in &self.recovery.confirmed {
+            memory.push(
+                AttentionItem::new(
+                    format!(
+                        "fact:{}\u{1}{}\u{1}{}",
+                        fact.entity, fact.attribute, fact.value
+                    ),
+                    AttentionKind::SessionFact,
+                    format!("{}的{}是{}", fact.entity, fact.attribute, fact.value),
+                )
+                .with_entities([fact.entity.clone()])
+                .with_predicates([fact.attribute.clone()])
+                .recency(fact.tick)
+                .trust(100),
+            );
+        }
+
+        if let Some(name) = self.identity.current() {
+            memory.push(
+                AttentionItem::new("identity:user", AttentionKind::Identity, name)
+                    .recency(focus_recency.saturating_add(1))
+                    .trust(100),
+            );
+        }
+
+        memory
+    }
+
+    /// 当前轮的上下文包：焦点、谓词与最近的未完成问题共同决定注意力。
+    pub fn context_packet(&self, budget: AttentionBudget) -> ContextPacket {
+        let mut query = AttentionQuery::new()
+            .with_focus(self.focus.iter().cloned())
+            .with_predicates(
+                self.turns
+                    .last()
+                    .and_then(|turn| turn.attribute.clone())
+                    .into_iter(),
+            );
+        if let Some(open) = self.latest_open_turn() {
+            if let Some(attribute) = &open.attribute {
+                query.predicates.push(attribute.clone());
+            }
+            if let Some(focus) = &open.focus {
+                query.goals.push(focus.clone());
+            }
+        }
+        if let Some(pending) = self.recovery.latest_pending() {
+            if let Some(attribute) = &pending.attribute {
+                query.predicates.push(attribute.clone());
+            }
+            if let Some(entity) = &pending.entity {
+                query.goals.push(entity.clone());
+            }
+        }
+        self.working_memory().select(&query, budget)
     }
 
     pub fn last_reply_plan(&self) -> &[String] {
@@ -4874,6 +5018,69 @@ mod tests {
         let recap = manager.recap_text();
         assert!(recap.contains("第 1 轮"), "{}", recap);
         assert!(recap.contains("姚明"), "{}", recap);
+    }
+
+    #[test]
+    fn context_packet_prioritizes_focus_and_open_questions() {
+        let mut manager = DialogueManager::new();
+        manager.note_plugin_turn(
+            "姚明的身高是多少",
+            MoveKind::AskAttribute,
+            Some("姚明"),
+            Some("身高"),
+            "226 厘米",
+            Vec::new(),
+            Vec::new(),
+        );
+        for (input, answer) in [("今天天气怎么样", "不知道"), ("谢谢", "不客气")] {
+            manager.note_plugin_turn(
+                input,
+                MoveKind::Other,
+                None,
+                None,
+                answer,
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        manager.note_plugin_focus("姚\u{200B}明");
+        let fault = crate::turn_runtime::TurnFault::new(
+            crate::turn_runtime::TurnFaultKind::Deadline,
+            crate::turn_runtime::TurnPhase::Reason,
+            "超时",
+            0,
+        );
+        manager.record_open_turn("叶莉的国籍是什么", 9, &fault, Some("叶莉"), Some("国籍"));
+
+        let packet = manager.context_packet(AttentionBudget::default());
+        let focused = packet
+            .items
+            .iter()
+            .find(|item| item.id == "turn:1")
+            .expect("焦点相关旧轮必须进入上下文包");
+        assert!(
+            focused.reasons.contains(&crate::working_memory::AttentionReason::FocusMatch),
+            "{:?}",
+            focused
+        );
+        assert!(
+            packet
+                .items
+                .iter()
+                .any(|item| item.kind == AttentionKind::Focus),
+            "{:?}",
+            packet
+        );
+        let open = packet
+            .items
+            .iter()
+            .find(|item| item.id == "open:1")
+            .expect("未完成问题必须进入上下文包");
+        assert!(open.reasons.contains(&crate::working_memory::AttentionReason::OpenQuestion));
+        assert!(open.reasons.contains(&crate::working_memory::AttentionReason::Pinned));
+        assert!(packet
+            .render_receipt(AttentionBudget::default())
+            .contains("工作记忆"));
     }
 
     #[test]

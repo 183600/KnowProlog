@@ -1825,6 +1825,9 @@ impl ApiState {
                                 "summary": session.manager.summary(),
                                 "policy": session.policy,
                                 "board": session.manager.board().view(session.reasoner.revision()),
+                                "working_memory": session.manager.context_packet(
+                                    crate::working_memory::AttentionBudget::default()
+                                ),
                                 "open_turn": session.manager.latest_open_turn(),
                                 "resumable": session.open_turn_resumable(),
                                 "poisoned": session.poisoned,
@@ -4419,6 +4422,20 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["turns"], 2);
         assert_eq!(value["focus_stack"][0], "姚明");
+        assert_eq!(value["working_memory"]["version"], 1);
+        let packet = value["working_memory"]["items"]
+            .as_array()
+            .expect("快照应包含工作记忆上下文包");
+        assert!(
+            packet.iter().any(|item| item["kind"] == "focus"),
+            "{}",
+            body
+        );
+        assert!(
+            packet.iter().any(|item| item["id"] == "turn:1"),
+            "{}",
+            body
+        );
 
         let (status, _, _) = raw_request(
             addr,

@@ -161,6 +161,7 @@ pub mod type_system;
 pub mod view_render;
 pub mod viewpoint;
 pub mod weak_construction;
+pub mod working_memory;
 
 #[cfg(test)]
 mod dialogue_conformance;
