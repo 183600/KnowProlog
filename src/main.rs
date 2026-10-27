@@ -846,6 +846,9 @@ enum Commands {
     RewriteRetrievalEval {
         /// Corpus file path
         corpus: String,
+        /// Rewrite book path (overrides <store>/rewrite_book.json)
+        #[arg(long)]
+        book: Option<String>,
         /// Exit non-zero when any accepted reading is wrong
         #[arg(long)]
         strict: bool,
@@ -2440,6 +2443,7 @@ async fn main() {
         }
         Some(Commands::RewriteRetrievalEval {
             corpus,
+            book,
             strict,
             json,
         }) => {
@@ -2464,8 +2468,17 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let reasoner =
+            let mut reasoner =
                 build_store_reasoner(config.as_ref(), &oxigraph_manager, &store_path, &facts).await;
+            if let Some(path) = book {
+                match RewriteBook::load_from_path(path) {
+                    Ok(loaded) => reasoner.set_rewrite_book(loaded),
+                    Err(error) => {
+                        eprintln!("读取重写手册失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            }
             let report = rewrite_retrieval::evaluate_with(
                 &cases,
                 &config.reasoning.rewrite_retrieval,
@@ -16926,14 +16939,19 @@ mod session_tests {
             "knowprolog",
             "rewrite-retrieval-eval",
             "corpus.tsv",
+            "--book",
+            "rules.json",
             "--strict",
             "--json",
         ])
         .expect("rewrite-retrieval-eval 参数应可解析");
         assert!(matches!(
             cli.command,
-            Some(Commands::RewriteRetrievalEval { corpus, strict, json })
-                if corpus == "corpus.tsv" && strict && json
+            Some(Commands::RewriteRetrievalEval { corpus, book, strict, json })
+                if corpus == "corpus.tsv"
+                    && book.as_deref() == Some("rules.json")
+                    && strict
+                    && json
         ));
     }
 
