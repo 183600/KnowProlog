@@ -14,7 +14,7 @@
 //! 关键约束与既有软路由一致：
 //!
 //! - 纯符号、无训练参数；所有分数都是可复现的规则分；
-//! - 默认关闭，调用方只在显式启用时使用；
+//! - 出厂 `config.toml` 已启用；库级 `Default` 关闭，调用方可显式关闭；
 //! - 不执行计划、不写知识库；只对候选读法做证据裁决；
 //! - 所有决策都带可打印回执，能逐项复核「为什么选它」。
 
@@ -493,7 +493,8 @@ fn default_partial_discount() -> f64 {
 /// 重写-检索裁决参数。所有阈值都是显式先验，不做在线学习。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RewriteRetrievalConfig {
-    /// 是否允许回答路径使用本模块；默认关闭，关闭时旧路径逐字节不变。
+    /// 是否允许回答路径使用本模块；库级默认关闭，出厂配置已启用。
+    /// 关闭时回答路径与旧行为逐字节一致。
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_max_hypotheses")]

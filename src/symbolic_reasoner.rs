@@ -11213,8 +11213,8 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_anchored(question) {
             return Some(answer);
         }
-        // 最后让多个候选读法用稠密检索证据竞争；默认关闭，且只在精确/
-        // 锚定路径失败后接管，因此不会改变已能确证的旧行为。
+        // 最后让多个候选读法用稠密检索证据竞争；出厂配置启用，且只在
+        // 精确/锚定路径失败后接管，因此不会改变已能确证的旧行为。
         if self.config.rewrite_retrieval.enabled && !rewrite_retrieval_attempted {
             if let Some(answer) = self.answer_rewrite_retrieval(question) {
                 return Some(answer);
