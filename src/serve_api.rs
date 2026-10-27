@@ -34,9 +34,11 @@
 //! - `GET  /`                      服务索引（端点清单）
 //! - `GET  /health`                健康检查
 //! - `GET  /metrics`               会话数 / 轮数 / 性能台账 / 启动分期明细
+//! - `GET  /metrics/semantic`      跨会话语义检索 KPI 聚合（窗口/告警/预算）
 //! - `POST /sessions`              新建会话 → `{"session_id": "s-1"}`
 //! - `GET  /sessions/{id}`         会话快照（焦点栈 / 历史摘要 / 策略）
 //! - `GET  /sessions/{id}/layers`  四层知识容器清单（基础/会话/推测/假设）
+//! - `GET  /sessions/{id}/semantic` 会话级语义检索观测（不含原始问句）
 //! - `GET  /sessions/{id}/export`  导出会话信封（可移植 JSON）
 //! - `POST /sessions/import`       导入会话信封重建会话
 //! - `DELETE /sessions/{id}`       关闭会话

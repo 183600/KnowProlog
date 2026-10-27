@@ -594,6 +594,21 @@ impl WindowMetrics {
         self.assembly_selected.merge(other.assembly_selected);
         self.assembly_empty.merge(other.assembly_empty);
         self.answers_at_least_once |= other.answers_at_least_once;
+        let mode = if self.budget.mode == ControlMode::Control
+            || other.budget.mode == ControlMode::Control
+        {
+            ControlMode::Control
+        } else {
+            ControlMode::Observe
+        };
+        let level = self.budget.level.max(other.budget.level);
+        self.budget = BudgetSnapshot {
+            mode,
+            level,
+            score: self.budget.score.min(other.budget.score),
+            capacity: self.budget.capacity.max(other.budget.capacity),
+        };
+        self.advice = SearchAdvice::from_budget(&BudgetState { level }, mode);
         for (code, count) in &other.codes {
             *self.codes.entry(code.clone()).or_insert(0) += count;
         }
@@ -1363,6 +1378,12 @@ mod tests {
         let second = WindowMetrics {
             observations: 5,
             answered: Ratio::new(2, 5),
+            budget: BudgetSnapshot {
+                mode: ControlMode::Control,
+                level: PressureLevel::Strict,
+                score: 0,
+                capacity: 100,
+            },
             ..WindowMetrics::default()
         };
         let fleet = SemanticFleetMetrics::from_windows(vec![first, second]);
@@ -1373,6 +1394,9 @@ mod tests {
         assert_eq!(fleet.window.answered.bps, Some(6667));
         assert_eq!(fleet.window.codes.get(CODE_ANSWERED), Some(&8));
         assert_eq!(fleet.window.alerts.len(), 1);
+        assert_eq!(fleet.window.budget.level, PressureLevel::Strict);
+        assert_eq!(fleet.window.budget.mode, ControlMode::Control);
+        assert_eq!(fleet.window.advice.max_items, Some(STRICT_MAX_ITEMS));
         assert_eq!(
             fleet.alerting_sessions.get("low_retrieval_recall"),
             Some(&1)
