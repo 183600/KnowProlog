@@ -143,6 +143,7 @@ pub mod rewrite_retrieval;
 pub mod schema_view;
 pub mod semantic_embedding;
 pub mod semantic_engine;
+pub mod semantic_monitor;
 pub mod semantic_entailment;
 pub mod semantic_grammar;
 pub mod serve_api;
