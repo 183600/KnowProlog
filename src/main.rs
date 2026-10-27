@@ -243,6 +243,14 @@ enum Commands {
         /// (blank lines and # comments are ignored)
         #[arg(long, value_name = "PATH")]
         facts_file: Option<String>,
+        /// Read facts from the knowledge store instead of (or in addition to)
+        /// --fact/--facts-file; the store is only opened for this flag
+        #[arg(long)]
+        from_store: bool,
+        /// Keep at most this many store facts (audit summary then covers the
+        /// sampled facts only)
+        #[arg(long, value_name = "N")]
+        max_facts: Option<usize>,
         /// Question text; its interrogative type constrains the replacement
         #[arg(long)]
         question: Option<String>,
@@ -1597,6 +1605,8 @@ async fn main() {
         text,
         fact,
         facts_file,
+        from_store,
+        max_facts,
         question,
         purpose,
         precision,
@@ -1617,6 +1627,9 @@ async fn main() {
             text.as_deref(),
             fact,
             facts_file.as_deref(),
+            *from_store,
+            *max_facts,
+            cli.store.as_deref(),
             question.as_deref(),
             purpose,
             precision,
@@ -1632,7 +1645,8 @@ async fn main() {
             session.as_deref(),
             &cli.config,
             *json,
-        );
+        )
+        .await;
         return;
     }
 
@@ -6111,10 +6125,13 @@ fn run_open_closure(
 
 /// `privacy`：词性类型化的信息流契约。默认影子审计，`--enforce` 才改写。
 #[allow(clippy::too_many_arguments)]
-fn run_privacy(
+async fn run_privacy(
     text: Option<&str>,
     facts: &[String],
     facts_file: Option<&str>,
+    from_store: bool,
+    max_facts: Option<usize>,
+    store_override: Option<&str>,
     question: Option<&str>,
     purpose: &str,
     precision: &str,
@@ -6171,6 +6188,42 @@ fn run_privacy(
             }
         }
     }
+    if from_store {
+        let store_path = match privacy_store_path(config_path, store_override) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(1);
+            }
+        };
+        let manager = match OxigraphManager::new(&store_path) {
+            Ok(manager) => manager,
+            Err(error) => {
+                eprintln!("打开知识存储失败（{}）：{}", store_path, error);
+                std::process::exit(1);
+            }
+        };
+        let refs = match manager.load_fact_refs().await {
+            Ok(refs) => refs,
+            Err(error) => {
+                eprintln!("读取知识存储事实失败（{}）：{}", store_path, error);
+                std::process::exit(1);
+            }
+        };
+        let limit = max_facts.unwrap_or(usize::MAX);
+        let mut seen = parsed_facts.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        let mut imported = 0usize;
+        for fact in refs {
+            if imported >= limit {
+                break;
+            }
+            let key = (fact.subject, fact.predicate, fact.value);
+            if seen.insert(key.clone()) {
+                parsed_facts.push(key);
+                imported += 1;
+            }
+        }
+    }
 
     let text_owned = match text {
         Some("-") => {
@@ -6184,8 +6237,8 @@ fn run_privacy(
         Some(value) => Some(value.to_string()),
         None => None,
     };
-    if text_owned.is_none() && parsed_facts.is_empty() && utterances.is_empty() {
-        eprintln!("请至少提供 --text、--fact \"主语|谓词|宾语\" 或 --utterance");
+    if text_owned.is_none() && parsed_facts.is_empty() && utterances.is_empty() && !from_store {
+        eprintln!("请至少提供 --text、--fact \"主语|谓词|宾语\"、--facts-file、--from-store 或 --utterance");
         std::process::exit(2);
     }
 
@@ -6356,6 +6409,8 @@ fn run_privacy(
             .collect();
         let report = serde_json::json!({
             "mode": policy.mode.code(),
+            "from_store": from_store,
+            "max_facts": max_facts,
             "requested_precision": requested.code(),
             "spans": spans,
             "redaction": redaction,
@@ -6386,6 +6441,9 @@ fn run_privacy(
     }
     if asks_policy {
         println!("{}", policy.render_summary());
+    }
+    if from_store && parsed_facts.is_empty() {
+        println!("知识存储中没有读到可裁决的事实。");
     }
     if text_owned.is_some() {
         if spans.is_empty() {
@@ -6518,6 +6576,20 @@ fn load_privacy_policy(path: &str) -> Result<PrivacyPolicy, String> {
     };
     policy.merge_default_rules();
     Ok(policy)
+}
+
+fn privacy_store_path(
+    config_path: &str,
+    store_override: Option<&str>,
+) -> Result<String, String> {
+    if let Some(path) = store_override {
+        return Ok(path.to_string());
+    }
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|error| format!("读取配置失败（{}）：{}", config_path, error))?;
+    let config = toml::from_str::<SystemConfig>(&content)
+        .map_err(|error| format!("解析配置失败（{}）：{}", config_path, error))?;
+    Ok(config.system.oxigraph_store_path)
 }
 
 fn read_privacy_facts(path: &str) -> Result<Vec<(String, String, String)>, String> {
@@ -17851,6 +17923,64 @@ mod session_tests {
             Cli::try_parse_from(["knowprolog", "snapshot", "--predicate", "age"]).is_err(),
             "--predicate 离开 --subject 应报错"
         );
+    }
+
+    #[test]
+    fn privacy_cli_accepts_store_audit_and_speech_acts() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "privacy",
+            "--from-store",
+            "--max-facts",
+            "12",
+            "--subject",
+            "张三",
+            "--utterance",
+            "别把我的电话告诉别人",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Privacy {
+                from_store,
+                max_facts,
+                subject,
+                utterance,
+                ..
+            }) => {
+                assert!(from_store);
+                assert_eq!(max_facts, Some(12));
+                assert_eq!(subject, "张三");
+                assert_eq!(utterance, vec!["别把我的电话告诉别人".to_string()]);
+            }
+            _ => panic!("应解析为隐私子命令"),
+        }
+    }
+
+    #[test]
+    fn privacy_fact_file_skips_comments_and_reports_bad_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.txt");
+        std::fs::write(
+            &path,
+            "# comment\n\n张三|电话|13800138000\n  李四|地址|北京市  \n",
+        )
+        .unwrap();
+        let facts = read_privacy_facts(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            facts,
+            vec![
+                (
+                    "张三".to_string(),
+                    "电话".to_string(),
+                    "13800138000".to_string()
+                ),
+                ("李四".to_string(), "地址".to_string(), "北京市".to_string()),
+            ]
+        );
+
+        std::fs::write(&path, "只有两个|字段\n").unwrap();
+        let error = read_privacy_facts(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains(":1"), "错误应带行号：{}", error);
     }
 
     #[test]
