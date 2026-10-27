@@ -497,9 +497,15 @@ impl SharedMemoryBoard {
     /// 发布一条声明；同键同值幂等，不同值保留并返回冲突证书。
     pub fn publish(&self, claim: NewClaim) -> Result<PublishOutcome, PublishError> {
         claim.validate()?;
-        let subject_key = TextIdentity::new(&claim.subject).identity().to_string();
-        let predicate_key = TextIdentity::new(&claim.predicate).identity().to_string();
-        let value_key = TextIdentity::new(&claim.value).identity().to_string();
+        // 先按展示上限截断，再派生身份键：否则「前 256 字相同、尾部不同」的
+        // 两个输入会得到相同展示、不同身份键，制造无法解释的幽灵冲突。
+        let subject_display = truncate_chars(&claim.subject, FIELD_TEXT_LIMIT);
+        let predicate_display = truncate_chars(&claim.predicate, FIELD_TEXT_LIMIT);
+        let value_display = truncate_chars(&claim.value, FIELD_TEXT_LIMIT);
+        let source_display = truncate_chars(&claim.source, FIELD_TEXT_LIMIT);
+        let subject_key = TextIdentity::new(&subject_display).identity().to_string();
+        let predicate_key = TextIdentity::new(&predicate_display).identity().to_string();
+        let value_key = TextIdentity::new(&value_display).identity().to_string();
         if subject_key.is_empty() {
             return Err(PublishError::EmptyField { field: "subject" });
         }
@@ -579,13 +585,13 @@ impl SharedMemoryBoard {
                 &value_key,
             ),
             scope: claim.scope.clone(),
-            subject: truncate_chars(&claim.subject, FIELD_TEXT_LIMIT),
+            subject: subject_display,
             subject_key,
-            predicate: truncate_chars(&claim.predicate, FIELD_TEXT_LIMIT),
+            predicate: predicate_display,
             predicate_key,
-            value: truncate_chars(&claim.value, FIELD_TEXT_LIMIT),
+            value: value_display,
             value_key,
-            source: truncate_chars(&claim.source, FIELD_TEXT_LIMIT),
+            source: source_display,
             revision,
         };
         state
@@ -779,10 +785,14 @@ fn view_digest(
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
-    let mut output: String = text.chars().take(limit).collect();
-    if text.chars().count() > limit {
-        output.push('…');
+    if text.chars().count() <= limit {
+        return text.to_string();
     }
+    if limit == 0 {
+        return String::new();
+    }
+    let mut output: String = text.chars().take(limit - 1).collect();
+    output.push('…');
     output
 }
 
@@ -893,6 +903,33 @@ mod tests {
         assert_eq!(duplicate.status(), "duplicate");
         assert_eq!(board.len(), 1);
         assert_eq!(board.evictions(), 0);
+    }
+
+    #[test]
+    fn truncation_happens_before_identity_derivation() {
+        let board = SharedMemoryBoard::new(4);
+        let subject = "甲".repeat(FIELD_TEXT_LIMIT);
+        let value = "值".repeat(FIELD_TEXT_LIMIT);
+        board
+            .publish(NewClaim::global(
+                format!("{}甲", subject),
+                "属性",
+                format!("{}甲", value),
+            ))
+            .unwrap();
+        let outcome = board
+            .publish(NewClaim::global(
+                format!("{}乙", subject),
+                "属性",
+                format!("{}乙", value),
+            ))
+            .unwrap();
+        assert_eq!(outcome.status(), "duplicate");
+        assert_eq!(board.len(), 1);
+        let view = board.snapshot();
+        assert_eq!(view.claims[0].subject.chars().count(), FIELD_TEXT_LIMIT);
+        assert_eq!(view.claims[0].value.chars().count(), FIELD_TEXT_LIMIT);
+        assert_eq!(view.conflict_count(), 0);
     }
 
     #[test]

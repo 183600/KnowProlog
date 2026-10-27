@@ -1285,8 +1285,8 @@ impl DialogueManager {
         memory
     }
 
-    /// 当前轮的上下文包：焦点、谓词与最近的未完成问题共同决定注意力。
-    pub fn context_packet(&self, budget: AttentionBudget) -> ContextPacket {
+    /// 当前轮的注意力查询：焦点 + 最近谓词 + 未完成问题/待补全目标。
+    pub fn attention_query(&self) -> AttentionQuery {
         let mut query = AttentionQuery::new()
             .with_focus(self.focus.iter().cloned())
             .with_predicates(
@@ -1311,7 +1311,26 @@ impl DialogueManager {
                 query.goals.push(entity.clone());
             }
         }
-        self.working_memory().select(&query, budget)
+        query
+    }
+
+    /// 当前轮的上下文包：焦点、谓词与最近的未完成问题共同决定注意力。
+    pub fn context_packet(&self, budget: AttentionBudget) -> ContextPacket {
+        self.context_packet_with(budget, std::iter::empty())
+    }
+
+    /// 在工作记忆之上叠加外部证据（如共享白板声明）后选包；外部项只是索引，
+    /// 不改写会话状态，也不自动升格为图谱事实。
+    pub fn context_packet_with(
+        &self,
+        budget: AttentionBudget,
+        external: impl IntoIterator<Item = AttentionItem>,
+    ) -> ContextPacket {
+        let mut memory = self.working_memory();
+        for item in external {
+            memory.push(item);
+        }
+        memory.select(&self.attention_query(), budget)
     }
 
     pub fn last_reply_plan(&self) -> &[String] {
@@ -5018,6 +5037,34 @@ mod tests {
         let recap = manager.recap_text();
         assert!(recap.contains("第 1 轮"), "{}", recap);
         assert!(recap.contains("姚明"), "{}", recap);
+    }
+
+    #[test]
+    fn context_packet_merges_external_evidence_without_mutating_state() {
+        let mut manager = DialogueManager::new();
+        manager.note_plugin_focus("姚\u{200B}明");
+        let evidence = AttentionItem::new(
+            "shared:claim:1",
+            AttentionKind::Evidence,
+            "姚明的身高是 226cm（来源：seed）",
+        )
+        .with_entities(["姚明"])
+        .with_predicates(["身高"])
+        .trust(65);
+        let packet = manager.context_packet_with(AttentionBudget::default(), [evidence]);
+        let shared = packet
+            .items
+            .iter()
+            .find(|item| item.id == "shared:claim:1")
+            .expect("外部证据必须能进入上下文包");
+        assert!(shared
+            .reasons
+            .contains(&crate::working_memory::AttentionReason::FocusMatch));
+        assert!(!manager
+            .context_packet(AttentionBudget::default())
+            .items
+            .iter()
+            .any(|item| item.id.starts_with("shared:")));
     }
 
     #[test]

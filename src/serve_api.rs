@@ -87,12 +87,16 @@ use crate::reading::{Reading, Residual};
 use crate::recovery::RecoveryMode;
 use crate::schema_view::SchemaView;
 use crate::shared_memory::{
-    MemoryScope, NewClaim, PublishError, SharedMemoryBoard, DEFAULT_MAX_CLAIMS,
+    MemoryScope, NewClaim, PublishError, SharedMemoryBoard, SharedMemoryView,
+    DEFAULT_MAX_CLAIMS,
 };
 use crate::startup_ledger::StartupLedger;
 use crate::symbolic_reasoner::{DialogueSnapshot, SymbolicReasoner};
 use crate::turn_runtime::{
     CancelToken, OpenTurn, TurnBudget, TurnControl, TurnFault, TurnFaultKind, TurnPhase,
+};
+use crate::working_memory::{
+    AttentionBudget, AttentionItem, AttentionKind, WORKING_MEMORY_CAPACITY,
 };
 use crate::{NlpConfig, ReasoningConfig};
 
@@ -1778,6 +1782,7 @@ impl ApiState {
         let plugin = self.plugin.clone();
         let frame_program = self.frame_program.clone();
         let turn_budget = self.turn_budget;
+        let shared_memory = Arc::clone(&self.shared_memory);
         let engine = Arc::new(self.engine_stamp());
         let thread_name = format!("kp-session-{}", id);
         std::thread::Builder::new()
@@ -1824,6 +1829,8 @@ impl ApiState {
                             let _ = reply.send(session.manager.dismiss_open_turn());
                         }
                         SessionCommand::Snapshot { reply } => {
+                            let shared = shared_memory.snapshot_for(&session.id);
+                            let evidence = shared_attention_items(shared.as_ref());
                             let _ = reply.send(serde_json::json!({
                                 "session_id": session.id,
                                 "turns": session.turns,
@@ -1833,9 +1840,16 @@ impl ApiState {
                                 "summary": session.manager.summary(),
                                 "policy": session.policy,
                                 "board": session.manager.board().view(session.reasoner.revision()),
-                                "working_memory": session.manager.context_packet(
-                                    crate::working_memory::AttentionBudget::default()
+                                "working_memory": session.manager.context_packet_with(
+                                    AttentionBudget::default(),
+                                    evidence,
                                 ),
+                                "shared_memory": {
+                                    "revision": shared.revision,
+                                    "claims": shared.claims.len(),
+                                    "conflicts": shared.conflicts.len(),
+                                    "digest": shared.digest,
+                                },
                                 "open_turn": session.manager.latest_open_turn(),
                                 "resumable": session.open_turn_resumable(),
                                 "poisoned": session.poisoned,
@@ -2737,6 +2751,44 @@ async fn handle_events(request: &Request) -> Response {
             "graph": graph,
         }),
     )
+}
+
+/// 把共享白板声明转成低可信度证据索引；冲突中的说法不替用户拍板，进一步降权。
+fn shared_attention_items(view: &SharedMemoryView) -> Vec<AttentionItem> {
+    let conflicted: std::collections::BTreeSet<&str> = view
+        .conflicts
+        .iter()
+        .flat_map(|certificate| certificate.claim_ids.iter().map(String::as_str))
+        .collect();
+    // 只索引最近发布的有界窗口：快照生成绝不随白板容量线性膨胀。
+    let mut recent: Vec<&crate::shared_memory::SharedClaim> = view.claims.iter().collect();
+    recent.sort_by_key(|claim| std::cmp::Reverse(claim.revision));
+    recent.truncate(WORKING_MEMORY_CAPACITY);
+    recent
+        .into_iter()
+        .map(|claim| {
+            let mut text = format!(
+                "{}的{}是{}",
+                claim.subject, claim.predicate, claim.value
+            );
+            if !claim.source.is_empty() {
+                text.push_str(&format!("（来源：{}）", claim.source));
+            }
+            AttentionItem::new(
+                format!("shared:{}", claim.id),
+                AttentionKind::Evidence,
+                text,
+            )
+            .with_entities([claim.subject.clone()])
+            .with_predicates([claim.predicate.clone()])
+            .recency(claim.revision)
+            .trust(if conflicted.contains(claim.id.as_str()) {
+                40
+            } else {
+                65
+            })
+        })
+        .collect()
 }
 
 /// 读取共享语义白板：无会话参数只读全局；指定会话时叠加该会话私有声明。
@@ -4418,6 +4470,37 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["claims"].as_array().unwrap().len(), 3);
         assert!(body.contains("190cm"), "{}", body);
+
+        let (status, _, body) =
+            raw_request(addr, "GET", &format!("/sessions/{}", first), &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["shared_memory"]["claims"], 3);
+        let shared_items: Vec<&serde_json::Value> = value["working_memory"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| {
+                item["id"]
+                    .as_str()
+                    .map(|id| id.starts_with("shared:"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(shared_items.len(), 3, "{}", body);
+        assert!(shared_items.iter().any(|item| {
+            item["entities"]
+                .as_array()
+                .map(|entities| entities.iter().any(|entity| entity == "叶莉"))
+                .unwrap_or(false)
+        }));
+
+        let (status, _, body) =
+            raw_request(addr, "GET", &format!("/sessions/{}", second), &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["shared_memory"]["claims"], 2);
+        assert!(!body.contains("190cm"), "{}", body);
 
         let (status, _, _) = raw_request(
             addr,
