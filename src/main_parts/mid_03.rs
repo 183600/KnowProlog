@@ -40,7 +40,7 @@ fn run_roles(text: Option<&str>, predicate: Option<&str>, json: bool, config_pat
                 .annotate_predicate(input, predicate)
                 .into_iter()
                 .collect(),
-            None => annotator.annotate(input),
+            None => annotator.annotate_sentences(input),
         };
         if frames.is_empty() {
             missing += 1;

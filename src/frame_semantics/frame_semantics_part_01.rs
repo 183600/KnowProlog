@@ -1220,6 +1220,26 @@ impl<'a> FrameAnnotator<'a> {
         vec![frame]
     }
 
+    /// 按句号/问号/感叹号/分号/换行切句后逐句标注，跨度仍指向整段文本。
+    pub fn annotate_sentences(&self, text: &str) -> Vec<FrameInstance> {
+        let mut frames = Vec::new();
+        for (sentence_index, (base, sentence)) in split_sentences(text).into_iter().enumerate() {
+            for mut frame in self.annotate(sentence) {
+                frame.evidence.sentence_index = sentence_index;
+                frame.evidence.start += base;
+                frame.evidence.end += base;
+                for filler in frame.roles.values_mut() {
+                    if let Some((start, end)) = filler.span {
+                        filler.span = Some((start + base, end + base));
+                    }
+                }
+                frame.refresh_id();
+                frames.push(frame);
+            }
+        }
+        frames
+    }
+
     /// 对未登记谓词做同样的格标记分析；谓词按字面最长匹配。
     pub fn annotate_predicate(&self, text: &str, predicate: &str) -> Option<FrameInstance> {
         let predicate = predicate.trim();
@@ -1372,6 +1392,28 @@ impl<'a> FrameAnnotator<'a> {
         frame.refresh_id();
         frame
     }
+}
+
+fn split_sentences(text: &str) -> Vec<(usize, &str)> {
+    let mut sentences = Vec::new();
+    let mut start = 0usize;
+    for (index, character) in text.char_indices() {
+        if matches!(character, '。' | '！' | '？' | '；' | '\n') {
+            let end = index + character.len_utf8();
+            let sentence = &text[start..end];
+            if !sentence.trim().is_empty() {
+                sentences.push((start, sentence));
+            }
+            start = end;
+        }
+    }
+    if start < text.len() {
+        let sentence = &text[start..];
+        if !sentence.trim().is_empty() {
+            sentences.push((start, sentence));
+        }
+    }
+    sentences
 }
 
 /// 渲染带可选组的模板：`[用{instrument}]` 只在角色接地时出现。

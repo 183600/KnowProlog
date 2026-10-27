@@ -876,6 +876,23 @@ mod tests {
     }
 
     #[test]
+    fn annotates_multiple_sentences_with_absolute_spans() {
+        let book = book();
+        let annotator = FrameAnnotator::new(&book);
+        let frames = annotator.annotate_sentences("张三用扳手修好了电脑。李四去北京。");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].evidence.sentence_index, 0);
+        assert_eq!(frames[0].usable(Role::Agent), Some("张三"));
+        assert_eq!(frames[1].evidence.sentence_index, 1);
+        assert_eq!(frames[1].usable(Role::Agent), Some("李四"));
+        assert_eq!(frames[1].usable(Role::Goal), Some("北京"));
+        let first_agent_span = frames[0].roles[&Role::Agent].span.expect("span");
+        assert_eq!(&"张三用扳手修好了电脑。李四去北京。"[first_agent_span.0..first_agent_span.1], "张三");
+        let second_agent_span = frames[1].roles[&Role::Agent].span.expect("span");
+        assert_eq!(&"张三用扳手修好了电脑。李四去北京。"[second_agent_span.0..second_agent_span.1], "李四");
+    }
+
+    #[test]
     fn prefers_predicate_outside_time_word() {
         let frame = repair_frame("张三去年去北京");
         assert_eq!(frame.usable(Role::Agent), Some("张三"));
