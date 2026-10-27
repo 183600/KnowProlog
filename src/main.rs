@@ -67,7 +67,7 @@ use know_prolog::{
     nlp::{normalize_words, preprocess, preprocess_annotated},
     nlu::NLUEngine,
     ontology_reasoning::{parse_ontology_lesson, OntologyProgram},
-    open_closure::{self, OpenClosureSession},
+    open_closure::{self, OpenClosureDialogue, OpenClosureSession, OpenClosureTurn},
     owl_annotation::{
         self, AnnotationLedger, GraphObservation, LedgerLoad as OwlLedgerLoad, ProposalOptions,
         ReviewAction,
@@ -247,6 +247,10 @@ enum Commands {
         /// Retract an observed fact as SUBJECT|PREDICATE|OBJECT (repeatable)
         #[arg(long = "retract", value_name = "S|P|O")]
         retract: Vec<String>,
+        /// Dialogue turn processed in order: statement, question,
+        /// confirmation/rejection, or 「为什么」 (repeatable)
+        #[arg(long = "turn", value_name = "TEXT")]
+        turn: Vec<String>,
         /// Session ledger JSON to load and save (state only; the knowledge
         /// store is never opened or written)
         #[arg(long)]
@@ -1500,6 +1504,7 @@ async fn main() {
         confirm,
         reject,
         retract,
+        turn,
         session,
         max_depth,
         max_nodes,
@@ -1514,6 +1519,7 @@ async fn main() {
             confirm,
             reject,
             retract,
+            turn,
             session.as_deref(),
             *max_depth,
             *max_nodes,
@@ -5787,36 +5793,6 @@ fn run_rewrite_rules(book_path: &str, adopt: &[String], retire: &[String], json:
     }
 }
 
-fn parse_open_fact(text: &str) -> Result<(String, String, String, bool), String> {
-    let trimmed = text.trim();
-    let (negated, body) = match trimmed.strip_prefix('!') {
-        Some(rest) => (true, rest.trim()),
-        None => (false, trimmed),
-    };
-    if body.is_empty() {
-        return Err("事实为空".to_string());
-    }
-    let parts: Vec<&str> = body.split(['|', '｜']).collect();
-    if parts.len() != 3 {
-        return Err(format!(
-            "无法解析事实「{}」；格式应为 SUBJECT|PREDICATE|OBJECT",
-            text
-        ));
-    }
-    let subject = parts[0].trim();
-    let predicate = parts[1].trim();
-    let object = parts[2].trim();
-    if subject.is_empty() || predicate.is_empty() || object.is_empty() {
-        return Err(format!("事实「{}」的主语、谓词或宾语为空", text));
-    }
-    Ok((
-        subject.to_string(),
-        predicate.to_string(),
-        object.to_string(),
-        negated,
-    ))
-}
-
 /// `open-closure`：只操作会话账本，不打开知识存储，也不写律典。
 #[allow(clippy::too_many_arguments)]
 fn run_open_closure(
@@ -5826,6 +5802,7 @@ fn run_open_closure(
     confirm: &[String],
     reject: &[String],
     retract: &[String],
+    turns: &[String],
     session_path: Option<&str>,
     max_depth: usize,
     max_nodes: usize,
@@ -5834,7 +5811,7 @@ fn run_open_closure(
 ) {
     let mut parsed_facts = Vec::new();
     for raw in facts {
-        match parse_open_fact(raw) {
+        match open_closure::parse_fact(raw) {
             Ok(fact) => parsed_facts.push(fact),
             Err(error) => {
                 eprintln!("{}", error);
@@ -5844,7 +5821,7 @@ fn run_open_closure(
     }
     let mut parsed_retractions = Vec::new();
     for raw in retract {
-        match parse_open_fact(raw) {
+        match open_closure::parse_fact(raw) {
             Ok((subject, predicate, object, _)) => {
                 parsed_retractions.push((subject, predicate, object))
             }
@@ -5926,6 +5903,21 @@ fn run_open_closure(
         max_expansions: max_expansions.max(1),
         ..ClosureBudget::default()
     };
+    let mut turn_outputs = Vec::new();
+    if !turns.is_empty() {
+        let mut dialogue = OpenClosureDialogue::from_session(session);
+        for input in turns {
+            let turn = dialogue.process(input, budget);
+            match &turn {
+                OpenClosureTurn::Observed { added, .. } => observed += added,
+                OpenClosureTurn::Confirmed { changed: true, .. } => confirmed += 1,
+                OpenClosureTurn::Rejected { changed: true, .. } => rejected += 1,
+                _ => {}
+            }
+            turn_outputs.push((input.clone(), turn));
+        }
+        session = dialogue.into_session();
+    }
     let mut answers = Vec::new();
     for (subject, predicate) in parsed_queries {
         let answer = session.answer(&subject, &predicate, budget);
@@ -5951,8 +5943,19 @@ fn run_open_closure(
                 })
             })
             .collect();
+        let turn_values: Vec<serde_json::Value> = turn_outputs
+            .iter()
+            .map(|(input, turn)| {
+                serde_json::json!({
+                    "input": input,
+                    "turn": turn,
+                    "text": turn.render_text(),
+                })
+            })
+            .collect();
         let payload = serde_json::json!({
             "session": &session,
+            "turns": turn_values,
             "answers": answer_values,
             "observed": observed,
             "retracted": retracted,
@@ -5972,13 +5975,17 @@ fn run_open_closure(
 
     print!("{}", session.render_text());
     if observed > 0 || retracted > 0 {
-        println!(
-            "本次吸收 {} 条记录，撤回 {} 条记录。",
-            observed, retracted
-        );
+        println!("本次吸收 {} 条记录，撤回 {} 条记录。", observed, retracted);
     }
     if confirmed > 0 || rejected > 0 {
         println!("本次确认 {} 个传递谓词，拒绝 {} 个。", confirmed, rejected);
+    }
+    for (input, turn) in &turn_outputs {
+        println!("\n回合：{}", input);
+        print!("{}", turn.render_text());
+        if !turn.render_text().ends_with('\n') {
+            println!();
+        }
     }
     for (subject, predicate, answer) in &answers {
         println!("\n查询：{}|{}", subject, predicate);

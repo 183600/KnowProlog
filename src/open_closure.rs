@@ -179,11 +179,7 @@ impl InferredTarget {
     fn from_path(path: Vec<String>) -> Self {
         let hops = path.len().saturating_sub(1);
         let target = path.last().cloned().unwrap_or_default();
-        Self {
-            target,
-            path,
-            hops,
-        }
+        Self { target, path, hops }
     }
 
     pub fn render_text(&self) -> String {
@@ -286,10 +282,7 @@ impl OpenClosureAnswer {
             }
         }
         if !self.blocked.is_empty() {
-            output.push_str(&format!(
-                "  被显式否定阻断：{}\n",
-                self.blocked.join("、")
-            ));
+            output.push_str(&format!("  被显式否定阻断：{}\n", self.blocked.join("、")));
         }
         for conflict in &self.conflicts {
             output.push_str(&format!("  冲突：{}\n", conflict));
@@ -321,6 +314,9 @@ pub struct OpenClosureSession {
     hypotheses: BTreeMap<String, PredicateHypothesis>,
     #[serde(default)]
     probes_asked: BTreeSet<String>,
+    /// 最近一次回答留下、尚未裁决的传递性探针。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_probe: Option<String>,
 }
 
 fn default_dialect() -> String {
@@ -340,6 +336,7 @@ impl OpenClosureSession {
             facts: Vec::new(),
             hypotheses: BTreeMap::new(),
             probes_asked: BTreeSet::new(),
+            pending_probe: None,
         }
     }
 
@@ -372,6 +369,10 @@ impl OpenClosureSession {
 
     pub fn probe_was_asked(&self, predicate: &str) -> bool {
         self.probes_asked.contains(predicate.trim())
+    }
+
+    pub fn pending_probe(&self) -> Option<&str> {
+        self.pending_probe.as_deref()
     }
 
     /// 登记一条开放事实；正负事实分开保存，便于把显式否定当反例。
@@ -489,12 +490,16 @@ impl OpenClosureSession {
 
     /// 用户确认某谓词在本会话内可传递。重复确认返回 false。
     pub fn confirm_transitive(&mut self, predicate: &str, reason: &str) -> bool {
-        self.set_hypothesis(predicate, HypothesisStatus::Confirmed, reason)
+        let changed = self.set_hypothesis(predicate, HypothesisStatus::Confirmed, reason);
+        self.clear_pending(predicate);
+        changed
     }
 
     /// 用户拒绝某谓词的传递假设。重复拒绝返回 false。
     pub fn reject_transitive(&mut self, predicate: &str, reason: &str) -> bool {
-        self.set_hypothesis(predicate, HypothesisStatus::Rejected, reason)
+        let changed = self.set_hypothesis(predicate, HypothesisStatus::Rejected, reason);
+        self.clear_pending(predicate);
+        changed
     }
 
     /// 清空假设，回到未确认状态，并允许再次询问。
@@ -502,7 +507,14 @@ impl OpenClosureSession {
         let predicate = predicate.trim();
         let removed = self.hypotheses.remove(predicate).is_some();
         self.probes_asked.remove(predicate);
+        self.clear_pending(predicate);
         removed
+    }
+
+    fn clear_pending(&mut self, predicate: &str) {
+        if self.pending_probe.as_deref() == Some(predicate.trim()) {
+            self.pending_probe = None;
+        }
     }
 
     fn set_hypothesis(&mut self, predicate: &str, status: HypothesisStatus, reason: &str) -> bool {
@@ -541,7 +553,8 @@ impl OpenClosureSession {
         let predicate = predicate.trim().to_string();
         let answer = self.build_answer(&subject, &predicate, budget);
         if answer.probe.is_some() {
-            self.probes_asked.insert(predicate);
+            self.probes_asked.insert(predicate.clone());
+            self.pending_probe = Some(predicate);
         }
         answer
     }
@@ -653,7 +666,8 @@ impl OpenClosureSession {
             let note = if support.is_empty() {
                 "会话中没有可检验的二跳链；缺少直接记录不代表否定。".to_string()
             } else {
-                "该谓词在会话中有二跳链，但本次查询起点没有可延伸路径；缺少直接记录不代表否定。".to_string()
+                "该谓词在会话中有二跳链，但本次查询起点没有可延伸路径；缺少直接记录不代表否定。"
+                    .to_string()
             };
             return OpenClosureAnswer {
                 subject: subject.to_string(),
@@ -855,6 +869,9 @@ impl OpenClosureSession {
             output.push_str("尚无开放事实。\n");
             return output;
         }
+        if let Some(predicate) = &self.pending_probe {
+            output.push_str(&format!("待确认的传递假设：「{}」\n", predicate));
+        }
         output.push_str("谓词：\n");
         for predicate in self.predicates() {
             let status = self.status(&predicate);
@@ -887,7 +904,8 @@ impl OpenClosureSession {
     }
 
     fn sort_facts(&mut self) {
-        self.facts.sort_by(|left, right| left.key().cmp(&right.key()));
+        self.facts
+            .sort_by(|left, right| left.key().cmp(&right.key()));
     }
 
     pub fn to_json(&self) -> String {
@@ -1000,10 +1018,7 @@ pub fn parse_query(text: &str) -> Result<(String, String), String> {
             )
         })
         .trim();
-    let cleaned = cleaned
-        .strip_prefix("查询")
-        .unwrap_or(cleaned)
-        .trim();
+    let cleaned = cleaned.strip_prefix("查询").unwrap_or(cleaned).trim();
 
     const TAILS: [&str; 12] = [
         "分别是谁",
@@ -1072,6 +1087,354 @@ fn validate_query(subject: &str, predicate: &str) -> Result<(String, String), St
     Ok((subject.to_string(), predicate.to_string()))
 }
 
+/// 解析显式事实 `SUBJECT|PREDICATE|OBJECT`；前缀 `!` 表示显式否定。
+pub fn parse_fact(text: &str) -> Result<(String, String, String, bool), String> {
+    let trimmed = text.trim();
+    let (negated, body) = match trimmed.strip_prefix('!') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, trimmed),
+    };
+    if body.is_empty() {
+        return Err("事实为空".to_string());
+    }
+    let parts: Vec<&str> = body.split(['|', '｜']).collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "无法解析事实「{}」；格式应为 SUBJECT|PREDICATE|OBJECT",
+            text
+        ));
+    }
+    let subject = parts[0].trim();
+    let predicate = parts[1].trim();
+    let object = parts[2].trim();
+    if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+        return Err(format!("事实「{}」的主语、谓词或宾语为空", text));
+    }
+    Ok((
+        subject.to_string(),
+        predicate.to_string(),
+        object.to_string(),
+        negated,
+    ))
+}
+
+/// 一轮会话的结果。确认/拒绝只改会话假设，不写知识库。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OpenClosureTurn {
+    Observed { added: usize, total: usize },
+    Answered { answer: OpenClosureAnswer },
+    Confirmed { predicate: String, changed: bool },
+    Rejected { predicate: String, changed: bool },
+    Explained { text: String },
+    Noop { text: String },
+}
+
+impl OpenClosureTurn {
+    pub fn render_text(&self) -> String {
+        match self {
+            OpenClosureTurn::Observed { added, total } => {
+                if *added == 0 {
+                    "没有吸收新的开放事实（已有记录或未抽到关系）。".to_string()
+                } else {
+                    format!("已吸收 {} 条开放事实（会话共 {} 条）。", added, total)
+                }
+            }
+            OpenClosureTurn::Answered { answer } => answer.render_text(),
+            OpenClosureTurn::Confirmed { predicate, changed } => {
+                if *changed {
+                    format!(
+                        "已确认「{}」在本会话可传递；知识库与律典均未修改。",
+                        predicate
+                    )
+                } else {
+                    format!("「{}」已经是确认状态。", predicate)
+                }
+            }
+            OpenClosureTurn::Rejected { predicate, changed } => {
+                if *changed {
+                    format!("已拒绝「{}」的传递假设；后续只返回直接记录。", predicate)
+                } else {
+                    format!("「{}」已经是拒绝状态。", predicate)
+                }
+            }
+            OpenClosureTurn::Explained { text } | OpenClosureTurn::Noop { text } => text.clone(),
+        }
+    }
+}
+
+/// 多轮开放闭包会话：陈述→观察，问句→回答并留下探针，确认/拒绝→改假设。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OpenClosureDialogue {
+    #[serde(default)]
+    session: OpenClosureSession,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_answer: Option<OpenClosureAnswer>,
+}
+
+impl Default for OpenClosureDialogue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenClosureDialogue {
+    pub fn new() -> Self {
+        Self {
+            session: OpenClosureSession::new(),
+            last_answer: None,
+        }
+    }
+
+    pub fn from_session(session: OpenClosureSession) -> Self {
+        Self {
+            session,
+            last_answer: None,
+        }
+    }
+
+    pub fn session(&self) -> &OpenClosureSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut OpenClosureSession {
+        &mut self.session
+    }
+
+    pub fn into_session(self) -> OpenClosureSession {
+        self.session
+    }
+
+    pub fn last_answer(&self) -> Option<&OpenClosureAnswer> {
+        self.last_answer.as_ref()
+    }
+
+    /// 处理一轮输入。决定性优先级：确认/拒绝 → 为什么 → 显式事实 → 问句 → 陈述。
+    pub fn process(&mut self, input: &str, budget: ClosureBudget) -> OpenClosureTurn {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return OpenClosureTurn::Noop {
+                text: "输入为空。".to_string(),
+            };
+        }
+
+        if let Some((confirm, explicit_predicate)) = parse_hypothesis_decision(trimmed) {
+            let predicate =
+                explicit_predicate.or_else(|| self.session.pending_probe().map(str::to_string));
+            let Some(predicate) = predicate else {
+                return OpenClosureTurn::Noop {
+                    text: "没有待确认的谓词；请写成「确认 谓词」或「拒绝 谓词」。".to_string(),
+                };
+            };
+            self.last_answer = None;
+            return if confirm {
+                let changed = self.session.confirm_transitive(&predicate, "对话确认");
+                OpenClosureTurn::Confirmed { predicate, changed }
+            } else {
+                let changed = self.session.reject_transitive(&predicate, "对话拒绝");
+                OpenClosureTurn::Rejected { predicate, changed }
+            };
+        }
+
+        if is_why_question(trimmed) {
+            if let Some(answer) = &self.last_answer {
+                return OpenClosureTurn::Explained {
+                    text: format!("上一次回答的解释：\n{}", answer.render_text()),
+                };
+            }
+            return OpenClosureTurn::Noop {
+                text: "还没有可解释的上一条回答。".to_string(),
+            };
+        }
+
+        if let Ok((subject, predicate, object, negated)) = parse_fact(trimmed) {
+            let added = if negated {
+                self.session
+                    .observe_negative(&subject, &predicate, &object, "对话事实")
+            } else {
+                self.session
+                    .observe_triple(&subject, &predicate, &object, "对话事实")
+            };
+            self.last_answer = None;
+            return OpenClosureTurn::Observed {
+                added: usize::from(added),
+                total: self.session.len(),
+            };
+        }
+
+        if looks_like_question(trimmed) {
+            match parse_query(trimmed) {
+                Ok((subject, predicate)) => {
+                    let answer = self.session.answer(&subject, &predicate, budget);
+                    self.last_answer = Some(answer.clone());
+                    OpenClosureTurn::Answered { answer }
+                }
+                Err(error) => OpenClosureTurn::Noop {
+                    text: format!(
+                        "{}；若想录入事实，请去掉问号或写成 SUBJECT|PREDICATE|OBJECT。",
+                        error
+                    ),
+                },
+            }
+        } else {
+            let added = self.session.observe_text(trimmed);
+            if added > 0 {
+                self.last_answer = None;
+                OpenClosureTurn::Observed {
+                    added,
+                    total: self.session.len(),
+                }
+            } else {
+                OpenClosureTurn::Noop {
+                    text: "没有从这句话中抽取到开放事实；可用 SUBJECT|PREDICATE|OBJECT 显式登记。"
+                        .to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn is_why_question(text: &str) -> bool {
+    let text = text.trim_matches(|ch: char| matches!(ch, '？' | '?' | ' '));
+    text == "为什么" || text == "为何" || text == "为什么这样" || text == "怎么得出"
+}
+
+fn looks_like_question(text: &str) -> bool {
+    if text.contains('?') || text.contains('？') {
+        return true;
+    }
+    if text.contains('|') || text.contains('｜') {
+        let parts = text.split(['|', '｜']).count();
+        return parts == 2;
+    }
+    [
+        "是谁",
+        "有谁",
+        "有哪些",
+        "有那些",
+        "是什么",
+        "多少",
+        "哪个",
+        "哪些",
+        "谁",
+    ]
+    .iter()
+    .any(|suffix| text.ends_with(suffix))
+}
+
+fn parse_hypothesis_decision(text: &str) -> Option<(bool, Option<String>)> {
+    let compact: String = text
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '。' | '！' | '!' | ' ' | '\t' | '\n' | '\r' | ',' | '，'
+            )
+        })
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    if compact.is_empty() {
+        return None;
+    }
+
+    const AFFIRM: [&str; 9] = [
+        "是", "是的", "对", "对的", "好", "好的", "可以", "同意", "确定",
+    ];
+    const REJECT: [&str; 8] = [
+        "不",
+        "不是",
+        "不对",
+        "不可以",
+        "不同意",
+        "拒绝",
+        "否认",
+        "撤回",
+    ];
+    if AFFIRM.contains(&compact.as_str()) {
+        return Some((true, None));
+    }
+    if REJECT.contains(&compact.as_str()) {
+        return Some((false, None));
+    }
+
+    const REJECT_MARKERS: [&str; 5] = ["不可传递", "不能传递", "不是传递", "非传递", "不传递"];
+    for marker in REJECT_MARKERS {
+        if let Some(position) = compact.find(marker) {
+            return Some((false, clean_decision_predicate(&compact[..position])));
+        }
+    }
+
+    for prefix in ["拒绝", "否认", "撤回", "取消"] {
+        if let Some(rest) = compact.strip_prefix(prefix) {
+            return Some((false, clean_decision_predicate(rest)));
+        }
+    }
+    for prefix in ["确认", "采纳", "登记", "假设"] {
+        if let Some(rest) = compact.strip_prefix(prefix) {
+            return Some((true, clean_decision_predicate(rest)));
+        }
+    }
+
+    const CONFIRM_MARKERS: [&str; 5] = ["可传递", "能传递", "是传递的", "是传递关系", "传递关系"];
+    for marker in CONFIRM_MARKERS {
+        if let Some(position) = compact.find(marker) {
+            return Some((true, clean_decision_predicate(&compact[..position])));
+        }
+    }
+    None
+}
+
+fn clean_decision_predicate(raw: &str) -> Option<String> {
+    let mut text = raw.trim();
+    for prefix in [
+        "确认",
+        "采纳",
+        "登记为",
+        "登记",
+        "假设",
+        "拒绝",
+        "否认",
+        "撤回",
+        "取消",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim();
+        }
+    }
+    for suffix in [
+        "作为传递关系",
+        "为传递关系",
+        "是传递关系",
+        "是传递的",
+        "可传递",
+        "能传递",
+        "传递关系",
+        "这个谓词",
+        "该谓词",
+        "谓词",
+    ] {
+        if let Some(rest) = text.strip_suffix(suffix) {
+            text = rest.trim();
+        }
+    }
+    let text = text
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '「' | '」' | '“' | '”' | '"' | '\'' | '`' | ' ' | '\t' | '\n' | '\r'
+            )
+        })
+        .trim_start_matches("把")
+        .trim_start_matches("将")
+        .trim();
+    if text.is_empty() || text.chars().count() > 32 {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,6 +1492,7 @@ mod tests {
         let mut session = session();
         let first = session.answer("张三", "师兄", ClosureBudget::default());
         assert!(first.probe.is_some());
+        assert_eq!(session.pending_probe(), Some("师兄"));
         let second = session.answer("张三", "师兄", ClosureBudget::default());
         assert!(second.probe.is_none());
         assert!(second.render_text().contains("条件答案"));
@@ -1156,10 +1520,7 @@ mod tests {
         let answer = session.peek_answer("张三", "师兄", ClosureBudget::default());
         assert_eq!(answer.kind, OpenAnswerKind::Conditional);
         assert!(answer.blocked.contains(&"王五".to_string()));
-        assert!(answer
-            .inferred
-            .iter()
-            .all(|target| target.target != "王五"));
+        assert!(answer.inferred.iter().all(|target| target.target != "王五"));
         assert!(!answer.conflicts.is_empty());
     }
 
@@ -1265,5 +1626,127 @@ mod tests {
         assert_eq!(restored, session);
         assert_eq!(restored.status("师兄"), HypothesisStatus::Confirmed);
         assert!(restored.probe_was_asked("师兄"));
+    }
+
+    #[test]
+    fn dialogue_turns_conditional_answer_into_confirmed_closure() {
+        let budget = ClosureBudget::default();
+        let mut dialogue = OpenClosureDialogue::new();
+
+        assert!(matches!(
+            dialogue.process("张三是李四的师兄。", budget),
+            OpenClosureTurn::Observed { added: 1, .. }
+        ));
+        assert!(matches!(
+            dialogue.process("李四是王五的师兄。", budget),
+            OpenClosureTurn::Observed { added: 1, .. }
+        ));
+
+        let first = dialogue.process("王五的所有师兄是谁？", budget);
+        match &first {
+            OpenClosureTurn::Answered { answer } => {
+                assert_eq!(answer.kind, OpenAnswerKind::Conditional);
+                assert!(answer.probe.is_some());
+                assert_eq!(
+                    answer
+                        .inferred
+                        .iter()
+                        .map(|target| target.target.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["张三"]
+                );
+            }
+            other => panic!("应得到条件答案：{:?}", other),
+        }
+        assert_eq!(dialogue.session().pending_probe(), Some("师兄"));
+
+        assert!(matches!(
+            dialogue.process("确认师兄", budget),
+            OpenClosureTurn::Confirmed { changed: true, .. }
+        ));
+        let confirmed = dialogue.process("王五的所有师兄是谁？", budget);
+        match confirmed {
+            OpenClosureTurn::Answered { answer } => {
+                assert_eq!(answer.kind, OpenAnswerKind::Confirmed);
+                assert!(answer.probe.is_none());
+                assert_eq!(answer.all_targets(), vec!["张三", "李四"]);
+                assert!(answer.render_text().contains("王五 → 李四 → 张三"));
+            }
+            other => panic!("应得到确认闭包：{:?}", other),
+        }
+
+        match dialogue.process("为什么？", budget) {
+            OpenClosureTurn::Explained { text } => {
+                assert!(text.contains("上一次回答的解释"));
+                assert!(text.contains("王五 → 李四 → 张三"));
+            }
+            other => panic!("应解释上一条回答：{:?}", other),
+        }
+
+        assert!(matches!(
+            dialogue.process("拒绝 师兄", budget),
+            OpenClosureTurn::Rejected { changed: true, .. }
+        ));
+        match dialogue.process("王五的所有师兄是谁？", budget) {
+            OpenClosureTurn::Answered { answer } => {
+                assert_eq!(answer.kind, OpenAnswerKind::Rejected);
+                assert!(answer.inferred.is_empty());
+            }
+            other => panic!("应得到拒绝后的直接记录：{:?}", other),
+        }
+    }
+
+    #[test]
+    fn dialogue_accepts_explicit_facts_and_short_answers() {
+        let budget = ClosureBudget::default();
+        let mut dialogue = OpenClosureDialogue::new();
+        assert!(matches!(
+            dialogue.process("张三|师兄|李四", budget),
+            OpenClosureTurn::Observed { added: 1, .. }
+        ));
+        assert!(matches!(
+            dialogue.process("李四|师兄|王五", budget),
+            OpenClosureTurn::Observed { added: 1, .. }
+        ));
+        assert!(matches!(
+            dialogue.process("张三|师兄", budget),
+            OpenClosureTurn::Answered { .. }
+        ));
+        assert!(matches!(
+            dialogue.process("是的", budget),
+            OpenClosureTurn::Confirmed { changed: true, .. }
+        ));
+        assert_eq!(
+            dialogue.session().status("师兄"),
+            HypothesisStatus::Confirmed
+        );
+        assert!(matches!(
+            dialogue.process("!张三|师兄|王五", budget),
+            OpenClosureTurn::Observed { added: 1, .. }
+        ));
+        let answer = dialogue.session_mut().answer("张三", "师兄", budget);
+        assert_eq!(answer.blocked, vec!["王五"]);
+    }
+
+    #[test]
+    fn decision_parser_understands_confirmations_and_rejections() {
+        assert_eq!(parse_hypothesis_decision("是的"), Some((true, None)));
+        assert_eq!(
+            parse_hypothesis_decision("确认师兄"),
+            Some((true, Some("师兄".into())))
+        );
+        assert_eq!(
+            parse_hypothesis_decision("确认「师兄」可传递"),
+            Some((true, Some("师兄".into())))
+        );
+        assert_eq!(
+            parse_hypothesis_decision("师兄不可传递"),
+            Some((false, Some("师兄".into())))
+        );
+        assert_eq!(
+            parse_hypothesis_decision("拒绝 师兄"),
+            Some((false, Some("师兄".into())))
+        );
+        assert_eq!(parse_hypothesis_decision("张三是李四的师兄"), None);
     }
 }
