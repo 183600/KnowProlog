@@ -1188,12 +1188,32 @@ impl EvalReport {
 pub fn evaluate<C, S>(
     cases: &[EvalCase],
     config: &RewriteRetrievalConfig,
-    mut candidates_for: C,
-    mut search: S,
+    candidates_for: C,
+    search: S,
 ) -> EvalReport
 where
     C: FnMut(&str) -> Vec<HypothesisCandidate>,
     S: FnMut(&str, usize, &SearchConstraints) -> EvidenceSearch,
+{
+    evaluate_with(cases, config, candidates_for, search, |hypothesis| {
+        hypothesis.answer.clone()
+    })
+}
+
+/// 与 [`evaluate`] 相同，但用 `answer_for` 执行选中读法并比较真实答案。
+///
+/// 探针答案可能只是首跳/中间实体；需要评估端到端回答质量时传入执行器。
+pub fn evaluate_with<C, S, A>(
+    cases: &[EvalCase],
+    config: &RewriteRetrievalConfig,
+    mut candidates_for: C,
+    mut search: S,
+    mut answer_for: A,
+) -> EvalReport
+where
+    C: FnMut(&str) -> Vec<HypothesisCandidate>,
+    S: FnMut(&str, usize, &SearchConstraints) -> EvidenceSearch,
+    A: FnMut(&HypothesisAssessment) -> Option<String>,
 {
     let mut report = EvalReport {
         total: cases.len(),
@@ -1209,8 +1229,10 @@ where
         match assessment.decision {
             Decision::Accept => {
                 report.accepted += 1;
-                let correct = assessment
-                    .answer()
+                let selected = assessment.selected_hypothesis();
+                let answer = selected.and_then(|hypothesis| answer_for(hypothesis));
+                let correct = answer
+                    .as_deref()
                     .map(|answer| case.answer_matches(answer))
                     .unwrap_or(false);
                 if correct {
@@ -1218,7 +1240,7 @@ where
                 } else {
                     report.accepted_wrong += 1;
                 }
-                if let Some(hypothesis) = assessment.selected_hypothesis() {
+                if let Some(hypothesis) = selected {
                     let source = hypothesis.candidate.source.label().to_string();
                     let entry = report.by_source.entry(source).or_default();
                     entry.selected += 1;
@@ -1420,6 +1442,23 @@ mod tests {
         assert!((report.coverage() - 0.5).abs() < 1e-9);
         assert!((report.precision() - 1.0).abs() < 1e-9);
         assert!(report.render_text().contains("精确率 1.00"));
+    }
+
+    #[test]
+    fn offline_evaluation_can_execute_selected_plan() {
+        let cases = vec![EvalCase::new("张三的师傅是谁", "李四")];
+        let mut retriever = retriever();
+        let report = evaluate_with(
+            &cases,
+            &RewriteRetrievalConfig::default(),
+            |question| vec![candidate(HypothesisSource::ExactPlan, "张三", "师傅")],
+            |query, k, constraints| retriever.search(query, k, constraints, Default::default()),
+            |_hypothesis| Some("王五".to_string()),
+        );
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.accepted_correct, 0);
+        assert_eq!(report.accepted_wrong, 1);
+        assert!((report.precision() - 0.0).abs() < 1e-9);
     }
 
     #[test]

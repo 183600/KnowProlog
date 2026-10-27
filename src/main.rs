@@ -2466,13 +2466,14 @@ async fn main() {
             };
             let reasoner =
                 build_store_reasoner(config.as_ref(), &oxigraph_manager, &store_path, &facts).await;
-            let report = rewrite_retrieval::evaluate(
+            let report = rewrite_retrieval::evaluate_with(
                 &cases,
                 &config.reasoning.rewrite_retrieval,
                 |question| reasoner.rewrite_retrieval_candidates(question),
                 |query, k, constraints| {
                     reasoner.evidence_search(query, k, constraints, SearchBudget::default())
                 },
+                |hypothesis| reasoner.answer_hypothesis(&hypothesis.candidate),
             );
             if json {
                 match serde_json::to_string_pretty(&report) {

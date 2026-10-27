@@ -11334,6 +11334,11 @@ impl SymbolicReasoner {
             .map(|assessment| assessment.render_report())
     }
 
+    /// 执行一个读法候选，返回最终回答（不写知识库）。
+    pub fn answer_hypothesis(&self, hypothesis: &HypothesisCandidate) -> Option<String> {
+        self.answer_plan(&hypothesis.plan, &hypothesis.question)
+    }
+
     /// 把可执行的候选读法转成会话澄清帧，让下一轮序号选择真正落地。
     fn rewrite_retrieval_clarification(
         &self,
@@ -11349,9 +11354,7 @@ impl SymbolicReasoner {
             if options.len() >= 3 {
                 break;
             }
-            let Some(answer) =
-                self.answer_plan(&hypothesis.candidate.plan, &hypothesis.candidate.question)
-            else {
+            let Some(answer) = self.answer_hypothesis(&hypothesis.candidate) else {
                 continue;
             };
             if Self::is_pending_failure(&answer) {
@@ -11406,8 +11409,7 @@ impl SymbolicReasoner {
         match assessment.decision {
             RewriteRetrievalDecision::Accept => {
                 let selected = assessment.selected_hypothesis()?;
-                let answer =
-                    self.answer_plan(&selected.candidate.plan, &selected.candidate.question)?;
+                let answer = self.answer_hypothesis(&selected.candidate)?;
                 if Self::is_pending_failure(&answer) {
                     return None;
                 }
