@@ -2319,8 +2319,8 @@ impl Request {
                 .unwrap_or(false)
     }
 
-    fn body_text(&self) -> String {
-        String::from_utf8_lossy(&self.body).to_string()
+    fn body_text(&self) -> Result<String, crate::text_identity::Utf8DecodeError> {
+        crate::text_identity::decode_utf8_strict(&self.body).map(str::to_string)
     }
 }
 
@@ -2344,6 +2344,18 @@ impl Response {
     }
 }
 
+fn utf8_body_error(error: crate::text_identity::Utf8DecodeError) -> Response {
+    Response::json(
+        400,
+        &serde_json::json!({
+            "error": format!("请求体不是合法 UTF-8：{}", error),
+            "code": error.code(),
+            "offset": error.offset,
+            "len": error.len,
+        }),
+    )
+}
+
 async fn serve_connection(mut stream: TcpStream, state: Arc<ApiState>) -> std::io::Result<()> {
     let request = match read_request(&mut stream, state.max_body_bytes).await {
         Ok(request) => request,
@@ -2358,7 +2370,14 @@ async fn serve_connection(mut stream: TcpStream, state: Arc<ApiState>) -> std::i
     };
     if request.wants_sse() && request.method == "POST" {
         if let Some(session_id) = turn_route(&request.path) {
-            return stream_turn(&mut stream, &state, &session_id, &request.body_text()).await;
+            let body = match request.body_text() {
+                Ok(body) => body,
+                Err(error) => {
+                    write_response(&mut stream, utf8_body_error(error)).await?;
+                    return Ok(());
+                }
+            };
+            return stream_turn(&mut stream, &state, &session_id, &body).await;
         }
     }
     if request.method == "POST" && request.path == "/v1/chat/completions" {
@@ -2646,7 +2665,11 @@ fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Respons
 /// 请求：`{"text":"...","question":"..."}`；`question` 可省略，省略时只返回事件图。
 /// 事件图按请求现算，不写入会话或默认 RDF 图；N-Quads 需调用 CLI `events --nquads`。
 async fn handle_events(request: &Request) -> Response {
-    let payload: serde_json::Value = match serde_json::from_str(&request.body_text()) {
+    let body = match request.body_text() {
+        Ok(body) => body,
+        Err(error) => return utf8_body_error(error),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
         Ok(value) => value,
         Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
     };
@@ -2765,8 +2788,15 @@ struct ChatRequest {
 }
 
 fn parse_chat_request(request: &Request) -> Result<ChatRequest, String> {
-    let value: serde_json::Value = serde_json::from_slice(&request.body)
-        .map_err(|error| format!("invalid JSON: {}", error))?;
+    let body = request.body_text().map_err(|error| {
+        format!(
+            "请求体不是合法 UTF-8（{}，偏移 {}）",
+            error.code(),
+            error.offset
+        )
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| format!("invalid JSON: {}", error))?;
     let messages = value
         .get("messages")
         .and_then(|messages| messages.as_array())
@@ -3020,7 +3050,13 @@ async fn stream_chat_completion(
 
 /// 轮次请求体：JSON（`input` / `message` / `text` / `prompt`）或纯文本。
 fn parse_turn_input(request: &Request) -> Result<String, String> {
-    let body = request.body_text();
+    let body = request.body_text().map_err(|error| {
+        format!(
+            "请求体不是合法 UTF-8（{}，偏移 {}）",
+            error.code(),
+            error.offset
+        )
+    })?;
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Err("empty body: expected {\"input\": \"...\"} or plain text".to_string());
@@ -4123,6 +4159,40 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(status, 201, "{}", body);
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         value["session_id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_turn_body_is_rejected_with_offset() {
+        let (addr, _server) = start_server(1);
+        let session_id = create_session(addr).await;
+        let body = b"{\"input\":\"\xE5\xBC".to_vec();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let header = format!(
+            "POST /sessions/{}/turns HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            session_id,
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 400"), "{}", head);
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            value["error"].as_str().unwrap().contains("偏移 10"),
+            "{}",
+            value
+        );
+        assert!(!value["error"].as_str().unwrap().contains('�'), "{}", value);
+        assert!(
+            raw_request(addr, "GET", "/metrics", &[], "")
+                .await
+                .2
+                .contains("\"sessions\":1"),
+            "非法请求不得创建会话"
+        );
     }
 
     #[tokio::test]
