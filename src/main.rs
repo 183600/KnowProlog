@@ -837,6 +837,9 @@ enum Commands {
     RewriteRetrieval {
         /// Question to analyse
         question: String,
+        /// Rewrite book path (overrides <store>/rewrite_book.json)
+        #[arg(long)]
+        book: Option<String>,
         /// Print the assessment as JSON
         #[arg(long)]
         json: bool,
@@ -2414,7 +2417,11 @@ async fn main() {
                 println!("{}", search.receipt.render_text());
             }
         }
-        Some(Commands::RewriteRetrieval { question, json }) => {
+        Some(Commands::RewriteRetrieval {
+            question,
+            book,
+            json,
+        }) => {
             let facts = match oxigraph_manager.load_graph_snapshot().await {
                 Ok(facts) => facts,
                 Err(error) => {
@@ -2422,8 +2429,17 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            let reasoner =
+            let mut reasoner =
                 build_store_reasoner(config.as_ref(), &oxigraph_manager, &store_path, &facts).await;
+            if let Some(path) = book {
+                match RewriteBook::load_from_path(path) {
+                    Ok(loaded) => reasoner.set_rewrite_book(loaded),
+                    Err(error) => {
+                        eprintln!("读取重写手册失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            }
             match reasoner.rewrite_retrieval_assessment(&question) {
                 Some(assessment) => {
                     if json {
@@ -16913,13 +16929,17 @@ mod session_tests {
             "knowprolog",
             "rewrite-retrieval",
             "谁的师傅是李四",
+            "--book",
+            "rules.json",
             "--json",
         ])
         .expect("rewrite-retrieval 参数应可解析");
         assert!(matches!(
             cli.command,
-            Some(Commands::RewriteRetrieval { question, json })
-                if question == "谁的师傅是李四" && json
+            Some(Commands::RewriteRetrieval { question, book, json })
+                if question == "谁的师傅是李四"
+                    && book.as_deref() == Some("rules.json")
+                    && json
         ));
     }
 
