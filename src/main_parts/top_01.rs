@@ -230,6 +230,18 @@ enum Commands {
         #[arg(long)]
         clarify: bool,
     },
+    /// Annotate Chinese text with predicate-centered semantic roles and show
+    /// the relation-frame projection plus a reversible realization
+    Roles {
+        /// Sentence to annotate; omit or "-" to read one sentence per line
+        text: Option<String>,
+        /// Predicate literal for sentences whose schema is not registered
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Print JSON records
+        #[arg(long)]
+        json: bool,
+    },
     /// Adjudicate sensitive spans and facts through the POS-typed privacy
     /// flow contract. Audit mode (default) only computes what would happen;
     /// --enforce rewrites/hides values and records the session ledger

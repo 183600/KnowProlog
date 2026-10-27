@@ -214,6 +214,11 @@ async fn run_interactive_mode(
             know_prolog::semantic_grammar::RulePack::from_config(&config),
         );
     }
+    if config.frame_semantics.enabled {
+        symbolic_reasoner.attach_frame_book(
+            know_prolog::frame_semantics::FrameBook::from_config(&config.frame_semantics),
+        );
+    }
     // 跨会话词法记忆：从独立命名图恢复词性证据与量词期待（只作软约束）。
     match oxigraph_manager.load_lexical_memory().await {
         Ok(memory) if !memory.is_empty() => {

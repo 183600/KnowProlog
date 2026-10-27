@@ -266,6 +266,9 @@ pub struct SystemConfig {
     /// 双向语义规则包：同一份规则负责正向抽取与反向实现（默认关闭）。
     #[serde(default)]
     pub semantic_grammar: semantic_grammar::SemanticGrammarConfig,
+    /// 谓词中心语义角色帧：schema 同时驱动角色标注与反向生成（默认关闭）。
+    #[serde(default)]
+    pub frame_semantics: frame_semantics::FrameSemanticsConfig,
 }
 #[derive(Debug, Deserialize, Clone)]
 pub struct SemanticMonitorConfig {

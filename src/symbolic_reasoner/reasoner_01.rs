@@ -410,6 +410,14 @@ impl SymbolicReasoner {
             self.generator.detach_semantic_grammar();
             sync.semantic_grammar = false;
         }
+        if config.frame_semantics.enabled {
+            self.generator
+                .attach_frame_book(crate::frame_semantics::FrameBook::from_config(
+                    &config.frame_semantics,
+                ));
+        } else {
+            self.generator.detach_frame_book();
+        }
 
         self.set_nlp_config(config.nlp.clone());
         sync.nlp_updated = true;
@@ -1052,6 +1060,16 @@ impl SymbolicReasoner {
     /// 挂接导入可逆帧：生成侧复用导入句措辞，回答侧作为最后一道保守回退。
     pub fn attach_import_frames(&mut self, frames: crate::import_frames::ImportFrameLedger) {
         self.generator.attach_import_frames(frames);
+    }
+
+    /// 挂接谓词中心语义角色帧。
+    pub fn attach_frame_book(&mut self, book: crate::frame_semantics::FrameBook) {
+        self.generator.attach_frame_book(book);
+    }
+
+    /// 当前语义角色帧台账（未挂接时为 `None`）。
+    pub fn frame_book(&self) -> Option<&crate::frame_semantics::FrameBook> {
+        self.generator.frame_book()
     }
 
     /// 摘除导入可逆帧（撤销全部导入或热加载关闭时使用）。

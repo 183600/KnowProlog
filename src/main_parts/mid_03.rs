@@ -1,3 +1,92 @@
+fn run_roles(text: Option<&str>, predicate: Option<&str>, json: bool, config_path: &str) {
+    use know_prolog::frame_semantics::{FrameAnnotator, FrameBook, FrameInstance};
+
+    let book = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|raw| toml::from_str::<SystemConfig>(&raw).ok())
+        .filter(|config| config.frame_semantics.enabled)
+        .map(|config| FrameBook::from_config(&config.frame_semantics))
+        .unwrap_or_else(FrameBook::with_core_schemas);
+
+    let inputs: Vec<String> = match text {
+        Some(text) if text != "-" => vec![text.to_string()],
+        _ => {
+            let mut buffer = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut buffer) {
+                eprintln!("读取标准输入失败: {}", error);
+                std::process::exit(1);
+            }
+            buffer
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+    };
+    if inputs.is_empty() {
+        eprintln!("没有输入句子：请提供文本参数，或从标准输入逐行输入。");
+        std::process::exit(1);
+    }
+
+    let annotator = FrameAnnotator::new(&book);
+    let mut records = Vec::new();
+    let mut missing = 0usize;
+    for input in &inputs {
+        let frames: Vec<FrameInstance> = match predicate {
+            Some(predicate) => annotator
+                .annotate_predicate(input, predicate)
+                .into_iter()
+                .collect(),
+            None => annotator.annotate(input),
+        };
+        if frames.is_empty() {
+            missing += 1;
+            if !json {
+                eprintln!("未识别谓词：{}（可用 --predicate 指定）", input);
+            }
+            continue;
+        }
+        for frame in frames {
+            let projection = frame.project();
+            let realized = book.realize(&frame);
+            if json {
+                records.push(serde_json::json!({
+                    "text": input,
+                    "frame": frame,
+                    "projection": projection,
+                    "realized": realized,
+                }));
+            } else {
+                println!("输入：{}", input);
+                println!("角色：{}", frame.render_roles());
+                match &projection {
+                    Some(projection) => println!("投影：{}", projection.render_text()),
+                    None => println!("投影：核心角色不足，未生成三元组"),
+                }
+                match &realized {
+                    Some(text) => println!("回译：{}", text),
+                    None => println!("回译：没有匹配的可逆模板"),
+                }
+                println!();
+            }
+        }
+    }
+
+    if json {
+        match serde_json::to_string_pretty(&records) {
+            Ok(rendered) => println!("{}", rendered),
+            Err(error) => {
+                eprintln!("语义角色帧序列化失败: {}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+    if missing == inputs.len() {
+        std::process::exit(1);
+    }
+}
+
 async fn run_joint_generate(
     config: &know_prolog::SystemConfig,
     manager: &OxigraphManager,
@@ -1393,6 +1482,11 @@ async fn build_store_reasoner(
     if config.semantic_grammar.enabled {
         reasoner
             .attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(config));
+    }
+    if config.frame_semantics.enabled {
+        reasoner.attach_frame_book(know_prolog::frame_semantics::FrameBook::from_config(
+            &config.frame_semantics,
+        ));
     }
     if let Ok(memory) = oxigraph_manager.load_lexical_memory().await {
         if !memory.is_empty() {

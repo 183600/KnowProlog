@@ -150,6 +150,17 @@ async fn main() {
         return;
     }
 
+    // 语义角色帧完全离线：配置里的 schema 优先，缺省使用内置核心种子。
+    if let Some(Commands::Roles {
+        text,
+        predicate,
+        json,
+    }) = &cli.command
+    {
+        run_roles(text.as_deref(), predicate.as_deref(), *json, &cli.config);
+        return;
+    }
+
     // 隐私裁决完全离线：只读策略/会话台账，不打开知识存储。
     if let Some(Commands::Privacy {
         text,

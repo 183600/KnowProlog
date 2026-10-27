@@ -742,6 +742,41 @@ mod tests {
     }
 
     #[test]
+    fn compiles_book_from_toml_config() {
+        let config: super::FrameSemanticsConfig = toml::from_str(
+            r#"
+            enabled = true
+            [[schemas]]
+            predicate = "修"
+            sense = "repair"
+            surfaces = ["修", "修好"]
+            realize = "{agent}用{instrument}修好了{patient}"
+            status = "active"
+            [[schemas.roles]]
+            role = "agent"
+            required = true
+            [[schemas.roles]]
+            role = "instrument"
+            required = true
+            markers = ["用"]
+            [[schemas.roles]]
+            role = "patient"
+            required = true
+            "#,
+        )
+        .expect("config");
+        let book = config.book();
+        assert_eq!(book.len(), 1);
+        let annotator = FrameAnnotator::new(&book);
+        let frame = annotator.annotate("张三用扳手修好了电脑").pop().expect("frame");
+        assert_eq!(frame.usable(Role::Instrument), Some("扳手"));
+        assert_eq!(
+            book.realize(&frame).as_deref(),
+            Some("张三用扳手修好了电脑")
+        );
+    }
+
+    #[test]
     fn roles_have_stable_labels() {
         assert_eq!(Role::parse("agent"), Some(Role::Agent));
         assert_eq!(Role::parse("施事"), Some(Role::Agent));

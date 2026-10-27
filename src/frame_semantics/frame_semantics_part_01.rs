@@ -268,6 +268,12 @@ pub enum SchemaStatus {
     Retired,
 }
 
+impl Default for SchemaStatus {
+    fn default() -> Self {
+        SchemaStatus::Candidate
+    }
+}
+
 impl SchemaStatus {
     pub fn label_zh(self) -> &'static str {
         match self {
@@ -645,6 +651,63 @@ impl FrameInstance {
     }
 }
 
+/// config.toml 的 `[frame_semantics]` 段；默认关闭。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct FrameSemanticsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub schemas: Vec<FrameSchemaConfig>,
+}
+
+/// 一条可配置的 schema 声明。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct FrameSchemaConfig {
+    #[serde(default)]
+    pub predicate: String,
+    #[serde(default)]
+    pub sense: String,
+    #[serde(default)]
+    pub surfaces: Vec<String>,
+    #[serde(default)]
+    pub roles: Vec<RoleSpec>,
+    #[serde(default)]
+    pub realize: Option<String>,
+    #[serde(default)]
+    pub status: SchemaStatus,
+    #[serde(default)]
+    pub support: usize,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl FrameSchemaConfig {
+    pub fn compile(&self) -> FrameSchema {
+        let mut schema = FrameSchema::new(self.predicate.clone(), self.sense.clone());
+        if !self.surfaces.is_empty() {
+            schema.surfaces = self.surfaces.clone();
+        }
+        if !self.roles.is_empty() {
+            schema.roles = self.roles.clone();
+            schema.roles.sort_by_key(|spec| spec.role);
+        }
+        schema.realize = self.realize.clone();
+        schema.status = self.status;
+        schema.support = self.support;
+        if let Some(source) = &self.source {
+            schema.sources = vec![source.clone()];
+        }
+        schema.refresh_id();
+        schema
+    }
+}
+
+impl FrameSemanticsConfig {
+    pub fn book(&self) -> FrameBook {
+        FrameBook::from_config(self)
+    }
+}
+
 /// 角色 schema 的注册表。默认不激活任何 schema，内置种子需显式装入。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FrameBook {
@@ -708,6 +771,19 @@ impl FrameBook {
                 .with_source("内置种子")
                 .activate(),
         );
+        book
+    }
+
+    /// 从配置编译：显式声明优先；没有声明时使用内置核心种子。
+    pub fn from_config(config: &FrameSemanticsConfig) -> Self {
+        let mut book = if config.schemas.is_empty() {
+            Self::with_core_schemas()
+        } else {
+            Self::new()
+        };
+        for schema in &config.schemas {
+            book.register(schema.compile());
+        }
         book
     }
 
