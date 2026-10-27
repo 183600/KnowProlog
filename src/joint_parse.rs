@@ -111,10 +111,18 @@ impl JointContext {
     }
 
     /// 把解析结果回写为下一轮种子：焦点实体、类型证据、最高置信谓词。
+    /// 只回写没有硬冲突的帧，避免类型互斥/未对齐的坏帧污染下一轮语境。
     pub fn observe_parse(&mut self, frames: &[JointFrame]) {
+        let healthy: Vec<&JointFrame> = frames
+            .iter()
+            .filter(|frame| !frame.is_hard_failure())
+            .collect();
+        if healthy.is_empty() {
+            return;
+        }
         let mut entities = Vec::new();
         let mut types = Vec::new();
-        for frame in frames {
+        for frame in &healthy {
             entities.push(frame.subject.canonical.clone());
             entities.push(frame.object.canonical.clone());
             types.extend(frame.subject_types.iter().cloned());
@@ -122,7 +130,7 @@ impl JointContext {
         }
         self.observe_focus(&entities);
         self.observe_types(&types);
-        if let Some(frame) = frames.iter().max_by(|left, right| {
+        if let Some(frame) = healthy.iter().max_by(|left, right| {
             left.original
                 .confidence
                 .total_cmp(&right.original.confidence)
@@ -1801,6 +1809,7 @@ mod tests {
         assert_eq!(frame.overall_verdict, TypeVerdict::Disjoint);
         assert!(!frame.conflicts.is_empty());
         assert!(!parse.converged);
+        assert!(parse.context.focus_entities.is_empty());
     }
 
     #[test]
