@@ -287,11 +287,11 @@ fn local_name(iri: &str) -> Option<String> {
     crate::identity::local_name(BASE_NS, iri)
 }
 
-fn display_named_node(node: &NamedNode) -> String {
+pub fn display_named_node(node: &NamedNode) -> String {
     local_name(node.as_str()).unwrap_or_else(|| node.as_str().to_string())
 }
 
-fn display_subject(subject: &Subject) -> String {
+pub fn display_subject(subject: &Subject) -> String {
     match subject {
         Subject::NamedNode(node) => display_named_node(node),
         Subject::BlankNode(node) => format!("_:{}", node.as_str()),
@@ -299,12 +299,21 @@ fn display_subject(subject: &Subject) -> String {
     }
 }
 
-fn display_term(term: &Term) -> String {
+pub fn display_term(term: &Term) -> String {
     match term {
         Term::NamedNode(node) => display_named_node(node),
         Term::BlankNode(node) => format!("_:{}", node.as_str()),
         Term::Literal(literal) => literal.value().to_string(),
         Term::Triple(triple) => format!("<<{}>>", triple),
+    }
+}
+
+/// 把四元组转成可展示、可引用的样例事实（不参与内容哈希）。
+pub fn gist_fact(quad: &Quad) -> GistFact {
+    GistFact {
+        subject: display_subject(&quad.subject),
+        predicate: display_named_node(&quad.predicate),
+        object: display_term(&quad.object),
     }
 }
 
@@ -524,6 +533,185 @@ pub fn parse_episode_graph(quads: impl Iterator<Item = Quad>) -> Vec<ImportEpiso
     });
     episodes.dedup_by(|left, right| left.id == right.id);
     episodes
+}
+
+/// 批次问题里的类型焦点：把常见中文问法映射到类型标签的别名集合。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeFocus {
+    Person,
+    Organization,
+    Place,
+    Event,
+    Work,
+}
+
+impl TypeFocus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Person => "人物",
+            Self::Organization => "组织",
+            Self::Place => "地点",
+            Self::Event => "事件",
+            Self::Work => "作品",
+        }
+    }
+
+    pub fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Person => &["person", "people", "human", "人物", "人员"],
+            Self::Organization => &[
+                "organization",
+                "organisation",
+                "company",
+                "org",
+                "公司",
+                "企业",
+                "组织",
+                "机构",
+            ],
+            Self::Place => &[
+                "place",
+                "location",
+                "city",
+                "country",
+                "地点",
+                "地方",
+                "城市",
+                "国家",
+                "位置",
+            ],
+            Self::Event => &["event", "事件"],
+            Self::Work => &[
+                "work", "book", "film", "movie", "song", "作品", "书籍", "电影", "歌曲",
+            ],
+        }
+    }
+}
+
+/// 批次问题意图；只描述问法，不读取存储。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpisodeQuestion {
+    Brief,
+    Count,
+    Types,
+    Predicates,
+    Subjects,
+    Source,
+    Timing,
+    Changes,
+    Samples,
+    TypeEntities(TypeFocus),
+    SubjectFacts,
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+/// 识别问题里的类型焦点（人物 / 组织 / 地点 / 事件 / 作品）。
+pub fn classify_type_focus(text: &str) -> Option<TypeFocus> {
+    let lower = text.to_ascii_lowercase();
+    let has = |needles: &[&str]| contains_any(&lower, needles);
+    if has(&["人物", "人员", "都有谁", "有谁", "person", "people"]) {
+        Some(TypeFocus::Person)
+    } else if has(&[
+        "公司",
+        "企业",
+        "组织",
+        "机构",
+        "organization",
+        "organisation",
+        "company",
+    ]) {
+        Some(TypeFocus::Organization)
+    } else if has(&[
+        "地点",
+        "地方",
+        "城市",
+        "国家",
+        "位置",
+        "place",
+        "location",
+        "city",
+        "country",
+    ]) {
+        Some(TypeFocus::Place)
+    } else if has(&["事件", "event"]) {
+        Some(TypeFocus::Event)
+    } else if has(&[
+        "作品", "书籍", "电影", "歌曲", "work", "book", "film", "movie", "song",
+    ]) {
+        Some(TypeFocus::Work)
+    } else {
+        None
+    }
+}
+
+/// 只按问法给批次问题分流；是否真的存在批次仍由调用方解析。
+///
+/// 顺序刻意固定：来源/时间/计数/类型等聚合问题优先于主体查询，避免
+/// 「这批里有哪些人物」被误当成某个实体的事实查询。
+pub fn classify_episode_question(text: &str) -> EpisodeQuestion {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return EpisodeQuestion::Brief;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let has = |needles: &[&str]| contains_any(&lower, needles);
+
+    if has(&[
+        "来源",
+        "哪个文件",
+        "什么文件",
+        "文件名",
+        "从哪",
+        "路径",
+        "source",
+    ]) {
+        return EpisodeQuestion::Source;
+    }
+    if has(&[
+        "什么时候",
+        "何时",
+        "导入时间",
+        "时间",
+        "日期",
+        "when",
+    ]) {
+        return EpisodeQuestion::Timing;
+    }
+    if has(&["新增", "重复", "幂等", "added", "duplicate"]) {
+        return EpisodeQuestion::Changes;
+    }
+    if has(&["多少条", "几条", "总数", "规模", "数量", "count", "how many"]) {
+        return EpisodeQuestion::Count;
+    }
+    if has(&["类型", "种类", "哪类", "什么类", "type", "kind"]) {
+        return EpisodeQuestion::Types;
+    }
+    if let Some(focus) = classify_type_focus(trimmed) {
+        return EpisodeQuestion::TypeEntities(focus);
+    }
+    if has(&["关于"]) {
+        return EpisodeQuestion::SubjectFacts;
+    }
+    if has(&["关系", "属性", "边", "predicate", "relation", "property"]) {
+        return EpisodeQuestion::Predicates;
+    }
+    if has(&["里的", "中的"]) {
+        return EpisodeQuestion::SubjectFacts;
+    }
+    if has(&[
+        "样例", "例子", "举例", "示例", "事实", "sample", "example",
+    ]) {
+        return EpisodeQuestion::Samples;
+    }
+    if has(&[
+        "主体", "实体", "有哪些", "谁", "名单", "列出", "entity", "list",
+    ]) {
+        return EpisodeQuestion::Subjects;
+    }
+    EpisodeQuestion::Brief
 }
 
 /// 批次引用：只在问题出现批次线索时使用，避免普通问题被最近导入偏置。
@@ -868,6 +1056,238 @@ pub fn render_episode_brief(episode: &ImportEpisode) -> String {
     lines.join("\n")
 }
 
+/// 批次内某类实体的有界列表（总数由调用方从批次图统计）。
+pub fn render_episode_type_entities(
+    episode: &ImportEpisode,
+    type_label: &str,
+    total: usize,
+    entities: &[String],
+) -> String {
+    if total == 0 {
+        return format!(
+            "批次 B{} 没有类型为「{}」的实体。",
+            episode.seq, type_label
+        );
+    }
+    format!(
+        "批次 B{} 中类型为「{}」的实体：{}（{}）。",
+        episode.seq,
+        type_label,
+        entities.join("、"),
+        truncated_note(entities.len(), total, "个")
+    )
+}
+
+/// 批次内某个主体的出入边（总数由调用方从批次图统计，样例有界）。
+pub fn render_episode_subject_facts(
+    episode: &ImportEpisode,
+    subject: &str,
+    total: usize,
+    facts: &[GistFact],
+) -> String {
+    let mut lines = vec![format!(
+        "批次 B{} 中与「{}」相关的断言（{}）：",
+        episode.seq,
+        subject,
+        truncated_note(facts.len(), total, "条")
+    )];
+    for (index, fact) in facts.iter().enumerate() {
+        lines.push(format!(
+            "  [B{}-{}] {}",
+            episode.seq,
+            index + 1,
+            fact.line()
+        ));
+    }
+    if facts.len() < total {
+        lines.push("以上为截断结果，不是全量；完整断言可用批次图查询。".to_string());
+    }
+    lines.join("\n")
+}
+
+/// 按问题意图生成批次回答；所有数字来自 episode，列表截断时显式说明。
+pub fn render_episode_answer(episode: &ImportEpisode, question: EpisodeQuestion) -> String {
+    match question {
+        EpisodeQuestion::Brief => {
+            let mut text = render_episode_brief(episode);
+            text.push_str(
+                "\n可继续问：这批有多少条断言？这批有哪些类型？这批有哪些人物？这批的来源是什么？",
+            );
+            text
+        }
+        EpisodeQuestion::Count => format!(
+            "批次 B{} 共 {} 条断言：不同主体 {} 个，不同谓词 {} 个，不同类型 {} 个。",
+            episode.seq,
+            episode.total,
+            episode.gist.distinct_subjects,
+            episode.gist.distinct_predicates,
+            episode.gist.distinct_types
+        ),
+        EpisodeQuestion::Types => {
+            if episode.gist.distinct_types == 0 {
+                format!("批次 B{} 没有 rdf:type 断言。", episode.seq)
+            } else {
+                render_counter_list(
+                    &format!("批次 B{} 类型分布", episode.seq),
+                    &episode.gist.type_counts,
+                    episode.gist.distinct_types,
+                )
+            }
+        }
+        EpisodeQuestion::Predicates => {
+            if episode.gist.distinct_predicates == 0 {
+                format!("批次 B{} 没有可陈述的谓词。", episode.seq)
+            } else {
+                render_counter_list(
+                    &format!("批次 B{} 谓词分布", episode.seq),
+                    &episode.gist.predicate_counts,
+                    episode.gist.distinct_predicates,
+                )
+            }
+        }
+        EpisodeQuestion::Subjects => {
+            if episode.gist.top_subjects.is_empty() {
+                format!("批次 B{} 没有可列出的主体。", episode.seq)
+            } else {
+                let body = episode
+                    .gist
+                    .top_subjects
+                    .iter()
+                    .map(|(label, count)| format!("{}（{} 条）", label, count))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                format!(
+                    "批次 B{} 不同主体 {} 个；按断言数 Top：{}（{}）。",
+                    episode.seq,
+                    episode.gist.distinct_subjects,
+                    body,
+                    truncated_note(
+                        episode.gist.top_subjects.len(),
+                        episode.gist.distinct_subjects,
+                        "个"
+                    )
+                )
+            }
+        }
+        EpisodeQuestion::Source => {
+            let mut lines = vec![
+                format!(
+                    "批次 B{} 来源：{}；格式：{}。",
+                    episode.seq, episode.source, episode.format
+                ),
+                format!(
+                    "批次 id：{}；批次图：{}。",
+                    episode.id, episode.batch_graph
+                ),
+            ];
+            if episode.input_named_graphs > 0 {
+                lines.push(format!(
+                    "输入含 {} 个命名图，落库时已按既有语义压平。",
+                    episode.input_named_graphs
+                ));
+            }
+            if episode.blank_nodes {
+                lines.push(
+                    "注意：本批含空白节点；解析器会重命名空白节点，同一文档重复导入可能得到不同批次 id。"
+                        .to_string(),
+                );
+            }
+            lines.join("\n")
+        }
+        EpisodeQuestion::Timing => format!(
+            "批次 B{} 导入时间：{}（Unix {} 秒）。",
+            episode.seq,
+            format_unix_seconds(episode.imported_at),
+            episode.imported_at
+        ),
+        EpisodeQuestion::Changes => {
+            let mut text = format!(
+                "批次 B{} 共 {} 条断言；首次导入新增 {} 条，重复 {} 条。",
+                episode.seq, episode.total, episode.added, episode.duplicates
+            );
+            if episode.blank_nodes {
+                text.push_str("\n注意：本批含空白节点，重复导入的幂等性可能受影响。");
+            }
+            text
+        }
+        EpisodeQuestion::Samples => {
+            let mut lines = vec![format!(
+                "批次 B{} 样例（{}）：",
+                episode.seq,
+                truncated_note(episode.gist.samples.len(), episode.total, "条断言")
+            )];
+            if episode.gist.samples.is_empty() {
+                lines.push("本批没有可展示的样例断言。".to_string());
+            }
+            for (index, sample) in episode.gist.samples.iter().enumerate() {
+                lines.push(format!(
+                    "  [B{}-{}] {}",
+                    episode.seq,
+                    index + 1,
+                    sample.line()
+                ));
+            }
+            if episode.gist.samples.len() < episode.total {
+                lines.push("以上只是样例，不是全量；完整断言可用批次图查询。".to_string());
+            }
+            lines.join("\n")
+        }
+        EpisodeQuestion::TypeEntities(focus) => {
+            let mut lines = vec![format!(
+                "批次 B{} 的类型分布：{}。",
+                episode.seq,
+                if episode.gist.distinct_types == 0 {
+                    "无".to_string()
+                } else {
+                    episode
+                        .gist
+                        .type_counts
+                        .iter()
+                        .map(|(label, count)| format!("{}×{}", label, count))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                }
+            )];
+            lines.push(format!(
+                "「{}」类实体的完整名单需要批次图查询；可用「批次里的<主体>有哪些事实」查看单实体断言。",
+                focus.label()
+            ));
+            lines.join("\n")
+        }
+        EpisodeQuestion::SubjectFacts => format!(
+            "批次 B{} 没有指定主体；可用「这批里的<主体>有哪些事实」查询具体断言。\n{}",
+            episode.seq,
+            render_episode_brief(episode)
+        ),
+    }
+}
+
+/// 把 Unix 秒格式化为 UTC 时间（无第三方日期库依赖）。
+pub fn format_unix_seconds(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let remainder = seconds % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        year,
+        month,
+        day,
+        remainder / 3_600,
+        (remainder % 3_600) / 60,
+        remainder % 60
+    )
+}
+
 /// 批次台账：按 seq 升序；超过上限时只展示最近 N 批并说明总数。
 pub fn render_episode_ledger(episodes: &[ImportEpisode]) -> String {
     if episodes.is_empty() {
@@ -1058,5 +1478,116 @@ mod tests {
         assert!(rendered.contains("仅显示最近 50 批"));
         assert!(rendered.contains("B52"));
         assert!(!rendered.contains("B1｜"));
+    }
+
+    #[test]
+    fn classifies_batch_questions_without_global_bias() {
+        assert_eq!(
+            classify_episode_question("这批讲了什么"),
+            EpisodeQuestion::Brief
+        );
+        assert_eq!(
+            classify_episode_question("这批有多少条断言"),
+            EpisodeQuestion::Count
+        );
+        assert_eq!(
+            classify_episode_question("这批有哪些类型"),
+            EpisodeQuestion::Types
+        );
+        assert_eq!(
+            classify_episode_question("这批有哪些人物"),
+            EpisodeQuestion::TypeEntities(TypeFocus::Person)
+        );
+        assert_eq!(
+            classify_episode_question("这批用了哪些关系"),
+            EpisodeQuestion::Predicates
+        );
+        assert_eq!(
+            classify_episode_question("这批里的张三有哪些事实"),
+            EpisodeQuestion::SubjectFacts
+        );
+        assert_eq!(
+            classify_episode_question("上一批的来源是什么"),
+            EpisodeQuestion::Source
+        );
+        assert_eq!(
+            classify_episode_question("第2批什么时候导入的"),
+            EpisodeQuestion::Timing
+        );
+        assert_eq!(
+            classify_episode_question("这批新增多少、重复多少"),
+            EpisodeQuestion::Changes
+        );
+        assert_eq!(
+            classify_episode_question("这批有什么例子"),
+            EpisodeQuestion::Samples
+        );
+        assert_eq!(
+            classify_episode_question("这批有哪些实体"),
+            EpisodeQuestion::Subjects
+        );
+        assert_eq!(classify_type_focus("这批里的公司"), Some(TypeFocus::Organization));
+        assert_eq!(classify_type_focus("这批里的地点"), Some(TypeFocus::Place));
+        assert_eq!(classify_type_focus("这批讲了什么"), None);
+    }
+
+    #[test]
+    fn answers_are_scoped_and_state_truncation() {
+        let mut sample = episode(2, "abc123", "data/second.ttl");
+        sample.added = 1;
+        sample.duplicates = 1;
+        sample.gist.distinct_types = 2;
+        sample.gist.type_counts = vec![("Person".to_string(), 2)];
+        sample.gist.distinct_predicates = 2;
+        sample.gist.predicate_counts = vec![("name".to_string(), 2)];
+        sample.gist.distinct_subjects = 3;
+        sample.gist.top_subjects = vec![("张三".to_string(), 2)];
+        sample.gist.samples = vec![GistFact {
+            subject: "张三".to_string(),
+            predicate: "name".to_string(),
+            object: "张三".to_string(),
+        }];
+
+        let count = render_episode_answer(&sample, EpisodeQuestion::Count);
+        assert!(count.contains("批次 B2 共 2 条断言"), "{}", count);
+        let types = render_episode_answer(&sample, EpisodeQuestion::Types);
+        assert!(types.contains("Person×2"), "{}", types);
+        assert!(types.contains("前 1 项 / 共 2 项"), "{}", types);
+        let changes = render_episode_answer(&sample, EpisodeQuestion::Changes);
+        assert!(changes.contains("新增 1 条"), "{}", changes);
+        assert!(changes.contains("重复 1 条"), "{}", changes);
+        let source = render_episode_answer(&sample, EpisodeQuestion::Source);
+        assert!(source.contains("data/second.ttl"), "{}", source);
+        let brief = render_episode_answer(&sample, EpisodeQuestion::Brief);
+        assert!(brief.contains("[B2-1]"), "{}", brief);
+        assert!(brief.contains("可继续问"), "{}", brief);
+        let subject_facts = render_episode_subject_facts(
+            &sample,
+            "张三",
+            3,
+            &[GistFact {
+                subject: "张三".to_string(),
+                predicate: "name".to_string(),
+                object: "张三".to_string(),
+            }],
+        );
+        assert!(subject_facts.contains("前 1 条 / 共 3 条"), "{}", subject_facts);
+        assert!(subject_facts.contains("不是全量"), "{}", subject_facts);
+        let entities =
+            render_episode_type_entities(&sample, "Person", 3, &["张三".to_string()]);
+        assert!(entities.contains("前 1 个 / 共 3 个"), "{}", entities);
+    }
+
+    #[test]
+    fn unix_seconds_render_as_utc() {
+        assert_eq!(format_unix_seconds(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            format_unix_seconds(1_700_000_000),
+            "2023-11-14 22:13:20 UTC"
+        );
+        assert_eq!(
+            format_unix_seconds(1_600_000_000),
+            "2020-09-13 12:26:40 UTC"
+        );
     }
 }
