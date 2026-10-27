@@ -1364,6 +1364,38 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         );
         assert!(!body.contains(question), "性能台账也不得泄露问题文本：{}", body);
 
+        let second = create_session(addr).await;
+        take_turn_body(addr, &second, "未名科技公司的老板是谁").await;
+        let (status, _, body) = raw_request(addr, "GET", "/metrics/semantic", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let fleet: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(fleet["sessions"], 2, "{}", body);
+        assert_eq!(fleet["unavailable_sessions"], 0, "{}", body);
+        assert!(
+            fleet["window"]["observations"].as_u64().unwrap_or(0) >= 2,
+            "{}",
+            body
+        );
+        assert!(
+            fleet["window"]["answered"]["denominator"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 2,
+            "{}",
+            body
+        );
+        assert!(
+            fleet["alerting_sessions"].is_object(),
+            "告警聚合必须是对象：{}",
+            body
+        );
+        assert!(!body.contains(question), "聚合指标不得泄露问题文本：{}", body);
+        assert!(
+            !body.contains("未名科技公司的老板是谁"),
+            "聚合指标不得泄露问题文本：{}",
+            body
+        );
+
         let (status, _, _) = raw_request(
             addr,
             "GET",

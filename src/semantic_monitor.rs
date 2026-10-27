@@ -164,6 +164,13 @@ impl Ratio {
         self.measured()
             .then(|| self.numerator as f64 / self.denominator as f64)
     }
+
+    pub fn merge(&mut self, other: Self) {
+        *self = Self::new(
+            self.numerator.saturating_add(other.numerator),
+            self.denominator.saturating_add(other.denominator),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +565,74 @@ impl WindowMetrics {
             }
         }
         output
+    }
+}
+
+impl WindowMetrics {
+    /// 把另一会话窗口并入当前窗口：比率按分子/分母重新计算，
+    /// 只合并派生计数与告警码，不复制任何问句文本。
+    pub fn merge(&mut self, other: &Self) {
+        self.capacity = self.capacity.max(other.capacity);
+        self.observations = self.observations.saturating_add(other.observations);
+        self.searches = self.searches.saturating_add(other.searches);
+        self.answered.merge(other.answered);
+        self.deferred.merge(other.deferred);
+        self.faults.merge(other.faults);
+        self.retrieval_share.merge(other.retrieval_share);
+        self.retrieval_recall.merge(other.retrieval_recall);
+        self.search_recall.merge(other.search_recall);
+        self.zero_recall_searches.merge(other.zero_recall_searches);
+        self.certified_searches.merge(other.certified_searches);
+        self.truncated_searches.merge(other.truncated_searches);
+        self.budget_exhausted_searches
+            .merge(other.budget_exhausted_searches);
+        self.index_empty_searches.merge(other.index_empty_searches);
+        self.assessment_accept.merge(other.assessment_accept);
+        self.assessment_clarify.merge(other.assessment_clarify);
+        self.assessment_abstain.merge(other.assessment_abstain);
+        self.low_margin.merge(other.low_margin);
+        self.assembly_selected.merge(other.assembly_selected);
+        self.assembly_empty.merge(other.assembly_empty);
+        self.answers_at_least_once |= other.answers_at_least_once;
+        for (code, count) in &other.codes {
+            *self.codes.entry(code.clone()).or_insert(0) += count;
+        }
+        for alert in &other.alerts {
+            if !self.alerts.iter().any(|known| known.code == alert.code) {
+                self.alerts.push(alert.clone());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticFleetMetrics {
+    pub sessions: usize,
+    pub window: WindowMetrics,
+    pub alerting_sessions: BTreeMap<String, u64>,
+}
+
+impl Default for SemanticFleetMetrics {
+    fn default() -> Self {
+        Self {
+            sessions: 0,
+            window: WindowMetrics::default(),
+            alerting_sessions: BTreeMap::new(),
+        }
+    }
+}
+
+impl SemanticFleetMetrics {
+    pub fn from_windows(windows: impl IntoIterator<Item = WindowMetrics>) -> Self {
+        let mut fleet = Self::default();
+        for window in windows {
+            fleet.sessions += 1;
+            fleet.window.merge(&window);
+            for alert in &window.alerts {
+                *fleet.alerting_sessions.entry(alert.code.clone()).or_insert(0) += 1;
+            }
+        }
+        fleet
     }
 }
 
@@ -1266,6 +1341,42 @@ mod tests {
         let json = serde_json::to_string(&observation).unwrap();
         assert!(!json.contains("秘密问题甲乙丙"));
         assert_eq!(observation.question_chars, "秘密问题甲乙丙".chars().count());
+    }
+
+    #[test]
+    fn fleet_metrics_merge_ratios_without_double_counting_denominators() {
+        let mut first = WindowMetrics {
+            observations: 10,
+            answered: Ratio::new(8, 10),
+            ..WindowMetrics::default()
+        };
+        first.codes.insert(CODE_ANSWERED.to_string(), 8);
+        first.alerts.push(Alert {
+            code: "low_retrieval_recall".to_string(),
+            severity: AlertSeverity::Warning,
+            numerator: 4,
+            denominator: 10,
+            bps: Some(4000),
+            message: "测试告警".to_string(),
+            repair: RepairAction::WidenEvidence,
+        });
+        let second = WindowMetrics {
+            observations: 5,
+            answered: Ratio::new(2, 5),
+            ..WindowMetrics::default()
+        };
+        let fleet = SemanticFleetMetrics::from_windows(vec![first, second]);
+        assert_eq!(fleet.sessions, 2);
+        assert_eq!(fleet.window.observations, 15);
+        assert_eq!(fleet.window.answered.numerator, 10);
+        assert_eq!(fleet.window.answered.denominator, 15);
+        assert_eq!(fleet.window.answered.bps, Some(6667));
+        assert_eq!(fleet.window.codes.get(CODE_ANSWERED), Some(&8));
+        assert_eq!(fleet.window.alerts.len(), 1);
+        assert_eq!(
+            fleet.alerting_sessions.get("low_retrieval_recall"),
+            Some(&1)
+        );
     }
 
     #[test]

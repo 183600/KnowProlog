@@ -733,6 +733,50 @@ impl ApiState {
         reply_rx.await.map_err(|_| SessionError::Unavailable)
     }
 
+    /// 跨会话聚合的语义监控：不触碰 LRU 活动序号，繁忙/不可用的会话计入
+    /// `unavailable_sessions` 而不是拖住整个指标请求。
+    async fn fleet_semantic_metrics(&self) -> serde_json::Value {
+        let senders: Vec<mpsc::Sender<SessionCommand>> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|handle| handle.tx.clone())
+            .collect();
+        let mut windows = Vec::new();
+        let mut unavailable_sessions = 0usize;
+        for tx in senders {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx
+                .try_send(SessionCommand::Semantic { reply: reply_tx })
+                .is_err()
+            {
+                unavailable_sessions += 1;
+                continue;
+            }
+            let value = match tokio::time::timeout(Duration::from_secs(2), reply_rx).await {
+                Ok(Ok(value)) => value,
+                _ => {
+                    unavailable_sessions += 1;
+                    continue;
+                }
+            };
+            match serde_json::from_value::<crate::semantic_monitor::WindowMetrics>(
+                value["metrics"].clone(),
+            ) {
+                Ok(metrics) => windows.push(metrics),
+                Err(_) => unavailable_sessions += 1,
+            }
+        }
+        let fleet = crate::semantic_monitor::SemanticFleetMetrics::from_windows(windows);
+        serde_json::json!({
+            "sessions": fleet.sessions,
+            "unavailable_sessions": unavailable_sessions,
+            "window": fleet.window,
+            "alerting_sessions": fleet.alerting_sessions,
+        })
+    }
+
     /// 导出会话信封（在 actor 内取一致快照）。
     async fn export_session(&self, session_id: &str) -> Result<SessionEnvelope, SessionError> {
         let tx = self.session_tx(session_id).await?;
@@ -984,11 +1028,13 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                 "endpoints": [
                     "GET /health",
                     "GET /metrics",
+                    "GET /metrics/semantic",
                     "POST /sessions",
                     "GET /sessions/{id}",
                     "GET /sessions/{id}/layers",
                     "GET /sessions/{id}/export",
                     "GET /sessions/{id}/read-traces",
+                    "GET /sessions/{id}/semantic",
                     "POST /sessions/import",
                     "DELETE /sessions/{id}",
                     "POST /sessions/{id}/turns",
@@ -1059,6 +1105,9 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "startup": state.startup.snapshot(),
                 }),
             )
+        }
+        ("GET", ["metrics", "semantic"]) => {
+            Response::json(200, &state.fleet_semantic_metrics().await)
         }
         ("POST", ["sessions"]) => match state.create_session().await {
             Ok(session_id) => Response::json(201, &serde_json::json!({"session_id": session_id})),
