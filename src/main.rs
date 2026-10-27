@@ -6943,9 +6943,15 @@ fn intro_request_entity(input: &str, reasoner: &SymbolicReasoner) -> Option<Stri
 }
 
 fn load_rewrite_book(store_path: &str) -> Option<RewriteBook> {
-    RewriteBook::load_from_path(format!("{}/rewrite_book.json", store_path))
-        .ok()
-        .or_else(|| RewriteBook::load_from_path("rewrite_book.json").ok())
+    let store_book = format!("{}/rewrite_book.json", store_path);
+    match RewriteBook::load_from_path(&store_book) {
+        Ok(book) => return Some(book),
+        Err(error) if std::path::Path::new(&store_book).exists() => {
+            eprintln!("重写手册读取失败（已忽略）：{}", error);
+        }
+        Err(_) => {}
+    }
+    RewriteBook::load_from_path("rewrite_book.json").ok()
 }
 
 /// 按 ask/交互/服务一致的装配顺序，从存储事实构建只读推理器。
