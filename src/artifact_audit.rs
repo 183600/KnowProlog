@@ -478,6 +478,7 @@ mod tests {
                 crate_version: env!("CARGO_PKG_VERSION").to_string(),
                 kb_fingerprint: "audit".to_string(),
                 kb_facts: 1,
+                kb_generation: 0,
                 prompt_mode: "on".to_string(),
                 recovery_mode: "observe".to_string(),
             },

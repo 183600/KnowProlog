@@ -80,6 +80,7 @@ pub mod identity_eval;
 pub mod import_frames;
 pub mod import_journal;
 pub mod joint_parse;
+pub mod knowledge_delta;
 pub mod knowledge_fusion;
 pub mod knowledge_layers;
 pub mod lang_runtime;

@@ -44,6 +44,9 @@
 //! - `DELETE /sessions/{id}/memory/{claim}` 撤回该会话私有声明
 //! - `GET/POST /v1/memory`          全局共享语义白板（`?session=` 只读叠加会话视图）
 //! - `DELETE /v1/memory/{claim}`    撤回全局共享声明
+//! - `GET  /v1/knowledge`          进程内知识台账（事实/别名版本与指纹）
+//! - `POST /v1/knowledge/facts`    追加全局事实（下一轮对所有活跃会话可见）
+//! - `POST /v1/knowledge/aliases`  准入实体别名（下一轮对所有活跃会话可见）
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
 //!   或 `?stream=1` 时按句 SSE 流式返回。轮次有墙钟预算（默认 30 秒 Enforce），
 //!   失败/取消/超时会回滚可观察状态并留下可继续的未完成轮次
@@ -79,6 +82,7 @@ use crate::dialogue_manager::{
     DialogueKnowledge, DialogueManager, DialogueManagerSnapshot, MoveKind,
 };
 use crate::event_graph::{EventDialogue, EventGraph};
+use crate::knowledge_delta::{KnowledgeBase, KnowledgeCatchup, KnowledgeChange};
 use crate::ontology_reasoning::OntologyProgram;
 use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime};
@@ -554,6 +558,9 @@ struct Session {
     turn_budget: TurnBudget,
     /// 回滚失败后的会话毒化标记：绝不带着半状态继续推理。
     poisoned: Option<String>,
+    knowledge: Arc<KnowledgeBase>,
+    knowledge_generation: u64,
+    perf: Arc<PerfLedger>,
 }
 
 /// 一轮开始前的可观察状态：失败轮必须原样回滚，不能出现「回答没给出，焦点却跳走」。
@@ -626,6 +633,59 @@ impl Session {
                     .adopt_session_triple(&fact.entity, &fact.attribute, &fact.value)
             })
             .count()
+    }
+
+    fn sync_knowledge(&mut self) {
+        let current = self.knowledge.generation();
+        if current == self.knowledge_generation {
+            return;
+        }
+        match self.knowledge.changes_since(self.knowledge_generation) {
+            KnowledgeCatchup::UpToDate => {
+                self.knowledge_generation = current;
+            }
+            KnowledgeCatchup::Incremental(changes) => {
+                let mut facts = 0usize;
+                let mut aliases = 0usize;
+                for change in &changes {
+                    match change {
+                        KnowledgeChange::Facts { facts: batch, .. } => {
+                            self.reasoner.observe_facts(batch);
+                            facts += batch.len();
+                        }
+                        KnowledgeChange::Aliases { aliases: batch, .. } => {
+                            self.reasoner.align_entity_aliases(batch);
+                            aliases += batch.len();
+                        }
+                    }
+                }
+                if let Some(last) = changes.last() {
+                    self.knowledge_generation = last.generation();
+                }
+                self.perf.bump("knowledge_session_appends");
+                self.perf.bump_by("knowledge_session_facts", facts as u64);
+                self.perf.bump_by("knowledge_session_aliases", aliases as u64);
+            }
+            KnowledgeCatchup::Rebuild => {
+                let snapshot = self.knowledge.snapshot();
+                self.reasoner.rebuild_from_graph(&snapshot.facts);
+                self.reasoner.align_entity_aliases(&snapshot.aliases);
+                self.knowledge_generation = snapshot.generation;
+                self.perf.bump("knowledge_session_rebuilds");
+            }
+        }
+    }
+
+    fn engine_stamp(&self) -> EngineStamp {
+        let snapshot = self.knowledge.snapshot();
+        EngineStamp {
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            kb_fingerprint: snapshot.fingerprint,
+            kb_facts: snapshot.facts.len(),
+            kb_generation: snapshot.generation,
+            prompt_mode: self.manager.prompt_mode().label().to_string(),
+            recovery_mode: self.manager.recovery_mode().label().to_string(),
+        }
     }
 
     fn checkpoint(&self) -> SessionCheckpoint {
@@ -807,6 +867,7 @@ impl Session {
         control: &mut TurnControl,
     ) -> Result<TurnResponse, TurnFault> {
         control.enter(TurnPhase::Prepare)?;
+        self.sync_knowledge();
         let raw_input = input.trim().to_string();
         if self.history.len() >= HISTORY_LIMIT {
             self.history.remove(0);
@@ -1139,6 +1200,8 @@ pub struct EngineStamp {
     /// 知识库事实内容的 FNV-1a 指纹（与加载顺序无关的确定性哈希）。
     pub kb_fingerprint: String,
     pub kb_facts: usize,
+    #[serde(default)]
+    pub kb_generation: u64,
     pub prompt_mode: String,
     pub recovery_mode: String,
 }
@@ -1155,11 +1218,31 @@ impl EngineStamp {
         if self.kb_facts != other.kb_facts {
             fields.push("kb_facts".to_string());
         }
+        if self.kb_generation != other.kb_generation {
+            fields.push("kb_generation".to_string());
+        }
         if self.prompt_mode != other.prompt_mode {
             fields.push("prompt_mode".to_string());
         }
         if self.recovery_mode != other.recovery_mode {
             fields.push("recovery_mode".to_string());
+        }
+        fields
+    }
+
+    fn mismatched_fields_for_resume(&self, current: &EngineStamp) -> Vec<String> {
+        let mut fields = Vec::new();
+        if self.crate_version != current.crate_version {
+            fields.push("crate_version".to_string());
+        }
+        if self.prompt_mode != current.prompt_mode {
+            fields.push("prompt_mode".to_string());
+        }
+        if self.recovery_mode != current.recovery_mode {
+            fields.push("recovery_mode".to_string());
+        }
+        if self.kb_generation > current.kb_generation {
+            fields.push("kb_generation".to_string());
         }
         fields
     }
@@ -1231,53 +1314,7 @@ impl SessionEnvelope {
     }
 }
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a_step(hash: u64, bytes: &[u8]) -> u64 {
-    let mut hash = hash;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-fn fnv1a_field(hash: u64, value: &str) -> u64 {
-    fnv1a_step(fnv1a_step(hash, value.as_bytes()), b"\x1f")
-}
-
-/// 事实集的确定性指纹：HashMap 属性按键排序，保证跨进程稳定。
-pub fn fingerprint_facts(facts: &[PrologFact]) -> String {
-    let mut hash = FNV_OFFSET;
-    for fact in facts {
-        match fact {
-            PrologFact::Entity {
-                name,
-                entity_type,
-                properties,
-            } => {
-                hash = fnv1a_step(hash, b"E\x1f");
-                hash = fnv1a_field(hash, name);
-                hash = fnv1a_field(hash, entity_type);
-                let mut keys: Vec<&String> = properties.keys().collect();
-                keys.sort();
-                for key in keys {
-                    hash = fnv1a_field(hash, key);
-                    hash = fnv1a_field(hash, &properties[key]);
-                }
-            }
-            PrologFact::Relation { from, rel_type, to } => {
-                hash = fnv1a_step(hash, b"R\x1f");
-                hash = fnv1a_field(hash, from);
-                hash = fnv1a_field(hash, rel_type);
-                hash = fnv1a_field(hash, to);
-            }
-        }
-        hash = fnv1a_step(hash, b"\n");
-    }
-    format!("{:016x}", hash)
-}
+pub use crate::knowledge_delta::fingerprint_facts;
 
 /// 会话 id → 冷存储文件名（过滤路径分隔符等，防目录穿越）。
 fn session_file_name(session_id: &str) -> String {
@@ -1418,6 +1455,10 @@ impl WarmBase {
         self.reasoner.lock().attach_semantic_grammar(grammar);
     }
 
+    fn observe_facts(&self, facts: &[PrologFact]) {
+        self.reasoner.lock().observe_facts(facts);
+    }
+
     /// 知识版本（分叉基座当前携带的 revision，供审计与测试）。
     pub fn revision(&self) -> u64 {
         self.reasoner.lock().revision()
@@ -1429,6 +1470,7 @@ impl WarmBase {
 fn build_session(
     id: String,
     warm: &WarmBase,
+    knowledge: Arc<KnowledgeBase>,
     perf: &Arc<PerfLedger>,
     prompt_mode: PromptMode,
     recovery_mode: RecoveryMode,
@@ -1439,6 +1481,7 @@ fn build_session(
     restore: Option<SessionRestore>,
 ) -> Session {
     let reasoner = warm.fork();
+    let knowledge_generation = knowledge.generation();
     perf.bump("session_forks");
     let mut manager = DialogueManager::new();
     manager.set_prompt_mode(prompt_mode);
@@ -1456,6 +1499,9 @@ fn build_session(
         plugin,
         turn_budget,
         poisoned: None,
+        knowledge,
+        knowledge_generation,
+        perf: Arc::clone(perf),
     };
     if let Some(restore) = restore {
         session.turns = restore.turns;
@@ -1479,14 +1525,13 @@ fn build_session(
 
 /// 服务共享状态：预热基座 + 会话 actor 表 + 计数（`Send + Sync`）。
 pub struct ApiState {
-    facts: Arc<Vec<PrologFact>>,
-    kb_fingerprint: String,
+    knowledge: Arc<KnowledgeBase>,
     /// 知识派生状态的预热基座：会话从这里分叉，不逐会话重放事实。
     warm: Arc<WarmBase>,
     /// 无状态问答缓存：键为「按序全部用户消息 + 策略」，纪元失效（纯函数结果）。
     stateless_answers: Arc<parking_lot::Mutex<RevisionLru<TurnResponse, CacheEpoch>>>,
-    /// 预热基座构建时的知识版本（缓存纪元的一部分）。
-    kb_revision: u64,
+    /// 知识写入纪元：每次事实/别名写入推进，旧缓存整体失效。
+    kb_revision: AtomicU64,
     /// 质量护照索引（由宿主注入；只读派生数据，供会话生成出处/冲突/缺口话语）。
     quality: Option<Arc<QualityIndex>>,
     /// 插件运行时（由宿主注入；多会话共享，模式在注入时确定）。
@@ -1527,20 +1572,18 @@ impl ApiState {
         max_sessions: usize,
         startup: Arc<StartupLedger>,
     ) -> Self {
-        let kb_fingerprint = fingerprint_facts(&facts);
+        let knowledge = Arc::new(KnowledgeBase::new(facts.clone()));
         // 预热基座：整进程唯一的全量重放点（会话创建只做字段级分叉）
         let warm = Arc::new(WarmBase::build(
             &facts, &reasoning, &synonyms, &perf, &startup,
         ));
-        let kb_revision = warm.revision();
         ApiState {
-            facts: Arc::new(facts),
-            kb_fingerprint,
+            knowledge,
             warm,
             stateless_answers: Arc::new(parking_lot::Mutex::new(RevisionLru::new(
                 STATELESS_CACHE_CAPACITY,
             ))),
-            kb_revision,
+            kb_revision: AtomicU64::new(0),
             quality: None,
             plugin: None,
             identity_epoch: AtomicU64::new(0),
@@ -1631,12 +1674,36 @@ impl ApiState {
     /// 宿主注入实体身份注册表里已确认的持久别名（别名与规范名同权），
     /// 使 CLI 里签过字的指称在 HTTP 会话同样可解。返回生效条数。
     pub fn align_entity_aliases(&self, aliases: &[(String, String)]) -> usize {
-        let applied = self.warm.reasoner.lock().align_entity_aliases(aliases);
-        // 新别名让旧词面指向新实体：缓存里的旧答案可能已改口。
-        if applied > 0 {
+        self.warm.reasoner.lock().align_entity_aliases(aliases);
+        let admitted = self.knowledge.record_aliases(aliases, "host");
+        if !admitted.is_empty() {
+            self.bump_knowledge_epoch();
             self.bump_identity_epoch();
         }
-        applied
+        admitted.len()
+    }
+
+    pub fn assert_facts(&self, facts: &[PrologFact], source: &str) -> usize {
+        let missing = self.knowledge.missing_facts(facts);
+        if missing.is_empty() {
+            return 0;
+        }
+        self.warm.observe_facts(&missing);
+        let admitted = self.knowledge.assert_facts(&missing, source);
+        if admitted.is_empty() {
+            return 0;
+        }
+        self.bump_knowledge_epoch();
+        admitted.len()
+    }
+
+    fn bump_knowledge_epoch(&self) {
+        self.kb_revision.fetch_add(1, Ordering::Relaxed);
+        self.perf.bump("knowledge_epoch_bumps");
+    }
+
+    pub fn knowledge_snapshot(&self) -> crate::knowledge_delta::KnowledgeSnapshot {
+        self.knowledge.snapshot()
     }
 
     /// 宿主注入律典（跨重启的采纳/退役决定），返回载入的显式决定条数。
@@ -1652,7 +1719,7 @@ impl ApiState {
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
     pub fn cache_epoch(&self) -> CacheEpoch {
         CacheEpoch {
-            kb_revision: self.kb_revision,
+            kb_revision: self.kb_revision.load(Ordering::Relaxed),
             identity_epoch: self.identity_epoch.load(Ordering::Relaxed),
         }
     }
@@ -1759,10 +1826,12 @@ impl ApiState {
 
     /// 当前引擎指纹（知识库指纹 + 运行模式）。
     pub fn engine_stamp(&self) -> EngineStamp {
+        let snapshot = self.knowledge.snapshot();
         EngineStamp {
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
-            kb_fingerprint: self.kb_fingerprint.clone(),
-            kb_facts: self.facts.len(),
+            kb_fingerprint: snapshot.fingerprint,
+            kb_facts: snapshot.facts.len(),
+            kb_generation: snapshot.generation,
             prompt_mode: self.prompt_mode.label().to_string(),
             recovery_mode: self.recovery_mode.label().to_string(),
         }
@@ -1785,7 +1854,7 @@ impl ApiState {
         let frame_program = self.frame_program.clone();
         let turn_budget = self.turn_budget;
         let shared_memory = Arc::clone(&self.shared_memory);
-        let engine = Arc::new(self.engine_stamp());
+        let knowledge = Arc::clone(&self.knowledge);
         let thread_name = format!("kp-session-{}", id);
         std::thread::Builder::new()
             .name(thread_name)
@@ -1797,6 +1866,7 @@ impl ApiState {
                     build_session(
                         id,
                         &warm,
+                        Arc::clone(&knowledge),
                         &perf,
                         prompt_mode,
                         recovery_mode,
@@ -1858,6 +1928,7 @@ impl ApiState {
                             }));
                         }
                         SessionCommand::Export { reply } => {
+                            session.sync_knowledge();
                             let mut envelope = SessionEnvelope {
                                 format: ENVELOPE_FORMAT.to_string(),
                                 version: ENVELOPE_VERSION,
@@ -1867,7 +1938,7 @@ impl ApiState {
                                 policy: session.policy.clone(),
                                 manager: session.manager.snapshot(),
                                 reasoner: session.reasoner.dialogue_snapshot(),
-                                engine: (*engine).clone(),
+                                engine: session.engine_stamp(),
                                 digest: String::new(),
                             };
                             envelope.seal();
@@ -1976,7 +2047,9 @@ impl ApiState {
             self.perf.bump(&error.metric_key());
             return Err(SessionError::Stale(error));
         }
-        let foreign = envelope.engine.mismatched_fields(&self.engine_stamp());
+        let foreign = envelope
+            .engine
+            .mismatched_fields_for_resume(&self.engine_stamp());
         if !foreign.is_empty() {
             let error = DecodeError::Fingerprint(foreign);
             self.perf.bump(&error.metric_key());
@@ -2468,6 +2541,9 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "GET /v1/memory",
                     "POST /v1/memory",
                     "DELETE /v1/memory/{claim}",
+                    "GET /v1/knowledge",
+                    "POST /v1/knowledge/facts",
+                    "POST /v1/knowledge/aliases",
                     "GET /v1/models",
                     "GET /v1/prompts",
                     "POST /v1/events",
@@ -2487,6 +2563,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
         ),
         ("GET", ["metrics"]) => {
             let memory = state.shared_memory.snapshot_all();
+            let knowledge = state.knowledge.snapshot();
             Response::json(
                 200,
                 &serde_json::json!({
@@ -2502,6 +2579,14 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "cold_sessions": state.cold_session_count(),
                     "evictions_total": state.evictions_total.load(Ordering::Relaxed),
                     "warm_revision": state.warm_revision(),
+                    "knowledge": {
+                        "generation": knowledge.generation,
+                        "facts": knowledge.facts.len(),
+                        "aliases": knowledge.aliases.len(),
+                        "fingerprint": knowledge.fingerprint,
+                        "journal": knowledge.journal_len,
+                        "cache_epoch": state.cache_epoch().kb_revision,
+                    },
                     "shared_memory": {
                         "revision": memory.revision,
                         "claims": memory.claims.len(),
@@ -2550,6 +2635,11 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             handle_shared_memory_view(state, session).await
         }
         ("POST", ["v1", "memory"]) => handle_shared_memory_publish(state, request, None).await,
+        ("GET", ["v1", "knowledge"]) => handle_knowledge_view(state).await,
+        ("POST", ["v1", "knowledge", "facts"]) => handle_knowledge_assert(state, request).await,
+        ("POST", ["v1", "knowledge", "aliases"]) => {
+            handle_knowledge_aliases(state, request).await
+        }
         ("DELETE", ["sessions", id, "memory", claim_id]) => {
             handle_shared_memory_retract(state, claim_id, Some(id)).await
         }
@@ -2722,6 +2812,212 @@ fn import_decode_response(state: &Arc<ApiState>, error: &DecodeError) -> Respons
 
 /// 导入信封：解码（解析/格式/版本/摘要/尺寸）→ 校验（会话 id/引擎）→
 /// 零副作用重建会话。解码回执随 201 响应返回（可审计的接收凭据）。
+const MAX_KNOWLEDGE_FACTS_PER_REQUEST: usize = 256;
+const MAX_KNOWLEDGE_ALIASES_PER_REQUEST: usize = 256;
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum KnowledgeFactInput {
+    Entity {
+        name: String,
+        #[serde(default)]
+        entity_type: String,
+        #[serde(default)]
+        properties: HashMap<String, String>,
+    },
+    Relation {
+        from: String,
+        rel_type: String,
+        to: String,
+    },
+}
+
+impl KnowledgeFactInput {
+    fn into_fact(self) -> Result<PrologFact, String> {
+        match self {
+            KnowledgeFactInput::Entity {
+                name,
+                entity_type,
+                properties,
+            } => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err("entity name must not be empty".to_string());
+                }
+                let entity_type = entity_type.trim();
+                let entity_type = if entity_type.is_empty() {
+                    "Entity".to_string()
+                } else {
+                    entity_type.to_string()
+                };
+                if properties.len() > 64 {
+                    return Err("entity properties must be at most 64 entries".to_string());
+                }
+                let mut normalized = HashMap::with_capacity(properties.len());
+                for (key, value) in properties {
+                    let key = key.trim();
+                    if key.is_empty() {
+                        return Err("entity property key must not be empty".to_string());
+                    }
+                    normalized.insert(key.to_string(), value);
+                }
+                Ok(PrologFact::Entity {
+                    name,
+                    entity_type,
+                    properties: normalized,
+                })
+            }
+            KnowledgeFactInput::Relation { from, rel_type, to } => {
+                let from = from.trim().to_string();
+                let rel_type = rel_type.trim().to_string();
+                let to = to.trim().to_string();
+                if from.is_empty() || rel_type.is_empty() || to.is_empty() {
+                    return Err("relation from/rel_type/to must not be empty".to_string());
+                }
+                Ok(PrologFact::Relation { from, rel_type, to })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeAliasInput {
+    surface: String,
+    canonical: String,
+}
+
+fn parse_knowledge_facts(payload: &serde_json::Value) -> Result<Vec<PrologFact>, String> {
+    let items = payload
+        .get("facts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "missing array field: facts".to_string())?;
+    if items.is_empty() {
+        return Err("facts must not be empty".to_string());
+    }
+    if items.len() > MAX_KNOWLEDGE_FACTS_PER_REQUEST {
+        return Err(format!(
+            "facts must contain at most {} entries",
+            MAX_KNOWLEDGE_FACTS_PER_REQUEST
+        ));
+    }
+    items
+        .iter()
+        .map(|item| {
+            serde_json::from_value::<KnowledgeFactInput>(item.clone())
+                .map_err(|error| format!("invalid fact: {error}"))
+                .and_then(KnowledgeFactInput::into_fact)
+        })
+        .collect()
+}
+
+fn parse_knowledge_aliases(payload: &serde_json::Value) -> Result<Vec<(String, String)>, String> {
+    let items = payload
+        .get("aliases")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "missing array field: aliases".to_string())?;
+    if items.is_empty() {
+        return Err("aliases must not be empty".to_string());
+    }
+    if items.len() > MAX_KNOWLEDGE_ALIASES_PER_REQUEST {
+        return Err(format!(
+            "aliases must contain at most {} entries",
+            MAX_KNOWLEDGE_ALIASES_PER_REQUEST
+        ));
+    }
+    items
+        .iter()
+        .map(|item| {
+            let alias = serde_json::from_value::<KnowledgeAliasInput>(item.clone())
+                .map_err(|error| format!("invalid alias: {error}"))?;
+            let surface = alias.surface.trim().to_string();
+            let canonical = alias.canonical.trim().to_string();
+            if surface.is_empty() || canonical.is_empty() {
+                return Err("alias surface/canonical must not be empty".to_string());
+            }
+            if surface == canonical {
+                return Err("alias surface must differ from canonical".to_string());
+            }
+            Ok((surface, canonical))
+        })
+        .collect()
+}
+
+async fn handle_knowledge_view(state: &Arc<ApiState>) -> Response {
+    let snapshot = state.knowledge.snapshot();
+    Response::json(
+        200,
+        &serde_json::json!({
+            "generation": snapshot.generation,
+            "facts": snapshot.facts.len(),
+            "aliases": snapshot.aliases,
+            "fingerprint": snapshot.fingerprint,
+            "journal": snapshot.journal_len,
+            "cache_epoch": state.cache_epoch().kb_revision,
+        }),
+    )
+}
+
+async fn handle_knowledge_assert(state: &Arc<ApiState>, request: &Request) -> Response {
+    let body = match request.body_text() {
+        Ok(body) => body,
+        Err(error) => return utf8_body_error(error),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
+    };
+    let facts = match parse_knowledge_facts(&payload) {
+        Ok(facts) => facts,
+        Err(message) => return Response::error(400, &message),
+    };
+    let source = payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("http");
+    let applied = state.assert_facts(&facts, source);
+    let snapshot = state.knowledge.snapshot();
+    let status = if applied > 0 { 201 } else { 200 };
+    Response::json(
+        status,
+        &serde_json::json!({
+            "status": if applied > 0 { "applied" } else { "unchanged" },
+            "applied": applied,
+            "source": source,
+            "scope": "process",
+            "generation": snapshot.generation,
+            "facts": snapshot.facts.len(),
+            "fingerprint": snapshot.fingerprint,
+        }),
+    )
+}
+
+async fn handle_knowledge_aliases(state: &Arc<ApiState>, request: &Request) -> Response {
+    let body = match request.body_text() {
+        Ok(body) => body,
+        Err(error) => return utf8_body_error(error),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
+    };
+    let aliases = match parse_knowledge_aliases(&payload) {
+        Ok(aliases) => aliases,
+        Err(message) => return Response::error(400, &message),
+    };
+    let applied = state.align_entity_aliases(&aliases);
+    let snapshot = state.knowledge.snapshot();
+    let status = if applied > 0 { 201 } else { 200 };
+    Response::json(
+        status,
+        &serde_json::json!({
+            "status": if applied > 0 { "admitted" } else { "unchanged" },
+            "applied": applied,
+            "generation": snapshot.generation,
+            "aliases": snapshot.aliases.len(),
+        }),
+    )
+}
+
 /// 无状态事件抽取/问答：`POST /v1/events`。
 ///
 /// 请求：`{"text":"...","question":"..."}`；`question` 可省略，省略时只返回事件图。
@@ -4040,6 +4336,71 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         );
     }
 
+    #[tokio::test]
+    async fn knowledge_assertions_reach_existing_sessions() {
+        let state = test_state(4);
+        let first = state.create_session().await.expect("会话应创建成功");
+        let second = state.create_session().await.expect("会话应创建成功");
+
+        let before = state
+            .take_turn(&first, "姚明的队友是谁")
+            .await
+            .expect("轮次应成功");
+        assert!(!before.reply.contains("叶莉"), "{}", before.reply);
+
+        let applied = state.assert_facts(
+            &[PrologFact::Relation {
+                from: "姚明".to_string(),
+                rel_type: "队友".to_string(),
+                to: "叶莉".to_string(),
+            }],
+            "test",
+        );
+        assert_eq!(applied, 1);
+        assert_eq!(state.knowledge_snapshot().generation, 1);
+
+        for session in [&first, &second] {
+            let after = state
+                .take_turn(session, "姚明的队友是谁")
+                .await
+                .expect("轮次应成功");
+            assert!(after.reply.contains("叶莉"), "{}", after.reply);
+        }
+        assert_eq!(
+            state.assert_facts(
+                &[PrologFact::Relation {
+                    from: "姚明".to_string(),
+                    rel_type: "队友".to_string(),
+                    to: "叶莉".to_string(),
+                }],
+                "test",
+            ),
+            0
+        );
+        assert_eq!(state.knowledge_snapshot().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn alias_admission_reaches_active_sessions() {
+        let state = test_state(2);
+        let session = state.create_session().await.expect("会话应创建成功");
+        let before = state
+            .take_turn(&session, "明哥的身高是多少")
+            .await
+            .expect("轮次应成功");
+        assert!(!before.reply.contains("226"), "{}", before.reply);
+
+        assert_eq!(
+            state.align_entity_aliases(&[("明哥".to_string(), "姚明".to_string())]),
+            1
+        );
+        let after = state
+            .take_turn(&session, "明哥的身高是多少")
+            .await
+            .expect("轮次应成功");
+        assert!(after.reply.contains("226"), "{}", after.reply);
+    }
+
     /// 注册表对齐（谓词别名/换向词面 + 实体持久别名）必须进暖基座：
     /// CLI 里签过字的说法，走 HTTP 发问同样要能命中同一份知识。
     #[tokio::test]
@@ -4136,6 +4497,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
                 crate_version: env!("CARGO_PKG_VERSION").to_string(),
                 kb_fingerprint: "test-fingerprint".to_string(),
                 kb_facts: 2,
+                kb_generation: 0,
                 prompt_mode: "on".to_string(),
                 recovery_mode: "observe".to_string(),
             },
@@ -4664,6 +5026,95 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["claims"].as_array().unwrap().len(), 2, "{}", body);
         assert!(!body.contains("190cm"), "{}", body);
+    }
+
+    #[tokio::test]
+    async fn knowledge_http_writes_are_visible_to_active_sessions() {
+        let (addr, _server) = start_server(2);
+        let session = create_session(addr).await;
+
+        let before = take_turn_body(addr, &session, "姚明的队友是谁").await;
+        assert!(!before["reply"].as_str().unwrap_or("").contains("叶莉"));
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/knowledge/facts",
+            &[("Content-Type", "application/json")],
+            r#"{"facts":[{"kind":"relation","from":"姚明","rel_type":"队友","to":"叶莉"}],"source":"http-test"}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["applied"], 1);
+        assert_eq!(value["generation"], 1);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/knowledge/aliases",
+            &[("Content-Type", "application/json")],
+            r#"{"aliases":[{"surface":"明哥","canonical":"姚明"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["applied"], 1);
+        assert_eq!(value["generation"], 2);
+
+        let after = take_turn_body(addr, &session, "姚明的队友是谁").await;
+        assert!(after["reply"].as_str().unwrap_or("").contains("叶莉"));
+        let alias = take_turn_body(addr, &session, "明哥的身高是多少").await;
+        assert!(alias["reply"].as_str().unwrap_or("").contains("226"));
+
+        let (status, _, body) = raw_request(addr, "GET", "/v1/knowledge", &[], "").await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["generation"], 2);
+        assert_eq!(value["facts"], 3);
+        assert_eq!(value["aliases"].as_array().unwrap().len(), 1);
+        assert_eq!(value["cache_epoch"], 2);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/knowledge/facts",
+            &[("Content-Type", "application/json")],
+            r#"{"facts":[{"kind":"relation","from":"","rel_type":"队友","to":"叶莉"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 400, "{}", body);
+    }
+
+    #[tokio::test]
+    async fn cold_session_resumes_after_knowledge_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let (addr, _server) = start_server_with_options(
+            1,
+            RecoveryMode::Observe,
+            Some(dir.path().to_path_buf()),
+            None,
+        );
+        let first = create_session(addr).await;
+        take_turn_body(addr, &first, "姚明的身高是多少").await;
+        let _second = create_session(addr).await;
+        assert!(
+            dir.path().join(format!("{}.json", first)).exists(),
+            "容量 1 应把 first 冻结到磁盘"
+        );
+
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/knowledge/facts",
+            &[("Content-Type", "application/json")],
+            r#"{"facts":[{"kind":"relation","from":"姚明","rel_type":"队友","to":"叶莉"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "{}", body);
+
+        let resumed = take_turn_body(addr, &first, "姚明的队友是谁").await;
+        assert!(resumed["reply"].as_str().unwrap_or("").contains("叶莉"));
     }
 
     #[tokio::test]
@@ -5881,6 +6332,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         build_session(
             "s-test".to_string(),
             &state.warm,
+            Arc::clone(&state.knowledge),
             &state.perf,
             state.prompt_mode,
             state.recovery_mode,
@@ -6081,6 +6533,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let mut session = build_session(
             "s-test".to_string(),
             &state.warm,
+            Arc::clone(&state.knowledge),
             &state.perf,
             state.prompt_mode,
             state.recovery_mode,
@@ -6154,6 +6607,7 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let mut session = build_session(
             "s-predictive".to_string(),
             &state.warm,
+            Arc::clone(&state.knowledge),
             &state.perf,
             state.prompt_mode,
             state.recovery_mode,
