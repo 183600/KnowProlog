@@ -1780,6 +1780,22 @@ impl DialogueManager {
         self.last_identity_card = None;
         if let Some(text) = knowledge.learned_rewrite_answer(input) {
             let plan = vec!["learned_rewrite".to_string()];
+            let entity = knowledge.entities_in(input).into_iter().next();
+            self.turns.push(DialogueTurn {
+                index: self.turns.len() + 1,
+                user: input.trim().to_string(),
+                kind: MoveKind::AskAttribute,
+                entity: entity.clone(),
+                attribute: None,
+                answer_excerpt: Some(excerpt(&text, 40)),
+                provenance: Vec::new(),
+                plan: plan.clone(),
+                warrant: None,
+                kb_revision: Some(knowledge.revision()),
+            });
+            if let Some(entity) = entity {
+                self.push_focus(&entity);
+            }
             self.last_reply = plan.clone();
             return Some(DialogueReply {
                 text,
@@ -4428,6 +4444,8 @@ mod tests {
             .expect("习得重写应接管本轮");
         assert_eq!(reply.text, "李四");
         assert_eq!(reply.plan, vec!["learned_rewrite"]);
+        assert_eq!(manager.focus_entity(), Some("张三"));
+        assert_eq!(manager.turn_count(), 1);
     }
 
     struct CrdKnowledge {
