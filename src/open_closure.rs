@@ -539,9 +539,8 @@ impl OpenClosureSession {
     ) -> OpenClosureAnswer {
         let subject = subject.trim().to_string();
         let predicate = predicate.trim().to_string();
-        let mut answer = self.build_answer(&subject, &predicate, budget, true);
-        if let Some(probe) = answer.probe.take() {
-            answer.probe = Some(probe);
+        let answer = self.build_answer(&subject, &predicate, budget);
+        if answer.probe.is_some() {
             self.probes_asked.insert(predicate);
         }
         answer
@@ -554,12 +553,7 @@ impl OpenClosureSession {
         predicate: &str,
         budget: ClosureBudget,
     ) -> OpenClosureAnswer {
-        self.build_answer(
-            subject.trim(),
-            predicate.trim(),
-            budget,
-            false,
-        )
+        self.build_answer(subject.trim(), predicate.trim(), budget)
     }
 
     fn build_answer(
@@ -567,11 +561,10 @@ impl OpenClosureSession {
         subject: &str,
         predicate: &str,
         budget: ClosureBudget,
-        allow_probe: bool,
     ) -> OpenClosureAnswer {
         let status = self.status(predicate);
-        let adjacency = self.positive_adjacency(predicate);
-        let negatives = self.negative_objects(predicate);
+        let negatives = self.negative_adjacency(predicate);
+        let adjacency = self.positive_adjacency(predicate, &negatives);
         let direct: Vec<String> = adjacency
             .get(subject)
             .map(|values| values.iter().cloned().collect())
@@ -601,26 +594,32 @@ impl OpenClosureSession {
             .collect();
         counterexamples.truncate(MAX_PROBE_CHAINS);
 
-        let mut conflicts: Vec<String> = counterexamples
-            .iter()
-            .map(|chain| {
+        let mut conflicts: Vec<String> = self
+            .contradicted_edges(predicate)
+            .into_iter()
+            .map(|(left, right)| {
                 format!(
-                    "二跳链 {} 的终点被显式否定，不能据传递性推出该目标",
-                    chain.path.join(" → ")
+                    "正负记录同时存在，已按否定阻断 {} → {}；请先撤回其中一条",
+                    left, right
                 )
             })
             .collect();
+        conflicts.extend(counterexamples.iter().map(|chain| {
+            format!(
+                "二跳链 {} 的终点被显式否定，不能据传递性推出该目标",
+                chain.path.join(" → ")
+            )
+        }));
 
         let query_probe_available = status == HypothesisStatus::Unknown
             && !support.is_empty()
             && has_query_chain
             && !self.probes_asked.contains(predicate);
-        let probe = if allow_probe && query_probe_available {
+        let probe = if query_probe_available {
             Some(build_probe(predicate, &support, &counterexamples))
         } else {
             None
         };
-
         if status == HypothesisStatus::Rejected {
             return OpenClosureAnswer {
                 subject: subject.to_string(),
@@ -723,7 +722,11 @@ impl OpenClosureSession {
             if direct_set.contains(target.as_str()) {
                 continue;
             }
-            if negatives.contains(target) {
+            let target_is_negated = negatives
+                .get(subject)
+                .map(|objects| objects.contains(target))
+                .unwrap_or(false);
+            if target_is_negated {
                 if blocked_set.insert(target.clone()) {
                     blocked.push(target.clone());
                 }
@@ -781,10 +784,21 @@ impl OpenClosureSession {
         }
     }
 
-    fn positive_adjacency(&self, predicate: &str) -> BTreeMap<String, BTreeSet<String>> {
+    fn positive_adjacency(
+        &self,
+        predicate: &str,
+        negatives: &BTreeMap<String, BTreeSet<String>>,
+    ) -> BTreeMap<String, BTreeSet<String>> {
         let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for fact in &self.facts {
             if fact.negated || fact.predicate != predicate {
+                continue;
+            }
+            let contradicted = negatives
+                .get(&fact.subject)
+                .map(|objects| objects.contains(&fact.object))
+                .unwrap_or(false);
+            if contradicted {
                 continue;
             }
             adjacency
@@ -795,12 +809,35 @@ impl OpenClosureSession {
         adjacency
     }
 
-    fn negative_objects(&self, predicate: &str) -> BTreeSet<String> {
-        self.facts
-            .iter()
-            .filter(|fact| fact.negated && fact.predicate == predicate)
-            .map(|fact| fact.object.clone())
-            .collect()
+    fn contradicted_edges(&self, predicate: &str) -> Vec<(String, String)> {
+        let mut positives: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut negatives: BTreeSet<(String, String)> = BTreeSet::new();
+        for fact in &self.facts {
+            if fact.predicate != predicate {
+                continue;
+            }
+            let pair = (fact.subject.clone(), fact.object.clone());
+            if fact.negated {
+                negatives.insert(pair);
+            } else {
+                positives.insert(pair);
+            }
+        }
+        positives.intersection(&negatives).cloned().collect()
+    }
+
+    fn negative_adjacency(&self, predicate: &str) -> BTreeMap<String, BTreeSet<String>> {
+        let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for fact in &self.facts {
+            if !fact.negated || fact.predicate != predicate {
+                continue;
+            }
+            adjacency
+                .entry(fact.subject.clone())
+                .or_default()
+                .insert(fact.object.clone());
+        }
+        adjacency
     }
 
     /// 简要账本：谓词、正负事实数与假设状态。
@@ -907,11 +944,12 @@ fn build_probe(
 
 fn two_hop_chains(
     adjacency: &BTreeMap<String, BTreeSet<String>>,
-    negatives: &BTreeSet<String>,
+    negatives: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<TransitiveChain> {
     let mut chains: Vec<TransitiveChain> = Vec::new();
     for (start, middles) in adjacency {
         let direct_targets = adjacency.get(start);
+        let negated_targets = negatives.get(start);
         for middle in middles {
             let Some(targets) = adjacency.get(middle) else {
                 continue;
@@ -926,7 +964,9 @@ fn two_hop_chains(
                 chains.push(TransitiveChain {
                     path: vec![start.clone(), middle.clone(), target.clone()],
                     adds_new_fact,
-                    blocked_by_negation: negatives.contains(target),
+                    blocked_by_negation: negated_targets
+                        .map(|values| values.contains(target))
+                        .unwrap_or(false),
                 });
             }
         }
@@ -1097,15 +1137,15 @@ mod tests {
     }
 
     #[test]
-    fn explicit_negation_blocks_the_inferred_target() {
+    fn explicit_negation_of_an_edge_removes_it_from_the_session_graph() {
         let mut session = session();
         session.observe_negative("李四", "师兄", "王五", "测试反例");
         let answer = session.answer("张三", "师兄", ClosureBudget::default());
-        assert_eq!(answer.kind, OpenAnswerKind::Conditional);
+        assert_eq!(answer.kind, OpenAnswerKind::DirectOnly);
         assert_eq!(answer.direct, vec!["李四"]);
         assert!(answer.inferred.is_empty());
-        assert_eq!(answer.blocked, vec!["王五"]);
         assert!(!answer.conflicts.is_empty());
+        assert!(answer.probe.is_none());
     }
 
     #[test]
@@ -1121,6 +1161,36 @@ mod tests {
             .iter()
             .all(|target| target.target != "王五"));
         assert!(!answer.conflicts.is_empty());
+    }
+
+    #[test]
+    fn peek_shows_probe_without_consuming_the_asking_quota() {
+        let session = session();
+        let peeked = session.peek_answer("张三", "师兄", ClosureBudget::default());
+        assert!(peeked.probe.is_some());
+        assert!(!session.probe_was_asked("师兄"));
+        let mut session = session;
+        let answered = session.answer("张三", "师兄", ClosureBudget::default());
+        assert!(answered.probe.is_some());
+        assert!(session.probe_was_asked("师兄"));
+    }
+
+    #[test]
+    fn negation_under_another_subject_does_not_block_this_chain() {
+        let mut session = session();
+        session.observe_negative("赵六", "师兄", "王五", "别人不是王五的师兄");
+        let answer = session.peek_answer("张三", "师兄", ClosureBudget::default());
+        assert_eq!(answer.kind, OpenAnswerKind::Conditional);
+        assert_eq!(
+            answer
+                .inferred
+                .iter()
+                .map(|target| target.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["王五"]
+        );
+        assert!(answer.blocked.is_empty());
+        assert!(answer.probe.is_some());
     }
 
     #[test]
