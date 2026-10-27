@@ -5,7 +5,7 @@
 # 默认是 audit（影子）模式：只计算“本该怎样”，不改写回答。
 mode = "audit"
 
-# 同一谓词下至少要有多少个不同数据主体共享同一精度桶。
+# 同一谓词下至少要有多少个不同数据主体共享同一精度桶；0 表示关闭检查。
 k_anonymity = 2
 max_closure_depth = 4
 max_closure_atoms = 256

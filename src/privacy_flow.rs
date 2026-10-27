@@ -659,7 +659,6 @@ impl PrivacyPolicy {
         for (category, precision) in default_category_precision() {
             self.category_precision.entry(category).or_insert(precision);
         }
-        self.k_anonymity = self.k_anonymity.max(1);
         self.max_closure_depth = self.max_closure_depth.max(1);
         self.max_closure_atoms = self.max_closure_atoms.max(1);
     }
@@ -860,9 +859,14 @@ impl PrivacyGraph {
         }
 
         let mut base = self.facts.clone();
-        base.push(target.clone());
+        let target_index = match base.iter().position(|fact| fact.key() == target.key()) {
+            Some(index) => index,
+            None => {
+                base.push(target.clone());
+                base.len() - 1
+            }
+        };
         let base_len = base.len();
-        let target_index = base_len - 1;
 
         let mut work: Vec<WorkFact> = base
             .iter()
@@ -2457,6 +2461,23 @@ mod tests {
         assert!(overlay
             .hide
             .contains(&("张三".to_string(), "地址".to_string())));
+    }
+
+    #[test]
+    fn zero_k_disables_anonymity_check() {
+        let mut policy = policy();
+        policy.k_anonymity = 0;
+        let mut graph = PrivacyGraph::new();
+        graph.add_fact(&policy, "张三", "地址", "北京市海淀区中关村大街1号");
+        let mut ledger = ledger();
+        let mut adjudicator = PrivacyAdjudicator::new(&policy, &graph, &mut ledger);
+        let decision = adjudicator.adjudicate(&DisclosureRequest::new(
+            "张三",
+            "地址",
+            "北京市海淀区中关村大街1号",
+        ));
+        assert_eq!(decision.effective_precision, DisclosurePrecision::Coarse);
+        assert!(!decision.codes.contains(&DecisionCode::KAnonymity));
     }
 
     #[test]
