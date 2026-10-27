@@ -1929,6 +1929,7 @@ impl ApiState {
                             let _ = reply.send(session.manager.dismiss_open_turn());
                         }
                         SessionCommand::Snapshot { reply } => {
+                            session.sync_knowledge();
                             let shared = shared_memory.snapshot_for(&session.id);
                             let evidence = shared_attention_items(shared.as_ref());
                             let _ = reply.send(serde_json::json!({
@@ -1980,6 +1981,7 @@ impl ApiState {
                             }));
                         }
                         SessionCommand::Layers { reply } => {
+                            session.sync_knowledge();
                             let manifest = session.reasoner.knowledge_layer_manifest();
                             let _ = reply.send(serde_json::json!({
                                 "session_id": session.id,
@@ -4507,6 +4509,10 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .await
             .expect("轮次应成功");
         assert!(!before.reply.contains("叶莉"), "{}", before.reply);
+        let layers_before = state.session_layers(&first).await.expect("层清单应可用");
+        let base_before = layers_before["manifest"]["layers"][0]["count"]
+            .as_u64()
+            .expect("L0 计数");
 
         let applied = state.assert_facts(
             &[PrologFact::Relation {
@@ -4518,6 +4524,14 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         );
         assert_eq!(applied, 1);
         assert_eq!(state.knowledge_snapshot().generation, 1);
+        let layers_after = state.session_layers(&first).await.expect("层清单应可用");
+        let base_after = layers_after["manifest"]["layers"][0]["count"]
+            .as_u64()
+            .expect("L0 计数");
+        assert!(
+            base_after > base_before,
+            "读取层清单前应追赶知识增量：{base_before} -> {base_after}"
+        );
 
         for session in [&first, &second] {
             let after = state
