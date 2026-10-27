@@ -262,6 +262,23 @@ impl FrameLedger {
         inherited
     }
 
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn from_json(text: &str) -> Option<Self> {
+        serde_json::from_str(text).ok()
+    }
+
+    pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
+    }
+
+    pub fn load_from_path(path: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Self::from_json(&text)
+    }
+
     pub fn render_state(&self) -> String {
         let mut output = String::new();
         let _ = writeln!(
@@ -766,6 +783,22 @@ mod tests {
         let frames = annotator.annotate(text);
         assert_eq!(frames.len(), 1, "{}", text);
         frames.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn book_and_ledger_round_trip_json_with_stable_digest() {
+        let book = book();
+        let digest = book.digest();
+        let restored = FrameBook::from_json(&book.to_json()).expect("book json");
+        assert_eq!(restored.len(), book.len());
+        assert_eq!(restored.digest(), digest);
+        assert!(digest.starts_with("book:"));
+
+        let mut ledger = FrameLedger::new();
+        ledger.observe(repair_frame("张三在北京用扳手修好了电脑"));
+        let restored = FrameLedger::from_json(&ledger.to_json()).expect("ledger json");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored.answer(Role::Location), Some("北京"));
     }
 
     #[test]

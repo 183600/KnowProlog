@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
-use crate::context_image::fnv1a_hex;
+use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::relation_frame::{EvidenceSpan, Polarity, RelationFrame};
 use crate::type_system::{TypeSystem, TypeVerdict};
 
@@ -923,6 +923,28 @@ impl FrameBook {
                     .find(|schema| schema.status == SchemaStatus::Active)
             })?;
         schema.realize(frame)
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn from_json(text: &str) -> Option<Self> {
+        serde_json::from_str(text).ok()
+    }
+
+    pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
+    }
+
+    pub fn load_from_path(path: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Self::from_json(&text)
+    }
+
+    pub fn digest(&self) -> String {
+        let value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        format!("book:{}", fnv1a_hex(canonical_json(&value).as_bytes()))
     }
 
     pub fn report(&self) -> String {
