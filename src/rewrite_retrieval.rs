@@ -562,13 +562,43 @@ impl Default for RewriteRetrievalConfig {
     }
 }
 
+fn unit(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn gain(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 10.0)
+    } else {
+        0.0
+    }
+}
+
 impl RewriteRetrievalConfig {
     fn clamped(&self) -> Self {
         let mut config = self.clone();
         config.max_hypotheses = config.max_hypotheses.clamp(1, 8);
         config.max_probes = config.max_probes.clamp(1, 4);
         config.per_probe_k = config.per_probe_k.clamp(1, 20);
-        config.partial_discount = config.partial_discount.clamp(0.0, 1.0);
+        config.accept_threshold = unit(config.accept_threshold);
+        config.clarify_threshold = unit(config.clarify_threshold).min(config.accept_threshold);
+        config.accept_margin = unit(config.accept_margin);
+        config.min_support = unit(config.min_support);
+        config.min_coverage = unit(config.min_coverage);
+        config.min_margin = unit(config.min_margin);
+        config.support_pivot = unit(config.support_pivot);
+        config.coverage_pivot = unit(config.coverage_pivot);
+        config.margin_pivot = unit(config.margin_pivot);
+        config.consistency_pivot = unit(config.consistency_pivot);
+        config.support_gain = gain(config.support_gain);
+        config.coverage_gain = gain(config.coverage_gain);
+        config.margin_gain = gain(config.margin_gain);
+        config.consistency_gain = gain(config.consistency_gain);
+        config.partial_discount = unit(config.partial_discount);
         config
     }
 }
@@ -1442,6 +1472,27 @@ mod tests {
         assert!((report.coverage() - 0.5).abs() < 1e-9);
         assert!((report.precision() - 1.0).abs() < 1e-9);
         assert!(report.render_text().contains("精确率 1.00"));
+    }
+
+    #[test]
+    fn config_clamping_bounds_thresholds_and_preserves_defaults() {
+        let defaults = RewriteRetrievalConfig::default();
+        assert_eq!(defaults.clone().clamped(), defaults);
+
+        let mut config = RewriteRetrievalConfig::default();
+        config.max_hypotheses = 0;
+        config.accept_threshold = 2.0;
+        config.clarify_threshold = 3.0;
+        config.min_support = -1.0;
+        config.support_gain = 100.0;
+        config.partial_discount = f64::NAN;
+        let clamped = config.clamped();
+        assert_eq!(clamped.max_hypotheses, 1);
+        assert_eq!(clamped.accept_threshold, 1.0);
+        assert_eq!(clamped.clarify_threshold, 1.0);
+        assert_eq!(clamped.min_support, 0.0);
+        assert_eq!(clamped.support_gain, 10.0);
+        assert_eq!(clamped.partial_discount, 0.0);
     }
 
     #[test]
