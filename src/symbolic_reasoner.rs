@@ -46,7 +46,8 @@ use crate::graph_repair::{
 use crate::graph_walk_embedding::GraphWalkEmbedding;
 use crate::holographic_memory::HolographicMemory;
 use crate::joint_parse::{
-    joint_parse, verify_frames, FrameVerification, JointContext, JointParse, JointParseOptions,
+    joint_parse, verify_frames, FrameVerification, JointContext, JointFrame, JointParse,
+    JointParseOptions,
 };
 use crate::knowledge_layers::{KnowledgeLayerManifest, LayerEntry};
 use crate::law_book::{LawBook, LawStatus};
@@ -120,11 +121,7 @@ fn term_span(question: &str, term: &str) -> Option<TextSpan> {
     Some(TextSpan::new(start, start + term.chars().count()))
 }
 
-fn insert_type_hint(
-    hints: &mut BTreeMap<String, BTreeSet<String>>,
-    entity: &str,
-    etype: &str,
-) {
+fn insert_type_hint(hints: &mut BTreeMap<String, BTreeSet<String>>, entity: &str, etype: &str) {
     let entity = entity.trim();
     let etype = etype.trim();
     if entity.is_empty() || etype.is_empty() {
@@ -11282,13 +11279,8 @@ impl SymbolicReasoner {
         if let Some(plan) = self.planner.parse(question) {
             let bonus = self.rewrite_retrieval_context_bonus(&plan);
             candidates.push(
-                HypothesisCandidate::new(
-                    HypothesisSource::ExactPlan,
-                    "planner",
-                    question,
-                    plan,
-                )
-                .with_context_bonus(bonus),
+                HypothesisCandidate::new(HypothesisSource::ExactPlan, "planner", question, plan)
+                    .with_context_bonus(bonus),
             );
         }
         let lexicon = self.relation_lexicon();
@@ -14124,6 +14116,47 @@ impl SymbolicReasoner {
             self.context.last_predicate(),
             crate::contextual_segmentation::DEFAULT_AMBIGUITY_MARGIN,
         )
+    }
+
+    /// 联合解析并把无硬冲突的帧回写到对话上下文，供后续指代与生成复用。
+    pub fn joint_parse_report_and_observe(&mut self, input_raw: &str) -> String {
+        let (focus, expected) = self.contextual_focus();
+        let predicate = self.context.last_predicate().map(str::to_string);
+        let parsed = self.joint_parse_result(
+            input_raw,
+            &focus,
+            &expected,
+            predicate.as_deref(),
+            crate::contextual_segmentation::DEFAULT_AMBIGUITY_MARGIN,
+        );
+        let healthy: Vec<&JointFrame> = parsed
+            .frames
+            .iter()
+            .filter(|frame| !frame.is_hard_failure())
+            .collect();
+        if !healthy.is_empty() {
+            let mut entities = Vec::with_capacity(healthy.len() * 2);
+            for frame in &healthy {
+                entities.push((
+                    frame.subject.canonical.clone(),
+                    frame.subject_types.first().cloned(),
+                ));
+                entities.push((
+                    frame.object.canonical.clone(),
+                    frame.object_types.first().cloned(),
+                ));
+            }
+            self.context.record_entities_typed(&entities);
+            if let Some(frame) = healthy.iter().max_by(|left, right| {
+                left.original
+                    .confidence
+                    .total_cmp(&right.original.confidence)
+                    .then_with(|| right.original.id.cmp(&left.original.id))
+            }) {
+                self.context.record_predicate(&frame.normalized.predicate);
+            }
+        }
+        parsed.render_report()
     }
 
     /// 与 [`Self::joint_parse_report`] 相同，但允许命令行显式给出焦点/类型/谓词。
@@ -27004,10 +27037,23 @@ types = [
         assert!(report.contains("苹果公司"), "{}", report);
         assert!(report.contains("回写上下文"), "{}", report);
         assert!(!report.contains("冲突：类型互斥"), "{}", report);
+        assert!(reasoner.context.focus_entities().is_empty());
+
+        let report = reasoner.joint_parse_report_and_observe("苹果的创始人是乔布斯");
+        assert!(report.contains("苹果公司"), "{}", report);
+        assert_eq!(
+            reasoner
+                .context
+                .focus_entities()
+                .first()
+                .map(String::as_str),
+            Some("苹果公司")
+        );
+        assert_eq!(reasoner.context.focus_type("苹果公司"), Some("公司"));
+        assert_eq!(reasoner.context.last_predicate(), Some("创始人"));
 
         let expected = vec![RelationFrame::new("苹果公司", "创始人", "乔布斯")];
-        let verification =
-            reasoner.verify_joint_generation("苹果的创始人是乔布斯", &expected);
+        let verification = reasoner.verify_joint_generation("苹果的创始人是乔布斯", &expected);
         assert!(verification.passed, "{:?}", verification);
     }
 

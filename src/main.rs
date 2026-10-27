@@ -53,6 +53,7 @@ use know_prolog::{
     },
     import_frames::{FrameLoad as ImportFrameLoad, ImportFrameLedger},
     import_journal::{ImportJournal, JournalLoad},
+    joint_parse::verify_frames,
     knowledge_fusion::{
         Adjudication, FusionPolicy, NamespaceKind, NamespaceRecord, NamespaceStatus, TrustLevel,
     },
@@ -93,7 +94,6 @@ use know_prolog::{
     recovery::RecoveryMode,
     reference_probe::{self, GroundingLedger, ProbeDecision, ProbeStatus},
     relation_acquisition::{GoalOpen, RelationAcquisition},
-    joint_parse::verify_frames,
     relation_frame::{
         diagnose as diagnose_frames, narrate_frame, FrameExtractor, FrameGate, RelationFrame,
         FRAME_DIALECT,
@@ -5791,13 +5791,7 @@ async fn run_joint_parse(
         }
     };
     let reasoner = build_store_reasoner(config, manager, store_path, &facts).await;
-    let result = reasoner.joint_parse_result(
-        &source,
-        context,
-        expected_types,
-        predicate,
-        margin,
-    );
+    let result = reasoner.joint_parse_result(&source, context, expected_types, predicate, margin);
     if json {
         match serde_json::to_string_pretty(&result) {
             Ok(rendered) => println!("{}", rendered),
@@ -7239,9 +7233,8 @@ async fn build_store_reasoner(
     );
     reasoner.set_nlp_config(config.nlp.clone());
     if config.semantic_grammar.enabled {
-        reasoner.attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(
-            config,
-        ));
+        reasoner
+            .attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(config));
     }
     if let Ok(memory) = oxigraph_manager.load_lexical_memory().await {
         if !memory.is_empty() {
@@ -11963,7 +11956,10 @@ async fn run_interactive_mode(
                 println!("请提供要联合解析的文本，例如：联合解析：苹果的创始人是乔布斯");
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                println!("{}", symbolic_reasoner.joint_parse_report(target));
+                println!(
+                    "{}",
+                    symbolic_reasoner.joint_parse_report_and_observe(target)
+                );
             }
             println!();
             continue;
