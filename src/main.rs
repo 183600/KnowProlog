@@ -79,6 +79,11 @@ use know_prolog::{
     pattern_ir::{self, PatternLibrary},
     perf_ledger::PerfLedger,
     plugin::{PluginRegistry, PluginRuntime, PluginSessionState, PluginSettings},
+    privacy_flow::{
+        self, ConsentScope, DisclosurePrecision, DisclosureRequest, PolicyMode,
+        PrivacyAdjudicator, PrivacyCategory, PrivacyGraph, PrivacyLedger, PrivacyPolicy,
+        SpanDetector,
+    },
     prolog_engine::PrologEngine,
     prolog_engine::PrologFact,
     prompt_spec::{self, LintSeverity, PromptMode},
@@ -223,6 +228,53 @@ enum Commands {
         /// treated as answers to that clarification until the session ends.
         #[arg(long)]
         clarify: bool,
+    },
+    /// Adjudicate sensitive spans and facts through the POS-typed privacy
+    /// flow contract. Audit mode (default) only computes what would happen;
+    /// --enforce rewrites/hides values and records the session ledger
+    Privacy {
+        /// Text to scan for sensitive spans; "-" reads from stdin
+        #[arg(long)]
+        text: Option<String>,
+        /// Fact to adjudicate as SUBJECT|PREDICATE|OBJECT (repeatable)
+        #[arg(long = "fact", value_name = "S|P|O")]
+        fact: Vec<String>,
+        /// Question text; its interrogative type constrains the replacement
+        #[arg(long)]
+        question: Option<String>,
+        /// Purpose of this disclosure (default: 问答)
+        #[arg(long, default_value = "问答")]
+        purpose: String,
+        /// Requested precision: exact / granular / coarse / type / hidden
+        #[arg(long, default_value = "exact")]
+        precision: String,
+        /// Override the k-anonymity threshold
+        #[arg(long)]
+        k: Option<usize>,
+        /// Enforce the policy instead of audit/shadow mode
+        #[arg(long)]
+        enforce: bool,
+        /// Grant session consent as SUBJECT|CATEGORY|PURPOSE (repeatable)
+        #[arg(long = "grant", value_name = "S|CATEGORY|PURPOSE")]
+        grant: Vec<String>,
+        /// Grant one-time consent as SUBJECT|CATEGORY|PURPOSE (repeatable)
+        #[arg(long = "grant-once", value_name = "S|CATEGORY|PURPOSE")]
+        grant_once: Vec<String>,
+        /// Revoke consent as SUBJECT|CATEGORY|PURPOSE (repeatable)
+        #[arg(long = "revoke", value_name = "S|CATEGORY|PURPOSE")]
+        revoke: Vec<String>,
+        /// Forget all facts about a subject, or SUBJECT|CATEGORY (repeatable)
+        #[arg(long = "forget", value_name = "SUBJECT[|CATEGORY]")]
+        forget: Vec<String>,
+        /// Policy file (TOML or JSON); defaults are used when omitted
+        #[arg(long)]
+        policy: Option<String>,
+        /// Session ledger JSON to load and save
+        #[arg(long)]
+        session: Option<String>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Explore transitive closure over open predicates in a session ledger:
     /// observe text/triples, ask "all", confirm or reject a transitive
@@ -1524,6 +1576,44 @@ async fn main() {
             *max_depth,
             *max_nodes,
             *max_expansions,
+            *json,
+        );
+        return;
+    }
+
+    // 隐私裁决完全离线：只读策略/会话台账，不打开知识存储。
+    if let Some(Commands::Privacy {
+        text,
+        fact,
+        question,
+        purpose,
+        precision,
+        k,
+        enforce,
+        grant,
+        grant_once,
+        revoke,
+        forget,
+        policy,
+        session,
+        json,
+    }) = &cli.command
+    {
+        run_privacy(
+            text.as_deref(),
+            fact,
+            question.as_deref(),
+            purpose,
+            precision,
+            *k,
+            *enforce,
+            grant,
+            grant_once,
+            revoke,
+            forget,
+            policy.as_deref(),
+            session.as_deref(),
+            &cli.config,
             *json,
         );
         return;
@@ -3405,6 +3495,8 @@ async fn main() {
         Some(Commands::ConfigFulfillment { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::OpenClosure { .. }) => {}
+        // 已在加载配置前处理（见 main 顶部早期分派）
+        Some(Commands::Privacy { .. }) => {}
         Some(Commands::EvalQuality {
             baseline,
             update_baseline,
@@ -5997,6 +6089,385 @@ fn run_open_closure(
     for warning in &warnings {
         eprintln!("{}", warning);
     }
+}
+
+
+/// `privacy`：词性类型化的信息流契约。默认影子审计，`--enforce` 才改写。
+#[allow(clippy::too_many_arguments)]
+fn run_privacy(
+    text: Option<&str>,
+    facts: &[String],
+    question: Option<&str>,
+    purpose: &str,
+    precision: &str,
+    k: Option<usize>,
+    enforce: bool,
+    grants: &[String],
+    grants_once: &[String],
+    revokes: &[String],
+    forgets: &[String],
+    policy_path: Option<&str>,
+    session_path: Option<&str>,
+    config_path: &str,
+    json: bool,
+) {
+    let mut policy = match policy_path {
+        Some(path) => match load_privacy_policy(path) {
+            Ok(policy) => policy,
+            Err(error) => {
+                eprintln!("读取隐私策略失败（{}）：{}", path, error);
+                std::process::exit(1);
+            }
+        },
+        None => PrivacyPolicy::default(),
+    };
+    if enforce {
+        policy.mode = PolicyMode::Enforce;
+    }
+    let requested = match DisclosurePrecision::parse(precision) {
+        Some(precision) => precision,
+        None => {
+            eprintln!("未知精度「{}」：可选 exact / granular / coarse / type / hidden", precision);
+            std::process::exit(2);
+        }
+    };
+
+    let mut parsed_facts = Vec::new();
+    for raw in facts {
+        match parse_privacy_fact(raw) {
+            Ok(fact) => parsed_facts.push(fact),
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let text_owned = match text {
+        Some("-") => {
+            let mut content = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut content) {
+                eprintln!("读取标准输入失败：{}", error);
+                std::process::exit(1);
+            }
+            Some(content)
+        }
+        Some(value) => Some(value.to_string()),
+        None => None,
+    };
+    if text_owned.is_none() && parsed_facts.is_empty() {
+        eprintln!("请至少提供 --text 或 --fact \"主语|谓词|宾语\"");
+        std::process::exit(2);
+    }
+
+    let mut ledger = match session_path {
+        Some(path) if std::path::Path::new(path).exists() => {
+            let content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(error) => {
+                    eprintln!("读取隐私台账失败（{}）：{}", path, error);
+                    std::process::exit(1);
+                }
+            };
+            match PrivacyLedger::from_json(&content) {
+                Ok(ledger) => ledger,
+                Err(error) => {
+                    eprintln!("解析隐私台账失败（{}）：{}", path, error);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => PrivacyLedger::new(),
+    };
+    ledger.begin_turn();
+
+    for raw in grants {
+        match parse_privacy_consent(raw) {
+            Ok((subject, category, purpose)) => {
+                ledger.grant(&subject, category, &purpose, ConsentScope::Session);
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    for raw in grants_once {
+        match parse_privacy_consent(raw) {
+            Ok((subject, category, purpose)) => {
+                ledger.grant(&subject, category, &purpose, ConsentScope::Once);
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    for raw in revokes {
+        match parse_privacy_consent(raw) {
+            Ok((subject, category, purpose)) => {
+                ledger.revoke(&subject, category, &purpose);
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    for raw in forgets {
+        match parse_privacy_forget(raw) {
+            Ok((subject, Some(category))) => {
+                ledger.forget_category(&subject, category, "命令行 --forget");
+            }
+            Ok((subject, None)) => {
+                ledger.forget_subject(&subject, "命令行 --forget");
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+
+    let annotated = text_owned.as_deref().map(|text| {
+        std::fs::read_to_string(config_path)
+            .ok()
+            .and_then(|content| toml::from_str::<SystemConfig>(&content).ok())
+            .map(|config| know_prolog::nlp::preprocess_annotated(text, &config.nlp))
+            .unwrap_or_default()
+    });
+    let spans = text_owned
+        .as_deref()
+        .map(|text| {
+            SpanDetector::new(&policy).scan(
+                text,
+                annotated.as_deref().unwrap_or(&[]),
+            )
+        })
+        .unwrap_or_default();
+
+    let mut graph = PrivacyGraph::new();
+    for (subject, predicate, object) in &parsed_facts {
+        graph.add_fact(&policy, subject, predicate, object);
+    }
+
+    let mut decisions = Vec::new();
+    {
+        let mut adjudicator = PrivacyAdjudicator::new(&policy, &graph, &mut ledger);
+        for (subject, predicate, object) in &parsed_facts {
+            let mut request = DisclosureRequest::new(subject, predicate, object)
+                .with_purpose(purpose)
+                .with_precision(requested);
+            if let Some(question) = question {
+                request = request.with_question(question);
+            }
+            if let Some(k) = k {
+                request = request.with_k(k);
+            }
+            decisions.push((
+                subject.clone(),
+                predicate.clone(),
+                object.clone(),
+                adjudicator.adjudicate(&request),
+            ));
+        }
+    }
+
+    if let Some(path) = session_path {
+        let canonical = match ledger.canonical_json() {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                eprintln!("隐私台账序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        };
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        if let Err(error) = std::fs::write(path, canonical) {
+            eprintln!("写入隐私台账失败（{}）：{}", path, error);
+            std::process::exit(1);
+        }
+    }
+
+    if json {
+        let fact_reports: Vec<serde_json::Value> = decisions
+            .iter()
+            .map(|(subject, predicate, object, decision)| {
+                serde_json::json!({
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object,
+                    "decision": decision,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "mode": policy.mode.code(),
+            "requested_precision": requested.code(),
+            "spans": spans,
+            "facts": fact_reports,
+            "ledger": ledger,
+            "ledger_digest": ledger.digest(),
+            "session": session_path,
+        });
+        match serde_json::to_string_pretty(&report) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("隐私报告序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    println!("策略模式：{}", policy.mode.label());
+    if text_owned.is_some() {
+        if spans.is_empty() {
+            println!("敏感跨度：未发现（强规则与词性弱证据均未命中）");
+        } else {
+            println!("敏感跨度（{}）：", spans.len());
+            for span in &spans {
+                println!("  {}", span.render());
+            }
+        }
+    }
+    if !decisions.is_empty() {
+        println!("事实裁决（{}）：", decisions.len());
+        for (subject, predicate, object, decision) in &decisions {
+            print!(
+                "{}",
+                render_privacy_decision(subject, predicate, object, decision)
+            );
+        }
+    }
+    println!(
+        "台账：第 {} 轮，授权 {} 条，披露 {} 条，墓碑 {} 条（摘要 {}）",
+        ledger.turn,
+        ledger.consents.len(),
+        ledger.disclosures.len(),
+        ledger.tombstones.len(),
+        ledger.digest()
+    );
+    if let Some(path) = session_path {
+        println!("会话台账已写入 {}。", path);
+    }
+}
+
+fn render_privacy_decision(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    decision: &privacy_flow::DisclosureDecision,
+) -> String {
+    let mut output = format!(
+        "  {} {} {}
+    结论：{}（{}；请求 {} → 实际 {}）
+",
+        subject,
+        predicate,
+        object,
+        decision.status.label(),
+        decision.category.label(),
+        decision.requested_precision.label(),
+        decision.effective_precision.label()
+    );
+    match &decision.replacement {
+        Some(value) => output.push_str(&format!("    可披露：{}
+", value)),
+        None => output.push_str("    可披露：（已省略）
+"),
+    }
+    if !decision.codes.is_empty() {
+        let codes: Vec<&str> = decision.codes.iter().map(|code| code.code()).collect();
+        output.push_str(&format!("    决策码：{}
+", codes.join(", ")));
+    }
+    if !decision.inference_leaks.is_empty() {
+        output.push_str("    组合推导风险：
+");
+        for leak in &decision.inference_leaks {
+            output.push_str(&format!("      - {}
+", leak.render()));
+        }
+    }
+    output.push_str(&format!(
+        "    回执：{} / {} / {}
+",
+        decision.receipt.status.code(),
+        decision.receipt.effective_precision.code(),
+        decision.receipt.fact_digest
+    ));
+    if let Some(audit) = &decision.audit {
+        output.push_str(&format!(
+            "    影子结论：{}，{}；（执行模式才会生效）
+",
+            audit.would_be_status.label(),
+            audit.would_be_precision.label()
+        ));
+    }
+    output
+}
+
+fn load_privacy_policy(path: &str) -> Result<PrivacyPolicy, String> {
+    let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut policy = match toml::from_str::<PrivacyPolicy>(&content) {
+        Ok(policy) => policy,
+        Err(toml_error) => serde_json::from_str::<PrivacyPolicy>(&content).map_err(|json_error| {
+            format!("TOML: {}；JSON: {}", toml_error, json_error)
+        })?,
+    };
+    policy.merge_default_rules();
+    Ok(policy)
+}
+
+fn parse_privacy_fact(raw: &str) -> Result<(String, String, String), String> {
+    let mut parts = raw.splitn(3, '|');
+    let subject = parts.next().unwrap_or_default().trim();
+    let predicate = parts.next().unwrap_or_default().trim();
+    let object = parts.next().unwrap_or_default().trim();
+    if subject.is_empty() || predicate.is_empty() || object.is_empty() {
+        return Err(format!(
+            "事实格式应为 主语|谓词|宾语（收到「{}」）",
+            raw
+        ));
+    }
+    Ok((
+        subject.to_string(),
+        predicate.to_string(),
+        object.to_string(),
+    ))
+}
+
+fn parse_privacy_consent(raw: &str) -> Result<(String, PrivacyCategory, String), String> {
+    let mut parts = raw.splitn(3, '|');
+    let subject = parts.next().unwrap_or_default().trim();
+    let category = parts.next().unwrap_or_default().trim();
+    let purpose = parts.next().unwrap_or_default().trim();
+    let category = PrivacyCategory::parse(category)
+        .ok_or_else(|| format!("未知隐私类别「{}」（例：contact / 联系方式）", category))?;
+    if subject.is_empty() {
+        return Err(format!("授权格式应为 主语|类别|用途（收到「{}」）", raw));
+    }
+    let purpose = if purpose.is_empty() { "问答" } else { purpose };
+    Ok((subject.to_string(), category, purpose.to_string()))
+}
+
+fn parse_privacy_forget(raw: &str) -> Result<(String, Option<PrivacyCategory>), String> {
+    let mut parts = raw.splitn(2, '|');
+    let subject = parts.next().unwrap_or_default().trim();
+    if subject.is_empty() {
+        return Err(format!("遗忘格式应为 主语[|类别]（收到「{}」）", raw));
+    }
+    let category = match parts.next() {
+        Some(value) => Some(PrivacyCategory::parse(value.trim()).ok_or_else(|| {
+            format!("未知隐私类别「{}」（例：health / 健康）", value.trim())
+        })?),
+        None => None,
+    };
+    Ok((subject.to_string(), category))
 }
 
 /// `forge`：离线从正例/反例归纳 token 正则，打印展开与探针结果。

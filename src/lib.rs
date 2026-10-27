@@ -113,6 +113,7 @@ pub mod plugin;
 pub mod predicate_registry;
 pub mod prediction_draft;
 pub mod predictive_elaboration;
+pub mod privacy_flow;
 pub mod probabilistic_query_intent;
 pub mod problog;
 pub mod prolog_engine;

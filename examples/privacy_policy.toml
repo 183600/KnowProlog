@@ -1,0 +1,60 @@
+# 词性类型化的信息流契约示例策略。
+# 用法：knowprolog privacy --policy examples/privacy_policy.toml \
+#         --fact '张三|电话|13800138000' --enforce
+#
+# 默认是 audit（影子）模式：只计算“本该怎样”，不改写回答。
+mode = "audit"
+
+# 同一谓词下至少要有多少个不同数据主体共享同一精度桶。
+k_anonymity = 2
+max_closure_depth = 4
+max_closure_atoms = 256
+
+# 弱证据（结巴人名/地名兜底）默认只提示；设为 true 才会硬拦。
+weak_evidence_blocks = false
+
+# 需要数据主体显式授权的类别；一次性授权可用 --grant-once。
+consent_required = [
+  "contact",
+  "credential",
+  "health",
+  "finance",
+  "demographic",
+]
+
+[category_precision]
+personal_identity = "exact"
+contact = "type"
+credential = "type"
+location = "coarse"
+health = "type"
+finance = "type"
+demographic = "coarse"
+relationship = "coarse"
+other = "exact"
+
+[sensitive_terms]
+"病历" = "health"
+"病史" = "health"
+"诊断书" = "health"
+"处方" = "health"
+"过敏史" = "health"
+"身份证号" = "credential"
+"银行卡号" = "finance"
+"家庭住址" = "location"
+
+# 逐谓词覆盖：就诊医院比普通健康属性更敏感时，可单独收紧。
+[[predicate_rules]]
+contains = "就诊医院"
+category = "health"
+max_precision = "type"
+
+# 组合推导：?s 就读学校 ?m；?m 位于 ?o ⇒ ?s 所在城区 ?o。
+# 披露学校名称会与公开的学校位置组合出学生所在城区，因此收紧到 type。
+[[inference_rules]]
+name = "学校位置推断城区"
+first = "就读学校"
+second = "位于"
+conclusion = "所在城区"
+category = "location"
+max_precision = "type"
