@@ -118,13 +118,7 @@ impl ImportEpisode {
     pub fn line(&self) -> String {
         let mut line = format!(
             "B{}｜{}｜{}｜{} 条断言（新增 {}，重复 {}）｜{}",
-            self.seq,
-            self.source,
-            self.format,
-            self.total,
-            self.added,
-            self.duplicates,
-            self.id
+            self.seq, self.source, self.format, self.total, self.added, self.duplicates, self.id
         );
         if self.blank_nodes {
             line.push_str("｜含空白节点：批次 id 可能随解析变化");
@@ -316,12 +310,7 @@ fn display_term(term: &Term) -> String {
 
 fn top_counts(counts: BTreeMap<String, usize>, limit: usize) -> Vec<(String, usize)> {
     let mut entries: Vec<(String, usize)> = counts.into_iter().collect();
-    entries.sort_by(|left, right| {
-        right
-            .1
-            .cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
+    entries.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     entries.truncate(limit);
     entries
 }
@@ -470,10 +459,7 @@ pub fn episode_quads(episode: &ImportEpisode) -> EpisodeResult<Vec<Quad>> {
         (P_DUPLICATES, episode.duplicates.to_string()),
         (P_BLANK_NODES, episode.blank_nodes.to_string()),
         (P_IMPORTED_AT, episode.imported_at.to_string()),
-        (
-            P_INPUT_NAMED_GRAPHS,
-            episode.input_named_graphs.to_string(),
-        ),
+        (P_INPUT_NAMED_GRAPHS, episode.input_named_graphs.to_string()),
     ] {
         quads.push(literal_quad(&subject, predicate, &value, &graph)?);
     }
@@ -531,7 +517,11 @@ pub fn parse_episode_graph(quads: impl Iterator<Item = Quad>) -> Vec<ImportEpiso
             }
         }
     }
-    episodes.sort_by(|left, right| left.seq.cmp(&right.seq).then_with(|| left.id.cmp(&right.id)));
+    episodes.sort_by(|left, right| {
+        left.seq
+            .cmp(&right.seq)
+            .then_with(|| left.id.cmp(&right.id))
+    });
     episodes.dedup_by(|left, right| left.id == right.id);
     episodes
 }
@@ -687,16 +677,9 @@ pub fn looks_like_episode_reference(text: &str) -> bool {
     }
     let trimmed = text.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if [
-        "导出",
-        "export",
-        "导入",
-        "import",
-        "sparql",
-        "查询sparql",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
+    if ["导出", "export", "导入", "import", "sparql", "查询sparql"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
     {
         return false;
     }
@@ -716,11 +699,7 @@ fn source_matches(source: &str, text: &str) -> bool {
     if text.contains(source) {
         return true;
     }
-    let base = source
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(source)
-        .trim();
+    let base = source.rsplit(['/', '\\']).next().unwrap_or(source).trim();
     base.chars().count() >= 3 && text.contains(base)
 }
 
@@ -815,7 +794,12 @@ pub fn render_episode_brief(episode: &ImportEpisode) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
         "批次 B{}｜来源 {}｜格式 {}｜{} 条断言（新增 {}，重复 {}）",
-        episode.seq, episode.source, episode.format, episode.total, episode.added, episode.duplicates
+        episode.seq,
+        episode.source,
+        episode.format,
+        episode.total,
+        episode.added,
+        episode.duplicates
     ));
     lines.push(format!(
         "稳定 id {}｜批次图 {}",
@@ -887,7 +871,8 @@ pub fn render_episode_brief(episode: &ImportEpisode) -> String {
 /// 批次台账：按 seq 升序；超过上限时只展示最近 N 批并说明总数。
 pub fn render_episode_ledger(episodes: &[ImportEpisode]) -> String {
     if episodes.is_empty() {
-        return "还没有 RDF 导入批次。用 import-rdf 或「导入rdf文件：」导入后会自动记账。".to_string();
+        return "还没有 RDF 导入批次。用 import-rdf 或「导入rdf文件：」导入后会自动记账。"
+            .to_string();
     }
     let mut ordered: Vec<&ImportEpisode> = episodes.iter().collect();
     ordered.sort_by_key(|episode| episode.seq);
