@@ -16911,6 +16911,16 @@ mod session_tests {
     }
 
     #[test]
+    fn rewrite_book_loads_from_store_path() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let path = dir.path().join("rewrite_book.json");
+        RewriteBook::new().save_to_path(&path).expect("写入手册");
+        let loaded =
+            load_rewrite_book(dir.path().to_str().expect("utf-8 路径")).expect("应读回手册");
+        assert_eq!(loaded.dialect, RewriteBook::new().dialect);
+    }
+
+    #[test]
     fn rewrite_retrieval_eval_cli_parses_corpus_and_flags() {
         let cli = Cli::try_parse_from([
             "knowprolog",
