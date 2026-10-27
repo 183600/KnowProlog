@@ -46,6 +46,7 @@
 //! - `DELETE /v1/memory/{claim}`    撤回全局共享声明
 //! - `GET  /v1/knowledge`          进程内知识台账（事实/别名版本与指纹）
 //! - `POST /v1/knowledge/facts`    追加全局事实（下一轮对所有活跃会话可见）
+//! - `PUT  /v1/knowledge/facts`    整表替换全局事实（懒重建，可更正/撤回）
 //! - `POST /v1/knowledge/aliases`  准入实体别名（下一轮对所有活跃会话可见）
 //! - `POST /sessions/{id}/turns`   一轮对话；`Accept: text/event-stream`
 //!   或 `?stream=1` 时按句 SSE 流式返回。轮次有墙钟预算（默认 30 秒 Enforce），
@@ -656,6 +657,11 @@ impl Session {
                         KnowledgeChange::Aliases { aliases: batch, .. } => {
                             self.reasoner.align_entity_aliases(batch);
                             aliases += batch.len();
+                        }
+                        KnowledgeChange::Reset { .. } => {
+                            let snapshot = self.knowledge.snapshot();
+                            self.reasoner.rebuild_from_graph(&snapshot.facts);
+                            self.reasoner.align_entity_aliases(&snapshot.aliases);
                         }
                     }
                 }
@@ -1459,6 +1465,10 @@ impl WarmBase {
         self.reasoner.lock().observe_facts(facts);
     }
 
+    fn rebuild_from_graph(&self, facts: &[PrologFact]) {
+        self.reasoner.lock().rebuild_from_graph(facts);
+    }
+
     /// 知识版本（分叉基座当前携带的 revision，供审计与测试）。
     pub fn revision(&self) -> u64 {
         self.reasoner.lock().revision()
@@ -1532,6 +1542,7 @@ pub struct ApiState {
     stateless_answers: Arc<parking_lot::Mutex<RevisionLru<TurnResponse, CacheEpoch>>>,
     /// 知识写入纪元：每次事实/别名写入推进，旧缓存整体失效。
     kb_revision: AtomicU64,
+    knowledge_write: parking_lot::Mutex<()>,
     /// 质量护照索引（由宿主注入；只读派生数据，供会话生成出处/冲突/缺口话语）。
     quality: Option<Arc<QualityIndex>>,
     /// 插件运行时（由宿主注入；多会话共享，模式在注入时确定）。
@@ -1584,6 +1595,7 @@ impl ApiState {
                 STATELESS_CACHE_CAPACITY,
             ))),
             kb_revision: AtomicU64::new(0),
+            knowledge_write: parking_lot::Mutex::new(()),
             quality: None,
             plugin: None,
             identity_epoch: AtomicU64::new(0),
@@ -1674,6 +1686,7 @@ impl ApiState {
     /// 宿主注入实体身份注册表里已确认的持久别名（别名与规范名同权），
     /// 使 CLI 里签过字的指称在 HTTP 会话同样可解。返回生效条数。
     pub fn align_entity_aliases(&self, aliases: &[(String, String)]) -> usize {
+        let _write = self.knowledge_write.lock();
         self.warm.reasoner.lock().align_entity_aliases(aliases);
         let admitted = self.knowledge.record_aliases(aliases, "host");
         if !admitted.is_empty() {
@@ -1684,6 +1697,7 @@ impl ApiState {
     }
 
     pub fn assert_facts(&self, facts: &[PrologFact], source: &str) -> usize {
+        let _write = self.knowledge_write.lock();
         let missing = self.knowledge.missing_facts(facts);
         if missing.is_empty() {
             return 0;
@@ -1695,6 +1709,19 @@ impl ApiState {
         }
         self.bump_knowledge_epoch();
         admitted.len()
+    }
+
+    pub fn replace_facts(&self, facts: Vec<PrologFact>, source: &str) -> bool {
+        let _write = self.knowledge_write.lock();
+        if self.knowledge.snapshot().facts.as_slice() == facts.as_slice() {
+            return false;
+        }
+        self.warm.rebuild_from_graph(&facts);
+        let changed = self.knowledge.replace_facts(facts, source);
+        if changed {
+            self.bump_knowledge_epoch();
+        }
+        changed
     }
 
     fn bump_knowledge_epoch(&self) {
@@ -2543,6 +2570,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "DELETE /v1/memory/{claim}",
                     "GET /v1/knowledge",
                     "POST /v1/knowledge/facts",
+                    "PUT /v1/knowledge/facts",
                     "POST /v1/knowledge/aliases",
                     "GET /v1/models",
                     "GET /v1/prompts",
@@ -2635,8 +2663,9 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
             handle_shared_memory_view(state, session).await
         }
         ("POST", ["v1", "memory"]) => handle_shared_memory_publish(state, request, None).await,
-        ("GET", ["v1", "knowledge"]) => handle_knowledge_view(state).await,
+        ("GET", ["v1", "knowledge"]) => handle_knowledge_view(state, request).await,
         ("POST", ["v1", "knowledge", "facts"]) => handle_knowledge_assert(state, request).await,
+        ("PUT", ["v1", "knowledge", "facts"]) => handle_knowledge_replace(state, request).await,
         ("POST", ["v1", "knowledge", "aliases"]) => {
             handle_knowledge_aliases(state, request).await
         }
@@ -2942,19 +2971,49 @@ fn parse_knowledge_aliases(payload: &serde_json::Value) -> Result<Vec<(String, S
         .collect()
 }
 
-async fn handle_knowledge_view(state: &Arc<ApiState>) -> Response {
-    let snapshot = state.knowledge.snapshot();
-    Response::json(
-        200,
-        &serde_json::json!({
-            "generation": snapshot.generation,
-            "facts": snapshot.facts.len(),
-            "aliases": snapshot.aliases,
-            "fingerprint": snapshot.fingerprint,
-            "journal": snapshot.journal_len,
-            "cache_epoch": state.cache_epoch().kb_revision,
+fn fact_to_json(fact: &PrologFact) -> serde_json::Value {
+    match fact {
+        PrologFact::Entity {
+            name,
+            entity_type,
+            properties,
+        } => {
+            let properties: BTreeMap<&String, &String> = properties.iter().collect();
+            serde_json::json!({
+                "kind": "entity",
+                "name": name,
+                "entity_type": entity_type,
+                "properties": properties,
+            })
+        }
+        PrologFact::Relation { from, rel_type, to } => serde_json::json!({
+            "kind": "relation",
+            "from": from,
+            "rel_type": rel_type,
+            "to": to,
         }),
-    )
+    }
+}
+
+async fn handle_knowledge_view(state: &Arc<ApiState>, request: &Request) -> Response {
+    let snapshot = state.knowledge.snapshot();
+    let include_facts = request
+        .query
+        .get("include_facts")
+        .map(|value| value == "1" || value == "true")
+        .unwrap_or(false);
+    let mut body = serde_json::json!({
+        "generation": snapshot.generation,
+        "facts": snapshot.facts.len(),
+        "aliases": snapshot.aliases,
+        "fingerprint": snapshot.fingerprint,
+        "journal": snapshot.journal_len,
+        "cache_epoch": state.cache_epoch().kb_revision,
+    });
+    if include_facts {
+        body["data"] = serde_json::Value::Array(snapshot.facts.iter().map(fact_to_json).collect());
+    }
+    Response::json(200, &body)
 }
 
 async fn handle_knowledge_assert(state: &Arc<ApiState>, request: &Request) -> Response {
@@ -2982,6 +3041,39 @@ async fn handle_knowledge_assert(state: &Arc<ApiState>, request: &Request) -> Re
         &serde_json::json!({
             "status": if applied > 0 { "applied" } else { "unchanged" },
             "applied": applied,
+            "source": source,
+            "scope": "process",
+            "generation": snapshot.generation,
+            "facts": snapshot.facts.len(),
+            "fingerprint": snapshot.fingerprint,
+        }),
+    )
+}
+
+async fn handle_knowledge_replace(state: &Arc<ApiState>, request: &Request) -> Response {
+    let body = match request.body_text() {
+        Ok(body) => body,
+        Err(error) => return utf8_body_error(error),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
+    };
+    let facts = match parse_knowledge_facts(&payload) {
+        Ok(facts) => facts,
+        Err(message) => return Response::error(400, &message),
+    };
+    let source = payload
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("http");
+    let changed = state.replace_facts(facts, source);
+    let snapshot = state.knowledge.snapshot();
+    Response::json(
+        200,
+        &serde_json::json!({
+            "status": if changed { "replaced" } else { "unchanged" },
+            "replaced": changed,
             "source": source,
             "scope": "process",
             "generation": snapshot.generation,
@@ -5067,13 +5159,33 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let alias = take_turn_body(addr, &session, "明哥的身高是多少").await;
         assert!(alias["reply"].as_str().unwrap_or("").contains("226"));
 
-        let (status, _, body) = raw_request(addr, "GET", "/v1/knowledge", &[], "").await;
+        let (status, _, body) =
+            raw_request(addr, "GET", "/v1/knowledge?include_facts=1", &[], "").await;
         assert_eq!(status, 200, "{}", body);
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["generation"], 2);
         assert_eq!(value["facts"], 3);
         assert_eq!(value["aliases"].as_array().unwrap().len(), 1);
         assert_eq!(value["cache_epoch"], 2);
+        assert_eq!(value["data"].as_array().unwrap().len(), 3);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "PUT",
+            "/v1/knowledge/facts",
+            &[("Content-Type", "application/json")],
+            r#"{"facts":[{"kind":"entity","name":"姚明","entity_type":"人物","properties":{"身高":"226","国籍":"中国"}},{"kind":"entity","name":"叶莉","entity_type":"人物","properties":{"身高":"190"}},{"kind":"relation","from":"姚明","rel_type":"队友","to":"王五"}]}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "replaced");
+        assert_eq!(value["generation"], 3);
+
+        let corrected = take_turn_body(addr, &session, "姚明的队友是谁").await;
+        let reply = corrected["reply"].as_str().unwrap_or("");
+        assert!(reply.contains("王五"), "{}", reply);
+        assert!(!reply.contains("叶莉"), "{}", reply);
 
         let (status, _, body) = raw_request(
             addr,

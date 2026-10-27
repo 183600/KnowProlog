@@ -66,20 +66,26 @@ pub enum KnowledgeChange {
         aliases: Vec<(String, String)>,
         source: String,
     },
+    Reset {
+        generation: u64,
+        source: String,
+    },
 }
 
 impl KnowledgeChange {
     pub fn generation(&self) -> u64 {
         match self {
             KnowledgeChange::Facts { generation, .. }
-            | KnowledgeChange::Aliases { generation, .. } => *generation,
+            | KnowledgeChange::Aliases { generation, .. }
+            | KnowledgeChange::Reset { generation, .. } => *generation,
         }
     }
 
     pub fn source(&self) -> &str {
         match self {
             KnowledgeChange::Facts { source, .. }
-            | KnowledgeChange::Aliases { source, .. } => source,
+            | KnowledgeChange::Aliases { source, .. }
+            | KnowledgeChange::Reset { source, .. } => source,
         }
     }
 
@@ -87,6 +93,7 @@ impl KnowledgeChange {
         match self {
             KnowledgeChange::Facts { .. } => "facts",
             KnowledgeChange::Aliases { .. } => "aliases",
+            KnowledgeChange::Reset { .. } => "reset",
         }
     }
 }
@@ -168,6 +175,12 @@ impl KnowledgeBase {
             .filter(|change| change.generation() > generation)
             .cloned()
             .collect();
+        if changes
+            .iter()
+            .any(|change| matches!(change, KnowledgeChange::Reset { .. }))
+        {
+            return KnowledgeCatchup::Rebuild;
+        }
         match changes.first() {
             Some(first) if first.generation() == generation.saturating_add(1) => {
                 KnowledgeCatchup::Incremental(changes)
@@ -219,6 +232,25 @@ impl KnowledgeBase {
             state.journal.pop_front();
         }
         admitted
+    }
+
+    pub fn replace_facts(&self, facts: Vec<PrologFact>, source: &str) -> bool {
+        let mut state = self.state.write();
+        if state.facts.as_slice() == facts.as_slice() {
+            return false;
+        }
+        state.facts = Arc::new(facts);
+        state.fingerprint = fingerprint_facts(&state.facts);
+        state.generation = state.generation.saturating_add(1);
+        let change = KnowledgeChange::Reset {
+            generation: state.generation,
+            source: source.to_string(),
+        };
+        state.journal.push_back(change);
+        while state.journal.len() > self.journal_capacity {
+            state.journal.pop_front();
+        }
+        true
     }
 
     pub fn record_aliases(
@@ -329,6 +361,22 @@ mod tests {
             knowledge.changes_since(1),
             KnowledgeCatchup::Incremental(_)
         ));
+    }
+
+    #[test]
+    fn replace_forces_rebuild_and_changes_fingerprint() {
+        let knowledge = KnowledgeBase::new(vec![relation("姚明", "队友", "叶莉")]);
+        let before = knowledge.snapshot();
+        assert!(knowledge.replace_facts(vec![relation("姚明", "队友", "王五")], "fix"));
+        let after = knowledge.snapshot();
+        assert_ne!(before.fingerprint, after.fingerprint);
+        assert_eq!(after.generation, 1);
+        assert_eq!(knowledge.changes_since(0), KnowledgeCatchup::Rebuild);
+        assert!(!knowledge.replace_facts(
+            vec![relation("姚明", "队友", "王五")],
+            "fix"
+        ));
+        assert_eq!(knowledge.generation(), 1);
     }
 
     #[test]
