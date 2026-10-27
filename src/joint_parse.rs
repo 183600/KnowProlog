@@ -776,6 +776,7 @@ fn evaluate_frames(
         );
         requests.push(FrameRequests { subject, object });
     }
+    disambiguate_argument_spans(text, &mut requests);
 
     let mut weld_log: BTreeMap<(usize, usize), WeldRecord> = BTreeMap::new();
     let mut unique: BTreeMap<(usize, usize), String> = BTreeMap::new();
@@ -1370,6 +1371,50 @@ fn absolute_char_span(
     find_char_span_from(text, surface, frame.evidence.start)
 }
 
+/// 主语/宾语词面互相包含且都回退到同一处时，按出现顺序拆开：
+/// 优先保留主语，把宾语挪到主语之后；否则把主语挪到宾语之后。
+fn disambiguate_argument_spans(text: &str, requests: &mut [FrameRequests]) {
+    for request in requests {
+        let (Some(subject_span), Some(object_span)) = (request.subject.span, request.object.span)
+        else {
+            continue;
+        };
+        if request.subject.surface == request.object.surface
+            || !spans_overlap(subject_span, object_span)
+        {
+            continue;
+        }
+        if let Some(found) = find_char_span_from_char(text, &request.object.surface, subject_span.1)
+        {
+            request.object.span = Some(found);
+            request.object.error = None;
+            continue;
+        }
+        if let Some(found) = find_char_span_from_char(text, &request.subject.surface, object_span.1)
+        {
+            request.subject.span = Some(found);
+            request.subject.error = None;
+        }
+    }
+}
+
+fn spans_overlap(left: (usize, usize), right: (usize, usize)) -> bool {
+    left.0 < right.1 && right.0 < left.1
+}
+
+fn find_char_span_from_char(
+    text: &str,
+    surface: &str,
+    char_start: usize,
+) -> Option<(usize, usize)> {
+    let byte_start = text
+        .char_indices()
+        .nth(char_start)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len());
+    find_char_span_from(text, surface, byte_start)
+}
+
 fn find_char_span_from(text: &str, surface: &str, byte_start: usize) -> Option<(usize, usize)> {
     let byte_start = byte_start.min(text.len());
     let haystack = &text[byte_start..];
@@ -1834,6 +1879,34 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("硬冲突")));
+    }
+
+    #[test]
+    fn overlapping_argument_surfaces_are_disambiguated_by_order() {
+        let text = "苹果公司的创始人是苹果";
+        let mut frame = RelationFrame::new("苹果公司", "创始人", "苹果");
+        frame.evidence = EvidenceSpan {
+            sentence_index: 0,
+            sentence: text.to_string(),
+            start: 0,
+            end: text.len(),
+            subject_span: None,
+            object_span: None,
+            polarity_span: None,
+        };
+        let schema = schema_with(&["公司"], &["水果"], &[]);
+        let mut segmenter = segmenter_with_apple();
+        let parse = joint_parse_with_frames(
+            &mut segmenter,
+            &schema,
+            text,
+            vec![frame],
+            &JointParseOptions::default(),
+        );
+        let frame = &parse.frames[0];
+        assert_eq!(frame.subject.span, Some((0, 4)));
+        assert_eq!(frame.object.span, Some((9, 11)));
+        assert!(frame.conflicts.is_empty(), "{:?}", frame.conflicts);
     }
 
     #[test]
