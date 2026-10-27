@@ -156,6 +156,7 @@ pub mod soft_route;
 pub mod startup_ledger;
 pub mod symbolic_generator;
 pub mod symbolic_reasoner;
+pub mod teachable_assertion;
 pub mod temporal;
 pub mod text_anchor;
 pub mod text_identity;
