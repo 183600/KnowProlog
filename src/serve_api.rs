@@ -45,6 +45,7 @@
 //! - `GET/POST /v1/memory`          全局共享语义白板（`?session=` 只读叠加会话视图）
 //! - `DELETE /v1/memory/{claim}`    撤回全局共享声明
 //! - `GET  /v1/knowledge`          进程内知识台账（事实/别名版本与指纹）
+//! - `GET  /v1/knowledge/changes`  增量变更日志（`?since=N`，缺口显式 409）
 //! - `POST /v1/knowledge/facts`    追加全局事实（下一轮对所有活跃会话可见）
 //! - `PUT  /v1/knowledge/facts`    整表替换全局事实（懒重建，可更正/撤回）
 //! - `POST /v1/knowledge/aliases`  准入实体别名（下一轮对所有活跃会话可见）
@@ -2569,6 +2570,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "POST /v1/memory",
                     "DELETE /v1/memory/{claim}",
                     "GET /v1/knowledge",
+                    "GET /v1/knowledge/changes",
                     "POST /v1/knowledge/facts",
                     "PUT /v1/knowledge/facts",
                     "POST /v1/knowledge/aliases",
@@ -2664,6 +2666,9 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
         }
         ("POST", ["v1", "memory"]) => handle_shared_memory_publish(state, request, None).await,
         ("GET", ["v1", "knowledge"]) => handle_knowledge_view(state, request).await,
+        ("GET", ["v1", "knowledge", "changes"]) => {
+            handle_knowledge_changes(state, request).await
+        }
         ("POST", ["v1", "knowledge", "facts"]) => handle_knowledge_assert(state, request).await,
         ("PUT", ["v1", "knowledge", "facts"]) => handle_knowledge_replace(state, request).await,
         ("POST", ["v1", "knowledge", "aliases"]) => {
@@ -3048,6 +3053,69 @@ async fn handle_knowledge_assert(state: &Arc<ApiState>, request: &Request) -> Re
             "fingerprint": snapshot.fingerprint,
         }),
     )
+}
+
+fn knowledge_change_to_json(change: &KnowledgeChange) -> serde_json::Value {
+    match change {
+        KnowledgeChange::Facts {
+            generation,
+            facts,
+            source,
+        } => serde_json::json!({
+            "generation": generation,
+            "kind": "facts",
+            "source": source,
+            "facts": facts.iter().map(fact_to_json).collect::<Vec<_>>(),
+        }),
+        KnowledgeChange::Aliases {
+            generation,
+            aliases,
+            source,
+        } => serde_json::json!({
+            "generation": generation,
+            "kind": "aliases",
+            "source": source,
+            "aliases": aliases.iter().map(|(surface, canonical)| {
+                serde_json::json!({"surface": surface, "canonical": canonical})
+            }).collect::<Vec<_>>(),
+        }),
+        KnowledgeChange::Reset { generation, source } => serde_json::json!({
+            "generation": generation,
+            "kind": "reset",
+            "source": source,
+        }),
+    }
+}
+
+async fn handle_knowledge_changes(state: &Arc<ApiState>, request: &Request) -> Response {
+    let since = request
+        .query
+        .get("since")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let generation = state.knowledge.generation();
+    match state.knowledge.journal_since(since) {
+        Some(changes) => Response::json(
+            200,
+            &serde_json::json!({
+                "from": since,
+                "generation": generation,
+                "requires_rebuild": changes.iter().any(|change| {
+                    matches!(change, KnowledgeChange::Reset { .. })
+                }),
+                "changes": changes.iter().map(knowledge_change_to_json).collect::<Vec<_>>(),
+            }),
+        ),
+        None => Response::json(
+            409,
+            &serde_json::json!({
+                "error": "knowledge journal no longer covers this generation",
+                "code": "journal_gap",
+                "from": since,
+                "generation": generation,
+            }),
+        ),
+    }
 }
 
 async fn handle_knowledge_replace(state: &Arc<ApiState>, request: &Request) -> Response {
@@ -5168,6 +5236,49 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(value["aliases"].as_array().unwrap().len(), 1);
         assert_eq!(value["cache_epoch"], 2);
         assert_eq!(value["data"].as_array().unwrap().len(), 3);
+        let snapshot_data = value["data"].clone();
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            "/v1/knowledge/changes?since=0",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["generation"], 2);
+        assert_eq!(value["requires_rebuild"], false);
+        assert_eq!(value["changes"].as_array().unwrap().len(), 2);
+        assert_eq!(value["changes"][0]["kind"], "facts");
+        assert_eq!(value["changes"][1]["kind"], "aliases");
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            "/v1/knowledge/changes?since=2",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["changes"].as_array().unwrap().len(), 0);
+
+        let roundtrip = serde_json::json!({"facts": snapshot_data}).to_string();
+        let (status, _, body) = raw_request(
+            addr,
+            "PUT",
+            "/v1/knowledge/facts",
+            &[("Content-Type", "application/json")],
+            &roundtrip,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["status"], "unchanged");
+        assert_eq!(value["generation"], 2);
 
         let (status, _, body) = raw_request(
             addr,
@@ -5181,6 +5292,20 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["status"], "replaced");
         assert_eq!(value["generation"], 3);
+
+        let (status, _, body) = raw_request(
+            addr,
+            "GET",
+            "/v1/knowledge/changes?since=2",
+            &[],
+            "",
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["requires_rebuild"], true);
+        assert_eq!(value["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(value["changes"][0]["kind"], "reset");
 
         let corrected = take_turn_body(addr, &session, "姚明的队友是谁").await;
         let reply = corrected["reply"].as_str().unwrap_or("");

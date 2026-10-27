@@ -161,13 +161,13 @@ impl KnowledgeBase {
         }
     }
 
-    pub fn changes_since(&self, generation: u64) -> KnowledgeCatchup {
+    pub fn journal_since(&self, generation: u64) -> Option<Vec<KnowledgeChange>> {
         let state = self.state.read();
         if generation == state.generation {
-            return KnowledgeCatchup::UpToDate;
+            return Some(Vec::new());
         }
         if generation > state.generation {
-            return KnowledgeCatchup::Rebuild;
+            return None;
         }
         let changes: Vec<KnowledgeChange> = state
             .journal
@@ -175,18 +175,27 @@ impl KnowledgeBase {
             .filter(|change| change.generation() > generation)
             .cloned()
             .collect();
+        match changes.first() {
+            Some(first) if first.generation() == generation.saturating_add(1) => Some(changes),
+            _ => None,
+        }
+    }
+
+    pub fn changes_since(&self, generation: u64) -> KnowledgeCatchup {
+        let changes = match self.journal_since(generation) {
+            Some(changes) => changes,
+            None => return KnowledgeCatchup::Rebuild,
+        };
+        if changes.is_empty() {
+            return KnowledgeCatchup::UpToDate;
+        }
         if changes
             .iter()
             .any(|change| matches!(change, KnowledgeChange::Reset { .. }))
         {
             return KnowledgeCatchup::Rebuild;
         }
-        match changes.first() {
-            Some(first) if first.generation() == generation.saturating_add(1) => {
-                KnowledgeCatchup::Incremental(changes)
-            }
-            _ => KnowledgeCatchup::Rebuild,
-        }
+        KnowledgeCatchup::Incremental(changes)
     }
 
     pub fn missing_facts(&self, facts: &[PrologFact]) -> Vec<PrologFact> {
@@ -236,10 +245,16 @@ impl KnowledgeBase {
 
     pub fn replace_facts(&self, facts: Vec<PrologFact>, source: &str) -> bool {
         let mut state = self.state.write();
-        if state.facts.as_slice() == facts.as_slice() {
+        let mut unique: Vec<PrologFact> = Vec::with_capacity(facts.len());
+        for fact in facts {
+            if !unique.contains(&fact) {
+                unique.push(fact);
+            }
+        }
+        if state.facts.as_slice() == unique.as_slice() {
             return false;
         }
-        state.facts = Arc::new(facts);
+        state.facts = Arc::new(unique);
         state.fingerprint = fingerprint_facts(&state.facts);
         state.generation = state.generation.saturating_add(1);
         let change = KnowledgeChange::Reset {
@@ -372,6 +387,9 @@ mod tests {
         assert_ne!(before.fingerprint, after.fingerprint);
         assert_eq!(after.generation, 1);
         assert_eq!(knowledge.changes_since(0), KnowledgeCatchup::Rebuild);
+        let journal = knowledge.journal_since(0).unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(journal[0].kind(), "reset");
         assert!(!knowledge.replace_facts(
             vec![relation("姚明", "队友", "王五")],
             "fix"
