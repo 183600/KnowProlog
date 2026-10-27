@@ -11334,6 +11334,47 @@ impl SymbolicReasoner {
             .map(|assessment| assessment.render_report())
     }
 
+    /// 把可执行的候选读法转成会话澄清帧，让下一轮序号选择真正落地。
+    fn rewrite_retrieval_clarification(
+        &self,
+        question: &str,
+        assessment: &rewrite_retrieval::Assessment,
+    ) -> Option<FormalClarification> {
+        let mut options = Vec::new();
+        for hypothesis in assessment
+            .hypotheses
+            .iter()
+            .filter(|hypothesis| hypothesis.answer.is_some())
+        {
+            if options.len() >= 3 {
+                break;
+            }
+            let Some(answer) =
+                self.answer_plan(&hypothesis.candidate.plan, &hypothesis.candidate.question)
+            else {
+                continue;
+            };
+            if Self::is_pending_failure(&answer) {
+                continue;
+            }
+            let evidence = hypothesis
+                .answers
+                .iter()
+                .take(2)
+                .map(|cluster| format!("{}（{:.2}）", cluster.answer, cluster.weight))
+                .collect();
+            options.push(FormalClarificationOption {
+                logical_form: hypothesis.candidate.receipt(),
+                answer,
+                evidence,
+            });
+        }
+        (options.len() >= 2).then(|| FormalClarification {
+            question: question.trim().to_string(),
+            options,
+        })
+    }
+
     fn render_rewrite_retrieval_clarification(
         &self,
         assessment: &rewrite_retrieval::Assessment,
@@ -11375,6 +11416,13 @@ impl SymbolicReasoner {
             }
             RewriteRetrievalDecision::Clarify => {
                 self.perf.bump("rewrite_retrieval_clarify");
+                if let Some(clarification) =
+                    self.rewrite_retrieval_clarification(question, &assessment)
+                {
+                    let prompt = clarification.prompt();
+                    *self.formal_clarification.lock() = Some(clarification);
+                    return Some(prompt);
+                }
                 Some(self.render_rewrite_retrieval_clarification(&assessment))
             }
             RewriteRetrievalDecision::Abstain => None,
@@ -17359,6 +17407,62 @@ mod tests {
             .expect("应能打印裁决回执");
         assert!(report.contains("读法裁决"), "{}", report);
         assert!(report.contains("张三"), "{}", report);
+    }
+
+    #[test]
+    fn rewrite_retrieval_clarification_builds_selectable_frame() {
+        let mut reasoner = SymbolicReasoner::new(rewrite_retrieval_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "老师".to_string(),
+                to: "王五".to_string(),
+            },
+        ]);
+        let candidates = vec![
+            HypothesisCandidate::new(
+                HypothesisSource::ExactPlan,
+                "master",
+                "张三的师傅是谁",
+                QueryPlan::FindObjectByPredicate {
+                    subject: "张三".to_string(),
+                    predicate: "师傅".to_string(),
+                },
+            ),
+            HypothesisCandidate::new(
+                HypothesisSource::ExactPlan,
+                "teacher",
+                "张三的老师是谁",
+                QueryPlan::FindObjectByPredicate {
+                    subject: "张三".to_string(),
+                    predicate: "老师".to_string(),
+                },
+            ),
+        ];
+        let assessment = rewrite_retrieval::assess(
+            "张三的师傅是谁",
+            candidates,
+            &reasoner.config.rewrite_retrieval,
+            |query, k, constraints| {
+                reasoner.evidence_search(query, k, constraints, SearchBudget::default())
+            },
+        );
+        let clarification = reasoner
+            .rewrite_retrieval_clarification("张三的师傅是谁", &assessment)
+            .expect("两个读法都有可执行答案时应建立澄清帧");
+        assert_eq!(clarification.options.len(), 2);
+        *reasoner.formal_clarification.lock() = Some(clarification);
+        match reasoner.answer_formal_clarification("1") {
+            FormalClarificationOutcome::Answered(answer) => {
+                assert!(answer.contains("按你选择的读法"), "{}", answer);
+            }
+            other => panic!("应接受序号选择：{:?}", other),
+        }
     }
 
     #[test]
