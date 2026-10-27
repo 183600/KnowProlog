@@ -1034,7 +1034,10 @@ fn resolve_argument(
     if let Some(ambiguity) = &choice.ambiguity {
         ambiguities.push(ambiguity.clone());
     }
-    if choice.canonical != token.canonical || choice.kind != token.kind {
+    if choice.canonical != token.canonical
+        || choice.kind != token.kind
+        || choice.etype != token.etype
+    {
         let token = &mut result.tokens[token_index];
         token.canonical = choice.canonical.clone();
         token.kind = choice.kind;
