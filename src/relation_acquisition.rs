@@ -37,6 +37,7 @@ pub enum AcquisitionSource {
     UserAnswer,
     UserConfirmation,
     UserCorrection,
+    UserAssertion,
     Graph,
     QuestionPresupposition,
     InducedPattern,
@@ -48,6 +49,7 @@ impl AcquisitionSource {
             AcquisitionSource::UserAnswer => "用户回答",
             AcquisitionSource::UserConfirmation => "用户确认",
             AcquisitionSource::UserCorrection => "用户纠错",
+            AcquisitionSource::UserAssertion => "用户陈述",
             AcquisitionSource::Graph => "知识图谱",
             AcquisitionSource::QuestionPresupposition => "问句预设",
             AcquisitionSource::InducedPattern => "对话诱导模式",
@@ -693,6 +695,7 @@ impl RelationAcquisition {
             || text.contains("是多少")
             || text.contains("哪一位")
             || text.contains("哪一个")
+            || text.contains("在哪")
             || text.contains("什么关系")
     }
 
@@ -724,6 +727,14 @@ impl RelationAcquisition {
         }
         if text.is_empty() {
             return None;
+        }
+
+        if let Some((subject, predicate)) = parse_where_work_question(&text) {
+            return Some(ParsedQuestion {
+                subject,
+                predicate,
+                form: QuestionForm::Where,
+            });
         }
 
         let reverse = text
@@ -969,6 +980,28 @@ impl RelationAcquisition {
     // ---------------------------------------------------------------------
     // 回答分类与账本写入
     // ---------------------------------------------------------------------
+
+    /// 自由陈述入口：把已抽取、已归一方向的断言写入账本。
+    ///
+    /// 与 `interpret_answer` 的区别是：这里没有槽位目标，用户陈述本身
+    /// 就是候选；是否确认仍由形状闸门与用户下一轮回答决定。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_assertion(
+        &mut self,
+        claim: Claim,
+        source: AcquisitionSource,
+        raw: &str,
+        rule: &str,
+        facts: &[PrologFact],
+        registry: &PredicateRegistry,
+        types: &TypeSystem,
+        shapes: &ShapeSet,
+    ) -> AcquisitionOutcome {
+        self.turn += 1;
+        self.record_claim(
+            None, claim, source, raw, rule, facts, registry, types, shapes,
+        )
+    }
 
     pub fn interpret_answer(
         &mut self,
@@ -1867,6 +1900,27 @@ impl RelationAcquisition {
     }
 }
 
+/// 「S 在哪(里/儿/个单位)工作」：中文里最常见的任职问法，不是所有格。
+/// 归一为规范谓词「任职于」，让覆盖层与图谱走同一方向。
+fn parse_where_work_question(text: &str) -> Option<(String, String)> {
+    let suffix = ["工作", "上班", "任职", "就职", "供职"]
+        .iter()
+        .find(|suffix| text.ends_with(*suffix))?;
+    let body = text[..text.len() - suffix.len()]
+        .trim_end_matches(['了', '过'])
+        .trim();
+    let position = body.rfind('在')?;
+    let tail = &body[position + '在'.len_utf8()..];
+    if !(tail.is_empty() || tail.starts_with('哪') || tail.starts_with("什么")) {
+        return None;
+    }
+    let subject = body[..position].trim();
+    if subject.is_empty() {
+        return None;
+    }
+    Some((subject.to_string(), "任职于".to_string()))
+}
+
 fn split_possession(text: &str) -> Option<(String, String)> {
     let (subject, predicate) = text.rsplit_once('的')?;
     let subject = subject.trim();
@@ -2716,6 +2770,66 @@ mod tests {
             panic!("形状缺口应打开目标：{:?}", opening);
         };
         assert_eq!(goal.origin, GoalOrigin::ShapeRepair);
+    }
+
+    #[test]
+    fn free_assertion_is_proposed_and_confirmation_reaches_overlay() {
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&profile("任职于", false, &["人物"], &["机构"]));
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![entity("张三", "Person", &[])];
+        let mut acquisition = RelationAcquisition::new();
+        let outcome = acquisition.record_assertion(
+            Claim::entity("张三", "任职于", "清华大学"),
+            AcquisitionSource::UserAssertion,
+            "张三在清华大学工作。",
+            "断言阅读",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+        );
+        assert_eq!(outcome.status, Some(AcquisitionStatus::Proposed));
+        assert!(acquisition.overlay().is_empty());
+
+        let id = outcome.claim_id.unwrap();
+        let confirmed = acquisition.confirm(Some(&id));
+        assert_eq!(confirmed.status, Some(AcquisitionStatus::Confirmed));
+        let overlay = acquisition.overlay();
+        assert_eq!(overlay.values("张三", "任职于").len(), 1);
+        assert_eq!(overlay.values("张三", "任职于")[0].object, "清华大学");
+    }
+
+    #[test]
+    fn where_work_question_parses_and_answers_from_overlay() {
+        let mut registry = PredicateRegistry::new();
+        registry.declare(&profile("任职于", false, &["人物"], &["机构"]));
+        let types = types();
+        let shapes = shapes(&registry, &types);
+        let facts = vec![entity("张三", "Person", &[])];
+        let mut acquisition = RelationAcquisition::new();
+        let outcome = acquisition.record_assertion(
+            Claim::entity("张三", "任职于", "清华大学"),
+            AcquisitionSource::UserAssertion,
+            "张三在清华大学工作。",
+            "断言阅读",
+            &facts,
+            &registry,
+            &types,
+            &shapes,
+        );
+        let id = outcome.claim_id.unwrap();
+        let _ = acquisition.confirm(Some(&id));
+
+        let parsed = RelationAcquisition::parse_question("张三在哪工作？").unwrap();
+        assert_eq!(parsed.subject, "张三");
+        assert_eq!(parsed.predicate, "任职于");
+        assert_eq!(parsed.form, QuestionForm::Where);
+        let answer = acquisition
+            .answer_from_overlay("张三在哪工作？", &registry)
+            .expect("覆盖层应能回答任职问句");
+        assert_eq!(answer.values, vec!["清华大学".to_string()]);
     }
 
     #[test]

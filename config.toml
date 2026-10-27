@@ -215,7 +215,9 @@ functional = true
 
 [[predicate_profiles]]
 name = "任职于"
-aliases = ["工作单位", "所在单位"]
+aliases = ["工作单位", "所在单位", "工作于", "就职于", "供职于"]
+domain = ["人物"]                      # 任职者
+range = ["机构"]                       # 任职单位（值域只作为类型建议，不自动写图）
 
 # 类型体系：实体类型的别名/子类/互斥声明（谓词画像的定义域/值域以规范类型书写）。
 # closure_gate = true 时模式闸门按「别名归一 + 子类闭包 + 互斥证据」判定：
@@ -235,8 +237,28 @@ canonical = "实体"
 alias = "人"
 canonical = "人物"
 
+[[type_system.aliases]]
+alias = "Organization"
+canonical = "机构"
+
+[[type_system.aliases]]
+alias = "Company"
+canonical = "机构"
+
+[[type_system.aliases]]
+alias = "公司"
+canonical = "机构"
+
+[[type_system.aliases]]
+alias = "组织"
+canonical = "机构"
+
 [[type_system.subclasses]]
 sub = "人物"
+sup = "实体"
+
+[[type_system.subclasses]]
+sub = "机构"
 sup = "实体"
 
 [[type_system.subclasses]]
