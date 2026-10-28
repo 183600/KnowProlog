@@ -50,6 +50,7 @@ pub mod dialogue_manager;
 pub mod discourse;
 pub mod embedding_eval;
 pub mod entailment_eval;
+pub mod entity_inventory;
 pub mod entity_linker;
 pub mod entity_registry;
 pub mod entity_relation_extractor;

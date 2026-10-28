@@ -491,6 +491,11 @@
             .expect("实体类型问句应可回答");
         assert!(entity_type.contains("「张三」的类型是「人物」"), "{}", entity_type);
 
+        let inventory = reasoner
+            .answer("李四有哪些关系")
+            .expect("实体关系清单应可回答");
+        assert!(inventory.contains("张三 师傅 李四（入向）"), "{}", inventory);
+
         assert!(!reasoner
             .answer("张三的年龄是多少")
             .unwrap_or_default()

@@ -441,6 +441,9 @@ impl SymbolicReasoner {
         ) {
             return Some(self.annotate_assumption_world(answer.text));
         }
+        if let Some(answer) = crate::entity_inventory::answer(&self.generator, question) {
+            return Some(self.annotate_assumption_world(answer));
+        }
         if let Some(answer) = self.answer_planned(question) {
             if !answer.contains("置信度") && !answer.contains("链接预测") {
                 return Some(self.annotate_assumption_world(answer));
@@ -783,6 +786,9 @@ impl SymbolicReasoner {
             question,
         ) {
             return Some(answer.text);
+        }
+        if let Some(answer) = crate::entity_inventory::answer(&self.generator, question) {
+            return Some(answer);
         }
         if let Some(answer) = self.answer_planned(question) {
             return Some(answer);
