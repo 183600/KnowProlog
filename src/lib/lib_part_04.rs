@@ -927,6 +927,7 @@ pub fn create_default_synonyms() -> HashMap<String, String> {
 mod cache_tests {
     include!("lib__cache_tests_01.rs");
     include!("lib__cache_tests_02.rs");
+    include!("lib__delta_cache_tests.rs");
 }
 #[cfg(test)]
 mod fusion_tests {

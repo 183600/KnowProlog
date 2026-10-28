@@ -143,7 +143,7 @@ impl OxigraphManager {
             store: Arc::new(Mutex::new(store)),
             revision: AtomicU64::new(0),
             snapshot_cache: parking_lot::Mutex::new(None),
-            relevant_cache: parking_lot::Mutex::new(RevisionLru::new(QUERY_CACHE_CAPACITY)),
+            relevant_cache: parking_lot::Mutex::new(DeltaQualifiedCache::new(QUERY_CACHE_CAPACITY)),
             direct_answer_cache: parking_lot::Mutex::new(RevisionLru::new(QUERY_CACHE_CAPACITY)),
             perf,
             predicate_registry: parking_lot::RwLock::new(
@@ -163,8 +163,48 @@ impl OxigraphManager {
     /// （version-after-write）。这样并发读者绝不会把过期数据缓存到新版本号上，
     /// 且重复导入不推进版本。
     fn bump_revision(&self) {
-        self.revision.fetch_add(1, Ordering::AcqRel);
+        self.bump_revision_with(None);
+    }
+
+    /// 带增量足迹的版本推进：相关事实缓存按依赖逐条复核，而不是整体失忆。
+    ///
+    /// 只有「纯追加且能给出完整足迹」的写入路径才应调用本函数；撤回、更正、
+    /// 整体替换等无法用增量表达的变化仍走 [`Self::bump_revision`] 全量清空。
+    fn bump_revision_with(&self, delta: Option<DeltaFootprint>) {
+        let revision = self
+            .revision
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
         self.perf.bump("revision_bump");
+        let mut cache = self.relevant_cache.lock();
+        match delta {
+            Some(mut delta) => {
+                delta.generation = revision;
+                let report = cache.observe(&delta);
+                self.perf
+                    .bump_by("relevant_cache_delta_retained", report.retained as u64);
+                self.perf.bump_by(
+                    "relevant_cache_delta_incomplete",
+                    report.marked_incomplete as u64,
+                );
+                self.perf.bump_by(
+                    "relevant_cache_delta_invalidated",
+                    report.invalidated as u64,
+                );
+                if report.gap {
+                    self.perf.bump("relevant_cache_delta_gap");
+                }
+                if report.cleared_all {
+                    self.perf.bump("relevant_cache_delta_cleared");
+                }
+            }
+            None => {
+                if !cache.is_empty() {
+                    self.perf.bump("relevant_cache_full_invalidations");
+                }
+                cache.clear();
+            }
+        }
     }
 
     pub async fn import_jsonld(
@@ -201,6 +241,7 @@ impl OxigraphManager {
         &self,
         quads: &[Quad],
     ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let delta = footprint_from_quads(quads);
         let store = self.store.lock().await;
         let (added, duplicates) = store.transaction(move |mut transaction| {
             let mut added = 0usize;
@@ -215,7 +256,7 @@ impl OxigraphManager {
             Ok::<(usize, usize), oxigraph::store::StorageError>((added, duplicates))
         })?;
         if added > 0 {
-            self.bump_revision();
+            self.bump_revision_with(Some(delta));
         }
         Ok((added, duplicates))
     }
@@ -580,7 +621,9 @@ impl OxigraphManager {
                     }
                 }
             }
-            Value::Object(obj) => self.process_jsonld_object(store, obj, context, anonymous, stats)?,
+            Value::Object(obj) => {
+                self.process_jsonld_object(store, obj, context, anonymous, stats)?
+            }
             _ => {}
         }
         Ok(())
@@ -657,9 +700,7 @@ impl OxigraphManager {
                     stats.relations += 1;
                 } else {
                     let object = match context.default_language.as_deref() {
-                        Some(language) => {
-                            Literal::new_language_tagged_literal(s, language)?.into()
-                        }
+                        Some(language) => Literal::new_language_tagged_literal(s, language)?.into(),
                         None => Literal::new_simple_literal(s),
                     };
                     store.insert(&Quad::new(
@@ -839,10 +880,14 @@ impl OxigraphManager {
             GraphName::DefaultGraph,
         ))?;
         for (index, cell) in cells.iter().enumerate() {
-            let item =
-                self.process_jsonld_list_item(
-                    store, &items[index], coercion, context, anonymous, stats,
-                )?;
+            let item = self.process_jsonld_list_item(
+                store,
+                &items[index],
+                coercion,
+                context,
+                anonymous,
+                stats,
+            )?;
             store.insert(&Quad::new(
                 cell.clone(),
                 rdf_first.clone(),
@@ -926,5 +971,4 @@ impl OxigraphManager {
             other => Ok(Literal::new_simple_literal(&other.to_string()).into()),
         }
     }
-
 }

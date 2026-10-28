@@ -183,9 +183,10 @@ impl OxigraphManager {
                 }
             }
         }
-        // 只有确有写入才推进版本
+        // 只有确有写入才推进版本；回执动作即精确的增量足迹。
         if receipt.added > 0 {
-            self.bump_revision();
+            let delta = footprint_from_actions(&receipt.actions);
+            self.bump_revision_with(Some(delta));
         }
         Ok(receipt)
     }

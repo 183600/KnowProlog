@@ -1,4 +1,3 @@
-
 use nlp::{normalize_words, pattern_from_strings, preprocess, PrologRule, TaggedWord};
 use prolog_engine::PrologFact;
 // RDF命名空间（与 identity::DEFAULT_BASE_NS 单一正本）
@@ -29,6 +28,77 @@ fn sparql_literal(text: &str) -> std::borrow::Cow<'_, str> {
     }
     std::borrow::Cow::Owned(escaped)
 }
+/// 把 IRI 的 kg 本地名（或实体路径名）计入增量足迹；外部 IRI 原样计入。
+fn touch_iri_name(delta: &mut DeltaFootprint, iri: &str) {
+    if let Some(name) = crate::identity::entity_local_name(BASE_NS, iri)
+        .or_else(|| crate::identity::local_name(BASE_NS, iri))
+    {
+        delta.touch_name(name);
+    } else {
+        delta.touch_name(iri);
+    }
+}
+
+/// 从 RDF 四元组提取「这次写入可能碰到哪些名称/谓词」。
+///
+/// 这是保守足迹：名称字面量、IRI 本地名与完整的非 kg IRI 都计入，宁可多失效
+/// 一条缓存，也不让新事实绕过依赖复核。
+fn footprint_from_quads(quads: &[Quad]) -> DeltaFootprint {
+    let mut delta = DeltaFootprint::new(0);
+    for quad in quads {
+        if let Subject::NamedNode(node) = &quad.subject {
+            touch_iri_name(&mut delta, node.as_str());
+        }
+        let predicate_iri = quad.predicate.as_str();
+        delta.touch_predicate(
+            crate::identity::local_name(BASE_NS, predicate_iri)
+                .unwrap_or_else(|| predicate_iri.to_string()),
+        );
+        match &quad.object {
+            Term::NamedNode(node) => touch_iri_name(&mut delta, node.as_str()),
+            Term::Literal(literal) => {
+                delta.touch_name(literal.value());
+            }
+            _ => {}
+        }
+    }
+    delta
+}
+
+/// 从导入回执的实际动作提取增量足迹（只含成功写入的三元组）。
+fn footprint_from_actions(actions: &[predicate_registry::ImportAction]) -> DeltaFootprint {
+    let mut delta = DeltaFootprint::new(0);
+    for action in actions {
+        match action {
+            predicate_registry::ImportAction::Named {
+                subject,
+                predicate,
+                object,
+            } => {
+                touch_iri_name(&mut delta, subject);
+                touch_iri_name(&mut delta, object);
+                delta.touch_predicate(
+                    crate::identity::local_name(BASE_NS, predicate)
+                        .unwrap_or_else(|| predicate.clone()),
+                );
+            }
+            predicate_registry::ImportAction::Literal {
+                subject,
+                predicate,
+                value,
+            } => {
+                touch_iri_name(&mut delta, subject);
+                delta.touch_name(value.clone());
+                delta.touch_predicate(
+                    crate::identity::local_name(BASE_NS, predicate)
+                        .unwrap_or_else(|| predicate.clone()),
+                );
+            }
+        }
+    }
+    delta
+}
+
 /// 实体在图中已声明的类型（rdf:type 的本地名集合，用于定义域/值域校验）。
 fn entity_type_labels(
     store: &Store,
@@ -966,7 +1036,7 @@ pub struct OxigraphManager {
     snapshot_cache: parking_lot::Mutex<Option<(u64, Arc<Vec<PrologFact>>)>>,
     // 相关事实查询缓存：同一知识版本内按查询键多槽缓存（LRU），
     // 交替询问不同实体互不挤占；写后整体失效
-    relevant_cache: parking_lot::Mutex<RevisionLru<Arc<Vec<PrologFact>>>>,
+    relevant_cache: parking_lot::Mutex<DeltaQualifiedCache<Arc<Vec<PrologFact>>>>,
     // 直答缓存：同一知识版本内按查询键多槽缓存（LRU，含"确无答案"的负缓存）
     direct_answer_cache: parking_lot::Mutex<RevisionLru<Option<String>>>,
     // 操作计数台账（可与会话推理器共享同一实例）
@@ -982,3 +1052,6 @@ pub struct OxigraphManager {
 /// 32 槽足以消除往返抖动，同时让内存占用可计算。
 const QUERY_CACHE_CAPACITY: usize = 32;
 use crate::cache::RevisionLru;
+use crate::delta_cache::{
+    ClosureFootprint, DeltaFootprint, DeltaQualifiedCache, FactPattern, Qualification,
+};

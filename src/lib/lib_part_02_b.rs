@@ -135,8 +135,9 @@ impl OxigraphManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let delta = footprint_from_quads(&quads);
         let store = self.store.lock().await;
-        self.bump_revision();
+        self.bump_revision_with(Some(delta));
         let added = store.transaction(move |mut transaction| {
             let mut added = 0usize;
             for quad in &quads {
@@ -245,6 +246,7 @@ impl OxigraphManager {
             crate::import_episode::DEFAULT_TOP_N,
             crate::import_episode::DEFAULT_SAMPLE_LIMIT,
         );
+        let delta = footprint_from_quads(&flattened);
         let store = self.store.lock().await;
         let existing = Self::import_episodes_from_store(&store)?;
         let known_episode = existing.iter().find(|episode| episode.id == id).cloned();
@@ -372,7 +374,7 @@ impl OxigraphManager {
 
         // 只在实际改变默认图时推进知识版本；批次元数据与命名图不污染快照缓存。
         if added > 0 {
-            self.bump_revision();
+            self.bump_revision_with(Some(delta));
         }
         let recorded = recorded_episode.is_some();
         let source_aliases_added = alias_episode.is_some();
@@ -424,8 +426,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = self.load_import_batch_quads(episode).await?;
         let keep_graphs = format.supports_datasets();
-        let mut serializer =
-            oxigraph::io::RdfSerializer::from_format(format).for_writer(writer);
+        let mut serializer = oxigraph::io::RdfSerializer::from_format(format).for_writer(writer);
         for quad in &quads {
             let quad = if keep_graphs {
                 quad.clone()
@@ -437,11 +438,11 @@ impl OxigraphManager {
                     GraphName::DefaultGraph,
                 )
             };
-            serializer
-                .serialize_quad(&quad)
-                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+            serializer.serialize_quad(&quad).map_err(
+                |error| -> Box<dyn std::error::Error + Send + Sync> {
                     format!("批次导出失败：{}", error).into()
-                })?;
+                },
+            )?;
         }
         serializer
             .finish()
@@ -466,12 +467,12 @@ impl OxigraphManager {
     {
         let store = self.store.lock().await;
         let existing = Self::import_episodes_from_store(&store)?;
-        let Some(current) = existing.iter().find(|known| known.id == episode.id).cloned() else {
-            return Err(format!(
-                "没有匹配的导入批次：B{}（{}）",
-                episode.seq, episode.id
-            )
-            .into());
+        let Some(current) = existing
+            .iter()
+            .find(|known| known.id == episode.id)
+            .cloned()
+        else {
+            return Err(format!("没有匹配的导入批次：B{}（{}）", episode.seq, episode.id).into());
         };
 
         let mut other_additions: Vec<(GraphName, HashSet<String>)> = Vec::new();
@@ -487,10 +488,9 @@ impl OxigraphManager {
                 })
                 .collect::<Result<HashSet<_>, _>>()?;
             if !keys.is_empty() {
-                let additions =
-                    GraphName::NamedNode(NamedNode::new(crate::import_episode::additions_graph_iri(
-                        &other.id,
-                    ))?);
+                let additions = GraphName::NamedNode(NamedNode::new(
+                    crate::import_episode::additions_graph_iri(&other.id),
+                )?);
                 other_additions.push((additions, keys));
             }
         }
@@ -782,5 +782,4 @@ impl OxigraphManager {
             &facts,
         )))
     }
-
 }

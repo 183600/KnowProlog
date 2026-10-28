@@ -551,10 +551,17 @@ impl<V> DeltaQualifiedCache<V> {
     }
 
     pub fn put(&mut self, key: String, value: V, qualification: Qualification) -> usize {
-        if self.generation != Some(qualification.generation) {
-            self.entries.clear();
-            self.order.clear();
-            self.generation = Some(qualification.generation);
+        match self.generation {
+            Some(current) if qualification.generation < current => return 0,
+            Some(current) if qualification.generation > current => {
+                self.entries.clear();
+                self.order.clear();
+                self.generation = Some(qualification.generation);
+            }
+            None => {
+                self.generation = Some(qualification.generation);
+            }
+            _ => {}
         }
         let replaced = self.entries.insert(
             key.clone(),
@@ -880,6 +887,19 @@ mod tests {
         assert_eq!(report.retained, 0);
         assert_eq!(report.invalidated, 0);
         assert!(cache.get(5, "q").is_some());
+    }
+
+    #[test]
+    fn stale_put_never_clears_newer_entries() {
+        let mut cache = DeltaQualifiedCache::new(4);
+        cache.put("fresh".to_string(), 2, qualification(4, &["李四"]));
+        assert_eq!(
+            cache.put("stale".to_string(), 1, qualification(3, &["张三"]),),
+            0
+        );
+        assert_eq!(cache.generation(), Some(4));
+        assert_eq!(cache.get(4, "fresh"), Some(&2));
+        assert!(cache.get(4, "stale").is_none());
     }
 
     #[test]

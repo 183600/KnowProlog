@@ -1,3 +1,41 @@
+/// 为「相关事实」缓存条目生成合格证：名称、关系谓词与多跳闭包足迹。
+///
+/// 新事实若只涉及别的实体、别的关系谓词，且不匹配任何查询词面，就不会改变
+/// 这份子图，条目可跨版本继续命中；一旦碰到闭包节点或查询词面则必须重算。
+fn relevant_facts_qualification(
+    generation: u64,
+    query_entities: &[String],
+    facts: &[PrologFact],
+) -> Qualification {
+    let mut support_entities = BTreeSet::new();
+    let mut support_predicates = BTreeSet::new();
+    for fact in facts {
+        match fact {
+            PrologFact::Entity { name, .. } => {
+                support_entities.insert(name.clone());
+            }
+            PrologFact::Relation { from, rel_type, to } => {
+                support_entities.insert(from.clone());
+                support_entities.insert(to.clone());
+                support_predicates.insert(rel_type.clone());
+            }
+        }
+    }
+    let closure = ClosureFootprint::new(query_entities.iter().cloned())
+        .with_expanded(support_entities.iter().cloned());
+    let mut qualification = Qualification::sensitive(generation)
+        .support_entities(support_entities)
+        .support_predicates(support_predicates)
+        .closure(closure)
+        .exhaustive(true);
+    for entity in query_entities {
+        if !entity.is_empty() {
+            qualification = qualification.watch(FactPattern::EntityContains(entity.clone()));
+        }
+    }
+    qualification
+}
+
 impl OxigraphManager {
     /// `http://example.org/kg/entity/张三` → `张三`（百分号编码无损反解），其它 IRI 原样返回。
     fn local_kg_name(iri: &str) -> String {
@@ -534,13 +572,20 @@ impl OxigraphManager {
         facts.extend(relations);
 
         let facts = Arc::new(facts);
-        if self
-            .relevant_cache
-            .lock()
-            .put(revision, cache_key, facts.clone())
-            > 0
-        {
-            self.perf.bump("relevant_facts_cache_evict");
+        let current = self.revision.load(Ordering::Acquire);
+        if current == revision {
+            let qualification =
+                relevant_facts_qualification(revision, query_entities, facts.as_ref());
+            if self
+                .relevant_cache
+                .lock()
+                .put(cache_key, facts.clone(), qualification)
+                > 0
+            {
+                self.perf.bump("relevant_facts_cache_evict");
+            }
+        } else {
+            self.perf.bump("relevant_facts_cache_stale_skip");
         }
         Ok(facts.as_ref().clone())
     }
