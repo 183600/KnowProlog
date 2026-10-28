@@ -192,3 +192,54 @@ async fn direct_answer_negative_cache_recomputes_when_entity_gains_property() {
     assert_eq!(answer.as_deref(), Some("北京的作者是曹雪芹"));
     assert!(perf.count("direct_answer_query") > queries);
 }
+
+#[tokio::test]
+async fn relevant_facts_empty_result_recomputes_when_query_entity_arrives() {
+    let (manager, _dir) = local_manager().await;
+    manager
+        .save_knowledge(vec![local_person("李四")])
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let query = vec!["张三".to_string()];
+
+    assert!(
+        manager
+            .get_relevant_facts(&query, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let scans = perf.count("relevant_facts_graph_scan");
+    assert!(
+        manager
+            .get_relevant_facts(&query, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        perf.count("relevant_facts_graph_scan"),
+        scans,
+        "同版本空结果也应命中缓存"
+    );
+
+    manager
+        .save_knowledge(vec![local_person("张三")])
+        .await
+        .unwrap();
+    let facts = manager.get_relevant_facts(&query, 1).await.unwrap();
+
+    assert!(!facts.is_empty(), "查询模式新命中时必须重算空缓存");
+    assert!(
+        perf.count("relevant_facts_graph_scan") > scans,
+        "模式命中应触发重新扫描"
+    );
+    assert!(
+        facts
+            .iter()
+            .any(|fact| matches!(fact, PrologFact::Entity { name, .. } if name == "张三")),
+        "重算结果应包含新入库实体：{:?}",
+        facts
+    );
+}
