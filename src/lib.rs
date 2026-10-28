@@ -84,6 +84,7 @@ pub mod import_journal;
 pub mod joint_parse;
 pub mod knowledge_delta;
 pub mod knowledge_fusion;
+pub mod kg_pattern;
 pub mod knowledge_layers;
 pub mod lang_runtime;
 pub mod law_book;
