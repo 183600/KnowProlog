@@ -1186,4 +1186,57 @@ mod tests {
             .expect("已声明的类型应可诚实回答");
         assert!(answer.text.contains("暂无显式成员"), "{}", answer.text);
     }
+
+    #[test]
+    fn dialogue_manager_persists_type_focus_across_snapshot() {
+        use crate::dialogue_manager::DialogueManager;
+        use crate::prolog_engine::PrologFact;
+        use crate::symbolic_reasoner::SymbolicReasoner;
+        use std::collections::HashMap;
+
+        let schema = schema();
+        let mut reasoner = SymbolicReasoner::new(crate::ReasoningConfig::default(), HashMap::new());
+        reasoner.configure_schema_view(&schema);
+        let mut facts = Vec::new();
+        for index in 0..25 {
+            facts.push(PrologFact::Entity {
+                name: format!("人物{:02}", index),
+                entity_type: "人物".to_string(),
+                properties: HashMap::from([("年龄".to_string(), index.to_string())]),
+            });
+        }
+        facts.push(PrologFact::Entity {
+            name: "甲公司".to_string(),
+            entity_type: "组织".to_string(),
+            properties: HashMap::from([("城市".to_string(), "北京".to_string())]),
+        });
+        reasoner.observe_facts(&facts);
+
+        let mut manager = DialogueManager::new();
+        let first = manager
+            .plan_pure_dialogue("人物有哪些成员", &reasoner)
+            .expect("对话管理器应接管类型问答");
+        assert!(first.text.contains("人物00"), "{}", first.text);
+        assert_eq!(manager.turn_count(), 1);
+
+        let second = manager
+            .plan_pure_dialogue("还有呢", &reasoner)
+            .expect("追问应沿成员游标翻页");
+        assert!(second.text.contains("人物20"), "{}", second.text);
+        assert!(!second.text.contains("人物00"), "{}", second.text);
+
+        let switched = manager
+            .plan_pure_dialogue("那机构呢", &reasoner)
+            .expect("追问应切换类型焦点");
+        assert!(switched.text.contains("类型「机构」的成员"), "{}", switched.text);
+
+        let snapshot = manager.snapshot();
+        assert!(!snapshot.type_memory.is_empty());
+        let mut restored = DialogueManager::new();
+        restored.restore(&snapshot);
+        let continued = restored
+            .plan_pure_dialogue("还有呢", &reasoner)
+            .expect("恢复后应继续使用类型焦点");
+        assert!(continued.text.contains("已全部列出"), "{}", continued.text);
+    }
 }

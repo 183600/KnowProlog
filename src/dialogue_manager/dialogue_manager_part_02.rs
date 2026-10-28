@@ -22,6 +22,7 @@ impl DialogueManager {
             references: BindingLedger::new(),
             identity: UserIdentityLedger::new(),
             epistemic_followup: None,
+            type_memory: crate::type_memory::TypeDialogueMemory::new(),
             last_identity_card: None,
             pending_reference: None,
             reference_resolver: ContextualResolver::new(),
@@ -687,6 +688,7 @@ impl DialogueManager {
             references: self.references.clone(),
             identity: self.identity.clone(),
             epistemic_followup: self.epistemic_followup.clone(),
+            type_memory: self.type_memory.clone(),
         }
     }
 
@@ -703,6 +705,7 @@ impl DialogueManager {
         self.references = snapshot.references.clone();
         self.identity = snapshot.identity.clone();
         self.epistemic_followup = snapshot.epistemic_followup.clone();
+        self.type_memory = snapshot.type_memory.clone();
         self.last_identity_card = None;
         self.pending_reference = None;
     }
@@ -868,14 +871,39 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
-        if let Some(text) = knowledge.type_memory_answer(input) {
+        if let Some(answer) =
+            knowledge.type_memory_answer_in_context(input, &mut self.type_memory)
+        {
+            let plans = vec!["type_memory".to_string()];
+            let provenance = answer
+                .focus
+                .as_ref()
+                .map(|focus| vec![format!("类型焦点：{}", focus)])
+                .unwrap_or_default();
+            self.turns.push(DialogueTurn {
+                index: self.turns.len() + 1,
+                user: input.trim().to_string(),
+                kind: MoveKind::Other,
+                entity: None,
+                attribute: None,
+                answer_excerpt: Some(excerpt(&answer.text, 40)),
+                provenance,
+                plan: plans.clone(),
+                warrant: None,
+                kb_revision: Some(knowledge.revision()),
+            });
+            self.last_reply = plans.clone();
+            if self.externals.last().map(String::as_str) == Some(input.trim()) {
+                self.externals.pop();
+            }
             return Some(DialogueReply {
-                text,
-                plan: vec!["type_memory".to_string()],
+                text: answer.text,
+                plan: plans,
                 kind: MoveKind::Other,
                 derivation: None,
             });
         }
+        self.type_memory.note_non_type_turn();
         if let Some(reply) = self.plan_epistemic_followup(input, knowledge) {
             return Some(reply);
         }

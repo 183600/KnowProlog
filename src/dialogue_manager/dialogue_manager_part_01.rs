@@ -142,6 +142,9 @@ pub struct DialogueManagerSnapshot {
     /// 而不是退化成一次普通身份追问。空态省略，旧快照字节不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic_followup: Option<EpistemicFollowup>,
+    /// 类型对话记忆：焦点类型、成员游标与已说槽位（空态省略）。
+    #[serde(default, skip_serializing_if = "crate::type_memory::TypeDialogueMemory::is_empty")]
+    pub type_memory: crate::type_memory::TypeDialogueMemory,
 }
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
 #[derive(Clone, Debug)]
@@ -206,6 +209,16 @@ pub trait DialogueKnowledge {
     fn type_memory_answer(&self, question: &str) -> Option<String> {
         let _ = question;
         None
+    }
+    /// 带会话焦点的类型问答；缺省回落到无状态实现。
+    fn type_memory_answer_in_context(
+        &self,
+        question: &str,
+        memory: &mut crate::type_memory::TypeDialogueMemory,
+    ) -> Option<crate::type_memory::TypeAnswer> {
+        let _ = memory;
+        self.type_memory_answer(question)
+            .map(|text| crate::type_memory::TypeAnswer { text, focus: None })
     }
     /// 为问句重建一条有界推导；`expected_answer` 用于把证明锚定到上一轮
     /// 的实际回答，匹配不上时返回 None（宁可不解释，也不挂错证明）。
@@ -385,6 +398,19 @@ impl DialogueKnowledge for SymbolicReasoner {
 
     fn type_memory_answer(&self, question: &str) -> Option<String> {
         crate::type_memory::answer(self.generator(), question).map(|answer| answer.text)
+    }
+
+    fn type_memory_answer_in_context(
+        &self,
+        question: &str,
+        memory: &mut crate::type_memory::TypeDialogueMemory,
+    ) -> Option<crate::type_memory::TypeAnswer> {
+        crate::type_memory::answer_in_context(
+            self.generator(),
+            Some(self.schema_view()),
+            memory,
+            question,
+        )
     }
 
     fn derivation(&self, question: &str, expected_answer: Option<&str>) -> Option<Derivation> {
@@ -823,6 +849,8 @@ pub struct DialogueManager {
     identity: UserIdentityLedger,
     /// 上一轮情态问句的算子与槽位（随快照持久化）。
     epistemic_followup: Option<EpistemicFollowup>,
+    /// 类型对话记忆：焦点类型、成员游标与已说槽位（随快照持久化）。
+    type_memory: crate::type_memory::TypeDialogueMemory,
     /// 最近一次身份卡（运行时只读视图，不进快照）。
     last_identity_card: Option<IdentityCard>,
     /// 待回答的歧义澄清请求（不持久化；恢复会话后需重新提问）。
