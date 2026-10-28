@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 /// 按纪元失效的有界 LRU 缓存：`V` 是值类型，`E` 是纪元类型（默认 `u64`）。
+#[derive(Clone)]
 pub struct RevisionLru<V, E = u64> {
     epoch: Option<E>,
     capacity: usize,

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use serde::Serialize;
+use crate::cache::RevisionLru;
 use crate::function_words::{projection_set, Projection};
 use crate::nlp::shared_jieba;
 use crate::prolog_engine::PrologFact;
@@ -15,6 +16,9 @@ const SUBCLASS_PREDICATES: [&str; 5] = ["子类", "子类于", "是一种", "属
 const SUBPROPERTY_PREDICATES: [&str; 4] = ["子关系", "子属性", "子关系于", "subPropertyOf"];
 /// 子类可达性的层数上限（中文领域层级很浅；上限只为防病态图）
 const MAX_SUBCLASS_DEPTH: usize = 16;
+/// 同一检索状态下可复用的查询结果缓存容量。
+const QUERY_CACHE_CAPACITY: usize = 32;
+
 /// 单条被检索的证据（三元组或实体属性）
 #[derive(Debug, Clone, Serialize)]
 pub struct RetrievalHit {
@@ -185,4 +189,9 @@ pub struct DenseRetriever {
     seed_candidates: Vec<String>,
     dirty: bool,
     built: bool,
+    /// 精确查询缓存：键覆盖查询、k、约束与预算，纪元随索引/层级变化推进。
+    search_cache: RevisionLru<EvidenceSearch>,
+    cache_epoch: u64,
+    cache_hits: u64,
+    cache_misses: u64,
 }

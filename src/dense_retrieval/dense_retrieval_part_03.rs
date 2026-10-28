@@ -81,6 +81,69 @@ mod tests {
         assert_eq!(retriever.doc_count(), 1);
     }
 
+    #[test]
+    fn repeated_search_reuses_exact_result_without_recomputing() {
+        let mut retriever = build_retriever();
+        let constraints = SearchConstraints::default();
+        let first = retriever.search("张三的年龄", 5, &constraints, SearchBudget::unlimited());
+        assert_eq!(retriever.cache_stats(), (0, 1));
+        let second = retriever.search("张三的年龄", 5, &constraints, SearchBudget::unlimited());
+        assert_eq!(retriever.cache_stats(), (1, 1));
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap(),
+            "缓存命中必须与重新计算逐字节一致"
+        );
+        // 不同 k 是不同的逻辑请求，必须分别计算。
+        let _ = retriever.search("张三的年龄", 3, &constraints, SearchBudget::unlimited());
+        assert_eq!(retriever.cache_stats(), (1, 2));
+    }
+
+    #[test]
+    fn evidence_mutation_invalidates_cached_results() {
+        let mut retriever = build_retriever();
+        let constraints = SearchConstraints {
+            predicate: Some("老师".to_string()),
+            ..SearchConstraints::default()
+        };
+        let before = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        assert!(!before
+            .hits
+            .iter()
+            .any(|hit| hit.subject == "赵六" && hit.predicate == "老师"));
+        retriever.observe_triple("赵六", "老师", "王五");
+        let after = retriever.search("", 10, &constraints, SearchBudget::unlimited());
+        assert!(after
+            .hits
+            .iter()
+            .any(|hit| hit.subject == "赵六" && hit.predicate == "老师"));
+        assert_eq!(retriever.cache_stats(), (0, 2), "写入后必须按未命中重算");
+    }
+
+    #[test]
+    fn schema_mutation_invalidates_cached_results() {
+        let mut retriever = DenseRetriever::new(8, 0.85, 8);
+        retriever.observe_entity("故宫", "地点", &[]);
+        let constraints = SearchConstraints {
+            entity_type: Some("人物".to_string()),
+            ..SearchConstraints::default()
+        };
+        let before = retriever.search("", 5, &constraints, SearchBudget::unlimited());
+        assert!(
+            before.hits.iter().any(|hit| hit.subject == "故宫"),
+            "无互斥证据时开放世界应相容：{:?}",
+            before.hits
+        );
+        retriever.observe_disjoint("地点", "人物");
+        let after = retriever.search("", 5, &constraints, SearchBudget::unlimited());
+        assert!(
+            !after.hits.iter().any(|hit| hit.subject == "故宫"),
+            "互斥类型登记后旧缓存必须失效：{:?}",
+            after.hits
+        );
+        assert_eq!(retriever.cache_stats(), (0, 2));
+    }
+
     fn exhaustive_hits(retriever: &DenseRetriever, query: &str, k: usize) -> Vec<RetrievalHit> {
         let seeds = retriever.seeds(query);
         let tokens = tokenize(query);

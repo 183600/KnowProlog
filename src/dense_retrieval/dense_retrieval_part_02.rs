@@ -29,7 +29,27 @@ impl DenseRetriever {
             seed_candidates: Vec::new(),
             dirty: false,
             built: false,
+            search_cache: RevisionLru::new(QUERY_CACHE_CAPACITY),
+            cache_epoch: 0,
+            cache_hits: 0,
+            cache_misses: 0,
         }
+    }
+
+    /// 索引内容或 schema 层级变化时推进缓存纪元：旧查询结果整体作废，
+    /// 无需逐条猜测哪些文档受影响。
+    fn bump_search_epoch(&mut self) {
+        self.cache_epoch = self.cache_epoch.wrapping_add(1);
+    }
+
+    /// 当前查询缓存的命中/未命中计数（观测用，不参与检索语义）。
+    pub fn cache_stats(&self) -> (u64, u64) {
+        (self.cache_hits, self.cache_misses)
+    }
+
+    /// 当前缓存条目数（观测/测试用）。
+    pub fn cache_len(&self) -> usize {
+        self.search_cache.len()
     }
 
     pub fn doc_count(&self) -> usize {
@@ -60,6 +80,7 @@ impl DenseRetriever {
         if !self.seen.insert(key) {
             return;
         }
+        self.bump_search_epoch();
         let mut terms: HashSet<String> = HashSet::new();
         terms.extend(index_terms(subject));
         terms.extend(index_terms(predicate));
@@ -181,6 +202,7 @@ impl DenseRetriever {
                 }
             }
             self.dirty = true;
+            self.bump_search_epoch();
         }
         removed
     }
@@ -212,6 +234,7 @@ impl DenseRetriever {
                     .or_default()
                     .insert(name.to_string());
                 self.dirty = true;
+                self.bump_search_epoch();
             }
             self.observe_triple(name, "类型", entity_type);
         }
@@ -227,10 +250,14 @@ impl DenseRetriever {
         if sub.is_empty() || sup.is_empty() || sub == sup {
             return;
         }
-        self.type_hierarchy
+        if self
+            .type_hierarchy
             .entry(sub.to_string())
             .or_default()
-            .insert(sup.to_string());
+            .insert(sup.to_string())
+        {
+            self.bump_search_epoch();
+        }
     }
 
     /// 登记一对互斥类型（幂等，顺序无关）：互斥是类型约束里唯一的硬剪证据。
@@ -245,7 +272,9 @@ impl DenseRetriever {
         } else {
             (right.to_string(), left.to_string())
         };
-        self.type_disjoint.insert(pair);
+        if self.type_disjoint.insert(pair) {
+            self.bump_search_epoch();
+        }
     }
 
     /// 子类可达（含传递闭包）：`sub ⊑* sup`。
@@ -362,14 +391,19 @@ impl DenseRetriever {
         if sub.is_empty() || sup.is_empty() || sub == sup {
             return;
         }
-        self.predicate_hierarchy
+        let direct = self
+            .predicate_hierarchy
             .entry(sub.to_string())
             .or_default()
             .insert(sup.to_string());
-        self.predicate_children
+        let reverse = self
+            .predicate_children
             .entry(sup.to_string())
             .or_default()
             .insert(sub.to_string());
+        if direct || reverse {
+            self.bump_search_epoch();
+        }
     }
 
     /// 登记谓词的定义域类型（幂等）：定义域/值域是 schema 级类型约束，
@@ -380,10 +414,14 @@ impl DenseRetriever {
         if predicate.is_empty() || class.is_empty() {
             return;
         }
-        self.predicate_domain
+        if self
+            .predicate_domain
             .entry(predicate.to_string())
             .or_default()
-            .insert(class.to_string());
+            .insert(class.to_string())
+        {
+            self.bump_search_epoch();
+        }
     }
 
     /// 登记谓词的值域类型（幂等）。
@@ -393,10 +431,14 @@ impl DenseRetriever {
         if predicate.is_empty() || class.is_empty() {
             return;
         }
-        self.predicate_range
+        if self
+            .predicate_range
             .entry(predicate.to_string())
             .or_default()
-            .insert(class.to_string());
+            .insert(class.to_string())
+        {
+            self.bump_search_epoch();
+        }
     }
 
     /// 谓词的全部严格父谓词（传递闭包，有界 BFS，字典序）。
@@ -1087,7 +1129,28 @@ impl DenseRetriever {
     ///
     /// 正确性契约：上界只用于跳过不可能进入前 k 的文档；预算耗尽或候选生成
     /// 截断时回执显式标记 `certified_top_k = false`，绝不把近似结果冒充精确结果。
+    ///
+    /// 同一索引纪元内的相同请求直接复用上次结果；任何证据或 schema 变化都推进
+    /// 纪元并使旧结果整体失效，因此缓存命中与重新计算逐字节相等。
     pub fn search(
+        &mut self,
+        query: &str,
+        k: usize,
+        constraints: &SearchConstraints,
+        budget: SearchBudget,
+    ) -> EvidenceSearch {
+        let key = query_cache_key(query, k, constraints, budget);
+        if let Some(cached) = self.search_cache.get(self.cache_epoch, &key) {
+            self.cache_hits += 1;
+            return cached.clone();
+        }
+        self.cache_misses += 1;
+        let result = self.search_uncached(query, k, constraints, budget);
+        self.search_cache.put(self.cache_epoch, key, result.clone());
+        result
+    }
+
+    fn search_uncached(
         &mut self,
         query: &str,
         k: usize,
@@ -1415,6 +1478,48 @@ impl DenseRetriever {
         output.trim_end().to_string()
     }
 }
+
+fn push_cache_field(out: &mut String, field: &str) {
+    out.push_str(&field.len().to_string());
+    out.push(':');
+    out.push_str(field);
+    out.push('|');
+}
+
+fn push_optional_cache_field(out: &mut String, field: Option<&str>) {
+    match field {
+        Some(value) => {
+            out.push('s');
+            push_cache_field(out, value);
+        }
+        None => out.push_str("-|"),
+    }
+}
+
+/// 完整规范键：任何会影响结果的输入都必须进入键，哈希不能替代它。
+fn query_cache_key(
+    query: &str,
+    k: usize,
+    constraints: &SearchConstraints,
+    budget: SearchBudget,
+) -> String {
+    let mut key = String::from("v1|");
+    push_cache_field(&mut key, query);
+    push_cache_field(&mut key, &k.clamp(1, 50).to_string());
+    push_optional_cache_field(&mut key, constraints.subject.as_deref());
+    push_optional_cache_field(&mut key, constraints.predicate.as_deref());
+    push_optional_cache_field(&mut key, constraints.object.as_deref());
+    push_optional_cache_field(&mut key, constraints.entity_type.as_deref());
+    match budget.max_scanned {
+        Some(limit) => {
+            key.push('s');
+            push_cache_field(&mut key, &limit.to_string());
+        }
+        None => key.push_str("-|"),
+    }
+    key
+}
+
 /// 分词并构造索引词项：结巴切词 + 中文二元组
 pub fn tokenize(text: &str) -> Vec<String> {
     let text = text.trim();
