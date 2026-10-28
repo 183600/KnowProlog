@@ -594,6 +594,7 @@ impl OxigraphManager {
         let winners = plan.materialize_keys();
 
         let mut removed = 0usize;
+        let mut removed_quads = Vec::new();
         for previous in &ledger.applied {
             if winners.contains(&(
                 previous.subject.clone(),
@@ -612,10 +613,12 @@ impl OxigraphManager {
             )?;
             if store.remove(&quad)? {
                 removed += 1;
+                removed_quads.push(quad);
             }
         }
 
         let mut inserted = 0usize;
+        let mut inserted_quads = Vec::new();
         for assertion in &plan.materialize {
             let quad = Self::assertion_quad(
                 &assertion.subject,
@@ -626,6 +629,7 @@ impl OxigraphManager {
             )?;
             if store.insert(&quad)? {
                 inserted += 1;
+                inserted_quads.push(quad);
             }
         }
 
@@ -638,7 +642,8 @@ impl OxigraphManager {
         ledger.sort_and_dedup();
         self.sync_fusion_ledger_locked(&store, &ledger)?;
         if inserted + removed > 0 {
-            self.bump_revision();
+            let delta = footprint_from_quad_sets(&inserted_quads, &removed_quads);
+            self.bump_revision_with(Some(delta));
         }
         self.perf.bump("fusion_apply");
         Ok(knowledge_fusion::FusionApplyOutcome {

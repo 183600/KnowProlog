@@ -1,4 +1,5 @@
     use super::*;
+    use crate::cache::RevisionLru;
     use crate::perf_ledger::PerfLedger;
 
     /// 有界 LRU：版本失效整体清空、命中触碰、溢出淘汰最久未用

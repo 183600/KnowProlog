@@ -11,8 +11,8 @@
 //!   - `exhaustive`：答案是穷尽枚举还是只取了一个见证。
 //!
 //! 增量到达时逐条判定：无关条目只推进版本（保留计算），相关条目按单调性
-//! 标记为「可能不完整」或直接失效；撤回/重置等无法用增量表达的变化仍走
-//! 全量清空。遍历顺序由条目 LRU 序决定，判定结果可复现、可审计。
+//! 标记为「可能不完整」或直接失效；撤回按去除足迹逐条失效，只有无法表达
+//! 的整体重置才全量清空。遍历顺序由条目 LRU 序决定，判定结果可复现、可审计。
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -158,9 +158,12 @@ pub struct DeltaFootprint {
     pub predicates: BTreeSet<String>,
     /// 新增事实（用于精确形状匹配）。
     pub facts: Vec<PrologFact>,
+    pub removed_names: BTreeSet<String>,
+    pub removed_predicates: BTreeSet<String>,
+    pub removed_facts: Vec<PrologFact>,
     /// 别名变化；别名不做「可能不完整」处理，触碰即失效。
     pub aliases: Vec<(String, String)>,
-    /// 无法用增量表达的整体重建（撤回、替换、结构迁移）。
+    /// 无法用增量表达的整体重建（替换、结构迁移）。
     pub rebuild: bool,
 }
 
@@ -171,6 +174,9 @@ impl DeltaFootprint {
             names: BTreeSet::new(),
             predicates: BTreeSet::new(),
             facts: Vec::new(),
+            removed_names: BTreeSet::new(),
+            removed_predicates: BTreeSet::new(),
+            removed_facts: Vec::new(),
             aliases: Vec::new(),
             rebuild: false,
         }
@@ -211,28 +217,25 @@ impl DeltaFootprint {
         }
     }
 
+    pub fn from_removed_facts(generation: u64, facts: &[PrologFact]) -> Self {
+        let mut footprint = Self::new(generation);
+        footprint.extend_removed_facts(facts);
+        footprint
+    }
+
     pub fn extend_facts(&mut self, facts: &[PrologFact]) {
         for fact in facts {
-            match fact {
-                PrologFact::Entity {
-                    name,
-                    entity_type,
-                    properties,
-                } => {
-                    self.names.insert(name.clone());
-                    self.names.insert(entity_type.clone());
-                    for (key, value) in properties {
-                        self.predicates.insert(key.clone());
-                        self.names.insert(value.clone());
-                    }
-                }
-                PrologFact::Relation { from, rel_type, to } => {
-                    self.names.insert(from.clone());
-                    self.names.insert(to.clone());
-                    self.predicates.insert(rel_type.clone());
-                }
-            }
+            self.names.extend(fact_names(fact));
+            self.predicates.extend(fact_predicates(fact));
             self.facts.push(fact.clone());
+        }
+    }
+
+    pub fn extend_removed_facts(&mut self, facts: &[PrologFact]) {
+        for fact in facts {
+            self.removed_names.extend(fact_names(fact));
+            self.removed_predicates.extend(fact_predicates(fact));
+            self.removed_facts.push(fact.clone());
         }
     }
 
@@ -244,11 +247,28 @@ impl DeltaFootprint {
         self.predicates.insert(predicate.into());
     }
 
+    pub fn touch_removed_name(&mut self, name: impl Into<String>) {
+        self.removed_names.insert(name.into());
+    }
+
+    pub fn touch_removed_predicate(&mut self, predicate: impl Into<String>) {
+        self.removed_predicates.insert(predicate.into());
+    }
+
+    pub fn has_removals(&self) -> bool {
+        !self.removed_names.is_empty()
+            || !self.removed_predicates.is_empty()
+            || !self.removed_facts.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
         !self.rebuild
             && self.names.is_empty()
             && self.predicates.is_empty()
             && self.facts.is_empty()
+            && self.removed_names.is_empty()
+            && self.removed_predicates.is_empty()
+            && self.removed_facts.is_empty()
             && self.aliases.is_empty()
     }
 }
@@ -323,32 +343,25 @@ impl Qualification {
         self
     }
 
-    fn touched_by(&self, delta: &DeltaFootprint) -> bool {
-        if delta.rebuild {
-            return true;
-        }
-        if self
-            .patterns
-            .iter()
-            .any(|pattern| matches!(pattern, FactPattern::Any))
-        {
-            return true;
-        }
-        if delta
-            .names
+    fn touched_by_sets(
+        &self,
+        names: &BTreeSet<String>,
+        predicates: &BTreeSet<String>,
+        facts: &[PrologFact],
+    ) -> bool {
+        if names
             .iter()
             .any(|name| self.support_entities.contains(name) || self.closure.contains(name))
         {
             return true;
         }
-        if delta
-            .predicates
+        if predicates
             .iter()
             .any(|predicate| self.support_predicates.contains(predicate))
         {
             return true;
         }
-        if delta.facts.iter().any(|fact| {
+        if facts.iter().any(|fact| {
             self.support_facts.contains(&fact_key(fact))
                 || self.patterns.iter().any(|pattern| {
                     pattern.matches_fact(fact)
@@ -364,15 +377,37 @@ impl Qualification {
         }) {
             return true;
         }
-        delta.names.iter().any(|name| {
+        names.iter().any(|name| {
             self.patterns
                 .iter()
                 .any(|pattern| pattern.matches_name(name))
-        }) || delta.predicates.iter().any(|predicate| {
+        }) || predicates.iter().any(|predicate| {
             self.patterns
                 .iter()
                 .any(|pattern| pattern.matches_predicate(predicate))
         })
+    }
+
+    fn touched_by(&self, delta: &DeltaFootprint) -> bool {
+        if delta.rebuild {
+            return true;
+        }
+        if self
+            .patterns
+            .iter()
+            .any(|pattern| matches!(pattern, FactPattern::Any))
+        {
+            return true;
+        }
+        self.touched_by_sets(&delta.names, &delta.predicates, &delta.facts)
+    }
+
+    fn touched_by_removal(&self, delta: &DeltaFootprint) -> bool {
+        self.touched_by_sets(
+            &delta.removed_names,
+            &delta.removed_predicates,
+            &delta.removed_facts,
+        )
     }
 
     fn touched_by_alias(&self, delta: &DeltaFootprint) -> bool {
@@ -402,6 +437,9 @@ fn qualification_impact(qualification: &Qualification, delta: &DeltaFootprint) -
         return Impact::Invalidate;
     }
     if !delta.aliases.is_empty() && qualification.touched_by_alias(delta) {
+        return Impact::Invalidate;
+    }
+    if qualification.touched_by_removal(delta) {
         return Impact::Invalidate;
     }
     if qualification.touched_by(delta) {
@@ -947,5 +985,46 @@ mod tests {
         );
         let report = cache.observe(&DeltaFootprint::from_facts(1, &[fact]));
         assert_eq!(report.invalidated, 1);
+    }
+
+    #[test]
+    fn unrelated_removal_retains_entry() {
+        let mut cache = DeltaQualifiedCache::new(2);
+        cache.put("q".to_string(), 1, qualification(0, &["张三"]));
+        let report = cache.observe(&DeltaFootprint::from_removed_facts(1, &[entity("王五")]));
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.invalidated, 0);
+        assert_eq!(cache.get(1, "q"), Some(&1));
+        assert_eq!(cache.status("q"), Some(EntryStatus::Complete));
+    }
+
+    #[test]
+    fn removal_touching_support_invalidates_even_additive_entry() {
+        let mut cache = DeltaQualifiedCache::new(2);
+        cache.put(
+            "q".to_string(),
+            1,
+            Qualification::additive(0).support_entities(["张三".to_string()]),
+        );
+        let report = cache.observe(&DeltaFootprint::from_removed_facts(
+            1,
+            &[relation("张三", "师傅", "王五")],
+        ));
+        assert_eq!(report.marked_incomplete, 0);
+        assert_eq!(report.invalidated, 1);
+        assert!(cache.get(1, "q").is_none());
+    }
+
+    #[test]
+    fn removal_pattern_hit_invalidates_entry() {
+        let mut cache = DeltaQualifiedCache::new(2);
+        cache.put(
+            "q".to_string(),
+            1,
+            Qualification::sensitive(0).watch(FactPattern::EntityContains("张三".to_string())),
+        );
+        let report = cache.observe(&DeltaFootprint::from_removed_facts(1, &[entity("张三")]));
+        assert_eq!(report.invalidated, 1);
+        assert!(cache.is_empty());
     }
 }

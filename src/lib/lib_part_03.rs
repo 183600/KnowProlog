@@ -248,13 +248,16 @@ impl OxigraphManager {
                 .quads_for_pattern(None, Some(predicate_iri.as_ref()), None, None)
                 .collect::<Result<Vec<_>, _>>()?;
             let mut removed = 0usize;
+            let mut removed_quads = Vec::new();
             for quad in quads {
                 if store.remove(&quad).unwrap_or(false) {
                     removed += 1;
+                    removed_quads.push(quad);
                 }
             }
             if removed > 0 {
-                self.bump_revision();
+                let delta = footprint_from_removed_quads(&removed_quads);
+                self.bump_revision_with(Some(delta));
             }
             removed
         };

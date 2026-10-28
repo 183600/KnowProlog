@@ -479,6 +479,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.lock().await;
         let mut removed = 0usize;
+        let mut removed_quads = Vec::new();
         for action in &receipt.actions {
             let quad = match action {
                 predicate_registry::ImportAction::Named {
@@ -504,6 +505,7 @@ impl OxigraphManager {
             };
             if store.remove(&quad).unwrap_or(false) {
                 removed += 1;
+                removed_quads.push(quad);
             }
         }
         {
@@ -537,7 +539,8 @@ impl OxigraphManager {
         }
         // 只有确有条目被移除才推进版本；重复撤销是无操作
         if removed > 0 {
-            self.bump_revision();
+            let delta = footprint_from_removed_quads(&removed_quads);
+            self.bump_revision_with(Some(delta));
         }
         Ok(removed)
     }
@@ -582,6 +585,7 @@ impl OxigraphManager {
             )
             .collect::<Result<Vec<_>, _>>()?;
         let mut removed = 0usize;
+        let mut removed_quads = Vec::new();
         let mut had_literal = false;
         let mut had_iri = false;
         for quad in existing {
@@ -597,6 +601,7 @@ impl OxigraphManager {
             }
             if store.remove(&quad)? {
                 removed += 1;
+                removed_quads.push(quad.clone());
                 match &quad.object {
                     Term::Literal(_) => had_literal = true,
                     Term::NamedNode(_) => had_iri = true,
@@ -608,6 +613,7 @@ impl OxigraphManager {
             return Ok((0, false));
         }
         let mut inserted = false;
+        let mut inserted_quads = Vec::new();
         if !new_value.is_empty() {
             if had_literal {
                 let new_quad = Quad::new(
@@ -619,6 +625,7 @@ impl OxigraphManager {
                 if !store.contains(&new_quad)? {
                     store.insert(&new_quad)?;
                     inserted = true;
+                    inserted_quads.push(new_quad);
                 }
             }
             if had_iri {
@@ -632,6 +639,7 @@ impl OxigraphManager {
                 if !store.contains(&new_quad)? {
                     store.insert(&new_quad)?;
                     inserted = true;
+                    inserted_quads.push(new_quad);
                 }
                 // 快照只保留「两端都有 kg:name」的关系：新宾语必须自带名称，
                 // 否则更正后的关系会在推理快照里凭空消失。
@@ -645,6 +653,7 @@ impl OxigraphManager {
                 if !store.contains(&name_quad)? {
                     store.insert(&name_quad)?;
                     inserted = true;
+                    inserted_quads.push(name_quad);
                 }
             }
         }
@@ -659,7 +668,8 @@ impl OxigraphManager {
                 new_value
             },
         );
-        self.bump_revision();
+        let delta = footprint_from_quad_sets(&inserted_quads, &removed_quads);
+        self.bump_revision_with(Some(delta));
         Ok((removed, inserted))
     }
 }

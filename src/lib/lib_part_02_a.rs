@@ -161,17 +161,11 @@ impl OxigraphManager {
         Arc::clone(&self.perf)
     }
 
-    /// 标记知识版本变化：调用方必须持有存储锁，且在本次实际写入完成之后
-    /// （version-after-write）。这样并发读者绝不会把过期数据缓存到新版本号上，
-    /// 且重复导入不推进版本。
-    fn bump_revision(&self) {
-        self.bump_revision_with(None);
-    }
-
     /// 带增量足迹的版本推进：相关事实缓存按依赖逐条复核，而不是整体失忆。
     ///
-    /// 只有「纯追加且能给出完整足迹」的写入路径才应调用本函数；撤回、更正、
-    /// 整体替换等无法用增量表达的变化仍走 [`Self::bump_revision`] 全量清空。
+    /// 调用方必须持有存储锁，并在实际写入完成之后调用（version-after-write），
+    /// 这样并发读者绝不会把过期数据缓存到新版本号上。只有能给出完整增量足迹
+    /// 的写入路径才应传入 `Some`；整体替换、结构迁移等只能传 `None` 全量清空。
     fn bump_revision_with(&self, delta: Option<DeltaFootprint>) {
         let revision = self
             .revision

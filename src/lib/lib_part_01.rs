@@ -39,30 +39,71 @@ fn touch_iri_name(delta: &mut DeltaFootprint, iri: &str) {
     }
 }
 
+fn touch_removed_iri_name(delta: &mut DeltaFootprint, iri: &str) {
+    if let Some(name) = crate::identity::entity_local_name(BASE_NS, iri)
+        .or_else(|| crate::identity::local_name(BASE_NS, iri))
+    {
+        delta.touch_removed_name(name);
+    } else {
+        delta.touch_removed_name(iri);
+    }
+}
+
 /// 从 RDF 四元组提取「这次写入可能碰到哪些名称/谓词」。
 ///
 /// 这是保守足迹：名称字面量、IRI 本地名与完整的非 kg IRI 都计入，宁可多失效
 /// 一条缓存，也不让新事实绕过依赖复核。
 fn footprint_from_quads(quads: &[Quad]) -> DeltaFootprint {
+    footprint_from_quad_sets(quads, &[])
+}
+
+fn footprint_from_removed_quads(quads: &[Quad]) -> DeltaFootprint {
+    footprint_from_quad_sets(&[], quads)
+}
+
+fn footprint_from_quad_sets(added: &[Quad], removed: &[Quad]) -> DeltaFootprint {
     let mut delta = DeltaFootprint::new(0);
-    for quad in quads {
-        if let Subject::NamedNode(node) = &quad.subject {
-            touch_iri_name(&mut delta, node.as_str());
-        }
-        let predicate_iri = quad.predicate.as_str();
-        delta.touch_predicate(
-            crate::identity::local_name(BASE_NS, predicate_iri)
-                .unwrap_or_else(|| predicate_iri.to_string()),
-        );
-        match &quad.object {
-            Term::NamedNode(node) => touch_iri_name(&mut delta, node.as_str()),
-            Term::Literal(literal) => {
-                delta.touch_name(literal.value());
-            }
-            _ => {}
-        }
+    for quad in added {
+        touch_quad(&mut delta, quad, false);
+    }
+    for quad in removed {
+        touch_quad(&mut delta, quad, true);
     }
     delta
+}
+
+fn touch_quad(delta: &mut DeltaFootprint, quad: &Quad, removed: bool) {
+    if let Subject::NamedNode(node) = &quad.subject {
+        if removed {
+            touch_removed_iri_name(delta, node.as_str());
+        } else {
+            touch_iri_name(delta, node.as_str());
+        }
+    }
+    let predicate = crate::identity::local_name(BASE_NS, quad.predicate.as_str())
+        .unwrap_or_else(|| quad.predicate.as_str().to_string());
+    if removed {
+        delta.touch_removed_predicate(predicate);
+    } else {
+        delta.touch_predicate(predicate);
+    }
+    match &quad.object {
+        Term::NamedNode(node) => {
+            if removed {
+                touch_removed_iri_name(delta, node.as_str());
+            } else {
+                touch_iri_name(delta, node.as_str());
+            }
+        }
+        Term::Literal(literal) => {
+            if removed {
+                delta.touch_removed_name(literal.value());
+            } else {
+                delta.touch_name(literal.value());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 从导入回执的实际动作提取增量足迹（只含成功写入的三元组）。
@@ -1051,7 +1092,6 @@ pub struct OxigraphManager {
 /// 每次写操作缓存容量上限（条目数）。对话中交替询问少量实体，
 /// 32 槽足以消除往返抖动，同时让内存占用可计算。
 const QUERY_CACHE_CAPACITY: usize = 32;
-use crate::cache::RevisionLru;
 use crate::delta_cache::{
     ClosureFootprint, DeltaFootprint, DeltaQualifiedCache, FactPattern, Qualification,
 };

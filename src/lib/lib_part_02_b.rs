@@ -520,10 +520,11 @@ impl OxigraphManager {
             .collect::<Result<_, _>>()?;
 
         let additions_len = additions.len();
-        let (removed, kept_elsewhere, batch_assertions) =
+        let (removed, kept_elsewhere, batch_assertions, removed_default_quads) =
             store.transaction(move |mut transaction| {
                 let mut removed = 0usize;
                 let mut kept_elsewhere = 0usize;
+                let mut removed_default_quads = Vec::new();
                 for addition in &additions {
                     let key = crate::import_episode::assertion_key(addition);
                     let owners: Vec<&GraphName> = other_additions
@@ -540,6 +541,7 @@ impl OxigraphManager {
                         );
                         if transaction.remove(default_quad.as_ref())? {
                             removed += 1;
+                            removed_default_quads.push(default_quad);
                         }
                     } else {
                         kept_elsewhere += 1;
@@ -566,15 +568,17 @@ impl OxigraphManager {
                 for quad in &metadata {
                     transaction.remove(quad.as_ref())?;
                 }
-                Ok::<(usize, usize, usize), ImportBatchTransactionError>((
+                Ok::<(usize, usize, usize, Vec<Quad>), ImportBatchTransactionError>((
                     removed,
                     kept_elsewhere,
                     batch_assertions,
+                    removed_default_quads,
                 ))
             })?;
 
         if removed > 0 {
-            self.bump_revision();
+            let delta = footprint_from_removed_quads(&removed_default_quads);
+            self.bump_revision_with(Some(delta));
         }
         self.perf.bump("import_batch_retract");
         Ok(crate::import_episode::BatchRetraction {

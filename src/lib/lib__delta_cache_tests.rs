@@ -243,3 +243,97 @@ async fn relevant_facts_empty_result_recomputes_when_query_entity_arrives() {
         facts
     );
 }
+
+#[tokio::test]
+async fn relevant_facts_cache_survives_unrelated_undo() {
+    let (manager, _dir) = local_manager().await;
+    manager
+        .save_knowledge(vec![local_person("张三"), local_person("李四")])
+        .await
+        .unwrap();
+    manager
+        .save_knowledge(vec![local_relation("张三", "李四")])
+        .await
+        .unwrap();
+    let receipt = manager
+        .save_knowledge_with_receipt(vec![local_person("王五")])
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let query = vec!["张三".to_string()];
+
+    let first = manager.get_relevant_facts(&query, 1).await.unwrap();
+    let scans = perf.count("relevant_facts_graph_scan");
+    let retained = perf.count("relevant_cache_delta_retained");
+    assert!(manager.undo_import(&receipt).await.unwrap() > 0);
+    let second = manager.get_relevant_facts(&query, 1).await.unwrap();
+
+    assert_eq!(first, second, "无关撤回不应改变已缓存的子图");
+    assert_eq!(
+        perf.count("relevant_facts_graph_scan"),
+        scans,
+        "无关撤回应保留缓存，而不是整图重扫"
+    );
+    assert!(
+        perf.count("relevant_cache_delta_retained") > retained,
+        "无关撤回应计入保留台账"
+    );
+}
+
+#[tokio::test]
+async fn relevant_facts_cache_recomputes_after_removal_in_closure() {
+    let (manager, _dir) = local_manager().await;
+    manager
+        .save_knowledge(vec![local_person("张三"), local_person("李四")])
+        .await
+        .unwrap();
+    let receipt = manager
+        .save_knowledge_with_receipt(vec![local_relation("张三", "李四")])
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let query = vec!["张三".to_string()];
+
+    let first = manager.get_relevant_facts(&query, 2).await.unwrap();
+    assert!(first
+        .iter()
+        .any(|fact| matches!(fact, PrologFact::Relation { .. })));
+    let scans = perf.count("relevant_facts_graph_scan");
+    assert!(manager.undo_import(&receipt).await.unwrap() > 0);
+    let second = manager.get_relevant_facts(&query, 2).await.unwrap();
+
+    assert!(
+        perf.count("relevant_facts_graph_scan") > scans,
+        "闭包内关系被撤回后必须重新扫描"
+    );
+    assert!(
+        !second
+            .iter()
+            .any(|fact| matches!(fact, PrologFact::Relation { .. })),
+        "重算结果不应保留已撤回的关系：{:?}",
+        second
+    );
+}
+
+#[tokio::test]
+async fn direct_answer_cache_recomputes_after_entity_undo() {
+    let (manager, _dir) = local_manager().await;
+    let receipt = manager
+        .save_knowledge_with_receipt(vec![local_city("北京", "中国")])
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let entities = vec!["北京".to_string()];
+
+    let first = manager.get_direct_answer("capital_query", &entities).await;
+    assert_eq!(first.as_deref(), Some("北京的首都是中国"));
+    let queries = perf.count("direct_answer_query");
+    assert!(manager.undo_import(&receipt).await.unwrap() > 0);
+    let second = manager.get_direct_answer("capital_query", &entities).await;
+
+    assert!(second.is_none(), "实体撤回后直答必须失效");
+    assert!(
+        perf.count("direct_answer_query") > queries,
+        "命中撤回足迹的直答必须重算"
+    );
+}
