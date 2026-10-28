@@ -1901,4 +1901,13 @@ mod tests {
         config.alignment_scale = 0.0;
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn clarify_before_fallback_defaults_on_for_legacy_configs() {
+        let legacy: SoftRouteConfig = toml::from_str("").expect("空配置应使用全部默认值");
+        assert!(legacy.clarify_before_fallback);
+        let explicit: SoftRouteConfig =
+            toml::from_str("clarify_before_fallback = false").expect("显式关闭应可解析");
+        assert!(!explicit.clarify_before_fallback);
+    }
 }

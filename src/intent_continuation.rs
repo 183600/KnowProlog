@@ -481,7 +481,11 @@ mod tests {
         assert_eq!(pending.options[0].query_type, "master_query");
         assert_eq!(pending.options[1].query_type, "teacher_query");
         assert_eq!(pending.turn, 7);
-        assert!(pending.prompt().contains("你想问哪一种"));
+        let prompt = pending.prompt();
+        assert!(prompt.contains("你想问哪一种"));
+        assert!(prompt.contains("1. 师傅查询（master_query）"));
+        assert!(prompt.contains("2. 老师查询（teacher_query）"));
+        assert!(!prompt.contains("模式："), "提示不应泄露内部模式名");
     }
 
     #[test]
