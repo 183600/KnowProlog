@@ -123,6 +123,26 @@ impl TypeExpectation {
     }
 }
 
+/// 类型 → 分类词的反向投影，供生成侧选择计数单位。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierPreference {
+    pub classifier: String,
+    pub expected_type: String,
+    pub votes: u32,
+    pub total: u32,
+    pub conflict: bool,
+}
+
+impl ClassifierPreference {
+    pub fn confidence(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            f64::from(self.votes) / f64::from(self.total)
+        }
+    }
+}
+
 /// 词法记忆：词形证据 + 量词期待。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LexicalMemory {
@@ -319,6 +339,68 @@ impl LexicalMemory {
         self.classifiers
             .get(classifier.trim())
             .and_then(ClassifierEvidence::expectation)
+    }
+
+    /// 反查某个类型常用的分类词（理解侧证据转为生成侧软约束）。
+    ///
+    /// 只返回票数达到 `min_votes` 的条目，按票数、置信度、词面稳定排序。
+    /// 冲突不会被隐藏：条目本身携带 `conflict`，调用方应优先选择无冲突者。
+    pub fn classifiers_for_type(
+        &self,
+        expected_type: &str,
+        min_votes: u32,
+    ) -> Vec<ClassifierPreference> {
+        let expected_type = expected_type.trim();
+        let min_votes = min_votes.max(1);
+        if expected_type.is_empty() {
+            return Vec::new();
+        }
+        let mut preferences: Vec<ClassifierPreference> = self
+            .classifiers
+            .iter()
+            .filter_map(|(classifier, entry)| {
+                let votes = entry.counts.get(expected_type).copied().unwrap_or(0);
+                if votes < min_votes {
+                    return None;
+                }
+                let total = entry.total();
+                let conflict = entry
+                    .counts
+                    .iter()
+                    .any(|(other, count)| other != expected_type && *count >= votes);
+                Some(ClassifierPreference {
+                    classifier: classifier.clone(),
+                    expected_type: expected_type.to_string(),
+                    votes,
+                    total,
+                    conflict,
+                })
+            })
+            .collect();
+        preferences.sort_by(|left, right| {
+            right
+                .votes
+                .cmp(&left.votes)
+                .then_with(|| {
+                    right
+                        .confidence()
+                        .partial_cmp(&left.confidence())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.classifier.cmp(&right.classifier))
+        });
+        preferences
+    }
+
+    /// 某个类型最可信的分类词；没有达到阈值的证据时返回 `None`。
+    pub fn best_classifier_for_type(
+        &self,
+        expected_type: &str,
+        min_votes: u32,
+    ) -> Option<ClassifierPreference> {
+        self.classifiers_for_type(expected_type, min_votes)
+            .into_iter()
+            .next()
     }
 
     /// 扫描原文中出现的已学量词，返回 `(量词, 类型期待)`。
@@ -874,6 +956,50 @@ mod tests {
             memory.classifier_expectation("位").map(|e| e.expected_type),
             Some("人物".to_string())
         );
+    }
+
+    #[test]
+    fn classifiers_can_be_reverse_looked_up_by_type() {
+        let mut memory = LexicalMemory::new(32);
+        memory.observe_annotated(
+            1,
+            &[
+                word("名", "q", TagSource::JiebaTag),
+                word("教授", "n", TagSource::JiebaTag),
+            ],
+        );
+        memory.observe_annotated(
+            2,
+            &[
+                word("位", "q", TagSource::JiebaTag),
+                word("教授", "n", TagSource::JiebaTag),
+            ],
+        );
+        let preferences = memory.classifiers_for_type("人物", 1);
+        assert_eq!(preferences.len(), 2, "{:?}", preferences);
+        assert!(preferences.iter().all(|entry| entry.expected_type == "人物"));
+        assert!(preferences.iter().all(|entry| !entry.conflict));
+
+        memory.observe_annotated(
+            3,
+            &[
+                word("名", "q", TagSource::JiebaTag),
+                word("教授", "n", TagSource::JiebaTag),
+            ],
+        );
+        let best = memory
+            .best_classifier_for_type("人物", 1)
+            .expect("应能反查分类词");
+        assert_eq!(best.classifier, "名");
+        assert_eq!(best.votes, 2);
+        assert_eq!(best.total, 2);
+        assert!((best.confidence() - 1.0).abs() < 1e-9);
+
+        assert!(
+            memory.best_classifier_for_type("人物", 3).is_none(),
+            "票数不足时必须弃权"
+        );
+        assert!(memory.classifiers_for_type("", 1).is_empty());
     }
 
     #[test]
