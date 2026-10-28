@@ -868,10 +868,14 @@ impl SymbolicReasoner {
                 None
             }
             QueryPlan::Count { subject, predicate } => {
-                self.answer_count(&subject, &predicate, false)
+                let classifier = crate::quantifier::requested_classifier(question)
+                    .or_else(|| self.learned_count_classifier(&predicate));
+                self.answer_count(&subject, &predicate, false, classifier.as_deref())
             }
             QueryPlan::Exist { subject, predicate } => {
-                self.answer_count(&subject, &predicate, true)
+                let classifier = crate::quantifier::requested_classifier(question)
+                    .or_else(|| self.learned_count_classifier(&predicate));
+                self.answer_count(&subject, &predicate, true, classifier.as_deref())
             }
             QueryPlan::Closure {
                 subject,
@@ -1267,7 +1271,29 @@ impl SymbolicReasoner {
         output
     }
 
-    fn answer_count(&self, subject: &str, predicate: &str, exist: bool) -> Option<String> {
+    /// 从词法记忆里取谓词期待类型最可信的量词；没有证据时返回 `None`。
+    fn learned_count_classifier(&self, predicate: &str) -> Option<String> {
+        let expected = self
+            .lexical_memory
+            .type_expectation(predicate)
+            .map(|expectation| expectation.expected_type)
+            .or_else(|| {
+                crate::identity::infer_suffix_type(predicate)
+                    .map(|(_, expected)| expected.to_string())
+            })?;
+        self.lexical_memory
+            .best_classifier_for_type(&expected, 1)
+            .filter(|preference| !preference.conflict)
+            .map(|preference| preference.classifier)
+    }
+
+    fn answer_count(
+        &self,
+        subject: &str,
+        predicate: &str,
+        exist: bool,
+        classifier: Option<&str>,
+    ) -> Option<String> {
         let entity = self.aligner.canonical_form(subject.trim());
         if entity.is_empty() {
             return None;
@@ -1301,20 +1327,26 @@ impl SymbolicReasoner {
             return None;
         }
         let values: Vec<String> = hits.iter().map(|hit| hit.value.clone()).collect();
+        let classifier = classifier
+            .map(str::trim)
+            .filter(|classifier| !classifier.is_empty())
+            .unwrap_or("个");
         let mut output = if exist {
             format!(
-                "是的，根据知识图谱，「{}」有 {}（共 {} 个：{}）。",
+                "是的，根据知识图谱，「{}」有 {}（共 {} {}：{}）。",
                 entity,
                 chain_predicate.surface,
                 values.len(),
+                classifier,
                 values.join("、")
             )
         } else {
             format!(
-                "根据知识图谱：「{}」的「{}」共有 {} 个：{}。",
+                "根据知识图谱：「{}」的「{}」共有 {} {}：{}。",
                 entity,
                 chain_predicate.surface,
                 values.len(),
+                classifier,
                 values.join("、")
             )
         };

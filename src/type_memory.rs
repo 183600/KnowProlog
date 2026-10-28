@@ -188,7 +188,7 @@ pub fn answer_in_context(
     }
 
     if let Some((parsed, _kind)) = parse_details(generator, schema, &normalized) {
-        return answer_parsed(generator, schema, memory, parsed);
+        return answer_parsed(generator, schema, memory, parsed, Some(&normalized));
     }
 
     let focus = memory.focus().cloned()?;
@@ -224,6 +224,7 @@ pub fn answer_in_context(
                 left: left.etype.clone(),
                 right,
             },
+            Some(&normalized),
         );
     }
     let kind = match focus.kind {
@@ -238,7 +239,7 @@ pub fn answer_in_context(
             etype: left.etype.clone(),
         },
     };
-    answer_parsed(generator, schema, memory, parsed)
+    answer_parsed(generator, schema, memory, parsed, Some(&normalized))
 }
 
 fn answer_parsed(
@@ -246,6 +247,7 @@ fn answer_parsed(
     schema: Option<&SchemaView>,
     memory: &mut TypeDialogueMemory,
     parsed: TypeQuestion,
+    question: Option<&str>,
 ) -> Option<TypeAnswer> {
     match parsed {
         TypeQuestion::Profile { etype } => {
@@ -284,7 +286,8 @@ fn answer_parsed(
         }
         TypeQuestion::Count { etype } => {
             let target = resolve_target(generator, schema, &etype)?;
-            let text = render_type_count(&target);
+            let classifier = question.and_then(crate::quantifier::requested_classifier);
+            let text = render_type_count(&target, classifier.as_deref());
             // 计数后把焦点留在成员表上：「他们是谁 / 还有呢」直接列出成员，
             // 不需要用户再重复类型名。
             memory.set_focus(TypeFocus::new(
@@ -1246,14 +1249,19 @@ fn schema_relation_note(
     None
 }
 
-fn render_type_count(target: &TypeTarget) -> String {
+fn render_type_count(target: &TypeTarget, classifier: Option<&str>) -> String {
     if target.members.is_empty() {
         format!("类型「{}」当前没有已知成员。", target.key)
     } else {
+        let classifier = classifier
+            .map(str::trim)
+            .filter(|classifier| !classifier.is_empty())
+            .unwrap_or("个");
         format!(
-            "类型「{}」共有 {} 个已知成员。",
+            "类型「{}」共有 {} {}已知成员。",
             target.key,
-            target.members.len()
+            target.members.len(),
+            classifier
         )
     }
 }
@@ -1499,6 +1507,16 @@ mod tests {
                 panic!("已声明的空类型也应诚实回答");
             });
         assert!(empty.text.contains("0") || empty.text.contains("没有"), "{}", empty.text);
+
+        let counted_with_measure =
+            answer(&generator, "一共有多少位人物？").expect("带量词的类型计数应可回答");
+        assert!(
+            counted_with_measure.text.contains("共有 2 位已知成员"),
+            "{}",
+            counted_with_measure.text
+        );
+        let named = answer(&generator, "人物有多少名").expect("句尾量词也应保留");
+        assert!(named.text.contains("共有 2 名已知成员"), "{}", named.text);
     }
 
     #[test]
