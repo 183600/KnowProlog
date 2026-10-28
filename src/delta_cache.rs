@@ -104,11 +104,11 @@ impl FactPattern {
                     to: actual_to,
                 },
             ) => {
-                from.as_ref().map_or(true, |value| value == actual_from)
+                from.as_ref().is_none_or(|value| value == actual_from)
                     && predicate
                         .as_ref()
-                        .map_or(true, |value| value == actual_predicate)
-                    && to.as_ref().map_or(true, |value| value == actual_to)
+                        .is_none_or(|value| value == actual_predicate)
+                    && to.as_ref().is_none_or(|value| value == actual_to)
             }
             (FactPattern::Relation { .. }, PrologFact::Entity { .. }) => false,
         }
