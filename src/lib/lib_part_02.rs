@@ -281,6 +281,12 @@ impl OxigraphManager {
                 if value.is_null() {
                     continue;
                 }
+                if term == "@language" {
+                    if let Some(language) = value.as_str() {
+                        context.default_language = Some(language.to_string());
+                    }
+                    continue;
+                }
                 if let Some(iri) = value.as_str() {
                     context.terms.insert(term.clone(), iri.to_string());
                     continue;
@@ -650,7 +656,12 @@ impl OxigraphManager {
                     ))?;
                     stats.relations += 1;
                 } else {
-                    let object = Literal::new_simple_literal(s);
+                    let object = match context.default_language.as_deref() {
+                        Some(language) => {
+                            Literal::new_language_tagged_literal(s, language)?.into()
+                        }
+                        None => Literal::new_simple_literal(s),
+                    };
                     store.insert(&Quad::new(
                         subject.clone(),
                         predicate.clone(),
@@ -740,6 +751,10 @@ impl OxigraphManager {
                         } else {
                             Self::jsonld_scalar_literal(val)
                         }
+                    } else if let (Value::String(text), Some(language)) =
+                        (val, context.default_language.as_deref())
+                    {
+                        Some(Literal::new_language_tagged_literal(text, language)?)
                     } else {
                         Self::jsonld_scalar_literal(val)
                     };
@@ -862,6 +877,8 @@ impl OxigraphManager {
             Value::String(text) => {
                 if let Some(coercion) = coercion {
                     Ok(Self::jsonld_coerced_node(text, coercion, context)?.into())
+                } else if let Some(language) = context.default_language.as_deref() {
+                    Ok(Literal::new_language_tagged_literal(text, language)?.into())
                 } else {
                     Ok(Literal::new_simple_literal(text).into())
                 }
@@ -892,6 +909,13 @@ impl OxigraphManager {
                     }
                     if let Some(language) = obj.get("@language").and_then(Value::as_str) {
                         return Ok(Literal::new_language_tagged_literal(&text, language)?.into());
+                    }
+                    if value.is_string() {
+                        if let Some(language) = context.default_language.as_deref() {
+                            return Ok(
+                                Literal::new_language_tagged_literal(&text, language)?.into()
+                            );
+                        }
                     }
                     return Ok(Self::jsonld_scalar_literal(value)
                         .map(Term::from)

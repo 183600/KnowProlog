@@ -197,12 +197,18 @@ struct JsonLdContext {
     terms: HashMap<String, String>,
     id_coerced: HashSet<String>,
     vocab_coerced: HashSet<String>,
+    /// 上下文级默认语言（`"@language": "zh"`）：未显式声明语言的字符串
+    /// 字面量应带此语言标签，而不是退化成无语言的简单字面量。
+    default_language: Option<String>,
     /// 本上下文重新定义的词项；合并到父级时必须先清掉继承的旧定义
     ///（含 `null` 清除与非 `null` 覆盖）。
     redefined: HashSet<String>,
 }
 impl JsonLdContext {
     fn clear_term(&mut self, term: &str) {
+        if term == "@language" {
+            self.default_language = None;
+        }
         self.terms.remove(term);
         self.id_coerced.remove(term);
         self.vocab_coerced.remove(term);
@@ -216,6 +222,9 @@ impl JsonLdContext {
         self.terms.extend(other.terms);
         self.id_coerced.extend(other.id_coerced);
         self.vocab_coerced.extend(other.vocab_coerced);
+        if other.default_language.is_some() {
+            self.default_language = other.default_language;
+        }
     }
 
     fn coercion(&self, term: &str) -> Option<NodeReferenceCoercion> {
