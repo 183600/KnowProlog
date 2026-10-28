@@ -64,7 +64,10 @@ use know_prolog::{
     load_config_from,
     local_semantic_adapter::LocalSemanticAdapter,
     neuro_symbolic_contrast::ContrastArbiter,
-    nlp::{normalize_words, normalize_words_sense_aware, preprocess, preprocess_annotated},
+    nlp::{
+        normalize_words, normalize_words_sense_aware_with, preprocess, preprocess_annotated,
+        TaggedWord,
+    },
     nlu::NLUEngine,
     ontology_reasoning::{parse_ontology_lesson, OntologyProgram},
     open_closure::{self, OpenClosureDialogue, OpenClosureSession, OpenClosureTurn},
@@ -123,6 +126,7 @@ use know_prolog::{
     teachable_assertion::{TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
+    type_system::TypeSystem,
     view_render::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
         render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,

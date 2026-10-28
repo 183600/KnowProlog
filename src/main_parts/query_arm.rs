@@ -352,11 +352,11 @@
                 } else {
                     None
                 };
-                let synonym_context = synonym_context_from_reasoner(&symbolic_reasoner);
-                let normalized_words = normalize_words_sense_aware(
+                let normalized_words = normalize_query_words(
                     tagged_words.clone(),
                     &synonym_graph,
-                    &synonym_context,
+                    &symbolic_reasoner,
+                    &language_config,
                     &synonyms,
                 );
                 // 感知层覆盖：已确认词面（图谱实体/确认别名/显式准入）保留为
@@ -366,10 +366,11 @@
                 let lexicon_normalized_words = if lexicon_tagged_words == tagged_words {
                     normalized_words.clone()
                 } else {
-                    normalize_words_sense_aware(
+                    normalize_query_words(
                         lexicon_tagged_words,
                         &synonym_graph,
-                        &synonym_context,
+                        &symbolic_reasoner,
+                        &language_config,
                         &synonyms,
                     )
                 };

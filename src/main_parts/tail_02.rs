@@ -13,6 +13,22 @@ fn synonym_context_from_reasoner(reasoner: &SymbolicReasoner) -> SynonymContext 
     context
 }
 
+/// 查询词归一化：同义词图 + 对话焦点语境 + 类型体系闭包。
+/// 歧义词面保持原样；无图证据时回退扁平同义词表。
+fn normalize_query_words(
+    words: Vec<TaggedWord>,
+    graph: &SynonymGraph,
+    reasoner: &SymbolicReasoner,
+    config: &SystemConfig,
+    synonyms: &std::collections::HashMap<String, String>,
+) -> Vec<TaggedWord> {
+    let context = synonym_context_from_reasoner(reasoner);
+    let types = TypeSystem::from_config(&config.type_system);
+    normalize_words_sense_aware_with(words, graph, &context, synonyms, |left, right| {
+        types.types_compatible(left, right)
+    })
+}
+
 /// 用相似成功经验为一句输入生成候选骨架（确认前不参与路由）。
 fn suggest_case_for_text(
     text: &str,

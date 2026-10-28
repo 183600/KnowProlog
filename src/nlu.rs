@@ -1,5 +1,8 @@
-use crate::nlp::{merge_name_fragments, normalize_words_sense_aware, preprocess, TaggedWord};
+use crate::nlp::{
+    merge_name_fragments, normalize_words_sense_aware_with, preprocess, TaggedWord,
+};
 use crate::synonym_graph::{SynonymContext, SynonymGraph};
+use crate::type_system::TypeSystem;
 use crate::{NlpConfig, SystemConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -47,6 +50,7 @@ pub struct NLUEngine {
     nlp_config: NlpConfig,
     synonyms: Option<HashMap<String, String>>,
     synonym_graph: SynonymGraph,
+    type_system: TypeSystem,
 }
 
 impl NLUEngine {
@@ -57,6 +61,7 @@ impl NLUEngine {
             nlp_config: config.nlp.clone(),
             synonyms: config.synonyms.as_ref().map(|s| s.mappings.clone()),
             synonym_graph: SynonymGraph::from_config(config, 0),
+            type_system: TypeSystem::from_config(&config.type_system),
         }
     }
 
@@ -72,11 +77,12 @@ impl NLUEngine {
         let tagged_words = merge_name_fragments(&tagged_words);
         let empty = HashMap::new();
         let fallback = self.synonyms.as_ref().unwrap_or(&empty);
-        let normalized_words = normalize_words_sense_aware(
+        let normalized_words = normalize_words_sense_aware_with(
             tagged_words,
             &self.synonym_graph,
             &SynonymContext::new(),
             fallback,
+            |left, right| self.type_system.types_compatible(left, right),
         );
 
         let mut semantics = Vec::new();

@@ -511,11 +511,28 @@ pub fn normalize_words(
 /// - `Unresolved`：回退到扁平映射，保证未进入词义图的旧配置仍按原行为工作；
 /// - 词性为动词/名动词的 token 走谓词层，其余走实体层。
 pub fn normalize_words_sense_aware(
-    mut words: Vec<TaggedWord>,
+    words: Vec<TaggedWord>,
     graph: &crate::synonym_graph::SynonymGraph,
     context: &crate::synonym_graph::SynonymContext,
     flat_fallback: &HashMap<String, String>,
 ) -> Vec<TaggedWord> {
+    normalize_words_sense_aware_with(words, graph, context, flat_fallback, |left, right| {
+        left.trim().eq_ignore_ascii_case(right.trim())
+    })
+}
+
+/// 与 [`normalize_words_sense_aware`] 相同，但允许调用方注入类型体系兼容关系
+/// （别名/子类闭包），让焦点类型 `Person` 与词义类型 `人物` 能够对齐。
+pub fn normalize_words_sense_aware_with<F>(
+    mut words: Vec<TaggedWord>,
+    graph: &crate::synonym_graph::SynonymGraph,
+    context: &crate::synonym_graph::SynonymContext,
+    flat_fallback: &HashMap<String, String>,
+    type_compatible: F,
+) -> Vec<TaggedWord>
+where
+    F: Fn(&str, &str) -> bool,
+{
     use crate::synonym_graph::{SynonymKind, SynonymResolution};
 
     for word in &mut words {
@@ -524,7 +541,7 @@ pub fn normalize_words_sense_aware(
         } else {
             SynonymKind::Entity
         };
-        match graph.canonicalize(&word.text, kind, context) {
+        match graph.canonicalize_with(&word.text, kind, context, &type_compatible) {
             SynonymResolution::Resolved(reading) => {
                 if reading.changes_surface() {
                     word.text = reading.canonical;
@@ -895,6 +912,43 @@ mod tests {
         let normalized =
             normalize_words_sense_aware(tagged(&[("创建", "v")]), &graph, &SynonymContext::new(), &flat);
         assert_eq!(normalized[0].text, "成立", "未进入词义图的旧映射仍回退扁平表");
+    }
+
+    #[test]
+    fn sense_aware_normalization_accepts_type_alias_closure() {
+        use crate::synonym_graph::{
+            SynonymContext, SynonymGraph, SynonymKind, SynonymSense,
+        };
+
+        let mut graph = SynonymGraph::new(16);
+        let outcome = graph.observe(
+            1,
+            "先生",
+            "老师",
+            SynonymKind::Entity,
+            SynonymSense::type_only("人物"),
+            "test",
+            1.0,
+        );
+        graph.confirm(outcome.id().unwrap(), 1);
+
+        let words = tagged(&[("先生", "n")]);
+        let unresolved = normalize_words_sense_aware(
+            words.clone(),
+            &graph,
+            &SynonymContext::new().with_expected_type("Person"),
+            &HashMap::new(),
+        );
+        assert_eq!(unresolved[0].text, "先生", "默认按字面类型匹配");
+
+        let resolved = normalize_words_sense_aware_with(
+            words,
+            &graph,
+            &SynonymContext::new().with_expected_type("Person"),
+            &HashMap::new(),
+            |left, right| left == "Person" && right == "人物",
+        );
+        assert_eq!(resolved[0].text, "老师", "类型别名应参与词义选择");
     }
 
     #[test]
