@@ -380,6 +380,11 @@ fn support_lattice_covers_five_states_and_normalizes_noise() {
         &[],
     );
     assert_eq!(graph_conflict.state, SupportState::Conflicted);
+    assert!(
+        graph_conflict.render_zh().contains("图谱自身"),
+        "{}",
+        graph_conflict.render_zh()
+    );
 
     let single_media_twice = assess_support(
         "公司",

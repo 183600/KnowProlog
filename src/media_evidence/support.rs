@@ -205,9 +205,17 @@ impl SupportReport {
                     .map(describe_value)
                     .collect::<Vec<_>>()
                     .join("；");
+                let has_text = self.values.iter().any(SupportValue::has_text);
+                let has_media = self.values.iter().any(SupportValue::has_media);
+                let conflict = match (has_text, has_media) {
+                    (true, true) => "图谱与媒体的说法不一致",
+                    (true, false) => "图谱自身存在互相矛盾的说法",
+                    (false, true) => "媒体证据之间存在互相矛盾的说法",
+                    (false, false) => "存在互相矛盾的说法",
+                };
                 format!(
-                    "{}，图谱与媒体的说法不一致：{}。我不替你拍板，请核实来源。",
-                    subject, alternatives
+                    "{}，{}：{}。我不替你拍板，请核实来源。",
+                    subject, conflict, alternatives
                 )
             }
             SupportState::Missing => format!("{}，当前没有图谱或媒体证据。", subject),
