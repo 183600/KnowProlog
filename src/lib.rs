@@ -100,6 +100,7 @@ pub mod link_prediction;
 pub mod local_semantic_adapter;
 pub mod logic_program;
 pub mod markov_logic;
+pub mod media_evidence;
 pub mod mention_lexicon;
 pub mod neuro_symbolic_contrast;
 pub mod nlp;
