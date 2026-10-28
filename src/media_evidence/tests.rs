@@ -262,6 +262,9 @@ fn selector_parses_chinese_deixis_without_hijacking_plain_questions() {
         "这个意图是什么",
         "切换视图",
         "第三段文字讲了什么",
+        "给我一张纸",
+        "第二份礼物是什么",
+        "这份菜单多少钱",
     ] {
         assert!(
             MediaSelector::parse(plain).is_none(),

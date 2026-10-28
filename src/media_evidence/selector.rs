@@ -59,15 +59,14 @@ impl MediaSelector {
             _ => {}
         }
         let ordinal = parse_ordinal(&compact);
-        if modalities.is_empty()
-            && (contains_sequence(&compact, "张") || contains_sequence(&compact, "幅"))
-        {
-            modalities.insert(Modality::Image);
-        }
-        if modalities.is_empty()
-            && (contains_sequence(&compact, "页") || contains_sequence(&compact, "份"))
-        {
-            modalities.insert(Modality::Document);
+        if modalities.is_empty() {
+            if let SelectorOrdinal::Index(_) = ordinal {
+                if contains_sequence(&compact, "张") || contains_sequence(&compact, "幅") {
+                    modalities.insert(Modality::Image);
+                } else if contains_sequence(&compact, "页") {
+                    modalities.insert(Modality::Document);
+                }
+            }
         }
         if modalities.is_empty() && locator.is_none() {
             return None;
