@@ -1253,6 +1253,29 @@
     }
 
     #[test]
+    fn graph_question_honors_negative_session_facts() {
+        let mut reasoner = graph_pattern_reasoner();
+        let before = reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应建立图谱模式会话");
+        assert!(before.contains("张三"), "{}", before);
+        let asserted = reasoner.assert_negative_nl_fact("张三的获奖不是金棕榈");
+        assert!(asserted.contains("已记住否定事实"), "{}", asserted);
+        assert!(
+            reasoner.graph_session.lock().is_none(),
+            "否定事实会阻断图谱边，旧结果必须失效"
+        );
+        let after = reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("否定后仍应可执行图谱查询");
+        assert!(
+            after.starts_with("没有找到同时满足这些条件的实体"),
+            "被否定事实不得继续作为图谱见证：{}",
+            after
+        );
+    }
+
+    #[test]
     fn graph_question_session_is_invalidated_by_session_fact_changes() {
         let mut reasoner = graph_pattern_reasoner();
         reasoner

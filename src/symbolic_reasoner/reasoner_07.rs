@@ -94,7 +94,9 @@ impl SymbolicReasoner {
         // 槽级压制同样作用于结构化图谱问答：会话赢家存在时，图谱旧值
         // 不参与匹配；它仍保留在图谱/账本里，撤回改口后自动恢复可见。
         facts.retain(|fact| {
+            let atom = Atom::rel(&fact.predicate, &fact.subject, &fact.object);
             !self.is_suppressed_slot_value(&fact.subject, &fact.predicate, &fact.object)
+                && !self.negative_atom_blocks(&atom)
         });
         // 类型闭包只在本轮图谱匹配中物化，不写回知识图谱：查询「电影」
         // 能命中显式断言的「科幻片」，依据仍是检索层已登记的子类边。

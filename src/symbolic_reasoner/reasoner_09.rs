@@ -979,6 +979,7 @@ impl SymbolicReasoner {
             false
         } else {
             self.session_negative_facts.push(atom);
+            self.invalidate_graph_session();
             true
         };
         let mut output = if added {
@@ -1219,6 +1220,7 @@ impl SymbolicReasoner {
                 .position(|negative| negative == &lesson.head)
             {
                 self.session_negative_facts.remove(position);
+                self.invalidate_graph_session();
                 superseded_negatives.push(rendered.clone());
             }
             // 槽级门控：功能槽上的直陈遇到不同取值时只问一句、零写入；
@@ -1325,6 +1327,7 @@ impl SymbolicReasoner {
                 .position(|existing| existing == &atom)
             {
                 self.session_negative_facts.remove(position);
+                self.invalidate_graph_session();
                 return format!("已撤销否定事实：{}。", rendered);
             }
             return format!("否定事实中没有「{}」。", rendered);
@@ -1362,6 +1365,9 @@ impl SymbolicReasoner {
                 .position(|negative| negative == &lesson.head)
                 .map(|position| self.session_negative_facts.remove(position))
                 .is_some();
+            if removed_negative {
+                self.invalidate_graph_session();
+            }
             if self.retract_atom(&lesson.head) {
                 self.note_slot_retract(&lesson.head);
                 revision_ops.push(ChangeOp::RetractFact(lesson.head.clone()));

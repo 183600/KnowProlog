@@ -69,6 +69,8 @@ impl SymbolicReasoner {
     }
 
     fn apply_dialogue_snapshot(&mut self, snapshot: &DialogueSnapshot) -> Result<(), String> {
+        // 快照会整体替换会话世界；旧图谱追问的结果页与见证下标不再可信。
+        self.invalidate_graph_session();
         // 先丢弃旧假设世界：快照要么恢复一组新的，要么保持无世界。
         self.discard_assumption_world();
         // 本体胶囊最先恢复：版本门 / 公理摘要不通过就整体拒绝，
