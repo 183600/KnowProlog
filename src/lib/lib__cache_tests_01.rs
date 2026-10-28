@@ -1795,6 +1795,69 @@
         assert_eq!(count.data.len(), 1, "失败导入不留下半批三元组");
     }
 
+    /// 批次导出只包含该批断言：数据集格式保留批次图名，图格式压平到默认图。
+    #[tokio::test]
+    async fn export_import_batch_is_scoped_to_the_batch_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let first = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/甲> <http://example.org/kg/name> \"甲\" ."
+                    .as_bytes(),
+                "first.ttl",
+            )
+            .await
+            .unwrap();
+        manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/乙> <http://example.org/kg/name> \"乙\" ."
+                    .as_bytes(),
+                "second.ttl",
+            )
+            .await
+            .unwrap();
+
+        let mut nquads = Vec::new();
+        let count = manager
+            .export_import_batch_to_writer(
+                &first.episode,
+                oxigraph::io::RdfFormat::NQuads,
+                &mut nquads,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let exported: Vec<Quad> = oxigraph::io::RdfParser::from_format(oxigraph::io::RdfFormat::NQuads)
+            .for_reader(nquads.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(
+            exported[0].graph_name,
+            GraphName::NamedNode(NamedNode::new(&first.episode.batch_graph).unwrap())
+        );
+        assert!(exported[0].subject.to_string().contains("甲"));
+
+        let mut turtle = Vec::new();
+        let count = manager
+            .export_import_batch_to_writer(
+                &first.episode,
+                oxigraph::io::RdfFormat::Turtle,
+                &mut turtle,
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let exported: Vec<Quad> = oxigraph::io::RdfParser::from_format(oxigraph::io::RdfFormat::Turtle)
+            .for_reader(turtle.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].graph_name, GraphName::DefaultGraph);
+        assert!(exported[0].object.to_string().contains("甲"));
+    }
+
     /// 批次问题只在出现批次线索时回答；类型名单与单主体事实来自批次命名图。
     #[tokio::test]
     async fn import_episode_answers_are_scoped_to_the_batch_graph() {

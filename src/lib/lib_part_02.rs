@@ -1278,6 +1278,68 @@ impl OxigraphManager {
         })
     }
 
+    /// 读取某批次的断言（批次命名图内容，保留批次图名）。
+    pub async fn load_import_batch_quads(
+        &self,
+        episode: &crate::import_episode::ImportEpisode,
+    ) -> Result<Vec<Quad>, Box<dyn std::error::Error + Send + Sync>> {
+        let graph = GraphName::NamedNode(NamedNode::new(&episode.batch_graph)?);
+        let store = self.store.lock().await;
+        self.perf.bump("import_batch_load");
+        store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
+    }
+
+    /// 把某批断言导出为独立 RDF 文件；数据集格式保留批次图名，图格式压平到默认图。
+    pub async fn export_import_batch_file(
+        &self,
+        episode: &crate::import_episode::ImportEpisode,
+        file_path: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let format = Self::detect_export_format(file_path)?;
+        let file = fs::File::create(file_path)?;
+        self.export_import_batch_to_writer(episode, format, file)
+            .await
+    }
+
+    /// 把某批断言序列化到任意 writer，返回写出的断言数。
+    pub async fn export_import_batch_to_writer<W: std::io::Write>(
+        &self,
+        episode: &crate::import_episode::ImportEpisode,
+        format: oxigraph::io::RdfFormat,
+        writer: W,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = self.load_import_batch_quads(episode).await?;
+        let keep_graphs = format.supports_datasets();
+        let mut serializer =
+            oxigraph::io::RdfSerializer::from_format(format).for_writer(writer);
+        for quad in &quads {
+            let quad = if keep_graphs {
+                quad.clone()
+            } else {
+                Quad::new(
+                    quad.subject.clone(),
+                    quad.predicate.clone(),
+                    quad.object.clone(),
+                    GraphName::DefaultGraph,
+                )
+            };
+            serializer
+                .serialize_quad(&quad)
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("批次导出失败：{}", error).into()
+                })?;
+        }
+        serializer
+            .finish()
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("批次导出失败：{}", error).into()
+            })?;
+        Ok(quads.len())
+    }
+
     /// 读取全部 RDF 导入情景（按 seq 升序）。
     pub async fn load_import_episodes(
         &self,

@@ -152,7 +152,11 @@
                 }
             }
         }
-        Some(Commands::Episodes { reference, json }) => {
+        Some(Commands::Episodes {
+            reference,
+            json,
+            export,
+        }) => {
             let episodes = match oxigraph_manager.load_import_episodes().await {
                 Ok(episodes) => episodes,
                 Err(error) => {
@@ -160,6 +164,35 @@
                     std::process::exit(1);
                 }
             };
+            if let Some(file_path) = export {
+                let Some(reference) = reference.as_deref() else {
+                    eprintln!("--export 需要同时给出批次引用，例如：episodes 第2批 --export batch2.ttl");
+                    std::process::exit(2);
+                };
+                let Some(episode) =
+                    know_prolog::import_episode::resolve_episode_reference(reference, &episodes)
+                else {
+                    eprintln!(
+                        "没有匹配的导入批次：{}（可用 episodes 查看当前批次）",
+                        reference
+                    );
+                    std::process::exit(1);
+                };
+                match oxigraph_manager
+                    .export_import_batch_file(episode, &file_path)
+                    .await
+                {
+                    Ok(count) => println!(
+                        "批次 B{} 导出成功：{} 条断言 → {}",
+                        episode.seq, count, file_path
+                    ),
+                    Err(error) => {
+                        eprintln!("批次导出失败：{}", error);
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             if let Some(reference) = reference {
                 if json {
                     match know_prolog::import_episode::resolve_episode_reference(

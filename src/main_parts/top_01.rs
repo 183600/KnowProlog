@@ -184,6 +184,10 @@ enum Commands {
         /// Print JSON instead of the Chinese brief
         #[arg(long)]
         json: bool,
+        /// Export the referenced batch to an RDF file (.ttl / .nt / .nq /
+        /// .trig / .rdf / .xml / .jsonld); requires a batch reference
+        #[arg(long)]
+        export: Option<String>,
     },
     /// Batch-import natural-language sentences with the explicitly adopted
     /// batch-teaching rules (base extraction rules still run first)
