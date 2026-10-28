@@ -17,10 +17,11 @@
 // 与 MLN-lite（log-odds 加权求和 + sigmoid）不同：这里的合取/析取共享同一批
 // 选择变量，天然处理证明重叠（相关源头），给出的是可能世界精确概率而不是近似和。
 
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::markov_logic::MarkovLogicEngine;
 use crate::resolution_engine::{apply_atom, unify_atoms, Atom, Substitution, Term};
@@ -436,7 +437,7 @@ pub struct ProblogEngine {
     max_depth: usize,
     max_proofs: usize,
     max_bdd_nodes: usize,
-    compiled: RefCell<Option<Arc<Compiled>>>,
+    compiled: Arc<RwLock<Option<Arc<Compiled>>>>,
 }
 
 impl ProblogEngine {
@@ -449,7 +450,7 @@ impl ProblogEngine {
             max_depth: max_depth.clamp(1, 16),
             max_proofs: max_proofs.clamp(1, 64),
             max_bdd_nodes: 200_000,
-            compiled: RefCell::new(None),
+            compiled: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -550,15 +551,19 @@ impl ProblogEngine {
     }
 
     fn invalidate(&mut self) {
-        *self.compiled.borrow_mut() = None;
+        *self.compiled.write() = None;
     }
 
     fn compiled(&self) -> Arc<Compiled> {
-        if let Some(existing) = self.compiled.borrow().as_ref() {
+        if let Some(existing) = self.compiled.read().as_ref() {
             return existing.clone();
         }
         let compiled = Arc::new(self.compile());
-        *self.compiled.borrow_mut() = Some(compiled.clone());
+        let mut slot = self.compiled.write();
+        if let Some(existing) = slot.as_ref() {
+            return existing.clone();
+        }
+        *slot = Some(compiled.clone());
         compiled
     }
 
