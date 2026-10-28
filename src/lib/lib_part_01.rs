@@ -70,12 +70,23 @@ impl QueryResult {
             return "（查询成功，无结果）".to_string();
         }
         let mut columns = self.columns.clone();
+        let mut extras: Vec<String> = Vec::new();
         for row in &self.data {
             for key in row.keys() {
-                if !columns.iter().any(|column| column == key) {
-                    columns.push(key.clone());
+                if !columns.iter().any(|column| column == key)
+                    && !extras.iter().any(|column| column == key)
+                {
+                    extras.push(key.clone());
                 }
             }
+        }
+        if columns.is_empty() {
+            // 兼容手工构造、未声明列顺序的结果：退回确定性的字典序。
+            extras.sort();
+            columns = extras;
+        } else {
+            extras.sort();
+            columns.extend(extras);
         }
         if columns.is_empty() {
             return "（查询成功，无变量绑定）".to_string();

@@ -1366,6 +1366,28 @@
         assert_eq!(header, vec!["o", "s"]);
     }
 
+    /// 手工构造且未声明列顺序的结果仍按字典序稳定渲染。
+    #[test]
+    fn query_result_without_declared_columns_is_deterministic() {
+        let result = QueryResult {
+            success: true,
+            columns: Vec::new(),
+            data: vec![HashMap::from([
+                ("b".to_string(), Value::String("2".to_string())),
+                ("a".to_string(), Value::String("1".to_string())),
+            ])],
+        };
+        let header: Vec<String> = result
+            .render_text()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .collect();
+        assert_eq!(header, vec!["a", "b"]);
+    }
+
     /// ASK 返回确定布尔；CONSTRUCT 按三元组逐行返回；语法错误不静默为空。
     #[tokio::test]
     async fn sparql_ask_construct_and_syntax_error() {
