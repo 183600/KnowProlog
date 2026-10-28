@@ -352,7 +352,14 @@
                 } else {
                     None
                 };
-                let normalized_words = normalize_words(tagged_words.clone(), &synonyms);
+                let synonym_graph = SynonymGraph::from_config(&language_config, 0);
+                let synonym_context = synonym_context_from_reasoner(&symbolic_reasoner);
+                let normalized_words = normalize_words_sense_aware(
+                    tagged_words.clone(),
+                    &synonym_graph,
+                    &synonym_context,
+                    &synonyms,
+                );
                 // 感知层覆盖：已确认词面（图谱实体/确认别名/显式准入）保留为
                 // 单一 token；旧切分仍是回退路径，覆盖层只增加边界证据。
                 let lexicon_tagged_words =
@@ -360,7 +367,12 @@
                 let lexicon_normalized_words = if lexicon_tagged_words == tagged_words {
                     normalized_words.clone()
                 } else {
-                    normalize_words(lexicon_tagged_words, &synonyms)
+                    normalize_words_sense_aware(
+                        lexicon_tagged_words,
+                        &synonym_graph,
+                        &synonym_context,
+                        &synonyms,
+                    )
                 };
                 // 路由上下文：让带守卫的模式只在相应对话状态下参与匹配。
                 let route_context = dialogue_pattern_context(&dialogue_manager, &symbolic_reasoner);

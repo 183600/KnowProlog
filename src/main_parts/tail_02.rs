@@ -1,3 +1,18 @@
+/// 从对话焦点与上一轮谓词提取同义解析语境：焦点类型作为软约束，
+/// 谓词名用于匹配词义定义域。没有证据时返回空语境（不猜测）。
+fn synonym_context_from_reasoner(reasoner: &SymbolicReasoner) -> SynonymContext {
+    let mut context = SynonymContext::new();
+    if let Some(predicate) = reasoner.context().last_predicate() {
+        context = context.with_predicate(predicate);
+    }
+    if let Some(focus) = reasoner.context().focus() {
+        if let Some(etype) = reasoner.context().focus_type(focus) {
+            context = context.with_expected_type(etype);
+        }
+    }
+    context
+}
+
 /// 用相似成功经验为一句输入生成候选骨架（确认前不参与路由）。
 fn suggest_case_for_text(
     text: &str,
