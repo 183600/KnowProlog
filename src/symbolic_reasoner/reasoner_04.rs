@@ -1,4 +1,10 @@
 impl SymbolicReasoner {
+    /// 会话事实/假设世界变化会改变 `graph_facts` 的输入，上一张图谱模式的
+    /// 结果页与见证下标必须整体失效，不能继续按旧事实回答追问。
+    fn invalidate_graph_session(&self) {
+        *self.graph_session.lock() = None;
+    }
+
     fn unindex_session_atom(&mut self, atom: &Atom) {
         if let Some((subject, predicate, object)) = Self::session_atom_triple(atom) {
             self.retrieval
@@ -13,6 +19,7 @@ impl SymbolicReasoner {
             return false;
         }
         self.session_facts.retain(|existing| existing != atom);
+        self.invalidate_graph_session();
         // 图谱事实始终保留；仅当图谱不再支持该原子时才从归结引擎与证据索引
         // 增量删除，避免每次撤回都重建整库（同名的图谱事实与会话事实互不误删）。
         if !self.graph_supports_atom(atom) {
@@ -34,6 +41,7 @@ impl SymbolicReasoner {
             return false;
         }
         let mut added = false;
+        let mut session_changed = false;
         if self.config.enable_resolution && self.resolver.add_fact_atom(atom.clone()) {
             added = true;
         }
@@ -41,6 +49,10 @@ impl SymbolicReasoner {
             self.session_facts.push(atom.clone());
             self.index_session_atom(&atom);
             added = true;
+            session_changed = true;
+        }
+        if session_changed {
+            self.invalidate_graph_session();
         }
         // 会话假设同步注入软逻辑引擎
         if added && self.config.enable_soft_logic {
@@ -808,11 +820,13 @@ impl SymbolicReasoner {
             self.problog.add_deterministic_fact(atom.clone());
         }
         self.index_session_atom(atom);
+        self.invalidate_graph_session();
     }
 
     /// 丢弃当前假设世界：只撤回本世界注入且不被图谱/会话事实支持的原子。
     fn discard_assumption_world(&mut self) -> Option<AssumptionWorld> {
         let world = self.assumption_world.take()?;
+        self.invalidate_graph_session();
         for atom in &world.assumptions {
             if self.graph_supports_atom(atom) || self.session_facts.contains(atom) {
                 continue;

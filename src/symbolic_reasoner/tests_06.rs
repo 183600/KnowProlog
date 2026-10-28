@@ -1253,6 +1253,61 @@
     }
 
     #[test]
+    fn graph_question_session_is_invalidated_by_session_fact_changes() {
+        let mut reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应建立图谱模式会话");
+        assert!(reasoner.graph_session.lock().is_some());
+        reasoner.assert_nl_fact("李四的师傅是张三");
+        assert!(
+            reasoner.graph_session.lock().is_none(),
+            "新增会话事实后旧结果页与见证下标必须失效"
+        );
+
+        reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("新会话应可重新建立图谱模式");
+        assert!(reasoner.graph_session.lock().is_some());
+        let retracted = reasoner.retract_nl_fact("李四的师傅是张三");
+        assert!(
+            retracted.contains("已忘记") || retracted.contains("已撤回"),
+            "{}",
+            retracted
+        );
+        assert!(
+            reasoner.graph_session.lock().is_none(),
+            "撤回会话事实后旧结果页与见证下标必须失效"
+        );
+    }
+
+    #[test]
+    fn graph_question_session_is_invalidated_by_assumption_world_changes() {
+        let mut reasoner = graph_pattern_reasoner();
+        reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("首轮应建立图谱模式会话");
+        assert!(reasoner.graph_session.lock().is_some());
+        reasoner
+            .enter_assumption_world("李四的出生地是北京")
+            .expect("应能进入假设世界");
+        assert!(
+            reasoner.graph_session.lock().is_none(),
+            "假设前提进入图谱输入后旧结果必须失效"
+        );
+
+        reasoner
+            .answer_graph_question("谁既导演过科幻片，又拿过金棕榈？")
+            .expect("假设世界内应可重新建立图谱模式");
+        assert!(reasoner.graph_session.lock().is_some());
+        reasoner.exit_assumption_world().expect("应能退出假设世界");
+        assert!(
+            reasoner.graph_session.lock().is_none(),
+            "假设前提退出图谱输入后旧结果必须失效"
+        );
+    }
+
+    #[test]
     fn epistemic_possibility_uses_problog_and_keeps_two_ledgers() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
