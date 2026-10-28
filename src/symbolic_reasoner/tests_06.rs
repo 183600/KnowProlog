@@ -1253,6 +1253,27 @@
     }
 
     #[test]
+    fn negative_type_blocks_inferred_graph_types() {
+        let mut reasoner = graph_pattern_reasoner();
+        reasoner
+            .teach_ontology("科幻片是一种电影")
+            .expect("可教学子类公理");
+        let before = reasoner
+            .answer_graph_question("有没有一部电影，主演是中国人？")
+            .expect("父类型问句应可编译");
+        assert!(before.contains("电影A"), "{}", before);
+        reasoner.assert_negative_nl_fact("电影A不是电影");
+        let after = reasoner
+            .answer_graph_question("有没有一部电影，主演是中国人？")
+            .expect("否定后仍应可执行图谱查询");
+        assert!(
+            after.starts_with("没有找到满足这些条件的实体"),
+            "被否定的祖先类型不得经子类闭包复活：{}",
+            after
+        );
+    }
+
+    #[test]
     fn graph_question_honors_negative_session_facts() {
         let mut reasoner = graph_pattern_reasoner();
         let before = reasoner

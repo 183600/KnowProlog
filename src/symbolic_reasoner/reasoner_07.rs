@@ -91,13 +91,6 @@ impl SymbolicReasoner {
                 ));
             }
         }
-        // 槽级压制同样作用于结构化图谱问答：会话赢家存在时，图谱旧值
-        // 不参与匹配；它仍保留在图谱/账本里，撤回改口后自动恢复可见。
-        facts.retain(|fact| {
-            let atom = Atom::rel(&fact.predicate, &fact.subject, &fact.object);
-            !self.is_suppressed_slot_value(&fact.subject, &fact.predicate, &fact.object)
-                && !self.negative_atom_blocks(&atom)
-        });
         // 类型闭包只在本轮图谱匹配中物化，不写回知识图谱：查询「电影」
         // 能命中显式断言的「科幻片」，依据仍是检索层已登记的子类边。
         let mut inferred = Vec::new();
@@ -113,6 +106,20 @@ impl SymbolicReasoner {
             }
         }
         facts.extend(inferred);
+        // 槽级压制与否定阻断同样作用于结构化图谱问答：会话赢家存在时，
+        // 图谱旧值不参与匹配；它仍保留在图谱/账本里，撤回改口后自动恢复。
+        // 过滤必须放在类型闭包之后，否则「某实体不是某祖先类型」仍会从
+        // 显式子类边物化出被否定的祖先。
+        facts.retain(|fact| {
+            let atom = Atom::rel(&fact.predicate, &fact.subject, &fact.object);
+            // 类型断言在图谱里用内部谓词 `type`，而自然语言否定解析成「是」；
+            // 两种写法必须指向同一条可阻断边。
+            let type_negative = fact.predicate == "type"
+                && self.negative_atom_blocks(&Atom::rel("是", &fact.subject, &fact.object));
+            !self.is_suppressed_slot_value(&fact.subject, &fact.predicate, &fact.object)
+                && !self.negative_atom_blocks(&atom)
+                && !type_negative
+        });
         facts.sort_by(|left, right| {
             (
                 &left.subject,
