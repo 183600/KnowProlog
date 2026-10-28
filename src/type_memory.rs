@@ -17,6 +17,7 @@ const TYPE_FOCUS_TTL: u32 = 3;
 pub enum TypeQuestion {
     Profile { etype: String },
     Members { etype: String },
+    Count { etype: String },
     Compare { left: String, right: String },
 }
 
@@ -279,6 +280,20 @@ fn answer_parsed(
                 focus: Some(focus_key),
             })
         }
+        TypeQuestion::Count { etype } => {
+            let target = resolve_target(generator, schema, &etype)?;
+            let text = render_type_count(&target);
+            // 计数后把焦点留在成员表上：「他们是谁 / 还有呢」直接列出成员，
+            // 不需要用户再重复类型名。
+            memory.set_focus(TypeFocus::new(
+                target.key.clone(),
+                TypeQuestionKind::Members,
+            ));
+            Some(TypeAnswer {
+                text,
+                focus: Some(target.key),
+            })
+        }
         TypeQuestion::Compare { left, right } => {
             let left_target = resolve_target(generator, schema, &left)?;
             let right_target = resolve_target(generator, schema, &right)?;
@@ -447,6 +462,16 @@ fn parse_details(
 
     let mentions = known_type_mentions(generator, schema, &question);
     if mentions.is_empty() {
+        // 单字类型别名（如「人」→「人物」）低于提及词表的两字门槛，
+        // 但「有多少个人」这类计数问句仍然应当落到类型上。
+        if let Some(subject) = count_subject(&question) {
+            if let Some(target) = resolve_target(generator, schema, &subject) {
+                return Some((
+                    TypeQuestion::Count { etype: target.key },
+                    TypeQuestionKind::Members,
+                ));
+            }
+        }
         return None;
     }
 
@@ -469,6 +494,7 @@ fn parse_details(
         ));
     }
 
+    let count_intent = count_remainder(&question).is_some();
     let profile_intent = has_profile_intent(&question);
     let member_intent = has_member_intent(&question, profile_intent)
         || (question.ends_with("有哪些")
@@ -484,6 +510,30 @@ fn parse_details(
         && !member_intent
     {
         return None;
+    }
+    if count_intent {
+        if let Some(remainder) = count_remainder(&question) {
+            let stripped = strip_count_tail(remainder);
+            // 只有量词/语气词（「人物有多少个」）或余下部分本身解析成类型
+            // （「有多少个人物」）才是类型计数；「人物有多少属性」问的是
+            // 属性个数，不能被劫持成成员计数。
+            let bare = stripped.is_empty();
+            let typed = !stripped.is_empty()
+                && resolve_target(generator, schema, stripped).is_some();
+            if bare || typed {
+                let etype = if typed {
+                    resolve_target(generator, schema, stripped)
+                        .map(|target| target.key)
+                        .unwrap_or_else(|| chosen.etype.clone())
+                } else {
+                    chosen.etype.clone()
+                };
+                return Some((
+                    TypeQuestion::Count { etype },
+                    TypeQuestionKind::Members,
+                ));
+            }
+        }
     }
     if profile_intent {
         return Some((
@@ -528,6 +578,50 @@ fn normalize(question: &str) -> String {
                 )
         })
         .to_string()
+}
+
+/// 计数问句的提示词（长的在前，避免「一共有多少」被「有多少」截断）。
+const COUNT_CUES: &[&str] = &[
+    "一共有多少",
+    "总共有多少",
+    "共有多少",
+    "有多少",
+    "一共有几个",
+    "共有几个",
+    "有几个",
+];
+
+/// 取计数提示词之后的部分（保留原词面，供类型解析与量词剥离）。
+fn count_remainder(question: &str) -> Option<&str> {
+    COUNT_CUES
+        .iter()
+        .find_map(|cue| question.split_once(cue).map(|(_, rest)| rest.trim()))
+}
+
+/// 去掉计数尾部的量词与语气词；返回空串表示「有多少个」这类裸计数。
+fn strip_count_tail(text: &str) -> &str {
+    let text = text.trim_start_matches(|c: char| {
+        matches!(
+            c,
+            '个' | '位' | '名' | '只' | '条' | '种' | '部' | '所' | '家' | '件' | '项' | '次'
+        )
+    });
+    text.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '呢' | '吗' | '啊' | '呀' | '吧' | '了' | '的' | '是' | '有' | '共'
+        )
+    })
+}
+
+/// 计数问句里直接出现的类型词（如「有多少个人物」→「人物」）。
+fn count_subject(question: &str) -> Option<String> {
+    let rest = strip_count_tail(count_remainder(question)?.trim());
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
 }
 
 fn has_any(text: &str, needles: &[&str]) -> bool {
@@ -1003,6 +1097,18 @@ fn schema_relation_note(
     None
 }
 
+fn render_type_count(target: &TypeTarget) -> String {
+    if target.members.is_empty() {
+        format!("类型「{}」当前没有已知成员。", target.key)
+    } else {
+        format!(
+            "类型「{}」共有 {} 个已知成员。",
+            target.key,
+            target.members.len()
+        )
+    }
+}
+
 fn render_member_page(target: &TypeTarget, page: &TypeMemberPage) -> String {
     if target.members.is_empty() {
         return empty_members_text(&target.key);
@@ -1147,6 +1253,7 @@ mod tests {
     fn schema() -> SchemaView {
         let mut schema = SchemaView::new();
         schema.declare_type_alias("组织", "机构");
+        schema.declare_type_alias("人", "人物");
         schema.declare_subclass("机构", "实体");
         schema.declare_subclass("人物", "实体");
         schema.declare_subclass("学生", "人物");
@@ -1211,6 +1318,71 @@ mod tests {
         assert!(answer.text.contains("张三"));
         assert!(answer.text.contains("李四"));
         assert!(answer.text.contains("已到成员表末尾"));
+    }
+
+    #[test]
+    fn type_count_questions_report_member_totals() {
+        let generator = generator();
+        let parsed = parse(&generator, "有多少个人物？").unwrap();
+        assert_eq!(
+            parsed,
+            TypeQuestion::Count {
+                etype: "人物".to_string()
+            }
+        );
+        let counted = answer(&generator, "有多少个人物？").unwrap();
+        assert!(
+            counted.text.contains("共有 2 个已知成员"),
+            "{}",
+            counted.text
+        );
+        assert_eq!(counted.focus.as_deref(), Some("人物"));
+
+        assert_eq!(
+            parse(&generator, "人物有多少个").unwrap(),
+            TypeQuestion::Count {
+                etype: "人物".to_string()
+            }
+        );
+        let schema = schema();
+        let empty =
+            answer_with_schema(&generator, Some(&schema), "学生有多少个").unwrap_or_else(|| {
+                panic!("已声明的空类型也应诚实回答");
+            });
+        assert!(empty.text.contains("0") || empty.text.contains("没有"), "{}", empty.text);
+    }
+
+    #[test]
+    fn single_char_type_alias_counts_and_attribute_counts_are_not_hijacked() {
+        let generator = generator();
+        let schema = schema();
+        let parsed = super::parse_details(&generator, Some(&schema), "有多少个人")
+            .map(|(question, _)| question)
+            .unwrap();
+        assert_eq!(
+            parsed,
+            TypeQuestion::Count {
+                etype: "人物".to_string()
+            }
+        );
+        let answer =
+            answer_with_schema(&generator, Some(&schema), "有多少个人").expect("别名计数应可回答");
+        assert!(answer.text.contains("共有 2 个已知成员"), "{}", answer.text);
+
+        assert!(
+            super::parse_details(&generator, Some(&schema), "人物有多少个属性").is_none(),
+            "问属性个数不能被劫持成成员计数"
+        );
+    }
+
+    #[test]
+    fn count_focus_pages_members_on_followup() {
+        let generator = generator();
+        let mut memory = TypeDialogueMemory::new();
+        answer_in_context(&generator, None, &mut memory, "有多少个人物").expect("计数应可回答");
+        let members = answer_in_context(&generator, None, &mut memory, "还有呢")
+            .expect("计数后追问应列出成员");
+        assert!(members.text.contains("张三"), "{}", members.text);
     }
 
     #[test]
