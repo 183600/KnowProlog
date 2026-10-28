@@ -1322,6 +1322,50 @@
         assert!(rendered.contains("18"), "{}", rendered);
     }
 
+    /// SELECT 的列顺序必须跟随查询声明，而不是按变量名字典序重排：
+    /// `?s ?p ?o` 应渲染成 s、p、o，而不是 o、p、s。
+    #[tokio::test]
+    async fn sparql_select_preserves_declared_column_order() {
+        let (manager, _dir) = temp_manager().await;
+        manager.save_knowledge(vec![person("张三")]).await.unwrap();
+
+        let result = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.columns, vec!["s", "p", "o"]);
+        let rendered = result.render_text();
+        let header: Vec<String> = rendered
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .collect();
+        assert_eq!(header, vec!["s", "p", "o"], "{}", rendered);
+
+        let reordered = manager
+            .query_sparql(
+                r#"PREFIX kg: <http://example.org/kg/>
+                SELECT ?o ?s WHERE { ?s kg:name ?o }"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reordered.columns, vec!["o", "s"]);
+        let header: Vec<String> = reordered
+            .render_text()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split('|')
+            .map(|cell| cell.trim().to_string())
+            .collect();
+        assert_eq!(header, vec!["o", "s"]);
+    }
+
     /// ASK 返回确定布尔；CONSTRUCT 按三元组逐行返回；语法错误不静默为空。
     #[tokio::test]
     async fn sparql_ask_construct_and_syntax_error() {

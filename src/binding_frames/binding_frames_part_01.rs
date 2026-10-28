@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use crate::conversational_graph::{GraphFact, MatchOptions};
 use crate::dialogue_manager::{DialogueKnowledge, MoveKind};
-use crate::kg_pattern::{KgPattern, KgPatternDecl, KgPatternRegistry};
+use crate::kg_pattern::{KgPatternDecl, KgPatternRegistry};
 use crate::quantity::{self, Comparison, Quantity};
 /// 继承槽位的逻辑轮次时限。
 pub const FRAME_ENV_TTL: u64 = 8;

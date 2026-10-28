@@ -54,10 +54,14 @@ fn entity_type_labels(
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
     pub success: bool,
+    /// 查询声明的变量顺序（`SELECT ?s ?p ?o` → s、p、o）；
+    /// 构造型结果（CONSTRUCT / DESCRIBE）固定为 subject、predicate、object，
+    /// ASK 为 boolean。渲染与 JSON 消费都应尊重这一顺序，而不是按字典序重排。
+    pub columns: Vec<String>,
     pub data: Vec<HashMap<String, Value>>,
 }
 impl QueryResult {
-    /// 表格化渲染任意 SPARQL 结果（列按变量名字典序，行保持查询顺序）。
+    /// 表格化渲染任意 SPARQL 结果（列按查询声明顺序，行保持查询顺序）。
     ///
     /// 列宽按字符（而非字节）计算，中文实体名也能对齐；空结果给固定措辞，
     /// 与 `ASK false`（一行 `boolean = false`）在输出上可区分。
@@ -65,7 +69,7 @@ impl QueryResult {
         if self.data.is_empty() {
             return "（查询成功，无结果）".to_string();
         }
-        let mut columns: Vec<String> = Vec::new();
+        let mut columns = self.columns.clone();
         for row in &self.data {
             for key in row.keys() {
                 if !columns.iter().any(|column| column == key) {
@@ -73,7 +77,6 @@ impl QueryResult {
                 }
             }
         }
-        columns.sort();
         if columns.is_empty() {
             return "（查询成功，无变量绑定）".to_string();
         }

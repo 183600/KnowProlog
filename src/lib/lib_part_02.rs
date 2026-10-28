@@ -1721,8 +1721,14 @@ impl OxigraphManager {
                     format!("SPARQL 执行失败：{}", error).into()
                 })?;
         let mut data: Vec<HashMap<String, Value>> = Vec::new();
+        let columns: Vec<String>;
         match results {
             QueryResults::Solutions(solutions) => {
+                columns = solutions
+                    .variables()
+                    .iter()
+                    .map(|variable| variable.as_str().to_string())
+                    .collect();
                 for solution in solutions {
                     let solution =
                         solution.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
@@ -1736,9 +1742,15 @@ impl OxigraphManager {
                 }
             }
             QueryResults::Boolean(value) => {
+                columns = vec!["boolean".to_string()];
                 data.push(HashMap::from([("boolean".to_string(), Value::Bool(value))]));
             }
             QueryResults::Graph(triples) => {
+                columns = vec![
+                    "subject".to_string(),
+                    "predicate".to_string(),
+                    "object".to_string(),
+                ];
                 for triple in triples {
                     let triple =
                         triple.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
@@ -1760,6 +1772,7 @@ impl OxigraphManager {
         }
         Ok(QueryResult {
             success: true,
+            columns,
             data,
         })
     }
