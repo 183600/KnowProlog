@@ -127,6 +127,7 @@ pub mod proof_journal;
 pub mod provenance;
 pub mod quality;
 pub mod quantity;
+pub mod quantifier;
 pub mod query_anchor;
 pub mod query_board;
 pub mod query_planner;
