@@ -742,6 +742,55 @@ impl SynonymGraph {
         graph
     }
 
+    /// 合并另一张图：保留本图墓碑，确认优先于待确认，证据与来源累加。
+    /// 用于把配置资产并入会话已学到的词义图。
+    pub fn merge_from(&mut self, other: &SynonymGraph) -> usize {
+        self.begin_turn(other.turn);
+        let mut merged = 0usize;
+        for (id, incoming) in &other.entries {
+            match self.entries.get_mut(id) {
+                Some(existing) => {
+                    if existing.is_refuted() {
+                        continue;
+                    }
+                    let before = existing.clone();
+                    existing.observations = existing
+                        .observations
+                        .saturating_add(incoming.observations);
+                    let total = existing.observations.max(1);
+                    existing.confidence = (((existing.confidence
+                        * f64::from(before.observations.max(1)))
+                        + (incoming.confidence * f64::from(incoming.observations.max(1))))
+                        / f64::from(total))
+                        .clamp(0.0, 1.0);
+                    existing.last_turn = existing.last_turn.max(incoming.last_turn);
+                    existing.first_turn = existing.first_turn.min(incoming.first_turn);
+                    existing.sources.extend(incoming.sources.iter().cloned());
+                    if incoming.status == SynonymStatus::Confirmed
+                        && existing.status == SynonymStatus::Proposed
+                    {
+                        existing.status = SynonymStatus::Confirmed;
+                    }
+                    if existing.note.is_none() {
+                        existing.note = incoming.note.clone();
+                    }
+                    if *existing != before {
+                        merged += 1;
+                    }
+                }
+                None => {
+                    self.entries.insert(id.clone(), incoming.clone());
+                    merged += 1;
+                }
+            }
+        }
+        if merged > 0 {
+            self.revision = self.revision.saturating_add(1);
+            self.prune();
+        }
+        merged
+    }
+
     /// 确认一条边（显式承诺）。
     pub fn confirm(&mut self, id: &str, turn: u64) -> bool {
         self.begin_turn(turn);
@@ -1803,6 +1852,52 @@ mod tests {
         let type_alias =
             graph.canonicalize("Person", SynonymKind::Type, &SynonymContext::new());
         assert_eq!(type_alias.canonical(), Some("人物"));
+    }
+
+    #[test]
+    fn merge_preserves_tombstones_and_adds_config_evidence() {
+        let mut local = SynonymGraph::new(16);
+        let id = add(&mut local, "阿明", "小明", None);
+        local.refute(&id, 2, Some("用户纠正"));
+        let mut config = SynonymGraph::new(16);
+        config.observe(
+            3,
+            "阿明",
+            "小明",
+            SynonymKind::Entity,
+            SynonymSense::default(),
+            "config",
+            1.0,
+        );
+        config.observe(
+            3,
+            "老婆",
+            "妻子",
+            SynonymKind::Entity,
+            SynonymSense::default(),
+            "config",
+            1.0,
+        );
+        let wife_id = config
+            .entries
+            .values()
+            .find(|entry| entry.surface == "老婆")
+            .unwrap()
+            .id
+            .clone();
+        config.confirm(&wife_id, 3);
+        local.merge_from(&config);
+        assert_eq!(
+            local.entry(&id).map(|entry| entry.status),
+            Some(SynonymStatus::Refuted),
+            "合并不得复活墓碑"
+        );
+        assert_eq!(
+            local
+                .canonicalize("老婆", SynonymKind::Entity, &SynonymContext::new())
+                .canonical(),
+            Some("妻子")
+        );
     }
 
     #[test]
