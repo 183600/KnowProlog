@@ -705,6 +705,10 @@ fn table_grid_parses_rectangular_csv_and_builds_candidates() {
     assert_eq!(candidate.object, "1981");
     assert!(candidate.render_zh().contains("表格第 2 行第 2 列"));
     assert_eq!(grid.candidates().len(), 4);
+
+    let tsv = TableGrid::parse_csv("\u{feff}公司\t年份\n甲公司\t1981\n").unwrap();
+    assert_eq!(tsv.headers(), ["公司", "年份"]);
+    assert_eq!(tsv.cell(2, 2), Some("1981"));
 }
 
 #[test]

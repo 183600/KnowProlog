@@ -53,14 +53,15 @@ impl TableGrid {
         })
     }
 
-    /// 解析逗号分隔的表格文本；空行被忽略，支持中文逗号。
+    /// 解析逗号/制表符分隔的表格文本；忽略空行、中文逗号与 UTF-8 BOM。
     pub fn parse_csv(text: &str) -> Result<Self, MediaError> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let rows: Vec<Vec<String>> = text
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .map(|line| {
-                line.split(['，', ','])
+                line.split(['，', ',', '\t'])
                     .map(|cell| cell.trim().to_string())
                     .collect()
             })
