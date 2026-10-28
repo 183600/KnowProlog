@@ -1,6 +1,6 @@
 {
   "lock_version": 1,
-  "language_version": "0.2.0",
+  "language_version": "0.3.0",
   "schema": {
     "snapshot_version": 1,
     "entity_types": {
@@ -793,6 +793,9 @@
     "predicate_profiles": {
       "任职于": {
         "aliases": [
+          "供职于",
+          "就职于",
+          "工作于",
           "工作单位",
           "所在单位"
         ],
@@ -800,8 +803,12 @@
         "functional": false,
         "transitive": false,
         "symmetric": false,
-        "domain": [],
-        "range": []
+        "domain": [
+          "人物"
+        ],
+        "range": [
+          "机构"
+        ]
       },
       "出生于": {
         "aliases": [
@@ -885,9 +892,13 @@
     "type_system": {
       "closure_gate": true,
       "aliases": {
+        "company": "机构",
         "entity": "实体",
+        "organization": "机构",
         "person": "人物",
-        "人": "人物"
+        "人": "人物",
+        "公司": "机构",
+        "组织": "机构"
       },
       "subclasses": {
         "人物": [
@@ -898,6 +909,9 @@
         ],
         "学生": [
           "人物"
+        ],
+        "机构": [
+          "实体"
         ]
       },
       "disjoint": [
@@ -1363,7 +1377,7 @@
       "system.default_language": "zh"
     }
   },
-  "schema_digest": "82cdb5cf2a20cde7",
+  "schema_digest": "77e462d255ad65a1",
   "nlu": {
     "version": 2,
     "corpus_digest": "f7da948dd31deb12",
