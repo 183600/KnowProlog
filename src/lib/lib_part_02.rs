@@ -31,6 +31,36 @@ fn push_unique_episode_fact(
     }
 }
 
+/// 一次批量写入的结果（RDF 与 JSON-LD 导入共用，保证两者的批次语义一致）。
+struct EpisodeWriteOutcome {
+    added: usize,
+    duplicates: usize,
+    episode: crate::import_episode::ImportEpisode,
+    recorded: bool,
+    source_aliases_added: bool,
+}
+
+/// JSON-LD 收据：保留原有实体/关系统计，并附上本次导入情景。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonldEpisodeReceipt {
+    pub stats: JsonldImportStats,
+    pub episode: crate::import_episode::ImportEpisode,
+    pub recorded: bool,
+    pub source_aliases_added: bool,
+}
+
+impl JsonldEpisodeReceipt {
+    pub fn summary(&self) -> String {
+        format!(
+            "{}\n批次 B{}｜id {}｜批次图 {}",
+            self.stats.summary(),
+            self.episode.seq,
+            self.episode.id,
+            self.episode.batch_graph
+        )
+    }
+}
+
 impl OxigraphManager {
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::with_perf_ledger(store_path, Arc::new(perf_ledger::PerfLedger::new()))
@@ -94,23 +124,52 @@ impl OxigraphManager {
         &self,
         jsonld_content: &str,
     ) -> Result<JsonldImportStats, Box<dyn std::error::Error + Send + Sync>> {
-        let store = self.store.lock().await;
-        // 持锁后、写前失效整图快照缓存：JSON-LD 导入可能分批写入，
-        // 版本号先行可保证中途失败也不会让读者把半成品缓存成完整快照
-        self.bump_revision();
-
-        // 解析 JSON-LD 内容
-        let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
-
-        // 直接处理 JSON 结构；三元组数按库长度差统计（重复导入计 0）
-        let before = store.len()?;
-        let mut stats = JsonldImportStats::default();
-        self.process_jsonld_simple(&store, &jsonld_value, &mut stats)
-            .await?;
-        let after = store.len()?;
-        stats.triples = after.saturating_sub(before);
-
+        // 先在内存暂存区完整展开，再一次性写入：JSON-LD 结构错误不会留下半批
+        // 三元组，也不会在失败时推进知识版本。
+        let (quads, mut stats) = self.stage_jsonld(jsonld_content).await?;
+        let (added, _) = self.insert_flattened_quads(&quads).await?;
+        stats.triples = added;
         Ok(stats)
+    }
+
+    /// 在内存暂存区展开 JSON-LD，返回默认图四元组与解析统计。
+    ///
+    /// 暂存避免结构化导入直接改写主库：解析/展开失败时主库不受影响。
+    async fn stage_jsonld(
+        &self,
+        jsonld_content: &str,
+    ) -> Result<(Vec<Quad>, JsonldImportStats), Box<dyn std::error::Error + Send + Sync>> {
+        let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
+        let staging = Store::new()?;
+        let mut stats = JsonldImportStats::default();
+        self.process_jsonld_simple(&staging, &jsonld_value, &mut stats)
+            .await?;
+        let quads = staging.iter().collect::<Result<Vec<_>, _>>()?;
+        Ok((quads, stats))
+    }
+
+    /// 把已展开的四元组写入默认图；返回（新增，重复）。
+    async fn insert_flattened_quads(
+        &self,
+        quads: &[Quad],
+    ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let (added, duplicates) = store.transaction(move |mut transaction| {
+            let mut added = 0usize;
+            let mut duplicates = 0usize;
+            for quad in quads {
+                if transaction.insert(quad.as_ref())? {
+                    added += 1;
+                } else {
+                    duplicates += 1;
+                }
+            }
+            Ok::<(usize, usize), oxigraph::store::StorageError>((added, duplicates))
+        })?;
+        if added > 0 {
+            self.bump_revision();
+        }
+        Ok((added, duplicates))
     }
 
     async fn process_jsonld_simple(
@@ -798,6 +857,40 @@ impl OxigraphManager {
         self.import_jsonld(&content).await
     }
 
+    /// 导入 JSON-LD 文件并记入导入情景（默认图 + 批次命名图 + 元数据图）。
+    pub async fn import_jsonld_file_batch(
+        &self,
+        file_path: &str,
+    ) -> Result<JsonldEpisodeReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        let content = fs::read_to_string(file_path)?;
+        self.import_jsonld_batch(&content, file_path).await
+    }
+
+    /// 导入 JSON-LD 内容并记入导入情景。
+    ///
+    /// 与 `import_jsonld` 共用同一套展开逻辑（含 @context、@reverse、@list
+    /// 与 @graph），但成功写入后会保留本批断言与确定性 gist，供「这批 /
+    /// 上一批 / 来源文件」回指。JSON-LD 的 @graph 不是 RDF 命名图，因此
+    /// `input_named_graphs` 恒为 0。
+    pub async fn import_jsonld_batch(
+        &self,
+        jsonld_content: &str,
+        source: &str,
+    ) -> Result<JsonldEpisodeReceipt, Box<dyn std::error::Error + Send + Sync>> {
+        let (quads, mut stats) = self.stage_jsonld(jsonld_content).await?;
+        let blank_nodes = crate::import_episode::has_blank_nodes(&quads);
+        let outcome = self
+            .write_episode_batch(quads, "JSON-LD".to_string(), source, 0, blank_nodes)
+            .await?;
+        stats.triples = outcome.added;
+        Ok(JsonldEpisodeReceipt {
+            stats,
+            episode: outcome.episode,
+            recorded: outcome.recorded,
+            source_aliases_added: outcome.source_aliases_added,
+        })
+    }
+
     /// 按名称识别 RDF 序列化格式，供标准输入等没有扩展名的场景使用。
     pub fn parse_rdf_format(
         name: &str,
@@ -965,6 +1058,37 @@ impl OxigraphManager {
             })
             .collect();
 
+        let outcome = self
+            .write_episode_batch(
+                flattened,
+                crate::import_episode::rdf_format_label(format).to_string(),
+                source,
+                input_named_graphs.len(),
+                blank_nodes,
+            )
+            .await?;
+        self.perf.bump("rdf_import_batch");
+        Ok(crate::import_episode::RdfImportReceipt {
+            episode: outcome.episode,
+            added: outcome.added,
+            duplicates: outcome.duplicates,
+            recorded: outcome.recorded,
+            source_aliases_added: outcome.source_aliases_added,
+        })
+    }
+
+    /// 把一批已压平的四元组写入默认图、批次命名图与情景元数据图。
+    ///
+    /// RDF 与 JSON-LD 导入共用：内容寻址、同批次来源别名、幂等回执与
+    /// gist 全部在这里完成，避免两条导入路径出现语义漂移。
+    async fn write_episode_batch(
+        &self,
+        flattened: Vec<Quad>,
+        format_label: String,
+        source: &str,
+        input_named_graphs: usize,
+        blank_nodes: bool,
+    ) -> Result<EpisodeWriteOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let id = crate::import_episode::batch_id(&flattened);
         let gist = crate::import_episode::build_gist(
             &flattened,
@@ -1002,13 +1126,13 @@ impl OxigraphManager {
             id: id.clone(),
             source: source.to_string(),
             sources: Vec::new(),
-            format: crate::import_episode::rdf_format_label(format).to_string(),
+            format: format_label,
             imported_at: crate::import_episode::now_unix_seconds(),
             total: flattened.len(),
             added: 0,
             duplicates: 0,
             blank_nodes,
-            input_named_graphs: input_named_graphs.len(),
+            input_named_graphs,
             batch_graph: batch_graph.clone(),
             gist,
         };
@@ -1085,17 +1209,16 @@ impl OxigraphManager {
         if added > 0 {
             self.bump_revision();
         }
-        self.perf.bump("rdf_import_batch");
         let recorded = recorded_episode.is_some();
         let source_aliases_added = alias_episode.is_some();
         let episode = recorded_episode
             .or(alias_episode)
             .or(known_episode)
             .unwrap_or(fallback_episode);
-        Ok(crate::import_episode::RdfImportReceipt {
-            episode,
+        Ok(EpisodeWriteOutcome {
             added,
             duplicates,
+            episode,
             recorded,
             source_aliases_added,
         })

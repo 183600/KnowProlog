@@ -8,15 +8,30 @@
                     eprintln!("读取标准输入失败: {}", error);
                     std::process::exit(1);
                 }
-                oxigraph_manager.import_jsonld(&content).await
+                oxigraph_manager
+                    .import_jsonld_batch(&content, "stdin")
+                    .await
             } else {
                 println!("正在导入 JSON-LD 文件: {}", file_path);
-                oxigraph_manager.import_jsonld_from_file(&file_path).await
+                oxigraph_manager
+                    .import_jsonld_file_batch(&file_path)
+                    .await
             };
 
             match import_result {
-                Ok(stats) => {
-                    println!("JSON-LD 导入成功：{}", stats.summary());
+                Ok(receipt) => {
+                    println!("JSON-LD 导入成功：{}", receipt.summary());
+                    println!(
+                        "批次 B{}｜id {}｜批次图 {}",
+                        receipt.episode.seq,
+                        receipt.episode.id,
+                        receipt.episode.batch_graph
+                    );
+                    if receipt.episode.blank_nodes {
+                        println!(
+                            "注意：本批含空白节点；同一文档重复导入可能得到不同批次 id。"
+                        );
+                    }
                     if let Err(error) =
                         persist_registry_observations(&oxigraph_manager, &store_path).await
                     {
@@ -33,9 +48,23 @@
             load_persistent_registries(&config, &oxigraph_manager, &store_path);
             println!("正在导入 JSON-LD 内容...");
 
-            match oxigraph_manager.import_jsonld(&content).await {
-                Ok(stats) => {
-                    println!("JSON-LD 内容导入成功：{}", stats.summary());
+            match oxigraph_manager
+                .import_jsonld_batch(&content, "内容")
+                .await
+            {
+                Ok(receipt) => {
+                    println!("JSON-LD 内容导入成功：{}", receipt.summary());
+                    println!(
+                        "批次 B{}｜id {}｜批次图 {}",
+                        receipt.episode.seq,
+                        receipt.episode.id,
+                        receipt.episode.batch_graph
+                    );
+                    if receipt.episode.blank_nodes {
+                        println!(
+                            "注意：本批含空白节点；同一内容重复导入可能得到不同批次 id。"
+                        );
+                    }
                     if let Err(error) =
                         persist_registry_observations(&oxigraph_manager, &store_path).await
                     {

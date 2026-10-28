@@ -1646,6 +1646,124 @@
         );
     }
 
+    /// JSON-LD 批量导入复用同一套情景结构：默认图 + 批次图 + 元数据图。
+    #[tokio::test]
+    async fn import_jsonld_batch_records_episode_and_batch_graph() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "member_of": "http://example.org/kg/member_of",
+                "Person": "http://example.org/kg/Person",
+                "Organization": "http://example.org/kg/Organization"
+            },
+            "@graph": [
+                {
+                    "@id": "http://example.org/kg/entity/张三",
+                    "@type": "Person",
+                    "name": "张三",
+                    "member_of": { "@id": "http://example.org/kg/entity/示例公司" }
+                },
+                {
+                    "@id": "http://example.org/kg/entity/示例公司",
+                    "@type": "Organization",
+                    "name": "示例公司"
+                }
+            ]
+        }"#;
+        let first = manager
+            .import_jsonld_batch(jsonld, "data/people.jsonld")
+            .await
+            .unwrap();
+        assert!(first.recorded);
+        assert_eq!(first.stats.entities, 2);
+        assert_eq!(first.stats.relations, 1);
+        assert_eq!(first.stats.triples, 5);
+        assert_eq!(first.episode.seq, 1);
+        assert_eq!(first.episode.format, "JSON-LD");
+        assert_eq!(first.episode.total, 5);
+        assert_eq!(first.episode.input_named_graphs, 0);
+        assert_eq!(first.episode.gist.distinct_subjects, 2);
+        assert!(!first.episode.blank_nodes);
+        assert_eq!(first.episode.source, "data/people.jsonld");
+        assert!(first.summary().contains("批次 B1"));
+
+        let batch = manager
+            .query_sparql(&format!(
+                "SELECT ?s WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
+                first.episode.batch_graph
+            ))
+            .await
+            .unwrap();
+        assert_eq!(batch.data.len(), 5);
+        let default = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert_eq!(default.data.len(), 5, "默认图仍是主视图");
+
+        let replay = manager
+            .import_jsonld_batch(jsonld, "data/people.jsonld")
+            .await
+            .unwrap();
+        assert!(!replay.recorded, "同内容重复导入不新建批次");
+        assert_eq!(replay.stats.triples, 0);
+        assert_eq!(replay.episode.added, 5, "批次记录保留首次导入的计数");
+        assert_eq!(manager.load_import_episodes().await.unwrap().len(), 1);
+
+        let alias = manager
+            .import_jsonld_batch(jsonld, "data/people-copy.jsonld")
+            .await
+            .unwrap();
+        assert!(alias.source_aliases_added);
+        let episodes = manager.load_import_episodes().await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(
+            crate::import_episode::resolve_episode_reference(
+                "people-copy.jsonld 讲了什么",
+                &episodes
+            )
+            .map(|episode| episode.seq),
+            Some(1)
+        );
+
+        let before = manager.load_import_episodes().await.unwrap().len();
+        let broken = manager
+            .import_jsonld_batch(r#"{"@id": "http://example.org/kg/entity/坏","#, "broken.jsonld")
+            .await;
+        assert!(broken.is_err());
+        assert_eq!(
+            manager.load_import_episodes().await.unwrap().len(),
+            before,
+            "结构化解析失败不留批次"
+        );
+    }
+
+    /// 普通 JSON-LD 导入保持原统计口径，且暂存失败不写入半批三元组。
+    #[tokio::test]
+    async fn import_jsonld_stages_before_writing() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {"name": "http://example.org/kg/name"},
+            "@id": "http://example.org/kg/entity/甲",
+            "name": "甲"
+        }"#;
+        let stats = manager.import_jsonld(jsonld).await.unwrap();
+        assert_eq!(stats.triples, 1);
+        assert_eq!(stats.entities, 1);
+        assert!(manager.load_import_episodes().await.unwrap().is_empty());
+
+        let broken = manager
+            .import_jsonld(r#"{"@id": "http://example.org/kg/entity/乙","#)
+            .await;
+        assert!(broken.is_err());
+        let count = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert_eq!(count.data.len(), 1, "失败导入不留下半批三元组");
+    }
+
     /// 批次问题只在出现批次线索时回答；类型名单与单主体事实来自批次命名图。
     #[tokio::test]
     async fn import_episode_answers_are_scoped_to_the_batch_graph() {
