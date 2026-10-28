@@ -71,10 +71,10 @@ impl Locator {
                 }
                 if x
                     .checked_add(*width)
-                    .map_or(true, |end| end > IMAGE_COORDINATE_SCALE)
+                    .is_none_or(|end| end > IMAGE_COORDINATE_SCALE)
                     || y
                         .checked_add(*height)
-                        .map_or(true, |end| end > IMAGE_COORDINATE_SCALE)
+                        .is_none_or(|end| end > IMAGE_COORDINATE_SCALE)
                 {
                     return Err(MediaError::InvalidLocator(
                         "图区域坐标必须落在 0..=1000 千分位内",
@@ -258,7 +258,7 @@ impl Anchor {
             LocatorHint::ImageSide(side) => self
                 .locator
                 .image_side()
-                .map_or(false, |actual| actual == *side),
+                .is_some_and(|actual| actual == *side),
             LocatorHint::LastSentence | LocatorHint::Sentence(_) => !self.text.trim().is_empty(),
         }
     }

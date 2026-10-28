@@ -36,7 +36,7 @@ impl TableGrid {
         }
         if rows[1..]
             .iter()
-            .any(|row| row.first().map_or(true, |cell| cell.trim().is_empty()))
+            .any(|row| row.first().is_none_or(|cell| cell.trim().is_empty()))
         {
             return Err(MediaError::InvalidTable("键列不能有空单元格"));
         }

@@ -110,10 +110,7 @@ impl MediaStore {
             .values()
             .filter(|stored| {
                 selector.modalities.is_empty()
-                    || selector
-                        .modalities
-                        .iter()
-                        .any(|modality| *modality == stored.record.modality)
+                    || selector.modalities.contains(&stored.record.modality)
             })
             .collect();
         candidates.sort_by_key(|stored| stored.record.sequence);

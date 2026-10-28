@@ -159,7 +159,7 @@ fn has_table_reference(chars: &[char]) -> bool {
             );
         let next_ok = chars
             .get(index + 1)
-            .map_or(false, |next| next.is_ascii_digit() || is_numeral_char(*next));
+            .is_some_and(|next| next.is_ascii_digit() || is_numeral_char(*next));
         if previous_ok || next_ok {
             return true;
         }
