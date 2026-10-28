@@ -331,6 +331,17 @@ impl SchemaView {
         canonical_with(&self.type_aliases, name)
     }
 
+    /// 显式登记的类型别名对（别名 → 规范名），按别名稳定排序。
+    ///
+    /// 同一别名可能以原样与小写两种键登记；这里按键去重，只暴露一次。
+    pub fn type_alias_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs: BTreeMap<String, String> = BTreeMap::new();
+        for (alias, canonical) in &self.type_aliases {
+            pairs.entry(alias.clone()).or_insert_with(|| canonical.clone());
+        }
+        pairs.into_iter().collect()
+    }
+
     pub fn canonical_property(&self, name: &str) -> String {
         canonical_with(&self.property_aliases, name)
     }

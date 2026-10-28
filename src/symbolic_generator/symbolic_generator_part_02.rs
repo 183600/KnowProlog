@@ -226,6 +226,48 @@ impl SymbolicGenerator {
         max_samples: usize,
     ) -> Option<TypeProfile> {
         let members_ref = self.type_members.get(etype)?;
+        let members: Vec<String> = members_ref.iter().cloned().collect();
+        self.build_type_profile_for_members(
+            etype,
+            &members,
+            revision,
+            max_predicates,
+            max_samples,
+        )
+    }
+
+    /// 为任意（已排序的）成员集合构建类型画像。
+    ///
+    /// 供模式视图把子类成员并入上位类型的画像；`type_name` 只用于展示，
+    /// `revision` 由调用方按参与合并的类型版本戳组合。成员为空时返回 None。
+    pub fn type_profile_for_members(
+        &self,
+        type_name: &str,
+        members: &[String],
+        revision: u64,
+        max_predicates: usize,
+        max_samples: usize,
+    ) -> Option<TypeProfile> {
+        if members.is_empty() {
+            return None;
+        }
+        self.build_type_profile_for_members(
+            type_name,
+            members,
+            revision,
+            max_predicates,
+            max_samples,
+        )
+    }
+
+    fn build_type_profile_for_members(
+        &self,
+        etype: &str,
+        members_ref: &[String],
+        revision: u64,
+        max_predicates: usize,
+        max_samples: usize,
+    ) -> Option<TypeProfile> {
         if members_ref.is_empty() {
             return None;
         }
