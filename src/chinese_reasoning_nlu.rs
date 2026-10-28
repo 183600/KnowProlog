@@ -11,6 +11,8 @@
 //   直陈句     → 确定事实。
 // 全过程只有字符串切分、连词表、中文数字解析与合一——没有神经网络、没有训练。
 
+use std::sync::Arc;
+
 use crate::problog::ProblogEngine;
 use crate::resolution_engine::{Atom, Clause, Term};
 
@@ -746,6 +748,56 @@ fn parse_default_lesson(
     })
 }
 
+/// 全称量词句 → 变量化 Horn 规则。
+///
+/// 「所有鸟都会飞」读作 `会飞(X) :- 是(X, 鸟)`，而不是把「所有鸟」当成一个
+/// 具体实体。只接受第一个论元为类名的原子；去掉类名后常见的「都/也」语气词。
+fn parse_universal_lesson(rest: &str, original: &str) -> Result<ChineseLesson, String> {
+    let rest = rest.trim().trim_start_matches('的').trim();
+    if rest.is_empty() {
+        return Err(format!("全称量词后缺少命题：「{}」", original));
+    }
+    let Some(mut atom) = parse_proposition(rest) else {
+        return Err(format!(
+            "无法解析全称量词后的命题「{}」（支持：所有S会V / 所有S是O / 所有S的P是O）",
+            rest
+        ));
+    };
+    let Some(first) = atom.terms.first_mut() else {
+        return Err(format!("全称量词后的命题缺少论元：「{}」", original));
+    };
+    let class = match first {
+        Term::Const(name) => {
+            let mut class = name.trim().to_string();
+            if class.chars().count() > 1 {
+                if let Some(last) = class.chars().last() {
+                    if matches!(last, '都' | '也' | '均' | '皆') {
+                        class.pop();
+                    }
+                }
+            }
+            if class.is_empty() {
+                return Err(format!("全称量词后缺少类名：「{}」", original));
+            }
+            *name = Arc::from(class.as_str());
+            class
+        }
+        Term::Var(_) => {
+            return Err(format!("全称量词后的命题不应已含变量：「{}」", original));
+        }
+    };
+    atom.terms[0] = Term::var("X");
+    Ok(ChineseLesson {
+        kind: LessonKind::ConditionalRule,
+        head: atom,
+        body: vec![Atom::rel("是", "X", &class)],
+        probability: 1.0,
+        source: "中文教学·全称量词".to_string(),
+        original: original.to_string(),
+        exception: None,
+    })
+}
+
 /// 解析单句中文知识
 pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
     let raw = text.trim();
@@ -761,6 +813,22 @@ pub fn parse_lesson(text: &str) -> Result<ChineseLesson, String> {
     }
     if crate::function_words::contains_question_marker(&cleaned) {
         return Err(format!("「{}」是疑问句，不能作为知识教学", cleaned));
+    }
+    // 句首全称量词不能当普通名词塞进事实，否则「所有鸟会飞」会被误学成
+    // 「会飞(所有鸟)」。这里把它还原成变量规则：会飞(X) :- 是(X, 鸟)。
+    if let Some(reading) = crate::quantifier::parse_quantifier(&cleaned) {
+        match reading.force {
+            crate::quantifier::QuantifierForce::Universal => {
+                return parse_universal_lesson(reading.remainder(), &cleaned);
+            }
+            crate::quantifier::QuantifierForce::No => {
+                return Err(format!(
+                    "「{}」是否定量词陈述；开放世界下「没有记录」不等于「全部没有」，暂不写入概率程序",
+                    cleaned
+                ));
+            }
+            _ => {}
+        }
     }
     let (probability, without_quantifier) = match extract_probability(&cleaned) {
         Some((probability, cleaned)) => (Some(probability), cleaned),
@@ -1123,6 +1191,25 @@ mod tests {
         let rendered = render_lesson_zh(&lesson);
         assert!(rendered.contains("只要"));
         assert!(rendered.contains("95%"));
+    }
+
+    #[test]
+    fn test_universal_quantifier_becomes_variable_rule() {
+        let lesson = parse_lesson("所有鸟都会飞").unwrap();
+        assert_eq!(lesson.kind, LessonKind::ConditionalRule);
+        assert_eq!(lesson.head.display(), "会飞(?X)");
+        assert_eq!(lesson.body[0].display(), "是(X, 鸟)");
+        assert!((lesson.probability - 1.0).abs() < 1e-9);
+        let clause = lesson_to_clause(&lesson).expect("全称句应可转成 Horn 子句");
+        assert_eq!(clause.head.display(), "会飞(?X)");
+        assert_eq!(clause.body[0].display(), "是(?X, 鸟)");
+
+        let binary = parse_lesson("所有学生都喜欢读书").unwrap();
+        assert_eq!(binary.head.display(), "喜欢(?X, 读书)");
+        assert_eq!(binary.body[0].display(), "是(X, 学生)");
+
+        let error = parse_lesson("没有鸟会飞").unwrap_err();
+        assert!(error.contains("否定量词"), "{}", error);
     }
 
     #[test]
