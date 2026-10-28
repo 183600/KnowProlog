@@ -1,3 +1,50 @@
+/// 直答查询实际读取的谓词：新事实碰到这些谓词才可能需要重算。
+///
+/// `name` 不列入普通实体查询：按名称匹配的实体由足迹里的名称字面量负责，
+/// 否则任何新实体的名字都会让全部直答缓存失效。全局查询（最大行星）例外，
+/// 它的答案确实会读取候选的名称。
+fn direct_answer_predicates(query_type: &str) -> &'static [&'static str] {
+    match query_type {
+        "capital_query" => &["capital"],
+        "altitude_query" => &["altitude"],
+        "chemical_formula_query" => &["formula"],
+        "author_query" => &["author"],
+        "champion_query" => &["champion"],
+        "birth_year_query" => &["birth_year"],
+        "concept_query" | "explanation_query" => &["definition"],
+        "quantity_query" => &["quantity"],
+        "planet_query" | "largest_query" => &["type", "size_rank", "name"],
+        "time_before_query" => &["time"],
+        "principle_query" => &["principle"],
+        "comparison_query" => &["comparison", "entity1", "entity2", "difference"],
+        "philosophy_query" => &["philosophy"],
+        "impact_query" => &["impact", "target"],
+        "cause_query" => &["cause"],
+        "reason_query" => &["reason"],
+        _ => &[],
+    }
+}
+
+/// 为直答缓存条目生成合格证：查询实体 + 查询读取的谓词。
+fn direct_answer_qualification(
+    generation: u64,
+    query_type: &str,
+    entities: &[String],
+) -> Qualification {
+    let mut qualification = Qualification::sensitive(generation)
+        .support_entities(entities.iter().cloned())
+        .support_predicates(
+            direct_answer_predicates(query_type)
+                .iter()
+                .map(|predicate| predicate.to_string()),
+        )
+        .exhaustive(true);
+    if matches!(query_type, "planet_query" | "largest_query") {
+        qualification = qualification.support_entities(["planet".to_string(), "1".to_string()]);
+    }
+    qualification
+}
+
 /// 为「相关事实」缓存条目生成合格证：名称、关系谓词与多跳闭包足迹。
 ///
 /// 新事实若只涉及别的实体、别的关系谓词，且不匹配任何查询词面，就不会改变
@@ -905,13 +952,19 @@ impl OxigraphManager {
         }
         self.perf.bump("direct_answer_cache_miss");
         let answer = self.get_direct_answer_uncached(query_type, entities).await;
-        if self
-            .direct_answer_cache
-            .lock()
-            .put(revision, cache_key, answer.clone())
-            > 0
-        {
-            self.perf.bump("direct_answer_cache_evict");
+        let current = self.revision.load(Ordering::Acquire);
+        if current == revision {
+            let qualification = direct_answer_qualification(revision, query_type, entities);
+            if self
+                .direct_answer_cache
+                .lock()
+                .put(cache_key, answer.clone(), qualification)
+                > 0
+            {
+                self.perf.bump("direct_answer_cache_evict");
+            }
+        } else {
+            self.perf.bump("direct_answer_cache_stale_skip");
         }
         answer
     }

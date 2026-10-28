@@ -144,7 +144,9 @@ impl OxigraphManager {
             revision: AtomicU64::new(0),
             snapshot_cache: parking_lot::Mutex::new(None),
             relevant_cache: parking_lot::Mutex::new(DeltaQualifiedCache::new(QUERY_CACHE_CAPACITY)),
-            direct_answer_cache: parking_lot::Mutex::new(RevisionLru::new(QUERY_CACHE_CAPACITY)),
+            direct_answer_cache: parking_lot::Mutex::new(DeltaQualifiedCache::new(
+                QUERY_CACHE_CAPACITY,
+            )),
             perf,
             predicate_registry: parking_lot::RwLock::new(
                 predicate_registry::PredicateRegistry::new(),
@@ -176,33 +178,52 @@ impl OxigraphManager {
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         self.perf.bump("revision_bump");
-        let mut cache = self.relevant_cache.lock();
+        let mut relevant_cache = self.relevant_cache.lock();
+        let mut direct_cache = self.direct_answer_cache.lock();
         match delta {
             Some(mut delta) => {
                 delta.generation = revision;
-                let report = cache.observe(&delta);
-                self.perf
-                    .bump_by("relevant_cache_delta_retained", report.retained as u64);
+                let relevant_report = relevant_cache.observe(&delta);
+                self.perf.bump_by(
+                    "relevant_cache_delta_retained",
+                    relevant_report.retained as u64,
+                );
                 self.perf.bump_by(
                     "relevant_cache_delta_incomplete",
-                    report.marked_incomplete as u64,
+                    relevant_report.marked_incomplete as u64,
                 );
                 self.perf.bump_by(
                     "relevant_cache_delta_invalidated",
-                    report.invalidated as u64,
+                    relevant_report.invalidated as u64,
                 );
-                if report.gap {
+                if relevant_report.gap {
                     self.perf.bump("relevant_cache_delta_gap");
                 }
-                if report.cleared_all {
+                if relevant_report.cleared_all {
                     self.perf.bump("relevant_cache_delta_cleared");
+                }
+                let direct_report = direct_cache.observe(&delta);
+                self.perf.bump_by(
+                    "direct_answer_cache_delta_retained",
+                    direct_report.retained as u64,
+                );
+                self.perf.bump_by(
+                    "direct_answer_cache_delta_invalidated",
+                    direct_report.invalidated as u64,
+                );
+                if direct_report.gap {
+                    self.perf.bump("direct_answer_cache_delta_gap");
                 }
             }
             None => {
-                if !cache.is_empty() {
+                if !relevant_cache.is_empty() {
                     self.perf.bump("relevant_cache_full_invalidations");
                 }
-                cache.clear();
+                if !direct_cache.is_empty() {
+                    self.perf.bump("direct_answer_cache_full_invalidations");
+                }
+                relevant_cache.clear();
+                direct_cache.clear();
             }
         }
     }

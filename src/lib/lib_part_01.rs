@@ -1038,7 +1038,7 @@ pub struct OxigraphManager {
     // 交替询问不同实体互不挤占；写后整体失效
     relevant_cache: parking_lot::Mutex<DeltaQualifiedCache<Arc<Vec<PrologFact>>>>,
     // 直答缓存：同一知识版本内按查询键多槽缓存（LRU，含"确无答案"的负缓存）
-    direct_answer_cache: parking_lot::Mutex<RevisionLru<Option<String>>>,
+    direct_answer_cache: parking_lot::Mutex<DeltaQualifiedCache<Option<String>>>,
     // 操作计数台账（可与会话推理器共享同一实例）
     perf: Arc<perf_ledger::PerfLedger>,
     // 谓词画像注册表：导入准入、别名/逆向归一、功能谓词冲突裁决
