@@ -284,7 +284,7 @@ fn answer_parsed(
             let right_target = resolve_target(generator, schema, &right)?;
             let mut focus = TypeFocus::new(left_target.key.clone(), TypeQuestionKind::Compare);
             focus.peer = Some(right_target.key.clone());
-            let text = render_comparison(generator, &left_target, &right_target);
+            let text = render_comparison(generator, schema, &left_target, &right_target);
             let focus_key = left_target.key.clone();
             memory.set_focus(focus);
             Some(TypeAnswer {
@@ -414,7 +414,7 @@ fn deepen_focus(
                 return continue_focus(generator, schema, memory, focus);
             };
             let right = resolve_target(generator, schema, peer)?;
-            let text = render_comparison(generator, &left, &right);
+            let text = render_comparison(generator, schema, &left, &right);
             memory.current_mut();
             Some(TypeAnswer {
                 text,
@@ -963,21 +963,44 @@ fn compare_targets(
 
 fn render_comparison(
     generator: &SymbolicGenerator,
+    schema: Option<&SchemaView>,
     left: &TypeTarget,
     right: &TypeTarget,
 ) -> String {
-    if let Some(comparison) = compare_targets(generator, left, right) {
-        return comparison.render();
+    let mut text = match compare_targets(generator, left, right) {
+        Some(comparison) => comparison.render(),
+        None => format!(
+            "类型对比「{}」与「{}」：\n  成员：{} {} 个；{} {} 个。\n  （至少一方暂无显式成员，暂无可比较的谓词。）",
+            left.key,
+            right.key,
+            left.key,
+            left.members.len(),
+            right.key,
+            right.members.len()
+        ),
+    };
+    if let Some(note) = schema_relation_note(schema, &left.key, &right.key) {
+        text.push_str(&format!("\n  {}", note));
     }
-    format!(
-        "类型对比「{}」与「{}」：\n  成员：{} {} 个；{} {} 个。\n  （至少一方暂无显式成员，暂无可比较的谓词。）",
-        left.key,
-        right.key,
-        left.key,
-        left.members.len(),
-        right.key,
-        right.members.len()
-    )
+    text
+}
+
+fn schema_relation_note(
+    schema: Option<&SchemaView>,
+    left: &str,
+    right: &str,
+) -> Option<String> {
+    let schema = schema?;
+    if schema.is_subclass(left, right) {
+        return Some(format!("模式关系：{} ⊑ {}。", left, right));
+    }
+    if schema.is_subclass(right, left) {
+        return Some(format!("模式关系：{} ⊑ {}。", right, left));
+    }
+    if schema.types_disjoint(left, right) {
+        return Some(format!("模式关系：{} ⊥ {}（可证明互斥）。", left, right));
+    }
+    None
 }
 
 fn render_member_page(target: &TypeTarget, page: &TypeMemberPage) -> String {
@@ -1314,6 +1337,29 @@ mod tests {
         let answer = answer_with_schema(&generator, Some(&schema), "学生一般有哪些属性")
             .expect("已声明的类型应可诚实回答");
         assert!(answer.text.contains("暂无显式成员"), "{}", answer.text);
+    }
+
+    #[test]
+    fn comparison_reports_schema_subclass_and_disjoint_evidence() {
+        let mut generator = generator();
+        generator.observe_entity("北京", "地点", &[]);
+        let schema = schema();
+        let disjoint = answer_with_schema(
+            &generator,
+            Some(&schema),
+            "比较人物和地点的区别",
+        )
+        .expect("对比应可回答");
+        assert!(disjoint.text.contains("⊥"), "{}", disjoint.text);
+        assert!(disjoint.text.contains("互斥"), "{}", disjoint.text);
+
+        let subclass = answer_with_schema(
+            &generator,
+            Some(&schema),
+            "比较学生和人物的区别",
+        )
+        .expect("子类对比应可回答");
+        assert!(subclass.text.contains("学生 ⊑ 人物"), "{}", subclass.text);
     }
 
     #[test]
