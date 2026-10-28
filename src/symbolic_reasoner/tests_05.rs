@@ -1585,6 +1585,15 @@
             .expect("名量词也应保留");
         assert!(named.contains("共有 2 名"), "{}", named);
 
+        reasoner.set_nlp_config(trace_nlp_config());
+        reasoner
+            .observe_lexical_text("三位学生")
+            .expect("应能观察词法证据");
+        let learned = reasoner
+            .answer("张三教过多少学生")
+            .expect("不写量词时应使用学到的分类词");
+        assert!(learned.contains("共有 2 位"), "{}", learned);
+
         let except_object = reasoner
             .answer("除了李四，张三还认识谁")
             .expect("集合差问宾语");

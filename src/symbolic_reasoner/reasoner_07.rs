@@ -1287,6 +1287,35 @@ impl SymbolicReasoner {
             .map(|preference| preference.classifier)
     }
 
+    /// 用命中值的实体类型反推分类词：`李四/王五` 都是学生时优先说「位/名」。
+    fn learned_count_classifier_for_values(
+        &self,
+        values: &[String],
+        predicate: &str,
+    ) -> Option<String> {
+        let expected = values
+            .iter()
+            .find_map(|value| self.generator.entity_type_of(value))
+            .map(str::to_string)
+            .or_else(|| {
+                self.lexical_memory
+                    .type_expectation(predicate)
+                    .map(|expectation| expectation.expected_type)
+            })
+            .or_else(|| {
+                crate::identity::infer_suffix_type(predicate)
+                    .map(|(_, expected)| expected.to_string())
+            })?;
+        let category = crate::quantifier::semantic_category(&expected)
+            .unwrap_or(expected.as_str())
+            .to_string();
+        self.lexical_memory
+            .best_classifier_for_type(&category, 1)
+            .or_else(|| self.lexical_memory.best_classifier_for_type(&expected, 1))
+            .filter(|preference| !preference.conflict)
+            .map(|preference| preference.classifier)
+    }
+
     fn answer_count(
         &self,
         subject: &str,
@@ -1327,7 +1356,12 @@ impl SymbolicReasoner {
             return None;
         }
         let values: Vec<String> = hits.iter().map(|hit| hit.value.clone()).collect();
+        let learned = classifier
+            .is_none()
+            .then(|| self.learned_count_classifier_for_values(&values, predicate))
+            .flatten();
         let classifier = classifier
+            .or(learned.as_deref())
             .map(str::trim)
             .filter(|classifier| !classifier.is_empty())
             .unwrap_or("个");

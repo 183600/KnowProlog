@@ -488,7 +488,7 @@ pub const PRONOUNS: [&str; 13] = [
 // ---------------------------------------------------------------------------
 
 /// 实体后缀 → 暂定类型（只做提名标注；确认后由 `admit` 显式准入）。
-pub const SUFFIX_TYPES: [(&str, &str); 19] = [
+pub const SUFFIX_TYPES: [(&str, &str); 24] = [
     ("公司", "组织"),
     ("集团", "组织"),
     ("大学", "组织"),
@@ -503,11 +503,16 @@ pub const SUFFIX_TYPES: [(&str, &str); 19] = [
     ("法院", "组织"),
     ("城市", "地点"),
     ("自治区", "地点"),
+    ("研究生", "人物"),
+    ("学生", "人物"),
     ("老师", "人物"),
+    ("教师", "人物"),
     ("教授", "人物"),
     ("博士", "人物"),
     ("医生", "人物"),
     ("律师", "人物"),
+    ("工程师", "人物"),
+    ("员工", "人物"),
 ];
 
 /// 按后缀表推断 OOV 词的暂定类型，返回（命中的后缀，暂定类型）。
@@ -710,6 +715,7 @@ mod tests {
         assert_eq!(infer_suffix_type("未名科技公司"), Some(("公司", "组织")));
         assert_eq!(infer_suffix_type("未名研究院"), Some(("研究院", "组织")));
         assert_eq!(infer_suffix_type("王老师"), Some(("老师", "人物")));
+        assert_eq!(infer_suffix_type("新生学生"), Some(("学生", "人物")));
         assert_eq!(infer_suffix_type("某某城市"), Some(("城市", "地点")));
         assert_eq!(infer_suffix_type("张三"), None);
         assert_eq!(infer_suffix_type("  "), None);

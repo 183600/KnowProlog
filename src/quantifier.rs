@@ -273,6 +273,44 @@ pub fn classifier_for_type(etype: &str) -> ClassifierChoice {
     }
 }
 
+/// 把具体类型/名词归并到一个语义范畴，供跨类型复用分类词证据。
+///
+/// 「学生」和「人物」共用「位」，「公司」和「组织」共用「家」；只做稳定的
+/// 粗粒度归并，不猜测未知词。
+pub fn semantic_category(label: &str) -> Option<&'static str> {
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    match label.to_ascii_lowercase().as_str() {
+        "person" | "people" | "human" => return Some("人物"),
+        "organization" | "organisation" | "company" => return Some("组织"),
+        "animal" => return Some("动物"),
+        "work" => return Some("作品"),
+        "city" | "location" | "place" | "country" => return Some("地点"),
+        _ => {}
+    }
+    if longest_suffix_hit(label, &PERSON_NOUNS).is_some() {
+        return Some("人物");
+    }
+    if longest_suffix_hit(label, &ORGANIZATION_NOUNS).is_some() {
+        return Some("组织");
+    }
+    if longest_suffix_hit(label, &ANIMAL_NOUNS).is_some() {
+        return Some("动物");
+    }
+    if longest_suffix_hit(label, &WORK_NOUNS).is_some() {
+        return Some("作品");
+    }
+    if longest_suffix_hit(label, &VEHICLE_NOUNS).is_some() {
+        return Some("交通工具");
+    }
+    if longest_suffix_hit(label, &PLACE_NOUNS).is_some() {
+        return Some("地点");
+    }
+    None
+}
+
 /// 综合选择：学到证据 > 显式请求 > 类型 > 名词 > 默认。
 pub fn select_classifier(
     learned: Option<&str>,
@@ -735,6 +773,10 @@ mod tests {
 
         let noun = select_classifier(None, None, None, Some("公司"));
         assert_eq!(noun.classifier, "家");
+
+        assert_eq!(semantic_category("学生"), Some("人物"));
+        assert_eq!(semantic_category("company"), Some("组织"));
+        assert_eq!(semantic_category("量子纠缠"), None);
 
         let fallback = select_classifier(None, None, None, Some("量子纠缠"));
         assert_eq!(fallback.classifier, "个");
