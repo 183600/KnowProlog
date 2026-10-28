@@ -604,6 +604,116 @@ impl SynonymGraph {
         ObserveOutcome::Added { id }
     }
 
+    /// 从现有配置资产编译同义词图：扁平同义词、实体画像、谓词画像与类型
+    /// 别名。画像里的类型/定义域/值域直接成为词义约束，不需要新增配置段。
+    ///
+    /// 扁平映射只播种为实体层：谓词别名由 `predicate_profiles` 提供定义域/
+    /// 值域，避免同一个词面在谓词层被无词义地重复声明。
+    pub fn from_config(config: &crate::SystemConfig, turn: u64) -> Self {
+        let mut graph = Self::default();
+        if let Some(synonyms) = &config.synonyms {
+            let mut pairs: Vec<(&String, &String)> = synonyms.mappings.iter().collect();
+            pairs.sort();
+            for (surface, canonical) in pairs {
+                if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
+                    .observe(
+                        turn,
+                        surface,
+                        canonical,
+                        SynonymKind::Entity,
+                        SynonymSense::default(),
+                        "config",
+                        1.0,
+                    )
+                {
+                    graph.confirm(&id, turn);
+                }
+            }
+        }
+        for profile in &config.entity_profiles {
+            let senses = senses_for(&profile.etype, &[], &[]);
+            for sense in senses {
+                if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
+                    .observe(
+                        turn,
+                        &profile.name,
+                        &profile.name,
+                        SynonymKind::Entity,
+                        sense.clone(),
+                        "entity_profile",
+                        1.0,
+                    )
+                {
+                    graph.confirm(&id, turn);
+                }
+                for alias in &profile.aliases {
+                    if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } =
+                        graph.observe(
+                            turn,
+                            alias,
+                            &profile.name,
+                            SynonymKind::Entity,
+                            sense.clone(),
+                            "entity_profile",
+                            1.0,
+                        )
+                    {
+                        graph.confirm(&id, turn);
+                    }
+                }
+            }
+        }
+        for profile in &config.predicate_profiles {
+            let senses = senses_for(&[], &profile.domain, &profile.range);
+            for sense in senses {
+                if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
+                    .observe(
+                        turn,
+                        &profile.name,
+                        &profile.name,
+                        SynonymKind::Predicate,
+                        sense.clone(),
+                        "predicate_profile",
+                        1.0,
+                    )
+                {
+                    graph.confirm(&id, turn);
+                }
+                for alias in &profile.aliases {
+                    if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } =
+                        graph.observe(
+                            turn,
+                            alias,
+                            &profile.name,
+                            SynonymKind::Predicate,
+                            sense.clone(),
+                            "predicate_profile",
+                            1.0,
+                        )
+                    {
+                        graph.confirm(&id, turn);
+                    }
+                }
+            }
+        }
+        for alias in &config.type_system.aliases {
+            if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
+                .observe(
+                    turn,
+                    &alias.alias,
+                    &alias.canonical,
+                    SynonymKind::Type,
+                    SynonymSense::default(),
+                    "type_system",
+                    1.0,
+                )
+            {
+                graph.confirm(&id, turn);
+            }
+        }
+        graph
+    }
+
     /// 从扁平映射播种：配置里的映射视为显式承诺（已确认、置信度 1.0）。
     /// 若多个映射把同一词面指向不同规范名，解析时会自然得到 `Ambiguous`。
     pub fn from_flat_mappings(
@@ -1262,6 +1372,38 @@ impl SynonymGraph {
     }
 }
 
+/// 画像声明的类型/定义域/值域 → 词义集合。空声明得到通配词义；多值声明
+/// 逐项成边（同一词面因此可以按语境选择不同词义）。
+fn senses_for(type_names: &[String], domains: &[String], ranges: &[String]) -> Vec<SynonymSense> {
+    let type_values: Vec<Option<&str>> = if type_names.is_empty() {
+        vec![None]
+    } else {
+        type_names.iter().map(|value| Some(value.as_str())).collect()
+    };
+    let domain_values: Vec<Option<&str>> = if domains.is_empty() {
+        vec![None]
+    } else {
+        domains.iter().map(|value| Some(value.as_str())).collect()
+    };
+    let range_values: Vec<Option<&str>> = if ranges.is_empty() {
+        vec![None]
+    } else {
+        ranges.iter().map(|value| Some(value.as_str())).collect()
+    };
+    let mut senses = Vec::new();
+    for type_name in &type_values {
+        for domain in &domain_values {
+            for range in &range_values {
+                let sense = SynonymSense::new(*type_name, *domain, *range);
+                if !senses.contains(&sense) {
+                    senses.push(sense);
+                }
+            }
+        }
+    }
+    senses
+}
+
 fn reading_of(entry: &SynonymEntry, score: f64, reason: &str) -> SynonymReading {
     SynonymReading {
         entry_id: entry.id.clone(),
@@ -1638,6 +1780,29 @@ mod tests {
         add(&mut graph, "丙", "C", None);
         assert_eq!(graph.len(), 2);
         assert!(graph.entry(&first).is_none(), "墓碑应先被淘汰");
+    }
+
+    #[test]
+    fn config_assets_compile_into_senses() {
+        let config: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 应可解析");
+        let graph = SynonymGraph::from_config(&config, 1);
+        assert!(graph.active_len() > 0);
+
+        let entity = graph.canonicalize("老婆", SynonymKind::Entity, &SynonymContext::new());
+        assert_eq!(entity.canonical(), Some("妻子"));
+
+        let predicate =
+            graph.canonicalize("老婆", SynonymKind::Predicate, &SynonymContext::new());
+        assert_eq!(predicate.canonical(), Some("配偶"));
+
+        let teacher =
+            graph.canonicalize("老师", SynonymKind::Predicate, &SynonymContext::new());
+        assert_eq!(teacher.canonical(), Some("师傅"));
+
+        let type_alias =
+            graph.canonicalize("Person", SynonymKind::Type, &SynonymContext::new());
+        assert_eq!(type_alias.canonical(), Some("人物"));
     }
 
     #[test]

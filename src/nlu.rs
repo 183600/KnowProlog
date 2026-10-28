@@ -1,4 +1,5 @@
-use crate::nlp::{merge_name_fragments, normalize_words, preprocess, TaggedWord};
+use crate::nlp::{merge_name_fragments, normalize_words_sense_aware, preprocess, TaggedWord};
+use crate::synonym_graph::{SynonymContext, SynonymGraph};
 use crate::{NlpConfig, SystemConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,6 +46,7 @@ pub struct NLUEngine {
     domains: Vec<DomainConfig>,
     nlp_config: NlpConfig,
     synonyms: Option<HashMap<String, String>>,
+    synonym_graph: SynonymGraph,
 }
 
 impl NLUEngine {
@@ -54,6 +56,7 @@ impl NLUEngine {
             domains,
             nlp_config: config.nlp.clone(),
             synonyms: config.synonyms.as_ref().map(|s| s.mappings.clone()),
+            synonym_graph: SynonymGraph::from_config(config, 0),
         }
     }
 
@@ -67,11 +70,14 @@ impl NLUEngine {
         // 人名碎片先合并（「小/nr + 明/unknown」→「小明/nr」），
         // 否则词槽会只截到「小」，意图匹配也随之走偏。
         let tagged_words = merge_name_fragments(&tagged_words);
-        let normalized_words = if let Some(synonyms) = &self.synonyms {
-            normalize_words(tagged_words, synonyms)
-        } else {
-            tagged_words
-        };
+        let empty = HashMap::new();
+        let fallback = self.synonyms.as_ref().unwrap_or(&empty);
+        let normalized_words = normalize_words_sense_aware(
+            tagged_words,
+            &self.synonym_graph,
+            &SynonymContext::new(),
+            fallback,
+        );
 
         let mut semantics = Vec::new();
 

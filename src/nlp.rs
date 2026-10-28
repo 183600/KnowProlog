@@ -505,6 +505,42 @@ pub fn normalize_words(
     words
 }
 
+/// 词义感知归一化：先查同义词图；只有 `Resolved` 且确实改变词面时才改写。
+///
+/// - `Ambiguous`：保持原词面，交给实体链接/澄清流程，绝不硬选；
+/// - `Unresolved`：回退到扁平映射，保证未进入词义图的旧配置仍按原行为工作；
+/// - 词性为动词/名动词的 token 走谓词层，其余走实体层。
+pub fn normalize_words_sense_aware(
+    mut words: Vec<TaggedWord>,
+    graph: &crate::synonym_graph::SynonymGraph,
+    context: &crate::synonym_graph::SynonymContext,
+    flat_fallback: &HashMap<String, String>,
+) -> Vec<TaggedWord> {
+    use crate::synonym_graph::{SynonymKind, SynonymResolution};
+
+    for word in &mut words {
+        let kind = if word.pos.starts_with('v') {
+            SynonymKind::Predicate
+        } else {
+            SynonymKind::Entity
+        };
+        match graph.canonicalize(&word.text, kind, context) {
+            SynonymResolution::Resolved(reading) => {
+                if reading.changes_surface() {
+                    word.text = reading.canonical;
+                }
+            }
+            SynonymResolution::Ambiguous { .. } => {}
+            SynonymResolution::Unresolved { .. } => {
+                if let Some(canonical) = flat_fallback.get(&word.text) {
+                    word.text = canonical.clone();
+                }
+            }
+        }
+    }
+    words
+}
+
 /// 人名碎片合并：结巴可能把「小明」切成「小/nr + 明/unknown」，
 /// 配置里的提取模式（如 ["nr","m","q"]）与查询槽位便难以命中。
 /// 这里把「nr + 连续单字 unknown」按最长 4 个字符合并成单一人名 token；
@@ -808,6 +844,57 @@ mod tests {
                 pos: pos.to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn sense_aware_normalization_keeps_ambiguous_surface() {
+        use crate::synonym_graph::{
+            SynonymContext, SynonymGraph, SynonymKind, SynonymSense,
+        };
+
+        let mut graph = SynonymGraph::new(16);
+        for (canonical, type_name) in [("苹果公司", "组织"), ("苹果", "水果")] {
+            let outcome = graph.observe(
+                1,
+                "苹果",
+                canonical,
+                SynonymKind::Entity,
+                SynonymSense::type_only(type_name),
+                "test",
+                1.0,
+            );
+            let id = outcome.id().unwrap().to_string();
+            graph.confirm(&id, 1);
+        }
+        let mut fallback = HashMap::new();
+        fallback.insert("苹果".to_string(), "苹果公司".to_string());
+
+        let words = tagged(&[("苹果", "n"), ("的", "u"), ("颜色", "n")]);
+        let kept = normalize_words_sense_aware(
+            words.clone(),
+            &graph,
+            &SynonymContext::new(),
+            &fallback,
+        );
+        assert_eq!(kept[0].text, "苹果", "歧义词面不得硬选");
+
+        let typed = normalize_words_sense_aware(
+            words,
+            &graph,
+            &SynonymContext::new().with_expected_type("组织"),
+            &fallback,
+        );
+        assert_eq!(typed[0].text, "苹果公司");
+
+        let fallback_words = tagged(&[("创建", "v")]);
+        let normalized =
+            normalize_words_sense_aware(fallback_words, &graph, &SynonymContext::new(), &fallback);
+        assert_eq!(normalized[0].text, "创建", "图里无证据时保留原词面");
+        let mut flat = HashMap::new();
+        flat.insert("创建".to_string(), "成立".to_string());
+        let normalized =
+            normalize_words_sense_aware(tagged(&[("创建", "v")]), &graph, &SynonymContext::new(), &flat);
+        assert_eq!(normalized[0].text, "成立", "未进入词义图的旧映射仍回退扁平表");
     }
 
     #[test]
