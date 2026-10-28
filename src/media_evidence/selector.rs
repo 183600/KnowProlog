@@ -115,7 +115,9 @@ fn find_sequence(haystack: &[char], needle: &str) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn contains_sequence(haystack: &[char], needle: &str) -> bool {
@@ -170,8 +172,20 @@ fn has_image_reference(chars: &[char]) -> bool {
         let previous_ok = previous.is_some_and(|previous| {
             matches!(
                 previous,
-                '这' | '那' | '上' | '下' | '此' | '本' | '该' | '第' | '张' | '幅' | '看' | '如'
-                    | '见' | '附' | '示'
+                '这' | '那'
+                    | '上'
+                    | '下'
+                    | '此'
+                    | '本'
+                    | '该'
+                    | '第'
+                    | '张'
+                    | '幅'
+                    | '看'
+                    | '如'
+                    | '见'
+                    | '附'
+                    | '示'
             ) || previous.is_ascii_digit()
         });
         let next_ok = next.is_some_and(|next| {
@@ -211,8 +225,7 @@ fn has_table_reference(chars: &[char]) -> bool {
         let previous_ok = index > 0
             && matches!(
                 chars[index - 1],
-                '这' | '上' | '下' | '该' | '此' | '那' | '第' | '图' | '张' | '幅' | '段'
-                    | '份'
+                '这' | '上' | '下' | '该' | '此' | '那' | '第' | '图' | '张' | '幅' | '段' | '份'
             );
         let next_ok = chars.get(index + 1).is_some_and(|next| {
             next.is_ascii_digit()
@@ -282,7 +295,9 @@ fn parse_ordinal(chars: &[char]) -> SelectorOrdinal {
             return SelectorOrdinal::Latest;
         }
     }
-    for token in ["这张", "这幅", "这段", "这个", "此图", "此表", "本图", "本表"] {
+    for token in [
+        "这张", "这幅", "这段", "这个", "此图", "此表", "本图", "本表",
+    ] {
         if contains_sequence(chars, token) {
             return SelectorOrdinal::Latest;
         }

@@ -3,7 +3,7 @@ use super::selection::MediaSelection;
 use super::selector::MediaSelector;
 use super::session::SessionMedia;
 use super::store::MediaStore;
-use super::support::{assess_support, MediaClaim, MediaCitation, SupportReport, SupportState};
+use super::support::{assess_support, MediaCitation, MediaClaim, SupportReport, SupportState};
 
 /// 一次媒体指认 + 跨模态支持判定 + 可上屏回答。
 #[derive(Debug, Clone, PartialEq)]

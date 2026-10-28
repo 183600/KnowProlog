@@ -183,10 +183,7 @@ impl SessionMedia {
         Self::from_value_with_capacity(value, DEFAULT_MAX_SESSION_ASSETS)
     }
 
-    pub fn from_value_with_capacity(
-        value: &Value,
-        capacity: usize,
-    ) -> Result<Self, MediaError> {
+    pub fn from_value_with_capacity(value: &Value, capacity: usize) -> Result<Self, MediaError> {
         let snapshot: MediaLedgerSnapshot = serde_json::from_value(value.clone())
             .map_err(|error| MediaError::SnapshotDamaged(error.to_string()))?;
         if snapshot.version != MEDIA_EVIDENCE_VERSION {

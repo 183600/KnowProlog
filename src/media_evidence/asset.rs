@@ -239,28 +239,58 @@ impl Default for MediaLimits {
 pub enum MediaError {
     EmptyAsset,
     EmptyMediaType,
-    LabelTooLong { actual: usize, limit: usize },
-    MediaTypeTooLong { actual: usize, limit: usize },
-    AssetTooLarge { actual: usize, limit: usize },
-    TotalBytesExceeded { actual: usize, limit: usize },
-    AssetCapacityExceeded { limit: usize },
-    AnchorCapacityExceeded { limit: usize },
-    AnchorTextTooLong { actual: usize, limit: usize },
+    LabelTooLong {
+        actual: usize,
+        limit: usize,
+    },
+    MediaTypeTooLong {
+        actual: usize,
+        limit: usize,
+    },
+    AssetTooLarge {
+        actual: usize,
+        limit: usize,
+    },
+    TotalBytesExceeded {
+        actual: usize,
+        limit: usize,
+    },
+    AssetCapacityExceeded {
+        limit: usize,
+    },
+    AnchorCapacityExceeded {
+        limit: usize,
+    },
+    AnchorTextTooLong {
+        actual: usize,
+        limit: usize,
+    },
     EmptyExtractor,
     InvalidConfidence,
     InvalidLocator(&'static str),
     InvalidTable(&'static str),
-    TableTooLarge { cells: usize, limit: usize },
+    TableTooLarge {
+        cells: usize,
+        limit: usize,
+    },
     LocatorModalityMismatch {
         modality: Modality,
         locator: &'static str,
     },
     UnknownAsset(String),
-    SessionCapacityExceeded { limit: usize },
-    SnapshotVersionUnsupported { found: u32, supported: u32 },
+    SessionCapacityExceeded {
+        limit: usize,
+    },
+    SnapshotVersionUnsupported {
+        found: u32,
+        supported: u32,
+    },
     SnapshotDamaged(String),
     Io(String),
-    PersistedHashMismatch { expected: String, actual: String },
+    PersistedHashMismatch {
+        expected: String,
+        actual: String,
+    },
 }
 
 impl MediaError {

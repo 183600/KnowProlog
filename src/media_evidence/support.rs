@@ -187,7 +187,10 @@ impl SupportReport {
                     .first()
                     .map(text_values_phrase)
                     .unwrap_or_default();
-                format!("{}，图谱记录：{}。目前没有可核对的媒体证据。", subject, text)
+                format!(
+                    "{}，图谱记录：{}。目前没有可核对的媒体证据。",
+                    subject, text
+                )
             }
             SupportState::MediaOnly => {
                 let value = self.values.first();
@@ -258,11 +261,7 @@ fn describe_value(value: &SupportValue) -> String {
             media_phrase(value)
         ),
         (true, false) => format!("图谱说『{}』", value.display),
-        (false, true) => format!(
-            "媒体说『{}』（{}）",
-            value.display,
-            media_phrase(value)
-        ),
+        (false, true) => format!("媒体说『{}』（{}）", value.display, media_phrase(value)),
         (false, false) => format!("『{}』", value.display),
     }
 }

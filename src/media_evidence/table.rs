@@ -43,7 +43,11 @@ impl TableGrid {
         Ok(Self {
             rows: rows
                 .into_iter()
-                .map(|row| row.into_iter().map(|cell| cell.trim().to_string()).collect())
+                .map(|row| {
+                    row.into_iter()
+                        .map(|cell| cell.trim().to_string())
+                        .collect()
+                })
                 .collect(),
             columns,
         })
@@ -105,15 +109,12 @@ impl TableGrid {
     }
 
     /// 键列 + 表头 + 值 → 可核对的事实候选（不自动写入图谱）。
-    pub fn candidate(
-        &self,
-        row: usize,
-        column: usize,
-    ) -> Option<TableFactCandidate> {
+    pub fn candidate(&self, row: usize, column: usize) -> Option<TableFactCandidate> {
         let subject = self.cell(row, 1)?;
         let predicate = self.cell(1, column)?;
         let object = self.cell(row, column)?;
-        if row < 2 || column < 2 || subject.is_empty() || predicate.is_empty() || object.is_empty() {
+        if row < 2 || column < 2 || subject.is_empty() || predicate.is_empty() || object.is_empty()
+        {
             return None;
         }
         Some(TableFactCandidate {

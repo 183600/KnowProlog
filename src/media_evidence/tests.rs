@@ -158,19 +158,13 @@ fn anchors_validate_modality_text_confidence_and_capacity() {
     );
     assert_eq!(
         store
-            .add_anchor(
-                &asset.id,
-                AnchorDraft::new(Locator::Whole, "x", "ocr", 1.5)
-            )
+            .add_anchor(&asset.id, AnchorDraft::new(Locator::Whole, "x", "ocr", 1.5))
             .unwrap_err(),
         MediaError::InvalidConfidence
     );
     assert_eq!(
         store
-            .add_anchor(
-                &asset.id,
-                AnchorDraft::new(Locator::Whole, "x", "  ", 0.5)
-            )
+            .add_anchor(&asset.id, AnchorDraft::new(Locator::Whole, "x", "  ", 0.5))
             .unwrap_err(),
         MediaError::EmptyExtractor
     );
@@ -191,7 +185,13 @@ fn anchors_validate_modality_text_confidence_and_capacity() {
             .with_entities(vec!["姚明".to_string()]),
         )
         .unwrap();
-    assert_eq!(store.anchor(&asset.id, &store.anchors(&asset.id).unwrap()[0].id).unwrap().entities, vec!["姚明"]);
+    assert_eq!(
+        store
+            .anchor(&asset.id, &store.anchors(&asset.id).unwrap()[0].id)
+            .unwrap()
+            .entities,
+        vec!["姚明"]
+    );
 }
 
 #[test]
@@ -244,11 +244,15 @@ fn selector_parses_chinese_deixis_without_hijacking_plain_questions() {
     assert!(MediaSelector::parse("知识图谱里有什么").is_none());
     assert!(MediaSelector::parse("世界上最高的山").is_none());
     assert_eq!(
-        MediaSelector::parse("地图上的北京在哪里").unwrap().modalities,
+        MediaSelector::parse("地图上的北京在哪里")
+            .unwrap()
+            .modalities,
         vec![Modality::Image]
     );
     assert_eq!(
-        MediaSelector::parse("这张照片里的人是谁").unwrap().modalities,
+        MediaSelector::parse("这张照片里的人是谁")
+            .unwrap()
+            .modalities,
         vec![Modality::Image]
     );
     for plain in [
@@ -278,8 +282,18 @@ fn selection_prefers_focus_and_clarifies_ambiguity() {
     let mut store = MediaStore::new(limits());
     let first = image(&mut store, b"first-image");
     let second = image(&mut store, b"second-image");
-    store.add_anchor(&first.id, AnchorDraft::new(Locator::Whole, "第一张", "manual", 1.0)).unwrap();
-    store.add_anchor(&second.id, AnchorDraft::new(Locator::Whole, "第二张", "manual", 1.0)).unwrap();
+    store
+        .add_anchor(
+            &first.id,
+            AnchorDraft::new(Locator::Whole, "第一张", "manual", 1.0),
+        )
+        .unwrap();
+    store
+        .add_anchor(
+            &second.id,
+            AnchorDraft::new(Locator::Whole, "第二张", "manual", 1.0),
+        )
+        .unwrap();
 
     let selector = MediaSelector::parse("图片").unwrap();
     let selection = store.select(&selector, None);
@@ -302,10 +316,7 @@ fn selection_prefers_focus_and_clarifies_ambiguity() {
     assert_eq!(latest.asset().unwrap().id, second.id);
 
     let indexed = MediaSelector::parse("第二张图").unwrap();
-    assert_eq!(
-        store.select(&indexed, None).asset().unwrap().id,
-        second.id
-    );
+    assert_eq!(store.select(&indexed, None).asset().unwrap().id, second.id);
     assert!(matches!(
         store.select(&MediaSelector::parse("第九张图").unwrap(), None),
         MediaSelection::Missing { .. }
@@ -335,10 +346,7 @@ fn table_and_side_locators_select_exact_anchor() {
         )
         .unwrap();
 
-    let table_selection = store.select(
-        &MediaSelector::parse("表格第三行第二列").unwrap(),
-        None,
-    );
+    let table_selection = store.select(&MediaSelector::parse("表格第三行第二列").unwrap(), None);
     assert_eq!(table_selection.anchors(), std::slice::from_ref(&cell));
 
     let side_selection = store.select(&MediaSelector::parse("这张图左边").unwrap(), None);
@@ -378,12 +386,7 @@ fn support_lattice_covers_five_states_and_normalizes_noise() {
     assert_eq!(media_only.state, SupportState::MediaOnly);
     assert!(media_only.render_zh().contains("仅依据你提供的媒体"));
 
-    let text_only = assess_support(
-        "公司",
-        "成立年份",
-        &["1980年".to_string()],
-        &[],
-    );
+    let text_only = assess_support("公司", "成立年份", &["1980年".to_string()], &[]);
     assert_eq!(text_only.state, SupportState::TextOnly);
 
     let conflicted = assess_support(
@@ -460,7 +463,10 @@ fn session_snapshot_has_no_bytes_and_restore_drops_deleted_assets() {
     assert!(dropped[0].render_zh().contains("不可用"));
 
     let mut empty = ContextImage::new();
-    empty.set_section(MEDIA_SECTION, serde_json::json!({"version": 1, "assets": []}));
+    empty.set_section(
+        MEDIA_SECTION,
+        serde_json::json!({"version": 1, "assets": []}),
+    );
     SessionMedia::new(2).install_into(&mut empty).unwrap();
     assert!(empty.section(MEDIA_SECTION).is_none());
 }
@@ -487,10 +493,7 @@ fn stale_generation_after_republish_is_unavailable() {
             actual_sequence: republished.sequence
         }
     );
-    assert_eq!(
-        reference.resolve(&store).unwrap_err().code(),
-        "stale"
-    );
+    assert_eq!(reference.resolve(&store).unwrap_err().code(), "stale");
 }
 
 #[test]
@@ -523,7 +526,11 @@ fn media_turn_grounds_answer_with_citation() {
     );
     assert_eq!(turn.state(), Some(SupportState::Corroborated));
     assert!(turn.response.contains("一致"), "{}", turn.response);
-    assert!(turn.response.contains("表格第 3 行第 2 列"), "{}", turn.response);
+    assert!(
+        turn.response.contains("表格第 3 行第 2 列"),
+        "{}",
+        turn.response
+    );
     assert_eq!(turn.citations().len(), 1);
     assert_eq!(turn.citations()[0].anchor_id, cell.id);
     assert!(turn.focus_updated);
@@ -536,21 +543,20 @@ fn media_turn_clarifies_instead_of_guessing() {
     let first = image(&mut store, b"turn-first");
     let second = image(&mut store, b"turn-second");
     store
-        .add_anchor(&first.id, AnchorDraft::new(Locator::Whole, "第一张图", "manual", 1.0))
+        .add_anchor(
+            &first.id,
+            AnchorDraft::new(Locator::Whole, "第一张图", "manual", 1.0),
+        )
         .unwrap();
     store
-        .add_anchor(&second.id, AnchorDraft::new(Locator::Whole, "第二张图", "manual", 1.0))
+        .add_anchor(
+            &second.id,
+            AnchorDraft::new(Locator::Whole, "第二张图", "manual", 1.0),
+        )
         .unwrap();
     let mut session = SessionMedia::new(4);
     let selector = MediaSelector::parse("图片").unwrap();
-    let turn = ground_media_turn(
-        &selector,
-        &store,
-        &mut session,
-        "人物",
-        "身份",
-        &[],
-    );
+    let turn = ground_media_turn(&selector, &store, &mut session, "人物", "身份", &[]);
     assert_eq!(turn.state(), None);
     assert!(turn.clarification.is_some());
     assert!(turn.response.contains("编号确认"), "{}", turn.response);
@@ -564,25 +570,32 @@ fn media_turn_uses_latest_asset_and_discloses_media_only() {
     let first = image(&mut store, b"turn-latest-first");
     let second = image(&mut store, b"turn-latest-second");
     store
-        .add_anchor(&first.id, AnchorDraft::new(Locator::Whole, "第一张图的内容", "manual", 1.0))
+        .add_anchor(
+            &first.id,
+            AnchorDraft::new(Locator::Whole, "第一张图的内容", "manual", 1.0),
+        )
         .unwrap();
     store
-        .add_anchor(&second.id, AnchorDraft::new(Locator::Whole, "第二张图的内容", "manual", 1.0))
+        .add_anchor(
+            &second.id,
+            AnchorDraft::new(Locator::Whole, "第二张图的内容", "manual", 1.0),
+        )
         .unwrap();
     let mut session = SessionMedia::new(4);
     session.remember(&first).unwrap();
     let selector = MediaSelector::parse("这张图").unwrap();
-    let turn = ground_media_turn(
-        &selector,
-        &store,
-        &mut session,
-        "人物",
-        "身份",
-        &[],
-    );
+    let turn = ground_media_turn(&selector, &store, &mut session, "人物", "身份", &[]);
     assert_eq!(turn.state(), Some(SupportState::MediaOnly));
-    assert!(turn.response.contains("仅依据你提供的媒体"), "{}", turn.response);
-    assert!(turn.response.contains("第二张图的内容"), "{}", turn.response);
+    assert!(
+        turn.response.contains("仅依据你提供的媒体"),
+        "{}",
+        turn.response
+    );
+    assert!(
+        turn.response.contains("第二张图的内容"),
+        "{}",
+        turn.response
+    );
     assert!(turn.focus_updated);
     assert_eq!(session.focus().unwrap().asset_id, second.id);
 }
@@ -616,9 +629,7 @@ fn last_sentence_focus_and_persisted_root() {
         anchor.focus_text(Some(&LocatorHint::Sentence(1))),
         "第一句。"
     );
-    let persisted = temporary
-        .path()
-        .join(format!("{}.bin", audio.content_hash));
+    let persisted = temporary.path().join(format!("{}.bin", audio.content_hash));
     assert_eq!(std::fs::read(&persisted).unwrap(), b"audio-bytes");
 
     std::fs::write(&persisted, b"tampered").unwrap();
@@ -634,10 +645,8 @@ fn last_sentence_focus_and_persisted_root() {
 
 #[test]
 fn table_grid_parses_rectangular_csv_and_builds_candidates() {
-    let grid = TableGrid::parse_csv(
-        "公司，成立年份，总部\n甲公司, 1981 ,北京\n乙公司,1999,上海\n",
-    )
-    .unwrap();
+    let grid = TableGrid::parse_csv("公司，成立年份，总部\n甲公司, 1981 ,北京\n乙公司,1999,上海\n")
+        .unwrap();
     assert_eq!(grid.row_count(), 3);
     assert_eq!(grid.column_count(), 3);
     assert_eq!(grid.headers(), ["公司", "成立年份", "总部"]);
@@ -685,10 +694,8 @@ fn table_grid_rejects_ragged_empty_and_oversized_tables() {
 fn table_ingest_feeds_cell_selection_and_support() {
     let mut store = MediaStore::new(limits());
     let asset = table(&mut store, b"company-grid");
-    let grid = TableGrid::parse_csv(
-        "公司,成立年份,总部\n甲公司,1981,北京\n乙公司,1999,上海\n",
-    )
-    .unwrap();
+    let grid =
+        TableGrid::parse_csv("公司,成立年份,总部\n甲公司,1981,北京\n乙公司,1999,上海\n").unwrap();
     let anchors = store.ingest_table(&asset.id, &grid).unwrap();
     assert_eq!(anchors.len(), 4);
     assert_eq!(anchors[0].entities, vec!["甲公司".to_string()]);
@@ -714,10 +721,8 @@ fn table_ingest_is_atomic_checked_and_modality_aware() {
     custom.max_anchors_per_asset = 2;
     let mut store = MediaStore::new(custom);
     let asset = table(&mut store, b"capacity-grid");
-    let grid = TableGrid::parse_csv(
-        "公司,成立年份,总部\n甲公司,1981,北京\n乙公司,1999,上海\n",
-    )
-    .unwrap();
+    let grid =
+        TableGrid::parse_csv("公司,成立年份,总部\n甲公司,1981,北京\n乙公司,1999,上海\n").unwrap();
     assert_eq!(
         store.ingest_table(&asset.id, &grid).unwrap_err().code(),
         "anchor_capacity_exceeded"

@@ -81,7 +81,11 @@ impl MediaSelection {
     pub fn describe_zh(&self) -> String {
         match self {
             MediaSelection::Selected { asset, anchors } => {
-                format!("已选中 {}，匹配 {} 个锚点", asset.display_zh(), anchors.len())
+                format!(
+                    "已选中 {}，匹配 {} 个锚点",
+                    asset.display_zh(),
+                    anchors.len()
+                )
             }
             MediaSelection::AssetWithoutAnchor { asset, hint } => format!(
                 "已找到 {}，但没有「{}」对应的锚点",
@@ -100,11 +104,7 @@ impl MediaSelection {
 
 impl MediaStore {
     /// 选择资产与锚点。歧义返回编号候选，绝不静默取第一个。
-    pub fn select(
-        &self,
-        selector: &MediaSelector,
-        focus: Option<&AssetRef>,
-    ) -> MediaSelection {
+    pub fn select(&self, selector: &MediaSelector, focus: Option<&AssetRef>) -> MediaSelection {
         let mut candidates: Vec<&super::store::StoredAsset> = self
             .assets
             .values()
@@ -159,14 +159,12 @@ impl MediaStore {
                     None
                 }
             }
-            SelectorOrdinal::Index(position) => u64::try_from(position)
-                .ok()
-                .and_then(|position| {
-                    candidates
-                        .iter()
-                        .copied()
-                        .find(|stored| stored.record.ordinal == position)
-                }),
+            SelectorOrdinal::Index(position) => u64::try_from(position).ok().and_then(|position| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|stored| stored.record.ordinal == position)
+            }),
         };
         let Some(stored) = selected else {
             return MediaSelection::Missing {

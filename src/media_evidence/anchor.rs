@@ -69,11 +69,9 @@ impl Locator {
                 if *width == 0 || *height == 0 {
                     return Err(MediaError::InvalidLocator("图区域宽高必须大于 0"));
                 }
-                if x
-                    .checked_add(*width)
+                if x.checked_add(*width)
                     .is_none_or(|end| end > IMAGE_COORDINATE_SCALE)
-                    || y
-                        .checked_add(*height)
+                    || y.checked_add(*height)
                         .is_none_or(|end| end > IMAGE_COORDINATE_SCALE)
                 {
                     return Err(MediaError::InvalidLocator(
