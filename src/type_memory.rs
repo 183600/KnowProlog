@@ -148,11 +148,36 @@ pub fn answer_in_context(
     memory: &mut TypeDialogueMemory,
     question: &str,
 ) -> Option<TypeAnswer> {
-    if let Some((parsed, _kind)) = parse_details(generator, schema, question) {
+    let normalized = normalize(question);
+    if is_gap_question(&normalized) {
+        let mentioned = known_type_mentions(generator, schema, &normalized)
+            .into_iter()
+            .find(|mention| !generator.is_known_entity(&mention.etype))
+            .map(|mention| mention.etype);
+        let target = match mentioned.as_deref() {
+            Some(etype) => resolve_target(generator, schema, etype),
+            None => memory
+                .focus()
+                .and_then(|focus| resolve_target(generator, schema, &focus.etype)),
+        };
+        if let Some(target) = target {
+            let text = render_gap(generator, &target);
+            if mentioned.is_some() || memory.focus().is_none() {
+                memory.set_focus(TypeFocus::new(target.key.clone(), TypeQuestionKind::Profile));
+            } else {
+                memory.current_mut();
+            }
+            return Some(TypeAnswer {
+                text,
+                focus: Some(target.key),
+            });
+        }
+    }
+
+    if let Some((parsed, _kind)) = parse_details(generator, schema, &normalized) {
         return answer_parsed(generator, schema, memory, parsed);
     }
 
-    let normalized = normalize(question);
     let focus = memory.focus().cloned()?;
 
     if is_continuation(&normalized) {
@@ -561,6 +586,22 @@ fn is_continuation(question: &str) -> bool {
             | "继续列"
             | "继续看"
             | "再说说"
+    )
+}
+
+fn is_gap_question(question: &str) -> bool {
+    has_any(
+        question,
+        &[
+            "缺什么",
+            "缺少",
+            "缺失",
+            "覆盖缺口",
+            "缺口",
+            "哪些没",
+            "还差",
+            "补全",
+        ],
     )
 }
 
@@ -976,6 +1017,74 @@ fn render_supplementary_predicates(
     output.trim_end().to_string()
 }
 
+fn member_has_predicate(generator: &SymbolicGenerator, member: &str, predicate: &str) -> bool {
+    !generator.relation_values(member, predicate).is_empty()
+        || !generator.attribute_values(member, predicate).is_empty()
+}
+
+fn render_gap(generator: &SymbolicGenerator, target: &TypeTarget) -> String {
+    let Some(profile) = profile_for_target(generator, target, PROFILE_CONTINUATION_PREDICATES, 0)
+    else {
+        return empty_profile_text(&target.key);
+    };
+    let total = profile.total_members;
+    let coverage = if total == 0 {
+        0
+    } else {
+        (profile.covered_members * 1000 / total).min(1000)
+    };
+    let mut gaps = Vec::new();
+    for summary in &profile.predicates {
+        if summary.coverage_milli >= 1000 {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for member in &target.members {
+            if !member_has_predicate(generator, member, &summary.predicate) {
+                missing.push(member.clone());
+                if missing.len() >= 3 {
+                    break;
+                }
+            }
+        }
+        if missing.is_empty() {
+            continue;
+        }
+        gaps.push((summary, missing));
+    }
+    let mut output = format!(
+        "类型画像「{}」的覆盖缺口（总体：{}/{} 个成员至少有 1 条事实，{}%）：\n",
+        target.key,
+        profile.covered_members,
+        total,
+        coverage / 10
+    );
+    if gaps.is_empty() {
+        output.push_str(&format!(
+            "  已归纳的 {} 种谓词覆盖全部成员，没有低覆盖缺口。",
+            profile.total_predicates
+        ));
+        return output.trim_end().to_string();
+    }
+    for (index, (summary, missing)) in gaps.iter().take(8).enumerate() {
+        output.push_str(&format!(
+            "  {}. {}（{}）：覆盖 {}/{} 个成员（{}%）；例如：{}",
+            index + 1,
+            summary.label,
+            summary.kind.label(),
+            summary.member_count,
+            total,
+            summary.coverage_milli / 10,
+            missing.join("、")
+        ));
+        output.push('\n');
+    }
+    if gaps.len() > 8 {
+        output.push_str(&format!("  （其余 {} 种低覆盖谓词未展开。）\n", gaps.len() - 8));
+    }
+    output.trim_end().to_string()
+}
+
 fn empty_profile_text(etype: &str) -> String {
     format!("类型画像「{}」：暂无显式成员，还没有可归纳的属性。", etype)
 }
@@ -1195,6 +1304,24 @@ mod tests {
         let answer = answer_with_schema(&generator, Some(&schema), "学生一般有哪些属性")
             .expect("已声明的类型应可诚实回答");
         assert!(answer.text.contains("暂无显式成员"), "{}", answer.text);
+    }
+
+    #[test]
+    fn gap_question_lists_low_coverage_slots_and_missing_members() {
+        let generator = generator();
+        let mut memory = TypeDialogueMemory::new();
+        answer_in_context(&generator, None, &mut memory, "人物一般有哪些属性")
+            .expect("画像应可回答");
+        let gap = answer_in_context(&generator, None, &mut memory, "还缺什么")
+            .expect("缺口问题应可回答");
+        assert!(gap.text.contains("覆盖缺口"), "{}", gap.text);
+        assert!(gap.text.contains("师傅"), "{}", gap.text);
+        assert!(gap.text.contains("李四"), "{}", gap.text);
+        assert_eq!(gap.focus.as_deref(), Some("人物"));
+
+        let explicit = answer_with_schema(&generator, None, "人物哪些属性缺失")
+            .expect("无会话焦点时也可按显式类型回答");
+        assert!(explicit.text.contains("覆盖缺口"), "{}", explicit.text);
     }
 
     #[test]
