@@ -352,7 +352,6 @@
                 } else {
                     None
                 };
-                let synonym_graph = SynonymGraph::from_config(&language_config, 0);
                 let synonym_context = synonym_context_from_reasoner(&symbolic_reasoner);
                 let normalized_words = normalize_words_sense_aware(
                     tagged_words.clone(),

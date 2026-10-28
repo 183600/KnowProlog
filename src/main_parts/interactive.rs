@@ -192,6 +192,30 @@ async fn run_interactive_mode(
         create_default_synonyms()
     };
 
+    // 词义感知同义词图：先恢复跨会话证据，再合并配置资产（实体/谓词画像、
+    // 类型别名、扁平同义词）。墓碑不复活；新增配置证据幂等落图。
+    let mut synonym_graph = match oxigraph_manager.load_synonym_graph().await {
+        Ok(graph) => graph,
+        Err(error) => {
+            eprintln!("读取同义词图失败，按空图启动：{}", error);
+            SynonymGraph::default()
+        }
+    };
+    let configured_synonyms = SynonymGraph::from_config(&config, synonym_graph.turn.max(1));
+    let merged_synonyms = synonym_graph.merge_from(&configured_synonyms);
+    if merged_synonyms > 0 || synonym_graph.turn == 0 {
+        synonym_graph.begin_turn(1);
+        if let Err(error) = oxigraph_manager.sync_synonym_graph(&synonym_graph).await {
+            eprintln!("同义词图落图失败（不影响本轮对话）：{}", error);
+        }
+    }
+    if !synonym_graph.is_empty() {
+        println!(
+            "已恢复同义词图：{} 条（「synonyms」命令查看解析与反向词面）。",
+            synonym_graph.len()
+        );
+    }
+
     // 神经符号对比仲裁器：联想通道（软逻辑+关联+图游走）与符号通道（蕴含+归结）
     // 交叉验证，输出带对冲词的结论，并保留会话级校准记忆
     let mut contrast_arbiter = ContrastArbiter::from_reasoning_config(&config.reasoning);
