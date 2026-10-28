@@ -261,6 +261,47 @@ impl OxigraphManager {
         Ok(lexical_memory::LexicalMemory::from_quads(quads.into_iter()))
     }
 
+    /// 同步同义词图：清空 `kg:graphs/synonym-graph` 后全量重写
+    /// （幂等；不推进知识版本）。词义证据是账本，不是事实。
+    pub async fn sync_synonym_graph(
+        &self,
+        graph: &synonym_graph::SynonymGraph,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = graph.to_quads()?;
+        let graph_name = GraphName::NamedNode(NamedNode::new(
+            synonym_graph::SYNONYM_GRAPH_IRI,
+        )?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph_name.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("synonym_graph_sync");
+        Ok(graph.len())
+    }
+
+    /// 读取同义词图（按条目 id 升序，确定性；不触碰任何缓存）。
+    pub async fn load_synonym_graph(
+        &self,
+    ) -> Result<synonym_graph::SynonymGraph, Box<dyn std::error::Error + Send + Sync>> {
+        let graph_name = GraphName::NamedNode(NamedNode::new(
+            synonym_graph::SYNONYM_GRAPH_IRI,
+        )?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph_name.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("synonym_graph_load");
+        Ok(synonym_graph::SynonymGraph::from_quads(
+            quads.into_iter(),
+        ))
+    }
+
     /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
     ///
     /// 每条派生事实带规则来源、前提、推导轮次、置信度与物化戳

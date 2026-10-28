@@ -1040,3 +1040,49 @@
         assert!(broken.is_err());
         assert_eq!(manager.load_import_episodes().await.unwrap().len(), before);
     }
+
+    /// 同义词图账本：命名图往返一致、幂等重写、不推进知识版本。
+    #[tokio::test]
+    async fn synonym_graph_ledger_roundtrip_is_isolated() {
+        use crate::synonym_graph::{
+            SynonymContext, SynonymGraph, SynonymKind, SynonymSense,
+        };
+
+        let (manager, _dir) = temp_manager().await;
+        let revision = manager.revision();
+        let mut graph = SynonymGraph::new(8);
+        let added = graph.observe(
+            1,
+            "老婆",
+            "妻子",
+            SynonymKind::Entity,
+            SynonymSense::type_only("人物"),
+            "test",
+            1.0,
+        );
+        let id = added.id().expect("应写入条目").to_string();
+        assert!(graph.confirm(&id, 1));
+        assert_eq!(manager.sync_synonym_graph(&graph).await.unwrap(), 1);
+
+        let loaded = manager.load_synonym_graph().await.unwrap();
+        assert_eq!(loaded.fingerprint(), graph.fingerprint());
+        assert_eq!(
+            loaded
+                .canonicalize("老婆", SynonymKind::Entity, &SynonymContext::new())
+                .canonical(),
+            Some("妻子")
+        );
+        assert_eq!(manager.revision(), revision, "账本写入不推进知识版本");
+
+        assert_eq!(manager.sync_synonym_graph(&graph).await.unwrap(), 1);
+        assert_eq!(manager.load_synonym_graph().await.unwrap().len(), 1);
+
+        assert_eq!(
+            manager
+                .sync_synonym_graph(&SynonymGraph::new(8))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(manager.load_synonym_graph().await.unwrap().is_empty());
+    }

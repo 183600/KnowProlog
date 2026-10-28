@@ -1041,6 +1041,12 @@ impl SynonymGraph {
             )?);
             quads.push(literal_quad(
                 &subject,
+                P_SCOPE,
+                &format!("{:?}", entry.scope),
+                &graph,
+            )?);
+            quads.push(literal_quad(
+                &subject,
                 P_CONFIDENCE,
                 &format!("{:.6}", entry.confidence),
                 &graph,
@@ -1053,10 +1059,31 @@ impl SynonymGraph {
             )?);
             quads.push(literal_quad(
                 &subject,
+                P_REFUTATIONS,
+                &entry.refutations.to_string(),
+                &graph,
+            )?);
+            quads.push(literal_quad(
+                &subject,
+                P_FIRST_TURN,
+                &entry.first_turn.to_string(),
+                &graph,
+            )?);
+            quads.push(literal_quad(
+                &subject,
                 P_LAST_TURN,
                 &entry.last_turn.to_string(),
                 &graph,
             )?);
+            if !entry.sources.is_empty() {
+                let sources: Vec<&str> = entry.sources.iter().map(String::as_str).collect();
+                quads.push(literal_quad(
+                    &subject,
+                    P_SOURCES,
+                    &sources.join("\u{1f}"),
+                    &graph,
+                )?);
+            }
             if let Some(type_name) = &entry.sense.type_name {
                 quads.push(literal_quad(&subject, P_SENSE_TYPE, type_name, &graph)?);
             }
