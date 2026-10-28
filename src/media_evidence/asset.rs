@@ -247,6 +247,8 @@ pub enum MediaError {
     EmptyExtractor,
     InvalidConfidence,
     InvalidLocator(&'static str),
+    InvalidTable(&'static str),
+    TableTooLarge { cells: usize, limit: usize },
     LocatorModalityMismatch {
         modality: Modality,
         locator: &'static str,
@@ -274,6 +276,8 @@ impl MediaError {
             MediaError::EmptyExtractor => "empty_extractor",
             MediaError::InvalidConfidence => "invalid_confidence",
             MediaError::InvalidLocator(_) => "invalid_locator",
+            MediaError::InvalidTable(_) => "invalid_table",
+            MediaError::TableTooLarge { .. } => "table_too_large",
             MediaError::LocatorModalityMismatch { .. } => "locator_modality_mismatch",
             MediaError::UnknownAsset(_) => "unknown_asset",
             MediaError::SessionCapacityExceeded { .. } => "session_capacity_exceeded",
@@ -314,6 +318,10 @@ impl fmt::Display for MediaError {
             MediaError::EmptyExtractor => write!(formatter, "抽取器名称不能为空"),
             MediaError::InvalidConfidence => write!(formatter, "置信度必须位于 0..=1"),
             MediaError::InvalidLocator(reason) => write!(formatter, "非法定位符：{}", reason),
+            MediaError::InvalidTable(reason) => write!(formatter, "非法表格：{}", reason),
+            MediaError::TableTooLarge { cells, limit } => {
+                write!(formatter, "表格单元格过多（{} > {}）", cells, limit)
+            }
             MediaError::LocatorModalityMismatch { modality, locator } => write!(
                 formatter,
                 "定位符 {} 不适用于 {} 资产",

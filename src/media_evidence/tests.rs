@@ -603,3 +603,102 @@ fn last_sentence_focus_and_persisted_root() {
         "persisted_hash_mismatch"
     );
 }
+
+#[test]
+fn table_grid_parses_rectangular_csv_and_builds_candidates() {
+    let grid = TableGrid::parse_csv(
+        "公司，成立年份，总部\n甲公司, 1981 ,北京\n乙公司,1999,上海\n",
+    )
+    .unwrap();
+    assert_eq!(grid.row_count(), 3);
+    assert_eq!(grid.column_count(), 3);
+    assert_eq!(grid.headers(), ["公司", "成立年份", "总部"]);
+    assert_eq!(grid.cell(2, 2), Some("1981"));
+    assert_eq!(grid.cell(0, 1), None);
+    assert_eq!(grid.cell(4, 1), None);
+
+    let candidate = grid.candidate(2, 2).unwrap();
+    assert_eq!(candidate.subject, "甲公司");
+    assert_eq!(candidate.predicate, "成立年份");
+    assert_eq!(candidate.object, "1981");
+    assert!(candidate.render_zh().contains("表格第 2 行第 2 列"));
+    assert_eq!(grid.candidates().len(), 4);
+}
+
+#[test]
+fn table_grid_rejects_ragged_empty_and_oversized_tables() {
+    assert_eq!(
+        TableGrid::from_rows(vec![
+            vec!["公司".into(), "年份".into()],
+            vec!["甲公司".into()],
+        ])
+        .unwrap_err()
+        .code(),
+        "invalid_table"
+    );
+    assert_eq!(
+        TableGrid::from_rows(vec![
+            vec!["".into(), "年份".into()],
+            vec!["甲公司".into(), "1981".into()],
+        ])
+        .unwrap_err()
+        .code(),
+        "invalid_table"
+    );
+    let columns = MAX_TABLE_CELLS / 2 + 1;
+    let wide = vec![vec!["表头".to_string(); columns]; 2];
+    assert_eq!(
+        TableGrid::from_rows(wide).unwrap_err().code(),
+        "table_too_large"
+    );
+}
+
+#[test]
+fn table_ingest_feeds_cell_selection_and_support() {
+    let mut store = MediaStore::new(limits());
+    let asset = table(&mut store, b"company-grid");
+    let grid = TableGrid::parse_csv(
+        "公司,成立年份,总部\n甲公司,1981,北京\n乙公司,1999,上海\n",
+    )
+    .unwrap();
+    let anchors = store.ingest_table(&asset.id, &grid).unwrap();
+    assert_eq!(anchors.len(), 4);
+    assert_eq!(anchors[0].entities, vec!["甲公司".to_string()]);
+
+    let selector = MediaSelector::parse("表格第三行第二列").unwrap();
+    let mut session = SessionMedia::new(4);
+    let turn = ground_media_turn(
+        &selector,
+        &store,
+        &mut session,
+        "乙公司",
+        "成立年份",
+        &["1999".to_string()],
+    );
+    assert_eq!(turn.state(), Some(SupportState::Corroborated));
+    assert!(turn.response.contains("1999"), "{}", turn.response);
+    assert_eq!(turn.citations()[0].asset_id, asset.id);
+}
+
+#[test]
+fn table_ingest_is_atomic_checked_and_modality_aware() {
+    let mut custom = limits();
+    custom.max_anchors_per_asset = 2;
+    let mut store = MediaStore::new(custom);
+    let asset = table(&mut store, b"capacity-grid");
+    let grid = TableGrid::parse_csv(
+        "公司,成立年份,总部\n甲公司,1981,北京\n乙公司,1999,上海\n",
+    )
+    .unwrap();
+    assert_eq!(
+        store.ingest_table(&asset.id, &grid).unwrap_err().code(),
+        "anchor_capacity_exceeded"
+    );
+    assert!(store.anchors(&asset.id).unwrap().is_empty());
+
+    let image = image(&mut store, b"not-a-table");
+    assert_eq!(
+        store.ingest_table(&image.id, &grid).unwrap_err().code(),
+        "locator_modality_mismatch"
+    );
+}

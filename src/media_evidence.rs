@@ -25,6 +25,7 @@ mod selector;
 mod session;
 mod store;
 mod support;
+mod table;
 mod turn;
 
 #[cfg(test)]
@@ -37,4 +38,5 @@ pub use selector::*;
 pub use session::*;
 pub use store::*;
 pub use support::*;
+pub use table::*;
 pub use turn::*;
