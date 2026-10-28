@@ -392,6 +392,32 @@
             continue;
         }
 
+        if matches!(input, "意图续体" | "意图澄清" | "待裁决意图" | "pending-intent") {
+            println!("{}", intent_continuation.render_report());
+            println!("（状态文件：{}）", intent_continuation_path);
+            println!();
+            continue;
+        }
+
+        if matches!(
+            input,
+            "放弃意图澄清" | "取消意图澄清" | "清空意图续体" | "clear-pending-intent"
+        ) {
+            match intent_continuation.cancel() {
+                Some(pending) => {
+                    println!("已放弃「{}」的意图澄清。", pending.original_input);
+                    if let Err(error) =
+                        intent_continuation.save_to_path(&intent_continuation_path)
+                    {
+                        eprintln!("意图续体保存失败：{}", error);
+                    }
+                }
+                None => println!("当前没有待裁决意图。"),
+            }
+            println!();
+            continue;
+        }
+
         // 模式匹配解释：对一句话给出胜者、命中榜与落选原因
         if let Some(text) = strip_any_prefix(
             input,
