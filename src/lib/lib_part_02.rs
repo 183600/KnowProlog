@@ -61,6 +61,53 @@ impl JsonldEpisodeReceipt {
     }
 }
 
+/// JSON-LD 匿名节点（没有 `@id` 的对象）的确定性命名作用域。
+///
+/// 文档指纹 + 节点序号 + 节点内容共同决定 IRI：同一文档重复导入得到同一节点，
+/// 不会像随机 UUID 那样破坏幂等；不同文档/不同位置也不会相互碰撞。
+struct JsonLdAnonymousScope {
+    fingerprint: u64,
+    next: std::cell::Cell<usize>,
+}
+
+impl JsonLdAnonymousScope {
+    fn new(document: &Value) -> Self {
+        let text = serde_json::to_string(document).unwrap_or_default();
+        Self {
+            fingerprint: fnv1a64(text.as_bytes()),
+            next: std::cell::Cell::new(0),
+        }
+    }
+
+    fn fresh(
+        &self,
+        obj: &serde_json::Map<String, Value>,
+    ) -> Result<NamedNode, Box<dyn std::error::Error + Send + Sync>> {
+        let index = self.next.get();
+        self.next.set(index.saturating_add(1));
+        let material = serde_json::to_string(obj).unwrap_or_default();
+        let mut hash = self.fingerprint;
+        hash = fnv1a64_update(hash, &index.to_le_bytes());
+        hash = fnv1a64_update(hash, material.as_bytes());
+        Ok(NamedNode::new(crate::identity::entity_uri(
+            BASE_NS,
+            &format!("anon-{:016x}", hash),
+        ))?)
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_update(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 impl OxigraphManager {
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::with_perf_ledger(store_path, Arc::new(perf_ledger::PerfLedger::new()))
@@ -141,8 +188,9 @@ impl OxigraphManager {
     ) -> Result<(Vec<Quad>, JsonldImportStats), Box<dyn std::error::Error + Send + Sync>> {
         let jsonld_value: Value = serde_json::from_str(jsonld_content)?;
         let staging = Store::new()?;
+        let anonymous = JsonLdAnonymousScope::new(&jsonld_value);
         let mut stats = JsonldImportStats::default();
-        self.process_jsonld_simple(&staging, &jsonld_value, &mut stats)
+        self.process_jsonld_simple(&staging, &jsonld_value, &anonymous, &mut stats)
             .await?;
         let quads = staging.iter().collect::<Result<Vec<_>, _>>()?;
         Ok((quads, stats))
@@ -176,6 +224,7 @@ impl OxigraphManager {
         &self,
         store: &Store,
         jsonld: &Value,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 处理直接的 JSON-LD 结构
@@ -184,7 +233,7 @@ impl OxigraphManager {
                 if let Some(obj) = item.as_object() {
                     // 处理每个对象
                     let context = Self::extract_jsonld_context(obj);
-                    self.process_jsonld_object(store, obj, &context, stats)?;
+                    self.process_jsonld_object(store, obj, &context, anonymous, stats)?;
                 }
             }
         } else if let Some(obj) = jsonld.as_object() {
@@ -195,15 +244,15 @@ impl OxigraphManager {
                 if let Some(graph_array) = graph.as_array() {
                     for item in graph_array {
                         if let Some(inner) = item.as_object() {
-                            self.process_jsonld_object(store, inner, &context, stats)?;
+                            self.process_jsonld_object(store, inner, &context, anonymous, stats)?;
                         }
                     }
                 } else if let Some(inner) = graph.as_object() {
-                    self.process_jsonld_object(store, inner, &context, stats)?;
+                    self.process_jsonld_object(store, inner, &context, anonymous, stats)?;
                 }
             } else {
                 // 单个对象
-                self.process_jsonld_object(store, obj, &context, stats)?;
+                self.process_jsonld_object(store, obj, &context, anonymous, stats)?;
             }
         }
         Ok(())
@@ -381,6 +430,7 @@ impl OxigraphManager {
         store: &Store,
         obj: &serde_json::Map<String, Value>,
         context: &JsonLdContext,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 节点级 @context 是作用域上下文：只影响本节点及其嵌套值。
@@ -401,10 +451,10 @@ impl OxigraphManager {
                 return Ok(());
             }
             if let Some(graph) = graph {
-                self.process_jsonld_graph(store, graph, context, stats)?;
+                self.process_jsonld_graph(store, graph, context, anonymous, stats)?;
             }
             if let Some(included) = included {
-                self.process_jsonld_graph(store, included, context, stats)?;
+                self.process_jsonld_graph(store, included, context, anonymous, stats)?;
             }
             return Ok(());
         }
@@ -417,11 +467,7 @@ impl OxigraphManager {
             }
             Self::jsonld_node(id, context)?
         } else {
-            NamedNode::new(crate::identity::entity_uri(
-                BASE_NS,
-                &Uuid::new_v4().to_string(),
-            ))?
-            .into()
+            anonymous.fresh(obj)?.into()
         };
         stats.entities += 1;
 
@@ -467,12 +513,12 @@ impl OxigraphManager {
             if let Some(value_array) = value.as_array() {
                 for val in value_array {
                     self.process_property_value(
-                        store, &subject, &predicate, val, coercion, context, stats,
+                        store, &subject, &predicate, val, coercion, context, anonymous, stats,
                     )?;
                 }
             } else {
                 self.process_property_value(
-                    store, &subject, &predicate, value, coercion, context, stats,
+                    store, &subject, &predicate, value, coercion, context, anonymous, stats,
                 )?;
             }
         }
@@ -488,12 +534,12 @@ impl OxigraphManager {
                 if let Some(value_array) = value.as_array() {
                     for val in value_array {
                         self.process_reverse_value(
-                            store, &subject, &predicate, val, coercion, context, stats,
+                            store, &subject, &predicate, val, coercion, context, anonymous, stats,
                         )?;
                     }
                 } else {
                     self.process_reverse_value(
-                        store, &subject, &predicate, value, coercion, context, stats,
+                        store, &subject, &predicate, value, coercion, context, anonymous, stats,
                     )?;
                 }
             }
@@ -502,10 +548,10 @@ impl OxigraphManager {
         // 带 @id/属性的节点也可以顺带承载命名图或 @included 节点；
         // 知识库只使用默认图，这里把其内容展开到默认图而不是丢弃。
         if let Some(graph) = obj.get("@graph") {
-            self.process_jsonld_graph(store, graph, context, stats)?;
+            self.process_jsonld_graph(store, graph, context, anonymous, stats)?;
         }
         if let Some(included) = obj.get("@included") {
-            self.process_jsonld_graph(store, included, context, stats)?;
+            self.process_jsonld_graph(store, included, context, anonymous, stats)?;
         }
 
         Ok(())
@@ -517,17 +563,18 @@ impl OxigraphManager {
         store: &Store,
         value: &Value,
         context: &JsonLdContext,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match value {
             Value::Array(items) => {
                 for item in items {
                     if let Some(obj) = item.as_object() {
-                        self.process_jsonld_object(store, obj, context, stats)?;
+                        self.process_jsonld_object(store, obj, context, anonymous, stats)?;
                     }
                 }
             }
-            Value::Object(obj) => self.process_jsonld_object(store, obj, context, stats)?,
+            Value::Object(obj) => self.process_jsonld_object(store, obj, context, anonymous, stats)?,
             _ => {}
         }
         Ok(())
@@ -542,6 +589,7 @@ impl OxigraphManager {
         value: &Value,
         coercion: Option<NodeReferenceCoercion>,
         context: &JsonLdContext,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let Some(obj) = value.as_object() else {
@@ -573,7 +621,7 @@ impl OxigraphManager {
         stats.relations += 1;
         // 带额外属性的反向节点本身也是节点（与正向嵌套对象一致）。
         if obj.keys().any(|key| key != "@id" && key != "@context") {
-            self.process_jsonld_object(store, obj, context, stats)?;
+            self.process_jsonld_object(store, obj, context, anonymous, stats)?;
         }
         Ok(())
     }
@@ -586,6 +634,7 @@ impl OxigraphManager {
         value: &Value,
         coercion: Option<NodeReferenceCoercion>,
         context: &JsonLdContext,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match value {
@@ -626,12 +675,13 @@ impl OxigraphManager {
                     if let Some(items) = set.as_array() {
                         for item in items {
                             self.process_property_value(
-                                store, subject, predicate, item, coercion, context, stats,
+                                store, subject, predicate, item, coercion, context, anonymous,
+                                stats,
                             )?;
                         }
                     } else {
                         self.process_property_value(
-                            store, subject, predicate, set, coercion, context, stats,
+                            store, subject, predicate, set, coercion, context, anonymous, stats,
                         )?;
                     }
                     return Ok(());
@@ -643,7 +693,7 @@ impl OxigraphManager {
                         other => vec![other.clone()],
                     };
                     self.process_jsonld_list(
-                        store, subject, predicate, &items, coercion, context, stats,
+                        store, subject, predicate, &items, coercion, context, anonymous, stats,
                     )?;
                     return Ok(());
                 }
@@ -662,7 +712,7 @@ impl OxigraphManager {
                         // 嵌套对象除 @id 外还带类型/属性时，它本身也是一个节点
                         // （JSON-LD 展开语义），继续落库而不是丢掉这些描述。
                         if obj.keys().any(|key| key != "@id" && key != "@context") {
-                            self.process_jsonld_object(store, obj, context, stats)?;
+                            self.process_jsonld_object(store, obj, context, anonymous, stats)?;
                         }
                     }
                 } else if let Some(val) = obj.get("@value") {
@@ -730,6 +780,7 @@ impl OxigraphManager {
         items: &[Value],
         coercion: Option<NodeReferenceCoercion>,
         context: &JsonLdContext,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // JSON-LD 规定 null 不产生 RDF 项：先剔除，避免把「空位」编码进链表。
@@ -774,7 +825,9 @@ impl OxigraphManager {
         ))?;
         for (index, cell) in cells.iter().enumerate() {
             let item =
-                self.process_jsonld_list_item(store, &items[index], coercion, context, stats)?;
+                self.process_jsonld_list_item(
+                    store, &items[index], coercion, context, anonymous, stats,
+                )?;
             store.insert(&Quad::new(
                 cell.clone(),
                 rdf_first.clone(),
@@ -802,6 +855,7 @@ impl OxigraphManager {
         item: &Value,
         coercion: Option<NodeReferenceCoercion>,
         context: &JsonLdContext,
+        anonymous: &JsonLdAnonymousScope,
         stats: &mut JsonldImportStats,
     ) -> Result<Term, Box<dyn std::error::Error + Send + Sync>> {
         match item {
@@ -823,7 +877,7 @@ impl OxigraphManager {
                     let node = Self::jsonld_node(id, context)?;
                     // 带描述的对象同时作为独立节点落库。
                     if obj.keys().any(|key| key != "@id" && key != "@context") {
-                        self.process_jsonld_object(store, obj, context, stats)?;
+                        self.process_jsonld_object(store, obj, context, anonymous, stats)?;
                     }
                     return Ok(node.into());
                 }

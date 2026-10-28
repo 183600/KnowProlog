@@ -1739,6 +1739,37 @@
         );
     }
 
+    /// 没有 @id 的 JSON-LD 节点必须确定性命名：重复导入同一文档保持幂等。
+    #[tokio::test]
+    async fn import_jsonld_anonymous_nodes_are_deterministic() {
+        let (manager, _dir) = temp_manager().await;
+        let jsonld = r#"{
+            "@context": {
+                "name": "http://example.org/kg/name",
+                "Person": "http://example.org/kg/Person"
+            },
+            "@graph": [
+                { "@type": "Person", "name": "匿名甲" },
+                { "@type": "Person", "name": "匿名乙" }
+            ]
+        }"#;
+        let first = manager.import_jsonld_batch(jsonld, "anon.jsonld").await.unwrap();
+        assert_eq!(first.stats.triples, 4);
+        assert_eq!(first.episode.total, 4);
+        let replay = manager
+            .import_jsonld_batch(jsonld, "anon.jsonld")
+            .await
+            .unwrap();
+        assert_eq!(replay.stats.triples, 0, "匿名节点不得因随机命名而重复新增");
+        assert!(!replay.recorded);
+        assert_eq!(replay.episode.id, first.episode.id);
+        assert_eq!(
+            manager.load_import_episodes().await.unwrap().len(),
+            1,
+            "同内容匿名节点文档只应记一个批次"
+        );
+    }
+
     /// 普通 JSON-LD 导入保持原统计口径，且暂存失败不写入半批三元组。
     #[tokio::test]
     async fn import_jsonld_stages_before_writing() {
