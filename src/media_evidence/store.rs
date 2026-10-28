@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -190,6 +192,46 @@ impl MediaStore {
             },
         );
         Ok(record)
+    }
+
+    /// 从文件发布资产：先看文件长度，再最多读 `max_asset_bytes + 1`，
+    /// 避免超大文件先被完整读入内存；同字节内容仍然幂等归并。
+    pub fn publish_file(
+        &mut self,
+        modality: Modality,
+        media_type: &str,
+        label: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<AssetRecord, MediaError> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|error| MediaError::Io(error.to_string()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(MediaError::Io("媒体源不是常规文件".to_string()));
+        }
+        let declared = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if declared > self.limits.max_asset_bytes {
+            return Err(MediaError::AssetTooLarge {
+                actual: declared,
+                limit: self.limits.max_asset_bytes,
+            });
+        }
+        let cap = u64::try_from(self.limits.max_asset_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::new();
+        file.take(cap)
+            .read_to_end(&mut bytes)
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        if bytes.len() > self.limits.max_asset_bytes {
+            return Err(MediaError::AssetTooLarge {
+                actual: bytes.len(),
+                limit: self.limits.max_asset_bytes,
+            });
+        }
+        self.publish(modality, media_type, label, &bytes)
     }
 
     /// 追加锚点；定位符必须与资产模态相容，文本与数量受硬上限约束。

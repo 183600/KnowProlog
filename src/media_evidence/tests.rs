@@ -816,3 +816,52 @@ fn labels_and_ordinals_are_per_modality_without_shift_after_deletion() {
         MediaSelection::Missing { .. }
     ));
 }
+
+#[test]
+fn publish_file_is_bounded_idempotent_and_directory_safe() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("photo.bin");
+    std::fs::write(&path, b"file-bytes").unwrap();
+    let mut store = MediaStore::new(limits());
+    let asset = store
+        .publish_file(Modality::Image, "image/png", "", &path)
+        .unwrap();
+    assert_eq!(asset.label, "图片 1");
+    assert_eq!(store.bytes(&asset.id).unwrap(), b"file-bytes");
+    let again = store
+        .publish_file(Modality::Image, "image/png", "", &path)
+        .unwrap();
+    assert_eq!(again.id, asset.id);
+    assert_eq!(store.len(), 1);
+
+    let oversized = temporary.path().join("oversized.bin");
+    std::fs::write(&oversized, vec![0u8; 65]).unwrap();
+    assert_eq!(
+        store
+            .publish_file(Modality::Image, "image/png", "", &oversized)
+            .unwrap_err()
+            .code(),
+        "asset_too_large"
+    );
+    assert_eq!(store.len(), 1);
+
+    assert_eq!(
+        store
+            .publish_file(Modality::Image, "image/png", "", temporary.path())
+            .unwrap_err()
+            .code(),
+        "io"
+    );
+    assert_eq!(
+        store
+            .publish_file(
+                Modality::Image,
+                "image/png",
+                "",
+                temporary.path().join("missing.bin"),
+            )
+            .unwrap_err()
+            .code(),
+        "io"
+    );
+}
