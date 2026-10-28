@@ -937,8 +937,8 @@ pub fn apply_lesson(program: &mut ProblogEngine, lesson: &ChineseLesson) {
         }
         LessonKind::ConditionalRule | LessonKind::CausalRule => {
             program.add_rule(
-                lesson.head.clone(),
-                lesson.body.clone(),
+                generalize_atom(&lesson.head),
+                lesson.body.iter().map(generalize_atom).collect(),
                 lesson.probability,
                 &lesson.source,
             );
@@ -1210,6 +1210,13 @@ mod tests {
 
         let error = parse_lesson("没有鸟会飞").unwrap_err();
         assert!(error.contains("否定量词"), "{}", error);
+
+        let mut program = ProblogEngine::new(6, 8);
+        apply_lesson(&mut program, &lesson);
+        program.add_deterministic_fact(Atom::rel("是", "麻雀", "鸟"));
+        let query = program.query(&Atom::unary("会飞", Term::constant("麻雀")), 3, 0.0);
+        assert_eq!(query.answers.len(), 1, "{:?}", query);
+        assert!((query.answers[0].probability - 1.0).abs() < 1e-9);
     }
 
     #[test]
