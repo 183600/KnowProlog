@@ -906,6 +906,71 @@ fn parse_ordinal_batch(text: &str) -> Option<usize> {
             return parse_chinese_number(&number).filter(|seq| *seq > 0);
         }
     }
+    // 「批次2」「批 2」等省掉「第」的写法。
+    for marker in ["批次", "批"] {
+        let Some((_, rest)) = text.split_once(marker) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let digits: String = rest
+            .chars()
+            .take_while(|ch| is_numeral_char(*ch))
+            .collect();
+        if !digits.is_empty() {
+            return parse_chinese_number(&digits).filter(|seq| *seq > 0);
+        }
+    }
+    None
+}
+
+fn is_compact_batch_boundary(ch: Option<char>) -> bool {
+    match ch {
+        None => true,
+        Some(ch) => {
+            !ch.is_ascii_alphanumeric() && !matches!(ch, '/' | '\\' | '_' | '-' | '.')
+        }
+    }
+}
+
+/// 解析 `B2` / `b2` / `batch2` 这类紧凑批次号；文件名（`B2.ttl`）不算。
+fn parse_compact_batch(text: &str) -> Option<usize> {
+    let chars: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    for index in 0..chars.len() {
+        let previous = if index == 0 {
+            None
+        } else {
+            Some(chars[index - 1])
+        };
+        if !is_compact_batch_boundary(previous) || chars[index] != 'b' {
+            continue;
+        }
+        let mut cursor = if chars.get(index + 1) == Some(&'a')
+            && chars.get(index + 2) == Some(&'t')
+            && chars.get(index + 3) == Some(&'c')
+            && chars.get(index + 4) == Some(&'h')
+        {
+            index + 5
+        } else {
+            index + 1
+        };
+        let start = cursor;
+        while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == start {
+            continue;
+        }
+        let next = chars.get(cursor).copied();
+        if !is_compact_batch_boundary(next) {
+            continue;
+        }
+        let digits: String = chars[start..cursor].iter().collect();
+        if let Ok(seq) = digits.parse::<usize>() {
+            if seq > 0 {
+                return Some(seq);
+            }
+        }
+    }
     None
 }
 
@@ -936,6 +1001,7 @@ pub fn parse_episode_reference(text: &str) -> Option<EpisodeReference> {
         || trimmed.contains("上一次导入")
         || trimmed.contains("上一份导入")
         || trimmed.contains("前一批")
+        || trimmed.contains("上个批次")
     {
         return Some(EpisodeReference::Previous);
     }
@@ -943,21 +1009,33 @@ pub fn parse_episode_reference(text: &str) -> Option<EpisodeReference> {
         || trimmed.contains("本批")
         || trimmed.contains("这一批")
         || trimmed.contains("最近一批")
+        || trimmed.contains("最新一批")
+        || trimmed.contains("最新批次")
+        || trimmed.contains("最后一个批次")
+        || trimmed.contains("最后一批")
         || trimmed.contains("最近那次导入")
+        || trimmed.contains("最近一次导入")
         || trimmed.contains("刚才那批")
         || trimmed.contains("刚才的导入")
         || trimmed.contains("刚才导入")
     {
         return Some(EpisodeReference::Latest);
     }
-    if let Some(seq) = parse_ordinal_batch(trimmed).or_else(|| parse_english_ordinal(trimmed)) {
+    if let Some(seq) = parse_ordinal_batch(trimmed)
+        .or_else(|| parse_english_ordinal(trimmed))
+        .or_else(|| parse_compact_batch(trimmed))
+    {
         return Some(EpisodeReference::Ordinal(seq));
     }
     if let Some(rest) = trimmed
         .split_once("批次id：")
         .or_else(|| trimmed.split_once("批次id:"))
+        .or_else(|| trimmed.split_once("批次 id："))
+        .or_else(|| trimmed.split_once("批次 id:"))
         .or_else(|| trimmed.split_once("batch id:"))
         .or_else(|| trimmed.split_once("batch id："))
+        .or_else(|| trimmed.split_once("batchid:"))
+        .or_else(|| trimmed.split_once("batchid："))
     {
         let id = rest.1.trim().split_whitespace().next().unwrap_or("");
         if !id.is_empty() {
@@ -1605,6 +1683,32 @@ mod tests {
         assert_eq!(
             parse_episode_reference("batch 2 summary"),
             Some(EpisodeReference::Ordinal(2))
+        );
+        assert_eq!(
+            parse_episode_reference("batch2"),
+            Some(EpisodeReference::Ordinal(2))
+        );
+        assert_eq!(
+            parse_episode_reference("B2 讲了什么"),
+            Some(EpisodeReference::Ordinal(2))
+        );
+        assert_eq!(
+            parse_episode_reference("批次2"),
+            Some(EpisodeReference::Ordinal(2))
+        );
+        assert_eq!(
+            parse_episode_reference("最新一批"),
+            Some(EpisodeReference::Latest)
+        );
+        assert_eq!(
+            parse_episode_reference("上个批次"),
+            Some(EpisodeReference::Previous)
+        );
+        assert_eq!(parse_episode_reference("B2.ttl 讲了什么"), None);
+        assert_eq!(
+            resolve_episode_reference("B2.ttl 讲了什么", &episodes),
+            None,
+            "文件名里的 B2 不应被当成批次号"
         );
         assert_eq!(
             resolve_episode_reference("上一批", &episodes).map(|item| item.seq),
