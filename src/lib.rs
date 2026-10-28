@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use oxigraph::model::*;
 use oxigraph::sparql::{Query, QueryResults};
 use oxigraph::store::Store;

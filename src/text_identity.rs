@@ -172,9 +172,15 @@ impl Utf8StreamDecoder {
             }
             Err(error) => {
                 let valid = error.valid_up_to();
-                let emitted = unsafe {
-                    // SAFETY：`valid_up_to` 之前的前缀已由 `from_utf8` 校验。
-                    std::str::from_utf8_unchecked(&self.pending[..valid]).to_string()
+                let emitted = match std::str::from_utf8(&self.pending[..valid]) {
+                    Ok(prefix) => prefix.to_string(),
+                    Err(_) => {
+                        let offset = self.consumed;
+                        self.pending.clear();
+                        let failure = Utf8DecodeError::invalid(offset, valid.max(1));
+                        self.poisoned = Some(failure);
+                        return Err(failure);
+                    }
                 };
                 match error.error_len() {
                     Some(len) => {
