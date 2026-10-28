@@ -286,7 +286,13 @@ fn answer_parsed(
         }
         TypeQuestion::Count { etype } => {
             let target = resolve_target(generator, schema, &etype)?;
-            let classifier = question.and_then(crate::quantifier::requested_classifier);
+            let classifier = question
+                .and_then(crate::quantifier::requested_classifier)
+                .or_else(|| {
+                    let choice = crate::quantifier::classifier_for_type(&target.key);
+                    (choice.source == crate::quantifier::ClassifierSource::Schema)
+                        .then_some(choice.classifier)
+                });
             let text = render_type_count(&target, classifier.as_deref());
             // 计数后把焦点留在成员表上：「他们是谁 / 还有呢」直接列出成员，
             // 不需要用户再重复类型名。
@@ -1517,6 +1523,8 @@ mod tests {
         );
         let named = answer(&generator, "人物有多少名").expect("句尾量词也应保留");
         assert!(named.text.contains("共有 2 名已知成员"), "{}", named.text);
+        let typed = answer(&generator, "人物有多少").expect("未写量词时按类型选量词");
+        assert!(typed.text.contains("共有 2 位已知成员"), "{}", typed.text);
     }
 
     #[test]
