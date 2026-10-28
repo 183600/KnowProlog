@@ -1576,6 +1576,7 @@
             .answer("张三教过的学生有多少")
             .expect("关系从句计数问句");
         assert!(relative_count.contains("共有 2 个"), "{}", relative_count);
+        assert!(!relative_count.contains("类型「学生」"), "{}", relative_count);
         let measured = reasoner
             .answer("张三教过多少位学生")
             .expect("带量词的关系计数问句");

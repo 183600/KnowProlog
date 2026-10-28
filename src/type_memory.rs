@@ -583,6 +583,12 @@ fn parse_details(
         return None;
     }
     if count_intent {
+        // 「张三教过的学生有多少」问的是关系取值数，不是类型成员数：
+        // 计数词前的短语含「的」时交给关系/闭包路径，避免把从属短语里的
+        // 类型词劫持成全局类型计数。
+        if count_prefix(&question).is_some_and(|prefix| prefix.contains('的')) {
+            return None;
+        }
         if let Some(remainder) = count_remainder(&question) {
             let stripped = strip_count_tail(remainder);
             // 只有量词/语气词（「人物有多少个」）或余下部分本身解析成类型
@@ -733,6 +739,13 @@ fn count_remainder(question: &str) -> Option<&str> {
     COUNT_CUES
         .iter()
         .find_map(|cue| question.split_once(cue).map(|(_, rest)| rest.trim()))
+}
+
+/// 计数词之前的短语；用于区分「人物有多少」与「张三教过的学生有多少」。
+fn count_prefix(question: &str) -> Option<&str> {
+    COUNT_CUES
+        .iter()
+        .find_map(|cue| question.split_once(cue).map(|(prefix, _)| prefix.trim()))
 }
 
 /// 去掉计数尾部的量词与语气词；返回空串表示「有多少个」这类裸计数。
