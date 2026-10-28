@@ -211,6 +211,9 @@ impl MediaStore {
             });
         }
         draft.locator.validate_for(modality)?;
+        if draft.text.trim().is_empty() {
+            return Err(MediaError::EmptyAnchorText);
+        }
         let text_len = draft.text.chars().count();
         if text_len > self.limits.max_anchor_text_chars {
             return Err(MediaError::AnchorTextTooLong {

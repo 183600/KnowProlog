@@ -158,6 +158,15 @@ fn anchors_validate_modality_text_confidence_and_capacity() {
     );
     assert_eq!(
         store
+            .add_anchor(
+                &asset.id,
+                AnchorDraft::new(Locator::Whole, "  ", "ocr", 0.5)
+            )
+            .unwrap_err(),
+        MediaError::EmptyAnchorText
+    );
+    assert_eq!(
+        store
             .add_anchor(&asset.id, AnchorDraft::new(Locator::Whole, "x", "ocr", 1.5))
             .unwrap_err(),
         MediaError::InvalidConfidence

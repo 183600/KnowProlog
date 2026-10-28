@@ -267,6 +267,7 @@ pub enum MediaError {
     AnchorCapacityExceeded {
         limit: usize,
     },
+    EmptyAnchorText,
     AnchorTextTooLong {
         actual: usize,
         limit: usize,
@@ -321,6 +322,7 @@ impl MediaError {
             MediaError::TotalBytesExceeded { .. } => "total_bytes_exceeded",
             MediaError::AssetCapacityExceeded { .. } => "asset_capacity_exceeded",
             MediaError::AnchorCapacityExceeded { .. } => "anchor_capacity_exceeded",
+            MediaError::EmptyAnchorText => "empty_anchor_text",
             MediaError::AnchorTextTooLong { .. } => "anchor_text_too_long",
             MediaError::EmptyExtractor => "empty_extractor",
             MediaError::ExtractorTooLong { .. } => "extractor_too_long",
@@ -364,6 +366,8 @@ impl fmt::Display for MediaError {
             MediaError::AnchorCapacityExceeded { limit } => {
                 write!(formatter, "锚点数量已达上限 {}", limit)
             }
+            MediaError::EmptyAnchorText => write!(formatter, "锚点文本不能为空"),
+            MediaError::EmptyAnchorText => write!(formatter, "锚点文本不能为空"),
             MediaError::AnchorTextTooLong { actual, limit } => {
                 write!(formatter, "锚点文本过长（{} > {} 字符）", actual, limit)
             }
