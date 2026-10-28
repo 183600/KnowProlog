@@ -21,12 +21,6 @@
             match import_result {
                 Ok(receipt) => {
                     println!("JSON-LD 导入成功：{}", receipt.summary());
-                    println!(
-                        "批次 B{}｜id {}｜批次图 {}",
-                        receipt.episode.seq,
-                        receipt.episode.id,
-                        receipt.episode.batch_graph
-                    );
                     if receipt.episode.blank_nodes {
                         println!(
                             "注意：本批含空白节点；同一文档重复导入可能得到不同批次 id。"
@@ -54,12 +48,6 @@
             {
                 Ok(receipt) => {
                     println!("JSON-LD 内容导入成功：{}", receipt.summary());
-                    println!(
-                        "批次 B{}｜id {}｜批次图 {}",
-                        receipt.episode.seq,
-                        receipt.episode.id,
-                        receipt.episode.batch_graph
-                    );
                     if receipt.episode.blank_nodes {
                         println!(
                             "注意：本批含空白节点；同一内容重复导入可能得到不同批次 id。"
