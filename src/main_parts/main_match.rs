@@ -488,6 +488,38 @@
             )
             .await;
         }
+        Some(Commands::Synonyms {
+            surface,
+            canonical,
+            kind,
+            expected_type,
+            predicate,
+            domain,
+            range,
+            echo,
+            confirm,
+            refute,
+            seed_config,
+            json,
+        }) => {
+            run_synonyms(
+                &config,
+                &oxigraph_manager,
+                surface,
+                canonical,
+                &kind,
+                expected_type,
+                predicate,
+                domain,
+                range,
+                &echo,
+                confirm,
+                refute,
+                seed_config,
+                json,
+            )
+            .await;
+        }
         Some(Commands::Segment {
             text,
             context,

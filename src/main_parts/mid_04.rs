@@ -392,6 +392,260 @@ async fn ask_with_lens(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_synonyms(
+    config: &SystemConfig,
+    oxigraph_manager: &OxigraphManager,
+    surface: Option<String>,
+    canonical: Option<String>,
+    kind: &str,
+    expected_type: Option<String>,
+    predicate: Option<String>,
+    domain: Option<String>,
+    range: Option<String>,
+    echoes: &[String],
+    confirm: bool,
+    refute: bool,
+    seed_config: bool,
+    json: bool,
+) {
+    let Some(kind) = SynonymKind::parse(kind) else {
+        eprintln!("未知同义层级「{}」：可用 entity / predicate / type。", kind);
+        std::process::exit(2);
+    };
+    if confirm && refute {
+        eprintln!("--confirm 与 --refute 不能同时使用。");
+        std::process::exit(2);
+    }
+    let mut graph = match oxigraph_manager.load_synonym_graph().await {
+        Ok(graph) => graph,
+        Err(error) => {
+            eprintln!("读取同义词图失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let turn = graph.turn.max(1);
+    if seed_config {
+        let configured = SynonymGraph::from_config(config, turn);
+        graph.merge_from(&configured);
+    }
+    let mut context = SynonymContext::new();
+    if let Some(expected_type) = expected_type.as_deref() {
+        context = context.with_expected_type(expected_type);
+    }
+    if let Some(predicate) = predicate.as_deref() {
+        context = context.with_predicate(predicate);
+    }
+    if let Some(domain) = domain.as_deref() {
+        context = context.with_domain(domain);
+    }
+    if let Some(range) = range.as_deref() {
+        context = context.with_range(range);
+    }
+    let sense = SynonymSense::new(
+        expected_type.as_deref(),
+        domain.as_deref().or(predicate.as_deref()),
+        range.as_deref(),
+    );
+
+    let persist = seed_config;
+    if confirm || refute {
+        let Some(surface) = surface.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            eprintln!("--confirm/--refute 需要 --surface。");
+            std::process::exit(2);
+        };
+        let Some(canonical) = canonical
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            eprintln!("--confirm/--refute 需要 --canonical。");
+            std::process::exit(2);
+        };
+        let existing = graph
+            .entries()
+            .find(|entry| {
+                entry.surface == surface && entry.canonical == canonical && entry.kind == kind
+            })
+            .map(|entry| entry.id.clone());
+        if refute {
+            let Some(id) = existing else {
+                eprintln!(
+                    "同义词图中没有「{}」→「{}」（{}），无法否证。",
+                    surface,
+                    canonical,
+                    kind.label()
+                );
+                std::process::exit(1);
+            };
+            graph.refute(&id, turn, Some("CLI 显式否证"));
+            if let Err(error) = oxigraph_manager.sync_synonym_graph(&graph).await {
+                eprintln!("写入同义词图失败: {}", error);
+                std::process::exit(1);
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "action": "refute",
+                        "id": id,
+                        "surface": surface,
+                        "canonical": canonical,
+                        "kind": kind,
+                    })
+                );
+            } else {
+                println!("已否证「{}」→「{}」（{}）。", surface, canonical, kind.label());
+            }
+            return;
+        }
+        let id = match existing {
+            Some(id) => {
+                graph.confirm(&id, turn);
+                id
+            }
+            None => {
+                let outcome = graph.observe(
+                    turn,
+                    surface,
+                    canonical,
+                    kind,
+                    sense,
+                    "cli",
+                    1.0,
+                );
+                let Some(id) = outcome.id().map(str::to_string) else {
+                    eprintln!("无法登记「{}」→「{}」：词面或规范名为空/过长。", surface, canonical);
+                    std::process::exit(1);
+                };
+                graph.confirm(&id, turn);
+                id
+            }
+        };
+        if let Err(error) = oxigraph_manager.sync_synonym_graph(&graph).await {
+            eprintln!("写入同义词图失败: {}", error);
+            std::process::exit(1);
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "action": "confirm",
+                    "id": id,
+                    "surface": surface,
+                    "canonical": canonical,
+                    "kind": kind,
+                })
+            );
+        } else {
+            println!("已确认「{}」→「{}」（{}）。", surface, canonical, kind.label());
+        }
+        return;
+    }
+
+    if let Some(surface) = surface.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let resolution = graph.canonicalize(surface, kind, &context);
+        if json {
+            match serde_json::to_string_pretty(&resolution) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("同义解析序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            match &resolution {
+                SynonymResolution::Resolved(reading) => {
+                    if reading.changes_surface() {
+                        println!(
+                            "「{}」→「{}」（{}）",
+                            reading.surface,
+                            reading.canonical,
+                            reading.reason
+                        );
+                    } else {
+                        println!(
+                            "「{}」保持原词面（{}，词义 {}）",
+                            reading.surface,
+                            reading.reason,
+                            reading.sense.label()
+                        );
+                    }
+                }
+                SynonymResolution::Ambiguous {
+                    surface,
+                    candidates,
+                    ..
+                } => {
+                    println!("「{}」有多个词义，保持原词面：", surface);
+                    for candidate in candidates {
+                        println!(
+                            "  - 「{}」{}（{}，得分 {:.2}）",
+                            candidate.canonical,
+                            candidate.kind.label(),
+                            candidate.sense.label(),
+                            candidate.score
+                        );
+                    }
+                }
+                SynonymResolution::Unresolved {
+                    surface, reason, ..
+                } => {
+                    println!("「{}」不改写：{}。", surface, reason.label());
+                }
+            }
+        }
+    } else if let Some(canonical) = canonical
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let choice = graph.surface_for(canonical, kind, &context, echoes);
+        if json {
+            match serde_json::to_string_pretty(&choice) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("反向词面序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!(
+                "「{}」→「{}」（{}，{}）",
+                choice.canonical,
+                choice.surface,
+                choice.source,
+                if choice.reversible {
+                    "可逆"
+                } else {
+                    "不可逆"
+                }
+            );
+        }
+    } else {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "turn": graph.turn,
+                    "capacity": graph.capacity,
+                    "entries": graph.entries().collect::<Vec<_>>(),
+                    "conflicts": graph.conflicts(),
+                    "fingerprint": graph.fingerprint(),
+                })
+            );
+        } else {
+            print!("{}", graph.render_report());
+        }
+    }
+    if persist {
+        if let Err(error) = oxigraph_manager.sync_synonym_graph(&graph).await {
+            eprintln!("写入同义词图失败: {}", error);
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn run_types(
     config: &SystemConfig,
     oxigraph_manager: &OxigraphManager,

@@ -119,6 +119,7 @@ use know_prolog::{
     startup_ledger::StartupLedger,
     symbolic_generator::SymbolicGenerator,
     symbolic_reasoner::{FormalClarificationOutcome, LanguagePolicySync, SymbolicReasoner},
+    synonym_graph::{SynonymContext, SynonymGraph, SynonymKind, SynonymResolution, SynonymSense},
     teachable_assertion::{TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
@@ -394,6 +395,46 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Print the profile/page/comparison as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or extend the sense-aware synonym graph; resolve a surface or
+    /// realize a canonical name with a reversible user-facing surface
+    Synonyms {
+        /// Surface to resolve (surface -> canonical)
+        #[arg(long)]
+        surface: Option<String>,
+        /// Canonical name to realize back to a user-facing surface
+        #[arg(long)]
+        canonical: Option<String>,
+        /// Synonym layer: entity / predicate / type
+        #[arg(long, default_value = "entity")]
+        kind: String,
+        /// Expected type used as a sense constraint
+        #[arg(long = "type")]
+        expected_type: Option<String>,
+        /// Predicate used as a domain/range context
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Explicit domain constraint
+        #[arg(long)]
+        domain: Option<String>,
+        /// Explicit range constraint
+        #[arg(long)]
+        range: Option<String>,
+        /// Session echo surface for reverse generation (repeatable)
+        #[arg(long = "echo")]
+        echo: Vec<String>,
+        /// Confirm SURFACE -> CANONICAL in the graph
+        #[arg(long)]
+        confirm: bool,
+        /// Refute SURFACE -> CANONICAL in the graph
+        #[arg(long)]
+        refute: bool,
+        /// Merge config assets (profiles, type aliases, flat synonyms) first
+        #[arg(long)]
+        seed_config: bool,
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },

@@ -331,7 +331,7 @@ impl SynonymEntry {
 }
 
 /// 一次解析结果。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SynonymResolution {
     /// 唯一且足够可信：可以改写为 `canonical`。
     Resolved(SynonymReading),
@@ -400,7 +400,7 @@ impl UnresolvedReason {
 }
 
 /// 一次可审计的解析读法。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SynonymReading {
     pub entry_id: String,
     pub surface: String,
@@ -433,7 +433,7 @@ impl SynonymReading {
 }
 
 /// 反向生成选择。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SurfaceChoice {
     pub canonical: String,
     pub surface: String,

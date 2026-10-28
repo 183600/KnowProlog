@@ -1802,4 +1802,55 @@ mod session_tests {
             Some("张三")
         );
     }
+    #[test]
+    fn synonyms_cli_parses_resolution_and_seed() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "synonyms",
+            "--surface",
+            "苹果",
+            "--kind",
+            "entity",
+            "--type",
+            "组织",
+            "--echo",
+            "苹果公司",
+            "--seed-config",
+            "--json",
+        ])
+        .expect("synonyms 解析参数应可解析");
+        match cli.command {
+            Some(Commands::Synonyms {
+                surface,
+                canonical,
+                kind,
+                expected_type,
+                echo,
+                seed_config,
+                json,
+                ..
+            }) => {
+                assert_eq!(surface.as_deref(), Some("苹果"));
+                assert!(canonical.is_none());
+                assert_eq!(kind, "entity");
+                assert_eq!(expected_type.as_deref(), Some("组织"));
+                assert_eq!(echo, vec!["苹果公司".to_string()]);
+                assert!(seed_config);
+                assert!(json);
+            }
+            other => panic!("应解析为 Synonyms：{:?}", other),
+        }
+
+        assert!(Cli::try_parse_from([
+            "knowprolog",
+            "synonyms",
+            "--canonical",
+            "妻子",
+            "--kind",
+            "predicate",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["knowprolog", "synonyms", "--kind", "unknown"]).is_ok());
+    }
+
 }
