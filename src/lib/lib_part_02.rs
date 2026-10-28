@@ -974,9 +974,10 @@ impl OxigraphManager {
         let store = self.store.lock().await;
         let existing = Self::import_episodes_from_store(&store)?;
         let known_episode = existing.iter().find(|episode| episode.id == id).cloned();
-        let alias_needed = known_episode.as_ref().map_or(false, |episode| {
-            !episode.all_sources().iter().any(|known| known == source)
-        });
+        let alias_needed = match known_episode.as_ref() {
+            Some(episode) => !episode.all_sources().iter().any(|known| known == source),
+            None => false,
+        };
         let old_metadata: Vec<Quad> = if alias_needed {
             let subject = Subject::NamedNode(NamedNode::new(
                 crate::import_episode::episode_subject_iri(&id),
@@ -1252,10 +1253,11 @@ impl OxigraphManager {
                 if length < 2 || !text.contains(&name) {
                     continue;
                 }
-                if best
-                    .as_ref()
-                    .map_or(true, |(best_length, _)| length > *best_length)
-                {
+                let better = match best.as_ref() {
+                    Some((best_length, _)) => length > *best_length,
+                    None => true,
+                };
+                if better {
                     best = Some((length, node.clone()));
                 }
             }
