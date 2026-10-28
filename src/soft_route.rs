@@ -124,6 +124,10 @@ fn default_max_alternatives() -> usize {
     4
 }
 
+fn default_clarify_before_fallback() -> bool {
+    true
+}
+
 /// 软路由参数。所有权重都是**可配置先验**，不做在线学习。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SoftRouteConfig {
@@ -175,6 +179,9 @@ pub struct SoftRouteConfig {
     /// 报告里最多展示多少个候选。
     #[serde(default = "default_max_alternatives")]
     pub max_alternatives: usize,
+    /// 软层判为澄清且存在回退候选时，是否先向用户澄清。
+    #[serde(default = "default_clarify_before_fallback")]
+    pub clarify_before_fallback: bool,
 }
 
 impl Default for SoftRouteConfig {
@@ -196,6 +203,7 @@ impl Default for SoftRouteConfig {
             extra_token_penalty: default_extra_token_penalty(),
             fuzzy_floor: default_fuzzy_floor(),
             max_alternatives: default_max_alternatives(),
+            clarify_before_fallback: default_clarify_before_fallback(),
         }
     }
 }

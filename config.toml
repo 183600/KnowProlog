@@ -132,7 +132,7 @@ calibration = [
 ]
 
 # 软路由：精确模式路由失败后，用动态规划软对齐 + log-odds 证据竞争解释。
-# 只在精确/回退路由都未命中时接管；守卫与覆盖闸门先行，领先不足时澄清或回退。
+# 守卫与覆盖闸门先行；领先不足时先澄清（可关闭 clarify_before_fallback），否则回退。
 [reasoning.soft_route]
 enabled = true                         # 关闭后与旧路径逐字节一致
 accept_threshold = 0.74                # 接受解释的最低后验
@@ -150,6 +150,7 @@ fallback_penalty = 0.30                # NLU 回退候选折扣
 extra_token_penalty = 0.06             # 每个未对齐实词的惩罚
 fuzzy_floor = 0.55                     # 单要素可接受的最低对齐质量
 max_alternatives = 4                   # 报告展示的候选上限
+clarify_before_fallback = true         # 需澄清时先追问，不直接交给 NLU 回退
 
 # 溯因式重写-检索互证（ARR）：保留多个读法，让稠密检索证据裁决。
 # 已采纳的学习规则优先；其余候选只在精确/锚定路径失败后接管。

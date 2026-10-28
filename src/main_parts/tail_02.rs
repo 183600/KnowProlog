@@ -84,6 +84,7 @@ fn route_query_with_patterns(
     episodes: &mut pattern_ir::PatternEpisodeLog,
     context: &pattern_ir::PatternContext,
     soft_config: &know_prolog::soft_route::SoftRouteConfig,
+    clarify: &mut Option<know_prolog::soft_route::SoftRouteOutcome>,
 ) -> Option<(String, Vec<String>, Option<String>)> {
     // 第一层：配置主路由。泛化前缀模式命中后仍让软层复核一次：
     // 近失句里它可能只吃掉了前缀，挡住更具体的配置规则。
@@ -127,34 +128,51 @@ fn route_query_with_patterns(
     if soft_config.enabled {
         let outcome =
             know_prolog::soft_route::route_tokens(input, library, words, context, soft_config);
-        if outcome.decision == know_prolog::soft_route::SoftDecision::Accept {
-            if let Some(candidate) = outcome.selected {
-                let matched = candidate.to_pattern_match();
-                episodes.record_match_with_context(input, words, &matched, context);
-                let note = format!(
-                    "软路由：{}（{}，理解置信度 {:.2}，对齐 {:.0}%，要素 {}/{}，token 覆盖 {:.0}%）",
-                    candidate.name(),
-                    candidate.entry.render(),
-                    candidate.confidence,
-                    candidate.alignment.score * 100.0,
-                    candidate.alignment.matched_elems,
-                    candidate.alignment.total_elems,
-                    candidate.alignment.token_coverage() * 100.0
-                );
-                return Some((
-                    matched.entry.query_type.clone(),
-                    matched.entities.clone(),
-                    Some(note),
-                ));
+        match outcome.decision {
+            know_prolog::soft_route::SoftDecision::Accept => {
+                if let Some(candidate) = outcome.selected {
+                    let matched = candidate.to_pattern_match();
+                    episodes.record_match_with_context(input, words, &matched, context);
+                    let note = format!(
+                        "软路由：{}（{}，理解置信度 {:.2}，对齐 {:.0}%，要素 {}/{}，token 覆盖 {:.0}%）",
+                        candidate.name(),
+                        candidate.entry.render(),
+                        candidate.confidence,
+                        candidate.alignment.score * 100.0,
+                        candidate.alignment.matched_elems,
+                        candidate.alignment.total_elems,
+                        candidate.alignment.token_coverage() * 100.0
+                    );
+                    return Some((
+                        matched.entry.query_type.clone(),
+                        matched.entities.clone(),
+                        Some(note),
+                    ));
+                }
             }
+            know_prolog::soft_route::SoftDecision::Clarify => {
+                if know_prolog::intent_continuation::has_distinct_options(&outcome) {
+                    if soft_config.clarify_before_fallback {
+                        *clarify = Some(outcome);
+                        return None;
+                    }
+                    *clarify = Some(outcome);
+                }
+            }
+            know_prolog::soft_route::SoftDecision::Reject => {}
         }
     }
 
     // 第三层：NLU 回退。软层拒绝/澄清后仍保留原有回退召回。
     if let Some(matched) = library.match_fallback_with_context(words, context) {
+        *clarify = None;
         return Some(exact_pattern_result(
             input, words, matched, episodes, context,
         ));
+    }
+
+    if clarify.is_some() {
+        return None;
     }
 
     // 失败也要留下可行动的粒度：记录最近受阻模式停在哪一要素。
@@ -174,6 +192,23 @@ fn route_query_with_patterns(
     None
 }
 
+fn offer_intent_continuation(
+    continuation: &mut know_prolog::intent_continuation::IntentContinuation,
+    path: &str,
+    input: &str,
+    outcome: &know_prolog::soft_route::SoftRouteOutcome,
+) -> bool {
+    let prompt = match continuation.offer(input, outcome) {
+        Some(pending) => pending.prompt(),
+        None => return false,
+    };
+    println!("{}", prompt);
+    if let Err(error) = continuation.save_to_path(path) {
+        eprintln!("意图续体保存失败（不影响本次澄清）：{}", error);
+    }
+    true
+}
+
 /// 感知层优先、旧切分兜底的路由：词表覆盖只增加边界证据，不牺牲旧召回。
 fn route_query_with_lexicon(
     library: &PatternLibrary,
@@ -183,14 +218,30 @@ fn route_query_with_lexicon(
     episodes: &mut pattern_ir::PatternEpisodeLog,
     context: &pattern_ir::PatternContext,
     soft_config: &know_prolog::soft_route::SoftRouteConfig,
+    clarify: &mut Option<know_prolog::soft_route::SoftRouteOutcome>,
 ) -> Option<(String, Vec<String>, Option<String>)> {
-    if let Some(hit) =
-        route_query_with_patterns(library, input, primary, episodes, context, soft_config)
-    {
+    if let Some(hit) = route_query_with_patterns(
+        library, input, primary, episodes, context, soft_config, clarify,
+    ) {
         return Some(hit);
     }
     if primary != fallback {
-        return route_query_with_patterns(library, input, fallback, episodes, context, soft_config);
+        let mut fallback_clarify = None;
+        if let Some(hit) = route_query_with_patterns(
+            library,
+            input,
+            fallback,
+            episodes,
+            context,
+            soft_config,
+            &mut fallback_clarify,
+        ) {
+            *clarify = None;
+            return Some(hit);
+        }
+        if fallback_clarify.is_some() {
+            *clarify = fallback_clarify;
+        }
     }
     None
 }

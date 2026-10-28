@@ -1,4 +1,90 @@
 {
+                if intent_continuation.begin_turn() {
+                    if let Err(error) =
+                        intent_continuation.save_to_path(&intent_continuation_path)
+                    {
+                        eprintln!("意图续体保存失败（不影响本轮回答）：{}", error);
+                    }
+                    println!("（上一轮的意图澄清已过期，按新问题处理。）");
+                }
+                let mut intent_replay: Option<String> = None;
+                if let Some(pending) = intent_continuation.pending().cloned() {
+                    match pending.parse_reply(input) {
+                        know_prolog::intent_continuation::IntentReply::Choice(index) => {
+                            if let Some(option) = intent_continuation.choose(index) {
+                                let valid = pattern_library
+                                    .entries()
+                                    .iter()
+                                    .any(|entry| entry.id() == option.pattern_id);
+                                if valid {
+                                    println!(
+                                        "（意图续体：按「{}」理解原句。）",
+                                        option.pattern_name
+                                    );
+                                    if let Err(error) =
+                                        intent_continuation.save_to_path(&intent_continuation_path)
+                                    {
+                                        eprintln!("意图续体保存失败（不影响本轮回答）：{}", error);
+                                    }
+                                    continue_original_query(
+                                        &language_config,
+                                        &oxigraph_manager,
+                                        &mut prolog_engine,
+                                        &response_formatter,
+                                        &local_semantic_adapter,
+                                        &external_knowledge_service,
+                                        &mut symbolic_reasoner,
+                                        &mut contrast_arbiter,
+                                        &mut plugin_runtime,
+                                        &pending.original_input,
+                                        &option.query_type,
+                                        &option.entities,
+                                        &[],
+                                    )
+                                    .await;
+                                    println!();
+                                    continue;
+                                }
+                                println!(
+                                    "（原解释「{}」已不在模式库中，重新理解原问题。）",
+                                    option.pattern_name
+                                );
+                                if let Err(error) =
+                                    intent_continuation.save_to_path(&intent_continuation_path)
+                                {
+                                    eprintln!("意图续体保存失败（不影响本轮回答）：{}", error);
+                                }
+                                intent_replay = Some(pending.original_input.clone());
+                            }
+                        }
+                        know_prolog::intent_continuation::IntentReply::Cancel => {
+                            intent_continuation.cancel();
+                            if let Err(error) =
+                                intent_continuation.save_to_path(&intent_continuation_path)
+                            {
+                                eprintln!("意图续体保存失败（不影响本轮回答）：{}", error);
+                            }
+                            println!("（已放弃这次意图澄清，请直接提出新的问题。）");
+                            println!();
+                            continue;
+                        }
+                        know_prolog::intent_continuation::IntentReply::OutOfRange => {
+                            println!("{}", pending.prompt());
+                            println!();
+                            continue;
+                        }
+                        know_prolog::intent_continuation::IntentReply::NewInput => {
+                            intent_continuation.take_pending();
+                            if let Err(error) =
+                                intent_continuation.save_to_path(&intent_continuation_path)
+                            {
+                                eprintln!("意图续体保存失败（不影响本轮回答）：{}", error);
+                            }
+                        }
+                    }
+                }
+                let input = intent_replay.as_deref().unwrap_or(input);
+
                 // 待确认的模式联想：先结算「是/不是」短答，再把原问句重放一次。
                 // 未识别为短答时静默丢弃待确认状态，按新输入继续处理。
                 let mut case_replay: Option<String> = None;
@@ -578,6 +664,7 @@
                                 }
                                 "知识查询" => {
                                     // 继续使用查询逻辑
+                                    let mut intent_clarify = None;
                                     if let Some((query_type, entities, pattern_note)) =
                                         route_query_with_lexicon(
                                             &pattern_library,
@@ -587,6 +674,7 @@
                                             &mut pattern_episodes,
                                             &route_context,
                                             &language_config.reasoning.soft_route,
+                                            &mut intent_clarify,
                                         )
                                     {
                                         // 执行查询流程
@@ -610,6 +698,16 @@
                                             &precomputed_query_entities,
                                         )
                                         .await;
+                                    } else if let Some(outcome) = intent_clarify {
+                                        if offer_intent_continuation(
+                                            &mut intent_continuation,
+                                            &intent_continuation_path,
+                                            input,
+                                            &outcome,
+                                        ) {
+                                            println!();
+                                            continue;
+                                        }
                                     } else if let Some(answer) = try_symbolic_reasoning(
                                         &mut symbolic_reasoner,
                                         &mut contrast_arbiter,
@@ -640,6 +738,7 @@
                                 _ => {
                                     println!("暂不支持该领域: {}", best_semantic.domain);
                                     // 如果NLU不能处理，回退到查询流程
+                                    let mut intent_clarify = None;
                                     if let Some((query_type, entities, pattern_note)) =
                                         route_query_with_lexicon(
                                             &pattern_library,
@@ -649,6 +748,7 @@
                                             &mut pattern_episodes,
                                             &route_context,
                                             &language_config.reasoning.soft_route,
+                                            &mut intent_clarify,
                                         )
                                     {
                                         if let Some(note) = &pattern_note {
@@ -671,6 +771,16 @@
                                             &precomputed_query_entities,
                                         )
                                         .await;
+                                    } else if let Some(outcome) = intent_clarify {
+                                        if offer_intent_continuation(
+                                            &mut intent_continuation,
+                                            &intent_continuation_path,
+                                            input,
+                                            &outcome,
+                                        ) {
+                                            println!();
+                                            continue;
+                                        }
                                     } else if let Some(answer) = try_symbolic_reasoning(
                                         &mut symbolic_reasoner,
                                         &mut contrast_arbiter,
@@ -795,6 +905,7 @@
                     }
                 }
 
+                let mut intent_clarify = None;
                 if let Some((query_type, entities, pattern_note)) = route_query_with_lexicon(
                     &pattern_library,
                     input,
@@ -803,6 +914,7 @@
                     &mut pattern_episodes,
                     &route_context,
                     &language_config.reasoning.soft_route,
+                    &mut intent_clarify,
                 ) {
                     println!("查询类型: {}, 实体: {:?}", query_type, entities);
                     if let Some(note) = &pattern_note {
@@ -959,6 +1071,16 @@
                                 println!("{}: {}", language_config.messages.process_error, e);
                             }
                         }
+                    }
+                } else if let Some(outcome) = intent_clarify {
+                    if offer_intent_continuation(
+                        &mut intent_continuation,
+                        &intent_continuation_path,
+                        input,
+                        &outcome,
+                    ) {
+                        println!();
+                        continue;
                     }
                 } else if let Some(answer) = try_symbolic_reasoning(
                     &mut symbolic_reasoner,

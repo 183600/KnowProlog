@@ -224,6 +224,18 @@ async fn run_interactive_mode(
     // 模式联想待确认：一次未命中解析给出的候选骨架。下一轮用户可直接答
     // 「是/不是」来转正或否决；否定记入负向反馈，避免同一骨架反复打扰。
     let mut pending_case: Option<(String, pattern_ir::CaseSuggestion)> = None;
+    let intent_continuation_path = format!("{}/pending_intent.json", store_path);
+    let mut intent_continuation =
+        know_prolog::intent_continuation::IntentContinuation::load_from_path(
+            &intent_continuation_path,
+        );
+    if intent_continuation.has_pending() {
+        println!("已恢复未完成的意图澄清：");
+        if let Some(pending) = intent_continuation.pending() {
+            println!("{}", pending.prompt());
+        }
+        println!();
+    }
 
     // 符号推理器：对话上下文 + 本体对齐 + 链接预测 + 符号嵌入
     let mut symbolic_reasoner = SymbolicReasoner::with_perf_ledger(
