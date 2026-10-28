@@ -463,13 +463,18 @@ fn parse_details(
     let mentions = known_type_mentions(generator, schema, &question);
     if mentions.is_empty() {
         // 单字类型别名（如「人」→「人物」）低于提及词表的两字门槛，
-        // 但「有多少个人」这类计数问句仍然应当落到类型上。
+        // 但「有多少个人」「人一般有哪些属性」这类问句仍应落到类型上。
         if let Some(subject) = count_subject(&question) {
             if let Some(target) = resolve_target(generator, schema, &subject) {
                 return Some((
                     TypeQuestion::Count { etype: target.key },
                     TypeQuestionKind::Members,
                 ));
+            }
+        }
+        if has_profile_intent(&question) {
+            if let Some(etype) = leading_single_char_type(generator, schema, &question) {
+                return Some((TypeQuestion::Profile { etype }, TypeQuestionKind::Profile));
             }
         }
         return None;
@@ -626,6 +631,27 @@ fn count_subject(question: &str) -> Option<String> {
 
 fn has_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+/// 单字类型别名 + 画像提示（如「人一般有哪些属性」）的兜底解析。
+///
+/// 只接受位于句首的单字，并要求其后紧跟画像提示，避免把普通句子里的
+/// 单字误判成类型。
+fn leading_single_char_type(
+    generator: &SymbolicGenerator,
+    schema: Option<&SchemaView>,
+    question: &str,
+) -> Option<String> {
+    const PROFILE_TAILS: &[&str] = &[
+        "一般", "通常", "常见", "有哪些", "有什么", "的属性", "的关系", "属性", "关系",
+        "画像", "概览", "概况", "特征", "特点", "长什么样", "怎么样",
+    ];
+    let first = question.chars().next()?;
+    let rest = &question[first.len_utf8()..];
+    if !PROFILE_TAILS.iter().any(|tail| rest.starts_with(tail)) {
+        return None;
+    }
+    resolve_target(generator, schema, &first.to_string()).map(|target| target.key)
 }
 
 fn has_profile_intent(question: &str) -> bool {
@@ -1373,6 +1399,20 @@ mod tests {
             super::parse_details(&generator, Some(&schema), "人物有多少个属性").is_none(),
             "问属性个数不能被劫持成成员计数"
         );
+
+        let profile = super::parse_details(&generator, Some(&schema), "人一般有哪些属性")
+            .map(|(question, _)| question)
+            .unwrap();
+        assert_eq!(
+            profile,
+            TypeQuestion::Profile {
+                etype: "人物".to_string()
+            }
+        );
+        let answer = answer_with_schema(&generator, Some(&schema), "人一般有哪些属性")
+            .expect("单字别名也应能回答类型画像");
+        assert!(answer.text.contains("类型画像「人物」"), "{}", answer.text);
+        assert!(answer.text.contains("年龄"), "{}", answer.text);
     }
 
     #[test]
