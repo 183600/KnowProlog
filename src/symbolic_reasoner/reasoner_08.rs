@@ -434,7 +434,11 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_probabilistic_intent(question) {
             return Some(answer);
         }
-        if let Some(answer) = crate::type_memory::answer(&self.generator, question) {
+        if let Some(answer) = crate::type_memory::answer_with_schema(
+            &self.generator,
+            Some(self.schema_view()),
+            question,
+        ) {
             return Some(self.annotate_assumption_world(answer.text));
         }
         if let Some(answer) = self.answer_planned(question) {
@@ -773,7 +777,11 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_probabilistic_intent(question) {
             return Some(answer);
         }
-        if let Some(answer) = crate::type_memory::answer(&self.generator, question) {
+        if let Some(answer) = crate::type_memory::answer_with_schema(
+            &self.generator,
+            Some(self.schema_view()),
+            question,
+        ) {
             return Some(answer.text);
         }
         if let Some(answer) = self.answer_planned(question) {

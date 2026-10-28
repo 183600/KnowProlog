@@ -1212,6 +1212,12 @@ mod tests {
         });
         reasoner.observe_facts(&facts);
 
+        let direct = reasoner
+            .answer("机构一般有哪些属性")
+            .expect("推理器直答也应复用模式视图");
+        assert!(direct.contains("类型画像「机构」"), "{}", direct);
+        assert!(direct.contains("城市"), "{}", direct);
+
         let mut manager = DialogueManager::new();
         let first = manager
             .plan_pure_dialogue("人物有哪些成员", &reasoner)
