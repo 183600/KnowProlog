@@ -485,6 +485,12 @@
             .expect("成员列表应可确证回答");
         assert!(members.contains("张三"), "{}", members);
         assert!(members.contains("李四"), "{}", members);
+
+        let entity_type = reasoner
+            .answer("张三是什么类型")
+            .expect("实体类型问句应可回答");
+        assert!(entity_type.contains("「张三」的类型是「人物」"), "{}", entity_type);
+
         assert!(!reasoner
             .answer("张三的年龄是多少")
             .unwrap_or_default()

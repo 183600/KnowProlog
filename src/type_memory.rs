@@ -19,6 +19,8 @@ pub enum TypeQuestion {
     Members { etype: String },
     Count { etype: String },
     Compare { left: String, right: String },
+    /// 查某个已知实体的显式类型：`李四是什么类型`。
+    EntityType { entity: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,7 +309,58 @@ fn answer_parsed(
                 focus: Some(focus_key),
             })
         }
+        TypeQuestion::EntityType { entity } => {
+            let Some(stored) = generator.entity_type_of(&entity) else {
+                return Some(TypeAnswer {
+                    text: format!("「{}」尚未登记显式类型。", entity),
+                    focus: None,
+                });
+            };
+            let canonical = schema
+                .map(|schema| schema.canonical_type(stored))
+                .filter(|canonical| !canonical.is_empty())
+                .unwrap_or_else(|| stored.to_string());
+            let text = render_entity_type(schema, &entity, &canonical);
+            memory.set_focus(TypeFocus::new(canonical.clone(), TypeQuestionKind::Profile));
+            Some(TypeAnswer {
+                text,
+                focus: Some(canonical),
+            })
+        }
     }
+}
+
+fn render_entity_type(
+    schema: Option<&SchemaView>,
+    entity: &str,
+    canonical: &str,
+) -> String {
+    let label = localized_type_label(canonical);
+    let mut text = if label != canonical {
+        format!("「{}」的类型是「{}」（{}）。", entity, canonical, label)
+    } else {
+        format!("「{}」的类型是「{}」。", entity, canonical)
+    };
+    if let Some(schema) = schema {
+        let mut supers: Vec<String> = schema
+            .class_ancestors(canonical)
+            .into_iter()
+            .filter(|class| class != canonical)
+            .map(|class| {
+                let label = localized_type_label(&class);
+                if label != class {
+                    format!("{}（{}）", class, label)
+                } else {
+                    class
+                }
+            })
+            .collect();
+        supers.sort();
+        if !supers.is_empty() {
+            text.push_str(&format!("\n上位类型：{}。", supers.join("、")));
+        }
+    }
+    text
 }
 
 fn continue_focus(
@@ -454,6 +507,10 @@ fn parse_details(
         return None;
     }
 
+    if let Some(entity) = entity_type_subject(generator, &question) {
+        return Some((TypeQuestion::EntityType { entity }, TypeQuestionKind::Profile));
+    }
+
     if question.contains("类型画像") || question.contains("类型概览") {
         if let Some(etype) = profile_mention(generator, schema, &question) {
             return Some((TypeQuestion::Profile { etype }, TypeQuestionKind::Profile));
@@ -555,6 +612,72 @@ fn parse_details(
             },
             TypeQuestionKind::Members,
         ));
+    }
+    None
+}
+
+/// 实体类型问句的谓词尾部。必须整段匹配，避免把「张三的师傅是什么类型」
+/// 误当成在问「张三」的类型。
+const ENTITY_TYPE_TAILS: &[&str] = &[
+    "是什么类型",
+    "是啥类型",
+    "是哪种类型",
+    "是哪一种类型",
+    "是哪类",
+    "是哪一类",
+    "是哪类实体",
+    "是哪一类实体",
+    "是什么类别",
+    "是什么类型的人",
+    "是什么类型的人物",
+    "是什么类型的实体",
+    "属于什么类型",
+    "属于哪种类型",
+    "属于哪一类",
+    "属于哪类",
+    "属于什么类别",
+    "属于哪个类型",
+    "属于何种类型",
+    "算哪类",
+    "算是什么类型",
+    "是何种类型",
+    "被归为什么类型",
+    "被归为哪类",
+    "的类型是什么",
+    "的实体类型是什么",
+    "的类别是什么",
+    "什么类型",
+    "哪种类型",
+    "什么类别",
+    "哪类",
+];
+
+/// 从问句中找出「问类型」的已知实体。最长实体优先，尾部必须完整命中
+/// [`ENTITY_TYPE_TAILS`]，因此属性链问句不会被劫持。
+fn entity_type_subject(generator: &SymbolicGenerator, question: &str) -> Option<String> {
+    let mut entities = generator.all_entities();
+    entities.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    for entity in entities {
+        let entity = entity.trim();
+        if entity.is_empty() {
+            continue;
+        }
+        for (start, _) in question.match_indices(entity) {
+            let suffix = question[start + entity.len()..]
+                .trim_start_matches(|c: char| matches!(c, '」' | '”' | '"' | '\'' | ' '));
+            let suffix = suffix.trim_end_matches(|c: char| {
+                matches!(c, '呢' | '啊' | '呀' | '吧' | '吗' | '。' | '？' | '?' | '！' | '!')
+            });
+            if ENTITY_TYPE_TAILS.contains(&suffix) {
+                return Some(entity.to_string());
+            }
+        }
     }
     None
 }
@@ -1672,4 +1795,47 @@ mod tests {
             .expect("恢复后应继续使用类型焦点");
         assert!(continued.text.contains("已全部列出"), "{}", continued.text);
     }
+    #[test]
+    fn entity_type_question_reports_declared_type_and_supertypes() {
+        let generator = generator();
+        let schema = schema();
+        for question in [
+            "张三是什么类型？",
+            "张三属于哪一类？",
+            "张三的类型是什么",
+            "「张三」是哪类实体",
+            "请问张三是什么类型的人物呢",
+        ] {
+            assert_eq!(
+                parse(&generator, question),
+                Some(TypeQuestion::EntityType {
+                    entity: "张三".to_string()
+                }),
+                "{}",
+                question
+            );
+        }
+        let answer = answer_with_schema(&generator, Some(&schema), "张三是什么类型？")
+            .expect("实体类型应可回答");
+        assert!(answer.text.contains("「张三」的类型是「人物」"), "{}", answer.text);
+        assert!(answer.text.contains("上位类型：实体"), "{}", answer.text);
+        assert_eq!(answer.focus.as_deref(), Some("人物"));
+    }
+
+    #[test]
+    fn entity_type_question_does_not_steal_attribute_chain_questions() {
+        let generator = generator();
+        assert_eq!(parse(&generator, "张三的师傅是什么类型？"), None);
+        assert_eq!(parse(&generator, "张三的年龄是什么？"), None);
+    }
+
+    #[test]
+    fn entity_type_question_reports_missing_type_honestly() {
+        let mut generator = generator();
+        generator.observe_entity("王五", "", &[]);
+        let answer = answer(&generator, "王五是什么类型？").expect("问句本身合法");
+        assert!(answer.text.contains("「王五」尚未登记显式类型"), "{}", answer.text);
+        assert_eq!(answer.focus, None);
+    }
+
 }
