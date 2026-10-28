@@ -159,9 +159,14 @@ impl MediaStore {
                     None
                 }
             }
-            SelectorOrdinal::Index(position) => position
-                .checked_sub(1)
-                .and_then(|index| candidates.get(index).copied()),
+            SelectorOrdinal::Index(position) => u64::try_from(position)
+                .ok()
+                .and_then(|position| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|stored| stored.record.ordinal == position)
+                }),
         };
         let Some(stored) = selected else {
             return MediaSelection::Missing {

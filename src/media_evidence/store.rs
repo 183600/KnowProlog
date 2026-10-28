@@ -24,6 +24,7 @@ pub struct MediaStore {
     pub(crate) assets: BTreeMap<AssetId, StoredAsset>,
     total_bytes: usize,
     pub(crate) next_sequence: u64,
+    next_ordinals: BTreeMap<Modality, u64>,
     next_anchor_sequence: u64,
     pub(crate) limits: MediaLimits,
     root: Option<PathBuf>,
@@ -41,6 +42,7 @@ impl MediaStore {
             assets: BTreeMap::new(),
             total_bytes: 0,
             next_sequence: 1,
+            next_ordinals: BTreeMap::new(),
             next_anchor_sequence: 1,
             limits,
             root: None,
@@ -149,8 +151,9 @@ impl MediaStore {
             });
         }
         let sequence = self.next_sequence;
+        let ordinal = self.next_ordinals.get(&modality).copied().unwrap_or(1);
         let label = if label.trim().is_empty() {
-            format!("{} {}", modality.label_zh(), sequence)
+            format!("{} {}", modality.label_zh(), ordinal)
         } else {
             label.trim().to_string()
         };
@@ -171,9 +174,12 @@ impl MediaStore {
             content_hash,
             byte_len: bytes.len(),
             label,
+            ordinal,
             sequence,
         };
         self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_ordinals
+            .insert(modality, ordinal.saturating_add(1));
         self.total_bytes = total;
         self.assets.insert(
             id,

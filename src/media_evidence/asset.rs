@@ -92,9 +92,11 @@ pub struct AssetRecord {
     pub media_type: String,
     pub content_hash: String,
     pub byte_len: usize,
-    /// 面向用户的稳定标签（`图 1`、`表格 2`…）。
+    /// 面向用户的稳定标签（`图片 1`、`表格 2`…）。
     pub label: String,
-    /// 发布次序（单调递增）；用于「第 N 张」「最近一张」与世代判定。
+    /// 同模态内的发布序号（从 1 开始）；与默认标签和「第 N 张」一致。
+    pub ordinal: u64,
+    /// 全局发布次序（单调递增）；用于「最近一张」与世代判定。
     pub sequence: u64,
 }
 

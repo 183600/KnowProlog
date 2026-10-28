@@ -727,3 +727,39 @@ fn table_ingest_is_atomic_checked_and_modality_aware() {
         "locator_modality_mismatch"
     );
 }
+
+#[test]
+fn labels_and_ordinals_are_per_modality_without_shift_after_deletion() {
+    let mut store = MediaStore::new(limits());
+    let first_image = image(&mut store, b"ordinal-image-1");
+    let grid = table(&mut store, b"ordinal-table-1");
+    let second_image = image(&mut store, b"ordinal-image-2");
+    assert_eq!(first_image.label, "图片 1");
+    assert_eq!(grid.label, "表格 1");
+    assert_eq!(second_image.label, "图片 2");
+    assert_eq!(first_image.ordinal, 1);
+    assert_eq!(grid.ordinal, 1);
+    assert_eq!(second_image.ordinal, 2);
+
+    let selector = MediaSelector::parse("图2").unwrap();
+    let MediaSelection::Selected { asset, .. } = store.select(&selector, None) else {
+        panic!("图2 应选中第二张图片");
+    };
+    assert_eq!(asset.id, second_image.id);
+
+    let selector = MediaSelector::parse("第一张表格").unwrap();
+    let MediaSelection::Selected { asset, .. } = store.select(&selector, None) else {
+        panic!("第一张表格应选中表格 1");
+    };
+    assert_eq!(asset.id, grid.id);
+
+    assert!(store.remove(&second_image.id));
+    assert!(matches!(
+        store.select(&MediaSelector::parse("图2").unwrap(), None),
+        MediaSelection::Missing { .. }
+    ));
+    assert!(matches!(
+        store.select(&MediaSelector::parse("第二张图").unwrap(), None),
+        MediaSelection::Missing { .. }
+    ));
+}
