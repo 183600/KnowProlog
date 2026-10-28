@@ -1503,7 +1503,7 @@ mod tests {
         let report = evaluate_with(
             &cases,
             &RewriteRetrievalConfig::default(),
-            |question| vec![candidate(HypothesisSource::ExactPlan, "张三", "师傅")],
+            |_question| vec![candidate(HypothesisSource::ExactPlan, "张三", "师傅")],
             |query, k, constraints| retriever.search(query, k, constraints, Default::default()),
             |_hypothesis| Some("王五".to_string()),
         );
