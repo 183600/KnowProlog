@@ -180,11 +180,13 @@ impl MediaStore {
                 .collect(),
             None => stored.anchors.clone(),
         };
-        if selector.locator.is_some() && anchors.is_empty() {
-            return MediaSelection::AssetWithoutAnchor {
-                asset: stored.record.clone(),
-                hint: selector.locator.expect("locator checked"),
-            };
+        if let Some(hint) = selector.locator {
+            if anchors.is_empty() {
+                return MediaSelection::AssetWithoutAnchor {
+                    asset: stored.record.clone(),
+                    hint,
+                };
+            }
         }
         MediaSelection::Selected {
             asset: stored.record.clone(),

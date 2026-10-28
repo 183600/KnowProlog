@@ -135,7 +135,7 @@ impl AssetRef {
     /// 按内容哈希与世代解析；删除或重发后旧引用永久失效。
     pub fn resolve<'a>(
         &self,
-        store: &'a crate::media_evidence::MediaStore,
+        store: &'a super::store::MediaStore,
     ) -> Result<&'a AssetRecord, UnavailableReason> {
         let record = store
             .asset(&self.asset_id)

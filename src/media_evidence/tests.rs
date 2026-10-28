@@ -466,6 +466,19 @@ fn stale_generation_after_republish_is_unavailable() {
 }
 
 #[test]
+fn zero_capacity_session_rejects_new_focus_without_panicking() {
+    let mut store = MediaStore::new(limits());
+    let asset = image(&mut store, b"zero-capacity");
+    let mut session = SessionMedia::new(0);
+    assert_eq!(
+        session.remember(&asset).unwrap_err(),
+        MediaError::SessionCapacityExceeded { limit: 0 }
+    );
+    assert!(session.focus().is_none());
+    assert!(!session.forget(&asset.id));
+}
+
+#[test]
 fn media_turn_grounds_answer_with_citation() {
     let mut store = MediaStore::new(limits());
     let table_asset = table(&mut store, b"turn-table");

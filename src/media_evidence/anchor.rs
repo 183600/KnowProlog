@@ -46,7 +46,7 @@ impl Locator {
                 *end_ms as f64 / 1000.0
             ),
             Locator::TextSpan { start, end } => {
-                format!("文本第 {}–{} 字", start + 1, end)
+                format!("文本第 {}–{} 字", start.saturating_add(1), end)
             }
         }
     }
@@ -143,8 +143,8 @@ impl Locator {
         else {
             return None;
         };
-        let horizontal = (2 * x + width) * 3;
-        let vertical = (2 * y + height) * 3;
+        let horizontal = (2 * u64::from(*x) + u64::from(*width)) * 3;
+        let vertical = (2 * u64::from(*y) + u64::from(*height)) * 3;
         let left = horizontal < 2000;
         let right = horizontal > 4000;
         let top = vertical < 2000;
