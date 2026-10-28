@@ -461,6 +461,87 @@ fn stale_generation_after_republish_is_unavailable() {
 }
 
 #[test]
+fn media_turn_grounds_answer_with_citation() {
+    let mut store = MediaStore::new(limits());
+    let table_asset = table(&mut store, b"turn-table");
+    let cell = cell_anchor(&mut store, &table_asset, 3, 2, "1981");
+    let mut session = SessionMedia::new(4);
+    let selector = MediaSelector::parse("表格第三行第二列").unwrap();
+    let turn = ground_media_turn(
+        &selector,
+        &store,
+        &mut session,
+        "公司",
+        "成立年份",
+        &["1981".to_string()],
+    );
+    assert_eq!(turn.state(), Some(SupportState::Corroborated));
+    assert!(turn.response.contains("一致"), "{}", turn.response);
+    assert!(turn.response.contains("表格第 3 行第 2 列"), "{}", turn.response);
+    assert_eq!(turn.citations().len(), 1);
+    assert_eq!(turn.citations()[0].anchor_id, cell.id);
+    assert!(turn.focus_updated);
+    assert_eq!(session.focus().unwrap().asset_id, table_asset.id);
+}
+
+#[test]
+fn media_turn_clarifies_instead_of_guessing() {
+    let mut store = MediaStore::new(limits());
+    let first = image(&mut store, b"turn-first");
+    let second = image(&mut store, b"turn-second");
+    store
+        .add_anchor(&first.id, AnchorDraft::new(Locator::Whole, "第一张图", "manual", 1.0))
+        .unwrap();
+    store
+        .add_anchor(&second.id, AnchorDraft::new(Locator::Whole, "第二张图", "manual", 1.0))
+        .unwrap();
+    let mut session = SessionMedia::new(4);
+    let selector = MediaSelector::parse("图片").unwrap();
+    let turn = ground_media_turn(
+        &selector,
+        &store,
+        &mut session,
+        "人物",
+        "身份",
+        &[],
+    );
+    assert_eq!(turn.state(), None);
+    assert!(turn.clarification.is_some());
+    assert!(turn.response.contains("编号确认"), "{}", turn.response);
+    assert!(!turn.focus_updated);
+    assert!(session.is_empty());
+}
+
+#[test]
+fn media_turn_uses_latest_asset_and_discloses_media_only() {
+    let mut store = MediaStore::new(limits());
+    let first = image(&mut store, b"turn-latest-first");
+    let second = image(&mut store, b"turn-latest-second");
+    store
+        .add_anchor(&first.id, AnchorDraft::new(Locator::Whole, "第一张图的内容", "manual", 1.0))
+        .unwrap();
+    store
+        .add_anchor(&second.id, AnchorDraft::new(Locator::Whole, "第二张图的内容", "manual", 1.0))
+        .unwrap();
+    let mut session = SessionMedia::new(4);
+    session.remember(&first).unwrap();
+    let selector = MediaSelector::parse("这张图").unwrap();
+    let turn = ground_media_turn(
+        &selector,
+        &store,
+        &mut session,
+        "人物",
+        "身份",
+        &[],
+    );
+    assert_eq!(turn.state(), Some(SupportState::MediaOnly));
+    assert!(turn.response.contains("仅依据你提供的媒体"), "{}", turn.response);
+    assert!(turn.response.contains("第二张图的内容"), "{}", turn.response);
+    assert!(turn.focus_updated);
+    assert_eq!(session.focus().unwrap().asset_id, second.id);
+}
+
+#[test]
 fn last_sentence_focus_and_persisted_root() {
     let temporary = tempfile::tempdir().unwrap();
     let mut store = MediaStore::with_root(temporary.path(), limits());
