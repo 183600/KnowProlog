@@ -1585,10 +1585,37 @@
             .await
             .unwrap();
         assert!(!replay.recorded, "同内容重复导入不新建批次");
+        assert!(!replay.source_aliases_added, "同一来源不重复记别名");
         assert_eq!(replay.added, 0);
         assert_eq!(replay.duplicates, 2);
         assert_eq!(replay.episode.id, first.episode.id);
         assert_eq!(manager.load_import_episodes().await.unwrap().len(), 1);
+
+        let alias = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::NQuads,
+                nquads.as_bytes(),
+                "data/copy.nq",
+            )
+            .await
+            .unwrap();
+        assert!(!alias.recorded, "同内容不同来源仍复用批次");
+        assert!(alias.source_aliases_added, "新来源应记入批次");
+        assert_eq!(alias.episode.seq, 1);
+        let episodes = manager.load_import_episodes().await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(
+            crate::import_episode::resolve_episode_reference("copy.nq 讲了什么", &episodes)
+                .map(|episode| episode.seq),
+            Some(1)
+        );
+        let source = manager
+            .answer_import_episode_question("这批的来源是什么", &episodes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source.contains("data/sample.nq"), "{}", source);
+        assert!(source.contains("data/copy.nq"), "{}", source);
 
         let second = manager
             .import_rdf_batch(

@@ -974,6 +974,21 @@ impl OxigraphManager {
         let store = self.store.lock().await;
         let existing = Self::import_episodes_from_store(&store)?;
         let known_episode = existing.iter().find(|episode| episode.id == id).cloned();
+        let alias_needed = known_episode.as_ref().map_or(false, |episode| {
+            !episode.all_sources().iter().any(|known| known == source)
+        });
+        let old_metadata: Vec<Quad> = if alias_needed {
+            let subject = Subject::NamedNode(NamedNode::new(
+                crate::import_episode::episode_subject_iri(&id),
+            )?);
+            let graph =
+                GraphName::NamedNode(NamedNode::new(crate::import_episode::EPISODE_LEDGER_GRAPH)?);
+            store
+                .quads_for_pattern(Some(subject.as_ref()), None, None, Some(graph.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let seq = existing
             .iter()
             .map(|episode| episode.seq)
@@ -985,6 +1000,7 @@ impl OxigraphManager {
             seq,
             id: id.clone(),
             source: source.to_string(),
+            sources: Vec::new(),
             format: crate::import_episode::rdf_format_label(format).to_string(),
             imported_at: crate::import_episode::now_unix_seconds(),
             total: flattened.len(),
@@ -997,11 +1013,17 @@ impl OxigraphManager {
         };
         let known_for_closure = known_episode.clone();
         let fallback_episode = fresh_episode.clone();
+        let source_for_closure = source.to_string();
 
-        let (added, duplicates, recorded_episode) = store
+        let (added, duplicates, recorded_episode, alias_episode) = store
             .transaction(
                 move |mut transaction| -> Result<
-                    (usize, usize, Option<crate::import_episode::ImportEpisode>),
+                    (
+                        usize,
+                        usize,
+                        Option<crate::import_episode::ImportEpisode>,
+                        Option<crate::import_episode::ImportEpisode>,
+                    ),
                     ImportBatchTransactionError,
                 > {
                     let mut added = 0usize;
@@ -1026,7 +1048,23 @@ impl OxigraphManager {
                         );
                         transaction.insert(batch_quad.as_ref())?;
                     }
-                    let recorded_episode = if known_for_closure.is_none() {
+                    let mut recorded_episode = None;
+                    let mut alias_episode = None;
+                    if let Some(known) = known_for_closure.clone() {
+                        if alias_needed {
+                            let mut episode = known;
+                            episode.record_source(&source_for_closure);
+                            for quad in &old_metadata {
+                                transaction.remove(quad.as_ref())?;
+                            }
+                            let metadata = crate::import_episode::episode_quads(&episode)
+                                .map_err(|error| ImportBatchTransactionError(error.to_string()))?;
+                            for quad in metadata {
+                                transaction.insert(quad.as_ref())?;
+                            }
+                            alias_episode = Some(episode);
+                        }
+                    } else {
                         let mut episode = fresh_episode.clone();
                         episode.added = added;
                         episode.duplicates = duplicates;
@@ -1035,11 +1073,9 @@ impl OxigraphManager {
                         for quad in metadata {
                             transaction.insert(quad.as_ref())?;
                         }
-                        Some(episode)
-                    } else {
-                        None
-                    };
-                    Ok((added, duplicates, recorded_episode))
+                        recorded_episode = Some(episode);
+                    }
+                    Ok((added, duplicates, recorded_episode, alias_episode))
                 },
             )
             .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
@@ -1050,7 +1086,9 @@ impl OxigraphManager {
         }
         self.perf.bump("rdf_import_batch");
         let recorded = recorded_episode.is_some();
+        let source_aliases_added = alias_episode.is_some();
         let episode = recorded_episode
+            .or(alias_episode)
             .or(known_episode)
             .unwrap_or(fallback_episode);
         Ok(crate::import_episode::RdfImportReceipt {
@@ -1058,6 +1096,7 @@ impl OxigraphManager {
             added,
             duplicates,
             recorded,
+            source_aliases_added,
         })
     }
 
@@ -1108,7 +1147,6 @@ impl OxigraphManager {
                 crate::import_episode::EpisodeQuestion::Brief
                     | crate::import_episode::EpisodeQuestion::Types
                     | crate::import_episode::EpisodeQuestion::Predicates
-                    | crate::import_episode::EpisodeQuestion::TypeEntities(_)
             ));
         if wants_subject {
             if let Some(answer) = self.batch_subject_facts_answer(episode, text).await? {

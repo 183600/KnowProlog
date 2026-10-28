@@ -97,6 +97,9 @@ pub struct ImportEpisode {
     /// 内容寻址批次 id。
     pub id: String,
     pub source: String,
+    /// 同内容曾从哪些其他来源导入（主 source 仍保留在 `source`）。
+    #[serde(default)]
+    pub sources: Vec<String>,
     pub format: String,
     /// Unix 秒；只作审计，不参与 gist 的确定性。
     pub imported_at: u64,
@@ -116,11 +119,50 @@ pub struct ImportEpisode {
 }
 
 impl ImportEpisode {
+    /// 主来源 + 同内容的其他来源（去重、保持首次出现顺序）。
+    pub fn all_sources(&self) -> Vec<String> {
+        let mut sources = Vec::new();
+        if !self.source.trim().is_empty() {
+            sources.push(self.source.clone());
+        }
+        for source in &self.sources {
+            if !source.trim().is_empty() && !sources.iter().any(|known| known == source) {
+                sources.push(source.clone());
+            }
+        }
+        sources
+    }
+
+    /// 记下一个新来源；已有来源或空来源返回 false。
+    pub fn record_source(&mut self, source: &str) -> bool {
+        if source.trim().is_empty() || self.all_sources().iter().any(|known| known == source) {
+            return false;
+        }
+        self.sources.push(source.to_string());
+        true
+    }
+
+    /// 台账/简报用的来源展示；多来源时用「、」连接。
+    pub fn source_summary(&self) -> String {
+        let sources = self.all_sources();
+        if sources.is_empty() {
+            self.source.clone()
+        } else {
+            sources.join("、")
+        }
+    }
+
     /// 批次的一句式摘要（台账 / CLI 共用）。
     pub fn line(&self) -> String {
         let mut line = format!(
             "B{}｜{}｜{}｜{} 条断言（新增 {}，重复 {}）｜{}",
-            self.seq, self.source, self.format, self.total, self.added, self.duplicates, self.id
+            self.seq,
+            self.source_summary(),
+            self.format,
+            self.total,
+            self.added,
+            self.duplicates,
+            self.id
         );
         if self.blank_nodes {
             line.push_str("｜含空白节点：批次 id 可能随解析变化");
@@ -137,6 +179,8 @@ pub struct RdfImportReceipt {
     pub duplicates: usize,
     /// 本次是否新建了批次记录（同内容重复导入为 false）。
     pub recorded: bool,
+    /// 本次是否把新来源记入已有批次（同内容、不同文件）。
+    pub source_aliases_added: bool,
 }
 
 impl RdfImportReceipt {
@@ -145,6 +189,11 @@ impl RdfImportReceipt {
             format!(
                 "新增 {} 条三元组；批次 B{} 已记为 {} 条断言（重复 {} 条）。",
                 self.added, self.episode.seq, self.episode.total, self.duplicates
+            )
+        } else if self.source_aliases_added {
+            format!(
+                "新增 {} 条三元组；批次 B{} 已存在，已记下新来源（重复 {} 条）。",
+                self.added, self.episode.seq, self.duplicates
             )
         } else {
             format!(
@@ -473,6 +522,9 @@ pub fn episode_quads(episode: &ImportEpisode) -> EpisodeResult<Vec<Quad>> {
         (P_INPUT_NAMED_GRAPHS, episode.input_named_graphs.to_string()),
     ] {
         quads.push(literal_quad(&subject, predicate, &value, &graph)?);
+    }
+    for source in episode.all_sources().iter().skip(1) {
+        quads.push(literal_quad(&subject, P_SOURCE, source, &graph)?);
     }
     quads.push(Quad::new(
         subject.clone(),
@@ -958,11 +1010,12 @@ pub fn resolve_episode_reference<'a>(
     if trimmed.is_empty() {
         return None;
     }
-    if let Some(episode) = episodes
-        .iter()
-        .rev()
-        .find(|episode| source_matches(&episode.source, trimmed))
-    {
+    if let Some(episode) = episodes.iter().rev().find(|episode| {
+        episode
+            .all_sources()
+            .iter()
+            .any(|source| source_matches(source, trimmed))
+    }) {
         return Some(episode);
     }
     let needle = trimmed.split_whitespace().next().unwrap_or(trimmed);
@@ -1003,7 +1056,7 @@ pub fn render_episode_brief(episode: &ImportEpisode) -> String {
     lines.push(format!(
         "批次 B{}｜来源 {}｜格式 {}｜{} 条断言（新增 {}，重复 {}）",
         episode.seq,
-        episode.source,
+        episode.source_summary(),
         episode.format,
         episode.total,
         episode.added,
@@ -1242,7 +1295,9 @@ pub fn render_episode_answer(episode: &ImportEpisode, question: EpisodeQuestion)
             let mut lines = vec![
                 format!(
                     "批次 B{} 来源：{}；格式：{}。",
-                    episode.seq, episode.source, episode.format
+                    episode.seq,
+                    episode.source_summary(),
+                    episode.format
                 ),
                 format!("批次 id：{}；批次图：{}。", episode.id, episode.batch_graph),
             ];
@@ -1426,6 +1481,7 @@ mod tests {
             seq,
             id: id.to_string(),
             source: source.to_string(),
+            sources: Vec::new(),
             format: "Turtle".to_string(),
             imported_at: 1700000000 + seq as u64,
             total: 2,
@@ -1529,8 +1585,27 @@ mod tests {
     }
 
     #[test]
+    fn source_aliases_are_deduped_and_resolve_by_file() {
+        let mut sample = episode(1, "dddd4444", "data/first.ttl");
+        assert!(sample.record_source("data/copy.ttl"));
+        assert!(!sample.record_source("data/copy.ttl"));
+        assert!(!sample.record_source("data/first.ttl"));
+        assert_eq!(
+            sample.all_sources(),
+            vec!["data/first.ttl".to_string(), "data/copy.ttl".to_string()]
+        );
+        assert_eq!(sample.source_summary(), "data/first.ttl、data/copy.ttl");
+        let episodes = vec![sample];
+        assert_eq!(
+            resolve_episode_reference("copy.ttl 讲了什么", &episodes).map(|episode| episode.seq),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn metadata_quads_roundtrip_episode_json() {
-        let original = episode(3, "cccc3333", "data/third.trig");
+        let mut original = episode(3, "cccc3333", "data/third.trig");
+        original.record_source("data/third-copy.trig");
         let quads = episode_quads(&original).unwrap();
         assert!(quads
             .iter()
