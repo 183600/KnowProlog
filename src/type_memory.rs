@@ -156,9 +156,19 @@ pub fn answer_in_context(
             .map(|mention| mention.etype);
         let target = match mentioned.as_deref() {
             Some(etype) => resolve_target(generator, schema, etype),
-            None => memory
-                .focus()
-                .and_then(|focus| resolve_target(generator, schema, &focus.etype)),
+            None => {
+                let names_entity = generator
+                    .all_entities()
+                    .iter()
+                    .any(|entity| !entity.trim().is_empty() && normalized.contains(entity));
+                if names_entity {
+                    None
+                } else {
+                    memory
+                        .focus()
+                        .and_then(|focus| resolve_target(generator, schema, &focus.etype))
+                }
+            }
         };
         if let Some(target) = target {
             let text = render_gap(generator, &target);
@@ -1322,6 +1332,11 @@ mod tests {
         let explicit = answer_with_schema(&generator, None, "人物哪些属性缺失")
             .expect("无会话焦点时也可按显式类型回答");
         assert!(explicit.text.contains("覆盖缺口"), "{}", explicit.text);
+
+        assert!(
+            answer_in_context(&generator, None, &mut memory, "张三缺什么").is_none(),
+            "实体问句不应被类型缺口劫持"
+        );
     }
 
     #[test]
