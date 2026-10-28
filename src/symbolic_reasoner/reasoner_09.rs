@@ -1159,6 +1159,11 @@ impl SymbolicReasoner {
 
     pub fn assert_nl_fact(&mut self, sentence_raw: &str) -> String {
         let sentence = sentence_raw.trim();
+        let sentence = ["记住：", "记住:", "记录：", "记录:", "断言：", "断言:"]
+            .iter()
+            .find_map(|prefix| sentence.strip_prefix(prefix))
+            .unwrap_or(sentence)
+            .trim();
         if sentence.is_empty() {
             return "请给出要记住的事实，例如：记住：张三是李四的师傅".to_string();
         }
@@ -1316,6 +1321,11 @@ impl SymbolicReasoner {
     /// 忘记一条会话事实：从会话归结事实集撤回（不触碰知识图谱）
     pub fn retract_nl_fact(&mut self, sentence_raw: &str) -> String {
         let sentence = sentence_raw.trim();
+        let sentence = ["忘记：", "忘记:", "遗忘：", "遗忘:", "撤回：", "撤回:"]
+            .iter()
+            .find_map(|prefix| sentence.strip_prefix(prefix))
+            .unwrap_or(sentence)
+            .trim();
         if sentence.is_empty() {
             return "请给出要忘记的事实，例如：忘记：张三是李四的师傅".to_string();
         }

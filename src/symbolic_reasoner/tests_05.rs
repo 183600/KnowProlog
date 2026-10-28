@@ -341,6 +341,37 @@
     }
 
     #[test]
+    fn session_fact_api_accepts_documented_command_prefixes() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let message = reasoner.assert_nl_fact("记住：钱七是孙八的师傅");
+        assert!(message.contains("已记住"), "实际：{}", message);
+        assert!(
+            reasoner
+                .session_facts
+                .iter()
+                .any(|atom| atom.display() == "师傅(孙八, 钱七)"),
+            "命令前缀不得混入主语：{:?}",
+            reasoner
+                .session_facts
+                .iter()
+                .map(|atom| atom.display())
+                .collect::<Vec<_>>()
+        );
+        let proof = reasoner.resolution_proof_report("孙八的师傅是钱七");
+        assert!(proof.contains("得证"), "带前缀写入的事实应可参与推理：{}", proof);
+        let forgotten = reasoner.retract_nl_fact("忘记：钱七是孙八的师傅");
+        assert!(forgotten.contains("已忘记"), "实际：{}", forgotten);
+        assert!(
+            !reasoner
+                .session_facts
+                .iter()
+                .any(|atom| atom.display() == "师傅(孙八, 钱七)"),
+            "带前缀撤回后应移除同一事实"
+        );
+    }
+
+    #[test]
     fn retract_session_fact_is_incremental_and_keeps_graph_duplicates() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
