@@ -467,6 +467,67 @@ fn predicate_matches(knowledge: &dyn DialogueKnowledge, candidate: &str, predica
         || knowledge.predicate_label(predicate) == candidate
         || knowledge.canonical_predicate(predicate).as_deref() == Some(candidate)
 }
+
+/// 绑定帧执行图谱模式时的单轮规模上限：超过就截断，不把穷举当答案。
+const KG_FRAME_MAX_SOLUTIONS: usize = 64;
+const KG_FRAME_MAX_EXPANSIONS: usize = 20_000;
+const KG_FACT_ENTITY_LIMIT: usize = 512;
+
+/// 把知识源暴露的实体、属性和出向关系物化成图事实。
+///
+/// 从本轮槽位种子出发，再吸收 `all_entities` 中有界枚举的实体；关系宾语
+/// 继续入队，因此两跳模式不需要第二套执行器。返回值第二项表示实体枚举
+/// 是否完整：只有完整时才敢把零解说成「无记录」。
+fn kg_facts_from_knowledge(
+    knowledge: &dyn DialogueKnowledge,
+    seeds: &[String],
+) -> (Vec<GraphFact>, bool) {
+    let all_entities = knowledge.all_entities();
+    let complete = all_entities.len() <= KG_FACT_ENTITY_LIMIT;
+    let mut queue = VecDeque::new();
+    let mut seen = BTreeSet::new();
+    for seed in seeds {
+        if seen.insert(seed.clone()) {
+            queue.push_back(seed.clone());
+        }
+    }
+    for entity in all_entities.into_iter().take(KG_FACT_ENTITY_LIMIT) {
+        if seen.insert(entity.clone()) {
+            queue.push_back(entity);
+        }
+    }
+
+    let mut facts = BTreeSet::new();
+    while let Some(entity) = queue.pop_front() {
+        if let Some(entity_type) = knowledge.entity_type(&entity) {
+            facts.insert((
+                0u8,
+                entity.clone(),
+                "type".to_string(),
+                entity_type,
+            ));
+        }
+        for (predicate, value) in knowledge.entity_attributes(&entity) {
+            facts.insert((1u8, entity.clone(), predicate, value));
+        }
+        for (predicate, object) in knowledge.entity_relations(&entity) {
+            facts.insert((2u8, entity.clone(), predicate, object.clone()));
+            if seen.len() < KG_FACT_ENTITY_LIMIT && seen.insert(object.clone()) {
+                queue.push_back(object);
+            }
+        }
+    }
+
+    let facts = facts
+        .into_iter()
+        .map(|(source, subject, predicate, object)| match source {
+            0 => GraphFact::type_assertion(subject, object),
+            1 => GraphFact::attribute(subject, predicate, object),
+            _ => GraphFact::relation(subject, predicate, object),
+        })
+        .collect();
+    (facts, complete)
+}
 fn clarification_candidates(
     _frame: &CompiledFrame,
     slot: &FrameSlotConfig,

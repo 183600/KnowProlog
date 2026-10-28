@@ -1,7 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use serde::{Deserialize, Serialize};
+use crate::conversational_graph::{GraphFact, MatchOptions};
 use crate::dialogue_manager::{DialogueKnowledge, MoveKind};
+use crate::kg_pattern::{KgPattern, KgPatternDecl, KgPatternRegistry};
 use crate::quantity::{self, Comparison, Quantity};
 /// 继承槽位的逻辑轮次时限。
 pub const FRAME_ENV_TTL: u64 = 8;
@@ -18,6 +20,9 @@ pub struct DialogueFramesConfig {
     pub enabled: bool,
     #[serde(default)]
     pub frames: Vec<FrameSchemaConfig>,
+    /// 帧目标可引用的图谱模式；与帧一起编译，避免运行期再解析字符串。
+    #[serde(default)]
+    pub kg_patterns: Vec<KgPatternDecl>,
 }
 /// 一个帧声明：模式、槽位、目标与措辞。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +127,12 @@ pub enum FrameGoalConfig {
         #[serde(default = "default_winner_output")]
         output: String,
     },
+    /// 任意已编译图谱模式：`bind` 把模式变量映射到帧槽位。
+    Pattern {
+        pattern: String,
+        #[serde(default)]
+        bind: BTreeMap<String, String>,
+    },
 }
 fn default_value_output() -> String {
     "value".to_string()
@@ -208,6 +219,12 @@ enum CompiledGoal {
         attribute: Operand,
         output: String,
     },
+    Pattern {
+        pattern: String,
+        bind: BTreeMap<String, String>,
+        inputs: Vec<String>,
+        outputs: Vec<String>,
+    },
 }
 impl CompiledGoal {
     fn kind_label(&self) -> &'static str {
@@ -217,16 +234,18 @@ impl CompiledGoal {
             CompiledGoal::ReverseRelation { .. } => "reverse_relation",
             CompiledGoal::Count { .. } => "count",
             CompiledGoal::Compare { .. } => "compare",
+            CompiledGoal::Pattern { .. } => "pattern",
         }
     }
 
-    fn output_slot(&self) -> &str {
+    fn output_slots(&self) -> Vec<String> {
         match self {
             CompiledGoal::Attribute { output, .. }
             | CompiledGoal::Relation { output, .. }
             | CompiledGoal::ReverseRelation { output, .. }
             | CompiledGoal::Count { output, .. }
-            | CompiledGoal::Compare { output, .. } => output,
+            | CompiledGoal::Compare { output, .. } => vec![output.clone()],
+            CompiledGoal::Pattern { outputs, .. } => outputs.clone(),
         }
     }
 
@@ -251,6 +270,9 @@ impl CompiledGoal {
                 attribute,
                 ..
             } => vec![left, right, attribute],
+            CompiledGoal::Pattern { inputs, .. } => {
+                return inputs.clone();
+            }
         };
         operands
             .into_iter()
@@ -333,15 +355,34 @@ pub struct FrameProgram {
     enabled: bool,
     frames: Vec<CompiledFrame>,
     ranked: Vec<(usize, usize)>,
+    kg_patterns: KgPatternRegistry,
 }
 impl FrameProgram {
     pub fn compile(config: &DialogueFramesConfig) -> Result<Self, Vec<FrameCompileError>> {
         let mut errors = Vec::new();
+        let kg_patterns = match KgPatternRegistry::from_declarations(&config.kg_patterns) {
+            Ok(registry) => registry,
+            Err(found) => {
+                errors.extend(found.into_iter().map(|error| FrameCompileError {
+                    code: error.code,
+                    path: format!("dialogue_frames.{}", error.path),
+                    message: error.message,
+                }));
+                KgPatternRegistry::empty()
+            }
+        };
+
         let mut frames = Vec::new();
         let mut seen_ids = BTreeSet::new();
 
         for (frame_index, schema) in config.frames.iter().enumerate() {
-            let frame = compile_frame(frame_index, schema, &mut seen_ids, &mut errors);
+            let frame = compile_frame(
+                frame_index,
+                schema,
+                &mut seen_ids,
+                &kg_patterns,
+                &mut errors,
+            );
             if let Some(frame) = frame {
                 frames.push(frame);
             }
@@ -385,6 +426,7 @@ impl FrameProgram {
             enabled: config.enabled,
             frames,
             ranked,
+            kg_patterns,
         })
     }
 
@@ -406,6 +448,10 @@ impl FrameProgram {
 
     pub fn frame_ids(&self) -> Vec<&str> {
         self.frames.iter().map(|frame| frame.id.as_str()).collect()
+    }
+
+    pub fn kg_patterns(&self) -> &KgPatternRegistry {
+        &self.kg_patterns
     }
 
     fn frame(&self, id: &str) -> Option<&CompiledFrame> {
@@ -962,6 +1008,104 @@ impl FrameProgram {
                     attribute: Some(attribute),
                 })
             }
+            CompiledGoal::Pattern {
+                pattern,
+                bind,
+                inputs,
+                ..
+            } => {
+                let spec = self.kg_patterns.get(pattern)?;
+                if inputs
+                    .iter()
+                    .any(|slot| !resolved.bindings.contains_key(slot))
+                {
+                    return None;
+                }
+                let mut input = BTreeMap::new();
+                for (variable, slot) in bind {
+                    if let Some(value) = resolved.bindings.get(slot) {
+                        input.insert(variable.clone(), value.clone());
+                    }
+                }
+                let seeds: Vec<String> = inputs
+                    .iter()
+                    .filter_map(|slot| resolved.bindings.get(slot).cloned())
+                    .collect();
+                let (facts, complete) = kg_facts_from_knowledge(knowledge, &seeds);
+                let result = spec.execute(
+                    &facts,
+                    &input,
+                    complete,
+                    MatchOptions::new(KG_FRAME_MAX_SOLUTIONS, KG_FRAME_MAX_EXPANSIONS),
+                );
+                if !result.is_proven() {
+                    return None;
+                }
+                let values = result.answer_values();
+                let mut bindings = resolved.bindings.clone();
+                bindings.insert("values".to_string(), values.join("、"));
+                bindings.insert("count".to_string(), result.total.to_string());
+                for (variable, slot) in bind {
+                    if spec.is_selected(variable) {
+                        if let Some(value) = result.first_value(variable) {
+                            bindings.insert(slot.clone(), value.to_string());
+                        }
+                    }
+                }
+                let vars = self.render_vars(frame, &bindings, knowledge);
+                let text = frame
+                    .realize_answer
+                    .as_ref()
+                    .and_then(|template| render_template(template, &vars))
+                    .unwrap_or_else(|| {
+                        if result.total == 0 {
+                            "没有找到匹配的记录。".to_string()
+                        } else {
+                            format!("查询结果：{}。", values.join("、"))
+                        }
+                    });
+                let mut evidence = vec![format!(
+                    "图谱模式「{}」{}（指纹 {}）",
+                    spec.id(),
+                    if spec.description().is_empty() {
+                        String::new()
+                    } else {
+                        format!("：{}", spec.description())
+                    },
+                    spec.semantic_fingerprint()
+                )];
+                evidence.extend(result.evidence_lines());
+                let entity = inputs
+                    .iter()
+                    .find(|slot| {
+                        frame.slots.get(*slot).map(|slot| slot.sort) == Some(SlotSort::Entity)
+                    })
+                    .and_then(|slot| bindings.get(slot))
+                    .cloned()
+                    .or_else(|| {
+                        bind.iter()
+                            .find(|(variable, _)| spec.is_selected(variable))
+                            .and_then(|(_, slot)| bindings.get(slot))
+                            .cloned()
+                    });
+                let attribute = inputs
+                    .iter()
+                    .find(|slot| {
+                        matches!(
+                            frame.slots.get(*slot).map(|slot| slot.sort),
+                            Some(SlotSort::Predicate | SlotSort::Attribute)
+                        )
+                    })
+                    .and_then(|slot| bindings.get(slot))
+                    .cloned();
+                Some(Executed {
+                    text,
+                    bindings,
+                    evidence,
+                    entity,
+                    attribute,
+                })
+            }
         }
     }
 
@@ -1036,6 +1180,10 @@ impl FrameProgram {
                     })
                     .unwrap_or_default()
             }
+            CompiledGoal::Pattern { .. } => bindings
+                .get("values")
+                .map(|value| vec![value.clone()])
+                .unwrap_or_default(),
         };
         vars.insert("values".to_string(), values.join("、"));
         vars.insert(
@@ -1047,7 +1195,16 @@ impl FrameProgram {
             "object".to_string(),
             values.first().cloned().unwrap_or_default(),
         );
-        vars.insert("count".to_string(), values.len().to_string());
+        vars.insert(
+            "count".to_string(),
+            match &frame.goal {
+                CompiledGoal::Pattern { .. } => bindings
+                    .get("count")
+                    .cloned()
+                    .unwrap_or_else(|| values.len().to_string()),
+                _ => values.len().to_string(),
+            },
+        );
         if let CompiledGoal::Compare {
             left,
             right,
@@ -1116,6 +1273,7 @@ fn compile_frame(
     frame_index: usize,
     schema: &FrameSchemaConfig,
     seen_ids: &mut BTreeSet<String>,
+    kg_patterns: &KgPatternRegistry,
     errors: &mut Vec<FrameCompileError>,
 ) -> Option<CompiledFrame> {
     let base = format!("frames[{}]", frame_index);
@@ -1202,38 +1360,46 @@ fn compile_frame(
         patterns.push(pattern);
     }
 
-    let goal = match compile_goal(&schema.goal, &slots, &format!("{}.goal", base), errors) {
+    let goal = match compile_goal(
+        &schema.goal,
+        &slots,
+        kg_patterns,
+        &format!("{}.goal", base),
+        errors,
+    ) {
         Some(goal) => goal,
         None => return None,
     };
-    let output = goal.output_slot().to_string();
-    if !slots.contains_key(&output) {
-        errors.push(FrameCompileError {
-            code: "frame_output_undeclared",
-            path: format!("{}.goal.output", base),
-            message: format!(
-                "目标输出槽「{}」未声明；答案模板无法安全渲染未声明变量",
-                output
-            ),
-        });
-    }
-    if goal.input_slots().iter().any(|slot| slot == &output) {
-        errors.push(FrameCompileError {
-            code: "frame_output_is_input",
-            path: format!("{}.goal.output", base),
-            message: format!("槽位「{}」同时被目标读取与写入", output),
-        });
-    }
-    if slots
-        .get(&output)
-        .map(|slot| slot.required)
-        .unwrap_or(false)
-    {
-        errors.push(FrameCompileError {
-            code: "frame_output_required",
-            path: format!("{}.slots", base),
-            message: format!("输出槽「{}」不能声明为必填输入槽", output),
-        });
+    let outputs = goal.output_slots();
+    for output in &outputs {
+        if !slots.contains_key(output) {
+            errors.push(FrameCompileError {
+                code: "frame_output_undeclared",
+                path: format!("{}.goal.output", base),
+                message: format!(
+                    "目标输出槽「{}」未声明；答案模板无法安全渲染未声明变量",
+                    output
+                ),
+            });
+        }
+        if goal.input_slots().iter().any(|slot| slot == output) {
+            errors.push(FrameCompileError {
+                code: "frame_output_is_input",
+                path: format!("{}.goal.output", base),
+                message: format!("槽位「{}」同时被目标读取与写入", output),
+            });
+        }
+        if slots
+            .get(output)
+            .map(|slot| slot.required)
+            .unwrap_or(false)
+        {
+            errors.push(FrameCompileError {
+                code: "frame_output_required",
+                path: format!("{}.slots", base),
+                message: format!("输出槽「{}」不能声明为必填输入槽", output),
+            });
+        }
     }
 
     for template in [&schema.realize.answer, &schema.realize.empty]
@@ -1270,7 +1436,7 @@ fn compile_frame(
         if !slot.required {
             continue;
         }
-        if name == &output {
+        if outputs.iter().any(|output| output == name) {
             continue;
         }
         let in_all_patterns = patterns
@@ -1409,6 +1575,7 @@ fn compile_pattern(source: &str, path: &str) -> Result<CompiledPattern, FrameCom
 fn compile_goal(
     goal: &FrameGoalConfig,
     slots: &BTreeMap<String, FrameSlotConfig>,
+    kg_patterns: &KgPatternRegistry,
     path: &str,
     errors: &mut Vec<FrameCompileError>,
 ) -> Option<CompiledGoal> {
@@ -1487,5 +1654,74 @@ fn compile_goal(
             attribute: compile_operand(attribute, "attribute", errors)?,
             output: output.clone(),
         },
+        FrameGoalConfig::Pattern { pattern, bind } => {
+            let Some(spec) = kg_patterns.get(pattern.trim()) else {
+                errors.push(FrameCompileError {
+                    code: "frame_goal_pattern_unknown",
+                    path: format!("{}.pattern", path),
+                    message: format!(
+                        "帧目标引用了未声明的图谱模式「{}」；请先在 dialogue_frames.kg_patterns 中声明",
+                        pattern
+                    ),
+                });
+                return None;
+            };
+            let variables = spec.variables();
+            let mut inputs = Vec::new();
+            let mut outputs = Vec::new();
+            let mut compiled_bind = BTreeMap::new();
+            for (variable, slot) in bind {
+                let name = variable.trim().trim_start_matches('?');
+                if !variables.contains(name) {
+                    errors.push(FrameCompileError {
+                        code: "frame_goal_pattern_bind_unknown",
+                        path: format!("{}.bind.{}", path, variable),
+                        message: format!(
+                            "绑定引用了图谱模式「{}」中不存在的变量「{}」",
+                            spec.id(),
+                            name
+                        ),
+                    });
+                    continue;
+                }
+                if !slots.contains_key(slot) {
+                    errors.push(FrameCompileError {
+                        code: "frame_goal_slot_unknown",
+                        path: format!("{}.bind.{}", path, variable),
+                        message: format!("模式绑定引用了未声明槽位「{}」", slot),
+                    });
+                    continue;
+                }
+                if spec.is_selected(name) {
+                    outputs.push(slot.clone());
+                } else {
+                    inputs.push(slot.clone());
+                }
+                compiled_bind.insert(name.to_string(), slot.clone());
+            }
+            for variable in spec.select() {
+                if !compiled_bind.contains_key(variable) {
+                    errors.push(FrameCompileError {
+                        code: "frame_goal_pattern_output_unbound",
+                        path: format!("{}.bind", path),
+                        message: format!(
+                            "图谱模式「{}」的投影变量「{}」没有绑定到输出槽",
+                            spec.id(),
+                            variable
+                        ),
+                    });
+                }
+            }
+            inputs.sort();
+            inputs.dedup();
+            outputs.sort();
+            outputs.dedup();
+            CompiledGoal::Pattern {
+                pattern: spec.id().to_string(),
+                bind: compiled_bind,
+                inputs,
+                outputs,
+            }
+        }
     })
 }
