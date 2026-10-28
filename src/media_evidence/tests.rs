@@ -869,3 +869,13 @@ fn publish_file_is_bounded_idempotent_and_directory_safe() {
         "io"
     );
 }
+
+#[test]
+fn media_types_are_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MediaStore>();
+    assert_send_sync::<SessionMedia>();
+    assert_send_sync::<MediaSelector>();
+    assert_send_sync::<TableGrid>();
+    assert_send_sync::<MediaTurn>();
+}
