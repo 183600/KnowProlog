@@ -128,11 +128,20 @@ impl TypeProfile {
         } else {
             (self.covered_members * 1000 / self.total_members).min(1000)
         };
+        let calibrated = crate::quantifier::calibrate_counts(
+            self.covered_members as u64,
+            self.total_members as u64,
+        )
+        .map(|estimate| estimate.label_zh())
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("，{}", label))
+        .unwrap_or_default();
         output.push_str(&format!(
-            "  覆盖：{}/{} 个成员至少有 1 条事实（{}%）；谓词 {} 种。\n",
+            "  覆盖：{}/{} 个成员至少有 1 条事实（{}%{}）；谓词 {} 种。\n",
             self.covered_members,
             self.total_members,
             coverage / 10,
+            calibrated,
             self.total_predicates
         ));
         if self.predicates.is_empty() {

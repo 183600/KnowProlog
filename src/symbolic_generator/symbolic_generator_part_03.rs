@@ -721,6 +721,7 @@ mod tests {
         assert!(report.contains("类型画像「人物」"), "{}", report);
         assert!(report.contains("成员：张三、李四、王五"), "{}", report);
         assert!(report.contains("覆盖：2/3"), "{}", report);
+        assert!(report.contains("许多"), "{}", report);
         assert!(report.contains("师傅"), "{}", report);
         assert!(report.contains("样例事实"), "{}", report);
         assert_eq!(report, generator.type_profile_report("人物").unwrap());
