@@ -367,7 +367,6 @@ impl fmt::Display for MediaError {
                 write!(formatter, "锚点数量已达上限 {}", limit)
             }
             MediaError::EmptyAnchorText => write!(formatter, "锚点文本不能为空"),
-            MediaError::EmptyAnchorText => write!(formatter, "锚点文本不能为空"),
             MediaError::AnchorTextTooLong { actual, limit } => {
                 write!(formatter, "锚点文本过长（{} > {} 字符）", actual, limit)
             }
