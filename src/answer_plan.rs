@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::confidence::ClaimEnvelope;
 use crate::context_image::fnv1a_hex;
+use crate::media_evidence::{Locator, MediaCitation};
 
 /// 回答计划的结构版本；不兼容变更时递增。
 pub const ANSWER_PLAN_VERSION: u32 = 1;
@@ -64,6 +65,46 @@ impl ClaimEvidence {
     }
 }
 
+/// 回答计划中的媒体引用：结构化定位 + 整数置信度，保持计划可比较。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanMediaCitation {
+    pub asset_id: String,
+    pub asset_label: String,
+    pub anchor_id: String,
+    pub locator: Locator,
+    pub extractor: String,
+    /// 置信度的万分之一整数表示（0..=10000），避免浮点进入计划身份。
+    pub confidence_bps: u16,
+}
+
+impl PlanMediaCitation {
+    pub fn render_zh(&self) -> String {
+        format!(
+            "{} · {} · {}（置信度 {:.2}）",
+            self.asset_label,
+            self.locator.label_zh(),
+            self.extractor,
+            self.confidence_bps as f64 / 10_000.0
+        )
+    }
+}
+
+impl From<&MediaCitation> for PlanMediaCitation {
+    fn from(citation: &MediaCitation) -> Self {
+        let confidence_bps = (citation.confidence * 10_000.0)
+            .round()
+            .clamp(0.0, 10_000.0) as u16;
+        Self {
+            asset_id: citation.asset_id.as_str().to_string(),
+            asset_label: citation.asset_label.clone(),
+            anchor_id: citation.anchor_id.as_str().to_string(),
+            locator: citation.locator.clone(),
+            extractor: citation.extractor.clone(),
+            confidence_bps,
+        }
+    }
+}
+
 /// 一条可被表达层选择的命题。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanClaim {
@@ -83,6 +124,9 @@ pub struct PlanClaim {
     /// 该命题依据的事实三元组；空证据跳过序列化，旧计划字节不变。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<ClaimEvidence>,
+    /// 该命题可引用的媒体锚点；空引用跳过序列化，旧计划字节不变。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<PlanMediaCitation>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -103,6 +147,7 @@ impl PlanClaim {
             session,
             envelope: None,
             evidence: Vec::new(),
+            media: Vec::new(),
         }
     }
 
@@ -118,11 +163,63 @@ impl PlanClaim {
         self
     }
 
+    /// 附加/覆盖命题可引用的媒体锚点；空引用不会写入序列化。
+    pub fn with_media_citations(mut self, media: Vec<PlanMediaCitation>) -> Self {
+        self.media = media;
+        self
+    }
+
     fn evidence_note(&self) -> String {
         if self.evidence.is_empty() {
             return String::new();
         }
         format!("；依据：{}", self.evidence_digest())
+    }
+
+    fn media_note(&self, detailed: bool) -> String {
+        if self.media.is_empty() {
+            return String::new();
+        }
+        let mut shown: Vec<&PlanMediaCitation> = if detailed {
+            self.media.iter().collect()
+        } else {
+            self.media
+                .iter()
+                .max_by(|left, right| {
+                    left.confidence_bps
+                        .cmp(&right.confidence_bps)
+                        .then_with(|| right.asset_id.cmp(&left.asset_id))
+                        .then_with(|| right.anchor_id.cmp(&left.anchor_id))
+                })
+                .into_iter()
+                .collect()
+        };
+        shown.sort_by(|left, right| {
+            left.asset_id
+                .cmp(&right.asset_id)
+                .then_with(|| left.anchor_id.cmp(&right.anchor_id))
+        });
+        let rendered = shown
+            .iter()
+            .map(|citation| citation.render_zh())
+            .collect::<Vec<_>>()
+            .join("；");
+        if detailed && self.media.len() > 3 {
+            format!("；媒体：{}；等 {} 条", rendered, self.media.len())
+        } else {
+            format!("；媒体：{}", rendered)
+        }
+    }
+
+    fn media_digest(&self) -> String {
+        if self.media.is_empty() {
+            return "无".to_string();
+        }
+        self.media
+            .iter()
+            .map(PlanMediaCitation::render_zh)
+            .collect::<Vec<_>>()
+            .join("；")
     }
 
     fn evidence_digest(&self) -> String {
@@ -246,6 +343,24 @@ impl AnswerPlan {
                 "\n{}|{}|{}|{}",
                 claim.slot, claim.predicate, claim.text, claim.session
             );
+            let mut media: Vec<&PlanMediaCitation> = claim.media.iter().collect();
+            media.sort_by(|left, right| {
+                left.asset_id
+                    .cmp(&right.asset_id)
+                    .then_with(|| left.anchor_id.cmp(&right.anchor_id))
+                    .then_with(|| left.confidence_bps.cmp(&right.confidence_bps))
+            });
+            for citation in media {
+                let _ = write!(
+                    material,
+                    "|m:{}|{}|{}|{}|{}",
+                    citation.asset_id,
+                    citation.anchor_id,
+                    citation.locator.label_zh(),
+                    citation.extractor,
+                    citation.confidence_bps
+                );
+            }
             if let Some(envelope) = claim.envelope {
                 let _ = write!(
                     material,
@@ -321,10 +436,15 @@ impl AnswerPlan {
                             "（谓词：{}；来源：{}）{}",
                             claim.predicate,
                             claim.source_label(),
-                            format!("{}{}", claim.envelope_note(), claim.evidence_note())
+                            format!(
+                                "{}{}{}",
+                                claim.envelope_note(),
+                                claim.evidence_note(),
+                                claim.media_note(true)
+                            )
                         )
                     } else {
-                        String::new()
+                        claim.media_note(false)
                     }
                 ),
                 Some(&claim.slot),
@@ -374,7 +494,12 @@ impl AnswerPlan {
                 claim.text.trim(),
                 claim.predicate,
                 claim.source_label(),
-                format!("{}{}", claim.envelope_note(), claim.evidence_note())
+                format!(
+                    "{}{}{}",
+                    claim.envelope_note(),
+                    claim.evidence_note(),
+                    claim.media_note(true)
+                )
             ),
             Some(&claim.slot),
             Some(index),
@@ -831,10 +956,36 @@ impl PlanDiff {
                                 && before.predicate == after.predicate
                                 && before.session == after.session
                                 && before.evidence != after.evidence
+                                && before.media == after.media
                         }
                         _ => false,
                     };
-                    if evidence_only {
+                    let media_only = match (&change.before, &change.after) {
+                        (Some(before), Some(after)) => {
+                            before.text == after.text
+                                && before.predicate == after.predicate
+                                && before.session == after.session
+                                && before.evidence == after.evidence
+                                && before.media != after.media
+                        }
+                        _ => false,
+                    };
+                    if media_only {
+                        let before_media = change
+                            .before
+                            .as_ref()
+                            .map(PlanClaim::media_digest)
+                            .unwrap_or_else(|| "无".to_string());
+                        let after_media = change
+                            .after
+                            .as_ref()
+                            .map(PlanClaim::media_digest)
+                            .unwrap_or_else(|| "无".to_string());
+                        output.push_str(&format!(
+                            "  [更新] {}：{}（媒体：{} → {}）\n",
+                            change.slot, after, before_media, after_media
+                        ));
+                    } else if evidence_only {
                         let before_evidence = change
                             .before
                             .as_ref()
@@ -1632,5 +1783,98 @@ mod tests {
         assert_eq!(restored, brief);
         assert_ne!(brief.event_id(0), detailed.event_id(0));
         assert_eq!(brief.event_id(brief.len()), None);
+    }
+
+    fn media_plan_citation(label: &str, confidence: f64) -> PlanMediaCitation {
+        use crate::media_evidence::{
+            AnchorDraft, Locator, MediaLimits, MediaStore, Modality,
+        };
+        let mut store = MediaStore::new(MediaLimits::default());
+        let bytes = format!("{}|{}", label, confidence);
+        let asset = store
+            .publish(Modality::Table, "text/csv", label, bytes.as_bytes())
+            .unwrap();
+        let anchor = store
+            .add_anchor(
+                &asset.id,
+                AnchorDraft::new(
+                    Locator::TableCell { row: 3, column: 2 },
+                    "1981",
+                    "table_parser",
+                    confidence,
+                ),
+            )
+            .unwrap();
+        PlanMediaCitation::from(&anchor.citation(&asset))
+    }
+
+    #[test]
+    fn media_citations_are_optional_serialized_and_change_identity() {
+        let plain = AnswerPlan::new(
+            "q",
+            "公司",
+            1,
+            vec![PlanClaim::new("s", "p", "公司成立于1981年。", false)],
+            0,
+            0,
+        );
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("media"), "空媒体引用不得增加序列化字节：{}", json);
+
+        let citation = media_plan_citation("表 1", 0.92);
+        let annotated = AnswerPlan::new(
+            "q",
+            "公司",
+            1,
+            vec![PlanClaim::new("s", "p", "公司成立于1981年。", false)
+                .with_media_citations(vec![citation])],
+            0,
+            0,
+        );
+        assert_ne!(plain.id, annotated.id, "媒体引用属于计划内容，必须进入指纹");
+        let json = serde_json::to_string(&annotated).unwrap();
+        assert!(json.contains("media"));
+        let detailed = annotated.realize(StyleDirective::Detailed).unwrap();
+        assert!(detailed.contains("媒体：表 1"), "{}", detailed);
+        assert!(detailed.contains("表格第 3 行第 2 列"), "{}", detailed);
+        assert!(detailed.contains("table_parser"), "{}", detailed);
+    }
+
+    #[test]
+    fn brief_shows_strongest_media_citation_and_diff_tracks_media_only_updates() {
+        let weak = media_plan_citation("表 1", 0.40);
+        let strong = media_plan_citation("表 2", 0.95);
+        let claim = PlanClaim::new("s", "p", "公司成立于1981年。", false)
+            .with_media_citations(vec![weak.clone(), strong.clone()]);
+        let plan = AnswerPlan::new("q", "公司", 1, vec![claim], 0, 0);
+        let brief = plan.realize(StyleDirective::Brief).unwrap();
+        assert!(brief.contains("表 2"), "{}", brief);
+        assert!(!brief.contains("表 1"), "{}", brief);
+        let detailed = plan.realize(StyleDirective::Detailed).unwrap();
+        assert!(detailed.contains("表 1") && detailed.contains("表 2"), "{}", detailed);
+
+        let before = AnswerPlan::new(
+            "q",
+            "公司",
+            1,
+            vec![PlanClaim::new("s", "p", "公司成立于1981年。", false)
+                .with_media_citations(vec![weak])],
+            0,
+            0,
+        );
+        let after = AnswerPlan::new(
+            "q",
+            "公司",
+            1,
+            vec![PlanClaim::new("s", "p", "公司成立于1981年。", false)
+                .with_media_citations(vec![strong])],
+            0,
+            0,
+        );
+        let diff = before.diff(&after);
+        assert_eq!(diff.counts().0, 1);
+        let rendered = diff.render_zh(false);
+        assert!(rendered.contains("媒体：表 1"), "{}", rendered);
+        assert!(rendered.contains("表 2"), "{}", rendered);
     }
 }
