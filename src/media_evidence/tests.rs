@@ -168,6 +168,38 @@ fn anchors_validate_modality_text_confidence_and_capacity() {
             .unwrap_err(),
         MediaError::EmptyExtractor
     );
+    assert_eq!(
+        store
+            .add_anchor(
+                &asset.id,
+                AnchorDraft::new(Locator::Whole, "x", "x".repeat(81), 0.5)
+            )
+            .unwrap_err()
+            .code(),
+        "extractor_too_long"
+    );
+    assert_eq!(
+        store
+            .add_anchor(
+                &asset.id,
+                AnchorDraft::new(Locator::Whole, "x", "ocr", 0.5)
+                    .with_entities((0..33).map(|index| format!("实体{index}")).collect())
+            )
+            .unwrap_err()
+            .code(),
+        "anchor_entity_capacity_exceeded"
+    );
+    assert_eq!(
+        store
+            .add_anchor(
+                &asset.id,
+                AnchorDraft::new(Locator::Whole, "x", "ocr", 0.5)
+                    .with_entities(vec!["长".repeat(81)])
+            )
+            .unwrap_err()
+            .code(),
+        "anchor_entity_too_long"
+    );
     store
         .add_anchor(
             &asset.id,
@@ -182,7 +214,11 @@ fn anchors_validate_modality_text_confidence_and_capacity() {
                 "ocr",
                 0.8,
             )
-            .with_entities(vec!["姚明".to_string()]),
+            .with_entities(vec![
+                " 姚明 ".to_string(),
+                "姚明".to_string(),
+                String::new(),
+            ]),
         )
         .unwrap();
     assert_eq!(

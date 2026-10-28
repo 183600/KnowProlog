@@ -6,8 +6,8 @@ use crate::context_image::fnv1a_hex;
 
 use super::anchor::{Anchor, AnchorDraft};
 use super::asset::{
-    AnchorId, AssetId, AssetRecord, MediaError, MediaLimits, Modality, MAX_LABEL_CHARS,
-    MAX_MEDIA_TYPE_CHARS,
+    AnchorId, AssetId, AssetRecord, MediaError, MediaLimits, Modality, MAX_ANCHOR_ENTITIES,
+    MAX_ENTITY_CHARS, MAX_EXTRACTOR_CHARS, MAX_LABEL_CHARS, MAX_MEDIA_TYPE_CHARS,
 };
 
 /// 已存资产（字节不可变，锚点有界追加）。
@@ -218,19 +218,49 @@ impl MediaStore {
                 limit: self.limits.max_anchor_text_chars,
             });
         }
-        if draft.extractor.trim().is_empty() {
+        let extractor = draft.extractor.trim();
+        if extractor.is_empty() {
             return Err(MediaError::EmptyExtractor);
+        }
+        let extractor_len = extractor.chars().count();
+        if extractor_len > MAX_EXTRACTOR_CHARS {
+            return Err(MediaError::ExtractorTooLong {
+                actual: extractor_len,
+                limit: MAX_EXTRACTOR_CHARS,
+            });
         }
         if !draft.confidence.is_finite() || !(0.0..=1.0).contains(&draft.confidence) {
             return Err(MediaError::InvalidConfidence);
+        }
+        let mut entities: Vec<String> = Vec::new();
+        for entity in draft.entities {
+            let entity = entity.trim();
+            if entity.is_empty() {
+                continue;
+            }
+            let entity_len = entity.chars().count();
+            if entity_len > MAX_ENTITY_CHARS {
+                return Err(MediaError::AnchorEntityTooLong {
+                    actual: entity_len,
+                    limit: MAX_ENTITY_CHARS,
+                });
+            }
+            if !entities.iter().any(|existing| existing == entity) {
+                entities.push(entity.to_string());
+            }
+        }
+        if entities.len() > MAX_ANCHOR_ENTITIES {
+            return Err(MediaError::AnchorEntityCapacityExceeded {
+                limit: MAX_ANCHOR_ENTITIES,
+            });
         }
         let anchor = Anchor {
             id: AnchorId(format!("a{}", self.next_anchor_sequence)),
             locator: draft.locator,
             text: draft.text,
-            extractor: draft.extractor.trim().to_string(),
+            extractor: extractor.to_string(),
             confidence: draft.confidence,
-            entities: draft.entities,
+            entities,
         };
         self.next_anchor_sequence = self.next_anchor_sequence.saturating_add(1);
         if let Some(stored) = self.assets.get_mut(asset_id) {

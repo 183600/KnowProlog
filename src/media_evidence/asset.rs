@@ -20,6 +20,12 @@ pub const DEFAULT_MAX_ANCHOR_TEXT: usize = 4096;
 pub const DEFAULT_MAX_SESSION_ASSETS: usize = 32;
 /// 资产标签字符上限。
 pub const MAX_LABEL_CHARS: usize = 80;
+/// 单条锚点携带的实体数量上限。
+pub const MAX_ANCHOR_ENTITIES: usize = 32;
+/// 单个锚点实体字符上限（与标签同宽）。
+pub const MAX_ENTITY_CHARS: usize = 80;
+/// 提取器名字符上限。
+pub const MAX_EXTRACTOR_CHARS: usize = 80;
 /// MIME 类型字符上限。
 pub const MAX_MEDIA_TYPE_CHARS: usize = 120;
 /// 澄清提示中最多展示的候选数。
@@ -266,6 +272,17 @@ pub enum MediaError {
         limit: usize,
     },
     EmptyExtractor,
+    ExtractorTooLong {
+        actual: usize,
+        limit: usize,
+    },
+    AnchorEntityCapacityExceeded {
+        limit: usize,
+    },
+    AnchorEntityTooLong {
+        actual: usize,
+        limit: usize,
+    },
     InvalidConfidence,
     InvalidLocator(&'static str),
     InvalidTable(&'static str),
@@ -306,6 +323,9 @@ impl MediaError {
             MediaError::AnchorCapacityExceeded { .. } => "anchor_capacity_exceeded",
             MediaError::AnchorTextTooLong { .. } => "anchor_text_too_long",
             MediaError::EmptyExtractor => "empty_extractor",
+            MediaError::ExtractorTooLong { .. } => "extractor_too_long",
+            MediaError::AnchorEntityCapacityExceeded { .. } => "anchor_entity_capacity_exceeded",
+            MediaError::AnchorEntityTooLong { .. } => "anchor_entity_too_long",
             MediaError::InvalidConfidence => "invalid_confidence",
             MediaError::InvalidLocator(_) => "invalid_locator",
             MediaError::InvalidTable(_) => "invalid_table",
@@ -348,6 +368,15 @@ impl fmt::Display for MediaError {
                 write!(formatter, "锚点文本过长（{} > {} 字符）", actual, limit)
             }
             MediaError::EmptyExtractor => write!(formatter, "抽取器名称不能为空"),
+            MediaError::ExtractorTooLong { actual, limit } => {
+                write!(formatter, "抽取器名称过长（{} > {} 字符）", actual, limit)
+            }
+            MediaError::AnchorEntityCapacityExceeded { limit } => {
+                write!(formatter, "锚点实体过多（上限 {}）", limit)
+            }
+            MediaError::AnchorEntityTooLong { actual, limit } => {
+                write!(formatter, "锚点实体过长（{} > {} 字符）", actual, limit)
+            }
             MediaError::InvalidConfidence => write!(formatter, "置信度必须位于 0..=1"),
             MediaError::InvalidLocator(reason) => write!(formatter, "非法定位符：{}", reason),
             MediaError::InvalidTable(reason) => write!(formatter, "非法表格：{}", reason),
