@@ -676,40 +676,50 @@ fn known_type_mentions(
     text: &str,
 ) -> Vec<TypeMention> {
     let haystack = text.to_ascii_lowercase();
-    let mut surfaces: BTreeMap<String, String> = BTreeMap::new();
-    let register = |surface: &str, etype: &str, surfaces: &mut BTreeMap<String, String>| {
-        let surface = surface.trim();
-        if surface.chars().count() < 2 {
-            return;
-        }
-        if let Some(target) = resolve_target(generator, schema, etype) {
-            surfaces
-                .entry(surface.to_string())
-                .or_insert(target.key);
-        }
-    };
+    let mut surfaces: BTreeMap<String, (u8, String)> = BTreeMap::new();
+    let register =
+        |surface: &str, etype: &str, priority: u8, surfaces: &mut BTreeMap<String, (u8, String)>| {
+            let surface = surface.trim();
+            if surface.chars().count() < 2 {
+                return;
+            }
+            if let Some(target) = resolve_target(generator, schema, etype) {
+                let entry = surfaces
+                    .entry(surface.to_string())
+                    .or_insert_with(|| (priority, target.key.clone()));
+                if priority < entry.0 {
+                    *entry = (priority, target.key);
+                }
+            }
+        };
     for etype in generator.all_types() {
-        register(&etype, &etype, &mut surfaces);
+        register(&etype, &etype, 0, &mut surfaces);
+    }
+    if let Some(schema) = schema {
+        for class in schema.declared_classes() {
+            register(&class, &class, 1, &mut surfaces);
+        }
+        for (alias, _canonical) in schema.type_alias_pairs() {
+            register(&alias, &alias, 2, &mut surfaces);
+        }
+    }
+    for etype in generator.all_types() {
         let label = localized_type_label(&etype);
         if label != etype {
-            register(label, &etype, &mut surfaces);
+            register(label, &etype, 3, &mut surfaces);
         }
     }
     if let Some(schema) = schema {
-        for (alias, _canonical) in schema.type_alias_pairs() {
-            register(&alias, &alias, &mut surfaces);
-        }
         for class in schema.declared_classes() {
-            register(&class, &class, &mut surfaces);
             let label = localized_type_label(&class);
             if label != class {
-                register(label, &class, &mut surfaces);
+                register(label, &class, 3, &mut surfaces);
             }
         }
     }
 
     let mut raw = Vec::new();
-    for (surface, etype) in surfaces {
+    for (surface, (_priority, etype)) in surfaces {
         let needle = surface.to_ascii_lowercase();
         for (start, matched) in haystack.match_indices(&needle) {
             raw.push(TypeMention {
@@ -1185,6 +1195,23 @@ mod tests {
         let answer = answer_with_schema(&generator, Some(&schema), "学生一般有哪些属性")
             .expect("已声明的类型应可诚实回答");
         assert!(answer.text.contains("暂无显式成员"), "{}", answer.text);
+    }
+
+    #[test]
+    fn exact_type_surface_beats_localized_label() {
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.observe_entity("张三", "Person", &[]);
+        generator.observe_entity("李四", "人物", &[]);
+        let parsed = parse(&generator, "人物有哪些成员").unwrap();
+        assert_eq!(
+            parsed,
+            TypeQuestion::Members {
+                etype: "人物".to_string()
+            }
+        );
+        let answer = answer(&generator, "人物有哪些成员").unwrap();
+        assert!(answer.text.contains("李四"), "{}", answer.text);
+        assert!(!answer.text.contains("张三"), "{}", answer.text);
     }
 
     #[test]
