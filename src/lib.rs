@@ -162,6 +162,7 @@ pub mod startup_ledger;
 pub mod streaming_draft;
 pub mod symbolic_generator;
 pub mod symbolic_reasoner;
+pub mod synonym_graph;
 pub mod teachable_assertion;
 pub mod temporal;
 pub mod text_anchor;
