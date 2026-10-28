@@ -885,6 +885,7 @@ mod session_tests {
             "换一个角度",
             "重新介绍",
             "撤销上次导入",
+            "撤销批次：第2批",
         ] {
             assert!(is_command_like(command), "{} 应被识别为系统命令", command);
         }
@@ -940,6 +941,25 @@ mod session_tests {
         // 非导入指令（自然语言条目）不误判
         assert_eq!(parse_import_directive("录入：小明18岁"), None);
         assert_eq!(parse_import_directive("导入jsonld文件"), None);
+    }
+
+    /// 撤销批次指令：支持全角/半角冒号与英文别名，空引用不误判。
+    #[test]
+    fn retract_batch_directive_parses_reference() {
+        assert_eq!(
+            parse_retract_batch_directive("撤销批次：第2批"),
+            Some("第2批".to_string())
+        );
+        assert_eq!(
+            parse_retract_batch_directive("撤销批次: data/sample.ttl"),
+            Some("data/sample.ttl".to_string())
+        );
+        assert_eq!(
+            parse_retract_batch_directive("retract batch: B1"),
+            Some("B1".to_string())
+        );
+        assert_eq!(parse_retract_batch_directive("撤销批次："), None);
+        assert_eq!(parse_retract_batch_directive("撤销上次导入"), None);
     }
 
     /// 帮助页覆盖关键入口（录入 / 导入 / 查询 / 退出），避免手册与实现漂移

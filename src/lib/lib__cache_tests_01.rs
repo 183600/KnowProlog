@@ -1858,6 +1858,128 @@
         assert!(exported[0].object.to_string().contains("甲"));
     }
 
+    /// 批次撤销只回撤本批首次新增；共享断言在最后一个持有者撤销时才移除。
+    #[tokio::test]
+    async fn retract_import_batch_respects_shared_assertions() {
+        let (manager, _dir) = temp_manager().await;
+        let first = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/甲> <http://example.org/kg/name> \"甲\" .
+                 <http://example.org/kg/entity/共同> <http://example.org/kg/name> \"共同\" ."
+                    .as_bytes(),
+                "first.ttl",
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/乙> <http://example.org/kg/name> \"乙\" .
+                 <http://example.org/kg/entity/共同> <http://example.org/kg/name> \"共同\" ."
+                    .as_bytes(),
+                "second.ttl",
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.added, 1);
+        assert_eq!(second.duplicates, 1);
+
+        let retraction = manager.retract_import_batch(&first.episode).await.unwrap();
+        assert_eq!(retraction.removed, 1, "只移除甲");
+        assert_eq!(retraction.kept_elsewhere, 1, "共同仍被第二批持有");
+        assert_eq!(retraction.batch_assertions, 2);
+        assert!(retraction.summary().contains("保留 1 条"));
+        let default = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert_eq!(default.data.len(), 2, "{:?}", default.data);
+        let batch = manager
+            .query_sparql(&format!(
+                "SELECT ?s WHERE {{ GRAPH <{}> {{ ?s ?p ?o }} }}",
+                first.episode.batch_graph
+            ))
+            .await
+            .unwrap();
+        assert!(batch.data.is_empty(), "批次图应被移除");
+        let episodes = manager.load_import_episodes().await.unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].seq, second.episode.seq);
+
+        let retraction = manager.retract_import_batch(&second.episode).await.unwrap();
+        assert_eq!(retraction.removed, 2, "最后持有者撤销后共享断言也应移除");
+        assert_eq!(retraction.kept_elsewhere, 0);
+        let default = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert!(default.data.is_empty(), "{:?}", default.data);
+        assert!(manager.load_import_episodes().await.unwrap().is_empty());
+    }
+
+    /// 导入前已存在的手动断言不能被批次撤销误删。
+    #[tokio::test]
+    async fn retract_import_batch_preserves_manual_assertions() {
+        let (manager, _dir) = temp_manager().await;
+        manager
+            .import_rdf_reader(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/甲> <http://example.org/kg/name> \"甲\" ."
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let batch = manager
+            .import_rdf_batch(
+                oxigraph::io::RdfFormat::Turtle,
+                "<http://example.org/kg/entity/甲> <http://example.org/kg/name> \"甲\" .
+                 <http://example.org/kg/entity/乙> <http://example.org/kg/name> \"乙\" ."
+                    .as_bytes(),
+                "mixed.ttl",
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.added, 1);
+        assert_eq!(batch.duplicates, 1);
+        let retraction = manager.retract_import_batch(&batch.episode).await.unwrap();
+        assert_eq!(retraction.removed, 1, "只移除批次新增的乙");
+        let default = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .unwrap();
+        assert_eq!(default.data.len(), 1);
+        assert!(
+            default.data[0]
+                .get("s")
+                .is_some_and(|value| value.to_string().contains("甲")),
+            "{:?}",
+            default.data
+        );
+    }
+
+    /// 未知批次撤销返回错误，且不改变现有数据。
+    #[tokio::test]
+    async fn retract_import_batch_rejects_unknown_batch() {
+        let (manager, _dir) = temp_manager().await;
+        let episode = crate::import_episode::ImportEpisode {
+            seq: 9,
+            id: "missing0000".to_string(),
+            source: "missing.ttl".to_string(),
+            sources: Vec::new(),
+            format: "Turtle".to_string(),
+            imported_at: 0,
+            total: 0,
+            added: 0,
+            duplicates: 0,
+            blank_nodes: false,
+            input_named_graphs: 0,
+            batch_graph: crate::import_episode::batch_graph_iri("missing0000"),
+            gist: crate::import_episode::BatchGist::default(),
+        };
+        assert!(manager.retract_import_batch(&episode).await.is_err());
+    }
+
     /// 批次问题只在出现批次线索时回答；类型名单与单主体事实来自批次命名图。
     #[tokio::test]
     async fn import_episode_answers_are_scoped_to_the_batch_graph() {

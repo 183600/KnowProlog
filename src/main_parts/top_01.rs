@@ -189,6 +189,12 @@ enum Commands {
         #[arg(long)]
         export: Option<String>,
     },
+    /// Retract a recorded RDF import batch: remove its first-time additions
+    /// from the default graph, then drop the batch graph and episode metadata
+    RetractBatch {
+        /// Batch reference (这批 / 上一批 / 第 N 批 / source file / batch id)
+        reference: String,
+    },
     /// Batch-import natural-language sentences with the explicitly adopted
     /// batch-teaching rules (base extraction rules still run first)
     BatchImport {

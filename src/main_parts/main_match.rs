@@ -248,6 +248,36 @@
                 );
             }
         }
+        Some(Commands::RetractBatch { reference }) => {
+            let episodes = match oxigraph_manager.load_import_episodes().await {
+                Ok(episodes) => episodes,
+                Err(error) => {
+                    eprintln!("读取导入批次失败：{}", error);
+                    std::process::exit(1);
+                }
+            };
+            let Some(episode) =
+                know_prolog::import_episode::resolve_episode_reference(&reference, &episodes)
+            else {
+                eprintln!(
+                    "没有匹配的导入批次：{}（可用 episodes 查看当前批次）",
+                    reference
+                );
+                std::process::exit(1);
+            };
+            match oxigraph_manager.retract_import_batch(episode).await {
+                Ok(retraction) => println!("{}", retraction.summary()),
+                Err(error) => {
+                    eprintln!("撤销批次失败：{}", error);
+                    std::process::exit(1);
+                }
+            }
+            if let Err(error) =
+                persist_registry_observations(&oxigraph_manager, &store_path).await
+            {
+                eprintln!("批次已撤销，但画像同步失败：{}", error);
+            }
+        }
         Some(Commands::BatchImport {
             file_path,
             dry_run,

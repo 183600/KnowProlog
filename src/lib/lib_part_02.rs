@@ -1207,9 +1207,11 @@ impl OxigraphManager {
                 > {
                     let mut added = 0usize;
                     let mut duplicates = 0usize;
+                    let mut added_quads = Vec::new();
                     for quad in &flattened {
                         if transaction.insert(quad.as_ref())? {
                             added += 1;
+                            added_quads.push(quad.clone());
                         } else {
                             duplicates += 1;
                         }
@@ -1244,6 +1246,19 @@ impl OxigraphManager {
                             alias_episode = Some(episode);
                         }
                     } else {
+                        let additions_graph_node = GraphName::NamedNode(
+                            NamedNode::new(crate::import_episode::additions_graph_iri(&id))
+                                .map_err(|error| ImportBatchTransactionError(error.to_string()))?,
+                        );
+                        for quad in &added_quads {
+                            let addition_quad = Quad::new(
+                                quad.subject.clone(),
+                                quad.predicate.clone(),
+                                quad.object.clone(),
+                                additions_graph_node.clone(),
+                            );
+                            transaction.insert(addition_quad.as_ref())?;
+                        }
                         let mut episode = fresh_episode.clone();
                         episode.added = added;
                         episode.duplicates = duplicates;
@@ -1338,6 +1353,142 @@ impl OxigraphManager {
                 format!("批次导出失败：{}", error).into()
             })?;
         Ok(quads.len())
+    }
+
+    /// 撤销一个批次：回撤本批首次新增、且未被其他批次共享的默认图断言。
+    ///
+    /// 安全边界：
+    /// - 只删除 `import-additions/{id}` 里记录过的「首次新增」三元组；
+    ///   导入前就已在默认图中的手动断言不会被误删；
+    /// - 若其他批次仍包含同一断言，则保留默认图，并把该断言转移到那些批次的
+    ///   新增图，保证日后撤销最后一个持有者时仍能正确回撤；
+    /// - 旧版本批次没有新增图时，只移除批次图与元数据，默认图保持不动。
+    pub async fn retract_import_batch(
+        &self,
+        episode: &crate::import_episode::ImportEpisode,
+    ) -> Result<crate::import_episode::BatchRetraction, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let store = self.store.lock().await;
+        let existing = Self::import_episodes_from_store(&store)?;
+        let Some(current) = existing.iter().find(|known| known.id == episode.id).cloned() else {
+            return Err(format!(
+                "没有匹配的导入批次：B{}（{}）",
+                episode.seq, episode.id
+            )
+            .into());
+        };
+
+        let mut other_additions: Vec<(GraphName, HashSet<String>)> = Vec::new();
+        for other in existing.iter().filter(|known| known.id != current.id) {
+            let graph = GraphName::NamedNode(NamedNode::new(&other.batch_graph)?);
+            let keys = store
+                .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+                .map(|quad| {
+                    quad.map(|quad| crate::import_episode::assertion_key(&quad))
+                        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                            Box::new(error)
+                        })
+                })
+                .collect::<Result<HashSet<_>, _>>()?;
+            if !keys.is_empty() {
+                let additions =
+                    GraphName::NamedNode(NamedNode::new(crate::import_episode::additions_graph_iri(
+                        &other.id,
+                    ))?);
+                other_additions.push((additions, keys));
+            }
+        }
+
+        let batch_graph = GraphName::NamedNode(NamedNode::new(&current.batch_graph)?);
+        let batch_quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(batch_graph.as_ref()))
+            .collect::<Result<_, _>>()?;
+        let additions_graph = GraphName::NamedNode(NamedNode::new(
+            crate::import_episode::additions_graph_iri(&current.id),
+        )?);
+        let additions: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(additions_graph.as_ref()))
+            .collect::<Result<_, _>>()?;
+        let ledger_graph =
+            GraphName::NamedNode(NamedNode::new(crate::import_episode::EPISODE_LEDGER_GRAPH)?);
+        let metadata_subject = Subject::NamedNode(NamedNode::new(
+            crate::import_episode::episode_subject_iri(&current.id),
+        )?);
+        let metadata: Vec<Quad> = store
+            .quads_for_pattern(
+                Some(metadata_subject.as_ref()),
+                None,
+                None,
+                Some(ledger_graph.as_ref()),
+            )
+            .collect::<Result<_, _>>()?;
+
+        let additions_len = additions.len();
+        let (removed, kept_elsewhere, batch_assertions) =
+            store.transaction(move |mut transaction| {
+                let mut removed = 0usize;
+                let mut kept_elsewhere = 0usize;
+                for addition in &additions {
+                    let key = crate::import_episode::assertion_key(addition);
+                    let owners: Vec<&GraphName> = other_additions
+                        .iter()
+                        .filter(|(_, keys)| keys.contains(&key))
+                        .map(|(graph, _)| graph)
+                        .collect();
+                    if owners.is_empty() {
+                        let default_quad = Quad::new(
+                            addition.subject.clone(),
+                            addition.predicate.clone(),
+                            addition.object.clone(),
+                            GraphName::DefaultGraph,
+                        );
+                        if transaction.remove(default_quad.as_ref())? {
+                            removed += 1;
+                        }
+                    } else {
+                        kept_elsewhere += 1;
+                        for owner in owners {
+                            let transferred = Quad::new(
+                                addition.subject.clone(),
+                                addition.predicate.clone(),
+                                addition.object.clone(),
+                                owner.clone(),
+                            );
+                            transaction.insert(transferred.as_ref())?;
+                        }
+                    }
+                }
+                let mut batch_assertions = 0usize;
+                for quad in &batch_quads {
+                    if transaction.remove(quad.as_ref())? {
+                        batch_assertions += 1;
+                    }
+                }
+                for quad in &additions {
+                    transaction.remove(quad.as_ref())?;
+                }
+                for quad in &metadata {
+                    transaction.remove(quad.as_ref())?;
+                }
+                Ok::<(usize, usize, usize), ImportBatchTransactionError>((
+                    removed,
+                    kept_elsewhere,
+                    batch_assertions,
+                ))
+            })?;
+
+        if removed > 0 {
+            self.bump_revision();
+        }
+        self.perf.bump("import_batch_retract");
+        Ok(crate::import_episode::BatchRetraction {
+            seq: current.seq,
+            id: current.id,
+            added: additions_len,
+            removed,
+            kept_elsewhere,
+            batch_assertions,
+        })
     }
 
     /// 读取全部 RDF 导入情景（按 seq 升序）。

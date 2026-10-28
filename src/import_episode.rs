@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const EPISODE_LEDGER_GRAPH: &str = "http://example.org/kg/graphs/import-episodes";
 /// 批次断言命名图前缀：`{prefix}{batch_id}`。
 pub const BATCH_GRAPH_PREFIX: &str = "http://example.org/kg/graphs/import-batches/";
+/// 批次「首次新增」命名图前缀：`{prefix}{batch_id}`，用于安全撤销默认图新增。
+pub const ADDITIONS_GRAPH_PREFIX: &str = "http://example.org/kg/graphs/import-additions/";
 /// 情景元数据节点前缀：`{prefix}{batch_id}`。
 pub const EPISODE_SUBJECT_PREFIX: &str = "http://example.org/kg/ledger/import-episode/";
 
@@ -204,9 +206,42 @@ impl RdfImportReceipt {
     }
 }
 
+/// 一次批次撤销的结果：只回撤本批「首次新增」且未被其他批次共享的断言。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BatchRetraction {
+    pub seq: usize,
+    pub id: String,
+    /// 本批首次新增到默认图的断言数（旧版本批次可能为 0）。
+    pub added: usize,
+    /// 实际从默认图移除的断言数。
+    pub removed: usize,
+    /// 因其他批次仍包含而保留在默认图的断言数。
+    pub kept_elsewhere: usize,
+    /// 移除的批次命名图断言数。
+    pub batch_assertions: usize,
+}
+
+impl BatchRetraction {
+    pub fn summary(&self) -> String {
+        let mut line = format!(
+            "已撤销批次 B{}（{}）：从默认图移除 {} 条，保留 {} 条（其他批次仍包含），并移除批次图 {} 条断言。",
+            self.seq, self.id, self.removed, self.kept_elsewhere, self.batch_assertions
+        );
+        if self.added == 0 {
+            line.push_str("该批次没有首次新增记录（可能来自旧版本）：默认图未改动。");
+        }
+        line
+    }
+}
+
 /// 批次命名图 IRI。
 pub fn batch_graph_iri(id: &str) -> String {
     format!("{}{}", BATCH_GRAPH_PREFIX, id)
+}
+
+/// 批次「首次新增」命名图 IRI。
+pub fn additions_graph_iri(id: &str) -> String {
+    format!("{}{}", ADDITIONS_GRAPH_PREFIX, id)
 }
 
 /// 情景元数据主语 IRI。
@@ -285,7 +320,9 @@ fn term_key(term: &Term) -> String {
 }
 
 /// 与插入顺序无关的断言规范形式（不包含原图名，因为落库时会压平）。
-fn assertion_key(quad: &Quad) -> String {
+///
+/// 也是批次差异、跨批次共享判断与撤销时比较断言的稳定键。
+pub fn assertion_key(quad: &Quad) -> String {
     format!(
         "{} <{}> {}",
         subject_key(&quad.subject),

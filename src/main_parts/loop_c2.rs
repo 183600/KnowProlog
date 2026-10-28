@@ -1013,6 +1013,35 @@
             continue;
         }
 
+        // 撤销批次：只回撤该批首次新增且未被其他批次共享的断言。
+        if let Some(reference) = parse_retract_batch_directive(input) {
+            match oxigraph_manager.load_import_episodes().await {
+                Ok(episodes) => {
+                    match know_prolog::import_episode::resolve_episode_reference(
+                        &reference, &episodes,
+                    ) {
+                        Some(episode) => {
+                            match oxigraph_manager.retract_import_batch(episode).await {
+                                Ok(retraction) => {
+                                    println!("{}", retraction.summary());
+                                    reasoner_stale = true;
+                                }
+                                Err(error) => eprintln!("撤销批次失败：{}", error),
+                            }
+                        }
+                        None => println!(
+                            "没有匹配的导入批次：{}（可用「批次台账」查看当前 {} 批）",
+                            reference,
+                            episodes.len()
+                        ),
+                    }
+                }
+                Err(error) => eprintln!("读取导入批次失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
         // 导入指令先于输入模式判定解析：简写（如「导入文件：」）不在 import_keywords
         // 中也可用；参数正文只做前缀剥离，路径/JSON 中的关键词不受影响。
         if let Some(directive) = parse_import_directive(input) {

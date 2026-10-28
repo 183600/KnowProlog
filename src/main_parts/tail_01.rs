@@ -396,6 +396,25 @@ fn parse_import_directive(input: &str) -> Option<ImportDirective> {
     None
 }
 
+/// 解析「撤销批次：<引用>」指令（兼容全角/半角冒号与英文 retract batch）。
+fn parse_retract_batch_directive(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for keyword in ["撤销批次", "retract batch"] {
+        let needle = keyword.to_ascii_lowercase();
+        for colon in [':', '：'] {
+            let prefix = format!("{}{}", needle, colon);
+            if lower.starts_with(&prefix) {
+                let reference = trimmed[prefix.len()..].trim();
+                if !reference.is_empty() {
+                    return Some(reference.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 交互式导出指令的解析结果。
 #[derive(Debug, PartialEq, Eq)]
 enum ExportDirective {
@@ -788,6 +807,8 @@ fn is_command_like(input: &str) -> bool {
         "导出rdf",
         "导出文件",
         "export rdf",
+        "撤销批次",
+        "retract batch",
         "全息",
         "对话本体",
         "对话状态",
