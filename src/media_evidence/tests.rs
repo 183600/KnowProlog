@@ -243,6 +243,31 @@ fn selector_parses_chinese_deixis_without_hijacking_plain_questions() {
     );
     assert!(MediaSelector::parse("知识图谱里有什么").is_none());
     assert!(MediaSelector::parse("世界上最高的山").is_none());
+    assert_eq!(
+        MediaSelector::parse("地图上的北京在哪里").unwrap().modalities,
+        vec![Modality::Image]
+    );
+    assert_eq!(
+        MediaSelector::parse("这张照片里的人是谁").unwrap().modalities,
+        vec![Modality::Image]
+    );
+    for plain in [
+        "第三个人是谁",
+        "第一次见面是什么时候",
+        "最后的答案是什么",
+        "上一个问题还没回答",
+        "当前天气怎么样",
+        "这个怎么用",
+        "图书馆在哪里",
+        "这个意图是什么",
+        "切换视图",
+        "第三段文字讲了什么",
+    ] {
+        assert!(
+            MediaSelector::parse(plain).is_none(),
+            "普通问题被媒体选择器误吞：{plain}"
+        );
+    }
 }
 
 #[test]

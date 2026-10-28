@@ -59,18 +59,17 @@ impl MediaSelector {
             _ => {}
         }
         let ordinal = parse_ordinal(&compact);
-        if modalities.is_empty() {
-            if let SelectorOrdinal::Index(_) = ordinal {
-                if contains_sequence(&compact, "张") || contains_sequence(&compact, "幅") {
-                    modalities.insert(Modality::Image);
-                } else if contains_sequence(&compact, "段") {
-                    modalities.insert(Modality::Audio);
-                } else if contains_sequence(&compact, "页") {
-                    modalities.insert(Modality::Document);
-                }
-            }
+        if modalities.is_empty()
+            && (contains_sequence(&compact, "张") || contains_sequence(&compact, "幅"))
+        {
+            modalities.insert(Modality::Image);
         }
-        if modalities.is_empty() && locator.is_none() && ordinal == SelectorOrdinal::Any {
+        if modalities.is_empty()
+            && (contains_sequence(&compact, "页") || contains_sequence(&compact, "份"))
+        {
+            modalities.insert(Modality::Document);
+        }
+        if modalities.is_empty() && locator.is_none() {
             return None;
         }
         Some(Self {
@@ -126,7 +125,34 @@ fn contains_sequence(haystack: &[char], needle: &str) -> bool {
 
 fn has_image_reference(chars: &[char]) -> bool {
     for token in [
-        "图片", "图像", "照片", "截图", "截屏", "插图", "这张图", "这幅图", "此图", "上图",
+        "图片",
+        "图像",
+        "照片",
+        "截图",
+        "截屏",
+        "插图",
+        "地图",
+        "蓝图",
+        "草图",
+        "流程图",
+        "架构图",
+        "示意图",
+        "柱状图",
+        "折线图",
+        "饼图",
+        "统计图",
+        "分布图",
+        "走势图",
+        "施工图",
+        "电路图",
+        "思维导图",
+        "平面图",
+        "立面图",
+        "剖面图",
+        "这张图",
+        "这幅图",
+        "此图",
+        "上图",
         "下图",
     ] {
         if contains_sequence(chars, token) {
@@ -137,15 +163,47 @@ fn has_image_reference(chars: &[char]) -> bool {
         if *character != '图' {
             return false;
         }
-        let previous_is_spectrum = index > 0 && chars[index - 1] == '谱';
-        let next_is_spectrum = index + 1 < chars.len() && chars[index + 1] == '谱';
-        !previous_is_spectrum && !next_is_spectrum
+        let previous = index.checked_sub(1).and_then(|at| chars.get(at));
+        let next = chars.get(index + 1);
+        if previous == Some(&'谱') || next == Some(&'谱') {
+            return false;
+        }
+        let previous_ok = previous.is_some_and(|previous| {
+            matches!(
+                previous,
+                '这' | '那' | '上' | '下' | '此' | '本' | '该' | '第' | '张' | '幅' | '看' | '如'
+                    | '见' | '附' | '示'
+            ) || previous.is_ascii_digit()
+        });
+        let next_ok = next.is_some_and(|next| {
+            matches!(
+                next,
+                '中' | '里' | '上' | '下' | '内' | '的' | '所' | '示' | '片' | '像'
+            ) || next.is_ascii_digit()
+                || is_numeral_char(*next)
+        });
+        previous_ok || next_ok
     })
 }
 
 fn has_table_reference(chars: &[char]) -> bool {
-    if contains_sequence(chars, "表格") {
-        return true;
+    for token in [
+        "表格",
+        "报表",
+        "表单",
+        "列表",
+        "统计表",
+        "时间表",
+        "课程表",
+        "日程表",
+        "对照表",
+        "价目表",
+        "数据表",
+        "图表",
+    ] {
+        if contains_sequence(chars, token) {
+            return true;
+        }
     }
     for (index, character) in chars.iter().enumerate() {
         if *character != '表' {
@@ -157,9 +215,11 @@ fn has_table_reference(chars: &[char]) -> bool {
                 '这' | '上' | '下' | '该' | '此' | '那' | '第' | '图' | '张' | '幅' | '段'
                     | '份'
             );
-        let next_ok = chars
-            .get(index + 1)
-            .is_some_and(|next| next.is_ascii_digit() || is_numeral_char(*next));
+        let next_ok = chars.get(index + 1).is_some_and(|next| {
+            next.is_ascii_digit()
+                || is_numeral_char(*next)
+                || matches!(next, '中' | '里' | '内' | '上' | '下')
+        });
         if previous_ok || next_ok {
             return true;
         }
