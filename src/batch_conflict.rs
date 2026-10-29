@@ -1394,6 +1394,22 @@ mod tests {
     }
 
     #[test]
+    fn independent_conflicts_share_one_table_and_resolve_together() {
+        let claims = vec![
+            claim("张三", "年龄", "30", AssertionStrength::Direct),
+            claim("张三", "年龄", "31", AssertionStrength::Direct),
+            claim("李四", "年龄", "40", AssertionStrength::Direct),
+            claim("李四", "年龄", "41", AssertionStrength::Direct),
+        ];
+        let plan = plan_batch(claims, &functional_options());
+        assert!(plan.accepted.is_empty(), "{:?}", plan);
+        assert_eq!(plan.questions.len(), 2, "{:?}", plan);
+        let answer = parse_batch_answer("1A，2B", &plan.questions);
+        assert!(answer.is_complete(), "{:?}", answer);
+        assert_eq!(answer.selections, vec![Some(0), Some(1)]);
+    }
+
+    #[test]
     fn answer_parser_accepts_ordinal_prefix_space_and_keep_base() {
         let claims = vec![
             claim("张三", "年龄", "31", AssertionStrength::Direct),
