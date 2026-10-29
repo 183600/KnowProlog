@@ -116,6 +116,22 @@ fn atomic_batch_writes_nothing_until_conflict_is_resolved() {
 }
 
 #[test]
+fn not_but_single_correction_uses_batch_path() {
+    let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+    let message = reasoner.assert_nl_fact("张三的年龄不是30，而是31");
+    assert!(message.contains("批次记住"), "{}", message);
+    assert!(reasoner.pending_batch_turn().is_none(), "{}", message);
+    assert!(reasoner.session_facts().iter().any(|atom| {
+        atom.predicate.as_ref() == "年龄"
+            && atom.terms[0].name() == "张三"
+            && atom.terms[1].name() == "31"
+    }), "{}", message);
+    assert!(!reasoner.session_facts().iter().any(|atom| {
+        atom.predicate.as_ref() == "年龄" && atom.terms[1].name() == "30"
+    }), "{}", message);
+}
+
+#[test]
 fn leading_hearsay_cue_only_scopes_to_its_own_claim() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     let message =

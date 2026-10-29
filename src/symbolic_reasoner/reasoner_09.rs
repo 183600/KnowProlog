@@ -1229,13 +1229,14 @@ impl SymbolicReasoner {
         if let Some(mode) = forced_batch {
             return self.assert_nl_batch(sentence, mode);
         }
-        if let Some(atom) = Self::parse_negative_atom(sentence) {
-            return self.assert_negative_atom(atom);
-        }
         // 多 claim 时优先按批次逐句判定强度：句首「据说/更正」只作用于
         // 它所在的那一句，不能把整段话都降为传闻或更正。
+        // 单条「不是A，而是B」也走批次，避免被否定解析误当成阻断边。
         if let Some(result) = self.try_assert_nl_batch(sentence, None) {
             return result;
+        }
+        if let Some(atom) = Self::parse_negative_atom(sentence) {
+            return self.assert_negative_atom(atom);
         }
         let (strength, content) = AssertionStrength::classify(sentence);
         if strength == AssertionStrength::Hearsay {

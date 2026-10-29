@@ -35,7 +35,11 @@ impl SymbolicReasoner {
             return None;
         }
         if outcome.claims.len() < 2 && forced.is_none() {
-            return None;
+            let not_but_correction = outcome.claims.len() == 1
+                && outcome.claims[0].correction_cue.as_deref() == Some("不是…而是");
+            if !not_but_correction {
+                return None;
+            }
         }
         Some(self.assert_batch_outcome(sentence, outcome, forced.unwrap_or(BatchMode::Progressive)))
     }

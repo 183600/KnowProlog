@@ -16,7 +16,8 @@ use crate::slot_ledger::{AssertionStrength, SlotKey};
 
 /// 明确的更正提示词。出现在句子任意位置都视为「这次是在改口」。
 pub const CORRECTION_CUES: &[&str] = &[
-    "其实", "不过", "更正", "纠正", "修正", "改口", "不对", "应该说", "改为", "改成", "而是",
+    "更正为", "纠正为", "修正为", "应该是", "应当是", "应为", "其实", "不过", "更正",
+    "纠正", "修正", "改口", "不对", "应该说", "改为", "改成", "而是",
 ];
 
 /// 批处理提交模式。
@@ -446,6 +447,11 @@ fn parse_segment(
         return Err("空句子".to_string());
     }
     let raw = strip_list_marker(raw);
+    if raw.contains("不是") && raw.contains("而是") {
+        if let Some(claim) = parse_not_but_correction(raw, previous, ordinal, start, end) {
+            return Ok(claim);
+        }
+    }
     if raw.contains("不是") || raw.contains("没有") {
         return Err(format!("「{}」是否定句，不能作为批次肯定事实", raw));
     }
@@ -459,8 +465,11 @@ fn parse_segment(
         return Err(format!("「{}」只有更正提示，没有可裁决内容", raw));
     }
 
-    // 省略宾语/谓词：更正片段「是31」沿用上一条 claim 的槽。
-    if let Some(rest) = content.strip_prefix('是') {
+    // 省略宾语/谓词：更正片段「是31」「为31」沿用上一条 claim 的槽。
+    if let Some(rest) = content
+        .strip_prefix('是')
+        .or_else(|| content.strip_prefix('为'))
+    {
         if let Some(previous) = previous {
             let object = rest.trim();
             if !object.is_empty() && !object.contains('是') {
@@ -475,6 +484,26 @@ fn parse_segment(
                     span: (start, end),
                 });
             }
+        }
+    }
+
+    // 更正片段只给值（「其实31」「更正为31」）时沿用上一条 claim 的槽。
+    if cue.is_some()
+        && !content.contains('是')
+        && !content.contains('的')
+        && !content.contains('岁')
+    {
+        if let Some(previous) = previous {
+            return Ok(BatchClaim {
+                subject: previous.subject.clone(),
+                predicate: previous.predicate.clone(),
+                object: content,
+                strength,
+                correction_cue: cue,
+                source: format!("第 {} 句", ordinal),
+                raw: raw.to_string(),
+                span: (start, end),
+            });
         }
     }
 
@@ -537,6 +566,56 @@ fn parse_segment(
         raw: raw.to_string(),
         span: (start, end),
     })
+}
+
+fn parse_not_but_correction(
+    raw: &str,
+    previous: Option<&BatchClaim>,
+    ordinal: usize,
+    start: usize,
+    end: usize,
+) -> Option<BatchClaim> {
+    let not_position = raw.find("不是")?;
+    let after_not = not_position + "不是".len();
+    let but_position = after_not + raw[after_not..].find("而是")?;
+    let before = raw[..not_position]
+        .trim()
+        .trim_end_matches(['，', ',', '：', ':', ' ']);
+    let old = raw[after_not..but_position]
+        .trim()
+        .trim_matches(['，', ',', '：', ':', ' ']);
+    let new = raw[but_position + "而是".len()..]
+        .trim()
+        .trim_start_matches(['是', '为'])
+        .trim();
+    if new.is_empty() {
+        return None;
+    }
+    let old_claim = if before.is_empty() {
+        previous.cloned()?
+    } else {
+        [format!("{}{}", before, old), format!("{}是{}", before, old)]
+            .iter()
+            .find_map(|candidate| parse_segment(candidate, previous, ordinal, start, end).ok())?
+    };
+    let object = if old_claim.predicate == "年龄" {
+        parse_age_claim(&format!("{}{}", old_claim.subject, new))
+            .map(|(_, object)| object)
+            .unwrap_or_else(|| new.trim_end_matches('岁').to_string())
+    } else {
+        new.trim_end_matches('岁').to_string()
+    };
+    if object.is_empty() {
+        return None;
+    }
+    let mut claim = old_claim;
+    claim.object = object;
+    claim.strength = AssertionStrength::Correction;
+    claim.correction_cue = Some("不是…而是".to_string());
+    claim.raw = raw.to_string();
+    claim.source = format!("第 {} 句", ordinal);
+    claim.span = (start, end);
+    Some(claim)
 }
 
 fn strip_list_marker(text: &str) -> &str {
@@ -1256,6 +1335,38 @@ mod tests {
         let outcome = parse_batch_claims("如果张三的师傅是李四，那么张三的师祖是赵六");
         assert!(outcome.claims.is_empty(), "{:?}", outcome);
         assert!(!outcome.errors.is_empty());
+    }
+
+    #[test]
+    fn not_but_correction_becomes_one_correction_claim() {
+        let outcome = parse_batch_claims("张三的年龄不是30，而是31");
+        assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
+        let claim = &outcome.claims[0];
+        assert_eq!(claim.subject, "张三");
+        assert_eq!(claim.predicate, "年龄");
+        assert_eq!(claim.object, "31");
+        assert_eq!(claim.strength, AssertionStrength::Correction);
+        assert_eq!(claim.correction_cue.as_deref(), Some("不是…而是"));
+
+        let outcome = parse_batch_claims("张三不是30岁，而是31岁");
+        assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
+        assert_eq!(outcome.claims[0].subject, "张三");
+        assert_eq!(outcome.claims[0].object, "31");
+    }
+
+    #[test]
+    fn correction_verb_and_bare_value_reuse_previous_slot() {
+        let outcome = parse_batch_claims("张三的年龄是30；更正为31");
+        assert_eq!(outcome.claims.len(), 2, "{:?}", outcome);
+        assert_eq!(outcome.claims[1].object, "31");
+        assert_eq!(
+            outcome.claims[1].strength,
+            AssertionStrength::Correction
+        );
+        let plan = plan_batch(outcome.claims, &functional_options());
+        assert_eq!(plan.accepted.len(), 1, "{:?}", plan);
+        assert_eq!(plan.claims[plan.accepted[0]].object, "31");
+        assert_eq!(plan.isolated.len(), 1, "{:?}", plan);
     }
 
     #[test]
