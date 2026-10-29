@@ -135,6 +135,91 @@ rules = [
         );
     }
 
+    #[test]
+    fn rule_adjudication_removes_losing_clause_from_resolver() {
+        use crate::plugin::{PluginManifest, PluginRegistry, PluginRuntime, PluginSettings};
+        use crate::resolution_engine::{Atom, Term};
+
+        let left: PluginManifest = toml::from_str(
+            r#"
+id = "zh.rules.left"
+version = "0.1.0"
+api = 1
+default_mode = "on"
+
+[[contributions]]
+kind = "rules"
+id = "left.age"
+functional = [{ predicate = "年龄", key = 0, value = 1 }]
+rules = [
+  { id = "age-left", head = "年龄(X, 38)", body = ["出生年(X, 1986)"] },
+]
+"#,
+        )
+        .expect("左侧规则包应可解析");
+        let right: PluginManifest = toml::from_str(
+            r#"
+id = "zh.rules.right"
+version = "0.1.0"
+api = 1
+default_mode = "on"
+
+[[contributions]]
+kind = "rules"
+id = "right.age"
+functional = [{ predicate = "年龄", key = 0, value = 1 }]
+rules = [
+  { id = "age-right", head = "年龄(X, 39)", body = ["出生年(X, 1990)"] },
+]
+"#,
+        )
+        .expect("右侧规则包应可解析");
+        let registry = PluginRegistry::from_manifests(vec![left, right]);
+        let mut runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "出生年".into(),
+                to: "1986".into(),
+            },
+            PrologFact::Relation {
+                from: "张三".into(),
+                rel_type: "出生年".into(),
+                to: "1990".into(),
+            },
+        ]);
+
+        let first = reasoner.apply_plugin_runtime(&runtime);
+        assert_eq!(first.rules, 2);
+        let goal = Atom::pattern("年龄", Term::constant("张三"), Term::var("Age"));
+        let ages = reasoner
+            .resolver()
+            .solve(&[goal.clone()], &["Age".to_string()])
+            .into_iter()
+            .filter_map(|solution| solution.bindings.get("Age").cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            ages,
+            BTreeSet::from(["38".to_string(), "39".to_string()])
+        );
+
+        let outcome = runtime
+            .handle_command("规则裁决 1=right.age")
+            .expect("裁决命令应被识别");
+        assert!(outcome.success, "{}", outcome.text);
+        let second = reasoner.apply_plugin_runtime(&runtime);
+        assert_eq!(second.rules, 0);
+        assert_eq!(second.rules_removed, 1);
+        let ages = reasoner
+            .resolver()
+            .solve(&[goal], &["Age".to_string()])
+            .into_iter()
+            .filter_map(|solution| solution.bindings.get("Age").cloned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ages, BTreeSet::from(["39".to_string()]));
+    }
+
     /// 配置本体并入单一本体：注入幂等、与教学公理同簿记、
     /// 随快照/重建/分叉一并保留（配置不再是第二套本体）。
     #[test]

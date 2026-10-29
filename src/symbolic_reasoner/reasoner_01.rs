@@ -1470,16 +1470,20 @@ impl SymbolicReasoner {
                 sync.inverse_surfaces += 1;
             }
         }
-        let mut known: BTreeSet<String> =
+        let previous: BTreeSet<String> =
             self.plugin_clauses.iter().map(clause_identity).collect();
+        let mut current = BTreeSet::new();
+        let mut next = Vec::new();
         for compiled in runtime.rule_clauses() {
             let identity = clause_identity(&compiled.clause);
-            if known.insert(identity) {
-                self.plugin_clauses.push(compiled.clause);
-                sync.rules += 1;
+            if current.insert(identity) {
+                next.push(compiled.clause);
             }
         }
-        if sync.rules > 0 {
+        sync.rules = current.difference(&previous).count();
+        sync.rules_removed = previous.difference(&current).count();
+        if sync.rules > 0 || sync.rules_removed > 0 {
+            self.plugin_clauses = next;
             self.rebuild_resolver();
         }
         sync.lessons = self.configure_ontology_program(&runtime.ontology_program());

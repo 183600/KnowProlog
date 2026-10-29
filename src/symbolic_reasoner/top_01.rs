@@ -988,6 +988,7 @@ pub struct PluginOntologySync {
     pub inverse_surfaces: usize,
     pub lessons: usize,
     pub rules: usize,
+    pub rules_removed: usize,
 }
 
 /// 语言策略热更新的回执。配置里的推理结构阈值不在本方法范围内：

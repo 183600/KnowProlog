@@ -94,6 +94,7 @@ impl ApiState {
             aliases: sync.aliases,
             inverse_surfaces: sync.inverse_surfaces,
             rules: sync.rules,
+            rules_removed: sync.rules_removed,
         }
     }
 

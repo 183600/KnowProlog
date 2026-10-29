@@ -67,10 +67,15 @@ pub struct PluginOntologyReceipt {
     pub aliases: usize,
     pub inverse_surfaces: usize,
     pub rules: usize,
+    pub rules_removed: usize,
 }
 impl PluginOntologyReceipt {
     pub fn is_empty(self) -> bool {
-        self.lessons == 0 && self.aliases == 0 && self.inverse_surfaces == 0 && self.rules == 0
+        self.lessons == 0
+            && self.aliases == 0
+            && self.inverse_surfaces == 0
+            && self.rules == 0
+            && self.rules_removed == 0
     }
 }
 /// 无状态问答缓存键：按序的全部用户消息（trim 后）+ 生效策略。

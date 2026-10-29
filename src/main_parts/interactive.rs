@@ -520,6 +520,9 @@ async fn run_interactive_mode(
     if plugin_sync.rules > 0 {
         println!("插件规则包已合并：{} 条规则。", plugin_sync.rules);
     }
+    if plugin_sync.rules_removed > 0 {
+        println!("插件规则包已撤回：{} 条规则。", plugin_sync.rules_removed);
+    }
     // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
     let mut plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
     let plugin_reference_entries = plugin_nlp
@@ -732,10 +735,15 @@ async fn run_interactive_mode(
                     || sync.lessons > 0
                     || sync.inverse_surfaces > 0
                     || sync.rules > 0
+                    || sync.rules_removed > 0
                 {
                     println!(
-                        "插件本体已增量合并：{} 条别名、{} 条公理、{} 条逆向词面、{} 条规则。",
-                        sync.aliases, sync.lessons, sync.inverse_surfaces, sync.rules
+                        "插件本体已增量合并：{} 条别名、{} 条公理、{} 条逆向词面、{} 条规则（撤回 {} 条）。",
+                        sync.aliases,
+                        sync.lessons,
+                        sync.inverse_surfaces,
+                        sync.rules,
+                        sync.rules_removed
                     );
                 } else if plugin_runtime.enabled_count() < enabled_before {
                     println!(
