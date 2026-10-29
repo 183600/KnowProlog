@@ -16,8 +16,9 @@ use crate::slot_ledger::{AssertionStrength, SlotKey};
 
 /// 明确的更正提示词。出现在句子任意位置都视为「这次是在改口」。
 pub const CORRECTION_CUES: &[&str] = &[
-    "更正为", "纠正为", "修正为", "应该是", "应当是", "应为", "其实", "不过", "更正",
-    "纠正", "修正", "改口", "不对", "应该说", "改为", "改成", "而是",
+    "更准确地说", "准确地说", "准确说", "实际上", "更正为", "更正成", "纠正为", "纠正成",
+    "修正为", "修正成", "应该是", "应当为", "应当是", "应该为", "应改为", "应为", "其实",
+    "实际", "不过", "更正", "纠正", "修正", "改口", "不对", "应该说", "改为", "改成", "而是",
 ];
 
 /// 批处理提交模式。
@@ -447,7 +448,7 @@ fn parse_segment(
         return Err("空句子".to_string());
     }
     let raw = strip_list_marker(raw);
-    if raw.contains("不是") && raw.contains("而是") {
+    if raw.contains("不是") {
         if let Some(claim) = parse_not_but_correction(raw, previous, ordinal, start, end) {
             return Ok(claim);
         }
@@ -577,17 +578,26 @@ fn parse_not_but_correction(
 ) -> Option<BatchClaim> {
     let not_position = raw.find("不是")?;
     let after_not = not_position + "不是".len();
-    let but_position = after_not + raw[after_not..].find("而是")?;
+    let (old_end, new_raw, cue) = if let Some(offset) = raw[after_not..].find("而是") {
+        let position = after_not + offset;
+        (position, &raw[position + "而是".len()..], "不是…而是")
+    } else {
+        let offset = raw[after_not..].find(['，', ','])?;
+        let position = after_not + offset;
+        let comma_len = raw[position..].chars().next()?.len_utf8();
+        let after_comma = raw[position + comma_len..].trim_start();
+        let new_raw = after_comma
+            .strip_prefix('是')
+            .or_else(|| after_comma.strip_prefix('为'))?;
+        (position, new_raw, "不是…是")
+    };
     let before = raw[..not_position]
         .trim()
         .trim_end_matches(['，', ',', '：', ':', ' ']);
-    let old = raw[after_not..but_position]
+    let old = raw[after_not..old_end]
         .trim()
         .trim_matches(['，', ',', '：', ':', ' ']);
-    let new = raw[but_position + "而是".len()..]
-        .trim()
-        .trim_start_matches(['是', '为'])
-        .trim();
+    let new = new_raw.trim_start_matches(['是', '为']).trim();
     if new.is_empty() {
         return None;
     }
@@ -611,7 +621,7 @@ fn parse_not_but_correction(
     let mut claim = old_claim;
     claim.object = object;
     claim.strength = AssertionStrength::Correction;
-    claim.correction_cue = Some("不是…而是".to_string());
+    claim.correction_cue = Some(cue.to_string());
     claim.raw = raw.to_string();
     claim.source = format!("第 {} 句", ordinal);
     claim.span = (start, end);
@@ -1352,6 +1362,14 @@ mod tests {
         assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
         assert_eq!(outcome.claims[0].subject, "张三");
         assert_eq!(outcome.claims[0].object, "31");
+
+        let outcome = parse_batch_claims("张三的年龄不是30，是31");
+        assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
+        assert_eq!(outcome.claims[0].object, "31");
+        assert_eq!(
+            outcome.claims[0].correction_cue.as_deref(),
+            Some("不是…是")
+        );
     }
 
     #[test]

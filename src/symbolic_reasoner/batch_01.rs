@@ -36,7 +36,11 @@ impl SymbolicReasoner {
         }
         if outcome.claims.len() < 2 && forced.is_none() {
             let not_but_correction = outcome.claims.len() == 1
-                && outcome.claims[0].correction_cue.as_deref() == Some("不是…而是");
+                && outcome
+                    .claims[0]
+                    .correction_cue
+                    .as_deref()
+                    .is_some_and(|cue| cue.starts_with("不是…"));
             if !not_but_correction {
                 return None;
             }
