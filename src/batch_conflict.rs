@@ -20,9 +20,10 @@ pub const CORRECTION_CUES: &[&str] = &[
 ];
 
 /// 批处理提交模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchMode {
     /// 先提交无冲突部分，冲突项隔离并提问。
+    #[default]
     Progressive,
     /// 只要还有未决冲突就零写入；裁决后再整批提交。
     Atomic,
@@ -319,12 +320,6 @@ pub struct BatchOptions {
     pub mode: BatchMode,
 }
 
-impl Default for BatchMode {
-    fn default() -> Self {
-        BatchMode::Progressive
-    }
-}
-
 impl BatchOptions {
     pub fn new() -> Self {
         Self::default()
@@ -484,7 +479,6 @@ fn parse_segment(
     }
 
     // 代词主语用批次内前一条 claim 补全。
-    let mut content = content;
     if let Some(previous) = previous {
         for pronoun in ["他们", "她们", "它们", "他", "她", "它", "这个人", "该人"] {
             if let Some(rest) = content.strip_prefix(pronoun) {
@@ -1044,16 +1038,16 @@ pub fn parse_batch_answer(answer: &str, questions: &[BatchQuestion]) -> BatchAns
         return outcome;
     }
     if ["都按后者", "全部按后者", "按后者", "都选后者"].iter().any(|cue| normalized.contains(cue)) {
-        for index in 0..questions.len() {
-            if let Some(last) = questions[index].options.len().checked_sub(1) {
+        for (index, question) in questions.iter().enumerate() {
+            if let Some(last) = question.options.len().checked_sub(1) {
                 outcome.selections[index] = Some(last);
             }
         }
         return outcome;
     }
     if ["都按前者", "全部按前者", "按前者", "都选前者"].iter().any(|cue| normalized.contains(cue)) {
-        for index in 0..questions.len() {
-            if !questions[index].options.is_empty() {
+        for (index, question) in questions.iter().enumerate() {
+            if !question.options.is_empty() {
                 outcome.selections[index] = Some(0);
             }
         }
@@ -1145,7 +1139,7 @@ fn parse_answer_token(
     }
     let question_index = number - 1;
     let rest = token[digits_end..]
-        .trim_start_matches(|ch: char| matches!(ch, ':' | '.' | '、' | ')' | '）' | '-'));
+        .trim_start_matches([':', '.', '、', ')', '）', '-']);
     let mut rest = rest;
     for prefix in ["第", "题", "选", "取", "按", "保留", ":"] {
         if let Some(stripped) = rest.strip_prefix(prefix) {
@@ -1165,7 +1159,7 @@ fn parse_answer_token(
             ));
         }
     }
-    let value = rest.trim_start_matches(|ch: char| matches!(ch, ':' | ' '));
+    let value = rest.trim_start_matches([':', ' ']);
     if value.is_empty() {
         return Err(format!("第 {} 处缺少选择。", number));
     }
