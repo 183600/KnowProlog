@@ -62,6 +62,12 @@ impl ApiState {
         self.warm.set_semantic_grammar(grammar);
     }
 
+    /// 注入配置态语义框架本：交互模式按 `[frame_semantics]` 启用，
+    /// 服务若缺失，同一配置下的生成/标注行为会静默退化。
+    pub fn set_frame_book(&mut self, book: crate::frame_semantics::FrameBook) {
+        self.warm.reasoner.lock().attach_frame_book(book);
+    }
+
     /// 宿主注入配置态本体（`[type_system]` + `[[predicate_profiles]]` 归约的公理）：
     /// 在建会话前调用，之后分叉的每个会话都携带同一份单一本体。
     /// 返回新登记的公理条数（重复调用按整句去重，返回 0）。

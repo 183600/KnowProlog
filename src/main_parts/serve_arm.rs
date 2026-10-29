@@ -87,6 +87,11 @@
                     know_prolog::semantic_grammar::RulePack::from_config(&config),
                 );
             }
+            if config.frame_semantics.enabled {
+                api_state.set_frame_book(know_prolog::frame_semantics::FrameBook::from_config(
+                    &config.frame_semantics,
+                ));
+            }
             api_state.set_frame_program(frame_program.clone());
             // 跨会话词法记忆：与交互启动一致地恢复词性证据与量词期待。
             match oxigraph_manager.load_lexical_memory().await {

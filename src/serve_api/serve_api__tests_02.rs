@@ -470,6 +470,19 @@
         assert_eq!(state.cache_epoch(), after, "空记忆不应推进纪元");
     }
 
+    /// `[frame_semantics]` 在交互入口会注入框架本，服务启动同样要带，
+    /// 否则同一配置下 HTTP 生成缺少角色标注。
+    #[test]
+    fn set_frame_book_reaches_warm_reasoner() {
+        use crate::frame_semantics::FrameBook;
+
+        let state = test_state(2);
+        let mut state = Arc::try_unwrap(state).ok().expect("测试状态应独占");
+        assert!(state.warm.reasoner.lock().frame_book().is_none());
+        state.set_frame_book(FrameBook::with_core_schemas());
+        assert!(state.warm.reasoner.lock().frame_book().is_some());
+    }
+
     #[tokio::test]
     async fn openai_compat_streaming_and_errors() {
         let (addr, _server) = start_server(4);
