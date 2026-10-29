@@ -409,3 +409,41 @@ async fn relevant_facts_cache_survives_duplicate_rdf_import() {
         "重复导入应按空增量保留缓存"
     );
 }
+
+#[tokio::test]
+async fn relevant_facts_cache_survives_unrelated_predicate_rejection() {
+    let (manager, _dir) = local_manager().await;
+    manager
+        .save_knowledge(vec![local_person("张三"), local_person("李四")])
+        .await
+        .unwrap();
+    manager
+        .save_knowledge(vec![local_relation("张三", "李四")])
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let query = vec!["张三".to_string()];
+
+    let first = manager.get_relevant_facts(&query, 1).await.unwrap();
+    let scans = perf.count("relevant_facts_graph_scan");
+    manager
+        .save_knowledge(vec![KnowledgeItem::Relationship {
+            from_label: "Person".to_string(),
+            from_id: "王五".to_string(),
+            to_label: "Person".to_string(),
+            to_id: "赵六".to_string(),
+            rel_type: "同乡".to_string(),
+            properties: HashMap::new(),
+        }])
+        .await
+        .unwrap();
+    assert!(manager.reject_predicate("同乡").await.unwrap() > 0);
+    let second = manager.get_relevant_facts(&query, 1).await.unwrap();
+
+    assert_eq!(first, second, "拒绝无关谓词不应改变已缓存的子图");
+    assert_eq!(
+        perf.count("relevant_facts_graph_scan"),
+        scans,
+        "无关谓词撤回应保留缓存，而不是整图重扫"
+    );
+}
