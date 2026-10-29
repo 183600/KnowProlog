@@ -1259,6 +1259,28 @@ fn add_edge(
 }
 
 /// 把一个依存树编译成规范框架；并列短语会展开成多个框架。
+fn tree_polarity(tree: &DependencyTree) -> FramePolarity {
+    let Some(root_index) = tree.root else {
+        return FramePolarity::Affirmative;
+    };
+    if tree
+        .tokens
+        .iter()
+        .take(root_index)
+        .any(|token| token.kind == TokenKind::Negation)
+        || tree
+            .tokens
+            .iter()
+            .skip(root_index + 1)
+            .take_while(|token| token.kind != TokenKind::Punctuation)
+            .any(|token| token.kind == TokenKind::Negation)
+    {
+        FramePolarity::Negative
+    } else {
+        FramePolarity::Affirmative
+    }
+}
+
 pub fn compile_frames(tree: &DependencyTree) -> Vec<CanonicalFrame> {
     let Some(root_index) = tree.root else {
         return Vec::new();
@@ -1283,22 +1305,7 @@ pub fn compile_frames(tree: &DependencyTree) -> Vec<CanonicalFrame> {
         .as_ref()
         .map(|phrase| phrase_parts(tree, phrase))
         .unwrap_or_default();
-    let polarity = if tree
-        .tokens
-        .iter()
-        .take(root_index)
-        .any(|token| token.kind == TokenKind::Negation)
-        || tree
-            .tokens
-            .iter()
-            .skip(root_index + 1)
-            .take_while(|token| token.kind != TokenKind::Punctuation)
-            .any(|token| token.kind == TokenKind::Negation)
-    {
-        FramePolarity::Negative
-    } else {
-        FramePolarity::Affirmative
-    };
+    let polarity = tree_polarity(tree);
     let base_confidence = 0.9
         - (tree.warnings.len() as f64 * 0.12).min(0.4)
         - if tree.subject.is_none() { 0.2 } else { 0.0 }
@@ -1576,6 +1583,8 @@ pub struct SpineQuery {
     pub max_results: usize,
     pub max_probes: Option<usize>,
     pub canonical_only: bool,
+    /// 限定框架极性；`None` 表示肯定和否定都接受。
+    pub polarity: Option<FramePolarity>,
 }
 
 impl SpineQuery {
@@ -1586,7 +1595,13 @@ impl SpineQuery {
             max_results: 32,
             max_probes: None,
             canonical_only: true,
+            polarity: None,
         }
+    }
+
+    pub fn with_polarity(mut self, polarity: FramePolarity) -> Self {
+        self.polarity = Some(polarity);
+        self
     }
 
     pub fn with_max_results(mut self, max_results: usize) -> Self {
@@ -2043,7 +2058,7 @@ impl SpineIndex {
         }
         Some(QuestionPlan {
             question: question.to_string(),
-            query: SpineQuery::new(edges),
+            query: SpineQuery::new(edges).with_polarity(tree_polarity(&tree)),
             slots,
             construction: tree.construction,
         })
@@ -2187,6 +2202,11 @@ impl SpineIndex {
             };
             if query.canonical_only && !edge.canonical {
                 continue;
+            }
+            if let Some(polarity) = query.polarity {
+                if self.frames.get(edge.frame).map(|frame| frame.polarity) != Some(polarity) {
+                    continue;
+                }
             }
             if query.same_frame && !frame_ids.is_empty() && !frame_ids.contains(&edge.frame) {
                 continue;
@@ -2533,6 +2553,7 @@ mod tests {
             max_results: 16,
             max_probes: None,
             canonical_only: true,
+            polarity: None,
         });
         assert!(
             search
@@ -2543,6 +2564,29 @@ mod tests {
             search.receipt
         );
         assert!(search.receipt.certified);
+    }
+
+    #[test]
+    fn negative_question_does_not_mix_affirmative_frames() {
+        let mut index = SpineIndex::from_text("张三批评了李四。王五没有批评李四。");
+        let positive = index
+            .answer_question("谁批评了李四？", None)
+            .expect("affirmative question should plan");
+        assert_eq!(
+            positive.answers(),
+            vec![("subject".to_string(), "张三".to_string())],
+            "{:?}",
+            positive.search.receipt
+        );
+        let negative = index
+            .answer_question("谁没有批评李四？", None)
+            .expect("negative question should plan");
+        assert_eq!(
+            negative.answers(),
+            vec![("subject".to_string(), "王五".to_string())],
+            "{:?}",
+            negative.search.receipt
+        );
     }
 
     #[test]
