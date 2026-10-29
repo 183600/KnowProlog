@@ -575,8 +575,19 @@ pub fn extract_frames(text: &str) -> Vec<CanonicalFrame> {
 fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current = String::new();
-    for ch in text.chars() {
-        if matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n') {
+    let chars: Vec<char> = text.chars().collect();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        let hard_boundary = matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n');
+        let soft_boundary = matches!(ch, '，' | ',')
+            && !chars
+                .get(index.wrapping_sub(1))
+                .map(|previous| previous.is_ascii_digit())
+                .unwrap_or(false)
+            && !chars
+                .get(index + 1)
+                .map(|next| next.is_ascii_digit())
+                .unwrap_or(false);
+        if hard_boundary || soft_boundary {
             if !current.trim().is_empty() {
                 sentences.push(current.trim().to_string());
             }
@@ -2632,6 +2643,17 @@ mod tests {
             "{:?}",
             answer
         );
+    }
+
+    #[test]
+    fn comma_separated_clauses_still_compile_frames() {
+        let frames = extract_frames("张三批评了李四，李四写了书。");
+        assert_eq!(frames.len(), 2, "{:?}", frames);
+        let predicates: BTreeSet<&str> = frames
+            .iter()
+            .map(|frame| frame.predicate.text.as_str())
+            .collect();
+        assert_eq!(predicates, BTreeSet::from(["批评", "写"]));
     }
 
     #[test]

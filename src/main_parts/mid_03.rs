@@ -1528,10 +1528,9 @@ async fn build_store_reasoner(
     reasoner
 }
 
-
 fn run_spine(text: Option<&str>, facts: &[String], question: Option<&str>, json: bool) {
     use know_prolog::dependency_spine::{
-        analyze, compile_frames, extract_frames, SpineIndex,
+        analyze_sentences, compile_frames, extract_frames, SpineIndex,
     };
 
     let mut index = SpineIndex::new();
@@ -1614,11 +1613,11 @@ fn run_spine(text: Option<&str>, facts: &[String], question: Option<&str>, json:
         let records: Vec<serde_json::Value> = inputs
             .iter()
             .map(|input| {
-                let tree = analyze(input);
-                let frames = compile_frames(&tree);
+                let trees = analyze_sentences(input);
+                let frames: Vec<_> = trees.iter().flat_map(compile_frames).collect();
                 serde_json::json!({
                     "text": input,
-                    "tree": tree,
+                    "trees": trees,
                     "frames": frames,
                 })
             })
@@ -1632,11 +1631,12 @@ fn run_spine(text: Option<&str>, facts: &[String], question: Option<&str>, json:
     }
 
     for input in &inputs {
-        let tree = analyze(input);
-        println!("{}", tree.render_text());
-        for frame in compile_frames(&tree) {
-            println!("规范框架：{}", frame.render_text());
+        for tree in analyze_sentences(input) {
+            println!("{}", tree.render_text());
+            for frame in compile_frames(&tree) {
+                println!("规范框架：{}", frame.render_text());
+            }
+            println!();
         }
-        println!();
     }
 }
