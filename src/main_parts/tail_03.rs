@@ -300,6 +300,18 @@ mod session_tests {
         ));
     }
 
+    /// ask 与交互/服务一致：配置启用的绑定帧必须进入多行会话，
+    /// 否则「查这个人的师傅」这类槽位回填只在另外两个入口可用。
+    #[tokio::test]
+    async fn ask_dialogue_injects_configured_frame_program() {
+        let config = load_config_from("config.toml").await.unwrap();
+        let dialogue = ask_dialogue(&config, RecoveryMode::Observe);
+        assert!(
+            dialogue.frame_program().is_some(),
+            "config.toml 的 [dialogue_frames] 启用时应编译出绑定帧程序"
+        );
+    }
+
     #[test]
     fn ask_cli_accepts_question_and_stdin_modes() {
         let cli = Cli::try_parse_from([

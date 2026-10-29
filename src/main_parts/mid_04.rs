@@ -1,3 +1,12 @@
+/// ask 的多行会话与交互/服务共用同一套对话前通道配置：
+/// 恢复策略之外，还必须编译并注入配置态绑定帧，否则槽位澄清在脚本入口失效。
+fn ask_dialogue(config: &SystemConfig, recovery_mode: RecoveryMode) -> DialogueManager {
+    let mut dialogue = DialogueManager::new();
+    dialogue.set_recovery_mode(recovery_mode);
+    dialogue.set_frame_program(compile_frame_program(config));
+    dialogue
+}
+
 async fn run_ask(
     config: &SystemConfig,
     oxigraph_manager: &OxigraphManager,
@@ -41,8 +50,7 @@ async fn run_ask(
 
     // 与交互/服务同一条对话前通道：查询板、指代、澄清与身份回合都在
     // reasoner.answer 之前；一次 ask 的多行输入共享同一会话记忆。
-    let mut dialogue = DialogueManager::new();
-    dialogue.set_recovery_mode(recovery_mode);
+    let mut dialogue = ask_dialogue(config, recovery_mode);
     let mut lens_cache: Option<(viewpoint::LensCorpus, BTreeSet<String>)> = None;
     let mut import_episodes: Option<Vec<know_prolog::import_episode::ImportEpisode>> = None;
     let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
