@@ -459,6 +459,56 @@ pub struct CanonicalFrame {
 }
 
 impl CanonicalFrame {
+    /// 没有源句时，用三元组合成一个最小规范框架，保证仍可被脊索引查询。
+    pub fn from_triple(subject: &str, predicate: &str, object: &str) -> Self {
+        let subject = subject.trim();
+        let predicate = predicate.trim();
+        let object = object.trim();
+        let subject_term = FrameTerm {
+            text: subject.to_string(),
+            head: subject.to_string(),
+            pos: "n".to_string(),
+            start: 0,
+            end: subject.len(),
+        };
+        let predicate_term = FrameTerm {
+            text: predicate.to_string(),
+            head: predicate.to_string(),
+            pos: "v".to_string(),
+            start: 0,
+            end: predicate.len(),
+        };
+        let object_term = FrameTerm {
+            text: object.to_string(),
+            head: object.to_string(),
+            pos: "n".to_string(),
+            start: 0,
+            end: object.len(),
+        };
+        let material = format!(
+            "synthetic|{}|{}|{}|affirmative|active|0",
+            subject, predicate, object
+        );
+        Self {
+            id: format!("dsi:{}", fnv1a_hex(material.as_bytes())),
+            subject: subject_term,
+            predicate: predicate_term,
+            object: object_term,
+            polarity: FramePolarity::Affirmative,
+            construction: Construction::Active,
+            flags: vec!["synthetic_frame".to_string()],
+            confidence: 1.0,
+            evidence: FrameEvidence {
+                sentence: String::new(),
+                root_token: 0,
+                subject_span: None,
+                predicate_span: None,
+                object_span: None,
+                edges: Vec::new(),
+            },
+        }
+    }
+
     pub fn is_complete(&self) -> bool {
         !self.subject.is_empty() && !self.predicate.is_empty() && !self.object.is_empty()
     }
@@ -1729,6 +1779,20 @@ impl SpineIndex {
         Self::from_frames(extract_frames(text))
     }
 
+    /// 从无源句三元组建索引：合成规范框架，保持与文本框架同一查询路径。
+    pub fn from_triples(triples: &[(String, String, String)]) -> Self {
+        let mut index = Self::new();
+        for (subject, predicate, object) in triples {
+            index.insert_frame(CanonicalFrame::from_triple(subject, predicate, object));
+        }
+        index.seal();
+        index
+    }
+
+    pub fn insert_triple(&mut self, subject: &str, predicate: &str, object: &str) {
+        self.insert_frame(CanonicalFrame::from_triple(subject, predicate, object));
+    }
+
     pub fn insert_frame(&mut self, frame: CanonicalFrame) {
         self.sealed = false;
         let frame_id = self.frames.len();
@@ -2568,6 +2632,23 @@ mod tests {
             "{:?}",
             answer
         );
+    }
+
+    #[test]
+    fn synthetic_frames_keep_queries_available_without_source_sentences() {
+        let triple = ("张三".to_string(), "批评".to_string(), "李四".to_string());
+        let mut index = SpineIndex::from_triples(&[triple]);
+        let answer = index
+            .answer_question("谁批评了李四？", None)
+            .expect("synthetic frame should answer");
+        assert!(
+            answer
+                .answers()
+                .contains(&("subject".to_string(), "张三".to_string())),
+            "{:?}",
+            answer
+        );
+        assert_eq!(index.frames()[0].flags, vec!["synthetic_frame"]);
     }
 
     #[test]
