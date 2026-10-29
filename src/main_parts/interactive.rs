@@ -747,7 +747,7 @@ async fn run_interactive_mode(
                     );
                 } else if plugin_runtime.enabled_count() < enabled_before {
                     println!(
-                        "提示：停用插件不撤回本会话已合并的本体与别名，重启后按当前启用集重建。"
+                        "提示：停用插件不撤回本会话已合并的本体与别名；规则包会按当前启用集重算。"
                     );
                 }
                 if let Err(error) = plugin_runtime.session_state().save(&plugin_state_path) {
