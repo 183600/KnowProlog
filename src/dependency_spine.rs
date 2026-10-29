@@ -1789,6 +1789,7 @@ impl QuestionSearch {
 #[derive(Debug, Clone, Default)]
 pub struct SpineIndex {
     frames: Vec<CanonicalFrame>,
+    frame_ids: HashMap<String, usize>,
     edges: Vec<SpineEdge>,
     frame_edges: Vec<Vec<usize>>,
     by_exact: HashMap<(String, DepLabel, String), Vec<usize>>,
@@ -1832,9 +1833,14 @@ impl SpineIndex {
         self.insert_frame(CanonicalFrame::from_triple(subject, predicate, object));
     }
 
-    pub fn insert_frame(&mut self, frame: CanonicalFrame) {
+    /// 插入框架；完全相同的框架 id 只保留第一次插入的证据。
+    pub fn insert_frame(&mut self, frame: CanonicalFrame) -> usize {
+        if let Some(frame_id) = self.frame_ids.get(&frame.id) {
+            return *frame_id;
+        }
         self.sealed = false;
         let frame_id = self.frames.len();
+        self.frame_ids.insert(frame.id.clone(), frame_id);
         self.frames.push(frame);
         self.frame_edges.push(Vec::new());
         let frame = &self.frames[frame_id];
@@ -1877,6 +1883,7 @@ impl SpineIndex {
             self.edges.push(edge);
             self.frame_edges[frame_id].push(edge_id);
         }
+        frame_id
     }
 
     /// 索引一棵表层依存树。重复调用不会删除既有框架。
@@ -1888,8 +1895,7 @@ impl SpineIndex {
         if frames.is_empty() {
             return;
         }
-        self.insert_frame(frames[0].clone());
-        let frame_id = self.frames.len() - 1;
+        let frame_id = self.insert_frame(frames[0].clone());
         for edge in &tree.edges {
             let Some(head) = tree.token(edge.head) else {
                 continue;
@@ -2587,6 +2593,22 @@ mod tests {
             search.receipt
         );
         assert!(search.receipt.certified);
+    }
+
+    #[test]
+    fn duplicate_frame_is_kept_once() {
+        let mut index = SpineIndex::new();
+        index.insert_triple("张三", "批评", "李四");
+        index.insert_triple("张三", "批评", "李四");
+        assert_eq!(index.frame_count(), 1);
+        assert_eq!(index.edge_count(), 2);
+        let search = index.lookup(
+            TermPattern::word("张三"),
+            TermPattern::word("批评"),
+            TermPattern::word("李四"),
+            None,
+        );
+        assert_eq!(search.solutions.len(), 1, "{:?}", search.receipt);
     }
 
     #[test]
