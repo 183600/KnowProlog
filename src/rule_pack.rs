@@ -1058,10 +1058,15 @@ fn detect_rule_conflicts(
 
     let mut witnesses: BTreeMap<String, RuleConflictWitness> = BTreeMap::new();
     let mut pairs = 0usize;
-    for (index, left) in rules.iter().enumerate() {
+    'pairs: for (index, left) in rules.iter().enumerate() {
         for right in rules.iter().skip(index + 1) {
             if left.pack == right.pack && left.rule_id == right.rule_id {
                 continue;
+            }
+            pairs += 1;
+            if pairs > MAX_CONFLICT_RULE_PAIRS {
+                *truncated = true;
+                break 'pairs;
             }
             if left.clause.head.predicate == right.clause.head.predicate {
                 let key = functional
@@ -1070,11 +1075,6 @@ fn detect_rule_conflicts(
                         functional.get(&(right.pack.as_str(), right.clause.head.predicate.as_ref()))
                     });
                 if let Some(key) = key {
-                    pairs += 1;
-                    if pairs > MAX_CONFLICT_RULE_PAIRS {
-                        *truncated = true;
-                        break;
-                    }
                     if let Some(witness) = functional_witness(left, right, key, index) {
                         witnesses.entry(witness.id.clone()).or_insert(witness);
                     }
@@ -1090,21 +1090,10 @@ fn detect_rule_conflicts(
                 if left.clause.head.predicate == right.clause.head.predicate {
                     continue;
                 }
-                pairs += 1;
-                if pairs > MAX_CONFLICT_RULE_PAIRS {
-                    *truncated = true;
-                    break;
-                }
                 if let Some(witness) = exclusive_witness(left, right, group, index) {
                     witnesses.entry(witness.id.clone()).or_insert(witness);
                 }
             }
-            if pairs > MAX_CONFLICT_RULE_PAIRS {
-                break;
-            }
-        }
-        if pairs > MAX_CONFLICT_RULE_PAIRS {
-            break;
         }
     }
     witnesses.into_values().collect()
