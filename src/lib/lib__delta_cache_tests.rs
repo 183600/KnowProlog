@@ -374,3 +374,38 @@ async fn relevant_facts_cache_survives_unrelated_batch_retraction() {
         "无关批次撤回应保留缓存，而不是整图重扫"
     );
 }
+
+#[tokio::test]
+async fn relevant_facts_cache_survives_duplicate_rdf_import() {
+    let (manager, _dir) = local_manager().await;
+    manager
+        .save_knowledge(vec![local_person("张三"), local_person("李四")])
+        .await
+        .unwrap();
+    manager
+        .save_knowledge(vec![local_relation("张三", "李四")])
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let query = vec!["张三".to_string()];
+
+    let first = manager.get_relevant_facts(&query, 1).await.unwrap();
+    let scans = perf.count("relevant_facts_graph_scan");
+    let added = manager
+        .import_rdf_reader(
+            oxigraph::io::RdfFormat::Turtle,
+            "<http://example.org/kg/entity/张三> <http://example.org/kg/师傅> <http://example.org/kg/entity/李四> ."
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(added, 0, "同一关系重复导入不应新增三元组");
+    let second = manager.get_relevant_facts(&query, 1).await.unwrap();
+
+    assert_eq!(first, second, "重复导入不应改变已缓存的子图");
+    assert_eq!(
+        perf.count("relevant_facts_graph_scan"),
+        scans,
+        "重复导入应按空增量保留缓存"
+    );
+}

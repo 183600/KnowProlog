@@ -108,8 +108,8 @@ impl OxigraphManager {
     /// 导入的知识也能立即被推理器与 SPARQL 默认图查询看到；需要保留来源
     /// 隔离时请使用 `namespace` 命令。
     ///
-    /// 与 JSON-LD 导入一致：持锁后、写前推进知识版本，保证并发读者不会把
-    /// 半成品缓存成完整快照；解析或写入失败时版本号也已推进（保守失效）。
+    /// 持锁写入完成后才推进知识版本：事务失败原样回滚，不留下半批数据；
+    /// 重复导入仍推进版本，但按空增量足迹保留无关缓存。
     pub async fn import_rdf_reader<R: std::io::Read>(
         &self,
         format: oxigraph::io::RdfFormat,
@@ -135,18 +135,20 @@ impl OxigraphManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let delta = footprint_from_quads(&quads);
         let store = self.store.lock().await;
-        self.bump_revision_with(Some(delta));
-        let added = store.transaction(move |mut transaction| {
+        let (added, added_quads) = store.transaction(move |mut transaction| {
             let mut added = 0usize;
+            let mut added_quads = Vec::new();
             for quad in &quads {
                 if transaction.insert(quad.as_ref())? {
                     added += 1;
+                    added_quads.push(quad.clone());
                 }
             }
-            Ok::<usize, oxigraph::store::StorageError>(added)
+            Ok::<(usize, Vec<Quad>), oxigraph::store::StorageError>((added, added_quads))
         })?;
+        let delta = footprint_from_quads(&added_quads);
+        self.bump_revision_with(Some(delta));
         Ok(added)
     }
 
