@@ -133,7 +133,7 @@ impl EntityRelationExtractor {
                 "教育背景".to_string(), "工作单位".to_string(), "家庭关系".to_string(),
             ],
             recognition_patterns: vec![
-                r"[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤].{1,3}".to_string(),
+                r"[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤][^的了是在有和与及把被给对从向为以于而且或但吗呢吧啊，。！？；：、\s]{1,3}".to_string(),
             ],
             context_keywords: vec![
                 "先生".to_string(), "女士".to_string(), "老师".to_string(), "教授".to_string(),
@@ -544,6 +544,57 @@ impl EntityRelationExtractor {
         Ok(entities)
     }
 
+    /// 把贪婪的人名正则命中裁剪成可信的姓名前缀。
+    ///
+    /// 结巴会把「张三」拆成量词 + 数词、把「张三批评」中的动词也留在正则
+    /// 命中里；这里按词性在第一个功能词/动词处截断，并要求至少两个汉字。
+    fn trim_person_candidate(&self, candidate: &str) -> Option<(String, usize)> {
+        let mut name = String::new();
+        for tag in self.jieba.tag(candidate, false) {
+            let word = tag.word;
+            if word.trim().is_empty() || word.chars().any(is_person_boundary) {
+                break;
+            }
+            let tag_text = tag.tag;
+            if name.is_empty() {
+                let first = word.chars().next()?;
+                if word.chars().count() == 1 && is_common_surname(first) {
+                    name.push_str(word);
+                    continue;
+                }
+                if tag_text.starts_with("nr") {
+                    name.push_str(word);
+                    continue;
+                }
+                break;
+            }
+            if name.chars().count() >= 4 {
+                break;
+            }
+            if tag_text.starts_with("nr") {
+                name.push_str(word);
+                continue;
+            }
+            if word.chars().count() == 1
+                && matches!(
+                    tag_text,
+                    "m" | "q" | "a" | "x" | "j" | "s" | "f" | "n"
+                )
+            {
+                name.push_str(word);
+                continue;
+            }
+            break;
+        }
+        let byte_len = name.len();
+        let char_count = name.chars().count();
+        if (2..=4).contains(&char_count) {
+            Some((name, byte_len))
+        } else {
+            None
+        }
+    }
+
     /// 获取缓存的正则
     fn get_compiled_regex(&self, pattern: &str) -> Option<Regex> {
         {
@@ -586,17 +637,25 @@ impl EntityRelationExtractor {
         for pattern in &entity_type.recognition_patterns {
             if let Some(regex) = self.get_compiled_regex(pattern) {
                 for mat in regex.find_iter(sentence) {
-                    let entity_text = mat.as_str();
-                    let confidence = self.calculate_entity_confidence(entity_text, keyword_hits);
+                    let (entity_text, end) = if type_name == "PERSON" {
+                        match self.trim_person_candidate(mat.as_str()) {
+                            Some((trimmed, byte_len)) => (trimmed, mat.start() + byte_len),
+                            None => continue,
+                        }
+                    } else {
+                        (mat.as_str().to_string(), mat.end())
+                    };
+                    let confidence =
+                        self.calculate_entity_confidence(&entity_text, keyword_hits);
 
                     if confidence > 0.5 {
                         entities.push(EntityExtraction {
-                            entity: entity_text.to_string(),
+                            entity: entity_text,
                             entity_type: type_name.to_string(),
                             confidence,
                             position: EntityPosition {
                                 start: mat.start(),
-                                end: mat.end(),
+                                end,
                                 sentence_id,
                                 paragraph_id: 0,
                             },
@@ -1247,6 +1306,16 @@ impl EntityRelationExtractor {
     }
 }
 
+fn is_common_surname(ch: char) -> bool {
+    "王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤"
+        .contains(ch)
+}
+
+fn is_person_boundary(ch: char) -> bool {
+    ch.is_whitespace()
+        || "的了是在有和与及把被给对从向为以于而且或但吗呢吧啊，。！？；：、·".contains(ch)
+}
+
 impl Default for EntityRelationExtractor {
     fn default() -> Self {
         Self::new()
@@ -1316,6 +1385,32 @@ mod tests {
         assert!((extractor.calculate_entity_confidence("甲", 0) - 0.5).abs() < 1e-9);
         let long_name = "甲".repeat(11);
         assert!((extractor.calculate_entity_confidence(&long_name, 0) - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_name_pattern_stops_before_function_words() {
+        let extractor = EntityRelationExtractor::new();
+        let (entities, relations) = extractor
+            .extract_entities_and_relations("李四被张三批评了。")
+            .await
+            .unwrap();
+        assert!(
+            entities.iter().any(|entity| entity.entity == "张三"),
+            "{:?}",
+            entities
+        );
+        assert!(
+            entities.iter().any(|entity| entity.entity == "李四"),
+            "{:?}",
+            entities
+        );
+        assert!(
+            relations.iter().any(|relation| {
+                relation.subject == "张三" && relation.object == "李四"
+            }),
+            "{:?}",
+            relations
+        );
     }
 
     #[tokio::test]
