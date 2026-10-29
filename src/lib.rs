@@ -45,6 +45,7 @@ pub mod conversational_graph;
 pub mod default_logic;
 pub mod delta_cache;
 pub mod dense_retrieval;
+pub mod dependency_spine;
 pub mod derivation;
 pub mod dialogue_eval;
 pub mod dialogue_frame;
