@@ -2165,10 +2165,6 @@ impl SpineIndex {
             receipt.truncated = true;
         }
         receipt.returned = solutions.len();
-        receipt.budget_exhausted = query
-            .max_probes
-            .map(|budget| used >= budget)
-            .unwrap_or(false);
         receipt.certified = !receipt.truncated && !receipt.budget_exhausted;
         if !receipt.certified {
             receipt
@@ -2191,12 +2187,6 @@ impl SpineIndex {
         solutions: &mut Vec<SpineSolution>,
         receipt: &mut SpineReceipt,
     ) {
-        if let Some(budget) = query.max_probes {
-            if *used >= budget {
-                receipt.budget_exhausted = true;
-                return;
-            }
-        }
         if depth == order.len() {
             let mut frames = frame_ids;
             frames.sort_unstable();
@@ -2213,6 +2203,12 @@ impl SpineIndex {
                 solutions.push(solution);
             }
             return;
+        }
+        if let Some(budget) = query.max_probes {
+            if *used >= budget {
+                receipt.budget_exhausted = true;
+                return;
+            }
         }
         let pattern_index = order[depth];
         let pattern = &query.edges[pattern_index];
@@ -2655,6 +2651,22 @@ mod tests {
             "{:?}",
             negative.search.receipt
         );
+    }
+
+    #[test]
+    fn exact_budget_completion_stays_certified() {
+        let mut index = SpineIndex::from_text("张三批评了李四。");
+        let search = index.query(
+            &SpineQuery::new(vec![EdgePattern::new(
+                TermPattern::Any,
+                DepLabel::NSubj,
+                TermPattern::Any,
+            )])
+            .with_budget(1),
+        );
+        assert_eq!(search.solutions.len(), 1, "{:?}", search.receipt);
+        assert!(!search.receipt.budget_exhausted, "{:?}", search.receipt);
+        assert!(search.receipt.certified, "{:?}", search.receipt);
     }
 
     #[test]
