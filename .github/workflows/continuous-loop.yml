@@ -293,11 +293,16 @@ jobs:
           XUEN_TASK='改进这个项目'
           PROMPT_IMPROVE='改进这个项目。先通读 README.md、PLAN.md 和现有代码，理解项目目标与当前进度，然后做出实质性的改进：补全缺失的功能、完善核心实现、提升代码质量与可用性，让项目向目标推进。每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。每完成一个可验证的改动就立即 git commit（不要 push、不要 amend），避免阶段被超时中断时丢失进度。不要输出或写入“改进了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动。'
           PROMPT_CLEAN='确保远程仓库里没有实验结果文件、REPORT*.md、临时调试脚本与调试输出等杂物；确保仓库中没有任何关于修复了哪些bug、优化或改进了哪些内容的记录（包括注释）。删除所有其他多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；LICENSE 是开源许可证文件，同样必须原样保留，也不属于“多余的内容”；README*.md（含所有语言版本的 README）是项目说明文档，同样必须原样保留，不能删除或移动；tests/ 是测试套件，必须原样保留；知识库与语料等仍被项目引用或加载的数据文件（如 *.txt、*.jsonld）不属于“多余的内容”，必须保留。'
+          # ================= 新增：docs 阶段提示词（每次循环 1/10 概率执行） =================
+          PROMPT_DOCS='优化这个项目的代码和文档。代码方面：只做不改变功能语义的重构（命名、注释、消除重复、结构清晰），保持对外接口与行为完全不变；每次改动后运行 cargo check --all-targets 自检，不通过就自己修好，并尽量运行 cargo test 验证行为。文档方面：改进 README.md 与 PLAN.md 的表述、结构与示例；可以修改内容，但不得删除或移动文件，也不得添加关于修复了哪些bug、优化或改进了哪些内容的记录。不要输出或写入“优化了哪些内容”的报告。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；LICENSE、README*.md（含所有语言版本的 README）、tests/ 目录同样绝对不能删除、修改或移动；知识库与语料等仍被项目引用的数据文件必须原样保留。'
+
 
           # 每阶段单次调用的最大时长（秒）
           IDEA_TIMEOUT=$((3*3600))     # 3h
           IMPROVE_TIMEOUT=$((3*3600))  # 3h
           CLEAN_TIMEOUT=$((3*3600))    # 3h
+          DOCS_TIMEOUT=$((3*3600))    # 3h（docs 阶段：优化代码与文档，1/10 概率执行）
+
 
           # ================= workflow 防删自愈 =================
           # agent 的 clean 阶段可能把 .github 当作“多余内容”删除。
@@ -967,6 +972,33 @@ jobs:
 
               sleep 5
             done
+
+            # ================= 新增：docs 阶段（每次循环 1/10 概率执行） =================
+            # 每次循环迭代掷一次骰子：1/10 概率命中才执行「优化代码和文档」阶段。
+            # 未命中时直接跳过、不占用本轮预算；命中时复用既有 run_phase / 质量门禁 / commit 机制。
+            DOCS_ROLL=$(( RANDOM % 10 ))
+            if [ "$DOCS_ROLL" -eq 0 ]; then
+              echo "[info] docs 阶段命中 1/10 概率（roll=0），本轮执行代码与文档优化"
+              P="$PROMPT_DOCS"
+              T="$DOCS_TIMEOUT"
+              REMAIN=$(( DEADLINE - $(date +%s) ))
+              if [ "$REMAIN" -le 0 ]; then
+                echo "[info] 全局时间已到，跳过 docs 阶段"
+              else
+                if [ "$T" -gt "$REMAIN" ]; then T="$REMAIN"; fi
+                echo ">>> iteration #$i | phase=docs | budget=${T}s"
+                PHASE_BASE="$(git rev-parse HEAD)"
+                run_phase docs "$P" "$T"
+                # ---- 质量门禁：通过才提交；不通过则整段撤销 ----
+                if gate_check; then
+                  commit_and_push "$i-docs"
+                else
+                  reject_phase
+                fi
+              fi
+            else
+              echo "[info] docs 阶段未命中 1/10 概率（roll=$DOCS_ROLL），本轮跳过"
+            fi
           done
       - name: Cleanup repo artifacts
         if: always()
