@@ -119,6 +119,86 @@
             continue;
         }
 
+        // 批次冲突裁决：一次回答挂起的冲突表
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "批答：",
+                "批答:",
+                "裁决：",
+                "裁决:",
+                "回答冲突：",
+                "回答冲突:",
+                "冲突裁决：",
+                "冲突裁决:",
+            ],
+        ) {
+            let answer = symbolic_reasoner.resolve_batch_answer(target);
+            println!("{}", answer);
+            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+            println!();
+            continue;
+        }
+
+        if matches!(input, "取消批答" | "取消裁决" | "放弃批答") {
+            let answer = symbolic_reasoner.resolve_batch_answer("取消");
+            println!("{}", answer);
+            println!();
+            continue;
+        }
+
+        if matches!(input, "查看批答" | "待裁决批次" | "冲突表") {
+            match symbolic_reasoner.pending_batch_report() {
+                Some(report) => println!("{}", report),
+                None => println!("当前没有待裁决批次。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 批量记住：一次解析成批、一次预检、一次回执；冲突项挂起为冲突表
+        if let Some(target) = strip_any_prefix(
+            input,
+            &[
+                "批量记住：",
+                "批量记住:",
+                "批次记住：",
+                "批次记住:",
+                "原子记住：",
+                "原子记住:",
+                "事务记住：",
+                "事务记住:",
+            ],
+        ) {
+            let target = target.trim();
+            if target.is_empty() {
+                println!("请给出要批量记住的事实，例如：批量记住：张三30岁；李四32岁");
+            } else {
+                refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
+                let answer = symbolic_reasoner.assert_nl_fact(input);
+                println!("{}", answer);
+                if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
+                    println!("{}", deferred);
+                    log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                }
+                let effects = conversation_theory::effects_from_text(
+                    target,
+                    conversation_theory::EffectOp::Add,
+                );
+                if let Some(chronicle) = chronicle.as_mut() {
+                    let _ = conversation_theory::append_assert(
+                        chronicle,
+                        target,
+                        &effects,
+                        kb_revision,
+                    );
+                }
+                log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+            }
+            println!();
+            continue;
+        }
+
         // 记住会话事实：断言为会话级事实（不写知识图谱，可随对话记忆持久化）
         if let Some(target) = strip_any_prefix(
             input,
