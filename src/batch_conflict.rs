@@ -1142,35 +1142,38 @@ pub fn parse_batch_answer(answer: &str, questions: &[BatchQuestion]) -> BatchAns
         outcome.cancelled = true;
         return outcome;
     }
-    if ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
-        .iter()
-        .any(|cue| normalized.contains(cue))
-    {
-        apply_defaults(questions, &mut outcome, 0..questions.len());
-        return outcome;
-    }
-    if ["都按后者", "全部按后者", "按后者", "都选后者"].iter().any(|cue| normalized.contains(cue)) {
-        for (index, question) in questions.iter().enumerate() {
-            outcome.selections[index] = last_value_option(question);
-        }
-        return outcome;
-    }
-    if ["都按前者", "全部按前者", "按前者", "都选前者"].iter().any(|cue| normalized.contains(cue)) {
-        for (index, question) in questions.iter().enumerate() {
-            outcome.selections[index] = first_value_option(question);
-        }
-        return outcome;
-    }
+    let has_rest = normalized.contains("其余");
+    let global_defaults = !has_rest
+        && ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
+            .iter()
+            .any(|cue| normalized.contains(cue));
+    let global_last = !has_rest
+        && ["都按后者", "全部按后者", "按后者", "都选后者"]
+            .iter()
+            .any(|cue| normalized.contains(cue));
+    let global_first = !has_rest
+        && ["都按前者", "全部按前者", "按前者", "都选前者"]
+            .iter()
+            .any(|cue| normalized.contains(cue));
 
     let mut rest_defaults = false;
     let mut rest_last = false;
-    for token in normalized.split(['，', ',', '；', ';', '、', ' ']).filter(|token| !token.is_empty()) {
+    let mut rest_first = false;
+    for token in normalized
+        .split(['，', ',', '；', ';', '、', ' '])
+        .filter(|token| !token.is_empty())
+    {
         if token.contains("其余") {
             if token.contains("后者") {
                 rest_last = true;
+            } else if token.contains("前者") {
+                rest_first = true;
             } else {
                 rest_defaults = true;
             }
+            continue;
+        }
+        if is_global_cue(token) {
             continue;
         }
         match parse_answer_token(token, questions) {
@@ -1183,19 +1186,41 @@ pub fn parse_batch_answer(answer: &str, questions: &[BatchQuestion]) -> BatchAns
         }
     }
     if rest_defaults {
-        let remaining: Vec<usize> = outcome
-            .unresolved()
-            .into_iter()
-            .collect();
+        let remaining: Vec<usize> = outcome.unresolved().into_iter().collect();
         apply_defaults(questions, &mut outcome, remaining);
     } else if rest_last {
         for index in outcome.unresolved() {
-            if let Some(last) = questions[index].options.len().checked_sub(1) {
-                outcome.selections[index] = Some(last);
-            }
+            outcome.selections[index] = last_value_option(&questions[index]);
+        }
+    } else if rest_first {
+        for index in outcome.unresolved() {
+            outcome.selections[index] = first_value_option(&questions[index]);
+        }
+    }
+    if global_defaults {
+        let remaining: Vec<usize> = outcome.unresolved().into_iter().collect();
+        apply_defaults(questions, &mut outcome, remaining);
+    } else if global_last {
+        for index in outcome.unresolved() {
+            outcome.selections[index] = last_value_option(&questions[index]);
+        }
+    } else if global_first {
+        for index in outcome.unresolved() {
+            outcome.selections[index] = first_value_option(&questions[index]);
         }
     }
     outcome
+}
+
+fn is_global_cue(token: &str) -> bool {
+    if token.starts_with(|ch: char| ch.is_ascii_digit()) {
+        return false;
+    }
+    ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
+        .iter()
+        .chain(["都按后者", "全部按后者", "按后者", "都选后者"].iter())
+        .chain(["都按前者", "全部按前者", "按前者", "都选前者"].iter())
+        .any(|cue| token.contains(cue))
 }
 
 fn apply_defaults(
@@ -1255,6 +1280,22 @@ fn parse_answer_token(
         }
     }
     let question = &questions[question_index];
+    if rest.contains("后者") {
+        return last_value_option(question)
+            .map(|option| (question_index, option))
+            .ok_or_else(|| format!("第 {} 处没有可选择的后者。", number));
+    }
+    if rest.contains("前者") {
+        return first_value_option(question)
+            .map(|option| (question_index, option))
+            .ok_or_else(|| format!("第 {} 处没有可选择的前者。", number));
+    }
+    if (rest.contains("同意") || rest.contains("建议")) && !rest.contains("不同意") {
+        return question
+            .default_option
+            .map(|option| (question_index, option))
+            .ok_or_else(|| format!("第 {} 处没有默认建议。", number));
+    }
     if let Some(first) = rest.chars().next() {
         if first.is_ascii_alphabetic() {
             let label = first.to_ascii_uppercase();
@@ -1561,6 +1602,23 @@ mod tests {
             plan.questions[0].options[last.selections[0].unwrap()].value.as_deref(),
             Some("31")
         );
+
+        let rest = parse_batch_answer("1A，其余按后者", &plan.questions);
+        assert_eq!(rest.selections[0], Some(0));
+        assert_eq!(rest.selections[1], Some(1));
+        assert_eq!(
+            plan.questions[1].options[rest.selections[1].unwrap()]
+                .value
+                .as_deref(),
+            Some("41")
+        );
+
+        let mixed = parse_batch_answer("1A，都按后者", &plan.questions);
+        assert_eq!(mixed.selections[0], Some(0));
+        assert_eq!(mixed.selections[1], Some(1));
+
+        let per_question = parse_batch_answer("1按后者，2按前者", &plan.questions);
+        assert_eq!(per_question.selections, vec![Some(1), Some(0)]);
 
         let cancelled = parse_batch_answer("取消", &plan.questions);
         assert!(cancelled.cancelled);
