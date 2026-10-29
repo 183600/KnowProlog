@@ -256,21 +256,27 @@ impl OxigraphManager {
         &self,
         quads: &[Quad],
     ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-        let delta = footprint_from_quads(quads);
         let store = self.store.lock().await;
-        let (added, duplicates) = store.transaction(move |mut transaction| {
+        let (added, duplicates, added_quads) = store.transaction(move |mut transaction| {
             let mut added = 0usize;
             let mut duplicates = 0usize;
+            let mut added_quads = Vec::new();
             for quad in quads {
                 if transaction.insert(quad.as_ref())? {
                     added += 1;
+                    added_quads.push(quad.clone());
                 } else {
                     duplicates += 1;
                 }
             }
-            Ok::<(usize, usize), oxigraph::store::StorageError>((added, duplicates))
+            Ok::<(usize, usize, Vec<Quad>), oxigraph::store::StorageError>((
+                added,
+                duplicates,
+                added_quads,
+            ))
         })?;
         if added > 0 {
+            let delta = footprint_from_quads(&added_quads);
             self.bump_revision_with(Some(delta));
         }
         Ok((added, duplicates))

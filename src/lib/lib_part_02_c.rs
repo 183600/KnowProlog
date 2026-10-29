@@ -657,6 +657,8 @@ impl OxigraphManager {
                 }
             }
         }
+        let delta = footprint_from_quad_sets(&inserted_quads, &removed_quads);
+        self.bump_revision_with(Some(delta));
         drop(store);
         self.predicate_registry.write().correct(
             entity,
@@ -668,8 +670,6 @@ impl OxigraphManager {
                 new_value
             },
         );
-        let delta = footprint_from_quad_sets(&inserted_quads, &removed_quads);
-        self.bump_revision_with(Some(delta));
         Ok((removed, inserted))
     }
 }
