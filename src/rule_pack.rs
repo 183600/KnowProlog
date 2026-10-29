@@ -493,9 +493,8 @@ impl RuleProgram {
             return;
         }
         for pack in &mut self.packs {
-            pack.rules.retain(|rule| {
-                !suppressed.contains(&(rule.pack.clone(), rule.rule_id.clone()))
-            });
+            pack.rules
+                .retain(|rule| !suppressed.contains(&(rule.pack.clone(), rule.rule_id.clone())));
         }
         self.report.rules = self.packs.iter().map(|pack| pack.rules.len()).sum();
     }
@@ -546,9 +545,7 @@ pub fn compile_packs(packs: &[RulePack]) -> RuleProgram {
     }
 
     report.packs = compiled.len();
-    report
-        .issues
-        .extend(cross_pack_issues(&compiled, packs));
+    report.issues.extend(cross_pack_issues(&compiled, packs));
     report.conflicts = detect_rule_conflicts(&compiled, &mut report.truncated);
     RuleProgram {
         packs: compiled,
@@ -1036,10 +1033,8 @@ fn detect_rule_conflicts(
     compiled: &[CompiledPack],
     truncated: &mut bool,
 ) -> Vec<RuleConflictWitness> {
-    let mut rules: Vec<&CompiledRule> = compiled
-        .iter()
-        .flat_map(|pack| pack.rules.iter())
-        .collect();
+    let mut rules: Vec<&CompiledRule> =
+        compiled.iter().flat_map(|pack| pack.rules.iter()).collect();
     rules.sort_by(|left, right| {
         left.pack
             .cmp(&right.pack)
@@ -1070,15 +1065,9 @@ fn detect_rule_conflicts(
             }
             if left.clause.head.predicate == right.clause.head.predicate {
                 let key = functional
-                    .get(&(
-                        left.pack.as_str(),
-                        left.clause.head.predicate.as_ref(),
-                    ))
+                    .get(&(left.pack.as_str(), left.clause.head.predicate.as_ref()))
                     .or_else(|| {
-                        functional.get(&(
-                            right.pack.as_str(),
-                            right.clause.head.predicate.as_ref(),
-                        ))
+                        functional.get(&(right.pack.as_str(), right.clause.head.predicate.as_ref()))
                     });
                 if let Some(key) = key {
                     pairs += 1;
@@ -1145,7 +1134,8 @@ fn functional_witness(
     }
     let left_value = resolved_term(&left.clause.head.terms[key.value], &subst);
     let right_value = resolved_term(&right_clause.head.terms[key.value], &subst);
-    let (Some(left_value), Some(right_value)) = (constant_of(&left_value), constant_of(&right_value))
+    let (Some(left_value), Some(right_value)) =
+        (constant_of(&left_value), constant_of(&right_value))
     else {
         return None;
     };
@@ -1240,12 +1230,7 @@ fn exclusive_witness(
     })
 }
 
-fn unify_terms_at(
-    left: &Atom,
-    right: &Atom,
-    index: usize,
-    subst: &mut Substitution,
-) -> bool {
+fn unify_terms_at(left: &Atom, right: &Atom, index: usize, subst: &mut Substitution) -> bool {
     let left_atom = Atom::new("$key", vec![left.terms[index].clone()]);
     let right_atom = Atom::new("$key", vec![right.terms[index].clone()]);
     unify_atoms(&left_atom, &right_atom, subst)
@@ -1302,11 +1287,8 @@ mod tests {
 
     #[test]
     fn compiles_chinese_rules_and_rejects_unsafe_heads() {
-        let safe = pack("safe").with_rule(RuleSpec::new(
-            "age",
-            "年龄(X, 38)",
-            &["出生年(X, 1986)"],
-        ));
+        let safe =
+            pack("safe").with_rule(RuleSpec::new("age", "年龄(X, 38)", &["出生年(X, 1986)"]));
         let program = compile_packs(&[safe]);
         assert_eq!(program.report.rules, 1);
         assert!(!program.report.has_errors(), "{:?}", program.report.issues);
@@ -1315,9 +1297,11 @@ mod tests {
         let unsafe_pack = pack("unsafe").with_rule(RuleSpec::new("bad", "年龄(X, 38)", &[]));
         let program = compile_packs(&[unsafe_pack]);
         assert!(program.report.has_errors());
-        assert!(program.report.issues.iter().any(|issue| issue
-            .message
-            .contains("未在规则体中绑定")));
+        assert!(program
+            .report
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("未在规则体中绑定")));
     }
 
     #[test]
@@ -1393,7 +1377,10 @@ mod tests {
         assert!(predicates.contains("已故"));
         let id = conflict.id.clone();
         assert!(program.report.adjudicate(&id, "living"));
-        assert_eq!(program.report.conflicts[0].status, WitnessStatus::Adjudicated);
+        assert_eq!(
+            program.report.conflicts[0].status,
+            WitnessStatus::Adjudicated
+        );
         assert_eq!(
             program.report.conflicts[0].preferred_pack.as_deref(),
             Some("living")
@@ -1405,10 +1392,12 @@ mod tests {
     fn dependency_cycle_and_layer_inversion_are_reported() {
         let mut base = pack("base").with_layer(3);
         base.requires.push("leaf".to_string());
-        base.rules.push(RuleSpec::new("base-rule", "基础(X)", &["事实(X)"]));
+        base.rules
+            .push(RuleSpec::new("base-rule", "基础(X)", &["事实(X)"]));
         let mut leaf = pack("leaf").with_layer(1);
         leaf.requires.push("base".to_string());
-        leaf.rules.push(RuleSpec::new("leaf-rule", "叶子(X)", &["事实(X)"]));
+        leaf.rules
+            .push(RuleSpec::new("leaf-rule", "叶子(X)", &["事实(X)"]));
         let program = compile_packs(&[base, leaf]);
         assert!(program.report.has_errors());
         assert!(program
@@ -1433,10 +1422,7 @@ mod tests {
             .with_rule(RuleSpec::new("b", "年龄(张三, 39)", &[]));
         let program = compile_packs(&[left, right]);
         assert_eq!(program.report.conflicts.len(), 1);
-        assert_eq!(
-            program.report.conflicts[0].status,
-            WitnessStatus::Actual
-        );
+        assert_eq!(program.report.conflicts[0].status, WitnessStatus::Actual);
         assert_eq!(program.report.conflicts[0].subject, "张三");
     }
 
@@ -1446,7 +1432,8 @@ mod tests {
             .with_functional(FunctionalKey::new("年龄", 0, 1))
             .with_rule(RuleSpec::new("one", "年龄(X, 38)", &["出生年(X, 1986)"]))
             .with_rule(RuleSpec::new("two", "年龄(X, 38)", &["出生年(X, 1986)"]));
-        pack.rules.push(RuleSpec::new("bad", "年龄(X)", &["出生年(X, 1986)"]));
+        pack.rules
+            .push(RuleSpec::new("bad", "年龄(X)", &["出生年(X, 1986)"]));
         let program = compile_packs(&[pack]);
         assert!(program
             .report
@@ -1514,10 +1501,7 @@ mod tests {
             .with_rule(RuleSpec::new("b", "年龄(X, 39)", &["出生年(X, 1990)"]));
         let first = compile_packs(&[left.clone(), right.clone()]);
         let second = compile_packs(&[right, left]);
-        assert_eq!(
-            first.report.conflicts[0].id,
-            second.report.conflicts[0].id
-        );
+        assert_eq!(first.report.conflicts[0].id, second.report.conflicts[0].id);
         assert_eq!(first.report.to_json(), second.report.to_json());
     }
 }
