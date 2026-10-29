@@ -249,8 +249,10 @@ impl SymbolicReasoner {
             output.push_str(&next.render_zh());
             output.push('\n');
             self.batch_pending = Some(next);
-        } else {
+        } else if commit.refused.is_empty() {
             output.push_str("本批冲突已全部裁决。\n");
+        } else {
+            output.push_str("本批冲突已裁决，但写入被修订守门器阻止；请按提示修正后重试。\n");
         }
         output.push_str(&format!("会话事实共 {} 条。", self.session_facts.len()));
         output

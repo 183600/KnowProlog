@@ -1098,6 +1098,7 @@ fn parse_answer_token(
     if token.is_empty() {
         return Err("空裁决项。".to_string());
     }
+    let token = token.strip_prefix("第").unwrap_or(token);
     let digits_end = token
         .char_indices()
         .take_while(|(_, ch)| ch.is_ascii_digit())
@@ -1147,6 +1148,11 @@ fn parse_answer_token(
     if value.is_empty() {
         return Err(format!("第 {} 处缺少选择。", number));
     }
+    if matches!(value, "保留原值" | "原值" | "保留") {
+        if let Some(option) = question.options.iter().position(|option| option.base) {
+            return Ok((question_index, option));
+        }
+    }
     if let Some(option) = question.option_by_value(value) {
         return Ok((question_index, option));
     }
@@ -1172,7 +1178,7 @@ fn parse_answer_token(
 }
 
 fn normalize_answer(answer: &str) -> String {
-    answer
+    let mapped: Vec<char> = answer
         .trim()
         .chars()
         .map(|ch| match ch {
@@ -1184,7 +1190,20 @@ fn normalize_answer(answer: &str) -> String {
             '，' => ',',
             other => other,
         })
-        .collect()
+        .collect();
+    let mut normalized = String::with_capacity(mapped.len());
+    for (index, ch) in mapped.iter().copied().enumerate() {
+        if ch == ' '
+            && index > 0
+            && index + 1 < mapped.len()
+            && mapped[index - 1].is_ascii_digit()
+            && mapped[index + 1].is_ascii_alphabetic()
+        {
+            continue;
+        }
+        normalized.push(ch);
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -1369,6 +1388,23 @@ mod tests {
 
         let cancelled = parse_batch_answer("取消", &plan.questions);
         assert!(cancelled.cancelled);
+    }
+
+    #[test]
+    fn answer_parser_accepts_ordinal_prefix_space_and_keep_base() {
+        let claims = vec![
+            claim("张三", "年龄", "31", AssertionStrength::Direct),
+        ];
+        let options = functional_options()
+            .with_base_values(SlotKey::new("张三", "年龄"), vec!["30".to_string()]);
+        let plan = plan_batch(claims, &options);
+        assert_eq!(plan.questions.len(), 1);
+        let spaced = parse_batch_answer("第1题 B", &plan.questions);
+        assert!(spaced.is_complete(), "{:?}", spaced);
+        assert_eq!(spaced.selections[0], Some(1));
+        let keep = parse_batch_answer("1保留原值", &plan.questions);
+        assert!(keep.is_complete(), "{:?}", keep);
+        assert_eq!(keep.selections[0], Some(0));
     }
 
     #[test]
