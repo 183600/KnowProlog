@@ -1212,7 +1212,12 @@ impl SymbolicReasoner {
         }
         if matches!(
             sentence,
-            "取消批答" | "取消裁决" | "放弃批答" | "查看批答" | "待裁决批次"
+            "取消批答"
+                | "取消裁决"
+                | "放弃批答"
+                | "查看批答"
+                | "待裁决批次"
+                | "冲突表"
         ) {
             if matches!(sentence, "取消批答" | "取消裁决" | "放弃批答") {
                 return self.resolve_batch_answer("取消");
@@ -1222,9 +1227,7 @@ impl SymbolicReasoner {
                 .unwrap_or_else(|| "当前没有待裁决批次。".to_string());
         }
         if let Some(mode) = forced_batch {
-            if let Some(result) = self.try_assert_nl_batch(sentence, Some(mode)) {
-                return result;
-            }
+            return self.assert_nl_batch(sentence, mode);
         }
         if let Some(atom) = Self::parse_negative_atom(sentence) {
             return self.assert_negative_atom(atom);

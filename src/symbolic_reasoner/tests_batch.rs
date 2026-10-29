@@ -57,6 +57,17 @@ fn batch_answer_can_replace_graph_base_value() {
 }
 
 #[test]
+fn forced_batch_reports_parse_errors_instead_of_falling_through() {
+    let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+    let message =
+        reasoner.assert_nl_fact("原子记住：如果张三的师傅是李四，那么张三的师祖是赵六");
+    assert!(message.contains("没能从"), "{}", message);
+    assert!(message.contains("未解析"), "{}", message);
+    assert!(reasoner.session_facts().is_empty(), "{}", message);
+    assert!(reasoner.pending_batch_turn().is_none());
+}
+
+#[test]
 fn atomic_batch_writes_nothing_until_conflict_is_resolved() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     let message = reasoner.assert_nl_fact(
