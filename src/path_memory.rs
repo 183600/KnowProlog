@@ -388,10 +388,17 @@ impl PathBundle {
         let mut output = String::new();
         let goal = self.goal.clone().unwrap_or_else(|| "?".to_string());
         if self.witnesses.is_empty() {
-            output.push_str(&format!(
-                "路径工作记忆：没有找到从「{}」到「{}」的路径。",
-                self.start, goal
-            ));
+            if self.truncated {
+                output.push_str(&format!(
+                    "路径工作记忆：未能在上限内确认从「{}」到「{}」的路径（搜索已按上限截断，不能排除存在路径）。",
+                    self.start, goal
+                ));
+            } else {
+                output.push_str(&format!(
+                    "路径工作记忆：没有找到从「{}」到「{}」的路径。",
+                    self.start, goal
+                ));
+            }
         } else {
             output.push_str(&format!(
                 "路径工作记忆：{} → {}，{} 条路径，扩展 {} 次，访问 {} 个节点。",
@@ -1165,9 +1172,15 @@ impl TraversalGraph {
                     let paths = forward_seen.entry(partial.node.clone()).or_default();
                     if paths.len() < options.max_paths.max(1) {
                         paths.push(partial.steps.clone());
+                    } else {
+                        bundle.truncated = true;
                     }
                 }
-                forward_frontier = trim_frontier(next_frontier, options.beam_width);
+                let (trimmed, did_trim) = trim_frontier(next_frontier, options.beam_width);
+                if did_trim {
+                    bundle.truncated = true;
+                }
+                forward_frontier = trimmed;
                 advanced = true;
             }
 
@@ -1253,9 +1266,15 @@ impl TraversalGraph {
                     let paths = backward_seen.entry(partial.node.clone()).or_default();
                     if paths.len() < options.max_paths.max(1) {
                         paths.push(partial.steps.clone());
+                    } else {
+                        bundle.truncated = true;
                     }
                 }
-                backward_frontier = trim_frontier(next_frontier, options.beam_width);
+                let (trimmed, did_trim) = trim_frontier(next_frontier, options.beam_width);
+                if did_trim {
+                    bundle.truncated = true;
+                }
+                backward_frontier = trimmed;
                 advanced = true;
             }
 
@@ -1418,9 +1437,11 @@ fn witness_prefix_key(start: &str, steps: &[PathStep]) -> String {
     key
 }
 
-fn trim_frontier(mut frontier: Vec<PartialPath>, beam_width: usize) -> Vec<PartialPath> {
-    frontier.truncate(beam_width.max(1));
-    frontier
+fn trim_frontier(mut frontier: Vec<PartialPath>, beam_width: usize) -> (Vec<PartialPath>, bool) {
+    let limit = beam_width.max(1);
+    let trimmed = frontier.len() > limit;
+    frontier.truncate(limit);
+    (frontier, trimmed)
 }
 
 fn join_bidirectional(
@@ -1696,6 +1717,52 @@ mod tests {
         assert_eq!(bundle.witnesses.len(), 1);
         assert_eq!(bundle.witnesses[0].end(), Some("李四"));
         assert!(bundle.witnesses[0].steps[0].inverted);
+    }
+
+    #[test]
+    fn between_hub_beam_pruning_is_reported_and_hedged() {
+        let mut graph = TraversalGraph::new();
+        for index in 1..=6 {
+            graph.add_edge("起点", "到", &format!("甲{index}"));
+            graph.add_edge(&format!("乙{index}"), "到", "终点");
+        }
+        graph.add_edge("甲6", "连", "乙6");
+
+        let bundle = graph.enumerate_between(
+            "起点",
+            "终点",
+            &TraversalOptions {
+                max_depth: 4,
+                beam_width: 4,
+                ..TraversalOptions::default()
+            },
+        );
+        assert!(
+            bundle.witnesses.is_empty(),
+            "两端枢纽的中段分支被剪掉后不应伪造见证：{:?}",
+            bundle.witnesses
+        );
+        assert!(bundle.truncated, "beam 剪枝丢弃了分支，必须置位 truncated");
+        let text = bundle.render_text();
+        assert!(
+            !text.contains("没有找到从「起点」到「终点」的路径。"),
+            "截断时不得给出无条件的否定断言：{}",
+            text
+        );
+        assert!(
+            text.contains("不能排除存在路径") && text.contains("截断"),
+            "截断且无见证时应给出 hedge 和截断说明：{}",
+            text
+        );
+
+        let mut small = TraversalGraph::new();
+        small.add_edge("张三", "师傅", "李四");
+        let unchanged = small.enumerate_between("李四", "张三", &TraversalOptions::default());
+        assert!(!unchanged.truncated);
+        assert_eq!(
+            unchanged.render_text(),
+            "路径工作记忆：没有找到从「李四」到「张三」的路径。"
+        );
     }
 
     #[test]
