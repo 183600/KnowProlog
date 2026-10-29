@@ -1495,6 +1495,15 @@ async fn build_store_reasoner(
             reasoner.set_lexical_memory(memory);
         }
     }
+    // 导入可逆帧是跨重启的语言记忆：交互模式在导入时学习并落盘，
+    // 只读的 ask/联合解析也必须恢复它，否则同一问法在两种入口下不同。
+    if let ImportFrameLoad::Loaded(frames) =
+        ImportFrameLedger::load(&format!("{}/import_frames.json", store_path))
+    {
+        if !frames.is_empty() {
+            reasoner.attach_import_frames(frames);
+        }
+    }
     let (ontology_program, _) = owl_annotation::ontology_program_with_annotations(
         &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),
         &format!("{}/{}", store_path, owl_annotation::LEDGER_FILE),

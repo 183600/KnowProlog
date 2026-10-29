@@ -469,6 +469,68 @@ mod session_tests {
         assert!(answer.contains("4 个"), "{}", answer);
     }
 
+    /// 交互导入学习到的可逆问法应随 `<store>/import_frames.json` 跨入口恢复，
+    /// ask 不能在同一个知识库上丢掉用户已经教过的措辞。
+    #[tokio::test]
+    async fn ask_reasoner_restores_persisted_import_frames() {
+        use know_prolog::import_frames::{
+            FactKind, FrameAtom, FrameObservation, ImportFrame, ImportFrameLedger,
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_path = dir.path().to_str().unwrap();
+        let manager = OxigraphManager::with_perf_ledger(store_path, PerfLedger::shared()).unwrap();
+        manager
+            .save_knowledge(vec![KnowledgeItem::Entity {
+                label: "人物".to_string(),
+                properties: HashMap::from([
+                    ("name".to_string(), "张三".to_string()),
+                    ("年龄".to_string(), "30".to_string()),
+                ]),
+            }])
+            .await
+            .unwrap();
+
+        let mut frames = ImportFrameLedger::new();
+        let frame = ImportFrame {
+            id: "ifr#年龄".to_string(),
+            kind: FactKind::Attribute,
+            predicate: "年龄".to_string(),
+            atoms: vec![
+                FrameAtom::Subject,
+                FrameAtom::Literal {
+                    surface: "今年".to_string(),
+                },
+                FrameAtom::Object,
+                FrameAtom::Literal {
+                    surface: "岁".to_string(),
+                },
+            ],
+            example_subject: "张三".to_string(),
+            example_object: "30".to_string(),
+            observations: vec![FrameObservation {
+                witness: "张三今年30岁".to_string(),
+                import_digest: "digest".to_string(),
+                turn: 1,
+            }],
+            ask_activated: true,
+        };
+        frames.frames.insert(frame.id.clone(), frame);
+        frames
+            .save(&format!("{}/import_frames.json", store_path))
+            .unwrap();
+
+        let facts = manager.load_graph_snapshot().await.unwrap();
+        let config = load_config_from("config.toml").await.unwrap();
+        let reasoner = build_store_reasoner(&config, &manager, store_path, &facts).await;
+        let restored = reasoner.import_frames().expect("导入帧应随存储恢复");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored.realize("张三", "年龄", "30").as_deref(),
+            Some("张三今年30岁")
+        );
+    }
+
     #[test]
     fn namespace_cli_parses_import_list_and_status() {
         let cli = Cli::try_parse_from(["knowprolog", "namespace", "--source", "alice", "a.ttl"])
