@@ -88,6 +88,17 @@
                 );
             }
             api_state.set_frame_program(frame_program.clone());
+            // 跨会话词法记忆：与交互启动一致地恢复词性证据与量词期待。
+            match oxigraph_manager.load_lexical_memory().await {
+                Ok(memory) if !memory.is_empty() => {
+                    let restored = api_state.apply_lexical_memory(memory);
+                    println!("服务已恢复词法记忆：{} 词条。", restored);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("词法记忆读取失败（已忽略，不影响知识库）：{}", error);
+                }
+            }
             // 单一本体：配置态本体注入暖基座，之后分叉的每个会话同源携带。
             let (ontology_program, owl_lessons) = owl_annotation::ontology_program_with_annotations(
                 &OntologyProgram::from_config(&config.type_system, &config.predicate_profiles),

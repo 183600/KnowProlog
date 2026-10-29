@@ -438,6 +438,38 @@
         assert_eq!(state.cache_epoch(), after, "空手册不应推进纪元");
     }
 
+    /// 与 CLI 共用存储时，服务也要恢复词法记忆（词性证据/量词期待），
+    /// 否则同一问法在 HTTP 入口得到的解析软约束不同。
+    #[test]
+    fn apply_lexical_memory_reaches_warm_reasoner_and_bumps_epoch() {
+        use crate::lexical_memory::{LexicalMemory, TokenEvidence};
+
+        let state = test_state(2);
+        let epoch = state.cache_epoch();
+        let mut memory = LexicalMemory::new(8);
+        memory.tokens.insert(
+            "t1".to_string(),
+            TokenEvidence {
+                id: "t1".to_string(),
+                surface: "姚明".to_string(),
+                pos: "nr".to_string(),
+                source: "test".to_string(),
+                count: 1,
+                first_turn: 1,
+                last_turn: 1,
+                type_votes: std::collections::BTreeMap::from([("人物".to_string(), 1)]),
+            },
+        );
+
+        assert_eq!(state.apply_lexical_memory(memory), 1);
+        assert_ne!(state.cache_epoch(), epoch);
+        assert_eq!(state.warm.reasoner.lock().lexical_memory().len(), 1);
+
+        let after = state.cache_epoch();
+        assert_eq!(state.apply_lexical_memory(LexicalMemory::new(8)), 0);
+        assert_eq!(state.cache_epoch(), after, "空记忆不应推进纪元");
+    }
+
     #[tokio::test]
     async fn openai_compat_streaming_and_errors() {
         let (addr, _server) = start_server(4);

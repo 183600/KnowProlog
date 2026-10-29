@@ -182,6 +182,18 @@ impl ApiState {
         count
     }
 
+    /// 宿主注入跨重启的词法记忆（词性证据与量词期待）。
+    /// 它不是硬规则，但会改变解析/生成，注入后旧缓存须整体失效。
+    pub fn apply_lexical_memory(&self, memory: crate::lexical_memory::LexicalMemory) -> usize {
+        let count = memory.len();
+        if memory.is_empty() {
+            return 0;
+        }
+        self.warm.reasoner.lock().set_lexical_memory(memory);
+        self.bump_identity_epoch();
+        count
+    }
+
     /// 宿主注入跨重启学习到的重写手册（`rewrite_book.json`），
     /// 与服务共用同一存储的 CLI 已能用的读法不应在 HTTP 入口消失。
     pub fn load_rewrite_book(&self, book: crate::rewrite_book::RewriteBook) -> usize {
