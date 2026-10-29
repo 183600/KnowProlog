@@ -20,6 +20,7 @@ pub mod alignment_memory;
 pub mod answer_plan;
 pub mod artifact_audit;
 pub mod association_miner;
+pub mod batch_conflict;
 pub mod batch_teaching;
 pub mod belief_revision;
 pub mod binding_frames;
