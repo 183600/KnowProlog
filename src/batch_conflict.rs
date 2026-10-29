@@ -1144,9 +1144,10 @@ pub fn parse_batch_answer(answer: &str, questions: &[BatchQuestion]) -> BatchAns
     }
     let has_rest = normalized.contains("其余");
     let global_defaults = !has_rest
-        && ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
-            .iter()
-            .any(|cue| normalized.contains(cue));
+        && (normalized == "同意"
+            || ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
+                .iter()
+                .any(|cue| normalized.contains(cue)));
     let global_last = !has_rest
         && ["都按后者", "全部按后者", "按后者", "都选后者"]
             .iter()
@@ -1655,6 +1656,9 @@ mod tests {
         let keep = parse_batch_answer("1保留原值", &plan.questions);
         assert!(keep.is_complete(), "{:?}", keep);
         assert_eq!(keep.selections[0], Some(0));
+        let agree = parse_batch_answer("同意", &plan.questions);
+        assert!(agree.is_complete(), "{:?}", agree);
+        assert_eq!(agree.selections[0], Some(0));
     }
 
     #[test]
