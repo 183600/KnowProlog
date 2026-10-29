@@ -1504,7 +1504,9 @@ async fn build_store_reasoner(
         &config.type_system,
         &config.predicate_profiles,
     ));
-    reasoner.align_predicate_pairs(&oxigraph_manager.predicate_query_pairs());
+    // 与交互/服务共用同一注册入口：谓词画像的别名、换向词面与显式律典
+    // （传递/对称/互逆）必须一起进入只读推理器；只同步别名会让 ask 忽略配置律。
+    sync_predicate_pairs(&mut reasoner, oxigraph_manager);
     reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
     if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
         reasoner.load_persisted_laws(persisted);

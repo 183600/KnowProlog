@@ -441,6 +441,34 @@ mod session_tests {
         assert!(reply.is_none(), "无语境线索不应接管旧回答路径");
     }
 
+    /// `ask` 的只读推理器必须和交互/服务一样接入配置律典：
+    /// 只同步谓词词面而不配置显式传递律，会让「所有」问句错误地拒绝闭包。
+    #[tokio::test]
+    async fn ask_reasoner_honors_configured_transitive_laws() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager =
+            OxigraphManager::with_perf_ledger(dir.path().to_str().unwrap(), PerfLedger::shared())
+                .unwrap();
+        let jsonld = std::fs::read_to_string("examples/master_disciple.jsonld").unwrap();
+        manager.import_jsonld(&jsonld).await.unwrap();
+        let facts = manager.load_graph_snapshot().await.unwrap();
+        let config = load_config_from("config.toml").await.unwrap();
+
+        let reasoner = build_store_reasoner(
+            &config,
+            &manager,
+            dir.path().to_str().unwrap(),
+            &facts,
+        )
+        .await;
+        let answer = reasoner
+            .answer("张三的所有师傅是谁")
+            .expect("传递律应让闭包回答");
+        assert!(answer.contains("law:transitive:师傅"), "{}", answer);
+        assert!(answer.contains("钱七"), "{}", answer);
+        assert!(answer.contains("4 个"), "{}", answer);
+    }
+
     #[test]
     fn namespace_cli_parses_import_list_and_status() {
         let cli = Cli::try_parse_from(["knowprolog", "namespace", "--source", "alice", "a.ttl"])
