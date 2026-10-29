@@ -958,7 +958,29 @@ impl EntityRelationExtractor {
     ) -> Result<Vec<KnowledgeTriple>, Box<dyn std::error::Error>> {
         let mut relations = Vec::new();
 
-        // 简化的依存句法分析
+        // 依存脊：先归一主动/被动/把字/判断等构式，再产出完整三元组。
+        for frame in crate::dependency_spine::extract_frames(sentence) {
+            if frame.subject.is_empty() || frame.object.is_empty() {
+                continue;
+            }
+            if frame.confidence < 0.5 {
+                continue;
+            }
+            let relation_type = self.map_verb_to_relation(&frame.predicate.head);
+            relations.push(KnowledgeTriple {
+                subject: frame.subject.text.clone(),
+                predicate: relation_type,
+                object: frame.object.text.clone(),
+                confidence: frame.confidence.min(0.75),
+                source_text: sentence.to_string(),
+                extraction_method: format!("dependency_spine_{}", frame.construction.code()),
+            });
+        }
+        if !relations.is_empty() {
+            return Ok(relations);
+        }
+
+        // 回退：旧的主谓宾扫描，仅在依存脊没有产出完整框架时使用。
         let words: Vec<_> = self
             .jieba
             .cut_for_search(sentence, false)
@@ -966,21 +988,13 @@ impl EntityRelationExtractor {
             .collect();
         let pos_tags = self.simple_pos_tagging(&words);
 
-        // 寻找主谓宾结构
         for i in 0..words.len() {
             if self.is_verb(&pos_tags[i]) {
                 let verb = &words[i];
-
-                // 寻找主语
                 let subject = self.find_subject(&words, &pos_tags, i);
-
-                // 寻找宾语
                 let object = self.find_object(&words, &pos_tags, i);
-
                 if let (Some(subj), Some(obj)) = (subject, object) {
-                    // 将动词映射为关系类型
                     let relation_type = self.map_verb_to_relation(verb);
-
                     relations.push(KnowledgeTriple {
                         subject: subj,
                         predicate: relation_type,
@@ -1302,6 +1316,30 @@ mod tests {
         assert!((extractor.calculate_entity_confidence("甲", 0) - 0.5).abs() < 1e-9);
         let long_name = "甲".repeat(11);
         assert!((extractor.calculate_entity_confidence(&long_name, 0) - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_dependency_spine_normalizes_passive_and_ba() {
+        let extractor = EntityRelationExtractor::new();
+
+        for text in ["李四被张三批评了。", "张三把李四批评了。"] {
+            let relations = extractor
+                .extract_relations_by_dependency(text, &[])
+                .await
+                .unwrap();
+            assert!(
+                relations.iter().any(|relation| {
+                    relation.subject == "张三"
+                        && relation.object == "李四"
+                        && relation
+                            .extraction_method
+                            .starts_with("dependency_spine_")
+                }),
+                "{} => {:?}",
+                text,
+                relations
+            );
+        }
     }
 
     #[test]
