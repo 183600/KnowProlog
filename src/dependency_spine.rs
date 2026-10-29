@@ -1005,6 +1005,19 @@ fn choose_root(tokens: &[SpineToken]) -> Option<usize> {
     {
         return Some(verb);
     }
+    let adjective_predicate = tokens.iter().enumerate().find_map(|(index, token)| {
+        if token.kind != TokenKind::Adjective {
+            return None;
+        }
+        let next = tokens.get(index + 1).map(|next| next.kind);
+        match next {
+            Some(TokenKind::Noun | TokenKind::ProperNoun | TokenKind::Particle) | None => None,
+            Some(_) => Some(index),
+        }
+    });
+    if let Some(adjective) = adjective_predicate {
+        return Some(adjective);
+    }
     tokens
         .iter()
         .position(|token| token.kind == TokenKind::Noun || token.kind == TokenKind::ProperNoun)
@@ -2030,19 +2043,29 @@ impl SpineIndex {
 
         let predicate = TermPattern::word(&root_token.text);
         let subject = match (&tree.subject, subject_is_wh) {
-            (Some(_), true) => TermPattern::var("subject"),
-            (Some(phrase), false) => TermPattern::word(&phrase.text),
-            (None, _) => return None,
+            (Some(_), true) => Some(TermPattern::var("subject")),
+            (Some(phrase), false) => Some(TermPattern::word(&phrase.text)),
+            (None, _) => None,
         };
         let object = match (&tree.object, object_is_wh) {
-            (Some(_), true) => TermPattern::var("object"),
-            (Some(phrase), false) => TermPattern::word(&phrase.text),
-            (None, _) => return None,
+            (Some(_), true) => Some(TermPattern::var("object")),
+            (Some(phrase), false) => Some(TermPattern::word(&phrase.text)),
+            (None, _) => None,
         };
-        let edges = vec![
-            EdgePattern::new(predicate.clone(), DepLabel::NSubj, subject),
-            EdgePattern::new(predicate, DepLabel::Obj, object),
-        ];
+        let mut edges = Vec::new();
+        if let Some(subject) = subject {
+            edges.push(EdgePattern::new(
+                predicate.clone(),
+                DepLabel::NSubj,
+                subject,
+            ));
+        }
+        if let Some(object) = object {
+            edges.push(EdgePattern::new(predicate, DepLabel::Obj, object));
+        }
+        if edges.is_empty() {
+            return None;
+        }
         let mut slots = Vec::new();
         if subject_is_wh {
             slots.push(QuestionSlot {
@@ -2564,6 +2587,29 @@ mod tests {
             search.receipt
         );
         assert!(search.receipt.certified);
+    }
+
+    #[test]
+    fn adjective_predicate_keeps_its_subject() {
+        let frames = extract_frames("苹果红了。");
+        assert_eq!(frames.len(), 1, "{:?}", frames);
+        assert_eq!(frames[0].subject.text, "苹果");
+        assert_eq!(frames[0].predicate.text, "红");
+        assert!(frames[0].object.is_empty());
+    }
+
+    #[test]
+    fn intransitive_question_uses_the_available_spine_edge() {
+        let mut index = SpineIndex::from_text("李四跑了。王五走了。");
+        let result = index
+            .answer_question("谁跑了？", None)
+            .expect("intransitive question should plan");
+        assert_eq!(
+            result.answers(),
+            vec![("subject".to_string(), "李四".to_string())],
+            "{:?}",
+            result.search.receipt
+        );
     }
 
     #[test]
