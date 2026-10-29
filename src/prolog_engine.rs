@@ -699,7 +699,7 @@ impl PrologEngine {
             self.note_fault(message.clone());
             return QueryOutcome::EngineFault(message);
         }
-        let query_str = format!("{}.", query);
+        let query_str = format!("{}.", query.trim_end_matches('.'));
         let resolution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.machine.run_query(query_str)
         }));

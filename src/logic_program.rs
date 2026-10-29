@@ -592,8 +592,10 @@ pub fn parse_atom(text: &str) -> Result<LAtom, ParseError> {
     }
     let predicate = text[..open].trim();
     validate_ident(predicate)?;
-    let inner = &text[open + 1..close];
-    let rest = text[close + 1..].trim();
+    let open_len = text[open..].chars().next().map_or(1, char::len_utf8);
+    let close_len = text[close..].chars().next().map_or(1, char::len_utf8);
+    let inner = &text[open + open_len..close];
+    let rest = text[close + close_len..].trim();
     if !rest.is_empty() {
         return Err(ParseError::new(format!("右括号后有多余内容：{}", rest)));
     }
@@ -771,6 +773,21 @@ mod tests {
         let reparsed = program_from(&source);
         let results = reparsed.query("available(X)").expect("查询应可解析");
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_atom_fullwidth_parens() {
+        let atom = parse_atom("plan（direct_answer, T）").expect("全角括号原子应可解析");
+        assert_eq!(atom.predicate, "plan");
+        assert_eq!(atom.terms.len(), 2);
+        assert_eq!(atom.terms[0], LTerm::Atom("direct_answer".to_string()));
+        assert!(matches!(&atom.terms[1], LTerm::Var(name) if name == "T"));
+    }
+
+    #[test]
+    fn test_parse_atom_mixed_width_parens_do_not_panic() {
+        let _ = parse_atom("p(a）");
+        let _ = parse_atom("p（a)");
     }
 
     #[test]
