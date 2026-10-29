@@ -337,3 +337,40 @@ async fn direct_answer_cache_recomputes_after_entity_undo() {
         "命中撤回足迹的直答必须重算"
     );
 }
+
+#[tokio::test]
+async fn relevant_facts_cache_survives_unrelated_batch_retraction() {
+    let (manager, _dir) = local_manager().await;
+    manager
+        .save_knowledge(vec![local_person("张三"), local_person("李四")])
+        .await
+        .unwrap();
+    manager
+        .save_knowledge(vec![local_relation("张三", "李四")])
+        .await
+        .unwrap();
+    let batch = manager
+        .import_rdf_batch(
+            oxigraph::io::RdfFormat::Turtle,
+            "<http://example.org/kg/entity/王五> <http://example.org/kg/name> \"王五\" ."
+                .as_bytes(),
+            "unrelated.ttl",
+        )
+        .await
+        .unwrap();
+    let perf = manager.perf_ledger();
+    let query = vec!["张三".to_string()];
+
+    let first = manager.get_relevant_facts(&query, 1).await.unwrap();
+    let scans = perf.count("relevant_facts_graph_scan");
+    let retraction = manager.retract_import_batch(&batch.episode).await.unwrap();
+    assert_eq!(retraction.removed, 1);
+    let second = manager.get_relevant_facts(&query, 1).await.unwrap();
+
+    assert_eq!(first, second, "无关批次撤回不应改变已缓存的子图");
+    assert_eq!(
+        perf.count("relevant_facts_graph_scan"),
+        scans,
+        "无关批次撤回应保留缓存，而不是整图重扫"
+    );
+}
