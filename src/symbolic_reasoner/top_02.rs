@@ -47,6 +47,7 @@ impl Clone for SymbolicReasoner {
             session_clauses: self.session_clauses.clone(),
             plugin_clauses: self.plugin_clauses.clone(),
             session_receipts: self.session_receipts.clone(),
+            batch_pending: self.batch_pending.clone(),
             clarification: self.clarification.clone(),
             last_abduction_goal: self.last_abduction_goal.clone(),
             last_abduction_vars: self.last_abduction_vars.clone(),

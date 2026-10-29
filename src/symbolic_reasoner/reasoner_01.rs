@@ -187,6 +187,7 @@ impl SymbolicReasoner {
             session_clauses: Vec::new(),
             plugin_clauses: Vec::new(),
             session_receipts: Vec::new(),
+            batch_pending: None,
             clarification: None,
             last_abduction_goal: None,
             last_abduction_vars: Vec::new(),
@@ -287,6 +288,7 @@ impl SymbolicReasoner {
         self.lessons_parsed.clear();
         self.frames = FrameMemory::new();
         self.pending_questions.clear();
+        self.batch_pending = None;
         *self.graph_session.lock() = None;
         // 会话事实可能已被索引为证据；分叉/重置时把非图谱来源的条目撤出索引。
         let session_facts = std::mem::take(&mut self.session_facts);

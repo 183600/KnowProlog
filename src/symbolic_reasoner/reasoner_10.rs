@@ -1499,6 +1499,7 @@ impl SymbolicReasoner {
         snapshot.frames = Some(self.frames.clone());
         snapshot.pending_questions =
             (!self.pending_questions.is_empty()).then(|| self.pending_questions.clone());
+        snapshot.batch_pending = self.batch_pending.clone();
         snapshot.ontology = self.discourse.ontology_capsule();
         snapshot.completion = (!self.completion.is_empty()).then(|| self.completion.clone());
         snapshot.predictive = (!self.predictive.is_empty()).then(|| self.predictive.clone());

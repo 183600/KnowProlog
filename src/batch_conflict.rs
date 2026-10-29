@@ -257,6 +257,39 @@ impl BatchPlan {
     }
 }
 
+/// 跨轮挂起的批次裁决：保留原 claim、问题与已提交/暂缓下标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchPendingTurn {
+    pub label: String,
+    pub mode: BatchMode,
+    pub claims: Vec<BatchClaim>,
+    pub questions: Vec<BatchQuestion>,
+    /// 已经提交过的 claim 下标（渐进模式下为无冲突项）。
+    #[serde(default)]
+    pub committed: Vec<usize>,
+    /// 原子模式下暂缓提交的无冲突项。
+    #[serde(default)]
+    pub deferred: Vec<usize>,
+}
+
+impl BatchPendingTurn {
+    pub fn render_zh(&self) -> String {
+        let mut lines = vec![format!(
+            "待裁决批次（{}模式）：{} 条 claim，{} 处冲突。",
+            self.mode.label_zh(),
+            self.claims.len(),
+            self.questions.len()
+        )];
+        for (index, question) in self.questions.iter().enumerate() {
+            lines.push(question.render_zh(index + 1));
+        }
+        lines.push(
+            "回复示例：批答：1B，2保留原值；或「批答：全部同意」「批答：取消」。".to_string(),
+        );
+        lines.join("\n")
+    }
+}
+
 /// 批裁决输入选项。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchOptions {
@@ -724,7 +757,7 @@ pub fn plan_batch(claims: Vec<BatchClaim>, options: &BatchOptions) -> BatchPlan 
                 let question = build_question(&claims, conflict_index, &conflict);
                 isolated.extend(factual.iter().map(|index| BatchIsolation {
                     claim: *index,
-                    reason: "与知识图谱基值不同，需先裁决".to_string(),
+                    reason: format!("{}：需先裁决", BatchConflictKind::GraphBaseConflict.label_zh()),
                     question: Some(conflict_index),
                 }));
                 conflicts.push(conflict);

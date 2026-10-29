@@ -10,6 +10,9 @@ use crate::abduction::{
 use crate::alignment_memory::{AlignmentKind, AlignmentMemory, AlignmentScope, LearnOutcome};
 use crate::answer_plan::{AnswerPlan, ClaimEvidence, PlanClaim, StyleDirective, MAX_PLAN_CLAIMS};
 use crate::association_miner::{display_item, AssociationMiner, AssociationRule};
+use crate::batch_conflict::{
+    self, BatchClaim, BatchMode, BatchOptions, BatchParseOutcome, BatchPendingTurn, BatchQuestion,
+};
 use crate::belief_revision::{BeliefState, ChangeOp, ChangeSet, RevisionConstraints};
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
@@ -99,7 +102,7 @@ use crate::semantic_monitor::{
     ControlMode, SearchAdvice, SemanticMonitor, SemanticObservation, TurnOutcome, WindowMetrics,
 };
 use crate::slot_ledger::{
-    AssertionStrength, SlotAssertion, SlotLedger, SlotPolicy, SlotTransition,
+    AssertionStrength, SlotAssertion, SlotKey, SlotLedger, SlotPolicy, SlotTransition,
 };
 use crate::symbolic_generator::{
     GenerationCursor, GenerationOrder, GenerationOverlay, ProfileClause, SymbolicGenerator,
@@ -613,6 +616,9 @@ pub struct DialogueSnapshot {
     // 悬问账本：没答上的目标 + 缺失前提；空账本不落盘，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_questions: Option<PendingQuestionLedger>,
+    // 批次冲突裁决：保留原 claim 与冲突表，重启后可继续「批答」；空则不落盘
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_pending: Option<BatchPendingTurn>,
     // 本体胶囊（教过的公理 + 摘要 + 闭包缓存）：跨会话/跨重建保留教学本体；
     // 未教过公理时缺省为 None，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -830,6 +836,7 @@ impl DialogueContext {
             contrast: None,
             frames: None,
             pending_questions: None,
+            batch_pending: None,
             ontology: None,
             completion: None,
             predictive: None,
@@ -1360,6 +1367,8 @@ pub struct SymbolicReasoner {
     plugin_clauses: Vec<Clause>,
     // 会话写入的修订回执（预检通过后才记录；支持按最新回执撤销）
     session_receipts: Vec<SessionRevisionReceipt>,
+    // 批次冲突裁决：一次输入编译成一批 claim，冲突未决时挂起一张冲突表
+    batch_pending: Option<BatchPendingTurn>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）
     clarification: Option<ClarificationSession>,
     // 最近一次溯因的目标合取与查询变量（澄清确认真后验证整个目标是否得证）

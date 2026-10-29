@@ -110,6 +110,7 @@ impl SymbolicReasoner {
             pending_questions.restore_from(saved);
         }
         self.pending_questions = pending_questions;
+        self.batch_pending = snapshot.batch_pending.clone();
         // 跨会话临时信念：恢复被采纳的会话假设（仍不写知识图谱）
         let mut restored: Vec<Atom> = Vec::new();
         for entry in &snapshot.session_facts {

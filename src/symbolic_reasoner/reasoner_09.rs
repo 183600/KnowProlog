@@ -1158,14 +1158,73 @@ impl SymbolicReasoner {
     }
 
     pub fn assert_nl_fact(&mut self, sentence_raw: &str) -> String {
-        let sentence = sentence_raw.trim();
-        let sentence = ["记住：", "记住:", "记录：", "记录:", "断言：", "断言:"]
+        let raw = sentence_raw.trim();
+        let forced_batch = if ["原子记住：", "原子记住:", "事务记住：", "事务记住:"]
             .iter()
-            .find_map(|prefix| sentence.strip_prefix(prefix))
-            .unwrap_or(sentence)
-            .trim();
+            .any(|prefix| raw.starts_with(prefix))
+        {
+            Some(BatchMode::Atomic)
+        } else if ["批量记住：", "批量记住:", "批次记住：", "批次记住:"]
+            .iter()
+            .any(|prefix| raw.starts_with(prefix))
+        {
+            Some(BatchMode::Progressive)
+        } else {
+            None
+        };
+        let sentence = [
+            "记住：",
+            "记住:",
+            "记录：",
+            "记录:",
+            "断言：",
+            "断言:",
+            "批量记住：",
+            "批量记住:",
+            "批次记住：",
+            "批次记住:",
+            "原子记住：",
+            "原子记住:",
+            "事务记住：",
+            "事务记住:",
+        ]
+        .iter()
+        .find_map(|prefix| raw.strip_prefix(prefix))
+        .unwrap_or(raw)
+        .trim();
         if sentence.is_empty() {
             return "请给出要记住的事实，例如：记住：张三是李四的师傅".to_string();
+        }
+        if let Some(rest) = [
+            "批答：",
+            "批答:",
+            "裁决：",
+            "裁决:",
+            "回答冲突：",
+            "回答冲突:",
+            "冲突裁决：",
+            "冲突裁决:",
+        ]
+        .iter()
+        .find_map(|prefix| sentence.strip_prefix(prefix))
+        {
+            return self.resolve_batch_answer(rest);
+        }
+        if matches!(
+            sentence,
+            "取消批答" | "取消裁决" | "放弃批答" | "查看批答" | "待裁决批次"
+        ) {
+            if matches!(sentence, "取消批答" | "取消裁决" | "放弃批答") {
+                return self.resolve_batch_answer("取消");
+            }
+            return self
+                .pending_batch_report()
+                .unwrap_or_else(|| "当前没有待裁决批次。".to_string());
+        }
+        if let Some(mode) = forced_batch {
+            if let Some(result) = self.try_assert_nl_batch(sentence, Some(mode)) {
+                return result;
+            }
         }
         if let Some(atom) = Self::parse_negative_atom(sentence) {
             return self.assert_negative_atom(atom);
@@ -1176,6 +1235,9 @@ impl SymbolicReasoner {
         }
         if strength == AssertionStrength::Correction && content != sentence {
             return self.correct_nl_fact(content);
+        }
+        if let Some(result) = self.try_assert_nl_batch(content, None) {
+            return result;
         }
         let outcome = chinese_reasoning_nlu::parse_lessons(content);
         // 写入前守门：先按当前会话世界试算，冲突时只问一个最小问题。

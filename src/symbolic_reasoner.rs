@@ -4,6 +4,7 @@ include!("symbolic_reasoner/top_01.rs");
 include!("symbolic_reasoner/top_02.rs");
 include!("symbolic_reasoner/top2_01.rs");
 include!("symbolic_reasoner/reasoner_01.rs");
+include!("symbolic_reasoner/batch_01.rs");
 include!("symbolic_reasoner/reasoner_02.rs");
 include!("symbolic_reasoner/reasoner_03.rs");
 include!("symbolic_reasoner/reasoner_04.rs");
@@ -25,4 +26,5 @@ mod tests {
     include!("symbolic_reasoner/tests_06.rs");
     include!("symbolic_reasoner/tests_07.rs");
     include!("symbolic_reasoner/tests_core_paths.rs");
+    include!("symbolic_reasoner/tests_batch.rs");
 }
