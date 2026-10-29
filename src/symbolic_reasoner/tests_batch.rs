@@ -60,7 +60,7 @@ fn batch_answer_can_replace_graph_base_value() {
 fn atomic_batch_writes_nothing_until_conflict_is_resolved() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     let message = reasoner.assert_nl_fact(
-        "原子记住：张三的年龄是30；张三的年龄是31；李四的师傅是王五",
+        "原子记住：据说王五的年龄是40；张三的年龄是30；张三的年龄是31；李四的师傅是王五",
     );
     assert!(message.contains("原子模式"), "{}", message);
     assert!(
@@ -68,10 +68,13 @@ fn atomic_batch_writes_nothing_until_conflict_is_resolved() {
         "原子模式有未决冲突时必须零写入：{}",
         message
     );
-    assert!(reasoner.pending_batch_turn().is_some());
+    let pending = reasoner.pending_batch_turn().expect("pending turn");
+    assert_eq!(pending.questions.len(), 1);
+    assert_eq!(pending.evidence.len(), 1, "传闻证据也必须暂缓：{:?}", pending);
 
     let resolved = reasoner.resolve_batch_answer("1A");
     assert!(resolved.contains("本批冲突已全部裁决"), "{}", resolved);
+    assert!(resolved.contains("已把传闻记为证据"), "{}", resolved);
     assert_eq!(reasoner.session_facts().len(), 2, "{}", resolved);
 }
 

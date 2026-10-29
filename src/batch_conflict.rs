@@ -270,6 +270,9 @@ pub struct BatchPendingTurn {
     /// 原子模式下暂缓提交的无冲突项。
     #[serde(default)]
     pub deferred: Vec<usize>,
+    /// 原子模式下暂缓写入的传闻证据。
+    #[serde(default)]
+    pub evidence: Vec<usize>,
 }
 
 impl BatchPendingTurn {

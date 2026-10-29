@@ -40,6 +40,29 @@ impl SymbolicReasoner {
         Some(self.assert_batch_outcome(sentence, outcome, forced.unwrap_or(BatchMode::Progressive)))
     }
 
+    fn apply_batch_evidence(
+        &mut self,
+        claims: &[BatchClaim],
+        indices: &[usize],
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        for &index in indices {
+            let Some(claim) = claims.get(index) else {
+                continue;
+            };
+            if let Ok(transition) = self.apply_session_slot(
+                &claim.subject,
+                &claim.predicate,
+                &claim.object,
+                AssertionStrength::Hearsay,
+                "批量传闻",
+            ) {
+                notes.push(transition.render_zh());
+            }
+        }
+        notes
+    }
+
     fn assert_batch_outcome(
         &mut self,
         text: &str,
@@ -80,19 +103,13 @@ impl SymbolicReasoner {
         let plan = batch_conflict::plan_batch(claims, &options);
 
         // 传闻只进证据区：不写会话事实，也不参与冲突提问。
-        let mut evidence_notes: Vec<String> = Vec::new();
-        for &index in &plan.evidence {
-            let claim = &plan.claims[index];
-            if let Ok(transition) = self.apply_session_slot(
-                &claim.subject,
-                &claim.predicate,
-                &claim.object,
-                AssertionStrength::Hearsay,
-                "批量传闻",
-            ) {
-                evidence_notes.push(transition.render_zh());
-            }
-        }
+        // 原子模式有未决冲突时连证据也暂缓，保证「裁决前零写入」。
+        let defer_evidence = plan.mode == BatchMode::Atomic && !plan.questions.is_empty();
+        let evidence_notes = if defer_evidence {
+            Vec::new()
+        } else {
+            self.apply_batch_evidence(&plan.claims, &plan.evidence)
+        };
 
         let commit = self.commit_batch_claims(&label, &plan.claims, &plan.accepted);
         let mut output = String::new();
@@ -138,6 +155,11 @@ impl SymbolicReasoner {
                 questions: plan.questions.clone(),
                 committed: commit.handled.clone(),
                 deferred: plan.deferred.clone(),
+                evidence: if defer_evidence {
+                    plan.evidence.clone()
+                } else {
+                    Vec::new()
+                },
             };
             output.push_str(&pending.render_zh());
             output.push('\n');
@@ -202,6 +224,11 @@ impl SymbolicReasoner {
             }
         }
         let commit = self.commit_batch_claims(&pending.label, &resolved_claims, &to_commit);
+        let evidence_notes = if all_resolved {
+            self.apply_batch_evidence(&pending.claims, &pending.evidence)
+        } else {
+            Vec::new()
+        };
         let mut output = String::new();
         if !parsed.notes.is_empty() {
             for note in &parsed.notes {
@@ -224,6 +251,9 @@ impl SymbolicReasoner {
                 }
             }
         }
+        for note in &evidence_notes {
+            output.push_str(&format!("  · {}\n", note.trim_end_matches('\n')));
+        }
         for reason in &commit.refused {
             output.push_str(&format!("  跳过：{}\n", reason.trim_end_matches('\n')));
         }
@@ -245,6 +275,7 @@ impl SymbolicReasoner {
                 questions: remaining_questions,
                 committed,
                 deferred: pending.deferred.clone(),
+                evidence: pending.evidence.clone(),
             };
             output.push_str(&next.render_zh());
             output.push('\n');
