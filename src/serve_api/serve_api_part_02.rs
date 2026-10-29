@@ -167,6 +167,21 @@ impl ApiState {
         applied
     }
 
+    /// 宿主注入交互导入学到的可逆措辞/问法（`import_frames.json`）。
+    /// 它们改变生成与首轮选路，必须让旧的无状态答案整体失效。
+    pub fn load_import_frames(
+        &self,
+        frames: crate::import_frames::ImportFrameLedger,
+    ) -> usize {
+        let count = frames.len();
+        if count == 0 {
+            return 0;
+        }
+        self.warm.reasoner.lock().attach_import_frames(frames);
+        self.bump_identity_epoch();
+        count
+    }
+
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
     pub fn cache_epoch(&self) -> CacheEpoch {
         CacheEpoch {

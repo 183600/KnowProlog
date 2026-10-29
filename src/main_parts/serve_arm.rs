@@ -124,6 +124,14 @@
                     println!("服务已载入律典显式决定：{} 条。", decided);
                 }
             }
+            if let ImportFrameLoad::Loaded(frames) =
+                ImportFrameLedger::load(&format!("{}/import_frames.json", store_path))
+            {
+                let restored = api_state.load_import_frames(frames);
+                if restored > 0 {
+                    println!("服务已恢复导入措辞/问法：{} 条。", restored);
+                }
+            }
             let quality_index = quality_index.with_revision(api_state.warm_revision());
             api_state.set_quality_index(Some(Arc::new(quality_index)));
             if let Some(dir) = session_dir {

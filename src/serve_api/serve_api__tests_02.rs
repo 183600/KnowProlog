@@ -344,6 +344,59 @@
         assert!(state.perf.count("identity_epoch_bumps") >= 2);
     }
 
+    /// 服务暖基座也要恢复交互导入落盘的措辞/问法，并让旧缓存失效。
+    #[test]
+    fn load_import_frames_reaches_warm_reasoner_and_bumps_epoch() {
+        use crate::import_frames::{
+            FactKind, FrameAtom, FrameObservation, ImportFrame, ImportFrameLedger,
+        };
+
+        let state = test_state(2);
+        let epoch = state.cache_epoch();
+        let mut ledger = ImportFrameLedger::new();
+        let frame = ImportFrame {
+            id: "ifr#年龄".to_string(),
+            kind: FactKind::Attribute,
+            predicate: "年龄".to_string(),
+            atoms: vec![
+                FrameAtom::Subject,
+                FrameAtom::Literal {
+                    surface: "今年".to_string(),
+                },
+                FrameAtom::Object,
+                FrameAtom::Literal {
+                    surface: "岁".to_string(),
+                },
+            ],
+            example_subject: "张三".to_string(),
+            example_object: "30".to_string(),
+            observations: vec![FrameObservation {
+                witness: "张三今年30岁".to_string(),
+                import_digest: "digest".to_string(),
+                turn: 1,
+            }],
+            ask_activated: true,
+        };
+        ledger.frames.insert(frame.id.clone(), frame);
+
+        assert_eq!(state.load_import_frames(ledger.clone()), 1);
+        assert_ne!(state.cache_epoch(), epoch);
+        assert_eq!(
+            state
+                .warm
+                .reasoner
+                .lock()
+                .import_frames()
+                .expect("暖基座应持有导入帧")
+                .len(),
+            1
+        );
+
+        let after = state.cache_epoch();
+        assert_eq!(state.load_import_frames(ImportFrameLedger::new()), 0);
+        assert_eq!(state.cache_epoch(), after, "空台账不应推进纪元");
+    }
+
     #[tokio::test]
     async fn openai_compat_streaming_and_errors() {
         let (addr, _server) = start_server(4);
