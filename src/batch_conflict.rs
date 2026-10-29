@@ -283,6 +283,24 @@ impl BatchPendingTurn {
             self.claims.len(),
             self.questions.len()
         )];
+        if !self.committed.is_empty() {
+            lines.push(format!(
+                "已提交 {} 条无冲突 claim；裁决只影响剩余冲突项。",
+                self.committed.len()
+            ));
+        }
+        if !self.deferred.is_empty() {
+            lines.push(format!(
+                "暂缓提交 {} 条无冲突 claim（原子模式，裁决后一起写入）。",
+                self.deferred.len()
+            ));
+        }
+        if !self.evidence.is_empty() {
+            lines.push(format!(
+                "暂缓记录 {} 条传闻证据（裁决后写入证据区）。",
+                self.evidence.len()
+            ));
+        }
         for (index, question) in self.questions.iter().enumerate() {
             lines.push(question.render_zh(index + 1));
         }
