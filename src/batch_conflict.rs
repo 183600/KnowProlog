@@ -1079,6 +1079,22 @@ fn build_question(
     }
 }
 
+fn first_value_option(question: &BatchQuestion) -> Option<usize> {
+    question
+        .options
+        .iter()
+        .position(|option| option.value.is_some())
+        .or_else(|| (!question.options.is_empty()).then_some(0))
+}
+
+fn last_value_option(question: &BatchQuestion) -> Option<usize> {
+    question
+        .options
+        .iter()
+        .rposition(|option| option.value.is_some())
+        .or_else(|| question.options.len().checked_sub(1))
+}
+
 fn option_label(index: usize) -> char {
     if index < 26 {
         (b'A' + index as u8) as char
@@ -1135,17 +1151,13 @@ pub fn parse_batch_answer(answer: &str, questions: &[BatchQuestion]) -> BatchAns
     }
     if ["都按后者", "全部按后者", "按后者", "都选后者"].iter().any(|cue| normalized.contains(cue)) {
         for (index, question) in questions.iter().enumerate() {
-            if let Some(last) = question.options.len().checked_sub(1) {
-                outcome.selections[index] = Some(last);
-            }
+            outcome.selections[index] = last_value_option(question);
         }
         return outcome;
     }
     if ["都按前者", "全部按前者", "按前者", "都选前者"].iter().any(|cue| normalized.contains(cue)) {
         for (index, question) in questions.iter().enumerate() {
-            if !question.options.is_empty() {
-                outcome.selections[index] = Some(0);
-            }
+            outcome.selections[index] = first_value_option(question);
         }
         return outcome;
     }
@@ -1543,8 +1555,12 @@ mod tests {
         assert!(answer.is_complete());
 
         let last = parse_batch_answer("都按后者", &plan.questions);
-        assert_eq!(last.selections[0], Some(plan.questions[0].options.len() - 1));
-        assert_eq!(last.selections[1], Some(plan.questions[1].options.len() - 1));
+        assert_eq!(last.selections[0], Some(1));
+        assert_eq!(last.selections[1], Some(1));
+        assert_eq!(
+            plan.questions[0].options[last.selections[0].unwrap()].value.as_deref(),
+            Some("31")
+        );
 
         let cancelled = parse_batch_answer("取消", &plan.questions);
         assert!(cancelled.cancelled);
