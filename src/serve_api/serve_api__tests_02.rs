@@ -397,6 +397,47 @@
         assert_eq!(state.cache_epoch(), after, "空台账不应推进纪元");
     }
 
+    /// 与 CLI 共用存储时，服务也必须载入已学习的重写规则，否则
+    /// 「张三到底师傅是谁」这类说法只在交互/ask 入口可用。
+    #[test]
+    fn load_rewrite_book_reaches_warm_reasoner_and_bumps_epoch() {
+        use crate::rewrite_book::{RewriteBook, RewriteRule, RewriteStatus};
+
+        let state = test_state(2);
+        let epoch = state.cache_epoch();
+        let mut book = RewriteBook::new();
+        book.rules.push(RewriteRule {
+            id: "learned-shell".to_string(),
+            plan_kind: "FindObjectByPredicate".to_string(),
+            surface: "{S}到底{P}是谁".to_string(),
+            canonical: "{S}的{P}是谁".to_string(),
+            status: RewriteStatus::Active,
+            support: 3,
+            predicates: vec!["师傅".to_string()],
+            entities: Vec::new(),
+            examples: Vec::new(),
+            refutations: 0,
+            source: "test".to_string(),
+        });
+
+        assert_eq!(state.load_rewrite_book(book), 1);
+        assert_ne!(state.cache_epoch(), epoch);
+        assert_eq!(
+            state
+                .warm
+                .reasoner
+                .lock()
+                .rewrite_book()
+                .expect("暖基座应持有重写手册")
+                .len(),
+            1
+        );
+
+        let after = state.cache_epoch();
+        assert_eq!(state.load_rewrite_book(RewriteBook::new()), 0);
+        assert_eq!(state.cache_epoch(), after, "空手册不应推进纪元");
+    }
+
     #[tokio::test]
     async fn openai_compat_streaming_and_errors() {
         let (addr, _server) = start_server(4);

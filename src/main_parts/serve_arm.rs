@@ -132,6 +132,12 @@
                     println!("服务已恢复导入措辞/问法：{} 条。", restored);
                 }
             }
+            if let Some(book) = load_rewrite_book(&store_path) {
+                let restored = api_state.load_rewrite_book(book);
+                if restored > 0 {
+                    println!("服务已恢复重写手册：{} 条规则。", restored);
+                }
+            }
             let quality_index = quality_index.with_revision(api_state.warm_revision());
             api_state.set_quality_index(Some(Arc::new(quality_index)));
             if let Some(dir) = session_dir {

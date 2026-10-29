@@ -182,6 +182,18 @@ impl ApiState {
         count
     }
 
+    /// 宿主注入跨重启学习到的重写手册（`rewrite_book.json`），
+    /// 与服务共用同一存储的 CLI 已能用的读法不应在 HTTP 入口消失。
+    pub fn load_rewrite_book(&self, book: crate::rewrite_book::RewriteBook) -> usize {
+        let count = book.len();
+        if count == 0 {
+            return 0;
+        }
+        self.warm.reasoner.lock().set_rewrite_book(book);
+        self.bump_identity_epoch();
+        count
+    }
+
     /// 当前缓存纪元（kb 版本 + 身份准入纪元）。
     pub fn cache_epoch(&self) -> CacheEpoch {
         CacheEpoch {
