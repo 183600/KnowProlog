@@ -180,8 +180,11 @@
             let plugin_receipt = api_state.configure_plugin_runtime(&plugin_runtime);
             if !plugin_receipt.is_empty() {
                 println!(
-                    "插件本体已并入服务统一推理器：{} 条公理、{} 条别名、{} 条逆向词面。",
-                    plugin_receipt.lessons, plugin_receipt.aliases, plugin_receipt.inverse_surfaces
+                    "插件本体已并入服务统一推理器：{} 条公理、{} 条别名、{} 条逆向词面、{} 条规则。",
+                    plugin_receipt.lessons,
+                    plugin_receipt.aliases,
+                    plugin_receipt.inverse_surfaces,
+                    plugin_receipt.rules
                 );
             }
             let plugin_runtime = (plugin_runtime.installed_count() > 0)

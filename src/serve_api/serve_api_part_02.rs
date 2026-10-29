@@ -93,6 +93,7 @@ impl ApiState {
             lessons: sync.lessons,
             aliases: sync.aliases,
             inverse_surfaces: sync.inverse_surfaces,
+            rules: sync.rules,
         }
     }
 

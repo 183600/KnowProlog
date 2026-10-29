@@ -77,6 +77,31 @@ impl PluginRuntime {
         issues
     }
 
+    pub fn rule_packs(&self) -> Vec<RulePack> {
+        self.manifests
+            .iter()
+            .filter(|manifest| self.mode(&manifest.id) == Some(PluginMode::On))
+            .flat_map(|manifest| {
+                manifest
+                    .contributions
+                    .iter()
+                    .filter_map(|contribution| contribution.rule_pack(&manifest.id))
+            })
+            .collect()
+    }
+
+    pub fn rule_program(&self) -> crate::rule_pack::RuleProgram {
+        crate::rule_pack::compile_packs(&self.rule_packs())
+    }
+
+    pub fn rule_report(&self) -> crate::rule_pack::CompositionReport {
+        self.rule_program().report
+    }
+
+    pub fn rule_clauses(&self) -> Vec<crate::rule_pack::CompiledRule> {
+        self.rule_program().clauses()
+    }
+
     pub fn last_trace(&self) -> Option<&PluginTrace> {
         self.last_trace.as_ref()
     }
@@ -1176,6 +1201,14 @@ impl PluginRuntime {
                     success: failures == 0,
                 }
             }
+            ParsedPluginCommand::Rules => {
+                let report = self.rule_report();
+                PluginCommandOutcome {
+                    text: report.render_zh(),
+                    state_changed: false,
+                    success: !report.has_errors(),
+                }
+            }
             ParsedPluginCommand::Why => PluginCommandOutcome {
                 text: self.render_trace(),
                 state_changed: false,
@@ -1319,6 +1352,37 @@ impl PluginRuntime {
             }
             if !manifest.conflicts.is_empty() {
                 lines.push(format!("    冲突：{}", manifest.conflicts.join("、")));
+            }
+        }
+        let has_rule_contributions = self.manifests.iter().any(|manifest| {
+            manifest
+                .contributions
+                .iter()
+                .any(|contribution| matches!(contribution, Contribution::Rules { .. }))
+        });
+        if has_rule_contributions {
+            let report = self.rule_report();
+            lines.push(format!(
+                "规则包：启用 {} 个、规则 {} 条；组合冲突 {} 条（结构错误 {}、警告 {}）。",
+                report.packs,
+                report.rules,
+                report.conflicts.len(),
+                report.error_count(),
+                report.warning_count()
+            ));
+            for issue in report.issues.iter().take(3) {
+                lines.push(format!("  {}", issue.render()));
+            }
+            for conflict in report.conflicts.iter().take(3) {
+                if let Some(first) = conflict.render_zh().lines().next() {
+                    lines.push(format!("  {}", first));
+                }
+            }
+            if report.conflicts.len() > 3 {
+                lines.push(format!(
+                    "  …共 {} 条冲突，用「规则包」查看。",
+                    report.conflicts.len()
+                ));
             }
         }
         if !self.last_used.is_empty() {

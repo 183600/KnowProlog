@@ -90,6 +90,51 @@ types = [
         );
     }
 
+    #[test]
+    fn plugin_rule_pack_joins_resolver_and_is_idempotent() {
+        use crate::plugin::{PluginManifest, PluginRegistry, PluginRuntime, PluginSettings};
+        use crate::resolution_engine::{Atom, Term};
+
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+id = "test.rules"
+version = "0.1.0"
+api = 1
+default_mode = "on"
+
+[[contributions]]
+kind = "rules"
+id = "test.age"
+functional = [{ predicate = "年龄", key = 0, value = 1 }]
+rules = [
+  { id = "age-1986", head = "年龄(X, 38)", body = ["出生年(X, 1986)"] },
+]
+"#,
+        )
+        .expect("规则包清单应可解析");
+        let registry = PluginRegistry::from_manifests(vec![manifest]);
+        assert!(!registry.has_errors(), "{}", registry.render_issues());
+        let runtime = PluginRuntime::with_settings(registry, &PluginSettings::default());
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&[PrologFact::Relation {
+            from: "张三".into(),
+            rel_type: "出生年".into(),
+            to: "1986".into(),
+        }]);
+
+        let first = reasoner.apply_plugin_runtime(&runtime);
+        assert_eq!(first.rules, 1);
+        let goal = Atom::pattern("年龄", Term::constant("张三"), Term::var("Age"));
+        let solutions = reasoner.resolver().solve(&[goal], &["Age".to_string()]);
+        assert_eq!(solutions.len(), 1);
+        assert_eq!(solutions[0].bindings.get("Age").map(String::as_str), Some("38"));
+        assert_eq!(
+            reasoner.apply_plugin_runtime(&runtime),
+            PluginOntologySync::default(),
+            "同一规则包重复应用必须无新增"
+        );
+    }
+
     /// 配置本体并入单一本体：注入幂等、与教学公理同簿记、
     /// 随快照/重建/分叉一并保留（配置不再是第二套本体）。
     #[test]

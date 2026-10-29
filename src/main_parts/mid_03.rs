@@ -1172,6 +1172,7 @@ fn run_plugins(settings: &PluginSettings, directory: Option<&str>, json: bool, e
             "plugins": runtime.manifests(),
             "modes": runtime.modes(),
             "issues": runtime.issues(),
+            "rule_packs": runtime.rule_report(),
             "evals": results,
         });
         match serde_json::to_string_pretty(&value) {

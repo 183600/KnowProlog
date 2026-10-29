@@ -987,6 +987,7 @@ pub struct PluginOntologySync {
     pub aliases: usize,
     pub inverse_surfaces: usize,
     pub lessons: usize,
+    pub rules: usize,
 }
 
 /// 语言策略热更新的回执。配置里的推理结构阈值不在本方法范围内：
@@ -1354,6 +1355,8 @@ pub struct SymbolicReasoner {
     session_negative_facts: Vec<Atom>,
     // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
     session_clauses: Vec<Clause>,
+    // 宿主插件规则包贡献（启动/启用时单调并入；停用不撤回，重启后按启用集重建）
+    plugin_clauses: Vec<Clause>,
     // 会话写入的修订回执（预检通过后才记录；支持按最新回执撤销）
     session_receipts: Vec<SessionRevisionReceipt>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）

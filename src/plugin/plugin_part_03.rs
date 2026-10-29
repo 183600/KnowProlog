@@ -21,6 +21,12 @@ fn parse_plugin_command(input: &str) -> Option<ParsedPluginCommand> {
     }
     if matches!(
         lower.as_str(),
+        "规则包" | "规则包诊断" | "规则冲突" | "rule packs" | "rulepack" | "rule conflicts"
+    ) {
+        return Some(ParsedPluginCommand::Rules);
+    }
+    if matches!(
+        lower.as_str(),
         "为什么这么答" | "插件依据" | "插件轨迹" | "插件trace" | "plugin trace"
     ) {
         return Some(ParsedPluginCommand::Why);
@@ -838,4 +844,60 @@ template = "「{entity}」导演过：{answer}。依据：{evidence}"
         assert_eq!(results.len(), 1);
         assert!(results[0].passed, "{}", results[0].detail);
     }
+    #[test]
+    fn rules_contribution_compiles_and_reports_composition_conflicts() {
+        let mut left = manifest("zh.rules.left", PluginMode::On);
+        left.contributions.push(Contribution::Rules {
+            id: "left.age".to_string(),
+            description: "左年龄规则".to_string(),
+            layer: 1,
+            activation: Vec::new(),
+            requires: Vec::new(),
+            conflicts: Vec::new(),
+            functional: vec![FunctionalKey::new("年龄", 0, 1)],
+            exclusive: Vec::new(),
+            rules: vec![RuleSpec::new(
+                "age-left",
+                "年龄(X, 38)",
+                &["出生年(X, 1986)"],
+            )],
+        });
+        let mut right = manifest("zh.rules.right", PluginMode::On);
+        right.contributions.push(Contribution::Rules {
+            id: "right.age".to_string(),
+            description: "右年龄规则".to_string(),
+            layer: 1,
+            activation: Vec::new(),
+            requires: Vec::new(),
+            conflicts: Vec::new(),
+            functional: vec![FunctionalKey::new("年龄", 0, 1)],
+            exclusive: Vec::new(),
+            rules: vec![RuleSpec::new(
+                "age-right",
+                "年龄(X, 39)",
+                &["出生年(X, 1990)"],
+            )],
+        });
+        let registry = PluginRegistry::from_manifests(vec![left, right]);
+        assert!(!registry.has_errors(), "{}", registry.render_issues());
+        let mut runtime = PluginRuntime::with_settings(
+            registry,
+            &PluginSettings {
+                enabled: vec!["zh.rules.left".to_string(), "zh.rules.right".to_string()],
+                ..PluginSettings::default()
+            },
+        );
+        let report = runtime.rule_report();
+        assert_eq!(report.packs, 2);
+        assert_eq!(report.rules, 2);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(runtime.rule_clauses().len(), 2);
+        assert!(runtime.render_report().contains("规则包"));
+        let outcome = runtime.handle_command("规则包").unwrap();
+        assert!(outcome.success);
+        assert!(outcome.text.contains("功能谓词分歧"));
+        assert!(outcome.text.contains("38"));
+        assert!(outcome.text.contains("39"));
+    }
+
 }

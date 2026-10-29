@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::ontology_reasoning::{OntologyLesson, OntologyProgram};
+use crate::rule_pack::{ExclusiveGroup, FunctionalKey, RulePack, RuleSpec};
 /// 当前宿主认识的插件清单 API 版本。
 pub const PLUGIN_API_VERSION: u32 = 1;
 /// 默认插件目录（相对工作目录）。
@@ -215,6 +216,26 @@ pub enum Contribution {
         #[serde(default)]
         suffix: String,
     },
+    /// 规则包：带层次、依赖、激活话题、功能键与互斥谓词的 Horn 规则。
+    Rules {
+        id: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        layer: i32,
+        #[serde(default)]
+        activation: Vec<String>,
+        #[serde(default)]
+        requires: Vec<String>,
+        #[serde(default)]
+        conflicts: Vec<String>,
+        #[serde(default)]
+        functional: Vec<FunctionalKey>,
+        #[serde(default)]
+        exclusive: Vec<ExclusiveGroup>,
+        #[serde(default)]
+        rules: Vec<RuleSpec>,
+    },
 }
 impl Contribution {
     pub fn id(&self) -> &str {
@@ -226,7 +247,8 @@ impl Contribution {
             | Contribution::Recipe { id, .. }
             | Contribution::Policy { id, .. }
             | Contribution::Template { id, .. }
-            | Contribution::Style { id, .. } => id,
+            | Contribution::Style { id, .. }
+            | Contribution::Rules { id, .. } => id,
         }
     }
 
@@ -240,6 +262,7 @@ impl Contribution {
             Contribution::Policy { .. } => "policy",
             Contribution::Template { .. } => "template",
             Contribution::Style { .. } => "style",
+            Contribution::Rules { .. } => "rules",
         }
     }
 
@@ -252,8 +275,48 @@ impl Contribution {
             | Contribution::Recipe { description, .. }
             | Contribution::Policy { description, .. }
             | Contribution::Template { description, .. }
-            | Contribution::Style { description, .. } => description,
+            | Contribution::Style { description, .. }
+            | Contribution::Rules { description, .. } => description,
         }
+    }
+
+    pub fn rule_pack(&self, plugin: &str) -> Option<RulePack> {
+        let Contribution::Rules {
+            id,
+            description,
+            layer,
+            activation,
+            requires,
+            conflicts,
+            functional,
+            exclusive,
+            rules,
+        } = self
+        else {
+            return None;
+        };
+        let qualify = |reference: &str| {
+            if reference.contains('#') {
+                reference.to_string()
+            } else {
+                format!("{}#{}", plugin, reference)
+            }
+        };
+        Some(RulePack {
+            id: format!("{}#{}", plugin, id),
+            name: if description.trim().is_empty() {
+                format!("{} / {}", plugin, id)
+            } else {
+                description.clone()
+            },
+            layer: *layer,
+            activation: activation.clone(),
+            requires: requires.iter().map(|entry| qualify(entry)).collect(),
+            conflicts: conflicts.iter().map(|entry| qualify(entry)).collect(),
+            functional: functional.clone(),
+            exclusive: exclusive.clone(),
+            rules: rules.clone(),
+        })
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1077,6 +1140,22 @@ fn validate_contribution(
                 ));
             }
         }
+        Contribution::Rules { .. } => {
+            if let Some(pack) = contribution.rule_pack(&manifest.id) {
+                for issue in crate::rule_pack::validate_pack(&pack) {
+                    issues.push(PluginIssue {
+                        severity: match issue.severity {
+                            crate::rule_pack::IssueSeverity::Error => PluginSeverity::Error,
+                            crate::rule_pack::IssueSeverity::Warning => PluginSeverity::Warning,
+                        },
+                        plugin: Some(manifest.id.clone()),
+                        file: None,
+                        field: issue.field,
+                        message: issue.message,
+                    });
+                }
+            }
+        }
     }
     issues
 }
@@ -1409,6 +1488,7 @@ enum ParsedPluginCommand {
     Report,
     Diagnose,
     Evaluate,
+    Rules,
     Why,
     Enable(String),
     Disable(String),

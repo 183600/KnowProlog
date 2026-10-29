@@ -517,6 +517,9 @@ async fn run_interactive_mode(
             plugin_sync.inverse_surfaces
         );
     }
+    if plugin_sync.rules > 0 {
+        println!("插件规则包已合并：{} 条规则。", plugin_sync.rules);
+    }
     // 指称线索在启动时补入分词/词性词典，与本体别名一样只在启动时合并。
     let mut plugin_nlp = plugin_runtime.augmented_nlp_config(&config.nlp);
     let plugin_reference_entries = plugin_nlp
@@ -725,10 +728,14 @@ async fn run_interactive_mode(
             println!("{}", outcome.text);
             if outcome.state_changed {
                 let sync = symbolic_reasoner.apply_plugin_runtime(&plugin_runtime);
-                if sync.aliases > 0 || sync.lessons > 0 || sync.inverse_surfaces > 0 {
+                if sync.aliases > 0
+                    || sync.lessons > 0
+                    || sync.inverse_surfaces > 0
+                    || sync.rules > 0
+                {
                     println!(
-                        "插件本体已增量合并：{} 条别名、{} 条公理、{} 条逆向词面。",
-                        sync.aliases, sync.lessons, sync.inverse_surfaces
+                        "插件本体已增量合并：{} 条别名、{} 条公理、{} 条逆向词面、{} 条规则。",
+                        sync.aliases, sync.lessons, sync.inverse_surfaces, sync.rules
                     );
                 } else if plugin_runtime.enabled_count() < enabled_before {
                     println!(

@@ -185,6 +185,7 @@ impl SymbolicReasoner {
             assumption_world: None,
             session_negative_facts: Vec::new(),
             session_clauses: Vec::new(),
+            plugin_clauses: Vec::new(),
             session_receipts: Vec::new(),
             clarification: None,
             last_abduction_goal: None,
@@ -1469,6 +1470,18 @@ impl SymbolicReasoner {
                 sync.inverse_surfaces += 1;
             }
         }
+        let mut known: BTreeSet<String> =
+            self.plugin_clauses.iter().map(clause_identity).collect();
+        for compiled in runtime.rule_clauses() {
+            let identity = clause_identity(&compiled.clause);
+            if known.insert(identity) {
+                self.plugin_clauses.push(compiled.clause);
+                sync.rules += 1;
+            }
+        }
+        if sync.rules > 0 {
+            self.rebuild_resolver();
+        }
         sync.lessons = self.configure_ontology_program(&runtime.ontology_program());
         sync
     }
@@ -1573,4 +1586,18 @@ impl SymbolicReasoner {
         }
         state.plan(changeset).render_zh()
     }
+}
+
+fn clause_identity(clause: &Clause) -> String {
+    format!(
+        "{}|{}|{}",
+        clause.source,
+        clause.head.display(),
+        clause
+            .body
+            .iter()
+            .map(Atom::display)
+            .collect::<Vec<_>>()
+            .join("&")
+    )
 }

@@ -523,6 +523,9 @@ impl SymbolicReasoner {
         for clause in &self.session_clauses {
             engine.add_clause(clause.clone());
         }
+        for clause in &self.plugin_clauses {
+            engine.add_clause(clause.clone());
+        }
         // 只有用户显式晋升到全局的补全规则才进入全局归结；本批/本例/
         // 命名空间规则留在回合内，避免没有事实级命名空间标签的引擎跨域 join。
         for clause in self.completion.reasoning_clauses() {
