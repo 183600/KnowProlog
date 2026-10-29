@@ -116,6 +116,30 @@ fn atomic_batch_writes_nothing_until_conflict_is_resolved() {
 }
 
 #[test]
+fn leading_hearsay_cue_only_scopes_to_its_own_claim() {
+    let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+    let message =
+        reasoner.assert_nl_fact("据说王五的年龄是40；张三的年龄是30；张三的年龄是31");
+    assert!(message.contains("批次记住"), "{}", message);
+    assert!(message.contains("已把传闻记为证据"), "{}", message);
+    assert_eq!(
+        reasoner.pending_batch_turn().map(|turn| turn.questions.len()),
+        Some(1),
+        "{}",
+        message
+    );
+    assert!(reasoner.session_facts().is_empty(), "{}", message);
+
+    let resolved = reasoner.resolve_batch_answer("1A");
+    assert!(resolved.contains("本批冲突已全部裁决"), "{}", resolved);
+    assert!(reasoner.session_facts().iter().any(|atom| {
+        atom.predicate.as_ref() == "年龄"
+            && atom.terms[0].name() == "张三"
+            && atom.terms[1].name() == "30"
+    }), "{}", resolved);
+}
+
+#[test]
 fn correction_cue_inside_one_input_resolves_batch_without_question() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     let message = reasoner.assert_nl_fact("张三30岁，其实31岁；李四32岁");
@@ -137,7 +161,7 @@ fn correction_cue_inside_one_input_resolves_batch_without_question() {
 #[test]
 fn pending_batch_survives_snapshot_roundtrip() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
-    reasoner.assert_nl_fact("张三的年龄是30；张三的年龄是31");
+    reasoner.assert_nl_fact("原子记住：据说王五的年龄是40；张三的年龄是30；张三的年龄是31");
     assert!(reasoner.pending_batch_turn().is_some());
     let snapshot = reasoner.dialogue_snapshot();
 
@@ -145,9 +169,12 @@ fn pending_batch_survives_snapshot_roundtrip() {
     restored
         .restore_dialogue_snapshot(&snapshot)
         .expect("批次挂起应随快照恢复");
-    assert!(restored.pending_batch_turn().is_some());
+    let pending = restored.pending_batch_turn().expect("pending turn");
+    assert_eq!(pending.questions.len(), 1);
+    assert_eq!(pending.evidence.len(), 1, "{:?}", pending);
     let resolved = restored.resolve_batch_answer("1B");
     assert!(resolved.contains("本批冲突已全部裁决"), "{}", resolved);
+    assert!(resolved.contains("已把传闻记为证据"), "{}", resolved);
     assert!(restored.session_facts().iter().any(|atom| {
         atom.predicate.as_ref() == "年龄" && atom.terms[1].name() == "31"
     }));

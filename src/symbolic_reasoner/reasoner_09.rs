@@ -1232,15 +1232,17 @@ impl SymbolicReasoner {
         if let Some(atom) = Self::parse_negative_atom(sentence) {
             return self.assert_negative_atom(atom);
         }
+        // 多 claim 时优先按批次逐句判定强度：句首「据说/更正」只作用于
+        // 它所在的那一句，不能把整段话都降为传闻或更正。
+        if let Some(result) = self.try_assert_nl_batch(sentence, None) {
+            return result;
+        }
         let (strength, content) = AssertionStrength::classify(sentence);
         if strength == AssertionStrength::Hearsay {
             return self.note_hearsay_nl_fact(content);
         }
         if strength == AssertionStrength::Correction && content != sentence {
             return self.correct_nl_fact(content);
-        }
-        if let Some(result) = self.try_assert_nl_batch(content, None) {
-            return result;
         }
         let outcome = chinese_reasoning_nlu::parse_lessons(content);
         // 写入前守门：先按当前会话世界试算，冲突时只问一个最小问题。
