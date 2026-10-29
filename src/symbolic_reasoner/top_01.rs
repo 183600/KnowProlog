@@ -1356,7 +1356,7 @@ pub struct SymbolicReasoner {
     session_negative_facts: Vec<Atom>,
     // 会话级 Horn 规则（用户用中文教的一般规则/条件句；供后向链归结使用）
     session_clauses: Vec<Clause>,
-    // 宿主插件规则包贡献（启动/启用时单调并入；停用不撤回，重启后按启用集重建）
+    // 宿主插件规则包贡献（按当前启用集重算；停用或裁决会撤回落选规则）
     plugin_clauses: Vec<Clause>,
     // 会话写入的修订回执（预检通过后才记录；支持按最新回执撤销）
     session_receipts: Vec<SessionRevisionReceipt>,
