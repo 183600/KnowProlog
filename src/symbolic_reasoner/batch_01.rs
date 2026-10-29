@@ -203,6 +203,7 @@ impl SymbolicReasoner {
             }
         }
         let all_resolved = remaining_questions.is_empty();
+        let conflict_selected: BTreeSet<usize> = selected.iter().copied().collect();
         if all_resolved {
             selected.extend(pending.deferred.iter().copied());
         }
@@ -216,9 +217,13 @@ impl SymbolicReasoner {
         if pending.mode == BatchMode::Atomic && !all_resolved {
             to_commit.clear();
         }
-        // 用户对冲突表的显式选择等同于「更正」：允许压制图谱基值/旧赢家。
+        // 只有用户在冲突表上显式选择的 claim 升级为「更正」；
+        // 原子模式暂缓的无冲突 claim 保持原强度，避免误压制非功能槽的旧值。
         let mut resolved_claims = pending.claims.clone();
         for &index in &to_commit {
+            if !conflict_selected.contains(&index) {
+                continue;
+            }
             if let Some(claim) = resolved_claims.get_mut(index) {
                 claim.strength = AssertionStrength::Correction;
             }

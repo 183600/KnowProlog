@@ -57,6 +57,32 @@ fn batch_answer_can_replace_graph_base_value() {
 }
 
 #[test]
+fn atomic_resolution_keeps_nonfunctional_deferred_claims_direct() {
+    let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+    reasoner.assert_nl_fact("记住：李四的师傅是赵六");
+    let message = reasoner.assert_nl_fact(
+        "原子记住：张三的年龄是30；张三的年龄是31；李四的师傅是王五",
+    );
+    assert!(message.contains("原子模式"), "{}", message);
+    assert_eq!(reasoner.session_facts().len(), 1, "{}", message);
+
+    let resolved = reasoner.resolve_batch_answer("1A");
+    assert!(resolved.contains("本批冲突已全部裁决"), "{}", resolved);
+    assert!(reasoner.session_facts().iter().any(|atom| {
+        atom.predicate.as_ref() == "师傅"
+            && atom.terms.len() == 2
+            && atom.terms[0].name() == "李四"
+            && atom.terms[1].name() == "赵六"
+    }), "{}", resolved);
+    assert!(reasoner.session_facts().iter().any(|atom| {
+        atom.predicate.as_ref() == "师傅"
+            && atom.terms.len() == 2
+            && atom.terms[0].name() == "李四"
+            && atom.terms[1].name() == "王五"
+    }), "{}", resolved);
+}
+
+#[test]
 fn forced_batch_reports_parse_errors_instead_of_falling_through() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     let message =
