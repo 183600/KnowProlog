@@ -30,6 +30,7 @@ impl PluginRuntime {
             activation_issues: Vec::new(),
             last_trace: None,
             last_used: Vec::new(),
+            rule_adjudications: BTreeMap::new(),
         };
         runtime.resolve_initial(desired);
         runtime
@@ -91,7 +92,12 @@ impl PluginRuntime {
     }
 
     pub fn rule_program(&self) -> crate::rule_pack::RuleProgram {
-        crate::rule_pack::compile_packs(&self.rule_packs())
+        let mut program = crate::rule_pack::compile_packs(&self.rule_packs());
+        for (conflict, pack) in &self.rule_adjudications {
+            program.report.adjudicate(conflict, pack);
+        }
+        program.apply_adjudications();
+        program
     }
 
     pub fn rule_report(&self) -> crate::rule_pack::CompositionReport {
@@ -102,6 +108,45 @@ impl PluginRuntime {
         self.rule_program().clauses()
     }
 
+    /// 记录一次规则冲突裁决；返回更新后的冲突说明。
+    pub fn adjudicate_rule_conflict(
+        &mut self,
+        conflict: &str,
+        pack: &str,
+    ) -> Result<String, String> {
+        let report = crate::rule_pack::compile_packs(&self.rule_packs()).report;
+        let conflict = conflict.trim();
+        let found = if let Ok(index) = conflict.parse::<usize>() {
+            report.conflicts.get(index.saturating_sub(1))
+        } else {
+            report.conflicts.iter().find(|entry| entry.id == conflict)
+        }
+        .ok_or_else(|| format!("没有找到规则冲突「{}」。", conflict))?;
+        let preferred = [&found.left_pack, &found.right_pack]
+            .into_iter()
+            .find(|candidate| pack_matches(candidate, pack))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "规则包「{}」不在冲突 {} 的两侧（{} / {}）。",
+                    pack, found.id, found.left_pack, found.right_pack
+                )
+            })?;
+        self.rule_adjudications
+            .insert(found.id.clone(), preferred.clone());
+        let updated = self
+            .rule_report()
+            .conflicts
+            .into_iter()
+            .find(|entry| entry.id == found.id)
+            .ok_or_else(|| "裁决后冲突意外消失。".to_string())?;
+        Ok(format!(
+            "已记录裁决：优先采用「{}」。\n{}",
+            preferred,
+            updated.render_zh()
+        ))
+    }
+
     pub fn last_trace(&self) -> Option<&PluginTrace> {
         self.last_trace.as_ref()
     }
@@ -110,6 +155,7 @@ impl PluginRuntime {
         PluginSessionState {
             modes: self.overrides.clone(),
             last_used: self.last_used.clone(),
+            rule_adjudications: self.rule_adjudications.clone(),
         }
     }
 
@@ -131,6 +177,7 @@ impl PluginRuntime {
             .into_iter()
             .filter(|id| self.modes.contains_key(id))
             .collect();
+        self.rule_adjudications = state.rule_adjudications;
         applied
     }
 
@@ -1209,6 +1256,20 @@ impl PluginRuntime {
                     success: !report.has_errors(),
                 }
             }
+            ParsedPluginCommand::AdjudicateRule { conflict, pack } => {
+                match self.adjudicate_rule_conflict(&conflict, &pack) {
+                    Ok(text) => PluginCommandOutcome {
+                        text,
+                        state_changed: true,
+                        success: true,
+                    },
+                    Err(message) => PluginCommandOutcome {
+                        text: message,
+                        state_changed: false,
+                        success: false,
+                    },
+                }
+            }
             ParsedPluginCommand::Why => PluginCommandOutcome {
                 text: self.render_trace(),
                 state_changed: false,
@@ -1548,4 +1609,14 @@ struct FrameCandidate {
     detail: String,
     recipe_invocation: Option<RecipeInvocation>,
     recipe: bool,
+}
+
+fn pack_matches(full: &str, requested: &str) -> bool {
+    let requested = requested.trim();
+    if full == requested {
+        return true;
+    }
+    full.rsplit_once('#')
+        .map(|(plugin, contribution)| plugin == requested || contribution == requested)
+        .unwrap_or(false)
 }

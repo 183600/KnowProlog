@@ -435,6 +435,16 @@ impl CompositionReport {
             for conflict in &self.conflicts {
                 lines.push(conflict.render_zh());
             }
+            if self
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.preferred_pack.is_none())
+            {
+                lines.push(
+                    "可用「规则裁决 <编号或冲突id>=<规则包>」记录选择，下一轮重建生效。"
+                        .to_string(),
+                );
+            }
         }
         lines.join("\n")
     }
@@ -456,6 +466,38 @@ impl RuleProgram {
             .iter()
             .flat_map(|pack| pack.rules.iter().cloned())
             .collect()
+    }
+
+    /// 按已记录的裁决抑制落选规则，使选择在下一轮重建时真正生效。
+    pub fn apply_adjudications(&mut self) {
+        let mut suppressed: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut kept: BTreeSet<(String, String)> = BTreeSet::new();
+        for conflict in &self.report.conflicts {
+            let Some(preferred) = &conflict.preferred_pack else {
+                continue;
+            };
+            let left = (conflict.left_pack.clone(), conflict.left_rule.clone());
+            let right = (conflict.right_pack.clone(), conflict.right_rule.clone());
+            if preferred == &conflict.left_pack {
+                kept.insert(left);
+                suppressed.insert(right);
+            } else if preferred == &conflict.right_pack {
+                kept.insert(right);
+                suppressed.insert(left);
+            }
+        }
+        for rule in &kept {
+            suppressed.remove(rule);
+        }
+        if suppressed.is_empty() {
+            return;
+        }
+        for pack in &mut self.packs {
+            pack.rules.retain(|rule| {
+                !suppressed.contains(&(rule.pack.clone(), rule.rule_id.clone()))
+            });
+        }
+        self.report.rules = self.packs.iter().map(|pack| pack.rules.len()).sum();
     }
 }
 
@@ -503,6 +545,7 @@ pub fn compile_packs(packs: &[RulePack]) -> RuleProgram {
         });
     }
 
+    report.packs = compiled.len();
     report
         .issues
         .extend(cross_pack_issues(&compiled, packs));
@@ -884,6 +927,44 @@ fn cross_pack_issues(compiled: &[CompiledPack], raw: &[RulePack]) -> Vec<PackIss
         );
     }
 
+    let mut functional_contracts: BTreeMap<&str, BTreeMap<(usize, usize), Vec<&str>>> =
+        BTreeMap::new();
+    for pack in compiled {
+        for key in &pack.spec.functional {
+            functional_contracts
+                .entry(key.predicate.as_str())
+                .or_default()
+                .entry((key.key, key.value))
+                .or_default()
+                .push(pack.spec.id.as_str());
+        }
+    }
+    for (predicate, positions) in functional_contracts {
+        if positions.len() < 2 {
+            continue;
+        }
+        let described = positions
+            .iter()
+            .map(|((key, value), packs)| {
+                format!("({}, {}) 由「{}」声明", key, value, packs.join("、"))
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        let first_pack = positions.values().next().and_then(|packs| packs.first());
+        if let Some(first_pack) = first_pack {
+            issues.push(PackIssue::new(
+                IssueSeverity::Error,
+                first_pack,
+                None,
+                "functional",
+                format!(
+                    "功能谓词「{}」在不同规则包中的位置声明不一致：{}。",
+                    predicate, described
+                ),
+            ));
+        }
+    }
+
     let mut signatures: BTreeMap<String, (&str, &str)> = BTreeMap::new();
     for pack in compiled {
         for rule in &pack.rules {
@@ -966,10 +1047,14 @@ fn detect_rule_conflicts(
             .then_with(|| left.clause.head.display().cmp(&right.clause.head.display()))
     });
 
-    let functional: BTreeMap<&str, &FunctionalKey> = compiled
+    let functional: BTreeMap<(&str, &str), &FunctionalKey> = compiled
         .iter()
-        .flat_map(|pack| pack.spec.functional.iter())
-        .map(|key| (key.predicate.as_str(), key))
+        .flat_map(|pack| {
+            pack.spec
+                .functional
+                .iter()
+                .map(move |key| ((pack.spec.id.as_str(), key.predicate.as_str()), key))
+        })
         .collect();
     let exclusive: Vec<&ExclusiveGroup> = compiled
         .iter()
@@ -984,7 +1069,18 @@ fn detect_rule_conflicts(
                 continue;
             }
             if left.clause.head.predicate == right.clause.head.predicate {
-                if let Some(key) = functional.get(left.clause.head.predicate.as_ref()) {
+                let key = functional
+                    .get(&(
+                        left.pack.as_str(),
+                        left.clause.head.predicate.as_ref(),
+                    ))
+                    .or_else(|| {
+                        functional.get(&(
+                            right.pack.as_str(),
+                            right.clause.head.predicate.as_ref(),
+                        ))
+                    });
+                if let Some(key) = key {
                     pairs += 1;
                     if pairs > MAX_CONFLICT_RULE_PAIRS {
                         *truncated = true;
@@ -1362,6 +1458,50 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.message.contains("功能谓词")));
+    }
+
+    #[test]
+    fn cross_pack_contract_position_mismatch_is_an_error() {
+        let left = pack("left")
+            .with_functional(FunctionalKey::new("年龄", 0, 1))
+            .with_rule(RuleSpec::new(
+                "a",
+                "年龄(X, 38, 备注)",
+                &["出生年(X, 1986)"],
+            ));
+        let right = pack("right")
+            .with_functional(FunctionalKey::new("年龄", 0, 2))
+            .with_rule(RuleSpec::new(
+                "b",
+                "年龄(X, 备注, 39)",
+                &["出生年(X, 1990)"],
+            ));
+        let program = compile_packs(&[left, right]);
+        assert_eq!(program.report.packs, 2);
+        assert!(program
+            .report
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("位置声明不一致")));
+        assert!(program.report.has_errors());
+    }
+
+    #[test]
+    fn adjudication_suppresses_the_losing_rule() {
+        let left = pack("left")
+            .with_functional(FunctionalKey::new("年龄", 0, 1))
+            .with_rule(RuleSpec::new("a", "年龄(X, 38)", &["出生年(X, 1986)"]));
+        let right = pack("right")
+            .with_functional(FunctionalKey::new("年龄", 0, 1))
+            .with_rule(RuleSpec::new("b", "年龄(X, 39)", &["出生年(X, 1990)"]));
+        let mut program = compile_packs(&[left, right]);
+        let id = program.report.conflicts[0].id.clone();
+        assert!(program.report.adjudicate(&id, "right"));
+        program.apply_adjudications();
+        assert_eq!(program.report.rules, 1);
+        let clauses = program.clauses();
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].pack, "right");
     }
 
     #[test]

@@ -25,6 +25,34 @@ fn parse_plugin_command(input: &str) -> Option<ParsedPluginCommand> {
     ) {
         return Some(ParsedPluginCommand::Rules);
     }
+    for prefix in [
+        "规则裁决：",
+        "规则裁决:",
+        "规则裁决 ",
+        "规则仲裁：",
+        "规则仲裁:",
+        "规则仲裁 ",
+        "rule adjudicate ",
+        "plugin adjudicate ",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if let Some((conflict, pack)) = rest
+                .split_once('=')
+                .or_else(|| rest.split_once('＝'))
+                .or_else(|| rest.rsplit_once(char::is_whitespace))
+            {
+                let conflict = conflict.trim().trim_matches(['「', '」', '"', '\'']);
+                let pack = pack.trim().trim_matches(['「', '」', '"', '\'']);
+                if !conflict.is_empty() && !pack.is_empty() {
+                    return Some(ParsedPluginCommand::AdjudicateRule {
+                        conflict: conflict.to_string(),
+                        pack: pack.to_string(),
+                    });
+                }
+            }
+        }
+    }
     if matches!(
         lower.as_str(),
         "为什么这么答" | "插件依据" | "插件轨迹" | "插件trace" | "plugin trace"
@@ -898,6 +926,21 @@ template = "「{entity}」导演过：{answer}。依据：{evidence}"
         assert!(outcome.text.contains("功能谓词分歧"));
         assert!(outcome.text.contains("38"));
         assert!(outcome.text.contains("39"));
+        let outcome = runtime.handle_command("规则裁决 1=right.age").unwrap();
+        assert!(outcome.success, "{}", outcome.text);
+        assert!(outcome.text.contains("已记录裁决"));
+        let report = runtime.rule_report();
+        assert_eq!(
+            report.conflicts[0].preferred_pack.as_deref(),
+            Some("zh.rules.right#right.age")
+        );
+        let clauses = runtime.rule_clauses();
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0].pack, "zh.rules.right#right.age");
+        assert!(!runtime
+            .handle_command("规则裁决 1=missing")
+            .unwrap()
+            .success);
     }
 
 }

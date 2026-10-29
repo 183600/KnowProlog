@@ -1458,6 +1458,8 @@ pub struct PluginSessionState {
     pub modes: BTreeMap<String, PluginMode>,
     #[serde(default)]
     pub last_used: Vec<String>,
+    #[serde(default)]
+    pub rule_adjudications: BTreeMap<String, String>,
 }
 impl PluginSessionState {
     pub fn load(path: impl AsRef<Path>) -> Option<Self> {
@@ -1489,6 +1491,7 @@ enum ParsedPluginCommand {
     Diagnose,
     Evaluate,
     Rules,
+    AdjudicateRule { conflict: String, pack: String },
     Why,
     Enable(String),
     Disable(String),
@@ -1504,4 +1507,5 @@ pub struct PluginRuntime {
     activation_issues: Vec<PluginIssue>,
     last_trace: Option<PluginTrace>,
     last_used: Vec<String>,
+    rule_adjudications: BTreeMap<String, String>,
 }
