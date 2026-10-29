@@ -21,6 +21,36 @@ mod session_tests {
     }
 
     #[test]
+    fn spine_cli_parses_fact_and_question() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "spine",
+            "--fact",
+            "张三批评了李四",
+            "--fact",
+            "李四写了书",
+            "--question",
+            "谁批评了李四？",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Spine {
+                fact,
+                question,
+                json,
+                ..
+            }) => {
+                assert_eq!(fact.len(), 2);
+                assert_eq!(question.as_deref(), Some("谁批评了李四？"));
+                assert!(json);
+            }
+            _ => panic!("应解析为依赖脊分析命令"),
+        }
+        assert!(Cli::try_parse_from(["knowprolog", "spine", "李四被张三批评了"]).is_ok());
+    }
+
+    #[test]
     fn privacy_cli_accepts_store_audit_and_speech_acts() {
         let cli = Cli::try_parse_from([
             "knowprolog",

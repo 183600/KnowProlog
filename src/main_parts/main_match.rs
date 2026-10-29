@@ -1616,7 +1616,7 @@
         // 已在加载默认配置前处理（见 main 顶部早期分派）
         Some(Commands::ConfigFulfillment { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
-        Some(Commands::Roles { .. }) => {}
+        Some(Commands::Roles { .. }) | Some(Commands::Spine { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::OpenClosure { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）

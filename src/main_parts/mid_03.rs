@@ -1527,3 +1527,116 @@ async fn build_store_reasoner(
     reasoner.observe_facts(facts);
     reasoner
 }
+
+
+fn run_spine(text: Option<&str>, facts: &[String], question: Option<&str>, json: bool) {
+    use know_prolog::dependency_spine::{
+        analyze, compile_frames, extract_frames, SpineIndex,
+    };
+
+    let mut index = SpineIndex::new();
+    for fact in facts {
+        for frame in extract_frames(fact) {
+            index.insert_frame(frame);
+        }
+    }
+    index.seal();
+
+    if let Some(question) = question {
+        if facts.is_empty() {
+            eprintln!("回答依存脊问句至少需要一条 --fact。");
+            std::process::exit(1);
+        }
+        match index.answer_question(question, None) {
+            Some(result) => {
+                if json {
+                    let answers: Vec<serde_json::Value> = result
+                        .answers()
+                        .into_iter()
+                        .map(|(role, value)| serde_json::json!({"role": role, "value": value}))
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "question": question,
+                            "plan": result.plan,
+                            "answers": answers,
+                            "solutions": result.search.solutions,
+                            "receipt": result.search.receipt,
+                        }))
+                        .unwrap_or_else(|error| format!("{{\"error\": \"{}\"}}", error))
+                    );
+                } else {
+                    println!("{}", result.render_text());
+                }
+            }
+            None => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "question": question,
+                            "plan": serde_json::Value::Null,
+                            "answers": [],
+                            "reason": "未找到疑问槽位或谓词",
+                        })
+                    );
+                } else {
+                    println!("未把「{}」编译成依存脊问句。", question);
+                }
+            }
+        }
+        return;
+    }
+
+    let inputs: Vec<String> = match text {
+        Some(text) if text != "-" => vec![text.to_string()],
+        _ => {
+            let mut buffer = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut buffer) {
+                eprintln!("读取标准输入失败: {}", error);
+                std::process::exit(1);
+            }
+            buffer
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+    };
+    if inputs.is_empty() {
+        eprintln!("没有输入句子：请提供文本参数，或从标准输入逐行输入。");
+        std::process::exit(1);
+    }
+
+    if json {
+        let records: Vec<serde_json::Value> = inputs
+            .iter()
+            .map(|input| {
+                let tree = analyze(input);
+                let frames = compile_frames(&tree);
+                serde_json::json!({
+                    "text": input,
+                    "tree": tree,
+                    "frames": frames,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&records)
+                .unwrap_or_else(|error| format!("{{\"error\": \"{}\"}}", error))
+        );
+        return;
+    }
+
+    for input in &inputs {
+        let tree = analyze(input);
+        println!("{}", tree.render_text());
+        for frame in compile_frames(&tree) {
+            println!("规范框架：{}", frame.render_text());
+        }
+        println!();
+    }
+}

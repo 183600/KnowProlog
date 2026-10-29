@@ -161,6 +161,18 @@ async fn main() {
         return;
     }
 
+    // 依存脊完全离线：分析、归一或在临时索引上回答 who/what 问句。
+    if let Some(Commands::Spine {
+        text,
+        fact,
+        question,
+        json,
+    }) = &cli.command
+    {
+        run_spine(text.as_deref(), fact, question.as_deref(), *json);
+        return;
+    }
+
     // 隐私裁决完全离线：只读策略/会话台账，不打开知识存储。
     if let Some(Commands::Privacy {
         text,

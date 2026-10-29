@@ -266,6 +266,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Analyze dependency spines and compile canonical frames offline; with
+    /// --fact and --question, build an in-memory spine index and answer.
+    Spine {
+        /// Sentence(s) to analyze; omit or "-" to read one line per sentence
+        text: Option<String>,
+        /// Fact sentence used to build the in-memory index (repeatable)
+        #[arg(long = "fact")]
+        fact: Vec<String>,
+        /// Who/what question answered against the in-memory index
+        #[arg(long)]
+        question: Option<String>,
+        /// Print JSON instead of the Chinese audit view
+        #[arg(long)]
+        json: bool,
+    },
     /// Adjudicate sensitive spans and facts through the POS-typed privacy
     /// flow contract. Audit mode (default) only computes what would happen;
     /// --enforce rewrites/hides values and records the session ledger

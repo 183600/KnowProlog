@@ -1626,6 +1626,76 @@ pub struct SpineSearch {
     pub receipt: SpineReceipt,
 }
 
+/// 问句中的一个待填槽位。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuestionSlot {
+    pub role: String,
+    pub variable: String,
+}
+
+/// 由问句编译出的检索计划。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuestionPlan {
+    pub question: String,
+    pub query: SpineQuery,
+    pub slots: Vec<QuestionSlot>,
+    pub construction: Construction,
+}
+
+impl QuestionPlan {
+    pub fn render_text(&self) -> String {
+        let slots = self
+            .slots
+            .iter()
+            .map(|slot| format!("{}={}?", slot.role, slot.variable))
+            .collect::<Vec<_>>()
+            .join("，");
+        format!(
+            "问句「{}」→ {}（{}）",
+            self.question,
+            self.query
+                .edges
+                .iter()
+                .map(EdgePattern::render)
+                .collect::<Vec<_>>()
+                .join(" ∧ "),
+            slots
+        )
+    }
+}
+
+/// 问句查询结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QuestionSearch {
+    pub plan: QuestionPlan,
+    pub search: SpineSearch,
+}
+
+impl QuestionSearch {
+    /// 按槽位返回去重后的候选答案；顺序稳定，便于后续裁决。
+    pub fn answers(&self) -> Vec<(String, String)> {
+        let mut answers = BTreeSet::new();
+        for solution in &self.search.solutions {
+            for slot in &self.plan.slots {
+                if let Some(value) = solution.bindings.get(&slot.variable) {
+                    answers.insert((slot.role.clone(), value.clone()));
+                }
+            }
+        }
+        answers.into_iter().collect()
+    }
+
+    pub fn render_text(&self) -> String {
+        let mut text = self.plan.render_text();
+        text.push('\n');
+        for (role, value) in self.answers() {
+            text.push_str(&format!("  {} = {}\n", role, value));
+        }
+        text.push_str(&self.search.receipt.render_text());
+        text
+    }
+}
+
 /// 依存脊索引。
 #[derive(Debug, Clone, Default)]
 pub struct SpineIndex {
@@ -1843,6 +1913,79 @@ impl SpineIndex {
         self.query(&query)
     }
 
+    /// 把自然语言问句编译成脊边查询：疑问词变成变量，其余词项保持常量。
+    ///
+    /// 支持 `谁/什么/哪...` 出现在主语、宾语或被动施事位置的问句；
+    /// 是非问与无法定位疑问角色的句子返回 `None`，交由其他通道处理。
+    pub fn plan_question(&self, question: &str) -> Option<QuestionPlan> {
+        let tree = analyze(question);
+        let root = tree.root?;
+        let root_token = tree.token(root)?;
+        if root_token.kind == TokenKind::Wh {
+            return None;
+        }
+        let subject_is_wh = tree
+            .subject
+            .as_ref()
+            .map(|phrase| phrase_contains_wh(&tree, phrase))
+            .unwrap_or(false);
+        let object_is_wh = tree
+            .object
+            .as_ref()
+            .map(|phrase| phrase_contains_wh(&tree, phrase))
+            .unwrap_or(false);
+        if !subject_is_wh && !object_is_wh {
+            return None;
+        }
+
+        let predicate = TermPattern::word(&root_token.text);
+        let subject = match (&tree.subject, subject_is_wh) {
+            (Some(_), true) => TermPattern::var("subject"),
+            (Some(phrase), false) => TermPattern::word(&phrase.text),
+            (None, _) => return None,
+        };
+        let object = match (&tree.object, object_is_wh) {
+            (Some(_), true) => TermPattern::var("object"),
+            (Some(phrase), false) => TermPattern::word(&phrase.text),
+            (None, _) => return None,
+        };
+        let edges = vec![
+            EdgePattern::new(predicate.clone(), DepLabel::NSubj, subject),
+            EdgePattern::new(predicate, DepLabel::Obj, object),
+        ];
+        let mut slots = Vec::new();
+        if subject_is_wh {
+            slots.push(QuestionSlot {
+                role: "subject".to_string(),
+                variable: "subject".to_string(),
+            });
+        }
+        if object_is_wh {
+            slots.push(QuestionSlot {
+                role: "object".to_string(),
+                variable: "object".to_string(),
+            });
+        }
+        Some(QuestionPlan {
+            question: question.to_string(),
+            query: SpineQuery::new(edges),
+            slots,
+            construction: tree.construction,
+        })
+    }
+
+    /// 编译并执行问句；返回计划与可审计检索结果。
+    pub fn answer_question(
+        &mut self,
+        question: &str,
+        max_probes: Option<usize>,
+    ) -> Option<QuestionSearch> {
+        let mut plan = self.plan_question(question)?;
+        plan.query.max_probes = max_probes.map(|budget| budget.max(1));
+        let search = self.query(&plan.query);
+        Some(QuestionSearch { plan, search })
+    }
+
     /// 执行带变量、多跳与预算的合取查询。
     pub fn query(&mut self, query: &SpineQuery) -> SpineSearch {
         self.seal();
@@ -2027,6 +2170,12 @@ impl SpineIndex {
                 .unwrap_or_default(),
         }
     }
+}
+
+fn phrase_contains_wh(tree: &DependencyTree, phrase: &Phrase) -> bool {
+    tree.tokens.iter().any(|token| {
+        token.kind == TokenKind::Wh && token.start >= phrase.start && token.end <= phrase.end
+    })
 }
 
 fn phrase_aliases(tree: &DependencyTree, token_index: usize) -> Vec<String> {
@@ -2369,6 +2518,62 @@ mod tests {
             second.frames()[0].id,
             "同输入必须同 id"
         );
+    }
+
+    #[test]
+    fn question_plan_turns_wh_into_bindable_variable() {
+        let index = SpineIndex::new();
+        let plan = index.plan_question("谁批评了李四？").unwrap();
+        assert_eq!(plan.slots.len(), 1);
+        assert_eq!(plan.slots[0].variable, "subject");
+        assert_eq!(plan.query.edges.len(), 2);
+        assert!(plan.query.edges.iter().any(|edge| {
+            edge.label == DepLabel::NSubj && edge.dep == TermPattern::var("subject")
+        }));
+    }
+
+    #[test]
+    fn index_answers_who_and_what_questions() {
+        let mut index = SpineIndex::from_text("张三批评了李四。李四写了书。");
+        let who = index
+            .answer_question("谁批评了李四？", None)
+            .expect("who question");
+        assert!(
+            who.answers()
+                .contains(&("subject".to_string(), "张三".to_string())),
+            "{:?}",
+            who
+        );
+        let what = index
+            .answer_question("张三批评了谁？", None)
+            .expect("what question");
+        assert!(
+            what.answers()
+                .contains(&("object".to_string(), "李四".to_string())),
+            "{:?}",
+            what
+        );
+    }
+
+    #[test]
+    fn passive_question_finds_agent() {
+        let mut index = SpineIndex::from_text("李四被张三批评了。");
+        let answer = index
+            .answer_question("李四被谁批评了？", None)
+            .expect("passive who question");
+        assert!(
+            answer
+                .answers()
+                .contains(&("subject".to_string(), "张三".to_string())),
+            "{:?}",
+            answer
+        );
+    }
+
+    #[test]
+    fn yes_no_question_has_no_spine_plan() {
+        let index = SpineIndex::new();
+        assert!(index.plan_question("张三批评了李四吗？").is_none());
     }
 
     #[test]
