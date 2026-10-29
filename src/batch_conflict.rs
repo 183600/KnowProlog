@@ -448,12 +448,12 @@ fn parse_segment(
         return Err("空句子".to_string());
     }
     let raw = strip_list_marker(raw);
-    if raw.contains("不是") {
+    if raw.contains("不是") || raw.contains("并非") {
         if let Some(claim) = parse_not_but_correction(raw, previous, ordinal, start, end) {
             return Ok(claim);
         }
     }
-    if raw.contains("不是") || raw.contains("没有") {
+    if raw.contains("不是") || raw.contains("并非") || raw.contains("没有") {
         return Err(format!("「{}」是否定句，不能作为批次肯定事实", raw));
     }
     let (mut strength, content) = AssertionStrength::classify(raw);
@@ -576,11 +576,18 @@ fn parse_not_but_correction(
     start: usize,
     end: usize,
 ) -> Option<BatchClaim> {
-    let not_position = raw.find("不是")?;
-    let after_not = not_position + "不是".len();
+    let (not_position, not_marker) = ["并不是", "并非", "不是"]
+        .iter()
+        .find_map(|marker| raw.find(marker).map(|position| (position, *marker)))?;
+    let after_not = not_position + not_marker.len();
+    let prefix = if not_marker == "不是" { "不是" } else { "并非" };
     let (old_end, new_raw, cue) = if let Some(offset) = raw[after_not..].find("而是") {
         let position = after_not + offset;
-        (position, &raw[position + "而是".len()..], "不是…而是")
+        (
+            position,
+            &raw[position + "而是".len()..],
+            format!("{}…而是", prefix),
+        )
     } else {
         let offset = raw[after_not..].find(['，', ','])?;
         let position = after_not + offset;
@@ -589,7 +596,7 @@ fn parse_not_but_correction(
         let new_raw = after_comma
             .strip_prefix('是')
             .or_else(|| after_comma.strip_prefix('为'))?;
-        (position, new_raw, "不是…是")
+        (position, new_raw, format!("{}…是", prefix))
     };
     let before = raw[..not_position]
         .trim()
@@ -621,7 +628,7 @@ fn parse_not_but_correction(
     let mut claim = old_claim;
     claim.object = object;
     claim.strength = AssertionStrength::Correction;
-    claim.correction_cue = Some(cue.to_string());
+    claim.correction_cue = Some(cue);
     claim.raw = raw.to_string();
     claim.source = format!("第 {} 句", ordinal);
     claim.span = (start, end);
@@ -1369,6 +1376,15 @@ mod tests {
         assert_eq!(
             outcome.claims[0].correction_cue.as_deref(),
             Some("不是…是")
+        );
+
+        let outcome = parse_batch_claims("李四并非30岁，而是31岁");
+        assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
+        assert_eq!(outcome.claims[0].subject, "李四");
+        assert_eq!(outcome.claims[0].object, "31");
+        assert_eq!(
+            outcome.claims[0].correction_cue.as_deref(),
+            Some("并非…而是")
         );
     }
 

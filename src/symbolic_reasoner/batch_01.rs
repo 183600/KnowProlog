@@ -40,7 +40,7 @@ impl SymbolicReasoner {
                     .claims[0]
                     .correction_cue
                     .as_deref()
-                    .is_some_and(|cue| cue.starts_with("不是…"));
+                    .is_some_and(|cue| cue.starts_with("不是…") || cue.starts_with("并非…"));
             if !not_but_correction {
                 return None;
             }
