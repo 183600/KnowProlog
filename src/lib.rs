@@ -88,6 +88,7 @@ pub mod holographic_memory;
 pub mod identity;
 pub mod identity_dialogue;
 pub mod identity_eval;
+pub mod identity_risk;
 pub mod import_episode;
 pub mod import_frames;
 pub mod import_journal;

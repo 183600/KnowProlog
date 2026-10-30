@@ -130,6 +130,12 @@ pub struct MergeRecord {
     pub from: String,
     pub into: String,
     pub moved_aliases: usize,
+    /// 合并前来源身份的类型快照（只读审计用，旧快照缺省为空）。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub from_types: BTreeSet<String>,
+    /// 合并前目标身份的类型快照（只读审计用，旧快照缺省为空）。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub into_types: BTreeSet<String>,
 }
 
 /// 词面解析结论（只解析已确认的词面；提名中的提案不参与解析）。
@@ -1101,12 +1107,18 @@ impl EntityRegistry {
             }
             cursor = next;
         }
-        let (moved_aliases, from_aliases) = {
+        let into_types_before = self
+            .records
+            .get(&into_target)
+            .map(|record| record.types.clone())
+            .unwrap_or_default();
+        let (moved_aliases, from_aliases, from_types) = {
             let Some(from_record) = self.records.get_mut(&from_target) else {
                 return Err(format!("找不到身份「{}」", from));
             };
             let aliases = std::mem::take(&mut from_record.aliases);
             let types = std::mem::take(&mut from_record.types);
+            let types_snapshot = types.clone();
             let origins = from_record.origins.clone();
             let moved = aliases.len();
             from_record.merged_into = Some(into_target.clone());
@@ -1129,7 +1141,7 @@ impl EntityRegistry {
             into_record
                 .sources
                 .insert(format!("合并自「{}」", from_target));
-            (moved, aliases)
+            (moved, aliases, types_snapshot)
         };
         {
             let into_record = self
@@ -1163,6 +1175,8 @@ impl EntityRegistry {
             from: from_target,
             into: into_target,
             moved_aliases,
+            from_types,
+            into_types: into_types_before,
         };
         self.merges.push(record.clone());
         Ok(record)

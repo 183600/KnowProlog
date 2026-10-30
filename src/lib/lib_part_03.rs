@@ -295,9 +295,16 @@ impl OxigraphManager {
         self.entity_registry.read().clone()
     }
 
-    /// 身份台账报告（确定性；含待确认提名与墓碑）。
+    /// 身份台账报告（确定性；含待确认提名、墓碑与身份风险审计）。
     pub fn entity_registry_report(&self) -> String {
-        self.entity_registry.read().report()
+        let registry = self.entity_registry.read();
+        let mut report = registry.report();
+        let risks = registry.risk_audit();
+        if !risks.is_clean() {
+            report.push_str("\n\n");
+            report.push_str(&risks.render_text());
+        }
+        report
     }
 
     /// 铸 URI 前的宪法检查（Exists / Redirect / Variant / Ambiguous / Fresh）。
