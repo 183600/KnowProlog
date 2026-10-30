@@ -1392,6 +1392,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect dialogue artifact URIs (session / turn / reply / claim /
+    /// mention / evidence): list the index, or resolve a URI or selector
+    DialogueArtifacts {
+        /// URI or selector (上一轮 / 第2点 / 依据 / 实体：姚明); omit to list
+        selector: Option<String>,
+        /// Override the chronicle path (defaults to the configured dialogue
+        /// state path or store directory)
+        #[arg(long)]
+        chronicle: Option<String>,
+        /// Override the session identity sidecar (defaults to the chronicle
+        /// path + .session.json)
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Audit persisted artifacts (knowledge `rustfmt --check`): canonical /
     /// non-canonical / damaged / missing, with optional atomic `--fix`
     Artifacts {

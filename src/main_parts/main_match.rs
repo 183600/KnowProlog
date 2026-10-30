@@ -1875,6 +1875,9 @@
             include!("serve_arm.rs");
 
         }
+        Some(Commands::DialogueArtifacts { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
+        }
         Some(Commands::Plugins { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
         }

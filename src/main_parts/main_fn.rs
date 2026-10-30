@@ -249,6 +249,21 @@ async fn main() {
         isolate_dialogue_state_path(&mut config.reasoning.dialogue_state_path, &store_path);
     }
     let config = Arc::new(config);
+    if let Some(Commands::DialogueArtifacts {
+        selector,
+        chronicle,
+        session,
+    }) = &cli.command
+    {
+        run_dialogue_artifacts(
+            &config,
+            &store_path,
+            selector.as_deref(),
+            chronicle.as_deref(),
+            session.as_deref(),
+        );
+        return;
+    }
     if let Some(Commands::BatchTeach {
         facts,
         corpus,

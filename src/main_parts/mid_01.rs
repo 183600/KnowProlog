@@ -413,6 +413,55 @@ fn isolate_dialogue_state_path(path: &mut Option<String>, store_path: &str) {
     );
 }
 
+/// `dialogue-artifacts`：读取编年史并输出稳定工件 URI；不打开知识存储。
+fn run_dialogue_artifacts(
+    config: &know_prolog::SystemConfig,
+    store_path: &str,
+    selector: Option<&str>,
+    chronicle_override: Option<&str>,
+    session_override: Option<&str>,
+) {
+    let chronicle_path = chronicle_override
+        .map(str::to_string)
+        .or_else(|| {
+            config
+                .reasoning
+                .dialogue_state_path
+                .as_deref()
+                .map(|path| format!("{}.chronicle.jsonl", path))
+        })
+        .unwrap_or_else(|| format!("{}/dialogue.chronicle.jsonl", store_path));
+    let session_path = session_override.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "{}{}",
+            chronicle_path,
+            know_prolog::dialogue_uri::SESSION_FILE_SUFFIX
+        )
+    });
+    let session = match DialogueSession::open_or_create(&session_path) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("对话工件会话标识打开失败（{}）：{}", session_path, error);
+            std::process::exit(1);
+        }
+    };
+    let (chronicle, audit) = match Chronicle::open(&chronicle_path, FsyncPolicy::None) {
+        Ok((chronicle, audit)) => (chronicle, audit),
+        Err(error) => {
+            eprintln!("对话编年史打开失败（{}）：{}", chronicle_path, error);
+            std::process::exit(1);
+        }
+    };
+    if !audit.is_clean() {
+        eprintln!("对话编年史{}", audit.verdict());
+    }
+    let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+    match selector {
+        Some(selector) => println!("{}", index.render_selector(selector)),
+        None => println!("{}", index.render_report()),
+    }
+}
+
 /// `artifacts`：工件审计（知识版 `rustfmt --check`）。
 ///
 /// 扫描已知持久化工件，按「解码 → 规范重编码 → 与磁盘比对」分类；
