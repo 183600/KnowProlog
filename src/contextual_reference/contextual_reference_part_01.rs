@@ -259,9 +259,30 @@ pub struct ClarifyQuestion {
     pub options: Vec<ClarifyOption>,
 }
 impl ClarifyQuestion {
+    /// 选项类型一致时按类型选分类词；混合类型保守回退「个」。
+    pub fn classifier(&self) -> String {
+        let mut types = self
+            .options
+            .iter()
+            .filter_map(|option| option.etype.as_deref())
+            .map(str::trim)
+            .filter(|etype| !etype.is_empty());
+        let Some(first) = types.next() else {
+            return "个".to_string();
+        };
+        if types.any(|etype| etype != first) {
+            return "个".to_string();
+        }
+        crate::quantifier::classifier_for_type(first).classifier
+    }
+
     /// 确定性渲染（同版本同字节，可 golden）。
     pub fn render(&self) -> String {
-        let mut out = format!("你说的「{}」是指哪一个？\n", self.mention);
+        let mut out = format!(
+            "你说的「{}」是指哪一{}？\n",
+            self.mention,
+            self.classifier()
+        );
         for (index, option) in self.options.iter().enumerate() {
             let _ = writeln!(out, "  {}. {}", index + 1, option.label);
         }

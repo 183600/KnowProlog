@@ -816,6 +816,46 @@ mod tests {
     }
 
     #[test]
+    fn clarify_question_uses_type_specific_classifier() {
+        let person = ClarifyQuestion {
+            mention: "小李".to_string(),
+            feature: DiscriminatingFeature::Type,
+            options: vec![
+                ClarifyOption {
+                    entity: "小李".to_string(),
+                    label: "小李".to_string(),
+                    etype: Some("人物".to_string()),
+                },
+                ClarifyOption {
+                    entity: "小李公司".to_string(),
+                    label: "小李公司".to_string(),
+                    etype: Some("人物".to_string()),
+                },
+            ],
+        };
+        assert_eq!(person.classifier(), "位");
+        assert!(person.render().contains("哪一位"));
+
+        let mixed = ClarifyQuestion {
+            options: vec![
+                ClarifyOption {
+                    entity: "苹果".to_string(),
+                    label: "苹果".to_string(),
+                    etype: Some("水果".to_string()),
+                },
+                ClarifyOption {
+                    entity: "苹果公司".to_string(),
+                    label: "苹果公司".to_string(),
+                    etype: Some("组织".to_string()),
+                },
+            ],
+            ..person
+        };
+        assert_eq!(mixed.classifier(), "个");
+        assert!(mixed.render().contains("哪一个"));
+    }
+
+    #[test]
     fn parse_clarify_act_variants() {
         let question = ClarifyQuestion {
             mention: "苹果".to_string(),
