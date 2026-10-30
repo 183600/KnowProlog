@@ -1749,6 +1749,44 @@ mod tests {
     }
 
     #[test]
+    fn coarsened_candidate_policy_keeps_options_without_previews() {
+        let request = request(&["苹果", "苹果公司"]);
+        let resolution = resolution(&[("苹果", 4), ("苹果公司", 3)]);
+        let report = probe_clarification_with_disclosure(
+            &request,
+            Some(&resolution),
+            7,
+            3,
+            |entity, _| {
+                if entity == "苹果" {
+                    answered("红色")
+                } else {
+                    answered("库克")
+                }
+            },
+            |entity| {
+                if entity == "苹果公司" {
+                    DisclosureGrade::coarsened("敏感属性")
+                } else {
+                    DisclosureGrade::public()
+                }
+            },
+        );
+        assert_eq!(report.firewall.disclosure.level, DisclosureLevel::Coarsened);
+        assert!(!report.firewall.options.is_empty());
+        assert!(report
+            .firewall
+            .options
+            .iter()
+            .all(|option| option.preview.is_none()));
+        assert!(report
+            .question
+            .options
+            .iter()
+            .all(|option| !option.label.contains('→')));
+    }
+
+    #[test]
     fn blocked_candidate_policy_withholds_previews_without_binding() {
         let request = request(&["苹果", "苹果公司"]);
         let resolution = resolution(&[("苹果", 4), ("苹果公司", 3)]);
