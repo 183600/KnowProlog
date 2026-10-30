@@ -1518,3 +1518,51 @@
             "NLU 回退层应随配置重建"
         );
     }
+
+    #[test]
+    fn pos_ontology_closure_extends_pos_and_entity_slots() {
+        let entry = PatternEntry::new(
+            "作者查询",
+            "config.toml#作者查询",
+            "author_query",
+            10,
+            true,
+            vec![
+                Elem::pos("n"),
+                Elem::word("的"),
+                Elem::word("作者"),
+                Elem::word("是"),
+                Elem::word("谁"),
+            ],
+        );
+        let tokens = tagged(&[
+            ("鲁迅", "nr"),
+            ("的", "u"),
+            ("作者", "n"),
+            ("是", "v"),
+            ("谁", "r"),
+        ]);
+        let matched = match_entry(&entry, &tokens).expect("n 应覆盖 nr");
+        assert_eq!(matched.entities, vec!["鲁迅".to_string()]);
+
+        let slot = PatternEntry::new(
+            "实体槽",
+            "test",
+            "entity",
+            1,
+            true,
+            vec![Elem::slot("实体", "实体")],
+        );
+        let tokens = tagged(&[("清华大学", "nt")]);
+        let matched = match_entry(&slot, &tokens).expect("实体槽应接受 nt");
+        assert_eq!(
+            matched.bindings.get("实体").and_then(|t| t.render_raw()),
+            Some("清华大学".to_string())
+        );
+
+        let time = tagged(&[("今天", "t")]);
+        assert!(
+            match_entry(&slot, &time).is_err(),
+            "纯时间词不应被当成实体槽"
+        );
+    }

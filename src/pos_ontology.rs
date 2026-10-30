@@ -522,6 +522,12 @@ impl PosOntology {
         let profile = self.profile(expected);
         profile.is_nominal()
     }
+
+    /// 实际词性是否可作为图谱实体提及（排除代词与纯时间词）。
+    pub fn is_entity_tag(&self, tag: &str) -> bool {
+        let profile = self.profile(tag);
+        profile.is_nominal() && !profile.has_sort(Sort::Time)
+    }
 }
 
 static STANDARD_ONTOLOGY: OnceLock<PosOntology> = OnceLock::new();
@@ -550,6 +556,10 @@ pub fn is_nominal_tag(tag: &str) -> bool {
 
 pub fn captures_entity(expected: &str) -> bool {
     standard().captures_entity(expected)
+}
+
+pub fn is_entity_tag(tag: &str) -> bool {
+    standard().is_entity_tag(tag)
 }
 
 #[cfg(test)]
@@ -619,6 +629,18 @@ mod tests {
         assert!(!ontology.captures_entity("r"));
         assert!(!ontology.captures_entity("v"));
         assert!(!ontology.captures_entity("q"));
+    }
+
+    #[test]
+    fn entity_tag_policy_excludes_time_and_pronouns() {
+        let ontology = PosOntology::standard();
+        assert!(ontology.is_entity_tag("n"));
+        assert!(ontology.is_entity_tag("nt"));
+        assert!(ontology.is_entity_tag("vn"));
+        assert!(ontology.is_entity_tag("s"));
+        assert!(!ontology.is_entity_tag("t"));
+        assert!(!ontology.is_entity_tag("r"));
+        assert!(!ontology.is_entity_tag("v"));
     }
 
     #[test]

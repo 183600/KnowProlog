@@ -639,25 +639,29 @@ const DATE_WORDS: &[&str] = &["明天", "后天", "今天", "昨天", "大后天
 fn sort_matches(sort: &str, hints: &[String], token: &crate::nlp::TaggedWord) -> bool {
     match sort {
         "城市" | "地点" => {
-            token.pos == "ns"
+            crate::pos_ontology::tag_matches("ns", &token.pos)
                 || token.pos == "n"
                 || CITY_LITERALS.contains(&token.text.as_str())
                 || hints.iter().any(|hint| token.text.contains(hint.as_str()))
         }
         "日期" | "时间" => {
             DATE_WORDS.contains(&token.text.as_str())
-                || (token.pos == "m"
+                || (crate::pos_ontology::tag_matches("m", &token.pos)
                     && (token.text.contains('天')
                         || token.text.contains('月')
                         || token.text.contains('年')))
                 || hints.iter().any(|hint| token.text.contains(hint.as_str()))
         }
-        "人名" => token.pos == "nr" || PERSON_LITERALS.contains(&token.text.as_str()),
-        "数量" => token.pos == "m" || token.text.chars().all(|c| c.is_numeric()),
+        "人名" => {
+            crate::pos_ontology::tag_matches("nr", &token.pos)
+                || PERSON_LITERALS.contains(&token.text.as_str())
+        }
+        "数量" => {
+            crate::pos_ontology::tag_matches("m", &token.pos)
+                || token.text.chars().all(|c| c.is_numeric())
+        }
         "实体" => {
-            token.pos == "nr"
-                || token.pos == "ns"
-                || token.pos == "n"
+            crate::pos_ontology::is_entity_tag(&token.pos)
                 || PERSON_LITERALS.contains(&token.text.as_str())
         }
         "属性" => matches!(token.pos.as_str(), "n" | "nz" | "vn"),
@@ -702,7 +706,10 @@ fn attempt_elem(
         }
         Elem::Pos { pos: expected } if expected == "nr" => {
             // 人名/整词词性只能从 token 边界开始，避免把半个词当人名。
-            if offset != 0 || (token.pos != "nr" && token.pos != "unknown") {
+            if offset != 0
+                || (!crate::pos_ontology::tag_matches("nr", &token.pos)
+                    && token.pos != "unknown")
+            {
                 return Err(ElemFailure::new(
                     MatchFailureKind::PosMismatch,
                     "期望人名(nr)",
@@ -715,7 +722,10 @@ fn attempt_elem(
                 Some(Elem::Word { surface }) => Some(surface.as_str()),
                 _ => None,
             };
-            while end < tokens.len() && (tokens[end].pos == "unknown" || tokens[end].pos == "nr") {
+            while end < tokens.len()
+                && (tokens[end].pos == "unknown"
+                    || crate::pos_ontology::tag_matches("nr", &tokens[end].pos))
+            {
                 if next_literal == Some(tokens[end].text.as_str())
                     || next_literal_starts_with(next_literal, tokens[end].text.as_str())
                 {
@@ -735,14 +745,14 @@ fn attempt_elem(
             })
         }
         Elem::Pos { pos: expected } => {
-            if offset != 0 || token.pos != *expected {
+            if offset != 0 || !crate::pos_ontology::tag_matches(expected, &token.pos) {
                 return Err(ElemFailure::new(
                     MatchFailureKind::PosMismatch,
                     format!("期望词性「{}」", expected),
                     token,
                 ));
             }
-            let entity = if matches!(expected.as_str(), "n" | "nr" | "ns") {
+            let entity = if crate::pos_ontology::captures_entity(expected) {
                 Some(token.text.clone())
             } else {
                 None
