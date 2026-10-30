@@ -905,7 +905,7 @@ impl KnowledgeExtractor {
         }
 
         if self.config.attributes.enabled {
-            for item in self.extract_attribute_items(text, tagged_words) {
+            for item in self.extract_attribute_items(text, tagged_words, &items) {
                 merge_attribute_item(&mut items, item);
             }
         }
@@ -939,15 +939,23 @@ impl KnowledgeExtractor {
         &self,
         text: &str,
         tagged_words: &[TaggedWord],
+        known: &[KnowledgeItem],
     ) -> Vec<KnowledgeItem> {
         if self.attribute_registry.is_empty() {
             return Vec::new();
         }
+        // 同句已由旧规则/文法确定的实体类型是属性定义域的锚点：
+        // 能证明互斥就拒绝，未知仍按开放世界接受。
+        let mut subject_types = known_subject_types(known);
         let mut items = Vec::new();
         for mention in self.attribute_registry.extract_mentions(text, tagged_words) {
+            let types = subject_types
+                .get(&mention.subject)
+                .cloned()
+                .unwrap_or_default();
             let assessment = self.attribute_registry.assess(
                 &self.type_system,
-                &BTreeSet::new(),
+                &types,
                 &mention.attribute,
                 &mention.raw_value,
             );
@@ -966,6 +974,10 @@ impl KnowledgeExtractor {
                 .next()
                 .cloned()
                 .unwrap_or_else(|| "Entity".to_string());
+            subject_types
+                .entry(mention.subject.clone())
+                .or_default()
+                .insert(label.clone());
             let mut properties = HashMap::new();
             properties.insert("name".to_string(), mention.subject);
             properties.insert(profile.canonical.clone(), value.to_string());
@@ -1148,6 +1160,27 @@ impl KnowledgeExtractor {
         None
     }
 }
+/// 抽取队列里已确定的实体类型：主体名 → 类型集合（属性定义域的锚点）。
+fn known_subject_types(items: &[KnowledgeItem]) -> BTreeMap<String, BTreeSet<String>> {
+    let mut types: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for item in items {
+        let KnowledgeItem::Entity { label, properties } = item else {
+            continue;
+        };
+        let Some(name) = properties.get("name") else {
+            continue;
+        };
+        let label = label.trim();
+        if !label.is_empty() {
+            types
+                .entry(name.clone())
+                .or_default()
+                .insert(label.to_string());
+        }
+    }
+    types
+}
+
 /// 同一句可能同时命中旧抽取规则与属性本体桥：按主体名合并，属性桥的
 /// 规范化取值覆盖原始字符串，避免同一事实以两种写法重复落库。
 fn merge_attribute_item(items: &mut Vec<KnowledgeItem>, incoming: KnowledgeItem) {

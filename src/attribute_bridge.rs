@@ -1247,6 +1247,85 @@ mod tests {
     }
 
     #[test]
+    fn known_subject_type_anchors_attribute_domain() {
+        let extra = r#"
+[[extraction_rules]]
+name = "公司"
+entity_type = "Company"
+priority = 10
+patterns = [{ pos_pattern = ["nr"], keyword_patterns = ["公司"], property_mappings = { name = "pos:nr" } }]
+
+[type_system]
+[[type_system.disjoint]]
+left = "Person"
+right = "Company"
+"#;
+        let config = std::sync::Arc::new(extraction_config_with(extra));
+        let extractor = crate::KnowledgeExtractor::new(config);
+        let tagged = vec![
+            TaggedWord {
+                text: "甲公司".to_string(),
+                pos: "nr".to_string(),
+            },
+            TaggedWord {
+                text: "身高".to_string(),
+                pos: "unknown".to_string(),
+            },
+        ];
+        let items = extractor.extract("甲公司身高2米", &tagged);
+        assert_eq!(items.len(), 1, "{:?}", items);
+        match &items[0] {
+            crate::KnowledgeItem::Entity { label, properties } => {
+                assert_eq!(label, "Company");
+                assert_eq!(properties.get("name").map(String::as_str), Some("甲公司"));
+                assert!(
+                    properties.get("height").is_none(),
+                    "可证明互斥的主体类型必须拒绝属性断言：{:?}",
+                    properties
+                );
+            }
+            other => panic!("应只保留公司实体，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unknown_subject_type_keeps_open_world_attribute() {
+        let extra = r#"
+[[extraction_rules]]
+name = "公司"
+entity_type = "Company"
+priority = 10
+patterns = [{ pos_pattern = ["nr"], keyword_patterns = ["公司"], property_mappings = { name = "pos:nr" } }]
+"#;
+        let config = std::sync::Arc::new(extraction_config_with(extra));
+        let extractor = crate::KnowledgeExtractor::new(config);
+        let tagged = vec![
+            TaggedWord {
+                text: "甲公司".to_string(),
+                pos: "nr".to_string(),
+            },
+            TaggedWord {
+                text: "身高".to_string(),
+                pos: "unknown".to_string(),
+            },
+        ];
+        let items = extractor.extract("甲公司身高2米", &tagged);
+        assert_eq!(items.len(), 1, "{:?}", items);
+        match &items[0] {
+            crate::KnowledgeItem::Entity { label, properties } => {
+                assert_eq!(label, "Company");
+                assert_eq!(
+                    properties.get("height").map(String::as_str),
+                    Some("200厘米"),
+                    "未声明互斥时按开放世界接受：{:?}",
+                    properties
+                );
+            }
+            other => panic!("应合并为公司实体，实际 {:?}", other),
+        }
+    }
+
+    #[test]
     fn quantity_values_normalize_to_declared_unit() {
         let registry = AttributeRegistry::from_config(&sample_config());
         let types = person_types();
@@ -1413,7 +1492,11 @@ mod tests {
             .any(|issue| issue.detail.contains("父属性")));
     }
     fn extraction_config() -> crate::SystemConfig {
-        toml::from_str(
+        extraction_config_with("")
+    }
+
+    fn extraction_config_with(extra: &str) -> crate::SystemConfig {
+        toml::from_str(&format!(
             r#"
 [system]
 oxigraph_endpoint = "http://localhost:7878"
@@ -1422,7 +1505,7 @@ default_language = "zh"
 
 [nlp]
 import_keywords = ["录入"]
-pos_dict = {}
+pos_dict = {{}}
 [nlp.name_patterns]
 prefixes = []
 suffixes = []
@@ -1479,8 +1562,8 @@ value_type = "quantity"
 dimension = "length"
 unit = "厘米"
 parent = "height"
-"#,
-        )
+{extra}"#
+        ))
         .expect("最小配置必须可解析")
     }
 
