@@ -767,11 +767,18 @@ fn is_content_word(word: &AnnotatedWord) -> bool {
 }
 
 fn is_content_pos(pos: &str) -> bool {
-    pos.starts_with('n') || pos.starts_with('v') || pos.starts_with('a') || pos == "i" || pos == "l"
+    if pos == "i" || pos == "l" {
+        return true;
+    }
+    let profile = crate::pos_ontology::profile(pos);
+    !profile.features.function_word
+        && ((profile.features.referential && !profile.features.pronoun)
+            || profile.features.predicate
+            || profile.features.modifier)
 }
 
 fn is_nounish(word: &AnnotatedWord) -> bool {
-    word.pos.starts_with('n') || word.pos == "vn"
+    crate::pos_ontology::is_entity_tag(&word.pos)
 }
 
 fn is_classifier_char(ch: char) -> bool {
@@ -789,7 +796,9 @@ fn classifier_surface(word: &AnnotatedWord) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    if word.pos == "q" || roles_of(text).contains(&Role::Quantifier) {
+    if crate::pos_ontology::profile(&word.pos).features.classifier
+        || roles_of(text).contains(&Role::Quantifier)
+    {
         return Some(text.to_string());
     }
     let mut chars = text.chars();
@@ -805,13 +814,7 @@ fn classifier_surface(word: &AnnotatedWord) -> Option<String> {
 }
 
 fn infer_word_types(word: &AnnotatedWord) -> Vec<String> {
-    let mut types = Vec::new();
-    match word.pos.as_str() {
-        "nr" => types.push("人物".to_string()),
-        "ns" => types.push("地点".to_string()),
-        "nt" => types.push("组织".to_string()),
-        _ => {}
-    }
+    let mut types = crate::pos_ontology::profile(&word.pos).ontology_types();
     if let Some((_, expected)) = infer_suffix_type(&word.text) {
         types.push(expected.to_string());
     }
@@ -924,6 +927,36 @@ mod tests {
             .expect("应记录词形");
         assert_eq!(evidence.pos, "nr");
         assert_eq!(evidence.source, "name_pattern");
+    }
+
+    #[test]
+    fn pos_closure_projects_weak_types_from_specific_tags() {
+        let mut memory = LexicalMemory::new(16);
+        memory.observe_annotated(
+            1,
+            &[
+                word("李明", "nrfg", TagSource::JiebaTag),
+                word("清华大学", "nt", TagSource::JiebaTag),
+                word("美丽", "an", TagSource::JiebaTag),
+                word("今天", "t", TagSource::JiebaTag),
+            ],
+        );
+        assert_eq!(
+            memory.type_expectation("李明").map(|e| e.expected_type),
+            Some("人物".to_string())
+        );
+        assert_eq!(
+            memory.type_expectation("清华大学").map(|e| e.expected_type),
+            Some("组织".to_string())
+        );
+        assert!(memory
+            .type_expectation("美丽")
+            .map(|e| e.expected_type == "属性")
+            .unwrap_or(false));
+        assert!(memory
+            .type_expectation("今天")
+            .map(|e| e.expected_type == "时间")
+            .unwrap_or(false));
     }
 
     #[test]
