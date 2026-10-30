@@ -292,18 +292,30 @@
                         for note in &report.notes {
                             println!("（{}）", note);
                         }
-                        match report.decision {
+                        match &report.decision {
                             ProbeDecision::Bind { entity, .. } => {
                                 let rewrite = rewrite_at(
                                     &ask.original_input,
                                     ask.start,
                                     ask.mention.chars().count(),
-                                    &entity,
+                                    entity,
                                 );
                                 if rewrite != input {
                                     println!("（语境改写：{}）", rewrite);
                                 }
                                 crd_input = Some(rewrite);
+                            }
+                            ProbeDecision::Conditional { .. } => {
+                                if let Some(text) = report.firewall.render_conditional_answer() {
+                                    println!("{}", text);
+                                }
+                                println!("{}", report.question.render());
+                                crd_pending = Some(ClarifyRequest {
+                                    question: report.question.clone(),
+                                    ..ask
+                                });
+                                println!();
+                                continue;
                             }
                             _ => {
                                 println!("{}", report.question.render());
