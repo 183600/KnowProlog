@@ -1195,9 +1195,10 @@ impl BindingTableStore {
 
     pub fn insert(&mut self, mut table: BindingTable) -> Result<StoreReceipt, TableError> {
         table.validate()?;
+        let max_rows = self.max_rows.max(1);
         let mut truncated = false;
-        if table.rows.len() > self.max_rows {
-            truncated = table.truncate_rows(self.max_rows);
+        if table.rows.len() > max_rows {
+            truncated = table.truncate_rows(max_rows);
         }
         let base = if table.id.trim().is_empty() {
             self.sequence += 1;
@@ -1213,7 +1214,8 @@ impl BindingTableStore {
         table.id = id.clone();
         self.tables.push(table);
         let mut evicted = Vec::new();
-        while self.tables.len() > self.max_tables {
+        let max_tables = self.max_tables.max(1);
+        while self.tables.len() > max_tables {
             let victim = self
                 .tables
                 .iter()
@@ -1698,6 +1700,17 @@ mod tests {
         assert_eq!(receipt.evicted, vec![first_id]);
         assert_eq!(store.len(), 1);
         assert_eq!(store.get("second").unwrap().created_turn, 5);
+    }
+
+    #[test]
+    fn damaged_limits_still_keep_an_insertable_store() {
+        let mut store = BindingTableStore::new();
+        store.max_tables = 0;
+        store.max_rows = 0;
+        let receipt = store.insert(height_table()).expect("上限损坏也不能吞表");
+        assert!(store.get(&receipt.id).is_some());
+        assert_eq!(store.len(), 1);
+        assert!(receipt.truncated);
     }
 
     #[test]
