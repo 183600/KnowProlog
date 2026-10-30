@@ -126,6 +126,7 @@ use know_prolog::{
     symbolic_generator::SymbolicGenerator,
     symbolic_reasoner::{FormalClarificationOutcome, LanguagePolicySync, SymbolicReasoner},
     synonym_graph::{SynonymContext, SynonymGraph, SynonymKind, SynonymResolution, SynonymSense},
+    variant_closure::{VariantClosure, VariantContext},
     teachable_assertion::{TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::TraceMode,
@@ -457,6 +458,47 @@ enum Commands {
         #[arg(long)]
         seed_config: bool,
         /// Print JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a name through the anchored variant closure: follow typed,
+    /// timed alias/synonym paths to one registered identity, or realize a
+    /// reversible surface for a canonical identity (read-only)
+    Variants {
+        /// Surface to resolve (surface -> anchored identity)
+        #[arg(long, conflicts_with = "canonical")]
+        surface: Option<String>,
+        /// Canonical identity to realize back to a reversible surface
+        #[arg(long)]
+        canonical: Option<String>,
+        /// Expected type used as an anchor guard
+        #[arg(long = "type")]
+        expected_type: Option<String>,
+        /// Predicate used as a sense/domain context
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Explicit domain constraint
+        #[arg(long)]
+        domain: Option<String>,
+        /// Explicit range constraint
+        #[arg(long)]
+        range: Option<String>,
+        /// Reference year for time-windowed variant edges
+        #[arg(long)]
+        year: Option<i32>,
+        /// Session echo surface for reverse generation (repeatable)
+        #[arg(long = "echo")]
+        echo: Vec<String>,
+        /// Also try anchored morphological rules (honorific/suffix/initials)
+        #[arg(long)]
+        morphology: bool,
+        /// Include proposed synonym entries as candidate edges
+        #[arg(long)]
+        include_pending: bool,
+        /// Seed registry profiles and configured synonyms first
+        #[arg(long)]
+        seed_config: bool,
+        /// Print the result as JSON
         #[arg(long)]
         json: bool,
     },

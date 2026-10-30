@@ -534,6 +534,11 @@ impl VariantContext {
         self
     }
 
+    pub fn including_pending_conditional(mut self, include: bool) -> Self {
+        self.include_pending = include;
+        self
+    }
+
     pub fn with_budget(mut self, budget: VariantBudget) -> Self {
         self.budget = budget;
         self
@@ -567,7 +572,7 @@ impl VariantUnresolvedReason {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum VariantResolution {
     Canonical(VariantCandidate),
     Resolved(VariantCandidate),
@@ -667,7 +672,7 @@ struct WalkState {
     anchor: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VariantSurface {
     pub anchor: String,
     pub surface: String,
@@ -690,7 +695,7 @@ impl VariantSurface {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VariantSurfaceChoice {
     pub anchor: String,
     pub surface: String,

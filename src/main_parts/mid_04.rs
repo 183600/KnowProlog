@@ -401,6 +401,111 @@ async fn ask_with_lens(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn run_variants(
+    config: &SystemConfig,
+    oxigraph_manager: &OxigraphManager,
+    surface: Option<String>,
+    canonical: Option<String>,
+    expected_type: Option<String>,
+    predicate: Option<String>,
+    domain: Option<String>,
+    range: Option<String>,
+    year: Option<i32>,
+    echoes: &[String],
+    morphology: bool,
+    include_pending: bool,
+    seed_config: bool,
+    json: bool,
+) {
+    let mut graph = match oxigraph_manager.load_synonym_graph().await {
+        Ok(graph) => graph,
+        Err(error) => {
+            eprintln!("读取同义词图失败: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let turn = graph.turn.max(1);
+    let mut configured = None;
+    if seed_config {
+        oxigraph_manager.configure_entities(&config.entity_profiles);
+        let seeded = SynonymGraph::from_config(config, turn);
+        graph.merge_from(&seeded);
+        configured = Some(seeded);
+    }
+    let registry = oxigraph_manager.entity_registry_snapshot();
+    let mut closure = VariantClosure::from_registry(&registry);
+    if let Some(configured) = configured.as_ref() {
+        closure.add_synonym_graph(configured);
+    }
+    closure.add_synonym_graph_including(&graph, include_pending);
+
+    let mut context = VariantContext::new().including_pending_conditional(include_pending);
+    if let Some(expected_type) = expected_type.as_deref() {
+        context = context.with_expected_type(expected_type);
+    }
+    if let Some(predicate) = predicate.as_deref() {
+        context = context.with_predicate(predicate);
+    }
+    if let Some(domain) = domain.as_deref() {
+        context = context.with_domain(domain);
+    }
+    if let Some(range) = range.as_deref() {
+        context = context.with_range(range);
+    }
+    if let Some(year) = year {
+        context = context.at_year(year);
+    }
+
+    if let Some(surface) = surface.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let resolution = if morphology {
+            closure.resolve_with_morphology(surface, &context)
+        } else {
+            closure.resolve(surface, &context)
+        };
+        if json {
+            match serde_json::to_string_pretty(&resolution) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("名变体解析序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", resolution.render());
+        }
+        return;
+    }
+
+    if let Some(canonical) = canonical.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let choice = closure.surface_for(canonical, &context, echoes);
+        if json {
+            match serde_json::to_string_pretty(&choice) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("名变体反向生成序列化失败: {}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", choice.render());
+        }
+        return;
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "anchors": closure.anchor_count(),
+                "edges": closure.edge_count(),
+                "report": closure.report(),
+            })
+        );
+    } else {
+        println!("{}", closure.report());
+    }
+}
+
 async fn run_synonyms(
     config: &SystemConfig,
     oxigraph_manager: &OxigraphManager,

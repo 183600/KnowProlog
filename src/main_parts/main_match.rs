@@ -520,6 +520,38 @@
             )
             .await;
         }
+        Some(Commands::Variants {
+            surface,
+            canonical,
+            expected_type,
+            predicate,
+            domain,
+            range,
+            year,
+            echo,
+            morphology,
+            include_pending,
+            seed_config,
+            json,
+        }) => {
+            run_variants(
+                &config,
+                &oxigraph_manager,
+                surface,
+                canonical,
+                expected_type,
+                predicate,
+                domain,
+                range,
+                year,
+                &echo,
+                morphology,
+                include_pending,
+                seed_config,
+                json,
+            )
+            .await;
+        }
         Some(Commands::Segment {
             text,
             context,

@@ -2030,4 +2030,49 @@ mod session_tests {
         assert!(Cli::try_parse_from(["knowprolog", "synonyms", "--kind", "unknown"]).is_ok());
     }
 
+    #[test]
+    fn variants_cli_parses_surface_and_canonical() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "variants",
+            "--surface",
+            "UCAS",
+            "--type",
+            "University",
+            "--year",
+            "2024",
+            "--morphology",
+            "--json",
+        ])
+        .expect("variants 解析参数应可解析");
+        match cli.command {
+            Some(Commands::Variants {
+                surface,
+                canonical,
+                expected_type,
+                year,
+                morphology,
+                json,
+                ..
+            }) => {
+                assert_eq!(surface.as_deref(), Some("UCAS"));
+                assert!(canonical.is_none());
+                assert_eq!(expected_type.as_deref(), Some("University"));
+                assert_eq!(year, Some(2024));
+                assert!(morphology);
+                assert!(json);
+            }
+            other => panic!("应解析为 Variants：{:?}", other),
+        }
+        assert!(Cli::try_parse_from([
+            "knowprolog",
+            "variants",
+            "--surface",
+            "北大",
+            "--canonical",
+            "北京大学",
+        ])
+        .is_err());
+    }
+
 }
