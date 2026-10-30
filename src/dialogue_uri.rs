@@ -817,7 +817,9 @@ impl DialogueArtifactIndex {
                 output.push('\n');
             }
         }
-        output.push_str("  用法：工件：上一轮 / 工件：第2点 / 工件：依据 / 工件：<URI>\n");
+        output.push_str(
+            "  用法：工件：上一轮 / 工件：第2点 / 工件：依据 / 工件：实体：姚明 / 工件：<URI>\n",
+        );
         output
     }
 
@@ -825,6 +827,18 @@ impl DialogueArtifactIndex {
         let spec = selector.trim();
         if matches!(spec, "依据" | "证据" | "出处") {
             return self.render_latest_evidence();
+        }
+        if let Some(entity) = spec
+            .strip_prefix("实体：")
+            .or_else(|| spec.strip_prefix("实体:"))
+            .or_else(|| spec.strip_prefix("实体 "))
+            .or_else(|| spec.strip_prefix("entity:"))
+            .or_else(|| spec.strip_prefix("entity "))
+        {
+            return self.render_entity_mentions(entity.trim());
+        }
+        if spec.starts_with(&format!("{}entity/", DEFAULT_BASE_NS)) {
+            return self.render_entity_mentions(spec);
         }
         match self.resolve_selector(spec) {
             Ok(resolved) => self.render_resolved(&resolved),
@@ -960,6 +974,80 @@ impl DialogueArtifactIndex {
                     digest
                 ));
                 append_block(&mut output, "内容", text);
+            }
+        }
+        output
+    }
+
+    pub fn mentions_of_entity(&self, entity: &str) -> Vec<(&TurnArtifact, &MentionArtifact)> {
+        let needle = entity.trim();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for turn in self.turns.values() {
+            for mention in &turn.mentions {
+                let matches = mention.surface == needle
+                    || mention.entity.as_deref() == Some(needle)
+                    || mention.entity_uri.as_deref() == Some(needle);
+                if matches {
+                    hits.push((turn, mention));
+                }
+            }
+        }
+        hits
+    }
+
+    pub fn replies_for_turn(&self, turn_seq: u64) -> Vec<&ReplyArtifact> {
+        self.replies
+            .values()
+            .filter(|reply| reply.turn_seq == Some(turn_seq))
+            .collect()
+    }
+
+    pub fn render_entity_mentions(&self, entity: &str) -> String {
+        let entity = entity.trim();
+        if entity.is_empty() {
+            return "用法：工件：实体：<实体名或实体 URI>".to_string();
+        }
+        let hits = self.mentions_of_entity(entity);
+        if hits.is_empty() {
+            return format!("没有找到实体「{}」的对话提及。", entity);
+        }
+        let entity_uri = if entity.starts_with(DEFAULT_BASE_NS) {
+            entity.to_string()
+        } else {
+            hits.iter()
+                .find_map(|(_, mention)| mention.entity_uri.clone())
+                .unwrap_or_else(|| entity_uri(DEFAULT_BASE_NS, entity))
+        };
+        let mut output = format!(
+            "实体「{}」的对话工件：{} 条提及\n  实体 URI：{}\n",
+            entity,
+            hits.len(),
+            entity_uri
+        );
+        for (position, (turn, mention)) in hits.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}  {}（第 {} 条，{}）\n",
+                position + 1,
+                mention.uri,
+                mention.surface,
+                mention.index,
+                mention.source
+            ));
+            output.push_str(&format!("     轮次：{}\n", turn.uri));
+            let replies = self.replies_for_turn(turn.seq);
+            if replies.is_empty() {
+                output.push_str("     回答：无\n");
+            } else {
+                for reply in replies {
+                    output.push_str(&format!(
+                        "     回答：{}  {}\n",
+                        reply.uri,
+                        compact(&reply.answer, 40)
+                    ));
+                }
             }
         }
         output
@@ -1557,6 +1645,31 @@ mod tests {
             index.resolve(&missing),
             Err(UriError::UnknownArtifact(_))
         ));
+    }
+
+    #[test]
+    fn entity_mentions_cross_reference_turns_and_replies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, index, _) = sample_index(&dir);
+        let hits = index.mentions_of_entity("姚明");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.seq, 1);
+        assert_eq!(hits[0].1.index, 1);
+        assert_eq!(index.replies_for_turn(1).len(), 1);
+
+        let by_name = index.render_selector("实体：姚明");
+        assert!(by_name.contains("1 条提及"), "{}", by_name);
+        assert!(by_name.contains(&hits[0].1.uri), "{}", by_name);
+        assert!(by_name.contains(&hits[0].0.uri), "{}", by_name);
+        assert!(by_name.contains("226 厘米"), "{}", by_name);
+
+        let entity_uri = entity_uri(DEFAULT_BASE_NS, "姚明");
+        let by_uri = index.render_selector(&entity_uri);
+        assert!(by_uri.contains("1 条提及"), "{}", by_uri);
+        assert!(by_uri.contains(&entity_uri), "{}", by_uri);
+        assert!(index
+            .render_selector("实体：不存在")
+            .contains("没有找到实体"));
     }
 
     #[test]
