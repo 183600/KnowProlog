@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bindings::{compare_quantity, BoundTerm};
 use crate::context_image::{canonical_json, fnv1a_hex, ContextImage};
+use crate::fact_snapshot::FactSnapshot;
 use crate::provenance::FactRef;
 use crate::quantity::Comparison;
 
@@ -599,6 +600,16 @@ impl BindingTable {
             invalidated: self.invalidated.clone(),
             missing_evidence,
         }
+    }
+
+    /// 用事实快照做失效检查：版本取自快照，证据只认快照里仍可采信的事实。
+    pub fn staleness_against(&self, snapshot: &FactSnapshot) -> Staleness {
+        let facts: BTreeSet<FactRef> = snapshot
+            .effective_records()
+            .into_iter()
+            .map(|record| record.fact.clone())
+            .collect();
+        self.staleness(snapshot.revision(), &facts)
     }
 
     pub fn filter_eq(&self, variable: &str, value: &str) -> Result<Self, TableError> {
@@ -1286,6 +1297,21 @@ impl BindingTableStore {
             .collect()
     }
 
+    /// 用事实快照批量检查台账里的表。
+    pub fn stale_reports_against(&self, snapshot: &FactSnapshot) -> Vec<(String, Staleness)> {
+        self.tables
+            .iter()
+            .filter_map(|table| {
+                let staleness = table.staleness_against(snapshot);
+                if staleness.is_stale() {
+                    Some((table.id.clone(), staleness))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn render(&self) -> String {
         if self.tables.is_empty() {
             return "绑定表台账：（空）".to_string();
@@ -1761,6 +1787,38 @@ mod tests {
             ),
             "点表绝不能实例化到李四"
         );
+    }
+
+    #[test]
+    fn snapshot_staleness_checks_effective_facts_and_revision() {
+        use crate::fact_snapshot::{FactKind, FactSnapshotBuilder};
+        use crate::provenance::{SourceId, SourceKind};
+
+        let table = height_table();
+        let source = SourceId::new(SourceKind::Import, "test", "height facts");
+        let mut builder = FactSnapshotBuilder::new(7);
+        for fact in table.evidence_facts() {
+            builder.add_base(fact, FactKind::Attribute, source.clone());
+        }
+        let snapshot = builder.build();
+        assert!(!table.staleness_against(&snapshot).is_stale());
+
+        let source = SourceId::new(SourceKind::Import, "test", "one fact");
+        let fact = table
+            .evidence_facts()
+            .into_iter()
+            .next()
+            .expect("样例表应有证据");
+        let mut partial_builder = FactSnapshotBuilder::new(7);
+        partial_builder.add_base(fact, FactKind::Attribute, source);
+        let partial = partial_builder.build();
+        let report = table.staleness_against(&partial);
+        assert_eq!(report.missing_evidence.len(), 1);
+
+        let mut store = BindingTableStore::new();
+        store.insert(table).unwrap();
+        assert_eq!(store.stale_reports_against(&snapshot).len(), 0);
+        assert_eq!(store.stale_reports_against(&partial).len(), 1);
     }
 
     #[test]
