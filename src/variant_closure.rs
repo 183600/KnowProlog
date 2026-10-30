@@ -2,11 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::entity_registry::{fold_surface, EntityRegistry, EntityStatus};
 use crate::synonym_graph::{SynonymGraph, SynonymKind, SynonymStatus};
 use crate::temporal::{TimePoint, Validity};
 use crate::type_system::{TypeSystem, TypeVerdict};
 
+pub const VARIANT_CLOSURE_DIALECT: &str = "knowprolog-variant-closure/1";
+pub const VARIANT_CLOSURE_VERSION: u32 = 1;
 pub const DEFAULT_VARIANT_MAX_DEPTH: usize = 6;
 pub const DEFAULT_VARIANT_MAX_NODES: usize = 256;
 pub const DEFAULT_VARIANT_MAX_EXPANSIONS: usize = 4_096;
@@ -375,6 +378,27 @@ impl VariantCandidate {
             self.validity.render()
         )
     }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VariantSnapshot {
+    #[serde(default = "dialect_default")]
+    dialect: String,
+    #[serde(default = "version_default")]
+    version: u32,
+    #[serde(default)]
+    anchors: BTreeMap<String, VariantAnchor>,
+    #[serde(default)]
+    edges: Vec<VariantEdge>,
+}
+
+fn dialect_default() -> String {
+    VARIANT_CLOSURE_DIALECT.to_string()
+}
+
+fn version_default() -> u32 {
+    VARIANT_CLOSURE_VERSION
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -962,6 +986,145 @@ impl VariantClosure {
 
     pub fn types(&self) -> &BTreeMap<String, VariantAnchor> {
         &self.anchors
+    }
+
+    pub fn refute_edge(&mut self, from: &str, to: &str, anchor: &str) -> bool {
+        self.set_edge_refuted(from, to, anchor, true)
+    }
+
+    pub fn restore_edge(&mut self, from: &str, to: &str, anchor: &str) -> bool {
+        self.set_edge_refuted(from, to, anchor, false)
+    }
+
+    fn set_edge_refuted(&mut self, from: &str, to: &str, anchor: &str, refuted: bool) -> bool {
+        let from_key = fold_surface(from);
+        let to_key = fold_surface(to);
+        let anchor_key = fold_surface(anchor);
+        let mut changed = false;
+        for edge in &mut self.edges {
+            if fold_surface(&edge.from) == from_key
+                && fold_surface(&edge.to) == to_key
+                && fold_surface(&edge.anchor) == anchor_key
+                && edge.refuted != refuted
+            {
+                edge.refuted = refuted;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn is_edge_refuted(&self, from: &str, to: &str, anchor: &str) -> bool {
+        let from_key = fold_surface(from);
+        let to_key = fold_surface(to);
+        let anchor_key = fold_surface(anchor);
+        self.edges.iter().any(|edge| {
+            edge.refuted
+                && fold_surface(&edge.from) == from_key
+                && fold_surface(&edge.to) == to_key
+                && fold_surface(&edge.anchor) == anchor_key
+        })
+    }
+
+    fn snapshot(&self) -> VariantSnapshot {
+        VariantSnapshot {
+            dialect: VARIANT_CLOSURE_DIALECT.to_string(),
+            version: VARIANT_CLOSURE_VERSION,
+            anchors: self.anchors.clone(),
+            edges: self.edges.clone(),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(&self.snapshot()).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn from_json(text: &str) -> Option<Self> {
+        let snapshot: VariantSnapshot = serde_json::from_str(text).ok()?;
+        if snapshot.version > VARIANT_CLOSURE_VERSION {
+            return None;
+        }
+        let mut closure = Self::new();
+        for (key, anchor) in snapshot.anchors {
+            let folded = fold_surface(&anchor.canonical);
+            if folded.is_empty() || folded != key {
+                return None;
+            }
+            closure.declare_anchor_typed(&anchor.canonical, &anchor.types);
+            if anchor.observed {
+                closure.mark_observed(&anchor.canonical);
+            }
+        }
+        for edge in snapshot.edges {
+            if !closure.add_edge(edge.clone()) && !closure.edges.iter().any(|existing| existing.key() == edge.key()) {
+                return None;
+            }
+        }
+        Some(closure)
+    }
+
+    pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
+    }
+
+    pub fn load_from_path(path: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Self::from_json(&text)
+    }
+
+    pub fn digest(&self) -> String {
+        match serde_json::to_value(self.snapshot()) {
+            Ok(value) => fnv1a_hex(canonical_json(&value).as_bytes()),
+            Err(_) => String::new(),
+        }
+    }
+
+    pub fn audit_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "名变体闭包：{} 个身份锚，{} 条变体边（{} 条墓碑）",
+            self.anchors.len(),
+            self.edges.len(),
+            self.edges.iter().filter(|edge| edge.refuted).count()
+        )];
+        let mut anchors: Vec<&VariantAnchor> = self.anchors.values().collect();
+        anchors.sort_by(|left, right| left.canonical.cmp(&right.canonical));
+        for anchor in anchors {
+            lines.push(format!(
+                "  - 「{}」（{}）",
+                anchor.canonical,
+                anchor.type_label()
+            ));
+            let mut edges: Vec<&VariantEdge> = self
+                .edges
+                .iter()
+                .filter(|edge| fold_surface(&edge.anchor) == fold_surface(&anchor.canonical))
+                .collect();
+            edges.sort_by(|left, right| {
+                left.from
+                    .cmp(&right.from)
+                    .then_with(|| left.to.cmp(&right.to))
+            });
+            for edge in edges {
+                lines.push(format!(
+                    "      {}「{}」→「{}」（{}，{:.2}{}）",
+                    if edge.refuted { "✗ " } else { "" },
+                    edge.from,
+                    edge.to,
+                    edge.kind.label(),
+                    edge.confidence,
+                    if edge.source.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，{}", edge.source)
+                    }
+                ));
+            }
+        }
+        lines
+    }
+
+    pub fn report(&self) -> String {
+        self.audit_lines().join("\n")
     }
 
     pub fn resolve(&self, surface: &str, context: &VariantContext) -> VariantResolution {
@@ -1762,6 +1925,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn refuted_edge_is_a_persistent_tombstone() {
+        let mut closure = VariantClosure::new();
+        closure.declare_anchor("北京");
+        closure.add_edge(VariantEdge::new("北平", "北京", VariantKind::FormerName, "北京"));
+        assert_eq!(closure.resolve("北平", &VariantContext::new()).canonical(), Some("北京"));
+        assert!(closure.refute_edge("北平", "北京", "北京"));
+        assert!(closure.is_edge_refuted("北平", "北京", "北京"));
+        let blocked = closure.resolve("北平", &VariantContext::new());
+        assert!(matches!(
+            blocked,
+            VariantResolution::Unresolved {
+                reason: VariantUnresolvedReason::GuardRejected,
+                ..
+            }
+        ));
+        let restored = VariantClosure::from_json(&closure.to_json()).expect("快照应可解码");
+        assert!(restored.is_edge_refuted("北平", "北京", "北京"));
+        let mut restored = restored;
+        assert!(restored.restore_edge("北平", "北京", "北京"));
+        assert_eq!(
+            restored.resolve("北平", &VariantContext::new()).canonical(),
+            Some("北京")
+        );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_is_stable() {
+        let closure = VariantClosure::from_parts(&registry(), &synonym_graph());
+        let json = closure.to_json();
+        let restored = VariantClosure::from_json(&json).expect("快照应可解码");
+        assert_eq!(closure.digest(), restored.digest());
+        assert_eq!(closure.edges().len(), restored.edges().len());
+        assert_eq!(
+            restored.resolve("UCAS", &VariantContext::new()).canonical(),
+            Some("中国科学院大学")
+        );
+        assert!(VariantClosure::from_json("{\"version\": 99}").is_none());
     }
 
     #[test]
