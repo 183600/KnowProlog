@@ -643,19 +643,29 @@ fn normalize_claims(claims: &[Claim]) -> Vec<Claim> {
 }
 
 fn detect_conflict(worlds: &[&CandidateWorld]) -> Option<(String, Vec<String>)> {
-    let mut slots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if worlds.len() < 2 {
+        return None;
+    }
+    let mut slots: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
     for world in worlds {
         if let WorldAnswer::Answered(claims) = &world.answer {
+            let mut per_slot: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for claim in claims {
-                slots
+                per_slot
                     .entry(claim.slot.clone())
                     .or_default()
-                    .insert(claim.value.clone());
+                    .push(claim.value.clone());
+            }
+            for (slot, mut values) in per_slot {
+                values.sort();
+                values.dedup();
+                slots.entry(slot).or_default().insert(values);
             }
         }
     }
-    for (slot, values) in slots {
-        if values.len() > 1 {
+    for (slot, value_sets) in slots {
+        if value_sets.len() > 1 {
+            let values: BTreeSet<String> = value_sets.into_iter().flatten().collect();
             return Some((slot, values.into_iter().collect()));
         }
     }
@@ -884,6 +894,40 @@ mod tests {
         assert_eq!(report.basis, "ranked_only");
         assert!(report.certificate.verify());
         assert!(report.render_text().contains("不变回答"));
+    }
+
+    #[test]
+    fn multi_valued_answers_within_one_world_are_not_conflicts() {
+        let request = FirewallRequest::new(
+            "苹果",
+            vec![
+                CandidateWorld::new(
+                    "苹果",
+                    1,
+                    5,
+                    Warrant::Ranked,
+                    WorldAnswer::Answered(vec![
+                        Claim::new("颜色", "红色"),
+                        Claim::new("颜色", "绿色"),
+                    ]),
+                ),
+                CandidateWorld::new(
+                    "苹果公司",
+                    2,
+                    4,
+                    Warrant::Ranked,
+                    WorldAnswer::Answered(vec![
+                        Claim::new("颜色", "红色"),
+                        Claim::new("颜色", "绿色"),
+                    ]),
+                ),
+            ],
+        );
+        let report = evaluate(&request);
+        assert!(matches!(
+            report.verdict,
+            FirewallVerdict::Invariant { ref claims } if claims.len() == 2
+        ));
     }
 
     #[test]
