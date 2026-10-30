@@ -1183,6 +1183,55 @@ fn check_attributes(
                 format!("{}.parent", path),
                 format!("父属性「{}」未在 attributes.profiles 中登记", parent),
             ),
+            Some(parent) => {
+                if let Some(parent_index) = canonical_names.get(&fold(parent)) {
+                    if parent_index != &index {
+                        let parent_profile = &profiles[*parent_index];
+                        if parent_profile.value_type != crate::attribute_bridge::AttributeValueType::Any
+                            && profile.value_type != crate::attribute_bridge::AttributeValueType::Any
+                            && parent_profile.value_type != profile.value_type
+                        {
+                            c.warn(
+                                "attribute_parent_value_type_mismatch",
+                                format!("{}.value_type", path),
+                                format!(
+                                    "子属性「{}」的值类型与父属性「{}」不一致：父属性查询可能召回不可比的值",
+                                    name, parent
+                                ),
+                            );
+                        }
+                        let parent_dimension = parent_profile
+                            .dimension
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|dimension| !dimension.is_empty())
+                            .and_then(crate::attribute_bridge::parse_dimension);
+                        let child_dimension = profile
+                            .dimension
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|dimension| !dimension.is_empty())
+                            .and_then(crate::attribute_bridge::parse_dimension);
+                        if let (Some(parent_dimension), Some(child_dimension)) =
+                            (parent_dimension, child_dimension)
+                        {
+                            if parent_dimension != child_dimension {
+                                c.warn(
+                                    "attribute_parent_dimension_mismatch",
+                                    format!("{}.dimension", path),
+                                    format!(
+                                        "子属性「{}」的{}量纲与父属性「{}」的{}量纲不一致：父属性查询可能聚合错量纲",
+                                        name,
+                                        child_dimension.label(),
+                                        parent,
+                                        parent_dimension.label()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
 

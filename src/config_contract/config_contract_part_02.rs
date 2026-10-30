@@ -987,7 +987,7 @@ process_error = "处理出错"
     #[test]
     fn attribute_profiles_report_schema_and_unit_problems() {
         let source = format!(
-            "{}\n[attributes]\nenabled = true\n\n[[attributes.profiles]]\nname = \"height\"\ndomain = [\"Persom\"]\nvalue_type = \"quantity\"\ndimension = \"length\"\nunit = \"千克\"\nparent = \"missing\"\n\n[[attributes.profiles]]\nname = \"甲\"\nparent = \"乙\"\n\n[[attributes.profiles]]\nname = \"乙\"\nparent = \"甲\"\n\n[[attributes.profiles]]\nname = \"width\"\ndimension = \"warp\"\nunit = \"不存在单位\"\n",
+            "{}\n[attributes]\nenabled = true\n\n[[attributes.profiles]]\nname = \"height\"\ndomain = [\"Persom\"]\nvalue_type = \"quantity\"\ndimension = \"length\"\nunit = \"千克\"\nparent = \"missing\"\n\n[[attributes.profiles]]\nname = \"甲\"\nparent = \"乙\"\n\n[[attributes.profiles]]\nname = \"乙\"\nparent = \"甲\"\n\n[[attributes.profiles]]\nname = \"width\"\ndimension = \"warp\"\nunit = \"不存在单位\"\n\n[[attributes.profiles]]\nname = \"mass_child\"\nparent = \"height\"\nvalue_type = \"string\"\ndimension = \"mass\"\n",
             base()
         );
         let issues = lint_source(&source);
@@ -997,6 +997,8 @@ process_error = "处理出错"
         assert_code(&issues, "attribute_parent_cycle");
         assert_code(&issues, "unknown_attribute_dimension");
         assert_code(&issues, "unknown_attribute_unit");
+        assert_code(&issues, "attribute_parent_value_type_mismatch");
+        assert_code(&issues, "attribute_parent_dimension_mismatch");
     }
 
     #[test]
