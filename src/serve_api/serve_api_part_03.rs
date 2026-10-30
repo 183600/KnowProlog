@@ -126,6 +126,97 @@ async fn handle_events(request: &Request) -> Response {
         }),
     )
 }
+/// 无状态共指闭包：`POST /v1/coref`。
+///
+/// 请求体与 CLI `coref` 的证据 JSON 相同，可额外带 `resolve` / `closure` /
+/// `predicate` / `operator` / `law` 字段；只读，不写会话或知识库。
+async fn handle_coref(request: &Request) -> Response {
+    let body = match request.body_text() {
+        Ok(body) => body,
+        Err(error) => return utf8_body_error(error),
+    };
+    let payload: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
+    };
+    let evidence: crate::coref_closure::CorefEvidence = match serde_json::from_value(payload.clone())
+    {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return Response::error(400, &format!("invalid coref evidence: {error}"));
+        }
+    };
+    let resolve = payload.get("resolve").and_then(serde_json::Value::as_str);
+    let closure = payload.get("closure").and_then(serde_json::Value::as_str);
+    let predicate = payload.get("predicate").and_then(serde_json::Value::as_str);
+    let law = payload.get("law").and_then(serde_json::Value::as_str);
+    let operator = match payload.get("operator").and_then(serde_json::Value::as_str) {
+        Some(raw) => match crate::pattern_closure::ClosureOp::parse(raw) {
+            Some(operator) => operator,
+            None => {
+                return Response::error(
+                    400,
+                    &format!("invalid operator: {raw} (use plus, star or exact:N)"),
+                );
+            }
+        },
+        None => crate::pattern_closure::ClosureOp::Plus,
+    };
+
+    let graph = evidence.into_graph();
+    let budget = crate::coref_closure::CorefBudget::default();
+    let build = graph.build(&budget);
+    let mut response = serde_json::json!({
+        "status": "ok",
+        "identity": build,
+    });
+    if let Some(surface) = resolve {
+        response["resolution"] = serde_json::to_value(build.resolve(surface))
+            .unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(start) = closure {
+        let quotient = graph.quotient(&budget);
+        match quotient.closure(
+            start,
+            operator,
+            crate::pattern_closure::ClosureBudget::default(),
+            law,
+            predicate,
+        ) {
+            Ok(outcome) => {
+                response["closure"] = coref_closure_json(&outcome);
+            }
+            Err(error) => return Response::error(400, &error.to_string()),
+        }
+    }
+    response["quotient"] = serde_json::to_value(graph.quotient(&budget))
+        .unwrap_or(serde_json::Value::Null);
+    Response::json(200, &response)
+}
+
+fn coref_closure_json(outcome: &crate::coref_closure::QuotientOutcome) -> serde_json::Value {
+    let targets: Vec<serde_json::Value> = outcome
+        .targets()
+        .into_iter()
+        .map(|target| {
+            serde_json::json!({
+                "target": target,
+                "hops": outcome.outcome.hop_count_of(target),
+                "witness": outcome.render_witness(target),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "start_surface": outcome.start_surface,
+        "start": outcome.start,
+        "operator": outcome.outcome.operator.label(),
+        "reached_count": outcome.outcome.reached_count,
+        "complete": outcome.outcome.complete(),
+        "truncated": outcome.outcome.truncated.map(|truncated| truncated.label()),
+        "targets": targets,
+    })
+}
+
 /// 把共享白板声明转成低可信度证据索引；冲突中的说法不替用户拍板，进一步降权。
 fn shared_attention_items(view: &SharedMemoryView) -> Vec<AttentionItem> {
     let conflicted: std::collections::BTreeSet<&str> = view

@@ -1109,6 +1109,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
                     "GET /v1/models",
                     "GET /v1/prompts",
                     "POST /v1/events",
+                    "POST /v1/coref",
                     "POST /v1/chat/completions"
                 ]
             }),
@@ -1170,6 +1171,7 @@ async fn route(state: &Arc<ApiState>, request: &Request) -> Response {
         },
         ("POST", ["sessions", "import"]) => handle_import(state, request).await,
         ("POST", ["v1", "events"]) => handle_events(request).await,
+        ("POST", ["v1", "coref"]) => handle_coref(request).await,
         ("GET", ["sessions", id]) => match state.session_snapshot(id).await {
             Ok(snapshot) => Response::json(200, &snapshot),
             Err(error) => session_error_response(error),

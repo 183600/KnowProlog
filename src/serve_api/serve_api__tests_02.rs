@@ -1630,3 +1630,88 @@
         assert!(value["answer"]["answer"].as_str().unwrap().contains("张三"));
         assert_eq!(value["graph"]["events"].as_array().unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn coref_endpoint_resolves_aliases_and_closes_relations() {
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/v1/coref".to_string(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            body: serde_json::json!({
+                "identity": [
+                    {"from": "老李", "to": "李四", "kind": "alias"},
+                    {"from": "他", "to": "李四", "kind": "pronoun", "confidence": 0.8}
+                ],
+                "non_identity": [
+                    {"from": "姚明的妻子", "to": "叶莉", "kind": "description"}
+                ],
+                "relations": [
+                    {"from": "李四", "to": "王五", "predicate": "师傅"},
+                    {"from": "王五", "to": "赵六", "predicate": "师傅"}
+                ],
+                "resolve": "老李",
+                "closure": "老李",
+                "predicate": "师傅",
+                "law": "师傅"
+            })
+            .to_string()
+            .into_bytes(),
+        };
+        let response = handle_coref(&request).await;
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["resolution"]["canonical"], "李四");
+        assert_eq!(value["closure"]["reached_count"], 2);
+        assert_eq!(value["closure"]["targets"][0]["target"], "王五");
+        assert_eq!(value["closure"]["targets"][1]["target"], "赵六");
+        assert_eq!(value["quotient"]["self_loops"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn coref_route_is_reachable_over_http() {
+        let (addr, _server) = start_server(2);
+        let body = serde_json::json!({
+            "identity": [{"from": "老李", "to": "李四"}]
+        })
+        .to_string();
+        let (status, _, body) = raw_request(
+            addr,
+            "POST",
+            "/v1/coref",
+            &[("Content-Type", "application/json")],
+            &body,
+        )
+        .await;
+        assert_eq!(status, 200, "{}", body);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["identity"]["canonical_of"]["老李"], "李四");
+        assert_eq!(value["identity"]["active_edges"], 1);
+    }
+
+    #[tokio::test]
+    async fn coref_endpoint_rejects_unknown_operator_without_panicking() {
+        let request = Request {
+            method: "POST".to_string(),
+            path: "/v1/coref".to_string(),
+            query: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            body: r#"{
+                "identity": [{"from": "老李", "to": "李四"}],
+                "closure": "老李",
+                "operator": "sometimes"
+            }"#
+            .as_bytes()
+            .to_vec(),
+        };
+        let response = handle_coref(&request).await;
+        assert_eq!(response.status, 400);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(value["error"].as_str().unwrap().contains("invalid operator"));
+    }
