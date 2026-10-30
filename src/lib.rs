@@ -56,6 +56,7 @@ pub mod dialogue_fuzz;
 pub mod dialogue_manager;
 pub mod dialogue_uri;
 pub mod discourse;
+pub mod disclosure_fusion;
 pub mod embedding_eval;
 pub mod entailment_eval;
 pub mod entity_inventory;

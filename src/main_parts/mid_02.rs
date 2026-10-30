@@ -853,6 +853,7 @@ async fn run_privacy(
     let asks_policy = acts
         .iter()
         .any(|act| matches!(act, PrivacyAct::AskPolicy));
+    let prior_ledger = ledger.clone();
 
     let annotated = text_owned.as_deref().map(|text| {
         std::fs::read_to_string(config_path)
@@ -900,6 +901,45 @@ async fn run_privacy(
             ));
         }
     }
+
+    let answer_report = if parsed_facts.len() > 1 {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut claims = Vec::new();
+        let mut quasi_identifiers = std::collections::BTreeSet::new();
+        for (subject, predicate, object) in &parsed_facts {
+            if !seen.insert((subject.clone(), predicate.clone(), object.clone())) {
+                continue;
+            }
+            let category = policy.classify_predicate(predicate);
+            if category.is_personal() {
+                quasi_identifiers.insert(predicate.clone());
+            }
+            claims.push(FusedClaim {
+                claim_id: format!("fact-{:03}", claims.len() + 1),
+                text: format!("{} {} {}", subject, predicate, object),
+                atoms: vec![ClaimAtom::new(subject, predicate, object)],
+                warrant: ClaimWarrant {
+                    level: WarrantLevel::Deductive,
+                    channels: [EvidenceChannel::Deductive].into_iter().collect(),
+                    sources: ["privacy_cli".to_string()].into_iter().collect(),
+                },
+            });
+        }
+        let config = AnswerDisclosureConfig {
+            requested_precision: requested,
+            quasi_identifiers,
+            ..AnswerDisclosureConfig::default()
+        };
+        Some(disclosure_fusion::decode_answer(
+            &policy,
+            &graph,
+            &prior_ledger,
+            &claims,
+            &config,
+        ))
+    } else {
+        None
+    };
 
     let audit_summary = if decisions.is_empty() {
         None
@@ -950,6 +990,7 @@ async fn run_privacy(
             "policy_summary": policy.render_summary(),
             "acts": acts,
             "audit_summary": audit_summary,
+            "answer_report": answer_report,
             "facts": fact_reports,
             "ledger": ledger,
             "ledger_digest": ledger.digest(),
@@ -1027,6 +1068,9 @@ async fn run_privacy(
                 render_privacy_decision(subject, predicate, object, decision)
             );
         }
+    }
+    if let Some(report) = &answer_report {
+        println!("{}", report.render_zh());
     }
     if let Some(summary) = &audit_summary {
         println!("{}", summary.render());
