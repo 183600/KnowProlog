@@ -2,12 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contextual_rag::{
-    AnswerExpectation, EvidenceAssembly, EvidenceBundle, EvidenceItem,
-};
-use crate::dense_retrieval::{
-    DenseRetriever, RetrievalHit, SearchBudget, SearchConstraints,
-};
+use crate::contextual_rag::{AnswerExpectation, EvidenceAssembly, EvidenceBundle, EvidenceItem};
+use crate::dense_retrieval::{DenseRetriever, RetrievalHit, SearchBudget, SearchConstraints};
 use crate::holographic_memory::HolographicMemory;
 
 const DEFAULT_PAGE_SIZE: usize = 3;
@@ -81,7 +77,15 @@ impl SearchMode {
             return Self::Verify;
         }
         if [
-            "哪些", "都有谁", "有谁", "列出", "所有", "全部", "几个", "多少位", "多少人",
+            "哪些",
+            "都有谁",
+            "有谁",
+            "列出",
+            "所有",
+            "全部",
+            "几个",
+            "多少位",
+            "多少人",
         ]
         .iter()
         .any(|cue| question.contains(cue))
@@ -502,7 +506,9 @@ impl SearchBackend for HoloSearchBackend<'_> {
         hits.truncate(request.normalized_max_results());
         let mut notes = Vec::new();
         if raw == 0 {
-            notes.push("全息通道需要主体+谓词、主体+客体或谓词+客体三个约束中的至少两个。".to_string());
+            notes.push(
+                "全息通道需要主体+谓词、主体+客体或谓词+客体三个约束中的至少两个。".to_string(),
+            );
         }
         if dropped > 0 {
             notes.push(format!("丢弃 {} 条未通过硬核查的全息候选。", dropped));
@@ -577,7 +583,10 @@ pub struct PortOutcome {
     pub batches: Vec<SearchBatch>,
 }
 
-fn merge_batches(batches: &[SearchBatch], request: &SearchRequest) -> (Vec<SearchHit>, PortReceipt) {
+fn merge_batches(
+    batches: &[SearchBatch],
+    request: &SearchRequest,
+) -> (Vec<SearchHit>, PortReceipt) {
     let mut merged: BTreeMap<(String, String, String), SearchHit> = BTreeMap::new();
     for batch in batches {
         for hit in &batch.hits {
@@ -631,9 +640,7 @@ fn merge_batches(batches: &[SearchBatch], request: &SearchRequest) -> (Vec<Searc
         top_k: max_results,
         bound_pruned: batches.iter().map(|batch| batch.receipt.bound_pruned).sum(),
         budget_exhausted: batches.iter().any(|batch| batch.receipt.budget_exhausted),
-        certified_top_k: batches.len() == 1
-            && batches[0].receipt.certified_top_k
-            && !truncated,
+        certified_top_k: batches.len() == 1 && batches[0].receipt.certified_top_k && !truncated,
         channels: batches
             .iter()
             .flat_map(|batch| batch.receipt.channels.iter().cloned())
@@ -644,9 +651,7 @@ fn merge_batches(batches: &[SearchBatch], request: &SearchRequest) -> (Vec<Searc
     receipt.channels.dedup();
     for batch in batches {
         for note in &batch.receipt.notes {
-            receipt
-                .notes
-                .push(format!("[{}] {}", batch.channel, note));
+            receipt.notes.push(format!("[{}] {}", batch.channel, note));
         }
     }
     if batches.len() > 1 {
@@ -966,10 +971,7 @@ fn retain_matching(set: &mut ResultSet, needle: &str, keep_matching: bool) -> St
         return format!("上一轮结果集里没有包含「{}」的条目。", needle);
     }
     if set.entries.is_empty() {
-        return format!(
-            "按「{}」处理后结果集为空：没有找到满足条件的证据。",
-            needle
-        );
+        return format!("按「{}」处理后结果集为空：没有找到满足条件的证据。", needle);
     }
     let verb = if keep_matching { "细化" } else { "排除" };
     let mut output = format!(
@@ -987,7 +989,9 @@ fn retain_matching(set: &mut ResultSet, needle: &str, keep_matching: bool) -> St
 }
 
 pub fn parse_followup(question: &str) -> Option<FollowUpAction> {
-    let question = question.trim().trim_end_matches(['?', '？', '。', '!', '！', ' ']);
+    let question = question
+        .trim()
+        .trim_end_matches(['?', '？', '。', '!', '！', ' ']);
     if question.is_empty() {
         return None;
     }
@@ -1125,11 +1129,13 @@ fn parse_exclude(question: &str) -> Option<String> {
     }
     let (start, prefix_len) = found?;
     let rest = question[start + prefix_len..].trim_start_matches(['，', ',', '、', ' ']);
-    let cut = ["还有", "之外", "以外", "呢", "吗", "？", "?", "，", ",", "。", "."]
-        .iter()
-        .filter_map(|marker| rest.find(marker))
-        .min()
-        .unwrap_or(rest.len());
+    let cut = [
+        "还有", "之外", "以外", "呢", "吗", "？", "?", "，", ",", "。", ".",
+    ]
+    .iter()
+    .filter_map(|marker| rest.find(marker))
+    .min()
+    .unwrap_or(rest.len());
     let value = rest[..cut]
         .trim()
         .trim_end_matches('外')
@@ -1149,11 +1155,13 @@ fn parse_refine(question: &str) -> Option<String> {
             continue;
         };
         let rest = &question[index + prefix.len()..];
-        let cut = ["的呢", "呢", "吗", "？", "?", "。", ".", "，", ",", "是", "有"]
-            .iter()
-            .filter_map(|marker| rest.find(marker))
-            .min()
-            .unwrap_or(rest.len());
+        let cut = [
+            "的呢", "呢", "吗", "？", "?", "。", ".", "，", ",", "是", "有",
+        ]
+        .iter()
+        .filter_map(|marker| rest.find(marker))
+        .min()
+        .unwrap_or(rest.len());
         let value = rest[..cut].trim().trim_end_matches('的').trim();
         if !value.is_empty() {
             return Some(value.to_string());
@@ -1164,7 +1172,15 @@ fn parse_refine(question: &str) -> Option<String> {
 
 fn is_explain(question: &str) -> bool {
     [
-        "为什么", "依据", "证据", "出处", "来源", "解释", "怎么知道", "怎么得出", "凭什么",
+        "为什么",
+        "依据",
+        "证据",
+        "出处",
+        "来源",
+        "解释",
+        "怎么知道",
+        "怎么得出",
+        "凭什么",
     ]
     .iter()
     .any(|cue| question.contains(cue))
@@ -1371,7 +1387,10 @@ mod tests {
             SearchMode::from_question("张三的师傅是李四吗"),
             SearchMode::Verify
         );
-        assert_eq!(SearchMode::from_question("什么是知识图谱"), SearchMode::Lookup);
+        assert_eq!(
+            SearchMode::from_question("什么是知识图谱"),
+            SearchMode::Lookup
+        );
 
         let request = SearchRequest::from_question(
             "张三有几个师傅",
@@ -1394,14 +1413,8 @@ mod tests {
             parse_followup("第二个是谁"),
             Some(FollowUpAction::Select(2))
         );
-        assert_eq!(
-            parse_followup("第十二条"),
-            Some(FollowUpAction::Select(12))
-        );
-        assert_eq!(
-            parse_followup("最后一条"),
-            Some(FollowUpAction::SelectLast)
-        );
+        assert_eq!(parse_followup("第十二条"), Some(FollowUpAction::Select(12)));
+        assert_eq!(parse_followup("最后一条"), Some(FollowUpAction::SelectLast));
         assert_eq!(
             parse_followup("除了李四还有谁"),
             Some(FollowUpAction::Exclude("李四".to_string()))
@@ -1450,9 +1463,7 @@ mod tests {
         assert!(refined.contains("赵六"), "{}", refined);
         assert!(!refined.contains("李四"), "{}", refined);
 
-        let explained = session
-            .respond(&FollowUpAction::Explain)
-            .expect("应可解释");
+        let explained = session.respond(&FollowUpAction::Explain).expect("应可解释");
         assert!(explained.contains("张三的师傅是谁"), "{}", explained);
         assert!(explained.contains("证据装配回执"), "{}", explained);
     }
