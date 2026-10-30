@@ -1194,7 +1194,7 @@ impl BindingTableStore {
                 .tables
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, table)| (table.revision, table.created_turn, table.id.clone()))
+                .min_by_key(|(index, table)| (table.revision, table.created_turn, *index))
                 .map(|(index, _)| index);
             match victim {
                 Some(index) => {

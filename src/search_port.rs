@@ -2,9 +2,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::binding_table::{
+    from_fact_refs, BindingTable, BindingTableStore, Coverage, TableSource,
+};
 use crate::contextual_rag::{AnswerExpectation, EvidenceAssembly, EvidenceBundle, EvidenceItem};
 use crate::dense_retrieval::{DenseRetriever, RetrievalHit, SearchBudget, SearchConstraints};
 use crate::holographic_memory::HolographicMemory;
+use crate::provenance::FactRef;
 
 const DEFAULT_PAGE_SIZE: usize = 3;
 const DEFAULT_MAX_ENTRIES: usize = 24;
@@ -956,6 +960,8 @@ pub struct SearchSession {
     last: Option<ResultSet>,
     page_size: usize,
     max_entries: usize,
+    tables: BindingTableStore,
+    last_table_id: Option<String>,
 }
 
 impl Default for SearchSession {
@@ -971,11 +977,15 @@ impl SearchSession {
             last: None,
             page_size: config.page_size,
             max_entries: config.max_entries,
+            tables: BindingTableStore::new(),
+            last_table_id: None,
         }
     }
 
     pub fn clear(&mut self) {
         self.last = None;
+        self.tables.clear();
+        self.last_table_id = None;
     }
 
     pub fn has_result_set(&self) -> bool {
@@ -986,14 +996,72 @@ impl SearchSession {
         self.last.as_ref()
     }
 
+    /// 会话内最近一次求解落成的绑定表。
+    pub fn last_table(&self) -> Option<&BindingTable> {
+        let id = self.last_table_id.as_deref()?;
+        self.tables.get(id)
+    }
+
+    /// 会话内所有仍有界保存的绑定表。
+    pub fn tables(&self) -> &BindingTableStore {
+        &self.tables
+    }
+
+    fn record_table(
+        &mut self,
+        question: &str,
+        facts: Vec<FactRef>,
+        coverage: Coverage,
+        revision: u64,
+        source: TableSource,
+    ) {
+        if facts.is_empty() {
+            return;
+        }
+        let Ok(table) = from_fact_refs(&facts, coverage, revision, source, question) else {
+            return;
+        };
+        if let Ok(receipt) = self.tables.insert(table) {
+            self.last_table_id = Some(receipt.id);
+        }
+    }
+
     pub fn record_assembly(&mut self, question: &str, assembly: &EvidenceAssembly) -> bool {
+        self.record_assembly_at(question, assembly, 0)
+    }
+
+    pub fn record_assembly_at(
+        &mut self,
+        question: &str,
+        assembly: &EvidenceAssembly,
+        revision: u64,
+    ) -> bool {
         let Some(bundle) = &assembly.bundle else {
             return false;
         };
         if bundle.items.is_empty() {
             return false;
         }
-        self.record(question, bundle, assembly.receipt.render_text())
+        let facts: Vec<FactRef> = bundle
+            .items
+            .iter()
+            .take(self.max_entries)
+            .map(|item| FactRef::new(&item.subject, &item.predicate, &item.object))
+            .collect();
+        let recorded = self.record(question, bundle, assembly.receipt.render_text());
+        if recorded {
+            self.record_table(
+                question,
+                facts,
+                Coverage::partial(format!(
+                    "证据装配返回前 {} 条候选，未证明完整",
+                    bundle.items.len().min(self.max_entries)
+                )),
+                revision,
+                TableSource::SearchPort,
+            );
+        }
+        recorded
     }
 
     pub fn record_search_hits(
@@ -1004,6 +1072,19 @@ impl SearchSession {
         predicate: Option<String>,
         hits: &[RetrievalHit],
         receipt: String,
+    ) -> bool {
+        self.record_search_hits_at(question, kind, anchor, predicate, hits, receipt, 0)
+    }
+
+    pub fn record_search_hits_at(
+        &mut self,
+        question: &str,
+        kind: &str,
+        anchor: Option<String>,
+        predicate: Option<String>,
+        hits: &[RetrievalHit],
+        receipt: String,
+        revision: u64,
     ) -> bool {
         let entries: Vec<SessionEntry> = hits
             .iter()
@@ -1022,6 +1103,11 @@ impl SearchSession {
         if entries.is_empty() {
             return false;
         }
+        let facts: Vec<FactRef> = entries
+            .iter()
+            .map(|entry| FactRef::new(&entry.subject, &entry.predicate, &entry.object))
+            .collect();
+        let count = entries.len();
         self.last = Some(ResultSet {
             question: question.trim().to_string(),
             kind: kind.to_string(),
@@ -1032,6 +1118,13 @@ impl SearchSession {
             cursor: 0,
             receipts: vec![receipt],
         });
+        self.record_table(
+            question,
+            facts,
+            Coverage::partial(format!("检索命中前 {} 条，未证明完整", count)),
+            revision,
+            TableSource::SearchPort,
+        );
         true
     }
 
@@ -1040,6 +1133,16 @@ impl SearchSession {
         question: &str,
         request: &SearchRequest,
         outcome: &PortOutcome,
+    ) -> bool {
+        self.record_port_outcome_at(question, request, outcome, 0)
+    }
+
+    pub fn record_port_outcome_at(
+        &mut self,
+        question: &str,
+        request: &SearchRequest,
+        outcome: &PortOutcome,
+        revision: u64,
     ) -> bool {
         let entries: Vec<SessionEntry> = outcome
             .hits
@@ -1051,6 +1154,11 @@ impl SearchSession {
         if entries.is_empty() {
             return false;
         }
+        let facts: Vec<FactRef> = entries
+            .iter()
+            .map(|entry| FactRef::new(&entry.subject, &entry.predicate, &entry.object))
+            .collect();
+        let count = entries.len();
         self.last = Some(ResultSet {
             question: question.trim().to_string(),
             kind: format!("语义检索:{}", request.mode.label()),
@@ -1061,6 +1169,17 @@ impl SearchSession {
             cursor: 0,
             receipts: vec![outcome.receipt.render_text()],
         });
+        self.record_table(
+            question,
+            facts,
+            Coverage::partial(format!(
+                "语义检索模式 {} 返回前 {} 条，未证明完整",
+                request.mode.label(),
+                count
+            )),
+            revision,
+            TableSource::SearchPort,
+        );
         true
     }
 
@@ -1185,12 +1304,7 @@ fn explain(set: &ResultSet) -> String {
     output.trim_end().to_string()
 }
 
-fn refine_with<F>(
-    set: &mut ResultSet,
-    needle: &str,
-    max_entries: usize,
-    requery: F,
-) -> String
+fn refine_with<F>(set: &mut ResultSet, needle: &str, max_entries: usize, requery: F) -> String
 where
     F: FnOnce(&ResultSet, &str) -> Option<PortOutcome>,
 {
@@ -1935,12 +2049,15 @@ mod tests {
             batches: Vec::new(),
         };
         let refined = session
-            .respond_with(&FollowUpAction::Refine("钱七".to_string()), |set, needle| {
-                assert_eq!(needle, "钱七");
-                assert_eq!(set.anchor.as_deref(), Some("张三"));
-                assert_eq!(set.predicate.as_deref(), Some("师傅"));
-                Some(outcome)
-            })
+            .respond_with(
+                &FollowUpAction::Refine("钱七".to_string()),
+                |set, needle| {
+                    assert_eq!(needle, "钱七");
+                    assert_eq!(set.anchor.as_deref(), Some("张三"));
+                    assert_eq!(set.predicate.as_deref(), Some("师傅"));
+                    Some(outcome)
+                },
+            )
             .expect("应有上一轮结果集");
         assert!(refined.contains("有界重查"), "{}", refined);
         assert!(refined.contains("钱七"), "{}", refined);
@@ -1981,7 +2098,10 @@ mod tests {
         let last = session.last().expect("应保留上一轮结果集");
         assert_eq!(last.entries.len(), 3);
         assert!(last.kind.starts_with("有界重查"), "{}", last.kind);
-        assert!(last.receipts.iter().any(|receipt| receipt.contains("重查回执")));
+        assert!(last
+            .receipts
+            .iter()
+            .any(|receipt| receipt.contains("重查回执")));
     }
 
     #[test]
@@ -1998,5 +2118,49 @@ mod tests {
             .respond(&FollowUpAction::Exclude("不存在".to_string()))
             .expect("未命中应诚实说明");
         assert!(missing.contains("没有包含"), "{}", missing);
+    }
+
+    #[test]
+    fn session_records_evidence_backed_binding_table() {
+        let session = session();
+        let table = session.last_table().expect("证据装配成功后应落一张绑定表");
+        assert_eq!(table.row_count(), session.last().unwrap().entries.len());
+        assert!(matches!(
+            table.coverage,
+            crate::binding_table::Coverage::Partial { .. }
+        ));
+        assert!(table.rows.iter().all(|row| !row.evidence.is_empty()));
+        assert!(table
+            .evidence_facts()
+            .contains(&FactRef::new("张三", "师傅", "李四")));
+        assert_eq!(session.tables().len(), 1);
+    }
+
+    #[test]
+    fn session_tables_use_knowledge_revision_for_reuse_checks() {
+        let mut session = SearchSession::new(SearchSessionConfig {
+            enabled: true,
+            takeover: false,
+            page_size: 2,
+            max_entries: 10,
+        });
+        let request = dense_request();
+        let outcome = PortOutcome {
+            hits: vec![search_hit("张三", "师傅", "李四")],
+            receipt: PortReceipt::default(),
+            batches: Vec::new(),
+        };
+        assert!(session.record_port_outcome_at("张三的师傅是谁", &request, &outcome, 4));
+        let table = session.last_table().unwrap();
+        assert_eq!(table.revision, 4);
+        assert!(!table.rows_reusable_at(4), "检索 top-k 不能冒充完整结果");
+        let routes = session.tables().route(&table.shape, 4);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].id, table.id);
+        assert!(
+            routes[0]
+                .staleness(5, &routes[0].evidence_facts())
+                .revision_changed
+        );
     }
 }

@@ -373,8 +373,7 @@ impl SymbolicReasoner {
         let profile = self.attribute_profiles.profile(&request.attribute)?;
         let mut keys = vec![profile.canonical.clone()];
         keys.extend(profile.aliases.iter().cloned());
-        if let Some(label) =
-            crate::symbolic_generator::localized_predicate_key(&profile.canonical)
+        if let Some(label) = crate::symbolic_generator::localized_predicate_key(&profile.canonical)
         {
             keys.push(label.to_string());
         }
@@ -395,7 +394,11 @@ impl SymbolicReasoner {
         }
         let mut rendered = Vec::with_capacity(values.len());
         for raw in values {
-            rendered.push(render_quantity_in_requested_unit(&raw, requested_unit, profile)?);
+            rendered.push(render_quantity_in_requested_unit(
+                &raw,
+                requested_unit,
+                profile,
+            )?);
         }
         Some(format!(
             "根据知识图谱，{}的{}是{}。",
@@ -457,11 +460,10 @@ impl SymbolicReasoner {
             .bump_by("semantic_search_hits", observation.search.returned);
         self.perf
             .bump_by("semantic_assemblies", observation.assembly.assemblies);
-        self.perf
-            .bump_by(
-                "semantic_assembly_selected",
-                observation.assembly.selected_assemblies,
-            );
+        self.perf.bump_by(
+            "semantic_assembly_selected",
+            observation.assembly.selected_assemblies,
+        );
         for code in &observation.codes {
             self.perf.bump(&format!("semantic_code_{code}"));
         }
@@ -915,10 +917,7 @@ impl SymbolicReasoner {
         request
     }
 
-    pub fn semantic_search_question(
-        &self,
-        question: &str,
-    ) -> crate::search_port::PortOutcome {
+    pub fn semantic_search_question(&self, question: &str) -> crate::search_port::PortOutcome {
         let request = self.semantic_search_request(question);
         self.semantic_search(&request)
     }
@@ -947,9 +946,10 @@ impl SymbolicReasoner {
             return None;
         }
         let answer = outcome.render_answer(&request);
+        let revision = self.revision();
         self.search_session
             .lock()
-            .record_port_outcome(question, &request, &outcome);
+            .record_port_outcome_at(question, &request, &outcome, revision);
         self.perf.bump("semantic_port_answers");
         Some(answer)
     }
@@ -1146,9 +1146,10 @@ impl SymbolicReasoner {
         if !keys.is_empty() {
             *self.contextual_last.lock() = Some((question.trim().to_string(), keys));
             if self.config.search_session.enabled {
+                let revision = self.revision();
                 self.search_session
                     .lock()
-                    .record_assembly(question.trim(), &assembly);
+                    .record_assembly_at(question.trim(), &assembly, revision);
             }
         }
         Some(assembly)
@@ -1257,13 +1258,15 @@ impl SymbolicReasoner {
             let predicate = target_predicate
                 .clone()
                 .or_else(|| session_hits.first().map(|hit| hit.predicate.clone()));
-            self.search_session.lock().record_search_hits(
+            let revision = self.revision();
+            self.search_session.lock().record_search_hits_at(
                 question.trim(),
                 "证据索引",
                 entities.first().cloned(),
                 predicate,
                 &session_hits,
                 search.receipt.render_text(),
+                revision,
             );
         }
         Some(output.trim_end().to_string())
