@@ -99,6 +99,7 @@ pub mod law_book;
 pub mod lex_gate;
 pub mod lexical_memory;
 pub mod lexical_trace;
+pub mod lexical_transducer;
 pub mod link_eval;
 pub mod link_prediction;
 pub mod local_semantic_adapter;
