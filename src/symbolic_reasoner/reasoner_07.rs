@@ -607,10 +607,12 @@ impl SymbolicReasoner {
         if candidates.is_empty() {
             return None;
         }
-        Some(rewrite_retrieval::assess(
+        let schema = crate::query_canonical::CanonicalSchema::from_law_book(&self.laws);
+        Some(rewrite_retrieval::assess_with_schema(
             question,
             candidates,
             &self.config.rewrite_retrieval,
+            &schema,
             |query, k, constraints| {
                 self.evidence_search(query, k, constraints, SearchBudget::default())
             },

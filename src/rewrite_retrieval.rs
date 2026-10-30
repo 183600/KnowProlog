@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::dense_retrieval::{EvidenceSearch, RetrievalHit, SearchConstraints};
+use crate::query_canonical::{self, CanonicalSchema};
 use crate::query_planner::{QueryPlan, QueryPlanner};
 
 /// 报告方言：读取方据此拒绝把旧版报告当新版解释。
@@ -140,7 +141,12 @@ impl HypothesisCandidate {
     /// 关系核心能识别「张三的师傅是谁」与「张三师傅谁」这类计划形状
     /// 不同、逻辑问题相同的读法；超出核心的计划退回原计划键。
     pub fn key(&self) -> String {
-        crate::query_canonical::plan_key(&self.plan, &crate::query_canonical::CanonicalSchema::new())
+        self.key_with(&CanonicalSchema::new())
+    }
+
+    /// 带已声明律的规范身份：别名/互逆/对称谓词归一后再比较。
+    pub fn key_with(&self, schema: &CanonicalSchema) -> String {
+        query_canonical::plan_key(&self.plan, schema)
     }
 
     pub fn receipt(&self) -> String {
@@ -764,12 +770,20 @@ fn sigmoid(value: f64) -> f64 {
 }
 
 fn normalise_candidates(candidates: Vec<HypothesisCandidate>) -> Vec<HypothesisCandidate> {
+    normalise_candidates_with_schema(candidates, &CanonicalSchema::new())
+}
+
+fn normalise_candidates_with_schema(
+    candidates: Vec<HypothesisCandidate>,
+    schema: &CanonicalSchema,
+) -> Vec<HypothesisCandidate> {
     let mut by_key: BTreeMap<String, HypothesisCandidate> = BTreeMap::new();
     for candidate in candidates {
-        match by_key.get(&candidate.key()) {
+        let key = candidate.key_with(schema);
+        match by_key.get(&key) {
             Some(existing) if existing.source.priority() >= candidate.source.priority() => {}
             _ => {
-                by_key.insert(candidate.key(), candidate);
+                by_key.insert(key, candidate);
             }
         }
     }
@@ -975,13 +989,30 @@ pub fn assess<F>(
     question: &str,
     candidates: Vec<HypothesisCandidate>,
     config: &RewriteRetrievalConfig,
+    search: F,
+) -> Assessment
+where
+    F: FnMut(&str, usize, &SearchConstraints) -> EvidenceSearch,
+{
+    assess_with_schema(question, candidates, config, &CanonicalSchema::new(), search)
+}
+
+/// 与 [`assess`] 相同，但用调用方已声明的律归一候选身份。
+///
+/// 例如配置了「老师 = 师傅」别名时，两个来源提出的同一问题只保留更可靠的
+/// 那个；无法归一的计划仍按原计划比较，不会把不同问题合并。
+pub fn assess_with_schema<F>(
+    question: &str,
+    candidates: Vec<HypothesisCandidate>,
+    config: &RewriteRetrievalConfig,
+    schema: &CanonicalSchema,
     mut search: F,
 ) -> Assessment
 where
     F: FnMut(&str, usize, &SearchConstraints) -> EvidenceSearch,
 {
     let config = config.clamped();
-    let candidates = normalise_candidates(candidates);
+    let candidates = normalise_candidates_with_schema(candidates, schema);
     let mut hypotheses: Vec<HypothesisAssessment> = candidates
         .into_iter()
         .filter_map(|candidate| evaluate_hypothesis(candidate, &config, &mut search))
@@ -1005,7 +1036,11 @@ where
                     .priority()
                     .cmp(&left.candidate.source.priority())
             })
-            .then_with(|| left.candidate.key().cmp(&right.candidate.key()))
+            .then_with(|| {
+                left.candidate
+                    .key_with(schema)
+                    .cmp(&right.candidate.key_with(schema))
+            })
     });
 
     let mut notes = Vec::new();
@@ -1433,6 +1468,41 @@ mod tests {
             assessment.hypotheses[0].candidate.source,
             HypothesisSource::ExactPlan
         );
+    }
+
+    #[test]
+    fn schema_aware_dedup_merges_alias_readings() {
+        let alias = HypothesisCandidate::new(
+            HypothesisSource::SyntaxRewrite,
+            "alias:老师",
+            "张三老师是谁",
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "老师".to_string(),
+            },
+        );
+        let canonical = HypothesisCandidate::new(
+            HypothesisSource::ExactPlan,
+            "planner",
+            "张三师傅是谁",
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "师傅".to_string(),
+            },
+        );
+        assert_eq!(
+            normalise_candidates(vec![alias.clone(), canonical.clone()]).len(),
+            2
+        );
+        let mut schema = CanonicalSchema::new();
+        schema.declare_alias("老师", "师傅");
+        let merged = normalise_candidates_with_schema(vec![alias, canonical], &schema);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, HypothesisSource::ExactPlan);
+        assert_eq!(merged[0].plan, QueryPlan::FindObjectByPredicate {
+            subject: "张三".to_string(),
+            predicate: "师傅".to_string(),
+        });
     }
 
     #[test]
