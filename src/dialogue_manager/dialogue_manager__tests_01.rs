@@ -312,9 +312,14 @@
             .expect("两个义项应升级为澄清");
         let snapshot = manager.snapshot();
         assert!(snapshot.pending_reference.is_some());
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("dialogue.json");
+        manager
+            .save_to_path(path.to_str().unwrap())
+            .expect("快照应可落盘");
 
         let mut restored = DialogueManager::new();
-        restored.restore(&snapshot);
+        assert!(restored.restore_from_path(path.to_str().unwrap()));
         assert!(restored.pending_reference().is_some());
         let reply = restored
             .plan_reply("2", &knowledge)
