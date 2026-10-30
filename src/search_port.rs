@@ -67,6 +67,16 @@ impl SearchMode {
         }
     }
 
+    pub fn parse(label: &str) -> Option<Self> {
+        match label.trim().to_ascii_lowercase().as_str() {
+            "lookup" | "查询" | "查值" => Some(Self::Lookup),
+            "enumerate" | "枚举" | "列举" => Some(Self::Enumerate),
+            "describe" | "画像" | "描述" => Some(Self::Describe),
+            "verify" | "验证" | "核实" => Some(Self::Verify),
+            _ => None,
+        }
+    }
+
     pub fn from_question(question: &str) -> Self {
         let question = question.trim();
         if ["是不是", "是否", "对不对", "对吗", "真的吗"]
@@ -218,6 +228,13 @@ impl SearchHit {
 
     pub fn text(&self) -> String {
         format!("{} 的 {} 是 {}", self.subject, self.predicate, self.object)
+    }
+
+    pub fn breakdown(&self) -> String {
+        format!(
+            "总 {:.3} = 词面 {:.3} + 结构 {:.3} + 谓词 {:.3}",
+            self.score, self.lexical, self.structural, self.predicate_match
+        )
     }
 }
 
@@ -581,6 +598,142 @@ pub struct PortOutcome {
     pub hits: Vec<SearchHit>,
     pub receipt: PortReceipt,
     pub batches: Vec<SearchBatch>,
+}
+
+/// 一次检索的答案值视图：同一取值可能由多条证据支持，排序只看最高分。
+#[derive(Debug, Clone, Serialize)]
+pub struct AnswerValue {
+    pub value: String,
+    pub score: f64,
+    pub support: Vec<(String, String, String)>,
+    pub channels: Vec<String>,
+}
+
+impl PortOutcome {
+    /// 按问句形态把证据三元组投影成答案值：主体已知时取客体，客体已知时
+    /// 取主体；验证模式始终围绕待验证客体分组。排序使用 `total_cmp` 与
+    /// 稳定字典序，不依赖哈希迭代顺序。
+    pub fn answer_values(&self, request: &SearchRequest) -> Vec<AnswerValue> {
+        let use_object = match request.mode {
+            SearchMode::Verify => true,
+            _ => request.constraints.subject.is_some() || request.constraints.object.is_none(),
+        };
+        let mut grouped: BTreeMap<String, AnswerValue> = BTreeMap::new();
+        for hit in &self.hits {
+            let value = if use_object {
+                &hit.object
+            } else {
+                &hit.subject
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            let entry = grouped
+                .entry(value.to_string())
+                .or_insert_with(|| AnswerValue {
+                    value: value.to_string(),
+                    score: f64::NEG_INFINITY,
+                    support: Vec::new(),
+                    channels: Vec::new(),
+                });
+            entry.score = entry.score.max(hit.score);
+            for channel in &hit.channels {
+                if !entry.channels.contains(channel) {
+                    entry.channels.push(channel.clone());
+                }
+            }
+            let key = hit.key();
+            if !entry.support.contains(&key) {
+                entry.support.push(key);
+            }
+        }
+        let mut values: Vec<AnswerValue> = grouped.into_values().collect();
+        for value in &mut values {
+            value.channels.sort();
+            value.channels.dedup();
+        }
+        values.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.value.cmp(&right.value))
+        });
+        values
+    }
+
+    /// 证据约束下的端口答句：只引用本次检索返回的已核实证据，并附回执。
+    pub fn render_answer(&self, request: &SearchRequest) -> String {
+        let values = self.answer_values(request);
+        let mut output = String::new();
+        if values.is_empty() {
+            output.push_str("没有找到满足条件的已核实证据（检索失败不等于知识库中没有该事实）。\n");
+            output.push_str(&self.receipt.render_text());
+            return output.trim_end().to_string();
+        }
+        match request.mode {
+            SearchMode::Verify => {
+                if let Some(claim) = request.constraints.object.as_deref() {
+                    output.push_str(&format!(
+                        "是。语义检索端口找到支持「{}」的已核实证据。\n",
+                        claim
+                    ));
+                } else {
+                    output.push_str("语义检索端口找到已核实证据，但未指定待验证取值。\n");
+                }
+            }
+            SearchMode::Enumerate => {
+                output.push_str(&format!("语义检索端口找到 {} 个候选值：\n", values.len()));
+                for (index, value) in values.iter().enumerate() {
+                    output.push_str(&format!(
+                        "  {}. {}（{}）\n",
+                        index + 1,
+                        value.value,
+                        value
+                            .support
+                            .first()
+                            .map(render_support)
+                            .unwrap_or_else(|| "无证据键".to_string())
+                    ));
+                }
+            }
+            SearchMode::Lookup | SearchMode::Describe => {
+                if values.len() == 1 {
+                    output.push_str(&format!("语义检索端口答案：{}。\n", values[0].value));
+                } else {
+                    let joined = values
+                        .iter()
+                        .map(|value| value.value.clone())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    output.push_str(&format!(
+                        "语义检索端口找到 {} 个候选答案：{}。\n",
+                        values.len(),
+                        joined
+                    ));
+                }
+            }
+        }
+        output.push_str("证据：\n");
+        for hit in self.hits.iter().take(6) {
+            output.push_str(&format!(
+                "  - {}（{}；{}）\n",
+                hit.text(),
+                if hit.channels.is_empty() {
+                    "无通道".to_string()
+                } else {
+                    hit.channels.join("+")
+                },
+                hit.breakdown()
+            ));
+        }
+        output.push_str(&self.receipt.render_text());
+        output.trim_end().to_string()
+    }
+}
+
+fn render_support(key: &(String, String, String)) -> String {
+    format!("{} {} {}", key.0, key.1, key.2)
 }
 
 fn merge_batches(
@@ -1307,6 +1460,77 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("多通道融合")));
+    }
+
+    #[test]
+    fn port_groups_answer_values_with_evidence_support() {
+        let mut retriever = dense();
+        let request = dense_request();
+        let mut backend = DenseSearchBackend::new(&mut retriever);
+        let batch = backend.search(&request);
+        let outcome = PortOutcome {
+            hits: batch.hits.clone(),
+            receipt: batch.receipt.clone(),
+            batches: vec![batch],
+        };
+        let values = outcome.answer_values(&request);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["李四", "王五"]
+        );
+        assert!(values.iter().all(|value| !value.support.is_empty()));
+        assert!(values
+            .iter()
+            .all(|value| value.channels.contains(&"dense".to_string())));
+
+        let rendered = outcome.render_answer(&request);
+        assert!(rendered.contains("语义检索端口"), "{}", rendered);
+        assert!(rendered.contains("李四"), "{}", rendered);
+        assert!(rendered.contains("证据"), "{}", rendered);
+        assert!(rendered.contains("语义检索回执"), "{}", rendered);
+    }
+
+    #[test]
+    fn verify_mode_only_affirms_when_claim_has_evidence() {
+        let mut retriever = dense();
+        let mut backend = DenseSearchBackend::new(&mut retriever);
+        let mut request = dense_request();
+        request.mode = SearchMode::Verify;
+        request.constraints.object = Some("李四".to_string());
+        let batch = backend.search(&request);
+        let outcome = PortOutcome {
+            hits: batch.hits.clone(),
+            receipt: batch.receipt.clone(),
+            batches: vec![batch],
+        };
+        let rendered = outcome.render_answer(&request);
+        assert!(rendered.contains("是。"), "{}", rendered);
+        assert!(rendered.contains("李四"), "{}", rendered);
+
+        let mut missing = request.clone();
+        missing.constraints.object = Some("赵六".to_string());
+        let batch = backend.search(&missing);
+        let outcome = PortOutcome {
+            hits: batch.hits.clone(),
+            receipt: batch.receipt.clone(),
+            batches: vec![batch],
+        };
+        assert!(outcome.hits.is_empty());
+        let rendered = outcome.render_answer(&missing);
+        assert!(rendered.contains("没有找到"), "{}", rendered);
+        assert!(!rendered.contains("是。"), "{}", rendered);
+    }
+
+    #[test]
+    fn search_mode_parses_english_and_chinese_labels() {
+        assert_eq!(SearchMode::parse("lookup"), Some(SearchMode::Lookup));
+        assert_eq!(SearchMode::parse(" 枚举 "), Some(SearchMode::Enumerate));
+        assert_eq!(SearchMode::parse("Describe"), Some(SearchMode::Describe));
+        assert_eq!(SearchMode::parse("验证"), Some(SearchMode::Verify));
+        assert_eq!(SearchMode::parse("unknown"), None);
     }
 
     fn item(id: &str, subject: &str, predicate: &str, object: &str) -> EvidenceItem {
