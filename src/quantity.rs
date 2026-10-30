@@ -412,6 +412,36 @@ impl Quantity {
             self.dimension.canonical_unit()
         )
     }
+
+    /// 换算到指定单位后的数值（`value * factor + offset = base` 的逆运算）。
+    ///
+    /// 单位必须是已登记的写法且量纲一致；未知单位、跨量纲、零乘数都返回
+    /// `None`，调用方不得把「不能换算」猜测成原值。
+    pub fn value_in_unit(&self, unit_alias: &str) -> Option<f64> {
+        let (_, target) = lookup_unit_entry(unit_alias.trim())?;
+        if target.dimension != self.dimension || target.factor == 0.0 {
+            return None;
+        }
+        Some((self.base - target.offset) / target.factor)
+    }
+
+    /// 换算到指定单位后的写法，如 `2.26米` → `226厘米`。
+    ///
+    /// 保留原精确度前缀；目标单位与量纲不匹配时返回 `None`。
+    pub fn format_in_unit(&self, unit_alias: &str) -> Option<String> {
+        let alias = unit_alias.trim();
+        if alias.is_empty() {
+            return None;
+        }
+        let value = self.value_in_unit(alias)?;
+        let prefix = match self.exactness {
+            Exactness::Exact => "",
+            Exactness::Approximate => "约",
+            Exactness::AtLeast => "至少",
+            Exactness::AtMost => "至多",
+        };
+        Some(format!("{}{}{}", prefix, format_number(value), alias))
+    }
 }
 
 fn nearly_equal(left: f64, right: f64) -> bool {
@@ -1016,6 +1046,26 @@ mod tests {
         assert_eq!(parse_quantity("3.5吨").unwrap().format_canonical(), "3500千克");
         assert_eq!(parse_quantity("约20岁").unwrap().format_canonical(), "约20年");
         assert_eq!(parse_quantity("226").unwrap().format_canonical(), "226");
+    }
+
+    #[test]
+    fn display_unit_conversion_is_exact_and_dimension_guarded() {
+        let height = parse_quantity("2.26米").unwrap();
+        assert!((height.value_in_unit("厘米").unwrap() - 226.0).abs() < 1e-9);
+        assert_eq!(height.format_in_unit("厘米").as_deref(), Some("226厘米"));
+        assert_eq!(
+            parse_quantity("约2.26米")
+                .unwrap()
+                .format_in_unit("厘米")
+                .as_deref(),
+            Some("约226厘米")
+        );
+        assert_eq!(
+            parse_quantity("18岁").unwrap().format_in_unit("岁").as_deref(),
+            Some("18岁")
+        );
+        assert_eq!(height.format_in_unit("千克"), None);
+        assert_eq!(height.format_in_unit("不存在单位"), None);
     }
 
     #[test]
