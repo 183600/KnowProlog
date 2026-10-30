@@ -697,11 +697,12 @@ fn match_pattern_for_prolog(
 
         match pattern_elem {
             PatternElement::Pos(expected_pos) => {
-                // 匹配词性
+                // 匹配词性：沿词性本体闭包，`n` 接受 `nr/ns/nt/nz/vn/...`
                 if expected_pos == "nr" {
                     // 特殊处理人名：尝试组合相邻的nr和unknown词
                     if pos < tagged_words.len()
-                        && (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown")
+                        && (crate::pos_ontology::tag_matches("nr", &tagged_words[pos].pos)
+                            || tagged_words[pos].pos == "unknown")
                     {
                         let mut name_parts = vec![tagged_words[pos].text.clone()];
                         let mut next_pos = pos + 1;
@@ -715,7 +716,10 @@ fn match_pattern_for_prolog(
                         // 检查后续的unknown词是否应该合并
                         while next_pos < tagged_words.len()
                             && (tagged_words[next_pos].pos == "unknown"
-                                || tagged_words[next_pos].pos == "nr")
+                                || crate::pos_ontology::tag_matches(
+                                    "nr",
+                                    &tagged_words[next_pos].pos,
+                                ))
                         {
                             let next_text = tagged_words[next_pos].text.as_str();
                             if next_literal == Some(next_text)
@@ -737,9 +741,14 @@ fn match_pattern_for_prolog(
                     } else {
                         return None; // 不是人名
                     }
-                } else if pos < tagged_words.len() && tagged_words[pos].pos == *expected_pos {
-                    // 如果是名词性成分，提取为实体
-                    if expected_pos == "n" || expected_pos == "nr" || expected_pos == "ns" {
+                } else if pos < tagged_words.len()
+                    && crate::pos_ontology::tag_matches(
+                        expected_pos,
+                        &tagged_words[pos].pos,
+                    )
+                {
+                    // 如果是名词性成分，提取为实体（含 nt/nz/vn 等后代）
+                    if crate::pos_ontology::captures_entity(expected_pos) {
                         entities.push(tagged_words[pos].text.clone());
                     }
                     pos += 1;
@@ -795,7 +804,8 @@ fn match_pattern_for_prolog(
             PatternElement::Name => {
                 // 匹配人名
                 if pos < tagged_words.len()
-                    && (tagged_words[pos].pos == "nr" || tagged_words[pos].pos == "unknown")
+                    && (crate::pos_ontology::tag_matches("nr", &tagged_words[pos].pos)
+                        || tagged_words[pos].pos == "unknown")
                 {
                     entities.push(tagged_words[pos].text.clone());
                     pos += 1;
@@ -806,7 +816,7 @@ fn match_pattern_for_prolog(
             PatternElement::Number => {
                 // 匹配数字
                 if pos < tagged_words.len()
-                    && (tagged_words[pos].pos == "m"
+                    && (crate::pos_ontology::tag_matches("m", &tagged_words[pos].pos)
                         || tagged_words[pos].text.chars().all(|c| c.is_numeric()))
                 {
                     entities.push(tagged_words[pos].text.clone());
@@ -815,8 +825,25 @@ fn match_pattern_for_prolog(
                     return None; // 不是数字
                 }
             }
+            PatternElement::PosOrWord(expected_pos, expected_word) => {
+                if pos >= tagged_words.len() {
+                    return None;
+                }
+                let current = &tagged_words[pos];
+                let pos_hit = crate::pos_ontology::tag_matches(expected_pos, &current.pos);
+                let word_hit = current.text == *expected_word
+                    || current.text.contains(expected_word.as_str())
+                    || expected_word.contains(current.text.as_str());
+                if !pos_hit && !word_hit {
+                    return None;
+                }
+                if pos_hit && crate::pos_ontology::captures_entity(expected_pos) {
+                    entities.push(current.text.clone());
+                }
+                pos += 1;
+            }
             _ => {
-                // 其他情况直接跳过 (如 Any, Optional, Capture, PosOrWord)
+                // 其他情况直接跳过 (如 Any, Optional, Capture)
                 pos += 1;
             }
         }
@@ -969,6 +996,79 @@ mod tests {
         ]);
         let matched = match_pattern_for_prolog(&words, &pattern).expect("ns 模式应能匹配");
         assert_eq!(matched, vec!["法国".to_string()]);
+    }
+
+    #[test]
+    fn nominal_pattern_accepts_specific_noun_descendants() {
+        let pattern = pattern_from_strings(vec![
+            "n".to_string(),
+            "的".to_string(),
+            "作者".to_string(),
+            "是".to_string(),
+            "谁".to_string(),
+        ]);
+        let words = tagged(&[
+            ("鲁迅", "nr"),
+            ("的", "u"),
+            ("作者", "n"),
+            ("是", "v"),
+            ("谁", "r"),
+        ]);
+        let matched = match_pattern_for_prolog(&words, &pattern).expect("n 应覆盖 nr");
+        assert_eq!(matched, vec!["鲁迅".to_string()]);
+
+        let pattern = pattern_from_strings(vec![
+            "n".to_string(),
+            "和".to_string(),
+            "n".to_string(),
+            "什么".to_string(),
+            "关系".to_string(),
+        ]);
+        let words = tagged(&[
+            ("清华大学", "nt"),
+            ("和", "c"),
+            ("北京", "ns"),
+            ("什么", "r"),
+            ("关系", "n"),
+        ]);
+        let matched = match_pattern_for_prolog(&words, &pattern).expect("n 应覆盖 nt/ns");
+        assert_eq!(matched, vec!["清华大学".to_string(), "北京".to_string()]);
+    }
+
+    #[test]
+    fn verbal_pattern_accepts_verb_noun_and_person_tags_accept_variants() {
+        let pattern = pattern_from_strings(vec!["v".to_string()]);
+        for tag in ["v", "vn", "vd"] {
+            let words = tagged(&[("研究", tag)]);
+            assert!(
+                match_pattern_for_prolog(&words, &pattern).is_some(),
+                "v 应覆盖 {}",
+                tag
+            );
+        }
+        let pattern = pattern_from_strings(vec![
+            "nr".to_string(),
+            "多大".to_string(),
+        ]);
+        let words = tagged(&[("李明", "nrfg"), ("多大", "r")]);
+        assert!(match_pattern_for_prolog(&words, &pattern).is_some());
+    }
+
+    #[test]
+    fn pos_or_word_matches_either_evidence_source() {
+        let words = tagged(&[("研究", "vn")]);
+        let by_pos = vec![PatternElement::PosOrWord("v".to_string(), "学习".to_string())];
+        assert_eq!(
+            match_pattern_for_prolog(&words, &by_pos),
+            Some(Vec::<String>::new()),
+            "谓词性不捕获实体"
+        );
+        let by_word = vec![PatternElement::PosOrWord("n".to_string(), "研究".to_string())];
+        let words = tagged(&[("研究", "vn")]);
+        assert_eq!(
+            match_pattern_for_prolog(&words, &by_word),
+            Some(vec!["研究".to_string()])
+        );
     }
 
     fn test_config() -> crate::NlpConfig {
