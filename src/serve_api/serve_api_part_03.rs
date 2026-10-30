@@ -139,13 +139,13 @@ async fn handle_coref(request: &Request) -> Response {
         Ok(value) => value,
         Err(error) => return Response::error(400, &format!("invalid JSON: {error}")),
     };
-    let evidence: crate::coref_closure::CorefEvidence = match serde_json::from_value(payload.clone())
-    {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            return Response::error(400, &format!("invalid coref evidence: {error}"));
-        }
-    };
+    let evidence: crate::coref_closure::CorefEvidence =
+        match serde_json::from_value(payload.clone()) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Response::error(400, &format!("invalid coref evidence: {error}"));
+            }
+        };
     let resolve = payload.get("resolve").and_then(serde_json::Value::as_str);
     let closure = payload.get("closure").and_then(serde_json::Value::as_str);
     let predicate = payload.get("predicate").and_then(serde_json::Value::as_str);
@@ -171,8 +171,8 @@ async fn handle_coref(request: &Request) -> Response {
         "identity": build,
     });
     if let Some(surface) = resolve {
-        response["resolution"] = serde_json::to_value(build.resolve(surface))
-            .unwrap_or(serde_json::Value::Null);
+        response["resolution"] =
+            serde_json::to_value(build.resolve(surface)).unwrap_or(serde_json::Value::Null);
     }
     if let Some(start) = closure {
         let quotient = graph.quotient(&budget);
@@ -189,8 +189,8 @@ async fn handle_coref(request: &Request) -> Response {
             Err(error) => return Response::error(400, &error.to_string()),
         }
     }
-    response["quotient"] = serde_json::to_value(graph.quotient(&budget))
-        .unwrap_or(serde_json::Value::Null);
+    response["quotient"] =
+        serde_json::to_value(graph.quotient(&budget)).unwrap_or(serde_json::Value::Null);
     Response::json(200, &response)
 }
 

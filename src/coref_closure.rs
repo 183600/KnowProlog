@@ -45,9 +45,12 @@ pub const DEFAULT_COREF_MAX_NODES: usize = 256;
 pub const DEFAULT_COREF_MAX_EDGES: usize = 2_048;
 
 /// 恒等边类型：只表达「这两个词面在当前语境下指同一个实体」。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
+    #[default]
     Alias,
     Abbreviation,
     FullName,
@@ -65,12 +68,6 @@ pub enum IdentityKind {
     Correction,
     Binding,
     Explicit,
-}
-
-impl Default for IdentityKind {
-    fn default() -> Self {
-        IdentityKind::Alias
-    }
 }
 
 impl IdentityKind {
@@ -116,19 +113,16 @@ impl IdentityKind {
 }
 
 /// 非恒等边类型：描述「通过某个关系/角色可以找到实体」，但不表达同一性。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NonIdentityKind {
+    #[default]
     Description,
     Bridging,
     Role,
     Metonymy,
-}
-
-impl Default for NonIdentityKind {
-    fn default() -> Self {
-        NonIdentityKind::Description
-    }
 }
 
 impl NonIdentityKind {
@@ -143,18 +137,15 @@ impl NonIdentityKind {
 }
 
 /// 恒等边状态：活跃 / 被证据反驳 / 已过期（更正或忘记）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityEdgeStatus {
+    #[default]
     Active,
     Refuted,
     Expired,
-}
-
-impl Default for IdentityEdgeStatus {
-    fn default() -> Self {
-        IdentityEdgeStatus::Active
-    }
 }
 
 impl IdentityEdgeStatus {
@@ -786,7 +777,7 @@ impl CorefBuild {
 }
 
 /// 身份图：恒等边、非恒等边与关系边的统一入口。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CorefGraph {
     #[serde(default)]
     nodes: BTreeMap<String, CorefNode>,
@@ -808,19 +799,6 @@ struct CorefNode {
     types: BTreeSet<String>,
     #[serde(default)]
     canonical_order: Option<usize>,
-}
-
-impl Default for CorefGraph {
-    fn default() -> Self {
-        Self {
-            nodes: BTreeMap::new(),
-            identity_edges: Vec::new(),
-            non_identity_edges: Vec::new(),
-            relation_edges: Vec::new(),
-            next_canonical_order: 0,
-            types: None,
-        }
-    }
 }
 
 impl CorefGraph {
@@ -1614,7 +1592,7 @@ impl CorefGraph {
             while let Some((node, path)) = queue.pop_front() {
                 let neighbours = adjacency.get(&node);
                 if path.len() >= budget.max_hops {
-                    if neighbours.map_or(false, |list| {
+                    if neighbours.is_some_and(|list| {
                         list.iter().any(|(next, _, _)| {
                             member_set.contains(next) && !visited.contains(next)
                         })
@@ -2012,7 +1990,7 @@ impl QuotientGraph {
         };
         targets
             .iter()
-            .filter(|(_, predicates)| predicate.map_or(true, |wanted| predicates.contains(wanted)))
+            .filter(|(_, predicates)| predicate.is_none_or(|wanted| predicates.contains(wanted)))
             .map(|(target, _)| target.clone())
             .collect()
     }
@@ -2035,7 +2013,7 @@ impl QuotientGraph {
                     targets
                         .iter()
                         .filter(|(_, predicates)| {
-                            predicate.map_or(true, |wanted| predicates.contains(wanted))
+                            predicate.is_none_or(|wanted| predicates.contains(wanted))
                         })
                         .map(|(target, _)| target.clone())
                         .collect()
