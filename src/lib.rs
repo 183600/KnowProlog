@@ -144,6 +144,7 @@ pub mod quantifier;
 pub mod quantity;
 pub mod query_anchor;
 pub mod query_board;
+pub mod query_canonical;
 pub mod query_planner;
 pub mod query_rewrite;
 pub mod query_scenario;

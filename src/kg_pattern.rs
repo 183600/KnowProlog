@@ -292,6 +292,64 @@ impl KgPattern {
         self.semantic_identity().fingerprint
     }
 
+    /// 压成查询身份层的关系核心（用于跨 QueryPlan / GraphPattern 比较）。
+    ///
+    /// 变量谓词不是具体问题，而是需要运行时接地的模板；这里显式拒绝，
+    /// 避免把模板误当成已归一的问题身份。
+    pub fn relation_core(
+        &self,
+    ) -> Result<crate::query_canonical::RelationCore, crate::query_canonical::CanonicalError>
+    {
+        use crate::query_canonical::{CanonicalError, CoreAtom, CoreFilter, CoreTerm, RelationCore};
+        let term = |term: &KgTerm| match term {
+            KgTerm::Var(name) => CoreTerm::Var(name.clone()),
+            KgTerm::Const(value) => CoreTerm::Const(value.clone()),
+        };
+        let mut atoms = Vec::with_capacity(self.atoms.len());
+        for atom in &self.atoms {
+            let predicate = match &atom.predicate {
+                KgTerm::Const(value) => value.clone(),
+                KgTerm::Var(name) => {
+                    return Err(CanonicalError::UnsupportedPattern(format!(
+                        "谓词变量 ?{} 需要运行时接地",
+                        name
+                    )))
+                }
+            };
+            atoms.push(CoreAtom::new(term(&atom.subject), predicate, term(&atom.object)));
+        }
+        let filters = self
+            .filters
+            .iter()
+            .map(|filter| match filter {
+                KgFilter::Equal { var, value } => CoreFilter::Equal {
+                    var: var.clone(),
+                    value: value.clone(),
+                },
+                KgFilter::NotEqual { var, value } => CoreFilter::NotEqual {
+                    var: var.clone(),
+                    value: value.clone(),
+                },
+                KgFilter::Type { var, of } => CoreFilter::Type {
+                    var: var.clone(),
+                    of: of.clone(),
+                },
+                KgFilter::NotType { var, of } => CoreFilter::NotType {
+                    var: var.clone(),
+                    of: of.clone(),
+                },
+            })
+            .collect();
+        Ok(RelationCore {
+            atoms,
+            filters,
+            select: self.select.clone(),
+            count: self.count_only,
+            distinct: true,
+            negated: false,
+        })
+    }
+
     /// 可审计的语义身份：指纹、规范材料与标号是否完整。
     pub fn semantic_identity(&self) -> KgPatternIdentity {
         let mut atoms = self.atoms.clone();
