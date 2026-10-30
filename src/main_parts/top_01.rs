@@ -12,6 +12,7 @@ use know_prolog::{
         LedgerLoad as BatchLedgerLoad,
     },
     binding_frames::FrameProgram,
+    binding_table::{from_fact_refs, Coverage, TableSource},
     chronicle::{Chronicle, EntityRef, FsyncPolicy},
     config_contract,
     contextual_reference::{
@@ -1137,6 +1138,10 @@ enum Commands {
         /// Print answers, hits and the receipt as JSON
         #[arg(long)]
         json: bool,
+        /// Also print the evidence-backed binding table with its coverage
+        /// scope and knowledge revision
+        #[arg(long)]
+        table: bool,
     },
     /// Arbitrate query readings (exact plan / syntax rewrite / anchoring)
     /// with dense-retrieval evidence and print the three-way decision receipt

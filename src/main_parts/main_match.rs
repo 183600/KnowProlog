@@ -994,6 +994,7 @@
             k,
             max_scanned,
             json,
+            table,
         }) => {
             let facts = match oxigraph_manager.load_graph_snapshot().await {
                 Ok(facts) => facts,
@@ -1045,6 +1046,29 @@
             }
             request.budget = SearchBudget { max_scanned };
             let outcome = reasoner.semantic_search(&request);
+            let table_facts: Vec<know_prolog::provenance::FactRef> = outcome
+                .hits
+                .iter()
+                .map(|hit| {
+                    know_prolog::provenance::FactRef::new(
+                        &hit.subject,
+                        &hit.predicate,
+                        &hit.object,
+                    )
+                })
+                .collect();
+            let binding_table = from_fact_refs(
+                &table_facts,
+                Coverage::partial(format!(
+                    "语义检索 {} 返回前 {} 条候选，未证明完整",
+                    request.mode.label(),
+                    table_facts.len()
+                )),
+                oxigraph_manager.revision(),
+                TableSource::SearchPort,
+                &question,
+            )
+            .ok();
             if json {
                 let payload = serde_json::json!({
                     "question": question,
@@ -1053,6 +1077,7 @@
                     "hits": outcome.hits,
                     "receipt": outcome.receipt,
                     "batches": outcome.batches,
+                    "binding_table": binding_table,
                 });
                 match serde_json::to_string_pretty(&payload) {
                     Ok(text) => println!("{}", text),
@@ -1063,6 +1088,12 @@
                 }
             } else {
                 println!("{}", outcome.render_answer(&request));
+                if table {
+                    match &binding_table {
+                        Some(binding_table) => println!("\n{}", binding_table.render()),
+                        None => println!("\n绑定表：（没有可落表的证据行）"),
+                    }
+                }
             }
         }
         Some(Commands::RewriteRetrieval {
