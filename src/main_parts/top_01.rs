@@ -1406,6 +1406,21 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Show the lexical transducer's surface → sense decisions, with an
+    /// optional canonical form to echo back through the session ledger
+    Transduce {
+        /// Text to transduce; "-" or omission reads newline-delimited text from stdin
+        text: Option<String>,
+        /// Canonical form to echo back (uses recent user surface when reversible)
+        #[arg(long)]
+        echo: Option<String>,
+        /// Restrict rules to one layer: entity / predicate / type
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print the transduction as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Audit persisted artifacts (knowledge `rustfmt --check`): canonical /
     /// non-canonical / damaged / missing, with optional atomic `--fix`
     Artifacts {

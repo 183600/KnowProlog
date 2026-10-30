@@ -264,6 +264,22 @@ async fn main() {
         );
         return;
     }
+    if let Some(Commands::Transduce {
+        text,
+        echo,
+        kind,
+        json,
+    }) = &cli.command
+    {
+        run_transduce(
+            &config,
+            text.as_deref(),
+            echo.as_deref(),
+            kind.as_deref(),
+            *json,
+        );
+        return;
+    }
     if let Some(Commands::BatchTeach {
         facts,
         corpus,

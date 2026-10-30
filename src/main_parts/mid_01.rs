@@ -462,6 +462,126 @@ fn run_dialogue_artifacts(
     }
 }
 
+fn run_transduce(
+    config: &know_prolog::SystemConfig,
+    text: Option<&str>,
+    echo: Option<&str>,
+    kind: Option<&str>,
+    json: bool,
+) {
+    use know_prolog::lexical_transducer::{
+        EchoLedger, LexicalTransducer, TransducerOptions,
+    };
+    use know_prolog::mention_lexicon::MentionLexicon;
+    use know_prolog::synonym_graph::{SynonymContext, SynonymGraph, SynonymKind};
+    use know_prolog::type_system::TypeSystem;
+
+    let graph = SynonymGraph::from_config(config, 1);
+    let mut lexicon = MentionLexicon::new();
+    for profile in &config.entity_profiles {
+        let etype = profile.etype.first().map(String::as_str);
+        lexicon.confirm(&profile.name, &profile.name, etype, "config");
+        for alias in &profile.aliases {
+            lexicon.confirm(alias, &profile.name, etype, "entity_profile");
+        }
+    }
+    let flat = config
+        .synonyms
+        .as_ref()
+        .map(|synonyms| synonyms.mappings.clone())
+        .unwrap_or_default();
+    let transducer =
+        LexicalTransducer::compile(&graph, &lexicon, &flat, TransducerOptions::default());
+    let types = TypeSystem::from_config(&config.type_system);
+    let context = SynonymContext::new();
+    let kind_filter = match kind {
+        Some(value) => match SynonymKind::parse(value) {
+            Some(kind) => Some(kind),
+            None => {
+                eprintln!("未知词法层「{}」：可选 entity / predicate / type", value);
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
+    let mut inputs: Vec<String> = Vec::new();
+    match text {
+        Some("-") | None => {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(line) => {
+                        if !line.trim().is_empty() {
+                            inputs.push(line);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("读取标准输入失败：{}", error);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        Some(text) => inputs.push(text.to_string()),
+    }
+    if inputs.is_empty() && echo.is_none() {
+        eprintln!("没有可转导的文本；请给出文本参数或通过标准输入提供。");
+        std::process::exit(1);
+    }
+
+    let mut ledger = EchoLedger::new();
+    let mut results = Vec::new();
+    for (index, input) in inputs.iter().enumerate() {
+        ledger.begin_turn(index as u64 + 1);
+        let transduction =
+            transducer.transduce_with_kind(input, &context, kind_filter, |left, right| {
+                types.types_compatible(left, right)
+            });
+        ledger.observe_all(&transduction);
+        let echo_choice = echo.map(|canonical| {
+            let kind = graph
+                .entries()
+                .find(|entry| {
+                    entry.is_confirmed()
+                        && entry.canonical == canonical
+                        && entry.kind == SynonymKind::Entity
+                })
+                .map(|entry| entry.kind)
+                .unwrap_or(SynonymKind::Entity);
+            ledger.choose(&graph, canonical, kind, &context)
+        });
+        if json {
+            results.push(serde_json::json!({
+                "text": input,
+                "transduction": transduction,
+                "echo": echo_choice,
+            }));
+        } else {
+            println!("{}", transduction.render_report());
+            if let Some(choice) = &echo_choice {
+                println!(
+                    "回声：「{}」→「{}」（{}，可逆：{}）",
+                    choice.canonical, choice.surface, choice.source, choice.reversible
+                );
+            }
+            if index + 1 < inputs.len() {
+                println!();
+            }
+        }
+    }
+    if json {
+        match serde_json::to_string_pretty(&results) {
+            Ok(output) => println!("{}", output),
+            Err(error) => {
+                eprintln!("转导结果序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// `artifacts`：工件审计（知识版 `rustfmt --check`）。
 ///
 /// 扫描已知持久化工件，按「解码 → 规范重编码 → 与磁盘比对」分类；

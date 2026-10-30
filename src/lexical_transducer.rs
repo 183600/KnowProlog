@@ -397,6 +397,19 @@ impl LexicalTransducer {
     where
         F: Fn(&str, &str) -> bool,
     {
+        self.transduce_with_kind(text, context, None, type_compatible)
+    }
+
+    pub fn transduce_with_kind<F>(
+        &self,
+        text: &str,
+        context: &SynonymContext,
+        kind_filter: Option<SynonymKind>,
+        type_compatible: F,
+    ) -> Transduction
+    where
+        F: Fn(&str, &str) -> bool,
+    {
         let projection = TextProjection::new(text, Default::default());
         let normalized = projection.normalized();
         let chars: Vec<char> = normalized.chars().collect();
@@ -408,7 +421,11 @@ impl LexicalTransducer {
         let selected = self.select_spans(&chars);
         let mut tokens: Vec<TransducedToken> = Vec::with_capacity(selected.len());
         for (start, end, surface) in selected {
-            let rules = self.rules_for(&surface);
+            let rules: Vec<&TransducerRule> = self
+                .rules_for(&surface)
+                .into_iter()
+                .filter(|rule| kind_filter.map_or(true, |kind| rule.kind == kind))
+                .collect();
             if rules.is_empty() {
                 continue;
             }
@@ -979,6 +996,31 @@ mod tests {
         let fallback = ledger.choose(&graph, "妻子", SynonymKind::Entity, &SynonymContext::new());
         assert_ne!(fallback.surface, "妻子");
         assert!(fallback.reversible);
+    }
+
+    #[test]
+    fn kind_filter_resolves_cross_layer_homographs() {
+        let transducer = LexicalTransducer::new(
+            vec![
+                TransducerRule::new("老婆", "妻子", SynonymKind::Entity, "n"),
+                TransducerRule::new("老婆", "配偶", SynonymKind::Predicate, "v"),
+            ],
+            TransducerOptions::default(),
+        );
+        let entity = transducer.transduce_with_kind(
+            "我老婆是老师",
+            &SynonymContext::new(),
+            Some(SynonymKind::Entity),
+            |left, right| left == right,
+        );
+        assert_eq!(entity.normalized, "我妻子是老师");
+        let predicate = transducer.transduce_with_kind(
+            "我老婆是老师",
+            &SynonymContext::new(),
+            Some(SynonymKind::Predicate),
+            |left, right| left == right,
+        );
+        assert_eq!(predicate.normalized, "我配偶是老师");
     }
 
     #[test]
