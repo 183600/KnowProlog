@@ -867,15 +867,22 @@ pub struct KnowledgeExtractor {
     config: Arc<SystemConfig>,
     semantic_grammar: semantic_grammar::RulePack,
     semantic_grammar_enabled: bool,
+    attribute_registry: attribute_bridge::AttributeRegistry,
+    type_system: type_system::TypeSystem,
 }
 impl KnowledgeExtractor {
     pub fn new(config: Arc<SystemConfig>) -> Self {
         let semantic_grammar = semantic_grammar::RulePack::from_config(&config);
         let semantic_grammar_enabled = config.semantic_grammar.enabled;
+        let attribute_registry =
+            attribute_bridge::AttributeRegistry::from_config(&config.attributes);
+        let type_system = type_system::TypeSystem::from_config(&config.type_system);
         Self {
             config,
             semantic_grammar,
             semantic_grammar_enabled,
+            attribute_registry,
+            type_system,
         }
     }
 
@@ -890,6 +897,12 @@ impl KnowledgeExtractor {
 
         if self.semantic_grammar_enabled {
             items.extend(self.semantic_grammar.extract_items(tagged_words));
+        }
+
+        if self.config.attributes.enabled {
+            for item in self.extract_attribute_items(text, tagged_words) {
+                merge_attribute_item(&mut items, item);
+            }
         }
 
         if text.contains("，") || text.contains("；") || text.contains("。") {
@@ -908,6 +921,47 @@ impl KnowledgeExtractor {
             }
         }
 
+        items
+    }
+
+    /// 本体引导的属性候选：只有命中已登记词面且通过值类型/量纲校验的
+    /// 断言才进入落库队列。主体类型未知时按开放世界接受并保留规范化值。
+    fn extract_attribute_items(
+        &self,
+        text: &str,
+        tagged_words: &[TaggedWord],
+    ) -> Vec<KnowledgeItem> {
+        if self.attribute_registry.is_empty() {
+            return Vec::new();
+        }
+        let mut items = Vec::new();
+        for mention in self.attribute_registry.extract_mentions(text, tagged_words) {
+            let assessment = self.attribute_registry.assess(
+                &self.type_system,
+                &BTreeSet::new(),
+                &mention.attribute,
+                &mention.raw_value,
+            );
+            if !assessment.is_accepted() {
+                continue;
+            }
+            let Some(value) = assessment.value() else {
+                continue;
+            };
+            let Some(profile) = self.attribute_registry.resolve(&mention.attribute) else {
+                continue;
+            };
+            let label = profile
+                .domain
+                .iter()
+                .next()
+                .cloned()
+                .unwrap_or_else(|| "Entity".to_string());
+            let mut properties = HashMap::new();
+            properties.insert("name".to_string(), mention.subject);
+            properties.insert(profile.canonical.clone(), value.to_string());
+            items.push(KnowledgeItem::Entity { label, properties });
+        }
         items
     }
 
@@ -1074,6 +1128,47 @@ impl KnowledgeExtractor {
         None
     }
 }
+/// 同一句可能同时命中旧抽取规则与属性本体桥：按主体名合并，属性桥的
+/// 规范化取值覆盖原始字符串，避免同一事实以两种写法重复落库。
+fn merge_attribute_item(items: &mut Vec<KnowledgeItem>, incoming: KnowledgeItem) {
+    let KnowledgeItem::Entity {
+        label: incoming_label,
+        properties: incoming_properties,
+    } = incoming
+    else {
+        items.push(incoming);
+        return;
+    };
+    let Some(subject) = incoming_properties.get("name").cloned() else {
+        items.push(KnowledgeItem::Entity {
+            label: incoming_label,
+            properties: incoming_properties,
+        });
+        return;
+    };
+    for item in items.iter_mut() {
+        if let KnowledgeItem::Entity { label, properties } = item {
+            if properties.get("name").map(String::as_str) != Some(subject.as_str()) {
+                continue;
+            }
+            if matches!(label.as_str(), "" | "Entity") && incoming_label != "Entity" {
+                *label = incoming_label.clone();
+            }
+            for (key, value) in &incoming_properties {
+                if key == "name" {
+                    continue;
+                }
+                properties.insert(key.clone(), value.clone());
+            }
+            return;
+        }
+    }
+    items.push(KnowledgeItem::Entity {
+        label: incoming_label,
+        properties: incoming_properties,
+    });
+}
+
 // Oxigraph操作管理器
 pub struct OxigraphManager {
     store: Arc<Mutex<Store>>,

@@ -836,6 +836,60 @@ required = true
 name = "property"
 data_type = "string"
 required = false
+# 属性本体桥：属性词面、定义域、值类型与规范单位。
+# 命中词面的「主体 + 属性 + 值」会先校验再折算到规范单位后落库；
+# 未登记属性不会被静默猜测，交给追问或后续登记。
+[attributes]
+enabled = true
+
+[[attributes.profiles]]
+name = "height"
+aliases = ["身高", "身长"]
+domain = ["Person"]
+value_type = "quantity"
+dimension = "length"
+unit = "厘米"
+functional = true
+description = "人物身高，统一折算为厘米"
+
+[[attributes.profiles]]
+name = "net_height"
+aliases = ["净身高"]
+domain = ["Person"]
+value_type = "quantity"
+dimension = "length"
+unit = "厘米"
+functional = true
+parent = "height"
+description = "净身高是身高的子属性"
+
+[[attributes.profiles]]
+name = "weight"
+aliases = ["体重"]
+domain = ["Person"]
+value_type = "quantity"
+dimension = "mass"
+unit = "千克"
+functional = true
+description = "人物体重，统一折算为千克"
+
+[[attributes.profiles]]
+name = "age"
+aliases = ["年龄"]
+domain = ["Person"]
+value_type = "quantity"
+dimension = "duration"
+unit = "岁"
+functional = true
+description = "人物年龄，统一折算为岁"
+
+[[attributes.profiles]]
+name = "birthplace"
+aliases = ["出生地", "籍贯"]
+domain = ["Person"]
+value_type = "string"
+description = "人物出生地"
+
 # 基础提取规则
 [[extraction_rules]]
 name = "人物信息提取"
