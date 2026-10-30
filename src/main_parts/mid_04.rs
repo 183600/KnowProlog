@@ -814,7 +814,10 @@ async fn shape_report_for(
     let facts = oxigraph_manager.load_graph_snapshot().await?;
     let registry = oxigraph_manager.predicate_registry_snapshot();
     let types = oxigraph_manager.type_system_snapshot();
-    let shapes = ShapeSet::from_schema(&config.entity_types, &registry, &types);
+    let mut shapes = ShapeSet::from_schema(&config.entity_types, &registry, &types);
+    let attributes =
+        know_prolog::attribute_bridge::AttributeRegistry::from_config(&config.attributes);
+    shapes.apply_attribute_profiles(&attributes);
     let report = shapes.validate(&facts, &registry, &types);
     Ok((shapes, report))
 }
@@ -835,7 +838,10 @@ async fn acquisition_context(
     let facts = load_graph_snapshot(oxigraph_manager).await?;
     let registry = oxigraph_manager.predicate_registry_snapshot();
     let types = oxigraph_manager.type_system_snapshot();
-    let shapes = ShapeSet::from_schema(&config.entity_types, &registry, &types);
+    let mut shapes = ShapeSet::from_schema(&config.entity_types, &registry, &types);
+    let attributes =
+        know_prolog::attribute_bridge::AttributeRegistry::from_config(&config.attributes);
+    shapes.apply_attribute_profiles(&attributes);
     Ok((facts, registry, types, shapes))
 }
 

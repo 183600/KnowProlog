@@ -421,6 +421,25 @@ impl ShapeSet {
         fnv1a_hex(canonical_json(&value).as_bytes())
     }
 
+    /// 用属性本体桥覆盖/补充形状约束：
+    /// - 值类型以属性档案为准（例如 `integer` 改为 `quantity`）；
+    /// - 单值属性补上 `max_count = 1`；
+    /// - 字符串属性移除过窄的数值类型约束。
+    pub fn apply_attribute_profiles(
+        &mut self,
+        attributes: &crate::attribute_bridge::AttributeRegistry,
+    ) {
+        if attributes.is_empty() {
+            return;
+        }
+        for shape in self.nodes.iter_mut().flat_map(|node| node.properties.iter_mut()) {
+            apply_attribute_shape(shape, attributes);
+        }
+        for shape in &mut self.relations {
+            apply_attribute_shape(shape, attributes);
+        }
+    }
+
     pub fn resolve_predicate(&self, predicate: &str) -> (String, bool) {
         match self.aliases.get(predicate.trim()) {
             Some(alias) => (alias.canonical.clone(), alias.inverted),
@@ -1241,12 +1260,35 @@ fn normalize_datatype(raw: &str) -> Option<String> {
         "integer" | "int" => "integer",
         "float" | "double" | "number" => "number",
         "boolean" | "bool" => "boolean",
+        "quantity" | "数量" => "quantity",
         "date" => "date",
         "datetime" => "datetime",
         "time" => "time",
         _ => return None,
     };
     Some(canonical.to_string())
+}
+
+fn apply_attribute_shape(
+    shape: &mut PropertyShape,
+    attributes: &crate::attribute_bridge::AttributeRegistry,
+) {
+    let Some(profile) = attributes.resolve(&shape.path) else {
+        return;
+    };
+    use crate::attribute_bridge::AttributeValueType;
+    shape.datatype = match profile.value_type {
+        AttributeValueType::Quantity => Some("quantity".to_string()),
+        AttributeValueType::Integer => Some("integer".to_string()),
+        AttributeValueType::Number => Some("number".to_string()),
+        AttributeValueType::Boolean => Some("boolean".to_string()),
+        AttributeValueType::Date => Some("date".to_string()),
+        AttributeValueType::Datetime => Some("datetime".to_string()),
+        AttributeValueType::String | AttributeValueType::Any => None,
+    };
+    if profile.functional {
+        shape.max_count = Some(1);
+    }
 }
 
 pub fn datatype_conforms(expected: &str, value: &str) -> bool {
@@ -1259,6 +1301,7 @@ pub fn datatype_conforms(expected: &str, value: &str) -> bool {
             trimmed.to_ascii_lowercase().as_str(),
             "true" | "false" | "1" | "0" | "yes" | "no" | "是" | "否"
         ),
+        "quantity" => crate::quantity::parse_quantity(trimmed).is_some(),
         "date" => parse_date(trimmed).is_some(),
         "datetime" => {
             let (date, time) = trimmed
@@ -1697,6 +1740,59 @@ mod tests {
             .iter()
             .any(|violation| violation.constraint == ConstraintKind::Closed
                 && violation.actual.contains(&"age".to_string())));
+    }
+
+    #[test]
+    fn attribute_profiles_refine_shape_datatypes_and_cardinality() {
+        use crate::attribute_bridge::{
+            AttributeBridgeConfig, AttributeProfileConfig, AttributeRegistry, AttributeValueType,
+        };
+        let mut shapes = ShapeSet::from_schema(
+            &[entity_type(
+                "Person",
+                &[("name", "string", true), ("height", "integer", false)],
+            )],
+            &PredicateRegistry::new(),
+            &TypeSystem::new(),
+        );
+        let attributes = AttributeRegistry::from_config(&AttributeBridgeConfig {
+            enabled: true,
+            profiles: vec![AttributeProfileConfig {
+                name: "height".to_string(),
+                aliases: vec!["身高".to_string()],
+                domain: vec!["Person".to_string()],
+                value_type: AttributeValueType::Quantity,
+                dimension: Some("length".to_string()),
+                unit: Some("厘米".to_string()),
+                functional: true,
+                ..AttributeProfileConfig::default()
+            }],
+        });
+        shapes.apply_attribute_profiles(&attributes);
+        let height = shapes.nodes[0]
+            .properties
+            .iter()
+            .find(|property| property.path == "height")
+            .unwrap();
+        assert_eq!(height.datatype.as_deref(), Some("quantity"));
+        assert_eq!(height.max_count, Some(1));
+
+        let facts = vec![entity(
+            "姚明",
+            "Person",
+            &[("name", "姚明"), ("height", "226厘米")],
+        )];
+        let report = shapes.validate(&facts, &PredicateRegistry::new(), &TypeSystem::new());
+        assert!(
+            !report.violations.iter().any(|violation| {
+                violation.path == "height" && violation.constraint == ConstraintKind::Datatype
+            }),
+            "{:?}",
+            report.violations
+        );
+        assert!(datatype_conforms("quantity", "226厘米"));
+        assert!(datatype_conforms("quantity", "约2.26米"));
+        assert!(!datatype_conforms("quantity", "很高"));
     }
 
     #[test]
