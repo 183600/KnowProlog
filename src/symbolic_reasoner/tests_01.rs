@@ -1692,3 +1692,27 @@
             .iter()
             .all(|hit| hit.subject == "张三" && hit.predicate == "师傅"));
     }
+
+    #[test]
+    fn search_session_records_evidence_fallback_results() {
+        let mut config = test_config();
+        config.search_session = crate::search_port::SearchSessionConfig {
+            enabled: true,
+            page_size: 1,
+            max_entries: 12,
+        };
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let first = reasoner
+            .answer_by_evidence("张三的师傅是谁")
+            .expect("证据索引应作答");
+        assert!(first.contains("李四"), "{}", first);
+
+        let page = reasoner.answer("还有呢").expect("结果集应可翻页");
+        assert!(page.contains("李四"), "{}", page);
+        assert!(page.contains("这已是全部结果"), "{}", page);
+
+        let explanation = reasoner.answer("为什么").expect("结果集应可解释");
+        assert!(explanation.contains("张三的师傅是谁"), "{}", explanation);
+        assert!(explanation.contains("检索回执"), "{}", explanation);
+    }

@@ -746,6 +746,45 @@ impl SearchSession {
         self.record(question, bundle, assembly.receipt.render_text())
     }
 
+    pub fn record_search_hits(
+        &mut self,
+        question: &str,
+        kind: &str,
+        anchor: Option<String>,
+        predicate: Option<String>,
+        hits: &[RetrievalHit],
+        receipt: String,
+    ) -> bool {
+        let entries: Vec<SessionEntry> = hits
+            .iter()
+            .take(self.max_entries)
+            .enumerate()
+            .map(|(index, hit)| SessionEntry {
+                id: format!("E{}", index + 1),
+                subject: hit.subject.clone(),
+                predicate: hit.predicate.clone(),
+                object: hit.object.clone(),
+                score: hit.score,
+                channels: vec!["dense".to_string()],
+                reasons: hit.reasons.clone(),
+            })
+            .collect();
+        if entries.is_empty() {
+            return false;
+        }
+        self.last = Some(ResultSet {
+            question: question.trim().to_string(),
+            kind: kind.to_string(),
+            anchor,
+            predicate,
+            entries,
+            page_size: self.page_size,
+            cursor: 0,
+            receipts: vec![receipt],
+        });
+        true
+    }
+
     fn record(&mut self, question: &str, bundle: &EvidenceBundle, receipt: String) -> bool {
         let entries: Vec<SessionEntry> = bundle
             .items

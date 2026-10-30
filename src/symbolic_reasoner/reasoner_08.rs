@@ -1149,6 +1149,20 @@ impl SymbolicReasoner {
                 "未证明 top-k（结果按当前预算返回）"
             }
         ));
+        if self.config.search_session.enabled {
+            let session_hits: Vec<_> = hits.iter().map(|hit| (**hit).clone()).collect();
+            let predicate = target_predicate
+                .clone()
+                .or_else(|| session_hits.first().map(|hit| hit.predicate.clone()));
+            self.search_session.lock().record_search_hits(
+                question.trim(),
+                "证据索引",
+                entities.first().cloned(),
+                predicate,
+                &session_hits,
+                search.receipt.render_text(),
+            );
+        }
         Some(output.trim_end().to_string())
     }
 
