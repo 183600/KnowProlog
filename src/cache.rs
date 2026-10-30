@@ -55,12 +55,9 @@ impl<V, E: Copy + Eq> RevisionLru<V, E> {
             self.order.clear();
             self.epoch = Some(epoch);
         }
-        if self.entries.insert(key.clone(), value).is_none() {
-            self.order.push(key);
-        } else {
-            self.order.retain(|cached| cached != &key);
-            self.order.push(key);
-        }
+        self.entries.insert(key.clone(), value);
+        self.order.retain(|cached| cached != &key);
+        self.order.push(key);
         if self.entries.len() > self.capacity {
             if let Some(oldest) = self.order.first().cloned() {
                 self.order.remove(0);

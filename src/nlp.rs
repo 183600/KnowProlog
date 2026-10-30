@@ -1,7 +1,18 @@
+//! 中文分词、词性标注与查询意图匹配。
+//!
+//! 对外分两层：
+//! - [`preprocess`] / [`preprocess_annotated`]：结巴分词 + 配置词性 + 姓名与
+//!   数词量词规则，前者只给词面与词性，后者额外保留来源、原始标签与字符边界；
+//! - [`analyze_query_intent`]：按 [`PrologRule`] 的优先级匹配标注序列，
+//!   返回查询类型与被捕获的实体。
+//!
+//! 已确认提及词表通过 [`preprocess_with_lexicon`] 叠加，不命中时与旧路径逐
+//! token 相同；归一化只改变词面，不移动原始文本中的实体位置。
+
 use crate::mention_lexicon::{LexiconSpan, MentionLexicon};
 use jieba_rs::Jieba; // 导入结巴分词库，用于中文分词
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap; // 导入哈希映射，用于存储键值对
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 static JIEBA: OnceLock<Jieba> = OnceLock::new();
@@ -81,6 +92,17 @@ pub struct AnnotatedWord {
     pub end: usize,
 }
 
+/// 丢弃审计信息，只保留旧接口需要的词面与词性。
+fn plain_words(words: Vec<AnnotatedWord>) -> Vec<TaggedWord> {
+    words
+        .into_iter()
+        .map(|word| TaggedWord {
+            text: word.text,
+            pos: word.pos,
+        })
+        .collect()
+}
+
 // Prolog推理规则结构体
 #[derive(Debug, Clone)]
 pub struct PrologRule {
@@ -105,13 +127,7 @@ pub enum PatternElement {
 // 预处理函数：分词并进行词性标注
 // 注意：crate::NlpConfig 引用的是 lib.rs 中的 NlpConfig
 pub fn preprocess(text: &str, config: &crate::NlpConfig) -> Vec<TaggedWord> {
-    preprocess_annotated(text, config)
-        .into_iter()
-        .map(|word| TaggedWord {
-            text: word.text,
-            pos: word.pos,
-        })
-        .collect()
+    plain_words(preprocess_annotated(text, config))
 }
 
 /// 与 [`preprocess`] 同序同标签，但保留词性来源、结巴原始标签与字符边界。
@@ -128,7 +144,7 @@ pub fn preprocess_annotated(text: &str, config: &crate::NlpConfig) -> Vec<Annota
     let spans = token_spans(text, &words);
 
     // 常见人名集合
-    let full_names: std::collections::HashSet<&str> = config
+    let full_names: HashSet<&str> = config
         .name_patterns
         .full_names
         .iter()
@@ -196,13 +212,7 @@ pub fn preprocess_with_lexicon(
     config: &crate::NlpConfig,
     lexicon: &MentionLexicon,
 ) -> Vec<TaggedWord> {
-    preprocess_annotated_with_lexicon(text, config, lexicon)
-        .into_iter()
-        .map(|word| TaggedWord {
-            text: word.text,
-            pos: word.pos,
-        })
-        .collect()
+    plain_words(preprocess_annotated_with_lexicon(text, config, lexicon))
 }
 
 /// 与 [`preprocess_with_lexicon`] 同序，但保留边界、来源与结巴原始标签。
@@ -640,25 +650,24 @@ pub fn analyze_query_intent(
         .windows(2)
         .all(|pair| pair[0].priority >= pair[1].priority)
     {
-        for rule in rules {
-            if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {
-                return Some((rule.query_type.clone(), entities)); // 返回查询类型和提取的实体
-            }
-        }
-        return None; // 没有匹配的规则
+        return first_matching_rule(tagged_words, rules);
     }
 
     let mut sorted_rules: Vec<&PrologRule> = rules.iter().collect();
     sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority)); // 按优先级降序排序
 
-    // 按优先级尝试匹配每个规则
-    for rule in sorted_rules {
-        if let Some(entities) = match_pattern_for_prolog(tagged_words, &rule.pattern) {
-            return Some((rule.query_type.clone(), entities)); // 返回查询类型和提取的实体
-        }
-    }
+    first_matching_rule(tagged_words, sorted_rules)
+}
 
-    None // 没有匹配的规则
+/// 按给定顺序返回第一条命中的规则及其捕获实体。
+fn first_matching_rule<'a>(
+    tagged_words: &[TaggedWord],
+    rules: impl IntoIterator<Item = &'a PrologRule>,
+) -> Option<(String, Vec<String>)> {
+    rules.into_iter().find_map(|rule| {
+        match_pattern_for_prolog(tagged_words, &rule.pattern)
+            .map(|entities| (rule.query_type.clone(), entities))
+    })
 }
 
 // 为Prolog推理匹配模式并提取实体

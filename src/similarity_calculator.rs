@@ -169,15 +169,7 @@ impl SimilarityCalculator {
     fn jaccard_similarity_from_words(&self, words1: &[&str], words2: &[&str]) -> f64 {
         let set1: HashSet<_> = words1.iter().copied().collect();
         let set2: HashSet<_> = words2.iter().copied().collect();
-
-        let intersection = set1.intersection(&set2).count();
-        let union = set1.len() + set2.len() - intersection;
-
-        if union == 0 {
-            0.0
-        } else {
-            intersection as f64 / union as f64
-        }
+        Self::calculate_ngram_set_similarity(&set1, &set2)
     }
 
     fn cosine_similarity_from_words(
@@ -501,15 +493,7 @@ impl SimilarityCalculator {
     fn calculate_synonym_similarity(node1: &ConceptNode, node2: &ConceptNode) -> f64 {
         let synonyms1: HashSet<_> = node1.synonyms.iter().collect();
         let synonyms2: HashSet<_> = node2.synonyms.iter().collect();
-
-        let intersection = synonyms1.intersection(&synonyms2).count();
-        let union = synonyms1.len() + synonyms2.len() - intersection;
-
-        if union == 0 {
-            0.0
-        } else {
-            intersection as f64 / union as f64
-        }
+        Self::calculate_ngram_set_similarity(&synonyms1, &synonyms2)
     }
 
     async fn calculate_ngram_similarity(&self, text1: &str, text2: &str) -> f64 {

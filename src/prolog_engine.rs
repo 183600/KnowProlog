@@ -1,7 +1,16 @@
+//! Scryer Prolog 适配层：把动态事实装载、三态查询与统一绑定串成一条链路。
+//!
+//! 引擎对外只暴露两类结果：
+//! - 事实装载：`load_facts*` / `load_temporal_facts*`，失败一律显式返回；
+//! - 查询：`query*` 家族，其中 [`QueryOutcome`] 区分「有解 / 无解 / 引擎故障」。
+//!
+//! 事实按规范序比较，装载时只写差量；Prolog 源码中的文本统一经
+//! [`escape_atom`] 转义，避免名称里的引号或反斜杠破坏语法。
+
 use scryer_prolog::machine::parsed_results::{prolog_value_to_json_string, QueryResolution, Value};
 use scryer_prolog::machine::Machine;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 
 use crate::bindings::{BindingSet, BoundTerm};
@@ -83,6 +92,27 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     } else {
         "未知 panic".to_string()
     }
+}
+
+/// 把类型化解集渲染成兼容的字符串行（未绑定项记为 `"null"`）。
+///
+/// [`PrologEngine::query`] 与 [`PrologEngine::query_checked`] 共用这一条
+/// 渲染路径，保证两个入口对同一查询给出逐字相同的绑定。
+fn render_binding_rows(solutions: Vec<BindingSet>) -> Vec<HashMap<String, String>> {
+    solutions
+        .into_iter()
+        .map(|bindings| {
+            bindings
+                .iter()
+                .map(|(name, term)| {
+                    (
+                        name.clone(),
+                        term.render_raw().unwrap_or_else(|| "null".to_string()),
+                    )
+                })
+                .collect()
+        })
+        .collect()
 }
 
 impl PrologEngine {
@@ -273,11 +303,8 @@ impl PrologEngine {
         let previous_counts = Self::count_facts(&previous);
         let target_counts = Self::count_facts(&facts);
 
-        // 需要撤回的实体键与关系键（BTreeSet 保证写入顺序确定，便于测试/复现）
-        let mut reset_entity_keys: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        let mut reset_relation_keys: std::collections::BTreeSet<(String, String, String)> =
-            std::collections::BTreeSet::new();
+        // 需要撤回的事实键（BTreeSet 保证写入顺序确定，便于测试/复现）
+        let mut reset_keys: BTreeSet<FactIdentity> = BTreeSet::new();
         let mut removed_count = 0usize;
         for (fact, before) in previous_counts.values() {
             let after = target_counts
@@ -288,35 +315,24 @@ impl PrologEngine {
                 continue;
             }
             removed_count += before - after;
-            match fact {
-                PrologFact::Entity {
-                    name, entity_type, ..
-                } => {
-                    reset_entity_keys.insert((name.clone(), entity_type.clone()));
-                }
-                PrologFact::Relation { from, rel_type, to } => {
-                    reset_relation_keys.insert((from.clone(), rel_type.clone(), to.clone()));
-                }
-            }
+            reset_keys.insert(fact.identity());
         }
 
-        let mut retract_goals = Vec::with_capacity(
-            reset_entity_keys.len() + reset_relation_keys.len(),
-        );
-        for (name, entity_type) in &reset_entity_keys {
-            retract_goals.push(format!(
-                "retractall(oxigraph_entity('{}', '{}', _))",
-                escape_atom(name),
-                escape_atom(entity_type)
-            ));
-        }
-        for (from, rel_type, to) in &reset_relation_keys {
-            retract_goals.push(format!(
-                "retractall(oxigraph_relation('{}', '{}', '{}'))",
-                escape_atom(from),
-                escape_atom(rel_type),
-                escape_atom(to)
-            ));
+        let mut retract_goals = Vec::with_capacity(reset_keys.len());
+        for key in &reset_keys {
+            match key {
+                FactIdentity::Entity { name, entity_type } => retract_goals.push(format!(
+                    "retractall(oxigraph_entity('{}', '{}', _))",
+                    escape_atom(name),
+                    escape_atom(entity_type)
+                )),
+                FactIdentity::Relation { from, rel_type, to } => retract_goals.push(format!(
+                    "retractall(oxigraph_relation('{}', '{}', '{}'))",
+                    escape_atom(from),
+                    escape_atom(rel_type),
+                    escape_atom(to)
+                )),
+            }
         }
 
         // 被撤回的实体/关系键在 retractall 后需要整体补回目标中该键的现存事实；
@@ -328,14 +344,7 @@ impl PrologEngine {
                 .get(&Self::fact_key(fact))
                 .map(|(_, count)| *count)
                 .unwrap_or(0);
-            let reset = match fact {
-                PrologFact::Entity {
-                    name, entity_type, ..
-                } => reset_entity_keys.contains(&(name.clone(), entity_type.clone())),
-                PrologFact::Relation { from, rel_type, to } => {
-                    reset_relation_keys.contains(&(from.clone(), rel_type.clone(), to.clone()))
-                }
-            };
+            let reset = reset_keys.contains(&fact.identity());
             added_count += after.saturating_sub(before);
             let to_write = if reset {
                 *after
@@ -635,21 +644,7 @@ impl PrologEngine {
     }
 
     pub fn query(&mut self, query: &str) -> Vec<HashMap<String, String>> {
-        self.query_outcome(query)
-            .into_solutions()
-            .into_iter()
-            .map(|bindings| {
-                bindings
-                    .iter()
-                    .map(|(name, term)| {
-                        (
-                            name.clone(),
-                            term.render_raw().unwrap_or_else(|| "null".to_string()),
-                        )
-                    })
-                    .collect()
-            })
-            .collect()
+        render_binding_rows(self.query_outcome(query).into_solutions())
     }
 
     /// 与 [`Self::query`] 同解同序的类型化版本：绑定为 [`BoundTerm`]。
@@ -670,20 +665,7 @@ impl PrologEngine {
         query: &str,
     ) -> Result<Vec<HashMap<String, String>>, String> {
         match self.query_outcome(query) {
-            QueryOutcome::Solutions(solutions) => Ok(solutions
-                .into_iter()
-                .map(|bindings| {
-                    bindings
-                        .iter()
-                        .map(|(name, term)| {
-                            (
-                                name.clone(),
-                                term.render_raw().unwrap_or_else(|| "null".to_string()),
-                            )
-                        })
-                        .collect()
-                })
-                .collect()),
+            QueryOutcome::Solutions(solutions) => Ok(render_binding_rows(solutions)),
             QueryOutcome::NoSolution => Ok(Vec::new()),
             QueryOutcome::EngineFault(message) => Err(message),
         }
@@ -740,111 +722,80 @@ impl PrologEngine {
     }
 
     pub fn generate_prolog_query(pattern: &str, entities: &[String]) -> Option<String> {
+        fn first_entity(entities: &[String]) -> Option<&str> {
+            entities.first().map(String::as_str)
+        }
+
+        fn entity_property_query(
+            entity: &str,
+            entity_type: &str,
+            property: &str,
+            variable: &str,
+        ) -> String {
+            format!(
+                "oxigraph_entity('{}', '{}', Properties), member({}-{}, Properties)",
+                escape_atom(entity),
+                escape_atom(entity_type),
+                property,
+                variable
+            )
+        }
+
         match pattern {
-            "age_query" => {
-                if let Some(person) = entities.first() {
-                    Some(format!("age_of('{}', Age)", escape_atom(person)))
-                } else {
-                    None
-                }
-            }
+            "age_query" => first_entity(entities)
+                .map(|person| format!("age_of('{}', Age)", escape_atom(person))),
             "relation_query" => {
-                if entities.len() >= 2 {
-                    Some(format!(
-                        "related('{}', Relation, '{}')",
-                        escape_atom(&entities[0]),
-                        escape_atom(&entities[1])
-                    ))
-                } else {
-                    None
-                }
+                let from = entities.first()?;
+                let to = entities.get(1)?;
+                Some(format!(
+                    "related('{}', Relation, '{}')",
+                    escape_atom(from),
+                    escape_atom(to)
+                ))
             }
-            "count_query" => {
-                if let Some(entity_type) = entities.first() {
-                    Some(format!(
-                        "count_entities('{}', Count)",
-                        escape_atom(entity_type)
-                    ))
-                } else {
-                    None
-                }
-            }
-            "spouse_query" => {
-                if let Some(person) = entities.first() {
-                    Some(format!("spouse_of('{}', Spouse)", escape_atom(person)))
-                } else {
-                    None
-                }
-            }
-            "capital_query" => {
-                if let Some(country) = entities.first() {
-                    Some(format!(
-                        "oxigraph_entity('{}', 'country', Properties), member(capital-Capital, Properties)",
-                        escape_atom(country)
-                    ))
-                } else {
-                    None
-                }
-            }
-            "altitude_query" => {
-                if let Some(place) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'geographicfeature', Properties), member(altitude-Altitude, Properties)", escape_atom(place)))
-                } else {
-                    None
-                }
-            }
-            "chemical_formula_query" => {
-                if let Some(chemical) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'chemical', Properties), member(formula-Formula, Properties)", escape_atom(chemical)))
-                } else {
-                    None
-                }
-            }
-            "author_query" => {
-                if let Some(work) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'literature', Properties), member(author-Author, Properties)", escape_atom(work)))
-                } else {
-                    None
-                }
-            }
-            "champion_query" => {
-                if let Some(event) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'sportevent', Properties), member(champion-Champion, Properties)", escape_atom(event)))
-                } else {
-                    None
-                }
-            }
-            "birth_year_query" => {
-                if let Some(language) = entities.first() {
-                    Some(format!("oxigraph_entity('{}', 'programminglanguage', Properties), member(birth_year-Year, Properties)", escape_atom(language)))
-                } else {
-                    None
-                }
-            }
+            "count_query" => first_entity(entities).map(|entity_type| {
+                format!("count_entities('{}', Count)", escape_atom(entity_type))
+            }),
+            "spouse_query" => first_entity(entities)
+                .map(|person| format!("spouse_of('{}', Spouse)", escape_atom(person))),
+            "capital_query" => first_entity(entities)
+                .map(|country| entity_property_query(country, "country", "capital", "Capital")),
+            "altitude_query" => first_entity(entities).map(|place| {
+                entity_property_query(place, "geographicfeature", "altitude", "Altitude")
+            }),
+            "chemical_formula_query" => first_entity(entities)
+                .map(|chemical| entity_property_query(chemical, "chemical", "formula", "Formula")),
+            "author_query" => first_entity(entities)
+                .map(|work| entity_property_query(work, "literature", "author", "Author")),
+            "champion_query" => first_entity(entities)
+                .map(|event| entity_property_query(event, "sportevent", "champion", "Champion")),
+            "birth_year_query" => first_entity(entities).map(|language| {
+                entity_property_query(language, "programminglanguage", "birth_year", "Year")
+            }),
             "largest_query" => {
-                if entities.len() >= 2 {
-                    Some(format!("oxigraph_entity(Entity, '{}', Properties), member(type-'{}', Properties), member(size_rank-'1', Properties)", escape_atom(&entities[0]), escape_atom(&entities[1])))
-                } else {
-                    None
-                }
+                let entity_type = entities.first()?;
+                let target = entities.get(1)?;
+                Some(format!(
+                    "oxigraph_entity(Entity, '{}', Properties), member(type-'{}', Properties), member(size_rank-'1', Properties)",
+                    escape_atom(entity_type),
+                    escape_atom(target)
+                ))
             }
             "quantity_query" => {
-                if entities.len() >= 2 {
-                    Some(format!("oxigraph_entity('{}', 'biologicalconcept', Properties), member(quantity-Quantity, Properties), member(unit-'{}', Properties)", escape_atom(&entities[0]), escape_atom(&entities[1])))
-                } else {
-                    None
-                }
+                let entity = entities.first()?;
+                let unit = entities.get(1)?;
+                Some(format!(
+                    "oxigraph_entity('{}', 'biologicalconcept', Properties), member(quantity-Quantity, Properties), member(unit-'{}', Properties)",
+                    escape_atom(entity),
+                    escape_atom(unit)
+                ))
             }
-            "concept_query" => {
-                if let Some(concept) = entities.first() {
-                    Some(format!(
-                        "oxigraph_entity('{}', Type, Properties)",
-                        escape_atom(concept)
-                    ))
-                } else {
-                    None
-                }
-            }
+            "concept_query" => first_entity(entities).map(|concept| {
+                format!(
+                    "oxigraph_entity('{}', Type, Properties)",
+                    escape_atom(concept)
+                )
+            }),
             "property_query" => {
                 if entities.len() >= 2 {
                     // 为基础知识属性查询生成通用查询，调整实体顺序
@@ -853,14 +804,14 @@ impl PrologEngine {
                         escape_atom(&entities[1]),
                         escape_atom(&entities[0])
                     ))
-                } else if let Some(entity) = entities.first() {
-                    // 单实体查询，查找所有属性
-                    Some(format!(
-                        "oxigraph_entity('{}', Type, Properties)",
-                        escape_atom(entity)
-                    ))
                 } else {
-                    None
+                    // 单实体查询，查找所有属性
+                    first_entity(entities).map(|entity| {
+                        format!(
+                            "oxigraph_entity('{}', Type, Properties)",
+                            escape_atom(entity)
+                        )
+                    })
                 }
             }
             _ => None,
@@ -942,9 +893,88 @@ pub enum PrologFact {
     },
 }
 
+/// 差量装载的撤回粒度：实体按 `(名称, 类型)`，关系按三元组。
+///
+/// 枚举声明顺序同时决定 `retractall` 目标的写入顺序（先实体、后关系），
+/// 与字段字典序一起保证装载过程可复现。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum FactIdentity {
+    Entity {
+        name: String,
+        entity_type: String,
+    },
+    Relation {
+        from: String,
+        rel_type: String,
+        to: String,
+    },
+}
+
+impl PrologFact {
+    fn identity(&self) -> FactIdentity {
+        match self {
+            PrologFact::Entity {
+                name, entity_type, ..
+            } => FactIdentity::Entity {
+                name: name.clone(),
+                entity_type: entity_type.clone(),
+            },
+            PrologFact::Relation { from, rel_type, to } => FactIdentity::Relation {
+                from: from.clone(),
+                rel_type: rel_type.clone(),
+                to: to.clone(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_queries_keep_their_public_templates() {
+        let one = vec!["甲".to_string()];
+        let two = vec!["甲".to_string(), "乙".to_string()];
+        let generate = PrologEngine::generate_prolog_query;
+
+        assert_eq!(
+            generate("age_query", &one).as_deref(),
+            Some("age_of('甲', Age)")
+        );
+        assert_eq!(
+            generate("relation_query", &two).as_deref(),
+            Some("related('甲', Relation, '乙')")
+        );
+        assert_eq!(
+            generate("count_query", &one).as_deref(),
+            Some("count_entities('甲', Count)")
+        );
+        assert_eq!(
+            generate("capital_query", &one).as_deref(),
+            Some(
+                "oxigraph_entity('甲', 'country', Properties), member(capital-Capital, Properties)"
+            )
+        );
+        assert_eq!(
+            generate("altitude_query", &one).as_deref(),
+            Some("oxigraph_entity('甲', 'geographicfeature', Properties), member(altitude-Altitude, Properties)")
+        );
+        assert_eq!(
+            generate("largest_query", &two).as_deref(),
+            Some("oxigraph_entity(Entity, '甲', Properties), member(type-'乙', Properties), member(size_rank-'1', Properties)")
+        );
+        assert_eq!(
+            generate("property_query", &two).as_deref(),
+            Some("oxigraph_relation('乙', Property, '甲')")
+        );
+        assert_eq!(
+            generate("property_query", &one).as_deref(),
+            Some("oxigraph_entity('甲', Type, Properties)")
+        );
+        assert!(generate("unknown_query", &one).is_none());
+        assert!(generate("relation_query", &one).is_none());
+    }
 
     #[test]
     fn test_escape_atom_escapes_quotes_and_backslashes() {
