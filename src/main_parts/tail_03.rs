@@ -330,6 +330,49 @@ mod session_tests {
         ));
     }
 
+    #[test]
+    fn search_cli_parses_port_request() {
+        let cli = Cli::try_parse_from([
+            "knowprolog",
+            "search",
+            "张三的师傅是谁",
+            "--mode",
+            "lookup",
+            "--subject",
+            "张三",
+            "--predicate",
+            "师傅",
+            "--k",
+            "5",
+            "--max-scanned",
+            "100",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Search {
+                question,
+                mode,
+                subject,
+                predicate,
+                k,
+                max_scanned,
+                json,
+                ..
+            }) => {
+                assert_eq!(question, "张三的师傅是谁");
+                assert_eq!(mode.as_deref(), Some("lookup"));
+                assert_eq!(subject.as_deref(), Some("张三"));
+                assert_eq!(predicate.as_deref(), Some("师傅"));
+                assert_eq!(k, 5);
+                assert_eq!(max_scanned, Some(100));
+                assert!(json);
+            }
+            _ => panic!("应解析为语义检索命令"),
+        }
+        assert!(Cli::try_parse_from(["knowprolog", "search", "张三的师傅是谁"]).is_ok());
+    }
+
     /// ask 与交互/服务一致：配置启用的绑定帧必须进入多行会话，
     /// 否则「查这个人的师傅」这类槽位回填只在另外两个入口可用。
     #[tokio::test]

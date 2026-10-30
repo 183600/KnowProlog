@@ -882,7 +882,7 @@ impl SymbolicReasoner {
 
     /// 把自然语言问句编译成检索动作（Lookup/Enumerate/Describe/Verify），
     /// 用当前实体与谓词表生成精确约束，再交给统一语义检索端口。
-    fn semantic_search_request(&self, question: &str) -> crate::search_port::SearchRequest {
+    pub fn semantic_search_request(&self, question: &str) -> crate::search_port::SearchRequest {
         let normalized = self.aligner.normalize_cow(question);
         let mentioned = self.mentioned_predicate_canonicals(question);
         let predicate = self

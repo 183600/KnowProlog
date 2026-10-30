@@ -984,6 +984,87 @@
                 println!("{}", search.receipt.render_text());
             }
         }
+        Some(Commands::Search {
+            question,
+            mode,
+            subject,
+            predicate,
+            object,
+            entity_type,
+            k,
+            max_scanned,
+            json,
+        }) => {
+            let facts = match oxigraph_manager.load_graph_snapshot().await {
+                Ok(facts) => facts,
+                Err(error) => {
+                    eprintln!("读取知识库失败: {}", error);
+                    std::process::exit(1);
+                }
+            };
+            let reasoner =
+                build_store_reasoner(config.as_ref(), &oxigraph_manager, &store_path, &facts).await;
+            let parsed_mode = match mode.as_deref() {
+                Some(label) => match SearchMode::parse(label) {
+                    Some(mode) => Some(mode),
+                    None => {
+                        eprintln!(
+                            "未知检索模式「{}」；可用值：lookup / enumerate / describe / verify",
+                            label
+                        );
+                        std::process::exit(2);
+                    }
+                },
+                None => None,
+            };
+            let explicit = parsed_mode.is_some()
+                || subject.is_some()
+                || predicate.is_some()
+                || object.is_some()
+                || entity_type.is_some();
+            let mut request = if explicit {
+                SearchRequest::from_question(question.as_str(), None, None, k)
+            } else {
+                reasoner.semantic_search_request(&question)
+            };
+            request.max_results = k.clamp(1, 50);
+            if let Some(mode) = parsed_mode {
+                request.mode = mode;
+            }
+            if let Some(value) = subject {
+                request.constraints.subject = Some(value.trim().to_string());
+            }
+            if let Some(value) = predicate {
+                request.constraints.predicate = Some(value.trim().to_string());
+            }
+            if let Some(value) = object {
+                request.constraints.object = Some(value.trim().to_string());
+            }
+            if let Some(value) = entity_type {
+                request.constraints.entity_type = Some(value.trim().to_string());
+            }
+            request.budget = SearchBudget { max_scanned };
+            let outcome = reasoner.semantic_search(&request);
+            if json {
+                let payload = serde_json::json!({
+                    "question": question,
+                    "request": request,
+                    "answers": outcome.answer_values(&request),
+                    "hits": outcome.hits,
+                    "receipt": outcome.receipt,
+                    "batches": outcome.batches,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => {
+                        eprintln!("语义检索结果序列化失败: {}", error);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                println!("{}", outcome.render_answer(&request));
+            }
+        }
         Some(Commands::RewriteRetrieval {
             question,
             book,

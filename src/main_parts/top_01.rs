@@ -114,6 +114,7 @@ use know_prolog::{
     rewrite_book::{self, RewriteBook},
     rewrite_retrieval,
     schema_view::SchemaView,
+    search_port::{SearchMode, SearchRequest},
     shape_dialogue::ShapeDialogue,
     shape_eval::{
         compare_baseline as compare_shape_eval_baseline, evaluate_seed as evaluate_shape_dialogue,
@@ -1104,6 +1105,36 @@ enum Commands {
         #[arg(long)]
         max_scanned: Option<usize>,
         /// Print hits and the receipt as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search through the unified semantic port (dense + holographic) and
+    /// print grouped answer values with an auditable receipt
+    Search {
+        /// Natural-language question or keyword query
+        question: String,
+        /// Retrieval action: lookup / enumerate / describe / verify
+        #[arg(long)]
+        mode: Option<String>,
+        /// Restrict to an exact subject
+        #[arg(long)]
+        subject: Option<String>,
+        /// Restrict to an exact predicate
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Restrict to an exact object
+        #[arg(long)]
+        object: Option<String>,
+        /// Restrict to entities with this declared type
+        #[arg(long = "type", value_name = "TYPE")]
+        entity_type: Option<String>,
+        /// Maximum number of evidence rows to return
+        #[arg(long, default_value_t = 8)]
+        k: usize,
+        /// Maximum number of candidates to score (default: unlimited)
+        #[arg(long)]
+        max_scanned: Option<usize>,
+        /// Print answers, hits and the receipt as JSON
         #[arg(long)]
         json: bool,
     },
