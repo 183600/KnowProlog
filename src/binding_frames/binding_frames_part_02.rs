@@ -46,6 +46,8 @@ fn is_builtin_var(name: &str) -> bool {
             | "raw"
             | "slot"
             | "slot_label"
+            | "evidence"
+            | "proof"
     )
 }
 fn render_template(template: &str, vars: &BTreeMap<String, String>) -> Option<String> {
@@ -1454,6 +1456,40 @@ output = "value"
         assert!(outcome.text.contains("226"), "{}", outcome.text);
         assert!(!outcome.text.contains("140"), "{}", outcome.text);
         assert!(memory.pending_prompt().is_none());
+    }
+
+    #[test]
+    fn realize_template_can_embed_proven_evidence() {
+        let program = FrameProgram::compile(&config(r#"
+enabled = true
+[[frames]]
+id = "person.evidence"
+patterns = ["{entity}的{attribute}是什么"]
+realize = { answer = "{entity}的{attribute}是{value}（依据：{evidence}）。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "attribute"
+sort = "attribute"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "attribute"
+output = "value"
+"#)).expect("证据模板应可编译");
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(&mut memory, "姚明的身高是什么", &FakeKnowledge::new(), 1)
+            .expect("应回答");
+        assert!(outcome.text.contains("226"), "{}", outcome.text);
+        assert!(outcome.text.contains("依据：实体「姚明」"), "{}", outcome.text);
+        assert!(outcome.text.contains("身高"), "{}", outcome.text);
     }
 
     struct FriendsKnowledge;

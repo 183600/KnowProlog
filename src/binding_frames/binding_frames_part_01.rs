@@ -1079,7 +1079,35 @@ impl FrameProgram {
         })
     }
 
+    /// 执行目标并把证明写回措辞：模板可以引用 `{evidence}` / `{proof}`，
+    /// 但这些变量只由本轮已得证的事实填充，不会凭空补全。
     fn execute(
+        &self,
+        frame: &CompiledFrame,
+        resolved: &Resolved,
+        knowledge: &dyn DialogueKnowledge,
+    ) -> Option<Executed> {
+        let mut executed = self.execute_inner(frame, resolved, knowledge)?;
+        let Some(template) = frame.realize_answer.as_deref() else {
+            return Some(executed);
+        };
+        if !template.contains("{evidence}") && !template.contains("{proof}") {
+            return Some(executed);
+        }
+        let mut vars = self.render_vars(frame, &executed.bindings, knowledge);
+        let evidence = executed.evidence.join("；");
+        vars.insert("evidence".to_string(), evidence.clone());
+        vars.insert(
+            "proof".to_string(),
+            format!("绑定帧「{}」：{}", frame.id, evidence),
+        );
+        if let Some(text) = render_template(template, &vars) {
+            executed.text = text;
+        }
+        Some(executed)
+    }
+
+    fn execute_inner(
         &self,
         frame: &CompiledFrame,
         resolved: &Resolved,
