@@ -785,6 +785,37 @@ mod tests {
     }
 
     #[test]
+    fn pos_evidence_projects_person_type_for_sketch() {
+        let mut linker = EntityLinker::new();
+        linker.register_entity("张三", Some("人物"));
+        let mut source = MapSenseSource::default();
+        source.add("张三", "人物", &[], &[], 0);
+        let text = "张三的出生地是哪里";
+        let mention = &linker.link_lattice(text, &[])[0];
+        let words = vec![
+            crate::lexical_memory::annotated_word(
+                "张三",
+                "nr",
+                crate::nlp::TagSource::JiebaTag,
+                0,
+                2,
+            ),
+            crate::lexical_memory::annotated_word(
+                "的",
+                "uj",
+                crate::nlp::TagSource::JiebaTag,
+                2,
+                3,
+            ),
+        ];
+        let sketch = sketch_mention_with_evidence(text, mention, None, Some(&words));
+        assert!(sketch.pos_tags.contains(&"nr".to_string()));
+        assert!(sketch.pos_sorts.contains(&crate::pos_ontology::Sort::Person));
+        assert!(sketch.pos_types.contains(&"人物".to_string()));
+        assert!(sketch.expectation_types.contains(&"人物".to_string()));
+    }
+
+    #[test]
     fn parse_clarify_act_variants() {
         let question = ClarifyQuestion {
             mention: "苹果".to_string(),

@@ -5,6 +5,8 @@ use crate::entity_registry::fold_surface;
 use crate::function_words::{roles_of, Role};
 use crate::identity::infer_suffix_type;
 use crate::lexical_memory::LexicalMemory;
+use crate::nlp::AnnotatedWord;
+use crate::pos_ontology::{self, Sort};
 /// 领先次优多少票算「唯一」（默认边际）。低于边际即升级为显式歧义。
 pub const DEFAULT_MARGIN_VOTES: i32 = 2;
 /// 区分性问题最多给出的候选数。
@@ -152,6 +154,12 @@ pub struct MentionSketch {
     pub key_offset: usize,
     /// 是否描述性指称
     pub is_description: bool,
+    /// 提及跨度内的实际词性标签（稳定排序、去重）。
+    pub pos_tags: Vec<String>,
+    /// 词性本体投影出的语义排序。
+    pub pos_sorts: Vec<Sort>,
+    /// 排序投影出的默认领域类型（软证据）。
+    pub pos_types: Vec<String>,
 }
 /// 义项卡：实体侧可比较的集合画像。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -683,6 +691,24 @@ impl ContextualResolver {
         focus: Option<&str>,
         memory: Option<&LexicalMemory>,
     ) -> CrdOutcome {
+        self.resolve_text_with_evidence(
+            text, linker, source, ledger, hints, focus, memory, None,
+        )
+    }
+
+    /// 在词法记忆之外再注入已标注词，用词性本体为指称补充类型证据。
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_text_with_evidence(
+        &self,
+        text: &str,
+        linker: &EntityLinker,
+        source: &dyn SenseSource,
+        ledger: &BindingLedger,
+        hints: &[String],
+        focus: Option<&str>,
+        memory: Option<&LexicalMemory>,
+        annotated: Option<&[AnnotatedWord]>,
+    ) -> CrdOutcome {
         let mentions = linker.link_lattice(text, hints);
         let descriptions = detect_descriptions(text, source);
         let mut global_expectations: Vec<String> =
@@ -710,7 +736,7 @@ impl ContextualResolver {
         let provisional: Vec<Option<String>> = mentions
             .iter()
             .map(|mention| {
-                self.evaluate_with_memory(
+                self.evaluate_with_evidence(
                     mention,
                     linker,
                     text,
@@ -721,6 +747,7 @@ impl ContextualResolver {
                     &[],
                     &global_expectations,
                     memory,
+                    annotated,
                 )
                 .chosen
             })
@@ -728,7 +755,7 @@ impl ContextualResolver {
         let peers: Vec<String> = provisional.iter().flatten().cloned().collect();
 
         for mention in &mentions {
-            let resolution = self.evaluate_with_memory(
+            let resolution = self.evaluate_with_evidence(
                 mention,
                 linker,
                 text,
@@ -739,6 +766,7 @@ impl ContextualResolver {
                 &peers,
                 &global_expectations,
                 memory,
+                annotated,
             );
             if outcome.ask.is_none() && resolution.verdict == Verdict::Ambiguous {
                 if let Some(question) = resolution.question.clone() {
@@ -829,7 +857,38 @@ impl ContextualResolver {
         global_expectations: &[String],
         memory: Option<&LexicalMemory>,
     ) -> MentionResolution {
-        let sketch = sketch_mention_with_memory(text, mention, memory);
+        self.evaluate_with_evidence(
+            mention,
+            linker,
+            text,
+            source,
+            ledger,
+            hints,
+            focus,
+            peers,
+            global_expectations,
+            memory,
+            None,
+        )
+    }
+
+    /// 与 [`Self::evaluate_with_memory`] 相同，并可注入已标注词补充词性证据。
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_with_evidence(
+        &self,
+        mention: &LinkedMention,
+        linker: &EntityLinker,
+        text: &str,
+        source: &dyn SenseSource,
+        ledger: &BindingLedger,
+        hints: &[String],
+        focus: Option<&str>,
+        peers: &[String],
+        global_expectations: &[String],
+        memory: Option<&LexicalMemory>,
+        annotated: Option<&[AnnotatedWord]>,
+    ) -> MentionResolution {
+        let sketch = sketch_mention_with_evidence(text, mention, memory, annotated);
         let key = fold_surface(&sketch.key_surface);
         let mut notes: Vec<String> = Vec::new();
 
@@ -1296,13 +1355,22 @@ fn classifier_of(word: &str) -> Option<String> {
 }
 /// 指称素描：从提及及其前后文抽中文特征。
 pub fn sketch_mention(text: &str, mention: &LinkedMention) -> MentionSketch {
-    sketch_mention_with_memory(text, mention, None)
+    sketch_mention_with_evidence(text, mention, None, None)
 }
 /// 与 [`sketch_mention`] 相同，但允许用词法记忆补充量词期待。
 pub fn sketch_mention_with_memory(
     text: &str,
     mention: &LinkedMention,
     memory: Option<&LexicalMemory>,
+) -> MentionSketch {
+    sketch_mention_with_evidence(text, mention, memory, None)
+}
+/// 在词法记忆之外再注入已标注词，用词性本体补充指称的语义排序。
+pub fn sketch_mention_with_evidence(
+    text: &str,
+    mention: &LinkedMention,
+    memory: Option<&LexicalMemory>,
+    annotated: Option<&[AnnotatedWord]>,
 ) -> MentionSketch {
     let chars: Vec<char> = text.chars().collect();
     let start = mention.start.min(chars.len());
@@ -1398,6 +1466,33 @@ pub fn sketch_mention_with_memory(
         }
     }
 
+    let mut pos_tags: Vec<String> = Vec::new();
+    let mut pos_sorts: Vec<Sort> = Vec::new();
+    let mut pos_types: Vec<String> = Vec::new();
+    if let Some(words) = annotated {
+        let end = start.saturating_add(mention.mention.chars().count());
+        for word in words
+            .iter()
+            .filter(|word| word.end > start && word.start < end)
+        {
+            let profile = pos_ontology::profile(&word.pos);
+            if !word.pos.trim().is_empty() {
+                pos_tags.push(word.pos.clone());
+            }
+            if profile.known {
+                pos_sorts.extend(profile.sorts.iter().copied());
+                pos_types.extend(profile.ontology_types());
+            }
+        }
+        pos_tags.sort();
+        pos_tags.dedup();
+        pos_sorts.sort();
+        pos_sorts.dedup();
+        pos_types.sort();
+        pos_types.dedup();
+        expectation_types.extend(pos_types.iter().cloned());
+    }
+
     expectation_types.sort();
     expectation_types.dedup();
     let is_description = relational_relation.is_some();
@@ -1411,5 +1506,8 @@ pub fn sketch_mention_with_memory(
         key_surface,
         key_offset,
         is_description,
+        pos_tags,
+        pos_sorts,
+        pos_types,
     }
 }
