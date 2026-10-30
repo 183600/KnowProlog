@@ -124,8 +124,14 @@
             // 跨重启采纳/退役决定，与交互启动同一套注册入口，建会话前完成。
             let aligned_predicates = api_state
                 .align_predicate_pairs(&oxigraph_manager.predicate_query_pairs(), &registry);
-            let aligned_entities =
-                api_state.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
+            let mut entity_aliases = oxigraph_manager.confirmed_entity_aliases();
+            let mut variant_closure =
+                VariantClosure::from_registry(&oxigraph_manager.entity_registry_snapshot());
+            if let Ok(graph) = oxigraph_manager.load_synonym_graph().await {
+                variant_closure.add_synonym_graph(&graph);
+                entity_aliases.extend(variant_closure.alias_pairs(&VariantContext::new()));
+            }
+            let aligned_entities = api_state.align_entity_aliases(&entity_aliases);
             if aligned_predicates > 0 || aligned_entities > 0 {
                 println!(
                     "服务已对齐知识注册表：{} 条谓词别名/换向词面、{} 条实体别名。",
