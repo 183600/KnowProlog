@@ -1907,6 +1907,26 @@ mod tests {
     }
 
     #[test]
+    fn reverse_generation_follows_nested_paths() {
+        let closure = VariantClosure::from_parts(&registry(), &synonym_graph());
+        let variants = closure.variants_of("中国科学院大学", &VariantContext::new());
+        let surfaces: Vec<&str> = variants
+            .iter()
+            .map(|variant| variant.surface.as_str())
+            .collect();
+        assert!(surfaces.contains(&"国科大"));
+        assert!(surfaces.contains(&"UCAS"));
+        let ucas = variants
+            .iter()
+            .find(|variant| variant.surface == "UCAS")
+            .expect("嵌套变体应保留完整路径");
+        assert_eq!(ucas.path.len(), 2);
+        assert_eq!(ucas.path[0].from, "UCAS");
+        assert_eq!(ucas.path[1].to, "中国科学院大学");
+        assert_eq!(ucas.render().matches("→").count(), 2);
+    }
+
+    #[test]
     fn morphology_is_anchored_and_composable() {
         let mut registry = EntityRegistry::new();
         registry.confirm_alias_with_origin("鲁迅", "周树人", NominationOrigin::Dialogue);
