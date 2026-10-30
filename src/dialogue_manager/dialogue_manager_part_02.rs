@@ -689,6 +689,7 @@ impl DialogueManager {
             identity: self.identity.clone(),
             epistemic_followup: self.epistemic_followup.clone(),
             type_memory: self.type_memory.clone(),
+            pending_reference: self.pending_reference.clone(),
         }
     }
 
@@ -706,8 +707,8 @@ impl DialogueManager {
         self.identity = snapshot.identity.clone();
         self.epistemic_followup = snapshot.epistemic_followup.clone();
         self.type_memory = snapshot.type_memory.clone();
+        self.pending_reference = snapshot.pending_reference.clone();
         self.last_identity_card = None;
-        self.pending_reference = None;
     }
 
     pub fn save_to_path(&self, path: &str) -> std::io::Result<()> {
@@ -871,8 +872,7 @@ impl DialogueManager {
         knowledge: &dyn DialogueKnowledge,
     ) -> Option<DialogueReply> {
         self.last_identity_card = None;
-        if let Some(answer) =
-            knowledge.type_memory_answer_in_context(input, &mut self.type_memory)
+        if let Some(answer) = knowledge.type_memory_answer_in_context(input, &mut self.type_memory)
         {
             let plans = vec!["type_memory".to_string()];
             let provenance = answer

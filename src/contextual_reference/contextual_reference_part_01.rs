@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-use serde::{Deserialize, Serialize};
 use crate::entity_linker::{EntityLinker, LinkCandidate, LinkMethod, LinkedMention};
 use crate::entity_registry::fold_surface;
 use crate::function_words::{roles_of, Role};
@@ -7,6 +5,8 @@ use crate::identity::infer_suffix_type;
 use crate::lexical_memory::LexicalMemory;
 use crate::nlp::AnnotatedWord;
 use crate::pos_ontology::{self, Sort};
+use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 /// 领先次优多少票算「唯一」（默认边际）。低于边际即升级为显式歧义。
 pub const DEFAULT_MARGIN_VOTES: i32 = 2;
 /// 区分性问题最多给出的候选数。
@@ -233,7 +233,7 @@ pub struct MentionResolution {
     pub notes: Vec<String>,
 }
 /// 区分性特征：问题由「分裂候选集」的需要决定，不是固定话术。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscriminatingFeature {
     /// 类型标签能分开候选（水果 vs 公司）
     Type,
@@ -245,14 +245,14 @@ pub enum DiscriminatingFeature {
     Names,
 }
 /// 澄清选项：候选实体 + 展示标签。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClarifyOption {
     pub entity: String,
     pub label: String,
     pub etype: Option<String>,
 }
 /// 区分性问题（选项 ≤3）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClarifyQuestion {
     pub mention: String,
     pub feature: DiscriminatingFeature,
@@ -305,7 +305,7 @@ pub enum ClarifyAct {
     Decline,
 }
 /// 待澄清请求：原始输入 + 指称跨度 + 问题。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClarifyRequest {
     pub original_input: String,
     pub mention: String,
@@ -712,9 +712,7 @@ impl ContextualResolver {
         focus: Option<&str>,
         memory: Option<&LexicalMemory>,
     ) -> CrdOutcome {
-        self.resolve_text_with_evidence(
-            text, linker, source, ledger, hints, focus, memory, None,
-        )
+        self.resolve_text_with_evidence(text, linker, source, ledger, hints, focus, memory, None)
     }
 
     /// 在词法记忆之外再注入已标注词，用词性本体为指称补充类型证据。
@@ -1371,8 +1369,7 @@ fn classifier_of(word: &str) -> Option<String> {
     if !matches!(first, '这' | '那' | '哪' | '每' | '某' | '几' | '数') {
         return None;
     }
-    (suffix.chars().count() == 1 && roles_of(&suffix).contains(&Role::Quantifier))
-        .then_some(suffix)
+    (suffix.chars().count() == 1 && roles_of(&suffix).contains(&Role::Quantifier)).then_some(suffix)
 }
 /// 指称素描：从提及及其前后文抽中文特征。
 pub fn sketch_mention(text: &str, mention: &LinkedMention) -> MentionSketch {

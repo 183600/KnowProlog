@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 use crate::binding_frames::{FrameMemory, FrameProgram};
 use crate::bindings::BindingSet;
 use crate::context_window::{select_window, ContextCue, WindowBudget, WindowSelection};
@@ -28,6 +26,8 @@ use crate::working_memory::{
     AttentionBudget, AttentionItem, AttentionKind, AttentionQuery, ContextPacket, WorkingMemory,
     WORKING_MEMORY_CAPACITY,
 };
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 /// 一轮话语的语用类型（对话本体的「动作类」）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoveKind {
@@ -143,8 +143,15 @@ pub struct DialogueManagerSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic_followup: Option<EpistemicFollowup>,
     /// 类型对话记忆：焦点类型、成员游标与已说槽位（空态省略）。
-    #[serde(default, skip_serializing_if = "crate::type_memory::TypeDialogueMemory::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::type_memory::TypeDialogueMemory::is_empty"
+    )]
     pub type_memory: crate::type_memory::TypeDialogueMemory,
+    /// 等待用户回答的指称澄清：跨快照恢复后仍能结算「1」「不是 A，是 B」。
+    /// 空态省略，未发生澄清的会话字节不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reference: Option<ClarifyRequest>,
 }
 /// 管理器的生成结果：文本 + 命中的策略 + 语用类型。
 #[derive(Clone, Debug)]
