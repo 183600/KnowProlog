@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::chronicle::{Chronicle, ChronicleEntry, EntityRef};
 
 use crate::context_image::fnv1a_hex;
-use crate::identity::encode_segment;
+use crate::identity::{encode_segment, entity_uri, DEFAULT_BASE_NS};
 
 pub const DEFAULT_DIALOGUE_NS: &str = "http://example.org/kg/dialogue/";
 pub const DIALOGUE_SESSION_VERSION: u32 = 1;
@@ -482,6 +482,7 @@ pub struct MentionArtifact {
     pub uri: String,
     pub surface: String,
     pub entity: Option<String>,
+    pub entity_uri: Option<String>,
     pub source: String,
 }
 
@@ -492,6 +493,7 @@ pub struct TurnArtifact {
     pub user: String,
     pub mode: String,
     pub focus: Option<String>,
+    pub focus_uri: Option<String>,
     pub kb_revision: u64,
     pub mentions: Vec<MentionArtifact>,
 }
@@ -849,12 +851,22 @@ impl DialogueArtifactIndex {
                 append_block(&mut output, "用户", &turn.user);
                 append_block(&mut output, "模式", &turn.mode);
                 if let Some(focus) = turn.focus.as_deref() {
-                    append_block(&mut output, "焦点", focus);
+                    match turn.focus_uri.as_deref() {
+                        Some(uri) => {
+                            append_block(&mut output, "焦点", &format!("{}（{}）", focus, uri))
+                        }
+                        None => append_block(&mut output, "焦点", focus),
+                    }
                 }
                 if !turn.mentions.is_empty() {
                     output.push_str("  提及：\n");
                     for mention in &turn.mentions {
-                        let entity = mention.entity.as_deref().unwrap_or("（未链接）");
+                        let entity =
+                            match (mention.entity.as_deref(), mention.entity_uri.as_deref()) {
+                                (Some(name), Some(uri)) => format!("{}（{}）", name, uri),
+                                (Some(name), None) => name.to_string(),
+                                _ => "（未链接）".to_string(),
+                            };
                         output.push_str(&format!(
                             "    {}. {}  {} → {}（{}）\n",
                             mention.index, mention.uri, mention.surface, entity, mention.source
@@ -931,11 +943,12 @@ impl DialogueArtifactIndex {
                     mention.index
                 ));
                 append_block(&mut output, "词面", &mention.surface);
-                append_block(
-                    &mut output,
-                    "实体",
-                    mention.entity.as_deref().unwrap_or("（未链接）"),
-                );
+                let entity = match (mention.entity.as_deref(), mention.entity_uri.as_deref()) {
+                    (Some(name), Some(uri)) => format!("{}（{}）", name, uri),
+                    (Some(name), None) => name.to_string(),
+                    _ => "（未链接）".to_string(),
+                };
+                append_block(&mut output, "实体", &entity);
                 append_block(&mut output, "来源", &mention.source);
                 append_block(&mut output, "轮次", &turn.uri);
             }
@@ -990,16 +1003,20 @@ impl DialogueArtifactIndex {
                 continue;
             }
             let index = mentions.len() as u32 + 1;
+            let entity = reference
+                .entity
+                .as_deref()
+                .map(str::trim)
+                .filter(|entity| !entity.is_empty())
+                .map(str::to_string);
             mentions.push(MentionArtifact {
                 index,
                 uri: mention_uri(&self.session, entry.seq, index),
                 surface: surface.to_string(),
-                entity: reference
-                    .entity
+                entity_uri: entity
                     .as_deref()
-                    .map(str::trim)
-                    .filter(|entity| !entity.is_empty())
-                    .map(str::to_string),
+                    .map(|entity| entity_uri(DEFAULT_BASE_NS, entity)),
+                entity,
                 source: reference.source.clone(),
             });
         }
@@ -1011,6 +1028,7 @@ impl DialogueArtifactIndex {
                     uri: mention_uri(&self.session, entry.seq, index),
                     surface: focus.to_string(),
                     entity: None,
+                    entity_uri: None,
                     source: "focus".to_string(),
                 });
             }
@@ -1022,6 +1040,9 @@ impl DialogueArtifactIndex {
                 uri: turn_uri(&self.session, entry.seq),
                 user,
                 mode,
+                focus_uri: focus
+                    .as_deref()
+                    .map(|focus| entity_uri(DEFAULT_BASE_NS, focus)),
                 focus,
                 kb_revision: entry.kb_revision,
                 mentions,
@@ -1430,6 +1451,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (session, index, _) = sample_index(&dir);
         assert_eq!(index.turn_count(), 1);
+        assert!(index.latest_turn().unwrap().focus.is_none());
         assert_eq!(index.reply_count(), 1);
         assert_eq!(index.claim_count(), 2);
         assert_eq!(index.evidence_count(), 2);
@@ -1440,6 +1462,10 @@ mod tests {
         assert_eq!(turn.mentions.len(), 1);
         assert_eq!(turn.mentions[0].surface, "姚明");
         assert_eq!(turn.mentions[0].entity.as_deref(), Some("姚明"));
+        assert_eq!(
+            turn.mentions[0].entity_uri.as_deref(),
+            Some(entity_uri(DEFAULT_BASE_NS, "姚明").as_str())
+        );
         assert!(matches!(
             index.resolve(&turn.uri).unwrap(),
             ResolvedArtifact::Turn(_)
