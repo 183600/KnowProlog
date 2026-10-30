@@ -556,6 +556,7 @@ impl FrameProgram {
             let pattern = &frame.patterns[pattern_index];
             memory.pending = None;
             memory.pending_ambiguity = None;
+            memory.session = None;
             memory.turn = turn;
             let mut outcome = self.outcome(frame, pattern, executed, turn);
             outcome.plan.insert(0, "frame_fault".to_string());
@@ -614,6 +615,7 @@ impl FrameProgram {
                 .collect();
             let prompt = ambiguity_prompt(raw, &candidates, distinct.len(), distinct.len() > shown);
             memory.pending = None;
+            memory.session = None;
             memory.pending_ambiguity = Some(PendingAmbiguity {
                 raw: raw.to_string(),
                 prompt: prompt.clone(),
@@ -708,6 +710,7 @@ impl FrameProgram {
         }
         if is_cancel_reply(input) {
             memory.pending_ambiguity = None;
+            memory.session = None;
             memory.ambiguities_cancelled += 1;
             return Some(FrameOutcome {
                 text: "好的，这次追问先放下。".to_string(),
