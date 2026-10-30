@@ -538,51 +538,86 @@ impl AttributeRegistry {
         }
     }
 
-    /// 从「主体 + 属性词面 + 值」句式中抽取第一条属性候选。
+    /// 从「主体 + 属性词面 + 值」句式中抽取全部属性候选。
     ///
     /// 只负责结构切分，不判断值是否合法；调用方用 [`Self::assess`] 决定
     /// 接受、标记或拒绝。问句式后缀（多少/什么/吗…）不会被当作断言。
+    ///
+    /// 同一句里的后续属性可以省略主体（「姚明身高226，体重120」）：
+    /// 优先使用属性词面左侧最近的姓名 token，找不到时沿用前一条候选的
+    /// 主体。值域以下一个属性词面为右边界，避免把「226体重120」粘成一个值。
     pub fn extract_mentions(&self, text: &str, tagged_words: &[TaggedWord]) -> Vec<AttributeMention> {
         if text.trim().is_empty() || self.profiles.is_empty() {
             return Vec::new();
         }
-        let Some((surface, attribute, start, end)) = self.find_first_surface(text) else {
-            return Vec::new();
-        };
-        let prefix = &text[..start];
-        let suffix = &text[end..];
-        let Some(subject) = extract_subject(prefix, text, start, tagged_words) else {
-            return Vec::new();
-        };
-        let Some(raw_value) = clean_value(suffix) else {
-            return Vec::new();
-        };
-        vec![AttributeMention {
-            subject,
-            attribute,
-            surface,
-            raw_value,
-            start,
-            end,
-        }]
+        let surfaces = self.extraction_surfaces();
+        let mut mentions = Vec::new();
+        let mut cursor = 0usize;
+        let mut last_subject: Option<String> = None;
+        while cursor < text.len() {
+            let Some((surface, attribute, start, end)) =
+                find_surface_at_or_after(text, cursor, &surfaces)
+            else {
+                break;
+            };
+            let next_start = find_surface_at_or_after(text, end, &surfaces)
+                .map(|(_, _, next, _)| next)
+                .unwrap_or(text.len());
+            let prefix = &text[..start];
+            let suffix = &text[end..next_start];
+            if let Some(raw_value) = clean_value(suffix) {
+                if let Some(subject) = extract_subject(
+                    prefix,
+                    text,
+                    start,
+                    tagged_words,
+                    last_subject.as_deref(),
+                    &surfaces,
+                ) {
+                    last_subject = Some(subject.clone());
+                    mentions.push(AttributeMention {
+                        subject,
+                        attribute,
+                        surface,
+                        raw_value,
+                        start,
+                        end,
+                    });
+                }
+            }
+            cursor = end;
+        }
+        mentions
     }
 
     fn find_first_surface(&self, text: &str) -> Option<(String, String, usize, usize)> {
-        let surfaces = self.extraction_surfaces();
-        for (index, _) in text.char_indices() {
-            for (surface, canonical) in &surfaces {
-                let length = surface.len();
-                if index + length > text.len() || !text.is_char_boundary(index + length) {
-                    continue;
-                }
-                let candidate = &text[index..index + length];
-                if candidate == surface || candidate.to_lowercase() == surface.to_lowercase() {
-                    return Some((surface.clone(), canonical.clone(), index, index + length));
-                }
+        find_surface_at_or_after(text, 0, &self.extraction_surfaces())
+    }
+}
+
+/// 在 `from` 之后寻找最早的属性词面；同一位置按已排序词面取最长者。
+fn find_surface_at_or_after(
+    text: &str,
+    from: usize,
+    surfaces: &[(String, String)],
+) -> Option<(String, String, usize, usize)> {
+    if from >= text.len() || !text.is_char_boundary(from) {
+        return None;
+    }
+    for (offset, _) in text[from..].char_indices() {
+        let index = from + offset;
+        for (surface, canonical) in surfaces {
+            let length = surface.len();
+            if index + length > text.len() || !text.is_char_boundary(index + length) {
+                continue;
+            }
+            let candidate = &text[index..index + length];
+            if candidate == surface || candidate.to_lowercase() == surface.to_lowercase() {
+                return Some((surface.clone(), canonical.clone(), index, index + length));
             }
         }
-        None
     }
+    None
 }
 
 /// 单位化属性问句的解析结果。
@@ -879,12 +914,26 @@ fn extract_subject(
     text: &str,
     alias_start: usize,
     tagged_words: &[TaggedWord],
+    last_subject: Option<&str>,
+    surfaces: &[(String, String)],
 ) -> Option<String> {
     if let Some(name) = last_name_token(text, alias_start, tagged_words) {
         return Some(name);
     }
     let cleaned = clean_subject(prefix);
-    (!cleaned.is_empty()).then_some(cleaned)
+    if cleaned.is_empty() {
+        return last_subject.map(str::to_string);
+    }
+    // 省略主语的后续属性：前缀里已经出现过属性词面（「姚明身高226」），
+    // 说明 cleaned 把上一条属性也吞进来了，沿用上一条主体而不是造出新名字。
+    if last_subject.is_some()
+        && surfaces
+            .iter()
+            .any(|(surface, _)| prefix.contains(surface.as_str()))
+    {
+        return last_subject.map(str::to_string);
+    }
+    Some(cleaned)
 }
 
 fn last_name_token(
@@ -1017,6 +1066,16 @@ mod tests {
                     ..AttributeProfileConfig::default()
                 },
                 AttributeProfileConfig {
+                    name: "weight".to_string(),
+                    aliases: vec!["体重".to_string()],
+                    domain: vec!["Person".to_string()],
+                    value_type: AttributeValueType::Quantity,
+                    dimension: Some("mass".to_string()),
+                    unit: Some("千克".to_string()),
+                    functional: true,
+                    ..AttributeProfileConfig::default()
+                },
+                AttributeProfileConfig {
                     name: "age".to_string(),
                     aliases: vec!["年龄".to_string()],
                     domain: vec!["Person".to_string()],
@@ -1146,6 +1205,52 @@ mod tests {
             }],
         );
         assert!(question.is_empty(), "问句不应落成属性断言");
+    }
+
+    #[test]
+    fn mentions_extract_all_attributes_with_shared_subject() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let tagged = vec![
+            TaggedWord {
+                text: "姚明".to_string(),
+                pos: "nr".to_string(),
+            },
+            TaggedWord {
+                text: "身高".to_string(),
+                pos: "unknown".to_string(),
+            },
+            TaggedWord {
+                text: "体重".to_string(),
+                pos: "unknown".to_string(),
+            },
+        ];
+        let mentions = registry.extract_mentions("姚明身高2.26米，体重120千克。", &tagged);
+        assert_eq!(mentions.len(), 2, "{mentions:?}");
+        assert_eq!(mentions[0].subject, "姚明");
+        assert_eq!(mentions[0].attribute, "height");
+        assert_eq!(mentions[0].raw_value, "2.26米");
+        assert_eq!(mentions[1].subject, "姚明", "省略主体应沿用前一条候选");
+        assert_eq!(mentions[1].attribute, "weight");
+        assert_eq!(mentions[1].raw_value, "120千克");
+    }
+
+    #[test]
+    fn mentions_prefer_longest_surface_at_same_position() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let mentions = registry.extract_mentions("姚明净身高225厘米", &[]);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].attribute, "net_height");
+        assert_eq!(mentions[0].raw_value, "225厘米");
+    }
+
+    #[test]
+    fn mentions_bound_value_by_next_attribute_without_punctuation() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let mentions = registry.extract_mentions("姚明身高226体重120", &[]);
+        assert_eq!(mentions.len(), 2, "{mentions:?}");
+        assert_eq!(mentions[0].raw_value, "226");
+        assert_eq!(mentions[1].attribute, "weight");
+        assert_eq!(mentions[1].raw_value, "120");
     }
 
     #[test]
@@ -1283,6 +1388,43 @@ parent = "height"
                 assert_eq!(
                     properties.get("height").map(String::as_str),
                     Some("226厘米")
+                );
+            }
+            other => panic!("期望实体项，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn knowledge_extractor_merges_multiple_attribute_facts_for_one_subject() {
+        let config = std::sync::Arc::new(extraction_config());
+        let extractor = crate::KnowledgeExtractor::new(config);
+        let tagged = vec![
+            TaggedWord {
+                text: "姚明".to_string(),
+                pos: "nr".to_string(),
+            },
+            TaggedWord {
+                text: "身高".to_string(),
+                pos: "unknown".to_string(),
+            },
+            TaggedWord {
+                text: "净身高".to_string(),
+                pos: "unknown".to_string(),
+            },
+        ];
+        let items = extractor.extract("姚明身高2.26米，净身高2.25米", &tagged);
+        assert_eq!(items.len(), 1, "{:?}", items);
+        match &items[0] {
+            crate::KnowledgeItem::Entity { label, properties } => {
+                assert_eq!(label, "Person");
+                assert_eq!(properties.get("name").map(String::as_str), Some("姚明"));
+                assert_eq!(
+                    properties.get("height").map(String::as_str),
+                    Some("226厘米")
+                );
+                assert_eq!(
+                    properties.get("net_height").map(String::as_str),
+                    Some("225厘米")
                 );
             }
             other => panic!("期望实体项，实际 {:?}", other),

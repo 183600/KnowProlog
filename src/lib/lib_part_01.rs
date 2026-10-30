@@ -922,7 +922,11 @@ impl KnowledgeExtractor {
                 } else {
                     part_tagged
                 };
-                items.extend(self.extract(part, &normalized_part_tagged));
+                for item in self.extract(part, &normalized_part_tagged) {
+                    // 整句已抽到的同一实体不能被分句重抽成第二条：
+                    // 属性桥的规范化取值与旧规则的原始取值要落在同一条记录上。
+                    merge_attribute_item(&mut items, item);
+                }
             }
         }
 
