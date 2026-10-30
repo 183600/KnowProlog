@@ -693,10 +693,18 @@ impl PortOutcome {
         match request.mode {
             SearchMode::Verify => {
                 if let Some(claim) = request.constraints.object.as_deref() {
-                    output.push_str(&format!(
-                        "是。语义检索端口找到支持「{}」的已核实证据。\n",
-                        claim
-                    ));
+                    let claim = claim.trim();
+                    if values.iter().any(|value| value.value == claim) {
+                        output.push_str(&format!(
+                            "是。语义检索端口找到支持「{}」的已核实证据。\n",
+                            claim
+                        ));
+                    } else {
+                        output.push_str(&format!(
+                            "未找到支持「{}」的已核实证据（检索失败不等于该事实为假）。\n",
+                            claim
+                        ));
+                    }
                 } else {
                     output.push_str("语义检索端口找到已核实证据，但未指定待验证取值。\n");
                 }
@@ -1699,6 +1707,16 @@ mod tests {
         assert!(outcome.hits.is_empty());
         let rendered = outcome.render_answer(&missing);
         assert!(rendered.contains("没有找到"), "{}", rendered);
+        assert!(!rendered.contains("是。"), "{}", rendered);
+
+        let batch = backend.search(&request);
+        let stale = PortOutcome {
+            hits: batch.hits.clone(),
+            receipt: batch.receipt.clone(),
+            batches: vec![batch],
+        };
+        let rendered = stale.render_answer(&missing);
+        assert!(rendered.contains("未找到支持"), "{}", rendered);
         assert!(!rendered.contains("是。"), "{}", rendered);
     }
 
