@@ -1064,7 +1064,7 @@ fn parse_exclude(question: &str) -> Option<String> {
     let mut found: Option<(usize, usize)> = None;
     for prefix in prefixes {
         if let Some(index) = question.find(prefix) {
-            if found.map_or(true, |(start, _)| index < start) {
+            if found.is_none_or(|(start, _)| index < start) {
                 found = Some((index, prefix.len()));
             }
         }
