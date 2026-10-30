@@ -535,14 +535,15 @@ impl BindingTable {
                 }
             }
             for (variable, expected) in &self.shape.pinned {
-                if let Some(found) = row.cells.get(variable) {
-                    if !terms_equal(expected, found) {
-                        return Err(TableError::PinnedMismatch {
-                            variable: variable.clone(),
-                            expected: expected.render_raw().unwrap_or_default(),
-                            found: found.render_raw().unwrap_or_default(),
-                        });
-                    }
+                let Some(found) = row.cells.get(variable) else {
+                    return Err(TableError::UnboundPinned(variable.clone()));
+                };
+                if !terms_equal(expected, found) {
+                    return Err(TableError::PinnedMismatch {
+                        variable: variable.clone(),
+                        expected: expected.render_raw().unwrap_or_default(),
+                        found: found.render_raw().unwrap_or_default(),
+                    });
                 }
             }
         }
@@ -1871,6 +1872,16 @@ mod tests {
         assert_eq!(table.rows[0].evidence, vec![facts[0].clone()]);
         assert!(table.coverage.caveat().contains("未证明完整"));
         assert!(table.render().contains("检索端口"));
+    }
+
+    #[test]
+    fn loaded_rows_must_bind_every_pinned_input() {
+        let shape = height_shape().pin("e", BoundTerm::text("张三"));
+        let mut table = BindingTable::new(shape, Coverage::Point, 7);
+        table
+            .rows
+            .push(BindingRow::from_pairs([("v", BoundTerm::classify("226"))]));
+        assert!(matches!(table.validate(), Err(TableError::UnboundPinned(name)) if name == "e"));
     }
 
     #[test]
