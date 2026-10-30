@@ -1544,6 +1544,25 @@ impl VariantClosure {
         variants
     }
 
+    pub fn alias_pairs(&self, context: &VariantContext) -> Vec<(String, String)> {
+        let mut surfaces: BTreeSet<String> = BTreeSet::new();
+        for edge in &self.edges {
+            if !edge.refuted {
+                surfaces.insert(edge.from.clone());
+            }
+        }
+        let mut pairs: Vec<(String, String)> = surfaces
+            .into_iter()
+            .filter_map(|surface| {
+                let canonical = self.resolve(&surface, context).canonical()?.to_string();
+                (canonical != surface).then_some((surface, canonical))
+            })
+            .collect();
+        pairs.sort();
+        pairs.dedup();
+        pairs
+    }
+
     pub fn surface_for(
         &self,
         anchor: &str,
@@ -1904,6 +1923,20 @@ mod tests {
         let choice = closure.surface_for("中国科学院大学", &VariantContext::new(), &[]);
         assert_eq!(choice.surface, "国科大");
         assert!(choice.reversible);
+    }
+
+    #[test]
+    fn alias_pairs_expand_nested_variants_but_skip_ambiguous_surfaces() {
+        let closure = VariantClosure::from_parts(&registry(), &synonym_graph());
+        let pairs = closure.alias_pairs(&VariantContext::new());
+        assert!(pairs.contains(&("UCAS".to_string(), "中国科学院大学".to_string())));
+        assert!(pairs.contains(&("国科大".to_string(), "中国科学院大学".to_string())));
+
+        let mut registry = EntityRegistry::new();
+        registry.confirm_alias_with_origin("北大", "北京大学", NominationOrigin::Dialogue);
+        registry.confirm_alias_with_origin("北大", "北大方正", NominationOrigin::Dialogue);
+        let ambiguous = VariantClosure::from_registry(&registry).alias_pairs(&VariantContext::new());
+        assert!(ambiguous.iter().all(|(surface, _)| surface != "北大"));
     }
 
     #[test]

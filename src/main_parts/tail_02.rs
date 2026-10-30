@@ -418,6 +418,23 @@ fn sync_entity_aliases(reasoner: &mut SymbolicReasoner, oxigraph_manager: &Oxigr
     reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
 }
 
+/// 把注册表与同义词图共同支撑的、无歧义的名变体同步进链接器：
+/// 嵌套简称/跨层别名只有经过锚定闭包才能落回唯一身份，扁平别名表看不到。
+async fn sync_entity_variant_aliases(
+    reasoner: &mut SymbolicReasoner,
+    oxigraph_manager: &OxigraphManager,
+) -> usize {
+    let mut closure = VariantClosure::from_registry(&oxigraph_manager.entity_registry_snapshot());
+    match oxigraph_manager.load_synonym_graph().await {
+        Ok(graph) => {
+            closure.add_synonym_graph(&graph);
+        }
+        Err(_) => return 0,
+    }
+    let pairs = closure.alias_pairs(&VariantContext::new());
+    reasoner.align_entity_aliases(&pairs)
+}
+
 /// 把全息命令参数切成若干词项：支持空白/中英文逗号/冒号分隔
 fn parse_holo_terms(target: &str, expected: usize) -> Option<Vec<String>> {
     let terms: Vec<String> = target

@@ -299,6 +299,11 @@ async fn run_interactive_mode(
     }
     // 实体身份：已确认的持久别名同步进链接器（别名与规范名同权）
     sync_entity_aliases(&mut symbolic_reasoner, &oxigraph_manager);
+    let variant_aliases =
+        sync_entity_variant_aliases(&mut symbolic_reasoner, &oxigraph_manager).await;
+    if variant_aliases > 0 {
+        println!("已同步可推导名变体：{} 条。", variant_aliases);
+    }
     // 语境指称消歧（CRD）：跨轮「说法 ↔ 实体」绑定账本 + 区分性追问；
     // 账本落盘 {store}/reference_bindings.json，重启后仍记得澄清过的指称。
     let reference_binding_path = format!("{}/reference_bindings.json", store_path);

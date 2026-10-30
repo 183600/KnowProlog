@@ -1518,6 +1518,7 @@ async fn build_store_reasoner(
     // （传递/对称/互逆）必须一起进入只读推理器；只同步别名会让 ask 忽略配置律。
     sync_predicate_pairs(&mut reasoner, oxigraph_manager);
     reasoner.align_entity_aliases(&oxigraph_manager.confirmed_entity_aliases());
+    sync_entity_variant_aliases(&mut reasoner, oxigraph_manager).await;
     if let Some(persisted) = LawBook::load_from_path(&format!("{}/law_book.json", store_path)) {
         reasoner.load_persisted_laws(persisted);
     }
