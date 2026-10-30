@@ -927,6 +927,75 @@ impl BindingTable {
         lines.join("\n")
     }
 
+    /// 只渲染指定变量已绑定的取值；未绑定单元格显式留白，每个取值都
+    /// 带上行内证据。单值、列表与零值使用不同措辞，覆盖范围始终随行。
+    pub fn render_values(&self, variable: &str) -> Result<String, TableError> {
+        self.validate()?;
+        self.require_variable(variable)?;
+        let mut values: Vec<(String, Vec<FactRef>)> = Vec::new();
+        let mut unbound = 0usize;
+        for row in &self.rows {
+            match row.get(variable).filter(|term| term.is_bound()) {
+                Some(term) => {
+                    let raw = term.to_string();
+                    match values.iter_mut().find(|(known, _)| known == &raw) {
+                        Some((_, evidence)) => {
+                            for fact in &row.evidence {
+                                if !evidence.contains(fact) {
+                                    evidence.push(fact.clone());
+                                }
+                            }
+                        }
+                        None => values.push((raw, row.evidence.clone())),
+                    }
+                }
+                None => unbound += 1,
+            }
+        }
+        let mut lines = Vec::new();
+        if values.is_empty() {
+            lines.push(format!("绑定表里 ?{} 没有已绑定的取值。", variable));
+        } else if values.len() == 1 {
+            lines.push(format!("?{} 的取值是「{}」。", variable, values[0].0));
+        } else {
+            let rendered = values
+                .iter()
+                .take(REPORT_ROW_CAP)
+                .map(|(value, _)| format!("「{}」", value))
+                .collect::<Vec<_>>()
+                .join("、");
+            lines.push(format!(
+                "?{} 有 {} 个取值：{}。",
+                variable,
+                values.len(),
+                rendered
+            ));
+        }
+        if unbound > 0 {
+            lines.push(format!("另有 {} 行未绑定 ?{}，已留白。", unbound, variable));
+        }
+        lines.push(format!("覆盖：{}", self.coverage.caveat()));
+        for (value, evidence) in values.iter().take(REPORT_ROW_CAP) {
+            let facts = if evidence.is_empty() {
+                "无证据".to_string()
+            } else {
+                evidence
+                    .iter()
+                    .map(FactRef::display)
+                    .collect::<Vec<_>>()
+                    .join("；")
+            };
+            lines.push(format!("  {} ← {}", value, facts));
+        }
+        if values.len() > REPORT_ROW_CAP {
+            lines.push(format!(
+                "…另有 {} 个取值未列出。",
+                values.len() - REPORT_ROW_CAP
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+
     fn require_variable(&self, variable: &str) -> Result<(), TableError> {
         if self.shape.variables.iter().any(|known| known == variable) {
             Ok(())
@@ -1645,6 +1714,28 @@ mod tests {
         let point = BindingTable::new(height_shape(), Coverage::Point, 1);
         let truncated = point.top_k(0).unwrap();
         assert!(truncated.coverage.is_point(), "点表截断后仍然只对点成立");
+    }
+
+    #[test]
+    fn value_generation_leaves_unbound_blank_and_cites_evidence() {
+        let table = height_table();
+        let text = table.render_values("v").expect("应能渲染取值");
+        assert!(text.contains("2 个取值"), "{}", text);
+        assert!(text.contains("226 厘米"), "{}", text);
+        assert!(text.contains("height(张三, 226 厘米)"), "{}", text);
+        assert!(text.contains("形状下的解已穷尽"), "{}", text);
+
+        let mut sparse = BindingTable::new(height_shape(), Coverage::Point, 7);
+        sparse
+            .add_row(BindingRow::from_pairs([
+                ("e", BoundTerm::text("张三")),
+                ("v", BoundTerm::Unbound),
+            ]))
+            .unwrap();
+        let text = sparse.render_values("v").expect("未绑定不是错误");
+        assert!(text.contains("没有已绑定的取值"), "{}", text);
+        assert!(text.contains("另有 1 行未绑定 ?v"), "{}", text);
+        assert!(text.contains("不得外推到其他实体"), "{}", text);
     }
 
     #[test]
