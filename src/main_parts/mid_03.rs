@@ -716,6 +716,7 @@ fn run_read_trace(
     corpus: Option<&str>,
     lexicon: bool,
     definitions: Option<&str>,
+    identity: bool,
     json: bool,
     config: &know_prolog::SystemConfig,
 ) {
@@ -777,6 +778,28 @@ fn run_read_trace(
     }
     let question = question.unwrap_or_default();
     let plan = QueryPlanner::new().parse(question);
+    let identity_lines = identity.then(|| {
+        let mut registry = know_prolog::predicate_registry::PredicateRegistry::new();
+        for profile in &config.predicate_profiles {
+            registry.declare(profile);
+        }
+        let book = know_prolog::law_book::LawBook::from_registry(&registry);
+        let schema = know_prolog::query_canonical::CanonicalSchema::from_law_book(&book);
+        let mut lines = Vec::new();
+        let Some(plan) = plan.as_ref() else {
+            lines.push("查询身份：没有可编译的计划，无法生成。".to_string());
+            return lines;
+        };
+        match know_prolog::query_canonical::canonicalize_plan(plan, &schema) {
+            Ok(canonical) => lines.push(canonical.receipt()),
+            Err(error) => lines.push(format!("查询身份：不可归一（{}）。", error)),
+        }
+        match know_prolog::query_canonical::audit_realization(plan, &schema) {
+            Some(audit) => lines.push(audit.receipt()),
+            None => lines.push("生成回读：该计划不支持生成中文问句。".to_string()),
+        }
+        lines
+    });
     let trace = match &inventory {
         Some(inventory) => lexical_trace::trace_question_with_inventory(
             question,
@@ -793,6 +816,15 @@ fn run_read_trace(
         }
     } else {
         println!("{}", trace.render_report());
+    }
+    if let Some(lines) = identity_lines {
+        for line in lines {
+            if json {
+                eprintln!("{}", line);
+            } else {
+                println!("{}", line);
+            }
+        }
     }
 }
 

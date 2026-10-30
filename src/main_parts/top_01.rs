@@ -616,6 +616,9 @@ enum Commands {
         /// accepted entries resolve coverage gaps without writing the KB
         #[arg(long, requires = "lexicon")]
         definitions: Option<String>,
+        /// Also print the canonical query identity and generated-question readback
+        #[arg(long)]
+        identity: bool,
         /// Print the trace/report as JSON
         #[arg(long)]
         json: bool,

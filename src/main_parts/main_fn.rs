@@ -340,6 +340,7 @@ async fn main() {
         corpus,
         lexicon,
         definitions,
+        identity,
         json,
     }) = &cli.command
     {
@@ -348,6 +349,7 @@ async fn main() {
             corpus.as_deref(),
             *lexicon,
             definitions.as_deref(),
+            *identity,
             *json,
             &config,
         );

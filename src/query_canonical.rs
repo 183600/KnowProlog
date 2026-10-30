@@ -1288,6 +1288,115 @@ fn mapping_from_choice(choice: &[Vec<String>]) -> BTreeMap<String, String> {
     mapping
 }
 
+/// 规范查询到中文表层的一次回读审计。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealizationAudit {
+    /// 生成的中文问句。
+    pub question: String,
+    /// 原计划的规范键。
+    pub original_key: String,
+    /// 回读后计划的关系种类。
+    pub readback_kind: Option<String>,
+    /// 回读后的规范键；回读失败或不可归一为 `None`。
+    pub readback_key: Option<String>,
+    /// 回读计划是否与原计划同键。
+    pub consistent: bool,
+}
+
+impl RealizationAudit {
+    pub fn receipt(&self) -> String {
+        format!(
+            "生成回读「{}」：{}；原键 {}，回读 {}（{}）",
+            self.question,
+            if self.consistent {
+                "同键"
+            } else {
+                "异键或无法回读"
+            },
+            self.original_key,
+            self.readback_key.as_deref().unwrap_or("—"),
+            self.readback_kind.as_deref().unwrap_or("—")
+        )
+    }
+}
+
+/// 为可逆的关系核心生成一个中文问句。
+///
+/// 只使用解析器能稳定读回的句式；不可逆的计划（路径、类比、否定是非等）
+/// 返回 `None`，宁可没有生成物，也不生成无法自检的句子。
+pub fn realize_question(plan: &QueryPlan) -> Option<String> {
+    match plan {
+        QueryPlan::FindObject { segments } if segments.len() >= 2 => {
+            Some(format!("{}是谁", segments.join("的")))
+        }
+        QueryPlan::FindObjectByPredicate { subject, predicate } => {
+            Some(format!("{}的{}是谁", subject, predicate))
+        }
+        QueryPlan::FindSubject { object, predicate } => {
+            Some(format!("{}是谁的{}", object, predicate))
+        }
+        QueryPlan::FindObjectExcept { .. } => None,
+        QueryPlan::FindSubjectExcept {
+            object,
+            predicate,
+            excluded,
+        } if !excluded.is_empty() => Some(format!(
+            "除了{}，还有谁的{}是{}",
+            excluded.join("、"),
+            predicate,
+            object
+        )),
+        QueryPlan::CheckTriple {
+            subject_segments,
+            object,
+        } if subject_segments.len() >= 2 => Some(format!(
+            "{}是{}",
+            subject_segments.join("的"),
+            object
+        )),
+        QueryPlan::CheckRelation {
+            subject,
+            predicate,
+            object,
+            negated: false,
+        } => Some(format!("{}的{}是{}", subject, predicate, object)),
+        QueryPlan::CheckRelation { negated: true, .. } => None,
+        QueryPlan::Count { subject, predicate } => {
+            Some(format!("{}有几个{}", subject, predicate))
+        }
+        QueryPlan::Exist { subject, predicate } => {
+            Some(format!("{}有没有{}", subject, predicate))
+        }
+        _ => None,
+    }
+}
+
+/// 生成中文问句并用同一 schema 回读，校验规范键是否保持不变。
+pub fn audit_realization(
+    plan: &QueryPlan,
+    schema: &CanonicalSchema,
+) -> Option<RealizationAudit> {
+    let original = canonicalize_plan(plan, schema).ok()?;
+    let question = realize_question(plan)?;
+    let readback = crate::query_planner::QueryPlanner::new().parse(&question);
+    let readback_kind = readback
+        .as_ref()
+        .map(crate::query_planner::QueryPlanner::kind)
+        .map(str::to_string);
+    let readback_key = readback
+        .as_ref()
+        .and_then(|readback| canonicalize_plan(readback, schema).ok())
+        .map(|canonical| canonical.key);
+    let consistent = readback_key.as_deref() == Some(original.key.as_str());
+    Some(RealizationAudit {
+        question,
+        original_key: original.key,
+        readback_kind,
+        readback_key,
+        consistent,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,6 +1585,59 @@ mod tests {
             canonicalize_kg_pattern(pattern, &schema).expect("KGP 模式应可归一");
         assert_eq!(graph_identity.key, pattern_identity.key);
         assert_eq!(graph_identity.atom_lines, vec!["a(v0,\"师傅\",v1)".to_string()]);
+    }
+
+    #[test]
+    fn realization_round_trips_supported_shapes() {
+        let schema = CanonicalSchema::new();
+        let plans = vec![
+            QueryPlan::FindObject {
+                segments: vec!["张三".to_string(), "师傅".to_string()],
+            },
+            find_object("张三", "师傅"),
+            QueryPlan::FindSubject {
+                object: "李四".to_string(),
+                predicate: "师傅".to_string(),
+            },
+            QueryPlan::FindSubjectExcept {
+                object: "李四".to_string(),
+                predicate: "师傅".to_string(),
+                excluded: vec!["王五".to_string(), "赵六".to_string()],
+            },
+            QueryPlan::CheckTriple {
+                subject_segments: vec!["张三".to_string(), "师傅".to_string()],
+                object: "李四".to_string(),
+            },
+            QueryPlan::CheckRelation {
+                subject: "张三".to_string(),
+                predicate: "师傅".to_string(),
+                object: "李四".to_string(),
+                negated: false,
+            },
+            QueryPlan::Count {
+                subject: "张三".to_string(),
+                predicate: "徒弟".to_string(),
+            },
+            QueryPlan::Exist {
+                subject: "张三".to_string(),
+                predicate: "徒弟".to_string(),
+            },
+        ];
+        for plan in plans {
+            let audit = audit_realization(&plan, &schema)
+                .unwrap_or_else(|| panic!("应能生成并回读：{:?}", plan));
+            assert!(audit.consistent, "{}", audit.receipt());
+        }
+        assert!(audit_realization(
+            &QueryPlan::CheckRelation {
+                subject: "张三".to_string(),
+                predicate: "师傅".to_string(),
+                object: "李四".to_string(),
+                negated: true,
+            },
+            &schema,
+        )
+        .is_none());
     }
 
     #[test]
