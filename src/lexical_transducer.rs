@@ -16,6 +16,51 @@ pub const LEXICAL_TRANSDUCER_VERSION: u32 = 1;
 pub const DEFAULT_MIN_SURFACE_CHARS: usize = 2;
 pub const DEFAULT_MAX_SURFACE_CHARS: usize = 32;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransducerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_protect_quoted_mentions")]
+    pub protect_quoted_mentions: bool,
+    #[serde(default = "default_min_surface_chars")]
+    pub min_surface_chars: usize,
+    #[serde(default = "default_max_surface_chars")]
+    pub max_surface_chars: usize,
+}
+
+impl Default for TransducerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protect_quoted_mentions: true,
+            min_surface_chars: DEFAULT_MIN_SURFACE_CHARS,
+            max_surface_chars: DEFAULT_MAX_SURFACE_CHARS,
+        }
+    }
+}
+
+impl TransducerConfig {
+    pub fn options(&self) -> TransducerOptions {
+        TransducerOptions {
+            min_surface_chars: self.min_surface_chars.max(1),
+            max_surface_chars: self.max_surface_chars.max(self.min_surface_chars.max(1)),
+            protect_quoted_mentions: self.protect_quoted_mentions,
+        }
+    }
+}
+
+fn default_protect_quoted_mentions() -> bool {
+    true
+}
+
+fn default_min_surface_chars() -> usize {
+    DEFAULT_MIN_SURFACE_CHARS
+}
+
+fn default_max_surface_chars() -> usize {
+    DEFAULT_MAX_SURFACE_CHARS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransducerOptions {
     pub min_surface_chars: usize,
@@ -838,12 +883,13 @@ where
                 piece_index += 1;
             }
             (Some(_), Some((None, _))) => {
-                let token = rewrites[rewrite_index];
-                output.push(TaggedWord {
-                    text: token.sense.clone(),
-                    pos: token.pos.clone(),
-                });
-                rewrite_index += 1;
+                emit_piece(
+                    &pieces[piece_index],
+                    &guards,
+                    &normalize,
+                    &mut output,
+                );
+                piece_index += 1;
             }
             (Some(_), _) => {
                 let token = rewrites[rewrite_index];
@@ -1348,6 +1394,58 @@ mod tests {
         let texts: Vec<&str> = output.iter().map(|word| word.text.as_str()).collect();
         assert_eq!(texts, vec!["“", "老婆", "”", "是", "谁"]);
         assert_eq!(transduction.receipt.protected_mentions, 1);
+    }
+
+    #[test]
+    fn tagged_words_rewrite_multiple_spans_without_reordering() {
+        let transducer = LexicalTransducer::new(
+            vec![
+                rule("老婆", "妻子"),
+                rule("老公", "丈夫"),
+                TransducerRule::new("老师", "师傅", SynonymKind::Predicate, "v"),
+            ],
+            TransducerOptions::default(),
+        );
+        let words = tagged(&[
+            ("我", "r"),
+            ("老婆", "n"),
+            ("和", "c"),
+            ("老公", "n"),
+            ("是", "v"),
+            ("老师", "v"),
+        ]);
+        let (output, _) = transduce_tagged_words(
+            "我老婆和老公是老师",
+            &words,
+            &transducer,
+            &SynonymContext::new(),
+            |left, right| left == right,
+            |word| word.clone(),
+        );
+        let texts: Vec<&str> = output.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(texts, vec!["我", "妻子", "和", "丈夫", "是", "师傅"]);
+    }
+
+    #[test]
+    fn tagged_words_fall_back_on_unaligned_tokens() {
+        let transducer = LexicalTransducer::new(
+            vec![rule("老大", "长者")],
+            TransducerOptions::default(),
+        );
+        let words = tagged(&[("xyz", "n"), ("老大", "n")]);
+        let (output, _) = transduce_tagged_words(
+            "abc老大",
+            &words,
+            &transducer,
+            &SynonymContext::new(),
+            |left, right| left == right,
+            |word| TaggedWord {
+                text: format!("{}!", word.text),
+                pos: word.pos.clone(),
+            },
+        );
+        let texts: Vec<&str> = output.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(texts, vec!["xyz!", "长者"]);
     }
 
     #[test]

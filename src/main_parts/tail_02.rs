@@ -16,6 +16,7 @@ fn synonym_context_from_reasoner(reasoner: &SymbolicReasoner) -> SynonymContext 
 /// 查询词归一化：同义词图 + 对话焦点语境 + 类型体系闭包。
 /// 歧义词面保持原样；无图证据时回退扁平同义词表。
 fn normalize_query_words(
+    input: &str,
     words: Vec<TaggedWord>,
     graph: &SynonymGraph,
     reasoner: &SymbolicReasoner,
@@ -24,6 +25,34 @@ fn normalize_query_words(
 ) -> Vec<TaggedWord> {
     let context = synonym_context_from_reasoner(reasoner);
     let types = TypeSystem::from_config(&config.type_system);
+    if config.lexical_transducer.enabled {
+        let transducer = know_prolog::lexical_transducer::LexicalTransducer::compile(
+            graph,
+            reasoner.mention_lexicon(),
+            synonyms,
+            config.lexical_transducer.options(),
+        );
+        let (transduced, _) = know_prolog::lexical_transducer::transduce_tagged_words(
+            input,
+            &words,
+            &transducer,
+            &context,
+            |left, right| types.types_compatible(left, right),
+            |word| {
+                normalize_words_sense_aware_with(
+                    vec![word.clone()],
+                    graph,
+                    &context,
+                    synonyms,
+                    |left, right| types.types_compatible(left, right),
+                )
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| word.clone())
+            },
+        );
+        return transduced;
+    }
     normalize_words_sense_aware_with(words, graph, &context, synonyms, |left, right| {
         types.types_compatible(left, right)
     })

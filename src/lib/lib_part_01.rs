@@ -373,6 +373,8 @@ pub struct SystemConfig {
     pub api: Option<ApiConfig>,
     pub nlp: NlpConfig,
     #[serde(default)]
+    pub lexical_transducer: lexical_transducer::TransducerConfig,
+    #[serde(default)]
     pub reasoning: ReasoningConfig,
     pub entity_types: Vec<EntityTypeConfig>,
     pub extraction_rules: Vec<ExtractionRule>,

@@ -16,6 +16,14 @@ external_ledger_path = ""            # 落盘路径；留空使用 <存储目录
 external_ledger_capacity = 64        # 条目数上限（LRU 淘汰）
 external_ledger_ttl_ticks = 0        # 时限（逻辑轮次，0 = 不过期，刷新用「外链刷新：实体」）
 
+# 词法转导：同义/别名按字符跨度改写，引号内按「提及」保留原词面，
+# 歧义与语境不符时保持原词面；关闭时查询路径逐字节回到旧行为。
+[lexical_transducer]
+enabled = true                         # 查询归一化启用统一转导器
+protect_quoted_mentions = true         # “老婆”/「老婆」按提及保护，《三体》等指称照常转导
+min_surface_chars = 2                  # 单字不做转导，避免吞掉功能词
+max_surface_chars = 32                 # 超长词面留给实体注册表，不进入转导索引
+
 # 符号推理配置（本体对齐 + 链接预测）
 [reasoning]
 enable_link_prediction = true          # 是否启用链接预测推理

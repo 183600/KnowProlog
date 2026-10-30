@@ -439,6 +439,7 @@
                     None
                 };
                 let normalized_words = normalize_query_words(
+                    input,
                     tagged_words.clone(),
                     &synonym_graph,
                     &symbolic_reasoner,
@@ -453,6 +454,7 @@
                     normalized_words.clone()
                 } else {
                     normalize_query_words(
+                        input,
                         lexicon_tagged_words,
                         &synonym_graph,
                         &symbolic_reasoner,
