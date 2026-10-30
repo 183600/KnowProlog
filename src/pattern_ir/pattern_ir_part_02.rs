@@ -640,7 +640,9 @@ fn sort_matches(sort: &str, hints: &[String], token: &crate::nlp::TaggedWord) ->
     match sort {
         "城市" | "地点" => {
             crate::pos_ontology::tag_matches("ns", &token.pos)
-                || crate::pos_ontology::tag_matches("n", &token.pos)
+                || token.pos == "n"
+                || crate::pos_ontology::profile(&token.pos)
+                    .has_sort(crate::pos_ontology::Sort::Place)
                 || CITY_LITERALS.contains(&token.text.as_str())
                 || hints.iter().any(|hint| token.text.contains(hint.as_str()))
         }

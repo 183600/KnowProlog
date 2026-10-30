@@ -255,7 +255,9 @@ impl NLUEngine {
     ) -> Option<String> {
         match slot_config.slot_type.as_str() {
             "城市" | "地点" => self.nth_matching_value(tagged_words, occurrence, |word| {
-                crate::pos_ontology::tag_matches("n", &word.pos)
+                word.pos == "n"
+                    || crate::pos_ontology::profile(&word.pos)
+                        .has_sort(crate::pos_ontology::Sort::Place)
                     || matches!(
                         word.text.as_str(),
                         "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉"

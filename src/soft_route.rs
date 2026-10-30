@@ -1170,7 +1170,7 @@ fn slot_match(
                 1.0
             } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Place) {
                 0.9
-            } else if crate::pos_ontology::tag_matches("n", &token.pos) {
+            } else if token.pos == "n" {
                 0.85
             } else {
                 return None;
@@ -1667,6 +1667,11 @@ mod tests {
             pos: "s".to_string(),
         };
         assert_eq!(slot_match("城市", "地点", &[], &place).map(|hit| hit.quality), Some(0.9));
+        let time = TaggedWord {
+            text: "今天".to_string(),
+            pos: "t".to_string(),
+        };
+        assert!(slot_match("城市", "地点", &[], &time).is_none());
     }
 
     #[test]
