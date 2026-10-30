@@ -12,10 +12,14 @@
 //! - 不引入外部依赖，摘要沿用规范 JSON + FNV-1a 64（完整性自检，非密码学）；
 //! - 未知命名空间显式报错，绝不把陌生 URI 静默当成实体。
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::chronicle::{Chronicle, ChronicleEntry, EntityRef};
 
 use crate::context_image::fnv1a_hex;
 use crate::identity::encode_segment;
@@ -472,6 +476,782 @@ impl DialogueSession {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionArtifact {
+    pub index: u32,
+    pub uri: String,
+    pub surface: String,
+    pub entity: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnArtifact {
+    pub seq: u64,
+    pub uri: String,
+    pub user: String,
+    pub mode: String,
+    pub focus: Option<String>,
+    pub kb_revision: u64,
+    pub mentions: Vec<MentionArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimArtifact {
+    pub index: u32,
+    pub uri: String,
+    pub statement_uri: String,
+    pub digest: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceArtifact {
+    pub uri: String,
+    pub digest: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyArtifact {
+    pub seq: u64,
+    pub uri: String,
+    pub turn_seq: Option<u64>,
+    pub question: Option<String>,
+    pub answer: String,
+    pub plan: Vec<String>,
+    pub proof_id: Option<String>,
+    pub kb_revision: u64,
+    pub claims: Vec<ClaimArtifact>,
+    pub evidence: Vec<EvidenceArtifact>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResolvedArtifact<'a> {
+    Session,
+    Turn(&'a TurnArtifact),
+    Reply(&'a ReplyArtifact),
+    Claim {
+        reply: &'a ReplyArtifact,
+        claim: &'a ClaimArtifact,
+    },
+    Statement {
+        digest: &'a str,
+        text: &'a str,
+    },
+    Mention {
+        turn: &'a TurnArtifact,
+        mention: &'a MentionArtifact,
+    },
+    Evidence {
+        digest: &'a str,
+        text: &'a str,
+    },
+}
+
+impl ResolvedArtifact<'_> {
+    pub fn kind(&self) -> ArtifactKind {
+        match self {
+            ResolvedArtifact::Session => ArtifactKind::Session,
+            ResolvedArtifact::Turn(_) => ArtifactKind::Turn,
+            ResolvedArtifact::Reply(_) => ArtifactKind::Reply,
+            ResolvedArtifact::Claim { .. } => ArtifactKind::Claim,
+            ResolvedArtifact::Statement { .. } => ArtifactKind::Statement,
+            ResolvedArtifact::Mention { .. } => ArtifactKind::Mention,
+            ResolvedArtifact::Evidence { .. } => ArtifactKind::Evidence,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DialogueArtifactIndex {
+    session: String,
+    turns: BTreeMap<u64, TurnArtifact>,
+    replies: BTreeMap<u64, ReplyArtifact>,
+    statements: BTreeMap<String, String>,
+    evidences: BTreeMap<String, String>,
+}
+
+impl DialogueArtifactIndex {
+    pub fn build(session: &str, entries: &[ChronicleEntry]) -> Self {
+        let mut index = Self {
+            session: session.trim().to_string(),
+            ..Self::default()
+        };
+        for entry in entries {
+            match entry.kind.as_str() {
+                "turn" => index.add_turn(entry),
+                "reply" => index.add_reply(entry),
+                _ => {}
+            }
+        }
+        index
+    }
+
+    pub fn from_chronicle(session: &DialogueSession, chronicle: &Chronicle) -> Self {
+        Self::build(session.id(), chronicle.entries())
+    }
+
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    pub fn session_uri(&self) -> String {
+        session_uri(&self.session)
+    }
+
+    pub fn turn_count(&self) -> usize {
+        self.turns.len()
+    }
+
+    pub fn reply_count(&self) -> usize {
+        self.replies.len()
+    }
+
+    pub fn claim_count(&self) -> usize {
+        self.replies.values().map(|reply| reply.claims.len()).sum()
+    }
+
+    pub fn evidence_count(&self) -> usize {
+        self.replies
+            .values()
+            .map(|reply| reply.evidence.len())
+            .sum()
+    }
+
+    pub fn turn(&self, seq: u64) -> Option<&TurnArtifact> {
+        self.turns.get(&seq)
+    }
+
+    pub fn reply(&self, seq: u64) -> Option<&ReplyArtifact> {
+        self.replies.get(&seq)
+    }
+
+    pub fn latest_turn(&self) -> Option<&TurnArtifact> {
+        self.turns.values().next_back()
+    }
+
+    pub fn latest_query_turn(&self) -> Option<&TurnArtifact> {
+        self.turns.values().rev().find(|turn| turn.mode == "query")
+    }
+
+    pub fn latest_reply(&self) -> Option<&ReplyArtifact> {
+        self.replies.values().next_back()
+    }
+
+    pub fn claim(&self, reply_seq: u64, index: u32) -> Option<&ClaimArtifact> {
+        self.reply(reply_seq)?
+            .claims
+            .iter()
+            .find(|claim| claim.index == index)
+    }
+
+    pub fn statement(&self, digest: &str) -> Option<&str> {
+        self.statements.get(digest).map(String::as_str)
+    }
+
+    pub fn evidence(&self, digest: &str) -> Option<&str> {
+        self.evidences.get(digest).map(String::as_str)
+    }
+
+    pub fn resolve(&self, uri: &str) -> Result<ResolvedArtifact<'_>, UriError> {
+        let reference = parse(uri)?;
+        if reference.session() != self.session {
+            return Err(UriError::UnknownArtifact(uri.to_string()));
+        }
+        match reference {
+            DialogueRef::Session { .. } => Ok(ResolvedArtifact::Session),
+            DialogueRef::Turn { seq, .. } => self
+                .turns
+                .get(&seq)
+                .map(ResolvedArtifact::Turn)
+                .ok_or_else(|| UriError::UnknownArtifact(uri.to_string())),
+            DialogueRef::Reply { seq, .. } => self
+                .replies
+                .get(&seq)
+                .map(ResolvedArtifact::Reply)
+                .ok_or_else(|| UriError::UnknownArtifact(uri.to_string())),
+            DialogueRef::Claim {
+                reply_seq, index, ..
+            } => {
+                let reply = self
+                    .replies
+                    .get(&reply_seq)
+                    .ok_or_else(|| UriError::UnknownArtifact(uri.to_string()))?;
+                let claim = reply
+                    .claims
+                    .iter()
+                    .find(|claim| claim.index == index)
+                    .ok_or_else(|| UriError::UnknownArtifact(uri.to_string()))?;
+                Ok(ResolvedArtifact::Claim { reply, claim })
+            }
+            DialogueRef::Statement { digest, .. } => self
+                .statements
+                .get_key_value(&digest)
+                .map(|(digest, text)| ResolvedArtifact::Statement {
+                    digest: digest.as_str(),
+                    text: text.as_str(),
+                })
+                .ok_or_else(|| UriError::UnknownArtifact(uri.to_string())),
+            DialogueRef::Mention {
+                turn_seq, index, ..
+            } => {
+                let turn = self
+                    .turns
+                    .get(&turn_seq)
+                    .ok_or_else(|| UriError::UnknownArtifact(uri.to_string()))?;
+                let mention = turn
+                    .mentions
+                    .iter()
+                    .find(|mention| mention.index == index)
+                    .ok_or_else(|| UriError::UnknownArtifact(uri.to_string()))?;
+                Ok(ResolvedArtifact::Mention { turn, mention })
+            }
+            DialogueRef::Evidence { digest, .. } => self
+                .evidences
+                .get_key_value(&digest)
+                .map(|(digest, text)| ResolvedArtifact::Evidence {
+                    digest: digest.as_str(),
+                    text: text.as_str(),
+                })
+                .ok_or_else(|| UriError::UnknownArtifact(uri.to_string())),
+        }
+    }
+
+    pub fn resolve_selector(&self, selector: &str) -> Result<ResolvedArtifact<'_>, String> {
+        let spec = selector.trim();
+        if spec.is_empty() {
+            return Err("用法：工件：<URI|上一轮|第2点|依据>".to_string());
+        }
+        if spec.starts_with("http://")
+            || spec.starts_with("https://")
+            || spec.starts_with(DEFAULT_DIALOGUE_NS)
+        {
+            return self.resolve(spec).map_err(|error| error.to_string());
+        }
+        match spec {
+            "上一轮" | "上一轮回答" | "上一条回答" | "最新回答" | "刚才的回答" => {
+                self.latest_reply()
+                    .map(ResolvedArtifact::Reply)
+                    .ok_or_else(|| "还没有可引用的回答。".to_string())
+            }
+            "上一轮问题" | "上一个问题" | "最新问题" | "刚才的问题" => self
+                .latest_query_turn()
+                .map(ResolvedArtifact::Turn)
+                .ok_or_else(|| "还没有可引用的查询轮次。".to_string()),
+            "依据" | "证据" | "出处" => self
+                .latest_reply()
+                .map(ResolvedArtifact::Reply)
+                .ok_or_else(|| "还没有可解释依据的回答。".to_string()),
+            _ => {
+                let index =
+                    parse_ordinal(spec).ok_or_else(|| format!("无法识别工件选择「{}」。", spec))?;
+                let reply = self
+                    .latest_reply()
+                    .ok_or_else(|| "还没有可引用的回答。".to_string())?;
+                let claim = reply
+                    .claims
+                    .iter()
+                    .find(|claim| claim.index == index)
+                    .ok_or_else(|| {
+                        format!(
+                            "最新回答只有 {} 点，没有第 {} 点。",
+                            reply.claims.len(),
+                            index
+                        )
+                    })?;
+                Ok(ResolvedArtifact::Claim { reply, claim })
+            }
+        }
+    }
+
+    pub fn render_report(&self) -> String {
+        let mut output = String::new();
+        output.push_str("对话工件索引\n");
+        output.push_str(&format!("  会话：{}\n", self.session_uri()));
+        output.push_str(&format!(
+            "  计数：轮次 {}，回答 {}，命题 {}，依据 {}\n",
+            self.turn_count(),
+            self.reply_count(),
+            self.claim_count(),
+            self.evidence_count()
+        ));
+        let mut recent: Vec<(u64, String)> = Vec::new();
+        for turn in self.turns.values() {
+            recent.push((
+                turn.seq,
+                format!(
+                    "  [轮次 {}] {}  用户：{}",
+                    turn.seq,
+                    turn.uri,
+                    compact(&turn.user, 40)
+                ),
+            ));
+        }
+        for reply in self.replies.values() {
+            let question = reply
+                .question
+                .as_deref()
+                .map(|question| format!("，问题：{}", compact(question, 24)))
+                .unwrap_or_default();
+            recent.push((
+                reply.seq,
+                format!(
+                    "  [回答 {}] {}{}  回答：{}",
+                    reply.seq,
+                    reply.uri,
+                    question,
+                    compact(&reply.answer, 40)
+                ),
+            ));
+        }
+        recent.sort_by_key(|(seq, _)| *seq);
+        if recent.is_empty() {
+            output.push_str("  最近：（还没有可寻址的对话工件）\n");
+        } else {
+            output.push_str("  最近：\n");
+            for (_, line) in recent.iter().rev().take(8).rev() {
+                output.push_str(line);
+                output.push('\n');
+            }
+        }
+        output.push_str("  用法：工件：上一轮 / 工件：第2点 / 工件：依据 / 工件：<URI>\n");
+        output
+    }
+
+    pub fn render_selector(&self, selector: &str) -> String {
+        let spec = selector.trim();
+        if matches!(spec, "依据" | "证据" | "出处") {
+            return self.render_latest_evidence();
+        }
+        match self.resolve_selector(spec) {
+            Ok(resolved) => self.render_resolved(&resolved),
+            Err(error) => format!("无法解析工件选择「{}」：{}", spec, error),
+        }
+    }
+
+    pub fn render_resolved(&self, resolved: &ResolvedArtifact<'_>) -> String {
+        let mut output = String::new();
+        match resolved {
+            ResolvedArtifact::Session => {
+                output.push_str(&format!("工件：{}\n", self.session_uri()));
+                output.push_str(&format!("  类型：{}\n", ArtifactKind::Session.label_zh()));
+                output.push_str(&self.render_report());
+            }
+            ResolvedArtifact::Turn(turn) => {
+                output.push_str(&format!("工件：{}\n", turn.uri));
+                output.push_str(&format!(
+                    "  类型：{}（seq {}，KB 修订 {}）\n",
+                    ArtifactKind::Turn.label_zh(),
+                    turn.seq,
+                    turn.kb_revision
+                ));
+                append_block(&mut output, "用户", &turn.user);
+                append_block(&mut output, "模式", &turn.mode);
+                if let Some(focus) = turn.focus.as_deref() {
+                    append_block(&mut output, "焦点", focus);
+                }
+                if !turn.mentions.is_empty() {
+                    output.push_str("  提及：\n");
+                    for mention in &turn.mentions {
+                        let entity = mention.entity.as_deref().unwrap_or("（未链接）");
+                        output.push_str(&format!(
+                            "    {}. {}  {} → {}（{}）\n",
+                            mention.index, mention.uri, mention.surface, entity, mention.source
+                        ));
+                    }
+                }
+            }
+            ResolvedArtifact::Reply(reply) => {
+                output.push_str(&format!("工件：{}\n", reply.uri));
+                let linked = reply
+                    .turn_seq
+                    .map(|seq| format!("，关联轮次 seq {}", seq))
+                    .unwrap_or_default();
+                output.push_str(&format!(
+                    "  类型：{}（seq {}，KB 修订 {}{}）\n",
+                    ArtifactKind::Reply.label_zh(),
+                    reply.seq,
+                    reply.kb_revision,
+                    linked
+                ));
+                if let Some(question) = reply.question.as_deref() {
+                    append_block(&mut output, "问题", question);
+                }
+                append_block(&mut output, "回答", &reply.answer);
+                if !reply.plan.is_empty() {
+                    append_block(&mut output, "计划", &reply.plan.join(" → "));
+                }
+                if !reply.claims.is_empty() {
+                    output.push_str(&format!("  命题（{}）：\n", reply.claims.len()));
+                    for claim in &reply.claims {
+                        output.push_str(&format!(
+                            "    第{}点：{}\n      陈述：{}\n      文本：{}\n",
+                            claim.index, claim.uri, claim.statement_uri, claim.text
+                        ));
+                    }
+                }
+                if !reply.evidence.is_empty() {
+                    output.push_str(&format!("  依据（{}）：\n", reply.evidence.len()));
+                    for evidence in &reply.evidence {
+                        output.push_str(&format!("    {}  {}\n", evidence.uri, evidence.text));
+                    }
+                }
+                if let Some(proof_id) = reply.proof_id.as_deref() {
+                    append_block(&mut output, "证明", proof_id);
+                }
+            }
+            ResolvedArtifact::Claim { reply, claim } => {
+                output.push_str(&format!("工件：{}\n", claim.uri));
+                output.push_str(&format!(
+                    "  类型：{}（回答 seq {}，第 {} 点）\n",
+                    ArtifactKind::Claim.label_zh(),
+                    reply.seq,
+                    claim.index
+                ));
+                append_block(&mut output, "文本", &claim.text);
+                append_block(&mut output, "陈述", &claim.statement_uri);
+                append_block(&mut output, "回答", &reply.uri);
+            }
+            ResolvedArtifact::Statement { digest, text } => {
+                output.push_str(&format!("工件：{}\n", statement_uri(&self.session, digest)));
+                output.push_str(&format!(
+                    "  类型：{}（摘要 {}）\n",
+                    ArtifactKind::Statement.label_zh(),
+                    digest
+                ));
+                append_block(&mut output, "文本", text);
+            }
+            ResolvedArtifact::Mention { turn, mention } => {
+                output.push_str(&format!("工件：{}\n", mention.uri));
+                output.push_str(&format!(
+                    "  类型：{}（轮次 seq {}，第 {} 条）\n",
+                    ArtifactKind::Mention.label_zh(),
+                    turn.seq,
+                    mention.index
+                ));
+                append_block(&mut output, "词面", &mention.surface);
+                append_block(
+                    &mut output,
+                    "实体",
+                    mention.entity.as_deref().unwrap_or("（未链接）"),
+                );
+                append_block(&mut output, "来源", &mention.source);
+                append_block(&mut output, "轮次", &turn.uri);
+            }
+            ResolvedArtifact::Evidence { digest, text } => {
+                output.push_str(&format!("工件：{}\n", evidence_uri(&self.session, digest)));
+                output.push_str(&format!(
+                    "  类型：{}（摘要 {}）\n",
+                    ArtifactKind::Evidence.label_zh(),
+                    digest
+                ));
+                append_block(&mut output, "内容", text);
+            }
+        }
+        output
+    }
+
+    pub fn render_latest_evidence(&self) -> String {
+        let Some(reply) = self.latest_reply() else {
+            return "还没有可解释依据的回答。".to_string();
+        };
+        if reply.evidence.is_empty() {
+            return format!("最新回答 {} 没有登记依据。", reply.uri);
+        }
+        let mut output = format!("最新回答 {} 的依据：\n", reply.uri);
+        for (position, evidence) in reply.evidence.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {}  {}\n",
+                position + 1,
+                evidence.uri,
+                evidence.text
+            ));
+        }
+        output
+    }
+
+    fn add_turn(&mut self, entry: &ChronicleEntry) {
+        let user = payload_str(entry, "user").unwrap_or_default().to_string();
+        let mode = payload_str(entry, "mode").unwrap_or("unknown").to_string();
+        let focus = payload_str(entry, "focus")
+            .map(str::trim)
+            .filter(|focus| !focus.is_empty())
+            .map(str::to_string);
+        let refs: Vec<EntityRef> = entry
+            .payload
+            .get("refs")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        let mut mentions = Vec::new();
+        for reference in &refs {
+            let surface = reference.surface.trim();
+            if surface.is_empty() {
+                continue;
+            }
+            let index = mentions.len() as u32 + 1;
+            mentions.push(MentionArtifact {
+                index,
+                uri: mention_uri(&self.session, entry.seq, index),
+                surface: surface.to_string(),
+                entity: reference
+                    .entity
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|entity| !entity.is_empty())
+                    .map(str::to_string),
+                source: reference.source.clone(),
+            });
+        }
+        if let Some(focus) = focus.as_deref() {
+            if !mentions.iter().any(|mention| mention.surface == focus) {
+                let index = mentions.len() as u32 + 1;
+                mentions.push(MentionArtifact {
+                    index,
+                    uri: mention_uri(&self.session, entry.seq, index),
+                    surface: focus.to_string(),
+                    entity: None,
+                    source: "focus".to_string(),
+                });
+            }
+        }
+        self.turns.insert(
+            entry.seq,
+            TurnArtifact {
+                seq: entry.seq,
+                uri: turn_uri(&self.session, entry.seq),
+                user,
+                mode,
+                focus,
+                kb_revision: entry.kb_revision,
+                mentions,
+            },
+        );
+    }
+
+    fn add_reply(&mut self, entry: &ChronicleEntry) {
+        let answer = payload_str(entry, "answer").unwrap_or_default().to_string();
+        let observed = entry.payload.get("observed_seq").and_then(Value::as_u64);
+        let turn_seq = observed
+            .filter(|seq| self.turns.contains_key(seq))
+            .or_else(|| {
+                self.turns
+                    .range(..entry.seq)
+                    .next_back()
+                    .map(|(seq, _)| *seq)
+            });
+        let question = payload_str(entry, "question")
+            .map(str::trim)
+            .filter(|question| !question.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                turn_seq
+                    .and_then(|seq| self.turns.get(&seq))
+                    .map(|turn| turn.user.clone())
+                    .filter(|user| !user.is_empty())
+            });
+        let plan = payload_strings(entry, "plan");
+        let provenance = payload_strings(entry, "provenance");
+        let proof_id = payload_str(entry, "proof_id")
+            .map(str::trim)
+            .filter(|proof| !proof.is_empty())
+            .map(str::to_string);
+        let mut claims = Vec::new();
+        for (position, text) in answer_units(&answer).into_iter().enumerate() {
+            let index = position as u32 + 1;
+            let digest = content_digest(&text);
+            let statement = statement_uri(&self.session, &digest);
+            claims.push(ClaimArtifact {
+                index,
+                uri: claim_uri(&self.session, entry.seq, index),
+                statement_uri: statement,
+                digest: digest.clone(),
+                text: text.clone(),
+            });
+            self.statements.entry(digest).or_insert(text);
+        }
+        let mut evidence = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for text in provenance {
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let digest = content_digest(text);
+            if !seen.insert(digest.clone()) {
+                continue;
+            }
+            evidence.push(EvidenceArtifact {
+                uri: evidence_uri(&self.session, &digest),
+                digest: digest.clone(),
+                text: text.to_string(),
+            });
+            self.evidences
+                .entry(digest)
+                .or_insert_with(|| text.to_string());
+        }
+        self.replies.insert(
+            entry.seq,
+            ReplyArtifact {
+                seq: entry.seq,
+                uri: reply_uri(&self.session, entry.seq),
+                turn_seq,
+                question,
+                answer,
+                plan,
+                proof_id,
+                kb_revision: entry.kb_revision,
+                claims,
+                evidence,
+            },
+        );
+    }
+}
+
+fn payload_str<'a>(entry: &'a ChronicleEntry, key: &str) -> Option<&'a str> {
+    entry.payload.get(key).and_then(Value::as_str)
+}
+
+fn payload_strings(entry: &ChronicleEntry, key: &str) -> Vec<String> {
+    entry
+        .payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn answer_units(answer: &str) -> Vec<String> {
+    let mut units: Vec<String> = answer
+        .lines()
+        .map(str::trim)
+        .map(strip_list_marker)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if units.is_empty() {
+        let trimmed = answer.trim();
+        if !trimmed.is_empty() {
+            units.push(trimmed.to_string());
+        }
+    }
+    units
+}
+
+fn strip_list_marker(line: &str) -> &str {
+    let line = line.trim();
+    for marker in ["- ", "* ", "• ", "· "] {
+        if let Some(rest) = line.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+    let bytes = line.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 || end >= line.len() {
+        return line;
+    }
+    let separator = line[end..].chars().next().unwrap_or_default();
+    if !matches!(separator, '.' | '、' | ')' | '）') {
+        return line;
+    }
+    let rest = &line[end + separator.len_utf8()..];
+    if rest.is_empty() || rest.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+        return line;
+    }
+    rest.trim_start()
+}
+
+fn parse_ordinal(spec: &str) -> Option<u32> {
+    let spec = spec.trim();
+    let digits = spec
+        .strip_prefix('第')
+        .unwrap_or(spec)
+        .trim()
+        .trim_end_matches(['点', '条', '项', '个', '句'])
+        .trim();
+    if let Ok(number) = digits.parse::<u32>() {
+        return (number > 0).then_some(number);
+    }
+    chinese_number(digits)
+}
+
+fn chinese_number(text: &str) -> Option<u32> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text == "十" {
+        return Some(10);
+    }
+    if let Some((tens, ones)) = text.split_once('十') {
+        let tens = if tens.is_empty() {
+            1
+        } else {
+            chinese_digit(tens)?
+        };
+        let ones = if ones.is_empty() {
+            0
+        } else {
+            chinese_digit(ones)?
+        };
+        let value = tens * 10 + ones;
+        return (value > 0).then_some(value);
+    }
+    let value = chinese_digit(text)?;
+    (value > 0).then_some(value)
+}
+
+fn chinese_digit(text: &str) -> Option<u32> {
+    if text.chars().count() != 1 {
+        return None;
+    }
+    match text.chars().next()? {
+        '零' => Some(0),
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+fn compact(text: &str, limit: usize) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut compact: String = joined.chars().take(limit).collect();
+    if joined.chars().count() > limit {
+        compact.push('…');
+    }
+    compact
+}
+
+fn append_block(output: &mut String, label: &str, text: &str) {
+    if text.is_empty() {
+        output.push_str(&format!("  {}：（空）\n", label));
+        return;
+    }
+    let mut lines = text.lines();
+    if let Some(first) = lines.next() {
+        output.push_str(&format!("  {}：{}\n", label, first));
+    }
+    for line in lines {
+        output.push_str(&format!("    {}\n", line));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +1365,172 @@ mod tests {
         std::fs::rename(&path, &moved).unwrap();
         let after_move = DialogueSession::open_or_create(&moved.to_string_lossy()).unwrap();
         assert_eq!(after_move.id(), id, "路径改名不得改变会话身份");
+    }
+
+    #[test]
+    fn answer_units_keep_content_and_strip_only_list_markers() {
+        let answer = "1. 第一点\n- 第二点\n2、第三点\n1.5 米不是列表\n• 第四点";
+        assert_eq!(
+            answer_units(answer),
+            vec![
+                "第一点".to_string(),
+                "第二点".to_string(),
+                "第三点".to_string(),
+                "1.5 米不是列表".to_string(),
+                "第四点".to_string(),
+            ]
+        );
+        assert_eq!(answer_units("  "), Vec::<String>::new());
+        assert_eq!(answer_units("单句回答"), vec!["单句回答".to_string()]);
+    }
+
+    #[test]
+    fn ordinal_parsing_accepts_arabic_and_chinese() {
+        assert_eq!(parse_ordinal("第2点"), Some(2));
+        assert_eq!(parse_ordinal("第二点"), Some(2));
+        assert_eq!(parse_ordinal("第十二条"), Some(12));
+        assert_eq!(parse_ordinal("二十"), Some(20));
+        assert_eq!(parse_ordinal("第十"), Some(10));
+        assert_eq!(parse_ordinal("第0点"), None);
+        assert_eq!(parse_ordinal("第N点"), None);
+    }
+
+    fn sample_index(dir: &tempfile::TempDir) -> (DialogueSession, DialogueArtifactIndex, String) {
+        let session_path = dir.path().join("dialogue.session.json");
+        let session = DialogueSession::open_or_create(&session_path.to_string_lossy()).unwrap();
+        let chronicle_path = dir.path().join("dialogue.chronicle.jsonl");
+        let chronicle_path_text = chronicle_path.to_string_lossy().to_string();
+        let (mut chronicle, _) =
+            Chronicle::open(&chronicle_path_text, crate::chronicle::FsyncPolicy::None).unwrap();
+        chronicle
+            .append_turn_with_refs(
+                "姚明多高",
+                "query",
+                None,
+                0,
+                &[EntityRef::linked("姚明", "姚明")],
+            )
+            .unwrap();
+        chronicle
+            .append_reply(
+                "1. 姚明的身高是 226 厘米。\n2. 他是篮球运动员。",
+                &["direct_answer".to_string()],
+                &["身高".to_string(), "职业".to_string()],
+            )
+            .unwrap();
+        chronicle
+            .append("trace", serde_json::json!({"ignored": true}))
+            .unwrap();
+        let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+        (session, index, chronicle_path_text)
+    }
+
+    #[test]
+    fn index_projects_turns_replies_claims_mentions_and_evidence() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, index, _) = sample_index(&dir);
+        assert_eq!(index.turn_count(), 1);
+        assert_eq!(index.reply_count(), 1);
+        assert_eq!(index.claim_count(), 2);
+        assert_eq!(index.evidence_count(), 2);
+
+        let turn = index.latest_turn().unwrap();
+        assert_eq!(turn.seq, 1);
+        assert_eq!(turn.user, "姚明多高");
+        assert_eq!(turn.mentions.len(), 1);
+        assert_eq!(turn.mentions[0].surface, "姚明");
+        assert_eq!(turn.mentions[0].entity.as_deref(), Some("姚明"));
+        assert!(matches!(
+            index.resolve(&turn.uri).unwrap(),
+            ResolvedArtifact::Turn(_)
+        ));
+
+        let reply = index.latest_reply().unwrap();
+        assert_eq!(reply.seq, 2);
+        assert_eq!(reply.turn_seq, Some(1));
+        assert_eq!(reply.question.as_deref(), Some("姚明多高"));
+        assert_eq!(reply.claims.len(), 2);
+        assert_eq!(reply.claims[0].text, "姚明的身高是 226 厘米。");
+        assert_eq!(reply.claims[1].text, "他是篮球运动员。");
+        assert_eq!(reply.claims[1].index, 2);
+        assert_eq!(
+            reply.claims[0].statement_uri,
+            statement_uri_for_text(session.id(), "姚明的身高是 226 厘米。")
+        );
+        assert_eq!(
+            index.statement(&reply.claims[0].digest).unwrap(),
+            "姚明的身高是 226 厘米。"
+        );
+
+        let claim = index.resolve(&reply.claims[1].uri).unwrap();
+        match claim {
+            ResolvedArtifact::Claim {
+                reply: parent,
+                claim,
+            } => {
+                assert_eq!(parent.seq, 2);
+                assert_eq!(claim.text, "他是篮球运动员。");
+            }
+            other => panic!("应解析为命题：{:?}", other.kind()),
+        }
+        assert!(matches!(
+            index.resolve(&reply.evidence[0].uri).unwrap(),
+            ResolvedArtifact::Evidence { .. }
+        ));
+        assert!(matches!(
+            index.resolve(&turn.mentions[0].uri).unwrap(),
+            ResolvedArtifact::Mention { .. }
+        ));
+        assert!(index.render_report().contains("对话工件索引"));
+        assert!(index.render_selector("第2点").contains("篮球运动员"));
+        assert!(index.render_selector("第二点").contains("篮球运动员"));
+        assert!(index.render_selector("上一轮").contains("226 厘米"));
+        assert!(index.render_selector("依据").contains("身高"));
+        assert!(index.render_selector("上一轮问题").contains("姚明多高"));
+        assert!(index
+            .render_selector(&reply.claims[0].uri)
+            .contains("226 厘米"));
+        assert!(index.render_selector("第9点").contains("没有第 9 点"));
+    }
+
+    #[test]
+    fn index_rebuild_after_restart_keeps_the_same_addresses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (session, first, chronicle_path) = sample_index(&dir);
+        let reply_uri = first.latest_reply().unwrap().uri.clone();
+        let claim_uri = first.latest_reply().unwrap().claims[1].uri.clone();
+        let digest = first.latest_reply().unwrap().claims[1].digest.clone();
+        let session_id = session.id().to_string();
+        let session_path = session.path().to_string_lossy().to_string();
+        drop(first);
+        drop(session);
+
+        let reopened_session = DialogueSession::open_or_create(&session_path).unwrap();
+        assert_eq!(reopened_session.id(), session_id);
+        let (chronicle, audit) =
+            Chronicle::open(&chronicle_path, crate::chronicle::FsyncPolicy::None).unwrap();
+        assert!(audit.is_clean());
+        let restored = DialogueArtifactIndex::from_chronicle(&reopened_session, &chronicle);
+        assert_eq!(restored.latest_reply().unwrap().uri, reply_uri);
+        assert_eq!(restored.claim(2, 2).unwrap().uri, claim_uri);
+        assert_eq!(restored.statement(&digest), Some("他是篮球运动员。"));
+        assert!(restored.render_selector("上一轮").contains("226 厘米"));
+    }
+
+    #[test]
+    fn resolve_rejects_other_sessions_and_unknown_artifacts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, index, _) = sample_index(&dir);
+        let foreign = reply_uri("another-session", 2);
+        assert!(matches!(
+            index.resolve(&foreign),
+            Err(UriError::UnknownArtifact(_))
+        ));
+        let missing = claim_uri(index.session(), 2, 9);
+        assert!(matches!(
+            index.resolve(&missing),
+            Err(UriError::UnknownArtifact(_))
+        ));
     }
 
     #[test]
