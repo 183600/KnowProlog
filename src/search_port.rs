@@ -1008,6 +1008,25 @@ impl SearchSession {
         &self.tables
     }
 
+    /// 把绑定表台账写入 ContextImage 侧车；只存表，不存结果集游标。
+    pub fn save_tables(&self, path: &str) -> std::io::Result<()> {
+        self.tables.save(path)
+    }
+
+    /// 从侧车恢复绑定表台账。损坏、缺段或版本不兼容都会原样报告，
+    /// 不把旧表悄悄当成当前会话的答案。
+    pub fn load_tables(&mut self, path: &str) -> crate::binding_table::StoreLoad {
+        match BindingTableStore::load(path) {
+            crate::binding_table::StoreLoad::Loaded(store) => {
+                self.last = None;
+                self.last_table_id = store.tables().last().map(|table| table.id.clone());
+                self.tables = store.clone();
+                crate::binding_table::StoreLoad::Loaded(store)
+            }
+            other => other,
+        }
+    }
+
     fn record_table(
         &mut self,
         question: &str,
@@ -2317,6 +2336,27 @@ mod tests {
             .respond(&FollowUpAction::Exclude("不存在".to_string()))
             .expect("未命中应诚实说明");
         assert!(missing.contains("没有包含"), "{}", missing);
+    }
+
+    #[test]
+    fn session_roundtrips_binding_tables_through_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tables.json");
+        let saved = session();
+        let original_id = saved.last_table().expect("应有绑定表").id.clone();
+        let path = path.to_str().expect("临时路径应是 UTF-8");
+        saved.save_tables(path).expect("应能保存绑定表");
+
+        let mut restored = session();
+        assert!(matches!(
+            restored.load_tables(path),
+            crate::binding_table::StoreLoad::Loaded(_)
+        ));
+        assert_eq!(restored.last_table().expect("恢复后应有表").id, original_id);
+        let count = restored
+            .answer_table_followup("一共几个", 0)
+            .expect("恢复后应能继续追问");
+        assert!(count.contains("3 行"), "{}", count);
     }
 
     #[test]
