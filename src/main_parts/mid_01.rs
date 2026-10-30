@@ -494,8 +494,13 @@ fn run_artifact_audit(
         defaults.push(state_path.to_string());
         defaults.push(format!("{}.manager.json", state_path));
         defaults.push(format!("{}.chronicle.jsonl", state_path));
+        defaults.push(format!("{}.chronicle.jsonl.session.json", state_path));
     } else {
         defaults.push(format!("{}/dialogue.chronicle.jsonl", store_path));
+        defaults.push(format!(
+            "{}/dialogue.chronicle.jsonl.session.json",
+            store_path
+        ));
     }
     for path in defaults {
         targets.entry(path).or_insert(false);

@@ -23,6 +23,7 @@ use crate::canonical::{self, DecodeError};
 use crate::chronicle::{Chronicle, FsyncPolicy};
 use crate::context_image::{ContextImage, IMAGE_VERSION};
 use crate::dialogue_manager::DialogueManagerSnapshot;
+use crate::dialogue_uri::DialogueSession;
 use crate::embedding_eval::EvalBaseline;
 use crate::entity_registry::{EntityRegistry, FOLD_VERSION};
 use crate::predicate_registry::PredicateRegistry;
@@ -40,6 +41,8 @@ pub enum ArtifactKind {
     DialogueState,
     /// 对话管理器快照（`*.manager.json`）。
     DialogueManager,
+    /// 对话工件会话标识侧车（`*.session.json`）。
+    DialogueSession,
     /// 谓词画像注册表。
     PredicateRegistry,
     /// 实体身份注册表。
@@ -59,6 +62,7 @@ impl ArtifactKind {
             ArtifactKind::SessionEnvelope => "session_envelope",
             ArtifactKind::DialogueState => "dialogue_state",
             ArtifactKind::DialogueManager => "dialogue_manager",
+            ArtifactKind::DialogueSession => "dialogue_session",
             ArtifactKind::PredicateRegistry => "predicate_registry",
             ArtifactKind::EntityRegistry => "entity_registry",
             ArtifactKind::EvalBaseline => "eval_baseline",
@@ -75,6 +79,9 @@ impl ArtifactKind {
         }
         if name.ends_with(".chronicle.jsonl") {
             return ArtifactKind::Chronicle;
+        }
+        if name.ends_with(".session.json") {
+            return ArtifactKind::DialogueSession;
         }
         match name {
             "import_journal.json" | "external_ledger.json" => ArtifactKind::ContextImage,
@@ -322,6 +329,7 @@ fn verify(bytes: &[u8], kind: ArtifactKind) -> Result<(String, bool), DecodeErro
         ArtifactKind::DialogueManager => {
             typed::<DialogueManagerSnapshot>(bytes, kind.label(), 1, limit)
         }
+        ArtifactKind::DialogueSession => DialogueSession::verify_bytes(bytes),
         ArtifactKind::PredicateRegistry => {
             typed::<PredicateRegistry>(bytes, kind.label(), 1, limit)
         }
@@ -533,10 +541,49 @@ mod tests {
             ArtifactKind::Chronicle
         );
         assert_eq!(
+            ArtifactKind::infer("oxigraph_data/dialogue_state.json.chronicle.jsonl.session.json"),
+            ArtifactKind::DialogueSession
+        );
+        assert_eq!(
             ArtifactKind::infer("oxigraph_data/entity_registry.json"),
             ArtifactKind::EntityRegistry
         );
         assert_eq!(ArtifactKind::infer("random.json"), ArtifactKind::Json);
+    }
+
+    #[test]
+    fn dialogue_session_sidecar_is_canonical_and_fixable() {
+        let path = temp_path("dialogue-session");
+        let path_text = path.to_string_lossy().to_string();
+        let session = DialogueSession::open_or_create(&path_text).unwrap();
+        assert!(!session.id().is_empty());
+        assert_eq!(
+            audit(&path_text, ArtifactKind::DialogueSession).status,
+            ArtifactStatus::Canonical
+        );
+
+        std::fs::write(
+            &path_text,
+            "{\n  \"session_version\": 1,\n  \"session_id\": \"s-audit\"\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            audit(&path_text, ArtifactKind::DialogueSession).status,
+            ArtifactStatus::NonCanonical
+        );
+        let fixed = fix(&path_text, ArtifactKind::DialogueSession).unwrap();
+        assert_eq!(fixed.status, ArtifactStatus::Canonical);
+
+        std::fs::write(
+            &path_text,
+            "{\"session_id\":\"\",\"session_version\":1}",
+        )
+        .unwrap();
+        assert!(matches!(
+            audit(&path_text, ArtifactKind::DialogueSession).status,
+            ArtifactStatus::Damaged(_)
+        ));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

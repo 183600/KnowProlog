@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use crate::chronicle::{Chronicle, ChronicleEntry, EntityRef};
 
+use crate::canonical::{self, DecodeError};
 use crate::context_image::fnv1a_hex;
 use crate::identity::{encode_segment, entity_uri, DEFAULT_BASE_NS};
 
@@ -408,6 +409,32 @@ impl DialogueSession {
         }))
     }
 
+    /// 解码并核查会话标识字节，返回（规范文本, 输入是否已规范）。
+    ///
+    /// 供工件审计复用：版本门与 `session_id` 不变量在解码后统一检查。
+    pub fn verify_bytes(bytes: &[u8]) -> Result<(String, bool), DecodeError> {
+        let (record, receipt) = canonical::decode_json::<SessionRecord>(
+            bytes,
+            "dialogue_session",
+            DIALOGUE_SESSION_VERSION,
+            canonical::DEFAULT_MAX_DECODE_BYTES,
+        )?;
+        if record.session_version > DIALOGUE_SESSION_VERSION {
+            return Err(DecodeError::Version {
+                found: record.session_version,
+                supported: DIALOGUE_SESSION_VERSION,
+            });
+        }
+        let id = record.session_id.trim();
+        if id.is_empty() || id.chars().any(char::is_control) {
+            return Err(DecodeError::Invariant(
+                "session_id 不能为空或包含控制字符".to_string(),
+            ));
+        }
+        let text = canonical::canonical_text(&record)?;
+        Ok((text, receipt.canonical))
+    }
+
     fn create(path: &Path) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -419,8 +446,12 @@ impl DialogueSession {
             session_version: DIALOGUE_SESSION_VERSION,
             session_id: id.clone(),
         };
-        let body = serde_json::to_vec(&record)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let body = canonical::canonical_bytes(&record).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("会话标识编码失败：{}", error),
+            )
+        })?;
         let tmp = PathBuf::from(format!(
             "{}.tmp-{}",
             path.to_string_lossy(),
@@ -1474,6 +1505,40 @@ mod tests {
         std::fs::rename(&path, &moved).unwrap();
         let after_move = DialogueSession::open_or_create(&moved.to_string_lossy()).unwrap();
         assert_eq!(after_move.id(), id, "路径改名不得改变会话身份");
+    }
+
+    #[test]
+    fn session_sidecar_is_canonical_and_verifiable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("dialogue.session.json");
+        let path_text = path.to_string_lossy().to_string();
+        DialogueSession::open_or_create(&path_text).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (canonical, is_canonical) = DialogueSession::verify_bytes(&bytes).unwrap();
+        assert!(is_canonical, "新建会话标识必须落成规范字节");
+        assert_eq!(canonical.as_bytes(), bytes.as_slice());
+
+        let pretty = format!(
+            "{{\n  \"session_version\": {},\n  \"session_id\": \"s-1\"\n}}\n",
+            DIALOGUE_SESSION_VERSION
+        );
+        let (canonical, is_canonical) =
+            DialogueSession::verify_bytes(pretty.as_bytes()).unwrap();
+        assert!(!is_canonical, "空白排布应被识别为非规范");
+        assert_eq!(canonical, "{\"session_id\":\"s-1\",\"session_version\":1}");
+
+        let future = format!(
+            "{{\"session_id\":\"s-1\",\"session_version\":{}}}",
+            DIALOGUE_SESSION_VERSION + 1
+        );
+        assert!(matches!(
+            DialogueSession::verify_bytes(future.as_bytes()),
+            Err(crate::canonical::DecodeError::Version { .. })
+        ));
+        assert!(matches!(
+            DialogueSession::verify_bytes(b"{\"session_id\":\"\",\"session_version\":1}"),
+            Err(crate::canonical::DecodeError::Invariant(_))
+        ));
     }
 
     #[test]
