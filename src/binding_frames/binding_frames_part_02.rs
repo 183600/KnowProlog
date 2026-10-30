@@ -108,6 +108,39 @@ struct PendingFrame {
     prompt: String,
     turn: u64,
 }
+/// 歧义澄清中的一个可执行候选：保存已证明的绑定与答案，用户选定后
+/// 不再重新解析原问句，也不重新执行目标。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredCandidate {
+    frame: String,
+    pattern: String,
+    bindings: BTreeMap<String, String>,
+    origins: BTreeMap<String, FrameOrigin>,
+    text: String,
+    evidence: Vec<String>,
+    entity: Option<String>,
+    attribute: Option<String>,
+    answer_values: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingAmbiguity {
+    raw: String,
+    prompt: String,
+    candidates: Vec<StoredCandidate>,
+    turn: u64,
+}
+/// 上一轮的模板实例：哪个帧、哪些绑定、答案集合与已说到哪里。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct FrameSession {
+    frame: String,
+    pattern: String,
+    bindings: BTreeMap<String, String>,
+    values: Vec<String>,
+    spoken: usize,
+    turn: u64,
+    entity: Option<String>,
+    attribute: Option<String>,
+}
 /// 会话级绑定记忆：环境、上一帧、待澄清帧与计数。
 ///
 /// 空态不写入快照（`DialogueManagerSnapshot` 用 `Option` + skip），
@@ -123,6 +156,10 @@ pub struct FrameMemory {
     #[serde(default)]
     pending: Option<PendingFrame>,
     #[serde(default)]
+    pending_ambiguity: Option<PendingAmbiguity>,
+    #[serde(default)]
+    session: Option<FrameSession>,
+    #[serde(default)]
     answered: u64,
     #[serde(default)]
     inherited_slots: u64,
@@ -132,6 +169,14 @@ pub struct FrameMemory {
     clarifications_bound: u64,
     #[serde(default)]
     clarifications_cancelled: u64,
+    #[serde(default)]
+    ambiguities_asked: u64,
+    #[serde(default)]
+    ambiguities_resolved: u64,
+    #[serde(default)]
+    ambiguities_cancelled: u64,
+    #[serde(default)]
+    enumerations: u64,
 }
 impl Default for FrameMemory {
     fn default() -> Self {
@@ -140,11 +185,17 @@ impl Default for FrameMemory {
             env: BTreeMap::new(),
             last: BTreeMap::new(),
             pending: None,
+            pending_ambiguity: None,
+            session: None,
             answered: 0,
             inherited_slots: 0,
             clarifications_asked: 0,
             clarifications_bound: 0,
             clarifications_cancelled: 0,
+            ambiguities_asked: 0,
+            ambiguities_resolved: 0,
+            ambiguities_cancelled: 0,
+            enumerations: 0,
         }
     }
 }
@@ -158,11 +209,17 @@ impl FrameMemory {
             && self.env.is_empty()
             && self.last.is_empty()
             && self.pending.is_none()
+            && self.pending_ambiguity.is_none()
+            && self.session.is_none()
             && self.answered == 0
             && self.inherited_slots == 0
             && self.clarifications_asked == 0
             && self.clarifications_bound == 0
             && self.clarifications_cancelled == 0
+            && self.ambiguities_asked == 0
+            && self.ambiguities_resolved == 0
+            && self.ambiguities_cancelled == 0
+            && self.enumerations == 0
     }
 
     pub fn turn(&self) -> u64 {
@@ -174,11 +231,36 @@ impl FrameMemory {
     }
 
     pub fn pending_prompt(&self) -> Option<&str> {
-        self.pending.as_ref().map(|pending| pending.prompt.as_str())
+        self.pending
+            .as_ref()
+            .map(|pending| pending.prompt.as_str())
+            .or_else(|| {
+                self.pending_ambiguity
+                    .as_ref()
+                    .map(|pending| pending.prompt.as_str())
+            })
+    }
+
+    /// 上一轮模板实例的帧 id（没有可枚举答案时为 None）。
+    pub fn session_frame(&self) -> Option<&str> {
+        self.session.as_ref().map(|session| session.frame.as_str())
+    }
+
+    /// 上一轮模板实例保存的答案集合。
+    pub fn session_values(&self) -> &[String] {
+        self.session
+            .as_ref()
+            .map(|session| session.values.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 答案游标：已经交付过多少项。
+    pub fn session_cursor(&self) -> Option<usize> {
+        self.session.as_ref().map(|session| session.spoken)
     }
 
     pub fn report(&self) -> String {
-        format!(
+        let mut report = format!(
             "绑定帧记忆：轮次 {}，回答 {} 次，继承槽 {} 次，澄清 {} 次（绑定 {}、撤销 {}），待澄清 {}。",
             self.turn,
             self.answered,
@@ -187,13 +269,33 @@ impl FrameMemory {
             self.clarifications_bound,
             self.clarifications_cancelled,
             if self.pending.is_some() { 1 } else { 0 }
-        )
+        );
+        if self.ambiguities_asked > 0 {
+            report.push_str(&format!(
+                " 歧义澄清 {} 次（解决 {}、撤销 {}）。",
+                self.ambiguities_asked, self.ambiguities_resolved, self.ambiguities_cancelled
+            ));
+        }
+        if self.enumerations > 0 {
+            report.push_str(&format!(" 答案枚举 {} 次。", self.enumerations));
+        }
+        report
     }
 
     fn prune(&mut self, turn: u64) {
         if let Some(pending) = &self.pending {
             if turn.saturating_sub(pending.turn) > FRAME_PENDING_TTL {
                 self.pending = None;
+            }
+        }
+        if let Some(pending) = &self.pending_ambiguity {
+            if turn.saturating_sub(pending.turn) > FRAME_PENDING_TTL {
+                self.pending_ambiguity = None;
+            }
+        }
+        if let Some(session) = &self.session {
+            if turn.saturating_sub(session.turn) > FRAME_SESSION_TTL {
+                self.session = None;
             }
         }
         self.env
@@ -266,6 +368,9 @@ struct Executed {
     evidence: Vec<String>,
     entity: Option<String>,
     attribute: Option<String>,
+    /// 目标证明出的完整答案集合（按确定序）；只用于多轮枚举，不参与
+    /// 本轮措辞之外的推测。
+    answer_values: Vec<String>,
 }
 /// 一轮帧规划结果（对话层据此记账，不直接打印）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,6 +730,79 @@ fn parse_choice_index(text: &str) -> Option<usize> {
         "十" => Some(10),
         _ => None,
     }
+}
+
+/// 歧义候选的答案签名：答案集合相同视为同一解释，不同集合必须澄清。
+fn answer_signature(executed: &Executed) -> String {
+    if executed.answer_values.is_empty() {
+        format!("text:{}", executed.text)
+    } else {
+        executed.answer_values.join("\u{1f}")
+    }
+}
+
+fn ambiguity_prompt(
+    raw: &str,
+    candidates: &[StoredCandidate],
+    total: usize,
+    truncated: bool,
+) -> String {
+    let mut prompt = format!(
+        "「{}」有 {} 种同样具体的解释{}：\n",
+        raw,
+        total,
+        if truncated { "（仅列出前几项）" } else { "" }
+    );
+    for (index, candidate) in candidates.iter().enumerate() {
+        prompt.push_str(&format!(
+            "  {}. {}\n",
+            index + 1,
+            single_line(&candidate.text, 80)
+        ));
+    }
+    prompt.push_str("回复序号选择你想问的解释；「都不是」放弃这次追问。");
+    prompt
+}
+
+fn single_line(text: &str, max_chars: usize) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = line.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}…", truncated)
+    } else {
+        truncated
+    }
+}
+
+enum EnumerationRequest {
+    Next,
+    All,
+    Index(usize),
+}
+
+/// 只识别明确的枚举指令；带实体的普通问句不会走到这里。
+fn parse_enumeration(input: &str) -> Option<EnumerationRequest> {
+    match input.trim() {
+        "还有呢" | "还有吗" | "还有哪些" | "还有哪个" | "还有别的吗" | "还有其他的吗"
+        | "下一个" | "下一个呢" | "继续" | "接着" | "然后呢" | "下一个是什么" => {
+            Some(EnumerationRequest::Next)
+        }
+        "全部" | "全部列出" | "全部列出来" | "都列出来" | "列出全部" | "所有"
+        | "所有结果" | "完整列表" | "列出来" | "有哪些" => Some(EnumerationRequest::All),
+        _ => parse_ordinal(input).map(EnumerationRequest::Index),
+    }
+}
+
+fn parse_ordinal(text: &str) -> Option<usize> {
+    let rest = text.trim().strip_prefix('第')?.trim_start();
+    let rest = rest.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '个' | '项' | '条' | '是' | '什' | '么' | '?' | '？' | '。' | ' ' | '，' | ','
+        )
+    });
+    parse_choice_index(rest)
 }
 #[cfg(test)]
 mod tests {
@@ -1103,5 +1281,329 @@ output = "value"
         assert!(program
             .plan(&mut memory, "姚明的高度是什么", &FakeKnowledge::new(), 1)
             .is_none());
+    }
+
+    fn ambiguity_program() -> FrameProgram {
+        FrameProgram::compile(&config(r#"
+enabled = true
+
+[[frames]]
+id = "a.height"
+patterns = ["{entity}的信息"]
+realize = { answer = "{entity}的身高是{value}。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:height"
+output = "value"
+
+[[frames]]
+id = "b.weight"
+patterns = ["{entity}的信息"]
+realize = { answer = "{entity}的体重是{value}。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:weight"
+output = "value"
+"#)).expect("歧义配置应可编译")
+    }
+
+    #[test]
+    fn equal_specificity_with_different_answers_asks_instead_of_picking() {
+        let program = ambiguity_program();
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(&mut memory, "姚明的信息", &FakeKnowledge::new(), 1)
+            .expect("应发起歧义澄清");
+        assert!(outcome.text.contains("226"), "{}", outcome.text);
+        assert!(outcome.text.contains("140"), "{}", outcome.text);
+        assert!(outcome
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_ambiguity"));
+        assert_eq!(memory.answered(), 0);
+        assert!(memory.pending_prompt().is_some());
+
+        let chosen = program
+            .plan(&mut memory, "1", &FakeKnowledge::new(), 2)
+            .expect("选择序号后应回答");
+        assert!(chosen.text.contains("226"), "{}", chosen.text);
+        assert!(!chosen.text.contains("140"), "{}", chosen.text);
+        assert!(chosen
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_ambiguity_resolved"));
+        assert_eq!(memory.answered(), 1);
+        assert_eq!(memory.session_frame(), Some("a.height"));
+        assert_eq!(memory.session_values(), ["226".to_string()]);
+        assert!(memory.pending_prompt().is_none());
+    }
+
+    #[test]
+    fn equal_specificity_with_same_answer_is_merged() {
+        let program = FrameProgram::compile(&config(r#"
+enabled = true
+[[frames]]
+id = "a.height"
+patterns = ["{entity}的信息"]
+realize = { answer = "{entity}的身高是{value}。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:height"
+output = "value"
+
+[[frames]]
+id = "b.height"
+patterns = ["{entity}的信息"]
+realize = { answer = "身高：{value}（{entity}）。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:height"
+output = "value"
+"#)).expect("配置应可编译");
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(&mut memory, "姚明的信息", &FakeKnowledge::new(), 1)
+            .expect("同答案不应要求澄清");
+        assert!(outcome.text.contains("226"), "{}", outcome.text);
+        assert!(outcome
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_ambiguous_same_answer:2"));
+        assert!(memory.pending_prompt().is_none());
+        assert_eq!(memory.answered(), 1);
+    }
+
+    #[test]
+    fn more_specific_pattern_wins_without_ambiguity() {
+        let program = FrameProgram::compile(&config(r#"
+enabled = true
+[[frames]]
+id = "generic"
+patterns = ["{entity}的{attribute}是什么"]
+realize = { answer = "通用：{value}。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "attribute"
+sort = "attribute"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:weight"
+output = "value"
+
+[[frames]]
+id = "specific"
+patterns = ["{entity}的身高是什么"]
+realize = { answer = "身高：{value}。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "value"
+sort = "text"
+[frames.goal]
+kind = "attribute"
+entity = "entity"
+attribute = "const:height"
+output = "value"
+"#)).expect("配置应可编译");
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(&mut memory, "姚明的身高是什么", &FakeKnowledge::new(), 1)
+            .expect("更具体的模式应胜出");
+        assert!(outcome.text.contains("226"), "{}", outcome.text);
+        assert!(!outcome.text.contains("140"), "{}", outcome.text);
+        assert!(memory.pending_prompt().is_none());
+    }
+
+    struct FriendsKnowledge;
+
+    impl DialogueKnowledge for FriendsKnowledge {
+        fn entities_in(&self, text: &str) -> Vec<String> {
+            ["张三", "李四", "王五"]
+                .iter()
+                .filter(|entity| text.contains(**entity))
+                .map(|entity| (*entity).to_string())
+                .collect()
+        }
+
+        fn known_entity(&self, entity: &str) -> bool {
+            matches!(entity, "张三" | "李四" | "王五")
+        }
+
+        fn answer(&self, _question: &str) -> Option<String> {
+            None
+        }
+
+        fn known_attributes(&self, _entity: &str) -> Vec<String> {
+            vec!["朋友".to_string()]
+        }
+
+        fn attribute_values(&self, _entity: &str, _attribute: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn all_entities(&self) -> Vec<String> {
+            vec!["张三".to_string(), "李四".to_string(), "王五".to_string()]
+        }
+
+        fn entity_relations(&self, entity: &str) -> Vec<(String, String)> {
+            if entity == "张三" {
+                vec![
+                    ("朋友".to_string(), "李四".to_string()),
+                    ("朋友".to_string(), "王五".to_string()),
+                ]
+            } else {
+                Vec::new()
+            }
+        }
+
+        fn canonical_predicate(&self, surface: &str) -> Option<String> {
+            (surface == "朋友").then(|| surface.to_string())
+        }
+
+        fn predicate_label(&self, predicate: &str) -> String {
+            predicate.to_string()
+        }
+    }
+
+    fn enumeration_program() -> FrameProgram {
+        FrameProgram::compile(&config(r#"
+enabled = true
+[[frames]]
+id = "friends"
+patterns = ["{entity}的朋友有哪些"]
+realize = { answer = "{entity}的朋友是{value}。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "friend"
+sort = "text"
+[frames.goal]
+kind = "relation"
+subject = "entity"
+predicate = "const:朋友"
+output = "friend"
+"#)).expect("枚举配置应可编译")
+    }
+
+    #[test]
+    fn enumeration_followup_uses_saved_answer_set() {
+        let program = enumeration_program();
+        let knowledge = FriendsKnowledge;
+        let mut memory = FrameMemory::new();
+        let first = program
+            .plan(&mut memory, "张三的朋友有哪些", &knowledge, 1)
+            .expect("应回答第一项");
+        assert!(first.text.contains("李四"), "{}", first.text);
+        assert!(!first.text.contains("王五"), "{}", first.text);
+        assert_eq!(memory.session_frame(), Some("friends"));
+        assert_eq!(memory.session_values().len(), 2);
+        assert_eq!(memory.session_cursor(), Some(1));
+
+        let second = program
+            .plan(&mut memory, "还有呢", &knowledge, 2)
+            .expect("应继续枚举");
+        assert!(second.text.contains("王五"), "{}", second.text);
+        assert!(second
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_enumerate_next"));
+        assert_eq!(memory.session_cursor(), Some(2));
+
+        let exhausted = program
+            .plan(&mut memory, "还有呢", &knowledge, 3)
+            .expect("应说明没有更多");
+        assert!(exhausted.text.contains("没有更多"), "{}", exhausted.text);
+        assert!(exhausted
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_enumerate_end"));
+    }
+
+    #[test]
+    fn enumeration_supports_all_and_ordinal_requests() {
+        let program = enumeration_program();
+        let knowledge = FriendsKnowledge;
+        let mut memory = FrameMemory::new();
+        program
+            .plan(&mut memory, "张三的朋友有哪些", &knowledge, 1)
+            .unwrap();
+        let all = program
+            .plan(&mut memory, "全部", &knowledge, 2)
+            .expect("应列出全部");
+        assert!(all.text.contains("李四"), "{}", all.text);
+        assert!(all.text.contains("王五"), "{}", all.text);
+        assert_eq!(memory.session_cursor(), Some(2));
+
+        let second = program
+            .plan(&mut memory, "第2个", &knowledge, 3)
+            .expect("应按序号回答");
+        assert!(second.text.contains("王五"), "{}", second.text);
+        assert!(second
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_enumerate_index"));
+        let missing = program
+            .plan(&mut memory, "第9个", &knowledge, 4)
+            .expect("越界应显式说明");
+        assert!(missing.text.contains("当前共 2 项"), "{}", missing.text);
+    }
+
+    #[test]
+    fn session_and_ambiguity_survive_serde_roundtrip() {
+        let program = enumeration_program();
+        let knowledge = FriendsKnowledge;
+        let mut memory = FrameMemory::new();
+        program
+            .plan(&mut memory, "张三的朋友有哪些", &knowledge, 1)
+            .unwrap();
+        let json = serde_json::to_string(&memory).expect("应可序列化");
+        let restored: FrameMemory = serde_json::from_str(&json).expect("应可反序列化");
+        assert_eq!(memory, restored);
+        assert_eq!(restored.session_values().len(), 2);
+        assert_eq!(restored.session_cursor(), Some(1));
     }
 }

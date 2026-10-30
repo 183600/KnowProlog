@@ -9,6 +9,8 @@ use crate::quantity::{self, Comparison, Quantity};
 pub const FRAME_ENV_TTL: u64 = 8;
 /// 待澄清帧的逻辑轮次时限。
 pub const FRAME_PENDING_TTL: u64 = 3;
+/// 模板实例（答案集合与游标）的逻辑轮次时限。
+pub const FRAME_SESSION_TTL: u64 = 16;
 /// 单次澄清最多展示的候选数。
 pub const FRAME_MAX_CANDIDATES: usize = 8;
 
@@ -458,7 +460,11 @@ impl FrameProgram {
         self.frames.iter().find(|frame| frame.id == id)
     }
 
-    /// 规划一轮：先结算待澄清帧，再按确定序尝试模式；执行成功才提交状态。
+    /// 规划一轮：先结算待澄清帧与歧义选择，再按确定序尝试模式。
+    ///
+    /// 与「第一条命中即返回」不同，这里会收集所有表面命中且目标可执行的
+    /// 候选，再按优先级与模式特化度仲裁：严格更具体的候选胜出；若多个
+    /// 同样具体的候选证明出不同答案，则发起一次显式歧义澄清，不静默择一。
     pub fn plan(
         &self,
         memory: &mut FrameMemory,
@@ -479,8 +485,17 @@ impl FrameProgram {
                 return Some(outcome);
             }
         }
+        if memory.pending_ambiguity.is_some() {
+            if let Some(outcome) = self.resolve_ambiguity(memory, &normalized, turn) {
+                return Some(outcome);
+            }
+        }
+        if let Some(outcome) = self.enumerate_session(memory, &normalized, turn) {
+            return Some(outcome);
+        }
 
-        let mut question: Option<QuestionPlan> = None;
+        let mut proven: Vec<(usize, usize, Resolved, Executed)> = Vec::new();
+        let mut question: Option<(usize, usize, Resolved)> = None;
         for (frame_index, pattern_index) in &self.ranked {
             let frame = &self.frames[*frame_index];
             let pattern = &frame.patterns[*pattern_index];
@@ -493,18 +508,22 @@ impl FrameProgram {
             };
             if !resolved.missing.is_empty() {
                 if question.is_none() {
-                    question = self.question_for(frame, &resolved, knowledge, input, turn);
+                    question = Some((*frame_index, *pattern_index, resolved));
                 }
                 continue;
             }
             if let Some(executed) = self.execute(frame, &resolved, knowledge) {
-                memory.commit(frame, &executed.bindings, &resolved.origins, turn);
-                memory.pending = None;
-                return Some(self.outcome(frame, pattern, executed, turn));
+                proven.push((*frame_index, *pattern_index, resolved, executed));
             }
         }
 
-        let question = question?;
+        if !proven.is_empty() {
+            return Some(self.arbitrate_proven(memory, &normalized, proven, turn));
+        }
+
+        let (frame_index, _pattern_index, resolved) = question?;
+        let frame = &self.frames[frame_index];
+        let question = self.question_for(frame, &resolved, knowledge, input, turn)?;
         let schema = question.pending.schema.clone();
         memory.pending = Some(question.pending);
         memory.turn = turn;
@@ -519,6 +538,302 @@ impl FrameProgram {
             kind: MoveKind::AskAttribute,
             entity: None,
             attribute: None,
+        })
+    }
+
+    /// 仲裁所有已证明候选。排序键与 `ranked` 一致，但把 id/词面从
+    /// 「决胜键」降为「稳定序」：同优先级、同特化度的不同解释必须澄清。
+    fn arbitrate_proven(
+        &self,
+        memory: &mut FrameMemory,
+        raw: &str,
+        proven: Vec<(usize, usize, Resolved, Executed)>,
+        turn: u64,
+    ) -> FrameOutcome {
+        let top_key = self.specificity(proven[0].0, proven[0].1);
+        let tied: Vec<&(usize, usize, Resolved, Executed)> = proven
+            .iter()
+            .filter(|candidate| self.specificity(candidate.0, candidate.1) == top_key)
+            .collect();
+        let mut distinct: Vec<&(usize, usize, Resolved, Executed)> = Vec::new();
+        let mut signatures = BTreeSet::new();
+        for candidate in &tied {
+            if signatures.insert(answer_signature(&candidate.3)) {
+                distinct.push(candidate);
+            }
+        }
+
+        if distinct.len() > 1 {
+            let shown = distinct.len().min(FRAME_MAX_CANDIDATES);
+            let candidates: Vec<StoredCandidate> = distinct
+                .iter()
+                .take(shown)
+                .map(|candidate| self.stored_candidate(candidate))
+                .collect();
+            let prompt = ambiguity_prompt(raw, &candidates, distinct.len(), distinct.len() > shown);
+            memory.pending = None;
+            memory.pending_ambiguity = Some(PendingAmbiguity {
+                raw: raw.to_string(),
+                prompt: prompt.clone(),
+                candidates,
+                turn,
+            });
+            memory.turn = turn;
+            memory.ambiguities_asked += 1;
+            return FrameOutcome {
+                text: prompt,
+                plan: vec![
+                    "frame_ambiguity".to_string(),
+                    format!("frame_ambiguity_candidates:{}", distinct.len()),
+                ],
+                provenance: vec![format!(
+                    "问题「{}」有 {} 个同样具体的绑定帧目标都可证明，未静默择一",
+                    raw,
+                    distinct.len()
+                )],
+                kind: MoveKind::AskAttribute,
+                entity: None,
+                attribute: None,
+            };
+        }
+
+        let tied_len = tied.len();
+        let proven_len = proven.len();
+        let (frame_index, pattern_index, resolved, executed) = proven.into_iter().next().unwrap();
+        let frame = &self.frames[frame_index];
+        let pattern = &frame.patterns[pattern_index];
+        memory.commit(frame, &executed.bindings, &resolved.origins, turn);
+        memory.pending = None;
+        memory.pending_ambiguity = None;
+        self.remember_session(memory, frame, pattern, &executed, turn);
+        let mut outcome = self.outcome(frame, pattern, executed, turn);
+        if tied_len > 1 {
+            outcome
+                .plan
+                .push(format!("frame_ambiguous_same_answer:{}", tied_len));
+            outcome.provenance.push(format!(
+                "另有 {} 个同样具体的候选给出相同答案，已合并采用",
+                tied_len - 1
+            ));
+        } else if proven_len > 1 {
+            outcome
+                .plan
+                .push(format!("frame_candidates:{}", proven_len));
+        }
+        outcome
+    }
+
+    fn specificity(&self, frame_index: usize, pattern_index: usize) -> (i32, usize, usize) {
+        let frame = &self.frames[frame_index];
+        let pattern = &frame.patterns[pattern_index];
+        (
+            frame.priority,
+            pattern.literal_chars,
+            usize::MAX - pattern.slots.len(),
+        )
+    }
+
+    fn stored_candidate(
+        &self,
+        candidate: &(usize, usize, Resolved, Executed),
+    ) -> StoredCandidate {
+        let (frame_index, pattern_index, resolved, executed) = candidate;
+        let frame = &self.frames[*frame_index];
+        StoredCandidate {
+            frame: frame.id.clone(),
+            pattern: frame.patterns[*pattern_index].source.clone(),
+            bindings: executed.bindings.clone(),
+            origins: resolved.origins.clone(),
+            text: executed.text.clone(),
+            evidence: executed.evidence.clone(),
+            entity: executed.entity.clone(),
+            attribute: executed.attribute.clone(),
+            answer_values: executed.answer_values.clone(),
+        }
+    }
+
+    /// 结算一次歧义选择：用户回复序号或完整候选答案后，才提交槽位记忆。
+    fn resolve_ambiguity(
+        &self,
+        memory: &mut FrameMemory,
+        input: &str,
+        turn: u64,
+    ) -> Option<FrameOutcome> {
+        let pending = memory.pending_ambiguity.clone()?;
+        if turn.saturating_sub(pending.turn) > FRAME_PENDING_TTL {
+            memory.pending_ambiguity = None;
+            return None;
+        }
+        if is_cancel_reply(input) {
+            memory.pending_ambiguity = None;
+            memory.ambiguities_cancelled += 1;
+            return Some(FrameOutcome {
+                text: "好的，这次追问先放下。".to_string(),
+                plan: vec![
+                    "frame_ambiguity_cancel".to_string(),
+                    "frame_ambiguity".to_string(),
+                ],
+                provenance: vec!["绑定帧的歧义澄清被用户撤销".to_string()],
+                kind: MoveKind::Other,
+                entity: None,
+                attribute: None,
+            });
+        }
+        let index = match parse_choice_index(input) {
+            Some(index) if index >= 1 && index <= pending.candidates.len() => index - 1,
+            Some(_) => {
+                memory.pending_ambiguity = Some(pending.clone());
+                return Some(FrameOutcome {
+                    text: pending.prompt.clone(),
+                    plan: vec![
+                        "frame_ambiguity_reprompt".to_string(),
+                        "frame_ambiguity".to_string(),
+                    ],
+                    provenance: vec!["歧义序号越界，已原样重问（零状态变化）".to_string()],
+                    kind: MoveKind::AskAttribute,
+                    entity: None,
+                    attribute: None,
+                });
+            }
+            None => match pending.candidates.iter().position(|candidate| {
+                normalize_utterance(&candidate.text) == input
+            }) {
+                Some(index) => index,
+                None => {
+                    memory.pending_ambiguity = None;
+                    return None;
+                }
+            },
+        };
+        let candidate = pending.candidates[index].clone();
+        let Some(frame) = self.frame(&candidate.frame) else {
+            memory.pending_ambiguity = None;
+            return None;
+        };
+        memory.commit(frame, &candidate.bindings, &candidate.origins, turn);
+        memory.pending_ambiguity = None;
+        memory.pending = None;
+        memory.ambiguities_resolved += 1;
+        let pattern = CompiledPattern {
+            source: candidate.pattern,
+            parts: Vec::new(),
+            slots: Vec::new(),
+            literal_chars: 0,
+        };
+        let executed = Executed {
+            text: candidate.text,
+            bindings: candidate.bindings,
+            evidence: candidate.evidence,
+            entity: candidate.entity,
+            attribute: candidate.attribute,
+            answer_values: candidate.answer_values,
+        };
+        self.remember_session(memory, frame, &pattern, &executed, turn);
+        let mut outcome = self.outcome(frame, &pattern, executed, turn);
+        outcome
+            .plan
+            .insert(0, "frame_ambiguity_resolved".to_string());
+        Some(outcome)
+    }
+
+    /// 记录本轮答案集合与游标，供「还有呢 / 第 2 个 / 全部」等追问复用。
+    fn remember_session(
+        &self,
+        memory: &mut FrameMemory,
+        frame: &CompiledFrame,
+        pattern: &CompiledPattern,
+        executed: &Executed,
+        turn: u64,
+    ) {
+        let values = executed.answer_values.clone();
+        if values.is_empty() {
+            memory.session = None;
+            return;
+        }
+        let lists_all = frame
+            .realize_answer
+            .as_deref()
+            .map(|template| template.contains("{values}") || template.contains("{objects}"))
+            .unwrap_or(true);
+        let spoken = if lists_all { values.len() } else { 1 };
+        memory.session = Some(FrameSession {
+            frame: frame.id.clone(),
+            pattern: pattern.source.clone(),
+            bindings: executed.bindings.clone(),
+            values,
+            spoken,
+            turn,
+            entity: executed.entity.clone(),
+            attribute: executed.attribute.clone(),
+        });
+    }
+
+    /// 枚举追问：只读取上一轮的模板实例，不重新解释问句，也不改写槽位环境。
+    fn enumerate_session(
+        &self,
+        memory: &mut FrameMemory,
+        input: &str,
+        turn: u64,
+    ) -> Option<FrameOutcome> {
+        let request = parse_enumeration(input)?;
+        let mut session = memory.session.clone()?;
+        if turn.saturating_sub(session.turn) > FRAME_SESSION_TTL {
+            memory.session = None;
+            return None;
+        }
+        let total = session.values.len();
+        let (text, plan_tag) = match request {
+            EnumerationRequest::Next => {
+                if session.spoken >= total {
+                    (
+                        format!("没有更多了：之前已列出全部 {} 项。", total),
+                        "frame_enumerate_end",
+                    )
+                } else {
+                    let value = session.values[session.spoken].clone();
+                    session.spoken += 1;
+                    (format!("还有：{}。", value), "frame_enumerate_next")
+                }
+            }
+            EnumerationRequest::All => {
+                session.spoken = total;
+                (
+                    format!("全部 {} 项：{}。", total, session.values.join("、")),
+                    "frame_enumerate_all",
+                )
+            }
+            EnumerationRequest::Index(index) => {
+                if index == 0 || index > total {
+                    (
+                        format!("没有第{}项：当前共 {} 项。", index, total),
+                        "frame_enumerate_missing",
+                    )
+                } else {
+                    session.spoken = session.spoken.max(index);
+                    (
+                        format!("第{}项是：{}。", index, session.values[index - 1]),
+                        "frame_enumerate_index",
+                    )
+                }
+            }
+        };
+        let frame_id = session.frame.clone();
+        let entity = session.entity.clone();
+        let attribute = session.attribute.clone();
+        session.turn = turn;
+        memory.session = Some(session);
+        memory.turn = turn;
+        memory.enumerations += 1;
+        Some(FrameOutcome {
+            text,
+            plan: vec![plan_tag.to_string(), format!("frame:{}", frame_id)],
+            provenance: vec![format!(
+                "沿用绑定帧「{}」上一轮保存的答案集合（{} 项）",
+                frame_id, total
+            )],
+            kind: MoveKind::AskAttribute,
+            entity,
+            attribute,
         })
     }
 
@@ -727,17 +1042,14 @@ impl FrameProgram {
             memory.commit(frame, &executed.bindings, &resolved.origins, turn);
             memory.pending = None;
             memory.clarifications_bound += 1;
-            let mut outcome = self.outcome(
-                frame,
-                &CompiledPattern {
-                    source: format!("clarification:{}", pending.raw),
-                    parts: Vec::new(),
-                    slots: Vec::new(),
-                    literal_chars: 0,
-                },
-                executed,
-                turn,
-            );
+            let pattern = CompiledPattern {
+                source: format!("clarification:{}", pending.raw),
+                parts: Vec::new(),
+                slots: Vec::new(),
+                literal_chars: 0,
+            };
+            self.remember_session(memory, frame, &pattern, &executed, turn);
+            let mut outcome = self.outcome(frame, &pattern, executed, turn);
             outcome
                 .plan
                 .insert(0, "frame_clarification_bound".to_string());
@@ -819,6 +1131,7 @@ impl FrameProgram {
                     evidence,
                     entity: Some(entity),
                     attribute: Some(attribute),
+                    answer_values: values,
                 })
             }
             CompiledGoal::Relation {
@@ -864,6 +1177,7 @@ impl FrameProgram {
                     evidence,
                     entity: Some(subject),
                     attribute: Some(predicate),
+                    answer_values: objects,
                 })
             }
             CompiledGoal::ReverseRelation {
@@ -909,6 +1223,7 @@ impl FrameProgram {
                     evidence,
                     entity: Some(object),
                     attribute: Some(predicate),
+                    answer_values: subjects,
                 })
             }
             CompiledGoal::Count {
@@ -950,6 +1265,7 @@ impl FrameProgram {
                     )],
                     entity: Some(subject),
                     attribute: Some(predicate),
+                    answer_values: Vec::new(),
                 })
             }
             CompiledGoal::Compare {
@@ -1006,6 +1322,7 @@ impl FrameProgram {
                     )],
                     entity: evaluated.winner,
                     attribute: Some(attribute),
+                    answer_values: Vec::new(),
                 })
             }
             CompiledGoal::Pattern {
@@ -1104,6 +1421,7 @@ impl FrameProgram {
                     evidence,
                     entity,
                     attribute,
+                    answer_values: values,
                 })
             }
         }
