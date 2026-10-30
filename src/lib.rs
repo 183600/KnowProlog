@@ -45,6 +45,7 @@ pub mod contextual_reference;
 pub mod contextual_segmentation;
 pub mod conversation_theory;
 pub mod conversational_graph;
+pub mod coref_closure;
 pub mod default_logic;
 pub mod delta_cache;
 pub mod dense_retrieval;
