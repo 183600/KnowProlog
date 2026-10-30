@@ -1716,3 +1716,22 @@
         assert!(explanation.contains("张三的师傅是谁"), "{}", explanation);
         assert!(explanation.contains("检索回执"), "{}", explanation);
     }
+
+    #[test]
+    fn semantic_search_question_compiles_lookup_and_keeps_constraints() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let outcome = reasoner.semantic_search_question("张三的师傅是谁");
+        assert!(!outcome.hits.is_empty());
+        assert!(outcome
+            .hits
+            .iter()
+            .all(|hit| hit.subject == "张三" && hit.predicate == "师傅"));
+        assert!(outcome.hits.iter().any(|hit| hit.object == "李四"));
+
+        let enumerated = reasoner.semantic_search_question("张三的师傅有哪些");
+        assert_eq!(
+            enumerated.batches.first().map(|batch| batch.mode),
+            Some(crate::search_port::SearchMode::Enumerate)
+        );
+    }

@@ -70,6 +70,32 @@ impl SearchMode {
             Self::Verify => "verify",
         }
     }
+
+    pub fn from_question(question: &str) -> Self {
+        let question = question.trim();
+        if ["是不是", "是否", "对不对", "对吗", "真的吗"]
+            .iter()
+            .any(|cue| question.contains(cue))
+            || ((question.ends_with('吗') || question.ends_with('么')) && question.contains('是'))
+        {
+            return Self::Verify;
+        }
+        if [
+            "哪些", "都有谁", "有谁", "列出", "所有", "全部", "几个", "多少位", "多少人",
+        ]
+        .iter()
+        .any(|cue| question.contains(cue))
+        {
+            return Self::Enumerate;
+        }
+        if ["介绍", "描述", "画像", "什么样", "什么样子"]
+            .iter()
+            .any(|cue| question.contains(cue))
+        {
+            return Self::Describe;
+        }
+        Self::Lookup
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -124,6 +150,27 @@ impl SearchRequest {
     pub fn new(query: impl Into<String>) -> Self {
         Self {
             query: query.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn from_question(
+        question: impl Into<String>,
+        anchor: Option<String>,
+        predicate: Option<String>,
+        max_results: usize,
+    ) -> Self {
+        let query = question.into();
+        Self {
+            mode: SearchMode::from_question(&query),
+            constraints: SearchConstraints {
+                subject: anchor,
+                predicate,
+                ..SearchConstraints::default()
+            },
+            expectation: AnswerExpectation::from_question(&query),
+            max_results,
+            query,
             ..Self::default()
         }
     }
@@ -1304,6 +1351,39 @@ mod tests {
         };
         assert!(session.record_assembly("张三的师傅是谁", &assembly));
         session
+    }
+
+    #[test]
+    fn question_compiles_to_mode_constraints_and_expectation() {
+        assert_eq!(
+            SearchMode::from_question("张三的师傅是谁"),
+            SearchMode::Lookup
+        );
+        assert_eq!(
+            SearchMode::from_question("张三的师傅有哪些"),
+            SearchMode::Enumerate
+        );
+        assert_eq!(
+            SearchMode::from_question("介绍一下张三"),
+            SearchMode::Describe
+        );
+        assert_eq!(
+            SearchMode::from_question("张三的师傅是李四吗"),
+            SearchMode::Verify
+        );
+        assert_eq!(SearchMode::from_question("什么是知识图谱"), SearchMode::Lookup);
+
+        let request = SearchRequest::from_question(
+            "张三有几个师傅",
+            Some("张三".to_string()),
+            Some("师傅".to_string()),
+            4,
+        );
+        assert_eq!(request.mode, SearchMode::Enumerate);
+        assert_eq!(request.constraints.subject.as_deref(), Some("张三"));
+        assert_eq!(request.constraints.predicate.as_deref(), Some("师傅"));
+        assert_eq!(request.expectation, AnswerExpectation::Number);
+        assert_eq!(request.max_results, 4);
     }
 
     #[test]

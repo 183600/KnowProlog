@@ -877,6 +877,28 @@ impl SymbolicReasoner {
         port.search(request)
     }
 
+    /// 把自然语言问句编译成检索动作（Lookup/Enumerate/Describe/Verify），
+    /// 用当前实体与谓词表生成精确约束，再交给统一语义检索端口。
+    pub fn semantic_search_question(
+        &self,
+        question: &str,
+    ) -> crate::search_port::PortOutcome {
+        let normalized = self.aligner.normalize_cow(question);
+        let mentioned = self.mentioned_predicate_canonicals(question);
+        let predicate = self
+            .first_mentioned_known_predicate(normalized.as_ref(), &mentioned)
+            .or_else(|| self.target_predicate_surface(normalized.as_ref()));
+        let anchor = self.entities_mentioned(question).into_iter().next();
+        let max_results = self.config.max_predictions.clamp(1, 8);
+        let request = crate::search_port::SearchRequest::from_question(
+            question,
+            anchor,
+            predicate,
+            max_results,
+        );
+        self.semantic_search(&request)
+    }
+
     /// 对上一轮结果集执行显式追问动作。默认关闭；没有结果集或不是结果集
     /// 动作时返回 None，完全回退到旧回答管线。
     pub fn answer_search_session(&self, question: &str) -> Option<String> {
