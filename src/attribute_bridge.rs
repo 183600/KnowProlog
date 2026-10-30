@@ -139,6 +139,20 @@ impl AttributeProfile {
         surfaces.insert(self.canonical.clone());
         surfaces.into_iter().collect()
     }
+
+    /// 稳定属性 IRI：`{base}attribute/{编码后的规范名}`。
+    pub fn iri(&self) -> String {
+        crate::identity::attribute_uri(crate::identity::DEFAULT_BASE_NS, &self.canonical)
+    }
+
+    /// 旧式平面谓词 IRI：`{base}{规范名}`（只读兼容，不切换默认写路径）。
+    pub fn legacy_iri(&self) -> String {
+        format!(
+            "{}{}",
+            crate::identity::DEFAULT_BASE_NS,
+            self.canonical
+        )
+    }
 }
 
 /// 属性注册表：规范名 + 别名索引 + 父子闭包 + 声明体检结果。
@@ -354,7 +368,18 @@ impl AttributeRegistry {
     }
 
     fn resolve_key(&self, surface: &str) -> Option<String> {
-        let key = normalize_key(surface);
+        let surface = surface.trim();
+        if surface.is_empty() {
+            return None;
+        }
+        // 读兼容：规范属性 IRI 与旧式平面谓词 IRI 都归一到本地名。
+        let local = crate::identity::attribute_local_name(
+            crate::identity::DEFAULT_BASE_NS,
+            surface,
+        )
+        .or_else(|| legacy_predicate_local_name(surface))
+        .unwrap_or_else(|| surface.to_string());
+        let key = normalize_key(&local);
         if key.is_empty() {
             return None;
         }
@@ -368,6 +393,23 @@ impl AttributeRegistry {
     pub fn resolve(&self, surface: &str) -> Option<&AttributeProfile> {
         self.resolve_key(surface)
             .and_then(|key| self.profiles.get(&key))
+    }
+
+    /// 属性 IRI → 规范画像：新式 `kg:attribute/{名}` 与旧式 `kg:{名}` 都接受。
+    ///
+    /// 实体路径与外部命名空间一律返回 `None`，避免把实体名误读成属性。
+    pub fn resolve_iri(&self, iri: &str) -> Option<&AttributeProfile> {
+        let local = crate::identity::attribute_local_name(
+            crate::identity::DEFAULT_BASE_NS,
+            iri,
+        )
+        .or_else(|| legacy_predicate_local_name(iri))?;
+        self.resolve(&local)
+    }
+
+    /// 词面/规范名 → 稳定属性 IRI（未登记返回 `None`）。
+    pub fn iri_for(&self, surface: &str) -> Option<String> {
+        self.resolve(surface).map(AttributeProfile::iri)
     }
 
     pub fn profile(&self, canonical: &str) -> Option<&AttributeProfile> {
@@ -678,6 +720,17 @@ fn find_requested_unit(suffix: &str, profile: &AttributeProfile) -> Option<Strin
 
 fn normalize_key(text: &str) -> String {
     text.trim().to_lowercase()
+}
+
+/// 旧式平面谓词 IRI → 本地名：仅接受 `{base}` 下的非实体、非属性路径。
+fn legacy_predicate_local_name(iri: &str) -> Option<String> {
+    let rest = iri.strip_prefix(crate::identity::DEFAULT_BASE_NS)?;
+    if rest.starts_with(crate::identity::ENTITY_PATH)
+        || rest.starts_with(crate::identity::ATTRIBUTE_PATH)
+    {
+        return None;
+    }
+    crate::identity::decode_segment(rest)
 }
 
 pub(crate) fn parse_dimension(text: &str) -> Option<Dimension> {
@@ -1125,6 +1178,72 @@ mod tests {
             registry.subattributes_of("身高"),
             vec!["height".to_string(), "net_height".to_string()]
         );
+    }
+
+    #[test]
+    fn attribute_iris_are_stable_and_read_both_new_and_legacy_forms() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let height = registry.profile("height").expect("height 已登记");
+        assert_eq!(
+            height.iri(),
+            "http://example.org/kg/attribute/height"
+        );
+        assert_eq!(height.legacy_iri(), "http://example.org/kg/height");
+        assert_eq!(
+            registry.iri_for("身高").as_deref(),
+            Some("http://example.org/kg/attribute/height")
+        );
+        assert_eq!(
+            registry
+                .resolve_iri("http://example.org/kg/attribute/height")
+                .map(|profile| profile.canonical.as_str()),
+            Some("height")
+        );
+        assert_eq!(
+            registry
+                .resolve_iri("http://example.org/kg/height")
+                .map(|profile| profile.canonical.as_str()),
+            Some("height"),
+            "旧式平面谓词必须仍可读"
+        );
+        assert_eq!(
+            registry
+                .resolve_iri("http://example.org/kg/身高")
+                .map(|profile| profile.canonical.as_str()),
+            Some("height"),
+            "旧式别名谓词也应可读"
+        );
+        assert!(
+            registry
+                .resolve_iri("http://example.org/kg/entity/height")
+                .is_none(),
+            "实体路径不得被误读成属性"
+        );
+        assert!(registry
+            .resolve_iri("http://other.org/kg/height")
+            .is_none());
+        assert!(registry.iri_for("未登记").is_none());
+    }
+
+    #[test]
+    fn assess_accepts_new_and_legacy_attribute_iris() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let types = person_types();
+        for attribute in [
+            "http://example.org/kg/attribute/height",
+            "http://example.org/kg/height",
+            "http://example.org/kg/身高",
+        ] {
+            let assessment =
+                registry.assess(&types, &type_set(&["Person"]), attribute, "2.26米");
+            assert_eq!(
+                assessment.verdict,
+                AttributeVerdict::Accepted,
+                "{attribute}"
+            );
+            assert_eq!(assessment.attribute, "height");
+            assert_eq!(assessment.value(), Some("226厘米"));
+        }
     }
 
     #[test]

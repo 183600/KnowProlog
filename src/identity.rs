@@ -19,6 +19,12 @@ pub const DEFAULT_BASE_NS: &str = "http://example.org/kg/";
 /// 实体 IRI 的路径前缀：`{base}entity/{编码后的规范名}`。
 pub const ENTITY_PATH: &str = "entity/";
 
+/// 属性 IRI 的路径前缀：`{base}attribute/{编码后的规范名}`。
+///
+/// 属性与实体、类型分处不同路径，谓词不再和类型/实体挤在同一个平面上；
+/// 旧数据仍使用 `{base}{词面}` 的平面 IRI，由 [`local_name`] 统一读兼容。
+pub const ATTRIBUTE_PATH: &str = "attribute/";
+
 /// IRI 路径段中必须百分号转义的字符（其余字符，含汉字，按 IRI 规范原样保留）。
 fn needs_escape(ch: char) -> bool {
     ch.is_control()
@@ -91,10 +97,30 @@ pub fn entity_local_name(base_ns: &str, iri: &str) -> Option<String> {
     decode_segment(local)
 }
 
-/// 任意 kg 本地名（含谓词/类型 IRI）：去掉 `{base}` 前缀后解码。
+/// 属性规范名 → 属性 URI（确定性，可无损反解）。
+pub fn attribute_uri(base_ns: &str, name: &str) -> String {
+    format!("{}{}{}", base_ns, ATTRIBUTE_PATH, encode_segment(name))
+}
+
+/// 属性 URI → 本地名：要求 `{base}attribute/` 前缀，解码失败返回 `None`。
+pub fn attribute_local_name(base_ns: &str, iri: &str) -> Option<String> {
+    let rest = iri.strip_prefix(base_ns)?;
+    let local = rest.strip_prefix(ATTRIBUTE_PATH)?;
+    decode_segment(local)
+}
+
+/// 任意 kg 本地名（含实体/属性路径、旧式谓词与类型 IRI）：
+/// 去掉 `{base}` 前缀与已知路径段后解码。
+///
+/// 读兼容约定：新数据可写 `kg:attribute/{规范名}`，旧数据仍写
+/// `kg:{词面}`；两者都归一为同一本地名。实体路径必须严格走
+/// [`entity_local_name`]，避免把 `kg:entity/height` 误读成属性。
 pub fn local_name(base_ns: &str, iri: &str) -> Option<String> {
     let rest = iri.strip_prefix(base_ns)?;
-    let local = rest.strip_prefix(ENTITY_PATH).unwrap_or(rest);
+    let local = rest
+        .strip_prefix(ENTITY_PATH)
+        .or_else(|| rest.strip_prefix(ATTRIBUTE_PATH))
+        .unwrap_or(rest);
     decode_segment(local)
 }
 
@@ -576,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn local_name_handles_entity_and_plain_paths() {
+    fn local_name_handles_entity_plain_and_attribute_paths() {
         assert_eq!(
             local_name(DEFAULT_BASE_NS, "http://example.org/kg/teacher_of").as_deref(),
             Some("teacher_of")
@@ -585,11 +611,43 @@ mod tests {
             local_name(DEFAULT_BASE_NS, "http://example.org/kg/entity/李四").as_deref(),
             Some("李四")
         );
+        assert_eq!(
+            local_name(DEFAULT_BASE_NS, "http://example.org/kg/attribute/height").as_deref(),
+            Some("height"),
+            "属性路径应与旧式平面谓词归一为同一本地名"
+        );
         assert_eq!(local_name(DEFAULT_BASE_NS, "http://other.org/x"), None);
         assert_eq!(
             entity_local_name(DEFAULT_BASE_NS, "http://example.org/kg/name"),
             None,
             "非实体路径不得被当成实体本地名"
+        );
+    }
+
+    #[test]
+    fn attribute_uri_roundtrip_and_path_is_separate_from_entities() {
+        for name in ["height", "身高", "出生/地", "a b"] {
+            let uri = attribute_uri(DEFAULT_BASE_NS, name);
+            assert!(uri.starts_with("http://example.org/kg/attribute/"));
+            assert_eq!(
+                attribute_local_name(DEFAULT_BASE_NS, &uri).as_deref(),
+                Some(name)
+            );
+            assert_eq!(local_name(DEFAULT_BASE_NS, &uri).as_deref(), Some(name));
+        }
+        assert_eq!(
+            attribute_uri(DEFAULT_BASE_NS, "身高"),
+            "http://example.org/kg/attribute/身高"
+        );
+        assert_eq!(
+            attribute_local_name(DEFAULT_BASE_NS, "http://example.org/kg/身高"),
+            None,
+            "旧式平面谓词不是属性路径"
+        );
+        assert_eq!(
+            attribute_local_name(DEFAULT_BASE_NS, "http://example.org/kg/entity/身高"),
+            None,
+            "实体路径不得被当成属性本地名"
         );
     }
 
