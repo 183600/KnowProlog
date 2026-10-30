@@ -393,9 +393,7 @@ pub struct AuditSummary {
     pub code_counts: BTreeMap<String, usize>,
 }
 impl AuditSummary {
-    pub fn from_decisions<'a>(
-        decisions: impl IntoIterator<Item = &'a DisclosureDecision>,
-    ) -> Self {
+    pub fn from_decisions<'a>(decisions: impl IntoIterator<Item = &'a DisclosureDecision>) -> Self {
         let mut summary = Self::default();
         for decision in decisions {
             summary.total += 1;
@@ -623,6 +621,9 @@ impl<'a> PrivacyAdjudicator<'a> {
             let (leaks, truncated) = self.graph.inference_leaks(&fact, self.policy, effective);
             if truncated {
                 add_code(&mut codes, DecisionCode::ClosureTruncated);
+                if self.policy.fail_closed_on_closure_truncation && category.is_personal() {
+                    effective = DisclosurePrecision::Hidden;
+                }
             }
             if !leaks.is_empty() {
                 let cap = leaks

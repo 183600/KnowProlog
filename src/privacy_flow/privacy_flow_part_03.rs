@@ -124,10 +124,9 @@ mod tests {
     #[test]
     fn redact_honors_policy_precision_and_weak_blocking() {
         let mut policy = policy();
-        policy.category_precision.insert(
-            PrivacyCategory::Location,
-            DisclosurePrecision::Granular,
-        );
+        policy
+            .category_precision
+            .insert(PrivacyCategory::Location, DisclosurePrecision::Granular);
         policy.weak_evidence_blocks = true;
         let detector = SpanDetector::new(&policy);
         let text = "张三住在北京市海淀区中关村大街1号。";
@@ -135,10 +134,7 @@ mod tests {
 
         assert!(redaction.text.contains("北京市海淀区"));
         assert!(!redaction.text.contains("中关村"));
-        assert_eq!(
-            redaction.kept_weak, 0,
-            "弱证据被提升为硬证据后不再原样保留"
-        );
+        assert_eq!(redaction.kept_weak, 0, "弱证据被提升为硬证据后不再原样保留");
         assert!(!redaction.text.contains("张三"));
         assert!(redaction.text.contains("某位人士"));
     }
@@ -376,6 +372,58 @@ mod tests {
     }
 
     #[test]
+    fn truncated_closure_blocks_personal_facts_by_default() {
+        let mut policy = policy();
+        policy.max_closure_atoms = 2;
+        policy.inference_rules.push(
+            InferenceRule::new(
+                "学校位置推断城区",
+                "学校地址",
+                "位于",
+                "所在城区",
+                PrivacyCategory::Location,
+            )
+            .with_max_precision(DisclosurePrecision::TypeOnly),
+        );
+        let mut graph = PrivacyGraph::new();
+        graph.add_fact(&policy, "张三", "学校地址", "阳光小学");
+        graph.add_fact(&policy, "阳光小学", "位于", "北京市海淀区");
+        let mut ledger = ledger();
+        let mut adjudicator = PrivacyAdjudicator::new(&policy, &graph, &mut ledger);
+        let decision =
+            adjudicator.adjudicate(&DisclosureRequest::new("张三", "学校地址", "阳光小学"));
+        assert_eq!(decision.status, DisclosureStatus::Blocked);
+        assert_eq!(decision.effective_precision, DisclosurePrecision::Hidden);
+        assert!(decision.codes.contains(&DecisionCode::ClosureTruncated));
+    }
+
+    #[test]
+    fn truncated_closure_can_be_configured_open() {
+        let mut policy = policy();
+        policy.max_closure_atoms = 2;
+        policy.fail_closed_on_closure_truncation = false;
+        policy.inference_rules.push(
+            InferenceRule::new(
+                "学校位置推断城区",
+                "学校地址",
+                "位于",
+                "所在城区",
+                PrivacyCategory::Location,
+            )
+            .with_max_precision(DisclosurePrecision::TypeOnly),
+        );
+        let mut graph = PrivacyGraph::new();
+        graph.add_fact(&policy, "张三", "学校地址", "阳光小学");
+        graph.add_fact(&policy, "阳光小学", "位于", "北京市海淀区");
+        let mut ledger = ledger();
+        let mut adjudicator = PrivacyAdjudicator::new(&policy, &graph, &mut ledger);
+        let decision =
+            adjudicator.adjudicate(&DisclosureRequest::new("张三", "学校地址", "阳光小学"));
+        assert_ne!(decision.status, DisclosureStatus::Blocked);
+        assert!(decision.codes.contains(&DecisionCode::ClosureTruncated));
+    }
+
+    #[test]
     fn inference_guard_can_block_when_rule_forbids_disclosure() {
         let mut policy = policy();
         policy.inference_rules.push(
@@ -520,18 +568,8 @@ mod tests {
                 category: Some(PrivacyCategory::Location),
             },
         );
-        assert!(ledger.is_tombstoned(
-            "张三",
-            "地址",
-            "北京市",
-            PrivacyCategory::Location
-        ));
-        assert!(!ledger.is_tombstoned(
-            "张三",
-            "电话",
-            "13800138000",
-            PrivacyCategory::Contact
-        ));
+        assert!(ledger.is_tombstoned("张三", "地址", "北京市", PrivacyCategory::Location));
+        assert!(!ledger.is_tombstoned("张三", "电话", "13800138000", PrivacyCategory::Contact));
     }
 
     #[test]

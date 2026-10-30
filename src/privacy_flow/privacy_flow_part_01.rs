@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::OnceLock;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
 use crate::function_words::{wh_kind, WhKind};
 use crate::nlp::{AnnotatedWord, TagSource};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 /// 会话隐私台账的方言版本；写入 JSON 以便迁移。
 pub const PRIVACY_LEDGER_VERSION: u32 = 1;
 /// 一次闭包最多保留多少个推导事实（含基础事实）。
@@ -160,7 +160,9 @@ impl PrivacyCategory {
                 PrivacyCategory::Demographic,
             ),
             (
-                &["父亲", "母亲", "父母", "配偶", "亲属", "家人", "朋友", "同事"],
+                &[
+                    "父亲", "母亲", "父母", "配偶", "亲属", "家人", "朋友", "同事",
+                ],
                 PrivacyCategory::Relationship,
             ),
             (
@@ -478,11 +480,7 @@ impl<'a> SpanDetector<'a> {
 ///
 /// 与逐事实裁决共享 [`coarsen_value`]，因此“某位人士 / 某地 / 15-19 岁”
 /// 这类表达在多轮之间保持稳定；只替换阻断跨度，句子的其余部分与语序不变。
-pub fn redact_spans(
-    text: &str,
-    spans: &[SensitiveSpan],
-    policy: &PrivacyPolicy,
-) -> SpanRedaction {
+pub fn redact_spans(text: &str, spans: &[SensitiveSpan], policy: &PrivacyPolicy) -> SpanRedaction {
     let chars: Vec<char> = text.chars().collect();
     let mut output = String::with_capacity(text.len());
     let mut records = Vec::new();
@@ -689,6 +687,8 @@ pub struct PrivacyPolicy {
     pub k_anonymity: usize,
     pub max_closure_depth: usize,
     pub max_closure_atoms: usize,
+    /// 闭包预算耗尽时是否按「无法证明安全」保守阻断个人事实。
+    pub fail_closed_on_closure_truncation: bool,
     pub weak_evidence_blocks: bool,
     pub category_precision: BTreeMap<PrivacyCategory, DisclosurePrecision>,
     pub predicate_rules: Vec<PredicateRule>,
@@ -703,6 +703,7 @@ impl Default for PrivacyPolicy {
             k_anonymity: DEFAULT_K_ANONYMITY,
             max_closure_depth: DEFAULT_MAX_CLOSURE_DEPTH,
             max_closure_atoms: DEFAULT_MAX_CLOSURE_ATOMS,
+            fail_closed_on_closure_truncation: true,
             weak_evidence_blocks: false,
             category_precision: default_category_precision(),
             predicate_rules: default_predicate_rules(),
@@ -791,11 +792,16 @@ impl PrivacyPolicy {
             .collect::<Vec<_>>()
             .join(" ");
         let mut text = format!(
-            "隐私策略：模式 {}，k={}，闭包深度 {}，闭包原子上限 {}，弱证据{}硬拦；类别上限：{}；需授权：{}；敏感词 {} 条，推导规则 {} 条",
+            "隐私策略：模式 {}，k={}，闭包深度 {}，闭包原子上限 {}，截断{}保守阻断，弱证据{}硬拦；类别上限：{}；需授权：{}；敏感词 {} 条，推导规则 {} 条",
             self.mode.label(),
             self.k_anonymity,
             self.max_closure_depth,
             self.max_closure_atoms,
+            if self.fail_closed_on_closure_truncation {
+                ""
+            } else {
+                "不"
+            },
             if self.weak_evidence_blocks {
                 ""
             } else {
@@ -1293,17 +1299,26 @@ impl PrivacyAct {
         let negated = contains_any(
             trimmed,
             &[
-                "不要", "不能", "不准", "不许", "不得", "别告诉", "别把", "别说", "别透露",
-                "别公开", "别分享", "别记", "别再",
+                "不要",
+                "不能",
+                "不准",
+                "不许",
+                "不得",
+                "别告诉",
+                "别把",
+                "别说",
+                "别透露",
+                "别公开",
+                "别分享",
+                "别记",
+                "别再",
             ],
         );
         let disclosure_verb = contains_any(trimmed, &["告诉", "透露", "说出去", "公开", "分享"]);
         let revokes = negated && disclosure_verb
             || contains_any(trimmed, &["撤回", "收回", "取消授权", "不同意"]);
-        let grants = contains_any(
-            trimmed,
-            &["可以告诉", "可以说", "同意", "允许", "授权"],
-        ) && !negated;
+        let grants =
+            contains_any(trimmed, &["可以告诉", "可以说", "同意", "允许", "授权"]) && !negated;
 
         if forgets {
             return PrivacyAct::Forget { category };
@@ -1320,7 +1335,8 @@ impl PrivacyAct {
             return PrivacyAct::AskPolicy;
         }
         if grants {
-            let scope = if contains_any(trimmed, &["只此一次", "仅此一次", "这一次", "这次可以"]) {
+            let scope = if contains_any(trimmed, &["只此一次", "仅此一次", "这一次", "这次可以"])
+            {
                 ConsentScope::Once
             } else {
                 ConsentScope::Session
