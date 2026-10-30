@@ -549,6 +549,10 @@ pub struct ReasoningConfig {
     pub rewrite_retrieval: rewrite_retrieval::RewriteRetrievalConfig,
     #[serde(default)]
     pub semantic_monitor: SemanticMonitorConfig,
+    /// 语义检索端口的结果集会话：显式处理「还有呢 / 第几个 / 除了… / 为什么」。
+    /// 默认关闭；关闭时回答路径与旧行为逐字节一致。
+    #[serde(default)]
+    pub search_session: search_port::SearchSessionConfig,
 }
 fn default_enable_holographic_memory() -> bool {
     true
@@ -737,6 +741,7 @@ impl Default for ReasoningConfig {
             soft_route: soft_route::SoftRouteConfig::default(),
             rewrite_retrieval: rewrite_retrieval::RewriteRetrievalConfig::default(),
             semantic_monitor: SemanticMonitorConfig::default(),
+            search_session: search_port::SearchSessionConfig::default(),
         }
     }
 }

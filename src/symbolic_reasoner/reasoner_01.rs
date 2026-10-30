@@ -143,6 +143,8 @@ impl SymbolicReasoner {
             config.holographic_similarity_floor,
             config.holographic_max_hits,
         );
+        let search_session =
+            crate::search_port::SearchSession::new(config.search_session.clone());
         let mut reasoner = Self {
             config,
             aligner,
@@ -170,6 +172,7 @@ impl SymbolicReasoner {
             rewrite_book: None,
             retrieval: parking_lot::Mutex::new(DenseRetriever::new(8, 0.85, 12)),
             contextual_last: parking_lot::Mutex::new(None),
+            search_session: parking_lot::Mutex::new(search_session),
             formal_clarification: parking_lot::Mutex::new(None),
             contextual_memory: ReadingMemory::new(512),
             attributes: HashSet::new(),
@@ -282,6 +285,7 @@ impl SymbolicReasoner {
         self.context.clear();
         self.epistemic_turns.clear();
         *self.contextual_last.lock() = None;
+        self.search_session.lock().clear();
         *self.formal_clarification.lock() = None;
         self.contextual_memory.clear();
         // 假设世界是会话态：分叉/重置时整体丢弃，不带走任何临时前提。

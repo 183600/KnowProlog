@@ -74,6 +74,14 @@ holographic_similarity_floor = 0.01    # 召回候选的余弦下限（低于视
 holographic_max_hits = 6               # 单次全息召回的最大候选数
 require_predicate_admission = false    # 严格准入：只允许画像中已登记的谓词入库（false=未知谓词自动待确认准入）
 
+# 语义检索端口的结果集会话：把上一轮已核实证据保留为显式结果集，
+# 支持「还有呢 / 第几个 / 除了… / 为什么」。默认关闭；
+# 关闭时回答路径与旧行为逐字节一致，普通问句仍走原管线。
+[reasoning.search_session]
+enabled = false
+page_size = 3
+max_entries = 24
+
 # 建设性多跳：链式查询缺一条中间边时，用已挖掘规则合成查询局部虚拟事实，
 # 让推断继续参与下一跳；默认关闭，关闭时回答路径逐字节不变。
 [reasoning.semantic_monitor]

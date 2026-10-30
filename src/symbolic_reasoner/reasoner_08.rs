@@ -823,6 +823,9 @@ impl SymbolicReasoner {
 
     /// 无观测副作用的回答实现（报告路径复用，避免失败轨迹递归）。
     fn answer_impl(&self, question: &str) -> Option<String> {
+        if let Some(answer) = self.answer_search_session(question) {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_learned_rewrite(question) {
             return Some(answer);
         }
@@ -857,6 +860,40 @@ impl SymbolicReasoner {
         self.answer_contextual(question)
             .or_else(|| self.formal_semantics_attempt(question))
             .or_else(|| self.generator.answer_import_frame(question))
+    }
+
+    /// 通过统一语义检索端口执行一次检索：稠密索引与全息记忆作为两个 backend，
+    /// 端口负责能力协商、证据归一与可审计回执。该通道只读，不改变回答路径。
+    pub fn semantic_search(
+        &self,
+        request: &crate::search_port::SearchRequest,
+    ) -> crate::search_port::PortOutcome {
+        let mut retrieval = self.retrieval.lock();
+        let mut port = crate::search_port::SearchPort::new();
+        port.register(crate::search_port::DenseSearchBackend::new(&mut retrieval));
+        if self.config.enable_holographic_memory {
+            port.register(crate::search_port::HoloSearchBackend::new(&self.holo));
+        }
+        port.search(request)
+    }
+
+    /// 对上一轮结果集执行显式追问动作。默认关闭；没有结果集或不是结果集
+    /// 动作时返回 None，完全回退到旧回答管线。
+    pub fn answer_search_session(&self, question: &str) -> Option<String> {
+        if !self.config.search_session.enabled {
+            return None;
+        }
+        let action = crate::search_port::parse_followup(question)?;
+        let reply = {
+            let mut session = self.search_session.lock();
+            session.respond(&action)
+        };
+        if reply.is_some() {
+            self.perf.bump("search_session_actions");
+            self.perf
+                .bump(&format!("search_session_{}", action.label()));
+        }
+        reply
     }
 
     /// 对话级证据装配（默认关闭）：把问句、焦点栈、上一谓词与已引用证据
@@ -1005,6 +1042,11 @@ impl SymbolicReasoner {
         let keys = assembly.selected_keys();
         if !keys.is_empty() {
             *self.contextual_last.lock() = Some((question.trim().to_string(), keys));
+            if self.config.search_session.enabled {
+                self.search_session
+                    .lock()
+                    .record_assembly(question.trim(), &assembly);
+            }
         }
         Some(assembly)
     }

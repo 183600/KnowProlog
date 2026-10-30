@@ -54,6 +54,7 @@
             soft_route: crate::soft_route::SoftRouteConfig::default(),
             rewrite_retrieval: crate::rewrite_retrieval::RewriteRetrievalConfig::default(),
             semantic_monitor: crate::SemanticMonitorConfig::default(),
+            search_session: crate::search_port::SearchSessionConfig::default(),
         }
     }
 
@@ -1589,4 +1590,105 @@
             Some(crate::semantic_monitor::STRICT_MAX_ITEMS)
         );
         assert!(advice.prefer_clarification);
+    }
+
+    fn search_session_config() -> ReasoningConfig {
+        let mut config = contextual_config();
+        config.search_session = crate::search_port::SearchSessionConfig {
+            enabled: true,
+            page_size: 2,
+            max_entries: 12,
+        };
+        config
+    }
+
+    fn search_session_facts() -> Vec<PrologFact> {
+        vec![
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "王五".to_string(),
+            },
+            PrologFact::Relation {
+                from: "张三".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "赵六".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn search_session_answers_deterministic_result_set_followups() {
+        let mut reasoner = SymbolicReasoner::new(search_session_config(), HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+        let first = reasoner
+            .answer_contextual("张三的师傅是谁")
+            .expect("首轮应装配多值槽位");
+        assert!(first.contains("李四"), "{}", first);
+        assert!(first.contains("王五"), "{}", first);
+        assert!(first.contains("赵六"), "{}", first);
+
+        let second = reasoner.answer("第二条是什么").expect("应能选中第 2 条");
+        assert!(second.contains("第 2 条"), "{}", second);
+        assert!(second.contains("王五"), "{}", second);
+
+        let page = reasoner.answer("还有呢").expect("应能继续翻页");
+        assert!(page.contains("赵六"), "{}", page);
+        assert!(page.contains("这已是全部结果"), "{}", page);
+
+        let explanation = reasoner.answer("为什么").expect("应能解释上一轮结果");
+        assert!(explanation.contains("张三的师傅是谁"), "{}", explanation);
+        assert!(explanation.contains("证据装配回执"), "{}", explanation);
+
+        let excluded = reasoner
+            .answer("除了王五还有谁")
+            .expect("应能从结果集中排除");
+        assert!(!excluded.contains("[E2]"), "{}", excluded);
+        assert!(excluded.contains("[E1]"), "{}", excluded);
+        assert!(excluded.contains("[E3]"), "{}", excluded);
+        assert!(reasoner.perf.count("search_session_actions") >= 4);
+    }
+
+    #[test]
+    fn search_session_stays_disabled_by_default() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+        reasoner
+            .answer_contextual("张三的师傅是谁")
+            .expect("首轮仍由旧管线回答");
+        assert!(reasoner.answer_search_session("第二条是什么").is_none());
+    }
+
+    #[test]
+    fn semantic_search_port_negotiates_dense_and_holo_channels() {
+        let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let request = crate::search_port::SearchRequest {
+            query: "师傅".to_string(),
+            mode: crate::search_port::SearchMode::Lookup,
+            constraints: SearchConstraints {
+                subject: Some("张三".to_string()),
+                predicate: Some("师傅".to_string()),
+                ..SearchConstraints::default()
+            },
+            max_results: 5,
+            ..crate::search_port::SearchRequest::default()
+        };
+        let outcome = reasoner.semantic_search(&request);
+        assert_eq!(outcome.batches.len(), 2);
+        assert!(!outcome.receipt.certified_top_k);
+        assert!(outcome
+            .hits
+            .iter()
+            .any(|hit| hit.channels.contains(&"dense".to_string())
+                && hit.channels.contains(&"holo".to_string())));
+        assert!(outcome
+            .hits
+            .iter()
+            .all(|hit| hit.subject == "张三" && hit.predicate == "师傅"));
     }

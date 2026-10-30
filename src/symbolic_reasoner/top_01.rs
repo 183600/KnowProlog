@@ -1332,6 +1332,8 @@ pub struct SymbolicReasoner {
     retrieval: parking_lot::Mutex<DenseRetriever>,
     // 对话级证据装配器的会话记忆：上次回答引用过的证据（追问去重、防复述）
     contextual_last: parking_lot::Mutex<Option<(String, Vec<EvidenceKey>)>>,
+    // 语义检索端口的结果集会话：显式保存上一轮证据，支持确定性追问操作
+    search_session: parking_lot::Mutex<crate::search_port::SearchSession>,
     // 语义歧义澄清帧：解析森林出现多个有证据读法时，等待用户选定其一
     formal_clarification: parking_lot::Mutex<Option<FormalClarification>>,
     // 语境分词读法记忆：同一词面在不同焦点/类型语境下的确认与纠正（会话态）

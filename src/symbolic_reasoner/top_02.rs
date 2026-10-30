@@ -30,6 +30,7 @@ impl Clone for SymbolicReasoner {
             rewrite_book: self.rewrite_book.clone(),
             retrieval: parking_lot::Mutex::new(self.retrieval.lock().clone()),
             contextual_last: parking_lot::Mutex::new(self.contextual_last.lock().clone()),
+            search_session: parking_lot::Mutex::new(self.search_session.lock().clone()),
             formal_clarification: parking_lot::Mutex::new(self.formal_clarification.lock().clone()),
             contextual_memory: self.contextual_memory.clone(),
             attributes: self.attributes.clone(),
