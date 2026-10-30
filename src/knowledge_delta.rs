@@ -146,6 +146,59 @@ impl KnowledgeBase {
         }
     }
 
+    /// 从基线快照 + 增量重建知识库（检查点 + 日志重放）。
+    ///
+    /// 只接受连续代数且不含 `Reset` 的增量；整体替换无法仅凭日志重建，
+    /// 返回 `None`，调用方应改用新的全量快照。重建后的日志只包含本次重放
+    /// 的增量，因此 `journal_len` 如实反映新库的日志窗口。
+    pub fn from_snapshot(
+        snapshot: &KnowledgeSnapshot,
+        changes: &[KnowledgeChange],
+    ) -> Option<Self> {
+        let mut facts = (*snapshot.facts).clone();
+        let mut aliases = snapshot.aliases.clone();
+        let mut generation = snapshot.generation;
+        for change in changes {
+            if change.generation() != generation.saturating_add(1) {
+                return None;
+            }
+            match change {
+                KnowledgeChange::Facts { facts: batch, .. } => {
+                    for fact in batch {
+                        if !facts.contains(fact) {
+                            facts.push(fact.clone());
+                        }
+                    }
+                }
+                KnowledgeChange::Aliases { aliases: batch, .. } => {
+                    for pair in batch {
+                        if !aliases.contains(pair) {
+                            aliases.push(pair.clone());
+                        }
+                    }
+                }
+                KnowledgeChange::Reset { .. } => return None,
+            }
+            generation = change.generation();
+        }
+        let journal_capacity = DEFAULT_JOURNAL_CAPACITY;
+        let mut journal: VecDeque<KnowledgeChange> = changes.iter().cloned().collect();
+        while journal.len() > journal_capacity {
+            journal.pop_front();
+        }
+        let fingerprint = fingerprint_facts(&facts);
+        Some(Self {
+            state: RwLock::new(KnowledgeState {
+                generation,
+                facts: Arc::new(facts),
+                aliases,
+                journal,
+                fingerprint,
+            }),
+            journal_capacity,
+        })
+    }
+
     pub fn generation(&self) -> u64 {
         self.state.read().generation
     }
@@ -367,6 +420,51 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_plus_incremental_changes_rebuilds_same_state() {
+        let knowledge = KnowledgeBase::new(vec![entity("姚明", "人物")]);
+        let base = knowledge.snapshot();
+        knowledge.assert_facts(&[relation("姚明", "队友", "叶莉")], "one");
+        knowledge.record_aliases(&[("明哥".to_string(), "姚明".to_string())], "two");
+        knowledge.assert_facts(&[entity("叶莉", "人物")], "three");
+        let current = knowledge.snapshot();
+        let changes = match knowledge.changes_since(base.generation) {
+            KnowledgeCatchup::Incremental(changes) => changes,
+            other => panic!("expected incremental, got {:?}", other),
+        };
+        let replayed = KnowledgeBase::from_snapshot(&base, &changes).expect("应可重放");
+        let rebuilt = replayed.snapshot();
+        assert_eq!(rebuilt.generation, current.generation);
+        assert_eq!(rebuilt.facts.as_slice(), current.facts.as_slice());
+        assert_eq!(rebuilt.aliases, current.aliases);
+        assert_eq!(rebuilt.fingerprint, current.fingerprint);
+        assert_eq!(
+            replayed.changes_since(base.generation),
+            KnowledgeCatchup::Incremental(changes)
+        );
+    }
+
+    #[test]
+    fn replay_rejects_reset_and_generation_gaps() {
+        let knowledge = KnowledgeBase::new(Vec::new());
+        let base = knowledge.snapshot();
+        knowledge.assert_facts(&[relation("甲", "认识", "乙")], "one");
+        let changes = knowledge.journal_since(base.generation).unwrap();
+        let replayed = KnowledgeBase::from_snapshot(&base, &changes).expect("应可重放");
+        assert_eq!(replayed.generation(), 1);
+
+        knowledge.replace_facts(vec![relation("甲", "认识", "丙")], "reset");
+        let with_reset = knowledge.journal_since(base.generation).unwrap();
+        assert!(KnowledgeBase::from_snapshot(&base, &with_reset).is_none());
+
+        let skipped = vec![KnowledgeChange::Facts {
+            generation: 3,
+            facts: vec![relation("甲", "认识", "丁")],
+            source: "gap".to_string(),
+        }];
+        assert!(KnowledgeBase::from_snapshot(&base, &skipped).is_none());
+    }
+
+    #[test]
     fn pruned_journal_requires_rebuild() {
         let knowledge = KnowledgeBase::with_journal_capacity(Vec::new(), 1);
         knowledge.assert_facts(&[relation("甲", "认识", "乙")], "one");
@@ -390,10 +488,7 @@ mod tests {
         let journal = knowledge.journal_since(0).unwrap();
         assert_eq!(journal.len(), 1);
         assert_eq!(journal[0].kind(), "reset");
-        assert!(!knowledge.replace_facts(
-            vec![relation("姚明", "队友", "王五")],
-            "fix"
-        ));
+        assert!(!knowledge.replace_facts(vec![relation("姚明", "队友", "王五")], "fix"));
         assert_eq!(knowledge.generation(), 1);
     }
 
