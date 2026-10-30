@@ -1299,6 +1299,25 @@ mod fusion_tests {
         assert_eq!(assertion.object, "Person");
         assert_eq!(assertion.object_kind, ObjectKind::Entity);
 
+        // 新属性 IRI 目录与旧式平面谓词读入后必须归一成同一本地名。
+        for predicate_iri in [
+            "http://example.org/kg/attribute/height",
+            "http://example.org/kg/height",
+        ] {
+            let attribute_quad = Quad::new(
+                NamedNode::new("http://example.org/kg/entity/小明").unwrap(),
+                NamedNode::new(predicate_iri).unwrap(),
+                Literal::new_simple_literal("226"),
+                GraphName::DefaultGraph,
+            );
+            let assertion =
+                OxigraphManager::assertion_from_rdf_quad(&attribute_quad, "alice", "a.ttl")
+                    .unwrap();
+            assert_eq!(assertion.subject, "小明");
+            assert_eq!(assertion.predicate, "height", "{predicate_iri}");
+            assert_eq!(assertion.object, "226");
+        }
+
         let blank = Quad::new(
             BlankNode::default(),
             NamedNode::new("http://example.org/kg/年龄").unwrap(),
