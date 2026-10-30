@@ -43,7 +43,7 @@ use know_prolog::{
         compare_baseline, entity_types_from_prolog_facts, evaluate, triples_from_prolog_facts,
         EvalBaseline, EvalConfig,
     },
-    entity_registry::{extract_alias_candidates, MintVerdict, NominationKind},
+    entity_registry::{extract_alias_candidates, EntityRegistry, MintVerdict, NominationKind},
     entity_thread::{render_event_line, EntityThreadDigest, ThreadLookup},
     event_graph::{EventDialogue, EventGraph},
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
@@ -133,7 +133,7 @@ use know_prolog::{
     variant_closure::{VariantClosure, VariantContext},
     teachable_assertion::{TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
-    trace_graph::TraceMode,
+    trace_graph::{ReferentTrail, TraceMode},
     type_system::TypeSystem,
     view_render::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
@@ -402,8 +402,21 @@ enum Commands {
     /// Inspect a coreference closure from JSON evidence: identity classes,
     /// ambiguity/type guards, and optional relation closure over the quotient
     Coref {
-        /// JSON evidence file; "-" reads from stdin
-        file_path: String,
+        /// JSON evidence file; "-" reads from stdin; omit when using artifacts
+        #[arg(value_name = "EVIDENCE")]
+        file_path: Option<String>,
+        /// Entity registry JSON to absorb (aliases, merges, types)
+        #[arg(long, value_name = "FILE")]
+        registry: Option<String>,
+        /// Variant closure JSON to absorb (metonymy stays non-identity)
+        #[arg(long, value_name = "FILE")]
+        variants: Option<String>,
+        /// Binding ledger snapshot JSON to absorb
+        #[arg(long, value_name = "FILE")]
+        bindings: Option<String>,
+        /// Referent trail JSON to absorb
+        #[arg(long, value_name = "FILE")]
+        trail: Option<String>,
         /// Resolve one surface and show its canonical identity + witness
         #[arg(long)]
         resolve: Option<String>,

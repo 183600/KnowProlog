@@ -153,6 +153,10 @@ async fn main() {
     // 共指闭包只读证据 JSON：不打开知识存储，也不写任何账本。
     if let Some(Commands::Coref {
         file_path,
+        registry,
+        variants,
+        bindings,
+        trail,
         resolve,
         closure,
         predicate,
@@ -162,7 +166,11 @@ async fn main() {
     }) = &cli.command
     {
         run_coref(
-            file_path,
+            file_path.as_deref(),
+            registry.as_deref(),
+            variants.as_deref(),
+            bindings.as_deref(),
+            trail.as_deref(),
             resolve.as_deref(),
             closure.as_deref(),
             predicate.as_deref(),

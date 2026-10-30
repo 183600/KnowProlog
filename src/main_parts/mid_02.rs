@@ -655,9 +655,33 @@ fn run_open_closure(
     }
 }
 
+fn read_coref_file(path: &str, label: &str) -> String {
+    if path == "-" {
+        let mut content = String::new();
+        if let Err(error) = std::io::stdin().read_to_string(&mut content) {
+            eprintln!("读取{}失败：{}", label, error);
+            std::process::exit(1);
+        }
+        content
+    } else {
+        match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                eprintln!("读取{}失败：{}", label, error);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// `coref`：只读证据 JSON，输出身份等价类、歧义/类型守卫与商图闭包。
+#[allow(clippy::too_many_arguments)]
 fn run_coref(
-    file_path: &str,
+    file_path: Option<&str>,
+    registry_path: Option<&str>,
+    variants_path: Option<&str>,
+    bindings_path: Option<&str>,
+    trail_path: Option<&str>,
     resolve: Option<&str>,
     closure: Option<&str>,
     predicate: Option<&str>,
@@ -665,30 +689,68 @@ fn run_coref(
     law: Option<&str>,
     json: bool,
 ) {
-    let content = if file_path == "-" {
-        let mut content = String::new();
-        if let Err(error) = std::io::stdin().read_to_string(&mut content) {
-            eprintln!("读取标准输入失败：{}", error);
-            std::process::exit(1);
-        }
-        content
-    } else {
-        match std::fs::read_to_string(file_path) {
-            Ok(content) => content,
-            Err(error) => {
-                eprintln!("读取证据文件失败：{}", error);
-                std::process::exit(1);
+    if file_path.is_none()
+        && registry_path.is_none()
+        && variants_path.is_none()
+        && bindings_path.is_none()
+        && trail_path.is_none()
+    {
+        eprintln!(
+            "缺少共指证据：请提供 EVIDENCE 文件或 --registry/--variants/--bindings/--trail 之一"
+        );
+        std::process::exit(2);
+    }
+    let mut graph = match file_path {
+        Some(path) => {
+            let content = read_coref_file(path, "证据");
+            match CorefEvidence::from_json(&content) {
+                Ok(evidence) => evidence.into_graph(),
+                Err(error) => {
+                    eprintln!("解析共指证据失败：{}", error);
+                    std::process::exit(1);
+                }
             }
         }
+        None => coref_closure::CorefGraph::new(),
     };
-    let evidence = match CorefEvidence::from_json(&content) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            eprintln!("解析共指证据失败：{}", error);
+    if let Some(path) = registry_path {
+        let content = read_coref_file(path, "实体注册表");
+        let Some(registry) = EntityRegistry::from_json(&content) else {
+            eprintln!("解析实体注册表失败：{}", path);
             std::process::exit(1);
-        }
-    };
-    let graph = evidence.into_graph();
+        };
+        graph.absorb_registry(&registry);
+    }
+    if let Some(path) = variants_path {
+        let content = read_coref_file(path, "词形闭包");
+        let Some(variants) = VariantClosure::from_json(&content) else {
+            eprintln!("解析词形闭包失败：{}", path);
+            std::process::exit(1);
+        };
+        graph.absorb_variant_closure(&variants, &VariantContext::default());
+    }
+    if let Some(path) = bindings_path {
+        let content = read_coref_file(path, "绑定账本");
+        let ledger = match BindingLedger::from_snapshot_json(&content) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                eprintln!("解析绑定账本失败：{}", error);
+                std::process::exit(1);
+            }
+        };
+        graph.absorb_bindings(&ledger);
+    }
+    if let Some(path) = trail_path {
+        let content = read_coref_file(path, "指代轨迹");
+        let trail: ReferentTrail = match serde_json::from_str(&content) {
+            Ok(trail) => trail,
+            Err(error) => {
+                eprintln!("解析指代轨迹失败：{}", error);
+                std::process::exit(1);
+            }
+        };
+        graph.absorb_referent_trail(&trail);
+    }
     let budget = coref_closure::CorefBudget::default();
     let build = graph.build(&budget);
 
