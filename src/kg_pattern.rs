@@ -1418,6 +1418,14 @@ impl KgPatternRegistry {
 
     /// 语义体检：重复模式、重复原子。只报告，不改变 registry。
     pub fn lint(&self) -> Vec<KgLint> {
+        self.lint_with_schema(&crate::query_canonical::CanonicalSchema::new())
+    }
+
+    /// 在结构 lint 之外，用已声明的别名/互逆/对称律检查跨谓词重言。
+    ///
+    /// 没有声明的律时行为与 [`Self::lint`] 完全一致；有律时只有规范键
+    /// 相同、但结构指纹不同的模式才会额外报告 `kg_pattern_schema_duplicate`。
+    pub fn lint_with_schema(&self, schema: &crate::query_canonical::CanonicalSchema) -> Vec<KgLint> {
         let mut lints = Vec::new();
         let mut fingerprints: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for pattern in &self.patterns {
@@ -1449,6 +1457,41 @@ impl KgPatternRegistry {
                     ),
                 });
             }
+        }
+        if schema.is_empty() {
+            return lints;
+        }
+        let mut canonical_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for pattern in &self.patterns {
+            if let Ok(query) = crate::query_canonical::canonicalize_kg_pattern(pattern, schema) {
+                canonical_ids
+                    .entry(query.key)
+                    .or_default()
+                    .insert(pattern.id().to_string());
+            }
+        }
+        for (key, ids) in canonical_ids {
+            if ids.len() < 2 {
+                continue;
+            }
+            let structures: BTreeSet<String> = ids
+                .iter()
+                .filter_map(|id| self.get(id))
+                .map(KgPattern::semantic_fingerprint)
+                .collect();
+            if structures.len() < 2 {
+                continue;
+            }
+            let pattern_ids: Vec<String> = ids.into_iter().collect();
+            lints.push(KgLint {
+                code: "kg_pattern_schema_duplicate",
+                message: format!(
+                    "模式 {} 在已声明等价律下同键（{}），可合并或改写为规范谓词",
+                    pattern_ids.join("、"),
+                    key
+                ),
+                pattern_ids,
+            });
         }
         lints
     }
@@ -1657,6 +1700,36 @@ select = ["value"]
         assert!(lints.iter().any(|lint| {
             lint.code == "kg_pattern_semantic_duplicate"
                 && lint.pattern_ids == vec!["capital_a", "capital_b"]
+        }));
+    }
+
+    #[test]
+    fn schema_lint_flags_alias_equivalent_patterns() {
+        let registry = KgPatternRegistry::compile(&config(
+            r#"
+enabled = true
+
+[[patterns]]
+id = "teacher_alias"
+atoms = [{ subject = "?person", predicate = "老师", object = "?teacher" }]
+select = ["teacher"]
+
+[[patterns]]
+id = "teacher_canonical"
+atoms = [{ subject = "?person", predicate = "师傅", object = "?teacher" }]
+select = ["teacher"]
+"#,
+        ))
+        .expect("应可编译");
+        let mut schema = crate::query_canonical::CanonicalSchema::new();
+        schema.declare_alias("老师", "师傅");
+        assert!(registry
+            .lint()
+            .iter()
+            .all(|lint| lint.code != "kg_pattern_schema_duplicate"));
+        assert!(registry.lint_with_schema(&schema).iter().any(|lint| {
+            lint.code == "kg_pattern_schema_duplicate"
+                && lint.pattern_ids == vec!["teacher_alias", "teacher_canonical"]
         }));
     }
 

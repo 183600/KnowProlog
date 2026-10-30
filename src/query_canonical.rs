@@ -350,6 +350,10 @@ impl CanonicalSchema {
         schema
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.aliases.is_empty() && self.inverses.is_empty() && self.symmetric.is_empty()
+    }
+
     pub fn alias_count(&self) -> usize {
         self.aliases.len()
     }
