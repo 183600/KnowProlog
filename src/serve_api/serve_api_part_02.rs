@@ -57,6 +57,14 @@ impl ApiState {
         self.warm.set_nlp_config(config);
     }
 
+    /// 注入属性本体档案：与 CLI 启动路径一致，单位化属性问答无需热重载。
+    pub fn set_attribute_profiles(
+        &mut self,
+        config: &crate::attribute_bridge::AttributeBridgeConfig,
+    ) {
+        self.warm.set_attribute_profiles(config);
+    }
+
     /// 注入双向语义规则包：之后由本基座分叉的会话在生成时复用同一份模板。
     pub fn set_semantic_grammar(&mut self, grammar: crate::semantic_grammar::RulePack) {
         self.warm.set_semantic_grammar(grammar);

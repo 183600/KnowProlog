@@ -82,6 +82,7 @@
             );
             // 读法观测：服务会话的失败轮同样留下有界回执，指标进共享性能台账。
             api_state.set_nlp_config(config.nlp.clone());
+            api_state.set_attribute_profiles(&config.attributes);
             if config.semantic_grammar.enabled {
                 api_state.set_semantic_grammar(
                     know_prolog::semantic_grammar::RulePack::from_config(&config),

@@ -370,6 +370,18 @@ impl SymbolicReasoner {
         self.read_traces.clear();
     }
 
+    /// 注入属性本体档案：单位化属性问答、别名归一与属性 IRI 读兼容
+    /// 都依赖这份注册表。启动时与热替换语言策略共用同一入口。
+    pub fn configure_attributes(
+        &mut self,
+        config: &crate::attribute_bridge::AttributeBridgeConfig,
+    ) {
+        self.attribute_profiles =
+            crate::attribute_bridge::AttributeRegistry::from_config(config);
+        self.generator
+            .set_attribute_profiles(&self.attribute_profiles);
+    }
+
     /// 应用热替换的语言策略：同义词、分词/NLU 配置、生成预算与双向语义规则。
     ///
     /// 只触碰「怎么说」这一层，不重建事实、焦点、会话假设或已学规则。
@@ -377,8 +389,7 @@ impl SymbolicReasoner {
     /// 这类撤销应由重启按新配置重建。
     pub fn apply_language_policy(&mut self, config: &SystemConfig) -> LanguagePolicySync {
         let mut sync = LanguagePolicySync::default();
-        self.attribute_profiles =
-            crate::attribute_bridge::AttributeRegistry::from_config(&config.attributes);
+        self.configure_attributes(&config.attributes);
         if let Some(synonyms) = &config.synonyms {
             for (alias, canonical) in &synonyms.mappings {
                 let (alias, canonical) = (alias.trim(), canonical.trim());

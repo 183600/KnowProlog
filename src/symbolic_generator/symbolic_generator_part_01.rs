@@ -667,6 +667,8 @@ pub struct SymbolicGenerator {
     completion_min_score: f64,
     // 谓词的中文表述（含词汇化动词）→ 规范谓词，供形式化语义解析复用
     predicate_surfaces: HashMap<String, String>,
+    // 配置态属性规范名 → 首选中文词面（新属性无需改代码即可被说出口）
+    attribute_labels: HashMap<String, String>,
     lexicalized_predicates: HashSet<String>,
     // 可选的同一份双向语义规则包：生成侧复用抽取侧配置的 realize 模板
     semantic_grammar: Option<crate::semantic_grammar::RulePack>,
@@ -719,6 +721,7 @@ impl Clone for SymbolicGenerator {
             max_profile_sentences: self.max_profile_sentences,
             completion_min_score: self.completion_min_score,
             predicate_surfaces: self.predicate_surfaces.clone(),
+            attribute_labels: self.attribute_labels.clone(),
             lexicalized_predicates: self.lexicalized_predicates.clone(),
             semantic_grammar: self.semantic_grammar.clone(),
             import_frames: self.import_frames.clone(),

@@ -257,6 +257,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_attribute_label_is_used_for_new_profiles() {
+        use crate::attribute_bridge::{
+            AttributeBridgeConfig, AttributeProfileConfig, AttributeRegistry, AttributeValueType,
+        };
+        let registry = AttributeRegistry::from_config(&AttributeBridgeConfig {
+            enabled: true,
+            profiles: vec![AttributeProfileConfig {
+                name: "wingspan".to_string(),
+                aliases: vec!["翼展".to_string()],
+                domain: vec!["人物".to_string()],
+                value_type: AttributeValueType::Quantity,
+                dimension: Some("length".to_string()),
+                unit: Some("厘米".to_string()),
+                ..Default::default()
+            }],
+        });
+        let mut generator = SymbolicGenerator::new(6, 0.3);
+        generator.set_attribute_profiles(&registry);
+        generator.observe_entity(
+            "张三",
+            "人物",
+            &[("wingspan".to_string(), "220厘米".to_string())],
+        );
+        assert_eq!(
+            generator.lexicalize("张三", "wingspan", &["220厘米".to_string()]),
+            "张三的翼展是220厘米。",
+            "新配置属性无需改代码即可获得中文词面"
+        );
+        let profile = generator.profile("张三").expect("应能生成介绍段落");
+        assert!(profile.contains("翼展"), "{}", profile);
+        assert!(!profile.contains("wingspan"), "{}", profile);
+    }
+
+    #[test]
     fn test_profile_generation_uses_facts_and_markers() {
         let generator = sample_generator();
         let profile = generator.profile("张三").expect("应能生成介绍段落");

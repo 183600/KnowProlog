@@ -245,6 +245,8 @@ async fn run_interactive_mode(
     );
     // 读法观测：注入与交互/导入路径相同的 NLP 配置；失败轮才留轨迹。
     symbolic_reasoner.set_nlp_config(config.nlp.clone());
+    // 属性本体档案：启动即生效，单位化属性问答与属性 IRI 读兼容不依赖热重载。
+    symbolic_reasoner.configure_attributes(&config.attributes);
     if config.semantic_grammar.enabled {
         symbolic_reasoner.attach_semantic_grammar(
             know_prolog::semantic_grammar::RulePack::from_config(&config),

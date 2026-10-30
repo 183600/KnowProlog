@@ -1360,6 +1360,11 @@ impl WarmBase {
         self.reasoner.lock().set_nlp_config(config);
     }
 
+    /// 为后续分叉注入属性本体档案（单位化问答与属性 IRI 读兼容）。
+    fn set_attribute_profiles(&self, config: &crate::attribute_bridge::AttributeBridgeConfig) {
+        self.reasoner.lock().configure_attributes(config);
+    }
+
     /// 为后续分叉注入双向语义规则包（生成侧与抽取侧共享模板）。
     fn set_semantic_grammar(&self, grammar: crate::semantic_grammar::RulePack) {
         self.reasoner.lock().attach_semantic_grammar(grammar);

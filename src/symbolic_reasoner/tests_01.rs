@@ -436,11 +436,11 @@
     #[test]
     fn attribute_unit_request_converts_stored_quantity() {
         use crate::attribute_bridge::{
-            AttributeBridgeConfig, AttributeProfileConfig, AttributeRegistry, AttributeValueType,
+            AttributeBridgeConfig, AttributeProfileConfig, AttributeValueType,
         };
 
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
-        reasoner.attribute_profiles = AttributeRegistry::from_config(&AttributeBridgeConfig {
+        reasoner.configure_attributes(&AttributeBridgeConfig {
             enabled: true,
             profiles: vec![AttributeProfileConfig {
                 name: "height".to_string(),

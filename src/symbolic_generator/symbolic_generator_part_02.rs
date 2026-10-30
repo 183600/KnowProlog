@@ -16,6 +16,7 @@ impl SymbolicGenerator {
             max_profile_sentences: max_profile_sentences.max(1),
             completion_min_score: completion_min_score.clamp(0.0, 1.0),
             predicate_surfaces: HashMap::new(),
+            attribute_labels: HashMap::new(),
             lexicalized_predicates: HashSet::new(),
             semantic_grammar: None,
             import_frames: None,
@@ -354,9 +355,7 @@ impl SymbolicGenerator {
                         as u32
                 };
                 TypePredicateSummary {
-                    label: localized_predicate_key(&predicate)
-                        .unwrap_or(predicate.as_str())
-                        .to_string(),
+                    label: self.predicate_label(&predicate),
                     predicate,
                     kind,
                     member_count: accumulator.members,
@@ -524,6 +523,41 @@ impl SymbolicGenerator {
         self.attributes.get(entity).map_or(false, |pairs| {
             pairs.iter().any(|(k, v)| k == key && v == value)
         })
+    }
+
+    /// 注入属性档案的首选词面：规范名 → 最短别名（同长取字典序）。
+    /// 已观察事实的谓词词面优先；这里只补配置态兜底，保证新属性也能生成中文。
+    pub fn set_attribute_profiles(
+        &mut self,
+        profiles: &crate::attribute_bridge::AttributeRegistry,
+    ) {
+        let mut labels = HashMap::new();
+        for canonical in profiles.canonical_names() {
+            let Some(profile) = profiles.profile(canonical) else {
+                continue;
+            };
+            let preferred = profile
+                .aliases
+                .iter()
+                .min_by_key(|alias| (alias.chars().count(), alias.as_str()))
+                .cloned()
+                .unwrap_or_else(|| profile.canonical.clone());
+            labels.insert(profile.canonical.clone(), preferred);
+        }
+        if labels != self.attribute_labels {
+            self.attribute_labels = labels;
+            self.revision += 1;
+            self.type_profile_cache.write().clear();
+        }
+    }
+
+    fn predicate_label(&self, predicate: &str) -> String {
+        if let Some(label) = self.attribute_labels.get(predicate) {
+            return label.clone();
+        }
+        localized_predicate_key(predicate)
+            .unwrap_or(predicate)
+            .to_string()
     }
 
     pub fn attribute_values(&self, entity: &str, key: &str) -> Vec<String> {
@@ -981,7 +1015,7 @@ impl SymbolicGenerator {
         if let Some(template) = lexical_template(predicate) {
             return template.replace("{s}", subject).replace("{o}", &joined);
         }
-        let surface = localized_predicate_key(predicate).unwrap_or(predicate);
+        let surface = self.predicate_label(predicate);
         format!("{}的{}是{}。", subject, surface, joined)
     }
 
