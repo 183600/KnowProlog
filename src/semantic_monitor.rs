@@ -7,6 +7,7 @@ use crate::context_image::fnv1a_hex;
 use crate::contextual_rag::{AssemblyReceipt, EvidenceAssembly};
 use crate::dense_retrieval::EvidenceSearch;
 use crate::rewrite_retrieval::{Assessment, Decision};
+use crate::search_port::{PortOutcome, PortReceipt};
 
 pub const DEFAULT_WINDOW: usize = 64;
 pub const MIN_ALERT_SAMPLE: u64 = 8;
@@ -194,6 +195,30 @@ pub struct SearchFold {
 }
 
 impl SearchFold {
+    fn observe_port(&mut self, receipt: &PortReceipt) {
+        let returned = receipt.returned;
+        self.searches += 1;
+        self.returned += returned as u64;
+        self.hit_searches += u64::from(returned > 0);
+        self.empty_searches += u64::from(returned == 0);
+        self.index_empty_searches += u64::from(receipt.docs == 0);
+        self.certified_searches += u64::from(receipt.certified_top_k);
+        self.budget_exhausted_searches += u64::from(receipt.budget_exhausted);
+        self.truncated_searches += u64::from(
+            receipt.budget_exhausted
+                || receipt
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("截断")),
+        );
+        self.docs = self.docs.max(receipt.docs);
+        self.max_returned = self.max_returned.max(returned);
+        self.candidates += receipt.candidates as u64;
+        self.scanned += receipt.scanned as u64;
+        self.constraint_pruned += receipt.constraint_pruned as u64;
+        self.bound_pruned += receipt.bound_pruned as u64;
+    }
+
     fn observe(&mut self, search: &EvidenceSearch) {
         let receipt = &search.receipt;
         let returned = search.hits.len();
@@ -817,6 +842,19 @@ impl SemanticMonitor {
         true
     }
 
+    pub fn record_port_outcome(&self, outcome: &PortOutcome) -> bool {
+        self.record_port_receipt(&outcome.receipt)
+    }
+
+    pub fn record_port_receipt(&self, receipt: &PortReceipt) -> bool {
+        let mut state = self.state.lock();
+        let Some(active) = state.active.as_mut() else {
+            return false;
+        };
+        active.search.observe_port(receipt);
+        true
+    }
+
     pub fn record_assembly(&self, assembly: &EvidenceAssembly) -> bool {
         self.record_assembly_receipt(&assembly.receipt)
     }
@@ -1356,6 +1394,34 @@ mod tests {
         let json = serde_json::to_string(&observation).unwrap();
         assert!(!json.contains("秘密问题甲乙丙"));
         assert_eq!(observation.question_chars, "秘密问题甲乙丙".chars().count());
+    }
+
+    #[test]
+    fn port_receipts_are_folded_into_search_metrics() {
+        let monitor = SemanticMonitor::new();
+        monitor.begin("张三的师傅是谁");
+        let receipt = PortReceipt {
+            docs: 5,
+            candidates: 4,
+            constraint_pruned: 1,
+            scanned: 3,
+            returned: 2,
+            top_k: 3,
+            bound_pruned: 1,
+            budget_exhausted: false,
+            certified_top_k: true,
+            channels: vec!["dense".to_string()],
+            notes: Vec::new(),
+        };
+        assert!(monitor.record_port_receipt(&receipt));
+        let observation = monitor.finish(TurnOutcome::Answered).expect("应完成观测");
+        assert_eq!(observation.search.searches, 1);
+        assert_eq!(observation.search.returned, 2);
+        assert_eq!(observation.search.certified_searches, 1);
+        assert_eq!(observation.search.candidates, 4);
+        assert_eq!(observation.search.scanned, 3);
+        assert_eq!(observation.search.constraint_pruned, 1);
+        assert_eq!(observation.search.bound_pruned, 1);
     }
 
     #[test]

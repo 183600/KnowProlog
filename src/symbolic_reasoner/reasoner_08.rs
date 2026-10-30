@@ -877,7 +877,9 @@ impl SymbolicReasoner {
         if self.config.enable_holographic_memory {
             port.register(crate::search_port::HoloSearchBackend::new(&self.holo));
         }
-        port.search(request)
+        let outcome = port.search(request);
+        self.semantic.record_port_outcome(&outcome);
+        outcome
     }
 
     /// 把自然语言问句编译成检索动作（Lookup/Enumerate/Describe/Verify），
