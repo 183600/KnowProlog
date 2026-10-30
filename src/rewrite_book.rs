@@ -559,7 +559,7 @@ fn refutations(rule: &RewriteRule, episodes: &[RewriteEpisode], lexicon: &Episod
             count += 1;
             continue;
         };
-        if actual != expected {
+        if !plans_equivalent(&actual, &expected) {
             count += 1;
         }
     }
@@ -672,7 +672,9 @@ pub fn evaluate(
             continue;
         };
         let baseline = compile_question(&episode.surface, lexicon).ok();
-        let baseline_ok = baseline.as_ref() == Some(&expected);
+        let baseline_ok = baseline
+            .as_ref()
+            .is_some_and(|actual| plans_equivalent(actual, &expected));
         let held_out = predicates
             .iter()
             .any(|predicate| held_out_predicates.contains(predicate));
@@ -686,7 +688,7 @@ pub fn evaluate(
         } else if let Some(application) = book.resolve_with(&episode.surface, lexicon, true) {
             outcome.rules_fired = 1;
             match compile_question(&application.text, lexicon) {
-                Ok(actual) if actual == expected => {
+                Ok(actual) if plans_equivalent(&actual, &expected) => {
                     outcome.rewritten_correct = 1;
                 }
                 Ok(_) => {
@@ -890,6 +892,16 @@ fn compile_pair(
         }
     }
     Some((plan, predicates))
+}
+
+/// 语义等价监督：同一关系核心的计划形状不同也算同一问题；
+/// 超出关系核心的计划仍要求完全相等，绝不放宽到「看起来像」。
+fn plans_equivalent(left: &QueryPlan, right: &QueryPlan) -> bool {
+    crate::query_canonical::plans_equivalent(
+        left,
+        right,
+        &crate::query_canonical::CanonicalSchema::new(),
+    )
 }
 
 fn compile_question(question: &str, lexicon: &EpisodeLexicon) -> Result<QueryPlan, String> {
@@ -1228,6 +1240,34 @@ mod tests {
             let (plan, _) = compile_pair(episode, &lexicon).expect("规范问句应可编译");
             assert_eq!(canonical, plan);
         }
+    }
+
+    #[test]
+    fn semantic_equivalence_covers_shape_variants_only() {
+        let chain = QueryPlan::FindObject {
+            segments: vec!["张三".to_string(), "师傅".to_string()],
+        };
+        let direct = QueryPlan::FindObjectByPredicate {
+            subject: "张三".to_string(),
+            predicate: "师傅".to_string(),
+        };
+        assert!(plans_equivalent(&chain, &direct));
+        let check_triple = QueryPlan::CheckTriple {
+            subject_segments: vec!["张三".to_string(), "师傅".to_string()],
+            object: "李四".to_string(),
+        };
+        let check_relation = QueryPlan::CheckRelation {
+            subject: "张三".to_string(),
+            predicate: "师傅".to_string(),
+            object: "李四".to_string(),
+            negated: false,
+        };
+        assert!(plans_equivalent(&check_triple, &check_relation));
+        let reverse = QueryPlan::FindSubject {
+            object: "李四".to_string(),
+            predicate: "师傅".to_string(),
+        };
+        assert!(!plans_equivalent(&chain, &reverse));
     }
 
     #[test]
