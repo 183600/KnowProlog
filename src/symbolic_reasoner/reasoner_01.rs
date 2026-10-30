@@ -263,6 +263,9 @@ impl SymbolicReasoner {
         fresh.lexical_memory = lexical_memory;
         fresh.contextual_memory = contextual_memory;
         fresh.attribute_profiles = attribute_profiles;
+        fresh
+            .generator
+            .set_attribute_profiles(&fresh.attribute_profiles);
         // 快照来自自身：胶囊公理摘要必然通过（除非内存中的快照被外部改写）。
         // 万一被拒，也保留新图谱与其余会话态，不让重建失败丢掉知识。
         let _ = fresh.restore_dialogue_snapshot(&snapshot);

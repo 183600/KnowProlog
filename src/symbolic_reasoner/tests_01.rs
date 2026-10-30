@@ -516,6 +516,41 @@
     }
 
     #[test]
+    fn rebuild_from_graph_keeps_configured_attribute_labels() {
+        use crate::attribute_bridge::{
+            AttributeBridgeConfig, AttributeProfileConfig, AttributeValueType,
+        };
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.configure_attributes(&AttributeBridgeConfig {
+            enabled: true,
+            profiles: vec![AttributeProfileConfig {
+                name: "wingspan".to_string(),
+                aliases: vec!["翼展".to_string()],
+                domain: vec!["人".to_string()],
+                value_type: AttributeValueType::Quantity,
+                dimension: Some("length".to_string()),
+                unit: Some("厘米".to_string()),
+                ..Default::default()
+            }],
+        });
+        let mut properties = HashMap::new();
+        properties.insert("wingspan".to_string(), "220厘米".to_string());
+        let facts = vec![PrologFact::Entity {
+            name: "张三".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }];
+        reasoner.rebuild_from_graph(&facts);
+
+        let profile = reasoner
+            .generate_about("张三")
+            .expect("重建后仍应生成介绍");
+        assert!(profile.contains("翼展"), "{profile}");
+        assert!(!profile.contains("wingspan"), "{profile}");
+    }
+
+    #[test]
     fn type_memory_answers_profiles_comparisons_and_members() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         let mut person_properties = HashMap::new();
