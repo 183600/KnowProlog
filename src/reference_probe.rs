@@ -740,11 +740,11 @@ fn candidate_set_complete(
                 .iter()
                 .filter(|candidate| candidate.survived())
                 .collect();
-            survivors.is_empty()
-                || (survivors.len() <= observations.len()
-                    && survivors
-                        .iter()
-                        .all(|candidate| observed.contains(candidate.entity.as_str())))
+            !survivors.is_empty()
+                && survivors.len() <= observations.len()
+                && survivors
+                    .iter()
+                    .all(|candidate| observed.contains(candidate.entity.as_str()))
         }
         None => request.question.options.len() <= observations.len(),
     }
