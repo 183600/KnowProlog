@@ -67,6 +67,12 @@ pub enum IdentityKind {
     Explicit,
 }
 
+impl Default for IdentityKind {
+    fn default() -> Self {
+        IdentityKind::Alias
+    }
+}
+
 impl IdentityKind {
     pub const fn label(self) -> &'static str {
         match self {
@@ -117,6 +123,12 @@ pub enum NonIdentityKind {
     Bridging,
     Role,
     Metonymy,
+}
+
+impl Default for NonIdentityKind {
+    fn default() -> Self {
+        NonIdentityKind::Description
+    }
 }
 
 impl NonIdentityKind {
@@ -246,7 +258,7 @@ impl NonIdentityEdge {
         }
     }
 
-    fn render(&self) -> String {
+    pub fn render(&self) -> String {
         format!(
             "「{}」—[{}]→「{}」（{}；非恒等，不传递）",
             self.from,
@@ -1791,6 +1803,108 @@ fn validity_allows(validity: Validity, at: Option<TimePoint>) -> bool {
     }
 }
 
+/// 命令行/快照友好的证据输入：字段名短，缺省值明确。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceIdentity {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub kind: IdentityKind,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub validity: Option<Validity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceNonIdentity {
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub kind: NonIdentityKind,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceRelation {
+    pub from: String,
+    pub to: String,
+    pub predicate: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub validity: Option<Validity>,
+}
+
+/// 一组可序列化的证据，直接转成 [`CorefGraph`]。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CorefEvidence {
+    #[serde(default)]
+    pub identity: Vec<EvidenceIdentity>,
+    #[serde(default)]
+    pub non_identity: Vec<EvidenceNonIdentity>,
+    #[serde(default)]
+    pub relations: Vec<EvidenceRelation>,
+}
+
+impl CorefEvidence {
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        serde_json::from_str(text).map_err(|error| error.to_string())
+    }
+
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    pub fn into_graph(self) -> CorefGraph {
+        let mut graph = CorefGraph::new();
+        for evidence in self.identity {
+            let anchor = evidence.anchor.as_deref().unwrap_or(&evidence.to);
+            let mut edge = IdentityEdge::new(&evidence.from, &evidence.to, evidence.kind, anchor);
+            if let Some(source) = &evidence.source {
+                edge = edge.with_source(source);
+            }
+            if let Some(confidence) = evidence.confidence {
+                edge = edge.with_confidence(confidence);
+            }
+            if let Some(validity) = evidence.validity {
+                edge = edge.with_validity(validity);
+            }
+            graph.add_identity_edge(edge);
+        }
+        for evidence in self.non_identity {
+            let source = evidence.source.as_deref().unwrap_or("证据输入");
+            graph.add_non_identity_edge(NonIdentityEdge::new(
+                &evidence.from,
+                &evidence.to,
+                evidence.kind,
+                source,
+            ));
+        }
+        for evidence in self.relations {
+            let mut edge = RelationEdge::new(&evidence.from, &evidence.to, &evidence.predicate);
+            if let Some(source) = &evidence.source {
+                edge = edge.with_source(source);
+            }
+            if let Some(confidence) = evidence.confidence {
+                edge = edge.with_confidence(confidence);
+            }
+            if let Some(validity) = evidence.validity {
+                edge = edge.with_validity(validity);
+            }
+            graph.add_relation_edge(edge);
+        }
+        graph
+    }
+}
+
 /// 更正回执：受影响的旧等价类要由上层标记 stale。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorrectionOutcome {
@@ -2487,6 +2601,31 @@ mod tests {
         let build = graph.build(&CorefBudget::default());
         assert_eq!(build.canonical("他"), Some("张三"));
         assert_eq!(build.resolve("他").witness[0].kind, IdentityKind::Pronoun);
+    }
+
+    #[test]
+    fn evidence_json_uses_friendly_field_names() {
+        let evidence = CorefEvidence::from_json(
+            r#"{
+                "identity": [
+                    {"from": "老李", "to": "李四", "kind": "alias"},
+                    {"from": "他", "to": "李四", "kind": "pronoun", "confidence": 0.8}
+                ],
+                "non_identity": [
+                    {"from": "姚明的妻子", "to": "叶莉", "kind": "description"}
+                ],
+                "relations": [
+                    {"from": "李四", "to": "王五", "predicate": "师傅"}
+                ]
+            }"#,
+        )
+        .expect("证据 JSON 应可解析");
+        let graph = evidence.into_graph();
+        let build = graph.build(&CorefBudget::default());
+        assert_eq!(build.canonical("老李"), Some("李四"));
+        assert_eq!(build.canonical("他"), Some("李四"));
+        assert_eq!(build.resolve("姚明的妻子").status, CorefStatus::Unknown);
+        assert_eq!(graph.relation_edges().len(), 1);
     }
 
     #[test]

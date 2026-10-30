@@ -21,6 +21,7 @@ use know_prolog::{
     },
     contextual_segmentation::{ContextualSegmenter, ReadingKind, ReadingMemory, SegmentOptions},
     conversation_theory::{self, ConversationTheory},
+    coref_closure::{self, CorefEvidence},
     create_default_synonyms,
     dense_retrieval::{DenseRetriever, SearchBudget, SearchConstraints},
     derivation::Derivation,
@@ -82,7 +83,7 @@ use know_prolog::{
     },
     ownthink_api::select_candidate_by_context,
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
-    pattern_closure::ClosureBudget,
+    pattern_closure::{ClosureBudget, ClosureOp},
     pattern_forge::{self, ForgeRequest, PatternForge},
     pattern_ir::{self, PatternLibrary},
     perf_ledger::PerfLedger,
@@ -395,6 +396,30 @@ enum Commands {
         #[arg(long, default_value_t = 20_000)]
         max_expansions: usize,
         /// Print the ledger and answers as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect a coreference closure from JSON evidence: identity classes,
+    /// ambiguity/type guards, and optional relation closure over the quotient
+    Coref {
+        /// JSON evidence file; "-" reads from stdin
+        file_path: String,
+        /// Resolve one surface and show its canonical identity + witness
+        #[arg(long)]
+        resolve: Option<String>,
+        /// Relation closure start surface (evaluated on the identity quotient)
+        #[arg(long)]
+        closure: Option<String>,
+        /// Restrict the relation closure to one predicate
+        #[arg(long)]
+        predicate: Option<String>,
+        /// Closure operator: "plus" (default), "star", or "exact:N"
+        #[arg(long, default_value = "plus")]
+        operator: String,
+        /// Transitive law id required by plus/star closures
+        #[arg(long)]
+        law: Option<String>,
+        /// Print JSON instead of the Chinese audit view
         #[arg(long)]
         json: bool,
     },

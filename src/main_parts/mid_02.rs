@@ -655,6 +655,151 @@ fn run_open_closure(
     }
 }
 
+fn parse_coref_operator(raw: &str) -> Option<ClosureOp> {
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "plus" | "+" | "传递" => Some(ClosureOp::Plus),
+        "star" | "*" | "自反" => Some(ClosureOp::Star),
+        other => {
+            let digits = other
+                .strip_prefix("exact:")
+                .or_else(|| other.strip_prefix("exact="))
+                .or_else(|| other.strip_prefix("exact"))
+                .unwrap_or(other);
+            digits
+                .parse::<usize>()
+                .ok()
+                .filter(|hops| *hops > 0)
+                .map(ClosureOp::Exact)
+        }
+    }
+}
+
+/// `coref`：只读证据 JSON，输出身份等价类、歧义/类型守卫与商图闭包。
+fn run_coref(
+    file_path: &str,
+    resolve: Option<&str>,
+    closure: Option<&str>,
+    predicate: Option<&str>,
+    operator: &str,
+    law: Option<&str>,
+    json: bool,
+) {
+    let content = if file_path == "-" {
+        let mut content = String::new();
+        if let Err(error) = std::io::stdin().read_to_string(&mut content) {
+            eprintln!("读取标准输入失败：{}", error);
+            std::process::exit(1);
+        }
+        content
+    } else {
+        match std::fs::read_to_string(file_path) {
+            Ok(content) => content,
+            Err(error) => {
+                eprintln!("读取证据文件失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    };
+    let evidence = match CorefEvidence::from_json(&content) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            eprintln!("解析共指证据失败：{}", error);
+            std::process::exit(1);
+        }
+    };
+    let graph = evidence.into_graph();
+    let budget = coref_closure::CorefBudget::default();
+    let build = graph.build(&budget);
+
+    if let Some(surface) = resolve {
+        let resolution = build.resolve(surface);
+        if json {
+            match serde_json::to_string_pretty(&resolution) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("序列化失败：{}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            println!("{}", resolution.render());
+        }
+        return;
+    }
+
+    if let Some(start) = closure {
+        let Some(operator) = parse_coref_operator(operator) else {
+            eprintln!(
+                "无法识别的闭包算子：{}（可用 plus / star / exact:N）",
+                operator
+            );
+            std::process::exit(2);
+        };
+        let quotient = graph.quotient(&budget);
+        match quotient.closure(start, operator, ClosureBudget::default(), law, predicate) {
+            Ok(outcome) => {
+                if json {
+                    let targets: Vec<serde_json::Value> = outcome
+                        .targets()
+                        .into_iter()
+                        .map(|target| {
+                            serde_json::json!({
+                                "target": target,
+                                "hops": outcome.outcome.hop_count_of(target),
+                                "witness": outcome.render_witness(target),
+                            })
+                        })
+                        .collect();
+                    let value = serde_json::json!({
+                        "start_surface": outcome.start_surface.clone(),
+                        "start": outcome.start.clone(),
+                        "operator": outcome.outcome.operator.label(),
+                        "reached_count": outcome.outcome.reached_count,
+                        "complete": outcome.outcome.complete(),
+                        "truncated": outcome.outcome.truncated.map(|truncated| truncated.label()),
+                        "targets": targets,
+                    });
+                    match serde_json::to_string_pretty(&value) {
+                        Ok(text) => println!("{}", text),
+                        Err(error) => {
+                            eprintln!("序列化失败：{}", error);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    println!("{}", outcome.render());
+                }
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if json {
+        let quotient = graph.quotient(&budget);
+        let value = serde_json::json!({
+            "identity": build,
+            "quotient": quotient,
+        });
+        match serde_json::to_string_pretty(&value) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", build.report());
+        if !graph.relation_edges().is_empty() {
+            println!();
+            println!("{}", graph.quotient(&budget).report());
+        }
+    }
+}
 
 /// `privacy`：词性类型化的信息流契约。默认影子审计，`--enforce` 才改写。
 #[allow(clippy::too_many_arguments)]

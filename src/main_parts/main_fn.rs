@@ -150,6 +150,29 @@ async fn main() {
         return;
     }
 
+    // 共指闭包只读证据 JSON：不打开知识存储，也不写任何账本。
+    if let Some(Commands::Coref {
+        file_path,
+        resolve,
+        closure,
+        predicate,
+        operator,
+        law,
+        json,
+    }) = &cli.command
+    {
+        run_coref(
+            file_path,
+            resolve.as_deref(),
+            closure.as_deref(),
+            predicate.as_deref(),
+            operator,
+            law.as_deref(),
+            *json,
+        );
+        return;
+    }
+
     // 语义角色帧完全离线：配置里的 schema 优先，缺省使用内置核心种子。
     if let Some(Commands::Roles {
         text,
