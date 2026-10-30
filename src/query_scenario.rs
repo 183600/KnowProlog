@@ -16,7 +16,7 @@
 //! 边界：运行器覆盖对话管理、查询板执行与回答渲染，不覆盖 CLI 命令分发
 //! 与 HTTP 层；CLI/HTTP 的一致性由各自的集成测试负责。
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -58,6 +58,13 @@ pub struct ScenarioRelation {
     pub to: String,
 }
 
+/// 剧本别名：surface 指向规范实体名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScenarioAlias {
+    pub surface: String,
+    pub canonical: String,
+}
+
 /// 一轮输入与它的轨迹契约。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioTurn {
@@ -65,8 +72,19 @@ pub struct ScenarioTurn {
     #[serde(default)]
     pub expect: TurnExpectation,
     /// 执行本轮前把知识版本推进到该值（用于验证「旧帧标旧」）。
+    ///
+    /// 与下面的增量字段同时出现时，显式修订号优先于自动推进。
     #[serde(default)]
     pub set_revision: Option<u64>,
+    /// 执行本轮前新增/更新实体；有实际变化时自动推进知识版本。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_entities: Vec<ScenarioEntity>,
+    /// 执行本轮前新增关系；有实际变化时自动推进知识版本。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_relations: Vec<ScenarioRelation>,
+    /// 执行本轮前新增别名；有实际变化时自动推进知识版本。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_aliases: Vec<ScenarioAlias>,
 }
 
 /// 一轮期望：全部字段可选，缺省即不断言。
@@ -111,6 +129,9 @@ pub struct TurnExpectation {
     /// 查询板是否处于激活状态。
     #[serde(default)]
     pub board_active: Option<bool>,
+    /// 本轮执行后的知识版本。
+    #[serde(default)]
+    pub revision: Option<u64>,
 }
 
 /// 单步回放结果。
@@ -122,6 +143,8 @@ pub struct ScenarioStepReport {
     pub focus: Option<String>,
     pub answer: String,
     pub board: Option<BoardView>,
+    /// 本轮执行后的知识版本（外部知识源由后端决定）。
+    pub revision: u64,
     pub failures: Vec<String>,
 }
 
@@ -191,13 +214,11 @@ pub fn run_file(path: impl AsRef<Path>) -> Result<ScenarioReport, String> {
 pub fn run_scenario(scenario: &QueryScenario) -> ScenarioReport {
     let knowledge = ScenarioKnowledge::from_scenario(scenario);
     run_scenario_with(scenario, &knowledge, |turn| {
-        if let Some(revision) = turn.set_revision {
-            knowledge.set_revision(revision);
-        }
+        knowledge.apply_turn(turn);
     })
 }
 
-/// 对任意知识源回放剧本（忽略 `set_revision`，知识版本由后端决定）。
+/// 对任意知识源回放剧本（忽略 `set_revision` 与回合内增量，知识版本由后端决定）。
 pub fn run_scenario_against(
     scenario: &QueryScenario,
     knowledge: &dyn DialogueKnowledge,
@@ -235,6 +256,7 @@ where
             .last()
             .map(|turn| turn.provenance.clone())
             .unwrap_or_default();
+        let revision = knowledge.revision();
         let actual = StepActual {
             reply_answered: reply.is_some(),
             op: op.as_deref(),
@@ -250,6 +272,7 @@ where
             }),
             focus: focus.as_deref(),
             provenance: &provenance,
+            revision,
         };
         let failures = check_expectations(&turn.expect, &actual);
         steps.push(ScenarioStepReport {
@@ -259,6 +282,7 @@ where
             focus,
             answer,
             board: view,
+            revision,
             failures,
         });
     }
@@ -283,6 +307,7 @@ struct StepActual<'a> {
     selected: Option<&'a str>,
     focus: Option<&'a str>,
     provenance: &'a [String],
+    revision: u64,
 }
 
 fn check_expectations(expect: &TurnExpectation, actual: &StepActual<'_>) -> Vec<String> {
@@ -393,6 +418,14 @@ fn check_expectations(expect: &TurnExpectation, actual: &StepActual<'_>) -> Vec<
             ));
         }
     }
+    if let Some(expected) = expect.revision {
+        if actual.revision != expected {
+            failures.push(format!(
+                "期望知识版本 v{}，实际 v{}",
+                expected, actual.revision
+            ));
+        }
+    }
     failures
 }
 
@@ -406,19 +439,33 @@ fn excerpt(text: &str, max: usize) -> String {
 }
 
 /// 剧本内自带的确定性知识源。
-#[derive(Debug, Clone)]
-pub struct ScenarioKnowledge {
+///
+/// 与真实知识库一样支持**回合间增量**：`add_entities` / `add_relations` /
+/// `add_aliases` 只在确有新内容时推进修订号，旧查询帧因此可被标旧，
+/// 下一轮扫描又能看到新事实。别名在读取时解析，指向规范实体。
+#[derive(Debug, Clone, Default)]
+struct ScenarioState {
     entities: Vec<ScenarioEntity>,
     relations: Vec<ScenarioRelation>,
-    revision: Cell<u64>,
+    aliases: Vec<(String, String)>,
+    revision: u64,
+}
+
+/// 剧本内自带的确定性知识源。
+#[derive(Debug, Clone)]
+pub struct ScenarioKnowledge {
+    state: RefCell<ScenarioState>,
 }
 
 impl ScenarioKnowledge {
     pub fn new(entities: Vec<ScenarioEntity>, relations: Vec<ScenarioRelation>) -> Self {
         ScenarioKnowledge {
-            entities,
-            relations,
-            revision: Cell::new(1),
+            state: RefCell::new(ScenarioState {
+                entities,
+                relations,
+                aliases: Vec::new(),
+                revision: 1,
+            }),
         }
     }
 
@@ -426,32 +473,157 @@ impl ScenarioKnowledge {
         Self::new(scenario.entities.clone(), scenario.relations.clone())
     }
 
+    /// 追加实体/关系/别名；只在确有变化时推进修订号并返回 `true`。
+    pub fn inject(
+        &self,
+        entities: &[ScenarioEntity],
+        relations: &[ScenarioRelation],
+        aliases: &[ScenarioAlias],
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let mut changed = false;
+        for entity in entities {
+            let name = entity.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(existing) = state
+                .entities
+                .iter_mut()
+                .find(|existing| existing.name == name)
+            {
+                if let Some(entity_type) = &entity.entity_type {
+                    if existing.entity_type.as_deref() != Some(entity_type.as_str()) {
+                        existing.entity_type = Some(entity_type.clone());
+                        changed = true;
+                    }
+                }
+                for (key, value) in &entity.attributes {
+                    if existing.attributes.get(key) != Some(value) {
+                        existing.attributes.insert(key.clone(), value.clone());
+                        changed = true;
+                    }
+                }
+            } else {
+                state.entities.push(entity.clone());
+                changed = true;
+            }
+        }
+        for relation in relations {
+            if relation.from.trim().is_empty()
+                || relation.predicate.trim().is_empty()
+                || relation.to.trim().is_empty()
+            {
+                continue;
+            }
+            let relation = ScenarioRelation {
+                from: resolve_name(&state.aliases, &relation.from),
+                predicate: relation.predicate.clone(),
+                to: resolve_name(&state.aliases, &relation.to),
+            };
+            if !state.relations.contains(&relation) {
+                state.relations.push(relation);
+                changed = true;
+            }
+        }
+        for alias in aliases {
+            let surface = alias.surface.trim();
+            let canonical = alias.canonical.trim();
+            if surface.is_empty() || canonical.is_empty() || surface == canonical {
+                continue;
+            }
+            if state.aliases.iter().any(|(known, _)| known == surface) {
+                continue;
+            }
+            let canonical = resolve_name(&state.aliases, canonical);
+            if resolve_name(&state.aliases, &canonical) == surface {
+                continue;
+            }
+            state.aliases.push((surface.to_string(), canonical));
+            changed = true;
+        }
+        if changed {
+            state.revision = state.revision.saturating_add(1);
+        }
+        changed
+    }
+
+    /// 应用一轮剧本声明的前置增量；显式 `set_revision` 最后生效。
+    pub fn apply_turn(&self, turn: &ScenarioTurn) -> bool {
+        let injected = self.inject(&turn.add_entities, &turn.add_relations, &turn.add_aliases);
+        let explicit = match turn.set_revision {
+            Some(revision) => {
+                let mut state = self.state.borrow_mut();
+                if state.revision == revision {
+                    false
+                } else {
+                    state.revision = revision;
+                    true
+                }
+            }
+            None => false,
+        };
+        injected || explicit
+    }
+
+    /// 显式覆盖修订号（用于验证「旧帧标旧」；不做单调约束）。
     pub fn set_revision(&self, revision: u64) {
-        self.revision.set(revision);
+        self.state.borrow_mut().revision = revision;
     }
 
-    fn entity(&self, name: &str) -> Option<&ScenarioEntity> {
-        self.entities.iter().find(|entity| entity.name == name)
+    fn entity(&self, name: &str) -> Option<ScenarioEntity> {
+        let state = self.state.borrow();
+        let canonical = resolve_name(&state.aliases, name);
+        state
+            .entities
+            .iter()
+            .find(|entity| entity.name == canonical)
+            .cloned()
     }
+}
 
-    fn type_of(&self, name: &str) -> String {
-        self.entity(name)
-            .and_then(|entity| entity.entity_type.clone())
-            .unwrap_or_else(|| "实体".to_string())
+/// 沿别名链解析规范名；遇到环时停在最后一个可解析节点。
+fn resolve_name(aliases: &[(String, String)], name: &str) -> String {
+    let mut current = name;
+    for _ in 0..=aliases.len() {
+        match aliases
+            .iter()
+            .find(|(surface, _)| surface == current)
+            .map(|(_, canonical)| canonical.as_str())
+        {
+            Some(next) => current = next,
+            None => break,
+        }
     }
+    current.to_string()
 }
 
 impl DialogueKnowledge for ScenarioKnowledge {
     fn entities_in(&self, text: &str) -> Vec<String> {
-        let mut found: Vec<String> = self
-            .entities
-            .iter()
-            .filter(|entity| text.contains(entity.name.as_str()))
-            .map(|entity| entity.name.clone())
-            .collect();
-        found.sort_by_key(|entity| std::cmp::Reverse(entity.chars().count()));
-        found.dedup();
-        found
+        let state = self.state.borrow();
+        let mut found: Vec<(usize, String)> = Vec::new();
+        for entity in &state.entities {
+            if text.contains(entity.name.as_str()) {
+                found.push((entity.name.chars().count(), entity.name.clone()));
+            }
+        }
+        for (surface, canonical) in &state.aliases {
+            if !text.contains(surface.as_str()) {
+                continue;
+            }
+            let canonical = resolve_name(&state.aliases, canonical);
+            if state.entities.iter().any(|entity| entity.name == canonical) {
+                found.push((surface.chars().count(), canonical));
+            }
+        }
+        found.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let mut names: Vec<String> = Vec::new();
+        for (_, name) in found {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        names
     }
 
     fn known_entity(&self, entity: &str) -> bool {
@@ -463,12 +635,18 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn known_attributes(&self, entity: &str) -> Vec<String> {
-        let mut keys: Vec<String> = self
-            .entity(entity)
-            .map(|entity| entity.attributes.keys().cloned().collect())
+        let state = self.state.borrow();
+        let canonical = resolve_name(&state.aliases, entity);
+        let mut keys: Vec<String> = state
+            .entities
+            .iter()
+            .find(|known| known.name == canonical)
+            .map(|known| known.attributes.keys().cloned().collect())
             .unwrap_or_default();
-        for relation in &self.relations {
-            if relation.from == entity && !keys.contains(&relation.predicate) {
+        for relation in &state.relations {
+            if resolve_name(&state.aliases, &relation.from) == canonical
+                && !keys.contains(&relation.predicate)
+            {
                 keys.push(relation.predicate.clone());
             }
         }
@@ -484,7 +662,8 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn all_entities(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
+        let state = self.state.borrow();
+        let mut names: Vec<String> = state
             .entities
             .iter()
             .map(|entity| entity.name.clone())
@@ -494,10 +673,16 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn all_types(&self) -> Vec<String> {
-        let mut types: Vec<String> = self
+        let state = self.state.borrow();
+        let mut types: Vec<String> = state
             .entities
             .iter()
-            .map(|entity| self.type_of(&entity.name))
+            .map(|entity| {
+                entity
+                    .entity_type
+                    .clone()
+                    .unwrap_or_else(|| "实体".to_string())
+            })
             .collect();
         types.sort();
         types.dedup();
@@ -505,10 +690,11 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn entities_of_type(&self, entity_type: &str) -> Vec<String> {
-        let mut members: Vec<String> = self
+        let state = self.state.borrow();
+        let mut members: Vec<String> = state
             .entities
             .iter()
-            .filter(|entity| self.type_of(&entity.name) == entity_type)
+            .filter(|entity| entity.entity_type.as_deref().unwrap_or("实体") == entity_type)
             .map(|entity| entity.name.clone())
             .collect();
         members.sort();
@@ -516,7 +702,8 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn entity_type(&self, entity: &str) -> Option<String> {
-        self.entity(entity).map(|entity| self.type_of(&entity.name))
+        self.entity(entity)
+            .map(|entity| entity.entity_type.unwrap_or_else(|| "实体".to_string()))
     }
 
     fn entity_attributes(&self, entity: &str) -> Vec<(String, String)> {
@@ -532,10 +719,18 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn entity_relations(&self, entity: &str) -> Vec<(String, String)> {
-        self.relations
+        let state = self.state.borrow();
+        let canonical = resolve_name(&state.aliases, entity);
+        state
+            .relations
             .iter()
-            .filter(|relation| relation.from == entity)
-            .map(|relation| (relation.predicate.clone(), relation.to.clone()))
+            .filter(|relation| resolve_name(&state.aliases, &relation.from) == canonical)
+            .map(|relation| {
+                (
+                    relation.predicate.clone(),
+                    resolve_name(&state.aliases, &relation.to),
+                )
+            })
             .collect()
     }
 
@@ -544,21 +739,24 @@ impl DialogueKnowledge for ScenarioKnowledge {
     }
 
     fn revision(&self) -> u64 {
-        self.revision.get()
+        self.state.borrow().revision
     }
 
     fn traceable_token(&self, token: &str) -> bool {
-        self.entities.iter().any(|entity| entity.name == token)
-            || self.entities.iter().any(|entity| {
+        let state = self.state.borrow();
+        let canonical = resolve_name(&state.aliases, token);
+        state.entities.iter().any(|entity| entity.name == canonical)
+            || state.aliases.iter().any(|(surface, _)| surface == token)
+            || state.entities.iter().any(|entity| {
                 entity
                     .attributes
                     .iter()
                     .any(|(key, value)| key == token || value == token)
             })
-            || self
-                .relations
-                .iter()
-                .any(|relation| relation.predicate == token || relation.to == token)
+            || state.relations.iter().any(|relation| {
+                relation.predicate == token
+                    || resolve_name(&state.aliases, &relation.to) == canonical
+            })
     }
 }
 
@@ -622,6 +820,34 @@ expect = { op = "explain", provenance_contains = ["身高"] }
 set_revision = 9
 input = "依据"
 expect = { op = "explain", stale = true, answer_contains = ["v1 → v9"] }
+"#;
+
+    const INCREMENTAL_SCENARIO: &str = r#"
+name = "增量身高"
+description = "扫描 → 回合间注入新实体（自动推进版本）→ 旧帧标旧 → 新扫描可见"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226", "国籍" = "中国" }
+
+[[entities]]
+name = "王治郅"
+type = "Person"
+attributes = { "身高" = "214", "国籍" = "中国" }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { op = "scan", rows = 2, revision = 1, stale = false }
+
+[[turns]]
+input = "依据"
+add_entities = [{ name = "易建联", type = "Person", attributes = { "身高" = "213", "国籍" = "中国" } }]
+expect = { op = "explain", revision = 2, stale = true, answer_contains = ["v1 → v2"] }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { op = "scan", rows = 3, revision = 2, stale = false, answer_contains = ["易建联"] }
 "#;
 
     #[test]
@@ -721,6 +947,9 @@ expect = { op = "explain", stale = true, answer_contains = ["v1 → v9"] }
                         ..TurnExpectation::default()
                     },
                     set_revision: None,
+                    add_entities: Vec::new(),
+                    add_relations: Vec::new(),
+                    add_aliases: Vec::new(),
                 },
                 ScenarioTurn {
                     input: "第二个呢".to_string(),
@@ -730,10 +959,171 @@ expect = { op = "explain", stale = true, answer_contains = ["v1 → v9"] }
                         ..TurnExpectation::default()
                     },
                     set_revision: None,
+                    add_entities: Vec::new(),
+                    add_relations: Vec::new(),
+                    add_aliases: Vec::new(),
                 },
             ],
         };
         let report = run_scenario_against(&scenario, &reasoner);
         assert!(report.passed, "{}", report.render_text());
+    }
+
+    #[test]
+    fn bundled_incremental_example_passes() {
+        let report = super::run_file("examples/incremental_scenario.toml")
+            .expect("增量示例剧本应可读取并运行");
+        assert!(report.passed, "{}", report.render_text());
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .map(|step| step.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2]
+        );
+    }
+
+    #[test]
+    fn incremental_turns_advance_revision_and_refresh_scan() {
+        let scenario = parse_scenario(INCREMENTAL_SCENARIO).expect("增量剧本应可解析");
+        let report = run_scenario(&scenario);
+        assert!(report.passed, "{}", report.render_text());
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .map(|step| step.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 2]
+        );
+        assert!(report.steps[1].board.as_ref().unwrap().stale);
+        assert_eq!(report.steps[2].board.as_ref().unwrap().rows, 3);
+    }
+
+    #[test]
+    fn injected_alias_resolves_to_canonical_entity() {
+        let scenario = parse_scenario(INCREMENTAL_SCENARIO).expect("增量剧本应可解析");
+        let knowledge = ScenarioKnowledge::from_scenario(&scenario);
+        let alias = ScenarioAlias {
+            surface: "明哥".to_string(),
+            canonical: "姚明".to_string(),
+        };
+        assert!(knowledge.inject(&[], &[], std::slice::from_ref(&alias)));
+        assert_eq!(knowledge.revision(), 2);
+        assert!(!knowledge.inject(&[], &[], std::slice::from_ref(&alias)));
+        assert_eq!(knowledge.revision(), 2);
+        assert_eq!(knowledge.entities_in("明哥和姚明"), vec!["姚明"]);
+        assert!(knowledge.known_entity("明哥"));
+        assert_eq!(knowledge.attribute_values("明哥", "身高"), vec!["226"]);
+        assert_eq!(knowledge.entity_type("明哥").as_deref(), Some("Person"));
+        assert!(knowledge.traceable_token("明哥"));
+    }
+
+    #[test]
+    fn injection_merges_attributes_without_false_bumps() {
+        let scenario = parse_scenario(INCREMENTAL_SCENARIO).expect("增量剧本应可解析");
+        let knowledge = ScenarioKnowledge::from_scenario(&scenario);
+        let unchanged = ScenarioEntity {
+            name: "姚明".to_string(),
+            entity_type: Some("Person".to_string()),
+            attributes: BTreeMap::from([
+                ("身高".to_string(), "226".to_string()),
+                ("国籍".to_string(), "中国".to_string()),
+            ]),
+        };
+        assert!(!knowledge.inject(std::slice::from_ref(&unchanged), &[], &[]));
+        assert_eq!(knowledge.revision(), 1);
+        let enriched = ScenarioEntity {
+            name: "姚明".to_string(),
+            entity_type: None,
+            attributes: BTreeMap::from([("球衣".to_string(), "11".to_string())]),
+        };
+        assert!(knowledge.inject(std::slice::from_ref(&enriched), &[], &[]));
+        assert_eq!(knowledge.revision(), 2);
+        assert_eq!(knowledge.attribute_values("姚明", "球衣"), vec!["11"]);
+    }
+
+    #[test]
+    fn incremental_scenario_stays_in_sync_with_journal_and_delta_cache() {
+        use crate::chronicle::{Chronicle, FsyncPolicy};
+        use crate::delta_cache::{DeltaFootprint, DeltaQualifiedCache, Qualification};
+        use crate::knowledge_delta::{KnowledgeBase, KnowledgeCatchup};
+        use crate::prolog_engine::PrologFact;
+        use std::collections::HashMap;
+
+        fn facts_for(
+            entities: &[ScenarioEntity],
+            relations: &[ScenarioRelation],
+        ) -> Vec<PrologFact> {
+            let mut facts: Vec<PrologFact> = entities
+                .iter()
+                .map(|entity| PrologFact::Entity {
+                    name: entity.name.clone(),
+                    entity_type: entity
+                        .entity_type
+                        .clone()
+                        .unwrap_or_else(|| "实体".to_string()),
+                    properties: entity
+                        .attributes
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<HashMap<_, _>>(),
+                })
+                .collect();
+            facts.extend(relations.iter().map(|relation| PrologFact::Relation {
+                from: relation.from.clone(),
+                rel_type: relation.predicate.clone(),
+                to: relation.to.clone(),
+            }));
+            facts
+        }
+
+        let scenario = parse_scenario(INCREMENTAL_SCENARIO).expect("增量剧本应可解析");
+        let scenario_knowledge = ScenarioKnowledge::from_scenario(&scenario);
+        let journal = KnowledgeBase::new(facts_for(&scenario.entities, &scenario.relations));
+        let mut cache = DeltaQualifiedCache::new(4);
+        cache.put(
+            "姚明身高".to_string(),
+            "226".to_string(),
+            Qualification::sensitive(journal.generation()).support_entities(["姚明".to_string()]),
+        );
+
+        let turn = &scenario.turns[1];
+        assert!(scenario_knowledge.apply_turn(turn));
+        let admitted = journal.assert_facts(
+            &facts_for(&turn.add_entities, &turn.add_relations),
+            "scenario",
+        );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(scenario_knowledge.revision(), journal.generation() + 1);
+        let changes = match journal.changes_since(0) {
+            KnowledgeCatchup::Incremental(changes) => changes,
+            other => panic!("期望增量，实际 {:?}", other),
+        };
+        let delta = DeltaFootprint::from_change(&changes[0]);
+        let report = cache.observe(&delta);
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.invalidated, 0);
+        assert_eq!(
+            cache.get(journal.generation(), "姚明身高"),
+            Some(&"226".to_string())
+        );
+
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("chronicle.jsonl");
+        let (mut chronicle, audit) =
+            Chronicle::open(path.to_str().unwrap(), FsyncPolicy::None).expect("打开编年史");
+        assert!(audit.is_clean());
+        chronicle.set_kb_revision(journal.generation());
+        chronicle
+            .append(
+                "knowledge",
+                serde_json::json!({ "fingerprint": journal.snapshot().fingerprint }),
+            )
+            .expect("追加知识记录");
+        assert_eq!(chronicle.kb_revision(), journal.generation());
+        assert_eq!(chronicle.watermark().0, 1);
+        assert_eq!(chronicle.replay_to(chronicle.last_seq()).len(), 1);
     }
 }

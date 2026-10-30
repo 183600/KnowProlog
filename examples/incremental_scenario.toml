@@ -1,0 +1,26 @@
+name = "增量身高自检"
+description = "扫描 → 回合间注入新实体并自动推进版本 → 旧帧标旧 → 新扫描可见；用「查询剧本：examples/incremental_scenario.toml」运行"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226", "国籍" = "中国" }
+
+[[entities]]
+name = "王治郅"
+type = "Person"
+attributes = { "身高" = "214", "国籍" = "中国" }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { op = "scan", rows = 2, revision = 1, stale = false, answer_contains = ["姚明"] }
+
+[[turns]]
+input = "依据"
+add_entities = [{ name = "易建联", type = "Person", attributes = { "身高" = "213", "国籍" = "中国" } }]
+add_aliases = [{ surface = "明哥", canonical = "姚明" }]
+expect = { op = "explain", revision = 2, stale = true, answer_contains = ["v1 → v2"] }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { op = "scan", rows = 3, revision = 2, stale = false, answer_contains = ["易建联"] }
