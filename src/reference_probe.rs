@@ -7,10 +7,14 @@ use serde::{Deserialize, Serialize};
 use crate::context_image::{canonical_json, fnv1a_hex};
 use crate::contextual_reference::{
     rewrite_at, ClarifyOption, ClarifyQuestion, ClarifyRequest, DiscriminatingFeature,
-    MentionResolution,
+    MentionResolution, Verdict,
+};
+use crate::referent_firewall::{
+    evaluate as evaluate_firewall, CandidateWorld, Claim, DisclosureGrade, DisclosureLevel,
+    FirewallCertificate, FirewallReport, FirewallRequest, FirewallVerdict, Warrant, WorldAnswer,
 };
 
-pub const GROUNDING_CERTIFICATE_VERSION: u32 = 2;
+pub const GROUNDING_CERTIFICATE_VERSION: u32 = 3;
 pub const MAX_PROBE_CANDIDATES: usize = 3;
 pub const MAX_GROUNDING_CERTIFICATES: usize = 32;
 pub const MAX_ANSWER_PREVIEW_CHARS: usize = 48;
@@ -71,17 +75,10 @@ impl ProbeSensitivity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeDecision {
-    Bind {
-        entity: String,
-        reason: String,
-    },
-    Repair {
-        entity: String,
-        reason: String,
-    },
-    Clarify {
-        reason: String,
-    },
+    Bind { entity: String, reason: String },
+    Repair { entity: String, reason: String },
+    Conditional { reason: String },
+    Clarify { reason: String },
 }
 
 impl ProbeDecision {
@@ -89,6 +86,7 @@ impl ProbeDecision {
         match self {
             ProbeDecision::Bind { .. } => "bind",
             ProbeDecision::Repair { .. } => "repair",
+            ProbeDecision::Conditional { .. } => "conditional",
             ProbeDecision::Clarify { .. } => "clarify",
         }
     }
@@ -98,7 +96,7 @@ impl ProbeDecision {
             ProbeDecision::Bind { entity, .. } | ProbeDecision::Repair { entity, .. } => {
                 Some(entity)
             }
-            ProbeDecision::Clarify { .. } => None,
+            ProbeDecision::Conditional { .. } | ProbeDecision::Clarify { .. } => None,
         }
     }
 
@@ -106,6 +104,7 @@ impl ProbeDecision {
         match self {
             ProbeDecision::Bind { reason, .. }
             | ProbeDecision::Repair { reason, .. }
+            | ProbeDecision::Conditional { reason }
             | ProbeDecision::Clarify { reason } => reason,
         }
     }
@@ -137,6 +136,8 @@ pub struct CertificateCandidate {
     pub answer_count: usize,
     pub answer_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub warrant: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub rewritten: String,
 }
 
@@ -152,6 +153,8 @@ pub struct GroundingCertificate {
     pub action: String,
     pub entity: Option<String>,
     pub candidates: Vec<CertificateCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambiguity: Option<FirewallCertificate>,
     pub certificate_digest: String,
 }
 
@@ -200,16 +203,27 @@ impl GroundingCertificate {
                 .as_deref()
                 .map(|fingerprint| format!("，指纹 {}", fingerprint))
                 .unwrap_or_default();
+            let basis = if candidate.warrant.is_empty() {
+                String::new()
+            } else {
+                format!("，依据 {}", candidate.warrant)
+            };
             let _ = writeln!(
                 out,
-                "    {}. {} [{} 票] {}（{} 项答案{}）",
+                "    {}. {} [{} 票] {}（{} 项答案{} {}）",
                 candidate.rank,
                 candidate.entity,
                 candidate.votes,
                 candidate.status,
                 candidate.answer_count,
-                fingerprint
+                fingerprint,
+                basis
             );
+        }
+        if let Some(ambiguity) = &self.ambiguity {
+            for line in ambiguity.render_text().lines() {
+                let _ = writeln!(out, "  {}", line);
+            }
         }
         out.trim_end().to_string()
     }
@@ -262,6 +276,65 @@ impl GroundingCertificate {
             });
         }
 
+        let complete = self
+            .ambiguity
+            .as_ref()
+            .map(|ambiguity| ambiguity.complete)
+            .unwrap_or(true);
+        let policy_level = self
+            .ambiguity
+            .as_ref()
+            .and_then(|ambiguity| match ambiguity.policy.as_str() {
+                "public" => Some(DisclosureLevel::Public),
+                "coarsened" => Some(DisclosureLevel::Coarsened),
+                "blocked" => Some(DisclosureLevel::Blocked),
+                _ => None,
+            })
+            .unwrap_or(DisclosureLevel::Public);
+        let replayed_worlds: Vec<CandidateWorld> = observations
+            .iter()
+            .map(|observation| {
+                let warrant = self
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.entity == observation.entity)
+                    .and_then(|candidate| Warrant::parse_code(&candidate.warrant))
+                    .unwrap_or(Warrant::Ranked);
+                let answer = match &observation.status {
+                    ProbeStatus::Answered(_) if observation.answerable() => WorldAnswer::Answered(
+                        observation
+                            .answers
+                            .iter()
+                            .map(|value| Claim::answer(value.clone()))
+                            .collect(),
+                    ),
+                    ProbeStatus::Answered(_) | ProbeStatus::NoAnswer => WorldAnswer::NoAnswer,
+                    ProbeStatus::Truncated => WorldAnswer::Unresolved("探测被截断".to_string()),
+                    ProbeStatus::Unsupported => WorldAnswer::Unresolved("不支持探测".to_string()),
+                };
+                CandidateWorld::new(
+                    observation.entity.clone(),
+                    observation.rank,
+                    observation.votes,
+                    warrant,
+                    answer,
+                )
+                .with_disclosure(DisclosureGrade {
+                    level: policy_level,
+                    reason: String::new(),
+                })
+            })
+            .collect();
+        let replayed_firewall = evaluate_firewall(&FirewallRequest {
+            mention: self.mention.clone(),
+            candidate_set_complete: complete,
+            worlds: replayed_worlds,
+        });
+        let ambiguity_matches = self
+            .ambiguity
+            .as_ref()
+            .map(|expected| replayed_firewall.certificate == *expected)
+            .unwrap_or(true);
         let (actual_sensitivity, actual_decision) = if observations.is_empty() {
             (
                 ProbeSensitivity::Uninformative,
@@ -270,7 +343,8 @@ impl GroundingCertificate {
                 },
             )
         } else {
-            let (sensitivity, decision, _) = classify(&observations);
+            let (sensitivity, decision, _) =
+                classify(&observations, complete, &replayed_firewall.verdict);
             (sensitivity, decision)
         };
         let actual_action = actual_decision.action().to_string();
@@ -278,7 +352,11 @@ impl GroundingCertificate {
             actual_action == self.action && actual_decision.entity() == self.entity.as_deref();
         let sensitivity_matches = actual_sensitivity.label() == self.sensitivity;
         let candidate_matches = candidates.iter().all(|candidate| candidate.matches);
-        let matches = replayable && candidate_matches && action_matches && sensitivity_matches;
+        let matches = replayable
+            && candidate_matches
+            && action_matches
+            && sensitivity_matches
+            && ambiguity_matches;
         let revision_changed = current_revision != self.revision;
 
         let mut notes = Vec::new();
@@ -308,6 +386,9 @@ impl GroundingCertificate {
                 actual_sensitivity.label()
             ));
         }
+        if !ambiguity_matches {
+            notes.push("歧义安全证书不一致：候选世界合并结果已变化".to_string());
+        }
 
         GroundingReplayReport {
             certificate_digest: self.certificate_digest.clone(),
@@ -320,6 +401,7 @@ impl GroundingCertificate {
             actual_sensitivity: actual_sensitivity.label().to_string(),
             expected_action: self.action.clone(),
             actual_action,
+            ambiguity_matches,
             candidates,
             notes,
         }
@@ -349,6 +431,7 @@ pub struct GroundingReplayReport {
     pub actual_sensitivity: String,
     pub expected_action: String,
     pub actual_action: String,
+    pub ambiguity_matches: bool,
     pub candidates: Vec<ReplayCandidate>,
     pub notes: Vec<String>,
 }
@@ -381,6 +464,15 @@ impl GroundingReplayReport {
             out,
             "  动作：{} → {}",
             self.expected_action, self.actual_action
+        );
+        let _ = writeln!(
+            out,
+            "  歧义安全证书：{}",
+            if self.ambiguity_matches {
+                "一致"
+            } else {
+                "不一致"
+            }
         );
         for candidate in &self.candidates {
             let _ = writeln!(
@@ -417,6 +509,7 @@ pub struct ReferenceProbeReport {
     pub observations: Vec<ProbedCandidate>,
     pub question: ClarifyQuestion,
     pub notes: Vec<String>,
+    pub firewall: FirewallReport,
     pub certificate: GroundingCertificate,
 }
 
@@ -529,10 +622,32 @@ pub fn probe_clarification<F>(
     resolution: Option<&MentionResolution>,
     revision: u64,
     max_candidates: usize,
-    mut probe: F,
+    probe: F,
 ) -> ReferenceProbeReport
 where
     F: FnMut(&str, &str) -> ProbeStatus,
+{
+    probe_clarification_with_disclosure(
+        request,
+        resolution,
+        revision,
+        max_candidates,
+        probe,
+        |_| DisclosureGrade::public(),
+    )
+}
+
+pub fn probe_clarification_with_disclosure<F, D>(
+    request: &ClarifyRequest,
+    resolution: Option<&MentionResolution>,
+    revision: u64,
+    max_candidates: usize,
+    mut probe: F,
+    mut disclosure: D,
+) -> ReferenceProbeReport
+where
+    F: FnMut(&str, &str) -> ProbeStatus,
+    D: FnMut(&str) -> DisclosureGrade,
 {
     let limit = max_candidates.clamp(1, MAX_PROBE_CANDIDATES);
     let mut observations = Vec::new();
@@ -566,8 +681,25 @@ where
         });
     }
 
-    let (sensitivity, decision, notes) = classify(&observations);
-    let question = enrich_question(request, &observations);
+    let complete = candidate_set_complete(request, resolution, &observations);
+    let worlds = worlds_from_observations(
+        request,
+        resolution,
+        &observations,
+        complete,
+        &mut disclosure,
+    );
+    let firewall = evaluate_firewall(&FirewallRequest {
+        mention: request.mention.clone(),
+        candidate_set_complete: complete,
+        worlds: worlds.clone(),
+    });
+    let (sensitivity, decision, mut notes) = classify(&observations, complete, &firewall.verdict);
+    notes.extend(firewall.notes.iter().cloned());
+    notes.sort();
+    notes.dedup();
+    let previews_allowed = firewall.disclosure.level == DisclosureLevel::Public;
+    let question = enrich_question(request, &observations, previews_allowed);
     let certificate = certificate_for(
         request,
         resolution,
@@ -575,6 +707,8 @@ where
         sensitivity,
         &decision,
         &observations,
+        &worlds,
+        &firewall,
     );
 
     ReferenceProbeReport {
@@ -585,8 +719,103 @@ where
         observations,
         question,
         notes,
+        firewall,
         certificate,
     }
+}
+
+fn candidate_set_complete(
+    request: &ClarifyRequest,
+    resolution: Option<&MentionResolution>,
+    observations: &[ProbedCandidate],
+) -> bool {
+    let observed: BTreeSet<&str> = observations
+        .iter()
+        .map(|observation| observation.entity.as_str())
+        .collect();
+    match resolution {
+        Some(resolution) => {
+            let survivors: Vec<&crate::contextual_reference::CandidateVote> = resolution
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.survived())
+                .collect();
+            survivors.is_empty()
+                || (survivors.len() <= observations.len()
+                    && survivors
+                        .iter()
+                        .all(|candidate| observed.contains(candidate.entity.as_str())))
+        }
+        None => request.question.options.len() <= observations.len(),
+    }
+}
+
+fn worlds_from_observations<D>(
+    request: &ClarifyRequest,
+    resolution: Option<&MentionResolution>,
+    observations: &[ProbedCandidate],
+    complete: bool,
+    disclosure: &mut D,
+) -> Vec<CandidateWorld>
+where
+    D: FnMut(&str) -> DisclosureGrade,
+{
+    observations
+        .iter()
+        .map(|observation| {
+            let answer = match &observation.status {
+                ProbeStatus::Answered(_) if observation.answerable() => WorldAnswer::Answered(
+                    observation
+                        .answers
+                        .iter()
+                        .map(|value| Claim::answer(value.clone()))
+                        .collect(),
+                ),
+                ProbeStatus::Answered(_) | ProbeStatus::NoAnswer => WorldAnswer::NoAnswer,
+                ProbeStatus::Truncated => WorldAnswer::Unresolved("探测被截断".to_string()),
+                ProbeStatus::Unsupported => WorldAnswer::Unresolved("不支持探测".to_string()),
+            };
+            let label = request
+                .question
+                .options
+                .iter()
+                .find(|option| option.entity == observation.entity)
+                .map(|option| option.label.clone());
+            let mut world = CandidateWorld::new(
+                observation.entity.clone(),
+                observation.rank,
+                observation.votes,
+                warrant_for(resolution, complete, &observation.entity),
+                answer,
+            );
+            if let Some(label) = label {
+                world = world.with_label(label);
+            }
+            world.with_disclosure(disclosure(&observation.entity))
+        })
+        .collect()
+}
+
+fn warrant_for(resolution: Option<&MentionResolution>, complete: bool, entity: &str) -> Warrant {
+    let Some(resolution) = resolution else {
+        return Warrant::Ranked;
+    };
+    if resolution.verdict == Verdict::Bound && resolution.chosen.as_deref() == Some(entity) {
+        return Warrant::Authorized;
+    }
+    let survivors: Vec<&crate::contextual_reference::CandidateVote> = resolution
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.survived())
+        .collect();
+    if complete
+        && (survivors.len() == 1 && survivors[0].entity == entity
+            || resolution.verdict == Verdict::Unique
+                && resolution.chosen.as_deref() == Some(entity))
+    {
+        return Warrant::Constrained;
+    }
+    Warrant::Ranked
 }
 
 fn normalize_status(status: ProbeStatus) -> ProbeStatus {
@@ -638,6 +867,8 @@ fn fingerprint_answers(answers: &[String]) -> Option<String> {
 
 fn classify(
     observations: &[ProbedCandidate],
+    complete: bool,
+    firewall_verdict: &FirewallVerdict,
 ) -> (ProbeSensitivity, ProbeDecision, Vec<String>) {
     if observations.is_empty() {
         return (
@@ -650,10 +881,8 @@ fn classify(
     }
 
     let any_unresolved = observations.iter().any(|obs| obs.status.unresolved());
-    let answerable: Vec<&ProbedCandidate> = observations
-        .iter()
-        .filter(|obs| obs.answerable())
-        .collect();
+    let answerable: Vec<&ProbedCandidate> =
+        observations.iter().filter(|obs| obs.answerable()).collect();
     let top_answerable = observations[0].answerable();
     let distinct: BTreeSet<&str> = answerable
         .iter()
@@ -682,6 +911,14 @@ fn classify(
         ProbeDecision::Clarify {
             reason: "存在截断或不支持的探测，不能据此宣称不可答".to_string(),
         }
+    } else if matches!(firewall_verdict, FirewallVerdict::Blocked { .. }) {
+        ProbeDecision::Clarify {
+            reason: "候选披露策略按最严者阻断，不能直接作答".to_string(),
+        }
+    } else if !complete {
+        ProbeDecision::Clarify {
+            reason: "存活候选未被完整探测，不能据此收窄指称".to_string(),
+        }
     } else if answerable.is_empty() {
         ProbeDecision::Clarify {
             reason: "所有候选均无答案，保留澄清且不宣称事实不存在".to_string(),
@@ -691,12 +928,16 @@ fn classify(
             reason: "候选义项给出不同答案，保留澄清".to_string(),
         }
     } else if top_answerable {
-        ProbeDecision::Bind {
-            entity: observations[0].entity.clone(),
-            reason: if answerable.len() == observations.len() {
-                "所有可答义项给出同一答案".to_string()
-            } else {
-                "只有最高分义项可答".to_string()
+        match firewall_verdict {
+            FirewallVerdict::Invariant { .. } => ProbeDecision::Bind {
+                entity: observations[0].entity.clone(),
+                reason: "所有候选义项都给出同一答案".to_string(),
+            },
+            FirewallVerdict::Conditional { .. } => ProbeDecision::Conditional {
+                reason: "只有部分候选可答，改为条件式回答，不静默收窄".to_string(),
+            },
+            _ => ProbeDecision::Clarify {
+                reason: "候选世界未能合并为不变回答，保留澄清".to_string(),
             },
         }
     } else {
@@ -707,10 +948,9 @@ fn classify(
     };
 
     let notes = match &decision {
-        ProbeDecision::Bind { entity, reason } => vec![format!(
-            "指称探测：{}，静默采用「{}」",
-            reason, entity
-        )],
+        ProbeDecision::Bind { entity, reason } => {
+            vec![format!("指称探测：{}，静默采用「{}」", reason, entity)]
+        }
         ProbeDecision::Repair { entity, reason } => {
             let preview = answerable
                 .iter()
@@ -722,6 +962,15 @@ fn classify(
                 reason, entity, preview, entity
             )]
         }
+        ProbeDecision::Conditional { reason } => vec![format!(
+            "指称探测：{}（候选：{}）",
+            reason,
+            answerable
+                .iter()
+                .map(|obs| obs.entity.as_str())
+                .collect::<Vec<_>>()
+                .join("/")
+        )],
         ProbeDecision::Clarify { reason } => {
             vec![format!("指称探测：{}", reason)]
         }
@@ -744,8 +993,12 @@ fn preview_answers(answers: &[String]) -> String {
 fn enrich_question(
     request: &ClarifyRequest,
     observations: &[ProbedCandidate],
+    previews_allowed: bool,
 ) -> ClarifyQuestion {
     let mut question = request.question.clone();
+    if !previews_allowed {
+        return question;
+    }
     for option in &mut question.options {
         let Some(observation) = observations
             .iter()
@@ -757,9 +1010,7 @@ fn enrich_question(
             ProbeStatus::Answered(_) if observation.answerable() => {
                 format!(" → {}", preview_answers(&observation.answers))
             }
-            ProbeStatus::Answered(_) | ProbeStatus::NoAnswer => {
-                "（当前知识库无答案）".to_string()
-            }
+            ProbeStatus::Answered(_) | ProbeStatus::NoAnswer => "（当前知识库无答案）".to_string(),
             ProbeStatus::Truncated => "（探测被截断）".to_string(),
             ProbeStatus::Unsupported => "（不支持探测）".to_string(),
         };
@@ -775,17 +1026,27 @@ fn certificate_for(
     sensitivity: ProbeSensitivity,
     decision: &ProbeDecision,
     observations: &[ProbedCandidate],
+    worlds: &[CandidateWorld],
+    firewall: &FirewallReport,
 ) -> GroundingCertificate {
     let candidates = observations
         .iter()
-        .map(|observation| CertificateCandidate {
-            rank: observation.rank,
-            entity: observation.entity.clone(),
-            votes: observation.votes,
-            status: observation.status.label().to_string(),
-            answer_count: observation.answers.len(),
-            answer_fingerprint: observation.answer_fingerprint.clone(),
-            rewritten: observation.rewritten.clone(),
+        .map(|observation| {
+            let warrant = worlds
+                .iter()
+                .find(|world| world.entity == observation.entity)
+                .map(|world| world.warrant.code())
+                .unwrap_or("ranked");
+            CertificateCandidate {
+                rank: observation.rank,
+                entity: observation.entity.clone(),
+                votes: observation.votes,
+                status: observation.status.label().to_string(),
+                answer_count: observation.answers.len(),
+                answer_fingerprint: observation.answer_fingerprint.clone(),
+                warrant: warrant.to_string(),
+                rewritten: observation.rewritten.clone(),
+            }
         })
         .collect();
     let key = resolution
@@ -802,12 +1063,12 @@ fn certificate_for(
         action: decision.action().to_string(),
         entity: decision.entity().map(str::to_string),
         candidates,
+        ambiguity: Some(firewall.certificate.clone()),
         certificate_digest: String::new(),
     };
     certificate.certificate_digest = certificate.compute_digest();
     certificate
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptedProbe {
@@ -821,6 +1082,7 @@ pub enum ScriptedProbe {
 pub enum GoldProbeAction {
     Bind(&'static str),
     Repair(&'static str),
+    Conditional,
     Clarify,
 }
 
@@ -861,7 +1123,7 @@ pub fn seed_cases() -> &'static [ProbeGoldCase] {
                 ("苹果", ScriptedProbe::Answers(&["红色"])),
                 ("苹果公司", ScriptedProbe::NoAnswer),
             ],
-            expected_action: GoldProbeAction::Bind("苹果"),
+            expected_action: GoldProbeAction::Conditional,
             expected_sensitivity: ProbeSensitivity::LinkSensitive,
         },
         ProbeGoldCase {
@@ -997,6 +1259,7 @@ pub struct GroundingEvalReport {
     pub repair_recall: f64,
     pub over_ask_rate: f64,
     pub silent_bind_rate: f64,
+    pub narrowing_safety: f64,
     pub truncation_safety: f64,
     pub preview_coverage: f64,
     pub certificate_replay_rate: f64,
@@ -1017,8 +1280,8 @@ impl GroundingEvalReport {
         );
         let _ = writeln!(
             out,
-            "over_ask_rate {:.4}；silent_bind_rate {:.4}；truncation_safety {:.4}",
-            self.over_ask_rate, self.silent_bind_rate, self.truncation_safety
+            "over_ask_rate {:.4}；silent_bind_rate {:.4}；narrowing_safety {:.4}；truncation_safety {:.4}",
+            self.over_ask_rate, self.silent_bind_rate, self.narrowing_safety, self.truncation_safety
         );
         let _ = writeln!(
             out,
@@ -1045,6 +1308,10 @@ impl GroundingEvalReport {
             self.silent_bind_rate,
         );
         metrics.insert(
+            "grounding.narrowing_safety".to_string(),
+            self.narrowing_safety,
+        );
+        metrics.insert(
             "grounding.truncation_safety".to_string(),
             self.truncation_safety,
         );
@@ -1060,10 +1327,8 @@ impl GroundingEvalReport {
     }
 }
 
-pub const GROUNDING_LOWER_IS_BETTER: [&str; 2] = [
-    "grounding.over_ask_rate",
-    "grounding.silent_bind_rate",
-];
+pub const GROUNDING_LOWER_IS_BETTER: [&str; 2] =
+    ["grounding.over_ask_rate", "grounding.silent_bind_rate"];
 
 fn eval_ratio(numerator: u32, denominator: u32) -> f64 {
     if denominator == 0 {
@@ -1117,6 +1382,7 @@ fn action_matches(expected: GoldProbeAction, decision: &ProbeDecision) -> bool {
         (GoldProbeAction::Repair(expected), ProbeDecision::Repair { entity, .. }) => {
             expected == entity
         }
+        (GoldProbeAction::Conditional, ProbeDecision::Conditional { .. }) => true,
         (GoldProbeAction::Clarify, ProbeDecision::Clarify { .. }) => true,
         _ => false,
     }
@@ -1136,6 +1402,8 @@ pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
     let mut over_asks = 0u32;
     let mut clarify_expected = 0u32;
     let mut silent_binds = 0u32;
+    let mut narrowing_expected = 0u32;
+    let mut narrowing_safe = 0u32;
     let mut unresolved_cases = 0u32;
     let mut truncation_safe = 0u32;
     let mut preview_expected = 0u32;
@@ -1173,6 +1441,7 @@ pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
                     repair_hits += 1;
                 }
             }
+            GoldProbeAction::Conditional => {}
             GoldProbeAction::Clarify => {
                 clarify_expected += 1;
                 if matches!(report.decision, ProbeDecision::Bind { .. }) {
@@ -1180,10 +1449,23 @@ pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
                 }
             }
         }
-        let unresolved = case
-            .script
+        let answerable_count = report
+            .observations
             .iter()
-            .any(|(_, script)| matches!(script, ScriptedProbe::Truncated | ScriptedProbe::Unsupported));
+            .filter(|observation| observation.answerable())
+            .count();
+        if answerable_count > 0 && answerable_count < report.observations.len() {
+            narrowing_expected += 1;
+            if !matches!(report.decision, ProbeDecision::Bind { .. }) {
+                narrowing_safe += 1;
+            }
+        }
+        let unresolved = case.script.iter().any(|(_, script)| {
+            matches!(
+                script,
+                ScriptedProbe::Truncated | ScriptedProbe::Unsupported
+            )
+        });
         if unresolved {
             unresolved_cases += 1;
             if !matches!(report.decision, ProbeDecision::Bind { .. }) {
@@ -1219,6 +1501,7 @@ pub fn evaluate(cases: &[ProbeGoldCase]) -> GroundingEvalReport {
         repair_recall: eval_ratio(repair_hits, repair_expected),
         over_ask_rate: eval_ratio(over_asks, bind_expected),
         silent_bind_rate: eval_ratio(silent_binds, clarify_expected),
+        narrowing_safety: eval_ratio(narrowing_safe, narrowing_expected),
         truncation_safety: eval_ratio(truncation_safe, unresolved_cases),
         preview_coverage: eval_ratio(preview_hits, preview_expected),
         certificate_replay_rate: eval_ratio(replay_hits, total),
@@ -1364,7 +1647,10 @@ mod tests {
             question: ClarifyQuestion {
                 mention: "苹果".to_string(),
                 feature: DiscriminatingFeature::Names,
-                options: options.iter().map(|entity| clarify_option(entity)).collect(),
+                options: options
+                    .iter()
+                    .map(|entity| clarify_option(entity))
+                    .collect(),
             },
         }
     }
@@ -1412,9 +1698,8 @@ mod tests {
     fn same_answer_binds_top_candidate() {
         let request = request(&["苹果", "苹果公司"]);
         let resolution = resolution(&[("苹果", 4), ("苹果公司", 3)]);
-        let report = probe_clarification(&request, Some(&resolution), 7, 3, |_, _| {
-            answered("红色")
-        });
+        let report =
+            probe_clarification(&request, Some(&resolution), 7, 3, |_, _| answered("红色"));
         assert_eq!(report.sensitivity, ProbeSensitivity::Stable);
         assert!(matches!(
             report.decision,
@@ -1422,6 +1707,80 @@ mod tests {
         ));
         assert_eq!(report.certificate.action, "bind");
         assert_eq!(report.certificate.entity.as_deref(), Some("苹果"));
+    }
+
+    #[test]
+    fn only_top_answerable_becomes_conditional_not_silent_bind() {
+        let request = request(&["苹果", "苹果公司"]);
+        let resolution = resolution(&[("苹果", 4), ("苹果公司", 3)]);
+        let report = probe_clarification(&request, Some(&resolution), 7, 3, |entity, _| {
+            if entity == "苹果" {
+                answered("红色")
+            } else {
+                ProbeStatus::NoAnswer
+            }
+        });
+        assert!(matches!(report.decision, ProbeDecision::Conditional { .. }));
+        assert_eq!(report.certificate.action, "conditional");
+        let text = report
+            .firewall
+            .render_conditional_answer()
+            .expect("conditional answer");
+        assert!(text.contains("红色"));
+        assert!(text.contains("当前知识库无答案"));
+    }
+
+    #[test]
+    fn truncated_candidate_set_blocks_bind_even_when_observed_answers_agree() {
+        let request = request(&["苹果", "苹果公司"]);
+        let resolution = resolution(&[
+            ("苹果", 4),
+            ("苹果公司", 3),
+            ("苹果唱片", 2),
+            ("苹果电影", 1),
+        ]);
+        let report =
+            probe_clarification(&request, Some(&resolution), 7, 2, |_, _| answered("红色"));
+        assert!(matches!(report.decision, ProbeDecision::Clarify { .. }));
+        assert!(!report.firewall.complete);
+        let ambiguity = report.certificate.ambiguity.as_ref().expect("ambiguity");
+        assert!(!ambiguity.complete);
+        assert_eq!(ambiguity.basis, "incomplete");
+    }
+
+    #[test]
+    fn blocked_candidate_policy_withholds_previews_without_binding() {
+        let request = request(&["苹果", "苹果公司"]);
+        let resolution = resolution(&[("苹果", 4), ("苹果公司", 3)]);
+        let report = probe_clarification_with_disclosure(
+            &request,
+            Some(&resolution),
+            7,
+            3,
+            |entity, _| {
+                if entity == "苹果" {
+                    answered("红色")
+                } else {
+                    answered("库克")
+                }
+            },
+            |entity| {
+                if entity == "苹果公司" {
+                    DisclosureGrade::blocked("个人联系方式")
+                } else {
+                    DisclosureGrade::public()
+                }
+            },
+        );
+        assert!(matches!(report.decision, ProbeDecision::Clarify { .. }));
+        assert_eq!(report.firewall.disclosure.level, DisclosureLevel::Blocked);
+        assert!(report.firewall.options.is_empty());
+        assert!(report
+            .question
+            .options
+            .iter()
+            .all(|option| !option.label.contains('→')));
+        assert!(!report.question.render().contains("库克"));
     }
 
     #[test]
@@ -1533,18 +1892,23 @@ mod tests {
                 ProbeStatus::NoAnswer
             }
         });
-        let same = report
-            .certificate
-            .replay(7, |entity, _| {
-                if entity == "苹果" {
-                    answered("红色")
-                } else {
-                    ProbeStatus::NoAnswer
-                }
-            });
+        let same = report.certificate.replay(7, |entity, _| {
+            if entity == "苹果" {
+                answered("红色")
+            } else {
+                ProbeStatus::NoAnswer
+            }
+        });
         assert!(same.replayable);
         assert!(same.matches, "{}", same.render_text());
         assert!(!same.revision_changed);
+        assert!(same.ambiguity_matches);
+        assert!(report
+            .certificate
+            .ambiguity
+            .as_ref()
+            .expect("ambiguity certificate")
+            .verify());
 
         let changed = report.certificate.replay(8, |entity, _| {
             if entity == "苹果" {
@@ -1603,14 +1967,15 @@ mod tests {
         let request = request(&["苹果", "苹果公司"]);
         let mut ledger = GroundingLedger::new();
         for revision in 0..(MAX_GROUNDING_CERTIFICATES as u64 + 8) {
-            let report = probe_clarification(&request, None, revision, 3, |_, _| {
-                answered("红色")
-            });
+            let report = probe_clarification(&request, None, revision, 3, |_, _| answered("红色"));
             ledger.push(report.certificate);
         }
         assert_eq!(ledger.len(), MAX_GROUNDING_CERTIFICATES);
         let before = ledger.len();
-        let duplicate = ledger.latest().cloned().expect("ledger should not be empty");
+        let duplicate = ledger
+            .latest()
+            .cloned()
+            .expect("ledger should not be empty");
         ledger.push(duplicate);
         assert_eq!(ledger.len(), before);
         let snapshot = ledger.snapshot_json().expect("snapshot");
@@ -1630,18 +1995,23 @@ mod tests {
         let second = evaluate_seed();
         assert_eq!(first, second);
         assert_eq!(first.action_accuracy, 1.0, "{}", first.render_text());
-        assert_eq!(
-            first.sensitivity_accuracy, 1.0,
-            "{}",
-            first.render_text()
-        );
+        assert_eq!(first.sensitivity_accuracy, 1.0, "{}", first.render_text());
         assert_eq!(first.repair_recall, 1.0, "{}", first.render_text());
         assert_eq!(first.over_ask_rate, 0.0, "{}", first.render_text());
         assert_eq!(first.silent_bind_rate, 0.0, "{}", first.render_text());
         assert_eq!(first.truncation_safety, 1.0, "{}", first.render_text());
+        assert_eq!(first.narrowing_safety, 1.0, "{}", first.render_text());
+        assert_eq!(
+            first
+                .flatten_metrics()
+                .get("grounding.narrowing_safety")
+                .copied(),
+            Some(1.0)
+        );
         assert_eq!(first.preview_coverage, 1.0, "{}", first.render_text());
         assert_eq!(
-            first.certificate_replay_rate, 1.0,
+            first.certificate_replay_rate,
+            1.0,
             "{}",
             first.render_text()
         );

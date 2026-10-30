@@ -50,6 +50,25 @@ impl Warrant {
         }
     }
 
+    pub fn code(self) -> &'static str {
+        match self {
+            Warrant::Authorized => "authorized",
+            Warrant::Constrained => "constrained",
+            Warrant::Ranked => "ranked",
+            Warrant::Truncated => "truncated",
+        }
+    }
+
+    pub fn parse_code(value: &str) -> Option<Self> {
+        match value {
+            "authorized" => Some(Warrant::Authorized),
+            "constrained" => Some(Warrant::Constrained),
+            "ranked" => Some(Warrant::Ranked),
+            "truncated" => Some(Warrant::Truncated),
+            _ => None,
+        }
+    }
+
     pub fn is_exclusion(self) -> bool {
         matches!(self, Warrant::Authorized | Warrant::Constrained)
     }
