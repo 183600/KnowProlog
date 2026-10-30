@@ -952,6 +952,29 @@ impl SymbolicReasoner {
         Some(answer)
     }
 
+    /// Refine 的有界重查请求：保留原问句与锚点，让新约束（可能是原证据里
+    /// 没有的谓词或取值）重新进入检索；候选上限沿用会话配置。
+    fn refine_search_request(
+        &self,
+        set: &crate::search_port::ResultSet,
+        needle: &str,
+    ) -> crate::search_port::SearchRequest {
+        let query = format!("{} {}", set.question, needle);
+        let predicate = if set.anchor.is_none() {
+            set.predicate.clone()
+        } else {
+            None
+        };
+        let mut request = crate::search_port::SearchRequest::from_question(
+            query,
+            set.anchor.clone(),
+            predicate,
+            self.config.search_session.max_entries,
+        );
+        request.mode = crate::search_port::SearchMode::Enumerate;
+        request
+    }
+
     /// 对上一轮结果集执行显式追问动作。默认关闭；没有结果集或不是结果集
     /// 动作时返回 None，完全回退到旧回答管线。
     pub fn answer_search_session(&self, question: &str) -> Option<String> {
@@ -961,7 +984,10 @@ impl SymbolicReasoner {
         let action = crate::search_port::parse_followup(question)?;
         let reply = {
             let mut session = self.search_session.lock();
-            session.respond(&action)
+            session.respond_with(&action, |set, needle| {
+                let request = self.refine_search_request(set, needle);
+                Some(self.semantic_search(&request))
+            })
         };
         if reply.is_some() {
             self.perf.bump("search_session_actions");

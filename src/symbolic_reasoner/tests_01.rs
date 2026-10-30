@@ -1718,6 +1718,35 @@
     }
 
     #[test]
+    fn search_session_refine_requeries_beyond_current_set() {
+        let mut reasoner = SymbolicReasoner::new(search_session_config(), HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+        let hit = crate::dense_retrieval::RetrievalHit {
+            subject: "张三".to_string(),
+            predicate: "师傅".to_string(),
+            object: "王五".to_string(),
+            score: 1.0,
+            lexical: 1.0,
+            structural: 0.0,
+            predicate_match: 0.0,
+            reasons: vec!["测试证据".to_string()],
+        };
+        assert!(reasoner.search_session.lock().record_search_hits(
+            "张三的师傅是谁",
+            "证据索引",
+            Some("张三".to_string()),
+            Some("师傅".to_string()),
+            &[hit],
+            "测试回执".to_string(),
+        ));
+
+        let refined = reasoner.answer("其中李四呢").expect("应触发有界重查");
+        assert!(refined.contains("有界重查"), "{}", refined);
+        assert!(refined.contains("李四"), "{}", refined);
+        assert!(!refined.contains("王五"), "{}", refined);
+    }
+
+    #[test]
     fn search_session_stays_disabled_by_default() {
         let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
         reasoner.observe_facts(&search_session_facts());

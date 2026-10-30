@@ -881,6 +881,18 @@ pub struct SessionEntry {
 }
 
 impl SessionEntry {
+    fn from_search_hit(index: usize, hit: &SearchHit) -> Self {
+        Self {
+            id: format!("E{}", index + 1),
+            subject: hit.subject.clone(),
+            predicate: hit.predicate.clone(),
+            object: hit.object.clone(),
+            score: hit.score,
+            channels: hit.channels.clone(),
+            reasons: hit.reasons.clone(),
+        }
+    }
+
     fn from_item(item: &EvidenceItem) -> Self {
         Self {
             id: item.id.clone(),
@@ -1020,15 +1032,7 @@ impl SearchSession {
             .iter()
             .take(self.max_entries)
             .enumerate()
-            .map(|(index, hit)| SessionEntry {
-                id: format!("E{}", index + 1),
-                subject: hit.subject.clone(),
-                predicate: hit.predicate.clone(),
-                object: hit.object.clone(),
-                score: hit.score,
-                channels: hit.channels.clone(),
-                reasons: hit.reasons.clone(),
-            })
+            .map(|(index, hit)| SessionEntry::from_search_hit(index, hit))
             .collect();
         if entries.is_empty() {
             return false;
@@ -1070,6 +1074,16 @@ impl SearchSession {
     }
 
     pub fn respond(&mut self, action: &FollowUpAction) -> Option<String> {
+        self.respond_with(action, |_, _| None)
+    }
+
+    /// 与 [`Self::respond`] 相同，但允许 Refine 在当前结果集没有命中时执行
+    /// 一次有界重查：重查结果仍按细化词过滤，并明确标记为未证明 top-k。
+    pub fn respond_with<F>(&mut self, action: &FollowUpAction, requery: F) -> Option<String>
+    where
+        F: FnOnce(&ResultSet, &str) -> Option<PortOutcome>,
+    {
+        let max_entries = self.max_entries;
         let set = self.last.as_mut()?;
         Some(match action {
             FollowUpAction::NextPage => next_page(set),
@@ -1077,7 +1091,7 @@ impl SearchSession {
             FollowUpAction::SelectLast => select(set, set.entries.len()),
             FollowUpAction::Explain => explain(set),
             FollowUpAction::Exclude(needle) => retain_matching(set, needle, false),
-            FollowUpAction::Refine(needle) => retain_matching(set, needle, true),
+            FollowUpAction::Refine(needle) => refine_with(set, needle, max_entries, requery),
         })
     }
 }
@@ -1152,6 +1166,78 @@ fn explain(set: &ResultSet) -> String {
     }
     for receipt in &set.receipts {
         output.push_str(receipt);
+        output.push('\n');
+    }
+    output.trim_end().to_string()
+}
+
+fn refine_with<F>(
+    set: &mut ResultSet,
+    needle: &str,
+    max_entries: usize,
+    requery: F,
+) -> String
+where
+    F: FnOnce(&ResultSet, &str) -> Option<PortOutcome>,
+{
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return "没有指定要细化的条件。".to_string();
+    }
+    let before = set.entries.len();
+    let matching: Vec<SessionEntry> = set
+        .entries
+        .iter()
+        .filter(|entry| entry.matches(needle))
+        .cloned()
+        .collect();
+    if !matching.is_empty() {
+        set.entries = matching;
+        set.cursor = 0;
+        return render_refined(set, needle, before, false);
+    }
+    if let Some(outcome) = requery(&*set, needle) {
+        let entries: Vec<SessionEntry> = outcome
+            .hits
+            .iter()
+            .filter(|hit| {
+                hit.subject.contains(needle)
+                    || hit.predicate.contains(needle)
+                    || hit.object.contains(needle)
+            })
+            .take(max_entries)
+            .enumerate()
+            .map(|(index, hit)| SessionEntry::from_search_hit(index, hit))
+            .collect();
+        if !entries.is_empty() {
+            set.entries = entries;
+            set.cursor = 0;
+            set.kind = format!("有界重查:{}", set.kind);
+            set.receipts.push(outcome.receipt.render_text());
+            return render_refined(set, needle, before, true);
+        }
+    }
+    format!("上一轮结果集里没有包含「{}」的条目。", needle)
+}
+
+fn render_refined(set: &ResultSet, needle: &str, before: usize, requeried: bool) -> String {
+    let mut output = if requeried {
+        format!(
+            "当前结果集里没有包含「{}」的条目；已按同一锚点做有界重查，命中 {} 条（原 {} 条；重查不证明全局 top-k）：\n",
+            needle,
+            set.entries.len(),
+            before
+        )
+    } else {
+        format!(
+            "按「{}」细化后还剩 {} 条（原 {} 条）：\n",
+            needle,
+            set.entries.len(),
+            before
+        )
+    };
+    for entry in &set.entries {
+        output.push_str(&entry.render_line());
         output.push('\n');
     }
     output.trim_end().to_string()
@@ -1645,6 +1731,21 @@ mod tests {
         }
     }
 
+    fn search_hit(subject: &str, predicate: &str, object: &str) -> SearchHit {
+        SearchHit {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+            score: 0.9,
+            lexical: 0.5,
+            structural: 0.3,
+            predicate_match: 0.1,
+            verified: true,
+            channels: vec!["dense".to_string()],
+            reasons: vec!["有界重查命中".to_string()],
+        }
+    }
+
     fn session() -> SearchSession {
         let mut session = SearchSession::new(SearchSessionConfig {
             enabled: true,
@@ -1783,6 +1884,42 @@ mod tests {
         let explained = session.respond(&FollowUpAction::Explain).expect("应可解释");
         assert!(explained.contains("张三的师傅是谁"), "{}", explained);
         assert!(explained.contains("证据装配回执"), "{}", explained);
+    }
+
+    #[test]
+    fn refine_requeries_only_when_current_set_has_no_match() {
+        let mut session = session();
+        let outcome = PortOutcome {
+            hits: vec![search_hit("张三", "师傅", "钱七")],
+            receipt: PortReceipt {
+                returned: 1,
+                ..PortReceipt::default()
+            },
+            batches: Vec::new(),
+        };
+        let refined = session
+            .respond_with(&FollowUpAction::Refine("钱七".to_string()), |set, needle| {
+                assert_eq!(needle, "钱七");
+                assert_eq!(set.anchor.as_deref(), Some("张三"));
+                assert_eq!(set.predicate.as_deref(), Some("师傅"));
+                Some(outcome)
+            })
+            .expect("应有上一轮结果集");
+        assert!(refined.contains("有界重查"), "{}", refined);
+        assert!(refined.contains("钱七"), "{}", refined);
+        assert!(!refined.contains("李四"), "{}", refined);
+        let last = session.last().expect("重查后应保留结果集");
+        assert_eq!(last.entries.len(), 1);
+        assert!(last.kind.starts_with("有界重查"), "{}", last.kind);
+        assert_eq!(last.receipts.len(), 2);
+
+        let refined = session
+            .respond_with(&FollowUpAction::Refine("钱七".to_string()), |_, _| {
+                panic!("当前结果集已有命中时不得重查")
+            })
+            .expect("应有上一轮结果集");
+        assert!(refined.contains("细化"), "{}", refined);
+        assert!(refined.contains("钱七"), "{}", refined);
     }
 
     #[test]
