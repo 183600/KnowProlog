@@ -914,16 +914,12 @@ async fn run_privacy(
             if category.is_personal() {
                 quasi_identifiers.insert(predicate.clone());
             }
-            claims.push(FusedClaim {
-                claim_id: format!("fact-{:03}", claims.len() + 1),
-                text: format!("{} {} {}", subject, predicate, object),
-                atoms: vec![ClaimAtom::new(subject, predicate, object)],
-                warrant: ClaimWarrant {
-                    level: WarrantLevel::Deductive,
-                    channels: [EvidenceChannel::Deductive].into_iter().collect(),
-                    sources: ["privacy_cli".to_string()].into_iter().collect(),
-                },
-            });
+            claims.push(FusedClaim::deductive(
+                format!("fact-{:03}", claims.len() + 1),
+                format!("{} {} {}", subject, predicate, object),
+                vec![ClaimAtom::new(subject, predicate, object)],
+                "privacy_cli",
+            ));
         }
         let config = AnswerDisclosureConfig {
             requested_precision: requested,

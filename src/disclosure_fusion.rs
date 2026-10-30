@@ -114,7 +114,6 @@ impl ClaimAtom {
             predicate: self.predicate.clone(),
         }
     }
-
 }
 
 /// 披露槽位：生成叠加层以「主语 + 谓词」为单位隐藏或替换。
@@ -208,6 +207,36 @@ impl ClaimWarrant {
     pub fn is_admissible(&self) -> bool {
         self.level.is_admissible()
     }
+
+    /// 演绎通道的保证书。
+    pub fn deductive(source: impl Into<String>) -> Self {
+        Self::from_channels(
+            [EvidenceChannel::Deductive].into_iter().collect(),
+            [source.into()].into_iter().collect(),
+        )
+    }
+
+    /// 联想通道的保证书。
+    pub fn associative(source: impl Into<String>) -> Self {
+        Self::from_channels(
+            [EvidenceChannel::Associative].into_iter().collect(),
+            [source.into()].into_iter().collect(),
+        )
+    }
+
+    /// 两通道互证的保证书。
+    pub fn corroborated<I, S>(sources: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::from_channels(
+            [EvidenceChannel::Associative, EvidenceChannel::Deductive]
+                .into_iter()
+                .collect(),
+            sources.into_iter().map(Into::into).collect(),
+        )
+    }
 }
 
 /// 融合后的命题：带保证书与去重后的证据原子。
@@ -217,6 +246,23 @@ pub struct FusedClaim {
     pub text: String,
     pub atoms: Vec<ClaimAtom>,
     pub warrant: ClaimWarrant,
+}
+
+impl FusedClaim {
+    /// 由演绎通道直接建立命题。
+    pub fn deductive(
+        claim_id: impl Into<String>,
+        text: impl Into<String>,
+        atoms: Vec<ClaimAtom>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            claim_id: claim_id.into(),
+            text: text.into(),
+            atoms,
+            warrant: ClaimWarrant::deductive(source),
+        }
+    }
 }
 
 /// 被拒绝的候选及稳定原因码。
@@ -594,6 +640,63 @@ impl AnswerDisclosureReport {
         if self.hitting_set_exhausted {
             text.push_str("；最小命中集搜索回退到贪心");
         }
+        const DETAIL_LIMIT: usize = 8;
+        for finding in self.joint_findings.iter().take(DETAIL_LIMIT) {
+            text.push_str(&format!(
+                "\n  联合 k-匿名：{} 的 {}，等价类 {}/{}",
+                finding.subject,
+                finding.predicates.join("、"),
+                finding.class_size,
+                finding.required
+            ));
+        }
+        if self.joint_findings.len() > DETAIL_LIMIT {
+            text.push_str(&format!(
+                "\n  联合 k-匿名：另有 {} 组未展开",
+                self.joint_findings.len() - DETAIL_LIMIT
+            ));
+        }
+        for leak in self.leaks.iter().take(DETAIL_LIMIT) {
+            text.push_str(&format!("\n  组合泄漏：{}", leak.render_zh()));
+        }
+        if self.leaks.len() > DETAIL_LIMIT {
+            text.push_str(&format!(
+                "\n  组合泄漏：另有 {} 条未展开",
+                self.leaks.len() - DETAIL_LIMIT
+            ));
+        }
+        for repair in self.repairs.iter().take(DETAIL_LIMIT) {
+            if repair.precision == DisclosurePrecision::Hidden {
+                text.push_str(&format!(
+                    "\n  修复：隐藏 {}（{}）",
+                    repair.slot.render(),
+                    repair.reason.code()
+                ));
+            } else {
+                text.push_str(&format!(
+                    "\n  修复：{} 降至 {}（{}，{} 个替换值）",
+                    repair.slot.render(),
+                    repair.precision.label(),
+                    repair.reason.code(),
+                    repair.replacements.len()
+                ));
+            }
+        }
+        if self.repairs.len() > DETAIL_LIMIT {
+            text.push_str(&format!(
+                "\n  修复：另有 {} 个槽位未展开",
+                self.repairs.len() - DETAIL_LIMIT
+            ));
+        }
+        for claim_id in self.removed_claims.iter().take(DETAIL_LIMIT) {
+            text.push_str(&format!("\n  移除命题：{}", claim_id));
+        }
+        if self.removed_claims.len() > DETAIL_LIMIT {
+            text.push_str(&format!(
+                "\n  移除命题：另有 {} 条未展开",
+                self.removed_claims.len() - DETAIL_LIMIT
+            ));
+        }
         text
     }
 }
@@ -936,9 +1039,26 @@ fn combined_facts(
     claims: &[FusedClaim],
     adjusted_precision: &BTreeMap<ClaimAtom, DisclosurePrecision>,
 ) -> Vec<PrivacyFact> {
-    let mut facts = graph.facts.clone();
+    let mut facts = Vec::with_capacity(graph.facts.len());
+    for fact in &graph.facts {
+        let atom = claims
+            .iter()
+            .flat_map(|claim| claim.atoms.iter())
+            .find(|atom| atom_matches_fact(atom, fact));
+        match atom.and_then(|atom| adjusted_precision.get(atom)).copied() {
+            Some(DisclosurePrecision::Hidden) => continue,
+            Some(precision) => {
+                let mut fact = fact.clone();
+                fact.precision = fact.precision.min(precision);
+                facts.push(fact);
+            }
+            None => facts.push(fact.clone()),
+        }
+    }
     for atom in claims.iter().flat_map(|claim| claim.atoms.iter()) {
-        if facts.iter().any(|fact| atom_matches_fact(atom, fact)) {
+        if facts.iter().any(|fact| atom_matches_fact(atom, fact))
+            || graph.facts.iter().any(|fact| atom_matches_fact(atom, fact))
+        {
             continue;
         }
         let category = policy.classify_predicate(&atom.predicate);
@@ -1492,7 +1612,8 @@ fn greedy_hitting_set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::privacy_flow::{InferenceRule, PolicyMode};
+    use crate::answer_plan::{AnswerPlan, ClaimEvidence, PlanClaim};
+    use crate::privacy_flow::{InferenceRule, PolicyMode, PredicateRule, PrivacyCategory};
 
     fn enforced_policy(k: usize) -> PrivacyPolicy {
         PrivacyPolicy {
@@ -1557,6 +1678,28 @@ mod tests {
         let report = fuse_candidates(&[], &[candidate], true);
         assert!(report.accepted.is_empty());
         assert_eq!(report.rejected[0].reason, "missing_evidence");
+    }
+
+    #[test]
+    fn plan_claims_become_deductive_candidates_with_slots() {
+        let plan = AnswerPlan::new(
+            "张三住在哪里",
+            "张三",
+            7,
+            vec![
+                PlanClaim::new("slot-address", "地址", "张三住在北京市", false)
+                    .with_evidence(vec![ClaimEvidence::new("张三", "地址", "北京市", false)]),
+            ],
+            0,
+            0,
+        );
+        let candidates = candidates_from_plan(&plan, EvidenceChannel::Deductive);
+        assert_eq!(candidates[0].claim_id, "slot-address");
+        let report = fuse_candidates(&[], &candidates, true);
+        let fused = &report.accepted[0];
+        assert_eq!(fused.warrant.level, WarrantLevel::Deductive);
+        assert_eq!(fused.atoms, vec![ClaimAtom::new("张三", "地址", "北京市")]);
+        assert!(fused.warrant.sources.contains("answer_plan"));
     }
 
     #[test]
@@ -1656,6 +1799,69 @@ mod tests {
             AnswerDisclosureConfig::default().with_requested_precision(DisclosurePrecision::Coarse);
         let safe = decode_answer(&policy, &graph, &PrivacyLedger::new(), &claims, &coarse);
         assert!(safe.leaks.is_empty());
+    }
+
+    #[test]
+    fn hidden_atom_is_not_reintroduced_by_graph_seed() {
+        let mut policy = enforced_policy(1);
+        policy.consent_required.clear();
+        policy.predicate_rules.insert(
+            0,
+            PredicateRule {
+                contains: "就读".to_string(),
+                category: PrivacyCategory::Location,
+                max_precision: Some(DisclosurePrecision::Hidden),
+            },
+        );
+        policy
+            .predicate_rules
+            .insert(1, PredicateRule::new("位于", PrivacyCategory::Other));
+        policy.inference_rules.push(
+            InferenceRule::new(
+                "学校所在城市",
+                "就读",
+                "位于",
+                "所在城市",
+                PrivacyCategory::Location,
+            )
+            .with_max_precision(DisclosurePrecision::TypeOnly),
+        );
+        let mut graph = PrivacyGraph::new();
+        graph.add_fact(&policy, "阳光小学", "就读", "海淀区");
+        graph.add_fact(&policy, "海淀区", "位于", "北京市");
+        let claims = vec![
+            FusedClaim::deductive(
+                "school",
+                "阳光小学位于海淀区",
+                vec![ClaimAtom::new("阳光小学", "就读", "海淀区")],
+                "test",
+            ),
+            FusedClaim::deductive(
+                "district",
+                "海淀区位于北京市",
+                vec![ClaimAtom::new("海淀区", "位于", "北京市")],
+                "test",
+            ),
+        ];
+        let report = decode_answer(
+            &policy,
+            &graph,
+            &PrivacyLedger::new(),
+            &claims,
+            &AnswerDisclosureConfig::default(),
+        );
+        let school = report
+            .atom_decisions
+            .iter()
+            .find(|decision| decision.claim_id == "school")
+            .expect("school decision");
+        assert_eq!(
+            school.decision.effective_precision,
+            DisclosurePrecision::Hidden
+        );
+        assert!(report.leaks.is_empty());
+        assert!(report.removed_claims.contains(&"school".to_string()));
+        assert!(!report.removed_claims.contains(&"district".to_string()));
     }
 
     #[test]

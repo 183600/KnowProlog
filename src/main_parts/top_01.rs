@@ -36,8 +36,7 @@ use know_prolog::{
     dialogue_manager::{DialogueManager, MoveKind},
     dialogue_uri::{DialogueArtifactIndex, DialogueSession},
     disclosure_fusion::{
-        self as disclosure_fusion, AnswerDisclosureConfig, ClaimAtom, ClaimWarrant,
-        EvidenceChannel, FusedClaim, WarrantLevel,
+        self as disclosure_fusion, AnswerDisclosureConfig, ClaimAtom, FusedClaim,
     },
     embedding_eval::{
         compare_baseline, entity_types_from_prolog_facts, evaluate, triples_from_prolog_facts,
