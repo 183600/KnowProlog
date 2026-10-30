@@ -747,6 +747,29 @@ impl SymbolicReasoner {
             }
             if let Some(expectation) = self.lexical_memory.type_expectation(&oov.text) {
                 oov.suggested_type = Some(expectation.expected_type);
+                continue;
+            }
+            if let Some(token) = trace
+                .tokens
+                .iter()
+                .find(|token| token.text == oov.text || token.start == oov.start)
+            {
+                let profile = crate::pos_ontology::profile(&token.pos);
+                oov.suggested_type = profile
+                    .sorts
+                    .iter()
+                    .filter(|sort| {
+                        matches!(
+                            sort,
+                            crate::pos_ontology::Sort::Person
+                                | crate::pos_ontology::Sort::Place
+                                | crate::pos_ontology::Sort::Organization
+                                | crate::pos_ontology::Sort::Event
+                                | crate::pos_ontology::Sort::Time
+                        )
+                    })
+                    .find_map(|sort| sort.ontology_type())
+                    .map(str::to_string);
             }
         }
     }
