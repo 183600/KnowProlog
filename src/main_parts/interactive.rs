@@ -619,6 +619,19 @@ async fn run_interactive_mode(
             None
         }
     };
+    // 对话工件会话标识：与编年史旁车持久化，URI 跨重启/路径改名保持稳定。
+    let dialogue_session_path = format!(
+        "{}{}",
+        chronicle_path,
+        know_prolog::dialogue_uri::SESSION_FILE_SUFFIX
+    );
+    let dialogue_session = match DialogueSession::open_or_create(&dialogue_session_path) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            eprintln!("对话工件会话标识打开失败（工件 URI 不可用）：{}", error);
+            None
+        }
+    };
     // 跨会话焦点兜底：只有快照没有恢复出焦点时，才用编年史最近的实体线程。
     // 显式会话状态永远优先；这里只移动下一轮的指代先验，不新增对话轮。
     if dialogue_enabled && dialogue_manager.focus_entity().is_none() {

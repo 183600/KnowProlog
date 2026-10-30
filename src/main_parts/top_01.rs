@@ -33,6 +33,7 @@ use know_prolog::{
         self, compare_baseline as compare_fuzz_baseline, FuzzBaseline, FuzzConfig, FuzzVerdict,
     },
     dialogue_manager::{DialogueManager, MoveKind},
+    dialogue_uri::{DialogueArtifactIndex, DialogueSession},
     embedding_eval::{
         compare_baseline, entity_types_from_prolog_facts, evaluate, triples_from_prolog_facts,
         EvalBaseline, EvalConfig,

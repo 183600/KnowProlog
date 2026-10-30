@@ -559,6 +559,9 @@
                         chronicle.kb_revision()
                     );
                     println!("  文件：{}", chronicle.path().display());
+                    if let Some(session) = dialogue_session.as_ref() {
+                        println!("  工件会话：{}", session.uri());
+                    }
                     let recent: Vec<TimelineTurn> = chronicle
                         .entries()
                         .iter()
@@ -572,6 +575,47 @@
                     }
                 }
                 None => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 对话工件索引：会话/轮次/回答/命题/提及/依据的稳定 URI（跨重启可寻址）。
+        if matches!(input, "对话工件" | "工件索引" | "工件") {
+            match (chronicle.as_ref(), dialogue_session.as_ref()) {
+                (Some(chronicle), Some(session)) => {
+                    let index = DialogueArtifactIndex::from_chronicle(session, chronicle);
+                    println!("{}", index.render_report());
+                }
+                (Some(_), None) => println!("对话工件会话标识不可用（见启动警告）。"),
+                _ => println!("编年史不可用（打开失败，见启动警告）。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 工件引用：按 URI 或会话内选择词（上一轮 / 第2点 / 依据）定位语义对象。
+        let artifact_request = if input.starts_with(know_prolog::dialogue_uri::DEFAULT_DIALOGUE_NS)
+        {
+            Some(input)
+        } else {
+            strip_any_prefix(
+                input,
+                &["工件：", "工件:", "工件 ", "引用：", "引用:", "引用 "],
+            )
+        };
+        if let Some(spec) = artifact_request {
+            let spec = spec.trim();
+            match (chronicle.as_ref(), dialogue_session.as_ref()) {
+                (Some(chronicle), Some(session)) if !spec.is_empty() => {
+                    let index = DialogueArtifactIndex::from_chronicle(session, chronicle);
+                    println!("{}", index.render_selector(spec));
+                }
+                (Some(_), Some(_)) => {
+                    println!("用法：工件：<URI|上一轮|第2点|依据>，例如「工件：第2点」。")
+                }
+                (Some(_), None) => println!("对话工件会话标识不可用（见启动警告）。"),
+                _ => println!("编年史不可用（打开失败，见启动警告）。"),
             }
             println!();
             continue;
