@@ -1480,10 +1480,10 @@ impl DialogueManager {
         // 类型未知时仍交给通用规划器（人物默认年龄），不猜测。
         if let Some(prefix) = stripped.strip_suffix("多大") {
             let subject = prefix.trim().trim_end_matches('有').trim();
-            let entity = explicit
-                .iter()
-                .find(|entity| !subject.is_empty() && subject.contains(entity.as_str()))
-                .cloned()
+            let entity = knowledge
+                .entities_in(subject)
+                .into_iter()
+                .next()
                 .or_else(|| {
                     if subject.is_empty() || contains_pronoun(subject) {
                         focus.clone()
@@ -1514,10 +1514,10 @@ impl DialogueManager {
                 continue;
             };
             let subject = prefix.trim().trim_end_matches('有').trim();
-            let entity = explicit
-                .iter()
-                .find(|entity| !subject.is_empty() && subject.contains(entity.as_str()))
-                .cloned()
+            let entity = knowledge
+                .entities_in(subject)
+                .into_iter()
+                .next()
                 .or_else(|| {
                     if subject.is_empty() || contains_pronoun(subject) {
                         focus.clone()
@@ -1547,10 +1547,7 @@ impl DialogueManager {
         // 「A 是 B 的 C」是系表判断（校验方向），不是「A是B」的属性问句。
         if (has_question || !stripped.contains('是')) && !is_copula_relation_statement(stripped) {
             if let Some((head, attribute)) = split_entity_attribute(stripped) {
-                let head_entity = explicit
-                    .iter()
-                    .find(|entity| head.contains(entity.as_str()))
-                    .cloned();
+                let head_entity = knowledge.entities_in(head).into_iter().next();
                 let entity = head_entity.clone().or_else(|| {
                     if head.is_empty() || contains_pronoun(head) {
                         focus.clone()

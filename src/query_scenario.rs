@@ -1002,6 +1002,27 @@ expect = { op = "scan", rows = 3, revision = 2, stale = false, answer_contains =
     }
 
     #[test]
+    fn injected_alias_is_visible_to_dialogue() {
+        let scenario = parse_scenario(
+            r#"
+name = "别名增量"
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226" }
+
+[[turns]]
+input = "明哥的身高是多少？"
+add_aliases = [{ surface = "明哥", canonical = "姚明" }]
+expect = { answered = true, revision = 2, focus = "姚明", answer_contains = ["226"] }
+"#,
+        )
+        .expect("别名剧本应可解析");
+        let report = run_scenario(&scenario);
+        assert!(report.passed, "{}", report.render_text());
+    }
+
+    #[test]
     fn injected_alias_resolves_to_canonical_entity() {
         let scenario = parse_scenario(INCREMENTAL_SCENARIO).expect("增量剧本应可解析");
         let knowledge = ScenarioKnowledge::from_scenario(&scenario);
