@@ -585,6 +585,62 @@ impl AttributeRegistry {
     }
 }
 
+/// 单位化属性问句的解析结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeRequest {
+    pub subject: String,
+    pub attribute: String,
+    pub surface: String,
+    /// 用户显式要求的单位（如「多少厘米」中的「厘米」）。
+    pub unit: Option<String>,
+}
+
+impl AttributeRegistry {
+    /// 解析「主体 + 已登记属性词面 + 单位问句」。
+    ///
+    /// 只有问句里出现显式单位时才返回 `Some(unit)`；无单位问句交给既有
+    /// 属性回答路径，避免本模块抢占普通「X 的身高是多少」。
+    pub fn parse_request(&self, question: &str) -> Option<AttributeRequest> {
+        if !crate::function_words::contains_question_marker(question) {
+            return None;
+        }
+        let (surface, attribute, start, end) = self.find_first_surface(question)?;
+        let profile = self.resolve(&attribute)?;
+        let subject = clean_subject(&question[..start]);
+        if subject.is_empty() {
+            return None;
+        }
+        let suffix = &question[end..];
+        let unit = find_requested_unit(suffix, profile)?;
+        Some(AttributeRequest {
+            subject,
+            attribute: profile.canonical.clone(),
+            surface,
+            unit: Some(unit),
+        })
+    }
+}
+
+fn find_requested_unit(suffix: &str, profile: &AttributeProfile) -> Option<String> {
+    let mut best: Option<(&'static str, usize)> = None;
+    for (alias, unit) in crate::quantity::UNITS {
+        if profile
+            .dimension
+            .is_some_and(|dimension| dimension != unit.dimension)
+        {
+            continue;
+        }
+        if !suffix.contains(alias) {
+            continue;
+        }
+        let length = alias.chars().count();
+        if best.is_none_or(|(_, best_length)| length > best_length) {
+            best = Some((alias, length));
+        }
+    }
+    best.map(|(alias, _)| alias.to_string())
+}
+
 fn normalize_key(text: &str) -> String {
     text.trim().to_lowercase()
 }
@@ -1132,4 +1188,174 @@ mod tests {
             .iter()
             .any(|issue| issue.detail.contains("父属性")));
     }
+    fn extraction_config() -> crate::SystemConfig {
+        toml::from_str(
+            r#"
+[system]
+oxigraph_endpoint = "http://localhost:7878"
+oxigraph_store_path = "oxigraph_data"
+default_language = "zh"
+
+[nlp]
+import_keywords = ["录入"]
+pos_dict = {}
+[nlp.name_patterns]
+prefixes = []
+suffixes = []
+full_names = []
+profession_suffix = []
+
+[[entity_types]]
+label = "Person"
+examples = []
+[[entity_types.properties]]
+name = "name"
+data_type = "string"
+required = true
+
+[[extraction_rules]]
+name = "无"
+entity_type = "Person"
+patterns = []
+priority = 0
+
+[[prolog_rules]]
+name = "属性查询"
+pattern = ["nr"]
+query_type = "property_query"
+priority = 1
+
+[messages]
+startup = ""
+ready = ""
+query_prompt = ""
+import_prompt = ""
+quit_prompt = ""
+importing = ""
+no_knowledge_extracted = ""
+cannot_understand = ""
+process_error = ""
+
+[attributes]
+enabled = true
+[[attributes.profiles]]
+name = "height"
+aliases = ["身高"]
+domain = ["Person"]
+value_type = "quantity"
+dimension = "length"
+unit = "厘米"
+functional = true
+
+[[attributes.profiles]]
+name = "net_height"
+aliases = ["净身高"]
+domain = ["Person"]
+value_type = "quantity"
+dimension = "length"
+unit = "厘米"
+parent = "height"
+"#,
+        )
+        .expect("最小配置必须可解析")
+    }
+
+    #[test]
+    fn knowledge_extractor_emits_normalized_attribute_fact() {
+        let config = std::sync::Arc::new(extraction_config());
+        let extractor = crate::KnowledgeExtractor::new(config);
+        let tagged = vec![
+            TaggedWord {
+                text: "姚明".to_string(),
+                pos: "nr".to_string(),
+            },
+            TaggedWord {
+                text: "身高".to_string(),
+                pos: "unknown".to_string(),
+            },
+        ];
+        let items = extractor.extract("姚明的身高是2.26米", &tagged);
+        assert_eq!(items.len(), 1, "{:?}", items);
+        match &items[0] {
+            crate::KnowledgeItem::Entity { label, properties } => {
+                assert_eq!(label, "Person");
+                assert_eq!(properties.get("name").map(String::as_str), Some("姚明"));
+                assert_eq!(
+                    properties.get("height").map(String::as_str),
+                    Some("226厘米")
+                );
+            }
+            other => panic!("期望实体项，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn attribute_value_overrides_rule_value_for_same_subject() {
+        let mut items = vec![crate::KnowledgeItem::Entity {
+            label: "Person".to_string(),
+            properties: [
+                ("name".to_string(), "姚明".to_string()),
+                ("height".to_string(), "226".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }];
+        crate::merge_attribute_item(
+            &mut items,
+            crate::KnowledgeItem::Entity {
+                label: "Person".to_string(),
+                properties: [
+                    ("name".to_string(), "姚明".to_string()),
+                    ("height".to_string(), "226厘米".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        );
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            crate::KnowledgeItem::Entity { properties, .. } => {
+                assert_eq!(
+                    properties.get("height").map(String::as_str),
+                    Some("226厘米")
+                );
+            }
+            other => panic!("期望实体项，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn request_parser_requires_question_and_explicit_unit() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let request = registry
+            .parse_request("姚明的身高是多少厘米？")
+            .expect("应识别单位化属性问句");
+        assert_eq!(request.subject, "姚明");
+        assert_eq!(request.attribute, "height");
+        assert_eq!(request.unit.as_deref(), Some("厘米"));
+
+        let meters = registry.parse_request("姚明身高多少米").unwrap();
+        assert_eq!(meters.unit.as_deref(), Some("米"));
+
+        assert!(
+            registry.parse_request("姚明的身高是多少").is_none(),
+            "无显式单位不抢答"
+        );
+        assert!(
+            registry.parse_request("姚明身高2.26米").is_none(),
+            "陈述句不是问句"
+        );
+    }
+
+    #[test]
+    fn shipped_config_compiles_attribute_profiles_without_issues() {
+        let config: crate::SystemConfig =
+            toml::from_str(include_str!("../config.toml")).expect("config.toml 必须可解析");
+        let registry = AttributeRegistry::from_config(&config.attributes);
+        assert!(registry.issues().is_empty(), "{:?}", registry.issues());
+        assert!(registry.resolve("身高").is_some());
+        assert!(registry.resolve("净身高").is_some());
+        assert_eq!(registry.ancestors("净身高"), vec!["height".to_string()]);
+    }
+
 }

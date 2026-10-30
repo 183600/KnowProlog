@@ -433,6 +433,39 @@
     }
 
     #[test]
+    fn attribute_unit_request_converts_stored_quantity() {
+        use crate::attribute_bridge::{
+            AttributeBridgeConfig, AttributeProfileConfig, AttributeRegistry, AttributeValueType,
+        };
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.attribute_profiles = AttributeRegistry::from_config(&AttributeBridgeConfig {
+            enabled: true,
+            profiles: vec![AttributeProfileConfig {
+                name: "height".to_string(),
+                aliases: vec!["身高".to_string()],
+                domain: vec!["人".to_string()],
+                value_type: AttributeValueType::Quantity,
+                dimension: Some("length".to_string()),
+                unit: Some("厘米".to_string()),
+                ..Default::default()
+            }],
+        });
+        reasoner.observe_facts(&attribute_facts());
+
+        let meters = reasoner.answer("姚明身高多少米").expect("应回答单位化问句");
+        assert!(meters.contains("2.26米"), "{meters}");
+        let centimeters = reasoner
+            .answer("姚明身高多少厘米")
+            .expect("应回答单位化问句");
+        assert!(centimeters.contains("226厘米"), "{centimeters}");
+        assert!(
+            reasoner.answer("姚明身高是多少").is_some(),
+            "无显式单位仍走既有属性回答路径"
+        );
+    }
+
+    #[test]
     fn type_memory_answers_profiles_comparisons_and_members() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         let mut person_properties = HashMap::new();

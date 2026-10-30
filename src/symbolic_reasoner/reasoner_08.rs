@@ -359,6 +359,52 @@ impl SymbolicReasoner {
         Some(output.trim_end().to_string())
     }
 
+    /// 按用户显式要求的单位回答已登记的数量属性。
+    ///
+    /// 只在问句同时命中「属性档案词面」与「显式单位」时接管；无单位问句、
+    /// 未知主体或无法解析的取值都返回 `None`，交回既有回答阶梯。
+    pub fn answer_attribute_unit(&self, question: &str) -> Option<String> {
+        let request = self.attribute_profiles.parse_request(question)?;
+        let requested_unit = request.unit.as_deref()?;
+        let entity = self.aligner.canonical_form(&request.subject);
+        if !self.is_known_entity(&entity) && !self.generator.is_known_entity(&entity) {
+            return None;
+        }
+        let profile = self.attribute_profiles.profile(&request.attribute)?;
+        let mut keys = vec![profile.canonical.clone()];
+        keys.extend(profile.aliases.iter().cloned());
+        if let Some(label) =
+            crate::symbolic_generator::localized_predicate_key(&profile.canonical)
+        {
+            keys.push(label.to_string());
+        }
+        if let Some(canonical) =
+            crate::symbolic_generator::canonical_predicate_key(&request.surface)
+        {
+            keys.push(canonical.to_string());
+        }
+        keys.sort();
+        keys.dedup();
+
+        let mut values = BTreeSet::new();
+        for key in &keys {
+            values.extend(self.generator.attribute_values(&entity, key));
+        }
+        if values.is_empty() {
+            return None;
+        }
+        let mut rendered = Vec::with_capacity(values.len());
+        for raw in values {
+            rendered.push(render_quantity_in_requested_unit(&raw, requested_unit, profile)?);
+        }
+        Some(format!(
+            "根据知识图谱，{}的{}是{}。",
+            entity,
+            request.surface,
+            rendered.join("、")
+        ))
+    }
+
     pub fn answer(&self, question: &str) -> Option<String> {
         self.semantic.begin(question);
         let rewritten = self.rewrite_predicate_alignment(question);
@@ -433,6 +479,9 @@ impl SymbolicReasoner {
         // 悄悄降级成普通确证回答。
         if let Some(answer) = self.answer_probabilistic_intent(question) {
             return Some(answer);
+        }
+        if let Some(answer) = self.answer_attribute_unit(question) {
+            return Some(self.annotate_assumption_world(answer));
         }
         if let Some(answer) = crate::type_memory::answer_with_schema(
             &self.generator,
@@ -778,6 +827,9 @@ impl SymbolicReasoner {
             return Some(answer);
         }
         if let Some(answer) = self.answer_probabilistic_intent(question) {
+            return Some(answer);
+        }
+        if let Some(answer) = self.answer_attribute_unit(question) {
             return Some(answer);
         }
         if let Some(answer) = crate::type_memory::answer_with_schema(
@@ -1683,3 +1735,36 @@ impl SymbolicReasoner {
         output.trim_end().to_string()
     }
 }
+
+/// 把库里的一条取值换算成用户请求的单位。
+///
+/// 老数据可能只存裸数字：此时按档案声明的单位补全再换算；取值与请求
+/// 量纲不一致则拒绝，避免把「226」误当成 226 米。
+fn render_quantity_in_requested_unit(
+    raw: &str,
+    requested_unit: &str,
+    profile: &crate::attribute_bridge::AttributeProfile,
+) -> Option<String> {
+    let mut quantity = crate::quantity::parse_quantity(raw);
+    if quantity
+        .as_ref()
+        .is_none_or(|parsed| parsed.dimension() == crate::quantity::Dimension::Count)
+    {
+        if let (Some(unit), Some(dimension)) = (&profile.unit, profile.dimension) {
+            if let Some(parsed) = crate::quantity::parse_quantity(&format!("{raw}{unit}")) {
+                if parsed.dimension() == dimension {
+                    quantity = Some(parsed);
+                }
+            }
+        }
+    }
+    let quantity = quantity?;
+    if profile
+        .dimension
+        .is_some_and(|dimension| dimension != quantity.dimension())
+    {
+        return None;
+    }
+    quantity.format_in_unit(requested_unit)
+}
+

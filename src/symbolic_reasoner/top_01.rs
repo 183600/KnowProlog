@@ -1340,6 +1340,8 @@ pub struct SymbolicReasoner {
     attributes: HashSet<(String, String, String)>,
     // 属性查询索引：规范槽位 `(实体, 属性)` → 取值列表（随知识重建）
     attribute_index: HashMap<(String, String), Vec<String>>,
+    // 属性本体档案：属性别名、量纲与规范单位；回答侧据此做单位化。
+    attribute_profiles: crate::attribute_bridge::AttributeRegistry,
     // 关联规则挖掘器（类型/谓词/属性篮子的支持度-置信度-提升度）
     associations: AssociationMiner,
     // 一阶归结引擎（事实 + 链接预测规则 + 关联规则）

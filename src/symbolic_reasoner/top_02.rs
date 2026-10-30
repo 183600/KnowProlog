@@ -34,6 +34,7 @@ impl Clone for SymbolicReasoner {
             contextual_memory: self.contextual_memory.clone(),
             attributes: self.attributes.clone(),
             attribute_index: self.attribute_index.clone(),
+            attribute_profiles: self.attribute_profiles.clone(),
             associations: self.associations.clone(),
             resolver: self.resolver.clone(),
             abduction: self.abduction.clone(),

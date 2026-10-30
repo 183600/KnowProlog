@@ -174,6 +174,7 @@ impl SymbolicReasoner {
             contextual_memory: ReadingMemory::new(512),
             attributes: HashSet::new(),
             attribute_index: HashMap::new(),
+            attribute_profiles: crate::attribute_bridge::AttributeRegistry::default(),
             associations,
             resolver,
             abduction,
@@ -244,6 +245,7 @@ impl SymbolicReasoner {
         let lexical_memory = self.lexical_memory.clone();
         let mention_lexicon = self.mention_lexicon.clone();
         let contextual_memory = self.contextual_memory.clone();
+        let attribute_profiles = self.attribute_profiles.clone();
         let rewrite_book = self.rewrite_book.clone();
         let schema_view = self.schema_view.clone();
         let mut fresh =
@@ -257,6 +259,7 @@ impl SymbolicReasoner {
         fresh.observe_facts(facts);
         fresh.lexical_memory = lexical_memory;
         fresh.contextual_memory = contextual_memory;
+        fresh.attribute_profiles = attribute_profiles;
         // 快照来自自身：胶囊公理摘要必然通过（除非内存中的快照被外部改写）。
         // 万一被拒，也保留新图谱与其余会话态，不让重建失败丢掉知识。
         let _ = fresh.restore_dialogue_snapshot(&snapshot);
@@ -370,6 +373,8 @@ impl SymbolicReasoner {
     /// 这类撤销应由重启按新配置重建。
     pub fn apply_language_policy(&mut self, config: &SystemConfig) -> LanguagePolicySync {
         let mut sync = LanguagePolicySync::default();
+        self.attribute_profiles =
+            crate::attribute_bridge::AttributeRegistry::from_config(&config.attributes);
         if let Some(synonyms) = &config.synonyms {
             for (alias, canonical) in &synonyms.mappings {
                 let (alias, canonical) = (alias.trim(), canonical.trim());
