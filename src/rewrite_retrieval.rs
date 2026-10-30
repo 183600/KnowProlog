@@ -135,13 +135,12 @@ impl HypothesisCandidate {
         self
     }
 
-    /// 去重键：同一逻辑计划只让最可靠的来源参赛。
+    /// 去重键：同一规范查询身份只让最可靠的来源参赛。
+    ///
+    /// 关系核心能识别「张三的师傅是谁」与「张三师傅谁」这类计划形状
+    /// 不同、逻辑问题相同的读法；超出核心的计划退回原计划键。
     pub fn key(&self) -> String {
-        format!(
-            "{}|{}",
-            QueryPlanner::kind(&self.plan),
-            QueryPlanner::format_plan(&self.plan)
-        )
+        crate::query_canonical::plan_key(&self.plan, &crate::query_canonical::CanonicalSchema::new())
     }
 
     pub fn receipt(&self) -> String {
@@ -1406,6 +1405,30 @@ mod tests {
             ],
         );
         assert_eq!(assessment.hypotheses.len(), 1);
+        assert_eq!(
+            assessment.hypotheses[0].candidate.source,
+            HypothesisSource::ExactPlan
+        );
+    }
+
+    #[test]
+    fn semantically_equal_plan_shapes_are_deduplicated() {
+        let exact = HypothesisCandidate::new(
+            HypothesisSource::ExactPlan,
+            "planner",
+            "张三的师傅是谁",
+            QueryPlan::FindObject {
+                segments: vec!["张三".to_string(), "师傅".to_string()],
+            },
+        );
+        let rewritten = candidate(HypothesisSource::SyntaxRewrite, "张三", "师傅");
+        let assessment = assess_with_retriever("张三的师傅是谁", vec![rewritten, exact]);
+        assert_eq!(
+            assessment.hypotheses.len(),
+            1,
+            "{}",
+            assessment.render_report()
+        );
         assert_eq!(
             assessment.hypotheses[0].candidate.source,
             HypothesisSource::ExactPlan
