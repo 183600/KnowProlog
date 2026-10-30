@@ -1226,12 +1226,24 @@ where
         if !entries.is_empty() {
             set.entries = entries;
             set.cursor = 0;
-            set.kind = format!("有界重查:{}", set.kind);
+            mark_requeried(set);
             set.receipts.push(outcome.receipt.render_text());
             return render_refined(set, needle, before, true);
         }
+        mark_requeried(set);
+        set.receipts.push(outcome.receipt.render_text());
+        return format!(
+            "上一轮结果集里没有包含「{}」；有界重查也未找到匹配条目（检索失败不等于不存在）。",
+            needle
+        );
     }
     format!("上一轮结果集里没有包含「{}」的条目。", needle)
+}
+
+fn mark_requeried(set: &mut ResultSet) {
+    if !set.kind.starts_with("有界重查:") {
+        set.kind = format!("有界重查:{}", set.kind);
+    }
 }
 
 fn render_refined(set: &ResultSet, needle: &str, before: usize, requeried: bool) -> String {
@@ -1945,6 +1957,31 @@ mod tests {
             .expect("应有上一轮结果集");
         assert!(refined.contains("细化"), "{}", refined);
         assert!(refined.contains("钱七"), "{}", refined);
+    }
+
+    #[test]
+    fn refine_reports_requery_without_matches() {
+        let mut session = session();
+        let outcome = PortOutcome {
+            hits: vec![search_hit("张三", "师傅", "孙八")],
+            receipt: PortReceipt {
+                returned: 1,
+                notes: vec!["重查回执".to_string()],
+                ..PortReceipt::default()
+            },
+            batches: Vec::new(),
+        };
+        let refined = session
+            .respond_with(&FollowUpAction::Refine("周九".to_string()), |_, _| {
+                Some(outcome)
+            })
+            .expect("应有上一轮结果集");
+        assert!(refined.contains("有界重查也未找到"), "{}", refined);
+        assert!(refined.contains("周九"), "{}", refined);
+        let last = session.last().expect("应保留上一轮结果集");
+        assert_eq!(last.entries.len(), 3);
+        assert!(last.kind.starts_with("有界重查"), "{}", last.kind);
+        assert!(last.receipts.iter().any(|receipt| receipt.contains("重查回执")));
     }
 
     #[test]
