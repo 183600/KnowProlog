@@ -655,26 +655,6 @@ fn run_open_closure(
     }
 }
 
-fn parse_coref_operator(raw: &str) -> Option<ClosureOp> {
-    let raw = raw.trim().to_ascii_lowercase();
-    match raw.as_str() {
-        "plus" | "+" | "传递" => Some(ClosureOp::Plus),
-        "star" | "*" | "自反" => Some(ClosureOp::Star),
-        other => {
-            let digits = other
-                .strip_prefix("exact:")
-                .or_else(|| other.strip_prefix("exact="))
-                .or_else(|| other.strip_prefix("exact"))
-                .unwrap_or(other);
-            digits
-                .parse::<usize>()
-                .ok()
-                .filter(|hops| *hops > 0)
-                .map(ClosureOp::Exact)
-        }
-    }
-}
-
 /// `coref`：只读证据 JSON，输出身份等价类、歧义/类型守卫与商图闭包。
 fn run_coref(
     file_path: &str,
@@ -729,7 +709,7 @@ fn run_coref(
     }
 
     if let Some(start) = closure {
-        let Some(operator) = parse_coref_operator(operator) else {
+        let Some(operator) = ClosureOp::parse(operator) else {
             eprintln!(
                 "无法识别的闭包算子：{}（可用 plus / star / exact:N）",
                 operator

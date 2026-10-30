@@ -33,6 +33,27 @@ impl ClosureOp {
             ClosureOp::Plus | ClosureOp::Star => max_depth,
         }
     }
+
+    /// 解析用户词面：`plus`/`star`/`exact:N`，同时接受 `+`、`*` 与中文别名。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim().to_ascii_lowercase();
+        match raw.as_str() {
+            "plus" | "+" | "传递" => Some(ClosureOp::Plus),
+            "star" | "*" | "自反" => Some(ClosureOp::Star),
+            other => {
+                let digits = other
+                    .strip_prefix("exact:")
+                    .or_else(|| other.strip_prefix("exact="))
+                    .or_else(|| other.strip_prefix("exact"))
+                    .unwrap_or(other);
+                digits
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|hops| *hops > 0)
+                    .map(ClosureOp::Exact)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,5 +521,21 @@ mod tests {
             ordered.last().map(|(name, hops)| (*name, *hops)),
             Some(("戊", 4))
         );
+    }
+
+    #[test]
+    fn operator_parse_accepts_english_chinese_and_exact_forms() {
+        assert_eq!(ClosureOp::parse("plus"), Some(ClosureOp::Plus));
+        assert_eq!(ClosureOp::parse("+"), Some(ClosureOp::Plus));
+        assert_eq!(ClosureOp::parse("传递"), Some(ClosureOp::Plus));
+        assert_eq!(ClosureOp::parse("star"), Some(ClosureOp::Star));
+        assert_eq!(ClosureOp::parse("*"), Some(ClosureOp::Star));
+        assert_eq!(ClosureOp::parse("自反"), Some(ClosureOp::Star));
+        assert_eq!(ClosureOp::parse("exact:2"), Some(ClosureOp::Exact(2)));
+        assert_eq!(ClosureOp::parse("exact=3"), Some(ClosureOp::Exact(3)));
+        assert_eq!(ClosureOp::parse("exact4"), Some(ClosureOp::Exact(4)));
+        assert_eq!(ClosureOp::parse("4"), Some(ClosureOp::Exact(4)));
+        assert_eq!(ClosureOp::parse("exact:0"), None);
+        assert_eq!(ClosureOp::parse("sometimes"), None);
     }
 }
