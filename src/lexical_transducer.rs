@@ -358,7 +358,7 @@ impl LexicalTransducer {
             if entry.status != LexiconStatus::Confirmed || entry.surface == entry.canonical {
                 continue;
             }
-            let kind = if entry.pos.starts_with('v') {
+            let kind = if crate::pos_ontology::profile(&entry.pos).is_verbal() {
                 SynonymKind::Predicate
             } else {
                 SynonymKind::Entity
@@ -979,7 +979,7 @@ fn kind_hint(
         };
         if span.start < raw.end && raw.start < span.end {
             seen = true;
-            if word.pos.starts_with('v') {
+            if crate::pos_ontology::profile(&word.pos).is_verbal() {
                 verb = true;
             }
         }

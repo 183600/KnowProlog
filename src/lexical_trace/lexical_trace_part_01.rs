@@ -1406,7 +1406,7 @@ fn span_has_unknown_token(tokens: &[TraceToken], span: TextSpan) -> bool {
 /// 「叶莉」时，其中一个 token 已被词性标注为人名；离线审计不应再把这种
 /// 已被消费的碎片报成世界缺口。
 fn span_has_name_evidence(tokens: &[TraceToken], span: TextSpan) -> bool {
-    tokens_in_span(tokens, span).any(|token| token.pos.starts_with("nr"))
+    tokens_in_span(tokens, span).any(|token| crate::pos_ontology::tag_matches("nr", &token.pos))
 }
 fn span_unknown_surfaces(tokens: &[TraceToken], span: TextSpan) -> Vec<String> {
     let mut surfaces: Vec<String> = tokens_in_span(tokens, span)

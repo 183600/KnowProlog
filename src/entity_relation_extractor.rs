@@ -562,7 +562,7 @@ impl EntityRelationExtractor {
                     name.push_str(word);
                     continue;
                 }
-                if tag_text.starts_with("nr") {
+                if crate::pos_ontology::tag_matches("nr", tag_text) {
                     name.push_str(word);
                     continue;
                 }
@@ -571,7 +571,7 @@ impl EntityRelationExtractor {
             if name.chars().count() >= 4 {
                 break;
             }
-            if tag_text.starts_with("nr") {
+            if crate::pos_ontology::tag_matches("nr", tag_text) {
                 name.push_str(word);
                 continue;
             }

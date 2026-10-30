@@ -536,7 +536,7 @@ where
     use crate::synonym_graph::{SynonymKind, SynonymResolution};
 
     for word in &mut words {
-        let kind = if word.pos.starts_with('v') {
+        let kind = if crate::pos_ontology::profile(&word.pos).is_verbal() {
             SynonymKind::Predicate
         } else {
             SynonymKind::Entity
