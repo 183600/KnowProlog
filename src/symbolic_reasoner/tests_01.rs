@@ -1718,6 +1718,28 @@
     }
 
     #[test]
+    fn search_session_answers_table_followups_from_recorded_bindings() {
+        let mut reasoner = SymbolicReasoner::new(search_session_config(), HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+        reasoner
+            .answer_contextual("张三的师傅是谁")
+            .expect("首轮应装配多值槽位");
+
+        let count = reasoner.answer("一共几个").expect("绑定表应能计数");
+        assert!(count.contains("3 行"), "{}", count);
+        assert!(count.contains("未证明完整"), "{}", count);
+
+        let top = reasoner.answer("前2个").expect("绑定表应能截取前 k");
+        assert!(top.contains("2 行"), "{}", top);
+        assert!(top.contains("李四"), "{}", top);
+
+        let sorted = reasoner.answer("按师傅排序").expect("绑定表应能排序");
+        assert!(sorted.contains("绑定表"), "{}", sorted);
+        assert!(sorted.contains("覆盖"), "{}", sorted);
+        assert!(sorted.contains("师傅(张三"), "{}", sorted);
+    }
+
+    #[test]
     fn search_session_refine_requeries_beyond_current_set() {
         let mut reasoner = SymbolicReasoner::new(search_session_config(), HashMap::new());
         reasoner.observe_facts(&search_session_facts());
