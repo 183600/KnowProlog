@@ -769,6 +769,7 @@ fn sigmoid(value: f64) -> f64 {
     1.0 / (1.0 + (-value).exp())
 }
 
+#[cfg(test)]
 fn normalise_candidates(candidates: Vec<HypothesisCandidate>) -> Vec<HypothesisCandidate> {
     normalise_candidates_with_schema(candidates, &CanonicalSchema::new())
 }

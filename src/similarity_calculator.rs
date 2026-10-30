@@ -44,6 +44,40 @@ pub struct SimilarityCalculator {
     idf_cache: Arc<RwLock<HashMap<String, f64>>>,
 }
 
+/// 双行动态规划编辑距离：较短字符串作为列方向，复用线程本地缓冲。
+pub(crate) fn levenshtein_distance(s1: &str, s2: &str) -> usize {
+    LEVENSHTEIN_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (chars1, chars2, prev, curr) = &mut *scratch;
+        chars1.clear();
+        chars1.extend(s1.chars());
+        chars2.clear();
+        chars2.extend(s2.chars());
+        let (rows, cols) = if chars1.len() <= chars2.len() {
+            (&*chars1, &*chars2)
+        } else {
+            (&*chars2, &*chars1)
+        };
+        let col_count = cols.len();
+
+        prev.clear();
+        prev.extend(0..=col_count);
+        curr.clear();
+        curr.resize(col_count + 1, 0);
+
+        for (i, row_char) in rows.iter().enumerate() {
+            curr[0] = i + 1;
+            for j in 1..=col_count {
+                let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
+                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            }
+            std::mem::swap(prev, curr);
+        }
+
+        prev[col_count]
+    })
+}
+
 impl SimilarityCalculator {
     pub fn new() -> Self {
         let jieba = crate::nlp::shared_jieba();
@@ -278,37 +312,7 @@ impl SimilarityCalculator {
     }
 
     fn levenshtein_distance(&self, s1: &str, s2: &str) -> usize {
-        // 双行动态规划：将较短字符串作为列方向；复用线程本地缓冲
-        LEVENSHTEIN_SCRATCH.with(|cell| {
-            let mut scratch = cell.borrow_mut();
-            let (chars1, chars2, prev, curr) = &mut *scratch;
-            chars1.clear();
-            chars1.extend(s1.chars());
-            chars2.clear();
-            chars2.extend(s2.chars());
-            let (rows, cols) = if chars1.len() <= chars2.len() {
-                (&*chars1, &*chars2)
-            } else {
-                (&*chars2, &*chars1)
-            };
-            let col_count = cols.len();
-
-            prev.clear();
-            prev.extend(0..=col_count);
-            curr.clear();
-            curr.resize(col_count + 1, 0);
-
-            for (i, row_char) in rows.iter().enumerate() {
-                curr[0] = i + 1;
-                for j in 1..=col_count {
-                    let cost = if *row_char == cols[j - 1] { 0 } else { 1 };
-                    curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-                }
-                std::mem::swap(prev, curr);
-            }
-
-            prev[col_count]
-        })
+        levenshtein_distance(s1, s2)
     }
 
     async fn tfidf_similarity_from_words(&self, words1: &[&str], words2: &[&str]) -> f64 {

@@ -31,6 +31,7 @@
 //! - 义务按稳定 id 排序，报告与摘要可逐字节复现；
 //! - 默认最多 256 条义务，超出显式标记截断（截断 ≠ 通过）。
 
+use crate::context_image::fnv1a_hex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -1073,17 +1074,7 @@ fn digest(report: &FulfillmentReport) -> String {
             entry.predicate, entry.occurrences
         ));
     }
-    fnv1a(material.as_bytes())
-}
-
-/// FNV-1a：只用于报告摘要，不用于安全用途。
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:016x}", hash)
+    fnv1a_hex(material.as_bytes())
 }
 
 #[cfg(test)]

@@ -1,3 +1,15 @@
+//! KnowProlog 核心库。
+//!
+//! 库按职责划分为若干层，公开模块供 CLI、HTTP 服务与集成测试共同使用：
+//!
+//! - **语言与理解**：`nlp`、`question_analyzer`、`advanced_nlu`、`kg_pattern` 等；
+//! - **抽取与存储**：`entity_relation_extractor`、`OxigraphManager`（本文件分片实现）；
+//! - **推理与规划**：`prolog_engine`、`resolution_engine`、`planning`、`query_planner`；
+//! - **对话与恢复**：`dialogue_manager`、`contextual_reference`、`recovery`；
+//! - **质量与观测**：`quality`、`release`、`perf_ledger`、`provenance`。
+//!
+//! 模块声明保持字典序，便于查找；实现细节按功能拆分到 `lib/` 下的分片文件。
+
 #![forbid(unsafe_code)]
 
 use oxigraph::model::*;
@@ -10,10 +22,9 @@ use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use toml;
 use uuid::Uuid;
 
-// 使模块公开，以便 main.rs 和 tests 可以访问
+// 公开模块：CLI、HTTP 服务与集成测试共享同一套类型与行为。
 pub mod abduction;
 pub mod advanced_nlu;
 pub mod alignment_memory;
@@ -200,7 +211,11 @@ pub mod working_memory;
 #[cfg(test)]
 mod dialogue_conformance;
 
+// 配置、抽取规则、RDF 查询结果与通用辅助。
 include!("lib/lib_part_01.rs");
+// OxigraphManager：JSON-LD/RDF 导入、批次写入、查询与导出。
 include!("lib/lib_part_02.rs");
+// 直答缓存与事实快照相关实现。
 include!("lib/lib_part_03.rs");
+// 查询实体提取、响应格式化、配置加载与输入模式判定。
 include!("lib/lib_part_04.rs");

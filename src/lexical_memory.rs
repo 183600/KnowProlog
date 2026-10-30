@@ -16,6 +16,7 @@
 //!   - 容量有界，按最近使用轮次与观察次数淘汰；
 //!   - 落图是幂等全量重写，使用独立命名图与账本命名空间，不污染知识图谱。
 
+use crate::context_image::short_hash;
 use std::collections::BTreeMap;
 
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
@@ -834,15 +835,6 @@ fn token_key(word: &AnnotatedWord) -> String {
 
 fn evidence_id(text: &str) -> String {
     short_hash(text)
-}
-
-fn short_hash(text: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:016x}{:x}", hash, text.len())
 }
 
 fn literal_quad(

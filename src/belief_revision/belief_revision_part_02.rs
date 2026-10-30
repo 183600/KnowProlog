@@ -270,7 +270,7 @@ fn state_digest(engine: &ResolutionEngine) -> String {
         material.push_str(&rule);
         material.push('\n');
     }
-    fnv1a(material.as_bytes())
+    fnv1a_hex(material.as_bytes())
 }
 fn atom_key(atom: &Atom) -> String {
     atom.display()
@@ -321,15 +321,6 @@ fn clip(text: &str, max_chars: usize) -> String {
     out.push('…');
     out
 }
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
-}
-
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------

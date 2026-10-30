@@ -559,16 +559,8 @@ impl SparseVector {
         for (key, value) in self.top(MAX_CONTEXT_FEATURES) {
             let _ = write!(canonical, "{}={:.4};", key, value);
         }
-        format!("{:016x}", fnv1a(canonical.as_bytes()))
+        format!("{:016x}", crate::context_image::fnv1a64(canonical.as_bytes()))
     }
-}
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct SurfaceReading {

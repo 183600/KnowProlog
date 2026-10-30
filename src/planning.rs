@@ -1,3 +1,4 @@
+use crate::context_image::fnv1a_hex;
 use std::collections::BTreeSet;
 
 pub const MAX_TRACE_STEPS: usize = 64;
@@ -213,7 +214,7 @@ impl PlanTrace {
         material.push_str(&self.visited.to_string());
         material.push('|');
         material.push_str(&self.frontier_peak.to_string());
-        fnv1a(material.as_bytes())
+        fnv1a_hex(material.as_bytes())
     }
 
     pub fn render_text(&self) -> String {
@@ -255,15 +256,6 @@ impl PlanRun {
     pub fn new(text: Option<String>, trace: PlanTrace) -> Self {
         Self { text, trace }
     }
-}
-
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:016x}", hash)
 }
 
 #[cfg(test)]

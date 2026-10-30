@@ -13,6 +13,7 @@
 //! 律典只读图谱事实，不写知识库；持久化写入是显式动作（`--save`），
 //! 启动时只回放已保存的显式采纳/退役决定，不重新审判知识库。
 
+use crate::context_image::fnv1a_hex;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -637,7 +638,7 @@ impl LawBook {
             material.push_str(&law.counterexample_count.to_string());
             material.push('\n');
         }
-        fnv1a(material.as_bytes())
+        fnv1a_hex(material.as_bytes())
     }
 
     /// 审计：功能谓词多值 = 矛盾；传递闭包缺口 / 显式互逆缺口 = 可物化缺口。
@@ -1008,16 +1009,6 @@ fn raw_edges(triples: &[Triple]) -> BTreeMap<String, BTreeSet<(String, String)>>
             .insert((triple.subject.clone(), triple.object.clone()));
     }
     edges
-}
-
-/// FNV-1a：小、稳定、无依赖；只用于账本摘要，不用于安全用途。
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:016x}", hash)
 }
 
 #[cfg(test)]

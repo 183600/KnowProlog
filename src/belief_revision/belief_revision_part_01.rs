@@ -1,3 +1,4 @@
+use crate::context_image::fnv1a_hex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use crate::law_book::{LawBook, LawKind};
@@ -120,7 +121,7 @@ impl ChangeSet {
             material.push_str(&op.canonical());
             material.push('\n');
         }
-        format!("cs:{}", fnv1a(material.as_bytes()))
+        format!("cs:{}", fnv1a_hex(material.as_bytes()))
     }
 
     pub fn render_zh(&self) -> String {
@@ -1007,7 +1008,7 @@ impl BeliefState {
         let id = format!(
             "plan:{}:{}",
             self.revision,
-            fnv1a(format!("{}|{}", changeset.fingerprint(), digest).as_bytes())
+            fnv1a_hex(format!("{}|{}", changeset.fingerprint(), digest).as_bytes())
         );
 
         RevisionPlan {
@@ -1051,7 +1052,7 @@ impl BeliefState {
         let id = format!(
             "commit:{}:{}",
             new_revision,
-            fnv1a(format!("{}|{}", plan.changeset.fingerprint(), digest).as_bytes())
+            fnv1a_hex(format!("{}|{}", plan.changeset.fingerprint(), digest).as_bytes())
         );
         let receipt = CommitReceipt {
             id,

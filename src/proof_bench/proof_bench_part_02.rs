@@ -1,3 +1,4 @@
+use crate::context_image::fnv1a_hex;
 fn run_scenario(
     scenario: &Scenario,
     facts: &[Fact],
@@ -758,14 +759,6 @@ pub fn corpus_digest(scenarios: &[Scenario]) -> String {
         }
     }
     fnv1a_hex(canonical.as_bytes())
-}
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
 }
 /// 导出为纯 Prolog 事实，供第三方 `consult` 后独立审计。
 ///

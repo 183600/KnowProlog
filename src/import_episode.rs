@@ -13,6 +13,7 @@
 //!     「前 N / 共 M」，样例绝不伪装成全量；
 //!   - **只做模板组合**：每句都可回溯到 `[B{seq}-{ordinal}]`，不猜、不补全。
 
+use crate::context_image::short_hash;
 use oxigraph::model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -261,19 +262,6 @@ pub fn rdf_format_label(format: oxigraph::io::RdfFormat) -> &'static str {
         oxigraph::io::RdfFormat::JsonLd { .. } => "JSON-LD",
         _ => "RDF",
     }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn short_hash(text: &str) -> String {
-    format!("{:016x}{:x}", fnv1a64(text.as_bytes()), text.len())
 }
 
 fn escape_literal(value: &str) -> String {

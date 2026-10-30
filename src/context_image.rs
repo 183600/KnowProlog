@@ -21,17 +21,31 @@ use crate::canonical::{self, DecodeError, DecodeReceipt};
 /// 当前支持的镜像格式版本。
 pub const IMAGE_VERSION: u32 = 1;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// 在既有 FNV-1a 状态上继续吸收一段字节。
+pub(crate) fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// FNV-1a 64 位哈希（无符号整数形式）。
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_update(FNV_OFFSET, bytes)
+}
 
 /// FNV-1a 64 位哈希（十六进制小写）。
 pub fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash = FNV_OFFSET;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{:016x}", hash)
+    format!("{:016x}", fnv1a64(bytes))
+}
+
+/// 稳定短哈希：FNV-1a 64 位 + 输入长度（消除同前缀截断歧义）。
+pub(crate) fn short_hash(text: &str) -> String {
+    format!("{:016x}{:x}", fnv1a64(text.as_bytes()), text.len())
 }
 
 /// 规范 JSON 文本：对象键按字典序递归排序，紧凑无空白。

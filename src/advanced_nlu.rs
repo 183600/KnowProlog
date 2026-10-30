@@ -733,37 +733,10 @@ impl AdvancedNLU {
             return 0.0;
         }
 
-        let distance = self.levenshtein_distance_with_lens(word1, len1, word2, len2);
+        let distance = crate::similarity_calculator::levenshtein_distance(word1, word2);
         let max_len = len1.max(len2);
 
         1.0 - (distance as f64 / max_len as f64)
-    }
-
-    fn levenshtein_distance_with_lens(
-        &self,
-        s1: &str,
-        len1: usize,
-        s2: &str,
-        len2: usize,
-    ) -> usize {
-        // 双行动态规划：较短字符串作为列方向，行方向逐字符迭代
-        let (rows, cols) = if len1 <= len2 { (s1, s2) } else { (s2, s1) };
-        let cols: Vec<char> = cols.chars().collect();
-        let col_count = cols.len();
-
-        let mut prev: Vec<usize> = (0..=col_count).collect();
-        let mut curr = vec![0usize; col_count + 1];
-
-        for (i, row_char) in rows.chars().enumerate() {
-            curr[0] = i + 1;
-            for j in 1..=col_count {
-                let cost = if row_char == cols[j - 1] { 0 } else { 1 };
-                curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-            }
-            std::mem::swap(&mut prev, &mut curr);
-        }
-
-        prev[col_count]
     }
 
     async fn extract_entities(

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::context_image::fnv1a_hex;
+use crate::grammar_extractor::split_sentences;
 use crate::law_book::LawBook;
 use crate::predicate_registry::PredicateRegistry;
 use crate::prolog_engine::PrologFact;
@@ -1146,25 +1147,6 @@ fn has_speculation(text: &str) -> bool {
     ]
     .iter()
     .any(|cue| text.contains(cue))
-}
-
-fn split_sentences(text: &str) -> Vec<&str> {
-    let mut sentences = Vec::new();
-    let mut start = 0usize;
-    for (index, ch) in text.char_indices() {
-        if matches!(ch, '。' | '！' | '？' | '；' | '!' | '?' | ';' | '\n') {
-            let sentence = text[start..index].trim();
-            if !sentence.is_empty() {
-                sentences.push(sentence);
-            }
-            start = index + ch.len_utf8();
-        }
-    }
-    let tail = text[start..].trim();
-    if !tail.is_empty() {
-        sentences.push(tail);
-    }
-    sentences
 }
 
 fn canonical_edge(

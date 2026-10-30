@@ -24,6 +24,10 @@ use crate::context_image::fnv1a_hex;
 use crate::conversational_graph::{
     EdgePattern, GraphFact, GraphPattern, MatchOptions, PatternConstraint, PatternTerm,
 };
+use crate::query_canonical::{
+    enumerate_choices, mapping_from_choice, permutations_of, refine_colors,
+    MAX_CANONICAL_LABELINGS,
+};
 
 /// KGP-IR 版本；语义或指纹算法不兼容变更时递增。
 pub const KG_PATTERN_VERSION: &str = "kgp/0.2";
@@ -233,9 +237,6 @@ pub struct KgPatternIdentity {
     pub canonical: String,
     pub complete: bool,
 }
-
-/// 颜色类内最多枚举多少种重命名（8 个同类变量 = 40320）。
-const MAX_CANONICAL_LABELINGS: u64 = 40_320;
 
 impl KgPattern {
     pub fn id(&self) -> &str {
@@ -1001,56 +1002,6 @@ fn filter_label(filter: &KgFilter) -> String {
     }
 }
 
-fn refine_colors(labels: &[String], edges: &[(usize, &'static str, usize)]) -> Vec<usize> {
-    let unique: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
-    let initial: BTreeMap<&str, usize> = unique
-        .iter()
-        .enumerate()
-        .map(|(index, label)| (*label, index))
-        .collect();
-    let mut colors: Vec<usize> = labels
-        .iter()
-        .map(|label| initial[label.as_str()])
-        .collect();
-    loop {
-        let mut signatures: Vec<(usize, Vec<(String, usize)>)> = colors
-            .iter()
-            .map(|color| (*color, Vec::new()))
-            .collect();
-        for (from, label, to) in edges {
-            signatures[*from]
-                .1
-                .push((format!(">{}", label), colors[*to]));
-            signatures[*to]
-                .1
-                .push((format!("<{}", label), colors[*from]));
-        }
-        for (_, pairs) in &mut signatures {
-            pairs.sort();
-        }
-        let mut unique_signatures = signatures.clone();
-        unique_signatures.sort();
-        unique_signatures.dedup();
-        let ranks: BTreeMap<(usize, Vec<(String, usize)>), usize> = unique_signatures
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, signature)| (signature, index))
-            .collect();
-        let new_colors: Vec<usize> = signatures
-            .iter()
-            .map(|signature| ranks[signature])
-            .collect();
-        let before = colors.iter().copied().collect::<BTreeSet<_>>().len();
-        let after = new_colors.iter().copied().collect::<BTreeSet<_>>().len();
-        colors = new_colors;
-        if before == after {
-            break;
-        }
-    }
-    colors
-}
-
 fn canonical_variable_mapping<F>(
     atoms: &[KgAtom],
     filters: &[KgFilter],
@@ -1102,66 +1053,6 @@ where
             .collect();
         (mapping_from_choice(&choice), false)
     }
-}
-
-fn permutations_of(items: &[String]) -> Vec<Vec<String>> {
-    fn walk(
-        items: &[String],
-        used: &mut [bool],
-        current: &mut Vec<String>,
-        output: &mut Vec<Vec<String>>,
-    ) {
-        if current.len() == items.len() {
-            output.push(current.clone());
-            return;
-        }
-        for index in 0..items.len() {
-            if used[index] {
-                continue;
-            }
-            used[index] = true;
-            current.push(items[index].clone());
-            walk(items, used, current, output);
-            current.pop();
-            used[index] = false;
-        }
-    }
-    let mut output = Vec::new();
-    let mut used = vec![false; items.len()];
-    let mut current = Vec::new();
-    walk(items, &mut used, &mut current, &mut output);
-    output
-}
-
-fn enumerate_choices<F>(
-    choices: &[Vec<Vec<String>>],
-    index: usize,
-    current: &mut Vec<Vec<String>>,
-    visit: &mut F,
-) where
-    F: FnMut(&[Vec<String>]),
-{
-    if index == choices.len() {
-        visit(current);
-        return;
-    }
-    for permutation in &choices[index] {
-        current.push(permutation.clone());
-        enumerate_choices(choices, index + 1, current, visit);
-        current.pop();
-    }
-}
-
-fn mapping_from_choice(choice: &[Vec<String>]) -> BTreeMap<String, String> {
-    let mut mapping = BTreeMap::new();
-    let mut index = 0;
-    for class in choice {
-        for name in class {
-            mapping.insert(name.clone(), format!("v{}", index));
-            index += 1;
-        }
-    }
-    mapping
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

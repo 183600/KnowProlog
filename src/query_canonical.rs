@@ -1182,7 +1182,10 @@ fn filter_label(filter: &CoreFilter) -> String {
     }
 }
 
-fn refine_colors(labels: &[String], edges: &[(usize, &'static str, usize)]) -> Vec<usize> {
+pub(crate) fn refine_colors(
+    labels: &[String],
+    edges: &[(usize, &'static str, usize)],
+) -> Vec<usize> {
     let unique: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
     let initial: BTreeMap<&str, usize> = unique
         .iter()
@@ -1232,7 +1235,7 @@ fn refine_colors(labels: &[String], edges: &[(usize, &'static str, usize)]) -> V
     colors
 }
 
-fn permutations_of(items: &[String]) -> Vec<Vec<String>> {
+pub(crate) fn permutations_of(items: &[String]) -> Vec<Vec<String>> {
     fn walk(
         items: &[String],
         used: &mut [bool],
@@ -1261,7 +1264,7 @@ fn permutations_of(items: &[String]) -> Vec<Vec<String>> {
     output
 }
 
-fn enumerate_choices<F>(
+pub(crate) fn enumerate_choices<F>(
     choices: &[Vec<Vec<String>>],
     index: usize,
     current: &mut Vec<Vec<String>>,
@@ -1280,7 +1283,7 @@ fn enumerate_choices<F>(
     }
 }
 
-fn mapping_from_choice(choice: &[Vec<String>]) -> BTreeMap<String, String> {
+pub(crate) fn mapping_from_choice(choice: &[Vec<String>]) -> BTreeMap<String, String> {
     let mut mapping = BTreeMap::new();
     let mut index = 0;
     for class in choice {

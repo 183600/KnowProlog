@@ -16,6 +16,7 @@
 //! 别名晋升仍必须走 `entity_registry` 的提名/确认流程。默认只消费
 //! `Confirmed` 条目，`Proposed` 需要显式打开。
 
+use crate::context_image::short_hash;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
@@ -1568,15 +1569,6 @@ fn entry_id(kind: SynonymKind, surface: &str, canonical: &str, sense: &SynonymSe
             sense.key()
         ))
     )
-}
-
-fn short_hash(text: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:016x}{:x}", hash, text.len())
 }
 
 fn literal_quad(

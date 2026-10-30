@@ -12,6 +12,7 @@
 //!   - **确定性**：id 与指纹由规范字符串哈希得出（FNV-1a），与插入顺序无关，
 //!     可逐字节断言。
 
+use crate::context_image::short_hash;
 use oxigraph::model::*;
 use serde::{Deserialize, Serialize};
 
@@ -155,20 +156,6 @@ pub struct DerivedLedger {
     /// 物化时的规则集指纹。
     pub fingerprint: String,
     pub entries: Vec<DerivedLedgerEntry>,
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// 稳定短哈希：FNV-1a 64 位 + 输入长度（消除同前缀截断歧义），全十六进制。
-fn short_hash(text: &str) -> String {
-    format!("{:016x}{:x}", fnv1a64(text.as_bytes()), text.len())
 }
 
 /// 规则条目的稳定 id。

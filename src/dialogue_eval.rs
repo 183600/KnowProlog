@@ -21,6 +21,7 @@
 //! - [`EvalKnowledge::Reasoner`]：真实 [`SymbolicReasoner`]（由金标事实构建），
 //!   端到端度量产品行为。模式参与语料摘要，避免跨模式误比基线。
 
+use crate::context_image::fnv1a_hex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
@@ -1376,15 +1377,6 @@ pub fn corpus_digest(scenarios: &[GoldScenario], mode: EvalKnowledge) -> String 
         }
     }
     fnv1a_hex(canonical.as_bytes())
-}
-
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@
 //! 低置信结构只作为候选，并显式写入 [`DependencyTree::warnings`]，不假装
 //! 句法分析总是确定无疑。
 
+use crate::context_image::fnv1a_hex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Serialize;
@@ -1480,15 +1481,6 @@ fn frame_id(
         tree.root.unwrap_or(0)
     );
     format!("dsi:{}", fnv1a_hex(material.as_bytes()))
-}
-
-fn fnv1a_hex(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
 }
 
 /// 索引中的一条脊边。`canonical` 为真表示来自规范框架，否则来自表层树。

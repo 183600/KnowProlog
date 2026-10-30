@@ -1,17 +1,9 @@
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
 /// 稳定短 id：FNV-1a + 输入长度，避免同前缀截断歧义。
 fn stable_id(prefix: &str, canonical: &str) -> String {
     format!(
         "{}{:016x}{:x}",
         prefix,
-        fnv1a64(canonical.as_bytes()),
+        crate::context_image::fnv1a64(canonical.as_bytes()),
         canonical.len()
     )
 }

@@ -17,6 +17,7 @@
 //!   - **账本即 RDF 命名图**：命名空间、断言、裁决与已物化赢家都落在
 //!     `kg:graphs/fusion`，可用 SPARQL 直接审计。
 
+use crate::context_image::short_hash;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -991,20 +992,6 @@ impl FusionApplyOutcome {
 // ---------------------------------------------------------------------------
 // RDF 往返
 // ---------------------------------------------------------------------------
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// 稳定短哈希：FNV-1a 64 位 + 输入长度（消除同前缀截断歧义），全十六进制。
-fn short_hash(text: &str) -> String {
-    format!("{:016x}{:x}", fnv1a64(text.as_bytes()), text.len())
-}
 
 fn named_node(iri: &str) -> FusionResult<NamedNode> {
     Ok(NamedNode::new(iri)?)

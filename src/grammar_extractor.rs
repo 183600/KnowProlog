@@ -293,7 +293,7 @@ fn is_punctuation(text: &str) -> bool {
 }
 
 /// 句子切分：按常见句末标点与换行切开。
-fn split_sentences(text: &str) -> Vec<&str> {
+pub(crate) fn split_sentences(text: &str) -> Vec<&str> {
     let mut sentences = Vec::new();
     let mut start = 0usize;
     for (index, ch) in text.char_indices() {

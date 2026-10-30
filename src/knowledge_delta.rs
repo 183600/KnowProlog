@@ -3,24 +3,13 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::context_image::{fnv1a64_update, FNV_OFFSET};
 use crate::prolog_engine::PrologFact;
 
 pub const DEFAULT_JOURNAL_CAPACITY: usize = 128;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a_step(hash: u64, bytes: &[u8]) -> u64 {
-    let mut hash = hash;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
 fn fnv1a_field(hash: u64, value: &str) -> u64 {
-    fnv1a_step(fnv1a_step(hash, value.as_bytes()), b"\x1f")
+    fnv1a64_update(fnv1a64_update(hash, value.as_bytes()), b"\x1f")
 }
 
 pub fn fingerprint_facts(facts: &[PrologFact]) -> String {
@@ -32,7 +21,7 @@ pub fn fingerprint_facts(facts: &[PrologFact]) -> String {
                 entity_type,
                 properties,
             } => {
-                hash = fnv1a_step(hash, b"E\x1f");
+                hash = fnv1a64_update(hash, b"E\x1f");
                 hash = fnv1a_field(hash, name);
                 hash = fnv1a_field(hash, entity_type);
                 let mut keys: Vec<&String> = properties.keys().collect();
@@ -43,13 +32,13 @@ pub fn fingerprint_facts(facts: &[PrologFact]) -> String {
                 }
             }
             PrologFact::Relation { from, rel_type, to } => {
-                hash = fnv1a_step(hash, b"R\x1f");
+                hash = fnv1a64_update(hash, b"R\x1f");
                 hash = fnv1a_field(hash, from);
                 hash = fnv1a_field(hash, rel_type);
                 hash = fnv1a_field(hash, to);
             }
         }
-        hash = fnv1a_step(hash, b"\n");
+        hash = fnv1a64_update(hash, b"\n");
     }
     format!("{:016x}", hash)
 }

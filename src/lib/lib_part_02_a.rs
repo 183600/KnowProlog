@@ -74,7 +74,7 @@ impl JsonLdAnonymousScope {
     fn new(document: &Value) -> Self {
         let text = serde_json::to_string(document).unwrap_or_default();
         Self {
-            fingerprint: fnv1a64(text.as_bytes()),
+            fingerprint: crate::context_image::fnv1a64(text.as_bytes()),
             next: std::cell::Cell::new(0),
         }
     }
@@ -87,25 +87,13 @@ impl JsonLdAnonymousScope {
         self.next.set(index.saturating_add(1));
         let material = serde_json::to_string(obj).unwrap_or_default();
         let mut hash = self.fingerprint;
-        hash = fnv1a64_update(hash, &index.to_le_bytes());
-        hash = fnv1a64_update(hash, material.as_bytes());
+        hash = crate::context_image::fnv1a64_update(hash, &index.to_le_bytes());
+        hash = crate::context_image::fnv1a64_update(hash, material.as_bytes());
         Ok(NamedNode::new(crate::identity::entity_uri(
             BASE_NS,
             &format!("anon-{:016x}", hash),
         ))?)
     }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    fnv1a64_update(0xcbf2_9ce4_8422_2325, bytes)
-}
-
-fn fnv1a64_update(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 impl OxigraphManager {
