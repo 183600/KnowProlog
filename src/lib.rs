@@ -25,6 +25,7 @@ pub mod batch_conflict;
 pub mod batch_teaching;
 pub mod belief_revision;
 pub mod binding_frames;
+pub mod binding_table;
 pub mod bindings;
 pub mod cache;
 pub mod canonical;
