@@ -666,11 +666,14 @@ pub fn extract_query_entities_from_tagged(
     let mut entities = Vec::new();
 
     for word in &tagged_words {
-        if word.pos == "nr"
-            || word.pos == "ns"
-            || word.pos == "nz"
-            || word.pos == "n"
-            || word.pos == "nt"
+        let profile = crate::pos_ontology::profile(&word.pos);
+        let nominal_sort = profile.has_sort(crate::pos_ontology::Sort::Person)
+            || profile.has_sort(crate::pos_ontology::Sort::Organization)
+            || profile.has_sort(crate::pos_ontology::Sort::Place)
+            || profile.has_sort(crate::pos_ontology::Sort::Event)
+            || profile.has_sort(crate::pos_ontology::Sort::Object);
+        if matches!(word.pos.as_str(), "n" | "nr" | "ns" | "nt" | "nz" | "ng" | "j")
+            || nominal_sort
         {
             entities.push(word.text.clone());
         }
@@ -908,6 +911,54 @@ pub fn detect_input_mode(input: &str, keywords: &[String]) -> InputMode {
         InputMode::Query
     }
 }
+#[cfg(test)]
+mod pos_ontology_extraction_tests {
+    use super::*;
+    use crate::nlp::TaggedWord;
+
+    fn tagged(pairs: &[(&str, &str)]) -> Vec<TaggedWord> {
+        pairs
+            .iter()
+            .map(|(text, pos)| TaggedWord {
+                text: text.to_string(),
+                pos: pos.to_string(),
+            })
+            .collect()
+    }
+
+    fn config() -> SystemConfig {
+        toml::from_str(include_str!("../../config.toml")).expect("config.toml 必须可解析")
+    }
+
+    #[test]
+    fn extraction_pos_pattern_accepts_nominal_descendants() {
+        let extractor = KnowledgeExtractor::new(Arc::new(config()));
+        let words = tagged(&[("鲁迅", "nr"), ("是", "v"), ("作家", "n")]);
+        assert!(extractor.check_pos_pattern(&words, &["n".to_string()]));
+        assert!(extractor.check_pos_pattern(&words, &["n".to_string(), "v".to_string()]));
+        assert!(extractor.check_pos_pattern(&words, &["nr".to_string()]));
+        assert!(!extractor.check_pos_pattern(&words, &["q".to_string()]));
+    }
+
+    #[test]
+    fn query_entities_include_nominal_projection_but_not_time_words() {
+        let cfg = config();
+        let words = tagged(&[
+            ("鲁迅", "nr"),
+            ("清华大学", "nt"),
+            ("北京", "ns"),
+            ("研究", "vn"),
+            ("今天", "t"),
+        ]);
+        let entities = extract_query_entities_from_tagged(&words, &cfg);
+        assert!(entities.contains(&"鲁迅".to_string()));
+        assert!(entities.contains(&"清华大学".to_string()));
+        assert!(entities.contains(&"北京".to_string()));
+        assert!(entities.contains(&"研究".to_string()));
+        assert!(!entities.contains(&"今天".to_string()));
+    }
+}
+
 pub fn create_prolog_rules(config: &SystemConfig) -> Vec<PrologRule> {
     config
         .prolog_rules

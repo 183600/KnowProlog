@@ -1034,7 +1034,12 @@ impl KnowledgeExtractor {
         for i in 0..=(tagged_words.len() - pos_pattern.len()) {
             let mut matched = true;
             for (j, expected_pos) in pos_pattern.iter().enumerate() {
-                if expected_pos != "*" && tagged_words[i + j].pos != *expected_pos {
+                if expected_pos != "*"
+                    && !crate::pos_ontology::tag_matches(
+                        expected_pos,
+                        &tagged_words[i + j].pos,
+                    )
+                {
                     matched = false;
                     break;
                 }
@@ -1077,7 +1082,7 @@ impl KnowledgeExtractor {
 
                     let mut matching_words = Vec::new();
                     for word in tagged_words {
-                        if word.pos == pos {
+                        if crate::pos_ontology::tag_matches(pos, &word.pos) {
                             matching_words.push(word.text.clone());
                         }
                     }
@@ -1093,7 +1098,7 @@ impl KnowledgeExtractor {
             // 避免把「姚明身高226」这类句式里紧跟的未知属性词并进人名。
             if pos_rule == "nr" {
                 for word in tagged_words {
-                    if word.pos == "nr" {
+                    if crate::pos_ontology::tag_matches("nr", &word.pos) {
                         return Some(word.text.clone());
                     }
                 }
@@ -1115,9 +1120,15 @@ impl KnowledgeExtractor {
                 }
             }
 
-            // 普通词性查找
+            // 普通词性查找：先精确命中，再按词性本体闭包回退，
+            // 保证旧配置的取值顺序不变，同时接受 nr/ns/nt/nz/vn 等后代。
             for word in tagged_words {
                 if word.pos == pos_rule {
+                    return Some(word.text.clone());
+                }
+            }
+            for word in tagged_words {
+                if crate::pos_ontology::tag_matches(pos_rule, &word.pos) {
                     return Some(word.text.clone());
                 }
             }
