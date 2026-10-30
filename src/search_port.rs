@@ -22,6 +22,10 @@ fn default_max_entries() -> usize {
 pub struct SearchSessionConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// 是否允许语义检索端口在首轮直接接管有证据的回答。默认关闭，
+    /// 关闭时回答路径与旧管线逐字节一致。
+    #[serde(default)]
+    pub takeover: bool,
     #[serde(default = "default_page_size")]
     pub page_size: usize,
     #[serde(default = "default_max_entries")]
@@ -32,6 +36,7 @@ impl Default for SearchSessionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            takeover: false,
             page_size: default_page_size(),
             max_entries: default_max_entries(),
         }
@@ -42,6 +47,7 @@ impl SearchSessionConfig {
     pub fn normalized(&self) -> Self {
         Self {
             enabled: self.enabled,
+            takeover: self.takeover,
             page_size: self.page_size.clamp(1, 20),
             max_entries: self.max_entries.clamp(1, 128),
         }
@@ -990,6 +996,43 @@ impl SearchSession {
         true
     }
 
+    pub fn record_port_outcome(
+        &mut self,
+        question: &str,
+        request: &SearchRequest,
+        outcome: &PortOutcome,
+    ) -> bool {
+        let entries: Vec<SessionEntry> = outcome
+            .hits
+            .iter()
+            .take(self.max_entries)
+            .enumerate()
+            .map(|(index, hit)| SessionEntry {
+                id: format!("E{}", index + 1),
+                subject: hit.subject.clone(),
+                predicate: hit.predicate.clone(),
+                object: hit.object.clone(),
+                score: hit.score,
+                channels: hit.channels.clone(),
+                reasons: hit.reasons.clone(),
+            })
+            .collect();
+        if entries.is_empty() {
+            return false;
+        }
+        self.last = Some(ResultSet {
+            question: question.trim().to_string(),
+            kind: format!("语义检索:{}", request.mode.label()),
+            anchor: request.constraints.subject.clone(),
+            predicate: request.constraints.predicate.clone(),
+            entries,
+            page_size: self.page_size,
+            cursor: 0,
+            receipts: vec![outcome.receipt.render_text()],
+        });
+        true
+    }
+
     fn record(&mut self, question: &str, bundle: &EvidenceBundle, receipt: String) -> bool {
         let entries: Vec<SessionEntry> = bundle
             .items
@@ -1556,6 +1599,7 @@ mod tests {
     fn session() -> SearchSession {
         let mut session = SearchSession::new(SearchSessionConfig {
             enabled: true,
+            takeover: false,
             page_size: 2,
             max_entries: 10,
         });

@@ -826,6 +826,9 @@ impl SymbolicReasoner {
         if let Some(answer) = self.answer_search_session(question) {
             return Some(answer);
         }
+        if let Some(answer) = self.answer_semantic_port(question) {
+            return Some(answer);
+        }
         if let Some(answer) = self.answer_learned_rewrite(question) {
             return Some(answer);
         }
@@ -879,24 +882,74 @@ impl SymbolicReasoner {
 
     /// 把自然语言问句编译成检索动作（Lookup/Enumerate/Describe/Verify），
     /// 用当前实体与谓词表生成精确约束，再交给统一语义检索端口。
-    pub fn semantic_search_question(
-        &self,
-        question: &str,
-    ) -> crate::search_port::PortOutcome {
+    fn semantic_search_request(&self, question: &str) -> crate::search_port::SearchRequest {
         let normalized = self.aligner.normalize_cow(question);
         let mentioned = self.mentioned_predicate_canonicals(question);
         let predicate = self
             .first_mentioned_known_predicate(normalized.as_ref(), &mentioned)
             .or_else(|| self.target_predicate_surface(normalized.as_ref()));
-        let anchor = self.entities_mentioned(question).into_iter().next();
+        let entities = self.entities_mentioned(question);
+        let anchor = entities.first().cloned();
         let max_results = self.config.max_predictions.clamp(1, 8);
-        let request = crate::search_port::SearchRequest::from_question(
+        let mut request = crate::search_port::SearchRequest::from_question(
             question,
             anchor,
             predicate,
             max_results,
         );
+        if request.mode == crate::search_port::SearchMode::Verify {
+            let (subject, object) = verify_anchor_pair(
+                question,
+                request.constraints.predicate.as_deref(),
+                &entities,
+            );
+            if subject.is_some() {
+                request.constraints.subject = subject;
+            }
+            if object.is_some() {
+                request.constraints.object = object;
+            }
+        }
+        request
+    }
+
+    pub fn semantic_search_question(
+        &self,
+        question: &str,
+    ) -> crate::search_port::PortOutcome {
+        let request = self.semantic_search_request(question);
         self.semantic_search(&request)
+    }
+
+    /// 语义检索端口接管首轮回答（默认关闭）。只有同时启用 `enabled` 与
+    /// `takeover`、问句可编译、端口确实找到已核实证据时才接管；否则返回
+    /// None，完全回退到旧回答管线。
+    pub fn answer_semantic_port(&self, question: &str) -> Option<String> {
+        if !self.config.search_session.enabled || !self.config.search_session.takeover {
+            return None;
+        }
+        if crate::search_port::parse_followup(question).is_some()
+            || !contextual_rag::looks_like_question(question)
+        {
+            return None;
+        }
+        let request = self.semantic_search_request(question);
+        if request.mode == crate::search_port::SearchMode::Describe
+            || (request.mode == crate::search_port::SearchMode::Verify
+                && request.constraints.object.is_none())
+        {
+            return None;
+        }
+        let outcome = self.semantic_search(&request);
+        if outcome.hits.is_empty() {
+            return None;
+        }
+        let answer = outcome.render_answer(&request);
+        self.search_session
+            .lock()
+            .record_port_outcome(question, &request, &outcome);
+        self.perf.bump("semantic_port_answers");
+        Some(answer)
     }
 
     /// 对上一轮结果集执行显式追问动作。默认关闭；没有结果集或不是结果集
@@ -1846,3 +1899,43 @@ fn render_quantity_in_requested_unit(
     quantity.format_in_unit(requested_unit)
 }
 
+/// 验证问句的锚点方向：谓词左侧最近的实体是主体，右侧实体是待验证客体；
+/// 若谓词右侧没有实体（如「李四是不是张三的师傅」），剩余实体就是客体。
+fn verify_anchor_pair(
+    question: &str,
+    predicate: Option<&str>,
+    entities: &[String],
+) -> (Option<String>, Option<String>) {
+    if entities.is_empty() {
+        return (None, None);
+    }
+    let Some(predicate) = predicate else {
+        return (entities.first().cloned(), entities.get(1).cloned());
+    };
+    let Some(predicate_pos) = question.find(predicate) else {
+        return (entities.first().cloned(), entities.get(1).cloned());
+    };
+    let mut subject: Option<(usize, String)> = None;
+    let mut object: Option<(usize, String)> = None;
+    for entity in entities {
+        let Some(index) = question.find(entity.as_str()) else {
+            continue;
+        };
+        if index < predicate_pos {
+            if subject.as_ref().is_none_or(|(best, _)| index >= *best) {
+                subject = Some((index, entity.clone()));
+            }
+        } else if object.as_ref().is_none_or(|(best, _)| index <= *best) {
+            object = Some((index, entity.clone()));
+        }
+    }
+    let subject = subject.map(|(_, entity)| entity);
+    let object = object.map(|(_, entity)| entity).or_else(|| {
+        let subject = subject.as_deref()?;
+        entities
+            .iter()
+            .find(|entity| entity.as_str() != subject)
+            .cloned()
+    });
+    (subject, object)
+}

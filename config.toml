@@ -79,6 +79,7 @@ require_predicate_admission = false    # 严格准入：只允许画像中已登
 # 关闭时回答路径与旧行为逐字节一致，普通问句仍走原管线。
 [reasoning.search_session]
 enabled = false
+takeover = false                     # 是否允许语义检索端口直接接管有证据的首轮回答
 page_size = 3
 max_entries = 24
 

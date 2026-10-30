@@ -1596,6 +1596,7 @@
         let mut config = contextual_config();
         config.search_session = crate::search_port::SearchSessionConfig {
             enabled: true,
+            takeover: false,
             page_size: 2,
             max_entries: 12,
         };
@@ -1655,6 +1656,68 @@
     }
 
     #[test]
+    fn semantic_port_takeover_answers_lookup_and_records_followups() {
+        let mut config = search_session_config();
+        config.search_session.takeover = true;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+
+        let first = reasoner
+            .answer("张三的师傅是谁")
+            .expect("端口应接管有证据的首轮");
+        assert!(first.contains("语义检索端口"), "{}", first);
+        assert!(first.contains("李四"), "{}", first);
+        assert!(reasoner.perf.count("semantic_port_answers") >= 1);
+        assert_eq!(
+            reasoner
+                .search_session
+                .lock()
+                .last()
+                .map(|set| set.entries.len()),
+            Some(3)
+        );
+
+        let second = reasoner.answer("第二条是什么").expect("结果集应可继续追问");
+        assert!(second.contains("第 2 条"), "{}", second);
+        assert!(second.contains("王五") || second.contains("赵六"), "{}", second);
+    }
+
+    #[test]
+    fn semantic_port_verify_extracts_subject_and_object() {
+        let mut config = search_session_config();
+        config.search_session.takeover = true;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+
+        let request = reasoner.semantic_search_request("张三的师傅是李四吗");
+        assert_eq!(request.mode, crate::search_port::SearchMode::Verify);
+        assert_eq!(request.constraints.subject.as_deref(), Some("张三"));
+        assert_eq!(request.constraints.object.as_deref(), Some("李四"));
+
+        let answer = reasoner
+            .answer("张三的师傅是李四吗")
+            .expect("应找到支持证据");
+        assert!(answer.contains("是。"), "{}", answer);
+        assert!(answer.contains("李四"), "{}", answer);
+
+        assert!(
+            reasoner.answer_semantic_port("李四的师傅是张三吗").is_none(),
+            "没有支持证据时端口必须弃权，不能把缺少证据当成否定"
+        );
+    }
+
+    #[test]
+    fn semantic_port_takeover_is_opt_in() {
+        let mut config = search_session_config();
+        config.search_session.takeover = false;
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&search_session_facts());
+        assert!(reasoner.answer_semantic_port("张三的师傅是谁").is_none());
+        let answer = reasoner.answer("张三的师傅是谁").expect("旧管线应回答");
+        assert!(!answer.contains("语义检索端口"), "{}", answer);
+    }
+
+    #[test]
     fn search_session_stays_disabled_by_default() {
         let mut reasoner = SymbolicReasoner::new(contextual_config(), HashMap::new());
         reasoner.observe_facts(&search_session_facts());
@@ -1698,6 +1761,7 @@
         let mut config = test_config();
         config.search_session = crate::search_port::SearchSessionConfig {
             enabled: true,
+            takeover: false,
             page_size: 1,
             max_entries: 12,
         };
