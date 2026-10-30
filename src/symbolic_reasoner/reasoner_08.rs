@@ -930,6 +930,7 @@ impl SymbolicReasoner {
             return None;
         }
         if crate::search_port::parse_followup(question).is_some()
+            || crate::search_port::parse_table_followup(question).is_some()
             || !contextual_rag::looks_like_question(question)
         {
             return None;
@@ -983,18 +984,28 @@ impl SymbolicReasoner {
         if !self.config.search_session.enabled {
             return None;
         }
-        let action = crate::search_port::parse_followup(question)?;
-        let reply = {
-            let mut session = self.search_session.lock();
-            session.respond_with(&action, |set, needle| {
-                let request = self.refine_search_request(set, needle);
-                Some(self.semantic_search(&request))
-            })
-        };
+        if let Some(action) = crate::search_port::parse_followup(question) {
+            let reply = {
+                let mut session = self.search_session.lock();
+                session.respond_with(&action, |set, needle| {
+                    let request = self.refine_search_request(set, needle);
+                    Some(self.semantic_search(&request))
+                })
+            };
+            if reply.is_some() {
+                self.perf.bump("search_session_actions");
+                self.perf
+                    .bump(&format!("search_session_{}", action.label()));
+            }
+            return reply;
+        }
+        let revision = self.revision();
+        let reply = self
+            .search_session
+            .lock()
+            .answer_table_followup(question, revision);
         if reply.is_some() {
-            self.perf.bump("search_session_actions");
-            self.perf
-                .bump(&format!("search_session_{}", action.label()));
+            self.perf.bump("search_session_table_actions");
         }
         reply
     }

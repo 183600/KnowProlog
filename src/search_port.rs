@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::binding_table::{
-    from_fact_refs, BindingTable, BindingTableStore, Coverage, TableSource,
+    from_fact_refs, BindingTable, BindingTableStore, Coverage, SortDirection, TableSource,
 };
+use crate::chinese_reasoning_nlu::parse_chinese_number_u64;
 use crate::contextual_rag::{AnswerExpectation, EvidenceAssembly, EvidenceBundle, EvidenceItem};
 use crate::dense_retrieval::{DenseRetriever, RetrievalHit, SearchBudget, SearchConstraints};
 use crate::holographic_memory::HolographicMemory;
@@ -1021,8 +1022,93 @@ impl SearchSession {
         let Ok(table) = from_fact_refs(&facts, coverage, revision, source, question) else {
             return;
         };
+        self.commit_table(table);
+    }
+
+    fn commit_table(&mut self, table: BindingTable) {
         if let Ok(receipt) = self.tables.insert(table) {
             self.last_table_id = Some(receipt.id);
+        }
+    }
+
+    /// 在最近一张绑定表上执行显式追问（计数 / 前 k / 排序）。
+    ///
+    /// 版本不同、属性不存在或表为空时都给出可审计的说明，不把旧行冒充
+    /// 新答案。成功派生出的表会写回会话台账，供下一次追问继续操作。
+    pub fn answer_table_followup(&mut self, question: &str, revision: u64) -> Option<String> {
+        let action = parse_table_followup(question)?;
+        let table = self.last_table()?.clone();
+        if table.revision != revision {
+            return Some(format!(
+                "上一轮绑定表属于知识版本 v{}，当前为 v{}；请重新检索后再{}。",
+                table.revision,
+                revision,
+                match action {
+                    TableFollowUp::Count => "计数",
+                    TableFollowUp::Top(_) => "截取前几行",
+                    TableFollowUp::Sort { .. } => "排序",
+                }
+            ));
+        }
+        match action {
+            TableFollowUp::Count => Some(format!(
+                "上一轮绑定表共 {} 行；{}。",
+                table.row_count(),
+                table.coverage.caveat()
+            )),
+            TableFollowUp::Top(k) => {
+                if k == 0 {
+                    return Some("前 0 行没有意义；请给出正整数。".to_string());
+                }
+                let total = table.row_count();
+                let result = table.top_k(k).ok()?;
+                let mut text = result.render();
+                if k > total {
+                    text.push_str(&format!(
+                        "\n\n（请求前 {} 行，但表内只有 {} 行，未发生截断。）",
+                        k, total
+                    ));
+                }
+                self.commit_table(result);
+                Some(text)
+            }
+            TableFollowUp::Sort {
+                attribute,
+                descending,
+            } => {
+                let direction = if descending {
+                    SortDirection::Descending
+                } else {
+                    SortDirection::Ascending
+                };
+                let mut target = table.clone();
+                let sort_variable = match attribute.as_deref() {
+                    None => "o".to_string(),
+                    Some(attribute) => match resolve_sort_column(&table, attribute) {
+                        SortColumn::Column(variable) => variable,
+                        SortColumn::Predicate(predicate) => {
+                            let filtered = table.filter_eq("p", &predicate).ok()?;
+                            if filtered.is_empty() {
+                                return Some(format!(
+                                    "上一轮绑定表没有谓词「{}」的行，未执行排序。",
+                                    predicate
+                                ));
+                            }
+                            target = filtered;
+                            "o".to_string()
+                        }
+                        SortColumn::Unknown => {
+                            return Some(format!(
+                                "无法把「{}」对应到绑定表的列或谓词，未执行排序。",
+                                attribute
+                            ));
+                        }
+                    },
+                };
+                let result = target.sort_by(&sort_variable, direction).ok()?;
+                self.commit_table(result.clone());
+                Some(result.render())
+            }
         }
     }
 
@@ -1421,6 +1507,119 @@ fn retain_matching(set: &mut ResultSet, needle: &str, keep_matching: bool) -> St
         output.push('\n');
     }
     output.trim_end().to_string()
+}
+
+/// 绑定表追问动作：只覆盖能由表本身确定回答的三种操作。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableFollowUp {
+    Count,
+    Top(usize),
+    Sort {
+        attribute: Option<String>,
+        descending: bool,
+    },
+}
+
+enum SortColumn {
+    Column(String),
+    Predicate(String),
+    Unknown,
+}
+
+fn resolve_sort_column(table: &BindingTable, attribute: &str) -> SortColumn {
+    let attribute = attribute.trim();
+    let column = match attribute {
+        "s" | "主语" | "实体" => Some("s"),
+        "p" | "谓词" | "谓语" | "属性" => Some("p"),
+        "o" | "宾语" | "取值" | "值" => Some("o"),
+        _ => None,
+    };
+    if let Some(variable) = column {
+        return SortColumn::Column(variable.to_string());
+    }
+    if table.rows.iter().any(|row| {
+        row.value_text("p")
+            .map(|predicate| predicate.contains(attribute))
+            .unwrap_or(false)
+    }) {
+        return SortColumn::Predicate(attribute.to_string());
+    }
+    SortColumn::Unknown
+}
+
+/// 解析表追问；未命中时返回 `None`，交给原有管线。
+pub fn parse_table_followup(question: &str) -> Option<TableFollowUp> {
+    let question = question
+        .trim()
+        .trim_end_matches(['?', '？', '。', '!', '！', ' ']);
+    if question.is_empty() {
+        return None;
+    }
+    if (question.contains("一共") || question.contains("总共") || question.contains("合计"))
+        && (question.contains('几') || question.contains("多少"))
+    {
+        return Some(TableFollowUp::Count);
+    }
+    if let Some(rest) = question.strip_prefix('前') {
+        if let Some(end) = rest
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '个' | '条' | '名' | '位' | '行'))
+            .map(|(index, _)| index)
+        {
+            let number = &rest[..end];
+            if !number.is_empty() {
+                let count = number
+                    .parse::<usize>()
+                    .ok()
+                    .or_else(|| parse_chinese_number_u64(number).map(|value| value as usize))?;
+                return Some(TableFollowUp::Top(count));
+            }
+        }
+    }
+    let descending = question.contains("降序")
+        || question.contains("从高到低")
+        || question.contains("从大到小")
+        || question.contains("由高到低")
+        || question.contains("由大到小");
+    let ascending =
+        question.contains("升序") || question.contains("从低到高") || question.contains("从小到大");
+    if question == "排序" || question == "排一下" || question == "排列" {
+        return Some(TableFollowUp::Sort {
+            attribute: None,
+            descending,
+        });
+    }
+    if let Some(rest) = question.strip_prefix('按') {
+        let mut attribute = rest.trim().to_string();
+        for suffix in ["排序", "排列一下", "排列", "排一下", "排"] {
+            if let Some(prefix) = attribute.strip_suffix(suffix) {
+                attribute = prefix.trim().to_string();
+                break;
+            }
+        }
+        for cue in [
+            "从高到低",
+            "从低到高",
+            "从大到小",
+            "从小到大",
+            "由高到低",
+            "由大到小",
+            "升序",
+            "降序",
+        ] {
+            attribute = attribute.replace(cue, "");
+        }
+        let attribute = attribute.trim();
+        return Some(TableFollowUp::Sort {
+            attribute: if attribute.is_empty() {
+                None
+            } else {
+                Some(attribute.to_string())
+            },
+            descending: descending && !ascending,
+        });
+    }
+    None
 }
 
 pub fn parse_followup(question: &str) -> Option<FollowUpAction> {
@@ -2118,6 +2317,84 @@ mod tests {
             .respond(&FollowUpAction::Exclude("不存在".to_string()))
             .expect("未命中应诚实说明");
         assert!(missing.contains("没有包含"), "{}", missing);
+    }
+
+    #[test]
+    fn table_followup_parser_is_conservative() {
+        assert_eq!(parse_table_followup("一共几个"), Some(TableFollowUp::Count));
+        assert_eq!(
+            parse_table_followup("总共有多少条"),
+            Some(TableFollowUp::Count)
+        );
+        assert_eq!(parse_table_followup("前三个"), Some(TableFollowUp::Top(3)));
+        assert_eq!(parse_table_followup("前3条"), Some(TableFollowUp::Top(3)));
+        assert_eq!(
+            parse_table_followup("按师傅降序排序"),
+            Some(TableFollowUp::Sort {
+                attribute: Some("师傅".to_string()),
+                descending: true,
+            })
+        );
+        assert_eq!(
+            parse_table_followup("按o从低到高排列"),
+            Some(TableFollowUp::Sort {
+                attribute: Some("o".to_string()),
+                descending: false,
+            })
+        );
+        assert_eq!(
+            parse_table_followup("排序"),
+            Some(TableFollowUp::Sort {
+                attribute: None,
+                descending: false,
+            })
+        );
+        assert_eq!(parse_table_followup("张三有几个师傅"), None);
+        assert_eq!(parse_table_followup("张三的师傅是谁"), None);
+    }
+
+    #[test]
+    fn table_followup_counts_truncates_sorts_and_reports_stale_revision() {
+        let mut base = session();
+        let count = base
+            .answer_table_followup("一共几个", 0)
+            .expect("应识别计数追问");
+        assert!(count.contains("3 行"), "{}", count);
+        assert!(count.contains("未证明完整"), "{}", count);
+
+        let top = base
+            .answer_table_followup("前2个", 0)
+            .expect("应识别前 k 追问");
+        assert!(top.contains("2 行"), "{}", top);
+        assert_eq!(base.last_table().unwrap().row_count(), 2);
+
+        let mut sorted = session();
+        sorted
+            .answer_table_followup("按师傅降序排序", 0)
+            .expect("应识别排序追问");
+        assert_eq!(
+            sorted
+                .last_table()
+                .unwrap()
+                .rows
+                .first()
+                .and_then(|row| row.value_text("o"))
+                .as_deref(),
+            Some("赵六")
+        );
+
+        let mut stale_session = session();
+        let stale = stale_session
+            .answer_table_followup("一共几个", 1)
+            .expect("版本变化也要给回执");
+        assert!(stale.contains("知识版本 v0"), "{}", stale);
+        assert!(stale.contains("请重新检索"), "{}", stale);
+
+        let missing = stale_session
+            .answer_table_followup("按身高排序", 0)
+            .expect("未知属性应诚实拒绝");
+        assert!(missing.contains("身高"), "{}", missing);
+        assert!(missing.contains("未执行排序"), "{}", missing);
     }
 
     #[test]
