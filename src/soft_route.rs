@@ -1133,10 +1133,13 @@ fn pos_match(expected: &str, token: &TaggedWord) -> Option<ElemHit> {
             ("ns", "n") => 0.65,
             ("q", "m") => 0.85,
             ("r", "unknown") => 0.4,
+            _ if crate::pos_ontology::tag_matches(expected, actual) => 0.8,
             _ => return None,
         }
     };
-    let entity = matches!(expected, "n" | "nr" | "ns").then(|| token.text.clone());
+    let entity = (matches!(expected, "n" | "nr" | "ns")
+        || crate::pos_ontology::captures_entity(expected))
+    .then(|| token.text.clone());
     Some(ElemHit {
         len: 1,
         quality,
@@ -1163,30 +1166,34 @@ fn slot_match(
     }
     let quality = match sort {
         "城市" | "地点" => {
-            if token.pos == "ns" || is_city_literal(&token.text) {
+            if crate::pos_ontology::tag_matches("ns", &token.pos) || is_city_literal(&token.text) {
                 1.0
-            } else if token.pos == "n" {
+            } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Place) {
+                0.9
+            } else if crate::pos_ontology::tag_matches("n", &token.pos) {
                 0.85
             } else {
                 return None;
             }
         }
         "日期" | "时间" => {
-            if token.pos == "m"
+            if crate::pos_ontology::tag_matches("m", &token.pos)
                 && (token.text.contains('天')
                     || token.text.contains('月')
                     || token.text.contains('年')
                     || token.text.contains('日'))
             {
                 1.0
-            } else if token.pos == "m" {
+            } else if crate::pos_ontology::tag_matches("m", &token.pos) {
                 0.8
+            } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Time) {
+                0.9
             } else {
                 return None;
             }
         }
         "人名" => {
-            if token.pos == "nr" {
+            if crate::pos_ontology::tag_matches("nr", &token.pos) {
                 1.0
             } else if token.pos == "unknown" {
                 0.8
@@ -1195,11 +1202,11 @@ fn slot_match(
             }
         }
         "数量" => {
-            if token.pos == "m"
+            if crate::pos_ontology::tag_matches("m", &token.pos)
                 || (!token.text.is_empty() && token.text.chars().all(|ch| ch.is_numeric()))
             {
                 1.0
-            } else if token.pos == "q" {
+            } else if crate::pos_ontology::tag_matches("q", &token.pos) {
                 0.8
             } else {
                 return None;
@@ -1208,7 +1215,7 @@ fn slot_match(
         "实体" => {
             if matches!(token.pos.as_str(), "nr" | "ns" | "n") {
                 1.0
-            } else if matches!(token.pos.as_str(), "nz" | "vn") {
+            } else if crate::pos_ontology::is_entity_tag(&token.pos) {
                 0.85
             } else {
                 return None;
@@ -1217,7 +1224,9 @@ fn slot_match(
         "属性" => {
             if matches!(token.pos.as_str(), "n" | "nz" | "vn") {
                 1.0
-            } else if token.pos == "v" {
+            } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Attribute) {
+                0.8
+            } else if crate::pos_ontology::tag_matches("v", &token.pos) {
                 0.7
             } else {
                 return None;
@@ -1639,6 +1648,25 @@ mod tests {
                 ],
             ),
         ])
+    }
+
+    #[test]
+    fn pos_closure_accepts_specific_noun_and_classifier_tags() {
+        let token = TaggedWord {
+            text: "某组织".to_string(),
+            pos: "nt".to_string(),
+        };
+        assert!(pos_match("n", &token).is_some());
+        let mq = TaggedWord {
+            text: "三个".to_string(),
+            pos: "mq".to_string(),
+        };
+        assert!(pos_match("q", &mq).is_some());
+        let place = TaggedWord {
+            text: "某地".to_string(),
+            pos: "s".to_string(),
+        };
+        assert_eq!(slot_match("城市", "地点", &[], &place).map(|hit| hit.quality), Some(0.9));
     }
 
     #[test]

@@ -255,8 +255,7 @@ impl NLUEngine {
     ) -> Option<String> {
         match slot_config.slot_type.as_str() {
             "城市" | "地点" => self.nth_matching_value(tagged_words, occurrence, |word| {
-                word.pos == "ns"
-                    || word.pos == "n"
+                crate::pos_ontology::tag_matches("n", &word.pos)
                     || matches!(
                         word.text.as_str(),
                         "厦门" | "北京" | "上海" | "广州" | "深圳" | "杭州" | "南京" | "武汉"
@@ -272,7 +271,7 @@ impl NLUEngine {
                 }
 
                 for word in tagged_words {
-                    if word.pos == "m"
+                    if crate::pos_ontology::tag_matches("m", &word.pos)
                         && (word.text.contains("天")
                             || word.text.contains("月")
                             || word.text.contains("年"))
@@ -290,19 +289,18 @@ impl NLUEngine {
                 None
             }
             "人名" => self.nth_matching_value(tagged_words, occurrence, |word| {
-                word.pos == "nr"
+                crate::pos_ontology::tag_matches("nr", &word.pos)
                     || matches!(
                         word.text.as_str(),
                         "姚明" | "刘德华" | "张三" | "李四" | "王五" | "李明"
                     )
             }),
             "数量" => self.nth_matching_value(tagged_words, occurrence, |word| {
-                word.pos == "m" || word.text.chars().all(|c| c.is_numeric())
+                crate::pos_ontology::tag_matches("m", &word.pos)
+                    || word.text.chars().all(|c| c.is_numeric())
             }),
             "实体" => self.nth_matching_value(tagged_words, occurrence, |word| {
-                word.pos == "nr"
-                    || word.pos == "ns"
-                    || word.pos == "n"
+                crate::pos_ontology::is_entity_tag(&word.pos)
                     || matches!(
                         word.text.as_str(),
                         "李明" | "姚明" | "刘德华" | "张三" | "李四" | "王五"
@@ -311,7 +309,12 @@ impl NLUEngine {
             "属性" => {
                 // 属性是「X的Y」中的名词性成分，取最后一个名词
                 for word in tagged_words.iter().rev() {
-                    if matches!(word.pos.as_str(), "n" | "nz" | "vn") {
+                    let profile = crate::pos_ontology::profile(&word.pos);
+                    if profile.is_nominal()
+                        && !profile.has_sort(crate::pos_ontology::Sort::Time)
+                        && !profile.has_sort(crate::pos_ontology::Sort::Person)
+                        && !profile.has_sort(crate::pos_ontology::Sort::Place)
+                    {
                         return Some(word.text.clone());
                     }
                 }
