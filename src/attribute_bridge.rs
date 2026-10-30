@@ -680,7 +680,7 @@ fn normalize_key(text: &str) -> String {
     text.trim().to_lowercase()
 }
 
-fn parse_dimension(text: &str) -> Option<Dimension> {
+pub(crate) fn parse_dimension(text: &str) -> Option<Dimension> {
     match normalize_key(text).as_str() {
         "length" | "长度" | "距离" => Some(Dimension::Length),
         "mass" | "weight" | "质量" | "重量" => Some(Dimension::Mass),

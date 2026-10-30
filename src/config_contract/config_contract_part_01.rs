@@ -170,6 +170,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_semantic_grammar(&mut c, config, &type_names);
     check_prolog_rules(&mut c, config);
     check_predicate_profiles(&mut c, config, &type_names);
+    check_attributes(&mut c, config, &type_names);
     check_entity_profiles(&mut c, config, &type_names);
     check_type_system(&mut c, config);
     check_synonyms(&mut c, config);
@@ -1044,6 +1045,311 @@ fn check_predicate_profiles(
         );
     }
 }
+/// 属性本体档案的契约检查：规范名/别名唯一、定义域类型可解析、
+/// 父属性链无环，以及单位与量纲一致。属性与谓词画像共享同一批词面时，
+/// 若两者归一方向不同则显式告警——这正是「同一个属性三套规范名」的入口。
+fn check_attributes(
+    c: &mut Collector,
+    config: &SystemConfig,
+    type_names: &BTreeSet<String>,
+) {
+    let profiles = &config.attributes.profiles;
+    if profiles.is_empty() {
+        return;
+    }
+    if !config.attributes.enabled {
+        c.warn(
+            "attributes_disabled_with_profiles",
+            "attributes.enabled",
+            "已声明属性档案但 attributes.enabled = false：这些属性不会参与导入抽取",
+        );
+    }
+
+    let mut canonical_names: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        let path = format!("attributes.profiles[{}]", index);
+        let name = profile.name.trim();
+        if name.is_empty() {
+            c.error(
+                "empty_attribute_name",
+                format!("{}.name", path),
+                "属性规范名为空",
+            );
+            continue;
+        }
+        if let Some(first) = canonical_names.insert(fold(name), index) {
+            c.error(
+                "duplicate_attribute_profile",
+                format!("{}.name", path),
+                format!("属性「{}」与 attributes.profiles[{}] 重复", name, first),
+            );
+        }
+    }
+
+    let mut alias_owner: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for (index, profile) in profiles.iter().enumerate() {
+        let path = format!("attributes.profiles[{}]", index);
+        let name = profile.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut local_aliases: BTreeSet<String> = BTreeSet::new();
+        for alias in &profile.aliases {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                c.warn(
+                    "empty_attribute_alias",
+                    format!("{}.aliases", path),
+                    "空别名：该声明被忽略",
+                );
+                continue;
+            }
+            if alias == name {
+                c.warn(
+                    "self_attribute_alias",
+                    format!("{}.aliases", path),
+                    format!("属性「{}」把规范名自身声明为别名", name),
+                );
+                continue;
+            }
+            if !local_aliases.insert(fold(alias)) {
+                c.warn(
+                    "duplicate_attribute_alias",
+                    format!("{}.aliases", path),
+                    format!("别名「{}」重复声明", alias),
+                );
+                continue;
+            }
+            if let Some(canonical_index) = canonical_names.get(&fold(alias)) {
+                if canonical_index != &index {
+                    let canonical = profiles[*canonical_index].name.trim();
+                    c.error(
+                        "attribute_alias_shadows_canonical",
+                        format!("{}.aliases", path),
+                        format!(
+                            "别名「{}」与 attributes.profiles[{}] 的规范名「{}」冲突",
+                            alias, canonical_index, canonical
+                        ),
+                    );
+                    continue;
+                }
+            }
+            match alias_owner.get(&fold(alias)) {
+                Some((owner_index, owner)) if owner_index != &index => {
+                    c.error(
+                        "attribute_alias_conflict",
+                        format!("{}.aliases", path),
+                        format!("别名「{}」已归属属性「{}」", alias, owner),
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    alias_owner.insert(fold(alias), (index, name.to_string()));
+                }
+            }
+        }
+        for domain in &profile.domain {
+            let domain = domain.trim();
+            if domain.is_empty() {
+                c.warn(
+                    "empty_attribute_domain_type",
+                    format!("{}.domain", path),
+                    "定义域含空类型名",
+                );
+            } else if !type_names.contains(&fold(domain)) {
+                c.warn(
+                    "unknown_attribute_domain_type",
+                    format!("{}.domain", path),
+                    format!(
+                        "定义域类型「{}」未在类型体系中出现：开放世界下仍接受，但无法校验",
+                        domain
+                    ),
+                );
+            }
+        }
+        match profile.parent.as_deref().map(str::trim) {
+            Some(parent) if parent.is_empty() => c.warn(
+                "empty_attribute_parent",
+                format!("{}.parent", path),
+                "父属性为空：该声明被忽略",
+            ),
+            Some(parent) if parent == name => c.error(
+                "self_attribute_parent",
+                format!("{}.parent", path),
+                format!("属性「{}」声明自身为父属性", name),
+            ),
+            Some(parent) if !canonical_names.contains_key(&fold(parent)) => c.warn(
+                "unknown_attribute_parent",
+                format!("{}.parent", path),
+                format!("父属性「{}」未在 attributes.profiles 中登记", parent),
+            ),
+            _ => {}
+        }
+
+        if let Some(dimension) = profile.dimension.as_deref().map(str::trim) {
+            if dimension.is_empty() {
+                c.warn(
+                    "empty_attribute_dimension",
+                    format!("{}.dimension", path),
+                    "量纲为空：该声明被忽略",
+                );
+            } else if crate::attribute_bridge::parse_dimension(dimension).is_none() {
+                c.warn(
+                    "unknown_attribute_dimension",
+                    format!("{}.dimension", path),
+                    format!("未知量纲「{}」：运行时将按未声明处理", dimension),
+                );
+            }
+        }
+        if let Some(unit) = profile.unit.as_deref().map(str::trim) {
+            if unit.is_empty() {
+                c.warn(
+                    "empty_attribute_unit",
+                    format!("{}.unit", path),
+                    "单位为空：该声明被忽略",
+                );
+            } else {
+                match crate::quantity::lookup_unit(unit) {
+                    Some(unit_def) => {
+                        if let Some(dimension) = profile
+                            .dimension
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|dimension| !dimension.is_empty())
+                            .and_then(crate::attribute_bridge::parse_dimension)
+                        {
+                            if dimension != unit_def.dimension {
+                                c.warn(
+                                    "attribute_unit_dimension_mismatch",
+                                    format!("{}.unit", path),
+                                    format!(
+                                        "单位「{}」属于{}量纲，与声明的{}量纲不一致：运行时将忽略单位",
+                                        unit,
+                                        unit_def.dimension.label(),
+                                        dimension.label()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    None => c.warn(
+                        "unknown_attribute_unit",
+                        format!("{}.unit", path),
+                        format!("未知单位「{}」：运行时将忽略单位", unit),
+                    ),
+                }
+            }
+        }
+        if profile.value_type == crate::attribute_bridge::AttributeValueType::Quantity
+            && profile
+                .dimension
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && profile
+                .unit
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            c.warn(
+                "quantity_attribute_without_dimension",
+                path.clone(),
+                format!(
+                    "数量属性「{}」既未声明量纲也未声明单位：数值只能按原样保存",
+                    name
+                ),
+            );
+        }
+    }
+
+    // 父属性链成环：只在环的入口报一次，避免每个成员重复刷屏。
+    for (index, profile) in profiles.iter().enumerate() {
+        let name = profile.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let mut cursor = fold(name);
+        loop {
+            if !seen.insert(cursor.clone()) {
+                c.error(
+                    "attribute_parent_cycle",
+                    format!("attributes.profiles[{}].parent", index),
+                    format!("属性「{}」的父属性链成环", name),
+                );
+                break;
+            }
+            let Some(current_index) = canonical_names.get(&cursor) else {
+                break;
+            };
+            let Some(parent) = profiles[*current_index]
+                .parent
+                .as_deref()
+                .map(str::trim)
+                .filter(|parent| !parent.is_empty())
+            else {
+                break;
+            };
+            cursor = fold(parent);
+        }
+    }
+
+    // 属性与谓词画像共享词面但规范名不同：解析/生成可能各说各话。
+    let mut predicate_surfaces: BTreeMap<String, String> = BTreeMap::new();
+    for profile in &config.predicate_profiles {
+        let canonical = profile.name.trim();
+        if canonical.is_empty() {
+            continue;
+        }
+        predicate_surfaces
+            .entry(fold(canonical))
+            .or_insert_with(|| canonical.to_string());
+        for alias in &profile.aliases {
+            let alias = alias.trim();
+            if !alias.is_empty() {
+                predicate_surfaces
+                    .entry(fold(alias))
+                    .or_insert_with(|| canonical.to_string());
+            }
+        }
+    }
+    for (index, profile) in profiles.iter().enumerate() {
+        let name = profile.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut surfaces = vec![(name.to_string(), name.to_string())];
+        surfaces.extend(
+            profile
+                .aliases
+                .iter()
+                .map(|alias| (alias.trim().to_string(), alias.trim().to_string())),
+        );
+        for (surface, _) in surfaces {
+            if surface.is_empty() {
+                continue;
+            }
+            let Some(predicate) = predicate_surfaces.get(&fold(&surface)) else {
+                continue;
+            };
+            if fold(predicate) == fold(name) {
+                continue;
+            }
+            c.warn(
+                "attribute_predicate_surface_conflict",
+                format!("attributes.profiles[{}]", index),
+                format!(
+                    "词面「{}」在属性档案中归一到「{}」，在谓词画像中归一到「{}」：导入/查询可能各说各话",
+                    surface, name, predicate
+                ),
+            );
+        }
+    }
+}
+
 fn check_entity_profiles(c: &mut Collector, config: &SystemConfig, type_names: &BTreeSet<String>) {
     let mut canonical_names: BTreeMap<String, usize> = BTreeMap::new();
     for (index, profile) in config.entity_profiles.iter().enumerate() {

@@ -973,6 +973,43 @@ process_error = "处理出错"
     }
 
     #[test]
+    fn attribute_profiles_report_duplicates_and_alias_conflicts() {
+        let source = format!(
+            "{}\n[attributes]\nenabled = true\n\n[[attributes.profiles]]\nname = \"height\"\naliases = [\"身高\", \"身高\"]\n\n[[attributes.profiles]]\nname = \"height\"\n\n[[attributes.profiles]]\nname = \"weight\"\naliases = [\"height\"]\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "duplicate_attribute_profile");
+        assert_code(&issues, "duplicate_attribute_alias");
+        assert_code(&issues, "attribute_alias_shadows_canonical");
+    }
+
+    #[test]
+    fn attribute_profiles_report_schema_and_unit_problems() {
+        let source = format!(
+            "{}\n[attributes]\nenabled = true\n\n[[attributes.profiles]]\nname = \"height\"\ndomain = [\"Persom\"]\nvalue_type = \"quantity\"\ndimension = \"length\"\nunit = \"千克\"\nparent = \"missing\"\n\n[[attributes.profiles]]\nname = \"甲\"\nparent = \"乙\"\n\n[[attributes.profiles]]\nname = \"乙\"\nparent = \"甲\"\n\n[[attributes.profiles]]\nname = \"width\"\ndimension = \"warp\"\nunit = \"不存在单位\"\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "unknown_attribute_domain_type");
+        assert_code(&issues, "attribute_unit_dimension_mismatch");
+        assert_code(&issues, "unknown_attribute_parent");
+        assert_code(&issues, "attribute_parent_cycle");
+        assert_code(&issues, "unknown_attribute_dimension");
+        assert_code(&issues, "unknown_attribute_unit");
+    }
+
+    #[test]
+    fn attribute_and_predicate_surface_divergence_is_reported() {
+        let source = format!(
+            "{}\n[[predicate_profiles]]\nname = \"年龄\"\naliases = [\"岁数\"]\n\n[attributes]\nenabled = true\n\n[[attributes.profiles]]\nname = \"age\"\naliases = [\"年龄\"]\ndomain = [\"Person\"]\nvalue_type = \"quantity\"\ndimension = \"duration\"\nunit = \"岁\"\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "attribute_predicate_surface_conflict");
+    }
+
+    #[test]
     fn parse_errors_are_returned() {
         assert!(lint_str("this is not toml = = =").is_err());
     }
