@@ -588,7 +588,20 @@ impl<'a> SearchPort<'a> {
         let batches: Vec<SearchBatch> = self
             .backends
             .iter_mut()
-            .map(|backend| backend.search(request))
+            .map(|backend| {
+                let capability = backend.capability();
+                if !capability.supports(request.mode) {
+                    return SearchBatch::empty(
+                        &capability.channel,
+                        request.mode,
+                        format!(
+                            "通道不支持 {} 模式；端口按能力声明跳过该 backend。",
+                            request.mode.label()
+                        ),
+                    );
+                }
+                backend.search(request)
+            })
             .collect();
         let (hits, receipt) = merge_batches(&batches, request);
         PortOutcome {
@@ -1503,6 +1516,42 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("多通道融合")));
+    }
+
+    struct LookupOnlyBackend;
+
+    impl SearchBackend for LookupOnlyBackend {
+        fn capability(&self) -> BackendCapability {
+            BackendCapability {
+                channel: "lookup-only".to_string(),
+                modes: vec![SearchMode::Lookup],
+                type_expansion: false,
+                certified_top_k: false,
+                cost: CostClass::Low,
+            }
+        }
+
+        fn search(&mut self, _request: &SearchRequest) -> SearchBatch {
+            panic!("端口不得调用不支持当前模式的 backend");
+        }
+    }
+
+    #[test]
+    fn port_skips_backends_that_do_not_support_the_mode() {
+        let mut port = SearchPort::new();
+        port.register(LookupOnlyBackend);
+        let request = SearchRequest {
+            mode: SearchMode::Enumerate,
+            ..dense_request()
+        };
+        let outcome = port.search(&request);
+        assert!(outcome.hits.is_empty());
+        assert_eq!(outcome.batches.len(), 1);
+        assert!(outcome.batches[0]
+            .receipt
+            .notes
+            .iter()
+            .any(|note| note.contains("跳过")));
     }
 
     #[test]
