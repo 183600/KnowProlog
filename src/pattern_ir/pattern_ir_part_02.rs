@@ -640,7 +640,7 @@ fn sort_matches(sort: &str, hints: &[String], token: &crate::nlp::TaggedWord) ->
     match sort {
         "城市" | "地点" => {
             crate::pos_ontology::tag_matches("ns", &token.pos)
-                || token.pos == "n"
+                || crate::pos_ontology::tag_matches("n", &token.pos)
                 || CITY_LITERALS.contains(&token.text.as_str())
                 || hints.iter().any(|hint| token.text.contains(hint.as_str()))
         }
@@ -664,7 +664,13 @@ fn sort_matches(sort: &str, hints: &[String], token: &crate::nlp::TaggedWord) ->
             crate::pos_ontology::is_entity_tag(&token.pos)
                 || PERSON_LITERALS.contains(&token.text.as_str())
         }
-        "属性" => matches!(token.pos.as_str(), "n" | "nz" | "vn"),
+        "属性" => {
+            let profile = crate::pos_ontology::profile(&token.pos);
+            profile.is_nominal()
+                && !profile.has_sort(crate::pos_ontology::Sort::Person)
+                && !profile.has_sort(crate::pos_ontology::Sort::Place)
+                && !profile.has_sort(crate::pos_ontology::Sort::Time)
+        }
         _ => true,
     }
 }

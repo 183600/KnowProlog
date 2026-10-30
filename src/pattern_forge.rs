@@ -666,19 +666,23 @@ fn learn_regex(tokens: &[TaggedWord]) -> (TokenRegex, BTreeMap<String, String>) 
         if text.is_empty() || is_punctuation(text) {
             continue;
         }
-        let atom = if token.pos == "nr" && !is_question_word(text) {
+        let atom = if crate::pos_ontology::tag_matches("nr", &token.pos) && !is_question_word(text) {
             let name = next_slot_name(&mut counts, "人物");
             fills.insert(name.clone(), text.to_string());
             ForgeAtom::slot(name, "人名")
-        } else if token.pos == "ns" && !is_question_word(text) {
+        } else if crate::pos_ontology::tag_matches("ns", &token.pos) && !is_question_word(text) {
             let name = next_slot_name(&mut counts, "地点");
             fills.insert(name.clone(), text.to_string());
             ForgeAtom::slot(name, "城市")
-        } else if (token.pos == "m" || token.pos == "q") && is_numeric(text) {
+        } else if (crate::pos_ontology::tag_matches("m", &token.pos)
+            || crate::pos_ontology::tag_matches("q", &token.pos))
+            && is_numeric(text)
+        {
             let name = next_slot_name(&mut counts, "数量");
             fills.insert(name.clone(), text.to_string());
             ForgeAtom::slot(name, "数量")
-        } else if (token.pos == "m" || token.pos == "q")
+        } else if (crate::pos_ontology::tag_matches("m", &token.pos)
+            || crate::pos_ontology::tag_matches("q", &token.pos))
             && is_date_like(text)
             && text.chars().any(|ch| ch.is_ascii_digit())
         {
