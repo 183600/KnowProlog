@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use crate::conversational_graph::{GraphFact, MatchOptions};
 use crate::dialogue_manager::{DialogueKnowledge, MoveKind};
-use crate::kg_pattern::{KgPatternDecl, KgPatternRegistry};
+use crate::kg_pattern::{KgPatternDecl, KgPatternRegistry, KgStatus};
 use crate::quantity::{self, Comparison, Quantity};
 /// 继承槽位的逻辑轮次时限。
 pub const FRAME_ENV_TTL: u64 = 8;
@@ -495,6 +495,8 @@ impl FrameProgram {
         }
 
         let mut proven: Vec<(usize, usize, Resolved, Executed)> = Vec::new();
+        let mut no_records: Option<(usize, usize, Resolved, Executed)> = None;
+        let mut fault: Option<(usize, usize, Resolved, Executed)> = None;
         let mut question: Option<(usize, usize, Resolved)> = None;
         for (frame_index, pattern_index) in &self.ranked {
             let frame = &self.frames[*frame_index];
@@ -513,12 +515,52 @@ impl FrameProgram {
                 continue;
             }
             if let Some(executed) = self.execute(frame, &resolved, knowledge) {
-                proven.push((*frame_index, *pattern_index, resolved, executed));
+                match &executed.status {
+                    FrameGoalStatus::Proven => {
+                        proven.push((*frame_index, *pattern_index, resolved, executed));
+                    }
+                    FrameGoalStatus::NoRecords => {
+                        if no_records.is_none() {
+                            no_records =
+                                Some((*frame_index, *pattern_index, resolved, executed));
+                        }
+                    }
+                    FrameGoalStatus::Fault(_) => {
+                        if fault.is_none() {
+                            fault = Some((*frame_index, *pattern_index, resolved, executed));
+                        }
+                    }
+                }
             }
         }
 
         if !proven.is_empty() {
             return Some(self.arbitrate_proven(memory, &normalized, proven, turn));
+        }
+
+        if let Some((frame_index, pattern_index, resolved, executed)) = no_records {
+            let frame = &self.frames[frame_index];
+            let pattern = &frame.patterns[pattern_index];
+            memory.commit(frame, &executed.bindings, &resolved.origins, turn);
+            memory.pending = None;
+            memory.pending_ambiguity = None;
+            self.remember_session(memory, frame, pattern, &executed, turn);
+            let mut outcome = self.outcome(frame, pattern, executed, turn);
+            outcome.plan.insert(0, "frame_no_records".to_string());
+            outcome.kind = MoveKind::Other;
+            return Some(outcome);
+        }
+
+        if let Some((frame_index, pattern_index, _resolved, executed)) = fault {
+            let frame = &self.frames[frame_index];
+            let pattern = &frame.patterns[pattern_index];
+            memory.pending = None;
+            memory.pending_ambiguity = None;
+            memory.turn = turn;
+            let mut outcome = self.outcome(frame, pattern, executed, turn);
+            outcome.plan.insert(0, "frame_fault".to_string());
+            outcome.kind = MoveKind::Other;
+            return Some(outcome);
         }
 
         let (frame_index, _pattern_index, resolved) = question?;
@@ -727,6 +769,7 @@ impl FrameProgram {
             entity: candidate.entity,
             attribute: candidate.attribute,
             answer_values: candidate.answer_values,
+            status: FrameGoalStatus::Proven,
         };
         self.remember_session(memory, frame, &pattern, &executed, turn);
         let mut outcome = self.outcome(frame, &pattern, executed, turn);
@@ -1160,6 +1203,7 @@ impl FrameProgram {
                     entity: Some(entity),
                     attribute: Some(attribute),
                     answer_values: values,
+                    status: FrameGoalStatus::Proven,
                 })
             }
             CompiledGoal::Relation {
@@ -1206,6 +1250,7 @@ impl FrameProgram {
                     entity: Some(subject),
                     attribute: Some(predicate),
                     answer_values: objects,
+                    status: FrameGoalStatus::Proven,
                 })
             }
             CompiledGoal::ReverseRelation {
@@ -1252,6 +1297,7 @@ impl FrameProgram {
                     entity: Some(object),
                     attribute: Some(predicate),
                     answer_values: subjects,
+                    status: FrameGoalStatus::Proven,
                 })
             }
             CompiledGoal::Count {
@@ -1294,6 +1340,7 @@ impl FrameProgram {
                     entity: Some(subject),
                     attribute: Some(predicate),
                     answer_values: Vec::new(),
+                    status: FrameGoalStatus::Proven,
                 })
             }
             CompiledGoal::Compare {
@@ -1351,6 +1398,7 @@ impl FrameProgram {
                     entity: evaluated.winner,
                     attribute: Some(attribute),
                     answer_values: Vec::new(),
+                    status: FrameGoalStatus::Proven,
                 })
             }
             CompiledGoal::Pattern {
@@ -1384,7 +1432,43 @@ impl FrameProgram {
                     MatchOptions::new(KG_FRAME_MAX_SOLUTIONS, KG_FRAME_MAX_EXPANSIONS),
                 );
                 if !result.is_proven() {
-                    return None;
+                    let status = match &result.status {
+                        KgStatus::NoRecords => FrameGoalStatus::NoRecords,
+                        KgStatus::Fault(detail) => FrameGoalStatus::Fault(detail.clone()),
+                        // 「未知」交给更强的管线，不在帧层说死。
+                        KgStatus::Unknown(_) | KgStatus::Proven => return None,
+                    };
+                    let mut bindings = resolved.bindings.clone();
+                    bindings.insert("values".to_string(), String::new());
+                    bindings.insert("count".to_string(), "0".to_string());
+                    let vars = self.render_vars(frame, &bindings, knowledge);
+                    let text = match &status {
+                        FrameGoalStatus::NoRecords => frame
+                            .realize_empty
+                            .as_ref()
+                            .and_then(|template| render_template(template, &vars))
+                            .unwrap_or_else(|| "没有找到匹配的记录。".to_string()),
+                        FrameGoalStatus::Fault(detail) => {
+                            format!("图谱模式「{}」执行故障：{}。", spec.id(), detail)
+                        }
+                        FrameGoalStatus::Proven => unreachable!(),
+                    };
+                    let mut evidence = vec![format!(
+                        "图谱模式「{}」状态：{}（指纹 {}）",
+                        spec.id(),
+                        status.label(),
+                        spec.semantic_fingerprint()
+                    )];
+                    evidence.extend(result.evidence_lines());
+                    return Some(Executed {
+                        text,
+                        bindings,
+                        evidence,
+                        entity: None,
+                        attribute: None,
+                        answer_values: Vec::new(),
+                        status,
+                    });
                 }
                 let values = result.answer_values();
                 let mut bindings = resolved.bindings.clone();
@@ -1450,6 +1534,7 @@ impl FrameProgram {
                     entity,
                     attribute,
                     answer_values: values,
+                    status: FrameGoalStatus::Proven,
                 })
             }
         }

@@ -364,6 +364,23 @@ struct QuestionPlan {
     prompt: String,
     pending: PendingFrame,
 }
+/// 目标执行的三态：得证、封闭世界确无记录、引擎故障。
+/// 「未知」不在此列：它应当回退到更强的管线，而不是被帧层说死。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrameGoalStatus {
+    Proven,
+    NoRecords,
+    Fault(String),
+}
+impl FrameGoalStatus {
+    fn label(&self) -> &'static str {
+        match self {
+            FrameGoalStatus::Proven => "proven",
+            FrameGoalStatus::NoRecords => "no_records",
+            FrameGoalStatus::Fault(_) => "fault",
+        }
+    }
+}
 struct Executed {
     text: String,
     bindings: BTreeMap<String, String>,
@@ -373,6 +390,7 @@ struct Executed {
     /// 目标证明出的完整答案集合（按确定序）；只用于多轮枚举，不参与
     /// 本轮措辞之外的推测。
     answer_values: Vec<String>,
+    status: FrameGoalStatus,
 }
 /// 一轮帧规划结果（对话层据此记账，不直接打印）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1490,6 +1508,83 @@ output = "value"
         assert!(outcome.text.contains("226"), "{}", outcome.text);
         assert!(outcome.text.contains("依据：实体「姚明」"), "{}", outcome.text);
         assert!(outcome.text.contains("身高"), "{}", outcome.text);
+    }
+
+    #[test]
+    fn pattern_no_records_is_reported_as_closed_world_absence() {
+        let program = FrameProgram::compile(&config(r#"
+enabled = true
+
+[[kg_patterns]]
+id = "knows"
+atoms = [{ subject = "?x", predicate = "knows", object = "?y" }]
+select = ["y"]
+
+[[frames]]
+id = "knows"
+patterns = ["{entity}认识谁"]
+realize = { empty = "没有查到{entity}认识的人。" }
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "person"
+sort = "text"
+[frames.goal]
+kind = "pattern"
+pattern = "knows"
+[frames.goal.bind]
+"?x" = "entity"
+"?y" = "person"
+"#)).expect("无记录配置应可编译");
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(&mut memory, "姚明认识谁", &FakeKnowledge::new(), 1)
+            .expect("封闭事实集无解应显式回答");
+        assert!(outcome.text.contains("没有查到姚明认识的人"), "{}", outcome.text);
+        assert!(outcome
+            .plan
+            .iter()
+            .any(|plan| plan == "frame_no_records"));
+        assert_eq!(memory.answered(), 1);
+        assert!(memory.session_frame().is_none());
+    }
+
+    #[test]
+    fn pattern_engine_fault_is_reported_instead_of_falling_through() {
+        let program = FrameProgram::compile(&config(r#"
+enabled = true
+
+[[kg_patterns]]
+id = "broken"
+atoms = [{ subject = "?x", predicate = "?p", object = "?y" }]
+select = ["y"]
+
+[[frames]]
+id = "broken"
+patterns = ["{entity}和谁有关"]
+[[frames.slots]]
+name = "entity"
+sort = "entity"
+required = true
+[[frames.slots]]
+name = "person"
+sort = "text"
+[frames.goal]
+kind = "pattern"
+pattern = "broken"
+[frames.goal.bind]
+"?x" = "entity"
+"?y" = "person"
+"#)).expect("故障配置应可编译");
+        let mut memory = FrameMemory::new();
+        let outcome = program
+            .plan(&mut memory, "姚明和谁有关", &FakeKnowledge::new(), 1)
+            .expect("引擎故障应显式回答");
+        assert!(outcome.text.contains("执行故障"), "{}", outcome.text);
+        assert!(outcome.plan.iter().any(|plan| plan == "frame_fault"));
+        assert_eq!(memory.answered(), 0);
     }
 
     struct FriendsKnowledge;
