@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::Serialize;
 
 use crate::nlp::shared_jieba;
+use crate::pos_ontology;
 
 /// 规范框架的句法构式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -672,6 +673,15 @@ fn classify_token(word: &str, pos: &str) -> TokenKind {
     }
     if pos.starts_with('m') {
         return TokenKind::Number;
+    }
+    if pos_ontology::tag_matches("n", pos) {
+        return TokenKind::Noun;
+    }
+    if pos_ontology::tag_matches("v", pos) {
+        return TokenKind::Verb;
+    }
+    if pos_ontology::tag_matches("a", pos) {
+        return TokenKind::Adjective;
     }
     if pos.starts_with('q') {
         return TokenKind::Measure;
@@ -2466,6 +2476,13 @@ mod tests {
         let frames = compile_frames(&tree);
         assert_eq!(frames.len(), 1, "{} => {:?}", text, frames);
         frames.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn classify_token_uses_ontology_closure_for_residual_tags() {
+        assert_eq!(classify_token("简称", "j"), TokenKind::Noun);
+        assert_eq!(classify_token("某地", "s"), TokenKind::Noun);
+        assert_eq!(classify_token("名词化", "vn"), TokenKind::Verb);
     }
 
     #[test]

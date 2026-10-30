@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context_image::fnv1a_hex;
 use crate::nlp::{merge_name_fragments, normalize_words, preprocess, TaggedWord};
+use crate::pos_ontology;
 use crate::{KnowledgeExtractor, KnowledgeItem, SystemConfig};
 
 pub const BATCH_DIALECT: &str = "knowprolog-batch-teach/1";
@@ -719,7 +720,7 @@ fn pos_matches(token: &TaggedWord, expected: &str) -> bool {
     if expected.is_empty() || expected == "*" || expected == "unknown" {
         return !FUNCTION_POS.contains(&token.pos.as_str());
     }
-    token.pos == expected
+    pos_ontology::tag_matches(expected, &token.pos)
 }
 
 fn match_atoms(atoms: &[RuleAtom], tokens: &[TaggedWord]) -> Vec<(String, String)> {
@@ -1164,6 +1165,18 @@ process_error = ""
             min_purity: 800,
             ..BatchOptions::default()
         }
+    }
+
+    #[test]
+    fn rule_pos_matching_follows_ontology_closure() {
+        let tag = |pos: &str| TaggedWord {
+            text: "词".to_string(),
+            pos: pos.to_string(),
+        };
+        assert!(pos_matches(&tag("nrfg"), "nr"));
+        assert!(pos_matches(&tag("vn"), "v"));
+        assert!(pos_matches(&tag("vn"), "n"));
+        assert!(!pos_matches(&tag("ns"), "nr"));
     }
 
     #[test]
