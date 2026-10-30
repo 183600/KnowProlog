@@ -178,21 +178,23 @@ impl SymbolicReasoner {
         // 实体属性（非关系型三元组）同样沿属性槽位命中：属性查询与关系查询
         // 走同一条链，逆向（反查主体）暂不支持属性。
         if !predicate.inverted {
-            let key = (node.to_string(), predicate.slot.clone());
-            let mut values = self.attribute_index.get(&key);
-            if values.is_none() {
-                // 图谱里常见英文属性键（JSON-LD 的 name/age/height…），
-                // 用户却按中文词面提问（姓名/年龄/身高…）。仅在中文槽位
-                // 无命中时回退到对照表，避免覆盖真实的中文谓词。
-                if let Some(canonical) =
-                    crate::symbolic_generator::canonical_predicate_key(&predicate.surface)
-                {
-                    values = self
-                        .attribute_index
-                        .get(&(node.to_string(), canonical.to_string()));
-                }
+            let mut keys = vec![predicate.slot.clone()];
+            // 图谱里常见英文属性键（JSON-LD 的 name/age/height…），
+            // 用户却按中文词面提问（姓名/年龄/身高…）。仅在中文槽位
+            // 无命中时回退到对照表，避免覆盖真实的中文谓词。
+            if let Some(canonical) =
+                crate::symbolic_generator::canonical_predicate_key(&predicate.surface)
+            {
+                keys.push(canonical.to_string());
             }
-            if let Some(values) = values {
+            // 父属性查询召回子属性事实（「身高」→「净身高」）。
+            keys.extend(self.attribute_profiles.lookup_keys(&predicate.surface));
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                let Some(values) = self.attribute_index.get(&(node.to_string(), key)) else {
+                    continue;
+                };
                 for value in values {
                     if seen.insert(value.clone()) {
                         hits.push(ValueHit {

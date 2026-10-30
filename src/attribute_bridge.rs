@@ -477,6 +477,25 @@ impl AttributeRegistry {
         result.into_iter().collect()
     }
 
+    /// 查询键闭包：规范名、别名与全部子属性的规范名/别名（含自身）。
+    ///
+    /// 「身高」查询要能召回「净身高」这类子属性事实；返回顺序确定，
+    /// 供属性倒排索引逐键查找。
+    pub fn lookup_keys(&self, surface: &str) -> Vec<String> {
+        let Some(profile) = self.resolve(surface) else {
+            return Vec::new();
+        };
+        let mut keys = BTreeSet::new();
+        for canonical in self.subattributes_of(&profile.canonical) {
+            let Some(child) = self.profile(&canonical) else {
+                continue;
+            };
+            keys.insert(child.canonical.clone());
+            keys.extend(child.aliases.iter().cloned());
+        }
+        keys.into_iter().collect()
+    }
+
     /// 全部可命中的词面（按长度降序，供最长匹配抽取）。
     pub fn extraction_surfaces(&self) -> Vec<(String, String)> {
         let mut surfaces: Vec<(String, String)> = Vec::new();
@@ -1372,6 +1391,21 @@ patterns = [{ pos_pattern = ["nr"], keyword_patterns = ["公司"], property_mapp
             unknown_attribute.verdict,
             AttributeVerdict::UnknownAttribute
         );
+    }
+
+    #[test]
+    fn lookup_keys_include_aliases_and_subattributes() {
+        let registry = AttributeRegistry::from_config(&sample_config());
+        let parent_keys = registry.lookup_keys("身高");
+        for expected in ["height", "net_height", "身高", "净身高", "身长"] {
+            assert!(parent_keys.iter().any(|key| key == expected), "{parent_keys:?}");
+        }
+        assert_eq!(parent_keys.len(), 5, "{parent_keys:?}");
+        assert_eq!(
+            registry.lookup_keys("净身高"),
+            vec!["net_height".to_string(), "净身高".to_string()]
+        );
+        assert!(registry.lookup_keys("未登记").is_empty());
     }
 
     #[test]

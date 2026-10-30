@@ -467,6 +467,55 @@
     }
 
     #[test]
+    fn parent_attribute_query_recalls_child_attribute_facts() {
+        use crate::attribute_bridge::{
+            AttributeBridgeConfig, AttributeProfileConfig, AttributeValueType,
+        };
+
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.configure_attributes(&AttributeBridgeConfig {
+            enabled: true,
+            profiles: vec![
+                AttributeProfileConfig {
+                    name: "height".to_string(),
+                    aliases: vec!["身高".to_string()],
+                    domain: vec!["人".to_string()],
+                    value_type: AttributeValueType::Quantity,
+                    dimension: Some("length".to_string()),
+                    unit: Some("厘米".to_string()),
+                    ..Default::default()
+                },
+                AttributeProfileConfig {
+                    name: "net_height".to_string(),
+                    aliases: vec!["净身高".to_string()],
+                    domain: vec!["人".to_string()],
+                    value_type: AttributeValueType::Quantity,
+                    dimension: Some("length".to_string()),
+                    unit: Some("厘米".to_string()),
+                    parent: Some("height".to_string()),
+                    ..Default::default()
+                },
+            ],
+        });
+        let mut properties = HashMap::new();
+        properties.insert("净身高".to_string(), "226cm".to_string());
+        reasoner.observe_facts(&[PrologFact::Entity {
+            name: "姚明".to_string(),
+            entity_type: "人".to_string(),
+            properties,
+        }]);
+
+        let answer = reasoner
+            .answer("姚明身高多少厘米")
+            .expect("父属性查询应召回子属性事实");
+        assert!(answer.contains("226厘米"), "{answer}");
+        let plain = reasoner
+            .answer("姚明身高是多少")
+            .expect("无单位父属性查询也应召回子属性事实");
+        assert!(plain.contains("226"), "{plain}");
+    }
+
+    #[test]
     fn type_memory_answers_profiles_comparisons_and_members() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         let mut person_properties = HashMap::new();

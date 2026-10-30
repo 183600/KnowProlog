@@ -371,8 +371,11 @@ impl SymbolicReasoner {
             return None;
         }
         let profile = self.attribute_profiles.profile(&request.attribute)?;
-        let mut keys = vec![profile.canonical.clone()];
-        keys.extend(profile.aliases.iter().cloned());
+        let mut keys = self.attribute_profiles.lookup_keys(&request.surface);
+        if keys.is_empty() {
+            keys.push(profile.canonical.clone());
+            keys.extend(profile.aliases.iter().cloned());
+        }
         if let Some(label) = crate::symbolic_generator::localized_predicate_key(&profile.canonical)
         {
             keys.push(label.to_string());
