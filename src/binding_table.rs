@@ -1105,6 +1105,18 @@ pub struct StoreReceipt {
     pub truncated: bool,
 }
 
+/// 形状复用计划：能直接用的行与只能当模板的形状必须分开。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableReuse<'a> {
+    /// 同版本、同完整形状且覆盖允许：可以直接复用这些行。
+    Rows(&'a BindingTable),
+    /// 只复用理解结构：固定输入或版本不同，必须按 `target` 重新执行。
+    Rerun {
+        template: &'a BindingTable,
+        target: TableShape,
+    },
+}
+
 /// 有界绑定表台账：默认 8 张、每张 256 行。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BindingTableStore {
@@ -1230,6 +1242,30 @@ impl BindingTableStore {
                 .then_with(|| left.id.cmp(&right.id))
         });
         candidates
+    }
+
+    /// 决定一次新问句能否直接复用旧行，还是只能复用形状后重新执行。
+    ///
+    /// 这是「点表不能随便实例化」的执行闸门：只有完整形状相同、知识版本
+    /// 相同且覆盖允许（全表/域表，或同一点表）时才返回 [`TableReuse::Rows`]；
+    /// 换实体、旧版本、部分表一律退化为 [`TableReuse::Rerun`]。
+    pub fn reuse(&self, target: &TableShape, revision: u64) -> Option<TableReuse<'_>> {
+        let candidates = self.route(target, revision);
+        if let Some(exact) = candidates.iter().copied().find(|table| {
+            table.shape.key() == target.key()
+                && table.revision == revision
+                && table.invalidated.is_none()
+                && (table.coverage.is_point() || table.coverage.is_complete())
+        }) {
+            return Some(TableReuse::Rows(exact));
+        }
+        candidates
+            .first()
+            .copied()
+            .map(|template| TableReuse::Rerun {
+                template,
+                target: target.clone(),
+            })
     }
 
     pub fn stale_reports(
@@ -1665,6 +1701,66 @@ mod tests {
         assert_eq!(stale_routes.len(), 2, "旧版本仍可复用形状");
         assert!(stale_routes.iter().all(|table| table.revision != 8));
         assert!(stale_routes.iter().all(|table| !table.rows_reusable_at(8)));
+    }
+
+    #[test]
+    fn reuse_plan_only_reuses_sound_rows_and_reruns_shape_templates() {
+        let mut store = BindingTableStore::new();
+        let complete = height_table();
+        let complete_id = store.insert(complete).unwrap().id;
+
+        assert!(matches!(
+            store.reuse(&height_shape(), 7),
+            Some(TableReuse::Rows(table)) if table.id == complete_id
+        ));
+
+        let other_entity = height_shape().pin("e", BoundTerm::text("李四"));
+        match store.reuse(&other_entity, 7) {
+            Some(TableReuse::Rerun { template, target }) => {
+                assert_eq!(template.id, complete_id);
+                assert_eq!(target.key(), other_entity.key());
+            }
+            other => panic!("换实体只能复用形状：{:?}", other),
+        }
+
+        assert!(
+            matches!(
+                store.reuse(&height_shape(), 8),
+                Some(TableReuse::Rerun { .. })
+            ),
+            "旧版本不能直接复用行"
+        );
+
+        let mut point = BindingTable::new(
+            height_shape().pin("e", BoundTerm::text("张三")),
+            Coverage::Point,
+            7,
+        );
+        point
+            .add_row(
+                BindingRow::from_pairs([
+                    ("e", BoundTerm::text("张三")),
+                    ("v", BoundTerm::classify("226")),
+                ])
+                .with_evidence([triple("张三", "height", "226")]),
+            )
+            .unwrap();
+        let point_id = store.insert(point).unwrap().id;
+        let zhangsan = height_shape().pin("e", BoundTerm::text("张三"));
+        assert!(
+            matches!(
+                store.reuse(&zhangsan, 7),
+                Some(TableReuse::Rows(table)) if table.id == point_id
+            ),
+            "同一点表可以直接回答同一个点"
+        );
+        assert!(
+            matches!(
+                store.reuse(&other_entity, 7),
+                Some(TableReuse::Rerun { .. })
+            ),
+            "点表绝不能实例化到李四"
+        );
     }
 
     #[test]
