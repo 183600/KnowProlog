@@ -4,6 +4,7 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::mention_lexicon::{LexiconStatus, MentionLexicon};
+use crate::nlp::TaggedWord;
 use crate::synonym_graph::{
     SynonymContext, SynonymGraph, SynonymKind, SynonymSense, SurfaceChoice,
 };
@@ -410,6 +411,21 @@ impl LexicalTransducer {
     where
         F: Fn(&str, &str) -> bool,
     {
+        self.transduce_with_hint(text, context, kind_filter, |_, _| None, type_compatible)
+    }
+
+    pub fn transduce_with_hint<F, K>(
+        &self,
+        text: &str,
+        context: &SynonymContext,
+        kind_filter: Option<SynonymKind>,
+        hint: K,
+        type_compatible: F,
+    ) -> Transduction
+    where
+        F: Fn(&str, &str) -> bool,
+        K: Fn(&str, CharSpan) -> Option<SynonymKind>,
+    {
         let projection = TextProjection::new(text, Default::default());
         let normalized = projection.normalized();
         let chars: Vec<char> = normalized.chars().collect();
@@ -421,11 +437,7 @@ impl LexicalTransducer {
         let selected = self.select_spans(&chars);
         let mut tokens: Vec<TransducedToken> = Vec::with_capacity(selected.len());
         for (start, end, surface) in selected {
-            let rules: Vec<&TransducerRule> = self
-                .rules_for(&surface)
-                .into_iter()
-                .filter(|rule| kind_filter.map_or(true, |kind| rule.kind == kind))
-                .collect();
+            let rules = self.rules_for(&surface);
             if rules.is_empty() {
                 continue;
             }
@@ -435,6 +447,14 @@ impl LexicalTransducer {
             else {
                 continue;
             };
+            let hinted_kind = kind_filter.or_else(|| hint(&surface, anchor.raw_chars));
+            let rules: Vec<&TransducerRule> = rules
+                .into_iter()
+                .filter(|rule| hinted_kind.map_or(true, |kind| rule.kind == kind))
+                .collect();
+            if rules.is_empty() {
+                continue;
+            }
             if let Some(quote) = protected
                 .iter()
                 .find(|range| start >= range.start && end <= range.end)
@@ -708,6 +728,222 @@ impl EchoLedger {
             .map(|surface| vec![surface.to_string()])
             .unwrap_or_default();
         graph.surface_for(canonical, kind, context, &echoes)
+    }
+}
+
+pub fn transduce_tagged_words<F, N>(
+    input: &str,
+    words: &[TaggedWord],
+    transducer: &LexicalTransducer,
+    context: &SynonymContext,
+    type_compatible: F,
+    normalize: N,
+) -> (Vec<TaggedWord>, Transduction)
+where
+    F: Fn(&str, &str) -> bool,
+    N: Fn(&TaggedWord) -> TaggedWord,
+{
+    let aligned = align_words(input, words);
+    let transduction = transducer.transduce_with_hint(
+        input,
+        context,
+        None,
+        |_, raw| kind_hint(words, &aligned, raw),
+        type_compatible,
+    );
+    let chars: Vec<char> = input.chars().collect();
+    let rewrites: Vec<&TransducedToken> = transduction
+        .tokens
+        .iter()
+        .filter(|token| token.decision.rewrites())
+        .collect();
+    let guards: Vec<CharSpan> = transduction
+        .tokens
+        .iter()
+        .filter(|token| !token.decision.rewrites())
+        .map(|token| token.anchor.raw_chars)
+        .collect();
+    let mut pieces = Vec::new();
+    for (word, span) in words.iter().zip(aligned.iter()) {
+        let Some(span) = *span else {
+            pieces.push((None, word.clone()));
+            continue;
+        };
+        let mut cuts = vec![span.start, span.end];
+        for rewrite in &rewrites {
+            let raw = rewrite.anchor.raw_chars;
+            if raw.start > span.start && raw.start < span.end {
+                cuts.push(raw.start);
+            }
+            if raw.end > span.start && raw.end < span.end {
+                cuts.push(raw.end);
+            }
+        }
+        for guard in &guards {
+            if guard.start > span.start && guard.start < span.end {
+                cuts.push(guard.start);
+            }
+            if guard.end > span.start && guard.end < span.end {
+                cuts.push(guard.end);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (start, end) = (pair[0], pair[1]);
+            if start >= end || end > chars.len() {
+                continue;
+            }
+            pieces.push((
+                Some(CharSpan::new(start, end)),
+                TaggedWord {
+                    text: chars[start..end].iter().collect(),
+                    pos: word.pos.clone(),
+                },
+            ));
+        }
+    }
+
+    let mut output = Vec::with_capacity(words.len() + rewrites.len());
+    let mut piece_index = 0;
+    let mut rewrite_index = 0;
+    while piece_index < pieces.len() || rewrite_index < rewrites.len() {
+        let piece = pieces.get(piece_index);
+        let rewrite = rewrites.get(rewrite_index).map(|token| token.anchor.raw_chars);
+        match (rewrite, piece) {
+            (Some(raw), Some((Some(span), _))) if span.start >= raw.start && span.start < raw.end => {
+                let token = rewrites[rewrite_index];
+                output.push(TaggedWord {
+                    text: token.sense.clone(),
+                    pos: token.pos.clone(),
+                });
+                rewrite_index += 1;
+                while piece_index < pieces.len() {
+                    if let (Some(span), _) = &pieces[piece_index] {
+                        if span.start < raw.end {
+                            piece_index += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+            }
+            (Some(_), Some((Some(span), _))) if span.end <= rewrite.expect("rewrite").start => {
+                emit_piece(
+                    &pieces[piece_index],
+                    &guards,
+                    &normalize,
+                    &mut output,
+                );
+                piece_index += 1;
+            }
+            (Some(_), Some((None, _))) => {
+                let token = rewrites[rewrite_index];
+                output.push(TaggedWord {
+                    text: token.sense.clone(),
+                    pos: token.pos.clone(),
+                });
+                rewrite_index += 1;
+            }
+            (Some(_), _) => {
+                let token = rewrites[rewrite_index];
+                output.push(TaggedWord {
+                    text: token.sense.clone(),
+                    pos: token.pos.clone(),
+                });
+                rewrite_index += 1;
+            }
+            (None, Some(_)) => {
+                emit_piece(
+                    &pieces[piece_index],
+                    &guards,
+                    &normalize,
+                    &mut output,
+                );
+                piece_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    (output, transduction)
+}
+
+fn emit_piece<N>(
+    piece: &(Option<CharSpan>, TaggedWord),
+    guards: &[CharSpan],
+    normalize: &N,
+    output: &mut Vec<TaggedWord>,
+) where
+    N: Fn(&TaggedWord) -> TaggedWord,
+{
+    let (span, word) = piece;
+    let guarded = span
+        .map(|span| {
+            guards
+                .iter()
+                .any(|guard| span.start >= guard.start && span.end <= guard.end)
+        })
+        .unwrap_or(false);
+    if guarded {
+        output.push(word.clone());
+    } else {
+        output.push(normalize(word));
+    }
+}
+
+fn align_words(input: &str, words: &[TaggedWord]) -> Vec<Option<CharSpan>> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut cursor = 0usize;
+    let mut aligned = Vec::with_capacity(words.len());
+    for word in words {
+        let needle: Vec<char> = word.text.chars().collect();
+        if needle.is_empty() {
+            aligned.push(None);
+            continue;
+        }
+        let mut found = None;
+        if needle.len() <= chars.len() {
+            for start in cursor..=chars.len() - needle.len() {
+                if chars[start..start + needle.len()] == needle[..] {
+                    found = Some(CharSpan::new(start, start + needle.len()));
+                    break;
+                }
+            }
+        }
+        if let Some(span) = found {
+            cursor = span.end;
+            aligned.push(Some(span));
+        } else {
+            aligned.push(None);
+        }
+    }
+    aligned
+}
+
+fn kind_hint(
+    words: &[TaggedWord],
+    aligned: &[Option<CharSpan>],
+    raw: CharSpan,
+) -> Option<SynonymKind> {
+    let mut seen = false;
+    let mut verb = false;
+    for (word, span) in words.iter().zip(aligned.iter()) {
+        let Some(span) = span else {
+            continue;
+        };
+        if span.start < raw.end && raw.start < span.end {
+            seen = true;
+            if word.pos.starts_with('v') {
+                verb = true;
+            }
+        }
+    }
+    if verb {
+        Some(SynonymKind::Predicate)
+    } else if seen {
+        Some(SynonymKind::Entity)
+    } else {
+        None
     }
 }
 
@@ -1021,6 +1257,97 @@ mod tests {
             |left, right| left == right,
         );
         assert_eq!(predicate.normalized, "我配偶是老师");
+    }
+
+    fn tagged(words: &[(&str, &str)]) -> Vec<TaggedWord> {
+        words
+            .iter()
+            .map(|(text, pos)| TaggedWord {
+                text: text.to_string(),
+                pos: pos.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tagged_words_use_pos_to_resolve_cross_layer_homographs() {
+        let transducer = LexicalTransducer::new(
+            vec![
+                TransducerRule::new("老婆", "妻子", SynonymKind::Entity, "n"),
+                TransducerRule::new("老师", "师傅", SynonymKind::Predicate, "v"),
+            ],
+            TransducerOptions::default(),
+        );
+        let words = tagged(&[("我", "r"), ("老婆", "n"), ("是", "v"), ("老师", "n")]);
+        let (output, _) = transduce_tagged_words(
+            "我老婆是老师",
+            &words,
+            &transducer,
+            &SynonymContext::new(),
+            |left, right| left == right,
+            |word| word.clone(),
+        );
+        let texts: Vec<&str> = output.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(texts, vec!["我", "妻子", "是", "老师"]);
+    }
+
+    #[test]
+    fn tagged_words_merge_a_surface_split_across_tokens() {
+        let transducer = LexicalTransducer::new(
+            vec![TransducerRule::new(
+                "未名科技公司",
+                "未名科技",
+                SynonymKind::Entity,
+                "nt",
+            )],
+            TransducerOptions::default(),
+        );
+        let words = tagged(&[
+            ("未名", "n"),
+            ("科技", "n"),
+            ("公司", "n"),
+            ("发布", "v"),
+            ("新品", "n"),
+        ]);
+        let (output, _) = transduce_tagged_words(
+            "未名科技公司发布新品",
+            &words,
+            &transducer,
+            &SynonymContext::new(),
+            |left, right| left == right,
+            |word| word.clone(),
+        );
+        let texts: Vec<&str> = output.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(texts, vec!["未名科技", "发布", "新品"]);
+    }
+
+    #[test]
+    fn tagged_words_keep_protected_mentions_verbatim() {
+        let transducer = LexicalTransducer::new(
+            vec![rule("老婆", "妻子")],
+            TransducerOptions::default(),
+        );
+        let words = tagged(&[("“", "x"), ("老婆", "n"), ("”", "x"), ("是", "v"), ("谁", "r")]);
+        let (output, transduction) = transduce_tagged_words(
+            "“老婆”是谁",
+            &words,
+            &transducer,
+            &SynonymContext::new(),
+            |left, right| left == right,
+            |word| {
+                if word.text == "老婆" {
+                    TaggedWord {
+                        text: "妻子".to_string(),
+                        pos: word.pos.clone(),
+                    }
+                } else {
+                    word.clone()
+                }
+            },
+        );
+        let texts: Vec<&str> = output.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(texts, vec!["“", "老婆", "”", "是", "谁"]);
+        assert_eq!(transduction.receipt.protected_mentions, 1);
     }
 
     #[test]
