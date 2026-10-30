@@ -26,7 +26,7 @@ use crate::conversational_graph::{
 };
 
 /// KGP-IR 版本；语义或指纹算法不兼容变更时递增。
-pub const KG_PATTERN_VERSION: &str = "kgp/0.1";
+pub const KG_PATTERN_VERSION: &str = "kgp/0.2";
 
 /// `[kg_patterns]` 配置：默认关闭；关闭时仍会编译校验，便于配置体检。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +226,17 @@ pub struct KgPattern {
     count_only: bool,
 }
 
+/// 一次语义标号的结果：指纹、规范材料，以及是否完成精确枚举。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KgPatternIdentity {
+    pub fingerprint: String,
+    pub canonical: String,
+    pub complete: bool,
+}
+
+/// 颜色类内最多枚举多少种重命名（8 个同类变量 = 40320）。
+const MAX_CANONICAL_LABELINGS: u64 = 40_320;
+
 impl KgPattern {
     pub fn id(&self) -> &str {
         &self.id
@@ -270,58 +281,43 @@ impl KgPattern {
         self.select.iter().any(|name| name == variable)
     }
 
-    /// 语义指纹：变量名按首次出现顺序 alpha-归一化，原子与过滤器排序后哈希。
+    /// 语义指纹：在变量重命名与原子/过滤器声明顺序下保持不变。
+    ///
+    /// 多原子模式不能按「首次出现」编号：交换两条原子的声明顺序会改变
+    /// 编号。这里把模式看成带标签的二部图（变量、常量、原子、过滤器），
+    /// 先用颜色细化求稳定划分，再在颜色类内枚举重命名，取字典序最小的
+    /// 规范材料。颜色类内组合数超过 [`MAX_CANONICAL_LABELINGS`] 时退化为
+    /// 按名称排序的确定性标号；此时同键仍蕴含等价，但不同键只表示未知。
     pub fn semantic_fingerprint(&self) -> String {
-        let mut raw_atoms: Vec<String> = self.atoms.iter().map(render_atom_raw).collect();
-        raw_atoms.sort();
+        self.semantic_identity().fingerprint
+    }
 
-        let mut mapping: BTreeMap<String, String> = BTreeMap::new();
-        for atom in &self.atoms {
-            for term in [&atom.subject, &atom.predicate, &atom.object] {
-                if let Some(name) = term.var_name() {
-                    let next = format!("v{}", mapping.len());
-                    mapping.entry(name.to_string()).or_insert(next);
-                }
-            }
-        }
+    /// 可审计的语义身份：指纹、规范材料与标号是否完整。
+    pub fn semantic_identity(&self) -> KgPatternIdentity {
+        let mut atoms = self.atoms.clone();
+        atoms.sort_by_key(render_atom_raw);
+        atoms.dedup_by_key(|atom| render_atom_raw(atom));
 
-        let mut atom_lines: Vec<String> = self
-            .atoms
-            .iter()
-            .map(|atom| render_atom_canonical(atom, &mapping))
-            .collect();
-        atom_lines.sort();
-        atom_lines.dedup();
+        let mut filters = self.filters.clone();
+        filters.sort_by_key(render_filter_raw);
+        filters.dedup_by_key(|filter| render_filter_raw(filter));
 
-        let mut filter_lines: Vec<String> = self
-            .filters
-            .iter()
-            .map(|filter| render_filter_canonical(filter, &mapping))
-            .collect();
-        filter_lines.sort();
-        filter_lines.dedup();
-
-        let mut select_lines: Vec<String> = self
-            .select
-            .iter()
-            .map(|name| {
-                mapping
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| format!("?{}", name))
-            })
-            .collect();
-        select_lines.sort();
-
-        let material = format!(
-            "{}|atoms:{}|filters:{}|select:{}|count:{}",
-            KG_PATTERN_VERSION,
-            atom_lines.join(";"),
-            filter_lines.join(";"),
-            select_lines.join(","),
-            u8::from(self.count_only)
+        let render = |mapping: &BTreeMap<String, String>| {
+            render_pattern_material(&atoms, &filters, &self.select, self.count_only, mapping)
+        };
+        let (mapping, complete) = canonical_variable_mapping(&atoms, &filters, &self.select, render);
+        let canonical = render_pattern_material(
+            &atoms,
+            &filters,
+            &self.select,
+            self.count_only,
+            &mapping,
         );
-        fnv1a_hex(material.as_bytes())
+        KgPatternIdentity {
+            fingerprint: fnv1a_hex(canonical.as_bytes()),
+            canonical,
+            complete,
+        }
     }
 
     fn compile(decl: &KgPatternDecl, path: &str) -> Result<Self, Vec<KgCompileError>> {
@@ -783,6 +779,15 @@ fn render_term_canonical(term: &KgTerm, mapping: &BTreeMap<String, String>) -> S
     }
 }
 
+fn render_filter_raw(filter: &KgFilter) -> String {
+    match filter {
+        KgFilter::Equal { var, value } => format!("equal({},{})", var, value),
+        KgFilter::NotEqual { var, value } => format!("not_equal({},{})", var, value),
+        KgFilter::Type { var, of } => format!("type({},{})", var, of),
+        KgFilter::NotType { var, of } => format!("not_type({},{})", var, of),
+    }
+}
+
 fn render_filter_canonical(filter: &KgFilter, mapping: &BTreeMap<String, String>) -> String {
     let canonical = |name: &str| {
         mapping
@@ -796,6 +801,309 @@ fn render_filter_canonical(filter: &KgFilter, mapping: &BTreeMap<String, String>
         KgFilter::Type { var, of } => format!("type({},{})", canonical(var), of),
         KgFilter::NotType { var, of } => format!("not_type({},{})", canonical(var), of),
     }
+}
+
+fn render_pattern_material(
+    atoms: &[KgAtom],
+    filters: &[KgFilter],
+    select: &[String],
+    count_only: bool,
+    mapping: &BTreeMap<String, String>,
+) -> String {
+    let mut atom_lines: Vec<String> = atoms
+        .iter()
+        .map(|atom| render_atom_canonical(atom, mapping))
+        .collect();
+    atom_lines.sort();
+    atom_lines.dedup();
+
+    let mut filter_lines: Vec<String> = filters
+        .iter()
+        .map(|filter| render_filter_canonical(filter, mapping))
+        .collect();
+    filter_lines.sort();
+    filter_lines.dedup();
+
+    let mut select_lines: Vec<String> = select
+        .iter()
+        .map(|name| {
+            mapping
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| format!("?{}", name))
+        })
+        .collect();
+    select_lines.sort();
+    select_lines.dedup();
+
+    format!(
+        "{}|atoms:{}|filters:{}|select:{}|count:{}",
+        KG_PATTERN_VERSION,
+        atom_lines.join(";"),
+        filter_lines.join(";"),
+        select_lines.join(","),
+        u8::from(count_only)
+    )
+}
+
+fn build_label_graph(
+    atoms: &[KgAtom],
+    filters: &[KgFilter],
+    select: &[String],
+) -> (Vec<String>, Vec<(usize, &'static str, usize)>, Vec<(String, usize)>) {
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for atom in atoms {
+        for term in [&atom.subject, &atom.predicate, &atom.object] {
+            if let Some(name) = term.var_name() {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    for filter in filters {
+        names.insert(filter_var(filter).to_string());
+    }
+
+    let selected: BTreeSet<&str> = select.iter().map(String::as_str).collect();
+    let mut labels = Vec::new();
+    let mut variables = Vec::new();
+    for name in &names {
+        let node = labels.len();
+        labels.push(if selected.contains(name.as_str()) {
+            "var:selected".to_string()
+        } else {
+            "var:plain".to_string()
+        });
+        variables.push((name.clone(), node));
+    }
+    let var_index: BTreeMap<String, usize> = variables
+        .iter()
+        .map(|(name, node)| (name.clone(), *node))
+        .collect();
+
+    let mut constants: BTreeMap<String, usize> = BTreeMap::new();
+    let mut edges = Vec::new();
+    for atom in atoms {
+        let node = labels.len();
+        labels.push("atom".to_string());
+        for (label, term) in [
+            ("s", &atom.subject),
+            ("p", &atom.predicate),
+            ("o", &atom.object),
+        ] {
+            let target = term_node(term, &var_index, &mut constants, &mut labels);
+            edges.push((node, label, target));
+        }
+    }
+    for filter in filters {
+        let node = labels.len();
+        labels.push(filter_label(filter));
+        let target = var_index[filter_var(filter)];
+        edges.push((node, "f", target));
+    }
+    (labels, edges, variables)
+}
+
+fn term_node(
+    term: &KgTerm,
+    var_index: &BTreeMap<String, usize>,
+    constants: &mut BTreeMap<String, usize>,
+    labels: &mut Vec<String>,
+) -> usize {
+    match term {
+        KgTerm::Var(name) => var_index[name.as_str()],
+        KgTerm::Const(value) => match constants.get(value) {
+            Some(node) => *node,
+            None => {
+                let node = labels.len();
+                labels.push(format!("const:{}:{}", value.len(), value));
+                constants.insert(value.clone(), node);
+                node
+            }
+        },
+    }
+}
+
+fn filter_var(filter: &KgFilter) -> &str {
+    match filter {
+        KgFilter::Equal { var, .. }
+        | KgFilter::NotEqual { var, .. }
+        | KgFilter::Type { var, .. }
+        | KgFilter::NotType { var, .. } => var,
+    }
+}
+
+fn filter_label(filter: &KgFilter) -> String {
+    match filter {
+        KgFilter::Equal { value, .. } => format!("filter:equal:{}:{}", value.len(), value),
+        KgFilter::NotEqual { value, .. } => {
+            format!("filter:not_equal:{}:{}", value.len(), value)
+        }
+        KgFilter::Type { of, .. } => format!("filter:type:{}:{}", of.len(), of),
+        KgFilter::NotType { of, .. } => format!("filter:not_type:{}:{}", of.len(), of),
+    }
+}
+
+fn refine_colors(labels: &[String], edges: &[(usize, &'static str, usize)]) -> Vec<usize> {
+    let unique: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+    let initial: BTreeMap<&str, usize> = unique
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (*label, index))
+        .collect();
+    let mut colors: Vec<usize> = labels
+        .iter()
+        .map(|label| initial[label.as_str()])
+        .collect();
+    loop {
+        let mut signatures: Vec<(usize, Vec<(String, usize)>)> = colors
+            .iter()
+            .map(|color| (*color, Vec::new()))
+            .collect();
+        for (from, label, to) in edges {
+            signatures[*from]
+                .1
+                .push((format!(">{}", label), colors[*to]));
+            signatures[*to]
+                .1
+                .push((format!("<{}", label), colors[*from]));
+        }
+        for (_, pairs) in &mut signatures {
+            pairs.sort();
+        }
+        let mut unique_signatures = signatures.clone();
+        unique_signatures.sort();
+        unique_signatures.dedup();
+        let ranks: BTreeMap<(usize, Vec<(String, usize)>), usize> = unique_signatures
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, signature)| (signature, index))
+            .collect();
+        let new_colors: Vec<usize> = signatures
+            .iter()
+            .map(|signature| ranks[signature])
+            .collect();
+        let before = colors.iter().copied().collect::<BTreeSet<_>>().len();
+        let after = new_colors.iter().copied().collect::<BTreeSet<_>>().len();
+        colors = new_colors;
+        if before == after {
+            break;
+        }
+    }
+    colors
+}
+
+fn canonical_variable_mapping<F>(
+    atoms: &[KgAtom],
+    filters: &[KgFilter],
+    select: &[String],
+    mut render: F,
+) -> (BTreeMap<String, String>, bool)
+where
+    F: FnMut(&BTreeMap<String, String>) -> String,
+{
+    let (labels, edges, variables) = build_label_graph(atoms, filters, select);
+    let colors = refine_colors(&labels, &edges);
+    let mut classes: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (name, node) in variables {
+        classes.entry(colors[node]).or_default().push(name);
+    }
+    for names in classes.values_mut() {
+        names.sort();
+    }
+    let class_list: Vec<Vec<String>> = classes.into_values().collect();
+    let permutations: Vec<Vec<Vec<String>>> = class_list
+        .iter()
+        .map(|names| permutations_of(names))
+        .collect();
+    let mut combinations: u64 = 1;
+    for choices in &permutations {
+        combinations = combinations.saturating_mul(choices.len() as u64);
+    }
+    if combinations <= MAX_CANONICAL_LABELINGS {
+        let mut best: Option<(String, BTreeMap<String, String>)> = None;
+        let mut current = Vec::new();
+        enumerate_choices(&permutations, 0, &mut current, &mut |choice| {
+            let mapping = mapping_from_choice(choice);
+            let material = render(&mapping);
+            if best
+                .as_ref()
+                .map_or(true, |(best_material, _)| material < *best_material)
+            {
+                best = Some((material, mapping));
+            }
+        });
+        match best {
+            Some((_, mapping)) => (mapping, true),
+            None => (BTreeMap::new(), true),
+        }
+    } else {
+        let choice: Vec<Vec<String>> = permutations
+            .iter()
+            .map(|choices| choices.first().cloned().unwrap_or_default())
+            .collect();
+        (mapping_from_choice(&choice), false)
+    }
+}
+
+fn permutations_of(items: &[String]) -> Vec<Vec<String>> {
+    fn walk(
+        items: &[String],
+        used: &mut [bool],
+        current: &mut Vec<String>,
+        output: &mut Vec<Vec<String>>,
+    ) {
+        if current.len() == items.len() {
+            output.push(current.clone());
+            return;
+        }
+        for index in 0..items.len() {
+            if used[index] {
+                continue;
+            }
+            used[index] = true;
+            current.push(items[index].clone());
+            walk(items, used, current, output);
+            current.pop();
+            used[index] = false;
+        }
+    }
+    let mut output = Vec::new();
+    let mut used = vec![false; items.len()];
+    let mut current = Vec::new();
+    walk(items, &mut used, &mut current, &mut output);
+    output
+}
+
+fn enumerate_choices<F>(
+    choices: &[Vec<Vec<String>>],
+    index: usize,
+    current: &mut Vec<Vec<String>>,
+    visit: &mut F,
+) where
+    F: FnMut(&[Vec<String>]),
+{
+    if index == choices.len() {
+        visit(current);
+        return;
+    }
+    for permutation in &choices[index] {
+        current.push(permutation.clone());
+        enumerate_choices(choices, index + 1, current, visit);
+        current.pop();
+    }
+}
+
+fn mapping_from_choice(choice: &[Vec<String>]) -> BTreeMap<String, String> {
+    let mut mapping = BTreeMap::new();
+    let mut index = 0;
+    for class in choice {
+        for name in class {
+            mapping.insert(name.clone(), format!("v{}", index));
+            index += 1;
+        }
+    }
+    mapping
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1291,6 +1599,61 @@ select = ["value"]
         assert!(lints.iter().any(|lint| {
             lint.code == "kg_pattern_semantic_duplicate"
                 && lint.pattern_ids == vec!["capital_a", "capital_b"]
+        }));
+    }
+
+    #[test]
+    fn semantic_fingerprint_is_atom_order_and_renaming_invariant() {
+        let registry = KgPatternRegistry::compile(&config(
+            r#"
+enabled = true
+
+[[patterns]]
+id = "chain_a"
+atoms = [
+  { subject = "?x", predicate = "p", object = "?y" },
+  { subject = "?y", predicate = "q", object = "?z" },
+]
+filters = [
+  { kind = "not_equal", var = "?z", value = "排除" },
+  { kind = "type", var = "?x", of = "Person" },
+]
+select = ["z"]
+
+[[patterns]]
+id = "chain_b"
+atoms = [
+  { subject = "?middle", predicate = "q", object = "?target" },
+  { subject = "?root", predicate = "p", object = "?middle" },
+]
+filters = [
+  { kind = "type", var = "?root", of = "Person" },
+  { kind = "not_equal", var = "?target", value = "排除" },
+]
+select = ["target"]
+
+[[patterns]]
+id = "chain_c"
+atoms = [
+  { subject = "?x", predicate = "p", object = "?y" },
+  { subject = "?y", predicate = "q", object = "?z" },
+  { subject = "?y", predicate = "r", object = "?z" },
+]
+select = ["z"]
+"#,
+        ))
+        .expect("应可编译");
+
+        let a = registry.get("chain_a").unwrap().semantic_identity();
+        let b = registry.get("chain_b").unwrap().semantic_identity();
+        let c = registry.get("chain_c").unwrap().semantic_identity();
+        assert_eq!(a.fingerprint, b.fingerprint, "{}", a.canonical);
+        assert_eq!(a.canonical, b.canonical);
+        assert_ne!(a.fingerprint, c.fingerprint);
+        assert!(a.complete && b.complete);
+        assert!(registry.lint().iter().any(|lint| {
+            lint.code == "kg_pattern_semantic_duplicate"
+                && lint.pattern_ids == vec!["chain_a", "chain_b"]
         }));
     }
 
