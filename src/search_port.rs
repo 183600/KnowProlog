@@ -266,7 +266,7 @@ impl PortReceipt {
         } else {
             "未证明 top-k"
         };
-        format!(
+        let mut text = format!(
             "语义检索回执：通道 {}，候选 {}，约束剪枝 {}，打分 {}，返回 {}/{}；{}。",
             if self.channels.is_empty() {
                 "无".to_string()
@@ -279,7 +279,13 @@ impl PortReceipt {
             self.returned,
             self.top_k,
             certificate
-        )
+        );
+        if !self.notes.is_empty() {
+            text.push_str("\n  回执注记：");
+            text.push_str(&self.notes.join("；"));
+            text.push('。');
+        }
+        text
     }
 }
 
@@ -1646,6 +1652,7 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("跳过")));
+        assert!(outcome.receipt.render_text().contains("跳过"));
     }
 
     #[test]
