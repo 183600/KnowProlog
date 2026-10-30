@@ -381,6 +381,9 @@ pub struct SystemConfig {
     pub prolog_rules: Vec<PrologRuleConfig>,
     pub messages: Messages,
     pub synonyms: Option<SynonymsConfig>,
+    /// 属性本体桥（可选）：属性词面、值类型、量纲/单位与定义域约束
+    #[serde(default)]
+    pub attributes: attribute_bridge::AttributeBridgeConfig,
     /// 谓词画像声明（可选）：导入准入、别名/逆向归一、功能谓词冲突裁决的共同依据
     #[serde(default)]
     pub predicate_profiles: Vec<predicate_registry::PredicateProfileConfig>,
