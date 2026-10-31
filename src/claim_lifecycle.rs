@@ -1212,6 +1212,213 @@ impl ClaimAuditReport {
     }
 }
 
+/// 表面的可擦除性等级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceKind {
+    /// 活跃表面：计划、工作记忆、证明缓存、当前回答等，删除后不得残留。
+    Active,
+    /// 归档表面：编年史历史字节等不可物理擦除的追加日志。
+    Archival,
+}
+
+impl SurfaceKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            SurfaceKind::Active => "active",
+            SurfaceKind::Archival => "archival",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            SurfaceKind::Active => "活跃表面",
+            SurfaceKind::Archival => "归档表面",
+        }
+    }
+}
+
+/// 调用方提供的待扫描表面；文本只在本次扫描中使用，不写入账本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Surface {
+    pub name: String,
+    pub kind: SurfaceKind,
+    pub text: String,
+}
+
+impl Surface {
+    pub fn active(name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: SurfaceKind::Active,
+            text: text.into(),
+        }
+    }
+
+    pub fn archival(name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: SurfaceKind::Archival,
+            text: text.into(),
+        }
+    }
+}
+
+/// 一次明文命中。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ResidueHit {
+    pub surface: String,
+    pub kind: SurfaceKind,
+    pub term: String,
+    pub count: usize,
+}
+
+impl ResidueHit {
+    pub fn render_zh(&self) -> String {
+        format!(
+            "{} {}：{} × {}",
+            self.kind.label_zh(),
+            self.surface,
+            self.term,
+            self.count
+        )
+    }
+}
+
+/// 明文残留报告：活跃命中是风险，归档命中只做显式披露。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidueReport {
+    pub verdict: AuditVerdict,
+    pub scanned_surfaces: usize,
+    pub scanned_terms: usize,
+    pub active_hits: Vec<ResidueHit>,
+    pub archival_hits: Vec<ResidueHit>,
+    pub unknown_reasons: Vec<String>,
+    pub digest: String,
+}
+
+impl ResidueReport {
+    fn seal(mut self) -> Self {
+        let material = canonical_json(&serde_json::json!({
+            "verdict": self.verdict.code(),
+            "scanned_surfaces": self.scanned_surfaces,
+            "scanned_terms": self.scanned_terms,
+            "active_hits": self.active_hits.iter().map(|hit| {
+                serde_json::json!({
+                    "surface": hit.surface,
+                    "kind": hit.kind.code(),
+                    "term": hit.term,
+                    "count": hit.count,
+                })
+            }).collect::<Vec<_>>(),
+            "archival_hits": self.archival_hits.iter().map(|hit| {
+                serde_json::json!({
+                    "surface": hit.surface,
+                    "kind": hit.kind.code(),
+                    "term": hit.term,
+                    "count": hit.count,
+                })
+            }).collect::<Vec<_>>(),
+            "unknown_reasons": self.unknown_reasons,
+        }));
+        self.digest = fnv1a_hex(material.as_bytes());
+        self
+    }
+
+    pub fn render_zh(&self) -> String {
+        let mut output = format!(
+            "明文残留扫描：{}（{}）\n  表面 {} / 词项 {} / 活跃命中 {} / 归档命中 {}",
+            self.verdict.label_zh(),
+            self.verdict.code(),
+            self.scanned_surfaces,
+            self.scanned_terms,
+            self.active_hits.len(),
+            self.archival_hits.len()
+        );
+        for hit in &self.active_hits {
+            output.push_str("\n  [active] ");
+            output.push_str(&hit.render_zh());
+        }
+        for hit in &self.archival_hits {
+            output.push_str("\n  [archival] ");
+            output.push_str(&hit.render_zh());
+        }
+        for reason in &self.unknown_reasons {
+            output.push_str("\n  [unknown] ");
+            output.push_str(reason);
+        }
+        output.push_str(&format!("\n  digest：{}", self.digest));
+        output
+    }
+}
+
+/// 用调用方提供的明文扫描表面。
+///
+/// 删除时明文只存在于本次调用；账本不保存原文。活跃表面命中判 `findings`，
+/// 归档表面命中单独报告为 archival，不会被忽略，也不会被误判为干净。
+pub fn scan_residue(surfaces: &[Surface], terms: &[String]) -> ResidueReport {
+    let mut terms: Vec<String> = terms
+        .iter()
+        .map(|term| term.trim().to_string())
+        .filter(|term| !term.is_empty())
+        .collect();
+    terms.sort();
+    terms.dedup();
+    let mut active_hits = Vec::new();
+    let mut archival_hits = Vec::new();
+    let mut unknown_reasons = Vec::new();
+    if terms.is_empty() {
+        unknown_reasons.push("没有提供要扫描的明文".to_string());
+    }
+    if surfaces.is_empty() {
+        unknown_reasons.push("没有提供任何表面".to_string());
+    }
+    if !surfaces.is_empty()
+        && !surfaces
+            .iter()
+            .any(|surface| surface.kind == SurfaceKind::Active)
+    {
+        unknown_reasons.push("没有提供活跃表面，无法判断残留".to_string());
+    }
+    for surface in surfaces {
+        for term in &terms {
+            let count = surface.text.matches(term.as_str()).count();
+            if count == 0 {
+                continue;
+            }
+            let hit = ResidueHit {
+                surface: surface.name.clone(),
+                kind: surface.kind,
+                term: term.clone(),
+                count,
+            };
+            match surface.kind {
+                SurfaceKind::Active => active_hits.push(hit),
+                SurfaceKind::Archival => archival_hits.push(hit),
+            }
+        }
+    }
+    active_hits.sort();
+    archival_hits.sort();
+    let verdict = if !unknown_reasons.is_empty() {
+        AuditVerdict::Unknown
+    } else if !active_hits.is_empty() {
+        AuditVerdict::Findings
+    } else {
+        AuditVerdict::Clean
+    };
+    ResidueReport {
+        verdict,
+        scanned_surfaces: surfaces.len(),
+        scanned_terms: terms.len(),
+        active_hits,
+        archival_hits,
+        unknown_reasons,
+        digest: String::new(),
+    }
+    .seal()
+}
+
 /// claim 生命周期账本。
 ///
 /// 字段公开以便审计读取；修改应通过方法完成，避免索引与记录脱节。
@@ -2903,5 +3110,39 @@ mod tests {
                 "clm_deadbeefdeadbeef".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn residue_scan_separates_active_from_archival() {
+        let surfaces = vec![
+            Surface::active("当前计划", "张三住在某街 1 号，电话 13800138000。"),
+            Surface::archival("编年史", "旧回答：李四的电话是 13900139000。"),
+        ];
+        let terms = vec!["13800138000".to_string(), "13900139000".to_string()];
+        let report = scan_residue(&surfaces, &terms);
+        assert_eq!(report.verdict, AuditVerdict::Findings);
+        assert_eq!(report.active_hits.len(), 1);
+        assert_eq!(report.active_hits[0].surface, "当前计划");
+        assert_eq!(report.archival_hits.len(), 1);
+        assert_eq!(report.archival_hits[0].surface, "编年史");
+    }
+
+    #[test]
+    fn residue_scan_does_not_claim_clean_without_terms_or_active_surfaces() {
+        let surfaces = vec![Surface::archival("编年史", "旧回答")];
+        let report = scan_residue(&surfaces, &[]);
+        assert_eq!(report.verdict, AuditVerdict::Unknown);
+        assert!(report
+            .unknown_reasons
+            .iter()
+            .any(|reason| reason.contains("明文")));
+
+        let report = scan_residue(&[], &["张三".to_string()]);
+        assert_eq!(report.verdict, AuditVerdict::Unknown);
+
+        let surfaces = vec![Surface::active("工作记忆", "与目标实体无关的文本")];
+        let report = scan_residue(&surfaces, &["张三".to_string()]);
+        assert_eq!(report.verdict, AuditVerdict::Clean);
+        assert!(report.active_hits.is_empty());
     }
 }
