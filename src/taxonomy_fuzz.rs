@@ -115,6 +115,8 @@ pub enum FollowUpPlan {
     NewSubject,
     /// 直接问句后回顾。
     Recap,
+    /// 直接问句后显式比较两个主体。
+    Compare,
 }
 
 impl FollowUpPlan {
@@ -125,6 +127,7 @@ impl FollowUpPlan {
             FollowUpPlan::Why => "why",
             FollowUpPlan::NewSubject => "new_subject",
             FollowUpPlan::Recap => "recap",
+            FollowUpPlan::Compare => "compare",
         }
     }
 
@@ -135,9 +138,26 @@ impl FollowUpPlan {
             FollowUpPlan::Why => Some("你怎么知道的？"),
             FollowUpPlan::NewSubject => Some("叶莉的国籍是多少"),
             FollowUpPlan::Recap => Some("我们聊过什么？"),
+            FollowUpPlan::Compare => Some("比较姚明和叶莉的身高"),
         }
     }
 }
+
+const WORLDS: [WorldVariant; 4] = [
+    WorldVariant::Complete,
+    WorldVariant::MissingAttribute,
+    WorldVariant::MissingEntity,
+    WorldVariant::RelationOnly,
+];
+
+const PLANS: [FollowUpPlan; 6] = [
+    FollowUpPlan::Direct,
+    FollowUpPlan::Continue,
+    FollowUpPlan::Why,
+    FollowUpPlan::NewSubject,
+    FollowUpPlan::Recap,
+    FollowUpPlan::Compare,
+];
 
 /// 一个可复现的最小失败。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -198,7 +218,12 @@ impl TaxonomyFuzzReport {
             self.checks,
             minimal.len()
         )];
-        lines.push("  组合：4 个知识世界 × 5 个追问计划 = 20 份会话契约。".to_string());
+        lines.push(format!(
+            "  组合：{} 个知识世界 × {} 个追问计划 = {} 份会话契约。",
+            WORLDS.len(),
+            PLANS.len(),
+            WORLDS.len() * PLANS.len()
+        ));
         if minimal.is_empty() {
             lines.push(
                 "  所有图式、缺口与追问转移通过：直接回答闭合、缺属性显式欠账、续聊留在同一回合、换主体开启新回合。"
@@ -227,25 +252,12 @@ impl TaxonomyFuzzReport {
 
 /// 跑完整课程。
 pub fn run(seed: u64) -> TaxonomyFuzzReport {
-    let worlds = [
-        WorldVariant::Complete,
-        WorldVariant::MissingAttribute,
-        WorldVariant::MissingEntity,
-        WorldVariant::RelationOnly,
-    ];
-    let plans = [
-        FollowUpPlan::Direct,
-        FollowUpPlan::Continue,
-        FollowUpPlan::Why,
-        FollowUpPlan::NewSubject,
-        FollowUpPlan::Recap,
-    ];
     let mut failures = Vec::new();
     let mut checks = 0usize;
     let mut passed = 0usize;
     let mut case = 0usize;
-    for world in worlds {
-        for plan in plans {
+    for world in WORLDS {
+        for plan in PLANS {
             case += 1;
             let report = run_contract(&course_contract(seed, case, world, plan));
             let mut case_failures = Vec::new();
@@ -539,6 +551,30 @@ fn inspect_case(
                 );
             }
         }
+        FollowUpPlan::Compare => {
+            if world == WorldVariant::Complete {
+                check(
+                    "compare_is_answered",
+                    &followup.input,
+                    followup.answered,
+                    "完整知识下比较问句让位了".to_string(),
+                );
+            }
+            if followup.answered {
+                check(
+                    "compare_schema",
+                    &followup.input,
+                    followup.answer_schema == AnswerSchema::Comparison.label(),
+                    format!("实际图式「{}」", followup.answer_schema),
+                );
+                check(
+                    "compare_starts_new_episode",
+                    &followup.input,
+                    followup.episode_turns == 1,
+                    format!("回合轮次 {}", followup.episode_turns),
+                );
+            }
+        }
     }
 }
 
@@ -576,7 +612,7 @@ mod tests {
     #[test]
     fn taxonomy_course_is_clean_and_stable() {
         let report = run(TAXONOMY_FUZZ_SEED);
-        assert_eq!(report.cases, 20);
+        assert_eq!(report.cases, WORLDS.len() * PLANS.len());
         assert_eq!(report.failed, 0, "{}", report.render_text());
         assert!(report.checks >= 60, "检查次数过少：{}", report.checks);
         let again = run(TAXONOMY_FUZZ_SEED);
@@ -596,24 +632,13 @@ mod tests {
     #[test]
     fn every_world_and_plan_pair_is_covered() {
         let mut request = Vec::new();
-        for world in [
-            WorldVariant::Complete,
-            WorldVariant::MissingAttribute,
-            WorldVariant::MissingEntity,
-            WorldVariant::RelationOnly,
-        ] {
-            for plan in [
-                FollowUpPlan::Direct,
-                FollowUpPlan::Continue,
-                FollowUpPlan::Why,
-                FollowUpPlan::NewSubject,
-                FollowUpPlan::Recap,
-            ] {
+        for world in WORLDS {
+            for plan in PLANS {
                 let contract = course_contract(TAXONOMY_FUZZ_SEED, 0, world, plan);
                 request.push((contract.entities.len(), contract.turns.len()));
             }
         }
-        assert_eq!(request.len(), 20);
+        assert_eq!(request.len(), WORLDS.len() * PLANS.len());
         assert!(request.iter().all(|(entities, turns)| *entities == 2 && *turns >= 1));
         let report = run(TAXONOMY_FUZZ_SEED);
         assert!(report.minimal_failures().is_empty());
