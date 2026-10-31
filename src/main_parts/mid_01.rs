@@ -904,6 +904,7 @@ async fn run_namespace_status(
 async fn run_fuse(
     manager: &OxigraphManager,
     config: &know_prolog::SystemConfig,
+    store_path: &str,
     apply: bool,
     prefer: &[String],
     arbitrate_view: bool,
@@ -939,7 +940,9 @@ async fn run_fuse(
 
     let policy = FusionPolicy::new().with_functional(functional_predicates(config));
     let (alignment, plan, inserted, removed) = if align_view {
-        let options = alignment_options(config, 2, 7_000);
+        manager.load_entity_registry(&format!("{}/entity_registry.json", store_path));
+        let options = alignment_options(config, 2, 7_000)
+            .with_canonical_hints(manager.confirmed_entity_aliases());
         if apply {
             let (alignment, outcome) = manager.apply_fusion_with_identity(&policy, &options).await?;
             (
@@ -1021,11 +1024,11 @@ async fn run_align(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ledger = manager.load_fusion_ledger().await?;
-    let options = alignment_options(config, rounds, min_confidence_bps);
-    let plan = align_ledger(&ledger, &options);
-
     let registry_path = format!("{}/entity_registry.json", store_path);
-    let registry_loaded = apply && manager.load_entity_registry(&registry_path);
+    let registry_loaded = manager.load_entity_registry(&registry_path);
+    let options = alignment_options(config, rounds, min_confidence_bps)
+        .with_canonical_hints(manager.confirmed_entity_aliases());
+    let plan = align_ledger(&ledger, &options);
     let mut applied = 0usize;
     let mut changed = 0usize;
     if apply {

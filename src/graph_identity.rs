@@ -58,6 +58,9 @@ pub struct AlignmentOptions {
     /// 谓词别名 → 规范谓词；结构比较前先归一（空映射表示不归一）。
     #[serde(default)]
     pub predicate_aliases: BTreeMap<String, String>,
+    /// 已确认别名 → 规范名；投影时优先保持既有规范名，避免重复对齐漂移。
+    #[serde(default)]
+    pub canonical_hints: BTreeMap<String, String>,
 }
 
 impl Default for AlignmentOptions {
@@ -72,6 +75,7 @@ impl Default for AlignmentOptions {
             accept_margin_bps: 1_000,
             min_confidence_bps: 7_000,
             predicate_aliases: BTreeMap::new(),
+            canonical_hints: BTreeMap::new(),
         }
     }
 }
@@ -102,6 +106,21 @@ impl AlignmentOptions {
             let canonical = canonical.trim();
             if !alias.is_empty() && !canonical.is_empty() && alias != canonical {
                 self.predicate_aliases
+                    .insert(alias.to_string(), canonical.to_string());
+            }
+        }
+        self
+    }
+
+    pub fn with_canonical_hints<I>(mut self, hints: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        for (alias, canonical) in hints {
+            let alias = alias.trim();
+            let canonical = canonical.trim();
+            if !alias.is_empty() && !canonical.is_empty() && alias != canonical {
+                self.canonical_hints
                     .insert(alias.to_string(), canonical.to_string());
             }
         }
@@ -263,6 +282,8 @@ pub struct AlignmentPlan {
     scope_order: Vec<String>,
     #[serde(default)]
     known_nodes: BTreeSet<(String, String)>,
+    #[serde(default)]
+    preferred_canonicals: BTreeSet<String>,
 }
 
 impl AlignmentPlan {
@@ -340,7 +361,13 @@ impl AlignmentPlan {
             });
             let canonical = component
                 .iter()
+                .filter(|(_, surface)| self.preferred_canonicals.contains(surface))
                 .find(|candidate| self.component_can_use(candidate, &component))
+                .or_else(|| {
+                    component
+                        .iter()
+                        .find(|candidate| self.component_can_use(candidate, &component))
+                })
                 .map(|(_, surface)| surface.clone());
             let Some(canonical) = canonical else {
                 continue;
@@ -632,6 +659,8 @@ pub fn align_assertions(
         .keys()
         .map(|key| (key.scope.clone(), key.surface.clone()))
         .collect();
+    let preferred_canonicals: BTreeSet<String> =
+        options.canonical_hints.values().cloned().collect();
 
     let mut buckets: BTreeMap<String, Vec<NodeKey>> = BTreeMap::new();
     for (key, fingerprint) in &fingerprints {
@@ -853,6 +882,7 @@ pub fn align_assertions(
         oversized_buckets,
         scope_order,
         known_nodes,
+        preferred_canonicals,
     }
 }
 
@@ -1260,6 +1290,26 @@ mod tests {
         assert!(projected.iter().any(|assertion| {
             assertion.namespace == "alice" && assertion.subject == "苹果公司"
         }));
+    }
+
+    #[test]
+    fn confirmed_canonical_hint_wins_over_namespace_trust() {
+        let options = AlignmentOptions::default()
+            .with_canonical_hints([("苹果公司".to_string(), "Apple Inc.".to_string())]);
+        let plan = align_assertions(&store(), &graph_pairs(), &options);
+        let mapping = plan.projection_map();
+        assert_eq!(
+            mapping
+                .get(&("alice".to_string(), "苹果公司".to_string()))
+                .map(String::as_str),
+            Some("Apple Inc.")
+        );
+        assert_eq!(
+            mapping
+                .get(&("bob".to_string(), "Apple Inc.".to_string()))
+                .map(String::as_str),
+            Some("Apple Inc.")
+        );
     }
 
     #[test]

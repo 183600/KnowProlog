@@ -1936,7 +1936,17 @@
             json,
         }) => {
             if let Err(e) =
-                run_fuse(&oxigraph_manager, &config, apply, &prefer, arbitrate, align, json).await
+                run_fuse(
+                    &oxigraph_manager,
+                    &config,
+                    &store_path,
+                    apply,
+                    &prefer,
+                    arbitrate,
+                    align,
+                    json,
+                )
+                .await
             {
                 eprintln!("知识融合失败: {}", e);
                 std::process::exit(1);
