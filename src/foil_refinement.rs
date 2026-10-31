@@ -1456,6 +1456,37 @@ pub fn rule_key(rule: &HornRule, rule_index: usize) -> String {
     rule_key_from_text(&rule.rule_text(), rule_index)
 }
 
+/// 把功能谓词上的规则候选编译成硬反例：若主语已有其它取值，规则推出的
+/// 未知候选在功能约束下就是冲突，而不是开放世界中的普通未知。
+///
+/// 仅枚举已挖出的规则应用，不写图谱；结果去重并稳定排序。
+pub fn functional_conflict_negatives(
+    predictor: &LinkPredictor,
+    ledger: &FoilLedger,
+) -> Vec<Triple> {
+    let mut out: BTreeSet<Triple> = BTreeSet::new();
+    for (index, rule) in predictor.rules().iter().enumerate() {
+        if !ledger.is_functional(&rule.head) {
+            continue;
+        }
+        for application in rule_applications(predictor, index, DEFAULT_MAX_RULE_APPLICATIONS) {
+            let triple = &application.triple;
+            if predictor.has_triple(&triple.subject, &triple.predicate, &triple.object) {
+                continue;
+            }
+            let mut values: BTreeSet<String> = predictor
+                .objects_of(&triple.subject, &triple.predicate)
+                .into_iter()
+                .collect();
+            values.extend(ledger.objects_of(&triple.subject, &triple.predicate));
+            if values.iter().any(|value| value != &triple.object) {
+                out.insert(triple.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 /// 把一组硬反例合并成去重、稳定排序的集合。
 pub fn normalize_negatives(negatives: &[Triple]) -> Vec<Triple> {
     let mut set: HashSet<Triple> = HashSet::new();
@@ -1627,6 +1658,17 @@ mod tests {
             matches!(evaluation.guard, RuleGuard::ExceptSubject { .. })
                 && evaluation.dropped_positives > 0
         }));
+    }
+
+    #[test]
+    fn functional_conflicts_are_derived_as_hard_negatives() {
+        let predictor = predictor();
+        let mut ledger = FoilLedger::new();
+        ledger.mark_functional("师祖");
+        let negatives = functional_conflict_negatives(&predictor, &ledger);
+        assert!(negatives.contains(&Triple::new("李四", "师祖", "赵六")));
+        assert!(!negatives.contains(&Triple::new("李四", "师祖", "王五")));
+        assert!(functional_conflict_negatives(&predictor, &FoilLedger::new()).is_empty());
     }
 
     #[test]

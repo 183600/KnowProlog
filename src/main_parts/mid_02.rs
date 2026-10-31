@@ -539,7 +539,9 @@ fn run_foil(
         .with_options(options)
         .sample(&hypotheses);
 
-    let negatives: Vec<LawTriple> = ledger.refutations().cloned().collect();
+    let mut negatives: Vec<LawTriple> = ledger.refutations().cloned().collect();
+    negatives.extend(functional_conflict_negatives(&predictor, &ledger));
+    let negatives = normalize_negatives(&negatives);
     let functional_set: BTreeSet<String> = ledger.functional_predicates().cloned().collect();
     let indices: Vec<usize> = if rule_indices.is_empty() {
         (0..predictor.rules().len()).collect()

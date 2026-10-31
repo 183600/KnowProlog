@@ -49,7 +49,10 @@ use know_prolog::{
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
     extract_query_entities_from_tagged,
-    foil_refinement::{refine_rule, FoilLedger, FoilOptions, FoilSampler, RefineOptions},
+    foil_refinement::{
+        functional_conflict_negatives, normalize_negatives, refine_rule, FoilLedger, FoilOptions,
+        FoilSampler, RefineOptions,
+    },
     frontier, fulfillment,
     fusion_arbitration::{arbitrate, ArbitrationInput},
     grammar_extractor::GrammarExtractor,
