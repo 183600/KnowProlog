@@ -684,6 +684,21 @@ impl ClaimDraft {
         self
     }
 
+    /// 与 [`ClaimLedger::register`] 完全一致的身份计算；调用方可在登记前
+    /// 用同一草稿查询闸门或建立外部索引。
+    pub fn claim_id(&self) -> String {
+        let structure = if self.structure.trim().is_empty() {
+            format!(
+                "text:{}",
+                fnv1a_hex(canonical_statement(&self.text).as_bytes())
+            )
+        } else {
+            self.structure.trim().to_string()
+        };
+        let shape = ClaimShape::new(&self.subject, &self.predicate, structure, self.session);
+        ClaimLedger::claim_id(&shape, &self.support)
+    }
+
     /// 从回答计划中的一条命题构造草稿。
     pub fn from_plan_claim(plan: &AnswerPlan, claim: &PlanClaim) -> Self {
         let mut support: Vec<ClaimSupport> = claim
@@ -2008,6 +2023,21 @@ impl ClaimLedger {
     /// 提交前闸门；不改状态，只给出 allow / refresh / deny 与可复核发现。
     pub fn gate(&self, id: &str, context: &GateContext) -> GateDecision {
         self.gate_inner(id, context, false)
+    }
+
+    /// 同批查询多条 claim 的闸门裁决；事件链只校验一次。
+    ///
+    /// 与逐条调用 [`ClaimLedger::gate`] 的结论一致，只省掉重复的整链扫描。
+    pub fn gate_batch<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+        context: &GateContext,
+    ) -> Vec<GateDecision> {
+        let chain_intact = context.chain_intact && self.verify_chain(None).intact;
+        let effective = context.clone().with_chain_intact(chain_intact);
+        ids.into_iter()
+            .map(|id| self.gate_inner(id, &effective, true))
+            .collect()
     }
 
     /// `chain_verified` 为真时跳过重复的整链校验；仅供同批提交使用。
@@ -4094,6 +4124,49 @@ mod tests {
             ClaimStatus::Expired
         );
         assert!(rebuilt.verify_chain(None).intact);
+    }
+
+    #[test]
+    fn batch_gate_matches_single_gate_and_shares_chain_check() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("周三十", "职业", "医生");
+        let first = ledger
+            .register(
+                draft(
+                    "周三十",
+                    "职业",
+                    "s1",
+                    "周三十是医生。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        let second = ledger
+            .register(
+                draft(
+                    "周三十",
+                    "身份",
+                    "s2",
+                    "周三十是医生。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        ledger
+            .retire_fact(&fact_key, RetirementKind::Redacted, "遗忘", 2, 2)
+            .unwrap();
+        let context = GateContext::default();
+        let ids = [first.id.as_str(), second.id.as_str()];
+        let singles = ids
+            .iter()
+            .map(|id| ledger.gate(id, &context))
+            .collect::<Vec<_>>();
+        assert_eq!(ledger.gate_batch(ids, &context), singles);
+        assert!(singles.iter().all(|decision| !decision.allowed()));
     }
 
     #[test]

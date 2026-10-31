@@ -1680,3 +1680,90 @@ rules = [
         );
         assert!(restored.belief_ledger_report().contains("赵六"));
     }
+
+    #[test]
+    fn restyle_gate_skips_retired_or_stale_claims() {
+        use crate::claim_lifecycle::{ClaimDraft, GateContext, RetirementKind};
+
+        let mut config = test_config();
+        config.max_profile_sentences = 6;
+        let mut facts = master_facts();
+        facts.push(PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "职业".to_string(),
+            to: "教师".to_string(),
+        });
+        facts.push(PrologFact::Relation {
+            from: "张三".to_string(),
+            rel_type: "地址".to_string(),
+            to: "北京".to_string(),
+        });
+        let mut reasoner = SymbolicReasoner::new(config, HashMap::new());
+        reasoner.observe_facts(&facts);
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        let plan = reasoner
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        assert!(plan.claim_count() >= 2);
+        assert!(!reasoner.claim_ledger().is_empty());
+
+        let retired = ClaimDraft::from_plan_claim(&plan, &plan.claims[0]).claim_id();
+        assert!(
+            reasoner
+                .claim_ledger()
+                .gate(&retired, &GateContext::default())
+                .allowed()
+        );
+        reasoner
+            .retire_generation_claim(&retired, RetirementKind::Retracted, "测试撤回")
+            .expect("已登记断言应可退役");
+        let stale = ClaimDraft::from_plan_claim(&plan, &plan.claims[1]).claim_id();
+        reasoner
+            .mark_generation_claim_stale(&stale, "测试待复核")
+            .expect("已登记断言应可标为待复核");
+
+        let text = reasoner
+            .restyle_generation(StyleDirective::Detailed)
+            .expect("其余断言仍应可复述");
+        assert!(!text.contains(plan.claims[0].text.trim()), "{}", text);
+        assert!(!text.contains(plan.claims[1].text.trim()), "{}", text);
+        assert!(text.contains("已跳过 2 条"), "{}", text);
+    }
+
+    #[test]
+    fn claim_lifecycle_survives_dialogue_snapshot() {
+        use crate::claim_lifecycle::{ClaimDraft, RetirementKind};
+
+        let mut config = test_config();
+        config.max_profile_sentences = 1;
+        let facts = master_facts();
+        let mut source = SymbolicReasoner::new(config.clone(), HashMap::new());
+        source.observe_facts(&facts);
+        source.generate_about("张三").expect("应能生成介绍");
+        let plan = source
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        let id = ClaimDraft::from_plan_claim(&plan, &plan.claims[0]).claim_id();
+        source
+            .retire_generation_claim(&id, RetirementKind::Retracted, "快照前撤回")
+            .expect("应可退役");
+        let snapshot = source.dialogue_snapshot();
+        assert!(snapshot.claims.is_some(), "非空账本应写入快照");
+
+        let mut target = SymbolicReasoner::new(config, HashMap::new());
+        target.observe_facts(&facts);
+        target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("claim 账本应随快照恢复");
+        assert!(target.claim_ledger().claim(&id).is_some_and(|record| {
+            record.status == crate::claim_lifecycle::ClaimStatus::Retracted
+        }));
+        let text = target
+            .restyle_generation(StyleDirective::Detailed)
+            .expect("其余断言仍应可复述");
+        assert!(!text.contains(plan.claims[0].text.trim()), "{}", text);
+    }

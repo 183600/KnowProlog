@@ -595,6 +595,9 @@ pub struct DialogueSnapshot {
     pub history: Vec<String>,
     #[serde(default)]
     pub generation: Option<GenerationState>,
+    /// claim 生命周期账本；旧快照缺省为空，空账本不落盘。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<crate::claim_lifecycle::ClaimLedger>,
     /// 逐命题复核台账；旧快照缺省为空，空台账不写字段以保持字节兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic_turns: Option<EpistemicTurnBook>,
@@ -841,6 +844,7 @@ impl DialogueContext {
             last_plan_kind: self.last_plan_kind.clone(),
             history: self.history.clone(),
             generation: self.generation.clone(),
+            claims: None,
             epistemic_turns: None,
             beliefs: None,
             session_facts: Vec::new(),
@@ -1326,6 +1330,8 @@ pub struct SymbolicReasoner {
     // 显式持久化的采纳/退役决定；每次重建律典后重新盖到声明/挖掘结果上。
     persisted_laws: Option<LawBook>,
     context: DialogueContext,
+    // 生成断言的提交前闸门与生命周期；随对话快照持久化，不写知识图谱。
+    claims: crate::claim_lifecycle::ClaimLedger,
     epistemic_turns: EpistemicTurnBook,
     // 跨模块/跨轮槽位信念：只记录带信封的命题，不写图谱。
     beliefs: BeliefLedger,

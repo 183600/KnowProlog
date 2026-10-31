@@ -81,6 +81,7 @@ impl SymbolicReasoner {
             &mut cursor,
         )?;
         self.observe_epistemic_plan(&plan);
+        self.remember_generation_plan(&plan);
         self.context.record_generation_with_plan(cursor, plan);
         let audit = self.audit_generation(&page.text, &page.trusted);
         let mut text = audit.text;
@@ -256,10 +257,132 @@ impl SymbolicReasoner {
                 plan.revision, self.revision, state.entity
             ));
         }
+        let (plan, blocked) = self.gate_generation_plan(plan);
+        if plan.claims.is_empty() && !blocked.is_empty() {
+            return Some(format!(
+                "最近一份生成计划中的 {} 条断言均已失效或待复核，未再复述；请重新输入「介绍：{}」生成新计划。",
+                blocked.len(),
+                state.entity
+            ));
+        }
         match plan.realize(directive) {
-            Ok(text) => Some(text),
+            Ok(text) if blocked.is_empty() => Some(text),
+            Ok(text) => {
+                let reasons = blocked
+                    .iter()
+                    .filter_map(|decision| decision.findings.first())
+                    .map(|finding| finding.render_zh())
+                    .collect::<Vec<_>>()
+                    .join("；");
+                Some(format!(
+                    "{}\n（已跳过 {} 条失效或待复核断言：{}）",
+                    text,
+                    blocked.len(),
+                    reasons
+                ))
+            }
             Err(error) => Some(error.to_string()),
         }
+    }
+
+    /// 把生成计划登记进会话 claim 账本；重复生成只追加观察事件。
+    fn remember_generation_plan(&mut self, plan: &AnswerPlan) {
+        let revision = self.revision;
+        let _ = self.claims.register_plan(plan, revision, revision);
+    }
+
+    /// 复述前逐条过闸门；只保留允许的断言，被拒/待复核的返回给调用方显式说明。
+    fn gate_generation_plan(
+        &self,
+        plan: &AnswerPlan,
+    ) -> (AnswerPlan, Vec<crate::claim_lifecycle::GateDecision>) {
+        let drafts = plan
+            .claims
+            .iter()
+            .map(|claim| crate::claim_lifecycle::ClaimDraft::from_plan_claim(plan, claim))
+            .collect::<Vec<_>>();
+        let ids = drafts
+            .iter()
+            .map(crate::claim_lifecycle::ClaimDraft::claim_id)
+            .collect::<Vec<_>>();
+        let decisions = self.claims.gate_batch(
+            ids.iter().map(String::as_str),
+            &crate::claim_lifecycle::GateContext::default(),
+        );
+        let mut kept = Vec::new();
+        let mut blocked = Vec::new();
+        for (claim, decision) in plan.claims.iter().zip(decisions) {
+            if decision.allowed() {
+                kept.push(claim.clone());
+            } else {
+                blocked.push(decision);
+            }
+        }
+        if blocked.is_empty() {
+            return (plan.clone(), blocked);
+        }
+        let filtered = AnswerPlan::new(
+            plan.question.clone(),
+            plan.subject.clone(),
+            plan.revision,
+            kept,
+            plan.omitted.saturating_add(blocked.len()),
+            plan.suppressed,
+        );
+        (filtered, blocked)
+    }
+
+    /// 当前会话的 claim 生命周期只读视图。
+    pub fn claim_ledger(&self) -> &crate::claim_lifecycle::ClaimLedger {
+        &self.claims
+    }
+
+    /// 退役生成路径依赖的事实，并沿支撑谱系传播到相关断言。
+    pub fn retire_generation_fact(
+        &mut self,
+        fact: &crate::claim_lifecycle::FactKey,
+        kind: crate::claim_lifecycle::RetirementKind,
+        reason: &str,
+    ) -> Result<crate::claim_lifecycle::Impact, crate::claim_lifecycle::ClaimError> {
+        let revision = self.revision;
+        self.claims.retire_fact(fact, kind, reason, revision, revision)
+    }
+
+    /// 显式退役一条生成断言，并传播到依赖它的后代。
+    pub fn retire_generation_claim(
+        &mut self,
+        id: &str,
+        kind: crate::claim_lifecycle::RetirementKind,
+        reason: &str,
+    ) -> Result<crate::claim_lifecycle::Impact, crate::claim_lifecycle::ClaimError> {
+        let revision = self.revision;
+        self.claims.retire_claim(id, kind, reason, revision, revision)
+    }
+
+    /// 把一条生成断言标为待复核；复述时会被闸门拦下。
+    pub fn mark_generation_claim_stale(
+        &mut self,
+        id: &str,
+        reason: &str,
+    ) -> Result<crate::claim_lifecycle::ClaimStatus, crate::claim_lifecycle::ClaimError> {
+        let revision = self.revision;
+        self.claims.mark_stale(id, reason, revision, revision)
+    }
+
+    /// 复核一条待复核断言；支撑仍失效时拒绝复活。
+    pub fn revalidate_generation_claim(
+        &mut self,
+        id: &str,
+    ) -> Result<crate::claim_lifecycle::ClaimStatus, crate::claim_lifecycle::ClaimError> {
+        let revision = self.revision;
+        self.claims.revalidate(id, revision, revision)
+    }
+
+    /// 当前 claim 账本的确定性审计回执。
+    pub fn claim_audit_report(&self) -> String {
+        self.claims
+            .audit(None, &crate::claim_lifecycle::AuditOptions::default())
+            .render_zh()
     }
 
     /// 用当前知识重建同一实体的计划，并与上一份计划逐点对照。
@@ -645,7 +768,10 @@ impl SymbolicReasoner {
                 )
             });
         match plan {
-            Some(plan) => self.context.record_generation_with_plan(cursor, plan),
+            Some(plan) => {
+                self.remember_generation_plan(&plan);
+                self.context.record_generation_with_plan(cursor, plan);
+            }
             None => self.context.record_generation_with_cursor(cursor),
         }
         let audit = self.audit_generation(&page.text, &page.trusted);
@@ -693,7 +819,10 @@ impl SymbolicReasoner {
                 )
             });
         match plan {
-            Some(plan) => self.context.record_generation_with_plan(cursor, plan),
+            Some(plan) => {
+                self.remember_generation_plan(&plan);
+                self.context.record_generation_with_plan(cursor, plan);
+            }
             None => self.context.record_generation_with_cursor(cursor),
         }
         let label = match order {

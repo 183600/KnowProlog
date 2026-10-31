@@ -82,6 +82,17 @@ impl SymbolicReasoner {
             self.sync_retrieval_type_hierarchy();
         }
         self.context.restore(snapshot);
+        // claim 生命周期是会话态；旧快照没有该字段时为空账本。
+        self.claims = snapshot.claims.clone().unwrap_or_default();
+        if self.claims.is_empty() {
+            if let Some(plan) = snapshot
+                .generation
+                .as_ref()
+                .and_then(|state| state.plan.as_ref())
+            {
+                self.claims.register_plan(plan, self.revision, self.revision);
+            }
+        }
         // 复核台账是会话态：旧快照缺省为空，避免把上一会话的待办带进来。
         self.epistemic_turns = snapshot.epistemic_turns.clone().unwrap_or_default();
         // 跨轮信念账本同样只在快照声明时恢复；旧快照保持空账本。

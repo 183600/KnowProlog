@@ -159,6 +159,7 @@ impl SymbolicReasoner {
             law_registry: None,
             persisted_laws: None,
             context: DialogueContext::new(5),
+            claims: crate::claim_lifecycle::ClaimLedger::new(),
             epistemic_turns: EpistemicTurnBook::new(),
             beliefs: BeliefLedger::default(),
             embedding,
