@@ -84,6 +84,17 @@ impl SymbolicReasoner {
         self.context.restore(snapshot);
         // claim 生命周期是会话态；旧快照没有该字段时为空账本。
         self.claims = snapshot.claims.clone().unwrap_or_default();
+        if self.claims.version > crate::claim_lifecycle::CLAIM_LEDGER_VERSION {
+            return Err(format!(
+                "claim 账本版本 {} 超出当前支持范围 {}",
+                self.claims.version,
+                crate::claim_lifecycle::CLAIM_LEDGER_VERSION
+            ));
+        }
+        self.claims.version = crate::claim_lifecycle::CLAIM_LEDGER_VERSION;
+        // 旧快照可能没有 plan/reply 反向索引；恢复后按 origins 重建，避免
+        // 计划/回答级退役在升级后静默失效。
+        self.claims.rebuild_indexes();
         if !self.claims.has_claims() {
             if let Some(plan) = snapshot
                 .generation

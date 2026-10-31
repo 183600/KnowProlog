@@ -1833,3 +1833,34 @@ rules = [
         assert!(!text.contains("教师"), "{}", text);
         assert!(text.contains("李四"), "{}", text);
     }
+
+    #[test]
+    fn restore_rebuilds_claim_origin_indexes_from_old_snapshots() {
+        let facts = master_facts();
+        let mut source = SymbolicReasoner::new(test_config(), HashMap::new());
+        source.observe_facts(&facts);
+        source.generate_about("张三").expect("应能生成介绍");
+        let plan = source
+            .context()
+            .generation_state()
+            .and_then(|state| state.plan.clone())
+            .expect("生成后应留下回答计划");
+        let mut snapshot = source.dialogue_snapshot();
+        let ledger = snapshot.claims.as_mut().expect("账本应写入快照");
+        ledger.plan_claims.clear();
+        ledger.reply_claims.clear();
+
+        let mut target = SymbolicReasoner::new(test_config(), HashMap::new());
+        target.observe_facts(&facts);
+        target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("旧快照应可恢复");
+        assert!(!target.claim_ledger().plan_claims.is_empty());
+        assert!(
+            target
+                .claim_ledger()
+                .impact_of_plan(&plan.id)
+                .plans
+                .contains(&plan.id)
+        );
+    }
