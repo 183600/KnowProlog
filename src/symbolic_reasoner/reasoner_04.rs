@@ -3,6 +3,8 @@ impl SymbolicReasoner {
     /// 结果页与见证下标必须整体失效，不能继续按旧事实回答追问。
     fn invalidate_graph_session(&self) {
         *self.graph_session.lock() = None;
+        // 会话事实/假设可能已直接注入归结引擎：旧证明不再可复用。
+        self.proof_memory.lock().clear();
     }
 
     fn unindex_session_atom(&mut self, atom: &Atom) {

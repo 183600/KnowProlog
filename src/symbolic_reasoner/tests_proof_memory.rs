@@ -70,3 +70,19 @@ fn forked_session_does_not_share_proof_memory() {
     assert!(!forked_access.hit, "证明记忆不得跨会话共享");
     assert!(forked_access.stored);
 }
+
+#[test]
+fn session_fact_adoption_invalidates_cached_proof() {
+    let mut reasoner = proof_reasoner();
+    let (_, first_access) = reasoner
+        .resolution_proof_view_with_receipt("张三的师傅是谁")
+        .expect("应能构建证明视图");
+    assert!(first_access.stored);
+
+    assert!(reasoner.adopt_atom(Atom::rel("师傅", "张三", "赵六")));
+    let (view, access) = reasoner
+        .resolution_proof_view_with_receipt("张三的师傅是谁")
+        .expect("会话事实变化后仍应能重算");
+    assert!(!access.hit, "会话事实变化后不得复用旧证明");
+    assert!(view.solutions.len() >= 2, "会话事实应进入重算结果");
+}
