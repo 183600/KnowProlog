@@ -84,6 +84,7 @@ use know_prolog::{
     ownthink_api::select_candidate_by_context,
     path_memory::{EdgeSource, PathEdge, PathPredicate, TraversalGraph, TraversalOptions},
     pattern_closure::{ClosureBudget, ClosureOp},
+    pattern_evolution::{self, EvolutionClock, EvolutionLedger},
     pattern_forge::{self, ForgeRequest, PatternForge},
     pattern_ir::{self, PatternLibrary},
     perf_ledger::PerfLedger,

@@ -432,7 +432,9 @@ fn validate_entry(entry: &PatternEntry) -> Result<(), EvolutionError> {
         ));
     }
     if entry.elems.is_empty() {
-        return Err(EvolutionError::InvalidEntry("模式至少要有一个要素".to_string()));
+        return Err(EvolutionError::InvalidEntry(
+            "模式至少要有一个要素".to_string(),
+        ));
     }
     Ok(())
 }
@@ -888,7 +890,9 @@ pub struct EvolutionReceipt {
 
 impl EvolutionReceipt {
     pub fn gate_findings(&self, gate: GateKind) -> impl Iterator<Item = &EvolutionFinding> {
-        self.findings.iter().filter(move |finding| finding.gate == gate)
+        self.findings
+            .iter()
+            .filter(move |finding| finding.gate == gate)
     }
 
     pub fn gate_tally(&self, gate: GateKind) -> (usize, usize) {
@@ -1172,7 +1176,11 @@ pub fn evaluate_proposal(
                 added_ids.contains(winner)
                     || candidate_entries
                         .get(winner)
-                        .map(|entry| added_sources.iter().any(|added| entry.source.starts_with(added)))
+                        .map(|entry| {
+                            added_sources
+                                .iter()
+                                .any(|added| entry.source.starts_with(added))
+                        })
                         .unwrap_or(false)
             })
             .unwrap_or(false);
@@ -1278,19 +1286,16 @@ pub fn evaluate_proposal(
         });
     }
 
-    let has_structural_error = findings
-        .iter()
-        .any(|finding| finding.gate != GateKind::Behavior && finding.severity == FindingSeverity::Error);
-    let has_behavior_error = findings
-        .iter()
-        .any(|finding| finding.gate == GateKind::Behavior && finding.severity == FindingSeverity::Error);
+    let has_structural_error = findings.iter().any(|finding| {
+        finding.gate != GateKind::Behavior && finding.severity == FindingSeverity::Error
+    });
+    let has_behavior_error = findings.iter().any(|finding| {
+        finding.gate == GateKind::Behavior && finding.severity == FindingSeverity::Error
+    });
     let has_warning = findings
         .iter()
         .any(|finding| finding.severity == FindingSeverity::Warning);
-    let route_additions = proposal
-        .added_entries()
-        .iter()
-        .any(|entry| entry.route);
+    let route_additions = proposal.added_entries().iter().any(|entry| entry.route);
     let verdict = if has_structural_error {
         EvolutionVerdict::Reject
     } else if has_behavior_error {
@@ -1406,14 +1411,8 @@ impl EvolutionLedger {
         if let Some(current) = self.current() {
             return current.clone();
         }
-        let generation = PatternGeneration::snapshot(
-            0,
-            None,
-            library,
-            clock,
-            GenerationStatus::Active,
-            note,
-        );
+        let generation =
+            PatternGeneration::snapshot(0, None, library, clock, GenerationStatus::Active, note);
         self.generations.push(generation.clone());
         generation
     }
@@ -1427,15 +1426,34 @@ impl EvolutionLedger {
         clock: EvolutionClock,
         note: impl Into<String>,
     ) -> Result<EvolutionReceipt, EvolutionError> {
-        let base = self
-            .generation(proposal.base_generation)
-            .cloned()
-            .ok_or(EvolutionError::BaseGenerationMissing {
+        let base = self.generation(proposal.base_generation).cloned().ok_or(
+            EvolutionError::BaseGenerationMissing {
                 requested: proposal.base_generation,
-                current: self.current().map(|snapshot| snapshot.generation).unwrap_or(0),
-            })?;
+                current: self
+                    .current()
+                    .map(|snapshot| snapshot.generation)
+                    .unwrap_or(0),
+            },
+        )?;
         let candidate = proposal.apply(&base)?;
-        let mut receipt = evaluate_proposal(&base, &candidate, proposal, episodes, config, clock);
+        self.transact_candidate(proposal, &base, &candidate, episodes, config, clock, note)
+    }
+
+    /// 执行一次已经构造好的候选库（用于「记录当前模式库」这类快照）。
+    ///
+    /// 提案仍提供基础代、来源类别与留出问句；候选库由调用方给出，因此
+    /// 配置重载导致的条目顺序变化也能被原样记录，而不是被增删编辑重排。
+    pub fn transact_candidate(
+        &mut self,
+        proposal: &EvolutionProposal,
+        base: &PatternGeneration,
+        candidate: &PatternLibrary,
+        episodes: &[PatternEpisode],
+        config: &SystemConfig,
+        clock: EvolutionClock,
+        note: impl Into<String>,
+    ) -> Result<EvolutionReceipt, EvolutionError> {
+        let mut receipt = evaluate_proposal(base, candidate, proposal, episodes, config, clock);
         if receipt.verdict.may_commit() {
             let status = match receipt.verdict {
                 EvolutionVerdict::Commit => GenerationStatus::Active,
@@ -1459,6 +1477,26 @@ impl EvolutionLedger {
         Ok(receipt)
     }
 
+    /// 把当前模式库记录成新的一代（相对台账当前代做完整回放）。
+    pub fn snapshot_library(
+        &mut self,
+        library: &PatternLibrary,
+        episodes: &[PatternEpisode],
+        config: &SystemConfig,
+        clock: EvolutionClock,
+        note: impl Into<String>,
+    ) -> Result<EvolutionReceipt, EvolutionError> {
+        let base = self.current().cloned().ok_or(EvolutionError::EmptyLedger)?;
+        let note = note.into();
+        let proposal = EvolutionProposal::new(
+            format!("snapshot-{}", self.next_generation()),
+            ProposalKind::Migration,
+            &base,
+            note.clone(),
+        );
+        self.transact_candidate(&proposal, &base, library, episodes, config, clock, note)
+    }
+
     /// 前向回滚：把旧代条目作为新代提交，不删除中间代，也不倒转时间。
     pub fn rollback(
         &mut self,
@@ -1466,10 +1504,7 @@ impl EvolutionLedger {
         clock: EvolutionClock,
         note: impl Into<String>,
     ) -> Result<PatternGeneration, EvolutionError> {
-        let current = self
-            .current()
-            .cloned()
-            .ok_or(EvolutionError::EmptyLedger)?;
+        let current = self.current().cloned().ok_or(EvolutionError::EmptyLedger)?;
         let target_generation = self
             .generation(target)
             .cloned()
@@ -1561,7 +1596,8 @@ impl EvolutionLedger {
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, EvolutionError> {
         let path = path.as_ref();
-        let text = fs::read_to_string(path).map_err(|error| EvolutionError::Io(error.to_string()))?;
+        let text =
+            fs::read_to_string(path).map_err(|error| EvolutionError::Io(error.to_string()))?;
         let ledger: Self =
             serde_json::from_str(&text).map_err(|error| EvolutionError::Json(error.to_string()))?;
         if ledger.dialect != EVOLUTION_DIALECT {
@@ -1753,19 +1789,14 @@ mod tests {
     #[test]
     fn structural_gate_rejects_dangling_query_type() {
         let base = base_generation();
-        let proposal = EvolutionProposal::new(
-            "teach-bad",
-            ProposalKind::Teach,
-            &base,
-            "悬空路由",
-        )
-        .with_edit(ProposalEdit::add(entry(
-            "坏模式",
-            "taught#bad",
-            "not_a_real_query",
-            50,
-            &["坏", "模式"],
-        )));
+        let proposal = EvolutionProposal::new("teach-bad", ProposalKind::Teach, &base, "悬空路由")
+            .with_edit(ProposalEdit::add(entry(
+                "坏模式",
+                "taught#bad",
+                "not_a_real_query",
+                50,
+                &["坏", "模式"],
+            )));
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,
@@ -1813,13 +1844,8 @@ mod tests {
                 Elem::word("哪里"),
             ],
         );
-        let proposal = EvolutionProposal::new(
-            "hijack",
-            ProposalKind::Teach,
-            &base,
-            "故意改道",
-        )
-        .with_edit(ProposalEdit::add(hijack));
+        let proposal = EvolutionProposal::new("hijack", ProposalKind::Teach, &base, "故意改道")
+            .with_edit(ProposalEdit::add(hijack));
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,
@@ -1847,16 +1873,9 @@ mod tests {
             50,
             &["今天", "天气", "如何"],
         );
-        let seed = matched_episode(
-            "今天天气如何",
-            &["今天", "天气", "如何"],
-            &new_entry,
-            1,
-            0,
-        );
-        let proposal =
-            EvolutionProposal::new("weather", ProposalKind::Teach, &base, "新问法")
-                .with_edit(ProposalEdit::add(new_entry));
+        let seed = matched_episode("今天天气如何", &["今天", "天气", "如何"], &new_entry, 1, 0);
+        let proposal = EvolutionProposal::new("weather", ProposalKind::Teach, &base, "新问法")
+            .with_edit(ProposalEdit::add(new_entry));
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,
@@ -1881,13 +1900,9 @@ mod tests {
             .find(|entry| entry.query_type == "age_query")
             .unwrap();
         let episode = matched_episode("小明多大", &["小明", "多大"], original, 3, 0);
-        let proposal = EvolutionProposal::new(
-            "drop-age",
-            ProposalKind::Forget,
-            &base,
-            "删除年龄规则",
-        )
-        .with_edit(ProposalEdit::remove_id(original.id()));
+        let proposal =
+            EvolutionProposal::new("drop-age", ProposalKind::Forget, &base, "删除年龄规则")
+                .with_edit(ProposalEdit::remove_id(original.id()));
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,
@@ -1922,9 +1937,8 @@ mod tests {
             true,
             vec![Elem::pos("nr"), Elem::word("多大")],
         );
-        let proposal =
-            EvolutionProposal::new("aggressive", ProposalKind::Teach, &base, "过泛化")
-                .with_edit(ProposalEdit::add(aggressive));
+        let proposal = EvolutionProposal::new("aggressive", ProposalKind::Teach, &base, "过泛化")
+            .with_edit(ProposalEdit::add(aggressive));
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,
@@ -1950,14 +1964,13 @@ mod tests {
             5,
             &["李四", "几岁"],
         );
-        let proposal =
-            EvolutionProposal::new("safe", ProposalKind::Teach, &base, "补充问法")
-                .with_edit(ProposalEdit::add(safe))
-                .with_held_out(HeldOutCase {
-                    input: "李四几岁".to_string(),
-                    expected_query_type: "age_query".to_string(),
-                    note: "留出".to_string(),
-                });
+        let proposal = EvolutionProposal::new("safe", ProposalKind::Teach, &base, "补充问法")
+            .with_edit(ProposalEdit::add(safe))
+            .with_held_out(HeldOutCase {
+                input: "李四几岁".to_string(),
+                expected_query_type: "age_query".to_string(),
+                note: "留出".to_string(),
+            });
         let receipt = ledger
             .transact(
                 &proposal,
@@ -1970,12 +1983,13 @@ mod tests {
         assert_eq!(receipt.verdict, EvolutionVerdict::Commit);
         assert_eq!(receipt.committed_generation, Some(1));
         assert_eq!(ledger.current().unwrap().status, GenerationStatus::Active);
-        assert_eq!(ledger.current().unwrap().fingerprint, receipt.candidate_fingerprint);
+        assert_eq!(
+            ledger.current().unwrap().fingerprint,
+            receipt.candidate_fingerprint
+        );
 
-        let path = std::env::temp_dir().join(format!(
-            "knowprolog-evolution-{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("knowprolog-evolution-{}.json", std::process::id()));
         ledger.save_to_path(&path).unwrap();
         let loaded = EvolutionLedger::load_from_path(&path).unwrap();
         let _ = std::fs::remove_file(&path);
@@ -1989,19 +2003,15 @@ mod tests {
         mappings.insert("老婆".to_string(), "妻子".to_string());
         config.synonyms = Some(crate::SynonymsConfig { mappings });
         let base = base_generation();
-        let proposal = EvolutionProposal::new(
-            "stale-surface",
-            ProposalKind::Teach,
-            &base,
-            "旧词面",
-        )
-        .with_edit(ProposalEdit::add(entry(
-            "老婆问法",
-            "taught#stale",
-            "age_query",
-            50,
-            &["老婆", "多大"],
-        )));
+        let proposal =
+            EvolutionProposal::new("stale-surface", ProposalKind::Teach, &base, "旧词面")
+                .with_edit(ProposalEdit::add(entry(
+                    "老婆问法",
+                    "taught#stale",
+                    "age_query",
+                    50,
+                    &["老婆", "多大"],
+                )));
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,
@@ -2019,27 +2029,61 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_library_records_drift_without_reordering() {
+        let base = base_generation();
+        let mut ledger = EvolutionLedger::default();
+        ledger.ensure_initial(&base.library(), base.clock, "初始");
+        let mut drifted = base.library();
+        drifted.add(entry(
+            "新增问法",
+            "taught#drift",
+            "age_query",
+            5,
+            &["李四", "几岁"],
+        ));
+        let receipt = ledger
+            .snapshot_library(
+                &drifted,
+                &[],
+                &config(),
+                EvolutionClock::new(0, 1, 1, 0),
+                "漂移快照",
+            )
+            .unwrap();
+        assert!(receipt.committed_generation.is_some());
+        let current = ledger.current().unwrap();
+        assert_eq!(
+            current.fingerprint,
+            pattern_ir::library_fingerprint(drifted.entries())
+        );
+        assert_eq!(
+            current
+                .entries
+                .iter()
+                .map(PatternEntry::id)
+                .collect::<Vec<_>>(),
+            drifted
+                .entries()
+                .iter()
+                .map(PatternEntry::id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn proposal_apply_rejects_fingerprint_drift_and_missing_target() {
         let base = base_generation();
-        let mut proposal = EvolutionProposal::new(
-            "stale-base",
-            ProposalKind::Teach,
-            &base,
-            "旧基础",
-        );
+        let mut proposal =
+            EvolutionProposal::new("stale-base", ProposalKind::Teach, &base, "旧基础");
         proposal.base_fingerprint = "deadbeef".to_string();
         assert!(matches!(
             proposal.apply(&base),
             Err(EvolutionError::FingerprintMismatch { .. })
         ));
 
-        let missing = EvolutionProposal::new(
-            "missing-target",
-            ProposalKind::Forget,
-            &base,
-            "删不存在",
-        )
-        .with_edit(ProposalEdit::remove_id("ffffffff"));
+        let missing =
+            EvolutionProposal::new("missing-target", ProposalKind::Forget, &base, "删不存在")
+                .with_edit(ProposalEdit::remove_id("ffffffff"));
         assert!(matches!(
             missing.apply(&base),
             Err(EvolutionError::EditTargetMissing(_))
@@ -2049,8 +2093,7 @@ mod tests {
     #[test]
     fn report_renders_four_gates_and_replay() {
         let base = base_generation();
-        let proposal =
-            EvolutionProposal::new("noop", ProposalKind::Migration, &base, "无变化");
+        let proposal = EvolutionProposal::new("noop", ProposalKind::Migration, &base, "无变化");
         let candidate = proposal.apply(&base).unwrap();
         let receipt = evaluate_proposal(
             &base,

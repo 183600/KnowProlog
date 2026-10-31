@@ -981,6 +981,12 @@ fn persist_pattern_forge(forge: &PatternForge, path: &str) {
     }
 }
 
+fn persist_pattern_evolution(ledger: &EvolutionLedger, path: &str) {
+    if let Err(error) = ledger.save_to_path(path) {
+        eprintln!("模式演化台账保存失败：{}", error);
+    }
+}
+
 /// 模式命中回执里若来源是锻造规则，则给该规则记一次成功使用。
 ///
 /// 只做计数，不改变回答；台账按需落盘，避免每轮都写 JSON。

@@ -121,6 +121,37 @@ async fn run_interactive_mode(
         }
         _ => {}
     }
+    // 模式演化台账：每次教学/诱导/锻造/确认/遗忘后都可以把当前库记成新代；
+    // 快照保存三时钟与经验水位，回滚只前向提交旧代，不篡改历史。
+    let evolution_path = format!("{}/pattern_evolution.json", store_path);
+    let mut pattern_evolution = match EvolutionLedger::load_from_path(&evolution_path) {
+        Ok(ledger) => ledger,
+        Err(pattern_evolution::EvolutionError::Io(_)) => EvolutionLedger::default(),
+        Err(error) => {
+            eprintln!("模式演化台账损坏（{}）：{}", evolution_path, error);
+            EvolutionLedger::default()
+        }
+    };
+    if pattern_evolution.is_empty() {
+        let clock = EvolutionClock::new(
+            0,
+            oxigraph_manager.revision(),
+            0,
+            pattern_episodes.revision(),
+        );
+        pattern_evolution.ensure_initial(&pattern_library, clock, "启动快照");
+        if let Err(error) = pattern_evolution.save_to_path(&evolution_path) {
+            eprintln!("模式演化台账保存失败：{}", error);
+        }
+    } else if let Some(current) = pattern_evolution.current() {
+        let fingerprint = pattern_ir::library_fingerprint(pattern_library.entries());
+        if current.fingerprint != fingerprint {
+            println!(
+                "模式演化：当前模式库相对第{}代已漂移；可用「演化快照」记录，或「演化回滚 <代>」恢复。",
+                current.generation
+            );
+        }
+    }
     // 经验检查点：交互中每 8 轮把变化过的经验台账落图一次，
     // 避免进程被中断时丢掉整段会话的确认/否定反馈（退出时仍会兜底落图）。
     let mut synced_episodes_revision = pattern_episodes.revision();

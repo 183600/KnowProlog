@@ -158,6 +158,130 @@
             continue;
         }
 
+        // 模式演化台账：代际快照、四类闸门与回执
+        if matches!(input, "模式演化" | "演化台账" | "模式代" | "模式演化报告") {
+            println!("{}", pattern_evolution.render_report());
+            if let Some(receipt) = pattern_evolution.receipts.last() {
+                println!("{}", receipt.render());
+            }
+            println!();
+            continue;
+        }
+
+        // 演化快照：把当前模式库相对上一代做完整回放并记为新一代
+        if input == "演化快照"
+            || strip_any_prefix(
+                input,
+                &["演化快照：", "演化快照:", "演化快照 ", "模式快照：", "模式快照:"],
+            )
+            .is_some()
+        {
+            let note = strip_any_prefix(
+                input,
+                &["演化快照：", "演化快照:", "演化快照 ", "模式快照：", "模式快照:"],
+            )
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .unwrap_or("手动快照");
+            let clock = EvolutionClock::new(
+                0,
+                kb_revision,
+                pattern_evolution
+                    .current()
+                    .map(|generation| generation.generation)
+                    .unwrap_or(0),
+                pattern_episodes.revision(),
+            );
+            match pattern_evolution.snapshot_library(
+                &pattern_library,
+                pattern_episodes.entries(),
+                &language_config,
+                clock,
+                note,
+            ) {
+                Ok(receipt) => {
+                    println!("{}", receipt.render());
+                    persist_pattern_evolution(&pattern_evolution, &evolution_path);
+                    if let Some(generation) = receipt.committed_generation {
+                        match oxigraph_manager
+                            .sync_pattern_ledger(pattern_library.entries())
+                            .await
+                        {
+                            Ok(count) => println!(
+                                "第{}代已生效；模式落图 {} 条。",
+                                generation, count
+                            ),
+                            Err(error) => println!(
+                                "第{}代已记录，但模式落图失败：{}",
+                                generation, error
+                            ),
+                        }
+                    } else {
+                        println!(
+                            "候选未写入：判定为{}（可用「模式演化」查看发现）。",
+                            receipt.verdict.label()
+                        );
+                    }
+                }
+                Err(error) => println!("演化快照失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 演化回执：最近一次闸门的完整发现与回放差异
+        if matches!(input, "演化回执" | "模式演化回执") {
+            match pattern_evolution.receipts.last() {
+                Some(receipt) => println!("{}", receipt.render()),
+                None => println!("还没有演化回执；先用「演化快照」记录一代。"),
+            }
+            println!();
+            continue;
+        }
+
+        // 演化回滚：把旧代条目作为新代提交，并立即恢复路由
+        if let Some(text) = strip_any_prefix(
+            input,
+            &["演化回滚：", "演化回滚:", "演化回滚 ", "模式回滚：", "模式回滚:"],
+        ) {
+            let target = text.trim();
+            let parsed = target.parse::<u64>().ok();
+            match parsed {
+                Some(target) => {
+                    let clock = EvolutionClock::new(
+                        0,
+                        kb_revision,
+                        pattern_evolution
+                            .current()
+                            .map(|generation| generation.generation)
+                            .unwrap_or(0),
+                        pattern_episodes.revision(),
+                    );
+                    match pattern_evolution.rollback(target, clock, "会话回滚") {
+                        Ok(generation) => {
+                            pattern_library = generation.library();
+                            persist_pattern_evolution(&pattern_evolution, &evolution_path);
+                            println!(
+                                "已前向回滚：第{}代（内容来自第{}代，指纹 {}）。",
+                                generation.generation, target, generation.fingerprint
+                            );
+                            match oxigraph_manager
+                                .sync_pattern_ledger(pattern_library.entries())
+                                .await
+                            {
+                                Ok(count) => println!("模式落图：{} 条已同步。", count),
+                                Err(error) => println!("回滚已生效，但模式落图失败：{}", error),
+                            }
+                        }
+                        Err(error) => println!("演化回滚失败：{}", error),
+                    }
+                }
+                None => println!("用法：演化回滚 <代>，例如「演化回滚 0」。"),
+            }
+            println!();
+            continue;
+        }
+
         // 模式联想：用相似成功经验泛化出候选骨架，只确认、不直接路由
         if let Some(text) = strip_any_prefix(
             input,
