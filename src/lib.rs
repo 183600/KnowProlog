@@ -45,6 +45,7 @@ pub mod causal_reasoning;
 pub mod causal_tokenization;
 pub mod chinese_reasoning_nlu;
 pub mod chronicle;
+pub mod claim_lifecycle;
 pub mod completion_episode;
 pub mod confidence;
 pub mod config_contract;
