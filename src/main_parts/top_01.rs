@@ -421,6 +421,9 @@ enum Commands {
         /// Retract an earlier refutation as SUBJECT|PREDICATE|OBJECT (repeatable)
         #[arg(long = "retract-refute", value_name = "S|P|O")]
         retract_refute: Vec<String>,
+        /// Retract an observed fact as SUBJECT|PREDICATE|OBJECT (repeatable)
+        #[arg(long = "retract-fact", value_name = "S|P|O")]
+        retract_fact: Vec<String>,
         /// Mark a predicate as single-valued for this session (repeatable)
         #[arg(long = "functional", value_name = "PREDICATE")]
         functional: Vec<String>,

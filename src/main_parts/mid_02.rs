@@ -456,6 +456,7 @@ fn run_foil(
     positives: &[String],
     refutations: &[String],
     retract_refutations: &[String],
+    retract_facts: &[String],
     functional: &[String],
     unmark_functional: &[String],
     clear_guards: bool,
@@ -481,7 +482,25 @@ fn run_foil(
         _ => FoilLedger::new(),
     };
 
+    let mut retracted_facts = 0usize;
+    for raw in retract_facts {
+        match open_closure::parse_fact(raw) {
+            Ok((subject, predicate, object, _)) => {
+                if ledger.retract_observation(&subject, &predicate, &object) {
+                    retracted_facts += 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut predictor = LinkPredictor::new();
+    for triple in ledger.observations() {
+        predictor.add_triple(&triple.subject, &triple.predicate, &triple.object);
+    }
     for raw in facts {
         match open_closure::parse_fact(raw) {
             Ok((subject, predicate, object, negated)) => {
@@ -605,15 +624,28 @@ fn run_foil(
     let predictions = predictor.predict_missing(32);
     let kept_predictions = ledger.filter_predictions(&predictor, &predictions).len();
     if json {
+        let prediction_rows: Vec<_> = predictions
+            .iter()
+            .map(|prediction| {
+                serde_json::json!({
+                    "triple": prediction.triple,
+                    "rule_index": prediction.rule_index,
+                    "confidence": prediction.confidence,
+                    "blocked": ledger.blocks_prediction(&predictor, prediction),
+                })
+            })
+            .collect();
         let payload = serde_json::json!({
             "reports": &reports,
             "refinements": &refinements,
             "ledger": &ledger,
             "adopted": adopted,
             "retracted_refutations": retracted_refutations,
+            "retracted_facts": retracted_facts,
             "cleared_guards": cleared_guards,
             "hypotheses_total": hypotheses_total,
             "hypotheses_inspected": reports.len(),
+            "predictions": prediction_rows,
             "predictions_sampled": predictions.len(),
             "predictions_kept": kept_predictions,
         });
@@ -660,6 +692,9 @@ fn run_foil(
     println!("{}", ledger.render_report(&predictor));
     if adopt {
         println!("已采纳精化：{} 条规则。", adopted);
+    }
+    if retracted_facts > 0 {
+        println!("已撤回 {} 条观察事实。", retracted_facts);
     }
     if retracted_refutations > 0 {
         println!("已撤回 {} 条显式否认。", retracted_refutations);

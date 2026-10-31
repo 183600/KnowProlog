@@ -1435,15 +1435,35 @@ impl FoilLedger {
         }
         let predictions = predictor.predict_missing(16);
         if !predictions.is_empty() {
-            let blocked = predictions
+            let blocked: Vec<_> = predictions
                 .iter()
                 .filter(|prediction| self.blocks_prediction(predictor, prediction))
-                .count();
+                .collect();
             output.push_str(&format!(
                 "\n  预测复核：抽样 {} 条，守卫阻断 {} 条。",
                 predictions.len(),
-                blocked
+                blocked.len()
             ));
+            for prediction in blocked.iter().take(8) {
+                let rule = predictor
+                    .rules()
+                    .get(prediction.rule_index)
+                    .map(|rule| rule.rule_text())
+                    .unwrap_or_else(|| format!("规则 #{}", prediction.rule_index));
+                output.push_str(&format!(
+                    "\n  - 阻断 {}|{}|{}（{}）",
+                    prediction.triple.subject,
+                    prediction.triple.predicate,
+                    prediction.triple.object,
+                    rule
+                ));
+            }
+            if blocked.len() > 8 {
+                output.push_str(&format!(
+                    "\n  - 另有 {} 条被阻断的预测未列出。",
+                    blocked.len() - 8
+                ));
+            }
         }
         output
     }
