@@ -1759,6 +1759,13 @@ enum Commands {
         /// Scan an archival surface as NAME=PATH (repeatable)
         #[arg(long = "archive-surface", value_name = "NAME=PATH")]
         archive_surface: Vec<String>,
+        /// Apply tombstones from a PrivacyLedger JSON to every known fact
+        #[arg(long = "privacy-ledger", value_name = "PATH")]
+        privacy_ledger: Option<String>,
+        /// Extra fact as SUBJECT|PREDICATE|OBJECT|SESSION checked against the
+        /// privacy ledger (repeatable)
+        #[arg(long = "forget-fact", value_name = "S|P|O")]
+        forget_fact: Vec<String>,
         /// Plaintext that must no longer appear on active surfaces (repeatable)
         #[arg(long = "scan-term", value_name = "TERM")]
         scan_term: Vec<String>,

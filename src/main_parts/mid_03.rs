@@ -1032,6 +1032,8 @@ fn run_claim_ledger(
     reason: &str,
     impact_facts: &[String],
     expected_emissions: Option<usize>,
+    privacy_ledger: Option<&str>,
+    forget_facts: &[String],
     scan_surfaces: &[String],
     archive_surfaces: &[String],
     scan_terms: &[String],
@@ -1103,6 +1105,46 @@ fn run_claim_ledger(
             }
         }
         dirty = true;
+    }
+
+    let mut privacy_impacts = Vec::new();
+    if let Some(privacy_path) = privacy_ledger {
+        let text = match std::fs::read_to_string(privacy_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("读取隐私台账失败：{}", error);
+                std::process::exit(1);
+            }
+        };
+        let privacy: know_prolog::privacy_flow::PrivacyLedger = match serde_json::from_str(&text) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                eprintln!("解析隐私台账失败：{}", error);
+                std::process::exit(1);
+            }
+        };
+        let mut facts: Vec<know_prolog::claim_lifecycle::FactKey> = ledger
+            .facts
+            .values()
+            .map(|record| record.key.clone())
+            .collect();
+        for raw in forget_facts {
+            let Some(fact) = parse_claim_fact(raw) else {
+                eprintln!("事实格式应为 SUBJECT|PREDICATE|OBJECT[|SESSION]：{}", raw);
+                std::process::exit(2);
+            };
+            facts.push(fact);
+        }
+        facts.sort();
+        facts.dedup();
+        let before = ledger.events.len();
+        privacy_impacts = ledger.retire_with_privacy(&privacy, &facts, reason, turn, revision);
+        if ledger.events.len() != before {
+            dirty = true;
+        }
+    } else if !forget_facts.is_empty() {
+        eprintln!("使用 --forget-fact 时必须同时提供 --privacy-ledger");
+        std::process::exit(2);
     }
 
     let mut claim_impacts = Vec::new();
@@ -1177,6 +1219,12 @@ fn run_claim_ledger(
                 serde_json::to_value(&impacts).unwrap_or(serde_json::Value::Null),
             );
         }
+        if !privacy_impacts.is_empty() {
+            object.insert(
+                "privacy_impacts".to_string(),
+                serde_json::to_value(&privacy_impacts).unwrap_or(serde_json::Value::Null),
+            );
+        }
         if !claim_impacts.is_empty() {
             object.insert(
                 "claim_impacts".to_string(),
@@ -1217,6 +1265,9 @@ fn run_claim_ledger(
             println!("{}", emission.render_zh());
         }
         for impact in &impacts {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &privacy_impacts {
             println!("{}", impact.render_zh());
         }
         for impact in &claim_impacts {
