@@ -1794,3 +1794,42 @@ rules = [
         assert!(!text.contains("教师"), "{}", text);
         assert!(text.contains("李四"), "{}", text);
     }
+
+    #[test]
+    fn fact_tombstone_survives_snapshot_without_any_claim() {
+        use crate::claim_lifecycle::{FactKey, RetirementKind};
+
+        let facts = vec![
+            PrologFact::Relation {
+                from: "郑六十".to_string(),
+                rel_type: "职业".to_string(),
+                to: "教师".to_string(),
+            },
+            PrologFact::Relation {
+                from: "郑六十".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+        ];
+        let mut source = SymbolicReasoner::new(test_config(), HashMap::new());
+        source.observe_facts(&facts);
+        source
+            .retire_generation_fact(
+                &FactKey::new("郑六十", "职业", "教师", false),
+                RetirementKind::Redacted,
+                "仅事实墓碑",
+            )
+            .expect("事实应可退役");
+        assert!(!source.claim_ledger().has_claims());
+        let snapshot = source.dialogue_snapshot();
+        assert!(snapshot.claims.is_some(), "仅有事实墓碑时也必须持久化");
+
+        let mut target = SymbolicReasoner::new(test_config(), HashMap::new());
+        target.observe_facts(&facts);
+        target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("事实墓碑应随快照恢复");
+        let text = target.generate_about("郑六十").expect("其余事实仍应可介绍");
+        assert!(!text.contains("教师"), "{}", text);
+        assert!(text.contains("李四"), "{}", text);
+    }

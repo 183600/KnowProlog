@@ -84,7 +84,7 @@ impl SymbolicReasoner {
         self.context.restore(snapshot);
         // claim 生命周期是会话态；旧快照没有该字段时为空账本。
         self.claims = snapshot.claims.clone().unwrap_or_default();
-        if self.claims.is_empty() {
+        if !self.claims.has_claims() {
             if let Some(plan) = snapshot
                 .generation
                 .as_ref()

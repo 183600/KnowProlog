@@ -1467,7 +1467,7 @@ impl SymbolicReasoner {
     /// 记忆外），供服务层在不触碰文件系统的前提下导出/导入会话。
     pub fn dialogue_snapshot(&self) -> DialogueSnapshot {
         let mut snapshot = self.context.snapshot();
-        snapshot.claims = (!self.claims.is_empty()).then(|| self.claims.clone());
+        snapshot.claims = self.claims.has_state().then(|| self.claims.clone());
         snapshot.session_facts = self
             .session_facts
             .iter()

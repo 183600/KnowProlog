@@ -1528,6 +1528,16 @@ impl ClaimLedger {
         self.claims.is_empty()
     }
 
+    /// 是否登记过 claim；事实墓碑可能先于任何 claim 出现。
+    pub fn has_claims(&self) -> bool {
+        !self.claims.is_empty()
+    }
+
+    /// 是否有任何需要随会话持久化的状态（claim、事实墓碑或事件）。
+    pub fn has_state(&self) -> bool {
+        !self.claims.is_empty() || !self.facts.is_empty() || !self.events.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.claims.len()
     }
