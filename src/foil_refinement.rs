@@ -460,12 +460,22 @@ impl<'a> FoilSampler<'a> {
             .predictor
             .objects_of(&foil.subject, &foil.predicate)
             .into_iter()
-            .any(|object| object != foil.object)
+            .filter(|object| object != &foil.object)
+            .any(|object| {
+                !self
+                    .ledger
+                    .is_refuted(&Triple::new(&foil.subject, &foil.predicate, &object))
+            })
             || self
                 .ledger
                 .objects_of(&foil.subject, &foil.predicate)
                 .into_iter()
-                .any(|object| object != foil.object);
+                .filter(|object| object != &foil.object)
+                .any(|object| {
+                    !self
+                        .ledger
+                        .is_refuted(&Triple::new(&foil.subject, &foil.predicate, &object))
+                });
         let status = if known && refuted {
             FoilStatus::Conflict
         } else if refuted {
@@ -1515,8 +1525,18 @@ pub fn functional_conflict_negatives(
             let mut values: BTreeSet<String> = predictor
                 .objects_of(&triple.subject, &triple.predicate)
                 .into_iter()
+                .filter(|value| {
+                    !ledger.is_refuted(&Triple::new(&triple.subject, &triple.predicate, value))
+                })
                 .collect();
-            values.extend(ledger.objects_of(&triple.subject, &triple.predicate));
+            values.extend(
+                ledger
+                    .objects_of(&triple.subject, &triple.predicate)
+                    .into_iter()
+                    .filter(|value| {
+                        !ledger.is_refuted(&Triple::new(&triple.subject, &triple.predicate, value))
+                    }),
+            );
             if values.iter().any(|value| value != &triple.object) {
                 out.insert(triple.clone());
             }
@@ -1696,6 +1716,16 @@ mod tests {
             matches!(evaluation.guard, RuleGuard::ExceptSubject { .. })
                 && evaluation.dropped_positives > 0
         }));
+    }
+
+    #[test]
+    fn refuted_values_do_not_create_functional_conflicts() {
+        let predictor = predictor();
+        let mut ledger = FoilLedger::new();
+        ledger.mark_functional("师祖");
+        ledger.refute("李四", "师祖", "王五");
+        let negatives = functional_conflict_negatives(&predictor, &ledger);
+        assert!(!negatives.contains(&Triple::new("李四", "师祖", "赵六")));
     }
 
     #[test]
