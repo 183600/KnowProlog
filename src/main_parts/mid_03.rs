@@ -886,6 +886,51 @@ fn run_prompt_lint(json: bool) {
     }
 }
 
+/// `session`：离线回放会话契约；路径省略时运行 `examples/sessions`。
+fn run_session_contracts(path: Option<&str>, json: bool) {
+    let target = path.unwrap_or(know_prolog::session_contract::SESSION_CONTRACT_DIR);
+    let reports = if std::path::Path::new(target).is_dir() {
+        match know_prolog::session_contract::run_directory(target) {
+            Ok(reports) => reports,
+            Err(error) => {
+                eprintln!("会话契约运行失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match know_prolog::session_contract::run_file(target) {
+            Ok(report) => vec![report],
+            Err(error) => {
+                eprintln!("会话契约运行失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    };
+    if reports.is_empty() {
+        eprintln!("没有找到会话契约：{}", target);
+        std::process::exit(1);
+    }
+    if json {
+        match serde_json::to_string_pretty(&reports) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("会话契约报告序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        for (index, report) in reports.iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            println!("{}", report.render_text());
+        }
+    }
+    if reports.iter().any(|report| !report.passed) {
+        std::process::exit(1);
+    }
+}
+
 /// `scenario`：离线回放查询板剧本；任一步失败以非零码退出（可直接进 CI）。
 fn run_query_scenario(file: &str, json: bool) {
     let report = match know_prolog::query_scenario::run_file(file) {

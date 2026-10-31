@@ -117,6 +117,12 @@ async fn main() {
         return;
     }
 
+    // 会话契约同样完全离线：过程回执不依赖配置、存储或网络。
+    if let Some(Commands::Session { path, json }) = &cli.command {
+        run_session_contracts(path.as_deref(), *json);
+        return;
+    }
+
     // 开放闭包只操作会话账本，不打开知识存储，也不写律典。
     if let Some(Commands::OpenClosure {
         text,

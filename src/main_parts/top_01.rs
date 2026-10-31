@@ -1598,6 +1598,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Replay session contracts (process receipts) offline; path may be a
+    /// file or a directory (default examples/sessions); exits non-zero on any
+    /// failure
+    Session {
+        /// Contract TOML file or directory; omit for examples/sessions
+        path: Option<String>,
+        /// Print the reports as a JSON array
+        #[arg(long)]
+        json: bool,
+    },
     /// Mine, review, export or import OWL axioms proposed from the graph
     #[command(disable_help_flag = true)]
     Owl {
