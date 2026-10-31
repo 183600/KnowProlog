@@ -85,6 +85,7 @@ pub mod event_graph;
 pub mod external_knowledge;
 pub mod external_ledger;
 pub mod fact_snapshot;
+pub mod foil_refinement;
 pub mod formal_semantics;
 pub mod frame_semantics;
 pub mod frontier;
